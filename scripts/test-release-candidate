@@ -231,7 +231,11 @@ class Fixture:
 
 
 def build_fixture(
-    module: ModuleType, root: Path, *, candidate_identity: str = "Scherzo Cloud Mirror"
+    module: ModuleType,
+    root: Path,
+    *,
+    candidate_identity: str = "Scherzo Cloud Mirror",
+    notes: bytes = b"## Fixed\n\n- Fix candidate publication.\n",
 ) -> Fixture:
     source = root / "source"
     source.mkdir()
@@ -261,7 +265,6 @@ def build_fixture(
     candidate_tree = git(source, "write-tree").decode("ascii").strip()
     prior = release_document("v0.24.0", base, "Prior fixture release.\n", 10)
     latest = module.normalize_latest_release("v0.24.0", base, prior)
-    notes = b"## Fixed\n\n- Fix candidate publication.\n"
     source_revision = "a" * 40
     stable = f"refs/tags/v0.24.0={base}\n".encode("ascii")
     plan = module.serialize(
@@ -281,7 +284,7 @@ def build_fixture(
             ("version", "0.25.0"),
             ("tag", "v0.25.0"),
             ("notes_sha256", module.sha256(notes)),
-            ("notes_base64", base64.b64encode(notes).decode("ascii")),
+            ("notes_base64", base64.b64encode(notes).decode("ascii") or "none"),
         )
     )
     candidate = commit_tree(
@@ -429,7 +432,7 @@ if args[:2] == ["release", "create"]:
         "tag_name": tag,
         "target_commitish": target,
         "name": option("--title"),
-        "body": Path(option("--notes-file")).read_text(),
+        "body": Path(option("--notes-file")).read_text() or None,
         "published_at": "",
         "draft": True,
         "prerelease": False,
@@ -612,6 +615,12 @@ def main() -> int:
         if fixture.state()["writes"] != before:
             fail("exact published release was not an idempotent no-op")
 
+        state = fixture.state()
+        state["releases"][-1]["body"] = None
+        fixture.write_state(state)
+        if run_verifier(fixture, check=False).returncode == 0:
+            fail("null release notes matched nonempty planned notes")
+
         fixture.reset_provider()
         state = fixture.state()
         state["tags"]["v0.25.0"] = fixture.base
@@ -690,6 +699,19 @@ def main() -> int:
         run_verifier(
             build_fixture(module, Path(temporary), candidate_identity="Useful Machinery Mirror")
         )
+
+    with tempfile.TemporaryDirectory(prefix="cli-release-candidate-empty-notes.") as temporary:
+        fixture = build_fixture(module, Path(temporary), notes=b"")
+        dist = make_dist(fixture.root)
+        reconciliation_command(fixture, dist, "apply")
+        state = fixture.state()
+        release = state["releases"][-1]
+        if release["draft"] or release["body"] is not None:
+            fail("empty planned notes did not publish GitHub's null release body")
+        run_verifier(fixture)
+        reconciliation_command(fixture, dist, "apply")
+        if fixture.state()["writes"] != state["writes"]:
+            fail("published release with null notes was not an idempotent no-op")
 
     print("CLI release-candidate fixture passed.")
     return 0

@@ -691,6 +691,9 @@ def verify_target_release(
     release_id = document.get("id")
     name = document.get("name")
     body = document.get("body")
+    # GitHub represents release notes with no content as null.
+    if body is None:
+        body = ""
     draft_value = document.get("draft")
     prerelease_value = document.get("prerelease")
     if (
