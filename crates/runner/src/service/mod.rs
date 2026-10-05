@@ -2975,7 +2975,18 @@ mod tests {
         expected_effect_count: usize,
         expected_event_count: usize,
     ) -> serde_json::Map<String, serde_json::Value> {
-        let events = capture.events();
+        // Assignment notifications can start a reconnect before the test aborts
+        // the service. Its connection event belongs to a later attempt, not the
+        // effect/connection pair under test. Keep exact counts for the first
+        // attempt and all effect events so duplicate timeout records still fail.
+        let events: Vec<_> = capture
+            .events()
+            .into_iter()
+            .filter(|event| {
+                event["event.name"] != "runner.gateway_connection"
+                    || event["um.connection.attempt"] == 1
+            })
+            .collect();
         assert_eq!(events.len(), expected_event_count);
         let effect = events
             .iter()
