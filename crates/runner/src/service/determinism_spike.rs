@@ -376,6 +376,19 @@ async fn run_assignment_scenario() -> Vec<String> {
                 .expect("semantic assignment response message ID"),
             6,
         ));
+        // Cleanup runs on the blocking pool. Observe its retention report
+        // before probing liveness so the report and pong have a causal order.
+        let retention = next_outbound(&mut fixture.outbound).await;
+        let retention = decode_text(&retention, "workspace retention report");
+        assert_eq!(retention["type"], "workspace_retention_report");
+        assert_eq!(retention["sequence"], 7);
+        assert_eq!(retention["payload"]["state"], "retained");
+        fixture.inbound.send(effect_observation_acknowledgement(
+            retention["messageId"]
+                .as_str()
+                .expect("workspace retention report message ID"),
+            7,
+        ));
         let stress_silence_timer =
             sleep_request(&mut fixture.sleep_requests, Duration::from_secs(2)).await;
         fixture
@@ -408,7 +421,7 @@ async fn run_assignment_scenario() -> Vec<String> {
     let outcome = outcome.expect("run deterministic established connection");
     assert!(outcome.opening_acknowledged);
     assert!(outcome.handshake_completed);
-    assert_eq!(next_sequence, 7);
+    assert_eq!(next_sequence, 8);
     transcript.record(
         "scenario.outcome:gateway-close:opening_acknowledged=true:handshake_completed=true"
             .to_owned(),
@@ -419,10 +432,12 @@ async fn run_assignment_scenario() -> Vec<String> {
     // notification can become ready immediately before or after the liveness
     // timer is first polled, so timer-request ordering is not a protocol
     // guarantee. Timeout-specific scenarios below retain those events.
-    events
+    let mut events: Vec<_> = events
         .into_iter()
         .filter(|event| !event.starts_with("sleep.requested:"))
-        .collect()
+        .collect();
+    normalize_retention_report_roots(&mut events);
+    events
 }
 
 async fn run_timeout_boundary_scenarios() -> Vec<String> {
@@ -675,7 +690,12 @@ async fn run_reconnect_scenario() -> Vec<String> {
         "source preparation must retain its deadline fence"
     );
     events.retain(|event| event != preparation_deadline);
-    for event in &mut events {
+    normalize_retention_report_roots(&mut events);
+    events
+}
+
+fn normalize_retention_report_roots(events: &mut [String]) {
+    for event in events {
         let Some(raw) = event.strip_prefix("outbound:text:") else {
             continue;
         };
@@ -689,7 +709,6 @@ async fn run_reconnect_scenario() -> Vec<String> {
             *event = format!("outbound:text:{frame}");
         }
     }
-    events
 }
 
 async fn run_terminal_close_scenario() -> Vec<String> {
