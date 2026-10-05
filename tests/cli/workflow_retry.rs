@@ -41,7 +41,7 @@ fn environment_retry_bundle() -> RunBundle {
     ])
     .unwrap();
     RunBundle::new(&format!(
-        "schemaVersion: 1\nsteps:\n  execute:\n    kind: cmd\n    command:\n      argv: {argv}\n"
+        "schemaVersion: 1\nenvironmentPassthrough: [RETRY_PHASE]\nsteps:\n  execute:\n    kind: cmd\n    command:\n      argv: {argv}\n"
     ))
 }
 

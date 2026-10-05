@@ -272,6 +272,7 @@ fn workflow_source(mode: ConsumerValueMode, attachment_splices: usize) -> String
     let named_attachments = "          - ref: inputs.evidence\n".repeat(attachment_splices);
     format!(
         r#"schemaVersion: 1
+environmentPassthrough: [VISIBLE]
 inputs:
   request:
     kind: text

@@ -19,8 +19,7 @@ use crate::workflow::git_artifact::{
 };
 use crate::workflow::resolution;
 
-const WORKFLOW: &str =
-    "schemaVersion: 1\nsteps:\n  inspect:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n";
+const WORKFLOW: &str = "schemaVersion: 1\nenvironmentPassthrough: [REAL_GIT, ARMED, MUTATED, BLOCKER]\nsteps:\n  inspect:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n";
 
 struct GitFixture {
     _temporary: tempfile::TempDir,

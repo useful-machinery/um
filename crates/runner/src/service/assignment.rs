@@ -6282,6 +6282,17 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
         fs::create_dir(&source).unwrap();
         fs::create_dir(&work).unwrap();
         fs::set_permissions(&work, fs::Permissions::from_mode(0o700)).unwrap();
+        // Fixture programs use named host inputs; declare them in the source that
+        // the runner actually admits instead of bypassing the environment policy.
+        let workflow = if workflow.contains("environmentPassthrough:") {
+            workflow.to_owned()
+        } else {
+            workflow.replacen(
+                "schemaVersion: 1\n",
+                "schemaVersion: 1\nenvironmentPassthrough: [WORKFLOW_ASSIGNMENT_COMMAND_FIXTURE_SOCKET, CLAUDE_CONFIG_DIR, CLAUDE_FIXTURE_FAIL, CODEX_HOME, CODEX_FIXTURE_HELPER, CODEX_FIXTURE_ARGUMENTS, CODEX_FIXTURE_REQUESTS, CODEX_FIXTURE_PROCESS, CODEX_FIXTURE_READY, CODEX_FIXTURE_PROCEED, CODEX_FIXTURE_DESCENDANT, CODEX_FIXTURE_SCENARIO, CODEX_FIXTURE_VERSION, CODEX_FIXTURE_RESPONSE]\n",
+                1,
+            )
+        };
         fs::write(source.join("workflow.yaml"), workflow).unwrap();
         fs::write(source.join("system.md"), "System.\n").unwrap();
         initialize_source_repository(&source);
@@ -8882,6 +8893,7 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
     #[tokio::test]
     async fn managed_workflow_environment_excludes_runner_credentials_and_helpers() {
         let workflow = r#"schemaVersion: 1
+environmentPassthrough: [RUNNER_VISIBLE]
 steps:
   check:
     kind: cmd
@@ -8889,12 +8901,13 @@ steps:
       argv:
         - sh
         - -c
-        - 'test "$RUNNER_VISIBLE" = retained && test -z "${GH_TOKEN+x}" && test -z "${GITHUB_TOKEN+x}" && test -z "${GIT_ASKPASS+x}" && test -z "${GIT_CONFIG_KEY_0+x}" && test -z "${GIT_CONFIG_VALUE_0+x}" && test -z "${GIT_SSH_COMMAND+x}" && test -z "${SSH_AUTH_SOCK+x}" && test -z "${SSH_AGENT_PID+x}" && test -z "${SCHERZO_SOURCE_TOKEN_FD+x}"'
+        - 'test "$RUNNER_VISIBLE" = retained && test -z "${RUNNER_HIDDEN+x}" && test -z "${GH_TOKEN+x}" && test -z "${GITHUB_TOKEN+x}" && test -z "${GIT_ASKPASS+x}" && test -z "${GIT_CONFIG_KEY_0+x}" && test -z "${GIT_CONFIG_VALUE_0+x}" && test -z "${GIT_SSH_COMMAND+x}" && test -z "${SSH_AUTH_SOCK+x}" && test -z "${SSH_AGENT_PID+x}" && test -z "${SCHERZO_SOURCE_TOKEN_FD+x}"'
 "#;
         let (_temporary, mut manager) = manager_fixture(workflow);
         let mut variables = manager.environment.variables().clone();
         for (name, value) in [
             ("RUNNER_VISIBLE", "retained"),
+            ("RUNNER_HIDDEN", "private"),
             ("GIT_ASKPASS", "/runner/private/askpass"),
             ("GIT_ASKPASS_REQUIRE", "force"),
             ("GIT_TERMINAL_PROMPT", "0"),
@@ -8943,6 +8956,7 @@ steps:
             Some(OsStr::new(&commit))
         );
         for name in [
+            "RUNNER_HIDDEN",
             "GIT_ASKPASS",
             "GIT_ASKPASS_REQUIRE",
             "GIT_TERMINAL_PROMPT",

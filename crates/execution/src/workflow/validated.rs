@@ -38,6 +38,7 @@ pub(crate) struct WorkflowNode {
 pub struct ValidatedWorkflow {
     pub(crate) schema_version: u8,
     pub(crate) description: Option<String>,
+    pub(crate) environment_passthrough: BTreeSet<String>,
     pub steps: BTreeMap<String, ValidatedStep>,
     pub recoveries: BTreeMap<String, Option<ValidatedStepRecovery>>,
     pub source_order: Vec<String>,

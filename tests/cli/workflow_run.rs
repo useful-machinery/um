@@ -195,6 +195,18 @@ impl RunBundle {
         ] {
             fs::create_dir(directory).unwrap();
         }
+        // The executable fixtures used by integration runs need explicit grants in
+        // the same source document submitted to the real CLI. Tests that supply
+        // their own passthrough contract keep it unchanged.
+        let source = if source.contains("environmentPassthrough:") {
+            source.to_owned()
+        } else {
+            source.replacen(
+                "schemaVersion: 1\n",
+                "schemaVersion: 1\nenvironmentPassthrough: [RETRY_PHASE, PHASE, RECOVERY_STATE, CLAUDE_CONFIG_DIR, ANTHROPIC_API_KEY, CODEX_HOME, CODEX_FIXTURE_HELPER, CODEX_LOCAL_SCENARIO, CODEX_LOCAL_READY, PI_CODING_AGENT_DIR, XDG_CONFIG_HOME, XDG_CACHE_HOME, XDG_DATA_HOME, XDG_STATE_HOME, PI_OFFLINE, PI_SKIP_VERSION_CHECK, PI_TELEMETRY, WORKFLOW_RUN_FIXTURE_SOCKET, WORKFLOW_RUN_FIXTURE_MODE, WORKFLOW_READY_FIFO, WORKFLOW_RELEASE_FIFO, WORKFLOW_HOLD_FIFO, CLAUDE_FIXTURE_PID, WORKFLOW_MARKER, RESULT_TARGET, ROOT_PATH, MOVED_ROOT, EXECUTION_MARKER, RUN_STATE, REMOVER_READY, REMOVER_RELEASE, SURVIVOR_PID, SURVIVOR_READY, SURVIVOR_RELEASE, LATE_SIDE_EFFECT, LEADER_FILE, GUARDIAN_FILE, DESCENDANT_FILE]\n",
+                1,
+            )
+        };
         fs::write(source_root.join(WORKFLOW_PATH), source).unwrap();
         Self {
             _temporary: temporary,
@@ -3539,31 +3551,31 @@ fn pinned_real_pi_runs_the_complete_mixed_value_and_export_dag() {
 }
 
 #[test]
-fn local_run_preserves_caller_github_environment_and_reserves_engine_prefix() {
-    let bundle = RunBundle::new(
-        r#"schemaVersion: 1
-steps:
-  authenticate:
-    kind: cmd
-    command:
-      argv:
-        - sh
-        - -c
-        - 'test "$GH_TOKEN" = local-gh-token && test "$GITHUB_TOKEN" = local-github-token && test -z "${SCHERZO_PRIVATE_SENTINEL+x}"'
-"#,
-    );
-    let output = isolated_command(&bundle.args(&bundle.result("environment")))
-        .env("GH_TOKEN", "local-gh-token")
-        .env("GITHUB_TOKEN", "local-github-token")
-        .env("SCHERZO_PRIVATE_SENTINEL", "must-not-reach-command")
-        .output()
-        .unwrap();
-
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+fn local_run_forwards_only_declared_host_environment() {
+    for (declaration, expected) in [
+        ("", "absent"),
+        ("environmentPassthrough: [WORKFLOW_VISIBLE]\n", "present"),
+    ] {
+        let bundle = RunBundle::new(&format!(
+            "schemaVersion: 1\n{declaration}steps:\n  authenticate:\n    kind: cmd\n    command:\n      argv: [sh, -c, 'test -z \"${{GH_TOKEN+x}}\" && test -z \"${{GITHUB_TOKEN+x}}\" && test -z \"${{SCHERZO_PRIVATE_SENTINEL+x}}\" && printf %s \"${{WORKFLOW_VISIBLE-absent}}\" > observed.txt']\n"
+        ));
+        let output = isolated_command(&bundle.args(&bundle.result("environment")))
+            .env("GH_TOKEN", "local-gh-token")
+            .env("GITHUB_TOKEN", "local-github-token")
+            .env("WORKFLOW_VISIBLE", "present")
+            .env("SCHERZO_PRIVATE_SENTINEL", "must-not-reach-command")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            fs::read_to_string(bundle.execution_root().join("observed.txt")).unwrap(),
+            expected
+        );
+    }
 }
 
 #[test]
@@ -5056,7 +5068,6 @@ fn owner_death_before_registration_or_continuation_never_executes_user_code() {
             b"-c".to_vec(),
             format!("touch {}", marker.display()).into_bytes(),
         ],
-        "environment": Vec::<(Vec<u8>, Vec<u8>)>::new(),
         "streamingStandardInput": false,
     });
     fs::write(

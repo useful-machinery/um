@@ -54,6 +54,7 @@ repository changes.
 | `schemaVersion` | yes | Integer `1`. |
 | `description` | no | Human metadata with no execution effect. |
 | `inputs` | no | Named Text, JSON, File, or attachments; optional JSON schema or exact File media type. |
+| `environmentPassthrough` | no | Unique host environment variable names explicitly forwarded to all steps, agents, and recovery handlers. |
 | `agentProfiles` | no | Workflow-local harness configurations. |
 | `steps` | yes | At least one ordinary `cmd` or `agent` node. |
 | `finalizers` | no | Nodes considered after the ordinary phase. |
@@ -63,6 +64,18 @@ Identifiers use lower camel case, contain 1 through 64 ASCII letters or digits, 
 match `^[a-z][A-Za-z0-9]*$`. Ordinary step and finalizer IDs share a namespace. V1
 rejects duplicate or non-string keys, anchors, aliases, merge keys, custom tags, and
 multiple YAML documents.
+
+Execution inherits only `PATH`, `HOME`, `USER`, `LOGNAME`, `LANG`, `LC_ALL`,
+`LC_CTYPE`, `TERM`, and `TMPDIR` from the launching process by default. Add
+other names at the workflow root, for example `environmentPassthrough: [MY_TOKEN]`.
+Names must be unique ASCII shell variable names (letter or underscore, then
+letters, digits, or underscores). Missing names remain unset. Engine-reserved
+`SCHERZO_*` and runner-private Git, SSH, and GitHub credential/helper names
+cannot be passed through. Runner source revision metadata is injected by the
+engine, not inherited from the host. Treat every declared name as available to
+all workflow code, including recovery. Guard and recovery scratch directories
+use `TMPDIR` when set (otherwise the system temporary directory); the guard's
+launch manifest never records environment values.
 
 Both ordinary node kinds may declare `failurePolicy`, `recovery`, `dependsOn`, `cwd`,
 and `outputs`. `failurePolicy` is `required` by default or may be `advisory`.

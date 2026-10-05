@@ -9,6 +9,7 @@ use super::condition::TerminalDisposition;
 pub(crate) struct WorkflowDocument {
     pub(crate) schema_version: u8,
     pub(crate) description: Option<String>,
+    pub(crate) environment_passthrough: BTreeSet<String>,
     pub(crate) inputs: BTreeMap<String, InputDeclaration>,
     pub(crate) agent_profiles: BTreeMap<String, AgentProfile>,
     pub(crate) steps: BTreeMap<String, StepDefinition>,

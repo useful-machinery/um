@@ -4349,6 +4349,12 @@ fn admit_fixture_with_inputs(
         temporary_root.read_dir().unwrap().count()
     ));
     fs::create_dir(&source_root).unwrap();
+    // Fixture processes need explicit passthrough in their workflow, just like production.
+    let source = source.replacen(
+        "schemaVersion: 1\n",
+        "schemaVersion: 1\nenvironmentPassthrough: [EXPLICIT_VALUE, WORKFLOW_FIXTURE_SOCKET, WORKFLOW_FIXTURE_EXIT_CODE, WORKFLOW_FIXTURE_MODE, WORKFLOW_FIXTURE_OUTPUT_BYTES, WORKFLOW_FIXTURE_ROLE]\n",
+        1,
+    );
     fs::write(source_root.join("workflow.yaml"), source).unwrap();
     admit_workflow(
         resolution::resolve(&source_root, Path::new("workflow.yaml")).unwrap(),

@@ -1,6 +1,8 @@
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
+#[cfg(target_os = "linux")]
+use std::os::fd::AsRawFd;
 use std::os::fd::OwnedFd;
 use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -54,31 +56,48 @@ const WORKER_POLL_INTERVAL: Duration = Duration::from_millis(5);
 const WORKER_BOUNDARY_TIMEOUT: Duration = MAXIMUM_CANCELLATION_GRACE;
 const MAXIMUM_MANIFEST_BYTES: u64 = 16 * 1024 * 1024;
 
+// Unix socket addresses have a much smaller limit than filesystem paths. Linux can
+// address the private staging directory through /proc/self/fd while bind/connect
+// runs, so a long TMPDIR does not consume the socket pathname budget. macOS does
+// not support traversing a directory through /dev/fd and uses the direct path.
+fn with_staging_socket<T>(
+    root: &Path,
+    name: &str,
+    operation: impl FnOnce(&Path) -> io::Result<T>,
+) -> io::Result<T> {
+    #[cfg(target_os = "linux")]
+    {
+        let directory = File::open(root)?;
+        let socket = PathBuf::from(format!("/proc/self/fd/{}/{name}", directory.as_raw_fd()));
+        operation(&socket)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        operation(&root.join(name))
+    }
+}
+
+fn create_guard_staging() -> io::Result<tempfile::TempDir> {
+    tempfile::Builder::new()
+        .prefix(TEMPORARY_DIRECTORY_PREFIX)
+        .tempdir_in(std::env::temp_dir())
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct LaunchManifest {
     program: Vec<u8>,
     arguments: Vec<Vec<u8>>,
-    environment: Vec<(Vec<u8>, Vec<u8>)>,
     streaming_standard_input: bool,
 }
 
 impl LaunchManifest {
-    fn new(
-        program: &Path,
-        arguments: &[OsString],
-        environment: &[(OsString, OsString)],
-        streaming_standard_input: bool,
-    ) -> Self {
+    fn new(program: &Path, arguments: &[OsString], streaming_standard_input: bool) -> Self {
         Self {
             program: program.as_os_str().as_bytes().to_vec(),
             arguments: arguments
                 .iter()
                 .map(|argument| argument.as_bytes().to_vec())
-                .collect(),
-            environment: environment
-                .iter()
-                .map(|(name, value)| (name.as_bytes().to_vec(), value.as_bytes().to_vec()))
                 .collect(),
             streaming_standard_input,
         }
@@ -90,13 +109,6 @@ impl LaunchManifest {
 
     fn arguments(&self) -> impl Iterator<Item = OsString> + '_ {
         self.arguments.iter().cloned().map(OsString::from_vec)
-    }
-
-    fn environment(&self) -> impl Iterator<Item = (OsString, OsString)> + '_ {
-        self.environment
-            .iter()
-            .cloned()
-            .map(|(name, value)| (OsString::from_vec(name), OsString::from_vec(value)))
     }
 }
 
@@ -190,15 +202,16 @@ impl StoppedChildGuard {
             ));
         }
         enable_child_subreaper()?;
-        let staging = tempfile::Builder::new()
-            .prefix(TEMPORARY_DIRECTORY_PREFIX)
-            .tempdir_in("/tmp")?;
+        let staging = create_guard_staging()?;
         let activity_lease = create_activity_lease(staging.path())?;
         let standard_input_listener = streaming_standard_input
-            .then(|| UnixListener::bind(staging.path().join(STANDARD_INPUT_SOCKET)))
+            .then(|| {
+                with_staging_socket(staging.path(), STANDARD_INPUT_SOCKET, |socket| {
+                    UnixListener::bind(socket)
+                })
+            })
             .transpose()?;
-        let manifest =
-            LaunchManifest::new(program, arguments, environment, streaming_standard_input);
+        let manifest = LaunchManifest::new(program, arguments, streaming_standard_input);
         let manifest_bytes = serde_json::to_vec(&manifest).map_err(io::Error::other)?;
         fs::write(staging.path().join(MANIFEST_FILE), manifest_bytes)?;
 
@@ -550,14 +563,15 @@ pub fn run_internal_worker() -> ExecutionOutcome {
 
 fn run_guard_worker() -> Result<(), ()> {
     let root = internal_root()?;
-    let manifest = read_manifest(&root)?;
+    read_manifest(&root)?;
     enable_child_subreaper().map_err(|_| ())?;
     let executable = crate::process::internal_worker_executable().map_err(|_| ())?;
-    let exec_boundary = UnixListener::bind(root.join(EXEC_BOUNDARY_SOCKET)).map_err(|_| ())?;
+    let exec_boundary = with_staging_socket(&root, EXEC_BOUNDARY_SOCKET, |socket| {
+        UnixListener::bind(socket)
+    })
+    .map_err(|_| ())?;
     let mut leader = std::process::Command::new(executable);
     leader
-        .env_clear()
-        .envs(manifest.environment())
         .env(INTERNAL_WORKER_ENVIRONMENT, LEADER_WORKER)
         .env(INTERNAL_ROOT_ENVIRONMENT, &root)
         .env(
@@ -763,10 +777,17 @@ fn run_leader_worker() -> Result<(), ()> {
         return Err(());
     }
     install_parent_death_protection()?;
-    let mut exec_boundary = UnixStream::connect(root.join(EXEC_BOUNDARY_SOCKET)).map_err(|_| ())?;
+    let mut exec_boundary = with_staging_socket(&root, EXEC_BOUNDARY_SOCKET, |socket| {
+        UnixStream::connect(socket)
+    })
+    .map_err(|_| ())?;
     let standard_input = manifest
         .streaming_standard_input
-        .then(|| UnixStream::connect(root.join(STANDARD_INPUT_SOCKET)))
+        .then(|| {
+            with_staging_socket(&root, STANDARD_INPUT_SOCKET, |socket| {
+                UnixStream::connect(socket)
+            })
+        })
         .transpose()
         .map_err(|_| ())?;
     if getppid() != Some(expected_parent)
@@ -782,8 +803,9 @@ fn run_leader_worker() -> Result<(), ()> {
     let mut command = std::process::Command::new(manifest.program());
     command
         .args(manifest.arguments())
-        .env_clear()
-        .envs(manifest.environment())
+        .env_remove(INTERNAL_WORKER_ENVIRONMENT)
+        .env_remove(INTERNAL_ROOT_ENVIRONMENT)
+        .env_remove(INTERNAL_PARENT_ENVIRONMENT)
         .stdin(standard_input.map_or_else(Stdio::null, |standard_input| {
             Stdio::from(OwnedFd::from(standard_input))
         }));
@@ -1145,7 +1167,6 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), ()> {
 
 #[cfg(test)]
 mod tests {
-    #[cfg(target_os = "linux")]
     use std::process::Command as StdCommand;
 
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
@@ -1177,6 +1198,48 @@ mod tests {
         fn observe(&self, _identity: &AuthenticatedProcessGroup) -> ProcessIdentityObservation {
             ProcessIdentityObservation::Unavailable
         }
+    }
+
+    #[test]
+    #[ignore = "run only in a child process with an isolated TMPDIR"]
+    fn guard_tmpdir_fixture() {
+        let root = PathBuf::from(std::env::var_os("TEST_TMPDIR_ROOT").unwrap());
+        let staging = create_guard_staging().unwrap();
+        assert!(staging.path().starts_with(root));
+        let _standard_input =
+            with_staging_socket(staging.path(), STANDARD_INPUT_SOCKET, |socket| {
+                UnixListener::bind(socket)
+            })
+            .unwrap();
+        let _exec_boundary = with_staging_socket(staging.path(), EXEC_BOUNDARY_SOCKET, |socket| {
+            UnixListener::bind(socket)
+        })
+        .unwrap();
+        assert!(staging.path().join(STANDARD_INPUT_SOCKET).exists());
+        assert!(staging.path().join(EXEC_BOUNDARY_SOCKET).exists());
+    }
+
+    #[test]
+    fn guard_staging_uses_tmpdir() {
+        let temporary = tempfile::tempdir_in("/tmp").unwrap();
+        #[cfg(target_os = "linux")]
+        let root = temporary.path().join("long-directory-component-".repeat(5));
+        #[cfg(not(target_os = "linux"))]
+        let root = temporary.path().join("isolated");
+        fs::create_dir(&root).unwrap();
+        #[cfg(target_os = "linux")]
+        assert!(root.join(TEMPORARY_DIRECTORY_PREFIX).as_os_str().len() > 108);
+        let status = StdCommand::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "workflow::child_guard::tests::guard_tmpdir_fixture",
+                "--ignored",
+            ])
+            .env("TMPDIR", &root)
+            .env("TEST_TMPDIR_ROOT", &root)
+            .status()
+            .unwrap();
+        assert!(status.success());
     }
 
     #[test]
@@ -1242,11 +1305,24 @@ mod tests {
         let (mut child, mut standard_input) = StoppedChildGuard::spawn_with_stdin_cancellable(
             Path::new("/bin/sh"),
             &arguments,
-            &[],
+            &[(
+                OsString::from("TEST_SENTINEL"),
+                OsString::from("private-sentinel"),
+            )],
             &cancellation,
             |_| Ok(()),
         )
         .unwrap();
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&fs::read(child.staging.path().join(MANIFEST_FILE)).unwrap())
+                .unwrap();
+        assert!(manifest.get("environment").is_none());
+        assert!(
+            !fs::read(child.staging.path().join(MANIFEST_FILE))
+                .unwrap()
+                .windows(b"private-sentinel".len())
+                .any(|bytes| bytes == b"private-sentinel")
+        );
         let mut standard_output = child.take_stdout().unwrap();
         child.continue_execution_cancellable(&cancellation).unwrap();
 

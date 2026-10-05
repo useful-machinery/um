@@ -142,6 +142,34 @@ fn media_type_parameters_use_horizontal_separators_and_control_free_unicode_valu
 }
 
 #[test]
+fn environment_passthrough_rejects_reserved_invalid_and_duplicate_names() {
+    for names in [
+        "[SCHERZO_INTERNAL_CHILD_GUARD_WORKER]",
+        "[GH_TOKEN]",
+        "[GIT_CONFIG_KEY_0]",
+        "[SSH_AUTH_SOCK]",
+        "[BAD-NAME]",
+        "[VISIBLE, VISIBLE]",
+    ] {
+        let source = format!(
+            "schemaVersion: 1\nenvironmentPassthrough: {names}\nsteps:\n  check:\n    kind: cmd\n    command:\n      argv: [/bin/true]\n"
+        );
+        assert_eq!(
+            decode(source.as_bytes()).unwrap_err().kind(),
+            DecodeFailureKind::StructuralContract,
+            "accepted {names}"
+        );
+    }
+    let source = b"schemaVersion: 1\nenvironmentPassthrough: [VISIBLE]\nsteps:\n  check:\n    kind: cmd\n    command:\n      argv: [/bin/true]\n";
+    assert!(
+        decode(source)
+            .unwrap()
+            .environment_passthrough
+            .contains("VISIBLE")
+    );
+}
+
+#[test]
 fn canonical_workflow_decodes_into_the_complete_execution_document() {
     let workflow = decode(&canonical_valid_fixture()).unwrap();
 

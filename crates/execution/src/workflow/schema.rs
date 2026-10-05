@@ -17,6 +17,12 @@ pub(super) struct WorkflowDto {
     #[serde(rename = "schemaVersion")]
     schema_version: u8,
     description: Option<String>,
+    #[serde(
+        rename = "environmentPassthrough",
+        default,
+        deserialize_with = "deserialize_environment_passthrough"
+    )]
+    environment_passthrough: BTreeSet<String>,
     #[serde(default)]
     inputs: BTreeMap<String, InputDeclarationDto>,
     #[serde(rename = "agentProfiles", default)]
@@ -340,6 +346,33 @@ struct ReferenceDto {
     reference: String,
 }
 
+fn deserialize_environment_passthrough<'de, D>(
+    deserializer: D,
+) -> Result<BTreeSet<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let names = Vec::<String>::deserialize(deserializer)?;
+    let mut allowed = BTreeSet::new();
+    for name in names {
+        let mut bytes = name.bytes();
+        if !bytes
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == b'_')
+            || !bytes.all(|c| c.is_ascii_alphanumeric() || c == b'_')
+            || super::admission::is_managed_runner_private_environment_name(std::ffi::OsStr::new(
+                &name,
+            ))
+            || !allowed.insert(name.clone())
+        {
+            return Err(serde::de::Error::custom(
+                "invalid or duplicate environment passthrough name",
+            ));
+        }
+    }
+    Ok(allowed)
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ExportDto {
@@ -453,6 +486,7 @@ impl WorkflowDto {
         Some(WorkflowDocument {
             schema_version: self.schema_version,
             description: self.description,
+            environment_passthrough: self.environment_passthrough,
             inputs,
             agent_profiles,
             steps,

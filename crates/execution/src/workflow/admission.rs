@@ -713,8 +713,12 @@ impl EnvironmentSnapshot {
         }
     }
 
-    fn without_engine_reserved_variables(&self) -> Self {
-        self.without_variables_matching(is_engine_reserved_environment_name)
+    fn for_workflow_children(&self, passthrough: &BTreeSet<String>) -> Self {
+        self.without_variables_matching(|name| {
+            is_managed_runner_private_environment_name(name)
+                || !(is_base_workflow_environment_name(name)
+                    || name.to_str().is_some_and(|name| passthrough.contains(name)))
+        })
     }
 
     pub fn without_managed_runner_credentials_and_helpers(&self) -> Self {
@@ -734,11 +738,26 @@ impl EnvironmentSnapshot {
     }
 }
 
+fn is_base_workflow_environment_name(name: &OsStr) -> bool {
+    matches!(
+        name.as_encoded_bytes(),
+        b"PATH"
+            | b"HOME"
+            | b"USER"
+            | b"LOGNAME"
+            | b"LANG"
+            | b"LC_ALL"
+            | b"LC_CTYPE"
+            | b"TERM"
+            | b"TMPDIR"
+    )
+}
+
 fn is_engine_reserved_environment_name(name: &OsStr) -> bool {
     name.as_encoded_bytes().starts_with(b"SCHERZO_")
 }
 
-fn is_managed_runner_private_environment_name(name: &OsStr) -> bool {
+pub(super) fn is_managed_runner_private_environment_name(name: &OsStr) -> bool {
     if is_engine_reserved_environment_name(name) {
         return true;
     }
@@ -1730,7 +1749,9 @@ fn admit_workflow_for(
     }
 
     let root = canonical_execution_root(&context.root)?;
-    let mut environment = context.environment.without_engine_reserved_variables();
+    let mut environment = context
+        .environment
+        .for_workflow_children(&workflow.definition.environment_passthrough);
     if let Some(source_revision) = context.source_revision {
         environment = environment
             .with_variable(

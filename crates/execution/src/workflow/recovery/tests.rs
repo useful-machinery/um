@@ -19,6 +19,34 @@ use crate::workflow::runtime::{
     TransitionSequence,
 };
 
+#[test]
+#[ignore = "run only in a child process with an isolated TMPDIR"]
+fn recovery_tmpdir_fixture() {
+    let root = std::path::PathBuf::from(std::env::var_os("TEST_TMPDIR_ROOT").unwrap())
+        .canonicalize()
+        .unwrap();
+    let execution = root.join("execution");
+    fs::create_dir(&execution).unwrap();
+    let staging = RecoveryStaging::create(&execution).unwrap();
+    assert!(staging.inner.path.starts_with(&root));
+}
+
+#[test]
+fn recovery_staging_uses_tmpdir() {
+    let root = tempfile::tempdir().unwrap();
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "workflow::recovery::tests::recovery_tmpdir_fixture",
+            "--ignored",
+        ])
+        .env("TMPDIR", root.path())
+        .env("TEST_TMPDIR_ROOT", root.path())
+        .status()
+        .unwrap();
+    assert!(status.success());
+}
+
 fn valid_decision() -> Vec<u8> {
     br#"{"schemaVersion":1,"decision":"recheck","summary":"repaired","reason":"verify unchanged"}"#
         .to_vec()

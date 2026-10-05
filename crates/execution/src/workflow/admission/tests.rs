@@ -1627,9 +1627,11 @@ fn cloud_source_revision_replaces_inherited_reserved_values_while_local_has_none
 }
 
 #[test]
-fn workflow_admission_reserves_only_engine_environment_variables() {
+fn workflow_admission_only_forwards_base_and_explicit_safe_names() {
     let environment = EnvironmentSnapshot::new([
         ("PATH", "/bin"),
+        ("VISIBLE", "exact"),
+        ("HIDDEN", "private"),
         ("GIT_ASKPASS", "/local/askpass"),
         ("GIT_CONFIG_COUNT", "1"),
         ("GIT_CONFIG_KEY_0", "credential.helper"),
@@ -1640,29 +1642,28 @@ fn workflow_admission_reserves_only_engine_environment_variables() {
         ("SCHERZO_SOURCE_TOKEN_FD", "9"),
     ]);
 
-    let filtered = environment.without_engine_reserved_variables();
-
-    for (name, value) in [
-        ("PATH", "/bin"),
-        ("GIT_ASKPASS", "/local/askpass"),
-        ("GIT_CONFIG_COUNT", "1"),
-        ("GIT_CONFIG_KEY_0", "credential.helper"),
-        ("GIT_CONFIG_VALUE_0", "/local/helper"),
-        ("GIT_SSH_COMMAND", "local-ssh"),
-        ("GH_TOKEN", "local-gh-token"),
-        ("GITHUB_TOKEN", "local-github-token"),
-    ] {
-        assert_eq!(
-            filtered.variable(OsStr::new(name)),
-            Some(OsStr::new(value)),
-            "{name}"
-        );
-    }
-    assert!(
-        filtered
-            .variable(OsStr::new("SCHERZO_SOURCE_TOKEN_FD"))
-            .is_none()
+    let filtered = environment.for_workflow_children(&["VISIBLE".to_owned()].into());
+    assert_eq!(
+        filtered.variable(OsStr::new("PATH")),
+        Some(OsStr::new("/bin"))
     );
+    assert_eq!(
+        filtered.variable(OsStr::new("VISIBLE")),
+        Some(OsStr::new("exact"))
+    );
+    for name in [
+        "HIDDEN",
+        "GIT_ASKPASS",
+        "GIT_CONFIG_COUNT",
+        "GIT_CONFIG_KEY_0",
+        "GIT_CONFIG_VALUE_0",
+        "GIT_SSH_COMMAND",
+        "GH_TOKEN",
+        "GITHUB_TOKEN",
+        "SCHERZO_SOURCE_TOKEN_FD",
+    ] {
+        assert!(filtered.variable(OsStr::new(name)).is_none(), "{name}");
+    }
 }
 
 fn execution_context(

@@ -237,6 +237,7 @@ pub(crate) fn validate(document: WorkflowDocument) -> Result<ValidatedWorkflow, 
     Ok(ValidatedWorkflow {
         schema_version: document.schema_version,
         description: document.description,
+        environment_passthrough: document.environment_passthrough,
         steps,
         recoveries,
         source_order: document.step_order,

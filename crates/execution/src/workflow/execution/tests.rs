@@ -350,6 +350,45 @@ fn execution_fixture_with_source_files(
 }
 
 #[tokio::test]
+async fn command_environment_requires_declared_passthrough() {
+    for (declaration, expected) in [
+        ("", b"unset".as_slice()),
+        (
+            "environmentPassthrough: [TEST_SENTINEL]\n",
+            b"present".as_slice(),
+        ),
+    ] {
+        let source = format!(
+            "schemaVersion: 1\n{declaration}steps:\n  check:\n    kind: cmd\n    command:\n      argv: [/bin/sh, -c, 'printf %s \"${{TEST_SENTINEL-unset}}\" > observed.txt']\n"
+        );
+        let fixture = execution_fixture(
+            &source,
+            ResolvedInputs::default(),
+            EnvironmentSnapshot::new([("PATH", "/bin:/usr/bin"), ("TEST_SENTINEL", "present")]),
+            CancellationSource::new(),
+            1,
+            1024,
+        );
+        let result = execute_workflow(
+            fixture.admitted,
+            &fixture.artifacts,
+            &fixture.inputs,
+            &StepDiagnosticLog::default(),
+            AgentExecution::disabled(),
+            TestClock,
+            NoopExecutionObserver,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.outcome, RunOutcome::Succeeded);
+        assert_eq!(
+            fs::read(fixture.execution_root.join("observed.txt")).unwrap(),
+            expected
+        );
+    }
+}
+
+#[tokio::test]
 async fn source_neutral_command_handler_repairs_and_rechecks_with_private_authority() {
     with_watchdog(async {
         let source = r#"schemaVersion: 1
@@ -785,7 +824,7 @@ async fn command_finalizer_receives_the_engine_context_after_ordinary_quiescence
         let executable = env::current_exe().unwrap();
         let fixture_args = fixture_arguments();
         let source = format!(
-            "schemaVersion: 1\nsteps:\n  work:\n    kind: cmd\n    command:\n      argv: {}\nfinalizers:\n  release:\n    kind: cmd\n    inputs:\n      context: {{ ref: finalization.context }}\n    command:\n      argv: {}\n",
+            "schemaVersion: 1\nenvironmentPassthrough: [WORKFLOW_FIXTURE_SOCKET]\nsteps:\n  work:\n    kind: cmd\n    command:\n      argv: {}\nfinalizers:\n  release:\n    kind: cmd\n    inputs:\n      context: {{ ref: finalization.context }}\n    command:\n      argv: {}\n",
             command_argv(
                 &fixture_script(0, "work", false),
                 &executable,
@@ -977,7 +1016,7 @@ async fn failure_stops_new_work_but_retains_the_successful_sibling_output() {
         let sibling_script = fixture_script(0, "sibling", true);
         let queued_script = fixture_script(0, "queued", false);
         let source = format!(
-            "schemaVersion: 1\nsteps:\n  aFail:\n    kind: cmd\n    command:\n      argv: {}\n  bSibling:\n    kind: cmd\n    command:\n      argv: {}\n    outputs:\n      retained:\n        kind: file\n        from: path\n        path: retained.txt\n        mediaType: text/plain\n  cFailChild:\n    kind: cmd\n    dependsOn: [aFail]\n    command:\n      argv: {}\n  zQueued:\n    kind: cmd\n    command:\n      argv: {}\n  zzQueuedChild:\n    kind: cmd\n    dependsOn: [zQueued]\n    command:\n      argv: {}\nexports:\n  retained:\n    ref: outputs.bSibling.retained\n",
+            "schemaVersion: 1\nenvironmentPassthrough: [WORKFLOW_FIXTURE_SOCKET]\nsteps:\n  aFail:\n    kind: cmd\n    command:\n      argv: {}\n  bSibling:\n    kind: cmd\n    command:\n      argv: {}\n    outputs:\n      retained:\n        kind: file\n        from: path\n        path: retained.txt\n        mediaType: text/plain\n  cFailChild:\n    kind: cmd\n    dependsOn: [aFail]\n    command:\n      argv: {}\n  zQueued:\n    kind: cmd\n    command:\n      argv: {}\n  zzQueuedChild:\n    kind: cmd\n    dependsOn: [zQueued]\n    command:\n      argv: {}\nexports:\n  retained:\n    ref: outputs.bSibling.retained\n",
             command_argv(&fail_script, &executable, &fixture_args),
             command_argv(&sibling_script, &executable, &fixture_args),
             command_argv(&queued_script, &executable, &fixture_args),
@@ -1066,7 +1105,7 @@ async fn controlled_cancellation_orders_events_and_waits_for_terminal_delivery()
         let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         let cancellation = CancellationSource::new();
         let source = format!(
-            "schemaVersion: 1\nsteps:\n  active:\n    kind: cmd\n    command:\n      argv: {}\n  pending:\n    kind: cmd\n    dependsOn: [active]\n    command:\n      argv: {}\n",
+            "schemaVersion: 1\nenvironmentPassthrough: [WORKFLOW_FIXTURE_SOCKET, WORKFLOW_FIXTURE_EXIT_CODE, WORKFLOW_FIXTURE_MODE, WORKFLOW_FIXTURE_OUTPUT_BYTES, WORKFLOW_FIXTURE_ROLE]\nsteps:\n  active:\n    kind: cmd\n    command:\n      argv: {}\n  pending:\n    kind: cmd\n    dependsOn: [active]\n    command:\n      argv: {}\n",
             serde_json::to_string(&std::iter::once(env::current_exe().unwrap().to_string_lossy().into_owned()).chain(fixture_arguments()).collect::<Vec<_>>()).unwrap(),
             serde_json::to_string(&["true"]).unwrap(),
         );

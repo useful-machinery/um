@@ -365,7 +365,7 @@ impl RecoveryStaging {
     pub(crate) fn create(execution_root: &Path) -> Result<Self, RecoveryHandlerFailure> {
         let temporary = tempfile::Builder::new()
             .prefix("scherzo-recovery-v1-")
-            .tempdir_in("/tmp")
+            .tempdir_in(std::env::temp_dir())
             .map_err(|_| RecoveryHandlerFailure::ContextUnavailable)?;
         std::fs::set_permissions(temporary.path(), Permissions::from_mode(0o700))
             .map_err(|_| RecoveryHandlerFailure::ContextUnavailable)?;

@@ -57,7 +57,7 @@ fn embedded_reference_is_emitted_unchanged_without_external_state() {
 
     let markdown = std::str::from_utf8(&output.stdout).expect("reference should be UTF-8 Markdown");
     assert!(
-        markdown.len() <= 16 * 1024,
+        markdown.len() <= 18 * 1024,
         "reference should remain concise"
     );
     assert_sections_are_ordered(
