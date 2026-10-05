@@ -2660,6 +2660,12 @@ async fn stubborn_descendant_is_forced_at_the_injected_deadline_before_terminal_
             STUBBORN_DESCENDANT_PI,
         )
         .unwrap();
+        let cwd = fixture.invocation.process().cwd().to_str().unwrap();
+        fs::write(
+            &fixture.phase_transcript,
+            CancellationPhase::Model.transcript(cwd),
+        )
+        .unwrap();
         let interrupted = SignalFifo::create(&fixture.standard_input);
         let cancellation = fixture.invocation.cancellation().clone();
         let process_control = fixture.invocation.process_control().clone();
@@ -2673,7 +2679,7 @@ async fn stubborn_descendant_is_forced_at_the_injected_deadline_before_terminal_
         };
         let mut cleanup = DetachedFixtureCleanup::new(&fixture.process, &fixture.descendant);
         cleanup.reaper = Some(fixture.process.parent().unwrap().join("reaper"));
-        let (mut task, _started, terminal) =
+        let (mut task, started, terminal) =
             start_invocation(fixture.invocation, diagnostics.clone());
 
         // A failed launch can never signal descendant readiness. Report its
@@ -2689,6 +2695,10 @@ async fn stubborn_descendant_is_forced_at_the_injected_deadline_before_terminal_
         // Let the reaper reach its wait for the descendant's exit.
         read_signal(fixture.process.parent().unwrap().join("group-detached")).await;
         read_signal(fixture.ready).await;
+        // The child can signal readiness while the guarded launch is still
+        // being registered. A native start acknowledgment proves the process
+        // supervisor is running before we request cancellation.
+        started.receive().await.unwrap();
         let process = process_id(&fs::read(&fixture.process).unwrap());
         let descendant = process_id(&fs::read(&fixture.descendant).unwrap());
         assert_eq!(getpgid(Some(process)).unwrap(), process);
@@ -2795,6 +2805,11 @@ fn stubborn_process_fixture() {
     let _reaper = spawn_process_fixture(
         "workflow::pi_json_v1::adapter_tests::stubborn_descendant_reaper_process_fixture",
     );
+    let mut protocol = process_fixture_output(3);
+    protocol
+        .write_all(&fs::read(std::env::var_os("PI_FIXTURE_PHASE_TRANSCRIPT").unwrap()).unwrap())
+        .unwrap();
+    protocol.flush().unwrap();
     let _diagnostic = signal_pi_process_fixture_ready();
 
     interrupted.recv().unwrap();
