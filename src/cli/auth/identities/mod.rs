@@ -201,6 +201,7 @@ where
         Ok(BoundRequiredOperation::Completed {
             result,
             credential_state,
+            ..
         }) => result
             .map(|outcome| BoundHumanSession::Outcome {
                 outcome,

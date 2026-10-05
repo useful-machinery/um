@@ -1,5 +1,7 @@
 use super::*;
 
+#[path = "project/trigger.rs"]
+mod trigger;
 #[path = "project/webhook.rs"]
 mod webhook;
 

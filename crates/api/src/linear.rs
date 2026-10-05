@@ -12,6 +12,8 @@ use super::{HttpTransportPolicy, UnreachableCategory, classify_reqwest_error, pr
 pub type LinearSession = models::LinearAuthorizationSession;
 pub type LinearConnection = models::LinearConnection;
 pub type LinearConnectionList = models::LinearConnectionList;
+pub type LinearEvaluation = models::LinearEvaluation;
+pub type LinearEvaluationState = models::linear_evaluation::State;
 pub type LinearSessionStatus = models::linear_authorization_session::Status;
 
 pub struct LinearApi {
@@ -113,42 +115,9 @@ impl LinearApi {
         if let Some(token) = &self.configuration.bearer_access_token {
             request = request.bearer_auth(token);
         }
-        let response = request.send().map_err(|error| LinearFailure::Unreachable {
-            category: classify_reqwest_error(&error),
-        })?;
-        let status = response.status();
-        let media_type = response
-            .headers()
-            .get(reqwest::header::CONTENT_TYPE)
-            .map(http_util::media_type)
-            .transpose()
-            .map_err(|_| invalid())?;
-        let retry_after = response
-            .headers()
-            .get("Retry-After")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.parse::<u64>().ok());
-        let body =
-            http_util::read_bounded_blocking_body(response).map_err(|error| match error {
-                BoundedBodyError::TooLarge => LinearFailure::InvalidResponse {
-                    credential_rejected: status == StatusCode::UNAUTHORIZED,
-                },
-                BoundedBodyError::Transport(error) => LinearFailure::Unreachable {
-                    category: classify_reqwest_error(&error),
-                },
-            })?;
-        if status == StatusCode::OK {
-            if media_type.as_deref() != Some(problem::JSON_MEDIA_TYPE) {
-                return Err(invalid());
-            }
-            let session =
-                serde_json::from_slice(&body).map_err(|_| LinearFailure::InvalidResponse {
-                    credential_rejected: false,
-                })?;
-            validate_session(session, organization, Some(id))
-        } else {
-            Err(classify_response(status, &body, retry_after))
-        }
+        let body = receive_json_response(request, StatusCode::OK)?;
+        let session = serde_json::from_slice(&body).map_err(|_| invalid())?;
+        validate_session(session, organization, Some(id))
     }
 
     pub fn connection(
@@ -184,6 +153,77 @@ impl LinearApi {
         Ok(page)
     }
 
+    pub fn evaluation(
+        &self,
+        organization: &str,
+        project: &str,
+        trigger: &str,
+        id: &str,
+    ) -> Result<LinearEvaluation, LinearFailure> {
+        self.request_evaluation(
+            reqwest::Method::GET,
+            organization,
+            project,
+            trigger,
+            id,
+            None,
+        )
+        .and_then(|evaluation| validate_evaluation(evaluation, trigger, id, None))
+    }
+
+    pub fn retry_evaluation(
+        &self,
+        organization: &str,
+        project: &str,
+        trigger: &str,
+        id: &str,
+        key: &str,
+    ) -> Result<LinearEvaluation, LinearFailure> {
+        self.request_evaluation(
+            reqwest::Method::POST,
+            organization,
+            project,
+            trigger,
+            id,
+            Some(key),
+        )
+        .and_then(|evaluation| validate_evaluation(evaluation, trigger, id, Some(2)))
+    }
+
+    // The generated client drops error headers. Keep its model while reading
+    // Retry-After and bounding both success and problem bodies here.
+    fn request_evaluation(
+        &self,
+        method: reqwest::Method,
+        organization: &str,
+        project: &str,
+        trigger: &str,
+        id: &str,
+        key: Option<&str>,
+    ) -> Result<LinearEvaluation, LinearFailure> {
+        let suffix = if key.is_some() { "/retry" } else { "" };
+        let endpoint = format!(
+            "{}/v1/organizations/{}/projects/{}/triggers/{}/evaluations/{}{}",
+            self.configuration.base_path.trim_end_matches('/'),
+            apis::urlencode(organization),
+            apis::urlencode(project),
+            apis::urlencode(trigger),
+            apis::urlencode(id),
+            suffix
+        );
+        let expected_status = if key.is_some() {
+            StatusCode::ACCEPTED
+        } else {
+            StatusCode::OK
+        };
+        let mut request = super::generated_api_request(&self.configuration, method, &endpoint);
+        if let Some(key) = key {
+            request = request.header("Idempotency-Key", key);
+        }
+        let body = receive_json_response(request, expected_status)?;
+        serde_json::from_slice(&body).map_err(|_| invalid())
+    }
+
     pub fn disconnect(
         &self,
         organization: &str,
@@ -215,6 +255,60 @@ impl Drop for LinearApi {
     fn drop(&mut self) {
         zeroize_generated_bearer_access_token(&mut self.configuration);
     }
+}
+
+fn receive_json_response(
+    request: reqwest::blocking::RequestBuilder,
+    expected_status: StatusCode,
+) -> Result<Vec<u8>, LinearFailure> {
+    let response = request.send().map_err(|error| LinearFailure::Unreachable {
+        category: classify_reqwest_error(&error),
+    })?;
+    let status = response.status();
+    let media_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .map(http_util::media_type)
+        .transpose()
+        .map_err(|_| invalid())?;
+    let retry_after = response
+        .headers()
+        .get("Retry-After")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok());
+    let body = http_util::read_bounded_blocking_body(response).map_err(|error| match error {
+        BoundedBodyError::TooLarge => LinearFailure::InvalidResponse {
+            credential_rejected: status == StatusCode::UNAUTHORIZED,
+        },
+        BoundedBodyError::Transport(error) => LinearFailure::Unreachable {
+            category: classify_reqwest_error(&error),
+        },
+    })?;
+    if status != expected_status {
+        return Err(classify_response(status, &body, retry_after));
+    }
+    if media_type.as_deref() != Some(problem::JSON_MEDIA_TYPE) {
+        return Err(invalid());
+    }
+    Ok(body)
+}
+
+fn validate_evaluation(
+    evaluation: LinearEvaluation,
+    trigger: &str,
+    id: &str,
+    minimum_cycle: Option<i32>,
+) -> Result<LinearEvaluation, LinearFailure> {
+    if evaluation.id != id
+        || evaluation.trigger_id != trigger
+        || evaluation.cycle_number < minimum_cycle.unwrap_or(1)
+        || evaluation.accepted_at.is_empty()
+        || evaluation.grant_id.is_empty()
+        || (evaluation.state == LinearEvaluationState::RunCreated) != evaluation.run_id.is_some()
+    {
+        return Err(invalid());
+    }
+    Ok(evaluation)
 }
 
 fn invalid() -> LinearFailure {

@@ -1137,6 +1137,25 @@ identity because the API defines exact replay; setup initiation and reads make o
 request attempt. A later completion retry must reuse the same setup session and provider
 installation ID.
 
+## Linear evaluation recovery
+
+An organization owner can start a new cycle for a failed evaluation while its
+original 30-day history remains available. The cycle uses the original event,
+connection, configuration and grant, and reads current Linear state again. It
+does not retry an already created run or revive a stopped evaluation.
+
+```sh
+um project trigger evaluation retry ORG PROJECT TRIGGER EVALUATION --timeout 5m --json
+```
+
+The command prints the request key in JSON results, including an unknown
+acceptance or interrupted observation. To recover after a process restart,
+repeat the same command as the same owner with `--idempotency-key KEY`; do not
+start with a new key until you have shown the evaluation. A timed-out or
+interrupted observation does not cancel a cycle. A result reports the final
+run, nonmatch, overlap, stopped, or failed state and its safe reason code;
+unknown acceptance never claims a run was created.
+
 ## Linear connections
 
 An active organization owner can connect a Linear workspace without supplying a Linear

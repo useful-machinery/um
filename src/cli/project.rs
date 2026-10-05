@@ -1,4 +1,5 @@
 mod output;
+mod trigger;
 mod webhook;
 
 use anyhow::{Context, anyhow};
@@ -35,6 +36,8 @@ enum ProjectCommand {
     RunnerPool(RunnerPoolCommand),
     #[command(about = "Show a project")]
     Show(ShowCommand),
+    #[command(about = "Manage a project's Linear triggers")]
+    Trigger(trigger::Command),
     #[command(about = "Manage a project's signed webhooks")]
     Webhook(webhook::Command),
 }
@@ -252,6 +255,7 @@ impl Command {
             ProjectCommand::Rename(command) => execute_leaf(command, RenameCommand::execute),
             ProjectCommand::Repository(command) => command.execute(),
             ProjectCommand::RunnerPool(command) => command.execute(),
+            ProjectCommand::Trigger(command) => command.execute(),
             ProjectCommand::Webhook(command) => command.execute(),
         }
     }

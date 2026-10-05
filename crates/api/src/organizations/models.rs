@@ -181,6 +181,7 @@ pub enum OrganizationAuditSubjectKind {
     GithubInstallation,
     LinearAuthorizationSession,
     LinearConnection,
+    LinearEvaluation,
     Project,
     WebhookSubscription,
     WebhookDelivery,
@@ -952,6 +953,7 @@ impl TryFrom<models::OrganizationAuditSubject> for OrganizationAuditSubject {
                 "las_",
             ),
             Kind::LinearConnection => (OrganizationAuditSubjectKind::LinearConnection, "lcn_"),
+            Kind::LinearEvaluation => (OrganizationAuditSubjectKind::LinearEvaluation, "tev_"),
             Kind::Project => (OrganizationAuditSubjectKind::Project, "prj_"),
             Kind::WebhookSubscription => {
                 (OrganizationAuditSubjectKind::WebhookSubscription, "whs_")

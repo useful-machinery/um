@@ -44,6 +44,7 @@ pub enum BoundRequiredOperation<T, E> {
     Completed {
         result: Result<T, E>,
         credential_state: LocalCredentialState,
+        binding: SessionBinding,
     },
     Unauthenticated {
         credential_state: LocalCredentialState,
@@ -265,6 +266,9 @@ pub fn execute_bound_required<T, E>(
         return Ok(BoundRequiredOperation::Completed {
             result: first,
             credential_state: LocalCredentialState::Retained,
+            binding: SessionBinding {
+                credential: binding.credential.clone(),
+            },
         });
     }
 
@@ -311,6 +315,7 @@ pub fn execute_bound_required<T, E>(
     Ok(BoundRequiredOperation::Completed {
         result: second,
         credential_state,
+        binding: SessionBinding { credential },
     })
 }
 

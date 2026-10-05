@@ -469,6 +469,7 @@ const fn audit_subject_kind(kind: OrganizationAuditSubjectKind) -> &'static str 
         OrganizationAuditSubjectKind::Assignment => "assignment",
         OrganizationAuditSubjectKind::LinearAuthorizationSession => "linear_authorization_session",
         OrganizationAuditSubjectKind::LinearConnection => "linear_connection",
+        OrganizationAuditSubjectKind::LinearEvaluation => "linear_evaluation",
     }
 }
 
