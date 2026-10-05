@@ -683,6 +683,34 @@ impl<'a> ApiFailureResult<'a> {
     }
 }
 
+// Publication and handoff diagnostics have different closed member sets but the same
+// human presentation: show each returned fact without interpreting its open value.
+fn write_publication_diagnostic(
+    output: &mut impl Write,
+    diagnostic: &impl Serialize,
+    indent: &str,
+) -> anyhow::Result<()> {
+    let serde_json::Value::Object(fields) = serde_json::to_value(diagnostic)? else {
+        return Err(anyhow::anyhow!("publication diagnostic is not an object"));
+    };
+    for (key, value) in fields {
+        let mut label = String::with_capacity(key.len() + 3);
+        for character in key.chars() {
+            if character.is_ascii_uppercase() {
+                label.push(' ');
+                label.push(character.to_ascii_lowercase());
+            } else {
+                label.push(character);
+            }
+        }
+        let text = value
+            .as_str()
+            .map_or_else(|| value.to_string(), str::to_owned);
+        writeln!(output, "{indent}diagnostic {label}: {text}")?;
+    }
+    Ok(())
+}
+
 fn write_pretty_json(value: &impl Serialize) -> io::Result<()> {
     let mut bytes = serde_json::to_vec_pretty(value).map_err(io::Error::other)?;
     bytes.push(b'\n');

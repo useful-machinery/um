@@ -30,6 +30,34 @@ fn prepared_publication(responses: Vec<Vec<u8>>) -> (ScriptedServer, tempfile::T
     (server, credential_directory, credential_path)
 }
 
+fn publication_diagnostic() -> serde_json::Value {
+    serde_json::json!({
+        "stage": "push", "gitResult": "future_git_result", "gitCommand": "push",
+        "gitExitCode": 17, "httpStatus": 429, "transportError": "future_transport_error",
+        "providerRequestId": "request-abc123", "retryAfter": "2026-09-03T19:00:00Z",
+        "budgetResource": "future_budget_resource", "errorType": "future_error_type"
+    })
+}
+
+fn assert_diagnostic_rendered(report: &str, code: &str, diagnostic: &serde_json::Value) {
+    let code_offset = report.find(code).expect("failure code is displayed");
+    let facts: Vec<_> = report
+        .lines()
+        .filter(|line| line.trim_start().starts_with("diagnostic "))
+        .collect();
+    assert_eq!(facts.len(), diagnostic.as_object().unwrap().len());
+    for value in diagnostic.as_object().unwrap().values() {
+        let value = value
+            .as_str()
+            .map_or_else(|| value.to_string(), str::to_owned);
+        let fact = facts
+            .iter()
+            .find(|line| line.contains(&value))
+            .unwrap_or_else(|| panic!("missing {value} in {report}"));
+        assert!(code_offset < report.find(*fact).unwrap());
+    }
+}
+
 fn publication_body() -> serde_json::Value {
     serde_json::json!({
         "id": PUBLICATION_ID,
@@ -516,6 +544,7 @@ fn publication_show_renders_a_stored_failure_as_a_successful_read() {
     for json in [false, true] {
         let mut failed = publication_history().remove(3);
         failed["id"] = serde_json::json!(PUBLICATION_ID);
+        failed["failure"]["diagnostic"] = publication_diagnostic();
         let (server, _directory, credential_path) =
             prepared_publication(vec![ok_publication_response(&failed)]);
         let environment = deployment_environment(&server.api_url, &credential_path);
@@ -553,6 +582,7 @@ fn publication_show_renders_a_stored_failure_as_a_successful_read() {
                     "missing {field:?}: {stdout}"
                 );
             }
+            assert_diagnostic_rendered(&stdout, "provider_unavailable", &publication_diagnostic());
         }
         assert_no_publication_secret(&output, &[TOKEN]);
 
@@ -749,6 +779,7 @@ fn publication_show_wait_reuses_plain_rendering_for_a_stored_failure() {
             "missing {field:?}: {stdout}"
         );
     }
+    assert!(!stdout.contains("diagnostic "));
     assert_no_publication_secret(&output, &[TOKEN]);
     assert_eq!(server.finish().len(), 1);
 }
@@ -776,7 +807,8 @@ fn publication_show_wait_rejects_a_malformed_observation_without_partial_output(
 #[test]
 fn publication_list_requests_and_renders_exactly_one_bounded_page() {
     for json in [false, true] {
-        let items = publication_history();
+        let mut items = publication_history();
+        items[3]["failure"]["diagnostic"] = publication_diagnostic();
         let page = serde_json::json!({
             "items": items,
             "nextCursor": NEXT_CURSOR
@@ -815,6 +847,7 @@ fn publication_list_requests_and_renders_exactly_one_bounded_page() {
             assert!(stdout.lines().any(|line| {
                 line == "  failure: provider_unavailable · phase: branch · retryable: true"
             }));
+            assert_diagnostic_rendered(&stdout, "provider_unavailable", &publication_diagnostic());
             assert!(
                 stdout
                     .lines()
@@ -964,6 +997,29 @@ fn publication_reads_reject_malformed_or_private_response_shapes() {
         ],
     );
     server.finish();
+
+    for diagnostic in [
+        serde_json::json!({"stage":"push", "privateProviderText":"unique-private-provider-text"}),
+        serde_json::json!({"stage":null}),
+        serde_json::json!({"stage":"not a slug"}),
+    ] {
+        let mut failed = publication_history().remove(3);
+        failed["id"] = serde_json::json!(PUBLICATION_ID);
+        failed["failure"]["diagnostic"] = diagnostic;
+        let (server, _directory, credential_path) =
+            prepared_publication(vec![ok_publication_response(&failed)]);
+        let output = run_with_env(
+            &show_args(true),
+            &deployment_environment(&server.api_url, &credential_path),
+        );
+        assert_eq!(output.status.code(), Some(1));
+        assert_eq!(
+            assert_one_json_document(&output.stdout)["outcome"],
+            "invalid_response"
+        );
+        assert_no_publication_secret(&output, &[TOKEN, "unique-private-provider-text"]);
+        server.finish();
+    }
 
     let history = publication_history();
     let malformed_pages = [

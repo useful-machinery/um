@@ -975,6 +975,9 @@ fn write_publication_human(
                 enum_text(&failure.phase)?,
                 failure.retryable
             )?;
+            if let Some(diagnostic) = failure.diagnostic.as_deref() {
+                super::write_publication_diagnostic(output, diagnostic, "    ")?;
+            }
         }
         if let Some(pull_request) = publication.pull_request.as_deref() {
             let url = redacted_human_url(&pull_request.url)?;
@@ -1021,6 +1024,9 @@ fn write_publication_human(
         writeln!(output, "failure: {}", enum_text(&failure.code)?)?;
         writeln!(output, "failure phase: {}", enum_text(&failure.phase)?)?;
         writeln!(output, "retryable: {}", failure.retryable)?;
+        if let Some(diagnostic) = failure.diagnostic.as_deref() {
+            super::write_publication_diagnostic(output, diagnostic, "  ")?;
+        }
     }
     writeln!(output, "created: {}", publication.created_at)?;
     writeln!(output, "updated: {}", publication.updated_at)?;

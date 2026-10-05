@@ -562,7 +562,7 @@ fn decode_closed_publication_value(
     )?;
     require_closed_field(&value, "branch", BRANCH_FIELDS, true)?;
     require_closed_field(&value, "pullRequest", PULL_REQUEST_FIELDS, true)?;
-    require_closed_field(&value, "failure", FAILURE_FIELDS, true)?;
+    require_closed_failure(&value)?;
     serde_json::from_value(value).map_err(|_| PublicationFailure::protocol(false))
 }
 
@@ -643,6 +643,76 @@ const PULL_REQUEST_METADATA_FIELDS: &[&str] =
 const BRANCH_FIELDS: &[&str] = &["headOid", "disposition", "url"];
 const PULL_REQUEST_FIELDS: &[&str] = &["providerId", "number", "url", "disposition", "state"];
 const FAILURE_FIELDS: &[&str] = &["phase", "code", "retryable"];
+const DIAGNOSTIC_FIELDS: &[&str] = &[
+    "stage",
+    "gitResult",
+    "gitCommand",
+    "gitExitCode",
+    "httpStatus",
+    "transportError",
+    "providerRequestId",
+    "retryAfter",
+    "budgetResource",
+    "errorType",
+];
+
+fn require_closed_failure(root: &serde_json::Value) -> Result<(), PublicationFailure> {
+    let failure = root
+        .get("failure")
+        .ok_or_else(|| PublicationFailure::protocol(false))?;
+    if failure.is_null() {
+        return Ok(());
+    }
+    let fields = failure
+        .as_object()
+        .ok_or_else(|| PublicationFailure::protocol(false))?;
+    if FAILURE_FIELDS.iter().any(|key| !fields.contains_key(*key))
+        || fields
+            .keys()
+            .any(|key| key != "diagnostic" && !FAILURE_FIELDS.contains(&key.as_str()))
+    {
+        return Err(PublicationFailure::protocol(false));
+    }
+    if let Some(diagnostic) = fields.get("diagnostic") {
+        let members = diagnostic
+            .as_object()
+            .ok_or_else(|| PublicationFailure::protocol(false))?;
+        if members.is_empty()
+            || members.iter().any(|(key, value)| {
+                !DIAGNOSTIC_FIELDS.contains(&key.as_str())
+                    || !valid_publication_diagnostic_member(key, value)
+            })
+        {
+            return Err(PublicationFailure::protocol(false));
+        }
+    }
+    Ok(())
+}
+
+fn valid_publication_diagnostic_member(key: &str, value: &serde_json::Value) -> bool {
+    match key {
+        "gitExitCode" | "httpStatus" => value
+            .as_i64()
+            .is_some_and(|number| i32::try_from(number).is_ok()),
+        "retryAfter" => value.as_str().is_some_and(|time| timestamp(time).is_ok()),
+        "providerRequestId" => value.as_str().is_some_and(|id| {
+            let bytes = id.as_bytes();
+            (1..=128).contains(&bytes.len())
+                && bytes[0].is_ascii_alphanumeric()
+                && bytes[1..].iter().all(|byte| {
+                    byte.is_ascii_alphanumeric() || matches!(byte, b':' | b'.' | b'_' | b'-')
+                })
+        }),
+        _ => value.as_str().is_some_and(|slug| {
+            let bytes = slug.as_bytes();
+            (1..=64).contains(&bytes.len())
+                && bytes[0].is_ascii_lowercase()
+                && bytes[1..]
+                    .iter()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'_')
+        }),
+    }
+}
 
 fn require_closed_field(
     root: &serde_json::Value,

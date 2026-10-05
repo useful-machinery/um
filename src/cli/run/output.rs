@@ -223,6 +223,13 @@ pub(super) fn write_cloud(
                     super::enum_text(&failure.phase)?
                 )?;
                 writeln!(io::stdout().lock(), "  retryable: {}", failure.retryable)?;
+                if let Some(diagnostic) = failure.diagnostic.as_deref() {
+                    super::super::write_publication_diagnostic(
+                        &mut io::stdout().lock(),
+                        diagnostic,
+                        "    ",
+                    )?;
+                }
             }
         }
         if snapshot

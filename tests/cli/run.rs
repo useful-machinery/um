@@ -2149,16 +2149,19 @@ fn create_selects_exact_export_once_and_omission_is_artifact_only() {
 
 #[test]
 fn create_and_show_wait_separate_failed_publication_handoff_from_execution() {
-    for (operation, expected_exit, json) in [
-        ("create", 1, true),
-        ("show", 0, true),
-        ("create", 1, false),
-        ("show", 0, false),
+    for (operation, expected_exit, json, wait) in [
+        ("create", 1, true, true),
+        ("show", 0, true, true),
+        ("create", 1, false, true),
+        ("show", 0, false, true),
+        ("show", 0, false, false),
     ] {
         let mut body = run_body_with_state("succeeded");
         body["publication"] = serde_json::json!({
             "exportName":"review", "state":"failed", "publicationId":null,
-            "failure": {"phase":"preflight", "code":"actor_authority_lost", "retryable":false}
+            "failure": {"phase":"preflight", "code":"actor_authority_lost", "retryable":false,
+                "diagnostic": {"stage":"acceptance", "deliveryPhase":"artifact_upload",
+                    "deliveryCode":"future_delivery_code", "errorType":"future_handoff_error"}}
         });
         let mut responses = Vec::new();
         if operation == "create" {
@@ -2177,7 +2180,9 @@ fn create_and_show_wait_separate_failed_publication_handoff_from_execution() {
             args.push("--allow-insecure-http");
             args
         };
-        arguments.insert(arguments.len() - 1, "--wait");
+        if wait {
+            arguments.insert(arguments.len() - 1, "--wait");
+        }
         let output = run_with_env(&arguments, &environment);
         assert_eq!(output.status.code(), Some(expected_exit));
         if json {
@@ -2185,6 +2190,7 @@ fn create_and_show_wait_separate_failed_publication_handoff_from_execution() {
             assert_eq!(result["outcome"], "settled");
             assert_eq!(result["run"]["state"], "succeeded");
             assert_eq!(result["run"]["publication"]["state"], "failed");
+            assert_eq!(result["run"]["publication"], body["publication"]);
             assert!(result["publication"].is_null());
             assert!(result["error"].is_null());
         } else {
@@ -2202,7 +2208,24 @@ fn create_and_show_wait_separate_failed_publication_handoff_from_execution() {
                     "missing {line} in {report}"
                 );
             }
-            assert!(report.contains("um publication create"));
+            let facts: Vec<_> = report
+                .lines()
+                .filter(|line| line.trim_start().starts_with("diagnostic "))
+                .collect();
+            let diagnostic = body["publication"]["failure"]["diagnostic"]
+                .as_object()
+                .unwrap();
+            assert_eq!(facts.len(), diagnostic.len());
+            for value in diagnostic.values() {
+                let fact = facts
+                    .iter()
+                    .find(|line| line.contains(value.as_str().unwrap()))
+                    .unwrap_or_else(|| panic!("missing {value} in {report}"));
+                assert!(report.find("actor_authority_lost").unwrap() < report.find(*fact).unwrap());
+            }
+            if wait {
+                assert!(report.contains("um publication create"));
+            }
         }
         assert_eq!(
             server.finish().len(),
@@ -2238,7 +2261,11 @@ fn human_run_observation_reports_failed_automatic_publication() {
         },
         "pullRequestMetadata": { "title": "Review", "body": "Run publication", "titleSource": "default", "descriptionSource": "default" },
         "branch": null, "pullRequest": null, "outcome": null,
-        "failure": { "phase": "branch", "code": "provider_unavailable", "retryable": true },
+        "failure": { "phase": "branch", "code": "provider_unavailable", "retryable": true,
+            "diagnostic": {"stage":"push", "gitResult":"future_git_result", "gitCommand":"push",
+                "gitExitCode":17, "httpStatus":429, "transportError":"future_transport_error",
+                "providerRequestId":"request-abc123", "retryAfter":"2026-09-03T19:00:00Z",
+                "budgetResource":"future_budget_resource", "errorType":"future_error_type"} },
         "actorPrincipalId": "prn_01k0z6r1w8f4jy2m7q9v3x5abc",
         "createdAt": "2026-09-03T18:00:00Z", "updatedAt": "2026-09-03T18:00:02Z",
         "startedAt": "2026-09-03T18:00:01Z", "terminalAt": "2026-09-03T18:00:02Z"
@@ -2287,6 +2314,22 @@ fn human_run_observation_reports_failed_automatic_publication() {
             );
         }
         assert!(report.contains(publication_id));
+        let facts: Vec<_> = report
+            .lines()
+            .filter(|line| line.trim_start().starts_with("diagnostic "))
+            .collect();
+        let diagnostic = publication["failure"]["diagnostic"].as_object().unwrap();
+        assert_eq!(facts.len(), diagnostic.len());
+        for value in diagnostic.values() {
+            let text = value
+                .as_str()
+                .map_or_else(|| value.to_string(), str::to_owned);
+            let fact = facts
+                .iter()
+                .find(|line| line.contains(&text))
+                .unwrap_or_else(|| panic!("missing {text} in {report}"));
+            assert!(report.find("provider_unavailable").unwrap() < report.find(*fact).unwrap());
+        }
         assert!(report.contains("um publication show"));
         assert_eq!(
             server.finish().len(),

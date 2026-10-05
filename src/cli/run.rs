@@ -1788,6 +1788,9 @@ fn write_run_human(deployment: &str, heading: &str, run: &Run) -> anyhow::Result
             writeln!(stdout, "  failure: {}", enum_text(&failure.code)?)?;
             writeln!(stdout, "  phase: {}", enum_text(&failure.phase)?)?;
             writeln!(stdout, "  retryable: {}", failure.retryable)?;
+            if let Some(diagnostic) = failure.diagnostic.as_deref() {
+                super::write_publication_diagnostic(&mut stdout, diagnostic, "    ")?;
+            }
         }
     } else {
         writeln!(stdout, "  none")?;
