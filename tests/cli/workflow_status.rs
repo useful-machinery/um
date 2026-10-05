@@ -337,6 +337,32 @@ fn closed_status_schema_accepts_positive_and_rejects_negative_fixtures() {
 }
 
 #[test]
+fn status_json_reports_invalid_committed_pending_result() {
+    let (_bundle, run_directory) = completed_run("invalid-pending-result");
+    let mut state = read_state(&run_directory);
+    state["attempts"][0]["result"] =
+        serde_json::json!({"status": "not_published", "reason": "publication_pending"});
+    write_state(&run_directory, &state);
+    fs::write(
+        run_directory.join("attempts/000001/result/result.json"),
+        b"invalid",
+    )
+    .unwrap();
+
+    let (output, error) = status_json(&run_directory);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stderr.is_empty());
+    assert!(status_schema().is_valid(&error));
+    assert_eq!(error["outcome"], "error");
+    assert_eq!(error["error"]["code"], "published_result_invalid");
+    assert_eq!(
+        error["runDirectory"],
+        fs::canonicalize(&run_directory).unwrap().to_str().unwrap()
+    );
+    assert_eq!(read_state(&run_directory), state);
+}
+
+#[test]
 fn status_json_and_plain_are_closed_read_only_snapshots() {
     let (_bundle, run_directory) = completed_run("settled");
     let run_before = fs::read(run_directory.join("run.json")).unwrap();

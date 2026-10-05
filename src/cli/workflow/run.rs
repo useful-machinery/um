@@ -595,12 +595,19 @@ async fn execute_attempt_phases(
             anyhow!("prepare local workflow paths: an authoritative path is not valid UTF-8")
         })?
         .to_owned();
-    let destination = prepare_attempt_result_destination(
-        attempt.run()?.result_directory(),
-        attempt.run()?.private_directory(),
-        attempt.run()?.attempt_directory_handle(),
-        attempt.run()?.private_directory_handle(),
-    )?;
+    let result_directory = attempt.run()?.result_directory().to_owned();
+    let private_directory = attempt.run()?.private_directory().to_owned();
+    let result_parent = rustix::io::dup(attempt.run()?.attempt_directory_handle())?;
+    let staging_parent = rustix::io::dup(attempt.run()?.private_directory_handle())?;
+    let destination = tokio::task::spawn_blocking(move || {
+        prepare_attempt_result_destination(
+            &result_directory,
+            &private_directory,
+            &result_parent,
+            &staging_parent,
+        )
+    })
+    .await??;
     attempt.private_staging = Some(attempt.run()?.create_private_staging()?);
     let staging = attempt
         .private_staging
@@ -810,6 +817,10 @@ async fn execute_attempt_phases(
             }
             let state_publication = match &publication {
                 Ok(_) => owned_run.record_result_published(),
+                // A committed rename is already visible. Do not seal a permanent
+                // failure over it when only the post-rename sync failed: status,
+                // retry and continue reconcile the pending publication durably.
+                Err(error) if error.committed() => Ok(()),
                 Err(error) => owned_run.record_result_publication_failed(
                     publication_failure_phase(error.phase()),
                     error.invariant(),

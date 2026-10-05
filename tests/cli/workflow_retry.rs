@@ -60,6 +60,50 @@ fn initial_failed_run(bundle: &RunBundle, name: &str) -> PathBuf {
 }
 
 #[test]
+fn retry_acquires_after_pre_rename_publication_crash() {
+    let bundle = environment_retry_bundle();
+    let run_directory = initial_failed_run(&bundle, "pre-rename-crash");
+    fs::remove_dir_all(run_directory.join("attempts/000001/result")).unwrap();
+    let mut state = read_state(&run_directory);
+    state["attempts"][0]["result"] =
+        serde_json::json!({"status": "not_published", "reason": "publication_pending"});
+    write_state(&run_directory, &state);
+
+    let status = isolated_command(&[
+        "workflow".to_owned(),
+        "status".to_owned(),
+        run_directory.to_string_lossy().into_owned(),
+        "--json".to_owned(),
+    ])
+    .output()
+    .unwrap();
+    assert!(status.status.success());
+    let snapshot: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!(snapshot["retry"], serde_json::json!({"eligible": true}));
+    assert_eq!(
+        snapshot["state"]["attempts"][0]["result"],
+        state["attempts"][0]["result"]
+    );
+
+    let output = isolated_command(&retry_args(
+        &run_directory,
+        bundle.execution_root(),
+        &["--json"],
+    ))
+    .env("RETRY_PHASE", "retry")
+    .output()
+    .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let terminal: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(terminal["attemptNumber"], 2);
+    assert_eq!(terminal["outcome"], "succeeded");
+}
+
+#[test]
 fn retry_uses_the_immutable_bundle_current_environment_and_fresh_attempt() {
     let bundle = environment_retry_bundle();
     let run_directory = initial_failed_run(&bundle, "fresh");

@@ -5,14 +5,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use super::*;
-use crate::workflow::archived_attempt::{
-    ArchivedAttemptState, ArchivedAttemptTrigger, ArchivedCommandOutput, ArchivedExecution,
-    ArchivedFailure,
-};
+use crate::workflow::archived_attempt::{ArchivedCommandOutput, ArchivedExecution};
 use crate::workflow::document::Output;
 use crate::workflow::evidence::{
     FailureCode, FailureDetail, FailurePhase, NodeDetail, PrimaryIssue,
 };
+use crate::workflow::local_run::{AttemptStateV1, AttemptTriggerV1};
 use crate::workflow::presentation_feed::WorkflowPresentationDefinition;
 use crate::workflow::resolution::{ContentDigestAlgorithm, WorkflowContentDigest};
 use crate::workflow::validated::WorkflowNodeRole;
@@ -100,7 +98,7 @@ fn hostile_node_evidence_is_safe_in_live_and_archived_presentations() {
     // The live plain renderer uses this canonical detail in its blocked transition.
     let live_plain_detail = crate::workflow::presentation::canonical_blocked_detail(&detail);
     let mut attempt = archived_attempt(None);
-    attempt.steps[1].state = ArchivedStepState::Blocked;
+    attempt.steps[1].state = WorkflowStepStateV1::Blocked;
     attempt.steps[1].detail = ArchivedStepDetail::Evidence(NodeDetail::Blocked(detail));
     let plain = crate::workflow::archived_presentation::render_plain(&attempt, false).unwrap();
     let view = ArchivedTerminalView::new(attempt);
@@ -495,7 +493,7 @@ async fn archived_host_failures_restore_and_preserve_failure_precedence() {
 
 fn archived_attempt(command_output: Option<ArchivedCommandOutput>) -> LocalArchivedAttempt {
     let started = timestamp("2026-08-06T12:00:01Z");
-    let failure: ArchivedFailure = FailureDetail::new(
+    let failure: FailureDetail = FailureDetail::new(
         FailurePhase::Execution,
         FailureCode::CommandExit,
         None,
@@ -537,8 +535,8 @@ fn archived_attempt(command_output: Option<ArchivedCommandOutput>) -> LocalArchi
             crate::workflow::publication::WorkspaceModifiedUnknownV1::Unknown,
         ),
         result_directory: PathBuf::from("/tmp/archive-run/attempts/0002/result"),
-        trigger: ArchivedAttemptTrigger::ExplicitRetry,
-        state: ArchivedAttemptState::WorkflowFailed,
+        trigger: AttemptTriggerV1::ExplicitRetry,
+        state: AttemptStateV1::WorkflowFailed,
         created_at: timestamp("2026-08-06T12:00:00Z"),
         started_at: Some(started),
         settled_at: timestamp("2026-08-06T12:00:05Z"),
@@ -568,7 +566,7 @@ fn archived_attempt(command_output: Option<ArchivedCommandOutput>) -> LocalArchi
             finished_at: timestamp("2026-08-06T12:00:04Z"),
             duration: Duration::from_secs(3),
         },
-        outcome: ArchivedWorkflowOutcome::Failed,
+        outcome: WorkflowOutcomeV1::Failed,
         primary_issue: Some(PrimaryIssue::failed(
             crate::workflow::validated::WorkflowNode {
                 id: "verify".to_owned(),
@@ -584,7 +582,7 @@ fn archived_attempt(command_output: Option<ArchivedCommandOutput>) -> LocalArchi
                 id: "prepare".to_owned(),
                 role: WorkflowNodeRole::Step,
                 failure_policy: FailurePolicy::Required,
-                state: ArchivedStepState::Succeeded,
+                state: WorkflowStepStateV1::Succeeded,
                 inherited_data_available: false,
                 started_at: Some(started),
                 duration: Some(Duration::from_secs(1)),
@@ -597,7 +595,7 @@ fn archived_attempt(command_output: Option<ArchivedCommandOutput>) -> LocalArchi
                 id: "verify".to_owned(),
                 role: WorkflowNodeRole::Step,
                 failure_policy: FailurePolicy::Required,
-                state: ArchivedStepState::Failed,
+                state: WorkflowStepStateV1::Failed,
                 inherited_data_available: false,
                 started_at: Some(started + Duration::from_secs(1)),
                 duration: Some(Duration::from_secs(2)),

@@ -225,6 +225,44 @@ steps:
 }
 
 #[test]
+fn continuation_acquires_after_pre_rename_publication_crash() {
+    let bundle = RunBundle::new(
+        "schemaVersion: 1\nsteps:\n  fail:\n    kind: cmd\n    command: {argv: [\"false\"]}\n",
+    );
+    let run = bundle.result("pre-rename-crash");
+    let mut initial = bundle.args(&run);
+    initial.insert(initial.len() - 1, "--json".to_owned());
+    assert_eq!(
+        isolated_command(&initial).output().unwrap().status.code(),
+        Some(1)
+    );
+    fs::remove_dir_all(run.join("attempts/000001/result")).unwrap();
+    let mut state: serde_json::Value =
+        serde_json::from_slice(&fs::read(run.join("state.json")).unwrap()).unwrap();
+    state["attempts"][0]["result"] =
+        serde_json::json!({"status": "not_published", "reason": "publication_pending"});
+    let mut bytes = serde_json::to_vec_pretty(&state).unwrap();
+    bytes.push(b'\n');
+    fs::write(run.join("state.json"), bytes).unwrap();
+
+    let replacement = bundle.source_root().join("invalid.yaml");
+    fs::write(&replacement, "schemaVersion: 2\nsteps: {}\n").unwrap();
+    let mut request = continue_args(&run, &["fail"]);
+    request.extend([
+        "--workflow".to_owned(),
+        replacement.to_string_lossy().into_owned(),
+    ]);
+    let output = isolated_command(&request).output().unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["phase"], "continuation");
+    assert_eq!(
+        result["diagnostics"][0]["code"],
+        "continuation_definition_invalid"
+    );
+}
+
+#[test]
 fn replacement_resolution_failure_uses_the_continuation_diagnostic_vocabulary() {
     let bundle = RunBundle::new(
         "schemaVersion: 1\nsteps:\n  fail:\n    kind: cmd\n    command: {argv: [\"false\"]}\n",

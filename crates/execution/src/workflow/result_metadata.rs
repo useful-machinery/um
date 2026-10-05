@@ -1847,12 +1847,21 @@ pub(super) fn export_origin_matches(
     let expected_producer = output_producers
         .get(&source.node.id)
         .and_then(|outputs| outputs.get(&source.output));
-    match source_state {
+    export_provenance_matches_source(source_state, provenance, producer, expected_producer)
+        && producer.is_none_or(valid_output_producer)
+}
+
+pub(super) fn export_provenance_matches_source(
+    state: WorkflowStepStateV1,
+    provenance: Option<&ExportProvenanceV1>,
+    producer: Option<&super::runtime::OutputProducer>,
+    expected_producer: Option<&super::runtime::OutputProducer>,
+) -> bool {
+    match state {
         WorkflowStepStateV1::Inherited => {
             provenance == Some(&ExportProvenanceV1::Inherited)
                 && producer.is_some()
                 && producer == expected_producer
-                && producer.is_some_and(valid_output_producer)
         }
         WorkflowStepStateV1::Succeeded => {
             provenance.is_none() && producer.is_none() && expected_producer.is_none()

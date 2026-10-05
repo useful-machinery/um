@@ -932,7 +932,7 @@ steps:
             id: step.id.clone(),
             role: step.role,
             failure_policy: step.definition.failure_policy(),
-            state: crate::workflow::archived_attempt::ArchivedStepState::Inherited,
+            state: crate::workflow::publication::WorkflowStepStateV1::Inherited,
             inherited_data_available: prior_state
                 == crate::workflow::evidence::InheritedPriorState::Succeeded,
             started_at: None,

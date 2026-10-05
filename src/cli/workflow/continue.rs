@@ -55,12 +55,13 @@ impl Command {
         );
         let run_directory = self.run.run_dir.clone();
         let opened = tokio::task::spawn_blocking(move || {
-            reconcile_current_result_publication(&run_directory);
-            acquire_local_continuation(&run_directory)
+            reconcile_current_result_publication(&run_directory).map_err(|error| {
+                anyhow::anyhow!("finalize workflow result publication: {error:?}")
+            })?;
+            acquire_local_continuation(&run_directory).map_err(anyhow::Error::new)
         })
         .await
-        .map_err(anyhow::Error::new)?
-        .map_err(anyhow::Error::new)?;
+        .map_err(anyhow::Error::new)??;
         let pending = match opened {
             LocalContinuationOpen::Acquired(pending) => *pending,
             LocalContinuationOpen::Rejected(rejection) => {

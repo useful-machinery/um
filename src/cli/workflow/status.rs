@@ -7,10 +7,11 @@ use serde_json::Value;
 
 use crate::exit_code::ExitCode;
 use um_execution::{
-    ColorChoice, LocalRecoveryStatus, LocalRetryEligibility, LocalRunStatusSnapshot,
-    LocalStatusError, LocalStatusResult, PresentationConfig, RequestedPresentationMode,
-    RetryIneligibilityReason, TerminalCapabilities, load_local_archived_attempt,
-    read_local_run_status, reconcile_current_result_publication, styled_terminal_text as styled,
+    ArchivedAttemptLoadError, ColorChoice, LocalRecoveryStatus, LocalRetryEligibility,
+    LocalRunStatusSnapshot, LocalStatusError, LocalStatusResult, PresentationConfig,
+    RequestedPresentationMode, RetryIneligibilityReason, TerminalCapabilities,
+    load_local_archived_attempt, operational_error_code, read_local_run_status,
+    reconcile_current_result_publication, styled_terminal_text as styled,
 };
 
 pub(super) const ABOUT: &str = "Show local workflow run status";
@@ -45,17 +46,19 @@ impl Command {
         &self,
         control: &super::super::OperationControl<()>,
     ) -> super::super::CommandResult {
-        reconcile_current_result_publication(&self.run.run_dir);
+        let reconciliation = reconcile_current_result_publication(&self.run.run_dir);
         let snapshot = read_local_run_status(&self.run.run_dir);
         super::super::complete_read_only_output(control, || {
             let exit = if self.presentation.output.json {
-                render_json(snapshot).context("write workflow status output")?
+                render_json(snapshot, reconciliation).context("write workflow status output")?
             } else {
                 let snapshot = snapshot
                     .map_err(|error| anyhow!(error.code.message()))
                     .with_context(|| {
                         format!("inspect workflow run {}", self.run.run_dir.display())
                     })?;
+                reconciliation
+                    .map_err(|error| anyhow!("finalize workflow result publication: {error:?}"))?;
                 let color = self.plain_color_enabled();
                 render_plain(&snapshot, color).context("write workflow status output")?
             };
@@ -195,9 +198,32 @@ struct ErrorDetail {
     message: &'static str,
 }
 
-fn render_json(snapshot: Result<LocalRunStatusSnapshot, LocalStatusError>) -> io::Result<ExitCode> {
-    match snapshot {
-        Ok(snapshot) => {
+fn render_json(
+    snapshot: Result<LocalRunStatusSnapshot, LocalStatusError>,
+    reconciliation: Result<(), ArchivedAttemptLoadError>,
+) -> io::Result<ExitCode> {
+    match (snapshot, reconciliation) {
+        (Ok(snapshot), Err(error)) => {
+            let code = match error {
+                ArchivedAttemptLoadError::Operational(error) => operational_error_code(error.code),
+                // A concurrent change to the selected attempt invalidated the
+                // pending selection between the two stable snapshot reads.
+                ArchivedAttemptLoadError::Ineligible(_) => "status_snapshot_unstable",
+            };
+            write_json(&StatusErrorOutput {
+                schema_version: 1,
+                command: COMMAND,
+                outcome: "error",
+                exit_status: ExitCode::GeneralFailure.as_u8(),
+                run_directory: snapshot.run_directory.to_str(),
+                error: ErrorDetail {
+                    code,
+                    message: "The workflow result could not be finalized. Check the run directory and try again.",
+                },
+            })?;
+            Ok(ExitCode::GeneralFailure)
+        }
+        (Ok(snapshot), Ok(())) => {
             let run_directory = snapshot
                 .run_directory
                 .to_str()
@@ -217,7 +243,7 @@ fn render_json(snapshot: Result<LocalRunStatusSnapshot, LocalStatusError>) -> io
             })?;
             Ok(ExitCode::Success)
         }
-        Err(error) => {
+        (Err(error), _) => {
             write_json(&StatusErrorOutput {
                 schema_version: 1,
                 command: COMMAND,

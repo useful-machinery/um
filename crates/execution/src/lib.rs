@@ -180,6 +180,7 @@ pub use workflow::archived_attempt::ArchivedAttemptOperationalError;
 pub use workflow::archived_attempt::ArchivedAttemptOperationalErrorCode;
 pub use workflow::archived_attempt::LoadedLocalArchivedAttempt;
 pub use workflow::archived_attempt::LocalArchivedAttempt;
+pub use workflow::archived_attempt::ProjectionInvariant;
 pub use workflow::archived_presentation::ArchivedViewOutputFailure;
 pub use workflow::artifact::ArtifactReadFailure;
 pub use workflow::artifact::ArtifactReleaseFailure;

@@ -982,7 +982,9 @@ fn output_capture_failure_detail(source: &OutputCaptureFailure) -> FailureDetail
                 CaptureFailureKind::CarrierProducerUnavailable => {
                     FailureCode::GitBundleGenerationFailed
                 }
-                CaptureFailureKind::StagingUnavailable => FailureCode::OutputStagingUnavailable,
+                CaptureFailureKind::InvalidDeclaration | CaptureFailureKind::StagingUnavailable => {
+                    FailureCode::OutputStagingUnavailable
+                }
             },
             Some(source.output_identity().to_owned()),
         ),

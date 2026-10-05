@@ -7,14 +7,15 @@ use serde::Serialize;
 use super::super::ExecutionOutcome;
 use super::archived_attempt::{
     ArchivedAttemptIneligibilityReason, ArchivedAttemptLoadError,
-    ArchivedAttemptOperationalErrorCode, ArchivedAttemptState, ArchivedAttemptTrigger,
-    ArchivedCancellationReason, ArchivedFailure, ArchivedStep, ArchivedStepDetail,
-    ArchivedStepState, ArchivedWorkflowOutcome, LoadedLocalArchivedAttempt, LocalArchivedAttempt,
+    ArchivedAttemptOperationalErrorCode, ArchivedStep, ArchivedStepDetail,
+    LoadedLocalArchivedAttempt, LocalArchivedAttempt,
 };
 use super::document::FailurePolicy;
 use super::evidence::{NodeDetail, Prerequisite, PrimaryIssueDetail};
+use super::local_run::{AttemptStateV1, AttemptTriggerV1};
 use super::presentation::{human_duration, styled_terminal_text as styled};
 use super::presentation_feed::{WorkflowPresentationStep, normalize_terminal_scalar};
+use super::publication::{CancellationReasonV1, WorkflowOutcomeV1, WorkflowStepStateV1};
 use super::publication::{FinalizationTriggerV1, WorkflowResultV1};
 use super::validated::WorkflowNodeRole;
 
@@ -365,17 +366,19 @@ fn terminal_counts(steps: &[ArchivedStep]) -> TerminalCounts {
     let mut counts = TerminalCounts::default();
     for step in steps {
         match step.state {
-            ArchivedStepState::Succeeded | ArchivedStepState::Inherited => counts.succeeded += 1,
-            ArchivedStepState::Failed => counts.failed += 1,
-            ArchivedStepState::Blocked => counts.blocked += 1,
-            ArchivedStepState::Skipped => counts.skipped += 1,
-            ArchivedStepState::NotRun => counts.not_run += 1,
-            ArchivedStepState::Cancelled => counts.cancelled += 1,
+            WorkflowStepStateV1::Succeeded | WorkflowStepStateV1::Inherited => {
+                counts.succeeded += 1
+            }
+            WorkflowStepStateV1::Failed => counts.failed += 1,
+            WorkflowStepStateV1::Blocked => counts.blocked += 1,
+            WorkflowStepStateV1::Skipped => counts.skipped += 1,
+            WorkflowStepStateV1::NotRun => counts.not_run += 1,
+            WorkflowStepStateV1::Cancelled => counts.cancelled += 1,
         }
         if step.failure_policy == FailurePolicy::Advisory
             && matches!(
                 step.state,
-                ArchivedStepState::Failed | ArchivedStepState::Blocked
+                WorkflowStepStateV1::Failed | WorkflowStepStateV1::Blocked
             )
         {
             counts.advisory_issues += 1;
@@ -500,7 +503,10 @@ pub const fn operational_error_code(code: ArchivedAttemptOperationalErrorCode) -
         ArchivedAttemptOperationalErrorCode::PublishedResultUnavailable => {
             "published_result_unavailable"
         }
-        ArchivedAttemptOperationalErrorCode::PublishedResultInvalid => "published_result_invalid",
+        ArchivedAttemptOperationalErrorCode::ProjectionInvariant(_) => "published_result_invalid",
+        ArchivedAttemptOperationalErrorCode::PublicationFinalizationFailed => {
+            "publication_finalization_failed"
+        }
         ArchivedAttemptOperationalErrorCode::CarrierLimitExceeded => {
             super::artifact_limits::CARRIER_LIMIT_DIAGNOSTIC_CODE
         }
@@ -528,8 +534,11 @@ const fn operational_error_message(code: ArchivedAttemptOperationalErrorCode) ->
         ArchivedAttemptOperationalErrorCode::PublishedResultUnavailable => {
             "The published result is unavailable. Restore the selected immutable result and try again."
         }
-        ArchivedAttemptOperationalErrorCode::PublishedResultInvalid => {
+        ArchivedAttemptOperationalErrorCode::ProjectionInvariant(_) => {
             "The published result is invalid. Select an intact published attempt."
+        }
+        ArchivedAttemptOperationalErrorCode::PublicationFinalizationFailed => {
+            "The result is valid but publication finalization failed. Check run directory permissions and try again."
         }
         ArchivedAttemptOperationalErrorCode::CarrierLimitExceeded => {
             "The published result has too many carriers. Select an intact published attempt."
@@ -574,27 +583,28 @@ const fn ineligibility_message(reason: ArchivedAttemptIneligibilityReason) -> &'
     }
 }
 
-pub(crate) const fn archived_trigger(trigger: ArchivedAttemptTrigger) -> &'static str {
-    match trigger {
-        ArchivedAttemptTrigger::Initial => "initial",
-        ArchivedAttemptTrigger::ExplicitRetry => "explicit_retry",
-        ArchivedAttemptTrigger::Continuation => "continuation",
-    }
+pub(super) const fn archived_trigger(trigger: AttemptTriggerV1) -> &'static str {
+    super::local_run::attempt_trigger_name(trigger)
 }
 
-pub(crate) const fn archived_attempt_state(state: ArchivedAttemptState) -> &'static str {
+pub(super) const fn archived_attempt_state(state: AttemptStateV1) -> &'static str {
     match state {
-        ArchivedAttemptState::Succeeded => "succeeded",
-        ArchivedAttemptState::WorkflowFailed => "workflow_failed",
-        ArchivedAttemptState::Cancelled => "cancelled",
+        AttemptStateV1::Succeeded => "succeeded",
+        AttemptStateV1::WorkflowFailed => "workflow_failed",
+        AttemptStateV1::Cancelled => "cancelled",
+        AttemptStateV1::Created => "created",
+        AttemptStateV1::Running => "running",
+        AttemptStateV1::Cancelling => "cancelling",
+        AttemptStateV1::Interrupted => "interrupted",
+        AttemptStateV1::Rejected => "rejected",
     }
 }
 
-pub(crate) const fn archived_outcome(outcome: ArchivedWorkflowOutcome) -> &'static str {
+pub(crate) const fn archived_outcome(outcome: WorkflowOutcomeV1) -> &'static str {
     match outcome {
-        ArchivedWorkflowOutcome::Succeeded => "succeeded",
-        ArchivedWorkflowOutcome::Failed => "failed",
-        ArchivedWorkflowOutcome::Cancelled => "cancelled",
+        WorkflowOutcomeV1::Succeeded => "succeeded",
+        WorkflowOutcomeV1::Failed => "failed",
+        WorkflowOutcomeV1::Cancelled => "cancelled",
     }
 }
 
@@ -605,15 +615,15 @@ pub(crate) const fn archived_role(role: WorkflowNodeRole) -> &'static str {
     }
 }
 
-pub(crate) const fn archived_step_state(state: ArchivedStepState) -> &'static str {
+pub(crate) const fn archived_step_state(state: WorkflowStepStateV1) -> &'static str {
     match state {
-        ArchivedStepState::Succeeded => "succeeded",
-        ArchivedStepState::Inherited => "inherited",
-        ArchivedStepState::Failed => "failed",
-        ArchivedStepState::Blocked => "blocked",
-        ArchivedStepState::Skipped => "skipped",
-        ArchivedStepState::NotRun => "not-run",
-        ArchivedStepState::Cancelled => "cancelled",
+        WorkflowStepStateV1::Succeeded => "succeeded",
+        WorkflowStepStateV1::Inherited => "inherited",
+        WorkflowStepStateV1::Failed => "failed",
+        WorkflowStepStateV1::Blocked => "blocked",
+        WorkflowStepStateV1::Skipped => "skipped",
+        WorkflowStepStateV1::NotRun => "not-run",
+        WorkflowStepStateV1::Cancelled => "cancelled",
     }
 }
 
@@ -639,7 +649,7 @@ pub(crate) const fn archived_finalization_trigger(trigger: FinalizationTriggerV1
     }
 }
 
-pub(crate) fn archived_failure_detail(failure: &ArchivedFailure) -> String {
+pub(crate) fn archived_failure_detail(failure: &super::evidence::FailureDetail) -> String {
     super::presentation::canonical_failure_detail(failure)
 }
 
@@ -671,16 +681,14 @@ fn snake_case_debug(value: impl std::fmt::Debug) -> String {
     super::presentation::snake_case_debug(value)
 }
 
-pub(crate) const fn archived_cancellation_reason(
-    reason: ArchivedCancellationReason,
-) -> &'static str {
+pub(crate) const fn archived_cancellation_reason(reason: CancellationReasonV1) -> &'static str {
     match reason {
-        ArchivedCancellationReason::UserRequest => "user_request",
-        ArchivedCancellationReason::TerminationRequest => "termination_request",
-        ArchivedCancellationReason::CallerOutputFailure => "caller_output_failure",
-        ArchivedCancellationReason::RunnerShutdown => "runner_shutdown",
-        ArchivedCancellationReason::ExecutionLeaseExpired => "execution_lease_expired",
-        ArchivedCancellationReason::ForceAbort => "force_abort",
+        CancellationReasonV1::UserRequest => "user_request",
+        CancellationReasonV1::TerminationRequest => "termination_request",
+        CancellationReasonV1::CallerOutputFailure => "caller_output_failure",
+        CancellationReasonV1::RunnerShutdown => "runner_shutdown",
+        CancellationReasonV1::ExecutionLeaseExpired => "execution_lease_expired",
+        CancellationReasonV1::ForceAbort => "force_abort",
     }
 }
 
@@ -696,28 +704,32 @@ fn timestamp(value: time::OffsetDateTime) -> String {
     super::presentation::header_timestamp(value)
 }
 
-const fn attempt_state_style(state: ArchivedAttemptState) -> &'static str {
+const fn attempt_state_style(state: AttemptStateV1) -> &'static str {
     match state {
-        ArchivedAttemptState::Succeeded => STYLE_SUCCESS,
-        ArchivedAttemptState::WorkflowFailed => STYLE_FAILURE,
-        ArchivedAttemptState::Cancelled => STYLE_BLOCKED,
+        AttemptStateV1::Succeeded => STYLE_SUCCESS,
+        AttemptStateV1::WorkflowFailed => STYLE_FAILURE,
+        AttemptStateV1::Cancelled
+        | AttemptStateV1::Cancelling
+        | AttemptStateV1::Interrupted
+        | AttemptStateV1::Rejected => STYLE_BLOCKED,
+        AttemptStateV1::Created | AttemptStateV1::Running => STYLE_MUTED,
     }
 }
 
-const fn outcome_style(outcome: ArchivedWorkflowOutcome) -> &'static str {
+const fn outcome_style(outcome: WorkflowOutcomeV1) -> &'static str {
     match outcome {
-        ArchivedWorkflowOutcome::Succeeded => STYLE_SUCCESS,
-        ArchivedWorkflowOutcome::Failed => STYLE_FAILURE,
-        ArchivedWorkflowOutcome::Cancelled => STYLE_BLOCKED,
+        WorkflowOutcomeV1::Succeeded => STYLE_SUCCESS,
+        WorkflowOutcomeV1::Failed => STYLE_FAILURE,
+        WorkflowOutcomeV1::Cancelled => STYLE_BLOCKED,
     }
 }
 
-const fn step_state_style(state: ArchivedStepState) -> &'static str {
+const fn step_state_style(state: WorkflowStepStateV1) -> &'static str {
     match state {
-        ArchivedStepState::Succeeded | ArchivedStepState::Inherited => STYLE_SUCCESS,
-        ArchivedStepState::Failed => STYLE_FAILURE,
-        ArchivedStepState::Blocked | ArchivedStepState::Cancelled => STYLE_BLOCKED,
-        ArchivedStepState::Skipped | ArchivedStepState::NotRun => STYLE_MUTED,
+        WorkflowStepStateV1::Succeeded | WorkflowStepStateV1::Inherited => STYLE_SUCCESS,
+        WorkflowStepStateV1::Failed => STYLE_FAILURE,
+        WorkflowStepStateV1::Blocked | WorkflowStepStateV1::Cancelled => STYLE_BLOCKED,
+        WorkflowStepStateV1::Skipped | WorkflowStepStateV1::NotRun => STYLE_MUTED,
     }
 }
 
@@ -780,7 +792,7 @@ mod tests {
             id: "agent".to_owned(),
             role: WorkflowNodeRole::Step,
             failure_policy: FailurePolicy::Required,
-            state: ArchivedStepState::Succeeded,
+            state: WorkflowStepStateV1::Succeeded,
             inherited_data_available: false,
             started_at: None,
             duration: None,
@@ -881,7 +893,9 @@ mod tests {
             ArchivedAttemptOperationalErrorCode::LockQueryFailed,
             ArchivedAttemptOperationalErrorCode::StatusSnapshotUnstable,
             ArchivedAttemptOperationalErrorCode::PublishedResultUnavailable,
-            ArchivedAttemptOperationalErrorCode::PublishedResultInvalid,
+            ArchivedAttemptOperationalErrorCode::ProjectionInvariant(
+                crate::workflow::archived_attempt::ProjectionInvariant::ArtifactSet,
+            ),
             ArchivedAttemptOperationalErrorCode::CarrierLimitExceeded,
             ArchivedAttemptOperationalErrorCode::RetainedWorkflowInvalid,
         ];
@@ -994,8 +1008,8 @@ mod tests {
                 super::super::publication::WorkspaceModifiedUnknownV1::Unknown,
             ),
             result_directory: PathBuf::from("/tmp/archive-run/attempts/000001/result"),
-            trigger: ArchivedAttemptTrigger::Initial,
-            state: ArchivedAttemptState::Succeeded,
+            trigger: AttemptTriggerV1::Initial,
+            state: AttemptStateV1::Succeeded,
             created_at: timestamp_value("2026-08-06T12:00:00Z"),
             started_at: Some(started),
             settled_at: timestamp_value("2026-08-06T12:00:05Z"),
@@ -1020,7 +1034,7 @@ mod tests {
                 finished_at: timestamp_value("2026-08-06T12:00:04Z"),
                 duration: Duration::from_secs(3),
             },
-            outcome: ArchivedWorkflowOutcome::Succeeded,
+            outcome: WorkflowOutcomeV1::Succeeded,
             primary_issue: None,
             cancellation: None,
             force_abort: None,
@@ -1029,7 +1043,7 @@ mod tests {
                 id: "prepare".to_owned(),
                 role: WorkflowNodeRole::Step,
                 failure_policy: FailurePolicy::Required,
-                state: ArchivedStepState::Succeeded,
+                state: WorkflowStepStateV1::Succeeded,
                 inherited_data_available: false,
                 started_at: Some(started),
                 duration: Some(Duration::from_secs(1)),

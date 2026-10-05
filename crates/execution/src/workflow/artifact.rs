@@ -153,6 +153,7 @@ pub(crate) enum CaptureFailureKind {
     GitCarrierSizeLimitExceeded,
     TotalGitCarrierSizeLimitExceeded,
     CarrierProducerUnavailable,
+    InvalidDeclaration,
     StagingUnavailable,
 }
 
@@ -616,6 +617,13 @@ impl CaptureReservation {
             .map_err(|_| CaptureFailureKind::StagingUnavailable)?;
         let usage = budget.usage_mut(class);
         let updated_budget = usage.reserved_bytes.checked_add(bytes).ok_or(overflow)?;
+        let updated_total = usage
+            .captured_bytes
+            .checked_add(updated_budget)
+            .ok_or(overflow)?;
+        if updated_total > self.store.limits(class).maximum_total_bytes.get() {
+            return Err(overflow);
+        }
         let updated_reservation = self.bytes.get(class).checked_add(bytes).ok_or(overflow)?;
         usage.reserved_bytes = updated_budget;
         *self.bytes.get_mut(class) = updated_reservation;
@@ -962,7 +970,6 @@ struct ArtifactStagingInner {
     artifacts: Mutex<BTreeSet<Arc<str>>>,
     identity_guards: Mutex<BTreeMap<Arc<str>, Arc<str>>>,
     budget: Mutex<CaptureBudgetLedger>,
-    capture_serial: Mutex<()>,
     filesystem: RwLock<Arc<dyn ArtifactFilesystem>>,
 }
 
@@ -1106,7 +1113,6 @@ impl ArtifactStaging {
                 artifacts: Mutex::new(BTreeSet::new()),
                 identity_guards: Mutex::new(BTreeMap::new()),
                 budget: Mutex::new(CaptureBudgetLedger::default()),
-                capture_serial: Mutex::new(()),
                 filesystem: RwLock::new(Arc::new(SystemArtifactFilesystem)),
             }),
         })
@@ -1180,14 +1186,6 @@ impl ArtifactStaging {
             });
         };
         let failure_identity = || Arc::<str>::from(first.output_identity());
-        let _serial = self.inner.capture_serial.lock().map_err(|_| {
-            CaptureAttemptFailure::Capture(CaptureFailure::new(
-                failure_identity(),
-                CaptureFailureKind::StagingUnavailable,
-            ))
-        })?;
-        cancellation.check()?;
-
         let mut identities = BTreeSet::new();
         if let Some(duplicate) = declarations
             .iter()
@@ -1195,7 +1193,7 @@ impl ArtifactStaging {
         {
             return Err(CaptureAttemptFailure::Capture(CaptureFailure::new(
                 Arc::from(duplicate.output_identity()),
-                CaptureFailureKind::StagingUnavailable,
+                CaptureFailureKind::InvalidDeclaration,
             )));
         }
         if let Some(invalid) = declarations
@@ -1204,7 +1202,7 @@ impl ArtifactStaging {
         {
             return Err(CaptureAttemptFailure::Capture(CaptureFailure::new(
                 Arc::from(invalid.output_identity()),
-                CaptureFailureKind::StagingUnavailable,
+                CaptureFailureKind::InvalidDeclaration,
             )));
         }
         let mut requested = BudgetCounts::default();
@@ -1237,7 +1235,7 @@ impl ArtifactStaging {
             let kind = match declaration.budget_class() {
                 Some(CarrierBudgetClass::File) => CaptureFailureKind::FileCountLimitExceeded,
                 Some(CarrierBudgetClass::Git) => CaptureFailureKind::GitCarrierCountLimitExceeded,
-                None => CaptureFailureKind::StagingUnavailable,
+                None => CaptureFailureKind::InvalidDeclaration,
             };
             return Err(CaptureAttemptFailure::Capture(CaptureFailure::new(
                 Arc::from(declaration.output_identity()),
@@ -2184,7 +2182,7 @@ impl ArtifactStaging {
                             identity.as_ref(),
                             AtFlags::empty(),
                         );
-                        return Err(CaptureFailureKind::StagingUnavailable);
+                        return Err(CaptureFailureKind::InvalidDeclaration);
                     };
                     artifacts.insert(Arc::clone(&identity));
                     return Ok((identity, File::from(file)));

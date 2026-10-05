@@ -1,3 +1,4 @@
+use crate::workflow::publication::{WorkflowOutcomeV1, WorkflowStepStateV1};
 use std::io;
 
 use super::*;
@@ -9,8 +10,7 @@ use self::interaction::ArchivedHostInteraction;
 use self::interaction::*;
 use self::widgets::*;
 use crate::workflow::archived_attempt::{
-    ArchivedDiagnosticStream, ArchivedStep, ArchivedStepDetail, ArchivedStepState,
-    ArchivedWorkflowOutcome, LocalArchivedAttempt,
+    ArchivedDiagnosticStream, ArchivedStep, ArchivedStepDetail, LocalArchivedAttempt,
 };
 use crate::workflow::archived_presentation::{
     archived_cancellation_reason, archived_failure_detail, archived_finalization_trigger,
@@ -585,18 +585,19 @@ fn archived_summary(attempt: &LocalArchivedAttempt) -> Vec<ArchivedSummaryLine> 
         "historical"
     };
     let trigger = match attempt.trigger {
-        crate::workflow::archived_attempt::ArchivedAttemptTrigger::Initial => "initial",
-        crate::workflow::archived_attempt::ArchivedAttemptTrigger::ExplicitRetry => {
-            "explicit retry"
-        }
-        crate::workflow::archived_attempt::ArchivedAttemptTrigger::Continuation => "continuation",
+        crate::workflow::local_run::AttemptTriggerV1::Initial => "initial",
+        crate::workflow::local_run::AttemptTriggerV1::ExplicitRetry => "explicit retry",
+        crate::workflow::local_run::AttemptTriggerV1::Continuation => "continuation",
     };
     let attempt_state = match attempt.state {
-        crate::workflow::archived_attempt::ArchivedAttemptState::Succeeded => "succeeded",
-        crate::workflow::archived_attempt::ArchivedAttemptState::WorkflowFailed => {
-            "workflow_failed"
-        }
-        crate::workflow::archived_attempt::ArchivedAttemptState::Cancelled => "cancelled",
+        crate::workflow::local_run::AttemptStateV1::Succeeded => "succeeded",
+        crate::workflow::local_run::AttemptStateV1::WorkflowFailed => "workflow_failed",
+        crate::workflow::local_run::AttemptStateV1::Cancelled => "cancelled",
+        crate::workflow::local_run::AttemptStateV1::Created => "created",
+        crate::workflow::local_run::AttemptStateV1::Running => "running",
+        crate::workflow::local_run::AttemptStateV1::Cancelling => "cancelling",
+        crate::workflow::local_run::AttemptStateV1::Interrupted => "interrupted",
+        crate::workflow::local_run::AttemptStateV1::Rejected => "rejected",
     };
     let (outcome, outcome_tone) = archived_outcome_status(attempt.outcome);
     let mut lines = vec![
@@ -747,23 +748,23 @@ fn archived_summary(attempt: &LocalArchivedAttempt) -> Vec<ArchivedSummaryLine> 
     lines
 }
 
-fn archived_outcome_status(outcome: ArchivedWorkflowOutcome) -> (&'static str, Tone) {
+fn archived_outcome_status(outcome: WorkflowOutcomeV1) -> (&'static str, Tone) {
     match outcome {
-        ArchivedWorkflowOutcome::Succeeded => ("succeeded", Tone::Success),
-        ArchivedWorkflowOutcome::Failed => ("failed", Tone::Failure),
-        ArchivedWorkflowOutcome::Cancelled => ("cancelled", Tone::Blocked),
+        WorkflowOutcomeV1::Succeeded => ("succeeded", Tone::Success),
+        WorkflowOutcomeV1::Failed => ("failed", Tone::Failure),
+        WorkflowOutcomeV1::Cancelled => ("cancelled", Tone::Blocked),
     }
 }
 
-fn archived_step_state(state: ArchivedStepState) -> StepStateKind {
+fn archived_step_state(state: WorkflowStepStateV1) -> StepStateKind {
     match state {
-        ArchivedStepState::Succeeded => StepStateKind::Succeeded,
-        ArchivedStepState::Inherited => StepStateKind::Inherited,
-        ArchivedStepState::Failed => StepStateKind::Failed,
-        ArchivedStepState::Blocked => StepStateKind::Blocked,
-        ArchivedStepState::Skipped => StepStateKind::Skipped,
-        ArchivedStepState::NotRun => StepStateKind::NotRun,
-        ArchivedStepState::Cancelled => StepStateKind::Cancelled,
+        WorkflowStepStateV1::Succeeded => StepStateKind::Succeeded,
+        WorkflowStepStateV1::Inherited => StepStateKind::Inherited,
+        WorkflowStepStateV1::Failed => StepStateKind::Failed,
+        WorkflowStepStateV1::Blocked => StepStateKind::Blocked,
+        WorkflowStepStateV1::Skipped => StepStateKind::Skipped,
+        WorkflowStepStateV1::NotRun => StepStateKind::NotRun,
+        WorkflowStepStateV1::Cancelled => StepStateKind::Cancelled,
     }
 }
 

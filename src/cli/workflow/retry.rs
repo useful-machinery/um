@@ -42,8 +42,10 @@ impl Command {
         );
         let run_directory = self.run.run_dir.clone();
         let opened = match tokio::task::spawn_blocking(move || {
-            reconcile_current_result_publication(&run_directory);
-            acquire_local_retry(&run_directory)
+            reconcile_current_result_publication(&run_directory).map_err(|error| {
+                anyhow::anyhow!("finalize workflow result publication: {error:?}")
+            })?;
+            acquire_local_retry(&run_directory).map_err(anyhow::Error::new)
         })
         .await
         {
@@ -61,7 +63,7 @@ impl Command {
             }
             Err(error) => {
                 signal_task.abort();
-                return super::run::diagnose(error);
+                return Err(error.into());
             }
         };
         let (workflow, inputs, maximum_parallel_steps) = {

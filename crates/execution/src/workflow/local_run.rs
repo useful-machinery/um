@@ -4727,6 +4727,14 @@ pub(super) fn mark_validated_result_published(
     requested: &Path,
     attempt_number: u64,
 ) -> Result<bool, LocalRunDirectoryError> {
+    mark_validated_result_published_with(requested, attempt_number, sync_directory)
+}
+
+fn mark_validated_result_published_with(
+    requested: &Path,
+    attempt_number: u64,
+    sync: impl Fn(&OwnedFd) -> Result<(), LocalRunDirectoryError>,
+) -> Result<bool, LocalRunDirectoryError> {
     let normalized = std::fs::canonicalize(requested)
         .map_err(|source| path_error(requested.to_owned(), "resolve run directory", source))?;
     let root = open_directory_path(&normalized)
@@ -4762,9 +4770,14 @@ pub(super) fn mark_validated_result_published(
     let attempt_name =
         attempt_directory_name(attempt_number).ok_or(LocalRunDirectoryError::StateInvalid)?;
     let attempt_directory = open_directory_at(&attempts, &attempt_name)?;
-    open_directory_at(&attempt_directory, "result")?;
-
+    let result = open_directory_at(&attempt_directory, "result")?;
     let private = Arc::new(open_directory_at(&root, PRIVATE_DIRECTORY)?);
+    // Publication synced the files and staged directories before the rename.
+    // A failed post-rename sync leaves the result visible but not yet durable;
+    // persist Published only after both sides of the rename are synced.
+    sync(&result)?;
+    sync(&attempt_directory)?;
+    sync(&private)?;
     let root = Arc::new(root);
     let store = StateStore {
         root,
@@ -7011,7 +7024,7 @@ fn status_result(result: &AttemptResultV1) -> LocalStatusResult {
     }
 }
 
-const fn attempt_trigger_name(trigger: AttemptTriggerV1) -> &'static str {
+pub(super) const fn attempt_trigger_name(trigger: AttemptTriggerV1) -> &'static str {
     match trigger {
         AttemptTriggerV1::Initial => "initial",
         AttemptTriggerV1::ExplicitRetry => "explicit_retry",

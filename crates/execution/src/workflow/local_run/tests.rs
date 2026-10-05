@@ -1,3 +1,4 @@
+use crate::workflow::publication::{CancellationReasonV1, WorkflowOutcomeV1};
 use std::collections::BTreeMap;
 use std::fs::{self, Permissions};
 use std::num::NonZeroU64;
@@ -17,9 +18,8 @@ use crate::workflow::admission::{
 };
 use crate::workflow::archived_attempt::{
     ArchivedAttemptIneligibilityReason, ArchivedAttemptLoadError,
-    ArchivedAttemptOperationalErrorCode, ArchivedAttemptState, ArchivedCancellationReason,
-    ArchivedStepDetail, ArchivedWorkflowOutcome, load_local_archived_attempt,
-    load_local_archived_attempt_observed,
+    ArchivedAttemptOperationalErrorCode, ArchivedStepDetail, ProjectionInvariant,
+    load_local_archived_attempt, load_local_archived_attempt_observed,
 };
 use crate::workflow::resolution;
 
@@ -1112,8 +1112,8 @@ fn archived_attempt_loads_schema_one_state_without_retained_output_foundation() 
     fs::write(run_path.join(STATE_FILE), json_bytes(state)).unwrap();
 
     let archived = load_local_archived_attempt(&run_path, None).unwrap();
-    assert_eq!(archived.attempt_number, 1);
-    assert_eq!(archived.state, ArchivedAttemptState::WorkflowFailed);
+    assert_eq!(archived.projection.attempt_number, 1);
+    assert_eq!(archived.projection.state, AttemptStateV1::WorkflowFailed);
 }
 
 #[test]
@@ -3509,19 +3509,20 @@ fn archived_attempt_preserves_advisory_issues_on_a_succeeded_attempt() {
 
     let archived = load_local_archived_attempt(&run_path, None).unwrap();
 
-    assert_eq!(archived.state, ArchivedAttemptState::Succeeded);
-    assert_eq!(archived.outcome, ArchivedWorkflowOutcome::Succeeded);
-    assert!(archived.primary_issue.is_none());
+    assert_eq!(archived.projection.state, AttemptStateV1::Succeeded);
+    assert_eq!(archived.projection.outcome, WorkflowOutcomeV1::Succeeded);
+    assert!(archived.projection.primary_issue.is_none());
     assert!(matches!(
-        archived.steps[0].detail,
+        archived.projection.steps[0].detail,
         ArchivedStepDetail::Evidence(crate::workflow::evidence::NodeDetail::Failed(_))
     ));
     assert!(matches!(
-        archived.steps[1].detail,
+        archived.projection.steps[1].detail,
         ArchivedStepDetail::Evidence(crate::workflow::evidence::NodeDetail::Blocked(_))
     ));
     assert!(
         archived
+            .projection
             .steps
             .iter()
             .all(|step| step.failure_policy == super::super::document::FailurePolicy::Advisory)
@@ -3597,24 +3598,30 @@ fn archived_attempt_loads_failed_current_result_and_raw_stream_prefixes_read_onl
     )
     .unwrap();
 
-    assert_eq!(archived.current_attempt_number, 1);
-    assert_eq!(archived.attempt_number, 1);
-    assert_eq!(archived.state, ArchivedAttemptState::WorkflowFailed);
-    assert_eq!(archived.outcome, ArchivedWorkflowOutcome::Failed);
-    assert_eq!(archived.result_directory, result_directory);
+    assert_eq!(archived.projection.current_attempt_number, 1);
+    assert_eq!(archived.projection.attempt_number, 1);
+    assert_eq!(archived.projection.state, AttemptStateV1::WorkflowFailed);
+    assert_eq!(archived.projection.outcome, WorkflowOutcomeV1::Failed);
+    assert_eq!(archived.projection.result_directory, result_directory);
     assert_eq!(
         serde_json::to_value(&archived.result).unwrap(),
         expected_result,
         "the loader must expose the complete value from its validated immutable read"
     );
     assert_eq!(result_open_count.get(), 1);
-    assert_eq!(archived.workflow.presentation_order, ["first", "second"]);
-    assert_eq!(archived.steps.len(), 2);
+    assert_eq!(
+        archived.projection.workflow.presentation_order,
+        ["first", "second"]
+    );
+    assert_eq!(archived.projection.steps.len(), 2);
     assert!(matches!(
-        archived.steps[0].detail,
+        archived.projection.steps[0].detail,
         ArchivedStepDetail::Evidence(crate::workflow::evidence::NodeDetail::Failed(_))
     ));
-    let output = archived.steps[0].command_output.as_ref().unwrap();
+    let output = archived.projection.steps[0]
+        .command_output
+        .as_ref()
+        .unwrap();
     assert_eq!(output.stdout.bytes.as_ref(), [0_u8, 0xff, b'\n']);
     assert_eq!(output.stdout.retained_bytes, 3);
     assert_eq!(output.stdout.discarded_bytes, 0);
@@ -3643,15 +3650,15 @@ fn archived_attempt_selects_current_and_explicit_historical_publications() {
     publish_result_fixture(&fixture, &retry);
 
     let current = load_local_archived_attempt(&run_path, None).unwrap();
-    assert_eq!(current.current_attempt_number, 2);
-    assert_eq!(current.attempt_number, 2);
-    assert_eq!(current.outcome, ArchivedWorkflowOutcome::Succeeded);
+    assert_eq!(current.projection.current_attempt_number, 2);
+    assert_eq!(current.projection.attempt_number, 2);
+    assert_eq!(current.projection.outcome, WorkflowOutcomeV1::Succeeded);
 
     let historical =
         load_local_archived_attempt(&run_path, Some(NonZeroU64::new(1).unwrap())).unwrap();
-    assert_eq!(historical.current_attempt_number, 2);
-    assert_eq!(historical.attempt_number, 1);
-    assert_eq!(historical.outcome, ArchivedWorkflowOutcome::Failed);
+    assert_eq!(historical.projection.current_attempt_number, 2);
+    assert_eq!(historical.projection.attempt_number, 1);
+    assert_eq!(historical.projection.outcome, WorkflowOutcomeV1::Failed);
 
     assert_archive_ineligible(
         load_local_archived_attempt(&run_path, Some(NonZeroU64::new(3).unwrap())).unwrap_err(),
@@ -3713,6 +3720,91 @@ fn archived_attempt_reports_each_nonpublished_disposition_without_fallback() {
         load_local_archived_attempt(&run_path, None).unwrap_err(),
         ArchivedAttemptIneligibilityReason::PublicationFailed,
     );
+}
+
+#[test]
+fn archived_load_does_not_finalize_pending_publication_and_reconciliation_reports_failure() {
+    let fixture = AdmittedFixture::new();
+    let run_path = fixture.run_path("archive-pending-finalization");
+    let run = InitialLocalRun::create(&run_path, &fixture.admitted).unwrap();
+    settle_as_succeeded(&run);
+    let result_directory = publish_result_fixture(&fixture, &run);
+    run.state
+        .update(|state| {
+            state.attempts[0].result = AttemptResultV1::NotPublished {
+                reason: ResultAbsentReasonV1::PublicationPending,
+            };
+            Ok(())
+        })
+        .unwrap();
+    drop(run);
+
+    load_local_archived_attempt(&run_path, None).unwrap();
+    assert!(matches!(
+        read_stable_local_run_snapshot(&run_path)
+            .unwrap()
+            .state
+            .attempts[0]
+            .result,
+        AttemptResultV1::NotPublished {
+            reason: ResultAbsentReasonV1::PublicationPending
+        }
+    ));
+    let valid_result = fs::read(result_directory.join("result.json")).unwrap();
+    fs::write(result_directory.join("result.json"), b"invalid").unwrap();
+    assert_archive_operational(
+        super::super::archived_attempt::reconcile_current_result_publication(&run_path)
+            .unwrap_err(),
+        ArchivedAttemptOperationalErrorCode::ProjectionInvariant(ProjectionInvariant::ArtifactSet),
+    );
+    assert!(matches!(
+        read_stable_local_run_snapshot(&run_path)
+            .unwrap()
+            .state
+            .attempts[0]
+            .result,
+        AttemptResultV1::NotPublished {
+            reason: ResultAbsentReasonV1::PublicationPending
+        }
+    ));
+    fs::write(result_directory.join("result.json"), valid_result).unwrap();
+    let syncs = std::cell::Cell::new(0);
+    assert!(
+        mark_validated_result_published_with(&run_path, 1, |directory| {
+            syncs.set(syncs.get() + 1);
+            if syncs.get() == 2 {
+                Err(file_error(
+                    directory,
+                    ".",
+                    "sync directory",
+                    std::io::Error::other("injected attempt-parent sync failure"),
+                ))
+            } else {
+                sync_directory(directory)
+            }
+        })
+        .is_err()
+    );
+    assert_eq!(syncs.get(), 2);
+    assert!(matches!(
+        read_stable_local_run_snapshot(&run_path)
+            .unwrap()
+            .state
+            .attempts[0]
+            .result,
+        AttemptResultV1::NotPublished {
+            reason: ResultAbsentReasonV1::PublicationPending
+        }
+    ));
+    super::super::archived_attempt::reconcile_current_result_publication(&run_path).unwrap();
+    assert!(matches!(
+        read_stable_local_run_snapshot(&run_path)
+            .unwrap()
+            .state
+            .attempts[0]
+            .result,
+        AttemptResultV1::Published { .. }
+    ));
 }
 
 #[test]
@@ -3779,42 +3871,42 @@ fn archived_attempt_rejects_malformed_and_cross_document_mismatched_results() {
     .unwrap();
     assert_archive_operational(
         load_local_archived_attempt(&run_path, None).unwrap_err(),
-        ArchivedAttemptOperationalErrorCode::PublishedResultInvalid,
+        ArchivedAttemptOperationalErrorCode::ProjectionInvariant(ProjectionInvariant::ArtifactSet),
     );
 
     let mut invalid_values = Vec::new();
     let mut value = valid.clone();
     value["unknown"] = Value::Bool(true);
-    invalid_values.push(value);
+    invalid_values.push((value, ProjectionInvariant::ArtifactSet));
     let mut value = valid.clone();
     value["attemptNumber"] = Value::from(2);
-    invalid_values.push(value);
+    invalid_values.push((value, ProjectionInvariant::AttemptMetadata));
     let mut value = valid.clone();
     value["workflow"]["digest"]["value"] = Value::String("0".repeat(64));
-    invalid_values.push(value);
+    invalid_values.push((value, ProjectionInvariant::AttemptMetadata));
     let mut value = valid.clone();
     value["execution"]["executionRoot"] = Value::String("/different".to_owned());
-    invalid_values.push(value);
+    invalid_values.push((value, ProjectionInvariant::AttemptMetadata));
     let mut value = valid.clone();
     value["outcome"] = Value::String("succeeded".to_owned());
     value.as_object_mut().unwrap().remove("primaryIssue");
-    invalid_values.push(value);
+    invalid_values.push((value, ProjectionInvariant::ArtifactSet));
     let mut value = valid.clone();
     value["steps"].as_array_mut().unwrap().swap(0, 1);
-    invalid_values.push(value);
+    invalid_values.push((value, ProjectionInvariant::Steps));
     let mut value = valid.clone();
     value["steps"][0]["commandOutput"]["stdout"]["retainedBytes"] = Value::from(2);
-    invalid_values.push(value);
+    invalid_values.push((value, ProjectionInvariant::ArtifactSet));
     let mut value = valid.clone();
     value["steps"][0]["detail"]["code"] = Value::String("future_code".to_owned());
     value["primaryIssue"]["detail"]["code"] = Value::String("future_code".to_owned());
-    invalid_values.push(value);
+    invalid_values.push((value, ProjectionInvariant::ArtifactSet));
 
-    for value in invalid_values {
+    for (value, invariant) in invalid_values {
         overwrite_result(&result_directory, value);
         assert_archive_operational(
             load_local_archived_attempt(&run_path, None).unwrap_err(),
-            ArchivedAttemptOperationalErrorCode::PublishedResultInvalid,
+            ArchivedAttemptOperationalErrorCode::ProjectionInvariant(invariant),
         );
     }
 }
@@ -3865,9 +3957,9 @@ fn archived_attempt_loads_cancelled_commands_that_never_started() {
 
     let archived = load_local_archived_attempt(&run_path, None).unwrap();
 
-    assert_eq!(archived.state, ArchivedAttemptState::Cancelled);
-    assert_eq!(archived.outcome, ArchivedWorkflowOutcome::Cancelled);
-    assert!(archived.steps.iter().all(|step| {
+    assert_eq!(archived.projection.state, AttemptStateV1::Cancelled);
+    assert_eq!(archived.projection.outcome, WorkflowOutcomeV1::Cancelled);
+    assert!(archived.projection.steps.iter().all(|step| {
         matches!(
             step.detail,
             ArchivedStepDetail::Evidence(crate::workflow::evidence::NodeDetail::Cancellation(_))
@@ -3912,16 +4004,20 @@ fn archived_attempt_loads_ordinary_force_with_suppressed_finalization() {
     let archived = load_local_archived_attempt(&run_path, None).unwrap();
 
     assert_eq!(
-        archived.force_abort.map(|force_abort| force_abort.phase),
+        archived
+            .projection
+            .force_abort
+            .map(|force_abort| force_abort.phase),
         Some(super::super::publication::ForceAbortPhaseV1::Ordinary)
     );
     assert_eq!(
         archived
+            .projection
             .finalization
             .as_ref()
             .and_then(|finalization| finalization.cancellation.as_ref())
             .map(|cancellation| cancellation.reason),
-        Some(ArchivedCancellationReason::ForceAbort)
+        Some(CancellationReasonV1::ForceAbort)
     );
 }
 
@@ -4022,7 +4118,7 @@ fn archived_attempt_loads_valid_result_larger_than_state_document_limit() {
 
     let archived = load_local_archived_attempt(&run_path, None)
         .expect("the result schema bounds streams independently, not the whole document");
-    assert_eq!(archived.steps.len(), 256);
+    assert_eq!(archived.projection.steps.len(), 256);
 }
 
 #[test]
@@ -4252,7 +4348,7 @@ fn archived_attempt_binds_retained_output_kind_and_export_metadata() {
     overwrite_result(&result_directory, substituted_result);
     assert_archive_operational(
         load_local_archived_attempt(&run_path, None).unwrap_err(),
-        ArchivedAttemptOperationalErrorCode::PublishedResultInvalid,
+        ArchivedAttemptOperationalErrorCode::ProjectionInvariant(ProjectionInvariant::Exports),
     );
 
     fs::write(result_directory.join("exports/0001"), retained_bytes).unwrap();
@@ -4351,7 +4447,7 @@ fn archived_attempt_enforces_alias_source_identity() {
     .expect("separate carriers are portable without the retained source identities");
     assert_archive_operational(
         load_local_archived_attempt(&run_path, None).unwrap_err(),
-        ArchivedAttemptOperationalErrorCode::PublishedResultInvalid,
+        ArchivedAttemptOperationalErrorCode::ProjectionInvariant(ProjectionInvariant::Exports),
     );
 
     let mut shared_by_distinct_sources = valid;
@@ -4366,7 +4462,7 @@ fn archived_attempt_enforces_alias_source_identity() {
     .expect("equal bytes are portable without the retained source identities");
     assert_archive_operational(
         load_local_archived_attempt(&run_path, None).unwrap_err(),
-        ArchivedAttemptOperationalErrorCode::PublishedResultInvalid,
+        ArchivedAttemptOperationalErrorCode::ProjectionInvariant(ProjectionInvariant::Exports),
     );
 }
 
@@ -4393,7 +4489,7 @@ fn archived_attempt_enforces_stream_prefix_retention_invariants() {
     overwrite_result(&result_directory, full_prefix);
     let archived = load_local_archived_attempt(&run_path, None).unwrap();
     assert_eq!(
-        archived.steps[0]
+        archived.projection.steps[0]
             .command_output
             .as_ref()
             .unwrap()
@@ -4409,7 +4505,7 @@ fn archived_attempt_enforces_stream_prefix_retention_invariants() {
     overwrite_result(&result_directory, impossible);
     assert_archive_operational(
         load_local_archived_attempt(&run_path, None).unwrap_err(),
-        ArchivedAttemptOperationalErrorCode::PublishedResultInvalid,
+        ArchivedAttemptOperationalErrorCode::ProjectionInvariant(ProjectionInvariant::ArtifactSet),
     );
 }
 
@@ -4458,7 +4554,7 @@ fn archived_attempt_validates_failure_identities_against_the_retained_step() {
     overwrite_result(&result_directory, invalid_name);
     assert_archive_operational(
         load_local_archived_attempt(&run_path, None).unwrap_err(),
-        ArchivedAttemptOperationalErrorCode::PublishedResultInvalid,
+        ArchivedAttemptOperationalErrorCode::ProjectionInvariant(ProjectionInvariant::Steps),
     );
 
     let mut input_failure = original.clone();
@@ -4496,7 +4592,7 @@ fn archived_attempt_validates_failure_identities_against_the_retained_step() {
     overwrite_result(&result_directory, input_failure);
     assert_archive_operational(
         load_local_archived_attempt(&run_path, None).unwrap_err(),
-        ArchivedAttemptOperationalErrorCode::PublishedResultInvalid,
+        ArchivedAttemptOperationalErrorCode::ProjectionInvariant(ProjectionInvariant::Steps),
     );
 
     let mut indexed_scalar = original.clone();
@@ -4519,7 +4615,7 @@ fn archived_attempt_validates_failure_identities_against_the_retained_step() {
     overwrite_result(&result_directory, indexed_scalar);
     assert_archive_operational(
         load_local_archived_attempt(&run_path, None).unwrap_err(),
-        ArchivedAttemptOperationalErrorCode::PublishedResultInvalid,
+        ArchivedAttemptOperationalErrorCode::ProjectionInvariant(ProjectionInvariant::Steps),
     );
 
     let mut output_failure = original;
@@ -4553,7 +4649,7 @@ fn archived_attempt_validates_failure_identities_against_the_retained_step() {
     overwrite_result(&result_directory, output_failure);
     assert_archive_operational(
         load_local_archived_attempt(&run_path, None).unwrap_err(),
-        ArchivedAttemptOperationalErrorCode::PublishedResultInvalid,
+        ArchivedAttemptOperationalErrorCode::ProjectionInvariant(ProjectionInvariant::Steps),
     );
 }
 
@@ -4758,7 +4854,7 @@ fn archived_attempt_rejects_impossible_outcomes_and_blocking_causes() {
     overwrite_result(&result_directory, false_blocker);
     assert_archive_operational(
         load_local_archived_attempt(&run_path, None).unwrap_err(),
-        ArchivedAttemptOperationalErrorCode::PublishedResultInvalid,
+        ArchivedAttemptOperationalErrorCode::ProjectionInvariant(ProjectionInvariant::Steps),
     );
 
     let mut impossible_success = valid;
@@ -4776,7 +4872,7 @@ fn archived_attempt_rejects_impossible_outcomes_and_blocking_causes() {
         .unwrap();
     assert_archive_operational(
         load_local_archived_attempt(&run_path, None).unwrap_err(),
-        ArchivedAttemptOperationalErrorCode::PublishedResultInvalid,
+        ArchivedAttemptOperationalErrorCode::ProjectionInvariant(ProjectionInvariant::ArtifactSet),
     );
 }
 
@@ -4810,7 +4906,9 @@ fn archived_attempt_rejects_not_run_step_with_failed_dependency() {
 
     assert_archive_operational(
         load_local_archived_attempt(&run_path, None).unwrap_err(),
-        ArchivedAttemptOperationalErrorCode::PublishedResultInvalid,
+        ArchivedAttemptOperationalErrorCode::ProjectionInvariant(
+            ProjectionInvariant::TerminalSteps,
+        ),
     );
 }
 
@@ -4867,6 +4965,6 @@ fn archived_attempt_rejects_symlinks_and_does_not_adopt_replacements() {
         |_| {},
     )
     .unwrap();
-    assert_eq!(archived.attempt_number, 1);
+    assert_eq!(archived.projection.attempt_number, 1);
     assert!(durable_tree(&run_path).is_empty());
 }

@@ -3,7 +3,8 @@ use std::io;
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _, symlink};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Barrier};
+use std::sync::{Arc, Barrier, Condvar, Mutex, mpsc};
+use std::time::Duration;
 
 use super::*;
 use crate::workflow::canonical_json;
@@ -1104,8 +1105,92 @@ impl CarrierProducer for GatedCarrierProducer {
     }
 }
 
+struct SignalledCarrierProducer {
+    started: Arc<(Mutex<bool>, Condvar)>,
+    resume: mpsc::Receiver<()>,
+}
+
+impl CarrierProducer for SignalledCarrierProducer {
+    fn stream_to(&mut self, destination: &mut CarrierDestination<'_>) -> io::Result<()> {
+        let (ready, signal) = &*self.started;
+        *ready.lock().unwrap() = true;
+        signal.notify_one();
+        self.resume.recv().map_err(io::Error::other)?;
+        destination.write_all(b"two")
+    }
+}
+
+fn producer_started(started: &Arc<(Mutex<bool>, Condvar)>) -> bool {
+    let (ready, signal) = &**started;
+    // Timeout bounds the anti-hang case where a wide lock prevents entry.
+    // The readiness bit, not the timer, establishes overlap.
+    let (ready, _) = signal
+        .wait_timeout_while(ready.lock().unwrap(), Duration::from_secs(10), |ready| {
+            !*ready
+        })
+        .unwrap();
+    *ready
+}
+
 #[test]
-fn concurrent_git_captures_reserve_in_serial_capture_order() {
+fn concurrent_git_captures_overlap_and_account_for_reservations() {
+    let fixture = CaptureFixture::with_all_limits(1, 1, 1, 2, 3, 6);
+    let started = Arc::new(Barrier::new(2));
+    let resume = Arc::new(Barrier::new(2));
+    let first_store = fixture.store.clone();
+    let first_started = Arc::clone(&started);
+    let first_resume = Arc::clone(&resume);
+    let first = std::thread::spawn(move || {
+        let mut producer = GatedCarrierProducer {
+            started: first_started,
+            resume: first_resume,
+            bytes: b"one",
+        };
+        let mut declarations = [CaptureCandidateDeclaration::GitBranch(
+            GitBranchCaptureDeclaration::new("first", git_metadata(1, 2, 3), Some(&mut producer)),
+        )];
+        first_store.capture_candidates(&mut declarations, &CaptureCancellation::default())
+    });
+    started.wait();
+    assert_eq!(fixture.store.git_reservation_usage(), (1, 0));
+    let second_store = fixture.store.clone();
+    let second_started = Arc::new((Mutex::new(false), Condvar::new()));
+    let producer_started_signal = Arc::clone(&second_started);
+    let (second_resume_tx, second_resume_rx) = mpsc::channel();
+    let second = std::thread::spawn(move || {
+        let mut producer = SignalledCarrierProducer {
+            started: producer_started_signal,
+            resume: second_resume_rx,
+        };
+        let mut declarations = [CaptureCandidateDeclaration::GitBranch(
+            GitBranchCaptureDeclaration::new("second", git_metadata(2, 3, 4), Some(&mut producer)),
+        )];
+        second_store.capture_candidates(&mut declarations, &CaptureCancellation::default())
+    });
+    if !producer_started(&second_started) {
+        // Bound the anti-hang case (the old wide lock). Release both workers
+        // before failing so a regression cannot strand the test process.
+        resume.wait();
+        drop(second_resume_tx);
+        let _ = first.join();
+        let _ = second.join();
+        panic!("second producer did not enter while first producer was blocked");
+    }
+    assert_eq!(fixture.store.git_reservation_usage(), (2, 0));
+    second_resume_tx.send(()).unwrap();
+    let second_retained = second.join().unwrap().unwrap().commit();
+    // The first producer is still waiting; the second capture has completed.
+    assert_eq!(fixture.store.git_budget_usage(), (1, 3));
+    resume.wait();
+    let retained = first.join().unwrap().unwrap().commit();
+    assert_eq!(fixture.store.git_budget_usage(), (2, 6));
+    assert_eq!(fixture.store.git_reservation_usage(), (0, 0));
+    assert_eq!(fixture.store.staged_artifact_count(), 2);
+    drop((retained, second_retained));
+}
+
+#[test]
+fn overlapping_git_captures_cannot_both_commit_the_same_remaining_bytes() {
     let fixture = CaptureFixture::with_all_limits(1, 1, 1, 2, 3, 3);
     let started = Arc::new(Barrier::new(2));
     let resume = Arc::new(Barrier::new(2));
@@ -1125,19 +1210,32 @@ fn concurrent_git_captures_reserve_in_serial_capture_order() {
     });
     started.wait();
     let second_store = fixture.store.clone();
+    let second_started = Arc::new((Mutex::new(false), Condvar::new()));
+    let producer_started_signal = Arc::clone(&second_started);
+    let (second_resume_tx, second_resume_rx) = mpsc::channel();
     let second = std::thread::spawn(move || {
-        let mut producer = BytesCarrierProducer(b"two".to_vec());
+        let mut producer = SignalledCarrierProducer {
+            started: producer_started_signal,
+            resume: second_resume_rx,
+        };
         let mut declarations = [CaptureCandidateDeclaration::GitBranch(
             GitBranchCaptureDeclaration::new("second", git_metadata(2, 3, 4), Some(&mut producer)),
         )];
         second_store.capture_candidates(&mut declarations, &CaptureCancellation::default())
     });
+    if !producer_started(&second_started) {
+        resume.wait();
+        drop(second_resume_tx);
+        let _ = first.join();
+        let _ = second.join();
+        panic!("second producer did not overlap the first");
+    }
+    second_resume_tx.send(()).unwrap();
+    let second_retained = second.join().unwrap().unwrap().commit();
+    assert_eq!(fixture.store.git_budget_usage(), (1, 3));
     resume.wait();
-
-    let retained = first.join().unwrap().unwrap().commit();
-    let failure = failed_capture(second.join().unwrap());
-
-    assert_eq!(failure.output_identity(), "second");
+    let failure = failed_capture(first.join().unwrap());
+    assert_eq!(failure.output_identity(), "first");
     assert_eq!(
         failure.kind(),
         CaptureFailureKind::TotalGitCarrierSizeLimitExceeded
@@ -1145,7 +1243,7 @@ fn concurrent_git_captures_reserve_in_serial_capture_order() {
     assert_eq!(fixture.store.git_budget_usage(), (1, 3));
     assert_eq!(fixture.store.git_reservation_usage(), (0, 0));
     assert_eq!(fixture.store.staged_artifact_count(), 1);
-    drop(retained);
+    drop(second_retained);
 }
 
 #[test]
@@ -1155,26 +1253,32 @@ fn git_carrier_presence_must_match_semantic_delta() {
     let mut missing_carrier = [CaptureCandidateDeclaration::GitBranch(
         GitBranchCaptureDeclaration::new("changed", git_metadata(1, 2, 3), None),
     )];
-    let missing_carrier_rejected = fixture
-        .store
-        .capture_candidates(&mut missing_carrier, &CaptureCancellation::default())
-        .is_err();
+    let missing_carrier_rejected = failed_capture(
+        fixture
+            .store
+            .capture_candidates(&mut missing_carrier, &CaptureCancellation::default()),
+    );
 
     let mut producer = BytesCarrierProducer(b"bundle".to_vec());
     let mut forbidden_carrier = [CaptureCandidateDeclaration::GitBranch(
         GitBranchCaptureDeclaration::new("unchanged", git_metadata(1, 1, 3), Some(&mut producer)),
     )];
-    let forbidden_carrier_rejected = fixture
-        .store
-        .capture_candidates(&mut forbidden_carrier, &CaptureCancellation::default())
-        .is_err();
+    let forbidden_carrier_rejected = failed_capture(
+        fixture
+            .store
+            .capture_candidates(&mut forbidden_carrier, &CaptureCancellation::default()),
+    );
 
     assert_eq!(fixture.store.git_budget_usage(), (0, 0));
     assert_eq!(fixture.store.git_reservation_usage(), (0, 0));
     assert_eq!(fixture.store.staged_artifact_count(), 0);
-    assert!(
-        missing_carrier_rejected && forbidden_carrier_rejected,
-        "carrier presence invariant was not enforced: missing_rejected={missing_carrier_rejected}, forbidden_rejected={forbidden_carrier_rejected}"
+    assert_eq!(
+        missing_carrier_rejected.kind(),
+        CaptureFailureKind::InvalidDeclaration
+    );
+    assert_eq!(
+        forbidden_carrier_rejected.kind(),
+        CaptureFailureKind::InvalidDeclaration
     );
 }
 

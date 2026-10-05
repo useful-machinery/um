@@ -29,6 +29,67 @@ use crate::workflow::result_validation::RetainedJsonSchema;
 use crate::workflow::runtime::{ForceAbortEvidence, OutputSet, RunCancellationPhase};
 use crate::workflow::validated::{WorkflowNode, WorkflowNodeRole};
 
+#[test]
+fn abandoned_preflight_is_removed_on_next_destination_validation() {
+    let temporary = tempfile::tempdir().unwrap();
+    let parent = temporary.path();
+    let result_parent = open_directory(parent).unwrap();
+    let (name, locked) = create_validation_directory(&result_parent).unwrap();
+    let abandoned = parent.join(name);
+    // Dropping the handle simulates process death before preflight cleanup.
+    drop(locked);
+    prepare_result_destination(&parent.join("result")).unwrap();
+    assert!(!abandoned.exists());
+
+    let private = parent.join("private");
+    fs::create_dir(&private).unwrap();
+    let staging_parent = open_directory(&private).unwrap();
+    let (source_name, locked) = create_validation_directory(&staging_parent).unwrap();
+    let abandoned_target = parent.join(&source_name);
+    renameat_with(
+        &staging_parent,
+        &source_name,
+        &result_parent,
+        &source_name,
+        RenameFlags::NOREPLACE,
+    )
+    .unwrap();
+    drop(locked);
+    let (source_name, locked) = create_validation_directory(&staging_parent).unwrap();
+    let abandoned_source = private.join(source_name);
+    drop(locked);
+    prepare_attempt_result_destination(
+        &parent.join("result"),
+        &private,
+        &result_parent,
+        &staging_parent,
+    )
+    .unwrap();
+    assert!(!abandoned_target.exists());
+    assert!(!abandoned_source.exists());
+
+    // A concurrent publisher's preflight must not be mistaken for a crash.
+    let (source_name, live) = create_validation_directory(&staging_parent).unwrap();
+    let abandoned_source = private.join(source_name);
+    prepare_attempt_result_destination(
+        &parent.join("result"),
+        &private,
+        &result_parent,
+        &staging_parent,
+    )
+    .unwrap();
+    assert!(abandoned_source.exists());
+    drop(live);
+    prepare_attempt_result_destination(
+        &parent.join("result"),
+        &private,
+        &result_parent,
+        &staging_parent,
+    )
+    .unwrap();
+    assert!(!abandoned_source.exists());
+}
+
 struct PublicationFixture {
     _temporary: tempfile::TempDir,
     source_root: PathBuf,
@@ -1831,6 +1892,41 @@ fn replaced_staged_exports_directory_is_rejected() {
         LocalPublicationFailureKind::VerificationUnavailable
     );
     assert!(!destination.exists());
+    assert!(staging_paths(&fixture.results_parent).is_empty());
+}
+
+struct FailCommittedSync;
+
+impl PublicationObserver for FailCommittedSync {
+    fn sync_committed_directory(&mut self, _directory: &OwnedFd) -> std::io::Result<()> {
+        Err(std::io::Error::other("injected post-rename sync failure"))
+    }
+}
+
+#[test]
+fn post_rename_sync_failure_identifies_visible_result_for_reconciliation() {
+    let fixture = PublicationFixture::new();
+    let run = run_fixture(&fixture);
+    let destination = fixture.destination("committed-sync-failed");
+    let failure = publish_with_observer(
+        &destination,
+        &fixture.artifacts,
+        &run,
+        &mut FailCommittedSync,
+    )
+    .unwrap_err();
+    assert_eq!(failure.phase(), LocalPublicationPhase::Commit);
+    assert!(failure.committed());
+    assert_eq!(
+        failure.kind(),
+        LocalPublicationFailureKind::CommittedDurabilityUnavailable
+    );
+    let (_, result) = read_result(&destination);
+    assert_eq!(result["attemptNumber"], run.attempt_number);
+    assert_eq!(
+        std::fs::read(destination.join("exports/0001")).unwrap(),
+        b"upper report bytes"
+    );
     assert!(staging_paths(&fixture.results_parent).is_empty());
 }
 

@@ -2399,10 +2399,12 @@
               "enum": [
                 "run_directory_unavailable",
                 "run_directory_invalid",
+                "recovery_schema_unsupported",
                 "lock_query_failed",
                 "status_snapshot_unstable",
                 "published_result_unavailable",
                 "published_result_invalid",
+                "publication_finalization_failed",
                 "carrier_limit_exceeded",
                 "retained_workflow_invalid",
                 "attempt_unknown",

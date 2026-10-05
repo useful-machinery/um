@@ -13,8 +13,8 @@ use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use ring::digest::{Context as DigestContext, SHA256};
 use rustix::fd::OwnedFd;
 use rustix::fs::{
-    AtFlags, FileType, Mode, OFlags, RenameFlags, fstat, mkdirat, openat, renameat_with, statat,
-    unlinkat,
+    AtFlags, FileType, FlockOperation, Mode, OFlags, RenameFlags, flock, fstat, mkdirat, openat,
+    renameat_with, statat, unlinkat,
 };
 use rustix::io::Errno;
 use serde::de::Error as _;
@@ -363,6 +363,7 @@ pub(crate) enum LocalPublicationFailureKind {
     SerializationUnavailable,
     VerificationUnavailable,
     AtomicPublicationUnavailable,
+    CommittedDurabilityUnavailable,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -436,6 +437,12 @@ impl LocalPublicationError {
         self.invariant
     }
 
+    /// A rename has made the result visible. The owner must leave the durable
+    /// attempt pending so reconciliation can sync it before recording publication.
+    pub fn committed(&self) -> bool {
+        self.kind == LocalPublicationFailureKind::CommittedDurabilityUnavailable
+    }
+
     /// Stable, content-free details for operator diagnostics. In particular, these
     /// omit the export name, which comes from the workflow definition.
     pub fn diagnostic_codes(&self) -> (&'static str, &'static str, Option<&'static str>) {
@@ -462,6 +469,9 @@ impl LocalPublicationError {
             LocalPublicationFailureKind::VerificationUnavailable => "verification_unavailable",
             LocalPublicationFailureKind::AtomicPublicationUnavailable => {
                 "atomic_publication_unavailable"
+            }
+            LocalPublicationFailureKind::CommittedDurabilityUnavailable => {
+                "committed_durability_unavailable"
             }
         };
         (phase, kind, self.invariant.map(RunResultInvariant::as_str))
@@ -1695,6 +1705,10 @@ trait PublicationObserver {
     fn close_staged_file(&mut self, file: File, _staged_file: &StagedFile) -> io::Result<()> {
         close_file(file)
     }
+
+    fn sync_committed_directory(&mut self, directory: &OwnedFd) -> io::Result<()> {
+        sync_directory(directory)
+    }
 }
 
 struct NoopPublicationObserver;
@@ -1753,37 +1767,13 @@ pub fn prepare_cloud_workflow_result(
     commit_oid: String,
     source_display_snapshot: Option<CloudSourceDisplaySnapshotV1>,
 ) -> Result<PreparedCloudWorkflowResult, LocalPublicationError> {
-    validate_export_source_set(run)?;
-    let mut exports = BTreeMap::new();
     let mut carriers = Vec::new();
-    let mut sources = BTreeMap::<(String, String), SourcePublication>::new();
-    for (index, (name, export)) in run.exports.iter().enumerate() {
-        let (ordinal, source) = checked_export_source(run, index, name)?;
-        let identity = (source.node.id.clone(), source.output.clone());
-        let metadata = match export {
-            ExportValue::Unavailable { reason } => {
-                unavailable_export(&mut sources, identity, source, *reason)?
-            }
-            ExportValue::Available { output } => {
-                if !captured_type_matches(source.value_type, output) {
-                    return Err(invalid_run_result(RunResultInvariant::ExportValues));
-                }
-                match existing_available_export(&sources, &identity, source, output)? {
-                    Some(metadata) => metadata,
-                    None => {
-                        let (metadata, carrier) =
-                            cloud_available_export(name, ordinal, source, output)?;
-                        if let Some(carrier) = carrier {
-                            carriers.push(carrier);
-                        }
-                        insert_available_source(&mut sources, identity, source, output, &metadata);
-                        metadata
-                    }
-                }
-            }
-        };
-        exports.insert(name.clone(), metadata);
-    }
+    let exports = project_exports(run, |_name, ordinal, source, output, metadata| {
+        if let Some(carrier) = cloud_available_export(ordinal, source, output, metadata)? {
+            carriers.push(carrier);
+        }
+        Ok(())
+    })?;
     let result = build_result_with_provenance(
         run,
         WorkflowProvenanceV1::Cloud {
@@ -1901,80 +1891,97 @@ fn write_result_json(
         .map_err(|_| serialization_unavailable())
 }
 
-fn cloud_available_export(
+// This projection is shared by local materialization and cloud handoff. Neither
+// destination is allowed to reinterpret the kind, digest or carrier presence.
+fn export_metadata(
     name: &str,
     ordinal: usize,
-    source: &ResolvedOutputSource,
     output: &CapturedValue,
-) -> Result<(ExportV1, Option<CloudResultCarrier>), LocalPublicationError> {
+) -> Result<ExportV1, LocalPublicationError> {
     let path = format!("{EXPORT_DIRECTORY}/{ordinal:04}");
-    let idempotency_key = format!("capture:{}:{}", source.node.id, source.output);
-    let (metadata, body) = match output {
-        CapturedValue::File(file) => (
-            ExportV1::Available {
-                kind: "file".to_owned(),
-                media_type: file.media_type().to_owned(),
-                path: path.clone(),
-                size_bytes: file.size(),
-                digest: DigestV1 {
-                    algorithm: "sha256".to_owned(),
-                    value: file.sha256().to_owned(),
-                },
+    let available =
+        |kind: &str, media_type: &str, size_bytes: u64, sha256: String| ExportV1::Available {
+            kind: kind.to_owned(),
+            media_type: media_type.to_owned(),
+            path: path.clone(),
+            size_bytes,
+            digest: DigestV1 {
+                algorithm: "sha256".to_owned(),
+                value: sha256,
+            },
+            provenance: None,
+            producer: None,
+            presentation: None,
+        };
+    Ok(match output {
+        CapturedValue::File(file) => available(
+            "file",
+            file.media_type(),
+            file.size(),
+            file.sha256().to_owned(),
+        ),
+        CapturedValue::Text(text) => {
+            let bytes = text.carrier();
+            available(
+                "text",
+                "text/plain; charset=utf-8",
+                semantic_export_size(bytes, name)?,
+                lowercase_hex(ring::digest::digest(&SHA256, bytes).as_ref()),
+            )
+        }
+        CapturedValue::Json(value) => {
+            let bytes = value.carrier();
+            available(
+                "json",
+                "application/json",
+                semantic_export_size(bytes, name)?,
+                lowercase_hex(ring::digest::digest(&SHA256, bytes).as_ref()),
+            )
+        }
+        CapturedValue::GitBranch(branch) => {
+            let metadata = branch.metadata();
+            if (metadata.base_oid() != metadata.head_oid()) != branch.carrier().is_some() {
+                return Err(invalid_run_result(RunResultInvariant::GitBranch));
+            }
+            ExportV1::GitBranch {
+                artifact_version: metadata.artifact_version(),
+                object_format: metadata.object_format().as_str().to_owned(),
+                base_oid: metadata.base_oid().to_owned(),
+                head_oid: metadata.head_oid().to_owned(),
+                tree_oid: metadata.tree_oid().to_owned(),
+                carrier: branch.carrier().map(|carrier| GitBranchCarrierV1 {
+                    path,
+                    media_type: carrier.media_type().to_owned(),
+                    size_bytes: carrier.size(),
+                    digest: DigestV1 {
+                        algorithm: "sha256".to_owned(),
+                        value: carrier.sha256().to_owned(),
+                    },
+                }),
                 provenance: None,
                 producer: None,
                 presentation: None,
-            },
-            Some(CloudCarrierBody::Staged(file.carrier().clone())),
-        ),
-        CapturedValue::Text(text) => byte_backed_cloud_export(
-            name,
-            "text",
-            "text/plain; charset=utf-8",
-            &path,
-            Arc::from(text.carrier()),
-        )?,
-        CapturedValue::Json(value) => byte_backed_cloud_export(
-            name,
-            "json",
-            "application/json",
-            &path,
-            Arc::from(value.carrier()),
-        )?,
-        CapturedValue::GitBranch(branch) => {
-            let branch_metadata = branch.metadata();
-            let carrier = branch.carrier().map(|carrier| GitBranchCarrierV1 {
-                path: path.clone(),
-                media_type: carrier.media_type().to_owned(),
-                size_bytes: carrier.size(),
-                digest: DigestV1 {
-                    algorithm: "sha256".to_owned(),
-                    value: carrier.sha256().to_owned(),
-                },
-            });
-            if (branch_metadata.base_oid() != branch_metadata.head_oid()) != carrier.is_some() {
-                return Err(invalid_run_result(RunResultInvariant::GitBranch));
             }
-            let body = branch
-                .carrier()
-                .map(|carrier| CloudCarrierBody::Staged(carrier.staged().clone()));
-            (
-                ExportV1::GitBranch {
-                    artifact_version: branch_metadata.artifact_version(),
-                    object_format: branch_metadata.object_format().as_str().to_owned(),
-                    base_oid: branch_metadata.base_oid().to_owned(),
-                    head_oid: branch_metadata.head_oid().to_owned(),
-                    tree_oid: branch_metadata.tree_oid().to_owned(),
-                    carrier,
-                    provenance: None,
-                    producer: None,
-                    presentation: None,
-                },
-                body,
-            )
         }
+    })
+}
+
+fn cloud_available_export(
+    ordinal: usize,
+    source: &ResolvedOutputSource,
+    output: &CapturedValue,
+    metadata: &ExportV1,
+) -> Result<Option<CloudResultCarrier>, LocalPublicationError> {
+    let body = match output {
+        CapturedValue::File(file) => Some(CloudCarrierBody::Staged(file.carrier().clone())),
+        CapturedValue::Text(text) => Some(CloudCarrierBody::Bytes(Arc::from(text.carrier()))),
+        CapturedValue::Json(value) => Some(CloudCarrierBody::Bytes(Arc::from(value.carrier()))),
+        CapturedValue::GitBranch(branch) => branch
+            .carrier()
+            .map(|carrier| CloudCarrierBody::Staged(carrier.staged().clone())),
     };
-    let carrier = match body {
-        Some(body) => {
+    let carrier = body
+        .map(|body| {
             let (media_type, size_bytes, sha256) = match &metadata {
                 ExportV1::Available {
                     media_type,
@@ -1994,45 +2001,17 @@ fn cloud_available_export(
                     return Err(invalid_run_result(RunResultInvariant::GitBranch));
                 }
             };
-            Some(CloudResultCarrier {
-                portable_owner_path: path,
-                idempotency_key,
+            Ok(CloudResultCarrier {
+                portable_owner_path: format!("{EXPORT_DIRECTORY}/{ordinal:04}"),
+                idempotency_key: format!("capture:{}:{}", source.node.id, source.output),
                 media_type,
                 size_bytes,
                 sha256,
                 body,
             })
-        }
-        None => None,
-    };
-    Ok((metadata, carrier))
-}
-
-fn byte_backed_cloud_export(
-    name: &str,
-    kind: &str,
-    media_type: &str,
-    path: &str,
-    bytes: Arc<[u8]>,
-) -> Result<(ExportV1, Option<CloudCarrierBody>), LocalPublicationError> {
-    let size_bytes = u64::try_from(bytes.len()).map_err(|_| export_write_error(name))?;
-    let sha256 = lowercase_hex(ring::digest::digest(&SHA256, &bytes).as_ref());
-    Ok((
-        ExportV1::Available {
-            kind: kind.to_owned(),
-            media_type: media_type.to_owned(),
-            path: path.to_owned(),
-            size_bytes,
-            digest: DigestV1 {
-                algorithm: "sha256".to_owned(),
-                value: sha256,
-            },
-            provenance: None,
-            producer: None,
-            presentation: None,
-        },
-        Some(CloudCarrierBody::Bytes(bytes)),
-    ))
+        })
+        .transpose()?;
+    Ok(carrier)
 }
 
 #[cfg(test)]
@@ -2062,39 +2041,9 @@ fn publish_prepared_with_observer(
         None,
     )?;
 
-    validate_export_source_set(run)?;
-    let mut exports = BTreeMap::new();
-    let mut sources = BTreeMap::<(String, String), SourcePublication>::new();
-    for (index, (name, export)) in run.exports.iter().enumerate() {
-        let (ordinal, source) = checked_export_source(run, index, name)?;
-        let identity = (source.node.id.clone(), source.output.clone());
-        let metadata = match export {
-            ExportValue::Available { output } => {
-                if !captured_type_matches(source.value_type, output) {
-                    return Err(invalid_run_result(RunResultInvariant::ExportValues));
-                }
-                match existing_available_export(&sources, &identity, source, output)? {
-                    Some(metadata) => metadata,
-                    None => {
-                        let metadata = write_available_export(
-                            &mut staging,
-                            observer,
-                            artifacts,
-                            name,
-                            ordinal,
-                            output,
-                        )?;
-                        insert_available_source(&mut sources, identity, source, output, &metadata);
-                        metadata
-                    }
-                }
-            }
-            ExportValue::Unavailable { reason } => {
-                unavailable_export(&mut sources, identity, source, *reason)?
-            }
-        };
-        exports.insert(name.clone(), metadata);
-    }
+    let exports = project_exports(run, |name, ordinal, _source, output, _metadata| {
+        materialize_available_export(&mut staging, observer, artifacts, name, ordinal, output)
+    })?;
 
     observe(
         observer,
@@ -2129,7 +2078,7 @@ fn publish_prepared_with_observer(
     })?;
     match target.existing_publication(&result, &staging.root)? {
         ExistingPublication::Absent => {
-            if let Err(error) = staging.commit(target)
+            if let Err(error) = staging.commit(target, observer)
                 && (error.kind() != LocalPublicationFailureKind::DestinationExists
                     || target.existing_publication(&result, &staging.root)?
                         != ExistingPublication::Identical)
@@ -2143,7 +2092,16 @@ fn publish_prepared_with_observer(
                 );
             }
         }
-        ExistingPublication::Identical => {}
+        ExistingPublication::Identical => {
+            observer
+                .sync_committed_directory(&target.parent)
+                .map_err(|_| {
+                    LocalPublicationError::new(
+                        LocalPublicationPhase::Commit,
+                        LocalPublicationFailureKind::CommittedDurabilityUnavailable,
+                    )
+                })?;
+        }
         ExistingPublication::Conflict => return Err(result_conflict()),
     }
     drop(staging);
@@ -2162,6 +2120,48 @@ fn publish_prepared_with_observer(
         result,
     };
     Ok(terminal)
+}
+
+// Shared alias resolution, declaration checks and export projection. The
+// destination callback only materializes the first carrier for each source.
+fn project_exports(
+    run: &WorkflowRunResult,
+    mut materialize: impl FnMut(
+        &str,
+        usize,
+        &ResolvedOutputSource,
+        &CapturedValue,
+        &ExportV1,
+    ) -> Result<(), LocalPublicationError>,
+) -> Result<BTreeMap<String, ExportV1>, LocalPublicationError> {
+    validate_export_source_set(run)?;
+    let mut exports = BTreeMap::new();
+    let mut sources = BTreeMap::<(String, String), SourcePublication>::new();
+    for (index, (name, export)) in run.exports.iter().enumerate() {
+        let (ordinal, source) = checked_export_source(run, index, name)?;
+        let identity = (source.node.id.clone(), source.output.clone());
+        let metadata = match export {
+            ExportValue::Unavailable { reason } => {
+                unavailable_export(&mut sources, identity, source, *reason)?
+            }
+            ExportValue::Available { output } => {
+                if !captured_type_matches(source.value_type, output) {
+                    return Err(invalid_run_result(RunResultInvariant::ExportValues));
+                }
+                match existing_available_export(&sources, &identity, source, output)? {
+                    Some(metadata) => metadata,
+                    None => {
+                        let metadata = export_metadata(name, ordinal, output)?;
+                        materialize(name, ordinal, source, output, &metadata)?;
+                        insert_available_source(&mut sources, identity, source, output, &metadata);
+                        metadata
+                    }
+                }
+            }
+        };
+        exports.insert(name.clone(), metadata);
+    }
+    Ok(exports)
 }
 
 enum SourcePublication {
@@ -2271,14 +2271,14 @@ fn captured_type_matches(value_type: WorkflowValueType, output: &CapturedValue) 
     value_type == output.value_type()
 }
 
-fn write_available_export(
+fn materialize_available_export(
     staging: &mut StagingDirectory<'_>,
     observer: &mut impl PublicationObserver,
     artifacts: &ArtifactStaging,
     name: &str,
     ordinal: usize,
     output: &CapturedValue,
-) -> Result<ExportV1, LocalPublicationError> {
+) -> Result<(), LocalPublicationError> {
     if let CapturedValue::GitBranch(branch) = output {
         return write_git_branch_export(staging, observer, artifacts, name, ordinal, branch);
     }
@@ -2290,11 +2290,7 @@ fn write_available_export(
             artifacts,
             name,
             &file_name,
-            AvailableCarrier {
-                kind: "file",
-                media_type: file.media_type(),
-                staged: file.carrier(),
-            },
+            file.carrier(),
         );
     }
 
@@ -2302,25 +2298,7 @@ fn write_available_export(
         .private_capture_carrier()
         .filter(|carrier| staged_carrier_matches_semantic_bytes(carrier, output))
     {
-        let (kind, media_type) = match output {
-            CapturedValue::Text(_) => ("text", "text/plain; charset=utf-8"),
-            CapturedValue::Json(_) => ("json", "application/json"),
-            CapturedValue::File(_) | CapturedValue::GitBranch(_) => {
-                return Err(unsupported_export_error(name));
-            }
-        };
-        return expose_available_carrier(
-            staging,
-            observer,
-            artifacts,
-            name,
-            &file_name,
-            AvailableCarrier {
-                kind,
-                media_type,
-                staged: carrier,
-            },
-        );
+        return expose_available_carrier(staging, observer, artifacts, name, &file_name, carrier);
     }
 
     observe(
@@ -2332,17 +2310,9 @@ fn write_available_export(
         LocalPublicationFailureKind::ExportWriteUnavailable,
         Some(name),
     )?;
-    let (kind, media_type, expected_size) = match output {
-        CapturedValue::Text(text) => (
-            "text",
-            "text/plain; charset=utf-8".to_owned(),
-            semantic_export_size(text.carrier(), name)?,
-        ),
-        CapturedValue::Json(value) => (
-            "json",
-            "application/json".to_owned(),
-            semantic_export_size(value.carrier(), name)?,
-        ),
+    let expected_size = match output {
+        CapturedValue::Text(text) => semantic_export_size(text.carrier(), name)?,
+        CapturedValue::Json(value) => semantic_export_size(value.carrier(), name)?,
         CapturedValue::File(_) | CapturedValue::GitBranch(_) => {
             return Err(unsupported_export_error(name));
         }
@@ -2350,27 +2320,17 @@ fn write_available_export(
     let mut destination = staging.create_export(&file_name).map_err(|kind| {
         LocalPublicationError::for_export(LocalPublicationPhase::ExportCopy, kind, name)
     })?;
-    let mut digest = DigestContext::new(&SHA256);
-    let written = {
-        let mut hashing = HashingWriter {
-            destination: &mut destination,
-            digest: &mut digest,
-            bytes: 0,
-        };
-        match output {
-            CapturedValue::Text(text) => hashing
-                .write_all(text.carrier())
-                .map_err(|_| export_write_error(name))?,
-            CapturedValue::Json(value) => hashing
-                .write_all(value.carrier())
-                .map_err(|_| export_write_error(name))?,
-            CapturedValue::File(_) | CapturedValue::GitBranch(_) => {
-                return Err(unsupported_export_error(name));
-            }
+    let bytes = match output {
+        CapturedValue::Text(text) => text.carrier(),
+        CapturedValue::Json(value) => value.carrier(),
+        CapturedValue::File(_) | CapturedValue::GitBranch(_) => {
+            return Err(unsupported_export_error(name));
         }
-        hashing.flush().map_err(|_| export_write_error(name))?;
-        hashing.bytes
     };
+    destination
+        .write_all(bytes)
+        .map_err(|_| export_write_error(name))?;
+    let written = u64::try_from(bytes.len()).map_err(|_| export_write_error(name))?;
     destination.flush().map_err(|_| export_write_error(name))?;
     if written != expected_size {
         return Err(export_write_error(name));
@@ -2389,19 +2349,6 @@ fn write_available_export(
                 name,
             )
         })?;
-    let metadata = ExportV1::Available {
-        kind: kind.to_owned(),
-        media_type,
-        path: format!("{EXPORT_DIRECTORY}/{file_name}"),
-        size_bytes: written,
-        digest: DigestV1 {
-            algorithm: "sha256".to_owned(),
-            value: lowercase_hex(digest.finish().as_ref()),
-        },
-        provenance: None,
-        producer: None,
-        presentation: None,
-    };
     observe(
         observer,
         &PublicationBoundary::AfterExportMaterialization {
@@ -2411,7 +2358,7 @@ fn write_available_export(
         LocalPublicationFailureKind::ExportWriteUnavailable,
         Some(name),
     )?;
-    Ok(metadata)
+    Ok(())
 }
 
 fn write_git_branch_export(
@@ -2421,47 +2368,25 @@ fn write_git_branch_export(
     name: &str,
     ordinal: usize,
     branch: &super::artifact::CapturedGitBranch,
-) -> Result<ExportV1, LocalPublicationError> {
+) -> Result<(), LocalPublicationError> {
     let metadata = branch.metadata();
     let has_delta = metadata.base_oid() != metadata.head_oid();
     if has_delta != branch.carrier().is_some() {
         return Err(invalid_run_result(RunResultInvariant::GitBranch));
     }
-    let carrier = match branch.carrier() {
-        None => None,
-        Some(carrier) => {
-            let file_name = format!("{ordinal:04}");
-            expose_staged_carrier(
-                staging,
-                observer,
-                artifacts,
-                name,
-                &file_name,
-                carrier.staged(),
-                branch.output_identity(),
-            )?;
-            Some(GitBranchCarrierV1 {
-                path: format!("{EXPORT_DIRECTORY}/{file_name}"),
-                media_type: carrier.media_type().to_owned(),
-                size_bytes: carrier.size(),
-                digest: DigestV1 {
-                    algorithm: "sha256".to_owned(),
-                    value: carrier.sha256().to_owned(),
-                },
-            })
-        }
-    };
-    Ok(ExportV1::GitBranch {
-        artifact_version: metadata.artifact_version(),
-        object_format: metadata.object_format().as_str().to_owned(),
-        base_oid: metadata.base_oid().to_owned(),
-        head_oid: metadata.head_oid().to_owned(),
-        tree_oid: metadata.tree_oid().to_owned(),
-        carrier,
-        provenance: None,
-        producer: None,
-        presentation: None,
-    })
+    if let Some(carrier) = branch.carrier() {
+        let file_name = format!("{ordinal:04}");
+        expose_staged_carrier(
+            staging,
+            observer,
+            artifacts,
+            name,
+            &file_name,
+            carrier.staged(),
+            branch.output_identity(),
+        )?;
+    }
+    Ok(())
 }
 
 fn observe(
@@ -2511,42 +2436,23 @@ fn expose_staged_carrier(
     )
 }
 
-struct AvailableCarrier<'a> {
-    kind: &'a str,
-    media_type: &'a str,
-    staged: &'a StagedCarrier,
-}
-
 fn expose_available_carrier(
     staging: &mut StagingDirectory<'_>,
     observer: &mut impl PublicationObserver,
     artifacts: &ArtifactStaging,
     export: &str,
     file_name: &str,
-    carrier: AvailableCarrier<'_>,
-) -> Result<ExportV1, LocalPublicationError> {
+    carrier: &StagedCarrier,
+) -> Result<(), LocalPublicationError> {
     expose_staged_carrier(
         staging,
         observer,
         artifacts,
         export,
         file_name,
-        carrier.staged,
-        carrier.staged.output_identity(),
-    )?;
-    Ok(ExportV1::Available {
-        kind: carrier.kind.to_owned(),
-        media_type: carrier.media_type.to_owned(),
-        path: format!("{EXPORT_DIRECTORY}/{file_name}"),
-        size_bytes: carrier.staged.size(),
-        digest: DigestV1 {
-            algorithm: "sha256".to_owned(),
-            value: carrier.staged.sha256().to_owned(),
-        },
-        provenance: None,
-        producer: None,
-        presentation: None,
-    })
+        carrier,
+        carrier.output_identity(),
+    )
 }
 
 fn staged_carrier_matches_semantic_bytes(carrier: &StagedCarrier, output: &CapturedValue) -> bool {
@@ -3470,7 +3376,9 @@ fn output_capture_failure_cause(failure: &OutputCaptureFailure) -> FailureCauseV
                 CaptureFailureKind::CarrierProducerUnavailable => {
                     FailureCodeV1::GitBundleGenerationFailed
                 }
-                CaptureFailureKind::StagingUnavailable => FailureCodeV1::OutputStagingUnavailable,
+                CaptureFailureKind::InvalidDeclaration | CaptureFailureKind::StagingUnavailable => {
+                    FailureCodeV1::OutputStagingUnavailable
+                }
             };
             let mut cause = FailureCauseV1::code(code);
             cause.output = Some(failure.output_identity().to_owned());
@@ -3650,28 +3558,6 @@ const fn exit_status(outcome: ExecutionOutcome) -> u16 {
     }
 }
 
-struct HashingWriter<'a> {
-    destination: &'a mut File,
-    digest: &'a mut DigestContext,
-    bytes: u64,
-}
-
-impl Write for HashingWriter<'_> {
-    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        let written = self.destination.write(bytes)?;
-        self.digest.update(&bytes[..written]);
-        self.bytes = self
-            .bytes
-            .checked_add(u64::try_from(written).map_err(|_| io::Error::other("export size"))?)
-            .ok_or_else(|| io::Error::other("export size"))?;
-        Ok(written)
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        self.destination.flush()
-    }
-}
-
 struct PublicationTarget {
     supplied_parent: PathBuf,
     parent: OwnedFd,
@@ -3764,6 +3650,10 @@ impl PublicationTarget {
                     .map_err(|_| invalid_publication_parent())?)
         {
             return Err(invalid_publication_parent());
+        }
+        cleanup_abandoned_preflights(&staging_parent)?;
+        if !same_file(&staging_parent, &parent).map_err(|_| invalid_publication_parent())? {
+            cleanup_abandoned_preflights(&parent)?;
         }
         verify_publication_capability(&staging_parent, &parent)?;
         Ok(Self {
@@ -4048,7 +3938,39 @@ impl<'a> StagingDirectory<'a> {
         (staged == *result).then_some(()).ok_or(Errno::IO)
     }
 
-    fn commit(&mut self, target: &PublicationTarget) -> Result<(), LocalPublicationError> {
+    fn commit(
+        &mut self,
+        target: &PublicationTarget,
+        observer: &mut impl PublicationObserver,
+    ) -> Result<(), LocalPublicationError> {
+        let unavailable = || {
+            LocalPublicationError::new(
+                LocalPublicationPhase::Commit,
+                LocalPublicationFailureKind::AtomicPublicationUnavailable,
+            )
+        };
+        let exports = self.exports.as_ref().ok_or_else(unavailable)?;
+        for name in &self.export_files {
+            let file = openat(
+                exports,
+                name,
+                OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::empty(),
+            )
+            .map(File::from)
+            .map_err(|_| unavailable())?;
+            file.sync_all().map_err(|_| unavailable())?;
+        }
+        open_result_file(&self.root)
+            .ok_or_else(unavailable)?
+            .sync_all()
+            .map_err(|_| unavailable())?;
+        sync_directory(exports).map_err(|_| unavailable())?;
+        sync_directory(&self.root).map_err(|_| unavailable())?;
+        sync_directory(self.parent).map_err(|_| unavailable())?;
+        if !same_file(self.parent, &target.parent).map_err(|_| unavailable())? {
+            sync_directory(&target.parent).map_err(|_| unavailable())?;
+        }
         renameat_with(
             self.parent,
             &self.identity,
@@ -4064,6 +3986,20 @@ impl<'a> StagingDirectory<'a> {
             LocalPublicationError::new(LocalPublicationPhase::Commit, kind)
         })?;
         self.committed = true;
+        let committed_unavailable = || {
+            LocalPublicationError::new(
+                LocalPublicationPhase::Commit,
+                LocalPublicationFailureKind::CommittedDurabilityUnavailable,
+            )
+        };
+        observer
+            .sync_committed_directory(&target.parent)
+            .map_err(|_| committed_unavailable())?;
+        if !same_file(self.parent, &target.parent).map_err(|_| committed_unavailable())? {
+            observer
+                .sync_committed_directory(self.parent)
+                .map_err(|_| committed_unavailable())?;
+        }
         Ok(())
     }
 
@@ -4100,11 +4036,53 @@ impl Drop for StagingDirectory<'_> {
     }
 }
 
+fn sync_directory(directory: &OwnedFd) -> io::Result<()> {
+    let readable = openat(directory, ".", directory_open_flags(), Mode::empty())?;
+    File::from(readable).sync_all()
+}
+
+// Preflight directories contain no data. Never follow links or remove nonempty entries:
+// another publisher may still own a concurrent preflight in the same parent.
+fn cleanup_abandoned_preflights(parent: &OwnedFd) -> Result<(), LocalPublicationError> {
+    let readable = openat(parent, ".", directory_open_flags(), Mode::empty())
+        .map_err(|_| invalid_publication_parent())?;
+    flock(&readable, FlockOperation::LockExclusive).map_err(|_| invalid_publication_parent())?;
+    for name in directory_entries(&readable).map_err(|_| invalid_publication_parent())? {
+        let Some(id) = name.strip_prefix(b".result-preflight-") else {
+            continue;
+        };
+        if id.len() != 26
+            || !id
+                .iter()
+                .all(|byte| b"0123456789abcdefghjkmnpqrstvwxyz".contains(byte))
+        {
+            continue;
+        }
+        let Ok(name) = std::str::from_utf8(&name) else {
+            continue;
+        };
+        if let Ok(directory) = openat(parent, name, directory_open_flags(), Mode::empty()) {
+            // The publisher holds a lock through preflight cleanup; only an
+            // abandoned directory can be removed by a competing attempt.
+            match flock(&directory, FlockOperation::NonBlockingLockExclusive) {
+                Ok(()) => {}
+                Err(Errno::AGAIN | Errno::ACCESS) => continue,
+                Err(_) => return Err(invalid_publication_parent()),
+            }
+            match unlinkat(parent, name, AtFlags::REMOVEDIR) {
+                Ok(()) | Err(Errno::NOENT | Errno::NOTEMPTY) => {}
+                Err(_) => return Err(invalid_publication_parent()),
+            }
+        }
+    }
+    sync_directory(parent).map_err(|_| invalid_publication_parent())
+}
+
 fn verify_publication_capability(
     staging_parent: &OwnedFd,
     target_parent: &OwnedFd,
 ) -> Result<(), LocalPublicationError> {
-    let source = create_validation_directory(staging_parent)?;
+    let (source, _locked_source) = create_validation_directory(staging_parent)?;
     for _ in 0..STAGING_ATTEMPTS {
         let destination = format!(
             ".result-preflight-{}",
@@ -4142,14 +4120,32 @@ fn verify_publication_capability(
     ))
 }
 
-fn create_validation_directory(parent: &OwnedFd) -> Result<String, LocalPublicationError> {
+fn create_validation_directory(
+    parent: &OwnedFd,
+) -> Result<(String, OwnedFd), LocalPublicationError> {
+    // Serialize the mkdir-to-child-lock window with orphan cleanup in this parent.
+    let parent_lock = openat(parent, ".", directory_open_flags(), Mode::empty())
+        .map_err(|_| invalid_publication_parent())?;
+    flock(&parent_lock, FlockOperation::LockExclusive).map_err(|_| invalid_publication_parent())?;
     for _ in 0..STAGING_ATTEMPTS {
         let identity = format!(
             ".result-preflight-{}",
             ulid::Ulid::generate().to_string().to_ascii_lowercase()
         );
         match mkdirat(parent, &identity, Mode::RWXU) {
-            Ok(()) => return Ok(identity),
+            Ok(()) => {
+                let directory = openat(parent, &identity, directory_open_flags(), Mode::empty())
+                    .and_then(|directory| {
+                        flock(&directory, FlockOperation::NonBlockingLockExclusive)?;
+                        Ok(directory)
+                    });
+                return directory
+                    .map(|directory| (identity.clone(), directory))
+                    .map_err(|_| {
+                        let _ = unlinkat(parent, &identity, AtFlags::REMOVEDIR);
+                        invalid_publication_parent()
+                    });
+            }
             Err(Errno::EXIST) => {}
             Err(_) => {
                 return Err(LocalPublicationError::new(
