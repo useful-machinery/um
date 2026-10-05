@@ -1709,6 +1709,13 @@ impl ExecutionJob {
                 .maximum_step_log_bytes()
                 .get(),
             cloud_capacity: Some(cloud_execution_capacity(&self.accepted.admitted)),
+            maximum_result_bytes: self
+                .accepted
+                .admitted
+                .workflow()
+                .capacity
+                .requirements
+                .portable_result_bytes,
             timing: WorkflowRunTiming {
                 started_at: started_at.utc,
                 finished_at: finished_at.utc,
@@ -1723,6 +1730,7 @@ impl ExecutionJob {
             finalization,
             exports: execution.exports,
             export_sources: workflow.definition.exports.clone(),
+            export_presentation: workflow.definition.export_presentation.clone(),
         })
     }
 
@@ -1745,15 +1753,21 @@ impl ExecutionJob {
                 return Ok(outcome);
             }
         }
-        self.await_delivery(
-            assignment_id,
-            ArtifactDeliverySpec::result(
+        let result = match prepared.result_file {
+            Some(file) => ArtifactDeliverySpec::result_file(
+                assignment_id.to_owned(),
+                attempt_id.to_owned(),
+                file,
+                prepared.result_size_bytes,
+                prepared.result_sha256,
+            ),
+            None => ArtifactDeliverySpec::result(
                 assignment_id.to_owned(),
                 attempt_id.to_owned(),
                 prepared.result_json,
             ),
-        )
-        .await
+        };
+        self.await_delivery(assignment_id, result).await
     }
 
     async fn await_delivery(
@@ -2130,6 +2144,7 @@ pub(super) fn cloud_execution_capacity(admitted: &AdmittedWorkflow) -> CloudExec
         condition_transition_count: requirements.condition_transition_count,
         aggregate_condition_transition_bytes: requirements.aggregate_condition_transition_bytes,
         terminal_result_structure_bytes: requirements.terminal_result_structure_bytes,
+        presentation_result_bytes: requirements.presentation_result_bytes,
         portable_result_bytes: requirements.portable_result_bytes,
         encoded_outbox_bytes: requirements.encoded_outbox_bytes,
     }

@@ -495,11 +495,7 @@ pub fn validate_portable_artifact_set(
     };
 
     inspect_root_boundary(&root, cancelled, &mut diagnostics)?;
-    let result_bytes = read_result(&root, cancelled, &mut diagnostics)?;
-    let metadata = result_bytes
-        .as_deref()
-        .map(|bytes| inspect_metadata(bytes, &mut diagnostics))
-        .unwrap_or_default();
+    let metadata = read_result(&root, cancelled, &mut diagnostics)?.unwrap_or_default();
     let exports = open_exports_directory(&root, &mut diagnostics)?;
     let inventory = exports
         .as_ref()
@@ -674,7 +670,7 @@ fn read_result(
     root: &OwnedFd,
     cancelled: &AtomicBool,
     diagnostics: &mut Diagnostics,
-) -> Result<Option<Vec<u8>>, PortableArtifactValidationFailure> {
+) -> Result<Option<MetadataInspection>, PortableArtifactValidationFailure> {
     let named = match statat(root, RESULT_FILE, AtFlags::SYMLINK_NOFOLLOW) {
         Ok(stat) => stat,
         Err(Errno::NOENT | Errno::NOTDIR) => {
@@ -710,6 +706,21 @@ fn read_result(
     }
 
     let mut file = File::from(descriptor);
+    if before.st_size > 64 * 1024 * 1024 {
+        if u64::try_from(before.st_size)
+            .ok()
+            .is_none_or(|size| size > result_metadata::MAXIMUM_RESULT_JSON_BYTES)
+        {
+            diagnostics.result(ArtifactDiagnosticCode::ResultLimitExceeded, None);
+            return Ok(None);
+        }
+        check_cancelled(cancelled)?;
+        let metadata = inspect_metadata_reader(&mut file, cancelled, diagnostics)?;
+        if retained_file_changed(root, RESULT_FILE, &file, &before) {
+            diagnostics.result(ArtifactDiagnosticCode::ResultUnavailable, None);
+        }
+        return Ok(Some(metadata));
+    }
     let bytes = match artifact_primitives::read_bounded(
         &mut file,
         result_metadata::MAXIMUM_RESULT_JSON_BYTES,
@@ -731,7 +742,129 @@ fn read_result(
     if retained_file_changed(root, RESULT_FILE, &file, &before) {
         diagnostics.result(ArtifactDiagnosticCode::ResultUnavailable, None);
     }
-    Ok(Some(bytes))
+    Ok(Some(inspect_metadata(&bytes, diagnostics)))
+}
+
+struct InterruptibleResultReader<'a> {
+    file: &'a mut File,
+    cancelled: &'a AtomicBool,
+}
+
+impl Read for InterruptibleResultReader<'_> {
+    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+        if self.cancelled.load(Ordering::Acquire) {
+            return Err(io::Error::other("artifact validation interrupted"));
+        }
+        self.file.read(bytes)
+    }
+}
+
+impl Seek for InterruptibleResultReader<'_> {
+    fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
+        self.file.seek(position)
+    }
+}
+
+fn inspect_metadata_reader(
+    file: &mut File,
+    cancelled: &AtomicBool,
+    diagnostics: &mut Diagnostics,
+) -> Result<MetadataInspection, PortableArtifactValidationFailure> {
+    let mut reader = InterruptibleResultReader { file, cancelled };
+    let result = match result_metadata::decode_reader(&mut reader) {
+        Ok(result) => result,
+        Err(_) => {
+            check_cancelled(cancelled)?;
+            diagnostics.result(ArtifactDiagnosticCode::ResultJsonInvalid, None);
+            return Ok(MetadataInspection::default());
+        }
+    };
+    check_cancelled(cancelled)?;
+    if result.schema_version != 1 {
+        diagnostics.result(
+            ArtifactDiagnosticCode::ResultSchemaUnsupported,
+            Some("/schemaVersion"),
+        );
+        return Ok(MetadataInspection::default());
+    }
+    if result
+        .steps
+        .iter()
+        .chain(
+            result
+                .finalization
+                .as_ref()
+                .into_iter()
+                .flat_map(|value| &value.finalizers),
+        )
+        .filter_map(|step| step.recovery.as_ref())
+        .any(|recovery| recovery.schema_version != 1)
+    {
+        diagnostics.result(
+            ArtifactDiagnosticCode::RecoverySchemaUnsupported,
+            Some("/steps"),
+        );
+        return Ok(MetadataInspection::default());
+    }
+    if result_metadata::validate(&result).is_err() {
+        diagnostics.result(ArtifactDiagnosticCode::ResultSchemaInvalid, None);
+    }
+    let mut states = BTreeMap::new();
+    for step in result.steps.iter().chain(
+        result
+            .finalization
+            .as_ref()
+            .into_iter()
+            .flat_map(|value| &value.finalizers),
+    ) {
+        let inherited_prior_state = match &step.detail {
+            Some(super::evidence::NodeDetail::Inherited(detail)) => Some(detail.prior_state),
+            _ => None,
+        };
+        if states
+            .insert(
+                step.id.clone(),
+                PortableSourceState {
+                    role: step.role,
+                    state: step.state,
+                    inherited_prior_state,
+                },
+            )
+            .is_some()
+        {
+            diagnostics.result(ArtifactDiagnosticCode::ResultSchemaInvalid, Some("/steps"));
+            return Ok(MetadataInspection::default());
+        }
+    }
+    let mut exports = match serde_json::to_value(&result.exports) {
+        Ok(Value::Object(map)) => map,
+        _ => {
+            diagnostics.result(
+                ArtifactDiagnosticCode::ResultSchemaInvalid,
+                Some("/exports"),
+            );
+            return Ok(MetadataInspection::default());
+        }
+    };
+    let continuation = result.continuation.is_some();
+    if (continuation && !result.export_sources.keys().eq(exports.keys()))
+        || (!continuation && !result.export_sources.is_empty())
+    {
+        diagnostics.result(
+            ArtifactDiagnosticCode::ResultSchemaInvalid,
+            Some("/exportSources"),
+        );
+    }
+    let inspected = inspect_exports(
+        &mut exports,
+        continuation,
+        Some(&result.output_producers),
+        Some(&result.export_sources),
+        Some(&states),
+        diagnostics,
+    );
+    check_cancelled(cancelled)?;
+    Ok(inspected)
 }
 
 #[derive(Default)]
@@ -1188,7 +1321,11 @@ fn valid_unavailable_entry(entry: &Value, origin: PortableExportOrigin<'_>) -> b
     else {
         return false;
     };
-    if !exact_keys(object, &["state", "reason"]) {
+    if !valid_presentation_member(object)
+        || object.len() != 2 + usize::from(object.contains_key("presentation"))
+        || !object.contains_key("state")
+        || !object.contains_key("reason")
+    {
         return false;
     }
     if !origin.continuation {
@@ -1323,8 +1460,18 @@ fn exact_export_keys(
     };
     let origin_fields = usize::from(provenance.is_some()) + usize::from(producer.is_some());
     origin_valid
-        && object.len() == base.len() + origin_fields
+        && valid_presentation_member(object)
+        && object.len()
+            == base.len() + origin_fields + usize::from(object.contains_key("presentation"))
         && base.iter().all(|key| object.contains_key(*key))
+}
+
+fn valid_presentation_member(object: &Map<String, Value>) -> bool {
+    object.get("presentation").is_none_or(|raw| {
+        serde_json::from_value::<super::publication::ExportPresentationV1>(raw.clone())
+            .ok()
+            .is_some_and(|value| result_metadata::valid_export_presentation(Some(&value)))
+    })
 }
 
 fn valid_git_carrier(carrier: &Map<String, Value>) -> bool {

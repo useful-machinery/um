@@ -7695,6 +7695,7 @@ finalizers:
             maximum_parallel_steps: NonZeroUsize::new(1).unwrap(),
             maximum_retained_bytes_per_stream: super::super::MAXIMUM_RETAINED_BYTES_PER_STREAM,
             cloud_capacity: None,
+            maximum_result_bytes: 202_027_692,
             timing: WorkflowRunTiming {
                 started_at: started.utc,
                 finished_at: started.utc + duration,
@@ -7717,6 +7718,7 @@ finalizers:
             finalization: None,
             exports: BTreeMap::new(),
             export_sources: BTreeMap::new(),
+            export_presentation: BTreeMap::new(),
         };
         view.reconcile_terminal_result(&run).unwrap();
         view.mark_quiescent();

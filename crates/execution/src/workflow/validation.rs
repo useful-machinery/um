@@ -8,17 +8,20 @@ use super::condition::{
     ConditionValueKind, JsonPointer, ResolvedOperand, ResolvedPredicate, ResolvedSelector,
 };
 use super::document::{
-    Agent, CommonNode, ConditionOperand, ConditionPredicate, FailurePolicy, FinalizerDefinition,
-    HarnessDefinition, InputDeclaration, MessageSource, NodeBody, Output, OutputReference,
-    RecoveryHandler, StepDefinition, StepRecovery, ValueReference, WorkflowDocument,
+    Agent, CommonNode, ConditionOperand, ConditionPredicate, ExportPresentation, FailurePolicy,
+    FinalizerDefinition, HarnessDefinition, InputDeclaration, MessageSource, NodeBody, Output,
+    OutputReference, PresentationSource, RecoveryHandler, StepDefinition, StepRecovery,
+    ValueReference, WorkflowDocument,
 };
 use super::evidence::{MAXIMUM_PREREQUISITES, Prerequisite};
+use super::export_presentation::{Field, resolve_text};
 use super::validated::{
     RequiredInputs, ResolvedDirectPrerequisite, ResolvedOutputSource, ResolvedValueReference,
     ResolvedValueSource, ValidatedAgent, ValidatedAgentMessage, ValidatedAgentStep,
-    ValidatedCommandStep, ValidatedCommonStep, ValidatedFinalizer, ValidatedHarness,
-    ValidatedMessageSource, ValidatedOutput, ValidatedRecoveryHandler, ValidatedStep,
-    ValidatedStepRecovery, ValidatedWorkflow, WorkflowNode, WorkflowNodeRole, WorkflowValueType,
+    ValidatedCommandStep, ValidatedCommonStep, ValidatedExportPresentation, ValidatedFinalizer,
+    ValidatedHarness, ValidatedMessageSource, ValidatedOutput, ValidatedPresentationField,
+    ValidatedRecoveryHandler, ValidatedStep, ValidatedStepRecovery, ValidatedWorkflow,
+    WorkflowNode, WorkflowNodeRole, WorkflowValueType,
 };
 use super::{claude_code, codex, pi};
 
@@ -50,6 +53,8 @@ pub(crate) enum ValidationFailureKind {
     AdvisoryDataDependency,
     InvalidExportTarget,
     AdvisoryExportTarget,
+    InvalidExportPresentation,
+    InvalidExportPresentationTarget,
     TooManyNodes,
     DuplicateNodeId,
     InvalidSourceOrder,
@@ -214,7 +219,18 @@ pub(crate) fn validate(document: WorkflowDocument) -> Result<ValidatedWorkflow, 
         .exports
         .iter()
         .map(|(name, reference)| {
-            resolve_export(name, reference, &document).map(|source| (name.clone(), source))
+            resolve_export(name, &reference.source, &document).map(|source| (name.clone(), source))
+        })
+        .collect::<Result<_, _>>()?;
+
+    let export_presentation = document
+        .exports
+        .iter()
+        .filter_map(|(name, export)| {
+            export.presentation.as_ref().map(|presentation| {
+                resolve_export_presentation(name, presentation, &document)
+                    .map(|resolved| (name.clone(), resolved))
+            })
         })
         .collect::<Result<_, _>>()?;
 
@@ -229,6 +245,7 @@ pub(crate) fn validate(document: WorkflowDocument) -> Result<ValidatedWorkflow, 
         finalizer_source_order: document.finalizer_order,
         finalizer_presentation_order: finalizer_graph.presentation_order,
         exports,
+        export_presentation,
         required_inputs,
         input_json_schema_paths,
         input_file_media_types,
@@ -1805,6 +1822,83 @@ fn resolve_export(
         },
         output: reference.output.clone(),
         value_type: output_value_type(output),
+    })
+}
+
+fn resolve_export_presentation(
+    name: &str,
+    presentation: &ExportPresentation,
+    document: &WorkflowDocument,
+) -> Result<ValidatedExportPresentation, ValidationFailure> {
+    fn resolve_field(
+        name: &str,
+        source: &PresentationSource,
+        field: Field,
+        document: &WorkflowDocument,
+    ) -> Result<ValidatedPresentationField, ValidationFailure> {
+        let location = ValidationLocation::Export {
+            name: name.to_owned(),
+        };
+        match source {
+            PresentationSource::Literal(value) => resolve_text(field, value)
+                .map(|trimmed| ValidatedPresentationField::Literal(trimmed.to_owned()))
+                .map_err(|_| {
+                    ValidationFailure::new(
+                        ValidationFailureKind::InvalidExportPresentation,
+                        location,
+                    )
+                }),
+            PresentationSource::Reference(reference) => {
+                let (role, body) = node_body(document, &reference.node).ok_or_else(|| {
+                    ValidationFailure::new(
+                        ValidationFailureKind::InvalidExportPresentationTarget,
+                        location.clone(),
+                    )
+                })?;
+                let output = common_node(body)
+                    .outputs
+                    .get(&reference.output)
+                    .ok_or_else(|| {
+                        ValidationFailure::new(
+                            ValidationFailureKind::InvalidExportPresentationTarget,
+                            location.clone(),
+                        )
+                    })?;
+                if output_value_type(output) != WorkflowValueType::Text
+                    || role == WorkflowNodeRole::Finalizer
+                        && !document.finalizers[&reference.node]
+                            .when
+                            .contains(&super::document::FinalizationTrigger::Succeeded)
+                {
+                    return Err(ValidationFailure::new(
+                        ValidationFailureKind::InvalidExportPresentationTarget,
+                        location,
+                    ));
+                }
+                Ok(ValidatedPresentationField::Reference(
+                    ResolvedOutputSource {
+                        node: WorkflowNode {
+                            id: reference.node.clone(),
+                            role,
+                        },
+                        output: reference.output.clone(),
+                        value_type: WorkflowValueType::Text,
+                    },
+                ))
+            }
+        }
+    }
+    Ok(ValidatedExportPresentation {
+        title: presentation
+            .title
+            .as_ref()
+            .map(|source| resolve_field(name, source, Field::Title, document))
+            .transpose()?,
+        description: presentation
+            .description
+            .as_ref()
+            .map(|source| resolve_field(name, source, Field::Description, document))
+            .transpose()?,
     })
 }
 

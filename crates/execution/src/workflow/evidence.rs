@@ -1,6 +1,7 @@
 use std::cmp::Ordering;
 use std::collections::BTreeSet;
 use std::fmt;
+use std::sync::Arc;
 
 use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize};
@@ -154,8 +155,18 @@ pub struct FailureDetail {
     pub(crate) exit_code: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) r#ref: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) pointer: Option<String>,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "serialize_failure_pointer"
+    )]
+    pub(crate) pointer: Option<Arc<str>>,
+}
+
+fn serialize_failure_pointer<S: serde::Serializer>(
+    pointer: &Option<Arc<str>>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    pointer.as_deref().serialize(serializer)
 }
 
 #[derive(Deserialize)]
@@ -183,17 +194,16 @@ impl<'de> Deserialize<'de> for FailureDetail {
         D: Deserializer<'de>,
     {
         let wire = FailureDetailWire::deserialize(deserializer)?;
-        let mut detail = Self::new(
-            wire.phase,
-            wire.code,
-            wire.input,
-            wire.collection_index,
-            wire.output,
-            wire.exit_code,
-        )
-        .map_err(D::Error::custom)?;
-        detail.r#ref = wire.r#ref;
-        detail.pointer = wire.pointer;
+        let detail = Self {
+            phase: wire.phase,
+            code: wire.code,
+            input: wire.input,
+            collection_index: wire.collection_index,
+            output: wire.output,
+            exit_code: wire.exit_code,
+            r#ref: wire.r#ref,
+            pointer: wire.pointer.map(Arc::from),
+        };
         detail.validate().map_err(D::Error::custom)?;
         Ok(detail)
     }
@@ -213,6 +223,7 @@ impl FailureDetail {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn new(
         phase: FailurePhase,
         code: FailureCode,
@@ -351,7 +362,7 @@ impl FailureDetail {
     ) -> Result<Self, EvidenceError> {
         let mut detail = Self::code(FailurePhase::Condition, FailureCode::JsonPointerMissing);
         detail.r#ref = Some(reference.into());
-        detail.pointer = Some(pointer.into());
+        detail.pointer = Some(Arc::from(pointer.into()));
         detail.validate()?;
         Ok(detail)
     }
@@ -1100,6 +1111,20 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn condition_failure_round_trips_with_its_source_fields() {
+        let detail =
+            FailureDetail::json_pointer_missing("outputs.produce.result", "/missing~1key").unwrap();
+        let encoded = serde_json::to_vec(&detail).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<FailureDetail>(&encoded).unwrap(),
+            detail
+        );
+        let mut missing_pointer = serde_json::to_value(&detail).unwrap();
+        missing_pointer.as_object_mut().unwrap().remove("pointer");
+        assert!(serde_json::from_value::<FailureDetail>(missing_pointer).is_err());
     }
 
     #[test]

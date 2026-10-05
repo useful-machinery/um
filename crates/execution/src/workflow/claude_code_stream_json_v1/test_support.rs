@@ -464,6 +464,22 @@ impl ControlledProviderRequest {
             .unwrap();
     }
 
+    pub(super) fn release_overload(mut self) {
+        self.response
+            .take()
+            .unwrap()
+            .send(LoopbackProviderResponse::Overload)
+            .unwrap();
+    }
+
+    pub(super) fn release_overload_after_thinking(mut self) {
+        self.response
+            .take()
+            .unwrap()
+            .send(LoopbackProviderResponse::OverloadAfterThinking)
+            .unwrap();
+    }
+
     pub(super) fn release_invalid_request(mut self) {
         self.response
             .take()
@@ -514,6 +530,8 @@ impl LoopbackBlock {
 enum LoopbackProviderResponse {
     Blocks(Vec<LoopbackBlock>),
     InvalidRequest,
+    Overload,
+    OverloadAfterThinking,
 }
 
 pub(super) struct LoopbackProvider {
@@ -614,6 +632,20 @@ async fn serve_connection(
             }))
             .unwrap(),
         ),
+        LoopbackProviderResponse::Overload => (
+            "529 Overloaded",
+            "application/json",
+            serde_json::to_vec(&json!({
+                "type": "error",
+                "error": { "type": "overloaded_error", "message": "synthetic overload" },
+            }))
+            .unwrap(),
+        ),
+        LoopbackProviderResponse::OverloadAfterThinking => (
+            "200 OK",
+            "text/event-stream",
+            overload_after_thinking_payload(),
+        ),
         response => ("200 OK", "text/event-stream", response_payload(response)),
     };
     let header = format!(
@@ -707,8 +739,10 @@ fn find_subslice(bytes: &[u8], needle: &[u8]) -> Option<usize> {
 fn response_payload(response: LoopbackProviderResponse) -> Vec<u8> {
     let events = match response {
         LoopbackProviderResponse::Blocks(blocks) => block_response_events(&blocks),
-        LoopbackProviderResponse::InvalidRequest => {
-            panic!("invalid requests use a non-SSE response")
+        LoopbackProviderResponse::InvalidRequest
+        | LoopbackProviderResponse::Overload
+        | LoopbackProviderResponse::OverloadAfterThinking => {
+            panic!("provider errors use a separate response")
         }
     };
 
@@ -718,6 +752,23 @@ fn response_payload(response: LoopbackProviderResponse) -> Vec<u8> {
         serde_json::to_writer(&mut payload, &event).unwrap();
         payload.extend_from_slice(b"\n\n");
     }
+    payload
+}
+
+fn overload_after_thinking_payload() -> Vec<u8> {
+    let events = block_response_events(&[LoopbackBlock::thinking(&["intermediate reasoning"])]);
+    let mut payload = Vec::new();
+    // End the stream with a provider error after thinking, before message_stop.
+    // No timing or connection race is needed to make the retry decision observable.
+    for (name, event) in events
+        .into_iter()
+        .take_while(|(name, _)| *name != "message_delta")
+    {
+        payload.extend_from_slice(format!("event: {name}\ndata: ").as_bytes());
+        serde_json::to_writer(&mut payload, &event).unwrap();
+        payload.extend_from_slice(b"\n\n");
+    }
+    payload.extend_from_slice(b"event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"synthetic overload\"}}\n\n");
     payload
 }
 

@@ -1901,6 +1901,15 @@ pub(super) struct AssignmentRoot {
 }
 
 impl AssignmentRoot {
+    pub(super) fn retention_report_identity(&self) -> Option<(String, String, String, String)> {
+        Some((
+            self.attempt_record.assignment_id.clone(),
+            self.attempt_record.attempt_id.clone(),
+            self.attempt_record.run_id.clone(),
+            self.execution.to_str()?.to_owned(),
+        ))
+    }
+
     pub(super) fn install_workflow_git(&mut self, authority: WorkflowGitAuthority) {
         self.workflow_git = Some(authority);
     }

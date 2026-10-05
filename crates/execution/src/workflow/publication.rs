@@ -33,6 +33,7 @@ use super::diagnostic::{CapturedDiagnosticStream, StepDiagnostic};
 use super::document::{FailurePolicy, FinalizationTrigger};
 use super::evidence::{NodeDetail, PrimaryIssue};
 use super::execution_root::open_directory;
+use super::export_presentation::{ContentReason, Field, resolve_text};
 use super::git_capture::GitCaptureFailure;
 use super::input::InputPreparationFailureKind;
 use super::private_staging::{directory_entry_names, same_file};
@@ -49,7 +50,10 @@ use super::step_runtime::{
     StepExecutionFailure, StepFailureCause, StepStartFailure, WorkingDirectoryFailure,
 };
 use super::validated::WorkflowNodeRole;
-use super::validated::{ResolvedOutputSource, WorkflowValueType};
+use super::validated::{
+    ResolvedOutputSource, ValidatedExportPresentation, ValidatedPresentationField,
+    WorkflowValueType,
+};
 use super::value::CapturedValue;
 use super::workspace_snapshot::WorkspaceSnapshotV1;
 
@@ -263,6 +267,7 @@ pub struct WorkflowRunResult {
     pub maximum_parallel_steps: NonZeroUsize,
     pub maximum_retained_bytes_per_stream: u64,
     pub cloud_capacity: Option<CloudExecutionCapacityV1>,
+    pub maximum_result_bytes: u64,
     pub timing: WorkflowRunTiming,
     pub outcome: RunOutcome,
     pub cancellation: Option<WorkflowRunCancellation>,
@@ -271,6 +276,7 @@ pub struct WorkflowRunResult {
     pub finalization: Option<WorkflowRunFinalization>,
     pub exports: ExportSet<CapturedValue>,
     pub export_sources: BTreeMap<String, ResolvedOutputSource>,
+    pub export_presentation: BTreeMap<String, super::validated::ValidatedExportPresentation>,
 }
 
 #[derive(Clone)]
@@ -290,7 +296,12 @@ pub struct CloudResultCarrier {
 }
 
 pub struct PreparedCloudWorkflowResult {
+    // Small results retain the existing in-memory delivery path. Large results
+    // remain in a private file until every retryable upload has completed.
     pub result_json: Arc<[u8]>,
+    pub result_file: Option<Arc<tempfile::NamedTempFile>>,
+    pub result_size_bytes: u64,
+    pub result_sha256: String,
     pub carriers: Vec<CloudResultCarrier>,
 }
 
@@ -667,6 +678,8 @@ pub struct CloudExecutionCapacityV1 {
     pub condition_transition_count: u64,
     pub aggregate_condition_transition_bytes: u64,
     pub terminal_result_structure_bytes: u64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub presentation_result_bytes: u64,
     pub portable_result_bytes: u64,
     pub encoded_outbox_bytes: u64,
     // jscpd:ignore-end
@@ -1272,6 +1285,10 @@ pub(crate) struct FailureCauseV1 {
     pub(crate) exit_code: Option<i32>,
 }
 
+fn is_zero(value: &u64) -> bool {
+    *value == 0
+}
+
 fn deserialize_nullable_option<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
 where
     D: Deserializer<'de>,
@@ -1321,6 +1338,7 @@ pub struct DiagnosticStreamV1 {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum ExportV1 {
     Available {
+        presentation: Option<ExportPresentationV1>,
         kind: String,
         media_type: String,
         path: String,
@@ -1330,6 +1348,7 @@ pub(crate) enum ExportV1 {
         producer: Option<OutputProducer>,
     },
     GitBranch {
+        presentation: Option<ExportPresentationV1>,
         artifact_version: u8,
         object_format: String,
         base_oid: String,
@@ -1341,7 +1360,69 @@ pub(crate) enum ExportV1 {
     },
     Unavailable {
         reason: ExportUnavailableReasonV1,
+        presentation: Option<ExportPresentationV1>,
     },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ExportPresentationV1 {
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub(crate) title: Option<PresentationFieldV1>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub(crate) description: Option<PresentationFieldV1>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
+pub(crate) enum PresentationFieldV1 {
+    Available {
+        value: String,
+    },
+    Unavailable {
+        reason: PresentationUnavailableReasonV1,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum PresentationUnavailableReasonV1 {
+    SourceFailed,
+    SourceBlocked,
+    SourceNotRun,
+    SourceInputUnavailable,
+    SourceTriggerNotSelected,
+    SourceCancelled,
+    Blank,
+    TooLarge,
+    ControlCharacter,
+    MultilineTitle,
+}
+
+impl ExportV1 {
+    pub(crate) fn presentation(&self) -> Option<&ExportPresentationV1> {
+        match self {
+            Self::Available { presentation, .. }
+            | Self::GitBranch { presentation, .. }
+            | Self::Unavailable { presentation, .. } => presentation.as_ref(),
+        }
+    }
+
+    fn set_presentation(&mut self, value: ExportPresentationV1) {
+        match self {
+            Self::Available { presentation, .. }
+            | Self::GitBranch { presentation, .. }
+            | Self::Unavailable { presentation, .. } => *presentation = Some(value),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1390,10 +1471,13 @@ impl Serialize for ExportV1 {
                 digest,
                 provenance,
                 producer,
+                presentation,
             } => {
                 let mut state = serializer.serialize_struct(
                     "AvailableExportV1",
-                    6 + usize::from(provenance.is_some()) + usize::from(producer.is_some()),
+                    6 + usize::from(provenance.is_some())
+                        + usize::from(producer.is_some())
+                        + usize::from(presentation.is_some()),
                 )?;
                 state.serialize_field("state", "available")?;
                 state.serialize_field("kind", kind)?;
@@ -1402,6 +1486,9 @@ impl Serialize for ExportV1 {
                 state.serialize_field("sizeBytes", size_bytes)?;
                 state.serialize_field("digest", digest)?;
                 serialize_export_origin(&mut state, provenance.as_ref(), producer.as_ref())?;
+                if let Some(presentation) = presentation {
+                    state.serialize_field("presentation", presentation)?;
+                }
                 state.end()
             }
             Self::GitBranch {
@@ -1413,12 +1500,14 @@ impl Serialize for ExportV1 {
                 carrier,
                 provenance,
                 producer,
+                presentation,
             } => {
                 let mut state = serializer.serialize_struct(
                     "GitBranchExportV1",
                     7 + usize::from(carrier.is_some())
                         + usize::from(provenance.is_some())
-                        + usize::from(producer.is_some()),
+                        + usize::from(producer.is_some())
+                        + usize::from(presentation.is_some()),
                 )?;
                 state.serialize_field("state", "available")?;
                 state.serialize_field("kind", "git_branch")?;
@@ -1431,12 +1520,24 @@ impl Serialize for ExportV1 {
                     state.serialize_field("carrier", carrier)?;
                 }
                 serialize_export_origin(&mut state, provenance.as_ref(), producer.as_ref())?;
+                if let Some(presentation) = presentation {
+                    state.serialize_field("presentation", presentation)?;
+                }
                 state.end()
             }
-            Self::Unavailable { reason } => {
-                let mut state = serializer.serialize_struct("UnavailableExportV1", 2)?;
+            Self::Unavailable {
+                reason,
+                presentation,
+            } => {
+                let mut state = serializer.serialize_struct(
+                    "UnavailableExportV1",
+                    2 + usize::from(presentation.is_some()),
+                )?;
                 state.serialize_field("state", "unavailable")?;
                 state.serialize_field("reason", reason)?;
+                if let Some(presentation) = presentation {
+                    state.serialize_field("presentation", presentation)?;
+                }
                 state.end()
             }
         }
@@ -1467,6 +1568,7 @@ impl<'de> Deserialize<'de> for ExportV1 {
                     carrier: wire.carrier,
                     provenance: wire.provenance,
                     producer: wire.producer,
+                    presentation: wire.presentation,
                 })
             }
             (Some("available"), Some(_)) => {
@@ -1483,6 +1585,7 @@ impl<'de> Deserialize<'de> for ExportV1 {
                     digest: wire.digest,
                     provenance: wire.provenance,
                     producer: wire.producer,
+                    presentation: wire.presentation,
                 })
             }
             (Some("unavailable"), None) => {
@@ -1493,6 +1596,7 @@ impl<'de> Deserialize<'de> for ExportV1 {
                 }
                 Ok(Self::Unavailable {
                     reason: wire.reason,
+                    presentation: wire.presentation,
                 })
             }
             _ => Err(D::Error::custom("invalid export state or kind")),
@@ -1513,6 +1617,8 @@ struct AvailableExportWire {
     provenance: Option<ExportProvenanceV1>,
     #[serde(default, deserialize_with = "deserialize_non_null_option")]
     producer: Option<OutputProducer>,
+    #[serde(default, deserialize_with = "deserialize_non_null_option")]
+    presentation: Option<ExportPresentationV1>,
 }
 
 // Available file-like and Git exports intentionally keep separate closed wire structs;
@@ -1534,6 +1640,8 @@ struct GitBranchExportWire {
     provenance: Option<ExportProvenanceV1>,
     #[serde(default, deserialize_with = "deserialize_non_null_option")]
     producer: Option<OutputProducer>,
+    #[serde(default, deserialize_with = "deserialize_non_null_option")]
+    presentation: Option<ExportPresentationV1>,
 }
 // jscpd:ignore-end
 
@@ -1542,6 +1650,8 @@ struct GitBranchExportWire {
 struct UnavailableExportWire {
     state: String,
     reason: ExportUnavailableReasonV1,
+    #[serde(default, deserialize_with = "deserialize_non_null_option")]
+    presentation: Option<ExportPresentationV1>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1685,32 +1795,110 @@ pub fn prepare_cloud_workflow_result(
         },
         exports,
     )?;
-    let result_json = encode_result_json(&result)?;
-    Ok(PreparedCloudWorkflowResult {
-        result_json: Arc::from(result_json),
-        carriers,
-    })
+    let mut file = tempfile::NamedTempFile::new().map_err(|_| serialization_unavailable())?;
+    write_result_json(&result, run.maximum_result_bytes, &mut file)?;
+    let size = file
+        .as_file()
+        .metadata()
+        .map_err(|_| serialization_unavailable())?
+        .len();
+    let mut digest = DigestContext::new(&SHA256);
+    let mut reader = file.reopen().map_err(|_| serialization_unavailable())?;
+    let mut buffer = [0; 64 * 1024];
+    loop {
+        let count = reader
+            .read(&mut buffer)
+            .map_err(|_| serialization_unavailable())?;
+        if count == 0 {
+            break;
+        }
+        digest.update(&buffer[..count]);
+    }
+    let sha256 = lowercase_hex(digest.finish().as_ref());
+    if size <= 16 * 1024 * 1024 {
+        let mut result_json =
+            Vec::with_capacity(usize::try_from(size).map_err(|_| serialization_unavailable())?);
+        file.reopen()
+            .map_err(|_| serialization_unavailable())?
+            .read_to_end(&mut result_json)
+            .map_err(|_| serialization_unavailable())?;
+        Ok(PreparedCloudWorkflowResult {
+            result_json: Arc::from(result_json),
+            result_file: None,
+            result_size_bytes: size,
+            result_sha256: sha256,
+            carriers,
+        })
+    } else {
+        Ok(PreparedCloudWorkflowResult {
+            result_json: Arc::from([]),
+            result_file: Some(Arc::new(file)),
+            result_size_bytes: size,
+            result_sha256: sha256,
+            carriers,
+        })
+    }
 }
 
-fn encode_result_json(result: &WorkflowResultV1) -> Result<Vec<u8>, LocalPublicationError> {
-    result_metadata::validate_with_invariant(result).map_err(invalid_run_result)?;
-    let mut bytes = serde_json::to_vec_pretty(result).map_err(|_| {
-        LocalPublicationError::new(
-            LocalPublicationPhase::Serialization,
-            LocalPublicationFailureKind::SerializationUnavailable,
-        )
-    })?;
-    bytes.push(b'\n');
-    if u64::try_from(bytes.len())
-        .ok()
-        .is_none_or(|size| size > result_metadata::MAXIMUM_RESULT_JSON_BYTES)
-    {
-        return Err(LocalPublicationError::new(
-            LocalPublicationPhase::Serialization,
-            LocalPublicationFailureKind::SerializationUnavailable,
-        ));
+fn serialization_unavailable() -> LocalPublicationError {
+    LocalPublicationError::new(
+        LocalPublicationPhase::Serialization,
+        LocalPublicationFailureKind::SerializationUnavailable,
+    )
+}
+
+struct ResultJsonWriter<'a, W> {
+    output: &'a mut W,
+    written: u64,
+    limit: u64,
+}
+
+impl<W: Write> Write for ResultJsonWriter<'_, W> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let size = u64::try_from(bytes.len()).map_err(io::Error::other)?;
+        if self
+            .written
+            .checked_add(size)
+            .is_none_or(|total| total > self.limit)
+        {
+            return Err(io::Error::other("portable result capacity exceeded"));
+        }
+        self.output.write_all(bytes)?;
+        self.written += size;
+        Ok(bytes.len())
     }
-    Ok(bytes)
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.output.flush()
+    }
+}
+
+fn write_result_json(
+    result: &WorkflowResultV1,
+    maximum_result_bytes: u64,
+    output: &mut impl Write,
+) -> Result<(), LocalPublicationError> {
+    result_metadata::validate_with_invariant(result).map_err(invalid_run_result)?;
+    let decorated = result
+        .exports
+        .values()
+        .any(|export| export.presentation().is_some());
+    let mut buffered = std::io::BufWriter::with_capacity(64 * 1024, output);
+    let mut writer = ResultJsonWriter {
+        output: &mut buffered,
+        written: 0,
+        limit: maximum_result_bytes.min(result_metadata::MAXIMUM_RESULT_JSON_BYTES),
+    };
+    if decorated {
+        serde_json::to_writer(&mut writer, result)
+    } else {
+        serde_json::to_writer_pretty(&mut writer, result)
+    }
+    .map_err(|_| serialization_unavailable())?;
+    writer
+        .write_all(b"\n")
+        .and_then(|()| writer.flush())
+        .map_err(|_| serialization_unavailable())
 }
 
 fn cloud_available_export(
@@ -1734,6 +1922,7 @@ fn cloud_available_export(
                 },
                 provenance: None,
                 producer: None,
+                presentation: None,
             },
             Some(CloudCarrierBody::Staged(file.carrier().clone())),
         ),
@@ -1778,6 +1967,7 @@ fn cloud_available_export(
                     carrier,
                     provenance: None,
                     producer: None,
+                    presentation: None,
                 },
                 body,
             )
@@ -1839,6 +2029,7 @@ fn byte_backed_cloud_export(
             },
             provenance: None,
             producer: None,
+            presentation: None,
         },
         Some(CloudCarrierBody::Bytes(bytes)),
     ))
@@ -1913,8 +2104,7 @@ fn publish_prepared_with_observer(
         None,
     )?;
     let result = build_result(run, exports)?;
-    let result_bytes = encode_result_json(&result)?;
-    let result_file = staging.write_result(&result_bytes)?;
+    let result_file = staging.write_result_streamed(&result, run.maximum_result_bytes)?;
     observer
         .close_staged_file(result_file, &StagedFile::Result)
         .map_err(|_| {
@@ -1937,11 +2127,11 @@ fn publish_prepared_with_observer(
             LocalPublicationFailureKind::VerificationUnavailable,
         )
     })?;
-    match target.existing_publication(&result, &result_bytes)? {
+    match target.existing_publication(&result, &staging.root)? {
         ExistingPublication::Absent => {
             if let Err(error) = staging.commit(target)
                 && (error.kind() != LocalPublicationFailureKind::DestinationExists
-                    || target.existing_publication(&result, &result_bytes)?
+                    || target.existing_publication(&result, &staging.root)?
                         != ExistingPublication::Identical)
             {
                 return Err(
@@ -2073,6 +2263,7 @@ fn unavailable_export(
     }
     Ok(ExportV1::Unavailable {
         reason: export_unavailable_reason(reason),
+        presentation: None,
     })
 }
 
@@ -2209,6 +2400,7 @@ fn write_available_export(
         },
         provenance: None,
         producer: None,
+        presentation: None,
     };
     observe(
         observer,
@@ -2268,6 +2460,7 @@ fn write_git_branch_export(
         carrier,
         provenance: None,
         producer: None,
+        presentation: None,
     })
 }
 
@@ -2352,6 +2545,7 @@ fn expose_available_carrier(
         },
         provenance: None,
         producer: None,
+        presentation: None,
     })
 }
 
@@ -2401,6 +2595,102 @@ fn carrier_handoff_error(export: &str, _failure: ArtifactExposeFailure) -> Local
         LocalPublicationFailureKind::CarrierHandoffUnavailable,
         export,
     )
+}
+
+fn resolve_presentation_field(
+    run: &WorkflowRunResult,
+    field: Field,
+    source: &ValidatedPresentationField,
+) -> Result<PresentationFieldV1, LocalPublicationError> {
+    let unavailable = |reason| PresentationFieldV1::Unavailable { reason };
+    let text = match source {
+        ValidatedPresentationField::Literal(value) => value.as_str(),
+        ValidatedPresentationField::Reference(source) => {
+            let step = match source.node.role {
+                WorkflowNodeRole::Step => run.steps.iter().find(|step| step.id == source.node.id),
+                WorkflowNodeRole::Finalizer => run.finalization.as_ref().and_then(|finalization| {
+                    finalization
+                        .finalizers
+                        .iter()
+                        .find(|step| step.id == source.node.id)
+                }),
+            }
+            .ok_or_else(|| invalid_run_result(RunResultInvariant::ExportSources))?;
+            match &step.state {
+                StepState::Succeeded { outputs }
+                | StepState::Inherited {
+                    outputs,
+                    disposition: super::runtime::InheritedDisposition::Succeeded,
+                    ..
+                } => match outputs.get(&source.output) {
+                    Some(CapturedValue::Text(text)) => text.as_str(),
+                    _ => return Err(invalid_run_result(RunResultInvariant::ExportSources)),
+                },
+                StepState::Failed { .. } => {
+                    return Ok(unavailable(PresentationUnavailableReasonV1::SourceFailed));
+                }
+                StepState::Blocked { .. } if source.node.role == WorkflowNodeRole::Finalizer => {
+                    return Ok(unavailable(
+                        PresentationUnavailableReasonV1::SourceInputUnavailable,
+                    ));
+                }
+                StepState::Blocked { .. } => {
+                    return Ok(unavailable(PresentationUnavailableReasonV1::SourceBlocked));
+                }
+                StepState::Skipped { .. } | StepState::Inherited { .. } => {
+                    return Ok(unavailable(PresentationUnavailableReasonV1::SourceNotRun));
+                }
+                StepState::NotRun { .. } if source.node.role == WorkflowNodeRole::Finalizer => {
+                    return Ok(unavailable(
+                        PresentationUnavailableReasonV1::SourceTriggerNotSelected,
+                    ));
+                }
+                StepState::NotRun { .. } => {
+                    return Ok(unavailable(PresentationUnavailableReasonV1::SourceNotRun));
+                }
+                StepState::Cancelled { .. } => {
+                    return Ok(unavailable(
+                        PresentationUnavailableReasonV1::SourceCancelled,
+                    ));
+                }
+                _ => return Err(invalid_run_result(RunResultInvariant::ExportSources)),
+            }
+        }
+    };
+    match resolve_text(field, text) {
+        Ok(value) => Ok(PresentationFieldV1::Available {
+            value: value.to_owned(),
+        }),
+        Err(_) if matches!(source, ValidatedPresentationField::Literal(_)) => {
+            Err(invalid_run_result(RunResultInvariant::ExportSources))
+        }
+        Err(reason) => Ok(unavailable(match reason {
+            ContentReason::Blank => PresentationUnavailableReasonV1::Blank,
+            ContentReason::ControlCharacter => PresentationUnavailableReasonV1::ControlCharacter,
+            ContentReason::TooLarge => PresentationUnavailableReasonV1::TooLarge,
+            ContentReason::MultilineTitle => PresentationUnavailableReasonV1::MultilineTitle,
+        })),
+    }
+}
+
+fn resolve_export_presentation(
+    run: &WorkflowRunResult,
+    presentation: &ValidatedExportPresentation,
+) -> Result<ExportPresentationV1, LocalPublicationError> {
+    let title = presentation
+        .title
+        .as_ref()
+        .map(|source| resolve_presentation_field(run, Field::Title, source))
+        .transpose()?;
+    let description = presentation
+        .description
+        .as_ref()
+        .map(|source| resolve_presentation_field(run, Field::Description, source))
+        .transpose()?;
+    if title.is_none() && description.is_none() {
+        return Err(invalid_run_result(RunResultInvariant::ExportSources));
+    }
+    Ok(ExportPresentationV1 { title, description })
 }
 
 fn build_result(
@@ -2473,7 +2763,17 @@ fn build_result_with_provenance(
                 .collect()
         })
         .unwrap_or_default();
+    if run
+        .export_presentation
+        .keys()
+        .any(|name| !exports.contains_key(name))
+    {
+        return Err(invalid_run_result(RunResultInvariant::ExportSources));
+    }
     for (name, export) in &mut exports {
+        if let Some(presentation) = run.export_presentation.get(name) {
+            export.set_presentation(resolve_export_presentation(run, presentation)?);
+        }
         let Some(source) = run.export_sources.get(name) else {
             return Err(invalid_run_result(RunResultInvariant::ExportSources));
         };
@@ -3505,7 +3805,7 @@ impl PublicationTarget {
     fn existing_publication(
         &self,
         expected: &WorkflowResultV1,
-        expected_bytes: &[u8],
+        expected_root: &OwnedFd,
     ) -> Result<ExistingPublication, LocalPublicationError> {
         let named = match statat(&self.parent, &self.name, AtFlags::SYMLINK_NOFOLLOW) {
             Err(Errno::NOENT) => return Ok(ExistingPublication::Absent),
@@ -3538,30 +3838,44 @@ impl PublicationTarget {
         if retained != *expected {
             return Ok(ExistingPublication::Conflict);
         }
-        let descriptor = match openat(
-            &root,
-            RESULT_FILE,
-            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-            Mode::empty(),
-        ) {
-            Ok(descriptor) => descriptor,
-            Err(_) => return Ok(ExistingPublication::Conflict),
+        let Some(mut file) = open_result_file(&root) else {
+            return Ok(ExistingPublication::Conflict);
         };
-        let mut file = File::from(descriptor);
-        let mut bytes = Vec::new();
-        if Read::by_ref(&mut file)
-            .take(result_metadata::MAXIMUM_RESULT_JSON_BYTES.saturating_add(1))
-            .read_to_end(&mut bytes)
-            .is_err()
+        let Some(mut expected) = open_result_file(expected_root) else {
+            return Ok(ExistingPublication::Conflict);
+        };
+        if fstat(&file).ok().map(|stat| stat.st_size)
+            != fstat(&expected).ok().map(|stat| stat.st_size)
         {
             return Ok(ExistingPublication::Conflict);
         }
-        Ok(if bytes == expected_bytes {
-            ExistingPublication::Identical
-        } else {
-            ExistingPublication::Conflict
-        })
+        let mut left = [0; 64 * 1024];
+        let mut right = [0; 64 * 1024];
+        loop {
+            let count = match file.read(&mut left) {
+                Ok(count) => count,
+                Err(_) => return Ok(ExistingPublication::Conflict),
+            };
+            if expected.read_exact(&mut right[..count]).is_err() || left[..count] != right[..count]
+            {
+                return Ok(ExistingPublication::Conflict);
+            }
+            if count == 0 {
+                return Ok(ExistingPublication::Identical);
+            }
+        }
     }
+}
+
+fn open_result_file(root: &OwnedFd) -> Option<File> {
+    openat(
+        root,
+        RESULT_FILE,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .ok()
+    .map(File::from)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3660,7 +3974,11 @@ impl<'a> StagingDirectory<'a> {
         artifacts.expose_carrier(carrier, expected_output_identity, exports, OsStr::new(name))
     }
 
-    fn write_result(&mut self, bytes: &[u8]) -> Result<File, LocalPublicationError> {
+    fn write_result_streamed(
+        &mut self,
+        value: &WorkflowResultV1,
+        maximum: u64,
+    ) -> Result<File, LocalPublicationError> {
         let mut result = openat(
             &self.root,
             RESULT_FILE,
@@ -3675,15 +3993,7 @@ impl<'a> StagingDirectory<'a> {
             )
         })?;
         self.result_created = true;
-        result
-            .write_all(bytes)
-            .and_then(|()| result.flush())
-            .map_err(|_| {
-                LocalPublicationError::new(
-                    LocalPublicationPhase::Serialization,
-                    LocalPublicationFailureKind::SerializationUnavailable,
-                )
-            })?;
+        write_result_json(value, maximum, &mut result)?;
         Ok(result)
     }
 

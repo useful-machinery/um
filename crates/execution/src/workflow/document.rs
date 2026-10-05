@@ -15,7 +15,25 @@ pub(crate) struct WorkflowDocument {
     pub(crate) step_order: Vec<String>,
     pub(crate) finalizers: BTreeMap<String, FinalizerDefinition>,
     pub(crate) finalizer_order: Vec<String>,
-    pub(crate) exports: BTreeMap<String, OutputReference>,
+    pub(crate) exports: BTreeMap<String, ExportDefinition>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ExportDefinition {
+    pub(crate) source: OutputReference,
+    pub(crate) presentation: Option<ExportPresentation>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ExportPresentation {
+    pub(crate) title: Option<PresentationSource>,
+    pub(crate) description: Option<PresentationSource>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum PresentationSource {
+    Literal(String),
+    Reference(OutputReference),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

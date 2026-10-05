@@ -8,6 +8,9 @@
       "$ref": "#/$defs/RunnerHello"
     },
     {
+      "$ref": "#/$defs/RunnerWorkspaceRetentionReport"
+    },
+    {
       "$ref": "#/$defs/RunnerEffectAcknowledged"
     },
     {
@@ -383,10 +386,15 @@
           "minimum": 2,
           "maximum": 536870912
         },
+        "presentationResultBytes": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 226848768
+        },
         "portableResultBytes": {
           "type": "integer",
           "minimum": 202027692,
-          "maximum": 901080408
+          "maximum": 1127929176
         },
         "encodedOutboxBytes": {
           "type": "integer",
@@ -697,6 +705,29 @@
               "required": [
                 "runnerVersion"
               ]
+            }
+          }
+        }
+      ],
+      "unevaluatedProperties": false
+    },
+    "RunnerWorkspaceRetentionReport": {
+      "allOf": [
+        {"$ref": "#/$defs/RunnerEnvelope"},
+        {
+          "properties": {
+            "type": {"const": "workspace_retention_report"},
+            "payload": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "assignmentId": {"$ref": "#/$defs/assignmentId"},
+                "attemptId": {"$ref": "#/$defs/attemptId"},
+                "runId": {"$ref": "#/$defs/runId"},
+                "executionRoot": {"type": "string", "pattern": "^/", "maxLength": 4096},
+                "state": {"enum": ["retained", "removed"]}
+              },
+              "required": ["assignmentId", "attemptId", "runId", "executionRoot", "state"]
             }
           }
         }

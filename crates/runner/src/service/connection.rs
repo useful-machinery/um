@@ -247,6 +247,16 @@ impl<'a> ProtocolLog<'a> {
                 assignment_id,
                 ..
             } => (envelope, "execution_finished", None, Some(assignment_id)),
+            RunnerFrame::WorkspaceRetentionReport {
+                envelope,
+                assignment_id,
+                ..
+            } => (
+                envelope,
+                "workspace_retention_report",
+                None,
+                Some(assignment_id),
+            ),
             RunnerFrame::ExecutionInterrupted {
                 envelope,
                 assignment_id,
@@ -4981,6 +4991,34 @@ mod tests {
                 ))
                 .await
                 .expect("acknowledge assignment rejection");
+            let Some(Ok(Message::Text(retention))) = socket.next().await else {
+                panic!("fixture did not receive workspace retention report");
+            };
+            let retention: serde_json::Value =
+                serde_json::from_str(&retention).expect("decode workspace retention report");
+            assert_eq!(retention["type"], "workspace_retention_report");
+            assert_eq!(
+                retention["payload"]["assignmentId"],
+                "asn_01k0z6r1w8f4jy2m7q9v3x5abh"
+            );
+            assert_eq!(
+                retention["payload"]["attemptId"],
+                "atm_01k0z6r1w8f4jy2m7q9v3x5abc"
+            );
+            assert_eq!(
+                retention["payload"]["runId"],
+                "run_01k0z6r1w8f4jy2m7q9v3x5abj"
+            );
+            assert_eq!(retention["payload"]["state"], "retained");
+            socket
+                .send(observation_acknowledgement(
+                    retention["messageId"]
+                        .as_str()
+                        .expect("retention message ID"),
+                    7,
+                ))
+                .await
+                .expect("acknowledge workspace retention report");
             socket
                 .send(Message::Text(
                     json!({
@@ -5014,7 +5052,7 @@ mod tests {
                     release_acknowledgement["messageId"]
                         .as_str()
                         .expect("release acknowledgement message ID"),
-                    7,
+                    8,
                 ))
                 .await
                 .expect("acknowledge release effect");
@@ -5028,11 +5066,11 @@ mod tests {
         let outcome = outcome.expect("run fixture connection");
         assert!(outcome.opening_acknowledged);
         assert!(outcome.handshake_completed);
-        assert_eq!(outcome.cloud_text_frames_received, 11);
-        assert_eq!(outcome.runner_text_frames_sent, 7);
+        assert_eq!(outcome.cloud_text_frames_received, 12);
+        assert_eq!(outcome.runner_text_frames_sent, 8);
         assert_eq!(outcome.effects_received, 3);
         assert_eq!(outcome.effect_acknowledgements_confirmed, 3);
-        assert_eq!(next_sequence, 8);
+        assert_eq!(next_sequence, 9);
         server.await.expect("join fixture server");
 
         let all_events = capture.events();
@@ -5075,7 +5113,7 @@ mod tests {
         assert_eq!(events[1]["um.runner.sequence"], 4);
         assert_eq!(events[1]["um.outcome"], "success");
         assert_eq!(events[2]["um.effect.id"], "eff_01k0z6r1w8f4jy2m7q9v3x5abj");
-        assert_eq!(events[2]["um.runner.sequence"], 7);
+        assert_eq!(events[2]["um.runner.sequence"], 8);
         assert_eq!(events[2]["um.outcome"], "success");
         assert_eq!(capture.span_count("runner.effect_acknowledgement"), 3);
         assert_eq!(capture.span_count("runner.assignment_preparation"), 1);
@@ -5085,7 +5123,7 @@ mod tests {
             .into_iter()
             .filter(|record| record["event.name"] == RUNNER_PROTOCOL_EVENT_NAME)
             .collect();
-        let expected = [
+        let mut expected = [
             ("text", Some("hello")),
             ("text", Some("welcome")),
             ("text", Some("observation_ack")),
@@ -5105,12 +5143,19 @@ mod tests {
             ("pong", None),
             ("text", Some("assignment_rejected")),
             ("text", Some("observation_ack")),
+            ("text", Some("workspace_retention_report")),
+            ("text", Some("observation_ack")),
             ("text", Some("assignment_release")),
             ("text", Some("effect_acknowledged")),
             ("text", Some("observation_ack")),
             ("close", None),
         ];
         assert_eq!(protocol.len(), expected.len());
+        // Cleanup can send the retention report before the runner receives the
+        // rejection acknowledgement. These opposite-direction frames may interleave.
+        if protocol[18]["um.protocol.frame_type"] == "workspace_retention_report" {
+            expected.swap(18, 19);
+        }
         for (index, (record, (kind, frame_type))) in protocol.iter().zip(expected).enumerate() {
             assert_eq!(record["um.main"], false);
             assert_eq!(record["um.protocol.order"], index + 1);

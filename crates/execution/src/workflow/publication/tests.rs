@@ -220,6 +220,7 @@ fn run_fixture(fixture: &PublicationFixture) -> WorkflowRunResult {
         maximum_parallel_steps: NonZeroUsize::new(2).unwrap(),
         maximum_retained_bytes_per_stream: super::super::MAXIMUM_RETAINED_BYTES_PER_STREAM,
         cloud_capacity: None,
+        maximum_result_bytes: 202_027_692,
         timing: WorkflowRunTiming {
             started_at: timestamp_fixture("2026-08-02T12:01:44Z"),
             finished_at: timestamp_fixture("2026-08-02T12:01:45.25Z"),
@@ -257,6 +258,7 @@ fn run_fixture(fixture: &PublicationFixture) -> WorkflowRunResult {
                 export_source("produce", "lower", WorkflowValueType::File),
             ),
         ]),
+        export_presentation: BTreeMap::new(),
     }
 }
 
@@ -378,6 +380,116 @@ fn read_result(destination: &Path) -> (Vec<u8>, Value) {
     (bytes, value)
 }
 
+#[test]
+fn sealed_presentation_resolves_fields_and_aliases_independently() {
+    use super::super::validated::{ValidatedExportPresentation, ValidatedPresentationField};
+
+    let fixture = PublicationFixture::new();
+    let mut run = run_fixture(&fixture);
+    if let StepState::Succeeded { outputs } = &mut run.steps[0].state {
+        outputs.insert(
+            "title".to_owned(),
+            CapturedValue::text(Arc::from(" \tRelease notes\n")),
+        );
+        outputs.insert(
+            "empty".to_owned(),
+            CapturedValue::text(Arc::from(" \t\r\n")),
+        );
+    }
+    let failure = StepFailureCause::Execution(StepExecutionFailure::Command(
+        CommandExecutionFailure::UnsuccessfulExit { code: Some(23) },
+    ));
+    let mut finalizer = succeeded_step("writeup", BTreeMap::new());
+    finalizer.role = WorkflowNodeRole::Finalizer;
+    finalizer.failure_policy = FailurePolicy::Advisory;
+    finalizer.state = StepState::Failed {
+        detail: canonical_failure_detail(FailurePhase::Execution, &failure).unwrap(),
+    };
+    run.finalization = Some(WorkflowRunFinalization {
+        trigger: FinalizationTrigger::Succeeded,
+        finalizers: vec![finalizer],
+        cancellation: None,
+        force_abort: false,
+    });
+    run.export_presentation.insert(
+        "reportA".to_owned(),
+        ValidatedExportPresentation {
+            title: Some(ValidatedPresentationField::Reference(export_source(
+                "produce",
+                "title",
+                WorkflowValueType::Text,
+            ))),
+            description: Some(ValidatedPresentationField::Reference(
+                ResolvedOutputSource {
+                    node: WorkflowNode {
+                        id: "writeup".to_owned(),
+                        role: WorkflowNodeRole::Finalizer,
+                    },
+                    output: "description".to_owned(),
+                    value_type: WorkflowValueType::Text,
+                },
+            )),
+        },
+    );
+    run.export_presentation.insert(
+        "reporta".to_owned(),
+        ValidatedExportPresentation {
+            title: Some(ValidatedPresentationField::Literal(
+                " Alternate title ".to_owned(),
+            )),
+            description: Some(ValidatedPresentationField::Reference(export_source(
+                "produce",
+                "empty",
+                WorkflowValueType::Text,
+            ))),
+        },
+    );
+    run.maximum_result_bytes += 20_000;
+    let destination = fixture.destination("export-presentation");
+    publish_workflow_result(&destination, &fixture.artifacts, &run).unwrap();
+    let (bytes, value) = read_result(&destination);
+    assert_eq!(
+        value["exports"]["reportA"]["presentation"],
+        serde_json::json!({
+            "title": {"state": "available", "value": "Release notes"},
+            "description": {"state": "unavailable", "reason": "source_failed"}
+        })
+    );
+    assert_eq!(
+        value["exports"]["reporta"]["presentation"],
+        serde_json::json!({
+            "title": {"state": "available", "value": "Alternate title"},
+            "description": {"state": "unavailable", "reason": "blank"}
+        })
+    );
+    assert!(super::super::result_metadata::decode(&bytes).is_ok());
+    for replacement in [
+        serde_json::json!({}),
+        serde_json::json!({"title": null}),
+        serde_json::json!({"title": {"state": "available", "value": " untrimmed"}}),
+        serde_json::json!({"description": {"state": "unavailable", "reason": "multiline_title"}}),
+        serde_json::json!({"title": {"state": "available", "value": "valid", "reason": "blank"}}),
+    ] {
+        let mut corrupt = value.clone();
+        corrupt["exports"]["reportA"]["presentation"] = replacement;
+        let mut encoded = serde_json::to_vec(&corrupt).unwrap();
+        encoded.push(b'\n');
+        assert!(super::super::result_metadata::decode(&encoded).is_err());
+    }
+    let mut historical = value;
+    historical["exports"]["reportA"]
+        .as_object_mut()
+        .unwrap()
+        .remove("presentation");
+    historical["exports"]["reporta"]
+        .as_object_mut()
+        .unwrap()
+        .remove("presentation");
+    let mut encoded = serde_json::to_vec(&historical).unwrap();
+    encoded.push(b'\n');
+    assert!(super::super::result_metadata::decode(&encoded).is_ok());
+}
+
 fn staging_paths(parent: &Path) -> Vec<PathBuf> {
     fs::read_dir(parent)
         .unwrap()
@@ -410,6 +522,7 @@ fn prepares_metadata_only_and_carrier_cloud_results() {
         condition_transition_count: 0,
         aggregate_condition_transition_bytes: 0,
         terminal_result_structure_bytes: 67_108_864,
+        presentation_result_bytes: 0,
         portable_result_bytes: 202_027_692,
         encoded_outbox_bytes: 85_458_944,
     });
@@ -480,6 +593,407 @@ fn prepares_metadata_only_and_carrier_cloud_results() {
     assert!(prepared.carriers.is_empty());
     let document: serde_json::Value = serde_json::from_slice(&prepared.result_json).unwrap();
     assert_eq!(document["exports"], serde_json::json!({}));
+}
+
+// Run-scoped, inert checkpoint seed. The caller owns the disposable directory;
+// it is never a workflow or provider dispatch.
+#[test]
+#[ignore]
+fn resource_checkpoint_seed_cloud_artifact() {
+    let target =
+        PathBuf::from(std::env::var_os("LIV_CHECKPOINT_DIR").expect("disposable directory"));
+    assert!(!target.exists());
+    fs::create_dir_all(target.join("exports")).unwrap();
+    let fixture = PublicationFixture::new();
+    let mut run = run_fixture(&fixture);
+    let shared_file = run.exports.get("reportA").unwrap().clone();
+    run.exports.clear();
+    run.export_sources.clear();
+    if let StepState::Succeeded { outputs } = &mut run.steps[0].state {
+        let oid: Arc<str> = Arc::from("0123456789abcdef0123456789abcdef01234567");
+        outputs.insert(
+            "branch".to_owned(),
+            CapturedValue::git_branch(crate::workflow::artifact::CapturedGitBranch::from_retained(
+                Arc::from("produce.branch"),
+                crate::workflow::artifact::GitBranchMetadata::new(oid.clone(), oid.clone(), oid),
+                None,
+            )),
+        );
+        outputs.insert(
+            "title".to_owned(),
+            CapturedValue::text(Arc::from("😀".repeat(255))),
+        );
+        outputs.insert(
+            "description".to_owned(),
+            CapturedValue::text(Arc::from("\\".repeat(8_192))),
+        );
+    } else {
+        panic!("seed producer must have succeeded");
+    }
+    let variant = std::env::var("LIV_CHECKPOINT_VARIANT").unwrap_or_default();
+    let conditional = variant.starts_with("conditional");
+    let cloud_source = variant == "conditional-cloud";
+    if cloud_source && let StepState::Succeeded { outputs } = &mut run.steps[0].state {
+        outputs.insert(
+            "result".to_owned(),
+            CapturedValue::json_fixture(Arc::new(serde_json::json!({}))),
+        );
+    }
+    // A real capture retains at most 4 MiB per invocation and 64 MiB per
+    // stream across the run. Exercise that budget with semantic base64 data,
+    // rather than whitespace following a small serialized result.
+    {
+        for ordinal in 0..14 {
+            run.steps.push(succeeded_step(
+                &format!("retained{ordinal:02}"),
+                BTreeMap::new(),
+            ));
+        }
+    }
+    for (index, step) in run.steps.iter_mut().enumerate() {
+        if conditional && index == 1 {
+            continue;
+        }
+        step.command_output = Some(StepDiagnostic::from_streams(
+            CapturedDiagnosticStream::from_parts(
+                Arc::<[u8]>::from(vec![b'A'; 4 * 1024 * 1024]),
+                0,
+                true,
+            ),
+            CapturedDiagnosticStream::from_parts(
+                Arc::<[u8]>::from(vec![b'A'; 4 * 1024 * 1024]),
+                0,
+                true,
+            ),
+        ));
+    }
+    let title = export_source("produce", "title", WorkflowValueType::Text);
+    let description = export_source("produce", "description", WorkflowValueType::Text);
+    for ordinal in 0..4_096 {
+        let name = format!("alias{ordinal:04}");
+        if ordinal == 0 {
+            let branch = match &run.steps[0].state {
+                StepState::Succeeded { outputs } => outputs.get("branch").unwrap().clone(),
+                _ => panic!("seed producer must have succeeded"),
+            };
+            run.exports
+                .insert(name.clone(), ExportValue::Available { output: branch });
+            run.export_sources.insert(
+                name.clone(),
+                export_source("produce", "branch", WorkflowValueType::GitBranch),
+            );
+        } else {
+            run.exports.insert(name.clone(), shared_file.clone());
+            run.export_sources.insert(
+                name.clone(),
+                export_source("produce", "upper", WorkflowValueType::File),
+            );
+        }
+        run.export_presentation.insert(
+            name,
+            crate::workflow::validated::ValidatedExportPresentation {
+                title: Some(
+                    crate::workflow::validated::ValidatedPresentationField::Reference(
+                        title.clone(),
+                    ),
+                ),
+                description: Some(
+                    crate::workflow::validated::ValidatedPresentationField::Reference(
+                        description.clone(),
+                    ),
+                ),
+            },
+        );
+    }
+    // The checkpoint must carry a real source projection, not a forged
+    // maximum-capacity offer unrelated to its authored nodes and exports.
+    let mut definition = String::from(
+        "schemaVersion: 1\nsteps:\n  produce:\n    kind: cmd\n    command: {argv: [\"true\"]}\n    outputs:\n      upper: {kind: file, from: path, path: \"odd names/report?.txt\", mediaType: application/junit+xml}\n      branch: {kind: git_branch, from: workspace}\n      result: {kind: json, from: path, path: result.json, schema: result.schema.json}\n      title: {kind: text, from: path, path: title.txt}\n      description: {kind: text, from: path, path: description.txt}\n  terminal:\n    kind: cmd\n    dependsOn: [produce]\n    command: {argv: [\"true\"]}\n",
+    );
+    if conditional {
+        definition.push_str("    condition:\n      disposition: {node: produce, is: succeeded}\n");
+    }
+    {
+        for ordinal in 0..14 {
+            definition.push_str(&format!(
+                "  retained{ordinal:02}:\n    kind: cmd\n    command: {{argv: [\"true\"]}}\n"
+            ));
+        }
+    }
+    definition.push_str("exports:\n");
+    for ordinal in 0..4_096 {
+        let value = if ordinal == 0 { "branch" } else { "upper" };
+        definition.push_str(&format!("  alias{ordinal:04}:\n    ref: outputs.produce.{value}\n    presentation:\n      title: {{ref: outputs.produce.title}}\n      description: {{ref: outputs.produce.description}}\n"));
+    }
+    if conditional {
+        // Quotes maximize real JSON expansion while occupying one YAML byte.
+        let source_document_maximum = if cloud_source {
+            1024 * 1024
+        } else {
+            usize::try_from(resolution::MAX_SOURCE_CLOSURE_BYTES).unwrap()
+        };
+        let length = source_document_maximum - definition.len() - 512;
+        let pointer = if variant == "conditional-escaped" || cloud_source {
+            format!("/{}", "\u{0007}".repeat(length / 2))
+        } else {
+            format!("/{}", "\"".repeat(length))
+        };
+        let authored_pointer = if variant == "conditional-escaped" || cloud_source {
+            format!("\"/{}\"", "\\a".repeat(length / 2))
+        } else {
+            format!("'{pointer}'")
+        };
+        definition = definition.replace(
+            "      disposition: {node: produce, is: succeeded}\n",
+            &format!("      equals:\n        - {{ref: outputs.produce.result, pointer: {authored_pointer}}}\n        - {{value: true}}\n"),
+        );
+        let detail = crate::workflow::evidence::FailureDetail::json_pointer_missing(
+            "outputs.produce.result",
+            pointer,
+        )
+        .unwrap();
+        run.steps[1].state = StepState::Failed {
+            detail: detail.clone(),
+        };
+        run.steps[1].timing = None;
+        run.steps[1].command_output = None;
+        run.outcome = RunOutcome::Failed {
+            primary_issue: PrimaryIssue::failed(
+                WorkflowNode {
+                    id: "terminal".to_owned(),
+                    role: WorkflowNodeRole::Step,
+                },
+                detail,
+            ),
+            later_cancellation: None,
+        };
+    }
+    let mut retained_schema =
+        r#"{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object"}"#.to_owned();
+    if conditional {
+        // Complete the legal closure to the admitted limit with an inert comment;
+        // the referenced JSON schema also counts toward that closure.
+        let schema_bytes =
+            r#"{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object"}"#.len();
+        let framing_bytes = b"scherzo.workflow.content-closure.v1\0".len()
+            + 8
+            + 2 * 16
+            + "workflow.yaml".len()
+            + "result.schema.json".len();
+        let remaining = usize::try_from(resolution::MAX_SOURCE_CLOSURE_BYTES).unwrap()
+            - definition.len()
+            - schema_bytes
+            - framing_bytes;
+        assert!(remaining >= 2);
+        if cloud_source {
+            // Cloud retains its existing 1-MiB document limit. A static schema
+            // comment fills the shared source-closure budget without enlarging it.
+            retained_schema.pop();
+            retained_schema.push_str(",\"$comment\":\"");
+            retained_schema.push_str(&"x".repeat(remaining - 14));
+            retained_schema.push_str("\"}");
+        } else {
+            definition.reserve_exact(remaining);
+            definition.push('#');
+            definition.push_str(&"x".repeat(remaining - 2));
+            definition.push('\n');
+        }
+    }
+    fs::write(fixture.source_root.join("workflow.yaml"), &definition).unwrap();
+    fs::write(target.with_extension("workflow.yaml"), definition).unwrap();
+    fs::write(
+        fixture.source_root.join("result.schema.json"),
+        retained_schema,
+    )
+    .unwrap();
+    fs::copy(
+        fixture.source_root.join("result.schema.json"),
+        target.with_extension("result.schema.json"),
+    )
+    .unwrap();
+    let resolved = resolution::resolve(&fixture.source_root, Path::new("workflow.yaml")).unwrap();
+    let expected = resolved.capacity.requirements;
+    assert_eq!(expected.presentation_result_bytes, 226_848_768);
+    run.content_digest = resolved.content_digest.clone();
+    run.maximum_result_bytes = expected.portable_result_bytes;
+    run.cloud_capacity = Some(CloudExecutionCapacityV1 {
+        execution_contract: "workflow_v1_cloud_inputs_artifacts@1".to_owned(),
+        source_closure_digest: DigestV1 {
+            algorithm: "sha256".to_owned(),
+            value: resolved.capacity.source_closure_digest.value.clone(),
+        },
+        general_maximum_transitions: expected.general_maximum_transitions,
+        selected_maximum_transitions: expected.cloud_maximum_transitions,
+        maximum_invocations: expected.maximum_invocations,
+        maximum_retained_bytes_per_invocation: expected.maximum_retained_bytes_per_invocation,
+        diagnostic_retention_bytes: expected.diagnostic_retention_bytes,
+        native_session_retention_bytes: expected.native_session_retention_bytes,
+        aggregate_retention_bytes: expected.aggregate_retention_bytes,
+        condition_transition_count: expected.condition_transition_count,
+        aggregate_condition_transition_bytes: expected.aggregate_condition_transition_bytes,
+        terminal_result_structure_bytes: expected.terminal_result_structure_bytes,
+        presentation_result_bytes: expected.presentation_result_bytes,
+        portable_result_bytes: expected.portable_result_bytes,
+        encoded_outbox_bytes: expected.encoded_outbox_bytes,
+    });
+    println!(
+        "resolved_source_bound={} conditional={} source_digest={}",
+        run.maximum_result_bytes, conditional, run.content_digest.value
+    );
+    fs::write(
+        target.with_extension("capacity.json"),
+        serde_json::to_vec(run.cloud_capacity.as_ref().unwrap()).unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        target.with_extension("workflow-digest.txt"),
+        &run.content_digest.value,
+    )
+    .unwrap();
+    drop(resolved);
+    let rss = std::process::Command::new("/bin/ps")
+        .args(["-o", "rss=", "-p", &std::process::id().to_string()])
+        .output()
+        .unwrap();
+    assert!(rss.status.success());
+    println!(
+        "serialization_baseline_rss_kib={}",
+        String::from_utf8(rss.stdout).unwrap().trim()
+    );
+    #[derive(Serialize)]
+    #[serde(rename_all = "camelCase")]
+    struct CheckpointOutcome<'a> {
+        outcome: &'static str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        failure: Option<&'a PrimaryIssue>,
+        force_abort: Option<()>,
+    }
+    let failure = match &run.outcome {
+        RunOutcome::Failed { primary_issue, .. } => Some(primary_issue),
+        _ => None,
+    };
+    let mut terminal =
+        std::io::BufWriter::new(fs::File::create(target.with_extension("terminal.json")).unwrap());
+    serde_json::to_writer(
+        &mut terminal,
+        &CheckpointOutcome {
+            outcome: if failure.is_some() {
+                "failed"
+            } else {
+                "succeeded"
+            },
+            failure,
+            force_abort: None,
+        },
+    )
+    .unwrap();
+    std::io::Write::flush(&mut terminal).unwrap();
+    drop(terminal);
+    let mut failure_file =
+        std::io::BufWriter::new(fs::File::create(target.with_extension("failure.json")).unwrap());
+    serde_json::to_writer(&mut failure_file, &failure).unwrap();
+    std::io::Write::flush(&mut failure_file).unwrap();
+    let started = um_support::monotonic_now();
+    let prepared = prepare_cloud_workflow_result(
+        &run,
+        "prj_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned(),
+        "rpc_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned(),
+        "sha1".to_owned(),
+        "0123456789abcdef0123456789abcdef01234567".to_owned(),
+        None,
+    )
+    .unwrap();
+    println!(
+        "production_cloud_serialization_bytes={} elapsed={:?}",
+        prepared.result_size_bytes,
+        um_support::monotonic_now().duration_since(started)
+    );
+    assert!(prepared.result_json.is_empty());
+    let file = prepared
+        .result_file
+        .as_ref()
+        .expect("large Cloud result stays on disk");
+    fs::copy(file.path(), target.join("result.json")).unwrap();
+    assert_eq!(
+        fs::metadata(target.join("result.json")).unwrap().len(),
+        prepared.result_size_bytes
+    );
+    let mut digest = ring::digest::Context::new(&ring::digest::SHA256);
+    let mut result_reader = fs::File::open(target.join("result.json")).unwrap();
+    let mut chunk = [0; 64 * 1024];
+    loop {
+        let count = std::io::Read::read(&mut result_reader, &mut chunk).unwrap();
+        if count == 0 {
+            break;
+        }
+        digest.update(&chunk[..count]);
+    }
+    assert_eq!(
+        super::super::schema_common::lowercase_hex(digest.finish().as_ref()),
+        prepared.result_sha256
+    );
+    for carrier in prepared.carriers {
+        let destination = target.join(&carrier.portable_owner_path);
+        match carrier.body {
+            CloudCarrierBody::Staged(staged) => {
+                let mut source = fixture.artifacts.open_artifact(staged.handle()).unwrap();
+                let mut output = fs::File::create(destination).unwrap();
+                std::io::copy(&mut source, &mut output).unwrap();
+            }
+            CloudCarrierBody::Bytes(bytes) => fs::write(destination, bytes).unwrap(),
+        }
+    }
+    // The retained run and writer belong to the Runner process. Run the strict
+    // reader/verifier separately so its RSS is measured as its own process.
+}
+
+#[test]
+#[ignore]
+fn resource_checkpoint_strict_reader() {
+    let target =
+        PathBuf::from(std::env::var_os("LIV_CHECKPOINT_DIR").expect("disposable artifact"));
+    let variant = std::env::var("LIV_CHECKPOINT_VARIANT").unwrap_or_default();
+    let conditional = variant.starts_with("conditional");
+    let maximum = if target.with_extension("capacity.json").exists() {
+        serde_json::from_slice::<Value>(&fs::read(target.with_extension("capacity.json")).unwrap())
+            .unwrap()["portableResultBytes"]
+            .as_u64()
+            .unwrap()
+    } else if conditional {
+        1_127_929_176
+    } else {
+        428_876_460
+    };
+    let root = rustix::fs::open(
+        &target,
+        rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::DIRECTORY | rustix::fs::OFlags::NOFOLLOW,
+        rustix::fs::Mode::empty(),
+    )
+    .unwrap();
+    let size = fs::metadata(target.join("result.json")).unwrap().len();
+    let result = super::super::artifact_set::read_and_validate(&root, maximum);
+    if size <= maximum {
+        assert_eq!(result.unwrap().exports.len(), 4_096);
+    } else {
+        assert_eq!(size, maximum + 1);
+        assert_eq!(
+            result.err(),
+            Some(super::super::artifact_set::ArtifactSetError::ResultFileUnavailable)
+        );
+    }
+}
+
+#[test]
+fn result_writer_rejects_one_byte_over_its_source_bound() {
+    let fixture = PublicationFixture::new();
+    let run = run_fixture(&fixture);
+    let result = build_result(&run, BTreeMap::new()).unwrap();
+    let mut encoded = Vec::new();
+    write_result_json(&result, run.maximum_result_bytes, &mut encoded).unwrap();
+    let exact = u64::try_from(encoded.len()).unwrap();
+    let mut bounded = Vec::new();
+    assert!(write_result_json(&result, exact - 1, &mut bounded).is_err());
+    assert!(bounded.len() < encoded.len());
 }
 
 #[test]

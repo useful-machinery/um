@@ -2768,6 +2768,11 @@ mod tests {
                 cloud_capacity: Some(crate::service::execution::cloud_execution_capacity(
                     &admitted,
                 )),
+                maximum_result_bytes: admitted
+                    .workflow()
+                    .capacity
+                    .requirements
+                    .portable_result_bytes,
                 timing: WorkflowRunTiming {
                     started_at: OffsetDateTime::UNIX_EPOCH,
                     finished_at: OffsetDateTime::UNIX_EPOCH + time::Duration::SECOND,
@@ -2796,6 +2801,7 @@ mod tests {
                 finalization: None,
                 exports,
                 export_sources: admitted.workflow().definition.exports.clone(),
+                export_presentation: admitted.workflow().definition.export_presentation.clone(),
             };
             prepare_cloud_workflow_result(
                 &run,

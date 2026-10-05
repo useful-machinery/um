@@ -27,6 +27,7 @@ mod runners;
 mod runs;
 mod service_principals;
 mod signup;
+mod webhooks;
 
 use reqwest::header::{HeaderValue, InvalidHeaderValue};
 use zeroize::{Zeroize as _, Zeroizing};
@@ -77,6 +78,7 @@ pub use delegations::{
     GetDelegationOutcome, ListDelegationsOutcome, ProposeDelegationOutcome, accept_delegation,
     end_delegation, get_delegation, list_current_principal_delegations, propose_delegation,
 };
+pub use generated::models::{CreateWebhookSubscriptionRequest, PatchWebhookSubscriptionRequest};
 pub use generated::models::{
     linear_authorization_session, linear_connection, linear_connection_error,
 };
@@ -163,6 +165,10 @@ pub use service_principals::{
     revoke_service_credential,
 };
 pub use signup::{SignupError, SignupOutcome, signup_human};
+pub use webhooks::{
+    Mutation as WebhookMutation, WebhookApi, WebhookDelivery, WebhookDeliveryList, WebhookFailure,
+    WebhookSubscription, WebhookSubscriptionList,
+};
 
 // OpenAPI Generator emits a library-shaped client; keep its public declarations
 // intact and contain the binary crate's visibility exception to this generated tree.

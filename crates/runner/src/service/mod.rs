@@ -2170,6 +2170,8 @@ mod tests {
                 ))
                 .await
                 .unwrap();
+            let mut interrupted = false;
+            let mut retention_reported = false;
             while let Some(Ok(Message::Text(frame))) = pending.next().await {
                 let frame: serde_json::Value = serde_json::from_str(&frame).unwrap();
                 // Promotion can replay a preparation-progress observation whose
@@ -2181,6 +2183,7 @@ mod tests {
                     Some(
                         "assignment_preparation_progress"
                             | "assignment_accepted"
+                            | "workspace_retention_report"
                             | "assignment_interrupted"
                     )
                 ) {
@@ -2191,7 +2194,9 @@ mod tests {
                     )
                     .await;
                 }
-                if frame["type"] == "assignment_interrupted" {
+                interrupted |= frame["type"] == "assignment_interrupted";
+                retention_reported |= frame["type"] == "workspace_retention_report";
+                if interrupted && retention_reported {
                     break;
                 }
             }

@@ -245,6 +245,8 @@ fn initialize_source_repository(source: &Path) -> anyhow::Result<()> {
     run_git(source, &["init", "--quiet", "--object-format=sha1"])?;
     run_git(source, &["config", "user.name", "Scherzo Fixture"])?;
     run_git(source, &["config", "user.email", "fixture@scherzo.invalid"])?;
+    // The nested fixture can inherit the host's global commit-signing policy.
+    run_git(source, &["config", "commit.gpgsign", "false"])?;
     run_git(source, &["add", "."])?;
     run_git(source, &["commit", "--quiet", "-m", "nested fixture"])?;
     Ok(())
@@ -322,6 +324,7 @@ fn offer() -> AssignmentOffer {
                 condition_transition_count: 0,
                 aggregate_condition_transition_bytes: 0,
                 terminal_result_structure_bytes: 67_108_864,
+                presentation_result_bytes: 0,
                 portable_result_bytes: 202_027_692,
                 encoded_outbox_bytes: 85_458_944,
             },
@@ -366,6 +369,7 @@ fn align_offer_with_source(source: &Path, offered: &mut AssignmentOffer) -> anyh
         condition_transition_count: requirements.condition_transition_count,
         aggregate_condition_transition_bytes: requirements.aggregate_condition_transition_bytes,
         terminal_result_structure_bytes: requirements.terminal_result_structure_bytes,
+        presentation_result_bytes: requirements.presentation_result_bytes,
         portable_result_bytes: requirements.portable_result_bytes,
         encoded_outbox_bytes: requirements.encoded_outbox_bytes,
     };
@@ -577,6 +581,7 @@ async fn wait_for_terminal(
                     | AssignmentObservation::Decision(_)
                     | AssignmentObservation::CancellationApplied(_)
                     | AssignmentObservation::LeaseRenewalRequested { .. }
+                    | AssignmentObservation::WorkspaceRetention { .. }
                     | AssignmentObservation::Artifact { .. } => None,
                 })
                 .collect());

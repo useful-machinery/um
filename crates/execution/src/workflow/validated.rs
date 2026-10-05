@@ -46,9 +46,22 @@ pub struct ValidatedWorkflow {
     pub finalizer_source_order: Vec<String>,
     pub finalizer_presentation_order: Vec<String>,
     pub exports: BTreeMap<String, ResolvedOutputSource>,
+    pub export_presentation: BTreeMap<String, ValidatedExportPresentation>,
     pub(crate) required_inputs: RequiredInputs,
     pub(crate) input_json_schema_paths: BTreeMap<String, String>,
     pub(crate) input_file_media_types: BTreeMap<String, String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ValidatedExportPresentation {
+    pub title: Option<ValidatedPresentationField>,
+    pub description: Option<ValidatedPresentationField>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ValidatedPresentationField {
+    Literal(String),
+    Reference(ResolvedOutputSource),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

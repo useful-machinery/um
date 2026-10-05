@@ -5,9 +5,10 @@ use serde_json::Value;
 
 use super::document::{
     Agent, AgentMessage, AgentNode, AgentProfile, CommandNode, CommonNode, ConditionOperand,
-    ConditionPredicate, ConditionSelector, FailurePolicy, FinalizationTrigger, FinalizerDefinition,
-    HarnessDefinition, InputDeclaration, MessageSource, NodeBody, Output, OutputReference,
-    RecoveryHandler, StepDefinition, StepRecovery, ValueReference, WorkflowDocument,
+    ConditionPredicate, ConditionSelector, ExportDefinition, ExportPresentation, FailurePolicy,
+    FinalizationTrigger, FinalizerDefinition, HarnessDefinition, InputDeclaration, MessageSource,
+    NodeBody, Output, OutputReference, PresentationSource, RecoveryHandler, StepDefinition,
+    StepRecovery, ValueReference, WorkflowDocument,
 };
 
 #[derive(Deserialize)]
@@ -24,7 +25,7 @@ pub(super) struct WorkflowDto {
     #[serde(default)]
     finalizers: BTreeMap<String, FinalizerDto>,
     #[serde(default)]
-    exports: BTreeMap<String, ReferenceDto>,
+    exports: BTreeMap<String, ExportDto>,
 }
 
 #[derive(Deserialize)]
@@ -339,6 +340,45 @@ struct ReferenceDto {
     reference: String,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExportDto {
+    #[serde(rename = "ref")]
+    reference: String,
+    presentation: Option<ExportPresentationDto>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExportPresentationDto {
+    title: Option<PresentationSourceDto>,
+    description: Option<PresentationSourceDto>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum PresentationSourceDto {
+    Literal(PresentationLiteralDto),
+    Reference(ReferenceDto),
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PresentationLiteralDto {
+    value: String,
+}
+
+impl PresentationSourceDto {
+    fn into_source(self) -> Option<PresentationSource> {
+        match self {
+            Self::Literal(literal) => Some(PresentationSource::Literal(literal.value)),
+            Self::Reference(reference) => {
+                parse_output_reference(&reference.reference).map(PresentationSource::Reference)
+            }
+        }
+    }
+}
+
 impl WorkflowDto {
     pub(super) fn into_document(
         self,
@@ -383,7 +423,30 @@ impl WorkflowDto {
             .exports
             .into_iter()
             .map(|(name, reference)| {
-                parse_output_reference(&reference.reference).map(|reference| (name, reference))
+                let source = parse_output_reference(&reference.reference)?;
+                let presentation = if let Some(presentation) = reference.presentation {
+                    let title = match presentation.title {
+                        Some(title) => Some(title.into_source()?),
+                        None => None,
+                    };
+                    let description = match presentation.description {
+                        Some(description) => Some(description.into_source()?),
+                        None => None,
+                    };
+                    if title.is_none() && description.is_none() {
+                        return None;
+                    }
+                    Some(ExportPresentation { title, description })
+                } else {
+                    None
+                };
+                Some((
+                    name,
+                    ExportDefinition {
+                        source,
+                        presentation,
+                    },
+                ))
             })
             .collect::<Option<_>>()?;
 

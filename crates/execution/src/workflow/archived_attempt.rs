@@ -374,13 +374,23 @@ fn load_local_archived_attempt_with(
         &result_root,
         result_metadata::MAXIMUM_RESULT_JSON_BYTES,
         || observer.result_file_opened(&result_directory),
-        |bytes| {
+        |result, size| {
             retained_budget
-                .account(bytes)
+                .account_size(size)
                 .map_err(|_| artifact_set::ArtifactSetError::Invalid)?;
-            let document = result_metadata::decode_document(bytes)
-                .map_err(|_| artifact_set::ArtifactSetError::Invalid)?;
-            if result_metadata::dispatch_recovery_summary_versions(&document).is_err() {
+            if result
+                .steps
+                .iter()
+                .chain(
+                    result
+                        .finalization
+                        .as_ref()
+                        .into_iter()
+                        .flat_map(|value| &value.finalizers),
+                )
+                .filter_map(|step| step.recovery.as_ref())
+                .any(|recovery| recovery.schema_version != 1)
+            {
                 recovery_unsupported = true;
                 return Err(artifact_set::ArtifactSetError::Invalid);
             }
@@ -1679,6 +1689,7 @@ fn validate_exports(
                 digest,
                 provenance,
                 producer,
+                ..
             } => {
                 let identity = (source.node.id.clone(), source.output.clone());
                 let owner = *owner_ordinals.get(&identity).ok_or(())?;
@@ -1704,8 +1715,12 @@ fn validate_exports(
                 producer,
                 ..
             } => {
+                // A branch may have no carrier; keep this ordinal check in its
+                // own branch instead of conflating file and Git descriptors.
+                // jscpd:ignore-start
                 let identity = (source.node.id.clone(), source.output.clone());
                 let owner = *owner_ordinals.get(&identity).ok_or(())?;
+                // jscpd:ignore-end
                 if !source_available
                     || !provenance_matches(provenance.as_ref(), producer.as_ref())
                     || source.value_type != WorkflowValueType::GitBranch
@@ -1725,7 +1740,7 @@ fn validate_exports(
                     return Err(());
                 }
             }
-            ExportV1::Unavailable { reason } => {
+            ExportV1::Unavailable { reason, .. } => {
                 if Some(*reason) != archived_export_unavailable_reason(source_step) {
                     return Err(());
                 }

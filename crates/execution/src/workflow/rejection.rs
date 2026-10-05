@@ -543,6 +543,14 @@ fn validation_classification(kind: ValidationFailureKind) -> (&'static str, &'st
             "invalid_export_target",
             "Reference a declared step output from the workflow export.",
         ),
+        ValidationFailureKind::InvalidExportPresentation => (
+            "invalid_export_presentation",
+            "Use nonempty, bounded title or description text without forbidden controls.",
+        ),
+        ValidationFailureKind::InvalidExportPresentationTarget => (
+            "invalid_export_presentation_target",
+            "Reference a Text output from a declared step or succeeded-trigger finalizer.",
+        ),
         ValidationFailureKind::AdvisoryExportTarget => (
             "advisory_export_target",
             "Export an output from a required workflow node.",

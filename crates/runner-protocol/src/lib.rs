@@ -42,6 +42,14 @@ pub enum RunnerFrame {
         envelope: RunnerEnvelope,
         runner_version: String,
     },
+    WorkspaceRetentionReport {
+        envelope: RunnerEnvelope,
+        assignment_id: String,
+        attempt_id: String,
+        run_id: String,
+        execution_root: String,
+        state: String,
+    },
     EffectAcknowledged {
         envelope: RunnerEnvelope,
         effect_id: String,
@@ -294,6 +302,7 @@ pub struct ExecutionCapacityV1RunnerProjection {
     pub condition_transition_count: u64,
     pub aggregate_condition_transition_bytes: u64,
     pub terminal_result_structure_bytes: u64,
+    pub presentation_result_bytes: u64,
     pub portable_result_bytes: u64,
     pub encoded_outbox_bytes: u64,
     // jscpd:ignore-end
@@ -681,6 +690,24 @@ pub fn encode_runner_frame(frame: &RunnerFrame) -> Result<Vec<u8>, EncodeError> 
             "hello",
             json!({ "runnerVersion": runner_version }),
         ),
+        RunnerFrame::WorkspaceRetentionReport {
+            envelope,
+            assignment_id,
+            attempt_id,
+            run_id,
+            execution_root,
+            state,
+        } => runner_frame_value(
+            envelope,
+            "workspace_retention_report",
+            json!({
+                "assignmentId": assignment_id,
+                "attemptId": attempt_id,
+                "runId": run_id,
+                "executionRoot": execution_root,
+                "state": state,
+            }),
+        ),
         RunnerFrame::EffectAcknowledged {
             envelope,
             effect_id,
@@ -1047,6 +1074,9 @@ fn decode_frame(bytes: &[u8]) -> Result<ValidatedFrame, DecodeError> {
             &frame.direction,
             frame.sent_at,
         ),
+        generated::RunnerProtocolVersion1::RunnerWorkspaceRetentionReport(frame) => {
+            validated_runner_frame!(frame)
+        }
         generated::RunnerProtocolVersion1::RunnerEffectAcknowledged(frame) => {
             validate_runner_frame(
                 &frame.protocol_version,
@@ -1332,6 +1362,9 @@ fn decode_frame(bytes: &[u8]) -> Result<ValidatedFrame, DecodeError> {
             let terminal_result_structure_bytes =
                 u64::try_from(capacity.terminal_result_structure_bytes)
                     .map_err(|_| DecodeError::InvalidFrame("terminalResultStructureBytes"))?;
+            let presentation_result_bytes =
+                u64::try_from(capacity.presentation_result_bytes.unwrap_or(0))
+                    .map_err(|_| DecodeError::InvalidFrame("presentationResultBytes"))?;
             let portable_result_bytes = u64::try_from(capacity.portable_result_bytes)
                 .map_err(|_| DecodeError::InvalidFrame("portableResultBytes"))?;
             let encoded_outbox_bytes = u64::try_from(capacity.encoded_outbox_bytes)
@@ -1363,6 +1396,7 @@ fn decode_frame(bytes: &[u8]) -> Result<ValidatedFrame, DecodeError> {
                 condition_transition_count,
                 aggregate_condition_transition_bytes,
                 terminal_result_structure_bytes,
+                presentation_result_bytes,
                 portable_result_bytes,
                 encoded_outbox_bytes,
             };
@@ -1816,6 +1850,13 @@ fn validate_closed_shape(value: &Value) -> Result<(), DecodeError> {
         .ok_or(DecodeError::InvalidFrame("payload"))?;
     let payload_keys: &[&str] = match frame_type {
         "hello" => &["runnerVersion"],
+        "workspace_retention_report" => &[
+            "assignmentId",
+            "attemptId",
+            "runId",
+            "executionRoot",
+            "state",
+        ],
         "effect_acknowledged" => &["effectId"],
         "assignment_preparing" => &["effectId", "assignmentId", "offeredExecutionSpecId"],
         "assignment_preparation_progress" => {

@@ -675,6 +675,20 @@ async fn run_reconnect_scenario() -> Vec<String> {
         "source preparation must retain its deadline fence"
     );
     events.retain(|event| event != preparation_deadline);
+    for event in &mut events {
+        let Some(raw) = event.strip_prefix("outbound:text:") else {
+            continue;
+        };
+        let mut frame: Value = serde_json::from_str(raw).expect("outbound frame is JSON");
+        if frame["type"] == "workspace_retention_report" {
+            let root = frame["payload"]["executionRoot"]
+                .as_str()
+                .expect("retention report has an execution root");
+            assert!(root.ends_with("/workspace"));
+            frame["payload"]["executionRoot"] = json!("<retained-workspace>");
+            *event = format!("outbound:text:{frame}");
+        }
+    }
     events
 }
 

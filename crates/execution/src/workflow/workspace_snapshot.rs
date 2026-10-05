@@ -605,6 +605,7 @@ mod tests {
             temporary.path(),
             &["config", "user.email", "snapshot@example.invalid"],
         );
+        git(temporary.path(), &["config", "commit.gpgsign", "false"]);
         fs::write(temporary.path().join("tracked"), b"initial\n").unwrap();
         fs::write(temporary.path().join(".gitignore"), b"*.ignored\n").unwrap();
         git(temporary.path(), &["add", "tracked", ".gitignore"]);

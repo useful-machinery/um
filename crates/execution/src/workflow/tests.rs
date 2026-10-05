@@ -16,6 +16,98 @@ fn canonical_valid_fixture() -> Vec<u8> {
 }
 
 #[test]
+fn export_presentation_sources_validate_without_creating_dependencies() {
+    // Source admission stays behind the canonical schema until the inert
+    // resource checkpoint has qualified the proposed portable envelope.
+    let source = serde_json::json!({
+        "schemaVersion": 1,
+        "steps": {
+            "implement": {
+                "kind": "cmd", "command": { "argv": ["true"] },
+                "outputs": {
+                    "branch": { "kind": "git_branch", "from": "workspace" },
+                    "summary": { "kind": "text", "from": "path", "path": "summary.txt" },
+                    "structured": { "kind": "json", "from": "path", "path": "summary.json", "schema": "schema.json" }
+                }
+            }
+        },
+        "finalizers": {
+            "writeup": {
+                "kind": "cmd", "command": { "argv": ["true"] },
+                "when": ["succeeded"], "failurePolicy": "advisory",
+                "outputs": { "title": { "kind": "text", "from": "path", "path": "title.txt" } }
+            }
+        },
+        "exports": {
+            "changes": {
+                "ref": "outputs.implement.branch",
+                "presentation": {
+                    "title": { "ref": "outputs.writeup.title" },
+                    "description": { "value": "  Result summary  " }
+                }
+            },
+            "alias": {
+                "ref": "outputs.implement.branch",
+                "presentation": { "title": { "ref": "outputs.implement.summary" } }
+            }
+        }
+    });
+    let validate_source = |source: serde_json::Value| {
+        let dto: schema::WorkflowDto = serde_json::from_value(source).unwrap();
+        let definition = dto
+            .into_document(vec!["implement".to_owned()], vec!["writeup".to_owned()])
+            .unwrap();
+        validation::validate(definition)
+    };
+    let validated = validate_source(source.clone()).unwrap();
+    let validated::ValidatedStep::Command(implement) = &validated.steps["implement"] else {
+        panic!("implementation is not a command");
+    };
+    assert!(implement.common.prerequisites.is_empty());
+    assert_eq!(
+        validated.export_presentation["changes"].description,
+        Some(validated::ValidatedPresentationField::Literal(
+            "Result summary".to_owned()
+        ))
+    );
+    assert!(matches!(
+        validated.export_presentation["changes"].title,
+        Some(validated::ValidatedPresentationField::Reference(_))
+    ));
+    let capacity = capacity::resolve_workflow_capacity(
+        &validated,
+        resolution::WorkflowContentDigest {
+            algorithm: resolution::ContentDigestAlgorithm::Sha256,
+            value: "1".repeat(64),
+        },
+        0,
+    )
+    .unwrap();
+    assert_eq!(capacity.requirements.presentation_result_bytes, 12_500);
+    assert_eq!(capacity.requirements.portable_result_bytes, 202_040_192);
+    let mut invalid = source.clone();
+    invalid["finalizers"]["writeup"]["when"] = serde_json::json!(["failed"]);
+    assert_eq!(
+        validate_source(invalid).unwrap_err().kind(),
+        validation::ValidationFailureKind::InvalidExportPresentationTarget
+    );
+    let mut invalid = source.clone();
+    invalid["exports"]["changes"]["presentation"]["title"] =
+        serde_json::json!({"ref":"outputs.implement.structured"});
+    assert_eq!(
+        validate_source(invalid).unwrap_err().kind(),
+        validation::ValidationFailureKind::InvalidExportPresentationTarget
+    );
+    let mut invalid = source;
+    invalid["exports"]["changes"]["presentation"]["description"] =
+        serde_json::json!({"value":"  "});
+    assert_eq!(
+        validate_source(invalid).unwrap_err().kind(),
+        validation::ValidationFailureKind::InvalidExportPresentation
+    );
+}
+
+#[test]
 fn media_type_parameters_use_horizontal_separators_and_control_free_unicode_values() {
     for valid in [
         "application/octet-stream;version=1",
@@ -190,14 +282,14 @@ fn canonical_workflow_decodes_into_the_complete_execution_document() {
     );
 
     assert_eq!(
-        workflow.exports["response"],
+        workflow.exports["response"].source,
         OutputReference {
             node: "implement".to_owned(),
             output: "response".to_owned(),
         }
     );
     assert_eq!(
-        workflow.exports["testReport"],
+        workflow.exports["testReport"].source,
         OutputReference {
             node: "test".to_owned(),
             output: "report".to_owned(),

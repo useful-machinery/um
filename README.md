@@ -1261,6 +1261,41 @@ response-body failure is retried once with the same key and serialized request, 
 access-token refresh within the invocation also retains them. Owner authorization and
 same-organization repository and runner-pool checks remain server-enforced.
 
+### Signed project webhooks
+
+After a qualified maintenance cutover, owners can create a subscription with
+`um project webhook create ORG PROJECT --config-file config.json`; use `-` for
+bounded standard input, unless the service credential also reads standard input.
+For example, the file may contain
+`{"url":"https://receiver.example.com/hook","eventTypes":["run.failed"],"contextKeys":[]}`.
+The secret in the first successful create or rotate response must be saved
+privately at once; later inspection and idempotent replay return metadata only.
+JSON create/rotate results retain the operation `outcome` and report
+`secretDisclosure: "shown_once"` only when a validated signing secret is included;
+`"metadata_only"` explicitly means no secret was recovered. Human output gives
+the same warning. Never treat a metadata-only response as a new signing key.
+`um project webhook update ORG PROJECT WEBHOOK --expected-version 1 --config-file patch.json`
+replaces only supplied selections and never reads the version implicitly. Empty
+`contextKeys` clears that selection. URL changes require a new subscription.
+
+Members may `list ORG PROJECT`, `show ORG PROJECT WEBHOOK`,
+`delivery list ORG PROJECT WEBHOOK --limit 20 --cursor CURSOR --run-id RUN_ID --state failed`
+and `delivery show ORG PROJECT WEBHOOK DELIVERY`. Owners may also `enable`,
+`disable`, `delete`, `rotate-secret`, `revoke-previous-secret`, and `test` with
+`ORG PROJECT WEBHOOK`, or `delivery replay ORG PROJECT WEBHOOK DELIVERY`.
+Deletion requires `--yes` and stops future sends; it does not erase retained history.
+One page is returned with an opaque `nextCursor`; `--json` selects schema-version-1
+results. The server enforces tenant and owner authorization. An uncertain
+mutation outcome is not permission to issue a new key blindly: inspect the
+resource first. For uncertain mutation failures, JSON retains the generated
+`idempotencyKey`, known `projectId`, optional `webhookId` and `deliveryId`, and
+`nextAction: "inspect_resource"`; human output also prints these non-secret
+identities. Keep the original key for diagnosis, but do not retry in a new
+invocation without first inspecting retained state. A completed replay returns
+`metadataOnly: true` and cannot recover a signing secret. See
+[receiver and recovery guidance](../docs/operations/webhook-delivery.md) for
+raw-body signature verification, deduplication, overlap and retention.
+
 ## Cloud runs
 
 List materialized runs within one organization (newest first) with bounded,
@@ -1670,7 +1705,7 @@ input/output, partial-message, subagent-forwarding, explicit-session-identity,
 permission-mode, setting-source, model, effort, append-system-prompt-file, and JSON-schema
 capabilities used by `ClaudeCodeStreamJsonV1`. The report contains only status, profile,
 observed version, supported range, exact repository qualification version, closed
-capabilities, and the selected absolute path. Qualification remains pinned to `2.1.283`
+capabilities, and the selected absolute path. Qualification remains pinned to `2.1.284`
 and does not claim that every admitted release or unexecuted host received exact-binary
 conformance. The report never exposes environment values, credentials, or loaded Claude
 settings. The JSON report has no `ready` field.

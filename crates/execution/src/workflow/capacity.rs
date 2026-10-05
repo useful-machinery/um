@@ -13,7 +13,8 @@ pub const MAXIMUM_ENCODED_OUTBOX_BYTES: u64 = 1_024_720_896;
 pub(crate) const MAXIMUM_CONDITION_TRANSITION_COUNT: u64 = 256;
 pub(crate) const MAXIMUM_CONDITION_TRANSITION_BYTES: u64 = 256 * 1024 * 1024;
 pub(crate) const MAXIMUM_TERMINAL_RESULT_STRUCTURE_BYTES: u64 = 512 * 1024 * 1024;
-pub(crate) const MAXIMUM_PORTABLE_RESULT_BYTES: u64 = 901_080_408;
+pub(crate) const MAXIMUM_PORTABLE_RESULT_BYTES: u64 = 1_127_929_176;
+pub(crate) const MAXIMUM_PRESENTATION_RESULT_BYTES: u64 = 226_848_768;
 pub(crate) const ORDINARY_PORTABLE_RESULT_BYTES: u64 = 202_027_692;
 const JSON_ESCAPED_POINTER_SOURCE_MULTIPLIER: u64 = 3;
 const MAXIMUM_CONDITION_PREDICATE_NODES: u64 = 256;
@@ -63,6 +64,7 @@ pub struct ComputedWorkflowCapacity {
     pub condition_transition_count: u64,
     pub aggregate_condition_transition_bytes: u64,
     pub terminal_result_structure_bytes: u64,
+    pub presentation_result_bytes: u64,
     pub portable_result_bytes: u64,
     pub encoded_outbox_bytes: u64,
 }
@@ -144,6 +146,54 @@ pub(crate) fn resolve_workflow_capacity(
         )
         .map_err(|_| CapacityCalculationFailure::ConditionEvidenceCapacityExceeded)?;
     }
+    let presentation_result_bytes =
+        workflow
+            .export_presentation
+            .values()
+            .try_fold(0_u64, |sum, presentation| {
+                let mut charge = 19_u64;
+                for (field, declaration) in [
+                    (
+                        super::export_presentation::Field::Title,
+                        presentation.title.as_ref(),
+                    ),
+                    (
+                        super::export_presentation::Field::Description,
+                        presentation.description.as_ref(),
+                    ),
+                ] {
+                    if let Some(declaration) = declaration {
+                        let bytes = match declaration {
+                            super::validated::ValidatedPresentationField::Literal(value) => {
+                                u64::try_from(value.len())
+                                    .map_err(|_| CapacityCalculationFailure::ArithmeticOverflow)?
+                            }
+                            super::validated::ValidatedPresentationField::Reference(_) => {
+                                match field {
+                                    super::export_presentation::Field::Title => 1_020,
+                                    super::export_presentation::Field::Description => 8_192,
+                                }
+                            }
+                        };
+                        charge = charge
+                            .checked_add(46)
+                            .and_then(|charge| charge.checked_add(bytes.checked_mul(6)?))
+                            .ok_or(CapacityCalculationFailure::ArithmeticOverflow)?;
+                    }
+                }
+                sum.checked_add(charge)
+                    .ok_or(CapacityCalculationFailure::ArithmeticOverflow)
+            })?;
+    requirements.presentation_result_bytes = presentation_result_bytes;
+    requirements.portable_result_bytes = requirements
+        .portable_result_bytes
+        .checked_add(presentation_result_bytes)
+        .ok_or(CapacityCalculationFailure::ArithmeticOverflow)?;
+    if presentation_result_bytes > MAXIMUM_PRESENTATION_RESULT_BYTES
+        || requirements.portable_result_bytes > MAXIMUM_PORTABLE_RESULT_BYTES
+    {
+        return Err(CapacityCalculationFailure::ConditionEvidenceCapacityExceeded);
+    }
     Ok(WorkflowCapacity {
         source_closure_digest,
         requirements,
@@ -191,6 +241,7 @@ pub(crate) fn calculate_capacity(
         condition_transition_count: 0,
         aggregate_condition_transition_bytes: 0,
         terminal_result_structure_bytes: RUNNER_TERMINAL_FRAME_BYTES,
+        presentation_result_bytes: 0,
         portable_result_bytes: ORDINARY_PORTABLE_RESULT_BYTES,
         encoded_outbox_bytes,
     })
@@ -289,12 +340,17 @@ pub(crate) fn calculate_condition_evidence_capacity(
 /// Both boundaries still validate their own projection before applying these bounds.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ConditionCapacityBounds {
+    // Runner and replay validate a partial untrusted wire projection; the
+    // resolver's ComputedWorkflowCapacity is a separate full derived budget.
+    // jscpd:ignore-start
     pub selected_maximum_transitions: u64,
     pub condition_transition_count: u64,
     pub aggregate_condition_transition_bytes: u64,
     pub terminal_result_structure_bytes: u64,
+    pub presentation_result_bytes: u64,
     pub portable_result_bytes: u64,
     pub encoded_outbox_bytes: u64,
+    // jscpd:ignore-end
 }
 
 impl ConditionCapacityBounds {
@@ -302,20 +358,24 @@ impl ConditionCapacityBounds {
     pub fn from_parts(
         selected_maximum_transitions: u64,
         condition: (u64, u64),
-        result: (u64, u64, u64),
+        result: (u64, u64, u64, u64),
     ) -> Self {
         Self {
             selected_maximum_transitions,
             condition_transition_count: condition.0,
             aggregate_condition_transition_bytes: condition.1,
             terminal_result_structure_bytes: result.0,
-            portable_result_bytes: result.1,
-            encoded_outbox_bytes: result.2,
+            presentation_result_bytes: result.1,
+            portable_result_bytes: result.2,
+            encoded_outbox_bytes: result.3,
         }
     }
 }
 
 pub fn valid_condition_capacity(capacity: ConditionCapacityBounds) -> bool {
+    if capacity.presentation_result_bytes > MAXIMUM_PRESENTATION_RESULT_BYTES {
+        return false;
+    }
     let expected_outbox = calculate_condition_outbox_reservation(
         capacity.selected_maximum_transitions,
         capacity.condition_transition_count,
@@ -326,7 +386,8 @@ pub fn valid_condition_capacity(capacity: ConditionCapacityBounds) -> bool {
     if capacity.condition_transition_count == 0 {
         return capacity.aggregate_condition_transition_bytes == 0
             && capacity.terminal_result_structure_bytes == RUNNER_TERMINAL_FRAME_BYTES
-            && capacity.portable_result_bytes == ORDINARY_PORTABLE_RESULT_BYTES
+            && ORDINARY_PORTABLE_RESULT_BYTES.checked_add(capacity.presentation_result_bytes)
+                == Some(capacity.portable_result_bytes)
             && expected_outbox == Some(capacity.encoded_outbox_bytes);
     }
     capacity.condition_transition_count <= MAXIMUM_CONDITION_TRANSITION_COUNT
@@ -335,10 +396,14 @@ pub fn valid_condition_capacity(capacity: ConditionCapacityBounds) -> bool {
         && capacity.aggregate_condition_transition_bytes.checked_mul(2)
             == Some(capacity.terminal_result_structure_bytes)
         && capacity.terminal_result_structure_bytes <= MAXIMUM_TERMINAL_RESULT_STRUCTURE_BYTES
-        && capacity.terminal_result_structure_bytes.checked_add(
-            super::result_metadata::MAXIMUM_ENCODED_RETAINED_STREAM_BYTES
-                + super::result_metadata::MAXIMUM_EXPORT_MEDIA_TYPE_JSON_BYTES,
-        ) == Some(capacity.portable_result_bytes)
+        && capacity
+            .terminal_result_structure_bytes
+            .checked_add(
+                super::result_metadata::MAXIMUM_ENCODED_RETAINED_STREAM_BYTES
+                    + super::result_metadata::MAXIMUM_EXPORT_MEDIA_TYPE_JSON_BYTES,
+            )
+            .and_then(|bytes| bytes.checked_add(capacity.presentation_result_bytes))
+            == Some(capacity.portable_result_bytes)
         && capacity.portable_result_bytes <= MAXIMUM_PORTABLE_RESULT_BYTES
         && expected_outbox == Some(capacity.encoded_outbox_bytes)
         && capacity.encoded_outbox_bytes <= MAXIMUM_ENCODED_OUTBOX_BYTES

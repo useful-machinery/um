@@ -1,0 +1,18 @@
+{
+  "protocolVersion": 1,
+  "direction": "runner_to_cloud",
+  "messageId": "rmsg_01k0z6r1w8f4jy2m7q9v3x5abr",
+  "runnerId": "rnr_01k0z6r1w8f4jy2m7q9v3x5abd",
+  "bootId": "rbt_01k0z6r1w8f4jy2m7q9v3x5abe",
+  "sequence": 4,
+  "sentAt": "2026-07-23T00:00:04Z",
+  "type": "workspace_retention_report",
+  "payloadVersion": 1,
+  "payload": {
+    "assignmentId": "asn_01k0z6r1w8f4jy2m7q9v3x5abf",
+    "attemptId": "atm_01k0z6r1w8f4jy2m7q9v3x5abg",
+    "runId": "run_01k0z6r1w8f4jy2m7q9v3x5abh",
+    "executionRoot": "/var/lib/scherzo-cloud/work/example/workspace",
+    "state": "retained"
+  }
+}

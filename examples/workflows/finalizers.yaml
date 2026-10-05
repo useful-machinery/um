@@ -104,6 +104,11 @@ finalizers:
 exports:
   workReceipt:
     ref: outputs.work.receipt
+    presentation:
+      title:
+        value: Finalizer demonstration
+      description:
+        ref: outputs.successReport.report
   cleanupReceipt:
     ref: outputs.cleanup.receipt
   finalReport:

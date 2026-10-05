@@ -978,7 +978,7 @@ fn automatic_publication(outcome: &str) -> serde_json::Value {
             "providerRepositoryId": "123456", "fullName": "example/repository",
             "baseBranch": "main", "destinationBranch": format!("scherzo/{RUN_ID}/changes")
         },
-        "pullRequestMetadata": {"title": "Review", "body": "Run publication"},
+        "pullRequestMetadata": {"title": "Review", "body": "Run publication", "titleSource": "default", "descriptionSource": "default"},
         "branch": branch, "pullRequest": pull_request, "outcome": outcome,
         "failure": null,
         "actorPrincipalId": "prn_01k0z6r1w8f4jy2m7q9v3x5abc",
@@ -2236,7 +2236,7 @@ fn human_run_observation_reports_failed_automatic_publication() {
             "providerRepositoryId": "123456", "fullName": "example/repository",
             "baseBranch": "main", "destinationBranch": format!("scherzo/{RUN_ID}/review")
         },
-        "pullRequestMetadata": { "title": "Review", "body": "Run publication" },
+        "pullRequestMetadata": { "title": "Review", "body": "Run publication", "titleSource": "default", "descriptionSource": "default" },
         "branch": null, "pullRequest": null, "outcome": null,
         "failure": { "phase": "branch", "code": "provider_unavailable", "retryable": true },
         "actorPrincipalId": "prn_01k0z6r1w8f4jy2m7q9v3x5abc",
@@ -2320,7 +2320,7 @@ fn human_run_observation_reports_successful_automatic_publication_url() {
             "providerRepositoryId": "123456", "fullName": "example/repository",
             "baseBranch": "main", "destinationBranch": format!("scherzo/{RUN_ID}/review")
         },
-        "pullRequestMetadata": { "title": "Review", "body": "Run publication" },
+        "pullRequestMetadata": { "title": "Review", "body": "Run publication", "titleSource": "default", "descriptionSource": "default" },
         "branch": {
             "headOid": "89abcdef0123456789abcdef0123456789abcdef",
             "disposition": "created", "url": "https://example.test/review/branch"

@@ -1326,6 +1326,12 @@ mod tests {
             .status()
             .unwrap();
         assert!(status.success());
+        let status = Command::new("git")
+            .current_dir(&workspace)
+            .args(["config", "commit.gpgsign", "false"])
+            .status()
+            .unwrap();
+        assert!(status.success());
         fs::write(workspace.join("tracked"), b"fixture\n").unwrap();
         let status = Command::new("git")
             .current_dir(&workspace)

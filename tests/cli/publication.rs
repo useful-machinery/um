@@ -57,6 +57,8 @@ fn publication_body() -> serde_json::Value {
         },
         "pullRequestMetadata": {
             "title": "Useful Machinery run: changes",
+            "titleSource": "default",
+            "descriptionSource": "default",
             "body": format!("Run: {RUN_ID}\nExport: {EXPORT_NAME}\n<!-- publication-marker -->")
         },
         "branch": null,
@@ -1069,6 +1071,13 @@ fn publication_create_rejects_malformed_success_without_partial_success_output()
     unknown_field["providerResponse"] = serde_json::json!("unique-provider-secret-sentinel");
     let mut invalid_lifecycle = body.clone();
     invalid_lifecycle["startedAt"] = serde_json::json!("2026-09-03T18:00:00Z");
+    let mut invalid_source = body.clone();
+    invalid_source["pullRequestMetadata"]["titleSource"] = serde_json::json!("provider");
+    let mut missing_source = body.clone();
+    missing_source["pullRequestMetadata"]
+        .as_object_mut()
+        .unwrap()
+        .remove("descriptionSource");
     let cases = vec![
         publication_response(
             "200 OK",
@@ -1115,6 +1124,8 @@ fn publication_create_rejects_malformed_success_without_partial_success_output()
         ),
         accepted_response(&unknown_field),
         accepted_response(&invalid_lifecycle),
+        accepted_response(&invalid_source),
+        accepted_response(&missing_source),
     ];
 
     for response in cases {

@@ -638,7 +638,8 @@ const TARGET_FIELDS: &[&str] = &[
     "baseBranch",
     "destinationBranch",
 ];
-const PULL_REQUEST_METADATA_FIELDS: &[&str] = &["title", "body"];
+const PULL_REQUEST_METADATA_FIELDS: &[&str] =
+    &["title", "body", "titleSource", "descriptionSource"];
 const BRANCH_FIELDS: &[&str] = &["headOid", "disposition", "url"];
 const PULL_REQUEST_FIELDS: &[&str] = &["providerId", "number", "url", "disposition", "state"];
 const FAILURE_FIELDS: &[&str] = &["phase", "code", "retryable"];

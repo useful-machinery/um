@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::{BufReader, Read, Seek, SeekFrom};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
@@ -35,13 +36,11 @@ use super::schema_common::{
 const MAXIMUM_STEPS: usize = 256;
 use super::artifact_limits::{MAXIMUM_CARRIERS, MAXIMUM_EXPORTS};
 pub(super) const MAXIMUM_EXPORT_MEDIA_TYPE_JSON_BYTES: u64 = MAXIMUM_EXPORTS as u64 * 128 * 12;
-pub(super) const MAXIMUM_RESULT_NON_STREAM_JSON_BYTES: u64 = 64 * 1024 * 1024;
 // Durable capture reserves the live run byte budget independently for stdout and
 // stderr. Base64 expands their aggregate and may add one padded quartet per stream.
 pub(super) const MAXIMUM_ENCODED_RETAINED_STREAM_BYTES: u64 = 2
     * (super::MAXIMUM_RETAINED_STREAM_BYTES_PER_RUN.div_ceil(3) * 4 + 2 * MAXIMUM_STEPS as u64 * 4);
-pub(crate) const MAXIMUM_RESULT_JSON_BYTES: u64 =
-    MAXIMUM_ENCODED_RETAINED_STREAM_BYTES + MAXIMUM_RESULT_NON_STREAM_JSON_BYTES;
+pub(crate) const MAXIMUM_RESULT_JSON_BYTES: u64 = super::capacity::MAXIMUM_PORTABLE_RESULT_BYTES;
 const SHA256_ALGORITHM: &str = "sha256";
 const BASE64_ENCODING: &str = "base64";
 
@@ -130,6 +129,7 @@ pub(crate) fn validate_document_envelope(document: &mut Value) -> Result<(), Res
     validation
 }
 
+#[cfg(test)]
 pub(crate) fn decode(bytes: &[u8]) -> Result<WorkflowResultV1, ResultMetadataError> {
     let document = decode_document(bytes).map_err(|_| ResultMetadataError)?;
     dispatch_recovery_summary_versions(&document).map_err(|_| ResultMetadataError)?;
@@ -137,6 +137,114 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<WorkflowResultV1, ResultMetadataErr
         serde_json::from_value::<WorkflowResultV1>(document).map_err(|_| ResultMetadataError)?;
     validate(&result)?;
     Ok(result)
+}
+
+// Check member uniqueness without retaining a second, potentially >1-GiB JSON
+// tree. Rewind the same bounded, identity-checked file for the typed pass.
+pub(crate) fn decode_reader(
+    reader: &mut (impl Read + Seek),
+) -> Result<WorkflowResultV1, ResultMetadataError> {
+    reader
+        .seek(SeekFrom::Start(0))
+        .map_err(|_| ResultMetadataError)?;
+    let mut prefix = [0; 3];
+    if reader.read(&mut prefix).map_err(|_| ResultMetadataError)? == 3
+        && prefix == [0xef, 0xbb, 0xbf]
+    {
+        return Err(ResultMetadataError);
+    }
+    let size = reader
+        .seek(SeekFrom::End(0))
+        .map_err(|_| ResultMetadataError)?;
+    if size == 0 {
+        return Err(ResultMetadataError);
+    }
+    reader
+        .seek(SeekFrom::End(-1))
+        .map_err(|_| ResultMetadataError)?;
+    let mut last = [0];
+    reader
+        .read_exact(&mut last)
+        .map_err(|_| ResultMetadataError)?;
+    if last != *b"\n" {
+        return Err(ResultMetadataError);
+    }
+    reader
+        .seek(SeekFrom::Start(0))
+        .map_err(|_| ResultMetadataError)?;
+    {
+        let mut buffered = BufReader::with_capacity(64 * 1024, &mut *reader);
+        let mut parser = serde_json::Deserializer::from_reader(&mut buffered);
+        UniqueStructure::deserialize(&mut parser).map_err(|_| ResultMetadataError)?;
+        parser.end().map_err(|_| ResultMetadataError)?;
+    }
+    reader
+        .seek(SeekFrom::Start(0))
+        .map_err(|_| ResultMetadataError)?;
+    let mut buffered = BufReader::with_capacity(64 * 1024, reader);
+    let mut parser = serde_json::Deserializer::from_reader(&mut buffered);
+    let result = WorkflowResultV1::deserialize(&mut parser).map_err(|_| ResultMetadataError)?;
+    parser.end().map_err(|_| ResultMetadataError)?;
+    Ok(result)
+}
+
+struct UniqueStructure;
+
+impl<'de> Deserialize<'de> for UniqueStructure {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_any(UniqueStructureVisitor)
+    }
+}
+
+struct UniqueStructureVisitor;
+
+impl<'de> Visitor<'de> for UniqueStructureVisitor {
+    type Value = UniqueStructure;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("JSON with unique object members")
+    }
+
+    fn visit_bool<E>(self, _: bool) -> Result<Self::Value, E> {
+        Ok(UniqueStructure)
+    }
+    fn visit_i64<E>(self, _: i64) -> Result<Self::Value, E> {
+        Ok(UniqueStructure)
+    }
+    fn visit_u64<E>(self, _: u64) -> Result<Self::Value, E> {
+        Ok(UniqueStructure)
+    }
+    fn visit_f64<E>(self, _: f64) -> Result<Self::Value, E> {
+        Ok(UniqueStructure)
+    }
+    fn visit_str<E>(self, _: &str) -> Result<Self::Value, E> {
+        Ok(UniqueStructure)
+    }
+    fn visit_string<E>(self, _: String) -> Result<Self::Value, E> {
+        Ok(UniqueStructure)
+    }
+    fn visit_none<E>(self) -> Result<Self::Value, E> {
+        Ok(UniqueStructure)
+    }
+    fn visit_unit<E>(self) -> Result<Self::Value, E> {
+        Ok(UniqueStructure)
+    }
+
+    fn visit_seq<A: SeqAccess<'de>>(self, mut sequence: A) -> Result<Self::Value, A::Error> {
+        while sequence.next_element::<UniqueStructure>()?.is_some() {}
+        Ok(UniqueStructure)
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+        let mut seen = BTreeSet::new();
+        while let Some(name) = map.next_key::<String>()? {
+            if !seen.insert(name) {
+                return Err(A::Error::custom("duplicate JSON object member"));
+            }
+            map.next_value::<UniqueStructure>()?;
+        }
+        Ok(UniqueStructure)
+    }
 }
 
 pub(crate) fn validate(result: &WorkflowResultV1) -> Result<(), ResultMetadataError> {
@@ -736,6 +844,7 @@ fn valid_cloud_capacity(
                 ),
                 (
                     capacity.terminal_result_structure_bytes,
+                    capacity.presentation_result_bytes,
                     capacity.portable_result_bytes,
                     capacity.encoded_outbox_bytes,
                 ),
@@ -1462,10 +1571,53 @@ fn valid_stream(stream: &DiagnosticStreamV1, maximum_stream_bytes: u64) -> bool 
     })
 }
 
+pub(super) fn valid_export_presentation(
+    presentation: Option<&super::publication::ExportPresentationV1>,
+) -> bool {
+    use super::export_presentation::{Field, resolve_text};
+    use super::publication::{PresentationFieldV1, PresentationUnavailableReasonV1};
+
+    let Some(presentation) = presentation else {
+        return true;
+    };
+    if presentation.title.is_none() && presentation.description.is_none() {
+        return false;
+    }
+    [
+        (Field::Title, presentation.title.as_ref()),
+        (Field::Description, presentation.description.as_ref()),
+    ]
+    .into_iter()
+    .all(|(field, content)| match content {
+        None => true,
+        Some(PresentationFieldV1::Available { value }) => {
+            resolve_text(field, value).is_ok_and(|trimmed| trimmed == value)
+        }
+        Some(PresentationFieldV1::Unavailable { reason }) => {
+            field == Field::Title || *reason != PresentationUnavailableReasonV1::MultilineTitle
+        }
+    })
+}
+
 fn validate_exports(result: &WorkflowResultV1) -> Result<(), ResultMetadataError> {
+    if result
+        .exports
+        .values()
+        .any(|export| export.presentation().is_some())
+        && result
+            .execution
+            .capacity
+            .as_ref()
+            .is_some_and(|capacity| capacity.presentation_result_bytes == 0)
+    {
+        return Err(ResultMetadataError);
+    }
     let mut groups = BTreeMap::<&str, Vec<(usize, &ExportV1)>>::new();
     for (index, (name, export)) in result.exports.iter().enumerate() {
         if !is_identifier(name) {
+            return Err(ResultMetadataError);
+        }
+        if !valid_export_presentation(export.presentation()) {
             return Err(ResultMetadataError);
         }
         let source = result.export_sources.get(name);
@@ -1478,6 +1630,7 @@ fn validate_exports(result: &WorkflowResultV1) -> Result<(), ResultMetadataError
                 digest,
                 provenance,
                 producer,
+                ..
             } => {
                 if !valid_export_origin(result, source, provenance.as_ref(), producer.as_ref())
                     || !valid_export_kind(kind, media_type)
@@ -1497,6 +1650,7 @@ fn validate_exports(result: &WorkflowResultV1) -> Result<(), ResultMetadataError
                 carrier,
                 provenance,
                 producer,
+                ..
             } => {
                 if !valid_export_origin(result, source, provenance.as_ref(), producer.as_ref())
                     || *artifact_version != 1
@@ -1520,7 +1674,7 @@ fn validate_exports(result: &WorkflowResultV1) -> Result<(), ResultMetadataError
                     None => None,
                 }
             }
-            ExportV1::Unavailable { reason } => {
+            ExportV1::Unavailable { reason, .. } => {
                 if !valid_unavailable_export_source(result, source, *reason) {
                     return Err(ResultMetadataError);
                 }

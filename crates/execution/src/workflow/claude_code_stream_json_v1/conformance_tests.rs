@@ -738,6 +738,88 @@ async fn pinned_real_claude_code_04_production_no_value_and_native_failure_are_t
 )]
 #[tokio::test]
 #[ignore = "requires pinned harness"]
+async fn pinned_real_claude_code_04b_provider_overload_retries_and_stream_error_fails_closed() {
+    let (executable, _exclusive) = exclusive_conformance_executable().await;
+    tokio::time::timeout(WATCHDOG, async {
+        let mut provider = LoopbackProvider::start().await;
+        let root = SyntheticClaudeCodeRoot::new();
+        let observations = RecordingObservationSink::default();
+        let running =
+            launch_recorded_response_lifecycle(executable, &root, &provider, &observations).await;
+        provider
+            .next_request()
+            .await
+            .release_overload_after_thinking();
+        let outcome = running.finish().await;
+        let AgentOutcome::Failed(failure) = outcome else {
+            panic!("damaged native exchange must fail closed, got {outcome:?}");
+        };
+        assert_eq!(failure.cause(), &AgentFailureCause::HarnessProtocolFailed);
+        let rejection = serde_json::to_value(failure.protocol_rejection().unwrap()).unwrap();
+        assert_eq!(rejection["detail"]["reason"], "message_transition_invalid");
+        assert!(observations.concatenated_text(assistant_text).is_empty());
+        assert!(!provider.has_pending_request());
+        // Native failure before transcript creation is allowed, but the owned links
+        // must never leave an ambient resumable conversation behind.
+        let ambient_paths = root.ambient_session_paths(DIRECT_SESSION_ID);
+        for ambient in &ambient_paths {
+            assert!(!ambient.exists());
+        }
+        assert_eq!(
+            fs::read_dir(ambient_paths[0].parent().unwrap())
+                .unwrap()
+                .count(),
+            0
+        );
+        provider.shutdown().await;
+
+        // An overload before stream initialization can be retried by Claude Code;
+        // the adapter still accepts only the final completed exchange as response.
+        let mut retry_provider = LoopbackProvider::start().await;
+        let retry_root = SyntheticClaudeCodeRoot::new();
+        let retry_observations = RecordingObservationSink::default();
+        let retry_running = launch_recorded_response_lifecycle(
+            conformance_executable(),
+            &retry_root,
+            &retry_provider,
+            &retry_observations,
+        )
+        .await;
+        retry_provider.next_request().await.release_overload();
+        let terminal = retry_running.terminal.receive();
+        tokio::pin!(terminal);
+        let retry_outcome = tokio::select! {
+            request = retry_provider.next_request() => {
+                assert!(request.used_placeholder_key());
+                request.release_text(RESPONSE);
+                terminal.await.unwrap()
+            }
+            outcome = &mut terminal => outcome.unwrap(),
+        };
+        retry_running.task.await.unwrap();
+        let AgentOutcome::Completed(CompletedAgentInvocation::Response(response)) = retry_outcome
+        else {
+            panic!("retry must produce one response, got {retry_outcome:?}");
+        };
+        assert_eq!(response.as_str(), RESPONSE);
+        assert_eq!(
+            retry_observations.concatenated_text(assistant_text),
+            RESPONSE
+        );
+        assert!(!retry_provider.has_pending_request());
+        assert_retained_native_session(&retry_root, &[RESPONSE]);
+        retry_provider.shutdown().await;
+    })
+    .await
+    .expect("pinned Claude Code overload probe watchdog expired");
+}
+
+#[expect(
+    clippy::disallowed_methods,
+    reason = "real time is used only as an anti-hang watchdog, never as success evidence"
+)]
+#[tokio::test]
+#[ignore = "requires pinned harness"]
 async fn pinned_real_claude_code_05_cancels_a_blocked_provider_request() {
     let (executable, _exclusive) = exclusive_conformance_executable().await;
     tokio::time::timeout(WATCHDOG, async {
@@ -909,7 +991,7 @@ async fn pinned_real_claude_code_08_correlates_a_nominal_thinking_envelope_befor
             LoopbackBlock::text(RESPONSE),
         ]);
 
-        // Claude Code 2.1.283 emits a nominal `assistant` envelope restating the thinking
+        // Claude Code 2.1.284 emits a nominal `assistant` envelope restating the thinking
         // block. `ActiveContentBlock::correlate_nominal` requires that envelope to be
         // byte-equal to the reconstructed `thinking_delta` stream, so reaching a response
         // at all proves the equality invariant holds for native thinking.

@@ -1,4 +1,5 @@
 mod output;
+mod webhook;
 
 use anyhow::{Context, anyhow};
 use clap::{Args, Subcommand, builder::NonEmptyStringValueParser};
@@ -34,6 +35,8 @@ enum ProjectCommand {
     RunnerPool(RunnerPoolCommand),
     #[command(about = "Show a project")]
     Show(ShowCommand),
+    #[command(about = "Manage a project's signed webhooks")]
+    Webhook(webhook::Command),
 }
 
 type Options = super::CommonArgs<super::ProjectJson, super::PrincipalAuthenticationArgs>;
@@ -249,6 +252,7 @@ impl Command {
             ProjectCommand::Rename(command) => execute_leaf(command, RenameCommand::execute),
             ProjectCommand::Repository(command) => command.execute(),
             ProjectCommand::RunnerPool(command) => command.execute(),
+            ProjectCommand::Webhook(command) => command.execute(),
         }
     }
 }

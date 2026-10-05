@@ -656,6 +656,13 @@ pub(super) enum AssignmentObservation {
         attempt_id: String,
         report: ExecutionReport,
     },
+    WorkspaceRetention {
+        assignment_id: String,
+        attempt_id: String,
+        run_id: String,
+        execution_root: String,
+        state: String,
+    },
     Artifact {
         delivery_id: u64,
         request: ArtifactRequest,
@@ -670,7 +677,8 @@ impl AssignmentObservation {
             Self::Decision(decision) => decision.assignment_id(),
             Self::CancellationApplied(application) => &application.assignment_id,
             Self::LeaseRenewalRequested { assignment_id, .. }
-            | Self::Execution { assignment_id, .. } => assignment_id,
+            | Self::Execution { assignment_id, .. }
+            | Self::WorkspaceRetention { assignment_id, .. } => assignment_id,
             Self::Artifact { request, .. } => request.assignment_id(),
         }
     }
@@ -733,6 +741,20 @@ impl AssignmentObservation {
                 attempt_id,
                 report,
             } => report.runner_frame(envelope, assignment_id.clone(), attempt_id.clone()),
+            Self::WorkspaceRetention {
+                assignment_id,
+                attempt_id,
+                run_id,
+                execution_root,
+                state,
+            } => RunnerFrame::WorkspaceRetentionReport {
+                envelope,
+                assignment_id: assignment_id.clone(),
+                attempt_id: attempt_id.clone(),
+                run_id: run_id.clone(),
+                execution_root: execution_root.clone(),
+                state: state.clone(),
+            },
             Self::Artifact { request, .. } => request.runner_frame(envelope),
         }
     }
@@ -1506,6 +1528,7 @@ enum ReleaseAfter {
 struct ReleasingAssignment {
     assignment_id: String,
     after: ReleaseAfter,
+    retention_report: Option<(String, String, String, String)>,
 }
 
 enum LocalSlot {
@@ -3442,9 +3465,11 @@ impl AssignmentManager {
         disposition: WorkspaceDisposition,
         after: ReleaseAfter,
     ) {
+        let retention_report = root.retention_report_identity();
         self.slot = Some(LocalSlot::Releasing(ReleasingAssignment {
             assignment_id: assignment_id.clone(),
             after,
+            retention_report,
         }));
         let sender = self.event_sender.clone();
         let wake = self.outbox.clone();
@@ -3469,6 +3494,22 @@ impl AssignmentManager {
         }
         match result {
             CleanupResult::Released | CleanupResult::Retained => {
+                if result == CleanupResult::Retained
+                    && let Some((assignment_id, attempt_id, run_id, execution_root)) =
+                        releasing.retention_report.as_ref()
+                    && self
+                        .outbox
+                        .enqueue(AssignmentObservation::WorkspaceRetention {
+                            assignment_id: assignment_id.clone(),
+                            attempt_id: attempt_id.clone(),
+                            run_id: run_id.clone(),
+                            execution_root: execution_root.clone(),
+                            state: "retained".to_owned(),
+                        })
+                        .is_err()
+                {
+                    self.cleanup_failed = true;
+                }
                 match releasing.after {
                     ReleaseAfter::Idle => {}
                     ReleaseAfter::Reporting(identity) => self.reporting = Some(*identity),
@@ -4766,6 +4807,7 @@ pub(super) mod test_support {
             condition_transition_count: requirements.condition_transition_count,
             aggregate_condition_transition_bytes: requirements.aggregate_condition_transition_bytes,
             terminal_result_structure_bytes: requirements.terminal_result_structure_bytes,
+            presentation_result_bytes: requirements.presentation_result_bytes,
             portable_result_bytes: requirements.portable_result_bytes,
             encoded_outbox_bytes: requirements.encoded_outbox_bytes,
         };
@@ -4804,6 +4846,7 @@ fn validate_carried_capacity(
         || carried.aggregate_condition_transition_bytes
             != resolved.aggregate_condition_transition_bytes
         || carried.terminal_result_structure_bytes != resolved.terminal_result_structure_bytes
+        || carried.presentation_result_bytes != resolved.presentation_result_bytes
         || carried.portable_result_bytes != resolved.portable_result_bytes
         || carried.encoded_outbox_bytes != resolved.encoded_outbox_bytes
     {
@@ -5007,6 +5050,7 @@ fn validate_execution_spec(
             ),
             (
                 capacity.terminal_result_structure_bytes,
+                capacity.presentation_result_bytes,
                 capacity.portable_result_bytes,
                 capacity.encoded_outbox_bytes,
             ),
@@ -5427,7 +5471,7 @@ for argument in "$@"; do
   previous=$argument
 done
 while IFS= read -r _; do :; done
-printf '{"type":"system","subtype":"init","cwd":"%s","session_id":"%s","model":"%s","permissionMode":"bypassPermissions","claude_code_version":"2.1.283"}\n' "$PWD" "$session" "$model"
+printf '{"type":"system","subtype":"init","cwd":"%s","session_id":"%s","model":"%s","permissionMode":"bypassPermissions","claude_code_version":"2.1.284"}\n' "$PWD" "$session" "$model"
 if [ "${CLAUDE_FIXTURE_FAIL-}" = 1 ]; then exit 23; fi
 printf '{"type":"stream_event","event":{"type":"message_start","message":{"id":"msg-runner","type":"message","role":"assistant","content":[],"model":"%s","usage":{"input_tokens":1,"output_tokens":0}}},"session_id":"%s","parent_tool_use_id":null}\n' "$model" "$session"
 printf '{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}},"session_id":"%s","parent_tool_use_id":null}\n' "$session"
@@ -6114,6 +6158,7 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
             condition_transition_count: 0,
             aggregate_condition_transition_bytes: 0,
             terminal_result_structure_bytes: 67_108_864,
+            presentation_result_bytes: 0,
             portable_result_bytes: 202_027_692,
             encoded_outbox_bytes: 85_458_944,
         }
@@ -7016,12 +7061,22 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
                         | AssignmentObservation::Decision(_)
                         | AssignmentObservation::CancellationApplied(_)
                         | AssignmentObservation::LeaseRenewalRequested { .. }
+                        | AssignmentObservation::WorkspaceRetention { .. }
                         | AssignmentObservation::Artifact { .. } => None,
                     })
                     .collect();
             }
             notified.await;
         }
+    }
+
+    fn assert_only_workspace_retention(manager: &mut AssignmentManager) {
+        let pending = manager.pending_observations(&BTreeSet::new(), 10);
+        assert_eq!(pending.len(), 1);
+        assert!(matches!(
+            pending[0].observation,
+            AssignmentObservation::WorkspaceRetention { .. }
+        ));
     }
 
     fn assert_acknowledged_run(
@@ -7303,6 +7358,26 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
         for (failure, expected) in cases {
             assert_eq!(run_input_decline(failure), expected);
         }
+    }
+
+    #[test]
+    fn presentation_capacity_offer_is_bound_to_resolved_source() {
+        let source = tempfile::tempdir().unwrap();
+        std::fs::write(source.path().join("workflow.yaml"),
+            "schemaVersion: 1\nsteps:\n  work:\n    kind: cmd\n    command: {argv: [\"true\"]}\n    outputs:\n      text: {kind: text, from: path, path: note.txt}\nexports:\n  note:\n    ref: outputs.work.text\n    presentation:\n      title: {ref: outputs.work.text}\n").unwrap();
+        let workflow = resolve(source.path(), Path::new("workflow.yaml")).unwrap();
+        let mut spec = offer("bg").execution_spec;
+        align_fixture_capacity(&mut spec, &workflow);
+        assert!(spec.capacity.presentation_result_bytes > 0);
+        assert_eq!(validate_carried_capacity(&spec, &workflow), Ok(()));
+        // Both changed fields still satisfy the closed arithmetic contract;
+        // only recomputation against the resolved source detects this offer.
+        spec.capacity.presentation_result_bytes += 1;
+        spec.capacity.portable_result_bytes += 1;
+        assert_eq!(
+            validate_carried_capacity(&spec, &workflow),
+            Err(capacity_binding_invalid())
+        );
     }
 
     #[test]
@@ -7594,7 +7669,7 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
 
     #[tokio::test]
     async fn command_failure_retains_git_dirty_untracked_ignored_and_build_bytes() {
-        let workflow = "schemaVersion: 1\nsteps:\n  write:\n    kind: cmd\n    command:\n      argv: [\"sh\", \"-c\", \"printf committed > tracked-output.txt; git add tracked-output.txt; git -c user.name=Fixture -c user.email=fixture@example.test commit --quiet -m 'retained fixture'; printf dirty-tracked > tracked-output.txt; printf '*.cache\\\\n' > .gitignore; printf untracked > untracked.txt; printf ignored > ignored.cache; mkdir build; printf build-output > build/result; exit 23\"]\n";
+        let workflow = "schemaVersion: 1\nsteps:\n  write:\n    kind: cmd\n    command:\n      argv: [\"sh\", \"-c\", \"printf committed > tracked-output.txt; git add tracked-output.txt; git -c commit.gpgsign=false -c user.name=Fixture -c user.email=fixture@example.test commit --quiet -m 'retained fixture'; printf dirty-tracked > tracked-output.txt; printf '*.cache\\\\n' > .gitignore; printf untracked > untracked.txt; printf ignored > ignored.cache; mkdir build; printf build-output > build/result; exit 23\"]\n";
         let (_temporary, mut manager) = manager_fixture(workflow);
         let offered = offer("bg");
         offer_then_prepare(&mut manager, &offered).await;
@@ -7860,11 +7935,7 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
 
         manager.handle_offer(offered).unwrap();
         assert_eq!(source.calls(), 1);
-        assert!(
-            manager
-                .pending_observations(&BTreeSet::new(), 10)
-                .is_empty()
-        );
+        assert_only_workspace_retention(&mut manager);
     }
 
     #[tokio::test]
@@ -8952,7 +9023,7 @@ steps:
         settle_cleanup(&mut manager).await;
 
         assert!(manager.slot.is_none());
-        assert_eq!(manager.pending_observations(&BTreeSet::new(), 10), vec![]);
+        assert_only_workspace_retention(&mut manager);
     }
 
     #[tokio::test]
@@ -11177,6 +11248,7 @@ steps:
             manager.slot = Some(LocalSlot::Releasing(ReleasingAssignment {
                 assignment_id: predecessor.assignment_id.clone(),
                 after: ReleaseAfter::Idle,
+                retention_report: None,
             }));
             manager.deferred_successor = Some(successor);
             // Both replay paths must enqueue a rejection even during shutdown.
@@ -11215,6 +11287,7 @@ steps:
         manager.slot = Some(LocalSlot::Releasing(ReleasingAssignment {
             assignment_id: predecessor.assignment_id.clone(),
             after: ReleaseAfter::Idle,
+            retention_report: None,
         }));
         manager.deferred_successor = Some(successor);
         manager

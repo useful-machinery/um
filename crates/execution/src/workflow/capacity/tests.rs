@@ -132,7 +132,15 @@ fn cloud_capacity_limits_match_shared_contract() {
     );
     assert_eq!(
         ORDINARY_PORTABLE_RESULT_BYTES,
-        number(&["variants", "ordinary", "portableResultBytes", "exact"])
+        number(&["variants", "ordinary", "portableResultBytes", "minimum"])
+    );
+    assert_eq!(
+        MAXIMUM_PRESENTATION_RESULT_BYTES,
+        number(&["commonBounds", "presentationResultBytes", "maximum"])
+    );
+    assert_eq!(
+        ORDINARY_PORTABLE_RESULT_BYTES + MAXIMUM_PRESENTATION_RESULT_BYTES,
+        number(&["variants", "ordinary", "portableResultBytes", "maximum"])
     );
     assert_eq!(
         MAXIMUM_CONDITION_TRANSITION_COUNT,
@@ -242,6 +250,7 @@ fn condition_capacity_replay_and_runner_share_the_numerical_boundary() {
         condition_transition_count: 0,
         aggregate_condition_transition_bytes: 0,
         terminal_result_structure_bytes: RUNNER_TERMINAL_FRAME_BYTES,
+        presentation_result_bytes: 0,
         portable_result_bytes: ORDINARY_PORTABLE_RESULT_BYTES,
         encoded_outbox_bytes: 85_458_944,
     };
@@ -268,6 +277,53 @@ fn condition_capacity_replay_and_runner_share_the_numerical_boundary() {
     }));
     assert!(!valid_condition_capacity(ConditionCapacityBounds {
         selected_maximum_transitions: u64::MAX,
+        ..conditional
+    }));
+}
+
+#[test]
+fn presentation_capacity_preserves_undecorated_bases_and_admits_maximum_aliases() {
+    let ordinary = ConditionCapacityBounds {
+        selected_maximum_transitions: 7,
+        condition_transition_count: 0,
+        aggregate_condition_transition_bytes: 0,
+        terminal_result_structure_bytes: RUNNER_TERMINAL_FRAME_BYTES,
+        presentation_result_bytes: MAXIMUM_PRESENTATION_RESULT_BYTES,
+        portable_result_bytes: 428_876_460,
+        encoded_outbox_bytes: 85_458_944,
+    };
+    assert_eq!(
+        ordinary.portable_result_bytes,
+        ORDINARY_PORTABLE_RESULT_BYTES + MAXIMUM_PRESENTATION_RESULT_BYTES
+    );
+    assert!(valid_condition_capacity(ordinary));
+    assert!(valid_condition_capacity(ConditionCapacityBounds {
+        presentation_result_bytes: 0,
+        portable_result_bytes: ORDINARY_PORTABLE_RESULT_BYTES,
+        ..ordinary
+    }));
+    assert!(!valid_condition_capacity(ConditionCapacityBounds {
+        portable_result_bytes: ordinary.portable_result_bytes + 1,
+        ..ordinary
+    }));
+
+    let conditional = ConditionCapacityBounds {
+        selected_maximum_transitions: 1_030,
+        condition_transition_count: 256,
+        aggregate_condition_transition_bytes: 268_435_456,
+        terminal_result_structure_bytes: 536_870_912,
+        presentation_result_bytes: MAXIMUM_PRESENTATION_RESULT_BYTES,
+        portable_result_bytes: MAXIMUM_PORTABLE_RESULT_BYTES,
+        encoded_outbox_bytes: MAXIMUM_ENCODED_OUTBOX_BYTES,
+    };
+    assert!(valid_condition_capacity(conditional));
+    assert!(valid_condition_capacity(ConditionCapacityBounds {
+        presentation_result_bytes: 0,
+        portable_result_bytes: 901_080_408,
+        ..conditional
+    }));
+    assert!(!valid_condition_capacity(ConditionCapacityBounds {
+        portable_result_bytes: MAXIMUM_PORTABLE_RESULT_BYTES + 1,
         ..conditional
     }));
 }
@@ -336,6 +392,7 @@ fn shared_recovery_capacity_vectors_match_the_resolver_owned_calculation() {
                         aggregate_condition_transition_bytes: expected
                             .aggregate_condition_transition_bytes,
                         terminal_result_structure_bytes: expected.terminal_result_structure_bytes,
+                        presentation_result_bytes: 0,
                         portable_result_bytes: expected.portable_result_bytes,
                         encoded_outbox_bytes: expected.encoded_outbox_bytes,
                     },

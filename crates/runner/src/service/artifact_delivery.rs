@@ -53,6 +53,14 @@ impl ArtifactUploadBody for StagedArtifactUploadBody {
     }
 }
 
+struct FileArtifactUploadBody(Arc<tempfile::NamedTempFile>);
+
+impl ArtifactUploadBody for FileArtifactUploadBody {
+    fn open(&self) -> io::Result<UploadReader> {
+        self.0.reopen().map(|file| Box::new(file) as UploadReader)
+    }
+}
+
 struct BytesArtifactUploadBody(Arc<[u8]>);
 
 impl ArtifactUploadBody for BytesArtifactUploadBody {
@@ -105,6 +113,24 @@ impl ArtifactDeliverySpec {
             size_bytes: carrier.size_bytes,
             sha256: carrier.sha256,
             body,
+        }
+    }
+
+    pub(super) fn result_file(
+        assignment_id: String,
+        attempt_id: String,
+        file: Arc<tempfile::NamedTempFile>,
+        size_bytes: u64,
+        sha256: String,
+    ) -> Self {
+        Self {
+            assignment_id,
+            attempt_id,
+            member: ArtifactMember::Result,
+            media_type: "application/json".to_owned(),
+            size_bytes,
+            sha256,
+            body: Arc::new(FileArtifactUploadBody(file)),
         }
     }
 
@@ -1399,6 +1425,27 @@ mod tests {
             "atm_01k0z6r1w8f4jy2m7q9v3x5abk".to_owned(),
             Arc::from(&b"{}"[..]),
         )
+    }
+
+    #[test]
+    fn file_backed_result_retries_from_the_first_byte() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        std::io::Write::write_all(&mut file, b"{\"result\":true}\n").unwrap();
+        let spec = ArtifactDeliverySpec::result_file(
+            "asn_01k0z6r1w8f4jy2m7q9v3x5abh".to_owned(),
+            "atm_01k0z6r1w8f4jy2m7q9v3x5abk".to_owned(),
+            Arc::new(file),
+            16,
+            "digest".to_owned(),
+        );
+        let mut first = spec.body.open().unwrap();
+        let mut prefix = [0; 4];
+        first.read_exact(&mut prefix).unwrap();
+        assert_eq!(&prefix, b"{\"re");
+        drop(first);
+        let mut retry = Vec::new();
+        spec.body.open().unwrap().read_to_end(&mut retry).unwrap();
+        assert_eq!(retry, b"{\"result\":true}\n");
     }
 
     #[test]

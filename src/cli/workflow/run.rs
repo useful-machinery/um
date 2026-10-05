@@ -2339,6 +2339,7 @@ fn build_run_result(
             .maximum_step_log_bytes()
             .get(),
         cloud_capacity: None,
+        maximum_result_bytes: workflow.capacity.requirements.portable_result_bytes,
         timing: run_timing,
         outcome: execution.outcome,
         cancellation,
@@ -2347,6 +2348,7 @@ fn build_run_result(
         finalization,
         exports: execution.exports,
         export_sources: workflow.definition.exports.clone(),
+        export_presentation: workflow.definition.export_presentation.clone(),
     })
 }
 

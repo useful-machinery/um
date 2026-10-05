@@ -325,14 +325,40 @@
       "required": ["ref"],
       "description": "A finalizer-local value reference. finalization.context is an engine value and creates no graph edge."
     },
+    "PresentationField": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": { "value": { "type": "string" } },
+          "required": ["value"]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": { "ref": { "$ref": "#/$defs/OutputReferenceString" } },
+          "required": ["ref"]
+        }
+      ]
+    },
+    "ExportPresentation": {
+      "type": "object",
+      "additionalProperties": false,
+      "minProperties": 1,
+      "properties": {
+        "title": { "$ref": "#/$defs/PresentationField" },
+        "description": { "$ref": "#/$defs/PresentationField" }
+      }
+    },
     "OutputReference": {
       "type": "object",
       "additionalProperties": false,
       "properties": {
-        "ref": { "$ref": "#/$defs/OutputReferenceString" }
+        "ref": { "$ref": "#/$defs/OutputReferenceString" },
+        "presentation": { "$ref": "#/$defs/ExportPresentation" }
       },
       "required": ["ref"],
-      "description": "A workflow export reference. Exports select outputs but create no graph edge."
+      "description": "A workflow export reference. Exports and presentation select outputs but create no graph edge."
     },
     "FileSource": {
       "type": "object",

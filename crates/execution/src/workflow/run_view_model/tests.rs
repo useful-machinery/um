@@ -996,6 +996,7 @@ fn succeeded_run_result(workflow: &ResolvedWorkflow, base: Instant) -> WorkflowR
         maximum_parallel_steps: NonZeroUsize::new(2).unwrap(),
         maximum_retained_bytes_per_stream: super::super::MAXIMUM_RETAINED_BYTES_PER_STREAM,
         cloud_capacity: None,
+        maximum_result_bytes: 202_027_692,
         timing: WorkflowRunTiming {
             started_at: point(base, 0).utc,
             finished_at: point(base, 90).utc,
@@ -1047,5 +1048,6 @@ fn succeeded_run_result(workflow: &ResolvedWorkflow, base: Instant) -> WorkflowR
         finalization: None,
         exports: BTreeMap::new(),
         export_sources: BTreeMap::new(),
+        export_presentation: BTreeMap::new(),
     }
 }

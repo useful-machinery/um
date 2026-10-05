@@ -321,9 +321,7 @@ fn attempt_directory_names_are_exact_at_the_six_digit_boundary() {
 fn retained_read_budget_enforces_the_component_derivation() {
     assert_eq!(
         MAXIMUM_RETAINED_TOTAL_BYTES,
-        MAXIMUM_RETAINED_CAPTURED_FILE_BYTES
-            + crate::workflow::result_metadata::MAXIMUM_ENCODED_RETAINED_STREAM_BYTES
-            + MAXIMUM_RETAINED_RUN_JSON_BYTES
+        MAXIMUM_RETAINED_CAPTURED_FILE_BYTES + MAXIMUM_RETAINED_RUN_JSON_BYTES
     );
 
     let mut captured_file_bytes = MAXIMUM_RETAINED_CAPTURED_FILE_BYTES - 1;
@@ -1140,6 +1138,7 @@ fn run_retains_original_git_baseline_for_descendant_retries() {
     git(&["init", "--quiet"]);
     git(&["config", "user.name", "Baseline Fixture"]);
     git(&["config", "user.email", "baseline@example.invalid"]);
+    git(&["config", "commit.gpgsign", "false"]);
     fs::write(fixture.execution_root.join("tracked"), b"original\n").unwrap();
     git(&["add", "tracked"]);
     git(&["commit", "--quiet", "-m", "original"]);

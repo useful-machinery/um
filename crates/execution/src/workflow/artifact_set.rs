@@ -40,14 +40,14 @@ pub(crate) fn read_and_validate(
     root: &OwnedFd,
     maximum_result_bytes: u64,
 ) -> Result<WorkflowResultV1, ArtifactSetError> {
-    read_and_validate_observing(root, maximum_result_bytes, || {}, |_| Ok(()))
+    read_and_validate_observing(root, maximum_result_bytes, || {}, |_, _| Ok(()))
 }
 
 pub(crate) fn read_and_validate_observing(
     root: &OwnedFd,
     maximum_result_bytes: u64,
     on_open: impl FnOnce(),
-    on_bytes: impl FnOnce(&[u8]) -> Result<(), ArtifactSetError>,
+    on_result: impl FnOnce(&WorkflowResultV1, u64) -> Result<(), ArtifactSetError>,
 ) -> Result<WorkflowResultV1, ArtifactSetError> {
     let descriptor = openat(
         root,
@@ -66,30 +66,26 @@ pub(crate) fn read_and_validate_observing(
     }
     on_open();
     let mut file = File::from(descriptor);
-    let bytes =
-        artifact_primitives::read_bounded(&mut file, maximum_result_bytes, &AtomicBool::new(false))
-            .map_err(|_| ArtifactSetError::ResultFileUnavailable)?;
-    if u64::try_from(bytes.len()) != Ok(before_size)
-        || artifact_primitives::retained_file_changed(root, RESULT_FILE, &file, &before)
-    {
-        return Err(ArtifactSetError::ResultFileUnavailable);
-    }
-    on_bytes(&bytes)?;
-    let result = match result_metadata::decode(&bytes) {
+    let result = match result_metadata::decode_reader(&mut file) {
         Ok(result) => result,
         Err(_) => {
-            // Preserve the specific carrier diagnostic even when the general
-            // metadata validator rejects an over-limit export map first.
-            let document =
-                result_metadata::decode_document(&bytes).map_err(|_| ArtifactSetError::Invalid)?;
-            let result: WorkflowResultV1 =
-                serde_json::from_value(document).map_err(|_| ArtifactSetError::Invalid)?;
-            if carrier_metadata(&result).len() > MAXIMUM_CARRIERS {
+            // Preserve the specific carrier diagnostic when the typed result
+            // parses but the general envelope check rejects its export map.
+            use std::io::{Seek as _, SeekFrom};
+            file.seek(SeekFrom::Start(0))
+                .map_err(|_| ArtifactSetError::Invalid)?;
+            if let Ok(result) = serde_json::from_reader::<_, WorkflowResultV1>(&mut file)
+                && carrier_metadata(&result).len() > MAXIMUM_CARRIERS
+            {
                 return Err(ArtifactSetError::CarrierLimitExceeded);
             }
             return Err(ArtifactSetError::Invalid);
         }
     };
+    if artifact_primitives::retained_file_changed(root, RESULT_FILE, &file, &before) {
+        return Err(ArtifactSetError::ResultFileUnavailable);
+    }
+    on_result(&result, before_size)?;
     validate(root, &result)?;
     Ok(result)
 }

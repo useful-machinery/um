@@ -2651,7 +2651,9 @@ async fn cancellation_keeps_the_admitted_deadline_when_observation_delivery_is_b
 
 #[tokio::test]
 async fn stubborn_descendant_is_forced_at_the_injected_deadline_before_terminal_report() {
-    with_watchdog(async {
+    // Detached process startup can contend with the other nextest fixtures in the
+    // package build. This limit is an anti-hang watchdog, not the cancellation grace.
+    with_watchdog_duration(Duration::from_secs(30), async {
         let fixture = ProcessFixture::new("success", "system".to_owned(), "message".to_owned());
         fs::write(
             fixture.invocation.adapter().executable(),
@@ -2671,9 +2673,18 @@ async fn stubborn_descendant_is_forced_at_the_injected_deadline_before_terminal_
         };
         let mut cleanup = DetachedFixtureCleanup::new(&fixture.process, &fixture.descendant);
         cleanup.reaper = Some(fixture.process.parent().unwrap().join("reaper"));
-        let (task, _started, terminal) = start_invocation(fixture.invocation, diagnostics.clone());
+        let (mut task, _started, terminal) =
+            start_invocation(fixture.invocation, diagnostics.clone());
 
-        read_signal(fixture.descendant_ready.clone()).await;
+        // A failed launch can never signal descendant readiness. Report its
+        // classified terminal failure rather than expiring the fixture watchdog.
+        tokio::select! {
+            _ = read_signal(fixture.descendant_ready.clone()) => {}
+            finished = &mut task => panic!(
+                "Pi fixture ended before descendant readiness: {finished:?}, terminal: {:?}",
+                terminal.receive().await
+            ),
+        }
         read_signal(fixture.result_settlement_ready).await;
         // Let the reaper reach its wait for the descendant's exit.
         read_signal(fixture.process.parent().unwrap().join("group-detached")).await;
@@ -2794,7 +2805,8 @@ fn stubborn_process_fixture() {
 #[test]
 #[ignore = "launched as the interrupt-resistant Pi descendant fixture"]
 fn stubborn_descendant_process_fixture() {
-    let _interrupt = process_fixture_interrupt_receiver();
+    // The reaper starts this fixture with SIGINT ignored before exec, so it
+    // survives the group interrupt until the injected force deadline.
     write_process_fixture_id("PI_FIXTURE_DESCENDANT");
     write_process_fixture_signal("PI_FIXTURE_DESCENDANT_READY", b"descendant-ready\n");
     loop {
@@ -2851,12 +2863,19 @@ impl Drop for DetachedFixtureCleanup {
     }
 }
 
+async fn with_watchdog<Output>(future: impl Future<Output = Output>) -> Output {
+    with_watchdog_duration(TEST_WATCHDOG, future).await
+}
+
 #[expect(
     clippy::disallowed_methods,
     reason = "real time is allowed only as an anti-hang watchdog, not a behavior assertion"
 )]
-async fn with_watchdog<Output>(future: impl Future<Output = Output>) -> Output {
-    match tokio::time::timeout(TEST_WATCHDOG, future).await {
+async fn with_watchdog_duration<Output>(
+    timeout: Duration,
+    future: impl Future<Output = Output>,
+) -> Output {
+    match tokio::time::timeout(timeout, future).await {
         Ok(output) => output,
         Err(_) => panic!("PiJsonV1 process fixture watchdog expired"),
     }
@@ -2901,6 +2920,7 @@ fn detached_standard_output_holder_process() {
 fn in_group_descendant_reaper_process() {
     run_descendant_reaper_process(
         "workflow::pi_json_v1::adapter_tests::in_group_descendant_process",
+        false,
     );
 }
 
@@ -2909,12 +2929,27 @@ fn in_group_descendant_reaper_process() {
 fn stubborn_descendant_reaper_process_fixture() {
     run_descendant_reaper_process(
         "workflow::pi_json_v1::adapter_tests::stubborn_descendant_process_fixture",
+        true,
     );
 }
 
-fn run_descendant_reaper_process(descendant_test: &str) {
-    let mut descendant = std::process::Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", descendant_test, "--ignored"])
+fn run_descendant_reaper_process(descendant_test: &str, ignore_interrupt: bool) {
+    let executable = std::env::current_exe().unwrap();
+    let mut command = if ignore_interrupt {
+        // An ignored signal disposition survives exec. Establish it before
+        // launching the fixture instead of racing signal-handler registration.
+        let mut command = std::process::Command::new("sh");
+        command
+            .args(["-c", "trap '' INT; exec \"$0\" --exact \"$1\" --ignored"])
+            .arg(executable)
+            .arg(descendant_test);
+        command
+    } else {
+        let mut command = std::process::Command::new(executable);
+        command.args(["--exact", descendant_test, "--ignored"]);
+        command
+    };
+    let mut descendant = command
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())

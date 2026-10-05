@@ -1,5 +1,8 @@
 use super::*;
 
+#[path = "project/webhook.rs"]
+mod webhook;
+
 const TOKEN: &str = "unique-project-command-token-sentinel";
 const SERVICE_API_KEY: &str =
     "crd_01k0z6r1w8f4jy2m7q9v3x5abc.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";

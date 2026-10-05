@@ -100,13 +100,14 @@ const MAXIMUM_RETAINED_INPUT_BYTES: u64 = 256 * 1024 * 1024;
 const MAXIMUM_RETAINED_CAPTURED_FILE_BYTES: u64 =
     MAXIMUM_RETAINED_SOURCE_CLOSURE_BYTES + MAXIMUM_RETAINED_INPUT_BYTES;
 const MAXIMUM_RETAINED_RUN_JSON_BYTES: u64 =
-    3 * MAXIMUM_DURABLE_JSON_BYTES + super::result_metadata::MAXIMUM_RESULT_NON_STREAM_JSON_BYTES;
+    3 * MAXIMUM_DURABLE_JSON_BYTES + super::result_metadata::MAXIMUM_RESULT_JSON_BYTES;
 // An archived-attempt read covers the immutable workflow/import captures, the base64
 // representation of both bounded diagnostic streams, and the run, state, manifest,
-// and result JSON envelopes. Each term is independently enforced while it is read.
-const MAXIMUM_RETAINED_TOTAL_BYTES: u64 = MAXIMUM_RETAINED_CAPTURED_FILE_BYTES
-    + super::result_metadata::MAXIMUM_ENCODED_RETAINED_STREAM_BYTES
-    + MAXIMUM_RETAINED_RUN_JSON_BYTES;
+// and result JSON envelopes. The complete result allowance already includes both
+// diagnostic streams; do not add them a second time. Each term is independently
+// enforced while it is read.
+const MAXIMUM_RETAINED_TOTAL_BYTES: u64 =
+    MAXIMUM_RETAINED_CAPTURED_FILE_BYTES + MAXIMUM_RETAINED_RUN_JSON_BYTES;
 const MAXIMUM_DIAGNOSTICS: usize = 256;
 const QUIESCENCE_POLL_INTERVAL: Duration = Duration::from_millis(5);
 const QUIESCENCE_POLL_ATTEMPTS: usize =
@@ -6197,6 +6198,10 @@ impl RetainedReadBudget {
 
     pub(super) fn account(&mut self, bytes: &[u8]) -> Result<(), LocalRunDirectoryError> {
         let size = u64::try_from(bytes.len()).map_err(|_| LocalRunDirectoryError::StateInvalid)?;
+        self.account_size(size)
+    }
+
+    pub(super) fn account_size(&mut self, size: u64) -> Result<(), LocalRunDirectoryError> {
         account_retained_bytes(&mut self.total_bytes, size, MAXIMUM_RETAINED_TOTAL_BYTES)
     }
 }

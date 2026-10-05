@@ -285,6 +285,7 @@ impl Fixture {
             maximum_parallel_steps: NonZeroUsize::new(2).unwrap(),
             maximum_retained_bytes_per_stream: super::super::MAXIMUM_RETAINED_BYTES_PER_STREAM,
             cloud_capacity: None,
+            maximum_result_bytes: 202_027_692,
             timing: WorkflowRunTiming {
                 started_at,
                 finished_at: timestamp("2026-08-02T12:01:45.25Z"),
@@ -318,6 +319,7 @@ impl Fixture {
             finalization: None,
             exports: BTreeMap::new(),
             export_sources: BTreeMap::new(),
+            export_presentation: BTreeMap::new(),
         }
     }
 }
