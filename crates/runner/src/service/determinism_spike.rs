@@ -376,25 +376,27 @@ async fn run_assignment_scenario() -> Vec<String> {
                 .expect("semantic assignment response message ID"),
             6,
         ));
-        // Cleanup runs on the blocking pool. Observe its retention report
-        // before probing liveness so the report and pong have a causal order.
-        let retention = next_outbound(&mut fixture.outbound).await;
-        let retention = decode_text(&retention, "workspace retention report");
-        assert_eq!(retention["type"], "workspace_retention_report");
-        assert_eq!(retention["sequence"], 7);
-        assert_eq!(retention["payload"]["state"], "retained");
+        // Cleanup runs on the blocking pool. Wait for its retention report
+        // rather than racing it against the ping response or gateway close.
+        let stress_silence_timer =
+            sleep_request(&mut fixture.sleep_requests, Duration::from_secs(2)).await;
+        let retained = next_outbound(&mut fixture.outbound).await;
+        let retained = decode_text(&retained, "workspace retention report");
+        assert_eq!(retained["type"], "workspace_retention_report");
+        assert_eq!(retained["sequence"], 7);
+        assert_eq!(retained["payload"]["state"], "retained");
         fixture.inbound.send(effect_observation_acknowledgement(
-            retention["messageId"]
+            retained["messageId"]
                 .as_str()
-                .expect("workspace retention report message ID"),
+                .expect("retention report message ID"),
             7,
         ));
-        let stress_silence_timer =
+        let retention_silence_timer =
             sleep_request(&mut fixture.sleep_requests, Duration::from_secs(2)).await;
         fixture
             .inbound
             .send(Message::Ping(b"scripted-boundary".to_vec().into()));
-        stress_silence_timer.release();
+        retention_silence_timer.release();
         let pong = next_outbound(&mut fixture.outbound).await;
         assert_eq!(pong, Message::Pong(b"scripted-boundary".to_vec().into()));
 
@@ -414,6 +416,7 @@ async fn run_assignment_scenario() -> Vec<String> {
         drop(prepare_acknowledgement_silence_timer);
         drop(progress_silence_timer);
         drop(progress_acknowledgement_silence_timer);
+        drop(stress_silence_timer);
         drop(final_silence_timer);
     };
 
@@ -426,18 +429,16 @@ async fn run_assignment_scenario() -> Vec<String> {
         "scenario.outcome:gateway-close:opening_acknowledged=true:handshake_completed=true"
             .to_owned(),
     );
-    let events = transcript.snapshot();
+    let events = normalize_retention_reports(transcript.snapshot());
     assert_assignment_acknowledgement_order(&events);
     // Assignment preparation runs independently from the connection loop. Its
     // notification can become ready immediately before or after the liveness
     // timer is first polled, so timer-request ordering is not a protocol
     // guarantee. Timeout-specific scenarios below retain those events.
-    let mut events: Vec<_> = events
+    events
         .into_iter()
         .filter(|event| !event.starts_with("sleep.requested:"))
-        .collect();
-    normalize_retention_report_roots(&mut events);
-    events
+        .collect()
 }
 
 async fn run_timeout_boundary_scenarios() -> Vec<String> {
@@ -690,12 +691,11 @@ async fn run_reconnect_scenario() -> Vec<String> {
         "source preparation must retain its deadline fence"
     );
     events.retain(|event| event != preparation_deadline);
-    normalize_retention_report_roots(&mut events);
-    events
+    normalize_retention_reports(events)
 }
 
-fn normalize_retention_report_roots(events: &mut [String]) {
-    for event in events {
+fn normalize_retention_reports(mut events: Vec<String>) -> Vec<String> {
+    for event in &mut events {
         let Some(raw) = event.strip_prefix("outbound:text:") else {
             continue;
         };
@@ -709,6 +709,7 @@ fn normalize_retention_report_roots(events: &mut [String]) {
             *event = format!("outbound:text:{frame}");
         }
     }
+    events
 }
 
 async fn run_terminal_close_scenario() -> Vec<String> {

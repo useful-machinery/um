@@ -1698,7 +1698,7 @@ fn validate_exports(result: &WorkflowResultV1) -> Result<(), ResultMetadataError
         if parse_carrier_ordinal(path) != Some(owner)
             || members
                 .iter()
-                .any(|(_, metadata)| *metadata != members[0].1)
+                .any(|(_, metadata)| !metadata.same_carrier_metadata(members[0].1))
         {
             return Err(ResultMetadataError);
         }

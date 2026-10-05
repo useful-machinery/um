@@ -1418,6 +1418,23 @@ pub(crate) enum PresentationUnavailableReasonV1 {
 }
 
 impl ExportV1 {
+    pub(super) fn same_carrier_metadata(&self, other: &Self) -> bool {
+        if self == other {
+            return true;
+        }
+        let without_presentation = |export: &Self| {
+            let mut metadata = export.clone();
+            match &mut metadata {
+                Self::Available { presentation, .. }
+                | Self::GitBranch { presentation, .. }
+                | Self::Unavailable { presentation, .. } => *presentation = None,
+            }
+            metadata
+        };
+        // Presentation belongs to each export alias, independently of its carrier.
+        without_presentation(self) == without_presentation(other)
+    }
+
     pub(crate) fn presentation(&self) -> Option<&ExportPresentationV1> {
         match self {
             Self::Available { presentation, .. }

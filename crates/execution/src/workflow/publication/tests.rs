@@ -561,10 +561,8 @@ fn staging_paths(parent: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
-#[test]
-fn prepares_metadata_only_and_carrier_cloud_results() {
-    let fixture = PublicationFixture::new();
-    let mut run = run_fixture(&fixture);
+fn set_cloud_capacity(run: &mut WorkflowRunResult, presentation_result_bytes: u64) {
+    run.maximum_result_bytes = 202_027_692 + presentation_result_bytes;
     run.cloud_capacity = Some(CloudExecutionCapacityV1 {
         execution_contract: "workflow_v1_cloud_inputs_artifacts@1".to_owned(),
         source_closure_digest: DigestV1 {
@@ -581,10 +579,17 @@ fn prepares_metadata_only_and_carrier_cloud_results() {
         condition_transition_count: 0,
         aggregate_condition_transition_bytes: 0,
         terminal_result_structure_bytes: 67_108_864,
-        presentation_result_bytes: 0,
-        portable_result_bytes: 202_027_692,
+        presentation_result_bytes,
+        portable_result_bytes: run.maximum_result_bytes,
         encoded_outbox_bytes: 85_458_944,
     });
+}
+
+#[test]
+fn prepares_metadata_only_and_carrier_cloud_results() {
+    let fixture = PublicationFixture::new();
+    let mut run = run_fixture(&fixture);
+    set_cloud_capacity(&mut run, 0);
     run.exports.insert(
         "agentResponse".to_owned(),
         ExportValue::Available {
@@ -652,6 +657,87 @@ fn prepares_metadata_only_and_carrier_cloud_results() {
     assert!(prepared.carriers.is_empty());
     let document: serde_json::Value = serde_json::from_slice(&prepared.result_json).unwrap();
     assert_eq!(document["exports"], serde_json::json!({}));
+}
+
+#[test]
+fn cloud_aliases_share_carriers_with_independent_presentation() {
+    use super::super::validated::{ValidatedExportPresentation, ValidatedPresentationField};
+
+    let fixture = PublicationFixture::new();
+    let mut run = run_fixture(&fixture);
+    set_cloud_capacity(&mut run, 512);
+    run.exports
+        .insert("reporta".to_owned(), run.exports["reportA"].clone());
+    run.export_sources
+        .insert("reporta".to_owned(), run.export_sources["reportA"].clone());
+    for (name, title) in [("reportA", "First title"), ("reporta", "Second title")] {
+        run.export_presentation.insert(
+            name.to_owned(),
+            ValidatedExportPresentation {
+                title: Some(ValidatedPresentationField::Literal(title.to_owned())),
+                description: None,
+            },
+        );
+    }
+    let prepared = prepare_cloud_workflow_result(
+        &run,
+        "prj_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned(),
+        "rpc_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned(),
+        "sha1".to_owned(),
+        "0123456789abcdef0123456789abcdef01234567".to_owned(),
+        None,
+    )
+    .unwrap();
+    assert_eq!(prepared.carriers.len(), 1);
+    let destination = fixture.destination("cloud-alias-presentation");
+    fs::create_dir_all(destination.join("exports")).unwrap();
+    fs::write(destination.join("result.json"), &prepared.result_json).unwrap();
+    for carrier in prepared.carriers {
+        let path = destination.join(carrier.portable_owner_path);
+        match carrier.body {
+            CloudCarrierBody::Staged(staged) => {
+                let mut source = fixture.artifacts.open_artifact(staged.handle()).unwrap();
+                std::io::copy(&mut source, &mut fs::File::create(path).unwrap()).unwrap();
+            }
+            CloudCarrierBody::Bytes(bytes) => fs::write(path, bytes).unwrap(),
+        }
+    }
+    let (bytes, result) = read_result(&destination);
+    assert_eq!(
+        result["exports"]["reportA"]["path"],
+        result["exports"]["reporta"]["path"]
+    );
+    assert_eq!(
+        result["exports"]["reportA"]["presentation"]["title"]["value"],
+        "First title"
+    );
+    assert_eq!(
+        result["exports"]["reporta"]["presentation"]["title"]["value"],
+        "Second title"
+    );
+    assert!(super::super::result_metadata::decode(&bytes).is_ok());
+    let validation = super::super::portable_artifact::validate_portable_artifact_set(
+        &destination,
+        &std::sync::atomic::AtomicBool::new(false),
+    )
+    .unwrap();
+    assert!(validation.is_valid(), "{:?}", validation.diagnostics);
+    let mut conflicting = result;
+    conflicting["exports"]["reporta"]["digest"]["value"] = Value::from("0".repeat(64));
+    fs::write(
+        destination.join("result.json"),
+        serde_json::to_vec(&conflicting).unwrap(),
+    )
+    .unwrap();
+    assert!(
+        super::super::result_metadata::decode(&serde_json::to_vec(&conflicting).unwrap()).is_err()
+    );
+    let validation = super::super::portable_artifact::validate_portable_artifact_set(
+        &destination,
+        &std::sync::atomic::AtomicBool::new(false),
+    )
+    .unwrap();
+    assert!(!validation.is_valid());
 }
 
 // Run-scoped, inert checkpoint seed. The caller owns the disposable directory;

@@ -949,6 +949,41 @@ fn accepts_consistent_alias_metadata_owned_by_the_lowest_ordinal() {
 }
 
 #[test]
+fn carrier_aliases_allow_independent_presentation_but_require_matching_digests() {
+    for git_branch in [false, true] {
+        let mut result = result_fixture();
+        if git_branch {
+            let file = result["exports"]["first"].clone();
+            let branch = json!({
+                "state": "available", "kind": "git_branch", "artifactVersion": 1,
+                "objectFormat": "sha1", "baseOid": "a".repeat(40),
+                "headOid": "b".repeat(40), "treeOid": "c".repeat(40),
+                "carrier": {
+                    "path": file["path"], "sizeBytes": file["sizeBytes"],
+                    "mediaType": "application/vnd.git.bundle", "digest": file["digest"]
+                }
+            });
+            result["exports"]["first"] = branch.clone();
+            result["exports"]["second"] = branch;
+        }
+        for name in ["first", "second"] {
+            result["exports"][name]["presentation"] = json!({
+                "title": {"state": "available", "value": name}
+            });
+        }
+        assert!(decode(&encode(&result)).is_ok());
+        let alias = &mut result["exports"]["second"];
+        let metadata = if git_branch {
+            &mut alias["carrier"]
+        } else {
+            alias
+        };
+        metadata["digest"]["value"] = Value::from("f".repeat(64));
+        assert_eq!(decode(&encode(&result)), Err(ResultMetadataError));
+    }
+}
+
+#[test]
 fn rejects_removed_step_fields_and_duplicate_object_members() {
     let mut removed_field = result_fixture();
     removed_field["steps"][0]["committedOutputCount"] = Value::from(0);

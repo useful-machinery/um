@@ -954,8 +954,13 @@ impl Write for FingerprintWriter<'_> {
 }
 
 fn metadata_fingerprint(metadata: &Value) -> Option<MetadataFingerprint> {
+    let carrier_metadata: BTreeMap<_, _> = metadata
+        .as_object()?
+        .iter()
+        .filter(|(name, _)| name.as_str() != "presentation")
+        .collect();
     let mut context = DigestContext::new(&SHA256);
-    serde_json::to_writer(FingerprintWriter(&mut context), metadata).ok()?;
+    serde_json::to_writer(FingerprintWriter(&mut context), &carrier_metadata).ok()?;
     let digest = context.finish();
     let mut fingerprint = [0_u8; 32];
     fingerprint.copy_from_slice(digest.as_ref());
