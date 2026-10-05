@@ -19,24 +19,21 @@ use super::input_transport::PreparedInputTransport;
 use super::result_bridge::{
     IncomingResultRequest, PreparedResultBridge, ResultSocketEvent, ValidatePiResultV1Response,
 };
-use super::{
-    AcceptedPiJsonV1Result, PiJsonV1Parser, PiJsonV1ProcessCompletion, PiJsonV1ProtocolLimits,
-};
-use crate::pi::{PiCompatibilityProfile, compatibility_profile_for_version};
+use super::{AcceptedPiJsonV1Result, PiJsonV1Parser, PiJsonV1ProcessCompletion};
+use crate::pi::compatibility_profile_for_version;
 use crate::workflow::admission::{CancellationReason, CancellationSource};
 use crate::workflow::agent::{
     AgentCompatibilityProfile, AgentFailure, AgentFailureCause, AgentInputKind, AgentInvocation,
-    AgentLifecycleMilestone, AgentObservation, AgentObservationSink, AgentOutcome,
-    AgentProcessDirective, AgentStartCallback, AgentValueKind, AgentValueMode,
-    MAXIMUM_INLINE_AGENT_INPUT_BYTES, PositiveDuration, check_agent_input_bound,
-    failed_agent_outcome, finish_agent_diagnostic_capture, run_cancellable_blocking_launch,
+    AgentLifecycleMilestone, AgentObservation, AgentOutcome, AgentProcessDirective,
+    AgentStartCallback, AgentValueKind, AgentValueMode, MAXIMUM_INLINE_AGENT_INPUT_BYTES,
+    PositiveDuration, check_agent_input_bound, failed_agent_outcome,
+    finish_agent_diagnostic_capture, run_cancellable_blocking_launch,
 };
 use crate::workflow::agent_process_driver::{self, GuardedProcess, Launch, Settlement};
 use crate::workflow::child_guard::ChildGuardCancellation;
 use crate::workflow::coordinator::CoordinatorClock;
 use crate::workflow::diagnostic::StepDiagnosticLog;
 use crate::workflow::observation::{ExecutionObserver, NoopExecutionObserver};
-use crate::workflow::pi::PiConfig;
 use crate::workflow::result_validation::{
     AuthoritativeResultValidator, ProcessResultValidationWorker, ResultValidationDecision,
     ResultValidationOutcome, ResultValidationWorker,
@@ -50,26 +47,7 @@ pub(crate) type PiJsonV1Adapter<
     Worker = ProcessResultValidationWorker,
 > = agent_process_driver::AdapterCore<Clock, Observer, Worker, PiProfile>;
 
-impl<Clock, Observer, Worker, Sink>
-    agent_process_driver::NativeProcessProfile<Clock, Observer, Worker, Sink> for PiProfile
-where
-    Clock: CoordinatorClock,
-    Observer: ExecutionObserver<Clock::Instant>,
-    Worker: ResultValidationWorker,
-    Sink: AgentObservationSink,
-{
-    type Configuration = PiConfig;
-    type Limits = PiJsonV1ProtocolLimits;
-    const NAME: &'static str = "pi_json_v1";
-
-    async fn invoke(
-        adapter: &agent_process_driver::AdapterCore<Clock, Observer, Worker, Self>,
-        invocation: AgentInvocation<PiConfig, PiJsonV1ProtocolLimits, Sink>,
-        started: &AgentStartCallback,
-    ) -> AgentOutcome {
-        adapter.invoke_inner(invocation, started).await
-    }
-}
+agent_process_driver::native_process_adapter!(PiProfile, "pi_json_v1");
 
 impl<Clock, Observer, Worker> agent_process_driver::AdapterCore<Clock, Observer, Worker, PiProfile>
 where
@@ -77,14 +55,11 @@ where
     Observer: ExecutionObserver<Clock::Instant>,
     Worker: ResultValidationWorker,
 {
-    async fn invoke_inner<Sink>(
+    async fn invoke_inner(
         &self,
-        invocation: AgentInvocation<PiConfig, PiJsonV1ProtocolLimits, Sink>,
+        invocation: AgentInvocation,
         started: &AgentStartCallback,
-    ) -> AgentOutcome
-    where
-        Sink: AgentObservationSink,
-    {
+    ) -> AgentOutcome {
         if let Some(reason) = invocation.cancellation().cancellation_reason() {
             return AgentOutcome::Cancelled { reason };
         }
@@ -108,6 +83,12 @@ where
         {
             Ok(prepared) => prepared,
             Err(outcome) => return outcome,
+        };
+        let Some((_, protocol_limits)) = invocation.adapter().native_configuration().pi() else {
+            return failed(AgentFailureCause::start_failure(
+                "harness profile",
+                "mismatch",
+            ));
         };
         // Even without a durable guard store, the stopped-child handshake ensures the
         // process is contained before it can run. Registration is a no-op in that case.
@@ -183,7 +164,7 @@ where
             Arc::clone(&plan.expected_cwd),
             invocation.value_mode().kind(),
             invocation.limits().maximum_response_bytes(),
-            *invocation.limits().adapter_protocol(),
+            protocol_limits,
             expected_result_tool_name,
         );
         let outcome = drive_process(
@@ -214,13 +195,10 @@ where
         outcome
     }
 
-    fn prepare_result_bridge<Sink>(
+    fn prepare_result_bridge(
         &self,
-        invocation: &AgentInvocation<PiConfig, PiJsonV1ProtocolLimits, Sink>,
-    ) -> Result<Option<ActiveResultBridge<Clock, Worker>>, AgentFailureCause>
-    where
-        Sink: AgentObservationSink,
-    {
+        invocation: &AgentInvocation,
+    ) -> Result<Option<ActiveResultBridge<Clock, Worker>>, AgentFailureCause> {
         let AgentValueMode::Result { schema, .. } = invocation.value_mode() else {
             return Ok(None);
         };
@@ -228,7 +206,12 @@ where
             invocation.identity(),
             invocation.staging().result_endpoint_directory(),
             schema,
-            *invocation.limits().adapter_protocol(),
+            invocation
+                .adapter()
+                .native_configuration()
+                .pi()
+                .map(|(_, limits)| limits)
+                .ok_or_else(|| AgentFailureCause::start_failure("harness profile", "mismatch"))?,
             invocation.limits().result_validation_deadline(),
             self.clock.clone(),
         )
@@ -272,12 +255,9 @@ impl PiJsonV1LaunchPlan {
     }
 }
 
-pub(super) fn prepare_launch<Sink>(
-    invocation: &AgentInvocation<PiConfig, PiJsonV1ProtocolLimits, Sink>,
-) -> Result<PiJsonV1LaunchPlan, AgentFailureCause>
-where
-    Sink: AgentObservationSink,
-{
+pub(super) fn prepare_launch(
+    invocation: &AgentInvocation,
+) -> Result<PiJsonV1LaunchPlan, AgentFailureCause> {
     check_agent_input_bound(
         invocation.prompt().message(),
         invocation.limits().maximum_message_bytes(),
@@ -288,7 +268,7 @@ where
         invocation,
         AgentCompatibilityProfile::PiJsonV1,
         compatibility_profile_for_version(invocation.adapter().version())
-            == Some(PiCompatibilityProfile::PiJsonV1),
+            == Some(AgentCompatibilityProfile::PiJsonV1),
         || AgentFailureCause::start_failure("launch preparation", "unavailable"),
     )?;
     agent_process_driver::verify_session_binding(
@@ -336,7 +316,11 @@ where
     )
     .map_err(|error| AgentFailureCause::start_failure("input transport", error))?;
 
-    let config = invocation.adapter().native_configuration();
+    let (config, _) = invocation
+        .adapter()
+        .native_configuration()
+        .pi()
+        .ok_or_else(|| AgentFailureCause::start_failure("harness profile", "mismatch"))?;
     let mut arguments = Vec::with_capacity(15_usize.saturating_add(invocation.attachments().len()));
     arguments.extend([
         OsString::from("--mode"),
@@ -387,13 +371,10 @@ where
 }
 
 #[cfg(test)]
-pub(super) fn build_command<Sink>(
-    invocation: &AgentInvocation<PiConfig, PiJsonV1ProtocolLimits, Sink>,
+pub(super) fn build_command(
+    invocation: &AgentInvocation,
     plan: &PiJsonV1LaunchPlan,
-) -> Result<Command, AgentFailureCause>
-where
-    Sink: AgentObservationSink,
-{
+) -> Result<Command, AgentFailureCause> {
     agent_process_driver::verify_session_binding(
         invocation
             .diagnostic_session()
@@ -418,15 +399,12 @@ where
     Ok(command)
 }
 
-fn launch_guarded_process<Sink>(
-    invocation: &AgentInvocation<PiConfig, PiJsonV1ProtocolLimits, Sink>,
+fn launch_guarded_process(
+    invocation: &AgentInvocation,
     plan: &PiJsonV1LaunchPlan,
     spawn_diagnostics: ProcessSpawnDiagnosticCapture<'_>,
     cancellation: &ChildGuardCancellation,
-) -> Result<(LaunchedPiProcess, ChildStderr), AgentFailureCause>
-where
-    Sink: AgentObservationSink,
-{
+) -> Result<(LaunchedPiProcess, ChildStderr), AgentFailureCause> {
     let environment = invocation
         .process()
         .environment()
@@ -476,14 +454,7 @@ struct ProcessSpawnDiagnosticCapture<'a> {
 }
 
 impl ProcessSpawnDiagnosticCapture<'_> {
-    fn capture<Sink>(
-        self,
-        invocation: &AgentInvocation<PiConfig, PiJsonV1ProtocolLimits, Sink>,
-        error: &io::Error,
-    ) -> AgentFailureCause
-    where
-        Sink: AgentObservationSink,
-    {
+    fn capture(self, invocation: &AgentInvocation, error: &io::Error) -> AgentFailureCause {
         let _ = self.log.record_process_spawn_failure(
             invocation.identity().step().to_owned(),
             invocation.identity().invocation(),
@@ -534,8 +505,8 @@ enum PiExtra {
     SettlementExpired,
 }
 
-struct PiProtocol<'a, Clock, Worker, Sink> {
-    invocation: &'a AgentInvocation<PiConfig, PiJsonV1ProtocolLimits, Sink>,
+struct PiProtocol<'a, Clock, Worker> {
+    invocation: &'a AgentInvocation,
     started: &'a AgentStartCallback,
     parser: PiJsonV1Parser,
     result_bridge: &'a mut Option<ActiveResultBridge<Clock, Worker>>,
@@ -548,12 +519,10 @@ struct PiProtocol<'a, Clock, Worker, Sink> {
     failure: Option<AgentFailure>,
 }
 
-impl<Clock, Worker, Sink> agent_process_driver::Protocol<Clock>
-    for PiProtocol<'_, Clock, Worker, Sink>
+impl<Clock, Worker> agent_process_driver::Protocol<Clock> for PiProtocol<'_, Clock, Worker>
 where
     Clock: CoordinatorClock,
     Worker: ResultValidationWorker,
-    Sink: AgentObservationSink,
 {
     type Extra = PiExtra;
 
@@ -740,8 +709,8 @@ where
     }
 }
 
-async fn drive_process<Clock, Worker, Sink>(
-    invocation: &AgentInvocation<PiConfig, PiJsonV1ProtocolLimits, Sink>,
+async fn drive_process<Clock, Worker>(
+    invocation: &AgentInvocation,
     started: &AgentStartCallback,
     process: LaunchedPiProcess,
     parser: PiJsonV1Parser,
@@ -752,7 +721,6 @@ async fn drive_process<Clock, Worker, Sink>(
 where
     Clock: CoordinatorClock,
     Worker: ResultValidationWorker,
-    Sink: AgentObservationSink,
 {
     let (begin_settlement, settlement_starts) = mpsc::unbounded_channel();
     let (expired, settlement_outcome) = mpsc::unbounded_channel();

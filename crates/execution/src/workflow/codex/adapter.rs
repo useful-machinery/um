@@ -15,21 +15,17 @@ use tokio::net::UnixStream;
 use tokio::sync::mpsc;
 
 use super::input::initial_turn_input;
-use super::{
-    CodexAppServerV1Parser, CodexAppServerV1ProtocolLimits, CodexAppServerV1RejectionReason,
-    ParserProgress,
-};
-use crate::codex::{CodexCompatibilityProfile, compatibility_profile_for_version};
+use super::{CodexAppServerV1Parser, CodexAppServerV1RejectionReason, ParserProgress};
+use crate::codex::compatibility_profile_for_version;
 use crate::workflow::agent::{
     AgentCompatibilityProfile, AgentFailure, AgentFailureCause, AgentHarnessSetupStage,
-    AgentInvocation, AgentLifecycleMilestone, AgentObservation, AgentObservationSink, AgentOutcome,
+    AgentInvocation, AgentLifecycleMilestone, AgentObservation, AgentOutcome,
     AgentProcessDirective, AgentStartCallback, PositiveDuration, failed_agent_outcome,
     finish_agent_diagnostic_capture,
 };
 use crate::workflow::agent_process_driver::{
     self, StdioProcess, WriteDeadline, close_standard_input,
 };
-use crate::workflow::codex::CodexConfig;
 use crate::workflow::coordinator::CoordinatorClock;
 use crate::workflow::diagnostic::StepDiagnosticLog;
 use crate::workflow::observation::ExecutionObserver;
@@ -109,29 +105,8 @@ impl<Clock, Observer, Worker>
     }
 }
 
-impl<Clock, Observer, Worker, Sink>
-    agent_process_driver::NativeProcessProfile<Clock, Observer, Worker, Sink> for CodexProfile
-where
-    Clock: CoordinatorClock,
-    Observer: ExecutionObserver<Clock::Instant>,
-    Worker: ResultValidationWorker,
-    Sink: AgentObservationSink,
-{
-    type Configuration = CodexConfig;
-    type Limits = CodexAppServerV1ProtocolLimits;
-    const NAME: &'static str = "codex_app_server_v1";
+agent_process_driver::native_process_adapter!(CodexProfile, "codex_app_server_v1");
 
-    async fn invoke(
-        adapter: &agent_process_driver::AdapterCore<Clock, Observer, Worker, Self>,
-        invocation: AgentInvocation<CodexConfig, CodexAppServerV1ProtocolLimits, Sink>,
-        started: &AgentStartCallback,
-    ) -> AgentOutcome {
-        adapter.invoke_inner(invocation, started).await
-    }
-}
-
-// Codex setup and result-validator preparation precede the shared process loop;
-// Codex's protocol hooks own native setup and correction transitions.
 impl<Clock, Observer, Worker>
     agent_process_driver::AdapterCore<Clock, Observer, Worker, CodexProfile>
 where
@@ -139,19 +114,23 @@ where
     Observer: ExecutionObserver<Clock::Instant>,
     Worker: ResultValidationWorker,
 {
-    async fn invoke_inner<Sink>(
+    async fn invoke_inner(
         &self,
-        invocation: AgentInvocation<CodexConfig, CodexAppServerV1ProtocolLimits, Sink>,
+        invocation: AgentInvocation,
         started: &AgentStartCallback,
-    ) -> AgentOutcome
-    where
-        Sink: AgentObservationSink,
-    {
+    ) -> AgentOutcome {
         // Setup ordering is part of Codex start authority; keep it local even though the
         // cancellation checkpoints resemble the independent Pi adapter.
         if let Some(reason) = invocation.cancellation().cancellation_reason() {
             return AgentOutcome::Cancelled { reason };
         }
+        let Some((configuration, protocol_limits)) =
+            invocation.adapter().native_configuration().codex()
+        else {
+            return failed_agent_outcome(setup_failure(AgentHarnessSetupStage::ExecutableLaunch));
+        };
+        let model: Arc<str> = Arc::from(configuration.model.as_str());
+        let effort: Arc<str> = Arc::from(configuration.effort.as_str());
         let (invocation, plan) = match self
             .prepare_invocation(
                 invocation,
@@ -176,7 +155,6 @@ where
             Err(outcome) => return outcome,
         };
         let diagnostic = self.start_diagnostic(&invocation, standard_error);
-        let configuration = invocation.adapter().native_configuration();
         let expected_cwd = Arc::clone(&plan.expected_cwd);
         let codex_home = Arc::clone(&plan.codex_home);
         let sqlite_home = Arc::clone(&plan.sqlite_home);
@@ -187,14 +165,14 @@ where
             sqlite_home,
             Arc::clone(&self.profile.client_version),
             Arc::from(invocation.adapter().version()),
-            Arc::from(configuration.model.as_str()),
-            Arc::from(configuration.effort.as_str()),
+            model,
+            effort,
             Arc::from(invocation.prompt().system_prompt()),
             initial_input,
             self.profile.selected_model_provider(),
             invocation.value_mode().kind(),
             invocation.limits().maximum_response_bytes(),
-            *invocation.limits().adapter_protocol(),
+            protocol_limits,
         ) {
             Ok(parser) => parser,
             Err(cause) => {
@@ -215,14 +193,8 @@ where
             ProcessTimingConfiguration {
                 clock: self.clock.clone(),
                 result_settlement_grace: invocation.limits().result_settlement_grace(),
-                standard_input_write_timeout: invocation
-                    .limits()
-                    .adapter_protocol()
-                    .standard_input_write_timeout(),
-                post_failure_cleanup_timeout: invocation
-                    .limits()
-                    .adapter_protocol()
-                    .post_failure_cleanup_timeout(),
+                standard_input_write_timeout: protocol_limits.standard_input_write_timeout(),
+                post_failure_cleanup_timeout: protocol_limits.post_failure_cleanup_timeout(),
             },
         )
         .await;
@@ -270,18 +242,15 @@ impl CodexAppServerV1LaunchPlan {
     }
 }
 
-pub(super) fn prepare_launch<Sink>(
-    invocation: &AgentInvocation<CodexConfig, CodexAppServerV1ProtocolLimits, Sink>,
-) -> Result<CodexAppServerV1LaunchPlan, AgentFailureCause>
-where
-    Sink: AgentObservationSink,
-{
+pub(super) fn prepare_launch(
+    invocation: &AgentInvocation,
+) -> Result<CodexAppServerV1LaunchPlan, AgentFailureCause> {
     agent_process_driver::check_prompt_bounds(invocation)?;
     agent_process_driver::require_native_profile(
         invocation,
         AgentCompatibilityProfile::CodexAppServerV1,
         compatibility_profile_for_version(invocation.adapter().version())
-            == Some(CodexCompatibilityProfile::CodexAppServerV1),
+            == Some(AgentCompatibilityProfile::CodexAppServerV1),
         || setup_failure(AgentHarnessSetupStage::ExecutableLaunch),
     )?;
     agent_process_driver::verify_session_binding(
@@ -388,25 +357,16 @@ fn prepare_sqlite_state(
 
 type LaunchedCodexProcess = StdioProcess;
 
-impl<Sink: AgentObservationSink>
-    agent_process_driver::StdioLaunchPlan<CodexConfig, CodexAppServerV1ProtocolLimits, Sink>
-    for CodexAppServerV1LaunchPlan
-{
+impl agent_process_driver::StdioLaunchPlan for CodexAppServerV1LaunchPlan {
     fn arguments(&self) -> &[OsString] {
         &self.arguments
     }
-    fn environment(
-        &self,
-        invocation: &AgentInvocation<CodexConfig, CodexAppServerV1ProtocolLimits, Sink>,
-    ) -> Vec<(OsString, OsString)> {
+    fn environment(&self, invocation: &AgentInvocation) -> Vec<(OsString, OsString)> {
         agent_process_driver::invocation_environment(invocation)
             .into_iter()
             .collect()
     }
-    fn verify_binding(
-        &self,
-        invocation: &AgentInvocation<CodexConfig, CodexAppServerV1ProtocolLimits, Sink>,
-    ) -> Result<(), AgentFailureCause> {
+    fn verify_binding(&self, invocation: &AgentInvocation) -> Result<(), AgentFailureCause> {
         agent_process_driver::verify_session_binding(
             invocation.diagnostic_session().verify_path_binding(),
             "codex diagnostic session binding",
@@ -438,8 +398,8 @@ enum CodexExtra {
     SettlementDeadline,
 }
 
-struct CodexProtocol<'a, Clock, Worker, Sink> {
-    invocation: &'a AgentInvocation<CodexConfig, CodexAppServerV1ProtocolLimits, Sink>,
+struct CodexProtocol<'a, Clock, Worker> {
+    invocation: &'a AgentInvocation,
     started: &'a AgentStartCallback,
     parser: CodexAppServerV1Parser,
     result_validator: Option<AuthoritativeResultValidator<Clock, Worker>>,
@@ -457,11 +417,10 @@ struct CodexProtocol<'a, Clock, Worker, Sink> {
     failure: Option<AgentFailureCause>,
 }
 
-impl<Clock, Worker, Sink> CodexProtocol<'_, Clock, Worker, Sink>
+impl<Clock, Worker> CodexProtocol<'_, Clock, Worker>
 where
     Clock: CoordinatorClock,
     Worker: ResultValidationWorker,
-    Sink: AgentObservationSink,
 {
     fn arm_cleanup(&mut self, mut clock: Clock) {
         let deadline = clock.now() + self.cleanup_timeout;
@@ -490,12 +449,10 @@ where
     }
 }
 
-impl<Clock, Worker, Sink> agent_process_driver::Protocol<Clock>
-    for CodexProtocol<'_, Clock, Worker, Sink>
+impl<Clock, Worker> agent_process_driver::Protocol<Clock> for CodexProtocol<'_, Clock, Worker>
 where
     Clock: CoordinatorClock,
     Worker: ResultValidationWorker,
-    Sink: AgentObservationSink,
 {
     type Extra = CodexExtra;
 
@@ -855,8 +812,8 @@ where
     }
 }
 
-async fn drive_process<Clock, Worker, Sink>(
-    invocation: &AgentInvocation<CodexConfig, CodexAppServerV1ProtocolLimits, Sink>,
+async fn drive_process<Clock, Worker>(
+    invocation: &AgentInvocation,
     started: &AgentStartCallback,
     process: LaunchedCodexProcess,
     parser: CodexAppServerV1Parser,
@@ -867,7 +824,6 @@ async fn drive_process<Clock, Worker, Sink>(
 where
     Clock: CoordinatorClock,
     Worker: ResultValidationWorker,
-    Sink: AgentObservationSink,
 {
     let (cooperative_interrupt, cooperative_interrupts) = mpsc::unbounded_channel();
     let protocol = CodexProtocol {
@@ -980,13 +936,10 @@ async fn write_pending_frames<Clock: CoordinatorClock>(
     Err(failure)
 }
 
-async fn emit_observations<Sink>(
-    invocation: &AgentInvocation<CodexConfig, CodexAppServerV1ProtocolLimits, Sink>,
+async fn emit_observations(
+    invocation: &AgentInvocation,
     observations: Vec<AgentObservation>,
-) -> Result<(), ()>
-where
-    Sink: AgentObservationSink,
-{
+) -> Result<(), ()> {
     for observation in observations {
         invocation
             .observations()

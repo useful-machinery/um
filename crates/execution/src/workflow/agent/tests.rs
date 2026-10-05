@@ -6,14 +6,13 @@ use std::time::Duration;
 use serde_json::json;
 use tokio::sync::mpsc;
 
-use super::dispatch::invoke_agent_dispatcher;
+use super::dispatch::AgentInvocationDispatcher;
 use super::scripted::{ScriptedAgentControl, ScriptedAgentValue, scripted_agent_dispatcher};
 use super::*;
-use crate::workflow::admission::{CancellationReason, EnvironmentSnapshot};
-use crate::workflow::agent_input::ClosedAgentInvocation;
+use crate::workflow::admission::EnvironmentSnapshot;
 use crate::workflow::execution_root::AdmittedExecutionRoot;
+use crate::workflow::pi::PiJsonV1ProtocolLimits;
 use crate::workflow::pi::{PiConfig, Thinking};
-use crate::workflow::pi_json_v1::PiJsonV1ProtocolLimits;
 use crate::workflow::runtime::TransitionSequence;
 use crate::workflow::validated::WorkflowValueType;
 
@@ -44,23 +43,7 @@ impl AgentObservationSink for RecordingObservationSink {
     }
 }
 
-type TestInvocation = AgentInvocation<PiConfig, PiJsonV1ProtocolLimits, RecordingObservationSink>;
-
-#[derive(Clone, Copy)]
-struct ReturningWithoutTerminalAdapter;
-
-impl AgentAdapter<RecordingObservationSink> for ReturningWithoutTerminalAdapter {
-    type NativeConfiguration = PiConfig;
-    type ProtocolLimits = PiJsonV1ProtocolLimits;
-
-    async fn invoke(
-        &self,
-        _invocation: TestInvocation,
-        _started: AgentStartCallback,
-        _terminal: AgentTerminalCallback,
-    ) {
-    }
-}
+type TestInvocation = AgentInvocation;
 
 struct InvocationFixture {
     _temporary: tempfile::TempDir,
@@ -69,8 +52,6 @@ struct InvocationFixture {
     observations: mpsc::UnboundedReceiver<AgentObservationEnvelope>,
     start_callback: AgentStartCallback,
     started: AgentStartReceiver,
-    terminal_callback: AgentTerminalCallback,
-    terminal: AgentTerminalReceiver,
 }
 
 fn invocation_fixture(value_mode: AgentValueMode) -> InvocationFixture {
@@ -133,7 +114,6 @@ fn invocation_fixture(value_mode: AgentValueMode) -> InvocationFixture {
         },
     );
     let (start_callback, started) = agent_start_channel();
-    let (terminal_callback, terminal) = agent_terminal_channel(&value_mode);
     InvocationFixture {
         _temporary: temporary,
         invocation,
@@ -141,8 +121,6 @@ fn invocation_fixture(value_mode: AgentValueMode) -> InvocationFixture {
         observations,
         start_callback,
         started,
-        terminal_callback,
-        terminal,
     }
 }
 
@@ -168,23 +146,16 @@ async fn start_script(
     fixture: InvocationFixture,
 ) -> (
     ScriptedAgentControl,
-    tokio::task::JoinHandle<()>,
+    tokio::task::JoinHandle<AgentOutcome>,
     CancellationSource,
     mpsc::UnboundedReceiver<AgentObservationEnvelope>,
-    AgentTerminalReceiver,
-    AgentTerminalCallback,
 ) {
     let expected_value_kind = fixture.invocation.value_mode().kind();
-    let terminal_probe = fixture.terminal_callback.clone();
     let (adapter, mut control) = scripted_agent_dispatcher();
     let task = tokio::spawn(async move {
-        invoke_agent_dispatcher(
-            &adapter,
-            ClosedAgentInvocation::Pi(fixture.invocation),
-            fixture.start_callback,
-            fixture.terminal_callback,
-        )
-        .await;
+        adapter
+            .invoke(fixture.invocation, fixture.start_callback)
+            .await
     });
     let invocation = control.wait_until_started().await.unwrap();
     assert_eq!(invocation.identity().run().as_ref(), "run-fixed");
@@ -192,32 +163,7 @@ async fn start_script(
     assert_eq!(invocation.value_kind(), expected_value_kind);
     invocation.control().start().await.unwrap();
     fixture.started.receive().await.unwrap();
-    (
-        control,
-        task,
-        fixture.cancellation,
-        fixture.observations,
-        fixture.terminal,
-        terminal_probe,
-    )
-}
-
-#[tokio::test]
-async fn adapter_return_without_terminal_report_becomes_protocol_failure() {
-    let fixture = invocation_fixture(AgentValueMode::None);
-
-    invoke_agent_adapter(
-        &ReturningWithoutTerminalAdapter,
-        fixture.invocation,
-        fixture.start_callback,
-        fixture.terminal_callback,
-    )
-    .await;
-
-    assert_eq!(
-        fixture.terminal.receive().await.unwrap(),
-        failed_agent_outcome(AgentFailureCause::HarnessProtocolFailed)
-    );
+    (control, task, fixture.cancellation, fixture.observations)
 }
 
 #[tokio::test]
@@ -301,14 +247,13 @@ async fn run_success(
     proposal: Option<ScriptedAgentValue>,
 ) -> AgentOutcome {
     let expected_kind = value_mode.kind();
-    let (control, task, _cancellation, _observations, terminal, _terminal_probe) =
+    let (control, task, _cancellation, _observations) =
         start_script(invocation_fixture(value_mode)).await;
     if let Some(proposal) = proposal {
         control.propose(proposal).await.unwrap();
     }
     control.complete().await.unwrap();
-    let outcome = terminal.receive().await.unwrap();
-    task.await.unwrap();
+    let outcome = task.await.unwrap();
     assert!(matches!(
         (&outcome, expected_kind),
         (
@@ -365,8 +310,7 @@ async fn observations_are_repeatable_ordered_and_never_terminal() {
 
 async fn run_observation_transcript() -> Vec<AgentObservationEnvelope> {
     let fixture = invocation_fixture(AgentValueMode::None);
-    let (control, task, _cancellation, mut observations, terminal, terminal_probe) =
-        start_script(fixture).await;
+    let (control, task, _cancellation, mut observations) = start_script(fixture).await;
     let transcript = [
         AgentObservation::Lifecycle {
             milestone: AgentLifecycleMilestone::HarnessStarted,
@@ -393,19 +337,16 @@ async fn run_observation_transcript() -> Vec<AgentObservationEnvelope> {
     for observation in transcript.iter().cloned() {
         control.observe(observation).await.unwrap();
     }
-    assert!(!terminal_probe.has_reported());
 
     let mut recorded = Vec::new();
     for _ in 0..transcript.len() {
         recorded.push(observations.recv().await.unwrap());
     }
     control.complete().await.unwrap();
-    assert!(terminal_probe.has_reported());
     assert_eq!(
-        terminal.receive().await.unwrap(),
+        task.await.unwrap(),
         AgentOutcome::Completed(CompletedAgentInvocation::NoValue)
     );
-    task.await.unwrap();
     recorded
 }
 
@@ -424,40 +365,4 @@ fn start_callback_accepts_one_acknowledgement() {
         .build()
         .unwrap();
     assert_eq!(runtime.block_on(receiver.receive()), Ok(()));
-}
-
-#[test]
-fn terminal_callback_accepts_one_mode_matching_outcome() {
-    let value_mode = AgentValueMode::Response {
-        output: Arc::from("response"),
-    };
-    let (terminal, receiver) = agent_terminal_channel(&value_mode);
-    let competing_callback = terminal.clone();
-
-    assert_eq!(
-        terminal.report(AgentOutcome::Completed(CompletedAgentInvocation::NoValue)),
-        Err(AgentTerminalReportError::CompletionModeMismatch)
-    );
-    assert_eq!(
-        terminal.report(AgentOutcome::Completed(CompletedAgentInvocation::Response(
-            BoundedAgentResponse::from_bounded(Arc::from("winner")),
-        ))),
-        Ok(())
-    );
-    assert_eq!(
-        competing_callback.report(AgentOutcome::Cancelled {
-            reason: CancellationReason::TerminationRequest,
-        }),
-        Err(AgentTerminalReportError::AlreadyReported)
-    );
-
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .build()
-        .unwrap();
-    assert_eq!(
-        runtime.block_on(receiver.receive()).unwrap(),
-        AgentOutcome::Completed(CompletedAgentInvocation::Response(
-            BoundedAgentResponse::from_bounded(Arc::from("winner"))
-        ))
-    );
 }

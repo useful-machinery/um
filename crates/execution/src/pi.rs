@@ -10,6 +10,7 @@ use super::harness_installation::{
 #[cfg(test)]
 use crate::process::CommandRunner;
 use crate::process::{CommandOutput, SystemCommandRunner};
+use crate::workflow::agent::AgentCompatibilityProfile;
 use std::ffi::OsStr;
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -35,19 +36,6 @@ const REQUIRED_CAPABILITIES: [PiCapability; 5] = [
     PiCapability::SystemPromptAppend,
     PiCapability::InvocationScopedProjectTrust,
 ];
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum PiCompatibilityProfile {
-    PiJsonV1,
-}
-
-impl PiCompatibilityProfile {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::PiJsonV1 => "PiJsonV1",
-        }
-    }
-}
 
 pub(crate) type PiVersion = StableVersion;
 
@@ -97,7 +85,6 @@ impl PiJsonV1Capabilities {
 pub struct ValidatedPiInstallation {
     executable: PathBuf,
     version: PiVersion,
-    profile: PiCompatibilityProfile,
     capabilities: PiJsonV1Capabilities,
 }
 
@@ -107,7 +94,6 @@ impl ValidatedPiInstallation {
         Self {
             executable,
             version: PiVersion::fixture(0, 87, 1, PI_JSON_V1_QUALIFICATION_VERSION),
-            profile: PiCompatibilityProfile::PiJsonV1,
             capabilities: PiJsonV1Capabilities {
                 required: REQUIRED_CAPABILITIES,
             },
@@ -122,8 +108,8 @@ impl ValidatedPiInstallation {
         &self.version
     }
 
-    pub const fn profile(&self) -> PiCompatibilityProfile {
-        self.profile
+    pub const fn profile(&self) -> AgentCompatibilityProfile {
+        AgentCompatibilityProfile::PiJsonV1
     }
 
     pub const fn capabilities(&self) -> &PiJsonV1Capabilities {
@@ -208,7 +194,7 @@ struct PiInstallationProfile;
 
 impl HarnessInstallationProfile for PiInstallationProfile {
     type Version = PiVersion;
-    type CompatibilityProfile = PiCompatibilityProfile;
+    type CompatibilityProfile = AgentCompatibilityProfile;
     type Capabilities = PiJsonV1Capabilities;
     type Installation = ValidatedPiInstallation;
     type Failure = PiInstallationFailure;
@@ -269,11 +255,10 @@ impl HarnessInstallationProfile for PiInstallationProfile {
             Self::Capabilities,
         >,
     ) -> Self::Installation {
-        let (executable, version, profile, capabilities) = parts.into_parts();
+        let (executable, version, _profile, capabilities) = parts.into_parts();
         ValidatedPiInstallation {
             executable,
             version,
-            profile,
             capabilities,
         }
     }
@@ -323,13 +308,15 @@ fn parse_version_output(output: &CommandOutput) -> Result<PiVersion, PiInstallat
     PiVersion::parse(version).ok_or_else(malformed)
 }
 
-fn compatibility_profile(version: &PiVersion) -> Option<PiCompatibilityProfile> {
+fn compatibility_profile(version: &PiVersion) -> Option<AgentCompatibilityProfile> {
     (version.numeric() >= PI_JSON_V1_MINIMUM_VERSION
         && version.numeric() < PI_JSON_V1_MAXIMUM_VERSION)
-        .then_some(PiCompatibilityProfile::PiJsonV1)
+        .then_some(AgentCompatibilityProfile::PiJsonV1)
 }
 
-pub(crate) fn compatibility_profile_for_version(observed: &str) -> Option<PiCompatibilityProfile> {
+pub(crate) fn compatibility_profile_for_version(
+    observed: &str,
+) -> Option<AgentCompatibilityProfile> {
     compatibility_profile(&PiVersion::parse(observed)?)
 }
 

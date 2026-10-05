@@ -8,7 +8,6 @@ use rustix::fs::{
     AtFlags, FileType, Mode, OFlags, chmodat, fchmod, fstat, mkdirat, openat, statat, unlinkat,
 };
 use rustix::io::{Errno, dup};
-use serde::Serialize;
 
 use super::agent::{
     AgentCompatibilityProfile, AgentInvocationIdentity, AgentOutcome,
@@ -23,7 +22,6 @@ const CODEX_APP_SERVER_V1_DIRECTORY: &str = "codex-app-server-v1";
 const NATIVE_SESSION_DIRECTORY: &str = "session";
 const CLAUDE_CODE_TRANSCRIPT_FILE: &str = "transcript.jsonl";
 const CLAUDE_CODE_RESOURCES_DIRECTORY: &str = "resources";
-const CLAUDE_CODE_NATIVE_SESSION_FORMAT_VERSION: u8 = 1;
 const METADATA_FILE: &str = "metadata.json";
 const PROTOCOL_REJECTION_FILE: &str = "protocol-rejection.json";
 const MAXIMUM_PROTOCOL_REJECTION_BYTES: usize = 16 * 1024;
@@ -92,51 +90,6 @@ struct ClaudeCodeNativeDiagnosticSession {
     directory_handle: Arc<OwnedFd>,
     resources_directory_handle: Arc<OwnedFd>,
     session_id: Arc<str>,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct PiDiagnosticSessionMetadata<'a> {
-    schema_version: u8,
-    local_run_id: &'a str,
-    attempt_number: u64,
-    step_id: &'a str,
-    invocation_id: u64,
-    profile: &'static str,
-    pi_version: &'a str,
-    native_session: NativeSessionMetadata,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct NativeSessionMetadata {
-    relative_directory: &'static str,
-    format_version: u8,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct ClaudeCodeDiagnosticSessionMetadata<'a> {
-    schema_version: u8,
-    local_run_id: &'a str,
-    attempt_number: u64,
-    step_id: &'a str,
-    invocation_id: u64,
-    profile: &'static str,
-    claude_code_version: &'a str,
-    native_session: NativeSessionMetadata,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct CodexDiagnosticSessionMetadata<'a> {
-    schema_version: u8,
-    local_run_id: &'a str,
-    attempt_number: u64,
-    step_id: &'a str,
-    invocation_id: u64,
-    profile: &'static str,
-    codex_version: &'a str,
 }
 
 impl AgentCompatibilityProfile {
@@ -380,50 +333,47 @@ fn metadata_bytes(
     profile: AgentCompatibilityProfile,
     harness_version: &str,
 ) -> Result<Vec<u8>, AgentDiagnosticSessionError> {
-    let mut bytes = match profile {
-        AgentCompatibilityProfile::PiJsonV1 => {
-            serde_json::to_vec_pretty(&PiDiagnosticSessionMetadata {
-                schema_version: 1,
-                local_run_id: &owner.local_run_id,
-                attempt_number: owner.attempt_number,
-                step_id: identity.step(),
-                invocation_id: identity.invocation().transition_sequence.get(),
-                profile: "PiJsonV1",
-                pi_version: harness_version,
-                native_session: NativeSessionMetadata {
-                    relative_directory: NATIVE_SESSION_DIRECTORY,
-                    format_version: 3,
-                },
-            })
-        }
-        AgentCompatibilityProfile::ClaudeCodeStreamJsonV1 => {
-            serde_json::to_vec_pretty(&ClaudeCodeDiagnosticSessionMetadata {
-                schema_version: 1,
-                local_run_id: &owner.local_run_id,
-                attempt_number: owner.attempt_number,
-                step_id: identity.step(),
-                invocation_id: identity.invocation().transition_sequence.get(),
-                profile: "ClaudeCodeStreamJsonV1",
-                claude_code_version: harness_version,
-                native_session: NativeSessionMetadata {
-                    relative_directory: NATIVE_SESSION_DIRECTORY,
-                    format_version: CLAUDE_CODE_NATIVE_SESSION_FORMAT_VERSION,
-                },
-            })
-        }
-        AgentCompatibilityProfile::CodexAppServerV1 => {
-            serde_json::to_vec_pretty(&CodexDiagnosticSessionMetadata {
-                schema_version: 1,
-                local_run_id: &owner.local_run_id,
-                attempt_number: owner.attempt_number,
-                step_id: identity.step(),
-                invocation_id: identity.invocation().transition_sequence.get(),
-                profile: "CodexAppServerV1",
-                codex_version: harness_version,
-            })
-        }
-    }
-    .map_err(|error| AgentDiagnosticSessionError::at("diagnostic I/O", error))?;
+    // These are wire-format versions, not invocation state. Keep the versioned
+    // diagnostic contract without carrying unread fields on internal types.
+    let metadata = match profile {
+        AgentCompatibilityProfile::PiJsonV1 => serde_json::json!({
+            "schemaVersion": 1,
+            "localRunId": owner.local_run_id.as_ref(),
+            "attemptNumber": owner.attempt_number,
+            "stepId": identity.step(),
+            "invocationId": identity.invocation().transition_sequence.get(),
+            "profile": "PiJsonV1",
+            "piVersion": harness_version,
+            "nativeSession": {
+                "relativeDirectory": NATIVE_SESSION_DIRECTORY,
+                "formatVersion": 3
+            }
+        }),
+        AgentCompatibilityProfile::ClaudeCodeStreamJsonV1 => serde_json::json!({
+            "schemaVersion": 1,
+            "localRunId": owner.local_run_id.as_ref(),
+            "attemptNumber": owner.attempt_number,
+            "stepId": identity.step(),
+            "invocationId": identity.invocation().transition_sequence.get(),
+            "profile": "ClaudeCodeStreamJsonV1",
+            "claudeCodeVersion": harness_version,
+            "nativeSession": {
+                "relativeDirectory": NATIVE_SESSION_DIRECTORY,
+                "formatVersion": 1
+            }
+        }),
+        AgentCompatibilityProfile::CodexAppServerV1 => serde_json::json!({
+            "schemaVersion": 1,
+            "localRunId": owner.local_run_id.as_ref(),
+            "attemptNumber": owner.attempt_number,
+            "stepId": identity.step(),
+            "invocationId": identity.invocation().transition_sequence.get(),
+            "profile": "CodexAppServerV1",
+            "codexVersion": harness_version
+        }),
+    };
+    let mut bytes = serde_json::to_vec_pretty(&metadata)
+        .map_err(|error| AgentDiagnosticSessionError::at("diagnostic I/O", error))?;
     bytes.push(b'\n');
     Ok(bytes)
 }
@@ -721,7 +671,7 @@ mod tests {
 
     use super::*;
     use crate::workflow::agent::{AgentOutcome, AgentValueKind, WorkflowRunId};
-    use crate::workflow::pi_json_v1::{PiJsonV1Parser, PiJsonV1ProcessCompletion};
+    use crate::workflow::pi::{PiJsonV1Parser, PiJsonV1ProcessCompletion};
     use crate::workflow::runtime::{ActionId, TransitionSequence};
 
     fn diagnostic_store(temporary: &tempfile::TempDir) -> (PathBuf, AgentDiagnosticSessionStore) {

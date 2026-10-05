@@ -1,24 +1,15 @@
-use std::marker::PhantomData;
 use std::sync::Arc;
 
 use serde_json::Value;
 use tokio::sync::{mpsc, oneshot};
 
-use super::dispatch::ClosedAgentDispatcher;
 use super::{
-    AgentAdapter, AgentCompatibilityProfile, AgentFailureCause, AgentInvocation,
-    AgentInvocationIdentity, AgentObservation, AgentObservationEmissionError, AgentObservationSink,
-    AgentOutcome, AgentStartCallback, AgentStartReportError, AgentTerminalCallback,
-    AgentTerminalReportError, AgentValueKind, AgentValueMode, BoundedAgentResponse, CapturedJson,
+    AgentCompatibilityProfile, AgentFailureCause, AgentInvocation, AgentInvocationIdentity,
+    AgentObservation, AgentObservationEmissionError, AgentOutcome, AgentStartCallback,
+    AgentStartReportError, AgentValueKind, AgentValueMode, BoundedAgentResponse, CapturedJson,
     CompletedAgentInvocation, failed_agent_outcome,
 };
 use crate::workflow::canonical_json;
-use crate::workflow::claude_code::ClaudeCodeConfig;
-use crate::workflow::claude_code_stream_json_v1::ClaudeCodeStreamJsonV1ProtocolLimits;
-use crate::workflow::codex::CodexConfig;
-use crate::workflow::codex_app_server_v1::CodexAppServerV1ProtocolLimits;
-use crate::workflow::pi::PiConfig;
-use crate::workflow::pi_json_v1::PiJsonV1ProtocolLimits;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum ScriptedAgentValue {
@@ -100,25 +91,10 @@ impl ScriptedInvocationStarted {
     }
 }
 
-pub(crate) struct ScriptedNativeAdapter<Configuration, ProtocolLimits> {
+#[derive(Clone)]
+pub(crate) struct ScriptedAgentDispatcher {
     started: mpsc::UnboundedSender<ScriptedInvocationStarted>,
-    native_types: PhantomData<fn() -> (Configuration, ProtocolLimits)>,
 }
-
-impl<Configuration, ProtocolLimits> Clone for ScriptedNativeAdapter<Configuration, ProtocolLimits> {
-    fn clone(&self) -> Self {
-        Self {
-            started: self.started.clone(),
-            native_types: PhantomData,
-        }
-    }
-}
-
-pub(crate) type ScriptedAgentDispatcher = ClosedAgentDispatcher<
-    ScriptedNativeAdapter<PiConfig, PiJsonV1ProtocolLimits>,
-    ScriptedNativeAdapter<ClaudeCodeConfig, ClaudeCodeStreamJsonV1ProtocolLimits>,
-    ScriptedNativeAdapter<CodexConfig, CodexAppServerV1ProtocolLimits>,
->;
 
 pub(crate) struct ScriptedAgentControl {
     current: Option<ScriptedInvocationControl>,
@@ -182,13 +158,10 @@ impl ScriptedBarrier {
 pub(crate) enum ScriptedAgentError {
     AdapterStopped,
     BarrierAlreadyReleased,
-    CompletionModeMismatch,
     InvocationAlreadyStarted,
     InvocationCancelled,
     InvocationNotStarted,
     ObservationSequenceExhausted,
-    TerminalAlreadyReported,
-    TerminalReceiverClosed,
     ValueAlreadyProposed,
     ValueTooLarge,
     WrongValueMode,
@@ -196,21 +169,10 @@ pub(crate) enum ScriptedAgentError {
 
 pub(crate) fn scripted_agent_dispatcher() -> (ScriptedAgentDispatcher, ScriptedAgentControl) {
     let (started_sender, started) = mpsc::unbounded_channel();
-    let pi = ScriptedNativeAdapter::<PiConfig, PiJsonV1ProtocolLimits> {
-        started: started_sender.clone(),
-        native_types: PhantomData,
-    };
-    let claude_code =
-        ScriptedNativeAdapter::<ClaudeCodeConfig, ClaudeCodeStreamJsonV1ProtocolLimits> {
-            started: started_sender.clone(),
-            native_types: PhantomData,
-        };
-    let codex = ScriptedNativeAdapter::<CodexConfig, CodexAppServerV1ProtocolLimits> {
-        started: started_sender,
-        native_types: PhantomData,
-    };
     (
-        ClosedAgentDispatcher::new(pi, claude_code, codex),
+        ScriptedAgentDispatcher {
+            started: started_sender,
+        },
         ScriptedAgentControl {
             current: None,
             started,
@@ -336,27 +298,16 @@ async fn receive_acknowledgement(
         .map_err(|_| ScriptedAgentError::AdapterStopped)?
 }
 
-impl<Sink, Configuration, ProtocolLimits> AgentAdapter<Sink>
-    for ScriptedNativeAdapter<Configuration, ProtocolLimits>
-where
-    Sink: AgentObservationSink,
-    Configuration: Send + Sync + 'static,
-    ProtocolLimits: Send + Sync + 'static,
-{
-    type NativeConfiguration = Configuration;
-    type ProtocolLimits = ProtocolLimits;
-
+impl super::AgentAdapter for ScriptedAgentDispatcher {
     async fn invoke(
         &self,
-        invocation: AgentInvocation<Configuration, ProtocolLimits, Sink>,
+        invocation: AgentInvocation,
         started: AgentStartCallback,
-        terminal: AgentTerminalCallback,
-    ) {
+    ) -> AgentOutcome {
         let (command_sender, mut commands) = mpsc::unbounded_channel();
         let mut cancellation = invocation.cancellation().subscribe();
         if let Some(reason) = *cancellation.borrow_and_update() {
-            let _ = terminal.report(AgentOutcome::Cancelled { reason });
-            return;
+            return AgentOutcome::Cancelled { reason };
         }
         if self
             .started
@@ -380,10 +331,7 @@ where
             })
             .is_err()
         {
-            let _ = terminal.report(failed_agent_outcome(
-                AgentFailureCause::HarnessProtocolFailed,
-            ));
-            return;
+            return failed_agent_outcome(AgentFailureCause::HarnessProtocolFailed);
         }
 
         let mut lifecycle_started = false;
@@ -391,23 +339,18 @@ where
         loop {
             if let Some(reason) = invocation.cancellation().cancellation_reason() {
                 drop(provisional.take());
-                let _ = terminal.report(AgentOutcome::Cancelled { reason });
-                return;
+                return AgentOutcome::Cancelled { reason };
             }
 
             tokio::select! {
                 biased;
                 changed = cancellation.changed() => {
                     if changed.is_err() {
-                        let _ = terminal.report(failed_agent_outcome(
-                            AgentFailureCause::HarnessProtocolFailed,
-                        ));
-                        return;
+                        return failed_agent_outcome(AgentFailureCause::HarnessProtocolFailed);
                     }
                     if let Some(reason) = *cancellation.borrow_and_update() {
                         drop(provisional.take());
-                        let _ = terminal.report(AgentOutcome::Cancelled { reason });
-                        return;
+                        return AgentOutcome::Cancelled { reason };
                     }
                 }
                 command = commands.recv() => {
@@ -466,9 +409,8 @@ where
                             let outcome = cancellation_outcome(&invocation).unwrap_or_else(|| {
                                 completed_outcome(&invocation, provisional.take())
                             });
-                            let result = terminal.report(outcome).map_err(ScriptedAgentError::from);
-                            let _ = acknowledged.send(result);
-                            return;
+                            let _ = acknowledged.send(Ok(()));
+                            return outcome;
                         }
                         ScriptedCommand::Fail {
                             cause,
@@ -476,29 +418,24 @@ where
                         } => {
                             let outcome = cancellation_outcome(&invocation)
                                 .unwrap_or_else(|| failed_agent_outcome(cause));
-                            let result = terminal.report(outcome).map_err(ScriptedAgentError::from);
-                            let _ = acknowledged.send(result);
-                            return;
+                            let _ = acknowledged.send(Ok(()));
+                            return outcome;
                         }
                     }
                 }
             }
         }
 
-        let outcome = cancellation_outcome(&invocation)
-            .unwrap_or_else(|| failed_agent_outcome(AgentFailureCause::HarnessProtocolFailed));
-        let _ = terminal.report(outcome);
+        cancellation_outcome(&invocation)
+            .unwrap_or_else(|| failed_agent_outcome(AgentFailureCause::HarnessProtocolFailed))
     }
 }
 
-fn propose_value<Configuration, ProtocolLimits, Sink>(
-    invocation: &AgentInvocation<Configuration, ProtocolLimits, Sink>,
+fn propose_value(
+    invocation: &AgentInvocation,
     provisional: &mut Option<CompletedAgentInvocation>,
     value: ScriptedAgentValue,
-) -> Result<(), ScriptedAgentError>
-where
-    Sink: AgentObservationSink,
-{
+) -> Result<(), ScriptedAgentError> {
     if invocation.cancellation().is_cancelled() {
         return Err(ScriptedAgentError::InvocationCancelled);
     }
@@ -526,13 +463,10 @@ where
     Ok(())
 }
 
-fn captured_json<Configuration, ProtocolLimits, Sink>(
-    invocation: &AgentInvocation<Configuration, ProtocolLimits, Sink>,
+fn captured_json(
+    invocation: &AgentInvocation,
     value: Arc<Value>,
-) -> Result<CapturedJson, ScriptedAgentError>
-where
-    Sink: AgentObservationSink,
-{
+) -> Result<CapturedJson, ScriptedAgentError> {
     let AgentValueMode::Result { schema, .. } = invocation.value_mode() else {
         return Err(ScriptedAgentError::WrongValueMode);
     };
@@ -549,13 +483,10 @@ where
     Ok(CapturedJson::from_validated(value, carrier, schema.clone()))
 }
 
-fn completed_outcome<Configuration, ProtocolLimits, Sink>(
-    invocation: &AgentInvocation<Configuration, ProtocolLimits, Sink>,
+fn completed_outcome(
+    invocation: &AgentInvocation,
     provisional: Option<CompletedAgentInvocation>,
-) -> AgentOutcome
-where
-    Sink: AgentObservationSink,
-{
+) -> AgentOutcome {
     match (invocation.value_mode().kind(), provisional) {
         (AgentValueKind::None, None) => AgentOutcome::Completed(CompletedAgentInvocation::NoValue),
         (AgentValueKind::Response, Some(completed @ CompletedAgentInvocation::Response(_)))
@@ -574,12 +505,7 @@ where
     }
 }
 
-fn cancellation_outcome<Configuration, ProtocolLimits, Sink>(
-    invocation: &AgentInvocation<Configuration, ProtocolLimits, Sink>,
-) -> Option<AgentOutcome>
-where
-    Sink: AgentObservationSink,
-{
+fn cancellation_outcome(invocation: &AgentInvocation) -> Option<AgentOutcome> {
     invocation
         .cancellation()
         .cancellation_reason()
@@ -599,16 +525,6 @@ impl From<AgentStartReportError> for ScriptedAgentError {
         match value {
             AgentStartReportError::AlreadyReported => Self::InvocationAlreadyStarted,
             AgentStartReportError::ReceiverClosed => Self::AdapterStopped,
-        }
-    }
-}
-
-impl From<AgentTerminalReportError> for ScriptedAgentError {
-    fn from(value: AgentTerminalReportError) -> Self {
-        match value {
-            AgentTerminalReportError::AlreadyReported => Self::TerminalAlreadyReported,
-            AgentTerminalReportError::CompletionModeMismatch => Self::CompletionModeMismatch,
-            AgentTerminalReportError::ReceiverClosed => Self::TerminalReceiverClosed,
         }
     }
 }

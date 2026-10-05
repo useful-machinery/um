@@ -533,7 +533,7 @@ exports:
 fn response_pi_execution() -> String {
     let frames = include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/crates/execution/src/workflow/pi_json_v1/fixtures/response-success.jsonl"
+        "/crates/execution/src/workflow/pi/fixtures/response-success.jsonl"
     ));
     let remaining = frames
         .lines()

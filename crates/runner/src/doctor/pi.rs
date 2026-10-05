@@ -4,7 +4,7 @@ use super::{
     CheckDescriptor, DoctorCheck, Outcome, capability_failure_details, compatible_harness_outcome,
 };
 use um_execution::{
-    PI_JSON_V1_QUALIFICATION_VERSION, PI_JSON_V1_SUPPORTED_RANGE, PiCompatibilityProfile,
+    AgentCompatibilityProfile, PI_JSON_V1_QUALIFICATION_VERSION, PI_JSON_V1_SUPPORTED_RANGE,
     PiIncompatibility, PiInstallationFailure, PiProbe, discover_and_validate_pi_installation,
 };
 
@@ -102,7 +102,7 @@ fn compatibility_details() -> BTreeMap<String, String> {
     BTreeMap::from([
         (
             "profile".to_owned(),
-            PiCompatibilityProfile::PiJsonV1.as_str().to_owned(),
+            AgentCompatibilityProfile::PiJsonV1.as_str().to_owned(),
         ),
         (
             "qualificationVersion".to_owned(),

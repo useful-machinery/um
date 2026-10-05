@@ -4,9 +4,9 @@ use super::{
     CheckDescriptor, DoctorCheck, Outcome, capability_failure_details, compatible_harness_outcome,
 };
 use um_execution::{
-    CLAUDE_CODE_STREAM_JSON_V1_QUALIFICATION_VERSION, CLAUDE_CODE_STREAM_JSON_V1_SUPPORTED_RANGE,
-    ClaudeCodeCompatibilityProfile, ClaudeCodeIncompatibility, ClaudeCodeInstallationFailure,
-    ClaudeCodeProbe, discover_and_validate_claude_code_installation,
+    AgentCompatibilityProfile, CLAUDE_CODE_STREAM_JSON_V1_QUALIFICATION_VERSION,
+    CLAUDE_CODE_STREAM_JSON_V1_SUPPORTED_RANGE, ClaudeCodeIncompatibility,
+    ClaudeCodeInstallationFailure, ClaudeCodeProbe, discover_and_validate_claude_code_installation,
 };
 
 pub(super) struct ClaudeCodeCheck;
@@ -109,7 +109,7 @@ fn compatibility_details() -> BTreeMap<String, String> {
     BTreeMap::from([
         (
             "profile".to_owned(),
-            ClaudeCodeCompatibilityProfile::ClaudeCodeStreamJsonV1
+            AgentCompatibilityProfile::ClaudeCodeStreamJsonV1
                 .as_str()
                 .to_owned(),
         ),

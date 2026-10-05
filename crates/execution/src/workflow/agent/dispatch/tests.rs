@@ -1,110 +1,26 @@
 use std::num::{NonZeroU64, NonZeroUsize};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use super::*;
 use crate::workflow::admission::{CancellationSource, EnvironmentSnapshot};
+use crate::workflow::agent::scripted::scripted_agent_dispatcher;
 use crate::workflow::agent::{
-    AdmittedAgentAdapter, AgentCompatibilityProfile, AgentInvocation, AgentInvocationIdentity,
-    AgentInvocationLimits, AgentInvocationStaging, AgentOutcome, AgentProcessContext, AgentPrompt,
+    AdmittedAgentAdapter, AgentCompatibilityProfile, AgentInvocationIdentity,
+    AgentInvocationLimits, AgentInvocationStaging, AgentProcessContext, AgentPrompt,
     AgentValueMode, CompletedAgentInvocation, NoopAgentObservationSink, PositiveDuration,
-    WorkflowRunId, agent_start_channel, agent_terminal_channel,
+    WorkflowRunId, agent_start_channel,
 };
 use crate::workflow::agent_diagnostics::AgentDiagnosticSession;
-use crate::workflow::agent_input::ClosedAgentInvocation;
+use crate::workflow::claude_code::ClaudeCodeStreamJsonV1ProtocolLimits;
 use crate::workflow::claude_code::{ClaudeCodeConfig, ClaudeCodeEffort};
-use crate::workflow::claude_code_stream_json_v1::ClaudeCodeStreamJsonV1ProtocolLimits;
+use crate::workflow::codex::CodexAppServerV1ProtocolLimits;
 use crate::workflow::codex::CodexConfig;
-use crate::workflow::codex_app_server_v1::CodexAppServerV1ProtocolLimits;
 use crate::workflow::execution_root::AdmittedExecutionRoot;
+use crate::workflow::pi::PiJsonV1ProtocolLimits;
 use crate::workflow::pi::{PiConfig, Thinking};
-use crate::workflow::pi_json_v1::PiJsonV1ProtocolLimits;
 use crate::workflow::process_group::ProcessGuardRegistry;
 use crate::workflow::runtime::{ActionId, TransitionSequence};
-
-#[derive(Clone)]
-struct RecordingPiAdapter(Arc<Mutex<Vec<PiConfig>>>);
-
-impl AgentAdapter<NoopAgentObservationSink> for RecordingPiAdapter {
-    type NativeConfiguration = PiConfig;
-    type ProtocolLimits = PiJsonV1ProtocolLimits;
-
-    async fn invoke(
-        &self,
-        invocation: AgentInvocation<
-            Self::NativeConfiguration,
-            Self::ProtocolLimits,
-            NoopAgentObservationSink,
-        >,
-        started: AgentStartCallback,
-        terminal: AgentTerminalCallback,
-    ) {
-        self.0
-            .lock()
-            .unwrap()
-            .push(invocation.adapter().native_configuration().clone());
-        started.report().unwrap();
-        terminal
-            .report(AgentOutcome::Completed(CompletedAgentInvocation::NoValue))
-            .unwrap();
-    }
-}
-
-#[derive(Clone)]
-struct RecordingClaudeCodeAdapter(Arc<Mutex<Vec<ClaudeCodeConfig>>>);
-
-impl AgentAdapter<NoopAgentObservationSink> for RecordingClaudeCodeAdapter {
-    type NativeConfiguration = ClaudeCodeConfig;
-    type ProtocolLimits = ClaudeCodeStreamJsonV1ProtocolLimits;
-
-    async fn invoke(
-        &self,
-        invocation: AgentInvocation<
-            Self::NativeConfiguration,
-            Self::ProtocolLimits,
-            NoopAgentObservationSink,
-        >,
-        started: AgentStartCallback,
-        terminal: AgentTerminalCallback,
-    ) {
-        self.0
-            .lock()
-            .unwrap()
-            .push(invocation.adapter().native_configuration().clone());
-        started.report().unwrap();
-        terminal
-            .report(AgentOutcome::Completed(CompletedAgentInvocation::NoValue))
-            .unwrap();
-    }
-}
-
-#[derive(Clone)]
-struct RecordingCodexAdapter(Arc<Mutex<Vec<CodexConfig>>>);
-
-impl AgentAdapter<NoopAgentObservationSink> for RecordingCodexAdapter {
-    type NativeConfiguration = CodexConfig;
-    type ProtocolLimits = CodexAppServerV1ProtocolLimits;
-
-    async fn invoke(
-        &self,
-        invocation: AgentInvocation<
-            Self::NativeConfiguration,
-            Self::ProtocolLimits,
-            NoopAgentObservationSink,
-        >,
-        started: AgentStartCallback,
-        terminal: AgentTerminalCallback,
-    ) {
-        self.0
-            .lock()
-            .unwrap()
-            .push(invocation.adapter().native_configuration().clone());
-        started.report().unwrap();
-        terminal
-            .report(AgentOutcome::Completed(CompletedAgentInvocation::NoValue))
-            .unwrap();
-    }
-}
 
 fn invocation<Configuration, ProtocolLimits>(
     temporary: &tempfile::TempDir,
@@ -113,7 +29,10 @@ fn invocation<Configuration, ProtocolLimits>(
     version: &str,
     configuration: Configuration,
     protocol_limits: ProtocolLimits,
-) -> AgentInvocation<Configuration, ProtocolLimits, NoopAgentObservationSink> {
+) -> AgentInvocation
+where
+    Configuration: crate::workflow::agent::IntoNativeHarness<ProtocolLimits>,
+{
     let root = temporary.path().join(format!("root-{profile:?}"));
     std::fs::create_dir(&root).unwrap();
     let cwd = AdmittedExecutionRoot::admit(&root)
@@ -171,87 +90,57 @@ fn invocation<Configuration, ProtocolLimits>(
     )
 }
 
-async fn dispatch(
-    dispatcher: &ClosedAgentDispatcher<
-        RecordingPiAdapter,
-        RecordingClaudeCodeAdapter,
-        RecordingCodexAdapter,
-    >,
-    invocation: ClosedAgentInvocation<NoopAgentObservationSink>,
-) {
-    let value_mode = AgentValueMode::None;
-    let (started, start) = agent_start_channel();
-    let (terminal, outcome) = agent_terminal_channel(&value_mode);
-    invoke_agent_dispatcher(dispatcher, invocation, started, terminal).await;
-    start.receive().await.unwrap();
-    assert_eq!(
-        outcome.receive().await.unwrap(),
-        AgentOutcome::Completed(CompletedAgentInvocation::NoValue)
-    );
-}
-
 #[tokio::test]
-async fn closed_dispatcher_routes_each_native_profile_without_translation_or_fallback() {
+async fn scripted_dispatch_preserves_each_native_harness_identity_and_returns_its_outcome() {
     let temporary = tempfile::tempdir().unwrap();
-    let pi_calls = Arc::new(Mutex::new(Vec::new()));
-    let claude_code_calls = Arc::new(Mutex::new(Vec::new()));
-    let codex_calls = Arc::new(Mutex::new(Vec::new()));
-    let dispatcher = ClosedAgentDispatcher::new(
-        RecordingPiAdapter(Arc::clone(&pi_calls)),
-        RecordingClaudeCodeAdapter(Arc::clone(&claude_code_calls)),
-        RecordingCodexAdapter(Arc::clone(&codex_calls)),
-    );
-    let pi_config = PiConfig {
-        model: "openai/gpt-5".to_owned(),
-        thinking: Thinking::Minimal,
-    };
-    let claude_code_config = ClaudeCodeConfig {
-        model: "claude-opus-4-1".to_owned(),
-        effort: ClaudeCodeEffort::High,
-    };
-    let codex_config = CodexConfig {
-        model: "gpt-5.4".to_owned(),
-        effort: "xhigh".to_owned(),
-    };
-
-    dispatch(
-        &dispatcher,
-        ClosedAgentInvocation::Pi(invocation(
+    let invocations = [
+        invocation(
             &temporary,
             AgentCompatibilityProfile::PiJsonV1,
             "/validated/pi",
             "0.84.2",
-            pi_config.clone(),
+            PiConfig {
+                model: "openai/gpt-5".into(),
+                thinking: Thinking::Minimal,
+            },
             PiJsonV1ProtocolLimits::profile(),
-        )),
-    )
-    .await;
-    dispatch(
-        &dispatcher,
-        ClosedAgentInvocation::ClaudeCode(invocation(
+        ),
+        invocation(
             &temporary,
             AgentCompatibilityProfile::ClaudeCodeStreamJsonV1,
             "/validated/claude",
             "2.1.284",
-            claude_code_config.clone(),
+            ClaudeCodeConfig {
+                model: "claude-opus-4-1".into(),
+                effort: ClaudeCodeEffort::High,
+            },
             ClaudeCodeStreamJsonV1ProtocolLimits::profile(),
-        )),
-    )
-    .await;
-    dispatch(
-        &dispatcher,
-        ClosedAgentInvocation::Codex(invocation(
+        ),
+        invocation(
             &temporary,
             AgentCompatibilityProfile::CodexAppServerV1,
             "/validated/codex",
             "0.147.23",
-            codex_config.clone(),
+            CodexConfig {
+                model: "gpt-5.4".into(),
+                effort: "xhigh".into(),
+            },
             CodexAppServerV1ProtocolLimits::profile(),
-        )),
-    )
-    .await;
-
-    assert_eq!(*pi_calls.lock().unwrap(), [pi_config]);
-    assert_eq!(*claude_code_calls.lock().unwrap(), [claude_code_config]);
-    assert_eq!(*codex_calls.lock().unwrap(), [codex_config]);
+        ),
+    ];
+    for invocation in invocations {
+        let profile = invocation.adapter().profile();
+        let (dispatcher, mut control) = scripted_agent_dispatcher();
+        let (callback, started) = agent_start_channel();
+        let task = tokio::spawn(async move { dispatcher.invoke(invocation, callback).await });
+        let observed = control.wait_until_started().await.unwrap();
+        assert_eq!(observed.profile(), profile);
+        observed.control().start().await.unwrap();
+        started.receive().await.unwrap();
+        control.complete().await.unwrap();
+        assert_eq!(
+            task.await.unwrap(),
+            AgentOutcome::Completed(CompletedAgentInvocation::NoValue)
+        );
+    }
 }

@@ -845,14 +845,13 @@ mod tests {
     fn codex_capability_rejection_retains_the_probed_identity() {
         use std::path::Path;
 
-        use crate::codex::{
-            CodexCapability, CodexCompatibilityProfile, CodexInstallationIdentity, CodexVersion,
-        };
+        use crate::codex::{CodexCapability, CodexInstallationIdentity, CodexVersion};
+        use crate::workflow::agent::AgentCompatibilityProfile;
 
         let identity = CodexInstallationIdentity::new(
             Path::new("/canonical/codex"),
             &CodexVersion::parse("0.147.23").unwrap(),
-            CodexCompatibilityProfile::CodexAppServerV1,
+            AgentCompatibilityProfile::CodexAppServerV1,
         );
         let failure =
             AgentHarnessInstallationFailure::Codex(CodexInstallationFailure::Unsupported {

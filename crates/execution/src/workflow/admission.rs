@@ -15,20 +15,20 @@ use super::artifact::CaptureCancellation;
 use super::cancellation::{MAXIMUM_CANCELLATION_GRACE, MINIMUM_CANCELLATION_GRACE};
 use super::capacity::WorkflowCapacity;
 use super::claude_code::ClaudeCodeConfig;
-use super::claude_code_stream_json_v1::ClaudeCodeStreamJsonV1ProtocolLimits;
+use super::claude_code::ClaudeCodeStreamJsonV1ProtocolLimits;
+use super::codex::CodexAppServerV1ProtocolLimits;
 use super::codex::CodexConfig;
-use super::codex_app_server_v1::CodexAppServerV1ProtocolLimits;
 use super::execution_root::{AdmittedExecutionRoot, ExecutionRootAdmissionFailure};
 use super::git_capture::{
     CloudGitCaptureProjection, GitCaptureContext, GitWorkspaceAdmissionFailure, LocalGitBaseline,
 };
 use super::pi::PiConfig;
-use super::pi_json_v1::PiJsonV1ProtocolLimits;
+use super::pi::PiJsonV1ProtocolLimits;
 use super::resolution::ResolvedWorkflow;
 use super::validated::{ValidatedHarness, ValidatedRecoveryHandler, ValidatedStep};
-use crate::claude_code::{ClaudeCodeCompatibilityProfile, ValidatedClaudeCodeInstallation};
-use crate::codex::{CodexCompatibilityProfile, ValidatedCodexInstallation};
-use crate::pi::{PiCompatibilityProfile, ValidatedPiInstallation};
+use crate::claude_code::ValidatedClaudeCodeInstallation;
+use crate::codex::ValidatedCodexInstallation;
+use crate::pi::ValidatedPiInstallation;
 
 const MAXIMUM_CAPTURED_FILES: usize = 1024;
 const MAXIMUM_CAPTURED_FILE_BYTES: u64 = 64 * 1024 * 1024;
@@ -2049,7 +2049,6 @@ fn admit_harness(
     match harness {
         ValidatedHarness::Pi(configuration) => {
             let installation = available.pi.as_ref().ok_or_else(missing_installation)?;
-            let PiCompatibilityProfile::PiJsonV1 = installation.profile();
             Ok(AdmittedHarness::Pi(PiJsonV1Admission {
                 installation: Arc::clone(installation),
                 configuration: configuration.clone(),
@@ -2061,7 +2060,6 @@ fn admit_harness(
                 .claude_code
                 .as_ref()
                 .ok_or_else(missing_installation)?;
-            let ClaudeCodeCompatibilityProfile::ClaudeCodeStreamJsonV1 = installation.profile();
             Ok(AdmittedHarness::ClaudeCode(
                 ClaudeCodeStreamJsonV1Admission {
                     installation: Arc::clone(installation),
@@ -2072,7 +2070,6 @@ fn admit_harness(
         }
         ValidatedHarness::Codex(configuration) => {
             let installation = available.codex.as_ref().ok_or_else(missing_installation)?;
-            let CodexCompatibilityProfile::CodexAppServerV1 = installation.profile();
             Ok(AdmittedHarness::Codex(CodexAppServerV1Admission {
                 installation: Arc::clone(installation),
                 configuration: configuration.clone(),

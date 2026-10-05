@@ -25,9 +25,8 @@ use tokio::sync::{mpsc, oneshot};
 
 use super::admission::CancellationSource;
 use super::agent::{
-    AgentAdapter, AgentCompatibilityProfile, AgentFailureCause, AgentInputKind, AgentInvocation,
-    AgentInvocationIdentity, AgentObservation, AgentObservationSink, AgentOutcome,
-    AgentProcessDirective, AgentStartCallback, AgentTerminalCallback, AgentValueMode,
+    AgentCompatibilityProfile, AgentFailureCause, AgentInputKind, AgentInvocation,
+    AgentInvocationIdentity, AgentObservation, AgentOutcome, AgentProcessDirective, AgentValueMode,
     PositiveDuration, StagedAgentAttachment, check_agent_input_bound, failed_agent_outcome,
     run_cancellable_blocking_launch,
 };
@@ -45,71 +44,54 @@ use super::result_validation::{
 };
 use tracing::Instrument as _;
 
-pub(super) async fn report_invocation(
+pub(crate) async fn report_invocation(
     profile: &'static str,
     identity: AgentInvocationIdentity,
     cancellation: CancellationSource,
-    terminal: AgentTerminalCallback,
     work: impl Future<Output = AgentOutcome>,
-) {
+) -> AgentOutcome {
     let span = tracing::info_span!("agent_invocation", profile,
         step = %identity.step(),
         sequence = identity.invocation().transition_sequence.get());
     let outcome = work.instrument(span).await;
-    let outcome = cancellation
+    cancellation
         .cancellation_reason()
-        .map_or(outcome, |reason| AgentOutcome::Cancelled { reason });
-    let _ = terminal.report(outcome);
+        .map_or(outcome, |reason| AgentOutcome::Cancelled { reason })
 }
 
-pub(crate) trait NativeProcessProfile<Clock, Observer, Worker, Sink>:
-    Clone + Send + Sync + 'static
-where
-    Clock: CoordinatorClock,
-    Observer: ExecutionObserver<Clock::Instant>,
-    Worker: ResultValidationWorker,
-    Sink: AgentObservationSink,
-{
-    type Configuration: Send + Sync + 'static;
-    type Limits: Send + Sync + 'static;
-    const NAME: &'static str;
-    fn invoke(
-        adapter: &AdapterCore<Clock, Observer, Worker, Self>,
-        invocation: AgentInvocation<Self::Configuration, Self::Limits, Sink>,
-        started: &AgentStartCallback,
-    ) -> impl Future<Output = AgentOutcome> + Send
-    where
-        Self: Sized;
+// The three process adapters share only the return/start envelope. Their preparation,
+// protocol and settlement policies remain native to each harness.
+macro_rules! native_process_adapter {
+    ($profile:ty, $name:expr) => {
+        impl<Clock, Observer, Worker> $crate::workflow::agent::AgentAdapter
+            for $crate::workflow::agent_process_driver::AdapterCore<
+                Clock,
+                Observer,
+                Worker,
+                $profile,
+            >
+        where
+            Clock: $crate::workflow::coordinator::CoordinatorClock,
+            Observer: $crate::workflow::observation::ExecutionObserver<Clock::Instant>,
+            Worker: $crate::workflow::result_validation::ResultValidationWorker,
+        {
+            async fn invoke(
+                &self,
+                invocation: $crate::workflow::agent::AgentInvocation,
+                started: $crate::workflow::agent::AgentStartCallback,
+            ) -> $crate::workflow::agent::AgentOutcome {
+                $crate::workflow::agent_process_driver::report_invocation(
+                    $name,
+                    invocation.identity().clone(),
+                    invocation.cancellation().clone(),
+                    self.invoke_inner(invocation, &started),
+                )
+                .await
+            }
+        }
+    };
 }
-
-impl<Clock, Observer, Worker, Sink, Profile> AgentAdapter<Sink>
-    for AdapterCore<Clock, Observer, Worker, Profile>
-where
-    Clock: CoordinatorClock,
-    Observer: ExecutionObserver<Clock::Instant>,
-    Worker: ResultValidationWorker,
-    Sink: AgentObservationSink,
-    Profile: NativeProcessProfile<Clock, Observer, Worker, Sink>,
-{
-    type NativeConfiguration = Profile::Configuration;
-    type ProtocolLimits = Profile::Limits;
-
-    async fn invoke(
-        &self,
-        invocation: AgentInvocation<Self::NativeConfiguration, Self::ProtocolLimits, Sink>,
-        started: AgentStartCallback,
-        terminal: AgentTerminalCallback,
-    ) {
-        report_invocation(
-            Profile::NAME,
-            invocation.identity().clone(),
-            invocation.cancellation().clone(),
-            terminal,
-            Profile::invoke(self, invocation, &started),
-        )
-        .await;
-    }
-}
+pub(crate) use native_process_adapter;
 
 pub(crate) struct AdapterCore<Clock, Observer, Worker, Profile = ()> {
     pub(super) profile: Profile,
@@ -173,14 +155,14 @@ impl<Clock, Observer, Worker, Profile> AdapterCore<Clock, Observer, Worker, Prof
         }
     }
 
-    pub(super) async fn launch_stdio<Config, Limits, Sink, Plan>(
+    pub(super) async fn launch_stdio<Plan>(
         &self,
-        invocation: AgentInvocation<Config, Limits, Sink>,
+        invocation: AgentInvocation,
         plan: Plan,
         join_failure: AgentFailureCause,
     ) -> Result<
         (
-            AgentInvocation<Config, Limits, Sink>,
+            AgentInvocation,
             Plan,
             StdioProcess,
             ChildStderr,
@@ -189,10 +171,7 @@ impl<Clock, Observer, Worker, Profile> AdapterCore<Clock, Observer, Worker, Prof
         AgentOutcome,
     >
     where
-        Config: Send + Sync + 'static,
-        Limits: Send + Sync + 'static,
-        Sink: AgentObservationSink,
-        Plan: StdioLaunchPlan<Config, Limits, Sink> + Send + 'static,
+        Plan: StdioLaunchPlan + Send + 'static,
     {
         let cancellation_source = invocation.cancellation().clone();
         let ((invocation, plan, launched), cancelled) =
@@ -233,18 +212,13 @@ impl<Clock, Observer, Worker, Profile> AdapterCore<Clock, Observer, Worker, Prof
         }
     }
 
-    pub(super) async fn prepare_invocation<Config, Limits, Sink, Plan>(
+    pub(super) async fn prepare_invocation<Plan>(
         &self,
-        invocation: AgentInvocation<Config, Limits, Sink>,
-        prepare: impl FnOnce(&AgentInvocation<Config, Limits, Sink>) -> Result<Plan, AgentFailureCause>
-        + Send
-        + 'static,
+        invocation: AgentInvocation,
+        prepare: impl FnOnce(&AgentInvocation) -> Result<Plan, AgentFailureCause> + Send + 'static,
         join_failure: AgentFailureCause,
-    ) -> Result<(AgentInvocation<Config, Limits, Sink>, Plan), AgentOutcome>
+    ) -> Result<(AgentInvocation, Plan), AgentOutcome>
     where
-        Config: Send + Sync + 'static,
-        Limits: Send + Sync + 'static,
-        Sink: AgentObservationSink,
         Plan: Send + 'static,
     {
         match tokio::task::spawn_blocking(move || {
@@ -289,9 +263,9 @@ impl<Clock, Observer, Worker, Profile: Default> AdapterCore<Clock, Observer, Wor
 impl<Clock: CoordinatorClock, Observer, Worker: ResultValidationWorker, Profile>
     AdapterCore<Clock, Observer, Worker, Profile>
 {
-    pub(super) fn start_diagnostic<Config, Limits, Sink: AgentObservationSink>(
+    pub(super) fn start_diagnostic(
         &self,
-        invocation: &AgentInvocation<Config, Limits, Sink>,
+        invocation: &AgentInvocation,
         standard_error: ChildStderr,
     ) -> PendingStepDiagnostic
     where
@@ -306,9 +280,9 @@ impl<Clock: CoordinatorClock, Observer, Worker: ResultValidationWorker, Profile>
         )
     }
 
-    pub(super) fn result_validator<Config, Limits, Sink: AgentObservationSink>(
+    pub(super) fn result_validator(
         &self,
-        invocation: &AgentInvocation<Config, Limits, Sink>,
+        invocation: &AgentInvocation,
     ) -> Option<AuthoritativeResultValidator<Clock, Worker>> {
         let AgentValueMode::Result { schema, .. } = invocation.value_mode() else {
             return None;
@@ -382,8 +356,8 @@ impl GuardedProcess {
     }
 }
 
-pub(super) async fn take_process_directives<Config, Limits, Sink: AgentObservationSink>(
-    invocation: &mut AgentInvocation<Config, Limits, Sink>,
+pub(super) async fn take_process_directives(
+    invocation: &mut AgentInvocation,
     child: &mut GuardedChild,
     process_group: Pid,
 ) -> Option<mpsc::UnboundedReceiver<AgentProcessDirective>> {
@@ -402,8 +376,8 @@ pub(super) fn verify_session_binding<E: std::fmt::Display>(
     binding.map_err(|error| AgentFailureCause::start_failure(stage, error))
 }
 
-pub(super) fn bind_agent_command<Config, Limits, Sink: AgentObservationSink>(
-    invocation: &AgentInvocation<Config, Limits, Sink>,
+pub(super) fn bind_agent_command(
+    invocation: &AgentInvocation,
     command: &mut std::process::Command,
 ) -> io::Result<()> {
     invocation
@@ -412,8 +386,8 @@ pub(super) fn bind_agent_command<Config, Limits, Sink: AgentObservationSink>(
         .map_err(|_| io::Error::other("agent working directory is unavailable"))
 }
 
-pub(super) fn require_native_profile<Config, Limits, Sink: AgentObservationSink>(
-    invocation: &AgentInvocation<Config, Limits, Sink>,
+pub(super) fn require_native_profile(
+    invocation: &AgentInvocation,
     expected: AgentCompatibilityProfile,
     compatible_version: bool,
     failure: impl FnOnce() -> AgentFailureCause,
@@ -428,9 +402,7 @@ pub(super) fn require_native_profile<Config, Limits, Sink: AgentObservationSink>
     }
 }
 
-pub(super) fn check_prompt_bounds<Config, Limits, Sink: AgentObservationSink>(
-    invocation: &AgentInvocation<Config, Limits, Sink>,
-) -> Result<(), AgentFailureCause> {
+pub(super) fn check_prompt_bounds(invocation: &AgentInvocation) -> Result<(), AgentFailureCause> {
     check_agent_input_bound(
         invocation.prompt().system_prompt(),
         invocation.limits().maximum_system_prompt_bytes(),
@@ -443,23 +415,17 @@ pub(super) fn check_prompt_bounds<Config, Limits, Sink: AgentObservationSink>(
     )
 }
 
-pub(super) trait StdioLaunchPlan<Config, Limits, Sink: AgentObservationSink> {
+pub(super) trait StdioLaunchPlan {
     fn arguments(&self) -> &[OsString];
-    fn environment(
-        &self,
-        invocation: &AgentInvocation<Config, Limits, Sink>,
-    ) -> Vec<(OsString, OsString)>;
-    fn verify_binding(
-        &self,
-        invocation: &AgentInvocation<Config, Limits, Sink>,
-    ) -> Result<(), AgentFailureCause>;
+    fn environment(&self, invocation: &AgentInvocation) -> Vec<(OsString, OsString)>;
+    fn verify_binding(&self, invocation: &AgentInvocation) -> Result<(), AgentFailureCause>;
     fn spawn_stage(&self) -> &'static str;
     fn release_stage(&self) -> &'static str;
     fn guard_failure(&self) -> AgentFailureCause;
 
     fn launch(
         &self,
-        invocation: &AgentInvocation<Config, Limits, Sink>,
+        invocation: &AgentInvocation,
         cancellation: &ChildGuardCancellation,
     ) -> Result<(StdioProcess, ChildStderr), AgentFailureCause> {
         Launch::for_invocation(
@@ -480,9 +446,7 @@ pub(super) trait StdioLaunchPlan<Config, Limits, Sink: AgentObservationSink> {
     }
 }
 
-pub(super) fn invocation_environment<Config, Limits, Sink: AgentObservationSink>(
-    invocation: &AgentInvocation<Config, Limits, Sink>,
-) -> BTreeMap<OsString, OsString> {
+pub(super) fn invocation_environment(invocation: &AgentInvocation) -> BTreeMap<OsString, OsString> {
     invocation
         .process()
         .environment()
@@ -575,8 +539,8 @@ pub(super) struct Launch<'a> {
 }
 
 impl<'a> Launch<'a> {
-    pub(super) fn for_invocation<Config, Limits, Sink: AgentObservationSink>(
-        invocation: &'a AgentInvocation<Config, Limits, Sink>,
+    pub(super) fn for_invocation(
+        invocation: &'a AgentInvocation,
         arguments: &'a [OsString],
         environment: &'a [(OsString, OsString)],
         cancellation: &'a ChildGuardCancellation,

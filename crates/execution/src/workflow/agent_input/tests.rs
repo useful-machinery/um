@@ -21,8 +21,8 @@ use crate::workflow::agent::{AgentValueKind, NoopAgentObservationSink, WorkflowR
 use crate::workflow::agent_diagnostics::AgentDiagnosticSessionStore;
 use crate::workflow::artifact::{ArtifactStaging, CaptureDeclaration};
 use crate::workflow::claude_code::{ClaudeCodeConfig, ClaudeCodeEffort};
+use crate::workflow::codex::CodexAppServerV1ProtocolLimits;
 use crate::workflow::codex::CodexConfig;
-use crate::workflow::codex_app_server_v1::CodexAppServerV1ProtocolLimits;
 use crate::workflow::input::{InputStaging, InputValue};
 use crate::workflow::pi::Thinking;
 use crate::workflow::resolution;
@@ -242,8 +242,7 @@ impl Fixture {
     fn materialize(
         &self,
         cancellation: CancellationSource,
-    ) -> Result<MaterializedAgentInvocation<NoopAgentObservationSink>, AgentInputMaterializationError>
-    {
+    ) -> Result<MaterializedAgentInvocation, AgentInputMaterializationError> {
         materialize_agent_invocation(
             &self.admitted,
             &self.artifacts,
@@ -508,38 +507,25 @@ fn each_declared_agent_value_mode_is_selected_without_file_outputs_affecting_it(
 fn materialization_preserves_each_profiles_native_configuration_and_limits() {
     let pi_fixture = Fixture::new(ConsumerValueMode::None);
     let pi_materialized = pi_fixture.materialize(CancellationSource::new()).unwrap();
-    let ClosedAgentInvocation::Pi(pi) = pi_materialized.invocation() else {
-        panic!("the Pi fixture must materialize a Pi invocation");
-    };
-    assert_eq!(pi.adapter().native_configuration().model, "openai/gpt-5");
-    assert_eq!(
-        pi.adapter().native_configuration().thinking,
-        Thinking::XHigh
-    );
-    assert_eq!(
-        pi.limits().adapter_protocol(),
-        &PiJsonV1ProtocolLimits::profile()
-    );
+    let pi = pi_materialized.invocation();
+    let (config, protocol) = pi.adapter().native_configuration().pi().unwrap();
+    assert_eq!(config.model, "openai/gpt-5");
+    assert_eq!(config.thinking, Thinking::XHigh);
+    assert_eq!(protocol, PiJsonV1ProtocolLimits::profile());
 
     let claude_fixture = Fixture::with_claude_code_consumer(ConsumerValueMode::None);
     let claude_materialized = claude_fixture
         .materialize(CancellationSource::new())
         .unwrap();
-    let ClosedAgentInvocation::ClaudeCode(claude) = claude_materialized.invocation() else {
-        panic!("the Claude fixture must materialize a Claude invocation");
-    };
-    assert_eq!(
-        claude.adapter().native_configuration().model,
-        "claude-opus-4-1"
-    );
-    assert_eq!(
-        claude.adapter().native_configuration().effort,
-        ClaudeCodeEffort::High
-    );
-    assert_eq!(
-        claude.limits().adapter_protocol(),
-        &ClaudeCodeStreamJsonV1ProtocolLimits::profile()
-    );
+    let claude = claude_materialized.invocation();
+    let (config, protocol) = claude
+        .adapter()
+        .native_configuration()
+        .claude_code()
+        .unwrap();
+    assert_eq!(config.model, "claude-opus-4-1");
+    assert_eq!(config.effort, ClaudeCodeEffort::High);
+    assert_eq!(protocol, ClaudeCodeStreamJsonV1ProtocolLimits::profile());
     assert_eq!(
         claude
             .diagnostic_session()
@@ -554,20 +540,16 @@ fn materialization_preserves_each_profiles_native_configuration_and_limits() {
     let codex_materialized = codex_fixture
         .materialize(CancellationSource::new())
         .unwrap();
-    let ClosedAgentInvocation::Codex(codex) = codex_materialized.invocation() else {
-        panic!("the Codex fixture must materialize a Codex invocation");
-    };
+    let codex = codex_materialized.invocation();
+    let (config, protocol) = codex.adapter().native_configuration().codex().unwrap();
     assert_eq!(codex.adapter().executable(), Path::new("/validated/codex"));
     assert_eq!(
         codex.adapter().version(),
         CODEX_APP_SERVER_V1_QUALIFICATION_VERSION
     );
-    assert_eq!(codex.adapter().native_configuration().model, "gpt-5.4");
-    assert_eq!(codex.adapter().native_configuration().effort, "xhigh");
-    assert_eq!(
-        codex.limits().adapter_protocol(),
-        &CodexAppServerV1ProtocolLimits::profile()
-    );
+    assert_eq!(config.model, "gpt-5.4");
+    assert_eq!(config.effort, "xhigh");
+    assert_eq!(protocol, CodexAppServerV1ProtocolLimits::profile());
     assert_eq!(
         codex
             .diagnostic_session()
@@ -915,12 +897,9 @@ fn agent_staging_rejects_a_replaced_execution_root_identity() {
     assert!(!fixture.staging.is_bound_to(fixture.admitted.execution()));
 }
 
-fn materialization_error<Sink>(
-    result: Result<MaterializedAgentInvocation<Sink>, AgentInputMaterializationError>,
-) -> AgentInputMaterializationError
-where
-    Sink: AgentObservationSink,
-{
+fn materialization_error(
+    result: Result<MaterializedAgentInvocation, AgentInputMaterializationError>,
+) -> AgentInputMaterializationError {
     match result {
         Ok(_) => panic!("materialization unexpectedly succeeded"),
         Err(error) => error,

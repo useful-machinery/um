@@ -23,10 +23,9 @@ use super::test_support::{
 use super::*;
 use crate::workflow::admission::{CancellationReason, CancellationSource};
 use crate::workflow::agent::{
-    AgentInvocation, AgentInvocationLimits, AgentInvocationStaging, AgentProcessContext,
-    AgentProcessControl, AgentPrompt, AgentStartReceiver, AgentTerminalReceiver, AgentValueMode,
+    AgentAdapter, AgentInvocation, AgentInvocationLimits, AgentInvocationStaging,
+    AgentProcessContext, AgentProcessControl, AgentPrompt, AgentStartReceiver, AgentValueMode,
     PositiveDuration, RetainedJsonSchema, StagedAgentAttachment, agent_start_channel,
-    agent_terminal_channel, invoke_agent_adapter,
 };
 use crate::workflow::agent_diagnostics::AgentDiagnosticSession;
 use crate::workflow::diagnostic::StepDiagnosticLog;
@@ -80,7 +79,7 @@ fn conformance_limits() -> AgentInvocationLimits<ClaudeCodeStreamJsonV1ProtocolL
 struct RunningProductionClaudeCode {
     task: tokio::task::JoinHandle<()>,
     started: AgentStartReceiver,
-    terminal: AgentTerminalReceiver,
+    terminal: tokio::sync::oneshot::Receiver<AgentOutcome>,
     cancellation: CancellationSource,
     process_control: AgentProcessControl,
 }
@@ -124,9 +123,9 @@ impl RunningProductionClaudeCode {
         )
         .unwrap();
         let (started_callback, started) = agent_start_channel();
-        let (terminal_callback, terminal) = agent_terminal_channel(&value_mode);
+        let (terminal_callback, terminal) = tokio::sync::oneshot::channel();
         let task = tokio::spawn(async move {
-            invoke_agent_adapter(&adapter, invocation, started_callback, terminal_callback).await;
+            let _ = terminal_callback.send(adapter.invoke(invocation, started_callback).await);
         });
         Self {
             task,
@@ -150,14 +149,14 @@ impl RunningProductionClaudeCode {
 
 struct RunningStartedClaudeCode {
     task: tokio::task::JoinHandle<()>,
-    terminal: AgentTerminalReceiver,
+    terminal: tokio::sync::oneshot::Receiver<AgentOutcome>,
     cancellation: CancellationSource,
     process_control: AgentProcessControl,
 }
 
 impl RunningStartedClaudeCode {
     async fn finish(self) -> AgentOutcome {
-        let outcome = self.terminal.receive().await.unwrap();
+        let outcome = self.terminal.await.unwrap();
         self.task.await.unwrap();
         outcome
     }
@@ -484,9 +483,9 @@ async fn pinned_real_claude_code_02_production_driver_returns_one_normalized_res
         )
         .unwrap();
         let (started, start) = agent_start_channel();
-        let (terminal, outcome) = agent_terminal_channel(&value_mode);
+        let (terminal, outcome) = tokio::sync::oneshot::channel();
         let execution = tokio::spawn(async move {
-            invoke_agent_adapter(&adapter, invocation, started, terminal).await;
+            let _ = terminal.send(adapter.invoke(invocation, started).await);
         });
 
         start.receive().await.unwrap();
@@ -530,7 +529,7 @@ async fn pinned_real_claude_code_02_production_driver_returns_one_normalized_res
         execution.await.unwrap();
 
         let AgentOutcome::Completed(CompletedAgentInvocation::Response(response)) =
-            outcome.receive().await.unwrap()
+            outcome.await.unwrap()
         else {
             panic!("production exact-binary adapter must return one response outcome");
         };
@@ -606,9 +605,9 @@ async fn pinned_real_claude_code_03_corrects_a_result_in_one_production_conversa
             super::adapter_tests::InlineValidationWorker,
         );
         let (started, start) = agent_start_channel();
-        let (terminal, outcome) = agent_terminal_channel(&value_mode);
+        let (terminal, outcome) = tokio::sync::oneshot::channel();
         let mut execution = tokio::spawn(async move {
-            invoke_agent_adapter(&adapter, invocation, started, terminal).await;
+            let _ = terminal.send(adapter.invoke(invocation, started).await);
         });
 
         start.receive().await.unwrap();
@@ -620,7 +619,7 @@ async fn pinned_real_claude_code_03_corrects_a_result_in_one_production_conversa
             request = provider.next_request() => request,
             joined = &mut execution => {
                 joined.unwrap();
-                panic!("adapter ended before correction request: {:?}", outcome.receive().await);
+                panic!("adapter ended before correction request: {:?}", outcome.await);
             }
         };
         assert!(contains_exact_value(second.body(), &json!({"result": -1})));
@@ -632,7 +631,7 @@ async fn pinned_real_claude_code_03_corrects_a_result_in_one_production_conversa
         execution.await.unwrap();
 
         let AgentOutcome::Completed(CompletedAgentInvocation::Result(result)) =
-            outcome.receive().await.unwrap()
+            outcome.await.unwrap()
         else {
             panic!("exact binary corrected result must complete");
         };
@@ -786,7 +785,7 @@ async fn pinned_real_claude_code_04b_provider_overload_retries_and_stream_error_
         )
         .await;
         retry_provider.next_request().await.release_overload();
-        let terminal = retry_running.terminal.receive();
+        let terminal = retry_running.terminal;
         tokio::pin!(terminal);
         let retry_outcome = tokio::select! {
             request = retry_provider.next_request() => {

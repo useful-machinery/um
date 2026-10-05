@@ -15,18 +15,18 @@ use tokio::process::{Child, Command};
 use tokio::sync::{mpsc, oneshot, watch};
 
 use super::admission::{AdmittedWorkflow, CancellationReason, EnvironmentSnapshot, ResolvedInput};
-use super::agent::dispatch::{AgentInvocationDispatcher, invoke_agent_dispatcher};
+use super::agent::dispatch::AgentInvocationDispatcher;
 use super::agent::{
-    AgentFailure, AgentFailureCause, AgentInvocationIdentity, AgentObservationEnvelope,
-    AgentObservationSink, AgentOutcome, AgentProcessControl, AgentStartReceiveError,
-    AgentTerminalReceiveError, CompletedAgentInvocation, WorkflowRunId, agent_start_channel,
-    agent_terminal_channel, failed_agent_outcome,
+    AgentFailure, AgentFailureCause, AgentInvocation, AgentInvocationIdentity,
+    AgentObservationEnvelope, AgentObservationSink, AgentOutcome, AgentProcessControl,
+    AgentStartReceiveError, CompletedAgentInvocation, WorkflowRunId, agent_start_channel,
+    failed_agent_outcome,
 };
 use super::agent_diagnostics::AgentDiagnosticSessionStore;
 use super::agent_input::{
     AgentInputMaterializationError, AgentInputStaging, AgentInputStagingLease,
-    AgentInputStartFailure, ClosedAgentInvocation, MaterializedAgentInvocation,
-    materialize_agent_invocation, materialize_recovery_agent_invocation,
+    AgentInputStartFailure, MaterializedAgentInvocation, materialize_agent_invocation,
+    materialize_recovery_agent_invocation,
 };
 use super::artifact::CaptureBoundaryObserver;
 use super::artifact::{
@@ -306,19 +306,13 @@ impl DriverOccurrenceContent for CapturedValue {
 #[derive(Clone, Copy)]
 pub struct NoAgentDispatcher;
 
-impl<Sink> AgentInvocationDispatcher<Sink> for NoAgentDispatcher
-where
-    Sink: AgentObservationSink,
-{
+impl AgentInvocationDispatcher for NoAgentDispatcher {
     async fn invoke(
         &self,
-        _invocation: ClosedAgentInvocation<Sink>,
+        _invocation: AgentInvocation,
         _started: super::agent::AgentStartCallback,
-        terminal: super::agent::AgentTerminalCallback,
-    ) {
-        let _ = terminal.report(failed_agent_outcome(
-            AgentFailureCause::HarnessProtocolFailed,
-        ));
+    ) -> AgentOutcome {
+        failed_agent_outcome(AgentFailureCause::HarnessProtocolFailed)
     }
 }
 
@@ -405,8 +399,7 @@ where
     }
 }
 
-pub trait WorkflowAgentDispatcher<Deadline, Observer>:
-    AgentInvocationDispatcher<AgentExecutionObservationSink<Deadline, Observer>>
+pub trait WorkflowAgentDispatcher<Deadline, Observer>: AgentInvocationDispatcher
 where
     Deadline: Send + Sync + 'static,
     Observer: ExecutionObserver<Deadline>,
@@ -417,7 +410,7 @@ impl<Deadline, Observer, Dispatcher> WorkflowAgentDispatcher<Deadline, Observer>
 where
     Deadline: Send + Sync + 'static,
     Observer: ExecutionObserver<Deadline>,
-    Dispatcher: AgentInvocationDispatcher<AgentExecutionObservationSink<Deadline, Observer>>,
+    Dispatcher: AgentInvocationDispatcher,
 {
 }
 
@@ -859,10 +852,7 @@ where
         round: RecoveryRoundNumber,
         action: ActionId,
         history: &[RecoveryRoundRecord<StepFailureCause>],
-    ) -> Result<
-        PreparedRecoveryHandler<AgentExecutionObservationSink<Clock::Instant, Observer>>,
-        RecoveryHandlerFailure,
-    > {
+    ) -> Result<PreparedRecoveryHandler, RecoveryHandlerFailure> {
         let staging = RecoveryStaging::create(self.admitted.execution().root())?;
         let context =
             staging.materialize(&self.admitted, step, round, history, &self.diagnostics)?;
@@ -1173,7 +1163,7 @@ where
         step: String,
         round: RecoveryRoundNumber,
         action: ActionId,
-        agent: MaterializedAgentInvocation<AgentExecutionObservationSink<Clock::Instant, Observer>>,
+        agent: MaterializedAgentInvocation,
         context: super::recovery::RecoveryInvocationStaging,
         mut cancellation: oneshot::Receiver<()>,
     ) -> Result<(), StepRuntimeError> {
@@ -1189,7 +1179,6 @@ where
         }
         let (invocation, staging) = agent.into_parts();
         let (started_callback, started) = agent_start_channel();
-        let (terminal, outcome) = agent_terminal_channel(invocation.value_mode());
         let dispatcher = match &self.agents {
             AgentExecution::Enabled { dispatcher, .. } => dispatcher.clone(),
             AgentExecution::Disabled => {
@@ -1205,17 +1194,14 @@ where
                     .await;
             }
         };
-        let mut invocation_task = tokio::spawn(async move {
-            invoke_agent_dispatcher(&dispatcher, invocation, started_callback, terminal).await;
-        });
+        let mut invocation_task =
+            tokio::spawn(async move { dispatcher.invoke(invocation, started_callback).await });
         let started = started.receive();
         tokio::pin!(started);
-        let outcome = outcome.receive();
-        tokio::pin!(outcome);
         let boundary = tokio::select! {
             biased;
             result = &mut started => AgentLifecycleBoundary::Started(result),
-            result = &mut outcome => AgentLifecycleBoundary::Terminal(result),
+            result = &mut invocation_task => AgentLifecycleBoundary::Terminal(agent_task_outcome(result)),
         };
         let (lifecycle_started, outcome) = match boundary {
             AgentLifecycleBoundary::Started(Ok(())) => {
@@ -1227,40 +1213,35 @@ where
                         self.with_work(|work| work.record_started(action));
                     }
                     Ok(StartDelivery::Cancelled(cancellation)) => {
-                        let _ = tokio::join!(&mut invocation_task, &mut outcome);
+                        let _ = (&mut invocation_task).await;
                         drop(staging);
                         drop(context);
                         return self.finish_cancellation(action, cancellation).await;
                     }
                     Ok(StartDelivery::Gone) => {
-                        let _ = tokio::join!(&mut invocation_task, &mut outcome);
+                        let _ = (&mut invocation_task).await;
                         drop(staging);
                         drop(context);
                         self.with_work(|work| work.abandon(action));
                         return Ok(());
                     }
                     Err(failure) => {
-                        let _ = tokio::join!(&mut invocation_task, &mut outcome);
+                        let _ = (&mut invocation_task).await;
                         drop(staging);
                         drop(context);
                         self.with_work(|work| work.abandon(action));
                         return Err(failure);
                     }
                 }
-                let (_, outcome) = tokio::join!(&mut invocation_task, &mut outcome);
+                let outcome = agent_task_outcome((&mut invocation_task).await);
                 (true, outcome)
             }
             AgentLifecycleBoundary::Started(Err(_)) => {
-                let (_, outcome) = tokio::join!(&mut invocation_task, &mut outcome);
+                let outcome = agent_task_outcome((&mut invocation_task).await);
                 (false, outcome)
             }
-            AgentLifecycleBoundary::Terminal(outcome) => {
-                let _ = invocation_task.await;
-                (false, outcome)
-            }
+            AgentLifecycleBoundary::Terminal(outcome) => (false, outcome),
         };
-        let outcome = outcome
-            .unwrap_or_else(|_| failed_agent_outcome(AgentFailureCause::HarnessProtocolFailed));
         if matches!(outcome, AgentOutcome::Cancelled { .. })
             && self
                 .admitted
@@ -1510,7 +1491,7 @@ where
         &self,
         step: String,
         action: ActionId,
-        agent: PreparedAgent<AgentExecutionObservationSink<Clock::Instant, Observer>>,
+        agent: PreparedAgent,
         mut cancellation: oneshot::Receiver<()>,
     ) -> Result<(), StepRuntimeError> {
         let process_control = agent.materialized.invocation().process_control().clone();
@@ -1531,7 +1512,6 @@ where
             .map(str::to_owned);
         let (invocation, staging) = materialized.into_parts();
         let (started_callback, started) = agent_start_channel();
-        let (terminal, outcome) = agent_terminal_channel(invocation.value_mode());
         let dispatcher = match &self.agents {
             AgentExecution::Enabled { dispatcher, .. } => dispatcher.clone(),
             AgentExecution::Disabled => {
@@ -1545,18 +1525,15 @@ where
                     .await;
             }
         };
-        let mut invocation_task = tokio::spawn(async move {
-            invoke_agent_dispatcher(&dispatcher, invocation, started_callback, terminal).await;
-        });
+        let mut invocation_task =
+            tokio::spawn(async move { dispatcher.invoke(invocation, started_callback).await });
         let started = started.receive();
         tokio::pin!(started);
-        let outcome = outcome.receive();
-        tokio::pin!(outcome);
 
         let boundary = tokio::select! {
             biased;
             result = &mut started => AgentLifecycleBoundary::Started(result),
-            result = &mut outcome => AgentLifecycleBoundary::Terminal(result),
+            result = &mut invocation_task => AgentLifecycleBoundary::Terminal(agent_task_outcome(result)),
         };
 
         let (lifecycle_started, outcome) = match boundary {
@@ -1569,37 +1546,32 @@ where
                         self.with_work(|work| work.record_started(action));
                     }
                     Ok(StartDelivery::Cancelled(cancellation)) => {
-                        let _ = tokio::join!(&mut invocation_task, &mut outcome);
+                        let _ = (&mut invocation_task).await;
                         drop(staging);
                         return self.finish_cancellation(action, cancellation).await;
                     }
                     Ok(StartDelivery::Gone) => {
-                        let _ = tokio::join!(&mut invocation_task, &mut outcome);
+                        let _ = (&mut invocation_task).await;
                         drop(staging);
                         self.with_work(|work| work.abandon(action));
                         return Ok(());
                     }
                     Err(failure) => {
-                        let _ = tokio::join!(&mut invocation_task, &mut outcome);
+                        let _ = (&mut invocation_task).await;
                         drop(staging);
                         self.with_work(|work| work.abandon(action));
                         return Err(failure);
                     }
                 }
-                let (_, outcome) = tokio::join!(&mut invocation_task, &mut outcome);
+                let outcome = agent_task_outcome((&mut invocation_task).await);
                 (true, outcome)
             }
             AgentLifecycleBoundary::Started(Err(_)) => {
-                let (_, outcome) = tokio::join!(&mut invocation_task, &mut outcome);
+                let outcome = agent_task_outcome((&mut invocation_task).await);
                 (false, outcome)
             }
-            AgentLifecycleBoundary::Terminal(outcome) => {
-                let _ = invocation_task.await;
-                (false, outcome)
-            }
+            AgentLifecycleBoundary::Terminal(outcome) => (false, outcome),
         };
-        let outcome = outcome
-            .unwrap_or_else(|_| failed_agent_outcome(AgentFailureCause::HarnessProtocolFailed));
 
         if matches!(outcome, AgentOutcome::Cancelled { .. }) {
             drop(staging);
@@ -1890,10 +1862,7 @@ where
         step: &str,
         action: ActionId,
         action_inputs: &BTreeMap<String, ActionInput<CapturedValue>>,
-    ) -> Result<
-        PreparedStep<AgentExecutionObservationSink<Clock::Instant, Observer>>,
-        StepStartFailure,
-    > {
+    ) -> Result<PreparedStep, StepStartFailure> {
         let definition =
             workflow_node(&self.admitted, step).ok_or(StepStartFailure::StepUnavailable)?;
         let body = match StepBody::from(definition) {
@@ -1989,7 +1958,7 @@ where
                 })?;
                 accounting.record_native_session(
                     materialized.invocation().identity(),
-                    materialized.invocation().profile(),
+                    materialized.invocation().adapter().profile(),
                     materialized.invocation().diagnostic_session(),
                 );
                 PreparedStepBody::Agent(Box::new(PreparedAgent { materialized }))
@@ -3026,7 +2995,11 @@ enum CommandLaunchBoundary<Deadline> {
 
 enum AgentLifecycleBoundary {
     Started(Result<(), AgentStartReceiveError>),
-    Terminal(Result<AgentOutcome, AgentTerminalReceiveError>),
+    Terminal(AgentOutcome),
+}
+
+fn agent_task_outcome(result: Result<AgentOutcome, tokio::task::JoinError>) -> AgentOutcome {
+    result.unwrap_or_else(|_| failed_agent_outcome(AgentFailureCause::HarnessProtocolFailed))
 }
 
 enum BeginLaunch<Deadline> {
@@ -3526,40 +3499,28 @@ fn completed_agent_outputs(
     Ok(BTreeMap::from([output]))
 }
 
-enum PreparedRecoveryHandler<Sink>
-where
-    Sink: AgentObservationSink,
-{
+enum PreparedRecoveryHandler {
     Command {
         command: PreparedCommand,
         context: super::recovery::RecoveryInvocationStaging,
     },
     Agent {
-        agent: Box<MaterializedAgentInvocation<Sink>>,
+        agent: Box<MaterializedAgentInvocation>,
         context: super::recovery::RecoveryInvocationStaging,
     },
 }
 
-struct PreparedStep<Sink>
-where
-    Sink: AgentObservationSink,
-{
-    body: PreparedStepBody<Sink>,
+struct PreparedStep {
+    body: PreparedStepBody,
 }
 
-enum PreparedStepBody<Sink>
-where
-    Sink: AgentObservationSink,
-{
+enum PreparedStepBody {
     Command(PreparedCommand),
-    Agent(Box<PreparedAgent<Sink>>),
+    Agent(Box<PreparedAgent>),
 }
 
-struct PreparedAgent<Sink>
-where
-    Sink: AgentObservationSink,
-{
-    materialized: MaterializedAgentInvocation<Sink>,
+struct PreparedAgent {
+    materialized: MaterializedAgentInvocation,
 }
 
 struct PreparedCommand {

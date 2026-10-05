@@ -19,20 +19,18 @@ mod workflow;
 
 pub use claude_code::{
     CLAUDE_CODE_STREAM_JSON_V1_QUALIFICATION_VERSION, CLAUDE_CODE_STREAM_JSON_V1_SUPPORTED_RANGE,
-    ClaudeCodeCompatibilityProfile, ClaudeCodeIncompatibility, ClaudeCodeInstallationFailure,
-    ClaudeCodeProbe, ValidatedClaudeCodeInstallation,
-    discover_and_validate_claude_code_installation,
+    ClaudeCodeIncompatibility, ClaudeCodeInstallationFailure, ClaudeCodeProbe,
+    ValidatedClaudeCodeInstallation, discover_and_validate_claude_code_installation,
 };
 pub use codex::{
     CODEX_APP_SERVER_V1_QUALIFICATION_VERSION, CODEX_APP_SERVER_V1_SUPPORTED_RANGE,
-    CodexCompatibilityProfile, CodexIncompatibility, CodexInstallationFailure, CodexProbe,
-    ValidatedCodexInstallation, discover_and_validate_codex_installation,
+    CodexIncompatibility, CodexInstallationFailure, CodexProbe, ValidatedCodexInstallation,
+    discover_and_validate_codex_installation,
 };
 pub use owned_tree::{RemovalError, open_directory_at, open_regular_file_at, remove_open_tree_at};
 pub use pi::{
-    PI_JSON_V1_QUALIFICATION_VERSION, PI_JSON_V1_SUPPORTED_RANGE, PiCompatibilityProfile,
-    PiIncompatibility, PiInstallationFailure, PiProbe, ValidatedPiInstallation,
-    discover_and_validate_pi_installation,
+    PI_JSON_V1_QUALIFICATION_VERSION, PI_JSON_V1_SUPPORTED_RANGE, PiIncompatibility,
+    PiInstallationFailure, PiProbe, ValidatedPiInstallation, discover_and_validate_pi_installation,
 };
 pub use workflow::MAXIMUM_RETAINED_BYTES_PER_STREAM;
 pub use workflow::admission::admit_workflow;
@@ -245,23 +243,21 @@ pub use workflow::CanonicalJsonError;
 pub use workflow::admission::ClaudeCodeStreamJsonV1Admission;
 pub use workflow::admission::CodexAppServerV1Admission;
 pub use workflow::admission::PiJsonV1Admission;
-pub use workflow::agent::AgentFailure;
 pub use workflow::agent::AgentInvocation;
 pub use workflow::agent::AgentObservationEnvelope;
 pub use workflow::agent::AgentObservationSink;
 pub use workflow::agent::AgentStartCallback;
-pub use workflow::agent::AgentTerminalCallback;
 pub use workflow::agent::dispatch::AgentInvocationDispatcher;
+pub use workflow::agent::{AgentCompatibilityProfile, AgentFailure};
 pub use workflow::agent_input::AgentInputStartFailure;
-pub use workflow::agent_input::ClosedAgentInvocation;
 pub use workflow::artifact::ArtifactHandle;
 pub use workflow::artifact::CaptureCandidateSet;
 pub use workflow::artifact::CaptureFailure;
 pub use workflow::artifact::CapturedArtifact;
 pub use workflow::artifact::CapturedGitBranch;
 pub use workflow::capacity::WorkflowCapacity;
-pub use workflow::claude_code_stream_json_v1::ClaudeCodeStreamJsonV1ProtocolLimits;
-pub use workflow::codex_app_server_v1::CodexAppServerV1ProtocolLimits;
+pub use workflow::claude_code::ClaudeCodeStreamJsonV1ProtocolLimits;
+pub use workflow::codex::CodexAppServerV1ProtocolLimits;
 pub use workflow::coordinator::CommitPort;
 pub use workflow::coordinator::CommittedReduction;
 pub use workflow::git_capture::GitCaptureFailure;
@@ -269,7 +265,7 @@ pub use workflow::git_capture::GitCommandTimeout;
 pub use workflow::input::InputPreparationFailure;
 pub use workflow::observation::CommandOutputClosedObservation;
 pub use workflow::observation::CommandOutputObservation;
-pub use workflow::pi_json_v1::PiJsonV1ProtocolLimits;
+pub use workflow::pi::PiJsonV1ProtocolLimits;
 pub use workflow::process_group::LeaderState;
 pub use workflow::publication::DiagnosticStreamV1;
 pub use workflow::publication::RunResultInvariant;

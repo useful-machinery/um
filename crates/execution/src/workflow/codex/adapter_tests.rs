@@ -20,11 +20,11 @@ use super::*;
 use crate::codex::CODEX_APP_SERVER_V1_QUALIFICATION_VERSION;
 use crate::workflow::admission::{CancellationReason, CancellationSource, EnvironmentSnapshot};
 use crate::workflow::agent::{
-    AdmittedAgentAdapter, AgentCompatibilityProfile, AgentInvocation, AgentInvocationIdentity,
-    AgentInvocationLimits, AgentInvocationStaging, AgentObservationEnvelope, AgentProcessContext,
-    AgentProcessControl, AgentPrompt, AgentStartReceiver, AgentTerminalReceiver, AgentValueMode,
-    PositiveDuration, RetainedJsonSchema, StagedAgentAttachment, WorkflowRunId,
-    agent_start_channel, agent_terminal_channel, invoke_agent_adapter,
+    AdmittedAgentAdapter, AgentAdapter, AgentCompatibilityProfile, AgentInvocation,
+    AgentInvocationIdentity, AgentInvocationLimits, AgentInvocationStaging,
+    AgentObservationEnvelope, AgentProcessContext, AgentProcessControl, AgentPrompt,
+    AgentStartReceiver, AgentValueMode, PositiveDuration, RetainedJsonSchema,
+    StagedAgentAttachment, WorkflowRunId, agent_start_channel,
 };
 use crate::workflow::agent_diagnostics::AgentDiagnosticSession;
 use crate::workflow::agent_process_driver::test_support::{
@@ -69,7 +69,7 @@ for argument in "$@"; do
 done > "$CODEX_FIXTURE_ARGUMENTS"
 printf 'bounded Codex fixture diagnostic\n' >&2
 exec "$CODEX_FIXTURE_HELPER" \
-  --exact workflow::codex_app_server_v1::adapter_tests::codex_process_fixture \
+  --exact workflow::codex::adapter_tests::codex_process_fixture \
   --ignored --test-threads=1 \
   3>&1 >/dev/null
 "#;
@@ -135,8 +135,7 @@ fn assert_failure_cause(outcome: AgentOutcome, expected: AgentFailureCause, scen
     assert_eq!(failure.cause(), &expected, "{scenario}");
 }
 
-type TestInvocation =
-    AgentInvocation<CodexConfig, CodexAppServerV1ProtocolLimits, RecordingObservationSink>;
+type TestInvocation = AgentInvocation;
 
 struct ProcessFixture {
     _temporary: tempfile::TempDir,
@@ -572,7 +571,7 @@ fn start_fixture(
 ) -> (
     tokio::task::JoinHandle<()>,
     AgentStartReceiver,
-    AgentTerminalReceiver,
+    tokio::sync::oneshot::Receiver<AgentOutcome>,
 ) {
     start_fixture_with_clock(invocation, diagnostics, PendingClock)
 }
@@ -584,7 +583,7 @@ fn start_fixture_with_clock<Clock: CoordinatorClock>(
 ) -> (
     tokio::task::JoinHandle<()>,
     AgentStartReceiver,
-    AgentTerminalReceiver,
+    tokio::sync::oneshot::Receiver<AgentOutcome>,
 ) {
     start_fixture_with_clock_and_synthetic_model_provider(
         invocation,
@@ -602,9 +601,8 @@ fn start_fixture_with_clock_and_synthetic_model_provider<Clock: CoordinatorClock
 ) -> (
     tokio::task::JoinHandle<()>,
     AgentStartReceiver,
-    AgentTerminalReceiver,
+    tokio::sync::oneshot::Receiver<AgentOutcome>,
 ) {
-    let value_mode = invocation.value_mode().clone();
     let adapter = CodexAppServerV1Adapter::with_validation_worker(
         diagnostics,
         NonZeroU64::new(1024).unwrap(),
@@ -615,9 +613,9 @@ fn start_fixture_with_clock_and_synthetic_model_provider<Clock: CoordinatorClock
         synthetic_model_provider,
     );
     let (started, start) = agent_start_channel();
-    let (terminal, outcome) = agent_terminal_channel(&value_mode);
+    let (terminal, outcome) = tokio::sync::oneshot::channel();
     let task = tokio::spawn(async move {
-        invoke_agent_adapter(&adapter, invocation, started, terminal).await;
+        let _ = terminal.send(adapter.invoke(invocation, started).await);
     });
     (task, start, outcome)
 }
@@ -626,7 +624,7 @@ struct RunningCancellationFixture {
     fixture: ProcessFixture,
     task: tokio::task::JoinHandle<()>,
     start: Option<AgentStartReceiver>,
-    outcome: AgentTerminalReceiver,
+    outcome: tokio::sync::oneshot::Receiver<AgentOutcome>,
     cancellation: CancellationSource,
     process_control: AgentProcessControl,
 }
@@ -661,7 +659,7 @@ impl RunningCancellationFixture {
 
     async fn finish(self) -> (ProcessFixture, AgentOutcome) {
         self.task.await.unwrap();
-        let outcome = self.outcome.receive().await.unwrap();
+        let outcome = self.outcome.await.unwrap();
         (self.fixture, outcome)
     }
 }
@@ -684,7 +682,7 @@ async fn run_fixture_with_synthetic_model_provider(
         synthetic_model_provider,
     );
     task.await.unwrap();
-    let outcome = outcome.receive().await.unwrap();
+    let outcome = outcome.await.unwrap();
     let started = start.receive().await.is_ok();
     if fixture.process.is_file() {
         let process = fixture_process(&fixture.process);
@@ -3796,7 +3794,7 @@ pub(super) mod structured_result {
             control.expired.send_replace(true);
             task.await.unwrap();
             assert_eq!(
-                outcome.receive().await.unwrap(),
+                outcome.await.unwrap(),
                 AgentOutcome::Failed(AgentFailureCause::ResultSettlementFailed.into()),
             );
             assert!(process_group_is_quiescent(fixture_process(
@@ -4208,7 +4206,7 @@ pub(super) mod adversarial_lifecycle {
 
             task.await.unwrap();
             assert_failure_cause(
-                outcome.receive().await.unwrap(),
+                outcome.await.unwrap(),
                 AgentFailureCause::HarnessProtocolFailed,
                 "stalled-request-responses",
             );

@@ -29,12 +29,10 @@ use crate::workflow::admission::{CancellationReason, CancellationSource, Environ
 use crate::workflow::agent::{
     AgentAdapter, AgentCompatibilityProfile, AgentHarnessSetupStage, AgentInvocation,
     AgentInvocationLimits, AgentInvocationStaging, AgentProcessContext, AgentPrompt,
-    AgentStartReceiver, AgentTerminalReceiver, AgentValueMode, PositiveDuration,
-    RetainedJsonSchema, StagedAgentAttachment, agent_start_channel, agent_terminal_channel,
-    invoke_agent_adapter,
+    AgentStartReceiver, AgentValueMode, PositiveDuration, RetainedJsonSchema,
+    StagedAgentAttachment, agent_start_channel,
 };
 use crate::workflow::agent_diagnostics::{AgentDiagnosticSession, AgentDiagnosticSessionStore};
-use crate::workflow::claude_code::ClaudeCodeConfig;
 use crate::workflow::coordinator::CoordinatorClock;
 use crate::workflow::diagnostic::StepDiagnosticLog;
 use crate::workflow::execution_root::AdmittedExecutionRoot;
@@ -104,37 +102,33 @@ printf '%s\n' "$output"
 
 const CANCELLATION_FAKE_CLAUDE: &str = r#"#!/bin/sh
 exec "$CLAUDE_FIXTURE_PROCESS_HELPER" \
-  --exact workflow::claude_code_stream_json_v1::adapter_tests::cancellation_process_fixture \
+  --exact workflow::claude_code::adapter_tests::cancellation_process_fixture \
   --ignored --test-threads=1 \
   3>&1 >/dev/null 2>&1
 "#;
 
 const STUBBORN_DESCENDANT_FAKE_CLAUDE: &str = r#"#!/bin/sh
 exec "$CLAUDE_FIXTURE_PROCESS_HELPER" \
-  --exact workflow::claude_code_stream_json_v1::adapter_tests::stubborn_process_fixture \
+  --exact workflow::claude_code::adapter_tests::stubborn_process_fixture \
   --ignored --test-threads=1 \
   3>&1 >/dev/null 2>&1
 "#;
 
 const STDOUT_BEFORE_INPUT_FAKE_CLAUDE: &str = r#"#!/bin/sh
 exec "$CLAUDE_FIXTURE_PROCESS_HELPER" \
-  --exact workflow::claude_code_stream_json_v1::adapter_tests::stdout_before_input_process_fixture \
+  --exact workflow::claude_code::adapter_tests::stdout_before_input_process_fixture \
   --ignored --test-threads=1 \
   3>&1 >/dev/null 2>&1
 "#;
 
 const BLOCKED_INPUT_FAKE_CLAUDE: &str = r#"#!/bin/sh
 exec "$CLAUDE_FIXTURE_PROCESS_HELPER" \
-  --exact workflow::claude_code_stream_json_v1::adapter_tests::blocked_input_process_fixture \
+  --exact workflow::claude_code::adapter_tests::blocked_input_process_fixture \
   --ignored --test-threads=1 \
   3>&1 >/dev/null 2>&1
 "#;
 
-type TestInvocation = AgentInvocation<
-    ClaudeCodeConfig,
-    ClaudeCodeStreamJsonV1ProtocolLimits,
-    RecordingObservationSink,
->;
+type TestInvocation = AgentInvocation;
 
 struct ProcessFixture {
     _temporary: tempfile::TempDir,
@@ -409,7 +403,7 @@ async fn run_fixture_allowing_start_failure(
     task.await.unwrap();
     (
         fixture,
-        outcome.receive().await.unwrap(),
+        outcome.await.unwrap(),
         start.receive().await.is_ok(),
     )
 }
@@ -420,9 +414,8 @@ fn start_process_fixture(
 ) -> (
     tokio::task::JoinHandle<()>,
     AgentStartReceiver,
-    AgentTerminalReceiver,
+    tokio::sync::oneshot::Receiver<AgentOutcome>,
 ) {
-    let value_mode = invocation.value_mode().clone();
     let adapter = ClaudeCodeStreamJsonV1Adapter::with_worker(
         diagnostics,
         NonZeroU64::new(1024).unwrap(),
@@ -431,9 +424,9 @@ fn start_process_fixture(
         InlineValidationWorker,
     );
     let (started, start) = agent_start_channel();
-    let (terminal, outcome) = agent_terminal_channel(&value_mode);
+    let (terminal, outcome) = tokio::sync::oneshot::channel();
     let task = tokio::spawn(async move {
-        invoke_agent_adapter(&adapter, invocation, started, terminal).await;
+        let _ = terminal.send(adapter.invoke(invocation, started).await);
     });
     (task, start, outcome)
 }
@@ -492,17 +485,12 @@ async fn invoke_fixture_adapter<Adapter>(
     adapter: Adapter,
 ) -> AgentOutcome
 where
-    Adapter: AgentAdapter<
-            RecordingObservationSink,
-            NativeConfiguration = ClaudeCodeConfig,
-            ProtocolLimits = ClaudeCodeStreamJsonV1ProtocolLimits,
-        >,
+    Adapter: AgentAdapter,
 {
-    let value_mode = invocation.value_mode().clone();
     let (started, start) = agent_start_channel();
-    let (terminal, outcome) = agent_terminal_channel(&value_mode);
-    invoke_agent_adapter(&adapter, invocation, started, terminal).await;
-    let outcome = outcome.receive().await.unwrap();
+    let (terminal, outcome) = tokio::sync::oneshot::channel();
+    let _ = terminal.send(adapter.invoke(invocation, started).await);
+    let outcome = outcome.await.unwrap();
     assert_eq!(
         start.receive().await,
         Ok(()),
@@ -1050,7 +1038,7 @@ fn stubborn_process_fixture() {
     let interrupted = process_fixture_interrupt_receiver();
     write_process_fixture_id("CLAUDE_FIXTURE_ARGUMENTS");
     let _descendant = spawn_process_fixture(
-        "workflow::claude_code_stream_json_v1::adapter_tests::stubborn_descendant_process_fixture",
+        "workflow::claude_code::adapter_tests::stubborn_descendant_process_fixture",
     );
     interrupted.recv().unwrap();
     write_process_fixture_signal("CLAUDE_FIXTURE_INTERRUPTED", b"interrupted\n");
@@ -1408,7 +1396,6 @@ async fn stalled_initial_input_write_reaches_a_typed_deadline() {
         let mut fixture =
             process_fixture_with_large_native_attachment(BLOCKED_INPUT_FAKE_CLAUDE, 0x24);
         let invocation = fixture.invocation.take().unwrap();
-        let value_mode = invocation.value_mode().clone();
         let (clock, mut registered, release) = controlled_clock();
         let adapter = ClaudeCodeStreamJsonV1Adapter::with_worker(
             fixture.diagnostics.clone(),
@@ -1418,15 +1405,15 @@ async fn stalled_initial_input_write_reaches_a_typed_deadline() {
             InlineValidationWorker,
         );
         let (started, start) = agent_start_channel();
-        let (terminal, outcome) = agent_terminal_channel(&value_mode);
+        let (terminal, outcome) = tokio::sync::oneshot::channel();
         let task = tokio::spawn(async move {
-            invoke_agent_adapter(&adapter, invocation, started, terminal).await;
+            let _ = terminal.send(adapter.invoke(invocation, started).await);
         });
 
         assert_eq!(registered.recv().await, Some(STANDARD_INPUT_WRITE_TIMEOUT));
         release.send_replace(true);
         task.await.unwrap();
-        let outcome = outcome.receive().await.unwrap();
+        let outcome = outcome.await.unwrap();
         assert!(start.receive().await.is_err());
         assert_agent_failure(
             &outcome,
@@ -2159,7 +2146,7 @@ async fn parser_rejection_is_surfaced_and_retained_beside_claude_invocation_meta
         metadata["nativeSession"],
         json!({
             "relativeDirectory": "session",
-            "formatVersion": 1,
+            "formatVersion": 1
         })
     );
     assert!(metadata.get("nativeSessionPersistence").is_none());
@@ -2223,7 +2210,7 @@ async fn cancellation_during_native_work_drains_and_quiesces_before_reporting() 
         let process = fixture_process(&process_path);
         assert!(cancellation.request_cancellation(CancellationReason::UserRequest));
         assert_eq!(interrupted.receive().await, b"interrupted\n");
-        assert_user_cancelled(outcome.receive().await.unwrap());
+        assert_user_cancelled(outcome.await.unwrap());
         task.await.unwrap();
         assert!(process_group_is_quiescent(process));
         assert!(
@@ -2269,7 +2256,7 @@ async fn forced_cancellation_removes_a_stubborn_in_group_descendant() {
         assert!(!process_group_is_quiescent(leader));
         assert_eq!(getpgid(Some(descendant)).unwrap(), leader);
         process_control.force();
-        assert_user_cancelled(outcome.receive().await.unwrap());
+        assert_user_cancelled(outcome.await.unwrap());
         task.await.unwrap();
         assert!(process_group_is_quiescent(leader));
     })

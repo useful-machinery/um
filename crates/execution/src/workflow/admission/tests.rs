@@ -7,14 +7,9 @@ use std::time::Duration;
 use tempfile::TempDir;
 
 use super::*;
-use crate::claude_code::{ClaudeCodeCompatibilityProfile, ValidatedClaudeCodeInstallation};
-use crate::codex::{
-    CODEX_APP_SERVER_V1_QUALIFICATION_VERSION, CodexCompatibilityProfile,
-    ValidatedCodexInstallation,
-};
-use crate::pi::{
-    PI_JSON_V1_QUALIFICATION_VERSION, PiCapability, PiCompatibilityProfile, ValidatedPiInstallation,
-};
+use crate::claude_code::ValidatedClaudeCodeInstallation;
+use crate::codex::{CODEX_APP_SERVER_V1_QUALIFICATION_VERSION, ValidatedCodexInstallation};
+use crate::pi::{PI_JSON_V1_QUALIFICATION_VERSION, PiCapability, ValidatedPiInstallation};
 use crate::workflow::claude_code::{ClaudeCodeConfig, ClaudeCodeEffort};
 use crate::workflow::codex::CodexConfig;
 use crate::workflow::pi::Thinking;
@@ -712,7 +707,7 @@ fn admission_pins_every_pi_configuration_and_bound_without_native_or_mutable_loo
         );
         assert_eq!(
             step.installation().profile(),
-            PiCompatibilityProfile::PiJsonV1
+            AgentCompatibilityProfile::PiJsonV1
         );
         assert!(
             step.installation()
@@ -824,7 +819,7 @@ fn internal_claude_admission_retains_native_effort_and_profile_limits() {
     assert_eq!(agent.installation(), &installation);
     assert_eq!(
         agent.installation().profile(),
-        ClaudeCodeCompatibilityProfile::ClaudeCodeStreamJsonV1
+        AgentCompatibilityProfile::ClaudeCodeStreamJsonV1
     );
     assert_eq!(agent.installation().version().as_str(), "2.1.284");
     assert_eq!(agent.configuration().model, "claude-opus-4-1");
@@ -867,7 +862,7 @@ fn codex_admission_preserves_the_exact_installation_configuration_and_limits() {
     assert_eq!(agent.installation(), &installation);
     assert_eq!(
         agent.installation().profile(),
-        CodexCompatibilityProfile::CodexAppServerV1
+        AgentCompatibilityProfile::CodexAppServerV1
     );
     assert_eq!(
         agent.installation().version().as_str(),

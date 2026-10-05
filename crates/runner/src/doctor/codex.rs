@@ -2,9 +2,9 @@ use std::collections::BTreeMap;
 
 use super::{CheckDescriptor, DoctorCheck, Outcome, compatible_harness_outcome};
 use um_execution::{
-    CODEX_APP_SERVER_V1_QUALIFICATION_VERSION, CODEX_APP_SERVER_V1_SUPPORTED_RANGE,
-    CodexCompatibilityProfile, CodexIncompatibility, CodexInstallationFailure, CodexProbe,
-    discover_and_validate_codex_installation,
+    AgentCompatibilityProfile, CODEX_APP_SERVER_V1_QUALIFICATION_VERSION,
+    CODEX_APP_SERVER_V1_SUPPORTED_RANGE, CodexIncompatibility, CodexInstallationFailure,
+    CodexProbe, discover_and_validate_codex_installation,
 };
 
 pub(super) struct CodexCheck;
@@ -104,7 +104,7 @@ fn compatibility_details() -> BTreeMap<String, String> {
     BTreeMap::from([
         (
             "profile".to_owned(),
-            CodexCompatibilityProfile::CodexAppServerV1
+            AgentCompatibilityProfile::CodexAppServerV1
                 .as_str()
                 .to_owned(),
         ),

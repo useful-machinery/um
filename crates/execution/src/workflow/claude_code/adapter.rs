@@ -18,22 +18,21 @@ use tokio::net::UnixStream;
 use tokio::sync::mpsc;
 
 use super::{
-    ClaudeCodeStreamJsonV1Parser, ClaudeCodeStreamJsonV1ProtocolLimits,
-    ClaudeCodeStreamJsonV1RejectionReason, CompletedResultExchange, FIXED_INVOCATION_ENVIRONMENT,
-    initial_user_text_frame, normal_mode_arguments, result_mode_arguments, user_content_frame,
+    ClaudeCodeStreamJsonV1Parser, ClaudeCodeStreamJsonV1RejectionReason, CompletedResultExchange,
+    FIXED_INVOCATION_ENVIRONMENT, initial_user_text_frame, normal_mode_arguments,
+    result_mode_arguments, user_content_frame,
 };
 use crate::claude_code::compatibility_profile_for_version;
 use crate::workflow::admission::{CancellationReason, CancellationSource};
 use crate::workflow::agent::{
     AgentCompatibilityProfile, AgentDiagnosticLevel, AgentFailureCause, AgentInvocation,
-    AgentLifecycleMilestone, AgentObservation, AgentObservationSink, AgentOutcome,
-    AgentProcessDirective, AgentStartCallback, AgentValueKind, OrderedAgentObservationSink,
-    PositiveDuration, StagedAgentAttachment, failed_agent_outcome, finish_agent_diagnostic_capture,
+    AgentLifecycleMilestone, AgentObservation, AgentOutcome, AgentProcessDirective,
+    AgentStartCallback, AgentValueKind, OrderedAgentObservationSink, PositiveDuration,
+    StagedAgentAttachment, failed_agent_outcome, finish_agent_diagnostic_capture,
 };
 use crate::workflow::agent_process_driver::{
     self, StdioProcess, WriteDeadline, close_standard_input,
 };
-use crate::workflow::claude_code::ClaudeCodeConfig;
 use crate::workflow::coordinator::CoordinatorClock;
 use crate::workflow::observation::ExecutionObserver;
 use crate::workflow::private_staging::open_directory_path;
@@ -61,29 +60,8 @@ pub(crate) type ClaudeCodeStreamJsonV1Adapter<
     Worker = ProcessResultValidationWorker,
 > = agent_process_driver::AdapterCore<Clock, Observer, Worker, ClaudeProfile>;
 
-impl<Clock, Observer, Worker, Sink>
-    agent_process_driver::NativeProcessProfile<Clock, Observer, Worker, Sink> for ClaudeProfile
-where
-    Clock: CoordinatorClock,
-    Observer: ExecutionObserver<Clock::Instant>,
-    Worker: ResultValidationWorker,
-    Sink: AgentObservationSink,
-{
-    type Configuration = ClaudeCodeConfig;
-    type Limits = ClaudeCodeStreamJsonV1ProtocolLimits;
-    const NAME: &'static str = "claude_code_stream_json_v1";
+agent_process_driver::native_process_adapter!(ClaudeProfile, "claude_code_stream_json_v1");
 
-    async fn invoke(
-        adapter: &agent_process_driver::AdapterCore<Clock, Observer, Worker, Self>,
-        invocation: AgentInvocation<ClaudeCodeConfig, ClaudeCodeStreamJsonV1ProtocolLimits, Sink>,
-        started: &AgentStartCallback,
-    ) -> AgentOutcome {
-        adapter.invoke_inner(invocation, started).await
-    }
-}
-
-// The concrete generic bounds are intentionally repeated per closed adapter; a shared
-// erased implementation would weaken exhaustive dispatch.
 impl<Clock, Observer, Worker>
     agent_process_driver::AdapterCore<Clock, Observer, Worker, ClaudeProfile>
 where
@@ -91,19 +69,24 @@ where
     Observer: ExecutionObserver<Clock::Instant>,
     Worker: ResultValidationWorker,
 {
-    async fn invoke_inner<Sink>(
+    async fn invoke_inner(
         &self,
-        invocation: AgentInvocation<ClaudeCodeConfig, ClaudeCodeStreamJsonV1ProtocolLimits, Sink>,
+        invocation: AgentInvocation,
         started: &AgentStartCallback,
-    ) -> AgentOutcome
-    where
-        Sink: AgentObservationSink,
-    {
+    ) -> AgentOutcome {
         // Claude's init acknowledgement and stream input make this a distinct startup
         // transition from Pi's session header and extension preparation.
         if let Some(reason) = invocation.cancellation().cancellation_reason() {
             return AgentOutcome::Cancelled { reason };
         }
+        let Some((configuration, _)) = invocation.adapter().native_configuration().claude_code()
+        else {
+            return failed_agent_outcome(AgentFailureCause::start_failure(
+                "harness profile",
+                "mismatch",
+            ));
+        };
+        let model: Arc<str> = Arc::from(configuration.model.as_str());
         let (invocation, plan) = match self
             .prepare_invocation(
                 invocation,
@@ -135,7 +118,7 @@ where
         let diagnostic = self.start_diagnostic(&invocation, standard_error);
         let parser = ClaudeCodeStreamJsonV1Parser::profile(
             Arc::clone(&plan.expected_cwd),
-            Arc::from(invocation.adapter().native_configuration().model.as_str()),
+            model,
             Arc::clone(&plan.session_id),
             Arc::from(invocation.adapter().version()),
             invocation.value_mode().kind(),
@@ -203,12 +186,9 @@ impl ClaudeCodeStreamJsonV1LaunchPlan {
     }
 }
 
-pub(super) fn prepare_launch<Sink>(
-    invocation: &AgentInvocation<ClaudeCodeConfig, ClaudeCodeStreamJsonV1ProtocolLimits, Sink>,
-) -> Result<ClaudeCodeStreamJsonV1LaunchPlan, AgentFailureCause>
-where
-    Sink: AgentObservationSink,
-{
+pub(super) fn prepare_launch(
+    invocation: &AgentInvocation,
+) -> Result<ClaudeCodeStreamJsonV1LaunchPlan, AgentFailureCause> {
     agent_process_driver::check_prompt_bounds(invocation)?;
     agent_process_driver::require_native_profile(
         invocation,
@@ -262,7 +242,11 @@ where
         })
         .map_err(|error| AgentFailureCause::start_failure("claude prompt write", error))?;
 
-    let configuration = invocation.adapter().native_configuration();
+    let (configuration, _) = invocation
+        .adapter()
+        .native_configuration()
+        .claude_code()
+        .ok_or_else(|| AgentFailureCause::start_failure("harness profile", "mismatch"))?;
     let arguments = if invocation.value_mode().kind() == AgentValueKind::Result {
         result_mode_arguments(
             &configuration.model,
@@ -303,14 +287,11 @@ struct OwnedAmbientSessionLink {
 }
 
 impl ClaudeCodeNativeSessionBridge {
-    fn prepare<Sink>(
-        invocation: &AgentInvocation<ClaudeCodeConfig, ClaudeCodeStreamJsonV1ProtocolLimits, Sink>,
+    fn prepare(
+        invocation: &AgentInvocation,
         expected_cwd: &Path,
         session_id: &str,
-    ) -> Result<Self, AgentFailureCause>
-    where
-        Sink: AgentObservationSink,
-    {
+    ) -> Result<Self, AgentFailureCause> {
         invocation
             .diagnostic_session()
             .verify_claude_code_native_session_path_binding()
@@ -439,13 +420,10 @@ impl Drop for ClaudeCodeNativeSessionBridge {
     }
 }
 
-fn claude_code_config_directory<Sink>(
-    invocation: &AgentInvocation<ClaudeCodeConfig, ClaudeCodeStreamJsonV1ProtocolLimits, Sink>,
+fn claude_code_config_directory(
+    invocation: &AgentInvocation,
     expected_cwd: &Path,
-) -> Result<PathBuf, AgentFailureCause>
-where
-    Sink: AgentObservationSink,
-{
+) -> Result<PathBuf, AgentFailureCause> {
     let environment = invocation.process().environment().variables();
     let configured = environment
         .get(std::ffi::OsStr::new("CLAUDE_CONFIG_DIR"))
@@ -511,12 +489,7 @@ fn base36(mut value: u32) -> String {
     reversed.iter().rev().collect()
 }
 
-fn initial_user_frame<Sink>(
-    invocation: &AgentInvocation<ClaudeCodeConfig, ClaudeCodeStreamJsonV1ProtocolLimits, Sink>,
-) -> Result<Vec<u8>, AgentFailureCause>
-where
-    Sink: AgentObservationSink,
-{
+fn initial_user_frame(invocation: &AgentInvocation) -> Result<Vec<u8>, AgentFailureCause> {
     if invocation.attachments().is_empty() {
         return initial_user_text_frame(invocation.prompt().message())
             .map_err(|_| AgentFailureCause::start_failure("launch preparation", "unavailable"));
@@ -702,20 +675,11 @@ fn read_staged_attachment(
 
 type LaunchedClaudeCodeProcess = StdioProcess;
 
-impl<Sink: AgentObservationSink>
-    agent_process_driver::StdioLaunchPlan<
-        ClaudeCodeConfig,
-        ClaudeCodeStreamJsonV1ProtocolLimits,
-        Sink,
-    > for ClaudeCodeStreamJsonV1LaunchPlan
-{
+impl agent_process_driver::StdioLaunchPlan for ClaudeCodeStreamJsonV1LaunchPlan {
     fn arguments(&self) -> &[OsString] {
         &self.arguments
     }
-    fn environment(
-        &self,
-        invocation: &AgentInvocation<ClaudeCodeConfig, ClaudeCodeStreamJsonV1ProtocolLimits, Sink>,
-    ) -> Vec<(OsString, OsString)> {
+    fn environment(&self, invocation: &AgentInvocation) -> Vec<(OsString, OsString)> {
         let mut environment = agent_process_driver::invocation_environment(invocation);
         environment.remove(OsStr::new("CLAUDE_CODE_PROJECT_DIR_NAME"));
         for (name, value) in FIXED_INVOCATION_ENVIRONMENT {
@@ -723,10 +687,7 @@ impl<Sink: AgentObservationSink>
         }
         environment.into_iter().collect()
     }
-    fn verify_binding(
-        &self,
-        invocation: &AgentInvocation<ClaudeCodeConfig, ClaudeCodeStreamJsonV1ProtocolLimits, Sink>,
-    ) -> Result<(), AgentFailureCause> {
+    fn verify_binding(&self, invocation: &AgentInvocation) -> Result<(), AgentFailureCause> {
         agent_process_driver::verify_session_binding(
             invocation
                 .diagnostic_session()
@@ -752,8 +713,8 @@ enum ClaudeExtra {
     SettlementExpired,
 }
 
-struct ClaudeProtocol<'a, Clock, Worker, Sink> {
-    invocation: &'a AgentInvocation<ClaudeCodeConfig, ClaudeCodeStreamJsonV1ProtocolLimits, Sink>,
+struct ClaudeProtocol<'a, Clock, Worker> {
+    invocation: &'a AgentInvocation,
     started: &'a AgentStartCallback,
     parser: ClaudeCodeStreamJsonV1Parser,
     validator: Option<&'a AuthoritativeResultValidator<Clock, Worker>>,
@@ -765,12 +726,10 @@ struct ClaudeProtocol<'a, Clock, Worker, Sink> {
     failure: Option<AgentFailureCause>,
 }
 
-impl<Clock, Worker, Sink> agent_process_driver::Protocol<Clock>
-    for ClaudeProtocol<'_, Clock, Worker, Sink>
+impl<Clock, Worker> agent_process_driver::Protocol<Clock> for ClaudeProtocol<'_, Clock, Worker>
 where
     Clock: CoordinatorClock,
     Worker: ResultValidationWorker,
-    Sink: AgentObservationSink,
 {
     type Extra = ClaudeExtra;
 
@@ -1017,8 +976,8 @@ struct ClaudeDriverInput<'a, Clock, Worker> {
     settlement_grace: PositiveDuration,
 }
 
-async fn drive_process<Clock, Worker, Sink>(
-    invocation: &AgentInvocation<ClaudeCodeConfig, ClaudeCodeStreamJsonV1ProtocolLimits, Sink>,
+async fn drive_process<Clock, Worker>(
+    invocation: &AgentInvocation,
     started: &AgentStartCallback,
     process: LaunchedClaudeCodeProcess,
     parser: ClaudeCodeStreamJsonV1Parser,
@@ -1028,7 +987,6 @@ async fn drive_process<Clock, Worker, Sink>(
 where
     Clock: CoordinatorClock,
     Worker: ResultValidationWorker,
-    Sink: AgentObservationSink,
 {
     let ClaudeDriverInput {
         bytes,
@@ -1169,8 +1127,8 @@ enum ObservationProgress {
     Failed,
 }
 
-async fn emit_observations<Sink: AgentObservationSink>(
-    sink: &OrderedAgentObservationSink<Sink>,
+async fn emit_observations(
+    sink: &OrderedAgentObservationSink,
     started: &AgentStartCallback,
     observations: Vec<AgentObservation>,
     cancellation: &CancellationSource,
@@ -1198,8 +1156,8 @@ async fn emit_observations<Sink: AgentObservationSink>(
     ObservationProgress::Completed
 }
 
-async fn emit_observation<Sink: AgentObservationSink>(
-    sink: &OrderedAgentObservationSink<Sink>,
+async fn emit_observation(
+    sink: &OrderedAgentObservationSink,
     observation: AgentObservation,
     cancellation: &CancellationSource,
 ) -> ObservationProgress {
@@ -1227,9 +1185,9 @@ enum ResultExchangeProgress {
     Cancelled(crate::workflow::admission::CancellationReason),
 }
 
-async fn handle_result_exchange<Clock, Worker, Sink>(
+async fn handle_result_exchange<Clock, Worker>(
     exchange: CompletedResultExchange,
-    invocation: &AgentInvocation<ClaudeCodeConfig, ClaudeCodeStreamJsonV1ProtocolLimits, Sink>,
+    invocation: &AgentInvocation,
     validator: Option<&AuthoritativeResultValidator<Clock, Worker>>,
     parser: &mut ClaudeCodeStreamJsonV1Parser,
     standard_input: &mut Option<UnixStream>,
@@ -1238,7 +1196,6 @@ async fn handle_result_exchange<Clock, Worker, Sink>(
 where
     Clock: CoordinatorClock,
     Worker: ResultValidationWorker,
-    Sink: AgentObservationSink,
 {
     match exchange {
         CompletedResultExchange::Candidate(candidate) => {
@@ -1291,8 +1248,8 @@ where
     }
 }
 
-async fn reject_and_continue<Clock: CoordinatorClock, Sink: AgentObservationSink>(
-    invocation: &AgentInvocation<ClaudeCodeConfig, ClaudeCodeStreamJsonV1ProtocolLimits, Sink>,
+async fn reject_and_continue<Clock: CoordinatorClock>(
+    invocation: &AgentInvocation,
     parser: &mut ClaudeCodeStreamJsonV1Parser,
     standard_input: &mut Option<UnixStream>,
     feedback: Arc<str>,

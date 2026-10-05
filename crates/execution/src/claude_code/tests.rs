@@ -115,7 +115,7 @@ fn stable_releases_in_range_with_every_capability_construct_pinned_installations
         assert_eq!(installation.version().as_str(), version);
         assert_eq!(
             installation.profile(),
-            ClaudeCodeCompatibilityProfile::ClaudeCodeStreamJsonV1
+            AgentCompatibilityProfile::ClaudeCodeStreamJsonV1
         );
         assert_eq!(
             installation.capabilities().required(),

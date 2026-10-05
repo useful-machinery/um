@@ -23,9 +23,7 @@ use crate::workflow::diagnostic::{CapturedDiagnosticStream, StepDiagnostic};
 use crate::workflow::evidence::{
     CancellationDetail, PrimaryIssue, failure_detail as canonical_failure_detail,
 };
-use crate::workflow::pi_json_v1::{
-    PiJsonV1Parser, PiJsonV1ProcessCompletion, PiJsonV1ProtocolLimits,
-};
+use crate::workflow::pi::{PiJsonV1Parser, PiJsonV1ProcessCompletion, PiJsonV1ProtocolLimits};
 use crate::workflow::resolution;
 use crate::workflow::result_validation::RetainedJsonSchema;
 use crate::workflow::runtime::{ForceAbortEvidence, OutputSet, RunCancellationPhase};

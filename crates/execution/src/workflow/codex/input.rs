@@ -1,18 +1,10 @@
 use serde_json::{Value, json};
 
-use crate::workflow::agent::{
-    AgentFailureCause, AgentInvocation, AgentObservationSink, StagedAgentAttachment,
-};
-use crate::workflow::codex::CodexConfig;
+use crate::workflow::agent::{AgentFailureCause, AgentInvocation, StagedAgentAttachment};
 
-use super::CodexAppServerV1ProtocolLimits;
-
-pub(super) fn initial_turn_input<Sink>(
-    invocation: &AgentInvocation<CodexConfig, CodexAppServerV1ProtocolLimits, Sink>,
-) -> Result<Vec<Value>, AgentFailureCause>
-where
-    Sink: AgentObservationSink,
-{
+pub(super) fn initial_turn_input(
+    invocation: &AgentInvocation,
+) -> Result<Vec<Value>, AgentFailureCause> {
     let validated = crate::workflow::agent_process_driver::validate_staged_attachments(
         invocation.attachments(),
         invocation.staging().result_endpoint_directory(),

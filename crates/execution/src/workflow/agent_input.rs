@@ -25,15 +25,13 @@ use super::agent_diagnostics::{
     AgentDiagnosticSession, AgentDiagnosticSessionError, AgentDiagnosticSessionStore,
 };
 use super::artifact::{ArtifactReadFailure, ArtifactStaging, CapturedArtifact};
-use super::claude_code::ClaudeCodeConfig;
-use super::claude_code_stream_json_v1::ClaudeCodeStreamJsonV1ProtocolLimits;
-use super::codex::CodexConfig;
-use super::codex_app_server_v1::CodexAppServerV1ProtocolLimits;
+#[cfg(test)]
+use super::claude_code::ClaudeCodeStreamJsonV1ProtocolLimits;
 use super::document::Output;
 use super::execution_root::{AdmittedExecutionRoot, open_directory};
 use super::invocation_accounting::InvocationAccountingLog;
-use super::pi::PiConfig;
-use super::pi_json_v1::PiJsonV1ProtocolLimits;
+#[cfg(test)]
+use super::pi::PiJsonV1ProtocolLimits;
 use super::private_staging::CleanupBlocker;
 use super::private_staging::{
     StagingDropPolicy, StagingLifecycle, cleanup_staging, create_staging_root, finish_payload_file,
@@ -58,102 +56,6 @@ const ATTACHMENT_DIRECTORY: &str = "attachments";
 const MESSAGE_FILE: &str = "message.md";
 const RESULT_ENDPOINT_DIRECTORY: &str = "result-endpoint";
 const STATIC_ATTACHMENT_MEDIA_TYPE: &str = "application/octet-stream";
-
-type PiJsonV1Invocation<Sink> = AgentInvocation<PiConfig, PiJsonV1ProtocolLimits, Sink>;
-type ClaudeCodeStreamJsonV1Invocation<Sink> =
-    AgentInvocation<ClaudeCodeConfig, ClaudeCodeStreamJsonV1ProtocolLimits, Sink>;
-type CodexAppServerV1Invocation<Sink> =
-    AgentInvocation<CodexConfig, CodexAppServerV1ProtocolLimits, Sink>;
-
-pub enum ClosedAgentInvocation<Sink>
-where
-    Sink: AgentObservationSink,
-{
-    Pi(PiJsonV1Invocation<Sink>),
-    ClaudeCode(ClaudeCodeStreamJsonV1Invocation<Sink>),
-    Codex(CodexAppServerV1Invocation<Sink>),
-}
-
-impl<Sink> ClosedAgentInvocation<Sink>
-where
-    Sink: AgentObservationSink,
-{
-    pub(crate) fn profile(&self) -> AgentCompatibilityProfile {
-        match self {
-            Self::Pi(invocation) => invocation.adapter().profile(),
-            Self::ClaudeCode(invocation) => invocation.adapter().profile(),
-            Self::Codex(invocation) => invocation.adapter().profile(),
-        }
-    }
-
-    pub(crate) fn identity(&self) -> &AgentInvocationIdentity {
-        match self {
-            Self::Pi(invocation) => invocation.identity(),
-            Self::ClaudeCode(invocation) => invocation.identity(),
-            Self::Codex(invocation) => invocation.identity(),
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn process(&self) -> &AgentProcessContext {
-        match self {
-            Self::Pi(invocation) => invocation.process(),
-            Self::ClaudeCode(invocation) => invocation.process(),
-            Self::Codex(invocation) => invocation.process(),
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn staging(&self) -> &AgentInvocationStaging {
-        match self {
-            Self::Pi(invocation) => invocation.staging(),
-            Self::ClaudeCode(invocation) => invocation.staging(),
-            Self::Codex(invocation) => invocation.staging(),
-        }
-    }
-
-    pub(crate) fn diagnostic_session(&self) -> &super::agent_diagnostics::AgentDiagnosticSession {
-        match self {
-            Self::Pi(invocation) => invocation.diagnostic_session(),
-            Self::ClaudeCode(invocation) => invocation.diagnostic_session(),
-            Self::Codex(invocation) => invocation.diagnostic_session(),
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn prompt(&self) -> &AgentPrompt {
-        match self {
-            Self::Pi(invocation) => invocation.prompt(),
-            Self::ClaudeCode(invocation) => invocation.prompt(),
-            Self::Codex(invocation) => invocation.prompt(),
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn attachments(&self) -> &[StagedAgentAttachment] {
-        match self {
-            Self::Pi(invocation) => invocation.attachments(),
-            Self::ClaudeCode(invocation) => invocation.attachments(),
-            Self::Codex(invocation) => invocation.attachments(),
-        }
-    }
-
-    pub(crate) fn value_mode(&self) -> &AgentValueMode {
-        match self {
-            Self::Pi(invocation) => invocation.value_mode(),
-            Self::ClaudeCode(invocation) => invocation.value_mode(),
-            Self::Codex(invocation) => invocation.value_mode(),
-        }
-    }
-
-    pub(crate) fn process_control(&self) -> &super::agent::AgentProcessControl {
-        match self {
-            Self::Pi(invocation) => invocation.process_control(),
-            Self::ClaudeCode(invocation) => invocation.process_control(),
-            Self::Codex(invocation) => invocation.process_control(),
-        }
-    }
-}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AgentInputStagingFailure {
@@ -303,19 +205,13 @@ impl Drop for AgentInputStagingLease {
     }
 }
 
-pub(crate) struct MaterializedAgentInvocation<Sink>
-where
-    Sink: AgentObservationSink,
-{
-    invocation: ClosedAgentInvocation<Sink>,
+pub(crate) struct MaterializedAgentInvocation {
+    invocation: AgentInvocation,
     staging: AgentInputStagingLease,
 }
 
-impl<Sink> MaterializedAgentInvocation<Sink>
-where
-    Sink: AgentObservationSink,
-{
-    pub(crate) fn invocation(&self) -> &ClosedAgentInvocation<Sink> {
+impl MaterializedAgentInvocation {
+    pub(crate) fn invocation(&self) -> &AgentInvocation {
         &self.invocation
     }
 
@@ -324,7 +220,7 @@ where
         self.staging.path()
     }
 
-    pub(crate) fn into_parts(self) -> (ClosedAgentInvocation<Sink>, AgentInputStagingLease) {
+    pub(crate) fn into_parts(self) -> (AgentInvocation, AgentInputStagingLease) {
         (self.invocation, self.staging)
     }
 }
@@ -657,7 +553,7 @@ pub(crate) fn materialize_agent_invocation<Sink>(
     cancellation: CancellationSource,
     process_guards: ProcessGuardRegistry,
     observation_sink: Sink,
-) -> Result<MaterializedAgentInvocation<Sink>, AgentInputMaterializationError>
+) -> Result<MaterializedAgentInvocation, AgentInputMaterializationError>
 where
     Sink: AgentObservationSink,
 {
@@ -742,22 +638,20 @@ where
         &identity,
         admitted_step,
     )?;
-    let invocation = closed_agent_invocation(
+    let invocation = admitted_agent_invocation(
         admitted_step,
         None,
-        AgentInvocationEnvelope {
-            identity,
-            working_directory,
-            environment: admitted.execution().environment().clone(),
-            staging: invocation_staging,
-            diagnostic_session,
-            prompt: plan.prompt,
-            attachments: staged_attachments,
-            value_mode: plan.value_mode,
-            cancellation,
-            process_guards,
-            observation_sink,
-        },
+        identity,
+        working_directory,
+        admitted.execution().environment().clone(),
+        invocation_staging,
+        diagnostic_session,
+        plan.prompt,
+        staged_attachments,
+        plan.value_mode,
+        cancellation,
+        process_guards,
+        observation_sink,
     );
     drop(lifecycle);
     Ok(MaterializedAgentInvocation {
@@ -781,7 +675,7 @@ pub(crate) fn materialize_recovery_agent_invocation<Sink>(
     process_guards: ProcessGuardRegistry,
     accounting: &InvocationAccountingLog,
     observation_sink: Sink,
-) -> Result<MaterializedAgentInvocation<Sink>, AgentInputMaterializationError>
+) -> Result<MaterializedAgentInvocation, AgentInputMaterializationError>
 where
     Sink: AgentObservationSink,
 {
@@ -855,22 +749,20 @@ where
         NonZeroU64::new(u64::try_from(MAXIMUM_RECOVERY_DECISION_BYTES).unwrap_or(u64::MAX))
             .unwrap_or(NonZeroU64::MIN);
 
-    let invocation = closed_agent_invocation(
+    let invocation = admitted_agent_invocation(
         harness,
         Some(maximum_result_bytes),
-        AgentInvocationEnvelope {
-            identity,
-            working_directory,
-            environment,
-            staging: invocation_staging,
-            diagnostic_session,
-            prompt,
-            attachments: Vec::new(),
-            value_mode,
-            cancellation,
-            process_guards,
-            observation_sink,
-        },
+        identity,
+        working_directory,
+        environment,
+        invocation_staging,
+        diagnostic_session,
+        prompt,
+        Vec::new(),
+        value_mode,
+        cancellation,
+        process_guards,
+        observation_sink,
     );
     drop(lifecycle);
     Ok(MaterializedAgentInvocation {
@@ -972,7 +864,13 @@ fn harness_version(harness: &AdmittedHarness) -> &str {
     }
 }
 
-struct AgentInvocationEnvelope<Sink> {
+#[expect(
+    clippy::too_many_arguments,
+    reason = "admitted harness selection keeps the concrete invocation fields together"
+)]
+fn admitted_agent_invocation<Sink>(
+    harness: &AdmittedHarness,
+    maximum_result_bytes: Option<NonZeroU64>,
     identity: AgentInvocationIdentity,
     working_directory: super::execution_root::AdmittedWorkingDirectory,
     environment: super::admission::EnvironmentSnapshot,
@@ -984,92 +882,48 @@ struct AgentInvocationEnvelope<Sink> {
     cancellation: CancellationSource,
     process_guards: ProcessGuardRegistry,
     observation_sink: Sink,
-}
-
-fn closed_agent_invocation<Sink>(
-    harness: &AdmittedHarness,
-    maximum_result_bytes: Option<NonZeroU64>,
-    envelope: AgentInvocationEnvelope<Sink>,
-) -> ClosedAgentInvocation<Sink>
+) -> AgentInvocation
 where
     Sink: AgentObservationSink,
 {
     macro_rules! admitted_invocation {
-        ($variant:ident, $profile:expr, $admission:ident) => {{
+        ($profile:expr, $admission:ident) => {{
             let mut limits = $admission.limits().clone();
             if let Some(maximum) = maximum_result_bytes {
                 limits = limits.with_maximum_result_bytes(maximum);
             }
-            ClosedAgentInvocation::$variant(agent_invocation(
-                $profile,
-                $admission.installation().executable(),
-                $admission.installation().version().as_str(),
-                $admission.configuration().clone(),
+            AgentInvocation::new(
+                identity,
+                AdmittedAgentAdapter::new(
+                    $profile,
+                    $admission.installation().executable().to_owned(),
+                    Arc::from($admission.installation().version().as_str()),
+                    $admission.configuration().clone(),
+                ),
+                AgentProcessContext::new(working_directory, environment),
+                staging,
+                diagnostic_session,
+                prompt,
+                Arc::from(attachments),
+                value_mode,
                 limits,
-                envelope,
-            ))
+                cancellation,
+                process_guards,
+                observation_sink,
+            )
         }};
     }
     match harness {
         AdmittedHarness::Pi(admission) => {
-            admitted_invocation!(Pi, AgentCompatibilityProfile::PiJsonV1, admission)
+            admitted_invocation!(AgentCompatibilityProfile::PiJsonV1, admission)
         }
-        AdmittedHarness::ClaudeCode(admission) => admitted_invocation!(
-            ClaudeCode,
-            AgentCompatibilityProfile::ClaudeCodeStreamJsonV1,
-            admission
-        ),
-        AdmittedHarness::Codex(admission) => admitted_invocation!(
-            Codex,
-            AgentCompatibilityProfile::CodexAppServerV1,
-            admission
-        ),
+        AdmittedHarness::ClaudeCode(admission) => {
+            admitted_invocation!(AgentCompatibilityProfile::ClaudeCodeStreamJsonV1, admission)
+        }
+        AdmittedHarness::Codex(admission) => {
+            admitted_invocation!(AgentCompatibilityProfile::CodexAppServerV1, admission)
+        }
     }
-}
-
-fn agent_invocation<NativeConfiguration, ProtocolLimits, Sink>(
-    profile: AgentCompatibilityProfile,
-    executable: &Path,
-    version: &str,
-    configuration: NativeConfiguration,
-    limits: super::agent::AgentInvocationLimits<ProtocolLimits>,
-    envelope: AgentInvocationEnvelope<Sink>,
-) -> AgentInvocation<NativeConfiguration, ProtocolLimits, Sink>
-where
-    Sink: AgentObservationSink,
-{
-    let AgentInvocationEnvelope {
-        identity,
-        working_directory,
-        environment,
-        staging,
-        diagnostic_session,
-        prompt,
-        attachments,
-        value_mode,
-        cancellation,
-        process_guards,
-        observation_sink,
-    } = envelope;
-    AgentInvocation::new(
-        identity,
-        AdmittedAgentAdapter::new(
-            profile,
-            executable.to_owned(),
-            Arc::from(version),
-            configuration,
-        ),
-        AgentProcessContext::new(working_directory, environment),
-        staging,
-        diagnostic_session,
-        prompt,
-        Arc::from(attachments),
-        value_mode,
-        limits,
-        cancellation,
-        process_guards,
-        observation_sink,
-    )
 }
 
 fn build_plan<'a>(

@@ -1,3 +1,4 @@
+use crate::workflow::agent::AgentCompatibilityProfile;
 use std::ffi::OsStr;
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -37,19 +38,6 @@ const REQUIRED_CAPABILITIES: [ClaudeCodeCapability; 13] = [
     ClaudeCodeCapability::AppendSystemPromptFile,
     ClaudeCodeCapability::JsonSchema,
 ];
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ClaudeCodeCompatibilityProfile {
-    ClaudeCodeStreamJsonV1,
-}
-
-impl ClaudeCodeCompatibilityProfile {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::ClaudeCodeStreamJsonV1 => "ClaudeCodeStreamJsonV1",
-        }
-    }
-}
 
 pub(crate) type ClaudeCodeVersion = StableVersion;
 
@@ -129,7 +117,6 @@ impl ClaudeCodeStreamJsonV1Capabilities {
 pub struct ValidatedClaudeCodeInstallation {
     executable: PathBuf,
     version: ClaudeCodeVersion,
-    profile: ClaudeCodeCompatibilityProfile,
     capabilities: ClaudeCodeStreamJsonV1Capabilities,
 }
 
@@ -144,7 +131,6 @@ impl ValidatedClaudeCodeInstallation {
                 263,
                 CLAUDE_CODE_STREAM_JSON_V1_QUALIFICATION_VERSION,
             ),
-            profile: ClaudeCodeCompatibilityProfile::ClaudeCodeStreamJsonV1,
             capabilities: ClaudeCodeStreamJsonV1Capabilities {
                 required: REQUIRED_CAPABILITIES,
             },
@@ -159,8 +145,8 @@ impl ValidatedClaudeCodeInstallation {
         &self.version
     }
 
-    pub const fn profile(&self) -> ClaudeCodeCompatibilityProfile {
-        self.profile
+    pub const fn profile(&self) -> AgentCompatibilityProfile {
+        AgentCompatibilityProfile::ClaudeCodeStreamJsonV1
     }
 
     pub const fn capabilities(&self) -> &ClaudeCodeStreamJsonV1Capabilities {
@@ -251,7 +237,7 @@ struct ClaudeCodeInstallationProfile;
 
 impl HarnessInstallationProfile for ClaudeCodeInstallationProfile {
     type Version = ClaudeCodeVersion;
-    type CompatibilityProfile = ClaudeCodeCompatibilityProfile;
+    type CompatibilityProfile = AgentCompatibilityProfile;
     type Capabilities = ClaudeCodeStreamJsonV1Capabilities;
     type Installation = ValidatedClaudeCodeInstallation;
     type Failure = ClaudeCodeInstallationFailure;
@@ -325,11 +311,10 @@ impl HarnessInstallationProfile for ClaudeCodeInstallationProfile {
             Self::Capabilities,
         >,
     ) -> Self::Installation {
-        let (executable, version, profile, capabilities) = parts.into_parts();
+        let (executable, version, _profile, capabilities) = parts.into_parts();
         ValidatedClaudeCodeInstallation {
             executable,
             version,
-            profile,
             capabilities,
         }
     }
@@ -379,15 +364,15 @@ fn parse_version_output(
     ClaudeCodeVersion::parse(version).ok_or_else(malformed)
 }
 
-fn compatibility_profile(version: &ClaudeCodeVersion) -> Option<ClaudeCodeCompatibilityProfile> {
+fn compatibility_profile(version: &ClaudeCodeVersion) -> Option<AgentCompatibilityProfile> {
     (version.numeric() >= CLAUDE_CODE_STREAM_JSON_V1_MINIMUM_VERSION
         && version.numeric() < CLAUDE_CODE_STREAM_JSON_V1_MAXIMUM_VERSION)
-        .then_some(ClaudeCodeCompatibilityProfile::ClaudeCodeStreamJsonV1)
+        .then_some(AgentCompatibilityProfile::ClaudeCodeStreamJsonV1)
 }
 
 pub(crate) fn compatibility_profile_for_version(
     observed: &str,
-) -> Option<ClaudeCodeCompatibilityProfile> {
+) -> Option<AgentCompatibilityProfile> {
     compatibility_profile(&ClaudeCodeVersion::parse(observed)?)
 }
 

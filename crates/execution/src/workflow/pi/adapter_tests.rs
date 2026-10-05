@@ -26,13 +26,12 @@ use crate::workflow::admission::{
     CancellationReason, CancellationSource, EnvironmentSnapshot, MAXIMUM_AGENT_PROMPT_BYTES,
 };
 use crate::workflow::agent::{
-    AdmittedAgentAdapter, AgentCompatibilityProfile, AgentInputKind, AgentInvocation,
+    AdmittedAgentAdapter, AgentAdapter, AgentCompatibilityProfile, AgentInputKind, AgentInvocation,
     AgentInvocationIdentity, AgentInvocationLimits, AgentInvocationStaging,
     AgentObservationEnvelope, AgentObservationSink, AgentOutcome, AgentProcessContext,
     AgentProcessControl, AgentPrompt, AgentStartReceiveError, AgentStartReceiver,
-    AgentTerminalReceiveError, AgentTerminalReceiver, AgentToolCallPhase, AgentValueMode,
-    MAXIMUM_INLINE_AGENT_INPUT_BYTES, PositiveDuration, RetainedJsonSchema, StagedAgentAttachment,
-    WorkflowRunId, agent_start_channel, agent_terminal_channel, invoke_agent_adapter,
+    AgentToolCallPhase, AgentValueMode, MAXIMUM_INLINE_AGENT_INPUT_BYTES, PositiveDuration,
+    RetainedJsonSchema, StagedAgentAttachment, WorkflowRunId, agent_start_channel,
 };
 use crate::workflow::coordinator::CoordinatorClock;
 use crate::workflow::diagnostic::{StepDiagnostic, StepDiagnosticLog};
@@ -62,7 +61,7 @@ const EXPECTED_RESPONSE: &str = "package contents";
 const SPAWN_DIAGNOSTIC_SECRET: &str = "SENTINEL_PI_SPAWN_ENVIRONMENT_SECRET";
 const STALLED_GUARD_PID_PATH: &str = "PI_STALLED_GUARD_PID_PATH";
 const STALLED_GUARD_LAUNCH_FIXTURE: &str =
-    "workflow::pi_json_v1::adapter_tests::cancelled_stalled_guarded_launch_cleans_worker_fixture";
+    "workflow::pi::adapter_tests::cancelled_stalled_guarded_launch_cleans_worker_fixture";
 
 fn assert_agent_failure(outcome: &AgentOutcome, cause: AgentFailureCause) {
     let AgentOutcome::Failed(failure) = outcome else {
@@ -229,7 +228,7 @@ case "$PI_FIXTURE_MODE" in
     ;;
   result-bridge-settlement-eof-after-grace)
     "$PI_FIXTURE_DETACHED_HOLDER" \
-      --exact workflow::pi_json_v1::adapter_tests::detached_standard_output_holder_process \
+      --exact workflow::pi::adapter_tests::detached_standard_output_holder_process \
       --ignored 3>&1 >/dev/null 2>&1 &
     # The guard reaps the group as soon as the leader exits. Wait for the holder
     # to detach before letting the leader exit; the FIFO is a readiness barrier.
@@ -237,7 +236,7 @@ case "$PI_FIXTURE_MODE" in
     ;;
   result-bridge-in-group-descendant)
     "$PI_FIXTURE_DETACHED_HOLDER" \
-      --exact workflow::pi_json_v1::adapter_tests::in_group_descendant_reaper_process \
+      --exact workflow::pi::adapter_tests::in_group_descendant_reaper_process \
       --ignored >/dev/null 2>&1 &
     IFS= read -r detached < "$PI_FIXTURE_GROUP_DETACHED"
     # Remain the group leader until the injected settlement deadline kills us.
@@ -248,14 +247,14 @@ esac
 
 const PHASE_CANCELLATION_PI: &str = r#"#!/bin/sh
 exec "$PI_FIXTURE_DETACHED_HOLDER" \
-  --exact workflow::pi_json_v1::adapter_tests::phase_cancellation_process_fixture \
+  --exact workflow::pi::adapter_tests::phase_cancellation_process_fixture \
   --ignored --test-threads=1 \
   3>&1 4>&2 >/dev/null 2>&1
 "#;
 
 const STUBBORN_DESCENDANT_PI: &str = r#"#!/bin/sh
 exec "$PI_FIXTURE_DETACHED_HOLDER" \
-  --exact workflow::pi_json_v1::adapter_tests::stubborn_process_fixture \
+  --exact workflow::pi::adapter_tests::stubborn_process_fixture \
   --ignored --test-threads=1 \
   3>&1 4>&2 >/dev/null 2>&1
 "#;
@@ -290,7 +289,7 @@ impl AgentObservationSink for RecordingObservationSink {
     }
 }
 
-type TestInvocation = AgentInvocation<PiConfig, PiJsonV1ProtocolLimits, RecordingObservationSink>;
+type TestInvocation = AgentInvocation;
 
 struct AcceptingProcessGuardStore;
 
@@ -819,7 +818,7 @@ fn start_invocation(
 ) -> (
     tokio::task::JoinHandle<()>,
     AgentStartReceiver,
-    AgentTerminalReceiver,
+    tokio::sync::oneshot::Receiver<AgentOutcome>,
 ) {
     start_invocation_with_clock(invocation, diagnostics, TestClock::Yielding)
 }
@@ -831,7 +830,7 @@ fn start_invocation_with_clock<Clock>(
 ) -> (
     tokio::task::JoinHandle<()>,
     AgentStartReceiver,
-    AgentTerminalReceiver,
+    tokio::sync::oneshot::Receiver<AgentOutcome>,
 )
 where
     Clock: CoordinatorClock,
@@ -847,15 +846,14 @@ fn start_invocation_with_clock_and_worker<Clock, Worker>(
 ) -> (
     tokio::task::JoinHandle<()>,
     AgentStartReceiver,
-    AgentTerminalReceiver,
+    tokio::sync::oneshot::Receiver<AgentOutcome>,
 )
 where
     Clock: CoordinatorClock,
     Worker: ResultValidationWorker,
 {
-    let value_mode = invocation.value_mode().clone();
     let (started_callback, started) = agent_start_channel();
-    let (terminal_callback, terminal) = agent_terminal_channel(&value_mode);
+    let (terminal_callback, terminal) = tokio::sync::oneshot::channel();
     let adapter = PiJsonV1Adapter::with_worker(
         diagnostics,
         NonZeroU64::new(1024).unwrap(),
@@ -864,7 +862,7 @@ where
         worker,
     );
     let task = tokio::spawn(async move {
-        invoke_agent_adapter(&adapter, invocation, started_callback, terminal_callback).await;
+        let _ = terminal_callback.send(adapter.invoke(invocation, started_callback).await);
     });
     (task, started, terminal)
 }
@@ -890,10 +888,10 @@ async fn admit_test_cancellation(
 
 async fn assert_user_cancellation(
     task: tokio::task::JoinHandle<()>,
-    terminal: AgentTerminalReceiver,
+    terminal: tokio::sync::oneshot::Receiver<AgentOutcome>,
 ) {
     assert_eq!(
-        terminal.receive().await.unwrap(),
+        terminal.await.unwrap(),
         AgentOutcome::Cancelled {
             reason: CancellationReason::UserRequest,
         }
@@ -925,7 +923,7 @@ async fn run_success(mut fixture: ProcessFixture) -> CapturedRun {
     write_signal(fixture.agent_release.clone()).await;
 
     started.receive().await.unwrap();
-    let outcome = terminal.receive().await.unwrap();
+    let outcome = terminal.await.unwrap();
     task.await.unwrap();
     let mut observations = vec![header];
     while let Ok(observation) = fixture.observations.try_recv() {
@@ -975,7 +973,7 @@ async fn run_start_failure(
     if release_agent {
         write_signal(fixture.agent_release.clone()).await;
     }
-    let outcome = terminal.receive().await.unwrap();
+    let outcome = terminal.await.unwrap();
     task.await.unwrap();
     let lifecycle_started = started.receive().await.is_ok();
     let mut observations = Vec::new();
@@ -1016,7 +1014,7 @@ async fn validation_socket_raw_exchange(socket_address: &Path, request: Value) -
 struct RunningResultFixture {
     _temporary: tempfile::TempDir,
     task: tokio::task::JoinHandle<()>,
-    terminal: tokio::task::JoinHandle<Result<AgentOutcome, AgentTerminalReceiveError>>,
+    terminal: tokio::sync::oneshot::Receiver<AgentOutcome>,
     socket_path: PathBuf,
     socket_address: PathBuf,
     extension_path: PathBuf,
@@ -1055,7 +1053,7 @@ impl RunningResultFixture {
     }
 
     async fn finish(&mut self) -> AgentOutcome {
-        let outcome = (&mut self.terminal).await.unwrap().unwrap();
+        let outcome = (&mut self.terminal).await.unwrap();
         (&mut self.task).await.unwrap();
         outcome
     }
@@ -1188,7 +1186,7 @@ where
         clock,
         worker,
     );
-    let mut terminal = tokio::spawn(async move { terminal.receive().await });
+    let mut terminal = terminal;
     tokio::select! {
         () = read_signal(fixture.result_first_ready) => {}
         outcome = &mut terminal => {
@@ -1620,7 +1618,7 @@ async fn assert_permission_denied_spawn_failure(fixture: ProcessFixture) {
         started.receive().await,
         Err(AgentStartReceiveError::CallbackDropped)
     );
-    let outcome = terminal.receive().await.unwrap();
+    let outcome = terminal.await.unwrap();
     task.await.unwrap();
 
     assert_agent_failure(
@@ -1640,7 +1638,7 @@ async fn assert_launch_failure_detail(fixture: ProcessFixture, stage: &str, frag
         started.receive().await,
         Err(AgentStartReceiveError::CallbackDropped)
     );
-    let outcome = terminal.receive().await.unwrap();
+    let outcome = terminal.await.unwrap();
     task.await.unwrap();
     let AgentOutcome::Failed(failure) = outcome else {
         panic!("expected launch failure")
@@ -1774,7 +1772,7 @@ async fn cancelled_stalled_guarded_launch_cleans_worker_fixture() {
 
         assert!(cancellation.request_cancellation(CancellationReason::UserRequest));
         assert_eq!(
-            terminal.receive().await.unwrap(),
+            terminal.await.unwrap(),
             AgentOutcome::Cancelled {
                 reason: CancellationReason::UserRequest,
             }
@@ -2133,7 +2131,10 @@ async fn adapter_waits_for_a_terminated_process_group_to_be_observed_absent() {
         {
             read_signal(running.descendant_ready.clone()).await;
             assert!(!process_group_is_quiescent(process));
-            assert!(!running.terminal.is_finished());
+            assert!(matches!(
+                running.terminal.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+            ));
             write_signal(running.settlement_release.clone()).await;
             read_signal(running.process.parent().unwrap().join("detached-done")).await;
         }
@@ -2168,7 +2169,7 @@ async fn detached_stdout_holder_obeys_the_platform_cleanup_boundary() {
         {
             now_seconds.store(130, Ordering::SeqCst);
             deadline_release.send_replace(true);
-            let outcome = (&mut running.terminal).await.unwrap().unwrap();
+            let outcome = (&mut running.terminal).await.unwrap();
             write_signal(running.settlement_release.clone()).await;
             read_signal(running.process.parent().unwrap().join("detached-done")).await;
             (&mut running.task).await.unwrap();
@@ -2407,9 +2408,7 @@ async fn exact_input_limits_prepare_unchanged_and_one_excess_byte_never_launches
         ] {
             let fixture = ProcessFixture::new("success", system_prompt, message);
             let capture = fixture.arguments.clone();
-            let value_mode = fixture.invocation.value_mode().clone();
             let (started_callback, started) = agent_start_channel();
-            let (terminal_callback, terminal) = agent_terminal_channel(&value_mode);
             let adapter = PiJsonV1Adapter::<TestClock, _>::new_default(
                 fixture.diagnostics,
                 NonZeroU64::new(1024).unwrap(),
@@ -2417,15 +2416,9 @@ async fn exact_input_limits_prepare_unchanged_and_one_excess_byte_never_launches
                 NoopExecutionObserver,
             )
             .unwrap();
-            invoke_agent_adapter(
-                &adapter,
-                fixture.invocation,
-                started_callback,
-                terminal_callback,
-            )
-            .await;
+            let outcome = adapter.invoke(fixture.invocation, started_callback).await;
             assert_agent_failure(
-                &terminal.receive().await.unwrap(),
+                &outcome,
                 AgentFailureCause::HarnessInputTooLarge {
                     input,
                     admitted_bytes: NonZeroU64::new(MAXIMUM_INPUT_BYTES).unwrap(),
@@ -2469,9 +2462,7 @@ async fn every_pre_agent_start_process_failure_is_a_start_failure_without_starte
 
         let fixture = ProcessFixture::new("success", "system".to_owned(), "message".to_owned());
         fs::remove_file(fixture.invocation.adapter().executable()).unwrap();
-        let value_mode = fixture.invocation.value_mode().clone();
         let (started_callback, started) = agent_start_channel();
-        let (terminal_callback, terminal) = agent_terminal_channel(&value_mode);
         let adapter = PiJsonV1Adapter::<TestClock, _>::new_default(
             fixture.diagnostics,
             NonZeroU64::new(1024).unwrap(),
@@ -2479,15 +2470,9 @@ async fn every_pre_agent_start_process_failure_is_a_start_failure_without_starte
             NoopExecutionObserver,
         )
         .unwrap();
-        invoke_agent_adapter(
-            &adapter,
-            fixture.invocation,
-            started_callback,
-            terminal_callback,
-        )
-        .await;
+        let outcome = adapter.invoke(fixture.invocation, started_callback).await;
         assert_agent_failure(
-            &terminal.receive().await.unwrap(),
+            &outcome,
             AgentFailureCause::start_failure(
                 "process spawn",
                 std::io::Error::from_raw_os_error(libc::ENOENT),
@@ -2557,7 +2542,7 @@ async fn cancellation_wins_during_every_native_phase_and_drains_late_events() {
             assert!(!process_group_is_quiescent(process));
             write_signal(release).await;
             assert_eq!(
-                terminal.receive().await.unwrap(),
+                terminal.await.unwrap(),
                 AgentOutcome::Cancelled {
                     reason: CancellationReason::UserRequest,
                 },
@@ -2660,12 +2645,6 @@ async fn stubborn_descendant_is_forced_at_the_injected_deadline_before_terminal_
             STUBBORN_DESCENDANT_PI,
         )
         .unwrap();
-        let cwd = fixture.invocation.process().cwd().to_str().unwrap();
-        fs::write(
-            &fixture.phase_transcript,
-            CancellationPhase::Model.transcript(cwd),
-        )
-        .unwrap();
         let interrupted = SignalFifo::create(&fixture.standard_input);
         let cancellation = fixture.invocation.cancellation().clone();
         let process_control = fixture.invocation.process_control().clone();
@@ -2677,6 +2656,12 @@ async fn stubborn_descendant_is_forced_at_the_injected_deadline_before_terminal_
             registrations,
             release: release_deadline,
         };
+        let cwd = fixture.invocation.process().cwd().to_str().unwrap();
+        fs::write(
+            &fixture.phase_transcript,
+            CancellationPhase::Model.transcript(cwd),
+        )
+        .unwrap();
         let mut cleanup = DetachedFixtureCleanup::new(&fixture.process, &fixture.descendant);
         cleanup.reaper = Some(fixture.process.parent().unwrap().join("reaper"));
         let (mut task, started, terminal) =
@@ -2688,17 +2673,15 @@ async fn stubborn_descendant_is_forced_at_the_injected_deadline_before_terminal_
             _ = read_signal(fixture.descendant_ready.clone()) => {}
             finished = &mut task => panic!(
                 "Pi fixture ended before descendant readiness: {finished:?}, terminal: {:?}",
-                terminal.receive().await
+                terminal.await
             ),
         }
+        // Readiness may arrive before guarded launch registration completes.
+        started.receive().await.unwrap();
         read_signal(fixture.result_settlement_ready).await;
         // Let the reaper reach its wait for the descendant's exit.
         read_signal(fixture.process.parent().unwrap().join("group-detached")).await;
         read_signal(fixture.ready).await;
-        // The child can signal readiness while the guarded launch is still
-        // being registered. A native start acknowledgment proves the process
-        // supervisor is running before we request cancellation.
-        started.receive().await.unwrap();
         let process = process_id(&fs::read(&fixture.process).unwrap());
         let descendant = process_id(&fs::read(&fixture.descendant).unwrap());
         assert_eq!(getpgid(Some(process)).unwrap(), process);
@@ -2803,13 +2786,8 @@ fn phase_cancellation_process_fixture() {
 fn stubborn_process_fixture() {
     let interrupted = begin_pi_process_fixture();
     let _reaper = spawn_process_fixture(
-        "workflow::pi_json_v1::adapter_tests::stubborn_descendant_reaper_process_fixture",
+        "workflow::pi::adapter_tests::stubborn_descendant_reaper_process_fixture",
     );
-    let mut protocol = process_fixture_output(3);
-    protocol
-        .write_all(&fs::read(std::env::var_os("PI_FIXTURE_PHASE_TRANSCRIPT").unwrap()).unwrap())
-        .unwrap();
-    protocol.flush().unwrap();
     let _diagnostic = signal_pi_process_fixture_ready();
 
     interrupted.recv().unwrap();
@@ -2934,7 +2912,7 @@ fn detached_standard_output_holder_process() {
 #[ignore = "launched as an out-of-group reaper by the process-group regression"]
 fn in_group_descendant_reaper_process() {
     run_descendant_reaper_process(
-        "workflow::pi_json_v1::adapter_tests::in_group_descendant_process",
+        "workflow::pi::adapter_tests::in_group_descendant_process",
         false,
     );
 }
@@ -2943,7 +2921,7 @@ fn in_group_descendant_reaper_process() {
 #[ignore = "launched as an out-of-group reaper by the cancellation regression"]
 fn stubborn_descendant_reaper_process_fixture() {
     run_descendant_reaper_process(
-        "workflow::pi_json_v1::adapter_tests::stubborn_descendant_process_fixture",
+        "workflow::pi::adapter_tests::stubborn_descendant_process_fixture",
         true,
     );
 }
@@ -2980,6 +2958,15 @@ fn run_descendant_reaper_process(descendant_test: &str, ignore_interrupt: bool) 
     .unwrap();
     let descendant_path = std::env::var_os("PI_FIXTURE_DESCENDANT").unwrap();
     fs::write(descendant_path, format!("{}\n", descendant.id())).unwrap();
+    if ignore_interrupt {
+        // The stubborn fixture uses fd 3 for its Pi transcript. The ordinary
+        // in-group reaper is launched without that descriptor.
+        let mut protocol = process_fixture_output(3);
+        protocol
+            .write_all(&fs::read(std::env::var_os("PI_FIXTURE_PHASE_TRANSCRIPT").unwrap()).unwrap())
+            .unwrap();
+        protocol.flush().unwrap();
+    }
     let settlement_ready = std::env::var_os("PI_FIXTURE_RESULT_SETTLEMENT_READY").unwrap();
     fs::write(settlement_ready, b"settlement-ready\n").unwrap();
     fs::write(

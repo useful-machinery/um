@@ -143,7 +143,7 @@ fn lower_bound_and_intervening_patches_retain_exact_versions() {
                 .unwrap();
 
         assert_eq!(installation.version().as_str(), version);
-        assert_eq!(installation.profile(), PiCompatibilityProfile::PiJsonV1);
+        assert_eq!(installation.profile(), AgentCompatibilityProfile::PiJsonV1);
     }
 }
 

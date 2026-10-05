@@ -18,17 +18,14 @@ use tokio::task::JoinSet;
 
 use super::adapter::{PROCESS_GROUP_QUIESCENCE_PROBE_INTERVAL, PiJsonV1Adapter};
 use super::*;
-use crate::pi::{
-    PI_JSON_V1_QUALIFICATION_VERSION, PiCompatibilityProfile, validate_pi_installation,
-};
+use crate::pi::{PI_JSON_V1_QUALIFICATION_VERSION, validate_pi_installation};
 use crate::workflow::admission::{CancellationReason, CancellationSource, EnvironmentSnapshot};
 use crate::workflow::agent::{
-    AdmittedAgentAdapter, AgentCompatibilityProfile, AgentInvocation, AgentInvocationIdentity,
-    AgentInvocationStaging, AgentObservation, AgentObservationEnvelope, AgentObservationSink,
-    AgentOutcome, AgentProcessControl, AgentPrompt, AgentStartReceiver, AgentTerminalReceiver,
+    AdmittedAgentAdapter, AgentAdapter, AgentCompatibilityProfile, AgentInvocation,
+    AgentInvocationIdentity, AgentInvocationStaging, AgentObservation, AgentObservationEnvelope,
+    AgentObservationSink, AgentOutcome, AgentProcessControl, AgentPrompt, AgentStartReceiver,
     AgentValueMode, CompletedAgentInvocation, RetainedJsonSchema, StagedAgentAttachment,
-    WorkflowRunId, agent_start_channel, agent_terminal_channel, failed_agent_outcome,
-    invoke_agent_adapter,
+    WorkflowRunId, agent_start_channel, failed_agent_outcome,
 };
 // The black-box fixture intentionally owns its imports instead of depending on the
 // executable-stub fixture module solely to share test wiring.
@@ -96,7 +93,7 @@ impl AgentObservationSink for RecordingSink {
     }
 }
 
-type ConformanceInvocation = AgentInvocation<PiConfig, PiJsonV1ProtocolLimits, RecordingSink>;
+type ConformanceInvocation = AgentInvocation;
 
 struct ControlledRequest {
     value: Value,
@@ -732,16 +729,15 @@ struct RunningRealPi {
     fixture: RealPiFixture,
     task: tokio::task::JoinHandle<()>,
     started: Option<AgentStartReceiver>,
-    terminal: AgentTerminalReceiver,
+    terminal: tokio::sync::oneshot::Receiver<AgentOutcome>,
 }
 
 impl RunningRealPi {
     fn launch(fixture: RealPiFixture) -> Self {
         let mut fixture = fixture;
         let invocation = fixture.invocation.take().unwrap();
-        let value_mode = invocation.value_mode().clone();
         let (started_callback, started) = agent_start_channel();
-        let (terminal_callback, terminal) = agent_terminal_channel(&value_mode);
+        let (terminal_callback, terminal) = tokio::sync::oneshot::channel();
         let adapter = PiJsonV1Adapter::with_worker(
             fixture.diagnostics.clone(),
             NonZeroU64::new(16 * 1024).unwrap(),
@@ -750,7 +746,7 @@ impl RunningRealPi {
             super::adapter_tests::InlineValidationWorker,
         );
         let task = tokio::spawn(async move {
-            invoke_agent_adapter(&adapter, invocation, started_callback, terminal_callback).await;
+            let _ = terminal_callback.send(adapter.invoke(invocation, started_callback).await);
         });
         Self {
             fixture,
@@ -772,7 +768,7 @@ impl RunningRealPi {
     }
 
     async fn finish(self) -> (RealPiFixture, AgentOutcome) {
-        let outcome = self.terminal.receive().await.unwrap();
+        let outcome = self.terminal.await.unwrap();
         self.task.await.unwrap();
         (self.fixture, outcome)
     }
@@ -782,7 +778,7 @@ impl RunningRealPi {
     ) -> (
         RealPiFixture,
         tokio::task::JoinHandle<()>,
-        AgentTerminalReceiver,
+        tokio::sync::oneshot::Receiver<AgentOutcome>,
     ) {
         let Self {
             fixture,
@@ -944,7 +940,7 @@ fn pinned_real_pi_01_qualification_anchor_is_exact_and_supported() {
         installation.version().as_str(),
         PI_JSON_V1_QUALIFICATION_VERSION
     );
-    assert_eq!(installation.profile(), PiCompatibilityProfile::PiJsonV1);
+    assert_eq!(installation.profile(), AgentCompatibilityProfile::PiJsonV1);
     println!(
         "qualified Pi version={} profile={} range={} executable={}",
         installation.version().as_str(),
@@ -1518,7 +1514,7 @@ async fn pinned_real_pi_04_provider_finalized_thinking_reaches_result_settlement
         running.await_started().await;
 
         let (mut fixture, task, terminal) = running.into_finishing();
-        let mut terminal = Box::pin(terminal.receive());
+        let mut terminal = Box::pin(terminal);
         let outcome = tokio::select! {
             biased;
             correction = fixture.controller.next("model") => {
@@ -1708,7 +1704,7 @@ async fn pinned_real_pi_recovers_after_a_partial_tool_call_transport_failure() {
         running.await_started().await;
 
         let (mut fixture, task, terminal) = running.into_finishing();
-        let mut terminal = Box::pin(terminal.receive());
+        let mut terminal = Box::pin(terminal);
         // Receiving the retry model request rather than a tool request is the execution barrier:
         // Pi discarded the interrupted call before beginning any extension tool execution.
         let recovered = tokio::select! {
@@ -1822,7 +1818,7 @@ async fn pinned_real_pi_recovers_after_a_truncated_result_tool_call() {
         running.await_started().await;
 
         let (mut fixture, task, terminal) = running.into_finishing();
-        let mut terminal = Box::pin(terminal.receive());
+        let mut terminal = Box::pin(terminal);
         let corrected = tokio::select! {
             request = fixture.controller.next("model") => request,
             outcome = &mut terminal => {
@@ -1868,9 +1864,8 @@ fn launch_with_blocking_validation(
 ) -> RunningRealPi {
     let mut fixture = fixture;
     let invocation = fixture.invocation.take().unwrap();
-    let value_mode = invocation.value_mode().clone();
     let (started_callback, started) = agent_start_channel();
-    let (terminal_callback, terminal) = agent_terminal_channel(&value_mode);
+    let (terminal_callback, terminal) = tokio::sync::oneshot::channel();
     let adapter = PiJsonV1Adapter::with_worker(
         fixture.diagnostics.clone(),
         NonZeroU64::new(16 * 1024).unwrap(),
@@ -1879,7 +1874,7 @@ fn launch_with_blocking_validation(
         worker,
     );
     let task = tokio::spawn(async move {
-        invoke_agent_adapter(&adapter, invocation, started_callback, terminal_callback).await;
+        let _ = terminal_callback.send(adapter.invoke(invocation, started_callback).await);
     });
     RunningRealPi {
         fixture,
@@ -1897,7 +1892,7 @@ async fn cancel_and_finish(running: RunningRealPi) -> RealPiFixture {
             .request_cancellation(CancellationReason::UserRequest)
     );
     assert_eq!(
-        running.terminal.receive().await.unwrap(),
+        running.terminal.await.unwrap(),
         AgentOutcome::Cancelled {
             reason: CancellationReason::UserRequest
         }
@@ -2059,7 +2054,7 @@ async fn pinned_real_pi_06_cancellation_kills_a_stubborn_process_group_descendan
         );
         running.fixture.process_control.force();
         assert_eq!(
-            running.terminal.receive().await.unwrap(),
+            running.terminal.await.unwrap(),
             AgentOutcome::Cancelled {
                 reason: CancellationReason::UserRequest
             }

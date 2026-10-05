@@ -720,7 +720,7 @@ export default function fakeProviderExtension(pi: ExtensionAPI): void {
         stubbornFixtureExecutable,
         [
           "--exact",
-          "workflow::pi_json_v1::conformance_tests::stubborn_descendant_process_fixture",
+          "workflow::pi::conformance_tests::stubborn_descendant_process_fixture",
           "--ignored",
           "--test-threads=1",
           "--nocapture",

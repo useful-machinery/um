@@ -3,6 +3,7 @@ use std::future::Future;
 use std::future::ready;
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -66,10 +67,20 @@ impl AgentInvocationIdentity {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum AgentCompatibilityProfile {
+pub enum AgentCompatibilityProfile {
     PiJsonV1,
     ClaudeCodeStreamJsonV1,
     CodexAppServerV1,
+}
+
+impl AgentCompatibilityProfile {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::PiJsonV1 => "PiJsonV1",
+            Self::ClaudeCodeStreamJsonV1 => "ClaudeCodeStreamJsonV1",
+            Self::CodexAppServerV1 => "CodexAppServerV1",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -109,6 +120,13 @@ impl<NativeConfiguration> AdmittedAgentAdapter<NativeConfiguration> {
 
     pub(crate) fn native_configuration(&self) -> &NativeConfiguration {
         &self.native_configuration
+    }
+
+    fn split(self) -> (AdmittedAgentAdapter<()>, NativeConfiguration) {
+        (
+            AdmittedAgentAdapter::new(self.profile, self.executable, self.version, ()),
+            self.native_configuration,
+        )
     }
 }
 
@@ -368,8 +386,28 @@ impl<AdapterProtocolLimits> AgentInvocationLimits<AdapterProtocolLimits> {
         self.result_settlement_grace
     }
 
+    #[cfg(test)]
     pub(crate) fn adapter_protocol(&self) -> &AdapterProtocolLimits {
         &self.adapter_protocol
+    }
+
+    fn split(self) -> (AgentInvocationLimits<()>, AdapterProtocolLimits) {
+        (
+            AgentInvocationLimits {
+                maximum_system_prompt_bytes: self.maximum_system_prompt_bytes,
+                maximum_message_bytes: self.maximum_message_bytes,
+                maximum_attachments: self.maximum_attachments,
+                maximum_attachment_bytes: self.maximum_attachment_bytes,
+                maximum_response_bytes: self.maximum_response_bytes,
+                maximum_result_bytes: self.maximum_result_bytes,
+                maximum_result_rejection_feedback_bytes: self
+                    .maximum_result_rejection_feedback_bytes,
+                result_validation_deadline: self.result_validation_deadline,
+                result_settlement_grace: self.result_settlement_grace,
+                adapter_protocol: (),
+            },
+            self.adapter_protocol,
+        )
     }
 }
 
@@ -527,18 +565,22 @@ impl AgentObservationSink for NoopAgentObservationSink {
     }
 }
 
+type ErasedObservation =
+    Arc<dyn Fn(AgentObservationEnvelope) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
+
 #[derive(Clone)]
-pub(crate) struct OrderedAgentObservationSink<Sink> {
+pub(crate) struct OrderedAgentObservationSink {
     identity: AgentInvocationIdentity,
-    sink: Sink,
+    sink: ErasedObservation,
     next_sequence: Arc<AsyncMutex<Option<u64>>>,
 }
 
-impl<Sink> OrderedAgentObservationSink<Sink>
-where
-    Sink: AgentObservationSink,
-{
-    fn new(identity: AgentInvocationIdentity, sink: Sink) -> Self {
+impl OrderedAgentObservationSink {
+    fn new<Sink: AgentObservationSink>(identity: AgentInvocationIdentity, sink: Sink) -> Self {
+        let sink: ErasedObservation = Arc::new(move |observation| {
+            let sink = sink.clone();
+            Box::pin(async move { sink.observe(observation).await })
+        });
         Self {
             identity,
             sink,
@@ -553,13 +595,12 @@ where
         let mut next_sequence = self.next_sequence.lock().await;
         let sequence = next_sequence.ok_or(AgentObservationEmissionError::SequenceExhausted)?;
         *next_sequence = sequence.checked_add(1);
-        self.sink
-            .observe(AgentObservationEnvelope {
-                identity: self.identity.clone(),
-                sequence: InvocationObservationSequence(sequence),
-                observation,
-            })
-            .await;
+        (self.sink)(AgentObservationEnvelope {
+            identity: self.identity.clone(),
+            sequence: InvocationObservationSequence(sequence),
+            observation,
+        })
+        .await;
         Ok(())
     }
 }
@@ -620,46 +661,122 @@ impl AgentProcessControl {
     }
 }
 
-pub struct AgentInvocation<NativeConfiguration, AdapterProtocolLimits, ObservationSink> {
+pub(crate) enum NativeHarness {
+    Pi(super::pi::PiConfig, super::pi::PiJsonV1ProtocolLimits),
+    ClaudeCode(
+        super::claude_code::ClaudeCodeConfig,
+        super::claude_code::ClaudeCodeStreamJsonV1ProtocolLimits,
+    ),
+    Codex(
+        super::codex::CodexConfig,
+        super::codex::CodexAppServerV1ProtocolLimits,
+    ),
+}
+
+impl NativeHarness {
+    pub(crate) fn pi(&self) -> Option<(&super::pi::PiConfig, super::pi::PiJsonV1ProtocolLimits)> {
+        match self {
+            Self::Pi(config, limits) => Some((config, *limits)),
+            _ => None,
+        }
+    }
+    pub(crate) fn claude_code(
+        &self,
+    ) -> Option<(
+        &super::claude_code::ClaudeCodeConfig,
+        super::claude_code::ClaudeCodeStreamJsonV1ProtocolLimits,
+    )> {
+        match self {
+            Self::ClaudeCode(config, limits) => Some((config, *limits)),
+            _ => None,
+        }
+    }
+    pub(crate) fn codex(
+        &self,
+    ) -> Option<(
+        &super::codex::CodexConfig,
+        super::codex::CodexAppServerV1ProtocolLimits,
+    )> {
+        match self {
+            Self::Codex(config, limits) => Some((config, *limits)),
+            _ => None,
+        }
+    }
+}
+
+pub(crate) trait IntoNativeHarness<Limits> {
+    fn into_harness(self, limits: Limits) -> NativeHarness;
+}
+
+impl IntoNativeHarness<super::pi::PiJsonV1ProtocolLimits> for super::pi::PiConfig {
+    fn into_harness(self, limits: super::pi::PiJsonV1ProtocolLimits) -> NativeHarness {
+        NativeHarness::Pi(self, limits)
+    }
+}
+impl IntoNativeHarness<super::claude_code::ClaudeCodeStreamJsonV1ProtocolLimits>
+    for super::claude_code::ClaudeCodeConfig
+{
+    fn into_harness(
+        self,
+        limits: super::claude_code::ClaudeCodeStreamJsonV1ProtocolLimits,
+    ) -> NativeHarness {
+        NativeHarness::ClaudeCode(self, limits)
+    }
+}
+impl IntoNativeHarness<super::codex::CodexAppServerV1ProtocolLimits> for super::codex::CodexConfig {
+    fn into_harness(self, limits: super::codex::CodexAppServerV1ProtocolLimits) -> NativeHarness {
+        NativeHarness::Codex(self, limits)
+    }
+}
+
+pub struct AgentInvocation {
     identity: AgentInvocationIdentity,
-    adapter: AdmittedAgentAdapter<NativeConfiguration>,
+    adapter: AdmittedAgentAdapter<NativeHarness>,
     process: AgentProcessContext,
     staging: AgentInvocationStaging,
     diagnostic_session: AgentDiagnosticSession,
     prompt: AgentPrompt,
     attachments: Arc<[StagedAgentAttachment]>,
     value_mode: AgentValueMode,
-    limits: AgentInvocationLimits<AdapterProtocolLimits>,
+    limits: AgentInvocationLimits<()>,
     cancellation: CancellationSource,
     process_guards: ProcessGuardRegistry,
-    observations: OrderedAgentObservationSink<ObservationSink>,
+    observations: OrderedAgentObservationSink,
     process_control: AgentProcessControl,
     process_directives: Option<mpsc::UnboundedReceiver<AgentProcessDirective>>,
 }
 
-impl<NativeConfiguration, AdapterProtocolLimits, ObservationSink>
-    AgentInvocation<NativeConfiguration, AdapterProtocolLimits, ObservationSink>
-where
-    ObservationSink: AgentObservationSink,
-{
+impl AgentInvocation {
     #[expect(
         clippy::too_many_arguments,
         reason = "construction makes every immutable invocation-envelope field explicit"
     )]
-    pub(crate) fn new(
+    pub(crate) fn new<Configuration, ProtocolLimits, ObservationSink>(
         identity: AgentInvocationIdentity,
-        adapter: AdmittedAgentAdapter<NativeConfiguration>,
+        adapter: AdmittedAgentAdapter<Configuration>,
         process: AgentProcessContext,
         staging: AgentInvocationStaging,
         diagnostic_session: AgentDiagnosticSession,
         prompt: AgentPrompt,
         attachments: Arc<[StagedAgentAttachment]>,
         value_mode: AgentValueMode,
-        limits: AgentInvocationLimits<AdapterProtocolLimits>,
+        limits: AgentInvocationLimits<ProtocolLimits>,
         cancellation: CancellationSource,
         process_guards: ProcessGuardRegistry,
         observation_sink: ObservationSink,
-    ) -> Self {
+    ) -> Self
+    where
+        Configuration: IntoNativeHarness<ProtocolLimits>,
+        ObservationSink: AgentObservationSink,
+    {
+        let (adapter, configuration) = adapter.split();
+        let (limits, protocol) = limits.split();
+        let adapter = AdmittedAgentAdapter::new(
+            adapter.profile,
+            adapter.executable,
+            adapter.version,
+            configuration.into_harness(protocol),
+        );
         let observations = OrderedAgentObservationSink::new(identity.clone(), observation_sink);
         let (process_control, process_directives) = agent_process_control_channel();
         Self {
@@ -684,7 +801,7 @@ where
         &self.identity
     }
 
-    pub(crate) fn adapter(&self) -> &AdmittedAgentAdapter<NativeConfiguration> {
+    pub(crate) fn adapter(&self) -> &AdmittedAgentAdapter<NativeHarness> {
         &self.adapter
     }
 
@@ -712,7 +829,7 @@ where
         &self.value_mode
     }
 
-    pub(crate) fn limits(&self) -> &AgentInvocationLimits<AdapterProtocolLimits> {
+    pub(crate) fn limits(&self) -> &AgentInvocationLimits<()> {
         &self.limits
     }
 
@@ -724,7 +841,7 @@ where
         &self.process_guards
     }
 
-    pub(crate) fn observations(&self) -> &OrderedAgentObservationSink<ObservationSink> {
+    pub(crate) fn observations(&self) -> &OrderedAgentObservationSink {
         &self.observations
     }
 
@@ -739,39 +856,16 @@ where
     }
 }
 
-pub(crate) trait AgentAdapter<Sink>: Clone + Send + Sync + 'static
-where
-    Sink: AgentObservationSink,
-{
-    type NativeConfiguration: Send + Sync + 'static;
-    type ProtocolLimits: Send + Sync + 'static;
-
+pub trait AgentAdapter: Clone + Send + Sync + 'static {
     fn invoke(
         &self,
-        invocation: AgentInvocation<Self::NativeConfiguration, Self::ProtocolLimits, Sink>,
+        invocation: AgentInvocation,
         started: AgentStartCallback,
-        terminal: AgentTerminalCallback,
-    ) -> impl Future<Output = ()> + Send;
-}
-
-pub(crate) async fn invoke_agent_adapter<Adapter, Sink>(
-    adapter: &Adapter,
-    invocation: AgentInvocation<Adapter::NativeConfiguration, Adapter::ProtocolLimits, Sink>,
-    started: AgentStartCallback,
-    terminal: AgentTerminalCallback,
-) where
-    Adapter: AgentAdapter<Sink>,
-    Sink: AgentObservationSink,
-{
-    let unreported_return = terminal.clone();
-    adapter.invoke(invocation, started, terminal).await;
-    let _ = unreported_return.report(failed_agent_outcome(
-        AgentFailureCause::HarnessProtocolFailed,
-    ));
+    ) -> impl Future<Output = AgentOutcome> + Send;
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct BoundedAgentResponse(Arc<str>);
+pub struct BoundedAgentResponse(Arc<str>);
 
 impl BoundedAgentResponse {
     pub(crate) fn from_bounded(value: Arc<str>) -> Self {
@@ -789,21 +883,11 @@ impl BoundedAgentResponse {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum CompletedAgentInvocation {
+pub enum CompletedAgentInvocation {
     NoValue,
     NoResponse,
     Response(BoundedAgentResponse),
     Result(CapturedJson),
-}
-
-impl CompletedAgentInvocation {
-    fn kind(&self) -> AgentValueKind {
-        match self {
-            Self::NoValue => AgentValueKind::None,
-            Self::NoResponse | Self::Response(_) => AgentValueKind::Response,
-            Self::Result(_) => AgentValueKind::Result,
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -871,7 +955,7 @@ pub(crate) struct AgentProtocolRejectionDiagnostic {
 }
 
 impl AgentProtocolRejectionDiagnostic {
-    pub(crate) fn pi_json_v1(diagnostic: super::pi_json_v1::PiJsonV1ProtocolRejection) -> Self {
+    pub(crate) fn pi_json_v1(diagnostic: super::pi::PiJsonV1ProtocolRejection) -> Self {
         Self {
             schema_version: 1,
             profile: AgentProtocolRejectionProfile::PiJsonV1(diagnostic),
@@ -879,7 +963,7 @@ impl AgentProtocolRejectionDiagnostic {
     }
 
     pub(crate) fn claude_code_stream_json_v1(
-        diagnostic: super::claude_code_stream_json_v1::ClaudeCodeStreamJsonV1ProtocolRejection,
+        diagnostic: super::claude_code::ClaudeCodeStreamJsonV1ProtocolRejection,
     ) -> Self {
         Self {
             schema_version: 1,
@@ -888,7 +972,7 @@ impl AgentProtocolRejectionDiagnostic {
     }
 
     pub(crate) fn codex_app_server_v1(
-        diagnostic: super::codex_app_server_v1::CodexAppServerV1ProtocolRejection,
+        diagnostic: super::codex::CodexAppServerV1ProtocolRejection,
     ) -> Self {
         Self {
             schema_version: 1,
@@ -900,11 +984,9 @@ impl AgentProtocolRejectionDiagnostic {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "profile", content = "detail")]
 pub(crate) enum AgentProtocolRejectionProfile {
-    PiJsonV1(super::pi_json_v1::PiJsonV1ProtocolRejection),
-    ClaudeCodeStreamJsonV1(
-        super::claude_code_stream_json_v1::ClaudeCodeStreamJsonV1ProtocolRejection,
-    ),
-    CodexAppServerV1(super::codex_app_server_v1::CodexAppServerV1ProtocolRejection),
+    PiJsonV1(super::pi::PiJsonV1ProtocolRejection),
+    ClaudeCodeStreamJsonV1(super::claude_code::ClaudeCodeStreamJsonV1ProtocolRejection),
+    CodexAppServerV1(super::codex::CodexAppServerV1ProtocolRejection),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -992,7 +1074,7 @@ pub(crate) fn check_agent_input_bound(
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum AgentOutcome {
+pub enum AgentOutcome {
     Completed(CompletedAgentInvocation),
     Failed(AgentFailure),
     Cancelled { reason: CancellationReason },
@@ -1059,78 +1141,6 @@ pub(crate) fn agent_start_channel() -> (AgentStartCallback, AgentStartReceiver) 
             state: Arc::new(Mutex::new(Some(started))),
         },
         AgentStartReceiver { started: receiver },
-    )
-}
-
-#[derive(Clone)]
-pub struct AgentTerminalCallback {
-    state: Arc<Mutex<Option<oneshot::Sender<AgentOutcome>>>>,
-    expected_value_kind: AgentValueKind,
-}
-
-impl AgentTerminalCallback {
-    pub(crate) fn report(&self, outcome: AgentOutcome) -> Result<(), AgentTerminalReportError> {
-        if let AgentOutcome::Completed(completed) = &outcome
-            && completed.kind() != self.expected_value_kind
-        {
-            return Err(AgentTerminalReportError::CompletionModeMismatch);
-        }
-
-        let mut sender = match self.state.lock() {
-            Ok(sender) => sender,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        let sender = sender
-            .take()
-            .ok_or(AgentTerminalReportError::AlreadyReported)?;
-        sender
-            .send(outcome)
-            .map_err(|_| AgentTerminalReportError::ReceiverClosed)
-    }
-
-    #[cfg(test)]
-    fn has_reported(&self) -> bool {
-        match self.state.lock() {
-            Ok(sender) => sender.is_none(),
-            Err(poisoned) => poisoned.into_inner().is_none(),
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum AgentTerminalReportError {
-    AlreadyReported,
-    CompletionModeMismatch,
-    ReceiverClosed,
-}
-
-pub(crate) struct AgentTerminalReceiver {
-    outcome: oneshot::Receiver<AgentOutcome>,
-}
-
-impl AgentTerminalReceiver {
-    pub(crate) async fn receive(self) -> Result<AgentOutcome, AgentTerminalReceiveError> {
-        self.outcome
-            .await
-            .map_err(|_| AgentTerminalReceiveError::CallbackDropped)
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum AgentTerminalReceiveError {
-    CallbackDropped,
-}
-
-pub(crate) fn agent_terminal_channel(
-    value_mode: &AgentValueMode,
-) -> (AgentTerminalCallback, AgentTerminalReceiver) {
-    let (terminal, outcome) = oneshot::channel();
-    (
-        AgentTerminalCallback {
-            state: Arc::new(Mutex::new(Some(terminal))),
-            expected_value_kind: value_mode.kind(),
-        },
-        AgentTerminalReceiver { outcome },
     )
 }
 

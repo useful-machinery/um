@@ -1,3 +1,4 @@
+use crate::workflow::agent::AgentCompatibilityProfile;
 use std::ffi::OsStr;
 use std::fmt;
 use std::fs;
@@ -81,19 +82,6 @@ const TURN_START_PROPERTIES: [&str; 8] = [
     "threadId",
 ];
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum CodexCompatibilityProfile {
-    CodexAppServerV1,
-}
-
-impl CodexCompatibilityProfile {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::CodexAppServerV1 => "CodexAppServerV1",
-        }
-    }
-}
-
 pub(crate) type CodexVersion = StableVersion;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -135,7 +123,7 @@ impl ValidatedCodexInstallation {
             identity: CodexInstallationIdentity::from_parts(
                 executable,
                 CodexVersion::fixture(0, 158, 0, CODEX_APP_SERVER_V1_QUALIFICATION_VERSION),
-                CodexCompatibilityProfile::CodexAppServerV1,
+                AgentCompatibilityProfile::CodexAppServerV1,
             ),
             capabilities: CodexAppServerV1Capabilities {
                 required: REQUIRED_CAPABILITIES,
@@ -151,7 +139,7 @@ impl ValidatedCodexInstallation {
         self.identity.version()
     }
 
-    pub const fn profile(&self) -> CodexCompatibilityProfile {
+    pub const fn profile(&self) -> AgentCompatibilityProfile {
         self.identity.profile()
     }
 
@@ -185,14 +173,14 @@ pub enum CodexIncompatibility {
 pub struct CodexInstallationIdentity {
     executable: PathBuf,
     version: CodexVersion,
-    profile: CodexCompatibilityProfile,
+    profile: AgentCompatibilityProfile,
 }
 
 impl CodexInstallationIdentity {
     pub(crate) fn new(
         executable: &Path,
         version: &CodexVersion,
-        profile: CodexCompatibilityProfile,
+        profile: AgentCompatibilityProfile,
     ) -> Self {
         Self::from_parts(executable.to_owned(), version.clone(), profile)
     }
@@ -200,7 +188,7 @@ impl CodexInstallationIdentity {
     fn from_parts(
         executable: PathBuf,
         version: CodexVersion,
-        profile: CodexCompatibilityProfile,
+        profile: AgentCompatibilityProfile,
     ) -> Self {
         Self {
             executable,
@@ -219,7 +207,7 @@ impl CodexInstallationIdentity {
         &self.version
     }
 
-    pub const fn profile(&self) -> CodexCompatibilityProfile {
+    pub const fn profile(&self) -> AgentCompatibilityProfile {
         self.profile
     }
     // jscpd:ignore-end
@@ -309,7 +297,7 @@ struct CodexInstallationProfile;
 
 impl HarnessInstallationProfile for CodexInstallationProfile {
     type Version = CodexVersion;
-    type CompatibilityProfile = CodexCompatibilityProfile;
+    type CompatibilityProfile = AgentCompatibilityProfile;
     type Capabilities = CodexAppServerV1Capabilities;
     type Installation = ValidatedCodexInstallation;
     type Failure = CodexInstallationFailure;
@@ -444,15 +432,15 @@ fn parse_version_output(output: &CommandOutput) -> Result<CodexVersion, CodexIns
     })
 }
 
-fn compatibility_profile(version: &CodexVersion) -> Option<CodexCompatibilityProfile> {
+fn compatibility_profile(version: &CodexVersion) -> Option<AgentCompatibilityProfile> {
     (version.numeric() >= CODEX_APP_SERVER_V1_MINIMUM_VERSION
         && version.numeric() < CODEX_APP_SERVER_V1_MAXIMUM_VERSION)
-        .then_some(CodexCompatibilityProfile::CodexAppServerV1)
+        .then_some(AgentCompatibilityProfile::CodexAppServerV1)
 }
 
 pub(crate) fn compatibility_profile_for_version(
     observed: &str,
-) -> Option<CodexCompatibilityProfile> {
+) -> Option<AgentCompatibilityProfile> {
     compatibility_profile(&CodexVersion::parse(observed)?)
 }
 
@@ -774,7 +762,7 @@ mod tests {
             assert_eq!(installation.version().as_str(), version);
             assert_eq!(
                 installation.profile(),
-                CodexCompatibilityProfile::CodexAppServerV1
+                AgentCompatibilityProfile::CodexAppServerV1
             );
             assert_eq!(
                 installation.capabilities().required(),
@@ -872,7 +860,7 @@ mod tests {
             Some(CodexInstallationIdentity::new(
                 &canonical,
                 &CodexVersion::parse("0.147.0").unwrap(),
-                CodexCompatibilityProfile::CodexAppServerV1,
+                AgentCompatibilityProfile::CodexAppServerV1,
             ))
         };
         assert_eq!(
