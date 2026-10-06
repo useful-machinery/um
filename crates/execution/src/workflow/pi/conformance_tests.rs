@@ -1,7 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::fs;
-use std::future::{Future, pending, ready};
 use std::io::Write as _;
 use std::num::NonZeroU64;
 use std::os::fd::OwnedFd;
@@ -16,27 +15,28 @@ use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinSet;
 
-use super::adapter::{PROCESS_GROUP_QUIESCENCE_PROBE_INTERVAL, PiJsonV1Adapter};
+use super::adapter::PiJsonV1Adapter;
 use super::*;
 use crate::pi::{PI_JSON_V1_QUALIFICATION_VERSION, validate_pi_installation};
 use crate::workflow::admission::{CancellationReason, CancellationSource, EnvironmentSnapshot};
 use crate::workflow::agent::{
     AdmittedAgentAdapter, AgentAdapter, AgentCompatibilityProfile, AgentInvocation,
     AgentInvocationIdentity, AgentInvocationStaging, AgentObservation, AgentObservationEnvelope,
-    AgentObservationSink, AgentOutcome, AgentProcessControl, AgentPrompt, AgentStartReceiver,
-    AgentValueMode, CompletedAgentInvocation, RetainedJsonSchema, StagedAgentAttachment,
-    WorkflowRunId, agent_start_channel, failed_agent_outcome,
+    AgentOutcome, AgentProcessControl, AgentPrompt, AgentStartReceiver, AgentValueMode,
+    CompletedAgentInvocation, RetainedJsonSchema, StagedAgentAttachment, WorkflowRunId,
+    agent_start_channel, failed_agent_outcome,
 };
 // The black-box fixture intentionally owns its imports instead of depending on the
 // executable-stub fixture module solely to share test wiring.
 use crate::workflow::agent_diagnostics::AgentDiagnosticSessionStore;
-use crate::workflow::coordinator::CoordinatorClock;
 use crate::workflow::diagnostic::StepDiagnosticLog;
 use crate::workflow::execution_root::AdmittedExecutionRoot;
 use crate::workflow::observation::NoopExecutionObserver;
 use crate::workflow::pi::{PiConfig, Thinking};
-use crate::workflow::result_validation::{ResultValidationWorker, ValidationWorkerRequest};
 use crate::workflow::runtime::{ActionId, TransitionSequence};
+use crate::workflow::test_support::{
+    ChannelObservationSink, PendingClock, pi_blocking_validation::BlockingValidationWorker,
+};
 
 const FAKE_PROVIDER_EXTENSION: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -58,39 +58,6 @@ fn require_conformance_executable() -> PathBuf {
             "UM_PI_CONFORMANCE_EXECUTABLE must name the pinned Pi {PI_JSON_V1_QUALIFICATION_VERSION} executable"
         )
     })
-}
-
-#[derive(Clone, Copy)]
-struct ConformanceClock;
-
-impl CoordinatorClock for ConformanceClock {
-    type Instant = Duration;
-
-    fn now(&mut self) -> Self::Instant {
-        Duration::ZERO
-    }
-
-    async fn wait_until(&self, deadline: Self::Instant) {
-        if deadline == PROCESS_GROUP_QUIESCENCE_PROBE_INTERVAL {
-            // Keep the outer anti-hang watchdog schedulable between OS-state probes.
-            let probe = tokio::spawn(async {});
-            let _ = probe.await;
-        } else {
-            pending().await
-        }
-    }
-}
-
-#[derive(Clone)]
-struct RecordingSink {
-    sender: mpsc::UnboundedSender<AgentObservationEnvelope>,
-}
-
-impl AgentObservationSink for RecordingSink {
-    fn observe(&self, observation: AgentObservationEnvelope) -> impl Future<Output = ()> + Send {
-        let _ = self.sender.send(observation);
-        ready(())
-    }
 }
 
 type ConformanceInvocation = AgentInvocation;
@@ -452,7 +419,7 @@ impl RealPiFixture {
             super::adapter_tests::invocation_limits(),
             cancellation.clone(),
             crate::workflow::process_group::ProcessGuardRegistry::default(),
-            RecordingSink {
+            ChannelObservationSink {
                 sender: observation_sender,
             },
         );
@@ -741,7 +708,7 @@ impl RunningRealPi {
         let adapter = PiJsonV1Adapter::with_worker(
             fixture.diagnostics.clone(),
             NonZeroU64::new(16 * 1024).unwrap(),
-            ConformanceClock,
+            PendingClock,
             NoopExecutionObserver,
             super::adapter_tests::InlineValidationWorker,
         );
@@ -1844,20 +1811,6 @@ async fn pinned_real_pi_recovers_after_a_truncated_result_tool_call() {
     .expect("pinned real-Pi truncated result recovery watchdog expired");
 }
 
-#[derive(Clone)]
-struct BlockingValidationWorker {
-    reached: mpsc::UnboundedSender<()>,
-}
-
-impl ResultValidationWorker for BlockingValidationWorker {
-    type Running = PendingResultValidation;
-
-    fn start(&self, _request: ValidationWorkerRequest) -> Result<Self::Running, ()> {
-        let _ = self.reached.send(());
-        Ok(PendingResultValidation)
-    }
-}
-
 fn launch_with_blocking_validation(
     fixture: RealPiFixture,
     worker: BlockingValidationWorker,
@@ -1869,7 +1822,7 @@ fn launch_with_blocking_validation(
     let adapter = PiJsonV1Adapter::with_worker(
         fixture.diagnostics.clone(),
         NonZeroU64::new(16 * 1024).unwrap(),
-        ConformanceClock,
+        PendingClock,
         NoopExecutionObserver,
         worker,
     );

@@ -1,4 +1,12 @@
+use super::admission::{AdmittedWorkflow, ExecutionContext, ResolvedInputs, admit_workflow};
+use super::resolution;
+use super::runtime::{
+    self, ConditionOutput, ExecutionSeed, ExecutionStart, InitialCancellation, Reduction,
+    RuntimeDefinition,
+};
 use std::fmt;
+use std::path::Path;
+
 use std::fs;
 use std::os::unix::fs::PermissionsExt as _;
 use std::process::{Command, ExitStatus, Stdio};
@@ -140,3 +148,105 @@ impl fmt::Debug for SynchronousGate {
             .finish_non_exhaustive()
     }
 }
+
+/// Builds reducer state through the production initializer; tests customize the
+/// definition and seed, never individual RuntimeState fields.
+pub(crate) struct ReductionBuilder<Output, Deadline> {
+    definition: RuntimeDefinition,
+    seed: ExecutionSeed<Output>,
+    initial_cancellation: Option<InitialCancellation<Deadline>>,
+}
+
+impl<Output, Deadline> ReductionBuilder<Output, Deadline> {
+    pub(crate) fn new(definition: RuntimeDefinition) -> Self {
+        Self {
+            definition,
+            seed: ExecutionSeed::empty(),
+            initial_cancellation: None,
+        }
+    }
+
+    pub(crate) fn seeded(mut self, seed: ExecutionSeed<Output>) -> Self {
+        self.seed = seed;
+        self
+    }
+
+    pub(crate) fn initially_cancelled(
+        mut self,
+        cancellation: InitialCancellation<Deadline>,
+    ) -> Self {
+        self.initial_cancellation = Some(cancellation);
+        self
+    }
+
+    pub(crate) fn build<Provisional, Cause>(self) -> Reduction<Provisional, Cause, Output, Deadline>
+    where
+        Cause: Clone,
+        Output: Clone + ConditionOutput,
+        Deadline: Clone,
+    {
+        runtime::initialize_seeded_definition(
+            ExecutionStart {
+                definition: self.definition,
+                initial_cancellation: self.initial_cancellation,
+            },
+            self.seed,
+        )
+    }
+}
+
+/// Owns the source-writing and resolution boundary of an admitted test workflow.
+/// The caller owns the temporary directory and execution policy for its scenario.
+pub(crate) struct AdmittedFixture<'a> {
+    source_root: &'a Path,
+    source: &'a str,
+    files: &'a [(&'a str, &'a [u8])],
+}
+
+impl<'a> AdmittedFixture<'a> {
+    pub(crate) fn new(source_root: &'a Path, source: &'a str) -> Self {
+        Self {
+            source_root,
+            source,
+            files: &[],
+        }
+    }
+
+    pub(crate) fn with_files(mut self, files: &'a [(&'a str, &'a [u8])]) -> Self {
+        self.files = files;
+        self
+    }
+
+    pub(crate) fn admit(
+        self,
+        imports: ResolvedInputs,
+        context: ExecutionContext,
+    ) -> AdmittedWorkflow {
+        fs::create_dir_all(self.source_root).unwrap();
+        fs::write(self.source_root.join("workflow.yaml"), self.source).unwrap();
+        for (path, bytes) in self.files {
+            let path = self.source_root.join(path);
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).unwrap();
+            }
+            fs::write(path, bytes).unwrap();
+        }
+        admit_workflow(
+            resolution::resolve(self.source_root, Path::new("workflow.yaml")).unwrap(),
+            imports,
+            context,
+        )
+        .unwrap()
+    }
+}
+
+// All clock, observation and validation fixtures live under this shared module.
+mod fixtures;
+pub(crate) use fixtures::{
+    ChannelObservationSink, ControlledClock, InlineValidationWorker, PendingClock,
+    RecordingObservationSink,
+};
+pub(crate) use fixtures::{
+    blocking_validation, claude_validation, codex_clock, pi_blocking_validation, pi_clock, pi_sink,
+    pi_validation, step_clock, validation_fixtures,
+};

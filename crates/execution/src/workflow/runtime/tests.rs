@@ -9,6 +9,7 @@ use crate::workflow::admission::{
     ResolvedJsonInput, admit_runner_workflow, admit_workflow,
 };
 use crate::workflow::resolution;
+use crate::workflow::test_support::ReductionBuilder;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct TestDeadline {
@@ -132,10 +133,7 @@ fn invocation_classification_uses_handler_kind_not_target_kind() {
 }
 
 fn initialize_test(definition: RuntimeDefinition) -> TestReduction {
-    initialize_definition(ExecutionStart {
-        definition,
-        initial_cancellation: None,
-    })
+    ReductionBuilder::<String, TestDeadline>::new(definition).build::<String, String>()
 }
 
 fn inherited_seed(
@@ -594,13 +592,9 @@ fn inherited_success_resolves_exports_without_authorizing_the_source() {
         output_set(&[("result", "retained")]),
     );
 
-    let reduction = initialize_seeded_definition::<String, String, String, TestDeadline>(
-        ExecutionStart {
-            definition: runtime_definition,
-            initial_cancellation: None,
-        },
-        seed,
-    );
+    let reduction = ReductionBuilder::<String, TestDeadline>::new(runtime_definition)
+        .seeded(seed)
+        .build::<String, String>();
 
     assert_step(&reduction.state, "cached", StepStateKind::Inherited);
     assert!(reduction.state.steps["cached"].recovery.is_none());
@@ -637,13 +631,9 @@ fn finalizers_receive_inherited_values_and_skipped_values_remain_unavailable() {
         InheritedDisposition::Succeeded,
         output_set(&[("resource", "retained")]),
     );
-    let reduction = initialize_seeded_definition::<String, String, String, TestDeadline>(
-        ExecutionStart {
-            definition: runtime_definition.clone(),
-            initial_cancellation: None,
-        },
-        succeeded,
-    );
+    let reduction = ReductionBuilder::<String, TestDeadline>::new(runtime_definition.clone())
+        .seeded(succeeded)
+        .build::<String, String>();
     assert!(matches!(
         reduction.actions.as_slice(),
         [RequestedAction {
@@ -659,13 +649,9 @@ fn finalizers_receive_inherited_values_and_skipped_values_remain_unavailable() {
         InheritedDisposition::Skipped,
         BTreeMap::new(),
     );
-    let reduction = initialize_seeded_definition::<String, String, String, TestDeadline>(
-        ExecutionStart {
-            definition: runtime_definition,
-            initial_cancellation: None,
-        },
-        skipped,
-    );
+    let reduction = ReductionBuilder::<String, TestDeadline>::new(runtime_definition)
+        .seeded(skipped)
+        .build::<String, String>();
     assert_step(&reduction.state, "cached", StepStateKind::Inherited);
     assert_step(&reduction.state, "release", StepStateKind::Blocked);
 }
@@ -1008,23 +994,22 @@ fn initial_cancellation_finishes_without_authorizing_a_start() {
             },
         ),
     ]);
-    let reduction = initialize_definition::<String, String, String, TestDeadline>(ExecutionStart {
-        definition: definition(
-            &[
-                ("aRoot", &[], &["result"]),
-                ("bChild", &["aRoot"], &["result"]),
-            ],
-            &[
-                ("childExport", "bChild", "result"),
-                ("rootExport", "aRoot", "result"),
-            ],
-            1,
-        ),
-        initial_cancellation: Some(InitialCancellation::Graceful {
-            request: cancellation(reason, 5_000),
-            operation: None,
-        }),
-    });
+    let reduction = ReductionBuilder::<String, TestDeadline>::new(definition(
+        &[
+            ("aRoot", &[], &["result"]),
+            ("bChild", &["aRoot"], &["result"]),
+        ],
+        &[
+            ("childExport", "bChild", "result"),
+            ("rootExport", "aRoot", "result"),
+        ],
+        1,
+    ))
+    .initially_cancelled(InitialCancellation::Graceful {
+        request: cancellation(reason, 5_000),
+        operation: None,
+    })
+    .build::<String, String>();
     let cancelling = cancelling_workflow(reason, None);
 
     assert_eq!(
@@ -2976,14 +2961,12 @@ fn trace_cancelled_trigger_and_successful_release() {
         )],
         1,
     );
-    let initialized =
-        initialize_definition::<String, String, String, TestDeadline>(ExecutionStart {
-            definition,
-            initial_cancellation: Some(InitialCancellation::Graceful {
-                request: cancellation(CancellationReason::UserRequest, 10),
-                operation: None,
-            }),
-        });
+    let initialized = ReductionBuilder::<String, TestDeadline>::new(definition)
+        .initially_cancelled(InitialCancellation::Graceful {
+            request: cancellation(CancellationReason::UserRequest, 10),
+            operation: None,
+        })
+        .build::<String, String>();
     let start = initialized
         .actions
         .iter()
@@ -3448,14 +3431,12 @@ fn trace_fresh_finalization_cancellation_does_not_replay_ordinary_cancellation()
         )],
         1,
     );
-    let initialized =
-        initialize_definition::<String, String, String, TestDeadline>(ExecutionStart {
-            definition,
-            initial_cancellation: Some(InitialCancellation::Graceful {
-                request: cancellation(CancellationReason::UserRequest, 10),
-                operation: None,
-            }),
-        });
+    let initialized = ReductionBuilder::<String, TestDeadline>::new(definition)
+        .initially_cancelled(InitialCancellation::Graceful {
+            request: cancellation(CancellationReason::UserRequest, 10),
+            operation: None,
+        })
+        .build::<String, String>();
     let mut state = initialized.state;
     let release = initialized.actions[0].id;
     reduce_and_advance(
@@ -3579,14 +3560,12 @@ fn initial_cancellation_rearms_finalizers_and_blocks_unavailable_ordinary_output
         ],
         2,
     );
-    let initialized =
-        initialize_definition::<String, String, String, TestDeadline>(ExecutionStart {
-            definition,
-            initial_cancellation: Some(InitialCancellation::Graceful {
-                request: cancellation(CancellationReason::UserRequest, 10),
-                operation: Some(CancellationOperationId::fixture(1)),
-            }),
-        });
+    let initialized = ReductionBuilder::<String, TestDeadline>::new(definition)
+        .initially_cancelled(InitialCancellation::Graceful {
+            request: cancellation(CancellationReason::UserRequest, 10),
+            operation: Some(CancellationOperationId::fixture(1)),
+        })
+        .build::<String, String>();
     let state = initialized.state;
 
     assert_eq!(

@@ -5,11 +5,9 @@ use std::future::Future;
 use std::io::{self, Read, Write};
 use std::net::TcpStream as StandardTcpStream;
 use std::num::NonZeroUsize;
-use std::ops::Add;
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 use std::process::{self, Stdio};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar};
 use std::task::Poll;
 use std::thread::ThreadId;
@@ -18,7 +16,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::process::Command;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::mpsc;
 
 use super::*;
 use crate::workflow::admission::{
@@ -44,7 +42,10 @@ use crate::workflow::runtime::{
     self, Action, ActiveStepInvocation, ExportValue, Occurrence, RequestedAction, StepState,
     TargetExecutionNumber, TransitionSequence, WorkflowState,
 };
-use crate::workflow::test_support::SynchronousGate;
+use crate::workflow::test_support::{
+    SynchronousGate,
+    step_clock::{AdvancingClock, ControlledClock, TestClock, TestInstant},
+};
 use crate::workflow::test_support::{
     process_fixture_interrupt_handler, run_with_stalled_child_guard, wait_for_stalled_child_guard,
 };
@@ -319,182 +320,6 @@ struct PreparedGroupCommand {
     listener: TcpListener,
     admitted: AdmittedWorkflow,
 }
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-struct TestInstant(Duration);
-
-impl Add<Duration> for TestInstant {
-    type Output = Self;
-
-    fn add(self, duration: Duration) -> Self::Output {
-        Self(self.0 + duration)
-    }
-}
-
-#[derive(Clone, Copy)]
-struct TestClock;
-
-impl CoordinatorClock for TestClock {
-    type Instant = TestInstant;
-
-    fn now(&mut self) -> Self::Instant {
-        TestInstant(Duration::ZERO)
-    }
-
-    async fn wait_until(&self, _deadline: Self::Instant) {
-        std::future::pending().await
-    }
-}
-
-#[derive(Clone)]
-struct ControlledClock {
-    now: TestInstant,
-    release: watch::Receiver<bool>,
-    registrations: mpsc::UnboundedSender<TestInstant>,
-    active_waiters: Arc<AtomicUsize>,
-}
-
-struct DeadlineControl {
-    release: watch::Sender<bool>,
-    registrations: mpsc::UnboundedReceiver<TestInstant>,
-    active_waiters: Arc<AtomicUsize>,
-}
-
-struct DeadlineWaiterGuard(Arc<AtomicUsize>);
-
-impl Drop for DeadlineWaiterGuard {
-    fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::SeqCst);
-    }
-}
-
-impl ControlledClock {
-    fn new(now: TestInstant) -> (Self, DeadlineControl) {
-        let (release, released) = watch::channel(false);
-        let (registrations, registered) = mpsc::unbounded_channel();
-        let active_waiters = Arc::new(AtomicUsize::new(0));
-        (
-            Self {
-                now,
-                release: released,
-                registrations,
-                active_waiters: Arc::clone(&active_waiters),
-            },
-            DeadlineControl {
-                release,
-                registrations: registered,
-                active_waiters,
-            },
-        )
-    }
-}
-
-impl CoordinatorClock for ControlledClock {
-    type Instant = TestInstant;
-
-    fn now(&mut self) -> Self::Instant {
-        self.now
-    }
-
-    async fn wait_until(&self, deadline: Self::Instant) {
-        self.active_waiters.fetch_add(1, Ordering::SeqCst);
-        let _guard = DeadlineWaiterGuard(Arc::clone(&self.active_waiters));
-        let _ = self.registrations.send(deadline);
-        let mut release = self.release.clone();
-        while !*release.borrow_and_update() {
-            if release.changed().await.is_err() {
-                return;
-            }
-        }
-    }
-}
-
-impl DeadlineControl {
-    async fn next_deadline(&mut self) -> TestInstant {
-        self.registrations.recv().await.unwrap()
-    }
-
-    fn release(&self) {
-        self.release.send(true).unwrap();
-    }
-
-    fn active_waiters(&self) -> usize {
-        self.active_waiters.load(Ordering::SeqCst)
-    }
-}
-
-#[derive(Clone)]
-struct AdvancingClock {
-    now: Arc<Mutex<TestInstant>>,
-    changed: watch::Receiver<TestInstant>,
-    registrations: mpsc::UnboundedSender<TestInstant>,
-    active_waiters: Arc<AtomicUsize>,
-}
-
-struct AdvancingClockControl {
-    now: Arc<Mutex<TestInstant>>,
-    changed: watch::Sender<TestInstant>,
-    registrations: mpsc::UnboundedReceiver<TestInstant>,
-    active_waiters: Arc<AtomicUsize>,
-}
-
-impl AdvancingClock {
-    fn new(now: TestInstant) -> (Self, AdvancingClockControl) {
-        let (changed, changes) = watch::channel(now);
-        let (registrations, registered) = mpsc::unbounded_channel();
-        let now = Arc::new(Mutex::new(now));
-        let active_waiters = Arc::new(AtomicUsize::new(0));
-        (
-            Self {
-                now: Arc::clone(&now),
-                changed: changes,
-                registrations,
-                active_waiters: Arc::clone(&active_waiters),
-            },
-            AdvancingClockControl {
-                now,
-                changed,
-                registrations: registered,
-                active_waiters,
-            },
-        )
-    }
-}
-
-impl CoordinatorClock for AdvancingClock {
-    type Instant = TestInstant;
-
-    fn now(&mut self) -> Self::Instant {
-        *self.now.lock().unwrap()
-    }
-
-    async fn wait_until(&self, deadline: Self::Instant) {
-        self.active_waiters.fetch_add(1, Ordering::SeqCst);
-        let _guard = DeadlineWaiterGuard(Arc::clone(&self.active_waiters));
-        let _ = self.registrations.send(deadline);
-        let mut changed = self.changed.clone();
-        while *changed.borrow_and_update() < deadline {
-            if changed.changed().await.is_err() {
-                return;
-            }
-        }
-    }
-}
-
-impl AdvancingClockControl {
-    async fn next_deadline(&mut self) -> TestInstant {
-        self.registrations.recv().await.unwrap()
-    }
-
-    fn advance_to(&self, now: TestInstant) {
-        *self.now.lock().unwrap() = now;
-        self.changed.send(now).unwrap();
-    }
-
-    fn active_waiters(&self) -> usize {
-        self.active_waiters.load(Ordering::SeqCst)
-    }
-}
-
 type WorkflowCommit = CommittedReduction<StepFailureCause, CapturedValue, TestInstant>;
 
 struct RecordingCommitPort {

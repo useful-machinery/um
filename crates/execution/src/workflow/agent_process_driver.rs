@@ -1,8 +1,6 @@
 //! Common guarded process lifecycle for the native streaming adapters.
 mod process_loop;
 pub(super) use process_loop::{ProcessOutput, Protocol, State, Supervisor, drive, drive_signalled};
-#[cfg(test)]
-pub(crate) mod test_support;
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fs::File;

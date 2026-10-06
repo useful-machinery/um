@@ -636,7 +636,7 @@ struct RuntimeExport {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct RuntimeDefinition {
+pub(crate) struct RuntimeDefinition {
     steps: BTreeMap<String, RuntimeStep>,
     ordinary_ids: BTreeSet<String>,
     finalizer_ids: BTreeSet<String>,
@@ -1166,24 +1166,12 @@ where
     )
 }
 
-struct ExecutionStart<Deadline> {
-    definition: RuntimeDefinition,
-    initial_cancellation: Option<InitialCancellation<Deadline>>,
+pub(in crate::workflow) struct ExecutionStart<Deadline> {
+    pub(in crate::workflow) definition: RuntimeDefinition,
+    pub(in crate::workflow) initial_cancellation: Option<InitialCancellation<Deadline>>,
 }
 
-#[cfg(test)]
-fn initialize_definition<Provisional, Cause, Output, Deadline>(
-    start: ExecutionStart<Deadline>,
-) -> Reduction<Provisional, Cause, Output, Deadline>
-where
-    Cause: Clone,
-    Output: Clone + ConditionOutput,
-    Deadline: Clone,
-{
-    initialize_seeded_definition(start, ExecutionSeed::empty())
-}
-
-fn initialize_seeded_definition<Provisional, Cause, Output, Deadline>(
+pub(in crate::workflow) fn initialize_seeded_definition<Provisional, Cause, Output, Deadline>(
     start: ExecutionStart<Deadline>,
     seed: ExecutionSeed<Output>,
 ) -> Reduction<Provisional, Cause, Output, Deadline>

@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
-use std::future::{Future, pending};
+use std::future::Future;
 use std::io::{BufRead as _, Write as _};
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::os::unix::ffi::OsStrExt as _;
@@ -39,10 +39,7 @@ use crate::workflow::execution_root::AdmittedExecutionRoot;
 use crate::workflow::observation::NoopExecutionObserver;
 use crate::workflow::private_staging::open_directory_path;
 use crate::workflow::process_group::{ProcessGuardRegistry, process_group_is_quiescent};
-use crate::workflow::result_validation::{
-    ResultValidationWorker, RunningResultValidation, ValidationWorkerDecision,
-    ValidationWorkerRequest,
-};
+use crate::workflow::result_validation::ResultValidationWorker;
 use crate::workflow::test_support::{
     process_fixture_interrupt_receiver, spawn_process_fixture, write_process_fixture_id,
     write_process_fixture_signal,
@@ -881,9 +878,10 @@ fn type_schema(root_type: &str) -> RetainedJsonSchema {
     }))
 }
 
-use crate::workflow::agent_process_driver::test_support::ControlledClock;
-pub(super) use crate::workflow::agent_process_driver::test_support::{
-    InlineValidation, InlineValidationWorker,
+use crate::workflow::test_support::ControlledClock;
+pub(super) use crate::workflow::test_support::InlineValidationWorker;
+use crate::workflow::test_support::claude_validation::{
+    FailingValidationWorker, PendingValidationWorker,
 };
 
 fn controlled_clock() -> (
@@ -901,53 +899,6 @@ fn controlled_clock() -> (
         registered,
         release,
     )
-}
-
-#[derive(Clone)]
-struct PendingValidationWorker {
-    stopped: Arc<AtomicBool>,
-    quiesced: Arc<AtomicBool>,
-}
-
-struct PendingValidation {
-    stopped: Arc<AtomicBool>,
-    quiesced: Arc<AtomicBool>,
-}
-
-impl ResultValidationWorker for PendingValidationWorker {
-    type Running = PendingValidation;
-
-    fn start(&self, _request: ValidationWorkerRequest) -> Result<Self::Running, ()> {
-        Ok(PendingValidation {
-            stopped: Arc::clone(&self.stopped),
-            quiesced: Arc::clone(&self.quiesced),
-        })
-    }
-}
-
-#[derive(Clone, Copy)]
-struct FailingValidationWorker;
-
-impl ResultValidationWorker for FailingValidationWorker {
-    type Running = InlineValidation;
-
-    fn start(&self, _request: ValidationWorkerRequest) -> Result<Self::Running, ()> {
-        Err(())
-    }
-}
-
-impl RunningResultValidation for PendingValidation {
-    async fn wait(&mut self) -> Result<ValidationWorkerDecision, ()> {
-        pending().await
-    }
-
-    fn request_stop(&mut self) {
-        self.stopped.store(true, Ordering::SeqCst);
-    }
-
-    async fn quiesce(self) {
-        self.quiesced.store(true, Ordering::SeqCst);
-    }
 }
 
 async fn run_result_fixture<Clock, Worker>(

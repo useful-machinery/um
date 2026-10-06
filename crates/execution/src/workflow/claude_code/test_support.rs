@@ -76,9 +76,7 @@ impl FixtureSignal {
     }
 }
 
-pub(super) use crate::workflow::agent_process_driver::test_support::{
-    PendingClock, RecordingObservationSink,
-};
+pub(super) use crate::workflow::test_support::{PendingClock, RecordingObservationSink};
 
 pub(super) fn invocation_identity(run: &str, step: &str) -> AgentInvocationIdentity {
     AgentInvocationIdentity::new(

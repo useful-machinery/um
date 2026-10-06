@@ -492,9 +492,6 @@ fn combined_system_prompt(
 
 type LaunchedPiProcess = agent_process_driver::ProcessOutput;
 
-#[cfg(test)]
-pub(super) use agent_process_driver::PROCESS_GROUP_QUIESCENCE_PROBE_INTERVAL;
-
 struct ResultSettlementConfiguration<Clock> {
     clock: Clock,
     grace: PositiveDuration,

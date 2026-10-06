@@ -27,9 +27,6 @@ use crate::workflow::agent::{
     StagedAgentAttachment, WorkflowRunId, agent_start_channel,
 };
 use crate::workflow::agent_diagnostics::AgentDiagnosticSession;
-use crate::workflow::agent_process_driver::test_support::{
-    ControlledClock, InlineValidationWorker, PendingClock, RecordingObservationSink,
-};
 use crate::workflow::codex::CodexConfig;
 use crate::workflow::coordinator::CoordinatorClock;
 use crate::workflow::diagnostic::StepDiagnosticLog;
@@ -37,6 +34,10 @@ use crate::workflow::execution_root::AdmittedExecutionRoot;
 use crate::workflow::observation::NoopExecutionObserver;
 use crate::workflow::process_group::{ProcessGuardRegistry, process_group_is_quiescent};
 use crate::workflow::runtime::{ActionId, TransitionSequence};
+use crate::workflow::test_support::codex_clock::ReleasedClock;
+use crate::workflow::test_support::{
+    ControlledClock, InlineValidationWorker, PendingClock, RecordingObservationSink,
+};
 
 // Keep this slug in the pinned Codex catalog: unknown slugs lose apply_patch and tool_search.
 const MODEL: &str = "gpt-5.5";
@@ -73,31 +74,6 @@ exec "$CODEX_FIXTURE_HELPER" \
   --ignored --test-threads=1 \
   3>&1 >/dev/null
 "#;
-
-#[derive(Clone)]
-struct ReleasedClock {
-    deadlines: mpsc::UnboundedSender<(Duration, oneshot::Sender<()>)>,
-}
-
-// This clock carries Codex-specific stdin-deadline synchronization; sharing it with
-// another profile's fixture would couple independent protocol timing contracts.
-impl CoordinatorClock for ReleasedClock {
-    type Instant = Duration;
-
-    fn now(&mut self) -> Self::Instant {
-        Duration::ZERO
-    }
-
-    async fn wait_until(&self, deadline: Self::Instant) {
-        let (release, released) = oneshot::channel();
-        if self.deadlines.send((deadline, release)).is_err() {
-            std::future::pending::<()>().await;
-        }
-        if released.await.is_err() {
-            std::future::pending::<()>().await;
-        }
-    }
-}
 
 fn assert_last_observation_is_quiescent(observations: &[AgentObservationEnvelope]) {
     assert!(matches!(

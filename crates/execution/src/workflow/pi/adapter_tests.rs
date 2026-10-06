@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fs;
-use std::future::{Future, pending};
+use std::future::Future;
 use std::io::{Read as _, Write as _};
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
@@ -18,7 +18,7 @@ use rustix::process::{
 };
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-use tokio::sync::{mpsc, oneshot, watch};
+use tokio::sync::{mpsc, watch};
 
 use super::adapter::{PiJsonV1Adapter, build_command, prepare_launch};
 use super::*;
@@ -28,10 +28,10 @@ use crate::workflow::admission::{
 use crate::workflow::agent::{
     AdmittedAgentAdapter, AgentAdapter, AgentCompatibilityProfile, AgentInputKind, AgentInvocation,
     AgentInvocationIdentity, AgentInvocationLimits, AgentInvocationStaging,
-    AgentObservationEnvelope, AgentObservationSink, AgentOutcome, AgentProcessContext,
-    AgentProcessControl, AgentPrompt, AgentStartReceiveError, AgentStartReceiver,
-    AgentToolCallPhase, AgentValueMode, MAXIMUM_INLINE_AGENT_INPUT_BYTES, PositiveDuration,
-    RetainedJsonSchema, StagedAgentAttachment, WorkflowRunId, agent_start_channel,
+    AgentObservationEnvelope, AgentOutcome, AgentProcessContext, AgentProcessControl, AgentPrompt,
+    AgentStartReceiveError, AgentStartReceiver, AgentToolCallPhase, AgentValueMode,
+    MAXIMUM_INLINE_AGENT_INPUT_BYTES, PositiveDuration, RetainedJsonSchema, StagedAgentAttachment,
+    WorkflowRunId, agent_start_channel,
 };
 use crate::workflow::coordinator::CoordinatorClock;
 use crate::workflow::diagnostic::{StepDiagnostic, StepDiagnosticLog};
@@ -42,8 +42,11 @@ use crate::workflow::process_group::{
     AuthenticatedProcessGroup, DurableProcessGuardStore, ProcessGuardRegistry,
     ProcessGuardStoreError, process_group_is_quiescent,
 };
-use crate::workflow::result_validation::{ResultValidationWorker, ValidationWorkerRequest};
+use crate::workflow::result_validation::ResultValidationWorker;
 use crate::workflow::runtime::{ActionId, TransitionSequence};
+use crate::workflow::test_support::pi_clock::TestClock;
+use crate::workflow::test_support::pi_sink::{ObservationGate, RecordingObservationSink};
+use crate::workflow::test_support::pi_validation::DeadlineValidationWorker;
 use crate::workflow::test_support::{
     process_fixture_interrupt_receiver, process_fixture_output, run_with_stalled_child_guard,
     spawn_process_fixture, wait_for_stalled_child_guard, write_process_fixture_id,
@@ -68,58 +71,6 @@ fn assert_agent_failure(outcome: &AgentOutcome, cause: AgentFailureCause) {
         panic!("expected agent failure, got {outcome:?}");
     };
     assert_eq!(failure.cause(), &cause);
-}
-
-#[derive(Clone)]
-enum TestClock {
-    Pending,
-    Yielding,
-    Controlled {
-        now_seconds: Arc<AtomicU64>,
-        registrations: mpsc::UnboundedSender<Duration>,
-        release: watch::Receiver<bool>,
-    },
-}
-
-impl CoordinatorClock for TestClock {
-    type Instant = Duration;
-
-    fn now(&mut self) -> Self::Instant {
-        match self {
-            Self::Pending | Self::Yielding => Duration::ZERO,
-            Self::Controlled { now_seconds, .. } => {
-                Duration::from_secs(now_seconds.load(Ordering::SeqCst))
-            }
-        }
-    }
-
-    async fn wait_until(&self, deadline: Self::Instant) {
-        let (registrations, release) = match self {
-            Self::Pending => return pending().await,
-            Self::Yielding => return explicit_scheduling_point().await,
-            Self::Controlled {
-                registrations,
-                release,
-                ..
-            } => (registrations, release),
-        };
-        let _ = registrations.send(deadline);
-        let mut release = release.clone();
-        while !*release.borrow_and_update() {
-            if release.changed().await.is_err() {
-                return;
-            }
-        }
-        explicit_scheduling_point().await;
-    }
-}
-
-async fn explicit_scheduling_point() {
-    let (complete, completed) = oneshot::channel();
-    tokio::spawn(async move {
-        let _ = complete.send(());
-    });
-    let _ = completed.await;
 }
 
 const FAKE_PI: &str = r#"#!/bin/sh
@@ -258,36 +209,6 @@ exec "$PI_FIXTURE_DETACHED_HOLDER" \
   --ignored --test-threads=1 \
   3>&1 4>&2 >/dev/null 2>&1
 "#;
-
-#[derive(Clone)]
-struct ObservationGate {
-    reached: mpsc::UnboundedSender<()>,
-    release: watch::Receiver<bool>,
-}
-
-#[derive(Clone)]
-struct RecordingObservationSink {
-    observations: mpsc::UnboundedSender<AgentObservationEnvelope>,
-    gate: Arc<Mutex<Option<ObservationGate>>>,
-}
-
-impl AgentObservationSink for RecordingObservationSink {
-    fn observe(&self, observation: AgentObservationEnvelope) -> impl Future<Output = ()> + Send {
-        let _ = self.observations.send(observation);
-        let gate = self.gate.lock().unwrap().clone();
-        async move {
-            let Some(mut gate) = gate else {
-                return;
-            };
-            let _ = gate.reached.send(());
-            while !*gate.release.borrow_and_update() {
-                if gate.release.changed().await.is_err() {
-                    return;
-                }
-            }
-        }
-    }
-}
 
 type TestInvocation = AgentInvocation;
 
@@ -758,18 +679,7 @@ pub(super) fn invocation_limits() -> AgentInvocationLimits<PiJsonV1ProtocolLimit
     )
 }
 
-pub(super) use crate::workflow::agent_process_driver::test_support::InlineValidationWorker;
-
-#[derive(Clone, Copy)]
-struct DeadlineValidationWorker;
-
-impl ResultValidationWorker for DeadlineValidationWorker {
-    type Running = PendingResultValidation;
-
-    fn start(&self, _request: ValidationWorkerRequest) -> Result<Self::Running, ()> {
-        Ok(PendingResultValidation)
-    }
-}
+pub(super) use crate::workflow::test_support::InlineValidationWorker;
 
 struct CapturedRun {
     _temporary: tempfile::TempDir,
