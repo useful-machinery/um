@@ -17,33 +17,36 @@ use crate::generated::models;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Default, Debug, PartialEq, Serialize, Deserialize)]
-pub struct WebhookAttempt {
-    #[serde(rename = "id")]
-    pub id: String,
-    #[serde(rename = "startedAt")]
-    pub started_at: String,
-    #[serde(rename = "finishedAt", skip_serializing_if = "Option::is_none")]
-    pub finished_at: Option<String>,
-    #[serde(rename = "currentKeyVersion")]
-    pub current_key_version: i64,
-    #[serde(rename = "previousKeyVersion", skip_serializing_if = "Option::is_none")]
-    pub previous_key_version: Option<i64>,
+pub struct RunnerDiagnostic {
+    #[serde(rename = "stage", skip_serializing_if = "Option::is_none")]
+    pub stage: Option<String>,
+    #[serde(rename = "gitCommand", skip_serializing_if = "Option::is_none")]
+    pub git_command: Option<String>,
+    #[serde(rename = "gitExitCode", skip_serializing_if = "Option::is_none")]
+    pub git_exit_code: Option<i32>,
+    #[serde(rename = "limitMs", skip_serializing_if = "Option::is_none")]
+    pub limit_ms: Option<i32>,
     #[serde(rename = "httpStatus", skip_serializing_if = "Option::is_none")]
     pub http_status: Option<i32>,
-    #[serde(rename = "failureCode", skip_serializing_if = "Option::is_none")]
-    pub failure_code: Option<models::WebhookFailureCode>,
+    #[serde(rename = "transportError", skip_serializing_if = "Option::is_none")]
+    pub transport_error: Option<String>,
+    #[serde(rename = "harnessError", skip_serializing_if = "Option::is_none")]
+    pub harness_error: Option<String>,
+    #[serde(rename = "declineCause", skip_serializing_if = "Option::is_none")]
+    pub decline_cause: Option<String>,
 }
 
-impl WebhookAttempt {
-    pub fn new(id: String, started_at: String, current_key_version: i64) -> WebhookAttempt {
-        WebhookAttempt {
-            id,
-            started_at,
-            finished_at: None,
-            current_key_version,
-            previous_key_version: None,
+impl RunnerDiagnostic {
+    pub fn new() -> RunnerDiagnostic {
+        RunnerDiagnostic {
+            stage: None,
+            git_command: None,
+            git_exit_code: None,
+            limit_ms: None,
             http_status: None,
-            failure_code: None,
+            transport_error: None,
+            harness_error: None,
+            decline_cause: None,
         }
     }
 }

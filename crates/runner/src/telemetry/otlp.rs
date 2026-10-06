@@ -40,7 +40,7 @@ const DIAGNOSTIC_NAME_FIELD: &str = "diagnostic.name";
 const DIAGNOSTIC_CLASSIFICATION_FIELD: &str = "diagnostic.classification";
 
 pub(super) fn configured_processor(writer: Arc<dyn EventWriter>) -> Option<ExportSpanProcessor> {
-    let diagnostics = DiagnosticReporter::new(writer);
+    let diagnostics = DiagnosticReporter::new(Arc::clone(&writer));
     let settings = match ExportSettings::from_lookup(|name| std::env::var_os(name)) {
         SettingsOutcome::Disabled => return None,
         SettingsOutcome::Invalid(classification) => {
@@ -50,10 +50,29 @@ pub(super) fn configured_processor(writer: Arc<dyn EventWriter>) -> Option<Expor
         SettingsOutcome::Enabled(settings) => settings,
     };
 
-    match OtlpHttpExporter::new(settings) {
-        Ok(exporter) => Some(ExportSpanProcessor::new(exporter, diagnostics)),
-        Err(()) => {
-            diagnostics.report(DiagnosticClassification::ExporterUnavailable);
+    // reqwest::blocking builds and tears down an internal runtime. Runner Serve
+    // initializes this recorder inside Tokio; construct the blocking client on
+    // a plain thread so its runtime is never dropped in an async context.
+    let fallback = DiagnosticReporter::new(writer);
+    let initializer = thread::Builder::new()
+        .name("runner-otlp-initialize".into())
+        .spawn(move || match OtlpHttpExporter::new(settings) {
+            Ok(exporter) => Some(ExportSpanProcessor::new(exporter, diagnostics)),
+            Err(()) => {
+                diagnostics.report(DiagnosticClassification::ExporterUnavailable);
+                None
+            }
+        });
+    match initializer {
+        Ok(initializer) => match initializer.join() {
+            Ok(processor) => processor,
+            Err(_) => {
+                fallback.report(DiagnosticClassification::ExporterUnavailable);
+                None
+            }
+        },
+        Err(_) => {
+            fallback.report(DiagnosticClassification::ExporterUnavailable);
             None
         }
     }

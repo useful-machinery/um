@@ -587,6 +587,30 @@
         "input_json_invalid"
       ]
     },
+    "RunnerDiagnostic": {
+      "type": "object",
+      "additionalProperties": false,
+      "minProperties": 1,
+      "properties": {
+        "stage": {"$ref": "#/$defs/diagnosticSlug"},
+        "gitCommand": {"$ref": "#/$defs/diagnosticSlug"},
+        "gitExitCode": {"$ref": "#/$defs/diagnosticInteger"},
+        "limitMs": {"$ref": "#/$defs/diagnosticInteger"},
+        "httpStatus": {"$ref": "#/$defs/diagnosticInteger"},
+        "transportError": {"$ref": "#/$defs/diagnosticSlug"},
+        "harnessError": {"$ref": "#/$defs/diagnosticSlug"},
+        "declineCause": {"$ref": "#/$defs/diagnosticSlug"}
+      }
+    },
+    "diagnosticSlug": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_]{0,63}$"
+    },
+    "diagnosticInteger": {
+      "type": "integer",
+      "minimum": -2147483648,
+      "maximum": 2147483647
+    },
     "AssignmentDecline": {
       "oneOf": [
         {
@@ -595,7 +619,8 @@
           "properties": {
             "type": {
               "const": "capacity_unavailable"
-            }
+            },
+            "diagnostic": {"$ref": "#/$defs/RunnerDiagnostic"}
           },
           "required": [
             "type"
@@ -610,7 +635,8 @@
             },
             "reason": {
               "$ref": "#/$defs/RunnerUnableReason"
-            }
+            },
+            "diagnostic": {"$ref": "#/$defs/RunnerDiagnostic"}
           },
           "required": [
             "type",
@@ -626,7 +652,8 @@
             },
             "reason": {
               "$ref": "#/$defs/ExecutionSpecInvalidReason"
-            }
+            },
+            "diagnostic": {"$ref": "#/$defs/RunnerDiagnostic"}
           },
           "required": [
             "type",
@@ -4511,7 +4538,8 @@
                 },
                 "workflowEvent": {
                   "$ref": "#/$defs/WorkflowTransitionEvent"
-                }
+                },
+                "diagnostic": {"$ref": "#/$defs/RunnerDiagnostic"}
               },
               "required": [
                 "assignmentId",
@@ -4551,6 +4579,7 @@
                 "outcome": {
                   "$ref": "#/$defs/WorkflowTerminalOutcome"
                 },
+                "diagnostic": {"$ref": "#/$defs/RunnerDiagnostic"},
                 "artifactDelivery": {
                   "$ref": "#/$defs/ArtifactDeliveryResult"
                 }
@@ -5329,7 +5358,8 @@
             },
             "code": {
               "$ref": "#/$defs/ArtifactRegistrationFailureCode"
-            }
+            },
+            "diagnostic": {"$ref": "#/$defs/RunnerDiagnostic"}
           },
           "required": [
             "outcome",
@@ -5349,7 +5379,8 @@
             },
             "code": {
               "$ref": "#/$defs/ArtifactUploadFailureCode"
-            }
+            },
+            "diagnostic": {"$ref": "#/$defs/RunnerDiagnostic"}
           },
           "required": [
             "outcome",
@@ -5369,7 +5400,8 @@
             },
             "code": {
               "$ref": "#/$defs/ArtifactPreparationFailureCode"
-            }
+            },
+            "diagnostic": {"$ref": "#/$defs/RunnerDiagnostic"}
           },
           "required": [
             "outcome",
