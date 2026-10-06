@@ -1128,29 +1128,30 @@ impl ReloadDependencies {
         }
         let preparation = self.prepare_candidate(config, sequence, attempt);
         tokio::pin!(preparation);
-        let prepared = tokio::select! {
-            biased;
-            result = &mut preparation => result,
-            result = &mut *connection => {
-                respond_to_reload(
-                    &mut request,
-                    Err(ControlError::PendingConnectionFailed),
-                );
-                return ConnectedReloadResult::Finished(result);
-            }
-            _ = shutdown.wait() => {
-                respond_to_reload(
-                    &mut request,
-                    Err(ControlError::PendingConnectionFailed),
-                );
-                return ConnectedReloadResult::Shutdown;
+        // Superseding the old session can precede the candidate welcome.
+        // Preserve the bounded handshake, and retain the old result for failure.
+        let mut prior_result = None;
+        let prepared = loop {
+            tokio::select! {
+                biased;
+                result = &mut preparation => break result,
+                result = &mut *connection, if prior_result.is_none() => {
+                    prior_result = Some(result);
+                }
+                _ = shutdown.wait() => {
+                    respond_to_reload(&mut request, Err(ControlError::PendingConnectionFailed));
+                    return ConnectedReloadResult::Shutdown;
+                }
             }
         };
         let prepared = match prepared {
             Ok(prepared) => prepared,
             Err(error) => {
                 respond_to_reload(&mut request, Err(error));
-                return ConnectedReloadResult::Continue;
+                return prior_result.map_or(
+                    ConnectedReloadResult::Continue,
+                    ConnectedReloadResult::Finished,
+                );
             }
         };
         match self.commit_candidate(prepared).await {
@@ -1165,7 +1166,10 @@ impl ReloadDependencies {
                 respond_to_reload(&mut request, Err(error));
                 match recovery {
                     Ok(recovered) => ConnectedReloadResult::Promoted(Box::new(recovered)),
-                    Err(_) => ConnectedReloadResult::Continue,
+                    Err(_) => prior_result.map_or(
+                        ConnectedReloadResult::Continue,
+                        ConnectedReloadResult::Finished,
+                    ),
                 }
             }
         }
@@ -1985,6 +1989,7 @@ mod tests {
     async fn accept_rotation_connections(
         listener: &tokio::net::TcpListener,
         current_ready: Option<tokio::sync::oneshot::Sender<()>>,
+        supersede_current: bool,
     ) -> (FixtureSocket, FixtureSocket) {
         let (mut current, current_headers) = accept_fixture_socket_with_headers(listener).await;
         assert!(
@@ -2021,6 +2026,11 @@ mod tests {
         };
         let pending_hello: serde_json::Value = serde_json::from_str(&pending_hello).unwrap();
         assert_eq!(pending_hello["bootId"], current_hello["bootId"]);
+        if supersede_current {
+            current.close(None).await.unwrap();
+            // Complete the old session before sending the candidate welcome.
+            while current.next().await.is_some() {}
+        }
         pending.send(welcome()).await.unwrap();
         pending
             .send(observation_acknowledgement(
@@ -2080,31 +2090,34 @@ mod tests {
 
     #[tokio::test]
     async fn control_socket_reload_promotes_the_live_same_boot_connection() {
-        let (listener, endpoint) = fixture_listener().await;
-        let fixture = RotationFixture::without_pending(&endpoint);
-        let socket_path = fixture.config.control_socket_path().unwrap().to_owned();
-        let (current_sent, current_received) = tokio::sync::oneshot::channel();
-        let server = tokio::spawn(async move {
-            let (current, mut pending) =
-                accept_rotation_connections(&listener, Some(current_sent)).await;
-            while pending.next().await.is_some() {}
-            drop(current);
-        });
-        let (service, _capture, shutdown_trigger) =
-            spawn_configured_service(fixture.config.clone(), fixture_sleeper());
-        with_watchdog(current_received).await.unwrap().unwrap();
-        assert_eq!(
-            request_staged_reload(&fixture, socket_path).await,
-            Response::Reloaded {
-                credential_id: "rrc_01k0z6r1w8f4jy2m7q9v3x5abd".to_owned()
-            }
-        );
-        let state: serde_json::Value =
-            serde_json::from_slice(&fs::read(&fixture.state_path).unwrap()).unwrap();
-        assert!(state.get("pendingCredential").is_none());
-        shutdown_trigger.notify_one();
-        with_watchdog(service).await.unwrap().unwrap().unwrap();
-        with_watchdog(server).await.unwrap().unwrap();
+        for supersede_current in [false, true] {
+            let (listener, endpoint) = fixture_listener().await;
+            let fixture = RotationFixture::without_pending(&endpoint);
+            let socket_path = fixture.config.control_socket_path().unwrap().to_owned();
+            let (current_sent, current_received) = tokio::sync::oneshot::channel();
+            let server = tokio::spawn(async move {
+                let (current, mut pending) =
+                    accept_rotation_connections(&listener, Some(current_sent), supersede_current)
+                        .await;
+                while pending.next().await.is_some() {}
+                drop(current);
+            });
+            let (service, _capture, shutdown_trigger) =
+                spawn_configured_service(fixture.config.clone(), fixture_sleeper());
+            with_watchdog(current_received).await.unwrap().unwrap();
+            assert_eq!(
+                request_staged_reload(&fixture, socket_path).await,
+                Response::Reloaded {
+                    credential_id: "rrc_01k0z6r1w8f4jy2m7q9v3x5abd".to_owned()
+                }
+            );
+            let state: serde_json::Value =
+                serde_json::from_slice(&fs::read(&fixture.state_path).unwrap()).unwrap();
+            assert!(state.get("pendingCredential").is_none());
+            shutdown_trigger.notify_one();
+            with_watchdog(service).await.unwrap().unwrap().unwrap();
+            with_watchdog(server).await.unwrap().unwrap();
+        }
     }
 
     #[tokio::test]
@@ -2451,7 +2464,7 @@ mod tests {
         let state_path = fixture.state_path.clone();
         let (promoted_sent, promoted_received) = tokio::sync::oneshot::channel();
         let server = tokio::spawn(async move {
-            let (current, mut pending) = accept_rotation_connections(&listener, None).await;
+            let (current, mut pending) = accept_rotation_connections(&listener, None, false).await;
             promoted_sent.send(()).unwrap();
             while pending.next().await.is_some() {}
             drop(current);
