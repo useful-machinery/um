@@ -1773,19 +1773,34 @@ fn condition_evidence_transition(value: &Value) -> bool {
 }
 
 pub fn is_condition_evidence_workflow_event(event: &Value) -> bool {
-    matches!(
-        (
-            event.get("to").and_then(Value::as_str),
-            event.pointer("/detail/phase").and_then(Value::as_str),
-            event.pointer("/detail/code").and_then(Value::as_str),
-        ),
-        (Some("skipped"), _, Some("condition_false"))
-            | (
-                Some("failed"),
-                Some("condition"),
-                Some("json_pointer_missing")
-            )
-    )
+    if event.get("eventType").and_then(Value::as_str) == Some("workflow_state_changed") {
+        return ["from", "to"].into_iter().any(|side| {
+            ["primaryIssue", "priorIssue"].into_iter().any(|field| {
+                event
+                    .get(side)
+                    .and_then(|state| state.get(field))
+                    .is_some_and(|issue| {
+                        issue.get("state").and_then(Value::as_str) == Some("failed")
+                            && is_condition_pointer_failure(&issue["detail"])
+                    })
+            })
+        });
+    }
+    if event.get("eventType").and_then(Value::as_str) != Some("step_state_changed") {
+        return false;
+    }
+    match event.get("to").and_then(Value::as_str) {
+        Some("skipped") => {
+            event.pointer("/detail/code").and_then(Value::as_str) == Some("condition_false")
+        }
+        Some("failed") => is_condition_pointer_failure(&event["detail"]),
+        _ => false,
+    }
+}
+
+fn is_condition_pointer_failure(detail: &Value) -> bool {
+    detail.get("phase").and_then(Value::as_str) == Some("condition")
+        && detail.get("code").and_then(Value::as_str) == Some("json_pointer_missing")
 }
 
 fn validate_protocol_schema(value: &Value) -> Result<(), DecodeError> {
@@ -2719,6 +2734,61 @@ mod tests {
             json!({ "phase": "start", "cause": { "code": "harness_start_failed" } });
         let encoded = encode_runner_frame(&frame).unwrap();
         assert!(decode_frame(&encoded).is_ok());
+    }
+
+    #[test]
+    fn large_workflow_condition_issues_pass_the_runner_encoder() {
+        let cases: Value = serde_json::from_slice(include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/runner-protocol/v1/condition-workflow-transitions.json"
+        )))
+        .unwrap();
+        for case in cases.as_array().unwrap() {
+            let mut event = case["workflowEvent"].clone();
+            for side in ["from", "to"] {
+                for field in ["primaryIssue", "priorIssue"] {
+                    if let Some(detail) = event
+                        .get_mut(side)
+                        .and_then(|state| state.get_mut(field))
+                        .and_then(|issue| issue.get_mut("detail"))
+                    {
+                        detail["pointer"] = json!(format!("/{}", "\u{0007}".repeat(65_536)));
+                    }
+                }
+            }
+            let frame = RunnerFrame::ExecutionTransition {
+                envelope: maximal_envelope(),
+                assignment_id: "asn_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned(),
+                attempt_id: "atm_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned(),
+                execution_event_sequence: 4,
+                workflow_event: event.clone(),
+            };
+            let encoded = encode_runner_frame(&frame)
+                .unwrap_or_else(|error| panic!("{}: {error:?}", case["name"]));
+            assert!(encoded.len() > MAXIMUM_ORDINARY_FRAME_BYTES);
+            assert!(matches!(decode_frame(&encoded), Ok(ValidatedFrame::Runner)));
+
+            // A schema-valid execution failure does not acquire the condition allowance.
+            for side in ["from", "to"] {
+                for field in ["primaryIssue", "priorIssue"] {
+                    if let Some(issue) = event.get_mut(side).and_then(|state| state.get_mut(field))
+                    {
+                        issue["detail"] =
+                            json!({"phase":"execution","code":"command_exit","exitCode":1});
+                    }
+                }
+            }
+            assert!(!is_condition_evidence_workflow_event(&event));
+            let mut ordinary: Value = serde_json::from_slice(&encoded).unwrap();
+            ordinary["payload"]["workflowEvent"] = event;
+            let mut ordinary = serde_json::to_vec(&ordinary).unwrap();
+            assert!(decode_frame(&ordinary).is_ok());
+            ordinary.resize(MAXIMUM_ORDINARY_FRAME_BYTES + 1, b' ');
+            assert!(matches!(
+                decode_frame(&ordinary),
+                Err(DecodeError::InvalidFrame("sizeClass"))
+            ));
+        }
     }
 
     #[test]

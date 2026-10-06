@@ -1,0 +1,235 @@
+[
+  {
+    "name": "failure_stopped",
+    "workflowEvent": {
+      "eventVersion": 1,
+      "eventType": "workflow_state_changed",
+      "transitionSequence": 7,
+      "from": {
+        "state": "executing",
+        "gate": "open"
+      },
+      "to": {
+        "state": "executing",
+        "gate": "failure_stopped",
+        "primaryIssue": {
+          "node": {
+            "id": "build",
+            "role": "step"
+          },
+          "state": "failed",
+          "detail": {
+            "phase": "condition",
+            "code": "json_pointer_missing",
+            "ref": "outputs.plan.result",
+            "pointer": "/missing"
+          }
+        }
+      }
+    }
+  },
+  {
+    "name": "cancelling",
+    "workflowEvent": {
+      "eventVersion": 1,
+      "eventType": "workflow_state_changed",
+      "transitionSequence": 7,
+      "from": {
+        "state": "executing",
+        "gate": "failure_stopped",
+        "primaryIssue": {
+          "node": {
+            "id": "build",
+            "role": "step"
+          },
+          "state": "failed",
+          "detail": {
+            "phase": "condition",
+            "code": "json_pointer_missing",
+            "ref": "outputs.plan.result",
+            "pointer": "/missing"
+          }
+        }
+      },
+      "to": {
+        "state": "executing",
+        "gate": "cancelling",
+        "reason": "user_request",
+        "priorIssue": {
+          "node": {
+            "id": "build",
+            "role": "step"
+          },
+          "state": "failed",
+          "detail": {
+            "phase": "condition",
+            "code": "json_pointer_missing",
+            "ref": "outputs.plan.result",
+            "pointer": "/missing"
+          }
+        }
+      }
+    }
+  },
+  {
+    "name": "prior_issue",
+    "workflowEvent": {
+      "eventVersion": 1,
+      "eventType": "workflow_state_changed",
+      "transitionSequence": 7,
+      "from": {
+        "state": "executing",
+        "gate": "cancelling",
+        "reason": "user_request",
+        "priorIssue": {
+          "node": {
+            "id": "build",
+            "role": "step"
+          },
+          "state": "failed",
+          "detail": {
+            "phase": "condition",
+            "code": "json_pointer_missing",
+            "ref": "outputs.plan.result",
+            "pointer": "/missing"
+          }
+        }
+      },
+      "to": {
+        "state": "finalizing",
+        "trigger": "cancelled",
+        "gate": "open",
+        "primaryIssue": {
+          "node": {
+            "id": "build",
+            "role": "step"
+          },
+          "state": "failed",
+          "detail": {
+            "phase": "condition",
+            "code": "json_pointer_missing",
+            "ref": "outputs.plan.result",
+            "pointer": "/missing"
+          }
+        }
+      }
+    }
+  },
+  {
+    "name": "finalizing",
+    "workflowEvent": {
+      "eventVersion": 1,
+      "eventType": "workflow_state_changed",
+      "transitionSequence": 7,
+      "from": {
+        "state": "executing",
+        "gate": "failure_stopped",
+        "primaryIssue": {
+          "node": {
+            "id": "build",
+            "role": "step"
+          },
+          "state": "failed",
+          "detail": {
+            "phase": "condition",
+            "code": "json_pointer_missing",
+            "ref": "outputs.plan.result",
+            "pointer": "/missing"
+          }
+        }
+      },
+      "to": {
+        "state": "finalizing",
+        "trigger": "failed",
+        "gate": "open",
+        "primaryIssue": {
+          "node": {
+            "id": "build",
+            "role": "step"
+          },
+          "state": "failed",
+          "detail": {
+            "phase": "condition",
+            "code": "json_pointer_missing",
+            "ref": "outputs.plan.result",
+            "pointer": "/missing"
+          }
+        }
+      }
+    }
+  },
+  {
+    "name": "failed",
+    "workflowEvent": {
+      "eventVersion": 1,
+      "eventType": "workflow_state_changed",
+      "transitionSequence": 7,
+      "from": {
+        "state": "finalizing",
+        "trigger": "failed",
+        "gate": "open",
+        "primaryIssue": {
+          "node": {
+            "id": "build",
+            "role": "step"
+          },
+          "state": "failed",
+          "detail": {
+            "phase": "condition",
+            "code": "json_pointer_missing",
+            "ref": "outputs.plan.result",
+            "pointer": "/missing"
+          }
+        }
+      },
+      "to": {
+        "state": "failed",
+        "primaryIssue": {
+          "node": {
+            "id": "build",
+            "role": "step"
+          },
+          "state": "failed",
+          "detail": {
+            "phase": "condition",
+            "code": "json_pointer_missing",
+            "ref": "outputs.plan.result",
+            "pointer": "/missing"
+          }
+        },
+        "forceAbort": null
+      }
+    }
+  },
+  {
+    "name": "from_only",
+    "workflowEvent": {
+      "eventVersion": 1,
+      "eventType": "workflow_state_changed",
+      "transitionSequence": 7,
+      "from": {
+        "state": "finalizing",
+        "trigger": "failed",
+        "gate": "open",
+        "primaryIssue": {
+          "node": {
+            "id": "build",
+            "role": "step"
+          },
+          "state": "failed",
+          "detail": {
+            "phase": "condition",
+            "code": "json_pointer_missing",
+            "ref": "outputs.plan.result",
+            "pointer": "/missing"
+          }
+        }
+      },
+      "to": {
+        "state": "cancelled",
+        "reason": "user_request",
+        "forceAbort": null
+      }
+    }
+  }
+]

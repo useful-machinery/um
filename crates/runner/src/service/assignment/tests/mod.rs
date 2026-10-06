@@ -5409,6 +5409,85 @@ fn outbox_accepts_large_condition_evidence_transition() {
     assert_eq!(outbox.lock().entries.len(), 1);
 }
 
+#[test]
+fn outbox_retains_large_condition_failure_through_finalization() {
+    let mut outbox = ObservationOutbox::new();
+    // One conditional step and one finalizer: 14 transitions, 64 reserved
+    // observations, a 4 MiB aggregate condition bound, and an 8 MiB terminal bound.
+    // Use the carried byte reservation rather than the larger service-wide cap.
+    outbox.maximum_encoded_bytes = (14 + 64 - 1 - 1) * 262_144 + 4_194_304 + 8_388_608;
+    outbox.reserve(14, outbox.maximum_encoded_bytes).unwrap();
+    // YAML's two-byte escape can expand to six JSON bytes. This pointer alone
+    // consumes the entire 1 MiB workflow-document allowance; real definitions
+    // necessarily leave room for their structure.
+    let pointer = format!("/{}", "\u{0007}".repeat(524_288));
+    let detail = json!({
+        "phase": "condition", "code": "json_pointer_missing",
+        "ref": "outputs.plan.result", "pointer": pointer,
+    });
+    let issue = json!({
+        "node": {"id": "build", "role": "step"},
+        "state": "failed", "detail": detail,
+    });
+    outbox
+        .enqueue(AssignmentObservation::Execution {
+            assignment_id: "asn_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned(),
+            attempt_id: "atm_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned(),
+            report: ExecutionReport::Transition {
+                execution_event_sequence: 1,
+                workflow_event: json!({
+                    "eventVersion": 1, "eventType": "step_state_changed",
+                    "transitionSequence": 1, "stepId": "build", "role": "step",
+                    "failurePolicy": "required", "from": "pending", "to": "failed",
+                    "detail": detail,
+                }),
+            },
+        })
+        .unwrap();
+    let cases: Value = serde_json::from_slice(include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../tests/fixtures/runner-protocol/v1/condition-workflow-transitions.json"
+    )))
+    .unwrap();
+    for case in cases.as_array().unwrap() {
+        if !matches!(
+            case["name"].as_str(),
+            Some("failure_stopped" | "finalizing" | "failed")
+        ) {
+            continue;
+        }
+        let event = serde_json::to_string(&case["workflowEvent"])
+            .unwrap()
+            .replace("\"/missing\"", &serde_json::to_string(&pointer).unwrap());
+        outbox
+            .enqueue(AssignmentObservation::Execution {
+                assignment_id: "asn_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned(),
+                attempt_id: "atm_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned(),
+                report: ExecutionReport::Transition {
+                    execution_event_sequence: 4,
+                    workflow_event: serde_json::from_str(&event).unwrap(),
+                },
+            })
+            .unwrap();
+    }
+    outbox.enqueue(AssignmentObservation::Execution {
+        assignment_id: "asn_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned(),
+        attempt_id: "atm_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned(),
+        report: ExecutionReport::Finished {
+            final_execution_event_sequence: 5,
+            outcome: json!({"outcome": "failed", "primaryIssue": issue, "forceAbort": null}),
+            artifact_delivery: json!({"outcome": "prepared", "artifactSetId": "ats_01k0z6r1w8f4jy2m7q9v3x5abc"}),
+        },
+    }).unwrap();
+    let pending = outbox.pending(&BTreeSet::new(), 10);
+    assert_eq!(pending.len(), 5);
+    for observation in pending {
+        let id = observation.id;
+        assert!(outbox.acknowledge(id).is_some());
+    }
+    assert!(outbox.pending(&BTreeSet::new(), 10).is_empty());
+}
+
 fn assert_only_one_pending_terminal(observation: AssignmentObservation) {
     let outbox = ObservationOutbox::new();
     assert!(outbox.enqueue(observation.clone()).is_ok());
