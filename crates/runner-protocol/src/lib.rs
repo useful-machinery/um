@@ -2199,6 +2199,10 @@ mod tests {
         )),
         include_bytes!(concat!(
             env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/runner-protocol/v1/valid/runner-artifact-result-register-maximum.json"
+        )),
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
             "/../../tests/fixtures/runner-protocol/v1/valid/runner-artifact-result-confirm.json"
         )),
         include_bytes!(concat!(
@@ -2219,6 +2223,10 @@ mod tests {
         include_bytes!(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/../../tests/fixtures/runner-protocol/v1/invalid/unknown-type.json"
+        )),
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/runner-protocol/v1/invalid/runner-artifact-result-register-over-maximum.json"
         )),
         include_bytes!(concat!(
             env!("CARGO_MANIFEST_DIR"),
@@ -2391,6 +2399,27 @@ mod tests {
 
         let encoded = encode_runner_frame(&frame).unwrap();
         assert!(matches!(decode_frame(&encoded), Ok(ValidatedFrame::Runner)));
+    }
+
+    #[test]
+    fn result_registration_encodes_the_workflow_capacity_range() {
+        for size_bytes in [202_027_693, 428_876_460, 1_127_929_176, 1_127_929_177] {
+            let frame = RunnerFrame::ArtifactResultRegister {
+                envelope: maximal_envelope(),
+                assignment_id: "asn_01k0z6r1w8f4jy2m7q9v3x5abh".to_owned(),
+                attempt_id: "atm_01k0z6r1w8f4jy2m7q9v3x5abk".to_owned(),
+                size_bytes,
+                sha256: "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a"
+                    .to_owned(),
+            };
+            let encoded = encode_runner_frame(&frame);
+            if size_bytes > 1_127_929_176 {
+                assert!(encoded.is_err());
+            } else {
+                let encoded = encoded.unwrap();
+                assert!(matches!(decode_frame(&encoded), Ok(ValidatedFrame::Runner)));
+            }
+        }
     }
 
     #[test]

@@ -5486,7 +5486,7 @@
     "artifactResultSizeBytes": {
       "type": "integer",
       "minimum": 0,
-      "maximum": 202027692
+      "maximum": 1127929176
     },
     "UploadCapability": {
       "type": "object",
