@@ -1,8 +1,8 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://docs.usefulmachinery.com/schemas/workflow-v1.schema.json",
-  "title": "Scherzo workflow format version 1",
-  "description": "Structural contract for a Scherzo workflow YAML document.",
+  "title": "Useful Machinery workflow format version 1",
+  "description": "Structural contract for a Useful Machinery workflow YAML document.",
   "$ref": "#/$defs/Workflow",
   "$defs": {
     "Identifier": {

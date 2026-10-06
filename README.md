@@ -10,11 +10,11 @@ run workflows locally with Pi, Claude Code, and Codex, or serve them from an enr
 outbound runner. The project is early, but the local workflow engine and its authoring,
 execution, and inspection tools are available today.
 
-## Why Scherzo
+## Why Useful Machinery
 
 Coding-agent automation often begins as a loose sequence of shell commands, prompts,
 and copy-and-paste handoffs. That approach becomes difficult to repeat, supervise, and
-recover once work spans several tools or agents. Scherzo gives the work a runtime:
+recover once work spans several tools or agents. Useful Machinery gives the work a runtime:
 
 - **One graph for commands and agents.** Express control flow and typed data flow in a
   workflow dependency graph instead of coordinating scripts and model sessions by
@@ -32,7 +32,7 @@ recover once work spans several tools or agents. Scherzo gives the work a runtim
 
 ## What you can build
 
-Use Scherzo to:
+Use Useful Machinery to:
 
 - run tests, linters, builds, and several independent code reviews in parallel, then
   combine their findings in one final artifact/PR;
@@ -62,7 +62,7 @@ flowchart LR
     S --> O["Exported report"]
 ```
 
-In scherzo workflows, output references create the data-flow edges automatically:
+In Useful Machinery workflows, output references create the data-flow edges automatically:
 
 ```yaml
 # yaml-language-server: $schema=https://docs.usefulmachinery.com/schemas/workflow-v1.schema.json
@@ -150,7 +150,7 @@ um workflow status ~/.um/runs/review-001
 um workflow view ~/.um/runs/review-001
 ```
 
-During execution, Scherzo schedules ready steps, supervises each command or fresh agent
+During execution, Useful Machinery schedules ready steps, supervises each command or fresh agent
 session, captures declared outputs, and publishes one durable terminal result. The same
 run handle works for noninteractive status, archived inspection, and an explicit retry
 when the retained state is eligible.
@@ -493,14 +493,14 @@ published attempt results, have no stable viewer or download interface, and disa
 only when the owning durable run directory is removed.
 
 An ordinary command or agent step may declare `recovery.retries` from 1 through 10 and
-optionally one `cmd` or fresh `agent` handler. Without a handler, Scherzo immediately
+optionally one `cmd` or fresh `agent` handler. Without a handler, Useful Machinery immediately
 rechecks the unchanged target. A handler can only return the closed `recheck` or
 `gave_up` decision through its engine-owned private result transport; it is not a DAG
 node and publishes no output. Every target recheck and handler is a fresh physical
 invocation in the same execution root. Provisional target failures remain history, and
 only the target invocation supplying terminal success commits outputs. Repeated external
 effects are at-least-once: authors supply stable domain idempotency keys through existing
-explicit inputs or admitted environment, never from Scherzo invocation or round IDs.
+explicit inputs or admitted environment, never from Useful Machinery invocation or round IDs.
 
 Every declared root input is required. Supply Text with `--input-text <NAME> <TEXT>` or
 `--input-text-file <NAME> <PATH|->`, JSON with `--input-json <NAME> <JSON>` or
@@ -528,7 +528,7 @@ execution, `Ctrl-C`, and eventual `q` handling continue.
 `Ctrl-C` requests the existing orderly `user_request` cancellation and does not abandon
 owned child work. `q` is ignored while execution, publication, cleanup, or run ownership
 is active. Once the retained attempt is complete, the interface remains open for
-post-run inspection until `q`; Scherzo then restores raw mode, the alternate screen, and
+post-run inspection until `q`; Useful Machinery then restores raw mode, the alternate screen, and
 the cursor before invoking the shared standard plain-summary renderer. The summary and
 process status are therefore the same contracts used by forced plain output. Inspect the
 durable run later with `workflow status <RUN_DIR>`; retry is always explicit.
@@ -547,7 +547,7 @@ agentProfiles:
 
 `model` is a nonempty native Claude model string. `effort` is one of `low`, `medium`,
 `high`, `xhigh`, or `max`; both fields are required and additional configuration is
-rejected. Scherzo does not query a model catalog, install Claude Code, or supply a
+rejected. Useful Machinery does not query a model catalog, install Claude Code, or supply a
 fallback model or harness.
 
 A Codex profile is also independent:
@@ -563,7 +563,7 @@ agentProfiles:
 ```
 
 Both Codex values are required nonempty native strings, and additional configuration is
-rejected. Scherzo does not read provider credentials during definition resolution,
+rejected. Useful Machinery does not read provider credentials during definition resolution,
 installation discovery, rejection presentation, or doctor checks.
 
 Local execution snapshots the inherited environment after resolution and removes
@@ -584,7 +584,7 @@ executable. Command-only workflows probe no harness; each single-harness workflo
 requires no unrelated installation. A mixed workflow requires exactly its selected
 harnesses and never substitutes or falls back between them. Workflow definitions,
 imports, and remote values cannot supply an executable or alter selection. The adapter
-does not read Scherzo human or runner credentials and does not contact Useful Machinery; an
+does not read Useful Machinery human or runner credentials and does not contact Useful Machinery; an
 admitted agent harness may use the provider and other host authority selected by its
 closed profile and inherited environment.
 
@@ -1718,7 +1718,7 @@ decisions. Missing, unexecutable, malformed, unsupported-version, and missing-ca
 outcomes have distinct report codes.
 
 The Claude Code check follows the same first-candidate and immutable-path rules for
-`claude`, admitting canonical stable releases in `>=2.1.234 <2.2.0`. Scherzo does not
+`claude`, admitting canonical stable releases in `>=2.1.234 <2.2.0`. Useful Machinery does not
 install or upgrade that executable. Its isolated `--version` and `--help` probes require the closed stream
 input/output, partial-message, subagent-forwarding, explicit-session-identity,
 permission-mode, setting-source, model, effort, append-system-prompt-file, and JSON-schema
@@ -1798,7 +1798,7 @@ grace or revoke it immediately if compromise is suspected. Never print an activa
 artifact or runner state while transferring or verifying it.
 
 Runner startup selects `pi`, `claude`, and `codex` independently from its inherited
-operator-controlled `PATH`. Scherzo installs none of them. Each successful installation
+operator-controlled `PATH`. Useful Machinery installs none of them. Each successful installation
 is validated once and retained as an immutable executable, exact-version, profile, and
 capability snapshot for the process lifetime: Pi requires `>=0.84.2 <0.88.0`, Claude Code
 requires `>=2.1.234 <2.2.0`, and Codex requires capability-compatible stable
@@ -1917,7 +1917,7 @@ attributes are not imported.
 Service events never contain the machine credential, endpoint path or query, raw
 protocol frames, WebSocket close reasons, or arbitrary network errors. OTLP credentials
 are supplied only by the user through the standard header variables; the runner ships
-no Scherzo-owned endpoint, ingestion credential, Honeycomb behavior, or collector
+no Useful Machinery-owned endpoint, ingestion credential, Honeycomb behavior, or collector
 requirement. Human and JSON output contracts for help, version, authentication, account,
 and `runner doctor` remain unchanged and do not initialize runner telemetry.
 
