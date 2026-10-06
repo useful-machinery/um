@@ -70,7 +70,7 @@ Execution inherits only `PATH`, `HOME`, `USER`, `LOGNAME`, `LANG`, `LC_ALL`,
 other names at the workflow root, for example `environmentPassthrough: [MY_TOKEN]`.
 Names must be unique ASCII shell variable names (letter or underscore, then
 letters, digits, or underscores). Missing names remain unset. Engine-reserved
-`SCHERZO_*` and runner-private Git, SSH, and GitHub credential/helper names
+`UM_*` and `SCHERZO_*`, along with runner-private Git, SSH, and GitHub credential/helper names
 cannot be passed through. Runner source revision metadata is injected by the
 engine, not inherited from the host. Treat every declared name as available to
 all workflow code, including recovery. Guard and recovery scratch directories

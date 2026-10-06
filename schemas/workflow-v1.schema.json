@@ -781,7 +781,7 @@
           "items": {
             "type": "string",
             "pattern": "^[A-Za-z_][A-Za-z0-9_]*$",
-            "not": { "pattern": "^(SCHERZO_|GIT_ASKPASS($|_REQUIRE$)|GIT_TERMINAL_PROMPT$|GIT_CURL_VERBOSE$|GIT_CONFIG($|_(COUNT|PARAMETERS|GLOBAL|NOSYSTEM|SYSTEM)$|_(KEY|VALUE)_)|GIT_SSH($|_COMMAND$)|GIT_TRACE|SSH_ASKPASS($|_REQUIRE$)|SSH_AUTH_SOCK$|SSH_AGENT_PID$|GH_TOKEN$|GITHUB_TOKEN$)" }
+            "not": { "pattern": "^(UM_|SCHERZO_|GIT_ASKPASS($|_REQUIRE$)|GIT_TERMINAL_PROMPT$|GIT_CURL_VERBOSE$|GIT_CONFIG($|_(COUNT|PARAMETERS|GLOBAL|NOSYSTEM|SYSTEM)$|_(KEY|VALUE)_)|GIT_SSH($|_COMMAND$)|GIT_TRACE|SSH_ASKPASS($|_REQUIRE$)|SSH_AUTH_SOCK$|SSH_AGENT_PID$|GH_TOKEN$|GITHUB_TOKEN$)" }
           }
         },
         "inputs": { "$ref": "#/$defs/WorkflowInputs" },
