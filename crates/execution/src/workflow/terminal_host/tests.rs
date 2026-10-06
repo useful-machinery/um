@@ -1363,7 +1363,7 @@ async fn widget_panic_restores_pty_and_reports_on_stderr() {
     use std::os::unix::ffi::OsStrExt as _;
     use std::process::{Command, Stdio};
 
-    if std::env::var_os("SCHERZO_WIDGET_PANIC_CHILD").is_some() {
+    if std::env::var_os("UM_WIDGET_PANIC_CHILD").is_some() {
         struct PanickingWidget(SystemTerminalBoundary);
         impl TerminalBoundary for PanickingWidget {
             fn setup(&mut self) -> io::Result<Rect> {
@@ -1442,7 +1442,7 @@ async fn widget_panic_restores_pty_and_reports_on_stderr() {
             "workflow::terminal_host::tests::widget_panic_restores_pty_and_reports_on_stderr",
             "--nocapture",
         ])
-        .env("SCHERZO_WIDGET_PANIC_CHILD", "1")
+        .env("UM_WIDGET_PANIC_CHILD", "1")
         .stdin(Stdio::from(slave.try_clone().unwrap()))
         .stdout(Stdio::from(slave.try_clone().unwrap()))
         .stderr(Stdio::piped())

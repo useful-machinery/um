@@ -40,7 +40,7 @@ steps:
             - |
               set -eu
               : > .command-repair-ready
-              printf '%s' '{"schemaVersion":1,"decision":"recheck","summary":"Applied the example repair.","reason":"The target can now pass its check."}' > "$SCHERZO_RECOVERY_RESULT"
+              printf '%s' '{"schemaVersion":1,"decision":"recheck","summary":"Applied the example repair.","reason":"The target can now pass its check."}' > "$UM_RECOVERY_RESULT"
     command:
       argv:
         - sh

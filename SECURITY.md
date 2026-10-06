@@ -22,7 +22,7 @@ boundary, mirror contents, CI workflow, or implementation are welcome.
 
 The human credential store contains one-hour OAuth access tokens and rotating refresh
 tokens without application-level encryption. Normal operation protects the
-`~/.scherzo/` application home with mode `0700` and `credentials.json` with mode `0600`.
+`~/.um/` application home with mode `0700` and `credentials.json` with mode `0600`.
 The CLI refuses unsafe ownership, permissions, symbolic links, malformed schemas, and
 unbounded token values rather than silently repairing or replacing them. Human
 credentials are never runner credentials.

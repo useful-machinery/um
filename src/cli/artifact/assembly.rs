@@ -91,7 +91,7 @@ fn assemble_artifact_set_with_clock(
         return Err(ArtifactAssemblyError::DestinationExists);
     }
     let staging = tempfile::Builder::new()
-        .prefix(".scherzo-artifact-download-")
+        .prefix(".um-artifact-download-")
         .tempdir_in(&parent)
         .map_err(|_| ArtifactAssemblyError::StagingUnavailable)?;
     std::fs::create_dir(staging.path().join("exports"))

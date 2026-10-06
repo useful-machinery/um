@@ -56,7 +56,7 @@ fn activation_issuance_body() -> serde_json::Value {
         },
         "artifact": {
             "schemaVersion": 1,
-            "activationUrl": format!("https://api.scherzo.dev/v1/runner-enrollments/{ACTIVATION_ID}/activate"),
+            "activationUrl": format!("https://api.usefulmachinery.com/v1/runner-enrollments/{ACTIVATION_ID}/activate"),
             "activationToken": format!("{ACTIVATION_ID}.{ACTIVATION_SECRET}"),
             "runnerId": RUNNER_ID,
             "expiresAt": "2026-08-09T13:00:00Z"

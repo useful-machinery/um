@@ -8,7 +8,7 @@ import { Type } from "typebox";
 
 // The materializer replaces this string without invoking a formatter.
 // prettier-ignore
-const GENERATED_CONFIG_JSON = "__SCHERZO_PI_JSON_V1_CONFIG_JSON__";
+const GENERATED_CONFIG_JSON = "__UM_PI_JSON_V1_CONFIG_JSON__";
 const MAX_PROTOCOL_FRAME_BYTES = 16 * 1024 * 1024;
 
 export interface PiJsonV1ExtensionConfig {

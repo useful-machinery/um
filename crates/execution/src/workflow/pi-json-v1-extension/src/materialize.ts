@@ -1,6 +1,6 @@
 import type { PiJsonV1ExtensionConfig } from "./pi-json-v1-extension.ts";
 
-const CONFIG_MARKER = "__SCHERZO_PI_JSON_V1_CONFIG_JSON__";
+const CONFIG_MARKER = "__UM_PI_JSON_V1_CONFIG_JSON__";
 const ENCODED_CONFIG_MARKER = JSON.stringify(CONFIG_MARKER);
 
 export function materializePiJsonV1Extension(

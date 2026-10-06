@@ -928,7 +928,7 @@ fn admission_uses_only_the_resolved_snapshot_and_leaves_the_execution_root_uncha
             ),
             EnvironmentSnapshot::new([
                 ("PATH", "/admitted/bin"),
-                ("SCHERZO_INHERITED", "must be removed"),
+                ("UM_INHERITED", "must be removed"),
             ]),
             CancellationPolicy::new(cancellation, Duration::from_secs(15)),
         ),
@@ -1006,7 +1006,7 @@ fn admission_uses_only_the_resolved_snapshot_and_leaves_the_execution_root_uncha
         admitted
             .execution()
             .environment()
-            .variable(std::ffi::OsStr::new("SCHERZO_INHERITED"))
+            .variable(std::ffi::OsStr::new("UM_INHERITED"))
             .is_none()
     );
     assert_eq!(
@@ -1567,9 +1567,9 @@ fn cloud_source_revision_replaces_inherited_reserved_values_while_local_has_none
     let fixture = WorkflowFixture::new(COMMAND_WORKFLOW);
     let environment = EnvironmentSnapshot::new([
         ("PATH", "/bin"),
-        ("SCHERZO_SOURCE_BRANCH", "inherited-branch"),
-        ("SCHERZO_SOURCE_COMMIT_OID", "inherited-commit"),
-        ("SCHERZO_OTHER", "inherited-other"),
+        ("UM_SOURCE_BRANCH", "inherited-branch"),
+        ("UM_SOURCE_COMMIT_OID", "inherited-commit"),
+        ("UM_OTHER", "inherited-other"),
     ]);
     let context = ExecutionContext::new(
         fixture.execution_root.clone(),
@@ -1583,7 +1583,7 @@ fn cloud_source_revision_replaces_inherited_reserved_values_while_local_has_none
         context.clone(),
     )
     .unwrap();
-    for name in ["SCHERZO_SOURCE_BRANCH", "SCHERZO_SOURCE_COMMIT_OID"] {
+    for name in ["UM_SOURCE_BRANCH", "UM_SOURCE_COMMIT_OID"] {
         assert!(
             local
                 .execution()
@@ -1607,21 +1607,21 @@ fn cloud_source_revision_replaces_inherited_reserved_values_while_local_has_none
         cloud
             .execution()
             .environment()
-            .variable(OsStr::new("SCHERZO_SOURCE_BRANCH")),
+            .variable(OsStr::new("UM_SOURCE_BRANCH")),
         Some(OsStr::new("refs/heads/exact-source"))
     );
     assert_eq!(
         cloud
             .execution()
             .environment()
-            .variable(OsStr::new("SCHERZO_SOURCE_COMMIT_OID")),
+            .variable(OsStr::new("UM_SOURCE_COMMIT_OID")),
         Some(OsStr::new("0123456789abcdef0123456789abcdef01234567"))
     );
     assert!(
         cloud
             .execution()
             .environment()
-            .variable(OsStr::new("SCHERZO_OTHER"))
+            .variable(OsStr::new("UM_OTHER"))
             .is_none()
     );
 }
@@ -1639,7 +1639,7 @@ fn workflow_admission_only_forwards_base_and_explicit_safe_names() {
         ("GIT_SSH_COMMAND", "local-ssh"),
         ("GH_TOKEN", "local-gh-token"),
         ("GITHUB_TOKEN", "local-github-token"),
-        ("SCHERZO_SOURCE_TOKEN_FD", "9"),
+        ("UM_SOURCE_TOKEN_FD", "9"),
     ]);
 
     let filtered = environment.for_workflow_children(&["VISIBLE".to_owned()].into());
@@ -1660,7 +1660,7 @@ fn workflow_admission_only_forwards_base_and_explicit_safe_names() {
         "GIT_SSH_COMMAND",
         "GH_TOKEN",
         "GITHUB_TOKEN",
-        "SCHERZO_SOURCE_TOKEN_FD",
+        "UM_SOURCE_TOKEN_FD",
     ] {
         assert!(filtered.variable(OsStr::new(name)).is_none(), "{name}");
     }

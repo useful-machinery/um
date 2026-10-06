@@ -1476,7 +1476,7 @@ struct EphemeralAskpass {
 
 impl EphemeralAskpass {
     fn create(parent: &Path, token: &[u8]) -> Result<Self, MaterializationFailure> {
-        let script = b"#!/bin/sh\ncase \"${1-}\" in\n  *[Uu]sername*) printf '%s\\n' 'x-access-token' ;;\n  *) IFS= read -r token < \"/dev/fd/$SCHERZO_SOURCE_TOKEN_FD\"; printf '%s\\n' \"$token\"; unset token ;;\nesac\n";
+        let script = b"#!/bin/sh\ncase \"${1-}\" in\n  *[Uu]sername*) printf '%s\\n' 'x-access-token' ;;\n  *) IFS= read -r token < \"/dev/fd/$UM_SOURCE_TOKEN_FD\"; printf '%s\\n' \"$token\"; unset token ;;\nesac\n";
         let mut helper = tempfile::Builder::new()
             .prefix("source-askpass-")
             .tempfile_in(parent)
@@ -1515,10 +1515,7 @@ impl EphemeralAskpass {
         command
             .env("GIT_ASKPASS", self.helper_path())
             .env("GIT_ASKPASS_REQUIRE", "force")
-            .env(
-                "SCHERZO_SOURCE_TOKEN_FD",
-                self.token.as_raw_fd().to_string(),
-            );
+            .env("UM_SOURCE_TOKEN_FD", self.token.as_raw_fd().to_string());
         inherit_for_git_child(command, self.token.as_raw_fd());
     }
 }
@@ -2702,7 +2699,7 @@ mod tests {
         );
         assert!(
             workflow_environment
-                .variable(OsStr::new("SCHERZO_SOURCE_TOKEN_FD"))
+                .variable(OsStr::new("UM_SOURCE_TOKEN_FD"))
                 .is_none()
         );
         let context = ExecutionContext::new(

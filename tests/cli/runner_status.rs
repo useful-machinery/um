@@ -267,7 +267,7 @@ fn runner_status_queries_only_the_configured_local_socket() {
     let output = run_with_env(
         &["runner", "status", "--config", &config],
         &[(
-            "SCHERZO_CLOUD_API_URL",
+            "UM_API_URL",
             "https://cloud-status-must-not-be-read.example",
         )],
     );

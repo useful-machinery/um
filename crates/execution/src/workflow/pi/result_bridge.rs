@@ -35,7 +35,7 @@ const EXTENSION_FILE_NAME: &str = "pi-json-v1-result-extension.ts";
 const SOCKET_FILE_NAME: &str = "result-validation.sock";
 const SOCKET_ALIAS_NAME: &str = "e";
 const SOCKET_ALIAS_ROOT: &str = "/tmp";
-const CONFIG_MARKER: &str = "\"__SCHERZO_PI_JSON_V1_CONFIG_JSON__\"";
+const CONFIG_MARKER: &str = "\"__UM_PI_JSON_V1_CONFIG_JSON__\"";
 const CHANNEL_FAILURE_CAUSE: &str = "The result-validation channel failed.";
 const EXTENSION_TEMPLATE: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),

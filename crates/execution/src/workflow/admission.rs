@@ -754,7 +754,7 @@ fn is_base_workflow_environment_name(name: &OsStr) -> bool {
 }
 
 fn is_engine_reserved_environment_name(name: &OsStr) -> bool {
-    name.as_encoded_bytes().starts_with(b"SCHERZO_")
+    name.as_encoded_bytes().starts_with(b"UM_")
 }
 
 pub(super) fn is_managed_runner_private_environment_name(name: &OsStr) -> bool {
@@ -1283,7 +1283,7 @@ impl AdmittedWorkflow {
     /// environment (which admission strips as an engine-reserved variable).
     pub(crate) fn with_continuation_context(mut self, path: &Path) -> Self {
         self.execution.environment = self.execution.environment.with_variable(
-            "SCHERZO_CONTINUATION_CONTEXT".into(),
+            "UM_CONTINUATION_CONTEXT".into(),
             path.as_os_str().to_owned(),
         );
         self
@@ -1755,11 +1755,11 @@ fn admit_workflow_for(
     if let Some(source_revision) = context.source_revision {
         environment = environment
             .with_variable(
-                OsString::from("SCHERZO_SOURCE_BRANCH"),
+                OsString::from("UM_SOURCE_BRANCH"),
                 OsString::from(source_revision.branch.as_ref()),
             )
             .with_variable(
-                OsString::from("SCHERZO_SOURCE_COMMIT_OID"),
+                OsString::from("UM_SOURCE_COMMIT_OID"),
                 OsString::from(source_revision.commit_oid.as_ref()),
             );
     }

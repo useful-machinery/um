@@ -200,7 +200,7 @@ class Fixture:
             **os.environ,
             "PATH": f"{self.fake_bin}:{os.environ['PATH']}",
             "GH_TOKEN": "fixture-token",
-            "SCHERZO_MOCK_GH_STATE": os.fspath(self.state_path),
+            "UM_MOCK_GH_STATE": os.fspath(self.state_path),
         }
 
     def state(self) -> dict[str, object]:
@@ -333,7 +333,7 @@ from pathlib import Path
 import subprocess
 import sys
 
-state_path = Path(os.environ["SCHERZO_MOCK_GH_STATE"])
+state_path = Path(os.environ["UM_MOCK_GH_STATE"])
 state = json.loads(state_path.read_text())
 args = sys.argv[1:]
 

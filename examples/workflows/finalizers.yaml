@@ -40,11 +40,11 @@ finalizers:
             printf '%s' 'cleanup consumed ordinary output: '
             while IFS= read -r line || [ -n "$line" ]; do
               printf '%s' "$line"
-            done < "$SCHERZO_STEP_INPUTS/values/workReceipt"
+            done < "$UM_STEP_INPUTS/values/workReceipt"
             printf '\n%s' 'cleanup received finalization context: '
             while IFS= read -r line || [ -n "$line" ]; do
               printf '%s' "$line"
-            done < "$SCHERZO_STEP_INPUTS/values/context"
+            done < "$UM_STEP_INPUTS/values/context"
             printf '\n'
           } > cleanup-receipt.txt
           printf '%s\n' 'cleanup completed'
@@ -72,7 +72,7 @@ finalizers:
             printf '%s\n' 'ordinary execution succeeded; cleanup was attempted'
             while IFS= read -r line || [ -n "$line" ]; do
               printf '%s\n' "$line"
-            done < "$SCHERZO_STEP_INPUTS/values/cleanupReceipt"
+            done < "$UM_STEP_INPUTS/values/cleanupReceipt"
           } > final-report.txt
           printf '%s\n' 'success report captured the cleanup receipt'
     outputs:

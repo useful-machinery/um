@@ -158,16 +158,13 @@ fn validate(bundle: &WorkflowBundle, json: bool) -> std::process::Output {
                 CREDENTIALS_FILE_VARIABLE,
                 "/dev/null/workflow-validation-credentials.json",
             ),
-            ("SCHERZO_CLOUD_API_URL", &api_url),
+            ("UM_API_URL", &api_url),
+            ("UM_AUTH_ISSUER", "http://auth.workflow-validation.invalid/"),
             (
-                "SCHERZO_CLOUD_AUTH_ISSUER",
-                "http://auth.workflow-validation.invalid/",
-            ),
-            (
-                "SCHERZO_CLOUD_AUTH_AUDIENCE",
+                "UM_AUTH_AUDIENCE",
                 "https://api.workflow-validation.invalid",
             ),
-            ("SCHERZO_CLOUD_AUTH_CLIENT_ID", "workflow-validation-client"),
+            ("UM_AUTH_CLIENT_ID", "workflow-validation-client"),
         ],
     );
 

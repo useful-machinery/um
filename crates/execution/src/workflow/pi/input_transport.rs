@@ -11,7 +11,7 @@ use crate::workflow::agent::AgentInvocationIdentity;
 
 const EXTENSION_FILE_NAME: &str = "pi-json-v1-input-extension.ts";
 const SYSTEM_PROMPT_FILE_NAME: &str = "system-prompt.md";
-const CONFIG_MARKER: &str = "\"__SCHERZO_PI_JSON_V1_INPUT_CONFIG_JSON__\"";
+const CONFIG_MARKER: &str = "\"__UM_PI_JSON_V1_INPUT_CONFIG_JSON__\"";
 const EXTENSION_TEMPLATE: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/src/workflow/pi-json-v1-extension/src/pi-json-v1-input.ts"

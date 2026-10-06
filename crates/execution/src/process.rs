@@ -12,7 +12,7 @@ use rustix::io::Errno;
 use rustix::process::{Pid, Signal, WaitId, WaitIdOptions, kill_process_group, waitid};
 
 const WAIT_POLL_INTERVAL: Duration = Duration::from_millis(10);
-const TEST_WORKER_EXECUTABLE: &str = "SCHERZO_TEST_INTERNAL_WORKER_EXECUTABLE";
+const TEST_WORKER_EXECUTABLE: &str = "UM_TEST_INTERNAL_WORKER_EXECUTABLE";
 
 pub(crate) fn internal_worker_executable() -> io::Result<PathBuf> {
     // Test binaries (including cross-crate callers with test-fixtures enabled)

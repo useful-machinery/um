@@ -152,7 +152,7 @@ impl QueuedWriter {
     fn stderr(dropped_count: Arc<AtomicU64>) -> Self {
         let (sender, receiver) = sync_channel::<QueueMessage>(EVENT_QUEUE_CAPACITY);
         let worker = thread::Builder::new()
-            .name("scherzo-runner-events".to_owned())
+            .name("um-runner-events".to_owned())
             .spawn(move || {
                 let mut stderr = FramedWriter::new(io::stderr());
                 while let Ok(message) = receiver.recv() {
@@ -349,7 +349,7 @@ impl Recorder {
         service_instance_id: &str,
         dropped_count: Arc<AtomicU64>,
     ) -> Self {
-        let tracer = provider.tracer("scherzo-runner");
+        let tracer = provider.tracer("um-runner");
         Self {
             provider,
             tracer,
@@ -364,7 +364,7 @@ impl Recorder {
         [
             KeyValue::new(MAIN, main),
             KeyValue::new(SCHEMA_VERSION, 1_i64),
-            KeyValue::new(SERVICE_NAME, "scherzo-runner"),
+            KeyValue::new(SERVICE_NAME, "um-runner"),
             KeyValue::new(SERVICE_VERSION, Arc::clone(&self.service_version)),
             KeyValue::new(SERVICE_INSTANCE_ID, Arc::clone(&self.service_instance_id)),
         ]
@@ -430,7 +430,7 @@ impl Recorder {
 fn runner_resource(service_version: &str, service_instance_id: &str) -> Resource {
     Resource::builder_empty()
         .with_attributes([
-            KeyValue::new(SERVICE_NAME, "scherzo-runner"),
+            KeyValue::new(SERVICE_NAME, "um-runner"),
             KeyValue::new(SERVICE_VERSION, service_version.to_owned()),
             KeyValue::new(SERVICE_INSTANCE_ID, service_instance_id.to_owned()),
         ])
@@ -750,7 +750,7 @@ mod tests {
         );
         assert_eq!(
             span_attribute("service.name"),
-            Some(&opentelemetry::Value::String("scherzo-runner".into()))
+            Some(&opentelemetry::Value::String("um-runner".into()))
         );
         assert_eq!(
             span_attribute("fixture.integer"),

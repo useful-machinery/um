@@ -20,8 +20,8 @@ in
     channel = "stable";
     version = rustVersion;
   };
-  env.SCHERZO_MSRV_CARGO = "${msrvToolchain}/bin/cargo";
-  env.SCHERZO_MSRV_RUSTC = "${msrvToolchain}/bin/rustc";
+  env.UM_MSRV_CARGO = "${msrvToolchain}/bin/cargo";
+  env.UM_MSRV_RUSTC = "${msrvToolchain}/bin/rustc";
 
   packages = [
     pkgs.actionlint

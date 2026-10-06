@@ -3,7 +3,7 @@ import { readFileSync } from "node:fs";
 
 // The Rust materializer replaces this string without invoking a formatter.
 // prettier-ignore
-const GENERATED_CONFIG_JSON = "__SCHERZO_PI_JSON_V1_INPUT_CONFIG_JSON__";
+const GENERATED_CONFIG_JSON = "__UM_PI_JSON_V1_INPUT_CONFIG_JSON__";
 
 export interface StagedInputConfig {
   marker: string;

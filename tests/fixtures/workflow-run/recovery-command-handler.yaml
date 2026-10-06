@@ -13,7 +13,7 @@ steps:
             - |
               set -eu
               : > command-repair-applied
-              printf '%s' '{"schemaVersion":1,"decision":"recheck","summary":"Applied the local repair.","reason":"The unchanged target can now succeed."}' > "$SCHERZO_RECOVERY_RESULT"
+              printf '%s' '{"schemaVersion":1,"decision":"recheck","summary":"Applied the local repair.","reason":"The unchanged target can now succeed."}' > "$UM_RECOVERY_RESULT"
     command:
       argv:
         - /bin/sh

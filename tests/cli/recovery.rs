@@ -234,7 +234,7 @@ steps:
             - |
               test ! -e artifact.txt
               printf repaired > repaired.marker
-              printf '%s' '{"schemaVersion":1,"decision":"recheck","summary":"restored generation precondition","reason":"rerun the complete target"}' > "$SCHERZO_RECOVERY_RESULT"
+              printf '%s' '{"schemaVersion":1,"decision":"recheck","summary":"restored generation precondition","reason":"rerun the complete target"}' > "$UM_RECOVERY_RESULT"
     command:
       argv:
         - /bin/sh
@@ -289,7 +289,7 @@ exports:
 
 #[test]
 fn durable_recovery_is_authoritative_before_handler_and_recheck_launch() {
-    let source = "schemaVersion: 1\nsteps:\n  verify:\n    kind: cmd\n    recovery:\n      retries: 1\n      handler:\n        kind: cmd\n        command:\n          argv:\n            - /bin/sh\n            - -c\n            - |\n              set -eu\n              role=false\n              active=false\n              while IFS= read -r line; do\n                case \"$line\" in *'\"role\": \"recovery_handler\"'*) role=true ;; esac\n                case \"$line\" in *'\"state\": \"active\"'*) active=true ;; esac\n              done < \"$RECOVERY_STATE\"\n              $role\n              $active\n              : > handler-observed-durable-state\n              : > repaired\n              printf '%s' '{\"schemaVersion\":1,\"decision\":\"recheck\",\"summary\":\"Durable handler state observed.\",\"reason\":\"The recheck can verify its own durable authorization.\"}' > \"$SCHERZO_RECOVERY_RESULT\"\n    command:\n      argv:\n        - /bin/sh\n        - -c\n        - |\n          set -eu\n          if [ ! -f repaired ]; then exit 75; fi\n          decision=false\n          execution=false\n          while IFS= read -r line; do\n            case \"$line\" in *'\"decision\": \"recheck\"'*) decision=true ;; esac\n            case \"$line\" in *'\"targetExecution\": 2'*) execution=true ;; esac\n          done < \"$RECOVERY_STATE\"\n          $decision\n          $execution\n          : > recheck-observed-durable-state\n";
+    let source = "schemaVersion: 1\nsteps:\n  verify:\n    kind: cmd\n    recovery:\n      retries: 1\n      handler:\n        kind: cmd\n        command:\n          argv:\n            - /bin/sh\n            - -c\n            - |\n              set -eu\n              role=false\n              active=false\n              while IFS= read -r line; do\n                case \"$line\" in *'\"role\": \"recovery_handler\"'*) role=true ;; esac\n                case \"$line\" in *'\"state\": \"active\"'*) active=true ;; esac\n              done < \"$RECOVERY_STATE\"\n              $role\n              $active\n              : > handler-observed-durable-state\n              : > repaired\n              printf '%s' '{\"schemaVersion\":1,\"decision\":\"recheck\",\"summary\":\"Durable handler state observed.\",\"reason\":\"The recheck can verify its own durable authorization.\"}' > \"$UM_RECOVERY_RESULT\"\n    command:\n      argv:\n        - /bin/sh\n        - -c\n        - |\n          set -eu\n          if [ ! -f repaired ]; then exit 75; fi\n          decision=false\n          execution=false\n          while IFS= read -r line; do\n            case \"$line\" in *'\"decision\": \"recheck\"'*) decision=true ;; esac\n            case \"$line\" in *'\"targetExecution\": 2'*) execution=true ;; esac\n          done < \"$RECOVERY_STATE\"\n          $decision\n          $execution\n          : > recheck-observed-durable-state\n";
     let bundle = RunBundle::new(source);
     let run_directory = bundle.result("durability-boundaries");
     let output = isolated_command(&json_run_args(&bundle, &run_directory))
@@ -365,7 +365,7 @@ fn gave_up_and_handler_failure_preserve_the_raw_target_failure() {
     let scenarios = [
         (
             "gave-up",
-            "printf '%s' '{\"schemaVersion\":1,\"decision\":\"gave_up\",\"summary\":\"Inspected the failure.\",\"reason\":\"Automatic repair is unsafe.\"}' > \"$SCHERZO_RECOVERY_RESULT\"",
+            "printf '%s' '{\"schemaVersion\":1,\"decision\":\"gave_up\",\"summary\":\"Inspected the failure.\",\"reason\":\"Automatic repair is unsafe.\"}' > \"$UM_RECOVERY_RESULT\"",
             "gave_up",
             "gave_up",
         ),
@@ -441,7 +441,7 @@ fn exhaustion_remains_terminal_until_retry_starts_fresh_execution_one() {
 
 #[test]
 fn active_status_reports_handler_kind_and_recheck_decision() {
-    let source = "schemaVersion: 1\nsteps:\n  verify:\n    kind: cmd\n    recovery:\n      retries: 1\n      handler:\n        kind: cmd\n        command:\n          argv:\n            - /bin/sh\n            - -c\n            - |\n              set -eu\n              mkfifo handler-release\n              : > handler-ready\n              read -r ignored < handler-release\n              printf '%s' '{\"schemaVersion\":1,\"decision\":\"recheck\",\"summary\":\"The handler authorized a recheck.\",\"reason\":\"The status projection must retain this decision.\"}' > \"$SCHERZO_RECOVERY_RESULT\"\n    command:\n      argv:\n        - /bin/sh\n        - -c\n        - |\n          set -eu\n          if [ ! -f first-target-failed ]; then\n            : > first-target-failed\n            exit 75\n          fi\n          mkfifo target-release\n          : > target-ready\n          read -r ignored < target-release\n";
+    let source = "schemaVersion: 1\nsteps:\n  verify:\n    kind: cmd\n    recovery:\n      retries: 1\n      handler:\n        kind: cmd\n        command:\n          argv:\n            - /bin/sh\n            - -c\n            - |\n              set -eu\n              mkfifo handler-release\n              : > handler-ready\n              read -r ignored < handler-release\n              printf '%s' '{\"schemaVersion\":1,\"decision\":\"recheck\",\"summary\":\"The handler authorized a recheck.\",\"reason\":\"The status projection must retain this decision.\"}' > \"$UM_RECOVERY_RESULT\"\n    command:\n      argv:\n        - /bin/sh\n        - -c\n        - |\n          set -eu\n          if [ ! -f first-target-failed ]; then\n            : > first-target-failed\n            exit 75\n          fi\n          mkfifo target-release\n          : > target-ready\n          read -r ignored < target-release\n";
     let bundle = RunBundle::new(source);
     let run_directory = bundle.result("active-status");
     let child = isolated_command(&json_run_args(&bundle, &run_directory))

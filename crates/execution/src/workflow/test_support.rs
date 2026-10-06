@@ -80,7 +80,7 @@ pub(super) async fn run_with_stalled_child_guard(
     tokio::process::Command::new(current_executable)
         .args(["--exact", test, "--ignored"])
         .env(worker_pid_variable, pid_path)
-        .env("SCHERZO_TEST_INTERNAL_WORKER_EXECUTABLE", guard_executable)
+        .env("UM_TEST_INTERNAL_WORKER_EXECUTABLE", guard_executable)
         .kill_on_drop(true)
         .status()
         .await

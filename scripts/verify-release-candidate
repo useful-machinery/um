@@ -308,7 +308,7 @@ class GitHub:
             "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
             "LC_ALL": "C",
         }
-        for name in ("GH_TOKEN", "GITHUB_TOKEN", "GH_HOST", "GH_CONFIG_DIR", "SCHERZO_MOCK_GH_STATE"):
+        for name in ("GH_TOKEN", "GITHUB_TOKEN", "GH_HOST", "GH_CONFIG_DIR", "UM_MOCK_GH_STATE"):
             if name in os.environ:
                 environment[name] = os.environ[name]
         result = subprocess.run(

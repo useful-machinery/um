@@ -19,9 +19,9 @@ use zeroize::Zeroizing;
 use super::deployment::DeploymentFingerprint;
 use super::token::{SecretToken, TokenSource};
 
-const CREDENTIALS_FILE_VARIABLE: &str = "SCHERZO_CLOUD_CREDENTIALS_FILE";
+const CREDENTIALS_FILE_VARIABLE: &str = "UM_CREDENTIALS_FILE";
 const HOME_VARIABLE: &str = "HOME";
-const APPLICATION_HOME_DIRECTORY_NAME: &str = ".scherzo";
+const APPLICATION_HOME_DIRECTORY_NAME: &str = ".um";
 const NORMAL_FILE_NAME: &str = "credentials.json";
 const SCHEMA_VERSION: u64 = 1;
 const DIRECTORY_MODE: u32 = 0o700;

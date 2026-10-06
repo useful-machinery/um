@@ -45,8 +45,8 @@ let
     inherit cargoArtifacts version;
     nativeBuildInputs = [ git ];
     env = {
-      SCHERZO_CLOUD_BUILD_IDENTITY = buildIdentity;
-      SCHERZO_CLOUD_VERSION = version;
+      UM_BUILD_IDENTITY = buildIdentity;
+      UM_VERSION = version;
       SSL_CERT_FILE = "${cacert}/etc/ssl/certs/ca-bundle.crt";
     };
   };
@@ -60,7 +60,7 @@ let
       # internal workers need the ordinary executable supplied explicitly.
       preBuild = ''
         cargo build --locked -p um-execution --example internal-worker
-        export SCHERZO_TEST_INTERNAL_WORKER_EXECUTABLE="$(realpath "''${CARGO_TARGET_DIR:-target}/debug/examples/internal-worker")"
+        export UM_TEST_INTERNAL_WORKER_EXECUTABLE="$(realpath "''${CARGO_TARGET_DIR:-target}/debug/examples/internal-worker")"
       '';
     }
   );

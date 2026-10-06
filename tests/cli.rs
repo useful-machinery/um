@@ -89,11 +89,11 @@ mod workflow_validate;
 #[path = "cli/workflow_view.rs"]
 mod workflow_view;
 
-const BUILD_VERSION: &str = match option_env!("SCHERZO_CLOUD_VERSION") {
+const BUILD_VERSION: &str = match option_env!("UM_VERSION") {
     Some(version) => version,
     None => env!("CARGO_PKG_VERSION"),
 };
-const BUILD_IDENTITY: &str = match option_env!("SCHERZO_CLOUD_BUILD_IDENTITY") {
+const BUILD_IDENTITY: &str = match option_env!("UM_BUILD_IDENTITY") {
     Some(identity) => identity,
     None => "unknown",
 };
@@ -179,12 +179,12 @@ fn poll_until<T: std::fmt::Debug>(
 }
 
 const ECHO_IDEMPOTENCY_KEY: &str = api_test_support::REQUEST_IDEMPOTENCY_KEY_ECHO;
-const CREDENTIALS_FILE_VARIABLE: &str = "SCHERZO_CLOUD_CREDENTIALS_FILE";
+const CREDENTIALS_FILE_VARIABLE: &str = "UM_CREDENTIALS_FILE";
 const DEPLOYMENT_VARIABLES: [&str; 4] = [
-    "SCHERZO_CLOUD_API_URL",
-    "SCHERZO_CLOUD_AUTH_ISSUER",
-    "SCHERZO_CLOUD_AUTH_AUDIENCE",
-    "SCHERZO_CLOUD_AUTH_CLIENT_ID",
+    "UM_API_URL",
+    "UM_AUTH_ISSUER",
+    "UM_AUTH_AUDIENCE",
+    "UM_AUTH_CLIENT_ID",
 ];
 const RUNNER_TELEMETRY_VARIABLES: [&str; 9] = [
     "OTEL_SDK_DISABLED",
@@ -646,10 +646,10 @@ fn deployment_environment_with_issuer<'a>(
 ) -> [(&'static str, &'a str); 5] {
     [
         (CREDENTIALS_FILE_VARIABLE, credential_path),
-        ("SCHERZO_CLOUD_API_URL", api_url),
-        ("SCHERZO_CLOUD_AUTH_ISSUER", issuer),
-        ("SCHERZO_CLOUD_AUTH_AUDIENCE", "https://api.fixture.example"),
-        ("SCHERZO_CLOUD_AUTH_CLIENT_ID", "fixture-public-client"),
+        ("UM_API_URL", api_url),
+        ("UM_AUTH_ISSUER", issuer),
+        ("UM_AUTH_AUDIENCE", "https://api.fixture.example"),
+        ("UM_AUTH_CLIENT_ID", "fixture-public-client"),
     ]
 }
 
@@ -722,10 +722,7 @@ fn write_credential_fixture_with_refresh_token(
 
 #[test]
 fn auth_without_a_subcommand_prints_composed_help_without_loading_deployment() {
-    let output = run_with_env(
-        &["auth"],
-        &[("SCHERZO_CLOUD_API_URL", "partial-override-is-ignored")],
-    );
+    let output = run_with_env(&["auth"], &[("UM_API_URL", "partial-override-is-ignored")]);
     let stdout = String::from_utf8_lossy(&output.stdout);
 
     assert!(output.status.success());
@@ -804,7 +801,7 @@ fn insecure_http_flag_is_scoped_to_networked_leaf_commands() {
 fn partial_deployment_override_fails_before_auth_dispatch() {
     let output = run_with_env(
         &["auth", "status", "--json"],
-        &[("SCHERZO_CLOUD_API_URL", "https://api.fixture.example")],
+        &[("UM_API_URL", "https://api.fixture.example")],
     );
 
     assert_eq!(output.status.code(), Some(1));
@@ -2047,7 +2044,7 @@ fn runner_doctor_does_not_load_human_configuration() {
         &["runner", "doctor"],
         &[
             ("PATH", path),
-            ("SCHERZO_CLOUD_API_URL", "partial-override-is-ignored"),
+            ("UM_API_URL", "partial-override-is-ignored"),
             (CREDENTIALS_FILE_VARIABLE, "/dev/null/credentials.json"),
         ],
     );

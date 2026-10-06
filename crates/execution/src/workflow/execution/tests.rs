@@ -405,17 +405,17 @@ steps:
             - -c
             - |
               if IFS= read -r unexpected; then exit 91; fi
-              test -r "$SCHERZO_RECOVERY_CONTEXT"
-              test ! -w "$SCHERZO_RECOVERY_CONTEXT"
-              /bin/grep -q '"schemaVersion": 1' "$SCHERZO_RECOVERY_CONTEXT"
-              /bin/grep -q '"recoveryRound": 1' "$SCHERZO_RECOVERY_CONTEXT"
-              /bin/grep -q '"executionNumber": 1' "$SCHERZO_RECOVERY_CONTEXT"
-              /bin/grep -q '"command_stderr"' "$SCHERZO_RECOVERY_CONTEXT"
-              test -z "${SCHERZO_INHERITED+x}"
-              printf '%s\n%s\n' SCHERZO_RECOVERY_CONTEXT SCHERZO_RECOVERY_RESULT > recovery-environment.txt
-              printf '%s\n%s\n' "$SCHERZO_RECOVERY_CONTEXT" "$SCHERZO_RECOVERY_RESULT" > recovery-private-paths.txt
+              test -r "$UM_RECOVERY_CONTEXT"
+              test ! -w "$UM_RECOVERY_CONTEXT"
+              /bin/grep -q '"schemaVersion": 1' "$UM_RECOVERY_CONTEXT"
+              /bin/grep -q '"recoveryRound": 1' "$UM_RECOVERY_CONTEXT"
+              /bin/grep -q '"executionNumber": 1' "$UM_RECOVERY_CONTEXT"
+              /bin/grep -q '"command_stderr"' "$UM_RECOVERY_CONTEXT"
+              test -z "${UM_INHERITED+x}"
+              printf '%s\n%s\n' UM_RECOVERY_CONTEXT UM_RECOVERY_RESULT > recovery-environment.txt
+              printf '%s\n%s\n' "$UM_RECOVERY_CONTEXT" "$UM_RECOVERY_RESULT" > recovery-private-paths.txt
               printf repaired > repaired.marker
-              printf '%s' '{"schemaVersion":1,"decision":"recheck","summary":"repaired workspace","reason":"target should pass unchanged"}' > "$SCHERZO_RECOVERY_RESULT"
+              printf '%s' '{"schemaVersion":1,"decision":"recheck","summary":"repaired workspace","reason":"target should pass unchanged"}' > "$UM_RECOVERY_RESULT"
               printf 'handler ordinary output is diagnostic only'
     command:
       argv:
@@ -445,7 +445,7 @@ exports:
             EnvironmentSnapshot::new([
                 ("PATH", "/bin:/usr/bin"),
                 ("EXPLICIT_VALUE", "retained"),
-                ("SCHERZO_INHERITED", "must-be-scrubbed"),
+                ("UM_INHERITED", "must-be-scrubbed"),
             ]),
             CancellationSource::new(),
             1,
@@ -476,7 +476,7 @@ exports:
         assert_eq!(bytes, b"terminal output");
         assert_eq!(
             fs::read_to_string(fixture.execution_root.join("recovery-environment.txt")).unwrap(),
-            "SCHERZO_RECOVERY_CONTEXT\nSCHERZO_RECOVERY_RESULT\n"
+            "UM_RECOVERY_CONTEXT\nUM_RECOVERY_RESULT\n"
         );
         let private_paths = fs::read_to_string(
             fixture.execution_root.join("recovery-private-paths.txt"),
@@ -519,7 +519,7 @@ steps:
             - -c
             - |
               printf repaired > repaired.marker
-              printf '%s' '{"schemaVersion":1,"decision":"recheck","summary":"repaired workspace","reason":"rerun the target"}' > "$SCHERZO_RECOVERY_RESULT"
+              printf '%s' '{"schemaVersion":1,"decision":"recheck","summary":"repaired workspace","reason":"rerun the target"}' > "$UM_RECOVERY_RESULT"
     command:
       argv: [/bin/sh, -c, "test -f repaired.marker || exit 75"]
 "#;
@@ -664,7 +664,7 @@ async fn command_handler_failures_stop_once_without_authorizing_recheck() {
             (
                 "execution",
                 r#"command:
-          argv: [/bin/sh, -c, "printf '%s' '{\"schemaVersion\":1,\"decision\":\"recheck\",\"summary\":\"looks valid\",\"reason\":\"but exit fails\"}' > \"$SCHERZO_RECOVERY_RESULT\"; exit 9"]"#,
+          argv: [/bin/sh, -c, "printf '%s' '{\"schemaVersion\":1,\"decision\":\"recheck\",\"summary\":\"looks valid\",\"reason\":\"but exit fails\"}' > \"$UM_RECOVERY_RESULT\"; exit 9"]"#,
                 RecoveryHandlerFailure::CommandExitFailed { code: Some(9) },
             ),
             (
@@ -676,7 +676,7 @@ async fn command_handler_failures_stop_once_without_authorizing_recheck() {
             (
                 "validation",
                 r#"command:
-          argv: [/bin/sh, -c, "printf '{' > \"$SCHERZO_RECOVERY_RESULT\""]"#,
+          argv: [/bin/sh, -c, "printf '{' > \"$UM_RECOVERY_RESULT\""]"#,
                 RecoveryHandlerFailure::DecisionInvalid(
                     RecoveryDecisionFailureKind::InvalidJson,
                 ),
@@ -688,8 +688,8 @@ async fn command_handler_failures_stop_once_without_authorizing_recheck() {
             - /bin/sh
             - -c
             - |
-              printf '%s' '{"schemaVersion":1,"decision":"recheck","summary":"valid","reason":"before settlement sabotage"}' > "$SCHERZO_RECOVERY_RESULT"
-              root=${SCHERZO_RECOVERY_CONTEXT%/context/context.json}
+              printf '%s' '{"schemaVersion":1,"decision":"recheck","summary":"valid","reason":"before settlement sabotage"}' > "$UM_RECOVERY_RESULT"
+              root=${UM_RECOVERY_CONTEXT%/context/context.json}
               mv "$root" "$root-moved""#,
                 RecoveryHandlerFailure::SettlementFailed,
             ),
@@ -908,17 +908,17 @@ async fn admitted_producer_consumer_executes_with_inputs_observations_and_export
         let producer_script = r#"set -eu
 if IFS= read -r unexpected; then exit 91; fi
 {
-  printf '%s|' "$(cat "$SCHERZO_STEP_INPUTS/values/prompt")"
-  cat "$SCHERZO_STEP_INPUTS/collections/attachments/000000"
+  printf '%s|' "$(cat "$UM_STEP_INPUTS/values/prompt")"
+  cat "$UM_STEP_INPUTS/collections/attachments/000000"
   printf '|'
-  cat "$SCHERZO_STEP_INPUTS/collections/attachments/000001"
+  cat "$UM_STEP_INPUTS/collections/attachments/000001"
 } > produced.txt
 printf producer-standard-output
 printf producer-standard-error >&2
 "#;
         let consumer_script = r#"set -eu
 if IFS= read -r unexpected; then exit 92; fi
-cat "$SCHERZO_STEP_INPUTS/values/artifact" > exported.txt
+cat "$UM_STEP_INPUTS/values/artifact" > exported.txt
 printf consumer-standard-output
 printf consumer-standard-error >&2
 "#;
@@ -1463,7 +1463,7 @@ async fn all_profiles_use_one_fresh_authoritative_recovery_protocol() {
                 ResolvedInputs::default(),
                 EnvironmentSnapshot::new([
                     ("PATH", "/bin:/usr/bin"),
-                    ("SCHERZO_INHERITED", "must-be-scrubbed"),
+                    ("UM_INHERITED", "must-be-scrubbed"),
                 ]),
                 CancellationSource::new(),
                 1,
@@ -1513,7 +1513,7 @@ async fn all_profiles_use_one_fresh_authoritative_recovery_protocol() {
             assert!(
                 started
                     .environment()
-                    .variable(std::ffi::OsStr::new("SCHERZO_INHERITED"))
+                    .variable(std::ffi::OsStr::new("UM_INHERITED"))
                     .is_none()
             );
             let context = read_recovery_context(&fs::read(&context_path).unwrap()).unwrap();
@@ -2064,7 +2064,7 @@ async fn structured_agent_result_flows_only_through_its_explicit_command_binding
       result:
         ref: outputs.produce.result
     command:
-      argv: ["/bin/sh", "-c", "IFS= read -r value < \"$SCHERZO_STEP_INPUTS/values/result\" || true; printf '%s' \"$value\" > consumed.json"]
+      argv: ["/bin/sh", "-c", "IFS= read -r value < \"$UM_STEP_INPUTS/values/result\" || true; printf '%s' \"$value\" > consumed.json"]
     outputs:
       consumed:
         kind: file

@@ -44,7 +44,7 @@ fn url_policy_requires_secure_or_explicit_loopback_development_transport() {
     for (mode, value, kind, accepted) in [
         (
             DeploymentMode::Production,
-            "https://api.scherzo.dev/v1/runner-enrollments/rna_01k0z6r1w8f4jy2m7q9v3x5abc/activate",
+            "https://api.usefulmachinery.com/v1/runner-enrollments/rna_01k0z6r1w8f4jy2m7q9v3x5abc/activate",
             CloudURLKind::Activation,
             true,
         ),
@@ -575,7 +575,7 @@ fn journal_rejects_a_verifier_that_does_not_match_its_secret() {
         activation_artifact: ActivationArtifact {
             schema_version: 1,
             activation_url: format!(
-                "https://api.scherzo.dev/v1/runner-enrollments/{ACTIVATION_ID}/activate"
+                "https://api.usefulmachinery.com/v1/runner-enrollments/{ACTIVATION_ID}/activate"
             ),
             activation_token: format!("{ACTIVATION_ID}.{ACTIVATION_SECRET}"),
             runner_id: RUNNER_ID.to_owned(),

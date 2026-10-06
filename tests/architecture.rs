@@ -496,11 +496,19 @@ fn execution_and_runner_receive_identity_without_reading_root_build_policy() {
             for forbidden in [
                 "crate::build_info",
                 "crate::exit_code",
-                "SCHERZO_CLOUD_VERSION",
-                "SCHERZO_CLOUD_BUILD_IDENTITY",
+                "UM_VERSION",
+                "UM_BUILD_IDENTITY",
                 "CARGO_PKG_VERSION",
             ] {
-                if text.contains(forbidden) {
+                let present = if forbidden.starts_with("crate::") {
+                    text.contains(forbidden)
+                } else {
+                    text.split(|character: char| {
+                        !character.is_ascii_alphanumeric() && character != '_'
+                    })
+                    .any(|token| token == forbidden)
+                };
+                if present {
                     violations.push(format!(
                         "{} reads root identity or exit policy through `{forbidden}`",
                         relative.display()

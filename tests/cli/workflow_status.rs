@@ -111,7 +111,7 @@ steps:
             - -c
             - |
               : > repaired
-              printf '%s' '{"schemaVersion":1,"decision":"recheck","summary":"repaired","reason":"recheck unchanged target"}' > "$SCHERZO_RECOVERY_RESULT"
+              printf '%s' '{"schemaVersion":1,"decision":"recheck","summary":"repaired","reason":"recheck unchanged target"}' > "$UM_RECOVERY_RESULT"
     command:
       argv: [/bin/sh, -c, 'test -f repaired || exit 75']
 "#,

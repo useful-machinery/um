@@ -187,8 +187,8 @@ jobs:
       - name: Build release binary
         shell: bash
         env:
-          SCHERZO_CLOUD_BUILD_IDENTITY: ${{ needs.verify_release.outputs.source_revision }}
-          SCHERZO_CLOUD_VERSION: ${{ needs.verify_release.outputs.version }}
+          UM_BUILD_IDENTITY: ${{ needs.verify_release.outputs.source_revision }}
+          UM_VERSION: ${{ needs.verify_release.outputs.version }}
         run: |
           set -euo pipefail
           cargo build --locked --release --target "${{ matrix.target }}"
@@ -196,8 +196,8 @@ jobs:
         if: matrix.target == 'aarch64-apple-darwin'
         shell: bash
         env:
-          SCHERZO_CLOUD_BUILD_IDENTITY: ${{ needs.verify_release.outputs.source_revision }}
-          SCHERZO_CLOUD_VERSION: ${{ needs.verify_release.outputs.version }}
+          UM_BUILD_IDENTITY: ${{ needs.verify_release.outputs.source_revision }}
+          UM_VERSION: ${{ needs.verify_release.outputs.version }}
         run: |
           set -euo pipefail
           cargo test --locked --release --target "${{ matrix.target }}" \

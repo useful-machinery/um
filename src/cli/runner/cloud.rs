@@ -894,7 +894,7 @@ mod tests {
             next_cursor: None,
         };
         let mut list_output = Vec::new();
-        write_runner_list_human_to(&mut list_output, "https://api.scherzo.dev", &page)
+        write_runner_list_human_to(&mut list_output, "https://api.usefulmachinery.com", &page)
             .expect("runner list should render");
         let list_output = String::from_utf8(list_output).expect("runner list should be UTF-8");
         for expected in [
@@ -917,7 +917,7 @@ mod tests {
         let mut output = Vec::new();
         write_runner_human_to(
             &mut output,
-            "https://api.scherzo.dev",
+            "https://api.usefulmachinery.com",
             "✓ Runner found.",
             &runner,
         )
@@ -949,8 +949,13 @@ mod tests {
         idle.activity.current_assignment_count = 0;
         idle.activity.current_assignment = None;
         let mut idle_output = Vec::new();
-        write_runner_human_to(&mut idle_output, "https://api.scherzo.dev", "Idle", &idle)
-            .expect("idle runner should render");
+        write_runner_human_to(
+            &mut idle_output,
+            "https://api.usefulmachinery.com",
+            "Idle",
+            &idle,
+        )
+        .expect("idle runner should render");
         assert!(
             String::from_utf8(idle_output)
                 .unwrap()

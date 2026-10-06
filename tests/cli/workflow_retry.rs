@@ -37,7 +37,7 @@ fn environment_retry_bundle() -> RunBundle {
     let argv = serde_json::to_string(&[
         "sh",
         "-c",
-        "set -eu; test -z \"${SCHERZO_CONTINUATION_CONTEXT:-}\"; printf '%s\\n' \"$RETRY_PHASE\" >> phases; test \"$RETRY_PHASE\" = retry",
+        "set -eu; test -z \"${UM_CONTINUATION_CONTEXT:-}\"; printf '%s\\n' \"$RETRY_PHASE\" >> phases; test \"$RETRY_PHASE\" = retry",
     ])
     .unwrap();
     RunBundle::new(&format!(
@@ -222,9 +222,9 @@ steps:
         - -c
         - >-
           set -eu;
-          test "$(cat "$SCHERZO_STEP_INPUTS/values/request")" = retained-request;
-          { cat "$SCHERZO_STEP_INPUTS/collections/evidence/000000";
-            cat "$SCHERZO_STEP_INPUTS/collections/evidence/000001"; } > observed;
+          test "$(cat "$UM_STEP_INPUTS/values/request")" = retained-request;
+          { cat "$UM_STEP_INPUTS/collections/evidence/000000";
+            cat "$UM_STEP_INPUTS/collections/evidence/000001"; } > observed;
           test "$RETRY_PHASE" = retry
 "#,
     );

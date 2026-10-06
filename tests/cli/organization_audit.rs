@@ -198,10 +198,7 @@ fn organization_audit_rejects_invalid_filters_before_loading_deployment() {
         &["organization", "audit", "list", "acme", "--limit", "101"][..],
         &["organization", "audit", "list", "acme", "--cursor", ""][..],
     ] {
-        let output = run_with_env(
-            args,
-            &[("SCHERZO_CLOUD_API_URL", "partial-override-must-not-load")],
-        );
+        let output = run_with_env(args, &[("UM_API_URL", "partial-override-must-not-load")]);
         assert_eq!(output.status.code(), Some(2));
         assert!(output.stdout.is_empty());
     }

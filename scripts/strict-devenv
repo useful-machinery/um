@@ -26,7 +26,7 @@ fi
 
 devenv_binary=$(type -P devenv || true)
 if [[ -z $devenv_binary ]]; then
-  devenv_binary=${SCHERZO_STRICT_DEVENV_BINARY:-}
+  devenv_binary=${UM_STRICT_DEVENV_BINARY:-}
 fi
 [[ $devenv_binary == /* && -x $devenv_binary ]] \
   || fail "devenv is required to enter the clean test environment"
@@ -43,11 +43,11 @@ keep_variables=(
   DEVENV_TUI
   HOME
   RUSTC_WRAPPER
-  SCHERZO_STRICT_DEVENV_BINARY
+  UM_STRICT_DEVENV_BINARY
 )
 printf -v keep_list '%s,' "${keep_variables[@]}"
 keep_list=${keep_list%,}
 
-export SCHERZO_STRICT_DEVENV_BINARY=$devenv_binary
+export UM_STRICT_DEVENV_BINARY=$devenv_binary
 cd -- "$public_root"
 exec "$devenv_binary" "--clean=$keep_list" "$@"

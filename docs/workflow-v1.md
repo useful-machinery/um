@@ -82,9 +82,9 @@ and `outputs`. `failurePolicy` is `required` by default or may be `advisory`.
 `recovery.retries` is 1 through 10. It either omits `handler` for an immediate unchanged
 target recheck, names one closed command handler, or names one fresh-agent handler with
 an existing profile and retained prompt. A command handler reads the bounded private
-Recovery Context Schema 1 path from `SCHERZO_RECOVERY_CONTEXT` and writes exactly one
+Recovery Context Schema 1 path from `UM_RECOVERY_CONTEXT` and writes exactly one
 closed, at-most-16-KiB `recheck` or `gave_up` decision document to the fresh private
-`SCHERZO_RECOVERY_RESULT` path. An agent handler's profile and compatible installed
+`UM_RECOVERY_RESULT` path. An agent handler's profile and compatible installed
 harness are admission and runner-placement requirements even when recovery never
 activates.
 
@@ -138,7 +138,7 @@ steps:
 The vector is passed directly to the operating system. There is no shell parsing,
 interpolation, glob expansion, redirection, pipeline construction, or implicit shell.
 Put complex shell behavior in a repository-owned script. Commands alone accept named
-`inputs`; each bound value is materialized under the run-time `SCHERZO_STEP_INPUTS`
+`inputs`; each bound value is materialized under the run-time `UM_STEP_INPUTS`
 directory with a `manifest.json`.
 
 ## Paths and references

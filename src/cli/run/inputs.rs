@@ -299,7 +299,7 @@ fn download_selected(
     };
     let total_size_bytes = members.iter().map(|member| member.size_bytes).sum();
     let staging = match tempfile::Builder::new()
-        .prefix(".scherzo-input-download-")
+        .prefix(".um-input-download-")
         .tempdir_in(&parent)
     {
         Ok(staging) => staging,

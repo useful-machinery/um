@@ -431,7 +431,7 @@ only checked-in bytes and cannot become stale when public releases move. `change
 frozen legacy archive; new append-only intent is reviewed outside this exported tree.
 
 Native Cargo builds report the permanent `0.0.0-dev` fallback. Reproducible Nix and
-release builds inject `SCHERZO_CLOUD_VERSION` and `SCHERZO_CLOUD_BUILD_IDENTITY` at
+release builds inject `UM_VERSION` and `UM_BUILD_IDENTITY` at
 compile time, and both `um version` and `um --version` read the same
 version. Structured version output also reports the resolved executable path and
 separately injected build identity. Packaging must verify the installed executable

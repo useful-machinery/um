@@ -1025,10 +1025,7 @@ fn organization_commands_reject_invalid_cli_input_before_deployment_loading() {
             "administrator",
         ][..],
     ] {
-        let output = run_with_env(
-            args,
-            &[("SCHERZO_CLOUD_API_URL", "partial-override-must-not-load")],
-        );
+        let output = run_with_env(args, &[("UM_API_URL", "partial-override-must-not-load")]);
         assert_eq!(output.status.code(), Some(2));
         assert!(output.stdout.is_empty());
     }
@@ -1938,7 +1935,7 @@ fn organization_member_remove_rejects_self_route_alias() {
             "--json",
             "--allow-insecure-http",
         ],
-        &[("SCHERZO_CLOUD_API_URL", "partial-override-must-not-load")],
+        &[("UM_API_URL", "partial-override-must-not-load")],
     );
 
     assert_eq!(output.status.code(), Some(2));
@@ -1957,10 +1954,7 @@ fn terminal_membership_commands_require_explicit_confirmation() {
         ][..],
         &["organization", "leave", "acme"][..],
     ] {
-        let output = run_with_env(
-            args,
-            &[("SCHERZO_CLOUD_API_URL", "partial-override-must-not-load")],
-        );
+        let output = run_with_env(args, &[("UM_API_URL", "partial-override-must-not-load")]);
 
         assert_eq!(output.status.code(), Some(2));
         assert!(output.stdout.is_empty());

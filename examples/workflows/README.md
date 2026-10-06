@@ -33,7 +33,7 @@ Cloud presentation and execution testing.
 Every command node launches `sh`. Most use only shell built-ins and `sleep`;
 `command-dataflow.yaml` and `recovery.yaml` also use basic local filesystem utilities.
 The examples that write files confine them to the execution root, and command inputs are
-read only from the engine-provided `SCHERZO_STEP_INPUTS` directory. No command example
+read only from the engine-provided `UM_STEP_INPUTS` directory. No command example
 uses the network.
 
 `hostile-output.yaml` and `large-response.yaml` use command steps so their exact bytes

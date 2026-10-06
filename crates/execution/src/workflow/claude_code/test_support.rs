@@ -27,7 +27,7 @@ use crate::workflow::runtime::{ActionId, TransitionSequence};
 const MAXIMUM_HTTP_HEADER_BYTES: usize = 64 * 1024;
 const MAXIMUM_PROVIDER_REQUEST_BYTES: usize = 16 * 1024 * 1024;
 const PLACEHOLDER_API_KEY: &str = "scherzo-loopback-placeholder";
-const CONFORMANCE_SHELL_ENVIRONMENT: &str = "SCHERZO_CLAUDE_CODE_CONFORMANCE_SHELL";
+const CONFORMANCE_SHELL_ENVIRONMENT: &str = "UM_CLAUDE_CODE_CONFORMANCE_SHELL";
 /// Opaque placeholder for the native `signature_delta` that accompanies a thinking
 /// block. Claude Code forwards this value without interpreting it in one exchange.
 const THINKING_SIGNATURE: &str = "c2NoZXJ6by1sb29wYmFjay10aGlua2luZy1zaWduYXR1cmU=";
@@ -209,7 +209,7 @@ impl SyntheticClaudeCodeRoot {
         fs::write(
             &hook_script,
             format!(
-                "set -eu\nprintf '%s\\n' \\\n  \"$SCHERZO_USER_SETTING\" \\\n  \"$SCHERZO_PROJECT_SETTING\" \\\n  \"$SCHERZO_LOCAL_SETTING\" \\\n  \"$CLAUDE_CONFIG_DIR\" \\\n  \"$DISABLE_UPDATES\" \\\n  \"$CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC\" \\\n  \"$CLAUDE_CODE_DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL\" \\\n  \"$CLAUDE_CODE_DISABLE_AUTO_MEMORY\" \\\n  \"$CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS\" \\\n  > '{}'\n",
+                "set -eu\nprintf '%s\\n' \\\n  \"$UM_USER_SETTING\" \\\n  \"$UM_PROJECT_SETTING\" \\\n  \"$UM_LOCAL_SETTING\" \\\n  \"$CLAUDE_CONFIG_DIR\" \\\n  \"$DISABLE_UPDATES\" \\\n  \"$CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC\" \\\n  \"$CLAUDE_CODE_DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL\" \\\n  \"$CLAUDE_CODE_DISABLE_AUTO_MEMORY\" \\\n  \"$CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS\" \\\n  > '{}'\n",
                 hook_observation.display(),
             ),
         )
@@ -219,7 +219,7 @@ impl SyntheticClaudeCodeRoot {
             self.config.join("settings.json"),
             serde_json::to_vec_pretty(&json!({
                 "env": {
-                    "SCHERZO_USER_SETTING": "user"
+                    "UM_USER_SETTING": "user"
                 }
             }))
             .unwrap(),
@@ -231,7 +231,7 @@ impl SyntheticClaudeCodeRoot {
             project_settings.join("settings.json"),
             serde_json::to_vec_pretty(&json!({
                 "env": {
-                    "SCHERZO_PROJECT_SETTING": "project"
+                    "UM_PROJECT_SETTING": "project"
                 },
                 "hooks": {
                     "UserPromptSubmit": [{
@@ -249,7 +249,7 @@ impl SyntheticClaudeCodeRoot {
             project_settings.join("settings.local.json"),
             serde_json::to_vec_pretty(&json!({
                 "env": {
-                    "SCHERZO_LOCAL_SETTING": "local"
+                    "UM_LOCAL_SETTING": "local"
                 }
             }))
             .unwrap(),

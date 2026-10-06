@@ -47,7 +47,7 @@ use harness_executable_tests::{manager_fixture_with_harnesses, manager_fixture_w
 const COMMAND_FIXTURE_TEST_NAME: &str = "service::assignment::tests::command_fixture_process";
 const FAILING_COMMAND_FIXTURE_TEST_NAME: &str =
     "service::assignment::tests::failing_command_fixture_process";
-// SCHERZO_* variables are intentionally removed from admitted command environments.
+// UM_* variables are intentionally removed from admitted command environments.
 const COMMAND_FIXTURE_SOCKET: &str = "WORKFLOW_ASSIGNMENT_COMMAND_FIXTURE_SOCKET";
 
 #[test]
@@ -3500,7 +3500,7 @@ steps:
       argv:
         - sh
         - -c
-        - 'test "$RUNNER_VISIBLE" = retained && test -z "${RUNNER_HIDDEN+x}" && test -z "${GH_TOKEN+x}" && test -z "${GITHUB_TOKEN+x}" && test -z "${GIT_ASKPASS+x}" && test -z "${GIT_CONFIG_KEY_0+x}" && test -z "${GIT_CONFIG_VALUE_0+x}" && test -z "${GIT_SSH_COMMAND+x}" && test -z "${SSH_AUTH_SOCK+x}" && test -z "${SSH_AGENT_PID+x}" && test -z "${SCHERZO_SOURCE_TOKEN_FD+x}"'
+        - 'test "$RUNNER_VISIBLE" = retained && test -z "${RUNNER_HIDDEN+x}" && test -z "${GH_TOKEN+x}" && test -z "${GITHUB_TOKEN+x}" && test -z "${GIT_ASKPASS+x}" && test -z "${GIT_CONFIG_KEY_0+x}" && test -z "${GIT_CONFIG_VALUE_0+x}" && test -z "${GIT_SSH_COMMAND+x}" && test -z "${SSH_AUTH_SOCK+x}" && test -z "${SSH_AGENT_PID+x}" && test -z "${UM_SOURCE_TOKEN_FD+x}"'
 "#;
     let (_temporary, mut manager) = manager_fixture(workflow);
     let mut variables = manager.environment.variables().clone();
@@ -3526,7 +3526,7 @@ steps:
         ("SSH_AGENT_PID", "4242"),
         ("GH_TOKEN", "runner-private"),
         ("GITHUB_TOKEN", "runner-private"),
-        ("SCHERZO_SOURCE_TOKEN_FD", "9"),
+        ("UM_SOURCE_TOKEN_FD", "9"),
     ] {
         variables.insert(OsString::from(name), OsString::from(value));
     }
@@ -3546,12 +3546,12 @@ steps:
         Some(OsStr::new("retained"))
     );
     assert_eq!(
-        environment.variable(OsStr::new("SCHERZO_SOURCE_BRANCH")),
+        environment.variable(OsStr::new("UM_SOURCE_BRANCH")),
         Some(OsStr::new("main"))
     );
     let commit = run_fixture_git(execution.root(), &["rev-parse", "HEAD"]);
     assert_eq!(
-        environment.variable(OsStr::new("SCHERZO_SOURCE_COMMIT_OID")),
+        environment.variable(OsStr::new("UM_SOURCE_COMMIT_OID")),
         Some(OsStr::new(&commit))
     );
     for name in [
@@ -3575,7 +3575,7 @@ steps:
         "SSH_AGENT_PID",
         "GH_TOKEN",
         "GITHUB_TOKEN",
-        "SCHERZO_SOURCE_TOKEN_FD",
+        "UM_SOURCE_TOKEN_FD",
     ] {
         assert!(environment.variable(OsStr::new(name)).is_none(), "{name}");
     }

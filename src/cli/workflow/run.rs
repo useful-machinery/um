@@ -3274,9 +3274,9 @@ mod tests {
                 "--exact",
                 "cli::workflow::run::tests::run_lock_probe_fixture",
             ])
-            .env("SCHERZO_TEST_RUN_LOCK_PATH", path)
+            .env("UM_TEST_RUN_LOCK_PATH", path)
             .env(
-                "SCHERZO_TEST_RUN_LOCK_AVAILABLE",
+                "UM_TEST_RUN_LOCK_AVAILABLE",
                 if expected { "true" } else { "false" },
             )
             .stdin(Stdio::null())
@@ -3293,9 +3293,9 @@ mod tests {
     #[test]
     #[ignore = "launched as a run.lock ownership probe"]
     fn run_lock_probe_fixture() {
-        let path = std::env::var_os("SCHERZO_TEST_RUN_LOCK_PATH")
-            .unwrap_or_else(|| panic!("SCHERZO_TEST_RUN_LOCK_PATH must be set"));
-        let expected = std::env::var("SCHERZO_TEST_RUN_LOCK_AVAILABLE").unwrap() == "true";
+        let path = std::env::var_os("UM_TEST_RUN_LOCK_PATH")
+            .unwrap_or_else(|| panic!("UM_TEST_RUN_LOCK_PATH must be set"));
+        let expected = std::env::var("UM_TEST_RUN_LOCK_AVAILABLE").unwrap() == "true";
         let lock = std::fs::OpenOptions::new()
             .read(true)
             .write(true)

@@ -4,7 +4,7 @@ set -euo pipefail
 # Start the helper itself with an empty environment before inspecting paths or
 # invoking Git. Only absolute tool locations and deterministic process settings
 # cross this boundary.
-if [[ ${SCHERZO_FIXTURE_GIT_ISOLATED:-0} != 1 ]]; then
+if [[ ${UM_FIXTURE_GIT_ISOLATED:-0} != 1 ]]; then
   script_path=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)/$(basename "${BASH_SOURCE[0]}")
   bash_binary=$(cd "$(dirname "$BASH")" && pwd -P)/$(basename "$BASH")
   git_binary=$(type -P git) || {
@@ -16,8 +16,8 @@ if [[ ${SCHERZO_FIXTURE_GIT_ISOLATED:-0} != 1 ]]; then
   utility_path=$(dirname "$(type -P mktemp)")
   clean_path=$(dirname "$bash_binary"):$(dirname "$git_binary"):$(dirname "$env_binary"):$utility_path:/usr/bin:/bin
   exec "$env_binary" -i \
-    SCHERZO_FIXTURE_GIT_ISOLATED=1 \
-    SCHERZO_FIXTURE_GIT_BINARY="$git_binary" \
+    UM_FIXTURE_GIT_ISOLATED=1 \
+    UM_FIXTURE_GIT_BINARY="$git_binary" \
     HOME=/nonexistent \
     PATH="$clean_path" \
     LC_ALL=C \
@@ -43,7 +43,7 @@ fail() {
 
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
 public_root=$(cd "$script_dir/.." && pwd -P)
-git_binary=${SCHERZO_FIXTURE_GIT_BINARY:?}
+git_binary=${UM_FIXTURE_GIT_BINARY:?}
 git_path=$(dirname "$git_binary"):/usr/bin:/bin
 marker_name=.scherzo-fixture-git-root
 

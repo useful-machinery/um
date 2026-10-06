@@ -26,8 +26,8 @@ use super::source::{
 use super::workspace::ProcessQuiescence;
 use um_execution::{CaptureCancellation, EnvironmentSnapshot};
 
-const INTERNAL_HELPER_ENVIRONMENT: &str = "SCHERZO_INTERNAL_WORKFLOW_GIT_HELPER";
-const INTERNAL_HELPER_SOCKET_ENVIRONMENT: &str = "SCHERZO_INTERNAL_WORKFLOW_GIT_SOCKET";
+const INTERNAL_HELPER_ENVIRONMENT: &str = "UM_INTERNAL_WORKFLOW_GIT_HELPER";
+const INTERNAL_HELPER_SOCKET_ENVIRONMENT: &str = "UM_INTERNAL_WORKFLOW_GIT_SOCKET";
 const INTERNAL_HELPER_VERSION: &str = "1";
 const HELPER_FILE: &str = "workflow-git-credential";
 const SOCKET_FILE: &str = "workflow-git.sock";

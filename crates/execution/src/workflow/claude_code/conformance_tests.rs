@@ -46,10 +46,12 @@ const WATCHDOG: Duration = Duration::from_secs(20);
 static EXACT_BINARY_CONFORMANCE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 fn conformance_executable() -> PathBuf {
-    std::env::var_os("SCHERZO_CLAUDE_CODE_CONFORMANCE_EXECUTABLE")
+    std::env::var_os("UM_CLAUDE_CODE_CONFORMANCE_EXECUTABLE")
         .map(PathBuf::from)
         .unwrap_or_else(|| {
-            panic!("SCHERZO_CLAUDE_CODE_CONFORMANCE_EXECUTABLE must name the pinned Claude Code executable")
+            panic!(
+                "UM_CLAUDE_CODE_CONFORMANCE_EXECUTABLE must name the pinned Claude Code executable"
+            )
         })
 }
 

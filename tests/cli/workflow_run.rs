@@ -467,6 +467,7 @@ pub(super) fn initialize_git_repository(repository: &Path) {
         repository,
         &["config", "user.email", "test@example.invalid"],
     );
+    git(repository, &["config", "commit.gpgSign", "false"]);
     fs::write(repository.join("tracked.txt"), b"baseline\n").unwrap();
     git(repository, &["add", "tracked.txt"]);
     git(repository, &["commit", "--quiet", "-m", "baseline"]);
@@ -488,7 +489,7 @@ steps:
       attachments:
         ref: inputs.evidence
     command:
-      argv: ["sh", "-c", "set -eu; if IFS= read -r unexpected; then exit 91; fi; test -z \"${SCHERZO_PRIVATE_SENTINEL+x}\"; { cat \"$SCHERZO_STEP_INPUTS/values/prompt\"; printf '|'; cat \"$SCHERZO_STEP_INPUTS/collections/attachments/000000\"; printf '|'; cat \"$SCHERZO_STEP_INPUTS/collections/attachments/000001\"; } > produced.txt; printf producer-live"]
+      argv: ["sh", "-c", "set -eu; if IFS= read -r unexpected; then exit 91; fi; test -z \"${UM_PRIVATE_SENTINEL+x}\"; { cat \"$UM_STEP_INPUTS/values/prompt\"; printf '|'; cat \"$UM_STEP_INPUTS/collections/attachments/000000\"; printf '|'; cat \"$UM_STEP_INPUTS/collections/attachments/000001\"; } > produced.txt; printf producer-live"]
     outputs:
       artifact:
         kind: file
@@ -501,7 +502,7 @@ steps:
       source:
         ref: outputs.produce.artifact
     command:
-      argv: ["sh", "-c", "set -eu; if IFS= read -r unexpected; then exit 92; fi; cat \"$SCHERZO_STEP_INPUTS/values/source\" > exported.txt; printf consumer-live"]
+      argv: ["sh", "-c", "set -eu; if IFS= read -r unexpected; then exit 92; fi; cat \"$UM_STEP_INPUTS/values/source\" > exported.txt; printf consumer-live"]
     outputs:
       result:
         kind: file
@@ -1025,7 +1026,7 @@ steps:
       argv:
         - sh
         - -c
-        - 'set -- "$SCHERZO_STEP_INPUTS/collections/evidence"/*; test "$1" = "$SCHERZO_STEP_INPUTS/collections/evidence/*"'
+        - 'set -- "$UM_STEP_INPUTS/collections/evidence"/*; test "$1" = "$UM_STEP_INPUTS/collections/evidence/*"'
 finalizers:
   finish:
     kind: cmd
@@ -1121,14 +1122,14 @@ steps:
         - -c
         - |
           set -eu
-          test "$(cat "$SCHERZO_STEP_INPUTS/values/inlineText")" = inline-text
-          test "$(cat "$SCHERZO_STEP_INPUTS/values/fileText")" = file-text
-          test "$(cat "$SCHERZO_STEP_INPUTS/values/inlineJson")" = '{"inline":true}'
-          test "$(cat "$SCHERZO_STEP_INPUTS/values/fileJson")" = '{"from":"file"}'
-          test "$(cat "$SCHERZO_STEP_INPUTS/values/payload")" = file-payload
-          test "$(cat "$SCHERZO_STEP_INPUTS/collections/evidence/000000")" = attachment
-          set -- "$SCHERZO_STEP_INPUTS/collections/emptyEvidence"/*
-          test "$1" = "$SCHERZO_STEP_INPUTS/collections/emptyEvidence/*"
+          test "$(cat "$UM_STEP_INPUTS/values/inlineText")" = inline-text
+          test "$(cat "$UM_STEP_INPUTS/values/fileText")" = file-text
+          test "$(cat "$UM_STEP_INPUTS/values/inlineJson")" = '{"inline":true}'
+          test "$(cat "$UM_STEP_INPUTS/values/fileJson")" = '{"from":"file"}'
+          test "$(cat "$UM_STEP_INPUTS/values/payload")" = file-payload
+          test "$(cat "$UM_STEP_INPUTS/collections/evidence/000000")" = attachment
+          set -- "$UM_STEP_INPUTS/collections/emptyEvidence"/*
+          test "$1" = "$UM_STEP_INPUTS/collections/emptyEvidence/*"
 "#,
     );
     let text_path = bundle._temporary.path().join("input.txt");
@@ -1640,7 +1641,7 @@ steps:
       request:
         ref: inputs.request
     command:
-      argv: ["sh", "-c", "cat \"$SCHERZO_STEP_INPUTS/values/request\" > observed.txt"]
+      argv: ["sh", "-c", "cat \"$UM_STEP_INPUTS/values/request\" > observed.txt"]
 "#,
     );
     let source = bundle.initial_cwd().join("relative-request.txt");
@@ -3389,11 +3390,11 @@ export default function fixtureWrite(pi: ExtensionAPI): void {
 #[test]
 #[ignore = "requires pinned harness"]
 fn pinned_real_pi_runs_the_complete_mixed_value_and_export_dag() {
-    let pinned_pi = std::env::var_os("SCHERZO_PI_CONFORMANCE_EXECUTABLE")
+    let pinned_pi = std::env::var_os("UM_PI_CONFORMANCE_EXECUTABLE")
         .map(PathBuf::from)
         .filter(|path| path.to_string_lossy().ends_with("-pi-0.87.1/bin/pi"))
         .unwrap_or_else(|| {
-            panic!("SCHERZO_PI_CONFORMANCE_EXECUTABLE must name the pinned Pi 0.87.1 executable")
+            panic!("UM_PI_CONFORMANCE_EXECUTABLE must name the pinned Pi 0.87.1 executable")
         });
     let bundle = RunBundle::new(mixed_agent_source());
     for (path, text) in [
@@ -3557,13 +3558,13 @@ fn local_run_forwards_only_declared_host_environment() {
         ("environmentPassthrough: [WORKFLOW_VISIBLE]\n", "present"),
     ] {
         let bundle = RunBundle::new(&format!(
-            "schemaVersion: 1\n{declaration}steps:\n  authenticate:\n    kind: cmd\n    command:\n      argv: [sh, -c, 'test -z \"${{GH_TOKEN+x}}\" && test -z \"${{GITHUB_TOKEN+x}}\" && test -z \"${{SCHERZO_PRIVATE_SENTINEL+x}}\" && printf %s \"${{WORKFLOW_VISIBLE-absent}}\" > observed.txt']\n"
+            "schemaVersion: 1\n{declaration}steps:\n  authenticate:\n    kind: cmd\n    command:\n      argv: [sh, -c, 'test -z \"${{GH_TOKEN+x}}\" && test -z \"${{GITHUB_TOKEN+x}}\" && test -z \"${{UM_PRIVATE_SENTINEL+x}}\" && printf %s \"${{WORKFLOW_VISIBLE-absent}}\" > observed.txt']\n"
         ));
         let output = isolated_command(&bundle.args(&bundle.result("environment")))
             .env("GH_TOKEN", "local-gh-token")
             .env("GITHUB_TOKEN", "local-github-token")
             .env("WORKFLOW_VISIBLE", "present")
-            .env("SCHERZO_PRIVATE_SENTINEL", "must-not-reach-command")
+            .env("UM_PRIVATE_SENTINEL", "must-not-reach-command")
             .output()
             .unwrap();
         assert!(
@@ -3611,9 +3612,9 @@ fn json_run_executes_named_inputs_closed_stdin_publication_and_offline_boundarie
         ],
     );
     let mut child = isolated_command(&args)
-        .env("SCHERZO_PRIVATE_SENTINEL", "must-not-reach-command")
+        .env("UM_PRIVATE_SENTINEL", "must-not-reach-command")
         .env(
-            "SCHERZO_CLOUD_API_URL",
+            "UM_API_URL",
             format!("http://{}", listener.local_addr().unwrap()),
         )
         .stdin(Stdio::piped())
@@ -4155,7 +4156,7 @@ steps:
       prompt:
         ref: inputs.request
     command:
-      argv: ["sh", "-c", "cat \"$SCHERZO_STEP_INPUTS/values/prompt\" > prompt.txt"]
+      argv: ["sh", "-c", "cat \"$UM_STEP_INPUTS/values/prompt\" > prompt.txt"]
     outputs:
       prompt:
         kind: file
@@ -4274,7 +4275,7 @@ steps:
       attachments:
         ref: inputs.evidence
     command:
-      argv: ["sh", "-c", "cat \"$SCHERZO_STEP_INPUTS/collections/attachments/000000\" > attachment.bin"]
+      argv: ["sh", "-c", "cat \"$UM_STEP_INPUTS/collections/attachments/000000\" > attachment.bin"]
     outputs:
       attachment:
         kind: file
@@ -4496,7 +4497,7 @@ steps:
       prompt:
         ref: inputs.request
     command:
-      argv: ["sh", "-c", "store=$(dirname \"$SCHERZO_STEP_INPUTS\"); mv \"$store\" \"$store.moved\""]
+      argv: ["sh", "-c", "store=$(dirname \"$UM_STEP_INPUTS\"); mv \"$store\" \"$store.moved\""]
 "#,
     );
     let destination = bundle.result("cleanup-diagnostic");
@@ -5087,8 +5088,8 @@ fn owner_death_before_registration_or_continuation_never_executes_user_code() {
         .env("CONTROL", &control)
         .env("GUARD_BIN", env!("CARGO_BIN_EXE_um"))
         .env("GUARD_PID", &guard_pid)
-        .env("SCHERZO_INTERNAL_CHILD_GUARD_WORKER", "guard-v1")
-        .env("SCHERZO_INTERNAL_CHILD_GUARD_ROOT", staging.path())
+        .env("UM_INTERNAL_CHILD_GUARD_WORKER", "guard-v1")
+        .env("UM_INTERNAL_CHILD_GUARD_ROOT", staging.path())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())

@@ -2104,7 +2104,7 @@ mod tests {
         // The workflow command has an isolated environment. Supply the worker
         // contract to the nested fixture explicitly rather than relying on
         // the test runner's environment surviving the command boundary.
-        let worker = std::env::var("SCHERZO_TEST_INTERNAL_WORKER_EXECUTABLE")
+        let worker = std::env::var("UM_TEST_INTERNAL_WORKER_EXECUTABLE")
             .expect("test worker executable must be supplied by the test runner");
         assert!(
             Path::new(&worker).is_file(),
@@ -2113,7 +2113,7 @@ mod tests {
         let fixture_arguments = vec![
             "/bin/sh".to_owned(),
             "-c".to_owned(),
-            "export SCHERZO_TEST_INTERNAL_WORKER_EXECUTABLE=\"$1\"; shift; exec \"$@\"".to_owned(),
+            "export UM_TEST_INTERNAL_WORKER_EXECUTABLE=\"$1\"; shift; exec \"$@\"".to_owned(),
             "sh".to_owned(),
             worker,
             std::env::current_exe()

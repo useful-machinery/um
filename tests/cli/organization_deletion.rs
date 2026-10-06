@@ -320,10 +320,7 @@ fn organization_deletion_rejects_invalid_targets_and_missing_confirmation_locall
         &["organization", "deletion", "request", "acme-research"][..],
         &["organization", "deletion", "cancel", "acme/research"][..],
     ] {
-        let output = run_with_env(
-            args,
-            &[("SCHERZO_CLOUD_API_URL", "partial-override-must-not-load")],
-        );
+        let output = run_with_env(args, &[("UM_API_URL", "partial-override-must-not-load")]);
         assert_eq!(output.status.code(), Some(2));
         assert!(output.stdout.is_empty());
     }

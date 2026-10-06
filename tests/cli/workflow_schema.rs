@@ -21,16 +21,10 @@ fn embedded_schema_is_emitted_unchanged_without_external_state() {
             super::CREDENTIALS_FILE_VARIABLE,
             "/dev/null/workflow-schema-credentials.json",
         )
-        .env("SCHERZO_CLOUD_API_URL", &api_url)
-        .env(
-            "SCHERZO_CLOUD_AUTH_ISSUER",
-            "http://auth.workflow-schema.invalid/",
-        )
-        .env(
-            "SCHERZO_CLOUD_AUTH_AUDIENCE",
-            "https://api.workflow-schema.invalid",
-        )
-        .env("SCHERZO_CLOUD_AUTH_CLIENT_ID", "workflow-schema-client")
+        .env("UM_API_URL", &api_url)
+        .env("UM_AUTH_ISSUER", "http://auth.workflow-schema.invalid/")
+        .env("UM_AUTH_AUDIENCE", "https://api.workflow-schema.invalid")
+        .env("UM_AUTH_CLIENT_ID", "workflow-schema-client")
         .output()
         .expect("um should run");
 

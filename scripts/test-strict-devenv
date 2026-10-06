@@ -29,7 +29,7 @@ if ! PATH="$ambient_directory:$PATH" \
   CARGO_TARGET_DIR="$cargo_target" \
   RUSTC_WRAPPER="$ambient_directory/$ambient_command" \
   DEVENV_TUI=false \
-  SCHERZO_CLI_STRICT_DEVENV_TEST_MARKER="$marker_value" \
+  UM_CLI_STRICT_DEVENV_TEST_MARKER="$marker_value" \
   "$boundary" shell -- bash -c '
     set -euo pipefail
     expected_target=$1
@@ -41,7 +41,7 @@ if ! PATH="$ambient_directory:$PATH" \
     [[ ${CARGO_BUILD_JOBS:-} == 1 ]]
     [[ ${RUSTC_WRAPPER:-} == "$ambient_directory/$ambient_command" ]]
     [[ ${DEVENV_TUI:-} == false ]]
-    [[ -z ${SCHERZO_CLI_STRICT_DEVENV_TEST_MARKER+x} ]]
+    [[ -z ${UM_CLI_STRICT_DEVENV_TEST_MARKER+x} ]]
     [[ :$PATH: != *":$ambient_directory:"* ]]
     ! command -v "$ambient_command" >/dev/null 2>&1
     if "$ambient_command" 2>"$diagnostic"; then

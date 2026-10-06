@@ -144,7 +144,7 @@ fn media_type_parameters_use_horizontal_separators_and_control_free_unicode_valu
 #[test]
 fn environment_passthrough_rejects_reserved_invalid_and_duplicate_names() {
     for names in [
-        "[SCHERZO_INTERNAL_CHILD_GUARD_WORKER]",
+        "[UM_INTERNAL_CHILD_GUARD_WORKER]",
         "[GH_TOKEN]",
         "[GIT_CONFIG_KEY_0]",
         "[SSH_AUTH_SOCK]",

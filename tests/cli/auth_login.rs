@@ -9,10 +9,10 @@ fn login_environment<'a>(
 ) -> [(&'static str, &'a str); 5] {
     [
         (CREDENTIALS_FILE_VARIABLE, credential_path),
-        ("SCHERZO_CLOUD_API_URL", &server.api_url),
-        ("SCHERZO_CLOUD_AUTH_ISSUER", &server.issuer),
-        ("SCHERZO_CLOUD_AUTH_AUDIENCE", "https://api.fixture.example"),
-        ("SCHERZO_CLOUD_AUTH_CLIENT_ID", "fixture-public-client"),
+        ("UM_API_URL", &server.api_url),
+        ("UM_AUTH_ISSUER", &server.issuer),
+        ("UM_AUTH_AUDIENCE", "https://api.fixture.example"),
+        ("UM_AUTH_CLIENT_ID", "fixture-public-client"),
     ]
 }
 
@@ -562,10 +562,10 @@ fn human_login_connection_failure_names_the_oauth_issuer_and_cause_on_stderr() {
     let credential_path = credential_path.to_str().unwrap();
     let environment = [
         (CREDENTIALS_FILE_VARIABLE, credential_path),
-        ("SCHERZO_CLOUD_API_URL", api_url),
-        ("SCHERZO_CLOUD_AUTH_ISSUER", issuer.as_str()),
-        ("SCHERZO_CLOUD_AUTH_AUDIENCE", "https://api.fixture.example"),
-        ("SCHERZO_CLOUD_AUTH_CLIENT_ID", "fixture-public-client"),
+        ("UM_API_URL", api_url),
+        ("UM_AUTH_ISSUER", issuer.as_str()),
+        ("UM_AUTH_AUDIENCE", "https://api.fixture.example"),
+        ("UM_AUTH_CLIENT_ID", "fixture-public-client"),
     ];
 
     let output = run_with_env(
@@ -740,10 +740,10 @@ fn local_login_failure_emits_no_auth_event_or_network_request() {
     let credential_path_string = credential_path.to_str().unwrap();
     let environment = [
         (CREDENTIALS_FILE_VARIABLE, credential_path_string),
-        ("SCHERZO_CLOUD_API_URL", api_url.as_str()),
-        ("SCHERZO_CLOUD_AUTH_ISSUER", issuer.as_str()),
-        ("SCHERZO_CLOUD_AUTH_AUDIENCE", "https://api.fixture.example"),
-        ("SCHERZO_CLOUD_AUTH_CLIENT_ID", "fixture-public-client"),
+        ("UM_API_URL", api_url.as_str()),
+        ("UM_AUTH_ISSUER", issuer.as_str()),
+        ("UM_AUTH_AUDIENCE", "https://api.fixture.example"),
+        ("UM_AUTH_CLIENT_ID", "fixture-public-client"),
     ];
 
     let output = run_with_env(

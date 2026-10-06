@@ -33,7 +33,7 @@ steps:
         - -c
         - |
           set -eu
-          attachments_dir="$SCHERZO_STEP_INPUTS/collections/attachments"
+          attachments_dir="$UM_STEP_INPUTS/collections/attachments"
           attachment_count=0
           for attachment in "$attachments_dir"/*; do
             [ -f "$attachment" ] || continue
@@ -44,7 +44,7 @@ steps:
             printf '%s\n' 'Named request:'
             while IFS= read -r line || [ -n "$line" ]; do
               printf '%s\n' "$line"
-            done < "$SCHERZO_STEP_INPUTS/values/request"
+            done < "$UM_STEP_INPUTS/values/request"
           } > summary.txt
 
           printf '%s\n' "{\"schemaVersion\":1,\"state\":\"captured\",\"attachmentCount\":$attachment_count}" > metadata.json
@@ -96,17 +96,17 @@ steps:
             printf '%s\n' 'Summary value:'
             while IFS= read -r line || [ -n "$line" ]; do
               printf '%s\n' "$line"
-            done < "$SCHERZO_STEP_INPUTS/values/summary"
+            done < "$UM_STEP_INPUTS/values/summary"
 
             printf '\n%s\n' 'JSON value:'
             while IFS= read -r line || [ -n "$line" ]; do
               printf '%s\n' "$line"
-            done < "$SCHERZO_STEP_INPUTS/values/metadata"
+            done < "$UM_STEP_INPUTS/values/metadata"
 
             printf '\n%s\n' 'File value:'
             while IFS= read -r line || [ -n "$line" ]; do
               printf '%s\n' "$line"
-            done < "$SCHERZO_STEP_INPUTS/values/attachmentReport"
+            done < "$UM_STEP_INPUTS/values/attachmentReport"
           } > delivered.txt
           printf '%s\n' 'delivered all three typed values'
     outputs:

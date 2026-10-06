@@ -22,7 +22,7 @@ steps:
             - /bin/sh
             - -c
             - |
-              printf '%s' '{"schemaVersion":1,"decision":"recheck","summary":"retry target","reason":"target remains invalid"}' > "$SCHERZO_RECOVERY_RESULT"
+              printf '%s' '{"schemaVersion":1,"decision":"recheck","summary":"retry target","reason":"target remains invalid"}' > "$UM_RECOVERY_RESULT"
     command:
       argv:
         - /bin/sh

@@ -1221,7 +1221,7 @@ mod tests {
         const DEFAULT_DUE_AFTER_SECONDS: u64 = 10;
         const MAX_DUE_AFTER_SECONDS: u64 = 600;
         const MIN_OBSERVED_SUSPEND: Duration = Duration::from_secs(1);
-        let due_after_seconds = match std::env::var_os("SCHERZO_LEASE_SUSPEND_DUE_SECONDS") {
+        let due_after_seconds = match std::env::var_os("UM_LEASE_SUSPEND_DUE_SECONDS") {
             None => DEFAULT_DUE_AFTER_SECONDS,
             Some(value) => value
                 .to_str()
@@ -1231,7 +1231,7 @@ mod tests {
         };
         let due_after = Duration::from_secs(due_after_seconds);
         let ready_path = PathBuf::from(
-            std::env::var_os("SCHERZO_LEASE_SUSPEND_READY_FILE")
+            std::env::var_os("UM_LEASE_SUSPEND_READY_FILE")
                 .expect("owning suspend script did not provide its readiness path"),
         );
         let clock = LeaseClock::system().expect("open native suspend-aware lease clock");

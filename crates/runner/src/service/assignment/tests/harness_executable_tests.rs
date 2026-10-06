@@ -270,7 +270,7 @@ async fn cloud_commands_agents_and_finalizers_receive_exact_source_revision() {
     let repository_argv = serde_json::to_string(&[
             "sh",
             "-c",
-            "test -d .git && test \"$(git rev-parse --is-inside-work-tree)\" = true && test -z \"$(git rev-parse --show-prefix)\" && test -z \"$(git branch --show-current)\" && test \"$SCHERZO_SOURCE_BRANCH\" = main && test \"$SCHERZO_SOURCE_COMMIT_OID\" = \"$(git rev-parse HEAD)\"",
+            "test -d .git && test \"$(git rev-parse --is-inside-work-tree)\" = true && test -z \"$(git rev-parse --show-prefix)\" && test -z \"$(git branch --show-current)\" && test \"$UM_SOURCE_BRANCH\" = main && test \"$UM_SOURCE_COMMIT_OID\" = \"$(git rev-parse HEAD)\"",
         ])
         .unwrap();
     let workflow = format!(
@@ -278,17 +278,17 @@ async fn cloud_commands_agents_and_finalizers_receive_exact_source_revision() {
     );
     let pi_source = SUCCESSFUL_PI.replacen(
             "set -eu",
-            "set -eu\ntest \"$SCHERZO_SOURCE_BRANCH\" = main\ntest \"$SCHERZO_SOURCE_COMMIT_OID\" = \"$(git rev-parse HEAD)\"",
+            "set -eu\ntest \"$UM_SOURCE_BRANCH\" = main\ntest \"$UM_SOURCE_COMMIT_OID\" = \"$(git rev-parse HEAD)\"",
             1,
         );
     let (_temporary, mut manager) = manager_fixture_with_pi(&workflow, Some(&pi_source));
     let mut environment = manager.environment.variables().clone();
     environment.insert(
-        OsString::from("SCHERZO_SOURCE_BRANCH"),
+        OsString::from("UM_SOURCE_BRANCH"),
         OsString::from("inherited-branch"),
     );
     environment.insert(
-        OsString::from("SCHERZO_SOURCE_COMMIT_OID"),
+        OsString::from("UM_SOURCE_COMMIT_OID"),
         OsString::from("inherited-commit"),
     );
     manager.environment = EnvironmentSnapshot::new(environment);

@@ -76,7 +76,7 @@ fn environment_selects_override_or_normal_home_path() -> anyhow::Result<()> {
     check_eq!(override_store.path, PathBuf::from(&override_path));
     check_eq!(
         home_store.path,
-        PathBuf::from("/private/home/.scherzo/credentials.json")
+        PathBuf::from("/private/home/.um/credentials.json")
     );
     Ok(())
 }

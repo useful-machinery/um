@@ -528,7 +528,7 @@ impl SpanProcessor for ExportSpanProcessor {
         let (sender, receiver) = sync_channel(self.queue_capacity);
         let diagnostics = self.diagnostics.clone();
         match thread::Builder::new()
-            .name("scherzo-runner-otlp".to_owned())
+            .name("um-runner-otlp".to_owned())
             .spawn(move || export_worker(exporter, receiver, &diagnostics))
         {
             Ok(worker) => {
@@ -953,10 +953,7 @@ mod tests {
         assert_eq!(
             resource_attributes.expect("captured OTLP resource"),
             HashMap::from([
-                (
-                    "service.name".to_owned(),
-                    serde_json::json!("scherzo-runner")
-                ),
+                ("service.name".to_owned(), serde_json::json!("um-runner")),
                 (
                     "service.version".to_owned(),
                     serde_json::json!(crate::telemetry::TEST_SERVICE_VERSION)

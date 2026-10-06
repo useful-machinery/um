@@ -172,14 +172,14 @@ fn controlled_path_for(executable: &Path) -> tempfile::TempDir {
 }
 
 fn conformance_executable() -> Option<PathBuf> {
-    std::env::var_os("SCHERZO_PI_CONFORMANCE_EXECUTABLE")
+    std::env::var_os("UM_PI_CONFORMANCE_EXECUTABLE")
         .map(PathBuf::from)
         .filter(|path| path.to_string_lossy().ends_with("-pi-0.87.1/bin/pi"))
 }
 
 fn require_conformance_executable() -> PathBuf {
     conformance_executable().unwrap_or_else(|| {
-        panic!("SCHERZO_PI_CONFORMANCE_EXECUTABLE must name the pinned Pi 0.87.1 executable")
+        panic!("UM_PI_CONFORMANCE_EXECUTABLE must name the pinned Pi 0.87.1 executable")
     })
 }
 

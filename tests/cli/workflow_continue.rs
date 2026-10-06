@@ -752,11 +752,11 @@ fn retry_after_failed_continuation_reruns_the_initial_definition_without_context
 steps:
   first:
     kind: cmd
-    command: {argv: ["sh", "-c", "test -z \"${SCHERZO_CONTINUATION_CONTEXT:-}\"; echo first >> calls"]}
+    command: {argv: ["sh", "-c", "test -z \"${UM_CONTINUATION_CONTEXT:-}\"; echo first >> calls"]}
   second:
     kind: cmd
     dependsOn: [first]
-    command: {argv: ["sh", "-c", "if test \"$PHASE\" = continued; then test -r \"$SCHERZO_CONTINUATION_CONTEXT\"; exit 75; fi; test -z \"${SCHERZO_CONTINUATION_CONTEXT:-}\"; test \"$PHASE\" = retry"]}
+    command: {argv: ["sh", "-c", "if test \"$PHASE\" = continued; then test -r \"$UM_CONTINUATION_CONTEXT\"; exit 75; fi; test -z \"${UM_CONTINUATION_CONTEXT:-}\"; test \"$PHASE\" = retry"]}
 finalizers:
   cleanup:
     kind: cmd
@@ -786,7 +786,7 @@ steps:
   second:
     kind: cmd
     dependsOn: [first]
-    command: {argv: ["sh", "-c", "test -r \"$SCHERZO_CONTINUATION_CONTEXT\"; exit 75"]}
+    command: {argv: ["sh", "-c", "test -r \"$UM_CONTINUATION_CONTEXT\"; exit 75"]}
 finalizers:
   cleanup:
     kind: cmd
@@ -856,7 +856,7 @@ steps:
       data: {ref: outputs.producer.data}
       document: {ref: outputs.producer.document}
     command:
-      argv: ["sh", "-c", "test -r $SCHERZO_STEP_INPUTS/values/data; test -r $SCHERZO_STEP_INPUTS/values/document; test $PHASE = continuation"]
+      argv: ["sh", "-c", "test -r $UM_STEP_INPUTS/values/data; test -r $UM_STEP_INPUTS/values/document; test $PHASE = continuation"]
 exports:
   retainedDocument: {ref: outputs.producer.document}
 "#,
@@ -927,12 +927,12 @@ steps:
             - |
               set -eu
               if test "$PHASE" = resumed; then
-                test -r "$SCHERZO_CONTINUATION_CONTEXT"
+                test -r "$UM_CONTINUATION_CONTEXT"
                 : > repaired
               else
-                test -z "${SCHERZO_CONTINUATION_CONTEXT:-}"
+                test -z "${UM_CONTINUATION_CONTEXT:-}"
               fi
-              printf '%s' '{"schemaVersion":1,"decision":"recheck","summary":"Retried after preparation.","reason":"Recheck current state."}' > "$SCHERZO_RECOVERY_RESULT"
+              printf '%s' '{"schemaVersion":1,"decision":"recheck","summary":"Retried after preparation.","reason":"Recheck current state."}' > "$UM_RECOVERY_RESULT"
     command:
       argv:
         - /bin/sh
@@ -940,10 +940,10 @@ steps:
         - |
           set -eu
           if test "$PHASE" = resumed; then
-            test -r "$SCHERZO_CONTINUATION_CONTEXT"
+            test -r "$UM_CONTINUATION_CONTEXT"
             test -f repaired
           else
-            test -z "${SCHERZO_CONTINUATION_CONTEXT:-}"
+            test -z "${UM_CONTINUATION_CONTEXT:-}"
             exit 75
           fi
 "#,
@@ -1069,7 +1069,7 @@ fn replacement_definition_and_root_are_selected_independently() {
 #[test]
 fn chained_continuation_keeps_original_producer_and_reruns_finalizers() {
     let bundle = RunBundle::new(
-        "schemaVersion: 1\nsteps:\n  producer:\n    kind: cmd\n    command: {argv: [\"sh\", \"-c\", \"echo producer >> calls; echo inherited > output.txt\"]}\n    outputs:\n      value: {kind: text, from: path, path: output.txt}\n  consumer:\n    kind: cmd\n    inputs:\n      value: {ref: outputs.producer.value}\n    command: {argv: [\"sh\", \"-c\", \"echo consumer >> calls; test \\\"$PHASE\\\" = final\"]}\nfinalizers:\n  cleanup:\n    kind: cmd\n    command: {argv: [\"sh\", \"-c\", \"if test \\\"$PHASE\\\" != initial; then test -r \\\"$SCHERZO_CONTINUATION_CONTEXT\\\"; else test -z ${SCHERZO_CONTINUATION_CONTEXT:-}; fi; echo cleanup >> calls\"]}\nexports:\n  retained:\n    ref: outputs.producer.value\n",
+        "schemaVersion: 1\nsteps:\n  producer:\n    kind: cmd\n    command: {argv: [\"sh\", \"-c\", \"echo producer >> calls; echo inherited > output.txt\"]}\n    outputs:\n      value: {kind: text, from: path, path: output.txt}\n  consumer:\n    kind: cmd\n    inputs:\n      value: {ref: outputs.producer.value}\n    command: {argv: [\"sh\", \"-c\", \"echo consumer >> calls; test \\\"$PHASE\\\" = final\"]}\nfinalizers:\n  cleanup:\n    kind: cmd\n    command: {argv: [\"sh\", \"-c\", \"if test \\\"$PHASE\\\" != initial; then test -r \\\"$UM_CONTINUATION_CONTEXT\\\"; else test -z ${UM_CONTINUATION_CONTEXT:-}; fi; echo cleanup >> calls\"]}\nexports:\n  retained:\n    ref: outputs.producer.value\n",
     );
     let run = bundle.result("chain");
     let mut initial = bundle.args(&run);
@@ -1161,7 +1161,7 @@ fn chained_continuation_keeps_original_producer_and_reruns_finalizers() {
 #[test]
 fn workflow_continue_inherits_prior_output_and_executes_only_downstream() {
     let bundle = RunBundle::new(
-        "schemaVersion: 1\nsteps:\n  first:\n    kind: cmd\n    command: {argv: [\"sh\", \"-c\", \"printf first > first.txt; echo first >> calls; test -z ${SCHERZO_CONTINUATION_CONTEXT:-}\"]}\n    outputs:\n      value: {kind: text, from: path, path: first.txt}\n  second:\n    kind: cmd\n    inputs:\n      value: {ref: outputs.first.value}\n    command: {argv: [\"sh\", \"-c\", \"echo second >> calls; if test \\\"$PHASE\\\" = continuation; then test -r \\\"$SCHERZO_CONTINUATION_CONTEXT\\\"; grep -q inheritedOutputs \\\"$SCHERZO_CONTINUATION_CONTEXT\\\"; else test -z ${SCHERZO_CONTINUATION_CONTEXT:-}; false; fi\"]}\n",
+        "schemaVersion: 1\nsteps:\n  first:\n    kind: cmd\n    command: {argv: [\"sh\", \"-c\", \"printf first > first.txt; echo first >> calls; test -z ${UM_CONTINUATION_CONTEXT:-}\"]}\n    outputs:\n      value: {kind: text, from: path, path: first.txt}\n  second:\n    kind: cmd\n    inputs:\n      value: {ref: outputs.first.value}\n    command: {argv: [\"sh\", \"-c\", \"echo second >> calls; if test \\\"$PHASE\\\" = continuation; then test -r \\\"$UM_CONTINUATION_CONTEXT\\\"; grep -q inheritedOutputs \\\"$UM_CONTINUATION_CONTEXT\\\"; else test -z ${UM_CONTINUATION_CONTEXT:-}; false; fi\"]}\n",
     );
     let run = bundle.result("continuation");
     let mut initial = bundle.args(&run);

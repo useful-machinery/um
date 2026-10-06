@@ -352,7 +352,7 @@ fn execution_context(execution_root: &Path) -> ExecutionContext {
         EnvironmentSnapshot::new([
             ("PATH", "/runner/bin"),
             ("VISIBLE", "exact"),
-            ("SCHERZO_CALLER_VALUE", "must-be-removed"),
+            ("UM_CALLER_VALUE", "must-be-removed"),
         ]),
         CancellationPolicy::new(CancellationSource::new(), Duration::from_secs(10)),
     )

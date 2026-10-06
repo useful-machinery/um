@@ -25,7 +25,7 @@ use super::coordinator::CoordinatorClock;
 use super::value::CapturedJson;
 
 const JSON_SCHEMA_DIALECT: &str = "https://json-schema.org/draft/2020-12/schema";
-const INTERNAL_WORKER_ENVIRONMENT: &str = "SCHERZO_INTERNAL_RESULT_VALIDATION_WORKER";
+const INTERNAL_WORKER_ENVIRONMENT: &str = "UM_INTERNAL_RESULT_VALIDATION_WORKER";
 const INTERNAL_WORKER_VERSION: &str = "workflow-result-v1";
 const MAXIMUM_SCHEMA_BYTES: u64 = 64 * 1024 * 1024;
 const MAXIMUM_WORKER_FEEDBACK_BYTES: u64 = 8 * 1024;

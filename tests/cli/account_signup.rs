@@ -6,10 +6,10 @@ fn signup_environment<'a>(
 ) -> [(&'static str, &'a str); 5] {
     [
         (CREDENTIALS_FILE_VARIABLE, credential_path),
-        ("SCHERZO_CLOUD_API_URL", &server.api_url),
-        ("SCHERZO_CLOUD_AUTH_ISSUER", &server.issuer),
-        ("SCHERZO_CLOUD_AUTH_AUDIENCE", "https://api.fixture.example"),
-        ("SCHERZO_CLOUD_AUTH_CLIENT_ID", "fixture-public-client"),
+        ("UM_API_URL", &server.api_url),
+        ("UM_AUTH_ISSUER", &server.issuer),
+        ("UM_AUTH_AUDIENCE", "https://api.fixture.example"),
+        ("UM_AUTH_CLIENT_ID", "fixture-public-client"),
     ]
 }
 

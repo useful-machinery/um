@@ -27,11 +27,11 @@ else
   expected_rustc_version=$rust_version
 fi
 
-if [[ -z "${SCHERZO_MSRV_CARGO:-}" || -z "${SCHERZO_MSRV_RUSTC:-}" ]]; then
+if [[ -z "${UM_MSRV_CARGO:-}" || -z "${UM_MSRV_RUSTC:-}" ]]; then
   echo "The declared-minimum Rust toolchain is unavailable; enter the devenv environment." >&2
   exit 1
 fi
-actual_rustc_version=$("$SCHERZO_MSRV_RUSTC" --version --verbose | awk '$1 == "release:" { print $2 }')
+actual_rustc_version=$("$UM_MSRV_RUSTC" --version --verbose | awk '$1 == "release:" { print $2 }')
 if [[ "$actual_rustc_version" != "$expected_rustc_version" ]]; then
   echo "The configured minimum rustc does not match Cargo.toml rust-version." >&2
   echo "Expected: $expected_rustc_version" >&2
@@ -53,6 +53,6 @@ if [[ "$active_rustc_version" == "$expected_rustc_version" ]]; then
 fi
 
 msrv_target_dir=${CARGO_TARGET_DIR:-$public_root/target}/msrv
-CARGO_TARGET_DIR="$msrv_target_dir" RUSTC="$SCHERZO_MSRV_RUSTC" \
-  "$SCHERZO_MSRV_CARGO" check --locked --workspace --all-targets --all-features
+CARGO_TARGET_DIR="$msrv_target_dir" RUSTC="$UM_MSRV_RUSTC" \
+  "$UM_MSRV_CARGO" check --locked --workspace --all-targets --all-features
 printf 'All targets and features compile with Rust %s.\n' "$actual_rustc_version"

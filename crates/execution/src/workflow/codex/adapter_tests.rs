@@ -48,10 +48,10 @@ const CORRECTION_TURN_ID: &str = "turn-correction";
 const PLACEHOLDER_KEY: &str = "scherzo-loopback-placeholder";
 
 fn conformance_executable() -> PathBuf {
-    std::env::var_os("SCHERZO_CODEX_CONFORMANCE_EXECUTABLE")
+    std::env::var_os("UM_CODEX_CONFORMANCE_EXECUTABLE")
         .map(PathBuf::from)
         .unwrap_or_else(|| {
-            panic!("SCHERZO_CODEX_CONFORMANCE_EXECUTABLE must name the pinned Codex executable")
+            panic!("UM_CODEX_CONFORMANCE_EXECUTABLE must name the pinned Codex executable")
         })
 }
 
@@ -2798,7 +2798,7 @@ for line in sys.stdin:
             },
         })
         response = json.loads(sys.stdin.readline())
-        with open(os.environ["SCHERZO_MCP_CAPTURE"], "w", encoding="utf-8") as output:
+        with open(os.environ["UM_MCP_CAPTURE"], "w", encoding="utf-8") as output:
             json.dump(response, output, separators=(",", ":"))
         send({
             "jsonrpc": "2.0",
@@ -2817,7 +2817,7 @@ for line in sys.stdin:
         let mut config = std::fs::read_to_string(&config_path).unwrap();
         config.push_str(&format!(
             "\n[mcp_servers.fixture]\ncommand = \"python3\"\nargs = [{}]\n\
-             [mcp_servers.fixture.env]\nSCHERZO_MCP_CAPTURE = {}\n",
+             [mcp_servers.fixture.env]\nUM_MCP_CAPTURE = {}\n",
             serde_json::to_string(script.to_str().unwrap()).unwrap(),
             serde_json::to_string(capture.to_str().unwrap()).unwrap(),
         ));

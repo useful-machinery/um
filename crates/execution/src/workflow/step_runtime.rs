@@ -1895,7 +1895,7 @@ where
                         .materialize(&values, &self.artifacts)
                         .map_err(StepStartFailure::InputPreparation)?;
                     prepared.environment = prepared.environment.with_variable(
-                        OsString::from("SCHERZO_STEP_INPUTS"),
+                        OsString::from("UM_STEP_INPUTS"),
                         view.path().as_os_str().to_owned(),
                     );
                     prepared.inputs = Some(view);

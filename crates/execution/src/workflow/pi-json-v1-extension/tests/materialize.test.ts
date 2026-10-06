@@ -27,7 +27,7 @@ test("materialization is byte-identical for fixed inputs", async () => {
 
   assert.equal(first, second);
   assert.ok(first.includes(JSON.stringify(JSON.stringify(fixedConfig))));
-  assert.ok(!first.includes("__SCHERZO_PI_JSON_V1_CONFIG_JSON__"));
+  assert.ok(!first.includes("__UM_PI_JSON_V1_CONFIG_JSON__"));
 });
 
 test("materialization rejects a template without exactly one marker", () => {

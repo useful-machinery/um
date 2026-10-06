@@ -34,9 +34,9 @@ use super::process_group::{
     terminate_authenticated_process_group, terminate_authenticated_process_group_with,
 };
 
-const INTERNAL_WORKER_ENVIRONMENT: &str = "SCHERZO_INTERNAL_CHILD_GUARD_WORKER";
-const INTERNAL_ROOT_ENVIRONMENT: &str = "SCHERZO_INTERNAL_CHILD_GUARD_ROOT";
-const INTERNAL_PARENT_ENVIRONMENT: &str = "SCHERZO_INTERNAL_CHILD_GUARD_PARENT";
+const INTERNAL_WORKER_ENVIRONMENT: &str = "UM_INTERNAL_CHILD_GUARD_WORKER";
+const INTERNAL_ROOT_ENVIRONMENT: &str = "UM_INTERNAL_CHILD_GUARD_ROOT";
+const INTERNAL_PARENT_ENVIRONMENT: &str = "UM_INTERNAL_CHILD_GUARD_PARENT";
 const GUARD_WORKER: &str = "guard-v1";
 const LEADER_WORKER: &str = "leader-v1";
 const CONTINUE: u8 = b'C';
@@ -1190,7 +1190,7 @@ mod tests {
     const UNRELATED_SIBLING_FIXTURE: &str =
         "workflow::child_guard::tests::unrelated_sibling_fixture";
     #[cfg(target_os = "linux")]
-    const NESTED_FIXTURE_ROOT: &str = "SCHERZO_NESTED_GUARD_FIXTURE_ROOT";
+    const NESTED_FIXTURE_ROOT: &str = "UM_NESTED_GUARD_FIXTURE_ROOT";
 
     struct UnavailableInspector;
 
@@ -1291,7 +1291,7 @@ mod tests {
 
     #[tokio::test]
     async fn guarded_child_can_receive_streaming_standard_input() {
-        let supplied_worker = std::env::var_os("SCHERZO_TEST_INTERNAL_WORKER_EXECUTABLE")
+        let supplied_worker = std::env::var_os("UM_TEST_INTERNAL_WORKER_EXECUTABLE")
             .expect("test worker executable must be supplied by the test runner");
         assert_eq!(
             child_guard_worker_executable().unwrap().as_os_str(),
@@ -1432,15 +1432,12 @@ mod tests {
                     "--ignored",
                     "--test-threads=1",
                 ])
-                .env("SCHERZO_NESTED_LEADER_PID", &leader_pid_path)
-                .env("SCHERZO_NESTED_LEADER_READY", &leader_ready)
-                .env("SCHERZO_NESTED_LEADER_INTERRUPTED", &leader_interrupted)
-                .env("SCHERZO_NESTED_DESCENDANT_PID", &descendant_pid_path)
-                .env("SCHERZO_NESTED_DESCENDANT_READY", &descendant_ready)
-                .env(
-                    "SCHERZO_NESTED_DESCENDANT_INTERRUPTED",
-                    &descendant_interrupted,
-                )
+                .env("UM_NESTED_LEADER_PID", &leader_pid_path)
+                .env("UM_NESTED_LEADER_READY", &leader_ready)
+                .env("UM_NESTED_LEADER_INTERRUPTED", &leader_interrupted)
+                .env("UM_NESTED_DESCENDANT_PID", &descendant_pid_path)
+                .env("UM_NESTED_DESCENDANT_READY", &descendant_ready)
+                .env("UM_NESTED_DESCENDANT_INTERRUPTED", &descendant_interrupted)
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
@@ -1515,12 +1512,12 @@ mod tests {
     #[test]
     #[ignore = "launched as the nested process-group leader"]
     fn nested_process_group_leader_fixture() {
-        let interrupted = std::env::var_os("SCHERZO_NESTED_LEADER_INTERRUPTED").unwrap();
+        let interrupted = std::env::var_os("UM_NESTED_LEADER_INTERRUPTED").unwrap();
         crate::workflow::test_support::process_fixture_interrupt_handler(move || {
             fs::write(interrupted, b"interrupted\n").unwrap();
         });
         fs::write(
-            std::env::var_os("SCHERZO_NESTED_LEADER_PID").unwrap(),
+            std::env::var_os("UM_NESTED_LEADER_PID").unwrap(),
             format!("{}\n", std::process::id()),
         )
         .unwrap();
@@ -1537,7 +1534,7 @@ mod tests {
             .spawn()
             .unwrap();
         fs::write(
-            std::env::var_os("SCHERZO_NESTED_LEADER_READY").unwrap(),
+            std::env::var_os("UM_NESTED_LEADER_READY").unwrap(),
             b"ready\n",
         )
         .unwrap();
@@ -1550,18 +1547,18 @@ mod tests {
     fn nested_stubborn_descendant_fixture() {
         let interrupted = crate::workflow::test_support::process_fixture_interrupt_receiver();
         fs::write(
-            std::env::var_os("SCHERZO_NESTED_DESCENDANT_PID").unwrap(),
+            std::env::var_os("UM_NESTED_DESCENDANT_PID").unwrap(),
             format!("{}\n", std::process::id()),
         )
         .unwrap();
         fs::write(
-            std::env::var_os("SCHERZO_NESTED_DESCENDANT_READY").unwrap(),
+            std::env::var_os("UM_NESTED_DESCENDANT_READY").unwrap(),
             b"ready\n",
         )
         .unwrap();
         interrupted.recv().unwrap();
         fs::write(
-            std::env::var_os("SCHERZO_NESTED_DESCENDANT_INTERRUPTED").unwrap(),
+            std::env::var_os("UM_NESTED_DESCENDANT_INTERRUPTED").unwrap(),
             b"interrupted\n",
         )
         .unwrap();
@@ -1575,7 +1572,7 @@ mod tests {
     #[ignore = "launched as the unrelated sibling process"]
     fn unrelated_sibling_fixture() {
         fs::write(
-            std::env::var_os("SCHERZO_UNRELATED_SIBLING_READY").unwrap(),
+            std::env::var_os("UM_UNRELATED_SIBLING_READY").unwrap(),
             b"ready\n",
         )
         .unwrap();
@@ -1597,7 +1594,7 @@ mod tests {
                 "--ignored",
                 "--test-threads=1",
             ])
-            .env("SCHERZO_UNRELATED_SIBLING_READY", &sibling_ready)
+            .env("UM_UNRELATED_SIBLING_READY", &sibling_ready)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());

@@ -138,16 +138,16 @@ durable run directory, and return to that run later:
 ```sh
 um workflow validate \
   --source-root . \
-  .scherzo/workflows/review.yaml
+  .um/workflows/review.yaml
 
 um workflow run \
   --source-root . \
   --execution-root . \
-  --run-dir ~/.scherzo/runs/review-001 \
-  .scherzo/workflows/review.yaml
+  --run-dir ~/.um/runs/review-001 \
+  .um/workflows/review.yaml
 
-um workflow status ~/.scherzo/runs/review-001
-um workflow view ~/.scherzo/runs/review-001
+um workflow status ~/.um/runs/review-001
+um workflow view ~/.um/runs/review-001
 ```
 
 During execution, Scherzo schedules ready steps, supervises each command or fresh agent
@@ -318,7 +318,7 @@ without running it:
 ```sh
 um workflow validate \
   --source-root ./my-repository \
-  ./my-repository/.scherzo/workflows/check.yaml
+  ./my-repository/.um/workflows/check.yaml
 ```
 
 Ready-to-run command and agent bundles are available under
@@ -462,12 +462,12 @@ um workflow run \
   --execution-root ./my-checkout \
   --run-dir ./runs/check-001 \
   --max-parallel 2 \
-  ./my-repository/.scherzo/workflows/check.yaml
+  ./my-repository/.um/workflows/check.yaml
 ```
 
 The run directory must not exist and must be disjoint from the execution root. The CLI
 normalizes it from its nearest existing parent and creates any missing parent suffix.
-First-workflow onboarding uses the owner-private `~/.scherzo/runs/` durable state root
+First-workflow onboarding uses the owner-private `~/.um/runs/` durable state root
 by default; retained runs are application state and do not belong under `~/.config`.
 The CLI retains immutable workflow and named-input bytes, durable closed run and attempt
 state, and attempt 1's atomic result beneath `attempts/000001/result`. Every agent
@@ -567,7 +567,7 @@ rejected. Scherzo does not read provider credentials during definition resolutio
 installation discovery, rejection presentation, or doctor checks.
 
 Local execution snapshots the inherited environment after resolution and removes
-`SCHERZO_` variables before launching commands or agents. Other caller-provided values are
+`UM_` variables before launching commands or agents. Other caller-provided values are
 retained unless the closed harness profile fixes them. ClaudeCodeStreamJsonV1 removes
 `CLAUDE_CODE_PROJECT_DIR_NAME` to keep retained-session routing authoritative and applies
 its documented native controls; values such as `GH_TOKEN`, `GITHUB_TOKEN`, and Git or SSH
@@ -634,7 +634,7 @@ run inputs and primary-workspace Git baseline remain immutable. A continuation i
 allowed only from an eligible latest failed, cancelled, or interrupted attempt, after
 all retained process groups are proven quiescent. Before actions run, plain output
 reports the ordered reexecuted and inherited partitions. Executed steps, recovery
-handlers, and finalizers can read the credential-free `SCHERZO_CONTINUATION_CONTEXT`
+handlers, and finalizers can read the credential-free `UM_CONTINUATION_CONTEXT`
 file; initial runs and explicit retries do not receive this variable. A continued
 step starts fresh; an inherited step has neither a new invocation nor a copied log.
 A required body-data consumer of an inherited skipped output is rejected, while
@@ -795,7 +795,7 @@ waits for browser authorization. Listing returns exactly one page and preserves
 
 One successful login establishes a renewable human session. The CLI stores the one-hour
 access token, its expiration, and a rotating refresh token in
-`~/.scherzo/credentials.json`, then silently renews access for every human-authenticated
+`~/.um/credentials.json`, then silently renews access for every human-authenticated
 command while the refresh session remains valid. Auth0 expires refresh sessions after 30
 days idle or 90 days total.
 
@@ -1040,9 +1040,9 @@ private regular file owned by the current Unix user, or through explicit standar
 
 ```sh
 um invitation preview inv_01k0z6r1w8f4jy2m7q9v3x5abc \
-  --capability-file ~/.config/scherzo/invitation.capability
+  --capability-file ~/.config/um/invitation.capability
 um invitation accept inv_01k0z6r1w8f4jy2m7q9v3x5abc \
-  --capability-file - < ~/.config/scherzo/invitation.capability
+  --capability-file - < ~/.config/um/invitation.capability
 ```
 
 Capability files must use mode `0600`, must not be symlinks, and must be owned by the
@@ -1843,7 +1843,7 @@ acceptance. The fixed preparation deadline is not extended
 by progress. Verified staging remains under the assignment root through execution and is
 removed or quarantined by the existing release path. Cloud commands, agents, and
 finalizers receive the exact recorded source branch and pinned commit as
-`SCHERZO_SOURCE_BRANCH` and `SCHERZO_SOURCE_COMMIT_OID`; local execution receives neither.
+`UM_SOURCE_BRANCH` and `UM_SOURCE_COMMIT_OID`; local execution receives neither.
 After the later start effect, a token-free repository helper can obtain lease-bound read
 access only for the credential-free primary `origin`. Runner Serve disables the helper,
 revokes every known issuance after process quiescence, destroys local helper and token
@@ -1910,7 +1910,7 @@ The WebSocket upgrade carries only the connection span's W3C `traceparent` (and 
 non-empty `tracestate`, if one exists), never baggage. The gateway can extract it as the
 session's remote parent. Effect acknowledgement spans remain independent roots and use
 the existing runner, boot, run, assignment, and effect IDs for correlation. Exported
-resource metadata contains only `service.name=scherzo-runner`, the package version, and
+resource metadata contains only `service.name=um-runner`, the package version, and
 the generated boot ID as `service.instance.id`; arbitrary resource environment
 attributes are not imported.
 

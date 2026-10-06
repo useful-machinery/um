@@ -11,10 +11,10 @@ const PRODUCTION_ISSUER: &str = "https://auth.usefulmachinery.com/";
 const PRODUCTION_AUDIENCE: &str = "https://api.usefulmachinery.com";
 const PRODUCTION_CLIENT_ID: &str = "4bLHkBx0rUaldAla2lKCABQ37C4BcxQM";
 
-const API_URL_VARIABLE: &str = "SCHERZO_CLOUD_API_URL";
-const ISSUER_VARIABLE: &str = "SCHERZO_CLOUD_AUTH_ISSUER";
-const AUDIENCE_VARIABLE: &str = "SCHERZO_CLOUD_AUTH_AUDIENCE";
-const CLIENT_ID_VARIABLE: &str = "SCHERZO_CLOUD_AUTH_CLIENT_ID";
+const API_URL_VARIABLE: &str = "UM_API_URL";
+const ISSUER_VARIABLE: &str = "UM_AUTH_ISSUER";
+const AUDIENCE_VARIABLE: &str = "UM_AUTH_AUDIENCE";
+const CLIENT_ID_VARIABLE: &str = "UM_AUTH_CLIENT_ID";
 const OVERRIDE_VARIABLES: [&str; 4] = [
     API_URL_VARIABLE,
     ISSUER_VARIABLE,
