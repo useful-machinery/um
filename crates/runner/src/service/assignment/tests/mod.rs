@@ -727,7 +727,42 @@ fn offer(suffix: &str) -> AssignmentOffer {
             capacity: production_capacity(),
             run_inputs: None,
         },
+        continuation: None,
     }
+}
+
+#[test]
+fn offer_replay_must_preserve_pinned_continuation_identity() {
+    let original = offer("bc");
+    let mut altered = original.clone();
+    altered.continuation = Some(Box::new(ContinuationOffer {
+        prior_assignment_id: "asn_01k0z6r1w8f4jy2m7q9v3x5aaa".to_owned(),
+        prior_attempt_id: "atm_01k0z6r1w8f4jy2m7q9v3x5aaa".to_owned(),
+        required_runner_boot_id: "rbt_01k0z6r1w8f4jy2m7q9v3x5aaa".to_owned(),
+        execution_root: "/retained/workspace".to_owned(),
+        definition_source: altered.execution_spec.workflow_definition_source.clone(),
+        effective_capacity: altered.execution_spec.capacity.clone(),
+        prior_manifest_digest: altered
+            .execution_spec
+            .workflow_definition_source
+            .workflow_source_closure_digest
+            .clone(),
+        request: serde_json::json!({"fromSteps":["build"]}),
+        reexecuted_steps: vec!["build".to_owned()],
+        inherited_steps: Vec::new(),
+        prior_settlement_snapshot: None,
+    }));
+    assert!(!same_assignment(&original, &altered));
+    let mut another_parent = altered.clone();
+    another_parent
+        .continuation
+        .as_mut()
+        .unwrap()
+        .prior_attempt_id = "atm_01k0z6r1w8f4jy2m7q9v3x5aab".to_owned();
+    assert!(!same_assignment(&altered, &another_parent));
+    let mut another_project = original.clone();
+    another_project.project_id = "prj_01k0z6r1w8f4jy2m7q9v3x5aab".to_owned();
+    assert!(!same_assignment(&original, &another_project));
 }
 
 fn prepare_for(manager: &AssignmentManager, offered: &AssignmentOffer) -> AssignmentPrepare {
@@ -1665,6 +1700,7 @@ async fn wait_for_terminal(manager: &mut AssignmentManager) -> Vec<ExecutionRepo
                     AssignmentObservation::Execution { report, .. } => Some(report),
                     AssignmentObservation::Preparing { .. }
                     | AssignmentObservation::PreparationProgress { .. }
+                    | AssignmentObservation::ContinuationReady { .. }
                     | AssignmentObservation::Decision(_)
                     | AssignmentObservation::CancellationApplied(_)
                     | AssignmentObservation::LeaseRenewalRequested { .. }
@@ -1858,6 +1894,7 @@ fn decoded_source_display_offer() -> AssignmentOffer {
         attempt_id,
         attempt_number,
         execution_spec: *execution_spec,
+        continuation: None,
     }
 }
 
@@ -1977,6 +2014,47 @@ fn presentation_capacity_offer_is_bound_to_resolved_source() {
     spec.capacity.portable_result_bytes += 1;
     assert_eq!(
         validate_carried_capacity(&spec, &workflow),
+        Err(capacity_binding_invalid())
+    );
+}
+
+#[test]
+fn replacement_capacity_is_checked_and_reserved_from_the_effective_definition() {
+    let source = tempfile::tempdir().unwrap();
+    fs::write(
+        source.path().join("workflow.yaml"),
+        "schemaVersion: 1\nsteps:\n  first:\n    kind: cmd\n    command: {argv: [\"true\"]}\n",
+    )
+    .unwrap();
+    let initial = resolve(source.path(), Path::new("workflow.yaml")).unwrap();
+    let mut offered = offer("bg");
+    align_fixture_capacity(&mut offered.execution_spec, &initial);
+    let initial_bytes = offered.execution_spec.capacity.encoded_outbox_bytes;
+    fs::write(source.path().join("workflow.yaml"),
+        "schemaVersion: 1\nsteps:\n  first:\n    kind: cmd\n    command: {argv: [\"true\"]}\n  replacement:\n    kind: cmd\n    command: {argv: [\"true\"]}\n").unwrap();
+    let replacement = resolve(source.path(), Path::new("workflow.yaml")).unwrap();
+    assert_eq!(
+        validate_carried_capacity(&offered.execution_spec, &replacement),
+        Err(AssignmentDecline::ExecutionSpecInvalid(
+            ExecutionSpecInvalidReason::WorkflowSourceDigestMismatch
+        ))
+    );
+    align_fixture_capacity(&mut offered.execution_spec, &replacement);
+    assert!(offered.execution_spec.capacity.encoded_outbox_bytes > initial_bytes);
+    assert_eq!(
+        validate_carried_capacity(&offered.execution_spec, &replacement),
+        Ok(())
+    );
+    let outbox = ObservationOutbox::new();
+    let capacity = &offered.execution_spec.capacity;
+    let transitions = usize::try_from(capacity.selected_maximum_transitions).unwrap();
+    assert_eq!(
+        outbox.reserve(transitions, capacity.encoded_outbox_bytes),
+        Ok(transitions)
+    );
+    offered.execution_spec.capacity.encoded_outbox_bytes -= 1;
+    assert_eq!(
+        validate_carried_capacity(&offered.execution_spec, &replacement),
         Err(capacity_binding_invalid())
     );
 }
@@ -2777,6 +2855,142 @@ async fn root_cleanup_failure_suppresses_pre_execution_cancellation_evidence() {
     assert!(retained.observation_id.is_none());
 
     assert_offer_rejected_without_cleanup(&mut manager, offer("bh"), environment_unavailable());
+}
+
+#[tokio::test]
+async fn cancellation_before_continuation_ready_releases_the_claim_without_an_ack() {
+    let workflow =
+        "schemaVersion: 1\nsteps:\n  check:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n";
+    let (_temporary, mut manager) = manager_fixture(workflow);
+    let offered = offer("bp");
+    let prepare = prepare_for(&manager, &offered);
+    let deadline = PreparationDeadline::from_wire(
+        &prepare.preparation_expires_at,
+        manager.sleeper.utc_now(),
+        manager.sleeper.now(),
+    )
+    .unwrap();
+    let work_root = Arc::clone(&manager.work_root);
+    let offer_for_claim = offered.clone();
+    let (root, claim_path) = tokio::task::spawn_blocking(move || {
+        let prior_assignment = "asn_01k0z6r1w8f4jy2m7q9v3x5abn";
+        let prior_attempt = "atm_01k0z6r1w8f4jy2m7q9v3x5abn";
+        let previous = work_root
+            .create_assignment_for_attempt(
+                prior_assignment,
+                &offer_for_claim.run_id,
+                prior_attempt,
+                None,
+            )
+            .unwrap();
+        AssignmentProcessGuards::durable(&previous.private).unwrap();
+        let previous_path = previous.workspace.path();
+        assert_eq!(
+            previous
+                .release_pending(
+                    ProcessQuiescence::Proven,
+                    WorkspaceDisposition::Retain(RetentionReason::Failed),
+                )
+                .wait(),
+            CleanupResult::Retained
+        );
+        let mut root = work_root
+            .create_assignment_for_attempt(
+                &offer_for_claim.assignment_id,
+                &offer_for_claim.run_id,
+                &offer_for_claim.attempt_id,
+                None,
+            )
+            .unwrap();
+        work_root
+            .claim_retained_for_attempt(
+                &mut root,
+                super::super::workspace::RetainedClaimRequest {
+                    assignment_id: &offer_for_claim.assignment_id,
+                    run_id: &offer_for_claim.run_id,
+                    attempt_id: &offer_for_claim.attempt_id,
+                    prior_assignment_id: prior_assignment,
+                    prior_attempt_id: prior_attempt,
+                    recorded_root: &previous_path,
+                },
+            )
+            .unwrap();
+        (
+            root,
+            previous_path
+                .parent()
+                .unwrap()
+                .join(".scherzo-runner-serve-claim-v1"),
+        )
+    })
+    .await
+    .unwrap();
+    assert!(claim_path.exists());
+
+    let cancellation = CaptureCancellation::default();
+    manager.slot = Some(LocalSlot::Preparing(Box::new(PreparingAssignment {
+        offer: offered.clone(),
+        cancellation: cancellation.clone(),
+        root_preparation: None,
+        root: None, // The preparation worker owns the claimed root until it reports.
+        prepare_effect_id: Some(prepare.effect_id.clone()),
+        preparation_event: None,
+    })));
+    let id = manager
+        .outbox
+        .enqueue(AssignmentObservation::ContinuationReady {
+            assignment_id: offered.assignment_id.clone(),
+            attempt_id: offered.attempt_id.clone(),
+            start_snapshot: json!({"algorithm": "git_worktree_sha256_v1", "unavailable": "git_unavailable"}),
+            quiescence: json!({"groupsRecorded": 0, "groupsTerminated": 0, "groupsAbsent": 0, "provenAt": NOW}),
+            modified: json!("unknown"),
+        })
+        .unwrap();
+    let outbox = manager.outbox.clone();
+    let sleeper = Arc::clone(&manager.sleeper);
+    let sender = manager.event_sender.clone();
+    let wake = manager.outbox.clone();
+    let (waiting, waiting_rx) = tokio::sync::oneshot::channel();
+    let worker_offer = offered.clone();
+    let worker = tokio::spawn(async move {
+        let wait =
+            outbox.wait_for_continuation_ready(id, deadline, &cancellation, sleeper.as_ref());
+        tokio::pin!(wait);
+        assert!(
+            std::future::poll_fn(|cx| {
+                std::task::Poll::Ready(std::future::Future::poll(wait.as_mut(), cx).is_pending())
+            })
+            .await
+        );
+        let _ = waiting.send(());
+        let decline = wait
+            .await
+            .expect_err("unacknowledged readiness must be cancelled");
+        sender
+            .send(ManagerEvent::Prepared {
+                offer: Box::new(worker_offer),
+                prepare_effect_id: prepare.effect_id,
+                deadline,
+                admission: Box::new(Err(Box::new((root, decline)))),
+            })
+            .unwrap();
+        wake.wake();
+    });
+    with_watchdog(waiting_rx).await.unwrap().unwrap();
+    manager.finish_transport(); // No ACK even on the disconnected transport.
+    manager
+        .handle_cancel(cancel_for(&offered, CancellationMode::Graceful, "bq"))
+        .unwrap();
+    with_watchdog(worker).await.unwrap().unwrap();
+    with_watchdog(wait_for_manager_state(&mut manager, |manager| {
+        manager.drain_events();
+        manager.slot.is_none()
+    }))
+    .await
+    .unwrap();
+    assert!(!claim_path.exists());
+    assert!(!manager.cleanup_failed);
+    assert_eq!(cancellation_applications(&mut manager).len(), 1);
 }
 
 #[tokio::test]

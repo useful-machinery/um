@@ -55,6 +55,13 @@ pub(in crate::service) fn nonnegative(value: i64) -> Result<u64, WelcomePolicyFa
 pub(in crate::service) fn validate_execution_spec(
     execution_spec: &ExecutionSpecV1RunnerProjection,
 ) -> Result<(), AssignmentDecline> {
+    validate_effective_spec(execution_spec, false)
+}
+
+pub(in crate::service) fn validate_effective_spec(
+    execution_spec: &ExecutionSpecV1RunnerProjection,
+    continuation: bool,
+) -> Result<(), AssignmentDecline> {
     if !matches!(execution_spec.schema_version, 1 | 2) {
         return Err(AssignmentDecline::ExecutionSpecInvalid(
             ExecutionSpecInvalidReason::UnsupportedSchemaVersion,
@@ -108,7 +115,12 @@ pub(in crate::service) fn validate_execution_spec(
         || primary.materialization_contract != "git_full_clone_v1"
         || !valid_workflow_connection
         || !valid_primary_connection
-        || !validate_source_identity_pair(workflow, primary)
+        || (if continuation {
+            workflow.repository_connection_id != primary.repository_connection_id
+                || workflow.object_format != primary.object_format
+        } else {
+            !validate_source_identity_pair(workflow, primary)
+        })
         || !lowercase_hex(&workflow.commit_oid, SHA1_HEX_CHARACTERS)
         || !lowercase_hex(&primary.commit_oid, SHA1_HEX_CHARACTERS)
         || !valid_path

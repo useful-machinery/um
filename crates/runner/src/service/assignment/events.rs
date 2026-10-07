@@ -113,7 +113,20 @@ impl AssignmentManager {
                             }
                             if !preparing.cancellation.is_cancelled() {
                                 let offer = preparing.offer;
-                                let response = rejected(&offer, environment_unavailable());
+                                let decline = match (&offer.continuation, error) {
+                                    (Some(_), AssignmentRootCreationError::OwnershipUnproven) => {
+                                        AssignmentDecline::RunnerUnable(
+                                            RunnerUnableReason::OwnershipUnproven,
+                                        )
+                                    }
+                                    (Some(_), AssignmentRootCreationError::Unavailable) => {
+                                        AssignmentDecline::RunnerUnable(
+                                            RunnerUnableReason::RetainedWorkspaceUnavailable,
+                                        )
+                                    }
+                                    _ => environment_unavailable(),
+                                };
+                                let response = rejected(&offer, decline);
                                 if let Err(failure) = self.retain_decision(offer, response) {
                                     self.lease_clock_failed |=
                                         failure == AssignmentManagerFailure::LeaseClock;
@@ -650,7 +663,23 @@ impl AssignmentManager {
         &self,
         offer: &AssignmentOffer,
     ) -> Result<(), AssignmentDecline> {
-        validate_execution_spec(&offer.execution_spec)
+        if offer.continuation.is_some() {
+            validate_effective_spec(&offer.execution_spec, true)?;
+        } else {
+            validate_execution_spec(&offer.execution_spec)?;
+        }
+        if let Some(continuation) = &offer.continuation
+            && (continuation.definition_source != offer.execution_spec.workflow_definition_source
+                || continuation.effective_capacity != offer.execution_spec.capacity)
+        {
+            return Err(AssignmentDecline::ExecutionSpecInvalid(
+                ExecutionSpecInvalidReason::WorkflowSourceDigestMismatch,
+            ));
+        }
+        // The continuation root preparer authenticates the pinned retained
+        // workspace before preparation; an ordinary offer must never substitute
+        // its fresh execution tree for this requested baseline.
+        Ok(())
     }
 
     pub(super) fn admission_runtime(&self) -> AdmissionRuntime {
@@ -668,6 +697,7 @@ impl AssignmentManager {
             guard_processes: self.guard_processes,
             recorder: self.recorder.clone(),
             preparation_event,
+            work_root: Arc::clone(&self.work_root),
         }
     }
 

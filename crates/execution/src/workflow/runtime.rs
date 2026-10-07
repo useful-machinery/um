@@ -3739,14 +3739,21 @@ where
         .map(|(name, source)| {
             let step = state.steps.get(&source.step)?;
             let value = match &step.state {
-                StepState::Succeeded { outputs }
-                | StepState::Inherited {
+                StepState::Succeeded { outputs } => ExportValue::Available {
+                    output: outputs.get(&source.output)?.clone(),
+                },
+                StepState::Inherited {
                     disposition: InheritedDisposition::Succeeded,
                     outputs,
                     ..
-                } => ExportValue::Available {
-                    output: outputs.get(&source.output)?.clone(),
-                },
+                } => outputs.get(&source.output).map_or(
+                    ExportValue::Unavailable {
+                        reason: ExportUnavailableReason::Failed,
+                    },
+                    |output| ExportValue::Available {
+                        output: output.clone(),
+                    },
+                ),
                 StepState::Inherited {
                     disposition: InheritedDisposition::Skipped,
                     ..

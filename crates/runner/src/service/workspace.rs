@@ -17,12 +17,18 @@ use rustix::fs::{
 };
 use rustix::io::{Errno, fcntl_dupfd_cloexec};
 
+use super::execution::{AssignmentProcessGuards, RetainedQuiescence};
 use super::workflow_git::{WorkflowGitAuthority, WorkflowGitTeardownReport};
-use um_execution::{RemovalError, open_directory_at, open_regular_file_at, remove_open_tree_at};
+use um_execution::{
+    CloudContinuationSnapshot, RemovalError, open_directory_at, open_regular_file_at,
+    remove_open_tree_at,
+};
 
 const LOCK_FILE_NAME: &str = ".scherzo-runner-serve.lock";
 const OWNERSHIP_MARKER_NAME: &str = ".scherzo-runner-serve-owner-v1";
 const ATTEMPT_RECORD_NAME: &str = ".scherzo-runner-serve-attempt-v1";
+const CLAIM_RECORD_NAME: &str = ".scherzo-runner-serve-claim-v1";
+const RETAINED_PARENT_NAME: &str = ".scherzo-runner-serve-retained-parent-v1";
 const ATTEMPT_RECORD_STAGING_PREFIX: &str = ".scherzo-runner-serve-attempt-staging-";
 const ATTEMPT_RECORD_HEADER: &str = "scherzo-runner-serve/attempt/v1";
 const CLEANUP_AUTHORITY_PREFIX: &str = ".scherzo-runner-serve-cleanup-v1-";
@@ -175,6 +181,7 @@ impl std::error::Error for WorkRootError {}
 pub(super) enum AssignmentRootCreationError {
     Unavailable,
     CleanupFailed,
+    OwnershipUnproven,
 }
 
 pub(super) trait TreeRemover: Send + Sync {
@@ -736,6 +743,13 @@ struct CleanupEngine {
     serialized: Arc<Mutex<()>>,
 }
 
+fn claim_absent_at(directory: &OwnedFd) -> bool {
+    matches!(
+        statat(directory, CLAIM_RECORD_NAME, AtFlags::SYMLINK_NOFOLLOW),
+        Err(rustix::io::Errno::NOENT)
+    )
+}
+
 impl CleanupEngine {
     fn remove(&self, tree: &OwnedTree) -> CleanupResult {
         let _serialized = self
@@ -744,6 +758,18 @@ impl CleanupEngine {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if self.cancellation.is_cancelled() {
             return CleanupResult::Preempted;
+        }
+        // Both direct assignment cleanup and workspace-only cleanup must refuse
+        // a retained workspace while another assignment holds its durable claim.
+        // An inaccessible parent is a safety failure, not absence of a claim.
+        if let Some(link) = tree.link()
+            && (link
+                .directory
+                .as_ref()
+                .is_some_and(|directory| !claim_absent_at(directory.as_ref()))
+                || !claim_absent_at(link.parent.as_ref()))
+        {
+            return CleanupResult::Quarantined(CleanupFailure::Safety);
         }
         let proof = match CleanupAuthorityProof::create(
             &self.authority,
@@ -1255,6 +1281,55 @@ fn unknown_retained_root(path: &Path) -> RetainedWorkspace {
     }
 }
 
+pub(super) struct RetainedClaimRequest<'a> {
+    pub(super) assignment_id: &'a str,
+    pub(super) run_id: &'a str,
+    pub(super) attempt_id: &'a str,
+    pub(super) prior_assignment_id: &'a str,
+    pub(super) prior_attempt_id: &'a str,
+    pub(super) recorded_root: &'a Path,
+}
+
+#[derive(Clone)]
+struct RetainedClaim {
+    assignment: OwnedTree,
+    file: Arc<File>,
+    owner: String,
+    released: Arc<AtomicBool>,
+}
+
+impl RetainedClaim {
+    fn release(&self) -> Result<(), ()> {
+        if self.released.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        if !matches!(self.assignment.validate(false)?, TreePresence::Present) {
+            return Err(());
+        }
+        let directory = self.assignment.directory()?;
+        let named = statat(
+            directory.as_ref(),
+            CLAIM_RECORD_NAME,
+            AtFlags::SYMLINK_NOFOLLOW,
+        )
+        .map_err(|_| ())?;
+        let held = fstat(self.file.as_ref()).map_err(|_| ())?;
+        if named.st_dev != held.st_dev
+            || named.st_ino != held.st_ino
+            || !safe_private_file_stat(&named)
+            || read_private_record_at(directory.as_ref(), CLAIM_RECORD_NAME, 128)?
+                != self.owner.as_bytes()
+        {
+            return Err(());
+        }
+        rustix::fs::unlinkat(directory.as_ref(), CLAIM_RECORD_NAME, AtFlags::empty())
+            .map_err(|_| ())?;
+        sync_directory(directory.as_ref())?;
+        self.released.store(true, Ordering::Release);
+        Ok(())
+    }
+}
+
 pub(super) struct WorkRootLease {
     boot_tree: OwnedTree,
     engine: CleanupEngine,
@@ -1426,6 +1501,12 @@ impl WorkRootLease {
             private: PrivateStaging { path: private_path },
             workspace: WorkspaceLease::new(workspace_tree, self.engine.clone()),
             workflow_git: None,
+            claim: None,
+            retained_quiescence: None,
+            continuation_snapshot: None,
+            continuation_proven_at: None,
+            settlement_snapshot: None,
+            retained_private_roots: std::collections::BTreeMap::new(),
             attempt_record,
             recorder,
             retained: Arc::clone(&self.retained),
@@ -1440,6 +1521,223 @@ impl WorkRootLease {
                 completion: ReleaseCompletion::new(),
             }),
         })
+    }
+
+    /// Only the current boot can adopt one of its own fenced, retained
+    /// assignments. The recorded path is compared before opening any prior
+    /// evidence; the previous guard journal is never reopened for an ordinary
+    /// new assignment. This runs on the blocking root-preparation worker.
+    pub(super) fn claim_retained_for_attempt(
+        &self,
+        root: &mut AssignmentRoot,
+        request: RetainedClaimRequest<'_>,
+    ) -> Result<RetainedQuiescence, AssignmentRootCreationError> {
+        let RetainedClaimRequest {
+            assignment_id,
+            run_id,
+            attempt_id,
+            prior_assignment_id,
+            prior_attempt_id,
+            recorded_root,
+        } = request;
+        if !um_runner_protocol::valid_assignment_id(prior_assignment_id)
+            || !um_runner_protocol::valid_assignment_id(assignment_id)
+            || root.attempt_record.assignment_id != assignment_id
+            || root.attempt_record.run_id != run_id
+            || root.attempt_record.attempt_id != attempt_id
+            || assignment_id == prior_assignment_id
+        {
+            return Err(AssignmentRootCreationError::OwnershipUnproven);
+        }
+        let mut cursor = prior_assignment_id.to_owned();
+        let mut visited = std::collections::BTreeSet::new();
+        let mut history = Vec::new();
+        let anchor = loop {
+            if !visited.insert(cursor.clone()) || visited.len() > 256 {
+                return Err(AssignmentRootCreationError::OwnershipUnproven);
+            }
+            let mut tree =
+                OwnedTree::capture_child(&self.boot_tree, self.boot_tree.path.join(&cursor))
+                    .map_err(|_| AssignmentRootCreationError::OwnershipUnproven)?;
+            let marker = MarkerProof::capture(
+                Arc::clone(
+                    tree.directory()
+                        .map_err(|_| AssignmentRootCreationError::OwnershipUnproven)?,
+                ),
+                ASSIGNMENT_MARKER,
+            )
+            .map_err(|_| AssignmentRootCreationError::OwnershipUnproven)?;
+            tree.install_marker(marker);
+            if !matches!(tree.validate(false), Ok(TreePresence::Present)) {
+                return Err(AssignmentRootCreationError::OwnershipUnproven);
+            }
+            let directory = tree
+                .directory()
+                .map_err(|_| AssignmentRootCreationError::OwnershipUnproven)?;
+            let record = read_attempt_record_at(directory.as_ref())
+                .map_err(|_| AssignmentRootCreationError::OwnershipUnproven)?;
+            if record.assignment_id != cursor
+                || record.run_id != run_id
+                || (cursor == prior_assignment_id && record.attempt_id != prior_attempt_id)
+            {
+                return Err(AssignmentRootCreationError::OwnershipUnproven);
+            }
+            let next = match statat(
+                directory.as_ref(),
+                RETAINED_PARENT_NAME,
+                AtFlags::SYMLINK_NOFOLLOW,
+            ) {
+                Err(rustix::io::Errno::NOENT) => None,
+                Ok(_) => {
+                    let bytes =
+                        read_private_record_at(directory.as_ref(), RETAINED_PARENT_NAME, 32)
+                            .map_err(|_| AssignmentRootCreationError::OwnershipUnproven)?;
+                    let name = std::str::from_utf8(&bytes)
+                        .map_err(|_| AssignmentRootCreationError::OwnershipUnproven)?;
+                    if !um_runner_protocol::valid_assignment_id(name) {
+                        return Err(AssignmentRootCreationError::OwnershipUnproven);
+                    }
+                    Some(name.to_owned())
+                }
+                Err(_) => return Err(AssignmentRootCreationError::OwnershipUnproven),
+            };
+            history.push(tree.clone());
+            match next {
+                Some(parent) => cursor = parent,
+                None => break tree,
+            }
+        };
+        let workspace_path = anchor.path.join("workspace");
+        if workspace_path != recorded_root {
+            return Err(AssignmentRootCreationError::OwnershipUnproven);
+        }
+        let mut workspace = OwnedTree::capture_child(&anchor, workspace_path.clone())
+            .map_err(|_| AssignmentRootCreationError::OwnershipUnproven)?;
+        workspace.install_marker(
+            MarkerProof::capture(
+                Arc::clone(
+                    anchor
+                        .directory()
+                        .map_err(|_| AssignmentRootCreationError::OwnershipUnproven)?,
+                ),
+                ASSIGNMENT_MARKER,
+            )
+            .map_err(|_| AssignmentRootCreationError::OwnershipUnproven)?,
+        );
+        if !matches!(workspace.validate(false), Ok(TreePresence::Present)) {
+            return Err(AssignmentRootCreationError::OwnershipUnproven);
+        }
+        let guards = history
+            .iter()
+            .map(|tree| {
+                AssignmentProcessGuards::recover(&tree.path.join("private"))
+                    .map_err(|_| AssignmentRootCreationError::OwnershipUnproven)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let proof = AssignmentProcessGuards::quiesce_retained_chain(&guards)
+            .map_err(|_| AssignmentRootCreationError::OwnershipUnproven)?;
+        // Exclusive creation is durable before any snapshot or credential work.
+        let directory = anchor
+            .directory()
+            .map_err(|_| AssignmentRootCreationError::OwnershipUnproven)?;
+        let mut claim_file = File::from(
+            openat(
+                directory.as_ref(),
+                CLAIM_RECORD_NAME,
+                OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::RUSR | Mode::WUSR,
+            )
+            .map_err(|_| AssignmentRootCreationError::OwnershipUnproven)?,
+        );
+        // The exclusive file is already visible. On an incomplete write, remove
+        // only the file we just created; a competing claimant must never mistake
+        // its partial contents for a valid claim. Once the owner bytes exist,
+        // transfer cleanup responsibility before either sync can fail.
+        if claim_file.write_all(assignment_id.as_bytes()).is_err() {
+            let named = statat(
+                directory.as_ref(),
+                CLAIM_RECORD_NAME,
+                AtFlags::SYMLINK_NOFOLLOW,
+            );
+            let held = fstat(&claim_file);
+            if matches!((named, held), (Ok(named), Ok(held)) if named.st_dev == held.st_dev && named.st_ino == held.st_ino)
+            {
+                let _ =
+                    rustix::fs::unlinkat(directory.as_ref(), CLAIM_RECORD_NAME, AtFlags::empty());
+                let _ = sync_directory(directory.as_ref());
+            }
+            return Err(AssignmentRootCreationError::OwnershipUnproven);
+        }
+        // Even a failed fsync leaves a named, possibly durable exclusive claim.
+        // Failed admission cleanup must release that exact file, not leave an
+        // orphan that blocks every subsequent continuation on this boot.
+        root.claim = Some(RetainedClaim {
+            assignment: anchor.clone(),
+            file: Arc::new(claim_file),
+            owner: assignment_id.to_owned(),
+            released: Arc::new(AtomicBool::new(false)),
+        });
+        root.claim
+            .as_ref()
+            .ok_or(AssignmentRootCreationError::OwnershipUnproven)?
+            .file
+            .sync_all()
+            .map_err(|_| AssignmentRootCreationError::OwnershipUnproven)?;
+        sync_directory(directory.as_ref())
+            .map_err(|_| AssignmentRootCreationError::OwnershipUnproven)?;
+        if !matches!(workspace.validate(false), Ok(TreePresence::Present)) {
+            return Err(AssignmentRootCreationError::OwnershipUnproven);
+        }
+        // The new assignment owns private evidence but executes in the prior
+        // workspace. Remove only its newly allocated empty directory.
+        let empty_workspace = root.workspace.clone();
+        if empty_workspace
+            .release_pending(ProcessQuiescence::Proven)
+            .wait()
+            != CleanupResult::Released
+        {
+            return Err(AssignmentRootCreationError::CleanupFailed);
+        }
+        root.workspace = WorkspaceLease::new(workspace, self.engine.clone());
+        root.execution = workspace_path;
+        root.retained_quiescence = Some(proof);
+        root.retained_private_roots = history
+            .iter()
+            .map(|tree| {
+                let record = read_attempt_record_at(
+                    tree.directory()
+                        .map_err(|_| AssignmentRootCreationError::OwnershipUnproven)?
+                        .as_ref(),
+                )
+                .map_err(|_| AssignmentRootCreationError::OwnershipUnproven)?;
+                Ok((record.attempt_id, tree.path.join("private")))
+            })
+            .collect::<Result<_, AssignmentRootCreationError>>()?;
+        let (parent_record, _) = create_record_staging(
+            root.assignment_tree
+                .directory()
+                .map_err(|_| AssignmentRootCreationError::CleanupFailed)?
+                .as_ref(),
+            ".retained-parent-staging-",
+            prior_assignment_id.as_bytes(),
+            32,
+        )
+        .map_err(|_| AssignmentRootCreationError::CleanupFailed)?;
+        let root_directory = root
+            .assignment_tree
+            .directory()
+            .map_err(|_| AssignmentRootCreationError::CleanupFailed)?;
+        renameat_with(
+            root_directory.as_ref(),
+            &parent_record,
+            root_directory.as_ref(),
+            RETAINED_PARENT_NAME,
+            RenameFlags::NOREPLACE,
+        )
+        .map_err(|_| AssignmentRootCreationError::CleanupFailed)?;
+        sync_directory(root_directory.as_ref())
+            .map_err(|_| AssignmentRootCreationError::CleanupFailed)?;
+        Ok(proof)
     }
 
     #[cfg(test)]
@@ -1486,6 +1784,10 @@ impl WorkRootLease {
 
     pub(super) fn startup_retained(&self) -> &[RetainedWorkspace] {
         &self.startup_retained
+    }
+
+    pub(super) fn boot_id(&self) -> Option<&str> {
+        self.boot_tree.path.file_name()?.to_str()
     }
 
     #[cfg(test)]
@@ -1891,6 +2193,12 @@ pub(super) struct AssignmentRoot {
     pub(super) private: PrivateStaging,
     pub(super) workspace: WorkspaceLease,
     workflow_git: Option<WorkflowGitAuthority>,
+    claim: Option<RetainedClaim>,
+    pub(super) retained_quiescence: Option<RetainedQuiescence>,
+    pub(super) continuation_snapshot: Option<CloudContinuationSnapshot>,
+    pub(super) continuation_proven_at: Option<String>,
+    pub(super) settlement_snapshot: Option<serde_json::Value>,
+    pub(super) retained_private_roots: std::collections::BTreeMap<String, PathBuf>,
     attempt_record: AttemptRecord,
     recorder: Option<Arc<crate::telemetry::Recorder>>,
     retained: Arc<AtomicBool>,
@@ -1901,12 +2209,15 @@ pub(super) struct AssignmentRoot {
 }
 
 impl AssignmentRoot {
-    pub(super) fn retention_report_identity(&self) -> Option<(String, String, String, String)> {
+    pub(super) fn retention_report_identity(
+        &self,
+    ) -> Option<(String, String, String, String, Option<serde_json::Value>)> {
         Some((
             self.attempt_record.assignment_id.clone(),
             self.attempt_record.attempt_id.clone(),
             self.attempt_record.run_id.clone(),
             self.execution.to_str()?.to_owned(),
+            self.settlement_snapshot.clone(),
         ))
     }
 
@@ -1935,6 +2246,7 @@ impl AssignmentRoot {
         let authority = self.workflow_git.clone();
         let worker_authority = authority.clone();
         let workspace = self.workspace.clone();
+        let claim = self.claim.clone();
         let completion = self.workspace_release.completion.clone();
         let worker_completion = completion.clone();
         let assignment_tree = self.assignment_tree.clone();
@@ -1949,6 +2261,12 @@ impl AssignmentRoot {
                         authority.teardown(quiescence)
                     });
                 let disposition = effective_disposition(disposition, quiescence, &report);
+                let claim_released = claim.as_ref().is_none_or(|claim| claim.release().is_ok());
+                let disposition = if claim_released {
+                    disposition
+                } else {
+                    WorkspaceDisposition::Retain(RetentionReason::ReleaseWorkerUnavailable)
+                };
                 let result = match disposition {
                     WorkspaceDisposition::Remove => {
                         let result = workspace.release_pending(quiescence).wait();
@@ -2449,6 +2767,194 @@ mod tests {
         child
     }
 
+    fn retained_failed_assignment(owner: &WorkRootLease) -> (AssignmentRoot, PathBuf) {
+        let previous = owner.create_assignment(ASSIGNMENT).unwrap();
+        let previous_path = previous.workspace.path();
+        AssignmentProcessGuards::durable(&previous.private).unwrap();
+        assert_eq!(
+            previous
+                .release_pending(
+                    ProcessQuiescence::Proven,
+                    WorkspaceDisposition::Retain(RetentionReason::Failed),
+                )
+                .wait(),
+            CleanupResult::Retained
+        );
+        (previous, previous_path)
+    }
+
+    #[test]
+    fn failed_post_claim_admission_releases_ownership_at_settlement() {
+        let directory = private_work_root();
+        let remover = ScriptedRemover::new([RemovalOutcome::Error; REMOVAL_DELAYS.len() + 1]);
+        let owner = WorkRootLease::acquire_with(
+            directory.path(),
+            BOOT_A,
+            filesystem(
+                remover,
+                Arc::new(RecordingSleeper::default()),
+                Arc::new(NoopWorkRootHook),
+            ),
+        )
+        .unwrap();
+        let (_previous, previous_path) = retained_failed_assignment(&owner);
+        let next = "asn_01k0z6r1w8f4jy2m7q9v3x5abd";
+        let mut claimant = owner
+            .create_assignment_for_attempt(
+                next,
+                "run_01k0z6r1w8f4jy2m7q9v3x5abc",
+                "atm_01k0z6r1w8f4jy2m7q9v3x5abd",
+                None,
+            )
+            .unwrap();
+        assert!(matches!(
+            owner.claim_retained_for_attempt(
+                &mut claimant,
+                RetainedClaimRequest {
+                    assignment_id: next,
+                    run_id: "run_01k0z6r1w8f4jy2m7q9v3x5abc",
+                    attempt_id: "atm_01k0z6r1w8f4jy2m7q9v3x5abd",
+                    prior_assignment_id: ASSIGNMENT,
+                    prior_attempt_id: "atm_01k0z6r1w8f4jy2m7q9v3x5abc",
+                    recorded_root: &previous_path,
+                }
+            ),
+            Err(AssignmentRootCreationError::CleanupFailed)
+        ));
+        let claim_path = directory
+            .path()
+            .join(BOOT_A)
+            .join(ASSIGNMENT)
+            .join(CLAIM_RECORD_NAME);
+        assert!(claim_path.exists());
+        assert_eq!(
+            claimant
+                .release_pending(
+                    ProcessQuiescence::Proven,
+                    WorkspaceDisposition::Retain(RetentionReason::Failed),
+                )
+                .wait(),
+            CleanupResult::Quarantined(CleanupFailure::OrdinaryRemovalExhausted)
+        );
+        assert!(!claim_path.exists());
+        assert!(previous_path.is_dir());
+    }
+
+    #[test]
+    fn retained_claim_requires_exact_identity_and_excludes_a_second_owner() {
+        let directory = private_work_root();
+        let owner = WorkRootLease::acquire_for_test(directory.path(), BOOT_A).unwrap();
+        let (previous, previous_path) = retained_failed_assignment(&owner);
+        let next = "asn_01k0z6r1w8f4jy2m7q9v3x5abd";
+        let next_attempt = "atm_01k0z6r1w8f4jy2m7q9v3x5abd";
+        let request = |recorded_root| RetainedClaimRequest {
+            assignment_id: next,
+            run_id: "run_01k0z6r1w8f4jy2m7q9v3x5abc",
+            attempt_id: next_attempt,
+            prior_assignment_id: ASSIGNMENT,
+            prior_attempt_id: "atm_01k0z6r1w8f4jy2m7q9v3x5abc",
+            recorded_root,
+        };
+        let mut claimed = owner
+            .create_assignment_for_attempt(
+                next,
+                "run_01k0z6r1w8f4jy2m7q9v3x5abc",
+                next_attempt,
+                None,
+            )
+            .unwrap();
+        let wrong_root = directory.path().join("other");
+        assert!(matches!(
+            owner.claim_retained_for_attempt(&mut claimed, request(&wrong_root)),
+            Err(AssignmentRootCreationError::OwnershipUnproven)
+        ));
+        let other_root = private_work_root();
+        let other_boot = WorkRootLease::acquire_for_test(other_root.path(), BOOT_A).unwrap();
+        let mut foreign = other_boot
+            .create_assignment_for_attempt(
+                next,
+                "run_01k0z6r1w8f4jy2m7q9v3x5abc",
+                next_attempt,
+                None,
+            )
+            .unwrap();
+        assert!(matches!(
+            other_boot.claim_retained_for_attempt(&mut foreign, request(&previous_path)),
+            Err(AssignmentRootCreationError::OwnershipUnproven)
+        ));
+        let proof = owner
+            .claim_retained_for_attempt(&mut claimed, request(&previous_path))
+            .expect("claim exact retained workspace");
+        assert_eq!((proof.recorded, proof.absent, proof.terminated), (0, 0, 0));
+        assert_eq!(claimed.execution, previous_path);
+        AssignmentProcessGuards::durable(&claimed.private).expect("next guard journal");
+        assert_eq!(
+            owner.engine.remove(&previous.assignment_tree),
+            CleanupResult::Quarantined(CleanupFailure::Safety),
+        );
+        let mut competing = owner
+            .create_assignment_for_attempt(
+                "asn_01k0z6r1w8f4jy2m7q9v3x5abe",
+                "run_01k0z6r1w8f4jy2m7q9v3x5abc",
+                "atm_01k0z6r1w8f4jy2m7q9v3x5abe",
+                None,
+            )
+            .unwrap();
+        assert!(matches!(
+            owner.claim_retained_for_attempt(
+                &mut competing,
+                RetainedClaimRequest {
+                    assignment_id: "asn_01k0z6r1w8f4jy2m7q9v3x5abe",
+                    ..request(&previous_path)
+                }
+            ),
+            Err(AssignmentRootCreationError::OwnershipUnproven)
+        ));
+        assert_eq!(
+            claimed
+                .release_pending(
+                    ProcessQuiescence::Proven,
+                    WorkspaceDisposition::Retain(RetentionReason::Failed),
+                )
+                .wait(),
+            CleanupResult::Retained,
+        );
+        assert!(
+            !directory
+                .path()
+                .join(BOOT_A)
+                .join(ASSIGNMENT)
+                .join(CLAIM_RECORD_NAME)
+                .exists()
+        );
+        assert!(previous_path.is_dir());
+        let proof = owner
+            .claim_retained_for_attempt(
+                &mut competing,
+                RetainedClaimRequest {
+                    assignment_id: "asn_01k0z6r1w8f4jy2m7q9v3x5abe",
+                    run_id: "run_01k0z6r1w8f4jy2m7q9v3x5abc",
+                    attempt_id: "atm_01k0z6r1w8f4jy2m7q9v3x5abe",
+                    prior_assignment_id: next,
+                    prior_attempt_id: next_attempt,
+                    recorded_root: &previous_path,
+                },
+            )
+            .expect("claim via immediate predecessor");
+        assert_eq!(competing.execution, previous_path);
+        assert_eq!(proof.recorded, 0);
+        assert_eq!(
+            competing
+                .release_pending(
+                    ProcessQuiescence::Proven,
+                    WorkspaceDisposition::Retain(RetentionReason::Failed)
+                )
+                .wait(),
+            CleanupResult::Retained
+        );
+        assert!(previous_path.is_dir());
+    }
+
     #[test]
     fn contention_precedes_enumeration_and_independent_roots_remain_usable() {
         let shared = private_work_root();
@@ -2748,9 +3254,38 @@ mod tests {
                 assignment_id: Some(ASSIGNMENT.to_owned()),
                 run_id: Some("run_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned()),
                 attempt_id: Some("atm_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned()),
-                path: workspace,
+                path: workspace.clone(),
                 reason: RetentionReason::Failed,
             }]
+        );
+        // A new boot may enumerate the old bytes for diagnostics, but cannot
+        // claim or clean them even with the correct path and IDs.
+        let next = "asn_01k0z6r1w8f4jy2m7q9v3x5abd";
+        let mut candidate = second
+            .create_assignment_for_attempt(
+                next,
+                "run_01k0z6r1w8f4jy2m7q9v3x5abc",
+                "atm_01k0z6r1w8f4jy2m7q9v3x5abd",
+                None,
+            )
+            .unwrap();
+        assert!(matches!(
+            second.claim_retained_for_attempt(
+                &mut candidate,
+                RetainedClaimRequest {
+                    assignment_id: next,
+                    run_id: "run_01k0z6r1w8f4jy2m7q9v3x5abc",
+                    attempt_id: "atm_01k0z6r1w8f4jy2m7q9v3x5abd",
+                    prior_assignment_id: ASSIGNMENT,
+                    prior_attempt_id: "atm_01k0z6r1w8f4jy2m7q9v3x5abc",
+                    recorded_root: &workspace,
+                }
+            ),
+            Err(AssignmentRootCreationError::OwnershipUnproven)
+        ));
+        assert_eq!(
+            fs::read(workspace.join("tracked")).unwrap(),
+            b"dirty tracked\n"
         );
     }
 
@@ -2786,6 +3321,8 @@ mod tests {
                 broker: super::super::source::test_support::unavailable_source_broker(),
                 assignment_id: ASSIGNMENT,
                 origin: Arc::from("https://github.example/acme/private.git"),
+                replace_origin: false,
+                previous_private_root: None,
                 workspace: &workspace,
                 private_root: assignment.private.path(),
                 environment: &environment,

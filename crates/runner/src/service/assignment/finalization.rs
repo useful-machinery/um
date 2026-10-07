@@ -111,7 +111,7 @@ impl AssignmentManager {
         match result {
             CleanupResult::Released | CleanupResult::Retained => {
                 if result == CleanupResult::Retained
-                    && let Some((assignment_id, attempt_id, run_id, execution_root)) =
+                    && let Some((assignment_id, attempt_id, run_id, execution_root, snapshot)) =
                         releasing.retention_report.as_ref()
                     && self
                         .outbox
@@ -121,6 +121,7 @@ impl AssignmentManager {
                             run_id: run_id.clone(),
                             execution_root: execution_root.clone(),
                             state: "retained".to_owned(),
+                            settlement_snapshot: snapshot.clone(),
                         })
                         .is_err()
                 {

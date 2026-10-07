@@ -1262,6 +1262,265 @@ fn retained_output_carriers_are_verified_and_orphans_are_removed() {
     ));
 }
 
+#[tokio::test]
+async fn cloud_continuation_recovers_unexported_output_across_three_attempts() {
+    let fixture = AdmittedFixture::from_source(
+        "schemaVersion: 1\nsteps:\n  first:\n    kind: cmd\n    command: {argv: [\"true\"]}\n    outputs:\n      message: {kind: text, from: path, path: message.txt}\n      unused: {kind: text, from: path, path: unused.txt}\n  second:\n    kind: cmd\n    inputs:\n      prompt: {ref: outputs.first.message}\n    command: {argv: [\"/bin/sh\", \"-c\", \"IFS= read -r value < \\\"$UM_STEP_INPUTS/values/prompt\\\" || exit 1; printf '%s\\\\n' \\\"$value\\\" > consumed.txt\"]}\n",
+    );
+    let root = fixture.run_path("cloud-private-chain");
+    fs::create_dir_all(&root).unwrap();
+    // The clean suite deliberately aliases TMPDIR through a symlink; the
+    // engine-bound context requires a physical, no-symlink absolute path.
+    let root = fs::canonicalize(root).unwrap();
+    let private1 = root.join("first");
+    let private2 = root.join("second");
+    fs::create_dir(&private1).unwrap();
+    fs::create_dir(&private2).unwrap();
+    let artifacts = ArtifactStaging::create(fixture.admitted.execution(), &private1).unwrap();
+    let attempt1 = "atm_01k0z6r1w8f4jy2m7q9v3x5abc";
+    let attempt2 = "atm_01k0z6r1w8f4jy2m7q9v3x5abd";
+    let output = BTreeMap::from([
+        (
+            "message".to_owned(),
+            CapturedValue::text(Arc::from("unexported evidence\n")),
+        ),
+        (
+            "unused".to_owned(),
+            CapturedValue::text(Arc::from("unused\n")),
+        ),
+    ]);
+    let first: crate::workflow::execution::WorkflowExecutionResult =
+        crate::workflow::execution::WorkflowExecutionResult {
+            outcome: crate::workflow::runtime::RunOutcome::Succeeded,
+            steps: BTreeMap::from([(
+                "first".to_owned(),
+                crate::workflow::runtime::StepState::Succeeded { outputs: output },
+            )]),
+            recoveries: BTreeMap::new(),
+            output_producers: BTreeMap::new(),
+            finalization_summary: None,
+            force_abort: None,
+            exports: BTreeMap::new(),
+            provenance: fixture.admitted.workflow().source.clone(),
+            content_digest: fixture.admitted.workflow().content_digest.clone(),
+        };
+    retain_cloud_workflow_evidence(&private1, attempt1, 1, &first, &artifacts).unwrap();
+    let mut roots = BTreeMap::from([(attempt1.to_owned(), private1.clone())]);
+    let inherited = vec![serde_json::json!({
+        "id":"first", "priorState":"succeeded", "definitionChanged": false,
+    })];
+    let reexecuted = vec!["second".to_owned()];
+    let consumed = load_cloud_continuation_seed(
+        &fixture.admitted,
+        &artifacts,
+        &roots,
+        attempt1,
+        1,
+        &inherited,
+        &reexecuted,
+    )
+    .unwrap();
+    assert_eq!(consumed.inherited_step("first").unwrap().outputs.len(), 1);
+    // B inherits A but does not read either output. C first consumes A.
+    let second = load_cloud_continuation_seed(
+        &fixture.admitted,
+        &artifacts,
+        &roots,
+        attempt1,
+        1,
+        &inherited,
+        &[],
+    )
+    .unwrap();
+    let first_seed = second.inherited_step("first").unwrap();
+    assert!(first_seed.outputs.is_empty());
+    assert!(first_seed.producers.is_empty());
+    let second_result: crate::workflow::execution::WorkflowExecutionResult =
+        crate::workflow::execution::WorkflowExecutionResult {
+            outcome: crate::workflow::runtime::RunOutcome::Succeeded,
+            steps: BTreeMap::from([(
+                "first".to_owned(),
+                crate::workflow::runtime::StepState::Inherited {
+                    detail: first_seed.detail.clone(),
+                    disposition: first_seed.disposition,
+                    outputs: first_seed.outputs.clone(),
+                },
+            )]),
+            recoveries: BTreeMap::new(),
+            output_producers: BTreeMap::new(),
+            finalization_summary: None,
+            force_abort: None,
+            exports: BTreeMap::new(),
+            provenance: fixture.admitted.workflow().source.clone(),
+            content_digest: fixture.admitted.workflow().content_digest.clone(),
+        };
+    retain_cloud_continuation_evidence(
+        &private2,
+        attempt2,
+        2,
+        &second_result,
+        &artifacts,
+        Some((&private1, attempt1, 1)),
+    )
+    .unwrap();
+    roots.insert(attempt2.to_owned(), private2.clone());
+    let third = load_cloud_continuation_seed(
+        &fixture.admitted,
+        &artifacts,
+        &roots,
+        attempt2,
+        2,
+        &[serde_json::json!({"id":"first","priorState":"inherited","definitionChanged":false})],
+        &reexecuted,
+    )
+    .unwrap();
+    let third_seed = third.inherited_step("first").unwrap();
+    assert_eq!(third_seed.producers["message"].attempt_id, attempt1);
+    assert!(matches!(third_seed.outputs.get("message"),
+        Some(CapturedValue::Text(value)) if value.as_str() == "unexported evidence\n"));
+    assert!(
+        fixture
+            .admitted
+            .execution()
+            .environment()
+            .variable(std::ffi::OsStr::new("UM_CONTINUATION_CONTEXT"))
+            .is_none()
+    );
+    let digest = super::super::publication::DigestV1 {
+        algorithm: "sha256".into(),
+        value: "a".repeat(64),
+    };
+    let record = super::super::publication::cloud_continuation_record(
+        serde_json::json!({"fromSteps":["second"],"definition":"inherited"}),
+        reexecuted.clone(),
+        vec![serde_json::json!({"id":"first","priorState":"inherited","definitionChanged":false})],
+        digest.clone(), digest,
+        super::super::publication::CloudContinuationEvidence {
+            execution_root: "/retained/workspace".into(),
+            prior_execution_root: "/retained/workspace".into(),
+            start_snapshot: serde_json::json!({"algorithm":"git_worktree_sha256_v1","unavailable":"git_unavailable"}),
+            prior_settlement_snapshot: None,
+            modified: serde_json::json!("unknown"),
+            quiescence: serde_json::json!({"groupsRecorded":0,"groupsTerminated":0,
+                "groupsAbsent":0,"provenAt":"2026-08-02T12:01:42Z"}),
+        },
+    ).unwrap();
+    let private3 = root.join("third");
+    fs::create_dir(&private3).unwrap();
+    let bound = bind_cloud_continuation_context(
+        fixture.admitted.clone(),
+        &private3,
+        &record,
+        Some((&private2, attempt2, 2)),
+    )
+    .unwrap();
+    let path = bound
+        .execution()
+        .environment()
+        .variable(std::ffi::OsStr::new("UM_CONTINUATION_CONTEXT"))
+        .unwrap();
+    assert_eq!(
+        bound
+            .execution()
+            .environment()
+            .variable(std::ffi::OsStr::new("SCHERZO_CONTINUATION_CONTEXT")),
+        Some(path)
+    );
+    let context: serde_json::Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+    assert_eq!(
+        context["inheritedOutputs"]["first"]["message"]["attemptId"],
+        attempt1
+    );
+    assert_eq!(
+        context["inheritedOutputs"]["first"]["unused"]["attemptId"],
+        attempt1
+    );
+    let inputs =
+        crate::workflow::input::InputStaging::create(bound.execution(), &private3).unwrap();
+    let execute = |admitted, seed| async {
+        crate::workflow::execution::execute_workflow(
+            admitted,
+            &artifacts,
+            &inputs,
+            &crate::workflow::diagnostic::StepDiagnosticLog::default(),
+            crate::workflow::step_runtime::AgentExecution::disabled(),
+            crate::workflow::test_support::step_clock::TestClock,
+            crate::workflow::execution::NoopCommitPort,
+            crate::workflow::observation::NoopExecutionObserver,
+            crate::workflow::step_runtime::WorkflowExecutionStart::seeded(
+                crate::workflow::process_group::ProcessGuardRegistry::default(),
+                seed,
+            ),
+        )
+        .await
+        .unwrap()
+    };
+    let third_result = execute(bound.clone(), third).await;
+    assert_eq!(
+        third_result.outcome,
+        crate::workflow::runtime::RunOutcome::Succeeded
+    );
+    assert!(matches!(
+        third_result.steps["first"],
+        StepState::Inherited { .. }
+    ));
+    assert!(matches!(
+        third_result.steps["second"],
+        StepState::Succeeded { .. }
+    ));
+    assert_eq!(
+        fs::read(fixture.execution_root.join("consumed.txt")).unwrap(),
+        b"unexported evidence\n"
+    );
+    fs::remove_file(fixture.execution_root.join("consumed.txt")).unwrap();
+    let carrier = private1.join("cloud-retained-v1/values/steps/first/message");
+    fs::set_permissions(&carrier, fs::Permissions::from_mode(0o600)).unwrap();
+    fs::write(&carrier, b"tampered\n").unwrap();
+    let unavailable = load_cloud_continuation_seed(
+        &fixture.admitted,
+        &artifacts,
+        &roots,
+        attempt2,
+        2,
+        &[serde_json::json!({"id":"first","priorState":"inherited","definitionChanged":false})],
+        &reexecuted,
+    )
+    .unwrap();
+    let inherited = unavailable.inherited_step("first").unwrap();
+    assert!(inherited.outputs.is_empty());
+    assert!(inherited.producers.is_empty());
+    let failure = execute(bound.clone(), unavailable).await;
+    assert!(matches!(
+        failure.outcome,
+        crate::workflow::runtime::RunOutcome::Failed { .. }
+    ));
+    assert!(!fixture.execution_root.join("consumed.txt").exists());
+
+    // A protected producer's private directory can become unavailable after
+    // the predecessor retained the reference. Do not reject the admitted
+    // continuation or reexecute the inherited step on that account.
+    roots.remove(attempt1);
+    let missing_producer = load_cloud_continuation_seed(
+        &fixture.admitted,
+        &artifacts,
+        &roots,
+        attempt2,
+        2,
+        &[serde_json::json!({"id":"first","priorState":"inherited","definitionChanged":false})],
+        &reexecuted,
+    )
+    .unwrap();
+    let inherited = missing_producer.inherited_step("first").unwrap();
+    assert!(inherited.outputs.is_empty());
+    assert!(inherited.producers.is_empty());
+    let missing = execute(bound, missing_producer).await;
+    assert!(matches!(
+        missing.outcome,
+        crate::workflow::runtime::RunOutcome::Failed { .. }
+    ));
+    assert!(!fixture.execution_root.join("consumed.txt").exists());
+}
+
 #[test]
 fn inherited_seed_loads_required_values_and_preserves_full_durable_references() {
     let fixture = AdmittedFixture::from_source(

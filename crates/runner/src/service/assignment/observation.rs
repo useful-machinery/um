@@ -242,6 +242,13 @@ pub(in crate::service) enum AssignmentObservation {
         preparation_sequence: u64,
         phase: String,
     },
+    ContinuationReady {
+        assignment_id: String,
+        attempt_id: String,
+        start_snapshot: Value,
+        quiescence: Value,
+        modified: Value,
+    },
     Decision(AssignmentDecision),
     CancellationApplied(AssignmentCancellationApplication),
     LeaseRenewalRequested {
@@ -260,6 +267,7 @@ pub(in crate::service) enum AssignmentObservation {
         run_id: String,
         execution_root: String,
         state: String,
+        settlement_snapshot: Option<serde_json::Value>,
     },
     Artifact {
         delivery_id: u64,
@@ -271,7 +279,8 @@ impl AssignmentObservation {
     pub(in crate::service) fn assignment_id(&self) -> &str {
         match self {
             Self::Preparing { assignment_id, .. }
-            | Self::PreparationProgress { assignment_id, .. } => assignment_id,
+            | Self::PreparationProgress { assignment_id, .. }
+            | Self::ContinuationReady { assignment_id, .. } => assignment_id,
             Self::Decision(decision) => decision.assignment_id(),
             Self::CancellationApplied(application) => &application.assignment_id,
             Self::LeaseRenewalRequested { assignment_id, .. }
@@ -313,6 +322,20 @@ impl AssignmentObservation {
                 preparation_sequence: *preparation_sequence,
                 phase: phase.clone(),
             },
+            Self::ContinuationReady {
+                assignment_id,
+                attempt_id,
+                start_snapshot,
+                quiescence,
+                modified,
+            } => RunnerFrame::ContinuationReady {
+                envelope,
+                assignment_id: assignment_id.clone(),
+                attempt_id: attempt_id.clone(),
+                start_snapshot: start_snapshot.clone(),
+                quiescence: quiescence.clone(),
+                modified: modified.clone(),
+            },
             Self::Decision(decision) => decision.runner_frame(envelope),
             Self::CancellationApplied(application) => RunnerFrame::AssignmentCancellationApplied {
                 envelope,
@@ -345,6 +368,7 @@ impl AssignmentObservation {
                 run_id,
                 execution_root,
                 state,
+                settlement_snapshot,
             } => RunnerFrame::WorkspaceRetentionReport {
                 envelope,
                 assignment_id: assignment_id.clone(),
@@ -352,6 +376,7 @@ impl AssignmentObservation {
                 run_id: run_id.clone(),
                 execution_root: execution_root.clone(),
                 state: state.clone(),
+                settlement_snapshot: settlement_snapshot.clone(),
             },
             Self::Artifact { request, .. } => request.runner_frame(envelope),
         }

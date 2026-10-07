@@ -90,6 +90,45 @@ impl WorkspaceSnapshotV1 {
     }
 }
 
+/// Cloud preparation runs on the runner's blocking preparation worker, after
+/// the retained directory is claimed and before any replacement source or
+/// credential helper is installed. An unavailable snapshot is evidence, not
+/// permission to substitute a null snapshot.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CloudContinuationSnapshot {
+    pub start_snapshot: serde_json::Value,
+    pub modified: serde_json::Value,
+}
+
+pub fn capture_cloud_continuation_snapshot(
+    execution_root: &Path,
+    prior_settlement: Option<&serde_json::Value>,
+) -> Result<CloudContinuationSnapshot, serde_json::Error> {
+    let start = capture_start_snapshot(execution_root);
+    let previous = prior_settlement.and_then(|value| {
+        serde_json::from_value::<WorkspaceSnapshotV1>(value.clone())
+            .ok()
+            .filter(|snapshot| snapshot.validate(true))
+    });
+    let modified =
+        compare_continuation_snapshots(execution_root, execution_root, &start, previous.as_ref());
+    Ok(CloudContinuationSnapshot {
+        start_snapshot: serde_json::to_value(start)?,
+        modified: serde_json::to_value(modified)?,
+    })
+}
+
+/// The execution owner records its own post-finalization snapshot even when
+/// portable publication fails. Snapshotting runs on a blocking worker.
+pub fn capture_cloud_settlement_snapshot(
+    execution_root: &Path,
+) -> Result<serde_json::Value, serde_json::Error> {
+    serde_json::to_value(capture_settlement_snapshot(
+        execution_root,
+        WorkspaceSnapshotSettlementV1::Engine,
+    ))
+}
+
 pub(super) fn capture_start_snapshot(execution_root: &Path) -> WorkspaceSnapshotV1 {
     capture_with(
         execution_root,
@@ -719,6 +758,22 @@ mod tests {
             compare_continuation_snapshots(repo.path(), repo.path(), &start, None),
             unknown
         );
+    }
+
+    #[test]
+    fn cloud_preparation_records_unavailable_snapshot_instead_of_missing_evidence() {
+        let prior = serde_json::to_value(capture_settlement_snapshot(
+            Path::new("/cloud-snapshot-fixture-missing"),
+            WorkspaceSnapshotSettlementV1::Engine,
+        ))
+        .unwrap();
+        let observed = capture_cloud_continuation_snapshot(
+            Path::new("/cloud-snapshot-fixture-missing"),
+            Some(&prior),
+        )
+        .unwrap();
+        assert!(observed.start_snapshot["unavailable"].is_string());
+        assert_eq!(observed.modified, serde_json::json!("unknown"));
     }
 
     #[test]

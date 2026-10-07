@@ -39,13 +39,13 @@ use um_execution::{
     valid_condition_capacity,
 };
 use um_runner_protocol::{
-    AssignmentDecline, CancellationApplicationDisposition, CancellationMode, ExecutionLeaseGrant,
-    ExecutionLeasePolicy, ExecutionSpecInvalidReason, ExecutionSpecV1RunnerProjection,
-    MAXIMUM_CONDITION_TRANSITION_FRAME_BYTES, MAXIMUM_ORDINARY_FRAME_BYTES,
-    MAXIMUM_TERMINAL_FRAME_BYTES, PrimaryWorkspaceSourceV1RunnerProjection, RunnerEnvelope,
-    RunnerFrame, RunnerUnableReason, SourceDisplaySnapshotV1RunnerProjection,
-    WorkflowDefinitionSourceV1RunnerProjection, encode_runner_frame,
-    is_condition_evidence_workflow_event,
+    AssignmentDecline, CancellationApplicationDisposition, CancellationMode, ContinuationOffer,
+    ExecutionLeaseGrant, ExecutionLeasePolicy, ExecutionSpecInvalidReason,
+    ExecutionSpecV1RunnerProjection, MAXIMUM_CONDITION_TRANSITION_FRAME_BYTES,
+    MAXIMUM_ORDINARY_FRAME_BYTES, MAXIMUM_TERMINAL_FRAME_BYTES,
+    PrimaryWorkspaceSourceV1RunnerProjection, RunnerEnvelope, RunnerFrame, RunnerUnableReason,
+    SourceDisplaySnapshotV1RunnerProjection, WorkflowDefinitionSourceV1RunnerProjection,
+    encode_runner_frame, is_condition_evidence_workflow_event,
 };
 
 mod admission;
@@ -81,6 +81,7 @@ pub(super) struct AssignmentOffer {
     pub(super) attempt_id: String,
     pub(super) attempt_number: u64,
     pub(super) execution_spec: ExecutionSpecV1RunnerProjection,
+    pub(super) continuation: Option<Box<ContinuationOffer>>,
 }
 
 pub(super) trait AssignmentRootPreparer: Send + Sync {
@@ -97,6 +98,9 @@ impl AssignmentRootPreparer for WorkRootLease {
         offer: &AssignmentOffer,
         recorder: Option<Arc<crate::telemetry::Recorder>>,
     ) -> Result<AssignmentRoot, AssignmentRootCreationError> {
+        // An offer only allocates the new assignment's private directory.
+        // A retained root may be inspected and claimed only after the bounded
+        // assignment-prepare command, never merely upon receiving an offer.
         self.create_assignment_for_attempt(
             &offer.assignment_id,
             &offer.run_id,
@@ -176,6 +180,7 @@ impl AssignmentIdentity {
 pub(super) struct AcceptedAssignment {
     identity: AssignmentIdentity,
     pub(super) attempt_number: u64,
+    pub(super) continuation: Option<Box<ContinuationOffer>>,
     pub(super) root: AssignmentRoot,
     pub(super) admitted: AdmittedWorkflow,
     pub(super) transition_budget: usize,
@@ -447,7 +452,7 @@ enum ReleaseAfter {
 struct ReleasingAssignment {
     assignment_id: String,
     after: ReleaseAfter,
-    retention_report: Option<(String, String, String, String)>,
+    retention_report: Option<(String, String, String, String, Option<serde_json::Value>)>,
 }
 
 enum LocalSlot {
@@ -531,6 +536,7 @@ struct AdmissionRuntime {
     guard_processes: bool,
     recorder: Option<Arc<crate::telemetry::Recorder>>,
     preparation_event: Option<TelemetryEvent>,
+    work_root: Arc<WorkRootLease>,
 }
 
 impl AdmissionRuntime {
@@ -600,14 +606,23 @@ impl AdmissionRuntime {
         let Some(workflow_git) = root.workflow_git() else {
             return Err(Box::new((root, environment_unavailable())));
         };
+        let process_guards = if self.guard_processes {
+            match AssignmentProcessGuards::durable(&root.private) {
+                Ok(guards) => guards,
+                Err(_) => return Err(Box::new((root, environment_unavailable()))),
+            }
+        } else {
+            AssignmentProcessGuards::new()
+        };
         Ok(AcceptedAssignment {
             identity: AssignmentIdentity::from_offer(offer),
             attempt_number: offer.attempt_number,
+            continuation: offer.continuation.clone(),
             root,
             admitted,
             transition_budget,
             execution_version: Arc::clone(&self.execution_version),
-            process_guards: AssignmentProcessGuards::new(),
+            process_guards,
             guard_processes: self.guard_processes,
             workflow_git,
         })
@@ -1431,9 +1446,11 @@ fn rejected(offer: &AssignmentOffer, decline: AssignmentDecline) -> AssignmentDe
 fn same_assignment(left: &AssignmentOffer, right: &AssignmentOffer) -> bool {
     left.assignment_id == right.assignment_id
         && left.run_id == right.run_id
+        && left.project_id == right.project_id
         && left.attempt_id == right.attempt_id
         && left.attempt_number == right.attempt_number
         && left.execution_spec == right.execution_spec
+        && left.continuation == right.continuation
 }
 
 fn start_matches_offer(start: &AssignmentStart, offer: &AssignmentOffer) -> bool {

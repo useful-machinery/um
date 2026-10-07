@@ -20,6 +20,9 @@
       "$ref": "#/$defs/RunnerAssignmentPreparationProgress"
     },
     {
+      "$ref": "#/$defs/RunnerContinuationReady"
+    },
+    {
       "$ref": "#/$defs/RunnerAssignmentAccepted"
     },
     {
@@ -563,7 +566,9 @@
         "execution_environment_unavailable",
         "source_service_unavailable",
         "input_service_unavailable",
-        "workflow_environment_unsupported"
+        "workflow_environment_unsupported",
+        "ownership_unproven",
+        "retained_workspace_unavailable"
       ]
     },
     "ExecutionSpecInvalidReason": {
@@ -752,7 +757,22 @@
                 "attemptId": {"$ref": "#/$defs/attemptId"},
                 "runId": {"$ref": "#/$defs/runId"},
                 "executionRoot": {"type": "string", "pattern": "^/", "maxLength": 4096},
-                "state": {"enum": ["retained", "removed"]}
+                "state": {"enum": ["retained", "removed"]},
+                "settlementSnapshot": {
+                  "type": "object", "additionalProperties": false,
+                  "properties": {
+                    "algorithm": {"const": "git_worktree_sha256_v1"},
+                    "value": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+                    "takenAt": {"$ref": "#/$defs/utcTimestamp"},
+                    "unavailable": {"enum": ["git_unavailable", "git_output_limit_exceeded", "not_work_tree", "execution_root_not_work_tree_root", "entry_limit_exceeded", "content_limit_exceeded", "gitlink", "unsupported_entry", "io_unavailable", "mutation_around_read"]},
+                    "settledBy": {"const": "engine"}
+                  },
+                  "required": ["algorithm", "settledBy"],
+                  "oneOf": [
+                    {"required": ["value", "takenAt"]},
+                    {"required": ["unavailable"]}
+                  ]
+                }
               },
               "required": ["assignmentId", "attemptId", "runId", "executionRoot", "state"]
             }
@@ -859,6 +879,51 @@
             }
           }
         }
+      ],
+      "unevaluatedProperties": false
+    },
+    "RunnerContinuationReady": {
+      "allOf": [
+        { "$ref": "#/$defs/RunnerEnvelope" },
+        { "properties": {
+          "type": { "const": "continuation_ready" },
+          "payload": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "assignmentId": { "$ref": "#/$defs/assignmentId" },
+              "attemptId": { "$ref": "#/$defs/attemptId" },
+              "startSnapshot": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "algorithm": { "const": "git_worktree_sha256_v1" },
+                  "value": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+                  "takenAt": { "$ref": "#/$defs/utcTimestamp" },
+                  "unavailable": { "enum": ["git_unavailable", "git_output_limit_exceeded", "not_work_tree", "execution_root_not_work_tree_root", "entry_limit_exceeded", "content_limit_exceeded", "gitlink", "unsupported_entry", "io_unavailable", "mutation_around_read"] }
+                },
+                "required": ["algorithm"],
+                "oneOf": [
+                  { "required": ["value", "takenAt"] },
+                  { "required": ["unavailable"] }
+                ]
+              },
+              "quiescence": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "groupsRecorded": { "type": "integer", "minimum": 0 },
+                  "groupsTerminated": { "type": "integer", "minimum": 0 },
+                  "groupsAbsent": { "type": "integer", "minimum": 0 },
+                  "provenAt": { "$ref": "#/$defs/utcTimestamp" }
+                },
+                "required": ["groupsRecorded", "groupsTerminated", "groupsAbsent", "provenAt"]
+              },
+              "modified": { "oneOf": [{ "type": "boolean" }, { "const": "unknown" }] }
+            },
+            "required": ["assignmentId", "attemptId", "startSnapshot", "quiescence", "modified"]
+          }
+        } }
       ],
       "unevaluatedProperties": false
     },
@@ -1133,6 +1198,24 @@
       ],
       "unevaluatedProperties": false
     },
+    "ContinuationOffer": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "priorAssignmentId": { "$ref": "#/$defs/assignmentId" },
+        "priorAttemptId": { "$ref": "#/$defs/attemptId" },
+        "requiredRunnerBootId": { "$ref": "#/$defs/bootId" },
+        "executionRoot": { "type": "string", "minLength": 1 },
+        "definitionSource": { "$ref": "#/$defs/WorkflowDefinitionSource" },
+        "effectiveCapacity": { "$ref": "#/$defs/ExecutionCapacity" },
+        "priorManifestDigest": { "$ref": "#/$defs/WorkflowSourceClosureDigest" },
+        "request": { "type": "object" },
+        "reexecutedSteps": { "type": "array", "minItems": 1, "items": { "type": "string" } },
+        "inheritedSteps": { "type": "array", "items": { "type": "object" } },
+        "priorSettlementSnapshot": { "type": ["object", "null"] }
+      },
+      "required": ["priorAssignmentId", "priorAttemptId", "requiredRunnerBootId", "executionRoot", "definitionSource", "effectiveCapacity", "priorManifestDigest", "request", "reexecutedSteps", "inheritedSteps", "priorSettlementSnapshot"]
+    },
     "CloudAssignmentOffer": {
       "allOf": [
         {
@@ -1168,6 +1251,9 @@
                 },
                 "executionSpec": {
                   "$ref": "#/$defs/ExecutionSpec"
+                },
+                "continuation": {
+                  "$ref": "#/$defs/ContinuationOffer"
                 }
               },
               "required": [

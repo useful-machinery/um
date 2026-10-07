@@ -49,6 +49,7 @@ pub enum RunnerFrame {
         run_id: String,
         execution_root: String,
         state: String,
+        settlement_snapshot: Option<serde_json::Value>,
     },
     EffectAcknowledged {
         envelope: RunnerEnvelope,
@@ -66,6 +67,14 @@ pub enum RunnerFrame {
         attempt_id: String,
         preparation_sequence: u64,
         phase: String,
+    },
+    ContinuationReady {
+        envelope: RunnerEnvelope,
+        assignment_id: String,
+        attempt_id: String,
+        start_snapshot: Value,
+        quiescence: Value,
+        modified: Value,
     },
     AssignmentAccepted {
         envelope: RunnerEnvelope,
@@ -175,6 +184,8 @@ pub enum RunnerUnableReason {
     SourceServiceUnavailable,
     InputServiceUnavailable,
     WorkflowEnvironmentUnsupported,
+    OwnershipUnproven,
+    RetainedWorkspaceUnavailable,
 }
 
 impl RunnerUnableReason {
@@ -184,6 +195,8 @@ impl RunnerUnableReason {
             Self::SourceServiceUnavailable => "source_service_unavailable",
             Self::InputServiceUnavailable => "input_service_unavailable",
             Self::WorkflowEnvironmentUnsupported => "workflow_environment_unsupported",
+            Self::OwnershipUnproven => "ownership_unproven",
+            Self::RetainedWorkspaceUnavailable => "retained_workspace_unavailable",
         }
     }
 }
@@ -260,13 +273,15 @@ pub struct ExecutionLimitsV1RunnerProjection {
     pub cancellation_grace_seconds: u64,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct WorkflowSourceClosureDigestV1RunnerProjection {
     pub algorithm: String,
     pub value: String,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct WorkflowDefinitionSourceV1RunnerProjection {
     pub repository_connection_id: String,
     pub object_format: String,
@@ -285,7 +300,8 @@ pub struct PrimaryWorkspaceSourceV1RunnerProjection {
     pub materialization_contract: String,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ExecutionCapacityV1RunnerProjection {
     pub execution_contract: String,
     pub source_closure_digest: WorkflowSourceClosureDigestV1RunnerProjection,
@@ -302,6 +318,7 @@ pub struct ExecutionCapacityV1RunnerProjection {
     pub condition_transition_count: u64,
     pub aggregate_condition_transition_bytes: u64,
     pub terminal_result_structure_bytes: u64,
+    #[serde(default)]
     pub presentation_result_bytes: u64,
     pub portable_result_bytes: u64,
     pub encoded_outbox_bytes: u64,
@@ -338,6 +355,25 @@ pub struct ExecutionSpecV1RunnerProjection {
     pub source_display_snapshot: Option<SourceDisplaySnapshotV1RunnerProjection>,
     pub capacity: ExecutionCapacityV1RunnerProjection,
     pub run_inputs: Option<RunInputProjectionV1>,
+}
+
+/// The pinned continuation evidence is carried separately from the immutable
+/// run execution specification. The runner verifies its source and capacity
+/// against the resolved closure before it accepts an assignment.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ContinuationOffer {
+    pub prior_assignment_id: String,
+    pub prior_attempt_id: String,
+    pub required_runner_boot_id: String,
+    pub execution_root: String,
+    pub definition_source: WorkflowDefinitionSourceV1RunnerProjection,
+    pub effective_capacity: ExecutionCapacityV1RunnerProjection,
+    pub prior_manifest_digest: WorkflowSourceClosureDigestV1RunnerProjection,
+    pub request: Value,
+    pub reexecuted_steps: Vec<String>,
+    pub inherited_steps: Vec<Value>,
+    pub prior_settlement_snapshot: Option<Value>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -552,6 +588,7 @@ pub enum CloudFrame {
         attempt_id: String,
         attempt_number: u64,
         execution_spec: Box<ExecutionSpecV1RunnerProjection>,
+        continuation: Option<Box<ContinuationOffer>>,
     },
     AssignmentPrepare {
         envelope: CloudEnvelope,
@@ -697,17 +734,20 @@ pub fn encode_runner_frame(frame: &RunnerFrame) -> Result<Vec<u8>, EncodeError> 
             run_id,
             execution_root,
             state,
-        } => runner_frame_value(
-            envelope,
-            "workspace_retention_report",
-            json!({
+            settlement_snapshot,
+        } => {
+            let mut payload = json!({
                 "assignmentId": assignment_id,
                 "attemptId": attempt_id,
                 "runId": run_id,
                 "executionRoot": execution_root,
                 "state": state,
-            }),
-        ),
+            });
+            if let Some(snapshot) = settlement_snapshot {
+                payload["settlementSnapshot"] = snapshot.clone();
+            }
+            runner_frame_value(envelope, "workspace_retention_report", payload)
+        }
         RunnerFrame::EffectAcknowledged {
             envelope,
             effect_id,
@@ -744,6 +784,24 @@ pub fn encode_runner_frame(frame: &RunnerFrame) -> Result<Vec<u8>, EncodeError> 
                 "attemptId": attempt_id,
                 "preparationSequence": preparation_sequence,
                 "phase": phase,
+            }),
+        ),
+        RunnerFrame::ContinuationReady {
+            envelope,
+            assignment_id,
+            attempt_id,
+            start_snapshot,
+            quiescence,
+            modified,
+        } => runner_frame_value(
+            envelope,
+            "continuation_ready",
+            json!({
+                "assignmentId": assignment_id,
+                "attemptId": attempt_id,
+                "startSnapshot": start_snapshot,
+                "quiescence": quiescence,
+                "modified": modified,
             }),
         ),
         RunnerFrame::AssignmentAccepted {
@@ -1091,6 +1149,9 @@ fn decode_frame(bytes: &[u8]) -> Result<ValidatedFrame, DecodeError> {
         generated::RunnerProtocolVersion1::RunnerAssignmentPreparationProgress(frame) => {
             validated_runner_frame!(frame)
         }
+        generated::RunnerProtocolVersion1::RunnerContinuationReady(frame) => {
+            validated_runner_frame!(frame)
+        }
         generated::RunnerProtocolVersion1::RunnerAssignmentAccepted(frame) => {
             validate_runner_frame(
                 &frame.protocol_version,
@@ -1400,6 +1461,19 @@ fn decode_frame(bytes: &[u8]) -> Result<ValidatedFrame, DecodeError> {
                 portable_result_bytes,
                 encoded_outbox_bytes,
             };
+            let continuation = frame
+                .payload
+                .continuation
+                .map(|value| {
+                    serde_json::to_value(value)
+                        .map_err(|_| DecodeError::InvalidFrame("continuation"))
+                        .and_then(|value| {
+                            serde_json::from_value(value)
+                                .map_err(|_| DecodeError::InvalidFrame("continuation"))
+                        })
+                })
+                .transpose()?
+                .map(Box::new);
             Ok(cloud(CloudFrame::AssignmentOffer {
                 envelope,
                 effect_id: frame.payload.effect_id.to_string(),
@@ -1422,6 +1496,7 @@ fn decode_frame(bytes: &[u8]) -> Result<ValidatedFrame, DecodeError> {
                     capacity,
                     run_inputs,
                 }),
+                continuation,
             }))
         }
         generated::RunnerProtocolVersion1::CloudAssignmentPrepare(frame) => {
@@ -1877,6 +1952,13 @@ fn validate_closed_shape(value: &Value) -> Result<(), DecodeError> {
         "assignment_preparation_progress" => {
             &["assignmentId", "attemptId", "preparationSequence", "phase"]
         }
+        "continuation_ready" => &[
+            "assignmentId",
+            "attemptId",
+            "startSnapshot",
+            "quiescence",
+            "modified",
+        ],
         "assignment_accepted" => &["effectId", "assignmentId", "offeredExecutionSpecId"],
         "assignment_rejected" => &["effectId", "assignmentId", "decline"],
         "assignment_cancellation_applied" => &[
@@ -1981,7 +2063,10 @@ fn validate_closed_shape(value: &Value) -> Result<(), DecodeError> {
         "assignment_release" => &["effectId", "assignmentId", "runId", "attemptId", "reason"],
         _ => return Err(DecodeError::InvalidFrame("type")),
     };
-    if payload.len() != payload_keys.len()
+    let continuation = frame_type == "assignment_offer" && payload.contains_key("continuation");
+    let settlement =
+        frame_type == "workspace_retention_report" && payload.contains_key("settlementSnapshot");
+    if payload.len() != payload_keys.len() + usize::from(continuation) + usize::from(settlement)
         || !payload_keys.iter().all(|key| payload.contains_key(*key))
     {
         return Err(DecodeError::InvalidFrame("payload"));
@@ -2099,6 +2184,10 @@ mod tests {
         include_bytes!(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/../../tests/fixtures/runner-protocol/v1/valid/runner-assignment-rejected.json"
+        )),
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/runner-protocol/v1/valid/runner-continuation-ready.json"
         )),
         include_bytes!(concat!(
             env!("CARGO_MANIFEST_DIR"),
@@ -2417,6 +2506,41 @@ mod tests {
     }
 
     #[test]
+    fn retained_workspace_report_carries_only_owner_snapshots() {
+        for settlement_snapshot in [
+            None,
+            Some(json!({
+                "algorithm":"git_worktree_sha256_v1",
+                "value":"a".repeat(64),
+                "takenAt":"2026-10-01T00:00:00Z",
+                "settledBy":"engine"
+            })),
+            Some(json!({
+                "algorithm":"git_worktree_sha256_v1",
+                "unavailable":"io_unavailable",
+                "settledBy":"engine"
+            })),
+        ] {
+            let frame = RunnerFrame::WorkspaceRetentionReport {
+                envelope: maximal_envelope(),
+                assignment_id: "asn_01k0z6r1w8f4jy2m7q9v3x5abh".to_owned(),
+                attempt_id: "atm_01k0z6r1w8f4jy2m7q9v3x5abk".to_owned(),
+                run_id: "run_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned(),
+                execution_root: "/retained/run".to_owned(),
+                state: "retained".to_owned(),
+                settlement_snapshot: settlement_snapshot.clone(),
+            };
+            let encoded = encode_runner_frame(&frame).unwrap();
+            let value: Value = serde_json::from_slice(&encoded).unwrap();
+            assert_eq!(
+                value["payload"].get("settlementSnapshot"),
+                settlement_snapshot.as_ref()
+            );
+            assert!(matches!(decode_frame(&encoded), Ok(ValidatedFrame::Runner)));
+        }
+    }
+
+    #[test]
     fn result_registration_encodes_the_workflow_capacity_range() {
         for size_bytes in [202_027_693, 428_876_460, 1_127_929_176, 1_127_929_177] {
             let frame = RunnerFrame::ArtifactResultRegister {
@@ -2587,6 +2711,52 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn continuation_offer_carries_pinned_evidence_without_changing_an_ordinary_offer() {
+        let mut offer: Value = serde_json::from_slice(include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/runner-protocol/v1/valid/cloud-assignment-offer-source-display.json"
+        )))
+        .unwrap();
+        let original = decode_cloud_frame(&serde_json::to_vec(&offer).unwrap()).unwrap();
+        assert!(matches!(
+            original,
+            CloudFrame::AssignmentOffer {
+                continuation: None,
+                ..
+            }
+        ));
+        offer["payload"]["attemptNumber"] = json!(2);
+        offer["payload"]["continuation"] = json!({
+            "priorAssignmentId": "asn_01k0z6r1w8f4jy2m7q9v3x5abd",
+            "priorAttemptId": "atm_01k0z6r1w8f4jy2m7q9v3x5abd",
+            "requiredRunnerBootId": "rbt_01k0z6r1w8f4jy2m7q9v3x5abc",
+            "executionRoot": "/retained/assignment/workspace",
+            "definitionSource": offer["payload"]["executionSpec"]["workflowDefinitionSource"].clone(),
+            "effectiveCapacity": offer["payload"]["executionSpec"]["capacity"].clone(),
+            "priorManifestDigest": offer["payload"]["executionSpec"]["workflowDefinitionSource"]["workflowSourceClosureDigest"].clone(),
+            "request": {"fromSteps": ["build"], "definition": "inherited"},
+            "reexecutedSteps": ["build"],
+            "inheritedSteps": [],
+            "priorSettlementSnapshot": null,
+        });
+        let _: generated::ContinuationOffer =
+            serde_json::from_value(offer["payload"]["continuation"].clone())
+                .expect("canonical continuation payload");
+        let decoded = decode_cloud_frame(&serde_json::to_vec(&offer).unwrap())
+            .expect("versioned continuation offer");
+        assert!(matches!(
+            decoded,
+            CloudFrame::AssignmentOffer {
+                attempt_number: 2,
+                continuation: Some(_),
+                ..
+            }
+        ));
+        offer["payload"]["continuation"]["unrecognizedClaim"] = json!(true);
+        assert!(decode_cloud_frame(&serde_json::to_vec(&offer).unwrap()).is_err());
     }
 
     #[test]

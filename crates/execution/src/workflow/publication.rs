@@ -127,6 +127,74 @@ pub struct ContinuationRecordV1 {
     pub(crate) workspace: ContinuationWorkspaceV1,
 }
 
+/// Evidence captured after the authenticated retained-workspace claim and
+/// acknowledged readiness. This is private runner state, not caller input.
+pub struct CloudContinuationEvidence {
+    pub execution_root: String,
+    pub prior_execution_root: String,
+    pub start_snapshot: serde_json::Value,
+    pub prior_settlement_snapshot: Option<serde_json::Value>,
+    pub modified: serde_json::Value,
+    pub quiescence: serde_json::Value,
+}
+
+#[derive(Debug)]
+pub struct CloudContinuationRecordError;
+
+pub fn cloud_continuation_record(
+    request: serde_json::Value,
+    reexecuted_steps: Vec<String>,
+    inherited_steps: Vec<serde_json::Value>,
+    manifest_digest: DigestV1,
+    prior_manifest_digest: DigestV1,
+    evidence: CloudContinuationEvidence,
+) -> Result<ContinuationRecordV1, CloudContinuationRecordError> {
+    let request: ContinuationRequestV1 =
+        serde_json::from_value(request).map_err(|_| CloudContinuationRecordError)?;
+    let from_steps = request.from_steps.clone();
+    let inherited_steps = inherited_steps
+        .into_iter()
+        .map(|step| serde_json::from_value(step).map_err(|_| CloudContinuationRecordError))
+        .collect::<Result<_, _>>()?;
+    let definition_source = match &request.definition {
+        ContinuationRequestedDefinitionV1::Inherited(_) => {
+            ContinuationDefinitionSourceV1::Inherited {
+                manifest_digest,
+                prior_manifest_digest,
+            }
+        }
+        ContinuationRequestedDefinitionV1::Replaced { .. } => {
+            ContinuationDefinitionSourceV1::Replaced {
+                manifest_digest,
+                prior_manifest_digest,
+            }
+        }
+    };
+    let workspace: ContinuationWorkspaceV1 = serde_json::from_value(serde_json::json!({
+        "executionRoot": evidence.execution_root,
+        "priorExecutionRoot": evidence.prior_execution_root,
+        "preparation": "ready",
+        "startSnapshot": evidence.start_snapshot,
+        "priorSettlementSnapshot": evidence.prior_settlement_snapshot,
+        "modified": evidence.modified,
+        "quiescence": evidence.quiescence,
+    }))
+    .map_err(|_| CloudContinuationRecordError)?;
+    let record = ContinuationRecordV1 {
+        request,
+        from_steps,
+        reexecuted_steps,
+        inherited_steps,
+        definition_source,
+        workspace,
+    };
+    if super::result_metadata::validate_continuation_record(&record) {
+        Ok(record)
+    } else {
+        Err(CloudContinuationRecordError)
+    }
+}
+
 impl ContinuationRecordV1 {
     pub fn reexecuted_steps(&self) -> &[String] {
         &self.reexecuted_steps

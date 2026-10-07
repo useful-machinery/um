@@ -26,11 +26,15 @@ impl AuthenticatedProcessGroup {
         })
     }
 
+    pub fn process_group_id(&self) -> i32 {
+        self.process_group.as_raw_pid()
+    }
+
     pub(crate) const fn process_group(&self) -> Pid {
         self.process_group
     }
 
-    pub(crate) fn leader_start_identity(&self) -> &str {
+    pub fn leader_start_identity(&self) -> &str {
         &self.leader_start_identity
     }
 }

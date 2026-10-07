@@ -61,7 +61,7 @@ mod text_fit;
 pub(crate) mod validated;
 pub(crate) mod validation;
 pub(crate) mod value;
-mod workspace_snapshot;
+pub(crate) mod workspace_snapshot;
 
 use std::fmt;
 use std::sync::OnceLock;

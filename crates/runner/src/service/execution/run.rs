@@ -194,6 +194,99 @@ impl ExecutionJob {
             .accepted
             .process_guards
             .registry(self.accepted.guard_processes);
+        let seed = if let Some(continuation) = &self.accepted.continuation {
+            let admitted = self.accepted.admitted.clone();
+            let artifacts = artifacts.clone();
+            let roots = self.accepted.root.retained_private_roots.clone();
+            let prior_id = continuation.prior_attempt_id.clone();
+            let prior_number = self.accepted.attempt_number.saturating_sub(1);
+            let inherited = continuation.inherited_steps.clone();
+            let reexecuted = continuation.reexecuted_steps.clone();
+            match tokio::task::spawn_blocking(move || {
+                load_cloud_continuation_seed(
+                    &admitted,
+                    &artifacts,
+                    &roots,
+                    &prior_id,
+                    prior_number,
+                    &inherited,
+                    &reexecuted,
+                )
+            })
+            .await
+            {
+                Ok(Ok(seed)) => Some(seed),
+                _ => {
+                    return self.execution_environment_lost(
+                        assignment_id,
+                        attempt_id,
+                        "continuation_inherited_evidence_unavailable",
+                        "continuation_execution",
+                    );
+                }
+            }
+        } else {
+            None
+        };
+        // The context belongs to the admitted execution environment, not to
+        // the source workflow or a caller-provided variable. Create it before
+        // any step, recovery handler or finalizer can start.
+        let start = match seed {
+            Some(seed) => {
+                let record = match self.continuation_record() {
+                    Ok(Some(record)) => record,
+                    _ => {
+                        return self.execution_environment_lost(
+                            assignment_id,
+                            attempt_id,
+                            "continuation_context_invalid",
+                            "continuation_execution",
+                        );
+                    }
+                };
+                let admitted = self.accepted.admitted.clone();
+                let private = self.accepted.root.private.path().to_path_buf();
+                let prior = self.accepted.continuation.as_ref().and_then(|offer| {
+                    self.accepted
+                        .root
+                        .retained_private_roots
+                        .get(&offer.prior_attempt_id)
+                        .map(|path| {
+                            (
+                                path.clone(),
+                                offer.prior_attempt_id.clone(),
+                                self.accepted.attempt_number.saturating_sub(1),
+                            )
+                        })
+                });
+                let bound = tokio::task::spawn_blocking(move || {
+                    let admitted = um_execution::bind_cloud_continuation_context(
+                        admitted,
+                        &private,
+                        &record,
+                        prior
+                            .as_ref()
+                            .map(|(path, id, number)| (path.as_path(), id.as_str(), *number)),
+                    )?;
+                    Ok::<_, um_execution::LocalRunDirectoryError>((admitted, seed))
+                })
+                .await;
+                let (admitted, seed) = match bound {
+                    Ok(Ok(bound)) => bound,
+                    _ => {
+                        return self.execution_environment_lost(
+                            assignment_id,
+                            attempt_id,
+                            "continuation_context_unavailable",
+                            "continuation_execution",
+                        );
+                    }
+                };
+                self.accepted.admitted = admitted;
+                WorkflowExecutionStart::seeded(process_guard_registry, seed)
+            }
+            None => WorkflowExecutionStart::initial(process_guard_registry),
+        };
         let execution = if let (Some(agent_staging), Some(diagnostic_sessions)) =
             (&agent_staging, agent_diagnostic_sessions)
         {
@@ -244,7 +337,7 @@ impl ExecutionJob {
                         RunnerExecutionClock,
                         NoopCommitPort,
                         observer.clone(),
-                        process_guard_registry,
+                        start,
                     ),
                     &cancellation,
                     &self.lease_clock,
@@ -277,7 +370,7 @@ impl ExecutionJob {
                         RunnerExecutionClock,
                         NoopCommitPort,
                         observer.clone(),
-                        process_guard_registry,
+                        start,
                     ),
                     &cancellation,
                     &self.lease_clock,
@@ -388,6 +481,67 @@ impl ExecutionJob {
                 .await;
         }
 
+        // Preserve private step outputs (including unexported ones) independently
+        // of the portable result. The next attempt can be offered before any
+        // artifact upload is complete.
+        let retain = tokio::task::spawn_blocking({
+            let private = self.accepted.root.private.path().to_path_buf();
+            let attempt_id = attempt_id.to_owned();
+            let attempt_number = self.accepted.attempt_number;
+            let result = result.clone();
+            let artifacts = artifacts.clone();
+            let prior = self.accepted.continuation.as_ref().and_then(|offer| {
+                self.accepted
+                    .root
+                    .retained_private_roots
+                    .get(&offer.prior_attempt_id)
+                    .map(|path| {
+                        (
+                            path.clone(),
+                            offer.prior_attempt_id.clone(),
+                            attempt_number.saturating_sub(1),
+                        )
+                    })
+            });
+            move || {
+                um_execution::retain_cloud_continuation_evidence(
+                    &private,
+                    &attempt_id,
+                    attempt_number,
+                    &result,
+                    &artifacts,
+                    prior
+                        .as_ref()
+                        .map(|(path, id, number)| (path.as_path(), id.as_str(), *number)),
+                )
+            }
+        })
+        .await;
+        if !matches!(retain, Ok(Ok(()))) {
+            self.collapse(
+                "runner_internal_failure",
+                "continuation_evidence_retention_failed",
+                "continuation_execution",
+            );
+            return self
+                .abort_unless_fenced(
+                    &post_stop_fence,
+                    assignment_id,
+                    attempt_id,
+                    last_sequence,
+                    "runner_internal_failure",
+                )
+                .await;
+        }
+        // The settling owner snapshots after finalizers, before publication can
+        // fail. Keep the snapshot with the retained report even without a set.
+        let execution_root = self.accepted.root.execution.clone();
+        self.accepted.root.settlement_snapshot = tokio::task::spawn_blocking(move || {
+            um_execution::capture_cloud_settlement_snapshot(&execution_root)
+        })
+        .await
+        .ok()
+        .and_then(Result::ok);
         let finished_at = RunnerExecutionClock.now();
         let prepared = match self.runner_result(
             &diagnostics,

@@ -36,22 +36,23 @@ use um_execution::{
     ActionId, ActiveStepInvocation, AdmittedWorkflow, AgentDiagnosticSessionStore, AgentExecution,
     AgentInputStaging, AgentInputStagingFailure, ArtifactStaging, ArtifactStagingFailure,
     AuthenticatedProcessGroup, AuthenticatedSignalResult, CancellationReason, CancellationSource,
-    CloudCarrierBody, CloudExecutionCapacityV1, CloudSourceDisplayRepositoryV1,
-    CloudSourceDisplaySnapshotV1, CoordinationError, CoordinatorClock, DigestV1,
-    DurableProcessGuardStore, ExecutionObservation, ExecutionObserver, FailurePolicy,
-    FinalizationGate, FinalizationSummary, FinalizerResult, ForceAbortEvidence, InputStaging,
-    InputStagingFailure, InvocationAccountingLog, NoopCommitPort, ObservedStepTransition,
-    PreparedCloudWorkflowResult, PrimaryIssue, ProcessGuardRegistry, ProcessGuardStoreError,
-    ProcessIdentityInspector, ProcessIdentityObservation, RecoveryDecisionKind,
-    RecoveryDiagnosticKindV1, RecoveryHandlerActivity, RecoveryHandlerKind,
+    CloudCarrierBody, CloudContinuationEvidence, CloudExecutionCapacityV1,
+    CloudSourceDisplayRepositoryV1, CloudSourceDisplaySnapshotV1, CoordinationError,
+    CoordinatorClock, DigestV1, DurableProcessGuardStore, ExecutionObservation, ExecutionObserver,
+    FailurePolicy, FinalizationGate, FinalizationSummary, FinalizerResult, ForceAbortEvidence,
+    InputStaging, InputStagingFailure, InvocationAccountingLog, NoopCommitPort,
+    ObservedStepTransition, PreparedCloudWorkflowResult, PrimaryIssue, ProcessGuardRegistry,
+    ProcessGuardStoreError, ProcessIdentityInspector, ProcessIdentityObservation,
+    RecoveryDecisionKind, RecoveryDiagnosticKindV1, RecoveryHandlerActivity, RecoveryHandlerKind,
     RecoveryInvocationDiagnosticV1, RecoveryInvocationRoleV1, RecoveryInvocationStateV1,
     RecoveryInvocationUsageV1, RecoveryInvocationV1, RunOutcome, SchedulingGate, StepDiagnostic,
     StepDiagnosticLog, StepFailureCause, StepRecoveryState, StepState, StepStateKind,
     SystemProcessIdentityInspector, TargetExecutionNumber, TransitionEvent, TransitionObservation,
-    ValidatedRecoveryHandler, ValidatedStep, WorkflowExecutionResult, WorkflowNodeRole,
-    WorkflowRunCancellation, WorkflowRunFinalization, WorkflowRunFinalizationCancellation,
-    WorkflowRunId, WorkflowRunResult, WorkflowRunStep, WorkflowRunStepKind, WorkflowRunTiming,
-    WorkflowState, WorkflowStepTiming, command_output_v1, execute_workflow,
+    ValidatedRecoveryHandler, ValidatedStep, WorkflowExecutionResult, WorkflowExecutionStart,
+    WorkflowNodeRole, WorkflowRunCancellation, WorkflowRunFinalization,
+    WorkflowRunFinalizationCancellation, WorkflowRunId, WorkflowRunResult, WorkflowRunStep,
+    WorkflowRunStepKind, WorkflowRunTiming, WorkflowState, WorkflowStepTiming,
+    cloud_continuation_record, command_output_v1, execute_workflow, load_cloud_continuation_seed,
     prepare_cloud_workflow_result, production_agent_dispatcher, step_recovery_summary_v1,
     summary_disposition_matches, terminate_authenticated_process_group,
 };
@@ -70,9 +71,9 @@ mod run;
 
 use lease_supervision::*;
 use observer::*;
-pub(super) use process_guards::AssignmentProcessGuards;
 #[cfg(test)]
 use process_guards::GuardProcessControl;
+pub(super) use process_guards::{AssignmentProcessGuards, RetainedQuiescence};
 use projection::*;
 
 #[derive(Clone)]

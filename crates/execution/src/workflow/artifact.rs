@@ -36,16 +36,31 @@ const IDENTITY_ATTEMPTS: usize = 16;
 #[derive(Clone, Default)]
 pub struct CaptureCancellation {
     cancelled: CancellationFlag,
+    changed: Arc<tokio::sync::Notify>,
     observer: Option<Arc<dyn CaptureBoundaryObserver>>,
 }
 
 impl CaptureCancellation {
     pub fn cancel(&self) {
         self.cancelled.cancel();
+        self.changed.notify_waiters();
     }
 
     pub fn is_cancelled(&self) -> bool {
         self.cancelled.is_cancelled()
+    }
+
+    /// Wait without losing a cancellation between registration and the flag check.
+    pub async fn cancelled(&self) {
+        loop {
+            let notified = self.changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.is_cancelled() {
+                return;
+            }
+            notified.await;
+        }
     }
 
     pub(crate) fn check(&self) -> Result<(), CaptureAttemptFailure> {
@@ -73,6 +88,7 @@ impl CaptureCancellation {
     pub(crate) fn with_observer(observer: Arc<dyn CaptureBoundaryObserver>) -> Self {
         Self {
             cancelled: CancellationFlag::default(),
+            changed: Arc::new(tokio::sync::Notify::new()),
             observer: Some(observer),
         }
     }

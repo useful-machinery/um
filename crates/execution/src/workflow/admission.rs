@@ -755,6 +755,7 @@ fn is_base_workflow_environment_name(name: &OsStr) -> bool {
 
 fn is_engine_reserved_environment_name(name: &OsStr) -> bool {
     name.as_encoded_bytes().starts_with(b"UM_")
+        || name.as_encoded_bytes() == b"SCHERZO_CONTINUATION_CONTEXT"
 }
 
 pub(super) fn is_managed_runner_private_environment_name(name: &OsStr) -> bool {
@@ -1282,10 +1283,17 @@ impl AdmittedWorkflow {
     /// Engine-only binding after the continuation claim, never from caller-supplied
     /// environment (which admission strips as an engine-reserved variable).
     pub(crate) fn with_continuation_context(mut self, path: &Path) -> Self {
-        self.execution.environment = self.execution.environment.with_variable(
-            "UM_CONTINUATION_CONTEXT".into(),
-            path.as_os_str().to_owned(),
-        );
+        self.execution.environment = self
+            .execution
+            .environment
+            .with_variable(
+                "UM_CONTINUATION_CONTEXT".into(),
+                path.as_os_str().to_owned(),
+            )
+            .with_variable(
+                "SCHERZO_CONTINUATION_CONTEXT".into(),
+                path.as_os_str().to_owned(),
+            );
         self
     }
 

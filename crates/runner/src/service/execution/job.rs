@@ -151,9 +151,10 @@ impl ExecutionJob {
         let assignment_id = self.accepted.assignment_id().to_owned();
         let attempt_id = self.accepted.attempt_id().to_owned();
         let run_id = self.accepted.run_id().to_owned();
-        let completion = self
-            .run_workflow(&assignment_id, &attempt_id, &run_id)
-            .await;
+        // Keep the large admitted workflow future off the caller's stack. In
+        // particular a retained continuation carries an inherited seed into
+        // both the enabled and disabled agent execution branches.
+        let completion = Box::pin(self.run_workflow(&assignment_id, &attempt_id, &run_id)).await;
         self.finish_execution(completion).await;
     }
 
@@ -508,10 +509,11 @@ impl ExecutionJob {
         if !states.is_empty() || !recoveries.is_empty() {
             return Err(RunnerResultFailure::new("step_state_unconsumed"));
         }
+        let continuation = self.continuation_record()?;
         Ok(WorkflowRunResult {
             run_directory: self.accepted.root.private.path().to_owned(),
             attempt_number: self.accepted.attempt_number,
-            continuation: None,
+            continuation,
             output_producers: execution.output_producers.into_iter().fold(
                 BTreeMap::new(),
                 |mut producers, ((node, output), producer)| {
@@ -560,6 +562,58 @@ impl ExecutionJob {
             export_sources: workflow.definition.exports.clone(),
             export_presentation: workflow.definition.export_presentation.clone(),
         })
+    }
+
+    pub(super) fn continuation_record(
+        &self,
+    ) -> Result<Option<um_execution::ContinuationRecordV1>, RunnerResultFailure> {
+        self.accepted
+            .continuation
+            .as_ref()
+            .map(|offer| {
+                let root = &self.accepted.root;
+                let snapshot = root
+                    .continuation_snapshot
+                    .as_ref()
+                    .ok_or_else(|| RunnerResultFailure::new("continuation_snapshot_missing"))?;
+                let proof = root
+                    .retained_quiescence
+                    .ok_or_else(|| RunnerResultFailure::new("continuation_quiescence_missing"))?;
+                let proven_at = root
+                    .continuation_proven_at
+                    .as_ref()
+                    .ok_or_else(|| RunnerResultFailure::new("continuation_proof_time_missing"))?;
+                let current_digest = &offer.effective_capacity.source_closure_digest;
+                let prior_digest = &offer.prior_manifest_digest;
+                cloud_continuation_record(
+                    offer.request.clone(),
+                    offer.reexecuted_steps.clone(),
+                    offer.inherited_steps.clone(),
+                    DigestV1 {
+                        algorithm: current_digest.algorithm.clone(),
+                        value: current_digest.value.clone(),
+                    },
+                    DigestV1 {
+                        algorithm: prior_digest.algorithm.clone(),
+                        value: prior_digest.value.clone(),
+                    },
+                    CloudContinuationEvidence {
+                        execution_root: root.execution.to_string_lossy().into_owned(),
+                        prior_execution_root: offer.execution_root.clone(),
+                        start_snapshot: snapshot.start_snapshot.clone(),
+                        prior_settlement_snapshot: offer.prior_settlement_snapshot.clone(),
+                        modified: snapshot.modified.clone(),
+                        quiescence: json!({
+                            "groupsRecorded": proof.recorded,
+                            "groupsTerminated": proof.terminated,
+                            "groupsAbsent": proof.absent,
+                            "provenAt": proven_at,
+                        }),
+                    },
+                )
+                .map_err(|_| RunnerResultFailure::new("continuation_provenance_invalid"))
+            })
+            .transpose()
     }
 
     pub(super) async fn deliver_artifacts(

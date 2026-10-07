@@ -1,0 +1,26 @@
+{
+  "protocolVersion": 1,
+  "direction": "runner_to_cloud",
+  "messageId": "rmsg_01k0z6r1w8f4jy2m7q9v3x5abg",
+  "runnerId": "rnr_01k0z6r1w8f4jy2m7q9v3x5abd",
+  "bootId": "rbt_01k0z6r1w8f4jy2m7q9v3x5abe",
+  "sequence": 3,
+  "sentAt": "2026-07-23T00:00:03Z",
+  "type": "continuation_ready",
+  "payloadVersion": 1,
+  "payload": {
+    "assignmentId": "asn_01k0z6r1w8f4jy2m7q9v3x5abn",
+    "attemptId": "atm_01k0z6r1w8f4jy2m7q9v3x5abp",
+    "startSnapshot": {
+      "algorithm": "git_worktree_sha256_v1",
+      "unavailable": "git_unavailable"
+    },
+    "quiescence": {
+      "groupsRecorded": 2,
+      "groupsTerminated": 1,
+      "groupsAbsent": 1,
+      "provenAt": "2026-07-23T00:00:03Z"
+    },
+    "modified": "unknown"
+  }
+}

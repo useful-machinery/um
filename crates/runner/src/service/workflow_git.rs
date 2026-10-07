@@ -305,6 +305,8 @@ pub(super) struct WorkflowGitInstall<'a> {
     pub(super) broker: Arc<dyn SourceCredentialBroker>,
     pub(super) assignment_id: &'a str,
     pub(super) origin: Arc<str>,
+    pub(super) replace_origin: bool,
+    pub(super) previous_private_root: Option<&'a Path>,
     pub(super) workspace: &'a Path,
     pub(super) private_root: &'a Path,
     pub(super) environment: &'a EnvironmentSnapshot,
@@ -320,6 +322,8 @@ impl WorkflowGitAuthority {
             broker,
             assignment_id,
             origin,
+            replace_origin,
+            previous_private_root,
             workspace,
             private_root,
             environment,
@@ -336,6 +340,15 @@ impl WorkflowGitAuthority {
             || parsed_origin.path().is_empty()
         {
             return Err(anyhow!("workflow Git origin is not credential-free"));
+        }
+        if replace_origin {
+            rewire_continuation_origin(
+                workspace,
+                environment,
+                &origin,
+                previous_private_root,
+                cancellation,
+            )?;
         }
         let helper_path = private_root.join(HELPER_FILE);
         let socket_path = private_root.join(SOCKET_FILE);
@@ -957,6 +970,77 @@ fn write_executable(path: &Path, bytes: &[u8]) -> io::Result<()> {
     file.set_permissions(Permissions::from_mode(0o700))
 }
 
+/// Only rewrite the single runner-owned origin in a real retained Git worktree.
+/// Never trust a substituted .git directory or a second/push remote. The HEAD
+/// and index are left untouched: this changes authority, not the run baseline.
+fn rewire_continuation_origin(
+    workspace: &Path,
+    environment: &EnvironmentSnapshot,
+    origin: &str,
+    previous_private_root: Option<&Path>,
+    cancellation: &CaptureCancellation,
+) -> anyhow::Result<()> {
+    let metadata =
+        fs::symlink_metadata(workspace.join(".git")).context("inspect retained Git metadata")?;
+    if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+        return Err(anyhow!("retained Git metadata is not a directory"));
+    }
+    let remotes = super::source::isolated_git_command(workspace, environment)
+        .args(["remote"])
+        .output()
+        .context("inspect retained Git remotes")?;
+    if !remotes.status.success() || remotes.stdout != b"origin\n" {
+        return Err(anyhow!("retained Git remote ownership is unproven"));
+    }
+    let old = local_config_values(workspace, environment, "remote.origin.url")
+        .ok_or_else(|| anyhow!("cannot inspect retained origin"))?;
+    if old.len() != 1
+        || old[0].is_empty()
+        || !local_config_values(workspace, environment, "remote.origin.pushurl")
+            .is_some_and(|values| values.is_empty())
+        || local_config_values(workspace, environment, "remote.origin.fetch")
+            != Some(vec![b"+refs/heads/*:refs/remotes/origin/*".to_vec()])
+    {
+        return Err(anyhow!("retained origin configuration is unproven"));
+    }
+    let old_url = std::str::from_utf8(&old[0]).context("decode retained origin")?;
+    if old_url != origin {
+        let old_key = format!("credential.{old_url}.helper");
+        let helpers = local_config_values(workspace, environment, &old_key)
+            .ok_or_else(|| anyhow!("cannot inspect retained Git helper"))?;
+        if !helpers.is_empty() {
+            let previous = previous_private_root
+                .ok_or_else(|| anyhow!("retained Git helper ownership is unproven"))?;
+            let expected = format!(
+                "!f() {{ exec {} \"$@\"; }}; f",
+                shell_quote(&previous.join(HELPER_FILE))?
+            );
+            if !unset_injected_local_config(workspace, environment, &old_key, &expected) {
+                return Err(anyhow!("retained Git helper ownership is unproven"));
+            }
+        }
+    }
+    set_local_config(
+        workspace,
+        environment,
+        "remote.origin.url",
+        origin,
+        cancellation,
+    )?;
+    let resolved = super::source::isolated_git_command(workspace, environment)
+        .args(["remote", "get-url", "--all", "origin"])
+        .output()
+        .context("verify retained origin")?;
+    if local_config_values(workspace, environment, "remote.origin.url")
+        != Some(vec![origin.as_bytes().to_vec()])
+        || !resolved.status.success()
+        || resolved.stdout != format!("{origin}\n").as_bytes()
+    {
+        return Err(anyhow!("retained origin replacement was not verified"));
+    }
+    Ok(())
+}
+
 fn set_local_config(
     workspace: &Path,
     environment: &EnvironmentSnapshot,
@@ -1483,6 +1567,8 @@ mod tests {
             broker,
             assignment_id: "asn_01k0z6r1w8f4jy2m7q9v3x5abc",
             origin: Arc::from(FIXTURE_ORIGIN),
+            replace_origin: false,
+            previous_private_root: None,
             workspace: &fixture.workspace,
             private_root: &fixture.private,
             environment: &EnvironmentSnapshot::new([("PATH", std::env::var_os("PATH").unwrap())]),
@@ -1492,6 +1578,161 @@ mod tests {
             cancellation: &CaptureCancellation::default(),
         })
         .unwrap()
+    }
+
+    #[test]
+    fn retained_origin_replacement_preserves_head_and_rejects_extra_remotes() {
+        let fixture = fixture();
+        let git = |args: &[&str]| {
+            Command::new("git")
+                .current_dir(&fixture.workspace)
+                .args(args)
+                .status()
+                .unwrap()
+        };
+        assert!(
+            git(&[
+                "remote",
+                "add",
+                "origin",
+                "https://github.example/old/repo.git"
+            ])
+            .success()
+        );
+        let environment = EnvironmentSnapshot::new([("PATH", std::env::var_os("PATH").unwrap())]);
+        let before = crate::service::source::isolated_git_command(&fixture.workspace, &environment)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap()
+            .stdout;
+        rewire_continuation_origin(
+            &fixture.workspace,
+            &environment,
+            FIXTURE_ORIGIN,
+            None,
+            &CaptureCancellation::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            local_config_values(&fixture.workspace, &environment, "remote.origin.url"),
+            Some(vec![FIXTURE_ORIGIN.as_bytes().to_vec()])
+        );
+        let after = crate::service::source::isolated_git_command(&fixture.workspace, &environment)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap()
+            .stdout;
+        assert_eq!(before, after);
+        assert!(
+            git(&[
+                "remote",
+                "add",
+                "other",
+                "https://github.example/other/repo.git"
+            ])
+            .success()
+        );
+        assert!(
+            rewire_continuation_origin(
+                &fixture.workspace,
+                &environment,
+                "https://github.example/another/repo.git",
+                None,
+                &CaptureCancellation::default()
+            )
+            .is_err()
+        );
+        assert_eq!(
+            local_config_values(&fixture.workspace, &environment, "remote.origin.url"),
+            Some(vec![FIXTURE_ORIGIN.as_bytes().to_vec()])
+        );
+    }
+
+    #[test]
+    fn continued_assignment_installs_new_helper_for_replaced_origin() {
+        let fixture = fixture();
+        assert!(
+            Command::new("git")
+                .current_dir(&fixture.workspace)
+                .args([
+                    "remote",
+                    "add",
+                    "origin",
+                    "https://github.example/old/repo.git"
+                ])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let environment = EnvironmentSnapshot::new([("PATH", std::env::var_os("PATH").unwrap())]);
+        let prior = WorkflowGitAuthority::install(WorkflowGitInstall {
+            broker: fixture_broker([], []),
+            assignment_id: "asn_01k0z6r1w8f4jy2m7q9v3x5abc",
+            origin: Arc::from("https://github.example/old/repo.git"),
+            replace_origin: false,
+            previous_private_root: None,
+            workspace: &fixture.workspace,
+            private_root: &fixture.private,
+            environment: &environment,
+            helper_executable: &test_helper_executable(),
+            clock: Arc::new(crate::service::TokioSleeper),
+            recorder: None,
+            cancellation: &CaptureCancellation::default(),
+        })
+        .unwrap();
+        let old_key = "credential.https://github.example/old/repo.git.helper";
+        assert_eq!(
+            local_config_values(&fixture.workspace, &environment, old_key)
+                .unwrap()
+                .len(),
+            1
+        );
+        let new_private = fixture._temporary.path().join("new-private");
+        fs::create_dir(&new_private).unwrap();
+        let broker = fixture_broker([], []);
+        let authority = WorkflowGitAuthority::install(WorkflowGitInstall {
+            broker,
+            assignment_id: "asn_01k0z6r1w8f4jy2m7q9v3x5abd",
+            origin: Arc::from(FIXTURE_ORIGIN),
+            replace_origin: true,
+            previous_private_root: Some(&fixture.private),
+            workspace: &fixture.workspace,
+            private_root: &new_private,
+            environment: &EnvironmentSnapshot::new([("PATH", std::env::var_os("PATH").unwrap())]),
+            helper_executable: &test_helper_executable(),
+            clock: Arc::new(crate::service::TokioSleeper),
+            recorder: None,
+            cancellation: &CaptureCancellation::default(),
+        })
+        .unwrap();
+        let environment = &authority.inner.environment;
+        assert_eq!(
+            local_config_values(&fixture.workspace, environment, "remote.origin.url"),
+            Some(vec![FIXTURE_ORIGIN.as_bytes().to_vec()])
+        );
+        let scoped = format!("credential.{FIXTURE_ORIGIN}.helper");
+        assert!(
+            local_config_values(&fixture.workspace, environment, old_key)
+                .unwrap()
+                .is_empty()
+        );
+        let helpers = local_config_values(&fixture.workspace, environment, &scoped).unwrap();
+        assert_eq!(helpers.len(), 1);
+        assert!(
+            helpers[0]
+                .windows(new_private.as_os_str().as_encoded_bytes().len())
+                .any(|bytes| bytes == new_private.as_os_str().as_encoded_bytes())
+        );
+        assert!(
+            authority
+                .teardown(ProcessQuiescence::Proven)
+                .local_state_destroyed
+        );
+        assert!(
+            prior
+                .teardown(ProcessQuiescence::Proven)
+                .local_state_destroyed
+        );
     }
 
     fn test_helper_executable() -> PathBuf {

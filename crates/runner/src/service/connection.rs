@@ -179,6 +179,11 @@ impl<'a> ProtocolLog<'a> {
                 None,
                 Some(assignment_id),
             ),
+            RunnerFrame::ContinuationReady {
+                envelope,
+                assignment_id,
+                ..
+            } => (envelope, "continuation_ready", None, Some(assignment_id)),
             RunnerFrame::AssignmentAccepted {
                 envelope,
                 effect_id,
@@ -1399,6 +1404,7 @@ impl BufferedEffect {
                 attempt_id,
                 attempt_number,
                 execution_spec,
+                continuation,
                 ..
             } => {
                 let offer = AssignmentOffer {
@@ -1409,6 +1415,7 @@ impl BufferedEffect {
                     attempt_id,
                     attempt_number,
                     execution_spec: *execution_spec,
+                    continuation,
                 };
                 (
                     effect_id,
@@ -3605,6 +3612,7 @@ mod tests {
             attempt_id,
             attempt_number,
             execution_spec: *execution_spec,
+            continuation: None,
         }
     }
 

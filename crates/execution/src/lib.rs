@@ -84,7 +84,8 @@ pub use workflow::local_run::{
     LocalRetryBeginError, LocalRetryEligibility, LocalRetryOpen, LocalRetryRejection,
     LocalRunStatusSnapshot, LocalStatusError, LocalStatusResult, PendingLocalContinuation,
     PublicationFailurePhaseV1, RetryIneligibilityReason, acquire_local_continuation,
-    acquire_local_retry, read_local_run_status,
+    acquire_local_retry, bind_cloud_continuation_context, load_cloud_continuation_seed,
+    read_local_run_status, retain_cloud_continuation_evidence, retain_cloud_workflow_evidence,
 };
 pub use workflow::observation::{
     ExecutionObservation, ExecutionObserver, ObservedStepTransition, TransitionObservation,
@@ -106,16 +107,16 @@ pub use workflow::process_group::{
     SystemProcessIdentityInspector, terminate_authenticated_process_group,
 };
 pub use workflow::publication::{
-    CloudCarrierBody, CloudExecutionCapacityV1, CloudResultCarrier, CloudSourceDisplayRepositoryV1,
-    CloudSourceDisplaySnapshotV1, ContinuationRecordV1, DigestV1, LocalPublicationError,
-    LocalPublicationPhase, PreparedCloudWorkflowResult, RecoveryDiagnosticKindV1,
-    RecoveryInvocationDiagnosticV1, RecoveryInvocationRoleV1, RecoveryInvocationStateV1,
-    RecoveryInvocationUsageV1, RecoveryInvocationV1, WorkflowResultV1, WorkflowRunCancellation,
-    WorkflowRunFinalization, WorkflowRunFinalizationCancellation, WorkflowRunResult,
-    WorkflowRunStep, WorkflowRunStepKind, WorkflowRunTerminalResultV1, WorkflowRunTiming,
-    WorkflowStepTiming, command_output_v1, prepare_attempt_result_destination,
-    prepare_cloud_workflow_result, publish_prepared_workflow_result, step_recovery_summary_v1,
-    summary_disposition_matches,
+    CloudCarrierBody, CloudContinuationEvidence, CloudExecutionCapacityV1, CloudResultCarrier,
+    CloudSourceDisplayRepositoryV1, CloudSourceDisplaySnapshotV1, ContinuationRecordV1, DigestV1,
+    LocalPublicationError, LocalPublicationPhase, PreparedCloudWorkflowResult,
+    RecoveryDiagnosticKindV1, RecoveryInvocationDiagnosticV1, RecoveryInvocationRoleV1,
+    RecoveryInvocationStateV1, RecoveryInvocationUsageV1, RecoveryInvocationV1, WorkflowResultV1,
+    WorkflowRunCancellation, WorkflowRunFinalization, WorkflowRunFinalizationCancellation,
+    WorkflowRunResult, WorkflowRunStep, WorkflowRunStepKind, WorkflowRunTerminalResultV1,
+    WorkflowRunTiming, WorkflowStepTiming, cloud_continuation_record, command_output_v1,
+    prepare_attempt_result_destination, prepare_cloud_workflow_result,
+    publish_prepared_workflow_result, step_recovery_summary_v1, summary_disposition_matches,
 };
 pub use workflow::rejection::{RejectionDiagnostic, human_resolution_remedy};
 pub use workflow::resolution::{
@@ -152,6 +153,10 @@ pub use workflow::validated::{
     ValidatedHarness, ValidatedRecoveryHandler, ValidatedStep, WorkflowNodeRole, WorkflowValueType,
 };
 pub use workflow::value::CapturedValue;
+pub use workflow::workspace_snapshot::{
+    CloudContinuationSnapshot, capture_cloud_continuation_snapshot,
+    capture_cloud_settlement_snapshot,
+};
 pub use workflow::{
     MAXIMUM_PARALLEL_STEPS, STRUCTURAL_SCHEMA, is_input_name, is_lowercase_hex,
     is_valid_input_display_name, is_valid_media_type, lowercase_hex,

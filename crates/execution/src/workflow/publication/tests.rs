@@ -11,6 +11,65 @@ use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
 use super::*;
+
+#[test]
+fn cloud_continuation_record_requires_claimed_readiness_and_pinned_definition() {
+    let digest = DigestV1 {
+        algorithm: "sha256".into(),
+        value: "a".repeat(64),
+    };
+    let evidence = || CloudContinuationEvidence {
+        execution_root: "/retained/workspace".into(),
+        prior_execution_root: "/retained/workspace".into(),
+        start_snapshot: json!({"algorithm":"git_worktree_sha256_v1","unavailable":"git_unavailable"}),
+        prior_settlement_snapshot: None,
+        modified: json!("unknown"),
+        quiescence: json!({"groupsRecorded":1,"groupsTerminated":1,"groupsAbsent":0,
+            "provenAt":"2026-08-02T12:01:42Z"}),
+    };
+    let request = || json!({"fromSteps":["retry"],"definition":"inherited"});
+    let record = cloud_continuation_record(
+        request(),
+        vec!["retry".into()],
+        vec![json!({"id":"previous","priorState":"succeeded","definitionChanged":false})],
+        digest.clone(),
+        digest.clone(),
+        evidence(),
+    )
+    .unwrap();
+    assert_eq!(record.reexecuted_steps(), &["retry"]);
+    assert_eq!(
+        record.inherited_step_ids().collect::<Vec<_>>(),
+        vec!["previous"]
+    );
+    assert!(
+        cloud_continuation_record(
+            request(),
+            vec!["retry".into()],
+            vec![],
+            DigestV1 {
+                value: "b".repeat(64),
+                ..digest.clone()
+            },
+            digest.clone(),
+            evidence()
+        )
+        .is_err()
+    );
+    let mut invalid = evidence();
+    invalid.quiescence["groupsRecorded"] = json!(2);
+    assert!(
+        cloud_continuation_record(
+            request(),
+            vec!["retry".into()],
+            vec![],
+            digest.clone(),
+            digest,
+            invalid
+        )
+        .is_err()
+    );
+}
 use crate::workflow::admission::{
     CancellationPolicy, CancellationSource, CaptureLimits, EnvironmentSnapshot, ExecutionContext,
     ExecutionPolicyLimits, InputLimits, ResolvedInputs, admit_workflow,

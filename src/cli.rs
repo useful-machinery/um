@@ -2100,7 +2100,7 @@ mod tests {
     }
 
     #[test]
-    fn nested_workflow_result_and_staging_survive_delivery_failure() {
+    fn nested_workflow_delivery_failure_retains_evidence_for_continuations() {
         // The workflow command has an isolated environment. Supply the worker
         // contract to the nested fixture explicitly rather than relying on
         // the test runner's environment surviving the command boundary.

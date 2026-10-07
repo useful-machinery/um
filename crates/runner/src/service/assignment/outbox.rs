@@ -13,6 +13,7 @@ pub(super) struct ObservationEntry {
 pub(super) struct ObservationOutboxState {
     pub(super) entries: VecDeque<ObservationEntry>,
     next_id: u64,
+    acknowledged_ready: BTreeSet<u64>,
 }
 
 #[derive(Clone)]
@@ -28,6 +29,7 @@ impl ObservationOutbox {
             state: Arc::new(Mutex::new(ObservationOutboxState {
                 entries: VecDeque::new(),
                 next_id: 1,
+                acknowledged_ready: BTreeSet::new(),
             })),
             changed: Arc::new(Notify::new()),
             maximum_encoded_bytes: MAXIMUM_ENCODED_OUTBOX_BYTES,
@@ -136,7 +138,59 @@ impl ObservationOutbox {
     pub(super) fn acknowledge(&self, id: u64) -> Option<AssignmentObservation> {
         let mut state = self.lock();
         let index = state.entries.iter().position(|entry| entry.id == id)?;
-        state.entries.remove(index).map(|entry| entry.observation)
+        let entry = state.entries.remove(index)?;
+        if matches!(
+            entry.observation,
+            AssignmentObservation::ContinuationReady { .. }
+        ) {
+            state.acknowledged_ready.insert(id);
+            drop(state);
+            self.changed.notify_waiters();
+        }
+        Some(entry.observation)
+    }
+
+    pub(super) async fn wait_for_continuation_ready(
+        &self,
+        id: u64,
+        deadline: PreparationDeadline,
+        cancellation: &CaptureCancellation,
+        sleeper: &dyn Sleeper,
+    ) -> Result<(), AssignmentDecline> {
+        loop {
+            let mut notified = std::pin::pin!(self.changed.notified());
+            notified.as_mut().enable();
+            if cancellation.is_cancelled() {
+                return Err(environment_unavailable());
+            }
+            {
+                let mut state = self.lock();
+                if state.acknowledged_ready.remove(&id) {
+                    return Ok(());
+                }
+                if !state
+                    .entries
+                    .iter()
+                    .any(|entry| entry.id == id && entry.replayable)
+                {
+                    return Err(environment_unavailable());
+                }
+            }
+            if cancellation.is_cancelled() {
+                return Err(environment_unavailable());
+            }
+            let remaining = deadline
+                .remaining_at(sleeper.now())
+                .ok_or_else(environment_unavailable)?;
+            let expiry = sleeper.sleep(remaining);
+            tokio::pin!(expiry);
+            tokio::select! {
+                biased;
+                () = cancellation.cancelled() => return Err(environment_unavailable()),
+                () = notified => {},
+                () = &mut expiry => return Err(environment_unavailable()),
+            }
+        }
     }
 
     pub(super) fn claim_for_transport(&self, id: u64) -> bool {
@@ -192,6 +246,8 @@ impl ObservationOutbox {
         state
             .entries
             .retain(|entry| entry.replayable || entry.encoded || entry.transport_owned);
+        drop(state);
+        self.changed.notify_waiters();
     }
 
     pub(in crate::service) fn finish_transport(&self) -> BTreeSet<u64> {
@@ -268,6 +324,54 @@ fn encoded_observation_bytes(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn continuation_ready_waits_for_durable_ack_not_frame_encoding() {
+        let outbox = ObservationOutbox::new();
+        let id = outbox
+            .enqueue(AssignmentObservation::ContinuationReady {
+                assignment_id: "asn_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned(),
+                attempt_id: "atm_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned(),
+                start_snapshot: serde_json::json!({
+                    "algorithm": "git_worktree_sha256_v1", "unavailable": "git_unavailable"
+                }),
+                quiescence: serde_json::json!({
+                    "groupsRecorded": 0, "groupsTerminated": 0, "groupsAbsent": 0,
+                    "provenAt": "2026-09-01T00:00:00Z"
+                }),
+                modified: serde_json::json!("unknown"),
+            })
+            .unwrap();
+        let sleeper = crate::service::test_support::fixture_sleeper();
+        let expiry = (sleeper.utc_now() + time::Duration::minutes(1))
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap();
+        let deadline =
+            PreparationDeadline::from_wire(&expiry, sleeper.utc_now(), sleeper.now()).unwrap();
+        outbox.mark_encoded(id);
+        let cancellation = CaptureCancellation::default();
+        let wait =
+            outbox.wait_for_continuation_ready(id, deadline, &cancellation, sleeper.as_ref());
+        tokio::pin!(wait);
+        assert!(
+            std::future::poll_fn(|context| {
+                std::task::Poll::Ready(
+                    std::future::Future::poll(wait.as_mut(), context).is_pending(),
+                )
+            })
+            .await
+        );
+        assert!(matches!(
+            outbox.acknowledge(id),
+            Some(AssignmentObservation::ContinuationReady { .. })
+        ));
+        assert!(
+            crate::service::test_support::with_watchdog(wait)
+                .await
+                .unwrap()
+                .is_ok()
+        );
+    }
 
     #[test]
     fn outbox_accounts_for_the_maximum_envelope_without_a_padding_guess() {

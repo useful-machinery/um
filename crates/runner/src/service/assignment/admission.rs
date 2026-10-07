@@ -415,13 +415,98 @@ impl AssignmentManager {
             let mut root = root;
             let workspace_path = root.workspace.path();
             let preparation = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                if let Some(continuation) = &worker_offer.continuation {
+                    if runtime.work_root.boot_id()
+                        != Some(continuation.required_runner_boot_id.as_str())
+                    {
+                        return Err(environment_unavailable());
+                    }
+                    runtime
+                        .work_root
+                        .claim_retained_for_attempt(
+                            &mut root,
+                            super::super::workspace::RetainedClaimRequest {
+                                assignment_id: &worker_offer.assignment_id,
+                                run_id: &worker_offer.run_id,
+                                attempt_id: &worker_offer.attempt_id,
+                                prior_assignment_id: &continuation.prior_assignment_id,
+                                prior_attempt_id: &continuation.prior_attempt_id,
+                                recorded_root: Path::new(&continuation.execution_root),
+                            },
+                        )
+                        .map_err(|error| match error {
+                            AssignmentRootCreationError::OwnershipUnproven => {
+                                AssignmentDecline::RunnerUnable(
+                                    RunnerUnableReason::OwnershipUnproven,
+                                )
+                            }
+                            AssignmentRootCreationError::Unavailable => {
+                                AssignmentDecline::RunnerUnable(
+                                    RunnerUnableReason::RetainedWorkspaceUnavailable,
+                                )
+                            }
+                            _ => environment_unavailable(),
+                        })?;
+                    // Snapshot after the durable claim, on this blocking worker.
+                    // An unavailable snapshot is explicit evidence, not a reason
+                    // to substitute null or to read the unclaimed workspace.
+                    root.continuation_snapshot = Some(
+                        um_execution::capture_cloud_continuation_snapshot(
+                            &root.execution,
+                            continuation.prior_settlement_snapshot.as_ref(),
+                        )
+                        .map_err(|_| environment_unavailable())?,
+                    );
+                    let proof = root
+                        .retained_quiescence
+                        .ok_or_else(environment_unavailable)?;
+                    let snapshot = root
+                        .continuation_snapshot
+                        .as_ref()
+                        .ok_or_else(environment_unavailable)?;
+                    let proven_at = sleeper
+                        .utc_now()
+                        .format(&time::format_description::well_known::Rfc3339)
+                        .map_err(|_| environment_unavailable())?;
+                    root.continuation_proven_at = Some(proven_at.clone());
+                    let id = runtime
+                        .outbox
+                        .enqueue(AssignmentObservation::ContinuationReady {
+                            assignment_id: worker_offer.assignment_id.clone(),
+                            attempt_id: worker_offer.attempt_id.clone(),
+                            start_snapshot: snapshot.start_snapshot.clone(),
+                            quiescence: serde_json::json!({
+                                "groupsRecorded": proof.recorded,
+                                "groupsTerminated": proof.terminated,
+                                "groupsAbsent": proof.absent,
+                                "provenAt": proven_at,
+                            }),
+                            modified: snapshot.modified.clone(),
+                        })
+                        .map_err(|_| environment_unavailable())?;
+                    tokio::runtime::Handle::current().block_on(
+                        runtime.outbox.wait_for_continuation_ready(
+                            id,
+                            deadline,
+                            &worker_cancellation,
+                            sleeper.as_ref(),
+                        ),
+                    )?;
+                }
+                let clone_root = if worker_offer.continuation.is_some() {
+                    let path = root.private.join("replacement-definition");
+                    std::fs::create_dir(&path).map_err(|_| environment_unavailable())?;
+                    path
+                } else {
+                    workspace_path.clone()
+                };
                 let checkout = super::super::source::checkout(
                     Arc::clone(&broker),
                     &environment,
                     &worker_offer.assignment_id,
                     &source,
                     &worker_cancellation,
-                    &workspace_path,
+                    &clone_root,
                     &root.private,
                 )
                 .map_err(materialization_decline)?;
@@ -443,8 +528,28 @@ impl AssignmentManager {
                 Ok::<_, AssignmentDecline>((materialized, inputs))
             }));
             let admission = match preparation {
-                Ok(Ok((materialized, inputs))) => {
-                    root.execution = materialized.execution_root;
+                Ok(Ok((mut materialized, inputs))) => {
+                    if worker_offer.continuation.is_some() {
+                        // The fetched effective definition has its own source root;
+                        // only execution adopts the retained primary work tree.
+                        materialized.execution_root = root.execution.clone();
+                        materialized.git_capture =
+                            materialized.workflow.requires_git_capture().then(|| {
+                                CloudGitCaptureProjection::new(
+                                    Arc::from(
+                                        worker_offer
+                                            .execution_spec
+                                            .primary_workspace_source
+                                            .commit_oid
+                                            .as_str(),
+                                    ),
+                                    Arc::from(materialized.workflow.content_digest.value.as_str()),
+                                    worker_cancellation.clone(),
+                                )
+                            });
+                    } else {
+                        root.execution = materialized.execution_root;
+                    }
                     let workflow_git = std::env::current_exe()
                         .map_err(anyhow::Error::from)
                         .and_then(|helper_executable| {
@@ -452,6 +557,14 @@ impl AssignmentManager {
                                 broker: Arc::clone(&broker),
                                 assignment_id: &worker_offer.assignment_id,
                                 origin: materialized.origin,
+                                replace_origin: worker_offer.continuation.is_some(),
+                                previous_private_root: worker_offer
+                                    .continuation
+                                    .as_ref()
+                                    .and_then(|offer| {
+                                        root.retained_private_roots.get(&offer.prior_attempt_id)
+                                    })
+                                    .map(|path| path.as_path()),
                                 workspace: &root.execution,
                                 private_root: &root.private,
                                 environment: &environment,

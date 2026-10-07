@@ -1,3 +1,9 @@
+mod cloud_retained;
+pub use cloud_retained::{
+    bind_cloud_continuation_context, load_cloud_continuation_seed,
+    retain_cloud_continuation_evidence, retain_cloud_workflow_evidence,
+};
+
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ffi::OsString;
 use std::fmt;
@@ -5474,9 +5480,21 @@ fn load_retained_value(
     node: &str,
     retained: &RetainedOutputV1,
 ) -> Result<CapturedValue, LocalRunDirectoryError> {
+    load_retained_value_from(producer_workflow, artifacts, node, retained, |retained| {
+        open_retained_carrier(root, state, retained)
+    })
+}
+
+fn load_retained_value_from(
+    producer_workflow: &ResolvedWorkflow,
+    artifacts: &ArtifactStaging,
+    node: &str,
+    retained: &RetainedOutputV1,
+    mut open: impl FnMut(&RetainedOutputV1) -> Result<RetainedCarrierProducer, LocalRunDirectoryError>,
+) -> Result<CapturedValue, LocalRunDirectoryError> {
     match retained {
         RetainedOutputV1::Text { carrier, .. } => {
-            let mut producer = open_retained_carrier(root, state, retained)?;
+            let mut producer = open(retained)?;
             let value = capture_retained_candidate(
                 artifacts,
                 retained.name(),
@@ -5495,7 +5513,7 @@ fn load_retained_value(
             let schema = producer_workflow
                 .json_schema(node, retained.name())
                 .ok_or(LocalRunDirectoryError::StateInvalid)?;
-            let mut producer = open_retained_carrier(root, state, retained)?;
+            let mut producer = open(retained)?;
             let value = capture_retained_candidate(
                 artifacts,
                 retained.name(),
@@ -5516,7 +5534,7 @@ fn load_retained_value(
             carrier,
             ..
         } => {
-            let mut producer = open_retained_carrier(root, state, retained)?;
+            let mut producer = open(retained)?;
             let value = capture_retained_candidate(
                 artifacts,
                 retained.name(),
@@ -5558,7 +5576,7 @@ fn load_retained_value(
                     None,
                 ),
                 Some(carrier) => {
-                    let mut producer = open_retained_carrier(root, state, retained)?;
+                    let mut producer = open(retained)?;
                     let mut declarations = [CaptureCandidateDeclaration::GitBranch(
                         GitBranchCaptureDeclaration::new(
                             retained.name(),
