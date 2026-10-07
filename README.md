@@ -1137,6 +1137,62 @@ identity because the API defines exact replay; setup initiation and reads make o
 request attempt. A later completion retry must reuse the same setup session and provider
 installation ID.
 
+## Linear triggers and evaluations
+
+Organization owners configure project triggers against a connected Linear workspace. Create
+requires a complete JSON object with explicit `enabled`, `source`, `target`, `conditions`,
+`inputs`, and `integrationContext`. For example:
+
+```json
+{
+  "enabled": true,
+  "source": {"type": "linear", "connectionId": "lcn_01k0z6r1w8f4jy2m7q9v3x5abc"},
+  "target": {"workflowPath": ".um/cloud/one-shot.yaml", "executionPrincipalId": "prn_01k0z6r1w8f4jy2m7q9v3x5abc"},
+  "conditions": [{"field": "event.action", "operator": "eq", "value": "update"}],
+  "inputs": {"ticket": {"kind": "file", "source": {"type": "snapshot"}}},
+  "integrationContext": {"issue": {"type": "field", "field": "current.identifier"}}
+}
+```
+
+The optional `publication` object (`{"exportName":"name"}`) selects the run export on
+creation or replaces that selection on update. The `ticket` File input receives the
+complete Ticket Snapshot Schema 1 JSON document; `file` accepts only `snapshot`.
+Text and JSON mappings also accept `literal` or `field` sources; JSON literals
+preserve null and structured values. Field names are a closed
+vocabulary, not paths or expressions. Conditions and mappings are replaced as whole
+collections, including an explicit empty object for clearing mappings. Update files
+contain only the fields to replace, never `enabled` or `expectedVersion`:
+
+```sh
+um project trigger create ORG PROJECT --config-file trigger.json
+um project trigger list ORG PROJECT --limit 50 --cursor CURSOR
+um project trigger show ORG PROJECT TRIGGER
+um project trigger update ORG PROJECT TRIGGER --config-file changes.json --expected-version 3
+um project trigger disable ORG PROJECT TRIGGER
+um project trigger enable ORG PROJECT TRIGGER
+um project trigger delete ORG PROJECT TRIGGER --yes
+um project trigger evaluation list ORG PROJECT TRIGGER --state failed --run-id RUN --limit 50
+um project trigger evaluation show ORG PROJECT TRIGGER EVALUATION
+```
+
+Use `--config-file -` for stdin unless the service API key also reads stdin. Unknown,
+missing, null and late-schema configuration properties are rejected before sending a
+request. There is no automatic fetch-and-patch: a version conflict requires inspecting
+and deliberately updating the selected version. Lifecycle actions use separate routes.
+Lists return only one page; pass the printed opaque next cursor with the same filters
+for another page. `--json` emits one schema-version-1 result with complete trigger
+configuration or evaluation facts, including the immutable selected version, attempt,
+reason, condition results, observations, and resulting or blocking run. History never
+claims the run of an overlapping evaluation. The evaluation API deliberately does not
+embed issue prose or snapshot bytes. After `run_created`, use `um run input show ORG RUN`
+and `um run input download ORG RUN --member inputs/ticket --output DIRECTORY` (using
+the configured File input name) to inspect the complete, verified Schema 1 file while
+its retained Run Input is available. A deletion stops pending work, not runs already
+admitted; retained evaluation history remains inspectable. If a mutation's response is lost,
+`commitment_unknown` retains its idempotency key even if replay is refused; JSON
+`replayOutcome` reports the closed replay failure without implying the first request failed.
+Inspect the trigger and your access before deciding whether to repeat the operation.
+
 ## Linear evaluation recovery
 
 An organization owner can start a new cycle for a failed evaluation while its

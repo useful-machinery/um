@@ -1,3 +1,6 @@
+mod config;
+mod management;
+
 use std::cell::Cell;
 use std::io::{self, Write};
 use std::time::Duration;
@@ -27,8 +30,22 @@ pub(super) struct Command {
 }
 #[derive(Debug, Subcommand)]
 enum Leaf {
+    #[command(about = "Create a Linear trigger")]
+    Create(management::Create),
+    #[command(about = "Delete a Linear trigger")]
+    Delete(management::Delete),
+    #[command(about = "Disable a Linear trigger")]
+    Disable(management::Target),
+    #[command(about = "Enable a Linear trigger")]
+    Enable(management::Target),
     #[command(about = "Manage Linear trigger evaluations")]
     Evaluation(EvaluationCommand),
+    #[command(about = "List Linear triggers")]
+    List(management::List),
+    #[command(about = "Show a Linear trigger")]
+    Show(management::Target),
+    #[command(about = "Update a Linear trigger")]
+    Update(management::Update),
 }
 #[derive(Debug, Args)]
 struct EvaluationCommand {
@@ -37,8 +54,12 @@ struct EvaluationCommand {
 }
 #[derive(Debug, Subcommand)]
 enum EvaluationLeaf {
+    #[command(about = "List retained evaluations")]
+    List(management::EvaluationList),
     #[command(about = "Retry a failed evaluation")]
     Retry(Retry),
+    #[command(about = "Show an evaluation")]
+    Show(management::EvaluationTarget),
 }
 // jscpd:ignore-end
 #[derive(Debug, Args)]
@@ -98,8 +119,21 @@ impl Command {
     pub(super) fn execute(self) -> super::super::CommandResult {
         match self.command {
             None => super::super::print_help(&["project", "trigger"]),
+            Some(Leaf::Create(cmd)) => management::execute(cmd, management::Management::Create),
+            Some(Leaf::List(cmd)) => management::execute(cmd, management::Management::List),
+            Some(Leaf::Show(cmd)) => management::execute(cmd, management::Management::Show),
+            Some(Leaf::Update(cmd)) => management::execute(cmd, management::Management::Update),
+            Some(Leaf::Enable(cmd)) => management::execute(cmd, management::Management::Enable),
+            Some(Leaf::Disable(cmd)) => management::execute(cmd, management::Management::Disable),
+            Some(Leaf::Delete(cmd)) => management::execute(cmd, management::Management::Delete),
             Some(Leaf::Evaluation(cmd)) => match cmd.command {
                 None => super::super::print_help(&["project", "trigger", "evaluation"]),
+                Some(EvaluationLeaf::List(cmd)) => {
+                    management::execute(cmd, management::Management::EvaluationList)
+                }
+                Some(EvaluationLeaf::Show(cmd)) => {
+                    management::execute(cmd, management::Management::EvaluationShow)
+                }
                 Some(EvaluationLeaf::Retry(cmd)) => super::super::execute_deployment_command(
                     Some(cmd),
                     &["project", "trigger", "evaluation", "retry"],
@@ -307,19 +341,70 @@ impl Retry {
                 )
             })
         };
-        let first = submit()?;
+        let first = match submit() {
+            Ok(result) => result,
+            Err(_) if control.dispatched() => {
+                // Session refresh can fail after the POST was sent. Even without
+                // a replay, retain the request key for explicit recovery.
+                return self
+                    .finish(
+                        control,
+                        None,
+                        "acceptance_unknown",
+                        Some("unavailable"),
+                        ExitCode::Unavailable,
+                    )
+                    .map(Ok);
+            }
+            Err(error) => return Err(error.into()),
+        };
         if stopped.get() {
             return Ok(Ok(ExitCode::Interrupted));
         }
-        let accepted = match first {
-            Err(LinearFailure::Unreachable { .. }) if !control.is_stopped() => submit()?,
-            result => result,
+        // A failed transport or unconfirmed response cannot settle a dispatched
+        // retry. Reuse the key once; even an authorization rejection on replay
+        // cannot prove whether the first request was accepted.
+        let uncertain = matches!(
+            &first,
+            Err(LinearFailure::Unreachable { .. } | LinearFailure::InvalidResponse { .. })
+        );
+        let accepted = if uncertain && !control.is_stopped() {
+            match submit() {
+                Ok(result) => result,
+                // The first POST may have committed even if session refresh (or
+                // preparing the replay) fails. Preserve its request identity.
+                Err(_) => {
+                    return self
+                        .finish(
+                            control,
+                            None,
+                            "acceptance_unknown",
+                            Some("unavailable"),
+                            ExitCode::Unavailable,
+                        )
+                        .map(Ok);
+                }
+            }
+        } else {
+            first
         };
         if stopped.get() {
             return Ok(Ok(ExitCode::Interrupted));
         }
         let accepted = match accepted {
             Ok(value) => value,
+            Err(failure) if uncertain => {
+                let (code, _) = failure_code(&failure, false);
+                return self
+                    .finish(
+                        control,
+                        None,
+                        "acceptance_unknown",
+                        Some(code),
+                        ExitCode::Unavailable,
+                    )
+                    .map(Ok);
+            }
             Err(failure) => return Ok(Err(failure)),
         };
         recovery.accepted_cycle = Some(accepted.cycle_number);
@@ -349,13 +434,27 @@ impl Retry {
                     &self.trigger,
                     &self.evaluation,
                 )
-            })? {
-                Err(LinearFailure::RateLimited { retry_after }) => {
-                    next = Duration::from_secs(retry_after.unwrap_or(2).max(2));
-                    continue;
+            }) {
+                // An observation failure does not undo a confirmed retry cycle.
+                Err(_) => {
+                    return self
+                        .finish(
+                            control,
+                            None,
+                            "observation_stopped",
+                            Some("unavailable"),
+                            ExitCode::Unavailable,
+                        )
+                        .map(Ok);
                 }
-                Err(failure) => return Ok(Err(failure)),
-                Ok(observation) => observation,
+                Ok(observation) => match observation {
+                    Err(LinearFailure::RateLimited { retry_after }) => {
+                        next = Duration::from_secs(retry_after.unwrap_or(2).max(2));
+                        continue;
+                    }
+                    Err(failure) => return Ok(Err(failure)),
+                    Ok(observation) => observation,
+                },
             };
             if observation.cycle_number != accepted.cycle_number {
                 return self

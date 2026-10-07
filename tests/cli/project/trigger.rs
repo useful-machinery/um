@@ -24,11 +24,38 @@ fn evaluation(state: &str, cycle: i32) -> serde_json::Value {
 }
 
 fn response(status: &str, body: serde_json::Value) -> Vec<u8> {
-    http_response(
+    let headers = if status == "202 Accepted" {
+        vec![(
+            "Idempotency-Key",
+            api_test_support::REQUEST_IDEMPOTENCY_KEY_ECHO,
+        )]
+    } else {
+        vec![]
+    };
+    http_response_with_headers(
         status,
         Some("application/json"),
+        &headers,
         &serde_json::to_vec(&body).unwrap(),
     )
+}
+
+fn run_human_retry(server: &ScriptedServer, key: &str) -> Output {
+    let directory = private_credential_directory();
+    let credentials = directory.path().join("credentials.json");
+    write_credential_fixture_for_deployment(
+        &credentials,
+        &server.api_url,
+        &server.issuer,
+        TOKEN,
+        "2999-01-01T00:00:00Z",
+    );
+    let environment = deployment_environment_with_issuer(
+        &server.api_url,
+        &server.issuer,
+        credentials.to_str().unwrap(),
+    );
+    run_with_env(&args(key), &environment)
 }
 
 fn args(key: &str) -> Vec<&str> {
@@ -46,6 +73,100 @@ fn args(key: &str) -> Vec<&str> {
         "--json",
         "--allow-insecure-http",
     ]
+}
+
+#[test]
+fn retry_requires_the_confirmed_request_identity_before_polling() {
+    let unconfirmed = http_response(
+        "202 Accepted",
+        Some("application/json"),
+        &serde_json::to_vec(&evaluation("pending", 2)).unwrap(),
+    );
+    let (server, _directory, credential) = prepared_project(vec![unconfirmed.clone(), unconfirmed]);
+    let output = run_project(&args("unconfirmed-cycle"), &server, &credential);
+    assert_eq!(output.status.code(), Some(4));
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["outcome"], "acceptance_unknown");
+    assert_eq!(result["idempotencyKey"], "unconfirmed-cycle");
+    let requests = server.finish();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(
+        header_value(&requests[0], "idempotency-key"),
+        header_value(&requests[1], "idempotency-key")
+    );
+}
+
+#[test]
+fn retry_replay_rejection_keeps_unknown_acceptance() {
+    let (server, _directory, credential) = prepared_project(vec![
+        Vec::new(),
+        problem_http_response(
+            "403 Forbidden",
+            serde_json::json!({"type":"https://api.usefulmachinery.com/problems/forbidden","title":"Forbidden","status":403}),
+        ),
+    ]);
+    let output = run_project(&args("recover-role-loss"), &server, &credential);
+    assert_eq!(output.status.code(), Some(4));
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["outcome"], "acceptance_unknown");
+    assert_eq!(result["code"], "forbidden");
+    assert_eq!(result["idempotencyKey"], "recover-role-loss");
+    assert_eq!(server.finish().len(), 2);
+}
+
+#[test]
+fn retry_first_post_refresh_failure_preserves_dispatched_key() {
+    let server = ScriptedServer::respond(vec![
+        problem_http_response(
+            "401 Unauthorized",
+            serde_json::json!({"type":"https://api.usefulmachinery.com/problems/unauthorized","title":"Unauthorized","status":401}),
+        ),
+        http_response("503 Service Unavailable", Some("application/json"), b"{}"),
+    ]);
+    let output = run_human_retry(&server, "first-post-refresh-fails");
+    assert_eq!(output.status.code(), Some(4), "{output:?}");
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["outcome"], "acceptance_unknown");
+    assert_eq!(result["idempotencyKey"], "first-post-refresh-fails");
+    let requests = server.finish();
+    assert_eq!(requests.len(), 2);
+    assert!(requests[0].starts_with("POST /api/"));
+    assert!(requests[1].starts_with("POST /auth/oauth/token "));
+    assert_eq!(
+        header_value(&requests[0], "idempotency-key"),
+        "first-post-refresh-fails"
+    );
+}
+
+#[test]
+fn retry_lost_response_and_failed_replay_refresh_preserves_original_key() {
+    let server = ScriptedServer::respond(vec![
+        Vec::new(),
+        problem_http_response(
+            "401 Unauthorized",
+            serde_json::json!({"type":"https://api.usefulmachinery.com/problems/unauthorized","title":"Unauthorized","status":401}),
+        ),
+        http_response("503 Service Unavailable", Some("application/json"), b"{}"),
+    ]);
+    let output = run_human_retry(&server, "lost-then-refresh-fails");
+    assert_eq!(output.status.code(), Some(4), "{output:?}");
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["outcome"], "acceptance_unknown");
+    assert_eq!(result["idempotencyKey"], "lost-then-refresh-fails");
+    assert!(result["acceptedCycle"].is_null());
+    let requests = server.finish();
+    assert_eq!(requests.len(), 3);
+    assert!(requests[0].starts_with("POST /api/"));
+    assert!(requests[1].starts_with("POST /api/"));
+    assert!(requests[2].starts_with("POST /auth/oauth/token "));
+    assert_eq!(
+        header_value(&requests[0], "idempotency-key"),
+        "lost-then-refresh-fails"
+    );
+    assert_eq!(
+        header_value(&requests[1], "idempotency-key"),
+        "lost-then-refresh-fails"
+    );
 }
 
 #[test]
@@ -167,6 +288,29 @@ fn retry_observation_transport_loss_keeps_accepted_cycle_not_unknown_submission(
     let requests = server.finish();
     assert_eq!(requests.len(), 2);
     assert!(requests[1].starts_with("GET "));
+}
+
+#[test]
+fn retry_observation_refresh_failure_keeps_confirmed_cycle() {
+    let server = ScriptedServer::respond(vec![
+        response("202 Accepted", evaluation("pending", 2)),
+        problem_http_response(
+            "401 Unauthorized",
+            serde_json::json!({"type":"https://api.usefulmachinery.com/problems/unauthorized","title":"Unauthorized","status":401}),
+        ),
+        http_response("503 Service Unavailable", Some("application/json"), b"{}"),
+    ]);
+    let output = run_human_retry(&server, "accepted-before-refresh-fails");
+    assert_eq!(output.status.code(), Some(4), "{output:?}");
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["outcome"], "observation_stopped");
+    assert_eq!(result["acceptedCycle"], 2);
+    assert_eq!(result["idempotencyKey"], "accepted-before-refresh-fails");
+    let requests = server.finish();
+    assert_eq!(requests.len(), 3);
+    assert!(requests[0].starts_with("POST /api/"));
+    assert!(requests[1].starts_with("GET /api/"));
+    assert!(requests[2].starts_with("POST /auth/oauth/token "));
 }
 
 #[test]
@@ -305,6 +449,41 @@ fn retry_get_rate_limit_preserves_retry_after_then_observes_terminal_state() {
             .iter()
             .all(|request| request.starts_with("GET "))
     );
+}
+
+#[test]
+fn retry_role_loss_after_acceptance_never_claims_run_or_resubmits() {
+    let (server, _directory, credential) = prepared_project(vec![
+        response("202 Accepted", evaluation("pending", 2)),
+        problem_http_response(
+            "403 Forbidden",
+            serde_json::json!({"type":"https://api.usefulmachinery.com/problems/forbidden","title":"Forbidden","status":403}),
+        ),
+    ]);
+    let output = run_project(&args("accepted-before-role-loss"), &server, &credential);
+    assert_eq!(output.status.code(), Some(1));
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["outcome"], "observation_stopped");
+    assert_eq!(result["acceptedCycle"], 2);
+    assert!(result["evaluation"].is_null());
+    assert_eq!(result["code"], "forbidden");
+    let requests = server.finish();
+    assert_eq!(requests.len(), 2);
+    assert!(requests[0].starts_with("POST ") && requests[1].starts_with("GET "));
+}
+
+#[test]
+fn retry_same_state_conflict_does_not_create_an_observation_cycle() {
+    let (server, _directory, credential) = prepared_project(vec![problem_http_response(
+        "409 Conflict",
+        serde_json::json!({"type":"https://api.usefulmachinery.com/problems/source-connection-conflict","title":"Conflict","status":409}),
+    )]);
+    let output = run_project(&args("racing-owner"), &server, &credential);
+    assert_eq!(output.status.code(), Some(1));
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["acceptedCycle"], serde_json::Value::Null);
+    assert_eq!(result["code"], "ineligible");
+    assert_eq!(server.finish().len(), 1);
 }
 
 #[test]

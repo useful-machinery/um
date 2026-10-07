@@ -102,8 +102,10 @@ pub use lifecycle::{
     request_current_principal_deletion, request_organization_deletion,
 };
 pub use linear::{
-    LinearApi, LinearConnection, LinearConnectionList, LinearEvaluation, LinearEvaluationState,
-    LinearFailure, LinearSession, LinearSessionStatus,
+    CreateLinearTriggerRequest, EvaluationFilters, LinearApi, LinearConnection,
+    LinearConnectionList, LinearEvaluation, LinearEvaluationList, LinearEvaluationState,
+    LinearFailure, LinearSession, LinearSessionStatus, LinearTrigger, LinearTriggerList,
+    LinearTriggerRead, TriggerAction, UpdateLinearTriggerRequest,
 };
 pub use organizations::{
     AcceptInvitationOutcome, AcceptedInvitationMembership, AuditActor, AuditProjectionWarning,
