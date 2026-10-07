@@ -268,6 +268,7 @@ fn webhook_create_update_and_filtered_pages_preserve_selection() {
     );
     let request = server.finish().remove(0);
     assert!(request.starts_with("PATCH "));
+    assert_eq!(header_value(&request, "content-type"), "application/json");
     assert_eq!(
         request_body(&request),
         serde_json::json!({"contextKeys":[],"expectedVersion":7})

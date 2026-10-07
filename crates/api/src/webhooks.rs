@@ -355,14 +355,7 @@ impl WebhookApi {
             }
             if let Some(body) = body {
                 request = request
-                    .header(
-                        CONTENT_TYPE,
-                        if matches!(kind, Some(Mutation::Update)) {
-                            "application/merge-patch+json"
-                        } else {
-                            problem::JSON_MEDIA_TYPE
-                        },
-                    )
+                    .header(CONTENT_TYPE, problem::JSON_MEDIA_TYPE)
                     .body(body.to_vec());
             }
             let response = match request.send() {
