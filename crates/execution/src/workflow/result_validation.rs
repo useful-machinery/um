@@ -546,8 +546,18 @@ fn evaluate_candidate(
         count += 1;
         let instance_path = error.instance_path().to_string();
         let schema_path = error.schema_path().to_string();
+        let detail = match error.kind() {
+            ValidationErrorKind::Required { property } => {
+                format!(" (missing property {property})")
+            }
+            ValidationErrorKind::AdditionalProperties { unexpected } => format!(
+                " (unexpected properties {})",
+                serde_json::to_string(unexpected).map_err(|_| ())?
+            ),
+            _ => String::new(),
+        };
         feedback.push(&format!(
-            "{count}. instance {} violates `{}` at schema {}\n",
+            "{count}. instance {} violates `{}`{detail} at schema {}\n",
             display_pointer(&instance_path, "$"),
             error.kind().keyword(),
             display_pointer(&schema_path, "#"),

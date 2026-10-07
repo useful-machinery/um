@@ -91,6 +91,8 @@ const TURN_INTERRUPT_REQUEST_ID: RequestId = RequestId(5);
 const CORRECTION_TURN_START_REQUEST_ID: RequestId = RequestId(6);
 const MAXIMUM_CORRECTION_TURNS: u8 = 1;
 const CLIENT_NAME: &str = "um";
+const SCHEMA_REJECTION_PREFIX: &str = "Result rejected by the workflow schema:\n";
+const CODEX_SCHEMA_CORRECTION_PREFIX: &str = "Correct the inner workflow JSON encoded in the outer `result` string; the harness owns the envelope. Schema diagnostics:\n";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CodexAppServerV1ProtocolLimits {
@@ -201,6 +203,13 @@ enum SetupState {
     Running,
     ResultValidation,
     Terminal,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TurnItemsView {
+    Full,
+    Summary,
+    NotLoaded,
 }
 
 impl SetupState {
@@ -422,6 +431,7 @@ pub(super) struct CodexAppServerV1Parser {
     synthetic_model_provider: Option<Arc<str>>,
     value_kind: AgentValueKind,
     maximum_response_bytes: NonZeroU64,
+    maximum_result_rejection_feedback_bytes: NonZeroU64,
     limits: CodexAppServerV1ProtocolLimits,
     frame: Vec<u8>,
     state: SetupState,
@@ -480,6 +490,7 @@ impl CodexAppServerV1Parser {
         synthetic_model_provider: Option<Arc<str>>,
         value_kind: AgentValueKind,
         maximum_response_bytes: NonZeroU64,
+        maximum_result_rejection_feedback_bytes: NonZeroU64,
         limits: CodexAppServerV1ProtocolLimits,
     ) -> Result<Self, AgentFailureCause> {
         let mut parser = Self {
@@ -494,6 +505,7 @@ impl CodexAppServerV1Parser {
             synthetic_model_provider,
             value_kind,
             maximum_response_bytes,
+            maximum_result_rejection_feedback_bytes,
             limits,
             frame: Vec::new(),
             state: SetupState::Initialize,
@@ -647,6 +659,10 @@ impl CodexAppServerV1Parser {
                 .ok_or_else(|| self.failure_for_current_phase())?,
         );
         self.reset_completed_turn();
+        let feedback = codex_result_correction_feedback(
+            feedback,
+            self.maximum_result_rejection_feedback_bytes,
+        );
         self.queue_turn_start(vec![json!({
             "type": "text",
             "text": feedback.as_ref(),
@@ -2119,6 +2135,19 @@ impl CodexAppServerV1Parser {
         self.prepare_rejection(CodexAppServerV1RejectionReason::TurnSummaryInvalid);
         let items =
             required_array(turn, "items").ok_or_else(|| self.failure_for_current_phase())?;
+        let items_view = match turn.get("itemsView") {
+            None => TurnItemsView::Full,
+            Some(Value::String(value)) => match value.as_str() {
+                "full" => TurnItemsView::Full,
+                "summary" => TurnItemsView::Summary,
+                "notLoaded" => TurnItemsView::NotLoaded,
+                _ => return Err(self.failure_for_current_phase()),
+            },
+            _ => return Err(self.failure_for_current_phase()),
+        };
+        if items_view == TurnItemsView::NotLoaded && !items.is_empty() {
+            return Err(self.failure_for_current_phase());
+        }
         let mut summary_ids = BTreeSet::new();
         for item in items {
             let item = item
@@ -2147,11 +2176,12 @@ impl CodexAppServerV1Parser {
                 }
             }
         }
-        if self
-            .completed_items
-            .iter()
-            .filter(|(_, item)| item.agent_message.is_some())
-            .any(|(id, _)| !summary_ids.contains(id))
+        if items_view == TurnItemsView::Full
+            && self
+                .completed_items
+                .iter()
+                .filter(|(_, item)| item.agent_message.is_some())
+                .any(|(id, _)| !summary_ids.contains(id))
         {
             return Err(self.failure_for_current_phase());
         }
@@ -2734,6 +2764,30 @@ impl<'de> Visitor<'de> for WeakResultEnvelopeVisitor {
 fn parse_weak_result_envelope(text: &str) -> Result<Value, ()> {
     let envelope = serde_json::from_str::<WeakResultEnvelope>(text).map_err(|_| ())?;
     um_support::strict_json_from_str(&envelope.0).map_err(|_| ())
+}
+
+fn codex_result_correction_feedback(feedback: Arc<str>, maximum_bytes: NonZeroU64) -> Arc<str> {
+    let Some(diagnostics) = feedback.strip_prefix(SCHEMA_REJECTION_PREFIX) else {
+        return feedback;
+    };
+    let maximum_bytes = usize::try_from(maximum_bytes.get()).unwrap_or(usize::MAX);
+    let mut correction = String::with_capacity(maximum_bytes.min(feedback.len()));
+    push_bounded(
+        &mut correction,
+        CODEX_SCHEMA_CORRECTION_PREFIX,
+        maximum_bytes,
+    );
+    push_bounded(&mut correction, diagnostics, maximum_bytes);
+    Arc::from(correction)
+}
+
+fn push_bounded(destination: &mut String, value: &str, maximum_bytes: usize) {
+    let remaining = maximum_bytes.saturating_sub(destination.len());
+    let mut end = remaining.min(value.len());
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    destination.push_str(&value[..end]);
 }
 
 fn weak_json_schema() -> Value {

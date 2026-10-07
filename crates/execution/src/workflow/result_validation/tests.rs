@@ -63,7 +63,7 @@ async fn candidates_are_bounded_rejected_and_corrected_through_one_validator() {
             "Result rejected by the workflow schema:\n",
             "1. instance /count violates `minimum` at schema /properties/count/minimum\n",
             "2. instance /name violates `minLength` at schema /properties/name/minLength\n",
-            "3. instance $ violates `additionalProperties` at schema /additionalProperties\n",
+            "3. instance $ violates `additionalProperties` (unexpected properties [\"extra\"]) at schema /additionalProperties\n",
         )
     );
 
@@ -77,6 +77,39 @@ async fn candidates_are_bounded_rejected_and_corrected_through_one_validator() {
     assert_eq!(accepted.value(), &json!({"count": 1, "name": "Ada"}));
     assert_eq!(accepted.canonical_json(), br#"{"count":1,"name":"Ada"}"#);
     assert_eq!(worker.starts(), 3);
+}
+
+#[test]
+fn rejection_feedback_names_missing_and_unexpected_properties() {
+    let schema = retained_schema(json!({
+        "$schema": JSON_SCHEMA_DIALECT,
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["verdict", "patchSha256", "summary", "findings"],
+        "properties": {
+            "verdict": {"enum": ["pass", "fail"]},
+            "patchSha256": {"type": "string"},
+            "summary": {"type": "string"},
+            "findings": {"type": "array"}
+        }
+    }));
+    let candidate = json!({
+        "patchSha256": "d75795a4e0f5e54ae97bf47d823607158a0a41657cb14a7d07c1f96e804ba2da",
+        "status": "pass",
+        "findings": []
+    });
+
+    let ValidationWorkerDecision::Rejected { feedback } =
+        evaluate_candidate(&schema, &candidate, FEEDBACK_LIMIT).unwrap()
+    else {
+        panic!("review-shaped candidate must be rejected");
+    };
+
+    assert!(feedback.contains("violates `required` (missing property \"verdict\")"));
+    assert!(feedback.contains("violates `required` (missing property \"summary\")"));
+    assert!(
+        feedback.contains("violates `additionalProperties` (unexpected properties [\"status\"])")
+    );
 }
 
 #[tokio::test]

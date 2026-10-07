@@ -1557,10 +1557,7 @@ impl ArtifactStaging {
         let source_metadata = fstat(&source).map_err(|_| ArtifactExposeFailure::Unavailable)?;
         let destination_metadata =
             fstat(destination).map_err(|_| ArtifactExposeFailure::Unavailable)?;
-        if FileType::from_raw_mode(destination_metadata.st_mode) != FileType::Directory
-            || source_metadata.st_dev != destination_metadata.st_dev
-            || u64::try_from(source_metadata.st_size) != Ok(carrier.size())
-        {
+        if !carrier_handoff_preconditions(&source_metadata, &destination_metadata, carrier.size()) {
             return Err(ArtifactExposeFailure::Unavailable);
         }
         self.inner
@@ -2288,6 +2285,19 @@ impl ArtifactStaging {
             carrier.handle.lease.release_budget(&self.inner);
         }
     }
+}
+
+fn carrier_handoff_preconditions(
+    source: &rustix::fs::Stat,
+    destination: &rustix::fs::Stat,
+    expected_size: u64,
+) -> bool {
+    // Overlay filesystems may report the upper-layer device for a newly created file while
+    // reporting the merged mount's device for its parent directory. `linkat` is the
+    // authoritative same-filesystem check; the exposed inode and device are verified after
+    // it succeeds.
+    FileType::from_raw_mode(destination.st_mode) == FileType::Directory
+        && u64::try_from(source.st_size) == Ok(expected_size)
 }
 
 impl ArtifactStagingInner {

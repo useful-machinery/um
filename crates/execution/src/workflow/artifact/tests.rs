@@ -872,6 +872,26 @@ fn mixed_candidates_commit_and_release_independent_typed_carriers() {
 }
 
 #[test]
+fn carrier_handoff_allows_overlay_directory_device_metadata() {
+    let temporary = tempfile::tempdir().unwrap();
+    let source_path = temporary.path().join("source");
+    let destination_path = temporary.path().join("destination");
+    fs::write(&source_path, b"carrier").unwrap();
+    fs::create_dir(&destination_path).unwrap();
+    let source = File::open(source_path).unwrap();
+    let destination = open_directory(&destination_path).unwrap();
+    let source_metadata = fstat(&source).unwrap();
+    let mut destination_metadata = fstat(&destination).unwrap();
+    destination_metadata.st_dev = source_metadata.st_dev.wrapping_add(1);
+
+    assert!(carrier_handoff_preconditions(
+        &source_metadata,
+        &destination_metadata,
+        7,
+    ));
+}
+
+#[test]
 fn aborting_a_mixed_candidate_releases_both_reservations_and_carriers() {
     let fixture = CaptureFixture::with_all_limits(2, 8, 16, 2, 8, 16);
     fs::write(fixture.execution_root.join("report.bin"), b"file").unwrap();

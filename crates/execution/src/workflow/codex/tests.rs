@@ -42,6 +42,7 @@ fn parser_with_system_prompt(
         synthetic_model_provider.map(Arc::from),
         value_kind,
         NonZeroU64::new(maximum_response_bytes).unwrap(),
+        NonZeroU64::new(512).unwrap(),
         CodexAppServerV1ProtocolLimits::profile(),
     )
     .unwrap()
@@ -286,6 +287,12 @@ fn turn_completed(items: Vec<Value>, status: &str) -> Value {
     })
 }
 
+fn turn_completed_with_items_view(items: Vec<Value>, status: &str, items_view: &str) -> Value {
+    let mut completed = turn_completed(items, status);
+    completed["params"]["turn"]["itemsView"] = json!(items_view);
+    completed
+}
+
 #[test]
 fn setup_requests_preserve_native_resources_and_only_fixtures_select_a_provider() {
     let mut production = parser(AgentValueKind::None, 1024, None);
@@ -328,6 +335,7 @@ fn admitted_text_attachment_fits_the_initial_native_turn() {
         None,
         AgentValueKind::None,
         NonZeroU64::new(1024).unwrap(),
+        NonZeroU64::new(512).unwrap(),
         CodexAppServerV1ProtocolLimits::profile(),
     )
     .unwrap();
@@ -790,6 +798,126 @@ fn completed_final_answer_is_authoritative_and_deltas_are_observations_only() {
         panic!("exact-limit completed final answer must be authoritative");
     };
     assert_eq!(response.as_str(), "12345");
+}
+
+#[test]
+fn not_loaded_turn_summary_uses_completed_streamed_agent_message() {
+    let mut parser = running_parser(AgentValueKind::Response, 1024);
+    feed(&mut parser, item_started("final", "agentMessage")).unwrap();
+    feed(
+        &mut parser,
+        item_completed("final", "settled response", json!("final_answer")),
+    )
+    .unwrap();
+    let (progress, _) = feed(
+        &mut parser,
+        turn_completed_with_items_view(vec![], "completed", "notLoaded"),
+    )
+    .unwrap();
+
+    assert!(progress.close_standard_input);
+    let AgentOutcome::Completed(CompletedAgentInvocation::Response(response)) = parser.finish(true)
+    else {
+        panic!("a non-loaded terminal summary must preserve the streamed response");
+    };
+    assert_eq!(response.as_str(), "settled response");
+}
+
+#[test]
+fn summary_turn_view_accepts_a_correlated_subset() {
+    let mut parser = running_parser(AgentValueKind::None, 1024);
+    for (id, text) in [("first", "first response"), ("second", "second response")] {
+        feed(&mut parser, item_started(id, "agentMessage")).unwrap();
+        feed(&mut parser, item_completed(id, text, json!("final_answer"))).unwrap();
+    }
+
+    feed(
+        &mut parser,
+        turn_completed_with_items_view(
+            vec![json!({
+                "id": "second",
+                "type": "agentMessage",
+                "text": "second response",
+                "phase": "final_answer",
+            })],
+            "completed",
+            "summary",
+        ),
+    )
+    .unwrap();
+
+    assert_eq!(
+        parser.finish(true),
+        AgentOutcome::Completed(CompletedAgentInvocation::NoValue)
+    );
+}
+
+#[test]
+fn full_and_absent_turn_views_remain_exhaustive() {
+    for items_view in [None, Some("full")] {
+        let mut parser = running_parser(AgentValueKind::None, 1024);
+        feed(&mut parser, item_started("final", "agentMessage")).unwrap();
+        feed(
+            &mut parser,
+            item_completed("final", "settled response", json!("final_answer")),
+        )
+        .unwrap();
+        let completed = match items_view {
+            Some(items_view) => turn_completed_with_items_view(vec![], "completed", items_view),
+            None => turn_completed(vec![], "completed"),
+        };
+
+        assert_eq!(
+            feed(&mut parser, completed).unwrap_err(),
+            AgentFailureCause::HarnessProtocolFailed,
+            "itemsView={items_view:?}",
+        );
+        assert_eq!(rejection_reason(&parser), "turn_summary_invalid");
+    }
+}
+
+#[test]
+fn terminal_item_views_fail_closed_on_inconsistent_or_unknown_values() {
+    for (items, items_view) in [
+        (
+            vec![json!({
+                "id": "final",
+                "type": "agentMessage",
+                "text": "settled response",
+                "phase": "final_answer",
+            })],
+            "notLoaded",
+        ),
+        (
+            vec![json!({
+                "id": "final",
+                "type": "agentMessage",
+                "text": "mismatched response",
+                "phase": "final_answer",
+            })],
+            "summary",
+        ),
+        (vec![], "future"),
+    ] {
+        let mut parser = running_parser(AgentValueKind::None, 1024);
+        feed(&mut parser, item_started("final", "agentMessage")).unwrap();
+        feed(
+            &mut parser,
+            item_completed("final", "settled response", json!("final_answer")),
+        )
+        .unwrap();
+
+        assert_eq!(
+            feed(
+                &mut parser,
+                turn_completed_with_items_view(items, "completed", items_view),
+            )
+            .unwrap_err(),
+            AgentFailureCause::HarnessProtocolFailed,
+            "itemsView={items_view}",
+        );
+        assert_eq!(rejection_reason(&parser), "turn_summary_invalid");
+    }
 }
 
 #[test]
@@ -1814,6 +1942,50 @@ fn one_rejection_queues_one_same_thread_correction_then_exhausts() {
             break;
         }
     }
+}
+
+#[test]
+fn schema_rejection_correction_identifies_the_inner_weak_envelope_value() {
+    let mut parser = running_parser(AgentValueKind::Result, 1024);
+    let invalid = json!({
+        "schemaVersion": 1,
+        "verdict": "fail",
+        "findings": [{"message": "blocking"}],
+    });
+    let text = result_envelope(invalid.clone());
+    feed(&mut parser, item_started("review", "agentMessage")).unwrap();
+    feed(
+        &mut parser,
+        item_completed("review", &text, json!("final_answer")),
+    )
+    .unwrap();
+    feed(
+        &mut parser,
+        turn_completed(
+            vec![json!({
+                "id": "review",
+                "type": "agentMessage",
+                "text": text,
+                "phase": "final_answer",
+            })],
+            "completed",
+        ),
+    )
+    .unwrap();
+    assert_eq!(parser.take_result_candidate().unwrap().as_ref(), &invalid);
+
+    parser
+        .reject_result(Arc::from(
+            "Result rejected by the workflow schema:\n1. instance /findings/0 violates `type` at schema /properties/findings/items/type\n2. instance $ violates `additionalProperties` at schema /additionalProperties\n",
+        ))
+        .unwrap();
+    let correction = take_json(&mut parser);
+    let feedback = correction["params"]["input"][0]["text"].as_str().unwrap();
+    assert!(feedback.contains("inner workflow JSON"));
+    assert!(feedback.contains("outer `result` string"));
+    assert!(feedback.contains("/findings/0 violates `type`"));
+    assert!(feedback.contains("violates `additionalProperties`"));
+    assert!(feedback.len() <= 512);
 }
 
 #[test]

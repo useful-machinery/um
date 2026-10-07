@@ -172,6 +172,9 @@ where
             self.profile.selected_model_provider(),
             invocation.value_mode().kind(),
             invocation.limits().maximum_response_bytes(),
+            invocation
+                .limits()
+                .maximum_result_rejection_feedback_bytes(),
             protocol_limits,
         ) {
             Ok(parser) => parser,
