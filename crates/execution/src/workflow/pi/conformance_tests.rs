@@ -226,6 +226,17 @@ impl RealPiFixture {
         Self::new_with_options(value_mode, false, false, false, 600_000, true)
     }
 
+    fn with_codemode_only(value_mode: AgentValueMode) -> Self {
+        let fixture = Self::new(value_mode, false, false);
+        let settings_path = fixture.project_directory.join(".pi/settings.json");
+        let mut settings: Value =
+            serde_json::from_slice(&fs::read(&settings_path).unwrap()).unwrap();
+        settings["defaultTools"] = json!(["+codemode"]);
+        settings["codemode"] = json!({"mode": "only"});
+        fs::write(settings_path, serde_json::to_vec_pretty(&settings).unwrap()).unwrap();
+        fixture
+    }
+
     fn new_with_options(
         value_mode: AgentValueMode,
         retry: bool,
@@ -457,9 +468,23 @@ impl RealPiFixture {
 
     fn assert_pre_response_cancellation_state(&self) {
         self.assert_retained_diagnostic_state();
+        let sessions = self.native_sessions();
+        assert_eq!(sessions.len(), 1);
+        let entries = fs::read_to_string(&sessions[0]).unwrap();
+        let messages: Vec<Value> = entries
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .filter(|entry: &Value| entry["type"] == "message")
+            .collect();
         assert!(
-            self.native_sessions().is_empty(),
-            "Pi must not synthesize a session file before an assistant message completes"
+            messages
+                .iter()
+                .any(|entry| entry["message"]["role"] == "user")
+        );
+        assert!(
+            messages
+                .iter()
+                .all(|entry| entry["message"]["role"] != "assistant")
         );
     }
 
@@ -1079,6 +1104,76 @@ async fn pinned_real_pi_02_launch_resources_attachments_and_response_conform() {
 )]
 #[tokio::test]
 #[ignore = "requires pinned harness"]
+async fn pinned_real_pi_02_nested_tool_events_are_observational() {
+    let _executable = require_conformance_executable();
+    tokio::time::timeout(PINNED_TEST_WATCHDOG, async {
+        let fixture = RealPiFixture::new(
+            AgentValueMode::Response {
+                output: Arc::from("response"),
+            },
+            false,
+            false,
+        );
+        let mut running = RunningRealPi::launch(fixture);
+        running.release_startup().await;
+        let model = running.fixture.controller.next("model").await;
+        assert!(tool_names(&model.value).contains("conformance_nested"));
+        model.release(json!({
+            "kind": "toolCalls",
+            "calls": [{"id": "call-nested", "name": "conformance_nested", "arguments": {}}]
+        }));
+        let nested = running.fixture.controller.next("tool").await;
+        assert_eq!(nested.value["parameters"]["value"], "nested");
+        nested.release(json!({"kind": "release"}));
+        let final_model = running.fixture.controller.next("model").await;
+        final_model.release(json!({"kind": "text", "blocks": ["done"], "stopReason": "stop"}));
+        running.await_started().await;
+        let (mut fixture, outcome) = running.finish().await;
+        assert_eq!(
+            outcome,
+            AgentOutcome::Completed(CompletedAgentInvocation::Response(
+                crate::workflow::agent::BoundedAgentResponse::from_bounded(Arc::from("done"))
+            ))
+        );
+        let mut nested_start = false;
+        let mut nested_end = false;
+        while let Ok(observation) = fixture.observations.try_recv() {
+            if let AgentObservation::UnrecognizedHarnessEvent { event } = observation.observation()
+                && event["parentToolCallId"] == "call-nested"
+                && event["toolName"] == "conformance_gate"
+            {
+                nested_start |= event["type"] == "tool_execution_start";
+                nested_end |= event["type"] == "tool_execution_end";
+            }
+        }
+        assert!(nested_start && nested_end);
+        let entries = fs::read_to_string(&fixture.native_sessions()[0]).unwrap();
+        let parent_result = entries
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .find(|entry| entry["message"]["toolCallId"] == "call-nested")
+            .unwrap();
+        assert_eq!(
+            parent_result["message"]["nestedCalls"]["calls"][0]["name"],
+            "conformance_gate"
+        );
+        assert_eq!(
+            parent_result["message"]["nestedCalls"]["calls"][0]["status"],
+            "ok"
+        );
+        fixture.assert_configuration_unchanged();
+        fixture.controller.shutdown().await;
+    })
+    .await
+    .expect("pinned real-Pi nested-call watchdog expired");
+}
+
+#[expect(
+    clippy::disallowed_methods,
+    reason = "real time is used only as an anti-hang watchdog, never as success evidence"
+)]
+#[tokio::test]
+#[ignore = "requires pinned harness"]
 async fn pinned_real_pi_02_bash_only_skills_and_tool_cwd_conform() {
     let _executable = require_conformance_executable();
     tokio::time::timeout(PINNED_TEST_WATCHDOG, async {
@@ -1357,6 +1452,37 @@ async fn pinned_real_pi_04_result_rejection_sibling_correction_and_termination_c
     })
     .await
     .expect("pinned real-Pi result conformance watchdog expired");
+}
+
+#[expect(
+    clippy::disallowed_methods,
+    reason = "real time is used only as an anti-hang watchdog, never as success evidence"
+)]
+#[tokio::test]
+#[ignore = "requires pinned harness"]
+async fn pinned_real_pi_04_codemode_only_keeps_terminal_result_direct() {
+    let _executable = require_conformance_executable();
+    tokio::time::timeout(PINNED_TEST_WATCHDOG, async {
+        let fixture = RealPiFixture::with_codemode_only(result_mode());
+        let mut running = RunningRealPi::launch(fixture);
+        running.release_startup().await;
+        let model = running.fixture.controller.next("model").await;
+        let names = tool_names(&model.value);
+        assert!(
+            names.contains("codemode"),
+            "built-in codemode was not activated: {names:?}"
+        );
+        let tool_name = result_tool_name(&model.value).to_owned();
+        model.release(count_one_result_response(
+            "call-codemode-result",
+            &tool_name,
+        ));
+        running.await_started().await;
+        let (fixture, outcome) = running.finish().await;
+        assert_count_one_result(fixture, outcome).await;
+    })
+    .await
+    .expect("pinned real-Pi codemode result watchdog expired");
 }
 
 #[expect(

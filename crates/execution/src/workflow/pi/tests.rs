@@ -980,6 +980,77 @@ fn result_mode_accepts_only_the_correlated_singleton_lifecycle() {
 }
 
 #[test]
+fn candidate_nested_and_truncated_tool_observations_do_not_settle_a_result() {
+    let mut events = values(SIBLING_RESULT_CORRECTION);
+    let insertion = events
+        .iter()
+        .position(|event| {
+            event["type"] == "tool_execution_end" && event["toolCallId"] == "call-sibling-read"
+        })
+        .unwrap();
+    // Nest under an ordinary call before the corrected singleton result. These
+    // observation-only fields cannot substitute for result or terminal authority.
+    let candidate = [
+        json!({"type": "tool_execution_start", "toolCallId": "nested-1", "toolName": "bash", "args": {"command": "echo"}, "parentToolCallId": "call-sibling-read"}),
+        json!({"type": "tool_execution_update", "toolCallId": "nested-1", "toolName": "bash", "args": {"command": "echo"}, "parentToolCallId": "call-sibling-read", "partialResult": {"content": [{"type": "text", "text": "partial"}]}}),
+        json!({"type": "tool_execution_end", "toolCallId": "nested-1", "toolName": "bash", "parentToolCallId": "call-sibling-read", "result": {"content": [{"type": "text", "text": "truncated"}], "structuredContent": {"output": "truncated", "truncated": true, "full_output_path": "/tmp/output"}, "details": {"truncation": {"truncated": true}, "fullOutputPath": "/tmp/output"}}, "isError": false}),
+        json!({"type": "tool_execution_start", "toolCallId": "nested-ps", "toolName": "powershell", "args": {"command": "Write-Output test"}, "parentToolCallId": "call-sibling-read"}),
+        json!({"type": "tool_execution_end", "toolCallId": "nested-ps", "toolName": "powershell", "parentToolCallId": "call-sibling-read", "result": {"content": [{"type": "text", "text": "truncated"}], "structuredContent": {"output": "truncated", "truncated": true, "full_output_path": "/tmp/powershell-output"}}, "isError": false}),
+        json!({"type": "response", "command": "prompt", "success": true, "data": {"disposition": "started"}}),
+        json!({"type": "response", "command": "steer", "success": true, "data": {"disposition": "handled"}}),
+        json!({"type": "response", "command": "follow_up", "success": true, "data": {"disposition": "queued"}}),
+    ];
+    events.splice(insertion..insertion, candidate);
+    for event in &mut events {
+        if let Some(message) = event.get_mut("message")
+            && message["role"] == "toolResult"
+            && message["toolCallId"] == "call-sibling-read"
+        {
+            message["nestedCalls"] = json!({"calls": [{"id": "nested-1", "name": "bash", "status": "ok", "arguments": {"command": "echo"}}, {"id": "nested-ps", "name": "powershell", "status": "ok", "argumentsBytes": 31}], "complete": false});
+            message["usage"] = usage();
+            message["source"] = json!("builtin:read");
+        }
+    }
+    let transcript = encoded(&events);
+    let replay = replay_accepted_result(&transcript, "call-corrected-result");
+    assert!(matches!(
+        replay.outcome,
+        AgentOutcome::Completed(CompletedAgentInvocation::Result(_))
+    ));
+    assert!(replay.observations.iter().any(|observation| matches!(
+        observation,
+        AgentObservation::UnrecognizedHarnessEvent { event } if event["toolCallId"] == "nested-1"
+    )));
+    assert!(replay.observations.iter().any(|observation| matches!(
+        observation,
+        AgentObservation::UnrecognizedHarnessEvent { event } if event["toolCallId"] == "nested-ps"
+    )));
+
+    let without_terminal = encoded(&events[..events.len() - 2]);
+    let end_offset = event_offset_for_call(
+        &without_terminal,
+        "tool_execution_end",
+        "call-corrected-result",
+    );
+    let mut parser = result_parser();
+    parser
+        .push_ignoring(&without_terminal[..end_offset])
+        .unwrap();
+    accept_result(
+        &mut parser,
+        "call-corrected-result",
+        Arc::new(json!({"result": {"answer": 42}})),
+    );
+    parser
+        .push_ignoring(&without_terminal[end_offset..])
+        .unwrap();
+    assert_failure(
+        &parser.finish(PiJsonV1ProcessCompletion::exited(true)),
+        AgentFailureCause::HarnessProtocolFailed,
+    );
+}
+
+#[test]
 fn sibling_result_rejection_is_recoverable_and_a_later_singleton_succeeds() {
     let replay = replay_accepted_result(SIBLING_RESULT_CORRECTION, "call-corrected-result");
     let AgentOutcome::Completed(CompletedAgentInvocation::Result(result)) = replay.outcome else {

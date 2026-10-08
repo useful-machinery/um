@@ -15,10 +15,11 @@ use std::ffi::OsStr;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-pub const PI_JSON_V1_SUPPORTED_RANGE: &str = ">=0.84.2 <0.88.0";
-pub const PI_JSON_V1_QUALIFICATION_VERSION: &str = "0.87.1";
+pub const PI_JSON_V1_SUPPORTED_RANGE: &str = ">=0.84.2 <0.88.0 || =0.99.1";
+pub const PI_JSON_V1_QUALIFICATION_VERSION: &str = "0.99.1";
 const PI_JSON_V1_MINIMUM_VERSION: (u64, u64, u64) = (0, 84, 2);
 const PI_JSON_V1_MAXIMUM_VERSION: (u64, u64, u64) = (0, 88, 0);
+const PI_JSON_V1_CANDIDATE_VERSION: (u64, u64, u64) = (0, 99, 1);
 const CAPABILITY_PROBE_ARGUMENTS: [&str; 7] = [
     "--no-approve",
     "--no-extensions",
@@ -93,7 +94,7 @@ impl ValidatedPiInstallation {
     pub fn fixture(executable: PathBuf) -> Self {
         Self {
             executable,
-            version: PiVersion::fixture(0, 87, 1, PI_JSON_V1_QUALIFICATION_VERSION),
+            version: PiVersion::fixture(0, 99, 1, PI_JSON_V1_QUALIFICATION_VERSION),
             capabilities: PiJsonV1Capabilities {
                 required: REQUIRED_CAPABILITIES,
             },
@@ -159,7 +160,7 @@ impl fmt::Display for PiInstallationFailure {
         match self {
             Self::Missing => write!(
                 formatter,
-                "Pi was not found in inherited PATH; install a stable Pi release in range {PI_JSON_V1_SUPPORTED_RANGE}"
+                "Pi was not found in inherited PATH; install a supported stable Pi release ({PI_JSON_V1_SUPPORTED_RANGE})"
             ),
             Self::Unexecutable { .. } => formatter.write_str(
                 "Pi selected from inherited PATH could not complete its validation probes",
@@ -177,7 +178,7 @@ impl fmt::Display for PiInstallationFailure {
                 .write_str("Pi selected from inherited PATH returned malformed capability help"),
             Self::Unsupported(PiIncompatibility::Version(version)) => write!(
                 formatter,
-                "Pi version {version} selected from inherited PATH is unsupported; install a stable Pi release in range {PI_JSON_V1_SUPPORTED_RANGE}"
+                "Pi version {version} selected from inherited PATH is unsupported; install a supported stable Pi release ({PI_JSON_V1_SUPPORTED_RANGE})"
             ),
             Self::Unsupported(PiIncompatibility::Capability { capability, .. }) => write!(
                 formatter,
@@ -309,8 +310,9 @@ fn parse_version_output(output: &CommandOutput) -> Result<PiVersion, PiInstallat
 }
 
 fn compatibility_profile(version: &PiVersion) -> Option<AgentCompatibilityProfile> {
-    (version.numeric() >= PI_JSON_V1_MINIMUM_VERSION
+    ((version.numeric() >= PI_JSON_V1_MINIMUM_VERSION
         && version.numeric() < PI_JSON_V1_MAXIMUM_VERSION)
+        || version.numeric() == PI_JSON_V1_CANDIDATE_VERSION)
         .then_some(AgentCompatibilityProfile::PiJsonV1)
 }
 

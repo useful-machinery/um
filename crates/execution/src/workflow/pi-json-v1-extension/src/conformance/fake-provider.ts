@@ -706,6 +706,25 @@ export default function fakeProviderExtension(pi: ExtensionAPI): void {
   });
 
   pi.registerTool({
+    name: "conformance_nested",
+    label: "Conformance nested tool",
+    description: "Calls a tool through Pi's nested execution pipeline",
+    parameters: Type.Object({}),
+    async execute(_toolCallId, _parameters, _signal, _onUpdate, ctx) {
+      const nested = await ctx.executeTool("conformance_gate", {
+        value: "nested",
+      });
+      if (nested.isError) {
+        throw new Error("The nested conformance tool failed");
+      }
+      return {
+        content: [{ type: "text" as const, text: "nested tool completed" }],
+        details: {},
+      };
+    },
+  });
+
+  pi.registerTool({
     name: "conformance_stubborn",
     label: "Conformance stubborn descendant",
     description:

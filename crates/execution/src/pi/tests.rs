@@ -98,7 +98,7 @@ fn bounded_compatibility_policy_constructs_the_complete_validated_value() {
     let executable = std::env::current_exe().unwrap();
     let runner = FakeRunner {
         invocations: Mutex::new(Vec::new()),
-        version: output(b"0.87.1\n"),
+        version: output(b"0.99.1\n"),
         capabilities: output(COMPLETE_HELP.as_bytes()),
     };
 
@@ -109,7 +109,7 @@ fn bounded_compatibility_policy_constructs_the_complete_validated_value() {
         installation.executable(),
         fs::canonicalize(executable).unwrap()
     );
-    assert_eq!(installation.version().as_str(), "0.87.1");
+    assert_eq!(installation.version().as_str(), "0.99.1");
     assert_eq!(installation.profile().as_str(), "PiJsonV1");
     assert_eq!(
         installation.capabilities().required(),
@@ -131,6 +131,8 @@ fn lower_bound_and_intervening_patches_retain_exact_versions() {
         ("0.84.2", LOWER_BOUND_HELP),
         ("0.85.1", COMPLETE_HELP),
         ("0.86.1", COMPLETE_HELP),
+        ("0.87.1", COMPLETE_HELP),
+        ("0.99.1", COMPLETE_HELP),
     ] {
         let runner = FakeRunner {
             invocations: Mutex::new(Vec::new()),
@@ -150,7 +152,9 @@ fn lower_bound_and_intervening_patches_retain_exact_versions() {
 #[test]
 fn version_range_and_capabilities_are_both_required() {
     let executable = std::env::current_exe().unwrap();
-    for unsupported in ["0.83.0", "0.84.1", "0.88.0"] {
+    for unsupported in [
+        "0.83.0", "0.84.1", "0.88.0", "0.95.0", "0.99.0", "0.99.2", "0.100.0",
+    ] {
         let runner = FakeRunner {
             invocations: Mutex::new(Vec::new()),
             version: output(format!("{unsupported}\n").as_bytes()),
@@ -212,7 +216,7 @@ fn version_range_and_capabilities_are_both_required() {
     ] {
         let runner = FakeRunner {
             invocations: Mutex::new(Vec::new()),
-            version: output(b"0.87.1\n"),
+            version: output(b"0.99.1\n"),
             capabilities: output(COMPLETE_HELP.replace(advertisement, replacement).as_bytes()),
         };
         assert_eq!(
@@ -220,7 +224,7 @@ fn version_range_and_capabilities_are_both_required() {
             Err(PiInstallationFailure::Unsupported(
                 PiIncompatibility::Capability {
                     capability,
-                    version: "0.87.1".to_owned(),
+                    version: "0.99.1".to_owned(),
                 }
             ))
         );

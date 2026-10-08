@@ -270,6 +270,9 @@ export function createResultTool(
 
   return {
     name: config.toolName,
+    // Codemode's only mode hides direct tools behind nested execution. Terminal
+    // results must remain model calls so their IDs correlate with agent_end.
+    exposure: "model-only" as const,
     label: "Submit workflow result",
     description:
       "Submit the final workflow result. Call this tool by itself as the final action; a valid result ends the step.",
