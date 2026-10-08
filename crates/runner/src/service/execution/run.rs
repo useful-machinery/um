@@ -287,6 +287,7 @@ impl ExecutionJob {
             }
             None => WorkflowExecutionStart::initial(process_guard_registry),
         };
+        let start = start.with_finalization_identity(run_id.to_owned(), attempt_id.to_owned());
         let execution = if let (Some(agent_staging), Some(diagnostic_sessions)) =
             (&agent_staging, agent_diagnostic_sessions)
         {

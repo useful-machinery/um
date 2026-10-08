@@ -887,6 +887,7 @@ struct FinalizationRuntime<Deadline> {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct RuntimeState<Cause, Output, Deadline = ()> {
     definition: Arc<RuntimeDefinition>,
+    pub(crate) finalization_identity: Option<(String, String)>,
     pub(crate) workflow: WorkflowState<Deadline>,
     // One namespace and one reducer map; role is retained in the definition and events.
     pub(crate) steps: BTreeMap<String, StepRuntimeState<Cause, Output>>,
@@ -1153,10 +1154,25 @@ where
     Output: Clone + ConditionOutput,
     Deadline: Clone,
 {
+    initialize_seeded_with_identity(admitted, seed, initial_cancellation, None)
+}
+
+pub(super) fn initialize_seeded_with_identity<Provisional, Cause, Output, Deadline>(
+    admitted: &AdmittedWorkflow,
+    seed: ExecutionSeed<Output>,
+    initial_cancellation: Option<InitialCancellation<Deadline>>,
+    identity: Option<(String, String)>,
+) -> Reduction<Provisional, Cause, Output, Deadline>
+where
+    Cause: Clone,
+    Output: Clone + ConditionOutput,
+    Deadline: Clone,
+{
     initialize_seeded_definition(
         ExecutionStart {
             definition: RuntimeDefinition::from_admitted(admitted),
             initial_cancellation,
+            identity,
         },
         seed,
     )
@@ -1165,6 +1181,7 @@ where
 pub(in crate::workflow) struct ExecutionStart<Deadline> {
     pub(in crate::workflow) definition: RuntimeDefinition,
     pub(in crate::workflow) initial_cancellation: Option<InitialCancellation<Deadline>>,
+    pub(in crate::workflow) identity: Option<(String, String)>,
 }
 
 pub(in crate::workflow) fn initialize_seeded_definition<Provisional, Cause, Output, Deadline>(
@@ -1221,6 +1238,7 @@ where
     let mut reduction = Reduction {
         state: RuntimeState {
             definition: Arc::new(start.definition),
+            finalization_identity: start.identity,
             workflow: WorkflowState::Executing {
                 gate: SchedulingGate::Open,
             },
@@ -3422,7 +3440,16 @@ fn enter_finalization_or_finish<Provisional, Cause, Output, Deadline>(
         OrdinaryOutcome::Cancelled { reason } => Some(*reason),
         OrdinaryOutcome::Succeeded => None,
     };
+    let (run_id, attempt_id) = reduction
+        .state
+        .finalization_identity
+        .as_ref()
+        .map_or(("unavailable", "unavailable"), |(run, attempt)| {
+            (run.as_str(), attempt.as_str())
+        });
     let context = finalization_context::serialize(FinalizationContext {
+        run_id,
+        attempt_id,
         trigger,
         primary_issue_step_id,
         cancellation_reason: ordinary_cancellation,
@@ -3524,15 +3551,21 @@ fn ordinary_issues<Cause, Output, Deadline>(
         .iter()
         .filter_map(|id| {
             let runtime = state.steps.get(id)?;
-            let disposition = match runtime.state {
-                StepState::Failed { .. } => OrdinaryIssueDisposition::Failed,
-                StepState::Blocked { .. } => OrdinaryIssueDisposition::Blocked,
+            let (disposition, failure, blocked_code) = match &runtime.state {
+                StepState::Failed { detail } => {
+                    (OrdinaryIssueDisposition::Failed, Some(detail.clone()), None)
+                }
+                StepState::Blocked { detail } => {
+                    (OrdinaryIssueDisposition::Blocked, None, Some(detail.code))
+                }
                 _ => return None,
             };
             Some(OrdinaryIssue {
                 step_id: id.clone(),
                 failure_policy: state.definition.steps.get(id)?.failure_policy,
                 disposition,
+                failure,
+                blocked_code,
             })
         })
         .collect()

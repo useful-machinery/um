@@ -187,6 +187,7 @@ impl<Output, Deadline> ReductionBuilder<Output, Deadline> {
     {
         runtime::initialize_seeded_definition(
             ExecutionStart {
+                identity: None,
                 definition: self.definition,
                 initial_cancellation: self.initial_cancellation,
             },

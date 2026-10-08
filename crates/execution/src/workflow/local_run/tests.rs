@@ -2169,6 +2169,11 @@ fn retry_commits_only_fresh_attempt_state_and_retained_inputs() {
     assert_eq!(state.current_attempt_number, 2);
     assert_eq!(state.attempts[0], predecessor);
     let attempt = &state.attempts[1];
+    assert_eq!(
+        retry.finalization_identity().unwrap(),
+        (state.local_run_id.clone(), attempt.attempt_id.clone())
+    );
+    assert_ne!(attempt.attempt_id, predecessor.attempt_id);
     assert_eq!(attempt.trigger, AttemptTriggerV1::ExplicitRetry);
     assert_eq!(attempt.prior_attempt_number, Some(1));
     assert_eq!(

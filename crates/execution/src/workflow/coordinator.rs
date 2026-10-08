@@ -945,6 +945,7 @@ where
     commits: Commits,
     actions: Actions,
     seed: runtime::ExecutionSeed<Output>,
+    finalization_identity: Option<(String, String)>,
     state: Option<RuntimeState<Cause, Output, Clock::Instant>>,
 }
 
@@ -991,8 +992,14 @@ where
             commits,
             actions,
             seed,
+            finalization_identity: None,
             state: None,
         }
+    }
+
+    pub(crate) fn with_finalization_identity(mut self, identity: Option<(String, String)>) -> Self {
+        self.finalization_identity = identity;
+        self
     }
 
     pub(crate) async fn run(
@@ -1028,12 +1035,20 @@ where
             DriverOccurrenceContentDigest,
         > = BTreeMap::new();
         let occurrence_identity_capacity = self.admitted.capacity().maximum_transitions;
-        let initialization = runtime::initialize_seeded_with_operation::<
-            Provisional,
-            Cause,
-            Output,
-            Clock::Instant,
-        >(&self.admitted, self.seed.clone(), initial_cancellation);
+        let initialization = if let Some(identity) = self.finalization_identity.clone() {
+            runtime::initialize_seeded_with_identity::<Provisional, Cause, Output, Clock::Instant>(
+                &self.admitted,
+                self.seed.clone(),
+                initial_cancellation,
+                Some(identity),
+            )
+        } else {
+            runtime::initialize_seeded_with_operation::<Provisional, Cause, Output, Clock::Instant>(
+                &self.admitted,
+                self.seed.clone(),
+                initial_cancellation,
+            )
+        };
         if initialization.state.transition_capacity_exceeded() {
             self.commit_coordination_diagnostic(
                 ordinal,

@@ -3234,6 +3234,7 @@ where
 pub struct WorkflowExecutionStart {
     process_guards: ProcessGuardRegistry,
     seed: super::runtime::ExecutionSeed<CapturedValue>,
+    finalization_identity: Option<(String, String)>,
 }
 
 impl WorkflowExecutionStart {
@@ -3248,7 +3249,13 @@ impl WorkflowExecutionStart {
         Self {
             process_guards,
             seed,
+            finalization_identity: None,
         }
+    }
+
+    pub fn with_finalization_identity(mut self, run_id: String, attempt_id: String) -> Self {
+        self.finalization_identity = Some((run_id, attempt_id));
+        self
     }
 }
 
@@ -3325,6 +3332,7 @@ where
     let WorkflowExecutionStart {
         process_guards,
         seed,
+        finalization_identity,
     } = start.into();
     if !artifacts.is_bound_to(admitted.execution()) {
         return Err(CoordinationError::ArtifactStagingMismatch);
@@ -3358,6 +3366,7 @@ where
     );
     let lifecycle = actions.clone();
     let result = Coordinator::new_seeded(admitted, receiver, clock, commits, actions, seed)
+        .with_finalization_identity(finalization_identity)
         .run()
         .await;
     if matches!(

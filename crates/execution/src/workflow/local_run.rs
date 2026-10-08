@@ -2123,6 +2123,16 @@ impl LocalAttemptOwner {
         self.attempt_number
     }
 
+    pub fn finalization_identity(&self) -> Result<(String, String), LocalRunDirectoryError> {
+        let state = lock_state(&self.state.current)?;
+        let attempt = state
+            .attempts
+            .iter()
+            .find(|attempt| attempt.attempt_number == self.attempt_number)
+            .ok_or(LocalRunDirectoryError::StateInvalid)?;
+        Ok((state.local_run_id.clone(), attempt.attempt_id.clone()))
+    }
+
     pub fn continuation_record(
         &self,
     ) -> Result<Option<super::publication::ContinuationRecordV1>, LocalRunDirectoryError> {

@@ -741,8 +741,10 @@ async fn execute_attempt_phases(
         .await
         .map_err(anyhow::Error::new)
         .context("load retained workflow values")?;
+    let (run_id, attempt_id) = attempt.run()?.finalization_identity()?;
     let execution_start =
-        WorkflowExecutionStart::seeded(attempt.run()?.process_guard_registry(), seed);
+        WorkflowExecutionStart::seeded(attempt.run()?.process_guard_registry(), seed)
+            .with_finalization_identity(run_id, attempt_id);
     attempt.execution_started = true;
     let execution = if let Some(error) = hooks.execution_failure() {
         Err(error)

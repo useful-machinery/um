@@ -3595,7 +3595,7 @@ fn initial_cancellation_rearms_finalizers_and_blocks_unavailable_ordinary_output
     };
     assert_eq!(
         context.as_ref(),
-        br#"{"schemaVersion":1,"trigger":"cancelled","primaryIssueStepId":null,"cancellationReason":"user_request","ordinaryIssues":[]}"#
+        br#"{"schemaVersion":2,"runId":"unavailable","attemptId":"unavailable","trigger":"cancelled","primaryIssueStepId":null,"cancellationReason":"user_request","ordinaryIssues":[]}"#
     );
 
     let stale: TestReduction = reduce(
@@ -3873,6 +3873,7 @@ fn trace_advisory_issue_context_is_exact_sorted_and_immutable() {
         1,
     );
     let mut state = initialize_test(definition).state;
+    state.finalization_identity = Some(("run-1".into(), "attempt-1".into()));
     reduce_and_advance(
         &mut state,
         Occurrence::StepStarted {
@@ -3894,7 +3895,7 @@ fn trace_advisory_issue_context_is_exact_sorted_and_immutable() {
     let ActionInput::FinalizationContext(bytes) = &inputs["context"] else {
         panic!()
     };
-    assert_eq!(bytes.as_ref(), br#"{"schemaVersion":1,"trigger":"succeeded","primaryIssueStepId":null,"cancellationReason":null,"ordinaryIssues":[{"stepId":"lint","failurePolicy":"advisory","disposition":"failed"}]}"#);
+    assert_eq!(bytes.as_ref(), br#"{"schemaVersion":2,"runId":"run-1","attemptId":"attempt-1","trigger":"succeeded","primaryIssueStepId":null,"cancellationReason":null,"ordinaryIssues":[{"stepId":"lint","failurePolicy":"advisory","disposition":"failed","failure":{"phase":"execution","code":"command_wait_failed","exitCode":null,"input":null,"output":null,"diagnostic":null},"blockedCode":null}]}"#);
     let retained = Arc::clone(bytes);
     let notify = boundary.actions[0].id;
     reduce_and_advance(
@@ -4959,7 +4960,7 @@ fn recovery_trace_output_capture_failure_only_authorizes_a_full_target_rerun() {
     };
     assert_eq!(
         context.as_ref(),
-        br#"{"schemaVersion":1,"trigger":"succeeded","primaryIssueStepId":null,"cancellationReason":null,"ordinaryIssues":[]}"#
+        br#"{"schemaVersion":2,"runId":"unavailable","attemptId":"unavailable","trigger":"succeeded","primaryIssueStepId":null,"cancellationReason":null,"ordinaryIssues":[]}"#
     );
     assert!(state.last_transition_sequence.get() <= 16);
 }
