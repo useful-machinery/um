@@ -92,6 +92,10 @@ impl AssignmentManager {
         // Run the synchronous release chain on the blocking pool, not the manager caller.
         tokio::task::spawn_blocking(move || {
             let result = root.release_pending(quiescence, disposition).wait();
+            // The root itself still holds the work-root lease through its trees
+            // and cleanup engine. Release it before waking the manager: a settled
+            // slot may immediately let the next boot acquire the same work root.
+            drop(root);
             let _ = sender.send(ManagerEvent::CleanupFinished {
                 assignment_id,
                 result,

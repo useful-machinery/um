@@ -1480,8 +1480,31 @@ mod tests {
                 stream
                     .set_read_timeout(Some(Duration::from_secs(10)))
                     .unwrap();
-                let mut request = [0_u8; 4096];
-                let _ = stream.read(&mut request).unwrap();
+                // Wait for the entire PUT, not just its first TCP segment. Closing
+                // with an unread body can reset the connection before reqwest sees
+                // the status line, making the status case a transport failure.
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 4096];
+                let header_end = loop {
+                    let count = stream.read(&mut buffer).unwrap();
+                    assert!(count > 0, "PUT closed before its body");
+                    request.extend_from_slice(&buffer[..count]);
+                    assert!(request.len() <= 4096, "unexpectedly large PUT");
+                    if let Some(end) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+                        break end + 4;
+                    }
+                };
+                assert!(
+                    String::from_utf8_lossy(&request[..header_end])
+                        .to_ascii_lowercase()
+                        .contains("content-length: 2\r\n")
+                );
+                while request.len() - header_end < 2 {
+                    let count = stream.read(&mut buffer).unwrap();
+                    assert!(count > 0, "PUT closed before its body");
+                    request.extend_from_slice(&buffer[..count]);
+                }
+                assert_eq!(&request[header_end..], b"{}");
                 if respond {
                     stream.write_all(b"HTTP/1.1 503 Unavailable\r\nContent-Length: 23\r\n\r\nsecret provider message").unwrap();
                 }

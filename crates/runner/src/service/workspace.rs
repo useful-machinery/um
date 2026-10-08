@@ -2080,9 +2080,15 @@ impl WorkspaceLease {
             return pending;
         };
         let state = Arc::clone(&self.state);
+        let completion = state.completion.clone();
         if std::thread::Builder::new()
             .name("runner-workspace-release".to_owned())
-            .spawn(move || state.completion.complete(state.engine.remove(&tree)))
+            .spawn(move || {
+                let result = state.engine.remove(&tree);
+                drop(tree);
+                drop(state);
+                completion.complete(result);
+            })
             .is_err()
         {
             self.state
@@ -2147,6 +2153,7 @@ impl WorkspaceLease {
             return (pending, None);
         };
         if quiescence == ProcessQuiescence::Failed {
+            drop(tree);
             self.state
                 .completion
                 .complete(CleanupResult::Quarantined(CleanupFailure::Quiescence));
@@ -2290,6 +2297,10 @@ impl AssignmentRoot {
                         workspace.retain_and_complete()
                     }
                 };
+                // Completion may wake a caller that immediately drops the old boot
+                // and acquires the same work root. Release every lock-bearing tree
+                // before signaling; retain_and_complete consumes the workspace.
+                drop(claim);
                 drop(assignment_tree);
                 worker_completion.complete(result);
             }))

@@ -365,6 +365,7 @@ enum CodexErrorKind {
     FlexUnavailable,
     ServerOverloaded,
     CyberPolicy,
+    TooManyDenials,
     InternalServerError,
     Unauthorized,
     BadRequest,
@@ -2063,9 +2064,10 @@ impl CodexAppServerV1Parser {
         let status = required_nonempty_string(turn, "status")
             .ok_or_else(|| self.failure_for_current_phase())?;
         self.require_turn_object(turn, status)?;
+        let terminal_has_error = matches!(turn.get("error"), Some(Value::Object(_)));
         let terminal_info = match turn.get("error") {
             None | Some(Value::Null) => None,
-            Some(Value::Object(error)) if status == "failed" => {
+            Some(Value::Object(error)) if matches!(status, "failed" | "interrupted") => {
                 let message = required_nonempty_string(error, "message")
                     .ok_or_else(|| self.failure_for_current_phase())?;
                 let info = self.parse_optional_codex_error_info(error.get("codexErrorInfo"))?;
@@ -2088,9 +2090,13 @@ impl CodexAppServerV1Parser {
                 self.complete_retry(true);
                 NativeTerminal::Completed
             }
-            "interrupted" if terminal_info.is_none() => {
+            "interrupted" => {
                 self.complete_retry(false);
-                NativeTerminal::Failed(AgentHarnessFailureDetail::ModelAborted)
+                NativeTerminal::Failed(if terminal_has_error {
+                    self.correlate_native_failure(terminal_info)?
+                } else {
+                    AgentHarnessFailureDetail::ModelAborted
+                })
             }
             "failed" => {
                 self.complete_retry(false);
@@ -2375,6 +2381,7 @@ impl CodexAppServerV1Parser {
                 "flexUnavailable" => CodexErrorKind::FlexUnavailable,
                 "serverOverloaded" => CodexErrorKind::ServerOverloaded,
                 "cyberPolicy" => CodexErrorKind::CyberPolicy,
+                "tooManyDenials" => CodexErrorKind::TooManyDenials,
                 "internalServerError" => CodexErrorKind::InternalServerError,
                 "unauthorized" => CodexErrorKind::Unauthorized,
                 "badRequest" => CodexErrorKind::BadRequest,

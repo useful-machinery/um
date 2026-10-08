@@ -6,6 +6,7 @@ use std::num::{NonZeroU64, NonZeroUsize};
 use std::os::unix::fs::{PermissionsExt as _, symlink};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use base64::Engine as _;
@@ -1436,6 +1437,7 @@ fn codex_process_fixture() {
     if matches!(
         scenario.as_str(),
         "cancellation-blocked"
+            | "cancellation-interrupted-with-error"
             | "cancellation-after-output"
             | "cancellation-after-async"
             | "cancellation-stubborn"
@@ -1460,7 +1462,9 @@ fn codex_process_fixture() {
             }
         }
         write_server_frame(&mut output, json!({"id": 5, "result": {}}));
-        send_turn_terminal(&mut output, "interrupted", items, None);
+        let error = (scenario == "cancellation-interrupted-with-error")
+            .then_some(("guardian denial", json!("tooManyDenials")));
+        send_turn_terminal(&mut output, "interrupted", items, error);
         expect_client_eof(&mut input);
         return;
     }
@@ -1598,6 +1602,8 @@ fn codex_process_fixture() {
             | "failure-after-start-hook"
             | "failure-after-start-model"
             | "failure-after-start-provider-other-prose"
+            | "failure-after-start-too-many-denials"
+            | "interrupted-too-many-denials"
             | "failure-after-start-authentication"
             | "failure-after-start-stubborn"
             | "failure-after-partial-output"
@@ -1653,6 +1659,9 @@ fn codex_process_fixture() {
         }
         let (message, info) = match scenario.as_str() {
             "failure-after-start-model" => ("model diagnostic", json!("badRequest")),
+            "failure-after-start-too-many-denials" | "interrupted-too-many-denials" => {
+                ("denial diagnostic", json!("tooManyDenials"))
+            }
             "failure-after-start-provider-other-prose" => {
                 ("unrelated provider prose", json!("internalServerError"))
             }
@@ -1677,10 +1686,16 @@ fn codex_process_fixture() {
             ),
             _ => ("native execution diagnostic", json!("other")),
         };
-        send_native_error(&mut output, message, info.clone(), false);
+        if scenario != "interrupted-too-many-denials" {
+            send_native_error(&mut output, message, info.clone(), false);
+        }
         send_turn_terminal(
             &mut output,
-            "failed",
+            if scenario == "interrupted-too-many-denials" {
+                "interrupted"
+            } else {
+                "failed"
+            },
             items,
             Some(("terminal prose differs", info)),
         );
@@ -1707,6 +1722,17 @@ fn codex_process_fixture() {
                     "startedAtMs": 19,
                 },
                 "emittedAtMs": 20,
+            }),
+        );
+        write_server_frame(
+            &mut output,
+            json!({
+                "method": "mcpServer/event/stream/notification",
+                "params": {
+                    "subscriptionId": "fixture-subscription",
+                    "notification": {"method": "notifications/events/event", "params": {}},
+                },
+                "emittedAtMs": 21,
             }),
         );
     }
@@ -1879,6 +1905,10 @@ enum LoopbackProviderTurn {
 
 enum LoopbackProviderResponse {
     Turns(VecDeque<LoopbackProviderTurn>),
+    Guardian {
+        parent_calls: Arc<AtomicUsize>,
+        classified: Arc<tokio::sync::Notify>,
+    },
     ServerError,
 }
 
@@ -1890,6 +1920,17 @@ struct LoopbackResponsesProvider {
 }
 
 impl LoopbackResponsesProvider {
+    async fn start_guardian() -> Self {
+        Self::start_with_response_release(
+            LoopbackProviderResponse::Guardian {
+                parent_calls: Arc::new(AtomicUsize::new(0)),
+                classified: Arc::new(tokio::sync::Notify::new()),
+            },
+            None,
+        )
+        .await
+    }
+
     async fn start_sequence(responses: &[&str]) -> Self {
         assert!(!responses.is_empty());
         Self::start_with_response_release(
@@ -1975,6 +2016,7 @@ impl LoopbackResponsesProvider {
         let task = tokio::spawn(async move {
             let mut response = response;
             let mut response_release = response_release;
+            let mut connections = tokio::task::JoinSet::new();
             loop {
                 let accepted = tokio::select! {
                     biased;
@@ -1982,8 +2024,26 @@ impl LoopbackResponsesProvider {
                     accepted = listener.accept() => accepted,
                 };
                 let (stream, _) = accepted.unwrap();
-                if serve_provider_request(stream, &requests, &mut response, &mut response_release)
-                    .await
+                if let LoopbackProviderResponse::Guardian {
+                    parent_calls,
+                    classified,
+                } = &response
+                {
+                    let requests = requests.clone();
+                    let mut response = LoopbackProviderResponse::Guardian {
+                        parent_calls: Arc::clone(parent_calls),
+                        classified: Arc::clone(classified),
+                    };
+                    connections.spawn(async move {
+                        serve_provider_request(stream, &requests, &mut response, &mut None).await;
+                    });
+                } else if serve_provider_request(
+                    stream,
+                    &requests,
+                    &mut response,
+                    &mut response_release,
+                )
+                .await
                 {
                     break;
                 }
@@ -2037,6 +2097,33 @@ async fn serve_provider_request(
         .nth(1)
         .unwrap()
         .to_owned();
+    if matches!(response, LoopbackProviderResponse::Guardian { .. })
+        && request_line.starts_with("GET /models")
+    {
+        // A known-model catalog keeps the Guardian policy explicit and avoids
+        // fallback metadata. This is an isolated native fixture, not an admission policy.
+        let model: Value = serde_json::from_str(include_str!(
+            "../../../tests/fixtures/codex-guardian-model.json"
+        ))
+        .unwrap();
+        let payload = json!({"models": [model]}).to_string();
+        let header = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            payload.len()
+        );
+        stream.write_all(header.as_bytes()).await.unwrap();
+        stream.write_all(payload.as_bytes()).await.unwrap();
+        return false;
+    }
+    if request_line.starts_with("GET /responses ") {
+        // Guardian's optional websocket warmup has no request body; refusing it
+        // confines the fixture to the already exercised HTTP Responses transport.
+        stream
+            .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        return false;
+    }
     let mut content_length = None;
     let mut authorization = String::new();
     for line in lines.filter(|line| !line.is_empty()) {
@@ -2047,7 +2134,8 @@ async fn serve_provider_request(
             authorization = value.trim().to_owned();
         }
     }
-    let content_length = content_length.unwrap();
+    let content_length = content_length
+        .unwrap_or_else(|| panic!("loopback request has no content length: {request_line}"));
     assert!(content_length <= 1024 * 1024);
     while bytes.len() < header_end + content_length {
         let mut chunk = [0_u8; 4096];
@@ -2055,20 +2143,57 @@ async fn serve_provider_request(
         assert!(read > 0);
         bytes.extend_from_slice(&chunk[..read]);
     }
-    let body = serde_json::from_slice(&bytes[header_end..header_end + content_length]).unwrap();
+    let body: Value =
+        serde_json::from_slice(&bytes[header_end..header_end + content_length]).unwrap();
     requests
         .send(ProviderRequest {
             path,
             authorization,
-            body,
+            body: body.clone(),
         })
         .unwrap();
     if let Some(response_release) = response_release.take() {
         response_release.await.unwrap();
     }
     let (status, content_type, payload) = match response {
-        LoopbackProviderResponse::Turns(turns) => {
-            let turn = turns.pop_front().expect("one loopback response");
+        LoopbackProviderResponse::Turns(_) | LoopbackProviderResponse::Guardian { .. } => {
+            let turn = match response {
+                LoopbackProviderResponse::Turns(turns) => {
+                    turns.pop_front().expect("one loopback response")
+                }
+                LoopbackProviderResponse::Guardian { parent_calls, .. } => {
+                    if body["model"] == "gpt-5.6-luna" {
+                        LoopbackProviderTurn::Completed("high".to_owned())
+                    } else if body
+                        .pointer("/client_metadata/x-openai-subagent")
+                        .and_then(Value::as_str)
+                        == Some("guardian")
+                    {
+                        LoopbackProviderTurn::Completed(
+                            json!({
+                                "risk_level":"high", "user_authorization":"unknown",
+                                "outcome":"deny", "rationale":"Fixture denies this action."
+                            })
+                            .to_string(),
+                        )
+                    } else {
+                        let index = parent_calls.fetch_add(1, Ordering::SeqCst);
+                        if index < 2 {
+                            LoopbackProviderTurn::NamespacedFunctionCall {
+                                call_id: format!("guardian-tool-{index}"),
+                                namespace: "mcp__fixture".to_owned(),
+                                name: "confirm_action".to_owned(),
+                                arguments: json!({}),
+                            }
+                        } else {
+                            LoopbackProviderTurn::Completed(RESPONSE.to_owned())
+                        }
+                    }
+                }
+                LoopbackProviderResponse::ServerError => {
+                    panic!("server errors are handled separately")
+                }
+            };
             let output = match turn {
                 LoopbackProviderTurn::Completed(response) => json!({
                     "type": "message",
@@ -2115,7 +2240,7 @@ async fn serve_provider_request(
                     "input": input,
                 }),
             };
-            let events = [
+            let mut events = vec![
                 json!({
                     "type": "response.created",
                     "response": {"id": "response-loopback"}
@@ -2138,6 +2263,14 @@ async fn serve_provider_request(
                     }
                 }),
             ];
+            if matches!(response, LoopbackProviderResponse::Guardian { .. })
+                && body["model"] == "gpt-5.6-luna"
+            {
+                events.insert(
+                    1,
+                    json!({"type":"response.output_text.delta", "delta":"high"}),
+                );
+            }
             let payload = events
                 .into_iter()
                 .map(|event| {
@@ -2167,7 +2300,18 @@ async fn serve_provider_request(
         "HTTP/1.1 {status}\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
         payload.len()
     );
-    for bytes in [header.as_bytes(), payload.as_bytes()] {
+    // Keep the first action open long enough for its asynchronous high-risk
+    // classification to be available to the second action's review.
+    let split = if matches!(response, LoopbackProviderResponse::Guardian { .. })
+        && body["model"] == "mock-model"
+        && body["client_metadata"]["x-openai-subagent"].is_null()
+        && !body["input"].to_string().contains("guardian-tool")
+    {
+        payload.find("event: response.completed").unwrap_or(0)
+    } else {
+        0
+    };
+    for bytes in [header.as_bytes(), &payload.as_bytes()[..split]] {
         match stream.write_all(bytes).await {
             Ok(()) => {}
             Err(error)
@@ -2181,13 +2325,40 @@ async fn serve_provider_request(
             Err(error) => panic!("loopback provider write failed: {error:?}"),
         }
     }
+    if split > 0 {
+        // The first action's response remains open until the asynchronous
+        // high-risk classifier has produced its native output.
+        if let LoopbackProviderResponse::Guardian { classified, .. } = response {
+            classified.notified().await;
+        }
+    }
+    match stream.write_all(&payload.as_bytes()[split..]).await {
+        Ok(()) => {}
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
+            ) =>
+        {
+            return true;
+        }
+        Err(error) => panic!("loopback provider write failed: {error:?}"),
+    }
     match stream.shutdown().await {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotConnected => {}
         Err(error) => panic!("loopback provider shutdown failed: {error:?}"),
     }
+    if let LoopbackProviderResponse::Guardian { classified, .. } = response
+        && body["model"] == "gpt-5.6-luna"
+    {
+        classified.notify_one();
+    }
     match response {
         LoopbackProviderResponse::Turns(turns) => turns.is_empty(),
+        LoopbackProviderResponse::Guardian { parent_calls, .. } => {
+            parent_calls.load(Ordering::SeqCst) >= 3
+        }
         LoopbackProviderResponse::ServerError => true,
     }
 }
@@ -2417,7 +2588,7 @@ pub(super) mod normal {
     }
 
     #[tokio::test]
-    async fn project_and_strict_review_metadata_do_not_settle_the_process() {
+    async fn project_guardian_and_mcp_metadata_do_not_settle_the_process() {
         with_watchdog(async {
             let fixture = ProcessFixture::new("metadata-nonsettling", AgentValueMode::None, 1024);
             let observations = fixture.observations.clone();
@@ -2432,7 +2603,7 @@ pub(super) mod normal {
                         AgentObservation::UnrecognizedHarnessEvent { .. }
                     ))
                     .count(),
-                2,
+                3,
             );
         })
         .await;
@@ -2479,7 +2650,13 @@ pub(super) mod exact_binary {
 
     impl DirectCodex {
         fn start(provider_address: std::net::SocketAddr) -> Self {
-            let fixture = ProcessFixture::with_exact_binary(provider_address, AgentValueMode::None);
+            Self::start_with_fixture(ProcessFixture::with_exact_binary(
+                provider_address,
+                AgentValueMode::None,
+            ))
+        }
+
+        fn start_with_fixture(fixture: ProcessFixture) -> Self {
             let plan = prepare_launch(fixture.invocation.as_ref().unwrap()).unwrap();
             let temporary_root = fixture.codex_home.parent().unwrap();
             let mut command = tokio::process::Command::new(&fixture.executable);
@@ -2528,12 +2705,15 @@ pub(super) mod exact_binary {
 
         async fn read_until(&mut self, mut predicate: impl FnMut(&Value) -> bool) -> Value {
             loop {
-                let line = self
-                    .output
-                    .next_line()
-                    .await
-                    .unwrap()
-                    .expect("pinned Codex closed stdout before the expected frame");
+                let Some(line) = self.output.next_line().await.unwrap() else {
+                    let stderr = (&mut self.stderr).await.unwrap();
+                    panic!(
+                        "pinned Codex closed stdout before expected frame; status={:?}; transcript={:?}; stderr={}",
+                        self.child.try_wait(),
+                        self.transcript,
+                        String::from_utf8_lossy(&stderr)
+                    );
+                };
                 let frame = serde_json::from_str::<Value>(&line).unwrap();
                 self.transcript.push(frame.clone());
                 if predicate(&frame) {
@@ -2558,27 +2738,43 @@ pub(super) mod exact_binary {
             approval_policy: &str,
             network_access: bool,
         ) -> (String, String) {
-            let approval_is_interactive = approval_policy == "on-request";
-            let thread_sandbox = if approval_is_interactive {
+            let thread_id = self.start_thread(approval_policy).await;
+            self.begin_turn(&thread_id, approval_policy, network_access)
+                .await
+        }
+
+        async fn start_thread(&mut self, approval_policy: &str) -> String {
+            self.start_thread_with_experimental_api(approval_policy, false)
+                .await
+        }
+
+        async fn start_thread_with_experimental_api(
+            &mut self,
+            approval_policy: &str,
+            experimental_api: bool,
+        ) -> String {
+            self.start_thread_with_model(approval_policy, MODEL, experimental_api)
+                .await
+        }
+
+        async fn start_thread_with_model(
+            &mut self,
+            approval_policy: &str,
+            model: &str,
+            experimental_api: bool,
+        ) -> String {
+            let thread_sandbox = if model == "mock-model" {
+                "read-only"
+            } else if approval_policy == "on-request" {
                 "workspace-write"
             } else {
                 "danger-full-access"
             };
-            let turn_sandbox = if approval_is_interactive {
-                json!({
-                    "type": "workspaceWrite",
-                    "writableRoots": [self._fixture.expected_cwd],
-                    "networkAccess": network_access,
-                    "excludeTmpdirEnvVar": true,
-                    "excludeSlashTmp": true,
-                })
-            } else {
-                json!({"type": "externalSandbox", "networkAccess": "enabled"})
-            };
             self.send(json!({
                 "id": 1,
                 "method": "initialize",
-                "params": {"clientInfo": {"name": "scherzo-conformance", "version": "1"}},
+                "params": {"clientInfo": {"name": "scherzo-conformance", "version": "1"},
+                    "capabilities": {"experimentalApi": experimental_api}},
             }))
             .await;
             let initialized = self.response(1).await;
@@ -2597,41 +2793,84 @@ pub(super) mod exact_binary {
             .await;
             let config = self.response(2).await;
             assert_eq!(config["result"]["config"]["model_provider"], PROVIDER);
+            if model == "mock-model" {
+                self.send(json!({"id": 9, "method": "model/list", "params": {}}))
+                    .await;
+                let models = self.response(9).await;
+                assert!(
+                    models["result"]["data"]
+                        .as_array()
+                        .is_some_and(|entries| entries.iter().any(|entry| entry["model"] == model))
+                );
+            }
             self.send(json!({
                 "id": 3,
                 "method": "thread/start",
                 "params": {
-                    "model": MODEL,
+                    "model": model,
                     "modelProvider": PROVIDER,
                     "cwd": self._fixture.expected_cwd,
                     "approvalPolicy": approval_policy,
+                    "approvalsReviewer": if model == "mock-model" { Some("auto_review") } else { None },
                     "sandbox": thread_sandbox,
                     "developerInstructions": "scherzo direct conformance",
                     "ephemeral": true,
-                    "config": {"bypass_hook_trust": true},
+                    "config": if model == "mock-model" { json!({}) } else { json!({"bypass_hook_trust": true}) },
                 },
             }))
             .await;
             let thread = self.response(3).await;
             assert_eq!(thread["result"]["approvalPolicy"], approval_policy);
-            let thread_id = thread["result"]["thread"]["id"]
+            thread["result"]["thread"]["id"]
                 .as_str()
                 .unwrap()
-                .to_owned();
-            self.send(json!({
-                "id": 4,
-                "method": "turn/start",
-                "params": {
+                .to_owned()
+        }
+
+        async fn begin_turn(
+            &mut self,
+            thread_id: &str,
+            approval_policy: &str,
+            network_access: bool,
+        ) -> (String, String) {
+            self.begin_turn_with_model(thread_id, approval_policy, network_access, MODEL)
+                .await
+        }
+
+        async fn begin_turn_with_model(
+            &mut self,
+            thread_id: &str,
+            approval_policy: &str,
+            network_access: bool,
+            model: &str,
+        ) -> (String, String) {
+            let turn_sandbox = if approval_policy == "on-request" {
+                json!({
+                    "type": "workspaceWrite",
+                    "writableRoots": [self._fixture.expected_cwd],
+                    "networkAccess": network_access,
+                    "excludeTmpdirEnvVar": true,
+                    "excludeSlashTmp": true,
+                })
+            } else {
+                json!({"type": "externalSandbox", "networkAccess": "enabled"})
+            };
+            let params = if model == "mock-model" {
+                json!({"threadId":thread_id, "input":[{"type":"text", "text":"exercise the pinned protocol"}],
+                    "approvalsReviewer":"auto_review"})
+            } else {
+                json!({
                     "threadId": thread_id,
                     "input": [{"type": "text", "text": "exercise the pinned protocol"}],
                     "cwd": self._fixture.expected_cwd,
                     "approvalPolicy": approval_policy,
                     "sandboxPolicy": turn_sandbox,
-                    "model": MODEL,
+                    "model": model,
                     "effort": "high",
-                },
-            }))
-            .await;
+                })
+            };
+            self.send(json!({"id": 4, "method": "turn/start", "params": params}))
+                .await;
             let turn = self.response(4).await;
             let turn_id = turn["result"]["turn"]["id"].as_str().unwrap().to_owned();
             if !self.transcript.iter().any(|frame| {
@@ -2646,7 +2885,7 @@ pub(super) mod exact_binary {
                 })
                 .await;
             }
-            (thread_id, turn_id)
+            (thread_id.to_owned(), turn_id)
         }
 
         async fn turn_completed(&mut self, thread_id: &str, turn_id: &str) -> Value {
@@ -2696,6 +2935,165 @@ pub(super) mod exact_binary {
             );
             provider.shutdown().await;
         }
+    }
+
+    // App Server only produces hosted-app stream notices after an explicit opt-in
+    // subscription. Use a disposable ChatGPT-shaped auth file and a loopback MCP
+    // endpoint; the provider and all project state remain isolated in this fixture.
+    async fn hosted_mcp_fixture() -> (
+        std::net::SocketAddr,
+        mpsc::UnboundedReceiver<Value>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (sent, requests) = mpsc::unbounded_channel();
+        let server = tokio::spawn(async move {
+            let mut connections = tokio::task::JoinSet::new();
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let sent = sent.clone();
+                connections.spawn(async move {
+                    let mut bytes = Vec::new();
+                    let header_end = loop {
+                        let mut chunk = [0; 4096];
+                        let read = socket.read(&mut chunk).await.unwrap();
+                        if read == 0 && bytes.is_empty() {
+                            return;
+                        }
+                        assert!(read > 0 && bytes.len() < 65536);
+                        bytes.extend_from_slice(&chunk[..read]);
+                        if let Some(end) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
+                            break end + 4;
+                        }
+                    };
+                    let headers = std::str::from_utf8(&bytes[..header_end]).unwrap();
+                    let request_line = headers.lines().next().unwrap().to_owned();
+                    let mcp_post = request_line.starts_with("POST /api/codex/ps/mcp ")
+                        || request_line.starts_with("POST /mcp ");
+                    let mcp_delete = request_line.starts_with("DELETE /api/codex/ps/mcp ")
+                        || request_line.starts_with("DELETE /mcp ");
+                    assert!(
+                        mcp_post
+                            || mcp_delete
+                            || request_line.starts_with("GET /ps/plugins/")
+                            || request_line.starts_with("GET /plugins/featured")
+                            || request_line.starts_with("POST /codex/analytics-events/")
+                            || request_line.starts_with("GET /api/codex/ps/mcp ")
+                            || request_line.starts_with("GET /mcp ")
+                            || request_line.starts_with("GET /api/codex/settings/user "),
+                        "unexpected hosted request: {request_line}"
+                    );
+                    let length = headers
+                        .lines()
+                        .find_map(|line| {
+                            line.split_once(':')
+                                .filter(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                        })
+                        .map(|(_, length)| length.trim().parse::<usize>().unwrap())
+                        .unwrap_or(0);
+                    assert!(length < 65536);
+                    while bytes.len() < header_end + length {
+                        let mut chunk = [0; 4096];
+                        let read = socket.read(&mut chunk).await.unwrap();
+                        assert!(read > 0);
+                        bytes.extend_from_slice(&chunk[..read]);
+                    }
+                    if !mcp_post {
+                        let mcp_get = request_line.starts_with("GET /api/codex/ps/mcp ")
+                            || request_line.starts_with("GET /mcp ");
+                        let body = if mcp_get || mcp_delete {
+                            ""
+                        } else {
+                            "{\"items\":[],\"plugins\":[]}"
+                        };
+                        let status = if mcp_get {
+                            "405 Method Not Allowed"
+                        } else if mcp_delete {
+                            "202 Accepted"
+                        } else {
+                            "200 OK"
+                        };
+                        let header = format!(
+                            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+                            body.len()
+                        );
+                        socket.write_all(header.as_bytes()).await.unwrap();
+                        socket.write_all(body.as_bytes()).await.unwrap();
+                        return;
+                    }
+                    let request: Value =
+                        serde_json::from_slice(&bytes[header_end..header_end + length]).unwrap();
+                    sent.send(request.clone()).unwrap();
+                    let (status, content_type, body) = match request["method"].as_str().unwrap() {
+                        "initialize" => ("200 OK", "application/json", json!({
+                            "jsonrpc": "2.0", "id": request["id"], "result": {
+                                "protocolVersion": "2025-06-18", "capabilities": {},
+                                "serverInfo": {"name": "hosted-fixture", "version": "1"}
+                            }
+                        }).to_string()),
+                        "notifications/initialized" => ("202 Accepted", "application/json", String::new()),
+                        "tools/list" => ("200 OK", "application/json", json!({
+                            "jsonrpc": "2.0", "id": request["id"], "result": {"tools": if request_line.starts_with("POST /mcp ") {
+                                json!([{"name":"confirm_action","description":"Synthetic approval action",
+                                    "inputSchema":{"type":"object","properties":{}}}])
+                            } else { json!([]) }}
+                        }).to_string()),
+                        "tools/call" => ("200 OK", "application/json", json!({
+                            "jsonrpc":"2.0", "id":request["id"], "result":{"content":[{"type":"text","text":"fixture complete"}]}
+                        }).to_string()),
+                        "events/stream" => {
+                            let meta = json!({"io.modelcontextprotocol/subscriptionId": request["id"], "provider": "hosted-fixture"});
+                            let active = json!({"jsonrpc":"2.0", "method":"notifications/events/active", "params":{"_meta":meta,"status":"active"}});
+                            let event = json!({"jsonrpc":"2.0", "method":"notifications/events/event", "params":{"_meta":meta,"name":"issue.updated","data":{"issue":42}}});
+                            ("200 OK", "text/event-stream", format!("event: message\ndata: {active}\n\nevent: message\ndata: {event}\n\n"))
+                        }
+                        method => panic!("unexpected hosted MCP request: {method}"),
+                    };
+                    let framing = if request["method"] == "events/stream" {
+                        String::new() // SSE remains open until the subscription is stopped.
+                    } else {
+                        format!("Content-Length: {}\r\n", body.len())
+                    };
+                    let header = format!(
+                        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nmcp-session-id: fixture-session\r\n{framing}\r\n"
+                    );
+                    socket.write_all(header.as_bytes()).await.unwrap();
+                    socket.write_all(body.as_bytes()).await.unwrap();
+                    if request["method"] == "events/stream" {
+                        // The connection stays open until the owning server task is cancelled.
+                        std::future::pending::<()>().await;
+                    }
+                });
+            }
+        });
+        (address, requests, server)
+    }
+
+    fn write_synthetic_hosted_auth(fixture: &ProcessFixture) {
+        let encode = |value: Value| {
+            base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .encode(serde_json::to_vec(&value).unwrap())
+        };
+        let id_token = format!(
+            "{}.{}.{}",
+            encode(json!({"alg":"none","typ":"JWT"})),
+            encode(json!({"https://api.openai.com/auth": {
+                "chatgpt_user_id":"fixture-user", "chatgpt_account_id":"fixture-account"
+            }})),
+            encode(json!("fixture-signature"))
+        );
+        std::fs::write(
+            fixture.codex_home.join("auth.json"),
+            json!({
+                "auth_mode": "chatgpt", "OPENAI_API_KEY": null,
+                "tokens": {"id_token":id_token, "access_token":"fixture-token",
+                    "refresh_token":"fixture-refresh", "account_id":"fixture-account"},
+                "last_refresh": "2099-01-01T00:00:00Z"
+            })
+            .to_string(),
+        )
+        .unwrap();
     }
 
     async fn release_provider_and_settle(
@@ -3200,6 +3598,220 @@ for line in sys.stdin:
         .await;
     }
 
+    #[tokio::test]
+    #[ignore = "requires pinned harness"]
+    async fn pinned_real_codex_opt_in_notice_boundary_on_production_requests() {
+        // An ambient opt-in cannot add subscription or interactive approval requests
+        // to the adapter's closed request set. Test the actual pinned process, not
+        // synthetic notifications, while keeping the provider on loopback.
+        with_watchdog(async {
+            let mut provider = LoopbackResponsesProvider::start_function_call_then_response(
+                "review-call",
+                "exec_command",
+                json!({"cmd": "printf reviewed"}),
+                RESPONSE,
+            )
+            .await;
+            let fixture = ProcessFixture::with_exact_binary(provider.address, response_mode());
+            let config_path = fixture.codex_home.join("config.toml");
+            let config = std::fs::read_to_string(&config_path).unwrap().replacen(
+                "model_provider = \"loopback\"",
+                "model_provider = \"loopback\"\napprovals_reviewer = \"auto_review\"",
+                1,
+            );
+            std::fs::write(
+                &config_path,
+                format!(
+                    "{config}\n[features.guardianv2]\nenabled = true\n[features]\nguardian_approval = true\n"
+                ),
+            )
+            .unwrap();
+            std::fs::write(
+                fixture.codex_home.join("requirements.toml"),
+                format!("[auto_review]\nrequired_on_models = [\"{MODEL}\"]\n"),
+            )
+            .unwrap();
+            let rules = fixture.codex_home.join("rules");
+            std::fs::create_dir(&rules).unwrap();
+            std::fs::write(
+                rules.join("default.rules"),
+                "prefix_rule(pattern=[\"printf\"], decision=\"prompt\")\n",
+            )
+            .unwrap();
+            let observations = fixture.observations.clone();
+            let (fixture, stdin_capture) = ProcessFixture::capture_exact_binary_stdin(fixture);
+            let mut run = tokio::spawn(run_fixture(fixture));
+            let initial = tokio::select! {
+                request = provider.next_request() => request,
+                result = &mut run => {
+                    let (fixture, outcome, started) = result.unwrap();
+                    panic!(
+                        "Codex ended before first provider request: {outcome:?}, started={started}, stderr={:?}",
+                        fixture.diagnostics.get("agent-step").map(|d| String::from_utf8_lossy(d.standard_error().bytes()).into_owned())
+                    );
+                },
+            };
+            assert_eq!(initial.path, "/responses");
+            let continuation = provider.next_request().await;
+            assert!(
+                continuation.body["input"].as_array().is_some_and(|input| {
+                    input.iter().any(|item| {
+                        item["type"] == "function_call_output" && item["call_id"] == "review-call"
+                    })
+                }),
+                "native command continuation: {}",
+                continuation.body["input"]
+            );
+            let (fixture, outcome, started) = run.await.unwrap();
+            assert_exact_response(outcome, started, "required auto-review under unattended policy");
+            let requests = std::fs::read_to_string(stdin_capture).unwrap();
+            let methods = requests
+                .lines()
+                .map(|line| {
+                    serde_json::from_str::<Value>(line).unwrap()["method"]
+                        .as_str()
+                        .unwrap()
+                        .to_owned()
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                methods,
+                ["initialize", "initialized", "config/read", "thread/start", "turn/start"]
+            );
+            assert!(!observations.snapshot().iter().any(|observation| matches!(
+                observation.observation(),
+                AgentObservation::UnrecognizedHarnessEvent { event }
+                    if matches!(event["method"].as_str(), Some(
+                        "autoApprovalReview/strictReviewRequired"
+                        | "mcpServer/event/stream/notification"
+                    ))
+            )));
+            drop(fixture);
+            provider.shutdown().await;
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires pinned harness"]
+    async fn pinned_real_codex_guardian_strict_review_is_correlated_and_nonsettling() {
+        with_watchdog(async {
+            let mut provider = LoopbackResponsesProvider::start_guardian().await;
+            let (hosted_address, _requests, hosted_server) = hosted_mcp_fixture().await;
+            let fixture = ProcessFixture::with_exact_binary_attachments_and_config(
+                provider.address, AgentValueMode::None, &[],
+                "[features]\nguardian_approval = true\napi_key_model_discovery = true\n[features.guardianv2]\nenabled = true\n[features.guardianv2.review_scope]\ncomputer_use_only = false\n",
+            );
+            let config_path = fixture.codex_home.join("config.toml");
+            let config = std::fs::read_to_string(&config_path).unwrap().replacen(
+                "model_provider = \"loopback\"",
+                &format!("chatgpt_base_url = \"http://{hosted_address}\"\nmodel = \"mock-model\"\napproval_policy = \"on-request\"\nsandbox_mode = \"read-only\"\nmodel_provider = \"loopback\"\napprovals_reviewer = \"auto_review\""),
+                1,
+            ).replacen("wire_api = \"responses\"", &format!("wire_api = \"responses\"\nsupports_websockets = false\nmodel_catalog_url = \"http://{}/models\"", provider.address), 1);
+            std::fs::write(config_path, config).unwrap();
+            configure_mcp_elicitation_fixture(&fixture);
+            write_synthetic_hosted_auth(&fixture);
+            let mut codex = DirectCodex::start_with_fixture(fixture);
+            // Strict-review notices require the experimental API opt-in.
+            let thread_id = codex.start_thread_with_model("on-request", "mock-model", true).await;
+            let (_, turn_id) = codex.begin_turn_with_model(&thread_id, "on-request", true, "mock-model").await;
+            let mut started_at = None;
+            let strict = codex.read_until(|frame| {
+                if frame["method"] == "item/autoApprovalReview/started" {
+                    started_at = Some(frame["params"]["startedAtMs"].clone());
+                }
+                frame["method"] == "autoApprovalReview/strictReviewRequired"
+                    || frame["method"] == "turn/completed"
+            }).await;
+            assert_eq!(strict["method"], "autoApprovalReview/strictReviewRequired");
+            assert_eq!(strict["params"]["threadId"], thread_id);
+            assert_eq!(strict["params"]["turnId"], turn_id);
+            assert_eq!(Some(strict["params"]["startedAtMs"].clone()), started_at);
+            assert!(!codex.transcript.iter().any(|frame| frame["method"] == "turn/completed"));
+            let completed = codex.turn_completed(&thread_id, &turn_id).await;
+            assert_eq!(completed["params"]["turn"]["status"], "completed");
+            let request = provider.next_request().await;
+            assert_eq!(request.path, "/responses");
+            codex.finish(provider).await;
+            hosted_server.abort();
+            hosted_server.await.unwrap_err();
+        }).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires pinned harness"]
+    async fn pinned_real_codex_hosted_subscription_emits_nonsettling_notices() {
+        with_watchdog(async {
+            let (hosted_address, mut hosted_requests, hosted_server) = hosted_mcp_fixture().await;
+            let (mut provider, release_response) = LoopbackResponsesProvider::start_blocked(RESPONSE).await;
+            let fixture = ProcessFixture::with_exact_binary_attachments_and_config(
+                provider.address, AgentValueMode::None, &[],
+                "[features]\napps = true\n",
+            );
+            let config_path = fixture.codex_home.join("config.toml");
+            let config = std::fs::read_to_string(&config_path).unwrap().replacen(
+                "model_provider = \"loopback\"",
+                &format!("chatgpt_base_url = \"http://{hosted_address}\"\nmodel_provider = \"loopback\""),
+                1,
+            );
+            std::fs::write(config_path, config).unwrap();
+            write_synthetic_hosted_auth(&fixture);
+            let mut codex = DirectCodex::start_with_fixture(fixture);
+            let thread_id = codex.start_thread_with_experimental_api("never", true).await;
+            codex.send(json!({"id": 5, "method": "mcpServer/event/stream/start", "params": {
+                "threadId": thread_id, "server": "codex_apps", "subscriptionId": "fixture-subscription",
+                "name": "issue.updated", "arguments": {"project":"fixture"},
+                "_meta": {"source":"fixture"}
+            }})).await;
+            let stream_request = tokio::select! {
+                request = hosted_requests.recv() => request.unwrap(),
+                response = codex.response(5) => panic!("hosted subscription failed before MCP initialize: {response}"),
+            };
+            assert_eq!(stream_request["method"], "initialize");
+            let stream_request = loop {
+                let request = hosted_requests.recv().await.unwrap();
+                if request["method"] == "events/stream" { break request; }
+            };
+            assert_eq!(stream_request["params"]["name"], "issue.updated");
+            assert_eq!(stream_request["params"]["arguments"], json!({"project":"fixture"}));
+            // The response and the two stream notices are independent native frames.
+            // Collect them in one read: sequential reads can discard an early response
+            // (or a notice delivered in the opposite order) and wait forever.
+            let (mut active, mut event, mut subscribed) = (None, None, None);
+            codex.read_until(|frame| {
+                if frame["method"] == "mcpServer/event/stream/notification" {
+                    match frame["params"]["notification"]["method"].as_str() {
+                        Some("notifications/events/active") => active = Some(frame.clone()),
+                        Some("notifications/events/event") => event = Some(frame.clone()),
+                        _ => {}
+                    }
+                } else if frame["id"] == 5 && frame.get("method").is_none() {
+                    subscribed = Some(frame.clone());
+                }
+                active.is_some() && event.is_some() && subscribed.is_some()
+            }).await;
+            let active = active.unwrap();
+            assert_eq!(active["params"]["subscriptionId"], "fixture-subscription");
+            assert_eq!(active["params"]["notification"]["params"]["status"], "active");
+            let event = event.unwrap();
+            assert_eq!(event["params"]["subscriptionId"], "fixture-subscription");
+            assert_eq!(event["params"]["notification"]["params"]["data"], json!({"issue":42}));
+            assert_eq!(subscribed.unwrap()["result"], json!({}));
+            let (_, turn_id) = codex.begin_turn(&thread_id, "never", true).await;
+            assert_eq!(provider.next_request().await.path, "/responses");
+            assert!(!codex.transcript.iter().any(|frame| frame["method"] == "turn/completed"));
+            codex.send(json!({"id": 6, "method": "mcpServer/event/stream/stop", "params": {
+                "subscriptionId": "fixture-subscription"
+            }})).await;
+            assert_eq!(codex.response(6).await["result"], json!({}));
+            release_response.send(()).unwrap();
+            assert_eq!(codex.turn_completed(&thread_id, &turn_id).await["params"]["turn"]["status"], "completed");
+            codex.finish(provider).await;
+            hosted_server.abort();
+            hosted_server.await.unwrap_err();
+        }).await;
+    }
+
     #[cfg(target_os = "linux")]
     #[tokio::test]
     #[ignore = "requires pinned harness"]
@@ -3414,6 +4026,7 @@ for line in sys.stdin:
             let (mut provider, release_response) =
                 LoopbackResponsesProvider::start_error_blocked().await;
             let fixture = ProcessFixture::with_exact_binary(provider.address, response_mode());
+            let observations = fixture.observations.clone();
             let run = tokio::spawn(run_fixture(fixture));
             let (_, outcome, started) =
                 release_provider_and_settle(&mut provider, release_response, run).await;
@@ -3425,6 +4038,13 @@ for line in sys.stdin:
                     detail: AgentHarnessFailureDetail::ModelError,
                 },
             );
+            assert!(observations.snapshot().iter().any(|observation| matches!(
+                observation.observation(),
+                AgentObservation::Diagnostic {
+                    level: AgentDiagnosticLevel::Error,
+                    message,
+                } if !message.is_empty() && message.len() <= 512
+            )));
             provider.shutdown().await;
 
             let (mut provider, release_response) =
@@ -4030,6 +4650,16 @@ pub(super) mod failure_ordering {
                     AgentHarnessFailureDetail::ModelError,
                 ),
                 (
+                    "failure-after-start-too-many-denials",
+                    true,
+                    AgentHarnessFailureDetail::ModelError,
+                ),
+                (
+                    "interrupted-too-many-denials",
+                    true,
+                    AgentHarnessFailureDetail::ModelError,
+                ),
+                (
                     "failure-after-start-authentication",
                     true,
                     AgentHarnessFailureDetail::ModelError,
@@ -4070,6 +4700,36 @@ pub(super) mod failure_ordering {
                 assert_fixture_quiescent(&fixture);
                 assert_no_native_rollout(&fixture);
             }
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn interrupted_guardian_terminal_without_error_notification_retains_diagnostic() {
+        with_watchdog(async {
+            let fixture =
+                ProcessFixture::new("interrupted-too-many-denials", response_mode(), 1024);
+            let observations = fixture.observations.clone();
+            let (fixture, outcome, started) = run_fixture(fixture).await;
+            assert!(started);
+            assert_eq!(
+                outcome,
+                AgentOutcome::Failed(
+                    AgentFailureCause::HarnessFailed {
+                        detail: AgentHarnessFailureDetail::ModelError,
+                    }
+                    .into(),
+                ),
+            );
+            assert!(observations.snapshot().iter().any(|observation| matches!(
+                observation.observation(),
+                AgentObservation::Diagnostic {
+                    level: AgentDiagnosticLevel::Error,
+                    message,
+                } if !message.is_empty() && message.len() <= 512
+            )));
+            assert_fixture_quiescent(&fixture);
+            assert_no_native_rollout(&fixture);
         })
         .await;
     }
@@ -4270,6 +4930,8 @@ pub(super) mod cancellation {
             );
             assert_cancelled_without_native_rollout(&fixture, outcome);
 
+            assert_active_cancellation_discards_response("cancellation-interrupted-with-error")
+                .await;
             assert_active_cancellation_discards_response("cancellation-after-async").await;
 
             let fixture =

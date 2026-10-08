@@ -16,10 +16,10 @@ use super::harness_installation::{
 use crate::process::CommandRunner;
 use crate::process::{CommandOutput, SystemCommandRunner};
 
-pub const CODEX_APP_SERVER_V1_SUPPORTED_RANGE: &str = ">=0.147.0 <0.159.0";
-pub const CODEX_APP_SERVER_V1_QUALIFICATION_VERSION: &str = "0.158.0";
+pub const CODEX_APP_SERVER_V1_SUPPORTED_RANGE: &str = ">=0.147.0 <0.161.0";
+pub const CODEX_APP_SERVER_V1_QUALIFICATION_VERSION: &str = "0.160.0";
 const CODEX_APP_SERVER_V1_MINIMUM_VERSION: (u64, u64, u64) = (0, 147, 0);
-const CODEX_APP_SERVER_V1_MAXIMUM_VERSION: (u64, u64, u64) = (0, 159, 0);
+const CODEX_APP_SERVER_V1_MAXIMUM_VERSION: (u64, u64, u64) = (0, 161, 0);
 const CAPABILITY_PROBE_ARGUMENTS: [&str; 4] =
     ["app-server", "generate-json-schema", "--out", "../schemas"];
 const MAXIMUM_SCHEMA_FILE_BYTES: u64 = 2 * 1024 * 1024;
@@ -122,7 +122,7 @@ impl ValidatedCodexInstallation {
         Self {
             identity: CodexInstallationIdentity::from_parts(
                 executable,
-                CodexVersion::fixture(0, 158, 0, CODEX_APP_SERVER_V1_QUALIFICATION_VERSION),
+                CodexVersion::fixture(0, 160, 0, CODEX_APP_SERVER_V1_QUALIFICATION_VERSION),
                 AgentCompatibilityProfile::CodexAppServerV1,
             ),
             capabilities: CodexAppServerV1Capabilities {
@@ -738,6 +738,11 @@ mod tests {
             "0.157.999",
             "0.158.0",
             "0.158.999",
+            "0.159.0",
+            "0.159.3",
+            "0.159.999",
+            "0.160.0",
+            "0.160.999",
         ] {
             let runner = compatible_runner(version);
             let installation = validate_codex_installation_with(
@@ -778,13 +783,13 @@ mod tests {
             installation.version().as_str(),
             CODEX_APP_SERVER_V1_QUALIFICATION_VERSION
         );
-        assert_eq!(installation.version().numeric(), (0, 158, 0));
+        assert_eq!(installation.version().numeric(), (0, 160, 0));
     }
 
     #[test]
     fn admission_rejects_versions_outside_the_undecorated_stable_release_line() {
         let executable = std::env::current_exe().unwrap();
-        for unsupported in ["0.146.999", "0.159.0", "1.147.0"] {
+        for unsupported in ["0.146.999", "0.161.0", "1.147.0"] {
             let runner = compatible_runner(unsupported);
             assert_eq!(
                 validate_codex_installation_with(
