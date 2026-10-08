@@ -120,9 +120,36 @@ impl StepDiagnostic {
 pub struct StepDiagnosticLog {
     entries: Arc<Mutex<BTreeMap<(String, ActionId), StepDiagnostic>>>,
     recovery_handlers: Arc<Mutex<BTreeSet<(String, ActionId)>>>,
+    git_capture_failures: Arc<Mutex<BTreeMap<String, serde_json::Value>>>,
 }
 
 impl StepDiagnosticLog {
+    pub fn record_git_capture_failure(
+        &self,
+        step: &str,
+        failure: &super::git_capture::GitCaptureFailure,
+    ) {
+        self.git_capture_failures
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(step.to_owned(), failure.capture_diagnostic());
+    }
+
+    pub(crate) fn clear_git_capture_failure(&self, step: &str) {
+        self.git_capture_failures
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(step);
+    }
+
+    pub fn git_capture_failure(&self, step: &str) -> Option<serde_json::Value> {
+        self.git_capture_failures
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(step)
+            .cloned()
+    }
+
     pub fn get(&self, step: &str) -> Option<StepDiagnostic> {
         let recovery_handlers = lock_recovery_handlers(&self.recovery_handlers).clone();
         lock_entries(&self.entries).iter().rev().find_map(

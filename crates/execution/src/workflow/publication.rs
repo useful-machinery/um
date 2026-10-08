@@ -3470,7 +3470,8 @@ fn output_capture_failure_cause(failure: &OutputCaptureFailure) -> FailureCauseV
             cause
         }
         OutputCaptureFailure::Git { output, failure } => {
-            let code = match failure {
+            let code = match failure.cause() {
+                GitCaptureFailure::CommandFailed(_) => FailureCodeV1::GitRequiredObjectsUnavailable,
                 GitCaptureFailure::Cancelled | GitCaptureFailure::Artifact(_) => {
                     FailureCodeV1::OutputStagingUnavailable
                 }

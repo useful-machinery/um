@@ -73,6 +73,13 @@ pub struct GitCommandTimeout {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GitCommandExit {
+    command: Arc<str>,
+    exit_code: i32,
+    cause: GitCaptureFailure,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum GitCaptureFailure {
     Cancelled,
     ExecutionRootRebound,
@@ -86,12 +93,41 @@ pub enum GitCaptureFailure {
     SourceAuthorityChanged,
     GitStructureLimitExceeded,
     CommandTimedOut(Box<GitCommandTimeout>),
+    CommandFailed(Box<GitCommandExit>),
     BundleGenerationFailed,
     BundleProfileInvalid,
     BundleVerificationFailed,
     WorkspaceChanged,
     TemporaryStorageUnavailable,
     Artifact(CaptureFailure),
+}
+
+impl GitCaptureFailure {
+    pub fn cause(&self) -> &Self {
+        match self {
+            Self::CommandFailed(exit) => exit.cause.cause(),
+            _ => self,
+        }
+    }
+
+    pub fn capture_diagnostic(&self) -> serde_json::Value {
+        match self {
+            Self::CommandTimedOut(timeout) => {
+                let mut diagnostic = serde_json::json!({
+                    "stage": "git_capture", "gitCommand": timeout.command.as_ref(),
+                });
+                if let Ok(limit) = i32::try_from(timeout.limit.as_millis()) {
+                    diagnostic["limitMs"] = serde_json::json!(limit);
+                }
+                diagnostic
+            }
+            Self::CommandFailed(exit) => serde_json::json!({
+                "stage": "git_capture", "gitCommand": exit.command.as_ref(),
+                "gitExitCode": exit.exit_code,
+            }),
+            _ => serde_json::json!({"stage": "git_capture"}),
+        }
+    }
 }
 
 impl fmt::Display for GitCaptureFailure {
@@ -662,7 +698,10 @@ impl GitCaptureContext {
                 capture_process_failure(failure, GitCaptureFailure::CleanlinessUnavailable)
             })?;
         if !clean.status.success() {
-            return Err(GitCaptureFailure::CleanlinessUnavailable);
+            return Err(command_failed(
+                &clean,
+                GitCaptureFailure::CleanlinessUnavailable,
+            ));
         }
         if clean.stdout.truncated || !clean.stdout.bytes.is_empty() {
             return Err(GitCaptureFailure::WorkspaceDirty);
@@ -682,7 +721,8 @@ impl GitCaptureContext {
             .map_err(|failure| {
                 capture_process_failure(failure, GitCaptureFailure::TreeUnavailable)
             })?;
-        let tree_oid = successful_oid(&tree).ok_or(GitCaptureFailure::TreeUnavailable)?;
+        let tree_oid = successful_oid(&tree)
+            .ok_or_else(|| command_failed(&tree, GitCaptureFailure::TreeUnavailable))?;
         if self.read_head(cancellation)? != head_oid {
             return Err(GitCaptureFailure::WorkspaceChanged);
         }
@@ -702,7 +742,8 @@ impl GitCaptureContext {
             .map_err(|failure| {
                 capture_process_failure(failure, GitCaptureFailure::HeadUnavailable)
             })?;
-        successful_oid(&head).ok_or(GitCaptureFailure::HeadUnavailable)
+        successful_oid(&head)
+            .ok_or_else(|| command_failed(&head, GitCaptureFailure::HeadUnavailable))
     }
 
     fn require_ancestor(
@@ -726,7 +767,10 @@ impl GitCaptureContext {
         match result.status.code() {
             Some(0) => Ok(()),
             Some(1) => Err(GitCaptureFailure::BaselineNotAncestor),
-            _ => Err(GitCaptureFailure::RequiredObjectsUnavailable),
+            _ => Err(command_failed(
+                &result,
+                GitCaptureFailure::RequiredObjectsUnavailable,
+            )),
         }
     }
 
@@ -757,7 +801,10 @@ impl GitCaptureContext {
                 capture_process_failure(failure, GitCaptureFailure::RequiredObjectsUnavailable)
             })?;
         if !objects.status.success() {
-            return Err(GitCaptureFailure::RequiredObjectsUnavailable);
+            return Err(command_failed(
+                &objects,
+                GitCaptureFailure::RequiredObjectsUnavailable,
+            ));
         }
         if objects.stdout.truncated {
             return Err(GitCaptureFailure::GitStructureLimitExceeded);
@@ -784,7 +831,10 @@ impl GitCaptureContext {
                 capture_process_failure(failure, GitCaptureFailure::RequiredObjectsUnavailable)
             })?;
         if !sizes.status.success() {
-            return Err(GitCaptureFailure::RequiredObjectsUnavailable);
+            return Err(command_failed(
+                &sizes,
+                GitCaptureFailure::RequiredObjectsUnavailable,
+            ));
         }
         if sizes.stdout.truncated {
             return Err(GitCaptureFailure::GitStructureLimitExceeded);
@@ -909,7 +959,10 @@ impl GitCaptureContext {
                 capture_process_failure(failure, GitCaptureFailure::BundleVerificationFailed)
             })?;
         if !initialized.status.success() {
-            return Err(GitCaptureFailure::BundleVerificationFailed);
+            return Err(command_failed(
+                &initialized,
+                GitCaptureFailure::BundleVerificationFailed,
+            ));
         }
 
         bundle
@@ -931,7 +984,10 @@ impl GitCaptureContext {
                 capture_process_failure(failure, GitCaptureFailure::BundleVerificationFailed)
             })?;
         if !indexed.status.success() || indexed.stdout.truncated {
-            return Err(GitCaptureFailure::BundleVerificationFailed);
+            return Err(command_failed(
+                &indexed,
+                GitCaptureFailure::BundleVerificationFailed,
+            ));
         }
 
         let object_type = self
@@ -950,7 +1006,10 @@ impl GitCaptureContext {
                 capture_process_failure(failure, GitCaptureFailure::BundleVerificationFailed)
             })?;
         if !object_type.status.success() || object_type.stdout.bytes != b"commit\n" {
-            return Err(GitCaptureFailure::BundleVerificationFailed);
+            return Err(command_failed(
+                &object_type,
+                GitCaptureFailure::BundleVerificationFailed,
+            ));
         }
         let commit = self
             .run_unbound(
@@ -972,7 +1031,10 @@ impl GitCaptureContext {
             || commit.stdout.bytes.split(|byte| *byte == b'\n').next()
                 != Some(expected_tree.as_bytes())
         {
-            return Err(GitCaptureFailure::BundleVerificationFailed);
+            return Err(command_failed(
+                &commit,
+                GitCaptureFailure::BundleVerificationFailed,
+            ));
         }
         Ok(())
     }
@@ -1014,7 +1076,10 @@ impl GitCaptureContext {
                 capture_process_failure(failure, GitCaptureFailure::RequiredObjectsUnavailable)
             })?;
         if !history.status.success() || history.stdout.truncated {
-            return Err(GitCaptureFailure::RequiredObjectsUnavailable);
+            return Err(command_failed(
+                &history,
+                GitCaptureFailure::RequiredObjectsUnavailable,
+            ));
         }
         let mut count_seen = false;
         let mut missing = false;
@@ -1124,7 +1189,10 @@ impl GitCaptureContext {
             return Err(GitCaptureFailure::GitStructureLimitExceeded);
         }
         if !tracked_modes.status.success() {
-            return Err(GitCaptureFailure::CleanlinessUnavailable);
+            return Err(command_failed(
+                &tracked_modes,
+                GitCaptureFailure::CleanlinessUnavailable,
+            ));
         }
         if contains_gitlink(&tracked_modes.stdout.bytes) {
             return Err(GitCaptureFailure::WorkspaceChanged);
@@ -1162,7 +1230,10 @@ impl GitCaptureContext {
             })?;
         if source_authority_snapshot(&authority).as_deref() != Some(self.source_authority.as_ref())
         {
-            return Err(GitCaptureFailure::SourceAuthorityChanged);
+            return Err(command_failed(
+                &authority,
+                GitCaptureFailure::SourceAuthorityChanged,
+            ));
         }
         Ok(())
     }
@@ -1448,18 +1519,40 @@ fn contains_gitlink(bytes: &[u8]) -> bool {
 }
 
 fn git_command_description(arguments: &[OsString]) -> Arc<str> {
-    let mut command = String::from("git");
-    for argument in arguments {
-        command.push(' ');
-        for character in argument.to_string_lossy().chars() {
-            if character == '`' {
-                command.push_str("\\`");
-            } else {
-                command.extend(character.escape_default());
-            }
-        }
-    }
+    // Never retain arguments: they can contain paths, refs or repository content.
+    let first = arguments.first().and_then(|arg| arg.to_str());
+    let subcommand = if first.is_some_and(|arg| arg.starts_with("--git-dir=")) {
+        arguments.get(1).and_then(|arg| arg.to_str())
+    } else {
+        first
+    };
+    let command = match subcommand {
+        Some("rev-parse") => "rev_parse",
+        Some("merge-base") => "merge_base",
+        Some("rev-list") => "rev_list",
+        Some("cat-file") => "cat_file",
+        Some("ls-files") => "ls_files",
+        Some("index-pack") => "index_pack",
+        Some("pack-objects") => "pack_objects",
+        Some("status") => "status",
+        Some("config") => "config",
+        Some("init") => "init",
+        _ => "git",
+    };
     Arc::from(command)
+}
+
+fn command_failed(output: &ProcessOutput, cause: GitCaptureFailure) -> GitCaptureFailure {
+    match output.status.code() {
+        Some(exit_code) if exit_code != 0 => {
+            GitCaptureFailure::CommandFailed(Box::new(GitCommandExit {
+                command: Arc::clone(&output.command),
+                exit_code,
+                cause,
+            }))
+        }
+        _ => cause,
+    }
 }
 
 pub(super) fn reserved_git_environment(name: &OsStr) -> bool {
@@ -1504,7 +1597,8 @@ fn admission_process_failure(failure: ProcessFailure) -> GitWorkspaceAdmissionFa
         ProcessFailure::Cancelled => GitWorkspaceAdmissionFailure::Cancelled,
         ProcessFailure::ExecutionRootRebound => GitWorkspaceAdmissionFailure::ExecutionRootRebound,
         ProcessFailure::TimedOut { .. } => GitWorkspaceAdmissionFailure::GitTimedOut,
-        ProcessFailure::Spawn
+        ProcessFailure::Exited { .. }
+        | ProcessFailure::Spawn
         | ProcessFailure::Wait
         | ProcessFailure::Io
         | ProcessFailure::Input
@@ -1521,6 +1615,13 @@ fn capture_process_failure(
         ProcessFailure::ExecutionRootRebound => GitCaptureFailure::ExecutionRootRebound,
         ProcessFailure::TimedOut { command, limit } => {
             GitCaptureFailure::CommandTimedOut(Box::new(GitCommandTimeout { command, limit }))
+        }
+        ProcessFailure::Exited { command, exit_code } => {
+            GitCaptureFailure::CommandFailed(Box::new(GitCommandExit {
+                command,
+                exit_code,
+                cause: unavailable,
+            }))
         }
         ProcessFailure::Spawn
         | ProcessFailure::Wait
@@ -1553,6 +1654,7 @@ enum ProcessFailure {
     Cancelled,
     ExecutionRootRebound,
     TimedOut { command: Arc<str>, limit: Duration },
+    Exited { command: Arc<str>, exit_code: i32 },
     Spawn,
     Wait,
     Io,
@@ -1566,6 +1668,7 @@ struct BoundedOutput {
 }
 
 struct ProcessOutput {
+    command: Arc<str>,
     status: ExitStatus,
     stdout: BoundedOutput,
 }
@@ -1617,7 +1720,7 @@ fn execute_process(
             &mut child,
             cancellation,
             timeout,
-            command_description,
+            Arc::clone(&command_description),
             || false,
             || {
                 stdout.is_finished()
@@ -1630,14 +1733,26 @@ fn execute_process(
         let stdout = stdout.join().map_err(|_| ProcessFailure::Io)?;
         let stderr = stderr.join().map_err(|_| ProcessFailure::Io)?;
         let input_result = input_writer
-            .map(|writer| writer.join().map_err(|_| ProcessFailure::Input))
-            .transpose()?
-            .transpose()
-            .map_err(|_| ProcessFailure::Input);
+            .map(|writer| {
+                writer
+                    .join()
+                    .map_err(|_| ProcessFailure::Input)
+                    .and_then(|result| result.map_err(|_| ProcessFailure::Input))
+            })
+            .unwrap_or(Ok(()));
         let status = status?;
+        if input_result.is_err()
+            && let Some(exit_code) = status.code().filter(|code| *code != 0)
+        {
+            return Err(ProcessFailure::Exited {
+                command: command_description,
+                exit_code,
+            });
+        }
         input_result?;
         stderr.map_err(|_| ProcessFailure::Io)?;
         Ok(ProcessOutput {
+            command: command_description,
             status,
             stdout: stdout.map_err(|_| ProcessFailure::Io)?,
         })
@@ -1695,7 +1810,7 @@ fn stream_process_stdout(
             &mut child,
             cancellation,
             timeout,
-            command_description,
+            Arc::clone(&command_description),
             || stream.is_finished(),
             || stream.is_finished() && input_writer.is_finished() && stderr.is_finished(),
         );
@@ -1704,7 +1819,8 @@ fn stream_process_stdout(
             .map_err(|_| PackStreamFailure::Process(ProcessFailure::Io))?;
         let input = input_writer
             .join()
-            .map_err(|_| PackStreamFailure::Process(ProcessFailure::Input))?;
+            .map_err(|_| ProcessFailure::Input)
+            .and_then(|result| result.map_err(|_| ProcessFailure::Input));
         let stderr = stderr
             .join()
             .map_err(|_| PackStreamFailure::Process(ProcessFailure::Io))?;
@@ -1718,7 +1834,15 @@ fn stream_process_stdout(
             Err(failure) => Err(PackStreamFailure::Process(failure)),
             Ok(status) => {
                 stream.map_err(PackStreamFailure::Destination)?;
-                input.map_err(|_| PackStreamFailure::Process(ProcessFailure::Input))?;
+                // An early Git exit can close stdin while the writer is still sending
+                // revisions. Keep the observed exit instead of reducing it to Input.
+                if let Some(exit_code) = status.code().filter(|code| *code != 0) {
+                    return Err(PackStreamFailure::Process(ProcessFailure::Exited {
+                        command: command_description,
+                        exit_code,
+                    }));
+                }
+                input.map_err(PackStreamFailure::Process)?;
                 stderr.map_err(|_| PackStreamFailure::Process(ProcessFailure::Io))?;
                 if status.success() {
                     Ok(())

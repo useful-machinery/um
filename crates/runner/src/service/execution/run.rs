@@ -717,8 +717,20 @@ impl ExecutionJob {
                     recovery_summaries.clone(),
                 ),
                 artifact_delivery,
+                diagnostic: None,
             },
             RunOutcome::Failed { primary_issue, .. } => ExecutionReport::Finished {
+                diagnostic: {
+                    let issue = workflow_issue(&primary_issue);
+                    issue
+                        .get("node")
+                        .and_then(|node| node.get("id"))
+                        .and_then(serde_json::Value::as_str)
+                        .zip(issue.get("detail"))
+                        .and_then(|(step, detail)| {
+                            git_capture_diagnostic(step, detail, &diagnostics)
+                        })
+                },
                 final_execution_event_sequence: last_sequence,
                 outcome: terminal_outcome(
                     "failed",
@@ -750,6 +762,7 @@ impl ExecutionJob {
                     CancellationReason::UserRequest | CancellationReason::ForceAbort
                 ) {
                     ExecutionReport::Finished {
+                        diagnostic: None,
                         final_execution_event_sequence: last_sequence,
                         outcome: terminal_outcome(
                             "cancelled",

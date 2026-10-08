@@ -1392,6 +1392,7 @@ fn enqueue_finished(manager: &AssignmentManager, identity: &AssignmentIdentity) 
             assignment_id: identity.assignment_id.clone(),
             attempt_id: identity.attempt_id.clone(),
             report: ExecutionReport::Finished {
+                diagnostic: None,
                 final_execution_event_sequence: 1,
                 outcome: json!({ "outcome": "succeeded", "forceAbort": null }),
                 artifact_delivery: json!({
@@ -1578,11 +1579,9 @@ async fn assert_workflow_environment_unsupported(manager: &mut AssignmentManager
     assert!(matches!(
         &pending[0].observation,
         AssignmentObservation::Decision(AssignmentDecision::Rejected {
-            decline: AssignmentDecline::RunnerUnable(
-                RunnerUnableReason::WorkflowEnvironmentUnsupported
-            ),
+            decline: AssignmentDecline::Diagnosed { decline, stage: "admission", cause: "admission_invalid" },
             ..
-        })
+        }) if **decline == AssignmentDecline::RunnerUnable(RunnerUnableReason::WorkflowEnvironmentUnsupported)
     ));
     settle_cleanup(manager).await;
     assert!(manager.slot.is_none());
@@ -1961,6 +1960,10 @@ async fn run_input_failures_keep_transient_local_and_immutable_families_distinct
             AssignmentDecline::RunnerUnable(RunnerUnableReason::ExecutionEnvironmentUnavailable),
         ),
         (
+            RunInputFailure::AssignmentFenced,
+            AssignmentDecline::RunnerUnable(RunnerUnableReason::InputServiceUnavailable),
+        ),
+        (
             RunInputFailure::InvalidProjection,
             AssignmentDecline::ExecutionSpecInvalid(
                 ExecutionSpecInvalidReason::InvalidInputProjection,
@@ -1994,7 +1997,16 @@ async fn run_input_failures_keep_transient_local_and_immutable_families_distinct
         ),
     ];
     for (failure, expected) in cases {
-        assert_eq!(run_input_decline(failure), expected);
+        let cause = match failure {
+            RunInputFailure::ServiceUnavailable => "input_service_unavailable",
+            RunInputFailure::AssignmentFenced => "assignment_fenced",
+            RunInputFailure::EnvironmentUnavailable => "execution_root_unavailable",
+            _ => "admission_invalid",
+        };
+        assert_eq!(
+            run_input_decline(failure),
+            expected.diagnosed("input_materialization", cause)
+        );
     }
 }
 
@@ -2665,14 +2677,53 @@ async fn source_materialization_declines_preserve_failure_provenance() {
         AssignmentDecline::ExecutionSpecInvalid(
             ExecutionSpecInvalidReason::SourceCommitUnavailable,
         )
+        .diagnosed("source_materialization", "admission_invalid")
     );
     assert_eq!(
         materialization_decline(MaterializationFailure::RepositoryUnavailable),
         AssignmentDecline::RunnerUnable(RunnerUnableReason::SourceServiceUnavailable)
+            .diagnosed("source_materialization", "source_repository_unavailable")
     );
     assert_eq!(
         materialization_decline(MaterializationFailure::EnvironmentUnavailable),
         AssignmentDecline::RunnerUnable(RunnerUnableReason::ExecutionEnvironmentUnavailable)
+            .diagnosed("source_materialization", "execution_root_unavailable")
+    );
+    for (failure, cause) in [
+        (
+            MaterializationFailure::ProviderUnavailable,
+            "source_provider_unavailable",
+        ),
+        (
+            MaterializationFailure::RepositoryUnavailable,
+            "source_repository_unavailable",
+        ),
+        (
+            MaterializationFailure::AssignmentFenced,
+            "assignment_fenced",
+        ),
+    ] {
+        assert_eq!(
+            materialization_decline(failure),
+            AssignmentDecline::RunnerUnable(RunnerUnableReason::SourceServiceUnavailable)
+                .diagnosed("source_materialization", cause)
+        );
+    }
+}
+
+#[test]
+fn admission_git_context_causes_keep_distinct_safe_facts() {
+    assert_eq!(
+        admission_diagnostic(AdmissionFailureKind::GitContextUnavailable),
+        ("admission", "git_context_unavailable")
+    );
+    assert_eq!(
+        admission_diagnostic(AdmissionFailureKind::GitContextNotRepository),
+        ("admission", "git_context_invalid")
+    );
+    assert_eq!(
+        admission_diagnostic(AdmissionFailureKind::GitContextExecutionRootMismatch),
+        ("execution_root", "execution_root_unavailable")
     );
 }
 
@@ -2687,7 +2738,8 @@ async fn source_credential_failure_declines_the_assignment() {
     assert_preparation_declined(
         &mut manager,
         offered,
-        AssignmentDecline::RunnerUnable(RunnerUnableReason::SourceServiceUnavailable),
+        AssignmentDecline::RunnerUnable(RunnerUnableReason::SourceServiceUnavailable)
+            .diagnosed("source_materialization", "source_provider_unavailable"),
     )
     .await;
 }
@@ -5515,7 +5567,8 @@ async fn oversized_workflow_is_rejected_before_semantic_acceptance() {
     assert_preparation_declined(
         &mut manager,
         offer("bg"),
-        AssignmentDecline::ExecutionSpecInvalid(ExecutionSpecInvalidReason::WorkflowSourceInvalid),
+        AssignmentDecline::ExecutionSpecInvalid(ExecutionSpecInvalidReason::WorkflowSourceInvalid)
+            .diagnosed("source_materialization", "workflow_source_unavailable"),
     )
     .await;
 }
@@ -5573,6 +5626,7 @@ fn oversized_observation_is_rejected_before_queueing() {
             assignment_id: "asn_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned(),
             attempt_id: "atm_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned(),
             report: ExecutionReport::Transition {
+                diagnostic: None,
                 execution_event_sequence: 1,
                 workflow_event: json!({
                     "eventVersion": 1,
@@ -5599,6 +5653,7 @@ fn outbox_accepts_large_condition_evidence_transition() {
         assignment_id: "asn_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned(),
         attempt_id: "atm_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned(),
         report: ExecutionReport::Transition {
+            diagnostic: None,
             execution_event_sequence: 1,
             workflow_event: json!({
                 "eventVersion": 1,
@@ -5648,6 +5703,7 @@ fn outbox_retains_large_condition_failure_through_finalization() {
             assignment_id: "asn_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned(),
             attempt_id: "atm_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned(),
             report: ExecutionReport::Transition {
+                diagnostic: None,
                 execution_event_sequence: 1,
                 workflow_event: json!({
                     "eventVersion": 1, "eventType": "step_state_changed",
@@ -5678,6 +5734,7 @@ fn outbox_retains_large_condition_failure_through_finalization() {
                 assignment_id: "asn_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned(),
                 attempt_id: "atm_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned(),
                 report: ExecutionReport::Transition {
+                    diagnostic: None,
                     execution_event_sequence: 4,
                     workflow_event: serde_json::from_str(&event).unwrap(),
                 },
@@ -5688,6 +5745,7 @@ fn outbox_retains_large_condition_failure_through_finalization() {
         assignment_id: "asn_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned(),
         attempt_id: "atm_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned(),
         report: ExecutionReport::Finished {
+            diagnostic: None,
             final_execution_event_sequence: 5,
             outcome: json!({"outcome": "failed", "primaryIssue": issue, "forceAbort": null}),
             artifact_delivery: json!({"outcome": "prepared", "artifactSetId": "ats_01k0z6r1w8f4jy2m7q9v3x5abc"}),
@@ -5734,6 +5792,7 @@ fn outbox_accepts_only_one_terminal_per_assignment() {
         })
         .collect::<Vec<_>>();
     let large_report = ExecutionReport::Finished {
+        diagnostic: None,
         final_execution_event_sequence: 1,
         outcome: json!({
             "outcome": "failed",
@@ -5763,6 +5822,7 @@ fn outbox_accepts_only_one_terminal_per_assignment() {
         }),
     };
     let small_report = ExecutionReport::Finished {
+        diagnostic: None,
         final_execution_event_sequence: 1,
         outcome: json!({"outcome": "succeeded", "forceAbort": null}),
         artifact_delivery: json!({

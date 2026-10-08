@@ -1078,6 +1078,7 @@ pub(super) mod test_support {
                     assignment_id: "asn_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned(),
                     attempt_id: "atm_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned(),
                     report: ExecutionReport::Transition {
+                        diagnostic: None,
                         execution_event_sequence: sequence,
                         workflow_event: serde_json::json!({
                             "eventVersion": 1,
@@ -1102,6 +1103,7 @@ pub(super) mod test_support {
                 assignment_id: "asn_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned(),
                 attempt_id: "atm_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned(),
                 report: ExecutionReport::Finished {
+                    diagnostic: None,
                     final_execution_event_sequence: 1,
                     outcome: serde_json::json!({
                         "outcome": "succeeded",
@@ -1284,6 +1286,16 @@ fn disable_workflow_git_off_thread(workflow_git: &WorkflowGitAuthority) {
 }
 
 fn run_input_decline(failure: RunInputFailure) -> AssignmentDecline {
+    let cause = match failure {
+        RunInputFailure::AssignmentFenced => "assignment_fenced",
+        RunInputFailure::ServiceUnavailable => "input_service_unavailable",
+        RunInputFailure::EnvironmentUnavailable => "execution_root_unavailable",
+        _ => "admission_invalid",
+    };
+    run_input_decline_code(failure).diagnosed("input_materialization", cause)
+}
+
+fn run_input_decline_code(failure: RunInputFailure) -> AssignmentDecline {
     match failure {
         RunInputFailure::ServiceUnavailable => {
             AssignmentDecline::RunnerUnable(RunnerUnableReason::InputServiceUnavailable)
@@ -1314,6 +1326,19 @@ fn run_input_decline(failure: RunInputFailure) -> AssignmentDecline {
 }
 
 fn materialization_decline(failure: MaterializationFailure) -> AssignmentDecline {
+    let cause = match failure {
+        MaterializationFailure::ProviderUnavailable => "source_provider_unavailable",
+        MaterializationFailure::RepositoryUnavailable => "source_repository_unavailable",
+        MaterializationFailure::AssignmentFenced => "assignment_fenced",
+        MaterializationFailure::WorkflowUnavailable
+        | MaterializationFailure::WorkflowDigestMismatch => "workflow_source_unavailable",
+        MaterializationFailure::EnvironmentUnavailable => "execution_root_unavailable",
+        _ => "admission_invalid",
+    };
+    materialization_decline_code(failure).diagnosed("source_materialization", cause)
+}
+
+fn materialization_decline_code(failure: MaterializationFailure) -> AssignmentDecline {
     let reason = match failure {
         MaterializationFailure::UnsupportedObjectFormat => {
             return AssignmentDecline::ExecutionSpecInvalid(
@@ -1346,6 +1371,24 @@ fn invalid_execution_limits() -> AssignmentDecline {
 }
 
 fn admission_decline(failure: AdmissionFailure, cloud_git_capture: bool) -> AssignmentDecline {
+    let kind = failure.kind();
+    let (stage, cause) = admission_diagnostic(kind);
+    admission_decline_code(failure, cloud_git_capture).diagnosed(stage, cause)
+}
+
+fn admission_diagnostic(kind: AdmissionFailureKind) -> (&'static str, &'static str) {
+    match kind {
+        AdmissionFailureKind::GitContextUnavailable => ("admission", "git_context_unavailable"),
+        AdmissionFailureKind::GitContextNotRepository => ("admission", "git_context_invalid"),
+        AdmissionFailureKind::GitContextExecutionRootMismatch => {
+            ("execution_root", "execution_root_unavailable")
+        }
+        _ if kind.is_execution_root_failure() => ("execution_root", "execution_root_unavailable"),
+        _ => ("admission", "admission_invalid"),
+    }
+}
+
+fn admission_decline_code(failure: AdmissionFailure, cloud_git_capture: bool) -> AssignmentDecline {
     let kind = failure.kind();
     if cloud_git_capture {
         match kind {

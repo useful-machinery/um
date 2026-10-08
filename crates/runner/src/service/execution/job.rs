@@ -56,6 +56,7 @@ impl ExecutionJob {
         self.containment_clock = clock;
         tokio::spawn(self.finish_execution(ExecutionCompletion::containment_gated(
             ExecutionReport::Finished {
+                diagnostic: None,
                 final_execution_event_sequence: 1,
                 outcome: terminal_outcome("succeeded", None, None, None, None, None),
                 artifact_delivery: json!({"outcome": "prepared", "artifactSetId": "ats_01k0z6r1w8f4jy2m7q9v3x5abc"}),

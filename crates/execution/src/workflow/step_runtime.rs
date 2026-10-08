@@ -496,6 +496,7 @@ enum CaptureWorkerMessage {
 
 #[derive(Clone)]
 struct CaptureWorker {
+    diagnostics: StepDiagnosticLog,
     admitted: AdmittedWorkflow,
     artifacts: ArtifactStaging,
     occurrences: OccurrenceSender<ProvisionalStepOutputs, StepFailureCause, CapturedValue>,
@@ -579,6 +580,7 @@ where
         let (capture_requests, mut queued_captures) =
             mpsc::unbounded_channel::<CaptureWorkerMessage>();
         let capture_worker = CaptureWorker {
+            diagnostics: diagnostics.clone(),
             admitted: admitted.clone(),
             artifacts: artifacts.clone(),
             occurrences: occurrences.clone(),
@@ -2394,6 +2396,10 @@ impl CaptureWorker {
             return;
         }
         self.with_work(|work| work.begin_delivery(action));
+        self.diagnostics.clear_git_capture_failure(&step);
+        if let OutputCaptureFailure::Git { failure, .. } = &failure {
+            self.diagnostics.record_git_capture_failure(&step, failure);
+        }
         let occurrence = DriverOccurrence::output_capture_failed(
             step,
             action,

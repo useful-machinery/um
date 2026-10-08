@@ -4248,6 +4248,7 @@ steps:
     let artifacts = test_artifacts(&admitted);
     let (occurrences, _receiver) = occurrence_channel(NonZeroUsize::new(1).unwrap());
     let worker = CaptureWorker {
+        diagnostics: StepDiagnosticLog::default(),
         admitted,
         artifacts: artifacts.staging.clone(),
         occurrences,

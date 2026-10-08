@@ -11,6 +11,74 @@ use um_runner_protocol::{MAXIMUM_ORDINARY_FRAME_BYTES, RunnerEnvelope, RunnerFra
 // jscpd:ignore-end
 
 #[test]
+fn git_capture_diagnostic_is_sibling_only_for_the_matching_failed_node() {
+    let diagnostics = StepDiagnosticLog::default();
+    diagnostics.record_git_capture_failure(
+        "capture",
+        &um_execution::GitCaptureFailure::RequiredObjectsUnavailable,
+    );
+    let detail = json!({"phase": "output_capture", "code": "git_required_objects_unavailable", "output": "bundle"});
+    let diagnostic = git_capture_diagnostic("capture", &detail, &diagnostics).unwrap();
+    assert_eq!(diagnostic, json!({"stage": "git_capture"}));
+    assert!(git_capture_diagnostic("other", &detail, &diagnostics).is_none());
+    assert!(
+        git_capture_diagnostic(
+            "capture",
+            &json!({
+                "phase": "execution", "code": "command_exit",
+            }),
+            &diagnostics
+        )
+        .is_none()
+    );
+    let report = ExecutionReport::Finished {
+        final_execution_event_sequence: 1,
+        outcome: json!({"outcome":"failed", "primaryIssue": {
+            "node": {"id":"capture", "role":"step"}, "state":"failed", "detail": detail,
+        }, "forceAbort":null}),
+        artifact_delivery: json!({"outcome":"prepared", "artifactSetId":"ats_01k0z6r1w8f4jy2m7q9v3x5abc"}),
+        diagnostic: Some(diagnostic),
+    };
+    let frame = report.runner_frame(
+        RunnerEnvelope {
+            message_id: "rmsg_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned(),
+            runner_id: "rnr_01k0z6r1w8f4jy2m7q9v3x5abd".to_owned(),
+            boot_id: "rbt_01k0z6r1w8f4jy2m7q9v3x5abe".to_owned(),
+            sequence: 1,
+            sent_at: "2026-07-23T00:00:00Z".to_owned(),
+        },
+        "asn_01k0z6r1w8f4jy2m7q9v3x5abh".to_owned(),
+        "atm_01k0z6r1w8f4jy2m7q9v3x5abk".to_owned(),
+    );
+    let bytes = um_runner_protocol::encode_runner_frame(&frame).unwrap();
+    let value: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(value["payload"]["diagnostic"]["stage"], "git_capture");
+    assert!(
+        value["payload"]["outcome"]["primaryIssue"]
+            .get("diagnostic")
+            .is_none()
+    );
+}
+
+#[test]
+fn upload_failure_diagnostic_is_sent_as_artifact_delivery_sibling() {
+    let outcome = ArtifactDeliveryOutcome::Failed(
+        crate::service::artifact_delivery::ClosedArtifactDeliveryFailure {
+            phase: "upload".to_owned(),
+            code: "result_upload_failed".to_owned(),
+            diagnostic: Some(json!({"stage":"artifact_upload", "httpStatus":503})),
+        },
+    );
+    assert_eq!(
+        artifact_delivery_result(&outcome),
+        json!({
+            "outcome": "failed", "phase": "upload", "code": "result_upload_failed",
+            "diagnostic": {"stage":"artifact_upload", "httpStatus":503},
+        })
+    );
+}
+
+#[test]
 fn typed_outbox_and_staging_causes_keep_the_failure_identity() {
     for (error, suffix) in [
         (OutboxFailure::Encoding, "encoding_failed"),

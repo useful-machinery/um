@@ -20,7 +20,6 @@ use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 use super::artifact_delivery::{
     ArtifactDeliveryBroker, ArtifactDeliveryOutcome, ArtifactDeliverySpec,
-    ClosedArtifactDeliveryFailure,
 };
 use super::assignment::{
     AcceptedAssignment, AssignmentObservation, CausalLease, ExecutionReport, LeaseAuthority,
@@ -423,10 +422,7 @@ fn observed_workflow_cancellation(
 }
 
 fn internal_delivery_failure(phase: &str) -> ArtifactDeliveryOutcome {
-    ArtifactDeliveryOutcome::Failed(ClosedArtifactDeliveryFailure {
-        phase: phase.to_owned(),
-        code: "delivery_internal_failure".to_owned(),
-    })
+    super::artifact_delivery::internal_failure(phase)
 }
 
 fn workflow_step_kind_policy(step: &ValidatedStep) -> (WorkflowRunStepKind, FailurePolicy) {
@@ -444,11 +440,17 @@ fn artifact_delivery_result(delivery: &ArtifactDeliveryOutcome) -> Value {
             "outcome": "prepared",
             "artifactSetId": artifact_set_id,
         }),
-        ArtifactDeliveryOutcome::Failed(failure) => json!({
-            "outcome": "failed",
-            "phase": failure.phase,
-            "code": failure.code,
-        }),
+        ArtifactDeliveryOutcome::Failed(failure) => {
+            let mut result = json!({
+                "outcome": "failed",
+                "phase": failure.phase,
+                "code": failure.code,
+            });
+            if let Some(diagnostic) = &failure.diagnostic {
+                result["diagnostic"] = diagnostic.clone();
+            }
+            result
+        }
         ArtifactDeliveryOutcome::Delivered { .. } | ArtifactDeliveryOutcome::AuthorityLost => {
             json!({
                 "outcome": "failed",

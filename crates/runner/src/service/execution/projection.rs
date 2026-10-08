@@ -440,6 +440,18 @@ pub(super) fn workflow_issue(issue: &PrimaryIssue) -> Value {
     json!(issue)
 }
 
+pub(super) fn git_capture_diagnostic(
+    step: &str,
+    detail: &Value,
+    diagnostics: &StepDiagnosticLog,
+) -> Option<Value> {
+    (detail.get("phase")?.as_str()? == "output_capture"
+        && (detail.get("code")?.as_str()?.starts_with("git_")
+            || detail.get("code")?.as_str()? == "output_staging_unavailable"))
+        .then(|| diagnostics.git_capture_failure(step))
+        .flatten()
+}
+
 // The portable result may reject inconsistent step metadata. Keep the original
 // failure and its bounded command diagnostic in the runner-private retained
 // workspace so that a second failure cannot erase the first one.

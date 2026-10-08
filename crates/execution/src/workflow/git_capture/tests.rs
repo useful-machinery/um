@@ -1044,17 +1044,151 @@ fn promisor_capture_hydrates_only_required_objects_from_existing_source_authorit
 }
 
 #[test]
+fn git_failure_diagnostic_does_not_copy_drained_stderr_or_command_arguments() {
+    let sentinel = "private stderr and error text SECRET";
+    let mut command = Command::new("sh");
+    command.args([
+        "-c",
+        "printf '%s' 'private stderr and error text SECRET' >&2; exit 13",
+    ]);
+    let output = execute_process(
+        command,
+        git_command_description(&[OsString::from("rev-list"), OsString::from(sentinel)]),
+        ProcessInput::None,
+        MAXIMUM_SMALL_OUTPUT_BYTES,
+        &CaptureCancellation::default(),
+        Duration::from_secs(10),
+    )
+    .unwrap();
+    let failure = command_failed(&output, GitCaptureFailure::RequiredObjectsUnavailable);
+    assert_eq!(
+        failure.cause(),
+        &GitCaptureFailure::RequiredObjectsUnavailable
+    );
+    let diagnostic = failure.capture_diagnostic();
+    assert_eq!(
+        diagnostic,
+        serde_json::json!({
+            "stage": "git_capture", "gitCommand": "rev_list", "gitExitCode": 13,
+        })
+    );
+    assert!(!diagnostic.to_string().contains(sentinel));
+}
+
+#[test]
+fn early_git_exit_with_piped_input_keeps_command_and_exit_diagnostic() {
+    // The child closes stdin before reading; the input exceeds any pipe buffer,
+    // so the writer encounters BrokenPipe while the child reports its exit.
+    let input = vec![b'x'; 4 * 1024 * 1024];
+    let mut command = Command::new("sh");
+    command.args(["-c", "exec 0<&-; printf 'secret stderr' >&2; exit 13"]);
+    let failure = execute_process(
+        command,
+        git_command_description(&[
+            OsString::from("cat-file"),
+            OsString::from("secret argument"),
+        ]),
+        ProcessInput::Bytes(&input),
+        MAXIMUM_SMALL_OUTPUT_BYTES,
+        &CaptureCancellation::default(),
+        Duration::from_secs(10),
+    )
+    .err()
+    .expect("early exit must fail");
+    let capture = capture_process_failure(failure, GitCaptureFailure::RequiredObjectsUnavailable);
+    assert_eq!(
+        capture.cause(),
+        &GitCaptureFailure::RequiredObjectsUnavailable
+    );
+    assert_eq!(
+        capture.capture_diagnostic(),
+        serde_json::json!({
+            "stage": "git_capture", "gitCommand": "cat_file", "gitExitCode": 13,
+        })
+    );
+}
+
+#[test]
 fn unavailable_promised_objects_fail_capture_instead_of_admission() {
     let fixture = promisor_fixture();
     let unavailable_source = fixture.source.with_extension("unavailable");
     fs::rename(&fixture.source, &unavailable_source).unwrap();
 
+    let failure = capture_failure(fixture.workspace.capture());
     assert_eq!(
-        capture_failure(fixture.workspace.capture()),
-        GitCaptureFailure::RequiredObjectsUnavailable
+        failure.cause(),
+        &GitCaptureFailure::RequiredObjectsUnavailable
+    );
+    let diagnostic = failure.capture_diagnostic();
+    assert_eq!(
+        diagnostic,
+        serde_json::json!({
+            "stage": "git_capture", "gitCommand": "rev_list", "gitExitCode": 128,
+        })
+    );
+    assert!(
+        !diagnostic
+            .to_string()
+            .contains(&unavailable_source.display().to_string())
     );
     assert_eq!(fixture.workspace.artifacts.git_reservation_usage(), (0, 0));
     assert_eq!(fixture.workspace.artifacts.staged_artifact_count(), 0);
+}
+
+#[test]
+fn post_admission_config_failure_keeps_git_exit_diagnostic() {
+    let temporary = tempfile::tempdir().unwrap();
+    let repository = temporary.path().join("repository");
+    init_repository(&repository);
+    fs::write(repository.join("tracked.txt"), b"baseline\n").unwrap();
+    git(&repository, &["add", "tracked.txt"]);
+    git(&repository, &["commit", "--quiet", "-m", "baseline"]);
+    let armed = temporary.path().join("armed");
+    let wrapper = temporary.path().join("git-with-config-failure");
+    fs::write(
+        &wrapper,
+        "#!/bin/sh\ncase \" $* \" in\n  *\" config --null --get-regexp \"*)\n    if [ -f \"$ARMED\" ]; then
+      printf 'private config stderr SECRET\\n' >&2
+      exit 13
+    fi ;;
+esac
+exec \"$REAL_GIT\" \"$@\"\n",
+    )
+    .unwrap();
+    fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o700)).unwrap();
+    let (admitted, artifacts) = admitted_capture(
+        temporary.path(),
+        &repository,
+        [
+            ("REAL_GIT", git_executable().as_os_str()),
+            ("ARMED", armed.as_os_str()),
+        ],
+    );
+    let capture = GitCaptureContext::admit_with_program(
+        admitted.execution(),
+        &CaptureCancellation::default(),
+        wrapper,
+        GIT_COMMAND_TIMEOUT,
+    )
+    .unwrap();
+    fs::write(repository.join("tracked.txt"), b"changed\n").unwrap();
+    git(&repository, &["commit", "--quiet", "-am", "change"]);
+    // All admission queries used real Git. The next authority query fails in
+    // capture, as it can when repository configuration becomes unreadable.
+    fs::write(&armed, b"").unwrap();
+
+    let failure =
+        capture_failure(capture.capture("changes", &artifacts, &CaptureCancellation::default()));
+    assert_eq!(failure.cause(), &GitCaptureFailure::SourceAuthorityChanged);
+    let diagnostic = failure.capture_diagnostic();
+    assert_eq!(
+        diagnostic,
+        serde_json::json!({
+            "stage": "git_capture", "gitCommand": "config", "gitExitCode": 13,
+        })
+    );
+    assert!(!diagnostic.to_string().contains("SECRET"));
+    assert_eq!(artifacts.staged_artifact_count(), 0);
 }
 
 #[test]
@@ -1146,9 +1280,10 @@ fn global_git_config_cannot_redirect_promisor_hydration() {
     let unavailable_source = fixture.source.with_extension("unavailable");
     fs::rename(&fixture.source, unavailable_source).unwrap();
 
+    let failure = capture_failure(fixture.workspace.capture());
     assert_eq!(
-        capture_failure(fixture.workspace.capture()),
-        GitCaptureFailure::RequiredObjectsUnavailable
+        failure.cause(),
+        &GitCaptureFailure::RequiredObjectsUnavailable
     );
     assert_eq!(fixture.workspace.artifacts.staged_artifact_count(), 0);
 }
@@ -1176,9 +1311,10 @@ fn git_config_parameters_cannot_redirect_promisor_hydration() {
     let unavailable_source = fixture.source.with_extension("unavailable");
     fs::rename(&fixture.source, unavailable_source).unwrap();
 
+    let failure = capture_failure(fixture.workspace.capture());
     assert_eq!(
-        capture_failure(fixture.workspace.capture()),
-        GitCaptureFailure::RequiredObjectsUnavailable
+        failure.cause(),
+        &GitCaptureFailure::RequiredObjectsUnavailable
     );
     assert_eq!(fixture.workspace.artifacts.staged_artifact_count(), 0);
 }
@@ -1429,11 +1565,15 @@ esac\nexec \"$REAL_GIT\" \"$@\"\n",
     let GitCaptureFailure::CommandTimedOut(timeout) = failure else {
         panic!("capture timeout changed failure variant");
     };
-    assert_eq!(
-        timeout.command.as_ref(),
-        "git pack-objects --stdout --revs --no-sparse --no-use-bitmap-index --window=0 --depth=0"
-    );
+    assert_eq!(timeout.command.as_ref(), "pack_objects");
     assert_eq!(timeout.limit, capture_timeout);
+    let diagnostic = GitCaptureFailure::CommandTimedOut(timeout).capture_diagnostic();
+    assert_eq!(
+        diagnostic,
+        serde_json::json!({
+            "stage": "git_capture", "gitCommand": "pack_objects", "limitMs": 5000,
+        })
+    );
     assert_eq!(artifacts.git_reservation_usage(), (0, 0));
 }
 

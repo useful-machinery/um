@@ -9,11 +9,13 @@ pub(in crate::service) enum ExecutionReport {
     Transition {
         execution_event_sequence: u64,
         workflow_event: Value,
+        diagnostic: Option<Value>,
     },
     Finished {
         final_execution_event_sequence: u64,
         outcome: Value,
         artifact_delivery: Value,
+        diagnostic: Option<Value>,
     },
     Interrupted {
         final_execution_event_sequence: u64,
@@ -67,17 +69,20 @@ impl ExecutionReport {
             Self::Transition {
                 execution_event_sequence,
                 workflow_event,
+                diagnostic,
             } => RunnerFrame::ExecutionTransition {
                 envelope,
                 assignment_id,
                 attempt_id,
                 execution_event_sequence: *execution_event_sequence,
                 workflow_event: workflow_event.clone(),
+                diagnostic: diagnostic.clone(),
             },
             Self::Finished {
                 final_execution_event_sequence,
                 outcome,
                 artifact_delivery,
+                diagnostic,
             } => RunnerFrame::ExecutionFinished {
                 envelope,
                 assignment_id,
@@ -85,6 +90,7 @@ impl ExecutionReport {
                 final_execution_event_sequence: *final_execution_event_sequence,
                 outcome: outcome.clone(),
                 artifact_delivery: artifact_delivery.clone(),
+                diagnostic: diagnostic.clone(),
             },
             Self::Interrupted {
                 final_execution_event_sequence,

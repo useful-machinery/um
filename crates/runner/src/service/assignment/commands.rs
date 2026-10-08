@@ -118,7 +118,7 @@ impl AssignmentDecision {
                 envelope,
                 effect_id: effect_id.clone(),
                 assignment_id: assignment_id.clone(),
-                decline: *decline,
+                decline: decline.clone(),
             },
         }
     }

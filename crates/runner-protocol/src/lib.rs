@@ -121,6 +121,7 @@ pub enum RunnerFrame {
         attempt_id: String,
         execution_event_sequence: u64,
         workflow_event: Value,
+        diagnostic: Option<Value>,
     },
     ExecutionFinished {
         envelope: RunnerEnvelope,
@@ -129,6 +130,7 @@ pub enum RunnerFrame {
         final_execution_event_sequence: u64,
         outcome: Value,
         artifact_delivery: Value,
+        diagnostic: Option<Value>,
     },
     ExecutionInterrupted {
         envelope: RunnerEnvelope,
@@ -250,19 +252,43 @@ impl ExecutionSpecInvalidReason {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AssignmentDecline {
     CapacityUnavailable,
     RunnerUnable(RunnerUnableReason),
     ExecutionSpecInvalid(ExecutionSpecInvalidReason),
+    Diagnosed {
+        decline: Box<Self>,
+        stage: &'static str,
+        cause: &'static str,
+    },
 }
 
 impl AssignmentDecline {
-    pub const fn protocol_type_and_reason(self) -> (&'static str, Option<&'static str>) {
+    pub fn diagnosed(self, stage: &'static str, cause: &'static str) -> Self {
+        Self::Diagnosed {
+            decline: Box::new(self),
+            stage,
+            cause,
+        }
+    }
+
+    pub fn protocol_type_and_reason(&self) -> (&'static str, Option<&'static str>) {
         match self {
             Self::CapacityUnavailable => ("capacity_unavailable", None),
             Self::RunnerUnable(reason) => ("runner_unable", Some(reason.as_str())),
             Self::ExecutionSpecInvalid(reason) => ("execution_spec_invalid", Some(reason.as_str())),
+            Self::Diagnosed { decline, .. } => decline.protocol_type_and_reason(),
+        }
+    }
+
+    fn diagnostic(&self) -> Option<Value> {
+        match self {
+            Self::Diagnosed { stage, cause, .. } => Some(json!({
+                "stage": stage,
+                "declineCause": cause,
+            })),
+            _ => None,
         }
     }
 }
@@ -825,22 +851,23 @@ pub fn encode_runner_frame(frame: &RunnerFrame) -> Result<Vec<u8>, EncodeError> 
             decline,
         } => {
             let (decline_type, decline_reason) = decline.protocol_type_and_reason();
-            let decline = match decline_reason {
+            let decline_value = match decline_reason {
                 Some(reason) => json!({
                     "type": decline_type,
                     "reason": reason,
                 }),
                 None => json!({ "type": decline_type }),
             };
-            runner_frame_value(
-                envelope,
-                "assignment_rejected",
-                json!({
-                    "effectId": effect_id,
-                    "assignmentId": assignment_id,
-                    "decline": decline,
-                }),
-            )
+            let mut decline_value = decline_value;
+            if let Some(diagnostic) = decline.diagnostic() {
+                decline_value["diagnostic"] = diagnostic;
+            }
+            let payload = json!({
+                "effectId": effect_id,
+                "assignmentId": assignment_id,
+                "decline": decline_value,
+            });
+            runner_frame_value(envelope, "assignment_rejected", payload)
         }
         RunnerFrame::AssignmentCancellationApplied {
             envelope,
@@ -907,16 +934,19 @@ pub fn encode_runner_frame(frame: &RunnerFrame) -> Result<Vec<u8>, EncodeError> 
             attempt_id,
             execution_event_sequence,
             workflow_event,
-        } => runner_frame_value(
-            envelope,
-            "execution_transition",
-            json!({
+            diagnostic,
+        } => {
+            let mut payload = json!({
                 "assignmentId": assignment_id,
                 "attemptId": attempt_id,
                 "executionEventSequence": execution_event_sequence,
                 "workflowEvent": workflow_event,
-            }),
-        ),
+            });
+            if let Some(diagnostic) = diagnostic {
+                payload["diagnostic"] = diagnostic.clone();
+            }
+            runner_frame_value(envelope, "execution_transition", payload)
+        }
         RunnerFrame::ExecutionFinished {
             envelope,
             assignment_id,
@@ -924,17 +954,20 @@ pub fn encode_runner_frame(frame: &RunnerFrame) -> Result<Vec<u8>, EncodeError> 
             final_execution_event_sequence,
             outcome,
             artifact_delivery,
-        } => runner_frame_value(
-            envelope,
-            "execution_finished",
-            json!({
+            diagnostic,
+        } => {
+            let mut payload = json!({
                 "assignmentId": assignment_id,
                 "attemptId": attempt_id,
                 "finalExecutionEventSequence": final_execution_event_sequence,
                 "outcome": outcome,
                 "artifactDelivery": artifact_delivery,
-            }),
-        ),
+            });
+            if let Some(diagnostic) = diagnostic {
+                payload["diagnostic"] = diagnostic.clone();
+            }
+            runner_frame_value(envelope, "execution_finished", payload)
+        }
         RunnerFrame::ExecutionInterrupted {
             envelope,
             assignment_id,
@@ -2066,7 +2099,15 @@ fn validate_closed_shape(value: &Value) -> Result<(), DecodeError> {
     let continuation = frame_type == "assignment_offer" && payload.contains_key("continuation");
     let settlement =
         frame_type == "workspace_retention_report" && payload.contains_key("settlementSnapshot");
-    if payload.len() != payload_keys.len() + usize::from(continuation) + usize::from(settlement)
+    let diagnostic = matches!(
+        frame_type,
+        "execution_transition" | "execution_finished" | "execution_interrupted"
+    ) && payload.contains_key("diagnostic");
+    if payload.len()
+        != payload_keys.len()
+            + usize::from(continuation)
+            + usize::from(settlement)
+            + usize::from(diagnostic)
         || !payload_keys.iter().all(|key| payload.contains_key(*key))
     {
         return Err(DecodeError::InvalidFrame("payload"));
@@ -2506,6 +2547,31 @@ mod tests {
     }
 
     #[test]
+    fn diagnosed_decline_keeps_closed_reason_and_sibling_safe_facts() {
+        let frame = RunnerFrame::AssignmentRejected {
+            envelope: maximal_envelope(),
+            effect_id: "eff_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned(),
+            assignment_id: "asn_01k0z6r1w8f4jy2m7q9v3x5abh".to_owned(),
+            decline: AssignmentDecline::RunnerUnable(RunnerUnableReason::SourceServiceUnavailable)
+                .diagnosed("source_materialization", "source_repository_unavailable"),
+        };
+        let encoded = encode_runner_frame(&frame).unwrap();
+        let value: Value = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(
+            value["payload"]["decline"],
+            json!({
+                "type": "runner_unable",
+                "reason": "source_service_unavailable",
+                "diagnostic": {
+                    "stage": "source_materialization",
+                    "declineCause": "source_repository_unavailable",
+                },
+            })
+        );
+        assert!(matches!(decode_frame(&encoded), Ok(ValidatedFrame::Runner)));
+    }
+
+    #[test]
     fn retained_workspace_report_carries_only_owner_snapshots() {
         for settlement_snapshot in [
             None,
@@ -2869,6 +2935,7 @@ mod tests {
         }
         assert_eq!(remaining_rounds, 0);
         RunnerFrame::ExecutionFinished {
+            diagnostic: None,
             envelope: maximal_envelope(),
             assignment_id: "asn_07zzzzzzzzzzzzzzzzzzzzzzzz".to_owned(),
             attempt_id: "atm_07zzzzzzzzzzzzzzzzzzzzzzzz".to_owned(),
@@ -2927,6 +2994,7 @@ mod tests {
                 }
             }
             let frame = RunnerFrame::ExecutionTransition {
+                diagnostic: None,
                 envelope: maximal_envelope(),
                 assignment_id: "asn_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned(),
                 attempt_id: "atm_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned(),
@@ -2986,6 +3054,7 @@ mod tests {
         assert!(encoded.len() < MAXIMUM_TERMINAL_FRAME_BYTES);
 
         let settling = RunnerFrame::ExecutionTransition {
+            diagnostic: None,
             envelope: maximal_envelope(),
             assignment_id: "asn_07zzzzzzzzzzzzzzzzzzzzzzzz".to_owned(),
             attempt_id: "atm_07zzzzzzzzzzzzzzzzzzzzzzzz".to_owned(),

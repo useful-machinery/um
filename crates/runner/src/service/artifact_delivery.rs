@@ -180,6 +180,7 @@ impl ArtifactDeliverySpec {
 pub(super) struct ClosedArtifactDeliveryFailure {
     pub(super) phase: String,
     pub(super) code: String,
+    pub(super) diagnostic: Option<serde_json::Value>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -267,6 +268,7 @@ struct Delivery {
     backoff: Backoff,
     finalization_deadline: Option<OffsetDateTime>,
     deadline_read_scheduled: bool,
+    last_upload_diagnostic: Option<serde_json::Value>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -301,7 +303,7 @@ impl DeliveryPhase {
 
 struct UploadCompleted {
     delivery_id: u64,
-    result: Result<(), ()>,
+    result: Result<Option<serde_json::Value>, ()>,
 }
 
 struct RetryWork {
@@ -397,6 +399,7 @@ impl ArtifactDeliveryBroker {
                 backoff: Backoff::new(),
                 finalization_deadline: None,
                 deadline_read_scheduled: false,
+                last_upload_diagnostic: None,
             },
         );
         Ok(receiver)
@@ -671,7 +674,11 @@ impl ArtifactDeliveryBroker {
                 }),
             ) if delivery_phase.result_set_id() == Some(artifact_set_id.as_str()) => {
                 completion = Some(ArtifactDeliveryOutcome::Failed(
-                    ClosedArtifactDeliveryFailure { phase, code },
+                    ClosedArtifactDeliveryFailure {
+                        phase,
+                        code,
+                        diagnostic: None,
+                    },
                 ));
             }
             (
@@ -768,6 +775,9 @@ impl ArtifactDeliveryBroker {
             let artifact_set_id = artifact_set_id.clone();
             let carrier_id = carrier_id.clone();
             let upload_capability = upload_capability.clone();
+            if let Ok(diagnostic) = &completed.result {
+                delivery.last_upload_diagnostic = diagnostic.clone();
+            }
             if completed.result.is_err() {
                 let exhausted = upload_retry_failure(&delivery.spec);
                 match plan_retry(
@@ -989,13 +999,15 @@ fn failed_for_code(operation_phase: &str, code: String) -> ArtifactDeliveryOutco
     ArtifactDeliveryOutcome::Failed(ClosedArtifactDeliveryFailure {
         phase: phase.to_owned(),
         code,
+        diagnostic: None,
     })
 }
 
-fn internal_failure(phase: &str) -> ArtifactDeliveryOutcome {
+pub(super) fn internal_failure(phase: &str) -> ArtifactDeliveryOutcome {
     ArtifactDeliveryOutcome::Failed(ClosedArtifactDeliveryFailure {
         phase: phase.to_owned(),
         code: "delivery_internal_failure".to_owned(),
+        diagnostic: None,
     })
 }
 
@@ -1007,6 +1019,7 @@ fn upload_retry_failure(spec: &ArtifactDeliverySpec) -> ArtifactDeliveryOutcome 
         } else {
             "carrier_upload_failed".to_owned()
         },
+        diagnostic: None,
     })
 }
 
@@ -1274,7 +1287,7 @@ impl UploadWork {
         }
     }
 
-    fn run(self) -> Result<(), ()> {
+    fn run(self) -> Result<Option<serde_json::Value>, ()> {
         validate_capability(
             &self.capability,
             self.size_bytes,
@@ -1311,10 +1324,28 @@ impl UploadWork {
         {
             Ok(response)
                 if response.status().is_success()
-                    || response.status() == StatusCode::PRECONDITION_FAILED => {}
-            Ok(_) | Err(_) => {}
+                    || response.status() == StatusCode::PRECONDITION_FAILED =>
+            {
+                Ok(None)
+            }
+            Ok(response) => Ok(Some(serde_json::json!({
+                "stage": "artifact_upload",
+                "httpStatus": response.status().as_u16(),
+            }))),
+            Err(error) => {
+                // Reqwest's connect bucket also includes DNS and TLS failures;
+                // it does not reliably distinguish them without parsing error text.
+                let class = if error.is_timeout() {
+                    "timed_out"
+                } else {
+                    "transport_failed"
+                };
+                Ok(Some(serde_json::json!({
+                    "stage": "artifact_upload",
+                    "transportError": class,
+                })))
+            }
         }
-        Ok(())
     }
 }
 
@@ -1405,8 +1436,18 @@ fn confirm_observation(
     })
 }
 
-fn complete(state: &mut ArtifactDeliveryState, delivery_id: u64, result: ArtifactDeliveryOutcome) {
+fn complete(
+    state: &mut ArtifactDeliveryState,
+    delivery_id: u64,
+    mut result: ArtifactDeliveryOutcome,
+) {
     if let Some(delivery) = state.deliveries.remove(&delivery_id) {
+        if let ArtifactDeliveryOutcome::Failed(failure) = &mut result
+            && failure.diagnostic.is_none()
+            && failure.phase == "upload"
+        {
+            failure.diagnostic = delivery.last_upload_diagnostic;
+        }
         let _ = delivery.completion.send(result);
     }
 }
@@ -1425,6 +1466,52 @@ mod tests {
             "atm_01k0z6r1w8f4jy2m7q9v3x5abk".to_owned(),
             Arc::from(&b"{}"[..]),
         )
+    }
+
+    #[test]
+    fn upload_put_diagnostic_contains_only_status_or_transport_class() {
+        use std::io::{Read as _, Write as _};
+        use std::net::{TcpListener, TcpStream};
+
+        let spec = result_spec();
+        for respond in [true, false] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(10)))
+                    .unwrap();
+                let mut request = [0_u8; 4096];
+                let _ = stream.read(&mut request).unwrap();
+                if respond {
+                    stream.write_all(b"HTTP/1.1 503 Unavailable\r\nContent-Length: 23\r\n\r\nsecret provider message").unwrap();
+                }
+            });
+            let capability = ArtifactUploadCapability {
+                url: format!("http://{address}/secret-path"),
+                content_length: spec.size_bytes.to_string(),
+                content_type: spec.media_type.clone(),
+                if_none_match: "*".to_owned(),
+                checksum_sha256: checksum_base64(&spec.sha256).unwrap(),
+                expires_at: "2026-08-20T00:05:00Z".to_owned(),
+            };
+            let mut work = UploadWork::new(1, &spec, capability);
+            work.allow_insecure_loopback = true;
+            let result = work.run();
+            // Unblock accept if the client failed before connecting; this connection
+            // cannot make a failed PUT succeed because its result is already fixed.
+            let _ = TcpStream::connect_timeout(&address, Duration::from_secs(1));
+            server.join().unwrap();
+            let diagnostic = result.unwrap().unwrap();
+            assert_eq!(diagnostic["stage"], "artifact_upload");
+            if respond {
+                assert_eq!(diagnostic["httpStatus"], 503);
+            } else {
+                assert_eq!(diagnostic["transportError"], "transport_failed");
+            }
+            assert!(!diagnostic.to_string().contains("secret"));
+        }
     }
 
     #[test]
@@ -1599,6 +1686,7 @@ mod tests {
                 completion.try_recv(),
                 Ok(ArtifactDeliveryOutcome::Failed(
                     ClosedArtifactDeliveryFailure {
+                        diagnostic: None,
                         phase: phase.to_owned(),
                         code: code.to_owned(),
                     }
@@ -1659,10 +1747,67 @@ mod tests {
             completion.try_recv(),
             Ok(ArtifactDeliveryOutcome::Failed(
                 ClosedArtifactDeliveryFailure {
+                    diagnostic: None,
                     phase: "registration".to_owned(),
                     code: "delivery_internal_failure".to_owned(),
                 }
             ))
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_upload_diagnostic_survives_cloud_confirmation() {
+        let outbox = ObservationOutbox::new();
+        let (sleeper, _) = controlled_sleeper();
+        let (broker, mut completion) = start_result_delivery(&outbox, sleeper);
+        let artifact_set_id = "ats_01k0z6r1w8f4jy2m7q9v3x5ac0".to_owned();
+        let spec = result_spec();
+        let capability = ArtifactUploadCapability {
+            url: "http://127.0.0.1:9000/artifact".to_owned(),
+            content_length: spec.size_bytes.to_string(),
+            content_type: spec.media_type.clone(),
+            if_none_match: "*".to_owned(),
+            checksum_sha256: checksum_base64(&spec.sha256).unwrap(),
+            expires_at: "2026-08-20T00:05:00Z".to_owned(),
+        };
+        broker.lock().deliveries.get_mut(&1).unwrap().phase = DeliveryPhase::Uploading {
+            artifact_set_id: artifact_set_id.clone(),
+            carrier_id: None,
+            upload_capability: capability,
+        };
+        broker
+            .uploads
+            .send(UploadCompleted {
+                delivery_id: 1,
+                result: Ok(Some(
+                    serde_json::json!({"stage": "artifact_upload", "httpStatus": 503}),
+                )),
+            })
+            .unwrap();
+        broker.drain_uploads();
+        broker
+            .handle_response(
+                1,
+                ArtifactCloudResponse::ResultConfirmation(ArtifactResultConfirmationResponse {
+                    request_message_id: "rmsg_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned(),
+                    outcome: ArtifactResultConfirmationOutcome::Failed {
+                        artifact_set_id,
+                        phase: "upload".to_owned(),
+                        code: "result_upload_failed".to_owned(),
+                    },
+                }),
+            )
+            .unwrap();
+        let result = completion.try_recv().unwrap();
+        assert_eq!(
+            result,
+            ArtifactDeliveryOutcome::Failed(ClosedArtifactDeliveryFailure {
+                phase: "upload".to_owned(),
+                code: "result_upload_failed".to_owned(),
+                diagnostic: Some(
+                    serde_json::json!({"stage": "artifact_upload", "httpStatus": 503})
+                ),
+            })
         );
     }
 
@@ -1695,6 +1840,7 @@ mod tests {
             completion.try_recv(),
             Ok(ArtifactDeliveryOutcome::Failed(
                 ClosedArtifactDeliveryFailure {
+                    diagnostic: None,
                     phase: "upload".to_owned(),
                     code: "result_upload_failed".to_owned(),
                 }

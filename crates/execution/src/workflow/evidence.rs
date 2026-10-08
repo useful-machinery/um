@@ -989,7 +989,8 @@ fn output_capture_failure_detail(source: &OutputCaptureFailure) -> FailureDetail
             Some(source.output_identity().to_owned()),
         ),
         OutputCaptureFailure::Git { output, failure } => (
-            match failure {
+            match failure.cause() {
+                GitCaptureFailure::CommandFailed(_) => FailureCode::GitRequiredObjectsUnavailable,
                 GitCaptureFailure::Cancelled
                 | GitCaptureFailure::Artifact(_)
                 | GitCaptureFailure::StagingMismatch => FailureCode::OutputStagingUnavailable,
