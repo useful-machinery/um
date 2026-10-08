@@ -11,6 +11,8 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use nix::sys::stat::Mode;
 use nix::unistd::mkfifo;
 use rustix::process::{Pid, getpgid};
+#[cfg(target_os = "linux")]
+use rustix::process::{PidfdFlags, Signal, pidfd_open, pidfd_send_signal};
 use serde_json::{Value, json};
 use tokio::io::AsyncWriteExt as _;
 use tokio::process::Command;
@@ -716,6 +718,12 @@ async fn pinned_real_claude_code_04_production_no_value_and_native_failure_are_t
             .next_request()
             .await
             .release_invalid_request();
+        // This qualification release retries an invalid provider request once. Keep
+        // both responses controlled so the terminal native failure can be observed.
+        let retry = failure_provider.next_request().await;
+        assert!(retry.used_placeholder_key());
+        assert!(retry.body()["messages"].is_array());
+        retry.release_invalid_request();
         assert_eq!(
             failure.finish().await,
             failed_agent_outcome(AgentFailureCause::HarnessFailed {
@@ -894,6 +902,78 @@ async fn pinned_real_claude_code_06_cancels_a_stubborn_bash_descendant() {
     .expect("pinned Claude Code stubborn-child cancellation watchdog expired");
 }
 
+#[cfg(target_os = "linux")]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "real time is used only as an anti-hang watchdog, never as success evidence"
+)]
+#[tokio::test]
+#[ignore = "requires pinned harness"]
+async fn pinned_real_claude_code_06b_headless_term_and_cont_quiesce_owned_work() {
+    let (executable, _exclusive) = exclusive_conformance_executable().await;
+    nix::sys::prctl::set_child_subreaper(true).unwrap();
+    tokio::time::timeout(WATCHDOG, async {
+        let mut provider = LoopbackProvider::start().await;
+        let root = SyntheticClaudeCodeRoot::new();
+        let child = FixtureSignal::create(root.private().join("term-child.pid"));
+        let blocker = root.private().join("term-child.blocker");
+        mkfifo(&blocker, Mode::S_IRUSR | Mode::S_IWUSR).unwrap();
+        let native_payload = executable
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("libexec/claude-code/claude");
+        let running = launch_response_lifecycle(executable, &root, &provider).await;
+        provider.next_request().await.release_tool_use(
+            "Bash",
+            json!({
+                "command": format!(
+                    "printf '%s\\n' \"$$\" > '{}'; IFS= read -r unexpected < '{}'",
+                    child.path().display(), blocker.display()
+                ),
+                "description": "Block owned work for a headless termination probe",
+            }),
+        );
+        let child = process_id(&child.receive().await);
+        let process_group = getpgid(Some(child)).unwrap();
+        let status = fs::read_to_string(format!("/proc/{}/status", child.as_raw_pid())).unwrap();
+        let parent: i32 = status
+            .lines()
+            .find_map(|line| line.strip_prefix("PPid:\t"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let cmdline = fs::read(format!("/proc/{parent}/cmdline")).unwrap();
+        assert!(
+            cmdline
+                .split(|byte| *byte == 0)
+                .any(|arg| arg == native_payload.as_os_str().as_encoded_bytes())
+        );
+        // Keep both signals bound to the same process even if TERM exits it before
+        // CONT can be delivered. The owned child is ready before either signal.
+        let native = pidfd_open(Pid::from_raw(parent).unwrap(), PidfdFlags::empty()).unwrap();
+        assert_eq!(
+            fs::read(format!("/proc/{parent}/cmdline")).unwrap(),
+            cmdline
+        );
+        pidfd_send_signal(&native, Signal::TERM).unwrap();
+        match pidfd_send_signal(&native, Signal::CONT) {
+            Ok(()) | Err(rustix::io::Errno::SRCH) => {}
+            Err(error) => panic!("native SIGCONT failed: {error}"),
+        }
+        let outcome = running.finish().await;
+        assert!(matches!(outcome, AgentOutcome::Failed(_)), "{outcome:?}");
+        assert!(process_group_is_quiescent(process_group));
+        assert!(!provider.has_pending_request());
+        assert_retained_native_session(&root, &["Complete the controlled lifecycle exchange."]);
+        provider.shutdown().await;
+    })
+    .await
+    .expect("pinned Claude Code headless termination watchdog expired");
+}
+
 #[expect(
     clippy::disallowed_methods,
     reason = "real time is used only as an anti-hang watchdog, never as success evidence"
@@ -992,7 +1072,7 @@ async fn pinned_real_claude_code_08_correlates_a_nominal_thinking_envelope_befor
             LoopbackBlock::text(RESPONSE),
         ]);
 
-        // Claude Code 2.1.284 emits a nominal `assistant` envelope restating the thinking
+        // Claude Code 2.1.289 emits a nominal `assistant` envelope restating the thinking
         // block. `ActiveContentBlock::correlate_nominal` requires that envelope to be
         // byte-equal to the reconstructed `thinking_delta` stream, so reaching a response
         // at all proves the equality invariant holds for native thinking.

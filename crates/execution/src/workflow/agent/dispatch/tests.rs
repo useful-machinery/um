@@ -109,7 +109,7 @@ async fn scripted_dispatch_preserves_each_native_harness_identity_and_returns_it
             &temporary,
             AgentCompatibilityProfile::ClaudeCodeStreamJsonV1,
             "/validated/claude",
-            "2.1.284",
+            "2.1.289",
             ClaudeCodeConfig {
                 model: "claude-opus-4-1".into(),
                 effort: ClaudeCodeEffort::High,

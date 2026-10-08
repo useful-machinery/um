@@ -4390,16 +4390,37 @@ async fn try_read_fixture_line(stream: &TcpStream) -> Option<Vec<u8>> {
     let mut line = Vec::new();
     let mut buffer = [0_u8; 4096];
     loop {
+        // A report and its next event can arrive in one TCP read. Inspect the
+        // available bytes first so this read leaves later messages on the socket.
+        let available = match stream.peek(&mut buffer).await {
+            Ok(0) => return None,
+            Ok(read) => read,
+            Err(failure)
+                if matches!(
+                    failure.kind(),
+                    io::ErrorKind::BrokenPipe
+                        | io::ErrorKind::ConnectionAborted
+                        | io::ErrorKind::ConnectionReset
+                ) =>
+            {
+                return None;
+            }
+            Err(failure) => panic!("fixture control peek failed: {failure:?}"),
+        };
+        let through_line = buffer[..available]
+            .iter()
+            .position(|&byte| byte == b'\n')
+            .map_or(available, |index| index + 1);
         stream.readable().await.unwrap();
-        match stream.try_read(&mut buffer) {
+        match stream.try_read(&mut buffer[..through_line]) {
             Ok(0) => return None,
             Ok(read) => {
                 line.extend_from_slice(&buffer[..read]);
+                assert!(line.len() <= 16 * 1024);
                 if line.last() == Some(&b'\n') {
                     line.pop();
                     return Some(line);
                 }
-                assert!(line.len() <= 16 * 1024);
             }
             Err(failure) if failure.kind() == io::ErrorKind::WouldBlock => {}
             Err(failure)
