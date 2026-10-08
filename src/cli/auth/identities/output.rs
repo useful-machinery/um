@@ -22,7 +22,6 @@ pub(super) fn write_list(
     match outcome {
         // Identity and membership collections intentionally keep separate JSON contracts and
         // human renderers because their item vocabularies evolve independently.
-        // jscpd:ignore-start
         ListIdentitiesOutcome::Listed(page) => {
             if json {
                 write_json(&ListResult {
@@ -37,7 +36,6 @@ pub(super) fn write_list(
             }
             Ok(ExitCode::Success)
         }
-        // jscpd:ignore-end
         ListIdentitiesOutcome::Common(common) => {
             write_common(deployment, common, authentication, json)
         }
@@ -167,7 +165,6 @@ impl LinkOutput {
         expires_at: OffsetDateTime,
     ) -> anyhow::Result<()> {
         // Keep identity-link presentation and its error context next to this command.
-        // jscpd:ignore-start
         if self.json {
             let event = um_human_auth::activation_event(
                 deployment,
@@ -177,7 +174,6 @@ impl LinkOutput {
             )
             .context("format identity-link activation expiration")?;
             self.json_line(&event)
-        // jscpd:ignore-end
         } else {
             let stdout = io::stdout();
             let mut stdout = stdout.lock();

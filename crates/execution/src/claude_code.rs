@@ -4,7 +4,6 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 
 // This harness consumes the shared installation lifecycle but owns all profile policy below.
-// jscpd:ignore-start
 #[cfg(test)]
 use super::harness_installation::validate_installation_with as validate_shared_installation;
 use super::harness_installation::{
@@ -15,7 +14,6 @@ use super::harness_installation::{
 #[cfg(test)]
 use crate::process::CommandRunner;
 use crate::process::{CommandOutput, SystemCommandRunner};
-// jscpd:ignore-end
 
 pub const CLAUDE_CODE_STREAM_JSON_V1_SUPPORTED_RANGE: &str = ">=2.1.234 <2.2.0";
 pub const CLAUDE_CODE_STREAM_JSON_V1_QUALIFICATION_VERSION: &str = "2.1.284";
@@ -155,7 +153,6 @@ impl ValidatedClaudeCodeInstallation {
 }
 
 // Probe labels remain harness-specific because they are part of Claude diagnostics.
-// jscpd:ignore-start
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ClaudeCodeProbe {
     Version,
@@ -170,10 +167,8 @@ impl ClaudeCodeProbe {
         }
     }
 }
-// jscpd:ignore-end
 
 // Claude diagnostics stay harness-specific so adding Pi failure policy cannot alter Claude codes.
-// jscpd:ignore-start
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ClaudeCodeIncompatibility {
     Version(String),
@@ -231,7 +226,6 @@ impl fmt::Display for ClaudeCodeInstallationFailure {
 }
 
 impl std::error::Error for ClaudeCodeInstallationFailure {}
-// jscpd:ignore-end
 
 struct ClaudeCodeInstallationProfile;
 
@@ -266,7 +260,6 @@ impl HarnessInstallationProfile for ClaudeCodeInstallationProfile {
     }
 
     // Each profile owns these policy mappings despite the shared probe lifecycle.
-    // jscpd:ignore-start
     fn parse_version_output(output: &CommandOutput) -> Result<Self::Version, Self::Failure> {
         parse_version_output(output)
     }
@@ -329,7 +322,6 @@ impl HarnessInstallationProfile for ClaudeCodeInstallationProfile {
     fn unexecutable_failure() -> Self::Failure {
         ClaudeCodeInstallationFailure::Unexecutable { version: None }
     }
-    // jscpd:ignore-end
 }
 
 pub fn discover_and_validate_claude_code_installation()

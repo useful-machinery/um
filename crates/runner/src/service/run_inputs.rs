@@ -217,7 +217,6 @@ pub(super) trait RunInputBroker: Send + Sync {
     ) -> Result<CapabilityEnvelope, BrokerFailure>;
 
     // The object-safe broker declaration intentionally mirrors its HTTP implementation.
-    // jscpd:ignore-start
     fn download(
         &self,
         url: &str,
@@ -226,7 +225,6 @@ pub(super) trait RunInputBroker: Send + Sync {
         deadline: PreparationDeadline,
         consume: &mut dyn FnMut(&[u8]) -> Result<(), BrokerFailure>,
     ) -> Result<(), BrokerFailure>;
-    // jscpd:ignore-end
 }
 
 #[derive(Clone)]

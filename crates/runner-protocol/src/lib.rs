@@ -333,7 +333,6 @@ pub struct ExecutionCapacityV1RunnerProjection {
     pub source_closure_digest: WorkflowSourceClosureDigestV1RunnerProjection,
     // Runner admission consumes a closed wire projection rather than the resolver's
     // computed type so protocol decoding cannot accidentally become capacity authority.
-    // jscpd:ignore-start
     pub general_maximum_transitions: u64,
     pub selected_maximum_transitions: u64,
     pub maximum_invocations: u64,
@@ -348,7 +347,6 @@ pub struct ExecutionCapacityV1RunnerProjection {
     pub presentation_result_bytes: u64,
     pub portable_result_bytes: u64,
     pub encoded_outbox_bytes: u64,
-    // jscpd:ignore-end
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -526,7 +524,6 @@ pub struct ArtifactConfirmationResponse {
 
 // Result freeze responses remain distinct from carrier responses because their
 // deadline participates in a separate result-finalization state machine.
-// jscpd:ignore-start
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ArtifactResultRegistrationOutcome {
     Succeeded {
@@ -545,7 +542,6 @@ pub struct ArtifactResultRegistrationResponse {
     pub request_message_id: String,
     pub outcome: ArtifactResultRegistrationOutcome,
 }
-// jscpd:ignore-end
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ArtifactResultConfirmationOutcome {

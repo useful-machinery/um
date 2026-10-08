@@ -1019,7 +1019,6 @@ pub(super) struct AttemptFinalizationCompleteV1 {
 
 // Completed finalizers and live attempt nodes remain distinct durable envelopes even
 // though both carry the same canonical detail union.
-// jscpd:ignore-start
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(super) struct DurableFinalizerV1 {
@@ -1036,7 +1035,6 @@ pub(super) struct DurableFinalizerV1 {
     )]
     pub(super) detail: Option<NodeDetail>,
 }
-// jscpd:ignore-end
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -4273,7 +4271,6 @@ fn attempt_step_state<Output>(state: &StepState<Output>) -> AttemptStepStateV1 {
 
 // Durable state copies detail while the live view model copies it into observation
 // facts; keeping both projections explicit avoids coupling persistence to presentation.
-// jscpd:ignore-start
 fn attempt_step_detail<Output>(state: &StepState<Output>) -> Option<NodeDetail> {
     match state {
         StepState::Inherited { detail, .. } => Some(NodeDetail::Inherited(detail.clone())),
@@ -4292,7 +4289,6 @@ fn attempt_step_detail<Output>(state: &StepState<Output>) -> Option<NodeDetail> 
         | StepState::Succeeded { .. } => None,
     }
 }
-// jscpd:ignore-end
 
 fn durable_finalization_summary<Deadline>(
     summary: &FinalizationSummary<Deadline>,
@@ -8172,7 +8168,6 @@ fn validate_attempt_finalization<'a>(
                 )
                 // Progress and complete finalizers have distinct durable types and phase
                 // invariants, so keeping their local validation explicit is clearer.
-                // jscpd:ignore-start
                 || complete.finalizers.iter().any(|finalizer| {
                     finalizer.role != AttemptNodeRoleV1::Finalizer
                         || finalizer.id.is_empty()
@@ -8191,7 +8186,6 @@ fn validate_attempt_finalization<'a>(
                             complete.force_abort,
                         )
                 })
-            // jscpd:ignore-end
             {
                 return Err(LocalRunDirectoryError::AttemptFinalizationCompleteInvalid);
             }

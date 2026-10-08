@@ -2,12 +2,12 @@ use std::fmt;
 use std::io;
 use std::time::Duration;
 
-use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderValue};
+use reqwest::header::{AUTHORIZATION, HeaderValue};
 use reqwest::{Response, StatusCode, Url};
 
 use super::bearer_authorization;
 use super::http_client::{DnsResolutionError, HttpClient, HttpEndpointError};
-use super::http_util::{self, BoundedBodyError};
+use super::http_util::{self, BufferedResponseError};
 use super::principal_profile::{self, PrincipalProfile};
 use super::problem;
 
@@ -15,7 +15,6 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 const PRINCIPAL_NOT_PROVISIONED: &str =
     "https://api.usefulmachinery.com/problems/principal-not-provisioned";
 const JSON_MEDIA_TYPE: &str = "application/json";
-const PROBLEM_MEDIA_TYPE: &str = "application/problem+json";
 const ACCEPTED_MEDIA_TYPES: &str = "application/json, application/problem+json";
 
 #[derive(Debug, Eq, PartialEq)]
@@ -197,30 +196,23 @@ async fn execute_current_principal_request(
 async fn decode_response(
     response: Response,
 ) -> Result<CurrentPrincipalOutcome, CurrentPrincipalError> {
-    let status = response.status();
-    let credential_rejected = status == StatusCode::UNAUTHORIZED;
-    let content_type = response
-        .headers()
-        .get(CONTENT_TYPE)
-        .map(http_util::media_type)
-        .transpose()
-        .map_err(|_| {
-            CurrentPrincipalError::protocol(
-                "the Content-Type header is not valid text",
-                credential_rejected,
-            )
-        })?;
-    let body = match http_util::read_bounded_body(response).await {
-        Ok(body) => body,
-        Err(BoundedBodyError::TooLarge) => {
+    let (status, content_type, body) = match http_util::decode_response_parts(response).await {
+        Ok(parts) => parts,
+        Err(BufferedResponseError::InvalidContentType { status }) => {
             return Err(CurrentPrincipalError::protocol(
-                "the response body exceeds 1 MiB",
-                credential_rejected,
+                "the Content-Type header is not valid text",
+                status == StatusCode::UNAUTHORIZED,
             ));
         }
-        Err(BoundedBodyError::Transport(error)) => {
+        Err(BufferedResponseError::TooLarge { status }) => {
+            return Err(CurrentPrincipalError::protocol(
+                "the response body exceeds 1 MiB",
+                status == StatusCode::UNAUTHORIZED,
+            ));
+        }
+        Err(BufferedResponseError::Transport { source, .. }) => {
             return Ok(CurrentPrincipalOutcome::Unreachable(
-                classify_reqwest_error(&error),
+                classify_reqwest_error(&source),
             ));
         }
     };
@@ -231,14 +223,14 @@ async fn decode_response(
             decode_authenticated(&body)
         }
         StatusCode::UNAUTHORIZED => {
-            require_media_type(content_type.as_deref(), PROBLEM_MEDIA_TYPE, true)?;
-            let problem = decode_problem(&body, StatusCode::UNAUTHORIZED, true)?;
+            let problem = problem::decode_parts(&body, status, content_type.as_deref())
+                .map_err(|reason| CurrentPrincipalError::protocol(reason, true))?;
             let _ = problem;
             Ok(CurrentPrincipalOutcome::Unauthenticated)
         }
         StatusCode::FORBIDDEN => {
-            require_media_type(content_type.as_deref(), PROBLEM_MEDIA_TYPE, false)?;
-            let problem = decode_problem(&body, StatusCode::FORBIDDEN, false)?;
+            let problem = problem::decode_parts(&body, status, content_type.as_deref())
+                .map_err(|reason| CurrentPrincipalError::protocol(reason, false))?;
             if problem.r#type != PRINCIPAL_NOT_PROVISIONED {
                 return Err(CurrentPrincipalError::protocol(
                     "a 403 response is not the principal-not-provisioned problem",
@@ -271,14 +263,8 @@ fn require_media_type(
     expected: &'static str,
     credential_rejected: bool,
 ) -> Result<(), CurrentPrincipalError> {
-    if actual == Some(expected) {
-        Ok(())
-    } else {
-        Err(CurrentPrincipalError::protocol(
-            "the response Content-Type is not valid for its HTTP status",
-            credential_rejected,
-        ))
-    }
+    http_util::require_media_type(actual, expected)
+        .map_err(|reason| CurrentPrincipalError::protocol(reason, credential_rejected))
 }
 
 fn decode_authenticated(body: &[u8]) -> Result<CurrentPrincipalOutcome, CurrentPrincipalError> {
@@ -297,15 +283,6 @@ fn decode_authenticated(body: &[u8]) -> Result<CurrentPrincipalOutcome, CurrentP
             actions: response.actions,
         },
     ))
-}
-
-fn decode_problem(
-    body: &[u8],
-    expected_status: StatusCode,
-    credential_rejected: bool,
-) -> Result<super::generated::models::Problem, CurrentPrincipalError> {
-    problem::decode(body, expected_status)
-        .map_err(|reason| CurrentPrincipalError::protocol(reason, credential_rejected))
 }
 
 pub fn classify_reqwest_error(error: &reqwest::Error) -> UnreachableCategory {

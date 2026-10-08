@@ -99,7 +99,6 @@ pub struct LifecycleApiError {
 
 // Lifecycle errors retain operation-specific vocabulary and response validation rather than
 // coupling deletion authorization to the broader organization API error taxonomy.
-// jscpd:ignore-start
 impl LifecycleApiError {
     pub fn credential_rejected(&self) -> bool {
         self.credential_rejected
@@ -125,7 +124,6 @@ impl LifecycleApiError {
         }
     }
 }
-// jscpd:ignore-end
 
 #[derive(Debug)]
 enum LifecycleApiErrorKind {
@@ -397,7 +395,6 @@ fn execute_request(
     let mut last_failure = UnreachableCategory::Connection;
     // Lifecycle retry distinguishes a received terminal failure from an ambiguous success-body
     // interruption, so sharing the simpler identity retry loop would weaken mutation semantics.
-    // jscpd:ignore-start
     for attempt in 0..MUTATION_ATTEMPTS {
         match client.run(REQUEST_TIMEOUT, send_request(client, spec)) {
             Ok(Ok(response)) => return Ok(RequestExecution::Response(response)),
@@ -412,7 +409,6 @@ fn execute_request(
             um_support::sleep(um_support::short_retry_delay());
         }
     }
-    // jscpd:ignore-end
     Ok(RequestExecution::Unreachable(last_failure))
 }
 

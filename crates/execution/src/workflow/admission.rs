@@ -485,7 +485,6 @@ impl std::fmt::Debug for ResolvedFile {
 
 impl ResolvedFile {
     // A singular File deliberately remains a distinct value type from attachment members.
-    // jscpd:ignore-start
     pub fn new(media_type: Arc<str>, bytes: Arc<[u8]>) -> Self {
         Self { media_type, bytes }
     }
@@ -497,7 +496,6 @@ impl ResolvedFile {
     pub fn bytes(&self) -> &[u8] {
         &self.bytes
     }
-    // jscpd:ignore-end
 }
 
 #[derive(Clone, Eq, PartialEq)]

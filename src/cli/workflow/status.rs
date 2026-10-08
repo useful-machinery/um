@@ -24,7 +24,6 @@ const STYLE_BLOCKED: &str = "38;2;250;179;135";
 
 // Status composes run identity and presentation options without execution inputs. A terminal
 // publication-pending snapshot may first reconcile an already committed immutable result.
-// jscpd:ignore-start
 #[derive(Debug, Args)]
 pub(super) struct Command {
     #[command(flatten)]
@@ -33,7 +32,6 @@ pub(super) struct Command {
     #[command(flatten)]
     presentation: super::PresentationOptions,
 }
-// jscpd:ignore-end
 
 impl Command {
     pub(super) fn execute(self) -> super::super::CommandResult {

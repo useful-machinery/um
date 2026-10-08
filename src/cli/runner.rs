@@ -100,7 +100,6 @@ impl CloudOptions {
 // Registration creation and standalone activation issuance intentionally keep
 // distinct Clap types because their positional resources and required options
 // are different operator contracts.
-// jscpd:ignore-start
 #[derive(Debug, Args)]
 struct CreateCommand {
     #[arg(value_name = OrganizationArg::VALUE_NAME, help = OrganizationArg::HELP)]
@@ -122,7 +121,6 @@ struct CreateCommand {
     #[command(flatten)]
     options: CloudOptions,
 }
-// jscpd:ignore-end
 
 #[derive(Debug, Args)]
 struct ListCommand {

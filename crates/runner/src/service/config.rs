@@ -219,7 +219,6 @@ impl Config {
 
     // Runner service configuration snapshots and workflow admission intentionally retain
     // parallel typed builders; sharing their containers would merge separate lifecycle layers.
-    // jscpd:ignore-start
     pub fn claude_code_installation(&self) -> Option<&ValidatedClaudeCodeInstallation> {
         self.claude_code_installation.as_ref()
     }
@@ -240,7 +239,6 @@ impl Config {
         self.codex_installation = Some(installation);
         self
     }
-    // jscpd:ignore-end
 
     #[cfg(feature = "test-fixtures")]
     pub fn fixture_for_command_tests(

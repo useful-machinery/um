@@ -241,7 +241,6 @@ pub struct ServicePrincipalApiError {
 
 // Service-principal failures retain their own operation vocabulary and secret-safe
 // protocol diagnostics rather than sharing organization error construction.
-// jscpd:ignore-start
 impl ServicePrincipalApiError {
     pub fn credential_rejected(&self) -> bool {
         self.credential_rejected
@@ -263,7 +262,6 @@ impl ServicePrincipalApiError {
         }
     }
 }
-// jscpd:ignore-end
 
 #[derive(Debug)]
 enum ServicePrincipalApiErrorKind {
@@ -351,7 +349,6 @@ impl Error for ServicePrincipalApiError {
 
 // This request plan owns secret-bearing service responses and retry counts, so it stays
 // distinct from the organization transport plan despite their common HTTP fields.
-// jscpd:ignore-start
 struct RequestSpec {
     operation: Operation,
     method: Method,
@@ -362,7 +359,6 @@ struct RequestSpec {
     body: Option<Vec<u8>>,
     attempts: usize,
 }
-// jscpd:ignore-end
 
 enum RequestExecution {
     Response(BufferedResponse),
@@ -520,7 +516,6 @@ fn execute_credential_mutation<T>(
 
 // Service credential requests keep operation-specific secret and credential-rejection
 // diagnostics; sharing another domain's request builder would erase that distinction.
-// jscpd:ignore-start
 fn request_spec(
     client: &HttpClient,
     api_url: &str,
@@ -559,7 +554,6 @@ fn request_spec(
         attempts: input.attempts,
     })
 }
-// jscpd:ignore-end
 
 fn execute_request(
     client: &HttpClient,
@@ -582,7 +576,6 @@ fn execute_request(
 
 // The service transport deliberately mirrors the repository's strict HTTP boundary while
 // retaining service-specific retries and redacted protocol errors.
-// jscpd:ignore-start
 async fn send_and_receive(
     client: &HttpClient,
     spec: &RequestSpec,
@@ -615,7 +608,6 @@ async fn send_and_receive(
     })?;
     receive_response(spec.operation, response).await
 }
-// jscpd:ignore-end
 
 async fn receive_response(
     operation: Operation,

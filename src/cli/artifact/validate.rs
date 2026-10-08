@@ -1,13 +1,11 @@
 // Artifact validation and workflow status have separate structured output contracts despite
 // sharing the standard I/O and cancellation primitives imported here.
-// jscpd:ignore-start
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, anyhow};
 use clap::Args;
 use serde::Serialize;
-// jscpd:ignore-end
 
 use crate::exit_code::{ExitCode, OutcomeClass};
 use um_execution::{
@@ -32,13 +30,11 @@ pub(super) struct Command {
 
 impl Command {
     // This leaf owns artifact-specific arguments while the shared helper owns signal behavior.
-    // jscpd:ignore-start
     pub(super) fn execute(self) -> super::super::CommandResult {
         super::super::execute_read_only_with_signals("artifact validation", move |control| {
             self.execute_blocking(control)
         })
     }
-    // jscpd:ignore-end
 
     fn execute_blocking(
         &self,

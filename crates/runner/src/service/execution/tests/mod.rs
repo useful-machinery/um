@@ -1,6 +1,5 @@
 // Runner execution and artifact delivery intentionally own separate broker fixtures;
 // their matching imports keep each test module independently readable.
-// jscpd:ignore-start
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
@@ -8,7 +7,6 @@ use super::*;
 use crate::service::lease_clock::{LeaseTimerRelease, controlled_lease_clock};
 use crate::service::test_support::{controlled_sleeper, sleep_request, with_watchdog};
 use um_runner_protocol::{MAXIMUM_ORDINARY_FRAME_BYTES, RunnerEnvelope, RunnerFrame};
-// jscpd:ignore-end
 
 #[test]
 fn git_capture_diagnostic_is_sibling_only_for_the_matching_failed_node() {

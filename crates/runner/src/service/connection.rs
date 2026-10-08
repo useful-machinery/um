@@ -1229,7 +1229,6 @@ where
     // entering assignment transport before protected-state promotion. This
     // bounded pre-welcome parser therefore repeats only the common base-frame
     // handling rather than reusing the effect-capable established loop.
-    // jscpd:ignore-start
     loop {
         let message = tokio::select! {
             biased;
@@ -1357,7 +1356,6 @@ where
             }
         }
     }
-    // jscpd:ignore-end
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1880,7 +1878,6 @@ impl<'a> ConnectionDependencies<'a> {
 
 // Deterministic transcript fixtures retain a plain mutable counter while
 // production shares one sequence allocator across candidate connections.
-// jscpd:ignore-start
 #[cfg(test)]
 pub(super) async fn run_established<R, W>(
     dependencies: ConnectionDependencies<'_>,
@@ -1898,7 +1895,6 @@ where
     *next_sequence = sequence.peek();
     result
 }
-// jscpd:ignore-end
 
 pub(super) async fn run_established_shared<R, W>(
     dependencies: ConnectionDependencies<'_>,
@@ -2577,7 +2573,6 @@ fn handle_artifact_cloud_response(
 
 // Effect receipts and semantic observations have different telemetry and state effects;
 // explicit sender boundaries are clearer than one mode-switched transport operation.
-// jscpd:ignore-start
 #[expect(
     clippy::too_many_arguments,
     reason = "effect receipt binds transport, telemetry, and service-scope assignment state"
@@ -2599,7 +2594,6 @@ async fn send_effect_receipt<W>(
 where
     W: Sink<Message, Error = WebSocketError> + Unpin,
 {
-    // jscpd:ignore-end
     let (effect_id, pending_manager_effect, event) = effect.into_parts();
 
     let emission = next_sequence.lock_emission().await;
@@ -2665,7 +2659,6 @@ fn next_envelope(
 }
 
 // This boundary intentionally remains separate from effect-receipt delivery above.
-// jscpd:ignore-start
 #[expect(
     clippy::too_many_arguments,
     reason = "semantic observation delivery owns the complete transport envelope"
@@ -2687,7 +2680,6 @@ async fn send_assignment_observation<W>(
 where
     W: Sink<Message, Error = WebSocketError> + Unpin,
 {
-    // jscpd:ignore-end
     let kind = match pending.artifact_request() {
         Some((delivery_id, request_kind)) => PendingObservationKind::ArtifactObservation {
             id: pending.id,
@@ -3368,7 +3360,6 @@ mod tests {
 
         // This gate models ready-state pressure only; keeping its inert flush and close beside
         // that model is clearer than coupling it to the separate multi-point writer fixture.
-        // jscpd:ignore-start
         fn poll_flush(
             self: Pin<&mut Self>,
             _context: &mut Context<'_>,
@@ -3382,7 +3373,6 @@ mod tests {
         ) -> Poll<Result<(), Self::Error>> {
             Poll::Ready(Ok(()))
         }
-        // jscpd:ignore-end
     }
 
     struct BackpressuredCandidateSocket {

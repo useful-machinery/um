@@ -949,7 +949,6 @@ struct BlockedArtifactFilesystem {
 impl ArtifactFilesystem for BlockedArtifactFilesystem {
     // The test adapter must use the same filesystem signature while selectively
     // rejecting an operation; keeping it separate makes the injected failure explicit.
-    // jscpd:ignore-start
     fn link(
         &self,
         source: &OwnedFd,
@@ -963,7 +962,6 @@ impl ArtifactFilesystem for BlockedArtifactFilesystem {
             Err(Errno::PERM)
         }
     }
-    // jscpd:ignore-end
 
     fn unlink(&self, directory: &OwnedFd, name: &str) -> Result<(), Errno> {
         if self.unlink {
@@ -1589,7 +1587,6 @@ impl ArtifactStaging {
 
     // Each concrete staging owner keeps a typed release API while delegating the
     // shared preserve-on-drop transition to StagingDropPolicy.
-    // jscpd:ignore-start
     pub fn release(&self) -> Result<(), ArtifactReleaseFailure> {
         self.inner.cleanup()
     }
@@ -1601,7 +1598,6 @@ impl ArtifactStaging {
     pub fn preserve_on_drop(&self) {
         self.inner.drop_policy.preserve_on_drop();
     }
-    // jscpd:ignore-end
 
     #[cfg(test)]
     pub(crate) fn staged_artifact_count(&self) -> usize {
@@ -1891,7 +1887,6 @@ impl ArtifactStaging {
 
     // Hard-link and streaming capture intentionally have parallel typed entry points while
     // differing in identity acquisition, rollback, and byte transfer.
-    // jscpd:ignore-start
     fn stage_linked_carrier(
         &self,
         output_identity: Arc<str>,
@@ -1901,7 +1896,6 @@ impl ArtifactStaging {
         bounds: CaptureBounds,
         cancellation: &CaptureCancellation,
     ) -> Result<StagedCarrier, CaptureAttemptFailure> {
-        // jscpd:ignore-end
         let unavailable = || {
             CaptureAttemptFailure::Capture(CaptureFailure::new(
                 Arc::clone(&output_identity),
@@ -2324,7 +2318,6 @@ impl ArtifactStagingInner {
 
     // Artifact leases have identity-guard and budget transitions that do not
     // belong in the input-view cleanup implementations.
-    // jscpd:ignore-start
     fn remove_artifact(&self, artifact_identity: &str) -> bool {
         if self.drop_policy.is_preserved() {
             return true;
@@ -2344,7 +2337,6 @@ impl ArtifactStagingInner {
         }
         removed
     }
-    // jscpd:ignore-end
 
     fn remove_artifact_while_active(&self, artifact_identity: &str) -> bool {
         let Ok(filesystem) = self.filesystem.read() else {

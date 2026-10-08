@@ -64,7 +64,6 @@ pub enum ObservedStepTransition {
     OutputsCommitted {
         outputs: Vec<String>,
     },
-    // jscpd:ignore-start -- Observations carry transition payloads, while runtime states own settled state.
     Failed {
         detail: FailureDetail,
     },
@@ -83,7 +82,6 @@ pub enum ObservedStepTransition {
     Cancelled {
         detail: CancellationDetail,
     },
-    // jscpd:ignore-end
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

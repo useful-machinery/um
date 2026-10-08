@@ -953,7 +953,6 @@ async fn run_connection_loop_with_work_root(
                     {
                         // Both connected and backoff reload entry points install the
                         // same prepared transport through the shared state transition.
-                        // jscpd:ignore-start
                         install_promoted_attempt(
                             promoted,
                             &mut config,
@@ -963,7 +962,6 @@ async fn run_connection_loop_with_work_root(
                             &mut attempt,
                             &mut promoted_attempt,
                         );
-                        // jscpd:ignore-end
                         continue;
                     }
                 }
@@ -2318,7 +2316,6 @@ mod tests {
     // These integration proofs intentionally exercise different interleavings
     // against the same closed handshake; keeping each scenario explicit makes
     // its ordering contract auditable.
-    // jscpd:ignore-start
     #[tokio::test]
     async fn pending_handshake_preserves_contiguous_current_boot_sequences() {
         let (listener, endpoint) = fixture_listener().await;
@@ -2608,7 +2605,6 @@ mod tests {
         fs::remove_file(hard_link).unwrap();
     }
 
-    // jscpd:ignore-end
     #[tokio::test]
     async fn reload_authentication_failure_preserves_pending_state() {
         let (listener, endpoint) = fixture_listener().await;

@@ -1604,7 +1604,6 @@ pub(super) mod test_support {
         }
 
         // This preparation fixture never exercises the separately tested runtime broker.
-        // jscpd:ignore-start
         fn issue_workflow_git(
             &self,
             _assignment_id: &str,
@@ -1620,7 +1619,6 @@ pub(super) mod test_support {
         ) -> Result<WorkflowGitRevocation, CredentialBrokerFailure> {
             Err(CredentialBrokerFailure::Unavailable)
         }
-        // jscpd:ignore-end
     }
 
     pub(in crate::service) fn fixture_source_broker(
@@ -1660,7 +1658,6 @@ pub(super) mod test_support {
         }
 
         // This transport gate models source unavailability; runtime Git is deliberately inert.
-        // jscpd:ignore-start
         fn commit_availability(
             &self,
             _assignment_id: &str,
@@ -1684,7 +1681,6 @@ pub(super) mod test_support {
         ) -> Result<WorkflowGitRevocation, CredentialBrokerFailure> {
             Err(CredentialBrokerFailure::Unavailable)
         }
-        // jscpd:ignore-end
     }
 
     pub(in crate::service) fn gated_unavailable_source_broker() -> (
@@ -1789,7 +1785,6 @@ mod tests {
         }
 
         // Materialization call accounting is isolated from runtime-authority fixtures.
-        // jscpd:ignore-start
         fn issue_workflow_git(
             &self,
             _assignment_id: &str,
@@ -1805,7 +1800,6 @@ mod tests {
         ) -> Result<WorkflowGitRevocation, CredentialBrokerFailure> {
             Err(CredentialBrokerFailure::Unavailable)
         }
-        // jscpd:ignore-end
     }
 
     struct RepositoryFixture {

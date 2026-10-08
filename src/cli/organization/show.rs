@@ -15,7 +15,6 @@ pub(super) struct Command {
     organization_ref: OrganizationArg,
 
     // Clap input ownership remains operation-local; shared execution policy lives in LeafOptions.
-    // jscpd:ignore-start
     #[command(flatten)]
     options: LeafOptions,
 }
@@ -26,7 +25,6 @@ impl Command {
             organization_ref,
             options,
         } = self;
-        // jscpd:ignore-end
         options.execute(
             deployment,
             |client, api_url, access_token| {

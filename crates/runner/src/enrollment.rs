@@ -1260,7 +1260,6 @@ fn validate_private_file(metadata: &Metadata) -> Result<(), EnrollmentError> {
 
 // Enrollment state and human OAuth storage intentionally translate the same
 // no-follow private-file primitive into different domain error contracts.
-// jscpd:ignore-start
 fn create_new_private_file(path: &Path) -> io::Result<File> {
     let file = OpenOptions::new()
         .read(true)
@@ -1272,7 +1271,6 @@ fn create_new_private_file(path: &Path) -> io::Result<File> {
     file.set_permissions(Permissions::from_mode(FILE_MODE))?;
     Ok(file)
 }
-// jscpd:ignore-end
 
 fn open_or_create_private_file(path: &Path) -> Result<File, EnrollmentError> {
     match create_new_private_file(path) {

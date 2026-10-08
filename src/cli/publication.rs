@@ -496,7 +496,6 @@ impl ShowCommand {
             move |control| self.execute_waiting_blocking(&deployment, control),
             // Run and Publication retain separate typed API/session and timeout renderers; only
             // their polling state machine is shared.
-            // jscpd:ignore-start
             move || write_wait_timeout(&timeout_context).map_err(Into::into),
         )
     }
@@ -514,7 +513,6 @@ impl ShowCommand {
         };
         let transport_policy = self.options.http.transport_policy();
         let result = wait_for_terminal_publication(
-            // jscpd:ignore-end
             || {
                 observe_publication(
                     deployment,
@@ -563,7 +561,6 @@ impl ListCommand {
             )?;
             super::complete_read_only_output(control, || {
                 // List and show retain separate result envelopes despite sharing run coordinates.
-                // jscpd:ignore-start
                 write_list(
                     &ReadOutputContext {
                         deployment: deployment.fingerprint().api_url(),
@@ -576,7 +573,6 @@ impl ListCommand {
                     },
                     result,
                 )
-                // jscpd:ignore-end
                 .map_err(Into::into)
             })
         })
@@ -1155,7 +1151,6 @@ fn write_failure(
 
 // Read failures intentionally omit creation-only retry coordinates. Keeping this projection
 // separate prevents a show or list error from implying that a mutation may have committed.
-// jscpd:ignore-start
 fn write_read_failure(
     context: &ReadOutputContext<'_>,
     failure: &PublicationFailure,
@@ -1242,7 +1237,6 @@ fn write_read_failure(
     }
     Ok(class.exit_code())
 }
-// jscpd:ignore-end
 
 fn with_recovery_key(human: String, idempotency_key: &str) -> String {
     if let Some((diagnostic, remedy)) = human.split_once("\n\n") {
@@ -1304,7 +1298,6 @@ struct PublicationResult<'a> {
 
 // Publication failures keep their run/export/key recovery coordinates explicit; sharing the
 // shorter artifact failure envelope would make retry ambiguity invisible.
-// jscpd:ignore-start
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct FailureResult<'a> {
@@ -1318,7 +1311,6 @@ struct FailureResult<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     category: Option<&'a str>,
 }
-// jscpd:ignore-end
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]

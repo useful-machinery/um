@@ -111,7 +111,6 @@ pub struct IdentityApiError {
 
 // Identity and organization API errors retain separate operation vocabularies and
 // protocol reasons even though both expose the shared credential-rejection signal.
-// jscpd:ignore-start
 impl IdentityApiError {
     pub fn credential_rejected(&self) -> bool {
         self.credential_rejected
@@ -133,7 +132,6 @@ impl IdentityApiError {
         }
     }
 }
-// jscpd:ignore-end
 
 #[derive(Debug)]
 enum IdentityApiErrorKind {
@@ -805,7 +803,6 @@ fn require_problem(
 
 // Each API domain maps the shared media-type validator into its own typed operation error.
 // Keeping that one-line adapter local preserves useful identity operation context.
-// jscpd:ignore-start
 fn require_media_type(
     operation: Operation,
     response: &ReceivedResponse,
@@ -815,4 +812,3 @@ fn require_media_type(
     http_util::require_media_type(response.content_type.as_deref(), expected)
         .map_err(|reason| IdentityApiError::protocol(operation, reason, credential_rejected))
 }
-// jscpd:ignore-end

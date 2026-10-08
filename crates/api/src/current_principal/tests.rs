@@ -127,8 +127,11 @@ fn signup_actions_are_preserved_as_opaque_values_or_omitted() {
     ]);
     for expected_actions in [Some(actions), None] {
         let body = problem(403, PRINCIPAL_NOT_PROVISIONED, expected_actions.clone());
-        let server =
-            TestServer::respond(response("403 Forbidden", Some(PROBLEM_MEDIA_TYPE), &body));
+        let server = TestServer::respond(response(
+            "403 Forbidden",
+            Some(problem::PROBLEM_MEDIA_TYPE),
+            &body,
+        ));
 
         let outcome = get_current_principal(&http_client(), &server.api_url, None).unwrap();
 
@@ -148,7 +151,7 @@ fn recognized_http_failures_map_to_closed_status_categories() {
     for (status, content_type, body, expected) in [
         (
             "401 Unauthorized",
-            Some(PROBLEM_MEDIA_TYPE),
+            Some(problem::PROBLEM_MEDIA_TYPE),
             problem(
                 401,
                 "https://api.usefulmachinery.com/problems/unauthorized",
@@ -189,12 +192,12 @@ fn malformed_or_unexpected_responses_are_protocol_failures() {
         ("200 OK", Some(JSON_MEDIA_TYPE), b"not-json".as_slice()),
         (
             "403 Forbidden",
-            Some(PROBLEM_MEDIA_TYPE),
+            Some(problem::PROBLEM_MEDIA_TYPE),
             br#"{"type":"https://example.invalid/different","title":"No","status":403}"#.as_slice(),
         ),
         (
             "404 Not Found",
-            Some(PROBLEM_MEDIA_TYPE),
+            Some(problem::PROBLEM_MEDIA_TYPE),
             br#"{"type":"about:blank","title":"Missing","status":404}"#.as_slice(),
         ),
     ];
@@ -212,7 +215,11 @@ fn malformed_or_unexpected_responses_are_protocol_failures() {
 #[test]
 fn malformed_unauthorized_response_still_marks_the_credential_rejected() {
     let body = br#"{"secret":"unique-response-secret"}"#;
-    let server = TestServer::respond(response("401 Unauthorized", Some(PROBLEM_MEDIA_TYPE), body));
+    let server = TestServer::respond(response(
+        "401 Unauthorized",
+        Some(problem::PROBLEM_MEDIA_TYPE),
+        body,
+    ));
 
     let error = get_current_principal(&http_client(), &server.api_url, Some("synthetic-token"))
         .unwrap_err();

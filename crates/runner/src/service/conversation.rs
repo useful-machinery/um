@@ -33,7 +33,6 @@ const REPLAY_OVERRIDE: &str = "UM_RUNNER_CONVERSATION_FIXTURE";
 struct UnavailableSourceBroker;
 
 // Conversation replay intentionally models one broker with every source operation unavailable.
-// jscpd:ignore-start
 impl SourceCredentialBroker for UnavailableSourceBroker {
     fn issue(
         &self,
@@ -67,7 +66,6 @@ impl SourceCredentialBroker for UnavailableSourceBroker {
         Err(CredentialBrokerFailure::Unavailable)
     }
 }
-// jscpd:ignore-end
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]

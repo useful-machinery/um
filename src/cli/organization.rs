@@ -87,7 +87,6 @@ impl LeafOptions {
 
     // Organization mutations add request identity before delegating to the same domain-specific
     // renderer; keeping that boundary explicit is clearer than callback-shaping the read path.
-    // jscpd:ignore-start
     fn execute_mutation<O>(
         self,
         deployment: &Deployment,
@@ -112,7 +111,6 @@ impl LeafOptions {
             write,
         )
     }
-    // jscpd:ignore-end
 }
 
 impl Command {

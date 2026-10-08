@@ -120,7 +120,6 @@ impl Command {
         let workflow_for_context = workflow.clone();
         let context_cancellation = cancellation.clone();
         // Discovery is shared with retry, while rejection here must settle abandonment.
-        // jscpd:ignore-start
         let (context, installation_failures) = match tokio::task::spawn_blocking(move || {
             super::run::continuation_execution_context(
                 &workflow_for_context,
@@ -141,7 +140,6 @@ impl Command {
                 .await;
             }
         };
-        // jscpd:ignore-end
         let context = if workflow.requires_git_capture() {
             context.with_local_git_baseline(baseline)
         } else {

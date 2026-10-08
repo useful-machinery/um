@@ -1138,7 +1138,6 @@ pub(super) mod test_support {
         }
     }
 
-    // jscpd:ignore-start -- Test offers and production result metadata use distinct protocol projections.
     pub(in crate::service) fn align_fixture_capacity(
         execution_spec: &mut ExecutionSpecV1RunnerProjection,
         workflow: &ResolvedWorkflow,
@@ -1172,7 +1171,6 @@ pub(super) mod test_support {
         };
     }
 }
-// jscpd:ignore-end
 
 fn validate_carried_capacity(
     execution_spec: &ExecutionSpecV1RunnerProjection,

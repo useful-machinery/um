@@ -81,7 +81,6 @@ type CloudInputOptions = super::CommonArgs<super::RunJson, super::PrincipalAuthe
 
 // This leaf keeps its API identities explicit; sharing Clap fields with runner-pool
 // creation would couple unrelated command contracts and their help text.
-// jscpd:ignore-start
 #[derive(Debug, Args)]
 struct CreateCommand {
     #[arg(value_name = OrganizationArg::VALUE_NAME, help = OrganizationArg::HELP)]
@@ -89,7 +88,6 @@ struct CreateCommand {
 
     #[arg(long, value_name = ProjectArg::VALUE_NAME, help = ProjectArg::HELP)]
     project_id: ProjectArg,
-    // jscpd:ignore-end
     #[arg(
         long,
         value_name = "WORKFLOW",
@@ -629,7 +627,6 @@ impl CreateCommand {
             .with_run_key(&run_idempotency_key);
         // Run dispatch owns cancellation recovery and a run-specific request envelope; it stays
         // explicit rather than sharing project creation's superficially similar API call.
-        // jscpd:ignore-start
         let result = with_api(
             deployment,
             self.options.http.transport_policy(),
@@ -651,7 +648,6 @@ impl CreateCommand {
                 )
             },
         );
-        // jscpd:ignore-end
         let result = match result {
             Ok(result) => result,
             Err(_) => {

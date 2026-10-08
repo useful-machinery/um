@@ -1313,7 +1313,6 @@ mod tests {
 
     impl SourceCredentialBroker for FixtureBroker {
         // Runtime-authority tests deliberately make preparation operations unavailable.
-        // jscpd:ignore-start
         fn issue(
             &self,
             _assignment_id: &str,
@@ -1330,7 +1329,6 @@ mod tests {
             Err(CredentialBrokerFailure::Unavailable)
         }
 
-        // jscpd:ignore-end
         fn issue_workflow_git(
             &self,
             _assignment_id: &str,

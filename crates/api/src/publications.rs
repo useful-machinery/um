@@ -8,15 +8,11 @@ use time::format_description::well_known::Rfc3339;
 
 // Resource adapters keep their generated model and problem vocabularies local so Publication
 // validation does not depend on the Run adapter's private contract surface.
-// jscpd:ignore-start
 use super::generated::{apis, models};
 use super::http_client::generated_configuration;
 use super::http_util::{self, BoundedBodyError, BufferedBlockingResponse};
-use super::problem::{
-    self, BAD_REQUEST, FORBIDDEN, JSON_MEDIA_TYPE, NOT_FOUND, PROBLEM_MEDIA_TYPE, UNAUTHORIZED,
-};
+use super::problem::{self, BAD_REQUEST, FORBIDDEN, JSON_MEDIA_TYPE, NOT_FOUND, UNAUTHORIZED};
 use super::{HttpTransportPolicy, UnreachableCategory, classify_reqwest_error};
-// jscpd:ignore-end
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 const CREATE_ATTEMPTS: usize = 2;
@@ -463,10 +459,11 @@ fn validated_problem_failure(
     failure: PublicationFailure,
     credential_rejected: bool,
 ) -> PublicationFailure {
-    if require_media_type(response, PROBLEM_MEDIA_TYPE, credential_rejected).is_err() {
-        return PublicationFailure::protocol(credential_rejected);
-    }
-    let decoded = match problem::decode(&response.body, response.status) {
+    let decoded = match problem::decode_header_parts(
+        &response.body,
+        response.status,
+        response.content_type.as_ref(),
+    ) {
         Ok(decoded) => decoded,
         Err(_) => return PublicationFailure::protocol(credential_rejected),
     };
@@ -505,17 +502,8 @@ fn require_media_type(
     expected: &str,
     credential_rejected: bool,
 ) -> Result<(), PublicationFailure> {
-    let actual = response
-        .content_type
-        .as_ref()
-        .map(http_util::media_type)
-        .transpose()
-        .map_err(|_| PublicationFailure::protocol(credential_rejected))?;
-    if actual.as_deref() == Some(expected) {
-        Ok(())
-    } else {
-        Err(PublicationFailure::protocol(credential_rejected))
-    }
+    http_util::require_header_media_type(response.content_type.as_ref(), expected)
+        .map_err(|_| PublicationFailure::protocol(credential_rejected))
 }
 
 fn decode_closed_publication(body: &[u8]) -> Result<Publication, PublicationFailure> {

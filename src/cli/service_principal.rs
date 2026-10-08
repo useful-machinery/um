@@ -185,14 +185,12 @@ impl super::HumanCredentialOutcome for CreateAttemptOutcome {
 impl CreateCommand {
     // Unlike run creation, this wrapper protects commitment through one-time secret delivery.
     // Keep the command-specific signal policy visible rather than sharing a dispatch adapter.
-    // jscpd:ignore-start
     fn execute(self, deployment: Deployment) -> super::CommandResult {
         validate_secret_output(&self.api_key_file, self.options.json)?;
         super::execute_bounded_mutation_with_signals("service-principal creation", move |control| {
             self.execute_blocking(&deployment, control)
         })
     }
-    // jscpd:ignore-end
 
     fn execute_blocking(
         self,
@@ -495,7 +493,6 @@ struct RevokeResult<'a> {
 
 // Service secret failures can carry non-secret principal and credential metadata, so this
 // envelope remains separate from the generic API failure envelope.
-// jscpd:ignore-start
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct FailureResult<'a> {
@@ -517,7 +514,6 @@ struct FailureResult<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     recovery: Option<&'static str>,
 }
-// jscpd:ignore-end
 
 fn write_create_outcome(
     deployment: &str,

@@ -6,12 +6,10 @@ pub struct CodexConfig {
 }
 
 // Codex keeps native effort as a string and must not inherit Claude's closed effort enum.
-// jscpd:ignore-start
 pub(crate) fn resolve_config(value: &Value) -> Option<CodexConfig> {
     let config = serde_json::from_value::<CodexConfig>(value.clone()).ok()?;
     (!config.model.is_empty() && !config.effort.is_empty()).then_some(config)
 }
-// jscpd:ignore-end
 
 #[cfg(test)]
 mod config_tests {
@@ -20,7 +18,6 @@ mod config_tests {
     #[test]
     fn future_configuration_is_exact_and_uses_native_nonempty_effort() {
         // Keep native strings visible rather than coupling this contract to Claude's enum tests.
-        // jscpd:ignore-start
         for effort in ["low", "xhigh", "future-native-effort", " "] {
             assert_eq!(
                 resolve_config(&serde_json::json!({
@@ -33,7 +30,6 @@ mod config_tests {
                 })
             );
         }
-        // jscpd:ignore-end
 
         for invalid in [
             serde_json::json!({"effort": "high"}),
@@ -802,7 +798,6 @@ impl CodexAppServerV1Parser {
         }
         // Codex keeps native terminal/exit precedence and no-response semantics local;
         // sharing this final match would couple independent harness protocol authority.
-        // jscpd:ignore-start
         if !exit_success {
             return failed(AgentFailureCause::HarnessFailed {
                 detail: AgentHarnessFailureDetail::UnsuccessfulExit,
@@ -823,7 +818,6 @@ impl CodexAppServerV1Parser {
                 |result| AgentOutcome::Completed(CompletedAgentInvocation::Result(result)),
             ),
         }
-        // jscpd:ignore-end
     }
 
     fn parse_frame(&mut self, frame: &[u8]) -> Result<ParserProgress, AgentFailureCause> {
@@ -2670,7 +2664,6 @@ impl CodexAppServerV1Parser {
 
     // Codex owns additive-event retention and provisional-value invalidation locally so
     // another harness cannot silently change this profile's protocol authority.
-    // jscpd:ignore-start
     fn observe_unrecognized(&mut self, value: &Value) {
         self.observations
             .push(AgentObservation::UnrecognizedHarnessEvent {
@@ -2693,7 +2686,6 @@ impl CodexAppServerV1Parser {
         self.failure = Some(failure.clone());
         Err(failure)
     }
-    // jscpd:ignore-end
 }
 
 #[derive(Clone, Copy)]
@@ -2812,7 +2804,6 @@ fn framed_json(value: &Value) -> Result<Vec<u8>, AgentFailureCause> {
 
 // App Server's admitted field shapes remain in its private parser rather than coupling
 // native schema evolution to the Pi or Claude transport parsers.
-// jscpd:ignore-start
 fn required_object<'a>(
     object: &'a Map<String, Value>,
     key: &str,
@@ -2862,11 +2853,9 @@ fn required_bool(object: &Map<String, Value>, key: &str) -> Option<bool> {
 fn required_u64(object: &Map<String, Value>, key: &str) -> Option<u64> {
     object.get(key)?.as_u64()
 }
-// jscpd:ignore-end
 
 // These small constructors preserve Codex-specific terminal and observation authority
 // without introducing a shared native-parser result layer.
-// jscpd:ignore-start
 fn lifecycle(milestone: AgentLifecycleMilestone) -> AgentObservation {
     AgentObservation::Lifecycle { milestone }
 }
@@ -2874,7 +2863,6 @@ fn lifecycle(milestone: AgentLifecycleMilestone) -> AgentObservation {
 fn failed(cause: AgentFailureCause) -> AgentOutcome {
     AgentOutcome::Failed(cause.into())
 }
-// jscpd:ignore-end
 
 #[cfg(test)]
 mod tests;

@@ -112,7 +112,6 @@ type CancellationOptions = super::CommonArgs<super::StreamingJson, super::NoAuth
 
 // Account deletion keeps its own nested command path and credential cleanup while organization
 // deletion retains target-bound authorization, so the two family dispatchers stay explicit.
-// jscpd:ignore-start
 impl AccountCommand {
     pub(super) fn execute(self) -> super::CommandResult {
         super::execute_deployment_command(
@@ -130,7 +129,6 @@ impl AccountCommand {
         )
     }
 }
-// jscpd:ignore-end
 
 impl OrganizationCommand {
     pub(super) fn execute(self) -> super::CommandResult {
@@ -499,7 +497,6 @@ fn execute_cancellation(
 
 // Cancellation and identity linking deliberately retain distinct terminal event and diagnostic
 // contracts even though both consume the shared browser-proof state machine.
-// jscpd:ignore-start
 fn handle_device_flow_error(
     output: &mut CancellationOutput<'_>,
     deployment: &Deployment,
@@ -522,10 +519,8 @@ fn handle_device_flow_error(
         DeviceFlowError::ActivationOutput(error) => Err(error.into()),
     }
 }
-// jscpd:ignore-end
 
 // Browser-proof authorization failures are projected into deletion-specific outcomes and remedies.
-// jscpd:ignore-start
 fn handle_authorization_error(
     output: &mut CancellationOutput<'_>,
     deployment: &Deployment,
@@ -549,7 +544,6 @@ fn handle_authorization_error(
         }
     }
 }
-// jscpd:ignore-end
 
 fn handle_protocol_error(
     output: &mut CancellationOutput<'_>,
@@ -575,7 +569,6 @@ fn handle_protocol_error(
 }
 
 // Phase names are shared machine vocabulary, while deletion owns separate operation context.
-// jscpd:ignore-start
 const fn phase_name(phase: DeviceFlowPhase) -> &'static str {
     match phase {
         DeviceFlowPhase::DeviceAuthorization => "device_authorization",
@@ -593,7 +586,6 @@ fn cancellation_flow_context(deployment: &Deployment, phase: DeviceFlowPhase) ->
         deployment.fingerprint().issuer()
     )
 }
-// jscpd:ignore-end
 
 #[derive(Clone, Copy)]
 enum LocalCredentialDisposition {
@@ -826,7 +818,6 @@ impl<'a> CancellationOutput<'a> {
         expires_at: OffsetDateTime,
     ) -> anyhow::Result<()> {
         // Keep deletion-cancellation presentation and its error context next to this command.
-        // jscpd:ignore-start
         if self.json {
             let event = um_human_auth::activation_event(
                 deployment,
@@ -836,7 +827,6 @@ impl<'a> CancellationOutput<'a> {
             )
             .context("format deletion cancellation activation expiration")?;
             write_json_line(&event)
-        // jscpd:ignore-end
         } else {
             let mut stdout = io::stdout().lock();
             writeln!(stdout, "Cancel {} deletion\n", self.target.noun())?;
@@ -874,7 +864,6 @@ impl<'a> CancellationOutput<'a> {
     }
 
     // Browser failures remain deletion result events rather than adopting identity-link fields.
-    // jscpd:ignore-start
     fn browser_failure(
         &mut self,
         deployment: &str,
@@ -897,7 +886,6 @@ impl<'a> CancellationOutput<'a> {
         )
         .map_err(Into::into)
     }
-    // jscpd:ignore-end
 
     fn api_outcome(
         &mut self,

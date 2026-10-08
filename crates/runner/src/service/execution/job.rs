@@ -65,7 +65,6 @@ impl ExecutionJob {
         )));
     }
 
-    // jscpd:ignore-start -- The job exposes guard injection to its assignment callers;
     // the guard store separately owns the injected containment observation.
     #[cfg(test)]
     pub(in crate::service) fn use_quiescence_fixture(
@@ -76,7 +75,6 @@ impl ExecutionJob {
             .process_guards
             .use_quiescence_fixture(quiescent);
     }
-    // jscpd:ignore-end
 
     pub(in crate::service) fn spawn(self) {
         let assignment_id = self.accepted.assignment_id().to_owned();

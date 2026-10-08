@@ -83,14 +83,12 @@ pub(crate) async fn buffer_api_response<E>(
         })
 }
 
-pub(crate) async fn buffer_response(
+pub(crate) async fn decode_response_parts(
     response: Response,
-) -> Result<BufferedResponse, BufferedResponseError> {
+) -> Result<(StatusCode, Option<String>, Zeroizing<Vec<u8>>), BufferedResponseError> {
     let status = response.status();
-    let content_type = response.headers().get(CONTENT_TYPE).cloned();
-    let idempotency_key = response.headers().get("Idempotency-Key").cloned();
-    let location = response.headers().get(LOCATION).cloned();
-    let retry_after = response.headers().get("Retry-After").cloned();
+    let content_type = parse_content_type(response.headers().get(CONTENT_TYPE))
+        .map_err(|_| BufferedResponseError::InvalidContentType { status })?;
     let body = read_bounded_body(response)
         .await
         .map_err(|error| match error {
@@ -99,11 +97,16 @@ pub(crate) async fn buffer_response(
                 BufferedResponseError::Transport { status, source }
             }
         })?;
-    let content_type = content_type
-        .as_ref()
-        .map(media_type)
-        .transpose()
-        .map_err(|_| BufferedResponseError::InvalidContentType { status })?;
+    Ok((status, content_type, body))
+}
+
+pub(crate) async fn buffer_response(
+    response: Response,
+) -> Result<BufferedResponse, BufferedResponseError> {
+    let idempotency_key = response.headers().get("Idempotency-Key").cloned();
+    let location = response.headers().get(LOCATION).cloned();
+    let retry_after = response.headers().get("Retry-After").cloned();
+    let (status, content_type, body) = decode_response_parts(response).await?;
     Ok(BufferedResponse {
         status,
         content_type,
@@ -291,6 +294,21 @@ pub(crate) fn require_nonempty(value: &str, reason: &'static str) -> Result<(), 
 
 pub(crate) fn header_matches(header: Option<&HeaderValue>, expected: &str) -> bool {
     header.and_then(|value| value.to_str().ok()) == Some(expected)
+}
+
+pub(crate) fn parse_content_type(
+    header: Option<&HeaderValue>,
+) -> Result<Option<String>, InvalidHeaderText> {
+    header.map(media_type).transpose()
+}
+
+pub(crate) fn require_header_media_type(
+    header: Option<&HeaderValue>,
+    expected: &str,
+) -> Result<(), &'static str> {
+    let actual =
+        parse_content_type(header).map_err(|_| "the Content-Type header is not valid text")?;
+    require_media_type(actual.as_deref(), expected)
 }
 
 pub(crate) fn require_media_type(actual: Option<&str>, expected: &str) -> Result<(), &'static str> {

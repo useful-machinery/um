@@ -1062,7 +1062,6 @@ impl PiJsonV1Parser {
     ) -> Result<(), AgentFailureCause> {
         // Pi and Claude progress envelopes are independent native contracts; sharing their
         // similarly shaped field extraction would couple profiles that evolve separately.
-        // jscpd:ignore-start
         let call_id = required_nonempty_string(object, "toolCallId")
             .ok_or_else(|| self.protocol_failure())?;
         let name =
@@ -1076,7 +1075,6 @@ impl PiJsonV1Parser {
             name,
             AgentToolCallPhase::Updated,
         ));
-        // jscpd:ignore-end
         Ok(())
     }
 

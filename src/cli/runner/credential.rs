@@ -39,7 +39,6 @@ enum CredentialCommand {
 // Credential commands keep their own Clap metadata so help and positional
 // resource contracts remain explicit instead of coupling lifecycle commands to
 // activation or registration administration.
-// jscpd:ignore-start
 #[derive(Debug, Args)]
 struct ListCommand {
     #[arg(value_name = OrganizationArg::VALUE_NAME, help = OrganizationArg::HELP)]
@@ -65,11 +64,9 @@ struct MutationCommand {
     #[command(flatten)]
     options: CloudOptions,
 }
-// jscpd:ignore-end
 
 // This namespace deliberately mirrors sibling runner namespaces while retaining
 // its credential-specific command path and deployment-loading boundary.
-// jscpd:ignore-start
 impl Command {
     pub(super) fn execute(self) -> super::super::CommandResult {
         let Some(command) = self.command else {
@@ -78,7 +75,6 @@ impl Command {
         super::execute_cloud(command, |command, deployment| command.execute(deployment))
     }
 }
-// jscpd:ignore-end
 
 impl CredentialCommand {
     fn execute(self, deployment: &Deployment) -> anyhow::Result<ExitCode> {
@@ -94,7 +90,6 @@ impl ListCommand {
     fn execute(self, deployment: &Deployment) -> anyhow::Result<ExitCode> {
         // Credential and pool listings resolve different resource hierarchies and retain
         // separate output schemas despite sharing pagination fields.
-        // jscpd:ignore-start
         let result = cloud::with_api(
             deployment,
             self.options.http.transport_policy(),
@@ -109,7 +104,6 @@ impl ListCommand {
                 )
             },
         )?;
-        // jscpd:ignore-end
         match result {
             Ok(page) => {
                 if self.options.json {

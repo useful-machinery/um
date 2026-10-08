@@ -341,7 +341,6 @@ pub(super) fn write_member_removal(
 
 // Leaving omits a membership ID while owner removal requires one; explicit wrappers keep each
 // machine outcome and human heading attached to the command that owns it.
-// jscpd:ignore-start
 pub(super) fn write_leave(
     deployment: &str,
     organization: &str,
@@ -362,7 +361,6 @@ pub(super) fn write_leave(
         outcome,
     )
 }
-// jscpd:ignore-end
 
 fn write_audit_records_human(
     deployment: &str,
@@ -982,7 +980,6 @@ fn write_current_membership_failure(
 
 // Organization mutation failures retain their established stdout human-report contract;
 // the shared service/project failure renderer writes human diagnostics to stderr.
-// jscpd:ignore-start
 fn write_failure(
     deployment: &str,
     outcome: &'static str,
@@ -1006,7 +1003,6 @@ fn write_failure(
     }
     Ok(outcome_class.exit_code())
 }
-// jscpd:ignore-end
 
 fn write_cloud_failure_json(
     deployment: &str,

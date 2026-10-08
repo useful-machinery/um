@@ -547,7 +547,6 @@ fn hex_nibble(byte: u8) -> Option<u8> {
     }
 }
 
-// jscpd:ignore-start
 #[derive(Clone, Copy, Debug)]
 struct RunnerExecutionInstant {
     monotonic: Instant,
@@ -564,7 +563,6 @@ impl Add<Duration> for RunnerExecutionInstant {
         }
     }
 }
-// jscpd:ignore-end
 
 #[derive(Clone, Copy)]
 struct RunnerExecutionClock;

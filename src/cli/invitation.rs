@@ -67,7 +67,6 @@ type InvitationOptions =
 
 // Invitation leaves keep operation-local execution and error context rather than exposing
 // organization-profile terminology through a shared operation abstraction.
-// jscpd:ignore-start
 
 impl InvitationOptions {
     fn execute<O>(
@@ -126,7 +125,6 @@ impl InvitationOptions {
         )
     }
 }
-// jscpd:ignore-end
 
 #[derive(Debug, Args)]
 struct InboxCommand {
@@ -208,7 +206,6 @@ struct IssueCommand {
 
 // This page belongs to owner-visible invitation history; keeping its arguments local prevents
 // runner-list semantics from becoming a shared abstraction merely because both are paginated.
-// jscpd:ignore-start
 #[derive(Debug, Args)]
 struct OrganizationListCommand {
     #[arg(value_name = OrganizationArg::VALUE_NAME, help = OrganizationArg::HELP)]
@@ -220,7 +217,6 @@ struct OrganizationListCommand {
     #[command(flatten)]
     options: InvitationOptions,
 }
-// jscpd:ignore-end
 
 #[derive(Debug, Args)]
 struct RevokeCommand {
@@ -325,7 +321,6 @@ impl AccessCommand {
 
     // Read access and mutation access intentionally keep different capability and request-
     // identity signatures even though their final renderer forwarding is parallel.
-    // jscpd:ignore-start
     fn execute<O>(
         self,
         deployment: &Deployment,
@@ -364,12 +359,10 @@ impl AccessCommand {
                 },
             )
         })
-        // jscpd:ignore-end
     }
 
     // The mutation variant stays separate because its operation receives the generated
     // idempotency key; merging it with reads would make that security boundary optional.
-    // jscpd:ignore-start
     fn execute_mutation<O>(
         self,
         deployment: &Deployment,
@@ -410,7 +403,6 @@ impl AccessCommand {
                 },
             )
         })
-        // jscpd:ignore-end
     }
 
     fn with_access(

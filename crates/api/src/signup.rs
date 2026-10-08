@@ -3,16 +3,14 @@ use std::time::Duration;
 
 // Signup keeps its transport imports explicit because its retrying mutation has
 // different request and failure semantics from read-only principal lookup.
-// jscpd:ignore-start
-use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderValue};
+use reqwest::header::{ACCEPT, AUTHORIZATION, HeaderValue};
 use reqwest::{Response, StatusCode, Url};
 
 use super::bearer_authorization;
 use super::http_client::{HttpClient, HttpEndpointError};
-use super::http_util::{self, BoundedBodyError};
+use super::http_util::{self, BufferedResponseError};
 use super::human_principal::{self, HumanPrincipal};
 use super::problem;
-// jscpd:ignore-end
 use super::{UnreachableCategory, classify_reqwest_error};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
@@ -191,35 +189,26 @@ async fn execute_signup_request(
 }
 
 async fn decode_response(response: Response) -> Result<SignupOutcome, AttemptError> {
-    let status = response.status();
-    let credential_rejected = status == StatusCode::UNAUTHORIZED;
-    // Signup must distinguish retryable transport failures from protocol
-    // failures, unlike status lookup, so this small response adapter stays local.
-    // jscpd:ignore-start
-    let content_type = response
-        .headers()
-        .get(CONTENT_TYPE)
-        .map(http_util::media_type)
-        .transpose()
-        .map_err(|_| {
-            AttemptError::Protocol(SignupError::protocol(
-                "the Content-Type header is not valid text",
-                credential_rejected,
-            ))
-        })?;
-    let body = match http_util::read_bounded_body(response).await {
-        Ok(body) => body,
-        Err(BoundedBodyError::TooLarge) => {
-            return Err(AttemptError::Protocol(SignupError::protocol(
-                "the response body exceeds 1 MiB",
-                credential_rejected,
-            )));
-        }
-        Err(BoundedBodyError::Transport(error)) => {
-            return Err(AttemptError::Transport(classify_reqwest_error(&error)));
-        }
-    };
-    // jscpd:ignore-end
+    let (status, content_type, body) =
+        http_util::decode_response_parts(response)
+            .await
+            .map_err(|error| match error {
+                BufferedResponseError::InvalidContentType { status } => {
+                    AttemptError::Protocol(SignupError::protocol(
+                        "the Content-Type header is not valid text",
+                        status == StatusCode::UNAUTHORIZED,
+                    ))
+                }
+                BufferedResponseError::TooLarge { status } => {
+                    AttemptError::Protocol(SignupError::protocol(
+                        "the response body exceeds 1 MiB",
+                        status == StatusCode::UNAUTHORIZED,
+                    ))
+                }
+                BufferedResponseError::Transport { source, .. } => {
+                    AttemptError::Transport(classify_reqwest_error(&source))
+                }
+            })?;
 
     match status {
         StatusCode::CREATED => {

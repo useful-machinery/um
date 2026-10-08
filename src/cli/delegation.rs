@@ -1,5 +1,4 @@
 // Command modules keep domain imports local; an import facade would obscure API ownership.
-// jscpd:ignore-start
 use std::io::{self, Write};
 
 use anyhow::{Context, anyhow};
@@ -15,7 +14,6 @@ use um_api::{
     propose_delegation,
 };
 use um_human_auth::Deployment;
-// jscpd:ignore-end
 
 pub(super) const ABOUT: &str = "Manage Useful Machinery delegations";
 const NAME: &str = "delegation";
@@ -46,7 +44,6 @@ type DelegationOptions =
 
 // Participant-selected reads and mutations share one credential decision, while mutations add a
 // non-optional request identity. Keeping both paths here makes that distinction explicit.
-// jscpd:ignore-start
 impl DelegationOptions {
     fn execute<O>(
         self,
@@ -102,7 +99,6 @@ impl DelegationOptions {
         )
     }
 }
-// jscpd:ignore-end
 
 type DelegationOutputOptions =
     super::CommonArgs<super::DelegationJson, super::NoAuthenticationArgs>;
@@ -173,7 +169,6 @@ struct EndCommand {
 
 // Delegation dispatch remains local so the actor restriction on each leaf is visible beside the
 // command spelling instead of hidden in a generic family dispatcher.
-// jscpd:ignore-start
 impl Command {
     pub(super) fn execute(self) -> super::CommandResult {
         super::execute_deployment_command(
@@ -194,7 +189,6 @@ impl Command {
         )
     }
 }
-// jscpd:ignore-end
 
 impl ListCommand {
     fn execute(self, deployment: &Deployment) -> anyhow::Result<ExitCode> {
@@ -258,7 +252,6 @@ impl ShowCommand {
 
 // Acceptance deliberately bypasses the human-session adapter and requires one explicit service
 // key, so its direct client path must remain separate from human and participant-selected leaves.
-// jscpd:ignore-start
 impl AcceptCommand {
     fn execute(self, deployment: &Deployment) -> anyhow::Result<ExitCode> {
         let api_key = self.options.authentication.api_key()?;
@@ -284,11 +277,9 @@ impl AcceptCommand {
         .context("write delegation acceptance result")
     }
 }
-// jscpd:ignore-end
 
 // Ending retains participant-selected authentication and a terminal confirmation, so it remains
 // separate from create-style human-only mutations with superficially similar closure plumbing.
-// jscpd:ignore-start
 impl EndCommand {
     fn execute(self, deployment: &Deployment) -> anyhow::Result<ExitCode> {
         let delegation_id = self.target.delegation_id;
@@ -303,7 +294,6 @@ impl EndCommand {
         )
     }
 }
-// jscpd:ignore-end
 
 fn parse_principal_id(value: &str) -> Result<String, String> {
     if um_support::valid_typed_id(value, "prn_") {
@@ -485,7 +475,6 @@ fn write_end(
 
 // Delegation remedies distinguish exact participants and nominated services; retaining this
 // mapping beside delegation output is clearer than sharing invitation or membership prose.
-// jscpd:ignore-start
 fn write_common(
     deployment: &str,
     failure: &CommonDelegationFailure,
@@ -529,11 +518,9 @@ fn write_common(
     };
     write_failure(deployment, outcome, category, None, &message, class, json)
 }
-// jscpd:ignore-end
 
 // Delegation terminal, hidden-resource, and replay failures have domain-specific stable outcomes
 // and remedies, so they remain separate from invitation lifecycle failures.
-// jscpd:ignore-start
 fn write_not_found(deployment: &str, json: bool) -> anyhow::Result<ExitCode> {
     write_failure(
         deployment,
@@ -587,7 +574,6 @@ fn write_failure(
     }
     Ok(class.exit_code())
 }
-// jscpd:ignore-end
 
 fn write_page(deployment: &str, page: &DelegationPage, json: bool) -> anyhow::Result<()> {
     if json {

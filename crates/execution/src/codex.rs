@@ -198,7 +198,6 @@ impl CodexInstallationIdentity {
     }
 
     // Codex failures retain this identity without coupling their contract to Pi or Claude.
-    // jscpd:ignore-start
     pub fn executable(&self) -> &Path {
         &self.executable
     }
@@ -210,7 +209,6 @@ impl CodexInstallationIdentity {
     pub const fn profile(&self) -> AgentCompatibilityProfile {
         self.profile
     }
-    // jscpd:ignore-end
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -306,7 +304,6 @@ impl HarnessInstallationProfile for CodexInstallationProfile {
     const CAPABILITY_PROBE_ARGUMENTS: &'static [&'static str] = &CAPABILITY_PROBE_ARGUMENTS;
 
     // Codex owns its isolated native-state directories independently of Pi's trust policy.
-    // jscpd:ignore-start
     fn probe_isolation(search_path: &OsStr) -> Result<ProbeIsolation, Self::Failure> {
         let mut isolation = ProbeIsolation::create(
             "scherzo-codex-validation-",
@@ -317,10 +314,8 @@ impl HarnessInstallationProfile for CodexInstallationProfile {
         isolation.add_directory_environment("CODEX_HOME", "codex-home");
         Ok(isolation)
     }
-    // jscpd:ignore-end
 
     // Keep release-line failure mappings profile-local so Codex review cannot alter Pi admission.
-    // jscpd:ignore-start
     fn parse_version_output(output: &CommandOutput) -> Result<Self::Version, Self::Failure> {
         parse_version_output(output)
     }
@@ -335,7 +330,6 @@ impl HarnessInstallationProfile for CodexInstallationProfile {
             identity: None,
         }
     }
-    // jscpd:ignore-end
 
     fn validate_capability_output(
         output: &CommandOutput,
@@ -371,7 +365,6 @@ impl HarnessInstallationProfile for CodexInstallationProfile {
     }
 
     // Construction and executable failures remain explicit parts of the closed Codex profile.
-    // jscpd:ignore-start
     fn installation(
         parts: ValidatedInstallationParts<
             Self::Version,
@@ -398,7 +391,6 @@ impl HarnessInstallationProfile for CodexInstallationProfile {
     fn unexecutable_failure() -> Self::Failure {
         CodexInstallationFailure::Unexecutable { identity: None }
     }
-    // jscpd:ignore-end
 }
 
 pub fn discover_and_validate_codex_installation()

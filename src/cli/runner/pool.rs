@@ -46,7 +46,6 @@ struct CreateCommand {
 
 // Pool and registration commands intentionally keep distinct Clap types so their
 // nouns, value names, and help remain exact without a metadata abstraction.
-// jscpd:ignore-start
 #[derive(Debug, Args)]
 struct ListCommand {
     #[arg(value_name = OrganizationArg::VALUE_NAME, help = OrganizationArg::HELP)]
@@ -85,7 +84,6 @@ struct RenameCommand {
     #[command(flatten)]
     options: CloudOptions,
 }
-// jscpd:ignore-end
 
 #[derive(Debug, Args)]
 struct DeleteCommand {
@@ -128,14 +126,12 @@ impl CreateCommand {
             |api| api.create_pool(&self.organization, &key, &self.name),
         )?;
         // Pool creation uses the shared runner failure contract but retains its own result body.
-        // jscpd:ignore-start
         cloud::write_pool_create(
             deployment.fingerprint().api_url(),
             &result,
             self.options.authentication.kind(),
             self.options.json,
         )
-        // jscpd:ignore-end
     }
 }
 

@@ -997,7 +997,6 @@ mod tests {
         };
         // This compact pure-renderer fixture intentionally owns different terminal facts
         // from the richer archived-TUI interaction fixture.
-        // jscpd:ignore-start
         LocalArchivedAttempt {
             run_directory: PathBuf::from("/tmp/archive-run"),
             current_attempt_number: 1,
@@ -1026,7 +1025,6 @@ mod tests {
                 steps: BTreeMap::from([("prepare".to_owned(), definition)]),
                 node_roles: BTreeMap::from([("prepare".to_owned(), WorkflowNodeRole::Step)]),
             },
-            // jscpd:ignore-end
             execution: ArchivedExecution {
                 execution_root: PathBuf::from("/tmp/execution"),
                 maximum_parallel_steps: 2,

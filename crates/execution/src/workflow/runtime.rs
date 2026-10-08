@@ -136,7 +136,6 @@ pub struct RecoveryRoundNumber(u8);
 
 // Recovery rounds and target executions deliberately remain distinct typed ordinals even while
 // V1 keeps their values equal; sharing one type would erase the versioned ABI invariant.
-// jscpd:ignore-start
 impl RecoveryRoundNumber {
     pub const fn get(self) -> u8 {
         self.0
@@ -151,7 +150,6 @@ impl RecoveryRoundNumber {
         self.0.checked_add(1).map(Self)
     }
 }
-// jscpd:ignore-end
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RecoveryHandlerKind {
@@ -1010,7 +1008,6 @@ pub(crate) enum Occurrence<Provisional, Cause, Output, Deadline> {
 
 // Runtime and terminal outcomes intentionally remain distinct: the former exists only while
 // crossing the phase boundary, while the latter is the adapter-facing finish contract.
-// jscpd:ignore-start
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RunOutcome {
     Succeeded,
@@ -1022,7 +1019,6 @@ pub enum RunOutcome {
         reason: CancellationReason,
     },
 }
-// jscpd:ignore-end
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum ActionInput<Output> {
@@ -1614,7 +1610,6 @@ fn stale_operation<Cause, Output, Deadline>(
 
 // Ordinary and finalization cancellation deliberately retain separate gates and events;
 // their matching dispatch shapes make the phase boundary explicit rather than generic.
-// jscpd:ignore-start
 fn apply_cancellation<Provisional, Cause, Output, Deadline>(
     reduction: &mut Reduction<Provisional, Cause, Output, Deadline>,
     cancellation: CancellationRequest<Deadline>,
@@ -1750,7 +1745,6 @@ where
     true
 }
 
-// jscpd:ignore-end
 fn apply_force_abort<Provisional, Cause, Output, Deadline>(
     reduction: &mut Reduction<Provisional, Cause, Output, Deadline>,
     operation: CancellationOperationId,
@@ -2479,7 +2473,6 @@ fn clear_active_invocation<Cause, Output, Deadline>(
 
 // Primary issue selection is phase-specific even though both transitions carry the same
 // surrounding workflow fields; keeping them separate makes ordinary precedence explicit.
-// jscpd:ignore-start
 fn close_ordinary_gate_for_failure<Provisional, Cause, Output, Deadline>(
     reduction: &mut Reduction<Provisional, Cause, Output, Deadline>,
     primary_issue: PrimaryIssue,
@@ -2541,7 +2534,6 @@ fn select_finalizer_primary_issue<Provisional, Cause, Output, Deadline>(
     });
 }
 
-// jscpd:ignore-end
 fn stabilize<Provisional, Cause, Output, Deadline>(
     reduction: &mut Reduction<Provisional, Cause, Output, Deadline>,
 ) where
@@ -2950,7 +2942,6 @@ fn next_ordinary_pending_disposition<Cause, Output, Deadline>(
     })
 }
 
-// jscpd:ignore-start -- Condition and body blockers intentionally remain separate two-stage evidence paths.
 fn condition_blockers<Cause, Output, Deadline>(
     state: &RuntimeState<Cause, Output, Deadline>,
     definition: &RuntimeStep,
@@ -2999,7 +2990,6 @@ fn condition_blockers<Cause, Output, Deadline>(
     blockers.dedup();
     blockers
 }
-// jscpd:ignore-end
 
 fn ordinary_unsatisfied_prerequisites<Cause, Output, Deadline>(
     state: &RuntimeState<Cause, Output, Deadline>,
@@ -3485,7 +3475,6 @@ fn enter_finalization_or_finish<Provisional, Cause, Output, Deadline>(
 
 // Finalization entry and ordinary outcome composition both enumerate the closed ordinary
 // outcomes, but they own different state changes and should not share a partial mapper.
-// jscpd:ignore-start
 fn ordinary_outcome<Cause, Output, Deadline>(
     state: &RuntimeState<Cause, Output, Deadline>,
 ) -> Option<OrdinaryOutcome>
@@ -3526,7 +3515,6 @@ where
     })
 }
 
-// jscpd:ignore-end
 fn ordinary_issues<Cause, Output, Deadline>(
     state: &RuntimeState<Cause, Output, Deadline>,
 ) -> Vec<OrdinaryIssue> {
@@ -3552,7 +3540,6 @@ fn ordinary_issues<Cause, Output, Deadline>(
 
 // Finalization and ordinary completion retain distinct quiescence predicates; the similar
 // guards are clearer than an abstraction parameterized by role and phase.
-// jscpd:ignore-start
 fn finish_finalization_if_terminal<Provisional, Cause, Output, Deadline>(
     reduction: &mut Reduction<Provisional, Cause, Output, Deadline>,
 ) where
@@ -3579,7 +3566,6 @@ fn finish_finalization_if_terminal<Provisional, Cause, Output, Deadline>(
     finish_run(reduction, outcome, Some(summary));
 }
 
-// jscpd:ignore-end
 fn finalization_summary<Cause, Output, Deadline>(
     state: &RuntimeState<Cause, Output, Deadline>,
     finalization: &FinalizationRuntime<Deadline>,

@@ -60,7 +60,6 @@ enum InputSetCommand {
 
 // Input-set creation and runner-pool creation share only generic CLI shape; their
 // project/input and pool-name operations remain clearer as separate command types.
-// jscpd:ignore-start
 #[derive(Debug, Args)]
 struct CreateCommand {
     #[arg(value_name = OrganizationArg::VALUE_NAME, help = OrganizationArg::HELP)]
@@ -75,7 +74,6 @@ struct CreateCommand {
     #[command(flatten)]
     options: super::CloudInputOptions,
 }
-// jscpd:ignore-end
 
 #[derive(Clone, Debug, Args)]
 struct InputSetReference {
@@ -155,7 +153,6 @@ struct SealCommand {
 
 // Keep this leaf's reference and confirmation wording explicit: Run Input Set deletion
 // and retained-content deletion are distinct destructive contracts in CLI help.
-// jscpd:ignore-start
 #[derive(Debug, Args)]
 struct DeleteCommand {
     #[command(flatten)]
@@ -167,7 +164,6 @@ struct DeleteCommand {
     #[command(flatten)]
     options: super::CloudInputOptions,
 }
-// jscpd:ignore-end
 
 impl Command {
     pub(super) fn execute(self) -> super::super::CommandResult {
@@ -254,7 +250,6 @@ impl CreateCommand {
                 let input_set_id = control.recovery();
                 // Creation reports an allocated input-set coordinate rather than the retained-run
                 // coordinate used by input deletion; each recovery envelope stays explicit.
-                // jscpd:ignore-start
                 super::finish_operation(control, || {
                     write_result(
                         deployment.fingerprint().api_url(),
@@ -266,7 +261,6 @@ impl CreateCommand {
                         self.options.json,
                     )
                 })
-                // jscpd:ignore-end
             },
             move |signal, snapshot| {
                 super::super::report_dispatched_signal(
@@ -532,7 +526,6 @@ impl SealCommand {
                 let result = seal(&deployment, &self, control)?;
                 // Sealing and deletion have distinct success bodies and recovery semantics even
                 // though both complete through the shared mutation control.
-                // jscpd:ignore-start
                 super::finish_operation(control, || {
                     write_result(
                         deployment.fingerprint().api_url(),
@@ -544,7 +537,6 @@ impl SealCommand {
                         self.options.json,
                     )
                 })
-                // jscpd:ignore-end
             },
             move |signal, snapshot| {
                 report_input_set_mutation_unknown(
@@ -597,7 +589,6 @@ impl DeleteCommand {
             move |control| {
                 // Input Set deletion and retained-input deletion deliberately keep separate
                 // recovery subjects and output envelopes.
-                // jscpd:ignore-start
                 let result = super::with_api(
                     &deployment,
                     self.options.http.transport_policy(),
@@ -611,7 +602,6 @@ impl DeleteCommand {
                         )
                     },
                 )?;
-                // jscpd:ignore-end
                 super::finish_operation(control, || {
                     write_mutation_result(
                         deployment.fingerprint().api_url(),
@@ -740,7 +730,6 @@ fn write_upload_result(
 
 // Deletion has an empty success value and a mutation receipt; upload keeps member counts and a
 // verification-required outcome, so explicit closures make the two result contracts reviewable.
-// jscpd:ignore-start
 fn write_mutation_result(
     deployment: &str,
     organization: &str,
@@ -776,7 +765,6 @@ fn write_mutation_result(
         },
     )
 }
-// jscpd:ignore-end
 
 fn write_input_set_outcome<T>(
     deployment: &str,

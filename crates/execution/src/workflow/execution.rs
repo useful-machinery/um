@@ -203,14 +203,12 @@ pub async fn execute_workflow<Clock, Commits, Observer, Dispatcher>(
 ) -> Result<WorkflowExecutionResult<Clock::Instant>, CoordinationError>
 // This result projection intentionally repeats the shared runtime's generic port
 // constraints so it can preserve its distinct domain result.
-// jscpd:ignore-start
 where
     Clock: CoordinatorClock,
     Clock::Instant: Sync,
     Commits: WorkflowCommitPort<Clock>,
     Observer: ExecutionObserver<Clock::Instant>,
     Dispatcher: WorkflowAgentDispatcher<Clock::Instant, Observer>,
-    // jscpd:ignore-end
 {
     let provenance = admitted.workflow().source.clone();
     let content_digest = admitted.workflow().content_digest.clone();

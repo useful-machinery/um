@@ -19,7 +19,6 @@ pub(super) struct Command {
 
     // Self-leave keeps an operation-local Clap type because its terminal confirmation and
     // bodyless success projection differ from every read and targeted-member command.
-    // jscpd:ignore-start
     #[command(flatten)]
     options: LeafOptions,
 }
@@ -27,7 +26,6 @@ pub(super) struct Command {
 impl Command {
     pub(super) fn execute(self, deployment: &Deployment) -> anyhow::Result<ExitCode> {
         let organization_ref = self.organization_ref;
-        // jscpd:ignore-end
         self.options.execute_mutation(
             deployment,
             |client, api_url, access_token, idempotency_key| {

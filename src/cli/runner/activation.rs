@@ -45,7 +45,6 @@ struct ActivationRevocationOutput<'a> {
 
 // Pool and activation namespaces keep concrete subcommand enums so Clap owns
 // each exact operator vocabulary without a metadata-driven command abstraction.
-// jscpd:ignore-start
 #[derive(Debug, Args)]
 pub(super) struct Command {
     #[command(subcommand)]
@@ -64,7 +63,6 @@ enum ActivationCommand {
     #[command(about = "Revoke a runner activation")]
     Revoke(RevokeCommand),
 }
-// jscpd:ignore-end
 
 #[derive(Debug, Args)]
 struct IssueCommand {
@@ -104,7 +102,6 @@ struct RevokeCommand {
 
 // Nested command dispatch deliberately mirrors the pool namespace while
 // preserving activation-specific help and subcommand types.
-// jscpd:ignore-start
 impl Command {
     pub(super) fn execute(self) -> super::super::CommandResult {
         let Some(command) = self.command else {
@@ -113,7 +110,6 @@ impl Command {
         super::execute_cloud(command, |command, deployment| command.execute(deployment))
     }
 }
-// jscpd:ignore-end
 
 impl ActivationCommand {
     fn execute(self, deployment: &Deployment) -> anyhow::Result<ExitCode> {
@@ -131,7 +127,6 @@ impl IssueCommand {
         let key = generate_idempotency_key().context("generate activation request identity")?;
         // Activation creation has one-time secret delivery semantics that must remain separate
         // from activation revocation despite their shared runner lookup.
-        // jscpd:ignore-start
         let result = cloud::with_api(
             deployment,
             self.options.http.transport_policy(),
@@ -142,7 +137,6 @@ impl IssueCommand {
                 api.create_activation(&self.target.organization, &runner.id, &key)
             },
         )?;
-        // jscpd:ignore-end
         let issuance = match completed_cloud_result(
             deployment,
             result,
@@ -162,7 +156,6 @@ impl IssueCommand {
         } else if self.options.json {
             // Registration creation and standalone activation issuance expose
             // deliberately different non-secret JSON result documents.
-            // jscpd:ignore-start
             serde_json::to_writer_pretty(
                 &mut io::stdout().lock(),
                 &ActivationCreationOutput {
@@ -174,7 +167,6 @@ impl IssueCommand {
                 },
             )?;
             writeln!(io::stdout().lock())?;
-            // jscpd:ignore-end
         } else {
             write_activation_summary(
                 &mut io::stdout().lock(),
@@ -192,7 +184,6 @@ impl ListCommand {
     fn execute(self, deployment: &Deployment) -> anyhow::Result<ExitCode> {
         // Activation, pool, and credential listings retain distinct target resolution and
         // output schemas even though they share pagination mechanics.
-        // jscpd:ignore-start
         let result = cloud::with_api(
             deployment,
             self.options.http.transport_policy(),
@@ -243,7 +234,6 @@ impl ListCommand {
                 self.options.json,
             ),
         }
-        // jscpd:ignore-end
     }
 }
 

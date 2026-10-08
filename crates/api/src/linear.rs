@@ -563,15 +563,11 @@ fn receive_json_response(
 }
 
 fn validate_json_media_type(headers: &reqwest::header::HeaderMap) -> Result<(), LinearFailure> {
-    let media_type = headers
-        .get(reqwest::header::CONTENT_TYPE)
-        .map(http_util::media_type)
-        .transpose()
-        .map_err(|_| invalid())?;
-    if media_type.as_deref() != Some(problem::JSON_MEDIA_TYPE) {
-        return Err(invalid());
-    }
-    Ok(())
+    http_util::require_header_media_type(
+        headers.get(reqwest::header::CONTENT_TYPE),
+        problem::JSON_MEDIA_TYPE,
+    )
+    .map_err(|_| invalid())
 }
 
 fn receive_response(

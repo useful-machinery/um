@@ -284,7 +284,6 @@ pub(super) fn write_capability_error(
 
 // Invitation authorization remedies distinguish recipients from organization owners, so this
 // mapping stays beside invitation output instead of reusing membership-specific prose.
-// jscpd:ignore-start
 fn write_common(
     deployment: &str,
     failure: &CommonOrganizationFailure,
@@ -328,7 +327,6 @@ fn write_common(
     };
     write_failure(deployment, outcome, category, None, &message, class, json)
 }
-// jscpd:ignore-end
 
 fn write_unavailable(deployment: &str, json: bool) -> anyhow::Result<ExitCode> {
     write_failure(
@@ -495,7 +493,6 @@ fn write_membership_human(
 
 // Both invitation page projections intentionally share the root JSON list envelope while
 // retaining invitation-specific output context at this boundary.
-// jscpd:ignore-start
 fn write_invitation_page_json(
     deployment: &str,
     items: &[impl Serialize],
@@ -504,7 +501,6 @@ fn write_invitation_page_json(
     super::super::write_cloud_list_json(deployment, items, next_cursor)
         .context("write JSON invitation list result")
 }
-// jscpd:ignore-end
 
 const fn target_kind(kind: InvitationTargetKind) -> &'static str {
     match kind {

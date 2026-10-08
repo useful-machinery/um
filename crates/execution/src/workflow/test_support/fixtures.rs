@@ -60,7 +60,6 @@ pub(crate) struct PendingClock;
 
 // The pending clock deliberately never releases ordinary deadlines, unlike the
 // controlled clock's explicit watch gate; keep their trait implementations separate.
-// jscpd:ignore-start
 impl CoordinatorClock for PendingClock {
     type Instant = Duration;
 
@@ -74,7 +73,6 @@ impl CoordinatorClock for PendingClock {
         }
     }
 }
-// jscpd:ignore-end
 
 #[derive(Clone)]
 pub(crate) struct ControlledClock {
@@ -392,7 +390,6 @@ pub(crate) mod validation_fixtures {
 
     // Validation starts at a nonzero instant and exposes registration via the
     // worker test's control channel; the step clock tracks active waiters instead.
-    // jscpd:ignore-start
     impl CoordinatorClock for ControlledClock {
         type Instant = TestInstant;
 
@@ -409,7 +406,6 @@ pub(crate) mod validation_fixtures {
             }
         }
     }
-    // jscpd:ignore-end
 }
 
 pub(crate) mod pi_clock {

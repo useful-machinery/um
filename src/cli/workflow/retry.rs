@@ -14,7 +14,6 @@ pub(super) const AFTER_HELP: &str = "Retry eligibility:
   executes every workflow step as a new attempt.";
 
 // Run, retry, and status intentionally compose different subsets of shared workflow options.
-// jscpd:ignore-start
 #[derive(Debug, Args)]
 pub(super) struct Command {
     #[command(flatten)]
@@ -26,7 +25,6 @@ pub(super) struct Command {
     #[command(flatten)]
     presentation: super::PresentationOptions,
 }
-// jscpd:ignore-end
 
 impl Command {
     pub(super) fn execute(self) -> super::super::CommandResult {

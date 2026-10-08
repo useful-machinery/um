@@ -1,4 +1,5 @@
 use reqwest::StatusCode;
+use reqwest::header::HeaderValue;
 
 use super::generated::models;
 
@@ -44,13 +45,30 @@ pub(super) fn decode(
     Ok(problem)
 }
 
+pub(super) fn decode_parts(
+    body: &[u8],
+    status: StatusCode,
+    content_type: Option<&str>,
+) -> Result<models::Problem, &'static str> {
+    super::http_util::require_media_type(content_type, PROBLEM_MEDIA_TYPE)?;
+    decode(body, status)
+}
+
+pub(super) fn decode_header_parts(
+    body: &[u8],
+    status: StatusCode,
+    content_type: Option<&HeaderValue>,
+) -> Result<models::Problem, &'static str> {
+    super::http_util::require_header_media_type(content_type, PROBLEM_MEDIA_TYPE)?;
+    decode(body, status)
+}
+
 pub(super) fn decode_type_parts(
     body: &[u8],
     status: StatusCode,
     content_type: Option<&str>,
 ) -> Result<String, &'static str> {
-    super::http_util::require_media_type(content_type, PROBLEM_MEDIA_TYPE)?;
-    decode(body, status).map(|problem| problem.r#type)
+    decode_parts(body, status, content_type).map(|problem| problem.r#type)
 }
 
 pub(super) fn require_type_parts(

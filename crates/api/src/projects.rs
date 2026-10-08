@@ -12,7 +12,7 @@ use super::generated::apis;
 use super::generated::models;
 use super::http_client::generated_configuration;
 use super::http_util::{self, BoundedBodyError};
-use super::problem::{self, ACCEPTED_MEDIA_TYPES, JSON_MEDIA_TYPE, PROBLEM_MEDIA_TYPE};
+use super::problem::{self, ACCEPTED_MEDIA_TYPES, JSON_MEDIA_TYPE};
 use super::{HttpTransportPolicy, UnreachableCategory, classify_reqwest_error};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
@@ -661,17 +661,8 @@ fn require_media_type(
     expected: &str,
     credential_rejected: bool,
 ) -> Result<(), ProjectFailure> {
-    let actual = response
-        .content_type
-        .as_ref()
-        .map(http_util::media_type)
-        .transpose()
-        .map_err(|_| ProjectFailure::protocol(credential_rejected))?;
-    if actual.as_deref() == Some(expected) {
-        Ok(())
-    } else {
-        Err(ProjectFailure::protocol(credential_rejected))
-    }
+    http_util::require_header_media_type(response.content_type.as_ref(), expected)
+        .map_err(|_| ProjectFailure::protocol(credential_rejected))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -693,7 +684,6 @@ pub enum ProjectFailure {
 
 // Project failures carry a closed outcome set distinct from Cloud run failures even
 // though both expose the same credential-rejection predicate to human sessions.
-// jscpd:ignore-start
 impl ProjectFailure {
     pub fn credential_rejected(&self) -> bool {
         matches!(
@@ -711,7 +701,6 @@ impl ProjectFailure {
         }
     }
 }
-// jscpd:ignore-end
 
 fn classify_project_response(response: &ReceivedResponse, operation: Operation) -> ProjectFailure {
     let status = response.status;
@@ -719,10 +708,9 @@ fn classify_project_response(response: &ReceivedResponse, operation: Operation) 
         return ProjectFailure::Unreachable(UnreachableCategory::Server);
     }
     let credential_rejected = status == StatusCode::UNAUTHORIZED;
-    if require_media_type(response, PROBLEM_MEDIA_TYPE, credential_rejected).is_err() {
-        return ProjectFailure::protocol(credential_rejected);
-    }
-    let Ok(decoded) = problem::decode(&response.body, status) else {
+    let Ok(decoded) =
+        problem::decode_header_parts(&response.body, status, response.content_type.as_ref())
+    else {
         return ProjectFailure::protocol(credential_rejected);
     };
     if !operation.permits_failure(status, &decoded.r#type) {

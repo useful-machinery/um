@@ -549,7 +549,6 @@ impl ArtifactDeliveryBroker {
             }
             // Absence and retry are distinct Cloud facts even though both retain
             // the exact carrier identity for another bounded delivery attempt.
-            // jscpd:ignore-start
             (
                 DeliveryPhase::Confirming {
                     artifact_set_id: expected_set,
@@ -598,7 +597,6 @@ impl ArtifactDeliveryBroker {
                     &mut completion,
                 );
             }
-            // jscpd:ignore-end
             (
                 DeliveryPhase::Confirming {
                     artifact_set_id: expected_set,

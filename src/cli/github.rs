@@ -210,7 +210,6 @@ impl CompleteCommand {
     fn execute(self, deployment: &Deployment) -> anyhow::Result<ExitCode> {
         // GitHub setup keeps its multi-field completion request explicit rather than sharing
         // project repository mutation plumbing with a different failure and output contract.
-        // jscpd:ignore-start
         let result = with_api(
             deployment,
             self.options.http.transport_policy(),
@@ -223,7 +222,6 @@ impl CompleteCommand {
                 )
             },
         )?;
-        // jscpd:ignore-end
         output::write_installation(
             deployment.fingerprint().api_url(),
             &self.organization,

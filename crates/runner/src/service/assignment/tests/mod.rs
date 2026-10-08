@@ -295,7 +295,6 @@ impl SourceCredentialBroker for BlockingSourceBroker {
     }
 
     // Preparation-cancellation tests never grant execution-time source authority.
-    // jscpd:ignore-start
     fn issue_workflow_git(
         &self,
         _assignment_id: &str,
@@ -311,7 +310,6 @@ impl SourceCredentialBroker for BlockingSourceBroker {
     ) -> Result<WorkflowGitRevocation, CredentialBrokerFailure> {
         Err(CredentialBrokerFailure::Fenced)
     }
-    // jscpd:ignore-end
 }
 
 struct BlockingSourceFixture {
@@ -366,7 +364,6 @@ impl BlockingSourceFixture {
 
 // Manager tests need a bool-scripted remover coupled to their admission fixture;
 // the filesystem module keeps its richer partial-removal script local.
-// jscpd:ignore-start
 struct CleanupRemover {
     outcomes: Mutex<VecDeque<bool>>,
     calls: AtomicUsize,
@@ -391,7 +388,6 @@ impl TreeRemover for CleanupRemover {
         }
     }
 }
-// jscpd:ignore-end
 
 struct CleanupSleepRequest {
     duration: Duration,
@@ -436,7 +432,6 @@ fn run_command_fixture() {
 // already-running root test binary. Keep only the success and process-quiescence
 // scenarios needed to verify runner integration; the execution crate owns the full
 // Codex protocol fixture and conformance matrix.
-// jscpd:ignore-start
 fn write_codex_fixture_frame(output: &mut impl std::io::Write, value: Value) {
     serde_json::to_writer(&mut *output, &value).unwrap();
     output.write_all(b"\n").unwrap();
@@ -677,7 +672,6 @@ fn codex_process_fixture() {
     input.read_to_end(&mut trailing).unwrap();
     assert!(trailing.is_empty());
 }
-// jscpd:ignore-end
 
 // Keep commands alive until the test observes them. Bare `true` and `false`
 // commands can exit before the direct-child test path captures their process identity.
@@ -3742,7 +3736,6 @@ async fn execution_spec_accepts_the_shared_parallelism_limit_and_declines_the_ne
 }
 
 // These compact admission smoke tests intentionally share fixture setup.
-// jscpd:ignore-start
 #[tokio::test]
 async fn command_workflows_do_not_require_an_agent_runtime() {
     let workflow =
@@ -3752,8 +3745,6 @@ async fn command_workflows_do_not_require_an_agent_runtime() {
     offer_then_prepare(&mut manager, &offered).await;
     assert_eq!(active_step_count(&manager), Some(1));
 }
-
-// jscpd:ignore-end
 
 #[tokio::test]
 async fn managed_workflow_environment_excludes_runner_credentials_and_helpers() {
@@ -5620,7 +5611,6 @@ fn oversized_observation_is_rejected_before_queueing() {
     let outbox = ObservationOutbox::new();
     // This limit fixture deliberately keeps a complete schema-valid transition; sharing
     // the failure-mapper test's richer construction would obscure the size boundary.
-    // jscpd:ignore-start
     assert_eq!(
         outbox.enqueue(AssignmentObservation::Execution {
             assignment_id: "asn_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned(),
@@ -5641,7 +5631,6 @@ fn oversized_observation_is_rejected_before_queueing() {
         }),
         Err(OutboxFailure::Encoding)
     );
-    // jscpd:ignore-end
     assert_eq!(outbox.lock().entries.len(), 0);
 }
 

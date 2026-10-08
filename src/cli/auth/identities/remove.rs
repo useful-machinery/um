@@ -11,7 +11,6 @@ pub(super) const ABOUT: &str = "Remove a linked sign-in identity";
 
 // List and remove remain separate Clap leaves because only removal owns a target and
 // idempotent mutation, while each leaf retains a distinct result contract.
-// jscpd:ignore-start
 #[derive(Debug, Args)]
 pub(super) struct Command {
     #[arg(value_name = "IDENTITY_ID", help = "Linked identity ID")]
@@ -27,7 +26,6 @@ pub(super) struct Command {
 impl Command {
     pub(super) fn run(self, deployment: &Deployment) -> anyhow::Result<ExitCode> {
         let client = self.options.client()?;
-        // jscpd:ignore-end
         let idempotency_key = um_support::generate_idempotency_key()
             .context("generate identity-removal request identity")?;
         let outcome = with_principal_credential(

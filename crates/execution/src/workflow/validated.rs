@@ -79,7 +79,6 @@ pub struct ValidatedStepRecovery {
 
 // Source and validated handlers deliberately remain separate: validation pins an agent
 // harness, while source syntax must not carry one. Sharing the type would blur that boundary.
-// jscpd:ignore-start
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ValidatedRecoveryHandler {
     Command {
@@ -93,7 +92,6 @@ pub enum ValidatedRecoveryHandler {
         harness: ValidatedHarness,
     },
 }
-// jscpd:ignore-end
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ValidatedStep {

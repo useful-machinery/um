@@ -63,7 +63,6 @@ impl Credential {
 
     // Credential access remains on the redacting authentication type rather
     // than sharing enrollment-response accessors that have no secret boundary.
-    // jscpd:ignore-start
     pub(crate) fn runner_id(&self) -> &str {
         &self.runner_id
     }
@@ -75,7 +74,6 @@ impl Credential {
     pub(crate) fn bearer_value(&self) -> &str {
         &self.value
     }
-    // jscpd:ignore-end
 }
 
 #[cfg(test)]

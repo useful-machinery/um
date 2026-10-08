@@ -88,7 +88,6 @@ fn artifact_digest(bytes: &[u8]) -> String {
 fn portable_result_bytes() -> Vec<u8> {
     // Keep this black-box wire fixture independent of the production assembly unit fixture so
     // the public command cannot pass by sharing the builder that it is expected to validate.
-    // jscpd:ignore-start
     let document = serde_json::json!({
         "schemaVersion": 1,
         "attemptNumber": 1,
@@ -142,7 +141,6 @@ fn portable_result_bytes() -> Vec<u8> {
         }],
         "exports": {}
     });
-    // jscpd:ignore-end
     let mut bytes = serde_json::to_vec_pretty(&document).unwrap();
     bytes.push(b'\n');
     bytes

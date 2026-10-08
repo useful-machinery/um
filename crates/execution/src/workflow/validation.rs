@@ -713,7 +713,6 @@ fn infer_condition_value_reference(
                     location,
                 ));
             }
-            // jscpd:ignore-start -- Condition and body traversals retain distinct failure locations.
             validate_data_dependency_authority(
                 document,
                 consumer_name,
@@ -726,7 +725,6 @@ fn infer_condition_value_reference(
             if consumer_role == producer_role {
                 mark_data_prerequisite(prerequisites, &reference.node, true);
             }
-            // jscpd:ignore-end
             Ok(())
         }
     }

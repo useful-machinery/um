@@ -27,7 +27,6 @@ pub(super) struct Command {
     delegator_principal_id: Option<String>,
 
     // Clap input ownership remains operation-local; shared execution policy lives in LeafOptions.
-    // jscpd:ignore-start
     #[command(flatten)]
     options: LeafOptions,
 }
@@ -40,7 +39,6 @@ impl Command {
             delegator_principal_id,
             options,
         } = self;
-        // jscpd:ignore-end
         if options.authentication.service_api_key_file.is_some() && delegator_principal_id.is_none()
         {
             return Err(anyhow!(

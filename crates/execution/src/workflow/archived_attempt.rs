@@ -140,7 +140,6 @@ pub(crate) struct ArchivedExecution {
 
 // The archive projection owns decoded bytes rather than the result wire encoding, so a
 // separate type keeps untrusted deserialization out of the presentation model.
-// jscpd:ignore-start
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ArchivedDiagnosticStream {
     pub(crate) bytes: Arc<[u8]>,
@@ -149,7 +148,6 @@ pub(crate) struct ArchivedDiagnosticStream {
     pub(crate) truncated: bool,
     pub(crate) fully_drained: bool,
 }
-// jscpd:ignore-end
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ArchivedCommandOutput {
@@ -1685,10 +1683,8 @@ fn validate_exports(
             } => {
                 // A branch may have no carrier; keep this ordinal check in its
                 // own branch instead of conflating file and Git descriptors.
-                // jscpd:ignore-start
                 let identity = (source.node.id.clone(), source.output.clone());
                 let owner = *owner_ordinals.get(&identity).ok_or(())?;
-                // jscpd:ignore-end
                 if !source_available
                     || !provenance_matches(provenance.as_ref(), producer.as_ref())
                     || source.value_type != WorkflowValueType::GitBranch

@@ -397,7 +397,6 @@ fn refresh_after_rejection(
 
 // Keep the authority-acquiring entry distinct from the path used by a caller already
 // holding that authority; reacquiring the lock would deadlock.
-// jscpd:ignore-start
 fn coordinated_refresh_until(
     store: &CredentialStore,
     client: &HttpClient,
@@ -409,7 +408,6 @@ fn coordinated_refresh_until(
     let _authority = store
         .refresh_authority_until(deployment.fingerprint(), deadline)
         .map_err(|error| deadline_store_error(error, deadline))?;
-    // jscpd:ignore-end
     coordinated_refresh_under_authority_until(store, client, deployment, reason, deadline)
 }
 

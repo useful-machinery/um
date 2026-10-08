@@ -501,7 +501,6 @@ fn reactor_timer(
 
 // Linux and macOS compile as mutually exclusive implementations of one platform module;
 // keeping each small native import surface local makes unsupported targets fail closed.
-// jscpd:ignore-start
 #[cfg(target_os = "linux")]
 mod platform {
     use std::io;
@@ -512,7 +511,6 @@ mod platform {
         LeaseClockError, TimerFuture, owned_native_timer, reactor_timer, require_tokio_reactor,
         timer_descriptor, timer_setup,
     };
-    // jscpd:ignore-end
 
     pub(super) fn now_nanoseconds() -> Result<u64, LeaseClockError> {
         clock_gettime_nanoseconds(libc::CLOCK_BOOTTIME)

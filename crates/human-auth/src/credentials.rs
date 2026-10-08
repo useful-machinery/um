@@ -69,7 +69,6 @@ impl fmt::Debug for StoredCredential {
 impl StoredCredential {
     // Stored and freshly issued credentials deliberately remain separate states;
     // their small secret-borrowing APIs are clearer than a shared token trait.
-    // jscpd:ignore-start
     pub(crate) fn access_token(&self) -> &SecretToken {
         &self.access_token
     }
@@ -77,7 +76,6 @@ impl StoredCredential {
     pub(crate) fn refresh_token(&self) -> &SecretToken {
         &self.refresh_token
     }
-    // jscpd:ignore-end
 
     pub(crate) fn needs_refresh(&self, now: OffsetDateTime) -> bool {
         let expiry_cutoff = now.checked_add(TOKEN_EXPIRY_MARGIN).unwrap_or(now);

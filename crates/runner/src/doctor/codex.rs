@@ -19,7 +19,6 @@ impl DoctorCheck for CodexCheck {
     }
 
     // Doctor keeps a profile-local adapter so Codex remains independently selectable.
-    // jscpd:ignore-start
     fn run(&self) -> Outcome {
         match discover_and_validate_codex_installation() {
             Ok(installation) => compatible_harness_outcome(
@@ -37,7 +36,6 @@ impl DoctorCheck for CodexCheck {
             Err(failure) => failure_outcome(failure),
         }
     }
-    // jscpd:ignore-end
 }
 
 fn failure_outcome(failure: CodexInstallationFailure) -> Outcome {

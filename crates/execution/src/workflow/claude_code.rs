@@ -6,7 +6,6 @@ pub struct ClaudeCodeConfig {
 }
 
 // Claude effort is deliberately independent of Pi thinking because the harness contracts differ.
-// jscpd:ignore-start
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
 pub(crate) enum ClaudeCodeEffort {
     #[serde(rename = "low")]
@@ -32,10 +31,8 @@ impl ClaudeCodeEffort {
         }
     }
 }
-// jscpd:ignore-end
 
 // Keep this direct decoder local so Claude's closed configuration can evolve independently.
-// jscpd:ignore-start
 pub(crate) fn resolve_config(value: &Value) -> Option<ClaudeCodeConfig> {
     let config = serde_json::from_value::<ClaudeCodeConfig>(value.clone()).ok()?;
     if config.model.is_empty() {
@@ -47,7 +44,6 @@ pub(crate) fn resolve_config(value: &Value) -> Option<ClaudeCodeConfig> {
         effort: config.effort,
     })
 }
-// jscpd:ignore-end
 
 #[cfg(test)]
 mod config_tests {
@@ -196,7 +192,6 @@ pub(crate) enum ClaudeCodeStreamJsonV1RejectionReason {
     ToolProgressEventInvalid,
     // Pi uses some matching terminal labels, but each closed profile must own and evolve
     // its rejection taxonomy independently.
-    // jscpd:ignore-start
     ResultCorrelationInvalid,
     TerminalDrainEventInvalid,
     EndOfStreamInvariantInvalid,
@@ -207,7 +202,6 @@ pub(crate) enum ClaudeCodeStreamJsonV1RejectionReason {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ClaudeCodeStreamJsonV1EventType {
-    // jscpd:ignore-end
     System,
     StreamEvent,
     Assistant,
@@ -312,7 +306,6 @@ impl Default for ClaudeCodeStreamJsonV1RejectionContext {
 
 // Keep each closed profile's limits beside its native parser so future profile changes
 // cannot silently alter another harness's admission contract.
-// jscpd:ignore-start
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ClaudeCodeStreamJsonV1ProtocolLimits {
     maximum_frame_bytes: NonZeroU64,
@@ -328,7 +321,6 @@ impl ClaudeCodeStreamJsonV1ProtocolLimits {
             maximum_frame_bytes,
         }
     }
-    // jscpd:ignore-end
 
     #[cfg(test)]
     const fn with_maximum_frame_bytes(maximum_frame_bytes: NonZeroU64) -> Self {
@@ -574,7 +566,6 @@ impl ClaudeCodeStreamJsonV1Parser {
     /// Consumes arbitrary stdout chunks while retaining at most one bounded JSONL frame.
     // Pi and Claude intentionally retain independent native state machines; sharing
     // this byte loop would couple their profile-specific failure transitions.
-    // jscpd:ignore-start
     pub(crate) fn push_stdout(
         &mut self,
         bytes: &[u8],
@@ -610,7 +601,6 @@ impl ClaudeCodeStreamJsonV1Parser {
         }
         Ok(())
     }
-    // jscpd:ignore-end
 
     pub(crate) fn finish(mut self, exit_success: bool) -> AgentOutcome {
         if self.failure.is_none() && !self.frame.is_empty() {
@@ -676,7 +666,6 @@ impl ClaudeCodeStreamJsonV1Parser {
 
     // Native parser state stays profile-local even though both profiles snapshot before
     // decoding and install one fallback diagnostic for otherwise unclassified rejections.
-    // jscpd:ignore-start
     fn parse_frame(&mut self, frame: &[u8]) -> Result<(), AgentFailureCause> {
         self.prepare_rejection(ClaudeCodeStreamJsonV1ProtocolStage::FrameRead);
         let result = self.parse_frame_inner(frame);
@@ -694,12 +683,10 @@ impl ClaudeCodeStreamJsonV1Parser {
         self.rejection_state_snapshot = None;
         result
     }
-    // jscpd:ignore-end
 
     fn parse_frame_inner(&mut self, frame: &[u8]) -> Result<(), AgentFailureCause> {
         // This profile owns decoding failure classification because Claude's init boundary
         // differs from Pi's session-header and agent-start boundaries.
-        // jscpd:ignore-start
         self.rejection_context.stage = ClaudeCodeStreamJsonV1ProtocolStage::FrameDecode;
         let value =
             um_support::strict_json_from_slice(frame).map_err(|_| self.protocol_failure())?;
@@ -709,7 +696,6 @@ impl ClaudeCodeStreamJsonV1Parser {
                 ClaudeCodeStreamJsonV1ProtocolStage::FrameDecode,
             );
         };
-        // jscpd:ignore-end
 
         self.rejection_context.outer_event = required_string(object, "type").map(claude_event_type);
         if self.session_id.is_none() {
@@ -1752,7 +1738,6 @@ impl ClaudeCodeStreamJsonV1Parser {
 
     // Claude initialization, rather than Pi's session-plus-agent-start sequence, owns the
     // start-to-protocol failure transition; keep that authority in this parser.
-    // jscpd:ignore-start
     fn protocol_failure(&self) -> AgentFailureCause {
         if self.session_id.is_some() {
             AgentFailureCause::HarnessProtocolFailed
@@ -1923,7 +1908,6 @@ impl ClaudeCodeStreamJsonV1Parser {
             retry_active: self.retry_active,
         }
     }
-    // jscpd:ignore-end
 }
 
 fn default_rejection_reason(
@@ -2230,7 +2214,6 @@ fn failed(cause: AgentFailureCause) -> AgentOutcome {
 
 // These accessors and native identity checks stay profile-local because their callers
 // assign different lifecycle authority and failure timing to superficially similar fields.
-// jscpd:ignore-start
 fn required_string<'a>(object: &'a Map<String, Value>, key: &str) -> Option<&'a str> {
     object.get(key)?.as_str()
 }
@@ -2272,7 +2255,6 @@ fn valid_session_id(value: &str) -> bool {
             .iter()
             .any(|byte| byte.is_ascii_hexdigit() && *byte != b'0')
 }
-// jscpd:ignore-end
 
 #[cfg(test)]
 mod adapter_tests;

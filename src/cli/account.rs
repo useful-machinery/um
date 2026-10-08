@@ -155,7 +155,6 @@ fn execute_update(
 }
 
 // Account and auth retain separate command enums so each family owns its public dispatch surface.
-// jscpd:ignore-start
 impl Command {
     pub(super) fn execute(self) -> super::CommandResult {
         match self.command {
@@ -176,4 +175,3 @@ impl Command {
         }
     }
 }
-// jscpd:ignore-end

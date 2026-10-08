@@ -24,7 +24,6 @@ Attempt selection:
 
 // View keeps its attempt selector beside its leaf-specific presentation surface; sharing
 // this clap shape with execution commands would incorrectly share their inputs.
-// jscpd:ignore-start
 #[derive(Debug, Args)]
 pub(super) struct Command {
     #[command(flatten)]
@@ -41,7 +40,6 @@ pub(super) struct Command {
     #[command(flatten)]
     presentation: super::PresentationOptions,
 }
-// jscpd:ignore-end
 
 impl Command {
     pub(super) fn execute(self) -> super::super::CommandResult {

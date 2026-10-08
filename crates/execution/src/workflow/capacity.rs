@@ -342,7 +342,6 @@ pub(crate) fn calculate_condition_evidence_capacity(
 pub struct ConditionCapacityBounds {
     // Runner and replay validate a partial untrusted wire projection; the
     // resolver's ComputedWorkflowCapacity is a separate full derived budget.
-    // jscpd:ignore-start
     pub selected_maximum_transitions: u64,
     pub condition_transition_count: u64,
     pub aggregate_condition_transition_bytes: u64,
@@ -350,7 +349,6 @@ pub struct ConditionCapacityBounds {
     pub presentation_result_bytes: u64,
     pub portable_result_bytes: u64,
     pub encoded_outbox_bytes: u64,
-    // jscpd:ignore-end
 }
 
 impl ConditionCapacityBounds {

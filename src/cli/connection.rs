@@ -1,5 +1,4 @@
 // CLI families keep their domain imports local rather than introducing a cross-family module.
-// jscpd:ignore-start
 use std::io::{self, Write};
 use std::time::Duration;
 
@@ -12,7 +11,6 @@ use um_api::{
     HttpClient, LinearApi, LinearConnection, LinearFailure, LinearSession, LinearSessionStatus,
 };
 use um_human_auth::Deployment;
-// jscpd:ignore-end
 
 use super::{OrganizationArg, PrincipalAuthenticationArgs};
 
@@ -116,7 +114,6 @@ struct ConfirmationTarget {
     confirmation: super::ConfirmationArgs,
 }
 // Linear connection pagination has a separate output and authority contract from publication lists.
-// jscpd:ignore-start
 #[derive(Debug, Args)]
 struct List {
     #[arg(value_name = OrganizationArg::VALUE_NAME, help = OrganizationArg::HELP)]
@@ -126,7 +123,6 @@ struct List {
     #[command(flatten)]
     options: Options,
 }
-// jscpd:ignore-end
 
 impl Command {
     pub(super) fn execute(self) -> super::CommandResult {

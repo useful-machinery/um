@@ -23,7 +23,6 @@ pub(super) const ABOUT: &str = "Sign in";
 pub(super) struct Command {
     // Login keeps its force option and three-way completion mapping local;
     // sharing this command shell with status would couple distinct result contracts.
-    // jscpd:ignore-start
     #[arg(long, help = "Start a new sign-in even if you're already signed in")]
     force: bool,
 
@@ -49,7 +48,6 @@ impl Command {
                 .map(OutcomeClass::exit_code)
         })
     }
-    // jscpd:ignore-end
 
     fn run(
         self,
@@ -385,13 +383,11 @@ impl LoginOutput {
         expires_at: OffsetDateTime,
     ) -> anyhow::Result<()> {
         // Keep login presentation and its error context next to this command.
-        // jscpd:ignore-start
         if self.json {
             let event =
                 um_human_auth::activation_event(deployment, authorization, expires_at, None)
                     .context("format sign-in expiration")?;
             self.json_line(&event)
-        // jscpd:ignore-end
         } else {
             let stdout = io::stdout();
             let mut stdout = stdout.lock();

@@ -52,7 +52,6 @@ impl ScriptedInvocationStarted {
 
     // The scripted adapter exposes prompt fields for protocol-order assertions; these accessors
     // intentionally mirror the immutable production prompt without sharing its authority type.
-    // jscpd:ignore-start
     pub(crate) fn system_prompt(&self) -> &str {
         &self.system_prompt
     }
@@ -60,7 +59,6 @@ impl ScriptedInvocationStarted {
     pub(crate) fn message(&self) -> &str {
         &self.message
     }
-    // jscpd:ignore-end
 
     pub(crate) fn working_directory(&self) -> &std::path::Path {
         &self.working_directory

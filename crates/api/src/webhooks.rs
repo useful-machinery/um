@@ -79,7 +79,6 @@ pub enum WebhookFailure {
 
 // Webhook and run failures are separate closed policy domains despite sharing
 // the credential rejection predicate used by human-session refresh.
-// jscpd:ignore-start
 impl WebhookFailure {
     pub fn credential_rejected(&self) -> bool {
         matches!(
@@ -91,7 +90,6 @@ impl WebhookFailure {
         )
     }
 }
-// jscpd:ignore-end
 
 #[derive(Clone, Copy)]
 pub enum Mutation {

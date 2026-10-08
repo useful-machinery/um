@@ -4,7 +4,6 @@ use std::time::Duration;
 
 // Delegation transport retains a domain-local protocol vocabulary; sharing imports would not
 // create a concept that can evolve independently of the operation-specific response decoder.
-// jscpd:ignore-start
 use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderValue};
 use reqwest::{Method, StatusCode, Url};
 use serde::Serialize;
@@ -19,7 +18,6 @@ use super::problem::{
     self, ACCEPTED_MEDIA_TYPES, BAD_REQUEST, FORBIDDEN, JSON_MEDIA_TYPE, NOT_FOUND, UNAUTHORIZED,
 };
 use super::{UnreachableCategory, bearer_authorization, classify_reqwest_error};
-// jscpd:ignore-end
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 const READ_ATTEMPTS: usize = 1;
@@ -127,7 +125,6 @@ pub struct DelegationApiError {
 
 // Delegation errors keep their own operation names and credential-rejection signal rather than
 // coupling this authorization surface to another API domain's error type.
-// jscpd:ignore-start
 impl DelegationApiError {
     pub fn credential_rejected(&self) -> bool {
         self.credential_rejected
@@ -149,11 +146,9 @@ impl DelegationApiError {
         }
     }
 }
-// jscpd:ignore-end
 
 // Protocol diagnostics name delegation-specific actions, so a separate error kind and renderer
 // are clearer than a generic API error that would erase the failed operation.
-// jscpd:ignore-start
 #[derive(Debug)]
 enum DelegationApiErrorKind {
     Endpoint(HttpEndpointError),
@@ -258,7 +253,6 @@ impl fmt::Display for DelegationApiError {
         }
     }
 }
-// jscpd:ignore-end
 
 impl Error for DelegationApiError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
@@ -297,7 +291,6 @@ impl Operation {
 
 // The delegation request plan owns this domain's bodyless participant mutations and proposal
 // body; keeping it typed here prevents another domain from selecting delegation retry semantics.
-// jscpd:ignore-start
 struct RequestSpec {
     operation: Operation,
     method: Method,
@@ -307,7 +300,6 @@ struct RequestSpec {
     body: Option<Zeroizing<Vec<u8>>>,
     maximum_attempts: usize,
 }
-// jscpd:ignore-end
 
 type AttemptError = ApiAttemptError<DelegationApiError>;
 
@@ -530,7 +522,6 @@ fn request_spec(
 
 // Delegation transport owns its exact mutation retry count and typed error construction; sharing
 // another domain's loop would let unrelated operations alter this contract.
-// jscpd:ignore-start
 fn execute_request(
     client: &HttpClient,
     spec: &RequestSpec,
@@ -583,7 +574,6 @@ async fn send_request(
     })
     .await
 }
-// jscpd:ignore-end
 
 fn decode_list(response: BufferedResponse) -> Result<ListDelegationsOutcome, DelegationApiError> {
     match response.status {
@@ -727,7 +717,6 @@ fn decode_end(
 
 // Common statuses retain delegation-specific typed outcomes and protocol diagnostics; folding
 // them into another domain would couple independent authorization and error contracts.
-// jscpd:ignore-start
 fn decode_common_failure(
     operation: Operation,
     response: &BufferedResponse,
@@ -760,7 +749,6 @@ fn decode_common_failure(
         )),
     }
 }
-// jscpd:ignore-end
 
 fn decode_delegation_page(
     operation: Operation,
@@ -1021,7 +1009,6 @@ fn decode_problem_type(
 
 // Proposal concurrency is the only delegation response carrying Retry-After; keeping validation
 // here preserves that narrow contract instead of exposing a generic retry policy.
-// jscpd:ignore-start
 fn parse_retry_after(
     operation: Operation,
     response: &BufferedResponse,
@@ -1041,7 +1028,6 @@ fn parse_retry_after(
             )
         })
 }
-// jscpd:ignore-end
 
 fn unrecognized_conflict(operation: Operation) -> DelegationApiError {
     DelegationApiError::protocol(

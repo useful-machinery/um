@@ -745,7 +745,6 @@ pub struct CloudExecutionCapacityV1 {
     pub source_closure_digest: DigestV1,
     // Portable results and Runner frames are independently closed schemas; keeping this
     // flat projection explicit prevents either wire contract from becoming the other's ABI.
-    // jscpd:ignore-start
     pub general_maximum_transitions: u64,
     pub selected_maximum_transitions: u64,
     pub maximum_invocations: u64,
@@ -760,7 +759,6 @@ pub struct CloudExecutionCapacityV1 {
     pub presentation_result_bytes: u64,
     pub portable_result_bytes: u64,
     pub encoded_outbox_bytes: u64,
-    // jscpd:ignore-end
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -832,7 +830,6 @@ pub(crate) enum CancellationReasonV1 {
 
 // The published result's terminal-only enum must remain closed independently of the
 // durable attempt projection, which also admits live states.
-// jscpd:ignore-start
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum WorkflowStepStateV1 {
@@ -844,7 +841,6 @@ pub(crate) enum WorkflowStepStateV1 {
     NotRun,
     Cancelled,
 }
-// jscpd:ignore-end
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1036,7 +1032,6 @@ pub(crate) struct RecoveryHandlerFailureV1 {
 
 // Recovery handler and target failures are separate closed schemas; keeping each field
 // explicit is clearer than a generic cause that could admit fields at the wrong boundary.
-// jscpd:ignore-start
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct RecoveryHandlerFailureCauseV1 {
@@ -1054,7 +1049,6 @@ pub(crate) struct RecoveryHandlerFailureCauseV1 {
     )]
     pub(crate) decision_rejection: Option<RecoveryDecisionRejectionV1>,
 }
-// jscpd:ignore-end
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1718,7 +1712,6 @@ struct AvailableExportWire {
 
 // Available file-like and Git exports intentionally keep separate closed wire structs;
 // flattening their shared optional origin fields would weaken unknown-field rejection.
-// jscpd:ignore-start
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct GitBranchExportWire {
@@ -1738,7 +1731,6 @@ struct GitBranchExportWire {
     #[serde(default, deserialize_with = "deserialize_non_null_option")]
     presentation: Option<ExportPresentationV1>,
 }
-// jscpd:ignore-end
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]

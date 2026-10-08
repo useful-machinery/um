@@ -71,7 +71,6 @@ struct RepositorySelectionArgs {
 
 // Project creation has repository and optional pool inputs that must remain distinct
 // from runner-pool creation despite their shared organization/name shell.
-// jscpd:ignore-start
 #[derive(Debug, Args)]
 struct CreateCommand {
     #[arg(value_name = OrganizationArg::VALUE_NAME, help = OrganizationArg::HELP)]
@@ -89,11 +88,9 @@ struct CreateCommand {
     #[command(flatten)]
     options: Options,
 }
-// jscpd:ignore-end
 
 // Project leaves intentionally keep their Clap identities explicit so each help page
 // names the exact resource accepted by the corresponding public API operation.
-// jscpd:ignore-start
 #[derive(Debug, Args)]
 struct ListCommand {
     #[arg(value_name = OrganizationArg::VALUE_NAME, help = OrganizationArg::HELP)]
@@ -135,7 +132,6 @@ struct RenameCommand {
     #[command(flatten)]
     options: Options,
 }
-// jscpd:ignore-end
 
 #[derive(Debug, Args)]
 struct RepositoryCommand {
@@ -301,7 +297,6 @@ impl RunnerPoolCommand {
 
 // This wrapper supplies project-specific deployment diagnostics while organization
 // commands retain their independent organization wording.
-// jscpd:ignore-start
 fn execute_leaf<T>(
     command: T,
     execute: impl FnOnce(T, &Deployment) -> anyhow::Result<ExitCode>,
@@ -313,7 +308,6 @@ fn execute_leaf<T>(
         |command, deployment| execute(command, deployment).map_err(Into::into),
     )
 }
-// jscpd:ignore-end
 
 impl CreateCommand {
     fn execute(self, deployment: &Deployment) -> anyhow::Result<ExitCode> {
@@ -371,7 +365,6 @@ impl CreateCommand {
 
 // Each read command binds a distinct public projection and machine envelope; keeping
 // these mappings explicit makes the user-visible outcome contract reviewable.
-// jscpd:ignore-start
 impl ListCommand {
     fn execute(self, deployment: &Deployment) -> anyhow::Result<ExitCode> {
         let result = with_api(
@@ -441,7 +434,6 @@ impl RenameCommand {
         )
     }
 }
-// jscpd:ignore-end
 
 impl RepositoryShowCommand {
     fn execute(self, deployment: &Deployment) -> anyhow::Result<ExitCode> {
@@ -622,7 +614,6 @@ fn resolve_pool_id(
 
 // Human-session orchestration stays failure-domain-specific so project protocol
 // rejection cannot be confused with a Cloud run outcome.
-// jscpd:ignore-start
 pub(in crate::cli) fn with_api<T>(
     deployment: &Deployment,
     transport_policy: HttpTransportPolicy,
@@ -654,4 +645,3 @@ pub(in crate::cli) fn with_api<T>(
         ProjectFailure::Unreachable,
     )
 }
-// jscpd:ignore-end

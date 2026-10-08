@@ -21,7 +21,6 @@ use super::super::{ObservationClock, ObservationControl, OrganizationArg, Projec
 type Options =
     super::super::CommonArgs<super::super::ProjectJson, super::super::PrincipalAuthenticationArgs>;
 
-// jscpd:ignore-start
 // Clap's explicit nested groups mirror the webhook grammar; each leaf owns its own flags.
 #[derive(Debug, Args)]
 pub(super) struct Command {
@@ -61,7 +60,6 @@ enum EvaluationLeaf {
     #[command(about = "Show an evaluation")]
     Show(management::EvaluationTarget),
 }
-// jscpd:ignore-end
 #[derive(Debug, Args)]
 struct Retry {
     #[arg(value_name = OrganizationArg::VALUE_NAME, help = OrganizationArg::HELP)]
@@ -188,7 +186,6 @@ impl Retry {
                 )
                 .map_err(Into::into)
             },
-            // jscpd:ignore-start
             // Keep timeout reporting and pinned auth near the evaluation's cycle recovery;
             // run cancellation has a different recovery contract despite similar plumbing.
             move |snapshot| {
@@ -230,7 +227,6 @@ impl Retry {
             binding: None,
         };
         let result = self.poll(&mut authentication, control, timer)?;
-        // jscpd:ignore-end
         let (code, exit) = match result {
             Ok(exit) => return Ok(exit),
             Err(failure) => failure_code(

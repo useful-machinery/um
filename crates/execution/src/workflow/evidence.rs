@@ -44,7 +44,6 @@ impl FailurePhase {
 
 // Canonical committed codes deliberately mirror the separately versioned provisional
 // recovery-summary wire enum; sharing them would make recovery history node evidence.
-// jscpd:ignore-start
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum FailureCode {
@@ -138,7 +137,6 @@ pub(crate) enum FailureCode {
     GitTemporaryStorageUnavailable,
     OutputStagingUnavailable,
 }
-// jscpd:ignore-end
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]

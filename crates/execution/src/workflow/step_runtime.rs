@@ -797,7 +797,6 @@ where
 
     // Keep recovery preparation separate from ordinary DAG input preparation: sharing this
     // lifecycle-shaped code would make graph inputs representable at the handler boundary.
-    // jscpd:ignore-start
     async fn execute_recovery_handler(
         &self,
         step: String,
@@ -847,7 +846,6 @@ where
         }
     }
 
-    // jscpd:ignore-end
     fn prepare_recovery_handler(
         &self,
         step: &str,
@@ -1014,7 +1012,6 @@ where
 
     // Recovery commands share containment mechanics with targets but have private result
     // authority and handler occurrences, so combining the two paths would blur settlement.
-    // jscpd:ignore-start
     async fn execute_recovery_command(
         &self,
         step: String,
@@ -1156,10 +1153,8 @@ where
             .await
     }
 
-    // jscpd:ignore-end
     // Recovery agents share adapter quiescence with targets but exclude DAG values and accept
     // only the recovery result schema; keep that authority path independently reviewable.
-    // jscpd:ignore-start
     async fn execute_recovery_agent(
         &self,
         step: String,
@@ -1295,7 +1290,6 @@ where
             .await
     }
 
-    // jscpd:ignore-end
     async fn report_recovery_handler_started(
         &self,
         step: &str,
@@ -1313,7 +1307,6 @@ where
 
     // Handler settlement intentionally mirrors target settlement while emitting a distinct
     // closed occurrence set that can never publish target values.
-    // jscpd:ignore-start
     async fn settle_recovery_start_failure(
         &self,
         step: String,
@@ -1354,7 +1347,6 @@ where
         self.settle_agent_occurrence(action, occurrence).await
     }
 
-    // jscpd:ignore-end
     async fn report_step_started(
         &self,
         step: &str,
@@ -3115,7 +3107,6 @@ where
                 }
                 // A recovery action intentionally has the same delivery deduplication shell as
                 // a target action but dispatches a graph-input-free physical invocation.
-                // jscpd:ignore-start
                 Action::StartRecoveryHandler {
                     step,
                     round,
@@ -3145,7 +3136,6 @@ where
                         },
                     );
                 }
-                // jscpd:ignore-end
                 Action::CancelStep { step, deadline, .. } => {
                     match runtime.request_capture_cancellation(&step, requested.id) {
                         CaptureCancellationRegistration::Active

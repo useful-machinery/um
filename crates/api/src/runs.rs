@@ -10,9 +10,7 @@ use time::format_description::well_known::Rfc3339;
 use super::generated::{apis, models};
 use super::http_client::{HttpClient, generated_configuration};
 use super::http_util::{self, BoundedBodyError, BufferedBlockingResponse};
-use super::problem::{
-    self, BAD_REQUEST, FORBIDDEN, JSON_MEDIA_TYPE, NOT_FOUND, PROBLEM_MEDIA_TYPE, UNAUTHORIZED,
-};
+use super::problem::{self, BAD_REQUEST, FORBIDDEN, JSON_MEDIA_TYPE, NOT_FOUND, UNAUTHORIZED};
 use super::{HttpTransportPolicy, UnreachableCategory, classify_reqwest_error};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
@@ -577,10 +575,11 @@ pub(super) type ReceivedResponse = BufferedBlockingResponse;
 
 fn classify_retry_failure(response: &ReceivedResponse) -> RunFailure {
     if response.status == StatusCode::CONFLICT {
-        if require_media_type(response, PROBLEM_MEDIA_TYPE, false).is_err() {
-            return RunFailure::protocol(false);
-        }
-        return match problem::decode(&response.body, response.status) {
+        return match problem::decode_header_parts(
+            &response.body,
+            response.status,
+            response.content_type.as_ref(),
+        ) {
             Ok(problem) => match problem.r#type.as_str() {
                 "https://api.usefulmachinery.com/problems/trigger-active-run" => {
                     RunFailure::RetryConflict(RetryConflict::TriggerSlot)
@@ -740,10 +739,11 @@ pub(super) fn classify_failure(response: &ReceivedResponse, operation: RunOperat
             validated_problem_failure(response, Some(NOT_FOUND), RunFailure::NotFound, false)
         }
         StatusCode::CONFLICT if matches!(operation, RunOperation::Create | RunOperation::Input) => {
-            if require_media_type(response, PROBLEM_MEDIA_TYPE, false).is_err() {
-                return RunFailure::protocol(false);
-            }
-            match problem::decode(&response.body, response.status) {
+            match problem::decode_header_parts(
+                &response.body,
+                response.status,
+                response.content_type.as_ref(),
+            ) {
                 Ok(problem)
                     if problem.r#type
                         == "https://api.usefulmachinery.com/problems/idempotency-conflict" =>
@@ -1101,9 +1101,12 @@ fn require_problem_type(
     expected_type: Option<&str>,
     credential_rejected: bool,
 ) -> Result<(), RunFailure> {
-    require_media_type(response, PROBLEM_MEDIA_TYPE, credential_rejected)?;
-    let decoded = problem::decode(&response.body, response.status)
-        .map_err(|_| RunFailure::protocol(credential_rejected))?;
+    let decoded = problem::decode_header_parts(
+        &response.body,
+        response.status,
+        response.content_type.as_ref(),
+    )
+    .map_err(|_| RunFailure::protocol(credential_rejected))?;
     if expected_type.is_none_or(|expected| decoded.r#type == expected) {
         Ok(())
     } else {
@@ -1116,17 +1119,8 @@ pub(super) fn require_media_type(
     expected: &str,
     credential_rejected: bool,
 ) -> Result<(), RunFailure> {
-    let actual = response
-        .content_type
-        .as_ref()
-        .map(http_util::media_type)
-        .transpose()
-        .map_err(|_| RunFailure::protocol(credential_rejected))?;
-    if actual.as_deref() == Some(expected) {
-        Ok(())
-    } else {
-        Err(RunFailure::protocol(credential_rejected))
-    }
+    http_util::require_header_media_type(response.content_type.as_ref(), expected)
+        .map_err(|_| RunFailure::protocol(credential_rejected))
 }
 
 pub fn valid_integration_context<'a>(

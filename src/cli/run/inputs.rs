@@ -723,7 +723,6 @@ fn write_download_interrupted(
 
 // Retained-input deletion emits a mutation receipt while inventory emits the full retained-input
 // projection; each closure stays next to its machine contract.
-// jscpd:ignore-start
 fn write_delete(
     deployment: &str,
     organization: &str,
@@ -758,7 +757,6 @@ fn write_delete(
         },
     )
 }
-// jscpd:ignore-end
 
 fn write_run_outcome<T>(
     deployment: &str,

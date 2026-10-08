@@ -74,7 +74,6 @@ pub struct OrganizationMembershipPage {
 pub struct OrganizationMembershipHistoryEntry {
     // Owner history and current-principal history intentionally remain separate models: their
     // optional profiles belong to different principals and obey different privacy rules.
-    // jscpd:ignore-start
     pub id: String,
     pub organization_id: String,
     pub principal_id: String,
@@ -87,7 +86,6 @@ pub struct OrganizationMembershipHistoryEntry {
     pub updated_at: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub terminal_at: Option<String>,
-    // jscpd:ignore-end
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]

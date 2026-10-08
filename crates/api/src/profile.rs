@@ -7,7 +7,7 @@ use reqwest::{Response, StatusCode, Url};
 
 use super::generated::models;
 use super::http_client::{HttpClient, HttpEndpointError};
-use super::http_util::{self, BoundedBodyError};
+use super::http_util::{self, BufferedResponseError};
 use super::principal_profile::{self, PrincipalProfile};
 use super::problem::{
     self, ACCEPTED_MEDIA_TYPES, BAD_REQUEST, FORBIDDEN, JSON_MEDIA_TYPE, UNAUTHORIZED,
@@ -227,7 +227,6 @@ async fn decode_response(
     expects_display_name: bool,
 ) -> Result<UpdateProfileOutcome, AttemptError> {
     let status = response.status();
-    let credential_rejected = status == StatusCode::UNAUTHORIZED;
     if status == StatusCode::OK
         && response.headers().get("Idempotency-Key") != Some(expected_idempotency_key)
     {
@@ -236,40 +235,37 @@ async fn decode_response(
             false,
         )));
     }
-    let content_type = response
-        .headers()
-        .get(CONTENT_TYPE)
-        .map(http_util::media_type)
-        .transpose()
-        .map_err(|_| {
-            AttemptError::Protocol(UpdateProfileError::protocol(
-                "the Content-Type header is not valid text",
-                credential_rejected,
-            ))
-        })?;
-    let body = match http_util::read_bounded_body(response).await {
-        Ok(body) => body,
-        Err(BoundedBodyError::TooLarge) => {
+    let (status, content_type, body) = match http_util::decode_response_parts(response).await {
+        Ok(parts) => parts,
+        Err(BufferedResponseError::InvalidContentType { status }) => {
             return Err(AttemptError::Protocol(UpdateProfileError::protocol(
-                "the response body exceeds 1 MiB",
-                credential_rejected,
+                "the Content-Type header is not valid text",
+                status == StatusCode::UNAUTHORIZED,
             )));
         }
-        Err(BoundedBodyError::Transport(_)) if credential_rejected => {
+        Err(BufferedResponseError::TooLarge { status }) => {
+            return Err(AttemptError::Protocol(UpdateProfileError::protocol(
+                "the response body exceeds 1 MiB",
+                status == StatusCode::UNAUTHORIZED,
+            )));
+        }
+        Err(BufferedResponseError::Transport { status, .. })
+            if status == StatusCode::UNAUTHORIZED =>
+        {
             return Err(AttemptError::Protocol(UpdateProfileError::protocol(
                 "the unauthorized response body could not be read",
                 true,
             )));
         }
-        Err(BoundedBodyError::Transport(error)) if status == StatusCode::OK => {
-            return Err(AttemptError::Ambiguous(classify_reqwest_error(&error)));
+        Err(BufferedResponseError::Transport { status, source }) if status == StatusCode::OK => {
+            return Err(AttemptError::Ambiguous(classify_reqwest_error(&source)));
         }
-        Err(BoundedBodyError::Transport(error)) => {
+        Err(BufferedResponseError::Transport { status, source }) => {
             return Ok(UpdateProfileOutcome::Unreachable(
                 if status.is_server_error() {
                     UnreachableCategory::Server
                 } else {
-                    classify_reqwest_error(&error)
+                    classify_reqwest_error(&source)
                 },
             ));
         }

@@ -21,7 +21,6 @@ impl DoctorCheck for ClaudeCodeCheck {
     }
 
     // Doctor keeps a harness-local adapter so Pi and Claude reports stay independently selectable.
-    // jscpd:ignore-start
     fn run(&self) -> Outcome {
         match discover_and_validate_claude_code_installation() {
             Ok(installation) => compatible_harness_outcome(
@@ -39,7 +38,6 @@ impl DoctorCheck for ClaudeCodeCheck {
             Err(failure) => failure_outcome(failure),
         }
     }
-    // jscpd:ignore-end
 }
 
 fn failure_outcome(failure: ClaudeCodeInstallationFailure) -> Outcome {
@@ -61,7 +59,6 @@ fn failure_outcome(failure: ClaudeCodeInstallationFailure) -> Outcome {
             )
         }
         // Claude probe codes and messages stay local so Pi diagnostics can evolve independently.
-        // jscpd:ignore-start
         ClaudeCodeInstallationFailure::Malformed { probe, version } => {
             let (code, message) = match probe {
                 ClaudeCodeProbe::Version => (
@@ -80,7 +77,6 @@ fn failure_outcome(failure: ClaudeCodeInstallationFailure) -> Outcome {
             }
             Outcome::fail(code, message, details)
         }
-        // jscpd:ignore-end
         ClaudeCodeInstallationFailure::Unsupported(ClaudeCodeIncompatibility::Version(version)) => {
             let mut details = compatibility_details();
             details.insert("version".to_owned(), version);

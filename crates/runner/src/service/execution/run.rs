@@ -325,8 +325,7 @@ impl ExecutionJob {
             );
             // Enabled and disabled execution carry distinct static dispatcher types;
             // keeping each engine call explicit avoids a dynamic adapter boundary.
-            // jscpd:ignore-start
-            let result = mark_engine_terminal(
+            mark_engine_terminal(
                 run_under_lease(
                     execute_workflow(
                         self.accepted.admitted.clone(),
@@ -353,13 +352,10 @@ impl ExecutionJob {
                 ),
                 Arc::clone(&self.engine_terminal),
             )
-            .await;
-            // jscpd:ignore-end
-            result
+            .await
         } else {
             // See the enabled branch: the no-agent dispatcher is intentionally a different type.
-            // jscpd:ignore-start
-            let result = mark_engine_terminal(
+            mark_engine_terminal(
                 run_under_lease(
                     execute_workflow(
                         self.accepted.admitted.clone(),
@@ -386,9 +382,7 @@ impl ExecutionJob {
                 ),
                 Arc::clone(&self.engine_terminal),
             )
-            .await;
-            // jscpd:ignore-end
-            result
+            .await
         };
         self.accepted.workflow_git.disable();
 

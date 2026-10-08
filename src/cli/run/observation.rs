@@ -336,7 +336,6 @@ pub(super) fn wait_run_with_reads(
 
 // Receipt observation has a different terminal predicate and read authority from Run reads;
 // keeping its polling boundary separate makes resolved-receipt ordering explicit.
-// jscpd:ignore-start
 pub(super) fn wait_cancellation(
     context: ObservationContext<'_>,
     control: &impl super::super::ObservationControl,
@@ -361,7 +360,6 @@ pub(super) fn wait_cancellation(
             credential_rejected: false,
         });
     };
-    // jscpd:ignore-end
     let deadline = timeout.map(|duration| started.checked_add(duration).unwrap_or(started));
     wait_receipt_with(
         |_remaining| {

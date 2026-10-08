@@ -902,7 +902,6 @@ mod tests {
                 .unwrap();
         // Keep this profile-local expected document explicit; sharing it with Pi's
         // exact-binary fixture would obscure the intentionally different metadata fields.
-        // jscpd:ignore-start
         assert_eq!(
             metadata,
             json!({
@@ -920,7 +919,6 @@ mod tests {
             })
         );
         assert!(metadata.get("environment").is_none());
-        // jscpd:ignore-end
     }
 
     #[test]
@@ -956,7 +954,6 @@ mod tests {
         assert_eq!(std::fs::read_dir(first.directory()).unwrap().count(), 1);
         // Keep Codex's complete no-native-session metadata explicit so profile fields
         // remain reviewable without coupling this fixture to Pi's native-session shape.
-        // jscpd:ignore-start
         let metadata: serde_json::Value =
             serde_json::from_slice(&std::fs::read(first.directory().join(METADATA_FILE)).unwrap())
                 .unwrap();
@@ -974,7 +971,6 @@ mod tests {
         );
         assert!(metadata.get("environment").is_none());
         assert!(metadata.get("nativeSession").is_none());
-        // jscpd:ignore-end
         let retry_metadata: serde_json::Value = serde_json::from_slice(
             &std::fs::read(retried.directory().join(METADATA_FILE)).unwrap(),
         )

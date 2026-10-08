@@ -80,7 +80,6 @@ pub(super) fn write_pool_create(
 }
 
 // Pool operations intentionally bind each stable machine outcome to its own command heading.
-// jscpd:ignore-start
 pub(super) fn write_pool_show(
     deployment: &str,
     result: &Result<RunnerPool, RunnerFailure>,
@@ -96,11 +95,9 @@ pub(super) fn write_pool_show(
         json,
     )
 }
-// jscpd:ignore-end
 
 // Each command wrapper binds one stable machine outcome to its human verdict;
 // spelling out that binding is clearer than a second layer of callback indirection.
-// jscpd:ignore-start
 pub(super) fn write_pool_rename(
     deployment: &str,
     result: &Result<RunnerPool, RunnerFailure>,
@@ -116,7 +113,6 @@ pub(super) fn write_pool_rename(
         json,
     )
 }
-// jscpd:ignore-end
 
 fn write_pool(
     deployment: &str,
@@ -152,7 +148,6 @@ fn write_pool(
 
 // Pool pages have a deliberately compact presentation and a pool-specific JSON
 // envelope; sharing organization or runner row rendering would couple output contracts.
-// jscpd:ignore-start
 pub(super) fn write_pool_list(
     deployment: &str,
     result: &Result<RunnerPoolList, RunnerFailure>,
@@ -189,11 +184,9 @@ pub(super) fn write_pool_list(
         Err(failure) => write_failure(deployment, failure, authentication, json),
     }
 }
-// jscpd:ignore-end
 
 // Registration rows own the independent projection summary and JSON envelope;
 // a generic page renderer would hide that product-specific field contract.
-// jscpd:ignore-start
 pub(super) fn write_runner_list(
     deployment: &str,
     result: &Result<RunnerRegistrationList, RunnerFailure>,
@@ -250,7 +243,6 @@ fn write_runner_list_human_to(
     writeln!(output, "  Deployment: {deployment}")?;
     Ok(())
 }
-// jscpd:ignore-end
 
 pub(super) fn write_runner_show(
     deployment: &str,
@@ -269,7 +261,6 @@ pub(super) fn write_runner_show(
 }
 
 // Rename and show are separate public commands even though both render one registration.
-// jscpd:ignore-start
 pub(super) fn write_runner_rename(
     deployment: &str,
     result: &Result<RunnerRegistration, RunnerFailure>,
@@ -285,11 +276,9 @@ pub(super) fn write_runner_rename(
         json,
     )
 }
-// jscpd:ignore-end
 
 // Transition headings are caller-owned so mode, move, and future concrete transitions cannot
 // silently inherit a read-command outcome.
-// jscpd:ignore-start
 pub(super) fn write_runner_transition(
     deployment: &str,
     result: &Result<RunnerRegistration, RunnerFailure>,
@@ -300,7 +289,6 @@ pub(super) fn write_runner_transition(
 ) -> anyhow::Result<ExitCode> {
     write_runner(deployment, result, outcome, heading, authentication, json)
 }
-// jscpd:ignore-end
 
 fn write_runner(
     deployment: &str,
@@ -687,7 +675,6 @@ fn write_failure_with_context(
     };
     // Runner failures own a closed machine vocabulary distinct from organization
     // failures, so the small stream-selection adapter remains domain-local.
-    // jscpd:ignore-start
     let (runner_id, runner_pool_id) = match target {
         Some(DeletionTarget::Runner(id)) => (Some(id), None),
         Some(DeletionTarget::Pool(id)) => (None, Some(id)),
@@ -732,7 +719,6 @@ fn write_failure_with_context(
             )?;
         }
     }
-    // jscpd:ignore-end
     Ok(outcome_class.exit_code())
 }
 
@@ -785,7 +771,6 @@ struct RunnerListResult<'a> {
 
 // This schema intentionally excludes organization-only retry metadata and must
 // remain an independently reviewable machine contract.
-// jscpd:ignore-start
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct FailureResult<'a> {
@@ -841,7 +826,6 @@ struct PoolDeletionUnknown<'a> {
     runner_pool_id: &'a str,
     commitment: &'static str,
 }
-// jscpd:ignore-end
 
 #[cfg(test)]
 mod tests {

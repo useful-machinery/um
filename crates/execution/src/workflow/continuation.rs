@@ -305,7 +305,6 @@ fn check_body_references(step: &ValidatedStep, references: &mut BTreeSet<Resolve
         ValidatedStep::Agent(agent) => {
             // Document validation and resolved-reference admission traverse distinct types.
             // Keeping these traversals separate makes the admission boundary explicit.
-            // jscpd:ignore-start
             for source in agent
                 .agent
                 .message
@@ -317,7 +316,6 @@ fn check_body_references(step: &ValidatedStep, references: &mut BTreeSet<Resolve
                     add_reference(source, references);
                 }
             }
-            // jscpd:ignore-end
         }
     }
 }

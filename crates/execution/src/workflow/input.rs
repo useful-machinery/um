@@ -354,7 +354,6 @@ impl InputStaging {
 
     // Each concrete staging owner keeps a typed release API while delegating the
     // shared preserve-on-drop transition to StagingDropPolicy.
-    // jscpd:ignore-start
     pub fn release(&self) -> Result<(), InputStagingReleaseFailure> {
         self.inner.cleanup()
     }
@@ -366,7 +365,6 @@ impl InputStaging {
     pub fn preserve_on_drop(&self) {
         self.inner.drop_policy.preserve_on_drop();
     }
-    // jscpd:ignore-end
 
     fn reserve(
         &self,
@@ -610,7 +608,6 @@ impl InputStagingInner {
 
     // Input reservations and agent views have different ledgers after the shared
     // preservation check, so keeping their deletion transitions local is clearer.
-    // jscpd:ignore-start
     fn remove_view(&self, identity: &str) -> bool {
         if self.drop_policy.is_preserved() {
             return true;
@@ -631,7 +628,6 @@ impl InputStagingInner {
         }
         cleaned
     }
-    // jscpd:ignore-end
 
     fn remove_view_entry(&self, identity: &str) -> bool {
         if self.cleanup_blocker.is_blocked() {
