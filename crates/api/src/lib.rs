@@ -447,6 +447,52 @@ mod tests {
     }
 
     #[test]
+    fn generated_continuation_envelopes_keep_staged_portable_absence() {
+        use generated::models;
+        for (stage, encoded) in [
+            (
+                "pending",
+                include_str!("../tests/fixtures/run-continuation-pending.json"),
+            ),
+            (
+                "ready",
+                include_str!("../tests/fixtures/run-continuation-ready.json"),
+            ),
+            (
+                "unavailable",
+                include_str!("../tests/fixtures/run-continuation-unavailable.json"),
+            ),
+        ] {
+            let envelope: models::RunContinuationEnvelope =
+                serde_json::from_str(encoded).expect("decode public continuation envelope");
+            assert_eq!(envelope.request.attempt_id, envelope.run.current_attempt_id);
+            assert_eq!(
+                envelope.request.attempt_number,
+                envelope.run.current_attempt_number
+            );
+            assert_eq!(envelope.request.reexecuted_steps, vec!["rerun"]);
+            assert_eq!(envelope.request.inherited_steps[0].id, "produce");
+            assert!(envelope.run.artifact_delivery.is_none());
+            assert_eq!(
+                envelope.run.portable_result,
+                models::run::PortableResult::Absent
+            );
+            let workspace = &envelope
+                .run
+                .continuation
+                .as_ref()
+                .expect("continuation")
+                .workspace;
+            let actual =
+                serde_json::to_value(workspace.preparation).expect("serialize preparation");
+            assert_eq!(actual, stage);
+            assert_eq!(workspace.execution_root, "/runner/work");
+            assert_eq!(workspace.prior_execution_root, "/runner/work");
+            assert_eq!(workspace.start_snapshot.is_some(), stage == "ready");
+        }
+    }
+
+    #[test]
     fn generated_linear_callback_accepts_declared_html_response() {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let body = "<!doctype html><p>Authorization received.</p>";

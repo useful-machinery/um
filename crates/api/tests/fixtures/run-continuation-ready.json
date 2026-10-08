@@ -1,0 +1,137 @@
+{
+  "request": {
+    "requestId": "cmd_01k0z6r1w8f4jy2m7q9v3x5abc",
+    "organizationId": "org_01k0z6r1w8f4jy2m7q9v3x5abc",
+    "runId": "run_01k0z6r1w8f4jy2m7q9v3x5abc",
+    "attemptId": "atm_01k0z6r1w8f4jy2m7q9v3x5abd",
+    "attemptNumber": 2,
+    "acceptedAt": "2026-08-23T12:01:00Z",
+    "definitionSource": {
+      "repositoryConnectionId": "rpc_01k0z6r1w8f4jy2m7q9v3x5abc",
+      "objectFormat": "sha1",
+      "commitOid": "0123456789abcdef0123456789abcdef01234567",
+      "workflowPath": "workflows/build.yaml",
+      "workflowSourceClosureDigest": {
+        "algorithm": "sha256",
+        "value": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+      }
+    },
+    "reexecutedSteps": [
+      "rerun"
+    ],
+    "inheritedSteps": [
+      {
+        "id": "produce",
+        "priorState": "succeeded",
+        "definitionChanged": false
+      }
+    ]
+  },
+  "run": {
+    "id": "run_01k0z6r1w8f4jy2m7q9v3x5abc",
+    "organizationId": "org_01k0z6r1w8f4jy2m7q9v3x5abc",
+    "projectId": "prj_01k0z6r1w8f4jy2m7q9v3x5abc",
+    "displayName": "Production release",
+    "executionSpecId": "xsp_01k0z6r1w8f4jy2m7q9v3x5abc",
+    "state": "running",
+    "version": 4,
+    "currentAttemptId": "atm_01k0z6r1w8f4jy2m7q9v3x5abd",
+    "currentAttemptNumber": 2,
+    "sourceBranch": "main",
+    "workflowDefinitionSource": {
+      "repositoryConnectionId": "rpc_01k0z6r1w8f4jy2m7q9v3x5abc",
+      "objectFormat": "sha1",
+      "commitOid": "0123456789abcdef0123456789abcdef01234567",
+      "workflowPath": "workflows/build.yaml",
+      "workflowSourceClosureDigest": {
+        "algorithm": "sha256",
+        "value": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+      }
+    },
+    "primaryWorkspaceSource": {
+      "kind": "connected_repository",
+      "providerKind": "github",
+      "repositoryConnectionId": "rpc_01k0z6r1w8f4jy2m7q9v3x5abc",
+      "objectFormat": "sha1",
+      "commitOid": "0123456789abcdef0123456789abcdef01234567",
+      "materializationContract": "git_full_clone_v1"
+    },
+    "sourceDisplaySnapshot": {
+      "organizationDisplayName": "Example Organization",
+      "projectName": "example-project",
+      "repository": {
+        "providerKind": "github",
+        "fullName": "example/repository"
+      }
+    },
+    "inputs": {
+      "inputSetId": "ris_01k0z6r1w8f4jy2m7q9v3x5abc",
+      "attachmentCount": 2,
+      "aggregateBytes": 42,
+      "availability": "available",
+      "inputCount": 2
+    },
+    "integrationContext": {
+      "issueId": "abc-123",
+      "source": "linear"
+    },
+    "publication": null,
+    "cancellation": null,
+    "interruption": null,
+    "failure": null,
+    "rejection": null,
+    "artifactDelivery": null,
+    "portableResult": "absent",
+    "continuation": {
+      "request": {
+        "fromSteps": [
+          "rerun"
+        ],
+        "definition": "inherited"
+      },
+      "fromSteps": [
+        "rerun"
+      ],
+      "reexecutedSteps": [
+        "rerun"
+      ],
+      "inheritedSteps": [
+        {
+          "id": "produce",
+          "priorState": "succeeded",
+          "definitionChanged": false
+        }
+      ],
+      "definitionSource": {
+        "kind": "inherited",
+        "manifestDigest": {
+          "algorithm": "sha256",
+          "value": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        },
+        "priorManifestDigest": {
+          "algorithm": "sha256",
+          "value": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        }
+      },
+      "workspace": {
+        "executionRoot": "/runner/work",
+        "priorExecutionRoot": "/runner/work",
+        "preparation": "ready",
+        "startSnapshot": {
+          "algorithm": "git_worktree_sha256_v1",
+          "unavailable": "not_work_tree"
+        },
+        "priorSettlementSnapshot": null,
+        "modified": "unknown",
+        "quiescence": {
+          "groupsRecorded": 1,
+          "groupsTerminated": 1,
+          "groupsAbsent": 0,
+          "provenAt": "2026-08-23T12:02:00Z"
+        }
+      }
+    },
+    "createdAt": "2026-08-23T12:00:00Z",
+    "updatedAt": "2026-08-23T12:00:00Z"
+  }
+}
