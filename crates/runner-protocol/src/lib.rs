@@ -931,18 +931,19 @@ pub fn encode_runner_frame(frame: &RunnerFrame) -> Result<Vec<u8>, EncodeError> 
             execution_event_sequence,
             workflow_event,
             diagnostic,
-        } => {
-            let mut payload = json!({
-                "assignmentId": assignment_id,
-                "attemptId": attempt_id,
-                "executionEventSequence": execution_event_sequence,
-                "workflowEvent": workflow_event,
-            });
-            if let Some(diagnostic) = diagnostic {
-                payload["diagnostic"] = diagnostic.clone();
-            }
-            runner_frame_value(envelope, "execution_transition", payload)
-        }
+        } => runner_frame_value(
+            envelope,
+            "execution_transition",
+            with_runner_diagnostic(
+                json!({
+                    "assignmentId": assignment_id,
+                    "attemptId": attempt_id,
+                    "executionEventSequence": execution_event_sequence,
+                    "workflowEvent": workflow_event,
+                }),
+                diagnostic,
+            ),
+        ),
         RunnerFrame::ExecutionFinished {
             envelope,
             assignment_id,
@@ -951,19 +952,20 @@ pub fn encode_runner_frame(frame: &RunnerFrame) -> Result<Vec<u8>, EncodeError> 
             outcome,
             artifact_delivery,
             diagnostic,
-        } => {
-            let mut payload = json!({
-                "assignmentId": assignment_id,
-                "attemptId": attempt_id,
-                "finalExecutionEventSequence": final_execution_event_sequence,
-                "outcome": outcome,
-                "artifactDelivery": artifact_delivery,
-            });
-            if let Some(diagnostic) = diagnostic {
-                payload["diagnostic"] = diagnostic.clone();
-            }
-            runner_frame_value(envelope, "execution_finished", payload)
-        }
+        } => runner_frame_value(
+            envelope,
+            "execution_finished",
+            with_runner_diagnostic(
+                json!({
+                    "assignmentId": assignment_id,
+                    "attemptId": attempt_id,
+                    "finalExecutionEventSequence": final_execution_event_sequence,
+                    "outcome": outcome,
+                    "artifactDelivery": artifact_delivery,
+                }),
+                diagnostic,
+            ),
+        ),
         RunnerFrame::ExecutionInterrupted {
             envelope,
             assignment_id,
@@ -1079,6 +1081,13 @@ pub fn encode_runner_frame(frame: &RunnerFrame) -> Result<Vec<u8>, EncodeError> 
             Err(EncodeError::Serialization)
         }
     }
+}
+
+fn with_runner_diagnostic(mut payload: Value, diagnostic: &Option<Value>) -> Value {
+    if let Some(diagnostic) = diagnostic {
+        payload["diagnostic"] = diagnostic.clone();
+    }
+    payload
 }
 
 fn runner_frame_value(envelope: &RunnerEnvelope, frame_type: &str, payload: Value) -> Value {
@@ -2955,6 +2964,44 @@ mod tests {
                 "artifactSetId": "ats_07zzzzzzzzzzzzzzzzzzzzzzzz",
             }),
         }
+    }
+
+    #[test]
+    fn failed_node_diagnostic_is_a_validated_sibling() {
+        let mut frame = maximal_recovery_terminal_frame();
+        let RunnerFrame::ExecutionFinished {
+            diagnostic,
+            outcome,
+            ..
+        } = &mut frame
+        else {
+            panic!("expected terminal frame");
+        };
+        *outcome = json!({"outcome": "failed", "forceAbort": null,
+            "primaryIssue": {"node": {"id": "agent", "role": "step"}, "state": "failed",
+                "detail": {"phase": "execution", "code": "harness_failed"}}});
+        *diagnostic = Some(json!({"harnessError": "future_value", "httpStatus": 503}));
+        let encoded =
+            encode_runner_frame(&frame).unwrap_or_else(|error| panic!("{error:?} {frame:?}"));
+        assert!(matches!(decode_frame(&encoded), Ok(ValidatedFrame::Runner)));
+        let value: Value = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(
+            value["payload"]["diagnostic"],
+            json!({"harnessError": "future_value", "httpStatus": 503})
+        );
+        assert!(
+            value["payload"]["outcome"]["primaryIssue"]
+                .get("diagnostic")
+                .is_none()
+        );
+        let RunnerFrame::ExecutionFinished { diagnostic, .. } = &mut frame else {
+            panic!("expected terminal frame");
+        };
+        *diagnostic = Some(json!({"message": "private sentinel"}));
+        assert!(matches!(
+            encode_runner_frame(&frame),
+            Err(EncodeError::InvalidFrame("schema"))
+        ));
     }
 
     #[test]

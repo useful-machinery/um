@@ -921,7 +921,26 @@ impl ExecutionJob {
 
     pub(super) fn describe_report(&self, report: &ExecutionReport) {
         match report {
-            ExecutionReport::Finished { outcome, .. } => {
+            ExecutionReport::Finished {
+                outcome,
+                diagnostic,
+                ..
+            } => {
+                if let Some(diagnostic) = diagnostic {
+                    for (field, attribute) in [
+                        ("harnessError", "um.diagnostic.harness_error"),
+                        ("httpStatus", "um.diagnostic.http_status"),
+                    ] {
+                        if let Some(value) = diagnostic.get(field) {
+                            if let Some(value) = value.as_str() {
+                                self.run_event
+                                    .set(KeyValue::new(attribute, value.to_owned()));
+                            } else if let Some(value) = value.as_i64() {
+                                self.run_event.set(KeyValue::new(attribute, value));
+                            }
+                        }
+                    }
+                }
                 match outcome["outcome"].as_str() {
                     Some("succeeded") => self.run_event.result("succeeded"),
                     Some("failed") => {

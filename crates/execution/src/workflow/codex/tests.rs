@@ -2366,11 +2366,79 @@ fn bounded_native_error_prose_does_not_replace_structured_identity() {
         parser.finish(true),
         AgentOutcome::Failed(
             AgentFailureCause::HarnessFailed {
-                detail: AgentHarnessFailureDetail::ModelError,
+                detail: AgentHarnessFailureDetail::Classified {
+                    canonical: CanonicalHarnessFailure::ModelError,
+                    diagnostic: HarnessFailureDiagnostic::from_code("unauthorized", None),
+                },
             }
             .into(),
         ),
     );
+}
+
+#[test]
+fn structured_codex_failures_project_safe_runner_diagnostics() {
+    use crate::workflow::evidence::{FailurePhase, failure_detail};
+    use crate::workflow::step_runtime::{StepExecutionFailure, StepFailureCause};
+
+    for (info, expected) in [
+        (
+            json!("contextWindowExceeded"),
+            json!({"harnessError": "context_window_exceeded"}),
+        ),
+        (
+            json!("usageLimitExceeded"),
+            json!({"harnessError": "usage_limit_exceeded"}),
+        ),
+        (
+            json!("unauthorized"),
+            json!({"harnessError": "unauthorized"}),
+        ),
+        (
+            json!("serverOverloaded"),
+            json!({"harnessError": "overloaded"}),
+        ),
+        (
+            json!({"responseStreamDisconnected": {"httpStatusCode": 503}}),
+            json!({"harnessError": "stream_disconnected", "httpStatus": 503}),
+        ),
+        (json!("flexUnavailable"), json!({"harnessError": "other"})),
+    ] {
+        let mut parser = running_parser(AgentValueKind::None, 1024);
+        feed(
+            &mut parser,
+            json!({"method": "turn/completed", "params": {
+                "threadId": "thread-1",
+                "turn": {"id": "turn-1", "items": [], "status": "failed",
+                    "error": {"message": "private sentinel /path token", "codexErrorInfo": info}},
+            }}),
+        )
+        .unwrap();
+        let AgentOutcome::Failed(failure) = parser.finish(true) else {
+            panic!("expected harness failure");
+        };
+        let detail = failure_detail(
+            FailurePhase::Execution,
+            &StepFailureCause::Execution(StepExecutionFailure::Agent(failure)),
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(&detail).unwrap()["code"],
+            "harness_failed"
+        );
+        assert_eq!(detail.runner_diagnostic(), Some(expected));
+        assert!(
+            !serde_json::to_string(&detail.runner_diagnostic())
+                .unwrap()
+                .contains("sentinel")
+        );
+        assert!(
+            serde_json::to_value(&detail)
+                .unwrap()
+                .get("diagnostic")
+                .is_none()
+        );
+    }
 }
 
 #[test]
@@ -2409,7 +2477,10 @@ fn flex_unavailable_preserves_native_failure_and_retry_correlation() {
             parser.finish(true),
             AgentOutcome::Failed(
                 AgentFailureCause::HarnessFailed {
-                    detail: AgentHarnessFailureDetail::ModelError,
+                    detail: AgentHarnessFailureDetail::Classified {
+                        canonical: CanonicalHarnessFailure::ModelError,
+                        diagnostic: HarnessFailureDiagnostic::from_code("other", None),
+                    },
                 }
                 .into()
             ),

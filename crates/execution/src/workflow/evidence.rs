@@ -7,7 +7,9 @@ use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize};
 
 use super::admission::CancellationReason;
-use super::agent::{AgentFailure, AgentFailureCause};
+use super::agent::{
+    AgentFailure, AgentFailureCause, AgentHarnessFailureDetail, HarnessFailureDiagnostic,
+};
 use super::agent_input::AgentInputStartFailure;
 use super::artifact::CaptureFailureKind;
 use super::git_capture::GitCaptureFailure;
@@ -138,7 +140,7 @@ pub(crate) enum FailureCode {
     OutputStagingUnavailable,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FailureDetail {
     pub(crate) phase: FailurePhase,
@@ -158,6 +160,22 @@ pub struct FailureDetail {
         serialize_with = "serialize_failure_pointer"
     )]
     pub(crate) pointer: Option<Arc<str>>,
+    // Transport-only sidecar. Not canonical node evidence or part of its equality.
+    #[serde(skip)]
+    harness_diagnostic: Option<HarnessFailureDiagnostic>,
+}
+
+impl PartialEq for FailureDetail {
+    fn eq(&self, other: &Self) -> bool {
+        self.phase == other.phase
+            && self.code == other.code
+            && self.input == other.input
+            && self.collection_index == other.collection_index
+            && self.output == other.output
+            && self.exit_code == other.exit_code
+            && self.r#ref == other.r#ref
+            && self.pointer == other.pointer
+    }
 }
 
 fn serialize_failure_pointer<S: serde::Serializer>(
@@ -201,6 +219,7 @@ impl<'de> Deserialize<'de> for FailureDetail {
             exit_code: wire.exit_code,
             r#ref: wire.r#ref,
             pointer: wire.pointer.map(Arc::from),
+            harness_diagnostic: None,
         };
         detail.validate().map_err(D::Error::custom)?;
         Ok(detail)
@@ -218,6 +237,7 @@ impl FailureDetail {
             exit_code: None,
             r#ref: None,
             pointer: None,
+            harness_diagnostic: None,
         }
     }
 
@@ -239,9 +259,23 @@ impl FailureDetail {
             exit_code,
             r#ref: None,
             pointer: None,
+            harness_diagnostic: None,
         };
         detail.validate()?;
         Ok(detail)
+    }
+
+    /// Safe runner-protocol sibling; no message, provider text, or canonical fields.
+    pub fn runner_diagnostic(&self) -> Option<serde_json::Value> {
+        let diagnostic = self.harness_diagnostic?;
+        let mut object = serde_json::Map::new();
+        if let Some(error) = diagnostic.harness_error {
+            object.insert("harnessError".to_owned(), serde_json::json!(error));
+        }
+        if let Some(status) = diagnostic.http_status {
+            object.insert("httpStatus".to_owned(), serde_json::json!(status));
+        }
+        (!object.is_empty()).then_some(serde_json::Value::Object(object))
     }
 
     fn validate(&self) -> Result<(), EvidenceError> {
@@ -695,6 +729,13 @@ impl<'de> Deserialize<'de> for PrimaryIssue {
 }
 
 impl PrimaryIssue {
+    pub fn runner_diagnostic(&self) -> Option<serde_json::Value> {
+        match &self.detail {
+            PrimaryIssueDetail::Failed(detail) => detail.runner_diagnostic(),
+            PrimaryIssueDetail::Blocked(_) => None,
+        }
+    }
+
     pub(crate) fn failed(node: WorkflowNode, detail: FailureDetail) -> Self {
         Self {
             node,
@@ -904,7 +945,7 @@ fn working_directory_detail(source: &WorkingDirectoryFailure) -> FailureDetail {
 }
 
 fn agent_failure_detail(phase: FailurePhase, source: &AgentFailure) -> FailureDetail {
-    code(
+    let mut detail = code(
         phase,
         match source.cause() {
             AgentFailureCause::HarnessStartFailed { .. }
@@ -921,7 +962,14 @@ fn agent_failure_detail(phase: FailurePhase, source: &AgentFailure) -> FailureDe
             AgentFailureCause::CapturedValueTooLarge => FailureCode::CapturedValueTooLarge,
             AgentFailureCause::ResultSettlementFailed => FailureCode::ResultSettlementFailed,
         },
-    )
+    );
+    if let AgentFailureCause::HarnessFailed {
+        detail: AgentHarnessFailureDetail::Classified { diagnostic, .. },
+    } = source.cause()
+    {
+        detail.harness_diagnostic = Some(*diagnostic);
+    }
+    detail
 }
 
 fn execution_failure_detail(source: &StepExecutionFailure) -> FailureDetail {
@@ -1088,6 +1136,58 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn harness_diagnostic_is_sibling_only_and_never_changes_canonical_evidence() {
+        use super::super::agent::CanonicalHarnessFailure;
+
+        let cause = |harness_error| {
+            StepFailureCause::Execution(StepExecutionFailure::Agent(AgentFailure::new(
+                AgentFailureCause::HarnessFailed {
+                    detail: AgentHarnessFailureDetail::Classified {
+                        canonical: CanonicalHarnessFailure::ModelError,
+                        diagnostic: HarnessFailureDiagnostic::from_code(harness_error, Some(429)),
+                    },
+                },
+            )))
+        };
+        let classified =
+            failure_detail(FailurePhase::Execution, &cause("rate_limit_error")).unwrap();
+        let other = failure_detail(
+            FailurePhase::Execution,
+            &cause("private sentinel /path token"),
+        )
+        .unwrap();
+        let unclassified = failure_detail(
+            FailurePhase::Execution,
+            &StepFailureCause::Execution(StepExecutionFailure::Agent(AgentFailure::new(
+                AgentFailureCause::HarnessFailed {
+                    detail: AgentHarnessFailureDetail::ModelError,
+                },
+            ))),
+        )
+        .unwrap();
+        assert_eq!(classified, other);
+        assert_eq!(classified, unclassified);
+        assert_eq!(
+            classified.runner_diagnostic(),
+            Some(json!({"harnessError": "rate_limited", "httpStatus": 429}))
+        );
+        assert_eq!(
+            other.runner_diagnostic(),
+            Some(json!({"harnessError": "other", "httpStatus": 429}))
+        );
+        assert_eq!(unclassified.runner_diagnostic(), None);
+        assert_eq!(
+            serde_json::to_value(&classified).unwrap(),
+            serde_json::to_value(&unclassified).unwrap()
+        );
+        assert!(
+            !serde_json::to_string(&other.runner_diagnostic())
+                .unwrap()
+                .contains("sentinel")
+        );
+    }
 
     #[test]
     fn blocked_detail_deduplicates_and_sorts_exact_pairs() {

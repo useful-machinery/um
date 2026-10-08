@@ -95,8 +95,9 @@ use super::admission::CancellationReason;
 use super::agent::{
     AgentDiagnosticLevel, AgentFailure, AgentFailureCause, AgentHarnessFailureDetail,
     AgentLifecycleMilestone, AgentObservation, AgentProtocolRejectionDiagnostic,
-    AgentToolCallPhase, AgentValueKind, BoundedAgentResponse, CapturedJson,
-    CompletedAgentInvocation, failed_agent_outcome, tool_call_observation,
+    AgentToolCallPhase, AgentValueKind, BoundedAgentResponse, CanonicalHarnessFailure,
+    CapturedJson, CompletedAgentInvocation, HarnessFailureDiagnostic, failed_agent_outcome,
+    tool_call_observation,
 };
 
 const SESSION_VERSION: u64 = 3;
@@ -1524,7 +1525,26 @@ impl PiJsonV1Parser {
                     ))
                 }
             },
-            StopReason::Error => harness_failure(AgentHarnessFailureDetail::ModelError),
+            StopReason::Error => {
+                // Pi's errorMessage is prose. Only the structured error code and numeric
+                // HTTP status from the final assistant's error diagnostic are eligible.
+                let classified = assistant.diagnostics.iter().rev().find_map(|entry| {
+                    let error = entry.error.as_ref()?.as_object()?;
+                    let code = error.get("code").and_then(Value::as_str).unwrap_or("other");
+                    let status = error
+                        .get("status")
+                        .and_then(Value::as_u64)
+                        .and_then(|status| u16::try_from(status).ok());
+                    Some(HarnessFailureDiagnostic::from_code(code, status))
+                });
+                harness_failure(classified.map_or(
+                    AgentHarnessFailureDetail::ModelError,
+                    |diagnostic| AgentHarnessFailureDetail::Classified {
+                        canonical: CanonicalHarnessFailure::ModelError,
+                        diagnostic,
+                    },
+                ))
+            }
             StopReason::Aborted => harness_failure(AgentHarnessFailureDetail::ModelAborted),
             StopReason::Pending => self.protocol_failure_outcome(
                 PiJsonV1RejectionReason::TerminalInvariantInvalid,

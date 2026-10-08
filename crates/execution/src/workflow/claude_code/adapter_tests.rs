@@ -1993,7 +1993,7 @@ async fn production_failure_matrix_uses_only_existing_typed_outcomes() {
         )
         .unwrap();
         let (_, outcome, started) = run_fixture_allowing_start_failure(fixture).await;
-        assert!(started);
+        assert!(started, "fixture exit {exit_status}: {outcome:?}");
         assert_agent_failure(&outcome, cause);
     }
 

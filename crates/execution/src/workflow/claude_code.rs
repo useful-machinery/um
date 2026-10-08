@@ -99,8 +99,9 @@ use serde_json::{Map, Value, json};
 use super::agent::{
     AgentDiagnosticLevel, AgentFailure, AgentFailureCause, AgentHarnessFailureDetail,
     AgentLifecycleMilestone, AgentObservation, AgentOutcome, AgentProtocolRejectionDiagnostic,
-    AgentToolCallPhase, AgentValueKind, BoundedAgentResponse, CapturedJson,
-    CompletedAgentInvocation, failed_agent_outcome, tool_call_observation,
+    AgentToolCallPhase, AgentValueKind, BoundedAgentResponse, CanonicalHarnessFailure,
+    CapturedJson, CompletedAgentInvocation, HarnessFailureDiagnostic, failed_agent_outcome,
+    tool_call_observation,
 };
 #[cfg(test)]
 const QUALIFICATION_VERSION: &str =
@@ -426,6 +427,7 @@ pub(crate) struct ClaudeCodeStreamJsonV1Parser {
     result_decision_pending: bool,
     accepted_result: Option<CapturedJson>,
     native_failure: Option<AgentHarnessFailureDetail>,
+    native_api_error: Option<HarnessFailureDiagnostic>,
     retry_active: bool,
     observations: Vec<AgentObservation>,
     rejection_context: ClaudeCodeStreamJsonV1RejectionContext,
@@ -483,6 +485,7 @@ impl ClaudeCodeStreamJsonV1Parser {
             result_decision_pending: false,
             accepted_result: None,
             native_failure: None,
+            native_api_error: None,
             retry_active: false,
             observations: Vec::new(),
             rejection_context: ClaudeCodeStreamJsonV1RejectionContext::default(),
@@ -560,6 +563,7 @@ impl ClaudeCodeStreamJsonV1Parser {
         self.final_main_message = None;
         self.exchange_structured_output_candidates = 0;
         self.native_failure = None;
+        self.native_api_error = None;
         Ok(())
     }
 
@@ -1386,11 +1390,17 @@ impl ClaudeCodeStreamJsonV1Parser {
                 .filter(|_| required_string(block, "type") == Some("text"))
                 .ok_or_else(|| self.protocol_failure())?;
             if self.active_message.is_some()
-                || required_nonempty_string(object, "error").is_none()
                 || required_nonempty_string(object, "request_id").is_none()
             {
                 return Err(self.protocol_failure());
             }
+            let code =
+                required_nonempty_string(object, "error").ok_or_else(|| self.protocol_failure())?;
+            let http_status = object
+                .get("api_error_status")
+                .and_then(Value::as_u64)
+                .and_then(|status| u16::try_from(status).ok());
+            self.native_api_error = Some(HarnessFailureDiagnostic::from_code(code, http_status));
             self.observations.push(AgentObservation::Diagnostic {
                 level: AgentDiagnosticLevel::Error,
                 message: Arc::from(diagnostic),
@@ -1637,7 +1647,34 @@ impl ClaudeCodeStreamJsonV1Parser {
             if terminal_reason == "completed" {
                 return Err(self.protocol_failure());
             }
-            self.native_failure = Some(AgentHarnessFailureDetail::ModelError);
+            // terminal_reason and subtype are harness-owned classifications; result text is not.
+            let code = match terminal_reason {
+                "rate_limit" | "rate_limited" => terminal_reason,
+                "context_window_exceeded"
+                | "prompt_too_long"
+                | "usage_limit_exceeded"
+                | "unauthorized"
+                | "overloaded"
+                | "bad_request"
+                | "server_error"
+                | "sandbox_error" => terminal_reason,
+                _ => subtype,
+            };
+            let http_status = object
+                .get("api_error_status")
+                .and_then(Value::as_u64)
+                .and_then(|status| u16::try_from(status).ok());
+            let mut diagnostic = if terminal_reason == "api_error" {
+                self.native_api_error
+                    .unwrap_or_else(|| HarnessFailureDiagnostic::from_code(code, None))
+            } else {
+                HarnessFailureDiagnostic::from_code(code, None)
+            };
+            diagnostic.http_status = http_status.or(diagnostic.http_status);
+            self.native_failure = Some(AgentHarnessFailureDetail::Classified {
+                canonical: CanonicalHarnessFailure::ModelError,
+                diagnostic,
+            });
         }
 
         let completes_harness = self.value_kind != AgentValueKind::Result;

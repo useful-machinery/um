@@ -511,15 +511,25 @@ impl ExecutionObserver<RunnerExecutionInstant> for RunnerExecutionObserver {
                     phase: *phase,
                 });
             }
+            let diagnostic = match transition.step.as_ref() {
+                Some(ObservedStepTransition::Failed { detail }) => detail.runner_diagnostic(),
+                _ => None,
+            };
             let workflow_event =
                 workflow_event(&transition, invocation_evidence.as_ref(), state.force_abort);
-            let diagnostic = (workflow_event["to"] == "failed")
-                .then(|| workflow_event.get("stepId").and_then(Value::as_str))
-                .flatten()
-                .zip(workflow_event.get("detail"))
-                .and_then(|(step, detail)| {
-                    git_capture_diagnostic(step, detail, &observer.invocation_evidence.diagnostics)
-                });
+            let diagnostic = diagnostic.or_else(|| {
+                (workflow_event["to"] == "failed")
+                    .then(|| workflow_event.get("stepId").and_then(Value::as_str))
+                    .flatten()
+                    .zip(workflow_event.get("detail"))
+                    .and_then(|(step, detail)| {
+                        git_capture_diagnostic(
+                            step,
+                            detail,
+                            &observer.invocation_evidence.diagnostics,
+                        )
+                    })
+            });
             let enqueued = observer.outbox.enqueue(AssignmentObservation::Execution {
                 assignment_id: observer.assignment_id.clone(),
                 attempt_id: observer.attempt_id.clone(),

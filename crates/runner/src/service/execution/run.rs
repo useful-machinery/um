@@ -714,7 +714,7 @@ impl ExecutionJob {
                 diagnostic: None,
             },
             RunOutcome::Failed { primary_issue, .. } => ExecutionReport::Finished {
-                diagnostic: {
+                diagnostic: primary_issue.runner_diagnostic().or_else(|| {
                     let issue = workflow_issue(&primary_issue);
                     issue
                         .get("node")
@@ -724,7 +724,7 @@ impl ExecutionJob {
                         .and_then(|(step, detail)| {
                             git_capture_diagnostic(step, detail, &diagnostics)
                         })
-                },
+                }),
                 final_execution_event_sequence: last_sequence,
                 outcome: terminal_outcome(
                     "failed",

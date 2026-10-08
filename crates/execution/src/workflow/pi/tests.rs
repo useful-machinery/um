@@ -663,6 +663,56 @@ fn native_retry_observations_do_not_override_the_final_response() {
 }
 
 #[test]
+fn pi_structured_error_code_projects_only_safe_fields() {
+    for (code, status, expected) in [
+        (
+            json!("context_window_exceeded"),
+            Some(429),
+            "context_window_exceeded",
+        ),
+        (json!("rate_limit"), Some(429), "rate_limited"),
+        (json!("unknown_provider_code"), Some(429), "other"),
+        (json!(42), Some(429), "other"),
+        (Value::Null, Some(429), "other"),
+        (Value::Null, None, "other"),
+    ] {
+        let mut message = assistant(json!([]), "error", 2);
+        message["errorMessage"] = json!("private sentinel /path token");
+        message["diagnostics"] = json!([{"type": "provider", "timestamp": 2,
+            "error": {"message": "private sentinel /path token", "code": code, "status": status}}]);
+        let error = message["diagnostics"][0]["error"].as_object_mut().unwrap();
+        if code.is_null() {
+            error.remove("code");
+        }
+        if status.is_none() {
+            error.remove("status");
+        }
+        let replay = replay(&terminal_transcript(message), AgentValueKind::None);
+        let AgentOutcome::Failed(failure) = replay.outcome else {
+            panic!("expected failure");
+        };
+        let AgentFailureCause::HarnessFailed {
+            detail: AgentHarnessFailureDetail::Classified { diagnostic, .. },
+        } = failure.cause()
+        else {
+            panic!("expected classified failure");
+        };
+        assert_eq!(diagnostic.harness_error, Some(expected));
+        assert_eq!(diagnostic.http_status, status);
+        let detail = crate::workflow::evidence::failure_detail(
+            crate::workflow::evidence::FailurePhase::Execution,
+            &crate::workflow::step_runtime::StepFailureCause::Execution(
+                crate::workflow::step_runtime::StepExecutionFailure::Agent(failure),
+            ),
+        )
+        .unwrap();
+        let projected = detail.runner_diagnostic().unwrap();
+        assert_eq!(projected["harnessError"], expected);
+        assert!(!projected.to_string().contains("sentinel"));
+    }
+}
+
+#[test]
 fn terminal_stop_reason_uses_the_native_mode_table() {
     for (reason, expected) in [
         (

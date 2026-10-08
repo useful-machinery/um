@@ -68,8 +68,8 @@ use serde_json::{Map, Value, json};
 use super::agent::{
     AgentDiagnosticLevel, AgentFailureCause, AgentHarnessFailureDetail, AgentHarnessSetupStage,
     AgentLifecycleMilestone, AgentObservation, AgentOutcome, AgentProtocolRejectionDiagnostic,
-    AgentToolCallPhase, AgentValueKind, BoundedAgentResponse, CapturedJson,
-    CompletedAgentInvocation,
+    AgentToolCallPhase, AgentValueKind, BoundedAgentResponse, CanonicalHarnessFailure,
+    CapturedJson, CompletedAgentInvocation, HarnessFailureDiagnostic,
 };
 
 const MAXIMUM_FRAME_BYTES: u64 = 16 * 1024 * 1024;
@@ -393,12 +393,25 @@ struct CodexErrorInfo {
 }
 
 impl CodexErrorInfo {
-    const fn failure_detail(self) -> AgentHarnessFailureDetail {
-        match self.kind {
-            CodexErrorKind::ResponseStreamDisconnected => {
-                AgentHarnessFailureDetail::ModelOutputTruncated
-            }
-            _ => AgentHarnessFailureDetail::ModelError,
+    fn failure_detail(self, truncated: bool) -> AgentHarnessFailureDetail {
+        let code = match self.kind {
+            CodexErrorKind::ContextWindowExceeded => "contextWindowExceeded",
+            CodexErrorKind::UsageLimitExceeded => "usageLimitExceeded",
+            CodexErrorKind::Unauthorized => "unauthorized",
+            CodexErrorKind::ServerOverloaded => "serverOverloaded",
+            CodexErrorKind::BadRequest => "badRequest",
+            CodexErrorKind::InternalServerError => "internalServerError",
+            CodexErrorKind::SandboxError => "sandboxError",
+            CodexErrorKind::ResponseStreamDisconnected => "responseStreamDisconnected",
+            _ => "other",
+        };
+        AgentHarnessFailureDetail::Classified {
+            canonical: if truncated || self.kind == CodexErrorKind::ResponseStreamDisconnected {
+                CanonicalHarnessFailure::ModelOutputTruncated
+            } else {
+                CanonicalHarnessFailure::ModelError
+            },
+            diagnostic: HarnessFailureDiagnostic::from_code(code, self.http_status_code),
         }
     }
 }
@@ -2473,18 +2486,19 @@ impl CodexAppServerV1Parser {
             return Err(self.failure_for_current_phase());
         }
         let selected = terminal.or(native);
-        if selected.is_some_and(|info| {
+        let truncated = selected.is_some_and(|info| {
             info.kind == CodexErrorKind::ResponseStreamDisconnected
                 || info.kind == CodexErrorKind::ResponseTooManyFailedAttempts
                     && self.truncated_provider_stream_seen
-        }) {
-            Ok(AgentHarnessFailureDetail::ModelOutputTruncated)
-        } else {
-            Ok(selected.map_or(
-                AgentHarnessFailureDetail::ModelError,
-                CodexErrorInfo::failure_detail,
-            ))
-        }
+        });
+        Ok(selected.map_or(
+            if truncated {
+                AgentHarnessFailureDetail::ModelOutputTruncated
+            } else {
+                AgentHarnessFailureDetail::ModelError
+            },
+            |info| info.failure_detail(truncated),
+        ))
     }
 
     fn complete_retry(&mut self, recovered: bool) {

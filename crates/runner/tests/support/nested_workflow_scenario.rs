@@ -534,6 +534,11 @@ pub(crate) async fn run_nested_workflow_delivery_failure_scenario(
     // The retaining boot has settled. A new boot can see the durable bytes,
     // but cannot claim the previous boot's workspace, even with exact IDs.
     drop(manager);
+    ensure!(
+        Arc::strong_count(&work_root) == 1,
+        "previous boot still has {} work root owners",
+        Arc::strong_count(&work_root)
+    );
     drop(work_root);
     let replacement_boot = "rbt_01k0z6r1w8f4jy2m7q9v3x5abf";
     let other =

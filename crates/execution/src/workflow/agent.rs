@@ -896,13 +896,83 @@ pub(crate) enum AgentInputKind {
     Message,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq)]
 pub(crate) enum AgentHarnessFailureDetail {
     ModelOutputTruncated,
     UnexpectedTerminalToolUse,
     ModelError,
     ModelAborted,
     UnsuccessfulExit,
+    Classified {
+        canonical: CanonicalHarnessFailure,
+        diagnostic: HarnessFailureDiagnostic,
+    },
+}
+
+// The safe diagnostic is not part of the canonical failure identity. The
+// adapter's more precise sidecar must not change retry or result equality.
+impl PartialEq for AgentHarnessFailureDetail {
+    fn eq(&self, other: &Self) -> bool {
+        std::mem::discriminant(&self.canonical()) == std::mem::discriminant(&other.canonical())
+    }
+}
+
+impl AgentHarnessFailureDetail {
+    fn canonical(self) -> Self {
+        match self {
+            Self::Classified {
+                canonical: CanonicalHarnessFailure::ModelError,
+                ..
+            } => Self::ModelError,
+            Self::Classified {
+                canonical: CanonicalHarnessFailure::ModelOutputTruncated,
+                ..
+            } => Self::ModelOutputTruncated,
+            detail => detail,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CanonicalHarnessFailure {
+    ModelError,
+    ModelOutputTruncated,
+}
+
+// Only closed classifications selected from harness protocol fields enter this sidecar.
+// Never copy message text or an unrecognized provider-supplied code into it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct HarnessFailureDiagnostic {
+    pub(crate) harness_error: Option<&'static str>,
+    pub(crate) http_status: Option<u16>,
+}
+
+impl HarnessFailureDiagnostic {
+    pub(crate) fn from_code(code: &str, http_status: Option<u16>) -> Self {
+        let harness_error = match code {
+            "context_window_exceeded" | "contextWindowExceeded" | "prompt_too_long" => {
+                "context_window_exceeded"
+            }
+            "usage_limit_exceeded" | "usageLimitExceeded" => "usage_limit_exceeded",
+            "rate_limited" | "rateLimit" | "rate_limit" | "rate_limit_error" => "rate_limited",
+            "unauthorized"
+            | "authentication_error"
+            | "authentication_failed"
+            | "permission_error" => "unauthorized",
+            "overloaded" | "serverOverloaded" | "overloaded_error" => "overloaded",
+            "bad_request" | "badRequest" | "invalid_request_error" | "invalid_request" => {
+                "bad_request"
+            }
+            "server_error" | "internalServerError" => "server_error",
+            "sandbox_error" | "sandboxError" => "sandbox_error",
+            "stream_disconnected" | "responseStreamDisconnected" => "stream_disconnected",
+            _ => "other",
+        };
+        Self {
+            harness_error: Some(harness_error),
+            http_status,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

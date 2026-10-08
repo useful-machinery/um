@@ -988,6 +988,36 @@ fn result_candidate_requires_correlated_success_acknowledgement() {
 }
 
 #[test]
+fn structured_claude_terminal_reason_is_classified_without_result_text() {
+    for (reason, expected, status) in [
+        ("rate_limit", "rate_limited", None),
+        ("context_window_exceeded", "context_window_exceeded", None),
+        ("prompt_too_long", "context_window_exceeded", Some(400)),
+        ("error_during_execution", "other", None),
+    ] {
+        let frames = framed(&[
+            init(QUALIFICATION_VERSION, SESSION_ID),
+            json!({"type": "result", "subtype": "error_during_execution",
+                "is_error": true, "terminal_reason": reason,
+                "api_error_status": status,
+                "result": "private sentinel /path token", "session_id": SESSION_ID}),
+        ]);
+        let (_, outcome) = replay(&frames, AgentValueKind::None, 1024);
+        let AgentOutcome::Failed(failure) = outcome else {
+            panic!("expected harness failure");
+        };
+        let crate::workflow::agent::AgentFailureCause::HarnessFailed {
+            detail: AgentHarnessFailureDetail::Classified { diagnostic, .. },
+        } = failure.cause()
+        else {
+            panic!("expected structured harness failure");
+        };
+        assert_eq!(diagnostic.harness_error, Some(expected));
+        assert_eq!(diagnostic.http_status, status);
+    }
+}
+
+#[test]
 fn unsuccessful_native_result_and_exit_use_existing_typed_failures() {
     let native_error = framed(&[
         init(QUALIFICATION_VERSION, SESSION_ID),
@@ -1003,7 +1033,10 @@ fn unsuccessful_native_result_and_exit_use_existing_typed_failures() {
     assert_failed(
         outcome,
         AgentFailureCause::HarnessFailed {
-            detail: AgentHarnessFailureDetail::ModelError,
+            detail: AgentHarnessFailureDetail::Classified {
+                canonical: CanonicalHarnessFailure::ModelError,
+                diagnostic: HarnessFailureDiagnostic::from_code("other", None),
+            },
         },
     );
 
@@ -1037,7 +1070,10 @@ fn unsuccessful_native_result_and_exit_use_existing_typed_failures() {
     assert_failed(
         outcome,
         AgentFailureCause::HarnessFailed {
-            detail: AgentHarnessFailureDetail::ModelError,
+            detail: AgentHarnessFailureDetail::Classified {
+                canonical: CanonicalHarnessFailure::ModelError,
+                diagnostic: HarnessFailureDiagnostic::from_code("other", None),
+            },
         },
     );
     assert!(observations.iter().any(|observation| matches!(
@@ -1047,6 +1083,63 @@ fn unsuccessful_native_result_and_exit_use_existing_typed_failures() {
             message,
         } if message.as_ref() == "API Error: controlled rejection"
     )));
+
+    for (code, expected, assistant_status, result_status, selected_status) in [
+        (
+            "rate_limit_error",
+            "rate_limited",
+            Some(429),
+            None,
+            Some(429),
+        ),
+        (
+            "authentication_failed",
+            "unauthorized",
+            Some(401),
+            Some(403),
+            Some(403),
+        ),
+        ("invalid_request", "bad_request", None, Some(400), Some(400)),
+    ] {
+        let api_error = framed(&[
+            init(QUALIFICATION_VERSION, SESSION_ID),
+            json!({"type": "assistant", "message": {
+                "id": "msg-api-error", "model": "<synthetic>", "role": "assistant",
+                "type": "message", "content": [{"type": "text", "text": "private sentinel"}]},
+                "parent_tool_use_id": null, "session_id": SESSION_ID,
+                "error": code, "api_error_status": assistant_status,
+                "request_id": "req-controlled", "is_api_error_message": true}),
+            json!({"type": "result", "subtype": "success", "is_error": true,
+                "terminal_reason": "api_error", "result": "private sentinel",
+                "api_error_status": result_status, "session_id": SESSION_ID}),
+        ]);
+        let (_, outcome) = replay(&api_error, AgentValueKind::None, 1024);
+        let AgentOutcome::Failed(failure) = outcome else {
+            panic!("expected harness failure");
+        };
+        let AgentFailureCause::HarnessFailed {
+            detail: AgentHarnessFailureDetail::Classified { diagnostic, .. },
+        } = failure.cause()
+        else {
+            panic!("expected structured harness error");
+        };
+        assert_eq!(diagnostic.harness_error, Some(expected));
+        assert_eq!(diagnostic.http_status, selected_status);
+        let detail = crate::workflow::evidence::failure_detail(
+            crate::workflow::evidence::FailurePhase::Execution,
+            &crate::workflow::step_runtime::StepFailureCause::Execution(
+                crate::workflow::step_runtime::StepExecutionFailure::Agent(failure),
+            ),
+        )
+        .unwrap();
+        let projected = detail.runner_diagnostic().unwrap();
+        assert_eq!(projected["harnessError"], expected);
+        assert_eq!(
+            projected.get("httpStatus").cloned(),
+            selected_status.map(|s| json!(s))
+        );
+        assert!(!projected.to_string().contains("sentinel"));
+    }
 
     let mut parser = parser(AgentValueKind::None, 1024);
     parser

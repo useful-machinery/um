@@ -495,7 +495,11 @@ fn codex_process_fixture() {
     let scenario = std::env::var("CODEX_FIXTURE_SCENARIO").unwrap();
     assert!(matches!(
         scenario.as_str(),
-        "no-value" | "success-stubborn" | "failure-after-start-stubborn" | "cancellation-stubborn"
+        "no-value"
+            | "success-stubborn"
+            | "failure-after-start"
+            | "failure-after-start-stubborn"
+            | "cancellation-stubborn"
     ));
     let sqlite_home = PathBuf::from(std::env::var_os("CODEX_FIXTURE_SQLITE_HOME").unwrap());
     assert!(sqlite_home.is_absolute());
@@ -607,13 +611,16 @@ fn codex_process_fixture() {
     if scenario == "success-stubborn" || scenario == "failure-after-start-stubborn" {
         materialize_runner_stubborn_descendant();
     }
-    if scenario == "failure-after-start-stubborn" {
+    if matches!(
+        scenario.as_str(),
+        "failure-after-start" | "failure-after-start-stubborn"
+    ) {
         write_codex_fixture_frame(
             &mut output,
             json!({"method": "error", "params": {
                 "threadId": THREAD_ID,
                 "turnId": TURN_ID,
-                "error": {"message": "native execution diagnostic", "codexErrorInfo": "other"},
+                "error": {"message": "private sentinel /path token", "codexErrorInfo": "unauthorized"},
                 "willRetry": false,
             }}),
         );
@@ -625,7 +632,7 @@ fn codex_process_fixture() {
                     "id": TURN_ID,
                     "items": [],
                     "status": "failed",
-                    "error": {"message": "terminal prose differs", "codexErrorInfo": "other"},
+                    "error": {"message": "terminal prose differs", "codexErrorInfo": "unauthorized"},
                 },
             }}),
         );

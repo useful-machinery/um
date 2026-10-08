@@ -394,20 +394,69 @@ async fn codex_success_contains_stubborn_descendants_and_releases_slot() {
 async fn codex_failure_reports_only_after_stubborn_descendants_quiesce() {
     let (temporary, _manager, reports) =
         run_codex_with_stubborn_descendant("failure-after-start-stubborn").await;
+    assert_codex_failure_diagnostic(&reports);
+    assert_codex_fixture_quiescent(&temporary);
+}
 
+#[tokio::test]
+async fn codex_failed_node_and_terminal_report_carry_safe_sibling_diagnostics() {
+    let (_temporary, mut manager) =
+        manager_fixture_with_harnesses(CODEX_ONLY_WORKFLOW, None, None, Some(SUCCESSFUL_CODEX));
+    select_codex_scenario(&mut manager, "failure-after-start");
+    let reports = offer_and_execute(&mut manager).await;
+    assert_codex_failure_diagnostic(&reports);
+}
+
+fn assert_codex_failure_diagnostic(reports: &[ExecutionReport]) {
     assert!(reports.iter().any(|report| matches!(
         report,
-        ExecutionReport::Transition { workflow_event, .. }
+        ExecutionReport::Transition { workflow_event, diagnostic: Some(diagnostic), .. }
             if workflow_event["eventType"] == "step_state_changed"
                 && workflow_event["stepId"] == "codex"
                 && workflow_event["to"] == "failed"
+                && workflow_event["detail"]["code"] == "harness_failed"
+                && workflow_event.get("diagnostic").is_none()
+                && diagnostic == &json!({"harnessError": "unauthorized"})
     )));
     assert!(matches!(
         reports.last(),
-        Some(ExecutionReport::Finished { outcome, .. })
+        Some(ExecutionReport::Finished { outcome, diagnostic: Some(diagnostic), .. })
             if outcome["outcome"] == "failed"
+                && outcome["primaryIssue"]["detail"]["code"] == "harness_failed"
+                && outcome["primaryIssue"].get("diagnostic").is_none()
+                && diagnostic == &json!({"harnessError": "unauthorized"})
     ));
-    assert_codex_fixture_quiescent(&temporary);
+    for (sequence, report) in reports.iter().enumerate() {
+        if matches!(
+            report,
+            ExecutionReport::Transition {
+                diagnostic: Some(_),
+                ..
+            } | ExecutionReport::Finished {
+                diagnostic: Some(_),
+                ..
+            }
+        ) {
+            let frame = report.runner_frame(
+                RunnerEnvelope {
+                    message_id: format!("rmsg_{:026}", sequence + 1),
+                    runner_id: "rnr_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned(),
+                    boot_id: "rbt_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned(),
+                    sequence: (sequence + 1) as u64,
+                    sent_at: NOW.to_owned(),
+                },
+                "asn_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned(),
+                "atm_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned(),
+            );
+            let encoded = encode_runner_frame(&frame).expect("diagnostic is valid on wire");
+            assert!(
+                !String::from_utf8(encoded)
+                    .unwrap()
+                    .contains("private sentinel")
+            );
+        }
+    }
+    assert!(!format!("{reports:?}").contains("private sentinel"));
 }
 
 #[tokio::test]
