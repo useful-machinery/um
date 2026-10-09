@@ -1,6 +1,8 @@
 # Useful Machinery CLI
 
-Useful Machinery CLI turns repeatable engineering work into explicit, durable workflows.
+**SDLC as Code.** Useful Machinery turns your software development lifecycle into
+repeatable workflows, versioned alongside your code.
+
 Define commands and coding agents in one repository-owned YAML file, connect typed
 outputs to downstream steps, run independent work concurrently, and retain a result you
 can inspect instead of reconstructing what happened from terminal scrollback.
@@ -10,11 +12,37 @@ run workflows locally with Pi, Claude Code, and Codex, or serve them from an enr
 outbound runner. The project is early, but the local workflow engine and its authoring,
 execution, and inspection tools are available today.
 
-## Why Useful Machinery
+## Get started
+
+Open your repository in your coding agent and paste this prompt:
+
+```text
+Help me get started with Useful Machinery in this repository.
+
+Retrieve and follow the official onboarding guide:
+https://docs.usefulmachinery.com/agent/onboarding.md
+
+Treat the guide as the source of truth. Inspect my setup first, explain what you recommend, and ask before installing software or modifying files.
+```
+
+The guide helps your agent inspect your setup, verify or propose installation of
+the official CLI, and offer a first repository workflow before guiding you through
+Cloud account setup.
+
+A starter workflow follows `implement → check → review`: you supply the task,
+an agent implements it, your repository checks run, and another agent reviews the
+result. Local workflow authoring and validation do not require a Cloud account.
+
+You can also read the [official onboarding guide](https://docs.usefulmachinery.com/agent/onboarding.md)
+directly. Follow it for current installation and setup guidance.
+
+## Why SDLC as Code?
 
 Coding-agent automation often begins as a loose sequence of shell commands, prompts,
 and copy-and-paste handoffs. That approach becomes difficult to repeat, supervise, and
-recover once work spans several tools or agents. Useful Machinery gives the work a runtime:
+recover once work spans several tools or agents. Keep workflows, prompts, checks,
+and output schemas in source control so changes to your engineering process can
+be reviewed alongside changes to your software. Useful Machinery gives the work a runtime:
 
 - **One graph for commands and agents.** Express control flow and typed data flow in a
   workflow dependency graph instead of coordinating scripts and model sessions by
@@ -48,6 +76,17 @@ Use Useful Machinery to:
 The bundles under [`examples/workflows/`](examples/workflows/) include ready-to-run
 recipes for command data flow, parallel agents, structured results, recovery,
 cancellation, advisory failures, attachments, and finalizers.
+
+## Explore
+
+| I want to… | Start here |
+| --- | --- |
+| See available features and limitations | [Current capabilities](#current-capabilities) |
+| Find workflow examples | [Workflow examples](examples/workflows/README.md) |
+| Learn workflow syntax and semantics | [Workflow V1 reference](https://docs.usefulmachinery.com/reference/workflow-v1.md) |
+| Validate and run a local workflow | [Validation](#local-workflow-validation) and [execution](#local-workflow-execution) |
+| Submit and inspect Cloud runs | [Cloud runs](#cloud-runs) |
+| Understand this public mirror | [Contributing](#contributing) |
 
 ## A workflow at a glance
 
