@@ -2,7 +2,7 @@
 $ um run create --help
 Create a run
 
-Usage: um run create [OPTIONS] --project-id <PROJECT> --workflow-path <WORKFLOW> <ORGANIZATION>
+Usage: um run create [OPTIONS] --project-id <PROJECT> --workflow-path <PATH> <ORGANIZATION>
 
 Arguments:
   <ORGANIZATION>  Organization ID or exact slug
@@ -10,7 +10,7 @@ Arguments:
 Options:
       --project-id <PROJECT>
           Project ID
-      --workflow-path <WORKFLOW>
+      --workflow-path <PATH>
           Canonical repository-relative workflow path
       --source-branch <BRANCH>
           Source branch (the project default when omitted)

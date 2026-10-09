@@ -19,6 +19,575 @@ const REPOSITORY_CONNECTION_ID: &str = "rpc_01k0z6r1w8f4jy2m7q9v3x5abc";
 const INPUT_SET_ID: &str = "ris_01k0z6r1w8f4jy2m7q9v3x5abc";
 const WORKFLOW_PATH: &str = "workflows/build.yaml";
 
+mod continuation_command_tests {
+    use super::*;
+    use std::io::{BufRead, BufReader, Read};
+    use std::net::{TcpListener, TcpStream};
+    #[cfg(target_os = "linux")]
+    use std::process::Stdio;
+    #[cfg(target_os = "linux")]
+    use std::sync::mpsc;
+
+    const REQUEST_ID: &str = "cmd_01k0z6r1w8f4jy2m7q9v3x5abc";
+    const PRIOR: &str = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+    const CURRENT: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    fn projection(state: &str) -> serde_json::Value {
+        let mut run = run_body_with_state(match state {
+            "replaced" => "preparing",
+            "changed-receipt" => "running",
+            "third" => "succeeded",
+            other => other,
+        });
+        if state == "interrupted" {
+            run["interruption"]["phase"] = serde_json::json!("accepted");
+            run["interruption"]["cause"] = serde_json::json!("retained_workspace_unavailable");
+            run["interruption"]["stopConfirmed"] = serde_json::json!(false);
+        }
+        let preparation = if state == "interrupted" {
+            "unavailable"
+        } else if state == "running" || state == "changed-receipt" || state == "third" {
+            "ready"
+        } else {
+            "pending"
+        };
+        run["workflowDefinitionSource"]["workflowSourceClosureDigest"]["value"] =
+            serde_json::json!(PRIOR);
+        run["continuation"] = serde_json::json!({
+            "request": {"fromSteps": ["build", "test"], "definition": "inherited", "expectedRunVersion": 7},
+            "fromSteps": ["build", "test"], "reexecutedSteps": ["build", "test"],
+            "inheritedSteps": [{"id":"source", "priorState":"inherited", "definitionChanged":false}],
+            "definitionSource": {"kind":"inherited", "manifestDigest": {"algorithm":"sha256", "value":PRIOR},
+                "priorManifestDigest":{"algorithm":"sha256", "value":PRIOR}},
+            "workspace": {"executionRoot":"/work/current", "priorExecutionRoot":"/work/prior",
+                "preparation":preparation, "startSnapshot":null, "priorSettlementSnapshot":null,
+                "modified":"unknown", "quiescence":null}
+        });
+        if state == "replaced" {
+            run["continuation"]["definitionSource"]["kind"] = serde_json::json!("replaced");
+            run["continuation"]["definitionSource"]["manifestDigest"]["value"] =
+                serde_json::json!(CURRENT);
+            run["continuation"]["request"]["definition"] = serde_json::json!({"replaced":{
+                "commitOid":"abcdef0123456789abcdef0123456789abcdef01",
+                "workflowPath":"workflows/replacement.yaml"}});
+        }
+        if state == "third" {
+            run["currentAttemptId"] = serde_json::json!("atm_01k0z6r1w8f4jy2m7q9v3x5abd");
+            run["currentAttemptNumber"] = serde_json::json!(3);
+            run["version"] = serde_json::json!(9);
+            run["continuation"]["request"]["fromSteps"] = serde_json::json!(["test"]);
+            run["continuation"]["fromSteps"] = serde_json::json!(["test"]);
+            run["continuation"]["reexecutedSteps"] = serde_json::json!(["test"]);
+            run["continuation"]["inheritedSteps"] = serde_json::json!([
+                {"id":"source", "priorState":"inherited", "definitionChanged":false},
+                {"id":"build", "priorState":"succeeded", "definitionChanged":false}
+            ]);
+            run["continuation"]["definitionSource"]["kind"] = serde_json::json!("replaced");
+            run["continuation"]["definitionSource"]["manifestDigest"]["value"] =
+                serde_json::json!(CURRENT);
+            run["continuation"]["request"]["definition"] = serde_json::json!({"replaced":{
+                "commitOid":"abcdef0123456789abcdef0123456789abcdef01",
+                "workflowPath":"workflows/replacement.yaml"}});
+            run["continuation"]["workspace"]["priorExecutionRoot"] =
+                serde_json::json!("/work/current");
+            run["continuation"]["workspace"]["executionRoot"] = serde_json::json!("/work/third");
+            run["portableResult"] = serde_json::json!("available");
+            run["artifactDelivery"] = serde_json::json!({"state":"succeeded", "artifactSetId":"ats_01k0z6r1w8f4jy2m7q9v3x5abc"});
+        }
+        if preparation == "ready" {
+            run["continuation"]["workspace"]["startSnapshot"] = serde_json::json!({"algorithm":"git_worktree_sha256_v1","value":CURRENT,"takenAt":"2026-08-10T12:00:01Z"});
+            run["continuation"]["workspace"]["quiescence"] = serde_json::json!({"groupsRecorded":0,"groupsTerminated":0,"groupsAbsent":0,"provenAt":"2026-08-10T12:00:01Z"});
+        }
+        run
+    }
+
+    fn envelope(state: &str) -> serde_json::Value {
+        let run = projection(state);
+        let mut definition = projection("preparing")["workflowDefinitionSource"].clone();
+        if state == "replaced" {
+            definition["commitOid"] = serde_json::json!("abcdef0123456789abcdef0123456789abcdef01");
+            definition["workflowPath"] = serde_json::json!("workflows/replacement.yaml");
+            definition["workflowSourceClosureDigest"]["value"] = serde_json::json!(CURRENT);
+        }
+        serde_json::json!({"request":{
+            "requestId":REQUEST_ID,"organizationId":ORGANIZATION_ID,"runId":RUN_ID,
+            "attemptId":ATTEMPT_ID,"attemptNumber":2,"acceptedAt":"2026-08-10T12:00:00Z",
+            "definitionSource":definition,"reexecutedSteps":["build","test"],
+            "inheritedSteps":[{"id":"source","priorState":"inherited","definitionChanged":false}]
+        },"run":run})
+    }
+
+    fn request(stream: &TcpStream) -> String {
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .unwrap();
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        let mut lines = String::new();
+        let mut length = 0;
+        loop {
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            assert!(!line.is_empty());
+            if line == "\r\n" {
+                break;
+            }
+            if line.to_ascii_lowercase().starts_with("content-length:") {
+                length = line.split(':').nth(1).unwrap().trim().parse().unwrap();
+            }
+            lines.push_str(&line);
+        }
+        let mut body = vec![0; length];
+        reader.read_exact(&mut body).unwrap();
+        lines.push_str("\r\n");
+        lines.push_str(std::str::from_utf8(&body).unwrap());
+        lines
+    }
+
+    // Each accepted socket is a scripted response barrier, not a timed race.
+    fn execute(steps: &[&str], args: &[&str]) -> (Output, Vec<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let api_url = format!("http://{}/api", listener.local_addr().unwrap());
+        let directory = private_credential_directory();
+        let credentials = directory.path().join("credentials.json");
+        write_credential_fixture(&credentials, &api_url, TOKEN, "2999-01-01T00:00:00Z");
+        let steps = steps
+            .iter()
+            .map(|step| step.to_string())
+            .collect::<Vec<_>>();
+        let server = std::thread::spawn(move || {
+            let mut requests = Vec::new();
+            for step in steps {
+                let (mut stream, _) = listener.accept().unwrap();
+                let captured = request(&stream);
+                if step == "truncated-401" {
+                    stream.write_all(b"HTTP/1.1 401 Unauthorized\r\nContent-Type: application/problem+json\r\nContent-Length: 100\r\nConnection: close\r\n\r\n{}").unwrap();
+                } else if step != "lost" {
+                    let post = captured.starts_with("POST ");
+                    let status = if post { "201 Created" } else { "200 OK" };
+                    let location = format!(
+                        "/v1/organizations/{ORGANIZATION_ID}/runs/{RUN_ID}/continuation-requests/{REQUEST_ID}"
+                    );
+                    let key = if post {
+                        Some(header_value(&captured, "idempotency-key"))
+                    } else {
+                        None
+                    };
+                    let mut headers = vec![("Cache-Control", "private, no-store")];
+                    if let Some(key) = key {
+                        headers.push(("Location", &location));
+                        headers.push(("Idempotency-Key", key));
+                    }
+                    let mut body = if step == "show-running" {
+                        projection("running")
+                    } else if step == "show-interrupted" {
+                        projection("interrupted")
+                    } else if step == "show-third" {
+                        projection("third")
+                    } else {
+                        envelope(&step)
+                    };
+                    if step == "changed-receipt" {
+                        body["request"]["acceptedAt"] = serde_json::json!("2026-08-11T12:00:00Z");
+                    }
+                    if step == "changed-request" {
+                        body["run"]["continuation"]["request"]["fromSteps"] =
+                            serde_json::json!(["test", "build"]);
+                    }
+                    let response = if step == "admission-version" || step == "admission-node" {
+                        let violation = if step == "admission-version" {
+                            serde_json::json!({"code":"expected_run_version_conflict"})
+                        } else {
+                            serde_json::json!({"code":"continuation_references_unsatisfied", "node":"test", "producer":"source", "reference":"steps.source.outputs.file", "priorState":"failed"})
+                        };
+                        http_response_with_headers("409 Conflict", Some("application/problem+json"), &[],
+                            &serde_json::to_vec(&serde_json::json!({"type":"https://api.usefulmachinery.com/problems/continuation-admission-invalid", "title":"Continuation admission invalid", "status":409, "continuationViolations":[violation]})).unwrap())
+                    } else if step == "not-found" {
+                        http_response_with_headers("404 Not Found", Some("application/problem+json"), &[],
+                            br#"{"type":"https://api.usefulmachinery.com/problems/not-found","title":"Not Found","status":404}"#)
+                    } else {
+                        http_response_with_headers(
+                            status,
+                            Some("application/json"),
+                            &headers,
+                            &serde_json::to_vec(&body).unwrap(),
+                        )
+                    };
+                    stream.write_all(&response).unwrap();
+                }
+                requests.push(captured);
+            }
+            requests
+        });
+        let environment = deployment_environment(&api_url, credentials.to_str().unwrap());
+        let output = run_with_env(args, &environment);
+        (output, server.join().unwrap())
+    }
+
+    fn args() -> Vec<&'static str> {
+        vec![
+            "run",
+            "continue",
+            ORGANIZATION,
+            RUN_ID,
+            "--from",
+            "build",
+            "--from",
+            "test",
+            "--expected-version",
+            "7",
+            "--json",
+            "--allow-insecure-http",
+        ]
+    }
+
+    #[test]
+    fn lost_201_replays_same_request_then_reports_admission_not_execution() {
+        let (output, requests) = execute(&["lost", "preparing"], &args());
+        assert_eq!(output.status.code(), Some(0), "{output:?}");
+        let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(result["outcome"], "accepted");
+        assert_eq!(result["request"]["attemptId"], ATTEMPT_ID);
+        assert_eq!(
+            result["run"]["continuation"]["workspace"]["preparation"],
+            "pending"
+        );
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            header_value(&requests[0], "idempotency-key"),
+            header_value(&requests[1], "idempotency-key")
+        );
+        assert_eq!(
+            header_value(&requests[0], "authorization"),
+            header_value(&requests[1], "authorization")
+        );
+        assert_eq!(
+            requests[0].split("\r\n\r\n").nth(1),
+            requests[1].split("\r\n\r\n").nth(1)
+        );
+        let body: serde_json::Value =
+            serde_json::from_str(requests[0].split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        assert_eq!(
+            body,
+            serde_json::json!({"fromSteps":["build","test"],"definition":"inherited","expectedRunVersion":7})
+        );
+    }
+
+    #[test]
+    fn replacement_pair_is_exact_and_human_output_distinguishes_inheritance() {
+        let mut args = args();
+        args.retain(|arg| *arg != "--json");
+        args.extend([
+            "--workflow-commit",
+            "abcdef0123456789abcdef0123456789abcdef01",
+            "--workflow-path",
+            "workflows/replacement.yaml",
+        ]);
+        let (output, requests) = execute(&["replaced"], &args);
+        assert_eq!(output.status.code(), Some(0), "{output:?}");
+        let body: serde_json::Value =
+            serde_json::from_str(requests[0].split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        assert_eq!(
+            body["definition"]["replaced"],
+            serde_json::json!({
+            "commitOid":"abcdef0123456789abcdef0123456789abcdef01",
+            "workflowPath":"workflows/replacement.yaml"})
+        );
+        let text = String::from_utf8(output.stdout).unwrap();
+        assert!(text.contains("accepted attempt:"));
+        assert!(text.contains("inherited: source"));
+        assert!(text.contains("preparation: pending"));
+        assert!(text.contains("effective commit: abcdef0123456789abcdef0123456789abcdef01"));
+        assert!(text.contains("portable result: absent"));
+        assert!(text.contains("execution root: /work/current"));
+    }
+
+    #[test]
+    fn run_show_reads_current_ready_and_boot_loss_projection_without_mutation() {
+        for (state, marker) in [
+            ("show-running", "preparation: ready"),
+            ("show-interrupted", "retained_workspace_unavailable"),
+        ] {
+            let (output, requests) = execute(
+                &[state],
+                &["run", "show", ORGANIZATION, RUN_ID, "--allow-insecure-http"],
+            );
+            assert_eq!(output.status.code(), Some(0), "{output:?}");
+            assert_eq!(requests.len(), 1);
+            assert!(requests[0].starts_with("GET "));
+            let text = String::from_utf8(output.stdout).unwrap();
+            assert!(text.contains(marker));
+            assert!(text.contains("reexecution partition: build, test"));
+            assert!(text.contains("modified: unknown"));
+            assert!(text.contains("portable result: absent"));
+        }
+    }
+
+    #[test]
+    fn show_wait_observes_boot_loss_without_submitting_another_attempt() {
+        let (output, requests) = execute(
+            &["show-running", "show-interrupted"],
+            &[
+                "run",
+                "show",
+                ORGANIZATION,
+                RUN_ID,
+                "--wait",
+                "--json",
+                "--allow-insecure-http",
+            ],
+        );
+        assert_eq!(output.status.code(), Some(0), "{output:?}");
+        let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(
+            result["run"]["interruption"]["cause"],
+            "retained_workspace_unavailable"
+        );
+        assert_eq!(result["run"]["portableResult"], "absent");
+        assert!(requests.iter().all(|request| request.starts_with("GET ")));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn signal_stops_receipt_observation_without_a_second_submission() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let api_url = format!("http://{}/api", listener.local_addr().unwrap());
+        let directory = private_credential_directory();
+        let credentials = directory.path().join("credentials.json");
+        write_credential_fixture(&credentials, &api_url, TOKEN, "2999-01-01T00:00:00Z");
+        let (ready, reached) = mpsc::sync_channel(0);
+        let (release, released) = mpsc::sync_channel(0);
+        let server = std::thread::spawn(move || {
+            let (mut post, _) = listener.accept().unwrap();
+            let captured = request(&post);
+            let key = header_value(&captured, "idempotency-key").to_owned();
+            let location = format!(
+                "/v1/organizations/{ORGANIZATION_ID}/runs/{RUN_ID}/continuation-requests/{REQUEST_ID}"
+            );
+            post.write_all(&http_response_with_headers(
+                "201 Created",
+                Some("application/json"),
+                &[
+                    ("Idempotency-Key", &key),
+                    ("Location", &location),
+                    ("Cache-Control", "private, no-store"),
+                ],
+                &serde_json::to_vec(&envelope("preparing")).unwrap(),
+            ))
+            .unwrap();
+            let (get, _) = listener.accept().unwrap();
+            let observed = request(&get);
+            ready.send(()).unwrap();
+            released.recv().unwrap();
+            drop(get);
+            listener.set_nonblocking(true).unwrap();
+            assert!(
+                matches!(listener.accept(), Err(error) if error.kind() == io::ErrorKind::WouldBlock)
+            );
+            (captured, observed)
+        });
+        let environment = deployment_environment(&api_url, credentials.to_str().unwrap());
+        let mut command = Command::new(env!("CARGO_BIN_EXE_um"));
+        let mut args = args();
+        args.push("--wait");
+        command
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .env_remove(CREDENTIALS_FILE_VARIABLE);
+        for variable in DEPLOYMENT_VARIABLES {
+            command.env_remove(variable);
+        }
+        for (name, value) in environment {
+            command.env(name, value);
+        }
+        let child = command.spawn().unwrap();
+        reached.recv().unwrap();
+        rustix::process::kill_process(
+            rustix::process::Pid::from_raw(i32::try_from(child.id()).unwrap()).unwrap(),
+            rustix::process::Signal::TERM,
+        )
+        .unwrap();
+        let output = child.wait_with_output().unwrap();
+        release.send(()).unwrap();
+        let (post, get) = server.join().unwrap();
+        assert_eq!(output.status.code(), Some(143), "{output:?}");
+        let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(result["outcome"], "observation_stopped");
+        assert_eq!(result["request"]["requestId"], REQUEST_ID);
+        assert!(post.starts_with("POST ") && get.starts_with("GET "));
+    }
+
+    #[test]
+    fn older_receipt_keeps_its_partition_when_current_attempt_and_portable_result_advance() {
+        let mut args = args();
+        args.push("--wait");
+        let (output, requests) = execute(&["preparing", "third"], &args);
+        assert_eq!(output.status.code(), Some(0), "{output:?}");
+        let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(result["request"]["attemptNumber"], 2);
+        assert_eq!(
+            result["run"]["workflowDefinitionSource"]["workflowSourceClosureDigest"]["value"],
+            PRIOR
+        );
+        assert_eq!(
+            result["run"]["continuation"]["definitionSource"]["manifestDigest"]["value"],
+            CURRENT
+        );
+        assert_eq!(
+            result["request"]["reexecutedSteps"],
+            serde_json::json!(["build", "test"])
+        );
+        assert_eq!(result["run"]["currentAttemptNumber"], 3);
+        assert_eq!(
+            result["run"]["continuation"]["reexecutedSteps"],
+            serde_json::json!(["test"])
+        );
+        assert_eq!(result["run"]["portableResult"], "available");
+        assert_eq!(
+            result["run"]["continuation"]["inheritedSteps"][0]["priorState"],
+            "inherited"
+        );
+        assert_eq!(requests.len(), 2);
+        let (human, reads) = execute(
+            &["show-third"],
+            &["run", "show", ORGANIZATION, RUN_ID, "--allow-insecure-http"],
+        );
+        assert_eq!(human.status.code(), Some(0), "{human:?}");
+        assert_eq!(reads.len(), 1);
+        let text = String::from_utf8(human.stdout).unwrap();
+        assert!(text.contains("reexecution partition: test"));
+        assert!(text.contains("inherited: source (prior: inherited"));
+        assert!(text.contains("portable result: available"));
+    }
+
+    #[test]
+    fn two_lost_responses_leave_one_key_and_unknown_acceptance() {
+        let (output, requests) = execute(&["lost", "lost"], &args());
+        assert_eq!(output.status.code(), Some(4), "{output:?}");
+        let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(result["outcome"], "acceptance_unknown");
+        assert_eq!(
+            result["idempotencyKey"],
+            header_value(&requests[0], "idempotency-key")
+        );
+        assert_eq!(
+            header_value(&requests[0], "idempotency-key"),
+            header_value(&requests[1], "idempotency-key")
+        );
+        assert!(result["request"].is_null());
+    }
+
+    #[test]
+    fn lost_response_then_unreadable_401_cannot_refresh_or_submit_again() {
+        let (output, requests) = execute(&["lost", "truncated-401"], &args());
+        assert_eq!(output.status.code(), Some(4), "{output:?}");
+        let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(result["outcome"], "acceptance_unknown");
+        assert_eq!(result["code"], "acceptance_unknown");
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            header_value(&requests[0], "idempotency-key"),
+            header_value(&requests[1], "idempotency-key")
+        );
+        assert_eq!(
+            requests[0].split("\r\n\r\n").nth(1),
+            requests[1].split("\r\n\r\n").nth(1)
+        );
+    }
+
+    #[test]
+    fn admission_violations_retain_stale_version_and_reference_details() {
+        for (step, code) in [
+            ("admission-version", "expected_run_version_conflict"),
+            ("admission-node", "continuation_references_unsatisfied"),
+        ] {
+            let (output, requests) = execute(&[step], &args());
+            assert_eq!(output.status.code(), Some(1), "{output:?}");
+            assert_eq!(requests.len(), 1);
+            let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(result["outcome"], "error");
+            assert_eq!(result["code"], "continuation_admission_invalid");
+            assert_eq!(result["diagnostic"][0]["code"], code);
+            if step == "admission-node" {
+                assert_eq!(result["diagnostic"][0]["node"], "test");
+                assert_eq!(result["diagnostic"][0]["producer"], "source");
+                assert_eq!(
+                    result["diagnostic"][0]["reference"],
+                    "steps.source.outputs.file"
+                );
+                assert_eq!(result["diagnostic"][0]["priorState"], "failed");
+            }
+        }
+        let mut human_args = args();
+        human_args.retain(|arg| *arg != "--json");
+        let (output, requests) = execute(&["admission-node"], &human_args);
+        assert_eq!(requests.len(), 1);
+        assert_eq!(output.status.code(), Some(1), "{output:?}");
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(stderr.contains("continuation_references_unsatisfied"));
+        assert!(stderr.contains(
+            "node: test producer: source reference: steps.source.outputs.file prior state: failed"
+        ));
+    }
+
+    #[test]
+    fn not_found_after_lost_response_is_not_proof_of_non_admission() {
+        let (output, requests) = execute(&["lost", "not-found"], &args());
+        assert_eq!(output.status.code(), Some(4), "{output:?}");
+        let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(result["outcome"], "acceptance_unknown");
+        assert!(result["request"].is_null());
+        assert_eq!(requests.len(), 2);
+    }
+
+    #[test]
+    fn post_cannot_report_a_different_semantic_request_as_accepted() {
+        let (output, requests) = execute(&["changed-request"], &args());
+        assert_eq!(output.status.code(), Some(4), "{output:?}");
+        let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(result["outcome"], "acceptance_unknown");
+        assert!(result["request"].is_null());
+        assert_eq!(requests.len(), 1);
+    }
+
+    #[test]
+    fn receipt_get_must_not_rewrite_original_admission() {
+        let mut args = args();
+        args.push("--wait");
+        let (output, requests) = execute(&["preparing", "changed-receipt"], &args);
+        assert_eq!(output.status.code(), Some(1), "{output:?}");
+        let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(result["code"], "protocol_error");
+        assert_eq!(result["request"]["acceptedAt"], "2026-08-10T12:00:00Z");
+        assert_eq!(requests.len(), 2);
+    }
+
+    #[test]
+    fn receipt_get_observes_ready_then_boot_loss_without_claiming_portable_result() {
+        let mut args = args();
+        args.push("--wait");
+        let (output, requests) = execute(&["preparing", "running", "interrupted"], &args);
+        assert_eq!(output.status.code(), Some(0), "{output:?}");
+        let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(result["outcome"], "observed");
+        assert_eq!(
+            result["run"]["continuation"]["workspace"]["preparation"],
+            "unavailable"
+        );
+        assert_eq!(
+            result["run"]["interruption"]["cause"],
+            "retained_workspace_unavailable"
+        );
+        assert_eq!(result["run"]["portableResult"], "absent");
+        assert!(
+            requests[1..]
+                .iter()
+                .all(|line| line.starts_with("GET ") && line.contains(REQUEST_ID))
+        );
+    }
+}
+
 mod retry_command_tests {
     use super::*;
     use std::io::{BufRead, BufReader, Read};

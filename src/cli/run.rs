@@ -19,6 +19,7 @@ use um_human_auth::Deployment;
 use super::{OrganizationArg, ProjectArg};
 
 mod acquisition;
+mod continuation;
 mod input_set;
 mod inputs;
 mod list;
@@ -62,6 +63,8 @@ pub(super) struct Command {
 enum RunCommand {
     #[command(about = "Request cancellation of a Useful Machinery run")]
     Cancel(CancelCommand),
+    #[command(about = "Continue a run from selected steps")]
+    Continue(continuation::Command),
     #[command(about = "Create a run")]
     Create(CreateCommand),
     #[command(about = inputs::ABOUT)]
@@ -90,7 +93,7 @@ struct CreateCommand {
     project_id: ProjectArg,
     #[arg(
         long,
-        value_name = "WORKFLOW",
+        value_name = "PATH",
         help = "Canonical repository-relative workflow path"
     )]
     workflow_path: String,
@@ -235,6 +238,12 @@ impl Command {
                 Some(command),
                 &[NAME],
                 "configure Useful Machinery run creation",
+                |command, deployment| command.execute(deployment.clone()),
+            ),
+            Some(RunCommand::Continue(command)) => super::execute_deployment_command(
+                Some(command),
+                &[NAME],
+                "configure Useful Machinery run continuation",
                 |command, deployment| command.execute(deployment.clone()),
             ),
             Some(RunCommand::InputSet(command)) => command.execute(),
@@ -1197,12 +1206,16 @@ fn failure_code(
         RunFailure::InvalidInput => ("invalid_input", ExitCode::GeneralFailure),
         RunFailure::NotFound => ("not_found", ExitCode::GeneralFailure),
         RunFailure::IdempotencyConflict => ("idempotency_conflict", ExitCode::GeneralFailure),
+        RunFailure::ContinuationAdmissionInvalid(_) => {
+            ("continuation_admission_invalid", ExitCode::GeneralFailure)
+        }
         RunFailure::Conflict | RunFailure::RetryConflict(_) => {
             ("submission_failed", ExitCode::GeneralFailure)
         }
         RunFailure::RetryAfter(_)
         | RunFailure::RetryAmbiguousRateLimited
-        | RunFailure::RetryAmbiguousAuthentication => ("unavailable", ExitCode::Unavailable),
+        | RunFailure::RetryAmbiguousAuthentication
+        | RunFailure::ContinuationAcceptanceUnknown => ("unavailable", ExitCode::Unavailable),
         RunFailure::CreationRejected => ("creation_rejected", ExitCode::GeneralFailure),
         RunFailure::Unreachable(_) => ("unavailable", ExitCode::Unavailable),
         RunFailure::Protocol { .. } => ("protocol_error", ExitCode::GeneralFailure),
@@ -1350,6 +1363,45 @@ fn run_api<'a>(
     )
     .map_err(|error| anyhow!(error))
     .context("prepare Cloud run networking")
+}
+
+// Keep the acting principal and semantic request pinned across a mutation
+// replay; credential renewal never authorizes a different principal.
+fn with_pinned_run_mutation<T>(
+    deployment: &Deployment,
+    options: &RunOptions,
+    error_context: &'static str,
+    operation: impl Fn(&RunApi<'_>) -> Result<T, RunFailure>,
+) -> anyhow::Result<Result<T, RunFailure>> {
+    let policy = options.http.transport_policy();
+    let client = super::human_session_client(policy)?;
+    let submit = |token: &str| {
+        let api = run_api(&client, deployment, token, policy)?;
+        Ok(operation(&api))
+    };
+    if let Some(api_key) = options.authentication.service_api_key()? {
+        return submit(api_key.expose());
+    }
+    match um_human_auth::execute_pinned_required(
+        &client,
+        deployment,
+        |token| submit(token.expose()),
+        |result| {
+            result
+                .as_ref()
+                .is_ok_and(|value| value.as_ref().is_err_and(RunFailure::credential_rejected))
+        },
+    ) {
+        Ok(um_human_auth::BoundRequiredOperation::Completed { result, .. }) => result,
+        Ok(
+            um_human_auth::BoundRequiredOperation::Unauthenticated { .. }
+            | um_human_auth::BoundRequiredOperation::ActingSessionChanged,
+        ) => Ok(Err(RunFailure::Unauthenticated)),
+        Err(error) => match error.unreachable_category() {
+            Some(category) => Ok(Err(RunFailure::Unreachable(category))),
+            None => Err(anyhow!(error).context(error_context)),
+        },
+    }
 }
 
 fn with_api_until<T>(
@@ -1818,6 +1870,7 @@ fn write_run_human(deployment: &str, heading: &str, run: &Run) -> anyhow::Result
     } else {
         writeln!(stdout, "  none")?;
     }
+    continuation::write_run_continuation(&mut stdout, run)?;
     write_run_terminal_issue(&mut stdout, run)?;
     writeln!(stdout, "\nartifact delivery:")?;
     match run.artifact_delivery.as_deref() {
@@ -1917,7 +1970,8 @@ fn write_failure_with_input_set(
             "error: Cloud run resource not found or unavailable\n\nCheck the organization and resource identifier, then try again.".to_owned(),
             OutcomeClass::GeneralFailure,
         ),
-        RunFailure::Conflict | RunFailure::IdempotencyConflict | RunFailure::RetryConflict(_) => (
+        RunFailure::Conflict | RunFailure::IdempotencyConflict | RunFailure::RetryConflict(_)
+        | RunFailure::ContinuationAdmissionInvalid(_) => (
             "conflict",
             None,
             "error: Cloud run request conflicts with current state\n\nCheck the resource state and try again.".to_owned(),
@@ -1937,7 +1991,8 @@ fn write_failure_with_input_set(
         ),
         RunFailure::RetryAfter(_)
         | RunFailure::RetryAmbiguousRateLimited
-        | RunFailure::RetryAmbiguousAuthentication => (
+        | RunFailure::RetryAmbiguousAuthentication
+        | RunFailure::ContinuationAcceptanceUnknown => (
             "unreachable", None,
             "error: Cloud run API is temporarily unavailable\n\nTry again after the reported interval.".to_owned(),
             OutcomeClass::RateLimited,
@@ -2850,7 +2905,7 @@ mod tests {
     #[test]
     fn wait_bounds_retries_and_preserves_the_transport_failure() {
         let failure = RunFailure::Unreachable(UnreachableCategory::Connection);
-        let api = ScriptedObservationApi::new([Err(failure), Err(failure)]);
+        let api = ScriptedObservationApi::new([Err(failure.clone()), Err(failure.clone())]);
         let started_at = um_support::monotonic_now();
         let clock = ControlledWaitClock::new(started_at);
 

@@ -86,7 +86,9 @@ pub use github::{
     GitHubAccountType, GitHubApi, GitHubFailure, GitHubInstallation, GitHubInstallationState,
     GitHubRepository, GitHubRepositoryList, GitHubSetupSession,
 };
-pub use http_client::{HttpCancellation, HttpClient, HttpEndpointError, HttpTransportPolicy};
+pub use http_client::{
+    HttpCancellation, HttpClient, HttpClientError, HttpEndpointError, HttpTransportPolicy,
+};
 pub use http_util::{
     BoundedBodyError, InvalidHeaderText, MAX_RESPONSE_BODY_BYTES, media_type, read_bounded_body,
 };
@@ -152,12 +154,16 @@ pub use runners::{
     RunnerRegistrationList, RunnerRegistrationMode,
 };
 pub use runs::{
-    CreateRunInput, RetryConflict, Run, RunApi, RunArtifactDelivery, RunCancellation,
-    RunCancellationEffectiveMode, RunCancellationEnvelope, RunCancellationMode,
-    RunCancellationReceipt, RunCancellationReceiptMode, RunCancellationReceiptState,
-    RunCancellationResolutionKind, RunCreationAcceptance, RunCreationPending, RunFailure,
-    RunInterruption, RunList, RunListFilter, RunObservation, RunPublicationHandoffState, RunRead,
-    RunRetryReceipt, RunRetryRejection, RunRetryState, RunState, valid_integration_context,
+    ContinuationAdmissionViolation, CreateRunInput, RetryConflict, Run, RunApi,
+    RunArtifactDelivery, RunCancellation, RunCancellationEffectiveMode, RunCancellationEnvelope,
+    RunCancellationMode, RunCancellationReceipt, RunCancellationReceiptMode,
+    RunCancellationReceiptState, RunCancellationResolutionKind, RunContinuationDefinition,
+    RunContinuationEnvelope, RunContinuationPreparation, RunContinuationReceipt,
+    RunContinuationReplacement, RunContinuationReplacementSource, RunContinuationRequest,
+    RunContinuationWorkspaceModified, RunCreationAcceptance, RunCreationPending, RunFailure,
+    RunInterruption, RunInterruptionPhase, RunList, RunListFilter, RunObservation,
+    RunPublicationHandoffState, RunRead, RunRetryReceipt, RunRetryRejection, RunRetryState,
+    RunState, valid_integration_context,
 };
 pub use service_principals::{
     CreateServicePrincipalOutcome, IssueServiceCredentialOutcome, IssuedServiceApiKey,

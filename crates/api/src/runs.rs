@@ -30,11 +30,21 @@ pub type RunState = models::run::State;
 pub type RunCreationAcceptance = models::RunCreationAcceptance;
 pub type RunCreationPending = models::RunCreationPending;
 pub type RunArtifactDelivery = models::RunArtifactDelivery;
+pub type ContinuationAdmissionViolation = models::ContinuationAdmissionViolation;
+pub type RunContinuationEnvelope = models::RunContinuationEnvelope;
+pub type RunContinuationReceipt = models::RunContinuationReceipt;
+pub type RunContinuationRequest = models::RunContinuationRequest;
+pub type RunContinuationDefinition = models::RunContinuationRequestDefinition;
+pub type RunContinuationReplacement = models::RunContinuationRequestDefinitionOneOf;
+pub type RunContinuationReplacementSource = models::RunContinuationRequestDefinitionOneOfReplaced;
+pub type RunContinuationWorkspaceModified = models::RunContinuationWorkspaceModified;
 pub type RunRetryReceipt = models::RunRetryReceipt;
 pub type RunRetryState = models::run_retry_receipt::State;
 pub type RunRetryRejection = models::run_retry_receipt::Rejection;
 pub type RunCancellation = models::RunCancellation;
 pub type RunInterruption = models::RunInterruption;
+pub type RunInterruptionPhase = models::run_interruption::Phase;
+pub type RunContinuationPreparation = models::run_continuation_workspace::Preparation;
 pub type RunCancellationEnvelope = models::RunCancellationEnvelope;
 pub type RunCancellationReceipt = models::RunCancellationReceipt;
 pub type RunCancellationMode = models::run_cancellation_request::Mode;
@@ -156,6 +166,7 @@ impl<'a> RunApi<'a> {
             build,
         )
         .map(|(response, _)| response)
+        .map_err(|(failure, _)| failure)
     }
 
     fn send_api_request_with_statuses(
@@ -164,7 +175,7 @@ impl<'a> RunApi<'a> {
         idempotency_key: Option<&str>,
         begin_dispatch: impl Fn() -> bool,
         mut build: impl FnMut() -> reqwest::blocking::RequestBuilder,
-    ) -> Result<(ReceivedResponse, bool), RunFailure> {
+    ) -> Result<(ReceivedResponse, bool), (RunFailure, bool)> {
         let mut ambiguous_attempt = false;
         let attempts = if idempotency_key.is_some() {
             CREATE_ATTEMPTS
@@ -174,7 +185,7 @@ impl<'a> RunApi<'a> {
         let mut last_transport_failure = UnreachableCategory::Connection;
         for attempt in 0..attempts {
             if !begin_dispatch() {
-                return Err(RunFailure::Interrupted);
+                return Err((RunFailure::Interrupted, ambiguous_attempt));
             }
             let response = match build().send() {
                 Ok(response) => response,
@@ -192,7 +203,7 @@ impl<'a> RunApi<'a> {
                         um_support::sleep(um_support::short_retry_delay());
                         continue;
                     }
-                    return Err(RunFailure::Unreachable(category));
+                    return Err((RunFailure::Unreachable(category), ambiguous_attempt));
                 }
             };
             let status = response.status();
@@ -202,12 +213,16 @@ impl<'a> RunApi<'a> {
                 require_exact_header(
                     response.headers().get_all("Idempotency-Key").iter(),
                     idempotency_key,
-                )?;
+                )
+                .map_err(|failure| (failure, ambiguous_attempt))?;
             }
             match http_util::buffer_blocking_response(response) {
                 Ok(response) => return Ok((response, ambiguous_attempt)),
                 Err(BoundedBodyError::TooLarge) => {
-                    return Err(RunFailure::protocol(status == StatusCode::UNAUTHORIZED));
+                    return Err((
+                        RunFailure::protocol(status == StatusCode::UNAUTHORIZED),
+                        ambiguous_attempt,
+                    ));
                 }
                 Err(BoundedBodyError::Transport(error))
                     if idempotency_key.is_some() && success_statuses.contains(&status) =>
@@ -219,21 +234,107 @@ impl<'a> RunApi<'a> {
                         um_support::sleep(um_support::short_retry_delay());
                         continue;
                     }
-                    return Err(RunFailure::Unreachable(category));
+                    return Err((RunFailure::Unreachable(category), ambiguous_attempt));
                 }
                 Err(BoundedBodyError::Transport(_)) if status == StatusCode::UNAUTHORIZED => {
-                    return Err(RunFailure::protocol(true));
+                    return Err((RunFailure::protocol(true), ambiguous_attempt));
                 }
                 Err(BoundedBodyError::Transport(error)) => {
-                    return Err(RunFailure::Unreachable(if status.is_server_error() {
-                        UnreachableCategory::Server
-                    } else {
-                        classify_reqwest_error(&error)
-                    }));
+                    return Err((
+                        RunFailure::Unreachable(if status.is_server_error() {
+                            UnreachableCategory::Server
+                        } else {
+                            classify_reqwest_error(&error)
+                        }),
+                        ambiguous_attempt,
+                    ));
                 }
             }
         }
-        Err(RunFailure::Unreachable(last_transport_failure))
+        Err((
+            RunFailure::Unreachable(last_transport_failure),
+            ambiguous_attempt,
+        ))
+    }
+
+    pub fn request_continuation(
+        &self,
+        organization: &str,
+        run_id: &str,
+        key: &str,
+        request: &RunContinuationRequest,
+        begin_dispatch: impl Fn() -> bool,
+    ) -> Result<RunContinuationEnvelope, RunFailure> {
+        let endpoint = format!(
+            "{}/{}/continuation-requests",
+            self.collection_endpoint(organization),
+            apis::urlencode(run_id)
+        );
+        let (response, ambiguous) = self
+            .send_api_request_with_statuses(
+                &[StatusCode::CREATED],
+                Some(key),
+                begin_dispatch,
+                || {
+                    self.request(Method::POST, &endpoint)
+                        .header("Idempotency-Key", key)
+                        .json(request)
+                },
+            )
+            .map_err(|(failure, ambiguous)| {
+                if ambiguous {
+                    RunFailure::ContinuationAcceptanceUnknown
+                } else {
+                    failure
+                }
+            })?;
+        // No unsuccessful replay, including 404, establishes whether the first
+        // transport-ambiguous request was admitted.
+        if ambiguous && response.status != StatusCode::CREATED {
+            return Err(RunFailure::ContinuationAcceptanceUnknown);
+        }
+        if response.status != StatusCode::CREATED {
+            return Err(classify_continuation_failure(&response));
+        }
+        require_media_type(&response, JSON_MEDIA_TYPE, false)?;
+        require_exact_header(response.idempotency_keys.iter(), key)?;
+        require_exact_header(response.cache_controls.iter(), PRIVATE_CACHE_CONTROL)?;
+        let envelope: RunContinuationEnvelope =
+            serde_json::from_slice(&response.body).map_err(|_| RunFailure::protocol(false))?;
+        validate_continuation_envelope(&envelope, run_id, None, Some(request))?;
+        let location = format!(
+            "/v1/organizations/{}/runs/{}/continuation-requests/{}",
+            apis::urlencode(&envelope.request.organization_id),
+            apis::urlencode(run_id),
+            apis::urlencode(&envelope.request.request_id)
+        );
+        require_exact_header(response.locations.iter(), &location)?;
+        Ok(envelope)
+    }
+
+    pub fn get_continuation(
+        &self,
+        organization: &str,
+        run_id: &str,
+        request_id: &str,
+        timeout: Option<Duration>,
+    ) -> Result<RunContinuationEnvelope, RunFailure> {
+        let endpoint = format!(
+            "{}/{}/continuation-requests/{}",
+            self.collection_endpoint(organization),
+            apis::urlencode(run_id),
+            apis::urlencode(request_id)
+        );
+        let response = self.read_response(&endpoint, timeout)?;
+        if response.status != StatusCode::OK {
+            return Err(classify_failure(&response, RunOperation::Get));
+        }
+        require_media_type(&response, JSON_MEDIA_TYPE, false)?;
+        require_exact_header(response.cache_controls.iter(), PRIVATE_CACHE_CONTROL)?;
+        let envelope: RunContinuationEnvelope =
+            serde_json::from_slice(&response.body).map_err(|_| RunFailure::protocol(false))?;
+        validate_continuation_envelope(&envelope, run_id, Some(request_id), None)?;
+        Ok(envelope)
     }
 
     pub fn request_retry(
@@ -251,16 +352,24 @@ impl<'a> RunApi<'a> {
         );
         let mut request = models::RunRetryRequest::new();
         request.expected_version = expected_version;
-        let (response, ambiguous_attempt) = self.send_api_request_with_statuses(
-            &[StatusCode::ACCEPTED],
-            Some(key),
-            begin_dispatch,
-            || {
-                self.request(Method::POST, &endpoint)
-                    .header("Idempotency-Key", key)
-                    .json(&request)
-            },
-        )?;
+        let (response, ambiguous_attempt) = self
+            .send_api_request_with_statuses(
+                &[StatusCode::ACCEPTED],
+                Some(key),
+                begin_dispatch,
+                || {
+                    self.request(Method::POST, &endpoint)
+                        .header("Idempotency-Key", key)
+                        .json(&request)
+                },
+            )
+            .map_err(|(failure, ambiguous)| {
+                if ambiguous && failure.credential_rejected() {
+                    RunFailure::RetryAmbiguousAuthentication
+                } else {
+                    failure
+                }
+            })?;
         if response.status == StatusCode::UNAUTHORIZED && ambiguous_attempt {
             return Err(RunFailure::RetryAmbiguousAuthentication);
         }
@@ -331,16 +440,18 @@ impl<'a> RunApi<'a> {
             self.collection_endpoint(organization),
             apis::urlencode(run_id)
         );
-        let (response, _) = self.send_api_request_with_statuses(
-            &[StatusCode::OK, StatusCode::ACCEPTED],
-            Some(key),
-            begin_dispatch,
-            || {
-                self.request(Method::POST, &endpoint)
-                    .header("Idempotency-Key", key)
-                    .json(&models::RunCancellationRequest::new(mode))
-            },
-        )?;
+        let (response, _) = self
+            .send_api_request_with_statuses(
+                &[StatusCode::OK, StatusCode::ACCEPTED],
+                Some(key),
+                begin_dispatch,
+                || {
+                    self.request(Method::POST, &endpoint)
+                        .header("Idempotency-Key", key)
+                        .json(&models::RunCancellationRequest::new(mode))
+                },
+            )
+            .map_err(|(failure, _)| failure)?;
         let status = response.status;
         if !matches!(status, StatusCode::OK | StatusCode::ACCEPTED) {
             return Err(classify_failure(&response, RunOperation::Create));
@@ -521,7 +632,7 @@ impl Drop for RunApi<'_> {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum RunFailure {
     Unauthenticated,
     Forbidden,
@@ -534,6 +645,8 @@ pub enum RunFailure {
     RetryAfter(Duration),
     RetryAmbiguousRateLimited,
     RetryAmbiguousAuthentication,
+    ContinuationAcceptanceUnknown,
+    ContinuationAdmissionInvalid(Vec<models::ContinuationAdmissionViolation>),
     Gone,
     Unreachable(UnreachableCategory),
     InputUploadRejected,
@@ -608,6 +721,79 @@ fn classify_retry_failure(response: &ReceivedResponse) -> RunFailure {
         return RunFailure::RetryAfter(Duration::from_secs(delay));
     }
     classify_failure(response, RunOperation::Get)
+}
+
+fn classify_continuation_failure(response: &ReceivedResponse) -> RunFailure {
+    if response.status == StatusCode::CONFLICT {
+        return match problem::decode_header_parts(
+            &response.body,
+            response.status,
+            response.content_type.as_ref(),
+        ) {
+            Ok(problem)
+                if problem.r#type
+                    == "https://api.usefulmachinery.com/problems/continuation-admission-invalid" =>
+            {
+                problem
+                    .continuation_violations
+                    .filter(|violations| !violations.is_empty())
+                    .map_or(
+                        RunFailure::protocol(false),
+                        RunFailure::ContinuationAdmissionInvalid,
+                    )
+            }
+            Ok(problem)
+                if problem.r#type
+                    == "https://api.usefulmachinery.com/problems/idempotency-conflict" =>
+            {
+                RunFailure::IdempotencyConflict
+            }
+            Ok(_) => RunFailure::Conflict,
+            Err(_) => RunFailure::protocol(false),
+        };
+    }
+    classify_failure(response, RunOperation::Create)
+}
+
+fn validate_continuation_envelope(
+    envelope: &RunContinuationEnvelope,
+    run_id: &str,
+    request_id: Option<&str>,
+    submitted: Option<&RunContinuationRequest>,
+) -> Result<(), RunFailure> {
+    let receipt = &envelope.request;
+    if !um_support::valid_typed_id(&receipt.request_id, "cmd_")
+        || request_id.is_some_and(|id| id != receipt.request_id)
+        || !um_support::valid_typed_id(&receipt.organization_id, "org_")
+        || receipt.run_id != run_id
+        || !um_support::valid_typed_id(&receipt.attempt_id, "atm_")
+        || receipt.attempt_number < 2
+        || !valid_timestamp(&receipt.accepted_at)
+        || envelope.run.id != run_id
+        || envelope.run.organization_id != receipt.organization_id
+        || envelope.run.current_attempt_number < receipt.attempt_number
+        || (request_id.is_none() && envelope.run.current_attempt_number != receipt.attempt_number)
+        || submitted.is_some_and(|submitted| {
+            envelope
+                .run
+                .continuation
+                .as_ref()
+                .is_none_or(|continuation| continuation.request.as_ref() != submitted)
+        })
+        || (envelope.run.current_attempt_number == receipt.attempt_number
+            && (envelope.run.current_attempt_id != receipt.attempt_id
+                || envelope
+                    .run
+                    .continuation
+                    .as_ref()
+                    .is_none_or(|continuation| {
+                        continuation.reexecuted_steps != receipt.reexecuted_steps
+                            || continuation.inherited_steps != receipt.inherited_steps
+                    })))
+    {
+        return Err(RunFailure::protocol(false));
+    }
+    validate_run((*envelope.run).clone(), run_id).map(|_| ())
 }
 
 fn validate_retry_receipt(receipt: &RunRetryReceipt, run_id: &str) -> Result<(), RunFailure> {
@@ -1173,9 +1359,12 @@ fn valid_bounded_string(value: &str, minimum: usize, maximum: usize) -> bool {
 fn valid_canonical_workflow_path(value: &str) -> bool {
     valid_bounded_string(value, 1, 4096)
         && !value.starts_with('/')
-        && value
-            .split('/')
-            .all(|component| !component.is_empty() && component != "." && component != "..")
+        && value.split('/').all(|component| {
+            !component.is_empty()
+                && component != "."
+                && component != ".."
+                && !component.contains('\0')
+        })
 }
 
 fn lowercase_hex(value: &str, length: usize) -> bool {

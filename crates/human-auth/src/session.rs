@@ -673,6 +673,15 @@ pub enum SessionError {
 }
 
 impl SessionError {
+    pub fn observation_lock_timeout(&self) -> bool {
+        matches!(
+            self,
+            Self::CredentialStore(
+                CredentialError::LockTimeout | CredentialError::RefreshLockTimeout
+            )
+        )
+    }
+
     pub fn unreachable_category(&self) -> Option<UnreachableCategory> {
         match self {
             Self::RefreshUnreachable(category) => Some(*category),
@@ -680,6 +689,8 @@ impl SessionError {
         }
     }
 }
+
+impl std::error::Error for SessionError {}
 
 impl fmt::Display for SessionError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {

@@ -2,14 +2,14 @@ use super::super::ObservationControl;
 use std::io::{self, Write};
 use std::time::Duration;
 
-use anyhow::{Context, anyhow};
+use anyhow::Context;
 use clap::Args;
 use serde::Serialize;
 use um_api::{
     RetryConflict, RunFailure, RunRetryReceipt, RunRetryRejection, RunRetryState,
     UnreachableCategory,
 };
-use um_human_auth::{BoundRequiredOperation, Deployment};
+use um_human_auth::Deployment;
 
 use crate::exit_code::ExitCode;
 
@@ -344,41 +344,20 @@ fn pinned_submission(
     control: &super::super::OperationControl<Recovery>,
     key: &str,
 ) -> anyhow::Result<Result<RunRetryReceipt, RunFailure>> {
-    let policy = command.options.http.transport_policy();
-    let client = super::super::human_session_client(policy)?;
-    let submit = |token: &str| {
-        let api = super::run_api(&client, deployment, token, policy)?;
-        Ok(api.request_retry(
-            &command.run.organization,
-            &command.run.run_id,
-            key,
-            command.expected_version,
-            || control.begin_dispatch(),
-        ))
-    };
-    if let Some(api_key) = command.options.authentication.service_api_key()? {
-        return submit(api_key.expose());
-    }
-    match um_human_auth::execute_pinned_required(
-        &client,
+    super::with_pinned_run_mutation(
         deployment,
-        |token| submit(token.expose()),
-        |result| {
-            result
-                .as_ref()
-                .is_ok_and(|value| value.as_ref().is_err_and(RunFailure::credential_rejected))
+        &command.options,
+        "acquire human session for Cloud run retry",
+        |api| {
+            api.request_retry(
+                &command.run.organization,
+                &command.run.run_id,
+                key,
+                command.expected_version,
+                || control.begin_dispatch(),
+            )
         },
-    ) {
-        Ok(BoundRequiredOperation::Completed { result, .. }) => result,
-        Ok(
-            BoundRequiredOperation::Unauthenticated { .. }
-            | BoundRequiredOperation::ActingSessionChanged,
-        ) => Ok(Err(RunFailure::Unauthenticated)),
-        Err(error) => match error.unreachable_category() {
-            Some(category) => Ok(Err(RunFailure::Unreachable(category))),
-            None => Err(anyhow!(error).context("acquire human session for Cloud run retry")),
-        },
-    }
+    )
 }
 
 fn rejection_code(rejection: RunRetryRejection) -> &'static str {

@@ -435,10 +435,11 @@ async fn run_assignment_scenario() -> Vec<String> {
     // notification can become ready immediately before or after the liveness
     // timer is first polled, so timer-request ordering is not a protocol
     // guarantee. Timeout-specific scenarios below retain those events.
-    events
+    let events = events
         .into_iter()
         .filter(|event| !event.starts_with("sleep.requested:"))
-        .collect()
+        .collect();
+    normalize_assignment_retention_order(events)
 }
 
 async fn run_timeout_boundary_scenarios() -> Vec<String> {
@@ -709,6 +710,42 @@ fn normalize_retention_reports(mut events: Vec<String>) -> Vec<String> {
             *event = format!("outbound:text:{frame}");
         }
     }
+    events
+}
+
+fn normalize_assignment_retention_order(mut events: Vec<String>) -> Vec<String> {
+    let rejection = event_position(
+        &events,
+        0,
+        "outbound:text:",
+        "\"type\":\"assignment_rejected\"",
+    );
+    let retention = event_position(
+        &events,
+        rejection + 1,
+        "outbound:text:",
+        "\"type\":\"workspace_retention_report\"",
+    );
+    let ping = event_position(
+        &events,
+        retention + 1,
+        "inbound.read:ping:",
+        "scripted-boundary",
+    );
+    assert!(rejection < retention && retention < ping);
+
+    // Cleanup can report retention before or after the connection reads the
+    // rejection acknowledgement. Preserve both events and their contents,
+    // while comparing them in one order across repetitions.
+    let report = events.remove(retention);
+    let acknowledgement = event_position(
+        &events,
+        rejection + 1,
+        "inbound.read:text:",
+        "\"acknowledgedSequence\":6",
+    );
+    assert!(acknowledgement < ping - 1);
+    events.insert(acknowledgement + 1, report);
     events
 }
 

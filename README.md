@@ -1449,6 +1449,14 @@ um run show \
 um run show acme-labs run_01k0z6r1w8f4jy2m7q9v3x5abc \
   --wait --timeout 30m
 
+# Continue from selected steps on the same retained runner boot. Admission is not execution.
+um run continue acme-labs run_01k0z6r1w8f4jy2m7q9v3x5abc \
+  --from build --from test --expected-version 7 --json
+# Observe the immutable admission receipt with the current Run until it settles.
+um run continue acme-labs run_01k0z6r1w8f4jy2m7q9v3x5abc \
+  --from build --wait --timeout 30m
+# To replace the definition, supply both --workflow-commit OID and --workflow-path PATH.
+
 # Retry an eligible terminal run; observe the durable receipt until it resolves.
 um run retry acme-labs run_01k0z6r1w8f4jy2m7q9v3x5abc \
   --expected-version 7 --timeout 30m
@@ -1559,6 +1567,28 @@ to a later manual attempt. Cancel observes only its receipt and terminal Run. A 
 proof of a stopped Run. Force requires explicit `--force`; to escalate use a new
 idempotency key. Reuse `--idempotency-key` with the same mode and Run to reconcile an
 uncertain response. Signals and timeouts stop only local observation.
+
+`run continue ORGANIZATION RUN --from STEP [--from STEP ...]` selects distinct steps
+in the supplied order. The optional `--workflow-commit OID --workflow-path PATH` pair
+replaces the workflow definition; otherwise the definition is inherited.
+`--expected-version N` guards admission. A generated key is reused for at most one
+ambiguous transport replay of the identical request and principal. If both attempts
+are ambiguous, acceptance is unknown: inspect the run before another request; a 404
+is not proof of non-admission. A 201 contains an immutable accepted attempt and
+partition, **not** proof of execution. Without `--wait` it returns on admission;
+with `--wait` it reads the immutable receipt alongside the latest authorized Run
+until terminal state. `--timeout` requires `--wait` and begins after acceptance.
+JSON emits `operation: continue`, `outcome`, `request` (the immutable receipt),
+`run` (the current projection), `idempotencyKey` when acceptance is unknown, and
+`code` on failure. Admission rejection includes a `diagnostic` array of safe
+violation codes and optional node/producer/reference/prior-state details in
+JSON, also shown in human output. The Run shows selected/inherited/reexecuted
+steps, effective source digest, both workspace paths, pending/ready/unavailable preparation,
+modified true/false/unknown, interruption cause, and portable-result absence.
+The Run partition is not an output-producer inventory; direct producer identities
+for inherited output values are preserved in retained and portable results, not
+inferred from a preceding attempt in the Run summary. Missing portable results
+cannot supply that evidence. Signals and timeouts stop observation only, never submit a second continuation.
 
 `run retry ORGANIZATION RUN` always observes its retry receipt; `--expected-version`
 requires a positive integer and `--timeout` limits observation after acceptance.

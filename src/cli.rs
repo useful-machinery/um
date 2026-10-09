@@ -2458,6 +2458,7 @@ mod tests {
             "publication show",
             "run",
             "run cancel",
+            "run continue",
             "run create",
             "run input",
             "run input delete",

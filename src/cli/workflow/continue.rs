@@ -18,7 +18,7 @@ pub(super) struct Command {
     #[arg(
         long = "from",
         required = true,
-        value_name = "NODE",
+        value_name = "STEP",
         help = "Ordinary step to reexecute (repeatable)"
     )]
     from_steps: Vec<String>,

@@ -221,8 +221,11 @@ fn moved_sources_have_one_final_owner_and_private_generated_api() {
             "human-auth facade does not privately own {implementation}"
         );
     }
+    // The credential facade also exports CredentialError for callers that need to
+    // classify local credential-store failures. Keep checking the public ownership
+    // boundary without requiring CredentialStore to be exported on its own line.
     for consumed in [
-        "pub use credentials::CredentialStore;",
+        "pub use credentials::{CredentialError, CredentialStore};",
         "pub use deployment::Deployment;",
         "pub use session::{",
     ] {

@@ -381,6 +381,15 @@ pub enum HttpClientError {
     BuildClient(reqwest::Error),
 }
 
+impl Error for HttpClientError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::BuildRuntime(error) => Some(error),
+            Self::BuildClient(error) => Some(error),
+        }
+    }
+}
+
 impl fmt::Display for HttpClientError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
