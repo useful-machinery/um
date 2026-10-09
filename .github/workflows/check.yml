@@ -187,7 +187,7 @@ jobs:
       - name: Build release binary
         shell: bash
         env:
-          UM_BUILD_IDENTITY: ${{ needs.verify_release.outputs.source_revision }}
+          UM_RELEASE_COMMIT: ${{ needs.verify_release.outputs.candidate_mirror }}
           UM_VERSION: ${{ needs.verify_release.outputs.version }}
         run: |
           set -euo pipefail
@@ -196,7 +196,7 @@ jobs:
         if: matrix.target == 'aarch64-apple-darwin'
         shell: bash
         env:
-          UM_BUILD_IDENTITY: ${{ needs.verify_release.outputs.source_revision }}
+          UM_RELEASE_COMMIT: ${{ needs.verify_release.outputs.candidate_mirror }}
           UM_VERSION: ${{ needs.verify_release.outputs.version }}
         run: |
           set -euo pipefail
@@ -206,14 +206,14 @@ jobs:
       - name: Verify release identity
         shell: bash
         env:
-          EXPECTED_SOURCE_REVISION: ${{ needs.verify_release.outputs.source_revision }}
+          EXPECTED_BUILD_IDENTITY: ${{ needs.verify_release.outputs.candidate_mirror }}
           EXPECTED_VERSION: ${{ needs.verify_release.outputs.version }}
         run: |
           set -euo pipefail
           binary="target/${{ matrix.target }}/release/um"
           test "$("$binary" --version)" = "um $EXPECTED_VERSION"
           version_json=$("$binary" version --json)
-          python3 - "$version_json" "$EXPECTED_VERSION" "$EXPECTED_SOURCE_REVISION" <<'PY'
+          python3 - "$version_json" "$EXPECTED_VERSION" "$EXPECTED_BUILD_IDENTITY" <<'PY'
           import json
           import sys
 

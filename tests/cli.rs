@@ -95,9 +95,12 @@ const BUILD_VERSION: &str = match option_env!("UM_VERSION") {
     Some(version) => version,
     None => env!("CARGO_PKG_VERSION"),
 };
-const BUILD_IDENTITY: &str = match option_env!("UM_BUILD_IDENTITY") {
+const BUILD_IDENTITY: &str = match option_env!("UM_RELEASE_COMMIT") {
     Some(identity) => identity,
-    None => "unknown",
+    None => match option_env!("UM_BUILD_IDENTITY") {
+        Some(identity) => identity,
+        None => "unknown",
+    },
 };
 
 struct TestPty {

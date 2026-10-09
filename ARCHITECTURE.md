@@ -430,12 +430,13 @@ policy, explicit impact, and an optional latest stable version. Source validatio
 only checked-in bytes and cannot become stale when public releases move. `changes/` is a
 frozen legacy archive; new append-only intent is reviewed outside this exported tree.
 
-Native Cargo builds report the permanent `0.0.0-dev` fallback. Reproducible Nix and
-release builds inject `UM_VERSION` and `UM_BUILD_IDENTITY` at
-compile time, and both `um version` and `um --version` read the same
-version. Structured version output also reports the resolved executable path and
-separately injected build identity. Packaging must verify the installed executable
-reports these exact values. `scripts/check-release` validates static policy and fallback
+Native Cargo builds report the permanent `0.0.0-dev` fallback. Reproducible Nix builds
+inject `UM_VERSION` and `UM_BUILD_IDENTITY` at compile time. Official release builds
+inject `UM_VERSION` and the public release tag commit through `UM_RELEASE_COMMIT`,
+which takes precedence over a development build identity. Both `um version` and
+`um --version` read the same version. Structured version output also reports the
+resolved executable path and separately injected build identity. Packaging must verify
+the installed executable reports these exact values. `scripts/check-release` validates static policy and fallback
 consistency. Release-only planning observes stable state after source validation and binds that
 snapshot into an untagged candidate commit. Public `main` is a rolling candidate rather
 than a release reservation. Managed Buildkite reads canonical source and private journal

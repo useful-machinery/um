@@ -498,6 +498,7 @@ fn execution_and_runner_receive_identity_without_reading_root_build_policy() {
                 "crate::exit_code",
                 "UM_VERSION",
                 "UM_BUILD_IDENTITY",
+                "UM_RELEASE_COMMIT",
                 "CARGO_PKG_VERSION",
             ] {
                 let present = if forbidden.starts_with("crate::") {

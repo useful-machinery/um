@@ -729,6 +729,8 @@ output. Use `um version --json` for the schema-version-1 structured contract:
 ```
 
 Packaged builds replace the local `unknown` build identity with their source revision.
+Official GitHub release binaries report the public commit identified by the release tag
+as `buildIdentity`.
 The schema does not define a release channel.
 
 ## Human authentication
