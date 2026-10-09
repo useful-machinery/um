@@ -625,6 +625,7 @@ const TARGET_FIELDS: &[&str] = &[
     "fullName",
     "baseBranch",
     "destinationBranch",
+    "branchVersion",
 ];
 const PULL_REQUEST_METADATA_FIELDS: &[&str] =
     &["title", "body", "titleSource", "descriptionSource"];
@@ -772,8 +773,17 @@ fn validate_publication(
         && valid_provider_id(&publication.target.provider_repository_id)
         && valid_repository_full_name(&publication.target.full_name)
         && valid_bounded_string(&publication.target.base_branch, 1, 1024)
-        && publication.target.destination_branch
-            == format!("scherzo/{requested_run_id}/{}", publication.export_name)
+        && match publication.target.branch_version {
+            1 => {
+                publication.target.destination_branch
+                    == format!("scherzo/{requested_run_id}/{}", publication.export_name)
+            }
+            2 => {
+                publication.target.destination_branch
+                    == format!("um/{requested_run_id}/{}", publication.export_name)
+            }
+            _ => false,
+        }
         && valid_bounded_string(&publication.target.destination_branch, 1, 1024)
         && valid_bounded_string(&publication.pull_request_metadata.title, 1, 256)
         && valid_bounded_string(&publication.pull_request_metadata.body, 1, 65_536)

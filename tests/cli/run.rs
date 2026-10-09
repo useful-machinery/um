@@ -1545,7 +1545,7 @@ fn automatic_publication(outcome: &str) -> serde_json::Value {
         "target": {
             "repositoryConnectionId": REPOSITORY_CONNECTION_ID,
             "providerRepositoryId": "123456", "fullName": "example/repository",
-            "baseBranch": "main", "destinationBranch": format!("scherzo/{RUN_ID}/changes")
+            "baseBranch": "main", "branchVersion": 2, "destinationBranch": format!("um/{RUN_ID}/changes")
         },
         "pullRequestMetadata": {"title": "Review", "body": "Run publication", "titleSource": "default", "descriptionSource": "default"},
         "branch": branch, "pullRequest": pull_request, "outcome": outcome,
@@ -2826,7 +2826,7 @@ fn human_run_observation_reports_failed_automatic_publication() {
         "target": {
             "repositoryConnectionId": REPOSITORY_CONNECTION_ID,
             "providerRepositoryId": "123456", "fullName": "example/repository",
-            "baseBranch": "main", "destinationBranch": format!("scherzo/{RUN_ID}/review")
+            "baseBranch": "main", "branchVersion": 2, "destinationBranch": format!("um/{RUN_ID}/review")
         },
         "pullRequestMetadata": { "title": "Review", "body": "Run publication", "titleSource": "default", "descriptionSource": "default" },
         "branch": null, "pullRequest": null, "outcome": null,
@@ -2930,7 +2930,7 @@ fn human_run_observation_reports_successful_automatic_publication_url() {
         "target": {
             "repositoryConnectionId": REPOSITORY_CONNECTION_ID,
             "providerRepositoryId": "123456", "fullName": "example/repository",
-            "baseBranch": "main", "destinationBranch": format!("scherzo/{RUN_ID}/review")
+            "baseBranch": "main", "branchVersion": 2, "destinationBranch": format!("um/{RUN_ID}/review")
         },
         "pullRequestMetadata": { "title": "Review", "body": "Run publication", "titleSource": "default", "descriptionSource": "default" },
         "branch": {

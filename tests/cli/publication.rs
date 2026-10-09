@@ -81,7 +81,7 @@ fn publication_body() -> serde_json::Value {
             "providerRepositoryId": "123456",
             "fullName": "scherzo-systems/um",
             "baseBranch": "main",
-            "destinationBranch": format!("scherzo/{RUN_ID}/{EXPORT_NAME}")
+            "branchVersion": 2, "destinationBranch": format!("um/{RUN_ID}/{EXPORT_NAME}")
         },
         "pullRequestMetadata": {
             "title": "Useful Machinery run: changes",
@@ -102,7 +102,10 @@ fn publication_body() -> serde_json::Value {
 }
 
 fn publication_history() -> Vec<serde_json::Value> {
-    let queued = publication_body();
+    let mut queued = publication_body();
+    queued["target"]["branchVersion"] = serde_json::json!(1);
+    queued["target"]["destinationBranch"] =
+        serde_json::json!(format!("scherzo/{RUN_ID}/{EXPORT_NAME}"));
 
     let mut running = publication_body();
     running["id"] = serde_json::json!("pub_01k0z6r1w8f4jy2m7q9v3x5abd");
@@ -433,7 +436,7 @@ fn publication_create_sends_the_closed_request_and_renders_plain_and_json_receip
                 format!("export: {EXPORT_NAME}"),
                 "state: queued".to_owned(),
                 "repository: scherzo-systems/um".to_owned(),
-                format!("destination branch: scherzo/{RUN_ID}/{EXPORT_NAME}"),
+                format!("destination branch: um/{RUN_ID}/{EXPORT_NAME}"),
                 format!("idempotency key: {CALLER_KEY}"),
             ] {
                 assert!(
@@ -517,7 +520,10 @@ fn publication_create_wait_classifies_every_stored_terminal_outcome() {
 
 #[test]
 fn publication_create_wait_completes_from_a_terminal_acceptance_without_an_item_read() {
-    let terminal = succeeded_publication("pull_request_already_merged");
+    let mut terminal = succeeded_publication("pull_request_already_merged");
+    terminal["target"]["branchVersion"] = serde_json::json!(1);
+    terminal["target"]["destinationBranch"] =
+        serde_json::json!(format!("scherzo/{RUN_ID}/{EXPORT_NAME}"));
     let (server, _directory, credential_path) =
         prepared_publication(vec![accepted_response(&terminal)]);
     let environment = deployment_environment(&server.api_url, &credential_path);
@@ -1574,4 +1580,49 @@ fn signal_during_session_acquisition_emits_no_false_publication_receipt() {
         &[TOKEN, REFRESHED_TOKEN, "unique-predispatch-refreshed-token"],
     );
     assert!(server.finish().is_empty());
+}
+
+#[test]
+fn publication_targets_require_the_exact_accepted_branch_version() {
+    for (version, prefix, valid) in [
+        (Some(1), "scherzo", true),
+        (Some(2), "um", true),
+        (Some(1), "um", false),
+        (Some(2), "scherzo", false),
+        (Some(0), "scherzo", false),
+        (Some(3), "um", false),
+        (None, "scherzo", false),
+        (None, "um", false),
+    ] {
+        let mut body = publication_body();
+        body["target"]["destinationBranch"] =
+            serde_json::json!(format!("{prefix}/{RUN_ID}/{EXPORT_NAME}"));
+        if let Some(version) = version {
+            body["target"]["branchVersion"] = serde_json::json!(version);
+        } else {
+            body["target"]
+                .as_object_mut()
+                .unwrap()
+                .remove("branchVersion");
+        }
+        let (server, _directory, credential_path) =
+            prepared_publication(vec![ok_publication_response(&body)]);
+        let environment = deployment_environment(&server.api_url, &credential_path);
+        let output = run_with_env(&show_args(true), &environment);
+        assert_eq!(
+            output.status.success(),
+            valid,
+            "version {version:?}, prefix {prefix}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        if valid {
+            let result = assert_one_json_document(&output.stdout);
+            assert_eq!(result["publication"], body);
+        } else {
+            let result = assert_one_json_document(&output.stdout);
+            assert_eq!(result["outcome"], "invalid_response");
+            assert!(result.get("publication").is_none());
+        }
+        assert_eq!(server.finish().len(), 1);
+    }
 }
