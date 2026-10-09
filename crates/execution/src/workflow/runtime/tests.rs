@@ -4,9 +4,9 @@ use std::time::Duration;
 
 use super::*;
 use crate::workflow::admission::{
-    CancellationPolicy, CancellationReason, CancellationSource, CaptureLimits, EnvironmentSnapshot,
-    ExecutionContext, ExecutionPolicyLimits, InputLimits, ResolvedInput, ResolvedInputs,
-    ResolvedJsonInput, admit_runner_workflow, admit_workflow,
+    AdmittedWorkflow, CancellationPolicy, CancellationReason, CancellationSource, CaptureLimits,
+    EnvironmentSnapshot, ExecutionContext, ExecutionPolicyLimits, InputLimits, ResolvedInput,
+    ResolvedInputs, ResolvedJsonInput, admit_runner_workflow, admit_workflow,
 };
 use crate::workflow::resolution;
 use crate::workflow::test_support::ReductionBuilder;
@@ -899,15 +899,36 @@ steps:
     ));
 }
 
-#[test]
-fn inferred_data_edges_drive_runtime_scheduling_and_blocking() {
+/// Admits an input-free workflow source with default test limits.
+fn admit_test_workflow(source: &str) -> (tempfile::TempDir, AdmittedWorkflow) {
     let temporary = tempfile::tempdir().unwrap();
     let source_root = temporary.path().join("source");
     let execution_root = temporary.path().join("execution");
     fs::create_dir(&source_root).unwrap();
     fs::create_dir(&execution_root).unwrap();
-    fs::write(
-        source_root.join("workflow.yaml"),
+    fs::write(source_root.join("workflow.yaml"), source).unwrap();
+    let admitted = admit_workflow(
+        resolution::resolve(&source_root, Path::new("workflow.yaml")).unwrap(),
+        ResolvedInputs::default(),
+        ExecutionContext::new(
+            execution_root,
+            ExecutionPolicyLimits::new(
+                2,
+                CaptureLimits::new(1024, 1024 * 1024, 64 * 1024 * 1024),
+                InputLimits::new(1024, 1024 * 1024, 64 * 1024 * 1024, 64 * 1024 * 1024),
+                1024 * 1024,
+            ),
+            EnvironmentSnapshot::default(),
+            CancellationPolicy::new(CancellationSource::new(), Duration::from_secs(1)),
+        ),
+    )
+    .unwrap();
+    (temporary, admitted)
+}
+
+#[test]
+fn inferred_data_edges_drive_runtime_scheduling_and_blocking() {
+    let (_temporary, admitted) = admit_test_workflow(
         "schemaVersion: 1
 steps:
   consumer:
@@ -928,25 +949,7 @@ steps:
         path: artifact.txt
         mediaType: text/plain
 ",
-    )
-    .unwrap();
-    let admitted = admit_workflow(
-        resolution::resolve(&source_root, Path::new("workflow.yaml")).unwrap(),
-        ResolvedInputs::default(),
-        ExecutionContext::new(
-            execution_root,
-            ExecutionPolicyLimits::new(
-                2,
-                CaptureLimits::new(1024, 1024 * 1024, 64 * 1024 * 1024),
-                InputLimits::new(1024, 1024 * 1024, 64 * 1024 * 1024, 64 * 1024 * 1024),
-                1024 * 1024,
-            ),
-            EnvironmentSnapshot::default(),
-            CancellationPolicy::new(CancellationSource::new(), Duration::from_secs(1)),
-        ),
-    )
-    .unwrap();
-
+    );
     let initialization = initialize::<String, String, String, TestDeadline>(&admitted, None);
     assert_eq!(initialization.actions, [start_action(1, "producer")]);
     assert_step(&initialization.state, "consumer", StepStateKind::Pending);
@@ -964,6 +967,62 @@ steps:
         reduction.state.steps["consumer"].state,
         blocked_state([Prerequisite::body("outputs.producer.artifact").unwrap()])
     );
+    assert_eq!(
+        reduction.state.workflow,
+        WorkflowState::Failed {
+            primary_issue: primary_issue.clone(),
+            later_cancellation: None,
+        }
+    );
+    assert_eq!(
+        reduction.actions,
+        [finish_failed_action(5, primary_issue, ExportSet::new())]
+    );
+}
+
+#[test]
+fn failure_stop_blocks_a_conditioned_step_whose_body_input_failed() {
+    let (_temporary, admitted) = admit_test_workflow(
+        "schemaVersion: 1
+steps:
+  consumer:
+    kind: cmd
+    condition:
+      disposition: {node: producer, is: succeeded}
+    inputs:
+      artifact:
+        ref: outputs.producer.artifact
+    command:
+      argv: [\"true\"]
+  producer:
+    kind: cmd
+    command:
+      argv: [\"true\"]
+    outputs:
+      artifact:
+        kind: file
+        from: path
+        path: artifact.txt
+        mediaType: text/plain
+",
+    );
+
+    let initialization = initialize::<String, String, String, TestDeadline>(&admitted, None);
+    assert_step(&initialization.state, "consumer", StepStateKind::Pending);
+    let reduction = reduce(
+        &initialization.state,
+        Occurrence::StepStartFailed {
+            step: "producer".to_owned(),
+            action: action_id(1),
+            cause: "failed to start".to_owned(),
+        },
+    );
+
+    assert_eq!(
+        reduction.state.steps["consumer"].state,
+        blocked_state([Prerequisite::body("outputs.producer.artifact").unwrap()])
+    );
+    let primary_issue = failure("producer", FailurePhase::Start, "failed to start");
     assert_eq!(
         reduction.state.workflow,
         WorkflowState::Failed {

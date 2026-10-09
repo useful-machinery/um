@@ -2945,7 +2945,8 @@ fn next_ordinary_pending_disposition<Cause, Output, Deadline>(
         if !matches!(runtime.state, StepState::Pending) {
             return None;
         }
-        let blockers = ordinary_unsatisfied_prerequisites(state, step_id, definition);
+        let blockers =
+            ordinary_unsatisfied_prerequisites(state, step_id, definition, failure_stopped);
         if !blockers.is_empty() {
             return BlockedDetail::new(blockers)
                 .ok()
@@ -3009,20 +3010,29 @@ fn condition_blockers<Cause, Output, Deadline>(
     blockers
 }
 
+// While scheduling is open, an unevaluated condition owns readiness: a false condition skips
+// the step even when its body inputs are unavailable. After a failure stop no condition is
+// evaluated again, so body and control prerequisites must also block or the step would remain
+// pending forever.
 fn ordinary_unsatisfied_prerequisites<Cause, Output, Deadline>(
     state: &RuntimeState<Cause, Output, Deadline>,
     id: &str,
     definition: &RuntimeStep,
+    failure_stopped: bool,
 ) -> Vec<Prerequisite> {
     let condition_pending = definition.condition.is_some()
         && state
             .steps
             .get(id)
             .is_some_and(|runtime| !runtime.condition_passed);
-    if condition_pending {
-        return condition_blockers(state, definition);
+    let mut blockers = if condition_pending {
+        condition_blockers(state, definition)
+    } else {
+        Vec::new()
+    };
+    if condition_pending && !failure_stopped {
+        return blockers;
     }
-    let mut blockers = Vec::new();
     for prerequisite in definition.prerequisites.iter() {
         let Some(producer) = state.steps.get(&prerequisite.producer) else {
             continue;
@@ -3035,6 +3045,7 @@ fn ordinary_unsatisfied_prerequisites<Cause, Output, Deadline>(
         if prerequisite.control
             && !control_satisfied
             && let Ok(blocker) = Prerequisite::control(prerequisite.producer.clone())
+            && !blockers.contains(&blocker)
         {
             blockers.push(blocker);
         }
