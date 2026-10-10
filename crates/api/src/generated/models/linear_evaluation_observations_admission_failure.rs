@@ -17,56 +17,55 @@ use crate::generated::models;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Default, Debug, PartialEq, Serialize, Deserialize)]
-pub struct RunArtifactDeliveryRegistrationFailed {
-    #[serde(rename = "state")]
-    pub state: State,
+pub struct LinearEvaluationObservationsAdmissionFailure {
     #[serde(rename = "phase")]
     pub phase: Phase,
-    #[serde(rename = "code")]
-    pub code: Code,
+    #[serde(rename = "cause")]
+    pub cause: Cause,
 }
 
-impl RunArtifactDeliveryRegistrationFailed {
-    pub fn new(state: State, phase: Phase, code: Code) -> RunArtifactDeliveryRegistrationFailed {
-        RunArtifactDeliveryRegistrationFailed { state, phase, code }
-    }
-}
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
-pub enum State {
-    #[serde(rename = "failed")]
-    Failed,
-}
-
-impl Default for State {
-    fn default() -> State {
-        Self::Failed
+impl LinearEvaluationObservationsAdmissionFailure {
+    pub fn new(phase: Phase, cause: Cause) -> LinearEvaluationObservationsAdmissionFailure {
+        LinearEvaluationObservationsAdmissionFailure { phase, cause }
     }
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
 pub enum Phase {
-    #[serde(rename = "registration")]
-    Registration,
+    #[serde(rename = "create_run")]
+    CreateRun,
 }
 
 impl Default for Phase {
     fn default() -> Phase {
-        Self::Registration
+        Self::CreateRun
     }
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
-pub enum Code {
-    #[serde(rename = "storage_quota_exceeded")]
-    StorageQuotaExceeded,
-    #[serde(rename = "upload_authorization_failed")]
-    UploadAuthorizationFailed,
-    #[serde(rename = "stored_object_conflict")]
-    StoredObjectConflict,
-    #[serde(rename = "delivery_internal_failure")]
-    DeliveryInternalFailure,
+pub enum Cause {
+    #[serde(rename = "input_binding_invalid")]
+    InputBindingInvalid,
+    #[serde(rename = "input_schema_invalid")]
+    InputSchemaInvalid,
+    #[serde(rename = "request_invalid")]
+    RequestInvalid,
+    #[serde(rename = "input_set_invalid")]
+    InputSetInvalid,
+    #[serde(rename = "workflow_invalid")]
+    WorkflowInvalid,
+    #[serde(rename = "source_unavailable")]
+    SourceUnavailable,
+    #[serde(rename = "input_storage_unavailable")]
+    InputStorageUnavailable,
+    #[serde(rename = "authorization_rejected")]
+    AuthorizationRejected,
+    #[serde(rename = "cancelled")]
+    Cancelled,
+    #[serde(rename = "unknown")]
+    Unknown,
 }
 
-impl Default for Code {
-    fn default() -> Code {
-        Self::StorageQuotaExceeded
+impl Default for Cause {
+    fn default() -> Cause {
+        Self::InputBindingInvalid
     }
 }

@@ -1212,6 +1212,9 @@ fn failure_code(
         RunFailure::Conflict | RunFailure::RetryConflict(_) => {
             ("submission_failed", ExitCode::GeneralFailure)
         }
+        RunFailure::InputAdmissionRejected { .. } => {
+            ("input_admission_rejected", ExitCode::GeneralFailure)
+        }
         RunFailure::RetryAfter(_)
         | RunFailure::RetryAmbiguousRateLimited
         | RunFailure::RetryAmbiguousAuthentication
@@ -1497,6 +1500,52 @@ fn write_create(
     json: bool,
 ) -> anyhow::Result<ExitCode> {
     let (key, run_dispatched) = submission;
+    if let Err(RunFailure::InputAdmissionRejected {
+        status,
+        problem_type,
+        diagnostic,
+    }) = &result
+    {
+        if json {
+            output::write_input_admission_failure(
+                deployment,
+                organization,
+                input_set_id,
+                key,
+                output::InputAdmissionProblem {
+                    status: *status,
+                    problem_type,
+                    diagnostic: diagnostic
+                        .as_ref()
+                        .map(|(code, input)| (*code, input.as_str())),
+                },
+            )?;
+        } else {
+            let mut stderr = io::stderr().lock();
+            writeln!(
+                stderr,
+                "error: Cloud run input admission rejected (HTTP {status})\nproblem type: https://api.usefulmachinery.com/problems/{problem_type}"
+            )?;
+            if let Some((code, input)) = diagnostic {
+                writeln!(stderr, "diagnostic.code: {code}\ndiagnostic.input: {input}")?;
+            }
+            let remedy = match *problem_type {
+                "run-input-set-not-sealed" => {
+                    "Seal the retained input set before submitting again."
+                }
+                "run-input-set-consumed" | "run-input-set-expired" => {
+                    "Create and seal a new input set before submitting again."
+                }
+                _ => "Correct the named input's kind or schema and submit a corrected request.",
+            };
+            writeln!(
+                stderr,
+                "input set: {}\n\nInspect the input set with `um run input-set show`. {remedy} This rejection did not create a run.",
+                input_set_id.unwrap_or("none")
+            )?;
+        }
+        return Ok(ExitCode::GeneralFailure);
+    }
     match result {
         Ok(acceptance) => {
             if json {
@@ -1975,6 +2024,11 @@ fn write_failure_with_input_set(
             "conflict",
             None,
             "error: Cloud run request conflicts with current state\n\nCheck the resource state and try again.".to_owned(),
+            OutcomeClass::GeneralFailure,
+        ),
+        RunFailure::InputAdmissionRejected { .. } => (
+            "input_admission_rejected", None,
+            "error: Cloud run input admission rejected\n\nCorrect the named input and submit a corrected request.".to_owned(),
             OutcomeClass::GeneralFailure,
         ),
         RunFailure::CreationRejected => (

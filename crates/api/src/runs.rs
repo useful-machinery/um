@@ -639,6 +639,12 @@ pub enum RunFailure {
     InvalidInput,
     NotFound,
     Conflict,
+    /// Reviewed input-admission problem fields only; never carry server prose.
+    InputAdmissionRejected {
+        status: u16,
+        problem_type: &'static str,
+        diagnostic: Option<(&'static str, String)>,
+    },
     IdempotencyConflict,
     CreationRejected,
     RetryConflict(RetryConflict),
@@ -652,7 +658,9 @@ pub enum RunFailure {
     InputUploadRejected,
     InputDownloadRejected,
     Interrupted,
-    Protocol { credential_rejected: bool },
+    Protocol {
+        credential_rejected: bool,
+    },
 }
 
 impl RunFailure {
@@ -936,11 +944,24 @@ pub(super) fn classify_failure(response: &ReceivedResponse, operation: RunOperat
                 {
                     RunFailure::IdempotencyConflict
                 }
+                Ok(problem) if operation == RunOperation::Create => {
+                    input_admission_rejection(response, problem).unwrap_or(RunFailure::Conflict)
+                }
                 Ok(_) => RunFailure::Conflict,
                 Err(_) => RunFailure::protocol(false),
             }
         }
         StatusCode::GONE if matches!(operation, RunOperation::Create | RunOperation::Input) => {
+            if operation == RunOperation::Create
+                && let Ok(problem) = problem::decode_header_parts(
+                    &response.body,
+                    response.status,
+                    response.content_type.as_ref(),
+                )
+                && let Some(rejection) = input_admission_rejection(response, problem)
+            {
+                return rejection;
+            }
             validated_problem_failure(response, None, RunFailure::Gone, false)
         }
         StatusCode::PAYLOAD_TOO_LARGE | StatusCode::UNSUPPORTED_MEDIA_TYPE
@@ -952,6 +973,62 @@ pub(super) fn classify_failure(response: &ReceivedResponse, operation: RunOperat
         status if status.is_server_error() => RunFailure::Unreachable(UnreachableCategory::Server),
         _ => RunFailure::protocol(false),
     }
+}
+
+// Only repository-owned terminal input-set problems qualify. Server detail and
+// title are never used; an absent or unsafe diagnostic does not erase the status.
+fn input_admission_rejection(
+    response: &ReceivedResponse,
+    problem: models::Problem,
+) -> Option<RunFailure> {
+    let problem_type = match (response.status, problem.r#type.as_str()) {
+        (
+            StatusCode::CONFLICT,
+            "https://api.usefulmachinery.com/problems/run-input-bindings-invalid",
+        ) => "run-input-bindings-invalid",
+        (
+            StatusCode::CONFLICT,
+            "https://api.usefulmachinery.com/problems/run-input-schema-mismatch",
+        ) => "run-input-schema-mismatch",
+        (
+            StatusCode::CONFLICT,
+            "https://api.usefulmachinery.com/problems/run-input-set-not-sealed",
+        ) => "run-input-set-not-sealed",
+        (
+            StatusCode::CONFLICT,
+            "https://api.usefulmachinery.com/problems/run-input-set-consumed",
+        ) => "run-input-set-consumed",
+        (StatusCode::GONE, "https://api.usefulmachinery.com/problems/run-input-set-expired") => {
+            "run-input-set-expired"
+        }
+        _ => return None,
+    };
+    let diagnostic = problem.diagnostic.and_then(|diagnostic| {
+        if diagnostic.input.is_empty()
+            || diagnostic.input.len() > 128
+            || !diagnostic
+                .input
+                .bytes()
+                .all(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b'-')
+        {
+            return None;
+        }
+        let code = match diagnostic.code {
+            models::run_input_diagnostic::Code::MissingRequiredInput => "missing_required_input",
+            models::run_input_diagnostic::Code::UnexpectedInput => "unexpected_input",
+            models::run_input_diagnostic::Code::InputKindMismatch => "input_kind_mismatch",
+            models::run_input_diagnostic::Code::InputSchemaMismatch => "input_schema_mismatch",
+            models::run_input_diagnostic::Code::InputMediaTypeMismatch => {
+                "input_media_type_mismatch"
+            }
+        };
+        Some((code, diagnostic.input))
+    });
+    Some(RunFailure::InputAdmissionRejected {
+        status: response.status.as_u16(),
+        problem_type,
+        diagnostic,
+    })
 }
 
 fn validated_problem_failure(

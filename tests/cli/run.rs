@@ -3627,6 +3627,160 @@ fn run_create_consumes_an_explicit_sealed_input_set_without_restaging() {
 }
 
 #[test]
+fn create_json_input_rejected_by_file_workflow_reports_safe_binding_diagnostic() {
+    let directory = tempfile::tempdir().unwrap();
+    let input = directory.path().join("request.json");
+    let bytes = b"{\"private\":\"ticket sentinel\"}";
+    fs::write(&input, bytes).unwrap();
+    let storage = OneShotServer::respond("204 No Content", None, b"");
+    let signed_url = format!(
+        "{}/private/request?signature=capability-sentinel",
+        storage.api_url
+    );
+    let rejection = problem_http_response(
+        "409 Conflict",
+        serde_json::json!({
+            "type": "https://api.usefulmachinery.com/problems/run-input-bindings-invalid",
+            "title": "Run Input bindings invalid", "status": 409,
+            "detail": "ticket sentinel must not be displayed",
+            "diagnostic": { "code": "input_kind_mismatch", "input": "request" }
+        }),
+    );
+    let (server, _credentials, credential_path) = prepared_run(vec![
+        create_scalar_input_set_response(bytes, "json", false),
+        scalar_upload_capability_response(bytes, "application/json", &signed_url),
+        seal_scalar_input_set_response(bytes, "json", false),
+        rejection,
+    ]);
+    let environment = deployment_environment(&server.api_url, &credential_path);
+    let output = run_with_env(
+        &create_args_with_scalar_input(
+            "--input-json-file",
+            "request",
+            input.to_str().unwrap(),
+            false,
+        ),
+        &environment,
+    );
+    assert_eq!(output.status.code(), Some(1));
+    let diagnostic = String::from_utf8_lossy(&output.stderr);
+    for fact in [
+        "HTTP 409",
+        "run-input-bindings-invalid",
+        "diagnostic.code: input_kind_mismatch",
+        "diagnostic.input: request",
+        INPUT_SET_ID,
+    ] {
+        assert!(diagnostic.contains(fact), "missing {fact}: {diagnostic}");
+    }
+    assert_no_secret_output(&output, &["ticket sentinel", "capability-sentinel"]);
+    let requests = server.finish();
+    assert_eq!(requests.len(), 4);
+    assert_eq!(request_body(&requests[3])["inputSetId"], INPUT_SET_ID);
+    storage.finish();
+}
+
+#[test]
+fn create_input_admission_json_keeps_cloud_envelope_and_safe_diagnostic() {
+    let (server, _directory, credential_path) = prepared_run(vec![problem_http_response(
+        "409 Conflict",
+        serde_json::json!({
+            "type": "https://api.usefulmachinery.com/problems/run-input-bindings-invalid",
+            "title": "Run Input bindings invalid", "status": 409,
+            "detail": "ticket sentinel",
+            "diagnostic": { "code": "input_kind_mismatch", "input": "request" }
+        }),
+    )]);
+    let environment = deployment_environment(&server.api_url, &credential_path);
+    let mut arguments = create_args(true);
+    let insertion = arguments.len() - 1;
+    arguments.splice(insertion..insertion, ["--input-set-id", INPUT_SET_ID]);
+    let output = run_with_env(&arguments, &environment);
+    assert_eq!(output.status.code(), Some(1));
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["operation"], "create");
+    assert_eq!(result["outcome"], "error");
+    assert_eq!(result["inputSetId"], INPUT_SET_ID);
+    assert_eq!(result["error"]["httpStatus"], 409);
+    assert_eq!(
+        result["error"]["problemType"],
+        "https://api.usefulmachinery.com/problems/run-input-bindings-invalid"
+    );
+    assert_eq!(result["error"]["diagnostic"]["code"], "input_kind_mismatch");
+    assert_eq!(result["error"]["diagnostic"]["input"], "request");
+    assert!(result["error"]["idempotencyKey"].as_str().is_some());
+    assert_no_secret_output(&output, &["ticket sentinel"]);
+    assert_eq!(server.finish().len(), 1);
+}
+
+#[test]
+fn create_input_set_rejections_without_diagnostic_retain_safe_http_facts() {
+    for (status, kind, remedy) in [
+        (
+            "409 Conflict",
+            "run-input-set-not-sealed",
+            "Seal the retained input set",
+        ),
+        (
+            "409 Conflict",
+            "run-input-set-consumed",
+            "Create and seal a new input set",
+        ),
+        (
+            "410 Gone",
+            "run-input-set-expired",
+            "Create and seal a new input set",
+        ),
+    ] {
+        for json in [false, true] {
+            let (server, _directory, credential_path) = prepared_run(vec![problem_http_response(
+                status,
+                serde_json::json!({
+                    "type": format!("https://api.usefulmachinery.com/problems/{kind}"),
+                    "title": "Input set not ready", "status": if status == "410 Gone" { 410 } else { 409 },
+                    "detail": "ticket sentinel"
+                }),
+            )]);
+            let environment = deployment_environment(&server.api_url, &credential_path);
+            let mut arguments = create_args(json);
+            let insertion = arguments.len() - 1;
+            arguments.splice(insertion..insertion, ["--input-set-id", INPUT_SET_ID]);
+            let output = run_with_env(&arguments, &environment);
+            assert_eq!(output.status.code(), Some(1), "{kind}");
+            if json {
+                let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+                assert_eq!(
+                    result["error"]["httpStatus"],
+                    if status == "410 Gone" { 410 } else { 409 }
+                );
+                assert_eq!(
+                    result["error"]["problemType"],
+                    format!("https://api.usefulmachinery.com/problems/{kind}")
+                );
+                assert!(result["error"].get("diagnostic").is_none());
+                assert_eq!(result["inputSetId"], INPUT_SET_ID);
+            } else {
+                let diagnostic = String::from_utf8_lossy(&output.stderr);
+                assert!(
+                    diagnostic.contains(kind)
+                        && diagnostic.contains(INPUT_SET_ID)
+                        && diagnostic.contains(remedy)
+                        && diagnostic.contains(if status == "410 Gone" {
+                            "HTTP 410"
+                        } else {
+                            "HTTP 409"
+                        }),
+                    "{diagnostic}"
+                );
+                assert!(!diagnostic.contains("diagnostic.code"));
+            }
+            assert_no_secret_output(&output, &["ticket sentinel"]);
+            assert_eq!(server.finish().len(), 1);
+        }
+    }
+}
+
+#[test]
 fn explicit_input_set_conflicts_with_acquired_inputs_before_cloud_access() {
     let output = Command::new(env!("CARGO_BIN_EXE_um"))
         .args([

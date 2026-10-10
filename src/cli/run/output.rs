@@ -35,6 +35,8 @@ struct CloudResult<'a> {
     deployment: &'a str,
     organization_ref: &'a str,
     run_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    input_set_id: Option<&'a str>,
     outcome: &'static str,
     run: Option<&'a Run>,
     publication: Option<&'a Publication>,
@@ -50,6 +52,64 @@ struct CloudError<'a> {
     idempotency_key: Option<&'a str>,
     requested_mode: Option<&'a str>,
     request_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    http_status: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    problem_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    diagnostic: Option<InputAdmissionDiagnostic<'a>>,
+}
+
+#[derive(Serialize)]
+struct InputAdmissionDiagnostic<'a> {
+    code: &'a str,
+    input: &'a str,
+}
+
+pub(super) struct InputAdmissionProblem<'a> {
+    pub status: u16,
+    pub problem_type: &'a str,
+    pub diagnostic: Option<(&'a str, &'a str)>,
+}
+
+pub(super) fn write_input_admission_failure(
+    deployment: &str,
+    organization: &str,
+    input_set_id: Option<&str>,
+    key: Option<&str>,
+    problem: InputAdmissionProblem<'_>,
+) -> anyhow::Result<()> {
+    let result = CloudResult {
+        schema_version: 1,
+        operation: "create",
+        deployment,
+        organization_ref: organization,
+        run_id: None,
+        input_set_id,
+        outcome: "error",
+        run: None,
+        publication: None,
+        cancellation_request: None,
+        replayed: None,
+        error: Some(CloudError {
+            code: "input_admission_rejected",
+            idempotency_key: key,
+            requested_mode: None,
+            request_id: None,
+            http_status: Some(problem.status),
+            problem_type: Some(format!(
+                "https://api.usefulmachinery.com/problems/{}",
+                problem.problem_type
+            )),
+            diagnostic: problem
+                .diagnostic
+                .map(|(code, input)| InputAdmissionDiagnostic { code, input }),
+        }),
+    };
+    let mut stdout = io::stdout().lock();
+    serde_json::to_writer(&mut stdout, &result)?;
+    writeln!(stdout)?;
+    Ok(())
 }
 
 pub(super) struct CloudOutput<'a> {
@@ -82,6 +142,7 @@ pub(super) fn write_cloud(
             deployment,
             organization_ref: organization,
             run_id: snapshot.run_id.as_deref(),
+            input_set_id: None,
             outcome,
             run: snapshot.run.as_deref(),
             publication: snapshot.publication.as_deref(),
@@ -95,6 +156,9 @@ pub(super) fn write_cloud(
                     .cancellation_request
                     .as_deref()
                     .map(|request| request.id.as_str()),
+                http_status: None,
+                problem_type: None,
+                diagnostic: None,
             }),
         };
         let stdout = io::stdout();
