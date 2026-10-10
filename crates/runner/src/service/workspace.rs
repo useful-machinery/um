@@ -24,20 +24,106 @@ use um_execution::{
     remove_open_tree_at,
 };
 
-const LOCK_FILE_NAME: &str = ".scherzo-runner-serve.lock";
-const OWNERSHIP_MARKER_NAME: &str = ".scherzo-runner-serve-owner-v1";
-const ATTEMPT_RECORD_NAME: &str = ".scherzo-runner-serve-attempt-v1";
-const CLAIM_RECORD_NAME: &str = ".scherzo-runner-serve-claim-v1";
-const RETAINED_PARENT_NAME: &str = ".scherzo-runner-serve-retained-parent-v1";
-const ATTEMPT_RECORD_STAGING_PREFIX: &str = ".scherzo-runner-serve-attempt-staging-";
-const ATTEMPT_RECORD_HEADER: &str = "scherzo-runner-serve/attempt/v1";
-const CLEANUP_AUTHORITY_PREFIX: &str = ".scherzo-runner-serve-cleanup-v1-";
-const CLEANUP_AUTHORITY_STAGING_PREFIX: &str = ".scherzo-runner-serve-cleanup-staging-";
-const CLEANUP_AUTHORITY_HEADER: &str = "scherzo-runner-serve/cleanup-authority/v1";
-const CLEANUP_IDENTITY_ATTRIBUTE: &str = "user.scherzo.runner-cleanup-v1";
+const LOCK_FILE_NAME: &str = ".um-runner-serve.lock";
+const OWNERSHIP_MARKER_NAME: &str = ".um-runner-serve-owner-v1";
+const ATTEMPT_RECORD_NAME: &str = ".um-runner-serve-attempt-v1";
+const CLAIM_RECORD_NAME: &str = ".um-runner-serve-claim-v1";
+const RETAINED_PARENT_NAME: &str = ".um-runner-serve-retained-parent-v1";
+const ATTEMPT_RECORD_STAGING_PREFIX: &str = ".um-runner-serve-attempt-staging-";
+const ATTEMPT_RECORD_HEADER: &str = "um-runner-serve/attempt/v1";
+const CLEANUP_AUTHORITY_PREFIX: &str = ".um-runner-serve-cleanup-v1-";
+const CLEANUP_AUTHORITY_STAGING_PREFIX: &str = ".um-runner-serve-cleanup-staging-";
+const CLEANUP_AUTHORITY_HEADER: &str = "um-runner-serve/cleanup-authority/v1";
+const CLEANUP_IDENTITY_ATTRIBUTE: &str = "user.um.runner-cleanup-v1";
 const CLEANUP_IDENTITY_BYTES: usize = 32;
-const BOOT_MARKER: &[u8] = b"scherzo-runner-serve/boot-root/v1\n";
-const ASSIGNMENT_MARKER: &[u8] = b"scherzo-runner-serve/assignment-root/v1\n";
+const BOOT_MARKER: &[u8] = b"um-runner-serve/boot-root/v1\n";
+const ASSIGNMENT_MARKER: &[u8] = b"um-runner-serve/assignment-root/v1\n";
+// Historical boots are diagnostic-only. Never rewrite their evidence or use
+// this descriptor to authorize a current-boot claim or cleanup.
+#[derive(Clone, Copy)]
+struct RetainedFormat {
+    marker_name: &'static str,
+    boot_marker: &'static [u8],
+    assignment_marker: &'static [u8],
+    attempt_name: &'static str,
+    attempt_header: &'static str,
+}
+
+const CURRENT_RETAINED_FORMAT: RetainedFormat = RetainedFormat {
+    marker_name: OWNERSHIP_MARKER_NAME,
+    boot_marker: BOOT_MARKER,
+    assignment_marker: ASSIGNMENT_MARKER,
+    attempt_name: ATTEMPT_RECORD_NAME,
+    attempt_header: ATTEMPT_RECORD_HEADER,
+};
+const LEGACY_RETAINED_FORMAT: RetainedFormat = RetainedFormat {
+    marker_name: ".scherzo-runner-serve-owner-v1",
+    boot_marker: b"scherzo-runner-serve/boot-root/v1\n",
+    assignment_marker: b"scherzo-runner-serve/assignment-root/v1\n",
+    attempt_name: ".scherzo-runner-serve-attempt-v1",
+    attempt_header: "scherzo-runner-serve/attempt/v1",
+};
+const LEGACY_CLAIM_RECORD_NAME: &str = ".scherzo-runner-serve-claim-v1";
+
+impl RetainedFormat {
+    fn capture_boot(parent: Arc<OwnedFd>) -> Result<(Self, MarkerProof), ()> {
+        let format = match (
+            statat(
+                parent.as_ref(),
+                CURRENT_RETAINED_FORMAT.marker_name,
+                AtFlags::SYMLINK_NOFOLLOW,
+            ),
+            statat(
+                parent.as_ref(),
+                LEGACY_RETAINED_FORMAT.marker_name,
+                AtFlags::SYMLINK_NOFOLLOW,
+            ),
+        ) {
+            (Ok(_), Err(Errno::NOENT)) => CURRENT_RETAINED_FORMAT,
+            (Err(Errno::NOENT), Ok(_)) => LEGACY_RETAINED_FORMAT,
+            _ => return Err(()),
+        };
+        let marker = format.capture_marker(parent, format.boot_marker)?;
+        Ok((format, marker))
+    }
+
+    fn capture_marker(
+        self,
+        parent: Arc<OwnedFd>,
+        contents: &'static [u8],
+    ) -> Result<MarkerProof, ()> {
+        let other_name = if self.marker_name == OWNERSHIP_MARKER_NAME {
+            LEGACY_RETAINED_FORMAT.marker_name
+        } else {
+            OWNERSHIP_MARKER_NAME
+        };
+        if !matches!(
+            statat(parent.as_ref(), other_name, AtFlags::SYMLINK_NOFOLLOW),
+            Err(Errno::NOENT)
+        ) {
+            return Err(());
+        }
+        MarkerProof::capture_named(parent, self.marker_name, contents)
+    }
+
+    fn read_attempt(self, directory: &OwnedFd) -> Result<AttemptRecord, ()> {
+        let other_name = if self.attempt_name == ATTEMPT_RECORD_NAME {
+            LEGACY_RETAINED_FORMAT.attempt_name
+        } else {
+            ATTEMPT_RECORD_NAME
+        };
+        if !matches!(
+            statat(directory, other_name, AtFlags::SYMLINK_NOFOLLOW),
+            Err(Errno::NOENT)
+        ) {
+            return Err(());
+        }
+        let contents =
+            read_private_record_at(directory, self.attempt_name, MAXIMUM_ATTEMPT_RECORD_BYTES)?;
+        AttemptRecord::decode_with_header(&contents, self.attempt_header)
+    }
+}
+
 const PRIVATE_FILE_MODE: u32 = 0o600;
 const PRIVATE_DIRECTORY_MODE: u32 = 0o700;
 const MAXIMUM_ATTEMPT_RECORD_BYTES: u64 = 512;
@@ -516,9 +602,13 @@ impl AttemptRecord {
     }
 
     fn decode(contents: &[u8]) -> Result<Self, ()> {
+        Self::decode_with_header(contents, ATTEMPT_RECORD_HEADER)
+    }
+
+    fn decode_with_header(contents: &[u8], header: &str) -> Result<Self, ()> {
         let contents = std::str::from_utf8(contents).map_err(|_| ())?;
         let mut lines = contents.split('\n');
-        if lines.next() != Some(ATTEMPT_RECORD_HEADER) {
+        if lines.next() != Some(header) {
             return Err(());
         }
         let assignment_id = parse_authority_field(&mut lines, "assignment-id=")?;
@@ -744,10 +834,14 @@ struct CleanupEngine {
 }
 
 fn claim_absent_at(directory: &OwnedFd) -> bool {
-    matches!(
-        statat(directory, CLAIM_RECORD_NAME, AtFlags::SYMLINK_NOFOLLOW),
-        Err(rustix::io::Errno::NOENT)
-    )
+    [CLAIM_RECORD_NAME, LEGACY_CLAIM_RECORD_NAME]
+        .into_iter()
+        .all(|name| {
+            matches!(
+                statat(directory, name, AtFlags::SYMLINK_NOFOLLOW),
+                Err(Errno::NOENT)
+            )
+        })
 }
 
 impl CleanupEngine {
@@ -835,6 +929,7 @@ impl CleanupEngine {
 #[derive(Clone)]
 struct MarkerProof {
     parent: Arc<OwnedFd>,
+    name: &'static str,
     contents: &'static [u8],
     device: u64,
     inode: u64,
@@ -842,14 +937,18 @@ struct MarkerProof {
 
 impl MarkerProof {
     fn capture(parent: Arc<OwnedFd>, contents: &'static [u8]) -> Result<Self, ()> {
-        let metadata = statat(
-            parent.as_ref(),
-            OWNERSHIP_MARKER_NAME,
-            AtFlags::SYMLINK_NOFOLLOW,
-        )
-        .map_err(|_| ())?;
+        Self::capture_named(parent, OWNERSHIP_MARKER_NAME, contents)
+    }
+
+    fn capture_named(
+        parent: Arc<OwnedFd>,
+        name: &'static str,
+        contents: &'static [u8],
+    ) -> Result<Self, ()> {
+        let metadata = statat(parent.as_ref(), name, AtFlags::SYMLINK_NOFOLLOW).map_err(|_| ())?;
         let proof = Self {
             parent,
+            name,
             contents,
             device: normalized_device(metadata.st_dev),
             inode: metadata.st_ino,
@@ -860,11 +959,7 @@ impl MarkerProof {
 
     fn is_missing(&self) -> bool {
         matches!(
-            statat(
-                self.parent.as_ref(),
-                OWNERSHIP_MARKER_NAME,
-                AtFlags::SYMLINK_NOFOLLOW,
-            ),
+            statat(self.parent.as_ref(), self.name, AtFlags::SYMLINK_NOFOLLOW,),
             Err(Errno::NOENT)
         )
     }
@@ -1137,7 +1232,7 @@ fn safe_owned_directory_stat(metadata: &Stat) -> bool {
 fn verify_marker(marker: &MarkerProof) -> Result<(), ()> {
     let descriptor = openat(
         marker.parent.as_ref(),
-        OWNERSHIP_MARKER_NAME,
+        marker.name,
         OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
         Mode::empty(),
     )
@@ -1145,7 +1240,7 @@ fn verify_marker(marker: &MarkerProof) -> Result<(), ()> {
     let metadata = fstat(&descriptor).map_err(|_| ())?;
     let named = statat(
         marker.parent.as_ref(),
-        OWNERSHIP_MARKER_NAME,
+        marker.name,
         AtFlags::SYMLINK_NOFOLLOW,
     )
     .map_err(|_| ())?;
@@ -1198,7 +1293,11 @@ fn safe_private_file(metadata: &Metadata) -> bool {
         && metadata.nlink() == 1
 }
 
-fn discover_retained_workspaces(boot: &OwnedTree, retained: &mut Vec<RetainedWorkspace>) {
+fn discover_retained_workspaces(
+    boot: &OwnedTree,
+    format: RetainedFormat,
+    retained: &mut Vec<RetainedWorkspace>,
+) {
     let initial_count = retained.len();
     let Ok(directory) = boot.directory() else {
         retained.push(unknown_retained_root(boot.path()));
@@ -1229,7 +1328,9 @@ fn discover_retained_workspaces(boot: &OwnedTree, retained: &mut Vec<RetainedWor
             continue;
         };
         let Some(marker) = assignment_tree.directory().ok().and_then(|directory| {
-            MarkerProof::capture(Arc::clone(directory), ASSIGNMENT_MARKER).ok()
+            format
+                .capture_marker(Arc::clone(directory), format.assignment_marker)
+                .ok()
         }) else {
             retained.push(unknown_retained_root(&assignment_path));
             continue;
@@ -1237,7 +1338,7 @@ fn discover_retained_workspaces(boot: &OwnedTree, retained: &mut Vec<RetainedWor
         assignment_tree.install_marker(marker);
         let Ok(record) = assignment_tree
             .directory()
-            .and_then(|directory| read_attempt_record_at(directory.as_ref()))
+            .and_then(|directory| format.read_attempt(directory.as_ref()))
         else {
             retained.push(unknown_retained_root(&assignment_path));
             continue;
@@ -1420,15 +1521,16 @@ impl WorkRootLease {
                 startup_retained.push(unknown_retained_root(&path));
                 continue;
             };
-            let marker = tree.directory().ok().and_then(|directory| {
-                MarkerProof::capture(Arc::clone(directory), BOOT_MARKER).ok()
-            });
-            let Some(marker) = marker else {
+            let marker = tree
+                .directory()
+                .ok()
+                .and_then(|directory| RetainedFormat::capture_boot(Arc::clone(directory)).ok());
+            let Some((format, marker)) = marker else {
                 startup_retained.push(unknown_retained_root(&path));
                 continue;
             };
             tree.install_marker(marker);
-            discover_retained_workspaces(&tree, &mut startup_retained);
+            discover_retained_workspaces(&tree, format, &mut startup_retained);
         }
 
         authority
@@ -3048,6 +3150,172 @@ mod tests {
         assert_eq!(remover.calls.load(Ordering::Relaxed), 0);
     }
 
+    fn convert_retained_fixture_to_legacy(root: &Path) {
+        let boot = root.join(BOOT_A);
+        let assignment = boot.join(ASSIGNMENT);
+        for (path, contents) in [
+            (&boot, LEGACY_RETAINED_FORMAT.boot_marker),
+            (&assignment, LEGACY_RETAINED_FORMAT.assignment_marker),
+        ] {
+            fs::rename(
+                path.join(OWNERSHIP_MARKER_NAME),
+                path.join(LEGACY_RETAINED_FORMAT.marker_name),
+            )
+            .unwrap();
+            fs::write(path.join(LEGACY_RETAINED_FORMAT.marker_name), contents).unwrap();
+        }
+        let record = assignment.join(ATTEMPT_RECORD_NAME);
+        let contents = String::from_utf8(fs::read(&record).unwrap()).unwrap();
+        fs::rename(
+            &record,
+            assignment.join(LEGACY_RETAINED_FORMAT.attempt_name),
+        )
+        .unwrap();
+        fs::write(
+            assignment.join(LEGACY_RETAINED_FORMAT.attempt_name),
+            contents.replacen(
+                ATTEMPT_RECORD_HEADER,
+                LEGACY_RETAINED_FORMAT.attempt_header,
+                1,
+            ),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn legacy_directory_lock_excludes_new_owner_before_named_lock_creation() {
+        let root = private_work_root();
+        let directory = open_work_root(root.path()).unwrap();
+        FileExt::try_lock(&directory).unwrap();
+        let old_lock = open_lock(&root.path().join(".scherzo-runner-serve.lock")).unwrap();
+        FileExt::try_lock(&old_lock).unwrap();
+        assert!(matches!(
+            WorkRootLease::acquire_for_test(root.path(), BOOT_B),
+            Err(WorkRootError::WorkRootInUse)
+        ));
+        assert!(!root.path().join(LOCK_FILE_NAME).exists());
+        fs::remove_file(root.path().join(".scherzo-runner-serve.lock")).unwrap();
+        assert!(matches!(
+            WorkRootLease::acquire_for_test(root.path(), BOOT_B),
+            Err(WorkRootError::WorkRootInUse)
+        ));
+        assert!(!root.path().join(LOCK_FILE_NAME).exists());
+    }
+
+    #[test]
+    fn either_claim_family_fences_current_workspace_cleanup() {
+        for name in [CLAIM_RECORD_NAME, LEGACY_CLAIM_RECORD_NAME] {
+            let root = private_work_root();
+            let remover = ScriptedRemover::new([]);
+            let owner = owner_with_remover(root.path(), remover.clone());
+            let assignment = assignment_with_retained_file(&owner);
+            fs::write(owner.boot_path().join(ASSIGNMENT).join(name), b"claim").unwrap();
+            assert_eq!(
+                release_workspace(&assignment),
+                CleanupResult::Quarantined(CleanupFailure::Safety)
+            );
+            assert_eq!(remover.calls.load(Ordering::Relaxed), 0);
+            assert_eq!(
+                fs::read(assignment.workspace.path().join("owned")).unwrap(),
+                b"retained"
+            );
+        }
+    }
+
+    #[test]
+    fn unsafe_or_mixed_legacy_evidence_remains_unknown_and_untouched() {
+        #[derive(Clone, Copy, Debug)]
+        enum Mutation {
+            BothBootMarkers,
+            BothAssignmentMarkers,
+            OtherAssignmentFamily,
+            OtherAttemptHeader,
+            BothAttemptFiles,
+            MarkerSymlink,
+            MarkerDirectory,
+            MarkerMalformed,
+        }
+        for mutation in [
+            Mutation::BothBootMarkers,
+            Mutation::BothAssignmentMarkers,
+            Mutation::OtherAssignmentFamily,
+            Mutation::OtherAttemptHeader,
+            Mutation::BothAttemptFiles,
+            Mutation::MarkerSymlink,
+            Mutation::MarkerDirectory,
+            Mutation::MarkerMalformed,
+        ] {
+            let root = private_work_root();
+            let owner = owner_with_remover(root.path(), ScriptedRemover::new([]));
+            let (assignment, workspace) = retained_failed_assignment(&owner);
+            fs::write(workspace.join("owned"), b"retained").unwrap();
+            drop(assignment);
+            drop(owner);
+            convert_retained_fixture_to_legacy(root.path());
+            let boot = root.path().join(BOOT_A);
+            let assignment = boot.join(ASSIGNMENT);
+            let marker = assignment.join(LEGACY_RETAINED_FORMAT.marker_name);
+            let unknown = match mutation {
+                Mutation::BothBootMarkers => {
+                    fs::write(boot.join(OWNERSHIP_MARKER_NAME), BOOT_MARKER).unwrap();
+                    boot.clone()
+                }
+                Mutation::BothAssignmentMarkers => {
+                    fs::write(assignment.join(OWNERSHIP_MARKER_NAME), ASSIGNMENT_MARKER).unwrap();
+                    assignment.clone()
+                }
+                Mutation::OtherAssignmentFamily => {
+                    fs::rename(&marker, assignment.join(OWNERSHIP_MARKER_NAME)).unwrap();
+                    fs::write(assignment.join(OWNERSHIP_MARKER_NAME), ASSIGNMENT_MARKER).unwrap();
+                    assignment.clone()
+                }
+                Mutation::OtherAttemptHeader => {
+                    let record = AttemptRecord::new(
+                        ASSIGNMENT,
+                        "run_01k0z6r1w8f4jy2m7q9v3x5abc",
+                        "atm_01k0z6r1w8f4jy2m7q9v3x5abc",
+                    )
+                    .unwrap();
+                    fs::write(
+                        assignment.join(LEGACY_RETAINED_FORMAT.attempt_name),
+                        record.encode(),
+                    )
+                    .unwrap();
+                    assignment.clone()
+                }
+                Mutation::BothAttemptFiles => {
+                    fs::copy(
+                        assignment.join(LEGACY_RETAINED_FORMAT.attempt_name),
+                        assignment.join(ATTEMPT_RECORD_NAME),
+                    )
+                    .unwrap();
+                    assignment.clone()
+                }
+                Mutation::MarkerSymlink => {
+                    fs::rename(&marker, assignment.join("outside-marker")).unwrap();
+                    symlink("outside-marker", &marker).unwrap();
+                    assignment.clone()
+                }
+                Mutation::MarkerDirectory => {
+                    fs::remove_file(&marker).unwrap();
+                    create_private_directory(&marker).unwrap();
+                    assignment.clone()
+                }
+                Mutation::MarkerMalformed => {
+                    fs::write(&marker, b"unknown-version\n").unwrap();
+                    assignment.clone()
+                }
+            };
+            let current = WorkRootLease::acquire_for_test(root.path(), BOOT_B).unwrap();
+            assert_eq!(
+                current.startup_retained(),
+                &[unknown_retained_root(&unknown)],
+                "{mutation:?}"
+            );
+            assert_eq!(fs::read(workspace.join("owned")).unwrap(), b"retained");
+        }
+    }
+
     #[test]
     fn startup_retains_old_boots_and_creates_a_fresh_root() {
         let root = private_work_root();
@@ -3208,6 +3476,12 @@ mod tests {
 
     #[test]
     fn retained_attempt_survives_restart_with_identity_and_original_bytes() {
+        for legacy in [false, true] {
+            retained_attempt_survives_restart(legacy);
+        }
+    }
+
+    fn retained_attempt_survives_restart(legacy: bool) {
         let root = private_work_root();
         let remover = ScriptedRemover::new([]);
         let first = owner_with_remover(root.path(), remover.clone());
@@ -3237,6 +3511,32 @@ mod tests {
         );
         drop(assignment);
         drop(first);
+        if legacy {
+            convert_retained_fixture_to_legacy(root.path());
+        }
+        let format = if legacy {
+            LEGACY_RETAINED_FORMAT
+        } else {
+            CURRENT_RETAINED_FORMAT
+        };
+        let evidence = [
+            root.path().join(BOOT_A).join(format.marker_name),
+            root.path()
+                .join(BOOT_A)
+                .join(ASSIGNMENT)
+                .join(format.marker_name),
+            root.path()
+                .join(BOOT_A)
+                .join(ASSIGNMENT)
+                .join(format.attempt_name),
+        ];
+        let before: Vec<_> = evidence
+            .iter()
+            .map(|path| {
+                let metadata = fs::symlink_metadata(path).unwrap();
+                (metadata.dev(), metadata.ino(), fs::read(path).unwrap())
+            })
+            .collect();
 
         let second = WorkRootLease::acquire_for_test(root.path(), BOOT_B).unwrap();
         assert_eq!(
@@ -3268,6 +3568,23 @@ mod tests {
                 path: workspace.clone(),
                 reason: RetentionReason::Failed,
             }]
+        );
+        for (path, expected) in evidence.iter().zip(before) {
+            let metadata = fs::symlink_metadata(path).unwrap();
+            assert_eq!(
+                (metadata.dev(), metadata.ino(), fs::read(path).unwrap()),
+                expected
+            );
+        }
+        assert_eq!(
+            fs::read(second.boot_path().join(OWNERSHIP_MARKER_NAME)).unwrap(),
+            BOOT_MARKER
+        );
+        assert!(
+            !second
+                .boot_path()
+                .join(LEGACY_RETAINED_FORMAT.marker_name)
+                .exists()
         );
         // A new boot may enumerate the old bytes for diagnostics, but cannot
         // claim or clean them even with the correct path and IDs.

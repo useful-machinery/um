@@ -2973,7 +2973,7 @@ async fn cancellation_before_continuation_ready_releases_the_claim_without_an_ac
             previous_path
                 .parent()
                 .unwrap()
-                .join(".scherzo-runner-serve-claim-v1"),
+                .join(".um-runner-serve-claim-v1"),
         )
     })
     .await
