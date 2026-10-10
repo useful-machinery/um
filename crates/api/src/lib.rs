@@ -94,8 +94,9 @@ pub use http_util::{
 };
 pub use human_principal::HumanPrincipal;
 pub use identities::{
-    CommonIdentityFailure, IdentityApiError, LinkIdentityOutcome, ListIdentitiesOutcome,
-    OidcIdentity, RemoveIdentityOutcome, link_identity, list_identities, remove_identity,
+    CommonIdentityFailure, IdentityApiError, IdentityKind, LinkIdentityOutcome,
+    ListIdentitiesOutcome, OidcIdentity, RemoveIdentityOutcome, link_identity, list_identities,
+    remove_identity,
 };
 pub use lifecycle::{
     CancelDeletionOutcome, CommonLifecycleFailure, DeletionSchedule, LifecycleApiError,

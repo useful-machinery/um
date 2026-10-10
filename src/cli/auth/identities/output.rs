@@ -6,7 +6,7 @@ use time::OffsetDateTime;
 
 use crate::exit_code::{ExitCode, OutcomeClass};
 use um_api::{
-    CommonIdentityFailure, LinkIdentityOutcome, ListIdentitiesOutcome, OidcIdentity,
+    CommonIdentityFailure, IdentityKind, LinkIdentityOutcome, ListIdentitiesOutcome, OidcIdentity,
     RemoveIdentityOutcome, UnreachableCategory,
 };
 use um_human_auth::Deployment;
@@ -28,7 +28,7 @@ pub(super) fn write_list(
                     schema_version: 1,
                     deployment,
                     outcome: "listed",
-                    items: &page.items,
+                    items: page.items.iter().map(PresentedIdentity::new).collect(),
                     next_cursor: page.next_cursor.as_deref(),
                 })?;
             } else {
@@ -353,7 +353,7 @@ impl LinkOutput {
                 outcome: terminal.outcome,
                 phase: terminal.phase,
                 category: terminal.category,
-                identity: terminal.identity,
+                identity: terminal.identity.map(PresentedIdentity::new),
                 local_session_identity: terminal.local_session_identity,
             })?;
         } else if let Some(identity) = terminal.identity {
@@ -473,6 +473,9 @@ fn write_identity_list_human(
 
 fn write_identity_fields(output: &mut impl Write, identity: &OidcIdentity) -> io::Result<()> {
     writeln!(output, "identity: {}", identity.id)?;
+    if let Some(provider) = Provider::for_identity(identity) {
+        writeln!(output, "sign-in method: {}", provider.label())?;
+    }
     writeln!(
         output,
         "current: {}",
@@ -497,13 +500,84 @@ fn write_json(value: &impl Serialize) -> anyhow::Result<()> {
     super::super::super::write_pretty_json(value).context("write JSON identity result")
 }
 
+// Presentation hints only: authorization and linking use the exact issuer and subject,
+// never this label. GitLab's namespace was observed twice in the isolated Auth0
+// connection (UM-2562); production must reproduce it before that connection is bound.
+const AUTH0_ISSUER: &str = "https://auth.usefulmachinery.com/";
+const GITLAB_SUBJECT_PREFIX: &str = "oauth2|um-gitlab-com-signin|um-gitlab-com:";
+
+#[derive(Serialize)]
+#[serde(rename_all = "lowercase")]
+enum Provider {
+    Github,
+    Google,
+    #[serde(rename = "gitlab.com")]
+    Gitlab,
+    Unknown,
+}
+
+impl Provider {
+    fn for_identity(identity: &OidcIdentity) -> Option<Self> {
+        if identity.kind == IdentityKind::WorkloadOidc {
+            return None;
+        }
+        let subject = identity.subject.as_str();
+        Some(if identity.issuer != AUTH0_ISSUER {
+            Self::Unknown
+        } else if subject
+            .strip_prefix("github|")
+            .is_some_and(|id| !id.is_empty())
+        {
+            Self::Github
+        } else if subject
+            .strip_prefix("google-oauth2|")
+            .is_some_and(|id| !id.is_empty())
+        {
+            Self::Google
+        } else if subject
+            .strip_prefix(GITLAB_SUBJECT_PREFIX)
+            .is_some_and(|id| !id.is_empty() && id.bytes().all(|byte| byte.is_ascii_digit()))
+        {
+            Self::Gitlab
+        } else {
+            Self::Unknown
+        })
+    }
+
+    const fn label(&self) -> &'static str {
+        match self {
+            Self::Github => "GitHub",
+            Self::Google => "Google",
+            Self::Gitlab => "GitLab.com",
+            Self::Unknown => "Other",
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct PresentedIdentity<'a> {
+    #[serde(flatten)]
+    identity: &'a OidcIdentity,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    provider: Option<Provider>,
+}
+
+impl<'a> PresentedIdentity<'a> {
+    fn new(identity: &'a OidcIdentity) -> Self {
+        Self {
+            identity,
+            provider: Provider::for_identity(identity),
+        }
+    }
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ListResult<'a> {
     schema_version: u8,
     deployment: &'a str,
     outcome: &'static str,
-    items: &'a [OidcIdentity],
+    items: Vec<PresentedIdentity<'a>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     next_cursor: Option<&'a str>,
 }
@@ -530,6 +604,6 @@ struct LinkResultEvent<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     category: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    identity: Option<&'a OidcIdentity>,
+    identity: Option<PresentedIdentity<'a>>,
     local_session_identity: &'static str,
 }

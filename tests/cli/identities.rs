@@ -5,6 +5,30 @@ const SERVICE_API_KEY: &str =
     "crd_01k0z6r1w8f4jy2m7q9v3x5abc.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
 const CURRENT_IDENTITY_ID: &str = "idn_01k0z6r1w8f4jy2m7q9v3x5abc";
 const LINKED_IDENTITY_ID: &str = "idn_01k0z6r1w8f4jy2m7q9v3x5abd";
+const AUTH0_ISSUER: &str = "https://auth.usefulmachinery.com/";
+
+// Synthetic stable ID with the subject shape observed twice in the isolated
+// UM-2562 Auth0 connection; production qualification is a later binding gate.
+fn observed_gitlab_identity() -> serde_json::Value {
+    let fixture: serde_json::Value = serde_json::from_str(include_str!(
+        "../fixtures/identity/gitlab-com-namespace.json"
+    ))
+    .unwrap();
+    let mut value = identity(
+        LINKED_IDENTITY_ID,
+        fixture["issuer"].as_str().unwrap(),
+        fixture["subject"].as_str().unwrap(),
+        false,
+    );
+    value.as_object_mut().unwrap().remove("assertedEmail");
+    value.as_object_mut().unwrap().remove("emailVerified");
+    value
+}
+
+fn with_provider(mut identity: serde_json::Value, provider: &str) -> serde_json::Value {
+    identity["provider"] = provider.into();
+    identity
+}
 
 fn identity(id: &str, issuer: &str, subject: &str, current: bool) -> serde_json::Value {
     serde_json::json!({
@@ -173,8 +197,8 @@ fn list_returns_one_exact_page_with_current_and_provenance_fields() {
             "deployment": server.api_url,
             "outcome": "listed",
             "items": [
-                identity(CURRENT_IDENTITY_ID, "https://issuer.example/", "ada-current", true),
-                identity(LINKED_IDENTITY_ID, "https://work.example/", "ada-work", false)
+                with_provider(identity(CURRENT_IDENTITY_ID, "https://issuer.example/", "ada-current", true), "unknown"),
+                with_provider(identity(LINKED_IDENTITY_ID, "https://work.example/", "ada-work", false), "unknown")
             ],
             "nextCursor": "opaque-next-page"
         })
@@ -188,6 +212,301 @@ fn list_returns_one_exact_page_with_current_and_provenance_fields() {
         header_value(&request, "authorization"),
         format!("Bearer {CURRENT_TOKEN}")
     );
+}
+
+#[test]
+fn list_presents_only_exact_auth0_human_namespaces_without_changing_api_fields() {
+    let mut gitlab = observed_gitlab_identity();
+    gitlab["id"] = "idn_01k0z6r1w8f4jy2m7q9v3x5abe".into();
+    let items = vec![
+        identity(CURRENT_IDENTITY_ID, AUTH0_ISSUER, "github|321", true),
+        identity(LINKED_IDENTITY_ID, AUTH0_ISSUER, "google-oauth2|987", false),
+        gitlab,
+        identity(
+            "idn_01k0z6r1w8f4jy2m7q9v3x5abf",
+            AUTH0_ISSUER,
+            "oauth2|other|123",
+            false,
+        ),
+        identity(
+            "idn_01k0z6r1w8f4jy2m7q9v3x5abg",
+            "https://other.example/",
+            "github|321",
+            false,
+        ),
+        identity(
+            "idn_01k0z6r1w8f4jy2m7q9v3x5abh",
+            AUTH0_ISSUER,
+            "github|",
+            false,
+        ),
+        identity(
+            "idn_01k0z6r1w8f4jy2m7q9v3x5abj",
+            AUTH0_ISSUER,
+            "oauth2|um-gitlab-com-signin|um-gitlab-com:abc",
+            false,
+        ),
+    ];
+    let expected = items
+        .iter()
+        .cloned()
+        .enumerate()
+        .map(|(index, item)| match index {
+            0 => with_provider(item, "github"),
+            1 => with_provider(item, "google"),
+            2 => with_provider(item, "gitlab.com"),
+            _ => with_provider(item, "unknown"),
+        })
+        .collect::<Vec<_>>();
+
+    for json in [true, false] {
+        let server = ScriptedServer::respond(vec![identity_page(serde_json::json!(items), None)]);
+        let directory = private_credential_directory();
+        let path = directory.path().join("credentials.json");
+        write_credential_fixture_for_deployment(
+            &path,
+            &server.api_url,
+            &server.issuer,
+            CURRENT_TOKEN,
+            "2999-01-01T00:00:00Z",
+        );
+        let environment = deployment_environment_with_issuer(
+            &server.api_url,
+            &server.issuer,
+            path.to_str().unwrap(),
+        );
+        let mut args = vec!["auth", "identity", "list", "--allow-insecure-http"];
+        if json {
+            args.push("--json");
+        }
+        let output = run_with_env(&args, &environment);
+        assert!(output.status.success());
+        assert!(output.stderr.is_empty());
+        if json {
+            let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(
+                result,
+                serde_json::json!({
+                    "schemaVersion": 1, "deployment": server.api_url,
+                    "outcome": "listed", "items": expected,
+                })
+            );
+        } else {
+            let text = String::from_utf8(output.stdout).unwrap();
+            for (item, label) in items.iter().zip([
+                "GitHub",
+                "Google",
+                "GitLab.com",
+                "Other",
+                "Other",
+                "Other",
+                "Other",
+            ]) {
+                let block = format!(
+                    "identity: {}\nsign-in method: {label}\ncurrent: {}\nissuer: {}\nsubject: {}",
+                    item["id"].as_str().unwrap(),
+                    if item["current"] == true { "yes" } else { "no" },
+                    item["issuer"].as_str().unwrap(),
+                    item["subject"].as_str().unwrap(),
+                );
+                assert!(text.contains(&block), "missing identity block: {block}");
+            }
+            assert!(text.contains("sign-in method: GitLab.com\ncurrent: no\nissuer: https://auth.usefulmachinery.com/\nsubject: oauth2|um-gitlab-com-signin|um-gitlab-com:123456\nlinked:"));
+            assert!(text.contains("asserted email: github|321@example.test"));
+            assert!(text.contains("email verified: yes"));
+            assert_eq!(text.matches("sign-in method:").count(), items.len());
+            assert!(text.contains("identity: idn_"));
+        }
+        server.finish();
+    }
+}
+
+#[test]
+fn service_list_does_not_label_a_workload_subject() {
+    let workload = workload_identity(LINKED_IDENTITY_ID, AUTH0_ISSUER, "github|321");
+    for json in [true, false] {
+        let server = ScriptedServer::respond(vec![identity_page(
+            serde_json::json!([workload.clone()]),
+            None,
+        )]);
+        let directory = private_credential_directory();
+        let key = directory.path().join("service.key");
+        fs::write(&key, format!("{SERVICE_API_KEY}\n")).unwrap();
+        fs::set_permissions(&key, Permissions::from_mode(0o600)).unwrap();
+        let missing_store = directory.path().join("no-human-session.json");
+        let environment = deployment_environment(&server.api_url, missing_store.to_str().unwrap());
+        let mut args = vec![
+            "auth",
+            "identity",
+            "list",
+            "--service-api-key-file",
+            key.to_str().unwrap(),
+            "--allow-insecure-http",
+        ];
+        if json {
+            args.push("--json");
+        }
+        let output = run_with_env(&args, &environment);
+        assert!(output.status.success());
+        if json {
+            let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(result["items"], serde_json::json!([workload]));
+        } else {
+            let text = String::from_utf8(output.stdout).unwrap();
+            assert!(
+                text.contains("issuer: https://auth.usefulmachinery.com/\nsubject: github|321")
+            );
+            assert!(!text.contains("sign-in method:"));
+        }
+        assert!(!missing_store.exists());
+        assert_eq!(server.finish().len(), 1);
+    }
+}
+
+#[test]
+fn unknown_identity_remains_removable_by_opaque_id() {
+    let unknown = identity(
+        LINKED_IDENTITY_ID,
+        "https://other.example/",
+        "github|321",
+        false,
+    );
+    let server = ScriptedServer::respond(vec![
+        identity_page(
+            serde_json::json!([
+                identity(CURRENT_IDENTITY_ID, AUTH0_ISSUER, "github|321", true),
+                unknown.clone(),
+            ]),
+            None,
+        ),
+        http_response_with_headers(
+            "204 No Content",
+            None,
+            &[("Idempotency-Key", ECHO_IDEMPOTENCY_KEY)],
+            &[],
+        ),
+    ]);
+    let directory = private_credential_directory();
+    let path = directory.path().join("credentials.json");
+    write_credential_fixture_for_deployment(
+        &path,
+        &server.api_url,
+        &server.issuer,
+        CURRENT_TOKEN,
+        "2999-01-01T00:00:00Z",
+    );
+    let environment =
+        deployment_environment_with_issuer(&server.api_url, &server.issuer, path.to_str().unwrap());
+    let listed = run_with_env(
+        &[
+            "auth",
+            "identity",
+            "list",
+            "--json",
+            "--allow-insecure-http",
+        ],
+        &environment,
+    );
+    assert!(listed.status.success());
+    let value: serde_json::Value = serde_json::from_slice(&listed.stdout).unwrap();
+    assert_eq!(value["items"][1], with_provider(unknown, "unknown"));
+    let removed = run_with_env(
+        &[
+            "auth",
+            "identity",
+            "remove",
+            LINKED_IDENTITY_ID,
+            "--yes",
+            "--json",
+            "--allow-insecure-http",
+        ],
+        &environment,
+    );
+    assert!(removed.status.success());
+    let value: serde_json::Value = serde_json::from_slice(&removed.stdout).unwrap();
+    assert_eq!(value["identityId"], LINKED_IDENTITY_ID);
+    assert_eq!(value["outcome"], "removed");
+    let requests = server.finish();
+    assert!(requests[1].starts_with(&format!(
+        "DELETE /api/v1/me/identities/{LINKED_IDENTITY_ID} HTTP/1.1"
+    )));
+}
+
+#[test]
+fn successful_link_presents_human_provider_but_not_workload_provider() {
+    for (linked, provider, label) in [
+        (
+            identity(LINKED_IDENTITY_ID, AUTH0_ISSUER, "github|321", false),
+            "github",
+            "GitHub",
+        ),
+        (
+            identity(LINKED_IDENTITY_ID, AUTH0_ISSUER, "google-oauth2|987", false),
+            "google",
+            "Google",
+        ),
+        (observed_gitlab_identity(), "gitlab.com", "GitLab.com"),
+        (
+            identity(
+                LINKED_IDENTITY_ID,
+                "https://other.example/",
+                "github|321",
+                false,
+            ),
+            "unknown",
+            "Other",
+        ),
+    ] {
+        for json in [true, false] {
+            let (server, _directory, path) = prepared_identity_command(
+                identity_link_flow_responses(vec![link_success(linked.clone())]),
+            );
+            let environment = deployment_environment_with_issuer(
+                &server.api_url,
+                &server.issuer,
+                path.to_str().unwrap(),
+            );
+            let mut args = vec!["auth", "identity", "link", "--allow-insecure-http"];
+            if json {
+                args.push("--json");
+            }
+            let output = run_with_env(&args, &environment);
+            assert!(output.status.success());
+            if json {
+                assert!(output.stderr.is_empty());
+                let events = String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                    .collect::<Vec<_>>();
+                assert_eq!(events.len(), 2);
+                assert_eq!(
+                    events[1],
+                    serde_json::json!({
+                        "schemaVersion": 1, "event": "result", "deployment": server.api_url,
+                        "outcome": "linked", "identity": with_provider(linked.clone(), provider),
+                        "localSessionIdentity": "unchanged",
+                    })
+                );
+            } else {
+                assert!(
+                    String::from_utf8_lossy(&output.stderr).contains("Waiting for authorization")
+                );
+                let text = String::from_utf8(output.stdout).unwrap();
+                assert!(text.contains(&format!(
+                    "identity: {}\nsign-in method: {label}\ncurrent: no\nissuer: {}\nsubject: {}",
+                    linked["id"].as_str().unwrap(),
+                    linked["issuer"].as_str().unwrap(),
+                    linked["subject"].as_str().unwrap(),
+                )));
+                assert!(text.contains("local session identity: unchanged"));
+                assert_eq!(
+                    text.contains("asserted email:"),
+                    linked.get("assertedEmail").is_some()
+                );
+            }
+            assert_eq!(server.finish().len(), 4);
+        }
+    }
 }
 
 #[test]
@@ -311,7 +630,7 @@ fn link_uses_fresh_separate_browser_proof_and_keeps_the_local_session() {
             "event": "result",
             "deployment": server.api_url,
             "outcome": "linked",
-            "identity": linked,
+            "identity": with_provider(linked, "unknown"),
             "localSessionIdentity": "unchanged"
         })
     );
@@ -610,6 +929,121 @@ fn link_does_not_report_an_unchanged_session_after_rejected_credential_cleanup()
 }
 
 #[test]
+fn stored_unclaimed_login_requires_forced_original_sign_in_before_separate_link() {
+    let original_principal = serde_json::json!({
+        "principal": {
+            "id": "prn_01k0z6r1w8f4jy2m7q9v3x5abc", "type": "human", "state": "active"
+        }
+    });
+    let principal_response = json_http_response("200 OK", original_principal);
+    let mut responses = vec![
+        identity_problem(
+            "403 Forbidden",
+            403,
+            "https://api.usefulmachinery.com/problems/principal-not-provisioned",
+        ),
+        json_http_response(
+            "200 OK",
+            serde_json::json!({
+                "device_code": "private-original-method-code",
+                "user_code": "ORIGINAL-CODE",
+                "verification_uri": "https://auth.fixture.example/activate",
+                "expires_in": 600, "interval": 1
+            }),
+        ),
+        json_http_response(
+            "200 OK",
+            serde_json::json!({
+                "access_token": "original-principal-token", "refresh_token": "original-refresh",
+                "token_type": "Bearer", "expires_in": 3600
+            }),
+        ),
+        principal_response.clone(),
+        principal_response,
+    ];
+    let linked = observed_gitlab_identity();
+    responses.extend(identity_link_flow_responses(vec![link_success(
+        linked.clone(),
+    )]));
+    let (server, _directory, path) = prepared_identity_command(responses);
+    let environment =
+        deployment_environment_with_issuer(&server.api_url, &server.issuer, path.to_str().unwrap());
+
+    let ordinary = run_with_env(
+        &["auth", "login", "--json", "--allow-insecure-http"],
+        &environment,
+    );
+    assert!(ordinary.status.success());
+    let events = String::from_utf8(ordinary.stdout).unwrap();
+    let status: serde_json::Value = serde_json::from_str(events.trim()).unwrap();
+    assert_eq!(status["status"]["state"], "signup_required");
+    assert!(!events.contains("activation_required"));
+
+    let forced = run_with_env(
+        &[
+            "auth",
+            "login",
+            "--force",
+            "--json",
+            "--allow-insecure-http",
+        ],
+        &environment,
+    );
+    assert!(forced.status.success());
+    let events = String::from_utf8(forced.stdout).unwrap();
+    assert!(events.contains("activation_required"));
+    let completion: serde_json::Value =
+        serde_json::from_str(events.lines().last().unwrap()).unwrap();
+    assert_eq!(completion["status"]["state"], "authenticated");
+
+    let confirmation = run_with_env(
+        &["auth", "status", "--json", "--allow-insecure-http"],
+        &environment,
+    );
+    assert!(confirmation.status.success());
+    let confirmed: serde_json::Value = serde_json::from_slice(&confirmation.stdout).unwrap();
+    assert_eq!(confirmed["state"], "authenticated");
+    assert_eq!(
+        confirmed["principal"]["id"],
+        "prn_01k0z6r1w8f4jy2m7q9v3x5abc"
+    );
+    let original_session = fs::read(&path).unwrap();
+
+    let link = run_with_env(
+        &[
+            "auth",
+            "identity",
+            "link",
+            "--json",
+            "--allow-insecure-http",
+        ],
+        &environment,
+    );
+    assert!(link.status.success());
+    let result: serde_json::Value = serde_json::from_str(
+        String::from_utf8_lossy(&link.stdout)
+            .lines()
+            .last()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(result["outcome"], "linked");
+    assert_eq!(result["identity"], with_provider(linked, "gitlab.com"));
+    assert_eq!(result["localSessionIdentity"], "unchanged");
+    assert_eq!(fs::read(&path).unwrap(), original_session);
+    let requests = server.finish();
+    assert_eq!(requests.len(), 9);
+    assert!(requests[0].starts_with("GET /api/v1/me HTTP/1.1"));
+    assert!(requests[1].starts_with("POST /auth/oauth/device/code HTTP/1.1"));
+    assert!(requests[4].starts_with("GET /api/v1/me HTTP/1.1"));
+    assert!(requests[5].starts_with("GET /api/v1/me/identities?limit=1 HTTP/1.1"));
+    assert_eq!(
+        header_value(&requests[8], "authorization"),
+        "Bearer original-principal-token"
+    );
+}
+
+#[test]
 fn removing_the_former_session_identity_keeps_the_forced_login_session() {
     let removal = http_response_with_headers(
         "204 No Content",
@@ -813,6 +1247,41 @@ fn service_remove_reports_disabled_workload_identity_linking() {
 }
 
 #[test]
+fn service_link_human_does_not_label_a_workload_subject() {
+    let linked = workload_identity(LINKED_IDENTITY_ID, AUTH0_ISSUER, "github|321");
+    let server = ScriptedServer::respond(vec![link_success(linked)]);
+    let directory = private_credential_directory();
+    let key = directory.path().join("service.key");
+    let proof = directory.path().join("workload.token");
+    fs::write(&key, format!("{SERVICE_API_KEY}\n")).unwrap();
+    fs::write(&proof, "workload-proof\n").unwrap();
+    fs::set_permissions(&key, Permissions::from_mode(0o600)).unwrap();
+    fs::set_permissions(&proof, Permissions::from_mode(0o600)).unwrap();
+    let missing_store = directory.path().join("no-human-session.json");
+    let environment = deployment_environment(&server.api_url, missing_store.to_str().unwrap());
+    let output = run_with_env(
+        &[
+            "auth",
+            "identity",
+            "link",
+            "--service-api-key-file",
+            key.to_str().unwrap(),
+            "--workload-token-file",
+            proof.to_str().unwrap(),
+            "--allow-insecure-http",
+        ],
+        &environment,
+    );
+    assert!(output.status.success());
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(text.contains("identity: idn_"));
+    assert!(text.contains("issuer: https://auth.usefulmachinery.com/\nsubject: github|321"));
+    assert!(!text.contains("sign-in method:"));
+    assert!(!missing_store.exists());
+    assert_eq!(server.finish().len(), 1);
+}
+
+#[test]
 fn service_identity_link_uses_explicit_private_key_and_workload_token_files() {
     const SERVICE_KEY: &str =
         "crd_01k0z6r1w8f4jy2m7q9v3x5abc.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
@@ -858,6 +1327,7 @@ fn service_identity_link_uses_explicit_private_key_and_workload_token_files() {
     assert_eq!(result["identity"]["kind"], "workload_oidc");
     assert!(result["identity"].get("assertedEmail").is_none());
     assert!(result["identity"].get("emailVerified").is_none());
+    assert!(result["identity"].get("provider").is_none());
     for secret in [SERVICE_KEY, WORKLOAD_TOKEN] {
         assert!(!String::from_utf8_lossy(&output.stdout).contains(secret));
         assert!(!String::from_utf8_lossy(&output.stderr).contains(secret));

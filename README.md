@@ -832,7 +832,22 @@ service-actor authorization still apply.
 Identity list and remove use one schema-version-1 JSON document with `--json`. Linking
 uses newline-delimited schema-version-1 activation and terminal-result events because it
 waits for browser authorization. Listing returns exactly one page and preserves
-`nextCursor`; `--limit` accepts 1 through 200.
+`nextCursor`; `--limit` accepts 1 through 200. Human list items and successful link
+results show a sign-in method (GitHub, Google, GitLab.com or Other); JSON identities
+add `provider` (`github`, `google`, `gitlab.com` or `unknown`). This is only a
+presentation hint based on the exact Useful Machinery Auth0 issuer and recognized
+subject namespaces. A different issuer or unrecognized namespace is `unknown`, still
+listable and removable by `idn_` ID. Workload identities omit `provider`. The API's
+exact issuer, subject, current flag and optional email provenance remain unchanged.
+For example, a linked human identity without an email claim may appear as:
+
+```json
+{"id":"idn_01k0z6r1w8f4jy2m7q9v3x5abd","kind":"oidc","issuer":"https://auth.usefulmachinery.com/","subject":"oauth2|um-gitlab-com-signin|um-gitlab-com:123456","createdAt":"2026-09-05T12:00:00Z","current":false,"provider":"gitlab.com"}
+```
+
+The example is synthetic: the GitLab.com namespace was observed in an isolated
+tenant, not yet qualified against the production connection. These labels do not
+enable a provider or link accounts by email.
 
 One successful login establishes a renewable human session. The CLI stores the one-hour
 access token, its expiration, and a rotating refresh token in

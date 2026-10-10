@@ -1,0 +1,4 @@
+{
+  "issuer": "https://auth.usefulmachinery.com/",
+  "subject": "oauth2|um-gitlab-com-signin|um-gitlab-com:123456"
+}
