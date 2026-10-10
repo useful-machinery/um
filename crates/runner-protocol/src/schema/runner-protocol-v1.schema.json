@@ -2224,7 +2224,8 @@
               "enum": [
                 "starting",
                 "running",
-                "capturing_outputs"
+                "capturing_outputs",
+                "recovering"
               ]
             },
             "to": {

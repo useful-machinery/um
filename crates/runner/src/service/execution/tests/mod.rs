@@ -802,7 +802,7 @@ fn recovery_agent_allocation_failure_retains_harness_stderr_without_native_sessi
 }
 
 #[tokio::test]
-async fn recovery_settlement_attaches_one_bounded_invocation_evidence() {
+async fn recovery_cancellation_preserves_bounded_invocation_evidence() {
     let outbox = ObservationOutbox::new();
     let observer = RunnerExecutionObserver::new(
         "asn_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned(),
@@ -880,6 +880,57 @@ async fn recovery_settlement_attaches_one_bounded_invocation_evidence() {
     assert_eq!(workflow_event["invocationEvidence"]["invocationId"], 1);
     assert_eq!(workflow_event["invocationEvidence"]["role"], "target");
     assert!(serde_json::to_vec(workflow_event).unwrap().len() <= MAXIMUM_ORDINARY_FRAME_BYTES);
+
+    let detail = serde_json::from_value(json!({"code": "user_request"})).unwrap();
+    for (sequence, from, to, step) in [
+        (
+            3,
+            StepStateKind::Recovering,
+            StepStateKind::Cancelling,
+            ObservedStepTransition::Cancelling { detail },
+        ),
+        (
+            4,
+            StepStateKind::Cancelling,
+            StepStateKind::Cancelled,
+            ObservedStepTransition::Cancelled { detail },
+        ),
+    ] {
+        observer
+            .observe(ExecutionObservation::Transition(Box::new(
+                TransitionObservation {
+                    event: TransitionEvent::Step {
+                        sequence: TransitionSequence(sequence),
+                        step: "verify".to_owned(),
+                        role: WorkflowNodeRole::Step,
+                        failure_policy: FailurePolicy::Required,
+                        from,
+                        to,
+                    },
+                    step: Some(step),
+                },
+            )))
+            .await;
+    }
+    assert_eq!(observer.fault(), None);
+    let observations = outbox.pending(&BTreeSet::new(), 4);
+    assert_eq!(observations.len(), 4);
+    let AssignmentObservation::Execution {
+        report: ExecutionReport::Transition { workflow_event, .. },
+        ..
+    } = &observations[3].observation
+    else {
+        panic!("cancelled transition was not enqueued");
+    };
+    assert_eq!(workflow_event["to"], "cancelled");
+    assert_eq!(workflow_event["detail"]["code"], "user_request");
+    assert_eq!(workflow_event["invocationEvidence"]["invocationId"], 2);
+    assert_eq!(
+        workflow_event["invocationEvidence"]["role"],
+        "recovery_handler"
+    );
+    assert_eq!(workflow_event["invocationEvidence"]["state"], "cancelled");
+    assert_eq!(workflow_event["invocationEvidence"]["recoveryRound"], 1);
 }
 
 #[tokio::test]

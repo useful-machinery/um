@@ -395,6 +395,78 @@ fn unavailable_inherited_exports_require_a_resolved_skipped_source() {
 }
 
 #[test]
+fn cloud_continuation_preserves_typed_attempt_ids_and_export_producers() {
+    let mut document = continuation_result_fixture();
+    let cloud = cloud_result_fixture();
+    document["workflow"]["provenance"] = cloud["workflow"]["provenance"].clone();
+    document["execution"] = cloud["execution"].clone();
+    let attempt_id = "atm_01k0z6r1w8f4jy2m7q9v3x5abc";
+    document["steps"][0]["detail"]["priorAttemptId"] = json!(attempt_id);
+    document["outputProducers"]["produce"]["message"]["attemptId"] = json!(attempt_id);
+    document["exportSources"] = json!({
+        "message": {"node": {"id": "produce", "role": "step"}, "output": "message"}
+    });
+    document["exports"] = json!({
+        "message": {
+            "state": "available", "kind": "text", "mediaType": "text/plain; charset=utf-8",
+            "path": "exports/0001", "sizeBytes": 4,
+            "digest": {"algorithm": "sha256", "value": "0".repeat(64)},
+            "provenance": "inherited",
+            "producer": document["outputProducers"]["produce"]["message"].clone()
+        }
+    });
+    let valid: WorkflowResultV1 = serde_json::from_value(document.clone()).unwrap();
+    assert_eq!(validate_with_invariant(&valid), Ok(()));
+
+    for invalid_id in [
+        "00000000-0000-0000-0000-000000000001",
+        "run_01k0z6r1w8f4jy2m7q9v3x5abc",
+        "atm_invalid",
+    ] {
+        let mut invalid = valid.clone();
+        let Some(NodeDetail::Inherited(detail)) = &mut invalid.steps[0].detail else {
+            panic!("missing inherited step");
+        };
+        detail.prior_attempt_id = invalid_id.to_owned();
+        assert_eq!(
+            validate_with_invariant(&invalid),
+            Err(RunResultInvariant::StepMetadata)
+        );
+
+        let mut invalid = valid.clone();
+        invalid
+            .output_producers
+            .get_mut("produce")
+            .unwrap()
+            .get_mut("message")
+            .unwrap()
+            .attempt_id = invalid_id.to_owned();
+        assert_eq!(
+            validate_with_invariant(&invalid),
+            Err(RunResultInvariant::Continuation)
+        );
+    }
+    document["exports"]["message"]["producer"]["attemptId"] =
+        json!("atm_01k0z6r1w8f4jy2m7q9v3x5abd");
+    let mismatched: WorkflowResultV1 = serde_json::from_value(document).unwrap();
+    assert_eq!(
+        validate_with_invariant(&mismatched),
+        Err(RunResultInvariant::ExportMetadata)
+    );
+
+    let mut local: WorkflowResultV1 =
+        serde_json::from_value(continuation_result_fixture()).unwrap();
+    let Some(NodeDetail::Inherited(detail)) = &mut local.steps[0].detail else {
+        panic!("missing inherited step");
+    };
+    detail.prior_attempt_id = attempt_id.to_owned();
+    assert_eq!(
+        validate_with_invariant(&local),
+        Err(RunResultInvariant::StepMetadata)
+    );
+}
+
+#[test]
 fn inherited_export_provenance_requires_its_direct_producer() {
     let mut document = continuation_result_fixture();
     document["exportSources"] = json!({

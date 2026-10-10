@@ -858,6 +858,7 @@ fn inspect_metadata_reader(
     let inspected = inspect_exports(
         &mut exports,
         continuation,
+        Some(&result.workflow.provenance),
         Some(&result.output_producers),
         Some(&result.export_sources),
         Some(&states),
@@ -1038,6 +1039,10 @@ fn inspect_metadata(bytes: &[u8], diagnostics: &mut Diagnostics) -> MetadataInsp
         |sources| serde_json::from_value(sources.clone()).ok(),
     );
     let source_states = portable_source_states(&document);
+    let workflow_provenance = document
+        .get("workflow")
+        .and_then(|workflow| workflow.get("provenance"))
+        .and_then(|provenance| serde_json::from_value(provenance.clone()).ok());
     let Some(exports) = document.get_mut("exports").and_then(Value::as_object_mut) else {
         return MetadataInspection::default();
     };
@@ -1057,6 +1062,7 @@ fn inspect_metadata(bytes: &[u8], diagnostics: &mut Diagnostics) -> MetadataInsp
     inspect_exports(
         exports,
         continuation,
+        workflow_provenance.as_ref(),
         output_producers.as_ref(),
         export_sources.as_ref(),
         source_states.as_ref(),
@@ -1113,6 +1119,7 @@ fn portable_source_states(document: &Value) -> Option<PortableSourceStates> {
 fn inspect_exports(
     exports: &mut Map<String, Value>,
     continuation: bool,
+    workflow_provenance: Option<&super::publication::WorkflowProvenanceV1>,
     output_producers: Option<&BTreeMap<String, BTreeMap<String, super::runtime::OutputProducer>>>,
     export_sources: Option<&BTreeMap<String, super::publication::ExportSourceV1>>,
     source_states: Option<&PortableSourceStates>,
@@ -1181,6 +1188,7 @@ fn inspect_exports(
         });
         let origin = PortableExportOrigin {
             continuation,
+            workflow_provenance,
             output_producers,
             source,
             source_state: source_state.map(|state| state.state),
@@ -1309,6 +1317,7 @@ fn record_carrier_reference(
 #[derive(Clone, Copy)]
 struct PortableExportOrigin<'a> {
     continuation: bool,
+    workflow_provenance: Option<&'a super::publication::WorkflowProvenanceV1>,
     output_producers:
         Option<&'a BTreeMap<String, BTreeMap<String, super::runtime::OutputProducer>>>,
     source: Option<&'a super::publication::ExportSourceV1>,
@@ -1448,13 +1457,17 @@ fn exact_export_keys(
         .get("producer")
         .and_then(|value| serde_json::from_value(value.clone()).ok());
     let origin_valid = if origin.continuation {
-        let (Some(output_producers), Some(source), Some(source_state)) =
-            (origin.output_producers, origin.source, origin.source_state)
-        else {
+        let (Some(output_producers), Some(workflow_provenance), Some(source), Some(source_state)) = (
+            origin.output_producers,
+            origin.workflow_provenance,
+            origin.source,
+            origin.source_state,
+        ) else {
             return false;
         };
         result_metadata::export_origin_matches(
             output_producers,
+            workflow_provenance,
             source,
             source_state,
             provenance.as_ref(),
@@ -1992,58 +2005,80 @@ mod tests {
 
     #[test]
     fn inherited_export_shape_requires_a_typed_recorded_producer() {
-        let recorded = super::super::runtime::OutputProducer {
-            attempt_id: "00000000-0000-0000-0000-000000000001".to_owned(),
-            attempt_number: 1,
-            node: "produce".to_owned(),
-            output: "message".to_owned(),
-        };
-        let output_producers = BTreeMap::from([(
-            "produce".to_owned(),
-            BTreeMap::from([("message".to_owned(), recorded.clone())]),
-        )]);
-        let source = super::super::publication::ExportSourceV1 {
-            node: super::super::publication::WorkflowNodeV1 {
-                id: "produce".to_owned(),
-                role: super::super::publication::WorkflowNodeRoleV1::Step,
-            },
-            output: "message".to_owned(),
-        };
-        let base = ["state", "kind", "mediaType", "path", "sizeBytes", "digest"];
-        let mut entry = serde_json::json!({
-            "state": "available",
-            "kind": "text",
-            "mediaType": "text/plain; charset=utf-8",
-            "path": "exports/0001",
-            "sizeBytes": 4,
-            "digest": {"algorithm": "sha256", "value": "0".repeat(64)},
-            "provenance": "inherited",
-            "producer": recorded
-        });
-        let origin = PortableExportOrigin {
-            continuation: true,
-            output_producers: Some(&output_producers),
-            source: Some(&source),
-            source_state: Some(super::super::publication::WorkflowStepStateV1::Inherited),
-            source_inherited_prior_state: Some(
-                super::super::evidence::InheritedPriorState::Succeeded,
+        use super::super::publication::WorkflowProvenanceV1;
+        for (workflow_provenance, attempt_id) in [
+            (
+                WorkflowProvenanceV1::Local {
+                    source_root: "/tmp/source".to_owned(),
+                },
+                "00000000-0000-0000-0000-000000000001",
             ),
-        };
-        let valid = |entry: &Value| exact_export_keys(entry.as_object().unwrap(), &base, origin);
-        assert!(valid(&entry));
+            (
+                WorkflowProvenanceV1::Cloud {
+                    project_id: "prj_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned(),
+                    repository_connection_id: "rpc_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned(),
+                    object_format: "sha1".to_owned(),
+                    commit_oid: "1".repeat(40),
+                    source_display_snapshot: None,
+                },
+                "atm_01k0z6r1w8f4jy2m7q9v3x5abc",
+            ),
+        ] {
+            let recorded = super::super::runtime::OutputProducer {
+                attempt_id: attempt_id.to_owned(),
+                attempt_number: 1,
+                node: "produce".to_owned(),
+                output: "message".to_owned(),
+            };
+            let output_producers = BTreeMap::from([(
+                "produce".to_owned(),
+                BTreeMap::from([("message".to_owned(), recorded.clone())]),
+            )]);
+            let source = super::super::publication::ExportSourceV1 {
+                node: super::super::publication::WorkflowNodeV1 {
+                    id: "produce".to_owned(),
+                    role: super::super::publication::WorkflowNodeRoleV1::Step,
+                },
+                output: "message".to_owned(),
+            };
+            let base = ["state", "kind", "mediaType", "path", "sizeBytes", "digest"];
+            let mut entry = serde_json::json!({
+                "state": "available",
+                "kind": "text",
+                "mediaType": "text/plain; charset=utf-8",
+                "path": "exports/0001",
+                "sizeBytes": 4,
+                "digest": {"algorithm": "sha256", "value": "0".repeat(64)},
+                "provenance": "inherited",
+                "producer": recorded
+            });
+            let origin = PortableExportOrigin {
+                continuation: true,
+                workflow_provenance: Some(&workflow_provenance),
+                output_producers: Some(&output_producers),
+                source: Some(&source),
+                source_state: Some(super::super::publication::WorkflowStepStateV1::Inherited),
+                source_inherited_prior_state: Some(
+                    super::super::evidence::InheritedPriorState::Succeeded,
+                ),
+            };
+            let valid =
+                |entry: &Value| exact_export_keys(entry.as_object().unwrap(), &base, origin);
+            assert!(valid(&entry));
 
-        entry["producer"]["attemptId"] = Value::Null;
-        assert!(!valid(&entry));
-        entry["producer"] = serde_json::json!({
-            "attemptId": "00000000-0000-0000-0000-000000000002",
-            "attemptNumber": 1,
-            "node": "produce",
-            "output": "message"
-        });
-        assert!(!valid(&entry));
-        entry.as_object_mut().unwrap().remove("producer");
-        entry.as_object_mut().unwrap().remove("provenance");
-        assert!(!valid(&entry));
+            entry["producer"]["attemptId"] = Value::Null;
+            assert!(!valid(&entry));
+            entry["producer"] = serde_json::json!({
+                "attemptId": "00000000-0000-0000-0000-000000000002",
+                "attemptNumber": 1,
+                "node": "produce",
+                "output": "message"
+            });
+            assert!(!valid(&entry));
+            entry.as_object_mut().unwrap().remove("producer");
+            entry.as_object_mut().unwrap().remove("provenance");
+            assert!(!valid(&entry));
+        }
     }
 
     #[test]
@@ -2062,6 +2097,7 @@ mod tests {
         let output_producers = BTreeMap::new();
         let origin = |prior_state| PortableExportOrigin {
             continuation: true,
+            workflow_provenance: None,
             output_producers: Some(&output_producers),
             source: Some(&source),
             source_state: Some(super::super::publication::WorkflowStepStateV1::Inherited),
@@ -2095,6 +2131,7 @@ mod tests {
             &entry,
             PortableExportOrigin {
                 continuation: true,
+                workflow_provenance: None,
                 output_producers: Some(&succeeded_producers),
                 source: Some(&source),
                 source_state: Some(super::super::publication::WorkflowStepStateV1::Inherited),

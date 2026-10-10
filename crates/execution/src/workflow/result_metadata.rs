@@ -333,6 +333,7 @@ pub(crate) fn validate_with_invariant(result: &WorkflowResultV1) -> Result<(), R
     let mut ids = BTreeSet::new();
     validate_steps(
         &result.steps,
+        &result.workflow.provenance,
         WorkflowNodeRoleV1::Step,
         maximum_stream_bytes,
         &mut ids,
@@ -341,6 +342,7 @@ pub(crate) fn validate_with_invariant(result: &WorkflowResultV1) -> Result<(), R
     if let Some(finalization) = &result.finalization {
         validate_steps(
             &finalization.finalizers,
+            &result.workflow.provenance,
             WorkflowNodeRoleV1::Finalizer,
             maximum_stream_bytes,
             &mut ids,
@@ -436,7 +438,11 @@ fn validate_continuation(result: &WorkflowResultV1) -> Result<(), ResultMetadata
             if !is_identifier(output)
                 || producer.node != *node
                 || producer.output != *output
-                || !output_producer_matches_inherited_detail(producer, detail)
+                || !output_producer_matches_inherited_detail(
+                    producer,
+                    detail,
+                    &result.workflow.provenance,
+                )
             {
                 return Err(ResultMetadataError);
             }
@@ -448,8 +454,9 @@ fn validate_continuation(result: &WorkflowResultV1) -> Result<(), ResultMetadata
 fn output_producer_matches_inherited_detail(
     producer: &super::runtime::OutputProducer,
     detail: &super::evidence::InheritedDetail,
+    provenance: &WorkflowProvenanceV1,
 ) -> bool {
-    if !super::local_run::is_canonical_uuid(&producer.attempt_id) {
+    if !valid_attempt_id(&producer.attempt_id, provenance) {
         return false;
     }
     match detail.prior_state {
@@ -461,6 +468,13 @@ fn output_producer_matches_inherited_detail(
             producer.attempt_number > 0 && producer.attempt_number < detail.prior_attempt_number
         }
         super::evidence::InheritedPriorState::Skipped => false,
+    }
+}
+
+fn valid_attempt_id(attempt_id: &str, provenance: &WorkflowProvenanceV1) -> bool {
+    match provenance {
+        WorkflowProvenanceV1::Local { .. } => super::local_run::is_canonical_uuid(attempt_id),
+        WorkflowProvenanceV1::Cloud { .. } => valid_typed_id(attempt_id, "atm_"),
     }
 }
 
@@ -971,6 +985,7 @@ fn cancellation_detail(reason: CancellationReasonV1) -> CancellationDetail {
 
 fn validate_steps(
     steps: &[WorkflowStepV1],
+    provenance: &WorkflowProvenanceV1,
     expected_role: WorkflowNodeRoleV1,
     maximum_stream_bytes: u64,
     ids: &mut BTreeSet<String>,
@@ -996,7 +1011,7 @@ fn validate_steps(
                 Some(NodeDetail::Inherited(detail)),
             ) => {
                 detail.prior_attempt_number > 0
-                    && super::local_run::is_canonical_uuid(&detail.prior_attempt_id)
+                    && valid_attempt_id(&detail.prior_attempt_id, provenance)
             }
             (_, WorkflowStepStateV1::Failed, Some(NodeDetail::Failed(_))) => true,
             (_, WorkflowStepStateV1::Blocked, Some(NodeDetail::Blocked(_))) => true,
@@ -1742,6 +1757,7 @@ fn valid_export_origin(
     };
     export_origin_matches(
         &result.output_producers,
+        &result.workflow.provenance,
         source,
         step.state,
         provenance,
@@ -1836,6 +1852,7 @@ pub(super) fn unavailable_export_source_matches(
 
 pub(super) fn export_origin_matches(
     output_producers: &BTreeMap<String, BTreeMap<String, super::runtime::OutputProducer>>,
+    workflow_provenance: &WorkflowProvenanceV1,
     source: &ExportSourceV1,
     source_state: WorkflowStepStateV1,
     provenance: Option<&ExportProvenanceV1>,
@@ -1848,7 +1865,7 @@ pub(super) fn export_origin_matches(
         .get(&source.node.id)
         .and_then(|outputs| outputs.get(&source.output));
     export_provenance_matches_source(source_state, provenance, producer, expected_producer)
-        && producer.is_none_or(valid_output_producer)
+        && producer.is_none_or(|producer| valid_output_producer(producer, workflow_provenance))
 }
 
 pub(super) fn export_provenance_matches_source(
@@ -1874,9 +1891,12 @@ pub(super) fn export_provenance_matches_source(
     }
 }
 
-fn valid_output_producer(producer: &super::runtime::OutputProducer) -> bool {
+fn valid_output_producer(
+    producer: &super::runtime::OutputProducer,
+    provenance: &WorkflowProvenanceV1,
+) -> bool {
     producer.attempt_number > 0
-        && super::local_run::is_canonical_uuid(&producer.attempt_id)
+        && valid_attempt_id(&producer.attempt_id, provenance)
         && is_identifier(&producer.node)
         && is_identifier(&producer.output)
 }
