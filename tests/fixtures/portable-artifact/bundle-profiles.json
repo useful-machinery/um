@@ -1,0 +1,102 @@
+{
+  "baseOid": "0000000000000000000000000000000000000000",
+  "headOid": "1111111111111111111111111111111111111111",
+  "treeOid": "2222222222222222222222222222222222222222",
+  "profiles": [
+    {
+      "name": "legacy-v2",
+      "header": "# v2 git bundle\n-0000000000000000000000000000000000000000 prerequisite\n1111111111111111111111111111111111111111 refs/scherzo/head\n\n",
+      "valid": true
+    },
+    {
+      "name": "um-v3",
+      "header": "# v3 git bundle\n@object-format=sha1\n-0000000000000000000000000000000000000000 prerequisite\n1111111111111111111111111111111111111111 refs/um/head\n\n",
+      "valid": true
+    },
+    {
+      "name": "v2-um-ref",
+      "header": "# v2 git bundle\n-0000000000000000000000000000000000000000 prerequisite\n1111111111111111111111111111111111111111 refs/um/head\n\n",
+      "valid": false
+    },
+    {
+      "name": "v3-legacy-ref",
+      "header": "# v3 git bundle\n@object-format=sha1\n-0000000000000000000000000000000000000000 prerequisite\n1111111111111111111111111111111111111111 refs/scherzo/head\n\n",
+      "valid": false
+    },
+    {
+      "name": "v3-missing-capability",
+      "header": "# v3 git bundle\n-0000000000000000000000000000000000000000 prerequisite\n1111111111111111111111111111111111111111 refs/um/head\n\n",
+      "valid": false
+    },
+    {
+      "name": "v3-sha256",
+      "header": "# v3 git bundle\n@object-format=sha256\n-0000000000000000000000000000000000000000 prerequisite\n1111111111111111111111111111111111111111 refs/um/head\n\n",
+      "valid": false
+    },
+    {
+      "name": "v3-duplicate-capability",
+      "header": "# v3 git bundle\n@object-format=sha1\n@object-format=sha1\n-0000000000000000000000000000000000000000 prerequisite\n1111111111111111111111111111111111111111 refs/um/head\n\n",
+      "valid": false
+    },
+    {
+      "name": "v3-filtered",
+      "header": "# v3 git bundle\n@object-format=sha1\n@filter=blob:none\n-0000000000000000000000000000000000000000 prerequisite\n1111111111111111111111111111111111111111 refs/um/head\n\n",
+      "valid": false
+    },
+    {
+      "name": "v2-capability",
+      "header": "# v2 git bundle\n@object-format=sha1\n-0000000000000000000000000000000000000000 prerequisite\n1111111111111111111111111111111111111111 refs/scherzo/head\n\n",
+      "valid": false
+    },
+    {
+      "name": "v2-mixed-refs",
+      "header": "# v2 git bundle\n-0000000000000000000000000000000000000000 prerequisite\n1111111111111111111111111111111111111111 refs/scherzo/head\n1111111111111111111111111111111111111111 refs/um/head\n\n",
+      "valid": false
+    },
+    {
+      "name": "v2-duplicate-ref",
+      "header": "# v2 git bundle\n-0000000000000000000000000000000000000000 prerequisite\n1111111111111111111111111111111111111111 refs/scherzo/head\n1111111111111111111111111111111111111111 refs/scherzo/head\n\n",
+      "valid": false
+    },
+    {
+      "name": "v2-wrong-head",
+      "header": "# v2 git bundle\n-0000000000000000000000000000000000000000 prerequisite\n3333333333333333333333333333333333333333 refs/scherzo/head\n\n",
+      "valid": false
+    },
+    {
+      "name": "v2-extra-prerequisite",
+      "header": "# v2 git bundle\n-0000000000000000000000000000000000000000 prerequisite\n-4444444444444444444444444444444444444444 prerequisite\n1111111111111111111111111111111111111111 refs/scherzo/head\n\n",
+      "valid": false
+    },
+    {
+      "name": "v2-wrong-prerequisite",
+      "header": "# v2 git bundle\n-4444444444444444444444444444444444444444 prerequisite\n1111111111111111111111111111111111111111 refs/scherzo/head\n\n",
+      "valid": false
+    },
+    {
+      "name": "v3-mixed-refs",
+      "header": "# v3 git bundle\n@object-format=sha1\n-0000000000000000000000000000000000000000 prerequisite\n1111111111111111111111111111111111111111 refs/um/head\n1111111111111111111111111111111111111111 refs/scherzo/head\n\n",
+      "valid": false
+    },
+    {
+      "name": "v3-duplicate-ref",
+      "header": "# v3 git bundle\n@object-format=sha1\n-0000000000000000000000000000000000000000 prerequisite\n1111111111111111111111111111111111111111 refs/um/head\n1111111111111111111111111111111111111111 refs/um/head\n\n",
+      "valid": false
+    },
+    {
+      "name": "v3-wrong-head",
+      "header": "# v3 git bundle\n@object-format=sha1\n-0000000000000000000000000000000000000000 prerequisite\n3333333333333333333333333333333333333333 refs/um/head\n\n",
+      "valid": false
+    },
+    {
+      "name": "v3-extra-prerequisite",
+      "header": "# v3 git bundle\n@object-format=sha1\n-0000000000000000000000000000000000000000 prerequisite\n-4444444444444444444444444444444444444444 prerequisite\n1111111111111111111111111111111111111111 refs/um/head\n\n",
+      "valid": false
+    },
+    {
+      "name": "v3-wrong-prerequisite",
+      "header": "# v3 git bundle\n@object-format=sha1\n-4444444444444444444444444444444444444444 prerequisite\n1111111111111111111111111111111111111111 refs/um/head\n\n",
+      "valid": false
+    }
+  ]
+}

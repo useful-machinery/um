@@ -29,6 +29,7 @@ use super::artifact::{
     GitBranchCaptureDeclaration, GitBranchMetadata, GitObjectFormat,
 };
 use super::execution_root::{AdmittedExecutionRoot, WorkingDirectorySelectionFailure};
+use super::git_artifact::bundle_header;
 use super::schema_common::{is_lowercase_hex, lowercase_hex};
 use crate::process::ManagedProcessGroup;
 
@@ -1429,11 +1430,6 @@ impl CarrierProducer for GitBundleProducer<'_> {
             }
         }
     }
-}
-
-fn bundle_header(baseline_oid: &str, head_oid: &str) -> Vec<u8> {
-    format!("# v2 git bundle\n-{baseline_oid} scherzo baseline\n{head_oid} refs/scherzo/head\n\n")
-        .into_bytes()
 }
 
 fn read_bundle_header(bundle: &mut File) -> Result<Vec<u8>, GitCaptureFailure> {

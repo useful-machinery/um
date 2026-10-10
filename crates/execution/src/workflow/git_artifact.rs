@@ -16,6 +16,19 @@ const MAXIMUM_DELTA_DEPTH: u8 = 64;
 const COPY_BUFFER_BYTES: usize = 64 * 1024;
 const PACK_CHECKSUM_BYTES: u64 = 20;
 
+const LEGACY_BUNDLE_SIGNATURE: &[u8] = b"# v2 git bundle\n";
+const CURRENT_BUNDLE_SIGNATURE: &str = "# v3 git bundle\n";
+const CURRENT_BUNDLE_CAPABILITY: &str = "@object-format=sha1\n";
+const LEGACY_BUNDLE_REF: &[u8] = b"refs/scherzo/head";
+const CURRENT_BUNDLE_REF: &str = "refs/um/head";
+
+pub(super) fn bundle_header(baseline_oid: &str, head_oid: &str) -> Vec<u8> {
+    format!(
+        "{CURRENT_BUNDLE_SIGNATURE}{CURRENT_BUNDLE_CAPABILITY}-{baseline_oid} UM baseline\n{head_oid} {CURRENT_BUNDLE_REF}\n\n"
+    )
+    .into_bytes()
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum GitArtifactFailure {
     Header,
@@ -73,9 +86,17 @@ fn validate_bundle_header(
     let mut total = 0_usize;
     let mut line = Vec::new();
     read_header_line(&mut reader, &mut line, &mut total)?;
-    if line != b"# v2 git bundle\n" {
+    let expected_ref = if line == LEGACY_BUNDLE_SIGNATURE {
+        LEGACY_BUNDLE_REF
+    } else if line == CURRENT_BUNDLE_SIGNATURE.as_bytes() {
+        read_header_line(&mut reader, &mut line, &mut total)?;
+        if line != CURRENT_BUNDLE_CAPABILITY.as_bytes() {
+            return Err(GitArtifactFailure::Profile);
+        }
+        CURRENT_BUNDLE_REF.as_bytes()
+    } else {
         return Err(GitArtifactFailure::Header);
-    }
+    };
 
     let mut prerequisites = Vec::new();
     let mut references = Vec::new();
@@ -122,7 +143,7 @@ fn validate_bundle_header(
         || references.as_slice()
             != [(
                 descriptor.head_oid.as_bytes().to_vec(),
-                b"refs/scherzo/head".to_vec(),
+                expected_ref.to_vec(),
             )]
     {
         return Err(GitArtifactFailure::Profile);

@@ -478,6 +478,43 @@ fn real_git_bundle_round_trips_through_the_portable_parser() {
 }
 
 #[test]
+fn bundle_profiles_preserve_legacy_and_bind_um_ref_to_v3() {
+    let contract: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../../../tests/fixtures/portable-artifact/bundle-profiles.json"
+    ))
+    .unwrap();
+    let descriptor = GitArtifactDescriptor {
+        base_oid: contract["baseOid"].as_str().unwrap(),
+        head_oid: contract["headOid"].as_str().unwrap(),
+        tree_oid: contract["treeOid"].as_str().unwrap(),
+    };
+    for case in contract["profiles"].as_array().unwrap() {
+        let header = case["header"].as_str().unwrap();
+        let mut file = tempfile::tempfile().unwrap();
+        file.write_all(header.as_bytes()).unwrap();
+        let result = validate_bundle_header(&mut file, descriptor);
+        if case["valid"].as_bool().unwrap() {
+            assert_eq!(
+                result,
+                Ok(u64::try_from(header.len()).unwrap()),
+                "{}",
+                case["name"]
+            );
+        } else {
+            assert_eq!(result, Err(GitArtifactFailure::Profile), "{}", case["name"]);
+        }
+    }
+
+    let fixture = RealBundleFixture::new();
+    let mut bytes = bundle_header(&fixture.base_oid, &fixture.head_oid);
+    bytes.extend_from_slice(&fixture.bytes[fixture.body_offset..]);
+    assert_eq!(fixture.validate(&bytes), Ok(()));
+    assert_eq!(fixture.validate(&fixture.bytes), Ok(()));
+    *bytes.last_mut().unwrap() ^= 0xff;
+    assert_eq!(fixture.validate(&bytes), Err(GitArtifactFailure::Checksum));
+}
+
+#[test]
 fn reference_and_offset_deltas_resolve_to_their_original_objects() {
     let fixture = RealBundleFixture::new();
 

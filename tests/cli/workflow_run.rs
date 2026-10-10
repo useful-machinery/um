@@ -1907,14 +1907,13 @@ exports:
     );
 
     fs::set_permissions(&carrier_path, fs::Permissions::from_mode(0o600)).unwrap();
-    let advertised_ref = b"refs/scherzo/head";
+    let advertised_ref = b"refs/um/head";
     let ref_offset = original
         .windows(advertised_ref.len())
         .position(|window| window == advertised_ref)
         .unwrap();
     let mut wrong_profile = original.clone();
-    wrong_profile[ref_offset..ref_offset + advertised_ref.len()]
-        .copy_from_slice(b"refs/scherzo/heap");
+    wrong_profile[ref_offset..ref_offset + advertised_ref.len()].copy_from_slice(b"refs/um/heap");
     fs::write(&carrier_path, wrong_profile).unwrap();
     assert_eq!(
         fs::read(&retained_change_path).unwrap(),

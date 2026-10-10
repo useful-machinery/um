@@ -633,7 +633,7 @@ fn merge_forked_before_baseline_excludes_prerequisite_history_and_imports_indepe
             "fetch",
             "--quiet",
             bundle_path.to_str().unwrap(),
-            "refs/scherzo/head:refs/heads/imported",
+            "refs/um/head:refs/heads/imported",
         ],
     );
     assert_eq!(git_oid(&baseline_repository, "refs/heads/imported"), head);
