@@ -56,6 +56,7 @@ fn outcome_class(outcome: &UpdateProfileOutcome) -> OutcomeClass {
             super::super::unreachable_outcome_class(*category)
         }
         UpdateProfileOutcome::InvalidDisplayName
+        | UpdateProfileOutcome::HumanDisplayNameRequired
         | UpdateProfileOutcome::IdempotencyConflict
         | UpdateProfileOutcome::RequestTooLarge
         | UpdateProfileOutcome::UnsupportedMediaType => OutcomeClass::GeneralFailure,
@@ -77,6 +78,7 @@ enum UpdateResultBody<'a> {
     Set { principal: PrincipalResult<'a> },
     Cleared { principal: PrincipalResult<'a> },
     InvalidDisplayName,
+    HumanDisplayNameRequired,
     Unauthenticated,
     Forbidden,
     IdempotencyConflict,
@@ -101,6 +103,9 @@ impl<'a> UpdateResult<'a> {
                 },
             },
             UpdateProfileOutcome::InvalidDisplayName => UpdateResultBody::InvalidDisplayName,
+            UpdateProfileOutcome::HumanDisplayNameRequired => {
+                UpdateResultBody::HumanDisplayNameRequired
+            }
             UpdateProfileOutcome::Unauthenticated => UpdateResultBody::Unauthenticated,
             UpdateProfileOutcome::Forbidden => UpdateResultBody::Forbidden,
             UpdateProfileOutcome::IdempotencyConflict => UpdateResultBody::IdempotencyConflict,
@@ -143,6 +148,10 @@ fn write_human_result(
         UpdateProfileOutcome::Updated(principal) => {
             write_updated_account(&mut stdout, deployment, operation, principal)
         }
+        UpdateProfileOutcome::HumanDisplayNameRequired => writeln!(
+            stdout,
+            "! Your display name cannot be cleared while you have a current membership.\n\nLeave or end every active or suspended membership before clearing it."
+        ),
         UpdateProfileOutcome::InvalidDisplayName => writeln!(
             stdout,
             "! Your display name was rejected.\n\nUse a name that normalizes to 1 through 200 Unicode scalar values and contains no control characters."

@@ -56,6 +56,14 @@ let
     // {
       cargoExtraArgs = "--locked --workspace --all-targets --all-features";
       doInstallCargoArtifacts = false;
+      # The dependency archive is built for release; nextest and its worker
+      # example compile fresh debug artifacts. Avoid storing full debug symbols
+      # in both builds, which can exhaust the validation host's disk before
+      # the test suite runs. Keep debug assertions and every test enabled.
+      env = testArgs.env // {
+        CARGO_PROFILE_DEV_DEBUG = "0";
+        CARGO_PROFILE_TEST_DEBUG = "0";
+      };
       # --all-targets builds the example as a test harness. Tests that spawn
       # internal workers need the ordinary executable supplied explicitly.
       preBuild = ''

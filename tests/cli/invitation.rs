@@ -320,6 +320,46 @@ fn invitation_accept_reads_a_protected_capability_file_without_printing_it() {
 }
 
 #[test]
+fn invitation_accept_name_gate_reports_a_recoverable_schema_one_failure() {
+    for json in [false, true] {
+        let (server, _directory, _path, credential_path) =
+            prepared(vec![problem_response_with_headers(
+                "409 Conflict",
+                "https://api.usefulmachinery.com/problems/human-display-name-required",
+                409,
+                &[],
+            )]);
+        let environment = deployment_environment(&server.api_url, &credential_path);
+        let mut arguments = vec![
+            "invitation",
+            "accept",
+            INVITATION_ID,
+            "--allow-insecure-http",
+        ];
+        if json {
+            arguments.push("--json");
+        }
+        let output = run_with_env(&arguments, &environment);
+        assert_eq!(output.status.code(), Some(1));
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("Invitation request failed"));
+        if json {
+            let document: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(document["schemaVersion"], 1);
+            assert_eq!(document["outcome"], "human_display_name_required");
+            assert!(output.stderr.is_empty());
+        } else {
+            let message = String::from_utf8(output.stderr).unwrap();
+            assert!(message.contains("um account update --display-name"));
+        }
+        let request = server.finish().pop().unwrap();
+        assert_authenticated(&request);
+        assert!(request.starts_with(&format!(
+            "POST /api/v1/invitations/{INVITATION_ID}/accept HTTP/1.1\r\n"
+        )));
+    }
+}
+
+#[test]
 fn invitation_decline_and_owner_revoke_have_deterministic_success_output() {
     let (server, _directory, _path, credential_path) = prepared(vec![
         http_response_with_headers(

@@ -189,6 +189,15 @@ pub(super) fn write_accept(
             write_common(deployment, failure, authentication, json)
         }
         AcceptInvitationOutcome::Unavailable => write_unavailable(deployment, json),
+        AcceptInvitationOutcome::HumanDisplayNameRequired => write_failure(
+            deployment,
+            "human_display_name_required",
+            None,
+            None,
+            "error: your account needs a display name before joining this organization\n\nSet it with um account update --display-name, then explicitly retry accepting the invitation.",
+            OutcomeClass::GeneralFailure,
+            json,
+        ),
         AcceptInvitationOutcome::MembershipLimitReached => write_failure(
             deployment,
             "membership_limit_reached",

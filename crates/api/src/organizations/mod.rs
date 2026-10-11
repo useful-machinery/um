@@ -36,6 +36,8 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 const MUTATION_ATTEMPTS: usize = 2;
 const READ_ATTEMPTS: usize = 1;
 const MERGE_PATCH_MEDIA_TYPE: &str = "application/merge-patch+json";
+const HUMAN_DISPLAY_NAME_REQUIRED: &str =
+    "https://api.usefulmachinery.com/problems/human-display-name-required";
 const CREATION_NOT_PERMITTED: &str =
     "https://api.usefulmachinery.com/problems/organization-creation-not-permitted";
 const SLUG_UNAVAILABLE: &str = "https://api.usefulmachinery.com/problems/slug-unavailable";
@@ -71,6 +73,7 @@ pub enum CreateOrganizationOutcome {
     Created(Organization),
     Common(CommonOrganizationFailure),
     CreationNotPermitted,
+    HumanDisplayNameRequired,
     SlugUnavailable,
     QuantityLimitReached,
     RateLimited { retry_after: u64 },
@@ -181,6 +184,7 @@ pub enum PreviewInvitationOutcome {
 pub enum AcceptInvitationOutcome {
     Accepted(AcceptedInvitationMembership),
     Common(CommonOrganizationFailure),
+    HumanDisplayNameRequired,
     Unavailable,
     MembershipLimitReached,
     IdempotencyConflict,
@@ -1508,6 +1512,9 @@ fn decode_accept_invitation_response(
         StatusCode::CONFLICT => {
             let problem_type = decode_problem_type(Operation::AcceptInvitation, &response, false)?;
             match problem_type.as_str() {
+                HUMAN_DISPLAY_NAME_REQUIRED => {
+                    Ok(AcceptInvitationOutcome::HumanDisplayNameRequired)
+                }
                 INVITATION_UNAVAILABLE => Ok(AcceptInvitationOutcome::Unavailable),
                 MEMBERSHIP_LIMIT => Ok(AcceptInvitationOutcome::MembershipLimitReached),
                 IDEMPOTENCY_CONFLICT => Ok(AcceptInvitationOutcome::IdempotencyConflict),
@@ -1821,6 +1828,9 @@ fn decode_create_response(
         StatusCode::CONFLICT => {
             let problem_type = decode_problem_type(Operation::Create, &response, false)?;
             match problem_type.as_str() {
+                HUMAN_DISPLAY_NAME_REQUIRED => {
+                    Ok(CreateOrganizationOutcome::HumanDisplayNameRequired)
+                }
                 SLUG_UNAVAILABLE => Ok(CreateOrganizationOutcome::SlugUnavailable),
                 QUANTITY_LIMIT_REACHED => Ok(CreateOrganizationOutcome::QuantityLimitReached),
                 IDEMPOTENCY_CONFLICT => Ok(CreateOrganizationOutcome::IdempotencyConflict),

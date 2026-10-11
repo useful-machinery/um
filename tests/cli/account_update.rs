@@ -154,8 +154,48 @@ fn account_update_clears_the_display_name_with_an_explicit_null() {
 }
 
 #[test]
+fn account_clear_rejects_a_current_membership() {
+    let (server, _directory, credential_path) = prepared_update(vec![update_problem(
+        "409 Conflict",
+        409,
+        "https://api.usefulmachinery.com/problems/human-display-name-required",
+    )]);
+    let environment =
+        deployment_environment_with_issuer(&server.api_url, &server.issuer, &credential_path);
+    let output = run_with_env(
+        &[
+            "account",
+            "update",
+            "--clear-display-name",
+            "--json",
+            "--allow-insecure-http",
+        ],
+        &environment,
+    );
+    assert_eq!(output.status.code(), Some(1));
+    let document: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(document["schemaVersion"], 1);
+    assert_eq!(document["outcome"], "human_display_name_required");
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("private-problem-detail"));
+    let request = server.finish().pop().unwrap();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(request_body(&request)).unwrap(),
+        serde_json::json!({"displayName": null})
+    );
+}
+
+#[test]
 fn account_update_reports_meaningful_api_failures_without_problem_prose() {
     let cases = [
+        (
+            update_problem(
+                "409 Conflict",
+                409,
+                "https://api.usefulmachinery.com/problems/human-display-name-required",
+            ),
+            "human_display_name_required",
+            1,
+        ),
         (
             update_problem(
                 "400 Bad Request",

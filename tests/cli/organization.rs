@@ -346,6 +346,45 @@ fn service_create_sends_explicit_delegator_without_using_human_credentials() {
 }
 
 #[test]
+fn service_create_name_gate_points_to_the_nominated_human_without_private_fields() {
+    const SERVICE_KEY: &str =
+        "crd_01k0z6r1w8f4jy2m7q9v3x5abc.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    const DELEGATOR: &str = "prn_01k0z6r1w8f4jy2m7q9v3x5abc";
+    let response = organization_problem(
+        "409 Conflict",
+        409,
+        "https://api.usefulmachinery.com/problems/human-display-name-required",
+    );
+    let server = ScriptedServer::respond(vec![response]);
+    let directory = private_credential_directory();
+    let key_path = directory.path().join("service.key");
+    fs::write(&key_path, format!("{SERVICE_KEY}\n")).unwrap();
+    fs::set_permissions(&key_path, Permissions::from_mode(0o600)).unwrap();
+    let human_credentials = directory.path().join("unused-human.json");
+    let environment = deployment_environment(&server.api_url, human_credentials.to_str().unwrap());
+    let output = run_with_env(
+        &[
+            "organization",
+            "create",
+            "--display-name",
+            "Acme",
+            "--delegator-principal-id",
+            DELEGATOR,
+            "--service-api-key-file",
+            key_path.to_str().unwrap(),
+            "--allow-insecure-http",
+        ],
+        &environment,
+    );
+    assert_eq!(output.status.code(), Some(1));
+    let message = String::from_utf8_lossy(&output.stdout);
+    assert!(message.contains("nominated human"));
+    assert!(!message.contains(DELEGATOR));
+    assert!(!message.contains("private-problem-detail"));
+    server.finish();
+}
+
+#[test]
 fn service_create_requires_explicit_human_delegator() {
     const SERVICE_KEY: &str =
         "crd_01k0z6r1w8f4jy2m7q9v3x5abc.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
@@ -497,6 +536,16 @@ fn create_expected_outcomes_have_exact_json_and_exit_statuses() {
                 "https://api.usefulmachinery.com/problems/organization-creation-not-permitted",
             ),
             "creation_not_permitted",
+            1,
+            None,
+        ),
+        (
+            organization_problem(
+                "409 Conflict",
+                409,
+                "https://api.usefulmachinery.com/problems/human-display-name-required",
+            ),
+            "human_display_name_required",
             1,
             None,
         ),

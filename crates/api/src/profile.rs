@@ -17,6 +17,8 @@ use super::{UnreachableCategory, bearer_authorization, classify_reqwest_error};
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 const MAX_ATTEMPTS: usize = 2;
 const MERGE_PATCH_MEDIA_TYPE: &str = "application/merge-patch+json";
+const HUMAN_DISPLAY_NAME_REQUIRED: &str =
+    "https://api.usefulmachinery.com/problems/human-display-name-required";
 const INVALID_DISPLAY_NAME: &str = "https://api.usefulmachinery.com/problems/invalid-display-name";
 const IDEMPOTENCY_CONFLICT: &str = "https://api.usefulmachinery.com/problems/idempotency-conflict";
 const REQUEST_BODY_TOO_LARGE: &str =
@@ -28,6 +30,7 @@ const UNSUPPORTED_MEDIA_TYPE: &str =
 pub enum UpdateProfileOutcome {
     Updated(PrincipalProfile),
     InvalidDisplayName,
+    HumanDisplayNameRequired,
     Unauthenticated,
     Forbidden,
     IdempotencyConflict,
@@ -306,8 +309,18 @@ async fn decode_response(
             Ok(UpdateProfileOutcome::Forbidden)
         }
         StatusCode::CONFLICT => {
-            require_profile_problem(&body, status, content_type.as_deref(), IDEMPOTENCY_CONFLICT)?;
-            Ok(UpdateProfileOutcome::IdempotencyConflict)
+            let problem_type = problem::decode_type_parts(&body, status, content_type.as_deref())
+                .map_err(|reason| {
+                AttemptError::Protocol(UpdateProfileError::protocol(reason, false))
+            })?;
+            match problem_type.as_str() {
+                HUMAN_DISPLAY_NAME_REQUIRED => Ok(UpdateProfileOutcome::HumanDisplayNameRequired),
+                IDEMPOTENCY_CONFLICT => Ok(UpdateProfileOutcome::IdempotencyConflict),
+                _ => Err(AttemptError::Protocol(UpdateProfileError::protocol(
+                    "unrecognized profile conflict",
+                    false,
+                ))),
+            }
         }
         StatusCode::PAYLOAD_TOO_LARGE => {
             require_profile_problem(

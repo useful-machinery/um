@@ -229,6 +229,12 @@ fn create_classifies_its_operation_specific_failures() {
         (
             "409 Conflict",
             409,
+            HUMAN_DISPLAY_NAME_REQUIRED,
+            CreateOrganizationOutcome::HumanDisplayNameRequired,
+        ),
+        (
+            "409 Conflict",
+            409,
             QUANTITY_LIMIT_REACHED,
             CreateOrganizationOutcome::QuantityLimitReached,
         ),
@@ -1163,6 +1169,29 @@ fn accept_invitation_replays_the_same_capability_body_after_an_interrupted_succe
         serde_json::from_str::<serde_json::Value>(body(&requests[0])).unwrap(),
         serde_json::json!({ "capability": capability })
     );
+}
+
+#[test]
+fn authorized_invitation_name_gate_is_a_non_retryable_outcome() {
+    let server = ScriptedHttpServer::respond(problem_response(
+        "409 Conflict",
+        409,
+        HUMAN_DISPLAY_NAME_REQUIRED,
+        &[],
+    ));
+
+    let outcome = accept_invitation(
+        &http_client(),
+        &server.api_url,
+        TOKEN,
+        "inv_01k0z6r1w8f4jy2m7q9v3x5abc",
+        None,
+        KEY,
+    )
+    .expect("name requirement should decode");
+
+    assert_eq!(outcome, AcceptInvitationOutcome::HumanDisplayNameRequired);
+    assert_eq!(server.finish().len(), 1);
 }
 
 #[test]

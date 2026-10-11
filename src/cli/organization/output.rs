@@ -44,6 +44,19 @@ pub(super) fn write_create(
             OutcomeClass::Forbidden,
             json,
         ),
+        CreateOrganizationOutcome::HumanDisplayNameRequired => write_failure(
+            deployment,
+            "human_display_name_required",
+            None,
+            None,
+            if authentication == super::super::PrincipalAuthenticationKind::ServiceApiKey {
+                "! The nominated human owner needs a display name.\n\nAsk them to set their account display name, then retry."
+            } else {
+                "! Your account needs a display name.\n\nSet it with um account update --display-name, then retry."
+            },
+            OutcomeClass::GeneralFailure,
+            json,
+        ),
         CreateOrganizationOutcome::SlugUnavailable => write_failure(
             deployment,
             "slug_unavailable",
