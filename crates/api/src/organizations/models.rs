@@ -52,12 +52,32 @@ pub struct CurrentPrincipalMembershipPage {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct LinkedEmail {
+    pub email: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub verified: Option<bool>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NameState {
+    Live,
+    Missing,
+    Unavailable,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct OrganizationMembershipDirectoryEntry {
     pub id: String,
     pub principal_id: String,
     pub principal_type: PrincipalType,
+    pub principal_state: DirectoryPrincipalState,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub linked_emails: Option<Vec<LinkedEmail>>,
+    pub state: MembershipState,
     pub role: MembershipRole,
 }
 
@@ -80,6 +100,9 @@ pub struct OrganizationMembershipHistoryEntry {
     pub principal_type: PrincipalType,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,
+    pub name_state: NameState,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub linked_emails: Option<Vec<LinkedEmail>>,
     pub role: MembershipRole,
     pub state: MembershipState,
     pub created_at: String,
@@ -316,6 +339,13 @@ pub struct AcceptedInvitationMembership {
 pub enum PrincipalType {
     Human,
     Service,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DirectoryPrincipalState {
+    Active,
+    Suspended,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -683,6 +713,15 @@ impl TryFrom<models::OrganizationMembershipList> for OrganizationMembershipPage 
     }
 }
 
+impl From<models::OrganizationLinkedEmail> for LinkedEmail {
+    fn from(value: models::OrganizationLinkedEmail) -> Self {
+        Self {
+            email: value.email,
+            verified: value.verified,
+        }
+    }
+}
+
 impl TryFrom<models::OrganizationMembershipDirectoryEntry>
     for OrganizationMembershipDirectoryEntry
 {
@@ -712,7 +751,26 @@ impl TryFrom<models::OrganizationMembershipDirectoryEntry>
                     PrincipalType::Service
                 }
             },
+            principal_state: match value.principal_state {
+                models::organization_membership_directory_entry::PrincipalState::Active => {
+                    DirectoryPrincipalState::Active
+                }
+                models::organization_membership_directory_entry::PrincipalState::Suspended => {
+                    DirectoryPrincipalState::Suspended
+                }
+            },
             display_name: value.display_name,
+            linked_emails: value
+                .linked_emails
+                .map(|links| links.into_iter().map(LinkedEmail::from).collect()),
+            state: match value.state {
+                models::organization_membership_directory_entry::State::Active => {
+                    MembershipState::Active
+                }
+                models::organization_membership_directory_entry::State::Suspended => {
+                    MembershipState::Suspended
+                }
+            },
             role: match value.role {
                 models::organization_membership_directory_entry::Role::Owner => {
                     MembershipRole::Owner
@@ -758,6 +816,31 @@ impl TryFrom<models::OrganizationMembershipHistoryEntry> for OrganizationMembers
         {
             return Err("the organization membership history display name is invalid");
         }
+        match (value.state, value.name_state, value.display_name.is_some()) {
+            (
+                models::organization_membership_history_entry::State::Ended,
+                models::organization_membership_history_entry::NameState::Unavailable,
+                false,
+            )
+            | (
+                models::organization_membership_history_entry::State::Active
+                | models::organization_membership_history_entry::State::Suspended,
+                models::organization_membership_history_entry::NameState::Live,
+                true,
+            )
+            | (
+                models::organization_membership_history_entry::State::Active
+                | models::organization_membership_history_entry::State::Suspended,
+                models::organization_membership_history_entry::NameState::Missing,
+                false,
+            ) => {}
+            _ => return Err("the organization membership history name state is inconsistent"),
+        }
+        if value.state == models::organization_membership_history_entry::State::Ended
+            && value.linked_emails.is_some()
+        {
+            return Err("the ended membership has current linked emails");
+        }
         parse_timestamp(
             &value.created_at,
             "the organization membership history creation time is invalid",
@@ -786,6 +869,18 @@ impl TryFrom<models::OrganizationMembershipHistoryEntry> for OrganizationMembers
                 }
             },
             display_name: value.display_name,
+            name_state: match value.name_state {
+                models::organization_membership_history_entry::NameState::Live => NameState::Live,
+                models::organization_membership_history_entry::NameState::Missing => {
+                    NameState::Missing
+                }
+                models::organization_membership_history_entry::NameState::Unavailable => {
+                    NameState::Unavailable
+                }
+            },
+            linked_emails: value
+                .linked_emails
+                .map(|links| links.into_iter().map(LinkedEmail::from).collect()),
             role: match value.role {
                 models::organization_membership_history_entry::Role::Owner => MembershipRole::Owner,
                 models::organization_membership_history_entry::Role::Member => {

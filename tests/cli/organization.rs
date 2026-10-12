@@ -123,6 +123,8 @@ fn membership_history_items() -> serde_json::Value {
             "principalId": "prn_01k0z6r1w8f4jy2m7q9v3x5abc",
             "principalType": "human",
             "displayName": "Ada Lovelace",
+            "nameState": "live",
+            "linkedEmails": [{"email": "first@example.test", "verified": false}, {"email": "second@example.test"}],
             "role": "owner",
             "state": "active",
             "createdAt": "2026-07-29T12:00:00Z",
@@ -134,11 +136,37 @@ fn membership_history_items() -> serde_json::Value {
             "organizationId": "org_01k0z6r1w8f4jy2m7q9v3x5abc",
             "principalId": "prn_01k0z6r1w8f4jy2m7q9v3x5abd",
             "principalType": "service",
+            "nameState": "unavailable",
             "role": "member",
             "state": "ended",
             "createdAt": "2026-07-29T12:01:00Z",
             "updatedAt": "2026-07-29T12:02:00Z",
             "terminalAt": "2026-07-29T12:02:00Z"
+        },
+        {
+            "id": "mem_01k0z6r1w8f4jy2m7q9v3x5abe",
+            "organizationId": "org_01k0z6r1w8f4jy2m7q9v3x5abc",
+            "principalId": "prn_01k0z6r1w8f4jy2m7q9v3x5abe",
+            "principalType": "human",
+            "displayName": "Ada Lovelace",
+            "nameState": "live",
+            "linkedEmails": [],
+            "role": "member",
+            "state": "suspended",
+            "createdAt": "2026-07-29T12:03:00Z",
+            "updatedAt": "2026-07-29T12:03:00Z"
+        },
+        {
+            "id": "mem_01k0z6r1w8f4jy2m7q9v3x5abf",
+            "organizationId": "org_01k0z6r1w8f4jy2m7q9v3x5abc",
+            "principalId": "prn_01k0z6r1w8f4jy2m7q9v3x5abf",
+            "principalType": "human",
+            "nameState": "missing",
+            "linkedEmails": [],
+            "role": "member",
+            "state": "active",
+            "createdAt": "2026-07-29T12:04:00Z",
+            "updatedAt": "2026-07-29T12:04:00Z"
         }
     ])
 }
@@ -150,6 +178,7 @@ fn membership_update_success() -> Vec<u8> {
         "principalId": "prn_01k0z6r1w8f4jy2m7q9v3x5abc",
         "principalType": "human",
         "displayName": "Ada Lovelace",
+        "nameState": "live",
         "role": "member",
         "state": "active",
         "createdAt": "2026-07-29T12:00:00Z",
@@ -1473,15 +1502,20 @@ fn json_members_list_emits_one_continued_page_exactly() {
             "id": "mem_owner",
             "principalId": "prn_human",
             "principalType": "human",
+            "principalState": "active",
             "displayName": "Ada Lovelace",
+            "linkedEmails": [{"email": "ada@first.test", "verified": true}, {"email": "ada@second.test"}],
             "role": "owner",
+            "state": "active",
             "future": "member-response-sentinel"
         },
         {
             "id": "mem_service",
             "principalId": "prn_service",
             "principalType": "service",
-            "role": "member"
+            "principalState": "suspended",
+            "role": "member",
+            "state": "suspended"
         }
     ]);
     let cursor = "opaque continuation /+=?&";
@@ -1505,7 +1539,7 @@ fn json_members_list_emits_one_continued_page_exactly() {
     assert_eq!(
         serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap(),
         serde_json::json!({
-            "schemaVersion": 1,
+            "schemaVersion": 2,
             "deployment": server.api_url,
             "outcome": "listed",
             "items": [
@@ -1513,14 +1547,19 @@ fn json_members_list_emits_one_continued_page_exactly() {
                     "id": "mem_owner",
                     "principalId": "prn_human",
                     "principalType": "human",
+                    "principalState": "active",
                     "displayName": "Ada Lovelace",
-                    "role": "owner"
+                    "linkedEmails": [{"email": "ada@first.test", "verified": true}, {"email": "ada@second.test"}],
+                    "role": "owner",
+                    "state": "active"
                 },
                 {
                     "id": "mem_service",
                     "principalId": "prn_service",
                     "principalType": "service",
-                    "role": "member"
+                    "principalState": "suspended",
+                    "role": "member",
+                    "state": "suspended"
                 }
             ],
             "nextCursor": cursor
@@ -1543,14 +1582,18 @@ fn human_and_empty_members_pages_have_exact_output() {
             "id": "mem_owner",
             "principalId": "prn_human",
             "principalType": "human",
+            "principalState": "active",
             "displayName": "Ada Lovelace",
-            "role": "owner"
+            "role": "owner",
+            "state": "active"
         },
         {
             "id": "mem_service",
             "principalId": "prn_service",
             "principalType": "service",
-            "role": "member"
+            "principalState": "suspended",
+            "role": "member",
+            "state": "active"
         }
     ]);
     let (server, _directory, _path, credential_path) =
@@ -1572,8 +1615,9 @@ fn human_and_empty_members_pages_have_exact_output() {
         format!(
             concat!(
                 "✓ Organization members listed.\n\n",
-                "  Membership: mem_owner  Principal: prn_human  Type: human  Role: owner  Name: Ada Lovelace\n",
-                "  Membership: mem_service  Principal: prn_service  Type: service  Role: member\n\n",
+                "  Membership: mem_owner  Principal: prn_human  Type: human  Role: owner  Name: Ada Lovelace  State: active\n",
+                "  Membership: mem_service  Principal: prn_service  Type: service  Role: member  State: active\n",
+                "    Principal state: suspended\n\n",
                 "  Next cursor: next-page\n",
                 "  Deployment: {}\n"
             ),
@@ -1625,7 +1669,7 @@ fn human_and_empty_members_pages_have_exact_output() {
     assert_eq!(
         serde_json::from_slice::<serde_json::Value>(&empty.stdout).unwrap(),
         serde_json::json!({
-            "schemaVersion": 1,
+            "schemaVersion": 2,
             "deployment": server.api_url,
             "outcome": "listed",
             "items": []
@@ -1699,7 +1743,7 @@ fn membership_management_workflow_has_stable_json_and_request_contracts() {
             "history",
             "acme-research",
             "--limit",
-            "2",
+            "4",
             "--cursor",
             "opaque /+=?&",
             "--json",
@@ -1716,7 +1760,7 @@ fn membership_management_workflow_has_stable_json_and_request_contracts() {
     assert_eq!(
         serde_json::from_slice::<serde_json::Value>(&history.stdout).unwrap(),
         serde_json::json!({
-            "schemaVersion": 1,
+            "schemaVersion": 2,
             "deployment": server.api_url,
             "outcome": "listed",
             "items": expected_history,
@@ -1800,7 +1844,7 @@ fn membership_management_workflow_has_stable_json_and_request_contracts() {
     let requests = server.finish();
     assert_eq!(requests.len(), 4);
     assert!(requests[0].starts_with(
-        "GET /api/v1/organizations/acme-research/memberships/history?limit=2&cursor=opaque+%2F%2B%3D%3F%26 HTTP/1.1\r\n"
+        "GET /api/v1/organizations/acme-research/memberships/history?limit=4&cursor=opaque+%2F%2B%3D%3F%26 HTTP/1.1\r\n"
     ));
     assert!(requests[1].starts_with(
         "PATCH /api/v1/organizations/acme-research/memberships/mem_01k0z6r1w8f4jy2m7q9v3x5abc HTTP/1.1\r\n"
@@ -1937,7 +1981,10 @@ fn membership_management_human_reports_use_the_expected_streams() {
     assert!(report.contains("principal: prn_01k0z6r1w8f4jy2m7q9v3x5abd · type: service"));
     assert!(report.contains("role: member · state: ended"));
     assert!(report.contains("terminal: 2026-07-29T12:02:00Z"));
-    assert!(!report.contains("unavailable"));
+    assert!(report.contains("name: unavailable"));
+    assert!(report.contains("name: missing"));
+    assert!(report.contains("first@example.test (unverified)"));
+    assert!(report.contains("second@example.test (verification unknown)"));
     assert!(history.stderr.is_empty());
     server.finish();
 

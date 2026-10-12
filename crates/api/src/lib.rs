@@ -113,22 +113,22 @@ pub use linear::{
 pub use organizations::{
     AcceptInvitationOutcome, AcceptedInvitationMembership, AuditActor, AuditProjectionWarning,
     AuditProjectionWarningReason, CommonOrganizationFailure, CreateOrganizationOutcome,
-    CurrentPrincipalMembership, GetOrganizationOutcome, Invitation, InvitationDeliveryState,
-    InvitationInboxEntry, InvitationPreview, InvitationState, InvitationTarget,
-    InvitationTargetKind, InvitationTerminationOutcome, IssueInvitationOutcome,
-    ListCurrentPrincipalMembershipsOutcome, ListInvitationInboxOutcome,
+    CurrentPrincipalMembership, DirectoryPrincipalState, GetOrganizationOutcome, Invitation,
+    InvitationDeliveryState, InvitationInboxEntry, InvitationPreview, InvitationState,
+    InvitationTarget, InvitationTargetKind, InvitationTerminationOutcome, IssueInvitationOutcome,
+    LinkedEmail, ListCurrentPrincipalMembershipsOutcome, ListInvitationInboxOutcome,
     ListOrganizationAuditRecordsOutcome, ListOrganizationInvitationsOutcome,
     ListOrganizationMembershipHistoryOutcome, ListOrganizationMembershipsOutcome, MembershipRole,
-    MembershipState, MembershipTerminationOutcome, Organization, OrganizationAuditRecord,
-    OrganizationAuditSubjectKind, OrganizationError, OrganizationMembershipDirectoryEntry,
-    OrganizationMembershipHistoryEntry, OrganizationState, PreviewInvitationOutcome, PrincipalType,
-    UpdateOrganizationMembershipOutcome, UpdateOrganizationOutcome, accept_invitation,
-    create_organization, create_organization_with_delegator, decline_invitation,
-    end_organization_membership, get_organization, issue_invitation, leave_organization,
-    list_current_principal_memberships, list_invitation_inbox, list_organization_audit_records,
-    list_organization_invitations, list_organization_membership_history,
-    list_organization_memberships, preview_invitation, revoke_invitation, update_organization,
-    update_organization_membership_role,
+    MembershipState, MembershipTerminationOutcome, NameState, Organization,
+    OrganizationAuditRecord, OrganizationAuditSubjectKind, OrganizationError,
+    OrganizationMembershipDirectoryEntry, OrganizationMembershipHistoryEntry, OrganizationState,
+    PreviewInvitationOutcome, PrincipalType, UpdateOrganizationMembershipOutcome,
+    UpdateOrganizationOutcome, accept_invitation, create_organization,
+    create_organization_with_delegator, decline_invitation, end_organization_membership,
+    get_organization, issue_invitation, leave_organization, list_current_principal_memberships,
+    list_invitation_inbox, list_organization_audit_records, list_organization_invitations,
+    list_organization_membership_history, list_organization_memberships, preview_invitation,
+    revoke_invitation, update_organization, update_organization_membership_role,
 };
 pub use principal_profile::PrincipalProfile;
 pub use profile::{UpdateProfileError, UpdateProfileOutcome, update_current_principal};
@@ -419,7 +419,7 @@ mod tests {
     #[test]
     fn membership_patch_client_uses_contract_media_type() {
         let _ = rustls::crypto::ring::default_provider().install_default();
-        let body = r#"{"id":"mem_01k0z6r1w8f4jy2m7q9v3x5abc","organizationId":"org_01k0z6r1w8f4jy2m7q9v3x5abc","principalId":"prn_01k0z6r1w8f4jy2m7q9v3x5abc","principalType":"human","role":"owner","state":"active","createdAt":"2026-07-29T00:00:00Z","updatedAt":"2026-07-29T00:00:00Z"}"#;
+        let body = r#"{"id":"mem_01k0z6r1w8f4jy2m7q9v3x5abc","organizationId":"org_01k0z6r1w8f4jy2m7q9v3x5abc","principalId":"prn_01k0z6r1w8f4jy2m7q9v3x5abc","principalType":"human","nameState":"missing","role":"owner","state":"active","createdAt":"2026-07-29T00:00:00Z","updatedAt":"2026-07-29T00:00:00Z"}"#;
         let response = format!(
             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
             body.len()

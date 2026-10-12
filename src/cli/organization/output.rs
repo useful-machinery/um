@@ -6,11 +6,11 @@ use serde::Serialize;
 use crate::exit_code::{ExitCode, OutcomeClass};
 use um_api::{
     AuditActor, AuditProjectionWarning, AuditProjectionWarningReason, CommonOrganizationFailure,
-    CreateOrganizationOutcome, CurrentPrincipalMembership, GetOrganizationOutcome,
-    ListCurrentPrincipalMembershipsOutcome, ListOrganizationAuditRecordsOutcome,
-    ListOrganizationMembershipHistoryOutcome, ListOrganizationMembershipsOutcome,
-    MembershipTerminationOutcome, Organization, OrganizationAuditRecord,
-    OrganizationAuditSubjectKind, OrganizationMembershipDirectoryEntry,
+    CreateOrganizationOutcome, CurrentPrincipalMembership, DirectoryPrincipalState,
+    GetOrganizationOutcome, ListCurrentPrincipalMembershipsOutcome,
+    ListOrganizationAuditRecordsOutcome, ListOrganizationMembershipHistoryOutcome,
+    ListOrganizationMembershipsOutcome, MembershipTerminationOutcome, NameState, Organization,
+    OrganizationAuditRecord, OrganizationAuditSubjectKind, OrganizationMembershipDirectoryEntry,
     OrganizationMembershipHistoryEntry, OrganizationState, PrincipalType,
     UpdateOrganizationMembershipOutcome, UpdateOrganizationOutcome,
 };
@@ -194,7 +194,7 @@ pub(super) fn write_members_list(
     match outcome {
         ListOrganizationMembershipsOutcome::Listed(page) => {
             if json {
-                write_list_json(deployment, &page.items, page.next_cursor.as_deref())?;
+                write_members_list_json(deployment, &page.items, page.next_cursor.as_deref())?;
             } else {
                 write_members_human(deployment, &page.items, page.next_cursor.as_deref())?;
             }
@@ -220,7 +220,7 @@ pub(super) fn write_members_history(
     match outcome {
         ListOrganizationMembershipHistoryOutcome::Listed(page) => {
             if json {
-                write_list_json(deployment, &page.items, page.next_cursor.as_deref())?;
+                write_members_list_json(deployment, &page.items, page.next_cursor.as_deref())?;
             } else {
                 write_membership_history_human(
                     "✓ Organization membership history listed.",
@@ -882,6 +882,32 @@ fn write_membership_times(
     writeln!(output)
 }
 
+fn write_members_list_json(
+    deployment: &str,
+    items: &[impl Serialize],
+    next_cursor: Option<&str>,
+) -> anyhow::Result<()> {
+    super::super::write_cloud_list_json_version(2, deployment, items, next_cursor)
+        .context("write JSON organization membership list result")
+}
+
+fn write_linked_emails(
+    output: &mut impl Write,
+    links: Option<&Vec<um_api::LinkedEmail>>,
+) -> io::Result<()> {
+    if let Some(links) = links {
+        for link in links {
+            let verification = match link.verified {
+                Some(true) => "verified",
+                Some(false) => "unverified",
+                None => "verification unknown",
+            };
+            writeln!(output, "    Email: {} ({verification})", link.email)?;
+        }
+    }
+    Ok(())
+}
+
 fn write_members_human(
     deployment: &str,
     items: &[OrganizationMembershipDirectoryEntry],
@@ -902,7 +928,11 @@ fn write_members_human(
         if let Some(display_name) = &item.display_name {
             write!(stdout, "  Name: {display_name}")?;
         }
-        writeln!(stdout)?;
+        writeln!(stdout, "  State: {}", membership_state(item.state))?;
+        if item.principal_state == DirectoryPrincipalState::Suspended {
+            writeln!(stdout, "    Principal state: suspended")?;
+        }
+        write_linked_emails(&mut stdout, item.linked_emails.as_ref())?;
     }
     if !items.is_empty() {
         writeln!(stdout)?;
@@ -936,9 +966,16 @@ fn write_membership_history_human(
             item.principal_id,
             principal_type(item.principal_type)
         )?;
-        if let Some(display_name) = &item.display_name {
-            writeln!(stdout, "name: {display_name}")?;
+        match item.name_state {
+            NameState::Live => {
+                if let Some(display_name) = &item.display_name {
+                    writeln!(stdout, "name: {display_name}")?;
+                }
+            }
+            NameState::Missing => writeln!(stdout, "name: missing")?,
+            NameState::Unavailable => writeln!(stdout, "name: unavailable")?,
         }
+        write_linked_emails(&mut stdout, item.linked_emails.as_ref())?;
         writeln!(stdout, "organization: {}", item.organization_id)?;
         write_membership_times(&mut stdout, item)?;
     }

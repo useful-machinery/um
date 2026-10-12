@@ -747,8 +747,17 @@ fn write_cloud_list_json(
     items: &[impl Serialize],
     next_cursor: Option<&str>,
 ) -> io::Result<()> {
+    write_cloud_list_json_version(1, deployment, items, next_cursor)
+}
+
+fn write_cloud_list_json_version(
+    version: u8,
+    deployment: &str,
+    items: &[impl Serialize],
+    next_cursor: Option<&str>,
+) -> io::Result<()> {
     write_pretty_json(&CloudListResult {
-        schema_version: 1,
+        schema_version: version,
         deployment,
         outcome: "listed",
         items,

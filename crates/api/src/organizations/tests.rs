@@ -55,6 +55,7 @@ fn membership_history_entry() -> serde_json::Value {
         "principalId": "prn_01k0z6r1w8f4jy2m7q9v3x5abc",
         "principalType": "human",
         "displayName": "Ada Lovelace",
+        "nameState": "live",
         "role": "owner",
         "state": "active",
         "createdAt": "2026-07-29T12:00:00Z",
@@ -416,8 +417,10 @@ fn membership_list_preserves_optional_query_and_decodes_models() {
             "id": "mem_fixture",
             "principalId": "prn_fixture",
             "principalType": "human",
+            "principalState": "suspended",
             "displayName": "Ada",
             "role": "owner",
+            "state": "active",
             "future": true
         }],
         "nextCursor": "opaque cursor"
@@ -439,6 +442,10 @@ fn membership_list_preserves_optional_query_and_decodes_models() {
         panic!("expected listed page");
     };
     assert_eq!(page.items.len(), 1);
+    assert_eq!(
+        page.items[0].principal_state,
+        DirectoryPrincipalState::Suspended
+    );
     assert_eq!(page.next_cursor.as_deref(), Some("opaque cursor"));
     let request = server.finish_one();
     assert!(request.starts_with(

@@ -21,11 +21,11 @@ use super::{UnreachableCategory, classify_reqwest_error};
 
 pub use models::{
     AcceptedInvitationMembership, AuditActor, AuditProjectionWarning, AuditProjectionWarningReason,
-    CurrentPrincipalMembership, Invitation, InvitationDeliveryState, InvitationInboxEntry,
-    InvitationPreview, InvitationState, InvitationTargetKind, MembershipRole, MembershipState,
-    Organization, OrganizationAuditRecord, OrganizationAuditSubjectKind,
-    OrganizationMembershipDirectoryEntry, OrganizationMembershipHistoryEntry, OrganizationState,
-    PrincipalType,
+    CurrentPrincipalMembership, DirectoryPrincipalState, Invitation, InvitationDeliveryState,
+    InvitationInboxEntry, InvitationPreview, InvitationState, InvitationTargetKind, LinkedEmail,
+    MembershipRole, MembershipState, NameState, Organization, OrganizationAuditRecord,
+    OrganizationAuditSubjectKind, OrganizationMembershipDirectoryEntry,
+    OrganizationMembershipHistoryEntry, OrganizationState, PrincipalType,
 };
 pub(crate) use models::{
     CurrentPrincipalMembershipPage, InvitationInboxPage, InvitationPage,
