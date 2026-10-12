@@ -1900,7 +1900,7 @@ closed operator configuration:
 After enrollment has committed protected state, start the service with one value:
 
 ```sh
-um runner serve --config /etc/scherzo/runner.json
+um runner serve --config /etc/um/runner.json
 ```
 
 Production operators should follow the private monorepo's
@@ -1923,7 +1923,7 @@ Rotate a running host only with a replacement activation issued for its existing
 um runner enroll \
   --replace-credential \
   --activation-file /protected/path/replacement-activation.json \
-  --config /etc/scherzo/runner.json
+  --config /etc/um/runner.json
 ```
 
 The command reports Cloud enrollment and live promotion separately. It stages the new
@@ -2032,7 +2032,7 @@ For example, the receiver and its credential both remain under the operator's co
 ```sh
 OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=https://telemetry.example.test/v1/traces \
 OTEL_EXPORTER_OTLP_TRACES_HEADERS='authorization=Bearer%20operator-owned-token' \
-  um runner serve --config /etc/scherzo/runner.json
+  um runner serve --config /etc/um/runner.json
 ```
 
 `OTEL_SDK_DISABLED` is the sole remote-export privacy switch. Case-insensitive `true`

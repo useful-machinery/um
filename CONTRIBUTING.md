@@ -1,6 +1,6 @@
 # Contributing
 
-Thank you for your interest in Scherzo Cloud CLI.
+Thank you for your interest in Useful Machinery CLI.
 
 ## Read-only mirror
 

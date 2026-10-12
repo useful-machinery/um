@@ -91,7 +91,7 @@ OpenTelemetry endpoint environment variable. The trace-specific endpoint takes
 precedence. Remote receivers require HTTPS; cleartext HTTP is limited to the exact
 `localhost` host or a loopback IP. Endpoints containing user information, a query, or a
 fragment are rejected. Standard OTLP header variables may carry credentials, but the
-user owns both those credentials and the receiver. Scherzo supplies no telemetry
+user owns both those credentials and the receiver. Useful Machinery supplies no telemetry
 endpoint, ingestion credential, backend-specific behavior, or collector.
 
 `OTEL_SDK_DISABLED` is the only export privacy switch. Case-insensitive `true` is a hard
@@ -139,7 +139,7 @@ current process can execute, and invokes only the resulting absolute path for a
 candidate after selecting an incompatible installation. The latter probe combines
 `--help` with Pi's invocation-scoped project rejection and resource-discovery disable
 flags. Both probes run from a fresh private temporary working directory with fresh home,
-Pi agent, and XDG directories. Their child environment is cleared before Scherzo
+Pi agent, and XDG directories. Their child environment is cleared before Useful Machinery
 restores the captured inherited `PATH` for environment-based launcher interpreter
 resolution and supplies only those temporary paths, deterministic no-color controls,
 and Pi's offline, no-update-check, and no-install-telemetry controls. The absolute Pi
@@ -151,7 +151,7 @@ help probe verifies the one-run `--approve` flag without reading `defaultProject
 reading or mutating the operator's `trust.json`.
 
 The operator-selected ClaudeCodeStreamJsonV1 check applies the same first-executable,
-canonical-path, no-fallback rule to executable name `claude`. Scherzo does not install,
+canonical-path, no-fallback rule to executable name `claude`. Useful Machinery does not install,
 upgrade, repair, or substitute that executable. Its probes run from a fresh private
 project, home, Claude configuration, and XDG directories with a cleared child
 environment, inherited `PATH` only for launcher interpreter resolution, fixed update and
@@ -192,16 +192,16 @@ ClaudeCodeStreamJsonV1 launches normal Claude Code with the fixed unattended
 `bypassPermissions` mode and runner-owned user, project, and local setting sources. That
 mode suppresses interactive permission prompts; it does not reduce native tool authority,
 confine filesystem paths, filter network access, isolate processes, restrict resources,
-or protect ambient secrets. Scherzo's update, nonessential-traffic, marketplace, memory,
+or protect ambient secrets. Useful Machinery's update, nonessential-traffic, marketplace, memory,
 Git-instruction, and fresh retained-session controls are deterministic profile behavior,
 not a sandbox. The profile removes `CLAUDE_CODE_PROJECT_DIR_NAME` so an inherited native
-path override cannot redirect the validated release away from Scherzo's fresh retained-session
+path override cannot redirect the validated release away from Useful Machinery's fresh retained-session
 links.
 
 Local users and runner operators own the security boundary around Claude Code. They must
 trust or isolate the execution root and every loaded project instruction, skill, hook,
 MCP server, plugin, provider configuration, and credential. They also own filesystem,
-process, network, resource, and secret policy. Scherzo does not claim that runner-owned
+process, network, resource, and secret policy. Useful Machinery does not claim that runner-owned
 settings can contain a hostile same-user process, and the maintained conformance suite
 runs only in fresh synthetic roots against a loopback provider without live credentials.
 
@@ -239,13 +239,13 @@ Codex labels their phase `final_answer`.
 
 The transient SQLite directory remains outside the workflow
 execution root and ambient `CODEX_HOME`, stays live through settlement and process-group
-quiescence, and is then removed. Scherzo retains no native thread transcript or
+quiescence, and is then removed. Useful Machinery retains no native thread transcript or
 Codex-native state. App Server events remain the only native workflow, result, failure,
 retry, cancellation, settlement, or recovery authority. Runner assignment failure and
 cancellation reporting use the same production dispatcher and remain behind descendant
 quiescence; no Cloud protocol or credential boundary is involved.
 
-Durable local runs retain only the owner-private Scherzo correlation metadata and an
+Durable local runs retain only the owner-private Useful Machinery correlation metadata and an
 optional bounded structural protocol rejection for Codex. Those diagnostics remain with
 the owning run after success, failure, cancellation, or forced termination, are never
 reopened for execution or recovery, and disappear when the run is removed. Runner-local
