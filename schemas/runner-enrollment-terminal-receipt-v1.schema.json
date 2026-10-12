@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://docs.usefulmachinery.com/schemas/runner-enrollment-terminal-receipt-v1.schema.json",
-  "title": "Scherzo Runner Enrollment Terminal Receipt V1",
+  "title": "Useful Machinery Runner Enrollment Terminal Receipt V1",
   "type": "object",
   "additionalProperties": false,
   "required": ["schemaVersion", "activationId", "disposition", "observedAt"],

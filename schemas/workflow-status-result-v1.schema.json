@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://docs.usefulmachinery.com/schemas/workflow-status-result-v1.schema.json",
-  "title": "Scherzo Cloud Workflow Status Result Schema 1",
+  "title": "Useful Machinery Workflow Status Result Schema 1",
   "oneOf": [
     {
       "$ref": "#/$defs/StatusSnapshot"

@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://docs.usefulmachinery.com/schemas/runner-operator-config-v1.schema.json",
-  "title": "Scherzo Runner Operator Configuration V1",
+  "title": "Useful Machinery Runner Operator Configuration V1",
   "type": "object",
   "additionalProperties": false,
   "required": ["schemaVersion", "deploymentMode", "runnerStatePath", "controlSocketPath", "workRoot"],
