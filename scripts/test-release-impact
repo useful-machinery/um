@@ -63,7 +63,7 @@ printf '%s\n' 'candidate-C-byte-identical' >"$candidate_repository/source"
 "$fixture_git" init-worktree "$build_804_root" "$candidate_repository"
 candidate_git() { "$fixture_git" worktree "$build_804_root" "$candidate_repository" "$@"; }
 candidate_git config user.name 'Build 804 Fixture'
-candidate_git config user.email build-804@scherzo.invalid
+candidate_git config user.email build-804@usefulmachinery.invalid
 candidate_git add source
 candidate_git commit --quiet --message 'Create candidate C'
 candidate_commit=$(candidate_git rev-parse HEAD)

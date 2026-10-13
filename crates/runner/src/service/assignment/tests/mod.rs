@@ -1038,7 +1038,10 @@ fn run_fixture_git(repository: &Path, arguments: &[&str]) -> String {
 fn initialize_source_repository(source: &Path) {
     run_fixture_git(source, &["init", "--quiet", "--object-format=sha1"]);
     run_fixture_git(source, &["config", "user.name", "Scherzo Fixture"]);
-    run_fixture_git(source, &["config", "user.email", "fixture@scherzo.invalid"]);
+    run_fixture_git(
+        source,
+        &["config", "user.email", "fixture@usefulmachinery.invalid"],
+    );
     run_fixture_git(source, &["add", "."]);
     run_fixture_git(source, &["commit", "--quiet", "-m", "fixture"]);
 }

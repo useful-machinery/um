@@ -2696,7 +2696,10 @@ mod tests {
     fn initialize_accepted_repository(source: &Path) {
         fixture_git(source, &["init", "--quiet", "--object-format=sha1"]);
         fixture_git(source, &["config", "user.name", "Scherzo Fixture"]);
-        fixture_git(source, &["config", "user.email", "fixture@scherzo.invalid"]);
+        fixture_git(
+            source,
+            &["config", "user.email", "fixture@usefulmachinery.invalid"],
+        );
         fixture_git(source, &["add", "."]);
         fixture_git(source, &["commit", "--quiet", "-m", "fixture"]);
     }

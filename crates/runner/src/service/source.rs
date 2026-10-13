@@ -2247,7 +2247,7 @@ mod tests {
         run_fixture_git(repository, &["config", "user.name", "Scherzo Fixture"]);
         run_fixture_git(
             repository,
-            &["config", "user.email", "fixture@scherzo.invalid"],
+            &["config", "user.email", "fixture@usefulmachinery.invalid"],
         );
     }
 

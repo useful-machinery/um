@@ -731,7 +731,10 @@ impl SourceCredentialBroker for FixtureSourceBroker {
 fn initialize_source_repository(source: &Path) -> anyhow::Result<()> {
     run_git(source, &["init", "--quiet", "--object-format=sha1"])?;
     run_git(source, &["config", "user.name", "Scherzo Fixture"])?;
-    run_git(source, &["config", "user.email", "fixture@scherzo.invalid"])?;
+    run_git(
+        source,
+        &["config", "user.email", "fixture@usefulmachinery.invalid"],
+    )?;
     // The nested fixture can inherit the host's global commit-signing policy.
     run_git(source, &["config", "commit.gpgsign", "false"])?;
     run_git(source, &["add", "."])?;

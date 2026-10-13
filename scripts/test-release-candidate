@@ -241,7 +241,7 @@ def build_fixture(
     source.mkdir()
     git(source, "init", "--quiet", "--initial-branch=main")
     git(source, "config", "user.name", "Fixture")
-    git(source, "config", "user.email", "fixture@scherzo.invalid")
+    git(source, "config", "user.email", "fixture@usefulmachinery.invalid")
     write_public_tree(source)
     git(source, "add", "--all")
     base_tree = git(source, "write-tree").decode("ascii").strip()
