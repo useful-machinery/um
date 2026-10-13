@@ -78,7 +78,13 @@ pub(super) fn write_organization_list(
     match outcome {
         ListOrganizationInvitationsOutcome::Listed(page) => {
             if json {
-                write_invitation_page_json(deployment, &page.items, page.next_cursor.as_deref())?;
+                super::super::write_cloud_list_json_version(
+                    2,
+                    deployment,
+                    &page.items,
+                    page.next_cursor.as_deref(),
+                )
+                .context("write JSON invitation history")?;
             } else {
                 write_organization_list_human(
                     deployment,
@@ -431,6 +437,8 @@ fn write_invitation_fields(output: &mut impl Write, invitation: &Invitation) -> 
     }
     if let Some(email) = &invitation.target_email {
         writeln!(output, "target email: {email}")?;
+    } else if invitation.target_kind == InvitationTargetKind::Email {
+        writeln!(output, "target email: unavailable")?;
     }
     if let Some(delivery_state) = invitation.delivery_state {
         writeln!(output, "delivery: {}", delivery_state_text(delivery_state))?;
@@ -500,8 +508,7 @@ fn write_membership_human(
     Ok(())
 }
 
-// Both invitation page projections intentionally share the root JSON list envelope while
-// retaining invitation-specific output context at this boundary.
+// The unaffected inbox retains its schema-1 list envelope.
 fn write_invitation_page_json(
     deployment: &str,
     items: &[impl Serialize],

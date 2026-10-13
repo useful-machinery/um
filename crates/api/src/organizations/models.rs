@@ -467,7 +467,16 @@ impl TryFrom<models::Invitation> for Invitation {
                     .is_some_and(|email| valid_bounded_text(email, 3, 320))
                     && value.target_principal_id.is_none()
             }
-            (_, _) => value.target_principal_id.is_none() && value.target_email.is_none(),
+            (InvitationState::Accepted, _) | (_, InvitationTargetKind::Principal) => {
+                value.target_principal_id.is_none() && value.target_email.is_none()
+            }
+            (_, InvitationTargetKind::Email) => {
+                value.target_principal_id.is_none()
+                    && value
+                        .target_email
+                        .as_deref()
+                        .is_none_or(|email| valid_bounded_text(email, 3, 320))
+            }
         };
         if !target_is_valid
             || target_kind == InvitationTargetKind::Principal && value.delivery_state.is_some()

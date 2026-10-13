@@ -163,8 +163,11 @@ fn organization_invitation_list_preserves_terminal_history_and_cursor() {
     let accepted = invitation("accepted", Some("2026-01-03T03:04:05Z"));
     let mut revoked = invitation("revoked", Some("2026-01-04T03:04:05Z"));
     revoked["id"] = "inv_01k0z6r1w8f4jy2m7q9v3x5abd".into();
+    revoked["targetKind"] = "email".into();
+    revoked["targetEmail"] = "not-joined@example.test".into();
     let mut expired = invitation("expired", Some("2026-01-09T03:04:05Z"));
     expired["id"] = "inv_01k0z6r1w8f4jy2m7q9v3x5abe".into();
+    expired["targetKind"] = "email".into(); // Older erased offer remains unavailable.
     let (server, _directory, _path, credential_path) = prepared(vec![json_http_response(
         "200 OK",
         serde_json::json!({
@@ -195,7 +198,15 @@ fn organization_invitation_list_preserves_terminal_history_and_cursor() {
     assert!(stdout.contains("\"state\": \"accepted\""));
     assert!(stdout.contains("\"state\": \"revoked\""));
     assert!(stdout.contains("\"state\": \"expired\""));
-    assert!(stdout.contains("\"nextCursor\": \"page-two\""));
+    let document: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(document["schemaVersion"], 2);
+    assert_eq!(
+        document["items"][1]["targetEmail"],
+        "not-joined@example.test"
+    );
+    assert_eq!(document["items"][2]["targetKind"], "email");
+    assert!(document["items"][2].get("targetEmail").is_none());
+    assert_eq!(document["nextCursor"], "page-two");
     assert!(output.stderr.is_empty());
     let request = server.finish().pop().unwrap();
     assert!(request.starts_with(&format!(
