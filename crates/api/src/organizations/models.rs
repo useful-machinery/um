@@ -62,6 +62,7 @@ pub struct LinkedEmail {
 #[serde(rename_all = "snake_case")]
 pub enum NameState {
     Live,
+    Snapshot,
     Missing,
     Unavailable,
 }
@@ -96,7 +97,8 @@ pub struct OrganizationMembershipHistoryEntry {
     // optional profiles belong to different principals and obey different privacy rules.
     pub id: String,
     pub organization_id: String,
-    pub principal_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub principal_id: Option<String>,
     pub principal_type: PrincipalType,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,
@@ -815,7 +817,11 @@ impl TryFrom<models::OrganizationMembershipHistoryEntry> for OrganizationMembers
         if !um_support::valid_typed_id(&value.organization_id, "org_") {
             return Err("the organization membership history organization ID is invalid");
         }
-        if !um_support::valid_typed_id(&value.principal_id, "prn_") {
+        if value
+            .principal_id
+            .as_deref()
+            .is_some_and(|id| !um_support::valid_typed_id(id, "prn_"))
+        {
             return Err("the organization membership history principal ID is invalid");
         }
         if value
@@ -828,8 +834,14 @@ impl TryFrom<models::OrganizationMembershipHistoryEntry> for OrganizationMembers
         match (value.state, value.name_state, value.display_name.is_some()) {
             (
                 models::organization_membership_history_entry::State::Ended,
-                models::organization_membership_history_entry::NameState::Unavailable,
+                models::organization_membership_history_entry::NameState::Unavailable
+                | models::organization_membership_history_entry::NameState::Missing,
                 false,
+            )
+            | (
+                models::organization_membership_history_entry::State::Ended,
+                models::organization_membership_history_entry::NameState::Snapshot,
+                true,
             )
             | (
                 models::organization_membership_history_entry::State::Active
@@ -844,6 +856,13 @@ impl TryFrom<models::OrganizationMembershipHistoryEntry> for OrganizationMembers
                 false,
             ) => {}
             _ => return Err("the organization membership history name state is inconsistent"),
+        }
+        if value.principal_id.is_none()
+            && (value.state != models::organization_membership_history_entry::State::Ended
+                || value.name_state
+                    != models::organization_membership_history_entry::NameState::Unavailable)
+        {
+            return Err("only an erased ended membership may omit the principal ID");
         }
         if value.state == models::organization_membership_history_entry::State::Ended
             && value.linked_emails.is_some()
@@ -880,6 +899,9 @@ impl TryFrom<models::OrganizationMembershipHistoryEntry> for OrganizationMembers
             display_name: value.display_name,
             name_state: match value.name_state {
                 models::organization_membership_history_entry::NameState::Live => NameState::Live,
+                models::organization_membership_history_entry::NameState::Snapshot => {
+                    NameState::Snapshot
+                }
                 models::organization_membership_history_entry::NameState::Missing => {
                     NameState::Missing
                 }

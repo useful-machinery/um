@@ -963,11 +963,11 @@ fn write_membership_history_human(
         writeln!(
             stdout,
             "principal: {} · type: {}",
-            item.principal_id,
+            item.principal_id.as_deref().unwrap_or("unavailable"),
             principal_type(item.principal_type)
         )?;
         match item.name_state {
-            NameState::Live => {
+            NameState::Live | NameState::Snapshot => {
                 if let Some(display_name) = &item.display_name {
                     writeln!(stdout, "name: {display_name}")?;
                 }

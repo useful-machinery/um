@@ -136,7 +136,8 @@ fn membership_history_items() -> serde_json::Value {
             "organizationId": "org_01k0z6r1w8f4jy2m7q9v3x5abc",
             "principalId": "prn_01k0z6r1w8f4jy2m7q9v3x5abd",
             "principalType": "service",
-            "nameState": "unavailable",
+            "displayName": "At departure",
+            "nameState": "snapshot",
             "role": "member",
             "state": "ended",
             "createdAt": "2026-07-29T12:01:00Z",
@@ -167,6 +168,29 @@ fn membership_history_items() -> serde_json::Value {
             "state": "active",
             "createdAt": "2026-07-29T12:04:00Z",
             "updatedAt": "2026-07-29T12:04:00Z"
+        },
+        {
+            "id": "mem_01k0z6r1w8f4jy2m7q9v3x5abg",
+            "organizationId": "org_01k0z6r1w8f4jy2m7q9v3x5abc",
+            "principalId": "prn_01k0z6r1w8f4jy2m7q9v3x5abg",
+            "principalType": "human",
+            "nameState": "unavailable",
+            "role": "member",
+            "state": "ended",
+            "createdAt": "2026-07-29T12:05:00Z",
+            "updatedAt": "2026-07-29T12:06:00Z",
+            "terminalAt": "2026-07-29T12:06:00Z"
+        },
+        {
+            "id": "mem_01k0z6r1w8f4jy2m7q9v3x5abh",
+            "organizationId": "org_01k0z6r1w8f4jy2m7q9v3x5abc",
+            "principalType": "human",
+            "nameState": "unavailable",
+            "role": "member",
+            "state": "ended",
+            "createdAt": "2026-07-29T12:07:00Z",
+            "updatedAt": "2026-07-29T12:08:00Z",
+            "terminalAt": "2026-07-29T12:08:00Z"
         }
     ])
 }
@@ -1743,7 +1767,7 @@ fn membership_management_workflow_has_stable_json_and_request_contracts() {
             "history",
             "acme-research",
             "--limit",
-            "4",
+            "6",
             "--cursor",
             "opaque /+=?&",
             "--json",
@@ -1844,7 +1868,7 @@ fn membership_management_workflow_has_stable_json_and_request_contracts() {
     let requests = server.finish();
     assert_eq!(requests.len(), 4);
     assert!(requests[0].starts_with(
-        "GET /api/v1/organizations/acme-research/memberships/history?limit=4&cursor=opaque+%2F%2B%3D%3F%26 HTTP/1.1\r\n"
+        "GET /api/v1/organizations/acme-research/memberships/history?limit=6&cursor=opaque+%2F%2B%3D%3F%26 HTTP/1.1\r\n"
     ));
     assert!(requests[1].starts_with(
         "PATCH /api/v1/organizations/acme-research/memberships/mem_01k0z6r1w8f4jy2m7q9v3x5abc HTTP/1.1\r\n"
@@ -1981,8 +2005,10 @@ fn membership_management_human_reports_use_the_expected_streams() {
     assert!(report.contains("principal: prn_01k0z6r1w8f4jy2m7q9v3x5abd · type: service"));
     assert!(report.contains("role: member · state: ended"));
     assert!(report.contains("terminal: 2026-07-29T12:02:00Z"));
-    assert!(report.contains("name: unavailable"));
+    assert!(report.contains("name: At departure"));
     assert!(report.contains("name: missing"));
+    assert!(report.contains("name: unavailable"));
+    assert!(report.contains("principal: unavailable · type: human"));
     assert!(report.contains("first@example.test (unverified)"));
     assert!(report.contains("second@example.test (verification unknown)"));
     assert!(history.stderr.is_empty());
