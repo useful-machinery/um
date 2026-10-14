@@ -320,8 +320,8 @@ local and CI entrypoint for this invariant.
 
 ## Generated contracts
 
-Versioned OpenAPI and runner protocol contracts define the interface with the Scherzo
-Cloud control plane. Generated clients, types, and codecs needed to build this
+Versioned OpenAPI and runner protocol contracts define the interface with the Useful
+Machinery control plane. Generated clients, types, and codecs needed to build this
 executable will be committed here.
 
 A normal public build consumes the committed client beneath

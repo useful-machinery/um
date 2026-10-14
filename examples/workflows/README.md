@@ -1,7 +1,7 @@
-# Scherzo workflow examples
+# Useful Machinery workflow examples
 
-These Workflow V1 examples provide practical recipes and terminal states for Scherzo
-Cloud presentation and execution testing.
+These Workflow V1 examples provide practical recipes and terminal states for Useful
+Machinery presentation and execution testing.
 
 | Workflow | Demonstrates |
 | --- | --- |
