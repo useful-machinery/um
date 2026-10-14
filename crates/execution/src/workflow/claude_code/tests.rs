@@ -243,6 +243,343 @@ fn parser_requires_matching_initialization_and_serialized_exchange_results() {
     );
 }
 
+fn background_first_turn() -> Vec<Value> {
+    let mut values = vec![
+        init(QUALIFICATION_VERSION, SESSION_ID),
+        message_start("tool-turn"),
+    ];
+    values.extend([
+        stream_event(json!({"type":"content_block_start","index":0,"content_block":{
+            "type":"tool_use","id":"bash-call","name":"Bash","input":{}
+        }})),
+        stream_event(json!({"type":"content_block_delta","index":0,"delta":{
+            "type":"input_json_delta","partial_json":"{}"
+        }})),
+        stream_event(json!({"type":"content_block_stop","index":0})),
+        stream_event(json!({"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":1}})),
+        stream_event(json!({"type":"message_stop"})),
+        json!({"type":"system","subtype":"task_started","session_id":SESSION_ID,
+            "task_id":"task-1","task_type":"local_bash","tool_use_id":"bash-call","is_backgrounded":true}),
+        json!({"type":"user","session_id":SESSION_ID,"parent_tool_use_id":null,
+            "message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"bash-call",
+                "content":[{"type":"text","text":"background"}],"is_error":false}]},
+            "tool_use_result":{"backgroundTaskId":"task-1"}}),
+    ]);
+    values.extend(text_message("first-answer", &["intermediate"], true));
+    values.push(result(SESSION_ID));
+    values
+}
+
+fn background_notification() -> Value {
+    json!({"type":"system","subtype":"task_notification","session_id":SESSION_ID,
+        "task_id":"task-1","tool_use_id":"bash-call","status":"completed"})
+}
+
+#[test]
+fn correlated_background_continuation_keeps_only_the_last_response() {
+    let mut values = background_first_turn();
+    values.push(background_notification());
+    values.push(init(QUALIFICATION_VERSION, SESSION_ID));
+    values.extend(text_message("final-answer", &["final"], true));
+    values.push(result(SESSION_ID));
+    let (_, outcome) = replay(&framed(&values), AgentValueKind::Response, 1024);
+    let AgentOutcome::Completed(CompletedAgentInvocation::Response(response)) = outcome else {
+        panic!("correlated native continuation must settle: {outcome:?}");
+    };
+    assert_eq!(response.as_str(), "final");
+}
+
+#[test]
+fn background_completion_during_foreground_work_does_not_require_another_init() {
+    let mut values = background_first_turn();
+    let notification = background_notification();
+    // Native may report completion while the first exchange is still active.
+    let final_message = values
+        .iter()
+        .position(|value| value["event"]["message"]["id"] == "first-answer")
+        .unwrap();
+    values.insert(final_message, notification);
+    let (_, outcome) = replay(&framed(&values), AgentValueKind::Response, 1024);
+    let AgentOutcome::Completed(CompletedAgentInvocation::Response(response)) = outcome else {
+        panic!("settled background work must not require a wakeup: {outcome:?}");
+    };
+    assert_eq!(response.as_str(), "intermediate");
+}
+
+#[test]
+fn separate_background_wakeups_preserve_other_outstanding_tasks() {
+    let mut values = background_first_turn();
+    let second_start = values
+        .iter()
+        .position(|value| value["event"]["message"]["id"] == "first-answer")
+        .unwrap();
+    let mut second = vec![message_start("second-bash")];
+    second.extend([
+        stream_event(json!({"type":"content_block_start","index":0,"content_block":{
+            "type":"tool_use","id":"bash-2","name":"Bash","input":{}
+        }})),
+        stream_event(json!({"type":"content_block_stop","index":0})),
+        stream_event(json!({"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":1}})),
+        stream_event(json!({"type":"message_stop"})),
+        json!({"type":"system","subtype":"task_started","session_id":SESSION_ID,
+            "task_id":"task-2","task_type":"local_bash","tool_use_id":"bash-2","is_backgrounded":true}),
+        json!({"type":"user","session_id":SESSION_ID,"parent_tool_use_id":null,
+            "message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"bash-2",
+                "content":"background","is_error":false}]},
+            "tool_use_result":{"backgroundTaskId":"task-2"}}),
+    ]);
+    values.splice(second_start..second_start, second);
+    values.extend([
+        background_notification(),
+        json!({"type":"system","subtype":"background_tasks_changed","session_id":SESSION_ID,
+            "tasks":[{"task_id":"task-2","task_type":"local_bash"}]}),
+        init(QUALIFICATION_VERSION, SESSION_ID),
+    ]);
+    values.extend(text_message("second-answer", &["second"], true));
+    values.extend([
+        result(SESSION_ID),
+        json!({"type":"system","subtype":"task_notification","session_id":SESSION_ID,
+            "task_id":"task-2","tool_use_id":"bash-2","status":"completed"}),
+        json!({"type":"system","subtype":"background_tasks_changed","session_id":SESSION_ID,
+            "tasks":[]}),
+        init(QUALIFICATION_VERSION, SESSION_ID),
+    ]);
+    values.extend(text_message("third-answer", &["third"], true));
+    values.push(result(SESSION_ID));
+    let (_, outcome) = replay(&framed(&values), AgentValueKind::Response, 1024);
+    let AgentOutcome::Completed(CompletedAgentInvocation::Response(response)) = outcome else {
+        panic!("independent task wakeups must settle: {outcome:?}");
+    };
+    assert_eq!(response.as_str(), "third");
+    let mut contradictory = values;
+    let snapshot = contradictory
+        .iter_mut()
+        .find(|value| value["subtype"] == "background_tasks_changed")
+        .unwrap();
+    snapshot["tasks"][0]["task_id"] = json!("unrelated");
+    assert_failed(
+        replay(&framed(&contradictory), AgentValueKind::Response, 1024).1,
+        AgentFailureCause::HarnessProtocolFailed,
+    );
+}
+
+#[test]
+fn structured_result_can_follow_settled_background_work_but_not_new_work() {
+    let mut values = background_first_turn();
+    let first_answer = values
+        .iter()
+        .position(|value| value["event"]["message"]["id"] == "first-answer")
+        .unwrap();
+    values.truncate(first_answer);
+    values.push(background_notification());
+    values.extend([
+        message_start("structured"),
+        stream_event(json!({"type":"content_block_start","index":0,"content_block":{
+            "type":"tool_use","id":"structured-call","name":"StructuredOutput",
+            "input":{"result":7}
+        }})),
+        stream_event(json!({"type":"content_block_stop","index":0})),
+        json!({"type":"user","session_id":SESSION_ID,"parent_tool_use_id":null,
+            "message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"structured-call",
+                "content":"ok","is_error":false}]}}),
+        stream_event(json!({"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":1}})),
+        stream_event(json!({"type":"message_stop"})),
+    ]);
+    let mut terminal = result(SESSION_ID);
+    terminal["structured_output"] = json!({"result":7});
+    values.push(terminal);
+    let mut accepted = parser(AgentValueKind::Result, 1024);
+    accepted.push_stdout(&framed(&values), drop).unwrap();
+    assert_eq!(
+        accepted.take_completed_result_exchange(),
+        Some(CompletedResultExchange::Candidate(Arc::new(json!(7))))
+    );
+    accepted
+        .accept_result(CapturedJson::fixture(Arc::new(json!(7))))
+        .unwrap();
+    assert!(matches!(
+        accepted.finish(true),
+        AgentOutcome::Completed(CompletedAgentInvocation::Result(_))
+    ));
+
+    // A result may be accepted before an already-owned task finishes. The
+    // notification is lifecycle drain; a subsequent native turn is not.
+    let mut late = values.clone();
+    late.remove(first_answer);
+    let mut accepted = parser(AgentValueKind::Result, 1024);
+    accepted.push_stdout(&framed(&late), drop).unwrap();
+    assert!(matches!(
+        accepted.take_completed_result_exchange(),
+        Some(CompletedResultExchange::Candidate(_))
+    ));
+    accepted
+        .accept_result(CapturedJson::fixture(Arc::new(json!(7))))
+        .unwrap();
+    accepted
+        .push_stdout(&framed(&[background_notification()]), drop)
+        .unwrap();
+    assert!(matches!(
+        accepted.finish(true),
+        AgentOutcome::Completed(CompletedAgentInvocation::Result(_))
+    ));
+    let mut forbidden = parser(AgentValueKind::Result, 1024);
+    forbidden.push_stdout(&framed(&late), drop).unwrap();
+    forbidden.take_completed_result_exchange();
+    forbidden
+        .accept_result(CapturedJson::fixture(Arc::new(json!(7))))
+        .unwrap();
+    forbidden
+        .push_stdout(&framed(&[background_notification()]), drop)
+        .unwrap();
+    assert_eq!(
+        forbidden.push_stdout(&framed(&[init(QUALIFICATION_VERSION, SESSION_ID)]), drop),
+        Err(AgentFailureCause::HarnessProtocolFailed)
+    );
+
+    let mut pending = background_first_turn();
+    pending.truncate(first_answer);
+    pending.push(result(SESSION_ID));
+    let mut parser = parser(AgentValueKind::Result, 1024);
+    parser.push_stdout(&framed(&pending), drop).unwrap();
+    assert_eq!(
+        parser.take_completed_result_exchange(),
+        Some(CompletedResultExchange::MissingCandidate)
+    );
+    parser
+        .push_stdout(&framed(&[background_notification()]), drop)
+        .unwrap();
+    assert_failed(parser.finish(true), AgentFailureCause::MissingResult);
+}
+
+#[test]
+fn foreground_bash_calls_retire_after_their_tool_results() {
+    let mut values = vec![init(QUALIFICATION_VERSION, SESSION_ID)];
+    for index in 0..129 {
+        let call = format!("bash-{index}");
+        values.extend([
+            message_start(&format!("message-{index}")),
+            stream_event(json!({"type":"content_block_start","index":0,"content_block":{
+                "type":"tool_use","id":call,"name":"Bash","input":{}
+            }})),
+            stream_event(json!({"type":"content_block_stop","index":0})),
+            stream_event(json!({"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":1}})),
+            stream_event(json!({"type":"message_stop"})),
+            json!({"type":"user","session_id":SESSION_ID,"parent_tool_use_id":null,
+                "message":{"role":"user","content":[{"type":"tool_result","tool_use_id":call,
+                    "content":"ok","is_error":false}]}}),
+        ]);
+    }
+    values.extend(text_message("last", &["done"], true));
+    values.push(result(SESSION_ID));
+    let (_, outcome) = replay(&framed(&values), AgentValueKind::Response, 1024);
+    assert!(
+        matches!(
+            outcome,
+            AgentOutcome::Completed(CompletedAgentInvocation::Response(_))
+        ),
+        "{outcome:?}"
+    );
+}
+
+#[test]
+fn background_continuation_rejects_unrelated_and_unsettled_work() {
+    let first = background_first_turn();
+    for mutate in [
+        ("task_started", "tool_use_id", "unrelated-call"),
+        ("user", "backgroundTaskId", "unrelated-task"),
+    ] {
+        let mut changed = first.clone();
+        if mutate.0 == "task_started" {
+            let started = changed
+                .iter_mut()
+                .find(|value| value["subtype"] == "task_started")
+                .unwrap();
+            started[mutate.1] = json!(mutate.2);
+        } else {
+            let acknowledgement = changed
+                .iter_mut()
+                .find(|value| value["type"] == "user")
+                .unwrap();
+            acknowledgement["tool_use_result"][mutate.1] = json!(mutate.2);
+        }
+        assert_failed(
+            replay(&framed(&changed), AgentValueKind::Response, 1024).1,
+            AgentFailureCause::HarnessProtocolFailed,
+        );
+    }
+    let mut premature = first.clone();
+    let task_start = premature
+        .iter()
+        .position(|event| event["subtype"] == "task_started")
+        .unwrap();
+    premature.swap(task_start - 1, task_start);
+    assert_failed(
+        replay(&framed(&premature), AgentValueKind::Response, 1024).1,
+        AgentFailureCause::HarnessProtocolFailed,
+    );
+    assert_failed(
+        replay(&framed(&first), AgentValueKind::Response, 1024).1,
+        AgentFailureCause::HarnessProtocolFailed,
+    );
+    for extra in [
+        vec![init(QUALIFICATION_VERSION, SESSION_ID)],
+        vec![
+            json!({"type":"system","subtype":"task_notification","session_id":SESSION_ID,
+            "task_id":"unrelated","tool_use_id":"bash-call","status":"completed"}),
+        ],
+        vec![background_notification(), background_notification()],
+        vec![
+            background_notification(),
+            init(
+                QUALIFICATION_VERSION,
+                "00000000-0000-4000-8000-000000000002",
+            ),
+        ],
+    ] {
+        let mut values = first.clone();
+        values.extend(extra);
+        assert_failed(
+            replay(&framed(&values), AgentValueKind::Response, 1024).1,
+            AgentFailureCause::HarnessProtocolFailed,
+        );
+    }
+    let mut failed_turn = first.clone();
+    let terminal = failed_turn.last_mut().unwrap();
+    terminal["subtype"] = json!("error_during_execution");
+    terminal["is_error"] = json!(true);
+    terminal["terminal_reason"] = json!("error_during_execution");
+    failed_turn.push(background_notification());
+    failed_turn.push(init(QUALIFICATION_VERSION, SESSION_ID));
+    assert_failed(
+        replay(&framed(&failed_turn), AgentValueKind::Response, 1024).1,
+        AgentFailureCause::HarnessProtocolFailed,
+    );
+    let mut forged = first.clone();
+    forged.push(background_notification());
+    forged.push(init(QUALIFICATION_VERSION, SESSION_ID));
+    forged.push(
+        json!({"type":"user", "session_id":SESSION_ID, "parent_tool_use_id":null,
+        "message":{"role":"user","content":[{"type":"text","text":"unsolicited"}]}}),
+    );
+    assert_failed(
+        replay(&framed(&forged), AgentValueKind::Response, 1024).1,
+        AgentFailureCause::HarnessProtocolFailed,
+    );
+    let mut accepted = parser(AgentValueKind::Result, 1024);
+    accepted
+        .push_stdout(
+            &framed(&[init(QUALIFICATION_VERSION, SESSION_ID), result(SESSION_ID)]),
+            drop,
+        )
+        .unwrap();
+    assert_eq!(
+        accepted
+            .push_stdout(&framed(&[background_notification()]), drop)
+            .unwrap_err(),
+        AgentFailureCause::HarnessProtocolFailed
+    );
+}
+
 #[test]
 fn every_initialization_must_match_the_validated_installation_version() {
     let admitted_version = "2.1.235";

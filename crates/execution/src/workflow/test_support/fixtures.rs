@@ -116,7 +116,9 @@ impl CoordinatorClock for ControlledClock {
 }
 
 #[derive(Clone, Default)]
-pub(crate) struct RecordingObservationSink(Arc<Mutex<Vec<AgentObservationEnvelope>>>);
+pub(crate) struct RecordingObservationSink(
+    Arc<(Mutex<Vec<AgentObservationEnvelope>>, tokio::sync::Notify)>,
+);
 
 impl RecordingObservationSink {
     /// Native text and reasoning arrive as arbitrarily split deltas.
@@ -131,16 +133,34 @@ impl RecordingObservationSink {
     }
 
     pub(crate) fn snapshot(&self) -> Vec<AgentObservationEnvelope> {
-        self.0.lock().expect("observation sink lock").clone()
+        self.0.0.lock().expect("observation sink lock").clone()
+    }
+
+    pub(crate) async fn wait_for(&self, predicate: impl Fn(&AgentObservation) -> bool) {
+        loop {
+            let notified = self.0.1.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self
+                .snapshot()
+                .iter()
+                .any(|event| predicate(event.observation()))
+            {
+                return;
+            }
+            notified.await;
+        }
     }
 }
 
 impl AgentObservationSink for RecordingObservationSink {
     fn observe(&self, observation: AgentObservationEnvelope) -> impl Future<Output = ()> + Send {
         self.0
+            .0
             .lock()
             .expect("observation sink lock")
             .push(observation);
+        self.0.1.notify_waiters();
         ready(())
     }
 }

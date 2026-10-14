@@ -407,6 +407,14 @@ pub(crate) enum CompletedResultExchange {
     NativeFailure,
 }
 
+struct BackgroundCommand {
+    task_id: Arc<str>,
+    tool_use_id: Arc<str>,
+    run_id: Option<Arc<str>>,
+    acknowledged: bool,
+    notified: bool,
+}
+
 pub(crate) struct ClaudeCodeStreamJsonV1Parser {
     expected_cwd: Arc<str>,
     expected_model: Arc<str>,
@@ -420,6 +428,8 @@ pub(crate) struct ClaudeCodeStreamJsonV1Parser {
     exchange_initialized: bool,
     exchange_active: bool,
     completed_exchanges: u64,
+    bash_calls: Vec<Arc<str>>,
+    background_commands: Vec<BackgroundCommand>,
     active_message: Option<StreamedMessage>,
     final_main_message: Option<CompletedMainMessage>,
     exchange_structured_output_candidates: u64,
@@ -478,6 +488,8 @@ impl ClaudeCodeStreamJsonV1Parser {
             exchange_initialized: false,
             exchange_active: true,
             completed_exchanges: 0,
+            bash_calls: Vec::new(),
+            background_commands: Vec::new(),
             active_message: None,
             final_main_message: None,
             exchange_structured_output_candidates: 0,
@@ -632,6 +644,7 @@ impl ClaudeCodeStreamJsonV1Parser {
             || self.completed_result_exchange.is_some()
             || self.result_decision_pending
             || self.completed_exchanges == 0
+            || self.background_commands.iter().any(|task| !task.notified)
         {
             return self.protocol_failure_outcome(
                 AgentFailureCause::HarnessProtocolFailed,
@@ -714,6 +727,17 @@ impl ClaudeCodeStreamJsonV1Parser {
         }
         if event_type == "system" && required_string(object, "subtype") == Some("init") {
             self.rejection_context.stage = ClaudeCodeStreamJsonV1ProtocolStage::Initialization;
+            if !self.exchange_active && self.value_kind != AgentValueKind::Result {
+                if self.native_failure.is_some()
+                    || !self.background_commands.iter().any(|task| task.notified)
+                {
+                    return Err(self.protocol_failure());
+                }
+                self.begin_exchange()?;
+                // Only completed tasks authorize this wakeup. Others remain owned by
+                // the invocation and may notify during the next native exchange.
+                self.background_commands.retain(|task| !task.notified);
+            }
             return self.parse_initialization(object);
         }
 
@@ -769,10 +793,52 @@ impl ClaudeCodeStreamJsonV1Parser {
     ) -> Result<(), AgentFailureCause> {
         self.require_matching_session(object)?;
         match event_type {
-            "system" if required_string(object, "subtype") == Some("status") => {
+            "system"
+                if matches!(
+                    required_string(object, "subtype"),
+                    Some("status" | "task_updated" | "task_notification")
+                ) =>
+            {
                 self.rejection_context.stage = ClaudeCodeStreamJsonV1ProtocolStage::SystemEvent;
                 self.parse_system(object, value)
             }
+            "system" if required_string(object, "subtype") == Some("background_tasks_changed") => {
+                let tasks =
+                    required_array(object, "tasks").ok_or_else(|| self.protocol_failure())?;
+                if tasks.len()
+                    != self
+                        .background_commands
+                        .iter()
+                        .filter(|task| !task.notified)
+                        .count()
+                {
+                    return Err(self.protocol_failure());
+                }
+                let mut seen = Vec::new();
+                for entry in tasks {
+                    let entry = entry.as_object().ok_or_else(|| self.protocol_failure())?;
+                    let id = required_nonempty_string(entry, "task_id")
+                        .ok_or_else(|| self.protocol_failure())?;
+                    if required_string(entry, "task_type") != Some("local_bash")
+                        || seen.contains(&id)
+                        || !self.background_commands.iter().any(|task| {
+                            !task.notified
+                                && task.task_id.as_ref() == id
+                                && task.run_id.as_deref()
+                                    == required_nonempty_string(entry, "run_id")
+                        })
+                    {
+                        return Err(self.protocol_failure());
+                    }
+                    seen.push(id);
+                }
+                self.observe_unrecognized(value);
+                Ok(())
+            }
+            "system" if required_string(object, "subtype") == Some("task_started") => self.reject(
+                ClaudeCodeStreamJsonV1RejectionReason::TerminalDrainEventInvalid,
+                ClaudeCodeStreamJsonV1ProtocolStage::TerminalDrain,
+            ),
             "stream_event" | "assistant" | "user" | "tool_progress" | "result" => self.reject(
                 ClaudeCodeStreamJsonV1RejectionReason::TerminalDrainEventInvalid,
                 ClaudeCodeStreamJsonV1ProtocolStage::TerminalDrain,
@@ -1037,6 +1103,14 @@ impl ClaudeCodeStreamJsonV1Parser {
                 else {
                     return Err(self.protocol_failure());
                 };
+                if name == "Bash" {
+                    if self.bash_calls.len() >= 128
+                        || self.bash_calls.iter().any(|id| id.as_ref() == call_id)
+                    {
+                        return Err(self.protocol_failure());
+                    }
+                    self.bash_calls.push(Arc::from(call_id));
+                }
                 self.observations.push(AgentObservation::ToolCall {
                     call_id: Arc::from(call_id),
                     name: Arc::from(name),
@@ -1484,7 +1558,7 @@ impl ClaudeCodeStreamJsonV1Parser {
         value: &Value,
     ) -> Result<(), AgentFailureCause> {
         self.require_matching_session(object)?;
-        parent_tool_use_id(object).ok_or_else(|| self.protocol_failure())?;
+        let parent = parent_tool_use_id(object).ok_or_else(|| self.protocol_failure())?;
         let message = required_object(object, "message").ok_or_else(|| self.protocol_failure())?;
         let content = required_array(message, "content").ok_or_else(|| self.protocol_failure())?;
         if required_string(message, "role") != Some("user") {
@@ -1495,6 +1569,12 @@ impl ClaudeCodeStreamJsonV1Parser {
                 return Err(self.protocol_failure());
             };
             if required_string(block, "type") != Some("tool_result") {
+                if self.completed_exchanges > 0
+                    && self.value_kind != AgentValueKind::Result
+                    && parent.is_none()
+                {
+                    return Err(self.protocol_failure());
+                }
                 self.observe_unrecognized(value);
                 continue;
             }
@@ -1504,6 +1584,21 @@ impl ClaudeCodeStreamJsonV1Parser {
                 .get("content")
                 .and_then(normalized_tool_result_content)
                 .ok_or_else(|| self.protocol_failure())?;
+            if let Some(task_id) = object
+                .get("tool_use_result")
+                .and_then(Value::as_object)
+                .and_then(|result| required_nonempty_string(result, "backgroundTaskId"))
+            {
+                let Some(task) = self.background_commands.iter_mut().find(|task| {
+                    task.task_id.as_ref() == task_id && task.tool_use_id.as_ref() == call_id
+                }) else {
+                    return Err(self.protocol_failure());
+                };
+                if task.acknowledged {
+                    return Err(self.protocol_failure());
+                }
+                task.acknowledged = true;
+            }
             let acknowledges_structured_output =
                 self.active_message.as_ref().is_some_and(|message| {
                     message
@@ -1549,6 +1644,12 @@ impl ClaudeCodeStreamJsonV1Parser {
                 is_error,
                 content: Arc::from(result),
             });
+            // A foreground Bash result no longer needs correlation state. A
+            // background result has already been paired with task_started above;
+            // its task identity remains until notification/continuation.
+            if let Some(index) = self.bash_calls.iter().position(|id| id.as_ref() == call_id) {
+                self.bash_calls.remove(index);
+            }
         }
         Ok(())
     }
@@ -1586,6 +1687,65 @@ impl ClaudeCodeStreamJsonV1Parser {
             "compact_boundary" => self
                 .observations
                 .push(lifecycle(AgentLifecycleMilestone::CompactionCompleted)),
+            "task_started" => {
+                if required_string(object, "task_type") != Some("local_bash")
+                    || required_bool(object, "is_backgrounded") != Some(true)
+                {
+                    self.observe_unrecognized(value);
+                    return Ok(());
+                }
+                if !self.exchange_active || self.active_message.is_some() {
+                    return Err(self.protocol_failure());
+                }
+                let task_id = required_nonempty_string(object, "task_id")
+                    .ok_or_else(|| self.protocol_failure())?;
+                let tool_use_id = required_nonempty_string(object, "tool_use_id")
+                    .ok_or_else(|| self.protocol_failure())?;
+                if !self.bash_calls.iter().any(|id| id.as_ref() == tool_use_id)
+                    || self.background_commands.len() >= 128
+                    || self.background_commands.iter().any(|task| {
+                        task.task_id.as_ref() == task_id || task.tool_use_id.as_ref() == tool_use_id
+                    })
+                {
+                    return Err(self.protocol_failure());
+                }
+                self.background_commands.push(BackgroundCommand {
+                    task_id: Arc::from(task_id),
+                    tool_use_id: Arc::from(tool_use_id),
+                    run_id: required_nonempty_string(object, "run_id").map(Arc::from),
+                    acknowledged: false,
+                    notified: false,
+                });
+            }
+            "task_updated" | "task_notification" => {
+                let task_id = required_nonempty_string(object, "task_id")
+                    .ok_or_else(|| self.protocol_failure())?;
+                let Some(task) = self
+                    .background_commands
+                    .iter_mut()
+                    .find(|task| task.task_id.as_ref() == task_id)
+                else {
+                    if self.exchange_active {
+                        self.observe_unrecognized(value);
+                        return Ok(());
+                    }
+                    return Err(self.protocol_failure());
+                };
+                if required_nonempty_string(object, "run_id") != task.run_id.as_deref() {
+                    return Err(self.protocol_failure());
+                }
+                if required_string(object, "subtype") == Some("task_notification") {
+                    if !task.acknowledged
+                        || task.notified
+                        || required_nonempty_string(object, "tool_use_id")
+                            != Some(task.tool_use_id.as_ref())
+                        || required_nonempty_string(object, "status") != Some("completed")
+                    {
+                        return Err(self.protocol_failure());
+                    }
+                    task.notified = true;
+                }
+            }
             _ => self.observe_unrecognized(value),
         }
         Ok(())
@@ -1702,7 +1862,7 @@ impl ClaudeCodeStreamJsonV1Parser {
             .ok_or_else(|| self.protocol_failure())?;
         self.observations
             .push(lifecycle(AgentLifecycleMilestone::TurnCompleted));
-        if completes_harness {
+        if completes_harness && self.background_commands.iter().all(|task| task.notified) {
             self.observations
                 .push(lifecycle(AgentLifecycleMilestone::HarnessCompleted));
         }

@@ -989,24 +989,24 @@ async fn pinned_real_claude_code_07_retains_forwarded_subagent_activity() {
 
         provider.next_request().await.release_tool_use(
             "Agent",
-            json!({
-                "description": "Run a controlled subagent",
+            json!({"description": "Run a controlled subagent",
                 "prompt": "Return the exact subagent retained marker.",
                 "subagent_type": "general-purpose",
                 "run_in_background": false,
             }),
         );
-        provider
-            .next_request()
-            .await
-            .release_text("subagent retained marker");
+        let mut terminal = running.terminal;
+        tokio::select! {
+            request = provider.next_request() => request.release_text("subagent retained marker"),
+            outcome = &mut terminal => panic!("subagent stopped before child request: {outcome:?}"),
+        }
         provider.next_request().await.release_text(RESPONSE);
-
         let AgentOutcome::Completed(CompletedAgentInvocation::Response(response)) =
-            running.finish().await
+            terminal.await.unwrap()
         else {
             panic!("subagent exchange must complete through the production adapter");
         };
+        running.task.await.unwrap();
         assert_eq!(response.as_str(), RESPONSE);
         assert_retained_native_session(&root, &["subagent retained marker", RESPONSE]);
         let subagents = root.retained_resources().join("subagents");
@@ -1025,6 +1025,165 @@ async fn pinned_real_claude_code_07_retains_forwarded_subagent_activity() {
     })
     .await
     .expect("pinned Claude Code subagent-retention watchdog expired");
+}
+
+#[cfg(target_os = "linux")]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "real time is only an anti-hang boundary for the native process"
+)]
+#[tokio::test]
+#[ignore = "requires pinned harness"]
+async fn pinned_real_claude_code_06e_cancel_pending_background_after_first_result() {
+    let (executable, _exclusive) = exclusive_conformance_executable().await;
+    nix::sys::prctl::set_child_subreaper(true).unwrap();
+    tokio::time::timeout(WATCHDOG, async {
+        let mut provider = LoopbackProvider::start().await;
+        let root = SyntheticClaudeCodeRoot::new();
+        let ready = FixtureSignal::create(root.private().join("pending-child.pid"));
+        let blocker = root.private().join("pending-child.blocker");
+        mkfifo(&blocker, Mode::S_IRUSR | Mode::S_IWUSR).unwrap();
+        let observations = RecordingObservationSink::default();
+        let running =
+            launch_recorded_response_lifecycle(executable, &root, &provider, &observations).await;
+        provider.next_request().await.release_tool_use(
+            "Bash",
+            json!({
+                "command": format!("printf '%s\\n' \"$$\" > '{}'; IFS= read -r done < '{}'",
+                    ready.path().display(), blocker.display()),
+                "description": "Block a background command until cancellation",
+                "run_in_background": true,
+            }),
+        );
+        let child = process_id(&ready.receive().await);
+        let process_group = getpgid(Some(child)).unwrap();
+        provider
+            .next_request()
+            .await
+            .release_text("not authoritative");
+        observations
+            .wait_for(|event| {
+                matches!(
+                    event,
+                    AgentObservation::Lifecycle {
+                        milestone: AgentLifecycleMilestone::TurnCompleted,
+                    }
+                )
+            })
+            .await;
+        assert!(
+            running
+                .cancellation
+                .request_cancellation(CancellationReason::UserRequest)
+        );
+        running.process_control.interrupt();
+        assert_user_cancelled(running).await;
+        assert!(process_group_is_quiescent(process_group));
+        assert!(!provider.has_pending_request());
+        provider.shutdown().await;
+    })
+    .await
+    .expect("pending background cancellation watchdog expired");
+}
+
+#[expect(
+    clippy::disallowed_methods,
+    reason = "real time is only an anti-hang boundary for the native process"
+)]
+#[tokio::test]
+#[ignore = "requires pinned harness"]
+async fn pinned_real_claude_code_06d_prompt_hook_deny_prevents_provider_request() {
+    let (executable, _exclusive) = exclusive_conformance_executable().await;
+    tokio::time::timeout(WATCHDOG, async {
+        let mut provider = LoopbackProvider::start().await;
+        let root = SyntheticClaudeCodeRoot::new();
+        let hook = root.private().join("deny-prompt.sh");
+        let observed = root.private().join("prompt-denied");
+        fs::write(&hook, format!("printf denied > '{}'; exit 2\n", observed.display())).unwrap();
+        let settings = root.project().join(".claude/settings.json");
+        fs::create_dir_all(settings.parent().unwrap()).unwrap();
+        fs::write(settings, serde_json::to_vec(&json!({
+            "hooks": {"UserPromptSubmit": [{"hooks": [{"type": "command",
+                "command": format!("{} {}", std::env::var("UM_CLAUDE_CODE_CONFORMANCE_SHELL").unwrap(), hook.display())
+            }]}]}
+        })).unwrap()).unwrap();
+        let running = RunningProductionClaudeCode::launch(
+            executable, &root, &provider, AgentValueMode::None,
+            RecordingObservationSink::default(),
+        );
+        let mut terminal = running.terminal;
+        let outcome = tokio::select! {
+            outcome = &mut terminal => outcome.unwrap(),
+            _ = provider.next_request() => panic!("denied prompt reached provider"),
+        };
+        running.task.await.unwrap();
+        assert!(matches!(outcome, AgentOutcome::Failed(_)), "{outcome:?}");
+        assert_eq!(fs::read(observed).unwrap(), b"denied");
+        assert!(!provider.has_pending_request());
+        provider.shutdown().await;
+    }).await.expect("native prompt-hook deny watchdog expired");
+}
+
+#[expect(
+    clippy::disallowed_methods,
+    reason = "real time bounds only a controlled external process probe"
+)]
+#[tokio::test]
+#[ignore = "requires pinned harness"]
+async fn pinned_real_claude_code_06c_background_completion_continuation() {
+    let (executable, _exclusive) = exclusive_conformance_executable().await;
+    tokio::time::timeout(WATCHDOG, async {
+        let mut provider = LoopbackProvider::start().await;
+        let root = SyntheticClaudeCodeRoot::new();
+        let ready = FixtureSignal::create(root.private().join("background-ready"));
+        let blocker = root.private().join("background-blocker");
+        mkfifo(&blocker, Mode::S_IRUSR | Mode::S_IWUSR).unwrap();
+        let observations = RecordingObservationSink::default();
+        let mut running = launch_recorded_response_lifecycle(
+            executable, &root, &provider, &observations,
+        ).await;
+        provider.next_request().await.release_tool_use(
+            "Bash",
+            json!({
+                "command": format!(
+                    "printf 'ready\\n' > '{}'; IFS= read -r done < '{}'; printf 'background finished\\n'",
+                    ready.path().display(), blocker.display()
+                ),
+                "description": "Run a controlled background command",
+                "run_in_background": true,
+            }),
+        );
+        // The tool returns a task identity before its child is released.
+        let next = provider.next_request().await;
+        assert_eq!(ready.receive().await, b"ready\n");
+        next.release_text("first response");
+        observations.wait_for(|event| matches!(event, AgentObservation::Lifecycle {
+            milestone: AgentLifecycleMilestone::TurnCompleted,
+        })).await;
+        assert!(matches!(running.terminal.try_recv(), Err(tokio::sync::oneshot::error::TryRecvError::Empty)));
+        let release = tokio::task::spawn_blocking(move || {
+            fs::write(blocker, b"done\n").unwrap();
+        });
+        release.await.unwrap();
+        let mut terminal = running.terminal;
+        let outcome = tokio::select! {
+            request = provider.next_request() => {
+                assert!(request.used_placeholder_key());
+                assert!(request.body()["messages"].is_array());
+                request.release_text("final response");
+                terminal.await.unwrap()
+            }
+            outcome = &mut terminal => outcome.unwrap(),
+        };
+        running.task.await.unwrap();
+        let AgentOutcome::Completed(CompletedAgentInvocation::Response(response)) = outcome else {
+            panic!("background continuation must settle, got {outcome:?}");
+        };
+        assert_eq!(response.as_str(), "final response");
+        assert!(!provider.has_pending_request());
+        assert_retained_native_session(&root, &["first response", "final response"]);
+        provider.shutdown().await;
+    }).await.expect("background probe watchdog expired");
 }
 
 /// Ordered thinking segments deliberately carry multibyte, newline, tab, and trailing
@@ -1072,7 +1231,7 @@ async fn pinned_real_claude_code_08_correlates_a_nominal_thinking_envelope_befor
             LoopbackBlock::text(RESPONSE),
         ]);
 
-        // Claude Code 2.1.289 emits a nominal `assistant` envelope restating the thinking
+        // Claude Code 2.1.296 emits a nominal `assistant` envelope restating the thinking
         // block. `ActiveContentBlock::correlate_nominal` requires that envelope to be
         // byte-equal to the reconstructed `thinking_delta` stream, so reaching a response
         // at all proves the equality invariant holds for native thinking.

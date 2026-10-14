@@ -263,7 +263,9 @@ impl SyntheticClaudeCodeRoot {
 printf 'started\n' > '{}'
 while IFS= read -r line; do
   printf '%s\n' "$line" >> '{}'
-  if [[ "$line" =~ \"id\":([0-9]+) ]]; then
+  if [[ "$line" =~ \"id\":\"([^\"]+)\" ]]; then
+    id="\"${{BASH_REMATCH[1]}}\""
+  elif [[ "$line" =~ \"id\":([0-9]+) ]]; then
     id="${{BASH_REMATCH[1]}}"
   else
     continue
@@ -277,6 +279,9 @@ while IFS= read -r line; do
       ;;
     *ping*)
       printf '{{"jsonrpc":"2.0","id":%s,"result":{{}}}}\n' "$id"
+      ;;
+    *)
+      printf '{{"jsonrpc":"2.0","id":%s,"error":{{"code":-32601,"message":"Method not found"}}}}\n' "$id"
       ;;
   esac
 done
