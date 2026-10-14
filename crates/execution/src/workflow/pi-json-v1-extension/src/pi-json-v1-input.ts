@@ -71,6 +71,12 @@ export function createPiJsonV1InputExtension(
 
     if (systemPrompt !== undefined) {
       pi.on("before_agent_start", (event, ctx) => {
+        // Pi 0.99.1 omits messageType on user starts; Pi 1.2.0 supplies
+        // it. Only an explicit custom start cannot own the staged prompt.
+        if (event.messageType !== undefined && event.messageType !== "user") {
+          ctx.abort();
+          return;
+        }
         const replaced = replaceSingleMarker(event.systemPrompt, systemPrompt);
         if (replaced === undefined) {
           ctx.abort();

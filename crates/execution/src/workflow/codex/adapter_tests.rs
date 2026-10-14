@@ -3002,14 +3002,24 @@ pub(super) mod exact_binary {
                     if !mcp_post {
                         let mcp_get = request_line.starts_with("GET /api/codex/ps/mcp ")
                             || request_line.starts_with("GET /mcp ");
-                        let body = if mcp_get || mcp_delete {
+                        if mcp_get {
+                            // Streamable HTTP MCP opens a GET SSE channel alongside POSTs.
+                            // Refusing it can race session initialization and prevent the
+                            // explicit events/stream subscription from ever being sent.
+                            socket
+                                .write_all(
+                                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nmcp-session-id: fixture-session\r\n\r\n",
+                                )
+                                .await
+                                .unwrap();
+                            std::future::pending::<()>().await;
+                        }
+                        let body = if mcp_delete {
                             ""
                         } else {
                             "{\"items\":[],\"plugins\":[]}"
                         };
-                        let status = if mcp_get {
-                            "405 Method Not Allowed"
-                        } else if mcp_delete {
+                        let status = if mcp_delete {
                             "202 Accepted"
                         } else {
                             "200 OK"

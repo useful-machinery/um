@@ -829,6 +829,14 @@ export default function fakeProviderExtension(pi: ExtensionAPI): void {
   });
 
   pi.on("before_agent_start", async (event, ctx) => {
+    // The harness submits one user prompt; an extension-triggered custom run
+    // must never masquerade as that prompt in the startup proof.
+    if (event.messageType !== "user") {
+      throw new Error("Unexpected custom run in the startup proof");
+    }
+    if (ctx.isIdle()) {
+      throw new Error("The starting run must already count as busy");
+    }
     if (process.env.UM_PI_FAKE_BASH_ONLY_TOOLS === "1") {
       pi.setActiveTools(["bash"]);
     }

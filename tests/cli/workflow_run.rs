@@ -3391,9 +3391,9 @@ export default function fixtureWrite(pi: ExtensionAPI): void {
 fn pinned_real_pi_runs_the_complete_mixed_value_and_export_dag() {
     let pinned_pi = std::env::var_os("UM_PI_CONFORMANCE_EXECUTABLE")
         .map(PathBuf::from)
-        .filter(|path| path.to_string_lossy().ends_with("-pi-0.99.1/bin/pi"))
+        .filter(|path| path.to_string_lossy().ends_with("-pi-1.2.0/bin/pi"))
         .unwrap_or_else(|| {
-            panic!("UM_PI_CONFORMANCE_EXECUTABLE must name the pinned Pi 0.99.1 executable")
+            panic!("UM_PI_CONFORMANCE_EXECUTABLE must name the pinned Pi 1.2.0 executable")
         });
     let bundle = RunBundle::new(mixed_agent_source());
     for (path, text) in [

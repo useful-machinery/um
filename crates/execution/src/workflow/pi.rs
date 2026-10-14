@@ -807,7 +807,17 @@ impl PiJsonV1Parser {
     }
 
     fn agent_settled(&mut self, object: &Map<String, Value>) -> Result<(), AgentFailureCause> {
-        self.require_authority_event_shape(object, &["type"])?;
+        // Pi 1.1+ reports whether the run was aborted. This is a typed
+        // observation, not a replacement for agent_end or terminal stopReason.
+        if !(has_only_required_shape(object, &["type"])
+            || (has_only_required_shape(object, &["type", "aborted"])
+                && required_bool(object, "aborted").is_some()))
+        {
+            return self.reject(
+                PiJsonV1RejectionReason::EventShapeInvalid,
+                PiJsonV1ProtocolStage::EventPayload,
+            );
+        }
         if !self.protocol.can_settle() {
             return self.reject(
                 PiJsonV1RejectionReason::EventTransitionInvalid,
@@ -1182,7 +1192,19 @@ impl PiJsonV1Parser {
             "tool_execution_end" => &["type", "toolCallId", "toolName", "result", "isError"][..],
             _ => return self.reject_result_tool_shape(authoritative),
         };
-        if authoritative && !has_only_required_shape(object, required) {
+        // Pi 1.1+ adds execution duration on completed tool calls. It is
+        // observational; call identity, result and termination remain required.
+        let has_duration = event_type == "tool_execution_end" && object.contains_key("durationMs");
+        if authoritative
+            && !(has_only_required_shape(object, required)
+                || has_duration
+                    && object.len() == required.len() + 1
+                    && required.iter().all(|key| object.contains_key(*key))
+                    && object
+                        .get("durationMs")
+                        .and_then(Value::as_f64)
+                        .is_some_and(|duration| duration.is_finite() && duration >= 0.0))
+        {
             return self.reject_result_tool_shape(true);
         }
         let Some(call_id) = required_nonempty_string(object, "toolCallId") else {
@@ -2776,6 +2798,12 @@ fn work_bearing_after_boundary(
 }
 
 fn observation_event_has_unknown_fields(event_type: &str, object: &Map<String, Value>) -> bool {
+    if event_type == "tool_execution_end"
+        && object.contains_key("durationMs")
+        && nonnegative_number(object, "durationMs").is_none()
+    {
+        return true;
+    }
     let allowed: &[&str] = match event_type {
         "turn_start" => &["type"],
         "turn_end" => &["type", "message", "toolResults"],
@@ -2783,7 +2811,14 @@ fn observation_event_has_unknown_fields(event_type: &str, object: &Map<String, V
         "message_update" => &["type", "usage", "assistantMessageEvent"],
         "tool_execution_start" => &["type", "toolCallId", "toolName", "args"],
         "tool_execution_update" => &["type", "toolCallId", "toolName", "args", "partialResult"],
-        "tool_execution_end" => &["type", "toolCallId", "toolName", "result", "isError"],
+        "tool_execution_end" => &[
+            "type",
+            "toolCallId",
+            "toolName",
+            "result",
+            "isError",
+            "durationMs",
+        ],
         "auto_retry_start" | "summarization_retry_scheduled" => {
             &["type", "attempt", "maxAttempts", "delayMs", "errorMessage"]
         }

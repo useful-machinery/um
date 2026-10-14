@@ -403,10 +403,11 @@ fn ordinary_tool_events_are_normalized_without_correlation_authority() {
         session(),
         json!({"type": "agent_start"}),
         json!({"type": "tool_execution_update", "toolCallId": "unknown", "toolName": "inspect", "args": {"v": 2}, "partialResult": {"content": [{"type": "text", "text": "partial"}]}}),
-        json!({"type": "tool_execution_end", "toolCallId": "unknown", "toolName": "inspect", "result": {"content": [{"type": "text", "text": "first end"}]}, "isError": false}),
+        json!({"type": "tool_execution_end", "toolCallId": "unknown", "toolName": "inspect", "result": {"content": [{"type": "text", "text": "first end"}]}, "isError": false, "durationMs": 0}),
         json!({"type": "tool_execution_start", "toolCallId": "unknown", "toolName": "renamed", "args": {"v": 3}}),
         json!({"type": "tool_execution_start", "toolCallId": "unknown", "toolName": "inspect", "args": {"v": 4}}),
-        json!({"type": "tool_execution_end", "toolCallId": "unknown", "toolName": "inspect", "result": {"content": [{"type": "text", "text": "repeated end"}]}, "isError": true}),
+        json!({"type": "tool_execution_end", "toolCallId": "unknown", "toolName": "inspect", "result": {"content": [{"type": "text", "text": "repeated end"}]}, "isError": true, "durationMs": 1.25}),
+        json!({"type": "tool_execution_end", "toolCallId": "invalid-duration", "toolName": "inspect", "result": {"content": [{"type": "text", "text": "not accepted"}]}, "isError": true, "durationMs": "invalid"}),
         json!({"type": "agent_end", "messages": [terminal], "willRetry": false}),
         json!({"type": "agent_settled"}),
     ]);
@@ -421,14 +422,30 @@ fn ordinary_tool_events_are_normalized_without_correlation_authority() {
             .count(),
         5
     );
+    let results: Vec<_> = replay
+        .observations
+        .iter()
+        .filter_map(|observation| match observation {
+            AgentObservation::ToolResult {
+                call_id,
+                is_error,
+                content,
+            } => Some((call_id.as_ref(), *is_error, content.as_ref())),
+            _ => None,
+        })
+        .collect();
     assert_eq!(
-        replay
-            .observations
-            .iter()
-            .filter(|observation| matches!(observation, AgentObservation::ToolResult { .. }))
-            .count(),
-        2
+        results,
+        [
+            ("unknown", false, "first end"),
+            ("unknown", true, "repeated end")
+        ]
     );
+    assert!(replay.observations.iter().any(|observation| matches!(
+        observation,
+        AgentObservation::UnrecognizedHarnessEvent { event }
+            if event["toolCallId"] == "invalid-duration"
+    )));
 }
 
 #[test]
@@ -549,6 +566,42 @@ fn pre_settlement_continuation_replaces_the_terminal_candidate() {
         replay(&encoded(&continued), AgentValueKind::None).outcome,
         AgentOutcome::Completed(CompletedAgentInvocation::NoValue)
     );
+}
+
+#[test]
+fn settlement_aborted_is_typed_but_never_terminal_authority() {
+    for settled in [
+        json!({"type": "agent_settled"}),
+        json!({"type": "agent_settled", "aborted": false}),
+        json!({"type": "agent_settled", "aborted": true}),
+    ] {
+        let mut events = values(RESPONSE_SUCCESS);
+        *events.last_mut().unwrap() = settled.clone();
+        assert!(matches!(
+            replay(&encoded(&events), AgentValueKind::Response).outcome,
+            AgentOutcome::Completed(_)
+        ));
+
+        // Neither the new bit nor a prior agent_start can replace agent_end.
+        events.retain(|event| event["type"] != "agent_end");
+        assert_failure(
+            &replay(&encoded(&events), AgentValueKind::Response).outcome,
+            AgentFailureCause::HarnessProtocolFailed,
+        );
+    }
+    for invalid in [
+        json!({"type": "agent_settled", "aborted": "true"}),
+        json!({"type": "agent_settled", "aborted": null}),
+        json!({"type": "agent_settled", "aborted": false, "extra": 1}),
+    ] {
+        let mut events = values(RESPONSE_SUCCESS);
+        *events.last_mut().unwrap() = invalid;
+        assert_eq!(
+            protocol_rejection(&replay(&encoded(&events), AgentValueKind::Response).outcome)["detail"]
+                ["reason"],
+            "event_shape_invalid"
+        );
+    }
 }
 
 #[test]
@@ -977,6 +1030,42 @@ fn result_mode_accepts_only_the_correlated_singleton_lifecycle() {
             Err(AgentFailureCause::HarnessProtocolFailed)
         );
     }
+}
+
+#[test]
+fn result_tool_duration_is_observational_not_a_correlation_escape() {
+    let mut events = values(TERMINAL_TOOL_USE);
+    let end = events
+        .iter_mut()
+        .find(|event| event["type"] == "tool_execution_end")
+        .unwrap();
+    end["durationMs"] = json!(1.25);
+    assert!(matches!(
+        replay_accepted_result(&encoded(&events), "call-result").outcome,
+        AgentOutcome::Completed(CompletedAgentInvocation::Result(_))
+    ));
+    let end = events
+        .iter_mut()
+        .find(|event| event["type"] == "tool_execution_end")
+        .unwrap();
+    end["durationMs"] = json!("invalid");
+    let transcript = encoded(&events);
+    let end_offset = event_offset(&transcript, "tool_execution_end");
+    let mut parser = result_parser();
+    parser.push_ignoring(&transcript[..end_offset]).unwrap();
+    accept_result(
+        &mut parser,
+        "call-result",
+        Arc::new(json!({"result": {"answer": 42}})),
+    );
+    assert_eq!(
+        parser.push_ignoring(&transcript[end_offset..]),
+        Err(AgentFailureCause::HarnessProtocolFailed)
+    );
+    assert_eq!(
+        protocol_rejection(&parser.finish(PiJsonV1ProcessCompletion::exited(false)))["detail"]["reason"],
+        "result_correlation_invalid"
+    );
 }
 
 #[test]
