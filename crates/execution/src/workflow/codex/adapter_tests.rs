@@ -3356,7 +3356,13 @@ for line in sys.stdin:
             let codex_home = fixture.codex_home.clone();
             let sqlite_staging = fixture.sqlite_staging.clone();
             let expected_cwd = fixture.expected_cwd.clone();
-            let config = std::fs::read(codex_home.join("config.toml")).unwrap();
+            // Native defaults must not replace the workflow's explicit thread model or
+            // turn effort even when the server config disagrees with both.
+            let config = format!(
+                "model = \"server-default-model\"\nmodel_reasoning_effort = \"low\"\n{}",
+                std::fs::read_to_string(codex_home.join("config.toml")).unwrap()
+            );
+            std::fs::write(codex_home.join("config.toml"), &config).unwrap();
             let mut run = tokio::spawn(run_fixture_with_synthetic_model_provider(fixture, None));
             let request = tokio::select! {
                 request = provider.next_request() => request,
@@ -3417,7 +3423,7 @@ for line in sys.stdin:
             assert_eq!(turn_start["params"]["cwd"], expected_cwd.to_str().unwrap());
             assert_no_native_rollout(&fixture);
             assert_eq!(
-                std::fs::read(codex_home.join("config.toml")).unwrap(),
+                std::fs::read_to_string(codex_home.join("config.toml")).unwrap(),
                 config
             );
             assert!(!codex_home.join("state_5.sqlite").exists());

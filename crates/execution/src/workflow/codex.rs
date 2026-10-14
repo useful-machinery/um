@@ -338,6 +338,7 @@ struct CompletedAgentMessage {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum AgentMessagePhase {
     Commentary,
+    PartialAnswer,
     FinalAnswer,
 }
 
@@ -1588,8 +1589,9 @@ impl CodexAppServerV1Parser {
         }
         let (agent_message, value_eligible) = if kind == "agentMessage" {
             let message = self.parse_completed_agent_message(item)?;
-            let value_eligible = message.delivery != Some(AgentMessageDelivery::Async);
-            if !value_eligible {
+            let value_eligible = message.delivery != Some(AgentMessageDelivery::Async)
+                && message.phase != Some(AgentMessagePhase::PartialAnswer);
+            if message.delivery == Some(AgentMessageDelivery::Async) {
                 self.invalidate_earlier_value_candidates();
             }
             self.retain_agent_message(message.text.len())?;
@@ -1630,6 +1632,9 @@ impl CodexAppServerV1Parser {
             Some(Value::String(phase)) if phase == "commentary" => {
                 Some(AgentMessagePhase::Commentary)
             }
+            Some(Value::String(phase)) if phase == "partial_answer" => {
+                Some(AgentMessagePhase::PartialAnswer)
+            }
             Some(Value::String(phase)) if phase == "final_answer" => {
                 Some(AgentMessagePhase::FinalAnswer)
             }
@@ -1667,7 +1672,10 @@ impl CodexAppServerV1Parser {
         {
             return Ok(());
         }
-        if message.phase == Some(AgentMessagePhase::Commentary) {
+        if matches!(
+            message.phase,
+            Some(AgentMessagePhase::Commentary | AgentMessagePhase::PartialAnswer)
+        ) {
             return Ok(());
         }
         let is_final = message.phase == Some(AgentMessagePhase::FinalAnswer);
@@ -2208,7 +2216,12 @@ impl CodexAppServerV1Parser {
             .values()
             .filter(|item| item.value_eligible)
             .filter_map(|item| item.agent_message.as_ref())
-            .filter(|message| message.phase != Some(AgentMessagePhase::Commentary));
+            .filter(|message| {
+                !matches!(
+                    message.phase,
+                    Some(AgentMessagePhase::Commentary | AgentMessagePhase::PartialAnswer)
+                )
+            });
         let Some(candidate) = candidates.next() else {
             return Ok(None);
         };

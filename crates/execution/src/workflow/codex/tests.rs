@@ -801,6 +801,101 @@ fn completed_final_answer_is_authoritative_and_deltas_are_observations_only() {
 }
 
 #[test]
+fn partial_answers_remain_correlated_but_have_no_response_or_result_authority() {
+    for value_kind in [AgentValueKind::Response, AgentValueKind::Result] {
+        for final_follows in [false, true] {
+            let mut parser = running_parser(value_kind, 5);
+            let partial_text = result_envelope(json!(99));
+            let partial = json!({
+                "id": "partial",
+                "type": "agentMessage",
+                "text": partial_text,
+                "phase": "partial_answer",
+            });
+            feed(&mut parser, item_started("partial", "agentMessage")).unwrap();
+            let (_, observations) = feed(
+                &mut parser,
+                item_completed("partial", &partial_text, json!("partial_answer")),
+            )
+            .unwrap();
+            assert!(observations.iter().any(|observation| matches!(
+                observation,
+                AgentObservation::Lifecycle {
+                    milestone: AgentLifecycleMilestone::MessageCompleted,
+                }
+            )));
+
+            let mut items = vec![partial];
+            if final_follows {
+                let text = if value_kind == AgentValueKind::Result {
+                    result_envelope(json!(7))
+                } else {
+                    "final".to_owned()
+                };
+                feed(&mut parser, item_started("final", "agentMessage")).unwrap();
+                feed(
+                    &mut parser,
+                    item_completed("final", &text, json!("final_answer")),
+                )
+                .unwrap();
+                items.push(json!({
+                    "id": "final", "type": "agentMessage", "text": text, "phase": "final_answer",
+                }));
+            }
+            feed(&mut parser, turn_completed(items, "completed")).unwrap();
+            match (value_kind, final_follows) {
+                (AgentValueKind::Response, true) => {
+                    let AgentOutcome::Completed(CompletedAgentInvocation::Response(response)) =
+                        parser.finish(true)
+                    else {
+                        panic!("ordinary final must settle after a partial answer");
+                    };
+                    assert_eq!(response.as_str(), "final");
+                }
+                (AgentValueKind::Response, false) => assert_eq!(
+                    parser.finish(true),
+                    AgentOutcome::Completed(CompletedAgentInvocation::NoResponse),
+                ),
+                (AgentValueKind::Result, true) => {
+                    assert_eq!(parser.take_result_candidate().unwrap().as_ref(), &json!(7));
+                }
+                (AgentValueKind::Result, false) => {
+                    assert!(parser.take_result_candidate().is_none());
+                    assert_eq!(
+                        parser.finish(true),
+                        AgentOutcome::Failed(AgentFailureCause::MissingResult.into()),
+                    );
+                }
+                _ => panic!("only response and result modes are exercised"),
+            }
+        }
+    }
+
+    let mut mismatched = running_parser(AgentValueKind::Response, 1024);
+    feed(&mut mismatched, item_started("partial", "agentMessage")).unwrap();
+    feed(
+        &mut mismatched,
+        item_completed("partial", "provisional", json!("partial_answer")),
+    )
+    .unwrap();
+    assert_eq!(
+        feed(
+            &mut mismatched,
+            turn_completed(
+                vec![json!({
+                    "id": "partial", "type": "agentMessage", "text": "provisional",
+                    "phase": "final_answer",
+                })],
+                "completed",
+            ),
+        )
+        .unwrap_err(),
+        AgentFailureCause::HarnessProtocolFailed,
+    );
+    assert_eq!(rejection_reason(&mismatched), "turn_summary_invalid");
+}
+
+#[test]
 fn not_loaded_turn_summary_uses_completed_streamed_agent_message() {
     let mut parser = running_parser(AgentValueKind::Response, 1024);
     feed(&mut parser, item_started("final", "agentMessage")).unwrap();
@@ -1331,6 +1426,14 @@ fn candidate_additive_events_are_bounded_nonsettling_observations() {
     });
     for event in [
         json!({
+            "method": "thread/prediction/updated",
+            "params": {
+                "threadId": "thread-1",
+                "sourceTurnId": "turn-1",
+                "result": {"type": "completed", "text": "not a settled response"},
+            },
+        }),
+        json!({
             "method": "item/mcpToolCall/progress",
             "params": {
                 "threadId": "thread-1",
@@ -1440,6 +1543,31 @@ fn candidate_additive_events_are_bounded_nonsettling_observations() {
         panic!("candidate events must not settle or replace the ordinary response");
     };
     assert_eq!(response.as_str(), "ordinary");
+
+    let mut result = running_parser(AgentValueKind::Result, 1024);
+    let (progress, observations) = feed(
+        &mut result,
+        json!({
+            "method": "thread/prediction/updated",
+            "params": {
+                "threadId": "thread-1",
+                "sourceTurnId": "turn-1",
+                "result": {"type": "completed", "text": result_envelope(json!(7))},
+            },
+        }),
+    )
+    .unwrap();
+    assert_eq!(progress, ParserProgress::default());
+    assert!(matches!(
+        observations.as_slice(),
+        [AgentObservation::UnrecognizedHarnessEvent { .. }]
+    ));
+    assert!(result.take_result_candidate().is_none());
+    feed(&mut result, turn_completed(vec![], "completed")).unwrap();
+    assert_eq!(
+        result.finish(true),
+        AgentOutcome::Failed(AgentFailureCause::MissingResult.into()),
+    );
 
     let mut mismatched = running_parser(AgentValueKind::None, 1024);
     assert_eq!(
