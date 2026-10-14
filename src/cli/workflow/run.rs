@@ -55,7 +55,7 @@ pub(super) const AFTER_HELP: &str = "Interactive mode:
   interface active; undersized terminals show a resize notice without changing modes.
   Use Up/Down or j/k to select steps, Enter to inspect logs, ? for complete help,
   Ctrl-C to request cancellation, and q to leave only after publication and cleanup.
-  After q, Scherzo restores the terminal and prints the standard plain summary.";
+  After q, Useful Machinery restores the terminal and prints the standard plain summary.";
 
 const MAXIMUM_INPUTS: usize = 256;
 const MAXIMUM_TEXT_BYTES: u64 = 1024 * 1024;

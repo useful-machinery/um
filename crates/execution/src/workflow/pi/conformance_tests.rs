@@ -43,7 +43,7 @@ const FAKE_PROVIDER_EXTENSION: &str = include_str!(concat!(
     "/src/workflow/pi-json-v1-extension/src/conformance/fake-provider.ts"
 ));
 const PINNED_TEST_WATCHDOG: Duration = Duration::from_secs(20);
-const MODEL_NAME: &str = "scherzo-fake/conformance";
+const MODEL_NAME: &str = "um-fake/conformance";
 
 fn conformance_executable() -> Option<PathBuf> {
     let expected_suffix = format!("-pi-{PI_JSON_V1_QUALIFICATION_VERSION}/bin/pi");

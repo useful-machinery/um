@@ -3268,7 +3268,7 @@ agentProfiles:
     harness:
       kind: pi
       config:
-        model: scherzo-fake/conformance
+        model: um-fake/conformance
         thinking: xhigh
 steps:
   seed:

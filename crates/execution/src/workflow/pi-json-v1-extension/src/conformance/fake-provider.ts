@@ -652,11 +652,11 @@ export default function fakeProviderExtension(pi: ExtensionAPI): void {
   // active invocation cwd through ExtensionContext when the tool executes.
   pi.registerTool(createBashToolDefinition("/"));
 
-  pi.registerProvider("scherzo-fake", {
-    name: "Scherzo deterministic fake provider",
+  pi.registerProvider("um-fake", {
+    name: "Useful Machinery deterministic fake provider",
     baseUrl: "http://offline.invalid",
     apiKey: "offline-fixture-key",
-    api: "scherzo-fake-api",
+    api: "um-fake-api",
     models: [
       {
         id: "conformance",

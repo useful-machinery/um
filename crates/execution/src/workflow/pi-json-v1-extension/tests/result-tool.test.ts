@@ -11,8 +11,8 @@ import {
 } from "../fixtures/generated/pi-json-v1-extension.ts";
 
 const fixedConfig: PiJsonV1ExtensionConfig = {
-  toolName: "scherzo_result_unit_fixed",
-  socketPath: "/tmp/scherzo/unit-fixed/result.sock",
+  toolName: "um_result_unit_fixed",
+  socketPath: "/tmp/um/unit-fixed/result.sock",
   parameters: {
     type: "object",
     properties: {

@@ -19,7 +19,7 @@ if [[ $# -gt 1 ]]; then
   usage
 fi
 
-check_root=$(mktemp -d "${TMPDIR:-/tmp}/scherzo-pi-json-v1-check.XXXXXX")
+check_root=$(mktemp -d "${TMPDIR:-/tmp}/um-pi-json-v1-check.XXXXXX")
 cleanup() {
   rm -rf -- "$check_root"
 }

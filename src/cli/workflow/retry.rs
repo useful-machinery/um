@@ -192,7 +192,7 @@ fn write_reuse_warning(execution_root: &std::path::Path, attempts: &[u64]) -> io
         .join(", ");
     writeln!(
         standard_error,
-        "! Execution root {execution_root:?} was used by earlier attempt(s) {attempts} and may contain prior changes; Scherzo does not check cleanliness or mutations."
+        "! Execution root {execution_root:?} was used by earlier attempt(s) {attempts} and may contain prior changes; Useful Machinery does not check cleanliness or mutations."
     )?;
     standard_error.flush()
 }

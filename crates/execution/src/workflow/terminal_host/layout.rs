@@ -348,7 +348,7 @@ pub(super) fn render_too_small(
             Block::default()
                 .borders(Borders::ALL)
                 .border_style(separator_style(color))
-                .title(" Scherzo workflow run "),
+                .title(" Useful Machinery workflow run "),
         ),
         area,
     );

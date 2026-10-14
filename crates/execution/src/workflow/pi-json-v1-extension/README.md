@@ -1,6 +1,6 @@
 # PiJsonV1 extension toolchain
 
-This private npm project checks the engine-owned TypeScript extension that Scherzo will
+This private npm project checks the engine-owned TypeScript extension that Useful Machinery will
 materialize for a `PiJsonV1` result invocation. It is development tooling, not a
 published package and not a workflow runtime. Rust remains responsible for invocation
 identity, retained-schema validation, and terminal workflow state. The result

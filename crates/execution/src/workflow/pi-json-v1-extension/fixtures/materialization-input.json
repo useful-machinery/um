@@ -1,6 +1,6 @@
 {
-  "toolName": "scherzo_result_8f3c2a1d",
-  "socketPath": "/tmp/scherzo/invocation-fixed/result-validation.sock",
+  "toolName": "um_result_8f3c2a1d",
+  "socketPath": "/tmp/um/invocation-fixed/result-validation.sock",
   "parameters": {
     "additionalProperties": false,
     "properties": {

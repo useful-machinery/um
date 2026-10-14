@@ -152,7 +152,7 @@ pub(super) fn render_archived_too_small(frame: &mut Frame<'_>, area: Rect, color
             Block::default()
                 .borders(Borders::ALL)
                 .border_style(separator_style(color))
-                .title(" Scherzo archived workflow attempt "),
+                .title(" Useful Machinery archived workflow attempt "),
         ),
         area,
     );

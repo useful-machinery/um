@@ -8,7 +8,7 @@ import { Type } from "typebox";
 
 // The materializer replaces this string without invoking a formatter.
 // prettier-ignore
-const GENERATED_CONFIG_JSON = "{\"toolName\":\"scherzo_result_8f3c2a1d\",\"socketPath\":\"/tmp/scherzo/invocation-fixed/result-validation.sock\",\"parameters\":{\"additionalProperties\":false,\"properties\":{\"result\":{\"$defs\":{\"Change\":{\"additionalProperties\":false,\"properties\":{\"summary\":{\"type\":\"string\"}},\"required\":[\"summary\"],\"type\":\"object\"}},\"additionalProperties\":false,\"properties\":{\"summary\":{\"type\":\"string\"}},\"required\":[\"summary\"],\"type\":\"object\"}},\"required\":[\"result\"],\"type\":\"object\"}}";
+const GENERATED_CONFIG_JSON = "{\"toolName\":\"um_result_8f3c2a1d\",\"socketPath\":\"/tmp/um/invocation-fixed/result-validation.sock\",\"parameters\":{\"additionalProperties\":false,\"properties\":{\"result\":{\"$defs\":{\"Change\":{\"additionalProperties\":false,\"properties\":{\"summary\":{\"type\":\"string\"}},\"required\":[\"summary\"],\"type\":\"object\"}},\"additionalProperties\":false,\"properties\":{\"summary\":{\"type\":\"string\"}},\"required\":[\"summary\"],\"type\":\"object\"}},\"required\":[\"result\"],\"type\":\"object\"}}";
 const MAX_PROTOCOL_FRAME_BYTES = 16 * 1024 * 1024;
 
 export interface PiJsonV1ExtensionConfig {
