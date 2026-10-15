@@ -631,7 +631,13 @@ async fn pinned_real_claude_code_03_corrects_a_result_in_one_production_conversa
             second.body(),
             "Result rejected by the workflow schema:"
         ));
-        second.release_structured_output(json!({"result": 7}));
+        // The corrected candidate follows a thinking block, as a Claude model with extended
+        // thinking submits it; reaching the accepted result proves a thinking sibling leaves
+        // the candidate standalone on the exact binary.
+        second.release_blocks(vec![
+            LoopbackBlock::thinking(&["correcting the result "]),
+            LoopbackBlock::tool_use(STRUCTURED_OUTPUT_TOOL_NAME, json!({"result": 7})),
+        ]);
         execution.await.unwrap();
 
         let AgentOutcome::Completed(CompletedAgentInvocation::Result(result)) =
@@ -1315,6 +1321,120 @@ async fn pinned_real_claude_code_09_every_block_kind_correlates_its_own_nominal_
     })
     .await
     .expect("pinned Claude Code block-kind correlation watchdog expired");
+}
+
+#[expect(
+    clippy::disallowed_methods,
+    reason = "real time is used only as an anti-hang watchdog, never as success evidence"
+)]
+#[tokio::test]
+#[ignore = "requires pinned harness"]
+async fn pinned_real_claude_code_10_tool_exchange_normalizes_inputs_and_omits_is_error() {
+    let (executable, _exclusive) = exclusive_conformance_executable().await;
+    tokio::time::timeout(WATCHDOG, async {
+        let mut provider = LoopbackProvider::start().await;
+        let root = SyntheticClaudeCodeRoot::new();
+        let observations = RecordingObservationSink::default();
+        let running =
+            launch_recorded_response_lifecycle(executable, &root, &provider, &observations).await;
+
+        // A Write followed by a Bash call in one message reproduces the live workflow
+        // exchange that drifted from the profile: Write's successful result carries no
+        // `is_error`, and the model's Bash `command` begins with `cd <cwd> && `, which
+        // Claude Code strips before restating the block in its nominal envelope. The
+        // command reads the file with shell builtins only: the Bash tool's `PATH` under
+        // the synthetic root is `/usr/bin:/bin`, which carries no coreutils on the NixOS
+        // conformance runners.
+        let probe = root.project().join("probe-marker.txt");
+        const READ_PROBE: &str = "printf '%s\\n' \"$(<probe-marker.txt)\"";
+        let streamed_command = format!("cd {} && {READ_PROBE}", root.project().display());
+        provider.next_request().await.release_blocks(vec![
+            LoopbackBlock::tool_use(
+                "Write",
+                json!({"file_path": probe.display().to_string(), "content": "probe-marker\n"}),
+            ),
+            LoopbackBlock::tool_use(
+                "Bash",
+                json!({"command": streamed_command, "description": "controlled probe"}),
+            ),
+        ]);
+        provider.next_request().await.release_text(RESPONSE);
+
+        let AgentOutcome::Completed(CompletedAgentInvocation::Response(response)) =
+            running.finish().await
+        else {
+            panic!("a tool exchange with normalized inputs must reach an ordinary response");
+        };
+        assert_eq!(response.as_str(), RESPONSE);
+        assert_eq!(fs::read_to_string(&probe).unwrap(), "probe-marker\n");
+
+        // Both results are observed as successes; the Bash result is the written content.
+        let results = observations
+            .snapshot()
+            .iter()
+            .filter_map(|observation| match observation.observation() {
+                AgentObservation::ToolResult {
+                    call_id,
+                    is_error,
+                    content,
+                } => Some((Arc::clone(call_id), *is_error, Arc::clone(content))),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(results.len(), 2, "{results:?}");
+        assert!(
+            results.iter().all(|(_, is_error, _)| !is_error),
+            "{results:?}"
+        );
+        assert!(
+            results
+                .iter()
+                .any(|(_, _, content)| content.trim() == "probe-marker")
+        );
+
+        // The retained native transcript proves the drift this case qualifies: the Bash
+        // block Claude Code recorded no longer begins with the `cd <cwd> && ` prefix the
+        // model streamed, and the Write result carries no `is_error` member at all.
+        let transcript = fs::read_to_string(root.retained_transcript())
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        let bash_block = transcript
+            .iter()
+            .find_map(|message| find_content_block(message, "tool_use", "Bash"))
+            .expect("retained transcript must carry the Bash tool_use block");
+        assert_eq!(bash_block["input"]["command"], READ_PROBE);
+        let write_result = transcript
+            .iter()
+            .find_map(|message| find_tool_result(message, "File created successfully"))
+            .expect("retained transcript must carry the Write tool_result block");
+        assert!(write_result.get("is_error").is_none(), "{write_result}");
+
+        assert!(!provider.has_pending_request());
+        assert_retained_native_session(&root, &[RESPONSE]);
+        provider.shutdown().await;
+    })
+    .await
+    .expect("pinned Claude Code tool-exchange normalization watchdog expired");
+}
+
+fn content_blocks(message: &Value) -> impl Iterator<Item = &Value> {
+    message["message"]["content"]
+        .as_array()
+        .into_iter()
+        .flatten()
+}
+
+fn find_content_block<'a>(message: &'a Value, block_type: &str, name: &str) -> Option<&'a Value> {
+    content_blocks(message).find(|block| block["type"] == block_type && block["name"] == name)
+}
+
+fn find_tool_result<'a>(message: &'a Value, content_fragment: &str) -> Option<&'a Value> {
+    content_blocks(message).find(|block| {
+        block["type"] == "tool_result"
+            && contains_string_fragment(&block["content"], content_fragment)
+    })
 }
 
 fn contains_exact_value(value: &Value, expected: &Value) -> bool {

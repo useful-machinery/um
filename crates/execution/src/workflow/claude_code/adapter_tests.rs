@@ -534,7 +534,7 @@ esac
 struct ResultExchangeFixture {
     candidate: Option<Value>,
     structured_tool_count: usize,
-    sibling_text: bool,
+    sibling_tool_use: bool,
 }
 
 impl ResultExchangeFixture {
@@ -542,7 +542,7 @@ impl ResultExchangeFixture {
         Self {
             candidate: Some(candidate),
             structured_tool_count: 1,
-            sibling_text: false,
+            sibling_tool_use: false,
         }
     }
 }
@@ -820,12 +820,19 @@ fn result_exchange_transcript(
             }));
         }
         let next_index = fixture.structured_tool_count;
-        if fixture.sibling_text {
+        // Thinking and text siblings are observational and leave a candidate standalone;
+        // another tool call beside it is other native work and makes it ambiguous.
+        if fixture.sibling_tool_use {
             values.extend([
                 stream_event(json!({
                     "type": "content_block_start",
                     "index": next_index,
-                    "content_block": {"type": "text", "text": "sibling"},
+                    "content_block": {
+                        "type": "tool_use",
+                        "id": format!("tool-sibling-{exchange}"),
+                        "name": "Bash",
+                        "input": {"command": "true"},
+                    },
                 })),
                 stream_event(json!({
                     "type": "content_block_stop",
@@ -1492,12 +1499,12 @@ async fn ambiguous_duplicate_and_missing_candidates_never_become_results() {
         ResultExchangeFixture {
             candidate: Some(json!({"result": 1})),
             structured_tool_count: 1,
-            sibling_text: true,
+            sibling_tool_use: true,
         },
         ResultExchangeFixture {
             candidate: Some(json!({"result": 1})),
             structured_tool_count: 2,
-            sibling_text: false,
+            sibling_tool_use: false,
         },
     ];
     for first in ambiguous {
@@ -1524,7 +1531,7 @@ async fn ambiguous_duplicate_and_missing_candidates_never_become_results() {
         ResultExchangeFixture {
             candidate: None,
             structured_tool_count: 0,
-            sibling_text: false,
+            sibling_tool_use: false,
         },
         None,
         ResultFixtureMode::Settle,

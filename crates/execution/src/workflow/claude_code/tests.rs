@@ -673,6 +673,134 @@ fn contradictory_nominal_assistant_text_rejects_the_response() {
     assert_failed(outcome, AgentFailureCause::HarnessProtocolFailed);
 }
 
+/// One Bash exchange as Claude Code 2.1.296 emits it: the streamed `input_json_delta`
+/// carries the model's input, the nominal envelope restates the block with the
+/// client-normalized input and the additive 2.1.296 members, and the tool result carries
+/// the additive `tool_result_meta`. The nominal block and the result block are supplied so
+/// one transcript shape serves both the accepted and the contradictory cases.
+fn bash_exchange_transcript(nominal_block: Value, tool_result_block: Value) -> Vec<Value> {
+    let streamed_command = format!("cd {CWD} && ls");
+    let mut values = vec![init(QUALIFICATION_VERSION, SESSION_ID)];
+    values.extend([
+        message_start("msg-bash"),
+        stream_event(json!({
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {"type": "tool_use", "id": "tool-bash", "name": "Bash", "input": {}},
+        })),
+        stream_event(json!({
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {
+                "type": "input_json_delta",
+                "partial_json": json!({"command": streamed_command, "description": "list"})
+                    .to_string(),
+            },
+        })),
+        json!({
+            "type": "assistant",
+            "message": {
+                "id": "msg-bash",
+                "type": "message",
+                "role": "assistant",
+                "content": [nominal_block],
+                "model": MODEL,
+                "container": null,
+                "context_management": null,
+                "stop_details": null,
+            },
+            "wire_tool_inputs": {
+                "tool-bash": {"command": streamed_command, "description": "list"},
+            },
+            "parent_tool_use_id": null,
+            "session_id": SESSION_ID,
+        }),
+        stream_event(json!({"type": "content_block_stop", "index": 0})),
+        stream_event(json!({
+            "type": "message_delta",
+            "delta": {"stop_reason": "tool_use"},
+            "usage": {"output_tokens": 1},
+        })),
+        stream_event(json!({"type": "message_stop"})),
+        json!({
+            "type": "user",
+            "message": {"role": "user", "content": [tool_result_block]},
+            "parent_tool_use_id": null,
+            "session_id": SESSION_ID,
+            "tool_use_result": {"stdout": "README.md", "stderr": "", "interrupted": false},
+            "tool_result_meta": [{
+                "id": "tool-bash",
+                "permission_decision": {"decision": "allow", "source": "mode"},
+            }],
+        }),
+    ]);
+    values.extend(text_message("msg-final", &["done"], true));
+    values.push(result(SESSION_ID));
+    values
+}
+
+fn normalized_bash_nominal_block() -> Value {
+    json!({
+        "type": "tool_use",
+        "id": "tool-bash",
+        "name": "Bash",
+        "input": {"command": "ls", "description": "list"},
+        "caller": {"type": "direct"},
+    })
+}
+
+fn bash_tool_result_block(is_error: Option<Value>) -> Value {
+    let mut block = json!({
+        "type": "tool_result",
+        "tool_use_id": "tool-bash",
+        "content": "README.md",
+    });
+    if let Some(is_error) = is_error {
+        block["is_error"] = is_error;
+    }
+    block
+}
+
+#[test]
+fn nominal_tool_use_correlates_by_identity_and_an_omitted_is_error_is_success() {
+    let values = bash_exchange_transcript(
+        normalized_bash_nominal_block(),
+        bash_tool_result_block(None),
+    );
+    let (observations, outcome) = replay(&framed(&values), AgentValueKind::Response, 1024);
+    let AgentOutcome::Completed(CompletedAgentInvocation::Response(response)) = outcome else {
+        panic!("a client-normalized nominal tool input must not fail the exchange");
+    };
+    assert_eq!(response.as_str(), "done");
+    assert!(observations.iter().any(|observation| matches!(
+        observation,
+        AgentObservation::ToolResult { call_id, is_error: false, content }
+            if call_id.as_ref() == "tool-bash" && content.as_ref() == "README.md"
+    )));
+}
+
+#[test]
+fn nominal_tool_use_identity_and_tool_result_shape_still_fail_closed() {
+    let mut other_identity = normalized_bash_nominal_block();
+    other_identity["id"] = json!("tool-other");
+    let mut other_name = normalized_bash_nominal_block();
+    other_name["name"] = json!("Write");
+    let mut non_object_input = normalized_bash_nominal_block();
+    non_object_input["input"] = json!("ls");
+    for contradictory in [other_identity, other_name, non_object_input] {
+        let values = bash_exchange_transcript(contradictory, bash_tool_result_block(None));
+        let (_, outcome) = replay(&framed(&values), AgentValueKind::Response, 1024);
+        assert_failed(outcome, AgentFailureCause::HarnessProtocolFailed);
+    }
+
+    let values = bash_exchange_transcript(
+        normalized_bash_nominal_block(),
+        bash_tool_result_block(Some(json!("false"))),
+    );
+    let (_, outcome) = replay(&framed(&values), AgentValueKind::Response, 1024);
+    assert_failed(outcome, AgentFailureCause::HarnessProtocolFailed);
+}
+
 #[test]
 fn stream_continuations_from_another_thread_reject_the_response() {
     let values = [
@@ -1322,6 +1450,159 @@ fn result_candidate_requires_correlated_success_acknowledgement() {
         Some(CompletedResultExchange::AmbiguousCandidate),
         "a failed StructuredOutput acknowledgement must disqualify its candidate",
     );
+}
+
+/// One result-mode exchange whose StructuredOutput call follows the supplied sibling
+/// blocks, each given as a complete `content_block_start` block, acknowledged
+/// successfully and ended by a result carrying the same envelope.
+fn structured_output_exchange_after(siblings: &[Value]) -> Vec<Value> {
+    let envelope = json!({"result": 7});
+    let call_id = "tool-structured-output";
+    let mut terminal_result = result(SESSION_ID);
+    terminal_result["structured_output"] = envelope.clone();
+    let mut values = vec![
+        init(QUALIFICATION_VERSION, SESSION_ID),
+        message_start("msg-result"),
+    ];
+    for (index, sibling) in siblings.iter().enumerate() {
+        values.extend([
+            stream_event(json!({
+                "type": "content_block_start",
+                "index": index,
+                "content_block": sibling,
+            })),
+            json!({
+                "type": "assistant",
+                "message": {
+                    "id": "msg-result",
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [sibling],
+                    "model": MODEL,
+                },
+                "parent_tool_use_id": null,
+                "session_id": SESSION_ID,
+            }),
+            stream_event(json!({"type": "content_block_stop", "index": index})),
+        ]);
+    }
+    let index = siblings.len();
+    let candidate_block = json!({
+        "type": "tool_use",
+        "id": call_id,
+        "name": "StructuredOutput",
+        "input": envelope,
+    });
+    values.extend([
+        stream_event(json!({
+            "type": "content_block_start",
+            "index": index,
+            "content_block": candidate_block,
+        })),
+        json!({
+            "type": "assistant",
+            "message": {
+                "id": "msg-result",
+                "type": "message",
+                "role": "assistant",
+                "content": [candidate_block],
+                "model": MODEL,
+            },
+            "parent_tool_use_id": null,
+            "session_id": SESSION_ID,
+        }),
+        stream_event(json!({"type": "content_block_stop", "index": index})),
+        json!({
+            "type": "user",
+            "message": {
+                "role": "user",
+                "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": call_id,
+                    "content": "structurally correlated acknowledgement",
+                }],
+            },
+            "parent_tool_use_id": null,
+            "session_id": SESSION_ID,
+            "tool_use_result": "structurally correlated acknowledgement",
+        }),
+        stream_event(json!({
+            "type": "message_delta",
+            "delta": {"stop_reason": "tool_use"},
+            "usage": {"output_tokens": 1},
+        })),
+        stream_event(json!({"type": "message_stop"})),
+        terminal_result,
+    ]);
+    values
+}
+
+#[test]
+fn result_candidate_stays_standalone_beside_thinking_but_not_another_tool_call() {
+    let values = structured_output_exchange_after(&[
+        json!({"type": "thinking", "thinking": "deciding on the result", "signature": "sig"}),
+        json!({"type": "text", "text": "Submitting the result."}),
+    ]);
+    let mut standalone = parser(AgentValueKind::Result, 1024);
+    standalone.push_stdout(&framed(&values), drop).unwrap();
+    assert!(
+        matches!(
+            standalone.take_completed_result_exchange(),
+            Some(CompletedResultExchange::Candidate(candidate)) if *candidate == json!(7)
+        ),
+        "thinking and text beside the structured-output call are observations"
+    );
+
+    let values = structured_output_exchange_after(&[json!({
+        "type": "tool_use",
+        "id": "tool-sibling",
+        "name": "Bash",
+        "input": {"command": "true"},
+    })]);
+    let mut ambiguous = parser(AgentValueKind::Result, 1024);
+    ambiguous.push_stdout(&framed(&values), drop).unwrap();
+    assert_eq!(
+        ambiguous.take_completed_result_exchange(),
+        Some(CompletedResultExchange::AmbiguousCandidate),
+        "another tool call beside the structured-output call is other native work",
+    );
+}
+
+#[test]
+fn tool_result_blocks_other_than_text_are_observed_without_content() {
+    let values = bash_exchange_transcript(
+        normalized_bash_nominal_block(),
+        json!({
+            "type": "tool_result",
+            "tool_use_id": "tool-bash",
+            "content": [
+                {"type": "tool_reference", "tool_name": "Bash"},
+                {"type": "text", "text": "README.md"},
+                {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AA=="}},
+            ],
+        }),
+    );
+    let (observations, outcome) = replay(&framed(&values), AgentValueKind::Response, 1024);
+    assert!(matches!(
+        outcome,
+        AgentOutcome::Completed(CompletedAgentInvocation::Response(_))
+    ));
+    assert!(observations.iter().any(|observation| matches!(
+        observation,
+        AgentObservation::ToolResult { call_id, is_error: false, content }
+            if call_id.as_ref() == "tool-bash" && content.as_ref() == "README.md"
+    )));
+
+    let values = bash_exchange_transcript(
+        normalized_bash_nominal_block(),
+        json!({
+            "type": "tool_result",
+            "tool_use_id": "tool-bash",
+            "content": [{"type": "text"}],
+        }),
+    );
+    let (_, outcome) = replay(&framed(&values), AgentValueKind::Response, 1024);
+    assert_failed(outcome, AgentFailureCause::HarnessProtocolFailed);
 }
 
 #[test]

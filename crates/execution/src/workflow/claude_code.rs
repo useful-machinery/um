@@ -1006,6 +1006,7 @@ impl ClaudeCodeStreamJsonV1Parser {
             active_block: None,
             completed_blocks: 0,
             text_blocks: 0,
+            tool_use_blocks: 0,
             structured_output_candidates: Vec::new(),
             structured_output_call_ids: Vec::new(),
             structured_output_acknowledgements: 0,
@@ -1303,6 +1304,9 @@ impl ClaudeCodeStreamJsonV1Parser {
             };
             message.next_index += 1;
             message.completed_blocks += 1;
+            if matches!(block, ActiveContentBlock::ToolUse { .. }) {
+                message.tool_use_blocks = message.tool_use_blocks.saturating_add(1);
+            }
             block
         };
         if let ActiveContentBlock::ToolUse {
@@ -1402,8 +1406,8 @@ impl ClaudeCodeStreamJsonV1Parser {
         }
         if message.parent_tool_use_id.is_none() {
             self.final_main_message = Some(CompletedMainMessage {
-                completed_blocks: message.completed_blocks,
                 text_blocks: message.text_blocks,
+                tool_use_blocks: message.tool_use_blocks,
                 structured_output_candidates: message.structured_output_candidates,
                 structured_output_acknowledgements: message.structured_output_acknowledgements,
                 successful_structured_output_acknowledgements: message
@@ -1606,23 +1610,12 @@ impl ClaudeCodeStreamJsonV1Parser {
                         .iter()
                         .any(|expected| expected.as_ref() == call_id)
                 });
-            let omitted_structured_output_success = acknowledges_structured_output
-                && required_string(object, "tool_use_result") == Some(result.as_str());
-            let omitted_completed_agent_success = !acknowledges_structured_output
-                && object
-                    .get("tool_use_result")
-                    .and_then(Value::as_object)
-                    .is_some_and(|tool_result| {
-                        required_string(tool_result, "status") == Some("completed")
-                            && required_nonempty_string(tool_result, "agentId").is_some()
-                            && required_nonempty_string(tool_result, "agentType").is_some()
-                    });
-            let is_error = required_bool(block, "is_error")
-                .or_else(|| {
-                    (omitted_structured_output_success || omitted_completed_agent_success)
-                        .then_some(false)
-                })
-                .ok_or_else(|| self.protocol_failure())?;
+            // `is_error` is optional on a native tool result and absent means success, as
+            // in the Messages API block shape; a present value must still be a boolean.
+            let is_error = match block.get("is_error") {
+                None => false,
+                Some(is_error) => is_error.as_bool().ok_or_else(|| self.protocol_failure())?,
+            };
             if acknowledges_structured_output {
                 let message = self
                     .active_message
@@ -1882,8 +1875,10 @@ impl ClaudeCodeStreamJsonV1Parser {
         let Some(message) = self.final_main_message.as_ref() else {
             return CompletedResultExchange::AmbiguousCandidate;
         };
+        // Thinking and text siblings are observational; a second tool call in the
+        // candidate's message is other native work and makes the candidate ambiguous.
         if self.exchange_structured_output_candidates != 1
-            || message.completed_blocks != 1
+            || message.tool_use_blocks != 1
             || message.structured_output_candidates.len() != 1
             || message.structured_output_candidates.first() != Some(structured_output)
             || message.structured_output_acknowledgements != 1
@@ -2260,6 +2255,7 @@ struct StreamedMessage {
     active_block: Option<ActiveContentBlock>,
     completed_blocks: u64,
     text_blocks: u64,
+    tool_use_blocks: u64,
     structured_output_candidates: Vec<Value>,
     structured_output_call_ids: Vec<Arc<str>>,
     structured_output_acknowledgements: u64,
@@ -2320,23 +2316,18 @@ impl ActiveContentBlock {
             Self::ToolUse {
                 call_id,
                 name,
-                initial_input,
-                input_json,
-                input_delta_seen,
                 nominal_seen,
+                ..
             } => {
-                let nominal_input = block.get("input");
-                let input_matches = if *input_delta_seen {
-                    serde_json::from_str::<Value>(input_json).ok().as_ref() == nominal_input
-                } else {
-                    Some(&*initial_input) == nominal_input
-                };
+                // The envelope restates the block with Claude Code's client-normalized
+                // input (for example a Bash `command` without its leading `cd <cwd> && `),
+                // so the streamed input is not compared. The call identity and name are
+                // the correlation; the native tool input carries no Scherzo authority.
                 let matches = !*nominal_seen
                     && required_string(block, "type") == Some("tool_use")
                     && required_nonempty_string(block, "id") == Some(call_id.as_ref())
                     && required_nonempty_string(block, "name") == Some(name.as_ref())
-                    && nominal_input.is_some_and(Value::is_object)
-                    && input_matches;
+                    && block.get("input").is_some_and(Value::is_object);
                 *nominal_seen |= matches;
                 matches
             }
@@ -2354,8 +2345,8 @@ impl ActiveContentBlock {
 }
 
 struct CompletedMainMessage {
-    completed_blocks: u64,
     text_blocks: u64,
+    tool_use_blocks: u64,
     structured_output_candidates: Vec<Value>,
     structured_output_acknowledgements: u64,
     successful_structured_output_acknowledgements: u64,
@@ -2375,6 +2366,9 @@ fn bounded_append(value: &mut String, addition: &str, maximum_bytes: u64) -> boo
     true
 }
 
+// A tool result is observational, so its text blocks are concatenated and the other
+// block kinds Claude Code emits (`tool_reference` from ToolSearch, `image` from a screen
+// capture) contribute nothing while remaining well formed.
 fn normalized_tool_result_content(value: &Value) -> Option<String> {
     match value {
         Value::String(value) => Some(value.clone()),
@@ -2382,10 +2376,9 @@ fn normalized_tool_result_content(value: &Value) -> Option<String> {
             let mut result = String::new();
             for block in blocks {
                 let block = block.as_object()?;
-                if required_string(block, "type") != Some("text") {
-                    return None;
+                if required_nonempty_string(block, "type")? == "text" {
+                    result.push_str(required_string(block, "text")?);
                 }
-                result.push_str(required_string(block, "text")?);
             }
             Some(result)
         }
