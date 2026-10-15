@@ -1,4 +1,5 @@
 // CLI families keep their domain imports local rather than introducing a cross-family module.
+mod gitlab;
 use std::io::{self, Write};
 use std::time::Duration;
 
@@ -25,6 +26,11 @@ pub(super) struct Command {
 }
 #[derive(Debug, Subcommand)]
 enum Provider {
+    #[command(
+        about = "Manage GitLab.com connections and credential candidates",
+        after_help = "Setup guide: https://docs.usefulmachinery.com/agent/gitlab-setup.md"
+    )]
+    Gitlab(gitlab::Command),
     #[command(about = "Manage Linear workspace connections")]
     Linear(LinearCommand),
 }
@@ -129,6 +135,7 @@ impl Command {
         match self.command {
             None => super::print_help(&[NAME]),
             Some(Provider::Linear(command)) => command.execute(),
+            Some(Provider::Gitlab(command)) => command.execute(),
         }
     }
 }

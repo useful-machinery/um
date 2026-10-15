@@ -316,6 +316,7 @@ json_family!(ArtifactJson, "artifact");
 json_family!(DelegationJson, "delegation");
 json_family!(DeletionJson, "deletion");
 json_family!(GithubJson, "GitHub");
+json_family!(GitlabJson, "GitLab connection");
 json_family!(IdentityJson, "identity");
 json_family!(InvitationJson, "invitation");
 json_family!(OrganizationJson, "organization");
@@ -2372,6 +2373,16 @@ mod tests {
             "auth logout",
             "auth status",
             "connection",
+            "connection gitlab",
+            "connection gitlab create",
+            "connection gitlab credential",
+            "connection gitlab credential activate",
+            "connection gitlab credential cancel",
+            "connection gitlab credential create",
+            "connection gitlab credential show",
+            "connection gitlab list",
+            "connection gitlab remove",
+            "connection gitlab show",
             "connection linear",
             "connection linear authorization",
             "connection linear authorization create",

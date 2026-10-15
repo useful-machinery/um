@@ -93,6 +93,9 @@ Before and after:
 | 3 | `AuthenticationRequired` | The command requires a signed-in identity. |
 | 4 | `Unavailable` | Useful Machinery is unreachable or the request is temporarily rate limited. |
 | 5 | `RunnerRecoveryRequired` | Runner Serve stopped non-admitting for operator recovery. |
+| 6 | `Conflict` | A GitLab connection mutation conflicts with current authority or a request key. |
+| 7 | `CandidateUnavailable` | A GitLab credential candidate cannot be activated. |
+| 8 | `IdentityMismatch` | The reviewed GitLab provider identity does not match the expected user. |
 | 130 | `Interrupted` | The command was interrupted by the user. |
 | 143 | `Terminated` | The command received a termination request. |
 
@@ -192,13 +195,13 @@ separate entity family.
 - **Noun number:** every command-group token is a singular noun. Compound group
   names have a singular head noun (`input-set`, `runner-pool`,
   `service-principal`). There are no plural exceptions. The number-neutral
-  names are exactly `auth` (an abbreviation) and `github` (a proper noun); add
-  any future number-neutral or irregular spelling here rather than inferring
-  it. In particular, the canonical singular group tokens are `identity`,
+  names are exactly `auth` (an abbreviation), `github` and `gitlab` (proper
+  nouns); add any future number-neutral or irregular spelling here rather than
+  inferring it. In particular, the canonical singular group tokens are `identity`,
   `input`, `invitation`, and `member`, never `identities`, `inputs`,
   `invitations`, or `members`.
 - **Verb lexicon:** the final token of every leaf below a command group is one
-  of this closed set: `accept`, `begin`, `cancel`, `complete`, `create`,
+  of this closed set: `accept`, `activate`, `begin`, `cancel`, `complete`, `create`,
   `decline`, `delete`, `disable`, `doctor`, `download`, `drain`, `enable`,
   `end`, `enroll`, `history`, `issue`, `leave`, `link`, `list`, `login`,
   `logout`, `move`, `preview`, `propose`, `reference`, `remove`, `rename`,

@@ -9,6 +9,7 @@ mod artifacts_tests;
 mod current_principal;
 mod delegations;
 mod github;
+mod gitlab;
 mod http_client;
 mod http_util;
 mod human_principal;
@@ -78,6 +79,9 @@ pub use delegations::{
     GetDelegationOutcome, ListDelegationsOutcome, ProposeDelegationOutcome, accept_delegation,
     end_delegation, get_delegation, list_current_principal_delegations, propose_delegation,
 };
+pub use generated::models::submit_git_lab_candidate_request::{
+    AccountUse as GitLabAccountUse, Kind as GitLabTokenKind,
+};
 pub use generated::models::{CreateWebhookSubscriptionRequest, PatchWebhookSubscriptionRequest};
 pub use generated::models::{
     linear_authorization_session, linear_connection, linear_connection_error,
@@ -86,6 +90,7 @@ pub use github::{
     GitHubAccountType, GitHubApi, GitHubFailure, GitHubInstallation, GitHubInstallationState,
     GitHubRepository, GitHubRepositoryList, GitHubSetupSession,
 };
+pub use gitlab::{GitLabApi, GitLabFailure, GitLabSubmission};
 pub use http_client::{
     HttpCancellation, HttpClient, HttpClientError, HttpEndpointError, HttpTransportPolicy,
 };

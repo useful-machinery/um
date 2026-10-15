@@ -10,6 +10,9 @@ pub(crate) enum ExitCode {
     AuthenticationRequired = 3,
     Unavailable = 4,
     RunnerRecoveryRequired = 5,
+    Conflict = 6,
+    CandidateUnavailable = 7,
+    IdentityMismatch = 8,
     Interrupted = 130,
     Terminated = 143,
 }

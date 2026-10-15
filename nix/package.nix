@@ -5,6 +5,7 @@
   git,
   jq,
   lib,
+  python3,
   version,
 }:
 
@@ -43,7 +44,10 @@ let
 
   testArgs = commonArgs // {
     inherit cargoArtifacts version;
-    nativeBuildInputs = [ git ];
+    nativeBuildInputs = [
+      git
+      python3
+    ];
     env = {
       UM_BUILD_IDENTITY = buildIdentity;
       UM_VERSION = version;

@@ -1268,6 +1268,44 @@ interrupted observation does not cancel a cycle. A result reports the final
 run, nonmatch, overlap, stopped, or failed state and its safe reason code;
 unknown acceptance never claims a run was created.
 
+## GitLab.com connections and credential candidates
+
+GitLab setup is CLI-only for now. Credential activation and GitLab run admission remain
+closed pending qualification; creating a connection or submitting a candidate does
+not enable execution. See the [GitLab.com setup guide](https://docs.usefulmachinery.com/agent/gitlab-setup.md)
+for supported token kinds, Developer access, expiry and the retained-record limit.
+
+```sh
+um connection gitlab create ORG https://gitlab.com --json
+um connection gitlab list ORG --json
+um connection gitlab show ORG CONNECTION --json
+um connection gitlab credential create ORG CONNECTION --expected-version VERSION \
+  --kind service-account --token-file /path/to/private-token --json
+um connection gitlab credential show ORG CONNECTION CANDIDATE --json
+um connection gitlab credential activate ORG CONNECTION CANDIDATE \
+  --expected-provider-user-id ID --dedicated-automation --json
+um connection gitlab credential cancel ORG CONNECTION CANDIDATE --json
+um connection gitlab remove ORG CONNECTION --expected-version VERSION --yes --json
+```
+
+Pass the credential only from an owned, regular, non-symlink mode-0600 file or
+`--token-file -` (standard input); never pass it as an argument. The CLI submits
+once and returns the candidate's current state. Show it separately for review.
+Activation checks a verified identity and requires explicit attestation (or an
+interactive identity prompt). The API currently fails real-token activation closed.
+Local disconnect does not revoke the upstream token: revoke it separately at GitLab.
+Every mutation accepts `--idempotency-key` to replay an uncertain response; without
+one the CLI generates and prints a key, including on ambiguous transport failures.
+A completed activation can be replayed while the server retains its receipt, even
+if candidate metadata has expired: reuse the same key with the explicitly reviewed
+provider ID and `--dedicated-automation`. A cancellation acknowledgement does not
+prove a terminal candidate was cancelled or undo activation. Neither create nor
+show polls. GitLab credential commands distinguish usage (exit 2), authentication
+(3), unavailable
+transport (4), conflict (6), candidate unavailability (7), and identity mismatch (8).
+
+<!-- UM-2559: document repository selection and project binding here. -->
+
 ## Linear connections
 
 An active organization owner can connect a Linear workspace without supplying a Linear

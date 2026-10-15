@@ -44,6 +44,8 @@ mod connection;
 mod delegation;
 #[path = "cli/github.rs"]
 mod github;
+#[path = "cli/gitlab.rs"]
+mod gitlab;
 #[path = "cli/identities.rs"]
 mod identities;
 #[path = "cli/invitation.rs"]

@@ -1662,7 +1662,7 @@ pub fn submit_git_lab_candidate(
     let p_path_organization_ref = organization_ref;
     let p_path_gitlab_connection_id = gitlab_connection_id;
     let p_header_idempotency_key = idempotency_key;
-    let p_body_submit_git_lab_candidate_request = submit_git_lab_candidate_request;
+    let mut p_body_submit_git_lab_candidate_request = submit_git_lab_candidate_request;
 
     let uri_str = format!(
         "{}/v1/organizations/{organizationRef}/connections/gitlab/{gitlabConnectionId}/credential-candidates",
@@ -1681,7 +1681,11 @@ pub fn submit_git_lab_candidate(
     if let Some(ref token) = configuration.bearer_access_token {
         req_builder = req_builder.bearer_auth(token.to_owned());
     };
-    req_builder = req_builder.json(&p_body_submit_git_lab_candidate_request);
+    let secret_body = crate::gitlab::secret_body(&p_body_submit_git_lab_candidate_request);
+    zeroize::Zeroize::zeroize(&mut p_body_submit_git_lab_candidate_request.token);
+    req_builder = req_builder
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(secret_body?);
 
     let req = req_builder.build()?;
     let resp = configuration.client.execute(req)?;
