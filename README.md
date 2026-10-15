@@ -1219,6 +1219,45 @@ identity because the API defines exact replay; setup initiation and reads make o
 request attempt. A later completion retry must reuse the same setup session and provider
 installation ID.
 
+## Project actions
+
+Organization owners configure Google Docs workflow actions under the provider-neutral
+`project action` namespace. The configuration file is a closed JSON object: create
+requires `displayName`, `workflowPath`, and explicit `enabled`. See
+[`examples/action-config.json`](examples/action-config.json) for a complete example.
+Bindings may be `user`, `document` (`field` is `id` or `url`), or `literal`
+(`kind` is `text` with a string value or `json` with any JSON value, including null).
+The optional `publication` is null or `{"exportName":"name"}`. Configured
+bindings and publication are validated against the workflow at form load and launch,
+not during CLI configuration. This command does not edit a Google document or launch
+an action.
+
+```sh
+um project action create ORG PROJECT --config-file examples/action-config.json
+um project action list ORG PROJECT --limit 50 --cursor CURSOR
+um project action show ORG PROJECT ACTION
+um project action update ORG PROJECT ACTION --config-file patch.json --expected-version 3
+um project action enable ORG PROJECT ACTION
+um project action disable ORG PROJECT ACTION
+um project action delete ORG PROJECT ACTION --yes
+```
+
+A patch contains only changed configuration fields, never `enabled` or
+`expectedVersion`; the positive version comes from the flag. A `publication: null`
+patch clears the selection, while omission leaves it unchanged. Enable, disable,
+and delete use no version or preliminary read. `--config-file -` reads standard input;
+it cannot share that input with `--service-api-key-file -`. List is paginated with
+an opaque next cursor. Show returns a nonsecret tombstone for a recently deleted
+action. Delete needs `--yes` and succeeds on an empty `204` response. `--json` uses
+the schema-version-1 envelope with `action`, `items`, or `tombstone` data and a
+stable outcome. An ambiguous transport reply is retried with the same automatic
+request key and body. If the result remains uncertain, inspect the action before
+issuing another mutation; the key is reported for diagnosis but cannot be supplied
+as a CLI flag. A rejected replay after a lost reply does not establish that the
+first mutation failed: the CLI reports `result_uncertain`, the replay outcome,
+and the original key rather than advising another create. A source-built CLI
+is not a published or installed release.
+
 ## Linear triggers and evaluations
 
 Organization owners configure project triggers against a connected Linear workspace. Create

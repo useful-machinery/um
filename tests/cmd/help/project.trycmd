@@ -5,6 +5,7 @@ Manage Useful Machinery projects
 Usage: um project [COMMAND]
 
 Commands:
+  action       Manage a project's actions
   create       Create a project
   list         List projects
   rename       Rename a project

@@ -1,0 +1,13 @@
+{
+  "displayName": "Review this document",
+  "workflowPath": ".um/workflows/review-document.yaml",
+  "enabled": true,
+  "description": "Review the current document.",
+  "inputBindings": {
+    "documentId": {"type": "document", "field": "id"},
+    "houseStyle": {"type": "literal", "kind": "text", "value": "Use our editorial guide."}
+  },
+  "inputPresentation": {
+    "instructions": {"label": "Review instructions", "help": "Describe the review you need."}
+  }
+}

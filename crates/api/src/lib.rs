@@ -10,6 +10,7 @@ mod current_principal;
 mod delegations;
 mod github;
 mod gitlab;
+mod google_docs_actions;
 mod http_client;
 mod http_util;
 mod human_principal;
@@ -96,6 +97,7 @@ pub use github::{
     GitHubRepository, GitHubRepositoryList, GitHubSetupSession,
 };
 pub use gitlab::{GitLabApi, GitLabFailure, GitLabSubmission};
+pub use google_docs_actions::{ActionApi, ActionFailure, ActionRead, Lifecycle as ActionLifecycle};
 pub use http_client::{
     HttpCancellation, HttpClient, HttpClientError, HttpEndpointError, HttpTransportPolicy,
 };

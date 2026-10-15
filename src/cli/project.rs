@@ -1,3 +1,4 @@
+mod action;
 mod output;
 mod trigger;
 mod webhook;
@@ -27,6 +28,8 @@ pub(super) struct Command {
 
 #[derive(Debug, Subcommand)]
 enum ProjectCommand {
+    #[command(about = "Manage a project's actions")]
+    Action(action::Command),
     #[command(about = "Create a project")]
     Create(CreateCommand),
     #[command(about = "List projects")]
@@ -268,6 +271,7 @@ impl Command {
             return super::print_help(&[NAME]);
         };
         match command {
+            ProjectCommand::Action(command) => command.execute(),
             ProjectCommand::Create(command) => execute_leaf(command, CreateCommand::execute),
             ProjectCommand::List(command) => execute_leaf(command, ListCommand::execute),
             ProjectCommand::Show(command) => execute_leaf(command, ShowCommand::execute),
