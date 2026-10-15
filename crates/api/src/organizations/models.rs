@@ -206,6 +206,7 @@ pub enum OrganizationAuditSubjectKind {
     LinearConnection,
     LinearEvaluation,
     Project,
+    GoogleDocsAction,
     WebhookSubscription,
     WebhookDelivery,
     RepositoryConnection,
@@ -1079,6 +1080,7 @@ impl TryFrom<models::OrganizationAuditSubject> for OrganizationAuditSubject {
             Kind::LinearConnection => (OrganizationAuditSubjectKind::LinearConnection, "lcn_"),
             Kind::LinearEvaluation => (OrganizationAuditSubjectKind::LinearEvaluation, "tev_"),
             Kind::Project => (OrganizationAuditSubjectKind::Project, "prj_"),
+            Kind::GoogleDocsAction => (OrganizationAuditSubjectKind::GoogleDocsAction, "gda_"),
             Kind::WebhookSubscription => {
                 (OrganizationAuditSubjectKind::WebhookSubscription, "whs_")
             }

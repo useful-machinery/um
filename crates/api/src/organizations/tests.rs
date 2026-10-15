@@ -5,6 +5,27 @@ use crate::HttpTransportPolicy;
 use crate::http_util::MAX_RESPONSE_BODY_BYTES;
 use um_test_support::ScriptedHttpServer;
 
+#[test]
+fn accepts_only_action_ids_for_action_audit_subjects() {
+    let subject = generated_models::OrganizationAuditSubject {
+        kind: generated_models::organization_audit_subject::Kind::GoogleDocsAction,
+        id: "gda_01k0z6r1w8f4jy2m7q9v3x5abc".into(),
+    };
+    let converted = models::OrganizationAuditSubject::try_from(subject.clone()).unwrap();
+    assert_eq!(
+        converted.kind,
+        OrganizationAuditSubjectKind::GoogleDocsAction
+    );
+    assert_eq!(converted.id, subject.id);
+    assert!(
+        models::OrganizationAuditSubject::try_from(generated_models::OrganizationAuditSubject {
+            id: "prj_01k0z6r1w8f4jy2m7q9v3x5abc".into(),
+            ..subject
+        })
+        .is_err()
+    );
+}
+
 const TOKEN: &str = "organization-unit-test-token-sentinel";
 const KEY: &str = "organization-unit-test-idempotency-key";
 
