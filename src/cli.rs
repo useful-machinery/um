@@ -64,7 +64,9 @@ use anyhow::{Context, anyhow};
 use clap::{Args, CommandFactory, Parser, Subcommand};
 use serde::Serialize;
 
-use self::entity::{InstallationArg, OrganizationArg, PoolArg, ProjectArg, RepositoryArg};
+use self::entity::{
+    GitLabConnectionArg, InstallationArg, OrganizationArg, PoolArg, ProjectArg, RepositoryArg,
+};
 use crate::exit_code::{ExitCode, OutcomeClass};
 use crate::service_auth::{ServiceApiKey, read_api_key};
 use um_api::{

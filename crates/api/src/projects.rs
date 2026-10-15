@@ -27,6 +27,8 @@ const QUANTITY_LIMIT: &str = "https://api.usefulmachinery.com/problems/quantity-
 const RATE_LIMIT: &str = "https://api.usefulmachinery.com/problems/rate-limit-exceeded";
 const IDEMPOTENCY_CONFLICT: &str = "https://api.usefulmachinery.com/problems/idempotency-conflict";
 const SOURCE_CONFLICT: &str = "https://api.usefulmachinery.com/problems/source-connection-conflict";
+const REPOSITORY_UNAVAILABLE: &str =
+    "https://api.usefulmachinery.com/problems/repository-unavailable";
 
 pub type Project = models::Project;
 pub type ProjectList = models::ProjectList;
@@ -41,9 +43,15 @@ pub struct ProjectApi {
     configuration: apis::configuration::Configuration,
 }
 
+#[derive(Clone, Copy)]
+pub enum ProjectRepositorySelector<'a> {
+    GitHub(&'a str),
+    GitLab(&'a str),
+}
+
 pub struct CreateProjectInput<'a> {
     pub name: &'a str,
-    pub installation_id: &'a str,
+    pub repository: ProjectRepositorySelector<'a>,
     pub repository_id: &'a str,
     pub default_branch: Option<&'a str>,
     pub runner_pool_id: Option<&'a str>,
@@ -88,10 +96,24 @@ impl ProjectApi {
         idempotency_key: &str,
         input: CreateProjectInput<'_>,
     ) -> Result<Project, ProjectFailure> {
-        let mut repository = models::ProjectRepositorySelection::new(
-            input.installation_id.to_owned(),
-            input.repository_id.to_owned(),
-        );
+        let mut repository = match input.repository {
+            ProjectRepositorySelector::GitHub(id) => {
+                let mut selection = models::ProjectRepositorySelection::new(
+                    models::project_repository_selection::ProviderKind::Github,
+                    input.repository_id.to_owned(),
+                );
+                selection.installation_binding_id = Some(id.to_owned());
+                selection
+            }
+            ProjectRepositorySelector::GitLab(id) => {
+                let mut selection = models::ProjectRepositorySelection::new(
+                    models::project_repository_selection::ProviderKind::Gitlab,
+                    input.repository_id.to_owned(),
+                );
+                selection.gitlab_connection_id = Some(id.to_owned());
+                selection
+            }
+        };
         repository.default_branch = input.default_branch.map(str::to_owned);
         let mut request = models::CreateProjectRequest::new(input.name.to_owned(), repository);
         request.runner_pool_id = input.runner_pool_id.map(str::to_owned);
@@ -228,14 +250,28 @@ impl ProjectApi {
         organization: &str,
         project_id: &str,
         idempotency_key: &str,
-        installation_id: &str,
+        repository: ProjectRepositorySelector<'_>,
         repository_id: &str,
         default_branch: Option<&str>,
     ) -> Result<Project, ProjectFailure> {
-        let mut request = models::SetProjectRepositoryRequest::new(
-            installation_id.to_owned(),
-            repository_id.to_owned(),
-        );
+        let mut request = match repository {
+            ProjectRepositorySelector::GitHub(id) => {
+                let mut selection = models::SetProjectRepositoryRequest::new(
+                    models::set_project_repository_request::ProviderKind::Github,
+                    repository_id.to_owned(),
+                );
+                selection.installation_binding_id = Some(id.to_owned());
+                selection
+            }
+            ProjectRepositorySelector::GitLab(id) => {
+                let mut selection = models::SetProjectRepositoryRequest::new(
+                    models::set_project_repository_request::ProviderKind::Gitlab,
+                    repository_id.to_owned(),
+                );
+                selection.gitlab_connection_id = Some(id.to_owned());
+                selection
+            }
+        };
         request.default_branch = default_branch.map(str::to_owned);
         let body = serialize_request(&request)?;
         let path = project_child_path(organization, project_id, "repository");
@@ -677,6 +713,7 @@ pub enum ProjectFailure {
     RateLimited { retry_after: u64 },
     IdempotencyConflict,
     SourceConflict,
+    RepositoryUnavailable,
     Conflict,
     Unreachable(UnreachableCategory),
     Protocol { credential_rejected: bool },
@@ -734,6 +771,7 @@ fn classify_project_response(response: &ReceivedResponse, operation: Operation) 
         (StatusCode::CONFLICT, QUANTITY_LIMIT) => ProjectFailure::QuantityLimitReached,
         (StatusCode::CONFLICT, IDEMPOTENCY_CONFLICT) => ProjectFailure::IdempotencyConflict,
         (StatusCode::CONFLICT, SOURCE_CONFLICT) => ProjectFailure::SourceConflict,
+        (StatusCode::CONFLICT, REPOSITORY_UNAVAILABLE) => ProjectFailure::RepositoryUnavailable,
         (StatusCode::CONFLICT, _) => ProjectFailure::Conflict,
         _ => ProjectFailure::protocol(credential_rejected),
     }
@@ -808,11 +846,47 @@ fn validate_repository(repository: ProjectRepository) -> Result<ProjectRepositor
 }
 
 fn valid_repository_fields(repository: &ProjectRepository) -> bool {
+    let origin_valid = match repository.provider_kind {
+        models::project_repository::ProviderKind::Github => {
+            repository
+                .installation_binding_id
+                .as_deref()
+                .is_some_and(|id| um_support::valid_typed_id(id, "ghi_"))
+                && repository.gitlab_connection_id.is_none()
+                && repository.instance_url.is_none()
+                && repository.admission_diagnostic.is_none()
+                && valid_bounded_text(&repository.full_name, 1, 255)
+        }
+        models::project_repository::ProviderKind::Gitlab => {
+            repository.installation_binding_id.is_none()
+                && repository
+                    .gitlab_connection_id
+                    .as_deref()
+                    .is_some_and(|id| um_support::valid_typed_id(id, "glc_"))
+                && repository
+                    .instance_url
+                    .as_deref()
+                    .is_some_and(|url| url.starts_with("https://") && url.len() <= 2048)
+                && valid_gitlab_path(&repository.full_name)
+        }
+    };
     um_support::valid_typed_id(&repository.connection_id, "rpc_")
-        && um_support::valid_typed_id(&repository.installation_binding_id, "ghi_")
+        && origin_valid
         && valid_provider_id(&repository.provider_repository_id)
-        && valid_bounded_text(&repository.full_name, 1, 255)
         && valid_bounded_text(&repository.default_branch, 1, 1024)
+}
+
+fn valid_gitlab_path(value: &str) -> bool {
+    value.len() <= 8192
+        && value.split('/').count() >= 2
+        && value.split('/').all(|component| {
+            !component.is_empty()
+                && component != "."
+                && component != ".."
+                && component
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-'))
+        })
 }
 
 fn validate_installation_list(

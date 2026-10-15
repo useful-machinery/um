@@ -84,4 +84,9 @@ identifier_arg!(
     "INSTALLATION",
     "GitHub installation binding ID"
 );
+identifier_arg!(
+    GitLabConnectionArg,
+    "GITLAB_CONNECTION",
+    "GitLab connection ID"
+);
 identifier_arg!(RepositoryArg, "REPOSITORY", "Provider repository ID");

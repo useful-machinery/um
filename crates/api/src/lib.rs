@@ -147,7 +147,7 @@ pub use projects::{
     GitHubInstallationList as ProjectGitHubInstallationList,
     GitHubRepository as ProjectGitHubRepository,
     GitHubRepositoryList as ProjectGitHubRepositoryList, Project, ProjectApi, ProjectFailure,
-    ProjectList, ProjectReadinessBlocker, ProjectRepository,
+    ProjectList, ProjectReadinessBlocker, ProjectRepository, ProjectRepositorySelector,
 };
 pub use publications::{
     Publication, PublicationApi, PublicationFailure, PublicationList, PublicationState,

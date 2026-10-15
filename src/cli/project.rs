@@ -7,11 +7,14 @@ use clap::{Args, Subcommand, builder::NonEmptyStringValueParser};
 
 use crate::exit_code::ExitCode;
 use um_api::{
-    CreateProjectInput, HttpClient, HttpTransportPolicy, ProjectApi, ProjectFailure, RunnerFailure,
+    CreateProjectInput, HttpClient, HttpTransportPolicy, ProjectApi, ProjectFailure,
+    ProjectRepositorySelector, RunnerFailure,
 };
 use um_human_auth::Deployment;
 
-use super::{InstallationArg, OrganizationArg, PoolArg, ProjectArg, RepositoryArg};
+use super::{
+    GitLabConnectionArg, InstallationArg, OrganizationArg, PoolArg, ProjectArg, RepositoryArg,
+};
 
 pub(super) const ABOUT: &str = "Manage Useful Machinery projects";
 const NAME: &str = "project";
@@ -48,10 +51,20 @@ type Options = super::CommonArgs<super::ProjectJson, super::PrincipalAuthenticat
 struct RepositorySelectionArgs {
     #[arg(
         long,
+        required_unless_present = "gitlab_connection_id",
+        conflicts_with = "gitlab_connection_id",
         value_name = InstallationArg::VALUE_NAME,
         help = InstallationArg::HELP
     )]
-    installation_id: InstallationArg,
+    installation_id: Option<InstallationArg>,
+
+    #[arg(
+        long,
+        required_unless_present = "installation_id",
+        value_name = GitLabConnectionArg::VALUE_NAME,
+        help = GitLabConnectionArg::HELP
+    )]
+    gitlab_connection_id: Option<GitLabConnectionArg>,
 
     #[arg(
         long,
@@ -67,6 +80,16 @@ struct RepositorySelectionArgs {
         help = "Set the configured default branch (the provider default when omitted)"
     )]
     default_branch: Option<String>,
+}
+
+impl RepositorySelectionArgs {
+    fn selector(&self) -> anyhow::Result<ProjectRepositorySelector<'_>> {
+        match (&self.installation_id, &self.gitlab_connection_id) {
+            (Some(id), None) => Ok(ProjectRepositorySelector::GitHub(id)),
+            (None, Some(id)) => Ok(ProjectRepositorySelector::GitLab(id)),
+            _ => Err(anyhow!("select exactly one repository provider")),
+        }
+    }
 }
 
 // Project creation has repository and optional pool inputs that must remain distinct
@@ -332,6 +355,7 @@ impl CreateCommand {
             },
             None => None,
         };
+        let selector = self.repository.selector()?;
         let key = um_support::generate_idempotency_key()
             .context("generate project creation request identity")?;
         let result = with_api(
@@ -344,7 +368,7 @@ impl CreateCommand {
                     &key,
                     CreateProjectInput {
                         name: &self.name,
-                        installation_id: &self.repository.installation_id,
+                        repository: selector,
                         repository_id: &self.repository.repository_id,
                         default_branch: self.repository.default_branch.as_deref(),
                         runner_pool_id: runner_pool_id.as_deref(),
@@ -454,6 +478,7 @@ impl RepositoryShowCommand {
 
 impl RepositorySetCommand {
     fn execute(self, deployment: &Deployment) -> anyhow::Result<ExitCode> {
+        let selector = self.repository.selector()?;
         let key = um_support::generate_idempotency_key()
             .context("generate project repository request identity")?;
         let result = with_api(
@@ -465,7 +490,7 @@ impl RepositorySetCommand {
                     &self.project.organization,
                     &self.project.project_id,
                     &key,
-                    &self.repository.installation_id,
+                    selector,
                     &self.repository.repository_id,
                     self.repository.default_branch.as_deref(),
                 )

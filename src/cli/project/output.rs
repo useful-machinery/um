@@ -60,6 +60,9 @@ pub(super) fn write_project_list(
                             blocker_list(&project.execution_readiness.blockers)
                         )?;
                     }
+                    if project.repository.as_deref().is_some_and(admission_closed) {
+                        writeln!(stdout, "  admission: GitLab run admission is closed")?;
+                    }
                 }
                 write_list_footer(
                     &mut stdout,
@@ -99,9 +102,18 @@ pub(super) fn write_repository(
                 )?;
                 writeln!(
                     stdout,
-                    "installation: {}",
-                    repository.installation_binding_id
+                    "provider: {}",
+                    enum_text(&repository.provider_kind)?
                 )?;
+                if let Some(installation) = &repository.installation_binding_id {
+                    writeln!(stdout, "installation: {installation}")?;
+                }
+                if let Some(connection) = &repository.gitlab_connection_id {
+                    writeln!(stdout, "GitLab connection: {connection}")?;
+                }
+                if let Some(instance_url) = &repository.instance_url {
+                    writeln!(stdout, "GitLab instance: {instance_url}")?;
+                }
                 writeln!(stdout, "repository: {}", repository.full_name)?;
                 writeln!(
                     stdout,
@@ -109,6 +121,9 @@ pub(super) fn write_repository(
                     repository.provider_repository_id
                 )?;
                 writeln!(stdout, "default branch: {}", repository.default_branch)?;
+                if admission_closed(&repository) {
+                    writeln!(stdout, "admission: GitLab run admission is closed")?;
+                }
                 writeln!(
                     stdout,
                     "availability: {}",
@@ -161,10 +176,24 @@ fn write_project_human(deployment: &str, heading: &str, project: &Project) -> an
             writeln!(stdout, "repository: {}", repository.full_name)?;
             writeln!(
                 stdout,
+                "provider: {}",
+                enum_text(&repository.provider_kind)?
+            )?;
+            writeln!(
+                stdout,
                 "repository connection: {}",
                 repository.connection_id
             )?;
+            if let Some(connection) = &repository.gitlab_connection_id {
+                writeln!(stdout, "GitLab connection: {connection}")?;
+            }
+            if let Some(instance_url) = &repository.instance_url {
+                writeln!(stdout, "GitLab instance: {instance_url}")?;
+            }
             writeln!(stdout, "default branch: {}", repository.default_branch)?;
+            if admission_closed(repository) {
+                writeln!(stdout, "admission: GitLab run admission is closed")?;
+            }
             writeln!(
                 stdout,
                 "repository availability: {}",
@@ -187,6 +216,10 @@ fn write_project_human(deployment: &str, heading: &str, project: &Project) -> an
     writeln!(stdout, "updated: {}", project.updated_at)?;
     writeln!(stdout, "deployment: {deployment}")?;
     Ok(())
+}
+
+fn admission_closed(repository: &ProjectRepository) -> bool {
+    repository.admission_diagnostic.is_some()
 }
 
 fn readiness(project: &Project) -> &'static str {
@@ -283,6 +316,12 @@ fn write_failure(
             "source_conflict",
             None,
             "error: selected GitHub repository or branch is unavailable\n\nList the installation repositories and choose an available repository and branch.".to_owned(),
+            OutcomeClass::GeneralFailure,
+        ),
+        ProjectFailure::RepositoryUnavailable => (
+            "repository_unavailable",
+            None,
+            "error: selected GitLab repository or branch is unavailable\n\nCheck the GitLab connection, selection, and branch before retrying.".to_owned(),
             OutcomeClass::GeneralFailure,
         ),
         ProjectFailure::Conflict => (

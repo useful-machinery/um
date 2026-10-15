@@ -13,6 +13,7 @@ const ORGANIZATION_ID: &str = "org_01k0z6r1w8f4jy2m7q9v3x5abc";
 const MEMBERSHIP_ID: &str = "mem_01k0z6r1w8f4jy2m7q9v3x5abc";
 const PROJECT_ID: &str = "prj_01k0z6r1w8f4jy2m7q9v3x5abc";
 const INSTALLATION_ID: &str = "ghi_01k0z6r1w8f4jy2m7q9v3x5abc";
+const GITLAB_CONNECTION_ID: &str = "glc_01k0z6r1w8f4jy2m7q9v3x5abc";
 const CONNECTION_ID: &str = "rpc_01k0z6r1w8f4jy2m7q9v3x5abc";
 const POOL_ID: &str = "rpl_01k0z6r1w8f4jy2m7q9v3x5abc";
 const REPOSITORY_ID: &str = "123456789";
@@ -35,6 +36,7 @@ fn prepared_project(responses: Vec<Vec<u8>>) -> (ScriptedServer, tempfile::TempD
 fn repository_body(full_name: &str, default_branch: &str) -> serde_json::Value {
     serde_json::json!({
         "connectionId": CONNECTION_ID,
+        "providerKind": "github",
         "installationBindingId": INSTALLATION_ID,
         "providerRepositoryId": REPOSITORY_ID,
         "fullName": full_name,
@@ -576,6 +578,7 @@ fn discovery_and_project_management_feed_an_inputless_cloud_run() {
         serde_json::json!({
             "name": "widget",
             "repository": {
+                "providerKind": "github",
                 "installationBindingId": INSTALLATION_ID,
                 "providerRepositoryId": REPOSITORY_ID,
                 "defaultBranch": "release"
@@ -605,6 +608,7 @@ fn discovery_and_project_management_feed_an_inputless_cloud_run() {
     assert_eq!(
         request_body(&requests[10]),
         serde_json::json!({
+            "providerKind": "github",
             "installationBindingId": INSTALLATION_ID,
             "providerRepositoryId": REPOSITORY_ID
         })
@@ -728,6 +732,7 @@ fn project_creation_resolves_an_exact_pool_name() {
         serde_json::json!({
             "name": "widget",
             "repository": {
+                "providerKind": "github",
                 "installationBindingId": INSTALLATION_ID,
                 "providerRepositoryId": REPOSITORY_ID
             },
@@ -824,6 +829,109 @@ fn project_create_rejects_success_without_required_identity_headers() {
 }
 
 #[test]
+fn gitlab_project_create_bind_and_read_preserve_provider_identity() {
+    let long_path = format!("group/subgroup/{}", "a".repeat(260));
+    let repository = serde_json::json!({
+        "connectionId": CONNECTION_ID,
+        "providerKind": "gitlab",
+        "gitlabConnectionId": GITLAB_CONNECTION_ID,
+        "instanceUrl": "https://gitlab.example.com",
+        "admissionDiagnostic": "gitlab_admission_closed",
+        "providerRepositoryId": REPOSITORY_ID,
+        "fullName": long_path,
+        "defaultBranch": "main",
+        "availability": "unavailable"
+    });
+    let mut project = project_body("widget", false, Some(repository.clone()));
+    project["executionReadiness"] = serde_json::json!({
+        "ready": false,
+        "blockers": ["runner_pool_unassigned", "repository_unavailable"]
+    });
+    let (server, _directory, credential_path) = prepared_project(vec![
+        project_response("201 Created", project.clone(), true),
+        project_response("200 OK", project.clone(), false),
+        json_http_response("200 OK", project),
+    ]);
+    let create = run_project(
+        &[
+            "project",
+            "create",
+            ORGANIZATION,
+            "--name",
+            "widget",
+            "--gitlab-connection-id",
+            GITLAB_CONNECTION_ID,
+            "--repository-id",
+            REPOSITORY_ID,
+            "--json",
+            "--allow-insecure-http",
+        ],
+        &server,
+        &credential_path,
+    );
+    let created = assert_json_success(&create, "created");
+    assert_eq!(created["project"]["repository"], repository);
+    assert_eq!(created["project"]["executionReadiness"]["ready"], false);
+
+    let bind = run_project(
+        &[
+            "project",
+            "repository",
+            "set",
+            ORGANIZATION,
+            PROJECT_ID,
+            "--gitlab-connection-id",
+            GITLAB_CONNECTION_ID,
+            "--repository-id",
+            REPOSITORY_ID,
+            "--json",
+            "--allow-insecure-http",
+        ],
+        &server,
+        &credential_path,
+    );
+    assert_eq!(
+        assert_json_success(&bind, "repository_set")["project"]["repository"],
+        repository
+    );
+    let show = run_project(
+        &[
+            "project",
+            "show",
+            ORGANIZATION,
+            PROJECT_ID,
+            "--allow-insecure-http",
+        ],
+        &server,
+        &credential_path,
+    );
+    assert!(
+        show.status.success(),
+        "{}",
+        String::from_utf8_lossy(&show.stderr)
+    );
+    let text = String::from_utf8(show.stdout).unwrap();
+    assert!(text.contains(&format!("repository: {long_path}")));
+    assert!(text.contains(&format!("GitLab connection: {GITLAB_CONNECTION_ID}")));
+    assert!(text.contains("repository_unavailable"));
+    assert!(text.contains("admission: GitLab run admission is closed"));
+
+    let requests = server.finish();
+    assert_eq!(requests.len(), 3);
+    for request in &requests[..2] {
+        let body = request_body(request);
+        let selection = if body.get("repository").is_some() {
+            &body["repository"]
+        } else {
+            &body
+        };
+        assert_eq!(selection["providerKind"], "gitlab");
+        assert_eq!(selection["gitlabConnectionId"], GITLAB_CONNECTION_ID);
+        assert!(selection.get("installationBindingId").is_none());
+    }
+}
+
+#[test]
 fn project_human_output_exposes_readiness_and_blockers() {
     let project = project_body(
         "widget",
@@ -907,6 +1015,23 @@ fn project_api_errors_have_closed_json_outcomes_and_exit_codes() {
             "409 Conflict",
             "https://api.usefulmachinery.com/problems/source-connection-conflict",
             "source_conflict",
+            1,
+        ),
+        (
+            vec![
+                "project",
+                "create",
+                ORGANIZATION,
+                "--name",
+                "widget",
+                "--gitlab-connection-id",
+                GITLAB_CONNECTION_ID,
+                "--repository-id",
+                REPOSITORY_ID,
+            ],
+            "409 Conflict",
+            "https://api.usefulmachinery.com/problems/repository-unavailable",
+            "repository_unavailable",
             1,
         ),
         (
