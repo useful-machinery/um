@@ -62,6 +62,9 @@ use super::process_group::{
     ProcessGuardRegistry, ProcessGuardStoreError, ProcessIdentityObservation,
     system_process_identity_observation, terminate_authenticated_process_group,
 };
+use super::profile_replacement::{
+    AgentProfileReplacementDocument, MAXIMUM_AGENT_PROFILE_REPLACEMENT_BYTES,
+};
 use super::publication::{
     CancellationReasonV1, FinalizationTriggerV1, RunResultInvariant, cancellation_reason,
     finalization_trigger,
@@ -467,6 +470,8 @@ struct WorkflowManifestV1 {
     maximum_parallel_steps: usize,
     source_files: Vec<ManifestSourceFileV1>,
     inputs: BTreeMap<String, ManifestInputV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    agent_profile_replacement: Option<ManifestFileV1>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -3056,6 +3061,17 @@ fn retain_execution_specification(
         };
         inputs.insert(name.clone(), retained);
     }
+    let agent_profile_replacement = admitted
+        .workflow()
+        .agent_profile_replacement
+        .as_ref()
+        .map(|replacement| {
+            ordinal = ordinal
+                .checked_add(1)
+                .ok_or(LocalRunDirectoryError::SerializationUnavailable)?;
+            retain_file(files, ordinal, replacement.document.bytes())
+        })
+        .transpose()?;
     let manifest = WorkflowManifestV1 {
         schema_version: 1,
         workflow_path: admitted.workflow().source.workflow_path.clone(),
@@ -3063,6 +3079,7 @@ fn retain_execution_specification(
         maximum_parallel_steps: admitted.execution().limits().maximum_parallel_steps().get(),
         source_files,
         inputs,
+        agent_profile_replacement,
     };
     validate_manifest(&manifest)?;
     Ok(manifest)
@@ -6124,10 +6141,21 @@ fn load_retained_execution_directory(
         };
         inputs.insert(name.clone(), value);
     }
+    let replacement = manifest
+        .agent_profile_replacement
+        .as_ref()
+        .map(|file| {
+            if file.size_bytes > MAXIMUM_AGENT_PROFILE_REPLACEMENT_BYTES {
+                return Err(LocalRunDirectoryError::StateInvalid);
+            }
+            read_file(file).map(AgentProfileReplacementDocument::new)
+        })
+        .transpose()?;
     let workflow = resolve_retained(
         PathBuf::from(&manifest.source_root),
         &manifest.workflow_path,
         source_closure,
+        replacement.as_ref(),
     )
     .map_err(|_| LocalRunDirectoryError::StateInvalid)?;
     if workflow.content_digest.algorithm.as_str() != expected_workflow_digest.algorithm
@@ -6176,6 +6204,9 @@ fn retained_manifest_file_count(
         .source_files
         .len()
         .checked_add(input_files.ok_or(LocalRunDirectoryError::StateInvalid)?)
+        .and_then(|count| {
+            count.checked_add(usize::from(manifest.agent_profile_replacement.is_some()))
+        })
         .ok_or(LocalRunDirectoryError::StateInvalid)?;
     u64::try_from(count)
         .ok()
@@ -7429,6 +7460,12 @@ fn validate_manifest(manifest: &WorkflowManifestV1) -> Result<(), LocalRunDirect
                 }
             }
         }
+    }
+    if let Some(file) = &manifest.agent_profile_replacement {
+        if file.size_bytes > MAXIMUM_AGENT_PROFILE_REPLACEMENT_BYTES {
+            return Err(LocalRunDirectoryError::SerializationUnavailable);
+        }
+        retained_files.push(file);
     }
     let mut expected_ordinal = 1_u64;
     for file in retained_files {

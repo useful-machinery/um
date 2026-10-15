@@ -51,8 +51,8 @@ use super::step_runtime::{
 };
 use super::validated::WorkflowNodeRole;
 use super::validated::{
-    ResolvedOutputSource, ValidatedExportPresentation, ValidatedPresentationField,
-    WorkflowValueType,
+    ResolvedOutputSource, ValidatedExportPresentation, ValidatedHarness,
+    ValidatedPresentationField, WorkflowValueType,
 };
 use super::value::CapturedValue;
 use super::workspace_snapshot::WorkspaceSnapshotV1;
@@ -331,6 +331,7 @@ pub struct WorkflowRunResult {
     pub workflow_path: String,
     pub source_root: PathBuf,
     pub content_digest: WorkflowContentDigest,
+    pub agent_profile_replacement: Option<AgentProfileReplacementV1>,
     pub execution_root: PathBuf,
     pub maximum_parallel_steps: NonZeroUsize,
     pub maximum_retained_bytes_per_stream: u64,
@@ -695,6 +696,80 @@ pub(crate) struct WorkflowIdentityV1 {
     pub(crate) path: String,
     pub(crate) provenance: WorkflowProvenanceV1,
     pub(crate) digest: DigestV1,
+    #[serde(
+        rename = "agentProfileReplacement",
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub(crate) agent_profile_replacement: Option<AgentProfileReplacementV1>,
+}
+
+/// The invocation-time agent profile replacement recorded by a result, as defined by
+/// Local Workflow Run CLI section 3.6.4.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentProfileReplacementV1 {
+    pub digest: DigestV1,
+    pub profiles: BTreeMap<String, ReplacedAgentProfileV1>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReplacedAgentProfileV1 {
+    pub harness: ReplacedHarnessV1,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "config", rename_all = "snake_case")]
+pub enum ReplacedHarnessV1 {
+    Pi { model: String, thinking: String },
+    ClaudeCode { model: String, effort: String },
+    Codex { model: String, effort: String },
+}
+
+impl AgentProfileReplacementV1 {
+    pub fn from_resolved(
+        replacement: &super::profile_replacement::ResolvedAgentProfileReplacement,
+    ) -> Self {
+        Self {
+            digest: DigestV1 {
+                algorithm: "sha256".to_owned(),
+                value: replacement.digest.clone(),
+            },
+            profiles: replacement
+                .profiles
+                .iter()
+                .map(|(name, harness)| {
+                    (
+                        name.clone(),
+                        ReplacedAgentProfileV1 {
+                            harness: ReplacedHarnessV1::from(harness),
+                        },
+                    )
+                })
+                .collect(),
+        }
+    }
+}
+
+impl From<&ValidatedHarness> for ReplacedHarnessV1 {
+    fn from(harness: &ValidatedHarness) -> Self {
+        match harness {
+            ValidatedHarness::Pi(config) => Self::Pi {
+                model: config.model.clone(),
+                thinking: config.thinking.as_str().to_owned(),
+            },
+            ValidatedHarness::ClaudeCode(config) => Self::ClaudeCode {
+                model: config.model.clone(),
+                effort: config.effort.as_str().to_owned(),
+            },
+            ValidatedHarness::Codex(config) => Self::Codex {
+                model: config.model.clone(),
+                effort: config.effort.clone(),
+            },
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -2802,6 +2877,7 @@ fn build_result_with_provenance(
                 algorithm: run.content_digest.algorithm.as_str().to_owned(),
                 value: run.content_digest.value.clone(),
             },
+            agent_profile_replacement: run.agent_profile_replacement.clone(),
         },
         execution: WorkflowExecutionV1 {
             execution_root: None,

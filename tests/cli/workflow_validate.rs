@@ -132,6 +132,14 @@ exports:
 }
 
 fn validate(bundle: &WorkflowBundle, json: bool) -> std::process::Output {
+    validate_with_arguments(bundle, json, &[])
+}
+
+fn validate_with_arguments(
+    bundle: &WorkflowBundle,
+    json: bool,
+    arguments: &[&str],
+) -> std::process::Output {
     let listener = TcpListener::bind("127.0.0.1:0").expect("network sentinel should bind");
     listener
         .set_nonblocking(true)
@@ -151,6 +159,7 @@ fn validate(bundle: &WorkflowBundle, json: bool) -> std::process::Output {
     if json {
         args.push("--json");
     }
+    args.extend_from_slice(arguments);
     let output = run_with_env(
         &args,
         &[
@@ -559,4 +568,68 @@ fn selected_workflow_must_remain_within_the_explicit_source_root() {
     assert_eq!(report["diagnostics"][0]["code"], "source_path_escape");
     assert!(output.stderr.is_empty());
     assert!(!bundle.marker.exists());
+}
+
+#[test]
+fn agent_profile_replacement_is_applied_and_reported_without_retention() {
+    let bundle = WorkflowBundle::valid();
+    let document = bundle.root.join("profiles.yaml");
+    fs::write(
+        &document,
+        "schemaVersion: 1\nagentProfiles:\n  coding:\n    harness:\n      kind: claude_code\n      config:\n        model: example/claude\n        effort: high\n",
+    )
+    .expect("replacement document should be written");
+    let document = document.to_str().unwrap();
+
+    let baseline = validate(&bundle, true);
+    assert!(baseline.status.success());
+    let baseline: serde_json::Value = serde_json::from_slice(&baseline.stdout).unwrap();
+
+    let json = validate_with_arguments(&bundle, true, &["--agent-profiles", document]);
+    assert!(
+        json.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&json.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
+    assert_eq!(report["outcome"], "valid");
+    assert_eq!(
+        report["replacedAgentProfiles"],
+        serde_json::json!({
+            "coding": {
+                "harness": {
+                    "kind": "claude_code",
+                    "config": {"model": "example/claude", "effort": "high"}
+                }
+            }
+        })
+    );
+    assert_eq!(report["digest"], baseline["digest"]);
+    assert!(baseline.get("replacedAgentProfiles").is_none());
+
+    let human = validate_with_arguments(&bundle, false, &["--agent-profiles", document]);
+    assert!(human.status.success());
+    assert!(
+        String::from_utf8_lossy(&human.stdout).contains("replaced agent profiles: coding"),
+        "{}",
+        String::from_utf8_lossy(&human.stdout)
+    );
+
+    fs::write(
+        document,
+        "schemaVersion: 1\nagentProfiles:\n  missing:\n    harness:\n      kind: claude_code\n      config:\n        model: example/claude\n        effort: high\n",
+    )
+    .unwrap();
+    let rejected = validate_with_arguments(&bundle, true, &["--agent-profiles", document]);
+    assert_eq!(rejected.status.code(), Some(1));
+    let report: serde_json::Value = serde_json::from_slice(&rejected.stdout).unwrap();
+    assert_eq!(report["outcome"], "invalid");
+    assert_eq!(
+        report["diagnostics"][0]["code"],
+        "unknown_replacement_profile"
+    );
+    assert_eq!(
+        report["diagnostics"][0]["location"],
+        serde_json::json!({"kind": "agent_profile_replacement", "profile": "missing"})
+    );
 }

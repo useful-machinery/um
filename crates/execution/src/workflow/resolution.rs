@@ -9,6 +9,9 @@ use ring::digest::{Context, SHA256};
 use serde_json::Value;
 
 use super::capacity::{CapacityCalculationFailure, WorkflowCapacity, resolve_workflow_capacity};
+use super::profile_replacement::{
+    self, AgentProfileReplacementDocument, ResolvedAgentProfileReplacement,
+};
 use super::result_validation::{JsonSchemaSupportFailure, RetainedJsonSchema};
 use super::schema_common::lowercase_hex;
 use super::validated::{
@@ -34,6 +37,7 @@ pub(crate) enum ResolutionFailureKind {
     SourceChangedDuringResolution,
     InvalidWorkflowDocument(DecodeFailureKind),
     InvalidWorkflowDefinition(ValidationFailureKind),
+    InvalidReplacementDocument(DecodeFailureKind),
     InvalidTextEncoding,
     InvalidInputSchemaEncoding,
     InvalidInputSchemaJson,
@@ -56,6 +60,7 @@ pub(crate) enum ResolutionLocation {
     SourceRoot,
     Workflow,
     Semantic(ValidationLocation),
+    AgentProfileReplacement,
     SystemPrompt { step: String },
     MessageText { step: String, index: usize },
     MessageAttachment { step: String, index: usize },
@@ -161,6 +166,8 @@ pub struct ResolvedWorkflow {
     pub source: WorkflowSourceProvenance,
     pub content_digest: WorkflowContentDigest,
     pub capacity: WorkflowCapacity,
+    /// The invocation-time agent profile replacement applied to this definition, if any.
+    pub agent_profile_replacement: Option<ResolvedAgentProfileReplacement>,
 }
 
 impl ResolvedWorkflow {
@@ -212,7 +219,20 @@ pub fn resolve(
     source_root: &Path,
     selected_workflow: &Path,
 ) -> Result<ResolvedWorkflow, ResolutionFailure> {
-    resolve_with_sources(SourceResolver::new(source_root)?, selected_workflow)
+    resolve_with_agent_profiles(source_root, selected_workflow, None)
+}
+
+// The same adapter entry with an invocation-time agent profile replacement.
+pub fn resolve_with_agent_profiles(
+    source_root: &Path,
+    selected_workflow: &Path,
+    replacement: Option<&AgentProfileReplacementDocument>,
+) -> Result<ResolvedWorkflow, ResolutionFailure> {
+    resolve_with_sources(
+        SourceResolver::new(source_root)?,
+        selected_workflow,
+        replacement,
+    )
 }
 
 // Human CLI workflow files are ordinary host paths, independent of source-root spelling.
@@ -220,10 +240,19 @@ pub fn resolve_workflow_file(
     source_root: &Path,
     workflow_file: &Path,
 ) -> Result<ResolvedWorkflow, ResolutionFailure> {
+    resolve_workflow_file_with_agent_profiles(source_root, workflow_file, None)
+}
+
+// The human CLI entry with an invocation-time agent profile replacement.
+pub fn resolve_workflow_file_with_agent_profiles(
+    source_root: &Path,
+    workflow_file: &Path,
+    replacement: Option<&AgentProfileReplacementDocument>,
+) -> Result<ResolvedWorkflow, ResolutionFailure> {
     let (source_root, workflow_file) = host_workflow_paths(source_root, workflow_file)?;
     let sources = SourceResolver::new(&source_root)?;
     let canonical_workflow = sources.canonical_workflow_file(&workflow_file)?;
-    resolve_with_sources(sources, &canonical_workflow)
+    resolve_with_sources(sources, &canonical_workflow, replacement)
 }
 
 fn host_workflow_paths(
@@ -257,27 +286,31 @@ pub(crate) fn resolve_retained(
     source_root: PathBuf,
     workflow_path: &str,
     source_closure: BTreeMap<String, Arc<[u8]>>,
+    replacement: Option<&AgentProfileReplacementDocument>,
 ) -> Result<ResolvedWorkflow, ResolutionFailure> {
     resolve_with_sources(
         SourceResolver::from_retained(source_root, source_closure)?,
         Path::new(workflow_path),
+        replacement,
     )
 }
 
 fn resolve_with_sources(
     mut sources: SourceResolver,
     selected_workflow: &Path,
+    replacement: Option<&AgentProfileReplacementDocument>,
 ) -> Result<ResolvedWorkflow, ResolutionFailure> {
     let selected_candidate = sources.path_from_root(selected_workflow);
     let workflow_source = sources.load(&selected_candidate, ResolutionLocation::Workflow)?;
     let workflow_path = workflow_source.canonical_path.clone();
-    resolve_loaded_workflow(sources, workflow_source)
+    resolve_loaded_workflow(sources, workflow_source, replacement)
         .map_err(|failure| failure.with_workflow_path(workflow_path))
 }
 
 fn resolve_loaded_workflow(
     mut sources: SourceResolver,
     workflow_source: LoadedSource,
+    replacement: Option<&AgentProfileReplacementDocument>,
 ) -> Result<ResolvedWorkflow, ResolutionFailure> {
     let document = decode(&workflow_source.bytes).map_err(|failure| {
         ResolutionFailure::new(
@@ -285,12 +318,38 @@ fn resolve_loaded_workflow(
             ResolutionLocation::Workflow,
         )
     })?;
-    let mut definition = validation::validate(document).map_err(|failure| {
+    // The selected workflow's own declared profiles are validated first so that a
+    // defective definition is reported as such rather than as a replacement failure.
+    let decoded_replacement = replacement
+        .map(|document| {
+            profile_replacement::decode(document.bytes()).map_err(|failure| {
+                ResolutionFailure::new(
+                    ResolutionFailureKind::InvalidReplacementDocument(failure.kind()),
+                    ResolutionLocation::AgentProfileReplacement,
+                )
+            })
+        })
+        .transpose()?;
+    let mut definition = validation::validate_with_replacement(
+        document,
+        decoded_replacement
+            .as_ref()
+            .map(|replacement| &replacement.profiles),
+    )
+    .map_err(|failure| {
         ResolutionFailure::new(
             ResolutionFailureKind::InvalidWorkflowDefinition(failure.kind()),
             ResolutionLocation::Semantic(failure.location().clone()),
         )
     })?;
+    let agent_profile_replacement = replacement.map(|document| {
+        let digest = ring::digest::digest(&SHA256, document.bytes());
+        ResolvedAgentProfileReplacement {
+            document: document.clone(),
+            digest: lowercase_hex(digest.as_ref()),
+            profiles: definition.replaced_agent_profiles.clone(),
+        }
+    });
 
     let Some(workflow_directory) = workflow_source.canonical_host_path.parent() else {
         return Err(ResolutionFailure::new(
@@ -340,6 +399,7 @@ fn resolve_loaded_workflow(
         },
         content_digest,
         capacity,
+        agent_profile_replacement,
     })
 }
 

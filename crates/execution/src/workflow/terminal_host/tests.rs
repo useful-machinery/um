@@ -2886,6 +2886,7 @@ fn complete_scripted_view(
         workflow_path: workflow.source.workflow_path.clone(),
         source_root: workflow.source.source_root.clone(),
         content_digest: workflow.content_digest.clone(),
+        agent_profile_replacement: None,
         execution_root: workflow.source.source_root.clone(),
         maximum_parallel_steps: NonZeroUsize::new(1).unwrap(),
         maximum_retained_bytes_per_stream: super::super::MAXIMUM_RETAINED_BYTES_PER_STREAM,

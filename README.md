@@ -360,6 +360,10 @@ um workflow validate \
   ./my-repository/.um/workflows/check.yaml
 ```
 
+`workflow validate` accepts the same `--agent-profiles <PATH>` replacement document as
+`workflow run`, applies it identically, and reports the replaced profile names without
+retaining the document.
+
 Ready-to-run command and agent bundles are available under
 [`examples/workflows/`](examples/workflows/). They cover basic DAGs, command input and
 output dataflow, recovery, advisory and required failures, cancellation, all three agent
@@ -550,6 +554,28 @@ with `--input-attachments-empty <NAME>`. JSON is strict and may be constrained b
 retained workflow schema. File media types are explicit and optional declaration constraints
 match exactly. All bindings are acquired before execution, and one Text or JSON file input
 may exclusively claim standard input. Workflow commands always receive closed standard input.
+
+`--agent-profiles <PATH>` replaces declared agent profiles for one invocation without
+editing the workflow. The file is a closed YAML document with `schemaVersion: 1` and an
+`agentProfiles` map whose keys name profiles the selected workflow declares and whose
+values are complete harness definitions in the ordinary Workflow V1 grammar. Each named
+profile is replaced as a whole, so every step, finalizer, and recovery handler that
+references it runs on the replacement; unnamed profiles keep their declarations. A
+replacement may select a different harness kind, and only the harnesses the effective
+profiles select must be installed. The document never changes the source-closure digest.
+Its exact bytes are retained with the run and reapplied by `retry` and `continue`, and
+`result.json` records the digest and effective configuration under
+`workflow.agentProfileReplacement`. The structural contract is
+[`schemas/agent-profile-replacement-v1.schema.json`](schemas/agent-profile-replacement-v1.schema.json).
+
+```sh
+um workflow run \
+  --source-root . \
+  --execution-root . \
+  --run-dir ~/.um/runs/review-002 \
+  --agent-profiles ~/.um/profiles/claude.yaml \
+  .um/workflows/review.yaml
+```
 
 Without `--plain` or `--json`, run uses the interactive terminal interface when stdin and
 stdout are terminals, `TERM` is present and neither empty nor `dumb`, and stdin is not

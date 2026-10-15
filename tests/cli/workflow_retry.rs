@@ -533,3 +533,81 @@ fn retry_terminal_json_output_failure_preserves_the_published_attempt() {
     assert!(stderr.contains("TerminalJsonWriter"));
     assert!(stderr.contains("attempts/000002/result"));
 }
+
+#[test]
+fn retry_reapplies_the_retained_agent_profile_replacement_after_the_document_is_removed() {
+    // The replaced profile is unused, so no harness installation is required and the
+    // test exercises retention and reapplication alone.
+    let bundle = RunBundle::new(
+        "schemaVersion: 1\nagentProfiles:\n  unused:\n    harness:\n      kind: pi\n      config:\n        model: fixture/model\n        thinking: low\nsteps:\n  execute:\n    kind: cmd\n    command:\n      argv: [sh, -c, 'test \"$RETRY_PHASE\" = retry']\n",
+    );
+    let document = bundle.initial_cwd().join("profiles.yaml");
+    fs::write(
+        &document,
+        "schemaVersion: 1\nagentProfiles:\n  unused:\n    harness:\n      kind: claude_code\n      config:\n        model: fixture/claude\n        effort: low\n",
+    )
+    .unwrap();
+    let run_directory = bundle.result("retained-replacement");
+    let mut args = bundle.args(&run_directory);
+    args.splice(
+        args.len() - 1..args.len() - 1,
+        [
+            "--agent-profiles".to_owned(),
+            document.to_string_lossy().into_owned(),
+            "--json".to_owned(),
+        ],
+    );
+    let initial = isolated_command(&args)
+        .env("RETRY_PHASE", "initial")
+        .output()
+        .unwrap();
+    assert_eq!(initial.status.code(), Some(1));
+    let read_result = |attempt: &str| -> serde_json::Value {
+        serde_json::from_slice(
+            &fs::read(run_directory.join(format!("attempts/{attempt}/result/result.json")))
+                .unwrap(),
+        )
+        .unwrap()
+    };
+    let first = read_result("000001");
+    assert_eq!(first["outcome"], "failed");
+    assert_eq!(
+        first["workflow"]["agentProfileReplacement"]["profiles"]["unused"]["harness"]["kind"],
+        "claude_code"
+    );
+    fs::write(&document, "schemaVersion: 1\nagentProfiles: {}\n").unwrap();
+    fs::remove_file(&document).unwrap();
+
+    let retry = isolated_command(&retry_args(
+        &run_directory,
+        bundle.execution_root(),
+        &["--json"],
+    ))
+    .env("RETRY_PHASE", "retry")
+    .output()
+    .unwrap();
+    assert!(
+        retry.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&retry.stdout),
+        String::from_utf8_lossy(&retry.stderr)
+    );
+    let terminal: serde_json::Value = serde_json::from_slice(&retry.stdout).unwrap();
+    assert_eq!(terminal["attemptNumber"], 2);
+    assert_eq!(terminal["outcome"], "succeeded");
+    let second = read_result("000002");
+    assert_eq!(
+        second["workflow"]["agentProfileReplacement"],
+        first["workflow"]["agentProfileReplacement"]
+    );
+
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(run_directory.join("workflow/manifest.json")).unwrap())
+            .unwrap();
+    let retained = run_directory.join("workflow").join(
+        manifest["agentProfileReplacement"]["relativeFile"]
+            .as_str()
+            .unwrap(),
+    );
+    assert!(retained.is_file());
+}

@@ -5,7 +5,7 @@ use clap::Args;
 use um_execution::{
     CancellationSource, LocalContinuationOpen, PendingLocalContinuation, WorkflowRunOutput,
     WorkflowRunPresentationResult, acquire_local_continuation, admit_local_continuation_workflow,
-    reconcile_current_result_publication, resolve_workflow_file,
+    reconcile_current_result_publication, resolve_workflow_file_with_agent_profiles,
 };
 
 pub(super) const ABOUT: &str = "Continue selected steps of a local workflow run";
@@ -77,8 +77,17 @@ impl Command {
         let workflow = if let Some(path) = &self.workflow {
             let root = original_root.clone();
             let selected = path.clone();
-            match super::run::blocking_operation(move || resolve_workflow_file(&root, &selected))
-                .await
+            // A continuation inherits the run's retained replacement, even under a
+            // replaced definition (Local Workflow Run CLI section 3.6.5).
+            let replacement = pending
+                .previous_definition()
+                .agent_profile_replacement
+                .as_ref()
+                .map(|replacement| replacement.document.clone());
+            match super::run::blocking_operation(move || {
+                resolve_workflow_file_with_agent_profiles(&root, &selected, replacement.as_ref())
+            })
+            .await
             {
                 Ok(workflow) => workflow,
                 Err(super::run::BlockingOperationError::Operation(failure)) => {

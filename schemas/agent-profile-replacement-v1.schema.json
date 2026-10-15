@@ -1,0 +1,96 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://docs.usefulmachinery.com/schemas/agent-profile-replacement-v1.schema.json",
+  "title": "Useful Machinery agent profile replacement version 1",
+  "description": "Structural contract for the closed document supplied through `um workflow run --agent-profiles`. Each key names an agent profile declared by the selected workflow; its value replaces that declaration as a whole.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "agentProfiles"],
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "agentProfiles": {
+      "type": "object",
+      "minProperties": 1,
+      "propertyNames": { "$ref": "#/$defs/Identifier" },
+      "additionalProperties": { "$ref": "#/$defs/AgentProfile" }
+    }
+  },
+  "$defs": {
+    "Identifier": {
+      "type": "string",
+      "maxLength": 64,
+      "pattern": "^[a-z][A-Za-z0-9]*$"
+    },
+    "PiConfig": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "model": { "type": "string", "minLength": 1 },
+        "thinking": {
+          "enum": ["off", "minimal", "low", "medium", "high", "xhigh", "max"]
+        }
+      },
+      "required": ["model", "thinking"]
+    },
+    "PiHarness": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "kind": { "const": "pi" },
+        "config": { "$ref": "#/$defs/PiConfig" }
+      },
+      "required": ["kind", "config"]
+    },
+    "ClaudeCodeConfig": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "model": { "type": "string", "minLength": 1 },
+        "effort": { "enum": ["low", "medium", "high", "xhigh", "max"] }
+      },
+      "required": ["model", "effort"]
+    },
+    "ClaudeCodeHarness": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "kind": { "const": "claude_code" },
+        "config": { "$ref": "#/$defs/ClaudeCodeConfig" }
+      },
+      "required": ["kind", "config"]
+    },
+    "CodexConfig": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "model": { "type": "string", "minLength": 1 },
+        "effort": { "type": "string", "minLength": 1 }
+      },
+      "required": ["model", "effort"]
+    },
+    "CodexHarness": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "kind": { "const": "codex" },
+        "config": { "$ref": "#/$defs/CodexConfig" }
+      },
+      "required": ["kind", "config"]
+    },
+    "AgentProfile": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "harness": {
+          "oneOf": [
+            { "$ref": "#/$defs/PiHarness" },
+            { "$ref": "#/$defs/ClaudeCodeHarness" },
+            { "$ref": "#/$defs/CodexHarness" }
+          ]
+        }
+      },
+      "required": ["harness"],
+      "description": "A complete replacement for one declared profile. Replacement grants no execution authority."
+    }
+  }
+}

@@ -44,8 +44,13 @@ use um_execution::{
     WorkflowTerminalHost, admit_local_workflow, command_output_v1, default_execution_policy_limits,
     discover_and_validate_claude_code_installation, discover_and_validate_codex_installation,
     discover_and_validate_pi_installation, execute_workflow, prepare_attempt_result_destination,
-    production_agent_dispatcher, publish_prepared_workflow_result, resolve_workflow_file,
-    step_recovery_summary_v1, summary_disposition_matches,
+    production_agent_dispatcher, publish_prepared_workflow_result,
+    resolve_workflow_file_with_agent_profiles, step_recovery_summary_v1,
+    summary_disposition_matches,
+};
+use um_execution::{
+    AgentProfileReplacementDocument, AgentProfileReplacementV1,
+    MAXIMUM_AGENT_PROFILE_REPLACEMENT_BYTES,
 };
 
 pub(super) const ABOUT: &str = "Run a local command and agent workflow";
@@ -91,6 +96,13 @@ pub(super) struct Command {
 
     #[arg(
         long,
+        value_name = "PATH",
+        help = "Replace declared agent profiles with the closed replacement document at PATH"
+    )]
+    agent_profiles: Option<PathBuf>,
+
+    #[arg(
+        long,
         value_name = "COUNT",
         default_value_t = 1,
         value_parser = parse_parallelism,
@@ -129,22 +141,31 @@ impl Command {
                 }
                 _ => error.into(),
             })?;
+        let replacement = match &self.agent_profiles {
+            Some(path) => Some(acquire_agent_profile_replacement(path, &cancellation)?),
+            None => None,
+        };
         let source_root = self.source.source_root.clone();
         let workflow_file = self.source.workflow_file.clone();
-        let workflow =
-            match blocking_operation(move || resolve_workflow_file(&source_root, &workflow_file))
-                .await
-            {
-                Ok(workflow) => workflow,
-                Err(BlockingOperationError::Operation(failure)) => {
-                    return rejection_output(presentation_config, |output| {
-                        output.render_resolution_rejection(&failure)
-                    });
-                }
-                Err(BlockingOperationError::WorkerUnavailable) => {
-                    return Err(anyhow!("resolve local workflow definition").into());
-                }
-            };
+        let workflow = match blocking_operation(move || {
+            resolve_workflow_file_with_agent_profiles(
+                &source_root,
+                &workflow_file,
+                replacement.as_ref(),
+            )
+        })
+        .await
+        {
+            Ok(workflow) => workflow,
+            Err(BlockingOperationError::Operation(failure)) => {
+                return rejection_output(presentation_config, |output| {
+                    output.render_resolution_rejection(&failure)
+                });
+            }
+            Err(BlockingOperationError::WorkerUnavailable) => {
+                return Err(anyhow!("resolve local workflow definition").into());
+            }
+        };
         let workflow_for_context = workflow.clone();
         let execution_root = self.execution.execution_root;
         let maximum_parallel_steps = self.max_parallel;
@@ -1446,6 +1467,35 @@ fn input_bytes_error() -> anyhow::Error {
     anyhow!("acquire local workflow inputs: an input byte bound was exceeded")
 }
 
+/// Acquire the exact bytes of an agent profile replacement document under the Local
+/// Workflow Run CLI section 3.6.3 rules. Failures name the cause but never the path.
+pub(super) fn acquire_agent_profile_replacement(
+    path: &Path,
+    cancellation: &CancellationSource,
+) -> Result<AgentProfileReplacementDocument, super::super::CommandFailure> {
+    let acquire = || -> Result<AgentProfileReplacementDocument, InputAcquisitionFailureKind> {
+        let file = open_regular_input(path)?;
+        let bytes = read_bounded(file, MAXIMUM_AGENT_PROFILE_REPLACEMENT_BYTES, cancellation)?;
+        if std::str::from_utf8(&bytes).is_err() {
+            return Err(InputAcquisitionFailureKind::InvalidUtf8);
+        }
+        Ok(AgentProfileReplacementDocument::new(bytes))
+    };
+    acquire().map_err(|kind| {
+        let error = anyhow!("agent profile replacement document: {kind}");
+        match (kind, cancellation.cancellation_reason()) {
+            (InputAcquisitionFailureKind::Interrupted, Some(CancellationReason::UserRequest)) => {
+                super::super::CommandFailure::for_outcome(error, OutcomeClass::Interrupted)
+            }
+            (
+                InputAcquisitionFailureKind::Interrupted,
+                Some(CancellationReason::TerminationRequest),
+            ) => super::super::CommandFailure::for_outcome(error, OutcomeClass::Terminated),
+            _ => error.into(),
+        }
+    })
+}
+
 fn open_regular_input(path: &Path) -> Result<File, InputAcquisitionFailureKind> {
     super::super::open_regular_file_nonblocking(path).map_err(|error| match error {
         super::super::OpenRegularFileError::NotRegular => {
@@ -2344,6 +2394,10 @@ fn build_run_result(
         workflow_path: execution.provenance.workflow_path,
         source_root: execution.provenance.source_root,
         content_digest: execution.content_digest,
+        agent_profile_replacement: workflow
+            .agent_profile_replacement
+            .as_ref()
+            .map(AgentProfileReplacementV1::from_resolved),
         execution_root: admitted.execution().root().to_owned(),
         maximum_parallel_steps: admitted.execution().limits().maximum_parallel_steps(),
         maximum_retained_bytes_per_stream: admitted
@@ -3112,6 +3166,7 @@ mod tests {
                 execution_root: PathBuf::from("execution"),
             },
             run_dir: PathBuf::from("run"),
+            agent_profiles: None,
             inputs: super::super::super::NamedInputArgs {
                 input_text: Vec::new(),
                 input_text_file: Vec::new(),

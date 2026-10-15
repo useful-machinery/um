@@ -31,7 +31,8 @@ fn semantic_class(path: &str, long: &str) -> Option<String> {
         | "input-json-file"
         | "input-file"
         | "input-attachment"
-        | "input-attachments-empty" => long,
+        | "input-attachments-empty"
+        | "agent-profiles" => long,
         // Only these paths flatten PaginationArgs. Other options named --limit
         // do not acquire pagination semantics just by sharing the spelling.
         "limit" => match path {

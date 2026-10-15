@@ -2749,6 +2749,11 @@ mod tests {
                 workflow_path: admitted.workflow().source.workflow_path.clone(),
                 source_root: admitted.execution().root().to_owned(),
                 content_digest: admitted.workflow().content_digest.clone(),
+                agent_profile_replacement: admitted
+                    .workflow()
+                    .agent_profile_replacement
+                    .as_ref()
+                    .map(um_execution::AgentProfileReplacementV1::from_resolved),
                 execution_root: admitted.execution().root().to_owned(),
                 maximum_parallel_steps: admitted.execution().limits().maximum_parallel_steps(),
                 maximum_retained_bytes_per_stream: admitted

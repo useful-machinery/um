@@ -51,6 +51,8 @@ pub struct ValidatedWorkflow {
     pub(crate) required_inputs: RequiredInputs,
     pub(crate) input_json_schema_paths: BTreeMap<String, String>,
     pub(crate) input_file_media_types: BTreeMap<String, String>,
+    /// Profiles replaced at invocation time, with their pinned effective configuration.
+    pub(crate) replaced_agent_profiles: BTreeMap<String, ValidatedHarness>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

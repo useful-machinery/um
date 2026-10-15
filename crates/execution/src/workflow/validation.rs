@@ -8,10 +8,10 @@ use super::condition::{
     ConditionValueKind, JsonPointer, ResolvedOperand, ResolvedPredicate, ResolvedSelector,
 };
 use super::document::{
-    Agent, CommonNode, ConditionOperand, ConditionPredicate, ExportPresentation, FailurePolicy,
-    FinalizerDefinition, HarnessDefinition, InputDeclaration, MessageSource, NodeBody, Output,
-    OutputReference, PresentationSource, RecoveryHandler, StepDefinition, StepRecovery,
-    ValueReference, WorkflowDocument,
+    Agent, AgentProfile, CommonNode, ConditionOperand, ConditionPredicate, ExportPresentation,
+    FailurePolicy, FinalizerDefinition, HarnessDefinition, InputDeclaration, MessageSource,
+    NodeBody, Output, OutputReference, PresentationSource, RecoveryHandler, StepDefinition,
+    StepRecovery, ValueReference, WorkflowDocument,
 };
 use super::evidence::{MAXIMUM_PREREQUISITES, Prerequisite};
 use super::export_presentation::{Field, resolve_text};
@@ -39,6 +39,8 @@ pub(crate) enum ValidationFailureKind {
     DependencyCycle,
     InvalidAgentProfileConfig,
     UnknownAgentProfile,
+    UnknownReplacementProfile,
+    InvalidReplacementProfileConfig,
     UnknownInput,
     UnknownOutputStep,
     UnknownOutput,
@@ -80,6 +82,7 @@ pub(crate) enum ValidationLocation {
     WorkflowGraph,
     WorkflowNamespace,
     AgentProfile { profile: String },
+    AgentProfileReplacement { profile: String },
     AgentProfileReference { step: String },
     RecoveryAgentProfileReference { step: String },
     FinalizerAgentProfileReference { finalizer: String },
@@ -131,10 +134,45 @@ struct ValidatedGraph {
     presentation_order: Vec<String>,
 }
 
+#[cfg(test)]
 pub(crate) fn validate(document: WorkflowDocument) -> Result<ValidatedWorkflow, ValidationFailure> {
+    validate_with_replacement(document, None)
+}
+
+/// Validate a document, replacing declared agent profiles as a whole by name.
+///
+/// Replacement happens after every declared profile is syntax-validated and before any
+/// step, finalizer, or recovery-handler reference is pinned, so each reference to a
+/// replaced name pins the replacement. Unknown names and invalid configurations are
+/// rejected in ascending name order.
+pub(crate) fn validate_with_replacement(
+    document: WorkflowDocument,
+    replacement: Option<&BTreeMap<String, AgentProfile>>,
+) -> Result<ValidatedWorkflow, ValidationFailure> {
     validate_node_namespace(&document)?;
     validate_workflow_condition_bounds(&document)?;
-    let agent_profiles = validate_agent_profiles(&document)?;
+    let mut agent_profiles = validate_agent_profiles(&document)?;
+    let mut replaced_agent_profiles = BTreeMap::new();
+    for (name, profile) in replacement.into_iter().flatten() {
+        if !agent_profiles.contains_key(name) {
+            return Err(ValidationFailure::new(
+                ValidationFailureKind::UnknownReplacementProfile,
+                ValidationLocation::AgentProfileReplacement {
+                    profile: name.clone(),
+                },
+            ));
+        }
+        let harness = validate_harness(&profile.harness).ok_or_else(|| {
+            ValidationFailure::new(
+                ValidationFailureKind::InvalidReplacementProfileConfig,
+                ValidationLocation::AgentProfileReplacement {
+                    profile: name.clone(),
+                },
+            )
+        })?;
+        agent_profiles.insert(name.clone(), harness.clone());
+        replaced_agent_profiles.insert(name.clone(), harness);
+    }
     let step_graph = validate_step_graph(&document)?;
     let finalizer_graph = validate_finalizer_graph(&document)?;
     validate_output_rules(&document)?;
@@ -250,6 +288,7 @@ pub(crate) fn validate(document: WorkflowDocument) -> Result<ValidatedWorkflow, 
         required_inputs,
         input_json_schema_paths,
         input_file_media_types,
+        replaced_agent_profiles,
     })
 }
 
@@ -1644,20 +1683,22 @@ fn validate_agent_profiles(
                     },
                 )
             };
-            let harness = match &profile.harness {
-                HarnessDefinition::Pi { config } => pi::resolve_config(config)
-                    .map(ValidatedHarness::Pi)
-                    .ok_or_else(invalid_config)?,
-                HarnessDefinition::ClaudeCode { config } => claude_code::resolve_config(config)
-                    .map(ValidatedHarness::ClaudeCode)
-                    .ok_or_else(invalid_config)?,
-                HarnessDefinition::Codex { config } => codex::resolve_config(config)
-                    .map(ValidatedHarness::Codex)
-                    .ok_or_else(invalid_config)?,
-            };
+            let harness = validate_harness(&profile.harness).ok_or_else(invalid_config)?;
             Ok((name.clone(), harness))
         })
         .collect()
+}
+
+fn validate_harness(harness: &HarnessDefinition) -> Option<ValidatedHarness> {
+    match harness {
+        HarnessDefinition::Pi { config } => pi::resolve_config(config).map(ValidatedHarness::Pi),
+        HarnessDefinition::ClaudeCode { config } => {
+            claude_code::resolve_config(config).map(ValidatedHarness::ClaudeCode)
+        }
+        HarnessDefinition::Codex { config } => {
+            codex::resolve_config(config).map(ValidatedHarness::Codex)
+        }
+    }
 }
 
 fn resolve_agent_profile(

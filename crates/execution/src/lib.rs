@@ -109,20 +109,22 @@ pub use workflow::process_group::{
     SystemProcessIdentityInspector, terminate_authenticated_process_group,
 };
 pub use workflow::publication::{
-    CloudCarrierBody, CloudContinuationEvidence, CloudExecutionCapacityV1, CloudResultCarrier,
-    CloudSourceDisplayRepositoryV1, CloudSourceDisplaySnapshotV1, ContinuationRecordV1, DigestV1,
-    LocalPublicationError, LocalPublicationPhase, PreparedCloudWorkflowResult,
-    RecoveryDiagnosticKindV1, RecoveryInvocationDiagnosticV1, RecoveryInvocationRoleV1,
-    RecoveryInvocationStateV1, RecoveryInvocationUsageV1, RecoveryInvocationV1, WorkflowResultV1,
-    WorkflowRunCancellation, WorkflowRunFinalization, WorkflowRunFinalizationCancellation,
-    WorkflowRunResult, WorkflowRunStep, WorkflowRunStepKind, WorkflowRunTerminalResultV1,
-    WorkflowRunTiming, WorkflowStepTiming, cloud_continuation_record, command_output_v1,
-    prepare_attempt_result_destination, prepare_cloud_workflow_result,
+    AgentProfileReplacementV1, CloudCarrierBody, CloudContinuationEvidence,
+    CloudExecutionCapacityV1, CloudResultCarrier, CloudSourceDisplayRepositoryV1,
+    CloudSourceDisplaySnapshotV1, ContinuationRecordV1, DigestV1, LocalPublicationError,
+    LocalPublicationPhase, PreparedCloudWorkflowResult, RecoveryDiagnosticKindV1,
+    RecoveryInvocationDiagnosticV1, RecoveryInvocationRoleV1, RecoveryInvocationStateV1,
+    RecoveryInvocationUsageV1, RecoveryInvocationV1, ReplacedAgentProfileV1, ReplacedHarnessV1,
+    WorkflowResultV1, WorkflowRunCancellation, WorkflowRunFinalization,
+    WorkflowRunFinalizationCancellation, WorkflowRunResult, WorkflowRunStep, WorkflowRunStepKind,
+    WorkflowRunTerminalResultV1, WorkflowRunTiming, WorkflowStepTiming, cloud_continuation_record,
+    command_output_v1, prepare_attempt_result_destination, prepare_cloud_workflow_result,
     publish_prepared_workflow_result, step_recovery_summary_v1, summary_disposition_matches,
 };
 pub use workflow::rejection::{RejectionDiagnostic, human_resolution_remedy};
 pub use workflow::resolution::{
-    ResolutionFailure, ResolvedWorkflow, resolve, resolve_workflow_file,
+    ResolutionFailure, ResolvedWorkflow, resolve, resolve_with_agent_profiles,
+    resolve_workflow_file, resolve_workflow_file_with_agent_profiles,
 };
 pub use workflow::result_validation::{
     internal_worker_requested as result_validation_worker_requested,
@@ -239,6 +241,10 @@ pub use workflow::validated::ValidatedCommonStep;
 pub use workflow::validated::ValidatedFinalizer;
 pub use workflow::validated::ValidatedStepRecovery;
 pub use workflow::validated::ValidatedWorkflow;
+pub use workflow::{
+    AGENT_PROFILE_REPLACEMENT_SCHEMA, AgentProfileReplacementDocument,
+    MAXIMUM_AGENT_PROFILE_REPLACEMENT_BYTES, ResolvedAgentProfileReplacement,
+};
 
 pub use claude_code::ClaudeCodeStreamJsonV1Capabilities;
 pub use codex::CodexAppServerV1Capabilities;

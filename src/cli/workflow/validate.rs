@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::io::{self, Write};
+use std::path::PathBuf;
 
 use anyhow::Context;
 use clap::Args;
@@ -7,8 +8,9 @@ use serde::Serialize;
 
 use crate::exit_code::ExitCode;
 use um_execution::{
-    RejectionDiagnostic as Diagnostic, ResolutionFailure, ResolvedWorkflow,
-    human_resolution_remedy, resolve_workflow_file,
+    CancellationSource, RejectionDiagnostic as Diagnostic, ReplacedAgentProfileV1,
+    ReplacedHarnessV1, ResolutionFailure, ResolvedWorkflow, human_resolution_remedy,
+    resolve_workflow_file_with_agent_profiles,
 };
 
 pub(super) const ABOUT: &str = "Validate a local workflow definition";
@@ -19,13 +21,31 @@ pub(super) struct Command {
     #[command(flatten)]
     source: super::LocalWorkflowSource,
 
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Replace declared agent profiles with the closed replacement document at PATH"
+    )]
+    agent_profiles: Option<PathBuf>,
+
     #[command(flatten)]
     output: super::super::JsonArgs<super::super::WorkflowJson>,
 }
 
 impl Command {
     pub(super) fn execute(self) -> super::super::CommandResult {
-        match resolve_workflow_file(&self.source.source_root, &self.source.workflow_file) {
+        let replacement = match &self.agent_profiles {
+            Some(path) => Some(super::run::acquire_agent_profile_replacement(
+                path,
+                &CancellationSource::new(),
+            )?),
+            None => None,
+        };
+        match resolve_workflow_file_with_agent_profiles(
+            &self.source.source_root,
+            &self.source.workflow_file,
+            replacement.as_ref(),
+        ) {
             Ok(workflow) => {
                 let result = if self.output.json {
                     write_json_valid(&workflow)
@@ -73,6 +93,18 @@ fn write_human_valid(workflow: &ResolvedWorkflow) -> anyhow::Result<()> {
         "required inputs: {}",
         human_required_inputs(workflow)
     )?;
+    if let Some(replacement) = &workflow.agent_profile_replacement {
+        writeln!(
+            stdout,
+            "replaced agent profiles: {}",
+            replacement
+                .profiles
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .join(", ")
+        )?;
+    }
     Ok(())
 }
 
@@ -134,6 +166,22 @@ fn write_json_valid(workflow: &ResolvedWorkflow) -> anyhow::Result<()> {
             step_count: workflow.definition.steps.len(),
             finalizer_count: workflow.definition.finalizers.len(),
             required_inputs,
+            replaced_agent_profiles: workflow.agent_profile_replacement.as_ref().map(
+                |replacement| {
+                    replacement
+                        .profiles
+                        .iter()
+                        .map(|(name, harness)| {
+                            (
+                                name.as_str(),
+                                ReplacedAgentProfileV1 {
+                                    harness: ReplacedHarnessV1::from(harness),
+                                },
+                            )
+                        })
+                        .collect()
+                },
+            ),
         },
     };
     write_json(&report)
@@ -178,6 +226,11 @@ enum JsonResult<'a> {
         finalizer_count: usize,
         #[serde(rename = "requiredInputs")]
         required_inputs: BTreeMap<&'a str, &'static str>,
+        #[serde(
+            rename = "replacedAgentProfiles",
+            skip_serializing_if = "Option::is_none"
+        )]
+        replaced_agent_profiles: Option<BTreeMap<&'a str, ReplacedAgentProfileV1>>,
     },
     Invalid {
         workflow: Option<WorkflowIdentity<'a>>,

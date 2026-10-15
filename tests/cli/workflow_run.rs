@@ -5724,3 +5724,208 @@ fn signal_command_fixture() {
     let mut blocked = [0_u8; 1];
     let _ = control.read(&mut blocked);
 }
+
+fn agent_profile_replacement_document(
+    profile: &str,
+    kind: &str,
+    model: &str,
+    level: &str,
+) -> String {
+    let level_key = if kind == "pi" { "thinking" } else { "effort" };
+    format!(
+        "schemaVersion: 1\nagentProfiles:\n  {profile}:\n    harness:\n      kind: {kind}\n      config:\n        model: {model}\n        {level_key}: {level}\n"
+    )
+}
+
+fn run_with_agent_profiles(bundle: &RunBundle, destination: &Path, document: &Path) -> Vec<String> {
+    let mut args = bundle.args(destination);
+    args.splice(
+        args.len() - 1..args.len() - 1,
+        [
+            "--agent-profiles".to_owned(),
+            document.to_string_lossy().into_owned(),
+            "--json".to_owned(),
+        ],
+    );
+    args
+}
+
+#[test]
+fn agent_profile_replacement_pins_the_replacement_harness_and_records_provenance() {
+    let claude = ClaudeCodeFixture::with_execution(
+        "2.1.296 (Claude Code)",
+        CLAUDE_CODE_COMPLETE_HELP,
+        true,
+        response_claude_code_execution(),
+    );
+    // The workflow declares only a Pi profile; the replacement selects Claude Code and
+    // no Pi installation is on PATH.
+    let bundle = RunBundle::new(response_agent_source());
+    bundle.write_source("system.md", "system");
+    bundle.write_source("message.md", "prompt");
+    let document = bundle.initial_cwd().join("claude-profiles.yaml");
+    fs::write(
+        &document,
+        agent_profile_replacement_document("local", "claude_code", "fixture/claude", "xhigh"),
+    )
+    .unwrap();
+    let destination = bundle.result("replaced-profile");
+    let output = isolated_command(&run_with_agent_profiles(&bundle, &destination, &document))
+        .env(
+            "PATH",
+            fixture_path_with_host_tools(&[claude.path_directory()]),
+        )
+        .env("CLAUDE_CONFIG_DIR", bundle.claude_config())
+        .env("ANTHROPIC_API_KEY", "synthetic-credential-sentinel")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read(attempt_result(&destination).join("exports/0001")).unwrap(),
+        b"claude response"
+    );
+    let result = result_json(&destination);
+    let replacement = &result["workflow"]["agentProfileReplacement"];
+    assert_eq!(
+        replacement["profiles"],
+        serde_json::json!({
+            "local": {
+                "harness": {
+                    "kind": "claude_code",
+                    "config": {"model": "fixture/claude", "effort": "xhigh"}
+                }
+            }
+        })
+    );
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(destination.join("workflow/manifest.json")).unwrap())
+            .unwrap();
+    let retained = &manifest["agentProfileReplacement"];
+    assert_eq!(replacement["digest"], retained["digest"]);
+    assert_eq!(
+        fs::read(
+            destination
+                .join("workflow")
+                .join(retained["relativeFile"].as_str().unwrap())
+        )
+        .unwrap(),
+        fs::read(&document).unwrap()
+    );
+    // The source closure is unchanged by the replacement.
+    assert!(
+        manifest["sourceFiles"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|file| file["path"] != "claude-profiles.yaml")
+    );
+
+    let view = isolated_command(&[
+        "workflow".to_owned(),
+        "view".to_owned(),
+        destination.to_string_lossy().into_owned(),
+        "--json".to_owned(),
+    ])
+    .output()
+    .unwrap();
+    assert!(view.status.success());
+    let view: serde_json::Value = serde_json::from_slice(&view.stdout).unwrap();
+    assert_eq!(
+        view["result"]["workflow"]["agentProfileReplacement"],
+        *replacement
+    );
+}
+
+#[test]
+fn agent_profile_replacement_rejections_are_typed_before_any_step_starts() {
+    let bundle = RunBundle::new(response_agent_source());
+    bundle.write_source("system.md", "system");
+    bundle.write_source("message.md", "prompt");
+    let cases = [
+        (
+            "unknown",
+            agent_profile_replacement_document("missing", "claude_code", "fixture/claude", "low"),
+            "unknown_replacement_profile",
+            Some("missing"),
+        ),
+        (
+            "empty-effort",
+            agent_profile_replacement_document("local", "codex", "fixture/codex", "\"\""),
+            "invalid_replacement_document",
+            None,
+        ),
+        (
+            "empty",
+            "schemaVersion: 1\nagentProfiles: {}\n".to_owned(),
+            "invalid_replacement_document",
+            None,
+        ),
+        (
+            "translated-thinking",
+            agent_profile_replacement_document("local", "claude_code", "fixture/claude", "xhigh")
+                .replace("effort: xhigh", "thinking: xhigh"),
+            "invalid_replacement_document",
+            None,
+        ),
+    ];
+    let documents = bundle.initial_cwd().join("replacement-path-sentinel");
+    fs::create_dir(&documents).unwrap();
+    for (name, document_bytes, code, profile) in cases {
+        let document = documents.join(format!("{name}.yaml"));
+        fs::write(&document, document_bytes).unwrap();
+        let destination = bundle.result(name);
+        let output = isolated_command(&run_with_agent_profiles(&bundle, &destination, &document))
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(1), "{name}");
+        let terminal: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(terminal["outcome"], "rejected", "{name}");
+        assert_eq!(terminal["phase"], "resolution", "{name}");
+        let diagnostic = &terminal["diagnostics"][0];
+        assert_eq!(diagnostic["code"], code, "{name}");
+        assert_eq!(
+            diagnostic["location"]["kind"], "agent_profile_replacement",
+            "{name}"
+        );
+        match profile {
+            Some(profile) => assert_eq!(diagnostic["location"]["profile"], profile, "{name}"),
+            None => assert!(diagnostic["location"].get("profile").is_none(), "{name}"),
+        }
+        assert!(!destination.exists(), "{name}");
+        let rendered = String::from_utf8_lossy(&output.stdout);
+        assert!(!rendered.contains("fixture/"), "{name}: {rendered}");
+        assert!(
+            !rendered.contains("replacement-path-sentinel"),
+            "{name}: {rendered}"
+        );
+    }
+
+    // A defective declared profile is reported as the workflow's own failure even when
+    // a replacement names it; an empty model fails the workflow's structural contract.
+    let broken =
+        RunBundle::new(&response_agent_source().replace("model: fixture/model", "model: \"\""));
+    broken.write_source("system.md", "system");
+    broken.write_source("message.md", "prompt");
+    let document = broken.initial_cwd().join("replacement.yaml");
+    fs::write(
+        &document,
+        agent_profile_replacement_document("local", "claude_code", "fixture/claude", "low"),
+    )
+    .unwrap();
+    let destination = broken.result("declared-failure-wins");
+    let output = isolated_command(&run_with_agent_profiles(&broken, &destination, &document))
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    let terminal: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        terminal["diagnostics"][0]["code"],
+        "invalid_workflow_structure"
+    );
+    assert_eq!(terminal["diagnostics"][0]["location"]["kind"], "workflow");
+}

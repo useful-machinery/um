@@ -139,6 +139,9 @@ impl<'a> RejectionLocation<'a> {
             ResolutionLocation::SourceRoot => Self::simple("source_root"),
             ResolutionLocation::Workflow => Self::simple("workflow"),
             ResolutionLocation::Semantic(location) => Self::from_validation(location),
+            ResolutionLocation::AgentProfileReplacement => {
+                Self::simple("agent_profile_replacement")
+            }
             ResolutionLocation::SystemPrompt { step } => Self::for_step("system_prompt", step),
             ResolutionLocation::MessageText { step, index } => Self {
                 index: Some(*index),
@@ -184,6 +187,10 @@ impl<'a> RejectionLocation<'a> {
             ValidationLocation::AgentProfile { profile } => Self {
                 profile: Some(profile),
                 ..Self::simple("agent_profile")
+            },
+            ValidationLocation::AgentProfileReplacement { profile } => Self {
+                profile: Some(profile),
+                ..Self::simple("agent_profile_replacement")
             },
             ValidationLocation::AgentProfileReference { step } => {
                 Self::for_step("agent_profile_reference", step)
@@ -385,6 +392,10 @@ fn resolution_classification(kind: ResolutionFailureKind) -> (&'static str, &'st
         ),
         ResolutionFailureKind::InvalidWorkflowDocument(kind) => decode_classification(kind),
         ResolutionFailureKind::InvalidWorkflowDefinition(kind) => validation_classification(kind),
+        ResolutionFailureKind::InvalidReplacementDocument(_) => (
+            "invalid_replacement_document",
+            "Supply one closed agent profile replacement document with schemaVersion 1 and a nonempty agentProfiles map.",
+        ),
         ResolutionFailureKind::InvalidTextEncoding => (
             "invalid_text_encoding",
             "Encode the system prompt or message text source as UTF-8.",
@@ -490,6 +501,14 @@ fn validation_classification(kind: ValidationFailureKind) -> (&'static str, &'st
         ValidationFailureKind::UnknownAgentProfile => (
             "unknown_agent_profile",
             "Reference an agent profile declared by this workflow.",
+        ),
+        ValidationFailureKind::UnknownReplacementProfile => (
+            "unknown_replacement_profile",
+            "Replace only agent profiles declared by the selected workflow.",
+        ),
+        ValidationFailureKind::InvalidReplacementProfileConfig => (
+            "invalid_replacement_profile_config",
+            "Correct the replacement profile's harness configuration.",
         ),
         ValidationFailureKind::UnknownInput => (
             "unknown_input",

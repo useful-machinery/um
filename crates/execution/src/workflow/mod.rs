@@ -40,6 +40,7 @@ pub(crate) mod presentation;
 pub(crate) mod presentation_feed;
 mod private_staging;
 pub(crate) mod process_group;
+pub(crate) mod profile_replacement;
 pub(crate) mod publication;
 pub(crate) mod recovery;
 pub(crate) mod rejection;
@@ -74,6 +75,10 @@ use document::WorkflowDocument;
 pub use canonical_json::CanonicalJsonError;
 pub use claude_code::ClaudeCodeConfig;
 pub use pi::PiConfig;
+pub use profile_replacement::{
+    AGENT_PROFILE_REPLACEMENT_SCHEMA, AgentProfileReplacementDocument,
+    MAXIMUM_AGENT_PROFILE_REPLACEMENT_BYTES, ResolvedAgentProfileReplacement,
+};
 
 pub const STRUCTURAL_SCHEMA: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),

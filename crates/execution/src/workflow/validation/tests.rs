@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use super::super::claude_code::{ClaudeCodeConfig, ClaudeCodeEffort};
 use super::super::decode;
 use super::super::document::{
@@ -1851,4 +1853,180 @@ fn workflow_node_evidence_definition_limit_applies_to_steps_and_finalizers() {
             }
         }
     }
+}
+
+fn replacement_profiles(source: &str) -> BTreeMap<String, super::super::document::AgentProfile> {
+    super::super::profile_replacement::decode(source.as_bytes())
+        .unwrap()
+        .profiles
+}
+
+const REPLACEABLE_SOURCE: &str = "schemaVersion: 1
+agentProfiles:
+  coding:
+    harness:
+      kind: pi
+      config:
+        model: openai/gpt-5
+        thinking: xhigh
+  review:
+    harness:
+      kind: pi
+      config:
+        model: openai/gpt-4.1
+        thinking: low
+steps:
+  implement:
+    kind: agent
+    agent:
+      profile: coding
+      systemPrompt: prompts/system.md
+      message:
+        text:
+          - file: prompts/message.md
+  verify:
+    kind: cmd
+    recovery:
+      retries: 1
+      handler:
+        kind: agent
+        profile: coding
+        prompt: prompts/repair.md
+    command: {argv: [\"true\"]}
+finalizers:
+  summarize:
+    kind: agent
+    agent:
+      profile: review
+      systemPrompt: prompts/system.md
+      message:
+        text:
+          - file: prompts/message.md
+";
+
+#[test]
+fn agent_profile_replacement_pins_every_reference_as_a_whole_without_translation() {
+    let replacement = replacement_profiles(
+        "schemaVersion: 1\nagentProfiles:\n  coding:\n    harness:\n      kind: claude_code\n      config:\n        model: example/claude\n        effort: low\n",
+    );
+    let workflow = super::validate_with_replacement(
+        decode(REPLACEABLE_SOURCE.as_bytes()).unwrap(),
+        Some(&replacement),
+    )
+    .unwrap();
+    let expected = ValidatedHarness::ClaudeCode(ClaudeCodeConfig {
+        model: "example/claude".to_owned(),
+        effort: ClaudeCodeEffort::Low,
+    });
+    let ValidatedStep::Agent(step) = &workflow.steps["implement"] else {
+        panic!("implement must be an agent step");
+    };
+    assert_eq!(step.agent.harness, expected);
+    let Some(super::super::validated::ValidatedRecoveryHandler::Agent { harness, .. }) =
+        &workflow.recoveries["verify"].as_ref().unwrap().handler
+    else {
+        panic!("verify must have an agent recovery handler");
+    };
+    assert_eq!(harness, &expected);
+    let ValidatedStep::Agent(finalizer) = &workflow.finalizers["summarize"].body else {
+        panic!("summarize must be an agent finalizer");
+    };
+    assert_eq!(
+        finalizer.agent.harness,
+        ValidatedHarness::Pi(PiConfig {
+            model: "openai/gpt-4.1".to_owned(),
+            thinking: Thinking::Low,
+        })
+    );
+    assert_eq!(
+        workflow.replaced_agent_profiles,
+        BTreeMap::from([("coding".to_owned(), expected)])
+    );
+
+    let unreplaced = super::validate(decode(REPLACEABLE_SOURCE.as_bytes()).unwrap()).unwrap();
+    assert!(unreplaced.replaced_agent_profiles.is_empty());
+
+    // Replacing an unused declared profile is valid and has no runtime effect.
+    let unused_only = super::validate_with_replacement(
+        decode(REPLACEABLE_SOURCE.as_bytes()).unwrap(),
+        Some(&replacement_profiles(
+            "schemaVersion: 1\nagentProfiles:\n  review:\n    harness:\n      kind: codex\n      config:\n        model: example/codex\n        effort: medium\n",
+        )),
+    )
+    .unwrap();
+    assert_eq!(unused_only.steps, unreplaced.steps);
+    assert_eq!(unused_only.replaced_agent_profiles.len(), 1);
+}
+
+#[test]
+fn agent_profile_replacement_failures_are_typed_and_ordered_after_declared_failures() {
+    let document = || decode(REPLACEABLE_SOURCE.as_bytes()).unwrap();
+    let failure = super::validate_with_replacement(
+        document(),
+        Some(&replacement_profiles(
+            "schemaVersion: 1\nagentProfiles:\n  missing:\n    harness:\n      kind: pi\n      config:\n        model: openai/gpt-5\n        thinking: low\n",
+        )),
+    )
+    .unwrap_err();
+    assert_eq!(
+        failure.kind(),
+        ValidationFailureKind::UnknownReplacementProfile
+    );
+    assert_eq!(
+        failure.location(),
+        &ValidationLocation::AgentProfileReplacement {
+            profile: "missing".to_owned(),
+        }
+    );
+
+    let invalid_config = |name: &str| {
+        (
+            name.to_owned(),
+            super::super::document::AgentProfile {
+                harness: HarnessDefinition::Pi {
+                    config: serde_json::json!({"model": "", "thinking": "low"}),
+                },
+            },
+        )
+    };
+    // `coding` precedes `missing` in name order, so its invalid configuration is
+    // reported before the unknown name.
+    let mut replacement = replacement_profiles(
+        "schemaVersion: 1\nagentProfiles:\n  missing:\n    harness:\n      kind: pi\n      config:\n        model: openai/gpt-5\n        thinking: low\n",
+    );
+    replacement.extend([invalid_config("coding")]);
+    let failure = super::validate_with_replacement(document(), Some(&replacement)).unwrap_err();
+    assert_eq!(
+        failure.kind(),
+        ValidationFailureKind::InvalidReplacementProfileConfig
+    );
+    assert_eq!(
+        failure.location(),
+        &ValidationLocation::AgentProfileReplacement {
+            profile: "coding".to_owned(),
+        }
+    );
+
+    // A defective declared profile is the workflow's own failure even when replaced.
+    let mut broken = document();
+    broken.agent_profiles.get_mut("review").unwrap().harness = HarnessDefinition::Pi {
+        config: serde_json::json!({"model": "", "thinking": "low"}),
+    };
+    let failure = super::validate_with_replacement(
+        broken,
+        Some(&replacement_profiles(
+            "schemaVersion: 1\nagentProfiles:\n  review:\n    harness:\n      kind: claude_code\n      config:\n        model: example/claude\n        effort: low\n",
+        )),
+    )
+    .unwrap_err();
+    assert_eq!(
+        failure.kind(),
+        ValidationFailureKind::InvalidAgentProfileConfig
+    );
+    assert_eq!(
+        failure.location(),
+        &ValidationLocation::AgentProfile {
+            profile: "review".to_owned(),
+        }
+    );
 }

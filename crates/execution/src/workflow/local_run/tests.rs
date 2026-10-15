@@ -403,6 +403,7 @@ fn retained_manifest_rejects_source_files_out_of_canonical_order() {
             source_file("auxiliary.txt", 2),
         ],
         inputs: BTreeMap::new(),
+        agent_profile_replacement: None,
     };
 
     assert_eq!(

@@ -523,6 +523,13 @@ impl ExecutionJob {
             workflow_path: execution.provenance.workflow_path,
             source_root: execution.provenance.source_root,
             content_digest: execution.content_digest,
+            agent_profile_replacement: self
+                .accepted
+                .admitted
+                .workflow()
+                .agent_profile_replacement
+                .as_ref()
+                .map(um_execution::AgentProfileReplacementV1::from_resolved),
             execution_root: self.accepted.admitted.execution().root().to_owned(),
             maximum_parallel_steps: self
                 .accepted

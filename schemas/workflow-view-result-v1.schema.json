@@ -63,6 +63,144 @@
         }
       }
     },
+    "AgentProfileReplacement": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "digest",
+        "profiles"
+      ],
+      "properties": {
+        "digest": {
+          "$ref": "#/$defs/Digest"
+        },
+        "profiles": {
+          "type": "object",
+          "minProperties": 1,
+          "propertyNames": {
+            "$ref": "#/$defs/Identifier"
+          },
+          "additionalProperties": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "harness"
+            ],
+            "properties": {
+              "harness": {
+                "oneOf": [
+                  {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": [
+                      "kind",
+                      "config"
+                    ],
+                    "properties": {
+                      "kind": {
+                        "const": "pi"
+                      },
+                      "config": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": [
+                          "model",
+                          "thinking"
+                        ],
+                        "properties": {
+                          "model": {
+                            "type": "string",
+                            "minLength": 1
+                          },
+                          "thinking": {
+                            "enum": [
+                              "off",
+                              "minimal",
+                              "low",
+                              "medium",
+                              "high",
+                              "xhigh",
+                              "max"
+                            ]
+                          }
+                        }
+                      }
+                    }
+                  },
+                  {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": [
+                      "kind",
+                      "config"
+                    ],
+                    "properties": {
+                      "kind": {
+                        "const": "claude_code"
+                      },
+                      "config": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": [
+                          "model",
+                          "effort"
+                        ],
+                        "properties": {
+                          "model": {
+                            "type": "string",
+                            "minLength": 1
+                          },
+                          "effort": {
+                            "enum": [
+                              "low",
+                              "medium",
+                              "high",
+                              "xhigh",
+                              "max"
+                            ]
+                          }
+                        }
+                      }
+                    }
+                  },
+                  {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": [
+                      "kind",
+                      "config"
+                    ],
+                    "properties": {
+                      "kind": {
+                        "const": "codex"
+                      },
+                      "config": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": [
+                          "model",
+                          "effort"
+                        ],
+                        "properties": {
+                          "model": {
+                            "type": "string",
+                            "minLength": 1
+                          },
+                          "effort": {
+                            "type": "string",
+                            "minLength": 1
+                          }
+                        }
+                      }
+                    }
+                  }
+                ]
+              }
+            }
+          }
+        }
+      }
+    },
     "NodeRole": {
       "enum": [
         "step",
@@ -2049,6 +2187,9 @@
             },
             "digest": {
               "$ref": "#/$defs/Digest"
+            },
+            "agentProfileReplacement": {
+              "$ref": "#/$defs/AgentProfileReplacement"
             }
           }
         },
