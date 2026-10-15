@@ -157,6 +157,13 @@ pub struct CloudGitCaptureProjection {
     source_commit: Arc<str>,
     workflow_digest: Arc<str>,
     admission_cancellation: CaptureCancellation,
+    workspace: CloudGitWorkspace,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CloudGitWorkspace {
+    InitialCheckout,
+    RetainedContinuation,
 }
 
 impl fmt::Debug for CloudGitCaptureProjection {
@@ -165,6 +172,7 @@ impl fmt::Debug for CloudGitCaptureProjection {
             .debug_struct("CloudGitCaptureProjection")
             .field("source_commit", &self.source_commit)
             .field("workflow_digest", &self.workflow_digest)
+            .field("workspace", &self.workspace)
             .finish_non_exhaustive()
     }
 }
@@ -179,6 +187,21 @@ impl CloudGitCaptureProjection {
             source_commit,
             workflow_digest,
             admission_cancellation,
+            workspace: CloudGitWorkspace::InitialCheckout,
+        }
+    }
+
+    /// The caller must first authenticate the retained workspace claim, prove
+    /// same-boot process quiescence, and obtain the continuation-ready ack.
+    /// `source_commit` remains the original primary workspace source commit.
+    pub fn for_continuation(
+        source_commit: Arc<str>,
+        workflow_digest: Arc<str>,
+        admission_cancellation: CaptureCancellation,
+    ) -> Self {
+        Self {
+            workspace: CloudGitWorkspace::RetainedContinuation,
+            ..Self::new(source_commit, workflow_digest, admission_cancellation)
         }
     }
 
@@ -415,13 +438,27 @@ impl GitCaptureContext {
             .map_err(admission_process_failure)?;
         let current_head =
             successful_oid(&baseline).ok_or(GitWorkspaceAdmissionFailure::BaselineUnavailable)?;
-        let baseline_oid = retained_baseline.map_or_else(
+        if retained_baseline
+            .is_some_and(|retained| retained.object_format() != context.object_format)
+        {
+            return Err(GitWorkspaceAdmissionFailure::UnsupportedObjectFormat);
+        }
+        // A continuation keeps the original artifact base even when earlier
+        // workflow steps have advanced HEAD. Both local and Cloud retention
+        // require that base to remain available and ancestral to the current head.
+        let retained_commit = retained_baseline
+            .map(|retained| &retained.commit_oid)
+            .or_else(|| {
+                cloud
+                    .filter(|projection| {
+                        projection.workspace == CloudGitWorkspace::RetainedContinuation
+                    })
+                    .map(|projection| &projection.source_commit)
+            });
+        let baseline_oid = retained_commit.map_or_else(
             || Ok(Arc::clone(&current_head)),
             |retained| {
-                if retained.object_format() != context.object_format {
-                    return Err(GitWorkspaceAdmissionFailure::UnsupportedObjectFormat);
-                }
-                let object = format!("{}^{{commit}}", retained.commit_oid());
+                let object = format!("{retained}^{{commit}}");
                 let available = context
                     .run_source(
                         &["cat-file", "-e", &object],
@@ -440,7 +477,7 @@ impl GitCaptureContext {
                         &[
                             "merge-base",
                             "--is-ancestor",
-                            retained.commit_oid(),
+                            retained.as_ref(),
                             &current_head,
                         ],
                         ProcessInput::None,
@@ -453,7 +490,7 @@ impl GitCaptureContext {
                 if !ancestry.status.success() || ancestry.stdout.truncated {
                     return Err(GitWorkspaceAdmissionFailure::BaselineUnavailable);
                 }
-                Ok(Arc::clone(&retained.commit_oid))
+                Ok(Arc::clone(retained))
             },
         )?;
         let source_authority = context
@@ -470,7 +507,9 @@ impl GitCaptureContext {
             return Err(GitWorkspaceAdmissionFailure::BaselineUnavailable);
         }
         context.git_metadata = context.read_git_metadata(cancellation)?;
-        if cloud.is_some() {
+        if cloud
+            .is_some_and(|projection| projection.workspace == CloudGitWorkspace::InitialCheckout)
+        {
             let status = context
                 .run_source(
                     &[

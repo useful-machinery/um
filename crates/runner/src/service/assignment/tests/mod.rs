@@ -42,6 +42,7 @@ use um_runner_protocol::{
 
 const NOW: &str = "2026-07-23T00:00:00Z";
 mod artifact_delivery_tests;
+mod git_continuation_tests;
 mod harness_executable_tests;
 use harness_executable_tests::{manager_fixture_with_harnesses, manager_fixture_with_pi};
 const COMMAND_FIXTURE_TEST_NAME: &str = "service::assignment::tests::command_fixture_process";

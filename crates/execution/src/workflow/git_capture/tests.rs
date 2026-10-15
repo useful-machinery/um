@@ -25,6 +25,7 @@ struct GitFixture {
     _temporary: tempfile::TempDir,
     repository: PathBuf,
     artifacts: ArtifactStaging,
+    admitted: crate::workflow::admission::AdmittedWorkflow,
     capture: GitCaptureContext,
 }
 
@@ -57,6 +58,7 @@ impl GitFixture {
             _temporary: temporary,
             repository,
             artifacts,
+            admitted,
             capture,
         }
     }
@@ -71,6 +73,144 @@ impl GitFixture {
         self.capture
             .capture("changes", &self.artifacts, &CaptureCancellation::default())
     }
+}
+
+#[test]
+fn cloud_continuation_preserves_dirty_work_but_capture_still_requires_a_clean_commit() {
+    for dirty in ["tracked", "staged", "untracked"] {
+        let fixture = GitFixture::new();
+        let baseline = fixture.capture.baseline_oid();
+        let path = if dirty == "untracked" {
+            "new.txt"
+        } else {
+            "tracked.txt"
+        };
+        fs::write(fixture.repository.join(path), b"retained edits\n").unwrap();
+        if dirty == "staged" {
+            git(&fixture.repository, &["add", path]);
+        }
+        let projection = CloudGitCaptureProjection::new(
+            Arc::from(baseline),
+            Arc::from("0".repeat(64)),
+            CaptureCancellation::default(),
+        );
+        assert_eq!(
+            GitCaptureContext::admit_cloud(fixture.admitted.execution(), &projection).unwrap_err(),
+            GitWorkspaceAdmissionFailure::InitialWorkspaceDirty,
+        );
+        let retained = CloudGitCaptureProjection::for_continuation(
+            Arc::from(baseline),
+            Arc::from("0".repeat(64)),
+            CaptureCancellation::default(),
+        );
+        let capture =
+            GitCaptureContext::admit_cloud(fixture.admitted.execution(), &retained).unwrap();
+        assert_eq!(
+            fs::read(fixture.repository.join(path)).unwrap(),
+            b"retained edits\n"
+        );
+        assert!(matches!(
+            capture
+                .capture(
+                    "changes",
+                    &fixture.artifacts,
+                    &CaptureCancellation::default()
+                )
+                .err()
+                .unwrap()
+                .cause(),
+            GitCaptureFailure::WorkspaceDirty,
+        ));
+        git(&fixture.repository, &["add", "--all"]);
+        git(
+            &fixture.repository,
+            &["commit", "--quiet", "-m", "retained change"],
+        );
+        let candidates = capture
+            .capture(
+                "changes",
+                &fixture.artifacts,
+                &CaptureCancellation::default(),
+            )
+            .unwrap();
+        let branch = candidates.outputs()["changes"].as_git_branch().unwrap();
+        assert_eq!(branch.metadata().base_oid(), baseline);
+        assert_eq!(
+            branch.metadata().head_oid(),
+            git_oid(&fixture.repository, "HEAD")
+        );
+    }
+}
+
+#[test]
+fn cloud_continuation_uses_original_source_baseline_after_workflow_commits() {
+    let fixture = GitFixture::new();
+    let baseline = fixture.capture.baseline_oid();
+    fixture.commit_file("tracked.txt", b"committed before failure\n", "candidate");
+    let head = git_oid(&fixture.repository, "HEAD");
+    let projection = CloudGitCaptureProjection::new(
+        Arc::from(baseline),
+        Arc::from("0".repeat(64)),
+        CaptureCancellation::default(),
+    );
+    assert_eq!(
+        GitCaptureContext::admit_cloud(fixture.admitted.execution(), &projection).unwrap_err(),
+        GitWorkspaceAdmissionFailure::BaselineUnavailable,
+    );
+    let retained = CloudGitCaptureProjection::for_continuation(
+        Arc::from(baseline),
+        Arc::from("0".repeat(64)),
+        CaptureCancellation::default(),
+    );
+    let capture = GitCaptureContext::admit_cloud(fixture.admitted.execution(), &retained).unwrap();
+    assert_eq!(capture.workflow_digest(), Some("0".repeat(64).as_str()));
+    let candidates = capture
+        .capture(
+            "changes",
+            &fixture.artifacts,
+            &CaptureCancellation::default(),
+        )
+        .unwrap();
+    let branch = candidates.outputs()["changes"].as_git_branch().unwrap();
+    assert_eq!(branch.metadata().base_oid(), baseline);
+    assert_eq!(branch.metadata().head_oid(), head);
+}
+
+#[test]
+fn cloud_continuation_requires_available_ancestral_source_baseline() {
+    let fixture = GitFixture::new();
+    let baseline = fixture.capture.baseline_oid();
+    let projection = |source| {
+        CloudGitCaptureProjection::for_continuation(
+            source,
+            Arc::from("0".repeat(64)),
+            CaptureCancellation::default(),
+        )
+    };
+    assert_eq!(
+        GitCaptureContext::admit_cloud(
+            fixture.admitted.execution(),
+            &projection(Arc::from("0".repeat(40)))
+        )
+        .unwrap_err(),
+        GitWorkspaceAdmissionFailure::BaselineUnavailable,
+    );
+    git(
+        &fixture.repository,
+        &["checkout", "--quiet", "--orphan", "unrelated"],
+    );
+    git(
+        &fixture.repository,
+        &["commit", "--quiet", "-m", "unrelated root"],
+    );
+    assert_eq!(
+        GitCaptureContext::admit_cloud(
+            fixture.admitted.execution(),
+            &projection(Arc::from(baseline))
+        )
+        .unwrap_err(),
+        GitWorkspaceAdmissionFailure::BaselineUnavailable,
+    );
 }
 
 fn admitted_capture<const N: usize>(
@@ -543,6 +683,7 @@ fn merge_forked_before_baseline_excludes_prerequisite_history_and_imports_indepe
         _temporary: temporary,
         repository,
         artifacts,
+        admitted,
         capture,
     };
 

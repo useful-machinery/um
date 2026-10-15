@@ -535,7 +535,7 @@ impl AssignmentManager {
                         materialized.execution_root = root.execution.clone();
                         materialized.git_capture =
                             materialized.workflow.requires_git_capture().then(|| {
-                                CloudGitCaptureProjection::new(
+                                CloudGitCaptureProjection::for_continuation(
                                     Arc::from(
                                         worker_offer
                                             .execution_spec
