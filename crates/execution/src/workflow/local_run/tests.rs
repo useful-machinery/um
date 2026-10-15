@@ -92,6 +92,16 @@ impl AdmittedFixture {
         maximum_step_log_bytes: u64,
         environment: EnvironmentSnapshot,
     ) -> Self {
+        Self::from_source_with_git(source, inputs, maximum_step_log_bytes, environment, false)
+    }
+
+    fn from_source_with_git(
+        source: &str,
+        inputs: ResolvedInputs,
+        maximum_step_log_bytes: u64,
+        environment: EnvironmentSnapshot,
+        git: bool,
+    ) -> Self {
         let temporary = tempfile::tempdir().unwrap();
         let source_root = temporary.path().join("source");
         let execution_root = temporary.path().join("execution");
@@ -99,12 +109,31 @@ impl AdmittedFixture {
         for directory in [&source_root, &execution_root, &run_parent] {
             fs::create_dir(directory).unwrap();
         }
+        if git {
+            let run_git = |args: &[&str]| {
+                let output = std::process::Command::new("git")
+                    .args(args)
+                    .current_dir(&execution_root)
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "git {args:?}: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            };
+            run_git(&["init", "--quiet"]);
+            run_git(&["config", "user.name", "Checkpoint Fixture"]);
+            run_git(&["config", "user.email", "checkpoint@example.invalid"]);
+            run_git(&["config", "commit.gpgsign", "false"]);
+            fs::write(execution_root.join("tracked"), b"baseline\n").unwrap();
+            run_git(&["add", "tracked"]);
+            run_git(&["commit", "--quiet", "-m", "baseline"]);
+        }
         fs::write(source_root.join("workflow.yaml"), source).unwrap();
         let workflow = resolution::resolve(&source_root, Path::new("workflow.yaml")).unwrap();
-        let admitted = admit_workflow(
-            workflow,
-            inputs,
-            ExecutionContext::new(
+        let admitted = admit_workflow(workflow, inputs, {
+            let context = ExecutionContext::new(
                 execution_root.clone(),
                 ExecutionPolicyLimits::new(
                     2,
@@ -114,8 +143,13 @@ impl AdmittedFixture {
                 ),
                 environment,
                 CancellationPolicy::new(CancellationSource::new(), Duration::from_secs(10)),
-            ),
-        )
+            );
+            if git {
+                context.with_local_git_capture()
+            } else {
+                context
+            }
+        })
         .unwrap();
         Self {
             _temporary: temporary,
@@ -1304,6 +1338,22 @@ async fn cloud_continuation_recovers_unexported_output_across_three_attempts() {
             provenance: fixture.admitted.workflow().source.clone(),
             content_digest: fixture.admitted.workflow().content_digest.clone(),
         };
+    retain_cloud_completed_steps(
+        &private1,
+        attempt1,
+        1,
+        &first.steps,
+        &first.output_producers,
+        &artifacts,
+        None,
+    )
+    .unwrap();
+    assert!(!private1.join("cloud-retained-v1/state.json").exists());
+    let first_marker: serde_json::Value = serde_json::from_slice(
+        &fs::read(private1.join("cloud-retained-v1/commits/first.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(first_marker["steps"]["first"]["state"], "succeeded");
     retain_cloud_workflow_evidence(&private1, attempt1, 1, &first, &artifacts).unwrap();
     let mut roots = BTreeMap::from([(attempt1.to_owned(), private1.clone())]);
     let inherited = vec![serde_json::json!({
@@ -1354,6 +1404,24 @@ async fn cloud_continuation_recovers_unexported_output_across_three_attempts() {
             provenance: fixture.admitted.workflow().source.clone(),
             content_digest: fixture.admitted.workflow().content_digest.clone(),
         };
+    retain_cloud_completed_steps(
+        &private2,
+        attempt2,
+        2,
+        &second_result.steps,
+        &second_result.output_producers,
+        &artifacts,
+        Some((&private1, attempt1, 1)),
+    )
+    .unwrap();
+    let inherited_marker: serde_json::Value = serde_json::from_slice(
+        &fs::read(private2.join("cloud-retained-v1/commits/first.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        inherited_marker["steps"]["first"]["references"][0]["attemptId"],
+        attempt1
+    );
     retain_cloud_continuation_evidence(
         &private2,
         attempt2,
@@ -5231,4 +5299,295 @@ fn archived_attempt_rejects_symlinks_and_does_not_adopt_replacements() {
     .unwrap();
     assert_eq!(archived.projection.attempt_number, 1);
     assert!(durable_tree(&run_path).is_empty());
+}
+
+#[tokio::test]
+async fn cloud_step_is_readable_while_a_real_downstream_command_is_running() {
+    let fixture = AdmittedFixture::from_source(
+        "schemaVersion: 1\nsteps:\n  first:\n    kind: cmd\n    command: {argv: [\"/bin/sh\", \"-c\", \"printf private-evidence > message.txt\"]}\n    outputs:\n      message: {kind: text, from: path, path: message.txt}\n  second:\n    kind: cmd\n    inputs:\n      prompt: {ref: outputs.first.message}\n    command: {argv: [\"/bin/sh\", \"-c\", \"printf ready > ready; read x < gate; IFS= read -r value < \\\"$UM_STEP_INPUTS/values/prompt\\\"; printf '%s' \\\"$value\\\" > consumed.txt\"]}\n",
+    );
+    let root = fs::canonicalize(&fixture.execution_root).unwrap();
+    nix::unistd::mkfifo(
+        &root.join("gate"),
+        nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+    )
+    .unwrap();
+    let private = fs::canonicalize(fixture.run_path("incremental-private").parent().unwrap())
+        .unwrap()
+        .join("incremental-private");
+    fs::create_dir(&private).unwrap();
+    let artifacts = ArtifactStaging::create(fixture.admitted.execution(), &private).unwrap();
+    let inputs =
+        crate::workflow::input::InputStaging::create(fixture.admitted.execution(), &private)
+            .unwrap();
+    let attempt = "atm_01k0z6r1w8f4jy2m7q9v3x5abe";
+    let execution = tokio::spawn({
+        let admitted = fixture.admitted.clone();
+        let artifacts = artifacts.clone();
+        let private = private.clone();
+        async move {
+            crate::workflow::execution::execute_workflow(
+                admitted,
+                &artifacts,
+                &inputs,
+                &crate::workflow::diagnostic::StepDiagnosticLog::default(),
+                crate::workflow::step_runtime::AgentExecution::disabled(),
+                crate::workflow::test_support::step_clock::TestClock,
+                crate::workflow::execution::CloudStepCommitPort::new(
+                    private,
+                    attempt.to_owned(),
+                    1,
+                    artifacts.clone(),
+                    None,
+                ),
+                crate::workflow::observation::NoopExecutionObserver,
+                crate::workflow::step_runtime::WorkflowExecutionStart::initial(
+                    crate::workflow::process_group::ProcessGuardRegistry::default(),
+                ),
+            )
+            .await
+        }
+    });
+    // The external child exposes a file marker, with no in-process notification.
+    // Poll only this OS boundary; the watchdog bounds a missing readiness signal.
+    let ready = root.join("ready");
+    cloud_test_poll(|| ready.exists()).await;
+    assert_eq!(fs::read(ready).unwrap(), b"ready");
+    assert!(!execution.is_finished());
+    assert!(!private.join("cloud-retained-v1/state.json").exists());
+    assert!(!private.join("result.json").exists());
+    let marker: serde_json::Value = serde_json::from_slice(
+        &fs::read(private.join("cloud-retained-v1/commits/first.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(marker["steps"].as_object().unwrap().len(), 1);
+    assert_eq!(marker["steps"]["first"]["state"], "succeeded");
+    assert_eq!(
+        marker["steps"]["first"]["references"][0]["attemptId"],
+        attempt
+    );
+    // A crashed, unrenamed downstream checkpoint must not supply success.
+    fs::write(private.join("cloud-retained-v1/.state.pending"), b"{broken").unwrap();
+    fs::write(
+        private.join("cloud-retained-v1/commits/.second.pending"),
+        b"{broken",
+    )
+    .unwrap();
+    assert!(matches!(
+        load_cloud_continuation_seed(
+            &fixture.admitted,
+            &artifacts,
+            &BTreeMap::from([(attempt.to_owned(), private.clone())]),
+            attempt,
+            1,
+            &[json!({"id":"second","priorState":"succeeded","definitionChanged":false})],
+            &[],
+        ),
+        Err(LocalRunDirectoryError::StateInvalid)
+    ));
+    let carrier = private.join("cloud-retained-v1/values/steps/first/message");
+    assert_eq!(fs::read(carrier).unwrap(), b"private-evidence");
+    let seed = load_cloud_continuation_seed(
+        &fixture.admitted,
+        &artifacts,
+        &BTreeMap::from([(attempt.to_owned(), private.clone())]),
+        attempt,
+        1,
+        &[json!({"id":"first","priorState":"succeeded","definitionChanged":false})],
+        &["second".to_owned()],
+    )
+    .unwrap();
+    assert_eq!(
+        seed.inherited_step("first").unwrap().producers["message"].attempt_id,
+        attempt
+    );
+    cloud_test_watchdog(async {
+        cloud_test_poll(|| {
+            match nix::fcntl::open(
+                &root.join("gate"),
+                nix::fcntl::OFlag::O_WRONLY | nix::fcntl::OFlag::O_NONBLOCK,
+                nix::sys::stat::Mode::empty(),
+            ) {
+                Ok(fd) => {
+                    File::from(fd).write_all(b"go\n").unwrap();
+                    true
+                }
+                Err(nix::errno::Errno::ENXIO) => false,
+                Err(error) => panic!("downstream gate could not open: {error}"),
+            }
+        })
+        .await;
+    })
+    .await;
+    let result = cloud_test_watchdog(execution).await.unwrap().unwrap();
+    assert_eq!(
+        result.outcome,
+        crate::workflow::runtime::RunOutcome::Succeeded
+    );
+    retain_cloud_workflow_evidence(&private, attempt, 1, &result, &artifacts).unwrap();
+    let terminal: serde_json::Value =
+        serde_json::from_slice(&fs::read(private.join("cloud-retained-v1/state.json")).unwrap())
+            .unwrap();
+    assert_eq!(terminal["steps"].as_object().unwrap().len(), 2);
+    assert_eq!(
+        fs::read(fixture.execution_root.join("consumed.txt")).unwrap(),
+        b"private-evidence"
+    );
+}
+
+#[expect(
+    clippy::disallowed_methods,
+    reason = "bounded OS process readiness polling, not an assertion timer"
+)]
+async fn cloud_test_poll(mut ready: impl FnMut() -> bool) {
+    cloud_test_watchdog(async {
+        let mut poll = tokio::time::interval(Duration::from_millis(10));
+        while !ready() {
+            poll.tick().await;
+        }
+    })
+    .await;
+}
+
+#[expect(
+    clippy::disallowed_methods,
+    reason = "real time only bounds a hung child process, never establishes readiness"
+)]
+async fn cloud_test_watchdog<T>(future: impl std::future::Future<Output = T>) -> T {
+    tokio::time::timeout(Duration::from_secs(15), future)
+        .await
+        .unwrap_or_else(|_| panic!("cloud checkpoint test process did not finish"))
+}
+
+#[tokio::test]
+async fn failed_cloud_checkpoint_never_releases_step_success() {
+    let fixture = AdmittedFixture::from_source(
+        "schemaVersion: 1\nsteps:\n  first:\n    kind: cmd\n    command: {argv: [\"/bin/sh\", \"-c\", \"printf evidence > message.txt\"]}\n    outputs:\n      message: {kind: text, from: path, path: message.txt}\n  second:\n    kind: cmd\n    dependsOn: [first]\n    command: {argv: [\"/bin/sh\", \"-c\", \"printf started > downstream\"]}\n",
+    );
+    let private = fixture.run_path("failed-checkpoint");
+    fs::create_dir(&private).unwrap();
+    fs::create_dir_all(private.join("cloud-retained-v1/commits/first.json")).unwrap();
+    let artifacts = ArtifactStaging::create(fixture.admitted.execution(), &private).unwrap();
+    let inputs =
+        crate::workflow::input::InputStaging::create(fixture.admitted.execution(), &private)
+            .unwrap();
+    let result = crate::workflow::execution::execute_workflow(
+        fixture.admitted.clone(),
+        &artifacts,
+        &inputs,
+        &crate::workflow::diagnostic::StepDiagnosticLog::default(),
+        crate::workflow::step_runtime::AgentExecution::disabled(),
+        crate::workflow::test_support::step_clock::TestClock,
+        crate::workflow::execution::CloudStepCommitPort::new(
+            private.clone(),
+            "atm_01k0z6r1w8f4jy2m7q9v3x5ac0".into(),
+            1,
+            artifacts.clone(),
+            None,
+        ),
+        crate::workflow::observation::NoopExecutionObserver,
+        crate::workflow::step_runtime::WorkflowExecutionStart::initial(
+            crate::workflow::process_group::ProcessGuardRegistry::default(),
+        ),
+    )
+    .await;
+    assert!(matches!(
+        result,
+        Err(crate::workflow::coordinator::CoordinationError::CommitFailed)
+    ));
+    assert!(!fixture.execution_root.join("downstream").exists());
+    assert!(!private.join("cloud-retained-v1/state.json").exists());
+}
+
+#[tokio::test]
+async fn cloud_checkpoint_accepts_carrier_free_git_and_rejects_unpublished_records() {
+    let fixture = AdmittedFixture::from_source_with_git(
+        "schemaVersion: 1\nsteps:\n  first:\n    kind: cmd\n    command: {argv: [\"git\", \"--version\"]}\n    outputs:\n      branch: {kind: git_branch, from: workspace}\n  second:\n    kind: cmd\n    dependsOn: [first]\n    command: {argv: [\"git\", \"--version\"]}\n",
+        ResolvedInputs::default(),
+        1024,
+        EnvironmentSnapshot::new([("PATH", std::env::var_os("PATH").unwrap())]),
+        true,
+    );
+    let private = fixture.run_path("git-checkpoint");
+    fs::create_dir(&private).unwrap();
+    let artifacts = ArtifactStaging::create(fixture.admitted.execution(), &private).unwrap();
+    let attempt = "atm_01k0z6r1w8f4jy2m7q9v3x5abf";
+    let inputs =
+        crate::workflow::input::InputStaging::create(fixture.admitted.execution(), &private)
+            .unwrap();
+    let commits = private.join("cloud-retained-v1/commits");
+    fs::create_dir_all(&commits).unwrap();
+    fs::write(commits.join(".first.pending"), b"{incomplete").unwrap();
+    let roots = BTreeMap::from([(attempt.to_owned(), private.clone())]);
+    let request = [json!({"id":"first","priorState":"succeeded","definitionChanged":false})];
+    assert!(matches!(
+        load_cloud_continuation_seed(
+            &fixture.admitted,
+            &artifacts,
+            &roots,
+            attempt,
+            1,
+            &request,
+            &["second".to_owned()],
+        ),
+        Err(LocalRunDirectoryError::StateInvalid)
+    ));
+    let result = crate::workflow::execution::execute_workflow(
+        fixture.admitted.clone(),
+        &artifacts,
+        &inputs,
+        &crate::workflow::diagnostic::StepDiagnosticLog::default(),
+        crate::workflow::step_runtime::AgentExecution::disabled(),
+        crate::workflow::test_support::step_clock::TestClock,
+        crate::workflow::execution::CloudStepCommitPort::new(
+            private.clone(),
+            attempt.to_owned(),
+            1,
+            artifacts.clone(),
+            None,
+        ),
+        crate::workflow::observation::NoopExecutionObserver,
+        crate::workflow::step_runtime::WorkflowExecutionStart::initial(
+            crate::workflow::process_group::ProcessGuardRegistry::default(),
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        result.outcome,
+        crate::workflow::runtime::RunOutcome::Succeeded
+    );
+    let marker: serde_json::Value =
+        serde_json::from_slice(&fs::read(commits.join("first.json")).unwrap()).unwrap();
+    assert!(marker["steps"]["first"]["outputs"][0]["carrier"].is_null());
+    let seed = load_cloud_continuation_seed(
+        &fixture.admitted,
+        &artifacts,
+        &roots,
+        attempt,
+        1,
+        &request,
+        &["second".to_owned()],
+    )
+    .unwrap();
+    assert!(seed.inherited_step("first").unwrap().outputs.is_empty());
+    assert_eq!(
+        marker["steps"]["first"]["references"][0]["attemptId"],
+        attempt
+    );
+    // A renamed but incomplete commit is not evidence either.
+    fs::set_permissions(commits.join("first.json"), Permissions::from_mode(0o600)).unwrap();
+    fs::write(commits.join("first.json"), b"{incomplete").unwrap();
+    assert!(matches!(
+        load_cloud_continuation_seed(
+            &fixture.admitted,
+            &artifacts,
+            &roots,
+            attempt,
+            1,
+            &request,
+            &["second".to_owned()],
+        ),
+        Err(LocalRunDirectoryError::StateInvalid)
+    ));
 }

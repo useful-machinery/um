@@ -1,4 +1,5 @@
 mod cloud_retained;
+pub(crate) use cloud_retained::retain_cloud_completed_steps;
 pub use cloud_retained::{
     bind_cloud_continuation_context, load_cloud_continuation_seed,
     retain_cloud_continuation_evidence, retain_cloud_workflow_evidence,

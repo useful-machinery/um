@@ -288,6 +288,25 @@ impl ExecutionJob {
             None => WorkflowExecutionStart::initial(process_guard_registry),
         };
         let start = start.with_finalization_identity(run_id.to_owned(), attempt_id.to_owned());
+        let cloud_commit = CloudStepCommitPort::new(
+            self.accepted.root.private.path().to_path_buf(),
+            attempt_id.to_owned(),
+            self.accepted.attempt_number,
+            artifacts.clone(),
+            self.accepted.continuation.as_ref().and_then(|offer| {
+                self.accepted
+                    .root
+                    .retained_private_roots
+                    .get(&offer.prior_attempt_id)
+                    .map(|path| {
+                        (
+                            path.clone(),
+                            offer.prior_attempt_id.clone(),
+                            self.accepted.attempt_number.saturating_sub(1),
+                        )
+                    })
+            }),
+        );
         let execution = if let (Some(agent_staging), Some(diagnostic_sessions)) =
             (&agent_staging, agent_diagnostic_sessions)
         {
@@ -335,7 +354,7 @@ impl ExecutionJob {
                         &diagnostics,
                         agents,
                         RunnerExecutionClock,
-                        NoopCommitPort,
+                        cloud_commit,
                         observer.clone(),
                         start,
                     ),
@@ -365,7 +384,7 @@ impl ExecutionJob {
                         &diagnostics,
                         AgentExecution::disabled(),
                         RunnerExecutionClock,
-                        NoopCommitPort,
+                        cloud_commit,
                         observer.clone(),
                         start,
                     ),

@@ -133,20 +133,164 @@ pub fn retain_cloud_continuation_evidence<Deadline>(
             Ok(state)
         })
         .transpose()?;
+    let (root, stored) = retain_steps(
+        CloudAttempt {
+            private,
+            attempt_id,
+            attempt_number,
+        },
+        &result.steps,
+        &result.output_producers,
+        artifacts,
+        previous.as_ref(),
+        false,
+    )?;
+    let bytes = serde_json::to_vec(&stored).map_err(|_| LocalRunDirectoryError::StateInvalid)?;
+    if bytes.len() as u64 > MAX_STATE_BYTES {
+        return Err(LocalRunDirectoryError::StateInvalid);
+    }
+    match statat(&root, STATE_FILE, AtFlags::SYMLINK_NOFOLLOW) {
+        Err(rustix::io::Errno::NOENT) => {
+            match unlinkat(&root, ".state.pending", AtFlags::empty()) {
+                Ok(()) | Err(rustix::io::Errno::NOENT) => {}
+                Err(_) => return Err(LocalRunDirectoryError::StateWriteUnavailable),
+            }
+            write_new_immutable_file(&root, ".state.pending", &bytes)?;
+            renameat_with(
+                &root,
+                ".state.pending",
+                &root,
+                STATE_FILE,
+                RenameFlags::NOREPLACE,
+            )
+            .map_err(|_| LocalRunDirectoryError::StateWriteUnavailable)?;
+        }
+        Ok(_) => write_or_verify_immutable_file(&root, STATE_FILE, &bytes)?,
+        Err(_) => return Err(LocalRunDirectoryError::StateInvalid),
+    }
+    sync_directory(&root)?;
+    let private_directory =
+        open_directory_path(private).map_err(|_| LocalRunDirectoryError::StateWriteUnavailable)?;
+    sync_directory(&private_directory)?;
+    Ok(())
+}
+
+/// Commit a newly succeeded step before the engine exposes its success transition.
+/// A commit marker is published only after its private carriers have been synced.
+pub(crate) fn retain_cloud_completed_steps(
+    private: &Path,
+    attempt_id: &str,
+    attempt_number: u64,
+    steps: &BTreeMap<String, StepState<CapturedValue>>,
+    producers: &BTreeMap<(String, String), OutputProducer>,
+    artifacts: &ArtifactStaging,
+    prior: Option<(&Path, &str, u64)>,
+) -> Result<(), LocalRunDirectoryError> {
+    let previous = prior
+        .filter(|_| {
+            steps
+                .values()
+                .any(|step| matches!(step, StepState::Inherited { .. }))
+        })
+        .map(|(path, id, number)| {
+            let state = read_attempt(path)?;
+            if state.attempt_id != id || state.attempt_number != number || number >= attempt_number
+            {
+                return Err(LocalRunDirectoryError::StateInvalid);
+            }
+            Ok(state)
+        })
+        .transpose()?;
+    retain_steps(
+        CloudAttempt {
+            private,
+            attempt_id,
+            attempt_number,
+        },
+        steps,
+        producers,
+        artifacts,
+        previous.as_ref(),
+        true,
+    )?;
+    Ok(())
+}
+
+struct CloudAttempt<'a> {
+    private: &'a Path,
+    attempt_id: &'a str,
+    attempt_number: u64,
+}
+
+fn retain_steps(
+    attempt: CloudAttempt<'_>,
+    states: &BTreeMap<String, StepState<CapturedValue>>,
+    producers: &BTreeMap<(String, String), OutputProducer>,
+    artifacts: &ArtifactStaging,
+    previous: Option<&StoredAttempt>,
+    incremental: bool,
+) -> Result<(OwnedFd, StoredAttempt), LocalRunDirectoryError> {
+    let CloudAttempt {
+        private,
+        attempt_id,
+        attempt_number,
+    } = attempt;
     let dir = private.join(DIRECTORY);
-    std::fs::DirBuilder::new()
-        .mode(0o700)
-        .create(&dir)
-        .map_err(|_| LocalRunDirectoryError::StagingUnavailable)?;
+    match std::fs::DirBuilder::new().mode(0o700).create(&dir) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(_) => return Err(LocalRunDirectoryError::StagingUnavailable),
+    }
     let root = open_directory_path(&dir).map_err(|_| LocalRunDirectoryError::StagingUnavailable)?;
     let values = create_or_open_directory(&root, VALUES_DIRECTORY)?;
     let steps = create_or_open_directory(&values, "steps")?;
+    let commits = create_or_open_directory(&root, "commits")?;
     let mut stored = StoredAttempt {
         attempt_id: attempt_id.to_owned(),
         attempt_number,
         steps: BTreeMap::new(),
     };
-    for (node, state) in &result.steps {
+    for (node, state) in states {
+        if incremental
+            && !matches!(
+                state,
+                StepState::Succeeded { .. }
+                    | StepState::Skipped { .. }
+                    | StepState::Inherited { .. }
+            )
+        {
+            continue;
+        }
+        if !valid_file_component(node) {
+            return Err(LocalRunDirectoryError::StateInvalid);
+        }
+        let marker = format!("{node}.json");
+        if incremental {
+            match statat(&commits, marker.as_str(), AtFlags::SYMLINK_NOFOLLOW) {
+                Ok(_) => {
+                    let file = File::from(
+                        openat(
+                            &commits,
+                            marker.as_str(),
+                            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK,
+                            Mode::empty(),
+                        )
+                        .map_err(|_| LocalRunDirectoryError::StateInvalid)?,
+                    );
+                    let record = read_cloud_record(file)?;
+                    if record.attempt_id != attempt_id
+                        || record.attempt_number != attempt_number
+                        || record.steps.len() != 1
+                        || !record.steps.contains_key(node)
+                    {
+                        return Err(LocalRunDirectoryError::StateInvalid);
+                    }
+                    continue;
+                }
+                Err(rustix::io::Errno::NOENT) => {}
+                Err(_) => return Err(LocalRunDirectoryError::StateInvalid),
+            }
+        }
         let (kind, outputs) = match state {
             StepState::Succeeded { outputs } => (StoredState::Succeeded, Some(outputs)),
             StepState::Skipped { .. } => (StoredState::Skipped, None),
@@ -181,8 +325,7 @@ pub fn retain_cloud_continuation_evidence<Deadline>(
         if let Some(outputs) = outputs {
             let node_directory = create_or_open_directory(&steps, node)?;
             for (name, value) in outputs {
-                let producer = result
-                    .output_producers
+                let producer = producers
                     .get(&(node.clone(), name.clone()))
                     .cloned()
                     .unwrap_or_else(|| OutputProducer {
@@ -206,58 +349,129 @@ pub fn retain_cloud_continuation_evidence<Deadline>(
             }
             sync_directory(&node_directory)?;
         }
-        stored.steps.insert(
-            node.clone(),
-            StoredStep {
-                state: kind,
-                outputs: retained,
-                references,
-            },
-        );
+        let step = StoredStep {
+            state: kind,
+            outputs: retained,
+            references,
+        };
+        stored.steps.insert(node.clone(), step.clone());
+        if incremental {
+            sync_directory(&steps)?;
+            sync_directory(&values)?;
+            sync_directory(&root)?;
+            let record = StoredAttempt {
+                attempt_id: attempt_id.to_owned(),
+                attempt_number,
+                steps: BTreeMap::from([(node.clone(), step)]),
+            };
+            let bytes =
+                serde_json::to_vec(&record).map_err(|_| LocalRunDirectoryError::StateInvalid)?;
+            if bytes.len() as u64 > MAX_STATE_BYTES {
+                return Err(LocalRunDirectoryError::StateInvalid);
+            }
+            // An abandoned pending file is never success evidence. Replace it only
+            // while holding this attempt's sole engine commit port.
+            let pending = format!(".{node}.pending");
+            match unlinkat(&commits, pending.as_str(), AtFlags::empty()) {
+                Ok(()) | Err(rustix::io::Errno::NOENT) => {}
+                Err(_) => return Err(LocalRunDirectoryError::StateWriteUnavailable),
+            }
+            write_new_immutable_file(&commits, &pending, &bytes)?;
+            renameat_with(
+                &commits,
+                pending.as_str(),
+                &commits,
+                marker.as_str(),
+                RenameFlags::NOREPLACE,
+            )
+            .map_err(|_| LocalRunDirectoryError::StateWriteUnavailable)?;
+            sync_directory(&commits)?;
+            sync_directory(&root)?;
+            let private_directory = open_directory_path(private)
+                .map_err(|_| LocalRunDirectoryError::StateWriteUnavailable)?;
+            sync_directory(&private_directory)?;
+        }
     }
     sync_directory(&steps)?;
     sync_directory(&values)?;
     sync_directory(&root)?;
-    let bytes = serde_json::to_vec(&stored).map_err(|_| LocalRunDirectoryError::StateInvalid)?;
-    if bytes.len() as u64 > MAX_STATE_BYTES {
-        return Err(LocalRunDirectoryError::StateInvalid);
-    }
-    let file = rustix::fs::openat(
-        &root,
-        STATE_FILE,
-        rustix::fs::OFlags::WRONLY
-            | rustix::fs::OFlags::CREATE
-            | rustix::fs::OFlags::EXCL
-            | rustix::fs::OFlags::NOFOLLOW,
-        rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
-    )
-    .map_err(|_| LocalRunDirectoryError::StateWriteUnavailable)?;
-    let mut file = File::from(file);
-    file.write_all(&bytes)
-        .map_err(|_| LocalRunDirectoryError::StateWriteUnavailable)?;
-    file.sync_all()
-        .map_err(|_| LocalRunDirectoryError::StateWriteUnavailable)?;
-    sync_directory(&root)?;
-    let private_directory =
-        open_directory_path(private).map_err(|_| LocalRunDirectoryError::StateWriteUnavailable)?;
-    sync_directory(&private_directory)?;
-    Ok(())
+    Ok((root, stored))
 }
 
 fn read_attempt(private: &Path) -> Result<StoredAttempt, LocalRunDirectoryError> {
     let root = open_directory_path(&private.join(DIRECTORY))
         .map_err(|_| LocalRunDirectoryError::StateInvalid)?;
-    let file = File::from(
-        rustix::fs::openat(
-            &root,
-            STATE_FILE,
-            rustix::fs::OFlags::RDONLY
-                | rustix::fs::OFlags::NOFOLLOW
-                | rustix::fs::OFlags::NONBLOCK,
-            rustix::fs::Mode::empty(),
-        )
-        .map_err(|_| LocalRunDirectoryError::StateInvalid)?,
-    );
+    let mut state: Option<StoredAttempt> = match rustix::fs::openat(
+        &root,
+        STATE_FILE,
+        rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::NONBLOCK,
+        rustix::fs::Mode::empty(),
+    ) {
+        Ok(file) => Some(read_cloud_record(File::from(file))?),
+        Err(rustix::io::Errno::NOENT) => None,
+        Err(_) => return Err(LocalRunDirectoryError::StateInvalid),
+    };
+    let commits = match statat(&root, "commits", AtFlags::SYMLINK_NOFOLLOW) {
+        Err(rustix::io::Errno::NOENT) => None,
+        Ok(_) => Some(open_directory_at(&root, "commits")?),
+        Err(_) => return Err(LocalRunDirectoryError::StateInvalid),
+    };
+    if let Some(commits) = commits {
+        let names =
+            directory_entry_names(&commits).map_err(|_| LocalRunDirectoryError::StateInvalid)?;
+        for name in names {
+            let name =
+                std::str::from_utf8(&name).map_err(|_| LocalRunDirectoryError::StateInvalid)?;
+            if name.starts_with('.') && name.ends_with(".pending") {
+                continue;
+            } // Interrupted, unpublished checkpoint.
+            let node = name
+                .strip_suffix(".json")
+                .filter(|node| valid_file_component(node))
+                .ok_or(LocalRunDirectoryError::StateInvalid)?;
+            let file = File::from(
+                rustix::fs::openat(
+                    &commits,
+                    name,
+                    rustix::fs::OFlags::RDONLY
+                        | rustix::fs::OFlags::NOFOLLOW
+                        | rustix::fs::OFlags::NONBLOCK,
+                    rustix::fs::Mode::empty(),
+                )
+                .map_err(|_| LocalRunDirectoryError::StateInvalid)?,
+            );
+            let record = read_cloud_record(file)?;
+            if record.steps.len() != 1 || !record.steps.contains_key(node) {
+                return Err(LocalRunDirectoryError::StateInvalid);
+            }
+            match &mut state {
+                Some(state) => {
+                    if state.attempt_id != record.attempt_id
+                        || state.attempt_number != record.attempt_number
+                    {
+                        return Err(LocalRunDirectoryError::StateInvalid);
+                    }
+                    for (node, step) in record.steps {
+                        if let Some(existing) = state.steps.get(&node) {
+                            if existing.state != step.state
+                                || existing.references != step.references
+                                || existing.outputs != step.outputs
+                            {
+                                return Err(LocalRunDirectoryError::StateInvalid);
+                            }
+                        } else {
+                            state.steps.insert(node, step);
+                        }
+                    }
+                }
+                None => state = Some(record),
+            }
+        }
+    }
+    state.ok_or(LocalRunDirectoryError::StateInvalid)
+}
+
+fn read_cloud_record(file: File) -> Result<StoredAttempt, LocalRunDirectoryError> {
     let mut bytes = Vec::new();
     file.take(MAX_STATE_BYTES + 1)
         .read_to_end(&mut bytes)

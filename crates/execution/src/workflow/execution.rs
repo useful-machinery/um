@@ -1,6 +1,7 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::convert::Infallible;
 use std::future::{Future, ready};
+use std::path::PathBuf;
 
 use super::admission::AdmittedWorkflow;
 use super::artifact::ArtifactStaging;
@@ -35,6 +36,120 @@ pub struct WorkflowExecutionResult<Deadline = ()> {
 }
 
 pub struct NoopCommitPort;
+
+/// Cloud's step commit runs before observer success and before dependent actions.
+/// The filesystem work must not block the current-thread runner executor.
+pub struct CloudStepCommitPort {
+    private: PathBuf,
+    attempt_id: String,
+    attempt_number: u64,
+    artifacts: ArtifactStaging,
+    prior: Option<(PathBuf, String, u64)>,
+    committed: BTreeSet<String>,
+}
+
+impl CloudStepCommitPort {
+    pub fn new(
+        private: PathBuf,
+        attempt_id: String,
+        attempt_number: u64,
+        artifacts: ArtifactStaging,
+        prior: Option<(PathBuf, String, u64)>,
+    ) -> Self {
+        Self {
+            private,
+            attempt_id,
+            attempt_number,
+            artifacts,
+            prior,
+            committed: BTreeSet::new(),
+        }
+    }
+}
+
+impl<Deadline: Send> CommitPort<CommittedReduction<StepFailureCause, CapturedValue, Deadline>>
+    for CloudStepCommitPort
+{
+    type Error = super::local_run::LocalRunDirectoryError;
+
+    fn commit(
+        &mut self,
+        commit: CommittedReduction<StepFailureCause, CapturedValue, Deadline>,
+    ) -> impl Future<Output = Result<(), Self::Error>> {
+        let steps: BTreeMap<_, _> = commit
+            .state
+            .steps
+            .iter()
+            .filter(|(node, runtime)| {
+                !self.committed.contains(*node)
+                    && matches!(
+                        runtime.state,
+                        StepState::Succeeded { .. }
+                            | StepState::Skipped { .. }
+                            | StepState::Inherited { .. }
+                    )
+            })
+            .map(|(node, runtime)| (node.clone(), runtime.state.clone()))
+            .collect();
+        self.committed.extend(steps.keys().cloned());
+        let private = self.private.clone();
+        let attempt_id = self.attempt_id.clone();
+        let attempt_number = self.attempt_number;
+        let artifacts = self.artifacts.clone();
+        let prior = self.prior.clone();
+        let producers = commit.state.output_producers.clone();
+        async move {
+            if steps.is_empty() {
+                return Ok(());
+            }
+            let retained = tokio::task::spawn_blocking(move || {
+                super::local_run::retain_cloud_completed_steps(
+                    &private,
+                    &attempt_id,
+                    attempt_number,
+                    &steps,
+                    &producers,
+                    &artifacts,
+                    prior
+                        .as_ref()
+                        .map(|(path, id, number)| (path.as_path(), id.as_str(), *number)),
+                )
+            })
+            .await
+            .map_err(|_| {
+                tracing::error!(
+                    event = "cloud_step_checkpoint_failed",
+                    cause = "worker_join_failed"
+                );
+                super::local_run::LocalRunDirectoryError::StateWriteUnavailable
+            })?;
+            if let Err(error) = &retained {
+                // Never emit private paths or carrier contents from the OS error.
+                let cause = match error {
+                    super::local_run::LocalRunDirectoryError::StateInvalid => "invalid_state",
+                    super::local_run::LocalRunDirectoryError::StateConflict => "state_conflict",
+                    super::local_run::LocalRunDirectoryError::StateWriteUnavailable => {
+                        "state_write_unavailable"
+                    }
+                    super::local_run::LocalRunDirectoryError::StagingUnavailable => {
+                        "staging_unavailable"
+                    }
+                    super::local_run::LocalRunDirectoryError::CarrierInvalid => "carrier_invalid",
+                    super::local_run::LocalRunDirectoryError::Artifact { .. } => {
+                        "artifact_unavailable"
+                    }
+                    super::local_run::LocalRunDirectoryError::File { source, .. } => {
+                        tracing::error!(event = "cloud_step_checkpoint_failed", cause = "file_io", kind = ?source.kind());
+                        return retained;
+                    }
+                    _ => "retention_unavailable",
+                };
+                tracing::error!(event = "cloud_step_checkpoint_failed", cause);
+            }
+            retained
+        }
+    }
+}
 
 impl<Commit> CommitPort<Commit> for NoopCommitPort {
     type Error = Infallible;

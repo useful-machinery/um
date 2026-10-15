@@ -74,7 +74,9 @@ pub use workflow::evidence::{BlockedDetail, Prerequisite};
 pub use workflow::evidence::{
     FailureDetail, InheritedDetail, InheritedPriorState, NodeDetail, PrimaryIssue,
 };
-pub use workflow::execution::{NoopCommitPort, WorkflowExecutionResult, execute_workflow};
+pub use workflow::execution::{
+    CloudStepCommitPort, NoopCommitPort, WorkflowExecutionResult, execute_workflow,
+};
 pub use workflow::git_capture::CloudGitCaptureProjection;
 pub use workflow::input::InputStaging;
 pub use workflow::invocation_accounting::InvocationAccountingLog;
