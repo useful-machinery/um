@@ -1453,7 +1453,53 @@ async fn header_writer_failure_is_returned_without_local_rendering() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn blocked_writer_does_not_block_observation_or_cancellation() {
+async fn stalled_writer_applies_backpressure_to_bursts_instead_of_failing() {
+    let fixture = Fixture::new(workflow_source());
+    let (entered, waiting) = std::sync::mpsc::channel();
+    let blocked = Arc::new(AtomicBool::new(false));
+    let gate = Arc::new((Mutex::new(false), Condvar::new()));
+    let presentation = WorkflowRunOutput::new(
+        config(RequestedPresentationMode::Plain, ColorChoice::Never),
+        BlockingWriter {
+            blocked: blocked.clone(),
+            gate: gate.clone(),
+            entered,
+        },
+        io::sink(),
+    )
+    .start(
+        &fixture.workflow,
+        1,
+        TestClock::fixed("2026-08-02T12:01:44Z"),
+    )
+    .unwrap();
+    presentation.flush_pending().await;
+    blocked.store(true, Ordering::SeqCst);
+    let (queue_full, full) = std::sync::mpsc::channel();
+    let release = std::thread::spawn(move || {
+        waiting.recv().unwrap();
+        full.recv().unwrap();
+        let (lock, wake) = &*gate;
+        *lock.lock().unwrap() = true;
+        wake.notify_all();
+    });
+    // The writer holds the first observation and the queue holds the next
+    // capacity; the writer recovers only once the following admission must wait.
+    for index in 0..3 * PRESENTATION_QUEUE_CAPACITY {
+        if index == PRESENTATION_QUEUE_CAPACITY + 1 {
+            queue_full.send(()).unwrap();
+        }
+        presentation
+            .observe(step_transition("a", StepStateKind::Starting, None))
+            .await;
+    }
+    presentation.flush_pending().await;
+    release.join().unwrap();
+    assert!(presentation.failure().is_none());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn permanently_blocked_writer_fails_without_blocking_cancellation() {
     let fixture = Fixture::new(workflow_source());
     let (entered, waiting) = std::sync::mpsc::channel();
     let blocked = Arc::new(AtomicBool::new(false));

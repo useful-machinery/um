@@ -1,10 +1,9 @@
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::fmt;
-use std::future::{Future, ready};
+use std::future::Future;
 use std::io::{self, IsTerminal, Write};
 use std::path::Path;
-use std::sync::mpsc::{self, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -12,6 +11,7 @@ use super::text_fit::{display_width, next_detail_segment};
 use serde::Serialize;
 use time::format_description::well_known::Rfc3339;
 use time::{OffsetDateTime, UtcOffset};
+use tokio::sync::mpsc::{self, error::TrySendError};
 use tokio::sync::{oneshot, watch};
 
 use super::super::ExecutionOutcome;
@@ -816,17 +816,68 @@ fn write_pretty_json(writer: &mut impl Write, value: &impl Serialize) -> io::Res
 }
 
 const PRESENTATION_QUEUE_CAPACITY: usize = 1024;
+// A burst larger than the queue waits for the writer; only a writer that stays
+// stalled this long is treated as unreadable output.
+#[cfg(not(test))]
+const PRESENTATION_BACKPRESSURE_TIMEOUT: Duration = Duration::from_secs(30);
+#[cfg(test)]
+const PRESENTATION_BACKPRESSURE_TIMEOUT: Duration = Duration::from_millis(200);
 
 struct PresentationQueue<StandardOutput, StandardError> {
-    sender: SyncSender<PresentationMessage<StandardOutput, StandardError>>,
+    sender: mpsc::Sender<PresentationMessage<StandardOutput, StandardError>>,
     finished: bool,
+}
+
+#[expect(
+    clippy::disallowed_methods,
+    reason = "this is the anti-hang bound that distinguishes a stalled writer from a burst"
+)]
+async fn backpressure_timeout<F: Future>(
+    future: F,
+) -> Result<F::Output, tokio::time::error::Elapsed> {
+    tokio::time::timeout(PRESENTATION_BACKPRESSURE_TIMEOUT, future).await
+}
+
+/// A message admitted behind every earlier message, or one still waiting for capacity.
+enum QueueAdmission<Message> {
+    Sent,
+    Waiting(mpsc::Sender<Message>, Message),
+    Failed(io::ErrorKind),
+}
+
+impl<Message> QueueAdmission<Message> {
+    fn try_admit(sender: &mpsc::Sender<Message>, message: Message) -> Self {
+        match sender.try_reserve() {
+            Ok(permit) => {
+                permit.send(message);
+                Self::Sent
+            }
+            Err(TrySendError::Full(())) => Self::Waiting(sender.clone(), message),
+            Err(TrySendError::Closed(())) => Self::Failed(io::ErrorKind::BrokenPipe),
+        }
+    }
+
+    async fn complete(self) -> Result<(), io::ErrorKind> {
+        match self {
+            Self::Sent => Ok(()),
+            Self::Failed(kind) => Err(kind),
+            Self::Waiting(sender, message) => match backpressure_timeout(sender.reserve()).await {
+                Ok(Ok(permit)) => {
+                    permit.send(message);
+                    Ok(())
+                }
+                Ok(Err(_)) => Err(io::ErrorKind::BrokenPipe),
+                Err(_) => Err(io::ErrorKind::WouldBlock),
+            },
+        }
+    }
 }
 
 type PresentationMessage<StandardOutput, StandardError> =
     Box<dyn FnOnce(&mut PresentationState<StandardOutput, StandardError>) + Send>;
 
 pub struct WorkflowRunPresentation<StandardOutput, StandardError, Clock> {
-    // The lock only serializes nonblocking queue admission, never rendering or I/O.
+    // The lock only orders nonblocking queue admission, never rendering, I/O or waiting.
     sender: Arc<Mutex<PresentationQueue<StandardOutput, StandardError>>>,
     failures: watch::Receiver<Option<PresentationFailure>>,
     failure_sender: watch::Sender<Option<PresentationFailure>>,
@@ -886,7 +937,7 @@ where
             finished: false,
         };
         let opened_at = clock.sample();
-        let (sender, receiver) = mpsc::sync_channel::<
+        let (sender, mut receiver) = mpsc::channel::<
             PresentationMessage<StandardOutput, StandardError>,
         >(PRESENTATION_QUEUE_CAPACITY);
         std::thread::Builder::new()
@@ -895,7 +946,7 @@ where
                 if let Err(failure) = state.write_header(opened_at.utc, maximum_parallel_steps) {
                     state.record_failure(failure);
                 }
-                for message in receiver {
+                while let Some(message) = receiver.blocking_recv() {
                     message(&mut state);
                 }
             })
@@ -933,20 +984,23 @@ where
     }
 
     /// Wait for previously accepted observations without blocking the caller's executor.
-    /// Queue exhaustion instead reports an output failure to subscribers.
+    /// A writer that stays stalled past the backpressure timeout reports an output failure.
     pub async fn flush_pending(&self) {
         let (reply, done) = oneshot::channel();
-        let submitted = {
+        let admission = {
             let queue = self
                 .sender
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            queue.sender.try_send(Box::new(move |_| {
-                let _ = reply.send(());
-            }))
+            QueueAdmission::try_admit(
+                &queue.sender,
+                Box::new(move |_| {
+                    let _ = reply.send(());
+                }),
+            )
         };
-        if let Err(error) = submitted {
-            self.record_queue_failure(&error);
+        if let Err(kind) = admission.complete().await {
+            self.record_queue_failure(kind);
             return;
         }
         if done.await.is_err() {
@@ -1005,23 +1059,26 @@ where
                 ));
             }
             queue.finished = true;
-            queue.sender.try_send(Box::new(move |state| {
-                let publication = match &publication {
-                    OwnedPublication::Published(terminal) => {
-                        PublicationPresentation::Published(terminal)
-                    }
-                    OwnedPublication::Failed(error) => PublicationPresentation::Failed(error),
-                };
-                let _ = reply.send(state.finish_internal(
-                    &run,
-                    publication,
-                    emit_terminal_json,
-                    observed_at,
-                ));
-            }))
+            QueueAdmission::try_admit(
+                &queue.sender,
+                Box::new(move |state| {
+                    let publication = match &publication {
+                        OwnedPublication::Published(terminal) => {
+                            PublicationPresentation::Published(terminal)
+                        }
+                        OwnedPublication::Failed(error) => PublicationPresentation::Failed(error),
+                    };
+                    let _ = reply.send(state.finish_internal(
+                        &run,
+                        publication,
+                        emit_terminal_json,
+                        observed_at,
+                    ));
+                }),
+            )
         };
-        if let Err(error) = submitted {
-            self.record_queue_failure(&error);
+        if let Err(kind) = submitted.complete().await {
+            self.record_queue_failure(kind);
             return WorkflowRunPresentationResult::Failed(
                 self.failure()
                     .unwrap_or_else(|| {
@@ -1052,19 +1109,12 @@ where
         presented
     }
 
-    fn record_queue_failure(
-        &self,
-        error: &TrySendError<PresentationMessage<StandardOutput, StandardError>>,
-    ) {
+    fn record_queue_failure(&self, kind: io::ErrorKind) {
         let mut queue_failure = self
             .queue_failure
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if queue_failure.is_none() && self.failures.borrow().is_none() {
-            let kind = match error {
-                TrySendError::Full(_) => io::ErrorKind::WouldBlock,
-                TrySendError::Disconnected(_) => io::ErrorKind::BrokenPipe,
-            };
             let failure = PresentationFailure {
                 operation: PresentationFailureOperation::LineWriter,
                 error_kind: Some(kind),
@@ -1133,24 +1183,32 @@ where
         observation: ExecutionObservation<Deadline>,
     ) -> impl Future<Output = ()> + Send {
         let observed_at = self.clock.sample();
-        let queue = self
-            .sender
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if !queue.finished
-            && self.failure().is_none()
-            && let Err(error) = queue.sender.try_send(Box::new(move |state| {
-                if state.failure.is_none()
-                    && !state.finished
-                    && let Err(failure) = state.render_observation(observed_at, observation)
-                {
-                    state.record_failure(failure);
-                }
-            }))
-        {
-            self.record_queue_failure(&error);
+        let admission = {
+            let queue = self
+                .sender
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            (!queue.finished && self.failure().is_none()).then(|| {
+                QueueAdmission::try_admit(
+                    &queue.sender,
+                    Box::new(move |state: &mut PresentationState<_, _>| {
+                        if state.failure.is_none()
+                            && !state.finished
+                            && let Err(failure) = state.render_observation(observed_at, observation)
+                        {
+                            state.record_failure(failure);
+                        }
+                    }) as PresentationMessage<StandardOutput, StandardError>,
+                )
+            })
+        };
+        async move {
+            if let Some(admission) = admission
+                && let Err(kind) = admission.complete().await
+            {
+                self.record_queue_failure(kind);
+            }
         }
-        ready(())
     }
 }
 
