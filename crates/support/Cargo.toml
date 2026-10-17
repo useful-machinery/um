@@ -10,6 +10,9 @@ publish = false
 [lints]
 workspace = true
 
+[features]
+test-fixtures = []
+
 [dependencies]
 getrandom.workspace = true
 jsonschema.workspace = true

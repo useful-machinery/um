@@ -1031,6 +1031,10 @@ impl DeferredObservationTimeout {
 const OBSERVATION_POLL_INTERVAL: Duration = Duration::from_secs(2);
 const MAXIMUM_CONSECUTIVE_OBSERVATION_FAILURES: usize = 2;
 
+fn observation_poll_interval() -> Duration {
+    um_support::poll_interval(OBSERVATION_POLL_INTERVAL)
+}
+
 trait ObservationClock {
     fn now(&self) -> Instant;
     fn sleep(&self, duration: Duration);
@@ -1183,7 +1187,7 @@ fn wait_for_terminal_observation_bounded<T, S, E>(
         let Some(remaining) = remaining_observation_wait(timeout, started_at, clock.now()) else {
             return Ok(TerminalObservation::TimedOut);
         };
-        clock.sleep(OBSERVATION_POLL_INTERVAL.min(remaining));
+        clock.sleep(observation_poll_interval().min(remaining));
     }
 }
 
@@ -1196,7 +1200,7 @@ fn remaining_observation_wait(
         Some(timeout) => timeout
             .checked_sub(now.saturating_duration_since(started_at))
             .filter(|remaining| !remaining.is_zero()),
-        None => Some(OBSERVATION_POLL_INTERVAL),
+        None => Some(observation_poll_interval()),
     }
 }
 
@@ -2384,6 +2388,10 @@ mod tests {
             "connection gitlab credential show",
             "connection gitlab list",
             "connection gitlab remove",
+            "connection gitlab repository",
+            "connection gitlab repository link",
+            "connection gitlab repository list",
+            "connection gitlab repository remove",
             "connection gitlab show",
             "connection linear",
             "connection linear authorization",

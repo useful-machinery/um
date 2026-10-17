@@ -5,6 +5,8 @@ use time::OffsetDateTime;
 
 const MINIMUM_RETRY_DELAY_MILLISECONDS: u64 = 50;
 const RETRY_JITTER_MILLISECONDS: u64 = 100;
+#[cfg(feature = "test-fixtures")]
+const TEST_POLL_INTERVAL_MILLISECONDS: &str = "UM_TEST_POLL_INTERVAL_MILLISECONDS";
 
 #[expect(
     clippy::disallowed_methods,
@@ -44,6 +46,19 @@ pub fn sleep(duration: Duration) {
 )]
 pub async fn async_sleep(duration: Duration) {
     tokio::time::sleep(duration).await;
+}
+
+/// Integration tests drive the built command binary and cannot inject a clock,
+/// so builds with `test-fixtures` let them shorten a polling cadence through
+/// the environment. Every other build polls at the production interval.
+pub fn poll_interval(production: Duration) -> Duration {
+    #[cfg(feature = "test-fixtures")]
+    if let Some(milliseconds) = std::env::var_os(TEST_POLL_INTERVAL_MILLISECONDS)
+        .and_then(|value| value.to_str()?.parse().ok())
+    {
+        return Duration::from_millis(milliseconds).min(production);
+    }
+    production
 }
 
 pub fn short_retry_delay() -> Duration {

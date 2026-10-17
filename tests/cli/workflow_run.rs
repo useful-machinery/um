@@ -575,7 +575,7 @@ set -- "$config"/projects/*
 native_project=$1
 printf '{malformed retained transcript' > "$native_project/$session.jsonl"
 while IFS= read -r _; do :; done
-printf '{"type":"system","subtype":"init","cwd":"%s","session_id":"%s","model":"%s","permissionMode":"bypassPermissions","claude_code_version":"2.1.296"}\n' "$PWD" "$session" "$model"
+printf '{"type":"system","subtype":"init","cwd":"%s","session_id":"%s","model":"%s","permissionMode":"bypassPermissions","claude_code_version":"2.1.300"}\n' "$PWD" "$session" "$model"
 printf '{"type":"stream_event","event":{"type":"message_start","message":{"id":"msg-local","type":"message","role":"assistant","content":[],"model":"%s","usage":{"input_tokens":1,"output_tokens":0}}},"session_id":"%s","parent_tool_use_id":null}\n' "$model" "$session"
 printf '{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}},"session_id":"%s","parent_tool_use_id":null}\n' "$session"
 printf '{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"claude response"}},"session_id":"%s","parent_tool_use_id":null}\n' "$session"
@@ -588,7 +588,7 @@ printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":
 
 fn response_claude_code_execution_for_version(version: &str) -> String {
     response_claude_code_execution().replace(
-        "\"claude_code_version\":\"2.1.296\"",
+        "\"claude_code_version\":\"2.1.300\"",
         &format!("\"claude_code_version\":\"{version}\""),
     )
 }
@@ -608,7 +608,7 @@ emit_exchange() {
   value=$2
   call=tool-result-$exchange
   message=msg-result-$exchange
-  printf '{"type":"system","subtype":"init","cwd":"%s","session_id":"%s","model":"%s","permissionMode":"bypassPermissions","claude_code_version":"2.1.296"}\n' "$PWD" "$session" "$model"
+  printf '{"type":"system","subtype":"init","cwd":"%s","session_id":"%s","model":"%s","permissionMode":"bypassPermissions","claude_code_version":"2.1.300"}\n' "$PWD" "$session" "$model"
   printf '{"type":"stream_event","event":{"type":"message_start","message":{"id":"%s","type":"message","role":"assistant","content":[],"model":"%s","usage":{"input_tokens":1,"output_tokens":0}}},"session_id":"%s","parent_tool_use_id":null}\n' "$message" "$model" "$session"
   printf '{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"%s","name":"StructuredOutput","input":{"result":%s}}},"session_id":"%s","parent_tool_use_id":null}\n' "$call" "$value" "$session"
   printf '{"type":"assistant","message":{"id":"%s","type":"message","role":"assistant","content":[{"type":"tool_use","id":"%s","name":"StructuredOutput","input":{"result":%s}}],"model":"%s"},"parent_tool_use_id":null,"session_id":"%s"}\n' "$message" "$call" "$value" "$model" "$session"
@@ -667,7 +667,7 @@ done
 IFS= read -r _
 printf '%s\n' "$$" > "$CLAUDE_FIXTURE_PID"
 trap 'exit 130' INT TERM
-printf '{"type":"system","subtype":"init","cwd":"%s","session_id":"%s","model":"%s","permissionMode":"bypassPermissions","claude_code_version":"2.1.296"}\n' "$PWD" "$session" "$model"
+printf '{"type":"system","subtype":"init","cwd":"%s","session_id":"%s","model":"%s","permissionMode":"bypassPermissions","claude_code_version":"2.1.300"}\n' "$PWD" "$session" "$model"
 printf '\001' > "$WORKFLOW_READY_FIFO"
 IFS= read -r _ < "$WORKFLOW_RELEASE_FIFO"
 exit 23"#
@@ -2068,7 +2068,7 @@ fn agent_installation_rejections_use_inherited_path_order_without_publication() 
 #[test]
 fn claude_code_only_run_pins_the_validated_executable_without_pi_or_path_fallback() {
     let replacement =
-        ClaudeCodeFixture::new("2.1.296 (Claude Code)", CLAUDE_CODE_COMPLETE_HELP, false);
+        ClaudeCodeFixture::new("2.1.300 (Claude Code)", CLAUDE_CODE_COMPLETE_HELP, false);
     let mut probe_barrier = AgentBarrierFixture::new();
     let capability_hook = format!(
         "printf '\\001' > {}; IFS= read -r _ < {}",
@@ -2287,7 +2287,7 @@ fn local_claude_execution_rejects_a_version_that_contradicts_the_validated_snaps
 #[test]
 fn local_admission_probes_only_the_harness_selected_by_the_workflow() {
     let pi = PiFixture::new("0.84.2", COMPLETE_HELP, true);
-    let claude = ClaudeCodeFixture::new("2.1.296 (Claude Code)", CLAUDE_CODE_COMPLETE_HELP, true);
+    let claude = ClaudeCodeFixture::new("2.1.300 (Claude Code)", CLAUDE_CODE_COMPLETE_HELP, true);
     let codex = CodexFixture::with_execution("0.147.0");
 
     let claude_bundle = RunBundle::new(response_claude_code_agent_source());
@@ -2597,7 +2597,7 @@ fn codex_cancellation_quiesces_before_atomic_publication() {
 fn mixed_local_run_invokes_each_harness_once_and_publishes_both_exports() {
     let pi = PiFixture::with_execution("0.84.2", COMPLETE_HELP, true, &response_pi_execution());
     let claude = ClaudeCodeFixture::with_execution(
-        "2.1.296 (Claude Code)",
+        "2.1.300 (Claude Code)",
         CLAUDE_CODE_COMPLETE_HELP,
         true,
         response_claude_code_execution(),
@@ -2663,7 +2663,7 @@ fn mixed_local_run_invokes_each_harness_once_and_publishes_both_exports() {
 fn mixed_pi_claude_and_codex_run_preserves_independent_dispatch_and_atomic_exports() {
     let pi = PiFixture::with_execution("0.84.2", COMPLETE_HELP, true, &response_pi_execution());
     let claude = ClaudeCodeFixture::with_execution(
-        "2.1.296 (Claude Code)",
+        "2.1.300 (Claude Code)",
         CLAUDE_CODE_COMPLETE_HELP,
         true,
         response_claude_code_execution(),
@@ -2745,7 +2745,7 @@ fn mixed_pi_claude_and_codex_run_preserves_independent_dispatch_and_atomic_expor
 #[test]
 fn local_claude_result_correction_publishes_only_the_authoritatively_valid_value() {
     let claude = ClaudeCodeFixture::with_execution(
-        "2.1.296 (Claude Code)",
+        "2.1.300 (Claude Code)",
         CLAUDE_CODE_COMPLETE_HELP,
         true,
         corrected_claude_code_result_execution(),
@@ -2795,7 +2795,7 @@ fn mixed_local_failure_and_cancellation_publish_only_after_quiescence() {
     ] {
         let pi = PiFixture::with_execution("0.84.2", COMPLETE_HELP, true, &response_pi_execution());
         let claude = ClaudeCodeFixture::with_execution(
-            "2.1.296 (Claude Code)",
+            "2.1.300 (Claude Code)",
             CLAUDE_CODE_COMPLETE_HELP,
             true,
             blocked_claude_code_execution(),
@@ -2880,7 +2880,7 @@ fn mixed_local_failure_and_cancellation_publish_only_after_quiescence() {
 #[test]
 fn interrupted_agent_can_be_abandoned_and_retried_without_an_active_ledger_entry() {
     let blocked = ClaudeCodeFixture::with_execution(
-        "2.1.296 (Claude Code)",
+        "2.1.300 (Claude Code)",
         CLAUDE_CODE_COMPLETE_HELP,
         true,
         blocked_claude_code_execution(),
@@ -2926,7 +2926,7 @@ fn interrupted_agent_can_be_abandoned_and_retried_without_an_active_ledger_entry
     let _ = child.wait_with_output().unwrap();
 
     let completed = ClaudeCodeFixture::with_execution(
-        "2.1.296 (Claude Code)",
+        "2.1.300 (Claude Code)",
         CLAUDE_CODE_COMPLETE_HELP,
         true,
         response_claude_code_execution(),
@@ -3391,9 +3391,9 @@ export default function fixtureWrite(pi: ExtensionAPI): void {
 fn pinned_real_pi_runs_the_complete_mixed_value_and_export_dag() {
     let pinned_pi = std::env::var_os("UM_PI_CONFORMANCE_EXECUTABLE")
         .map(PathBuf::from)
-        .filter(|path| path.to_string_lossy().ends_with("-pi-1.2.0/bin/pi"))
+        .filter(|path| path.to_string_lossy().ends_with("-pi-1.3.0/bin/pi"))
         .unwrap_or_else(|| {
-            panic!("UM_PI_CONFORMANCE_EXECUTABLE must name the pinned Pi 1.2.0 executable")
+            panic!("UM_PI_CONFORMANCE_EXECUTABLE must name the pinned Pi 1.3.0 executable")
         });
     let bundle = RunBundle::new(mixed_agent_source());
     for (path, text) in [
@@ -5126,7 +5126,7 @@ fn guardian_loss_cannot_leave_a_descendant_running() {
     let argv = serde_json::to_string(&[
         "sh",
         "-c",
-        "set -eu; printf '%s\\n' \"$$\" > \"$LEADER_FILE\"; printf '%s\\n' \"$PPID\" > \"$GUARDIAN_FILE\"; sleep 300 </dev/null >/dev/null 2>&1 & descendant=$!; printf '%s\\n' \"$descendant\" > \"$DESCENDANT_FILE\"; wait \"$descendant\"",
+        "set -eu; printf '%s\\n' \"$$\" > \"$LEADER_FILE\"; while read -r key parent _; do if [ \"$key\" = PPid: ]; then printf '%s\\n' \"$parent\" > \"$GUARDIAN_FILE\"; break; fi; done < /proc/self/status; sleep 300 </dev/null >/dev/null 2>&1 & descendant=$!; printf '%s\\n' \"$descendant\" > \"$DESCENDANT_FILE\"; wait \"$descendant\"", 
     ])
     .unwrap();
     let bundle = RunBundle::new(&format!(
@@ -5753,7 +5753,7 @@ fn run_with_agent_profiles(bundle: &RunBundle, destination: &Path, document: &Pa
 #[test]
 fn agent_profile_replacement_pins_the_replacement_harness_and_records_provenance() {
     let claude = ClaudeCodeFixture::with_execution(
-        "2.1.296 (Claude Code)",
+        "2.1.300 (Claude Code)",
         CLAUDE_CODE_COMPLETE_HELP,
         true,
         response_claude_code_execution(),

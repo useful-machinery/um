@@ -75,15 +75,18 @@ pub(crate) fn assemble_artifact_set(
         run_id,
         destination,
         um_support::utc_now,
+        File::sync_all,
     )
 }
 
+/// Production syncs every downloaded member before the staged set is committed.
 fn assemble_artifact_set_with_clock(
     source: &mut impl ArtifactSource,
     organization: &str,
     run_id: &str,
     destination: &Path,
     mut now: impl FnMut() -> time::OffsetDateTime,
+    sync_member: fn(&File) -> std::io::Result<()>,
 ) -> Result<AssembledArtifact, ArtifactAssemblyError> {
     let inventory = collect_inventory(source, organization, run_id)?;
     let (parent, destination_name) = destination_parent(destination)?;
@@ -106,6 +109,7 @@ fn assemble_artifact_set_with_clock(
             &inventory,
             batch,
             &mut now,
+            sync_member,
         )?;
     }
 
@@ -135,6 +139,10 @@ fn assemble_artifact_set_with_clock(
     })
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the batch carries the assembly's clock and durability test seams"
+)]
 fn download_capability_batch(
     source: &mut impl ArtifactSource,
     organization: &str,
@@ -143,6 +151,7 @@ fn download_capability_batch(
     inventory: &CompleteInventory,
     batch: &[ArtifactMember],
     now: &mut impl FnMut() -> time::OffsetDateTime,
+    sync_member: fn(&File) -> std::io::Result<()>,
 ) -> Result<(), ArtifactAssemblyError> {
     let retention_expires_at = parse_artifact_timestamp(&inventory.expires_at)?;
     let mut first_undownloaded = 0;
@@ -175,7 +184,7 @@ fn download_capability_batch(
                 }
                 break;
             }
-            download_member(source, staging, capability)?;
+            download_member(source, staging, capability, sync_member)?;
             first_undownloaded += 1;
         }
     }
@@ -301,6 +310,7 @@ fn download_member(
     source: &mut impl ArtifactSource,
     staging: &Path,
     capability: &ArtifactCapabilityMember,
+    sync_member: fn(&File) -> std::io::Result<()>,
 ) -> Result<(), ArtifactAssemblyError> {
     let path = staging.join(&capability.member.path);
     let mut file = OpenOptions::new()
@@ -312,8 +322,7 @@ fn download_member(
     let downloaded = source.download(capability, &mut file)?;
     file.flush()
         .map_err(|_| ArtifactAssemblyError::StagingUnavailable)?;
-    file.sync_all()
-        .map_err(|_| ArtifactAssemblyError::StagingUnavailable)?;
+    sync_member(&file).map_err(|_| ArtifactAssemblyError::StagingUnavailable)?;
     if downloaded.size_bytes != capability.member.size_bytes
         || downloaded.sha256 != capability.member.sha256
     {
@@ -528,7 +537,17 @@ mod tests {
         let destination = root.path().join("artifact-set");
         let mut source = fake_source(pages, bytes);
 
-        let assembled = assemble_fixture(&mut source, &destination).unwrap();
+        // Durably syncing 4,097 members costs tens of seconds on some hosts and
+        // proves nothing the smaller fixtures' production syncs do not.
+        let assembled = assemble_artifact_set_with_clock(
+            &mut source,
+            "acme",
+            "run_fixture",
+            &destination,
+            fixture_now,
+            |_| Ok(()),
+        )
+        .unwrap();
 
         assert_eq!(assembled.member_count, 4097);
         assert_eq!(source.issue_count, 41);
@@ -555,9 +574,15 @@ mod tests {
             }
         };
 
-        let assembled =
-            assemble_artifact_set_with_clock(&mut source, "acme", "run_fixture", &destination, now)
-                .unwrap();
+        let assembled = assemble_artifact_set_with_clock(
+            &mut source,
+            "acme",
+            "run_fixture",
+            &destination,
+            now,
+            File::sync_all,
+        )
+        .unwrap();
 
         assert_eq!(assembled.member_count, 2);
         assert_eq!(source.issue_count, 2);
@@ -614,9 +639,18 @@ mod tests {
         source: &mut FakeSource,
         destination: &Path,
     ) -> Result<AssembledArtifact, ArtifactAssemblyError> {
-        assemble_artifact_set_with_clock(source, "acme", "run_fixture", destination, || {
-            test_timestamp("2026-08-17T12:01:00Z")
-        })
+        assemble_artifact_set_with_clock(
+            source,
+            "acme",
+            "run_fixture",
+            destination,
+            fixture_now,
+            File::sync_all,
+        )
+    }
+
+    fn fixture_now() -> time::OffsetDateTime {
+        test_timestamp("2026-08-17T12:01:00Z")
     }
 
     fn test_timestamp(value: &str) -> time::OffsetDateTime {

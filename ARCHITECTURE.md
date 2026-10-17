@@ -96,14 +96,14 @@ executable's native version and help probes. The isolated probes retain inherite
 only so an environment-based launcher can resolve its interpreter; they never use it to
 select another harness candidate.
 
-Pi maps canonical stable versions in `>=0.84.2 <0.88.0` or exactly `0.99.1` or `1.2.0` into
-`ValidatedPiInstallation`; the repository separately qualifies exact release `1.2.0`.
+Pi maps canonical stable versions in `>=0.84.2 <0.88.0` or exactly `0.99.1`, `1.2.0`, or `1.3.0` into
+`ValidatedPiInstallation`; the repository separately qualifies exact release `1.3.0`.
 Claude Code maps canonical stable versions in
 `>=2.1.234 <2.2.0` into `ValidatedClaudeCodeInstallation`; the repository separately
-qualifies exact release `2.1.296`. Codex maps stable `>=0.147.0 <0.163.0`
+qualifies exact release `2.1.300`. Codex maps stable `>=0.147.0 <0.164.0`
 installations with the maintained App Server schema capabilities into
 `ValidatedCodexInstallation`; the repository separately qualifies exact release
-`0.162.1`. Each immutable value carries the absolute path, exact
+`0.163.0`. Each immutable value carries the absolute path, exact
 observed version, closed profile, and closed capability set. Local and runner admission
 inspect resolved workflows and require only each selected installation. Admission and
 later execution use those values without another `PATH` lookup or native probe, so later

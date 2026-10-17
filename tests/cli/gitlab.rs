@@ -254,6 +254,309 @@ fn connection_and_candidate_verbs_use_exact_resources_and_explicit_bodies() {
 }
 
 #[test]
+fn repository_discovery_and_selection_use_exact_generated_actions() {
+    let mut selected = active_connection();
+    selected["version"] = 5.into();
+    selected["selectedRepositoryIds"] = serde_json::json!(["123456789", "42"]);
+    let mut removed = selected.clone();
+    removed["version"] = 6.into();
+    removed["selectedRepositoryIds"] = serde_json::json!([]);
+    let page = serde_json::json!({"items":[{"providerRepositoryId":"123456789",
+        "fullName":"group/subgroup/widget", "defaultBranch":"main", "selected":true,
+        "availability":"unavailable"}], "nextCursor":"another-page"});
+    let (server, _dir, credential) = prepared(vec![
+        json_http_response("200 OK", page.clone()),
+        json_http_response("200 OK", page.clone()),
+        json_http_response("200 OK", page),
+        json_http_response("200 OK", selected),
+        json_http_response("200 OK", removed),
+    ]);
+    let doc = single(&run_gitlab(
+        &server,
+        &credential,
+        &[
+            "repository",
+            "list",
+            ORG,
+            CONNECTION,
+            "--selected",
+            "--limit",
+            "1",
+        ],
+    ));
+    assert_eq!(doc["result"]["nextCursor"], "another-page");
+    assert_eq!(doc["result"]["items"][0]["availability"], "unavailable");
+    let human = run_with_env(
+        &[
+            "connection",
+            "gitlab",
+            "repository",
+            "list",
+            ORG,
+            CONNECTION,
+            "--search",
+            "widget",
+            "--cursor",
+            "another-page",
+            "--allow-insecure-http",
+        ],
+        &deployment_environment(&server.api_url, &credential),
+    );
+    assert!(human.status.success(), "{human:?}");
+    let text = String::from_utf8(human.stdout).unwrap();
+    assert!(text.contains("123456789  group/subgroup/widget  main  selected  unavailable"));
+    assert!(text.contains("next cursor: another-page"));
+    let exact = single(&run_gitlab(
+        &server,
+        &credential,
+        &[
+            "repository",
+            "list",
+            ORG,
+            CONNECTION,
+            "--repository-id",
+            "123456789",
+        ],
+    ));
+    assert_eq!(
+        exact["result"]["items"][0]["providerRepositoryId"],
+        "123456789"
+    );
+    for (verb, version, outcome) in [("link", "4", "linked"), ("remove", "5", "removed")] {
+        let args = [
+            vec![
+                "repository",
+                verb,
+                ORG,
+                CONNECTION,
+                "--repository-id",
+                "123456789",
+                "--repository-id",
+                "42",
+                "--expected-version",
+                version,
+                "--idempotency-key",
+                "selection-key",
+                "--delegator-principal-id",
+                "prn_01k0z6r1w8f4jy2m7q9v3x5abc",
+            ],
+            if verb == "remove" {
+                vec!["--yes"]
+            } else {
+                vec![]
+            },
+        ]
+        .concat();
+        let doc = single(&run_gitlab(&server, &credential, &args));
+        assert_eq!(doc["outcome"], outcome);
+        assert_eq!(doc["idempotencyKey"], "selection-key");
+    }
+    let requests = server.finish();
+    request(
+        &requests[0],
+        "GET",
+        &format!("/{CONNECTION}/repositories?limit=1&selected=true"),
+        None,
+        None,
+    );
+    request(
+        &requests[1],
+        "GET",
+        &format!("/{CONNECTION}/repositories?cursor=another-page&search=widget"),
+        None,
+        None,
+    );
+    request(
+        &requests[2],
+        "GET",
+        &format!("/{CONNECTION}/repositories?providerRepositoryId=123456789"),
+        None,
+        None,
+    );
+    for (index, version, field) in [
+        (3, 4, "addProviderRepositoryIds"),
+        (4, 5, "removeProviderRepositoryIds"),
+    ] {
+        request(
+            &requests[index],
+            "PATCH",
+            &format!("/{CONNECTION}/repository-selection"),
+            Some(serde_json::json!({
+                "expectedVersion":version, (field):["123456789", "42"],
+                "delegatorPrincipalId":"prn_01k0z6r1w8f4jy2m7q9v3x5abc"
+            })),
+            Some("selection-key"),
+        );
+    }
+}
+
+#[test]
+fn repository_selection_preconditions_conflicts_and_lost_response_replay() {
+    let (server, _dir, credential) = prepared(vec![]);
+    for args in [
+        vec![
+            "repository",
+            "link",
+            ORG,
+            CONNECTION,
+            "--repository-id",
+            "0",
+            "--expected-version",
+            "4",
+        ],
+        vec![
+            "repository",
+            "remove",
+            ORG,
+            CONNECTION,
+            "--repository-id",
+            "42",
+            "--expected-version",
+            "0",
+            "--yes",
+        ],
+        vec![
+            "repository",
+            "list",
+            ORG,
+            CONNECTION,
+            "--selected",
+            "--search",
+            "foo",
+        ],
+        vec![
+            "repository",
+            "list",
+            ORG,
+            CONNECTION,
+            "--repository-id",
+            "01",
+        ],
+        vec![
+            "repository",
+            "link",
+            ORG,
+            CONNECTION,
+            "--expected-version",
+            "4",
+        ],
+        vec![
+            "repository",
+            "link",
+            ORG,
+            CONNECTION,
+            "--repository-id",
+            "42",
+            "--repository-id",
+            "0",
+            "--expected-version",
+            "4",
+        ],
+        vec![
+            "repository",
+            "remove",
+            ORG,
+            CONNECTION,
+            "--repository-id",
+            "42",
+            "--repository-id",
+            "+43",
+            "--expected-version",
+            "4",
+            "--yes",
+        ],
+        vec![
+            "repository",
+            "link",
+            ORG,
+            CONNECTION,
+            "--repository-id",
+            "42",
+            "--repository-id",
+            "9223372036854775808",
+            "--expected-version",
+            "4",
+        ],
+    ] {
+        let output = run_gitlab(&server, &credential, &args);
+        assert_eq!(output.status.code(), Some(2), "{output:?}");
+        assert!(output.stdout.is_empty());
+    }
+    assert!(server.finish().is_empty());
+
+    let conflict = problem_http_response(
+        "409 Conflict",
+        serde_json::json!({
+            "type":"https://api.usefulmachinery.com/problems/repository-unavailable",
+            "title":"Conflict", "status":409, "detail":SECRET
+        }),
+    );
+    let (server, _dir, credential) = prepared(vec![conflict]);
+    let output = run_gitlab(
+        &server,
+        &credential,
+        &[
+            "repository",
+            "link",
+            ORG,
+            CONNECTION,
+            "--repository-id",
+            "42",
+            "--expected-version",
+            "4",
+        ],
+    );
+    assert_eq!(output.status.code(), Some(6));
+    assert!(output.stdout.is_empty());
+    assert!(!String::from_utf8_lossy(&output.stderr).contains(SECRET));
+    assert_eq!(server.finish().len(), 1);
+
+    for verb in ["link", "remove"] {
+        let (server, _dir, credential) = prepared(vec![
+            Vec::new(),
+            json_http_response("200 OK", active_connection()),
+        ]);
+        let args = [
+            vec![
+                "repository",
+                verb,
+                ORG,
+                CONNECTION,
+                "--repository-id",
+                "42",
+                "--repository-id",
+                "43",
+                "--expected-version",
+                "3",
+                "--idempotency-key",
+                "replay-selection",
+            ],
+            if verb == "remove" {
+                vec!["--yes"]
+            } else {
+                vec![]
+            },
+        ]
+        .concat();
+        let doc = single(&run_gitlab(&server, &credential, &args));
+        assert_eq!(doc["idempotencyKey"], "replay-selection");
+        let calls = server.finish();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0], calls[1]);
+        request(
+            &calls[0],
+            "PATCH",
+            &format!("/{CONNECTION}/repository-selection"),
+            Some(serde_json::json!({
+                "expectedVersion":3,
+                (if verb == "link" { "addProviderRepositoryIds" } else { "removeProviderRepositoryIds" }):["42", "43"]
+            })),
+            Some("replay-selection"),
+        );
+    }
+}
+
+#[test]
 fn active_connection_rendering_uses_only_nonsecret_metadata() {
     let mut active = active_connection();
     // A malformed upstream extension cannot turn an unknown field into CLI output.
@@ -308,7 +611,7 @@ fn human_candidate_review_shows_verified_identity_and_expiry_without_secret() {
         "42",
         "dedicated_user",
         "api",
-        "2027-09-05T00:00:00Z",
+        "token expires (UTC instant): 2027-09-05T00:00:00Z",
     ] {
         assert!(text.contains(value));
     }
@@ -402,7 +705,7 @@ fn terminal_review_requires_exact_identity_and_dedication_before_activation() {
             "Enter the verified provider user ID: ",
         );
         assert!(transcript.contains("automation-bot (42)"));
-        assert!(transcript.contains("2027-09-05T00:00:00Z"));
+        assert!(transcript.contains("token expires (UTC instant): 2027-09-05T00:00:00Z"));
         writer.write_all(format!("{id}\n").as_bytes()).unwrap();
         if let Some(attestation) = attestation {
             await_terminal_prompt(
@@ -452,6 +755,10 @@ fn help_links_public_setup_and_requires_explicit_activation_flags() {
     for args in [
         vec!["connection", "gitlab", "--help"],
         vec!["connection", "gitlab", "credential", "activate", "--help"],
+        vec!["connection", "gitlab", "repository", "list", "--help"],
+        vec!["connection", "gitlab", "repository", "link", "--help"],
+        vec!["project", "create", "--help"],
+        vec!["project", "repository", "set", "--help"],
     ] {
         let output = run(&args);
         assert!(output.status.success());

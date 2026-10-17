@@ -5,9 +5,68 @@ use std::path::{Path, PathBuf};
 
 use rustix::fs::{AtFlags, FileType, Mode, OFlags, fstat, openat, renameat, statat, unlinkat};
 
+use crate::service::recovery::{RecoveryHost, SystemRecoveryHost};
 use serde::{Deserialize, Serialize};
 
 const GUARDS_FILE: &str = "process-guards-v1.json";
+const RECOVERY_GUARDS_FILE: &str = "process-guards-v2.json";
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub(in crate::service) struct HostBoot {
+    pub(super) host_binding: String,
+    pub(super) os_boot_id: String,
+}
+
+impl HostBoot {
+    pub(in crate::service) fn inspect(
+        host_binding: &str,
+        host: &dyn RecoveryHost,
+    ) -> Result<Self, ProcessGuardStoreError> {
+        let os_boot_id = host.os_boot_id().map_err(|_| ProcessGuardStoreError)?;
+        let os_boot_id = os_boot_id.trim_end_matches(['\r', '\n']).to_owned();
+        if host_binding.len() != 32
+            || !host_binding.bytes().all(|c| c.is_ascii_hexdigit())
+            || !canonical_uuid(&os_boot_id)
+        {
+            return Err(ProcessGuardStoreError);
+        }
+        Ok(Self {
+            host_binding: host_binding.to_owned(),
+            os_boot_id,
+        })
+    }
+}
+
+fn canonical_uuid(value: &str) -> bool {
+    value.len() == 36
+        && value.bytes().enumerate().all(|(i, c)| {
+            if [8, 13, 18, 23].contains(&i) {
+                c == b'-'
+            } else {
+                c.is_ascii_digit() || (b'a'..=b'f').contains(&c)
+            }
+        })
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct StoredJournal {
+    schema_version: u8,
+    records: Vec<StoredGuardV2>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct StoredGuardV2 {
+    guard_id: String,
+    host_binding: String,
+    os_boot_id: String,
+    process_group_id: i32,
+    leader_start_identity: String,
+    lifecycle: StoredLifecycle,
+}
+
 const MAX_GUARDS_BYTES: u64 = 1024 * 1024;
 const NOFOLLOW: i32 = rustix::fs::OFlags::NOFOLLOW.bits().cast_signed();
 
@@ -18,6 +77,8 @@ struct StoredGuard {
     group: i32,
     leader_start_identity: String,
     lifecycle: StoredLifecycle,
+    #[serde(skip)]
+    os_boot_id: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -54,10 +115,18 @@ impl From<StoredLifecycle> for GuardLifecycle {
 struct GuardJournal {
     directory: File,
     private: PathBuf,
+    binding: Option<HostBoot>,
+    host: Arc<dyn RecoveryHost>,
 }
 
 impl GuardJournal {
-    fn open(private: &Path) -> Result<Self, ProcessGuardStoreError> {
+    fn current_boot(&self) -> Option<Result<HostBoot, ProcessGuardStoreError>> {
+        self.binding
+            .as_ref()
+            .map(|binding| HostBoot::inspect(&binding.host_binding, self.host.as_ref()))
+    }
+
+    fn open(private: &Path, host: Arc<dyn RecoveryHost>) -> Result<Self, ProcessGuardStoreError> {
         let directory = OpenOptions::new()
             .read(true)
             .custom_flags(rustix::fs::OFlags::DIRECTORY.bits().cast_signed() | NOFOLLOW)
@@ -77,6 +146,8 @@ impl GuardJournal {
         Ok(Self {
             directory,
             private: private.to_owned(),
+            binding: None,
+            host,
         })
     }
 
@@ -92,10 +163,27 @@ impl GuardJournal {
         Ok(())
     }
 
-    fn create(private: &Path) -> Result<Self, ProcessGuardStoreError> {
-        let journal = Self::open(private)?;
+    fn create(
+        private: &Path,
+        binding: Option<HostBoot>,
+        host: Arc<dyn RecoveryHost>,
+    ) -> Result<Self, ProcessGuardStoreError> {
+        let mut journal = Self::open(private, host)?;
+        journal.binding = binding;
         journal.binding_matches()?;
-        match statat(&journal.directory, GUARDS_FILE, AtFlags::SYMLINK_NOFOLLOW) {
+        let other = if journal.binding.is_some() {
+            GUARDS_FILE
+        } else {
+            RECOVERY_GUARDS_FILE
+        };
+        if !matches!(
+            statat(&journal.directory, other, AtFlags::SYMLINK_NOFOLLOW),
+            Err(rustix::io::Errno::NOENT)
+        ) {
+            return Err(ProcessGuardStoreError);
+        }
+        let name = journal.name();
+        match statat(&journal.directory, name, AtFlags::SYMLINK_NOFOLLOW) {
             Err(error) if error == rustix::io::Errno::NOENT => {}
             _ => return Err(ProcessGuardStoreError),
         }
@@ -105,13 +193,19 @@ impl GuardJournal {
         let mut file = File::from(
             openat(
                 &journal.directory,
-                GUARDS_FILE,
+                name,
                 OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
                 Mode::from_raw_mode(0o600),
             )
             .map_err(|_| ProcessGuardStoreError)?,
         );
-        file.write_all(b"[]").map_err(|_| ProcessGuardStoreError)?;
+        let initial = if journal.binding.is_some() {
+            b"{\"schemaVersion\":2,\"records\":[]}".as_slice()
+        } else {
+            b"[]".as_slice()
+        };
+        file.write_all(initial)
+            .map_err(|_| ProcessGuardStoreError)?;
         file.sync_all().map_err(|_| ProcessGuardStoreError)?;
         journal
             .directory
@@ -121,10 +215,20 @@ impl GuardJournal {
         Ok(journal)
     }
 
+    fn name(&self) -> &'static str {
+        if self.binding.is_some() {
+            RECOVERY_GUARDS_FILE
+        } else {
+            GUARDS_FILE
+        }
+    }
+
     fn persist(
         &self,
         records: &BTreeMap<String, GuardRecord>,
     ) -> Result<(), ProcessGuardStoreError> {
+        // A missing/corrupt prior image cannot be repaired by a new writer.
+        self.read()?;
         let values = records
             .iter()
             .map(|(id, record)| StoredGuard {
@@ -132,9 +236,31 @@ impl GuardJournal {
                 group: record.identity.process_group_id(),
                 leader_start_identity: record.identity.leader_start_identity().to_owned(),
                 lifecycle: record.lifecycle.into(),
+                os_boot_id: record.os_boot_id.clone(),
             })
             .collect::<Vec<_>>();
-        let contents = serde_json::to_vec(&values).map_err(|_| ProcessGuardStoreError)?;
+        let contents = if let Some(binding) = &self.binding {
+            let records = records
+                .iter()
+                .map(|(guard_id, record)| {
+                    Ok(StoredGuardV2 {
+                        guard_id: guard_id.clone(),
+                        host_binding: binding.host_binding.clone(),
+                        os_boot_id: record.os_boot_id.clone().ok_or(ProcessGuardStoreError)?,
+                        process_group_id: record.identity.process_group_id(),
+                        leader_start_identity: record.identity.leader_start_identity().to_owned(),
+                        lifecycle: record.lifecycle.into(),
+                    })
+                })
+                .collect::<Result<Vec<_>, ProcessGuardStoreError>>()?;
+            serde_json::to_vec(&StoredJournal {
+                schema_version: 2,
+                records,
+            })
+        } else {
+            serde_json::to_vec(&values)
+        }
+        .map_err(|_| ProcessGuardStoreError)?;
         if u64::try_from(contents.len()).map_err(|_| ProcessGuardStoreError)? > MAX_GUARDS_BYTES {
             return Err(ProcessGuardStoreError);
         }
@@ -165,7 +291,7 @@ impl GuardJournal {
                 &self.directory,
                 temporary.as_str(),
                 &self.directory,
-                GUARDS_FILE,
+                self.name(),
             )
             .map_err(|_| ProcessGuardStoreError)?;
             self.directory
@@ -181,17 +307,28 @@ impl GuardJournal {
 
     fn read(&self) -> Result<BTreeMap<String, GuardRecord>, ProcessGuardStoreError> {
         self.binding_matches()?;
+        let other = if self.binding.is_some() {
+            GUARDS_FILE
+        } else {
+            RECOVERY_GUARDS_FILE
+        };
+        if !matches!(
+            statat(&self.directory, other, AtFlags::SYMLINK_NOFOLLOW),
+            Err(rustix::io::Errno::NOENT)
+        ) {
+            return Err(ProcessGuardStoreError);
+        }
         let file = File::from(
             openat(
                 &self.directory,
-                GUARDS_FILE,
-                OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                self.name(),
+                OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOFOLLOW | OFlags::CLOEXEC,
                 Mode::empty(),
             )
             .map_err(|_| ProcessGuardStoreError)?,
         );
         let metadata = fstat(&file).map_err(|_| ProcessGuardStoreError)?;
-        let named = statat(&self.directory, GUARDS_FILE, AtFlags::SYMLINK_NOFOLLOW)
+        let named = statat(&self.directory, self.name(), AtFlags::SYMLINK_NOFOLLOW)
             .map_err(|_| ProcessGuardStoreError)?;
         if FileType::from_raw_mode(metadata.st_mode) != FileType::RegularFile
             || metadata.st_uid != rustix::process::geteuid().as_raw()
@@ -209,8 +346,33 @@ impl GuardJournal {
         if u64::try_from(bytes.len()).map_err(|_| ProcessGuardStoreError)? > MAX_GUARDS_BYTES {
             return Err(ProcessGuardStoreError);
         }
-        let values: Vec<StoredGuard> =
-            serde_json::from_slice(&bytes).map_err(|_| ProcessGuardStoreError)?;
+        let values: Vec<StoredGuard> = if let Some(binding) = &self.binding {
+            let journal: StoredJournal =
+                serde_json::from_slice(&bytes).map_err(|_| ProcessGuardStoreError)?;
+            if journal.schema_version != 2 {
+                return Err(ProcessGuardStoreError);
+            }
+            journal
+                .records
+                .into_iter()
+                .map(|record| {
+                    if record.host_binding != binding.host_binding
+                        || !canonical_uuid(&record.os_boot_id)
+                    {
+                        return Err(ProcessGuardStoreError);
+                    }
+                    Ok(StoredGuard {
+                        id: record.guard_id,
+                        group: record.process_group_id,
+                        leader_start_identity: record.leader_start_identity,
+                        lifecycle: record.lifecycle,
+                        os_boot_id: Some(record.os_boot_id),
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?
+        } else {
+            serde_json::from_slice(&bytes).map_err(|_| ProcessGuardStoreError)?
+        };
         let mut records = BTreeMap::new();
         for value in values {
             let group =
@@ -225,6 +387,7 @@ impl GuardJournal {
                         GuardRecord {
                             identity,
                             lifecycle: value.lifecycle.into(),
+                            os_boot_id: value.os_boot_id,
                         },
                     )
                     .is_some()
@@ -232,7 +395,7 @@ impl GuardJournal {
                 return Err(ProcessGuardStoreError);
             }
         }
-        let current = statat(&self.directory, GUARDS_FILE, AtFlags::SYMLINK_NOFOLLOW)
+        let current = statat(&self.directory, self.name(), AtFlags::SYMLINK_NOFOLLOW)
             .map_err(|_| ProcessGuardStoreError)?;
         if metadata.st_dev != current.st_dev || metadata.st_ino != current.st_ino {
             return Err(ProcessGuardStoreError);
@@ -253,6 +416,7 @@ pub(super) enum GuardLifecycle {
 pub(super) struct GuardRecord {
     identity: AuthenticatedProcessGroup,
     lifecycle: GuardLifecycle,
+    os_boot_id: Option<String>,
 }
 
 pub(super) trait GuardProcessControl: Send + Sync {
@@ -308,14 +472,59 @@ impl AssignmentProcessGuards {
     }
 
     pub(in crate::service) fn durable(private: &Path) -> Result<Self, ProcessGuardStoreError> {
-        GuardJournal::create(private)?;
+        GuardJournal::create(private, None, Arc::new(SystemRecoveryHost))?;
         Self::recover(private)
+    }
+
+    pub(in crate::service) fn durable_recovery(
+        private: &Path,
+        binding: HostBoot,
+        host: Arc<dyn RecoveryHost>,
+    ) -> Result<Self, ProcessGuardStoreError> {
+        GuardJournal::create(private, Some(binding.clone()), Arc::clone(&host))?;
+        Self::recover_with(private, Some(binding), host)
     }
 
     // Call only after authenticating the retaining assignment's exact workspace
     // and private directory. Never recover a prior owner's guards for a new root.
     pub(in crate::service) fn recover(private: &Path) -> Result<Self, ProcessGuardStoreError> {
-        let journal = GuardJournal::open(private)?;
+        let host: Arc<dyn RecoveryHost> = Arc::new(SystemRecoveryHost);
+        let journal = GuardJournal::open(private, Arc::clone(&host))?;
+        if statat(
+            &journal.directory,
+            RECOVERY_GUARDS_FILE,
+            AtFlags::SYMLINK_NOFOLLOW,
+        )
+        .is_ok()
+        {
+            let binding = host.host_binding().map_err(|_| ProcessGuardStoreError)?;
+            return Self::recover_with(
+                private,
+                Some(HostBoot::inspect(
+                    binding.trim_end_matches(['\r', '\n']),
+                    host.as_ref(),
+                )?),
+                host,
+            );
+        }
+        Self::recover_with(private, None, host)
+    }
+
+    pub(in crate::service) fn recover_recovery(
+        private: &Path,
+        binding: HostBoot,
+        host: Arc<dyn RecoveryHost>,
+    ) -> Result<Self, ProcessGuardStoreError> {
+        Self::recover_with(private, Some(binding), host)
+    }
+
+    fn recover_with(
+        private: &Path,
+        binding: Option<HostBoot>,
+        host: Arc<dyn RecoveryHost>,
+    ) -> Result<Self, ProcessGuardStoreError> {
+        let mut journal = GuardJournal::open(private, host)?;
+        journal.binding = binding;
         let records = journal.read()?;
         let mut sequences = std::collections::BTreeSet::new();
         let mut highest = 0_u64;
@@ -349,6 +558,13 @@ impl AssignmentProcessGuards {
         Ok(guards)
     }
 
+    pub(in crate::service) fn recovery_journal(&self) -> bool {
+        self.lock()
+            .journal
+            .as_ref()
+            .is_some_and(|journal| journal.binding.is_some())
+    }
+
     pub(in crate::service) fn registry(&self, guarded: bool) -> ProcessGuardRegistry {
         if guarded {
             let store: Arc<dyn DurableProcessGuardStore> = Arc::new(self.clone());
@@ -362,10 +578,22 @@ impl AssignmentProcessGuards {
         let (identities, control) = {
             let mut state = self.lock();
             state.forced_containment_started = true;
+            let current = state
+                .journal
+                .as_ref()
+                .and_then(|journal| journal.current_boot())
+                .and_then(Result::ok);
             let identities = state
                 .records
                 .values()
-                .filter(|record| record.lifecycle != GuardLifecycle::Quiesced)
+                .filter(|record| {
+                    record.lifecycle != GuardLifecycle::Quiesced
+                        && record.os_boot_id.as_ref().is_none_or(|boot| {
+                            current
+                                .as_ref()
+                                .is_some_and(|identity| boot == &identity.os_boot_id)
+                        })
+                })
                 .map(|record| record.identity.clone())
                 .collect::<Vec<_>>();
             (identities, Arc::clone(&state.control))
@@ -379,11 +607,22 @@ impl AssignmentProcessGuards {
     // the report must describe the same observation, not two racing inspections.
     pub(super) fn quiescence_snapshot(&self) -> (bool, Vec<String>) {
         let state = self.lock();
+        let current = state
+            .journal
+            .as_ref()
+            .and_then(|journal| journal.current_boot());
+        let boot_unknown = current.as_ref().is_some_and(Result::is_err);
         let surviving = state
             .records
             .iter()
             .filter(|(_, record)| {
                 record.lifecycle != GuardLifecycle::Quiesced
+                    && record.os_boot_id.as_ref().is_none_or(|boot| {
+                        current
+                            .as_ref()
+                            .and_then(|result| result.as_ref().ok())
+                            .is_some_and(|identity| boot == &identity.os_boot_id)
+                    })
                     && !matches!(
                         state.control.observe(&record.identity),
                         ProcessIdentityObservation::Absent
@@ -401,7 +640,10 @@ impl AssignmentProcessGuards {
         if let Some(quiescent) = &state.quiescence_fixture {
             return (quiescent.load(Ordering::Acquire), surviving);
         }
-        (surviving.is_empty() && !state.journal_failed, surviving)
+        (
+            surviving.is_empty() && !state.journal_failed && !boot_unknown,
+            surviving,
+        )
     }
 
     pub(in crate::service) fn is_quiescent(&self) -> bool {
@@ -461,17 +703,32 @@ impl AssignmentProcessGuards {
                 return Err(ProcessGuardStoreError);
             }
             let control = Arc::clone(&state.control);
-            identities.extend(
-                state
-                    .records
-                    .values()
-                    .map(|record| (record.identity.clone(), Arc::clone(&control))),
-            );
+            let current_boot = state
+                .journal
+                .as_ref()
+                .and_then(|journal| journal.current_boot())
+                .transpose()?;
+            identities.extend(state.records.values().map(|record| {
+                (
+                    record.identity.clone(),
+                    Arc::clone(&control),
+                    record
+                        .os_boot_id
+                        .as_ref()
+                        .zip(current_boot.as_ref())
+                        .map(|(recorded, current)| recorded != &current.os_boot_id)
+                        .unwrap_or(false),
+                )
+            }));
         }
         let recorded = u64::try_from(identities.len()).map_err(|_| ProcessGuardStoreError)?;
         let mut exact = Vec::new();
         let mut absent = 0_u64;
-        for (identity, control) in identities {
+        for (identity, control, old_boot) in identities {
+            if old_boot {
+                absent += 1;
+                continue;
+            }
             match control.observe(&identity) {
                 ProcessIdentityObservation::Exact { .. } => exact.push((identity, control)),
                 ProcessIdentityObservation::Absent => absent += 1,
@@ -551,11 +808,17 @@ impl DurableProcessGuardStore for AssignmentProcessGuards {
         let id = format!("{step}:{action_id}:{}", state.next_id);
         state.next_id = state.next_id.checked_add(1).ok_or(ProcessGuardStoreError)?;
         // A stalled write cannot hide a pending launch from forced containment.
+        let os_boot_id = state
+            .journal
+            .as_ref()
+            .and_then(|journal| journal.binding.as_ref())
+            .map(|binding| binding.os_boot_id.clone());
         state.records.insert(
             id.clone(),
             GuardRecord {
                 identity: identity.clone(),
                 lifecycle: GuardLifecycle::Prepared,
+                os_boot_id,
             },
         );
         let updated = state.records.clone();
@@ -780,7 +1043,7 @@ mod tests {
         assert!(guards.register("node", 3, &identity()).is_err());
         assert!(!other_private.join(GUARDS_FILE).exists());
         assert!(
-            GuardJournal::open(&original)
+            GuardJournal::open(&original, Arc::new(SystemRecoveryHost))
                 .expect("original handle")
                 .read()
                 .expect("original journal")
@@ -834,6 +1097,60 @@ mod tests {
         std::os::unix::fs::symlink(temp.path().join("outside"), &journal)
             .expect("substitute journal");
         assert!(AssignmentProcessGuards::recover(&private).is_err());
+    }
+
+    #[test]
+    fn recovery_journal_never_signals_a_recycled_group_after_os_reboot() {
+        use crate::service::recovery::host_fixture::fixture_host;
+
+        let (_temp, private) = private_directory();
+        let binding = HostBoot::inspect("a".repeat(32).as_str(), fixture_host().as_ref())
+            .expect("boot identity");
+        let guards =
+            AssignmentProcessGuards::durable_recovery(&private, binding.clone(), fixture_host())
+                .expect("create");
+        let id = guards
+            .register("node", 3, &identity())
+            .expect("committed guard");
+        guards.mark_released(&id).expect("released");
+        drop(guards);
+        let journal_path = private.join(RECOVERY_GUARDS_FILE);
+        let mut bytes: serde_json::Value =
+            serde_json::from_slice(&fs::read(&journal_path).expect("journal")).expect("json");
+        let replacement = if binding.os_boot_id.starts_with('0') {
+            "1"
+        } else {
+            "0"
+        };
+        let older = format!("{replacement}{}", &binding.os_boot_id[1..]);
+        bytes["records"][0]["osBootId"] = serde_json::json!(older);
+        fs::write(&journal_path, serde_json::to_vec(&bytes).expect("encode"))
+            .expect("fixture boot transition");
+        let recovered =
+            AssignmentProcessGuards::recover_recovery(&private, binding.clone(), fixture_host())
+                .expect("reopen");
+        let control = Arc::new(QuiescenceControl {
+            unknown: true,
+            signals: AtomicUsize::new(0),
+            alive: std::sync::atomic::AtomicBool::new(true),
+        });
+        recovered.use_control(control.clone());
+        assert_eq!(
+            AssignmentProcessGuards::quiesce_retained_chain(&[recovered])
+                .expect("older boot absent"),
+            RetainedQuiescence {
+                recorded: 1,
+                terminated: 0,
+                absent: 1
+            }
+        );
+        assert_eq!(control.signals.load(Ordering::SeqCst), 0);
+        bytes["schemaVersion"] = serde_json::json!(3);
+        fs::write(&journal_path, serde_json::to_vec(&bytes).expect("encode"))
+            .expect("unknown revision");
+        assert!(
+            AssignmentProcessGuards::recover_recovery(&private, binding, fixture_host()).is_err()
+        );
     }
 
     #[test]

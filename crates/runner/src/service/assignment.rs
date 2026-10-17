@@ -607,13 +607,62 @@ impl AdmissionRuntime {
             return Err(Box::new((root, environment_unavailable())));
         };
         let process_guards = if self.guard_processes {
-            match AssignmentProcessGuards::durable(&root.private) {
+            let journal = if offer.continuation.is_none() {
+                self.work_root.recovery().and_then(|store| {
+                    store
+                        .host_boot()
+                        .ok()
+                        .map(|binding| (binding, store.host()))
+                })
+            } else {
+                None
+            };
+            let created = match journal {
+                Some((binding, host)) => {
+                    AssignmentProcessGuards::durable_recovery(&root.private, binding, host)
+                }
+                None => AssignmentProcessGuards::durable(&root.private),
+            };
+            match created {
                 Ok(guards) => guards,
                 Err(_) => return Err(Box::new((root, environment_unavailable()))),
             }
         } else {
             AssignmentProcessGuards::new()
         };
+        if process_guards.recovery_journal() && offer.continuation.is_none() {
+            let owner = Arc::clone(&self.work_root);
+            let origin = super::recovery::Origin::from_assignment(
+                &root,
+                owner.boot_id().unwrap_or_default(),
+            );
+            let recorder = self.recorder.clone();
+            // Catalog/manifest fsync is optional and may finish only before a
+            // future registration. Never add an ordinary execution start gate.
+            if std::thread::Builder::new()
+                .name("runner-recovery-registration".into())
+                .spawn(move || {
+                    if let Some(store) = owner.recovery()
+                        && let Err(error) = store.register(origin)
+                        && let Some(recorder) = recorder.as_deref()
+                    {
+                        super::record_optional_recovery_failure(
+                            recorder,
+                            error.error_type(),
+                            error.diagnostic(),
+                        );
+                    }
+                })
+                .is_err()
+                && let Some(recorder) = self.recorder.as_deref()
+            {
+                super::record_optional_recovery_failure(
+                    recorder,
+                    "local_recovery_worker_unavailable",
+                    serde_json::json!({"errorType": "local_recovery_worker_unavailable", "stage": "registration_worker"}).to_string(),
+                );
+            }
+        }
         Ok(AcceptedAssignment {
             identity: AssignmentIdentity::from_offer(offer),
             attempt_number: offer.attempt_number,

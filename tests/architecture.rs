@@ -136,6 +136,7 @@ fn workspace_members_and_edges_match_final_graph() {
         ("um-cli", "um-human-auth", "normal"),
         ("um-cli", "um-runner", "normal"),
         ("um-cli", "um-runner", "dev"),
+        ("um-cli", "um-support", "dev"),
         ("um-cli", "um-support", "normal"),
         ("um-cli", "um-test-support", "dev"),
         ("um-api", "um-support", "normal"),

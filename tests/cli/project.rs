@@ -837,7 +837,7 @@ fn gitlab_project_create_bind_and_read_preserve_provider_identity() {
         "connectionId": CONNECTION_ID,
         "providerKind": "gitlab",
         "gitlabConnectionId": GITLAB_CONNECTION_ID,
-        "instanceUrl": "https://gitlab.example.com",
+        "instanceUrl": "https://gitlab.com",
         "admissionDiagnostic": "gitlab_admission_closed",
         "providerRepositoryId": REPOSITORY_ID,
         "fullName": long_path,
@@ -850,10 +850,45 @@ fn gitlab_project_create_bind_and_read_preserve_provider_identity() {
         "blockers": ["runner_pool_unassigned", "repository_unavailable"]
     });
     let (server, _directory, credential_path) = prepared_project(vec![
+        json_http_response(
+            "200 OK",
+            serde_json::json!({
+                "id": GITLAB_CONNECTION_ID, "organizationId": ORGANIZATION_ID,
+                "instanceUrl": "https://gitlab.com", "state": "active", "credentialReason": null,
+                "version": 5, "providerUser": {"id":"42","username":"automation-bot"},
+                "credential": {"providerTokenId":"77","kind":"personal_access_token",
+                    "accountUse":"dedicated_user","permissionProfile":"api",
+                    "expiresAt":"2027-09-05T00:00:00Z","validatedAt":"2026-09-05T12:00:00Z",
+                    "expiryNotice":"none"},
+                "selectedRepositoryIds": [REPOSITORY_ID],
+                "support": {"state":"supported","observedVersion":"18.0"},
+                "createdAt":"2026-09-05T12:00:00Z", "updatedAt":"2026-09-05T12:01:00Z"
+            }),
+        ),
         project_response("201 Created", project.clone(), true),
         project_response("200 OK", project.clone(), false),
         json_http_response("200 OK", project),
     ]);
+    // A project can bind only after an owner explicitly selects the provider ID.
+    let selection = run_project(
+        &[
+            "connection",
+            "gitlab",
+            "repository",
+            "link",
+            ORGANIZATION,
+            GITLAB_CONNECTION_ID,
+            "--repository-id",
+            REPOSITORY_ID,
+            "--expected-version",
+            "4",
+            "--json",
+            "--allow-insecure-http",
+        ],
+        &server,
+        &credential_path,
+    );
+    assert_json_success(&selection, "linked");
     let create = run_project(
         &[
             "project",
@@ -919,8 +954,15 @@ fn gitlab_project_create_bind_and_read_preserve_provider_identity() {
     assert!(text.contains("admission: GitLab run admission is closed"));
 
     let requests = server.finish();
-    assert_eq!(requests.len(), 3);
-    for request in &requests[..2] {
+    assert_eq!(requests.len(), 4);
+    assert!(requests[0].starts_with(&format!(
+        "PATCH /api/v1/organizations/{ORGANIZATION}/connections/gitlab/{GITLAB_CONNECTION_ID}/repository-selection "
+    )));
+    assert_eq!(
+        request_body(&requests[0])["addProviderRepositoryIds"],
+        serde_json::json!([REPOSITORY_ID])
+    );
+    for request in &requests[1..3] {
         let body = request_body(request);
         let selection = if body.get("repository").is_some() {
             &body["repository"]

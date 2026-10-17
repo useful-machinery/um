@@ -1460,6 +1460,49 @@ async fn pinned_real_pi_04_result_rejection_sibling_correction_and_termination_c
 )]
 #[tokio::test]
 #[ignore = "requires pinned harness"]
+async fn pinned_real_pi_04_malformed_tool_arguments_cannot_settle_a_result() {
+    let _executable = require_conformance_executable();
+    tokio::time::timeout(PINNED_TEST_WATCHDOG, async {
+        let (mut running, first, tool_name) = launch_result_case().await;
+        let raw = "{\"result\":{\"count\":1},";
+        first.release(json!({
+            "kind": "malformedToolCall",
+            "id": "call-malformed",
+            "name": tool_name,
+            "rawArguments": raw
+        }));
+        running.await_started().await;
+        // The next model request is the barrier: validation rejected the call before
+        // either the result extension or its settlement socket could accept it.
+        let corrected = running.fixture.controller.next("model").await;
+        assert!(
+            corrected.value["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|message| {
+                    message["role"] == "toolResult"
+                        && message["toolCallId"] == "call-malformed"
+                        && message["isError"] == true
+                        && message["content"][0]["text"]
+                            .as_str()
+                            .is_some_and(|text| text.contains(raw))
+                })
+        );
+        corrected.release(count_one_result_response("call-corrected", &tool_name));
+        let (fixture, outcome) = running.finish().await;
+        assert_count_one_result(fixture, outcome).await;
+    })
+    .await
+    .expect("pinned real-Pi malformed-call watchdog expired");
+}
+
+#[expect(
+    clippy::disallowed_methods,
+    reason = "real time is used only as an anti-hang watchdog, never as success evidence"
+)]
+#[tokio::test]
+#[ignore = "requires pinned harness"]
 async fn pinned_real_pi_04_codemode_only_keeps_terminal_result_direct() {
     let _executable = require_conformance_executable();
     tokio::time::timeout(PINNED_TEST_WATCHDOG, async {

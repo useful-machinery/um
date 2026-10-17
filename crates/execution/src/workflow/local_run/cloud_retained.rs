@@ -398,9 +398,27 @@ fn retain_steps(
     Ok((root, stored))
 }
 
+fn open_retained_directory(path: &Path) -> Result<OwnedFd, LocalRunDirectoryError> {
+    // Do not let a rebound ancestor redirect inherited private evidence into
+    // another attempt (NOFOLLOW on the final component alone is insufficient).
+    let mut components = path.components();
+    if components.next() != Some(std::path::Component::RootDir) {
+        return Err(LocalRunDirectoryError::StateInvalid);
+    }
+    let mut directory =
+        open_directory_path(Path::new("/")).map_err(|_| LocalRunDirectoryError::StateInvalid)?;
+    for part in components {
+        let std::path::Component::Normal(name) = part else {
+            return Err(LocalRunDirectoryError::StateInvalid);
+        };
+        directory = open_directory_at(&directory, name)
+            .map_err(|_| LocalRunDirectoryError::StateInvalid)?;
+    }
+    Ok(directory)
+}
+
 fn read_attempt(private: &Path) -> Result<StoredAttempt, LocalRunDirectoryError> {
-    let root = open_directory_path(&private.join(DIRECTORY))
-        .map_err(|_| LocalRunDirectoryError::StateInvalid)?;
+    let root = open_retained_directory(&private.join(DIRECTORY))?;
     let mut state: Option<StoredAttempt> = match rustix::fs::openat(
         &root,
         STATE_FILE,
@@ -502,8 +520,7 @@ fn open_cloud_carrier(
     if carrier.relative_path != relative {
         return Err(LocalRunDirectoryError::StateInvalid);
     }
-    let root = open_directory_path(&private.join(DIRECTORY))
-        .map_err(|_| LocalRunDirectoryError::StateInvalid)?;
+    let root = open_retained_directory(&private.join(DIRECTORY))?;
     let values = open_directory_at(&root, VALUES_DIRECTORY)?;
     let steps = open_directory_at(&values, "steps")?;
     let parent = open_directory_at(&steps, node)?;
@@ -646,4 +663,28 @@ pub fn load_cloud_continuation_seed(
         );
     }
     ExecutionSeed::new(admitted, seeds).map_err(|_| LocalRunDirectoryError::StateInvalid)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn inherited_private_reader_rejects_rebound_ancestor() {
+        let root = tempfile::tempdir().expect("isolated root");
+        let real = root
+            .path()
+            .canonicalize()
+            .expect("canonical root")
+            .join("original");
+        std::fs::create_dir(&real).expect("original");
+        let alias = root
+            .path()
+            .canonicalize()
+            .expect("canonical root")
+            .join("replacement");
+        std::os::unix::fs::symlink(&real, &alias).expect("substituted ancestor");
+        assert!(open_retained_directory(&real).is_ok());
+        assert!(open_retained_directory(&alias).is_err());
+    }
 }

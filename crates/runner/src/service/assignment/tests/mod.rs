@@ -208,7 +208,7 @@ for argument in "$@"; do
   previous=$argument
 done
 while IFS= read -r _; do :; done
-printf '{"type":"system","subtype":"init","cwd":"%s","session_id":"%s","model":"%s","permissionMode":"bypassPermissions","claude_code_version":"2.1.296"}\n' "$PWD" "$session" "$model"
+printf '{"type":"system","subtype":"init","cwd":"%s","session_id":"%s","model":"%s","permissionMode":"bypassPermissions","claude_code_version":"2.1.300"}\n' "$PWD" "$session" "$model"
 if [ "${CLAUDE_FIXTURE_FAIL-}" = 1 ]; then exit 23; fi
 printf '{"type":"stream_event","event":{"type":"message_start","message":{"id":"msg-runner","type":"message","role":"assistant","content":[],"model":"%s","usage":{"input_tokens":1,"output_tokens":0}}},"session_id":"%s","parent_tool_use_id":null}\n' "$model" "$session"
 printf '{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}},"session_id":"%s","parent_tool_use_id":null}\n' "$session"
@@ -4816,6 +4816,26 @@ async fn accepted_runner_assignment_enables_stopped_spawn_registration() {
         Some(LocalSlot::Accepted(accepted))
             if accepted.process_guards.registry(accepted.guard_processes).is_durable()
     ));
+}
+
+#[tokio::test]
+async fn ordinary_admission_prepares_recovery_journal_without_a_start_gate() {
+    let workflow =
+        "schemaVersion: 1\nsteps:\n  check:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n";
+    let (_temporary, mut manager) = manager_fixture(workflow);
+    manager
+        .work_root
+        .enable_recovery(
+            &manager.runner_id,
+            crate::service::recovery::host_fixture::fixture_host(),
+        )
+        .unwrap();
+    manager.guard_processes = true;
+    let offered = offer("bg");
+    offer_then_prepare(&mut manager, &offered).await;
+    assert!(matches!(&manager.slot, Some(LocalSlot::Accepted(accepted))
+        if accepted.process_guards.recovery_journal()
+            && accepted.identity.assignment_id == offered.assignment_id));
 }
 
 #[tokio::test]

@@ -464,6 +464,7 @@ pub(super) fn materialize(
         cancellation,
         private_root,
         um_support::utc_now,
+        File::sync_all,
     )
 }
 
@@ -472,6 +473,11 @@ struct MaterializationIdentity<'a> {
     execution_spec_id: &'a str,
 }
 
+/// Production syncs every member file and its staging directory entry.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the clock and durability sync are the materialization test seams"
+)]
 fn materialize_with_clock(
     broker: Option<&dyn RunInputBroker>,
     identity: MaterializationIdentity<'_>,
@@ -480,6 +486,7 @@ fn materialize_with_clock(
     cancellation: &CaptureCancellation,
     private_root: &Path,
     mut utc_now: impl FnMut() -> OffsetDateTime,
+    sync: fn(&File) -> std::io::Result<()>,
 ) -> Result<ResolvedInputs, RunInputFailure> {
     let Some(projection) = projection else {
         return Ok(ResolvedInputs::default());
@@ -541,6 +548,7 @@ fn materialize_with_clock(
                     capability,
                     cancellation,
                     deadline,
+                    sync,
                 )?;
                 ensure_materialization_current(cancellation, deadline)?;
                 completed.push(completed_member);
@@ -825,6 +833,7 @@ fn download_member(
     capability: &CapabilityMember,
     cancellation: &CaptureCancellation,
     deadline: PreparationDeadline,
+    sync: fn(&File) -> std::io::Result<()>,
 ) -> Result<PathBuf, RunInputFailure> {
     let mut temporary = tempfile::Builder::new()
         .prefix("member-")
@@ -862,9 +871,7 @@ fn download_member(
     if observed != member.size_bytes || observed_digest.as_ref() != expected_digest.as_slice() {
         return Err(RunInputFailure::ContentMismatch);
     }
-    temporary
-        .as_file()
-        .sync_all()
+    sync(temporary.as_file())
         .and_then(|()| {
             temporary
                 .as_file()
@@ -876,7 +883,7 @@ fn download_member(
         .persist_noclobber(&completed)
         .map_err(|_| RunInputFailure::EnvironmentUnavailable)?;
     File::open(staging)
-        .and_then(|directory| directory.sync_all())
+        .and_then(|directory| sync(&directory))
         .map_err(|_| RunInputFailure::EnvironmentUnavailable)?;
     Ok(completed)
 }
@@ -1650,7 +1657,22 @@ mod tests {
             let (broker, projection) = broker_for(manifest, bodies);
             let private = tempfile::tempdir().unwrap();
 
-            let inputs = materialize_projection(&broker, &projection, private.path()).unwrap();
+            // Durably syncing hundreds of members costs seconds on some hosts and
+            // proves nothing the smaller fixtures' production syncs do not.
+            let inputs = materialize_with_clock(
+                Some(&broker),
+                MaterializationIdentity {
+                    assignment_id: "asn_01k0z6r1w8f4jy2m7q9v3x5abc",
+                    execution_spec_id: "xsp_01k0z6r1w8f4jy2m7q9v3x5abc",
+                },
+                Some(&projection),
+                deadline(),
+                &CaptureCancellation::default(),
+                private.path(),
+                um_support::utc_now,
+                |_| Ok(()),
+            )
+            .unwrap();
 
             assert_eq!(text_value(&inputs, "request"), "request");
             let attachments = attachment_values(&inputs, "evidence");
@@ -1711,6 +1733,7 @@ mod tests {
                     start
                 }
             },
+            File::sync_all,
         )
         .unwrap();
 

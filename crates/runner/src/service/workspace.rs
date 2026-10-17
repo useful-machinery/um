@@ -519,21 +519,21 @@ impl CleanupCancellation {
 }
 
 #[derive(Clone)]
-struct WorkRootAuthority {
-    shared: Arc<WorkRootAuthorityShared>,
+pub(super) struct WorkRootAuthority {
+    pub(super) shared: Arc<WorkRootAuthorityShared>,
 }
 
-struct WorkRootAuthorityShared {
+pub(super) struct WorkRootAuthorityShared {
     path: PathBuf,
     device: u64,
     inode: u64,
-    directory_lock: File,
+    pub(super) directory_lock: File,
     lock_path: PathBuf,
     lock_file: File,
 }
 
 impl WorkRootAuthority {
-    fn validate(&self) -> Result<(), ()> {
+    pub(super) fn validate(&self) -> Result<(), ()> {
         let opened_root = self.shared.directory_lock.metadata().map_err(|_| ())?;
         let linked_root = fs::symlink_metadata(&self.shared.path).map_err(|_| ())?;
         if !safe_owned_directory(&opened_root)
@@ -548,8 +548,42 @@ impl WorkRootAuthority {
         verify_lock_identity(&self.shared.lock_path, &self.shared.lock_file).map_err(|_| ())
     }
 
-    fn work_root(&self) -> &Path {
+    pub(super) fn work_root(&self) -> &Path {
         &self.shared.path
+    }
+
+    pub(super) fn authenticate_recovery_link(
+        &self,
+        link: &super::recovery::Link,
+    ) -> Result<PathBuf, ()> {
+        self.validate()?;
+        let boot_path = self.work_root().join(&link.boot_id);
+        let mut boot = OwnedTree::capture_root(&self.shared.directory_lock, boot_path)?;
+        let (format, marker) = RetainedFormat::capture_boot(Arc::clone(boot.directory()?))?;
+        if format.marker_name != OWNERSHIP_MARKER_NAME {
+            return Err(());
+        }
+        boot.install_marker(marker);
+        let mut assignment = OwnedTree::capture_child(&boot, boot.path.join(&link.assignment_id))?;
+        assignment.install_marker(
+            format.capture_marker(Arc::clone(assignment.directory()?), ASSIGNMENT_MARKER)?,
+        );
+        if !matches!(assignment.validate(false)?, TreePresence::Present) {
+            return Err(());
+        }
+        let record = format.read_attempt(assignment.directory()?.as_ref())?;
+        if record.assignment_id != link.assignment_id
+            || record.run_id != link.run_id
+            || record.attempt_id != link.attempt_id
+        {
+            return Err(());
+        }
+        let private = assignment.path.join("private");
+        let metadata = fs::symlink_metadata(&private).map_err(|_| ())?;
+        if !safe_owned_directory(&metadata) {
+            return Err(());
+        }
+        Ok(private)
     }
 
     fn sync(&self) -> Result<(), ()> {
@@ -567,10 +601,10 @@ impl Drop for WorkRootAuthorityShared {
 }
 
 #[derive(Clone, Eq, PartialEq)]
-struct AttemptRecord {
-    assignment_id: String,
-    run_id: String,
-    attempt_id: String,
+pub(super) struct AttemptRecord {
+    pub(super) assignment_id: String,
+    pub(super) run_id: String,
+    pub(super) attempt_id: String,
     disposition: RetentionReason,
 }
 
@@ -831,6 +865,7 @@ struct CleanupEngine {
     cancellation: Arc<CleanupCancellation>,
     authority: WorkRootAuthority,
     serialized: Arc<Mutex<()>>,
+    recovery: Arc<std::sync::OnceLock<super::recovery::RecoveryStore>>,
 }
 
 fn claim_absent_at(directory: &OwnedFd) -> bool {
@@ -853,6 +888,37 @@ impl CleanupEngine {
         if self.cancellation.is_cancelled() {
             return CleanupResult::Preempted;
         }
+        let recovery_record = statat(
+            &self.authority.shared.directory_lock,
+            ".um-recovery-root-v1.json",
+            AtFlags::SYMLINK_NOFOLLOW,
+        );
+        if !matches!(recovery_record, Err(Errno::NOENT)) && self.recovery.get().is_none() {
+            return CleanupResult::Retained;
+        }
+        if tree.path.parent() != Some(self.authority.work_root())
+            && self
+                .recovery
+                .get()
+                .is_some_and(|store| !store.may_clean_tree(tree.path()))
+        {
+            return CleanupResult::Retained;
+        }
+        if tree.path.parent() == Some(self.authority.work_root())
+            && tree
+                .path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(valid_boot_id)
+            && self.recovery.get().is_some_and(|store| {
+                tree.path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_none_or(|boot| store.boot_has_unresolved_anchors(boot))
+            })
+        {
+            return CleanupResult::Retained;
+        }
         // Both direct assignment cleanup and workspace-only cleanup must refuse
         // a retained workspace while another assignment holds its durable claim.
         // An inaccessible parent is a safety failure, not absence of a claim.
@@ -862,6 +928,27 @@ impl CleanupEngine {
                 .as_ref()
                 .is_some_and(|directory| !claim_absent_at(directory.as_ref()))
                 || !claim_absent_at(link.parent.as_ref()))
+        {
+            return CleanupResult::Quarantined(CleanupFailure::Safety);
+        }
+        let anchor_directory = if tree
+            .path
+            .file_name()
+            .is_some_and(|name| name == "workspace")
+        {
+            tree.link().map(|link| link.parent.as_ref())
+        } else if tree
+            .path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(valid_assignment_id)
+        {
+            tree.directory().ok().map(|directory| directory.as_ref())
+        } else {
+            None
+        };
+        if anchor_directory
+            .is_some_and(|directory| !super::recovery::claim_absent_for_cleanup(directory))
         {
             return CleanupResult::Quarantined(CleanupFailure::Safety);
         }
@@ -1438,6 +1525,7 @@ pub(super) struct WorkRootLease {
     retained: Arc<AtomicBool>,
     startup_retained: Vec<RetainedWorkspace>,
     workspace_release_spawner: Arc<dyn WorkspaceReleaseSpawner>,
+    recovery: Arc<std::sync::OnceLock<super::recovery::RecoveryStore>>,
     _authority: WorkRootAuthority,
 }
 
@@ -1489,6 +1577,7 @@ impl WorkRootLease {
             .validate()
             .map_err(|()| WorkRootError::UnsafeWorkRoot)?;
         let cancellation = Arc::new(CleanupCancellation::default());
+        let recovery = Arc::new(std::sync::OnceLock::new());
         let engine = CleanupEngine {
             remover: filesystem.remover,
             sleeper: filesystem.sleeper,
@@ -1496,6 +1585,7 @@ impl WorkRootLease {
             cancellation: Arc::clone(&cancellation),
             authority: authority.clone(),
             serialized: Arc::new(Mutex::new(())),
+            recovery: Arc::clone(&recovery),
         };
 
         filesystem.hook.before_child_enumeration();
@@ -1550,6 +1640,7 @@ impl WorkRootLease {
             retained: Arc::new(AtomicBool::new(false)),
             startup_retained,
             workspace_release_spawner: filesystem.workspace_release_spawner,
+            recovery,
             _authority: authority,
         }))
     }
@@ -1858,7 +1949,12 @@ impl WorkRootLease {
     pub(super) fn release_boot_root_pending(&self) -> PendingRelease {
         let completion = ReleaseCompletion::new();
         let pending = completion.pending();
-        if self.retained.load(Ordering::Acquire) {
+        if self.retained.load(Ordering::Acquire)
+            || self.recovery().is_some_and(|store| {
+                self.boot_id()
+                    .is_none_or(|boot| store.boot_has_unresolved_anchors(boot))
+            })
+        {
             completion.complete(CleanupResult::Retained);
             return pending;
         }
@@ -1882,6 +1978,36 @@ impl WorkRootLease {
 
     pub(super) fn cancel_cleanup(&self) {
         self.cancellation.cancel();
+    }
+
+    pub(super) fn enable_recovery(
+        &self,
+        runner_id: &str,
+        host: Arc<dyn super::recovery::RecoveryHost>,
+    ) -> Result<(), super::recovery::RecoveryError> {
+        let _cleanup = self
+            .engine
+            .serialized
+            .lock()
+            .map_err(|_| super::recovery::RecoveryError::Record("cleanup lock"))?;
+        if self.cancellation.is_cancelled() {
+            return Err(super::recovery::RecoveryError::Record("startup stopped"));
+        }
+        let store = super::recovery::RecoveryStore::open(
+            self._authority.clone(),
+            runner_id,
+            self.boot_id()
+                .ok_or(super::recovery::RecoveryError::Record("boot ID"))?,
+            Arc::clone(&self.engine.serialized),
+            host,
+        )?;
+        self.recovery
+            .set(store)
+            .map_err(|_| super::recovery::RecoveryError::Record("already initialized"))
+    }
+
+    pub(super) fn recovery(&self) -> Option<&super::recovery::RecoveryStore> {
+        self.recovery.get()
     }
 
     pub(super) fn startup_retained(&self) -> &[RetainedWorkspace] {
@@ -2308,7 +2434,7 @@ pub(super) struct AssignmentRoot {
     pub(super) continuation_proven_at: Option<String>,
     pub(super) settlement_snapshot: Option<serde_json::Value>,
     pub(super) retained_private_roots: std::collections::BTreeMap<String, PathBuf>,
-    attempt_record: AttemptRecord,
+    pub(super) attempt_record: AttemptRecord,
     recorder: Option<Arc<crate::telemetry::Recorder>>,
     retained: Arc<AtomicBool>,
     engine: CleanupEngine,

@@ -176,7 +176,7 @@ fn doctor_reports_exact_codex_identity_without_credentials_or_native_configurati
     let config = codex_home.path().join("config.toml");
     let native_config = b"model_provider = \"native-sentinel\"\n";
     fs::write(&config, native_config).unwrap();
-    let fixture = CodexFixture::new("0.162.1", true, true);
+    let fixture = CodexFixture::new("0.163.0", true, true);
     let unselected = CodexFixture::new("0.147.23", true, true);
     let path =
         std::env::join_paths([fixture.path_directory(), unselected.path_directory()]).unwrap();
@@ -202,10 +202,10 @@ fn doctor_reports_exact_codex_identity_without_credentials_or_native_configurati
     let check = &report["checks"][0];
     assert_eq!(check["id"], CODEX_CHECK_ID);
     assert_eq!(check["status"], "pass");
-    assert_eq!(check["details"]["version"], "0.162.1");
+    assert_eq!(check["details"]["version"], "0.163.0");
     assert_eq!(check["details"]["profile"], "CodexAppServerV1");
-    assert_eq!(check["details"]["supportedRange"], ">=0.147.0 <0.163.0");
-    assert_eq!(check["details"]["qualificationVersion"], "0.162.1");
+    assert_eq!(check["details"]["supportedRange"], ">=0.147.0 <0.164.0");
+    assert_eq!(check["details"]["qualificationVersion"], "0.163.0");
     assert_eq!(check["details"]["capabilities"], REQUIRED_CAPABILITIES);
     assert_eq!(
         Path::new(check["details"]["executablePath"].as_str().unwrap()),
@@ -253,6 +253,8 @@ fn doctor_accepts_each_reviewed_codex_minor_line() {
         "0.162.0",
         "0.162.1",
         "0.162.999",
+        "0.163.0",
+        "0.163.999",
     ] {
         let fixture = CodexFixture::new(version, true, true);
         let output = doctor_json(fixture.path_directory(), &[]);
@@ -267,7 +269,7 @@ fn doctor_accepts_each_reviewed_codex_minor_line() {
 #[test]
 fn doctor_does_not_fall_back_after_the_first_path_candidate_fails() {
     let incompatible = CodexFixture::new("0.146.99", true, true);
-    let fallback = CodexFixture::new("0.162.1", true, true);
+    let fallback = CodexFixture::new("0.163.0", true, true);
     let path =
         std::env::join_paths([incompatible.path_directory(), fallback.path_directory()]).unwrap();
 
@@ -340,21 +342,21 @@ fn doctor_rejects_out_of_range_decorated_and_schema_incompatible_codex() {
             b"--version\n".as_slice(),
         ),
         (
-            "0.163.0",
+            "0.164.0",
             true,
             true,
             "unsupported_codex_version",
             b"--version\n".as_slice(),
         ),
         (
-            "0.162.1-rc.1",
+            "0.163.0-rc.1",
             true,
             true,
             "malformed_codex_version",
             b"--version\n".as_slice(),
         ),
         (
-            "0.162.1+vendor",
+            "0.163.0+vendor",
             true,
             true,
             "malformed_codex_version",

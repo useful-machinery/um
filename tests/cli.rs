@@ -642,7 +642,7 @@ fn write_runner_config(directory: &tempfile::TempDir, connection_url: &str) -> S
 fn deployment_environment<'a>(
     api_url: &'a str,
     credential_path: &'a str,
-) -> [(&'static str, &'a str); 5] {
+) -> [(&'static str, &'a str); 6] {
     deployment_environment_with_issuer(api_url, "http://auth.fixture.example/", credential_path)
 }
 
@@ -650,13 +650,16 @@ fn deployment_environment_with_issuer<'a>(
     api_url: &'a str,
     issuer: &'a str,
     credential_path: &'a str,
-) -> [(&'static str, &'a str); 5] {
+) -> [(&'static str, &'a str); 6] {
     [
         (CREDENTIALS_FILE_VARIABLE, credential_path),
         ("UM_API_URL", api_url),
         ("UM_AUTH_ISSUER", issuer),
         ("UM_AUTH_AUDIENCE", "https://api.fixture.example"),
         ("UM_AUTH_CLIENT_ID", "fixture-public-client"),
+        // Scripted servers answer at once, so skip the production polling
+        // cadence between observations. Controlled-clock unit tests cover it.
+        ("UM_TEST_POLL_INTERVAL_MILLISECONDS", "10"),
     ]
 }
 

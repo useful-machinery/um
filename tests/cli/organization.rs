@@ -191,6 +191,20 @@ fn membership_history_items() -> serde_json::Value {
             "createdAt": "2026-07-29T12:07:00Z",
             "updatedAt": "2026-07-29T12:08:00Z",
             "terminalAt": "2026-07-29T12:08:00Z"
+        },
+        {
+            "id": "mem_01k0z6r1w8f4jy2m7q9v3x5abj",
+            "organizationId": "org_01k0z6r1w8f4jy2m7q9v3x5abc",
+            "principalId": "prn_01k0z6r1w8f4jy2m7q9v3x5abj",
+            "principalType": "human",
+            "displayName": "At departure",
+            "nameState": "snapshot",
+            "linkedEmails": [{"email": "then@example.test", "verified": false}, {"email": "unknown@example.test"}],
+            "role": "member",
+            "state": "ended",
+            "createdAt": "2026-07-29T12:09:00Z",
+            "updatedAt": "2026-07-29T12:10:00Z",
+            "terminalAt": "2026-07-29T12:10:00Z"
         }
     ])
 }
@@ -1999,7 +2013,11 @@ fn membership_management_human_reports_use_the_expected_streams() {
         &environment,
     );
 
-    assert!(history.status.success());
+    assert!(
+        history.status.success(),
+        "{}",
+        String::from_utf8_lossy(&history.stderr)
+    );
     let report = String::from_utf8(history.stdout).unwrap();
     assert!(report.contains("membership: mem_01k0z6r1w8f4jy2m7q9v3x5abd"));
     assert!(report.contains("principal: prn_01k0z6r1w8f4jy2m7q9v3x5abd · type: service"));
@@ -2011,6 +2029,8 @@ fn membership_management_human_reports_use_the_expected_streams() {
     assert!(report.contains("principal: unavailable · type: human"));
     assert!(report.contains("first@example.test (unverified)"));
     assert!(report.contains("second@example.test (verification unknown)"));
+    assert!(report.contains("then@example.test (unverified)"));
+    assert!(report.contains("unknown@example.test (verification unknown)"));
     assert!(history.stderr.is_empty());
     server.finish();
 

@@ -275,7 +275,7 @@ impl Start {
                     &session.id,
                     &self.options,
                     control,
-                    POLL_INTERVAL,
+                    poll_interval(),
                 )
             },
             move |signal, snapshot| {
@@ -347,7 +347,7 @@ fn observe(
         let result = with_api(d, options, |api| api.session(org, id))?;
         match result {
             Ok(session) if session.status == LinearSessionStatus::LinearSessionPending => {
-                next = POLL_INTERVAL
+                next = poll_interval()
             }
             Ok(session) => {
                 return finish(control, || session_output(d, org, &session, options.json));
@@ -373,6 +373,10 @@ fn observe(
 const POLL_INTERVAL: Duration = Duration::from_secs(5);
 const POLL_WAIT_SLICE: Duration = Duration::from_millis(100);
 
+fn poll_interval() -> Duration {
+    um_support::poll_interval(POLL_INTERVAL)
+}
+
 fn wait_for_poll(
     control: &super::OperationControl<Recovery>,
     delay: Duration,
@@ -392,7 +396,7 @@ fn wait_for_poll(
 }
 
 fn retry_delay(retry_after: Option<u64>) -> Duration {
-    Duration::from_secs(retry_after.unwrap_or(5).max(5))
+    Duration::from_secs(retry_after.unwrap_or(0)).max(poll_interval())
 }
 
 #[cfg(test)]

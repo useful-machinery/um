@@ -238,7 +238,7 @@ impl Command {
                                 )
                             });
                         }
-                        RunRetryState::Pending => super::super::OBSERVATION_POLL_INTERVAL,
+                        RunRetryState::Pending => super::super::observation_poll_interval(),
                     }
                 }
                 Ok(Err(RunFailure::Unreachable(UnreachableCategory::Timeout)))
@@ -270,7 +270,7 @@ impl Command {
                     if failure.retryable_observation() && consecutive_failures == 0 =>
                 {
                     consecutive_failures += 1;
-                    super::super::OBSERVATION_POLL_INTERVAL
+                    super::super::observation_poll_interval()
                 }
                 Ok(Err(failure)) => {
                     let (code, exit) = failure_code(&failure, self.options.authentication.kind());

@@ -471,7 +471,7 @@ fn polling_respects_rate_limit_and_reports_recovery_required() {
         http_response_with_headers(
             "429 Too Many Requests",
             Some("application/problem+json"),
-            &[("Retry-After", "3")],
+            &[("Retry-After", "1")],
             &serde_json::to_vec(
                 &serde_json::json!({"type":"about:blank","title":SECRET,"status":429}),
             )

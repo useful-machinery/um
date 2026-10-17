@@ -72,7 +72,7 @@ use lease_supervision::*;
 use observer::*;
 #[cfg(test)]
 use process_guards::GuardProcessControl;
-pub(super) use process_guards::{AssignmentProcessGuards, RetainedQuiescence};
+pub(super) use process_guards::{AssignmentProcessGuards, HostBoot, RetainedQuiescence};
 use projection::*;
 
 #[derive(Clone)]

@@ -7,7 +7,8 @@ use anyhow::{Context, anyhow, bail};
 use clap::{Args, Subcommand, ValueEnum};
 use serde_json::{Value, json};
 use um_api::{
-    GitLabAccountUse, GitLabApi, GitLabFailure, GitLabSubmission, GitLabTokenKind, HttpClient,
+    GitLabAccountUse, GitLabApi, GitLabFailure, GitLabRepositoryQuery, GitLabSelection,
+    GitLabSubmission, GitLabTokenKind, HttpClient,
 };
 use um_human_auth::Deployment;
 use zeroize::Zeroizing;
@@ -35,6 +36,8 @@ enum Leaf {
     List(List),
     #[command(about = "Remove a GitLab connection", after_help = GUIDE)]
     Remove(Remove),
+    #[command(about = "Manage selected GitLab repositories", after_help = GUIDE)]
+    Repository(Repository),
     #[command(about = "Show a GitLab connection", after_help = GUIDE)]
     Show(Target),
 }
@@ -53,6 +56,20 @@ enum CredentialLeaf {
     Create(Submit),
     #[command(about = "Show a GitLab credential candidate", after_help = GUIDE)]
     Show(CandidateTarget),
+}
+#[derive(Debug, Args)]
+struct Repository {
+    #[command(subcommand)]
+    command: Option<RepositoryLeaf>,
+}
+#[derive(Debug, Subcommand)]
+enum RepositoryLeaf {
+    #[command(about = "Link a GitLab repository", after_help = GUIDE)]
+    Link(Selection),
+    #[command(about = "List GitLab repositories", after_help = GUIDE)]
+    List(RepositoryList),
+    #[command(about = "Remove a GitLab repository selection", after_help = GUIDE)]
+    Remove(RemoveSelection),
 }
 #[derive(Debug, Args)]
 struct Base {
@@ -151,6 +168,47 @@ struct Remove {
     #[command(flatten)]
     key: Key,
 }
+#[derive(Debug, Args)]
+struct RepositoryList {
+    #[command(flatten)]
+    target: Target,
+    #[command(flatten)]
+    page: super::super::PaginationArgs<200>,
+    #[arg(long, conflicts_with_all = ["provider_repository_id", "selected"], help = "Filter by repository name")]
+    search: Option<String>,
+    #[arg(
+        long = "repository-id",
+        value_name = "REPOSITORY",
+        conflicts_with = "selected",
+        help = super::super::RepositoryArg::HELP
+    )]
+    provider_repository_id: Option<String>,
+    #[arg(
+        long,
+        help = "Show only selected repositories (also works when GitLab is unavailable)"
+    )]
+    selected: bool,
+}
+#[derive(Debug, Args)]
+struct Selection {
+    #[command(flatten)]
+    target: Target,
+    #[arg(long = "repository-id", value_name = "REPOSITORY", num_args = 1, required = true, help = super::super::RepositoryArg::HELP)]
+    repositories: Vec<String>,
+    #[command(flatten)]
+    precondition: ExpectedVersion,
+    #[command(flatten)]
+    attribution: Attribution,
+    #[command(flatten)]
+    key: Key,
+}
+#[derive(Debug, Args)]
+struct RemoveSelection {
+    #[command(flatten)]
+    selection: Selection,
+    #[command(flatten)]
+    confirmation: super::super::ConfirmationArgs,
+}
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum CredentialKind {
     GroupAccessToken,
@@ -219,6 +277,12 @@ impl Command {
             Some(Leaf::List(cmd)) => cmd.execute(),
             Some(Leaf::Show(cmd)) => cmd.read_connection(),
             Some(Leaf::Remove(cmd)) => cmd.execute(),
+            Some(Leaf::Repository(cmd)) => match cmd.command {
+                None => super::super::print_help(&[NAME, "gitlab", "repository"]),
+                Some(RepositoryLeaf::List(cmd)) => cmd.execute(),
+                Some(RepositoryLeaf::Link(cmd)) => cmd.execute(true),
+                Some(RepositoryLeaf::Remove(cmd)) => cmd.selection.execute(false),
+            },
         }
     }
 }
@@ -270,6 +334,15 @@ fn version(value: i64) -> anyhow::Result<i64> {
     }
     Ok(value)
 }
+fn repository_id(value: &str) -> anyhow::Result<&str> {
+    if value.starts_with('0')
+        || !value.bytes().all(|b| b.is_ascii_digit())
+        || !matches!(value.parse::<i64>(), Ok(1..=i64::MAX))
+    {
+        bail!("invalid provider repository ID: use a positive decimal GitLab project ID");
+    }
+    Ok(value)
+}
 fn result(
     d: &Deployment,
     base: &Base,
@@ -288,7 +361,9 @@ fn result(
                     println!();
                 } else {
                     let mut out = io::stdout().lock();
-                    let kind = if value.get("connectionId").is_some() {
+                    let kind = if outcome == "repositories listed" {
+                        "GitLab repositories"
+                    } else if value.get("connectionId").is_some() {
                         "GitLab credential candidate"
                     } else {
                         "GitLab connection"
@@ -296,14 +371,30 @@ fn result(
                     writeln!(out, "{kind}: {outcome}")?;
                     if let Some(items) = value.get("items").and_then(Value::as_array) {
                         for item in items {
-                            writeln!(
-                                out,
-                                "{}  {}  {}  {}",
-                                item["id"].as_str().unwrap_or("?"),
-                                item["state"].as_str().unwrap_or("?"),
-                                item["instanceUrl"].as_str().unwrap_or("?"),
-                                item["credential"]["expiryNotice"].as_str().unwrap_or("-")
-                            )?;
+                            if outcome == "repositories listed" {
+                                writeln!(
+                                    out,
+                                    "{}  {}  {}  {}  {}",
+                                    item["providerRepositoryId"].as_str().unwrap_or("?"),
+                                    item["fullName"].as_str().unwrap_or("?"),
+                                    item["defaultBranch"].as_str().unwrap_or("-"),
+                                    if item["selected"] == true {
+                                        "selected"
+                                    } else {
+                                        "not selected"
+                                    },
+                                    item["availability"].as_str().unwrap_or("?")
+                                )?;
+                            } else {
+                                writeln!(
+                                    out,
+                                    "{}  {}  {}  {}",
+                                    item["id"].as_str().unwrap_or("?"),
+                                    item["state"].as_str().unwrap_or("?"),
+                                    item["instanceUrl"].as_str().unwrap_or("?"),
+                                    item["credential"]["expiryNotice"].as_str().unwrap_or("-")
+                                )?;
+                            }
                         }
                         if let Some(cursor) = value["nextCursor"].as_str() {
                             writeln!(out, "next cursor: {cursor}")?;
@@ -322,7 +413,7 @@ fn result(
                             ("kind", "kind"),
                             ("accountUse", "account use"),
                             ("permissionProfile", "permission profile"),
-                            ("tokenExpiresAt", "token expires"),
+                            ("tokenExpiresAt", "token expires (UTC instant)"),
                             ("failureCode", "failure code"),
                             ("expiresAt", "review expires"),
                         ] {
@@ -338,6 +429,17 @@ fn result(
                             }
                         }
                     }
+                    if let Some(ids) = value.get("selectedRepositoryIds").and_then(Value::as_array)
+                    {
+                        writeln!(
+                            out,
+                            "selected repositories: {}",
+                            ids.iter()
+                                .filter_map(Value::as_str)
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        )?;
+                    }
                     if let Some(user) = value.get("providerUser").filter(|v| !v.is_null()) {
                         if let Some(id) = user["id"].as_str() {
                             writeln!(out, "provider user id: {id}")?;
@@ -351,7 +453,7 @@ fn result(
                             ("kind", "kind"),
                             ("accountUse", "account use"),
                             ("permissionProfile", "permission profile"),
-                            ("expiresAt", "expires"),
+                            ("expiresAt", "expires (UTC instant)"),
                             ("expiryNotice", "expiry notice"),
                         ] {
                             if let Some(v) = credential.get(field).filter(|v| !v.is_null()) {
@@ -497,6 +599,63 @@ impl List {
                 )
             })?;
             result(&d, &cmd.base, "listed", value, None)
+        })
+    }
+}
+impl RepositoryList {
+    fn execute(self) -> super::super::CommandResult {
+        if let Some(id) = self.provider_repository_id.as_deref() {
+            repository_id(id).map_err(usage)?;
+        }
+        deployment(self, |cmd, d| {
+            let value = with_api(&d, &cmd.target.base, |api| {
+                api.repositories(
+                    &cmd.target.base.organization,
+                    &cmd.target.connection,
+                    GitLabRepositoryQuery {
+                        limit: cmd.page.limit.map(i32::from),
+                        cursor: cmd.page.cursor.as_deref(),
+                        search: cmd.search.as_deref(),
+                        repository_id: cmd.provider_repository_id.as_deref(),
+                        selected: cmd.selected,
+                    },
+                )
+            })?;
+            result(&d, &cmd.target.base, "repositories listed", value, None)
+        })
+    }
+}
+impl Selection {
+    fn execute(self, link: bool) -> super::super::CommandResult {
+        let v = version(self.precondition.expected_version).map_err(usage)?;
+        for id in &self.repositories {
+            repository_id(id).map_err(usage)?;
+        }
+        let key = self.key.value().map_err(usage)?;
+        deployment(self, move |cmd, d| {
+            let org = cmd.target.base.organization.to_string();
+            let connection = cmd.target.connection;
+            let repositories = cmd.repositories;
+            let delegator = cmd.attribution.delegator_principal_id;
+            mutation(
+                d,
+                cmd.target.base,
+                key,
+                if link { "linked" } else { "removed" },
+                move |api, key| {
+                    api.select_repository(
+                        &org,
+                        &connection,
+                        key,
+                        GitLabSelection {
+                            version: v,
+                            repository_ids: &repositories,
+                            link,
+                            delegator: delegator.as_deref(),
+                        },
+                    )
+                },
+            )
         })
     }
 }
@@ -715,7 +874,7 @@ fn review_identity(shown: &Value) -> anyhow::Result<String> {
     )?;
     writeln!(
         tty,
-        "Permission profile: {}; expires: {}",
+        "Permission profile: {}; token expires (UTC instant): {}",
         shown["permissionProfile"].as_str().unwrap_or("unknown"),
         shown["tokenExpiresAt"].as_str().unwrap_or("unknown")
     )?;

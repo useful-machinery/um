@@ -1910,6 +1910,7 @@ enum LoopbackProviderResponse {
         classified: Arc<tokio::sync::Notify>,
     },
     ServerError,
+    Incomplete,
 }
 
 struct LoopbackResponsesProvider {
@@ -1977,6 +1978,10 @@ impl LoopbackResponsesProvider {
             None,
         )
         .await
+    }
+
+    async fn start_incomplete() -> Self {
+        Self::start_with_response_release(LoopbackProviderResponse::Incomplete, None).await
     }
 
     async fn start_error_blocked() -> (Self, oneshot::Sender<()>) {
@@ -2190,8 +2195,8 @@ async fn serve_provider_request(
                         }
                     }
                 }
-                LoopbackProviderResponse::ServerError => {
-                    panic!("server errors are handled separately")
+                LoopbackProviderResponse::ServerError | LoopbackProviderResponse::Incomplete => {
+                    panic!("non-completed responses are handled separately")
                 }
             };
             let output = match turn {
@@ -2282,6 +2287,29 @@ async fn serve_provider_request(
                 .collect::<String>();
             ("200 OK", "text/event-stream", payload)
         }
+        LoopbackProviderResponse::Incomplete => {
+            let events = [
+                json!({"type": "response.created", "response": {"id": "response-loopback"}}),
+                json!({"type": "response.output_item.done", "item": {
+                    "type": "message", "role": "assistant", "id": "message-loopback",
+                    "content": [{"type": "output_text", "text": "provisional"}]
+                }}),
+                json!({"type": "response.incomplete", "response": {
+                    "id": "response-loopback", "status": "incomplete",
+                    "incomplete_details": {"reason": "max_output_tokens"}
+                }}),
+            ];
+            let payload = events
+                .into_iter()
+                .map(|event| {
+                    format!(
+                        "event: {}\ndata: {event}\n\n",
+                        event["type"].as_str().unwrap()
+                    )
+                })
+                .collect::<String>();
+            ("200 OK", "text/event-stream", payload)
+        }
         LoopbackProviderResponse::ServerError => (
             "500 Internal Server Error",
             "application/json",
@@ -2359,7 +2387,7 @@ async fn serve_provider_request(
         LoopbackProviderResponse::Guardian { parent_calls, .. } => {
             parent_calls.load(Ordering::SeqCst) >= 3
         }
-        LoopbackProviderResponse::ServerError => true,
+        LoopbackProviderResponse::ServerError | LoopbackProviderResponse::Incomplete => true,
     }
 }
 
@@ -3008,7 +3036,7 @@ pub(super) mod exact_binary {
                             // explicit events/stream subscription from ever being sent.
                             socket
                                 .write_all(
-                                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nmcp-session-id: fixture-session\r\n\r\n",
+                                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nmcp-session-id: fixture-session\r\nTransfer-Encoding: chunked\r\n\r\n9\r\n: ready\n\n\r\n",
                                 )
                                 .await
                                 .unwrap();
@@ -3025,7 +3053,7 @@ pub(super) mod exact_binary {
                             "200 OK"
                         };
                         let header = format!(
-                            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+                            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: {}\r\n\r\n",
                             body.len()
                         );
                         socket.write_all(header.as_bytes()).await.unwrap();
@@ -3060,17 +3088,25 @@ pub(super) mod exact_binary {
                         }
                         method => panic!("unexpected hosted MCP request: {method}"),
                     };
-                    let framing = if request["method"] == "events/stream" {
-                        String::new() // SSE remains open until the subscription is stopped.
+                    // Every non-stream response ends with this task's socket: say
+                    // so explicitly or the native HTTP pool can reuse it before
+                    // observing EOF. SSE responses stay open and need chunk framing.
+                    let streaming = request["method"] == "events/stream";
+                    let framing = if streaming {
+                        "Transfer-Encoding: chunked\r\n".to_owned()
                     } else {
-                        format!("Content-Length: {}\r\n", body.len())
+                        format!("Connection: close\r\nContent-Length: {}\r\n", body.len())
                     };
                     let header = format!(
                         "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nmcp-session-id: fixture-session\r\n{framing}\r\n"
                     );
                     socket.write_all(header.as_bytes()).await.unwrap();
-                    socket.write_all(body.as_bytes()).await.unwrap();
-                    if request["method"] == "events/stream" {
+                    if streaming {
+                        socket.write_all(format!("{:x}\r\n{body}\r\n", body.len()).as_bytes()).await.unwrap();
+                    } else {
+                        socket.write_all(body.as_bytes()).await.unwrap();
+                    }
+                    if streaming {
                         // The connection stays open until the owning server task is cancelled.
                         std::future::pending::<()>().await;
                     }
@@ -3779,10 +3815,11 @@ for line in sys.stdin:
                 "name": "issue.updated", "arguments": {"project":"fixture"},
                 "_meta": {"source":"fixture"}
             }})).await;
-            let stream_request = tokio::select! {
-                request = hosted_requests.recv() => request.unwrap(),
-                response = codex.response(5) => panic!("hosted subscription failed before MCP initialize: {response}"),
-            };
+            // Wait for the actual server-side request. Racing this against a read
+            // of App Server stdout can consume an early stream notice before the
+            // request receiver wakes, then drop that notice when select cancels
+            // the stdout reader. The outer watchdog still bounds missing requests.
+            let stream_request = hosted_requests.recv().await.unwrap();
             assert_eq!(stream_request["method"], "initialize");
             let stream_request = loop {
                 let request = hosted_requests.recv().await.unwrap();
@@ -4089,6 +4126,37 @@ for line in sys.stdin:
                 terminal["params"]["turn"]["status"]
             );
             codex.finish(provider).await;
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires pinned harness"]
+    async fn pinned_real_codex_incomplete_response_discards_provisional_output() {
+        with_watchdog(async {
+            for mode in [
+                response_mode(),
+                result_mode(json!({
+                    "$schema": "https://json-schema.org/draft/2020-12/schema",
+                    "type": "string",
+                })),
+            ] {
+                let mut provider = LoopbackResponsesProvider::start_incomplete().await;
+                let fixture = ProcessFixture::with_exact_binary(provider.address, mode);
+                let run = tokio::spawn(run_fixture(fixture));
+                assert_eq!(provider.next_request().await.path, "/responses");
+                let (fixture, outcome, started) = run.await.unwrap();
+                assert_started_failure(
+                    "incomplete-response",
+                    outcome,
+                    started,
+                    AgentFailureCause::HarnessFailed {
+                        detail: AgentHarnessFailureDetail::ModelError,
+                    },
+                );
+                assert_transient_sqlite_cleaned(&fixture);
+                provider.shutdown().await;
+            }
         })
         .await;
     }

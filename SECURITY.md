@@ -158,7 +158,7 @@ environment, inherited `PATH` only for launcher interpreter resolution, fixed up
 nonessential-traffic disables, and deterministic no-color controls. It requires a
 canonical stable version in `>=2.1.234 <2.2.0` and the closed non-model capabilities used
 by the production adapter. The repository's exact qualification package remains
-`2.1.296`; accepting the range does not claim exact-binary conformance for every release
+`2.1.300`; accepting the range does not claim exact-binary conformance for every release
 or host. The validator does not read ambient `CLAUDE_CONFIG_DIR`, provider credentials, or native
 settings; query a provider or model catalog; execute the caller project; install or update
 Claude Code; or expose any of those values in doctor output.
@@ -166,8 +166,8 @@ Claude Code; or expose any of those values in doctor output.
 The operator-selected CodexAppServerV1 check applies the same first-executable,
 canonical-path, no-fallback rule to executable name `codex`. Its isolated version and
 generated-schema probes use fresh private native and XDG directories, accept only stable
-`>=0.147.0 <0.163.0`, and require the maintained App Server schema capability, including
-the ephemeral-thread contract. The exact repository qualification anchor is `0.162.1`;
+`>=0.147.0 <0.164.0`, and require the maintained App Server schema capability, including
+the ephemeral-thread contract. The exact repository qualification anchor is `0.163.0`;
 it does not substitute for the retained selected executable or prove an unexecuted host. The validator does not read ambient `CODEX_HOME`, provider
 credentials, or
 native configuration; start an App Server thread; query a provider; or expose any such

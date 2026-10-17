@@ -134,6 +134,7 @@ fn lower_bound_and_intervening_patches_retain_exact_versions() {
         ("0.87.1", COMPLETE_HELP),
         ("0.99.1", COMPLETE_HELP),
         ("1.2.0", COMPLETE_HELP),
+        ("1.3.0", COMPLETE_HELP),
     ] {
         let runner = FakeRunner {
             invocations: Mutex::new(Vec::new()),
@@ -155,7 +156,7 @@ fn version_range_and_capabilities_are_both_required() {
     let executable = std::env::current_exe().unwrap();
     for unsupported in [
         "0.83.0", "0.84.1", "0.88.0", "0.95.0", "0.99.0", "0.99.2", "0.100.0", "1.1.0", "1.2.1",
-        "1.3.0",
+        "1.3.1",
     ] {
         let runner = FakeRunner {
             invocations: Mutex::new(Vec::new()),

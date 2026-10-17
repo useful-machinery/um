@@ -150,6 +150,31 @@ fn organization_audit_list_preserves_one_privacy_safe_page_as_stable_json() {
 }
 
 #[test]
+fn redacted_acceptance_audit_warning_does_not_recreate_an_actor() {
+    let mut page = audit_page(None);
+    page["warnings"][0]["reason"] = "redacted".into();
+    let (server, _directory, _path, credential_path) =
+        organization::prepared_organization(vec![json_http_response("200 OK", page)], TOKEN);
+    let output = run_with_env(
+        &[
+            "organization",
+            "audit",
+            "list",
+            "acme-research",
+            "--json",
+            "--allow-insecure-http",
+        ],
+        &deployment_environment(&server.api_url, &credential_path),
+    );
+    assert!(output.status.success(), "{output:?}");
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["warnings"][0]["reason"], "redacted");
+    assert_eq!(result["items"][1]["detailsStatus"], "details_unavailable");
+    assert!(result["items"][1].get("actor").is_none());
+    server.finish();
+}
+
+#[test]
 fn human_audit_list_identifies_available_details_without_inventing_unavailable_details() {
     let (server, _directory, _path, credential_path) =
         organization::prepared_organization(vec![audit_success(None)], TOKEN);

@@ -96,7 +96,9 @@ pub use github::{
     GitHubAccountType, GitHubApi, GitHubFailure, GitHubInstallation, GitHubInstallationState,
     GitHubRepository, GitHubRepositoryList, GitHubSetupSession,
 };
-pub use gitlab::{GitLabApi, GitLabFailure, GitLabSubmission};
+pub use gitlab::{
+    GitLabApi, GitLabFailure, GitLabRepositoryQuery, GitLabSelection, GitLabSubmission,
+};
 pub use google_docs_actions::{ActionApi, ActionFailure, ActionRead, Lifecycle as ActionLifecycle};
 pub use http_client::{
     HttpCancellation, HttpClient, HttpClientError, HttpEndpointError, HttpTransportPolicy,

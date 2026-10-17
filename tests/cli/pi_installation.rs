@@ -174,12 +174,12 @@ fn controlled_path_for(executable: &Path) -> tempfile::TempDir {
 fn conformance_executable() -> Option<PathBuf> {
     std::env::var_os("UM_PI_CONFORMANCE_EXECUTABLE")
         .map(PathBuf::from)
-        .filter(|path| path.to_string_lossy().ends_with("-pi-1.2.0/bin/pi"))
+        .filter(|path| path.to_string_lossy().ends_with("-pi-1.3.0/bin/pi"))
 }
 
 fn require_conformance_executable() -> PathBuf {
     conformance_executable().unwrap_or_else(|| {
-        panic!("UM_PI_CONFORMANCE_EXECUTABLE must name the pinned Pi 1.2.0 executable")
+        panic!("UM_PI_CONFORMANCE_EXECUTABLE must name the pinned Pi 1.3.0 executable")
     })
 }
 
@@ -242,7 +242,7 @@ fn doctor_selects_path_pi_and_uses_only_the_two_closed_probes() {
     assert_eq!(reports[0]["checks"][0]["details"]["profile"], "PiJsonV1");
     assert_eq!(
         reports[0]["checks"][0]["details"]["supportedRange"],
-        ">=0.84.2 <0.88.0 || =0.99.1 || =1.2.0"
+        ">=0.84.2 <0.88.0 || =0.99.1 || =1.2.0 || =1.3.0"
     );
     assert_eq!(
         reports[0]["checks"][0]["details"]["capabilities"],
@@ -626,11 +626,11 @@ fn pinned_real_pi_conformance_executable_is_exact_and_independent_of_saved_trust
 
     assert_eq!(reports[0], reports[1]);
     let details = &reports[0]["checks"][0]["details"];
-    assert_eq!(details["version"], "1.2.0");
+    assert_eq!(details["version"], "1.3.0");
     assert_eq!(details["profile"], "PiJsonV1");
     assert_eq!(
         details["supportedRange"],
-        ">=0.84.2 <0.88.0 || =0.99.1 || =1.2.0"
+        ">=0.84.2 <0.88.0 || =0.99.1 || =1.2.0 || =1.3.0"
     );
     assert_eq!(details["capabilities"], REQUIRED_CAPABILITIES);
     assert_eq!(

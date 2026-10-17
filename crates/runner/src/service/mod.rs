@@ -10,6 +10,7 @@ mod conversation;
 mod determinism_spike;
 mod execution;
 mod lease_clock;
+mod recovery;
 mod run_inputs;
 mod source;
 #[cfg(test)]
@@ -464,6 +465,46 @@ where
             }
             Err(_) => return Err(ServiceError::BuildRuntime),
         };
+    // Recovery is optional for ordinary work. An invalid/missing host binding
+    // cannot be treated as a newly initialized recovery root on this boot.
+    let recovery_root = Arc::clone(&work_root);
+    let runner_id = dependencies.config.credential().runner_id().to_owned();
+    let recovery_recorder = Arc::clone(&dependencies.recorder);
+    // Detached optional bookkeeping never delays the ordinary start handshake.
+    // A first assignment arriving before this completes uses the boot-only format.
+    tokio::task::spawn_blocking(move || {
+        if let Err(error) =
+            recovery_root.enable_recovery(&runner_id, Arc::new(recovery::SystemRecoveryHost))
+        {
+            record_optional_recovery_failure(
+                &recovery_recorder,
+                error.error_type(),
+                error.diagnostic(),
+            );
+        } else if let Some(store) = recovery_root.recovery() {
+            match store.catalog() {
+                Ok(catalog) => {
+                    for workspace_id in catalog {
+                        let verified = store
+                            .manifest(&workspace_id)
+                            .and_then(|manifest| store.private_by_attempt(&manifest));
+                        if let Err(error) = verified {
+                            record_optional_recovery_failure(
+                                &recovery_recorder,
+                                error.error_type(),
+                                error.diagnostic(),
+                            );
+                        }
+                    }
+                }
+                Err(error) => record_optional_recovery_failure(
+                    &recovery_recorder,
+                    error.error_type(),
+                    error.diagnostic(),
+                ),
+            }
+        }
+    });
     record_startup_retention(&dependencies.recorder, work_root.startup_retained());
     let result = run_connection_loop_with_work_root(
         dependencies,
@@ -1494,6 +1535,22 @@ fn workspace_cleanup_failure(recorder: &Recorder, detail: Option<Vec<String>>) -
         },
     );
     ServiceError::WorkspaceCleanupFailed(detail)
+}
+
+fn record_optional_recovery_failure(
+    recorder: &Recorder,
+    error_type: &'static str,
+    diagnostic: String,
+) {
+    recorder
+        .start(
+            "runner.workspace_recovery",
+            [
+                KeyValue::new(telemetry::attribute::ERROR_TYPE, error_type),
+                KeyValue::new("diagnostic", diagnostic),
+            ],
+        )
+        .finish(Outcome::Failure);
 }
 
 fn record_non_admitting_failure(recorder: &Recorder, error_type: &'static str) {
@@ -2995,8 +3052,9 @@ mod tests {
             .events()
             .into_iter()
             .filter(|event| {
-                event["event.name"] != "runner.gateway_connection"
-                    || event["um.connection.attempt"] == 1
+                event["event.name"] != "runner.workspace_recovery"
+                    && (event["event.name"] != "runner.gateway_connection"
+                        || event["um.connection.attempt"] == 1)
             })
             .collect();
         assert_eq!(events.len(), expected_event_count);
@@ -3071,7 +3129,11 @@ mod tests {
             .await
             .expect("receive captured upgrade headers");
 
-        let events = capture.events();
+        let events: Vec<_> = capture
+            .events()
+            .into_iter()
+            .filter(|event| event["event.name"] == "runner.gateway_connection")
+            .collect();
         assert_eq!(events.len(), 1);
         let event = &events[0];
         assert_eq!(event["event.name"], "runner.gateway_connection");
@@ -3266,7 +3328,11 @@ mod tests {
             }
             let (_delay, release_backoff) = backoff_request(&mut sleep_requests).await;
 
-            let events = capture.events();
+            let events: Vec<_> = capture
+                .events()
+                .into_iter()
+                .filter(|event| event["event.name"] == "runner.gateway_connection")
+                .collect();
             assert_eq!(events.len(), 1);
             assert_eq!(events[0]["event.name"], "runner.gateway_connection");
             assert_eq!(events[0]["error.type"], error_type);

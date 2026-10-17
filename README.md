@@ -1369,7 +1369,31 @@ show polls. GitLab credential commands distinguish usage (exit 2), authenticatio
 (3), unavailable
 transport (4), conflict (6), candidate unavailability (7), and identity mismatch (8).
 
-<!-- UM-2559: document repository selection and project binding here. -->
+Once an active connection has a usable credential, discover repositories by numeric
+provider ID, then explicitly select one before binding a project. Use `--selected`
+to inspect retained selections even when upstream discovery is unavailable.
+`--search`, `--repository-id`, and `--selected` are exclusive list filters;
+`--limit` and `--cursor` paginate the list. Each link/remove requires the current
+connection version. Repeat `--repository-id REPOSITORY` in a single link/remove
+command to change multiple IDs atomically; each command supports `--idempotency-key` for replay and
+`--delegator-principal-id` for service-action attribution.
+
+```sh
+um connection gitlab repository list ORG CONNECTION --json
+um connection gitlab repository list ORG CONNECTION --selected --json
+um connection gitlab repository link ORG CONNECTION --repository-id REPOSITORY --expected-version VERSION --json
+um project create ORG --name PROJECT_NAME --gitlab-connection-id CONNECTION \
+  --repository-id REPOSITORY --json
+um project repository set ORG PROJECT --gitlab-connection-id CONNECTION \
+  --repository-id REPOSITORY --json
+um connection gitlab repository remove ORG CONNECTION --repository-id REPOSITORY \
+  --expected-version VERSION --yes --json
+```
+
+`--gitlab-connection-id` and `--installation-id` are mutually exclusive.
+The project shows the GitLab binding and closed admission diagnostic; binding
+cannot enable GitLab execution. The [setup guide](https://docs.usefulmachinery.com/agent/gitlab-setup.md)
+explains selection, credential limitations and local disconnect.
 
 ## Linear connections
 
@@ -1950,8 +1974,8 @@ probe and one capability-help probe. The probes clear the child environment exce
 the captured inherited `PATH`, fresh temporary Pi state and working-directory paths, and
 the required isolation controls. Retaining `PATH` lets an environment-based launcher
 resolve its interpreter without allowing another `pi` selection. It admits
-canonical stable versions in `>=0.84.2 <0.88.0` or exactly `0.99.1` or `1.2.0`;
-the repository qualifies exact Pi 1.2.0. The capability probe accepts both the 0.84.2
+canonical stable versions in `>=0.84.2 <0.88.0` or exactly `0.99.1`, `1.2.0`, or `1.3.0`;
+the repository qualifies exact Pi 1.3.0. The capability probe accepts both the 0.84.2
 `pi [options] [@files...] [messages...]` usage line and the 0.84.3+
 `pi [options] [--] [@files...] [messages...]` line, while still requiring the JSON
 event, custom-session-directory, extension, system-prompt append, and
@@ -1969,16 +1993,16 @@ input/output, partial-message, subagent-forwarding, explicit-session-identity,
 permission-mode, setting-source, model, effort, append-system-prompt-file, and JSON-schema
 capabilities used by `ClaudeCodeStreamJsonV1`. The report contains only status, profile,
 observed version, supported range, exact repository qualification version, closed
-capabilities, and the selected absolute path. Qualification remains pinned to `2.1.296`
+capabilities, and the selected absolute path. Qualification remains pinned to `2.1.300`
 and does not claim that every admitted release or unexecuted host received exact-binary
 conformance. The report never exposes environment values, credentials, or loaded Claude
 settings. The JSON report has no `ready` field.
 
-The Codex check selects `codex` independently, accepts stable `>=0.147.0 <0.163.0`, and
+The Codex check selects `codex` independently, accepts stable `>=0.147.0 <0.164.0`, and
 requires the generated App Server schema capability used by CodexAppServerV1. Its
 isolated version and schema probes do not read ambient `CODEX_HOME`, provider
 credentials, or native configuration. The report contains the exact observed version,
-supported range, exact repository qualification version `0.162.1`, closed capabilities,
+supported range, exact repository qualification version `0.163.0`, closed capabilities,
 and canonical executable without starting a thread. At execution, async-delivery
 messages, structured asynchronous questions, form elicitation, and bounded additive
 events remain unattended and cannot settle, approve, assign a project, persist, or
@@ -2045,9 +2069,9 @@ artifact or runner state while transferring or verifying it.
 Runner startup selects `pi`, `claude`, and `codex` independently from its inherited
 operator-controlled `PATH`. Useful Machinery installs none of them. Each successful installation
 is validated once and retained as an immutable executable, exact-version, profile, and
-capability snapshot for the process lifetime: Pi requires `>=0.84.2 <0.88.0` or exactly `0.99.1` or `1.2.0`, Claude Code
+capability snapshot for the process lifetime: Pi requires `>=0.84.2 <0.88.0` or exactly `0.99.1`, `1.2.0`, or `1.3.0`, Claude Code
 requires `>=2.1.234 <2.2.0`, and Codex requires capability-compatible stable
-`>=0.147.0 <0.163.0` with exact repository qualification anchor `0.162.1`. Admission and invocation never repeat a lookup or probe. A missing
+`>=0.147.0 <0.164.0` with exact repository qualification anchor `0.163.0`. Admission and invocation never repeat a lookup or probe. A missing
 or incompatible installation leaves only that harness unavailable, so Runner Serve
 continues to accept command-only and other available-harness assignments. An assignment
 requiring the unavailable harness is rejected before launch, and selection never falls

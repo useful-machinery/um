@@ -12,7 +12,7 @@ fn service_key_file(directory: &tempfile::TempDir) -> String {
     path.to_string_lossy().into_owned()
 }
 
-fn service_environment<'a>(api_url: &'a str, credentials: &'a str) -> [(&'static str, &'a str); 5] {
+fn service_environment<'a>(api_url: &'a str, credentials: &'a str) -> [(&'static str, &'a str); 6] {
     deployment_environment(api_url, credentials)
 }
 

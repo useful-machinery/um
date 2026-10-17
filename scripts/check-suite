@@ -171,7 +171,11 @@ cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
 "$public_root/scripts/check-lint-policy"
 # --all-targets builds the example as a test harness, not as a worker.
 # Build the ordinary executable before exporting its explicit test contract.
-cargo build --locked -p um-execution --example internal-worker
+# Match the test run's packages and features, and build the binaries the
+# integration tests need anyway: a build-time dependency that the command
+# binary also links is otherwise built with a host-only profile, and every
+# library above it, including the worker's, would compile a second time.
+cargo build --locked --workspace --all-features --bins --example internal-worker
 export UM_TEST_INTERNAL_WORKER_EXECUTABLE="$cargo_target_dir/debug/examples/internal-worker"
 cargo nextest run --locked --workspace --all-targets --all-features
 

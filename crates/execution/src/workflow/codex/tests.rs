@@ -1434,6 +1434,26 @@ fn candidate_additive_events_are_bounded_nonsettling_observations() {
             },
         }),
         json!({
+            "method": "thread/readState/changed",
+            "params": {
+                "threadId": "thread-1",
+                "readState": {"revision": "rev-1", "firstUnread": null},
+            },
+        }),
+        json!({
+            "method": "thread/compacted",
+            "params": {"threadId": "thread-1", "turnId": "turn-1"},
+        }),
+        json!({
+            "method": "guardianWarning",
+            "params": {"threadId": "thread-1", "message": "fixture warning"},
+        }),
+        json!({
+            "method": "model/rerouted",
+            "params": {"threadId": "thread-1", "turnId": "turn-1",
+                "fromModel": "selected", "toModel": "daybreak", "reason": "fixture"},
+        }),
+        json!({
             "method": "item/mcpToolCall/progress",
             "params": {
                 "threadId": "thread-1",
@@ -1569,22 +1589,29 @@ fn candidate_additive_events_are_bounded_nonsettling_observations() {
         AgentOutcome::Failed(AgentFailureCause::MissingResult.into()),
     );
 
-    let mut mismatched = running_parser(AgentValueKind::None, 1024);
-    assert_eq!(
-        feed(
-            &mut mismatched,
-            json!({
-                "method": "thread/realtime/item/transcript/delta",
-                "params": {
-                    "threadId": "other-thread",
-                    "itemId": "realtime-item",
-                    "delta": "provisional",
-                },
-            }),
-        )
-        .unwrap_err(),
-        AgentFailureCause::HarnessProtocolFailed,
-    );
+    for event in [
+        json!({
+            "method": "thread/realtime/item/transcript/delta",
+            "params": {
+                "threadId": "other-thread",
+                "itemId": "realtime-item",
+                "delta": "provisional",
+            },
+        }),
+        json!({
+            "method": "thread/readState/changed",
+            "params": {
+                "threadId": "other-thread",
+                "readState": {"revision": "rev-1", "firstUnread": null},
+            },
+        }),
+    ] {
+        let mut mismatched = running_parser(AgentValueKind::None, 1024);
+        assert_eq!(
+            feed(&mut mismatched, event).unwrap_err(),
+            AgentFailureCause::HarnessProtocolFailed,
+        );
+    }
 }
 
 #[test]

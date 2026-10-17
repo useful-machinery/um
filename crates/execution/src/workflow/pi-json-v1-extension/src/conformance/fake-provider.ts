@@ -74,6 +74,13 @@ interface TruncatedToolCallResponse extends ResponseUsage {
   call: ToolCallResponse;
 }
 
+interface MalformedToolCallResponse extends ResponseUsage {
+  kind: "malformedToolCall";
+  id: string;
+  name: string;
+  rawArguments: string;
+}
+
 interface FailureResponse extends ResponseUsage {
   kind: "failure";
   stopReason: "error" | "aborted";
@@ -86,6 +93,7 @@ type ProviderResponse =
   | StreamedToolCallResponse
   | PartialToolCallFailureResponse
   | TruncatedToolCallResponse
+  | MalformedToolCallResponse
   | FailureResponse;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -202,6 +210,21 @@ function decodeResponse(value: unknown): ProviderResponse {
         name: value.call.name,
         arguments: value.call.arguments as JsonObject,
       },
+    };
+  }
+  if (
+    value.kind === "malformedToolCall" &&
+    typeof value.id === "string" &&
+    typeof value.name === "string" &&
+    typeof value.rawArguments === "string" &&
+    validInputTokens(value.inputTokens)
+  ) {
+    return {
+      kind: "malformedToolCall",
+      id: value.id,
+      name: value.name,
+      rawArguments: value.rawArguments,
+      inputTokens: value.inputTokens as number | undefined,
     };
   }
   if (
@@ -579,6 +602,40 @@ function emitTruncatedToolCall(
   });
 }
 
+function emitMalformedToolCall(
+  stream: AssistantMessageEventStream,
+  output: AssistantMessage,
+  response: MalformedToolCallResponse,
+): void {
+  const toolCall: ToolCall = {
+    type: "toolCall",
+    id: response.id,
+    name: response.name,
+    arguments: {},
+    argumentsError: `Malformed JSON\n\nReceived arguments:\n${response.rawArguments}`,
+  };
+  output.content.push(toolCall);
+  stream.push({
+    type: "toolcall_start",
+    contentIndex: 0,
+    partial: snapshot(output),
+  });
+  stream.push({
+    type: "toolcall_delta",
+    contentIndex: 0,
+    delta: response.rawArguments,
+    partial: snapshot(output),
+  });
+  stream.push({
+    type: "toolcall_end",
+    contentIndex: 0,
+    toolCall: structuredClone(toolCall),
+    partial: snapshot(output),
+  });
+  output.stopReason = "toolUse";
+  stream.push({ type: "done", reason: "toolUse", message: snapshot(output) });
+}
+
 function streamFakeProvider(
   model: Model<string>,
   context: TranscriptContext,
@@ -618,6 +675,8 @@ function streamFakeProvider(
         await emitPartialToolCallFailure(stream, output, response);
       } else if (response.kind === "truncatedToolCall") {
         emitTruncatedToolCall(stream, output, response.call);
+      } else if (response.kind === "malformedToolCall") {
+        emitMalformedToolCall(stream, output, response);
       } else {
         output.stopReason = response.stopReason;
         output.errorMessage = response.message;

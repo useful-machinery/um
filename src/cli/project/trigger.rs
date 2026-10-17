@@ -445,7 +445,7 @@ impl Retry {
                 }
                 Ok(observation) => match observation {
                     Err(LinearFailure::RateLimited { retry_after }) => {
-                        next = Duration::from_secs(retry_after.unwrap_or(2).max(2));
+                        next = Duration::from_secs(retry_after.unwrap_or(0)).max(poll_interval());
                         continue;
                     }
                     Err(failure) => return Ok(Err(failure)),
@@ -486,7 +486,7 @@ impl Retry {
                     )
                     .map(Ok);
             }
-            next = Duration::from_secs(2);
+            next = poll_interval();
         }
     }
 
@@ -516,6 +516,10 @@ impl Retry {
             .map_err(Into::into)
         })
     }
+}
+
+fn poll_interval() -> Duration {
+    um_support::poll_interval(Duration::from_secs(2))
 }
 
 fn failure_code(failure: &LinearFailure, acceptance_unknown: bool) -> (&'static str, ExitCode) {

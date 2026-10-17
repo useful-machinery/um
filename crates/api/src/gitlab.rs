@@ -46,6 +46,21 @@ pub(crate) fn secret_body(
     ))
 }
 
+pub struct GitLabRepositoryQuery<'a> {
+    pub limit: Option<i32>,
+    pub cursor: Option<&'a str>,
+    pub search: Option<&'a str>,
+    pub repository_id: Option<&'a str>,
+    pub selected: bool,
+}
+
+pub struct GitLabSelection<'a> {
+    pub version: i64,
+    pub repository_ids: &'a [String],
+    pub link: bool,
+    pub delegator: Option<&'a str>,
+}
+
 pub struct GitLabSubmission<'a> {
     pub version: i64,
     pub kind: models::submit_git_lab_candidate_request::Kind,
@@ -94,6 +109,10 @@ fn classify<E>(error: apis::Error<E>) -> GitLabFailure {
                     "https://api.usefulmachinery.com/problems/candidate-conflict"
                     | "https://api.usefulmachinery.com/problems/connection-version-conflict"
                     | "https://api.usefulmachinery.com/problems/connection-limit-reached"
+                    | "https://api.usefulmachinery.com/problems/connection-conflict"
+                    | "https://api.usefulmachinery.com/problems/cursor-stale"
+                    | "https://api.usefulmachinery.com/problems/repository-unavailable"
+                    | "https://api.usefulmachinery.com/problems/repository-limit-reached"
                     | "https://api.usefulmachinery.com/problems/idempotency-conflict",
                 ) => GitLabFailure::Conflict,
                 _ => GitLabFailure::Protocol,
@@ -158,6 +177,46 @@ impl GitLabApi {
     pub fn show(&self, org: &str, id: &str) -> Result<Value, GitLabFailure> {
         subject(
             source::get_git_lab_connection(&self.configuration, org, id).map_err(classify)?,
+            &[("id", id)],
+        )
+    }
+    pub fn repositories(
+        &self,
+        org: &str,
+        id: &str,
+        query: GitLabRepositoryQuery<'_>,
+    ) -> Result<Value, GitLabFailure> {
+        document(
+            source::list_git_lab_repositories(
+                &self.configuration,
+                org,
+                id,
+                query.limit,
+                query.cursor,
+                query.search,
+                query.repository_id,
+                query.selected.then_some(true),
+            )
+            .map_err(classify)?,
+        )
+    }
+    pub fn select_repository(
+        &self,
+        org: &str,
+        id: &str,
+        key: &str,
+        selection: GitLabSelection<'_>,
+    ) -> Result<Value, GitLabFailure> {
+        let mut body = models::PatchGitLabRepositorySelectionRequest::new(selection.version);
+        if selection.link {
+            body.add_provider_repository_ids = Some(selection.repository_ids.to_vec());
+        } else {
+            body.remove_provider_repository_ids = Some(selection.repository_ids.to_vec());
+        }
+        body.delegator_principal_id = selection.delegator.map(str::to_owned);
+        subject(
+            source::patch_git_lab_repository_selection(&self.configuration, org, id, key, body)
+                .map_err(classify)?,
             &[("id", id)],
         )
     }

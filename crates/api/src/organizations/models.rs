@@ -235,6 +235,7 @@ pub struct AuditProjectionWarning {
 pub enum AuditProjectionWarningReason {
     UnknownAction,
     MalformedRecord,
+    Redacted,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -259,6 +260,10 @@ pub struct Invitation {
     pub replacement_invitation_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub delivery_state: Option<InvitationDeliveryState>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub accepting_principal_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub accepted_membership_id: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -487,6 +492,20 @@ impl TryFrom<models::Invitation> for Invitation {
             return Err("the invitation target projection is invalid");
         }
 
+        if value.accepting_principal_id.is_some() != value.accepted_membership_id.is_some()
+            || value
+                .accepting_principal_id
+                .as_deref()
+                .is_some_and(|id| !um_support::valid_typed_id(id, "prn_"))
+            || value
+                .accepted_membership_id
+                .as_deref()
+                .is_some_and(|id| !um_support::valid_typed_id(id, "mem_"))
+            || state != InvitationState::Accepted && value.accepting_principal_id.is_some()
+        {
+            return Err("the invitation acceptance projection is invalid");
+        }
+
         Ok(Self {
             id: value.id,
             organization_id: value.organization_id,
@@ -506,6 +525,8 @@ impl TryFrom<models::Invitation> for Invitation {
                 models::invitation::DeliveryState::Sent => InvitationDeliveryState::Sent,
                 models::invitation::DeliveryState::Failed => InvitationDeliveryState::Failed,
             }),
+            accepting_principal_id: value.accepting_principal_id,
+            accepted_membership_id: value.accepted_membership_id,
         })
     }
 }
@@ -867,8 +888,13 @@ impl TryFrom<models::OrganizationMembershipHistoryEntry> for OrganizationMembers
         }
         if value.state == models::organization_membership_history_entry::State::Ended
             && value.linked_emails.is_some()
+            && (value.principal_id.is_none()
+                || value.principal_type
+                    != models::organization_membership_history_entry::PrincipalType::Human
+                || value.name_state
+                    == models::organization_membership_history_entry::NameState::Unavailable)
         {
-            return Err("the ended membership has current linked emails");
+            return Err("the ended membership has unavailable linked emails");
         }
         parse_timestamp(
             &value.created_at,
@@ -1168,6 +1194,9 @@ impl TryFrom<models::AuditProjectionWarning> for AuditProjectionWarning {
                 }
                 models::audit_projection_warning::Reason::MalformedRecord => {
                     AuditProjectionWarningReason::MalformedRecord
+                }
+                models::audit_projection_warning::Reason::Redacted => {
+                    AuditProjectionWarningReason::Redacted
                 }
             },
         })

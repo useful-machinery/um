@@ -11,22 +11,34 @@ require_command() {
     || fail "$1 is required. Enter the project devenv shell and retry."
 }
 
+# Words are classified once per command in every shell test, so the helpers
+# assign through a caller-named variable instead of forking a subshell. They
+# drop trailing newlines as the original command substitutions did.
 static_word() {
-  local word=$1
-  local length=${#word}
+  local static_word_value=$2
+  local length=${#static_word_value}
 
   if [[ $length -ge 2 ]]; then
-    if [[ ${word:0:1} == '"' && ${word:length-1:1} == '"' ]] \
-      || [[ ${word:0:1} == "'" && ${word:length-1:1} == "'" ]]; then
-      word=${word:1:length-2}
+    if [[ ${static_word_value:0:1} == '"' && ${static_word_value:length-1:1} == '"' ]] \
+      || [[ ${static_word_value:0:1} == "'" && ${static_word_value:length-1:1} == "'" ]]; then
+      static_word_value=${static_word_value:1:length-2}
     fi
   fi
 
-  printf '%s\n' "$word"
+  while [[ $static_word_value == *$'\n' ]]; do
+    static_word_value=${static_word_value%$'\n'}
+  done
+  printf -v "$1" '%s' "$static_word_value"
 }
 
 uri_decode() {
-  printf '%b' "${1//%/\\x}"
+  local uri_decode_value
+
+  printf -v uri_decode_value '%b' "${2//%/\\x}"
+  while [[ $uri_decode_value == *$'\n' ]]; do
+    uri_decode_value=${uri_decode_value%$'\n'}
+  done
+  printf -v "$1" '%s' "$uri_decode_value"
 }
 
 is_assignment() {
@@ -35,13 +47,13 @@ is_assignment() {
 
 is_literal_git() {
   local word
-  word=$(static_word "$1")
+  static_word word "$1"
   [[ $word == git || $word == */git ]]
 }
 
 is_wrapper() {
   local word
-  word=$(static_word "$1")
+  static_word word "$1"
   case "$word" in
     command|*/command|env|*/env|exec|*/exec)
       return 0
@@ -58,7 +70,7 @@ skip_command_options() {
   local word
 
   while [[ $command_index -lt ${#command_words[@]} ]]; do
-    word=$(static_word "${command_words[$command_index]}")
+    static_word word "${command_words[$command_index]}"
     case "$word" in
       --)
         ((command_index += 1))
@@ -87,7 +99,7 @@ skip_env_options() {
   local word
 
   while [[ $env_index -lt ${#env_words[@]} ]]; do
-    word=$(static_word "${env_words[$env_index]}")
+    static_word word "${env_words[$env_index]}"
     case "$word" in
       --)
         ((env_index += 1))
@@ -117,7 +129,7 @@ skip_exec_options() {
   local word
 
   while [[ $exec_index -lt ${#exec_words[@]} ]]; do
-    word=$(static_word "${exec_words[$exec_index]}")
+    static_word word "${exec_words[$exec_index]}"
     case "$word" in
       --)
         ((exec_index += 1))
@@ -150,7 +162,7 @@ contains_literal_git_invocation() {
   done
 
   while [[ $index -lt ${#invocation_words[@]} ]]; do
-    executable=$(static_word "${invocation_words[$index]}")
+    static_word executable "${invocation_words[$index]}"
     if is_literal_git "$executable"; then
       return 0
     fi
@@ -189,7 +201,7 @@ status=0
 check_file() {
   local file=$1
   local first_line ast_output ast_status line column source source_encoded
-  local encoded_word encoded_words
+  local encoded_word encoded_words word
   local -a words
 
   IFS= read -r first_line <"$file" || true
@@ -215,14 +227,15 @@ check_file() {
   while IFS=$'\t' read -r line column source_encoded encoded_words; do
     words=()
     for encoded_word in $encoded_words; do
-      words+=("$(uri_decode "$encoded_word")")
+      uri_decode word "$encoded_word"
+      words+=("$word")
     done
 
     if ! contains_literal_git_invocation words; then
       continue
     fi
 
-    source=$(uri_decode "$source_encoded")
+    uri_decode source "$source_encoded"
     printf '%s:%s:%s: literal Git command bypasses fixture isolation: %s\n' \
       "$file" "$line" "$column" "$source" >&2
     status=1

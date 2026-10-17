@@ -160,7 +160,9 @@ fn organization_invitation_issue_sends_target_and_idempotency_key() {
 
 #[test]
 fn organization_invitation_list_preserves_terminal_history_and_cursor() {
-    let accepted = invitation("accepted", Some("2026-01-03T03:04:05Z"));
+    let mut accepted = invitation("accepted", Some("2026-01-03T03:04:05Z"));
+    accepted["acceptingPrincipalId"] = "prn_01k0z6r1w8f4jy2m7q9v3x5abd".into();
+    accepted["acceptedMembershipId"] = "mem_01k0z6r1w8f4jy2m7q9v3x5abc".into();
     let mut revoked = invitation("revoked", Some("2026-01-04T03:04:05Z"));
     revoked["id"] = "inv_01k0z6r1w8f4jy2m7q9v3x5abd".into();
     revoked["targetKind"] = "email".into();
@@ -201,6 +203,15 @@ fn organization_invitation_list_preserves_terminal_history_and_cursor() {
     let document: serde_json::Value = serde_json::from_str(&stdout).unwrap();
     assert_eq!(document["schemaVersion"], 2);
     assert_eq!(
+        document["items"][0]["acceptingPrincipalId"],
+        "prn_01k0z6r1w8f4jy2m7q9v3x5abd"
+    );
+    assert_eq!(
+        document["items"][0]["acceptedMembershipId"],
+        "mem_01k0z6r1w8f4jy2m7q9v3x5abc"
+    );
+    assert!(document["items"][1].get("acceptedMembershipId").is_none());
+    assert_eq!(
         document["items"][1]["targetEmail"],
         "not-joined@example.test"
     );
@@ -213,6 +224,36 @@ fn organization_invitation_list_preserves_terminal_history_and_cursor() {
         "GET /api/v1/organizations/{ORG_ID}/invitations?limit=3&cursor=page-one HTTP/1.1\r\n"
     )));
     assert_authenticated(&request);
+}
+
+#[test]
+fn organization_invitation_history_human_labels_recorded_and_unavailable_links() {
+    let mut recorded = invitation("accepted", Some("2026-01-03T03:04:05Z"));
+    recorded["acceptingPrincipalId"] = "prn_01k0z6r1w8f4jy2m7q9v3x5abd".into();
+    recorded["acceptedMembershipId"] = "mem_01k0z6r1w8f4jy2m7q9v3x5abc".into();
+    let mut older = invitation("accepted", Some("2026-01-03T03:04:05Z"));
+    older["id"] = "inv_01k0z6r1w8f4jy2m7q9v3x5abd".into();
+    let (server, _directory, _path, credential_path) = prepared(vec![json_http_response(
+        "200 OK",
+        serde_json::json!({ "items": [recorded, older] }),
+    )]);
+    let environment = deployment_environment(&server.api_url, &credential_path);
+    let output = run_with_env(
+        &[
+            "organization",
+            "invitation",
+            "list",
+            ORG_ID,
+            "--allow-insecure-http",
+        ],
+        &environment,
+    );
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("accepted by: prn_01k0z6r1w8f4jy2m7q9v3x5abd"));
+    assert!(stdout.contains("accepted membership: mem_01k0z6r1w8f4jy2m7q9v3x5abc"));
+    assert!(stdout.contains("acceptance link: unavailable"));
+    server.finish();
 }
 
 #[test]

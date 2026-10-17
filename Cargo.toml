@@ -128,6 +128,7 @@ futures-util.workspace = true
 rustix = { workspace = true, features = ["event", "pty"] }
 um-execution = { workspace = true, features = ["test-fixtures"] }
 um-runner = { workspace = true, features = ["test-fixtures"] }
+um-support = { workspace = true, features = ["test-fixtures"] }
 um-test-support.workspace = true
 trycmd.workspace = true
 tokio = { workspace = true, features = ["sync"] }

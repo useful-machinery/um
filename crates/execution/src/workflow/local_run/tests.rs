@@ -5350,10 +5350,11 @@ async fn cloud_step_is_readable_while_a_real_downstream_command_is_running() {
         }
     });
     // The external child exposes a file marker, with no in-process notification.
-    // Poll only this OS boundary; the watchdog bounds a missing readiness signal.
+    // Its shell redirect creates the marker before writing it, so wait for the
+    // complete value rather than existence. Poll only this OS boundary; the
+    // watchdog bounds a missing readiness signal.
     let ready = root.join("ready");
-    cloud_test_poll(|| ready.exists()).await;
-    assert_eq!(fs::read(ready).unwrap(), b"ready");
+    cloud_test_poll(|| fs::read(&ready).is_ok_and(|marker| marker == b"ready")).await;
     assert!(!execution.is_finished());
     assert!(!private.join("cloud-retained-v1/state.json").exists());
     assert!(!private.join("result.json").exists());
@@ -5511,6 +5512,7 @@ async fn cloud_checkpoint_accepts_carrier_free_git_and_rejects_unpublished_recor
     );
     let private = fixture.run_path("git-checkpoint");
     fs::create_dir(&private).unwrap();
+    let private = fs::canonicalize(private).unwrap();
     let artifacts = ArtifactStaging::create(fixture.admitted.execution(), &private).unwrap();
     let attempt = "atm_01k0z6r1w8f4jy2m7q9v3x5abf";
     let inputs =

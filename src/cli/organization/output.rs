@@ -489,6 +489,7 @@ const fn audit_warning_reason(reason: AuditProjectionWarningReason) -> &'static 
     match reason {
         AuditProjectionWarningReason::UnknownAction => "unknown_action",
         AuditProjectionWarningReason::MalformedRecord => "malformed_record",
+        AuditProjectionWarningReason::Redacted => "redacted",
     }
 }
 

@@ -416,6 +416,18 @@ fn write_organization_list_human(
     writeln!(stdout, "✓ Organization invitation history listed.\n")?;
     for invitation in items {
         write_invitation_fields(&mut stdout, invitation)?;
+        if invitation.state == InvitationState::Accepted {
+            match (
+                &invitation.accepting_principal_id,
+                &invitation.accepted_membership_id,
+            ) {
+                (Some(principal), Some(membership)) => {
+                    writeln!(stdout, "accepted by: {principal}")?;
+                    writeln!(stdout, "accepted membership: {membership}")?;
+                }
+                _ => writeln!(stdout, "acceptance link: unavailable")?,
+            }
+        }
         writeln!(stdout)?;
     }
     super::super::write_page_footer(&mut stdout, deployment, next_cursor)?;

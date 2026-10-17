@@ -42,16 +42,27 @@ let
     }
   );
 
+  certificateEnv = {
+    SSL_CERT_FILE = "${cacert}/etc/ssl/certs/ca-bundle.crt";
+  };
+
+  # The test gate injects fixed values shaped like the rolling version and
+  # build identity, so its result is reused until the CLI source changes rather
+  # than rerun for every commit. The tests compare the binary with whichever
+  # values were injected, and the package's postInstall verifies the real ones.
+  testVersion = "0.0.0-dev.0+rev.0000000000000000000000000000000000000000";
+  testBuildIdentity = "0000000000000000000000000000000000000000";
+
   testArgs = commonArgs // {
-    inherit cargoArtifacts version;
+    inherit cargoArtifacts;
+    version = testVersion;
     nativeBuildInputs = [
       git
       python3
     ];
-    env = {
-      UM_BUILD_IDENTITY = buildIdentity;
-      UM_VERSION = version;
-      SSL_CERT_FILE = "${cacert}/etc/ssl/certs/ca-bundle.crt";
+    env = certificateEnv // {
+      UM_BUILD_IDENTITY = testBuildIdentity;
+      UM_VERSION = testVersion;
     };
   };
 
@@ -71,7 +82,7 @@ let
       # --all-targets builds the example as a test harness. Tests that spawn
       # internal workers need the ordinary executable supplied explicitly.
       preBuild = ''
-        cargo build --locked -p um-execution --example internal-worker
+        cargo build --locked --workspace --all-features --bins --example internal-worker
         export UM_TEST_INTERNAL_WORKER_EXECUTABLE="$(realpath "''${CARGO_TARGET_DIR:-target}/debug/examples/internal-worker")"
       '';
     }
@@ -85,7 +96,10 @@ craneLib.buildPackage (
 
     nativeBuildInputs = [ jq ];
 
-    env = testArgs.env;
+    env = certificateEnv // {
+      UM_BUILD_IDENTITY = buildIdentity;
+      UM_VERSION = version;
+    };
 
     # A direct production package build must first realize the nextest
     # derivation. The test gate cannot be bypassed through the package output.

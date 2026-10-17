@@ -30,7 +30,10 @@ pub(super) struct Command {
 enum ProjectCommand {
     #[command(about = "Manage a project's actions")]
     Action(action::Command),
-    #[command(about = "Create a project")]
+    #[command(
+        about = "Create a project",
+        after_help = "GitLab setup: https://docs.usefulmachinery.com/agent/gitlab-setup.md"
+    )]
     Create(CreateCommand),
     #[command(about = "List projects")]
     List(ListCommand),
@@ -169,7 +172,10 @@ struct RepositoryCommand {
 enum RepositorySubcommand {
     #[command(about = "Remove a project's repository binding")]
     Remove(RepositoryRemoveCommand),
-    #[command(about = "Bind or replace a project's repository")]
+    #[command(
+        about = "Bind or replace a project's repository",
+        after_help = "GitLab setup: https://docs.usefulmachinery.com/agent/gitlab-setup.md"
+    )]
     Set(RepositorySetCommand),
     #[command(about = "Show a project's repository binding")]
     Show(RepositoryShowCommand),

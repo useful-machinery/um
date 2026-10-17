@@ -8,7 +8,9 @@ pub use idempotency::generate_idempotency_key;
 pub use public_id::{
     valid_lowercase_hyphenated, valid_organization_ref, valid_typed_id, valid_url_safe_name,
 };
-pub use timing::{async_sleep, elapsed, monotonic_now, short_retry_delay, sleep, utc_now};
+pub use timing::{
+    async_sleep, elapsed, monotonic_now, poll_interval, short_retry_delay, sleep, utc_now,
+};
 pub use tls::install_provider;
 pub use workflow_contract::strict_json::{
     from_slice as strict_json_from_slice, from_str as strict_json_from_str,
