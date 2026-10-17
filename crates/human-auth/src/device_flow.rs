@@ -139,7 +139,9 @@ fn run<T>(
         let Some(wait) = schedule.next_wait(um_support::monotonic_now()) else {
             return Ok(DeviceFlowOutcome::Expired);
         };
-        if cancellation.wait(wait) {
+        // The schedule keeps the RFC 8628 interval; only command test builds
+        // shorten the wait it yields when their scripted server answers at once.
+        if cancellation.wait(um_support::poll_interval(wait)) {
             return Ok(DeviceFlowOutcome::Cancelled);
         }
         if schedule.expired(um_support::monotonic_now()) {

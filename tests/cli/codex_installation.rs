@@ -226,36 +226,10 @@ fn doctor_reports_exact_codex_identity_without_credentials_or_native_configurati
 }
 
 #[test]
-fn doctor_accepts_each_reviewed_codex_minor_line() {
-    for version in [
-        "0.147.0",
-        "0.148.999",
-        "0.149.999",
-        "0.150.999",
-        "0.151.999",
-        "0.152.999",
-        "0.153.999",
-        "0.154.999",
-        "0.155.999",
-        "0.156.999",
-        "0.157.0",
-        "0.157.1",
-        "0.157.999",
-        "0.158.0",
-        "0.158.999",
-        "0.159.0",
-        "0.159.3",
-        "0.159.999",
-        "0.160.0",
-        "0.160.999",
-        "0.161.0",
-        "0.161.999",
-        "0.162.0",
-        "0.162.1",
-        "0.162.999",
-        "0.163.0",
-        "0.163.999",
-    ] {
+fn doctor_accepts_the_reviewed_codex_range_endpoints() {
+    // The in-process installation unit test admits every reviewed minor line;
+    // the command only needs to prove it reports the range's endpoints.
+    for version in ["0.147.0", "0.163.999"] {
         let fixture = CodexFixture::new(version, true, true);
         let output = doctor_json(fixture.path_directory(), &[]);
         assert!(output.status.success(), "{version}");

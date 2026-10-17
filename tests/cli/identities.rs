@@ -434,78 +434,67 @@ fn unknown_identity_remains_removable_by_opaque_id() {
 
 #[test]
 fn successful_link_presents_human_provider_but_not_workload_provider() {
-    for (linked, provider, label) in [
+    // Link and list share one provider presentation; the list test covers every
+    // provider in both output modes, so each link mode needs one sign-in flow.
+    for (linked, provider, label, json) in [
         (
             identity(LINKED_IDENTITY_ID, AUTH0_ISSUER, "github|321", false),
             "github",
             "GitHub",
+            true,
         ),
         (
-            identity(LINKED_IDENTITY_ID, AUTH0_ISSUER, "google-oauth2|987", false),
-            "google",
-            "Google",
-        ),
-        (observed_gitlab_identity(), "gitlab.com", "GitLab.com"),
-        (
-            identity(
-                LINKED_IDENTITY_ID,
-                "https://other.example/",
-                "github|321",
-                false,
-            ),
-            "unknown",
-            "Other",
+            observed_gitlab_identity(),
+            "gitlab.com",
+            "GitLab.com",
+            false,
         ),
     ] {
-        for json in [true, false] {
-            let (server, _directory, path) = prepared_identity_command(
-                identity_link_flow_responses(vec![link_success(linked.clone())]),
-            );
-            let environment = deployment_environment_with_issuer(
-                &server.api_url,
-                &server.issuer,
-                path.to_str().unwrap(),
-            );
-            let mut args = vec!["auth", "identity", "link", "--allow-insecure-http"];
-            if json {
-                args.push("--json");
-            }
-            let output = run_with_env(&args, &environment);
-            assert!(output.status.success());
-            if json {
-                assert!(output.stderr.is_empty());
-                let events = String::from_utf8_lossy(&output.stdout)
-                    .lines()
-                    .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
-                    .collect::<Vec<_>>();
-                assert_eq!(events.len(), 2);
-                assert_eq!(
-                    events[1],
-                    serde_json::json!({
-                        "schemaVersion": 1, "event": "result", "deployment": server.api_url,
-                        "outcome": "linked", "identity": with_provider(linked.clone(), provider),
-                        "localSessionIdentity": "unchanged",
-                    })
-                );
-            } else {
-                assert!(
-                    String::from_utf8_lossy(&output.stderr).contains("Waiting for authorization")
-                );
-                let text = String::from_utf8(output.stdout).unwrap();
-                assert!(text.contains(&format!(
-                    "identity: {}\nsign-in method: {label}\ncurrent: no\nissuer: {}\nsubject: {}",
-                    linked["id"].as_str().unwrap(),
-                    linked["issuer"].as_str().unwrap(),
-                    linked["subject"].as_str().unwrap(),
-                )));
-                assert!(text.contains("local session identity: unchanged"));
-                assert_eq!(
-                    text.contains("asserted email:"),
-                    linked.get("assertedEmail").is_some()
-                );
-            }
-            assert_eq!(server.finish().len(), 4);
+        let (server, _directory, path) = prepared_identity_command(identity_link_flow_responses(
+            vec![link_success(linked.clone())],
+        ));
+        let environment = deployment_environment_with_issuer(
+            &server.api_url,
+            &server.issuer,
+            path.to_str().unwrap(),
+        );
+        let mut args = vec!["auth", "identity", "link", "--allow-insecure-http"];
+        if json {
+            args.push("--json");
         }
+        let output = run_with_env(&args, &environment);
+        assert!(output.status.success());
+        if json {
+            assert!(output.stderr.is_empty());
+            let events = String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(events.len(), 2);
+            assert_eq!(
+                events[1],
+                serde_json::json!({
+                    "schemaVersion": 1, "event": "result", "deployment": server.api_url,
+                    "outcome": "linked", "identity": with_provider(linked.clone(), provider),
+                    "localSessionIdentity": "unchanged",
+                })
+            );
+        } else {
+            assert!(String::from_utf8_lossy(&output.stderr).contains("Waiting for authorization"));
+            let text = String::from_utf8(output.stdout).unwrap();
+            assert!(text.contains(&format!(
+                "identity: {}\nsign-in method: {label}\ncurrent: no\nissuer: {}\nsubject: {}",
+                linked["id"].as_str().unwrap(),
+                linked["issuer"].as_str().unwrap(),
+                linked["subject"].as_str().unwrap(),
+            )));
+            assert!(text.contains("local session identity: unchanged"));
+            assert_eq!(
+                text.contains("asserted email:"),
+                linked.get("assertedEmail").is_some()
+            );
+        }
+        assert_eq!(server.finish().len(), 4);
     }
 }
 

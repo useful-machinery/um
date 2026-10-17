@@ -6,14 +6,8 @@ use super::*;
 fn login_environment<'a>(
     server: &'a ScriptedServer,
     credential_path: &'a str,
-) -> [(&'static str, &'a str); 5] {
-    [
-        (CREDENTIALS_FILE_VARIABLE, credential_path),
-        ("UM_API_URL", &server.api_url),
-        ("UM_AUTH_ISSUER", &server.issuer),
-        ("UM_AUTH_AUDIENCE", "https://api.fixture.example"),
-        ("UM_AUTH_CLIENT_ID", "fixture-public-client"),
-    ]
+) -> [(&'static str, &'a str); 6] {
+    deployment_environment_with_issuer(&server.api_url, &server.issuer, credential_path)
 }
 
 fn json_lines(output: &[u8]) -> Vec<serde_json::Value> {
@@ -808,6 +802,8 @@ fn interrupting_login_emits_cancellation_and_exits_130() {
     for (name, value) in environment {
         command.env(name, value);
     }
+    // The interrupt must arrive during the production device-flow poll wait.
+    command.env_remove("UM_TEST_POLL_INTERVAL_MILLISECONDS");
     let mut child = command.spawn().expect("login process should start");
     let stdout = child.stdout.take().unwrap();
     let mut stdout = BufReader::new(stdout);

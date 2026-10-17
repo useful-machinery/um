@@ -4704,88 +4704,67 @@ pub(super) mod unattended_requests {
 pub(super) mod failure_ordering {
     use super::*;
 
-    #[tokio::test]
-    async fn correlated_native_failures_keep_structured_identity_across_orderings() {
-        with_watchdog(async {
-            for (scenario, expected_started, expected_detail) in [
-                (
-                    "failure-before-start-authentication",
-                    false,
-                    AgentHarnessFailureDetail::ModelError,
-                ),
-                (
-                    "failure-after-start-mcp",
-                    true,
-                    AgentHarnessFailureDetail::ModelError,
-                ),
-                (
-                    "failure-after-start-hook",
-                    true,
-                    AgentHarnessFailureDetail::ModelError,
-                ),
-                (
-                    "failure-after-start-model",
-                    true,
-                    AgentHarnessFailureDetail::ModelError,
-                ),
-                (
-                    "failure-after-start-provider-other-prose",
-                    true,
-                    AgentHarnessFailureDetail::ModelError,
-                ),
-                (
-                    "failure-after-start-too-many-denials",
-                    true,
-                    AgentHarnessFailureDetail::ModelError,
-                ),
-                (
-                    "interrupted-too-many-denials",
-                    true,
-                    AgentHarnessFailureDetail::ModelError,
-                ),
-                (
-                    "failure-after-start-authentication",
-                    true,
-                    AgentHarnessFailureDetail::ModelError,
-                ),
-                (
-                    "failure-after-partial-output",
-                    true,
-                    AgentHarnessFailureDetail::ModelError,
-                ),
-                (
-                    "failure-after-async",
-                    true,
-                    AgentHarnessFailureDetail::ModelError,
-                ),
-                (
-                    "retry-exhausted",
-                    true,
-                    AgentHarnessFailureDetail::ModelOutputTruncated,
-                ),
-                (
-                    "truncated-provider-stream",
-                    true,
-                    AgentHarnessFailureDetail::ModelOutputTruncated,
-                ),
-            ] {
-                let (fixture, outcome, started) = run_response_process(scenario, 1024).await;
-                assert_eq!(started, expected_started, "{scenario}: {outcome:?}");
-                assert_eq!(
-                    outcome,
-                    AgentOutcome::Failed(
-                        AgentFailureCause::HarnessFailed {
-                            detail: expected_detail,
-                        }
-                        .into(),
-                    ),
-                    "{scenario}",
-                );
-                assert_fixture_quiescent(&fixture);
-                assert_no_native_rollout(&fixture);
+    // Each ordering launches its own fixture process, so each is a separate test
+    // with its own watchdog rather than one serial loop under a shared deadline.
+    macro_rules! correlated_native_failure_tests {
+        ($($name:ident: $scenario:literal, $started:literal, $detail:ident;)*) => {$(
+            #[tokio::test]
+            async fn $name() {
+                assert_correlated_native_failure(
+                    $scenario,
+                    $started,
+                    AgentHarnessFailureDetail::$detail,
+                )
+                .await;
             }
+        )*};
+    }
+
+    async fn assert_correlated_native_failure(
+        scenario: &str,
+        expected_started: bool,
+        expected_detail: AgentHarnessFailureDetail,
+    ) {
+        with_watchdog(async {
+            let (fixture, outcome, started) = run_response_process(scenario, 1024).await;
+            assert_eq!(started, expected_started, "{scenario}: {outcome:?}");
+            assert_eq!(
+                outcome,
+                AgentOutcome::Failed(
+                    AgentFailureCause::HarnessFailed {
+                        detail: expected_detail,
+                    }
+                    .into(),
+                ),
+                "{scenario}",
+            );
+            assert_fixture_quiescent(&fixture);
+            assert_no_native_rollout(&fixture);
         })
         .await;
+    }
+
+    mod correlated_native_failures_keep_structured_identity_across_orderings {
+        use super::*;
+
+        correlated_native_failure_tests! {
+            failure_before_start_authentication:
+                "failure-before-start-authentication", false, ModelError;
+            failure_after_start_mcp: "failure-after-start-mcp", true, ModelError;
+            failure_after_start_hook: "failure-after-start-hook", true, ModelError;
+            failure_after_start_model: "failure-after-start-model", true, ModelError;
+            failure_after_start_provider_other_prose:
+                "failure-after-start-provider-other-prose", true, ModelError;
+            failure_after_start_too_many_denials:
+                "failure-after-start-too-many-denials", true, ModelError;
+            interrupted_too_many_denials: "interrupted-too-many-denials", true, ModelError;
+            failure_after_start_authentication:
+                "failure-after-start-authentication", true, ModelError;
+            failure_after_partial_output: "failure-after-partial-output", true, ModelError;
+            failure_after_async: "failure-after-async", true, ModelError;
+            retry_exhausted: "retry-exhausted", true, ModelOutputTruncated;
+            truncated_provider_stream: "truncated-provider-stream", true, ModelOutputTruncated;
+        }
     }
 
     #[tokio::test]
