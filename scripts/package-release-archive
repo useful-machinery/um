@@ -47,7 +47,18 @@ def canonical_member(name: str, value: bytes, mode: int) -> tuple[tarfile.TarInf
     return member, io.BytesIO(value)
 
 
-def package_archive(binary: Path, output: Path, version: str, target: str) -> Path:
+# Published archives use maximum compression. Callers that only check archive
+# layout may choose a faster level; the members and their order do not change.
+DEFAULT_COMPRESSION_LEVEL = 9
+
+
+def package_archive(
+    binary: Path,
+    output: Path,
+    version: str,
+    target: str,
+    compression_level: int = DEFAULT_COMPRESSION_LEVEL,
+) -> Path:
     public_root = Path(__file__).resolve().parent.parent
     sources = (
         ("LICENSE", regular_file(public_root / "LICENSE", "CLI license"), 0o644),
@@ -59,6 +70,8 @@ def package_archive(binary: Path, output: Path, version: str, target: str) -> Pa
         fail(f"version is not canonical MAJOR.MINOR.PATCH or 0.0.0-dev: {version}")
     if target not in TARGETS:
         fail(f"target is not a supported release target: {target}")
+    if not 1 <= compression_level <= 9:
+        fail(f"compression level is not between 1 and 9: {compression_level}")
     if output.is_symlink() or (output.exists() and not output.is_dir()):
         fail(f"output path is not a regular directory: {output}")
     output.mkdir(parents=True, exist_ok=True)
@@ -72,7 +85,13 @@ def package_archive(binary: Path, output: Path, version: str, target: str) -> Pa
     try:
         with tempfile.NamedTemporaryFile(dir=output, delete=False) as temporary:
             temporary_name = temporary.name
-            with gzip.GzipFile(filename="", mode="wb", fileobj=temporary, mtime=0) as compressed:
+            with gzip.GzipFile(
+                filename="",
+                mode="wb",
+                fileobj=temporary,
+                mtime=0,
+                compresslevel=compression_level,
+            ) as compressed:
                 with tarfile.open(
                     fileobj=compressed, mode="w", format=tarfile.USTAR_FORMAT
                 ) as archive:
@@ -101,10 +120,20 @@ def main() -> None:
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--target", required=True)
     parser.add_argument("--version", required=True)
+    parser.add_argument(
+        "--compression-level",
+        type=int,
+        default=DEFAULT_COMPRESSION_LEVEL,
+        help="gzip level; release publication uses the default",
+    )
     arguments = parser.parse_args()
 
     archive = package_archive(
-        arguments.binary, arguments.output, arguments.version, arguments.target
+        arguments.binary,
+        arguments.output,
+        arguments.version,
+        arguments.target,
+        arguments.compression_level,
     )
     print(archive)
 

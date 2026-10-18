@@ -20,8 +20,13 @@ if [[ $# -gt 1 ]]; then
 fi
 
 check_root=$(mktemp -d "${TMPDIR:-/tmp}/um-pi-json-v1-check.XXXXXX")
+staging=
 cleanup() {
   rm -rf -- "$check_root"
+  if [[ -n "$staging" && -d "$staging" ]]; then
+    chmod -R u+w "$staging"
+    rm -rf -- "$staging"
+  fi
 }
 trap cleanup EXIT
 
@@ -32,11 +37,74 @@ for entry in "$package_root"/*; do
   fi
 done
 
+npm_ci=(npm ci --ignore-scripts --no-audit --no-fund)
+
+if [[ "$mode" == dependencies ]]; then
+  # The dependency-state check proves that the lockfile installs; never
+  # substitute an earlier installation for it.
+  (
+    cd "$check_root"
+    "${npm_ci[@]}"
+    npm ls --all >/dev/null
+  )
+  exit 0
+fi
+
+# The full check reuses one read-only tree that npm ci produced from the same
+# manifest, lockfile, Node, npm, and platform. Any difference in those inputs
+# selects a new key, and a missing key runs npm ci exactly as before. The tree
+# is published by an atomic rename only after npm ci succeeds, and the check
+# never writes to it.
+cache_target=${CARGO_TARGET_DIR:-$public_root/target}
+if [[ $cache_target != /* ]]; then
+  cache_target=$public_root/$cache_target
+fi
+cache_parent=$cache_target/pi-json-v1-extension
+cache_key=$(
+  {
+    printf '%s\n' "${npm_ci[*]}" "$(node --version)" "$(npm --version)" "$(uname -sm)"
+    for input in package.json package-lock.json .npmrc; do
+      if [[ -e "$package_root/$input" ]]; then
+        printf '%s\n' "$input"
+        cat "$package_root/$input"
+      fi
+    done
+  } | python3 -c 'import hashlib, sys; print(hashlib.sha256(sys.stdin.buffer.read()).hexdigest())'
+)
+cached_tree=$cache_parent/node-modules-$cache_key
+if [[ ! -d "$cached_tree/node_modules" ]]; then
+  mkdir -p "$cache_parent"
+  staging=$(mktemp -d "$cache_parent/staging.XXXXXX")
+  mkdir "$staging/package"
+  for entry in "$package_root"/*; do
+    if [[ ${entry##*/} != node_modules ]]; then
+      cp -R -- "$entry" "$staging/package/"
+    fi
+  done
+  (
+    cd "$staging/package"
+    "${npm_ci[@]}"
+  )
+  mv -- "$staging/package/node_modules" "$staging/node_modules"
+  rm -rf -- "$staging/package"
+  chmod -R a-w "$staging/node_modules"
+  # Another check may publish the same key first; its tree is equivalent.
+  if python3 -c 'import os, sys; os.rename(sys.argv[1], sys.argv[2])' \
+    "$staging" "$cached_tree" 2>/dev/null; then
+    staging=
+  fi
+  # Keep only the current installation.
+  for entry in "$cache_parent"/node-modules-*; do
+    if [[ "$entry" != "$cached_tree" ]]; then
+      chmod -R u+w "$entry"
+      rm -rf -- "$entry"
+    fi
+  done
+fi
+ln -s "$cached_tree/node_modules" "$check_root/node_modules"
+
 (
   cd "$check_root"
-  npm ci --ignore-scripts --no-audit --no-fund
   npm ls --all >/dev/null
-  if [[ "$mode" == check ]]; then
-    npm_config_offline=true npm run check
-  fi
+  npm_config_offline=true npm run check
 )

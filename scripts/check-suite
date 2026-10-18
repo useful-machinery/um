@@ -153,7 +153,10 @@ ln -s "$long_tmp_physical" "$tmp_alias"
 # Do not let any suite command honor an inherited TMPDIR inside the checkout.
 export TMPDIR=$tmp_alias
 
-"$public_root/scripts/test-strict-devenv"
+# Devenv keys its evaluation cache on TMPDIR, and the suite alias is new on
+# every run. The boundary test is the only Devenv entry below, so give it a
+# fixed source-external TMPDIR; the clean boundary does not keep TMPDIR.
+TMPDIR=/tmp "$public_root/scripts/test-strict-devenv"
 "$public_root/scripts/check-structure"
 "$public_root/scripts/check-public-api-boundary"
 "$public_root/scripts/check-help-output-style"
@@ -177,14 +180,20 @@ cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
 # library above it, including the worker's, would compile a second time.
 cargo build --locked --workspace --all-features --bins --example internal-worker
 export UM_TEST_INTERNAL_WORKER_EXECUTABLE="$cargo_target_dir/debug/examples/internal-worker"
-cargo nextest run --locked --workspace --all-targets --all-features
+# Nextest normally re-executes itself before each test process. That second
+# exec costs about 65 ms per test on macOS, roughly 15 s across this suite, and
+# only guards an interactive job-control race that this noninteractive check
+# never meets.
+NEXTEST_DOUBLE_SPAWN=0 cargo nextest run --locked --workspace --all-targets --all-features
 
 # The packaging checks exercise archive layout, embedded authoring assets, and
 # isolated execution, none of which depend on optimization level. Reuse the
 # binary the integration tests just built instead of a second, optimized
 # compilation of the whole crate; the Nix package and release builds compile
 # optimized binaries with the injected version and identity and run this suite
-# against them.
+# against them. Those publication paths keep the packager's maximum default
+# compression; this layout check packs the large debug binary at the fastest
+# level, which changes only the compressed bytes.
 host_target=$(rustc -vV | awk '$1 == "host:" { print $2 }')
 case $host_target in
   aarch64-apple-darwin | aarch64-unknown-linux-gnu | x86_64-unknown-linux-gnu)
@@ -194,7 +203,8 @@ case $host_target in
         --binary "$cargo_target_dir/debug/um" \
         --output "$release_dist" \
         --target "$host_target" \
-        --version 0.0.0-dev
+        --version 0.0.0-dev \
+        --compression-level 1
     )
     "$public_root/scripts/verify-release-package-isolated" \
       --archive "$archive" \

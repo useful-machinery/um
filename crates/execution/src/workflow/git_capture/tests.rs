@@ -1694,7 +1694,9 @@ esac\nexec \"$REAL_GIT\" \"$@\"\n",
     // Admission is setup, not the timeout under test. Capture also runs real Git
     // preflight commands before the deliberately blocked pack-objects command,
     // so allow scheduling headroom without relying on a sleep to trigger failure.
-    let capture_timeout = Duration::from_secs(5);
+    // The limit applies to each command separately, and the preflight commands
+    // finish in milliseconds; the blocked command waits out the whole limit.
+    let capture_timeout = Duration::from_secs(2);
     capture.command_timeout = capture_timeout;
     fs::write(repository.join("change.txt"), b"change\n").unwrap();
     git(&repository, &["add", "change.txt"]);
@@ -1712,7 +1714,7 @@ esac\nexec \"$REAL_GIT\" \"$@\"\n",
     assert_eq!(
         diagnostic,
         serde_json::json!({
-            "stage": "git_capture", "gitCommand": "pack_objects", "limitMs": 5000,
+            "stage": "git_capture", "gitCommand": "pack_objects", "limitMs": 2000,
         })
     );
     assert_eq!(artifacts.git_reservation_usage(), (0, 0));

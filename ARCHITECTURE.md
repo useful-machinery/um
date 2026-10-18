@@ -7,12 +7,12 @@ executable. The current binary provides help, version output, deployment selecti
 secure local human credential store, caller-managed service API-key input, OAuth Device
 Authorization, server-confirmed authentication status, explicit human-principal signup,
 service-principal and credential lifecycle management, revoking logout, organization
-profile and membership management, one-page active member-directory and owner-only membership-history reads, inputless Cloud run creation
-and current projection reads, local Workflow V1 definition validation, and an outbound,
+profile and membership management, one-page active member-directory and owner-only membership-history reads, Cloud run creation
+with declared inputs and current projection reads, local Workflow V1 definition validation, and an outbound,
 enrolled runner transport.
 `um runner serve` opens a versioned WebSocket connection, durably
 acknowledges received assignment effects, and uses the shared workflow resolver,
-admission boundary, and execution engine for one configured inputless command, Pi,
+admission boundary, and execution engine for one configured command, Pi,
 Claude Code, Codex, or mixed workflow. Semantic acceptance reserves the runner's single
 local assignment slot; a matching later start effect authorizes execution.
 `um runner doctor` performs one
@@ -418,7 +418,7 @@ rendered help come from the same structure. Bare command groups may print their 
 help, but only an explicit leaf command may start long-running behavior.
 
 Organization parsing and credential policy live in `src/cli/organization.rs`; its
-`audit.rs`, `create.rs`, `show.rs`, `update.rs`, `leave.rs`, and `members.rs` children own
+`audit.rs`, `create.rs`, `list.rs`, `show.rs`, `update.rs`, `leave.rs`, and `members.rs` children own
 leaf arguments and API calls. `output.rs` exhaustively maps route-specific outcomes to
 human text, schema-version-1 JSON, and process status. The command modules never expose
 generated DTOs or map raw HTTP statuses independently.
@@ -473,9 +473,9 @@ types at their boundary instead of becoming the workflow model.
 
 The following decisions remain open:
 
-- repository checkout and execution behavior;
-- supported operating systems and service managers;
-- installation, update, and release packaging; and
+- supported service managers for long-running runner installation;
+- release signing, notarization, installers, package-manager metadata, and update
+  channels beyond the published archives, `SHA256SUMS`, and attestations; and
 - whether the runner eventually warrants a dedicated executable.
 
 Selecting any of these must preserve the public source and credential boundaries above.

@@ -1,20 +1,73 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Path helpers with dirname(1) and basename(1) semantics, as builtins: every
+# fixture Git command passes through this helper, so it avoids starting
+# utility processes. Each sets REPLY.
+path_dirname() {
+  local path=$1
+  if [[ -z $path ]]; then
+    REPLY=.
+    return
+  fi
+  while [[ $path == */ && $path == *[!/]* ]]; do
+    path=${path%/}
+  done
+  if [[ $path != *[!/]* ]]; then
+    REPLY=/
+  elif [[ $path != */* ]]; then
+    REPLY=.
+  else
+    path=${path%/*}
+    while [[ $path == */ ]]; do
+      path=${path%/}
+    done
+    REPLY=${path:-/}
+  fi
+}
+
+path_basename() {
+  local path=$1
+  while [[ $path == */ && $path == *[!/]* ]]; do
+    path=${path%/}
+  done
+  if [[ -n $path && $path != *[!/]* ]]; then
+    REPLY=/
+  else
+    REPLY=${path##*/}
+  fi
+}
+
 # Start the helper itself with an empty environment before inspecting paths or
 # invoking Git. Only absolute tool locations and deterministic process settings
 # cross this boundary.
 if [[ ${UM_FIXTURE_GIT_ISOLATED:-0} != 1 ]]; then
-  script_path=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)/$(basename "${BASH_SOURCE[0]}")
-  bash_binary=$(cd "$(dirname "$BASH")" && pwd -P)/$(basename "$BASH")
+  path_dirname "${BASH_SOURCE[0]}"
+  script_directory=$REPLY
+  path_basename "${BASH_SOURCE[0]}"
+  script_path=$(cd "$script_directory" && pwd -P)/$REPLY
+  path_dirname "$BASH"
+  bash_directory=$REPLY
+  path_basename "$BASH"
+  bash_binary=$(cd "$bash_directory" && pwd -P)/$REPLY
   git_binary=$(type -P git) || {
     echo "fixture-git: git is required" >&2
     exit 1
   }
-  git_binary=$(cd "$(dirname "$git_binary")" && pwd -P)/$(basename "$git_binary")
+  path_dirname "$git_binary"
+  git_directory=$REPLY
+  path_basename "$git_binary"
+  git_binary=$(cd "$git_directory" && pwd -P)/$REPLY
   env_binary=$(type -P env)
-  utility_path=$(dirname "$(type -P mktemp)")
-  clean_path=$(dirname "$bash_binary"):$(dirname "$git_binary"):$(dirname "$env_binary"):$utility_path:/usr/bin:/bin
+  mktemp_binary=$(type -P mktemp) || true
+  path_dirname "$mktemp_binary"
+  utility_path=$REPLY
+  path_dirname "$bash_binary"
+  clean_path=$REPLY
+  path_dirname "$git_binary"
+  clean_path+=:$REPLY
+  path_dirname "$env_binary"
+  clean_path+=:$REPLY:$utility_path:/usr/bin:/bin
   exec "$env_binary" -i \
     UM_FIXTURE_GIT_ISOLATED=1 \
     UM_FIXTURE_GIT_BINARY="$git_binary" \
@@ -41,10 +94,12 @@ fail() {
   exit 1
 }
 
-script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
+path_dirname "${BASH_SOURCE[0]}"
+script_dir=$(cd "$REPLY" && pwd -P)
 public_root=$(cd "$script_dir/.." && pwd -P)
 git_binary=${UM_FIXTURE_GIT_BINARY:?}
-git_path=$(dirname "$git_binary"):/usr/bin:/bin
+path_dirname "$git_binary"
+git_path=$REPLY:/usr/bin:/bin
 marker_name=.scherzo-fixture-git-root
 
 reject_source_overlap() {
@@ -73,6 +128,7 @@ new_root() {
   printf '%s\n' "$root"
 }
 
+# Validate a fixture root and set REPLY to its canonical path.
 canonical_root() {
   local requested=$1
   local root marker
@@ -85,15 +141,16 @@ canonical_root() {
   marker=$root/$marker_name
   [[ -f "$marker" && ! -L "$marker" ]] \
     || fail "TEST_ROOT was not created by fixture-git new-root"
-  [[ "$(cat "$marker")" == "$root" ]] \
+  [[ "$(<"$marker")" == "$root" ]] \
     || fail "TEST_ROOT marker does not match its canonical path"
   for directory in home xdg-config tmp hooks; do
     [[ -d "$root/$directory" && ! -L "$root/$directory" ]] \
       || fail "TEST_ROOT isolation directory is missing: $directory"
   done
-  printf '%s\n' "$root"
+  REPLY=$root
 }
 
+# Validate a repository below a fixture root and set REPLY to its path.
 canonical_repo() {
   local root=$1 requested=$2
   local parent base repo
@@ -108,8 +165,10 @@ canonical_repo() {
     [[ -d "$requested" ]] || fail "REPO must be a directory"
     repo=$(cd "$requested" && pwd -P)
   else
-    parent=$(dirname "$requested")
-    base=$(basename "$requested")
+    path_dirname "$requested"
+    parent=$REPLY
+    path_basename "$requested"
+    base=$REPLY
     [[ "$base" != "." && "$base" != ".." ]] || fail "REPO has an invalid basename"
     [[ -d "$parent" && ! -L "$parent" ]] \
       || fail "REPO parent must be an existing non-symbolic-link directory"
@@ -124,7 +183,7 @@ canonical_repo() {
       fail "REPO must be contained by TEST_ROOT"
       ;;
   esac
-  printf '%s\n' "$repo"
+  REPLY=$repo
 }
 
 validate_command() {
@@ -221,8 +280,10 @@ case "$mode" in
       usage
       exit 2
     }
-    root=$(canonical_root "$1")
-    repo=$(canonical_repo "$root" "$2")
+    canonical_root "$1"
+    root=$REPLY
+    canonical_repo "$root" "$2"
+    repo=$REPLY
     case "$mode" in
       init-worktree)
         [[ ! -e "$repo/.git" ]] || fail "worktree repository is already initialized"
@@ -245,8 +306,10 @@ case "$mode" in
       usage
       exit 2
     }
-    root=$(canonical_root "$1")
-    repo=$(canonical_repo "$root" "$2")
+    canonical_root "$1"
+    root=$REPLY
+    canonical_repo "$root" "$2"
+    repo=$REPLY
     shift 2
     run_git "$root" "$mode" "$repo" "$@"
     ;;

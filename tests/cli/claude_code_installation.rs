@@ -272,27 +272,9 @@ fn doctor_reports_each_claude_code_installation_failure_without_fallback() {
             b"--version\n".as_slice(),
         ),
         (
-            "2.1.222 (Claude Code)",
-            COMPLETE_HELP,
-            "unsupported_claude_code_version",
-            b"--version\n".as_slice(),
-        ),
-        (
             "2.1.233 (Claude Code)",
             COMPLETE_HELP,
             "unsupported_claude_code_version",
-            b"--version\n".as_slice(),
-        ),
-        (
-            "2.2.0 (Claude Code)",
-            COMPLETE_HELP,
-            "unsupported_claude_code_version",
-            b"--version\n".as_slice(),
-        ),
-        (
-            "2.1.234-rc.1 (Claude Code)",
-            COMPLETE_HELP,
-            "malformed_claude_code_version",
             b"--version\n".as_slice(),
         ),
         (

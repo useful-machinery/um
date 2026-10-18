@@ -78,18 +78,20 @@ Rust; tracked legacy violations are cleanup work, not precedent for new code.
 
 Keep `release.toml` at schema 2 with only the static initial version, development
 version, and pre-1.0 breaking-impact policy. Keep the Cargo package fallback permanently
-at `0.0.0-dev`; Nix development builds and allocated release builds inject their
+at `0.0.0-dev`; Nix development builds and official release builds inject their
 revision-bearing or exact authoritative versions. Source validation must not fetch,
 synchronize, or inspect public tags. Run the release fixture suites when changing this
 policy or its pure impact arithmetic.
 
-Public release execution must consume only the exact managed allocation and, for
-recovery, its current allowlisted recovery chain. Never derive a version from public tags
-or the frozen archive. Preserve read-only permissions for checks, verification, and native
+Public release execution is fail-forward: public `main` is a rolling untagged candidate
+that managed Buildkite advances, GitHub Actions verifies and builds, and a human approves
+before the final write-scoped job publishes. Never derive a version from public tags or
+the frozen archive. Preserve read-only permissions for checks, verification, and native
 builds; grant write only to the final reconcile job; pin every action by commit; and keep
-pull requests, ordinary checks, allocation or recovery refs, and recovery-mirror pushes
-incapable of publication. Exact manual dispatch is recovery-only and must build the
-original allocated mirror rather than current repaired source.
+pull requests and ordinary checks incapable of publication. Repair a pre-tag failure by
+advancing `main` with a corrected candidate; never reset the branch, move a stable tag,
+or edit a published release. The complete candidate contract is in
+[`CONTRIBUTING.md`](CONTRIBUTING.md#release-policy-and-archived-notes).
 
 ## Release-note archive
 

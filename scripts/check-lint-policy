@@ -4,35 +4,43 @@ set -euo pipefail
 public_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$public_root"
 
-has_timing_allow() {
-  awk '
-    function inspect_attribute() {
-      if (attribute ~ /allow[[:space:]]*\(/ && attribute ~ /clippy::disallowed_methods/) {
-        found = 1
+# Scan every source in one awk process. Each file is judged independently: an
+# item-scoped exception is an #[expect(clippy::disallowed_methods)] attribute
+# followed, apart from comments and further attributes, by a function. In
+# "first-failure" mode the scan stops at the first file, in argument order,
+# that uses #[allow] (checked first) or attaches the expectation to anything
+# else, and prints that file's diagnostic. In "report" mode it prints which of
+# the two shapes each file contains.
+scan_timing_suppressions() {
+  local mode=$1
+  shift
+  awk -v mode="$mode" '
+    function reset_file() {
+      collecting = 0
+      attribute = ""
+      awaiting_item = 0
+      timing_allow = 0
+      broad_expectation = 0
+    }
+    function finish_file(path) {
+      if (awaiting_item) {
+        broad_expectation = 1
+      }
+      if (mode == "report") {
+        print path ": timing_allow=" timing_allow " broad_expectation=" broad_expectation
+        return
+      }
+      if (timing_allow) {
+        print "Use item-scoped #[expect] for clippy::disallowed_methods exceptions; #[allow] is forbidden: " path > "/dev/stderr"
+        failed = 1
+        exit 1
+      }
+      if (broad_expectation) {
+        print "Attach clippy::disallowed_methods expectations directly to a function or method, never a crate or module: " path > "/dev/stderr"
+        failed = 1
+        exit 1
       }
     }
-    collecting {
-      attribute = attribute "\n" $0
-      if ($0 ~ /\]/) {
-        inspect_attribute()
-        collecting = 0
-      }
-      next
-    }
-    /^[[:space:]]*#(!)?\[/ {
-      collecting = 1
-      attribute = $0
-      if ($0 ~ /\]/) {
-        inspect_attribute()
-        collecting = 0
-      }
-    }
-    END { exit found ? 0 : 1 }
-  ' "$1"
-}
-
-has_broad_timing_expectation() {
-  awk '
     function inspect_item(line, item) {
       if (!awaiting_item) {
         return
@@ -47,13 +55,16 @@ has_broad_timing_expectation() {
       if (item ~ /(^|[[:space:]])fn[[:space:]]+(r#)?[[:alpha:]_][[:alnum:]_]*/) {
         awaiting_item = 0
       } else {
-        found = 1
+        broad_expectation = 1
       }
     }
     function inspect_attribute(line, trailing) {
+      if (attribute ~ /allow[[:space:]]*\(/ && attribute ~ /clippy::disallowed_methods/) {
+        timing_allow = 1
+      }
       if (attribute ~ /expect[[:space:]]*\(/ && attribute ~ /clippy::disallowed_methods/) {
         if (attribute ~ /^[[:space:]]*#!\[/) {
-          found = 1
+          broad_expectation = 1
         } else {
           awaiting_item = 1
         }
@@ -62,6 +73,13 @@ has_broad_timing_expectation() {
       trailing = line
       sub(/^.*\][[:space:]]*/, "", trailing)
       inspect_item(trailing)
+    }
+    FNR == 1 {
+      if (NR > 1) {
+        finish_file(current_file)
+      }
+      current_file = FILENAME
+      reset_file()
     }
     collecting {
       attribute = attribute "\n" $0
@@ -84,35 +102,34 @@ has_broad_timing_expectation() {
       inspect_item($0)
     }
     END {
-      if (awaiting_item) {
-        found = 1
+      if (!failed && NR > 0) {
+        finish_file(current_file)
       }
-      exit found ? 0 : 1
     }
-  ' "$1"
+  ' "$@"
 }
 
+rust_sources=()
 while IFS= read -r -d '' rust_source; do
-  if has_timing_allow "$rust_source"; then
-    echo "Use item-scoped #[expect] for clippy::disallowed_methods exceptions; #[allow] is forbidden: $rust_source" >&2
-    exit 1
-  fi
-  if has_broad_timing_expectation "$rust_source"; then
-    echo "Attach clippy::disallowed_methods expectations directly to a function or method, never a crate or module: $rust_source" >&2
-    exit 1
-  fi
+  rust_sources+=("$rust_source")
 done < <(
   find src crates tests \
     -path 'tests/fixtures/lint-policy' -prune -o \
     -name '*.rs' -type f -print0
 )
+# Empty files contain neither shape and produce no awk record, so they need no
+# separate pass.
+if ((${#rust_sources[@]} > 0)); then
+  scan_timing_suppressions first-failure "${rust_sources[@]}"
+fi
 
 broad_suppression_fixture=tests/fixtures/lint-policy/main.rs
-if ! has_timing_allow "$broad_suppression_fixture"; then
+fixture_report=$(scan_timing_suppressions report "$broad_suppression_fixture")
+if [[ $fixture_report != *"timing_allow=1"* ]]; then
   echo "Lint-policy fixture did not exercise an outer module timing allow." >&2
   exit 1
 fi
-if ! has_broad_timing_expectation "$broad_suppression_fixture"; then
+if [[ $fixture_report != *"broad_expectation=1"* ]]; then
   echo "Lint-policy fixture did not exercise an outer module timing expectation." >&2
   exit 1
 fi

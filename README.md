@@ -2214,7 +2214,7 @@ output may contain sensitive data, so inspect it only through operator access.
 `release.toml` schema 2 contains only static policy: the initial release is `0.1.0`, the
 source-development version is `0.0.0-dev`, and breaking impact before `1.0` is minor.
 Native Cargo builds always report the development fallback. Nix development packages
-inject a revision-bearing development version, while allocated release builds inject
+inject a revision-bearing development version, while official release builds inject
 their exact approved version.
 
 Run `./scripts/check-release` to validate the policy and Cargo fallback. Impact and
@@ -2223,17 +2223,16 @@ impact, and an optional latest stable version. Source checks never fetch or insp
 public tags. The files in `changes/` are a frozen legacy archive; new intent is reviewed
 in the canonical private journal before this standalone tree is mirrored.
 
-Managed publication allocates one exact version after review and mirrors an immutable
-allocation record with the source. Metadata-branch creation is ignored by workflow push
-triggers, and provider rules forbid updating or deleting those content-addressed refs.
-GitHub Actions verifies the allocation and any separately approved recovery chain from the
-accompanying public `main` push; it never chooses a version from mutable tags. The
-three native builds always check out the original allocated mirror for x86-64 and ARM64
-Linux and for Apple Silicon macOS. The final write-scoped job creates or
-reconciles only matching tag and draft state, then publishes the exact archives,
-`SHA256SUMS`, and GitHub build-provenance attestations on the
-[Releases](https://github.com/useful-machinery/um/releases) page. Exact
-published state and repeated valid recovery are no-ops.
+Public `main` is a rolling, untagged release candidate rather than a version
+reservation. Managed Buildkite advances it after validating the canonical source-evidence
+artifact; GitHub Actions verifies the candidate contract, builds the x86-64 and ARM64
+Linux and Apple Silicon macOS archives, and asks a human to approve the proposed version
+and notes in the protected `cli-release` environment before the final write-scoped job
+publishes the archives, `SHA256SUMS`, and build-provenance attestations on the
+[Releases](https://github.com/useful-machinery/um/releases) page. A pre-tag failure is
+repaired by advancing `main` with a corrected candidate. See
+[`CONTRIBUTING.md`](CONTRIBUTING.md#release-policy-and-archived-notes) for the complete
+candidate contract and repair rules.
 
 Release binaries are not currently signed or notarized. Verify a downloaded archive
 with the attached checksums and GitHub attestation before running it:
