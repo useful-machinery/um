@@ -351,6 +351,22 @@ pub(crate) fn validate_with_invariant(result: &WorkflowResultV1) -> Result<(), R
         validate_finalization(finalization, result.force_abort)
             .map_err(|_| RunResultInvariant::FinalizationMetadata)?;
     }
+    if let Some(status) = &result.workspace_recovery
+        && (!matches!(
+            result.workflow.provenance,
+            WorkflowProvenanceV1::Cloud { .. }
+        ) || status.schema_version != 1
+            || matches!(
+                status.status,
+                super::publication::WorkspaceRecoveryStateV1::Pending
+            )
+            || (matches!(
+                status.status,
+                super::publication::WorkspaceRecoveryStateV1::NotEstablished
+            ) != status.reason.is_some()))
+    {
+        return Err(RunResultInvariant::ResultStructure);
+    }
     validate_continuation(result).map_err(|_| RunResultInvariant::Continuation)?;
     validate_force_abort(result).map_err(|_| RunResultInvariant::OutcomeMetadata)?;
     validate_outcome(result).map_err(|_| RunResultInvariant::OutcomeMetadata)?;
@@ -533,6 +549,47 @@ pub(super) fn validate_continuation_record(record: &ContinuationRecordV1) -> boo
         _ => false,
     };
     let workspace = &record.workspace;
+    let recovery_valid = match (&record.schema_version, &workspace.recovery) {
+        (None, None) => true,
+        (Some(2), Some(recovery)) => {
+            recovery.schema_version == 1
+                && valid_typed_id(&recovery.workspace_id, "rws_")
+                && valid_typed_id(&recovery.work_root_id, "rwr_")
+                && valid_typed_id(&recovery.runner_id, "rnr_")
+                && valid_typed_id(&recovery.origin_runner_boot_id, "rbt_")
+                && (recovery.target_runner_boot_id.is_some()
+                    == recovery.claiming_assignment_id.is_some())
+                && (recovery.claiming_assignment_id.is_some()
+                    == recovery.claim_generation.is_some())
+                && recovery
+                    .target_runner_boot_id
+                    .as_deref()
+                    .is_none_or(|id| valid_typed_id(id, "rbt_"))
+                && recovery
+                    .claiming_assignment_id
+                    .as_deref()
+                    .is_none_or(|id| valid_typed_id(id, "asn_"))
+                && recovery
+                    .claim_generation
+                    .is_none_or(|generation| (1..=9_007_199_254_740_991).contains(&generation))
+                && recovery.failure.as_ref().is_none_or(|failure| {
+                    let unavailable = matches!(
+                        failure.code,
+                        super::publication::RecoveryFailureCodeV1::RetainedWorkspaceUnavailable
+                    );
+                    let reason_unavailable = matches!(
+                        failure.recovery_reason,
+                        super::publication::RecoveryReasonV1::WorkspaceNotFound
+                            | super::publication::RecoveryReasonV1::RecoveryRecordUnsupported
+                            | super::publication::RecoveryReasonV1::RecoveryNotEstablished
+                    );
+                    unavailable == reason_unavailable
+                })
+                && (workspace.preparation != ContinuationPreparationV1::Ready
+                    || recovery.claim_generation.is_some())
+        }
+        _ => false,
+    };
     let quiescence_valid = workspace.quiescence.as_ref().is_some_and(|proof| {
         proof.groups_terminated.checked_add(proof.groups_absent) == Some(proof.groups_recorded)
             && parse_canonical_utc_timestamp(&proof.proven_at).is_some()
@@ -554,7 +611,8 @@ pub(super) fn validate_continuation_record(record: &ContinuationRecordV1) -> boo
                 )
         }
     };
-    definition_valid
+    recovery_valid
+        && definition_valid
         && record
             .request
             .execution_root

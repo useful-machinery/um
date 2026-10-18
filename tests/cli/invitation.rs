@@ -161,6 +161,8 @@ fn organization_invitation_issue_sends_target_and_idempotency_key() {
 #[test]
 fn organization_invitation_list_preserves_terminal_history_and_cursor() {
     let mut accepted = invitation("accepted", Some("2026-01-03T03:04:05Z"));
+    accepted["targetKind"] = "email".into();
+    accepted["targetEmail"] = "delivered@example.test".into();
     accepted["acceptingPrincipalId"] = "prn_01k0z6r1w8f4jy2m7q9v3x5abd".into();
     accepted["acceptedMembershipId"] = "mem_01k0z6r1w8f4jy2m7q9v3x5abc".into();
     let mut revoked = invitation("revoked", Some("2026-01-04T03:04:05Z"));
@@ -203,6 +205,10 @@ fn organization_invitation_list_preserves_terminal_history_and_cursor() {
     let document: serde_json::Value = serde_json::from_str(&stdout).unwrap();
     assert_eq!(document["schemaVersion"], 2);
     assert_eq!(
+        document["items"][0]["targetEmail"],
+        "delivered@example.test"
+    );
+    assert_eq!(
         document["items"][0]["acceptingPrincipalId"],
         "prn_01k0z6r1w8f4jy2m7q9v3x5abd"
     );
@@ -229,6 +235,8 @@ fn organization_invitation_list_preserves_terminal_history_and_cursor() {
 #[test]
 fn organization_invitation_history_human_labels_recorded_and_unavailable_links() {
     let mut recorded = invitation("accepted", Some("2026-01-03T03:04:05Z"));
+    recorded["targetKind"] = "email".into();
+    recorded["targetEmail"] = "delivered@example.test".into();
     recorded["acceptingPrincipalId"] = "prn_01k0z6r1w8f4jy2m7q9v3x5abd".into();
     recorded["acceptedMembershipId"] = "mem_01k0z6r1w8f4jy2m7q9v3x5abc".into();
     let mut older = invitation("accepted", Some("2026-01-03T03:04:05Z"));
@@ -250,6 +258,7 @@ fn organization_invitation_history_human_labels_recorded_and_unavailable_links()
     );
     assert!(output.status.success(), "{output:?}");
     let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("delivered@example.test"));
     assert!(stdout.contains("accepted by: prn_01k0z6r1w8f4jy2m7q9v3x5abd"));
     assert!(stdout.contains("accepted membership: mem_01k0z6r1w8f4jy2m7q9v3x5abc"));
     assert!(stdout.contains("acceptance link: unavailable"));

@@ -395,6 +395,9 @@ fn write_cancel_context(
             if let Some(fault) = interruption.executor_fault.as_ref() {
                 writeln!(out, "executor fault: {}", super::enum_text(fault)?)?;
             }
+            if let Some(reason) = interruption.recovery_reason.as_ref() {
+                writeln!(out, "recovery reason: {}", super::enum_text(reason)?)?;
+            }
             writeln!(
                 out,
                 "stop confirmed: {}",

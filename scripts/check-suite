@@ -95,11 +95,39 @@ suite_temporary_root=$(mktemp -d "/tmp/scherzo-cli-check-suite.XXXXXX")
 source_snapshot_root=
 long_tmp_parent=
 source_snapshot_started=false
+background_names=()
+background_pids=()
+background_output_root=
+
+# Wait for every background check, print each one's output, and name each
+# failed check with its output on standard error. Fails if any check failed.
+finish_background_checks() {
+  local index name failed=0
+  for index in "${!background_pids[@]}"; do
+    name=${background_names[$index]}
+    if wait "${background_pids[$index]}"; then
+      cat "$background_output_root/$name"
+    else
+      printf 'CLI source check failed: %s\n' "$name" >&2
+      cat "$background_output_root/$name" >&2
+      failed=1
+    fi
+  done
+  background_names=()
+  background_pids=()
+  return "$failed"
+}
+
 cleanup() {
   local status=$?
   local snapshot_status
   trap - EXIT
   set +e
+  # A failed foreground command must not hide a background failure, and the
+  # source snapshot and temporary-root removal must follow every writer.
+  if ((${#background_pids[@]} > 0)) && ! finish_background_checks; then
+    status=1
+  fi
   if [[ $source_snapshot_started == true ]]; then
     snapshot_cli_tree "$source_snapshot_root/after"
     snapshot_status=$?
@@ -153,21 +181,41 @@ ln -s "$long_tmp_physical" "$tmp_alias"
 # Do not let any suite command honor an inherited TMPDIR inside the checkout.
 export TMPDIR=$tmp_alias
 
+# The source checks are mostly single-threaded and need nothing that Cargo
+# builds, while the Cargo phases below leave cores idle as tests run. Run them
+# beside Cargo, longest first, each with its own output file and its own
+# directory beneath the suite TMPDIR. The suite reports them after Cargo, or
+# on any earlier exit, and fails if any failed.
+background_output_root=$long_tmp_parent/background-output
+mkdir -m 700 "$background_output_root"
+start_background_check() {
+  local name=$1 temporary=$tmp_alias/c${#background_pids[@]}
+  shift
+  mkdir -m 700 "$temporary"
+  TMPDIR=$temporary "$@" >"$background_output_root/$name" 2>&1 &
+  background_names+=("$name")
+  background_pids+=("$!")
+}
+start_background_check check-structure "$public_root/scripts/check-structure"
+start_background_check check-pi-json-v1-extension \
+  "$public_root/scripts/check-pi-json-v1-extension"
 # Devenv keys its evaluation cache on TMPDIR, and the suite alias is new on
-# every run. The boundary test is the only Devenv entry below, so give it a
+# every run. The boundary test is the only Devenv entry here, so give it a
 # fixed source-external TMPDIR; the clean boundary does not keep TMPDIR.
-TMPDIR=/tmp "$public_root/scripts/test-strict-devenv"
-"$public_root/scripts/check-structure"
-"$public_root/scripts/check-public-api-boundary"
-"$public_root/scripts/check-help-output-style"
-"$public_root/scripts/check-pi-json-v1-extension"
+start_background_check test-strict-devenv \
+  env TMPDIR=/tmp "$public_root/scripts/test-strict-devenv"
+start_background_check check-help-output-style \
+  "$public_root/scripts/check-help-output-style"
+start_background_check check-public-api-boundary \
+  "$public_root/scripts/check-public-api-boundary"
 
 cd "$public_root"
 export CARGO_TERM_COLOR=never
-# This complete check reuses ordinary Cargo artifacts across invocations, but
-# retaining per-revision incremental state makes repeated exact-base checks grow
-# without a useful bound. Keep the shared target reusable without that state.
-export CARGO_INCREMENTAL=0
+# Incremental state pays off only in a target that a later check reuses for the
+# same source path; rustc keeps one session per crate there and discards older
+# ones. A cold checkout would only spend disk and time writing it, so it stays
+# off unless the caller that owns a persistent, size-bounded target enables it.
+export CARGO_INCREMENTAL=${CARGO_INCREMENTAL:-0}
 cargo fmt --all -- --check
 "$public_root/scripts/check-msrv"
 cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
@@ -184,6 +232,14 @@ export UM_TEST_INTERNAL_WORKER_EXECUTABLE="$cargo_target_dir/debug/examples/inte
 # exec costs about 65 ms per test on macOS, roughly 15 s across this suite, and
 # only guards an interactive job-control race that this noninteractive check
 # never meets.
+# On macOS many tests wait on child processes, so run about 1.6 test threads
+# per CPU there (16 on a 10-CPU host); see .config/nextest.toml. Linux hosts
+# keep nextest's one thread per CPU.
+if [[ $(uname -s) == Darwin ]]; then
+  # A separate assignment, so that a failed count stops the suite.
+  online_cpus=$(nproc)
+  export NEXTEST_TEST_THREADS=$((online_cpus * 8 / 5))
+fi
 NEXTEST_DOUBLE_SPAWN=0 cargo nextest run --locked --workspace --all-targets --all-features
 
 # The packaging checks exercise archive layout, embedded authoring assets, and
@@ -216,5 +272,7 @@ case $host_target in
       "$host_target"
     ;;
 esac
+
+finish_background_checks
 
 printf 'Public CLI source checks passed.\n'

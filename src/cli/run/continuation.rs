@@ -535,6 +535,18 @@ pub(super) fn write_run_continuation(out: &mut impl Write, run: &Run) -> anyhow:
         "\nportable result: {}",
         super::enum_text(&run.portable_result)?
     )?;
+    if let Some(recovery) = run.workspace_recovery.as_deref() {
+        writeln!(
+            out,
+            "workspace recovery: {}",
+            super::enum_text(&recovery.status)?
+        )?;
+        if let Some(reason) = recovery.reason.as_ref() {
+            writeln!(out, "  reason: {}", super::enum_text(reason)?)?;
+        }
+    } else {
+        writeln!(out, "workspace recovery: not recorded")?;
+    }
     let Some(continuation) = run.continuation.as_deref() else {
         return Ok(());
     };
@@ -587,6 +599,21 @@ pub(super) fn write_run_continuation(out: &mut impl Write, run: &Run) -> anyhow:
         )?;
     }
     let workspace = &continuation.workspace;
+    if let Some(recovery) = workspace.recovery.as_deref() {
+        writeln!(
+            out,
+            "  retained workspace: {} (root {}, origin boot {})",
+            recovery.workspace_id, recovery.work_root_id, recovery.origin_runner_boot_id
+        )?;
+        if let Some(failure) = recovery.failure.as_ref() {
+            writeln!(
+                out,
+                "  recovery failure: {} ({})",
+                super::enum_text(&failure.code)?,
+                super::enum_text(&failure.recovery_reason)?
+            )?;
+        }
+    }
     writeln!(
         out,
         "  preparation: {}",
@@ -623,6 +650,45 @@ pub(super) fn write_run_continuation(out: &mut impl Write, run: &Run) -> anyhow:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn human_continuation_reads_retained_recovery_without_inventing_legacy_identity() {
+        let mut value: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../crates/api/tests/fixtures/run-continuation-pending.json"
+        ))
+        .unwrap();
+        let legacy: um_api::RunContinuationEnvelope =
+            serde_json::from_value(value.clone()).unwrap();
+        let mut output = Vec::new();
+        write_run_continuation(&mut output, &legacy.run).unwrap();
+        let legacy_text = String::from_utf8(output).unwrap();
+        assert!(!legacy_text.contains("rws_"));
+
+        value["run"]["workspaceRecovery"] = serde_json::json!({
+            "schemaVersion":1,"status":"not_established","reason":"registration_rejected"
+        });
+        value["run"]["continuation"]["schemaVersion"] = serde_json::json!(2);
+        value["run"]["continuation"]["workspace"]["recovery"] = serde_json::json!({
+            "schemaVersion":1,"workspaceId":"rws_01k0z6r1w8f4jy2m7q9v3x5abc",
+            "workRootId":"rwr_01k0z6r1w8f4jy2m7q9v3x5abc",
+            "runnerId":"rnr_01k0z6r1w8f4jy2m7q9v3x5abc",
+            "originRunnerBootId":"rbt_01k0z6r1w8f4jy2m7q9v3x5abc",
+            "targetRunnerBootId":null,"claimingAssignmentId":null,
+            "claimGeneration":null,
+            "failure":{"code":"ownership_unproven","recoveryReason":"host_identity_mismatch"}
+        });
+        let seeded: um_api::RunContinuationEnvelope = serde_json::from_value(value).unwrap();
+        let mut output = Vec::new();
+        write_run_continuation(&mut output, &seeded.run).unwrap();
+        let text = String::from_utf8(output).unwrap();
+        for marker in [
+            "rws_01k0z6r1w8f4jy2m7q9v3x5abc",
+            "host_identity_mismatch",
+            "registration_rejected",
+        ] {
+            assert!(text.contains(marker), "missing {marker}");
+        }
+    }
 
     #[test]
     fn workflow_path_matches_the_server_canonical_path_boundary() {

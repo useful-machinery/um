@@ -94,7 +94,7 @@ fn output(bytes: &[u8]) -> CommandOutput {
 #[test]
 fn stable_releases_in_range_with_every_capability_construct_pinned_installations() {
     let executable = std::env::current_exe().unwrap();
-    for version in ["2.1.234", "2.1.300"] {
+    for version in ["2.1.234", "2.1.302"] {
         let runner = FakeRunner {
             invocations: Mutex::new(Vec::new()),
             version: output(format!("{version} (Claude Code)\n").as_bytes()),
@@ -136,7 +136,7 @@ fn fixture_version_matches_the_qualification_version() {
         installation.version().as_str(),
         CLAUDE_CODE_STREAM_JSON_V1_QUALIFICATION_VERSION
     );
-    assert_eq!(installation.version().numeric(), (2, 1, 300));
+    assert_eq!(installation.version().numeric(), (2, 1, 302));
 }
 
 #[test]

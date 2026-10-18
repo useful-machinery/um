@@ -10,6 +10,8 @@
     {
       "$ref": "#/$defs/RunnerWorkspaceRetentionReport"
     },
+    { "$ref": "#/$defs/RunnerWorkspaceInventory" },
+    { "$ref": "#/$defs/RunnerWorkspaceInventoryComplete" },
     {
       "$ref": "#/$defs/RunnerEffectAcknowledged"
     },
@@ -70,6 +72,8 @@
     {
       "$ref": "#/$defs/CloudObservationAck"
     },
+    { "$ref": "#/$defs/CloudWorkspaceRegistered" },
+    { "$ref": "#/$defs/CloudWorkspaceRegistrationRejected" },
     {
       "$ref": "#/$defs/CloudArtifactCarrierRegistration"
     },
@@ -105,6 +109,59 @@
     }
   ],
   "$defs": {
+    "workRootId": {"type": "string", "pattern": "^rwr_[0-7][0-9a-hjkmnp-tv-z]{25}$"},
+    "workspaceId": {"type": "string", "pattern": "^rws_[0-7][0-9a-hjkmnp-tv-z]{25}$"},
+    "claimGeneration": {"type": "integer", "minimum": 1, "maximum": 9007199254740991},
+    "RecoveryReason": {"enum": ["workspace_not_found", "recovery_record_unsupported", "recovery_not_established", "recovery_record_invalid", "workspace_identity_mismatch", "host_identity_mismatch", "root_identity_unavailable", "host_identity_unavailable", "prior_owner_unproven", "process_journal_invalid", "claim_generation_stale", "claim_generation_exhausted", "recovery_evidence_unavailable"]},
+    "RecoveryStatus": {
+      "type": "object", "additionalProperties": false,
+      "properties": {
+        "schemaVersion": {"const": 1},
+        "status": {"enum": ["pending", "established", "not_established"]},
+        "reason": {"enum": [null, "registration_unacknowledged", "registration_rejected", "local_recovery_record_unavailable", "recovery_not_supported", "execution_not_started"]}
+      },
+      "required": ["schemaVersion", "status", "reason"],
+      "if": {"properties": {"status": {"const": "not_established"}}, "required": ["status"]},
+      "then": {"properties": {"reason": {"not": {"type": "null"}}}},
+      "else": {"properties": {"reason": {"type": "null"}}}
+    },
+    "RecoveryStartReference": {
+      "type": "object", "additionalProperties": false,
+      "properties": {
+        "workRootId": {"$ref": "#/$defs/workRootId"},
+        "workspaceId": {"$ref": "#/$defs/workspaceId"},
+        "acknowledgedMessageId": {"$ref": "#/$defs/runnerMessageId"},
+        "acknowledgedSequence": {"$ref": "#/$defs/sequence"}
+      },
+      "required": ["workRootId", "workspaceId", "acknowledgedMessageId", "acknowledgedSequence"]
+    },
+    "RecoveryStartObservation": {
+      "type": "object", "additionalProperties": false,
+      "properties": {
+        "schemaVersion": {"const": 1},
+        "registration": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/RecoveryStartReference"}]},
+        "reason": {"enum": [null, "registration_unacknowledged", "registration_rejected", "local_recovery_record_unavailable"]}
+      },
+      "required": ["schemaVersion", "registration", "reason"],
+      "if": {"properties": {"registration": {"type": "null"}}, "required": ["registration"]},
+      "then": {"properties": {"reason": {"not": {"type": "null"}}}},
+      "else": {"properties": {"reason": {"type": "null"}}}
+    },
+    "RecoveryGrant": {
+      "type": "object", "additionalProperties": false,
+      "properties": {
+        "schemaVersion": {"const": 1},
+        "workspaceId": {"$ref": "#/$defs/workspaceId"},
+        "workRootId": {"$ref": "#/$defs/workRootId"},
+        "claimGeneration": {"$ref": "#/$defs/claimGeneration"},
+        "originRunnerBootId": {"$ref": "#/$defs/bootId"},
+        "originAssignmentId": {"$ref": "#/$defs/assignmentId"},
+        "originAttemptId": {"$ref": "#/$defs/attemptId"},
+        "priorAssignmentId": {"$ref": "#/$defs/assignmentId"},
+        "priorAttemptId": {"$ref": "#/$defs/attemptId"}
+      },
+      "required": ["schemaVersion", "workspaceId", "workRootId", "claimGeneration", "originRunnerBootId", "originAssignmentId", "originAttemptId", "priorAssignmentId", "priorAttemptId"]
+    },
     "runnerId": {
       "type": "string",
       "pattern": "^rnr_[0-7][0-9a-hjkmnp-tv-z]{25}$"
@@ -667,6 +724,19 @@
         }
       ]
     },
+    "RecoveryAssignmentDecline": {
+      "type": "object", "additionalProperties": false,
+      "properties": {
+        "type": {"const": "runner_unable"},
+        "reason": {"enum": ["ownership_unproven", "retained_workspace_unavailable"]},
+        "recoveryReason": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/RecoveryReason"}]},
+        "diagnostic": {"$ref": "#/$defs/RunnerDiagnostic"}
+      },
+      "required": ["type", "reason", "recoveryReason"],
+      "if": {"properties": {"reason": {"const": "retained_workspace_unavailable"}}, "required": ["reason"]},
+      "then": {"properties": {"recoveryReason": {"enum": ["workspace_not_found", "recovery_record_unsupported", "recovery_not_established"]}}},
+      "else": {"properties": {"recoveryReason": {"enum": ["recovery_record_invalid", "workspace_identity_mismatch", "host_identity_mismatch", "root_identity_unavailable", "host_identity_unavailable", "prior_owner_unproven", "process_journal_invalid", "claim_generation_stale", "claim_generation_exhausted", "recovery_evidence_unavailable"]}}}
+    },
     "RunnerEnvelope": {
       "type": "object",
       "properties": {
@@ -732,11 +802,29 @@
                   "type": "string",
                   "minLength": 1,
                   "maxLength": 128
+                },
+                "workspaceRecoveryVersion": {"const": 1},
+                "workspaceRecoveryRoot": {
+                  "type": "object", "additionalProperties": false,
+                  "properties": {
+                    "bindingState": {"enum": ["verified", "unavailable"]},
+                    "workRootId": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/workRootId"}]},
+                    "recoveryReason": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/RecoveryReason"}]},
+                    "diagnostic": {"$ref": "#/$defs/RunnerDiagnostic"}
+                  },
+                  "required": ["bindingState", "workRootId", "recoveryReason"],
+                  "if": {"properties": {"bindingState": {"const": "verified"}}, "required": ["bindingState"]},
+                  "then": {"properties": {"workRootId": {"$ref": "#/$defs/workRootId"}, "recoveryReason": {"type": "null"}}},
+                  "else": {"properties": {"recoveryReason": {"$ref": "#/$defs/RecoveryReason"}}}
                 }
               },
               "required": [
                 "runnerVersion"
-              ]
+              ],
+              "dependentRequired": {
+                "workspaceRecoveryVersion": ["workspaceRecoveryRoot"],
+                "workspaceRecoveryRoot": ["workspaceRecoveryVersion"]
+              }
             }
           }
         }
@@ -780,6 +868,56 @@
         }
       ],
       "unevaluatedProperties": false
+    },
+    "WorkspaceClaim": {
+      "type": "object", "additionalProperties": false,
+      "properties": {
+        "claimGeneration": {"$ref": "#/$defs/claimGeneration"},
+        "attemptId": {"$ref": "#/$defs/attemptId"},
+        "assignmentId": {"$ref": "#/$defs/assignmentId"},
+        "runnerBootId": {"$ref": "#/$defs/bootId"}
+      },
+      "required": ["claimGeneration", "attemptId", "assignmentId", "runnerBootId"]
+    },
+    "RunnerWorkspaceInventory": {
+      "allOf": [{"$ref": "#/$defs/RunnerEnvelope"}, {"properties": {
+        "type": {"const": "workspace_inventory"},
+        "payload": {
+          "type": "object", "additionalProperties": false,
+          "properties": {
+            "schemaVersion": {"const": 1},
+            "workRootId": {"$ref": "#/$defs/workRootId"},
+            "workspaceId": {"$ref": "#/$defs/workspaceId"},
+            "runId": {"$ref": "#/$defs/runId"},
+            "priorAttemptId": {"$ref": "#/$defs/attemptId"},
+            "priorAssignmentId": {"$ref": "#/$defs/assignmentId"},
+            "originRunnerBootId": {"$ref": "#/$defs/bootId"},
+            "originAssignmentId": {"$ref": "#/$defs/assignmentId"},
+            "originAttemptId": {"$ref": "#/$defs/attemptId"},
+            "executionRoot": {"type": "string", "pattern": "^/", "maxLength": 4096},
+            "observedClaim": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/WorkspaceClaim"}]},
+            "lastClaimGeneration": {"oneOf": [{"type": "null"}, {"type": "integer", "minimum": 0, "maximum": 9007199254740991}]},
+            "presence": {"enum": ["present", "unavailable"]},
+            "recoveryReason": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/RecoveryReason"}]},
+            "diagnostic": {"$ref": "#/$defs/RunnerDiagnostic"}
+          },
+          "required": ["schemaVersion", "workRootId", "workspaceId", "runId", "priorAttemptId", "priorAssignmentId", "originRunnerBootId", "originAssignmentId", "originAttemptId", "executionRoot", "observedClaim", "lastClaimGeneration", "presence", "recoveryReason"],
+          "if": {"properties": {"presence": {"const": "present"}}, "required": ["presence"]},
+          "then": {"properties": {"lastClaimGeneration": {"type": "integer"}, "recoveryReason": {"type": "null"}}},
+          "else": {"properties": {"recoveryReason": {"$ref": "#/$defs/RecoveryReason"}}}
+        }
+      }}], "unevaluatedProperties": false
+    },
+    "RunnerWorkspaceInventoryComplete": {
+      "allOf": [{"$ref": "#/$defs/RunnerEnvelope"}, {"properties": {
+        "type": {"const": "workspace_inventory_complete"},
+        "payload": {"type": "object", "additionalProperties": false,
+          "properties": {
+            "schemaVersion": {"const": 1},
+            "workRootId": {"$ref": "#/$defs/workRootId"},
+            "inventoryThroughSequence": {"$ref": "#/$defs/nonnegativeSequence"}
+          }, "required": ["schemaVersion", "workRootId", "inventoryThroughSequence"]}
+      }}], "unevaluatedProperties": false
     },
     "RunnerEffectAcknowledged": {
       "allOf": [
@@ -919,9 +1057,12 @@
                 },
                 "required": ["groupsRecorded", "groupsTerminated", "groupsAbsent", "provenAt"]
               },
-              "modified": { "oneOf": [{ "type": "boolean" }, { "const": "unknown" }] }
+              "modified": { "oneOf": [{ "type": "boolean" }, { "const": "unknown" }] },
+              "schemaVersion": {"const": 2},
+              "recovery": {"$ref": "#/$defs/RecoveryGrant"}
             },
-            "required": ["assignmentId", "attemptId", "startSnapshot", "quiescence", "modified"]
+            "required": ["assignmentId", "attemptId", "startSnapshot", "quiescence", "modified"],
+            "dependentRequired": {"schemaVersion": ["recovery"], "recovery": ["schemaVersion"]}
           }
         } }
       ],
@@ -983,14 +1124,21 @@
                   "$ref": "#/$defs/assignmentId"
                 },
                 "decline": {
-                  "$ref": "#/$defs/AssignmentDecline"
-                }
+                  "oneOf": [
+                    {"$ref": "#/$defs/AssignmentDecline"},
+                    {"$ref": "#/$defs/RecoveryAssignmentDecline"}
+                  ]
+                },
+                "schemaVersion": {"const": 2}
               },
               "required": [
                 "effectId",
                 "assignmentId",
                 "decline"
-              ]
+              ],
+              "if": {"required": ["schemaVersion"]},
+              "then": {"properties": {"decline": {"$ref": "#/$defs/RecoveryAssignmentDecline"}}},
+              "else": {"properties": {"decline": {"$ref": "#/$defs/AssignmentDecline"}}}
             }
           }
         }
@@ -1167,6 +1315,38 @@
       ],
       "unevaluatedProperties": false
     },
+    "CloudWorkspaceRegistered": {
+      "allOf": [{"$ref": "#/$defs/CloudEnvelope"}, {"properties": {
+        "type": {"const": "workspace_registered"},
+        "payload": {"type": "object", "additionalProperties": false,
+          "properties": {
+            "schemaVersion": {"const": 1},
+            "acknowledgedMessageId": {"$ref": "#/$defs/runnerMessageId"},
+            "acknowledgedSequence": {"$ref": "#/$defs/sequence"},
+            "workRootId": {"$ref": "#/$defs/workRootId"},
+            "workspaceId": {"$ref": "#/$defs/workspaceId"},
+            "runId": {"$ref": "#/$defs/runId"},
+            "originRunnerBootId": {"$ref": "#/$defs/bootId"},
+            "originAssignmentId": {"$ref": "#/$defs/assignmentId"},
+            "originAttemptId": {"$ref": "#/$defs/attemptId"},
+            "executionRoot": {"type": "string", "pattern": "^/", "maxLength": 4096}
+          }, "required": ["schemaVersion", "acknowledgedMessageId", "acknowledgedSequence", "workRootId", "workspaceId", "runId", "originRunnerBootId", "originAssignmentId", "originAttemptId", "executionRoot"]}
+      }}], "unevaluatedProperties": false
+    },
+    "CloudWorkspaceRegistrationRejected": {
+      "allOf": [{"$ref": "#/$defs/CloudEnvelope"}, {"properties": {
+        "type": {"const": "workspace_registration_rejected"},
+        "payload": {"type": "object", "additionalProperties": false,
+          "properties": {
+            "schemaVersion": {"const": 1},
+            "acknowledgedMessageId": {"$ref": "#/$defs/runnerMessageId"},
+            "acknowledgedSequence": {"$ref": "#/$defs/sequence"},
+            "workRootId": {"$ref": "#/$defs/workRootId"},
+            "workspaceId": {"$ref": "#/$defs/workspaceId"},
+            "reason": {"enum": ["origin_not_eligible", "evidence_rejected", "registration_unavailable"]}
+          }, "required": ["schemaVersion", "acknowledgedMessageId", "acknowledgedSequence", "workRootId", "workspaceId", "reason"]}
+      }}], "unevaluatedProperties": false
+    },
     "CloudObservationAck": {
       "allOf": [
         {
@@ -1202,6 +1382,8 @@
       "type": "object",
       "additionalProperties": false,
       "properties": {
+        "schemaVersion": {"const": 2},
+        "recovery": {"$ref": "#/$defs/RecoveryGrant"},
         "priorAssignmentId": { "$ref": "#/$defs/assignmentId" },
         "priorAttemptId": { "$ref": "#/$defs/attemptId" },
         "requiredRunnerBootId": { "$ref": "#/$defs/bootId" },
@@ -1214,7 +1396,8 @@
         "inheritedSteps": { "type": "array", "items": { "type": "object" } },
         "priorSettlementSnapshot": { "type": ["object", "null"] }
       },
-      "required": ["priorAssignmentId", "priorAttemptId", "requiredRunnerBootId", "executionRoot", "definitionSource", "effectiveCapacity", "priorManifestDigest", "request", "reexecutedSteps", "inheritedSteps", "priorSettlementSnapshot"]
+      "required": ["priorAssignmentId", "priorAttemptId", "requiredRunnerBootId", "executionRoot", "definitionSource", "effectiveCapacity", "priorManifestDigest", "request", "reexecutedSteps", "inheritedSteps", "priorSettlementSnapshot"],
+      "dependentRequired": {"schemaVersion": ["recovery"], "recovery": ["schemaVersion"]}
     },
     "CloudAssignmentOffer": {
       "allOf": [
@@ -1448,14 +1631,17 @@
                 },
                 "attemptId": {
                   "$ref": "#/$defs/attemptId"
-                }
+                },
+                "schemaVersion": {"const": 2},
+                "workspaceRecovery": {"$ref": "#/$defs/RecoveryStatus"}
               },
               "required": [
                 "effectId",
                 "assignmentId",
                 "runId",
                 "attemptId"
-              ]
+              ],
+              "dependentRequired": {"schemaVersion": ["workspaceRecovery"], "workspaceRecovery": ["schemaVersion"]}
             }
           }
         }
@@ -4588,12 +4774,15 @@
                 },
                 "attemptId": {
                   "$ref": "#/$defs/attemptId"
-                }
+                },
+                "schemaVersion": {"const": 2},
+                "workspaceRecovery": {"$ref": "#/$defs/RecoveryStartObservation"}
               },
               "required": [
                 "assignmentId",
                 "attemptId"
-              ]
+              ],
+              "dependentRequired": {"schemaVersion": ["workspaceRecovery"], "workspaceRecovery": ["schemaVersion"]}
             },
             "type": {
               "const": "execution_started"

@@ -5,11 +5,36 @@
 # x86_64-unknown-linux-gnu was 144.579s at cap 2 and 145.593s at cap 4.
 # Cap 8 was rejected after higher-cap-only failures on macOS.
 external-process = { max-threads = 4 }
+# macOS hosts, whose integration tests mostly wait on child processes, gain
+# from a higher cap; check-suite also runs more test threads than CPUs there.
+# Measured 2026-10-17 on a 10-CPU aarch64-apple-darwin host at load 25-37:
+# 109-126 s at cap 4 with 10 threads, 100-107 s at cap 6 with 16 threads.
+# Linux keeps cap 4 and one thread per CPU.
+external-process-macos = { max-threads = 6 }
 
 [profile.default]
 # Report ordinary tests as slow after 30 seconds and terminate them after 60.
 retries = 0
 slow-timeout = { period = "30s", terminate-after = 2 }
+
+[[profile.default.overrides]]
+# Start the two CPU-heavy maximum-size archive fixtures first and give each
+# two thread slots, so they neither finish last nor share a CPU with a full
+# set of other tests. They took 35-39 s this way, against 47-58 s when they
+# started late beside the rest of the suite. Host load from other work can
+# still stretch them past the ordinary 60-second limit (52-60 s and timeouts
+# at load 30-40), so they receive the integration-test backstop.
+filter = "package(um-execution) & (test(=workflow::local_run::tests::artifact_set_carrier_boundary_is_shared_by_archive_and_portable_inspection) | test(=workflow::local_run::tests::archived_attempt_loads_valid_result_larger_than_state_document_limit))"
+priority = 100
+threads-required = 2
+slow-timeout = { period = "60s", terminate-after = 2 }
+
+[[profile.default.overrides]]
+# On macOS, the process-heavy tests below use the wider group instead. Only
+# the group differs; the later overrides still set their timeouts.
+platform = 'cfg(target_os = "macos")'
+filter = "(package(um-execution) & (test(workflow::pi::adapter_tests) | test(workflow::codex::adapter_tests))) | kind(test)"
+test-group = "external-process-macos"
 
 [[profile.default.overrides]]
 # Pi and Codex adapter unit tests also launch process trees; share the

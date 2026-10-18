@@ -26,6 +26,7 @@ chmod +x "$ambient_directory/$ambient_command"
 if ! PATH="$ambient_directory:$PATH" \
   CARGO_BUILD_JOBS=1 \
   CARGO_HOME="$cargo_home" \
+  CARGO_INCREMENTAL=1 \
   CARGO_TARGET_DIR="$cargo_target" \
   RUSTC_WRAPPER="$ambient_directory/$ambient_command" \
   DEVENV_TUI=false \
@@ -39,6 +40,7 @@ if ! PATH="$ambient_directory:$PATH" \
     [[ ${CARGO_TARGET_DIR:-} == "$expected_target" ]]
     [[ ${CARGO_HOME:-} == "$5" ]]
     [[ ${CARGO_BUILD_JOBS:-} == 1 ]]
+    [[ ${CARGO_INCREMENTAL:-} == 1 ]]
     [[ ${RUSTC_WRAPPER:-} == "$ambient_directory/$ambient_command" ]]
     [[ ${DEVENV_TUI:-} == false ]]
     [[ -z ${UM_CLI_STRICT_DEVENV_TEST_MARKER+x} ]]

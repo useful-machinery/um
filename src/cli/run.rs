@@ -1652,6 +1652,9 @@ fn write_observation_human(
         if let Some(reason) = &decline.reason {
             writeln!(out, "  reason: {}", enum_text(reason)?)?;
         }
+        if let Some(reason) = &decline.recovery_reason {
+            writeln!(out, "  recovery reason: {}", enum_text(reason)?)?;
+        }
         writeln!(out, "  runner: {}", decline.runner_id)?;
         writeln!(out, "  declined at: {}", decline.declined_at)?;
     }
@@ -1732,10 +1735,16 @@ fn write_run_terminal_issue(out: &mut impl Write, run: &Run) -> anyhow::Result<(
         writeln!(out, "  state: {}", enum_text(&failure.state)?)?;
         let detail = serde_json::to_value(&failure.detail)?;
         writeln!(out, "  detail: {}", visible_text(&detail.to_string()))?;
+        if let Some(reason) = &failure.recovery_reason {
+            writeln!(out, "  recovery reason: {}", enum_text(reason)?)?;
+        }
     }
     if let Some(rejection) = run.rejection.as_deref() {
         writeln!(out, "\nrejection:")?;
         writeln!(out, "  reason: {}", visible_text(&rejection.reason))?;
+        if let Some(reason) = &rejection.recovery_reason {
+            writeln!(out, "  recovery reason: {}", enum_text(reason)?)?;
+        }
     }
     Ok(())
 }
@@ -1896,6 +1905,9 @@ fn write_run_human(deployment: &str, heading: &str, run: &Run) -> anyhow::Result
     if let Some(interruption) = run.interruption.as_deref() {
         writeln!(stdout, "  phase: {}", enum_text(&interruption.phase)?)?;
         writeln!(stdout, "  cause: {}", enum_text(&interruption.cause)?)?;
+        if let Some(reason) = &interruption.recovery_reason {
+            writeln!(stdout, "  recovery reason: {}", enum_text(reason)?)?;
+        }
         writeln!(
             stdout,
             "  executor fault: {}",

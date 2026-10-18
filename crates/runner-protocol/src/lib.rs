@@ -1160,16 +1160,36 @@ fn decode_frame(bytes: &[u8]) -> Result<ValidatedFrame, DecodeError> {
         return Err(DecodeError::InvalidFrame("sizeClass"));
     }
     validate_protocol_schema(&value)?;
+    // The canonical schema admits retained V1 recovery frames, but the
+    // unactivated runtime must not silently project their V2 fields away.
+    if unactivated_recovery_frame(&value) {
+        return Err(DecodeError::InvalidFrame("workspaceRecoveryVersion"));
+    }
     validate_closed_shape(&value)?;
     let generated = serde_json::from_value(value).map_err(|_| DecodeError::InvalidJson)?;
 
     match generated {
-        generated::RunnerProtocolVersion1::RunnerHello(frame) => validate_runner_frame(
-            &frame.protocol_version,
-            &frame.payload_version,
-            &frame.direction,
-            frame.sent_at,
-        ),
+        generated::RunnerProtocolVersion1::RunnerHello(frame) => {
+            if frame.payload.workspace_recovery_version.is_some()
+                || frame.payload.workspace_recovery_root.is_some()
+            {
+                return Err(DecodeError::InvalidFrame("workspaceRecoveryVersion"));
+            }
+            validate_runner_frame(
+                &frame.protocol_version,
+                &frame.payload_version,
+                &frame.direction,
+                frame.sent_at,
+            )
+        }
+        // The wire types are admitted for historical decoding, but runtime
+        // inventory and registration are not activated by this reader change.
+        generated::RunnerProtocolVersion1::RunnerWorkspaceInventory(_)
+        | generated::RunnerProtocolVersion1::RunnerWorkspaceInventoryComplete(_)
+        | generated::RunnerProtocolVersion1::CloudWorkspaceRegistered(_)
+        | generated::RunnerProtocolVersion1::CloudWorkspaceRegistrationRejected(_) => {
+            Err(DecodeError::InvalidFrame("workspaceRecoveryVersion"))
+        }
         generated::RunnerProtocolVersion1::RunnerWorkspaceRetentionReport(frame) => {
             validated_runner_frame!(frame)
         }
@@ -1188,6 +1208,9 @@ fn decode_frame(bytes: &[u8]) -> Result<ValidatedFrame, DecodeError> {
             validated_runner_frame!(frame)
         }
         generated::RunnerProtocolVersion1::RunnerContinuationReady(frame) => {
+            if frame.payload.schema_version.is_some() || frame.payload.recovery.is_some() {
+                return Err(DecodeError::InvalidFrame("workspaceRecoveryVersion"));
+            }
             validated_runner_frame!(frame)
         }
         generated::RunnerProtocolVersion1::RunnerAssignmentAccepted(frame) => {
@@ -1221,6 +1244,10 @@ fn decode_frame(bytes: &[u8]) -> Result<ValidatedFrame, DecodeError> {
             validated_runner_frame!(frame)
         }
         generated::RunnerProtocolVersion1::RunnerExecutionStarted(frame) => {
+            if frame.payload.schema_version.is_some() || frame.payload.workspace_recovery.is_some()
+            {
+                return Err(DecodeError::InvalidFrame("workspaceRecoveryVersion"));
+            }
             validated_runner_frame!(frame)
         }
         generated::RunnerProtocolVersion1::RunnerExecutionTransition(frame) => {
@@ -1323,6 +1350,16 @@ fn decode_frame(bytes: &[u8]) -> Result<ValidatedFrame, DecodeError> {
             }))
         }
         generated::RunnerProtocolVersion1::CloudAssignmentOffer(frame) => {
+            if frame
+                .payload
+                .continuation
+                .as_ref()
+                .is_some_and(|continuation| {
+                    continuation.schema_version.is_some() || continuation.recovery.is_some()
+                })
+            {
+                return Err(DecodeError::InvalidFrame("workspaceRecoveryVersion"));
+            }
             let envelope = validated_cloud_envelope!(frame)?;
             let execution_spec = frame.payload.execution_spec;
             let schema_version = if *execution_spec.schema_version == 1.0 {
@@ -1577,6 +1614,10 @@ fn decode_frame(bytes: &[u8]) -> Result<ValidatedFrame, DecodeError> {
             }))
         }
         generated::RunnerProtocolVersion1::CloudExecutionStartAuthorized(frame) => {
+            if frame.payload.schema_version.is_some() || frame.payload.workspace_recovery.is_some()
+            {
+                return Err(DecodeError::InvalidFrame("workspaceRecoveryVersion"));
+            }
             let envelope = validated_cloud_envelope!(frame)?;
             Ok(cloud(CloudFrame::ExecutionStartAuthorized {
                 envelope,
@@ -1928,6 +1969,27 @@ fn validate_protocol_schema(value: &Value) -> Result<(), DecodeError> {
         Ok(())
     } else {
         Err(DecodeError::InvalidFrame("schema"))
+    }
+}
+
+fn unactivated_recovery_frame(value: &Value) -> bool {
+    let kind = value.get("type").and_then(Value::as_str);
+    let payload = value.get("payload");
+    match kind {
+        Some(
+            "workspace_inventory"
+            | "workspace_inventory_complete"
+            | "workspace_registered"
+            | "workspace_registration_rejected",
+        ) => true,
+        Some("hello") => payload.is_some_and(|body| body.get("workspaceRecoveryVersion").is_some()),
+        Some("assignment_offer") => payload
+            .and_then(|body| body.get("continuation"))
+            .is_some_and(|continuation| continuation.get("schemaVersion").is_some()),
+        Some("continuation_ready" | "execution_started" | "execution_start_authorized") => {
+            payload.is_some_and(|body| body.get("schemaVersion").is_some())
+        }
+        _ => false,
     }
 }
 
@@ -2457,6 +2519,19 @@ mod tests {
                 decode_frame(fixture).is_ok(),
                 "validation rejected valid fixture {index}"
             );
+        }
+    }
+
+    #[test]
+    fn recovery_wire_fixtures_decode_but_are_not_activated_at_runtime() {
+        for fixture in [
+            include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/fixtures/runner-protocol/v1/valid/runner-recovery-hello.json")).as_slice(),
+            include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/fixtures/runner-protocol/v1/valid/runner-workspace-inventory-present.json")).as_slice(),
+            include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/fixtures/runner-protocol/v1/valid/runner-workspace-inventory-complete.json")).as_slice(),
+        ] {
+            assert!(serde_json::from_slice::<generated::RunnerProtocolVersion1>(fixture).is_ok());
+            let result = decode_frame(fixture);
+            assert!(matches!(result, Err(DecodeError::InvalidFrame("workspaceRecoveryVersion"))), "{:?}", result.err());
         }
     }
 

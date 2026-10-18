@@ -323,6 +323,21 @@ async fn pinned_real_claude_code_01_normal_mode_loopback_conforms_from_a_synthet
             NATIVE_MCP_MARKER,
         );
         install_native_resource_plugin(&executable, &root, &provider, &resources.marketplace).await;
+        // A second prompt hook observes the same turn without relying on execution order.
+        let concurrent_hook_observation = root.private().join("second-hook-observation");
+        let concurrent_hook = root.private().join("second-hook.sh");
+        fs::write(
+            &concurrent_hook,
+            format!("printf 'second hook complete\\n' > '{}'\n", concurrent_hook_observation.display()),
+        ).unwrap();
+        let settings_path = root.project().join(".claude/settings.json");
+        let mut settings: Value = serde_json::from_slice(&fs::read(&settings_path).unwrap()).unwrap();
+        settings["hooks"]["UserPromptSubmit"][0]["hooks"]
+            .as_array_mut().unwrap().push(json!({
+                "type": "command",
+                "command": format!("{} {}", std::env::var("UM_CLAUDE_CODE_CONFORMANCE_SHELL").unwrap(), concurrent_hook.display())
+            }));
+        fs::write(settings_path, serde_json::to_vec(&settings).unwrap()).unwrap();
         let expected_cwd = fs::canonicalize(root.project()).unwrap();
         let message = "Complete the deterministic synthetic exchange.";
 
@@ -366,13 +381,15 @@ async fn pinned_real_claude_code_01_normal_mode_loopback_conforms_from_a_synthet
         ] {
             assert!(
                 contains_string_fragment(request.body(), marker),
-                "native request omitted resource marker {marker}"
+                "native request omitted resource marker {marker}; tools={:?}; mcp={:?}",
+                request.body()["tools"], fs::read_to_string(&resources.mcp_observation)
             );
         }
         assert_eq!(
             fs::read_to_string(&resources.hook_observation).unwrap(),
             resources.expected_hook_observation,
         );
+        assert_eq!(fs::read(&concurrent_hook_observation).unwrap(), b"second hook complete\n");
         let mcp_observation = fs::read_to_string(&resources.mcp_observation).unwrap();
         assert!(mcp_observation.starts_with("started\n"));
         assert!(mcp_observation.contains("tools/list"));
@@ -989,45 +1006,47 @@ async fn pinned_real_claude_code_06b_headless_term_and_cont_quiesce_owned_work()
 async fn pinned_real_claude_code_07_retains_forwarded_subagent_activity() {
     let (executable, _exclusive) = exclusive_conformance_executable().await;
     tokio::time::timeout(WATCHDOG, async {
-        let mut provider = LoopbackProvider::start().await;
-        let root = SyntheticClaudeCodeRoot::new();
-        let running = launch_response_lifecycle(executable, &root, &provider).await;
+        for subagent_type in ["general-purpose", "fork"] {
+            let mut provider = LoopbackProvider::start().await;
+            let root = SyntheticClaudeCodeRoot::new();
+            let running = launch_response_lifecycle(executable.clone(), &root, &provider).await;
 
-        provider.next_request().await.release_tool_use(
-            "Agent",
-            json!({"description": "Run a controlled subagent",
-                "prompt": "Return the exact subagent retained marker.",
-                "subagent_type": "general-purpose",
-                "run_in_background": false,
-            }),
-        );
-        let mut terminal = running.terminal;
-        tokio::select! {
-            request = provider.next_request() => request.release_text("subagent retained marker"),
-            outcome = &mut terminal => panic!("subagent stopped before child request: {outcome:?}"),
+            provider.next_request().await.release_tool_use(
+                "Agent",
+                json!({"description": "Run a controlled subagent",
+                    "prompt": "Return the exact subagent retained marker.",
+                    "subagent_type": subagent_type,
+                    "run_in_background": false,
+                }),
+            );
+            let mut terminal = running.terminal;
+            tokio::select! {
+                request = provider.next_request() => request.release_text("subagent retained marker"),
+                outcome = &mut terminal => panic!("{subagent_type} stopped before child request: {outcome:?}"),
+            }
+            provider.next_request().await.release_text(RESPONSE);
+            let AgentOutcome::Completed(CompletedAgentInvocation::Response(response)) =
+                terminal.await.unwrap()
+            else {
+                panic!("{subagent_type} exchange must complete through the production adapter");
+            };
+            running.task.await.unwrap();
+            assert_eq!(response.as_str(), RESPONSE);
+            assert_retained_native_session(&root, &["subagent retained marker", RESPONSE]);
+            let subagents = root.retained_resources().join("subagents");
+            let retained = fs::read_dir(subagents)
+                .unwrap()
+                .map(|entry| fs::read_to_string(entry.unwrap().path()).unwrap())
+                .collect::<Vec<_>>();
+            assert!(!retained.is_empty());
+            assert!(
+                retained
+                    .iter()
+                    .any(|transcript| transcript.contains("subagent retained marker"))
+            );
+            assert!(!provider.has_pending_request());
+            provider.shutdown().await;
         }
-        provider.next_request().await.release_text(RESPONSE);
-        let AgentOutcome::Completed(CompletedAgentInvocation::Response(response)) =
-            terminal.await.unwrap()
-        else {
-            panic!("subagent exchange must complete through the production adapter");
-        };
-        running.task.await.unwrap();
-        assert_eq!(response.as_str(), RESPONSE);
-        assert_retained_native_session(&root, &["subagent retained marker", RESPONSE]);
-        let subagents = root.retained_resources().join("subagents");
-        let retained = fs::read_dir(subagents)
-            .unwrap()
-            .map(|entry| fs::read_to_string(entry.unwrap().path()).unwrap())
-            .collect::<Vec<_>>();
-        assert!(!retained.is_empty());
-        assert!(
-            retained
-                .iter()
-                .any(|transcript| transcript.contains("subagent retained marker"))
-        );
-        assert!(!provider.has_pending_request());
-        provider.shutdown().await;
     })
     .await
     .expect("pinned Claude Code subagent-retention watchdog expired");
@@ -1237,7 +1256,7 @@ async fn pinned_real_claude_code_08_correlates_a_nominal_thinking_envelope_befor
             LoopbackBlock::text(RESPONSE),
         ]);
 
-        // Claude Code 2.1.300 emits a nominal `assistant` envelope restating the thinking
+        // Claude Code 2.1.302 emits a nominal `assistant` envelope restating the thinking
         // block. `ActiveContentBlock::correlate_nominal` requires that envelope to be
         // byte-equal to the reconstructed `thinking_delta` stream, so reaching a response
         // at all proves the equality invariant holds for native thinking.
@@ -1321,6 +1340,65 @@ async fn pinned_real_claude_code_09_every_block_kind_correlates_its_own_nominal_
     })
     .await
     .expect("pinned Claude Code block-kind correlation watchdog expired");
+}
+
+#[expect(
+    clippy::disallowed_methods,
+    reason = "real time is used only as an anti-hang watchdog, never as success evidence"
+)]
+#[tokio::test]
+#[ignore = "requires pinned harness"]
+async fn pinned_real_claude_code_09b_oversized_image_read_returns_a_bounded_tool_error() {
+    let (executable, _exclusive) = exclusive_conformance_executable().await;
+    tokio::time::timeout(WATCHDOG, async {
+        let mut provider = LoopbackProvider::start().await;
+        let root = SyntheticClaudeCodeRoot::new();
+        // Sparse file: the native Read tool must refuse it without reading 129 MB.
+        let image = root.project().join("oversized.png");
+        fs::File::create(&image)
+            .unwrap()
+            .set_len(129 * 1024 * 1024)
+            .unwrap();
+        let observations = RecordingObservationSink::default();
+        let running =
+            launch_recorded_response_lifecycle(executable, &root, &provider, &observations).await;
+        provider
+            .next_request()
+            .await
+            .release_tool_use("Read", json!({"file_path": image.display().to_string()}));
+        let next = provider.next_request().await;
+        let tool_results = observations
+            .snapshot()
+            .iter()
+            .filter_map(|entry| match entry.observation() {
+                AgentObservation::ToolResult {
+                    is_error, content, ..
+                } => Some((*is_error, content.len())),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(tool_results.len(), 1, "{tool_results:?}");
+        assert!(
+            tool_results[0].0,
+            "oversized image must return a tool error"
+        );
+        assert!(
+            tool_results[0].1 < 4096,
+            "tool error must not contain image bytes"
+        );
+        next.release_text(RESPONSE);
+        let AgentOutcome::Completed(CompletedAgentInvocation::Response(response)) =
+            running.finish().await
+        else {
+            panic!("image refusal must allow the production adapter to settle");
+        };
+        assert_eq!(response.as_str(), RESPONSE);
+        assert_retained_native_session(&root, &[RESPONSE]);
+        assert!(!provider.has_pending_request());
+        provider.shutdown().await;
+    })
+    .await
+    .expect("oversized image refusal watchdog expired");
 }
 
 #[expect(

@@ -1993,7 +1993,7 @@ input/output, partial-message, subagent-forwarding, explicit-session-identity,
 permission-mode, setting-source, model, effort, append-system-prompt-file, and JSON-schema
 capabilities used by `ClaudeCodeStreamJsonV1`. The report contains only status, profile,
 observed version, supported range, exact repository qualification version, closed
-capabilities, and the selected absolute path. Qualification remains pinned to `2.1.300`
+capabilities, and the selected absolute path. Qualification remains pinned to `2.1.302`
 and does not claim that every admitted release or unexecuted host received exact-binary
 conformance. The report never exposes environment values, credentials, or loaded Claude
 settings. The JSON report has no `ready` field.
@@ -2276,10 +2276,12 @@ Run the canonical check from the repository root:
 
 The command uses `scripts/strict-devenv` to remove the caller's environment before
 Devenv constructs the declared test environment. This is the same entrypoint used by CI.
-It preserves `CARGO_BUILD_JOBS`, `CARGO_HOME`, `CARGO_TARGET_DIR`, and `RUSTC_WRAPPER`
-so build limits, a caller-owned registry and build cache, and runner-owned compiler
-coordination survive the clean boundary instead of recompiling the dependency graph
-from cold on every run. Jobs are per Cargo invocation.
+It preserves `CARGO_BUILD_JOBS`, `CARGO_HOME`, `CARGO_TARGET_DIR`, `CARGO_INCREMENTAL`,
+and `RUSTC_WRAPPER` so build limits, a caller-owned registry and build cache, and
+runner-owned compiler coordination survive the clean boundary instead of recompiling the
+dependency graph from cold on every run. Jobs are per Cargo invocation. Incremental
+compilation stays off unless the caller sets `CARGO_INCREMENTAL=1` for a persistent
+target it reuses.
 The check verifies public-source isolation, formatting, every target and feature on the
 `rust-version` declared in `Cargo.toml`, checked-in Clippy policy, unit and integration
 tests, and release-archive packaging of the tested binary.

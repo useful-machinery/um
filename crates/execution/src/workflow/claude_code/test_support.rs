@@ -254,6 +254,8 @@ impl SyntheticClaudeCodeRoot {
         )
         .unwrap();
 
+        // Exercise the 2026-07-28 discovery path and a tools/list response without
+        // optional resultType, ttlMs, or cacheScope members.
         let mcp_observation = self.private.join("native-mcp-observation.txt");
         let mcp_server = self.private.join("native-mcp-server.sh");
         fs::write(
@@ -271,8 +273,11 @@ while IFS= read -r line; do
     continue
   fi
   case "$line" in
+    *server/discover*)
+      printf '{{"jsonrpc":"2.0","id":%s,"result":{{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{{"tools":{{}}}},"_meta":{{"io.modelcontextprotocol/serverInfo":{{"name":"scherzo-native-resource","version":"1.0.0"}}}}}}}}\n' "$id"
+      ;;
     *initialize*)
-      printf '{{"jsonrpc":"2.0","id":%s,"result":{{"protocolVersion":"2024-11-05","capabilities":{{"tools":{{}}}},"serverInfo":{{"name":"scherzo-native-resource","version":"1.0.0"}}}}}}\n' "$id"
+      printf '{{"jsonrpc":"2.0","id":%s,"result":{{"protocolVersion":"2026-07-28","capabilities":{{"tools":{{}}}},"serverInfo":{{"name":"scherzo-native-resource","version":"1.0.0"}}}}}}\n' "$id"
       ;;
     *tools/list*)
       printf '{{"jsonrpc":"2.0","id":%s,"result":{{"tools":[{{"name":"scherzo_native_resource","description":"{}","inputSchema":{{"type":"object","properties":{{}}}}}}]}}}}\n' "$id"

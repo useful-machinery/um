@@ -299,6 +299,9 @@ impl<'a> RunApi<'a> {
         require_media_type(&response, JSON_MEDIA_TYPE, false)?;
         require_exact_header(response.idempotency_keys.iter(), key)?;
         require_exact_header(response.cache_controls.iter(), PRIVATE_CACHE_CONTROL)?;
+        if !valid_recovery_json_shape(&response.body) {
+            return Err(RunFailure::protocol(false));
+        }
         let envelope: RunContinuationEnvelope =
             serde_json::from_slice(&response.body).map_err(|_| RunFailure::protocol(false))?;
         validate_continuation_envelope(&envelope, run_id, None, Some(request))?;
@@ -331,6 +334,9 @@ impl<'a> RunApi<'a> {
         }
         require_media_type(&response, JSON_MEDIA_TYPE, false)?;
         require_exact_header(response.cache_controls.iter(), PRIVATE_CACHE_CONTROL)?;
+        if !valid_recovery_json_shape(&response.body) {
+            return Err(RunFailure::protocol(false));
+        }
         let envelope: RunContinuationEnvelope =
             serde_json::from_slice(&response.body).map_err(|_| RunFailure::protocol(false))?;
         validate_continuation_envelope(&envelope, run_id, Some(request_id), None)?;
@@ -459,6 +465,9 @@ impl<'a> RunApi<'a> {
         require_media_type(&response, JSON_MEDIA_TYPE, false)?;
         require_exact_header(response.idempotency_keys.iter(), key)?;
         require_exact_header(response.cache_controls.iter(), PRIVATE_CACHE_CONTROL)?;
+        if !valid_recovery_json_shape(&response.body) {
+            return Err(RunFailure::protocol(false));
+        }
         let envelope: RunCancellationEnvelope =
             serde_json::from_slice(&response.body).map_err(|_| RunFailure::protocol(false))?;
         let expected_location = format!(
@@ -491,6 +500,9 @@ impl<'a> RunApi<'a> {
         }
         require_media_type(&response, JSON_MEDIA_TYPE, false)?;
         require_exact_header(response.cache_controls.iter(), PRIVATE_CACHE_CONTROL)?;
+        if !valid_recovery_json_shape(&response.body) {
+            return Err(RunFailure::protocol(false));
+        }
         let envelope =
             serde_json::from_slice(&response.body).map_err(|_| RunFailure::protocol(false))?;
         let envelope = validate_cancellation_envelope(envelope, run_id, None, None)?;
@@ -744,7 +756,19 @@ fn classify_continuation_failure(response: &ReceivedResponse) -> RunFailure {
             {
                 problem
                     .continuation_violations
-                    .filter(|violations| !violations.is_empty())
+                    .filter(|violations| {
+                        !violations.is_empty()
+                            && violations.iter().all(|violation| {
+                                violation.recovery_reason.is_none_or(|reason| {
+                                    let code = match violation.code {
+                                        models::continuation_admission_violation::Code::RetainedWorkspaceUnavailable => "retained_workspace_unavailable",
+                                        models::continuation_admission_violation::Code::OwnershipUnproven => "ownership_unproven",
+                                        _ => return false,
+                                    };
+                                    valid_recovery_reason_for_code(code, reason)
+                                })
+                            })
+                    })
                     .map_or(
                         RunFailure::protocol(false),
                         RunFailure::ContinuationAdmissionInvalid,
@@ -873,6 +897,9 @@ fn decode_get_response(
         StatusCode::OK => {
             require_media_type(&response, JSON_MEDIA_TYPE, false)?;
             require_exact_header(response.cache_controls.iter(), PRIVATE_CACHE_CONTROL)?;
+            if !valid_recovery_json_shape(&response.body) {
+                return Err(RunFailure::protocol(false));
+            }
             let run =
                 serde_json::from_slice(&response.body).map_err(|_| RunFailure::protocol(false))?;
             validate_run(run, requested_run_id)
@@ -1173,9 +1200,54 @@ fn validate_run(run: Run, requested_run_id: &str) -> Result<Run, RunFailure> {
         && valid_cancellation(run.cancellation.as_deref())
         && (run.state != models::run::State::Cancelling || run.cancellation.is_some())
         && valid_interruption(run.state, run.interruption.as_deref())
+        && run
+            .failure
+            .as_deref()
+            .and_then(|failure| failure.recovery_reason)
+            .is_none_or(|reason| {
+                run.failure.as_deref().is_some_and(|failure| {
+                    failure
+                        .detail
+                        .get("code")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|code| valid_recovery_reason_for_code(code, reason))
+                })
+            })
+        && run
+            .rejection
+            .as_deref()
+            .and_then(|rejection| rejection.recovery_reason)
+            .is_none_or(|reason| {
+                run.rejection.as_deref().is_some_and(|rejection| {
+                    valid_recovery_reason_for_code(&rejection.reason, reason)
+                })
+            })
+        && run
+            .observation
+            .as_deref()
+            .and_then(|observation| observation.last_decline.as_deref())
+            .is_none_or(|decline| {
+                decline.recovery_reason.is_none_or(|reason| {
+                    if decline.code != models::run_placement_decline::Code::RunnerUnable {
+                        return false;
+                    }
+                    match decline.reason {
+                        Some(models::run_placement_decline::Reason::OwnershipUnproven) => {
+                            valid_recovery_reason_for_code("ownership_unproven", reason)
+                        }
+                        Some(
+                            models::run_placement_decline::Reason::RetainedWorkspaceUnavailable,
+                        ) => {
+                            valid_recovery_reason_for_code("retained_workspace_unavailable", reason)
+                        }
+                        _ => false,
+                    }
+                })
+            })
         && valid_artifact_delivery(run.artifact_delivery.as_deref())
         && valid_portable_result(&run)
         && valid_staged_continuation(&run)
+        && valid_workspace_recovery(run.workspace_recovery.as_deref())
         && valid_timestamp(&run.created_at)
         && valid_timestamp(&run.updated_at);
     if valid {
@@ -1220,6 +1292,18 @@ fn valid_interruption(
     let Some(interruption) = interruption else {
         return false;
     };
+    if interruption.recovery_reason.is_some_and(|reason| {
+        let code = match interruption.cause {
+            models::run_interruption::Cause::RetainedWorkspaceUnavailable => {
+                "retained_workspace_unavailable"
+            }
+            models::run_interruption::Cause::OwnershipUnproven => "ownership_unproven",
+            _ => return true,
+        };
+        !valid_recovery_reason_for_code(code, reason)
+    }) {
+        return false;
+    }
     match interruption.cause {
         models::run_interruption::Cause::ExecutorFault => {
             interruption.stop_confirmed && interruption.executor_fault.is_some()
@@ -1250,6 +1334,46 @@ fn valid_staged_continuation(run: &Run) -> bool {
         return true;
     };
     let workspace = &continuation.workspace;
+    if let Some(recovery) = workspace.recovery.as_deref() {
+        if continuation.schema_version != Some(models::run_continuation::SchemaVersion::Variant2)
+            || !um_support::valid_typed_id(&recovery.workspace_id, "rws_")
+            || !um_support::valid_typed_id(&recovery.work_root_id, "rwr_")
+            || !um_support::valid_typed_id(&recovery.runner_id, "rnr_")
+            || !um_support::valid_typed_id(&recovery.origin_runner_boot_id, "rbt_")
+        {
+            return false;
+        }
+        let grant = recovery.target_runner_boot_id.is_some();
+        if recovery.claiming_assignment_id.is_some() != grant
+            || recovery.claim_generation.is_some() != grant
+            || recovery
+                .target_runner_boot_id
+                .as_deref()
+                .is_some_and(|id| !um_support::valid_typed_id(id, "rbt_"))
+            || recovery
+                .claiming_assignment_id
+                .as_deref()
+                .is_some_and(|id| !um_support::valid_typed_id(id, "asn_"))
+            || recovery
+                .claim_generation
+                .is_some_and(|generation| !(1..=9_007_199_254_740_991).contains(&generation))
+            || recovery
+                .failure
+                .as_deref()
+                .is_some_and(|failure| !valid_recovery_pair(failure.code, failure.recovery_reason))
+        {
+            return false;
+        }
+        if matches!(
+            workspace.preparation,
+            models::run_continuation_workspace::Preparation::Ready
+        ) && !grant
+        {
+            return false;
+        }
+    } else if continuation.schema_version.is_some() {
+        return false;
+    }
     if !workspace
         .prior_settlement_snapshot
         .as_deref()
@@ -1315,6 +1439,287 @@ fn valid_staged_continuation(run: &Run) -> bool {
                 modified_unknown
             }
         }
+    }
+}
+
+// OpenAPI Generator represents required-null fields as Option and otherwise
+// loses the difference between explicit null and missing keys. Keep the
+// public read boundary closed before deserializing into generated models.
+fn valid_recovery_json_shape(bytes: &[u8]) -> bool {
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(bytes) else {
+        return false;
+    };
+    let run = value.get("run").unwrap_or(&value);
+    let Some(run) = run.as_object() else {
+        return true; // Nullable envelope run; the typed envelope checks it.
+    };
+    if let Some(status) = run.get("workspaceRecovery") {
+        let Some(status) = status.as_object() else {
+            return false;
+        };
+        if status.len() != 3
+            || !["schemaVersion", "status", "reason"]
+                .iter()
+                .all(|key| status.contains_key(*key))
+        {
+            return false;
+        }
+    }
+    let Some(continuation) = run
+        .get("continuation")
+        .and_then(serde_json::Value::as_object)
+    else {
+        return true;
+    };
+    let schema = continuation.get("schemaVersion");
+    let recovery = continuation
+        .get("workspace")
+        .and_then(|workspace| workspace.get("recovery"));
+    match (schema, recovery) {
+        (None, None) => true,
+        (Some(version), Some(recovery)) if version == 2 => {
+            let Some(recovery) = recovery.as_object() else {
+                return false;
+            };
+            let required = [
+                "schemaVersion",
+                "workspaceId",
+                "workRootId",
+                "runnerId",
+                "originRunnerBootId",
+                "targetRunnerBootId",
+                "claimingAssignmentId",
+                "claimGeneration",
+                "failure",
+            ];
+            if recovery.len() != required.len()
+                || !required.iter().all(|key| recovery.contains_key(*key))
+            {
+                return false;
+            }
+            match recovery.get("failure") {
+                Some(serde_json::Value::Null) => true,
+                Some(serde_json::Value::Object(failure)) => {
+                    failure.len() == 2
+                        && failure.contains_key("code")
+                        && failure.contains_key("recoveryReason")
+                }
+                _ => false,
+            }
+        }
+        _ => false,
+    }
+}
+
+fn valid_workspace_recovery(status: Option<&models::WorkspaceRecoveryStatus>) -> bool {
+    let Some(status) = status else {
+        return true;
+    };
+    match status.status {
+        models::workspace_recovery_status::Status::Pending
+        | models::workspace_recovery_status::Status::Established => status.reason.is_none(),
+        models::workspace_recovery_status::Status::NotEstablished => status.reason.is_some(),
+    }
+}
+
+fn valid_recovery_pair(
+    code: models::continuation_recovery_failure::Code,
+    reason: models::RecoveryReason,
+) -> bool {
+    let code = match code {
+        models::continuation_recovery_failure::Code::RetainedWorkspaceUnavailable => {
+            "retained_workspace_unavailable"
+        }
+        models::continuation_recovery_failure::Code::OwnershipUnproven => "ownership_unproven",
+    };
+    valid_recovery_reason_for_code(code, reason)
+}
+
+fn valid_recovery_reason_for_code(code: &str, reason: models::RecoveryReason) -> bool {
+    use models::RecoveryReason as Reason;
+    let unavailable = matches!(
+        reason,
+        Reason::WorkspaceNotFound
+            | Reason::RecoveryRecordUnsupported
+            | Reason::RecoveryNotEstablished
+    );
+    match code {
+        "retained_workspace_unavailable" => unavailable,
+        "ownership_unproven" => !unavailable,
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::disallowed_macros,
+    clippy::unwrap_used,
+    reason = "recovery reader tests use assertions and fixture extraction"
+)]
+mod recovery_read_tests {
+    use super::*;
+
+    #[test]
+    fn classified_interruption_requires_a_matching_closed_reason() {
+        let mut value = serde_json::json!({
+            "phase":"accepted", "cause":"ownership_unproven", "executorFault":null,
+            "stopConfirmed":false, "recoveryReason":"host_identity_mismatch"
+        });
+        let valid: models::RunInterruption = serde_json::from_value(value.clone()).unwrap();
+        assert!(valid_interruption(
+            models::run::State::Interrupted,
+            Some(&valid)
+        ));
+        value["recoveryReason"] = serde_json::json!("workspace_not_found");
+        let mismatched: models::RunInterruption = serde_json::from_value(value.clone()).unwrap();
+        assert!(!valid_interruption(
+            models::run::State::Interrupted,
+            Some(&mismatched)
+        ));
+        value["recoveryReason"] = serde_json::json!("unclassified");
+        assert!(serde_json::from_value::<models::RunInterruption>(value).is_err());
+    }
+
+    #[test]
+    fn classified_ownership_admission_problem_decodes_without_losing_reason() {
+        let response = |code: &str, reason: &str| BufferedBlockingResponse {
+            status: StatusCode::CONFLICT,
+            content_type: Some(HeaderValue::from_static("application/problem+json")),
+            idempotency_keys: vec![],
+            locations: vec![],
+            cache_controls: vec![],
+            retry_afters: vec![],
+            body: serde_json::to_vec(&serde_json::json!({
+                "type": "https://api.usefulmachinery.com/problems/continuation-admission-invalid",
+                "title": "Admission invalid", "status": 409,
+                "continuationViolations": [{"code": code, "recoveryReason": reason}]
+            }))
+            .unwrap(),
+        };
+        assert!(matches!(
+            classify_continuation_failure(&response("ownership_unproven", "host_identity_mismatch")),
+            RunFailure::ContinuationAdmissionInvalid(violations)
+                if violations.len() == 1
+                    && violations[0].code
+                        == models::continuation_admission_violation::Code::OwnershipUnproven
+                    && violations[0].recovery_reason
+                        == Some(models::RecoveryReason::HostIdentityMismatch)
+        ));
+        assert!(matches!(
+            classify_continuation_failure(&response("ownership_unproven", "workspace_not_found")),
+            RunFailure::Protocol { .. }
+        ));
+    }
+
+    #[test]
+    fn placement_decline_preserves_legacy_omission_and_validates_recovery_pair() {
+        let mut envelope: serde_json::Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/run-continuation-pending.json"
+        ))
+        .unwrap();
+        let id = envelope["run"]["id"].as_str().unwrap().to_owned();
+        envelope["run"]["observation"] = serde_json::json!({
+            "observedAt": "2026-08-23T12:02:00Z", "placement": null,
+            "assignment": null, "lastTransition": null,
+            "lastDecline": {
+                "code": "runner_unable", "reason": "ownership_unproven",
+                "runnerId": "rnr_01k0z6r1w8f4jy2m7q9v3x5abc",
+                "declinedAt": "2026-08-23T12:02:00Z"
+            }
+        });
+        let read = |document: &serde_json::Value| {
+            let run: models::Run = serde_json::from_value(document["run"].clone()).unwrap();
+            validate_run(run, &id).is_ok()
+        };
+        assert!(read(&envelope));
+        envelope["run"]["observation"]["lastDecline"]["recoveryReason"] =
+            serde_json::json!("host_identity_mismatch");
+        assert!(read(&envelope));
+        envelope["run"]["observation"]["lastDecline"]["recoveryReason"] =
+            serde_json::json!("workspace_not_found");
+        assert!(!read(&envelope));
+        envelope["run"]["observation"]["lastDecline"]["recoveryReason"] =
+            serde_json::json!("unclassified");
+        assert!(serde_json::from_value::<models::Run>(envelope["run"].clone()).is_err());
+    }
+
+    #[test]
+    fn continuation_reads_absence_pending_and_rejected_recovery_pairs() {
+        let mut document: serde_json::Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/run-continuation-pending.json"
+        ))
+        .unwrap();
+        assert!(valid_recovery_json_shape(
+            &serde_json::to_vec(&document).unwrap()
+        ));
+        let legacy: models::RunContinuationEnvelope =
+            serde_json::from_value(document.clone()).unwrap();
+        assert!(legacy.run.workspace_recovery.is_none());
+        assert!(
+            legacy
+                .run
+                .continuation
+                .as_ref()
+                .unwrap()
+                .workspace
+                .recovery
+                .is_none()
+        );
+        assert!(valid_staged_continuation(&legacy.run));
+
+        document["run"]["workspaceRecovery"] = serde_json::json!({
+            "schemaVersion": 1, "status": "established", "reason": null
+        });
+        document["run"]["continuation"]["schemaVersion"] = serde_json::json!(2);
+        document["run"]["continuation"]["workspace"]["recovery"] = serde_json::json!({
+            "schemaVersion": 1, "workspaceId": "rws_01k0z6r1w8f4jy2m7q9v3x5abc",
+            "workRootId": "rwr_01k0z6r1w8f4jy2m7q9v3x5abc",
+            "runnerId": "rnr_01k0z6r1w8f4jy2m7q9v3x5abc",
+            "originRunnerBootId": "rbt_01k0z6r1w8f4jy2m7q9v3x5abc",
+            "targetRunnerBootId": null, "claimingAssignmentId": null,
+            "claimGeneration": null, "failure": null
+        });
+        assert!(valid_recovery_json_shape(
+            &serde_json::to_vec(&document).unwrap()
+        ));
+        let parsed: models::RunContinuationEnvelope =
+            serde_json::from_value(document.clone()).unwrap();
+        assert!(valid_workspace_recovery(
+            parsed.run.workspace_recovery.as_deref()
+        ));
+        assert!(valid_staged_continuation(&parsed.run));
+
+        let mut missing_reason = document.clone();
+        missing_reason["run"]["workspaceRecovery"]
+            .as_object_mut()
+            .unwrap()
+            .remove("reason");
+        assert!(!valid_recovery_json_shape(
+            &serde_json::to_vec(&missing_reason).unwrap()
+        ));
+        let mut unknown_member = document.clone();
+        unknown_member["run"]["continuation"]["workspace"]["recovery"]["unexpected"] =
+            serde_json::json!(true);
+        assert!(!valid_recovery_json_shape(
+            &serde_json::to_vec(&unknown_member).unwrap()
+        ));
+
+        document["run"]["continuation"]["workspace"]["recovery"]["failure"] = serde_json::json!({
+            "code": "ownership_unproven", "recoveryReason": "host_identity_mismatch"
+        });
+        let failure: models::RunContinuationEnvelope =
+            serde_json::from_value(document.clone()).unwrap();
+        assert!(valid_staged_continuation(&failure.run));
+        document["run"]["continuation"]["workspace"]["recovery"]["failure"]["code"] =
+            serde_json::json!("retained_workspace_unavailable");
+        let invalid: models::RunContinuationEnvelope =
+            serde_json::from_value(document.clone()).unwrap();
+        assert!(!valid_staged_continuation(&invalid.run));
+        document["run"]["continuation"]["workspace"]["recovery"]
+            .as_object_mut()
+            .unwrap()
+            .remove("targetRunnerBootId");
+        assert!(serde_json::from_value::<models::RunContinuationEnvelope>(document).is_err());
     }
 }
 

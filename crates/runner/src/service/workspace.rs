@@ -2988,8 +2988,10 @@ mod tests {
     }
 
     fn spawn_ready_helper_child() -> Child {
+        // Replace the shell so the helper is the only process holding the
+        // inherited descriptors and killing it leaves no descendant behind.
         let mut child = Command::new("sh")
-            .args(["-c", "printf ready; while :; do sleep 60; done"])
+            .args(["-c", "printf ready; exec sleep 60"])
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
