@@ -240,10 +240,23 @@ pub enum AuditProjectionWarningReason {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct InvitationPartyIdentity {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub principal_id: Option<String>,
+    pub name_state: NameState,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub linked_emails: Option<Vec<LinkedEmail>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Invitation {
     pub id: String,
     pub organization_id: String,
-    pub issuer_principal_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub issuer_principal_id: Option<String>,
     pub target_kind: InvitationTargetKind,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub target_principal_id: Option<String>,
@@ -264,6 +277,12 @@ pub struct Invitation {
     pub accepting_principal_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub accepted_membership_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub issuer_identity: Option<InvitationPartyIdentity>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_identity: Option<InvitationPartyIdentity>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub accepting_identity: Option<InvitationPartyIdentity>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -416,6 +435,56 @@ impl TryFrom<models::InvitationList> for InvitationPage {
     }
 }
 
+impl TryFrom<models::InvitationPartyIdentity> for InvitationPartyIdentity {
+    type Error = &'static str;
+
+    fn try_from(value: models::InvitationPartyIdentity) -> Result<Self, Self::Error> {
+        if value
+            .principal_id
+            .as_deref()
+            .is_some_and(|id| !um_support::valid_typed_id(id, "prn_"))
+        {
+            return Err("the invitation party ID is invalid");
+        }
+        let name_state = match value.name_state {
+            models::invitation_party_identity::NameState::Live => NameState::Live,
+            models::invitation_party_identity::NameState::Snapshot => NameState::Snapshot,
+            models::invitation_party_identity::NameState::Missing => NameState::Missing,
+            models::invitation_party_identity::NameState::Unavailable => NameState::Unavailable,
+        };
+        if value.display_name.is_some()
+            != matches!(name_state, NameState::Live | NameState::Snapshot)
+            || value
+                .display_name
+                .as_deref()
+                .is_some_and(|name| !valid_bounded_text(name, 1, 200))
+            || value.principal_id.is_none()
+                && (value.display_name.is_some() || value.linked_emails.is_some())
+            || value.linked_emails.as_ref().is_some_and(|links| {
+                links
+                    .iter()
+                    .any(|link| !valid_bounded_text(&link.email, 3, 320))
+            })
+        {
+            return Err("the invitation party projection is invalid");
+        }
+        Ok(Self {
+            principal_id: value.principal_id,
+            name_state,
+            display_name: value.display_name,
+            linked_emails: value.linked_emails.map(|links| {
+                links
+                    .into_iter()
+                    .map(|link| LinkedEmail {
+                        email: link.email,
+                        verified: link.verified,
+                    })
+                    .collect()
+            }),
+        })
+    }
+}
+
 impl TryFrom<models::Invitation> for Invitation {
     type Error = &'static str;
 
@@ -426,7 +495,11 @@ impl TryFrom<models::Invitation> for Invitation {
         if !um_support::valid_typed_id(&value.organization_id, "org_") {
             return Err("the invitation organization ID is invalid");
         }
-        if !um_support::valid_typed_id(&value.issuer_principal_id, "prn_") {
+        if value
+            .issuer_principal_id
+            .as_deref()
+            .is_some_and(|id| !um_support::valid_typed_id(id, "prn_"))
+        {
             return Err("the invitation issuer principal ID is invalid");
         }
         parse_timestamp(&value.issued_at, "the invitation issue time is invalid")?;
@@ -527,6 +600,18 @@ impl TryFrom<models::Invitation> for Invitation {
             }),
             accepting_principal_id: value.accepting_principal_id,
             accepted_membership_id: value.accepted_membership_id,
+            issuer_identity: value
+                .issuer_identity
+                .map(|party| (*party).try_into())
+                .transpose()?,
+            target_identity: value
+                .target_identity
+                .map(|party| (*party).try_into())
+                .transpose()?,
+            accepting_identity: value
+                .accepting_identity
+                .map(|party| (*party).try_into())
+                .transpose()?,
         })
     }
 }

@@ -22,9 +22,9 @@ use super::{UnreachableCategory, classify_reqwest_error};
 pub use models::{
     AcceptedInvitationMembership, AuditActor, AuditProjectionWarning, AuditProjectionWarningReason,
     CurrentPrincipalMembership, DirectoryPrincipalState, Invitation, InvitationDeliveryState,
-    InvitationInboxEntry, InvitationPreview, InvitationState, InvitationTargetKind, LinkedEmail,
-    MembershipRole, MembershipState, NameState, Organization, OrganizationAuditRecord,
-    OrganizationAuditSubjectKind, OrganizationMembershipDirectoryEntry,
+    InvitationInboxEntry, InvitationPartyIdentity, InvitationPreview, InvitationState,
+    InvitationTargetKind, LinkedEmail, MembershipRole, MembershipState, NameState, Organization,
+    OrganizationAuditRecord, OrganizationAuditSubjectKind, OrganizationMembershipDirectoryEntry,
     OrganizationMembershipHistoryEntry, OrganizationState, PrincipalType,
 };
 pub(crate) use models::{

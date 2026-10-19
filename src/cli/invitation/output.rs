@@ -416,7 +416,24 @@ fn write_organization_list_human(
     writeln!(stdout, "✓ Organization invitation history listed.\n")?;
     for invitation in items {
         write_invitation_fields(&mut stdout, invitation)?;
+        write_party_identity(
+            &mut stdout,
+            "issuer identity",
+            invitation.issuer_identity.as_ref(),
+        )?;
+        if invitation.target_kind == InvitationTargetKind::Principal {
+            write_party_identity(
+                &mut stdout,
+                "recipient identity",
+                invitation.target_identity.as_ref(),
+            )?;
+        }
         if invitation.state == InvitationState::Accepted {
+            write_party_identity(
+                &mut stdout,
+                "accepting identity",
+                invitation.accepting_identity.as_ref(),
+            )?;
             match (
                 &invitation.accepting_principal_id,
                 &invitation.accepted_membership_id,
@@ -434,6 +451,36 @@ fn write_organization_list_human(
     Ok(())
 }
 
+fn write_party_identity(
+    output: &mut impl Write,
+    label: &str,
+    identity: Option<&um_api::InvitationPartyIdentity>,
+) -> io::Result<()> {
+    use um_api::NameState;
+    match identity {
+        Some(identity) => {
+            let name = match identity.name_state {
+                NameState::Live | NameState::Snapshot => {
+                    identity.display_name.as_deref().unwrap_or("unavailable")
+                }
+                NameState::Missing => "no name",
+                NameState::Unavailable => "unavailable",
+            };
+            writeln!(output, "{label}: {name}")?;
+            if let Some(id) = &identity.principal_id {
+                writeln!(output, "{label} principal: {id}")?;
+            }
+            if let Some(emails) = &identity.linked_emails {
+                for link in emails {
+                    writeln!(output, "{label} login email: {}", link.email)?;
+                }
+            }
+        }
+        None => writeln!(output, "{label}: unavailable")?,
+    }
+    Ok(())
+}
+
 fn write_invitation_fields(output: &mut impl Write, invitation: &Invitation) -> io::Result<()> {
     writeln!(
         output,
@@ -443,7 +490,14 @@ fn write_invitation_fields(output: &mut impl Write, invitation: &Invitation) -> 
         target_kind(invitation.target_kind)
     )?;
     writeln!(output, "organization: {}", invitation.organization_id)?;
-    writeln!(output, "issuer: {}", invitation.issuer_principal_id)?;
+    writeln!(
+        output,
+        "issuer: {}",
+        invitation
+            .issuer_principal_id
+            .as_deref()
+            .unwrap_or("unavailable")
+    )?;
     if let Some(principal_id) = &invitation.target_principal_id {
         writeln!(output, "target principal: {principal_id}")?;
     }

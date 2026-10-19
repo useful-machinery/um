@@ -165,6 +165,8 @@ fn organization_invitation_list_preserves_terminal_history_and_cursor() {
     accepted["targetEmail"] = "delivered@example.test".into();
     accepted["acceptingPrincipalId"] = "prn_01k0z6r1w8f4jy2m7q9v3x5abd".into();
     accepted["acceptedMembershipId"] = "mem_01k0z6r1w8f4jy2m7q9v3x5abc".into();
+    accepted["issuerIdentity"] = serde_json::json!({"principalId": PRINCIPAL_ID, "nameState": "snapshot", "displayName": "At issue", "linkedEmails": [{"email": "issuer@example.test", "verified": false}]});
+    accepted["acceptingIdentity"] = serde_json::json!({"principalId": "prn_01k0z6r1w8f4jy2m7q9v3x5abd", "nameState": "live", "displayName": "Now"});
     let mut revoked = invitation("revoked", Some("2026-01-04T03:04:05Z"));
     revoked["id"] = "inv_01k0z6r1w8f4jy2m7q9v3x5abd".into();
     revoked["targetKind"] = "email".into();
@@ -217,6 +219,18 @@ fn organization_invitation_list_preserves_terminal_history_and_cursor() {
         "mem_01k0z6r1w8f4jy2m7q9v3x5abc"
     );
     assert!(document["items"][1].get("acceptedMembershipId").is_none());
+    assert_eq!(
+        document["items"][0]["issuerIdentity"]["nameState"],
+        "snapshot"
+    );
+    assert_eq!(
+        document["items"][0]["issuerIdentity"]["linkedEmails"][0]["verified"],
+        false
+    );
+    assert_eq!(
+        document["items"][0]["acceptingIdentity"]["displayName"],
+        "Now"
+    );
     assert_eq!(
         document["items"][1]["targetEmail"],
         "not-joined@example.test"
