@@ -317,7 +317,7 @@
           "const": "connected_repository"
         },
         "providerKind": {
-          "const": "github"
+          "enum": ["github", "gitlab"]
         },
         "repositoryConnectionId": {
           "$ref": "#/$defs/repositoryConnectionId"
@@ -343,23 +343,27 @@
       ]
     },
     "SourceDisplayRepository": {
-      "type": "object",
-      "additionalProperties": false,
-      "properties": {
-        "providerKind": {
-          "const": "github"
-        },
-        "fullName": {
-          "type": "string",
-          "minLength": 3,
-          "maxLength": 255,
-          "pattern": "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$"
-        }
-      },
-      "required": [
-        "providerKind",
-        "fullName"
+      "oneOf": [
+        {"$ref": "#/$defs/GitHubSourceDisplayRepository"},
+        {"$ref": "#/$defs/GitLabSourceDisplayRepository"}
       ]
+    },
+    "GitHubSourceDisplayRepository": {
+      "type": "object", "additionalProperties": false,
+      "properties": {
+        "providerKind": {"const": "github"},
+        "fullName": {"type": "string", "minLength": 3, "maxLength": 255, "pattern": "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$"}
+      },
+      "required": ["providerKind", "fullName"]
+    },
+    "GitLabSourceDisplayRepository": {
+      "type": "object", "additionalProperties": false,
+      "properties": {
+        "providerKind": {"const": "gitlab"},
+        "instanceUrl": {"const": "https://gitlab.com"},
+        "fullName": {"type": "string", "minLength": 3, "maxLength": 8192, "pattern": "^[A-Za-z0-9_.-]+(/[A-Za-z0-9_.-]+)+$", "not": {"pattern": "(^|/)\\.{1,2}(/|$)"}}
+      },
+      "required": ["providerKind", "instanceUrl", "fullName"]
     },
     "SourceDisplaySnapshot": {
       "type": "object",
@@ -547,6 +551,11 @@
             "required": ["schemaVersion"]
           },
           "then": {"required": ["sourceDisplaySnapshot"]}
+        },
+        {
+          "if": {"properties": {"primaryWorkspaceSource": {"properties": {"providerKind": {"const": "gitlab"}}}}},
+          "then": {"properties": {"schemaVersion": {"const": 2}, "sourceDisplaySnapshot": {"properties": {"repository": {"$ref": "#/$defs/GitLabSourceDisplayRepository"}}}}, "required": ["sourceDisplaySnapshot"]},
+          "else": {"properties": {"sourceDisplaySnapshot": {"properties": {"repository": {"$ref": "#/$defs/GitHubSourceDisplayRepository"}}}}}
         }
       ]
     },

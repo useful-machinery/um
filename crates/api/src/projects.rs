@@ -876,7 +876,7 @@ fn valid_repository_fields(repository: &ProjectRepository) -> bool {
         && valid_bounded_text(&repository.default_branch, 1, 1024)
 }
 
-fn valid_gitlab_path(value: &str) -> bool {
+pub(super) fn valid_gitlab_path(value: &str) -> bool {
     value.len() <= 8192
         && value.split('/').count() >= 2
         && value.split('/').all(|component| {

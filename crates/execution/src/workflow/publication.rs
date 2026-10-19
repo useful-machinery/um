@@ -896,6 +896,8 @@ pub struct CloudSourceDisplaySnapshotV1 {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CloudSourceDisplayRepositoryV1 {
     pub provider_kind: String,
+    #[serde(rename = "instanceUrl", skip_serializing_if = "Option::is_none")]
+    pub instance_url: Option<String>,
     pub full_name: String,
 }
 

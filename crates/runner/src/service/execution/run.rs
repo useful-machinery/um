@@ -576,6 +576,7 @@ impl ExecutionJob {
                         project_name: snapshot.project_name.clone(),
                         repository: CloudSourceDisplayRepositoryV1 {
                             provider_kind: snapshot.repository.provider_kind.clone(),
+                            instance_url: snapshot.repository.instance_url.clone(),
                             full_name: snapshot.repository.full_name.clone(),
                         },
                     }

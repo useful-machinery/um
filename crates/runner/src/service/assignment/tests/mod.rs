@@ -1006,6 +1006,15 @@ async fn assert_preparation_declined(
     expected: AssignmentDecline,
 ) {
     align_offer_with_source_fixture(manager, &mut offered);
+    assert_unmodified_preparation_declined(manager, offered, expected).await;
+}
+
+// Cross-component offers must reach admission with their persisted pins intact.
+async fn assert_unmodified_preparation_declined(
+    manager: &mut AssignmentManager,
+    offered: AssignmentOffer,
+    expected: AssignmentDecline,
+) {
     manager.handle_offer(offered.clone()).unwrap();
     prepare_current(manager, &offered).await;
     let pending = manager.pending_observations(&BTreeSet::new(), 10);
@@ -1873,6 +1882,13 @@ fn runner_shutdown_outcome(reports: &[ExecutionReport]) -> &Value {
 }
 
 fn decoded_source_display_offer() -> AssignmentOffer {
+    decoded_offer_from_frame(include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../tests/fixtures/runner-protocol/v1/valid/cloud-assignment-offer-source-display.json"
+    )))
+}
+
+fn decoded_offer_from_frame(bytes: &[u8]) -> AssignmentOffer {
     let CloudFrame::AssignmentOffer {
         effect_id,
         assignment_id,
@@ -1882,11 +1898,7 @@ fn decoded_source_display_offer() -> AssignmentOffer {
         attempt_number,
         execution_spec,
         ..
-    } = decode_cloud_frame(include_bytes!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../tests/fixtures/runner-protocol/v1/valid/cloud-assignment-offer-source-display.json"
-    )))
-    .unwrap()
+    } = decode_cloud_frame(bytes).unwrap()
     else {
         panic!("expected an assignment offer");
     };
@@ -1933,6 +1945,34 @@ fn decoded_execution_spec_versions_retain_semantic_admission_guards() {
             ))
         );
     }
+}
+
+#[test]
+fn gitlab_offer_requires_matching_source_snapshot() {
+    let mut spec = decoded_source_display_offer().execution_spec;
+    let snapshot = spec.source_display_snapshot.as_mut().unwrap();
+    spec.primary_workspace_source.provider_kind = "gitlab".to_owned();
+    snapshot.repository.provider_kind = "gitlab".to_owned();
+    snapshot.repository.instance_url = Some("https://gitlab.com".to_owned());
+    snapshot.repository.full_name = format!("group/{}project", "n".repeat(8192 - 13));
+    let valid_snapshot = snapshot.clone();
+    assert_eq!(validate_execution_spec(&spec), Ok(()));
+    spec.source_display_snapshot
+        .as_mut()
+        .unwrap()
+        .repository
+        .full_name
+        .push('x');
+    assert!(validate_execution_spec(&spec).is_err());
+    spec.source_display_snapshot = None;
+    assert!(validate_execution_spec(&spec).is_err());
+    spec.source_display_snapshot = Some(valid_snapshot);
+    spec.source_display_snapshot
+        .as_mut()
+        .unwrap()
+        .repository
+        .instance_url = None;
+    assert!(validate_execution_spec(&spec).is_err());
 }
 
 #[tokio::test]
@@ -2734,6 +2774,149 @@ fn admission_git_context_causes_keep_distinct_safe_facts() {
         admission_diagnostic(AdmissionFailureKind::GitContextExecutionRootMismatch),
         ("execution_root", "execution_root_unavailable")
     );
+}
+
+struct NoGitLabCredentialBroker;
+
+impl SourceCredentialBroker for NoGitLabCredentialBroker {
+    fn issue(
+        &self,
+        _: &str,
+        _: &CaptureCancellation,
+    ) -> Result<ProviderCredential, CredentialBrokerFailure> {
+        panic!("GitLab preparation requested a provider credential")
+    }
+
+    fn commit_availability(
+        &self,
+        _: &str,
+        _: &CaptureCancellation,
+    ) -> Result<CommitAvailability, CredentialBrokerFailure> {
+        panic!("GitLab preparation requested a provider commit check")
+    }
+
+    fn issue_workflow_git(
+        &self,
+        _: &str,
+        _: &CaptureCancellation,
+    ) -> Result<ProviderCredential, CredentialBrokerFailure> {
+        panic!("GitLab preparation requested a workflow Git credential")
+    }
+
+    fn revoke_workflow_git(
+        &self,
+        _: &str,
+        _: &[u8],
+    ) -> Result<WorkflowGitRevocation, CredentialBrokerFailure> {
+        panic!("GitLab preparation requested a workflow Git revocation")
+    }
+}
+
+// Run by the Coordinator's cross-component harness while the admitting
+// Gateway test owns the disposable database. The JSON is the persisted
+// Coordinator effect, not a reconstructed execution-specification fixture.
+#[tokio::test]
+#[ignore = "requires the admitted Coordinator offer supplied by the integration harness"]
+async fn gitlab_admitted_offer_from_coordinator_declines_without_credential() {
+    let file = std::env::var("UM_GITLAB_ADMITTED_OFFER_FILE").unwrap();
+    let effect: Value = serde_json::from_slice(&std::fs::read(file).unwrap()).unwrap();
+    let mut payload = effect["payload"].as_object().unwrap().clone();
+    // Gateway's assignmentEffectFrame moves routing fields into the wire
+    // payload and consumes the Coordinator-only offer expiry timestamp.
+    payload.remove("offerExpiresAt");
+    for field in ["effectId", "assignmentId", "runId", "attemptId"] {
+        payload.insert(field.to_owned(), effect[field].clone());
+    }
+    let frame = serde_json::json!({
+        "protocolVersion": 1, "direction": "cloud_to_runner",
+        "messageId": "cmsg_01k0z6r1w8f4jy2m7q9v3x5abm",
+        "sentAt": "2026-07-23T00:00:02Z", "type": "assignment_offer",
+        "payloadVersion": 1, "payload": payload,
+    });
+    let offered = decoded_offer_from_frame(&serde_json::to_vec(&frame).unwrap());
+    assert_eq!(offered.execution_spec.schema_version, 2);
+    assert_eq!(
+        offered
+            .execution_spec
+            .primary_workspace_source
+            .provider_kind,
+        "gitlab"
+    );
+    assert_eq!(
+        offered
+            .execution_spec
+            .workflow_definition_source
+            .workflow_path,
+        "nested/workflows/build.yaml"
+    );
+    assert_eq!(
+        offered
+            .execution_spec
+            .workflow_definition_source
+            .workflow_source_closure_digest
+            .value,
+        "9cc9dcb0a9bf763b6b000f08cfa1a6b109891037eb3cb8e5e43e0fd50b4448ba"
+    );
+    let (_temporary, mut manager) = manager_fixture(
+        "schemaVersion: 1\nsteps:\n  check:\n    kind: cmd\n    command: {argv: [\"true\"]}\n",
+    );
+    manager.source_broker = Some(Arc::new(NoGitLabCredentialBroker));
+    assert_unmodified_preparation_declined(
+        &mut manager,
+        offered,
+        AssignmentDecline::RunnerUnable(RunnerUnableReason::SourceServiceUnavailable),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn gitlab_assignment_preparation_declines_without_requesting_a_broker_credential() {
+    for length in [256, 8192] {
+        let (_temporary, mut manager) = manager_fixture(
+            "schemaVersion: 1\nsteps:\n  check:\n    kind: cmd\n    command: {argv: [\"true\"]}\n",
+        );
+        manager.source_broker = Some(Arc::new(NoGitLabCredentialBroker));
+        let mut frame: Value = serde_json::from_slice(include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/runner-protocol/v1/valid/cloud-assignment-offer-source-display.json"
+        )))
+        .unwrap();
+        frame["payload"]["executionSpec"]["primaryWorkspaceSource"]["providerKind"] =
+            serde_json::json!("gitlab");
+        // The Gateway nested/static closure is pinned by the Coordinator offer
+        // fixture as well as by the persisted execution specification.
+        const GITLAB_CLOSURE: &str =
+            "9cc9dcb0a9bf763b6b000f08cfa1a6b109891037eb3cb8e5e43e0fd50b4448ba";
+        frame["payload"]["executionSpec"]["workflowDefinitionSource"]["workflowPath"] =
+            serde_json::json!("nested/workflows/build.yaml");
+        frame["payload"]["executionSpec"]["workflowDefinitionSource"]["workflowSourceClosureDigest"]
+            ["value"] = serde_json::json!(GITLAB_CLOSURE);
+        frame["payload"]["executionSpec"]["capacity"]["sourceClosureDigest"]["value"] =
+            serde_json::json!(GITLAB_CLOSURE);
+        frame["payload"]["executionSpec"]["sourceDisplaySnapshot"]["repository"] = serde_json::json!({
+            "providerKind": "gitlab", "instanceUrl": "https://gitlab.com",
+            "fullName": format!("group/{}project", "n".repeat(length - 13))
+        });
+        let encoded = serde_json::to_vec(&frame).unwrap();
+        let offered = decoded_offer_from_frame(&encoded);
+        assert_eq!(
+            offered
+                .execution_spec
+                .source_display_snapshot
+                .as_ref()
+                .unwrap()
+                .repository
+                .full_name
+                .len(),
+            length
+        );
+        assert_preparation_declined(
+            &mut manager,
+            offered,
+            AssignmentDecline::RunnerUnable(RunnerUnableReason::SourceServiceUnavailable),
+        )
+        .await;
+    }
 }
 
 #[tokio::test]

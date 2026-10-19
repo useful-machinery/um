@@ -111,7 +111,7 @@ pub(in crate::service) fn validate_effective_spec(
     if execution_spec.source_branch.is_empty()
         || execution_spec.source_branch.chars().count() > MAXIMUM_SOURCE_BRANCH_CHARACTERS
         || primary.kind != "connected_repository"
-        || primary.provider_kind != "github"
+        || !matches!(primary.provider_kind.as_str(), "github" | "gitlab")
         || primary.materialization_contract != "git_full_clone_v1"
         || !valid_workflow_connection
         || !valid_primary_connection
@@ -124,6 +124,28 @@ pub(in crate::service) fn validate_effective_spec(
         || !lowercase_hex(&workflow.commit_oid, SHA1_HEX_CHARACTERS)
         || !lowercase_hex(&primary.commit_oid, SHA1_HEX_CHARACTERS)
         || !valid_path
+        || !match (
+            execution_spec.schema_version,
+            execution_spec.source_display_snapshot.as_ref(),
+        ) {
+            (1, None) => primary.provider_kind == "github",
+            (2, Some(snapshot)) => {
+                snapshot.repository.provider_kind == primary.provider_kind
+                    && match snapshot.repository.provider_kind.as_str() {
+                        "github" => {
+                            snapshot.repository.instance_url.is_none()
+                                && valid_github_name(&snapshot.repository.full_name)
+                        }
+                        "gitlab" => {
+                            snapshot.repository.instance_url.as_deref()
+                                == Some("https://gitlab.com")
+                                && valid_gitlab_name(&snapshot.repository.full_name)
+                        }
+                        _ => false,
+                    }
+            }
+            _ => false,
+        }
         || workflow.workflow_source_closure_digest.algorithm != "sha256"
         || !lowercase_hex(
             &workflow.workflow_source_closure_digest.value,
@@ -167,6 +189,23 @@ pub(in crate::service) fn validate_effective_spec(
         ));
     }
     Ok(())
+}
+
+fn valid_github_name(name: &str) -> bool {
+    name.len() <= 255 && name.split('/').count() == 2 && valid_name_segments(name)
+}
+
+fn valid_gitlab_name(name: &str) -> bool {
+    (3..=8192).contains(&name.len()) && name.split('/').count() >= 2 && valid_name_segments(name)
+}
+
+fn valid_name_segments(name: &str) -> bool {
+    name.split('/').all(|segment| {
+        !matches!(segment, "" | "." | "..")
+            && segment
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-'))
+    })
 }
 
 pub(in crate::service) fn validate_source_identity_pair(

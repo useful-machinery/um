@@ -373,6 +373,16 @@ impl AssignmentManager {
         prepare_effect_id: String,
         deadline: PreparationDeadline,
     ) -> Result<(), AssignmentManagerFailure> {
+        // The version-2 GitLab assignment is a valid wire contract, but no
+        // runner fetch grant/relay exists yet. Never enter the GitHub broker.
+        if offer.execution_spec.primary_workspace_source.provider_kind == "gitlab" {
+            return self.reject_after_prepare_and_cleanup(
+                offer,
+                root,
+                prepare_effect_id,
+                AssignmentDecline::RunnerUnable(RunnerUnableReason::SourceServiceUnavailable),
+            );
+        }
         let source =
             super::super::source::MaterializationRequest::from_validated(&offer.execution_spec);
         let Some(broker) = self.source_broker.clone() else {

@@ -282,8 +282,18 @@ pub(crate) fn validate_with_invariant(result: &WorkflowResultV1) -> Result<(), R
                 && source_display_snapshot.as_ref().is_none_or(|snapshot| {
                     valid_organization_display_name(&snapshot.organization_display_name)
                         && valid_project_name(&snapshot.project_name)
-                        && snapshot.repository.provider_kind == "github"
-                        && valid_github_repository_name(&snapshot.repository.full_name)
+                        && match snapshot.repository.provider_kind.as_str() {
+                            "github" => {
+                                snapshot.repository.instance_url.is_none()
+                                    && valid_github_repository_name(&snapshot.repository.full_name)
+                            }
+                            "gitlab" => {
+                                snapshot.repository.instance_url.as_deref()
+                                    == Some("https://gitlab.com")
+                                    && valid_gitlab_repository_name(&snapshot.repository.full_name)
+                            }
+                            _ => false,
+                        }
                 }),
             result.execution.execution_root.is_none()
                 && result.execution.capacity.as_ref().is_some_and(|capacity| {
@@ -847,6 +857,17 @@ fn valid_github_repository_name(value: &str) -> bool {
     value.len() <= 255
         && value.split_once('/').is_some_and(|(owner, repository)| {
             valid_part(owner) && valid_part(repository) && !repository.contains('/')
+        })
+}
+
+fn valid_gitlab_repository_name(value: &str) -> bool {
+    (3..=8192).contains(&value.len())
+        && value.split('/').count() >= 2
+        && value.split('/').all(|segment| {
+            !matches!(segment, "" | "." | "..")
+                && segment
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-'))
         })
 }
 

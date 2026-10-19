@@ -358,6 +358,7 @@ pub struct RunInputProjectionV1 {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SourceDisplayRepositoryV1RunnerProjection {
     pub provider_kind: String,
+    pub instance_url: Option<String>,
     pub full_name: String,
 }
 
@@ -1422,11 +1423,7 @@ fn decode_frame(bytes: &[u8]) -> Result<ValidatedFrame, DecodeError> {
                 provider_kind: execution_spec
                     .primary_workspace_source
                     .provider_kind
-                    .as_str()
-                    .ok_or(DecodeError::InvalidFrame(
-                        "primaryWorkspaceSource.providerKind",
-                    ))?
-                    .to_owned(),
+                    .to_string(),
                 repository_connection_id: execution_spec
                     .primary_workspace_source
                     .repository_connection_id
@@ -1453,18 +1450,26 @@ fn decode_frame(bytes: &[u8]) -> Result<ValidatedFrame, DecodeError> {
                     .to_owned(),
             };
             let source_display_snapshot = execution_spec.source_display_snapshot.map(|snapshot| {
+                let repository = match snapshot.repository {
+                    generated::SourceDisplayRepository::HubSourceDisplayRepository(value) => {
+                        SourceDisplayRepositoryV1RunnerProjection {
+                            provider_kind: "github".to_owned(),
+                            instance_url: None,
+                            full_name: value.full_name.to_string(),
+                        }
+                    }
+                    generated::SourceDisplayRepository::LabSourceDisplayRepository(value) => {
+                        SourceDisplayRepositoryV1RunnerProjection {
+                            provider_kind: "gitlab".to_owned(),
+                            instance_url: Some("https://gitlab.com".to_owned()),
+                            full_name: value.full_name.to_string(),
+                        }
+                    }
+                };
                 SourceDisplaySnapshotV1RunnerProjection {
                     organization_display_name: snapshot.organization_display_name.to_string(),
                     project_name: snapshot.project_name.to_string(),
-                    repository: SourceDisplayRepositoryV1RunnerProjection {
-                        provider_kind: snapshot
-                            .repository
-                            .provider_kind
-                            .as_str()
-                            .unwrap_or("github")
-                            .to_owned(),
-                        full_name: snapshot.repository.full_name.to_string(),
-                    },
+                    repository,
                 }
             });
             match (schema_version, source_display_snapshot.is_some()) {
@@ -2907,6 +2912,47 @@ mod tests {
             }
         ));
         offer["payload"]["continuation"]["unrecognizedClaim"] = json!(true);
+        assert!(decode_cloud_frame(&serde_json::to_vec(&offer).unwrap()).is_err());
+    }
+
+    #[test]
+    fn gitlab_offer_round_trips_and_rejects_mismatched_or_missing_snapshot() {
+        let mut offer: Value = serde_json::from_slice(include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/runner-protocol/v1/valid/cloud-assignment-offer-source-display.json"
+        )))
+        .unwrap();
+        let spec = &mut offer["payload"]["executionSpec"];
+        spec["primaryWorkspaceSource"]["providerKind"] = json!("gitlab");
+        spec["sourceDisplaySnapshot"]["repository"] = json!({
+            "providerKind": "gitlab",
+            "instanceUrl": "https://gitlab.com",
+            "fullName": format!("group/{}project", "nested/".repeat(40))
+        });
+        let bytes = serde_json::to_vec(&offer).unwrap();
+        let frame = decode_cloud_frame(&bytes).expect("GitLab offer must decode");
+        let CloudFrame::AssignmentOffer { execution_spec, .. } = frame else {
+            panic!("expected offer");
+        };
+        assert_eq!(
+            execution_spec.primary_workspace_source.provider_kind,
+            "gitlab"
+        );
+        assert_eq!(
+            execution_spec
+                .source_display_snapshot
+                .unwrap()
+                .repository
+                .instance_url
+                .as_deref(),
+            Some("https://gitlab.com")
+        );
+        let accepted = offer.clone();
+        offer["payload"]["executionSpec"]["sourceDisplaySnapshot"] = Value::Null;
+        assert!(decode_cloud_frame(&serde_json::to_vec(&offer).unwrap()).is_err());
+        offer = accepted;
+        offer["payload"]["executionSpec"]["sourceDisplaySnapshot"]["repository"]["providerKind"] =
+            json!("github");
         assert!(decode_cloud_frame(&serde_json::to_vec(&offer).unwrap()).is_err());
     }
 

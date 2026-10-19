@@ -1185,6 +1185,10 @@ fn validate_run(run: Run, requested_run_id: &str) -> Result<Run, RunFailure> {
         && lowercase_hex(&workflow_source.workflow_source_closure_digest.value, 64)
         && um_support::valid_typed_id(&workspace_source.repository_connection_id, "rpc_")
         && lowercase_hex(&workspace_source.commit_oid, 40)
+        && valid_source_display_snapshot(
+            run.source_display_snapshot.as_deref(),
+            workspace_source.provider_kind,
+        )
         && inputs
             .input_set_id
             .as_deref()
@@ -1254,6 +1258,67 @@ fn validate_run(run: Run, requested_run_id: &str) -> Result<Run, RunFailure> {
         Ok(run)
     } else {
         Err(RunFailure::protocol(false))
+    }
+}
+
+fn valid_source_display_snapshot(
+    snapshot: Option<&models::SourceDisplaySnapshot>,
+    provider: models::primary_workspace_source::ProviderKind,
+) -> bool {
+    let Some(snapshot) = snapshot else {
+        // GitHub execution-1 records predate immutable display snapshots.
+        return provider == models::primary_workspace_source::ProviderKind::Github;
+    };
+    let repository = &snapshot.repository;
+    let name = snapshot.project_name.as_bytes();
+    let project_name_valid = (1..=63).contains(&name.len())
+        && name.first().is_some_and(u8::is_ascii_alphanumeric)
+        && name.last().is_some_and(u8::is_ascii_alphanumeric)
+        && name
+            .iter()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'-');
+    if !valid_bounded_string(&snapshot.organization_display_name, 1, 200)
+        || snapshot.organization_display_name.trim() != snapshot.organization_display_name
+        || snapshot
+            .organization_display_name
+            .chars()
+            .any(char::is_control)
+        || !project_name_valid
+    {
+        return false;
+    }
+    match (provider, repository.provider_kind) {
+        (
+            models::primary_workspace_source::ProviderKind::Github,
+            models::source_display_repository::ProviderKind::Github,
+        ) => {
+            repository.instance_url.is_none()
+                && (3..=255).contains(&repository.full_name.len())
+                && repository
+                    .full_name
+                    .split_once('/')
+                    .is_some_and(|(owner, name)| {
+                        !owner.is_empty()
+                            && !name.is_empty()
+                            && [owner, name].iter().all(|segment| {
+                                segment.bytes().all(|byte| {
+                                    byte.is_ascii_alphanumeric()
+                                        || matches!(byte, b'_' | b'.' | b'-')
+                                })
+                            })
+                    })
+        }
+        (
+            models::primary_workspace_source::ProviderKind::Gitlab,
+            models::source_display_repository::ProviderKind::Gitlab,
+        ) => {
+            repository.instance_url
+                == Some(Some(
+                    models::source_display_repository::InstanceUrl::HttpsColonSlashSlashGitlabCom,
+                ))
+                && super::projects::valid_gitlab_path(&repository.full_name)
+        }
+        _ => false,
     }
 }
 
@@ -1558,6 +1623,143 @@ fn valid_recovery_reason_for_code(code: &str, reason: models::RecoveryReason) ->
 )]
 mod recovery_read_tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires the admitted Run API response supplied by the cross-component harness"]
+    fn admitted_gitlab_run_response_decodes_in_cli() {
+        let file = std::env::var("UM_GITLAB_ADMITTED_API_FILE").unwrap();
+        let document: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(file).unwrap()).unwrap();
+        let run_id = document["id"].as_str().unwrap();
+        let expected = document["sourceDisplaySnapshot"].clone();
+        let encoded = serde_json::to_vec(&document).unwrap();
+        assert!(valid_recovery_json_shape(&encoded));
+        let typed: Run = serde_json::from_slice(&encoded).unwrap();
+        assert!(validate_run(typed, run_id).is_ok());
+        let response = decode_get_response(
+            BufferedBlockingResponse {
+                status: StatusCode::OK,
+                content_type: Some(HeaderValue::from_static("application/json")),
+                idempotency_keys: vec![],
+                locations: vec![],
+                cache_controls: vec![HeaderValue::from_static(PRIVATE_CACHE_CONTROL)],
+                retry_afters: vec![],
+                body: serde_json::to_vec(&document).unwrap(),
+            },
+            run_id,
+        )
+        .unwrap();
+        assert!(matches!(response, RunRead::Materialized(_)));
+        if let RunRead::Materialized(run) = response {
+            assert_eq!(
+                serde_json::to_value(run.as_ref()).unwrap()["sourceDisplaySnapshot"],
+                expected,
+            );
+        }
+    }
+
+    // REQ-WORKSPACE-11, REQ-WORKSPACE-31
+    #[test]
+    fn run_reader_preserves_closed_gitlab_snapshot_and_github_history() {
+        let mut run: serde_json::Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/run-continuation-pending.json"
+        ))
+        .unwrap();
+        run = run["run"].take();
+        let run_id = run["id"].as_str().unwrap().to_owned();
+        let read = |value: &serde_json::Value| {
+            decode_get_response(
+                BufferedBlockingResponse {
+                    status: StatusCode::OK,
+                    content_type: Some(HeaderValue::from_static("application/json")),
+                    idempotency_keys: vec![],
+                    locations: vec![],
+                    cache_controls: vec![HeaderValue::from_static(PRIVATE_CACHE_CONTROL)],
+                    retry_afters: vec![],
+                    body: serde_json::to_vec(value).unwrap(),
+                },
+                &run_id,
+            )
+        };
+        assert!(matches!(read(&run), Ok(RunRead::Materialized(_))));
+        run["sourceDisplaySnapshot"]["repository"]["instanceUrl"] = serde_json::Value::Null;
+        assert!(read(&run).is_err()); // GitHub forbids even an explicit null instance.
+        run["sourceDisplaySnapshot"] = serde_json::Value::Null;
+        assert!(read(&run).is_ok()); // Execution-1 GitHub had no snapshot.
+        run["primaryWorkspaceSource"]["providerKind"] = serde_json::json!("gitlab");
+        assert!(read(&run).is_err());
+        for length in [256, 8192] {
+            let name = format!("group/{}/project", "p".repeat(length - 14));
+            run["sourceDisplaySnapshot"] = serde_json::json!({
+                "organizationDisplayName": "Example Organization", "projectName": "example-project",
+                "repository": {"providerKind": "gitlab", "instanceUrl": "https://gitlab.com",
+                               "fullName": name}
+            });
+            let snapshot = read(&run).ok().and_then(|value| match value {
+                RunRead::Materialized(valid) => serde_json::to_value(valid.as_ref())
+                    .ok()
+                    .map(|value| value["sourceDisplaySnapshot"].clone()),
+                RunRead::Pending(_) => None,
+            });
+            assert_eq!(snapshot, Some(run["sourceDisplaySnapshot"].clone()));
+        }
+        // Malformed and mismatched variants below use the maximum valid name.
+        let original = run.clone();
+        let invalid = |change: &dyn Fn(&mut serde_json::Value)| {
+            let mut candidate = original.clone();
+            change(&mut candidate);
+            assert!(read(&candidate).is_err());
+        };
+        invalid(&|value| value["sourceDisplaySnapshot"] = serde_json::Value::Null);
+        invalid(&|value| {
+            value
+                .as_object_mut()
+                .unwrap()
+                .remove("sourceDisplaySnapshot");
+        });
+        invalid(&|value| {
+            value["sourceDisplaySnapshot"]["repository"]["providerKind"] =
+                serde_json::json!("github")
+        });
+        invalid(&|value| {
+            value["sourceDisplaySnapshot"]["repository"]
+                .as_object_mut()
+                .unwrap()
+                .remove("providerKind");
+        });
+        invalid(&|value| {
+            value["sourceDisplaySnapshot"]["repository"]
+                .as_object_mut()
+                .unwrap()
+                .remove("fullName");
+        });
+        invalid(&|value| {
+            value["sourceDisplaySnapshot"]["repository"]["instanceUrl"] = serde_json::Value::Null
+        });
+        invalid(&|value| {
+            value["sourceDisplaySnapshot"]["repository"]["instanceUrl"] =
+                serde_json::json!("https://other.example")
+        });
+        invalid(&|value| {
+            value["sourceDisplaySnapshot"]["repository"]["extra"] = serde_json::json!(true)
+        });
+        invalid(&|value| {
+            value["sourceDisplaySnapshot"]["repository"]["fullName"] =
+                serde_json::json!(format!("group/{}", "p".repeat(8187)))
+        });
+        invalid(&|value| {
+            value["sourceDisplaySnapshot"]["repository"]["fullName"] =
+                serde_json::json!("group/../project")
+        });
+        invalid(&|value| {
+            value["sourceDisplaySnapshot"]["repository"]["fullName"] =
+                serde_json::json!("group/%2F/project")
+        });
+        invalid(&|value| {
+            value["sourceDisplaySnapshot"]["repository"]["providerKind"] =
+                serde_json::json!("unknown")
+        });
+    }
 
     #[test]
     fn classified_interruption_requires_a_matching_closed_reason() {

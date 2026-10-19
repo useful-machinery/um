@@ -682,6 +682,7 @@ fn prepares_metadata_only_and_carrier_cloud_results() {
             project_name: "example-project".to_owned(),
             repository: CloudSourceDisplayRepositoryV1 {
                 provider_kind: "github".to_owned(),
+                instance_url: None,
                 full_name: "example/repository".to_owned(),
             },
         }),
@@ -702,6 +703,33 @@ fn prepares_metadata_only_and_carrier_cloud_results() {
         })
     );
     assert!(document["execution"].get("executionRoot").is_none());
+
+    for length in [256, 8192] {
+        let gitlab_path = format!("group/{}project", "n".repeat(length - 13));
+        let gitlab = prepare_cloud_workflow_result(
+            &run,
+            "prj_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned(),
+            "rpc_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned(),
+            "sha1".to_owned(),
+            "0123456789abcdef0123456789abcdef01234567".to_owned(),
+            Some(CloudSourceDisplaySnapshotV1 {
+                organization_display_name: "Example Organization".to_owned(),
+                project_name: "example-project".to_owned(),
+                repository: CloudSourceDisplayRepositoryV1 {
+                    provider_kind: "gitlab".to_owned(),
+                    instance_url: Some("https://gitlab.com".to_owned()),
+                    full_name: gitlab_path.clone(),
+                },
+            }),
+        )
+        .unwrap();
+        let gitlab_result: serde_json::Value = serde_json::from_slice(&gitlab.result_json).unwrap();
+        assert_eq!(
+            gitlab_result["workflow"]["provenance"]["sourceDisplaySnapshot"]["repository"]["fullName"],
+            gitlab_path
+        );
+        assert_eq!(gitlab_path.len(), length);
+    }
 
     let mut metadata_only = run;
     metadata_only.exports.clear();
