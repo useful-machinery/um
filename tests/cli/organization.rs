@@ -569,7 +569,7 @@ fn create_retries_one_ambiguous_failure_with_the_same_complete_request() {
     );
 }
 
-// REQ-ORG-37, REQ-ORG-38, REQ-ORG-39, REQ-ORG-40, REQ-ORG-41, REQ-ORG-45
+// REQ-ORG-86, REQ-ORG-38, REQ-ORG-39, REQ-ORG-40, REQ-ORG-41, REQ-ORG-45
 #[test]
 fn create_expected_outcomes_have_exact_json_and_exit_statuses() {
     let cases = [
