@@ -2515,6 +2515,7 @@ mod tests {
         assert_eq!(fs::read_dir(private.path()).unwrap().count(), 0);
     }
 
+    // REQ-WORKSPACE-13, REQ-WORKSPACE-14, REQ-WORKSPACE-17, REQ-WORKSPACE-18
     #[test]
     fn materializes_the_exact_detached_clean_commit_and_removes_credential_helpers() {
         const TOKEN: &str = "fixture-provider-token";
@@ -2903,6 +2904,7 @@ mod tests {
         );
     }
 
+    // REQ-WORKSPACE-15
     #[test]
     fn leaves_lfs_pointers_and_submodules_unhydrated() {
         let mut fixture = repository_fixture(OUTPUTLESS_WORKFLOW);
@@ -3020,6 +3022,7 @@ mod tests {
         );
     }
 
+    // REQ-WORKSPACE-13
     #[test]
     fn every_attempt_requires_a_new_empty_destination_and_credential_issue() {
         let fixture = repository_fixture(OUTPUTLESS_WORKFLOW);
@@ -3096,6 +3099,7 @@ mod tests {
         );
     }
 
+    // REQ-WORKSPACE-25
     #[test]
     fn rejects_a_non_commit_pinned_oid_as_an_integrity_failure() {
         let workflow = "schemaVersion: 1\nsteps:\n  check:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n";
@@ -3115,6 +3119,7 @@ mod tests {
         ));
     }
 
+    // REQ-WORKSPACE-23
     #[test]
     fn missing_pinned_commit_requires_authoritative_provider_absence() {
         let (_fixture, assignment, projection, broker) =
@@ -3133,6 +3138,7 @@ mod tests {
         );
     }
 
+    // REQ-WORKSPACE-24
     #[test]
     fn available_commit_after_generic_fetch_failure_remains_retryable() {
         let (_fixture, assignment, projection, broker) =
@@ -3144,6 +3150,7 @@ mod tests {
         );
     }
 
+    // REQ-WORKSPACE-24
     #[test]
     fn repository_unavailability_never_becomes_commit_unavailability() {
         let (_fixture, assignment, projection, broker) =
@@ -3203,6 +3210,7 @@ mod tests {
         );
     }
 
+    // REQ-WORKSPACE-25
     #[test]
     fn rejects_a_non_sha1_repository_before_fetching_the_pinned_commit() {
         let temporary = tempfile::tempdir().unwrap();
@@ -3745,6 +3753,7 @@ mod tests {
         assert_eq!(result, Err(MaterializationFailure::AssignmentFenced));
     }
 
+    // REQ-WORKSPACE-25
     #[test]
     fn rejects_a_pinned_digest_mismatch_after_checkout() {
         let workflow = "schemaVersion: 1\nsteps:\n  check:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n";

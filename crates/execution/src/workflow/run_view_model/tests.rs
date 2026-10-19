@@ -184,6 +184,7 @@ fn maximum_record(index: usize) -> Arc<[u8]> {
     Arc::from(bytes)
 }
 
+// REQ-LOCALRUN-39
 #[test]
 fn default_log_capacity_partitions_run_budgets_by_step_count() {
     for (step_count, expected_records, expected_bytes) in [
@@ -208,6 +209,7 @@ fn default_log_capacity_partitions_run_budgets_by_step_count() {
     }
 }
 
+// REQ-LOCALRUN-15
 #[test]
 fn execution_duration_excludes_time_spent_opening_the_view() {
     let (_temporary, workflow) = resolved_workflow();
@@ -231,6 +233,7 @@ fn execution_duration_excludes_time_spent_opening_the_view() {
     assert!(!executing.timing.frozen);
 }
 
+// REQ-LOCALRUN-18
 #[tokio::test]
 async fn transitions_project_definition_output_cancellation_and_frozen_timing() {
     let (_temporary, workflow) = resolved_workflow();
@@ -447,6 +450,7 @@ finalizers:
     );
 }
 
+// REQ-LOCALRUN-38
 #[tokio::test]
 async fn each_step_log_evicts_oldest_records_without_affecting_other_steps() {
     let (_temporary, workflow) = resolved_workflow();
@@ -536,6 +540,7 @@ async fn each_step_log_evicts_oldest_records_without_affecting_other_steps() {
     assert_eq!(updated_records[1].display_width, 3);
 }
 
+// REQ-LOCALRUN-38
 #[tokio::test]
 async fn derived_capacity_retains_past_the_old_limit_then_evicts_the_oldest_suffix() {
     const INJECTED_RECORD_CAPACITY: usize = 18;
@@ -631,6 +636,7 @@ async fn derived_capacity_retains_past_the_old_limit_then_evicts_the_oldest_suff
     assert_eq!(&step(&snapshot, "consume").log, &consume_before);
 }
 
+// REQ-WFRECOVERY-44
 #[tokio::test]
 async fn live_view_retains_recovery_role_round_handler_state_and_decision() {
     let (_temporary, workflow) = resolve_workflow(
@@ -727,6 +733,7 @@ fn lifecycle_completion_requires_matching_started_phase() {
     assert!(!snapshot.quit_eligible);
 }
 
+// REQ-LOCALRUN-58
 #[test]
 fn completed_successful_lifecycle_requires_explicit_adapter_completion() {
     let (_temporary, workflow) = resolved_workflow();
@@ -761,6 +768,7 @@ fn completed_successful_lifecycle_requires_explicit_adapter_completion() {
     assert!(view.snapshot().quit_eligible);
 }
 
+// REQ-LOCALRUN-58
 #[tokio::test]
 async fn terminal_result_and_local_lifecycle_do_not_enable_quit() {
     let (_temporary, workflow) = resolved_workflow();

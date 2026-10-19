@@ -229,6 +229,7 @@ fn retained_identity_guard_is_a_cleanup_tracked_hard_link() {
     );
 }
 
+// REQ-OUTPUTS-4
 #[test]
 fn rejects_unsafe_paths_symlinks_and_nonregular_sources_with_typed_failures() {
     let fixture = CaptureFixture::new(64);
@@ -281,6 +282,7 @@ fn captures_through_a_searchable_but_unreadable_directory() {
     assert_eq!(fixture.read(&captured), b"captured bytes");
 }
 
+// REQ-OUTPUTS-14
 #[test]
 fn the_exact_limit_succeeds_and_overflow_removes_the_partial_destination() {
     let fixture = CaptureFixture::new(5);
@@ -320,6 +322,7 @@ impl StreamCopier for GatedCopier {
     }
 }
 
+// REQ-OUTPUTS-2
 #[test]
 fn failed_sets_restore_file_reservations_and_preserve_prior_captures() {
     let fixture = CaptureFixture::with_limits(3, 4, 6);
@@ -381,6 +384,7 @@ fn failed_rollback_quarantines_the_store_and_release_retries_cleanup() {
     assert!(!staging_path.exists());
 }
 
+// REQ-OUTPUTS-14
 #[test]
 fn total_byte_overflow_rolls_back_the_set_and_the_exact_budget_is_reusable() {
     let fixture = CaptureFixture::with_limits(3, 4, 5);
@@ -447,6 +451,7 @@ fn retained_json_schema() -> RetainedJsonSchema {
     .unwrap()
 }
 
+// REQ-OUTPUTS-9
 #[test]
 fn path_capture_profiles_are_closed_over_semantic_policy() {
     let schema = retained_json_schema();
@@ -468,6 +473,7 @@ fn path_capture_profiles_are_closed_over_semantic_policy() {
     assert_eq!(profiles[2].json_schema(), None);
 }
 
+// REQ-OUTPUTS-6, REQ-OUTPUTS-7, REQ-OUTPUTS-8
 #[test]
 fn semantic_outputs_path_capture_decodes_values_and_classifies_content_failures() {
     let fixture = CaptureFixture::with_limits(3, 256, 768);
@@ -549,6 +555,7 @@ fn semantic_outputs_path_capture_decodes_values_and_classifies_content_failures(
     }
 }
 
+// REQ-OUTPUTS-11, REQ-OUTPUTS-12
 #[test]
 fn semantic_outputs_text_source_equivalence() {
     let fixture = CaptureFixture::with_limits(2, 128, 256);
@@ -628,6 +635,7 @@ fn semantic_outputs_text_source_equivalence() {
     assert_eq!(fixture.store.staged_artifact_count(), 0);
 }
 
+// REQ-OUTPUTS-8, REQ-OUTPUTS-11
 #[test]
 fn semantic_outputs_json_source_equivalence() {
     let fixture = CaptureFixture::with_limits(1, 128, 128);
@@ -946,6 +954,7 @@ fn zero_delta_git_value_has_no_carrier_or_budget_charge() {
     assert_eq!(fixture.store.staged_artifact_count(), 0);
 }
 
+// REQ-OUTPUTS-31
 #[test]
 fn git_overflow_rolls_back_both_ledgers_without_borrowing_file_capacity() {
     let fixture = CaptureFixture::with_all_limits(3, 8, 16, 2, 3, 3);
@@ -1021,6 +1030,7 @@ fn git_overflow_rolls_back_both_ledgers_without_borrowing_file_capacity() {
     drop(retained);
 }
 
+// REQ-OUTPUTS-31
 #[test]
 fn git_count_failure_acquires_neither_ledger() {
     let fixture = CaptureFixture::with_all_limits(2, 8, 16, 1, 8, 16);

@@ -59,6 +59,7 @@ fn audit_success(next_cursor: Option<&str>) -> Vec<u8> {
     json_http_response("200 OK", audit_page(next_cursor))
 }
 
+// REQ-AUDIT-7, REQ-AUDIT-8, REQ-AUDIT-21, REQ-AUDIT-22
 #[test]
 fn organization_audit_list_preserves_one_privacy_safe_page_as_stable_json() {
     let cursor = "next page /+=";
@@ -149,6 +150,7 @@ fn organization_audit_list_preserves_one_privacy_safe_page_as_stable_json() {
     assert!(!requests[0].contains("idempotency-key:"));
 }
 
+// REQ-AUDIT-14
 #[test]
 fn redacted_acceptance_audit_warning_does_not_recreate_an_actor() {
     let mut page = audit_page(None);
@@ -174,6 +176,7 @@ fn redacted_acceptance_audit_warning_does_not_recreate_an_actor() {
     server.finish();
 }
 
+// REQ-AUDIT-23
 #[test]
 fn human_audit_list_identifies_available_details_without_inventing_unavailable_details() {
     let (server, _directory, _path, credential_path) =
@@ -215,6 +218,7 @@ fn human_audit_list_identifies_available_details_without_inventing_unavailable_d
     server.finish();
 }
 
+// REQ-AUDIT-21
 #[test]
 fn organization_audit_rejects_invalid_filters_before_loading_deployment() {
     for args in [
@@ -226,5 +230,65 @@ fn organization_audit_rejects_invalid_filters_before_loading_deployment() {
         let output = run_with_env(args, &[("UM_API_URL", "partial-override-must-not-load")]);
         assert_eq!(output.status.code(), Some(2));
         assert!(output.stdout.is_empty());
+    }
+}
+
+// REQ-AUDIT-24
+#[test]
+fn refused_organization_audit_listing_reports_outcome_and_exit_without_server_wording() {
+    let problem = |status_text: &str, status: u16, kind: &str| {
+        organization::organization_problem(
+            status_text,
+            status,
+            &format!("https://api.usefulmachinery.com/problems/{kind}"),
+        )
+    };
+    for (response, outcome, exit) in [
+        (problem("404 Not Found", 404, "not-found"), "not_found", 1),
+        (problem("403 Forbidden", 403, "forbidden"), "forbidden", 1),
+        (
+            problem("400 Bad Request", 400, "bad-request"),
+            "invalid_input",
+            1,
+        ),
+        (
+            problem("401 Unauthorized", 401, "unauthorized"),
+            "unauthenticated",
+            3,
+        ),
+        (
+            http_response("503 Service Unavailable", None, &[]),
+            "unreachable",
+            4,
+        ),
+    ] {
+        let (server, _directory, _path, credential_path) =
+            organization::prepared_organization_refresh(vec![response], TOKEN);
+        let environment =
+            deployment_environment_with_issuer(&server.api_url, &server.issuer, &credential_path);
+
+        let output = run_with_env(
+            &[
+                "organization",
+                "audit",
+                "list",
+                "acme-research",
+                "--json",
+                "--allow-insecure-http",
+            ],
+            &environment,
+        );
+
+        assert_eq!(output.status.code(), Some(exit), "{outcome}");
+        let document: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(document["outcome"], outcome);
+        for wording in [
+            "organization-problem-title-sentinel",
+            "organization-problem-detail-sentinel",
+        ] {
+            assert!(!String::from_utf8_lossy(&output.stdout).contains(wording));
+            assert!(!String::from_utf8_lossy(&output.stderr).contains(wording));
+        }
+        server.finish();
     }
 }

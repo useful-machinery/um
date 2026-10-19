@@ -2284,6 +2284,7 @@ mod tests {
         RunInputManifest, UnreachableCategory,
     };
 
+    // REQ-DIAG-29, REQ-EVIDENCE-23
     #[test]
     fn run_show_renders_latest_decline_beside_placement_and_progress() {
         let observation: RunObservation = serde_json::from_value(serde_json::json!({
@@ -2295,7 +2296,10 @@ mod tests {
                 "leaseExpiresAt": "2026-08-03T13:00:00Z", "leaseValid": false,
                 "runnerConnected": true, "runnerLastSeenAt": null},
             "lastDecline": {"code": "runner_unable", "reason": "source_service_unavailable",
-                "runnerId": "runner-c", "declinedAt": "2026-08-03T11:59:00Z"},
+                "runnerId": "runner-c", "declinedAt": "2026-08-03T11:59:00Z",
+                "diagnostic": {"stage": "decline-stage-sentinel",
+                    "declineCause": "decline-cause-sentinel",
+                    "transportError": "decline-transport-sentinel"}},
             "lastTransition": {"attemptId": "attempt-a", "eventSequence": 3,
                 "transitionSequence": 2, "recordedAt": "2026-08-03T11:00:00Z",
                 "kind": "step_state_changed", "stepId": "build", "targetState": "running"}
@@ -2317,6 +2321,10 @@ mod tests {
         ] {
             assert!(output.contains(identifier), "missing {identifier}");
         }
+        assert!(
+            !output.contains("sentinel"),
+            "runner diagnostic rendered in {output}"
+        );
         // The public projection is serialized by the run-show command; the human
         // rendering must keep placement separate from coordinator progress.
     }
@@ -2474,13 +2482,17 @@ mod tests {
         );
     }
 
+    // REQ-DIAG-29
     #[test]
     fn terminal_run_human_output_includes_primary_issue_or_rejection() {
         let mut failed = serde_json::to_value(run(RunState::Failed)).unwrap();
         failed["failure"] = serde_json::json!({
             "node": {"id": "work", "role": "step"}, "state": "failed",
             "detail": {"code": "command_exit", "exitCode": 23,
-                "input": {"name": "source"}, "output": {"name": "result"}}
+                "input": {"name": "source"}, "output": {"name": "result"}},
+            "diagnostic": {"stage": "failure-stage-sentinel",
+                "harnessError": "failure-harness-sentinel",
+                "gitCommand": "failure-git-sentinel"}
         });
         let mut output = Vec::new();
         super::write_run_terminal_issue(&mut output, &serde_json::from_value(failed).unwrap())
@@ -2497,16 +2509,23 @@ mod tests {
         ] {
             assert!(text.contains(field), "missing {field} in {text}");
         }
+        assert!(
+            !text.contains("sentinel"),
+            "runner diagnostic rendered in {text}"
+        );
 
         let mut rejected = serde_json::to_value(run(RunState::Rejected)).unwrap();
-        rejected["rejection"] = serde_json::json!({"reason": "source_commit_unavailable"});
+        rejected["rejection"] = serde_json::json!({"reason": "source_commit_unavailable",
+            "diagnostic": {"stage": "rejection-stage-sentinel",
+                "transportError": "rejection-transport-sentinel"}});
         let mut output = Vec::new();
         super::write_run_terminal_issue(&mut output, &serde_json::from_value(rejected).unwrap())
             .unwrap();
+        let text = String::from_utf8(output).unwrap();
+        assert!(text.contains("source_commit_unavailable"));
         assert!(
-            String::from_utf8(output)
-                .unwrap()
-                .contains("source_commit_unavailable")
+            !text.contains("sentinel"),
+            "runner diagnostic rendered in {text}"
         );
     }
 
@@ -2832,6 +2851,7 @@ mod tests {
         (result, clock.into_sleeps(), responses.into_inner().len())
     }
 
+    // REQ-CANCEL-43
     #[test]
     fn cancellation_observation_requires_both_resolved_receipt_and_terminal_run() {
         let recorded = RefCell::new(Vec::new());
@@ -2853,6 +2873,7 @@ mod tests {
         assert_eq!(sleeps, vec![Duration::from_secs(2); 2]);
     }
 
+    // REQ-CANCEL-48
     #[test]
     fn cancellation_observation_fails_on_second_consecutive_retryable_error() {
         let (result, sleeps, remaining) = scripted_cancellation(

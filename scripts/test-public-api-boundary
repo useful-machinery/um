@@ -16,6 +16,7 @@ boundary_check=$script_dir/check-public-api-boundary
 test_root=$(mktemp -d "${TMPDIR:-/tmp}/scherzo-public-api-boundary-test.XXXXXX")
 trap 'rm -rf "$test_root"' EXIT
 
+# INV-CONTRACT-3
 clean_root=$test_root/clean
 mkdir -p "$clean_root/models"
 printf 'pub struct Organization;\n' >"$clean_root/models/organization.rs"

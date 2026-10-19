@@ -94,6 +94,7 @@ fn status_schema() -> jsonschema::Validator {
     jsonschema::draft202012::new(&schema).unwrap()
 }
 
+// REQ-WFRECOVERY-46, REQ-LOCALRUN-145
 #[test]
 fn settled_command_recovery_status_retains_terminal_evidence() {
     let bundle = RunBundle::new(
@@ -185,6 +186,7 @@ steps:
     }
 }
 
+// REQ-WFFINALIZE-19, REQ-WFEXEC-50
 #[test]
 fn live_finalization_status_is_incomplete_role_aware_and_retry_ineligible() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -336,6 +338,7 @@ fn closed_status_schema_accepts_positive_and_rejects_negative_fixtures() {
     }
 }
 
+// REQ-LOCALRUN-150, REQ-LOCALRUN-165
 #[test]
 fn status_json_reports_invalid_committed_pending_result() {
     let (_bundle, run_directory) = completed_run("invalid-pending-result");
@@ -362,6 +365,7 @@ fn status_json_reports_invalid_committed_pending_result() {
     assert_eq!(read_state(&run_directory), state);
 }
 
+// REQ-CONTINUE-30, REQ-LOCALRUN-121, REQ-LOCALRUN-144, REQ-LOCALRUN-145, REQ-LOCALRUN-146, REQ-LOCALRUN-149
 #[test]
 fn status_json_and_plain_are_closed_read_only_snapshots() {
     let (_bundle, run_directory) = completed_run("settled");
@@ -446,6 +450,7 @@ fn status_json_and_plain_are_closed_read_only_snapshots() {
     assert_eq!(lock_after.len(), lock_before.len());
 }
 
+// REQ-LOCALRUN-147, REQ-LOCALRUN-149
 #[test]
 fn active_owner_has_retry_precedence_and_status_does_not_signal_work() {
     let bundle = signal_bundle();
@@ -589,6 +594,7 @@ fn orphaned_guarded_cancellation_is_reaped_and_retry_eligible() {
     assert_eq!(result["retry"], serde_json::json!({"eligible": true}));
 }
 
+// REQ-LOCALRUN-147, REQ-LOCALRUN-148
 #[test]
 fn status_distinguishes_interrupted_abandoned_and_unproven_ownership() {
     let (_bundle, run_directory) = completed_run("recoverable");
@@ -666,6 +672,7 @@ fn status_distinguishes_interrupted_abandoned_and_unproven_ownership() {
     assert!(!plain.stdout.is_empty());
 }
 
+// REQ-LOCALRUN-151
 #[test]
 fn signals_interrupt_blocked_status_output_without_a_valid_object() {
     let (_bundle, run_directory) = completed_run("signal");
@@ -717,6 +724,7 @@ fn signals_interrupt_blocked_status_output_without_a_valid_object() {
     }
 }
 
+// REQ-LOCALRUN-80
 #[test]
 fn status_usage_errors_return_two_without_a_status_object() {
     for args in [
@@ -739,6 +747,7 @@ fn status_usage_errors_return_two_without_a_status_object() {
     }
 }
 
+// REQ-LOCALRUN-148, REQ-LOCALRUN-149, REQ-LOCALRUN-165
 #[test]
 fn invalid_run_directory_is_structured_and_missing_lock_is_not_created() {
     let (_bundle, run_directory) = completed_run("missing-lock");

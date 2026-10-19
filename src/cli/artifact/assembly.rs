@@ -458,6 +458,7 @@ mod tests {
         }
     }
 
+    // REQ-ARTIFACTSET-35
     #[test]
     fn metadata_only_set_commits_atomically_after_complete_validation() {
         let result = metadata_only_result();
@@ -481,6 +482,7 @@ mod tests {
         assert!(destination.join("exports").is_dir());
     }
 
+    // REQ-ARTIFACTSET-36
     #[test]
     fn partial_download_never_commits_destination() {
         let (members, bytes) = one_carrier_fixture();
@@ -493,6 +495,7 @@ mod tests {
         assert!(!destination.exists());
     }
 
+    // REQ-ARTIFACTSET-39
     #[test]
     fn maximum_set_assembles_across_forty_one_capability_batches() {
         let mut exports = serde_json::Map::new();
@@ -554,6 +557,7 @@ mod tests {
         assert!(destination.join("exports/4096").is_file());
     }
 
+    // REQ-ARTIFACTSET-39
     #[test]
     fn expired_unstarted_capabilities_are_refreshed_for_remaining_members() {
         let (members, bytes) = one_carrier_fixture();

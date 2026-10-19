@@ -163,6 +163,7 @@ def expect_verification_failure(verifier: Path, archive_path: Path, description:
         fail(f"{description} unexpectedly passed release-package verification")
 
 
+# REQ-ONBOARD-2
 def main() -> None:
     with tempfile.TemporaryDirectory(prefix="scherzo-release-package-test-") as temporary:
         root = Path(temporary)

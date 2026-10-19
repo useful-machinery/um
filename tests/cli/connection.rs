@@ -49,6 +49,7 @@ fn lines(output: &Output) -> Vec<serde_json::Value> {
         .collect()
 }
 
+// REQ-CONNECTION-40
 #[test]
 fn consent_handoff_and_later_authorization_inspection_are_nonsecret() {
     let (server, _dir, credential) = prepared(vec![
@@ -123,6 +124,7 @@ fn consent_handoff_and_later_authorization_inspection_are_nonsecret() {
     assert!(requests[1].contains(&format!("/authorization-sessions/{SESSION} ")));
 }
 
+// REQ-CONNECTION-41, REQ-CONNECTION-42
 #[test]
 fn polling_completion_uses_the_same_session_and_shows_connection_metadata() {
     let mut done = session("completed");
@@ -169,6 +171,7 @@ fn polling_completion_uses_the_same_session_and_shows_connection_metadata() {
     assert!(requests[1].contains(&format!("/authorization-sessions/{SESSION} ")));
 }
 
+// REQ-CONNECTION-40
 #[test]
 fn reauthorization_targets_only_the_requested_connection() {
     let mut reauthorized = session("pending");
@@ -268,6 +271,7 @@ fn reauthorization_conflict_and_role_loss_have_distinct_outcomes() {
     );
 }
 
+// REQ-CONNECTION-43
 #[test]
 fn lost_start_response_reuses_one_key_and_does_not_create_second_session() {
     let (server, _dir, credential) = prepared(vec![
@@ -441,6 +445,7 @@ fn rejected_service_credential_does_not_expose_a_token() {
     assert_eq!(server.finish().len(), 1);
 }
 
+// REQ-CONNECTION-39
 #[test]
 fn authorization_help_and_destructive_confirmation_are_available() {
     let help = run(&["connection", "linear", "authorization", "--help"]);
@@ -459,6 +464,7 @@ fn authorization_help_and_destructive_confirmation_are_available() {
     }
 }
 
+// REQ-CONNECTION-41, REQ-CONNECTION-42
 #[test]
 fn polling_respects_rate_limit_and_reports_recovery_required() {
     let mut recovered = session("recovery_required");
@@ -545,6 +551,7 @@ fn ambiguous_disconnect_reuses_exact_key_and_target() {
     assert_no_secret_output(&output, &[TOKEN, SECRET]);
 }
 
+// REQ-CONNECTION-39
 #[test]
 fn list_show_disconnect_and_delete_use_nonsecret_projections() {
     let (server, _dir, credential) = prepared(vec![
@@ -581,6 +588,7 @@ fn list_show_disconnect_and_delete_use_nonsecret_projections() {
     assert_eq!(server.finish().len(), 4);
 }
 
+// REQ-CONNECTION-39
 #[test]
 fn linear_list_rejects_limits_above_server_maximum_before_dispatch() {
     let (server, _dir, credential) = prepared(vec![json_http_response(

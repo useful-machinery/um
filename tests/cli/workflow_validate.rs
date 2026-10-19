@@ -262,6 +262,7 @@ fn assert_static_contents_absent(output: &std::process::Output) {
     }
 }
 
+// REQ-WFFORMAT-24, REQ-WFFORMAT-67, REQ-WFFORMAT-68, REQ-WFFORMAT-70, REQ-WFFORMAT-72
 #[test]
 fn valid_bundle_reports_provenance_without_executing_or_exposing_static_sources() {
     let bundle = WorkflowBundle::valid();
@@ -302,6 +303,7 @@ fn valid_bundle_reports_provenance_without_executing_or_exposing_static_sources(
     assert_static_contents_absent(&json);
 }
 
+// REQ-WFFORMAT-68
 #[test]
 fn valid_finalizers_are_resolved_without_execution() {
     let bundle = WorkflowBundle::valid();
@@ -323,6 +325,7 @@ fn valid_finalizers_are_resolved_without_execution() {
     assert_eq!(report["finalizerCount"], 1);
 }
 
+// REQ-WFFORMAT-45, REQ-WFFORMAT-69
 #[test]
 fn finalizer_diagnostics_preserve_the_node_role() {
     let bundle = WorkflowBundle::valid();
@@ -366,6 +369,8 @@ fn finalizer_diagnostics_preserve_the_node_role() {
     );
 }
 
+// REQ-WFFORMAT-6, REQ-WFFORMAT-17, REQ-WFFORMAT-18, REQ-WFFORMAT-38, REQ-WFFORMAT-55, REQ-WFFORMAT-56, REQ-WFFORMAT-57, REQ-WFFORMAT-67, REQ-WFFORMAT-69, REQ-WFFORMAT-70, REQ-WFFORMAT-72, REQ-WFFORMAT-77
+// REQ-WFFORMAT-71
 #[test]
 fn malformed_semantic_missing_escaping_and_schema_failures_are_bounded_results() {
     let malformed = WorkflowBundle::valid();
@@ -399,6 +404,7 @@ fn malformed_semantic_missing_escaping_and_schema_failures_are_bounded_results()
     )
     .expect("invalid result schema should be written");
 
+    let mut remedies = std::collections::BTreeSet::new();
     let missing_message_output = WorkflowBundle::valid();
     let source = fs::read_to_string(missing_message_output.workflow_path())
         .expect("workflow should be readable");
@@ -426,6 +432,15 @@ fn malformed_semantic_missing_escaping_and_schema_failures_are_bounded_results()
         assert_eq!(human.status.code(), Some(1));
         assert!(!human.stdout.is_empty());
         assert!(human.stdout.len() < 1024);
+        let human_text = String::from_utf8(human.stdout.clone()).unwrap();
+        let (_, remedy) = human_text
+            .split_once("No workflow steps were executed.\n\n")
+            .unwrap_or_else(|| panic!("{expected_code}: {human_text:?}"));
+        assert!(!remedy.trim().is_empty(), "{expected_code}");
+        assert!(
+            remedies.insert(remedy.to_owned()),
+            "{expected_code} repeats another failure's remedy"
+        );
         assert!(human.stderr.is_empty());
         assert_static_contents_absent(&human);
 
@@ -454,6 +469,7 @@ fn malformed_semantic_missing_escaping_and_schema_failures_are_bounded_results()
     }
 }
 
+// REQ-WFFORMAT-18
 #[test]
 fn missing_source_remedy_names_the_resolved_path() {
     let bundle = WorkflowBundle::valid();
@@ -471,6 +487,7 @@ fn missing_source_remedy_names_the_resolved_path() {
     assert!(output.stderr.is_empty());
 }
 
+// REQ-WFFORMAT-13
 #[test]
 fn relative_workflow_file_is_cwd_relative_without_root_relative_fallback() {
     let bundle = WorkflowBundle::valid();
@@ -529,6 +546,7 @@ fn absolute_workflow_paths_do_not_require_a_named_current_directory() {
     );
 }
 
+// REQ-WFFORMAT-12
 #[test]
 fn source_root_is_required_even_for_an_absolute_workflow_path() {
     let bundle = WorkflowBundle::valid();
@@ -545,6 +563,7 @@ fn source_root_is_required_even_for_an_absolute_workflow_path() {
     assert!(!bundle.marker.exists());
 }
 
+// REQ-WFFORMAT-14
 #[test]
 fn selected_workflow_must_remain_within_the_explicit_source_root() {
     let bundle = WorkflowBundle::valid();
@@ -570,6 +589,7 @@ fn selected_workflow_must_remain_within_the_explicit_source_root() {
     assert!(!bundle.marker.exists());
 }
 
+// REQ-WFFORMAT-52
 #[test]
 fn agent_profile_replacement_is_applied_and_reported_without_retention() {
     let bundle = WorkflowBundle::valid();

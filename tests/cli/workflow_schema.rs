@@ -2,6 +2,7 @@ use std::fs;
 use std::net::TcpListener;
 use std::process::Command;
 
+// REQ-WFFORMAT-73
 #[test]
 fn embedded_schema_is_emitted_unchanged_without_external_state() {
     let working_directory = tempfile::tempdir().expect("temporary working directory should exist");

@@ -99,7 +99,7 @@ impl Fixture {
         fs::write(source_root.join("prompts/system.md"), SYSTEM_PROMPT).unwrap();
         fs::write(source_root.join("prompts/message.md"), STATIC_MESSAGE).unwrap();
         fs::write(
-            source_root.join("attachments/static.bin"),
+            source_root.join("attachments/static.png"),
             STATIC_ATTACHMENT,
         )
         .unwrap();
@@ -142,7 +142,7 @@ impl Fixture {
         .unwrap();
         fs::write(source_root.join("prompts/message.md"), b"mutated message").unwrap();
         fs::write(
-            source_root.join("attachments/static.bin"),
+            source_root.join("attachments/static.png"),
             b"mutated attachment",
         )
         .unwrap();
@@ -333,7 +333,7 @@ steps:
           - ref: inputs.request
           - ref: outputs.responseProducer.response
         attachments:
-          - file: attachments/static.bin
+          - file: attachments/static.png
 {named_attachments}          - ref: outputs.resultProducer.result
           - ref: outputs.fileProducer.file
 {consumer_output}"#
@@ -380,6 +380,7 @@ fn identity() -> AgentInvocationIdentity {
     )
 }
 
+// REQ-WFFORMAT-50, REQ-WFEXEC-26, REQ-WFEXEC-27, REQ-WFEXEC-52
 #[test]
 fn retained_named_and_upstream_values_materialize_exactly_in_declared_order() {
     let fixture = Fixture::new(ConsumerValueMode::Result);
@@ -416,8 +417,8 @@ fn retained_named_and_upstream_values_materialize_exactly_in_declared_order() {
     let expected: [(&[u8], &str, Option<&str>); 5] = [
         (
             STATIC_ATTACHMENT,
-            STATIC_ATTACHMENT_MEDIA_TYPE,
-            Some("attachments/static.bin"),
+            "application/octet-stream",
+            Some("attachments/static.png"),
         ),
         (
             b"input-one".as_slice(),
@@ -460,7 +461,7 @@ fn retained_named_and_upstream_values_materialize_exactly_in_declared_order() {
         assert!(!attachment.path().to_string_lossy().contains("caller.png"));
     }
     assert_ne!(
-        fs::read(fixture.source_root.join("attachments/static.bin")).unwrap(),
+        fs::read(fixture.source_root.join("attachments/static.png")).unwrap(),
         fs::read(invocation.attachments()[0].path()).unwrap()
     );
 }
@@ -562,6 +563,7 @@ fn materialization_preserves_each_profiles_native_configuration_and_limits() {
     );
 }
 
+// REQ-AGENT-20
 #[test]
 fn expanded_attachment_splices_are_bounded_before_staging() {
     let fixture = Fixture::with_attachment_splices(ConsumerValueMode::None, 127);
@@ -915,6 +917,7 @@ fn staging_creation_error(
         Err(error) => error,
     }
 }
+// REQ-WFEXEC-35
 #[test]
 fn finalization_context_bytes_are_shared_by_command_and_agent() {
     let fixture = Fixture::new(ConsumerValueMode::None);

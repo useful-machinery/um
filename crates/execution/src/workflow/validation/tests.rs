@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 
 use super::super::claude_code::{ClaudeCodeConfig, ClaudeCodeEffort};
-use super::super::decode;
+use super::super::condition::{ResolvedOperand, ResolvedPredicate};
 use super::super::document::{
     FailurePolicy, FinalizationTrigger, HarnessDefinition, NodeBody, Output, ValueReference,
 };
@@ -11,6 +11,7 @@ use super::super::validated::{
     ValidatedMessageSource, ValidatedStep, ValidatedWorkflow, WorkflowNode, WorkflowNodeRole,
     WorkflowValueType,
 };
+use super::super::{DecodeFailureKind, decode};
 use super::{ValidationFailureKind, ValidationLocation};
 
 fn validate_yaml(source: &str) -> Result<ValidatedWorkflow, super::ValidationFailure> {
@@ -40,6 +41,7 @@ fn prerequisite_shape(prerequisites: &[ResolvedDirectPrerequisite]) -> Vec<(&str
         .collect()
 }
 
+// REQ-WFFORMAT-40
 #[test]
 fn failure_policy_defaults_and_typed_data_compatibility_are_resolved() {
     let source = "schemaVersion: 1
@@ -106,6 +108,7 @@ steps:
     );
 }
 
+// REQ-WFFORMAT-66
 #[test]
 fn advisory_outputs_cannot_be_exported() {
     let source = "schemaVersion: 1
@@ -134,6 +137,7 @@ exports:
     );
 }
 
+// REQ-WFFORMAT-38
 #[test]
 fn dependency_graph_failures_are_classified_at_owned_locations() {
     let missing = format!(
@@ -314,6 +318,7 @@ steps:
     assert_eq!(workflow.presentation_order, ["z", "a", "m"]);
 }
 
+// REQ-WFFORMAT-45, REQ-WFFORMAT-47, REQ-WFFORMAT-51
 #[test]
 fn agent_profiles_resolve_to_pinned_configs_and_missing_references_fail() {
     let source = "schemaVersion: 1
@@ -383,6 +388,7 @@ steps:
     );
 }
 
+// REQ-WFFORMAT-47, REQ-WFFORMAT-78
 #[test]
 fn claude_code_profiles_resolve_without_installation_or_model_lookup() {
     let source = "schemaVersion: 1
@@ -417,6 +423,7 @@ steps:
     );
 }
 
+// REQ-WFFORMAT-48, REQ-WFFORMAT-78
 #[test]
 fn codex_profiles_resolve_exact_nonempty_native_strings_without_lookup() {
     let source = "schemaVersion: 1
@@ -451,6 +458,7 @@ steps:
     );
 }
 
+// REQ-WFFORMAT-55
 #[test]
 fn output_bindings_require_declared_non_self_outputs() {
     let missing_step = "schemaVersion: 1
@@ -521,6 +529,7 @@ steps:
     );
 }
 
+// REQ-WFFORMAT-39
 #[test]
 fn command_output_references_form_normalized_direct_prerequisites() {
     let source = "schemaVersion: 1
@@ -630,6 +639,7 @@ steps:
     );
 }
 
+// REQ-WFFORMAT-39
 #[test]
 fn workflow_inputs_and_exports_do_not_create_step_prerequisites() {
     let source = "schemaVersion: 1
@@ -671,6 +681,7 @@ exports:
     assert_eq!(workflow.presentation_order, ["consumer", "producer"]);
 }
 
+// REQ-WFFORMAT-29
 #[test]
 fn undeclared_workflow_input_is_rejected() {
     let source = "schemaVersion: 1
@@ -757,6 +768,7 @@ steps:
     )
 }
 
+// REQ-WFCOND-6, REQ-WFCOND-7, REQ-WFCOND-10
 #[test]
 fn named_text_conditions_are_phase_valid_and_non_text_inputs_are_rejected() {
     let source = "schemaVersion: 1
@@ -827,6 +839,367 @@ finalizers:
     }
 }
 
+const CONDITION_WORKFLOW: &str = "schemaVersion: 1
+inputs:
+  request: {kind: text}
+  payload: {kind: json}
+steps:
+  plan:
+    kind: cmd
+    command: {argv: [\"true\"]}
+    outputs:
+      note: {kind: text, from: path, path: note.txt}
+  gate:
+    kind: cmd
+#gate
+    command: {argv: [\"true\"]}
+finalizers:
+  finish:
+    kind: cmd
+#finish
+    command: {argv: [\"true\"]}
+  report:
+    kind: cmd
+    command: {argv: [\"true\"]}
+";
+
+const TEXT_EQUALS: &str = "{equals: [{ref: inputs.request}, {value: x}]}";
+
+fn gate_condition(condition: &str) -> String {
+    CONDITION_WORKFLOW
+        .replace("#gate\n", &format!("    condition: {condition}\n"))
+        .replace("#finish\n", "")
+}
+
+fn finish_condition(condition: &str) -> String {
+    CONDITION_WORKFLOW
+        .replace("#gate\n", "")
+        .replace("#finish\n", &format!("    condition: {condition}\n"))
+}
+
+fn gate_location() -> ValidationLocation {
+    ValidationLocation::StepCondition {
+        step: "gate".to_owned(),
+    }
+}
+
+fn assert_structurally_invalid(source: &str) {
+    assert_eq!(
+        decode(source.as_bytes()).unwrap_err().kind(),
+        DecodeFailureKind::StructuralContract,
+        "accepted {source}"
+    );
+}
+
+fn resolved_condition<'a>(workflow: &'a ValidatedWorkflow, step: &str) -> &'a ResolvedPredicate {
+    let ValidatedStep::Command(step) = &workflow.steps[step] else {
+        panic!("{step} must be a command step");
+    };
+    step.common.condition.as_ref().unwrap()
+}
+
+// REQ-WFCOND-1
+#[test]
+fn a_condition_is_exactly_one_closed_predicate_object() {
+    let leaf = TEXT_EQUALS;
+    for accepted in [
+        format!("{{all: [{leaf}]}}"),
+        format!("{{any: [{leaf}]}}"),
+        format!("{{not: {leaf}}}"),
+        leaf.to_owned(),
+        "{exists: {ref: inputs.payload, pointer: /ready}}".to_owned(),
+        "{disposition: {node: plan, is: succeeded}}".to_owned(),
+    ] {
+        validate_yaml(&gate_condition(&accepted))
+            .unwrap_or_else(|failure| panic!("rejected {accepted}: {failure:?}"));
+    }
+    for rejected in [
+        format!("{{every: [{leaf}]}}"),
+        format!("{{not: {leaf}, all: [{leaf}]}}"),
+        "{disposition: {node: plan, is: succeeded, note: extra}}".to_owned(),
+        "{equals: [{ref: inputs.request, label: extra}, {value: x}]}".to_owned(),
+        "null".to_owned(),
+        "true".to_owned(),
+        "\"inputs.request == 'x'\"".to_owned(),
+        format!("[{leaf}]"),
+    ] {
+        assert_structurally_invalid(&gate_condition(&rejected));
+    }
+}
+
+// REQ-WFCOND-2
+#[test]
+fn compound_predicates_hold_bounded_ordered_children_and_fixed_arity() {
+    let children = |count: usize| {
+        (0..count)
+            .map(|index| format!("{{equals: [{{ref: inputs.request}}, {{value: v{index}}}]}}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let expected_children = || {
+        (0..64)
+            .map(|index| {
+                ResolvedPredicate::Equals([
+                    ResolvedOperand::text_reference("inputs.request"),
+                    ResolvedOperand::text_literal(format!("v{index}")),
+                ])
+            })
+            .collect::<Vec<_>>()
+    };
+    for (key, expected) in [
+        ("all", ResolvedPredicate::All(expected_children().into())),
+        ("any", ResolvedPredicate::Any(expected_children().into())),
+    ] {
+        let workflow =
+            validate_yaml(&gate_condition(&format!("{{{key}: [{}]}}", children(64)))).unwrap();
+        assert_eq!(resolved_condition(&workflow, "gate"), &expected);
+        for count in [0, 65] {
+            assert_structurally_invalid(&gate_condition(&format!(
+                "{{{key}: [{}]}}",
+                children(count)
+            )));
+        }
+    }
+    let leaf = TEXT_EQUALS;
+    for rejected in [
+        format!("{{not: [{leaf}]}}"),
+        format!("{{not: [{leaf}, {leaf}]}}"),
+        "{equals: [{ref: inputs.request}]}".to_owned(),
+        "{equals: [{ref: inputs.request}, {value: x}, {value: y}]}".to_owned(),
+    ] {
+        assert_structurally_invalid(&gate_condition(&rejected));
+    }
+}
+
+// REQ-WFCOND-3
+#[test]
+fn operands_are_a_reference_or_any_json_literal_but_never_two_literals() {
+    for literal in [
+        "null",
+        "true",
+        "3.5",
+        "text",
+        "[1, {a: null}]",
+        "{nested: {deep: [true]}}",
+    ] {
+        validate_yaml(&gate_condition(&format!(
+            "{{equals: [{{ref: inputs.payload, pointer: /a}}, {{value: {literal}}}]}}"
+        )))
+        .unwrap_or_else(|failure| panic!("rejected literal {literal}: {failure:?}"));
+    }
+    for rejected in [
+        "{equals: [{ref: inputs.request, value: x}, {value: x}]}",
+        "{equals: [{pointer: /a}, {value: x}]}",
+        "{equals: [{}, {value: x}]}",
+    ] {
+        assert_structurally_invalid(&gate_condition(rejected));
+    }
+    assert_failure(
+        &gate_condition("{equals: [{value: x}, {value: x}]}"),
+        ValidationFailureKind::InvalidCondition,
+        gate_location(),
+    );
+}
+
+// REQ-WFCOND-4
+#[test]
+fn exists_requires_a_pointer_into_a_json_value() {
+    validate_yaml(&gate_condition(
+        "{exists: {ref: inputs.payload, pointer: /ready}}",
+    ))
+    .unwrap();
+    assert_structurally_invalid(&gate_condition("{exists: {ref: inputs.payload}}"));
+    for text in ["inputs.request", "outputs.plan.note"] {
+        assert_failure(
+            &gate_condition(&format!("{{exists: {{ref: {text}, pointer: /ready}}}}")),
+            ValidationFailureKind::InvalidConditionType,
+            gate_location(),
+        );
+    }
+}
+
+// REQ-WFCOND-8
+#[test]
+fn condition_outputs_must_be_declared_and_steps_cannot_read_the_finalization_context() {
+    assert_failure(
+        &gate_condition("{equals: [{ref: outputs.missing.note}, {value: x}]}"),
+        ValidationFailureKind::UnknownOutputStep,
+        gate_location(),
+    );
+    assert_failure(
+        &gate_condition("{equals: [{ref: outputs.plan.missing}, {value: x}]}"),
+        ValidationFailureKind::UnknownOutput,
+        gate_location(),
+    );
+    let context = "{exists: {ref: finalization.context, pointer: /trigger}}";
+    assert_structurally_invalid(&gate_condition(context));
+    validate_yaml(&finish_condition(context)).unwrap();
+}
+
+// REQ-WFCOND-9
+#[test]
+fn dispositions_name_another_node_and_steps_cannot_observe_finalizers() {
+    let disposition = |node: &str| format!("{{disposition: {{node: {node}, is: succeeded}}}}");
+    for node in ["missing", "gate", "finish"] {
+        assert_failure(
+            &gate_condition(&disposition(node)),
+            ValidationFailureKind::InvalidConditionReference,
+            gate_location(),
+        );
+    }
+    for node in ["missing", "finish"] {
+        assert_failure(
+            &finish_condition(&disposition(node)),
+            ValidationFailureKind::InvalidConditionReference,
+            ValidationLocation::FinalizerCondition {
+                finalizer: "finish".to_owned(),
+            },
+        );
+    }
+    for node in ["plan", "gate", "report"] {
+        validate_yaml(&finish_condition(&disposition(node)))
+            .unwrap_or_else(|failure| panic!("finalizer could not observe {node}: {failure:?}"));
+    }
+}
+
+// REQ-WFCOND-11
+#[test]
+fn equals_never_mixes_text_and_json_kinds() {
+    for accepted in [
+        "{equals: [{ref: inputs.request}, {value: x}]}",
+        "{equals: [{value: x}, {ref: outputs.plan.note}]}",
+        "{equals: [{ref: inputs.request}, {ref: outputs.plan.note}]}",
+        "{equals: [{ref: inputs.payload, pointer: /a}, {value: x}]}",
+        "{equals: [{ref: inputs.payload}, {ref: inputs.payload, pointer: /a}]}",
+    ] {
+        validate_yaml(&gate_condition(accepted))
+            .unwrap_or_else(|failure| panic!("rejected {accepted}: {failure:?}"));
+    }
+    for rejected in [
+        "{equals: [{ref: inputs.request}, {value: 1}]}",
+        "{equals: [{value: null}, {ref: outputs.plan.note}]}",
+        "{equals: [{ref: inputs.request}, {ref: inputs.payload}]}",
+        "{equals: [{ref: inputs.request, pointer: /a}, {value: x}]}",
+    ] {
+        assert_failure(
+            &gate_condition(rejected),
+            ValidationFailureKind::InvalidConditionType,
+            gate_location(),
+        );
+    }
+}
+
+// REQ-WFCOND-14
+#[test]
+fn condition_depth_predicate_and_workflow_limits_count_predicates_not_operands() {
+    let nested = |levels: usize| {
+        let mut condition = TEXT_EQUALS.to_owned();
+        for _ in 1..levels {
+            condition = format!("{{not: {condition}}}");
+        }
+        condition
+    };
+    // One `any` holding 63 three-leaf `all` groups and one group of `last` leaves.
+    let predicates = |last: usize| {
+        let group = |leaves: usize| format!("{{all: [{}]}}", vec![TEXT_EQUALS; leaves].join(", "));
+        let mut groups = vec![group(3); 63];
+        groups.push(group(last));
+        format!("{{any: [{}]}}", groups.join(", "))
+    };
+    validate_yaml(&gate_condition(&nested(16))).unwrap();
+    assert_failure(
+        &gate_condition(&nested(17)),
+        ValidationFailureKind::ConditionDepthExceeded,
+        gate_location(),
+    );
+    validate_yaml(&gate_condition(&predicates(2))).unwrap();
+    assert_failure(
+        &gate_condition(&predicates(3)),
+        ValidationFailureKind::ConditionNodeLimitExceeded,
+        gate_location(),
+    );
+
+    let workflow = |extra: bool| {
+        let mut source = "schemaVersion: 1\ninputs:\n  request: {kind: text}\nsteps:\n".to_owned();
+        for index in 0..16 {
+            source.push_str(&format!(
+                "  step{index}:\n    kind: cmd\n    condition: {}\n    command: {{argv: [\"true\"]}}\n",
+                predicates(2)
+            ));
+        }
+        if extra {
+            source.push_str(&format!(
+                "  extra:\n    kind: cmd\n    condition: {TEXT_EQUALS}\n    command: {{argv: [\"true\"]}}\n"
+            ));
+        }
+        source
+    };
+    validate_yaml(&workflow(false)).unwrap();
+    assert_failure(
+        &workflow(true),
+        ValidationFailureKind::WorkflowConditionNodeLimitExceeded,
+        ValidationLocation::WorkflowGraph,
+    );
+}
+
+// REQ-WFCOND-16
+#[test]
+fn every_condition_reference_is_a_prerequisite_even_past_a_short_circuit() {
+    let source = "schemaVersion: 1
+inputs:
+  request: {kind: text}
+steps:
+  plan:
+    kind: cmd
+#plan
+    command: {argv: [\"true\"]}
+    outputs:
+      note: {kind: text, from: path, path: note.txt}
+  review:
+    kind: cmd
+#review
+    command: {argv: [\"true\"]}
+  gate:
+    kind: cmd
+    condition:
+      any:
+        - equals: [{ref: inputs.request}, {value: x}]
+        - equals: [{ref: outputs.plan.note}, {value: y}]
+        - disposition: {node: review, is: succeeded}
+    command: {argv: [\"true\"]}
+";
+    let acyclic = source.replace("#plan\n", "").replace("#review\n", "");
+    let workflow = validate_yaml(&acyclic).unwrap();
+    let ValidatedStep::Command(gate) = &workflow.steps["gate"] else {
+        panic!("gate must be a command step");
+    };
+    assert_eq!(
+        gate.common
+            .prerequisites
+            .iter()
+            .map(|prerequisite| (
+                prerequisite.producer.as_str(),
+                prerequisite.control,
+                prerequisite.disposition_control,
+                prerequisite.condition_data,
+            ))
+            .collect::<Vec<_>>(),
+        [("plan", false, false, true), ("review", false, true, false)]
+    );
+    for producer in ["#plan\n", "#review\n"] {
+        let cyclic = source
+            .replace(producer, "    dependsOn: [gate]\n")
+            .replace("#plan\n", "")
+            .replace("#review\n", "");
+        assert_failure(
+            &cyclic,
+            ValidationFailureKind::DependencyCycle,
+            ValidationLocation::WorkflowGraph,
+        );
+    }
+}
+
+// REQ-WFFORMAT-35, REQ-WFFORMAT-49
 #[test]
 fn message_type_table_rejects_every_inverse_destination_without_conversion() {
     let cases = [
@@ -1054,6 +1427,7 @@ exports:
     }
 }
 
+// REQ-WFFORMAT-29, REQ-WFFORMAT-39, REQ-WFFORMAT-55
 #[test]
 fn direct_message_reference_failures_are_reported_at_the_message_location() {
     for (reference, kind) in [
@@ -1090,6 +1464,7 @@ fn direct_message_reference_failures_are_reported_at_the_message_location() {
     );
 }
 
+// REQ-WFFORMAT-43
 #[test]
 fn git_branch_is_exportable_but_rejected_from_every_downstream_binding() {
     let producer = "schemaVersion: 1
@@ -1149,6 +1524,7 @@ steps:
     }
 }
 
+// REQ-WFFORMAT-56
 #[test]
 fn semantic_outputs_definition_rejects_duplicate_paths_and_excess_workspace_sources() {
     let duplicate_path = r#"schemaVersion: 1
@@ -1207,6 +1583,7 @@ steps:
     assert!(validate_yaml(&equal_paths_in_different_nodes).is_ok());
 }
 
+// REQ-WFFORMAT-56
 #[test]
 fn output_kind_and_agent_cardinality_rules_are_enforced() {
     let mut command =
@@ -1292,6 +1669,7 @@ steps:
     );
 }
 
+// REQ-WFFORMAT-65
 #[test]
 fn exports_must_target_declared_outputs() {
     let base = "schemaVersion: 1
@@ -1350,6 +1728,7 @@ fn structurally_decoded_references_are_not_reparsed_during_validation() {
     );
 }
 
+// REQ-WFFORMAT-9, REQ-WFFORMAT-10
 #[test]
 fn combined_node_limit_and_shared_namespace_are_enforced_before_validation() {
     fn workflow_with_counts(step_count: usize, finalizer_count: usize) -> String {
@@ -1406,6 +1785,7 @@ finalizers:
     );
 }
 
+// REQ-WFFINALIZE-17, REQ-WFEXEC-49
 #[test]
 fn semantic_outputs_ordinary_finalizer_parity() {
     let source = "schemaVersion: 1
@@ -1490,6 +1870,7 @@ exports:
     assert_eq!(workflow.exports["report"].node.id, "report");
 }
 
+// REQ-WFFORMAT-62
 #[test]
 fn finalizer_graph_rejects_cross_phase_edges_self_edges_duplicates_and_cycles() {
     let after_step = "schemaVersion: 1
@@ -1586,6 +1967,7 @@ finalizers:
     );
 }
 
+// REQ-WFFORMAT-64, REQ-WFFINALIZE-7
 #[test]
 fn output_references_obey_phase_trigger_and_failure_impact_rules() {
     let ordinary_reads_finalizer = "schemaVersion: 1
@@ -1681,6 +2063,7 @@ finalizers:
     validate_yaml(&control_only).unwrap();
 }
 
+// REQ-WFFORMAT-66
 #[test]
 fn finalizer_exports_require_required_success_eligibility() {
     let base = "schemaVersion: 1
@@ -1726,6 +2109,7 @@ exports:
     );
 }
 
+// REQ-WFFORMAT-63
 #[test]
 fn finalization_context_is_json_and_only_valid_in_declared_finalizer_positions() {
     let source = "schemaVersion: 1
@@ -1802,6 +2186,7 @@ finalizers:
     );
 }
 
+// REQ-WFCOND-15
 #[test]
 fn workflow_node_evidence_definition_limit_applies_to_steps_and_finalizers() {
     for finalizer in [false, true] {
@@ -1904,6 +2289,7 @@ finalizers:
           - file: prompts/message.md
 ";
 
+// REQ-WFFORMAT-52, REQ-AGENT-52, REQ-AGENT-53
 #[test]
 fn agent_profile_replacement_pins_every_reference_as_a_whole_without_translation() {
     let replacement = replacement_profiles(
@@ -1958,6 +2344,7 @@ fn agent_profile_replacement_pins_every_reference_as_a_whole_without_translation
     assert_eq!(unused_only.replaced_agent_profiles.len(), 1);
 }
 
+// REQ-AGENT-55
 #[test]
 fn agent_profile_replacement_failures_are_typed_and_ordered_after_declared_failures() {
     let document = || decode(REPLACEABLE_SOURCE.as_bytes()).unwrap();
@@ -2029,4 +2416,62 @@ fn agent_profile_replacement_failures_are_typed_and_ordered_after_declared_failu
             profile: "review".to_owned(),
         }
     );
+}
+
+// REQ-WFFORMAT-7
+#[test]
+fn description_is_inert_and_a_workflow_declares_no_identifier() {
+    let source = format!(
+        "schemaVersion: 1\nsteps:\n{}{}",
+        command_step("prepare", ""),
+        command_step("publish", "    dependsOn: [prepare]\n")
+    );
+    let described = source.replacen(
+        "schemaVersion: 1\n",
+        "schemaVersion: 1\ndescription: \"Release train: run publish when prepare succeeds\"\n",
+        1,
+    );
+
+    let plain = validate_yaml(&source).unwrap();
+    let mut described = validate_yaml(&described).unwrap();
+    assert!(described.description.is_some());
+    described.description = None;
+    assert_eq!(described, plain);
+
+    for identifier in ["id: release", "name: release", "workflowId: release"] {
+        assert_structurally_invalid(&source.replacen(
+            "schemaVersion: 1\n",
+            &format!("schemaVersion: 1\n{identifier}\n"),
+            1,
+        ));
+    }
+}
+
+// REQ-WFFORMAT-54
+#[test]
+fn output_kinds_require_their_source_schema_and_media_type_fields() {
+    let output = |fields: &str| {
+        format!(
+            "schemaVersion: 1\nsteps:\n  produce:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n    outputs:\n      value:\n{fields}"
+        )
+    };
+    for complete in [
+        "        kind: text\n        from: path\n        path: value.txt\n",
+        "        kind: json\n        from: path\n        path: value.json\n        schema: value.schema.json\n",
+        "        kind: file\n        from: path\n        path: value.bin\n        mediaType: application/octet-stream\n",
+    ] {
+        validate_yaml(&output(complete))
+            .unwrap_or_else(|failure| panic!("rejected {complete}: {failure:?}"));
+    }
+    for incomplete in [
+        "        kind: text\n        from: path\n",
+        "        kind: json\n        from: path\n        path: value.json\n",
+        "        kind: file\n        from: path\n        path: value.bin\n",
+        &format!(
+            "        kind: file\n        from: path\n        path: value.bin\n        mediaType: application/{}\n",
+            "x".repeat(117)
+        ),
+    ] {
+        assert_structurally_invalid(&output(incomplete));
+    }
 }

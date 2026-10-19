@@ -52,6 +52,7 @@ fn request_body(request: &str) -> &str {
         .expect("request should contain a body separator")
 }
 
+// REQ-CONNECTION-16, REQ-CONNECTION-17
 #[test]
 fn setup_begin_and_complete_preserve_the_browser_handoff() {
     let setup_url =
@@ -153,6 +154,7 @@ fn setup_begin_and_complete_preserve_the_browser_handoff() {
     }
 }
 
+// REQ-CONNECTION-16
 #[test]
 fn installation_and_repository_lists_expose_current_provider_state() {
     let mut disconnected = installation_body("disconnected");
@@ -355,6 +357,7 @@ fn github_successes_reject_mismatched_response_subjects() {
     );
 }
 
+// REQ-CONNECTION-19
 #[test]
 fn replayable_connection_mutations_retry_one_ambiguous_transport_failure() {
     let cases = [
@@ -416,6 +419,7 @@ fn replayable_connection_mutations_retry_one_ambiguous_transport_failure() {
     }
 }
 
+// REQ-CONNECTION-19
 #[test]
 fn meaningful_api_failures_have_closed_json_and_exit_statuses() {
     let cases = [(
@@ -453,6 +457,7 @@ fn meaningful_api_failures_have_closed_json_and_exit_statuses() {
     }
 }
 
+// REQ-CONNECTION-20
 #[test]
 fn setup_conflict_is_actionable_on_standard_error_without_problem_prose() {
     let response = github_problem(
@@ -531,6 +536,7 @@ fn oversized_github_success_response_is_rejected() {
     server.finish();
 }
 
+// REQ-CONNECTION-18
 #[test]
 fn remote_insecure_setup_url_is_rejected_before_browser_handoff() {
     let unsafe_url = "http://github.example/private-setup-url-sentinel";

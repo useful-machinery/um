@@ -53,6 +53,7 @@ fn request_body(request: &str) -> &str {
         .expect("request should contain a body separator")
 }
 
+// REQ-ACCOUNT-28
 #[test]
 fn account_update_sets_the_display_name_through_the_profile_patch() {
     let (server, _directory, credential_path) =
@@ -113,6 +114,7 @@ fn account_update_sets_the_display_name_through_the_profile_patch() {
     );
 }
 
+// REQ-ACCOUNT-28
 #[test]
 fn account_update_clears_the_display_name_with_an_explicit_null() {
     let (server, _directory, credential_path) = prepared_update(vec![updated_response(None)]);
@@ -153,6 +155,7 @@ fn account_update_clears_the_display_name_with_an_explicit_null() {
     );
 }
 
+// REQ-ACCOUNT-30
 #[test]
 fn account_clear_rejects_a_current_membership() {
     let (server, _directory, credential_path) = prepared_update(vec![update_problem(
@@ -184,6 +187,7 @@ fn account_clear_rejects_a_current_membership() {
     );
 }
 
+// REQ-ACCOUNT-29, REQ-ACCOUNT-31
 #[test]
 fn account_update_reports_meaningful_api_failures_without_problem_prose() {
     let cases = [
@@ -263,6 +267,7 @@ fn account_update_reports_meaningful_api_failures_without_problem_prose() {
     }
 }
 
+// REQ-ACCOUNT-29
 #[test]
 fn rejected_display_name_has_a_stable_human_remedy() {
     let response = update_problem(
@@ -294,6 +299,7 @@ fn rejected_display_name_has_a_stable_human_remedy() {
     assert_eq!(server.finish().len(), 1);
 }
 
+// REQ-ACCOUNT-27
 #[test]
 fn account_update_requires_exactly_one_display_name_operation() {
     for args in [

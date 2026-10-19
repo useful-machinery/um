@@ -80,6 +80,8 @@ fn assert_authorization(request: &str, credential: &str) {
     );
 }
 
+// REQ-DELEGATION-1, REQ-DELEGATION-6, REQ-DELEGATION-9, REQ-DELEGATION-11,
+// REQ-DELEGATION-12, REQ-DELEGATION-13
 #[test]
 fn delegation_workflow_preserves_actor_separation_history_and_pagination() {
     let location = format!("/v1/delegations/{DELEGATION_ID}");
@@ -273,6 +275,7 @@ fn delegation_workflow_preserves_actor_separation_history_and_pagination() {
     assert_authorization(&requests[5], SERVICE_API_KEY);
 }
 
+// REQ-DELEGATION-1, REQ-DELEGATION-6
 #[test]
 fn acceptance_requires_explicit_service_authentication_and_proposal_rejects_it() {
     let accept = run(&["delegation", "accept", DELEGATION_ID]);
@@ -290,6 +293,7 @@ fn acceptance_requires_explicit_service_authentication_and_proposal_rejects_it()
     assert!(String::from_utf8_lossy(&propose.stderr).contains("unexpected argument"));
 }
 
+// REQ-DELEGATION-8, REQ-DELEGATION-10, REQ-DELEGATION-15, REQ-DELEGATION-20
 #[test]
 fn ended_and_inaccessible_delegations_have_stable_failures() {
     let (server, _directory, human_credentials, service_key) = prepared(vec![

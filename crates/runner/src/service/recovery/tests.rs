@@ -45,6 +45,7 @@ fn grant(manifest: &Manifest, generation: u64) -> FixtureGrant {
     }
 }
 
+// INV-RUNNER-13
 #[test]
 fn retained_identity_and_local_generation_survive_fresh_boot_without_adopting_legacy() {
     let temp = private_tempdir();
@@ -178,6 +179,7 @@ fn retained_identity_and_local_generation_survive_fresh_boot_without_adopting_le
     assert!(store.claim_fixture(&workspace, &final_grant, true).is_err());
 }
 
+// INV-RUNNER-13
 #[test]
 fn competing_claims_and_cleanup_cannot_publish_a_removed_holder() {
     let temp = private_tempdir();
@@ -259,6 +261,7 @@ fn competing_claims_and_cleanup_cannot_publish_a_removed_holder() {
     }
 }
 
+// INV-RUNNER-13
 #[test]
 fn copied_root_and_unknown_catalog_revision_fail_without_adopting_old_work() {
     let original = private_tempdir();
@@ -298,6 +301,7 @@ impl FixtureGrant {
     }
 }
 
+// INV-RUNNER-13
 #[test]
 fn missing_or_corrupt_manifest_never_recreates_a_catalog_identity() {
     let temp = private_tempdir();
@@ -337,6 +341,7 @@ fn missing_or_corrupt_manifest_never_recreates_a_catalog_identity() {
     );
 }
 
+// INV-RUNNER-13
 #[test]
 fn invalid_manifest_identity_lineage_and_generation_cannot_authorize_a_claim() {
     let temp = private_tempdir();
@@ -389,6 +394,7 @@ fn invalid_manifest_identity_lineage_and_generation_cannot_authorize_a_claim() {
     assert_eq!(store.manifest(&id).unwrap(), manifest);
 }
 
+// INV-RUNNER-13
 #[test]
 fn record_reader_rejects_fifo_symlink_and_hardlink_without_trusting_the_contents() {
     use std::os::unix::fs::{PermissionsExt, symlink};
@@ -412,6 +418,7 @@ fn record_reader_rejects_fifo_symlink_and_hardlink_without_trusting_the_contents
     assert!(read_record::<serde_json::Value>(&directory, "record").is_err());
 }
 
+// INV-RUNNER-13
 #[test]
 fn claimed_generation_survives_restart_and_uncommitted_staging_cannot_reset_it() {
     let temp = private_tempdir();

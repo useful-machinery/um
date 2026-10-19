@@ -37,6 +37,8 @@ const INTERNAL_PACKAGES: [&str; 8] = [
     "um-test-support",
 ];
 
+// INV-SYSTEM-5
+// INV-CLI-1
 #[test]
 fn workspace_members_and_edges_match_final_graph() {
     let root = cli_root();
@@ -157,6 +159,8 @@ fn workspace_members_and_edges_match_final_graph() {
     );
 }
 
+// INV-CONTRACT-4
+// INV-CLI-2
 #[test]
 fn moved_sources_have_one_final_owner_and_private_generated_api() {
     let root = cli_root();
@@ -331,6 +335,7 @@ fn special_targets() -> Vec<(&'static str, BTreeSet<&'static str>)> {
     Vec::new()
 }
 
+// INV-CLI-2
 #[test]
 fn residual_module_dependencies_match_architecture() {
     let src = cli_root().join("src");
@@ -485,6 +490,7 @@ fn execution_boundary_policy_rejects_public_modules() {
     assert!(exposed_module_declarations("mod workflow;\n").is_empty());
 }
 
+// INV-CLI-4
 #[test]
 fn execution_and_runner_receive_identity_without_reading_root_build_policy() {
     let root = cli_root();
@@ -730,6 +736,7 @@ fn external_crate_containment() -> Vec<(&'static str, Vec<&'static str>)> {
     ]
 }
 
+// INV-CLI-3
 #[test]
 fn external_crates_stay_inside_their_owning_packages() {
     let root = cli_root();

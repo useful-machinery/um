@@ -49,6 +49,7 @@ pub(super) fn inherited_detail(detail: &InheritedDetail) -> String {
 mod tests {
     use super::*;
 
+    // REQ-OUTPUTS-17
     #[test]
     fn completion_text_is_independent_of_renderer() {
         assert_eq!(success_detail(true, 0), "exit 0");

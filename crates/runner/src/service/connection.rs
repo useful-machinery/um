@@ -3540,6 +3540,7 @@ mod tests {
         assert_eq!(next_sequence, 5);
     }
 
+    // INV-RUNNER-6
     #[tokio::test]
     async fn fills_exact_observation_window_and_refills_one_fifo_slot() {
         let context = full_observation_window_context();
@@ -3630,6 +3631,7 @@ mod tests {
             .expect("decode renewal effect fixture")
     }
 
+    // INV-RUNNER-6
     #[tokio::test]
     async fn renewal_is_applied_before_a_full_observation_window_drains() {
         let context = EstablishedTestContext::new();
@@ -3905,6 +3907,7 @@ mod tests {
         assert!(effect.get("error.type").is_none());
     }
 
+    // INV-RUNNER-6
     #[tokio::test]
     async fn full_window_effect_collision_reconnects_and_both_effects_replay() {
         const OFFER_EFFECT_ID: &str = "eff_01k0z6r1w8f4jy2m7q9v3x5abg";
@@ -4005,6 +4008,7 @@ mod tests {
         );
     }
 
+    // INV-RUNNER-4
     #[tokio::test]
     async fn reconnect_never_replays_an_unacknowledged_effect_receipt() {
         let context = EstablishedTestContext::new();
@@ -4067,6 +4071,7 @@ mod tests {
         assert_eq!(next_sequence, 3, "reconnect replayed the effect receipt");
     }
 
+    // INV-RUNNER-4
     #[tokio::test]
     async fn reconnect_replays_unacknowledged_terminal_with_same_identity() {
         let context = EstablishedTestContext::new();
@@ -4492,6 +4497,7 @@ mod tests {
         received[header_end..header_end + content_length].to_vec()
     }
 
+    // REQ-RUNNERENROLL-67
     #[test]
     fn assignment_rejection_protocol_events_record_bounded_decline_values() {
         let cases = [
@@ -4804,6 +4810,8 @@ mod tests {
         clippy::result_large_err,
         reason = "tungstenite's handshake callback requires its large error type"
     )]
+    // REQ-RUNNERENROLL-31
+    // REQ-TELEMETRY-12
     #[tokio::test]
     async fn authenticates_and_completes_hello_and_ping_pong() {
         let (listener, endpoint) = fixture_listener().await;

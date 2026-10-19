@@ -669,6 +669,7 @@ pub fn load_cloud_continuation_seed(
 mod tests {
     use super::*;
 
+    // INV-ENGINE-13
     #[test]
     fn inherited_private_reader_rejects_rebound_ancestor() {
         let root = tempfile::tempdir().expect("isolated root");

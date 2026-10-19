@@ -39,6 +39,7 @@ fn assert_json_matches_schema(format: &str, schema_source: &str, bytes: &[u8]) {
     );
 }
 
+// REQ-RUNNERENROLL-15, REQ-RUNNERENROLL-16
 #[test]
 fn url_policy_requires_secure_or_explicit_loopback_development_transport() {
     for (mode, value, kind, accepted) in [
@@ -117,6 +118,7 @@ fn url_policy_requires_secure_or_explicit_loopback_development_transport() {
     }
 }
 
+// REQ-RUNNERENROLL-14
 #[test]
 fn operator_config_written_bytes_match_schema_in_both_deployment_modes() {
     let temporary = tempfile::tempdir().expect("create config fixture");
@@ -148,6 +150,8 @@ fn activation_artifact_accepts_a_plain_relative_destination() {
     );
 }
 
+// REQ-RUNNERENROLL-18
+// INV-RUNNER-9
 #[test]
 fn atomic_state_write_uses_private_permissions_and_rejects_links() {
     let directory = tempfile::TempDir::new().expect("create directory");
@@ -171,6 +175,9 @@ fn atomic_state_write_uses_private_permissions_and_rejects_links() {
     assert_eq!(fs::read(&path).expect("reread original state"), original);
 }
 
+// INV-TRUST-1
+// REQ-RUNNERENROLL-18
+// INV-RUNNER-9
 #[test]
 fn successful_enrollment_commits_schema_valid_state_without_transmitting_secret() {
     let server = ScriptedHttpServer::respond(enrollment_response());
@@ -241,30 +248,14 @@ fn successful_enrollment_commits_schema_valid_state_without_transmitting_secret(
     assert!(!request.contains(&complete_credential));
 }
 
+// REQ-RUNNERENROLL-48
 #[test]
 fn replacement_enrollment_preserves_current_and_reuses_the_staged_pending_credential() {
     let server = ScriptedHttpServer::respond(enrollment_response_with_credential(
         REPLACEMENT_CREDENTIAL_ID,
     ));
     let fixture = EnrollmentFixture::new(&server, OTHER_ACTIVATION_ID, future_time());
-    let state_directory = fixture.state_path.parent().expect("state directory");
-    ensure_private_directory(state_directory).expect("create state directory");
-    atomic_write_json(
-        &fixture.state_path,
-        &serde_json::json!({
-            "schemaVersion": 1,
-            "runnerId": RUNNER_ID,
-            "connectionUrl": "ws://127.0.0.1:8765/v1/runner/connect",
-            "currentCredential": {
-                "id": CREDENTIAL_ID,
-                "secret": ACTIVATION_SECRET,
-                "activationId": ACTIVATION_ID,
-                "enrolledAt": "2026-08-06T12:00:00Z"
-            },
-            "updatedAt": "2026-08-06T12:00:00Z"
-        }),
-    )
-    .expect("write current runner state");
+    fixture.write_current_state();
 
     let outcome = enroll(
         Some(&fixture.activation_path),
@@ -357,6 +348,7 @@ fn replacement_enrollment_preserves_current_and_reuses_the_staged_pending_creden
     );
 }
 
+// REQ-RUNNERENROLL-16
 #[test]
 fn enrollment_rejects_redirects_without_losing_the_journal() {
     let server = ScriptedHttpServer::respond(redirect_response(
@@ -378,6 +370,7 @@ fn enrollment_rejects_redirects_without_losing_the_journal() {
     server.finish_one();
 }
 
+// REQ-RUNNERENROLL-21, REQ-RUNNERENROLL-23
 #[test]
 fn enrollment_journal_and_terminal_receipt_match_schemas_across_retries() {
     let server = ScriptedHttpServer::respond_in_sequence(vec![
@@ -475,6 +468,7 @@ fn enrollment_journal_and_terminal_receipt_match_schemas_across_retries() {
     replacement_server.finish_one();
 }
 
+// REQ-RUNNERENROLL-22
 #[test]
 fn resume_finishes_after_state_commits_before_journal_removal() {
     let server = ScriptedHttpServer::respond(enrollment_response());
@@ -593,6 +587,7 @@ fn journal_rejects_a_verifier_that_does_not_match_its_secret() {
     ));
 }
 
+// REQ-RUNNERENROLL-17, REQ-RUNNERENROLL-22
 #[test]
 fn resume_sends_an_expired_journal_instead_of_applying_local_expiry() {
     let server = ScriptedHttpServer::respond(enrollment_response());
@@ -610,6 +605,127 @@ fn resume_sends_an_expired_journal_instead_of_applying_local_expiry() {
     assert!(matches!(outcome, EnrollmentOutcome::Enrolled { .. }));
     assert!(!fixture.journal_path().exists());
     server.finish_one();
+}
+
+// REQ-RUNNERENROLL-6
+#[test]
+fn activation_file_is_created_private_and_never_replaces_an_existing_path() {
+    let directory = tempfile::TempDir::new().expect("create directory");
+    fs::set_permissions(directory.path(), Permissions::from_mode(0o700))
+        .expect("protect directory");
+    let artifact = ActivationArtifact {
+        schema_version: 1,
+        activation_url: format!(
+            "http://127.0.0.1:9/v1/runner-enrollments/{ACTIVATION_ID}/activate"
+        ),
+        activation_token: format!("{ACTIVATION_ID}.{ACTIVATION_SECRET}"),
+        runner_id: RUNNER_ID.to_owned(),
+        expires_at: future_time(),
+    };
+    let path = directory.path().join("activation.json");
+    let destination = path.to_str().expect("activation path should be UTF-8");
+
+    write_activation_file(destination, &artifact).expect("write activation file");
+    let metadata = fs::metadata(&path).expect("activation file metadata");
+    assert_eq!(metadata.mode() & 0o777, 0o600);
+    assert_eq!(metadata.uid(), rustix::process::geteuid().as_raw());
+    let written = fs::read(&path).expect("read activation file");
+    assert!(matches!(
+        write_activation_file(destination, &artifact),
+        Err(EnrollmentError::ArtifactWrite)
+    ));
+    assert_eq!(fs::read(&path).expect("reread activation file"), written);
+
+    let customer_file = directory.path().join("customer.txt");
+    fs::write(&customer_file, b"customer content").expect("write customer file");
+    let link = directory.path().join("link.json");
+    std::os::unix::fs::symlink(&customer_file, &link).expect("create symbolic link");
+    assert!(matches!(
+        write_activation_file(link.to_str().expect("link path should be UTF-8"), &artifact),
+        Err(EnrollmentError::ArtifactWrite)
+    ));
+    assert_eq!(
+        fs::read(&customer_file).expect("read customer file"),
+        b"customer content"
+    );
+}
+
+// REQ-RUNNERENROLL-20
+#[test]
+fn enrollment_refuses_an_enrolled_host_and_a_replacement_for_another_runner() {
+    let server = ScriptedHttpServer::respond_in_sequence(Vec::new());
+    let fixture = EnrollmentFixture::new(&server, OTHER_ACTIVATION_ID, future_time());
+    fixture.write_current_state();
+    let state = fs::read(&fixture.state_path).expect("read current state");
+
+    assert!(matches!(
+        enroll(
+            Some(&fixture.activation_path),
+            &fixture.config_path,
+            false,
+            false,
+        ),
+        Err(EnrollmentError::StateAlreadyEnrolled)
+    ));
+
+    let mut other_runner = fixture.artifact(&server, OTHER_ACTIVATION_ID, future_time());
+    other_runner.runner_id = "rnr_01k0z6r1w8f4jy2m7q9v3x5abd".to_owned();
+    let other_runner_path = fixture.root.path().join("other-runner-activation.json");
+    write_artifact(&other_runner_path, &other_runner);
+    assert!(matches!(
+        enroll(Some(&other_runner_path), &fixture.config_path, true, false),
+        Err(EnrollmentError::RunnerMismatch)
+    ));
+
+    assert_eq!(fs::read(&fixture.state_path).expect("reread state"), state);
+    assert!(!fixture.journal_path().exists());
+    assert!(server.finish().is_empty());
+}
+
+// REQ-RUNNERENROLL-24
+#[test]
+fn an_unresolved_journal_refuses_a_different_activation_until_resumed() {
+    let server = ScriptedHttpServer::respond_in_sequence(vec![
+        empty_response("500 Internal Server Error"),
+        empty_response("410 Gone"),
+        enrollment_response(),
+    ]);
+    let fixture = EnrollmentFixture::new(&server, ACTIVATION_ID, future_time());
+    assert!(matches!(
+        enroll(
+            Some(&fixture.activation_path),
+            &fixture.config_path,
+            false,
+            false,
+        ),
+        Err(EnrollmentError::NetworkAmbiguous)
+    ));
+    let journal = fs::read(fixture.journal_path()).expect("read unresolved journal");
+
+    let other = fixture.artifact(&server, OTHER_ACTIVATION_ID, future_time());
+    let other_path = fixture.root.path().join("other-activation.json");
+    write_artifact(&other_path, &other);
+    assert!(matches!(
+        enroll(Some(&other_path), &fixture.config_path, false, false),
+        Err(EnrollmentError::UnresolvedJournal)
+    ));
+    assert_eq!(
+        fs::read(fixture.journal_path()).expect("reread unresolved journal"),
+        journal
+    );
+
+    assert!(matches!(
+        enroll(None, &fixture.config_path, false, true).expect("resume to a definite outcome"),
+        EnrollmentOutcome::Gone { .. }
+    ));
+    assert!(matches!(
+        enroll(Some(&other_path), &fixture.config_path, false, false)
+            .expect("enroll the different activation after resolution"),
+        EnrollmentOutcome::Enrolled { .. }
+    ));
+    let requests = server.finish();
+    assert_eq!(requests.len(), 3);
+    assert!(requests[2].contains(OTHER_ACTIVATION_ID));
 }
 
 struct EnrollmentFixture {
@@ -658,6 +774,27 @@ impl EnrollmentFixture {
         expires_at: String,
     ) -> ActivationArtifact {
         activation_artifact(server, activation_id, expires_at)
+    }
+
+    fn write_current_state(&self) {
+        let state_directory = self.state_path.parent().expect("state directory");
+        ensure_private_directory(state_directory).expect("create state directory");
+        atomic_write_json(
+            &self.state_path,
+            &serde_json::json!({
+                "schemaVersion": 1,
+                "runnerId": RUNNER_ID,
+                "connectionUrl": "ws://127.0.0.1:8765/v1/runner/connect",
+                "currentCredential": {
+                    "id": CREDENTIAL_ID,
+                    "secret": ACTIVATION_SECRET,
+                    "activationId": ACTIVATION_ID,
+                    "enrolledAt": "2026-08-06T12:00:00Z"
+                },
+                "updatedAt": "2026-08-06T12:00:00Z"
+            }),
+        )
+        .expect("write current runner state");
     }
 
     fn journal_path(&self) -> PathBuf {

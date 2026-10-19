@@ -123,6 +123,8 @@ fn assert_json_success(output: &Output, outcome: &str) -> serde_json::Value {
     value
 }
 
+// REQ-AUTH-48, REQ-AUTH-49
+// REQ-PROJECT-75
 #[test]
 fn project_list_uses_only_the_explicit_service_api_key() {
     let directory = private_credential_directory();
@@ -203,6 +205,8 @@ fn project_list_uses_only_the_explicit_service_api_key() {
     );
 }
 
+// REQ-PROJECT-75, REQ-PROJECT-76,
+// REQ-PROJECT-77, REQ-PROJECT-79, REQ-PROJECT-81, REQ-WORKSPACE-7
 #[test]
 fn discovery_and_project_management_feed_an_inputless_cloud_run() {
     let membership_page = serde_json::json!({
@@ -654,6 +658,7 @@ fn discovery_and_project_management_feed_an_inputless_cloud_run() {
     }
 }
 
+// REQ-PROJECT-77
 #[test]
 fn project_runner_pool_selection_resolves_an_exact_name() {
     let project = project_body("widget", true, Some(repository_body("acme/widget", "main")));
@@ -692,6 +697,7 @@ fn project_runner_pool_selection_resolves_an_exact_name() {
     );
 }
 
+// REQ-PROJECT-76, REQ-PROJECT-77
 #[test]
 fn project_creation_resolves_an_exact_pool_name() {
     let project = project_body("widget", true, Some(repository_body("acme/widget", "main")));
@@ -743,6 +749,7 @@ fn project_creation_resolves_an_exact_pool_name() {
     );
 }
 
+// REQ-PROJECT-81
 #[test]
 fn project_create_retries_one_ambiguous_response() {
     let project = project_body(
@@ -777,6 +784,7 @@ fn project_create_retries_one_ambiguous_response() {
     assert_eq!(server.finish().len(), 2);
 }
 
+// REQ-PROJECT-82
 #[test]
 fn project_create_rejects_success_without_required_identity_headers() {
     let project = project_body(
@@ -830,6 +838,7 @@ fn project_create_rejects_success_without_required_identity_headers() {
     }
 }
 
+// REQ-PROJECT-78
 #[test]
 fn gitlab_project_create_bind_and_read_preserve_provider_identity() {
     let long_path = format!("group/subgroup/{}", "a".repeat(260));
@@ -975,6 +984,7 @@ fn gitlab_project_create_bind_and_read_preserve_provider_identity() {
     }
 }
 
+// REQ-PROJECT-78
 #[test]
 fn project_human_output_exposes_readiness_and_blockers() {
     let project = project_body(
@@ -1017,6 +1027,7 @@ fn project_human_output_exposes_readiness_and_blockers() {
     server.finish();
 }
 
+// REQ-PROJECT-80
 #[test]
 fn project_api_errors_have_closed_json_outcomes_and_exit_codes() {
     let cases = [
@@ -1137,6 +1148,7 @@ fn project_api_errors_have_closed_json_outcomes_and_exit_codes() {
     }
 }
 
+// REQ-PROJECT-82
 #[test]
 fn project_mutation_rejects_a_different_project_identity() {
     let mut other_project = project_body(
@@ -1174,6 +1186,7 @@ fn project_mutation_rejects_a_different_project_identity() {
     server.finish();
 }
 
+// REQ-PROJECT-82
 #[test]
 fn project_rate_limit_requires_a_positive_retry_after() {
     for retry_after in [None, Some("0"), Some("invalid")] {
@@ -1222,6 +1235,7 @@ fn project_rate_limit_requires_a_positive_retry_after() {
     }
 }
 
+// REQ-PROJECT-82
 #[test]
 fn inconsistent_project_readiness_is_an_invalid_response() {
     let mut project = project_body(

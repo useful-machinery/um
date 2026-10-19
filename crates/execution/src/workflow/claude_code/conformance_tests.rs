@@ -275,6 +275,8 @@ fn assert_retained_native_session(root: &SyntheticClaudeCodeRoot, expected: &[&s
     );
 }
 
+// REQ-AGENT-4
+// INV-HARNESS-10
 #[test]
 #[ignore = "requires pinned harness"]
 fn pinned_real_claude_code_00_qualification_anchor_is_exact() {

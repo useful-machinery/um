@@ -2399,6 +2399,7 @@ pub(super) mod normal {
         assert_completed_without_value(outcome, started);
     }
 
+    // INV-HARNESS-3, INV-HARNESS-9
     #[test]
     fn launch_is_strict_stdio_with_invocation_scoped_project_and_hook_trust() {
         let fixture = ProcessFixture::new("absent", AgentValueMode::None, 1024);
@@ -2439,6 +2440,8 @@ pub(super) mod normal {
         );
     }
 
+    // REQ-AGENT-24
+    // INV-HARNESS-9
     #[test]
     fn transient_sqlite_state_is_never_nested_in_codex_home() {
         let fixture = ProcessFixture::with_codex_home_containing_staging();
@@ -2454,6 +2457,7 @@ pub(super) mod normal {
         }
     }
 
+    // REQ-AGENT-18, REQ-AGENT-19
     #[tokio::test]
     async fn ordered_attachments_use_exact_wrappers_native_images_and_sealed_notices() {
         let canonical_json = br#"{"a":1,"z":2}"#;
@@ -3379,6 +3383,7 @@ for line in sys.stdin:
         .await;
     }
 
+    // REQ-AGENT-4, REQ-AGENT-22, REQ-AGENT-60
     #[tokio::test]
     #[ignore = "requires pinned harness"]
     async fn pinned_real_codex_handshake_completed_turn_and_native_resources_conform() {
@@ -4330,6 +4335,7 @@ pub(super) mod structured_result {
         })
     }
 
+    // REQ-AGENT-32
     #[tokio::test]
     async fn authoritative_validation_accepts_every_json_root_category() {
         with_watchdog(async {
@@ -4392,6 +4398,7 @@ pub(super) mod structured_result {
         .await;
     }
 
+    // REQ-AGENT-29
     #[tokio::test]
     async fn schema_rejection_is_corrected_once_on_the_same_settled_thread() {
         with_watchdog(async {
@@ -4450,6 +4457,8 @@ pub(super) mod structured_result {
         .await;
     }
 
+    // REQ-AGENT-33
+    // INV-HARNESS-7
     #[tokio::test]
     async fn accepted_result_that_misses_settlement_grace_is_discarded_after_quiescence() {
         with_watchdog(async {
@@ -4484,6 +4493,7 @@ pub(super) mod structured_result {
         .await;
     }
 
+    // REQ-AGENT-30, REQ-AGENT-31
     #[tokio::test]
     async fn oversized_exhausted_missing_and_failed_corrections_commit_no_candidate() {
         with_watchdog(async {
@@ -4547,6 +4557,8 @@ pub(super) mod start_failure {
         assert!(!error.is_empty());
     }
 
+    // REQ-AGENT-40
+    // INV-HARNESS-5
     #[tokio::test]
     async fn every_launch_and_setup_stage_is_typed_and_quiescent() {
         with_watchdog(async {
@@ -4638,6 +4650,8 @@ pub(super) mod start_failure {
 pub(super) mod unattended_requests {
     use super::*;
 
+    // REQ-AGENT-25
+    // INV-HARNESS-6
     #[tokio::test]
     async fn known_requests_receive_only_the_fixed_unattended_response() {
         with_watchdog(async {
@@ -4679,6 +4693,8 @@ pub(super) mod unattended_requests {
         .await;
     }
 
+    // REQ-AGENT-25, REQ-AGENT-38
+    // INV-HARNESS-6
     #[tokio::test]
     async fn unknown_request_is_declined_and_observed_without_failing() {
         with_watchdog(async {
@@ -4797,6 +4813,7 @@ pub(super) mod failure_ordering {
         .await;
     }
 
+    // REQ-AGENT-37
     #[tokio::test]
     async fn native_retry_can_recover_without_a_harness_retry() {
         with_watchdog(async {
@@ -4849,6 +4866,8 @@ pub(super) mod adversarial_lifecycle {
         .await;
     }
 
+    // REQ-AGENT-24
+    // INV-HARNESS-9
     #[tokio::test]
     async fn transient_sqlite_home_uses_an_ordinary_staging_path_and_is_removed() {
         with_watchdog(async {
@@ -4914,6 +4933,7 @@ pub(super) mod adversarial_lifecycle {
         .await;
     }
 
+    // REQ-AGENT-43
     #[tokio::test]
     async fn stderr_flood_is_fully_drained_but_retained_only_to_its_limit() {
         with_watchdog(async {
@@ -5077,6 +5097,8 @@ pub(super) mod cancellation {
         .await;
     }
 
+    // REQ-AGENT-46
+    // INV-HARNESS-8
     #[tokio::test]
     async fn cancellation_discards_partial_output_and_force_cleans_stubborn_descendants() {
         with_watchdog(async {

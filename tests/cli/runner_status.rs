@@ -244,6 +244,7 @@ async fn accept_runner_socket(
     .unwrap()
 }
 
+// REQ-RUNNERENROLL-41, REQ-RUNNERENROLL-42, REQ-RUNNERENROLL-80
 #[test]
 fn runner_status_queries_only_the_configured_local_socket() {
     let directory = private_credential_directory();
@@ -289,6 +290,8 @@ fn runner_status_queries_only_the_configured_local_socket() {
     server.join().unwrap();
 }
 
+// REQ-RUNNERENROLL-35
+// REQ-TELEMETRY-1
 #[test]
 fn terminal_authentication_remains_locally_inspectable() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -513,6 +516,7 @@ fn run_status_with_response(response: &'static [u8]) -> Output {
     output
 }
 
+// REQ-RUNNERENROLL-44
 #[test]
 fn runner_status_maps_control_protocol_errors_through_the_protocol_outcome() {
     let output = run_status_with_response(
@@ -524,6 +528,7 @@ fn runner_status_maps_control_protocol_errors_through_the_protocol_outcome() {
     assert!(!output.stderr.is_empty());
 }
 
+// REQ-RUNNERENROLL-44
 #[test]
 fn runner_status_maps_malformed_control_responses_through_the_protocol_outcome() {
     let output = run_status_with_response(b"not-json\n");
@@ -533,6 +538,7 @@ fn runner_status_maps_malformed_control_responses_through_the_protocol_outcome()
     assert!(!output.stderr.is_empty());
 }
 
+// REQ-RUNNERENROLL-44
 #[test]
 fn runner_status_reports_absent_and_refused_sockets_as_not_reachable() {
     let directory = private_credential_directory();

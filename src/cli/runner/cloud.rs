@@ -831,6 +831,7 @@ struct PoolDeletionUnknown<'a> {
 mod tests {
     use super::*;
 
+    // REQ-RUNNERPOOL-49, REQ-RUNNERPOOL-51, REQ-RUNNERPOOL-52
     #[test]
     fn runner_show_keeps_cloud_projections_separate_from_advertised_metadata() {
         let runner: RunnerRegistration = serde_json::from_str(

@@ -450,6 +450,7 @@ exports:
     .await;
 }
 
+// REQ-WFEXEC-9
 #[tokio::test]
 async fn harness_start_failure_is_a_start_failure() {
     with_watchdog(async {

@@ -53,6 +53,7 @@ fn created_response() -> Vec<u8> {
     )
 }
 
+// REQ-ACCOUNT-16, REQ-ACCOUNT-17
 #[test]
 fn human_signup_creates_and_reports_the_account() {
     let (server, _directory, _path, credential_path) = prepared_signup(
@@ -95,6 +96,7 @@ fn human_signup_creates_and_reports_the_account() {
     );
 }
 
+// REQ-ACCOUNT-18
 #[test]
 fn structured_signup_reports_the_authenticated_principal() {
     let (server, _directory, _path, credential_path) = prepared_signup(
@@ -128,6 +130,7 @@ fn structured_signup_reports_the_authenticated_principal() {
     server.finish();
 }
 
+// REQ-ACCOUNT-18, REQ-ACCOUNT-19
 #[test]
 fn signup_reports_policy_denial_without_claiming_a_principal() {
     let response = problem_http_response(
@@ -163,6 +166,7 @@ fn signup_reports_policy_denial_without_claiming_a_principal() {
     server.finish();
 }
 
+// REQ-ACCOUNT-20
 #[test]
 fn already_provisioned_signup_directs_the_human_to_status() {
     let response = problem_http_response(

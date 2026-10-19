@@ -110,6 +110,7 @@ impl Fixture {
     }
 }
 
+// REQ-WFEXEC-23, REQ-WFEXEC-25
 #[test]
 fn materializes_every_value_kind_with_exact_canonical_layout_and_private_copies() {
     let fixture = Fixture::new(2, 16, 1024, 4096);
@@ -310,6 +311,7 @@ fn materializes_singular_root_file_as_one_scalar_value() {
     assert_eq!(manifest["inputs"]["payload"]["path"], "values/payload");
 }
 
+// REQ-WFEXEC-24
 #[test]
 fn canonical_json_bytes_are_materialized_without_reserialization() {
     let fixture = Fixture::new(1, 8, 1024, 2048);

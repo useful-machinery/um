@@ -399,6 +399,7 @@ fn same_output_contract(current: &Output, previous: &Output) -> bool {
 mod tests {
     use super::*;
 
+    // INV-ENGINE-11
     #[test]
     fn union_of_control_and_data_closures_uses_kahn_order_not_selection_order() {
         let document = super::super::decode(

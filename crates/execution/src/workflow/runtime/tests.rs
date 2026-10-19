@@ -488,6 +488,7 @@ fn finalizer_definition(
     }
 }
 
+// REQ-WFCOND-27
 #[test]
 fn disposition_conditions_observe_the_inherited_state() {
     let temporary = tempfile::tempdir().unwrap();
@@ -825,6 +826,7 @@ fn uncancelled_admitted_workflow_initializes_the_runtime_graph() {
     assert!(initialization.state.exports.is_none());
 }
 
+// REQ-WFCOND-18, REQ-WFCOND-29, REQ-WFCOND-38
 #[test]
 fn json_input_condition_false_precedes_body_readiness() {
     let temporary = tempfile::tempdir().unwrap();
@@ -901,6 +903,14 @@ steps:
 
 /// Admits an input-free workflow source with default test limits.
 fn admit_test_workflow(source: &str) -> (tempfile::TempDir, AdmittedWorkflow) {
+    admit_test_workflow_with_inputs(source, ResolvedInputs::default())
+}
+
+/// Admits a workflow source with the given inputs and default test limits.
+fn admit_test_workflow_with_inputs(
+    source: &str,
+    inputs: ResolvedInputs,
+) -> (tempfile::TempDir, AdmittedWorkflow) {
     let temporary = tempfile::tempdir().unwrap();
     let source_root = temporary.path().join("source");
     let execution_root = temporary.path().join("execution");
@@ -909,7 +919,7 @@ fn admit_test_workflow(source: &str) -> (tempfile::TempDir, AdmittedWorkflow) {
     fs::write(source_root.join("workflow.yaml"), source).unwrap();
     let admitted = admit_workflow(
         resolution::resolve(&source_root, Path::new("workflow.yaml")).unwrap(),
-        ResolvedInputs::default(),
+        inputs,
         ExecutionContext::new(
             execution_root,
             ExecutionPolicyLimits::new(
@@ -926,6 +936,7 @@ fn admit_test_workflow(source: &str) -> (tempfile::TempDir, AdmittedWorkflow) {
     (temporary, admitted)
 }
 
+// REQ-WFEXEC-1, REQ-WFEXEC-10, REQ-WFEXEC-11
 #[test]
 fn inferred_data_edges_drive_runtime_scheduling_and_blocking() {
     let (_temporary, admitted) = admit_test_workflow(
@@ -980,6 +991,7 @@ steps:
     );
 }
 
+// REQ-WFCOND-34
 #[test]
 fn failure_stop_blocks_a_conditioned_step_whose_body_input_failed() {
     let (_temporary, admitted) = admit_test_workflow(
@@ -1033,6 +1045,335 @@ steps:
     assert_eq!(
         reduction.actions,
         [finish_failed_action(5, primary_issue, ExportSet::new())]
+    );
+}
+
+fn json_request(source: &'static [u8]) -> ResolvedInputs {
+    ResolvedInputs::new(BTreeMap::from([(
+        "request".to_owned(),
+        ResolvedInput::Json(ResolvedJsonInput::from_source(Arc::from(source)).unwrap()),
+    )]))
+}
+
+fn started_step(reduction: &TestReduction, step: &str) -> Option<ActionId> {
+    reduction
+        .actions
+        .iter()
+        .find_map(|action| match &action.action {
+            Action::StartStep { step: started, .. } if started == step => Some(action.id),
+            _ => None,
+        })
+}
+
+fn ordinary_node(id: &str) -> WorkflowNode {
+    WorkflowNode {
+        id: id.to_owned(),
+        role: WorkflowNodeRole::Step,
+    }
+}
+
+// REQ-WFCOND-28, REQ-WFRECOVERY-34
+#[test]
+fn recovering_step_keeps_its_passed_condition_and_reruns_after_a_failure_stop() {
+    let (_temporary, admitted) = admit_test_workflow_with_inputs(
+        r#"schemaVersion: 1
+inputs:
+  request: {kind: json}
+steps:
+  build:
+    kind: cmd
+    condition:
+      equals:
+        - {ref: inputs.request, pointer: /go}
+        - {value: true}
+    recovery:
+      retries: 1
+      handler:
+        kind: cmd
+        command: {argv: ["true"]}
+    command: {argv: ["true"]}
+  verify:
+    kind: cmd
+    command: {argv: ["true"]}
+"#,
+        json_request(br#"{"go":true}"#),
+    );
+    let initialization = initialize::<String, String, String, TestDeadline>(&admitted, None);
+    let build = started_step(&initialization, "build").unwrap();
+    let verify = started_step(&initialization, "verify").unwrap();
+    let mut state = initialization.state;
+    assert!(state.steps["build"].condition_passed);
+    for (step, action) in [("build", build), ("verify", verify)] {
+        reduce_and_advance(
+            &mut state,
+            Occurrence::StepStarted {
+                step: step.into(),
+                action,
+            },
+        );
+    }
+    let recovering = reduce_and_advance(
+        &mut state,
+        Occurrence::StepExecutionFailed {
+            step: "build".into(),
+            action: build,
+            cause: "build failed".into(),
+        },
+    );
+    let [handler] = recovering.actions.as_slice() else {
+        panic!("the failed build did not start exactly one recovery handler");
+    };
+    assert!(matches!(
+        handler.action,
+        Action::StartRecoveryHandler { .. }
+    ));
+
+    let stopped = reduce_and_advance(
+        &mut state,
+        Occurrence::StepExecutionFailed {
+            step: "verify".into(),
+            action: verify,
+            cause: "verify failed".into(),
+        },
+    );
+    let primary_issue = failure("verify", FailurePhase::Execution, "verify failed");
+    assert_eq!(
+        state.workflow,
+        WorkflowState::Executing {
+            gate: SchedulingGate::FailureStopped {
+                primary_issue: primary_issue.clone(),
+            },
+        }
+    );
+    assert!(stopped.actions.is_empty());
+    assert_step(&state, "build", StepStateKind::Recovering);
+
+    reduce_and_advance(
+        &mut state,
+        Occurrence::RecoveryHandlerStarted {
+            step: "build".into(),
+            round: recovery_round(1),
+            action: handler.id,
+        },
+    );
+    let recheck = reduce_and_advance(
+        &mut state,
+        Occurrence::RecoveryHandlerCompleted {
+            step: "build".into(),
+            round: recovery_round(1),
+            action: handler.id,
+            decision: RecoveryDecision::recheck("repaired", "rerun the build"),
+        },
+    );
+    let [rerun] = recheck.actions.as_slice() else {
+        panic!("the recheck did not authorize exactly one rerun");
+    };
+    let Action::StartStep {
+        step,
+        execution_number,
+        ..
+    } = &rerun.action
+    else {
+        panic!("the recheck authorized a non-target action");
+    };
+    assert_eq!((step.as_str(), execution_number.get()), ("build", 2));
+    assert!(state.steps["build"].condition_passed);
+
+    reduce_and_advance(
+        &mut state,
+        Occurrence::StepStarted {
+            step: "build".into(),
+            action: rerun.id,
+        },
+    );
+    reduce_and_advance(
+        &mut state,
+        Occurrence::StepExecutionCompleted {
+            step: "build".into(),
+            action: rerun.id,
+            provisional: String::new(),
+        },
+    );
+    assert_eq!(
+        state.steps["build"].state,
+        StepState::Succeeded {
+            outputs: OutputSet::new(),
+        }
+    );
+    assert_eq!(
+        state.workflow,
+        WorkflowState::Failed {
+            primary_issue,
+            later_cancellation: None,
+        }
+    );
+}
+
+// REQ-WFCOND-31, REQ-WFCOND-33
+#[test]
+fn skipped_step_satisfies_control_but_never_supplies_its_outputs() {
+    let (_temporary, admitted) = admit_test_workflow(
+        r#"schemaVersion: 1
+steps:
+  first:
+    kind: cmd
+    command: {argv: ["true"]}
+  gate:
+    kind: cmd
+    condition:
+      disposition: {node: first, is: failed}
+    command: {argv: ["true"]}
+    outputs:
+      value: {kind: text, from: path, path: value.txt}
+  later:
+    kind: cmd
+    dependsOn: [gate]
+    command: {argv: ["true"]}
+  reader:
+    kind: cmd
+    failurePolicy: advisory
+    inputs:
+      value: {ref: outputs.gate.value}
+    command: {argv: ["true"]}
+  watcher:
+    kind: cmd
+    failurePolicy: advisory
+    condition:
+      equals:
+        - {ref: outputs.gate.value}
+        - {value: go}
+    command: {argv: ["true"]}
+"#,
+    );
+    let initialization = initialize::<String, String, String, TestDeadline>(&admitted, None);
+    let first = started_step(&initialization, "first").unwrap();
+    let mut state = initialization.state;
+    reduce_and_advance(
+        &mut state,
+        Occurrence::StepStarted {
+            step: "first".into(),
+            action: first,
+        },
+    );
+    let settled = reduce_and_advance(
+        &mut state,
+        Occurrence::StepExecutionCompleted {
+            step: "first".into(),
+            action: first,
+            provisional: String::new(),
+        },
+    );
+
+    assert_step(&state, "gate", StepStateKind::Skipped);
+    assert!(started_step(&settled, "later").is_some());
+    assert_eq!(
+        state.steps["reader"].state,
+        blocked_state([Prerequisite::body("outputs.gate.value").unwrap()])
+    );
+    assert_eq!(
+        state.steps["watcher"].state,
+        blocked_state([Prerequisite::condition("outputs.gate.value").unwrap()])
+    );
+    assert_eq!(
+        state.workflow,
+        WorkflowState::Executing {
+            gate: SchedulingGate::Open,
+        }
+    );
+}
+
+// REQ-WFCOND-33
+#[test]
+fn unavailable_condition_value_blocks_instead_of_skipping_and_fails_a_required_node() {
+    let (_temporary, admitted) = admit_test_workflow(
+        r#"schemaVersion: 1
+steps:
+  consumer:
+    kind: cmd
+    condition:
+      equals:
+        - {ref: outputs.producer.value}
+        - {value: go}
+    command: {argv: ["true"]}
+  first:
+    kind: cmd
+    command: {argv: ["true"]}
+  lint:
+    kind: cmd
+    failurePolicy: advisory
+    command: {argv: ["true"]}
+    outputs:
+      value: {kind: text, from: path, path: value.txt}
+  producer:
+    kind: cmd
+    condition:
+      disposition: {node: first, is: failed}
+    command: {argv: ["true"]}
+    outputs:
+      value: {kind: text, from: path, path: value.txt}
+  watcher:
+    kind: cmd
+    failurePolicy: advisory
+    condition:
+      equals:
+        - {ref: outputs.lint.value}
+        - {value: go}
+    command: {argv: ["true"]}
+"#,
+    );
+    let initialization = initialize::<String, String, String, TestDeadline>(&admitted, None);
+    let first = started_step(&initialization, "first").unwrap();
+    let lint = started_step(&initialization, "lint").unwrap();
+    let mut state = initialization.state;
+    reduce_and_advance(
+        &mut state,
+        Occurrence::StepStartFailed {
+            step: "lint".into(),
+            action: lint,
+            cause: "failed to start".into(),
+        },
+    );
+    assert_eq!(
+        state.steps["watcher"].state,
+        blocked_state([Prerequisite::condition("outputs.lint.value").unwrap()])
+    );
+    assert_eq!(
+        state.workflow,
+        WorkflowState::Executing {
+            gate: SchedulingGate::Open,
+        }
+    );
+
+    reduce_and_advance(
+        &mut state,
+        Occurrence::StepStarted {
+            step: "first".into(),
+            action: first,
+        },
+    );
+    reduce_and_advance(
+        &mut state,
+        Occurrence::StepExecutionCompleted {
+            step: "first".into(),
+            action: first,
+            provisional: String::new(),
+        },
+    );
+    assert_step(&state, "producer", StepStateKind::Skipped);
+    let detail =
+        BlockedDetail::new([Prerequisite::condition("outputs.producer.value").unwrap()]).unwrap();
+    assert_eq!(
+        state.steps["consumer"].state,
+        StepState::Blocked {
+            detail: detail.clone()
+        }
+    );
+    assert_eq!(
+        state.workflow,
+        WorkflowState::Failed {
+            primary_issue: PrimaryIssue::blocked(ordinary_node("consumer"), detail),
+            later_cancellation: None,
+        }
     );
 }
 
@@ -1110,6 +1451,7 @@ fn initial_cancellation_finishes_without_authorizing_a_start() {
     );
 }
 
+// REQ-WFEXEC-45, REQ-WFEXEC-46
 #[test]
 fn runtime_cancellation_cancels_each_active_action_and_waits_for_quiescence() {
     let initialization = initialize_test(definition(
@@ -1376,6 +1718,7 @@ fn empty_dag_finishes_during_initialization() {
     assert_eq!(reduction.actions, [finish_action(1, BTreeMap::new())]);
 }
 
+// REQ-WFEXEC-1
 #[test]
 fn serial_steps_follow_every_success_state_and_identifier() {
     let initialization =
@@ -1495,6 +1838,7 @@ fn serial_steps_follow_every_success_state_and_identifier() {
     assert_eq!(state.exports, Some(ExportSet::new()));
 }
 
+// REQ-WFEXEC-1
 #[test]
 fn branching_dependents_wait_for_the_producers_committed_outputs() {
     let initialization = initialize_test(definition(
@@ -1607,6 +1951,8 @@ fn branching_dependents_wait_for_the_producers_committed_outputs() {
     );
 }
 
+// REQ-WFEXEC-3, REQ-WFEXEC-4
+// INV-ENGINE-2
 #[test]
 fn ready_selection_is_lexical_and_respects_parallelism() {
     let initialization = initialize_test(definition(
@@ -1732,6 +2078,7 @@ fn successful_exports_are_committed_to_state_and_the_only_finish_action() {
     assert_noop(&state, &late_cancellation);
 }
 
+// INV-ENGINE-1
 #[test]
 fn duplicate_and_stale_success_occurrences_are_noops() {
     let initialization = initialize_test(definition(&[("producer", &[], &["result"])], &[], 1));
@@ -1836,6 +2183,8 @@ fn duplicate_and_stale_success_occurrences_are_noops() {
     assert_noop(&terminal_state, &duplicate_capture);
 }
 
+// REQ-WFEXEC-17
+// INV-ENGINE-4
 #[test]
 fn failure_first_remains_failed_when_later_cancellation_stops_a_sibling() {
     let initialization = initialize_test(definition(
@@ -2019,6 +2368,8 @@ fn failure_first_remains_failed_when_later_cancellation_stops_a_sibling() {
     );
 }
 
+// REQ-WFEXEC-17
+// INV-ENGINE-4
 #[test]
 fn cancellation_first_makes_a_later_failure_stale() {
     let initialization = initialize_test(definition(
@@ -2115,6 +2466,74 @@ fn cancellation_first_makes_a_later_failure_stale() {
     assert_eq!(state.workflow, WorkflowState::Cancelled { reason });
 }
 
+// REQ-WFEXEC-18
+#[test]
+fn advisory_failure_before_cancellation_leaves_the_run_cancelled() {
+    let mut runtime_definition = definition(&[("build", &[], &[]), ("lint", &[], &[])], &[], 2);
+    runtime_definition
+        .steps
+        .get_mut("lint")
+        .unwrap()
+        .failure_policy = FailurePolicy::Advisory;
+    let initialization = initialize_test(runtime_definition);
+    let build = started_step(&initialization, "build").unwrap();
+    let lint = started_step(&initialization, "lint").unwrap();
+    let mut state = initialization.state;
+    for (step, action) in [("build", build), ("lint", lint)] {
+        reduce_and_advance(
+            &mut state,
+            Occurrence::StepStarted {
+                step: step.to_owned(),
+                action,
+            },
+        );
+    }
+    reduce_and_advance(
+        &mut state,
+        Occurrence::StepExecutionFailed {
+            step: "lint".to_owned(),
+            action: lint,
+            cause: "lint failed".to_owned(),
+        },
+    );
+    assert_step(&state, "lint", StepStateKind::Failed);
+
+    let reason = CancellationReason::UserRequest;
+    let cancelled = reduce_and_advance(
+        &mut state,
+        Occurrence::CancellationOperationRequested {
+            operation: CancellationOperationId::fixture(1),
+            reason,
+            deadline: deadline(9_001),
+        },
+    );
+    let [cancel] = cancelled.actions.as_slice() else {
+        panic!("cancellation did not cancel exactly the active build");
+    };
+    let finished = reduce_and_advance(
+        &mut state,
+        Occurrence::StepQuiesced {
+            step: "build".to_owned(),
+            action: cancel.id,
+        },
+    );
+
+    assert_eq!(state.workflow, WorkflowState::Cancelled { reason });
+    assert!(matches!(
+        finished.actions.as_slice(),
+        [RequestedAction {
+            action: Action::FinishRun {
+                outcome: RunOutcome::Cancelled { reason: finished_reason },
+                ..
+            },
+            ..
+        }] if *finished_reason == reason
+    ));
+    assert_step(&state, "lint", StepStateKind::Failed);
+}
+
+// REQ-WFEXEC-16
+// INV-ENGINE-4
 #[test]
 fn committed_success_survives_later_cancellation() {
     let initialization = initialize_test(definition(
@@ -2221,6 +2640,8 @@ fn committed_success_survives_later_cancellation() {
     assert_eq!(state.exports, Some(expected_exports));
 }
 
+// REQ-WFEXEC-9, REQ-WFEXEC-11
+// INV-ENGINE-3
 #[test]
 fn every_failure_phase_closes_scheduling_and_reaches_the_fixed_point() {
     for phase in [
@@ -2319,6 +2740,7 @@ fn every_failure_phase_closes_scheduling_and_reaches_the_fixed_point() {
     }
 }
 
+// REQ-WFEXEC-12
 #[test]
 fn later_active_failure_does_not_replace_the_primary_issue() {
     let initialization = initialize_test(definition(
@@ -2418,6 +2840,7 @@ fn later_active_failure_does_not_replace_the_primary_issue() {
     );
 }
 
+// REQ-WFEXEC-11, REQ-WFEXEC-16
 #[test]
 fn successful_sibling_outputs_and_export_reasons_survive_failure() {
     let initialization = initialize_test(definition(
@@ -2556,6 +2979,8 @@ fn successful_sibling_outputs_and_export_reasons_survive_failure() {
     );
 }
 
+// REQ-WFEXEC-2, REQ-WFEXEC-13, REQ-WFEXEC-15
+// INV-ENGINE-3
 #[test]
 fn advisory_failure_satisfies_control_and_keeps_the_gate_open() {
     let mut runtime_definition =
@@ -2633,6 +3058,7 @@ fn advisory_failure_satisfies_control_and_keeps_the_gate_open() {
     ));
 }
 
+// REQ-WFEXEC-2, REQ-WFEXEC-14
 #[test]
 fn advisory_failure_blocks_data_without_synthesis_and_satisfies_later_control() {
     let mut runtime_definition = definition(
@@ -2723,6 +3149,7 @@ fn advisory_failure_blocks_data_without_synthesis_and_satisfies_later_control() 
     ));
 }
 
+// REQ-WFEXEC-12, REQ-WFEXEC-13
 #[test]
 fn required_failure_remains_primary_after_an_advisory_failure() {
     let mut runtime_definition = definition(&[("lint", &[], &[]), ("test", &[], &[])], &[], 2);
@@ -2774,6 +3201,7 @@ fn required_failure_remains_primary_after_an_advisory_failure() {
     );
 }
 
+// INV-ENGINE-1
 #[test]
 fn duplicate_and_stale_failure_occurrences_are_noops() {
     let initialization = initialize_test(definition(&[("producer", &[], &["result"])], &[], 1));
@@ -2847,6 +3275,7 @@ fn duplicate_and_stale_failure_occurrences_are_noops() {
     assert_noop(&terminal, &duplicate);
 }
 
+// INV-ENGINE-1
 #[test]
 fn replaying_the_same_ordered_transcript_is_structurally_identical() {
     let transcript = || {
@@ -2932,6 +3361,8 @@ fn replaying_the_same_ordered_transcript_is_structurally_identical() {
         Some(available_exports(&[("finalReport", "d-committed")]))
     );
 }
+// REQ-WFEXEC-28, REQ-WFEXEC-33
+// INV-ENGINE-5
 #[test]
 fn trace_succeeded_trigger_and_failed_release() {
     let definition = finalizer_definition(
@@ -3007,6 +3438,7 @@ fn trace_succeeded_trigger_and_failed_release() {
     assert!(state.finalization_summary.is_some());
 }
 
+// REQ-CANCEL-29, REQ-WFFINALIZE-8
 #[test]
 fn trace_cancelled_trigger_and_successful_release() {
     let definition = finalizer_definition(
@@ -3048,6 +3480,8 @@ fn trace_cancelled_trigger_and_successful_release() {
     assert!(matches!(start.action, Action::StartStep { .. }));
 }
 
+// REQ-CANCEL-30, REQ-WFFINALIZE-13
+// INV-ENGINE-6
 #[test]
 fn trace_force_abort_during_ordinary_execution_contains_work_and_suppresses_finalizers() {
     let definition = finalizer_definition(
@@ -3232,6 +3666,7 @@ fn ordinary_force_escalation_preserves_an_earlier_graceful_reason() {
     );
 }
 
+// REQ-WFFINALIZE-12
 #[test]
 fn trace_force_abort_waits_for_owned_work_to_quiesce_and_repeated_force_abort_is_inert() {
     let definition = finalizer_definition(
@@ -3345,6 +3780,7 @@ fn trace_force_abort_waits_for_owned_work_to_quiesce_and_repeated_force_abort_is
     ));
 }
 
+// REQ-WFEXEC-31, REQ-WFEXEC-33
 #[test]
 fn trace_failed_finalizer_output_producer_blocks_consumer_without_replacing_primary() {
     let mut definition = finalizer_definition(
@@ -3420,6 +3856,7 @@ fn trace_failed_finalizer_output_producer_blocks_consumer_without_replacing_prim
     assert_eq!(primary_issue.node.id, "archive");
 }
 
+// REQ-WFEXEC-33
 #[test]
 fn trace_advisory_finalizer_failure_preserves_success() {
     let definition = finalizer_definition(
@@ -3477,6 +3914,7 @@ fn trace_advisory_finalizer_failure_preserves_success() {
     );
 }
 
+// REQ-WFFINALIZE-10, REQ-WFFINALIZE-11
 #[test]
 fn trace_fresh_finalization_cancellation_does_not_replay_ordinary_cancellation() {
     let definition = finalizer_definition(
@@ -3537,6 +3975,7 @@ fn trace_fresh_finalization_cancellation_does_not_replay_ordinary_cancellation()
     );
 }
 
+// REQ-WFFINALIZE-14
 #[test]
 fn ordinary_only_cancellation_preserves_open_finalization() {
     let definition = finalizer_definition(
@@ -3597,6 +4036,7 @@ fn ordinary_only_cancellation_preserves_open_finalization() {
     assert_eq!(state.steps["release"].state, StepState::Running);
 }
 
+// REQ-WFFINALIZE-4, REQ-WFFINALIZE-9
 #[test]
 fn initial_cancellation_rearms_finalizers_and_blocks_unavailable_ordinary_outputs() {
     let definition = finalizer_definition(
@@ -3668,6 +4108,7 @@ fn initial_cancellation_rearms_finalizers_and_blocks_unavailable_ordinary_output
     assert_noop(&state, &stale);
 }
 
+// REQ-WFEXEC-29, REQ-WFEXEC-31, REQ-WFEXEC-32
 #[test]
 fn finalizer_classification_precedes_bytewise_independent_selection() {
     let definition = finalizer_definition(
@@ -3767,6 +4208,7 @@ fn finalizer_classification_precedes_bytewise_independent_selection() {
     ));
 }
 
+// REQ-WFEXEC-7
 #[test]
 fn finalizer_ready_prefix_is_bytewise_and_uses_the_execution_parallelism_limit() {
     let definition = finalizer_definition(
@@ -3827,6 +4269,7 @@ fn finalizer_ready_prefix_is_bytewise_and_uses_the_execution_parallelism_limit()
     assert_eq!(state.steps["zeta"].state, StepState::Pending);
 }
 
+// REQ-WFFINALIZE-12
 #[test]
 fn force_abort_escalation_preserves_the_graceful_reason_and_deadline() {
     let definition = finalizer_definition(
@@ -3918,6 +4361,8 @@ fn force_abort_escalation_preserves_the_graceful_reason_and_deadline() {
     );
 }
 
+// REQ-WFEXEC-35, REQ-WFEXEC-36, REQ-WFEXEC-37
+// INV-ENGINE-5
 #[test]
 fn trace_advisory_issue_context_is_exact_sorted_and_immutable() {
     let definition = finalizer_definition(
@@ -3968,6 +4413,313 @@ fn trace_advisory_issue_context_is_exact_sorted_and_immutable() {
     assert_eq!(retained.as_ref(), bytes.as_ref());
 }
 
+// REQ-WFEXEC-30
+#[test]
+fn after_waits_for_every_predecessor_to_be_terminal_whatever_its_outcome() {
+    let (_temporary, admitted) = admit_test_workflow(
+        r#"schemaVersion: 1
+steps:
+  work:
+    kind: cmd
+    command: {argv: ["true"]}
+finalizers:
+  fBlocked:
+    kind: cmd
+    failurePolicy: advisory
+    inputs:
+      value: {ref: outputs.fFail.value}
+    command: {argv: ["true"]}
+  fFail:
+    kind: cmd
+    failurePolicy: advisory
+    command: {argv: ["true"]}
+    outputs:
+      value: {kind: text, from: path, path: value.txt}
+  fNotRun:
+    kind: cmd
+    when: [failed]
+    command: {argv: ["true"]}
+  fOk:
+    kind: cmd
+    command: {argv: ["true"]}
+  fSkipped:
+    kind: cmd
+    condition:
+      disposition: {node: work, is: failed}
+    command: {argv: ["true"]}
+  last:
+    kind: cmd
+    after: [fBlocked, fFail, fNotRun, fOk, fSkipped]
+    command: {argv: ["true"]}
+"#,
+    );
+    let initialization = initialize::<String, String, String, TestDeadline>(&admitted, None);
+    let work = started_step(&initialization, "work").unwrap();
+    let mut state = initialization.state;
+    reduce_and_advance(
+        &mut state,
+        Occurrence::StepStarted {
+            step: "work".into(),
+            action: work,
+        },
+    );
+    let boundary = reduce_and_advance(
+        &mut state,
+        Occurrence::StepExecutionCompleted {
+            step: "work".into(),
+            action: work,
+            provisional: String::new(),
+        },
+    );
+    let fail = started_step(&boundary, "fFail").unwrap();
+    let ok = started_step(&boundary, "fOk").unwrap();
+    assert_step(&state, "fNotRun", StepStateKind::NotRun);
+    assert_step(&state, "fSkipped", StepStateKind::Skipped);
+    assert_step(&state, "last", StepStateKind::Pending);
+
+    for (step, action) in [("fFail", fail), ("fOk", ok)] {
+        reduce_and_advance(
+            &mut state,
+            Occurrence::StepStarted {
+                step: step.into(),
+                action,
+            },
+        );
+    }
+    let succeeded = reduce_and_advance(
+        &mut state,
+        Occurrence::StepExecutionCompleted {
+            step: "fOk".into(),
+            action: ok,
+            provisional: String::new(),
+        },
+    );
+    assert_eq!(started_step(&succeeded, "last"), None);
+    assert_step(&state, "last", StepStateKind::Pending);
+
+    let released = reduce_and_advance(
+        &mut state,
+        Occurrence::StepExecutionFailed {
+            step: "fFail".into(),
+            action: fail,
+            cause: "advisory finalizer failed".into(),
+        },
+    );
+    assert_step(&state, "fBlocked", StepStateKind::Blocked);
+    assert_step(&state, "fFail", StepStateKind::Failed);
+    assert_step(&state, "fOk", StepStateKind::Succeeded);
+    assert!(started_step(&released, "last").is_some());
+}
+
+// REQ-WFEXEC-34
+#[test]
+fn finalizers_cannot_change_a_failed_or_cancelled_outcome() {
+    let failed_definition = finalizer_definition(
+        &[("work", FailurePolicy::Required, &[], &[], &[])],
+        &[(
+            "cleanup",
+            FailurePolicy::Required,
+            &[FinalizationTrigger::Failed],
+            &[],
+            &[],
+        )],
+        1,
+    );
+    let initialization = initialize_test(failed_definition);
+    let work = started_step(&initialization, "work").unwrap();
+    let mut state = initialization.state;
+    let boundary = reduce_and_advance(
+        &mut state,
+        Occurrence::StepStartFailed {
+            step: "work".into(),
+            action: work,
+            cause: "work failed".into(),
+        },
+    );
+    let cleanup = started_step(&boundary, "cleanup").unwrap();
+    reduce_and_advance(
+        &mut state,
+        Occurrence::StepStarted {
+            step: "cleanup".into(),
+            action: cleanup,
+        },
+    );
+    reduce_and_advance(
+        &mut state,
+        Occurrence::StepExecutionFailed {
+            step: "cleanup".into(),
+            action: cleanup,
+            cause: "cleanup failed".into(),
+        },
+    );
+    assert_step(&state, "cleanup", StepStateKind::Failed);
+    assert_eq!(
+        state.workflow,
+        WorkflowState::Failed {
+            primary_issue: failure("work", FailurePhase::Start, "work failed"),
+            later_cancellation: None,
+        }
+    );
+
+    let cancelled_definition = finalizer_definition(
+        &[("work", FailurePolicy::Required, &[], &[], &[])],
+        &[(
+            "release",
+            FailurePolicy::Required,
+            &[FinalizationTrigger::Cancelled],
+            &[],
+            &[],
+        )],
+        1,
+    );
+    let initialization = ReductionBuilder::<String, TestDeadline>::new(cancelled_definition)
+        .initially_cancelled(InitialCancellation::Graceful {
+            request: cancellation(CancellationReason::UserRequest, 10),
+            operation: None,
+        })
+        .build::<String, String>();
+    let release = started_step(&initialization, "release").unwrap();
+    let mut state = initialization.state;
+    reduce_and_advance(
+        &mut state,
+        Occurrence::StepStarted {
+            step: "release".into(),
+            action: release,
+        },
+    );
+    reduce_and_advance(
+        &mut state,
+        Occurrence::StepExecutionFailed {
+            step: "release".into(),
+            action: release,
+            cause: "release failed".into(),
+        },
+    );
+    assert_step(&state, "release", StepStateKind::Failed);
+    assert_eq!(
+        state.workflow,
+        WorkflowState::Cancelled {
+            reason: CancellationReason::UserRequest,
+        }
+    );
+}
+
+// REQ-WFFINALIZE-2
+#[test]
+fn finalization_context_bytes_are_fixed_when_the_ordinary_steps_finish() {
+    let mut definition = finalizer_definition(
+        &[("work", FailurePolicy::Required, &[], &[], &[])],
+        &[
+            (
+                "aFirst",
+                FailurePolicy::Required,
+                &[FinalizationTrigger::Succeeded],
+                &[("context", "finalization.context")],
+                &[],
+            ),
+            (
+                "bBlocked",
+                FailurePolicy::Advisory,
+                &[FinalizationTrigger::Succeeded],
+                &[
+                    ("context", "finalization.context"),
+                    ("receipt", "outputs.aFirst.receipt"),
+                ],
+                &["aFirst"],
+            ),
+            (
+                "cSecond",
+                FailurePolicy::Advisory,
+                &[FinalizationTrigger::Succeeded],
+                &[("context", "finalization.context")],
+                &[],
+            ),
+        ],
+        1,
+    );
+    definition
+        .steps
+        .get_mut("aFirst")
+        .unwrap()
+        .declared_outputs
+        .insert("receipt".into());
+    let context_input = |reduction: &TestReduction, finalizer: &str| {
+        reduction
+            .actions
+            .iter()
+            .find_map(|action| match &action.action {
+                Action::StartStep { step, inputs, .. } if step == finalizer => {
+                    match &inputs["context"] {
+                        ActionInput::FinalizationContext(bytes) => Some(bytes.to_vec()),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("{finalizer} did not start with the context"))
+    };
+    let initialization = initialize_test(definition);
+    let work = started_step(&initialization, "work").unwrap();
+    let mut state = initialization.state;
+    state.finalization_identity = Some(("run-1".into(), "attempt-1".into()));
+    reduce_and_advance(
+        &mut state,
+        Occurrence::StepStarted {
+            step: "work".into(),
+            action: work,
+        },
+    );
+    let boundary = reduce_and_advance(
+        &mut state,
+        Occurrence::StepExecutionCompleted {
+            step: "work".into(),
+            action: work,
+            provisional: String::new(),
+        },
+    );
+    let fixed = context_input(&boundary, "aFirst");
+    let first = started_step(&boundary, "aFirst").unwrap();
+    reduce_and_advance(
+        &mut state,
+        Occurrence::StepStarted {
+            step: "aFirst".into(),
+            action: first,
+        },
+    );
+    let after_failure = reduce_and_advance(
+        &mut state,
+        Occurrence::StepExecutionFailed {
+            step: "aFirst".into(),
+            action: first,
+            cause: "first failed".into(),
+        },
+    );
+    assert_step(&state, "bBlocked", StepStateKind::Blocked);
+    assert_eq!(context_input(&after_failure, "cSecond"), fixed);
+
+    let second = started_step(&after_failure, "cSecond").unwrap();
+    reduce_and_advance(
+        &mut state,
+        Occurrence::StepStarted {
+            step: "cSecond".into(),
+            action: second,
+        },
+    );
+    reduce_and_advance(
+        &mut state,
+        Occurrence::CancellationOperationRequested {
+            operation: CancellationOperationId::fixture(1),
+            reason: CancellationReason::UserRequest,
+            deadline: deadline(20),
+        },
+    );
+    assert_eq!(
+        state.finalization.as_ref().unwrap().context.as_ref(),
+        fixed.as_slice()
+    );
+}
+
+// REQ-WFFINALIZE-23
 #[test]
 fn finalizer_is_admitted_at_most_once_per_healthy_attempt() {
     let definition = finalizer_definition(
@@ -4132,6 +4884,8 @@ fn recovery_round(value: u8) -> RecoveryRoundNumber {
     RecoveryRoundNumber(value)
 }
 
+// REQ-WFRECOVERY-2, REQ-WFRECOVERY-28, REQ-WFRECOVERY-30
+// INV-ENGINE-7
 #[test]
 fn recovery_trace_handlerless_recheck_commits_only_execution_two_outputs() {
     let mut graph = definition(&[("fetch", &[], &["result"])], &[], 1);
@@ -4250,6 +5004,8 @@ fn recovery_trace_handlerless_recheck_commits_only_execution_two_outputs() {
     assert!(state.last_transition_sequence.get() <= 18);
 }
 
+// REQ-WFRECOVERY-25
+// INV-ENGINE-7
 #[test]
 fn recovery_trace_gave_up_preserves_the_target_failure_and_starts_no_recheck() {
     let mut graph = definition(&[("verify", &[], &[])], &[], 1);
@@ -4361,6 +5117,7 @@ fn recovery_trace_gave_up_preserves_the_target_failure_and_starts_no_recheck() {
     assert_eq!(ordinary_issues(&state).len(), 1);
 }
 
+// REQ-WFRECOVERY-28, REQ-WFRECOVERY-31, REQ-WFRECOVERY-32
 #[test]
 fn recovery_trace_required_exhaustion_selects_latest_failure_once() {
     let mut graph = definition(&[("compile", &[], &[])], &[], 1);
@@ -4450,6 +5207,7 @@ fn recovery_trace_required_exhaustion_selects_latest_failure_once() {
     assert_eq!(ordinary_issues(&state).len(), 1);
 }
 
+// REQ-WFRECOVERY-27, REQ-WFRECOVERY-31
 #[test]
 fn recovery_trace_advisory_exhaustion_releases_control_only_after_terminal_failure() {
     let mut graph = definition(&[("lint", &[], &[]), ("package", &["lint"], &[])], &[], 1);
@@ -4526,6 +5284,7 @@ fn recovery_trace_advisory_exhaustion_releases_control_only_after_terminal_failu
     assert_eq!(state.workflow, WorkflowState::Succeeded);
 }
 
+// REQ-WFRECOVERY-26
 #[test]
 fn recovery_trace_handler_start_failure_stops_without_retrying_the_handler() {
     let mut graph = definition(&[("verify", &[], &[])], &[], 1);
@@ -4591,6 +5350,7 @@ fn recovery_trace_handler_start_failure_stops_without_retrying_the_handler() {
     ));
 }
 
+// REQ-WFRECOVERY-32
 #[test]
 fn recovery_trace_agent_handler_execution_failure_preserves_target_precedence() {
     let mut graph = definition(&[("verify", &[], &[])], &[], 1);
@@ -4669,6 +5429,7 @@ fn recovery_trace_agent_handler_execution_failure_preserves_target_precedence() 
     ));
 }
 
+// REQ-WFRECOVERY-48
 #[test]
 fn recovery_trace_cancellation_preempts_all_five_active_phases() {
     #[derive(Clone, Copy)]
@@ -4875,6 +5636,8 @@ fn recovery_trace_cancellation_preempts_all_five_active_phases() {
     }
 }
 
+// REQ-WFRECOVERY-6, REQ-WFRECOVERY-24, REQ-WFRECOVERY-33, REQ-OUTPUTS-15
+// INV-ENGINE-5, INV-ENGINE-7
 #[test]
 fn recovery_trace_output_capture_failure_only_authorizes_a_full_target_rerun() {
     let mut graph = finalizer_definition(

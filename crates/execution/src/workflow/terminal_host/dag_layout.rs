@@ -416,6 +416,7 @@ mod tests {
         &layout.rows[index].below_node
     }
 
+    // REQ-LOCALRUN-17
     #[test]
     fn chains_and_independent_roots_keep_quiet_lanes() {
         let chain = layout(&[("a", &[]), ("b", &["a"]), ("c", &["b"])]);
@@ -437,6 +438,7 @@ mod tests {
         assert_eq!(node_row(&independent, 2), "●  ");
     }
 
+    // REQ-LOCALRUN-17
     #[test]
     fn transitively_redundant_edges_do_not_open_lanes() {
         let layout = layout(&[
@@ -477,6 +479,7 @@ mod tests {
         assert_eq!(node_row(&layout, 3), "    ●");
     }
 
+    // REQ-LOCALRUN-17
     #[test]
     fn fan_in_and_diamond_close_into_the_dependent_lane() {
         let fan_in = layout(&[("left", &[]), ("right", &[]), ("join", &["right", "left"])]);
@@ -498,6 +501,7 @@ mod tests {
         assert_eq!(node_row(&diamond, 3), "●─┘");
     }
 
+    // REQ-LOCALRUN-17
     #[test]
     fn excess_fan_out_collapses_into_an_explicit_bounded_lane() {
         let layout = layout(&[

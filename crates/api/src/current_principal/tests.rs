@@ -229,6 +229,7 @@ fn malformed_unauthorized_response_still_marks_the_credential_rejected() {
     server.finish_one();
 }
 
+// INV-CLI-9
 #[test]
 fn redirect_is_returned_as_a_protocol_failure_without_being_followed() {
     let response = b"HTTP/1.1 302 Found\r\nConnection: close\r\nLocation: http://127.0.0.1:1/escaped\r\nContent-Length: 0\r\n\r\n".to_vec();
@@ -241,6 +242,7 @@ fn redirect_is_returned_as_a_protocol_failure_without_being_followed() {
     server.finish_one();
 }
 
+// INV-CLI-9
 #[test]
 fn response_body_is_bounded_before_any_status_is_reported() {
     let body = vec![b'x'; MAX_RESPONSE_BODY_BYTES + 1];
@@ -281,6 +283,7 @@ fn request_deadline_maps_to_timeout() {
     server.finish_one();
 }
 
+// INV-CLI-9
 #[test]
 fn request_deadline_bounds_the_complete_streaming_response() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();

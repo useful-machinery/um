@@ -113,6 +113,7 @@ mod tests {
     use super::*;
     use um_execution::ClaudeCodeIncompatibility;
 
+    // REQ-RUNNERENROLL-32
     #[test]
     fn startup_retains_each_available_harness_snapshot_independently() {
         for (pi_available, claude_code_available, codex_available) in [
@@ -182,12 +183,14 @@ mod tests {
         }
     }
 
+    // REQ-RUNNERENROLL-38
     #[test]
     fn recovery_requirement_selects_the_supervisor_stopping_exit_code() {
         assert_eq!(service_exit_code(true), ExitCode::RunnerRecoveryRequired);
         assert_eq!(service_exit_code(false), ExitCode::GeneralFailure);
     }
 
+    // REQ-RUNNERENROLL-32
     #[test]
     fn incompatible_claude_code_and_missing_codex_do_not_remove_compatible_pi() {
         let pi = ValidatedPiInstallation::fixture(PathBuf::from("/validated/pi"));

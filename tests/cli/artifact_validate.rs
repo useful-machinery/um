@@ -253,6 +253,7 @@ fn diagnostic_codes(report: &Value) -> Vec<&str> {
         .collect()
 }
 
+// REQ-ARTIFACTSET-26
 #[test]
 fn missing_artifact_directory_is_operational_for_humans_and_structured_for_json() {
     let temporary = tempfile::tempdir().unwrap();
@@ -275,6 +276,7 @@ fn missing_artifact_directory_is_operational_for_humans_and_structured_for_json(
     );
 }
 
+// REQ-ARTIFACTSET-1, REQ-ARTIFACTSET-2, REQ-ARTIFACTSET-3, REQ-ARTIFACTSET-8, REQ-ARTIFACTSET-12, REQ-ARTIFACTSET-13, REQ-ARTIFACTSET-21, REQ-ARTIFACTSET-24, REQ-ARTIFACTSET-25
 #[test]
 fn copied_local_profile_set_validates_in_human_and_json_modes_without_mutation() {
     let artifact = ArtifactSet::valid();
@@ -311,6 +313,7 @@ fn copied_local_profile_set_validates_in_human_and_json_modes_without_mutation()
     assert_eq!(byte_snapshot(&artifact.root), before);
 }
 
+// REQ-ARTIFACTSET-13, REQ-ARTIFACTSET-16
 #[test]
 fn finalization_summary_is_validated_without_mutating_portable_artifact() {
     let artifact = ArtifactSet::valid();
@@ -353,6 +356,7 @@ fn finalization_summary_is_validated_without_mutating_portable_artifact() {
     assert!(diagnostic_codes(&report).contains(&"result_schema_invalid"));
 }
 
+// REQ-ARTIFACTSET-16
 #[test]
 fn finalization_cancellation_reason_must_match_cancelled_finalizers() {
     let artifact = ArtifactSet::valid();
@@ -389,6 +393,7 @@ fn finalization_cancellation_reason_must_match_cancelled_finalizers() {
     assert!(diagnostic_codes(&report).contains(&"result_schema_invalid"));
 }
 
+// REQ-ARTIFACTSET-16
 #[test]
 fn cancelled_outcome_rejects_required_finalization_issues() {
     let artifact = ArtifactSet::valid();
@@ -435,6 +440,7 @@ fn cancelled_outcome_rejects_required_finalization_issues() {
     assert!(diagnostic_codes(&report).contains(&"result_schema_invalid"));
 }
 
+// REQ-ARTIFACTSET-1, REQ-ARTIFACTSET-9
 #[test]
 fn cloud_metadata_only_and_carrier_bearing_sets_validate() {
     let carrier_bearing = ArtifactSet::valid();
@@ -463,6 +469,7 @@ fn cloud_metadata_only_and_carrier_bearing_sets_validate() {
     }
 }
 
+// REQ-ARTIFACTSET-21, REQ-ARTIFACTSET-23
 #[test]
 fn missing_carrier_remedy_names_the_resolved_path() {
     let artifact = ArtifactSet::valid();
@@ -480,6 +487,7 @@ fn missing_carrier_remedy_names_the_resolved_path() {
     assert!(output.stderr.is_empty());
 }
 
+// REQ-ARTIFACTSET-2, REQ-ARTIFACTSET-14, REQ-ARTIFACTSET-17, REQ-ARTIFACTSET-18, REQ-ARTIFACTSET-19, REQ-ARTIFACTSET-24
 #[test]
 fn corruption_is_reported_completely_in_normative_order() {
     let artifact = ArtifactSet::valid();
@@ -513,6 +521,7 @@ fn corruption_is_reported_completely_in_normative_order() {
     assert!(output.stderr.is_empty());
 }
 
+// REQ-ARTIFACTSET-4, REQ-ARTIFACTSET-5
 #[test]
 fn alias_and_current_kind_content_failures_are_reported_together() {
     let artifact = ArtifactSet::valid();
@@ -548,6 +557,7 @@ fn alias_and_current_kind_content_failures_are_reported_together() {
     assert!(output.stderr.is_empty());
 }
 
+// REQ-ARTIFACTSET-15
 #[test]
 fn carrier_symlinks_and_unsafe_metadata_paths_are_never_followed() {
     let linked = ArtifactSet::valid();
@@ -581,6 +591,7 @@ fn carrier_symlinks_and_unsafe_metadata_paths_are_never_followed() {
     assert_eq!(fs::read(outside).unwrap(), b"outside bytes");
 }
 
+// REQ-ARTIFACTSET-27
 #[test]
 fn unsupported_artifact_kinds_and_usage_errors_are_closed() {
     let artifact = ArtifactSet::valid();
@@ -612,6 +623,7 @@ fn unsupported_artifact_kinds_and_usage_errors_are_closed() {
     }
 }
 
+// REQ-ARTIFACTSET-16
 #[test]
 fn successful_command_without_required_output_metadata_is_rejected() {
     let artifact = ArtifactSet::valid();
@@ -627,6 +639,7 @@ fn successful_command_without_required_output_metadata_is_rejected() {
     assert!(diagnostic_codes(&report).contains(&"result_schema_invalid"));
 }
 
+// REQ-ARTIFACTSET-16
 #[test]
 fn contradictory_workflow_outcome_and_step_state_is_rejected() {
     let artifact = ArtifactSet::valid();
@@ -646,6 +659,7 @@ fn contradictory_workflow_outcome_and_step_state_is_rejected() {
     assert!(diagnostic_codes(&report).contains(&"result_schema_invalid"));
 }
 
+// REQ-ARTIFACTSET-5
 #[test]
 fn canonical_json_with_a_large_rfc_8259_number_is_valid() {
     let artifact = ArtifactSet::valid();
@@ -665,6 +679,7 @@ fn canonical_json_with_a_large_rfc_8259_number_is_valid() {
     );
 }
 
+// REQ-ARTIFACTSET-5
 #[test]
 fn canonical_json_at_the_nesting_limit_is_valid() {
     let artifact = ArtifactSet::valid();
@@ -685,6 +700,7 @@ fn canonical_json_at_the_nesting_limit_is_valid() {
     );
 }
 
+// REQ-ARTIFACTSET-17
 #[test]
 fn malformed_export_does_not_hide_its_usable_carrier_reference() {
     let artifact = ArtifactSet::valid();
@@ -717,6 +733,7 @@ fn malformed_export_does_not_hide_its_usable_carrier_reference() {
     assert!(diagnostic_codes(&report).contains(&"carrier_digest_mismatch"));
 }
 
+// REQ-ARTIFACTSET-20
 #[test]
 fn malformed_unresolved_reference_delta_is_rejected() {
     let artifact = ArtifactSet::valid();
@@ -753,6 +770,7 @@ fn malformed_unresolved_reference_delta_is_rejected() {
     assert!(diagnostic_codes(&report).contains(&"git_pack_invalid"));
 }
 
+// REQ-ARTIFACTSET-20
 #[test]
 fn unresolved_delta_chain_over_the_profile_limit_is_rejected() {
     let artifact = ArtifactSet::valid();
@@ -792,6 +810,7 @@ fn unresolved_delta_chain_over_the_profile_limit_is_rejected() {
     );
 }
 
+// REQ-ARTIFACTSET-6, REQ-ARTIFACTSET-17
 #[test]
 fn zero_delta_carrier_diagnostic_does_not_hide_other_shape_errors() {
     let artifact = ArtifactSet::valid();
@@ -827,6 +846,7 @@ fn zero_delta_carrier_diagnostic_does_not_hide_other_shape_errors() {
     assert!(codes.contains(&"git_zero_delta_invalid"));
 }
 
+// REQ-ARTIFACTSET-18
 #[cfg(target_os = "linux")]
 #[test]
 fn duplicate_code_and_location_diagnostics_are_deduplicated() {
@@ -862,6 +882,7 @@ fn duplicate_code_and_location_diagnostics_are_deduplicated() {
     );
 }
 
+// REQ-ARTIFACTSET-10, REQ-ARTIFACTSET-17
 #[test]
 fn export_limit_does_not_skip_later_authoritative_references() {
     let artifact = ArtifactSet::valid();
@@ -911,6 +932,7 @@ fn export_limit_does_not_skip_later_authoritative_references() {
     );
 }
 
+// REQ-ARTIFACTSET-10, REQ-ARTIFACTSET-17
 #[test]
 fn carrier_limit_does_not_skip_later_authoritative_references() {
     let artifact = ArtifactSet::valid();
@@ -950,4 +972,204 @@ fn carrier_limit_does_not_skip_later_authoritative_references() {
                     && diagnostic["location"]["path"] == "exports/4097"
             })
     );
+}
+
+fn extend_sparse(path: &Path, size: u64) {
+    fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .unwrap()
+        .set_len(size)
+        .unwrap();
+}
+
+fn validate_json(artifact: &ArtifactSet) -> (Option<i32>, Value) {
+    let output = run(&["artifact", "validate", "--json", artifact.argument()]);
+    (
+        output.status.code(),
+        serde_json::from_slice(&output.stdout).unwrap(),
+    )
+}
+
+// REQ-ARTIFACTSET-11
+#[test]
+fn result_and_single_carrier_byte_limits_make_the_set_invalid() {
+    const GIB: u64 = 1024 * 1024 * 1024;
+
+    let oversized_result = ArtifactSet::valid();
+    extend_sparse(&oversized_result.root.join("result.json"), 1_127_929_177);
+    let (status, report) = validate_json(&oversized_result);
+    assert_eq!(status, Some(1));
+    assert_eq!(diagnostic_codes(&report)[0], "result_limit_exceeded");
+
+    let oversized_carrier = ArtifactSet::valid();
+    extend_sparse(&oversized_carrier.root.join("exports/0003"), GIB + 1);
+    let (status, report) = validate_json(&oversized_carrier);
+    assert_eq!(status, Some(1));
+    assert!(
+        report["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(
+                |diagnostic| diagnostic["code"] == "carrier_size_limit_exceeded"
+                    && diagnostic["location"]["path"] == "exports/0003"
+            ),
+        "{report}"
+    );
+    assert!(!diagnostic_codes(&report).contains(&"carrier_total_size_limit_exceeded"));
+}
+
+// REQ-ARTIFACTSET-11
+#[test]
+fn distinct_carriers_together_hold_at_most_four_gibibytes() {
+    const GIB: u64 = 1024 * 1024 * 1024;
+    let artifact = ArtifactSet::valid();
+    let exports_directory = artifact.root.join("exports");
+    for entry in fs::read_dir(&exports_directory).unwrap() {
+        fs::remove_file(entry.unwrap().path()).unwrap();
+    }
+    let mut exports = serde_json::Map::new();
+    for ordinal in 1..=5 {
+        let path = format!("exports/{ordinal:04}");
+        fs::write(artifact.root.join(&path), b"x").unwrap();
+        if ordinal <= 4 {
+            // Four carriers exactly at the single-carrier limit reach the set limit.
+            extend_sparse(&artifact.root.join(&path), GIB);
+        }
+        exports.insert(
+            format!("export{ordinal}"),
+            available_export("file", "application/octet-stream", &path, b"x"),
+        );
+    }
+    let mut result = artifact.result();
+    result["exports"] = Value::Object(exports);
+    artifact.replace_result(&result);
+
+    let (status, report) = validate_json(&artifact);
+
+    assert_eq!(status, Some(1));
+    let codes = diagnostic_codes(&report);
+    assert!(!codes.contains(&"carrier_size_limit_exceeded"), "{report}");
+    assert!(
+        report["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(
+                |diagnostic| diagnostic["code"] == "carrier_total_size_limit_exceeded"
+                    && diagnostic["location"]["path"] == "exports/0005"
+            ),
+        "{report}"
+    );
+}
+
+// REQ-ARTIFACTSET-22
+#[test]
+fn human_output_escapes_hostile_directory_and_location_names() {
+    let artifact = ArtifactSet::valid();
+    let hostile_root = artifact
+        .root
+        .with_file_name("set\u{1b}[31m\u{202e}\nforged: line");
+    fs::rename(&artifact.root, &hostile_root).unwrap();
+    let hostile_argument = hostile_root.to_str().unwrap();
+    let forbidden = ['\u{1b}', '\u{202e}', '\u{7}'];
+
+    let valid = run(&["artifact", "validate", hostile_argument]);
+    assert!(valid.status.success());
+    let stdout = String::from_utf8(valid.stdout).unwrap();
+    assert!(!stdout.contains(forbidden), "{stdout:?}");
+    assert_eq!(
+        stdout
+            .lines()
+            .filter(|line| line.starts_with("directory: "))
+            .count(),
+        1
+    );
+    assert!(
+        !stdout.lines().any(|line| line.starts_with("forged")),
+        "{stdout:?}"
+    );
+
+    fs::write(
+        hostile_root.join("extra\u{1b}]0;title\u{7}\nlocation: forged"),
+        b"unexpected",
+    )
+    .unwrap();
+    let invalid = run(&["artifact", "validate", hostile_argument]);
+    assert_eq!(invalid.status.code(), Some(1));
+    let stdout = String::from_utf8(invalid.stdout).unwrap();
+    assert!(!stdout.contains(forbidden), "{stdout:?}");
+    let codes = stdout
+        .lines()
+        .filter(|line| line.starts_with("code: "))
+        .count();
+    let locations = stdout
+        .lines()
+        .filter(|line| line.starts_with("location: "))
+        .count();
+    assert_eq!(codes, 1, "{stdout:?}");
+    assert_eq!(locations, codes, "{stdout:?}");
+    assert!(
+        !stdout.lines().any(|line| line == "location: forged"),
+        "{stdout:?}"
+    );
+}
+
+// REQ-ARTIFACTSET-28
+#[test]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "real time is allowed only as an anti-hang watchdog, not a behavior assertion"
+)]
+fn interruption_during_output_exits_with_the_signal_status_and_no_result() {
+    let artifact = ArtifactSet::valid();
+    for ordinal in 0..4_000 {
+        fs::write(artifact.root.join(format!("unexpected-{ordinal:04}")), b"x").unwrap();
+    }
+    let before = byte_snapshot(&artifact.root);
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_um"))
+        .args(["artifact", "validate", "--json", artifact.argument()])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdout = child.stdout.take().unwrap();
+    // Validation has finished once output starts; the unread pipe then stalls the result.
+    let mut first = [0_u8; 1];
+    std::io::Read::read_exact(&mut stdout, &mut first).unwrap();
+    rustix::process::kill_process(
+        rustix::process::Pid::from_child(&child),
+        rustix::process::Signal::INT,
+    )
+    .unwrap();
+    // Wait for the exit before draining the pipe: reading first would let the writer finish
+    // the document while the interruption is still being enacted, which is the race this
+    // test exists to exclude. The process exits with the pipe still full, so the wait cannot
+    // deadlock; the channel timeout is only an anti-hang watchdog.
+    let stderr = child.stderr.take().unwrap();
+    let (exited, exit) = std::sync::mpsc::channel();
+    let waiter = std::thread::spawn(move || {
+        let status = child.wait();
+        exited.send(()).ok();
+        status
+    });
+    assert!(
+        exit.recv_timeout(std::time::Duration::from_secs(30))
+            .is_ok(),
+        "interrupted validation did not exit while its output pipe was unread"
+    );
+    let status = waiter.join().unwrap().unwrap();
+    let mut printed = first.to_vec();
+    std::io::Read::read_to_end(&mut stdout, &mut printed).unwrap();
+    drop(stderr);
+
+    assert_eq!(status.code(), Some(130));
+    assert!(
+        serde_json::from_slice::<Value>(&printed).is_err(),
+        "printed a complete result of {} bytes",
+        printed.len()
+    );
+    assert_eq!(byte_snapshot(&artifact.root), before);
 }

@@ -507,6 +507,7 @@ async fn sixty_second_lease_grace_allows_clean_exit_after_thirty_seconds() {
     assert!(!supervised.guards.forced_containment_started());
 }
 
+// REQ-RUNNERENROLL-73
 #[tokio::test]
 async fn runner_shutdown_is_retained_separately_from_sticky_user_cancellation() {
     let (lease_clock, _control, _waits) = controlled_lease_clock();

@@ -248,6 +248,7 @@ fn violations(root: &Command) -> BTreeSet<String> {
     failures
 }
 
+// REQ-DELEGATION-14
 #[test]
 fn cli_grammar_conforms() {
     let mut root = Cli::command();
@@ -344,6 +345,8 @@ fn entity_identifier_flags_match_the_command_tree_and_parser() {
     }
 }
 
+// REQ-ACCOUNT-61
+// REQ-SERVICEPRINCIPAL-20
 #[test]
 fn destructive_leaves_require_confirmation_but_runner_modes_do_not() {
     let gated: &[&[&str]] = &[

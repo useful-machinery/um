@@ -42,6 +42,7 @@ fn run(leaf: &[&str], server: &ScriptedServer, credentials: &str) -> Output {
     run_project(&args(leaf), server, credentials)
 }
 
+// REQ-WEBHOOK-73
 #[test]
 fn webhook_preserves_gateway_valid_raw_url_bytes() {
     for url in [
@@ -84,6 +85,7 @@ fn webhook_preserves_gateway_valid_raw_url_bytes() {
     }
 }
 
+// REQ-WEBHOOK-71, REQ-WEBHOOK-75, REQ-WEBHOOK-77
 #[test]
 fn webhook_owner_leaves_use_exact_paths_statuses_and_nonsecret_inspection() {
     let paths: &[(&[&str], &str, &str, bool)] = &[
@@ -217,6 +219,7 @@ fn prepared_server(server: ScriptedServer) -> (ScriptedServer, tempfile::TempDir
     write_credential_fixture(&path, &server.api_url, TOKEN, "2999-01-01T00:00:00Z");
     (server, dir, path.to_str().unwrap().to_owned())
 }
+// REQ-WEBHOOK-72, REQ-WEBHOOK-76, REQ-WEBHOOK-78
 #[test]
 fn webhook_create_update_and_filtered_pages_preserve_selection() {
     let input = private_credential_directory();
@@ -337,6 +340,7 @@ fn webhook_create_update_and_filtered_pages_preserve_selection() {
         }
     }
 }
+// REQ-WEBHOOK-80, REQ-WEBHOOK-81
 #[test]
 fn webhook_rejects_mismatched_and_malformed_delivery_responses() {
     let mut cases = Vec::new();
@@ -418,6 +422,7 @@ fn webhook_rejects_mismatched_and_malformed_delivery_responses() {
     assert_eq!(server.finish().len(), 1);
 }
 
+// REQ-WEBHOOK-72, REQ-WEBHOOK-74
 #[test]
 fn webhook_config_standard_input_and_service_actor_are_independent() {
     let source = br#"{"url":"https://receiver.example.com/hook","eventTypes":["run.failed"],"contextKeys":[]}"#;
@@ -453,6 +458,7 @@ fn webhook_config_standard_input_and_service_actor_are_independent() {
     assert!(_server.finish().is_empty());
 }
 
+// REQ-WEBHOOK-73, REQ-WEBHOOK-75
 #[test]
 fn webhook_invalid_config_and_stdin_contention_make_no_requests() {
     let server = ScriptedServer::respond(vec![]);

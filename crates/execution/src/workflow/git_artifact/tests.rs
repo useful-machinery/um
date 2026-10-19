@@ -477,6 +477,7 @@ fn real_git_bundle_round_trips_through_the_portable_parser() {
     assert_eq!(fixture.validate(&fixture.bytes), Ok(()));
 }
 
+// REQ-ARTIFACTSET-7
 #[test]
 fn bundle_profiles_preserve_legacy_and_bind_um_ref_to_v3() {
     let contract: serde_json::Value = serde_json::from_str(include_str!(

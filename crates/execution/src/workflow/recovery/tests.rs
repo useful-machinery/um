@@ -31,6 +31,7 @@ fn recovery_tmpdir_fixture() {
     assert!(staging.inner.path.starts_with(&root));
 }
 
+// REQ-WFRECOVERY-8
 #[test]
 fn recovery_staging_uses_tmpdir() {
     let root = tempfile::tempdir().unwrap();
@@ -52,6 +53,7 @@ fn valid_decision() -> Vec<u8> {
         .to_vec()
 }
 
+// REQ-WFRECOVERY-22, REQ-WFRECOVERY-23, REQ-WFRECOVERY-60
 #[test]
 fn decision_parser_rejects_each_closed_contract_failure_separately() {
     let overlong_summary = "s".repeat(MAXIMUM_RECOVERY_DECISION_TEXT_CODE_POINTS + 1);
@@ -125,6 +127,7 @@ fn decision_parser_rejects_each_closed_contract_failure_separately() {
     );
 }
 
+// REQ-WFRECOVERY-22
 #[test]
 fn decision_schema_and_parser_accept_three_thousand_non_ascii_code_points() {
     let summary = "é".repeat(3_000);
@@ -144,6 +147,7 @@ fn decision_schema_and_parser_accept_three_thousand_non_ascii_code_points() {
     );
 }
 
+// REQ-WFRECOVERY-19, REQ-WFRECOVERY-20, REQ-WFRECOVERY-21
 #[test]
 fn context_schema_one_materializes_every_required_current_and_prior_round_fact() {
     let temporary = tempfile::tempdir().unwrap();
@@ -280,6 +284,7 @@ fn context_schema_one_materializes_every_required_current_and_prior_round_fact()
     );
 }
 
+// REQ-WFRECOVERY-20
 #[test]
 fn lossy_projection_classifies_agent_adapter_start_failure_without_internal_detail() {
     let cause = project_cause(
@@ -387,6 +392,7 @@ fn result_staging() -> (tempfile::TempDir, RecoveryInvocationStaging) {
     )
 }
 
+// REQ-WFRECOVERY-10
 #[test]
 fn descriptor_bound_result_reader_rejects_missing_symlink_nonregular_and_oversized() {
     let (_temporary, staging) = result_staging();

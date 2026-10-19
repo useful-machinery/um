@@ -297,6 +297,7 @@ mod tests {
         AssignmentConfig::new(&work).unwrap()
     }
 
+    // REQ-RUNNERENROLL-30, REQ-RUNNERENROLL-31
     #[test]
     fn permits_wss_and_explicit_loopback_ws_only() {
         let temporary = tempfile::tempdir().unwrap();
@@ -344,6 +345,7 @@ mod tests {
         );
     }
 
+    // REQ-RUNNERENROLL-30
     #[test]
     fn requires_an_existing_work_root() {
         let temporary = tempfile::tempdir().unwrap();

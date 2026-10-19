@@ -651,6 +651,7 @@ pub(super) fn write_run_continuation(out: &mut impl Write, run: &Run) -> anyhow:
 mod tests {
     use super::*;
 
+    // REQ-CONTINUE-55
     #[test]
     fn human_continuation_reads_retained_recovery_without_inventing_legacy_identity() {
         let mut value: serde_json::Value = serde_json::from_str(include_str!(

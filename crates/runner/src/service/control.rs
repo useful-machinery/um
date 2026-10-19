@@ -542,6 +542,7 @@ mod tests {
         response
     }
 
+    // REQ-RUNNERENROLL-33, REQ-RUNNERENROLL-34
     #[tokio::test]
     async fn lifecycle_rejects_hostile_paths_and_recovers_an_owned_stale_socket() {
         let root = tempfile::tempdir_in("/tmp").unwrap();
@@ -579,6 +580,7 @@ mod tests {
         );
     }
 
+    // REQ-RUNNERENROLL-63
     #[tokio::test]
     async fn serves_a_bounded_secret_free_idle_snapshot() {
         let response = exchange(b"{\"schemaVersion\":1,\"operation\":\"status\"}\n").await;
@@ -608,6 +610,7 @@ mod tests {
         assert_eq!(ControlTimeouts::production().io, Duration::from_secs(2));
     }
 
+    // REQ-RUNNERENROLL-43
     #[test]
     fn reconnecting_retains_the_last_closed_failure_category() {
         let status = LiveStatus::new(
@@ -625,6 +628,7 @@ mod tests {
         );
     }
 
+    // REQ-RUNNERENROLL-63
     #[tokio::test]
     async fn contains_malformed_and_oversized_requests() {
         for request in [
@@ -644,6 +648,7 @@ mod tests {
         }
     }
 
+    // REQ-RUNNERENROLL-33
     #[test]
     fn runtime_directory_must_be_private_and_owned() {
         let root = tempfile::tempdir().unwrap();

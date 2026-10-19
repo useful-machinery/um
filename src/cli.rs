@@ -2303,6 +2303,7 @@ mod tests {
         );
     }
 
+    // REQ-SERVICEPRINCIPAL-1, REQ-SERVICEPRINCIPAL-23, REQ-SERVICEPRINCIPAL-24
     #[test]
     fn service_authentication_is_explicit_and_human_only_leaves_reject_it() {
         assert!(

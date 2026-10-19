@@ -120,6 +120,7 @@ pub(crate) fn serialize(context: FinalizationContext<'_>) -> Arc<[u8]> {
 mod tests {
     use super::*;
 
+    // REQ-WFFINALIZE-5
     #[test]
     fn classified_runner_diagnostic_is_projected_without_raw_cause() {
         use super::super::agent::{
@@ -160,6 +161,8 @@ mod tests {
         assert!(!String::from_utf8_lossy(&bytes).contains("rate_limit_error"));
     }
 
+    // REQ-WFEXEC-35, REQ-WFEXEC-36
+    // INV-ENGINE-5
     #[test]
     fn dedicated_serializer_preserves_the_context_abi_order() {
         use super::super::evidence::{BlockedCode, FailureCode, FailureDetail, FailurePhase};

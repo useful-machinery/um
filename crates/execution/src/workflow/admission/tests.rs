@@ -561,6 +561,7 @@ fn admission_rejects_capacity_reused_after_source_closure_changes() {
     );
 }
 
+// REQ-WFRECOVERY-15
 #[test]
 fn admission_rejects_recovery_placement_capacity_and_binding_before_execution() {
     let fixture = WorkflowFixture::new(RECOVERY_AGENT_WORKFLOW);
@@ -657,6 +658,7 @@ fn admission_rejects_recovery_placement_capacity_and_binding_before_execution() 
     );
 }
 
+// REQ-AGENT-14
 #[test]
 fn admission_pins_every_pi_configuration_and_bound_without_native_or_mutable_lookups() {
     let source = all_thinking_levels_workflow();
@@ -834,6 +836,7 @@ fn internal_claude_admission_retains_native_effort_and_profile_limits() {
     );
 }
 
+// REQ-AGENT-14
 #[test]
 fn codex_admission_preserves_the_exact_installation_configuration_and_limits() {
     let fixture = WorkflowFixture::new(AGENT_WORKFLOW);
@@ -1283,6 +1286,7 @@ fn admission_rejects_invalid_execution_limits_and_out_of_bounds_cancellation_pol
     );
 }
 
+// REQ-WFFORMAT-31
 #[test]
 fn admission_rejects_missing_required_input_and_unsupported_agent_steps_at_typed_locations() {
     let missing_inputs = WorkflowFixture::new(COMMAND_WORKFLOW);
@@ -1323,6 +1327,7 @@ fn admission_rejects_missing_required_input_and_unsupported_agent_steps_at_typed
     );
 }
 
+// REQ-WFFORMAT-31
 #[test]
 fn admission_rejects_wrong_and_extra_named_input_bindings() {
     let fixture = WorkflowFixture::new(COMMAND_WORKFLOW);
@@ -1441,6 +1446,7 @@ fn json_input_admission_preserves_null_and_applies_the_retained_schema() {
     );
 }
 
+// REQ-LOCALRUN-167
 #[test]
 fn file_input_admission_preserves_exact_media_type_without_sniffing_for_local_and_runner() {
     let constrained = WorkflowFixture::new(
@@ -1515,6 +1521,7 @@ fn file_input_admission_preserves_exact_media_type_without_sniffing_for_local_an
     );
 }
 
+// REQ-LOCALRUN-167
 #[test]
 fn admission_rejects_invalid_attachment_media_type() {
     let fixture = WorkflowFixture::new(COMMAND_WORKFLOW);
@@ -1562,6 +1569,7 @@ fn managed_runner_environment_removes_git_trace_redaction_overrides() {
     );
 }
 
+// REQ-WFEXEC-22
 #[test]
 fn cloud_source_revision_replaces_inherited_reserved_values_while_local_has_none() {
     let fixture = WorkflowFixture::new(COMMAND_WORKFLOW);
@@ -1626,6 +1634,7 @@ fn cloud_source_revision_replaces_inherited_reserved_values_while_local_has_none
     );
 }
 
+// REQ-WFFORMAT-33
 #[test]
 fn workflow_admission_only_forwards_base_and_explicit_safe_names() {
     let environment = EnvironmentSnapshot::new([
@@ -1707,4 +1716,41 @@ fn assert_failure(
     let failure = result.unwrap_err();
     assert_eq!(failure.kind(), kind);
     assert_eq!(failure.location(), &location);
+}
+
+// REQ-OUTPUTS-13
+#[test]
+fn default_policy_admits_the_capture_and_agent_payload_limits() {
+    // The default policy is what `um workflow run` and the runner hand to admission.
+    let fixture = WorkflowFixture::new(AGENT_WORKFLOW);
+    let admitted = admit_workflow(
+        fixture.resolve(),
+        text_inputs("Caller prompt."),
+        ExecutionContext::new(
+            fixture.execution_root.clone(),
+            default_execution_policy_limits(1),
+            EnvironmentSnapshot::default(),
+            CancellationPolicy::new(CancellationSource::new(), Duration::from_secs(1)),
+        )
+        .with_pi_installation(ValidatedPiInstallation::fixture(
+            fixture.execution_root.join("pi"),
+        )),
+    )
+    .unwrap();
+
+    let limits = admitted.execution().limits();
+    assert_eq!(limits.maximum_captured_files().get(), 1_024);
+    assert_eq!(limits.maximum_captured_file_bytes().get(), 64 * 1024 * 1024);
+    assert_eq!(
+        limits.maximum_total_captured_bytes().get(),
+        256 * 1024 * 1024
+    );
+    let AdmittedHarness::Pi(agent) = admitted.agent_step("agent").unwrap() else {
+        panic!("the Pi profile must retain Pi admission");
+    };
+    assert_eq!(
+        agent.limits().maximum_response_bytes().get(),
+        8 * 1024 * 1024
+    );
+    assert_eq!(agent.limits().maximum_result_bytes().get(), 8 * 1024 * 1024);
 }

@@ -95,6 +95,7 @@ fn prepared_account_request(
     (server, directory, credential_path)
 }
 
+// REQ-ACCOUNT-33, REQ-ACCOUNT-34, REQ-ACCOUNT-35
 #[test]
 fn account_deletion_request_schedules_thirty_days_and_removes_the_local_session() {
     let (server, _directory, credential_path) =
@@ -159,6 +160,7 @@ fn account_deletion_request_schedules_thirty_days_and_removes_the_local_session(
     );
 }
 
+// REQ-SERVICEPRINCIPAL-23, REQ-SERVICEPRINCIPAL-31
 #[test]
 fn service_account_deletion_reports_immediate_completion_without_human_cleanup() {
     let response = http_response_with_headers(
@@ -209,6 +211,7 @@ fn service_account_deletion_reports_immediate_completion_without_human_cleanup()
     );
 }
 
+// REQ-ACCOUNT-34
 #[test]
 fn account_deletion_accepts_a_schedule_updated_at_the_deadline() {
     let response = http_response_with_headers(
@@ -256,6 +259,7 @@ fn account_deletion_accepts_a_schedule_updated_at_the_deadline() {
     assert_eq!(server.finish().len(), 1);
 }
 
+// REQ-ACCOUNT-34
 #[test]
 fn account_deletion_preserves_a_concurrently_replaced_credential_pair() {
     let mut server = ScriptedServer::respond_with_paused_last_response(vec![schedule_response()]);
@@ -327,6 +331,7 @@ fn account_deletion_preserves_a_concurrently_replaced_credential_pair() {
     assert!(server.finish().is_empty());
 }
 
+// REQ-ACCOUNT-40
 #[test]
 fn account_deletion_request_emits_json_for_an_invalid_api_response() {
     let response = http_response(
@@ -376,6 +381,7 @@ fn account_deletion_request_emits_json_for_an_invalid_api_response() {
     assert_eq!(server.finish().len(), 1);
 }
 
+// REQ-ACCOUNT-36
 #[test]
 fn account_deletion_request_reports_owner_and_existing_schedule_conflicts() {
     for (problem_type, expected_outcome) in [
@@ -424,6 +430,7 @@ fn account_deletion_request_reports_owner_and_existing_schedule_conflicts() {
     }
 }
 
+// REQ-ACCOUNT-37, REQ-ACCOUNT-39
 #[test]
 fn account_deletion_cancellation_uses_fresh_unstored_browser_proof() {
     let server = ScriptedServer::respond(cancellation_flow_responses(cancellation_response()));
@@ -497,6 +504,7 @@ fn account_deletion_cancellation_uses_fresh_unstored_browser_proof() {
     assert!(!combined.contains("unique-account-cancellation-device-code"));
 }
 
+// REQ-ACCOUNT-40
 #[test]
 fn account_deletion_cancellation_emits_a_terminal_result_for_an_invalid_api_response() {
     let terminal = cancellation_response_with_headers(&[]);
@@ -544,6 +552,7 @@ fn account_deletion_cancellation_emits_a_terminal_result_for_an_invalid_api_resp
     assert_eq!(server.finish().len(), 3);
 }
 
+// REQ-ACCOUNT-38
 #[test]
 fn account_deletion_cancellation_reports_reauthentication_and_already_cancelled_states() {
     for (problem_type, expected_outcome) in [
@@ -599,6 +608,7 @@ fn account_deletion_cancellation_reports_reauthentication_and_already_cancelled_
     }
 }
 
+// REQ-ACCOUNT-32
 #[test]
 fn account_deletion_request_requires_explicit_confirmation() {
     let output = run(&["account", "deletion", "request"]);

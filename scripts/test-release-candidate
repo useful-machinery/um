@@ -587,6 +587,7 @@ def prove_workflow_contract() -> None:
         fail("public workflow exposes write authority before protected publication")
 
 
+# REQ-ONBOARD-1
 def main() -> int:
     module = load_verifier()
     prove_workflow_contract()

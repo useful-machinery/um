@@ -35,6 +35,7 @@ fn json_literal(value: Value) -> ResolvedOperand {
     ResolvedOperand::json_literal(Arc::new(value))
 }
 
+// REQ-WFCOND-12
 #[test]
 fn condition_pointer_round_trips_and_selects_strict_tokens() {
     let document = json!({
@@ -78,6 +79,7 @@ fn condition_pointer_round_trips_and_selects_strict_tokens() {
     }
 }
 
+// REQ-WFCOND-13
 #[test]
 fn condition_pointer_rejects_non_pointer_and_invalid_escapes() {
     for authored in ["x", "#", "#/a", "/~", "/~2", "/a/~x"] {
@@ -89,6 +91,7 @@ fn condition_pointer_rejects_non_pointer_and_invalid_escapes() {
     assert_eq!(pointer("/~01").tokens().collect::<Vec<_>>(), ["~1"]);
 }
 
+// REQ-WFCOND-21, REQ-WFCOND-22
 #[test]
 fn condition_equality_preserves_text_and_json_value_semantics() {
     for (left, right, equal) in [
@@ -158,6 +161,7 @@ fn condition_equality_preserves_text_and_json_value_semantics() {
     ));
 }
 
+// REQ-WFCOND-20, REQ-WFCOND-38, REQ-WFCOND-39, REQ-WFCOND-40
 #[test]
 fn condition_evaluation_is_left_to_right_and_completion_ordered() {
     let text = CapturedText::new(Arc::from("yes"));
@@ -236,6 +240,7 @@ fn condition_evaluation_is_left_to_right_and_completion_ordered() {
     );
 }
 
+// REQ-WFCOND-20
 #[test]
 fn condition_evaluation_short_circuits_without_retaining_a_true_trace() {
     let text = CapturedText::new(Arc::from("yes"));
@@ -270,6 +275,7 @@ fn condition_evaluation_short_circuits_without_retaining_a_true_trace() {
     );
 }
 
+// REQ-WFCOND-23, REQ-WFCOND-24, REQ-WFCOND-40
 #[test]
 fn condition_evaluation_missing_pointer_and_unavailable_source_are_distinct() {
     let json = captured_json(r#"{"present":null}"#);
@@ -320,6 +326,7 @@ fn condition_evaluation_missing_pointer_and_unavailable_source_are_distinct() {
     );
 }
 
+// REQ-WFCOND-37
 #[test]
 fn condition_evaluation_retains_the_complete_accepted_maximum_trace() {
     fn equal(expected: &str) -> ResolvedPredicate {
@@ -367,6 +374,7 @@ fn condition_evaluation_retains_the_complete_accepted_maximum_trace() {
     );
 }
 
+// REQ-WFCOND-5, REQ-WFCOND-26
 #[test]
 fn condition_evaluation_supports_every_terminal_disposition_without_source_detail() {
     for disposition in [

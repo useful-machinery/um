@@ -1137,6 +1137,7 @@ mod tests {
 
     use super::*;
 
+    // REQ-EVIDENCE-12
     #[test]
     fn harness_diagnostic_is_sibling_only_and_never_changes_canonical_evidence() {
         use super::super::agent::CanonicalHarnessFailure;
@@ -1189,6 +1190,7 @@ mod tests {
         );
     }
 
+    // REQ-EVIDENCE-10
     #[test]
     fn blocked_detail_deduplicates_and_sorts_exact_pairs() {
         let detail = BlockedDetail::new([
@@ -1228,6 +1230,7 @@ mod tests {
         assert!(serde_json::from_value::<FailureDetail>(missing_pointer).is_err());
     }
 
+    // REQ-EVIDENCE-5, REQ-EVIDENCE-6, REQ-EVIDENCE-7, REQ-EVIDENCE-26, REQ-OUTPUTS-5
     #[test]
     fn failure_detail_rejects_cross_phase_auxiliary_and_unsafe_names() {
         for value in [
@@ -1238,15 +1241,28 @@ mod tests {
             json!({"phase":"start","code":"inputs_unavailable","future":true}),
             json!({"phase":"start","code":"input_source_unavailable","input":"SECRET_PATH"}),
             json!({"phase":"output_capture","code":"output_missing","output":"../../secret"}),
+            json!({"phase":"execution","code":"step_unavailable"}),
+            json!({"phase":"output_capture","code":"harness_failed"}),
+            json!({"phase":"execution","code":"json_pointer_missing"}),
         ] {
-            assert!(serde_json::from_value::<FailureDetail>(value).is_err());
+            assert!(
+                serde_json::from_value::<FailureDetail>(value.clone()).is_err(),
+                "accepted {value}"
+            );
         }
-        assert!(
-            serde_json::from_value::<FailureDetail>(
-                json!({"phase":"start","code":"input_invalid_name","input":"SECRET_PATH"})
-            )
-            .is_ok()
-        );
+        // The codes shared by two phases are valid in exactly those phases.
+        for value in [
+            json!({"phase":"start","code":"input_invalid_name","input":"SECRET_PATH"}),
+            json!({"phase":"start","code":"step_unavailable"}),
+            json!({"phase":"output_capture","code":"step_unavailable"}),
+            json!({"phase":"start","code":"harness_failed"}),
+            json!({"phase":"execution","code":"harness_failed"}),
+        ] {
+            assert!(
+                serde_json::from_value::<FailureDetail>(value.clone()).is_ok(),
+                "rejected {value}"
+            );
+        }
     }
 
     #[test]
@@ -1277,6 +1293,7 @@ mod tests {
         assert!(serde_json::from_value::<ConditionFalseDetail>(detail).is_err());
     }
 
+    // REQ-EVIDENCE-5, REQ-EVIDENCE-11
     #[test]
     fn primary_issue_state_selects_the_closed_detail_member() {
         let failed = json!({

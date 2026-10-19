@@ -2869,6 +2869,7 @@ mod tests {
         assert_eq!(fcntl_getfl(&input).unwrap(), original);
     }
 
+    // REQ-LOCALRUN-83
     #[test]
     fn named_input_planning_rejects_conflicts_before_source_io() {
         let missing = "/path/that/must/not/be/read";
@@ -2921,6 +2922,7 @@ mod tests {
         }
     }
 
+    // REQ-LOCALRUN-88
     #[test]
     fn named_input_planning_enforces_inclusive_name_and_member_bounds() {
         let mut text = Vec::new();
@@ -2950,6 +2952,7 @@ mod tests {
         assert!(plan_inputs(&[], &[], &[], &[], &[], &attachments, &[]).is_err());
     }
 
+    // REQ-LOCALRUN-82, REQ-LOCALRUN-84
     #[tokio::test]
     async fn named_input_acquisition_preserves_empty_values_and_member_order() {
         let temporary = tempfile::tempdir().unwrap();
@@ -3011,6 +3014,7 @@ mod tests {
         ));
     }
 
+    // REQ-LOCALRUN-84
     #[tokio::test]
     async fn named_json_acquisition_rejects_duplicate_keys_without_a_fallback() {
         for source in ["{\"safe\":1,\"safe\":2}", "", "null true"] {
@@ -3032,6 +3036,7 @@ mod tests {
         }
     }
 
+    // REQ-LOCALRUN-85
     #[test]
     fn named_input_paths_follow_regular_symlinks_and_reject_nonregular_files() {
         let temporary = tempfile::tempdir().unwrap();
@@ -3057,6 +3062,7 @@ mod tests {
         );
     }
 
+    // REQ-LOCALRUN-88
     #[tokio::test]
     async fn json_file_acquisition_accepts_exact_source_bound_and_rejects_one_over() {
         let temporary = tempfile::tempdir().unwrap();
@@ -3109,6 +3115,7 @@ mod tests {
         );
     }
 
+    // REQ-LOCALRUN-88
     #[test]
     fn input_reader_accepts_exact_limit_and_rejects_one_over() {
         let cancellation = CancellationSource::new();
@@ -3198,6 +3205,7 @@ mod tests {
         );
     }
 
+    // REQ-WFFINALIZE-15, REQ-LOCALRUN-135
     #[test]
     fn repeated_signals_only_force_abort_a_cancelling_finalization() {
         let ordinary = CancellationSource::new();
@@ -3362,6 +3370,7 @@ mod tests {
         assert_eq!(available, expected);
     }
 
+    // REQ-LOCALRUN-138
     #[tokio::test]
     async fn execution_handoff_does_not_wait_for_a_blocked_plain_header() {
         let temporary = tempfile::tempdir().unwrap();

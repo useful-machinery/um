@@ -403,6 +403,7 @@ fn update_retries_failures_before_and_during_an_updated_response() {
     }
 }
 
+// INV-CLI-10
 #[test]
 fn mutation_attempt_budget_includes_interrupted_success_responses() {
     let interrupted = interrupted_success("201 Created");
@@ -506,6 +507,8 @@ fn membership_history_preserves_pagination_and_decodes_lifecycle_rows() {
     ));
 }
 
+// REQ-MEMBER-54
+// INV-CLI-10
 #[test]
 fn membership_role_update_retries_with_one_key_and_exact_merge_patch() {
     let server =
@@ -546,6 +549,7 @@ fn membership_role_update_retries_with_one_key_and_exact_merge_patch() {
     );
 }
 
+// REQ-MEMBER-54
 #[test]
 fn membership_termination_retries_exactly_on_distinct_member_and_self_routes() {
     let cases = [
@@ -611,6 +615,7 @@ fn membership_termination_rejects_malformed_no_content_successes() {
     }
 }
 
+// REQ-MEMBER-55
 #[test]
 fn membership_mutations_classify_owner_and_transition_conflicts() {
     let cases = [
@@ -959,6 +964,7 @@ fn mutation_successes_require_their_response_identity_headers() {
     missing_update_identity.finish_one();
 }
 
+// INV-CLI-10
 #[test]
 fn interrupted_success_with_mismatched_identity_is_not_retried() {
     let mut interrupted = response(
@@ -985,6 +991,7 @@ fn interrupted_success_with_mismatched_identity_is_not_retried() {
     assert_protocol_error(&error);
 }
 
+// REQ-AUTH-56
 #[test]
 fn redirects_and_malformed_unauthorized_responses_are_protocol_failures() {
     let redirect = ScriptedHttpServer::respond(response(
@@ -1038,6 +1045,7 @@ fn unauthorized_status_survives_the_body_deadline() {
     assert!(!error.to_string().contains(TOKEN));
 }
 
+// INV-CLI-9
 #[test]
 fn deadlines_cover_headers_and_reads_do_not_retry() {
     let mut server = ScriptedHttpServer::respond_when_released(success("200 OK"));
@@ -1094,6 +1102,7 @@ fn explicit_server_status_with_interrupted_body_is_not_retried() {
     );
 }
 
+// INV-CLI-10
 #[test]
 fn explicit_server_failures_are_not_retried() {
     let server = ScriptedHttpServer::respond(response("503 Service Unavailable", None, &[], &[]));
@@ -1110,6 +1119,7 @@ fn explicit_server_failures_are_not_retried() {
     server.finish_one();
 }
 
+// REQ-INVITE-58
 #[test]
 fn issue_invitation_retries_an_ambiguous_transport_failure_with_the_same_request() {
     let invitation_id = "inv_01k0z6r1w8f4jy2m7q9v3x5abc";
@@ -1158,6 +1168,7 @@ fn issue_invitation_retries_an_ambiguous_transport_failure_with_the_same_request
     );
 }
 
+// REQ-INVITE-58
 #[test]
 fn accept_invitation_replays_the_same_capability_body_after_an_interrupted_success() {
     let capability = "inv_01k0z6r1w8f4jy2m7q9v3x5abc.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";

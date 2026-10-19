@@ -151,6 +151,8 @@ fn lower_bound_and_intervening_patches_retain_exact_versions() {
     }
 }
 
+// REQ-AGENT-1, REQ-AGENT-7
+// INV-HARNESS-1
 #[test]
 fn version_range_and_capabilities_are_both_required() {
     let executable = std::env::current_exe().unwrap();

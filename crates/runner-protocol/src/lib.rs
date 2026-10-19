@@ -2506,6 +2506,8 @@ mod tests {
         )),
     ];
 
+    // INV-CONTRACT-7
+    // INV-RUNNER-1
     #[test]
     fn generated_types_and_handwritten_validation_accept_every_valid_fixture() {
         for (index, fixture) in VALID_FIXTURES.iter().enumerate() {
@@ -2522,6 +2524,7 @@ mod tests {
         }
     }
 
+    // INV-RUNNER-1
     #[test]
     fn recovery_wire_fixtures_decode_but_are_not_activated_at_runtime() {
         for fixture in [
@@ -2535,6 +2538,8 @@ mod tests {
         }
     }
 
+    // INV-CONTRACT-7
+    // INV-RUNNER-1
     #[test]
     fn generated_types_and_handwritten_validation_reject_every_invalid_fixture() {
         for (index, fixture) in INVALID_FIXTURES.iter().enumerate() {
@@ -3147,6 +3152,7 @@ mod tests {
         }
     }
 
+    // INV-RUNNER-1
     #[test]
     fn canonical_maximal_recovery_frame_has_published_exact_size() {
         let fixture: Value = serde_json::from_slice(include_bytes!(concat!(
@@ -3223,6 +3229,7 @@ mod tests {
         ));
     }
 
+    // INV-RUNNER-8
     #[test]
     fn decode_cloud_frame_rejects_invalid_welcome_timing_pair() {
         let bytes = br#"{

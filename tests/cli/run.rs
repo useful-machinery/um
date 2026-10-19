@@ -240,6 +240,7 @@ mod continuation_command_tests {
         ]
     }
 
+    // REQ-CONTINUE-1, REQ-CONTINUE-56, REQ-CONTINUE-57
     #[test]
     fn lost_201_replays_same_request_then_reports_admission_not_execution() {
         let (output, requests) = execute(&["lost", "preparing"], &args());
@@ -272,6 +273,7 @@ mod continuation_command_tests {
         );
     }
 
+    // REQ-CONTINUE-55, REQ-CONTINUE-56, REQ-CONTINUE-61
     #[test]
     fn replacement_pair_is_exact_and_human_output_distinguishes_inheritance() {
         let mut args = args();
@@ -301,6 +303,7 @@ mod continuation_command_tests {
         assert!(text.contains("execution root: /work/current"));
     }
 
+    // REQ-CONTINUE-61
     #[test]
     fn run_show_reads_current_ready_and_boot_loss_projection_without_mutation() {
         for (state, marker) in [
@@ -322,6 +325,7 @@ mod continuation_command_tests {
         }
     }
 
+    // REQ-CONTINUE-62
     #[test]
     fn show_wait_observes_boot_loss_without_submitting_another_attempt() {
         let (output, requests) = execute(
@@ -346,6 +350,7 @@ mod continuation_command_tests {
         assert!(requests.iter().all(|request| request.starts_with("GET ")));
     }
 
+    // REQ-CONTINUE-60
     #[cfg(target_os = "linux")]
     #[test]
     fn signal_stops_receipt_observation_without_a_second_submission() {
@@ -418,6 +423,7 @@ mod continuation_command_tests {
         assert!(post.starts_with("POST ") && get.starts_with("GET "));
     }
 
+    // REQ-CONTINUE-60
     #[test]
     fn older_receipt_keeps_its_partition_when_current_attempt_and_portable_result_advance() {
         let mut args = args();
@@ -461,6 +467,7 @@ mod continuation_command_tests {
         assert!(text.contains("portable result: available"));
     }
 
+    // REQ-CONTINUE-57
     #[test]
     fn two_lost_responses_leave_one_key_and_unknown_acceptance() {
         let (output, requests) = execute(&["lost", "lost"], &args());
@@ -478,6 +485,7 @@ mod continuation_command_tests {
         assert!(result["request"].is_null());
     }
 
+    // REQ-CONTINUE-57
     #[test]
     fn lost_response_then_unreadable_401_cannot_refresh_or_submit_again() {
         let (output, requests) = execute(&["lost", "truncated-401"], &args());
@@ -496,6 +504,7 @@ mod continuation_command_tests {
         );
     }
 
+    // REQ-CONTINUE-59
     #[test]
     fn admission_violations_retain_stale_version_and_reference_details() {
         for (step, code) in [
@@ -531,6 +540,7 @@ mod continuation_command_tests {
         ));
     }
 
+    // REQ-CONTINUE-57
     #[test]
     fn not_found_after_lost_response_is_not_proof_of_non_admission() {
         let (output, requests) = execute(&["lost", "not-found"], &args());
@@ -541,6 +551,7 @@ mod continuation_command_tests {
         assert_eq!(requests.len(), 2);
     }
 
+    // REQ-CONTINUE-58
     #[test]
     fn post_cannot_report_a_different_semantic_request_as_accepted() {
         let (output, requests) = execute(&["changed-request"], &args());
@@ -551,6 +562,7 @@ mod continuation_command_tests {
         assert_eq!(requests.len(), 1);
     }
 
+    // REQ-CONTINUE-58
     #[test]
     fn receipt_get_must_not_rewrite_original_admission() {
         let mut args = args();
@@ -563,6 +575,7 @@ mod continuation_command_tests {
         assert_eq!(requests.len(), 2);
     }
 
+    // REQ-CONTINUE-60
     #[test]
     fn receipt_get_observes_ready_then_boot_loss_without_claiming_portable_result() {
         let mut args = args();
@@ -734,6 +747,7 @@ mod retry_command_tests {
         ]
     }
 
+    // REQ-RETRY-31, REQ-RETRY-33, REQ-RETRY-39
     #[test]
     fn lost_acceptance_replays_one_key_and_only_get_can_apply() {
         let (output, requests) = execute(
@@ -762,6 +776,7 @@ mod retry_command_tests {
         );
     }
 
+    // REQ-RETRY-31, REQ-RETRY-39
     #[test]
     fn two_lost_post_responses_report_unresolved_transport_and_the_one_key() {
         let (output, requests) = execute(&[("lost", None), ("lost", None)], &args());
@@ -781,6 +796,7 @@ mod retry_command_tests {
         assert!(requests.iter().all(|request| request.starts_with("POST ")));
     }
 
+    // REQ-RETRY-32
     #[test]
     fn definitive_post_rate_limit_does_not_claim_unknown_acceptance() {
         let (output, requests) = execute(&[("rate-limited", None)], &args());
@@ -791,6 +807,7 @@ mod retry_command_tests {
         assert_eq!(requests.len(), 1);
     }
 
+    // REQ-RETRY-31
     #[test]
     fn rate_limited_replay_does_not_erase_ambiguous_first_post() {
         let (output, requests) = execute(&[("lost", None), ("rate-limited", None)], &args());
@@ -809,6 +826,7 @@ mod retry_command_tests {
         );
     }
 
+    // REQ-RETRY-31
     #[test]
     fn unauthorized_replay_cannot_erase_unresolved_acceptance() {
         let (output, requests) = execute(&[("lost", None), ("unauthorized", None)], &args());
@@ -826,6 +844,7 @@ mod retry_command_tests {
         );
     }
 
+    // REQ-RETRY-33
     #[test]
     fn resolved_replay_still_requires_a_get_before_reporting_applied() {
         let (output, requests) = execute(
@@ -845,6 +864,7 @@ mod retry_command_tests {
         );
     }
 
+    // REQ-RETRY-33
     #[test]
     fn pending_get_is_not_application_until_a_later_get_applies() {
         let (output, requests) = execute(
@@ -863,6 +883,7 @@ mod retry_command_tests {
         );
     }
 
+    // REQ-RETRY-34
     #[test]
     fn rejected_receipts_preserve_every_code() {
         for code in [
@@ -886,6 +907,7 @@ mod retry_command_tests {
         }
     }
 
+    // REQ-RETRY-36
     #[test]
     fn receipt_loss_and_authorization_loss_never_resubmit() {
         for (problem, code, exit) in [("not-found", "not_found", 1), ("forbidden", "forbidden", 1)]
@@ -960,6 +982,7 @@ mod retry_command_tests {
         );
     }
 
+    // REQ-RETRY-36
     #[test]
     fn rejected_service_identity_does_not_resubmit_after_acceptance() {
         let directory = private_credential_directory();
@@ -982,6 +1005,7 @@ mod retry_command_tests {
         assert_eq!(requests.len(), 2);
     }
 
+    // REQ-RETRY-33
     #[test]
     fn retry_after_does_not_resubmit_accepted_mutation() {
         for throttled in ["rate-limited", "unavailable"] {
@@ -1003,6 +1027,7 @@ mod retry_command_tests {
         }
     }
 
+    // REQ-RETRY-38
     #[cfg(target_os = "linux")]
     #[test]
     fn interruption_preserves_the_known_request_or_unknown_key_without_resubmission() {
@@ -1105,6 +1130,7 @@ mod retry_command_tests {
         }
     }
 
+    // REQ-RETRY-37
     #[test]
     fn pending_acceptance_times_out_without_claiming_application() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1150,6 +1176,7 @@ mod retry_command_tests {
         assert_eq!(json["receipt"]["state"], "pending");
     }
 
+    // REQ-RETRY-30, REQ-RETRY-40
     #[test]
     fn retry_human_result_and_invalid_version() {
         let human = [
@@ -1185,6 +1212,7 @@ mod retry_command_tests {
         assert!(!invalid.stderr.is_empty());
     }
 
+    // REQ-RETRY-35
     #[test]
     fn conflicts_are_not_reported_as_applied() {
         for (problem, outcome) in [
@@ -1215,6 +1243,8 @@ fn prepared_run(responses: Vec<Vec<u8>>) -> (ScriptedServer, tempfile::TempDir, 
     (server, credential_directory, credential_path)
 }
 
+// REQ-TRIGGER-53
+// REQ-RUN-66
 #[test]
 fn list_runs_filters_and_renders_text_and_json() {
     let body = serde_json::json!({
@@ -1302,6 +1332,7 @@ fn list_runs_filters_and_renders_text_and_json() {
     }
 }
 
+// REQ-RUN-66
 #[test]
 fn list_runs_accepts_full_pages_with_large_valid_contexts() {
     let context = (0..15)
@@ -1621,6 +1652,7 @@ fn cancellation_response(status: &str, key: &str, body: serde_json::Value) -> Ve
     )
 }
 
+// REQ-CANCEL-49
 #[cfg(target_os = "linux")]
 #[test]
 fn cancellation_signal_before_acceptance_preserves_key_and_never_observes() {
@@ -1683,6 +1715,7 @@ fn cancellation_signal_before_acceptance_preserves_key_and_never_observes() {
     assert!(server.finish().is_empty());
 }
 
+// REQ-CANCEL-49
 #[cfg(target_os = "linux")]
 #[test]
 fn cancellation_signal_after_acceptance_stops_observation_without_new_post() {
@@ -1753,6 +1786,7 @@ fn cancellation_signal_after_acceptance_stops_observation_without_new_post() {
     assert!(server.finish().is_empty());
 }
 
+// REQ-CANCEL-48, REQ-CANCEL-50, REQ-CANCEL-51
 #[test]
 fn cancellation_observation_failure_retains_reconciliation_identity_without_post_retry() {
     let key = "accepted-then-forbidden-key";
@@ -1823,6 +1857,7 @@ fn cancellation_observation_failure_retains_reconciliation_identity_without_post
     }
 }
 
+// REQ-CANCEL-40, REQ-CANCEL-41
 #[test]
 fn plain_force_cancellation_unknown_retains_requested_mode() {
     let key = "unknown-force-key";
@@ -1855,6 +1890,7 @@ fn plain_force_cancellation_unknown_retains_requested_mode() {
     }
 }
 
+// REQ-CANCEL-46, REQ-CANCEL-51
 #[test]
 fn plain_cancellation_timeout_retains_accepted_snapshot() {
     let key = "plain-timeout-key";
@@ -1920,6 +1956,7 @@ fn plain_cancellation_timeout_retains_accepted_snapshot() {
     )));
 }
 
+// REQ-CANCEL-45
 #[test]
 fn cancellation_wait_ends_as_creation_rejection_without_inventing_a_run() {
     let key = "rejected-create-key";
@@ -1963,6 +2000,7 @@ fn cancellation_wait_ends_as_creation_rejection_without_inventing_a_run() {
     assert_eq!(server.finish().len(), 2);
 }
 
+// REQ-CANCEL-43
 #[test]
 fn cancellation_wait_requires_resolved_receipt_and_terminal_run() {
     let key = "resolved-wait-key";
@@ -2016,6 +2054,8 @@ fn cancellation_wait_requires_resolved_receipt_and_terminal_run() {
     )));
 }
 
+// REQ-CANCEL-44
+// REQ-PUBLISH-64
 #[test]
 fn cancellation_wait_does_not_observe_a_linked_publication() {
     let key = "cancel-while-publication-started";
@@ -2060,6 +2100,7 @@ fn cancellation_wait_does_not_observe_a_linked_publication() {
     assert!(requests[1].contains(&format!("/cancellation-requests/{CANCELLATION_ID} ")));
 }
 
+// REQ-CANCEL-38
 #[test]
 fn explicit_force_escalation_uses_a_separate_key_and_never_reuses_graceful_strength() {
     let normal_key = "normal-request-key";
@@ -2108,6 +2149,7 @@ fn explicit_force_escalation_uses_a_separate_key_and_never_reuses_graceful_stren
     assert_eq!(request_body(&requests[1])["mode"], "force");
 }
 
+// REQ-CANCEL-42
 #[test]
 fn cancellation_local_authentication_failure_still_writes_one_json_result() {
     let environment = deployment_environment("http://127.0.0.1:1", "/dev/null/credentials.json");
@@ -2133,6 +2175,7 @@ fn cancellation_local_authentication_failure_still_writes_one_json_result() {
     assert_eq!(result["error"]["idempotencyKey"], "never-dispatched-key");
 }
 
+// REQ-CANCEL-42
 #[test]
 fn cancellation_definite_rate_limit_is_not_reported_as_unknown_acceptance() {
     let key = "rate-limit-key";
@@ -2164,6 +2207,7 @@ fn cancellation_definite_rate_limit_is_not_reported_as_unknown_acceptance() {
     assert_eq!(server.finish().len(), 1);
 }
 
+// REQ-CANCEL-42
 #[test]
 fn cancellation_key_conflict_does_not_send_escalation_or_claim_acceptance() {
     let key = "same-key-mode-conflict";
@@ -2199,6 +2243,7 @@ fn cancellation_key_conflict_does_not_send_escalation_or_claim_acceptance() {
     assert_eq!(server.finish().len(), 1);
 }
 
+// REQ-CANCEL-39, REQ-CANCEL-40
 #[test]
 fn cancellation_retry_reuses_key_and_mode_without_a_second_control() {
     let key = "cancellation-retry-key";
@@ -2238,6 +2283,7 @@ fn cancellation_retry_reuses_key_and_mode_without_a_second_control() {
     }
 }
 
+// REQ-CANCEL-39, REQ-CANCEL-50
 #[test]
 fn cancellation_terminal_noop_and_explicit_force_preserve_receipt_and_run() {
     for (mode, flag) in [("graceful", None), ("force", Some("--force"))] {
@@ -2280,6 +2326,7 @@ fn cancellation_terminal_noop_and_explicit_force_preserve_receipt_and_run() {
     }
 }
 
+// REQ-CANCEL-41
 #[test]
 fn cancellation_rejects_slug_location_even_when_receipt_is_valid() {
     let key = "slug-location-key";
@@ -2650,6 +2697,7 @@ fn run_show_with_response(response: Vec<u8>) -> (Output, ScriptedServer) {
     (output, server)
 }
 
+// REQ-CANCEL-47, REQ-CANCEL-54
 #[test]
 fn cloud_run_wait_flags_require_explicit_observation_and_bare_wait_is_absent() {
     for args in [
@@ -2674,6 +2722,7 @@ fn cloud_run_wait_flags_require_explicit_observation_and_bare_wait_is_absent() {
     }
 }
 
+// REQ-PUBLISH-13
 #[test]
 fn create_selects_exact_export_once_and_omission_is_artifact_only() {
     for selected in [Some("changes"), Some("review"), None] {
@@ -2716,6 +2765,8 @@ fn create_selects_exact_export_once_and_omission_is_artifact_only() {
     }
 }
 
+// REQ-DIAG-28, REQ-DIAG-30
+// REQ-PUBLISH-62, REQ-PUBLISH-63
 #[test]
 fn create_and_show_wait_separate_failed_publication_handoff_from_execution() {
     for (operation, expected_exit, json, wait) in [
@@ -2803,6 +2854,7 @@ fn create_and_show_wait_separate_failed_publication_handoff_from_execution() {
     }
 }
 
+// REQ-DIAG-28
 #[test]
 fn human_run_observation_reports_failed_automatic_publication() {
     let publication_id = "pub_01k0z6r1w8f4jy2m7q9v3x5abc";
@@ -2907,6 +2959,7 @@ fn human_run_observation_reports_failed_automatic_publication() {
     }
 }
 
+// REQ-PUBLISH-63
 #[test]
 fn human_run_observation_reports_successful_automatic_publication_url() {
     let publication_id = "pub_01k0z6r1w8f4jy2m7q9v3x5abc";
@@ -2988,6 +3041,7 @@ fn human_run_observation_reports_successful_automatic_publication_url() {
     }
 }
 
+// REQ-PUBLISH-61
 #[test]
 fn run_wait_tracks_automatic_attempt_through_handoff_and_publication() {
     let mut pending = run_body_with_state("succeeded");
@@ -3084,6 +3138,7 @@ fn run_wait_tracks_automatic_attempt_through_handoff_and_publication() {
     }
 }
 
+// REQ-PUBLISH-22, REQ-PUBLISH-62
 #[test]
 fn run_wait_keeps_successful_execution_separate_from_failed_publication() {
     let mut run = run_body_with_state("succeeded");
@@ -3172,6 +3227,7 @@ fn run_plain_publication_outcomes_do_not_invent_a_new_pull_request() {
     }
 }
 
+// REQ-RUN-62
 #[cfg(target_os = "linux")]
 #[test]
 fn create_signal_after_acceptance_stops_only_observation_and_keeps_replay() {
@@ -3284,6 +3340,7 @@ fn publication_observation_signal_retains_handoff_without_a_second_mutation() {
     assert_eq!(server.finish().len(), 0);
 }
 
+// REQ-RUN-58
 #[test]
 fn create_wait_preserves_authoritative_replay_through_failed_execution() {
     let mut body = run_body_with_state("failed");
@@ -3311,6 +3368,7 @@ fn create_wait_preserves_authoritative_replay_through_failed_execution() {
     assert!(requests[1].contains(&format!("/runs/{RUN_ID} HTTP/1.1")));
 }
 
+// REQ-RUN-58
 #[test]
 fn create_wait_displays_failed_primary_issue() {
     let mut body = run_body_with_state("failed");
@@ -3332,6 +3390,8 @@ fn create_wait_displays_failed_primary_issue() {
     assert_eq!(server.finish().len(), 2);
 }
 
+// REQ-WORKSPACE-7
+// REQ-RUN-55
 #[test]
 fn run_create_sends_inputless_request_and_reports_plain_and_json_receipts() {
     for json in [false, true] {
@@ -3397,6 +3457,7 @@ fn run_create_sends_inputless_request_and_reports_plain_and_json_receipts() {
     }
 }
 
+// REQ-TRIGGER-54
 #[test]
 fn run_create_sends_integration_context_from_regular_file_and_standard_input() {
     for source in ["file", "stdin"] {
@@ -3441,6 +3502,7 @@ fn run_create_sends_integration_context_from_regular_file_and_standard_input() {
     }
 }
 
+// REQ-RUNINPUT-53
 #[test]
 fn run_create_reads_named_text_and_json_from_standard_input() {
     for (flag, kind, input_bytes) in [
@@ -3487,6 +3549,7 @@ fn run_create_reads_named_text_and_json_from_standard_input() {
     }
 }
 
+// REQ-RUNINPUT-56
 #[test]
 fn competing_standard_input_claims_reject_before_cloud_access() {
     for input_flag in ["--input-text-file", "--input-json-file"] {
@@ -3512,6 +3575,7 @@ fn competing_standard_input_claims_reject_before_cloud_access() {
     }
 }
 
+// REQ-TRIGGER-54
 #[test]
 fn invalid_integration_context_rejects_before_cloud_access() {
     let mut too_many = serde_json::Map::new();
@@ -3548,6 +3612,7 @@ fn invalid_integration_context_rejects_before_cloud_access() {
     }
 }
 
+// REQ-TRIGGER-54
 #[test]
 fn invalid_integration_context_plain_output_redacts_caller_values() {
     const PRIVATE_VALUE: &str = "private-parser-value-sentinel";
@@ -3571,6 +3636,7 @@ fn invalid_integration_context_plain_output_redacts_caller_values() {
     assert!(server.finish().is_empty());
 }
 
+// REQ-TRIGGER-54
 #[test]
 fn oversized_integration_context_standard_input_rejects_before_cloud_access() {
     let (server, _credentials, credential_path) = prepared_run(Vec::new());
@@ -3586,6 +3652,7 @@ fn oversized_integration_context_standard_input_rejects_before_cloud_access() {
     assert!(server.finish().is_empty());
 }
 
+// REQ-TRIGGER-54
 #[test]
 fn unreadable_integration_context_rejects_before_cloud_access() {
     let directory = tempfile::tempdir().unwrap();
@@ -3605,6 +3672,7 @@ fn unreadable_integration_context_rejects_before_cloud_access() {
     assert!(server.finish().is_empty());
 }
 
+// REQ-RUNINPUT-57
 #[test]
 fn run_create_consumes_an_explicit_sealed_input_set_without_restaging() {
     let (server, _directory, credential_path) = prepared_run(vec![acceptance_response(false)]);
@@ -3626,6 +3694,7 @@ fn run_create_consumes_an_explicit_sealed_input_set_without_restaging() {
     assert_eq!(request_body(&request)["inputSetId"], INPUT_SET_ID);
 }
 
+// REQ-RUNINPUT-59, REQ-RUNINPUT-72
 #[test]
 fn create_json_input_rejected_by_file_workflow_reports_safe_binding_diagnostic() {
     let directory = tempfile::tempdir().unwrap();
@@ -3680,6 +3749,7 @@ fn create_json_input_rejected_by_file_workflow_reports_safe_binding_diagnostic()
     storage.finish();
 }
 
+// REQ-RUNINPUT-59
 #[test]
 fn create_input_admission_json_keeps_cloud_envelope_and_safe_diagnostic() {
     let (server, _directory, credential_path) = prepared_run(vec![problem_http_response(
@@ -3713,6 +3783,7 @@ fn create_input_admission_json_keeps_cloud_envelope_and_safe_diagnostic() {
     assert_eq!(server.finish().len(), 1);
 }
 
+// REQ-RUNINPUT-59
 #[test]
 fn create_input_set_rejections_without_diagnostic_retain_safe_http_facts() {
     for (status, kind, remedy) in [
@@ -3780,6 +3851,7 @@ fn create_input_set_rejections_without_diagnostic_retain_safe_http_facts() {
     }
 }
 
+// REQ-RUNINPUT-57
 #[test]
 fn explicit_input_set_conflicts_with_acquired_inputs_before_cloud_access() {
     let output = Command::new(env!("CARGO_BIN_EXE_um"))
@@ -3805,6 +3877,7 @@ fn explicit_input_set_conflicts_with_acquired_inputs_before_cloud_access() {
     assert!(!String::from_utf8_lossy(&output.stderr).contains("private argument sentinel"));
 }
 
+// REQ-RUNINPUT-54
 #[test]
 fn run_create_stages_present_named_text_input_files_before_binding_the_sealed_set() {
     for input_bytes in [b"".as_slice(), b"Write a concise limerick.\n".as_slice()] {
@@ -3942,6 +4015,7 @@ fn run_create_stages_present_named_text_input_files_before_binding_the_sealed_se
     }
 }
 
+// REQ-RUNINPUT-54
 #[test]
 fn run_create_stages_named_json_sources_without_rewriting_bytes() {
     let input_bytes = b"{\n  \"enabled\": true, \"ratio\": 1.00\n}\n";
@@ -4021,6 +4095,7 @@ fn run_create_stages_named_json_sources_without_rewriting_bytes() {
     }
 }
 
+// REQ-RUNINPUT-53, REQ-RUNINPUT-54
 #[test]
 fn run_create_stages_named_file_with_exact_media_type_and_bytes() {
     let input_bytes = *b"exact file bytes";
@@ -4085,6 +4160,7 @@ fn run_create_stages_named_file_with_exact_media_type_and_bytes() {
     assert_eq!(header_value(&upload, "content-type"), media_type);
 }
 
+// REQ-RUNINPUT-53, REQ-RUNINPUT-54, REQ-RUNINPUT-71
 #[test]
 fn run_create_stages_mixed_values_ordered_attachments_and_present_empty_collections() {
     let directory = tempfile::tempdir().unwrap();
@@ -4370,6 +4446,7 @@ fn download_capability_response_for_members(members: serde_json::Value) -> Vec<u
     )
 }
 
+// REQ-RUNINPUT-61
 #[test]
 fn explicit_input_set_flow_creates_open_then_uploads_seals_and_consumes() {
     let input_bytes = b"explicit single-use input\n";
@@ -4517,6 +4594,7 @@ fn explicit_input_set_flow_creates_open_then_uploads_seals_and_consumes() {
     assert_eq!(request_body(&requests[0])["inputSetId"], INPUT_SET_ID);
 }
 
+// REQ-RUNINPUT-61, REQ-RUNINPUT-64
 #[test]
 fn input_set_mutation_commands_upload_seal_and_delete_with_fresh_requests() {
     let input_bytes = b"selected single-use input\n";
@@ -4655,6 +4733,7 @@ fn input_set_mutation_commands_upload_seal_and_delete_with_fresh_requests() {
     assert_ne!(seal_key, delete_key);
 }
 
+// REQ-RUNINPUT-63
 #[test]
 fn sealing_an_already_sealed_input_set_reports_a_lifecycle_conflict() {
     let input_bytes = b"already sealed";
@@ -4698,6 +4777,7 @@ fn sealing_an_already_sealed_input_set_reports_a_lifecycle_conflict() {
     assert!(!requests[0].contains("/seal HTTP/1.1"));
 }
 
+// REQ-RUNINPUT-62
 #[test]
 fn input_set_upload_rejects_changed_member_bytes_before_capability_issue() {
     let expected = b"original immutable member";
@@ -4749,6 +4829,7 @@ fn input_set_upload_rejects_changed_member_bytes_before_capability_issue() {
     );
 }
 
+// REQ-RUNINPUT-61
 #[test]
 fn input_set_upload_resumes_one_exact_attachment_member() {
     let uploaded_bytes = b"already accepted sibling";
@@ -4879,6 +4960,7 @@ fn input_set_upload_resumes_one_exact_attachment_member() {
     );
 }
 
+// REQ-RUNINPUT-61
 #[test]
 fn input_set_and_retained_input_show_commands_emit_structural_json() {
     let input_bytes = b"show input";
@@ -4943,6 +5025,69 @@ fn input_set_and_retained_input_show_commands_emit_structural_json() {
     );
     assert_no_secret_output(&retained_output, &[TOKEN, "show input"]);
     retained_server.finish();
+}
+
+// REQ-RUNINPUT-65
+#[test]
+fn retained_input_show_reports_counts_bytes_and_content_expiry() {
+    let input_bytes = b"show expiry";
+    let unscheduled = retained_inputs_response(input_bytes);
+    let unscheduled_body = String::from_utf8(unscheduled.clone())
+        .unwrap()
+        .split_once("\r\n\r\n")
+        .unwrap()
+        .1
+        .to_owned();
+    let scheduled = http_response_with_headers(
+        "200 OK",
+        Some("application/json"),
+        &[("Cache-Control", "private, no-store")],
+        unscheduled_body
+            .replacen(
+                r#""contentExpiresAt":null"#,
+                r#""contentExpiresAt":"2026-09-23T01:02:00Z""#,
+                1,
+            )
+            .as_bytes(),
+    );
+    assert_ne!(
+        scheduled, unscheduled,
+        "fixture should carry contentExpiresAt"
+    );
+    for (response, expiry) in [
+        (scheduled, "2026-09-23T01:02:00Z"),
+        (unscheduled, "not scheduled"),
+    ] {
+        let (server, _credentials, credential_path) = prepared_run(vec![response]);
+        let environment = deployment_environment(&server.api_url, &credential_path);
+        let output = run_with_env(
+            &[
+                "run",
+                "input",
+                "show",
+                ORGANIZATION,
+                RUN_ID,
+                "--allow-insecure-http",
+            ],
+            &environment,
+        );
+        assert!(output.status.success());
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        let facts: Vec<&str> = stdout.lines().collect();
+        for fact in [
+            format!("input set: {INPUT_SET_ID}"),
+            "inputs: 1".to_owned(),
+            "attachment members: 0".to_owned(),
+            format!("bytes: {}", input_bytes.len()),
+            format!("content expires: {expiry}"),
+        ] {
+            assert!(
+                facts.contains(&fact.as_str()),
+                "missing {fact:?} in {stdout}"
+            );
+        }
+        server.finish();
+    }
 }
 
 #[test]
@@ -5118,6 +5263,7 @@ fn run_input_http_decoders_reject_duplicate_members_before_using_success_respons
     assert_no_secret_output(&output, &[TOKEN, "duplicate-upload", "duplicate-download"]);
 }
 
+// REQ-RUNINPUT-66, REQ-RUNINPUT-72, REQ-RUNINPUT-75
 #[test]
 fn retained_inputs_download_uses_inventory_bound_logical_paths() {
     let input_bytes = b"private retained input bytes\n";
@@ -5179,6 +5325,7 @@ fn retained_inputs_download_uses_inventory_bound_logical_paths() {
     );
 }
 
+// REQ-RUNINPUT-66
 #[test]
 fn retained_inputs_download_selects_exact_members_only() {
     let first = b"unselected private bytes";
@@ -5344,6 +5491,7 @@ fn retained_inputs_json_download_rejects_an_unrepresentable_destination_before_t
     assert!(server.finish().is_empty());
 }
 
+// REQ-RUNINPUT-66, REQ-RUNINPUT-75
 #[test]
 fn retained_input_integrity_failure_leaves_no_destination() {
     let expected = b"expected retained bytes";
@@ -5381,6 +5529,7 @@ fn retained_input_integrity_failure_leaves_no_destination() {
     storage.finish();
 }
 
+// REQ-RUNINPUT-66
 #[cfg(target_os = "linux")]
 #[test]
 fn interrupted_retained_input_download_removes_verified_private_staging() {
@@ -5506,6 +5655,7 @@ fn interrupted_retained_input_download_removes_verified_private_staging() {
     second_storage.finish();
 }
 
+// REQ-RUNINPUT-67
 #[test]
 fn retained_input_deletion_requires_confirmation_and_sends_one_idempotent_request() {
     let unconfirmed = Command::new(env!("CARGO_BIN_EXE_um"))
@@ -5548,6 +5698,7 @@ fn retained_input_deletion_requires_confirmation_and_sends_one_idempotent_reques
     assert_eq!(header_value(&request, "idempotency-key").len(), 64);
 }
 
+// REQ-RUNINPUT-55
 #[test]
 fn named_file_parameter_controls_stop_before_cloud_input_set_allocation() {
     let input_directory = tempfile::tempdir().unwrap();
@@ -5627,6 +5778,7 @@ fn invalid_json_and_scalar_binding_conflicts_stop_before_cloud_access() {
     ));
 }
 
+// REQ-RUNINPUT-55, REQ-RUNINPUT-72
 #[test]
 fn invalid_and_oversized_named_text_input_files_stop_before_cloud_access() {
     let input_directory = tempfile::tempdir().unwrap();
@@ -5672,6 +5824,7 @@ fn invalid_and_oversized_named_text_input_files_stop_before_cloud_access() {
     }
 }
 
+// REQ-RUNINPUT-55
 #[test]
 fn exactly_one_mib_text_input_reaches_input_set_creation() {
     let input_directory = tempfile::tempdir().unwrap();
@@ -5711,6 +5864,7 @@ fn exactly_one_mib_text_input_reaches_input_set_creation() {
     );
 }
 
+// REQ-RUN-56
 #[test]
 fn credential_rejection_reuses_the_create_key_and_reports_the_server_replay() {
     let server = ScriptedServer::respond(vec![
@@ -5837,6 +5991,7 @@ fn interrupted_create_without_an_idempotency_echo_is_invalid_response() {
     server.finish();
 }
 
+// REQ-RUN-56
 #[test]
 fn ambiguous_transport_retry_reuses_the_create_key_and_request() {
     let directory = tempfile::tempdir().unwrap();
@@ -6075,6 +6230,7 @@ fn text_input_upload_redirect_is_not_followed_or_reported_as_acceptance() {
     assert!(!upload.contains("authorization:"));
 }
 
+// REQ-RUNINPUT-58
 #[test]
 fn failed_staging_reports_allocated_input_set_in_human_mode() {
     let input_directory = tempfile::tempdir().unwrap();
@@ -6112,6 +6268,7 @@ fn failed_staging_reports_allocated_input_set_in_human_mode() {
     )));
 }
 
+// REQ-RUNINPUT-60
 #[test]
 fn precondition_replay_is_resolved_by_authoritative_sealing() {
     let input_bytes = b"already uploaded named input sentinel\n";
@@ -6145,6 +6302,9 @@ fn precondition_replay_is_resolved_by_authoritative_sealing() {
     storage.finish();
 }
 
+// REQ-RUNINPUT-45
+// REQ-WORKSPACE-12
+// REQ-RUN-59
 #[test]
 fn run_show_reports_the_complete_projection_in_plain_and_json_modes() {
     for json in [false, true] {
@@ -6270,6 +6430,7 @@ fn run_show_displays_terminal_failure_and_rejection() {
     }
 }
 
+// REQ-RUN-60
 #[test]
 fn run_show_distinguishes_pending_creation_and_creation_rejection() {
     let pending_response = http_response_with_headers(
@@ -6309,6 +6470,8 @@ fn run_show_distinguishes_pending_creation_and_creation_rejection() {
     server.finish();
 }
 
+// REQ-CANCEL-52
+// REQ-ARTIFACT-12
 #[test]
 fn run_show_renders_cancellation_interruption_and_artifact_delivery() {
     let mut body = run_body_with_state("interrupted");
@@ -6356,6 +6519,7 @@ fn run_show_renders_cancellation_interruption_and_artifact_delivery() {
     server.finish();
 }
 
+// REQ-RUN-45, REQ-RUN-61
 #[test]
 fn show_wait_emits_terminal_json_for_every_execution_outcome() {
     for state in [
@@ -6399,6 +6563,7 @@ fn show_wait_emits_terminal_json_for_every_execution_outcome() {
     }
 }
 
+// REQ-RUN-61
 #[test]
 fn show_wait_emits_the_terminal_plain_projection() {
     let (server, _directory, credential_path) =
@@ -6426,6 +6591,7 @@ fn show_wait_emits_the_terminal_plain_projection() {
     server.finish();
 }
 
+// REQ-RUN-62
 #[test]
 fn show_wait_bounds_expiring_and_rejected_credential_refresh() {
     for expiring in [true, false] {
@@ -6658,6 +6824,7 @@ fn show_wait_preserves_fatal_response_classifications() {
     }
 }
 
+// REQ-RUN-60
 #[test]
 fn run_show_rejects_a_projection_for_a_different_run() {
     let mut response_body = run_body();
@@ -6726,6 +6893,7 @@ fn pre_dispatch_refresh_outage_is_not_run_acceptance_unknown() {
     }
 }
 
+// REQ-RUN-57
 #[test]
 fn invalid_create_acceptance_in_plain_mode_retains_reconciliation_key() {
     let (server, _directory, credential_path) = prepared_run(vec![acceptance_response_for(
@@ -7044,6 +7212,7 @@ fn run_failures_use_registered_outcomes_without_exposing_secrets() {
     assert_no_secret_output(&output, &[TOKEN]);
 }
 
+// REQ-RUN-62
 #[test]
 fn show_wait_bounds_transport_retries_and_emits_one_unavailable_result() {
     let (server, _directory, credential_path) = prepared_run(vec![Vec::new(), Vec::new()]);
@@ -7073,6 +7242,7 @@ fn show_wait_bounds_transport_retries_and_emits_one_unavailable_result() {
     assert_eq!(server.finish().len(), 2);
 }
 
+// REQ-RUN-62
 #[test]
 fn signals_stop_only_active_cloud_run_show_observation() {
     for (signal, expected_exit) in [
@@ -7139,6 +7309,7 @@ fn signals_stop_only_active_cloud_run_show_observation() {
     }
 }
 
+// REQ-RUN-57
 #[cfg(target_os = "linux")]
 #[test]
 fn signalled_create_reports_unknown_commitment_without_exposing_credentials() {

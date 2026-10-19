@@ -730,6 +730,8 @@ fn write_credential_fixture_with_refresh_token(
     credential_file.write_all(b"\n").unwrap();
 }
 
+// REQ-AUTH-52
+// INV-CLI-8
 #[test]
 fn auth_without_a_subcommand_prints_composed_help_without_loading_deployment() {
     let output = run_with_env(&["auth"], &[("UM_API_URL", "partial-override-is-ignored")]);
@@ -740,6 +742,7 @@ fn auth_without_a_subcommand_prints_composed_help_without_loading_deployment() {
     assert!(output.stderr.is_empty());
 }
 
+// REQ-ONBOARD-3
 #[test]
 fn version_command_and_flag_report_the_resolved_build_version() {
     let expected = format!("um {BUILD_VERSION}\n");
@@ -753,6 +756,7 @@ fn version_command_and_flag_report_the_resolved_build_version() {
     }
 }
 
+// REQ-ONBOARD-4
 #[test]
 fn structured_version_reports_the_resolved_build_version_contract() {
     let output = run(&["version", "--json"]);
@@ -786,6 +790,55 @@ fn structured_version_reports_the_resolved_build_version_contract() {
     assert!(output.stderr.is_empty());
 }
 
+// REQ-ONBOARD-5
+#[test]
+fn version_inspection_ignores_deployment_credentials_and_network() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("network sentinel should bind");
+    listener
+        .set_nonblocking(true)
+        .expect("network sentinel should be nonblocking");
+    let api_url = format!("http://{}/api", listener.local_addr().unwrap());
+    let credential_directory = private_credential_directory();
+    let credential_path = credential_directory.path().join("credentials.json");
+    fs::write(&credential_path, b"not a credential store").unwrap();
+    let credential_path = credential_path
+        .to_str()
+        .expect("temporary credential path should be UTF-8");
+    let environments: [&[(&str, &str)]; 2] = [
+        &[
+            ("UM_API_URL", "partial-override-is-ignored"),
+            (CREDENTIALS_FILE_VARIABLE, credential_path),
+        ],
+        &[
+            ("UM_API_URL", &api_url),
+            ("UM_AUTH_ISSUER", &api_url),
+            ("UM_AUTH_AUDIENCE", "https://api.version.invalid"),
+            ("UM_AUTH_CLIENT_ID", "version-client"),
+            (CREDENTIALS_FILE_VARIABLE, credential_path),
+        ],
+    ];
+
+    for environment in environments {
+        for args in [
+            ["version"].as_slice(),
+            ["--version"].as_slice(),
+            ["version", "--json"].as_slice(),
+        ] {
+            let output = run_with_env(args, environment);
+
+            assert!(output.status.success(), "{args:?}: {output:?}");
+            assert!(!output.stdout.is_empty(), "{args:?}");
+            assert!(output.stderr.is_empty(), "{args:?}: {output:?}");
+        }
+    }
+    assert!(
+        matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+        "version inspection must not open a network connection"
+    );
+}
+
+// REQ-AUTH-53
+// INV-CLI-9
 #[test]
 fn insecure_http_flag_is_scoped_to_networked_leaf_commands() {
     let misplaced = run(&["--allow-insecure-http", "auth", "status"]);
@@ -807,6 +860,8 @@ fn insecure_http_flag_is_scoped_to_networked_leaf_commands() {
     server.finish();
 }
 
+// REQ-AUTH-35, REQ-AUTH-51
+// INV-CLI-8
 #[test]
 fn partial_deployment_override_fails_before_auth_dispatch() {
     let output = run_with_env(
@@ -818,6 +873,7 @@ fn partial_deployment_override_fails_before_auth_dispatch() {
     assert!(output.stdout.is_empty());
 }
 
+// REQ-AUTH-38, REQ-AUTH-53
 #[test]
 fn networked_auth_requires_http_opt_in_but_local_logout_does_not() {
     let body = br#"{"type":"https://api.usefulmachinery.com/problems/unauthorized","title":"Unauthorized","status":401}"#;
@@ -862,6 +918,7 @@ fn status_does_not_apply_transport_policy_to_the_unused_issuer() {
     assert!(output.stderr.is_empty());
 }
 
+// REQ-AUTH-32, REQ-AUTH-34, REQ-AUTH-54
 #[test]
 fn structured_status_preserves_authenticated_actions_without_interpreting_them() {
     let actions = serde_json::json!([
@@ -927,6 +984,7 @@ fn structured_status_preserves_authenticated_actions_without_interpreting_them()
     assert!(request.contains("authorization: Bearer unique-authenticated-synthetic-token\r\n"));
 }
 
+// REQ-AUTH-34
 #[test]
 fn human_authenticated_status_reproduces_opaque_actions() {
     let actions = serde_json::json!([
@@ -971,6 +1029,7 @@ fn human_authenticated_status_reproduces_opaque_actions() {
     server.finish();
 }
 
+// REQ-AUTH-34
 #[test]
 fn structured_status_preserves_signup_actions_without_synthesizing_fields() {
     let actions = serde_json::json!([{
@@ -1019,6 +1078,7 @@ fn structured_status_preserves_signup_actions_without_synthesizing_fields() {
     server.finish();
 }
 
+// REQ-AUTH-32, REQ-AUTH-34
 #[test]
 fn structured_status_omits_absent_optional_fields() {
     let cases = [
@@ -1063,6 +1123,7 @@ fn structured_status_omits_absent_optional_fields() {
     }
 }
 
+// REQ-AUTH-31, REQ-AUTH-35
 #[test]
 fn status_without_a_credential_still_contacts_the_server_without_authorization() {
     let body = br#"{"type":"https://api.usefulmachinery.com/problems/unauthorized","title":"Unauthorized","status":401}"#;
@@ -1091,6 +1152,7 @@ fn status_without_a_credential_still_contacts_the_server_without_authorization()
     assert!(!request.contains("authorization:"));
 }
 
+// REQ-AUTH-43
 #[test]
 fn expired_status_credential_is_refreshed_and_rotated_before_api_use() {
     let server = ScriptedServer::respond(vec![
@@ -1165,6 +1227,8 @@ fn expired_status_credential_is_refreshed_and_rotated_before_api_use() {
     );
 }
 
+// REQ-AUTH-44
+// INV-CLI-7
 #[test]
 fn rejected_status_access_token_refreshes_once_and_retries_once() {
     let unauthorized = problem_http_response(
@@ -1222,6 +1286,8 @@ fn rejected_status_access_token_refreshes_once_and_retries_once() {
     assert!(requests[2].contains("authorization: Bearer unique-recovered-status-access-token\r\n"));
 }
 
+// REQ-AUTH-44
+// INV-CLI-7
 #[test]
 fn a_second_status_rejection_stops_without_an_authentication_loop() {
     let unauthorized = || {
@@ -1274,6 +1340,8 @@ fn a_second_status_rejection_stops_without_an_authentication_loop() {
     assert!(stored["credentials"].as_array().unwrap().is_empty());
 }
 
+// REQ-AUTH-31, REQ-AUTH-44
+// INV-CLI-7
 #[test]
 fn terminal_refresh_rejection_removes_session_and_checks_anonymously() {
     let unauthorized = || {
@@ -1327,6 +1395,8 @@ fn terminal_refresh_rejection_removes_session_and_checks_anonymously() {
     assert!(stored["credentials"].as_array().unwrap().is_empty());
 }
 
+// REQ-AUTH-46
+// INV-CLI-7
 #[test]
 fn transient_refresh_failure_preserves_the_rotating_session() {
     for (status, category) in [
@@ -1373,6 +1443,7 @@ fn transient_refresh_failure_preserves_the_rotating_session() {
     }
 }
 
+// REQ-AUTH-46
 #[test]
 fn connection_failure_during_refresh_preserves_the_rotating_session() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1407,6 +1478,7 @@ fn connection_failure_during_refresh_preserves_the_rotating_session() {
     assert_eq!(fs::read(&credential_path).unwrap(), before);
 }
 
+// REQ-AUTH-43
 #[test]
 fn one_ambiguous_refresh_response_is_retried_and_rotated_atomically() {
     let server = ScriptedServer::respond(vec![
@@ -1467,6 +1539,8 @@ fn one_ambiguous_refresh_response_is_retried_and_rotated_atomically() {
     );
 }
 
+// REQ-AUTH-43
+// INV-CLI-6
 #[cfg(target_os = "linux")]
 #[test]
 fn concurrent_processes_exchange_one_rotating_refresh_token_once() {
@@ -1580,6 +1654,8 @@ fn concurrent_processes_exchange_one_rotating_refresh_token_once() {
     );
 }
 
+// REQ-AUTH-33, REQ-AUTH-35
+// INV-CLI-11
 #[test]
 fn unreachable_status_uses_unavailable_exit_code() {
     for (http_status, expected_category) in [
@@ -1612,6 +1688,7 @@ fn unreachable_status_uses_unavailable_exit_code() {
     }
 }
 
+// REQ-AUTH-32, REQ-AUTH-33, REQ-AUTH-35
 #[test]
 fn connection_failure_uses_unavailable_exit_code_and_status() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1640,6 +1717,7 @@ fn connection_failure_uses_unavailable_exit_code_and_status() {
     assert!(output.stderr.is_empty());
 }
 
+// REQ-AUTH-35, REQ-AUTH-41, REQ-AUTH-54
 #[test]
 fn credential_failure_emits_no_status_or_network_request() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1673,6 +1751,8 @@ fn credential_failure_emits_no_status_or_network_request() {
     assert_eq!(fs::read(&credential_path).unwrap(), malformed);
 }
 
+// REQ-AUTH-35, REQ-AUTH-54
+// INV-CLI-6
 #[test]
 fn protocol_failure_emits_no_status_and_does_not_leak_credentials() {
     let body = br#"{"unique":"unique-malformed-response-secret"}"#;
@@ -1743,6 +1823,8 @@ fn malformed_unauthorized_response_deletes_the_rejected_credential() {
     assert_eq!(server.finish().len(), 3);
 }
 
+// REQ-AUTH-36
+// INV-CLI-11
 #[test]
 fn human_status_writes_the_recognized_result_to_stdout() {
     let body = br#"{"type":"https://api.usefulmachinery.com/problems/unauthorized","title":"Unauthorized","status":401}"#;
@@ -1760,6 +1842,7 @@ fn human_status_writes_the_recognized_result_to_stdout() {
     server.finish();
 }
 
+// REQ-AUTH-37, REQ-AUTH-38, REQ-AUTH-40
 #[test]
 fn logout_revokes_and_removes_only_the_selected_renewable_session() {
     let server = ScriptedServer::respond(vec![http_response("200 OK", None, &[])]);
@@ -1853,6 +1936,7 @@ fn logout_revokes_and_removes_only_the_selected_renewable_session() {
     );
 }
 
+// REQ-AUTH-37, REQ-AUTH-38
 #[test]
 fn logout_removes_local_session_when_revocation_is_unconfirmed() {
     let server = ScriptedServer::respond(vec![Vec::new()]);
@@ -1887,6 +1971,7 @@ fn logout_removes_local_session_when_revocation_is_unconfirmed() {
     server.finish();
 }
 
+// REQ-AUTH-41, REQ-AUTH-54
 #[test]
 fn logout_preserves_malformed_credentials_without_leaking_contents() {
     let credential_directory =
@@ -1918,6 +2003,7 @@ fn logout_preserves_malformed_credentials_without_leaking_contents() {
     assert_eq!(fs::read(credential_path).unwrap(), malformed);
 }
 
+// REQ-RUNNERENROLL-46
 #[test]
 fn runner_doctor_lists_registered_checks_without_running_git() {
     let empty_path = tempfile::tempdir().expect("temporary empty PATH should be created");
@@ -1936,6 +2022,7 @@ fn runner_doctor_lists_registered_checks_without_running_git() {
     assert!(output.stderr.is_empty());
 }
 
+// REQ-RUNNERENROLL-45, REQ-RUNNERENROLL-79
 #[test]
 fn runner_doctor_reports_git_success_in_human_form() {
     let git_directory = fake_git(
@@ -1955,6 +2042,7 @@ fn runner_doctor_reports_git_success_in_human_form() {
     assert!(output.stderr.is_empty());
 }
 
+// REQ-RUNNERENROLL-47
 #[test]
 fn runner_doctor_reports_schema_one_json() {
     let git_directory = fake_git("printf '%s\\n' 'git version 2.42.0'");
@@ -2005,6 +2093,7 @@ fn runner_doctor_reports_schema_one_json() {
     assert!(output.stderr.is_empty());
 }
 
+// REQ-RUNNERENROLL-47, REQ-RUNNERENROLL-79
 #[test]
 fn runner_doctor_reports_missing_git() {
     let empty_path = tempfile::tempdir().expect("temporary empty PATH should be created");
@@ -2021,6 +2110,7 @@ fn runner_doctor_reports_missing_git() {
     assert!(output.stderr.is_empty());
 }
 
+// REQ-RUNNERENROLL-46
 #[test]
 fn runner_doctor_rejects_unknown_check_without_running_git() {
     let git_directory =
@@ -2042,6 +2132,7 @@ fn runner_doctor_rejects_unknown_check_without_running_git() {
     assert!(!marker.exists());
 }
 
+// REQ-RUNNERENROLL-45
 #[test]
 fn runner_doctor_does_not_load_human_configuration() {
     let git_directory = fake_git("printf '%s\\n' 'git version 2.42.0'");
@@ -2084,6 +2175,7 @@ fn runner_doctor_list_options_conflict() {
     }
 }
 
+// REQ-TELEMETRY-16
 #[test]
 fn otlp_configuration_is_ignored_outside_valid_runner_serve() {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind unused OTLP receiver");
@@ -2124,6 +2216,7 @@ fn otlp_configuration_is_ignored_outside_valid_runner_serve() {
     );
 }
 
+// REQ-TELEMETRY-19, REQ-TELEMETRY-26, REQ-TELEMETRY-27
 #[test]
 fn privacy_and_malformed_configuration_make_no_otlp_request() {
     for (privacy, malformed_endpoint, expected_diagnostic) in [
@@ -2231,6 +2324,7 @@ fn runner_serve_redacts_invalid_protected_state() {
     assert!(!stderr.contains(secret_marker));
 }
 
+// INV-CLI-11
 #[test]
 fn unknown_commands_are_usage_errors() {
     let output = run(&["unknown"]);

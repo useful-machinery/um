@@ -31,6 +31,7 @@ fn continue_args(run: &Path, from: &[&str]) -> Vec<String> {
     args
 }
 
+// REQ-CONTINUE-10, REQ-CONTINUE-13
 #[test]
 fn continuation_collects_all_missing_candidate_harness_profiles() {
     let bundle = RunBundle::new(
@@ -133,6 +134,7 @@ steps:
     assert_eq!(state["attempts"].as_array().unwrap().len(), 1);
 }
 
+// REQ-CONTINUE-9, REQ-CONTINUE-10
 #[test]
 fn continuation_reports_every_immutable_input_constraint_failure() {
     let bundle = RunBundle::new(
@@ -224,6 +226,7 @@ steps:
     assert_eq!(state["attempts"].as_array().unwrap().len(), 1);
 }
 
+// REQ-CONTINUE-27
 #[test]
 fn continuation_acquires_after_pre_rename_publication_crash() {
     let bundle = RunBundle::new(
@@ -262,6 +265,7 @@ fn continuation_acquires_after_pre_rename_publication_crash() {
     );
 }
 
+// REQ-CONTINUE-27, REQ-CONTINUE-28
 #[test]
 fn replacement_resolution_failure_uses_the_continuation_diagnostic_vocabulary() {
     let bundle = RunBundle::new(
@@ -295,6 +299,7 @@ fn replacement_resolution_failure_uses_the_continuation_diagnostic_vocabulary() 
     assert_eq!(state["attempts"].as_array().unwrap().len(), 1);
 }
 
+// REQ-CONTINUE-10, REQ-CONTINUE-28
 #[test]
 fn invalid_selection_keeps_independent_immutable_input_diagnostics() {
     let bundle = RunBundle::new(
@@ -529,6 +534,7 @@ steps:
     assert!(!run.join("attempts/000004").exists());
 }
 
+// REQ-CONTINUE-8, REQ-CONTINUE-10
 #[test]
 fn continuation_accumulates_inheritance_and_executed_git_admission_failures() {
     let bundle = RunBundle::new(
@@ -603,6 +609,7 @@ steps:
     assert_eq!(state["attempts"].as_array().unwrap().len(), 1);
 }
 
+// REQ-CONTINUE-27
 #[test]
 fn invalid_selection_does_not_claim_an_attempt() {
     let bundle = RunBundle::new(
@@ -640,6 +647,7 @@ fn invalid_selection_does_not_claim_an_attempt() {
     }
 }
 
+// REQ-CONTINUE-17
 #[test]
 fn inherited_zero_delta_git_keeps_original_producer_without_carrier() {
     let bundle = RunBundle::new(GIT_CONTINUATION_SOURCE);
@@ -696,6 +704,7 @@ fn inherited_zero_delta_git_keeps_original_producer_without_carrier() {
     assert!(jsonschema::validator_for(&schema).unwrap().is_valid(&view));
 }
 
+// REQ-CONTINUE-18
 #[test]
 fn continuation_git_capture_uses_initial_baseline_after_head_advances() {
     let bundle = RunBundle::new(GIT_CONTINUATION_SOURCE);
@@ -745,6 +754,7 @@ fn continuation_git_capture_uses_initial_baseline_after_head_advances() {
     assert!(result["exports"]["branch"]["carrier"].is_object());
 }
 
+// REQ-CONTINUE-5, REQ-CONTINUE-14
 #[test]
 fn retry_after_failed_continuation_reruns_the_initial_definition_without_context() {
     let bundle = RunBundle::new(
@@ -839,6 +849,7 @@ finalizers:
     );
 }
 
+// REQ-CONTINUE-16
 #[test]
 fn inherited_json_and_file_values_stage_from_original_producer() {
     let bundle = RunBundle::new(
@@ -905,6 +916,7 @@ exports:
     );
 }
 
+// REQ-WFRECOVERY-55
 #[test]
 fn continuation_recovery_handler_reads_bound_context_and_starts_fresh() {
     let bundle = RunBundle::new(
@@ -981,6 +993,7 @@ steps:
     );
 }
 
+// REQ-CONTINUE-11, REQ-CONTINUE-12, REQ-CONTINUE-23, REQ-CONTINUE-25
 #[test]
 fn replacement_definition_and_root_are_selected_independently() {
     let bundle = RunBundle::new(
@@ -1066,6 +1079,8 @@ fn replacement_definition_and_root_are_selected_independently() {
     );
 }
 
+// REQ-WFFINALIZE-22
+// REQ-CONTINUE-5, REQ-CONTINUE-15, REQ-CONTINUE-16, REQ-CONTINUE-17
 #[test]
 fn chained_continuation_keeps_original_producer_and_reruns_finalizers() {
     let bundle = RunBundle::new(
@@ -1158,6 +1173,7 @@ fn chained_continuation_keeps_original_producer_and_reruns_finalizers() {
     assert!(!run.join("attempts/000003/values/step/producer").exists());
 }
 
+// REQ-CONTINUE-1, REQ-CONTINUE-2, REQ-CONTINUE-3, REQ-CONTINUE-15, REQ-CONTINUE-19, REQ-CONTINUE-20, REQ-CONTINUE-21, REQ-CONTINUE-26, REQ-CONTINUE-29, REQ-CONTINUE-31
 #[test]
 fn workflow_continue_inherits_prior_output_and_executes_only_downstream() {
     let bundle = RunBundle::new(
@@ -1337,4 +1353,94 @@ fn workflow_continue_inherits_prior_output_and_executes_only_downstream() {
         "continuation_disposition_ineligible"
     );
     assert_eq!(fs::read(run.join("state.json")).unwrap(), before);
+}
+
+// REQ-AGENT-59
+#[test]
+fn continuation_applies_the_retained_profile_replacement_to_every_attempt() {
+    // The replaced profile is unused, so no harness installation is required.
+    let definition = |profiles: &str| {
+        format!(
+            "schemaVersion: 1\nenvironmentPassthrough: [PHASE]\n{profiles}steps:\n  execute:\n    kind: cmd\n    command: {{argv: [\"sh\", \"-c\", \"test \\\"$PHASE\\\" = continuation\"]}}\n"
+        )
+    };
+    let declared = "agentProfiles:\n  unused:\n    harness:\n      kind: pi\n      config:\n        model: fixture/model\n        thinking: low\n";
+    let bundle = RunBundle::new(&definition(declared));
+    let document = bundle.initial_cwd().join("profiles.yaml");
+    fs::write(
+        &document,
+        "schemaVersion: 1\nagentProfiles:\n  unused:\n    harness:\n      kind: claude_code\n      config:\n        model: fixture/claude\n        effort: low\n",
+    )
+    .unwrap();
+    let run = bundle.result("replaced-continuation");
+    let mut initial = bundle.args(&run);
+    initial.splice(
+        initial.len() - 1..initial.len() - 1,
+        [
+            "--agent-profiles".to_owned(),
+            document.to_string_lossy().into_owned(),
+            "--json".to_owned(),
+        ],
+    );
+    let first = isolated_command(&initial)
+        .env("PHASE", "initial")
+        .output()
+        .unwrap();
+    assert_eq!(first.status.code(), Some(1));
+    fs::remove_file(&document).unwrap();
+    let replacement = |attempt: &str| -> serde_json::Value {
+        let result: serde_json::Value = serde_json::from_slice(
+            &fs::read(run.join(format!("attempts/{attempt}/result/result.json"))).unwrap(),
+        )
+        .unwrap();
+        result["workflow"]["agentProfileReplacement"].clone()
+    };
+    let retained = replacement("000001");
+    assert_eq!(
+        retained["profiles"]["unused"]["harness"]["kind"],
+        "claude_code"
+    );
+    let continue_with = |workflow: Option<&str>, phase: &str| {
+        let mut request = continue_args(&run, &["execute"]);
+        if let Some(workflow) = workflow {
+            let path = bundle.source_root().join(workflow);
+            request.extend(["--workflow".to_owned(), path.to_string_lossy().into_owned()]);
+        }
+        isolated_command(&request)
+            .env("PHASE", phase)
+            .output()
+            .unwrap()
+    };
+
+    fs::write(bundle.source_root().join("undeclared.yaml"), definition("")).unwrap();
+    let rejected = continue_with(Some("undeclared.yaml"), "continuation");
+    assert_eq!(rejected.status.code(), Some(1));
+    let rejection: serde_json::Value = serde_json::from_slice(&rejected.stdout).unwrap();
+    assert_eq!(rejection["phase"], "continuation");
+    assert_eq!(
+        rejection["diagnostics"][0]["code"],
+        "continuation_definition_invalid"
+    );
+    assert!(!run.join("attempts/000002").exists());
+
+    fs::write(
+        bundle.source_root().join("replacement.yaml"),
+        definition(declared),
+    )
+    .unwrap();
+    // A failed continuation can itself be continued; each attempt reapplies the replacement.
+    for (workflow, phase, status, attempt) in [
+        (None, "unset", Some(1), "000002"),
+        (Some("replacement.yaml"), "continuation", Some(0), "000003"),
+    ] {
+        let output = continue_with(workflow, phase);
+        assert_eq!(
+            output.status.code(),
+            status,
+            "{attempt}: {} {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(replacement(attempt), retained, "{attempt}");
+    }
 }

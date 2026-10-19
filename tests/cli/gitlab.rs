@@ -114,6 +114,7 @@ fn request(
     }
 }
 
+// REQ-CONNECTION-56, REQ-CONNECTION-75
 #[test]
 fn connection_and_candidate_verbs_use_exact_resources_and_explicit_bodies() {
     let (server, _dir, credential) = prepared(vec![
@@ -253,6 +254,7 @@ fn connection_and_candidate_verbs_use_exact_resources_and_explicit_bodies() {
     );
 }
 
+// REQ-CONNECTION-56, REQ-CONNECTION-72, REQ-CONNECTION-73
 #[test]
 fn repository_discovery_and_selection_use_exact_generated_actions() {
     let mut selected = active_connection();
@@ -390,6 +392,7 @@ fn repository_discovery_and_selection_use_exact_generated_actions() {
     }
 }
 
+// REQ-CONNECTION-70
 #[test]
 fn repository_selection_preconditions_conflicts_and_lost_response_replay() {
     let (server, _dir, credential) = prepared(vec![]);
@@ -646,6 +649,7 @@ fn await_terminal_prompt(
     }
 }
 
+// REQ-CONNECTION-58
 #[test]
 fn terminal_review_requires_exact_identity_and_dedication_before_activation() {
     for (id, attestation, exit, posts) in [
@@ -750,6 +754,7 @@ fn mismatched_resource_response_cannot_authorize_identity_review() {
     assert_eq!(server.finish().len(), 1);
 }
 
+// REQ-CONNECTION-58
 #[test]
 fn help_links_public_setup_and_requires_explicit_activation_flags() {
     for args in [
@@ -781,6 +786,7 @@ fn help_links_public_setup_and_requires_explicit_activation_flags() {
     assert_eq!(output.status.code(), Some(2));
 }
 
+// REQ-CONNECTION-77
 #[test]
 fn authentication_and_candidate_conflicts_have_distinct_exits() {
     let problem = |status, code, kind| {
@@ -820,6 +826,7 @@ fn authentication_and_candidate_conflicts_have_distinct_exits() {
     assert_eq!(server.finish().len(), 3);
 }
 
+// REQ-CONNECTION-57
 #[test]
 fn credential_kinds_select_only_the_approved_token_declaration() {
     for (flag, kind, account) in [
@@ -872,6 +879,7 @@ fn credential_kinds_select_only_the_approved_token_declaration() {
     }
 }
 
+// REQ-CONNECTION-57
 #[test]
 fn unsafe_token_sources_and_versions_fail_before_network_use() {
     use std::os::unix::fs::symlink;
@@ -963,6 +971,7 @@ fn unsafe_token_sources_and_versions_fail_before_network_use() {
     assert!(server.finish().is_empty());
 }
 
+// REQ-CONNECTION-58, REQ-CONNECTION-74
 #[test]
 fn a_lost_mutation_response_replays_the_same_key_and_body() {
     let dir = private_credential_directory();
@@ -1279,6 +1288,7 @@ fn candidate_submission_and_activation_conflicts_do_not_retry() {
     assert_eq!(server.finish().len(), 2);
 }
 
+// REQ-CONNECTION-57
 #[test]
 fn token_stdin_is_exclusive_and_never_printed() {
     let (server, _dir, credential) =
@@ -1387,6 +1397,7 @@ fn signal_after_dispatch_reports_replay_key_without_secret() {
     }
 }
 
+// REQ-CONNECTION-47, REQ-CONNECTION-77
 #[test]
 fn pending_identity_mismatch_and_conflict_have_separate_exits() {
     let conflict = problem_http_response(

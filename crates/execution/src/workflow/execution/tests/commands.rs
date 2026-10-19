@@ -1,5 +1,6 @@
 use super::*;
 
+// REQ-WFEXEC-22
 #[tokio::test]
 async fn command_environment_requires_declared_passthrough() {
     for (declaration, expected) in [
@@ -39,6 +40,7 @@ async fn command_environment_requires_declared_passthrough() {
     }
 }
 
+// REQ-WFRECOVERY-7, REQ-WFRECOVERY-8, REQ-WFRECOVERY-9, REQ-WFRECOVERY-21, REQ-WFRECOVERY-30, REQ-WFRECOVERY-39, REQ-WFRECOVERY-59
 #[tokio::test]
 async fn source_neutral_command_handler_repairs_and_rechecks_with_private_authority() {
     with_watchdog(async {
@@ -152,6 +154,7 @@ exports:
     .await;
 }
 
+// REQ-WFRECOVERY-16
 #[tokio::test]
 async fn omitted_recovery_handler_cwd_inherits_command_target_cwd() {
     with_watchdog(async {
@@ -205,6 +208,244 @@ steps:
     .await;
 }
 
+// REQ-WFRECOVERY-17
+#[tokio::test]
+async fn recovery_handler_cwd_is_contained_and_moves_only_the_handler() {
+    with_watchdog(async {
+        let source = r#"schemaVersion: 1
+steps:
+  repair:
+    kind: cmd
+    cwd: target
+    recovery:
+      retries: 1
+      handler:
+        kind: cmd
+        cwd: HANDLER_CWD
+        command:
+          argv:
+            - /bin/sh
+            - -c
+            - |
+              pwd -P > handler-cwd.txt
+              printf '%s' '{"schemaVersion":1,"decision":"recheck","summary":"repaired workspace","reason":"rerun the target"}' > "$UM_RECOVERY_RESULT"
+    command:
+      argv: [/bin/sh, -c, "pwd -P >> target-cwd.txt; test -f ../repairs/handler-cwd.txt || exit 75"]
+"#;
+        let run = |handler_cwd: &str| {
+            let fixture = execution_fixture(
+                &source.replace("HANDLER_CWD", handler_cwd),
+                ResolvedInputs::default(),
+                EnvironmentSnapshot::new([("PATH", "/bin:/usr/bin")]),
+                CancellationSource::new(),
+                1,
+                1024,
+            );
+            fs::create_dir(fixture.execution_root.join("target")).unwrap();
+            fixture
+        };
+
+        let contained = run("repairs");
+        fs::create_dir(contained.execution_root.join("repairs")).unwrap();
+        let root = fs::canonicalize(&contained.execution_root).unwrap();
+        let result = execute_workflow(
+            contained.admitted,
+            &contained.artifacts,
+            &contained.inputs,
+            &StepDiagnosticLog::default(),
+            AgentExecution::disabled(),
+            TestClock,
+            NoopExecutionObserver,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.outcome, RunOutcome::Succeeded);
+        assert_eq!(
+            fs::read_to_string(contained.execution_root.join("repairs/handler-cwd.txt")).unwrap(),
+            format!("{}\n", root.join("repairs").display())
+        );
+        let target = root.join("target").display().to_string();
+        assert_eq!(
+            fs::read_to_string(contained.execution_root.join("target/target-cwd.txt")).unwrap(),
+            format!("{target}\n{target}\n")
+        );
+
+        let escaping = run("escape");
+        let outside = escaping._temporary.path().join("outside");
+        fs::create_dir(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, escaping.execution_root.join("escape")).unwrap();
+        let result = execute_workflow(
+            escaping.admitted,
+            &escaping.artifacts,
+            &escaping.inputs,
+            &StepDiagnosticLog::default(),
+            AgentExecution::disabled(),
+            TestClock,
+            NoopExecutionObserver,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(result.outcome, RunOutcome::Failed { .. }));
+        assert!(!outside.join("handler-cwd.txt").exists());
+        let recovery = result.recoveries["repair"].as_ref().unwrap();
+        assert!(matches!(
+            &recovery.rounds[0].handler.as_ref().unwrap().outcome,
+            RecoveryHandlerOutcome::Failed {
+                cause: StepFailureCause::RecoveryHandler(
+                    RecoveryHandlerFailure::WorkingDirectoryUnavailable
+                ),
+                ..
+            }
+        ));
+    })
+    .await;
+}
+
+// REQ-OUTPUTS-3
+#[tokio::test]
+async fn path_outputs_are_read_from_the_execution_root_not_the_step_cwd() {
+    with_watchdog(async {
+        let source = r#"schemaVersion: 1
+steps:
+  report:
+    kind: cmd
+    cwd: nested
+    command:
+      argv: [/bin/sh, -c, "printf from-cwd > report.txt; printf from-root > ../report.txt"]
+    outputs:
+      report: {kind: file, from: path, path: report.txt, mediaType: text/plain}
+exports:
+  report: {ref: outputs.report.report}
+"#;
+        let fixture = execution_fixture(
+            source,
+            ResolvedInputs::default(),
+            EnvironmentSnapshot::new([("PATH", "/bin:/usr/bin")]),
+            CancellationSource::new(),
+            1,
+            1024,
+        );
+        fs::create_dir(fixture.execution_root.join("nested")).unwrap();
+        let result = execute_workflow(
+            fixture.admitted,
+            &fixture.artifacts,
+            &fixture.inputs,
+            &StepDiagnosticLog::default(),
+            AgentExecution::disabled(),
+            TestClock,
+            NoopExecutionObserver,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.outcome, RunOutcome::Succeeded);
+        let ExportValue::Available { output } = &result.exports["report"] else {
+            panic!("the report output must be exported");
+        };
+        let mut bytes = Vec::new();
+        fixture
+            .artifacts
+            .copy_to(output.as_file().unwrap().handle(), &mut bytes)
+            .unwrap();
+        assert_eq!(bytes, b"from-root");
+    })
+    .await;
+}
+
+// REQ-WFCOND-25
+#[tokio::test]
+async fn condition_failure_precedes_any_invocation_and_follows_the_failure_policy() {
+    with_watchdog(async {
+        let source = r#"schemaVersion: 1
+steps:
+  plan:
+    kind: cmd
+    command: {argv: [/bin/sh, -c, "printf '{\"deploy\":true}' > plan.json"]}
+    outputs:
+      result: {kind: json, from: path, path: plan.json, schema: plan.schema.json}
+  deploy:
+    kind: cmd
+    failurePolicy: POLICY
+    condition:
+      equals:
+        - {ref: outputs.plan.result, pointer: /deployment}
+        - {value: approved}
+    recovery: {retries: 2}
+    command: {argv: [/bin/sh, -c, "printf deployed > deployed.marker"]}
+  package:
+    kind: cmd
+    dependsOn: [deploy]
+    command: {argv: [/bin/sh, -c, "printf packaged > packaged.marker"]}
+"#;
+        let detail = crate::workflow::evidence::FailureDetail::json_pointer_missing(
+            "outputs.plan.result",
+            "/deployment",
+        )
+        .unwrap();
+        for policy in ["required", "advisory"] {
+            let fixture = execution_fixture_with_source_files(
+                &source.replace("POLICY", policy),
+                &[(
+                    "plan.schema.json",
+                    br#"{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object"}"#,
+                )],
+                ResolvedInputs::default(),
+                EnvironmentSnapshot::new([("PATH", "/bin:/usr/bin")]),
+                CancellationSource::new(),
+                1,
+                1024,
+            );
+            let diagnostics = StepDiagnosticLog::default();
+            let result = execute_workflow(
+                fixture.admitted,
+                &fixture.artifacts,
+                &fixture.inputs,
+                &diagnostics,
+                AgentExecution::disabled(),
+                TestClock,
+                NoopExecutionObserver,
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(
+                result.steps["deploy"],
+                StepState::Failed {
+                    detail: detail.clone()
+                },
+                "{policy}"
+            );
+            assert!(diagnostics.invocation_ids("deploy").is_empty(), "{policy}");
+            assert!(
+                result.recoveries["deploy"]
+                    .as_ref()
+                    .is_none_or(|recovery| recovery.rounds.is_empty()),
+                "{policy} condition failure started recovery"
+            );
+            assert!(!fixture.execution_root.join("deployed.marker").exists());
+            match policy {
+                "required" => {
+                    let RunOutcome::Failed { primary_issue, .. } = &result.outcome else {
+                        panic!("a required condition failure must fail the run");
+                    };
+                    assert_eq!(primary_issue.node.id, "deploy");
+                    assert_eq!(
+                        primary_issue.detail,
+                        crate::workflow::evidence::PrimaryIssueDetail::Failed(detail.clone())
+                    );
+                    assert!(!fixture.execution_root.join("packaged.marker").exists());
+                }
+                _ => {
+                    assert_eq!(result.outcome, RunOutcome::Succeeded);
+                    assert!(fixture.execution_root.join("packaged.marker").exists());
+                }
+            }
+        }
+    })
+    .await;
+}
+
+// REQ-WFRECOVERY-6, REQ-WFRECOVERY-30
 #[tokio::test]
 async fn semantic_outputs_recovery_reruns_complete_target() {
     with_watchdog(async {
@@ -302,6 +543,7 @@ exports:
     .await;
 }
 
+// REQ-WFRECOVERY-10, REQ-WFRECOVERY-23, REQ-WFRECOVERY-26
 #[tokio::test]
 async fn command_handler_failures_stop_once_without_authorizing_recheck() {
     with_watchdog(async {
@@ -438,6 +680,7 @@ async fn configured_inactive_local_recovery_preserves_target_execution() {
     assert!(fixture.execution_root.join("target-started").exists());
 }
 
+// REQ-WFEXEC-28, REQ-WFEXEC-35
 #[tokio::test]
 async fn command_finalizer_receives_the_engine_context_after_ordinary_quiescence() {
     with_watchdog(async {
@@ -506,6 +749,7 @@ async fn command_finalizer_receives_the_engine_context_after_ordinary_quiescence
     .await;
 }
 
+// REQ-WFEXEC-19
 #[tokio::test]
 async fn command_receives_eof_instead_of_the_adapters_live_input() {
     with_watchdog(async {

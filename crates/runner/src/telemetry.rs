@@ -702,6 +702,7 @@ mod tests {
         test_recorder,
     };
 
+    // REQ-TELEMETRY-2
     #[test]
     fn projects_scalar_attributes_to_one_json_event_and_span() {
         let (recorder, capture) = test_recorder("rbt_fixture");
@@ -796,6 +797,7 @@ mod tests {
         ));
     }
 
+    // REQ-TELEMETRY-14
     #[test]
     fn writer_failure_is_nonfatal_and_reported_by_the_next_event() {
         #[derive(Debug)]
@@ -830,6 +832,7 @@ mod tests {
         assert_eq!(events[0][DROPPED_COUNT], 1);
     }
 
+    // REQ-TELEMETRY-14
     #[test]
     fn a_full_output_queue_drops_without_waiting() {
         let (sender, _receiver) = sync_channel(1);

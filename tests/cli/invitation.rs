@@ -114,6 +114,7 @@ fn assert_authenticated(request: &str) {
     );
 }
 
+// REQ-INVITE-57
 #[test]
 fn organization_invitation_issue_sends_target_and_idempotency_key() {
     let location = format!("/v1/invitations/{INVITATION_ID}");
@@ -158,6 +159,7 @@ fn organization_invitation_issue_sends_target_and_idempotency_key() {
     );
 }
 
+// REQ-INVITE-62, REQ-INVITE-63, REQ-INVITE-64, REQ-INVITE-81, REQ-INVITE-87
 #[test]
 fn organization_invitation_list_preserves_terminal_history_and_cursor() {
     let mut accepted = invitation("accepted", Some("2026-01-03T03:04:05Z"));
@@ -246,6 +248,7 @@ fn organization_invitation_list_preserves_terminal_history_and_cursor() {
     assert_authenticated(&request);
 }
 
+// REQ-INVITE-63
 #[test]
 fn organization_invitation_history_human_labels_recorded_and_unavailable_links() {
     let mut recorded = invitation("accepted", Some("2026-01-03T03:04:05Z"));
@@ -279,6 +282,7 @@ fn organization_invitation_history_human_labels_recorded_and_unavailable_links()
     server.finish();
 }
 
+// REQ-INVITE-67, REQ-INVITE-68
 #[test]
 fn invitation_inbox_and_preview_are_available_to_the_current_principal() {
     let (server, _directory, _path, credential_path) = prepared(vec![
@@ -346,6 +350,7 @@ fn invitation_inbox_and_preview_are_available_to_the_current_principal() {
         .for_each(|request| assert_authenticated(request));
 }
 
+// REQ-INVITE-76, REQ-INVITE-78, REQ-INVITE-79
 #[test]
 fn invitation_accept_reads_a_protected_capability_file_without_printing_it() {
     let (server, capability_directory, _path, credential_path) =
@@ -394,6 +399,7 @@ fn invitation_accept_reads_a_protected_capability_file_without_printing_it() {
     );
 }
 
+// REQ-INVITE-73
 #[test]
 fn invitation_accept_name_gate_reports_a_recoverable_schema_one_failure() {
     for json in [false, true] {
@@ -434,6 +440,7 @@ fn invitation_accept_name_gate_reports_a_recoverable_schema_one_failure() {
     }
 }
 
+// REQ-INVITE-66, REQ-INVITE-75
 #[test]
 fn invitation_decline_and_owner_revoke_have_deterministic_success_output() {
     let (server, _directory, _path, credential_path) = prepared(vec![
@@ -504,6 +511,7 @@ fn invitation_decline_and_owner_revoke_have_deterministic_success_output() {
     });
 }
 
+// REQ-INVITE-76, REQ-INVITE-77
 #[test]
 fn capability_file_rejects_group_access_without_printing_the_secret() {
     let credential_directory = private_credential_directory();
@@ -540,6 +548,7 @@ fn capability_file_rejects_group_access_without_printing_the_secret() {
     assert!(!stderr.contains(CAPABILITY));
 }
 
+// REQ-INVITE-77
 #[test]
 fn invitation_capability_must_match_the_path_invitation() {
     let credential_directory = private_credential_directory();
@@ -580,6 +589,7 @@ fn invitation_capability_must_match_the_path_invitation() {
     assert!(!stderr.contains("AAAAAAAA"));
 }
 
+// REQ-INVITE-69
 #[test]
 fn unavailable_invitation_returns_stable_json_and_exit_code() {
     let (server, _directory, _path, credential_path) = prepared(vec![problem_http_response(
@@ -613,6 +623,7 @@ fn unavailable_invitation_returns_stable_json_and_exit_code() {
     server.finish();
 }
 
+// REQ-INVITE-59, REQ-INVITE-74
 #[test]
 fn invitation_api_failures_use_stable_outcomes_and_exit_codes() {
     let (server, _directory, _path, credential_path) = prepared(vec![

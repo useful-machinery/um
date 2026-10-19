@@ -121,6 +121,7 @@ fn accept_control_request(listener: &UnixListener) -> (UnixStream, Vec<u8>) {
     (stream, request)
 }
 
+// REQ-RUNNERENROLL-48, REQ-RUNNERENROLL-49, REQ-RUNNERENROLL-81
 #[test]
 fn enrolls_then_promotes_a_replacement_without_exposing_credential_material() {
     let fixture = PendingEnrollmentFixture::new();
@@ -238,6 +239,7 @@ fn enrolls_then_promotes_a_replacement_without_exposing_credential_material() {
     }
 }
 
+// REQ-RUNNERENROLL-51
 #[test]
 fn retries_a_staged_replacement_through_the_secret_free_control_request() {
     let fixture = PendingEnrollmentFixture::new();
@@ -282,6 +284,7 @@ fn retries_a_staged_replacement_through_the_secret_free_control_request() {
     }
 }
 
+// REQ-RUNNERENROLL-50
 #[test]
 fn explicit_state_update_failure_is_not_reinterpreted_as_success() {
     let fixture = PendingEnrollmentFixture::new();
@@ -331,6 +334,7 @@ fn explicit_state_update_failure_is_not_reinterpreted_as_success() {
     assert!(state.get("pendingCredential").is_none());
 }
 
+// REQ-RUNNERENROLL-50
 #[test]
 fn reports_cloud_enrollment_separately_when_runner_serve_is_unreachable() {
     let fixture = PendingEnrollmentFixture::new();

@@ -2142,6 +2142,7 @@ mod tests {
         ));
     }
 
+    // REQ-ARTIFACTSET-19, REQ-ARTIFACTSET-20
     #[test]
     fn real_bundle_failures_emit_their_portable_diagnostic_codes() {
         let fixture = RealBundleFixture::new();

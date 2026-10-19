@@ -121,6 +121,7 @@ fn replace_manager_path_with_decoy(
     changed_path
 }
 
+// REQ-AGENT-11, REQ-AGENT-12
 #[tokio::test]
 async fn admission_requires_only_the_harness_selected_by_the_assignment() {
     let (pi_temporary, mut pi_manager) = manager_fixture_with_harnesses(
@@ -265,6 +266,7 @@ async fn command_and_each_harness_assignment_invoke_only_declared_snapshots() {
     }
 }
 
+// REQ-WORKSPACE-16
 #[tokio::test]
 async fn cloud_commands_agents_and_finalizers_receive_exact_source_revision() {
     let repository_argv = serde_json::to_string(&[
@@ -303,6 +305,7 @@ async fn cloud_commands_agents_and_finalizers_receive_exact_source_revision() {
     ));
 }
 
+// REQ-AGENT-10
 #[tokio::test]
 async fn all_harness_assignment_uses_each_snapshot_with_its_own_configuration() {
     let (temporary, mut manager) = manager_fixture_with_harnesses(

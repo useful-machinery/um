@@ -90,6 +90,8 @@ pub(crate) fn test_credential() -> Credential {
 mod tests {
     use super::{Credential, CredentialError};
 
+    // INV-TRUST-5
+    // INV-RUNNER-9
     #[test]
     fn builds_the_current_enrolled_bearer_without_exposing_it_in_debug() {
         let credential = super::test_credential();

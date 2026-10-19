@@ -464,6 +464,9 @@ mod tests {
 
     const KEY: &str = "crd_01k0z6r1w8f4jy2m7q9v3x5abc.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
 
+    // REQ-AUTH-49, REQ-AUTH-54
+    // REQ-SERVICEPRINCIPAL-26
+    // INV-CLI-6
     #[test]
     fn service_api_key_validation_is_canonical_and_debug_is_redacted() {
         let key = ServiceApiKey::parse(Zeroizing::new(KEY.to_owned()))
@@ -481,6 +484,8 @@ mod tests {
         }
     }
 
+    // REQ-AUTH-48
+    // REQ-SERVICEPRINCIPAL-25
     #[test]
     fn private_key_file_is_read_and_public_file_is_rejected() {
         let directory = tempfile::tempdir().expect("temporary directory should be created");
@@ -500,6 +505,7 @@ mod tests {
         ));
     }
 
+    // REQ-SERVICEPRINCIPAL-32
     #[test]
     fn workload_token_is_zeroizing_and_rejects_whitespace() {
         let directory = tempfile::tempdir().expect("temporary directory should be created");
@@ -519,6 +525,7 @@ mod tests {
         ));
     }
 
+    // REQ-SERVICEPRINCIPAL-8
     #[test]
     fn api_key_destination_never_overwrites_and_removes_uncommitted_files() {
         let directory = tempfile::tempdir().expect("temporary directory should be created");
@@ -557,6 +564,7 @@ mod tests {
         destination
     }
 
+    // REQ-SERVICEPRINCIPAL-12
     #[test]
     fn api_key_destination_removes_a_file_after_delivery_write_failure() {
         let directory = tempfile::tempdir().expect("temporary directory should be created");
@@ -573,6 +581,7 @@ mod tests {
         assert!(!path.exists());
     }
 
+    // REQ-SERVICEPRINCIPAL-12
     #[test]
     fn delivery_failure_cleanup_is_uncertain_when_the_destination_cannot_be_unlinked() {
         let directory = tempfile::tempdir().expect("temporary directory should be created");

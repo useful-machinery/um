@@ -36,6 +36,7 @@ fn collection() -> String {
 fn target(suffix: &str) -> String {
     format!("{}/{ACTION}{suffix}", collection())
 }
+// REQ-DOCSACTION-65
 #[test]
 fn documented_example_is_accepted_by_the_create_route() {
     let (_dir, path) = file(include_str!("../../../examples/action-config.json"));
@@ -76,6 +77,7 @@ fn source_json_may_exceed_normalized_configuration_limit() {
     assert_eq!(request_body(&server.finish().remove(0))["enabled"], true);
 }
 
+// REQ-DOCSACTION-65
 #[test]
 fn action_routes_and_closed_update() {
     let (_dir, path) = file(
@@ -156,6 +158,7 @@ fn action_routes_and_closed_update() {
         serde_json::json!({"expectedVersion":3,"description":"new"})
     );
 }
+// REQ-DOCSACTION-65, REQ-DOCSACTION-67, REQ-DOCSACTION-68
 #[test]
 fn reads_lifecycle_and_delete_observe_status_and_confirmation() {
     let (server, _credentials, credential) = prepared(vec![response(
@@ -274,6 +277,7 @@ fn reads_lifecycle_and_delete_observe_status_and_confirmation() {
     );
     assert!(server.finish().is_empty());
 }
+// REQ-DOCSACTION-70
 #[test]
 fn human_output_uses_safe_metadata_and_errors_use_stderr() {
     let (server, _credentials, credential) = prepared(vec![response("200 OK", action(), false)]);
@@ -319,6 +323,7 @@ fn human_output_uses_safe_metadata_and_errors_use_stderr() {
     assert_eq!(server.finish().len(), 1);
 }
 
+// REQ-DOCSACTION-66
 #[test]
 fn invalid_input_and_denial_do_not_leak_literals() {
     let (_dir, path) = file(r#"{"publication":{"exportName":"secret","extra":"private"}}"#);
@@ -395,6 +400,7 @@ fn invalid_input_and_denial_do_not_leak_literals() {
     assert_eq!(value["retryAfter"], 17);
     assert_eq!(server.finish().len(), 1);
 }
+// REQ-DOCSACTION-66
 #[test]
 fn standard_input_conflict_is_rejected_before_authentication() {
     let config =
@@ -446,6 +452,7 @@ fn standard_input_conflict_is_rejected_before_authentication() {
     assert!(server.finish().is_empty());
 }
 
+// REQ-DOCSACTION-69
 #[test]
 fn lost_reply_retries_identical_body_and_key() {
     let (_dir, path) = file(
@@ -470,6 +477,7 @@ fn lost_reply_retries_identical_body_and_key() {
     assert_eq!(request_body(&requests[0]), request_body(&requests[1]));
 }
 
+// REQ-DOCSACTION-69, REQ-DOCSACTION-70
 #[test]
 fn unresolved_reply_reports_key_without_configuration() {
     let (_dir, path) = file(
@@ -505,6 +513,7 @@ fn unresolved_reply_reports_key_without_configuration() {
     );
 }
 
+// REQ-DOCSACTION-69
 #[test]
 fn invalid_successful_replay_does_not_settle_a_lost_reply() {
     let (_dir, path) = file(

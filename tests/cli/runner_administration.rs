@@ -141,6 +141,7 @@ fn rate_limit_response() -> Vec<u8> {
     )
 }
 
+// REQ-RUNNERPOOL-60
 #[test]
 fn runner_deletion_requires_literal_confirmation_before_local_or_network_access() {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -181,6 +182,7 @@ fn runner_deletion_requires_literal_confirmation_before_local_or_network_access(
     );
 }
 
+// REQ-RUNNERPOOL-72
 #[test]
 fn runner_show_without_a_credential_reports_sign_in_on_stderr() {
     let output = run(&["runner", "show", ORGANIZATION, RUNNER_ID]);
@@ -197,6 +199,7 @@ fn runner_show_without_a_credential_reports_sign_in_on_stderr() {
     );
 }
 
+// REQ-RUNNERPOOL-73
 #[test]
 fn runner_protocol_failure_uses_the_shared_general_failure_status() {
     let (server, _directory, credential_path) = prepared_runner(vec![json_http_response(
@@ -226,6 +229,7 @@ fn runner_protocol_failure_uses_the_shared_general_failure_status() {
     assert_eq!(server.finish().len(), 1);
 }
 
+// REQ-RUNNERPOOL-46
 #[test]
 fn pool_create_sends_the_name_and_reports_the_created_pool() {
     let response = http_response_with_headers(
@@ -290,6 +294,7 @@ fn pool_create_sends_the_name_and_reports_the_created_pool() {
     );
 }
 
+// REQ-RUNNERPOOL-47, REQ-RUNNERPOOL-68
 #[test]
 fn deletion_by_name_resolves_once_and_emits_exact_success_json() {
     for (args, resolution, expected_path, expected_output) in [
@@ -364,6 +369,7 @@ fn deletion_by_name_resolves_once_and_emits_exact_success_json() {
     }
 }
 
+// REQ-RUNNERPOOL-71
 #[test]
 fn runner_deletion_reads_a_service_key_from_stdin_once() {
     let server = ScriptedServer::respond(vec![
@@ -491,6 +497,7 @@ fn deletion_refresh_reuses_the_resolved_id_and_invocation_key() {
     assert!(deletes[1].contains("authorization: Bearer unique-refreshed-delete-access-token\r\n"));
 }
 
+// REQ-RUNNERPOOL-69, REQ-RUNNERPOOL-78
 #[test]
 fn deletion_blockers_remain_ordered_and_bound_to_the_resolved_id() {
     let blocked = problem_http_response(
@@ -535,6 +542,7 @@ fn deletion_blockers_remain_ordered_and_bound_to_the_resolved_id() {
     assert_eq!(requests.len(), 2);
 }
 
+// REQ-RUNNERPOOL-70
 #[test]
 fn post_dispatch_transport_server_and_protocol_failures_report_unknown_commitment() {
     let failures = [
@@ -589,6 +597,7 @@ fn post_dispatch_transport_server_and_protocol_failures_report_unknown_commitmen
     }
 }
 
+// REQ-RUNNERPOOL-70
 #[test]
 fn later_owner_directed_deletion_uses_a_new_key_after_unknown_commitment() {
     let (first, _directory, credential_path) = prepared_runner(vec![
@@ -635,6 +644,7 @@ fn later_owner_directed_deletion_uses_a_new_key_after_unknown_commitment() {
     assert_ne!(first_key, later_key);
 }
 
+// REQ-RUNNERPOOL-70
 #[cfg(target_os = "linux")]
 #[test]
 fn post_dispatch_interrupt_and_termination_report_unknown_without_retry() {
@@ -801,6 +811,7 @@ fn runner_create_refreshes_a_token_rejected_during_activation() {
     assert!(activation_path.exists());
 }
 
+// REQ-RUNNERENROLL-8
 #[test]
 fn runner_create_preserves_registration_when_refresh_replay_fails_early() {
     let registration = http_response_with_headers(
@@ -882,6 +893,7 @@ fn runner_create_preserves_registration_when_refresh_replay_fails_early() {
     assert_eq!(server.finish().len(), 5);
 }
 
+// REQ-RUNNERENROLL-1, REQ-RUNNERENROLL-2, REQ-RUNNERENROLL-5
 #[test]
 fn runner_creation_commands_stdout_contains_only_the_transferable_artifact() {
     for (arguments, creates_runner) in [
@@ -983,6 +995,7 @@ fn runner_creation_commands_stdout_contains_only_the_transferable_artifact() {
     }
 }
 
+// REQ-RUNNERENROLL-7
 #[test]
 fn runner_creation_json_includes_deployment_without_exposing_the_artifact() {
     for creates_runner in [true, false] {
@@ -1059,6 +1072,7 @@ fn runner_creation_json_includes_deployment_without_exposing_the_artifact() {
     }
 }
 
+// REQ-RUNNERENROLL-8
 #[test]
 fn runner_create_reports_activation_failure_with_the_created_registration() {
     let registration = http_response_with_headers(
@@ -1140,6 +1154,7 @@ fn runner_create_reports_activation_failure_with_the_created_registration() {
     assert_eq!(server.finish().len(), 2);
 }
 
+// REQ-RUNNERENROLL-10, REQ-RUNNERENROLL-11
 #[test]
 fn activation_list_and_revoke_report_the_deployment() {
     let activation = activation_issuance_body()["activation"].clone();
@@ -1192,6 +1207,7 @@ fn activation_list_and_revoke_report_the_deployment() {
     }
 }
 
+// REQ-RUNNERENROLL-52
 #[test]
 fn credential_list_returns_only_lifecycle_metadata() {
     let credentials = serde_json::json!({
@@ -1235,6 +1251,7 @@ fn credential_list_returns_only_lifecycle_metadata() {
     )));
 }
 
+// REQ-RUNNERENROLL-53, REQ-RUNNERENROLL-54
 #[test]
 fn credential_mutations_send_empty_bodies_and_idempotency_keys() {
     for (command, subresource, state) in [
@@ -1285,6 +1302,57 @@ fn credential_mutations_send_empty_bodies_and_idempotency_keys() {
     }
 }
 
+// REQ-RUNNERENROLL-55, REQ-RUNNERENROLL-83
+#[test]
+fn refused_credential_transition_reports_its_outcome_and_advises_listing_credentials() {
+    for json in [true, false] {
+        let refused = problem_http_response(
+            "409 Conflict",
+            serde_json::json!({
+                "type": "https://api.usefulmachinery.com/problems/runner-credential-transition-unavailable",
+                "title": "Runner credential transition unavailable",
+                "status": 409
+            }),
+        );
+        let (server, _directory, credential_path) = prepared_runner(vec![
+            json_http_response("200 OK", registration_body()),
+            refused,
+        ]);
+        let environment = deployment_environment(&server.api_url, &credential_path);
+        let mut args = vec![
+            "runner",
+            "credential",
+            "retire",
+            ORGANIZATION,
+            RUNNER_ID,
+            CREDENTIAL_ID,
+            "--yes",
+            "--allow-insecure-http",
+        ];
+        if json {
+            args.push("--json");
+        }
+
+        let output = run_with_env(&args, &environment);
+
+        assert_eq!(output.status.code(), Some(1));
+        if json {
+            assert!(output.stderr.is_empty());
+            let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(result["outcome"], "credential_transition_unavailable");
+        } else {
+            assert!(output.stdout.is_empty());
+            assert!(
+                String::from_utf8_lossy(&output.stderr)
+                    .to_ascii_lowercase()
+                    .contains("list credentials")
+            );
+        }
+        assert_eq!(server.finish().len(), 2);
+    }
+}
+
+// REQ-RUNNERENROLL-13, REQ-RUNNERENROLL-17, REQ-RUNNERENROLL-19
 #[test]
 fn enrollment_accepts_an_artifact_from_explicit_stdin() {
     let enrollment = serde_json::json!({
@@ -1382,6 +1450,7 @@ fn enrollment_accepts_an_artifact_from_explicit_stdin() {
     assert!(!request_body(&request).contains(secret));
 }
 
+// REQ-RUNNERENROLL-23
 #[test]
 fn enrollment_gone_reports_that_the_commit_did_not_complete() {
     let server = ScriptedServer::respond(vec![http_response("410 Gone", None, &[])]);
@@ -1443,6 +1512,7 @@ fn enrollment_gone_reports_that_the_commit_did_not_complete() {
     assert_eq!(server.finish().len(), 1);
 }
 
+// REQ-RUNNERPOOL-53
 #[test]
 fn runner_mode_commands_send_closed_targets_with_idempotency() {
     for (command, mode) in [
@@ -1494,6 +1564,7 @@ fn runner_mode_commands_send_closed_targets_with_idempotency() {
     }
 }
 
+// REQ-RUNNERPOOL-47, REQ-RUNNERPOOL-57
 #[test]
 fn runner_move_resolves_the_destination_and_sends_only_its_id() {
     for pool in [POOL_ID, "builders"] {
@@ -1551,6 +1622,7 @@ fn runner_move_resolves_the_destination_and_sends_only_its_id() {
     }
 }
 
+// REQ-RUNNERPOOL-50, REQ-RUNNERPOOL-52
 #[test]
 fn runner_commands_report_reserved_run_and_idle_capacity() {
     for assigned in [true, false] {
@@ -1628,6 +1700,7 @@ fn runner_commands_report_reserved_run_and_idle_capacity() {
     }
 }
 
+// REQ-RUNNERPOOL-51
 #[test]
 fn runner_show_reports_independent_cloud_and_informational_projections() {
     let (server, _directory, credential_path) =

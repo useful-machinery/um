@@ -1,5 +1,11 @@
 # Architecture
 
+> This file is the enforced summary of the `um` executable's source boundary. The full
+> living descriptions are architecture chapters 12,
+> [CLI executable](../docs/architecture/12-cli-executable.md), 13,
+> [Workflow execution engine](../docs/architecture/13-workflow-execution-engine.md), and 14,
+> [Agent harness adapters and qualification](../docs/architecture/14-harness-adapters.md).
+
 ## Current state
 
 This repository defines the public source boundary for the Rust `um`

@@ -217,6 +217,7 @@ fn encode(value: &Value) -> Vec<u8> {
     bytes
 }
 
+// INV-ENGINE-14
 #[test]
 fn cloud_result_recovery_decisions_are_closed_and_legacy_bytes_stay_absent() {
     let legacy = cloud_metadata_only_result_fixture();
@@ -257,6 +258,7 @@ fn cloud_result_recovery_decisions_are_closed_and_legacy_bytes_stay_absent() {
     );
 }
 
+// INV-ENGINE-14
 #[test]
 fn seeded_cloud_continuation_recovery_reader_keeps_legacy_and_rejects_unbound_claims() {
     let mut seeded = continuation_result_fixture();
@@ -906,6 +908,7 @@ fn accepts_stream_truncated_at_the_declared_admitted_limit() {
     assert_eq!(decode(&encode(&result)), Err(ResultMetadataError));
 }
 
+// REQ-WFRECOVERY-41
 #[test]
 fn recovery_version_dispatch_precedes_nested_interpretation() {
     let mut result = result_fixture();
@@ -1062,6 +1065,7 @@ fn recovered_summary_accepts_schema_length_non_ascii_text() {
     assert!(decode(&encode(&result)).is_ok());
 }
 
+// REQ-WFRECOVERY-42
 #[test]
 fn recovered_summary_rejects_a_handler_that_gave_up() {
     let mut result = recovered_result_fixture();
@@ -1085,6 +1089,7 @@ fn recovered_summary_rejects_a_handler_that_gave_up() {
     );
 }
 
+// REQ-WFRECOVERY-42
 #[test]
 fn handlerless_summary_rejects_a_phantom_handler_invocation() {
     let mut result = recovered_result_fixture();
@@ -1215,4 +1220,227 @@ fn rejects_multiply_owned_alias_metadata() {
     non_owner["exports"]["first"]["path"] = Value::String("exports/0002".to_owned());
     non_owner["exports"]["second"]["path"] = Value::String("exports/0002".to_owned());
     assert_eq!(decode(&encode(&non_owner)), Err(ResultMetadataError));
+}
+
+fn strip_timing(node: &mut Value) {
+    let node = node.as_object_mut().unwrap();
+    node.remove("startedAt");
+    node.remove("durationMilliseconds");
+}
+
+fn add_timing(node: &mut Value) {
+    node["startedAt"] = json!("2026-08-02T12:01:44Z");
+    node["durationMilliseconds"] = json!(1000);
+}
+
+fn empty_command_output() -> Value {
+    let stream = json!({
+        "encoding": "base64",
+        "data": "",
+        "retainedBytes": 0,
+        "discardedBytes": 0,
+        "truncated": false,
+        "fullyDrained": true
+    });
+    json!({ "stdout": stream.clone(), "stderr": stream })
+}
+
+fn condition_failure_detail() -> Value {
+    serde_json::to_value(
+        super::super::evidence::FailureDetail::json_pointer_missing(
+            "outputs.upstream.ready",
+            "/ready",
+        )
+        .unwrap(),
+    )
+    .unwrap()
+}
+
+/// `produce` fails during execution; `consume` is blocked on it and `later` never runs.
+fn stopped_downstream_fixture() -> Value {
+    let mut result = failed_result_fixture("execution", json!({ "code": "harness_failed" }));
+    let steps = result["steps"].as_array_mut().unwrap();
+    steps.push(json!({
+        "id": "consume",
+        "role": "step",
+        "kind": "cmd",
+        "failurePolicy": "required",
+        "state": "blocked",
+        "detail": {
+            "code": "prerequisites_unsatisfied",
+            "prerequisites": [{ "kind": "control", "node": "produce" }]
+        }
+    }));
+    steps.push(json!({
+        "id": "later",
+        "role": "step",
+        "kind": "cmd",
+        "failurePolicy": "required",
+        "state": "not_run",
+        "detail": { "code": "failure_stop" }
+    }));
+    result
+}
+
+fn skipped_fixture() -> Value {
+    let mut result = result_fixture();
+    result["steps"].as_array_mut().unwrap().push(json!({
+        "id": "optional",
+        "role": "step",
+        "kind": "cmd",
+        "failurePolicy": "required",
+        "state": "skipped",
+        "detail": {
+            "code": "condition_false",
+            "evaluatedPredicates": [{ "path": "", "result": false }]
+        }
+    }));
+    result
+}
+
+fn advisory_failure_fixture() -> Value {
+    let mut result = result_fixture();
+    result["steps"][0]["failurePolicy"] = json!("advisory");
+    result["steps"][0]["state"] = json!("failed");
+    result["steps"][0]["detail"] = json!({ "phase": "execution", "code": "harness_failed" });
+    result
+}
+
+fn cancelled_fixture(reason: &str) -> Value {
+    let mut result = result_fixture();
+    result["exports"] = json!({});
+    result["outcome"] = json!("cancelled");
+    result["cancellation"] = json!({
+        "reason": reason,
+        "forceStopDeadline": "2026-08-02T12:01:46Z"
+    });
+    result["steps"][0]["state"] = json!("cancelled");
+    result["steps"][0]["detail"] = json!({ "code": reason });
+    result
+}
+
+// REQ-EVIDENCE-1
+#[test]
+fn only_nodes_that_started_record_timing_and_command_output() {
+    let started = stopped_downstream_fixture();
+    assert!(decode(&encode(&started)).is_ok());
+
+    let mut untimed_success = result_fixture();
+    strip_timing(&mut untimed_success["steps"][0]);
+    assert_eq!(decode(&encode(&untimed_success)), Err(ResultMetadataError));
+
+    let mut untimed_execution_failure = started.clone();
+    strip_timing(&mut untimed_execution_failure["steps"][0]);
+    assert_eq!(
+        decode(&encode(&untimed_execution_failure)),
+        Err(ResultMetadataError)
+    );
+
+    let timed_condition_failure = failed_result_fixture("condition", condition_failure_detail());
+    assert_eq!(
+        decode(&encode(&timed_condition_failure)),
+        Err(ResultMetadataError)
+    );
+    let mut condition_failure = timed_condition_failure;
+    strip_timing(&mut condition_failure["steps"][0]);
+    assert!(decode(&encode(&condition_failure)).is_ok());
+    condition_failure["steps"][0]["kind"] = json!("cmd");
+    assert!(decode(&encode(&condition_failure)).is_ok());
+    condition_failure["steps"][0]["commandOutput"] = empty_command_output();
+    assert_eq!(
+        decode(&encode(&condition_failure)),
+        Err(ResultMetadataError)
+    );
+
+    for (fixture, never_started) in [
+        (started.clone(), 1),
+        (started, 2),
+        (skipped_fixture(), 1),
+        (continuation_result_fixture(), 0),
+    ] {
+        assert!(decode(&encode(&fixture)).is_ok());
+        let mut timed = fixture.clone();
+        add_timing(&mut timed["steps"][never_started]);
+        assert_eq!(decode(&encode(&timed)), Err(ResultMetadataError));
+        if fixture["steps"][never_started]["kind"] == "cmd" {
+            let mut with_output = fixture;
+            with_output["steps"][never_started]["commandOutput"] = empty_command_output();
+            assert_eq!(decode(&encode(&with_output)), Err(ResultMetadataError));
+        }
+    }
+}
+
+// REQ-EVIDENCE-4
+#[test]
+fn node_detail_is_present_exactly_for_states_that_need_explaining() {
+    let mut explained_success = result_fixture();
+    explained_success["steps"][0]["detail"] = json!({ "code": "failure_stop" });
+    assert_eq!(
+        decode(&encode(&explained_success)),
+        Err(ResultMetadataError)
+    );
+
+    for (fixture, explained, state) in [
+        (advisory_failure_fixture(), 0, "failed"),
+        (stopped_downstream_fixture(), 1, "blocked"),
+        (stopped_downstream_fixture(), 2, "not_run"),
+        (skipped_fixture(), 1, "skipped"),
+        (cancelled_fixture("user_request"), 0, "cancelled"),
+        (continuation_result_fixture(), 0, "inherited"),
+    ] {
+        assert_eq!(fixture["steps"][explained]["state"], state);
+        assert!(decode(&encode(&fixture)).is_ok(), "{state}");
+        let mut unexplained = fixture;
+        unexplained["steps"][explained]
+            .as_object_mut()
+            .unwrap()
+            .remove("detail");
+        assert_eq!(
+            decode(&encode(&unexplained)),
+            Err(ResultMetadataError),
+            "{state}"
+        );
+    }
+}
+
+// REQ-EVIDENCE-8
+#[test]
+fn cancelled_node_detail_is_the_closed_authoritative_stop_reason() {
+    for reason in [
+        "user_request",
+        "termination_request",
+        "caller_output_failure",
+        "runner_shutdown",
+        "execution_lease_expired",
+    ] {
+        let cancelled = cancelled_fixture(reason);
+        assert!(decode(&encode(&cancelled)).is_ok(), "{reason}");
+        let mut other_reason = cancelled;
+        other_reason["steps"][0]["detail"]["code"] = json!(if reason == "user_request" {
+            "runner_shutdown"
+        } else {
+            "user_request"
+        });
+        assert_eq!(
+            decode(&encode(&other_reason)),
+            Err(ResultMetadataError),
+            "{reason}"
+        );
+    }
+
+    let mut forced = cancelled_fixture("user_request");
+    forced["steps"][0]["detail"]["code"] = json!("force_abort");
+    assert_eq!(decode(&encode(&forced)), Err(ResultMetadataError));
+    forced["forceAbort"] = json!({ "reason": "force_abort", "phase": "ordinary" });
+    assert!(decode(&encode(&forced)).is_ok());
+
+    for unknown in ["cancelled", "timeout", "operator_request"] {
+        let mut unknown_reason = cancelled_fixture("user_request");
+        unknown_reason["steps"][0]["detail"]["code"] = json!(unknown);
+        assert_eq!(
+            decode(&encode(&unknown_reason)),
+            Err(ResultMetadataError),
+            "{unknown}"
+        );
+    }
 }

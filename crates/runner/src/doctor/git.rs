@@ -300,6 +300,7 @@ mod tests {
         }
     }
 
+    // REQ-RUNNERENROLL-45
     #[test]
     fn git_check_accepts_the_minimum_version() {
         let outcome = check(Ok(output(

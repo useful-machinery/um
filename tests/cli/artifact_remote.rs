@@ -183,6 +183,7 @@ fn download_capability_response(result: &[u8], url: &str) -> Vec<u8> {
     )
 }
 
+// REQ-ARTIFACTSET-35, REQ-ARTIFACTSET-38
 #[test]
 fn artifact_download_json_reports_only_the_verified_committed_set() {
     let result = portable_result_bytes();
@@ -254,6 +255,7 @@ fn artifact_download_json_reports_only_the_verified_committed_set() {
     assert!(!download.contains("authorization:"));
 }
 
+// REQ-ARTIFACTSET-36
 #[test]
 fn artifact_download_verification_failure_emits_no_receipt_or_destination() {
     let expected = portable_result_bytes();
@@ -300,6 +302,7 @@ fn artifact_download_verification_failure_emits_no_receipt_or_destination() {
     storage.finish();
 }
 
+// REQ-ARTIFACTSET-30, REQ-ARTIFACTSET-31
 #[test]
 fn artifact_list_reports_one_inventory_page_without_download_authority_or_files() {
     for json in [false, true] {
@@ -374,6 +377,7 @@ fn artifact_list_reports_one_inventory_page_without_download_authority_or_files(
     }
 }
 
+// REQ-ARTIFACTSET-31
 #[test]
 fn artifact_list_accepts_a_short_final_continuation_page() {
     let response = inventory_response(serde_json::json!({
@@ -408,6 +412,7 @@ fn artifact_list_accepts_a_short_final_continuation_page() {
     assert!(requests[0].contains("cursor=current-page"));
 }
 
+// REQ-ARTIFACTSET-34
 #[test]
 fn artifact_list_reports_unsealed_or_missing_sets_as_unavailable_in_human_mode() {
     let (server, _credential_directory, credential_path) =
@@ -436,6 +441,7 @@ fn artifact_list_reports_unsealed_or_missing_sets_as_unavailable_in_human_mode()
     assert!(!requests[0].contains("download-capabilities"));
 }
 
+// REQ-ARTIFACTSET-32
 #[test]
 fn artifact_list_rejects_inventory_pages_that_ignore_request_bounds() {
     let mut body = inventory_body();
@@ -475,6 +481,7 @@ fn artifact_list_rejects_inventory_pages_that_ignore_request_bounds() {
     }
 }
 
+// REQ-ARTIFACTSET-33
 #[test]
 fn artifact_list_escapes_untrusted_remote_text_only_in_human_output() {
     let media_type = "text/plain\nforged: value\u{1b}[2J";
@@ -503,6 +510,7 @@ fn artifact_list_escapes_untrusted_remote_text_only_in_human_output() {
     }
 }
 
+// REQ-ARTIFACTSET-34
 #[test]
 fn artifact_list_json_preserves_meaningful_api_failure_classes() {
     let unauthenticated = run(&["artifact", "list", ORGANIZATION, RUN_ID, "--json"]);
@@ -618,4 +626,143 @@ fn artifact_list_json_preserves_meaningful_api_failure_classes() {
         assert!(requests[0].starts_with("GET "));
         assert!(!requests[0].contains("download-capabilities"));
     }
+}
+
+const SERVICE_API_KEY: &str =
+    "crd_01k0z6r1w8f4jy2m7q9v3x5abc.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+
+// REQ-ARTIFACTSET-29
+#[test]
+fn artifact_list_and_download_authenticate_with_a_service_api_key_file() {
+    let directory = private_credential_directory();
+    let key_path = directory.path().join("service.key");
+    fs::write(&key_path, format!("{SERVICE_API_KEY}\n")).unwrap();
+    fs::set_permissions(&key_path, Permissions::from_mode(0o600)).unwrap();
+    let key_path = key_path.to_str().unwrap();
+    let missing_human_store = directory.path().join("missing-human.json");
+    let run_scoped = format!("/api/v1/organizations/{ORGANIZATION}/runs/{RUN_ID}/");
+
+    let server = ScriptedServer::respond(vec![inventory_response(inventory_body())]);
+    let environment =
+        deployment_environment(&server.api_url, missing_human_store.to_str().unwrap());
+    let listed = run_with_env(
+        &[
+            "artifact",
+            "list",
+            ORGANIZATION,
+            RUN_ID,
+            "--service-api-key-file",
+            key_path,
+            "--json",
+            "--allow-insecure-http",
+        ],
+        &environment,
+    );
+    assert!(
+        listed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&listed.stderr)
+    );
+    let listing: serde_json::Value = serde_json::from_slice(&listed.stdout).unwrap();
+    assert_eq!(listing["outcome"], "listed");
+    let requests = server.finish();
+    assert_eq!(requests.len(), 1);
+    assert!(requests[0].starts_with(&format!("GET {run_scoped}artifact-set?")));
+    assert_eq!(
+        header_value(&requests[0], "authorization"),
+        format!("Bearer {SERVICE_API_KEY}")
+    );
+
+    let result = portable_result_bytes();
+    let storage = OneShotServer::respond("200 OK", Some("application/json"), &result);
+    let signed_url = format!("{}/result.json?signature=service", storage.api_url);
+    let server = ScriptedServer::respond(vec![
+        complete_inventory_response(&result),
+        download_capability_response(&result, &signed_url),
+    ]);
+    let environment =
+        deployment_environment(&server.api_url, missing_human_store.to_str().unwrap());
+    let output_root = tempfile::tempdir().unwrap();
+    let destination = output_root.path().join("downloaded");
+    let downloaded = run_with_env(
+        &[
+            "artifact",
+            "download",
+            ORGANIZATION,
+            RUN_ID,
+            "--output",
+            destination.to_str().unwrap(),
+            "--service-api-key-file",
+            key_path,
+            "--json",
+            "--allow-insecure-http",
+        ],
+        &environment,
+    );
+    assert!(
+        downloaded.status.success(),
+        "{}",
+        String::from_utf8_lossy(&downloaded.stderr)
+    );
+    assert_eq!(fs::read(destination.join("result.json")).unwrap(), result);
+    let requests = server.finish();
+    assert_eq!(requests.len(), 2);
+    for request in &requests {
+        assert!(request.contains(&run_scoped), "{request}");
+        assert_eq!(
+            header_value(request, "authorization"),
+            format!("Bearer {SERVICE_API_KEY}")
+        );
+    }
+    assert!(!storage.finish().contains("authorization:"));
+    assert!(!missing_human_store.exists());
+}
+
+// REQ-ARTIFACTSET-37
+#[test]
+fn artifact_download_refuses_an_existing_output_path() {
+    let result = portable_result_bytes();
+    let output_root = tempfile::tempdir().unwrap();
+    let existing = output_root.path().join("existing");
+    fs::create_dir(&existing).unwrap();
+    fs::write(existing.join("keep.txt"), b"keep").unwrap();
+    let dangling = output_root.path().join("dangling");
+    std::os::unix::fs::symlink(output_root.path().join("absent"), &dangling).unwrap();
+
+    for destination in [&existing, &dangling] {
+        let (server, _credential_directory, credential_path) =
+            prepared_artifact(complete_inventory_response(&result));
+        let environment = deployment_environment(&server.api_url, &credential_path);
+
+        let output = run_with_env(
+            &[
+                "artifact",
+                "download",
+                ORGANIZATION,
+                RUN_ID,
+                "--output",
+                destination.to_str().unwrap(),
+                "--allow-insecure-http",
+            ],
+            &environment,
+        );
+
+        assert_eq!(output.status.code(), Some(1), "{destination:?}");
+        assert!(output.stdout.is_empty());
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(
+            stderr.contains("Choose an output path that does not exist"),
+            "{stderr}"
+        );
+        let requests = server.finish();
+        assert!(
+            requests
+                .iter()
+                .all(|request| !request.contains("download-capabilities"))
+        );
+    }
+    assert_eq!(fs::read(existing.join("keep.txt")).unwrap(), b"keep");
+    assert_eq!(fs::read_dir(&existing).unwrap().count(), 1);
+    assert!(fs::symlink_metadata(&dangling).unwrap().is_symlink());
+    assert!(!output_root.path().join("absent").exists());
 }

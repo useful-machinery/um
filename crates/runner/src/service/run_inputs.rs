@@ -1470,6 +1470,7 @@ mod tests {
         assert!(!deadline.contains_expiry(now + time::Duration::minutes(16)));
     }
 
+    // INV-STORAGE-3
     #[test]
     fn canonical_encoder_matches_shared_digest_vectors() {
         let fixture: Value = serde_json::from_str(include_str!(
@@ -1487,6 +1488,7 @@ mod tests {
         }
     }
 
+    // REQ-RUNINPUT-40, REQ-RUNINPUT-71
     #[test]
     fn verifies_manifest_before_download_and_preserves_file_and_collection_order() {
         let empty = Vec::new();
@@ -1614,6 +1616,7 @@ mod tests {
         }
     }
 
+    // REQ-RUNINPUT-41
     #[test]
     fn digest_mismatch_prevents_capabilities_and_downloads_and_null_projection_is_call_free() {
         let manifest = ManifestV1 {
@@ -1650,6 +1653,7 @@ mod tests {
         assert_eq!(*broker.manifest_calls.lock().unwrap(), 1);
     }
 
+    // REQ-RUNINPUT-40
     #[test]
     fn materialization_batches_exact_members_at_boundaries_and_preserves_values() {
         for member_count in [99, 100, 101, MAXIMUM_ATTACHMENTS + 1] {
@@ -1842,6 +1846,7 @@ mod tests {
         assert_private_root_empty(private.path());
     }
 
+    // REQ-RUNINPUT-41
     #[test]
     fn content_failures_are_classified_and_remove_staging() {
         assert_eq!(
@@ -1884,6 +1889,7 @@ mod tests {
         }
     }
 
+    // REQ-RUNINPUT-40
     #[test]
     fn json_download_preserves_original_bytes_and_rejects_duplicates() {
         let source = b"{ \"z\": null, \"n\": 1.2300 }\n".to_vec();

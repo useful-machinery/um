@@ -324,6 +324,7 @@ mod tests {
         assert_eq!(decode_response(&encoded), Err(ProtocolFailure::Invalid));
     }
 
+    // REQ-RUNNERENROLL-43
     #[test]
     fn canonical_schema_accepts_only_valid_control_fixtures() {
         let cli_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
@@ -341,6 +342,63 @@ mod tests {
                 assert_eq!(validator.is_valid(&value), expected, "{}", path.display());
             }
         }
+    }
+
+    // REQ-RUNNERENROLL-82
+    #[test]
+    fn error_responses_carry_only_the_closed_control_error_set() {
+        let closed = [
+            (ControlError::InvalidRequest, "invalid_request"),
+            (ControlError::UnsupportedVersion, "unsupported_version"),
+            (ControlError::NoPendingCredential, "no_pending_credential"),
+            (
+                ControlError::PendingRegistrationMismatch,
+                "pending_registration_mismatch",
+            ),
+            (
+                ControlError::PendingAuthenticationFailed,
+                "pending_authentication_failed",
+            ),
+            (
+                ControlError::PendingProtocolFailed,
+                "pending_protocol_failed",
+            ),
+            (
+                ControlError::PendingConnectionFailed,
+                "pending_connection_failed",
+            ),
+            (ControlError::StateUpdateFailed, "state_update_failed"),
+        ];
+        let cli_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let schema: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(cli_root.join("schemas/runner-control-v1.schema.json")).unwrap(),
+        )
+        .unwrap();
+        let validator = jsonschema::validator_for(&schema).unwrap();
+        let schema_codes = schema["$defs"]["errorResponse"]["properties"]["error"]["enum"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|code| code.as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            schema_codes,
+            closed.iter().map(|(_, code)| *code).collect::<Vec<_>>()
+        );
+        for (error, code) in closed {
+            let encoded = encode_response(&Response::Error(error)).unwrap();
+            let value: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+            assert_eq!(value["outcome"], "error");
+            assert_eq!(value["error"], code);
+            assert!(validator.is_valid(&value), "{code}");
+            assert_eq!(decode_response(&encoded), Ok(Response::Error(error)));
+        }
+        assert_eq!(
+            decode_response(
+                b"{\"schemaVersion\":1,\"outcome\":\"error\",\"error\":\"credential_missing\"}\n"
+            ),
+            Err(ProtocolFailure::Invalid)
+        );
     }
 
     #[test]

@@ -893,4 +893,170 @@ mod tests {
             })
         );
     }
+
+    // REQ-WFFORMAT-80
+    #[test]
+    fn every_diagnostic_location_kind_is_in_the_closed_set() {
+        let text = || "a".to_owned();
+        let validation = [
+            ValidationLocation::WorkflowGraph,
+            ValidationLocation::WorkflowNamespace,
+            ValidationLocation::AgentProfile { profile: text() },
+            ValidationLocation::AgentProfileReplacement { profile: text() },
+            ValidationLocation::AgentProfileReference { step: text() },
+            ValidationLocation::RecoveryAgentProfileReference { step: text() },
+            ValidationLocation::FinalizerAgentProfileReference { finalizer: text() },
+            ValidationLocation::StepDependency {
+                step: text(),
+                index: 0,
+            },
+            ValidationLocation::StepInput {
+                step: text(),
+                input: text(),
+            },
+            ValidationLocation::MessageText {
+                step: text(),
+                index: 0,
+            },
+            ValidationLocation::MessageAttachment {
+                step: text(),
+                index: 0,
+            },
+            ValidationLocation::StepOutput {
+                step: text(),
+                output: text(),
+            },
+            ValidationLocation::StepCondition { step: text() },
+            ValidationLocation::FinalizerAfter {
+                finalizer: text(),
+                index: 0,
+            },
+            ValidationLocation::FinalizerInput {
+                finalizer: text(),
+                input: text(),
+            },
+            ValidationLocation::FinalizerMessageText {
+                finalizer: text(),
+                index: 0,
+            },
+            ValidationLocation::FinalizerMessageAttachment {
+                finalizer: text(),
+                index: 0,
+            },
+            ValidationLocation::FinalizerOutput {
+                finalizer: text(),
+                output: text(),
+            },
+            ValidationLocation::FinalizerCondition { finalizer: text() },
+            ValidationLocation::Export { name: text() },
+        ];
+        let resolution = [
+            ResolutionLocation::SourceRoot,
+            ResolutionLocation::Workflow,
+            ResolutionLocation::AgentProfileReplacement,
+            ResolutionLocation::SystemPrompt { step: text() },
+            ResolutionLocation::MessageText {
+                step: text(),
+                index: 0,
+            },
+            ResolutionLocation::MessageAttachment {
+                step: text(),
+                index: 0,
+            },
+            ResolutionLocation::InputSchema { input: text() },
+            ResolutionLocation::ResultSchema {
+                step: text(),
+                output: text(),
+            },
+            ResolutionLocation::FinalizerSystemPrompt { finalizer: text() },
+            ResolutionLocation::FinalizerMessageText {
+                finalizer: text(),
+                index: 0,
+            },
+            ResolutionLocation::FinalizerMessageAttachment {
+                finalizer: text(),
+                index: 0,
+            },
+            ResolutionLocation::FinalizerResultSchema {
+                finalizer: text(),
+                output: text(),
+            },
+            ResolutionLocation::RecoveryPrompt { step: text() },
+            ResolutionLocation::ContentDigest,
+            ResolutionLocation::Capacity,
+        ];
+        let admission = [
+            AdmissionLocation::Input { name: text() },
+            AdmissionLocation::AttachmentInput {
+                name: text(),
+                index: 0,
+            },
+            AdmissionLocation::Step { step: text() },
+            AdmissionLocation::RecoveryHandler { step: text() },
+            AdmissionLocation::ExecutionRoot,
+            AdmissionLocation::GitContext,
+        ];
+        let harness =
+            AgentHarnessInstallationFailure::Codex(CodexInstallationFailure::Unsupported {
+                incompatibility: CodexIncompatibility::Version("0.157.0".to_owned()),
+                identity: None,
+            });
+        let mut kinds = validation
+            .iter()
+            .map(|location| RejectionLocation::from_validation(location).kind)
+            .chain(
+                resolution
+                    .iter()
+                    .map(|location| RejectionLocation::from_resolution(location).kind),
+            )
+            .chain(admission.iter().map(|location| {
+                RejectionLocation::from_admission(location)
+                    .expect("located admission failure")
+                    .kind
+            }))
+            .collect::<std::collections::BTreeSet<_>>();
+        kinds.insert(
+            RejectionDiagnostic::from_agent_harness_installation(&harness)
+                .location
+                .kind,
+        );
+
+        let closed = std::collections::BTreeSet::from([
+            "workflow",
+            "source_root",
+            "execution_root",
+            "workflow_namespace",
+            "workflow_graph",
+            "capacity",
+            "content_digest",
+            "input",
+            "input_schema",
+            "input_attachment",
+            "result_schema",
+            "step",
+            "step_dependency",
+            "step_input",
+            "step_output",
+            "step_condition",
+            "system_prompt",
+            "message_text",
+            "message_attachment",
+            "agent_profile",
+            "agent_profile_reference",
+            "agent_profile_replacement",
+            "agent_harness",
+            "recovery_handler",
+            "recovery_prompt",
+            "recovery_agent_profile_reference",
+            "finalizer_after",
+            "finalizer_input",
+            "finalizer_message_text",
+            "finalizer_message_attachment",
+            "finalizer_output",
+            "finalizer_condition",
+            "export",
+            "git_context",
+        ]);
+        assert_eq!(kinds, closed);
+    }
 }

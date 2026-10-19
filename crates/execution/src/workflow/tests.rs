@@ -15,6 +15,7 @@ fn canonical_valid_fixture() -> Vec<u8> {
     fs::read(fixture_root().join("valid/plan-implement-test.yaml")).unwrap()
 }
 
+// REQ-WFFORMAT-65, REQ-EXPORTS-6, REQ-EXPORTS-7, REQ-EXPORTS-9
 #[test]
 fn export_presentation_sources_validate_without_creating_dependencies() {
     // Source admission stays behind the canonical schema until the inert
@@ -107,6 +108,7 @@ fn export_presentation_sources_validate_without_creating_dependencies() {
     );
 }
 
+// REQ-WFFORMAT-54
 #[test]
 fn media_type_parameters_use_horizontal_separators_and_control_free_unicode_values() {
     for valid in [
@@ -141,6 +143,7 @@ fn media_type_parameters_use_horizontal_separators_and_control_free_unicode_valu
     }
 }
 
+// REQ-WFFORMAT-32
 #[test]
 fn environment_passthrough_rejects_reserved_invalid_and_duplicate_names() {
     for names in [
@@ -169,6 +172,7 @@ fn environment_passthrough_rejects_reserved_invalid_and_duplicate_names() {
     );
 }
 
+// REQ-WFFORMAT-1, REQ-WFFORMAT-34, REQ-WFFORMAT-44
 #[test]
 fn canonical_workflow_decodes_into_the_complete_execution_document() {
     let workflow = decode(&canonical_valid_fixture()).unwrap();
@@ -325,6 +329,7 @@ fn canonical_workflow_decodes_into_the_complete_execution_document() {
     );
 }
 
+// REQ-WFFORMAT-41
 #[test]
 fn workflow_v1_decodes_the_three_closed_recovery_forms_only_on_ordinary_steps() {
     let fixture = fs::read(fixture_root().join("valid/recovery-forms.yaml")).unwrap();
@@ -355,6 +360,7 @@ fn workflow_v1_decodes_the_three_closed_recovery_forms_only_on_ordinary_steps() 
     assert!(workflow.finalizers.is_empty());
 }
 
+// REQ-WFFORMAT-46
 #[test]
 fn workflow_v1_decodes_all_three_closed_agent_profiles() {
     let fixture = fs::read(fixture_root().join("valid/mixed-agent-harnesses.yaml")).unwrap();
@@ -390,6 +396,7 @@ fn workflow_v1_decodes_all_three_closed_agent_profiles() {
     );
 }
 
+// REQ-WFFORMAT-48
 #[test]
 fn workflow_v1_codex_shape_is_exact() {
     for config in [
@@ -411,6 +418,7 @@ fn workflow_v1_codex_shape_is_exact() {
     }
 }
 
+// REQ-WFFORMAT-61
 #[test]
 fn finalizers_decode_with_independent_order_defaults_and_engine_context() {
     let source = br#"schemaVersion: 1
@@ -487,6 +495,7 @@ finalizers:
     );
 }
 
+// REQ-WFFORMAT-2, REQ-WFFORMAT-8, REQ-WFFORMAT-11, REQ-WFFORMAT-34, REQ-WFFORMAT-36, REQ-WFFORMAT-37, REQ-WFFORMAT-41, REQ-WFFORMAT-42, REQ-WFFORMAT-45, REQ-WFFORMAT-46, REQ-WFFORMAT-53, REQ-WFFORMAT-54, REQ-WFFORMAT-61, REQ-WFRECOVERY-56, REQ-WFRECOVERY-57
 #[test]
 fn every_canonical_invalid_fixture_is_a_structural_failure() {
     let invalid_root = fixture_root().join("invalid");
@@ -508,6 +517,7 @@ fn every_canonical_invalid_fixture_is_a_structural_failure() {
     }
 }
 
+// REQ-WFFORMAT-63
 #[test]
 fn finalization_context_is_structurally_restricted_to_finalizer_inputs_and_attachments() {
     let agent_prefix = "schemaVersion: 1
@@ -542,6 +552,7 @@ steps:
     }
 }
 
+// REQ-WFFORMAT-47, REQ-WFFORMAT-51
 #[test]
 fn unused_agent_profiles_still_use_the_pi_config_contract() {
     let source = b"schemaVersion: 1
@@ -565,6 +576,7 @@ steps:
     );
 }
 
+// REQ-WFFORMAT-4, REQ-WFFORMAT-5, REQ-WFFORMAT-10
 #[test]
 fn forbidden_yaml_features_are_not_normalized() {
     let cases = [
@@ -624,6 +636,7 @@ fn forbidden_yaml_features_are_not_normalized() {
     }
 }
 
+// REQ-WFFORMAT-3, REQ-WFFORMAT-5
 #[test]
 fn yaml_1_2_core_does_not_apply_legacy_scalar_coercions() {
     let workflow = decode(
@@ -661,6 +674,7 @@ fn yaml_1_2_core_does_not_apply_legacy_scalar_coercions() {
     );
 }
 
+// REQ-WFFORMAT-3
 #[test]
 fn schema_version_does_not_round_to_one() {
     let error = decode(
@@ -671,6 +685,7 @@ fn schema_version_does_not_round_to_one() {
     assert_eq!(error.kind(), DecodeFailureKind::StructuralContract);
 }
 
+// REQ-WFFORMAT-5
 #[test]
 fn explicit_yaml_core_tags_are_accepted() {
     let workflow = decode(
@@ -686,6 +701,7 @@ fn explicit_yaml_core_tags_are_accepted() {
     assert_eq!(prepare.argv, ["true"]);
 }
 
+// REQ-WFFORMAT-6
 #[test]
 fn decode_failures_are_classified() {
     let failures = [

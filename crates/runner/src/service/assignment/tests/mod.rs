@@ -1953,6 +1953,7 @@ async fn malformed_run_input_projection_has_the_closed_immutable_decline() {
     );
 }
 
+// REQ-RUNINPUT-42
 #[tokio::test]
 async fn run_input_failures_keep_transient_local_and_immutable_families_distinct() {
     let cases = [
@@ -2364,6 +2365,7 @@ async fn broker_materialization_transitions_preparing_to_prepared_for_file_expor
     ));
 }
 
+// REQ-WORKSPACE-26
 #[tokio::test]
 async fn command_failure_retains_git_dirty_untracked_ignored_and_build_bytes() {
     let workflow = "schemaVersion: 1\nsteps:\n  write:\n    kind: cmd\n    command:\n      argv: [\"sh\", \"-c\", \"printf committed > tracked-output.txt; git add tracked-output.txt; git -c commit.gpgsign=false -c user.name=Fixture -c user.email=fixture@example.test commit --quiet -m 'retained fixture'; printf dirty-tracked > tracked-output.txt; printf '*.cache\\\\n' > .gitignore; printf untracked > untracked.txt; printf ignored > ignored.cache; mkdir build; printf build-output > build/result; exit 23\"]\n";
@@ -2456,6 +2458,7 @@ async fn staged_carrier_delivery_reads_while_the_workspace_remains_available() {
     assert!(!helper.exists());
 }
 
+// REQ-RUNNERENROLL-70
 #[tokio::test]
 async fn credential_teardown_failure_after_prepared_delivery_retains_and_admits_a_successor() {
     let workflow =
@@ -2675,6 +2678,7 @@ async fn preparation_deadline_fences_blocked_source_materialization() {
     assert!(manager.slot.is_none());
 }
 
+// REQ-DIAG-25
 #[tokio::test]
 async fn source_materialization_declines_preserve_failure_provenance() {
     assert_eq!(
@@ -3425,6 +3429,7 @@ async fn authorized_execution_reports_one_run_after_acknowledgement() {
     }
 }
 
+// REQ-CANCEL-31
 #[tokio::test]
 async fn cancellation_during_result_delivery_reports_execution_terminal() {
     let (_temporary, mut manager, offered, cancellation) = cancellable_running_fixture().await;
@@ -3449,6 +3454,7 @@ async fn cancellation_during_result_delivery_reports_execution_terminal() {
     );
 }
 
+// REQ-CANCEL-29, REQ-WFFINALIZE-14
 #[tokio::test]
 async fn cloud_graceful_cancellation_preserves_open_finalizers() {
     let (_temporary, mut manager, offered, cancellation) = cancellable_running_fixture().await;
@@ -3500,6 +3506,7 @@ async fn causally_requested_renewal_survives_user_cancellation() {
     }
 }
 
+// REQ-CANCEL-29
 #[tokio::test]
 async fn user_cancellation_completion_waits_for_process_quiescence() {
     let workflow =
@@ -3519,6 +3526,7 @@ async fn user_cancellation_completion_waits_for_process_quiescence() {
     assert_acknowledged_run(&mut manager, &capture, "cancelled");
 }
 
+// REQ-CANCEL-32
 #[tokio::test]
 async fn runner_shutdown_remains_an_interruption_after_user_cancellation() {
     let workflow = "schemaVersion: 1\nsteps:\n  check:\n    kind: cmd\n    command:\n      argv: [\"sh\", \"-c\", \"sleep 60\"]\n";
@@ -3757,6 +3765,7 @@ async fn command_workflows_do_not_require_an_agent_runtime() {
     assert_eq!(active_step_count(&manager), Some(1));
 }
 
+// REQ-WORKSPACE-18
 #[tokio::test]
 async fn managed_workflow_environment_excludes_runner_credentials_and_helpers() {
     let workflow = r#"schemaVersion: 1
@@ -3935,6 +3944,7 @@ async fn shutdown_starts_finishing_cleanup_before_the_five_second_reserve() {
     assert!(manager.shutdown_complete());
 }
 
+// REQ-RUNNERENROLL-73
 #[tokio::test]
 async fn shutdown_requests_runner_cancellation_for_running_work() {
     let workflow =
@@ -4128,6 +4138,7 @@ async fn shutdown_while_waiting_for_start_authority_never_activates_workflow_git
     assert_no_executed_workflow_reports(&mut manager);
 }
 
+// REQ-CANCEL-27
 #[tokio::test]
 async fn cancellation_during_start_authorization_reports_pre_execution_stop() {
     let workflow =
@@ -4466,6 +4477,7 @@ async fn slow_renewal_is_applied_before_cancellation_and_reports_real_headroom()
     assert_eq!(event["um.lease.request_age_ms"], 20_000);
 }
 
+// INV-LIFECYCLE-5
 #[tokio::test]
 async fn causal_acceptance_basis() {
     let workflow =
@@ -4548,6 +4560,7 @@ async fn causal_acceptance_basis() {
     );
 }
 
+// INV-LIFECYCLE-5
 #[tokio::test]
 async fn wrong_wall_time_after_transport_does_not_change_lease_authority() {
     async fn outcome(sent_at: &str) -> (Vec<Duration>, usize) {
@@ -4576,6 +4589,7 @@ async fn wrong_wall_time_after_transport_does_not_change_lease_authority() {
     assert_eq!(past.1, 1);
 }
 
+// INV-LIFECYCLE-5
 #[tokio::test]
 async fn delayed_replayed_and_conflicting_grants() {
     let workflow =
@@ -4693,6 +4707,7 @@ async fn pre_start_renewal_replay_never_gains_authority() {
     );
 }
 
+// REQ-RUNNERENROLL-74, REQ-RUNNERENROLL-76
 #[tokio::test]
 async fn same_boot_reconnect_retains_lease_basis() {
     let workflow =
@@ -4990,6 +5005,7 @@ async fn completion_without_a_terminal_report_fences_assignment_writes() {
     assert!(manager.slot.is_none());
 }
 
+// INV-LIFECYCLE-5
 #[tokio::test]
 async fn expiry_release_revokes_running_authority_immediately() {
     let workflow =
@@ -5055,6 +5071,7 @@ async fn delayed_execution_job_does_not_start_at_cancellation_boundary() {
     );
 }
 
+// REQ-RUNNERENROLL-75
 #[tokio::test]
 async fn schedules_renewal_before_initial_lease_loss_cancellation() {
     let (_temporary, _manager, mut sleep_requests, _offered, _workspace) =
@@ -5072,6 +5089,7 @@ async fn schedules_renewal_before_initial_lease_loss_cancellation() {
     );
 }
 
+// REQ-RUNNERENROLL-75
 #[tokio::test]
 async fn lease_loss_quiescence_attempts_artifact_delivery_before_terminal_report() {
     let (_temporary, mut manager, mut sleep_requests, _offered, workspace) =
@@ -5191,6 +5209,7 @@ async fn renewal_at_cancellation_boundary_cannot_restore_authority() {
     assert!(running.authority_updates.borrow().revoked);
 }
 
+// INV-LIFECYCLE-5
 #[tokio::test]
 async fn exact_next_renewal_replaces_the_running_authority() {
     let (_temporary, mut manager, mut sleep_requests, offered, _workspace) =
@@ -5383,6 +5402,7 @@ async fn last_containment_wait_observes_departed_guard_before_fencing() {
     assert_normal_success_and_reuse(&mut manager, &reports).await;
 }
 
+// REQ-RUNNERENROLL-71
 #[tokio::test]
 async fn uncontainable_guard_is_named_in_terminal_report_and_fences_offers() {
     let (_temporary, mut manager, control, reports) =
@@ -5478,6 +5498,7 @@ async fn quiescence_failure_waits_for_terminal_ack_or_delivery_deadline() {
     }
 }
 
+// REQ-WFRECOVERY-53
 #[tokio::test]
 async fn runner_executes_recovery_and_reports_exact_summary_and_invocations() {
     let failing_argv = serde_json::to_string(&failing_command_fixture_arguments()).unwrap();

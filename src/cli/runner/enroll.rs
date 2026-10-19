@@ -432,6 +432,7 @@ mod tests {
         }
     }
 
+    // REQ-RUNNERENROLL-50
     #[test]
     fn replacement_reports_cloud_and_live_outcomes_separately() {
         let mut output = Vec::new();

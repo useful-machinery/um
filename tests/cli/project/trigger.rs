@@ -75,6 +75,7 @@ fn args(key: &str) -> Vec<&str> {
     ]
 }
 
+// REQ-TRIGGER-87
 #[test]
 fn retry_requires_the_confirmed_request_identity_before_polling() {
     let unconfirmed = http_response(
@@ -96,6 +97,7 @@ fn retry_requires_the_confirmed_request_identity_before_polling() {
     );
 }
 
+// REQ-TRIGGER-87
 #[test]
 fn retry_replay_rejection_keeps_unknown_acceptance() {
     let (server, _directory, credential) = prepared_project(vec![
@@ -114,6 +116,7 @@ fn retry_replay_rejection_keeps_unknown_acceptance() {
     assert_eq!(server.finish().len(), 2);
 }
 
+// REQ-TRIGGER-87
 #[test]
 fn retry_first_post_refresh_failure_preserves_dispatched_key() {
     let server = ScriptedServer::respond(vec![
@@ -138,6 +141,7 @@ fn retry_first_post_refresh_failure_preserves_dispatched_key() {
     );
 }
 
+// REQ-TRIGGER-87
 #[test]
 fn retry_lost_response_and_failed_replay_refresh_preserves_original_key() {
     let server = ScriptedServer::respond(vec![
@@ -169,6 +173,7 @@ fn retry_lost_response_and_failed_replay_refresh_preserves_original_key() {
     );
 }
 
+// REQ-TRIGGER-86
 #[test]
 fn retry_replays_lost_submission_then_inspects_terminal_state() {
     let key = "same-evaluation-cycle";
@@ -192,6 +197,7 @@ fn retry_replays_lost_submission_then_inspects_terminal_state() {
     }
 }
 
+// REQ-TRIGGER-86, REQ-TRIGGER-87
 #[test]
 fn retry_reports_unknown_acceptance_with_replay_key_after_two_lost_responses() {
     let (server, _directory, credential) = prepared_project(vec![Vec::new(), Vec::new()]);
@@ -205,6 +211,7 @@ fn retry_reports_unknown_acceptance_with_replay_key_after_two_lost_responses() {
     assert!(requests.iter().all(|request| request.starts_with("POST ")));
 }
 
+// REQ-TRIGGER-86
 #[test]
 fn retry_refreshes_each_observation_without_repeating_submission() {
     let rejected = problem_http_response(
@@ -272,6 +279,7 @@ fn retry_refreshes_each_observation_without_repeating_submission() {
     );
 }
 
+// REQ-TRIGGER-88
 #[test]
 fn retry_observation_transport_loss_keeps_accepted_cycle_not_unknown_submission() {
     let (server, _directory, credential) = prepared_project(vec![
@@ -290,6 +298,7 @@ fn retry_observation_transport_loss_keeps_accepted_cycle_not_unknown_submission(
     assert!(requests[1].starts_with("GET "));
 }
 
+// REQ-TRIGGER-88
 #[test]
 fn retry_observation_refresh_failure_keeps_confirmed_cycle() {
     let server = ScriptedServer::respond(vec![
@@ -313,6 +322,7 @@ fn retry_observation_refresh_failure_keeps_confirmed_cycle() {
     assert!(requests[2].starts_with("POST /auth/oauth/token "));
 }
 
+// REQ-TRIGGER-86, REQ-TRIGGER-87, REQ-TRIGGER-97
 #[test]
 fn retry_key_recovers_across_process_restart() {
     let (server, _directory, credential) = prepared_project(vec![
@@ -336,6 +346,7 @@ fn retry_key_recovers_across_process_restart() {
     );
 }
 
+// REQ-TRIGGER-88
 #[test]
 fn retry_signal_after_acceptance_reports_identity_without_cancelling_cycle() {
     let mut server = ScriptedServer::respond_with_paused_last_response(vec![
@@ -377,6 +388,7 @@ fn retry_signal_after_acceptance_reports_identity_without_cancelling_cycle() {
     assert!(server.finish().is_empty());
 }
 
+// REQ-TRIGGER-88
 #[test]
 fn retry_timeout_after_acceptance_keeps_cycle_identity() {
     let mut server = ScriptedServer::respond_with_paused_last_response(vec![
@@ -415,6 +427,7 @@ fn retry_timeout_after_acceptance_keeps_cycle_identity() {
     assert!(server.finish().is_empty());
 }
 
+// REQ-TRIGGER-87
 #[test]
 fn retry_post_rate_limit_is_definitive_and_does_not_submit_again() {
     let (server, _directory, credential) = prepared_project(vec![http_response_with_headers(
@@ -430,6 +443,7 @@ fn retry_post_rate_limit_is_definitive_and_does_not_submit_again() {
     assert_eq!(server.finish().len(), 1);
 }
 
+// REQ-TRIGGER-86
 #[test]
 fn retry_get_rate_limit_preserves_retry_after_then_observes_terminal_state() {
     let (server, _directory, credential) = prepared_project(vec![
@@ -451,6 +465,7 @@ fn retry_get_rate_limit_preserves_retry_after_then_observes_terminal_state() {
     );
 }
 
+// REQ-TRIGGER-88
 #[test]
 fn retry_role_loss_after_acceptance_never_claims_run_or_resubmits() {
     let (server, _directory, credential) = prepared_project(vec![
@@ -472,6 +487,7 @@ fn retry_role_loss_after_acceptance_never_claims_run_or_resubmits() {
     assert!(requests[0].starts_with("POST ") && requests[1].starts_with("GET "));
 }
 
+// REQ-TRIGGER-87
 #[test]
 fn retry_same_state_conflict_does_not_create_an_observation_cycle() {
     let (server, _directory, credential) = prepared_project(vec![problem_http_response(
@@ -486,6 +502,7 @@ fn retry_same_state_conflict_does_not_create_an_observation_cycle() {
     assert_eq!(server.finish().len(), 1);
 }
 
+// REQ-TRIGGER-86, REQ-TRIGGER-88
 #[test]
 fn retry_never_treats_failed_or_newer_cycle_as_a_run() {
     for (state, cycle, expected) in [

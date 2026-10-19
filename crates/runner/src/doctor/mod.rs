@@ -400,6 +400,7 @@ mod tests {
         }
     }
 
+    // REQ-RUNNERENROLL-46
     #[test]
     fn empty_selection_runs_only_default_checks() {
         let default_runs = Arc::new(AtomicUsize::new(0));
@@ -430,6 +431,7 @@ mod tests {
         assert_eq!(non_default_runs.load(Ordering::SeqCst), 0);
     }
 
+    // REQ-RUNNERENROLL-46
     #[test]
     fn explicit_selection_deduplicates_and_uses_registry_order() {
         let first_runs = Arc::new(AtomicUsize::new(0));
@@ -496,6 +498,7 @@ mod tests {
         assert_eq!(runs.load(Ordering::SeqCst), 0);
     }
 
+    // REQ-AGENT-47
     #[test]
     fn built_in_registry_contains_the_default_git_check() {
         let registry = built_in_registry().unwrap();

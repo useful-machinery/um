@@ -634,6 +634,7 @@ async fn cancelled_stalled_launch_cleans_worker_fixture() {
     .await;
 }
 
+// REQ-WFEXEC-19, REQ-WFEXEC-22
 #[tokio::test]
 async fn command_uses_contained_cwd_literal_argv_and_isolates_parent_environment() {
     with_watchdog(async {
@@ -676,6 +677,7 @@ async fn command_uses_contained_cwd_literal_argv_and_isolates_parent_environment
     .await;
 }
 
+// REQ-WFEXEC-22, REQ-WFEXEC-25
 #[tokio::test]
 async fn concurrent_consumers_receive_private_inputs_and_reserved_environment() {
     with_watchdog(async {
@@ -794,6 +796,7 @@ async fn concurrent_consumers_receive_private_inputs_and_reserved_environment() 
     .await;
 }
 
+// REQ-WFEXEC-25
 #[tokio::test]
 async fn concurrent_consumers_copy_one_committed_file_without_shared_mutation() {
     with_watchdog(async {
@@ -1288,6 +1291,7 @@ steps:
     .await;
 }
 
+// REQ-WFEXEC-46
 #[tokio::test]
 async fn cancel_first_rejects_a_ready_candidate_and_commit_first_retains_it() {
     with_watchdog(async {
@@ -1501,11 +1505,13 @@ steps:
     .await;
 }
 
+// INV-ENGINE-9
 #[tokio::test]
 async fn workflow_execution_rejects_artifact_staging_bound_to_another_execution() {
     assert_staging_binding_guard(StagingBindingMismatch::Artifact).await;
 }
 
+// INV-ENGINE-9
 #[tokio::test]
 async fn workflow_execution_rejects_input_staging_bound_to_another_execution() {
     assert_staging_binding_guard(StagingBindingMismatch::Input).await;
@@ -1619,6 +1625,7 @@ async fn workflow_execution_rejects_input_staging_with_a_different_live_limit() 
     assert!(commits.try_recv().is_err());
 }
 
+// REQ-OUTPUTS-1
 #[tokio::test]
 async fn workflow_execution_captures_declared_outputs_before_success() {
     with_watchdog(async {
@@ -1669,6 +1676,8 @@ async fn workflow_execution_captures_declared_outputs_before_success() {
     .await;
 }
 
+// REQ-OUTPUTS-9, REQ-EXPORTS-2
+// INV-ENGINE-12
 #[tokio::test]
 async fn multi_file_capture_emits_one_complete_typed_set_and_complete_exports() {
     let temporary = tempfile::tempdir().unwrap();
@@ -1877,6 +1886,8 @@ steps:
     ));
 }
 
+// REQ-OUTPUTS-2
+// INV-ENGINE-12
 #[tokio::test]
 async fn failed_set_rolls_back_without_removing_a_prior_steps_export() {
     let temporary = tempfile::tempdir().unwrap();
@@ -2257,6 +2268,7 @@ async fn reducer_action_order_deterministically_allocates_contended_capture_budg
     );
 }
 
+// REQ-WFEXEC-20
 #[tokio::test]
 async fn bare_program_search_skips_a_candidate_inaccessible_to_the_caller() {
     with_watchdog(async {
@@ -2326,6 +2338,7 @@ async fn bare_program_search_skips_a_candidate_inaccessible_to_the_caller() {
     .await;
 }
 
+// REQ-WFEXEC-9, REQ-WFEXEC-20
 #[tokio::test]
 async fn cwd_and_launch_failures_are_typed_start_occurrences() {
     with_watchdog(async {
@@ -2382,6 +2395,7 @@ enum RebindingCommand {
     AbsolutePath,
 }
 
+// REQ-WFEXEC-48
 #[tokio::test]
 async fn execution_root_rebinding_at_the_prelaunch_boundary_fails_before_spawn() {
     assert_execution_root_rebinding_fails_before_spawn(RebindingCommand::Absolute).await;
@@ -2526,6 +2540,7 @@ async fn panicked_spawned_step_task_fails_the_named_step() {
     .await;
 }
 
+// REQ-WFEXEC-21
 #[tokio::test]
 async fn nonzero_exit_is_a_typed_execution_occurrence_with_the_start_action() {
     with_watchdog(async {
@@ -3175,6 +3190,7 @@ async fn cancellation_during_diagnostic_join_waits_for_readers() {
     .await;
 }
 
+// REQ-WFEXEC-19
 #[tokio::test]
 async fn concurrent_commands_receive_distinct_process_groups() {
     with_watchdog(async {
@@ -3415,6 +3431,7 @@ async fn sixty_second_local_grace_allows_clean_exit_after_thirty_seconds() {
     .await;
 }
 
+// REQ-WFEXEC-47
 #[tokio::test]
 async fn admitted_deadline_forces_the_stubborn_process_group_without_wall_clock_waiting() {
     with_watchdog(async {
@@ -3597,6 +3614,7 @@ async fn natural_exit_before_cancel_delivery_has_no_late_lifecycle_or_cleanup_wo
     .await;
 }
 
+// REQ-WFEXEC-47
 #[tokio::test]
 async fn cancellation_after_the_owned_child_exits_still_terminates_its_descendant() {
     with_watchdog(async {

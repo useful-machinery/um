@@ -56,6 +56,7 @@ pub(crate) fn resolve_text(field: Field, original: &str) -> Result<&str, Content
 mod tests {
     use super::*;
 
+    // REQ-EXPORTS-8, REQ-EXPORTS-9, REQ-EXPORTS-12
     #[test]
     fn resolves_author_text_with_content_precedence() {
         let examples = [

@@ -220,6 +220,7 @@ fn safe_path(path: &Path) -> String {
 mod tests {
     use super::parse_attempt;
 
+    // REQ-LOCALRUN-153
     #[test]
     fn attempt_parser_accepts_only_positive_unsigned_decimal_values() {
         assert_eq!(parse_attempt("0002").unwrap().get(), 2);

@@ -427,6 +427,7 @@ fn step_transition(
     }))
 }
 
+// REQ-LOCALRUN-118
 #[tokio::test]
 async fn plain_blocked_evidence_never_writes_terminal_controls() {
     use crate::workflow::evidence::{BlockedDetail, Prerequisite};
@@ -463,6 +464,7 @@ async fn plain_blocked_evidence_never_writes_terminal_controls() {
     assert!(!output.contains('\u{1b}'), "{output:?}");
 }
 
+// REQ-LOCALRUN-1, REQ-LOCALRUN-2
 #[test]
 fn capability_matrix_selects_one_mode_without_consulting_runtime_state() {
     for stdin in [false, true] {
@@ -522,6 +524,7 @@ fn capability_matrix_selects_one_mode_without_consulting_runtime_state() {
     }
 }
 
+// REQ-LOCALRUN-5, REQ-LOCALRUN-119, REQ-LOCALRUN-120
 #[test]
 fn color_selection_uses_the_human_destination_and_environment_matrix() {
     for (mode, stdout_terminal, stderr_terminal, expected) in [
@@ -576,6 +579,7 @@ fn color_selection_uses_the_human_destination_and_environment_matrix() {
     );
 }
 
+// REQ-LOCALRUN-103, REQ-LOCALRUN-126, REQ-LOCALRUN-128
 #[test]
 fn rejection_json_is_one_pretty_document_without_stderr_prose() {
     let temporary = tempfile::tempdir().unwrap();
@@ -658,6 +662,7 @@ fn rejection_json_writer_failure_is_returned_without_local_rendering() {
     assert!(stderr.text().is_empty());
 }
 
+// REQ-LOCALRUN-91, REQ-LOCALRUN-128
 #[test]
 fn contracted_admission_rejection_has_the_resolved_workflow_identity() {
     let temporary = tempfile::tempdir().unwrap();
@@ -712,6 +717,7 @@ steps:
     assert!(!stdout.text().contains('\u{1b}'));
 }
 
+// REQ-LOCALRUN-104, REQ-LOCALRUN-105, REQ-LOCALRUN-106, REQ-LOCALRUN-107, REQ-LOCALRUN-110, REQ-LOCALRUN-114
 #[tokio::test]
 async fn live_stream_labels_normalized_output_and_orders_cancellation_acknowledgement() {
     let fixture = Fixture::new(workflow_source());
@@ -801,6 +807,7 @@ async fn live_stream_labels_normalized_output_and_orders_cancellation_acknowledg
     assert!(stderr.text().is_empty());
 }
 
+// REQ-LOCALRUN-112
 #[tokio::test]
 async fn tty_events_wrap_details_with_hanging_and_stacked_layouts() {
     let inline = render_start(
@@ -854,6 +861,7 @@ async fn tty_events_wrap_details_with_hanging_and_stacked_layouts() {
     assert!(event_lines.iter().all(|line| display_width(line) <= 60));
 }
 
+// REQ-LOCALRUN-112
 #[tokio::test]
 async fn redirected_events_remain_one_logical_record_per_line() {
     let mut redirected = config(RequestedPresentationMode::Plain, ColorChoice::Never);
@@ -868,6 +876,7 @@ async fn redirected_events_remain_one_logical_record_per_line() {
     assert!(!output.contains(VISUAL_CONTINUATION_MARKER));
 }
 
+// REQ-LOCALRUN-113
 #[tokio::test]
 async fn safety_fragmentation_keeps_its_own_prefixed_records_when_redirected() {
     let fixture = Fixture::new(workflow_source());
@@ -912,6 +921,7 @@ async fn safety_fragmentation_keeps_its_own_prefixed_records_when_redirected() {
     assert!(!output.contains(VISUAL_CONTINUATION_MARKER));
 }
 
+// REQ-LOCALRUN-112
 #[test]
 fn detail_wrapping_prefers_words_and_hard_wraps_by_display_cells() {
     assert_eq!(
@@ -928,6 +938,7 @@ fn detail_wrapping_prefers_words_and_hard_wraps_by_display_cells() {
     );
 }
 
+// REQ-OUTPUTS-16, REQ-OUTPUTS-17, REQ-LOCALRUN-109
 #[tokio::test]
 async fn committed_outputs_render_before_the_terminal_step_record() {
     let fixture = Fixture::new(
@@ -985,6 +996,7 @@ steps:
     );
 }
 
+// REQ-OUTPUTS-16, REQ-OUTPUTS-17
 #[tokio::test]
 async fn agent_success_uses_semantic_output_count_in_live_and_summary_details() {
     let temporary = tempfile::tempdir().unwrap();
@@ -1069,6 +1081,7 @@ steps:
     assert_eq!(summary_detail, "1 output committed");
 }
 
+// REQ-LOCALRUN-102, REQ-LOCALRUN-122, REQ-LOCALRUN-123
 #[tokio::test]
 async fn plain_and_json_route_live_records_summaries_and_terminal_json() {
     let fixture = Fixture::new(workflow_source());
@@ -1222,6 +1235,7 @@ async fn plain_and_json_route_live_records_summaries_and_terminal_json() {
     );
 }
 
+// REQ-LOCALRUN-125
 #[test]
 fn tui_handoff_uses_the_standard_summary_without_reopening_live_output() {
     let fixture = Fixture::new(workflow_source());
@@ -1259,6 +1273,7 @@ fn tui_handoff_uses_the_standard_summary_without_reopening_live_output() {
     assert!(!summary.contains("started 2026"));
 }
 
+// REQ-EVIDENCE-16, REQ-LOCALRUN-123
 #[tokio::test]
 async fn failed_and_cancelled_summaries_use_authoritative_terminal_facts() {
     let fixture = Fixture::new(workflow_source());
@@ -1384,6 +1399,7 @@ async fn failed_and_cancelled_summaries_use_authoritative_terminal_facts() {
     );
 }
 
+// REQ-LOCALRUN-131, REQ-LOCALRUN-141
 #[tokio::test]
 async fn publication_failure_keeps_factual_human_summary_and_omits_json() {
     let fixture = Fixture::new(workflow_source());
@@ -1420,6 +1436,7 @@ async fn publication_failure_keeps_factual_human_summary_and_omits_json() {
     assert!(!stderr.text().contains("run result succeeded · exit"));
 }
 
+// REQ-LOCALRUN-139
 #[tokio::test]
 async fn header_writer_failure_is_returned_without_local_rendering() {
     let fixture = Fixture::new(workflow_source());
@@ -1452,6 +1469,8 @@ async fn header_writer_failure_is_returned_without_local_rendering() {
     assert!(stderr.text().is_empty());
 }
 
+// REQ-LOCALRUN-164
+// INV-ENGINE-15
 #[tokio::test(flavor = "current_thread")]
 async fn stalled_writer_applies_backpressure_to_bursts_instead_of_failing() {
     let fixture = Fixture::new(workflow_source());
@@ -1498,6 +1517,8 @@ async fn stalled_writer_applies_backpressure_to_bursts_instead_of_failing() {
     assert!(presentation.failure().is_none());
 }
 
+// REQ-LOCALRUN-138
+// INV-ENGINE-15
 #[tokio::test(flavor = "current_thread")]
 async fn permanently_blocked_writer_fails_without_blocking_cancellation() {
     let fixture = Fixture::new(workflow_source());
@@ -1577,6 +1598,7 @@ async fn live_writer_failure_is_detected_when_the_destination_flush_fails() {
     assert_eq!(failure.error_kind, Some(io::ErrorKind::BrokenPipe));
 }
 
+// REQ-LOCALRUN-137
 #[tokio::test]
 async fn live_writer_failure_notifies_the_adapter_and_stops_further_writes() {
     let fixture = Fixture::new(workflow_source());
@@ -1614,6 +1636,7 @@ async fn live_writer_failure_notifies_the_adapter_and_stops_further_writes() {
     assert!(stderr.text().is_empty());
 }
 
+// REQ-LOCALRUN-140
 #[tokio::test]
 async fn terminal_json_writer_failure_reports_the_published_result_path() {
     let fixture = Fixture::new(workflow_source());
@@ -1660,6 +1683,7 @@ async fn terminal_json_writer_failure_reports_the_published_result_path() {
     assert!(stderr.text().contains("succeeded · exit 0"));
 }
 
+// REQ-LOCALRUN-124
 #[test]
 fn durations_use_compound_units_after_one_minute() {
     assert_eq!(human_duration(Duration::from_millis(999)), "999ms");
@@ -1668,6 +1692,7 @@ fn durations_use_compound_units_after_one_minute() {
     assert_eq!(human_duration(Duration::from_secs(3723)), "1h02m03s");
 }
 
+// REQ-LOCALRUN-121
 #[tokio::test]
 async fn json_color_always_styles_only_the_stderr_presentation() {
     let fixture = Fixture::new(workflow_source());
@@ -1702,4 +1727,93 @@ async fn json_color_always_styles_only_the_stderr_presentation() {
     assert!(!presentation.contains("\u{1b}[32m"));
     assert!(!stdout.text().contains('\u{1b}'));
     let _: Value = serde_json::from_str(&stdout.text()).unwrap();
+}
+
+// REQ-LOCALRUN-108
+#[tokio::test]
+async fn agent_start_records_name_the_profile_harness_and_level_without_prompts() {
+    const SYSTEM_SENTINEL: &str = "system-prompt-sentinel";
+    const MESSAGE_SENTINEL: &str = "message-text-sentinel";
+    let temporary = tempfile::tempdir().unwrap();
+    let source_root = temporary.path().join("source");
+    std::fs::create_dir(&source_root).unwrap();
+    let agent_step = |id: &str, profile: &str| {
+        format!(
+            "  {id}:\n    kind: agent\n    agent:\n      profile: {profile}\n      systemPrompt: system.md\n      message:\n        text:\n          - file: message.md\n    outputs:\n      response:\n        kind: text\n        from: agent_response\n"
+        )
+    };
+    std::fs::write(
+        source_root.join("workflow.yaml"),
+        format!(
+            "schemaVersion: 1
+agentProfiles:
+  planner:
+    harness:
+      kind: pi
+      config:
+        model: openai/gpt-5
+        thinking: high
+  reviewer:
+    harness:
+      kind: claude_code
+      config:
+        model: claude-opus-4-1
+        effort: xhigh
+  coder:
+    harness:
+      kind: codex
+      config:
+        model: gpt-5.4
+        effort: medium
+steps:
+{}{}{}",
+            agent_step("plan", "planner"),
+            agent_step("review", "reviewer"),
+            agent_step("code", "coder"),
+        ),
+    )
+    .unwrap();
+    std::fs::write(source_root.join("system.md"), SYSTEM_SENTINEL).unwrap();
+    std::fs::write(source_root.join("message.md"), MESSAGE_SENTINEL).unwrap();
+    let workflow = resolution::resolve(&source_root, Path::new("workflow.yaml")).unwrap();
+    let stdout = SharedWriter::default();
+    let presentation = WorkflowRunOutput::new(
+        config(RequestedPresentationMode::Plain, ColorChoice::Never),
+        stdout.clone(),
+        SharedWriter::default(),
+    )
+    .start(&workflow, 1, TestClock::fixed("2026-08-02T12:01:44Z"))
+    .unwrap();
+
+    for step in ["plan", "review", "code"] {
+        presentation
+            .observe(step_transition(step, StepStateKind::Starting, None))
+            .await;
+    }
+    presentation.flush_pending().await;
+
+    let output = stdout.text();
+    for (step, expected) in [
+        ("plan", ["planner", "pi", "openai/gpt-5", "thinking=high"]),
+        (
+            "review",
+            ["reviewer", "claude code", "claude-opus-4-1", "effort=xhigh"],
+        ),
+        ("code", ["coder", "codex", "gpt-5.4", "effort=medium"]),
+    ] {
+        let start = output
+            .lines()
+            .find(|line| {
+                let mut tokens = line.split_whitespace();
+                tokens.any(|token| token == step) && tokens.next() == Some("start")
+            })
+            .unwrap_or_else(|| panic!("no start record for {step} in {output:?}"));
+        for value in expected {
+            assert!(start.contains(value), "missing {value:?} in {start:?}");
+        }
+    }
+    assert!(!output.contains(SYSTEM_SENTINEL));
+    assert!(!output.contains(MESSAGE_SENTINEL));
+    assert!(!output.contains("system.md"));
+    assert!(!output.contains("message.md"));
 }

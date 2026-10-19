@@ -17,6 +17,7 @@ fn json_lines(output: &[u8]) -> Vec<serde_json::Value> {
         .collect()
 }
 
+// REQ-AUTH-20, REQ-AUTH-21, REQ-AUTH-24, REQ-AUTH-34, REQ-AUTH-54, REQ-AUTH-55
 #[test]
 fn forced_login_emits_ndjson_persists_token_and_confirms_principal() {
     let actions = serde_json::json!([{
@@ -165,6 +166,7 @@ fn forced_login_emits_ndjson_persists_token_and_confirms_principal() {
     );
 }
 
+// REQ-AUTH-21
 #[test]
 fn existing_authenticated_credential_short_circuits_device_authorization() {
     let server = ScriptedServer::respond(vec![json_http_response(
@@ -205,6 +207,7 @@ fn existing_authenticated_credential_short_circuits_device_authorization() {
     assert!(requests[0].starts_with("GET /api/v1/me HTTP/1.1\r\n"));
 }
 
+// REQ-AUTH-19, REQ-AUTH-27, REQ-AUTH-29
 #[test]
 fn human_login_writes_activation_and_terminal_result_to_stdout() {
     let server = ScriptedServer::respond(vec![
@@ -257,6 +260,7 @@ fn human_login_writes_activation_and_terminal_result_to_stdout() {
     server.finish();
 }
 
+// REQ-AUTH-19, REQ-AUTH-29, REQ-AUTH-36, REQ-AUTH-55
 #[test]
 fn human_login_prefers_the_direct_link_and_explains_required_signup() {
     let server = ScriptedServer::respond(vec![
@@ -318,6 +322,7 @@ fn human_login_prefers_the_direct_link_and_explains_required_signup() {
     server.finish();
 }
 
+// REQ-AUTH-21, REQ-AUTH-29, REQ-AUTH-36
 #[test]
 fn human_login_names_an_existing_authenticated_principal() {
     let server = ScriptedServer::respond(vec![json_http_response(
@@ -354,6 +359,7 @@ fn human_login_names_an_existing_authenticated_principal() {
     server.finish();
 }
 
+// REQ-AUTH-22, REQ-AUTH-26
 #[test]
 fn unauthenticated_existing_check_starts_device_authorization() {
     let server = ScriptedServer::respond(vec![
@@ -405,6 +411,7 @@ fn unauthenticated_existing_check_starts_device_authorization() {
     assert!(requests[2].starts_with("POST /auth/oauth/token HTTP/1.1\r\n"));
 }
 
+// REQ-AUTH-22, REQ-AUTH-27
 #[test]
 fn existing_status_unreachable_emits_failure_without_device_authorization() {
     let server = ScriptedServer::respond(vec![http_response("503 Service Unavailable", None, &[])]);
@@ -436,6 +443,7 @@ fn existing_status_unreachable_emits_failure_without_device_authorization() {
     assert!(requests[0].starts_with("GET /api/v1/me HTTP/1.1\r\n"));
 }
 
+// REQ-AUTH-22
 #[test]
 fn existing_status_protocol_error_emits_failure_without_device_authorization() {
     let server = ScriptedServer::respond(vec![json_http_response("200 OK", serde_json::json!({}))]);
@@ -466,6 +474,7 @@ fn existing_status_protocol_error_emits_failure_without_device_authorization() {
     assert!(requests[0].starts_with("GET /api/v1/me HTTP/1.1\r\n"));
 }
 
+// REQ-AUTH-29
 #[test]
 fn human_existing_status_protocol_failure_uses_shared_renderer_with_reason() {
     let server = ScriptedServer::respond(vec![json_http_response("200 OK", serde_json::json!({}))]);
@@ -482,6 +491,7 @@ fn human_existing_status_protocol_failure_uses_shared_renderer_with_reason() {
     server.finish();
 }
 
+// REQ-AUTH-26
 #[test]
 fn denied_forced_login_preserves_the_previous_credential() {
     let server = ScriptedServer::respond(vec![
@@ -544,6 +554,7 @@ fn denied_forced_login_preserves_the_previous_credential() {
     server.finish();
 }
 
+// REQ-AUTH-27, REQ-AUTH-29
 #[test]
 fn human_login_connection_failure_names_the_oauth_issuer_and_cause_on_stderr() {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -572,6 +583,7 @@ fn human_login_connection_failure_names_the_oauth_issuer_and_cause_on_stderr() {
     assert!(!output.stderr.is_empty());
 }
 
+// REQ-AUTH-26, REQ-AUTH-27
 #[test]
 fn login_unreachable_failures_report_the_active_phase() {
     let cases = [
@@ -630,6 +642,7 @@ fn login_unreachable_failures_report_the_active_phase() {
     }
 }
 
+// REQ-AUTH-26, REQ-AUTH-27
 #[test]
 fn login_protocol_failures_report_the_active_phase() {
     let cases = [
@@ -713,6 +726,7 @@ fn login_protocol_failures_report_the_active_phase() {
     }
 }
 
+// REQ-AUTH-30, REQ-AUTH-41
 #[test]
 fn local_login_failure_emits_no_auth_event_or_network_request() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -760,6 +774,7 @@ fn local_login_failure_emits_no_auth_event_or_network_request() {
     assert_eq!(fs::read(&credential_path).unwrap(), malformed);
 }
 
+// REQ-AUTH-20, REQ-AUTH-27, REQ-AUTH-28
 #[test]
 fn interrupting_login_emits_cancellation_and_exits_130() {
     let server = ScriptedServer::respond(vec![json_http_response(
@@ -848,6 +863,7 @@ fn interrupting_login_emits_cancellation_and_exits_130() {
     server.finish();
 }
 
+// REQ-AUTH-28
 #[test]
 fn interrupt_after_persistence_does_not_report_cancellation() {
     let mut server = ScriptedServer::respond_with_paused_last_response(vec![
@@ -953,6 +969,7 @@ fn interrupt_after_persistence_does_not_report_cancellation() {
     assert!(server.finish().is_empty());
 }
 
+// REQ-AUTH-25
 #[test]
 fn issued_token_is_retained_when_principal_confirmation_is_unreachable() {
     let server = ScriptedServer::respond(vec![
@@ -1017,6 +1034,7 @@ fn issued_token_is_retained_when_principal_confirmation_is_unreachable() {
     server.finish();
 }
 
+// REQ-AUTH-25, REQ-AUTH-27
 #[test]
 fn unauthenticated_principal_confirmation_emits_status_and_removes_token() {
     let server = ScriptedServer::respond(vec![
@@ -1088,6 +1106,7 @@ fn unauthenticated_principal_confirmation_emits_status_and_removes_token() {
     server.finish();
 }
 
+// REQ-AUTH-24, REQ-AUTH-34
 #[test]
 fn signup_required_principal_confirmation_preserves_opaque_actions() {
     let actions = serde_json::json!([{

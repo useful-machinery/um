@@ -307,6 +307,7 @@ impl Sleeper for LogicalSleeper {
     }
 }
 
+// INV-CONTRACT-11
 #[tokio::test]
 async fn replays_gateway_conversations_against_established_runner() {
     let conversations = load_conversations();

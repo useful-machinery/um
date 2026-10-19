@@ -57,6 +57,7 @@ fn evaluation() -> serde_json::Value {
         "blockingRunId":"run-other","event":{"valid":false,"invalidFields":["issueId"]},
         "conditionResults":[{"index":0,"matched":false,"reasonCode":"evidence_unavailable"}]})
 }
+// REQ-TRIGGER-80, REQ-TRIGGER-81, REQ-TRIGGER-82, REQ-TRIGGER-83, REQ-TRIGGER-84
 #[test]
 fn trigger_lifecycle_replaces_collections_and_reports_conflicts() {
     let (server, dir, credential) = prepared(vec![
@@ -176,6 +177,7 @@ fn trigger_lifecycle_replaces_collections_and_reports_conflicts() {
     assert!(!String::from_utf8_lossy(&create.stdout).contains(SECRET));
 }
 
+// REQ-TRIGGER-85
 #[test]
 fn lost_lifecycle_response_reuses_one_key_and_never_reports_early_success() {
     let (server, _dir, credential) = prepared(vec![Vec::new(), confirmed_trigger("200 OK")]);
@@ -204,6 +206,7 @@ fn lost_lifecycle_response_reuses_one_key_and_never_reports_early_success() {
     assert!(requests.iter().all(|request| request.starts_with("POST ")));
 }
 
+// REQ-TRIGGER-85
 #[test]
 fn two_lost_lifecycle_responses_expose_only_one_recoverable_request() {
     let (server, _dir, credential) = prepared(vec![Vec::new(), Vec::new()]);
@@ -235,6 +238,7 @@ fn two_lost_lifecycle_responses_expose_only_one_recoverable_request() {
     );
 }
 
+// REQ-TRIGGER-85
 #[test]
 fn rejected_mutation_replay_retains_request_identity_and_closed_failure() {
     for (reply, outcome) in [
@@ -286,6 +290,7 @@ fn rejected_mutation_replay_retains_request_identity_and_closed_failure() {
     }
 }
 
+// REQ-TRIGGER-85
 #[test]
 fn lost_create_response_followed_by_forbidden_replay_keeps_creation_key() {
     let (server, dir, credential) = prepared(vec![
@@ -328,6 +333,7 @@ fn lost_create_response_followed_by_forbidden_replay_keeps_creation_key() {
     );
 }
 
+// REQ-TRIGGER-85
 #[test]
 fn mutation_responses_require_exact_identity_and_complete_configuration() {
     let mut later = trigger();
@@ -367,6 +373,7 @@ fn mutation_responses_require_exact_identity_and_complete_configuration() {
     }
 }
 
+// REQ-TRIGGER-85
 #[test]
 fn delete_requires_exact_confirmed_response() {
     for reply in [
@@ -413,6 +420,7 @@ fn delete_requires_exact_confirmed_response() {
     }
 }
 
+// REQ-TRIGGER-84
 #[test]
 fn list_rejects_late_schema_without_emitting_partial_items() {
     let mut later_trigger = trigger();
@@ -445,6 +453,7 @@ fn list_rejects_late_schema_without_emitting_partial_items() {
     assert_eq!(server.finish().len(), 2);
 }
 
+// REQ-TRIGGER-74, REQ-TRIGGER-83
 #[test]
 fn filters_and_cursors_are_forwarded_once_and_history_preserves_immutable_facts() {
     let mut other_trigger = trigger();
@@ -586,6 +595,7 @@ fn filters_and_cursors_are_forwarded_once_and_history_preserves_immutable_facts(
     );
 }
 
+// REQ-TRIGGER-83
 #[test]
 fn human_and_json_inspection_agree_on_selection_attempt_and_snapshot_mapping() {
     let (server, _dir, credential) = prepared(vec![
@@ -649,6 +659,7 @@ fn human_and_json_inspection_agree_on_selection_attempt_and_snapshot_mapping() {
     assert_eq!(server.finish().len(), 4);
 }
 
+// REQ-TRIGGER-21, REQ-TRIGGER-84
 #[test]
 fn deleted_trigger_has_only_tombstone_fields_and_late_schema_is_rejected() {
     let (server, _dir, credential) = prepared(vec![
@@ -696,6 +707,7 @@ fn deleted_trigger_has_only_tombstone_fields_and_late_schema_is_rejected() {
     assert_eq!(server.finish().len(), 3);
 }
 
+// REQ-TRIGGER-84
 #[test]
 fn evaluation_show_rejects_late_schema_instead_of_dropping_history() {
     let mut later = evaluation();
@@ -723,6 +735,7 @@ fn evaluation_show_rejects_late_schema_instead_of_dropping_history() {
 }
 
 #[cfg(target_os = "linux")]
+// REQ-TRIGGER-85
 #[test]
 fn interrupted_mutation_reports_request_identity_without_new_cycle() {
     for (signal, code) in [
@@ -778,6 +791,7 @@ fn interrupted_mutation_reports_request_identity_without_new_cycle() {
     }
 }
 
+// REQ-TRIGGER-82
 #[test]
 fn invalid_file_and_competing_stdin_never_dispatch() {
     let (server, dir, credential) = prepared(vec![]);

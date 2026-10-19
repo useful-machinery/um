@@ -116,6 +116,7 @@ steps:
     );
 }
 
+// REQ-LOCALRUN-111, REQ-LOCALRUN-116
 #[test]
 fn agent_observations_are_typed_normalized_ordered_and_hide_native_events() {
     let (_temporary, workflow) = resolved_workflow(
@@ -171,6 +172,7 @@ fn agent_observations_are_typed_normalized_ordered_and_hide_native_events() {
     assert!(!format!("{native:?}").contains("nativeSecret"));
 }
 
+// REQ-LOCALRUN-114, REQ-LOCALRUN-116, REQ-LOCALRUN-117
 #[test]
 fn child_normalization_preserves_framing_and_exposes_untrusted_bytes() {
     let mut stream = ChildStream::default();
@@ -194,6 +196,7 @@ fn child_normalization_preserves_framing_and_exposes_untrusted_bytes() {
     );
 }
 
+// REQ-LOCALRUN-115
 #[test]
 fn child_normalization_resets_utf8_after_abandoning_a_control_candidate() {
     let mut stream = ChildStream::default();
@@ -204,6 +207,7 @@ fn child_normalization_resets_utf8_after_abandoning_a_control_candidate() {
     assert_eq!(records[0].payload, "\\x1b[\\xc2\\xa2");
 }
 
+// REQ-LOCALRUN-113, REQ-LOCALRUN-115
 #[test]
 fn child_normalization_bounds_long_lines_and_control_candidates() {
     let long = vec![b'x'; MAX_NORMALIZED_CHILD_RECORD_BYTES + 19];
@@ -235,6 +239,7 @@ fn child_normalization_bounds_long_lines_and_control_candidates() {
     assert!(exposed.ends_with('z'));
 }
 
+// REQ-LOCALRUN-106, REQ-LOCALRUN-117
 #[test]
 fn feed_preserves_typed_transitions_and_normalized_child_record_order() {
     let (_temporary, workflow) = resolved_workflow(

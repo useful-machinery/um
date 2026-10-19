@@ -103,6 +103,7 @@ fn retry_acquires_after_pre_rename_publication_crash() {
     assert_eq!(terminal["outcome"], "succeeded");
 }
 
+// REQ-LOCALRUN-78, REQ-LOCALRUN-92, REQ-LOCALRUN-127, REQ-LOCALRUN-129, REQ-LOCALRUN-130
 #[test]
 fn retry_uses_the_immutable_bundle_current_environment_and_fresh_attempt() {
     let bundle = environment_retry_bundle();
@@ -201,6 +202,7 @@ fn retry_uses_the_immutable_bundle_current_environment_and_fresh_attempt() {
     assert!(!run_directory.join("attempts/000003").exists());
 }
 
+// REQ-LOCALRUN-78, REQ-LOCALRUN-101
 #[test]
 fn retry_reconstructs_named_inputs_after_original_sources_are_removed() {
     let bundle = RunBundle::new(
@@ -286,6 +288,7 @@ steps:
     );
 }
 
+// REQ-WFFINALIZE-22, REQ-WFEXEC-51
 #[test]
 fn finalizer_retry_reruns_both_graphs_with_a_fresh_attempt() {
     let bundle = RunBundle::new(include_str!(
@@ -357,6 +360,7 @@ fn finalizer_retry_reruns_both_graphs_with_a_fresh_attempt() {
     );
 }
 
+// REQ-LOCALRUN-4
 #[test]
 fn tui_setup_failure_prevents_retry_execution_and_releases_the_attempt() {
     let bundle = environment_retry_bundle();
@@ -387,6 +391,7 @@ fn tui_setup_failure_prevents_retry_execution_and_releases_the_attempt() {
     assert!(!stderr.contains("summary"));
 }
 
+// REQ-LOCALRUN-103
 #[test]
 fn plain_retry_streams_a_human_run_and_rejection() {
     let bundle = environment_retry_bundle();
@@ -417,6 +422,7 @@ fn plain_retry_streams_a_human_run_and_rejection() {
     assert!(!rejection.stderr.is_empty());
 }
 
+// REQ-LOCALRUN-129
 #[test]
 fn concurrent_retry_is_a_nonblocking_typed_rejection() {
     let bundle = signal_bundle();
@@ -464,6 +470,7 @@ fn concurrent_retry_is_a_nonblocking_typed_rejection() {
     assert_eq!(output.status.code(), Some(130));
 }
 
+// REQ-LOCALRUN-129
 #[test]
 fn ownership_unproven_rejection_preserves_the_predecessor() {
     let bundle = environment_retry_bundle();
@@ -502,6 +509,7 @@ fn ownership_unproven_rejection_preserves_the_predecessor() {
     assert!(!run_directory.join("attempts/000002").exists());
 }
 
+// REQ-LOCALRUN-140
 #[test]
 fn retry_terminal_json_output_failure_preserves_the_published_attempt() {
     let bundle = environment_retry_bundle();
@@ -534,6 +542,7 @@ fn retry_terminal_json_output_failure_preserves_the_published_attempt() {
     assert!(stderr.contains("attempts/000002/result"));
 }
 
+// REQ-AGENT-57
 #[test]
 fn retry_reapplies_the_retained_agent_profile_replacement_after_the_document_is_removed() {
     // The replaced profile is unused, so no harness installation is required and the
@@ -610,4 +619,68 @@ fn retry_reapplies_the_retained_agent_profile_replacement_after_the_document_is_
             .unwrap(),
     );
     assert!(retained.is_file());
+}
+
+// REQ-LOCALRUN-79
+#[test]
+fn retry_warns_about_a_reused_execution_root_without_inspecting_it() {
+    let bundle = environment_retry_bundle();
+    let run_directory = initial_failed_run(&bundle, "reused-root");
+    let reused_root = fs::canonicalize(bundle.execution_root()).unwrap();
+    let fresh_root = bundle.result("fresh-execution");
+    fs::create_dir(&fresh_root).unwrap();
+
+    let fresh = isolated_command(&retry_args(
+        &run_directory,
+        &fresh_root,
+        &["--plain", "--color", "never"],
+    ))
+    .env("RETRY_PHASE", "initial")
+    .output()
+    .unwrap();
+    assert_eq!(fresh.status.code(), Some(1));
+    assert!(
+        fresh.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&fresh.stderr)
+    );
+
+    // Leave changes an earlier attempt could have made; the retry must not inspect them.
+    fs::write(reused_root.join("uncommitted-change"), b"prior attempt\n").unwrap();
+    let reused = isolated_command(&retry_args(
+        &run_directory,
+        &reused_root,
+        &["--plain", "--color", "never"],
+    ))
+    .env("RETRY_PHASE", "retry")
+    .output()
+    .unwrap();
+    assert!(
+        reused.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&reused.stdout),
+        String::from_utf8_lossy(&reused.stderr)
+    );
+    let stderr = String::from_utf8(reused.stderr).unwrap();
+    let warning: Vec<&str> = stderr.lines().collect();
+    assert_eq!(warning.len(), 1, "{stderr:?}");
+    assert!(
+        warning[0].contains(reused_root.to_str().unwrap()),
+        "{stderr:?}"
+    );
+    assert!(
+        !warning[0].contains(fresh_root.to_str().unwrap()),
+        "{stderr:?}"
+    );
+    let state = read_state(&run_directory);
+    assert_eq!(state["currentAttemptNumber"], 3);
+    assert_eq!(state["attempts"][2]["state"], "succeeded");
+    assert_eq!(
+        fs::read(reused_root.join("uncommitted-change")).unwrap(),
+        b"prior attempt\n"
+    );
+    assert_eq!(
+        fs::read_to_string(reused_root.join("phases")).unwrap(),
+        "initial\nretry\n"
+    );
 }

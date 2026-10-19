@@ -88,6 +88,7 @@ fn prepared_organization_deletion(
     (server, directory, credential_path)
 }
 
+// REQ-ORG-73
 #[test]
 fn organization_deletion_request_returns_the_schedule_and_retains_the_account_session() {
     let (server, _directory, credential_path) =
@@ -144,6 +145,7 @@ fn organization_deletion_request_returns_the_schedule_and_retains_the_account_se
     assert_eq!(request.split_once("\r\n\r\n").unwrap().1, "");
 }
 
+// REQ-ORG-71, REQ-ORG-73
 #[test]
 fn organization_deletion_request_preserves_owner_and_private_target_failures() {
     for (status, code, problem_type, expected_outcome) in [
@@ -199,6 +201,7 @@ fn organization_deletion_request_preserves_owner_and_private_target_failures() {
     }
 }
 
+// REQ-ORG-74
 #[test]
 fn organization_deletion_cancellation_uses_browser_proof_without_replacing_the_session() {
     let (server, _directory, credential_path) = prepared_organization_deletion(
@@ -262,6 +265,7 @@ fn organization_deletion_cancellation_uses_browser_proof_without_replacing_the_s
     assert!(!combined.contains(ORGANIZATION_TOKEN));
 }
 
+// REQ-ORG-74
 #[test]
 fn organization_deletion_cancellation_does_not_weaken_owner_or_actor_proof() {
     let terminal = organization_lifecycle_problem(
@@ -307,6 +311,7 @@ fn organization_deletion_cancellation_does_not_weaken_owner_or_actor_proof() {
     assert_eq!(server.finish().len(), 3);
 }
 
+// REQ-ORG-73
 #[test]
 fn organization_deletion_rejects_invalid_targets_and_missing_confirmation_locally() {
     for args in [

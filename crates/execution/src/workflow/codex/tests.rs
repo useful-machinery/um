@@ -293,6 +293,7 @@ fn turn_completed_with_items_view(items: Vec<Value>, status: &str, items_view: &
     completed
 }
 
+// REQ-AGENT-15, REQ-AGENT-16
 #[test]
 fn setup_requests_preserve_native_resources_and_only_fixtures_select_a_provider() {
     let mut production = parser(AgentValueKind::None, 1024, None);
@@ -476,6 +477,8 @@ fn matching_thread_notification_and_response_may_arrive_in_either_order() {
     );
 }
 
+// REQ-AGENT-17
+// INV-HARNESS-4
 #[test]
 fn thread_start_requires_a_fresh_unassigned_root_and_accepts_nullable_metadata() {
     for notification_first in [false, true] {
@@ -758,6 +761,7 @@ fn stale_duplicate_cross_thread_cross_turn_and_cross_item_identities_fail_closed
     );
 }
 
+// REQ-AGENT-26
 #[test]
 fn completed_final_answer_is_authoritative_and_deltas_are_observations_only() {
     let mut parser = running_parser(AgentValueKind::Response, 5);
@@ -2004,6 +2008,8 @@ fn malformed_wrapped_duplicate_and_missing_result_candidates_never_commit() {
     );
 }
 
+// REQ-AGENT-31
+// INV-HARNESS-7
 #[test]
 fn one_rejection_queues_one_same_thread_correction_then_exhausts() {
     let mut parser = running_parser(AgentValueKind::Result, 1024);
@@ -2453,6 +2459,7 @@ fn completed_terminal_before_start_acknowledgement_fails_closed() {
     );
 }
 
+// INV-HARNESS-5
 #[test]
 fn nonretry_native_error_cannot_be_erased_by_completed_terminal() {
     let mut parser = running_parser(AgentValueKind::Response, 1024);
@@ -2531,6 +2538,7 @@ fn bounded_native_error_prose_does_not_replace_structured_identity() {
     );
 }
 
+// REQ-DIAG-24, REQ-AGENT-45
 #[test]
 fn structured_codex_failures_project_safe_runner_diagnostics() {
     use crate::workflow::evidence::{FailurePhase, failure_detail};
@@ -2672,6 +2680,8 @@ fn flex_unavailable_preserves_native_failure_and_retry_correlation() {
     );
 }
 
+// REQ-AGENT-25
+// INV-HARNESS-6
 #[test]
 fn declined_server_requests_enforce_only_correlation_identity() {
     for (method, item_kind, params, expected) in [
@@ -2809,6 +2819,7 @@ fn mcp_elicitation_with_explicit_null_turn_id_is_declined() {
     );
 }
 
+// REQ-AGENT-38
 #[test]
 fn unknown_notifications_and_requests_are_observed_without_settling() {
     let mut parser = running_parser(AgentValueKind::None, 1024);

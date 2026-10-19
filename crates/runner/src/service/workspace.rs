@@ -3081,6 +3081,7 @@ mod tests {
         assert!(previous_path.is_dir());
     }
 
+    // REQ-CONTINUE-49
     #[test]
     fn retained_claim_requires_exact_identity_and_excludes_a_second_owner() {
         let directory = private_work_root();
@@ -3196,6 +3197,7 @@ mod tests {
         assert!(previous_path.is_dir());
     }
 
+    // REQ-RUNNERENROLL-65
     #[test]
     fn contention_precedes_enumeration_and_independent_roots_remain_usable() {
         let shared = private_work_root();
@@ -3239,6 +3241,7 @@ mod tests {
         assert_eq!(first.boot_path(), shared.path().join(BOOT_A));
     }
 
+    // REQ-RUNNERENROLL-65
     #[test]
     fn replacing_the_locked_file_cannot_create_a_second_owner() {
         let root = private_work_root();
@@ -3252,6 +3255,7 @@ mod tests {
         assert!(first_boot.exists());
     }
 
+    // REQ-RUNNERENROLL-65
     #[test]
     fn shared_work_root_fails_before_lock_creation_or_child_inspection() {
         let root = private_work_root();
@@ -3444,6 +3448,8 @@ mod tests {
         }
     }
 
+    // REQ-WORKSPACE-29
+    // REQ-RUNNERENROLL-66
     #[test]
     fn startup_retains_old_boots_and_creates_a_fresh_root() {
         let root = private_work_root();
@@ -3602,6 +3608,7 @@ mod tests {
         assert_eq!(failed_remover.calls.load(Ordering::Relaxed), 6);
     }
 
+    // REQ-RUNNERENROLL-69
     #[test]
     fn retained_attempt_survives_restart_with_identity_and_original_bytes() {
         for legacy in [false, true] {
@@ -3845,6 +3852,7 @@ mod tests {
         assert!(external_assignment_path.join(ATTEMPT_RECORD_NAME).exists());
     }
 
+    // REQ-RUNNERENROLL-68
     #[test]
     fn process_stop_failure_retains_without_invoking_the_remover() {
         let root = private_work_root();

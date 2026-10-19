@@ -666,6 +666,17 @@ mod tests {
         snapshot.value.as_deref().unwrap()
     }
 
+    // REQ-COMPAT-14
+    #[test]
+    fn snapshot_digest_keeps_the_retained_domain_framing() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = open_directory_path(temporary.path()).unwrap();
+        let empty = hash_entries(&root, &[], &BTreeMap::new(), &mut NoopSnapshotObserver).unwrap();
+        let mut framing = Context::new(&SHA256);
+        framing.update(b"scherzo-workspace-snapshot\0git_worktree_sha256_v1\0");
+        assert_eq!(empty, lowercase_hex(framing.finish().as_ref()));
+    }
+
     #[test]
     fn snapshot_git_environment_removes_repository_routing_and_configuration() {
         let environment = sanitized_git_environment([
@@ -719,6 +730,7 @@ mod tests {
         );
     }
 
+    // REQ-CONTINUE-23
     #[test]
     fn continuation_comparison_requires_same_root_and_engine_settlement() {
         use super::super::publication::{WorkspaceModifiedUnknownV1, WorkspaceModifiedV1};
@@ -760,6 +772,7 @@ mod tests {
         );
     }
 
+    // REQ-CONTINUE-24
     #[test]
     fn cloud_preparation_records_unavailable_snapshot_instead_of_missing_evidence() {
         let prior = serde_json::to_value(capture_settlement_snapshot(
@@ -776,6 +789,7 @@ mod tests {
         assert_eq!(observed.modified, serde_json::json!("unknown"));
     }
 
+    // REQ-CONTINUE-24
     #[test]
     fn snapshot_distinguishes_content_modes_untracked_and_symlinks() {
         let repository = repository();
@@ -839,6 +853,7 @@ mod tests {
         }
     }
 
+    // REQ-CONTINUE-68
     #[test]
     fn snapshot_reports_mutation_around_read_without_using_time_for_synchronization() {
         let repository = repository();

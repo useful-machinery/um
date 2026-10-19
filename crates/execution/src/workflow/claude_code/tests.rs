@@ -166,6 +166,8 @@ fn protocol_rejection_value(outcome: &AgentOutcome) -> Value {
     .unwrap()
 }
 
+// REQ-AGENT-16, REQ-AGENT-60
+// INV-HARNESS-3
 #[test]
 fn normal_mode_arguments_and_input_frame_are_exact() {
     let arguments = normal_mode_arguments(
@@ -275,6 +277,7 @@ fn background_notification() -> Value {
         "task_id":"task-1","tool_use_id":"bash-call","status":"completed"})
 }
 
+// REQ-AGENT-35
 #[test]
 fn correlated_background_continuation_keeps_only_the_last_response() {
     let mut values = background_first_turn();
@@ -580,6 +583,7 @@ fn background_continuation_rejects_unrelated_and_unsettled_work() {
     );
 }
 
+// INV-HARNESS-4
 #[test]
 fn every_initialization_must_match_the_validated_installation_version() {
     let admitted_version = "2.1.235";
@@ -615,6 +619,7 @@ fn every_initialization_must_match_the_validated_installation_version() {
     );
 }
 
+// REQ-AGENT-26
 #[test]
 fn recorded_response_uses_only_final_main_thread_deltas_once() {
     let (observations, outcome) = replay(RESPONSE_FIXTURE, AgentValueKind::Response, 1024);
@@ -1211,6 +1216,7 @@ fn truncation_and_frame_overflow_fail_in_the_current_protocol_phase() {
     );
 }
 
+// REQ-AGENT-27
 #[test]
 fn response_distinguishes_missing_text_from_a_present_empty_block() {
     let (_, missing) = replay(
@@ -1231,6 +1237,7 @@ fn response_distinguishes_missing_text_from_a_present_empty_block() {
     assert_eq!(empty.as_str(), "");
 }
 
+// REQ-AGENT-28
 #[test]
 fn response_utf8_limit_succeeds_exactly_and_fails_before_first_excess_byte() {
     let exact = completed_text_transcript(&["A", "é", "🔥"], true);
@@ -1246,6 +1253,7 @@ fn response_utf8_limit_succeeds_exactly_and_fails_before_first_excess_byte() {
     assert_failed(over_outcome, AgentFailureCause::CapturedValueTooLarge);
 }
 
+// REQ-AGENT-38
 #[test]
 fn reasoning_tools_results_metadata_and_unknown_events_are_normalized() {
     let mut values = vec![init(QUALIFICATION_VERSION, SESSION_ID)];
@@ -1537,6 +1545,7 @@ fn structured_output_exchange_after(siblings: &[Value]) -> Vec<Value> {
     values
 }
 
+// REQ-AGENT-30
 #[test]
 fn result_candidate_stays_standalone_beside_thinking_but_not_another_tool_call() {
     let values = structured_output_exchange_after(&[
@@ -1605,6 +1614,7 @@ fn tool_result_blocks_other_than_text_are_observed_without_content() {
     assert_failed(outcome, AgentFailureCause::HarnessProtocolFailed);
 }
 
+// REQ-AGENT-45
 #[test]
 fn structured_claude_terminal_reason_is_classified_without_result_text() {
     for (reason, expected, status) in [
@@ -1635,6 +1645,7 @@ fn structured_claude_terminal_reason_is_classified_without_result_text() {
     }
 }
 
+// REQ-AGENT-40
 #[test]
 fn unsuccessful_native_result_and_exit_use_existing_typed_failures() {
     let native_error = framed(&[

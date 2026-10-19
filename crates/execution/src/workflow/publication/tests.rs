@@ -499,6 +499,7 @@ fn read_result(destination: &Path) -> (Vec<u8>, Value) {
     (bytes, value)
 }
 
+// REQ-EXPORTS-10, REQ-EXPORTS-11, REQ-EXPORTS-12, REQ-EXPORTS-13, REQ-EXPORTS-14
 #[test]
 fn sealed_presentation_resolves_fields_and_aliases_independently() {
     use super::super::validated::{ValidatedExportPresentation, ValidatedPresentationField};
@@ -719,6 +720,7 @@ fn prepares_metadata_only_and_carrier_cloud_results() {
     assert_eq!(document["exports"], serde_json::json!({}));
 }
 
+// REQ-EXPORTS-13
 #[test]
 fn cloud_aliases_share_carriers_with_independent_presentation() {
     use super::super::validated::{ValidatedExportPresentation, ValidatedPresentationField};
@@ -1363,6 +1365,7 @@ fn publishes_streams_within_live_tui_run_budget() {
     assert_eq!(failure.invariant(), Some(RunResultInvariant::StepMetadata));
 }
 
+// INV-ENGINE-12
 #[test]
 fn publishes_each_terminal_outcome_as_the_same_self_contained_v1_value() {
     let fixture = PublicationFixture::new();
@@ -2251,6 +2254,7 @@ fn parser_response_limit_failure_remains_valid_result_metadata() {
     assert!(!detail.contains_key("protocolRejection"));
 }
 
+// REQ-EVIDENCE-12
 #[test]
 fn structured_agent_failure_keeps_protocol_rejection_out_of_node_detail() {
     let mut parser =
@@ -2292,6 +2296,7 @@ fn launch_failure_projects_only_contract_supported_recovery_cause() {
     );
 }
 
+// REQ-LOCALRUN-134
 #[test]
 fn incomplete_command_output_selects_local_failure_status_without_changing_outcome() {
     let fixture = PublicationFixture::new();

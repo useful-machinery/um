@@ -1633,6 +1633,7 @@ mod tests {
     use crate::telemetry::{TestCapture, test_recorder};
     use um_execution::resolve;
 
+    // REQ-RUNNERENROLL-65, REQ-RUNNERENROLL-71
     #[test]
     fn recovery_required_failures_are_closed_to_work_root_ownership() {
         for error in [
@@ -1645,6 +1646,7 @@ mod tests {
         assert!(!ServiceError::BuildRuntime.requires_operator_recovery());
     }
 
+    // REQ-RUNNERENROLL-72
     #[test]
     fn shutdown_timeout_accommodates_maximum_cancellation_grace() {
         assert_eq!(
@@ -1692,6 +1694,7 @@ mod tests {
         fn before_child_enumeration(&self) {}
     }
 
+    // REQ-RUNNERENROLL-66, REQ-RUNNERENROLL-69
     #[test]
     fn startup_retains_an_interrupted_cleanup_and_allows_a_fresh_assignment() {
         const STALE_BOOT: &str = "rbt_01k0z6r1w8f4jy2m7q9v3x5abc";
@@ -2097,6 +2100,7 @@ mod tests {
         (current, pending)
     }
 
+    // REQ-RUNNERENROLL-49
     #[tokio::test]
     async fn reload_promotes_a_valid_pending_credential_without_changing_boot() {
         let (listener, endpoint) = fixture_listener().await;
@@ -2175,6 +2179,7 @@ mod tests {
         }
     }
 
+    // REQ-RUNNERENROLL-49
     #[tokio::test]
     async fn live_reload_retains_the_boot_and_accepted_assignment_manager() {
         let (listener, endpoint) = fixture_listener().await;
@@ -2302,6 +2307,7 @@ mod tests {
         with_watchdog(server).await.unwrap().unwrap();
     }
 
+    // REQ-RUNNERENROLL-35, REQ-RUNNERENROLL-36
     #[tokio::test]
     async fn terminal_authentication_remains_locally_inspectable() {
         let (listener, endpoint) = fixture_listener().await;
@@ -2511,6 +2517,7 @@ mod tests {
         with_watchdog(server).await.unwrap().unwrap();
     }
 
+    // REQ-RUNNERENROLL-40
     #[tokio::test]
     async fn startup_establishes_current_before_promoting_pending_in_the_same_boot() {
         let (listener, endpoint) = fixture_listener().await;
@@ -2662,6 +2669,7 @@ mod tests {
         fs::remove_file(hard_link).unwrap();
     }
 
+    // REQ-RUNNERENROLL-50
     #[tokio::test]
     async fn reload_authentication_failure_preserves_pending_state() {
         let (listener, endpoint) = fixture_listener().await;
@@ -2686,6 +2694,7 @@ mod tests {
         server.await.unwrap();
     }
 
+    // REQ-RUNNERENROLL-50
     #[tokio::test]
     async fn reload_network_failure_preserves_pending_state() {
         let fixture = RotationFixture::new("ws://127.0.0.1:1/v1/runner/connect");
@@ -3079,6 +3088,8 @@ mod tests {
             .expect("captured gateway connection should exist")
     }
 
+    // REQ-RUNNERENROLL-38
+    // REQ-TELEMETRY-11, REQ-TELEMETRY-13, REQ-TELEMETRY-32
     #[tokio::test]
     async fn exits_when_the_gateway_closes_with_policy_violation() {
         let (listener, endpoint) = fixture_listener().await;
@@ -3292,6 +3303,8 @@ mod tests {
             .expect("fixture server failed");
     }
 
+    // REQ-RUNNERENROLL-37
+    // REQ-TELEMETRY-11
     #[tokio::test]
     async fn records_retryable_connection_failure_once_with_backoff() {
         for (error_type, outcome) in [
@@ -3419,6 +3432,7 @@ mod tests {
         drop(sleep_requests);
     }
 
+    // REQ-RUNNERENROLL-39
     #[tokio::test]
     async fn shutdown_reports_and_waits_for_an_accepted_assignment_interruption() {
         let (listener, endpoint) = fixture_listener().await;
@@ -3458,6 +3472,7 @@ mod tests {
             .expect("gateway fixture failed");
     }
 
+    // REQ-RUNNERENROLL-39
     #[tokio::test]
     async fn second_shutdown_signal_forces_exit_without_another_observation() {
         let (listener, endpoint) = fixture_listener().await;

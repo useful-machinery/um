@@ -1090,6 +1090,8 @@ fn launch_plan_stages_exact_prompt_and_lf_delimited_input() {
     assert_eq!(session_argument[1], OsStr::new(plan.session_id()));
 }
 
+// REQ-AGENT-17
+// INV-HARNESS-9
 #[test]
 fn an_existing_native_session_entry_is_never_selected_or_replaced() {
     let fixture = ProcessFixture::new(AgentValueMode::None, 1024);
@@ -1121,6 +1123,7 @@ fn native_project_slug_matches_the_pinned_claude_code_storage_format() {
     );
 }
 
+// REQ-AGENT-18, REQ-AGENT-19
 #[test]
 fn attachment_transport_is_ordered_lossless_and_uses_only_sealed_identities() {
     let source = tempfile::NamedTempFile::new().unwrap();
@@ -1291,6 +1294,7 @@ fn unreadable_native_attachment_preserves_the_attachment_read_failure() {
     assert!(!error.is_empty());
 }
 
+// REQ-AGENT-19
 #[test]
 fn native_attachment_above_the_inline_cap_uses_a_bounded_path_reference() {
     let oversized = vec![0x5a; MAXIMUM_INLINE_ATTACHMENT_FRAME_BYTES + 1];
@@ -1392,6 +1396,7 @@ async fn stalled_initial_input_write_reaches_a_typed_deadline() {
     .await;
 }
 
+// REQ-AGENT-32
 #[tokio::test]
 async fn permissive_native_envelope_preserves_every_authoritatively_valid_json_root() {
     let cases = [
@@ -1426,6 +1431,7 @@ async fn permissive_native_envelope_preserves_every_authoritatively_valid_json_r
     }
 }
 
+// REQ-AGENT-29
 #[tokio::test]
 async fn rejected_candidate_is_corrected_in_the_same_process_and_conversation() {
     let schema = retained_schema(json!({
@@ -1472,6 +1478,7 @@ async fn rejected_candidate_is_corrected_in_the_same_process_and_conversation() 
     assert_eq!(rejections, 1);
 }
 
+// REQ-AGENT-30
 #[tokio::test]
 async fn oversized_candidate_receives_bounded_feedback_before_a_valid_correction() {
     let fixture = ResultProcessFixture::new(
@@ -1493,6 +1500,7 @@ async fn oversized_candidate_receives_bounded_feedback_before_a_valid_correction
     assert!(feedback.len() <= 512);
 }
 
+// REQ-AGENT-31
 #[tokio::test]
 async fn ambiguous_duplicate_and_missing_candidates_never_become_results() {
     let ambiguous = [
@@ -1543,6 +1551,7 @@ async fn ambiguous_duplicate_and_missing_candidates_never_become_results() {
     );
 }
 
+// REQ-AGENT-34
 #[tokio::test]
 async fn validation_timeout_stops_its_worker_and_discards_the_candidate() {
     let stopped = Arc::new(AtomicBool::new(false));
@@ -1613,6 +1622,8 @@ async fn accepted_result_closes_input_and_remains_provisional_until_process_exit
     .await;
 }
 
+// REQ-AGENT-33
+// INV-HARNESS-7
 #[tokio::test]
 async fn post_acceptance_work_and_failed_settlement_discard_the_provisional_result() {
     with_watchdog(async {
@@ -1729,6 +1740,8 @@ async fn cancellation_after_a_provisional_result_forces_containment_quiescent() 
     .await;
 }
 
+// REQ-AGENT-22, REQ-AGENT-23, REQ-AGENT-24
+// INV-HARNESS-3
 #[tokio::test]
 async fn normal_driver_preserves_runner_configuration_and_returns_only_final_response() {
     let fixture = ProcessFixture::new(
@@ -1918,6 +1931,8 @@ async fn a_scripted_harness_that_writes_nowhere_emits_the_named_capture_diagnost
     assert!(diagnostic > quiescent);
 }
 
+// REQ-AGENT-39, REQ-AGENT-40
+// INV-HARNESS-5
 #[tokio::test]
 async fn production_failure_matrix_uses_only_existing_typed_outcomes() {
     enum Transcript {
@@ -2030,6 +2045,7 @@ async fn production_failure_matrix_uses_only_existing_typed_outcomes() {
     );
 }
 
+// REQ-AGENT-42
 #[tokio::test]
 async fn parser_rejection_is_surfaced_and_retained_beside_claude_invocation_metadata() {
     let fixture = ProcessFixture::new(AgentValueMode::None, 1024);
@@ -2183,6 +2199,8 @@ async fn cancellation_during_native_work_drains_and_quiesces_before_reporting() 
     .await;
 }
 
+// REQ-AGENT-46
+// INV-HARNESS-8
 #[tokio::test]
 async fn forced_cancellation_removes_a_stubborn_in_group_descendant() {
     with_watchdog(async {

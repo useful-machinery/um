@@ -335,6 +335,7 @@ fn host_restart_proves_old_work_absent_without_process_inspection() {
     );
 }
 
+// INV-ENGINE-10
 #[test]
 fn attempt_directory_names_are_exact_at_the_six_digit_boundary() {
     assert_eq!(attempt_directory_name(0), None);
@@ -450,6 +451,8 @@ fn retained_manifest_rejects_duplicate_named_input_keys() {
     assert!(!run_path.join("attempts/000002").exists());
 }
 
+// REQ-LOCALRUN-98
+// INV-ENGINE-10
 #[test]
 fn initial_publication_retains_the_staging_lock_and_immutable_execution_bytes() {
     let fixture = AdmittedFixture::new();
@@ -550,6 +553,7 @@ fn singular_file_input_is_retained_and_reused_for_retry() {
     assert_eq!(file.bytes(), [0_u8, 0xff, 7]);
 }
 
+// REQ-LOCALRUN-97
 #[test]
 fn run_target_validation_rejects_overlap_in_both_path_directions() {
     assert!(paths_overlap(
@@ -794,6 +798,7 @@ fn invocation_evidence_republication_preserves_first_authoritative_bytes() {
     );
 }
 
+// INV-ENGINE-10
 #[test]
 fn atomic_state_crash_boundaries_expose_only_complete_snapshots() {
     let fixture = AdmittedFixture::new();
@@ -876,6 +881,7 @@ fn retry_reports_state_path_and_failed_attempt_invariant() {
     assert!(error.to_string().contains("attempt execution root invalid"));
 }
 
+// REQ-WFRECOVERY-41
 #[test]
 fn status_preserves_unsupported_recovery_schema_through_state_file_context() {
     let fixture = AdmittedFixture::new();
@@ -1803,6 +1809,7 @@ fn inherited_seed_loads_required_values_and_preserves_full_durable_references() 
     assert_eq!(staged.st_ino, original.st_ino);
 }
 
+// INV-ENGINE-11
 #[test]
 fn continuation_validation_binds_inheritance_to_the_immediate_prior_step() {
     let fixture = AdmittedFixture::from_source(
@@ -2191,6 +2198,7 @@ fn retry_rejects_incomplete_succeeded_outputs_before_orphan_cleanup() {
     assert!(!run_path.join("attempts/000002").exists());
 }
 
+// REQ-WFFINALIZE-3
 #[test]
 fn retry_commits_only_fresh_attempt_state_and_retained_inputs() {
     let fixture = AdmittedFixture::new();
@@ -4263,6 +4271,7 @@ fn archived_attempt_uses_only_the_authoritative_recorded_result_location() {
     );
 }
 
+// REQ-LOCALRUN-166
 #[test]
 fn archived_attempt_rejects_a_broken_retained_workflow_closure() {
     let fixture = AdmittedFixture::new();
@@ -4842,6 +4851,7 @@ fn archived_attempt_enforces_stream_prefix_retention_invariants() {
     );
 }
 
+// REQ-EVIDENCE-7, REQ-EVIDENCE-13, REQ-OUTPUTS-5
 #[test]
 fn archived_attempt_validates_failure_identities_against_the_retained_step() {
     let fixture = AdmittedFixture::from_source_with_inputs(

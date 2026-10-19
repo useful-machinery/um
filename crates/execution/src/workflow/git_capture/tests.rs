@@ -142,6 +142,7 @@ fn cloud_continuation_preserves_dirty_work_but_capture_still_requires_a_clean_co
     }
 }
 
+// REQ-OUTPUTS-24
 #[test]
 fn cloud_continuation_uses_original_source_baseline_after_workflow_commits() {
     let fixture = GitFixture::new();
@@ -176,6 +177,7 @@ fn cloud_continuation_uses_original_source_baseline_after_workflow_commits() {
     assert_eq!(branch.metadata().head_oid(), head);
 }
 
+// REQ-OUTPUTS-24
 #[test]
 fn cloud_continuation_requires_available_ancestral_source_baseline() {
     let fixture = GitFixture::new();
@@ -389,6 +391,7 @@ fn capture_failure(result: Result<CaptureCandidateSet, GitCaptureFailure>) -> Gi
     }
 }
 
+// REQ-OUTPUTS-24, REQ-OUTPUTS-25, REQ-OUTPUTS-27, REQ-OUTPUTS-30
 #[test]
 fn changed_capture_has_verified_bundle_profile_metadata_size_and_digest() {
     let fixture = GitFixture::new();
@@ -488,6 +491,7 @@ fn capture_accepts_tree_copied_from_baseline() {
     );
 }
 
+// REQ-OUTPUTS-26, REQ-OUTPUTS-29
 #[test]
 fn zero_delta_carries_metadata_without_a_carrier_or_budget_charge() {
     let fixture = GitFixture::new();
@@ -514,6 +518,7 @@ fn zero_delta_carries_metadata_without_a_carrier_or_budget_charge() {
     drop(outputs);
 }
 
+// REQ-OUTPUTS-22
 #[test]
 fn admission_requires_the_execution_root_to_be_the_sha1_worktree_root() {
     let temporary = tempfile::tempdir().unwrap();
@@ -562,6 +567,7 @@ fn admission_requires_the_execution_root_to_be_the_sha1_worktree_root() {
     );
 }
 
+// REQ-OUTPUTS-22
 #[test]
 fn admission_rejects_a_clean_tracked_submodule() {
     let temporary = tempfile::tempdir().unwrap();
@@ -609,6 +615,7 @@ fn git_trace_environment_cannot_author_the_workspace() {
     assert_eq!(repository_bytes(&repository), before);
 }
 
+// REQ-OUTPUTS-25
 #[test]
 fn non_descendant_head_is_rejected_without_a_carrier_reservation() {
     let fixture = GitFixture::new();
@@ -631,6 +638,7 @@ fn non_descendant_head_is_rejected_without_a_carrier_reservation() {
     assert_eq!(fixture.artifacts.staged_artifact_count(), 0);
 }
 
+// REQ-OUTPUTS-25
 #[test]
 fn merge_forked_before_baseline_excludes_prerequisite_history_and_imports_independently() {
     const CARRIER_LIMIT: u64 = 32 * 1024;
@@ -878,6 +886,7 @@ fn bitmap_capture_matches_preflight_when_head_restores_a_historical_blob() {
     );
 }
 
+// REQ-OUTPUTS-26, REQ-OUTPUTS-27
 #[test]
 fn dirty_index_worktree_untracked_and_submodule_states_fail_without_adapter_authorship() {
     for dirty in ["staged", "tracked", "untracked"] {
@@ -1249,6 +1258,7 @@ fn early_git_exit_with_piped_input_keeps_command_and_exit_diagnostic() {
     );
 }
 
+// REQ-OUTPUTS-30
 #[test]
 fn unavailable_promised_objects_fail_capture_instead_of_admission() {
     let fixture = promisor_fixture();
@@ -1489,6 +1499,7 @@ impl CaptureBoundaryObserver for MutationObserver {
     }
 }
 
+// REQ-OUTPUTS-28
 #[test]
 fn post_staging_head_and_cleanliness_changes_rollback_provisional_state() {
     for mutation in [PostStagingMutation::Head, PostStagingMutation::Cleanliness] {
@@ -1658,6 +1669,7 @@ fn reaping_a_completed_leader_first_terminates_its_pipe_holding_group() {
     reader.join().unwrap();
 }
 
+// REQ-OUTPUTS-32
 #[test]
 fn capture_timeout_names_git_command_and_limit() {
     let temporary = tempfile::tempdir().unwrap();

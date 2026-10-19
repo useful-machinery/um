@@ -328,6 +328,7 @@ fn presentation_capacity_preserves_undecorated_bases_and_admits_maximum_aliases(
     }));
 }
 
+// REQ-WFRECOVERY-50, REQ-WFRECOVERY-51
 #[test]
 fn shared_recovery_capacity_vectors_match_the_resolver_owned_calculation() {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))

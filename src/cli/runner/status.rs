@@ -133,6 +133,7 @@ mod tests {
     use super::*;
     use um_runner::{ConnectionState, ProcessState};
 
+    // REQ-RUNNERENROLL-42, REQ-RUNNERENROLL-80
     #[test]
     fn renders_idle_and_nonzero_assignment_counts() {
         assert_eq!(
@@ -176,6 +177,7 @@ mod tests {
         );
     }
 
+    // REQ-RUNNERENROLL-42
     #[test]
     fn renders_the_closed_live_snapshot_without_absent_optional_fields() {
         let status = StatusSnapshot {
