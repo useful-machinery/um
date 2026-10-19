@@ -267,6 +267,10 @@ pub(in crate::service) enum AssignmentObservation {
         attempt_id: String,
         report: ExecutionReport,
     },
+    WorkspaceRegistration {
+        assignment_id: String,
+        payload: serde_json::Value,
+    },
     WorkspaceRetention {
         assignment_id: String,
         attempt_id: String,
@@ -291,7 +295,8 @@ impl AssignmentObservation {
             Self::CancellationApplied(application) => &application.assignment_id,
             Self::LeaseRenewalRequested { assignment_id, .. }
             | Self::Execution { assignment_id, .. }
-            | Self::WorkspaceRetention { assignment_id, .. } => assignment_id,
+            | Self::WorkspaceRetention { assignment_id, .. }
+            | Self::WorkspaceRegistration { assignment_id, .. } => assignment_id,
             Self::Artifact { request, .. } => request.assignment_id(),
         }
     }
@@ -368,6 +373,10 @@ impl AssignmentObservation {
                 attempt_id,
                 report,
             } => report.runner_frame(envelope, assignment_id.clone(), attempt_id.clone()),
+            Self::WorkspaceRegistration { payload, .. } => RunnerFrame::WorkspaceInventory {
+                envelope,
+                payload: payload.clone(),
+            },
             Self::WorkspaceRetention {
                 assignment_id,
                 attempt_id,

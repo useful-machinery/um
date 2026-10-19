@@ -637,20 +637,28 @@ impl AdmissionRuntime {
                 owner.boot_id().unwrap_or_default(),
             );
             let recorder = self.recorder.clone();
+            let outbox = self.outbox.clone();
             // Catalog/manifest fsync is optional and may finish only before a
             // future registration. Never add an ordinary execution start gate.
             if std::thread::Builder::new()
                 .name("runner-recovery-registration".into())
                 .spawn(move || {
-                    if let Some(store) = owner.recovery()
-                        && let Err(error) = store.register(origin)
-                        && let Some(recorder) = recorder.as_deref()
-                    {
-                        super::record_optional_recovery_failure(
-                            recorder,
-                            error.error_type(),
-                            error.diagnostic(),
-                        );
+                    let registration = owner.recovery().ok_or(("local_recovery_record_unavailable", serde_json::json!({"errorType": "local_recovery_record_unavailable", "stage": "registration"}).to_string())).and_then(|store| {
+                        store.register(origin.clone())
+                            .and_then(|workspace_id| store.initial_inventory(&workspace_id, &origin))
+                            .map_err(|error| (error.error_type(), error.diagnostic()))
+                    });
+                    match registration {
+                        Ok(payload) => {
+                            if outbox.enqueue(AssignmentObservation::WorkspaceRegistration {
+                                assignment_id: origin.assignment_id.clone(), payload,
+                            }).is_err() && let Some(recorder) = recorder.as_deref() {
+                                super::record_optional_recovery_failure(recorder, "local_recovery_outbox_unavailable", serde_json::json!({"errorType": "local_recovery_outbox_unavailable", "stage": "registration_outbox"}).to_string());
+                            }
+                        }
+                        Err((kind, diagnostic)) => if let Some(recorder) = recorder.as_deref() {
+                            super::record_optional_recovery_failure(recorder, kind, diagnostic);
+                        },
                     }
                 })
                 .is_err()
@@ -1117,6 +1125,23 @@ pub(super) mod test_support {
             })
             .expect("enqueue fixture lease clock failure report");
         manager.begin_lease_clock_failure_reporting(final_observation_id);
+    }
+
+    pub(in crate::service) fn enqueue_fixture_registration(manager: &AssignmentManager) -> u64 {
+        let mut frame: serde_json::Value = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/runner-protocol/v1/valid/runner-workspace-inventory-present.json"
+        )))
+        .expect("fixture inventory");
+        frame["payload"]["originRunnerBootId"] =
+            serde_json::json!("rbt_01k0z6r1w8f4jy2m7q9v3x5abe");
+        manager
+            .outbox
+            .enqueue(AssignmentObservation::WorkspaceRegistration {
+                assignment_id: "asn_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned(),
+                payload: frame["payload"].clone(),
+            })
+            .expect("enqueue fixture registration")
     }
 
     pub(in crate::service) fn enqueue_transitions(manager: &AssignmentManager, count: u64) {

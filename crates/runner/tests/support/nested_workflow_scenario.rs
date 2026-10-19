@@ -1106,6 +1106,7 @@ async fn wait_for_terminal(
                     | AssignmentObservation::CancellationApplied(_)
                     | AssignmentObservation::LeaseRenewalRequested { .. }
                     | AssignmentObservation::WorkspaceRetention { .. }
+                    | AssignmentObservation::WorkspaceRegistration { .. }
                     | AssignmentObservation::Artifact { .. } => None,
                 })
                 .collect());

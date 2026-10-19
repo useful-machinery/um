@@ -59,9 +59,29 @@ fn retained_identity_and_local_generation_survive_fresh_boot_without_adopting_le
     let _guards =
         AssignmentProcessGuards::durable_recovery(&original.private, binding, fixture_host())
             .unwrap();
-    let workspace = store
-        .register(Origin::from_assignment(&original, BOOT_A))
+    let registration_origin = Origin::from_assignment(&original, BOOT_A);
+    let workspace = store.register(registration_origin.clone()).unwrap();
+    let inventory = store
+        .initial_inventory(&workspace, &registration_origin)
         .unwrap();
+    assert_eq!(inventory["priorAssignmentId"], ASSIGNMENT);
+    assert_eq!(inventory["priorAttemptId"], ATTEMPT);
+    assert!(inventory["observedClaim"].is_null());
+    assert_eq!(inventory["lastClaimGeneration"], 0);
+    let frame = um_runner_protocol::RunnerFrame::WorkspaceInventory {
+        envelope: um_runner_protocol::RunnerEnvelope {
+            message_id: "rmsg_01k0z6r1w8f4jy2m7q9v3x5abc".into(),
+            runner_id: RUNNER.into(),
+            boot_id: BOOT_A.into(),
+            sequence: 2,
+            sent_at: "2026-10-18T00:00:00Z".into(),
+        },
+        payload: inventory,
+    };
+    let encoded = um_runner_protocol::encode_runner_frame(&frame).unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+    assert_eq!(value["type"], "workspace_inventory");
+    assert_eq!(value["payload"]["originAssignmentId"], ASSIGNMENT);
     let origin = store.manifest(&workspace).unwrap();
     let private = store.private_by_attempt(&origin).unwrap();
     assert_eq!(private[ATTEMPT], original.private.path());

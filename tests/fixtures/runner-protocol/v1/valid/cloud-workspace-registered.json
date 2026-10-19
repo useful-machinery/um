@@ -1,0 +1,20 @@
+{
+  "protocolVersion": 1,
+  "direction": "cloud_to_runner",
+  "messageId": "cmsg_01k0z6r1w8f4jy2m7q9v3x5abc",
+  "sentAt": "2026-08-02T12:01:44Z",
+  "type": "workspace_registered",
+  "payloadVersion": 1,
+  "payload": {
+    "schemaVersion": 1,
+    "acknowledgedMessageId": "rmsg_01k0z6r1w8f4jy2m7q9v3x5abc",
+    "acknowledgedSequence": 2,
+    "workRootId": "rwr_01k0z6r1w8f4jy2m7q9v3x5abc",
+    "workspaceId": "rws_01k0z6r1w8f4jy2m7q9v3x5abc",
+    "runId": "run_01k0z6r1w8f4jy2m7q9v3x5abc",
+    "originRunnerBootId": "rbt_01k0z6r1w8f4jy2m7q9v3x5abc",
+    "originAssignmentId": "asn_01k0z6r1w8f4jy2m7q9v3x5abc",
+    "originAttemptId": "atm_01k0z6r1w8f4jy2m7q9v3x5abc",
+    "executionRoot": "/retained/work"
+  }
+}

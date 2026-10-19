@@ -789,6 +789,11 @@ impl AssignmentManager {
         self.outbox.pending(in_flight, limit)
     }
 
+    pub(in crate::service) fn discard_unsent_registration(&mut self, id: u64) -> bool {
+        self.drain_events();
+        self.outbox.discard_unsent_registration(id)
+    }
+
     pub(in crate::service) fn acknowledge_observation(&mut self, id: u64) {
         self.drain_events();
         let Some(observation) = self.outbox.acknowledge(id) else {

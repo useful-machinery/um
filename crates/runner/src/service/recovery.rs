@@ -399,9 +399,10 @@ fn public_id(prefix: &str) -> String {
 /// The authority's directory lock remains held throughout this store's lifetime.
 /// A root without a V1 record may start new V1 work; historical directories are
 /// never enumerated into the catalog or assigned identities.
+#[derive(Clone)]
 pub(super) struct Origin {
     boot_id: String,
-    assignment_id: String,
+    pub(super) assignment_id: String,
     run_id: String,
     attempt_id: String,
     execution_root: PathBuf,
@@ -615,6 +616,44 @@ impl RecoveryStore {
             return Err(error);
         }
         Ok(workspace_id)
+    }
+
+    pub(super) fn initial_inventory(
+        &self,
+        workspace_id: &str,
+        origin: &Origin,
+    ) -> Result<serde_json::Value, RecoveryError> {
+        let root = self.root()?;
+        let entry = root
+            .catalog
+            .iter()
+            .find(|entry| {
+                entry.workspace_id == workspace_id
+                    && entry.origin_boot_id == origin.boot_id
+                    && entry.origin_assignment_id == origin.assignment_id
+                    && entry.origin_attempt_id == origin.attempt_id
+                    && entry.origin_run_id == origin.run_id
+                    && entry.execution_root == origin.execution_root
+            })
+            .ok_or_else(|| invalid("origin binding"))?;
+        let private = self.private(entry)?;
+        let manifest: Manifest = read_record(&private, MANIFEST)?;
+        manifest.validate(&root, entry)?;
+        if manifest.claim.is_some() || manifest.last_claim_generation != 0 {
+            return Err(invalid("origin claim"));
+        }
+        Ok(serde_json::json!({
+            "schemaVersion": 1, "workRootId": root.work_root_id,
+            "workspaceId": workspace_id, "runId": origin.run_id,
+            "priorAttemptId": origin.attempt_id,
+            "priorAssignmentId": origin.assignment_id,
+            "originRunnerBootId": origin.boot_id,
+            "originAssignmentId": origin.assignment_id,
+            "originAttemptId": origin.attempt_id,
+            "executionRoot": origin.execution_root,
+            "observedClaim": null, "lastClaimGeneration": 0,
+            "presence": "present", "recoveryReason": null,
+        }))
     }
 
     pub(super) fn may_clean_tree(&self, path: &Path) -> bool {

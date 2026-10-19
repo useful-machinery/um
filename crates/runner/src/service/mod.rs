@@ -2222,11 +2222,34 @@ mod tests {
                 .send(Message::Ping(vec![1, 2, 3].into()))
                 .await
                 .unwrap();
-            let Some(Ok(Message::Pong(payload))) = with_watchdog(current.next()).await.unwrap()
-            else {
-                panic!("current connection did not cross the preparation acknowledgement barrier");
-            };
-            assert_eq!(payload.as_ref(), &[1, 2, 3]);
+            // Registration is optional and can be emitted after acceptance. The
+            // barrier is the matching pong, not the next frame on the wire.
+            loop {
+                match with_watchdog(current.next()).await.unwrap() {
+                    Some(Ok(Message::Pong(payload))) => {
+                        assert_eq!(payload.as_ref(), &[1, 2, 3]);
+                        break;
+                    }
+                    Some(Ok(Message::Text(frame))) => {
+                        let frame: serde_json::Value =
+                            serde_json::from_str(&frame).expect("decode current observation");
+                        if frame["type"] == "workspace_inventory" {
+                            reject_fixture_registration(&mut current, &frame).await;
+                        } else {
+                            assert_eq!(frame["type"], "assignment_preparation_progress");
+                            acknowledge_runner_frame(
+                                &mut current,
+                                &frame,
+                                "acknowledge preparation progress",
+                            )
+                            .await;
+                        }
+                    }
+                    Some(Ok(_)) => {}
+                    Some(Err(error)) => panic!("current connection failed: {error}"),
+                    None => panic!("current connection closed before preparation barrier"),
+                }
+            }
             accepted_sent.send(()).unwrap();
 
             let mut pending = accept_fixture_socket(&listener).await;
@@ -2251,6 +2274,9 @@ mod tests {
                 // acknowledgement was still buffered on the retired transport.
                 // Acknowledge every expected observation in FIFO order instead
                 // of assuming the accepted observation is replayed first.
+                if frame["type"] == "workspace_inventory" {
+                    reject_fixture_registration(&mut pending, &frame).await;
+                }
                 if matches!(
                     frame["type"].as_str(),
                     Some(
@@ -2857,6 +2883,28 @@ mod tests {
             .unwrap_or_else(|error| panic!("{description}: {error}"));
     }
 
+    async fn reject_fixture_registration(socket: &mut FixtureSocket, frame: &serde_json::Value) {
+        socket
+            .send(Message::Text(
+                serde_json::json!({
+                    "protocolVersion": 1, "direction": "cloud_to_runner",
+                    "messageId": "cmsg_01k0z6r1w8f4jy2m7q9v3x5abh",
+                    "sentAt": "2026-10-18T00:00:00Z",
+                    "type": "workspace_registration_rejected", "payloadVersion": 1,
+                    "payload": {"schemaVersion": 1,
+                        "acknowledgedMessageId": frame["messageId"],
+                        "acknowledgedSequence": frame["sequence"],
+                        "workRootId": frame["payload"]["workRootId"],
+                        "workspaceId": frame["payload"]["workspaceId"],
+                        "reason": "origin_not_eligible"}
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .expect("reject optional registration");
+    }
+
     async fn next_semantic_assignment_frame(
         socket: &mut FixtureSocket,
         expected_type: &str,
@@ -2868,6 +2916,12 @@ mod tests {
             };
             let frame: serde_json::Value =
                 serde_json::from_str(&frame).expect("decode assignment observation");
+            if frame["type"] == "workspace_inventory" {
+                // Best-effort registration may race any ordinary assignment
+                // observation. It is not an execution-start prerequisite.
+                reject_fixture_registration(socket, &frame).await;
+                continue;
+            }
             if frame["type"] == "assignment_preparation_progress" {
                 if acknowledge_progress {
                     acknowledge_runner_frame(socket, &frame, "acknowledge preparation progress")
@@ -2910,12 +2964,8 @@ mod tests {
             .send(())
             .expect("report assignment acceptance");
 
-        let Some(Ok(Message::Text(interrupted))) = socket.next().await else {
-            panic!("fixture did not receive shutdown interruption");
-        };
-        let interrupted: serde_json::Value =
-            serde_json::from_str(&interrupted).expect("decode shutdown interruption");
-        assert_eq!(interrupted["type"], "assignment_interrupted");
+        let interrupted =
+            next_semantic_assignment_frame(&mut socket, "assignment_interrupted", true).await;
         assert_eq!(interrupted["payload"]["reason"], "graceful_shutdown");
         (socket, accepted, interrupted)
     }
@@ -3489,8 +3539,14 @@ mod tests {
 
             while let Some(frame) = socket.next().await {
                 match frame {
-                    Ok(Message::Text(_)) => {
-                        panic!("repeated shutdown signal produced another observation");
+                    Ok(Message::Text(raw)) => {
+                        let frame: serde_json::Value =
+                            serde_json::from_str(&raw).expect("decode observation");
+                        if frame["type"] != "workspace_inventory" {
+                            panic!(
+                                "repeated shutdown signal produced another mandatory observation"
+                            );
+                        }
                     }
                     Ok(_) => {}
                     Err(_) => break,

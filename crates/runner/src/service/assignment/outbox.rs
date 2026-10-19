@@ -81,7 +81,23 @@ impl ObservationOutbox {
         let retained_bytes = state.entries.iter().try_fold(0_u64, |total, entry| {
             total.checked_add(u64::try_from(entry.encoded_bytes).ok()?)
         });
+        // An optional registration may be dropped rather than consuming the
+        // slots and bytes reserved for mandatory execution observations.
+        let optional = matches!(
+            observation,
+            AssignmentObservation::WorkspaceRegistration { .. }
+        );
         if state.entries.len() == MAXIMUM_SERVICE_OBSERVATIONS
+            || (optional
+                && state.entries.len() >= MAXIMUM_SERVICE_OBSERVATIONS - OBSERVATION_RESERVE_BASE)
+            || (optional
+                && retained_bytes.is_none_or(|bytes| {
+                    bytes.saturating_add(u64::try_from(encoded_bytes).unwrap_or(u64::MAX))
+                        > self.maximum_encoded_bytes.saturating_sub(
+                            (OBSERVATION_RESERVE_BASE as u64)
+                                * (MAXIMUM_ORDINARY_FRAME_BYTES as u64),
+                        )
+                }))
             || retained_bytes
                 .and_then(|total| total.checked_add(u64::try_from(encoded_bytes).ok()?))
                 .is_none_or(|total| total > self.maximum_encoded_bytes)
@@ -133,6 +149,22 @@ impl ObservationOutbox {
                 retained_frame: entry.retained_frame.clone(),
             })
             .collect()
+    }
+
+    pub(super) fn discard_unsent_registration(&self, id: u64) -> bool {
+        let mut state = self.lock();
+        let Some(index) = state.entries.iter().position(|entry| {
+            entry.id == id
+                && !entry.encoded
+                && !entry.transport_owned
+                && matches!(
+                    entry.observation,
+                    AssignmentObservation::WorkspaceRegistration { .. }
+                )
+        }) else {
+            return false;
+        };
+        state.entries.remove(index).is_some()
     }
 
     pub(super) fn acknowledge(&self, id: u64) -> Option<AssignmentObservation> {
