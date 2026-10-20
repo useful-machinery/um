@@ -680,6 +680,7 @@ impl FixtureSourceBroker {
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner),
             ),
+            canonical_repository_url: None,
             token: ProviderSecret(b"fixture-provider-token".to_vec()),
             expires_at: OffsetDateTime::UNIX_EPOCH + Duration::from_secs(4_102_444_800),
         }

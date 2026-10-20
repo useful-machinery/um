@@ -43,6 +43,7 @@ use um_runner_protocol::{
 const NOW: &str = "2026-07-23T00:00:00Z";
 mod artifact_delivery_tests;
 mod git_continuation_tests;
+mod gitlab_execution;
 mod harness_executable_tests;
 use harness_executable_tests::{manager_fixture_with_harnesses, manager_fixture_with_pi};
 const COMMAND_FIXTURE_TEST_NAME: &str = "service::assignment::tests::command_fixture_process";
@@ -2777,15 +2778,18 @@ fn admission_git_context_causes_keep_distinct_safe_facts() {
     );
 }
 
-struct NoGitLabCredentialBroker;
+struct UnavailableGitLabGrantBroker {
+    calls: AtomicUsize,
+}
 
-impl SourceCredentialBroker for NoGitLabCredentialBroker {
+impl SourceCredentialBroker for UnavailableGitLabGrantBroker {
     fn issue(
         &self,
         _: &str,
         _: &CaptureCancellation,
     ) -> Result<ProviderCredential, CredentialBrokerFailure> {
-        panic!("GitLab preparation requested a provider credential")
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Err(CredentialBrokerFailure::Unavailable)
     }
 
     fn commit_availability(
@@ -2818,7 +2822,7 @@ impl SourceCredentialBroker for NoGitLabCredentialBroker {
 // Coordinator effect, not a reconstructed execution-specification fixture.
 #[tokio::test]
 #[ignore = "requires the admitted Coordinator offer supplied by the integration harness"]
-async fn gitlab_admitted_offer_from_coordinator_declines_without_credential() {
+async fn gitlab_admitted_offer_from_coordinator_requires_a_cloud_grant() {
     let file = std::env::var("UM_GITLAB_ADMITTED_OFFER_FILE").unwrap();
     let effect: Value = serde_json::from_slice(&std::fs::read(file).unwrap()).unwrap();
     let mut payload = effect["payload"].as_object().unwrap().clone();
@@ -2861,22 +2865,30 @@ async fn gitlab_admitted_offer_from_coordinator_declines_without_credential() {
     let (_temporary, mut manager) = manager_fixture(
         "schemaVersion: 1\nsteps:\n  check:\n    kind: cmd\n    command: {argv: [\"true\"]}\n",
     );
-    manager.source_broker = Some(Arc::new(NoGitLabCredentialBroker));
+    let broker = Arc::new(UnavailableGitLabGrantBroker {
+        calls: AtomicUsize::new(0),
+    });
+    manager.source_broker = Some(broker.clone());
     assert_unmodified_preparation_declined(
         &mut manager,
         offered,
-        AssignmentDecline::RunnerUnable(RunnerUnableReason::SourceServiceUnavailable),
+        AssignmentDecline::RunnerUnable(RunnerUnableReason::SourceServiceUnavailable)
+            .diagnosed("source_materialization", "source_provider_unavailable"),
     )
     .await;
+    assert_eq!(broker.calls.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
-async fn gitlab_assignment_preparation_declines_without_requesting_a_broker_credential() {
+async fn gitlab_assignment_preparation_fails_without_a_cloud_grant() {
     for length in [256, 8192] {
         let (_temporary, mut manager) = manager_fixture(
             "schemaVersion: 1\nsteps:\n  check:\n    kind: cmd\n    command: {argv: [\"true\"]}\n",
         );
-        manager.source_broker = Some(Arc::new(NoGitLabCredentialBroker));
+        let broker = Arc::new(UnavailableGitLabGrantBroker {
+            calls: AtomicUsize::new(0),
+        });
+        manager.source_broker = Some(broker.clone());
         let mut frame: Value = serde_json::from_slice(include_bytes!(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/../../tests/fixtures/runner-protocol/v1/valid/cloud-assignment-offer-source-display.json"
@@ -2914,9 +2926,11 @@ async fn gitlab_assignment_preparation_declines_without_requesting_a_broker_cred
         assert_preparation_declined(
             &mut manager,
             offered,
-            AssignmentDecline::RunnerUnable(RunnerUnableReason::SourceServiceUnavailable),
+            AssignmentDecline::RunnerUnable(RunnerUnableReason::SourceServiceUnavailable)
+                .diagnosed("source_materialization", "source_provider_unavailable"),
         )
         .await;
+        assert_eq!(broker.calls.load(Ordering::SeqCst), 1);
     }
 }
 

@@ -105,6 +105,7 @@ fn run_helper_process() -> anyhow::Result<()> {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) enum RevocationObservation {
     Settled(WorkflowGitRevocation),
+    CloudGrantRevoked { expires_at: OffsetDateTime },
     LocallyExpired { provider_expires_at: OffsetDateTime },
     UnconfirmedUntilExpiry { provider_expires_at: OffsetDateTime },
 }
@@ -154,7 +155,13 @@ impl WorkflowGitTeardownReport {
         let settled = observations
             .iter()
             .filter_map(|observation| match observation {
-                RevocationObservation::Settled(revocation) => Some(revocation.outcome),
+                RevocationObservation::Settled(WorkflowGitRevocation::GitHub {
+                    outcome, ..
+                }) => Some(*outcome),
+                RevocationObservation::CloudGrantRevoked { .. } => {
+                    Some(WorkflowGitRevocationOutcome::Revoked)
+                }
+                RevocationObservation::Settled(WorkflowGitRevocation::GitLabRevoked) => None,
                 RevocationObservation::LocallyExpired { .. } => {
                     Some(WorkflowGitRevocationOutcome::Expired)
                 }
@@ -239,6 +246,7 @@ struct WorkflowGitAuthorityInner {
     assignment_id: Arc<str>,
     origin: Url,
     origin_text: Arc<str>,
+    canonical_origin: Option<Arc<str>>,
     workspace: PathBuf,
     environment: EnvironmentSnapshot,
     scoped_helper_key: Arc<str>,
@@ -305,6 +313,7 @@ pub(super) struct WorkflowGitInstall<'a> {
     pub(super) broker: Arc<dyn SourceCredentialBroker>,
     pub(super) assignment_id: &'a str,
     pub(super) origin: Arc<str>,
+    pub(super) canonical_origin: Option<Arc<str>>,
     pub(super) replace_origin: bool,
     pub(super) previous_private_root: Option<&'a Path>,
     pub(super) workspace: &'a Path,
@@ -322,6 +331,7 @@ impl WorkflowGitAuthority {
             broker,
             assignment_id,
             origin,
+            canonical_origin,
             replace_origin,
             previous_private_root,
             workspace,
@@ -425,6 +435,7 @@ impl WorkflowGitAuthority {
                 assignment_id: Arc::from(assignment_id),
                 origin: parsed_origin,
                 origin_text: origin,
+                canonical_origin,
                 workspace: workspace.to_owned(),
                 environment: environment.clone(),
                 scoped_helper_key: scoped_helper_key.into(),
@@ -591,6 +602,18 @@ impl WorkflowGitAuthority {
             &self.inner.scoped_helper_key,
             &self.inner.helper_value,
         );
+        let origin_restored = self
+            .inner
+            .canonical_origin
+            .as_ref()
+            .is_none_or(|canonical| {
+                restore_runner_origin(
+                    &self.inner.workspace,
+                    &self.inner.environment,
+                    &self.inner.origin_text,
+                    canonical,
+                )
+            });
         let socket_removed = remove_recorded_path(&self.inner.socket_path, socket_identity, None);
         let helper_removed = remove_recorded_path(
             &self.inner.helper_path,
@@ -620,8 +643,22 @@ impl WorkflowGitAuthority {
                     .broker
                     .revoke_workflow_git(&self.inner.assignment_id, &credential.token.0)
                 {
-                    Ok(revocation) if revocation.provider_expires_at == credential.expires_at => {
+                    Ok(
+                        revocation @ WorkflowGitRevocation::GitHub {
+                            provider_expires_at,
+                            ..
+                        },
+                    ) if provider_expires_at == credential.expires_at
+                        && credential.canonical_repository_url.is_none() =>
+                    {
                         RevocationObservation::Settled(revocation)
+                    }
+                    Ok(WorkflowGitRevocation::GitLabRevoked)
+                        if credential.canonical_repository_url.is_some() =>
+                    {
+                        RevocationObservation::CloudGrantRevoked {
+                            expires_at: credential.expires_at,
+                        }
                     }
                     Ok(_) | Err(_) => RevocationObservation::UnconfirmedUntilExpiry {
                         provider_expires_at: credential.expires_at,
@@ -633,8 +670,12 @@ impl WorkflowGitAuthority {
         state.issuances.clear();
         state.current_issuance = None;
         state.active = None;
-        let local_state_destroyed =
-            worker_stopped && config_removed && socket_removed && helper_removed && alias_removed;
+        let local_state_destroyed = worker_stopped
+            && config_removed
+            && origin_restored
+            && socket_removed
+            && helper_removed
+            && alias_removed;
         let report =
             WorkflowGitTeardownReport::from_observations(observations, local_state_destroyed);
         record_teardown(self.inner.recorder.as_ref(), &report);
@@ -719,7 +760,8 @@ fn write_current_credential(
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let credential =
         issued.map_err(|failure| anyhow!("workflow Git credential broker failed: {failure:?}"))?;
-    let origin_matches = credential.repository_url.as_ref() == inner.origin_text.as_ref();
+    let origin_matches = credential.repository_url.as_ref() == inner.origin_text.as_ref()
+        && credential.canonical_repository_url == inner.canonical_origin;
     state.issuances.push(credential);
     let index = state
         .issuances
@@ -1041,6 +1083,32 @@ fn rewire_continuation_origin(
     Ok(())
 }
 
+// Only undo the runner's own remote replacement. A step-authored remote is
+// not ours to overwrite; failure to prove the state leaves retention guarded.
+pub(super) fn restore_runner_origin(
+    workspace: &Path,
+    environment: &EnvironmentSnapshot,
+    relay: &str,
+    canonical: &str,
+) -> bool {
+    match local_config_values(workspace, environment, "remote.origin.url") {
+        Some(values) if values == vec![relay.as_bytes().to_vec()] => {
+            set_local_config(
+                workspace,
+                environment,
+                "remote.origin.url",
+                canonical,
+                &CaptureCancellation::default(),
+            )
+            .is_ok()
+                && local_config_values(workspace, environment, "remote.origin.url")
+                    == Some(vec![canonical.as_bytes().to_vec()])
+        }
+        Some(values) if values == vec![canonical.as_bytes().to_vec()] => true,
+        _ => false,
+    }
+}
+
 fn set_local_config(
     workspace: &Path,
     environment: &EnvironmentSnapshot,
@@ -1155,15 +1223,27 @@ fn record_teardown(
     };
     for (index, observation) in report.observations.iter().enumerate() {
         let (outcome, issuance_id, provider_expires_at) = match observation {
-            RevocationObservation::Settled(revocation) => (
-                match revocation.outcome {
+            RevocationObservation::Settled(WorkflowGitRevocation::GitHub {
+                issuance_id,
+                outcome,
+                provider_expires_at,
+            }) => (
+                match outcome {
                     WorkflowGitRevocationOutcome::Revoked => "revoked",
                     WorkflowGitRevocationOutcome::AlreadyRevoked => "already_revoked",
                     WorkflowGitRevocationOutcome::Expired => "expired",
                     WorkflowGitRevocationOutcome::ResidualUntilExpiry => "residual_until_expiry",
                 },
-                revocation.issuance_id.clone(),
-                revocation.provider_expires_at,
+                issuance_id.clone(),
+                *provider_expires_at,
+            ),
+            RevocationObservation::CloudGrantRevoked { expires_at } => {
+                ("revoked", format!("local-grant-{}", index + 1), *expires_at)
+            }
+            RevocationObservation::Settled(WorkflowGitRevocation::GitLabRevoked) => (
+                "unconfirmed_until_expiry",
+                format!("local-grant-{}", index + 1),
+                OffsetDateTime::UNIX_EPOCH,
             ),
             RevocationObservation::LocallyExpired {
                 provider_expires_at,
@@ -1235,6 +1315,7 @@ pub(super) mod test_support {
                 origin: Url::parse("https://github.example/scherzo/fixture.git")
                     .expect("parse fixture workflow Git origin"),
                 origin_text: Arc::from("https://github.example/scherzo/fixture.git"),
+                canonical_origin: None,
                 workspace: placeholder.clone(),
                 environment: EnvironmentSnapshot::new(std::iter::empty::<(
                     std::ffi::OsString,
@@ -1343,6 +1424,7 @@ mod tests {
                 .ok_or(CredentialBrokerFailure::Unavailable)?;
             Ok(ProviderCredential {
                 repository_url: Arc::clone(&self.origin),
+                canonical_repository_url: None,
                 token: ProviderSecret(token),
                 expires_at,
             })
@@ -1364,7 +1446,7 @@ mod tests {
                 .expiries
                 .get(token)
                 .ok_or(CredentialBrokerFailure::InvalidResponse)?;
-            Ok(WorkflowGitRevocation {
+            Ok(WorkflowGitRevocation::GitHub {
                 issuance_id: format!("gti_{}", self.revoked_tokens.lock().unwrap().len()),
                 outcome,
                 provider_expires_at,
@@ -1565,6 +1647,7 @@ mod tests {
             broker,
             assignment_id: "asn_01k0z6r1w8f4jy2m7q9v3x5abc",
             origin: Arc::from(FIXTURE_ORIGIN),
+            canonical_origin: None,
             replace_origin: false,
             previous_private_root: None,
             workspace: &fixture.workspace,
@@ -1669,6 +1752,7 @@ mod tests {
             broker: fixture_broker([], []),
             assignment_id: "asn_01k0z6r1w8f4jy2m7q9v3x5abc",
             origin: Arc::from("https://github.example/old/repo.git"),
+            canonical_origin: None,
             replace_origin: false,
             previous_private_root: None,
             workspace: &fixture.workspace,
@@ -1694,6 +1778,7 @@ mod tests {
             broker,
             assignment_id: "asn_01k0z6r1w8f4jy2m7q9v3x5abd",
             origin: Arc::from(FIXTURE_ORIGIN),
+            canonical_origin: None,
             replace_origin: true,
             previous_private_root: Some(&fixture.private),
             workspace: &fixture.workspace,
@@ -1733,6 +1818,78 @@ mod tests {
                 .teardown(ProcessQuiescence::Proven)
                 .local_state_destroyed
         );
+    }
+
+    // REQ-WORKSPACE-34: a retained GitLab checkout cannot keep the Cloud
+    // remote or the scoped helper after runner-owned teardown.
+    #[test]
+    fn gitlab_teardown_restores_canonical_origin_without_overwriting_a_step() {
+        const CLOUD: &str = "https://cloud.example/v1/runner/git-read/asn_01k0z6r1w8f4jy2m7q9v3x5abc/repository.git";
+        const CANONICAL: &str = "https://gitlab.com/group/sub/project.git";
+        for step_changed_origin in [false, true] {
+            let fixture = fixture();
+            assert!(
+                Command::new("git")
+                    .current_dir(&fixture.workspace)
+                    .args(["remote", "add", "origin", CLOUD])
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            let environment =
+                EnvironmentSnapshot::new([("PATH", std::env::var_os("PATH").unwrap())]);
+            let authority = WorkflowGitAuthority::install(WorkflowGitInstall {
+                broker: fixture_broker([], []),
+                assignment_id: "asn_01k0z6r1w8f4jy2m7q9v3x5abc",
+                origin: Arc::from(CLOUD),
+                canonical_origin: Some(Arc::from(CANONICAL)),
+                replace_origin: false,
+                previous_private_root: None,
+                workspace: &fixture.workspace,
+                private_root: &fixture.private,
+                environment: &environment,
+                helper_executable: &test_helper_executable(),
+                clock: Arc::new(crate::service::TokioSleeper),
+                recorder: None,
+                cancellation: &CaptureCancellation::default(),
+            })
+            .unwrap();
+            if step_changed_origin {
+                assert!(
+                    Command::new("git")
+                        .current_dir(&fixture.workspace)
+                        .args([
+                            "remote",
+                            "set-url",
+                            "origin",
+                            "https://example.org/step.git"
+                        ])
+                        .status()
+                        .unwrap()
+                        .success()
+                );
+            }
+            let report = authority.teardown(ProcessQuiescence::Proven);
+            let wanted = if step_changed_origin {
+                "https://example.org/step.git"
+            } else {
+                CANONICAL
+            };
+            assert_eq!(
+                local_config_values(&fixture.workspace, &environment, "remote.origin.url"),
+                Some(vec![wanted.as_bytes().to_vec()])
+            );
+            assert_eq!(report.local_state_destroyed, !step_changed_origin);
+            assert!(
+                local_config_values(
+                    &fixture.workspace,
+                    &environment,
+                    &format!("credential.{CLOUD}.helper")
+                )
+                .unwrap()
+                .is_empty()
+            );
+        }
     }
 
     fn test_helper_executable() -> PathBuf {
@@ -2081,20 +2238,24 @@ mod tests {
     fn revocation_summary_distinguishes_replay_expiry_and_unconfirmed_residual() {
         let expiry = um_support::utc_now() + time::Duration::hours(1);
         let replay = WorkflowGitTeardownReport::from_observations(
-            vec![RevocationObservation::Settled(WorkflowGitRevocation {
-                issuance_id: "gti_replay".to_owned(),
-                outcome: WorkflowGitRevocationOutcome::AlreadyRevoked,
-                provider_expires_at: expiry,
-            })],
+            vec![RevocationObservation::Settled(
+                WorkflowGitRevocation::GitHub {
+                    issuance_id: "gti_replay".to_owned(),
+                    outcome: WorkflowGitRevocationOutcome::AlreadyRevoked,
+                    provider_expires_at: expiry,
+                },
+            )],
             true,
         );
         assert_eq!(replay.summary, RevocationSummary::FullyRevokedWithReplay);
         let expired = WorkflowGitTeardownReport::from_observations(
-            vec![RevocationObservation::Settled(WorkflowGitRevocation {
-                issuance_id: "gti_expired".to_owned(),
-                outcome: WorkflowGitRevocationOutcome::Expired,
-                provider_expires_at: expiry,
-            })],
+            vec![RevocationObservation::Settled(
+                WorkflowGitRevocation::GitHub {
+                    issuance_id: "gti_expired".to_owned(),
+                    outcome: WorkflowGitRevocationOutcome::Expired,
+                    provider_expires_at: expiry,
+                },
+            )],
             true,
         );
         assert_eq!(expired.summary, RevocationSummary::Expired);

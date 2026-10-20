@@ -3784,6 +3784,7 @@ mod tests {
                 broker: super::super::source::test_support::unavailable_source_broker(),
                 assignment_id: ASSIGNMENT,
                 origin: Arc::from("https://github.example/acme/private.git"),
+                canonical_origin: None,
                 replace_origin: false,
                 previous_private_root: None,
                 workspace: &workspace,

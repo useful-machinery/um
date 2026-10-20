@@ -1,15 +1,16 @@
 use std::ffi::OsStr;
-use std::fs::{self, File};
+use std::fs;
 use std::io::{Read, Seek, Write};
-use std::os::fd::AsRawFd as _;
-use std::os::unix::fs::PermissionsExt as _;
-use std::os::unix::process::CommandExt as _;
+use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 use std::time::Duration;
 
-use nix::fcntl::{FcntlArg, FdFlag, fcntl};
+use nix::sys::stat::Mode;
+use nix::unistd::mkfifo;
 use opentelemetry::KeyValue;
 use reqwest::StatusCode;
 use reqwest::header::{CACHE_CONTROL, CONTENT_TYPE, RETRY_AFTER};
@@ -44,6 +45,14 @@ pub(super) trait SourceCredentialBroker: Send + Sync {
         assignment_id: &str,
         cancellation: &CaptureCancellation,
     ) -> Result<CommitAvailability, CredentialBrokerFailure>;
+
+    fn revoke_preparation(
+        &self,
+        _assignment_id: &str,
+        _token: &[u8],
+    ) -> Result<(), CredentialBrokerFailure> {
+        Err(CredentialBrokerFailure::Unavailable)
+    }
 
     fn issue_workflow_git(
         &self,
@@ -104,6 +113,9 @@ impl ProviderRetryWaiter for SystemProviderRetryWaiter {
 
 pub(super) struct ProviderCredential {
     pub(super) repository_url: Arc<str>,
+    // For a GitLab grant the internal remote is the Cloud relay; this is the
+    // credential-free provider URL restored before capture or retention.
+    pub(super) canonical_repository_url: Option<Arc<str>>,
     pub(super) token: ProviderSecret,
     pub(super) expires_at: OffsetDateTime,
 }
@@ -132,6 +144,7 @@ pub(super) struct HttpSourceCredentialBroker {
     availability_endpoint: Url,
     workflow_git_endpoint: Url,
     workflow_git_revoke_endpoint: Url,
+    preparation_revoke_endpoint: Url,
     runner_credential: Credential,
     boot_id: Arc<str>,
     repository_url_policy: RepositoryUrlPolicy,
@@ -167,11 +180,14 @@ impl HttpSourceCredentialBroker {
             private_runner_http_endpoint(endpoint, "/v1/runner/workflow-git-credentials")?;
         let workflow_git_revoke_endpoint =
             private_runner_http_endpoint(endpoint, "/v1/runner/workflow-git-credentials/revoke")?;
+        let preparation_revoke_endpoint =
+            private_runner_http_endpoint(endpoint, "/v1/runner/source-credentials/revoke")?;
         Ok(Self {
             credential_endpoint,
             availability_endpoint,
             workflow_git_endpoint,
             workflow_git_revoke_endpoint,
+            preparation_revoke_endpoint,
             runner_credential: runner_credential.clone(),
             boot_id: Arc::from(boot_id),
             repository_url_policy,
@@ -203,6 +219,7 @@ impl HttpSourceCredentialBroker {
 struct CredentialResponse {
     schema_version: u64,
     repository_url: String,
+    read_url: Option<String>,
     token: SensitiveString,
     expires_at: String,
 }
@@ -247,10 +264,13 @@ pub(super) enum WorkflowGitRevocationOutcome {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(super) struct WorkflowGitRevocation {
-    pub(super) issuance_id: String,
-    pub(super) outcome: WorkflowGitRevocationOutcome,
-    pub(super) provider_expires_at: OffsetDateTime,
+pub(super) enum WorkflowGitRevocation {
+    GitHub {
+        issuance_id: String,
+        outcome: WorkflowGitRevocationOutcome,
+        provider_expires_at: OffsetDateTime,
+    },
+    GitLabRevoked,
 }
 
 #[derive(Deserialize)]
@@ -468,6 +488,7 @@ impl HttpSourceCredentialBroker {
         let CredentialResponse {
             schema_version,
             repository_url,
+            read_url,
             token,
             expires_at,
         } = parsed;
@@ -487,11 +508,73 @@ impl HttpSourceCredentialBroker {
             })
             .ok_or(CredentialBrokerFailure::InvalidResponse)?;
         let repository_url = validate_repository_url(&repository_url, self.repository_url_policy)?;
+        let (internal_url, canonical_repository_url) = match read_url {
+            Some(read_url) => {
+                let mut expected = self.credential_endpoint.clone();
+                expected.set_path(&format!(
+                    "/v1/runner/git-read/{assignment_id}/repository.git"
+                ));
+                // The broker names the deployment's public read origin; it
+                // need not equal the runner's separately published socket
+                // origin. Authenticate the broker response, and admit only
+                // the exact assignment-scoped Cloud path on a TLS origin.
+                let read_endpoint =
+                    Url::parse(&read_url).map_err(|_| CredentialBrokerFailure::InvalidResponse)?;
+                if !um_support::valid_typed_id(assignment_id, "asn_")
+                    || (read_endpoint.scheme() != "https"
+                        && !(read_endpoint.scheme() == "http"
+                            && crate::is_loopback(&read_endpoint)
+                            && crate::is_loopback(&expected)))
+                    || read_endpoint.host_str().is_none()
+                    || read_endpoint.username() != ""
+                    || read_endpoint.password().is_some()
+                    || read_endpoint.path() != expected.path()
+                    || read_endpoint.query().is_some()
+                    || read_endpoint.fragment().is_some()
+                    || read_endpoint.as_str() != read_url
+                    || !repository_url.starts_with("https://gitlab.com/")
+                    || !repository_url.ends_with(".git")
+                {
+                    return Err(CredentialBrokerFailure::InvalidResponse);
+                }
+                (read_url, Some(Arc::from(repository_url)))
+            }
+            None => {
+                if repository_url.starts_with("https://gitlab.com/") {
+                    return Err(CredentialBrokerFailure::InvalidResponse);
+                }
+                (repository_url, None)
+            }
+        };
         Ok(ProviderCredential {
-            repository_url: Arc::from(repository_url),
+            repository_url: Arc::from(internal_url),
+            canonical_repository_url,
             token,
             expires_at,
         })
+    }
+
+    fn revoke_preparation_current(
+        &self,
+        assignment_id: &str,
+        token: &[u8],
+    ) -> Result<(), CredentialBrokerFailure> {
+        let token =
+            std::str::from_utf8(token).map_err(|_| CredentialBrokerFailure::InvalidResponse)?;
+        let body = serde_json::to_vec(&WorkflowGitRevocationRequest {
+            schema_version: 1,
+            boot_id: self.boot_id.as_ref(),
+            assignment_id,
+            token,
+        })
+        .map(ProviderSecret)
+        .map_err(|_| CredentialBrokerFailure::Unavailable)?;
+        let response = self.request_encoded(&self.preparation_revoke_endpoint, body, None)?;
+        match response.status {
+            StatusCode::NO_CONTENT => Ok(()),
+            StatusCode::CONFLICT => Err(CredentialBrokerFailure::Fenced),
+            _ => Err(CredentialBrokerFailure::Unavailable),
+        }
     }
 
     fn revoke_workflow_git_current(
@@ -512,7 +595,10 @@ impl HttpSourceCredentialBroker {
         let response = self.request_encoded(&self.workflow_git_revoke_endpoint, body, None)?;
         match response.status {
             StatusCode::CONFLICT => return Err(CredentialBrokerFailure::Fenced),
-            StatusCode::OK => {}
+            StatusCode::NO_CONTENT if token.starts_with("grg_") => {
+                return Ok(WorkflowGitRevocation::GitLabRevoked);
+            }
+            StatusCode::OK if !token.starts_with("grg_") => {}
             _ => return Err(CredentialBrokerFailure::Unavailable),
         }
         let parsed: WorkflowGitRevocationResponse = serde_json::from_slice(&response.encoded.0)
@@ -525,7 +611,7 @@ impl HttpSourceCredentialBroker {
         if parsed.schema_version != 1 || !um_support::valid_typed_id(&parsed.issuance_id, "gti_") {
             return Err(CredentialBrokerFailure::InvalidResponse);
         }
-        Ok(WorkflowGitRevocation {
+        Ok(WorkflowGitRevocation::GitHub {
             issuance_id: parsed.issuance_id,
             outcome: parsed.outcome,
             provider_expires_at,
@@ -590,6 +676,14 @@ impl SourceCredentialBroker for HttpSourceCredentialBroker {
         run_broker_worker("runner-source-verification", cancellation, move || {
             broker.commit_availability_current(&assignment_id, &worker_cancellation)
         })
+    }
+
+    fn revoke_preparation(
+        &self,
+        assignment_id: &str,
+        token: &[u8],
+    ) -> Result<(), CredentialBrokerFailure> {
+        self.revoke_preparation_current(assignment_id, token)
     }
 
     fn issue_workflow_git(
@@ -708,7 +802,39 @@ pub(super) struct MaterializedSource {
     pub(super) workflow: ResolvedWorkflow,
     pub(super) execution_root: PathBuf,
     pub(super) origin: Arc<str>,
+    pub(super) canonical_origin: Option<Arc<str>>,
+    pub(super) origin_cleanup: Option<PreparationOriginCleanup>,
     pub(super) git_capture: Option<CloudGitCaptureProjection>,
+}
+
+// Before workflow authority is installed, a failed preparation or input
+// download still owns the clone and must not retain its Cloud remote. The
+// guard hands restoration to workflow teardown only after installation.
+pub(super) struct PreparationOriginCleanup {
+    root: PathBuf,
+    environment: EnvironmentSnapshot,
+    relay: Arc<str>,
+    canonical: Arc<str>,
+    installed: bool,
+}
+
+impl PreparationOriginCleanup {
+    pub(super) fn disarm(&mut self) {
+        self.installed = true;
+    }
+}
+
+impl Drop for PreparationOriginCleanup {
+    fn drop(&mut self) {
+        if !self.installed && self.root.join(".git").exists() {
+            let _ = super::workflow_git::restore_runner_origin(
+                &self.root,
+                &self.environment,
+                &self.relay,
+                &self.canonical,
+            );
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -749,6 +875,8 @@ pub(super) struct MaterializedCheckout {
     request: MaterializationRequest,
     source_root: PathBuf,
     origin: Arc<str>,
+    canonical_origin: Option<Arc<str>>,
+    origin_cleanup: Option<PreparationOriginCleanup>,
 }
 
 pub(super) fn checkout(
@@ -768,38 +896,108 @@ pub(super) fn checkout(
     let credential = broker
         .issue(assignment_id, cancellation)
         .map_err(map_broker_failure)?;
-    ensure_current(cancellation)?;
     let repository_url = Arc::clone(&credential.repository_url);
+    let canonical_origin = credential.canonical_repository_url.clone();
+    let mut issuances = vec![credential];
+    let origin_cleanup = canonical_origin
+        .as_ref()
+        .map(|canonical| PreparationOriginCleanup {
+            root: source_root.to_owned(),
+            environment: environment.clone(),
+            relay: Arc::clone(&repository_url),
+            canonical: Arc::clone(canonical),
+            installed: false,
+        });
 
-    {
-        let askpass = EphemeralAskpass::create(private_root, &credential.token.0)?;
+    let mut revocation_failure = None;
+    let checkout_result = (|| {
+        ensure_current(cancellation)?;
+        let first = issuances
+            .last()
+            .ok_or(MaterializationFailure::ProviderUnavailable)?;
+        let mut askpass = EphemeralAskpass::create(private_root, &first.token.0)?;
+        let mut git = PreparationGit {
+            askpass: &mut askpass,
+            broker: broker.as_ref(),
+            assignment_id,
+            issuances: &mut issuances,
+            canonical_origin: &canonical_origin,
+            revocation_failure: &mut revocation_failure,
+            cancellation,
+        };
         verify_remote_object_format(
             source_root,
             environment,
             private_root,
             repository_url.as_ref(),
-            &askpass,
-            cancellation,
+            &mut git,
         )?;
-        clone_repository(
-            source_root,
-            environment,
-            repository_url.as_ref(),
-            &askpass,
-            cancellation,
-        )?;
-        verify_connectivity(source_root, environment, None, cancellation)?;
-        fetch_pinned_commit(
-            source_root,
-            environment,
-            &askpass,
+        drop(askpass);
+        renew_preparation_grant(
             broker.as_ref(),
             assignment_id,
-            &request.commit_oid,
             cancellation,
+            &mut issuances,
+            &repository_url,
+            &canonical_origin,
+            &mut revocation_failure,
         )?;
+        let current = issuances
+            .last()
+            .ok_or(MaterializationFailure::ProviderUnavailable)?;
+        let mut askpass = EphemeralAskpass::create(private_root, &current.token.0)?;
+        let mut git = PreparationGit {
+            askpass: &mut askpass,
+            broker: broker.as_ref(),
+            assignment_id,
+            issuances: &mut issuances,
+            canonical_origin: &canonical_origin,
+            revocation_failure: &mut revocation_failure,
+            cancellation,
+        };
+        clone_repository(source_root, environment, repository_url.as_ref(), &mut git)?;
+        drop(askpass);
+        verify_connectivity(source_root, environment, None, cancellation)?;
+        renew_preparation_grant(
+            broker.as_ref(),
+            assignment_id,
+            cancellation,
+            &mut issuances,
+            &repository_url,
+            &canonical_origin,
+            &mut revocation_failure,
+        )?;
+        let current = issuances
+            .last()
+            .ok_or(MaterializationFailure::ProviderUnavailable)?;
+        let mut askpass = EphemeralAskpass::create(private_root, &current.token.0)?;
+        let mut git = PreparationGit {
+            askpass: &mut askpass,
+            broker: broker.as_ref(),
+            assignment_id,
+            issuances: &mut issuances,
+            canonical_origin: &canonical_origin,
+            revocation_failure: &mut revocation_failure,
+            cancellation,
+        };
+        fetch_pinned_commit(source_root, environment, &mut git, &request.commit_oid)?;
+        Ok::<(), MaterializationFailure>(())
+    })();
+    // A Git request can read the previous grant concurrently with renewal;
+    // retire every issuance only after the subprocess has exited. Revocation
+    // is mandatory even on a failed checkout or cancellation.
+    if canonical_origin.is_some() {
+        for credential in &issuances {
+            if let Err(failure) = broker.revoke_preparation(assignment_id, &credential.token.0) {
+                revocation_failure.get_or_insert(failure);
+            }
+        }
     }
-    drop(credential);
+    drop(issuances);
+    if let Some(failure) = revocation_failure {
+        return Err(map_broker_failure(failure));
+    }
+    checkout_result?;
     ensure_current(cancellation)?;
     verify_clone(
         source_root,
@@ -815,7 +1013,45 @@ pub(super) fn checkout(
         request: request.clone(),
         source_root: source_root.to_owned(),
         origin: repository_url,
+        canonical_origin,
+        origin_cleanup,
     })
+}
+
+// A preparation grant is never reused for a later Git command inside its
+// 30-second expiry margin. Replacements have exactly the same origin and
+// purpose; retire each issuance even if checkout subsequently fails.
+fn renew_preparation_grant(
+    broker: &dyn SourceCredentialBroker,
+    assignment_id: &str,
+    cancellation: &CaptureCancellation,
+    issuances: &mut Vec<ProviderCredential>,
+    repository_url: &Arc<str>,
+    canonical_origin: &Option<Arc<str>>,
+    revocation_failure: &mut Option<CredentialBrokerFailure>,
+) -> Result<(), MaterializationFailure> {
+    ensure_current(cancellation)?;
+    let current = issuances
+        .last()
+        .ok_or(MaterializationFailure::ProviderUnavailable)?;
+    if canonical_origin.is_none()
+        || current.expires_at > um_support::utc_now() + time::Duration::seconds(30)
+    {
+        return Ok(());
+    }
+    let replacement = broker
+        .issue(assignment_id, cancellation)
+        .map_err(map_broker_failure)?;
+    let matches_origin = replacement.repository_url == *repository_url
+        && replacement.canonical_repository_url == *canonical_origin;
+    if !matches_origin {
+        if let Err(error) = broker.revoke_preparation(assignment_id, &replacement.token.0) {
+            revocation_failure.get_or_insert(error);
+        }
+        return Err(MaterializationFailure::AssignmentFenced);
+    }
+    issuances.push(replacement);
+    Ok(())
 }
 
 pub(super) fn resolve_checkout(
@@ -856,6 +1092,8 @@ pub(super) fn resolve_checkout(
         workflow,
         execution_root: checkout.source_root,
         origin: checkout.origin,
+        canonical_origin: checkout.canonical_origin,
+        origin_cleanup: checkout.origin_cleanup,
         git_capture,
     })
 }
@@ -902,8 +1140,7 @@ fn verify_remote_object_format(
     environment: &EnvironmentSnapshot,
     private_root: &Path,
     repository_url: &str,
-    askpass: &EphemeralAskpass,
-    cancellation: &CaptureCancellation,
+    git: &mut PreparationGit<'_>,
 ) -> Result<(), MaterializationFailure> {
     let mut captured = tempfile::tempfile_in(private_root)
         .map_err(|_| MaterializationFailure::EnvironmentUnavailable)?;
@@ -911,21 +1148,17 @@ fn verify_remote_object_format(
         .try_clone()
         .map(Stdio::from)
         .map_err(|_| MaterializationFailure::EnvironmentUnavailable)?;
-    let mut command = git_command(
-        root,
-        environment,
-        &["ls-remote", repository_url, "HEAD"],
-        Some(askpass),
-    );
-    command
-        .stdin(Stdio::null())
-        .stdout(output)
-        .stderr(Stdio::null());
-    ensure_git_success(
-        &mut command,
-        cancellation,
-        MaterializationFailure::ProviderUnavailable,
-    )?;
+    if !git
+        .run_with_stdout(
+            root,
+            environment,
+            &["ls-remote", repository_url, "HEAD"],
+            output,
+        )?
+        .success()
+    {
+        return Err(MaterializationFailure::ProviderUnavailable);
+    }
     captured
         .rewind()
         .map_err(|_| MaterializationFailure::EnvironmentUnavailable)?;
@@ -950,10 +1183,9 @@ fn clone_repository(
     root: &Path,
     environment: &EnvironmentSnapshot,
     repository_url: &str,
-    askpass: &EphemeralAskpass,
-    cancellation: &CaptureCancellation,
+    git: &mut PreparationGit<'_>,
 ) -> Result<(), MaterializationFailure> {
-    run_git_status_with_failure(
+    let status = git.run(
         root,
         environment,
         &[
@@ -967,26 +1199,24 @@ fn clone_repository(
             repository_url,
             ".",
         ],
-        Some(askpass),
-        cancellation,
-        MaterializationFailure::ProviderUnavailable,
-    )
+    )?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(MaterializationFailure::ProviderUnavailable)
+    }
 }
 
 fn fetch_pinned_commit(
     root: &Path,
     environment: &EnvironmentSnapshot,
-    askpass: &EphemeralAskpass,
-    broker: &dyn SourceCredentialBroker,
-    assignment_id: &str,
+    git: &mut PreparationGit<'_>,
     commit_oid: &str,
-    cancellation: &CaptureCancellation,
 ) -> Result<(), MaterializationFailure> {
-    if commit_is_available(root, environment, commit_oid, cancellation)? {
+    if commit_is_available(root, environment, commit_oid, git.cancellation)? {
         return Ok(());
     }
-
-    let status = run_git_status_code(
+    let status = git.run(
         root,
         environment,
         &[
@@ -997,21 +1227,97 @@ fn fetch_pinned_commit(
             "origin",
             commit_oid,
         ],
-        Some(askpass),
-        cancellation,
-        MaterializationFailure::ProviderUnavailable,
     )?;
     if status.success() {
         return Ok(());
     }
-    match broker
-        .commit_availability(assignment_id, cancellation)
+    match git
+        .broker
+        .commit_availability(git.assignment_id, git.cancellation)
         .map_err(map_broker_failure)?
     {
         CommitAvailability::CommitAvailable => Err(MaterializationFailure::ProviderUnavailable),
         CommitAvailability::CommitUnavailable => Err(MaterializationFailure::CommitUnavailable),
         CommitAvailability::RepositoryUnavailable => {
             Err(MaterializationFailure::RepositoryUnavailable)
+        }
+    }
+}
+
+// Git may negotiate more than one HTTP request in a single clone or fetch.
+// Renew while the child runs and atomically swap only the private askpass
+// token; neither its command line nor the origin changes. The process group
+// stops on a broker, fence, or timeout failure.
+struct PreparationGit<'a> {
+    askpass: &'a mut EphemeralAskpass,
+    broker: &'a dyn SourceCredentialBroker,
+    assignment_id: &'a str,
+    issuances: &'a mut Vec<ProviderCredential>,
+    canonical_origin: &'a Option<Arc<str>>,
+    revocation_failure: &'a mut Option<CredentialBrokerFailure>,
+    cancellation: &'a CaptureCancellation,
+}
+
+impl PreparationGit<'_> {
+    fn run(
+        &mut self,
+        root: &Path,
+        environment: &EnvironmentSnapshot,
+        arguments: &[&str],
+    ) -> Result<ExitStatus, MaterializationFailure> {
+        self.run_with_stdout(root, environment, arguments, Stdio::null())
+    }
+
+    fn run_with_stdout(
+        &mut self,
+        root: &Path,
+        environment: &EnvironmentSnapshot,
+        arguments: &[&str],
+        stdout: Stdio,
+    ) -> Result<ExitStatus, MaterializationFailure> {
+        let mut command = git_command(root, environment, arguments, Some(self.askpass));
+        command
+            .stdin(Stdio::null())
+            .stdout(stdout)
+            .stderr(Stdio::null());
+        let mut child = ManagedProcessGroup::spawn(&mut command)
+            .map_err(|_| MaterializationFailure::EnvironmentUnavailable)?;
+        let started = um_support::monotonic_now();
+        loop {
+            ensure_current(self.cancellation)?;
+            if um_support::elapsed(started) >= GIT_OPERATION_TIMEOUT {
+                return Err(MaterializationFailure::ProviderUnavailable);
+            }
+            if let Some(status) = child
+                .try_wait()
+                .map_err(|_| MaterializationFailure::EnvironmentUnavailable)?
+            {
+                return Ok(status);
+            }
+            let previous = self.issuances.len();
+            let origin = self
+                .issuances
+                .last()
+                .ok_or(MaterializationFailure::ProviderUnavailable)?
+                .repository_url
+                .clone();
+            renew_preparation_grant(
+                self.broker,
+                self.assignment_id,
+                self.cancellation,
+                self.issuances,
+                &origin,
+                self.canonical_origin,
+                self.revocation_failure,
+            )?;
+            if self.issuances.len() != previous {
+                let current = self
+                    .issuances
+                    .last()
+                    .ok_or(MaterializationFailure::ProviderUnavailable)?;
+                self.askpass.replace_token(&current.token.0)?;
+            }
+            um_support::sleep(Duration::from_millis(100));
         }
     }
 }
@@ -1314,19 +1620,6 @@ fn run_git_status_code(
     run_managed_source_git(&mut command, cancellation, failure)
 }
 
-fn ensure_git_success(
-    command: &mut Command,
-    cancellation: &CaptureCancellation,
-    failure: MaterializationFailure,
-) -> Result<(), MaterializationFailure> {
-    let status = run_managed_source_git(command, cancellation, failure)?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(failure)
-    }
-}
-
 fn run_git_output(
     root: &Path,
     environment: &EnvironmentSnapshot,
@@ -1468,15 +1761,21 @@ fn run_managed_git(
     }
 }
 
+// A FIFO is a private rendezvous, not a token file: credentials remain only
+// in zeroizing memory and one challenge response to the Git child. Renewals
+// affect the next askpass invocation without persisting a token on disk.
 struct EphemeralAskpass {
     helper: tempfile::TempPath,
-    token: File,
-    token_length: usize,
+    fifo: tempfile::TempPath,
+    acknowledgment: tempfile::TempPath,
+    token: Arc<Mutex<ProviderSecret>>,
+    stop: Arc<AtomicBool>,
+    worker: Option<JoinHandle<()>>,
 }
 
 impl EphemeralAskpass {
     fn create(parent: &Path, token: &[u8]) -> Result<Self, MaterializationFailure> {
-        let script = b"#!/bin/sh\ncase \"${1-}\" in\n  *[Uu]sername*) printf '%s\\n' 'x-access-token' ;;\n  *) IFS= read -r token < \"/dev/fd/$UM_SOURCE_TOKEN_FD\"; printf '%s\\n' \"$token\"; unset token ;;\nesac\n";
+        let script = b"#!/bin/sh\ncase \"${1-}\" in\n  *[Uu]sername*) printf '%s\\n' 'x-access-token' ;;\n  *) IFS= read -r token < \"$UM_SOURCE_TOKEN_FIFO\"; printf '%s\\n' \"$token\"; unset token; printf '1' > \"$UM_SOURCE_TOKEN_ACK\" ;;\nesac\n";
         let mut helper = tempfile::Builder::new()
             .prefix("source-askpass-")
             .tempfile_in(parent)
@@ -1491,19 +1790,85 @@ impl EphemeralAskpass {
             })
             .map_err(|_| MaterializationFailure::EnvironmentUnavailable)?;
         let helper = helper.into_temp_path();
-        let mut token_output = tempfile::tempfile_in(parent)
+        let fifo = tempfile::Builder::new()
+            .prefix("source-token-")
+            .tempfile_in(parent)
+            .map_err(|_| MaterializationFailure::EnvironmentUnavailable)?
+            .into_temp_path();
+        fs::remove_file(&fifo).map_err(|_| MaterializationFailure::EnvironmentUnavailable)?;
+        mkfifo(fifo.to_path_buf().as_path(), Mode::S_IRUSR | Mode::S_IWUSR)
             .map_err(|_| MaterializationFailure::EnvironmentUnavailable)?;
-        token_output
-            .set_permissions(fs::Permissions::from_mode(0o600))
-            .and_then(|()| token_output.write_all(token))
-            .and_then(|()| token_output.flush())
-            .and_then(|()| token_output.rewind())
+        let acknowledgment = tempfile::Builder::new()
+            .prefix("source-ack-")
+            .tempfile_in(parent)
+            .map_err(|_| MaterializationFailure::EnvironmentUnavailable)?
+            .into_temp_path();
+        fs::remove_file(&acknowledgment)
             .map_err(|_| MaterializationFailure::EnvironmentUnavailable)?;
-        close_on_exec(&token_output)?;
+        mkfifo(
+            acknowledgment.to_path_buf().as_path(),
+            Mode::S_IRUSR | Mode::S_IWUSR,
+        )
+        .map_err(|_| MaterializationFailure::EnvironmentUnavailable)?;
+        let token = Arc::new(Mutex::new(ProviderSecret(token.to_vec())));
+        let stop = Arc::new(AtomicBool::new(false));
+        let path = fifo.to_path_buf();
+        let ack_path = acknowledgment.to_path_buf();
+        let shared = Arc::clone(&token);
+        let halted = Arc::clone(&stop);
+        let worker = std::thread::Builder::new()
+            .name("runner-preparation-askpass".to_owned())
+            .spawn(move || {
+                while !halted.load(Ordering::Acquire) {
+                    let Ok(mut pipe) = fs::OpenOptions::new().write(true).open(&path) else {
+                        break;
+                    };
+                    if halted.load(Ordering::Acquire) {
+                        break;
+                    }
+                    let guard = shared
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if pipe
+                        .write_all(&guard.0)
+                        .and_then(|()| pipe.write_all(b"\n"))
+                        .is_err()
+                    {
+                        break;
+                    }
+                    drop(guard);
+                    drop(pipe);
+                    // The helper closes the token pipe before acknowledging.
+                    // Without this handshake a second write can race the
+                    // first reader's close and leave the next challenge dry.
+                    let Ok(mut ack) = fs::OpenOptions::new()
+                        .read(true)
+                        .custom_flags(libc::O_NONBLOCK)
+                        .open(&ack_path)
+                    else {
+                        break;
+                    };
+                    loop {
+                        if halted.load(Ordering::Acquire) {
+                            return;
+                        }
+                        let mut received = [0u8; 1];
+                        match ack.read(&mut received) {
+                            Ok(1) if received[0] == b'1' => break,
+                            Ok(0) | Err(_) => um_support::sleep(Duration::from_millis(10)),
+                            _ => return,
+                        }
+                    }
+                }
+            })
+            .map_err(|_| MaterializationFailure::EnvironmentUnavailable)?;
         Ok(Self {
             helper,
-            token: token_output,
-            token_length: token.len(),
+            fifo,
+            acknowledgment,
+            token,
+            stop,
+            worker: Some(worker),
         })
     }
 
@@ -1511,49 +1876,40 @@ impl EphemeralAskpass {
         &self.helper
     }
 
+    fn replace_token(&mut self, token: &[u8]) -> Result<(), MaterializationFailure> {
+        if token.is_empty() || token.contains(&b'\n') || token.contains(&b'\r') {
+            return Err(MaterializationFailure::ProviderUnavailable);
+        }
+        let mut current = self
+            .token
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        current.0.zeroize();
+        current.0 = token.to_vec();
+        Ok(())
+    }
+
     fn bind(&self, command: &mut Command) {
         command
             .env("GIT_ASKPASS", self.helper_path())
             .env("GIT_ASKPASS_REQUIRE", "force")
-            .env("UM_SOURCE_TOKEN_FD", self.token.as_raw_fd().to_string());
-        inherit_for_git_child(command, self.token.as_raw_fd());
+            .env("UM_SOURCE_TOKEN_FIFO", &self.fifo)
+            .env("UM_SOURCE_TOKEN_ACK", &self.acknowledgment);
     }
 }
 
 impl Drop for EphemeralAskpass {
     fn drop(&mut self) {
-        let zeros = vec![0_u8; self.token_length];
-        let _ = self
-            .token
-            .rewind()
-            .and_then(|()| self.token.write_all(&zeros))
-            .and_then(|()| self.token.flush());
-    }
-}
-
-fn close_on_exec(file: &File) -> Result<(), MaterializationFailure> {
-    fcntl(file, FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC))
-        .map(|_| ())
-        .map_err(|_| MaterializationFailure::EnvironmentUnavailable)
-}
-
-#[allow(
-    unsafe_code,
-    reason = "the pre-exec hook prepares only the assignment-owned token descriptor"
-)]
-fn inherit_for_git_child(command: &mut Command, descriptor: libc::c_int) {
-    // SAFETY: `lseek` and `fcntl(F_SETFD)` are async-signal-safe, the descriptor
-    // remains open through spawn, and the closure performs no allocation or
-    // process-global work.
-    unsafe {
-        command.pre_exec(move || {
-            if libc::lseek(descriptor, 0, libc::SEEK_SET) == -1
-                || libc::fcntl(descriptor, libc::F_SETFD, 0) == -1
-            {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
+        self.stop.store(true, Ordering::Release);
+        // A nonblocking reader wakes the writer at open even if Git exited.
+        let wake = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(&self.fifo);
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+        drop(wake);
     }
 }
 
@@ -1569,6 +1925,7 @@ pub(super) mod test_support {
     ) -> ProviderCredential {
         ProviderCredential {
             repository_url: Arc::from(repository_url),
+            canonical_repository_url: None,
             token: ProviderSecret(token.as_bytes().to_vec()),
             expires_at: OffsetDateTime::UNIX_EPOCH + Duration::from_secs(3600),
         }
@@ -1722,10 +2079,11 @@ pub(super) mod test_support {
 mod tests {
     use std::collections::BTreeMap;
     use std::ffi::OsString;
+    use std::fs::File;
     use std::io::{Read as _, Write as _};
     use std::net::{TcpListener, TcpStream};
     use std::os::unix::ffi::OsStrExt as _;
-    use std::os::unix::fs::PermissionsExt as _;
+    use std::os::unix::fs::{FileTypeExt as _, PermissionsExt as _};
     use std::process::Command;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Mutex, mpsc};
@@ -2173,8 +2531,10 @@ mod tests {
             .as_bytes()
             .windows(needle.len())
             .any(|bytes| bytes == needle)
-            || fs::read(path)
-                .is_ok_and(|contents| contents.windows(needle.len()).any(|bytes| bytes == needle))
+            || (fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_file())
+                && fs::read(path).is_ok_and(|contents| {
+                    contents.windows(needle.len()).any(|bytes| bytes == needle)
+                }))
     }
 
     fn tree_contains(root: &Path, needle: &[u8]) -> bool {
@@ -2466,7 +2826,7 @@ mod tests {
     }
 
     #[test]
-    fn askpass_uses_a_named_executable_with_an_anonymous_inherited_token() {
+    fn askpass_serves_rotated_tokens_without_writing_a_secret_file() {
         const TOKEN: &[u8] = b"synthetic-provider-token";
         let private = tempfile::tempdir().unwrap();
         let askpass = EphemeralAskpass::create(private.path(), TOKEN).unwrap();
@@ -2474,8 +2834,26 @@ mod tests {
             .unwrap()
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
-        assert_eq!(private_entries.len(), 1);
-        assert_eq!(private_entries[0].path(), askpass.helper_path());
+        assert_eq!(private_entries.len(), 3);
+        assert!(
+            private_entries
+                .iter()
+                .any(|entry| entry.path() == askpass.helper_path())
+        );
+        assert!(
+            private_entries
+                .iter()
+                .any(|entry| entry.path() == askpass.fifo.to_path_buf())
+        );
+        assert!(
+            private_entries
+                .iter()
+                .any(|entry| entry.path() == askpass.acknowledgment.to_path_buf())
+        );
+        assert_eq!(
+            fs::metadata(&askpass.fifo).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
         assert_eq!(
             fs::metadata(askpass.helper_path())
                 .unwrap()
@@ -2484,13 +2862,13 @@ mod tests {
                 & 0o777,
             0o500
         );
+        assert!(
+            fs::symlink_metadata(&askpass.fifo)
+                .unwrap()
+                .file_type()
+                .is_fifo()
+        );
         assert!(!path_contains(askpass.helper_path(), TOKEN));
-        let unrelated = Command::new("sh")
-            .args(["-c", "test ! -e /dev/fd/$TOKEN_FD"])
-            .env("TOKEN_FD", askpass.token.as_raw_fd().to_string())
-            .status()
-            .unwrap();
-        assert!(unrelated.success());
         let provider_git = git_command(
             private.path(),
             &fixture_environment(),
@@ -2511,6 +2889,12 @@ mod tests {
 
         assert!(output.status.success());
         assert_eq!(output.stdout, b"synthetic-provider-token\n");
+        let mut askpass = askpass;
+        askpass.replace_token(b"replacement-grant").unwrap();
+        let mut second = Command::new(askpass.helper_path());
+        second.arg("Password for repository");
+        askpass.bind(&mut second);
+        assert_eq!(second.output().unwrap().stdout, b"replacement-grant\n");
         drop(askpass);
         assert_eq!(fs::read_dir(private.path()).unwrap().count(), 0);
     }
@@ -2695,6 +3079,16 @@ mod tests {
         assert!(
             workflow_environment
                 .variable(OsStr::new("UM_SOURCE_TOKEN_FD"))
+                .is_none()
+        );
+        assert!(
+            workflow_environment
+                .variable(OsStr::new("UM_SOURCE_TOKEN_FIFO"))
+                .is_none()
+        );
+        assert!(
+            workflow_environment
+                .variable(OsStr::new("UM_SOURCE_TOKEN_ACK"))
                 .is_none()
         );
         let context = ExecutionContext::new(
@@ -3370,6 +3764,116 @@ mod tests {
         .unwrap()
     }
 
+    // REQ-WORKSPACE-21: the broker's canonical provider URL cannot select the
+    // Git transport target. The broker's public Cloud origin and the exact
+    // assignment path (not the private runner socket origin) are authoritative.
+    #[test]
+    fn gitlab_grant_uses_only_the_assignment_cloud_read_url() {
+        let assignment = "asn_01k0z6r1w8f4jy2m7q9v3x5abc";
+        for valid in [true, false] {
+            let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            let endpoint = Url::parse(&format!(
+                "ws://{}/v1/runner/connect",
+                listener.local_addr().unwrap()
+            ))
+            .unwrap();
+            let mut expected = Url::parse(&format!(
+                "https://cloud.example/v1/runner/git-read/{assignment}/repository.git"
+            ))
+            .unwrap();
+            if !valid {
+                expected
+                    .set_path("/v1/runner/git-read/asn_01k0z6r1w8f4jy2m7q9v3x5abd/repository.git");
+            }
+            let expires = (um_support::utc_now() + time::Duration::minutes(5))
+                .format(&Rfc3339)
+                .unwrap();
+            let response = format!(
+                r#"{{"schemaVersion":1,"repositoryUrl":"https://gitlab.com/group/sub/project.git","readUrl":"{expected}","token":"grg_01k0z6r1w8f4jy2m7q9v3x5abc.{}","expiresAt":"{expires}"}}"#,
+                "a".repeat(43)
+            );
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let _ = read_source_broker_request(&mut stream);
+                write_source_broker_response(&mut stream, "200 OK", "", &response);
+            });
+            let broker = http_source_broker(&endpoint);
+            let result = broker.issue(assignment, &CaptureCancellation::default());
+            if valid {
+                let grant = result.unwrap();
+                assert_eq!(
+                    grant.canonical_repository_url.as_deref(),
+                    Some("https://gitlab.com/group/sub/project.git")
+                );
+                assert_eq!(grant.repository_url.as_ref(), expected.as_str());
+            } else {
+                assert_eq!(
+                    result.unwrap_err(),
+                    CredentialBrokerFailure::InvalidResponse
+                );
+            }
+            server.join().unwrap();
+        }
+    }
+
+    // REQ-WORKSPACE-34: a partial GitLab checkout that never reached workflow
+    // installation must not retain the relay remote on a failed preparation.
+    #[test]
+    fn failed_gitlab_preparation_restores_only_its_own_remote() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("checkout");
+        initialize_repository(&root, "sha1");
+        let environment = EnvironmentSnapshot::new([("PATH", std::env::var_os("PATH").unwrap())]);
+        let relay: Arc<str> = Arc::from(
+            "https://cloud.example/v1/runner/git-read/asn_01k0z6r1w8f4jy2m7q9v3x5abc/repository.git",
+        );
+        let canonical: Arc<str> = Arc::from("https://gitlab.com/group/sub/project.git");
+        run_fixture_git(&root, &["remote", "add", "origin", &relay]);
+        let guard = PreparationOriginCleanup {
+            root: root.clone(),
+            environment: environment.clone(),
+            relay: Arc::clone(&relay),
+            canonical: Arc::clone(&canonical),
+            installed: false,
+        };
+        drop(guard);
+        let origin = isolated_git_command(&root, &environment)
+            .args(["remote", "get-url", "origin"])
+            .output()
+            .unwrap();
+        assert!(origin.status.success());
+        assert_eq!(
+            String::from_utf8(origin.stdout).unwrap().trim(),
+            canonical.as_ref()
+        );
+
+        // A step-authored remote must not be rewritten by the preparation guard.
+        run_fixture_git(
+            &root,
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                "https://example.org/work.git",
+            ],
+        );
+        drop(PreparationOriginCleanup {
+            root: root.clone(),
+            environment: environment.clone(),
+            relay: Arc::clone(&relay),
+            canonical: Arc::clone(&canonical),
+            installed: false,
+        });
+        let origin = isolated_git_command(&root, &environment)
+            .args(["remote", "get-url", "origin"])
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8(origin.stdout).unwrap().trim(),
+            "https://example.org/work.git"
+        );
+    }
+
     #[test]
     fn repository_url_validation_uses_the_injected_policy() {
         let repository = tempfile::tempdir().unwrap();
@@ -3631,10 +4135,13 @@ mod tests {
         let revocation = broker
             .revoke_workflow_git("asn_01k0z6r1w8f4jy2m7q9v3x5abc", b"workflow-runtime-token")
             .unwrap();
-        assert_eq!(
-            revocation.outcome,
-            WorkflowGitRevocationOutcome::ResidualUntilExpiry
-        );
+        assert!(matches!(
+            revocation,
+            WorkflowGitRevocation::GitHub {
+                outcome: WorkflowGitRevocationOutcome::ResidualUntilExpiry,
+                ..
+            }
+        ));
         let revoke: serde_json::Value =
             serde_json::from_str(&revoke_request.recv().unwrap()).unwrap();
         assert_eq!(revoke["schemaVersion"], 1);
