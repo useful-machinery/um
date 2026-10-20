@@ -38,6 +38,9 @@
     "currentAttemptId": "atm_01k0z6r1w8f4jy2m7q9v3x5abd",
     "currentAttemptNumber": 2,
     "sourceBranch": "main",
+    "workspaceSource": null,
+    "workspaceBranch": null,
+    "workspaceMembership": null,
     "workflowDefinitionSource": {
       "repositoryConnectionId": "rpc_01k0z6r1w8f4jy2m7q9v3x5abc",
       "objectFormat": "sha1",

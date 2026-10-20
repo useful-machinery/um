@@ -515,41 +515,104 @@ fn decode_closed_publication(body: &[u8]) -> Result<Publication, PublicationFail
 fn decode_closed_publication_value(
     value: serde_json::Value,
 ) -> Result<Publication, PublicationFailure> {
-    require_closed_object(
-        &value,
+    let gitlab = match value
+        .get("providerKind")
+        .and_then(serde_json::Value::as_str)
+    {
+        Some("github") => false,
+        Some("gitlab") => true,
+        _ => return Err(PublicationFailure::protocol(false)),
+    };
+    let common = [
+        "id",
+        "organizationId",
+        "projectId",
+        "runId",
+        "artifactSetId",
+        "exportName",
+        "state",
+        "version",
+        "artifact",
+        "providerKind",
+        "target",
+        "branch",
+        "outcome",
+        "failure",
+        "actorPrincipalId",
+        "createdAt",
+        "updatedAt",
+        "startedAt",
+        "terminalAt",
+    ];
+    let variant: &[&str] = if gitlab {
         &[
-            "id",
-            "organizationId",
-            "projectId",
-            "runId",
-            "artifactSetId",
-            "exportName",
-            "state",
-            "version",
-            "artifact",
-            "target",
-            "pullRequestMetadata",
-            "branch",
-            "pullRequest",
-            "outcome",
-            "failure",
-            "actorPrincipalId",
-            "createdAt",
-            "updatedAt",
-            "startedAt",
-            "terminalAt",
-        ],
-    )?;
+            "providerActor",
+            "providerAuthorityGeneration",
+            "mergeRequestMetadata",
+            "mergeRequest",
+        ]
+    } else {
+        &["pullRequestMetadata", "pullRequest"]
+    };
+    let object = value
+        .as_object()
+        .ok_or_else(|| PublicationFailure::protocol(false))?;
+    if object.len() != common.len() + variant.len()
+        || !common
+            .iter()
+            .chain(variant.iter())
+            .all(|field| object.contains_key(*field))
+    {
+        return Err(PublicationFailure::protocol(false));
+    }
     require_closed_field(&value, "artifact", ARTIFACT_FIELDS, false)?;
-    require_closed_field(&value, "target", TARGET_FIELDS, false)?;
     require_closed_field(
         &value,
-        "pullRequestMetadata",
+        "target",
+        if gitlab {
+            GITLAB_TARGET_FIELDS
+        } else {
+            TARGET_FIELDS
+        },
+        false,
+    )?;
+    require_closed_field(
+        &value,
+        if gitlab {
+            "mergeRequestMetadata"
+        } else {
+            "pullRequestMetadata"
+        },
         PULL_REQUEST_METADATA_FIELDS,
         false,
     )?;
-    require_closed_field(&value, "branch", BRANCH_FIELDS, true)?;
-    require_closed_field(&value, "pullRequest", PULL_REQUEST_FIELDS, true)?;
+    require_closed_field(
+        &value,
+        "branch",
+        if gitlab {
+            GITLAB_BRANCH_FIELDS
+        } else {
+            BRANCH_FIELDS
+        },
+        true,
+    )?;
+    if gitlab {
+        require_closed_field(&value, "mergeRequest", MERGE_REQUEST_FIELDS, true)?;
+        if !value["providerActor"].is_null() {
+            require_closed_field(&value, "providerActor", ACTOR_FIELDS, false)?;
+        }
+        if value["providerActor"].is_null() != value["providerAuthorityGeneration"].is_null() {
+            return Err(PublicationFailure::protocol(false));
+        }
+        if value["branch"].is_object() && !value["branch"]["createdBy"].is_null() {
+            require_closed_field(&value["branch"], "createdBy", ACTOR_FIELDS, false)?;
+        }
+        if value["mergeRequest"].is_object() {
+            require_closed_field(&value["mergeRequest"], "author", ACTOR_FIELDS, false)?;
+        }
+    } else {
+        require_closed_field(&value, "pullRequest", PULL_REQUEST_FIELDS, true)?;
+    }
     require_closed_failure(&value)?;
     serde_json::from_value(value).map_err(|_| PublicationFailure::protocol(false))
 }
@@ -626,6 +689,27 @@ const TARGET_FIELDS: &[&str] = &[
     "baseBranch",
     "destinationBranch",
     "branchVersion",
+];
+const GITLAB_TARGET_FIELDS: &[&str] = &[
+    "repositoryConnectionId",
+    "providerRepositoryId",
+    "fullName",
+    "baseBranch",
+    "destinationBranch",
+    "branchVersion",
+    "gitlabConnectionId",
+    "instanceUrl",
+];
+const ACTOR_FIELDS: &[&str] = &["id", "username"];
+const GITLAB_BRANCH_FIELDS: &[&str] = &["headOid", "disposition", "url", "createdBy"];
+const MERGE_REQUEST_FIELDS: &[&str] = &[
+    "providerId",
+    "iid",
+    "url",
+    "disposition",
+    "state",
+    "author",
+    "sourceHeadOid",
 ];
 const PULL_REQUEST_METADATA_FIELDS: &[&str] =
     &["title", "body", "titleSource", "descriptionSource"];
@@ -739,7 +823,7 @@ fn validate_publication(
     requested_export_name: Option<&str>,
     requested_publication_id: Option<&str>,
 ) -> Result<(), PublicationFailure> {
-    use models::publication::{Outcome, State};
+    use models::publication::{Outcome, ProviderKind, State};
 
     let created_at = timestamp(&publication.created_at)?;
     let updated_at = timestamp(&publication.updated_at)?;
@@ -771,7 +855,45 @@ fn validate_publication(
         && um_support::is_lowercase_hex(&publication.artifact.head_oid, 40)
         && um_support::is_lowercase_hex(&publication.artifact.tree_oid, 40)
         && valid_provider_id(&publication.target.provider_repository_id)
-        && valid_repository_full_name(&publication.target.full_name)
+        && if publication.provider_kind == ProviderKind::Gitlab {
+            (3..=8192).contains(&publication.target.full_name.chars().count())
+                && publication.target.full_name.split('/').count() >= 2
+                && publication.target.full_name.split('/').all(|part| {
+                    !matches!(part, "" | "." | "..")
+                        && part.bytes().all(|byte| {
+                            byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-')
+                        })
+                })
+                && publication
+                    .target
+                    .gitlab_connection_id
+                    .as_ref()
+                    .is_some_and(|id| um_support::valid_typed_id(id, "glc_"))
+                && publication.target.instance_url.is_some()
+                && publication.target.branch_version == 2
+                && match (
+                    &publication.provider_actor,
+                    &publication.provider_authority_generation,
+                ) {
+                    (Some(Some(actor)), Some(Some(generation))) => {
+                        valid_provider_id(&actor.id)
+                            && !actor.username.is_empty()
+                            && *generation > 0
+                    }
+                    (Some(None), Some(None)) => true,
+                    _ => false,
+                }
+                && publication.pull_request_metadata.is_none()
+                && publication.pull_request.is_none()
+        } else {
+            valid_repository_full_name(&publication.target.full_name)
+                && publication.target.gitlab_connection_id.is_none()
+                && publication.target.instance_url.is_none()
+                && publication.provider_actor.is_none()
+                && publication.provider_authority_generation.is_none()
+                && publication.merge_request_metadata.is_none()
+                && publication.merge_request.is_none()
+        }
         && valid_bounded_string(&publication.target.base_branch, 1, 1024)
         && match publication.target.branch_version {
             1 => {
@@ -785,83 +907,195 @@ fn validate_publication(
             _ => false,
         }
         && valid_bounded_string(&publication.target.destination_branch, 1, 1024)
-        && valid_bounded_string(&publication.pull_request_metadata.title, 1, 256)
-        && valid_bounded_string(&publication.pull_request_metadata.body, 1, 65_536)
+        && if publication.provider_kind == ProviderKind::Gitlab {
+            publication
+                .merge_request_metadata
+                .as_deref()
+                .is_some_and(|metadata| {
+                    valid_bounded_string(&metadata.title, 1, 255)
+                        && (metadata.title.to_ascii_lowercase().starts_with("draft:")
+                            || metadata.title.to_ascii_lowercase().starts_with("[draft]")
+                            || metadata.title.to_ascii_lowercase().starts_with("(draft)"))
+                        && (1..=16384).contains(&metadata.body.len())
+                        && metadata
+                            .body
+                            .lines()
+                            .all(|line| !line.trim_start().starts_with('/'))
+                })
+        } else {
+            publication
+                .pull_request_metadata
+                .as_deref()
+                .is_some_and(|metadata| {
+                    valid_bounded_string(&metadata.title, 1, 256)
+                        && valid_bounded_string(&metadata.body, 1, 65_536)
+                })
+        }
         && updated_at >= created_at
         && expires_at > created_at
         && started_at.is_none_or(|started| started >= created_at && started <= updated_at)
         && terminal_at.is_none_or(|terminal| {
             started_at.is_some_and(|started| terminal >= started && terminal <= updated_at)
         });
-    let receipts_valid = publication
-        .branch
-        .as_deref()
-        .is_none_or(|branch| valid_branch(branch, &publication.artifact.head_oid))
+    let receipts_valid = publication.branch.as_deref().is_none_or(|branch| {
+        valid_branch(branch, &publication.artifact.head_oid)
+            && if publication.provider_kind == ProviderKind::Gitlab {
+                branch.created_by.is_some()
+            } else {
+                branch.created_by.is_none()
+            }
+    }) && publication
+        .pull_request
+        .as_ref()
+        .and_then(Option::as_deref)
+        .is_none_or(valid_pull_request)
         && publication
+            .merge_request
+            .as_ref()
+            .and_then(Option::as_deref)
+            .is_none_or(|mr| {
+                valid_provider_id(&mr.provider_id)
+                    && mr.iid >= 1
+                    && valid_https_url(&mr.url)
+                    && valid_provider_id(&mr.author.id)
+                    && !mr.author.username.is_empty()
+                    && mr.source_head_oid == publication.artifact.head_oid
+            })
+        && (publication
             .pull_request
-            .as_deref()
-            .is_none_or(valid_pull_request)
-        && (publication.pull_request.is_none() || publication.branch.is_some());
-    let lifecycle_valid = match publication.state {
-        State::Queued => {
-            started_at.is_none()
-                && terminal_at.is_none()
-                && publication.branch.is_none()
-                && publication.pull_request.is_none()
-                && publication.outcome.is_none()
-                && publication.failure.is_none()
-        }
-        State::Running => {
-            started_at.is_some()
-                && terminal_at.is_none()
-                && publication.outcome.is_none()
-                && publication.failure.is_none()
-        }
-        State::Succeeded => {
-            terminal_at.is_some()
-                && publication.failure.is_none()
-                && match publication.outcome {
-                    Some(Outcome::NoChanges) => {
-                        publication.branch.is_none() && publication.pull_request.is_none()
+            .as_ref()
+            .is_none_or(Option::is_none)
+            || publication.branch.is_some())
+        && (publication
+            .merge_request
+            .as_ref()
+            .is_none_or(Option::is_none)
+            || publication.branch.is_some());
+    let lifecycle_valid =
+        match publication.state {
+            State::Queued => {
+                started_at.is_none()
+                    && terminal_at.is_none()
+                    && publication.branch.is_none()
+                    && publication
+                        .pull_request
+                        .as_ref()
+                        .is_none_or(Option::is_none)
+                    && publication
+                        .merge_request
+                        .as_ref()
+                        .is_none_or(Option::is_none)
+                    && publication.outcome.is_none()
+                    && publication.failure.is_none()
+            }
+            State::Running => {
+                started_at.is_some()
+                    && terminal_at.is_none()
+                    && publication.outcome.is_none()
+                    && publication.failure.is_none()
+            }
+            State::Succeeded => {
+                terminal_at.is_some()
+                    && publication.failure.is_none()
+                    && match publication.outcome {
+                        Some(Outcome::NoChanges) => {
+                            publication.branch.is_none()
+                                && publication
+                                    .pull_request
+                                    .as_ref()
+                                    .is_none_or(Option::is_none)
+                                && publication
+                                    .merge_request
+                                    .as_ref()
+                                    .is_none_or(Option::is_none)
+                        }
+                        Some(Outcome::PullRequestPublished)
+                            if publication.provider_kind == ProviderKind::Github =>
+                        {
+                            publication
+                                .pull_request
+                                .as_ref()
+                                .and_then(Option::as_deref)
+                                .is_some_and(|pull_request| {
+                                    publication.branch.is_some()
+                                        && pull_request.state
+                                            == models::publication_pull_request::State::Open
+                                })
+                        }
+                        Some(Outcome::PullRequestAlreadyMerged)
+                            if publication.provider_kind == ProviderKind::Github =>
+                        {
+                            publication
+                                .pull_request
+                                .as_ref()
+                                .and_then(Option::as_deref)
+                                .is_some_and(|pull_request| {
+                                    publication.branch.is_some()
+                                        && pull_request.state
+                                            == models::publication_pull_request::State::Merged
+                                })
+                        }
+                        Some(Outcome::MergeRequestPublished)
+                            if publication.provider_kind == ProviderKind::Gitlab =>
+                        {
+                            publication
+                                .merge_request
+                                .as_ref()
+                                .and_then(Option::as_deref)
+                                .is_some_and(|mr| {
+                                    mr.state == models::publication_merge_request::State::Open
+                                })
+                        }
+                        Some(Outcome::MergeRequestAlreadyMerged)
+                            if publication.provider_kind == ProviderKind::Gitlab =>
+                        {
+                            publication
+                                .merge_request
+                                .as_ref()
+                                .and_then(Option::as_deref)
+                                .is_some_and(|mr| {
+                                    mr.state == models::publication_merge_request::State::Merged
+                                })
+                        }
+                        _ => false,
                     }
-                    Some(Outcome::PullRequestPublished) => publication
-                        .pull_request
-                        .as_deref()
-                        .is_some_and(|pull_request| {
-                            publication.branch.is_some()
-                                && pull_request.state
-                                    == models::publication_pull_request::State::Open
-                        }),
-                    Some(Outcome::PullRequestAlreadyMerged) => publication
-                        .pull_request
-                        .as_deref()
-                        .is_some_and(|pull_request| {
-                            publication.branch.is_some()
-                                && pull_request.state
-                                    == models::publication_pull_request::State::Merged
-                        }),
-                    None => false,
-                }
-        }
-        State::Failed => {
-            terminal_at.is_some()
+            }
+            State::Failed => terminal_at.is_some()
                 && publication.outcome.is_none()
-                && publication.pull_request.is_none()
                 && publication
-                    .failure
-                    .as_deref()
-                    .is_some_and(valid_publication_failure)
+                    .pull_request
+                    .as_ref()
+                    .is_none_or(Option::is_none)
+                && publication
+                    .merge_request
+                    .as_ref()
+                    .is_none_or(Option::is_none)
+                && publication.failure.as_deref().is_some_and(|failure| {
+                    valid_publication_failure(failure, publication.provider_kind)
+                        && if publication.provider_kind == ProviderKind::Gitlab {
+                            failure.code != models::publication_failure::Code::PullRequestConflict
+                            && failure.code
+                                != models::publication_failure::Code::WorkflowFileChangeUnsupported
+                        } else {
+                            failure.phase != models::publication_failure::Phase::MergeRequest
+                                && !matches!(
+                                failure.code,
+                                models::publication_failure::Code::MergeRequestConflict
+                                    | models::publication_failure::Code::ProviderIdentityChanged
+                            )
+                        }
+                })
                 && publication.branch.as_deref().is_none_or(|_| {
                     publication.failure.as_deref().is_some_and(|failure| {
                         matches!(
                             failure.phase,
                             models::publication_failure::Phase::Branch
                                 | models::publication_failure::Phase::PullRequest
+                                | models::publication_failure::Phase::MergeRequest
                         ) && failure.code != models::publication_failure::Code::TargetBranchConflict
                     })
-                })
-        }
-    };
+                }),
+        };
     if identities_valid && snapshot_valid && receipts_valid && lifecycle_valid {
         Ok(())
     } else {
@@ -881,9 +1115,23 @@ fn valid_pull_request(pull_request: &models::PublicationPullRequest) -> bool {
         && valid_https_url(&pull_request.url)
 }
 
-fn valid_publication_failure(failure: &models::PublicationFailure) -> bool {
+fn valid_publication_failure(
+    failure: &models::PublicationFailure,
+    provider: models::publication::ProviderKind,
+) -> bool {
+    use models::publication::ProviderKind;
     use models::publication_failure::{Code, Phase};
 
+    let request_phase = if provider == ProviderKind::Gitlab {
+        Phase::MergeRequest
+    } else {
+        Phase::PullRequest
+    };
+    // The public union admits the GitLab effect vocabulary even though this
+    // release's worker can only settle its provider-free preflight refusal.
+    if provider == ProviderKind::Gitlab && failure.phase == Phase::PullRequest {
+        return false;
+    }
     let expected_retryable = match failure.code {
         Code::ArtifactExpired
         | Code::ArtifactInvalid
@@ -897,6 +1145,8 @@ fn valid_publication_failure(failure: &models::PublicationFailure) -> bool {
         | Code::ProviderPermissionUnavailable
         | Code::TargetBranchConflict
         | Code::PullRequestConflict
+        | Code::MergeRequestConflict
+        | Code::ProviderIdentityChanged
         | Code::ProviderUnavailable => Some(true),
         Code::InternalPublicationFailure => None,
     };
@@ -908,17 +1158,20 @@ fn valid_publication_failure(failure: &models::PublicationFailure) -> bool {
         | Code::BaseBranchUnavailable
         | Code::BaseBranchIncompatible => failure.phase == Phase::Preflight,
         Code::ActorAuthorityLost | Code::ProjectRepositoryChanged => {
-            matches!(failure.phase, Phase::Branch | Phase::PullRequest)
+            failure.phase == Phase::Branch || failure.phase == request_phase
         }
-        Code::ProviderPermissionUnavailable | Code::ProviderUnavailable => matches!(
-            failure.phase,
-            Phase::Preflight | Phase::Branch | Phase::PullRequest
-        ),
+        Code::ProviderPermissionUnavailable | Code::ProviderUnavailable => {
+            matches!(failure.phase, Phase::Preflight | Phase::Branch)
+                || failure.phase == request_phase
+        }
         Code::TargetBranchConflict => failure.phase == Phase::Branch,
         Code::PullRequestConflict => failure.phase == Phase::PullRequest,
-        Code::ProviderRejected => {
-            matches!(failure.phase, Phase::Branch | Phase::PullRequest)
-        }
+        Code::MergeRequestConflict => failure.phase == Phase::MergeRequest,
+        Code::ProviderIdentityChanged => matches!(
+            failure.phase,
+            Phase::Preflight | Phase::Branch | Phase::MergeRequest
+        ),
+        Code::ProviderRejected => failure.phase == Phase::Branch || failure.phase == request_phase,
         Code::InternalPublicationFailure => true,
     };
     phase_valid && expected_retryable.is_none_or(|expected| failure.retryable == expected)

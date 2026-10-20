@@ -2,6 +2,15 @@ use super::*;
 
 #[tokio::test]
 async fn retained_cloud_git_work_survives_continuation_and_captures_original_baseline() {
+    exercise_retained_cloud_git_continuation(false).await;
+}
+
+#[tokio::test]
+async fn v3_continuation_executes_in_claimed_workspace_not_definition_checkout() {
+    exercise_retained_cloud_git_continuation(true).await;
+}
+
+async fn exercise_retained_cloud_git_continuation(v3: bool) {
     let workflow = r#"schemaVersion: 1
 steps:
   edit:
@@ -28,11 +37,32 @@ exports:
     resolve(&source_fixture_path(&manager), Path::new("workflow.yaml")).unwrap();
     let mut initial = offer("bg");
     align_offer_with_source_fixture(&manager, &mut initial);
+    if v3 {
+        let source = source_fixture_path(&manager);
+        fs::write(source.join("workflow.yaml"), "not: a workflow\n").unwrap();
+        run_fixture_git(&source, &["add", "workflow.yaml"]);
+        run_fixture_git(&source, &["commit", "--quiet", "-m", "workspace revision"]);
+        initial.execution_spec.primary_workspace_source.commit_oid =
+            run_fixture_git(&source, &["rev-parse", "HEAD"]);
+    }
     let baseline = initial
         .execution_spec
         .primary_workspace_source
         .commit_oid
         .clone();
+    if v3 {
+        let spec = v3_spec();
+        let mut membership = spec.workspace_membership.unwrap();
+        membership.workspace_commit_oid = baseline.clone();
+        membership.witness.tip_oid = baseline.clone();
+        membership.witness.reference =
+            format!("refs/heads/{}", initial.execution_spec.source_branch);
+        initial.execution_spec.schema_version = 3;
+        initial.execution_spec.source_display_snapshot = spec.source_display_snapshot;
+        initial.execution_spec.workspace_branch =
+            Some(initial.execution_spec.source_branch.clone());
+        initial.execution_spec.workspace_membership = Some(membership);
+    }
     manager.handle_offer(initial.clone()).unwrap();
     prepare_current(&mut manager, &initial).await;
     let workspace = match &mut manager.slot {

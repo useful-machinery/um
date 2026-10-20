@@ -46,6 +46,16 @@ pub(super) trait SourceCredentialBroker: Send + Sync {
         cancellation: &CaptureCancellation,
     ) -> Result<CommitAvailability, CredentialBrokerFailure>;
 
+    fn definition_commit_availability(
+        &self,
+        _assignment_id: &str,
+        _cancellation: &CaptureCancellation,
+    ) -> Result<CommitAvailability, CredentialBrokerFailure> {
+        // An adapter without role support must never verify the workspace
+        // pin to classify failure of a different definition pin.
+        Err(CredentialBrokerFailure::Unavailable)
+    }
+
     fn revoke_preparation(
         &self,
         _assignment_id: &str,
@@ -304,6 +314,7 @@ impl HttpSourceCredentialBroker {
         assignment_id: &str,
         retry_cancellation: &CaptureCancellation,
         request_cancellation: &CaptureCancellation,
+        source_role: Option<&str>,
     ) -> Result<BrokerResponse, CredentialBrokerFailure> {
         loop {
             let response = self.request_current_once(
@@ -311,6 +322,7 @@ impl HttpSourceCredentialBroker {
                 assignment_id,
                 retry_cancellation,
                 request_cancellation,
+                source_role,
             )?;
             let Some(retry_after) = response.retry_after else {
                 return Ok(response);
@@ -325,15 +337,20 @@ impl HttpSourceCredentialBroker {
         assignment_id: &str,
         retry_cancellation: &CaptureCancellation,
         request_cancellation: &CaptureCancellation,
+        source_role: Option<&str>,
     ) -> Result<BrokerResponse, CredentialBrokerFailure> {
         ensure_broker_current(retry_cancellation)?;
-        let body = serde_json::to_vec(&serde_json::json!({
+        let mut request = serde_json::json!({
             "schemaVersion": 1,
             "bootId": self.boot_id.as_ref(),
             "assignmentId": assignment_id,
-        }))
-        .map(ProviderSecret)
-        .map_err(|_| CredentialBrokerFailure::Unavailable)?;
+        });
+        if let Some(role) = source_role {
+            request["sourceRole"] = serde_json::json!(role);
+        }
+        let body = serde_json::to_vec(&request)
+            .map(ProviderSecret)
+            .map_err(|_| CredentialBrokerFailure::Unavailable)?;
         self.request_encoded(endpoint, body, Some(request_cancellation))
     }
 
@@ -465,6 +482,7 @@ impl HttpSourceCredentialBroker {
             assignment_id,
             retry_cancellation,
             request_cancellation,
+            None,
         )?;
         match response.status {
             StatusCode::CONFLICT => return Err(CredentialBrokerFailure::Fenced),
@@ -622,12 +640,14 @@ impl HttpSourceCredentialBroker {
         &self,
         assignment_id: &str,
         cancellation: &CaptureCancellation,
+        source_role: Option<&str>,
     ) -> Result<CommitAvailability, CredentialBrokerFailure> {
         let response = self.request_current(
             &self.availability_endpoint,
             assignment_id,
             cancellation,
             cancellation,
+            source_role,
         )?;
         match response.status {
             StatusCode::CONFLICT => return Err(CredentialBrokerFailure::Fenced),
@@ -674,7 +694,24 @@ impl SourceCredentialBroker for HttpSourceCredentialBroker {
         let assignment_id = assignment_id.to_owned();
         let worker_cancellation = cancellation.clone();
         run_broker_worker("runner-source-verification", cancellation, move || {
-            broker.commit_availability_current(&assignment_id, &worker_cancellation)
+            broker.commit_availability_current(&assignment_id, &worker_cancellation, None)
+        })
+    }
+
+    fn definition_commit_availability(
+        &self,
+        assignment_id: &str,
+        cancellation: &CaptureCancellation,
+    ) -> Result<CommitAvailability, CredentialBrokerFailure> {
+        let broker = self.clone();
+        let assignment_id = assignment_id.to_owned();
+        let worker_cancellation = cancellation.clone();
+        run_broker_worker("runner-definition-verification", cancellation, move || {
+            broker.commit_availability_current(
+                &assignment_id,
+                &worker_cancellation,
+                Some("definition"),
+            )
         })
     }
 
@@ -844,6 +881,7 @@ pub(super) struct MaterializationRequest {
     commit_oid: String,
     workflow_path: String,
     workflow_source_closure_digest: WorkflowSourceClosureDigest,
+    definition_role: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -867,7 +905,15 @@ impl MaterializationRequest {
                 algorithm: workflow.workflow_source_closure_digest.algorithm.clone(),
                 value: workflow.workflow_source_closure_digest.value.clone(),
             },
+            definition_role: execution_spec.schema_version == 3,
         }
+    }
+
+    pub(super) fn for_workspace(&self, commit_oid: &str) -> Self {
+        let mut workspace = self.clone();
+        workspace.commit_oid = commit_oid.to_owned();
+        workspace.definition_role = false;
+        workspace
     }
 }
 
@@ -980,7 +1026,7 @@ pub(super) fn checkout(
             revocation_failure: &mut revocation_failure,
             cancellation,
         };
-        fetch_pinned_commit(source_root, environment, &mut git, &request.commit_oid)?;
+        fetch_pinned_commit(source_root, environment, &mut git, request)?;
         Ok::<(), MaterializationFailure>(())
     })();
     // A Git request can read the previous grant concurrently with renewal;
@@ -1058,12 +1104,20 @@ pub(super) fn resolve_checkout(
     checkout: MaterializedCheckout,
     cancellation: &CaptureCancellation,
 ) -> Result<MaterializedSource, MaterializationFailure> {
+    let definition_root = checkout.source_root.clone();
+    resolve_definition_checkout(checkout, &definition_root, cancellation)
+}
+
+// Only the private definition checkout is read for YAML and static closure bytes;
+// the primary checkout remains the execution and Git capture root.
+pub(super) fn resolve_definition_checkout(
+    checkout: MaterializedCheckout,
+    definition_root: &Path,
+    cancellation: &CaptureCancellation,
+) -> Result<MaterializedSource, MaterializationFailure> {
     ensure_current(cancellation)?;
-    let workflow = resolve(
-        &checkout.source_root,
-        Path::new(&checkout.request.workflow_path),
-    )
-    .map_err(|_| MaterializationFailure::WorkflowUnavailable)?;
+    let workflow = resolve(definition_root, Path::new(&checkout.request.workflow_path))
+        .map_err(|_| MaterializationFailure::WorkflowUnavailable)?;
     ensure_current(cancellation)?;
     if workflow.source.workflow_path != checkout.request.workflow_path {
         return Err(MaterializationFailure::WorkflowUnavailable);
@@ -1211,8 +1265,9 @@ fn fetch_pinned_commit(
     root: &Path,
     environment: &EnvironmentSnapshot,
     git: &mut PreparationGit<'_>,
-    commit_oid: &str,
+    request: &MaterializationRequest,
 ) -> Result<(), MaterializationFailure> {
+    let commit_oid = &request.commit_oid;
     if commit_is_available(root, environment, commit_oid, git.cancellation)? {
         return Ok(());
     }
@@ -1231,11 +1286,15 @@ fn fetch_pinned_commit(
     if status.success() {
         return Ok(());
     }
-    match git
-        .broker
-        .commit_availability(git.assignment_id, git.cancellation)
-        .map_err(map_broker_failure)?
-    {
+    let availability = if request.definition_role {
+        git.broker
+            .definition_commit_availability(git.assignment_id, git.cancellation)
+    } else {
+        git.broker
+            .commit_availability(git.assignment_id, git.cancellation)
+    }
+    .map_err(map_broker_failure)?;
+    match availability {
         CommitAvailability::CommitAvailable => Err(MaterializationFailure::ProviderUnavailable),
         CommitAvailability::CommitUnavailable => Err(MaterializationFailure::CommitUnavailable),
         CommitAvailability::RepositoryUnavailable => {
@@ -2109,6 +2168,7 @@ mod tests {
     enum FixtureBrokerCall {
         Checkout,
         CommitAvailability,
+        DefinitionCommitAvailability,
     }
 
     struct FixtureBroker {
@@ -2139,6 +2199,19 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push(FixtureBrokerCall::CommitAvailability);
+            Ok(self.availability)
+        }
+
+        fn definition_commit_availability(
+            &self,
+            _assignment_id: &str,
+            cancellation: &CaptureCancellation,
+        ) -> Result<CommitAvailability, CredentialBrokerFailure> {
+            ensure_broker_current(cancellation)?;
+            self.calls
+                .lock()
+                .unwrap()
+                .push(FixtureBrokerCall::DefinitionCommitAvailability);
             Ok(self.availability)
         }
 
@@ -2802,6 +2875,7 @@ mod tests {
                 algorithm: "sha256".to_owned(),
                 value: fixture.digest.clone(),
             },
+            definition_role: false,
         }
     }
 
@@ -2900,6 +2974,68 @@ mod tests {
     }
 
     // REQ-WORKSPACE-13, REQ-WORKSPACE-14, REQ-WORKSPACE-17, REQ-WORKSPACE-18
+    #[test]
+    fn pinned_definition_does_not_read_workspace_yaml_or_static_files() {
+        let fixture = repository_fixture(
+            "schemaVersion: 1\nsteps:\n  original:\n    kind: cmd\n    command:\n      argv: [\"./script.sh\"]\n",
+        );
+        fs::write(fixture.repository.join("workflows/workflow.yaml"),
+            "schemaVersion: 1\nsteps:\n  replaced:\n    kind: cmd\n    command:\n      argv: [\"false\"]\n").unwrap();
+        fs::write(
+            fixture.repository.join("script.sh"),
+            b"#!/bin/sh\necho workspace\n",
+        )
+        .unwrap();
+        commit_repository(&fixture.repository);
+        let workspace_commit = String::from_utf8(
+            fixture_git_command()
+                .current_dir(&fixture.repository)
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_owned();
+        let (assignment, broker) = assignment_fixture(&fixture.repository);
+        let projection = projection(&fixture);
+        let cancellation = CaptureCancellation::default();
+        let definition_root = assignment.path().join("private/definition");
+        fs::create_dir(&definition_root).unwrap();
+        let definition_checkout = checkout(
+            broker.clone(),
+            &fixture_environment(),
+            "asn_01k0z6r1w8f4jy2m7q9v3x5abc",
+            &projection,
+            &cancellation,
+            &definition_root,
+            &assignment.path().join("private"),
+        )
+        .unwrap();
+        checkout(
+            broker,
+            &fixture_environment(),
+            "asn_01k0z6r1w8f4jy2m7q9v3x5abc",
+            &projection.for_workspace(&workspace_commit),
+            &cancellation,
+            &assignment.path().join("source"),
+            &assignment.path().join("private"),
+        )
+        .unwrap();
+        let workflow = resolve_checkout(definition_checkout, &cancellation).unwrap();
+        assert!(workflow.workflow.definition.steps.contains_key("original"));
+        assert!(!workflow.workflow.definition.steps.contains_key("replaced"));
+        assert_eq!(
+            fs::read(assignment.path().join("source/script.sh")).unwrap(),
+            b"#!/bin/sh\necho workspace\n"
+        );
+        assert_eq!(
+            fs::read_to_string(assignment.path().join("source/workflows/workflow.yaml")).unwrap(),
+            "schemaVersion: 1\nsteps:\n  replaced:\n    kind: cmd\n    command:\n      argv: [\"false\"]\n"
+        );
+    }
+
     #[test]
     fn materializes_the_exact_detached_clean_commit_and_removes_credential_helpers() {
         const TOKEN: &str = "fixture-provider-token";
@@ -3534,6 +3670,36 @@ mod tests {
 
     // REQ-WORKSPACE-24
     #[test]
+    fn missing_definition_is_classified_against_definition_not_available_workspace() {
+        let (fixture, assignment, mut definition, broker) =
+            missing_commit_fixture(CommitAvailability::CommitUnavailable);
+        definition.definition_role = true;
+        // The same repository still contains the pinned workspace commit.
+        let workspace = definition.for_workspace(&fixture.commit);
+        let other_assignment = empty_assignment();
+        assert!(
+            checkout(
+                broker.clone(),
+                &fixture_environment(),
+                "asn_01k0z6r1w8f4jy2m7q9v3x5abc",
+                &workspace,
+                &CaptureCancellation::default(),
+                &other_assignment.path().join("source"),
+                &other_assignment.path().join("private"),
+            )
+            .is_ok()
+        );
+        assert_eq!(
+            materialization_result(&assignment, broker.clone(), &definition).map(|_| ()),
+            Err(MaterializationFailure::CommitUnavailable),
+        );
+        assert_eq!(
+            broker.calls.lock().unwrap().last(),
+            Some(&FixtureBrokerCall::DefinitionCommitAvailability)
+        );
+    }
+
+    #[test]
     fn available_commit_after_generic_fetch_failure_remains_retryable() {
         let (_fixture, assignment, projection, broker) =
             missing_commit_fixture(CommitAvailability::CommitAvailable);
@@ -3627,6 +3793,7 @@ mod tests {
                 algorithm: "sha256".to_owned(),
                 value: "0".repeat(64),
             },
+            definition_role: false,
         };
 
         assert!(matches!(
@@ -3934,6 +4101,26 @@ mod tests {
             records[0][crate::telemetry::attribute::ERROR_TYPE],
             "source_repository_unavailable"
         );
+    }
+
+    #[test]
+    fn definition_verification_requests_only_the_server_derived_role() {
+        let (endpoint, request, server) = source_broker_response_fixture(
+            "200 OK",
+            r#"{"schemaVersion":1,"availability":"commit_unavailable"}"#,
+        );
+        let broker = http_source_broker(&endpoint);
+        assert_eq!(
+            broker.definition_commit_availability(
+                "asn_01k0z6r1w8f4jy2m7q9v3x5abc",
+                &CaptureCancellation::default(),
+            ),
+            Ok(CommitAvailability::CommitUnavailable),
+        );
+        let body: serde_json::Value = serde_json::from_str(&request.recv().unwrap()).unwrap();
+        assert_eq!(body["sourceRole"], "definition");
+        assert!(body.get("commitOid").is_none());
+        server.join().unwrap();
     }
 
     #[derive(Clone, Copy)]

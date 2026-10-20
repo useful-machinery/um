@@ -64,6 +64,8 @@ pub struct CreateRunInput<'a> {
     pub project_id: &'a str,
     pub workflow_path: &'a str,
     pub source_branch: Option<&'a str>,
+    pub workspace_branch: Option<&'a str>,
+    pub workspace_commit: Option<&'a str>,
     pub display_name: Option<&'a str>,
     pub input_set_id: Option<&'a str>,
     pub publish_export: Option<&'a str>,
@@ -120,11 +122,40 @@ impl<'a> RunApi<'a> {
         input: CreateRunInput<'_>,
         begin_dispatch: impl Fn() -> bool,
     ) -> Result<RunCreationAcceptance, RunFailure> {
+        if input.workspace_branch.is_some() && input.workspace_commit.is_some()
+            || input
+                .workspace_branch
+                .is_some_and(|branch| branch.is_empty())
+            || input
+                .workspace_commit
+                .is_some_and(|commit| !lowercase_hex(commit, 40))
+        {
+            return Err(RunFailure::InvalidInput);
+        }
         let mut request = models::CreateRunRequest::new(
             input.project_id.to_owned(),
             input.workflow_path.to_owned(),
         );
         request.source_branch = input.source_branch.map(str::to_owned);
+        request.workspace_source = match (input.workspace_branch, input.workspace_commit) {
+            (Some(branch), None) => Some(Box::new(
+                models::WorkspaceSourceSelection::WorkspaceSourceSelectionOneOf(Box::new(
+                    models::WorkspaceSourceSelectionOneOf::new(
+                        models::workspace_source_selection_one_of::Kind::Branch,
+                        branch.to_owned(),
+                    ),
+                )),
+            )),
+            (None, Some(commit)) => Some(Box::new(
+                models::WorkspaceSourceSelection::WorkspaceSourceSelectionOneOf1(Box::new(
+                    models::WorkspaceSourceSelectionOneOf1::new(
+                        models::workspace_source_selection_one_of_1::Kind::Commit,
+                        commit.to_owned(),
+                    ),
+                )),
+            )),
+            (None, None) | (Some(_), Some(_)) => None,
+        };
         request.display_name = input.display_name.map(str::to_owned);
         request.input_set_id = input.input_set_id.map(|id| Some(id.to_owned()));
         request.publication = input
@@ -1185,6 +1216,54 @@ fn validate_run(run: Run, requested_run_id: &str) -> Result<Run, RunFailure> {
         && lowercase_hex(&workflow_source.workflow_source_closure_digest.value, 64)
         && um_support::valid_typed_id(&workspace_source.repository_connection_id, "rpc_")
         && lowercase_hex(&workspace_source.commit_oid, 40)
+        && workflow_source.repository_connection_id == workspace_source.repository_connection_id
+        && (match &run.workspace_membership {
+            Some(membership) => {
+                membership.repository_connection_id == workspace_source.repository_connection_id
+                    && membership.workspace_commit_oid == workspace_source.commit_oid
+                    && membership.change_request.as_deref().is_none_or(|change| {
+                        change.head_repository_id == membership.provider_repository_id
+                    })
+                    && membership
+                        .provider_repository_id
+                        .parse::<u64>()
+                        .is_ok_and(|id| id > 0)
+                    && membership.witness.r#ref.starts_with("refs/heads/")
+                    && membership.witness.r#ref.len() > "refs/heads/".len()
+                    && lowercase_hex(&membership.witness.tip_oid, 40)
+                    && match membership.witness.relationship {
+                        models::workspace_membership_witness::Relationship::Equal => {
+                            membership.witness.tip_oid == workspace_source.commit_oid
+                        }
+                        models::workspace_membership_witness::Relationship::Ancestor => {
+                            membership.witness.tip_oid != workspace_source.commit_oid
+                        }
+                    }
+                    && match run.workspace_source.as_deref() {
+                        None => run
+                            .workspace_branch
+                            .as_deref()
+                            .is_some_and(|branch| valid_bounded_string(branch, 1, 1024)),
+                        Some(models::WorkspaceSourceSelection::WorkspaceSourceSelectionOneOf(
+                            selection,
+                        )) => {
+                            run.workspace_branch.as_deref() == Some(selection.branch.as_str())
+                                && valid_bounded_string(&selection.branch, 1, 1024)
+                        }
+                        Some(models::WorkspaceSourceSelection::WorkspaceSourceSelectionOneOf1(
+                            selection,
+                        )) => {
+                            run.workspace_branch.is_none()
+                                && selection.commit_oid == workspace_source.commit_oid
+                        }
+                    }
+            }
+            None => {
+                workflow_source.commit_oid == workspace_source.commit_oid
+                    && run.workspace_source.is_none()
+                    && run.workspace_branch.is_none()
+            }
+        })
         && valid_source_display_snapshot(
             run.source_display_snapshot.as_deref(),
             workspace_source.provider_kind,
@@ -1843,6 +1922,73 @@ mod recovery_read_tests {
         envelope["run"]["observation"]["lastDecline"]["recoveryReason"] =
             serde_json::json!("unclassified");
         assert!(serde_json::from_value::<models::Run>(envelope["run"].clone()).is_err());
+    }
+
+    #[test]
+    fn historical_run_read_accepts_null_workspace_provenance() {
+        let document: serde_json::Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/run-continuation-pending.json"
+        ))
+        .unwrap();
+        let run = &document["run"];
+        let run_id = run["id"].as_str().unwrap();
+        assert!(run["workspaceBranch"].is_null());
+        assert!(run["workspaceMembership"].is_null());
+        let response = |run: &serde_json::Value| BufferedBlockingResponse {
+            status: StatusCode::OK,
+            content_type: Some(HeaderValue::from_static("application/json")),
+            idempotency_keys: vec![],
+            locations: vec![],
+            cache_controls: vec![HeaderValue::from_static(PRIVATE_CACHE_CONTROL)],
+            retry_afters: vec![],
+            body: serde_json::to_vec(run).unwrap(),
+        };
+        assert!(matches!(
+            decode_get_response(response(run), run_id),
+            Ok(RunRead::Materialized(_))
+        ));
+        let mut incompatible = run.clone();
+        incompatible["workspaceBranch"] = serde_json::json!("main");
+        assert!(matches!(
+            decode_get_response(response(&incompatible), run_id),
+            Err(RunFailure::Protocol { .. })
+        ));
+    }
+
+    #[test]
+    fn run_reader_binds_independent_workspace_selection_to_retained_membership() {
+        let mut document: serde_json::Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/run-continuation-pending.json"
+        ))
+        .unwrap();
+        let run = &mut document["run"];
+        let run_id = run["id"].as_str().unwrap().to_owned();
+        let workspace_oid = run["primaryWorkspaceSource"]["commitOid"].clone();
+        run["workspaceBranch"] = serde_json::json!("main");
+        run["workspaceMembership"] = serde_json::json!({
+            "repositoryConnectionId": "rpc_01k0z6r1w8f4jy2m7q9v3x5abc",
+            "providerKind": "github", "providerRepositoryId": "1234",
+            "objectFormat": "sha1", "workspaceCommitOid": workspace_oid,
+            "witness": {"ref":"refs/heads/main", "tipOid": workspace_oid,
+                "relationship":"equal", "observedAt":"2026-08-23T12:02:00Z"}
+        });
+        let valid = |value: &serde_json::Value| {
+            let run: models::Run = serde_json::from_value(value.clone()).unwrap();
+            validate_run(run, &run_id).is_ok()
+        };
+        assert!(valid(run)); // Schema 3's default workspace branch has no explicit selector.
+        run["workspaceSource"] = serde_json::json!({"kind":"branch", "branch":"other"});
+        assert!(!valid(run));
+        run["workspaceSource"] = serde_json::json!({"kind":"branch", "branch":"main"});
+        assert!(valid(run));
+        run["workspaceSource"] = serde_json::json!({"kind":"commit", "commitOid": workspace_oid});
+        run["workspaceBranch"] = serde_json::Value::Null;
+        assert!(valid(run));
+        run["workspaceMembership"]["witness"]["tipOid"] =
+            serde_json::json!("abcdef0123456789abcdef0123456789abcdef01");
+        assert!(!valid(run));
+        run["workspaceMembership"] = serde_json::Value::Null;
+        assert!(!valid(run));
     }
 
     #[test]

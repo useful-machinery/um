@@ -1485,6 +1485,9 @@ fn run_body_with_state(state: &str) -> serde_json::Value {
         "currentAttemptId": ATTEMPT_ID,
         "currentAttemptNumber": 2,
         "sourceBranch": "release/next",
+        "workspaceSource": null,
+        "workspaceBranch": null,
+        "workspaceMembership": null,
         "workflowDefinitionSource": {
             "repositoryConnectionId": REPOSITORY_CONNECTION_ID,
             "objectFormat": "sha1",
@@ -1566,6 +1569,7 @@ fn automatic_publication(outcome: &str) -> serde_json::Value {
         "projectId": PROJECT_ID, "runId": RUN_ID,
         "artifactSetId": "ats_01k0z6r1w8f4jy2m7q9v3x5abc",
         "exportName": "changes", "state": "succeeded", "version": 2,
+        "providerKind": "github",
         "artifact": {
             "artifactVersion": 1, "objectFormat": "sha1",
             "baseOid": "0123456789abcdef0123456789abcdef01234567",
@@ -2395,7 +2399,7 @@ fn cancellation_retry_can_observe_pending_receipt_with_prior_failed_attempt() {
         ],
         &deployment_environment(&server.api_url, &credential_path),
     );
-    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
     let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(result["outcome"], "settled");
     assert_eq!(result["run"]["state"], "cancelled");
@@ -2868,6 +2872,7 @@ fn human_run_observation_reports_failed_automatic_publication() {
         "projectId": PROJECT_ID, "runId": RUN_ID,
         "artifactSetId": "ats_01k0z6r1w8f4jy2m7q9v3x5abc",
         "exportName": "review", "state": "failed", "version": 2,
+        "providerKind": "github",
         "artifact": {
             "artifactVersion": 1, "objectFormat": "sha1",
             "baseOid": "0123456789abcdef0123456789abcdef01234567",
@@ -2973,6 +2978,7 @@ fn human_run_observation_reports_successful_automatic_publication_url() {
         "projectId": PROJECT_ID, "runId": RUN_ID,
         "artifactSetId": "ats_01k0z6r1w8f4jy2m7q9v3x5abc",
         "exportName": "review", "state": "succeeded", "version": 2,
+        "providerKind": "github",
         "artifact": {
             "artifactVersion": 1, "objectFormat": "sha1",
             "baseOid": "0123456789abcdef0123456789abcdef01234567",
@@ -3191,6 +3197,59 @@ fn run_wait_keeps_successful_execution_separate_from_failed_publication() {
             server.finish().len(),
             if operation == "create" { 3 } else { 2 }
         );
+    }
+}
+
+// REQ-PUBLISH-76: the run wait uses the same tagged failure decoder as publication show.
+#[test]
+fn run_wait_decodes_gitlab_merge_request_failure_phase() {
+    let mut run = run_body_with_state("succeeded");
+    run["publication"] = automatic_handoff("started");
+    let mut failed = automatic_publication("no_changes");
+    failed["providerKind"] = serde_json::json!("gitlab");
+    failed["target"]["fullName"] = serde_json::json!("group/subgroup/project");
+    failed["target"]["gitlabConnectionId"] = serde_json::json!("glc_01k0z6r1w8f4jy2m7q9v3x5abc");
+    failed["target"]["instanceUrl"] = serde_json::json!("https://gitlab.com");
+    failed["providerActor"] = serde_json::Value::Null;
+    failed["providerAuthorityGeneration"] = serde_json::Value::Null;
+    let metadata = failed
+        .as_object_mut()
+        .unwrap()
+        .remove("pullRequestMetadata")
+        .unwrap();
+    failed["mergeRequestMetadata"] = metadata;
+    failed["mergeRequestMetadata"]["title"] = serde_json::json!("Draft: Review");
+    failed.as_object_mut().unwrap().remove("pullRequest");
+    failed["mergeRequest"] = serde_json::Value::Null;
+    failed["state"] = serde_json::json!("failed");
+    failed["outcome"] = serde_json::Value::Null;
+    failed["failure"] = serde_json::json!({"phase": "merge_request", "code": "provider_unavailable", "retryable": true});
+    for (phase, valid) in [("merge_request", true), ("pull_request", false)] {
+        failed["failure"]["phase"] = serde_json::json!(phase);
+        let (server, _directory, credential_path) = prepared_run(vec![
+            run_response(run.clone()),
+            publication_response(failed.clone()),
+        ]);
+        let output = run_with_env(
+            &[
+                "run",
+                "show",
+                ORGANIZATION,
+                RUN_ID,
+                "--wait",
+                "--json",
+                "--allow-insecure-http",
+            ],
+            &deployment_environment(&server.api_url, &credential_path),
+        );
+        if valid {
+            let document: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(output.status.code(), Some(0));
+            assert_eq!(document["publication"]["failure"]["phase"], "merge_request");
+        } else {
+            assert_invalid_response(&output);
+        }
+        server.finish();
     }
 }
 

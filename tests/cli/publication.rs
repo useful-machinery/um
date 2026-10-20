@@ -66,6 +66,7 @@ fn publication_body() -> serde_json::Value {
         "runId": RUN_ID,
         "artifactSetId": ARTIFACT_SET_ID,
         "exportName": EXPORT_NAME,
+        "providerKind": "github",
         "state": "queued",
         "version": 1,
         "artifact": {
@@ -99,6 +100,123 @@ fn publication_body() -> serde_json::Value {
         "startedAt": null,
         "terminalAt": null
     })
+}
+
+fn gitlab_publication_body() -> serde_json::Value {
+    let mut body = publication_body();
+    body["providerKind"] = serde_json::json!("gitlab");
+    body["providerActor"] = serde_json::Value::Null;
+    body["providerAuthorityGeneration"] = serde_json::Value::Null;
+    body["target"]["fullName"] = serde_json::json!("group/subgroup/repository");
+    body["target"]["gitlabConnectionId"] = serde_json::json!("glc_01k0z6r1w8f4jy2m7q9v3x5abc");
+    body["target"]["instanceUrl"] = serde_json::json!("https://gitlab.com");
+    let old = body
+        .as_object_mut()
+        .unwrap()
+        .remove("pullRequestMetadata")
+        .unwrap();
+    body.as_object_mut().unwrap().remove("pullRequest");
+    body["mergeRequestMetadata"] = old;
+    body["mergeRequestMetadata"]["title"] = serde_json::json!("Draft: changes");
+    body["mergeRequest"] = serde_json::Value::Null;
+    body
+}
+
+// REQ-PUBLISH-75, REQ-PUBLISH-76
+#[test]
+fn publication_commands_decode_gitlab_and_reject_mixed_variants() {
+    let body = gitlab_publication_body();
+    let (server, _directory, credential_path) =
+        prepared_publication(vec![accepted_response(&body)]);
+    let output = run_with_env(
+        &create_args(true, true),
+        &deployment_environment(&server.api_url, &credential_path),
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        assert_one_json_document(&output.stdout)["publication"],
+        body
+    );
+    server.finish();
+
+    for invalid in [
+        {
+            let mut value = body.clone();
+            value.as_object_mut().unwrap().remove("providerKind");
+            value
+        },
+        {
+            let mut value = body.clone();
+            value["pullRequest"] = serde_json::Value::Null;
+            value
+        },
+        {
+            let mut value = body.clone();
+            value["target"]["instanceUrl"] = serde_json::json!("https://other.example");
+            value
+        },
+        {
+            let mut value = body.clone();
+            value["target"]["branchVersion"] = serde_json::json!(1);
+            value
+        },
+    ] {
+        let (server, _directory, credential_path) =
+            prepared_publication(vec![ok_publication_response(&invalid)]);
+        let output = run_with_env(
+            &show_args(true),
+            &deployment_environment(&server.api_url, &credential_path),
+        );
+        assert_eq!(output.status.code(), Some(1));
+        assert_eq!(
+            assert_one_json_document(&output.stdout)["outcome"],
+            "invalid_response"
+        );
+        assert_no_publication_secret(&output, &[TOKEN]);
+        server.finish();
+    }
+}
+
+// REQ-PUBLISH-75, REQ-PUBLISH-76: command, list and run readers share this decoder.
+#[test]
+fn gitlab_failure_phases_are_provider_specific() {
+    let mut failed = gitlab_publication_body();
+    failed["state"] = serde_json::json!("failed");
+    failed["version"] = serde_json::json!(3);
+    failed["updatedAt"] = serde_json::json!("2026-09-03T18:00:02Z");
+    failed["startedAt"] = serde_json::json!("2026-09-03T18:00:01Z");
+    failed["terminalAt"] = serde_json::json!("2026-09-03T18:00:02Z");
+    for code in [
+        "actor_authority_lost",
+        "project_repository_changed",
+        "provider_unavailable",
+        "provider_rejected",
+    ] {
+        failed["failure"] = serde_json::json!({
+            "phase": "merge_request", "code": code, "retryable": code != "provider_rejected"
+        });
+        for (phase, valid) in [("merge_request", true), ("pull_request", false)] {
+            failed["failure"]["phase"] = serde_json::json!(phase);
+            let (server, _directory, credential_path) =
+                prepared_publication(vec![ok_publication_response(&failed)]);
+            let output = run_with_env(
+                &show_args(true),
+                &deployment_environment(&server.api_url, &credential_path),
+            );
+            let result = assert_one_json_document(&output.stdout);
+            assert_eq!(
+                result["outcome"],
+                if valid { "found" } else { "invalid_response" },
+                "{code} {phase}"
+            );
+            assert_eq!(output.status.success(), valid, "{code} {phase}");
+            server.finish();
+        }
+    }
 }
 
 fn publication_history() -> Vec<serde_json::Value> {

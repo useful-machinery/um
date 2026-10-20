@@ -787,6 +787,8 @@ fn offer() -> AssignmentOffer {
             },
             source_branch: "main".to_owned(),
             source_display_snapshot: None,
+            workspace_branch: None,
+            workspace_membership: None,
             workflow_definition_source: WorkflowDefinitionSourceV1RunnerProjection {
                 repository_connection_id: "rpc_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned(),
                 object_format: "sha1".to_owned(),

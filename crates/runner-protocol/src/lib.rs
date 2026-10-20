@@ -373,6 +373,37 @@ pub struct SourceDisplaySnapshotV1RunnerProjection {
     pub repository: SourceDisplayRepositoryV1RunnerProjection,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WorkspaceWitness {
+    #[serde(rename = "ref")]
+    pub reference: String,
+    pub tip_oid: String,
+    pub relationship: String,
+    pub observed_at: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WorkspaceChangeRequest {
+    pub provider_id: String,
+    pub number: u64,
+    pub head_repository_id: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WorkspaceMembership {
+    pub repository_connection_id: String,
+    pub provider_kind: String,
+    pub provider_repository_id: String,
+    pub object_format: String,
+    pub workspace_commit_oid: String,
+    pub witness: WorkspaceWitness,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub change_request: Option<WorkspaceChangeRequest>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ExecutionSpecV1RunnerProjection {
     pub execution_spec_id: String,
@@ -382,6 +413,8 @@ pub struct ExecutionSpecV1RunnerProjection {
     pub workflow_definition_source: WorkflowDefinitionSourceV1RunnerProjection,
     pub primary_workspace_source: PrimaryWorkspaceSourceV1RunnerProjection,
     pub source_display_snapshot: Option<SourceDisplaySnapshotV1RunnerProjection>,
+    pub workspace_branch: Option<String>,
+    pub workspace_membership: Option<WorkspaceMembership>,
     pub capacity: ExecutionCapacityV1RunnerProjection,
     pub run_inputs: Option<RunInputProjectionV1>,
 }
@@ -1398,10 +1431,11 @@ fn decode_frame(bytes: &[u8]) -> Result<ValidatedFrame, DecodeError> {
             }
             let envelope = validated_cloud_envelope!(frame)?;
             let execution_spec = frame.payload.execution_spec;
-            let schema_version = if *execution_spec.schema_version == 1.0 {
-                1
-            } else {
-                2
+            let schema_version = match *execution_spec.schema_version {
+                1.0 => 1,
+                2.0 => 2,
+                3.0 => 3,
+                _ => return Err(DecodeError::InvalidFrame("executionSpec.schemaVersion")),
             };
             let maximum_parallel_steps =
                 u64::try_from(execution_spec.execution_limits.maximum_parallel_steps.0)
@@ -1508,13 +1542,27 @@ fn decode_frame(bytes: &[u8]) -> Result<ValidatedFrame, DecodeError> {
                 }
             });
             match (schema_version, source_display_snapshot.is_some()) {
-                (1, false) | (2, true) => {}
+                (1, false) | (2 | 3, true) => {}
                 _ => {
                     return Err(DecodeError::InvalidFrame(
                         "executionSpec.sourceDisplaySnapshot",
                     ));
                 }
             }
+            let workspace_branch = execution_spec
+                .workspace_branch
+                .map(|branch| branch.to_string());
+            let workspace_membership = execution_spec
+                .workspace_membership
+                .map(|membership| {
+                    serde_json::to_value(membership)
+                        .map_err(|_| DecodeError::InvalidFrame("workspaceMembership"))
+                        .and_then(|value| {
+                            serde_json::from_value(value)
+                                .map_err(|_| DecodeError::InvalidFrame("workspaceMembership"))
+                        })
+                })
+                .transpose()?;
             let run_inputs = execution_spec
                 .run_inputs
                 .map(|inputs| RunInputProjectionV1 {
@@ -1608,6 +1656,8 @@ fn decode_frame(bytes: &[u8]) -> Result<ValidatedFrame, DecodeError> {
                     workflow_definition_source,
                     primary_workspace_source,
                     source_display_snapshot,
+                    workspace_branch,
+                    workspace_membership,
                     capacity,
                     run_inputs,
                 }),

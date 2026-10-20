@@ -975,9 +975,22 @@ fn write_publication_human(
                 super::write_publication_diagnostic(output, diagnostic, "    ")?;
             }
         }
-        if let Some(pull_request) = publication.pull_request.as_deref() {
+        if let Some(pull_request) = publication.pull_request.as_ref().and_then(Option::as_deref) {
             let url = redacted_human_url(&pull_request.url)?;
             writeln!(output, "  pull request: {}", url.escape_default())?;
+        }
+        if let Some(mr) = publication
+            .merge_request
+            .as_ref()
+            .and_then(Option::as_deref)
+        {
+            let url = redacted_human_url(&mr.url)?;
+            writeln!(
+                output,
+                "  merge request !{}: {}",
+                mr.iid,
+                url.escape_default()
+            )?;
         }
         return Ok(());
     }
@@ -1006,7 +1019,7 @@ fn write_publication_human(
         let url = redacted_human_url(&branch.url)?;
         writeln!(output, "branch url: {}", url.escape_default())?;
     }
-    if let Some(pull_request) = publication.pull_request.as_deref() {
+    if let Some(pull_request) = publication.pull_request.as_ref().and_then(Option::as_deref) {
         writeln!(output, "pull request: {}", pull_request.number)?;
         writeln!(
             output,
@@ -1015,6 +1028,16 @@ fn write_publication_human(
         )?;
         let url = redacted_human_url(&pull_request.url)?;
         writeln!(output, "pull request url: {}", url.escape_default())?;
+    }
+    if let Some(mr) = publication
+        .merge_request
+        .as_ref()
+        .and_then(Option::as_deref)
+    {
+        writeln!(output, "merge request: !{}", mr.iid)?;
+        writeln!(output, "merge request state: {}", enum_text(&mr.state)?)?;
+        let url = redacted_human_url(&mr.url)?;
+        writeln!(output, "merge request url: {}", url.escape_default())?;
     }
     if let Some(failure) = publication.failure.as_deref() {
         writeln!(output, "failure: {}", enum_text(&failure.code)?)?;

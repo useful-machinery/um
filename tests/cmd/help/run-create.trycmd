@@ -14,6 +14,10 @@ Options:
           Canonical repository-relative workflow path
       --source-branch <BRANCH>
           Source branch (the project default when omitted)
+      --workspace-branch <BRANCH>
+          Workspace branch (the workflow source when omitted)
+      --workspace-commit <HASH>
+          Workspace commit hash (the workflow source when omitted)
       --display-name <NAME>
           Set the run display name
       --input-set-id <INPUT_SET>

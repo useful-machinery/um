@@ -62,7 +62,7 @@ pub(in crate::service) fn validate_effective_spec(
     execution_spec: &ExecutionSpecV1RunnerProjection,
     continuation: bool,
 ) -> Result<(), AssignmentDecline> {
-    if !matches!(execution_spec.schema_version, 1 | 2) {
+    if !matches!(execution_spec.schema_version, 1..=3) {
         return Err(AssignmentDecline::ExecutionSpecInvalid(
             ExecutionSpecInvalidReason::UnsupportedSchemaVersion,
         ));
@@ -112,14 +112,30 @@ pub(in crate::service) fn validate_effective_spec(
         || execution_spec.source_branch.chars().count() > MAXIMUM_SOURCE_BRANCH_CHARACTERS
         || primary.kind != "connected_repository"
         || !matches!(primary.provider_kind.as_str(), "github" | "gitlab")
+        || (execution_spec.schema_version == 3 && primary.provider_kind != "github")
         || primary.materialization_contract != "git_full_clone_v1"
         || !valid_workflow_connection
         || !valid_primary_connection
-        || (if continuation {
+        || (if continuation || execution_spec.schema_version == 3 {
             workflow.repository_connection_id != primary.repository_connection_id
                 || workflow.object_format != primary.object_format
         } else {
             !validate_source_identity_pair(workflow, primary)
+        })
+        || (if execution_spec.schema_version == 3 {
+            execution_spec
+                .workspace_branch
+                .as_ref()
+                .is_some_and(|branch| {
+                    branch.is_empty() || branch.chars().count() > MAXIMUM_SOURCE_BRANCH_CHARACTERS
+                })
+                || !execution_spec
+                    .workspace_membership
+                    .as_ref()
+                    .is_some_and(|membership| valid_workspace_membership(membership, primary))
+        } else {
+            execution_spec.workspace_branch.is_some()
+                || execution_spec.workspace_membership.is_some()
         })
         || !lowercase_hex(&workflow.commit_oid, SHA1_HEX_CHARACTERS)
         || !lowercase_hex(&primary.commit_oid, SHA1_HEX_CHARACTERS)
@@ -129,7 +145,7 @@ pub(in crate::service) fn validate_effective_spec(
             execution_spec.source_display_snapshot.as_ref(),
         ) {
             (1, None) => primary.provider_kind == "github",
-            (2, Some(snapshot)) => {
+            (2 | 3, Some(snapshot)) => {
                 snapshot.repository.provider_kind == primary.provider_kind
                     && match snapshot.repository.provider_kind.as_str() {
                         "github" => {
@@ -215,6 +231,48 @@ pub(in crate::service) fn validate_source_identity_pair(
     workflow.repository_connection_id == primary.repository_connection_id
         && workflow.object_format == primary.object_format
         && workflow.commit_oid == primary.commit_oid
+}
+
+fn valid_workspace_membership(
+    membership: &um_runner_protocol::WorkspaceMembership,
+    primary: &PrimaryWorkspaceSourceV1RunnerProjection,
+) -> bool {
+    let witness = &membership.witness;
+    let ref_branch = witness.reference.strip_prefix("refs/heads/");
+    membership.repository_connection_id == primary.repository_connection_id
+        && membership.provider_kind == primary.provider_kind
+        && membership.object_format == primary.object_format
+        && membership.workspace_commit_oid == primary.commit_oid
+        && valid_positive_decimal(&membership.provider_repository_id)
+        && ref_branch.is_some_and(|branch| {
+            !branch.is_empty()
+                && branch.len() <= 1024
+                && !branch.starts_with('/')
+                && !branch.contains("..")
+                && !branch
+                    .chars()
+                    .any(|ch| matches!(ch, ' ' | '~' | '^' | ':' | '?' | '*' | '[' | '\\'))
+        })
+        && lowercase_hex(&witness.tip_oid, SHA1_HEX_CHARACTERS)
+        && match witness.relationship.as_str() {
+            "equal" => witness.tip_oid == primary.commit_oid,
+            "ancestor" => witness.tip_oid != primary.commit_oid,
+            _ => false,
+        }
+        && time::OffsetDateTime::parse(
+            &witness.observed_at,
+            &time::format_description::well_known::Rfc3339,
+        )
+        .is_ok_and(|at| at.offset() == time::UtcOffset::UTC)
+        && membership.change_request.as_ref().is_none_or(|request| {
+            valid_positive_decimal(&request.provider_id)
+                && (1..=9_007_199_254_740_991).contains(&request.number)
+                && request.head_repository_id == membership.provider_repository_id
+        })
+}
+
+fn valid_positive_decimal(value: &str) -> bool {
+    !value.starts_with('0') && value.parse::<i64>().is_ok_and(|id| id > 0)
 }
 
 pub(in crate::service) fn lowercase_hex(value: &str, length: usize) -> bool {

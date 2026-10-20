@@ -1305,16 +1305,41 @@ fn build_execution_context(
     let cancellation_grace =
         Duration::from_secs(execution_spec.execution_limits.cancellation_grace_seconds);
     let capacity = &execution_spec.capacity;
+    let mut provenance = SourceRevisionProvenance::new(
+        execution_spec.source_branch.as_str(),
+        execution_spec.primary_workspace_source.commit_oid.as_str(),
+    );
+    if execution_spec.schema_version == 3 {
+        provenance = provenance.with_definition(
+            execution_spec.source_branch.as_str(),
+            execution_spec
+                .workflow_definition_source
+                .commit_oid
+                .as_str(),
+        );
+        if execution_spec.workspace_branch.is_none() {
+            provenance = provenance.without_workspace_branch();
+        } else if let Some(branch) = &execution_spec.workspace_branch {
+            provenance = SourceRevisionProvenance::new(
+                branch.as_str(),
+                execution_spec.primary_workspace_source.commit_oid.as_str(),
+            )
+            .with_definition(
+                execution_spec.source_branch.as_str(),
+                execution_spec
+                    .workflow_definition_source
+                    .commit_oid
+                    .as_str(),
+            );
+        }
+    }
     let context = ExecutionContext::new(
         root.to_owned(),
         default_execution_policy_limits(maximum_parallel_steps),
         environment.without_managed_runner_credentials_and_helpers(),
         CancellationPolicy::new(CancellationSource::new(), cancellation_grace),
     )
-    .with_source_revision(SourceRevisionProvenance::new(
-        execution_spec.source_branch.as_str(),
-        execution_spec.primary_workspace_source.commit_oid.as_str(),
-    ))
+    .with_source_revision(provenance)
     .with_capacity_budget(WorkflowCapacityBudget {
         maximum_invocations: capacity.maximum_invocations,
         diagnostic_retention_bytes: capacity.diagnostic_retention_bytes,

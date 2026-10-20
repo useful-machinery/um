@@ -66,7 +66,7 @@ enum RunCommand {
     #[command(about = "Continue a run from selected steps")]
     Continue(continuation::Command),
     #[command(about = "Create a run")]
-    Create(CreateCommand),
+    Create(Box<CreateCommand>),
     #[command(about = inputs::ABOUT)]
     Input(inputs::Command),
     #[command(about = input_set::ABOUT)]
@@ -105,6 +105,19 @@ struct CreateCommand {
         help = "Source branch (the project default when omitted)"
     )]
     source_branch: Option<String>,
+
+    #[arg(long, value_name = "BRANCH", conflicts_with = "workspace_commit",
+        value_parser = NonEmptyStringValueParser::new(),
+        help = "Workspace branch (the workflow source when omitted)")]
+    workspace_branch: Option<String>,
+
+    #[arg(
+        long,
+        value_name = "HASH",
+        conflicts_with = "workspace_branch",
+        help = "Workspace commit hash (the workflow source when omitted)"
+    )]
+    workspace_commit: Option<String>,
 
     #[arg(
         long,
@@ -648,6 +661,8 @@ impl CreateCommand {
                         project_id: &self.project_id,
                         workflow_path: &self.workflow_path,
                         source_branch: self.source_branch.as_deref(),
+                        workspace_branch: self.workspace_branch.as_deref(),
+                        workspace_commit: self.workspace_commit.as_deref(),
                         display_name: self.display_name.as_deref(),
                         input_set_id: input_set_id.as_deref(),
                         publish_export: self.publish_export.as_deref(),
@@ -1770,6 +1785,11 @@ fn write_run_human(deployment: &str, heading: &str, run: &Run) -> anyhow::Result
         run.current_attempt_id, run.current_attempt_number
     )?;
     writeln!(stdout, "source branch: {}", run.source_branch)?;
+    writeln!(
+        stdout,
+        "workspace branch: {}",
+        run.workspace_branch.as_deref().unwrap_or("none")
+    )?;
     writeln!(stdout, "\nworkflow source:")?;
     writeln!(
         stdout,
@@ -1834,6 +1854,15 @@ fn write_run_human(deployment: &str, heading: &str, run: &Run) -> anyhow::Result
         "  materialization: {}",
         enum_text(&run.primary_workspace_source.materialization_contract)?
     )?;
+    if let Some(membership) = &run.workspace_membership {
+        writeln!(stdout, "  membership ref: {}", membership.witness.r#ref)?;
+        writeln!(stdout, "  membership tip: {}", membership.witness.tip_oid)?;
+        writeln!(
+            stdout,
+            "  membership observed: {}",
+            membership.witness.observed_at
+        )?;
+    }
     writeln!(stdout, "\ninputs:")?;
     writeln!(
         stdout,
@@ -2398,6 +2427,9 @@ mod tests {
             "currentAttemptId": "atm_01k0z6r1w8f4jy2m7q9v3x5abc",
             "currentAttemptNumber": 1,
             "sourceBranch": "main",
+            "workspaceSource": null,
+            "workspaceBranch": null,
+            "workspaceMembership": null,
             "workflowDefinitionSource": {
                 "repositoryConnectionId": "rpc_01k0z6r1w8f4jy2m7q9v3x5abc",
                 "objectFormat": "sha1",
@@ -2615,6 +2647,8 @@ mod tests {
                 project_id: "prj_01k0z6r1w8f4jy2m7q9v3x5abc",
                 workflow_path: "workflows/build.yaml",
                 source_branch: None,
+                workspace_branch: None,
+                workspace_commit: None,
                 display_name: None,
                 input_set_id: Some("ris_explicit"),
                 publish_export: None,

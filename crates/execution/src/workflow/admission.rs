@@ -958,16 +958,32 @@ pub struct AdmittedWorkflowCapacity {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SourceRevisionProvenance {
-    branch: Arc<str>,
+    branch: Option<Arc<str>>,
     commit_oid: Arc<str>,
+    definition: Option<(Arc<str>, Arc<str>)>,
 }
 
 impl SourceRevisionProvenance {
     pub fn new(branch: impl Into<Arc<str>>, commit_oid: impl Into<Arc<str>>) -> Self {
         Self {
-            branch: branch.into(),
+            branch: Some(branch.into()),
             commit_oid: commit_oid.into(),
+            definition: None,
         }
+    }
+
+    pub fn with_definition(
+        mut self,
+        branch: impl Into<Arc<str>>,
+        commit_oid: impl Into<Arc<str>>,
+    ) -> Self {
+        self.definition = Some((branch.into(), commit_oid.into()));
+        self
+    }
+
+    pub fn without_workspace_branch(mut self) -> Self {
+        self.branch = None;
+        self
     }
 }
 
@@ -1759,15 +1775,27 @@ fn admit_workflow_for(
         .environment
         .for_workflow_children(&workflow.definition.environment_passthrough);
     if let Some(source_revision) = context.source_revision {
-        environment = environment
-            .with_variable(
+        environment = environment.with_variable(
+            OsString::from("UM_SOURCE_COMMIT_OID"),
+            OsString::from(source_revision.commit_oid.as_ref()),
+        );
+        if let Some(branch) = source_revision.branch {
+            environment = environment.with_variable(
                 OsString::from("UM_SOURCE_BRANCH"),
-                OsString::from(source_revision.branch.as_ref()),
-            )
-            .with_variable(
-                OsString::from("UM_SOURCE_COMMIT_OID"),
-                OsString::from(source_revision.commit_oid.as_ref()),
+                OsString::from(branch.as_ref()),
             );
+        }
+        if let Some((branch, commit_oid)) = source_revision.definition {
+            environment = environment
+                .with_variable(
+                    OsString::from("UM_WORKFLOW_SOURCE_BRANCH"),
+                    OsString::from(branch.as_ref()),
+                )
+                .with_variable(
+                    OsString::from("UM_WORKFLOW_SOURCE_COMMIT_OID"),
+                    OsString::from(commit_oid.as_ref()),
+                );
+        }
     }
     let execution = AdmittedExecutionContext {
         root,

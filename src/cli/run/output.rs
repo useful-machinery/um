@@ -253,7 +253,8 @@ pub(super) fn write_cloud(
                     super::enum_text(&branch.disposition)?
                 )?;
             }
-            if let Some(pull_request) = publication.pull_request.as_deref() {
+            if let Some(pull_request) = publication.pull_request.as_ref().and_then(Option::as_deref)
+            {
                 writeln!(
                     io::stdout().lock(),
                     "  pull request: {} ({}, {})",
@@ -265,6 +266,19 @@ pub(super) fn write_cloud(
                 writeln!(
                     io::stdout().lock(),
                     "  pull request url: {}",
+                    url.escape_default()
+                )?;
+            }
+            if let Some(mr) = publication
+                .merge_request
+                .as_ref()
+                .and_then(Option::as_deref)
+            {
+                writeln!(io::stdout().lock(), "  merge request: !{}", mr.iid)?;
+                let url = super::super::publication::redacted_human_url(&mr.url)?;
+                writeln!(
+                    io::stdout().lock(),
+                    "  merge request url: {}",
                     url.escape_default()
                 )?;
             }

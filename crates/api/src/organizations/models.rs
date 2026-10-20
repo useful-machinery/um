@@ -1250,6 +1250,8 @@ impl From<models::OrganizationAuditChange> for OrganizationAuditChange {
             Field::Disposition => "disposition",
             Field::PullRequestState => "pull_request_state",
             Field::PullRequestNumber => "pull_request_number",
+            Field::MergeRequestState => "merge_request_state",
+            Field::MergeRequestIid => "merge_request_iid",
             Field::Outcome => "outcome",
             Field::FailurePhase => "failure_phase",
             Field::FailureCode => "failure_code",

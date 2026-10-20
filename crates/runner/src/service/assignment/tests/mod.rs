@@ -37,7 +37,7 @@ use um_runner_protocol::{
     ArtifactResultRegistrationResponse, CloudFrame, ExecutionCapacityV1RunnerProjection,
     ExecutionLimitsV1RunnerProjection, PrimaryWorkspaceSourceV1RunnerProjection,
     WorkflowDefinitionSourceV1RunnerProjection, WorkflowSourceClosureDigestV1RunnerProjection,
-    decode_cloud_frame,
+    WorkspaceMembership, WorkspaceWitness, decode_cloud_frame,
 };
 
 const NOW: &str = "2026-07-23T00:00:00Z";
@@ -727,6 +727,8 @@ fn offer(suffix: &str) -> AssignmentOffer {
             workflow_definition_source: production_workflow_definition_source(),
             primary_workspace_source: production_primary_workspace_source(),
             source_display_snapshot: None,
+            workspace_branch: None,
+            workspace_membership: None,
             capacity: production_capacity(),
             run_inputs: None,
         },
@@ -1916,6 +1918,73 @@ fn decoded_offer_from_frame(bytes: &[u8]) -> AssignmentOffer {
     }
 }
 
+fn v3_spec() -> ExecutionSpecV1RunnerProjection {
+    let mut spec = decoded_source_display_offer().execution_spec;
+    spec.schema_version = 3;
+    spec.workspace_branch = Some("topic".to_owned());
+    let workspace_commit_oid = "fedcba9876543210fedcba9876543210fedcba98".to_owned();
+    spec.primary_workspace_source.commit_oid = workspace_commit_oid.clone();
+    spec.workspace_membership = Some(WorkspaceMembership {
+        repository_connection_id: spec
+            .primary_workspace_source
+            .repository_connection_id
+            .clone(),
+        provider_kind: "github".to_owned(),
+        provider_repository_id: "1234".to_owned(),
+        object_format: "sha1".to_owned(),
+        workspace_commit_oid: workspace_commit_oid.clone(),
+        witness: WorkspaceWitness {
+            reference: "refs/heads/topic".to_owned(),
+            tip_oid: workspace_commit_oid,
+            relationship: "equal".to_owned(),
+            observed_at: "2026-10-18T12:00:00Z".to_owned(),
+        },
+        change_request: None,
+    });
+    spec
+}
+
+#[test]
+fn v3_source_binding_rejects_missing_or_conflicting_proof() {
+    let spec = v3_spec();
+    assert_eq!(validate_execution_spec(&spec), Ok(()));
+    let invalid = Err(AssignmentDecline::ExecutionSpecInvalid(
+        ExecutionSpecInvalidReason::InvalidSourceProjection,
+    ));
+    let mut missing = spec.clone();
+    missing.workspace_membership = None;
+    assert_eq!(validate_execution_spec(&missing), invalid);
+    let mut mismatched = spec.clone();
+    mismatched
+        .workspace_membership
+        .as_mut()
+        .unwrap()
+        .witness
+        .tip_oid = "0".repeat(40);
+    assert_eq!(validate_execution_spec(&mismatched), invalid);
+    let mut wrong_repository = spec.clone();
+    wrong_repository
+        .workspace_membership
+        .as_mut()
+        .unwrap()
+        .change_request = Some(um_runner_protocol::WorkspaceChangeRequest {
+        provider_id: "44".to_owned(),
+        number: 1,
+        head_repository_id: "999".to_owned(),
+    });
+    assert_eq!(validate_execution_spec(&wrong_repository), invalid);
+    let mut gitlab = spec.clone();
+    gitlab.primary_workspace_source.provider_kind = "gitlab".to_owned();
+    gitlab.workspace_membership.as_mut().unwrap().provider_kind = "gitlab".to_owned();
+    let display = &mut gitlab.source_display_snapshot.as_mut().unwrap().repository;
+    display.provider_kind = "gitlab".to_owned();
+    display.instance_url = Some("https://gitlab.com".to_owned());
+    assert_eq!(validate_execution_spec(&gitlab), invalid);
+    let mut historical = spec;
+    historical.schema_version = 2;
+    assert_eq!(validate_execution_spec(&historical), invalid);
+}
+
 #[test]
 fn decoded_execution_spec_versions_retain_semantic_admission_guards() {
     for mut spec in [
@@ -1937,7 +2006,7 @@ fn decoded_execution_spec_versions_retain_semantic_admission_guards() {
             ))
         );
     }
-    for version in [0, 3, u64::MAX] {
+    for version in [0, 4, u64::MAX] {
         let mut spec = decoded_source_display_offer().execution_spec;
         spec.schema_version = version;
         assert_eq!(

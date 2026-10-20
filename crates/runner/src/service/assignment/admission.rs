@@ -493,7 +493,8 @@ impl AssignmentManager {
                         ),
                     )?;
                 }
-                let clone_root = if worker_offer.continuation.is_some() {
+                let separate_definition = worker_offer.execution_spec.schema_version == 3;
+                let clone_root = if worker_offer.continuation.is_some() || separate_definition {
                     let path = root.private.join("replacement-definition");
                     std::fs::create_dir(&path).map_err(|_| environment_unavailable())?;
                     path
@@ -510,6 +511,24 @@ impl AssignmentManager {
                     &root.private,
                 )
                 .map_err(materialization_decline)?;
+                if separate_definition && worker_offer.continuation.is_none() {
+                    let workspace_source = source.for_workspace(
+                        &worker_offer
+                            .execution_spec
+                            .primary_workspace_source
+                            .commit_oid,
+                    );
+                    super::super::source::checkout(
+                        Arc::clone(&broker),
+                        &environment,
+                        &worker_offer.assignment_id,
+                        &workspace_source,
+                        &worker_cancellation,
+                        &workspace_path,
+                        &root.private,
+                    )
+                    .map_err(materialization_decline)?;
+                }
                 runtime.progress(&worker_offer, 2, "input_download")?;
                 let inputs = super::super::run_inputs::materialize(
                     input_broker.as_deref(),
@@ -522,9 +541,38 @@ impl AssignmentManager {
                 )
                 .map_err(run_input_decline)?;
                 runtime.progress(&worker_offer, 3, "workflow_admission")?;
-                let materialized =
+                let mut materialized =
                     super::super::source::resolve_checkout(checkout, &worker_cancellation)
                         .map_err(materialization_decline)?;
+                if separate_definition {
+                    // Both initial admission and continuation resolve immutable
+                    // definition bytes in private, then execute only in the claimed
+                    // primary workspace. Never execute a resumed run in the
+                    // disposable definition checkout.
+                    std::fs::remove_dir_all(&clone_root).map_err(|_| environment_unavailable())?;
+                    materialized.execution_root = workspace_path.clone();
+                    materialized.git_capture =
+                        materialized.workflow.requires_git_capture().then(|| {
+                            CloudGitCaptureProjection::new(
+                                Arc::from(
+                                    worker_offer
+                                        .execution_spec
+                                        .primary_workspace_source
+                                        .commit_oid
+                                        .as_str(),
+                                ),
+                                Arc::from(
+                                    worker_offer
+                                        .execution_spec
+                                        .workflow_definition_source
+                                        .workflow_source_closure_digest
+                                        .value
+                                        .as_str(),
+                                ),
+                                worker_cancellation.clone(),
+                            )
+                        });
+                }
                 Ok::<_, AssignmentDecline>((materialized, inputs))
             }));
             let admission = match preparation {

@@ -1636,6 +1636,49 @@ fn cloud_source_revision_replaces_inherited_reserved_values_while_local_has_none
 
 // REQ-WFFORMAT-33
 #[test]
+fn direct_commit_selection_omits_workspace_branch_but_retains_definition_provenance() {
+    let fixture = WorkflowFixture::new(COMMAND_WORKFLOW);
+    let context = ExecutionContext::new(
+        fixture.execution_root.clone(),
+        default_execution_policy_limits(1),
+        EnvironmentSnapshot::new([
+            ("UM_SOURCE_BRANCH", "untrusted"),
+            ("UM_WORKFLOW_SOURCE_COMMIT_OID", "untrusted"),
+        ]),
+        CancellationPolicy::new(CancellationSource::new(), Duration::from_secs(1)),
+    )
+    .with_source_revision(
+        SourceRevisionProvenance::new("ignored", "fedcba9876543210fedcba9876543210fedcba98")
+            .without_workspace_branch()
+            .with_definition("main", "0123456789abcdef0123456789abcdef01234567"),
+    );
+    let admitted = admit_runner_workflow(
+        fixture.resolve(),
+        text_and_attachments_inputs("request", Vec::new()),
+        context,
+    )
+    .unwrap();
+    let environment = admitted.execution().environment();
+    assert!(
+        environment
+            .variable(OsStr::new("UM_SOURCE_BRANCH"))
+            .is_none()
+    );
+    assert_eq!(
+        environment.variable(OsStr::new("UM_SOURCE_COMMIT_OID")),
+        Some(OsStr::new("fedcba9876543210fedcba9876543210fedcba98"))
+    );
+    assert_eq!(
+        environment.variable(OsStr::new("UM_WORKFLOW_SOURCE_BRANCH")),
+        Some(OsStr::new("main"))
+    );
+    assert_eq!(
+        environment.variable(OsStr::new("UM_WORKFLOW_SOURCE_COMMIT_OID")),
+        Some(OsStr::new("0123456789abcdef0123456789abcdef01234567"))
+    );
+}
+
+#[test]
 fn workflow_admission_only_forwards_base_and_explicit_safe_names() {
     let environment = EnvironmentSnapshot::new([
         ("PATH", "/bin"),
