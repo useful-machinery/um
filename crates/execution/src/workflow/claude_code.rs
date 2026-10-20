@@ -1749,9 +1749,22 @@ impl ClaudeCodeStreamJsonV1Parser {
         object: &Map<String, Value>,
     ) -> Result<(), AgentFailureCause> {
         self.require_matching_session(object)?;
+        // Claude Code reports its usage windows on every turn; only a window that is
+        // warning or rejecting is worth an operator's attention.
+        let info = object.get("rate_limit_info").and_then(Value::as_object);
+        let status = info.and_then(|info| required_nonempty_string(info, "status"));
+        if status == Some("allowed") {
+            return Ok(());
+        }
+        let window = info.and_then(|info| required_nonempty_string(info, "rateLimitType"));
+        let message = match (status, window) {
+            (Some(status), Some(window)) => format!("provider rate limit {status} ({window})"),
+            (Some(status), None) => format!("provider rate limit {status}"),
+            (None, _) => String::from("provider rate limit"),
+        };
         self.observations.push(AgentObservation::Diagnostic {
             level: AgentDiagnosticLevel::Warning,
-            message: Arc::from("provider rate limit"),
+            message: Arc::from(message),
         });
         Ok(())
     }

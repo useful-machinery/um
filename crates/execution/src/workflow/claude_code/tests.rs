@@ -1784,3 +1784,37 @@ fn unsuccessful_native_result_and_exit_use_existing_typed_failures() {
         },
     );
 }
+
+#[test]
+fn rate_limit_events_warn_only_when_a_window_is_not_allowed() {
+    fn rate_limit(info: Value) -> Value {
+        json!({"type": "rate_limit_event", "rate_limit_info": info, "session_id": SESSION_ID})
+    }
+    let transcript = framed(&[
+        init(QUALIFICATION_VERSION, SESSION_ID),
+        rate_limit(json!({"status": "allowed", "rateLimitType": "five_hour"})),
+        rate_limit(json!({"status": "allowed_warning", "rateLimitType": "seven_day"})),
+        rate_limit(json!({"status": "rejected"})),
+        rate_limit(json!({})),
+        result(SESSION_ID),
+    ]);
+    let (observations, _) = replay(&transcript, AgentValueKind::None, 1024);
+    let warnings: Vec<&str> = observations
+        .iter()
+        .filter_map(|observation| match observation {
+            AgentObservation::Diagnostic {
+                level: AgentDiagnosticLevel::Warning,
+                message,
+            } => Some(message.as_ref()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        warnings,
+        [
+            "provider rate limit allowed_warning (seven_day)",
+            "provider rate limit rejected",
+            "provider rate limit",
+        ]
+    );
+}
