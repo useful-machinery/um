@@ -1004,12 +1004,39 @@ impl CleanupEngine {
         }
     }
 
+    // A released assignment tree directly beneath a boot directory may be
+    // an ordinary recovery origin. Retirement is best effort: recovery
+    // already tolerates a cataloged origin whose assignment is absent.
+    fn retire_released_origin(&self, tree: &OwnedTree) {
+        let Some(store) = self.recovery.get() else {
+            return;
+        };
+        let Some(boot) = tree.path.parent() else {
+            return;
+        };
+        if boot.parent() != Some(self.authority.work_root()) {
+            return;
+        }
+        let (Some(boot_id), Some(assignment_id)) = (
+            boot.file_name().and_then(|name| name.to_str()),
+            tree.path.file_name().and_then(|name| name.to_str()),
+        ) else {
+            return;
+        };
+        if valid_boot_id(boot_id) && valid_assignment_id(assignment_id) {
+            let _ = store.retire_released_origin(boot_id, assignment_id);
+        }
+    }
+
     fn finish_removal(&self, tree: &OwnedTree, proof: CleanupAuthorityProof) -> CleanupResult {
         if tree.sync_parent().is_err() {
             return CleanupResult::Quarantined(CleanupFailure::Safety);
         }
         match proof.clear(&self.authority) {
-            Ok(()) => CleanupResult::Released,
+            Ok(()) => {
+                self.retire_released_origin(tree);
+                CleanupResult::Released
+            }
             Err(()) => CleanupResult::Quarantined(CleanupFailure::Safety),
         }
     }

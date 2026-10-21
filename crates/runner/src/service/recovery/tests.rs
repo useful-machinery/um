@@ -200,6 +200,44 @@ fn retained_identity_and_local_generation_survive_fresh_boot_without_adopting_le
 }
 
 #[test]
+fn releasing_an_ordinary_origin_retires_its_catalog_entry() {
+    let temp = private_tempdir();
+    let owner = WorkRootLease::acquire_for_test(temp.path(), BOOT_A).unwrap();
+    owner.enable_recovery(RUNNER, fixture_host()).unwrap();
+    let original = owner
+        .create_assignment_for_attempt(ASSIGNMENT, RUN, ATTEMPT, None)
+        .unwrap();
+    AssignmentProcessGuards::durable_recovery(
+        &original.private,
+        owner.recovery().unwrap().host_boot().unwrap(),
+        fixture_host(),
+    )
+    .unwrap();
+    let id = owner
+        .recovery()
+        .unwrap()
+        .register(Origin::from_assignment(&original, BOOT_A))
+        .unwrap();
+    assert_eq!(owner.recovery().unwrap().catalog().unwrap(), vec![id]);
+    assert_eq!(
+        original
+            .release_pending(
+                crate::service::workspace::ProcessQuiescence::Proven,
+                crate::service::workspace::WorkspaceDisposition::Remove,
+            )
+            .wait(),
+        CleanupResult::Released
+    );
+    assert!(owner.recovery().unwrap().catalog().unwrap().is_empty());
+    assert!(
+        !owner
+            .recovery()
+            .unwrap()
+            .boot_has_unresolved_anchors(BOOT_A)
+    );
+}
+
+#[test]
 fn released_ordinary_origin_does_not_block_unrelated_cleanup() {
     let temp = private_tempdir();
     let owner = WorkRootLease::acquire_for_test(temp.path(), BOOT_A).unwrap();

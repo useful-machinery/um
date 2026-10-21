@@ -556,6 +556,37 @@ impl RecoveryStore {
         open_private_directory(&assignment, "private")
     }
 
+    /// Retires the catalog entry of an ordinary origin whose assignment tree
+    /// was just released. The caller holds the cleanup gate (the cleanup
+    /// engine's serialized lock), so this never takes it again. A crash
+    /// between release and retirement leaves an entry whose origin is absent,
+    /// which may_clean_tree already tolerates and the next release retires.
+    pub(super) fn retire_released_origin(
+        &self,
+        boot_id: &str,
+        assignment_id: &str,
+    ) -> Result<(), RecoveryError> {
+        let mut writes = self.writes.lock().map_err(|_| invalid("write lock"))?;
+        if *writes {
+            return Err(invalid("uncertain commit"));
+        }
+        let mut root = self.root()?;
+        let before = root.catalog.len();
+        root.catalog.retain(|entry| {
+            !(entry.origin_boot_id == boot_id
+                && entry.origin_assignment_id == assignment_id
+                && self.origin_assignment_absent(entry))
+        });
+        if root.catalog.len() == before {
+            return Ok(());
+        }
+        if let Err(error) = persist(&self.authority.shared.directory_lock, ROOT, &root, true) {
+            *writes = true;
+            return Err(error);
+        }
+        Ok(())
+    }
+
     /// Catalog first, then manifest: a crash between them reports an unavailable
     /// cataloged anchor instead of forgetting a known identity. No registration
     /// acknowledgement exists yet, so incomplete records confer no guarantee.
