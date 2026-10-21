@@ -2285,7 +2285,6 @@ mod tests {
                     Some(
                         "assignment_preparation_progress"
                             | "assignment_accepted"
-                            | "workspace_retention_report"
                             | "assignment_interrupted"
                     )
                 ) {
@@ -2296,6 +2295,9 @@ mod tests {
                     )
                     .await;
                 }
+                // The retention report follows acknowledged interruption and
+                // cleanup. Shutdown waits for its dispatch, not acknowledgement,
+                // so writing an ack for it can race the runner closing the socket.
                 interrupted |= frame["type"] == "assignment_interrupted";
                 retention_reported |= frame["type"] == "workspace_retention_report";
                 if interrupted && retention_reported {
