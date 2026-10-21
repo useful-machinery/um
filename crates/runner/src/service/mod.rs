@@ -2226,6 +2226,9 @@ mod tests {
             // barrier is the matching pong, not the next frame on the wire.
             loop {
                 match with_watchdog(current.next()).await.unwrap() {
+                    Some(Ok(Message::Pong(payload))) if payload.as_ref() == [4, 5, 6] => {
+                        // A keepalive sent during source admission can still be in flight.
+                    }
                     Some(Ok(Message::Pong(payload))) => {
                         assert_eq!(payload.as_ref(), &[1, 2, 3]);
                         break;
@@ -2910,9 +2913,30 @@ mod tests {
         expected_type: &str,
         acknowledge_progress: bool,
     ) -> serde_json::Value {
+        // Source admission performs real Git I/O. Under a concurrent suite it can
+        // outlast the two-second fixture liveness window; the fake gateway must
+        // keep responding to the runner rather than waiting silently for admission.
+        let sleeper = fixture_sleeper();
         loop {
-            let Some(Ok(Message::Text(frame))) = socket.next().await else {
-                panic!("connection closed before {expected_type}");
+            let next = tokio::select! {
+                frame = socket.next() => frame,
+                _ = sleeper.sleep(Duration::from_millis(500)) => {
+                    socket.send(Message::Ping(vec![4, 5, 6].into())).await
+                        .expect("send fixture keepalive");
+                    continue;
+                }
+            };
+            let frame = match next {
+                Some(Ok(Message::Text(frame))) => frame,
+                Some(Ok(Message::Pong(payload))) if payload.as_ref() == [4, 5, 6] => continue,
+                Some(Ok(Message::Ping(payload))) => {
+                    socket
+                        .send(Message::Pong(payload))
+                        .await
+                        .expect("answer runner keepalive");
+                    continue;
+                }
+                other => panic!("connection ended before {expected_type}: {other:?}"),
             };
             let frame: serde_json::Value =
                 serde_json::from_str(&frame).expect("decode assignment observation");

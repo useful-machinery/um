@@ -122,6 +122,41 @@ fn gitlab_publication_body() -> serde_json::Value {
     body
 }
 
+// Run-scoped completion proof: the actual worker snapshot was rendered by the
+// Gateway API before this body reaches the CLI's strict response decoder.
+#[test]
+#[ignore = "requires the worker-backed response supplied by the GitLab integration harness"]
+fn worker_backed_gitlab_publication_through_cli() {
+    let response = std::env::var("UM_PUBLICATION_TEST_API_RESPONSE_JSON")
+        .expect("GitLab integration harness must supply its API response");
+    let body: serde_json::Value = serde_json::from_str(&response).expect("worker-backed API JSON");
+    let organization = body["organizationId"].as_str().expect("organization id");
+    let run = body["runId"].as_str().expect("run id");
+    let publication = body["id"].as_str().expect("publication id");
+    let (server, _directory, credentials) =
+        prepared_publication(vec![ok_publication_response(&body)]);
+    let output = run_with_env(
+        &[
+            "publication",
+            "show",
+            organization,
+            run,
+            publication,
+            "--json",
+            "--allow-insecure-http",
+        ],
+        &deployment_environment(&server.api_url, &credentials),
+    );
+    assert!(
+        output.status.success(),
+        "CLI rejected worker-backed API response"
+    );
+    let decoded = assert_one_json_document(&output.stdout);
+    assert_eq!(decoded["outcome"], "found");
+    assert_eq!(decoded["publication"], body);
+    server.finish();
+}
+
 // REQ-PUBLISH-75, REQ-PUBLISH-76
 #[test]
 fn publication_commands_decode_gitlab_and_reject_mixed_variants() {
@@ -217,6 +252,62 @@ fn gitlab_failure_phases_are_provider_specific() {
             server.finish();
         }
     }
+}
+
+// A squash merge can delete the source ref. The confirmed MR remains readable
+// without inventing a branch receipt or confusing global id with project iid.
+#[test]
+fn gitlab_merged_reuse_with_deleted_branch_is_readable() {
+    let mut merged = gitlab_publication_body();
+    merged["providerActor"] = serde_json::json!({"id":"123","username":"pinned-bot"});
+    merged["providerAuthorityGeneration"] = serde_json::json!(4);
+    merged["state"] = serde_json::json!("succeeded");
+    merged["version"] = serde_json::json!(4);
+    merged["outcome"] = serde_json::json!("merge_request_already_merged");
+    merged["updatedAt"] = serde_json::json!("2026-09-03T18:00:03Z");
+    merged["startedAt"] = serde_json::json!("2026-09-03T18:00:01Z");
+    merged["terminalAt"] = serde_json::json!("2026-09-03T18:00:03Z");
+    merged["mergeRequest"] = serde_json::json!({
+        "providerId": "9002", "iid": 3, "url": "https://gitlab.com/group/subgroup/repository/-/merge_requests/3",
+        "disposition": "reused", "state": "merged", "author": {"id":"456","username":"original-bot"},
+        "sourceHeadOid": "89abcdef0123456789abcdef0123456789abcdef"
+    });
+    let (server, _directory, credential_path) =
+        prepared_publication(vec![ok_publication_response(&merged)]);
+    let output = run_with_env(
+        &show_args(true),
+        &deployment_environment(&server.api_url, &credential_path),
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report = assert_one_json_document(&output.stdout);
+    assert_eq!(report["publication"], merged);
+    server.finish();
+
+    // An open exact MR is also reused without an intervening branch step.
+    merged["outcome"] = serde_json::json!("merge_request_published");
+    merged["mergeRequest"]["state"] = serde_json::json!("open");
+    let (server, _directory, credential_path) =
+        prepared_publication(vec![ok_publication_response(&merged)]);
+    let output = run_with_env(
+        &show_args(true),
+        &deployment_environment(&server.api_url, &credential_path),
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        assert_one_json_document(&output.stdout)["publication"],
+        merged
+    );
+    server.finish();
 }
 
 fn publication_history() -> Vec<serde_json::Value> {

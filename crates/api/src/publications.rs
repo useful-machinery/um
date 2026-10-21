@@ -937,6 +937,8 @@ fn validate_publication(
         && terminal_at.is_none_or(|terminal| {
             started_at.is_some_and(|started| terminal >= started && terminal <= updated_at)
         });
+    // A verified GitLab MR can be reused without a branch step, even when its
+    // source ref was removed after a merge. Only GitHub requires a branch.
     let receipts_valid = publication.branch.as_deref().is_none_or(|branch| {
         valid_branch(branch, &publication.artifact.head_oid)
             && if publication.provider_kind == ProviderKind::Gitlab {
@@ -963,11 +965,6 @@ fn validate_publication(
             })
         && (publication
             .pull_request
-            .as_ref()
-            .is_none_or(Option::is_none)
-            || publication.branch.is_some())
-        && (publication
-            .merge_request
             .as_ref()
             .is_none_or(Option::is_none)
             || publication.branch.is_some());
