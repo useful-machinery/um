@@ -199,6 +199,43 @@ fn retained_identity_and_local_generation_survive_fresh_boot_without_adopting_le
     assert!(store.claim_fixture(&workspace, &final_grant, true).is_err());
 }
 
+#[test]
+fn released_ordinary_origin_does_not_block_unrelated_cleanup() {
+    let temp = private_tempdir();
+    let owner = WorkRootLease::acquire_for_test(temp.path(), BOOT_A).unwrap();
+    owner.enable_recovery(RUNNER, fixture_host()).unwrap();
+    let original = owner
+        .create_assignment_for_attempt(ASSIGNMENT, RUN, ATTEMPT, None)
+        .unwrap();
+    AssignmentProcessGuards::durable_recovery(
+        &original.private,
+        owner.recovery().unwrap().host_boot().unwrap(),
+        fixture_host(),
+    )
+    .unwrap();
+    owner
+        .recovery()
+        .unwrap()
+        .register(Origin::from_assignment(&original, BOOT_A))
+        .unwrap();
+    let released = original.execution.parent().unwrap().to_path_buf();
+    drop(original);
+    let later = owner
+        .create_assignment_for_attempt(
+            "asn_01k0z6r1w8f4jy2m7q9v3x5abd",
+            RUN,
+            "atm_01k0z6r1w8f4jy2m7q9v3x5abd",
+            None,
+        )
+        .unwrap();
+    // A present origin with an unreadable manifest still blocks cleanup.
+    fs::remove_file(released.join("private").join(MANIFEST)).unwrap();
+    assert!(!owner.recovery().unwrap().may_clean_tree(&later.execution));
+    // Releasing the origin assignment itself no longer blocks unrelated paths.
+    fs::remove_dir_all(&released).unwrap();
+    assert!(owner.recovery().unwrap().may_clean_tree(&later.execution));
+}
+
 // INV-RUNNER-13
 #[test]
 fn competing_claims_and_cleanup_cannot_publish_a_removed_holder() {

@@ -419,6 +419,11 @@ impl AssignmentManager {
                     if runtime.work_root.boot_id()
                         != Some(continuation.required_runner_boot_id.as_str())
                     {
+                        runtime.preparation_failure(
+                            &worker_offer,
+                            "continuation_boot_identity",
+                            "boot_mismatch",
+                        );
                         return Err(environment_unavailable());
                     }
                     runtime
@@ -434,6 +439,20 @@ impl AssignmentManager {
                                 recorded_root: Path::new(&continuation.execution_root),
                             },
                         )
+                        .inspect_err(|&error| {
+                            runtime.preparation_failure(
+                                &worker_offer,
+                                "continuation_retained_claim",
+                                match error {
+                                    AssignmentRootCreationError::OwnershipUnproven => {
+                                        "ownership_unproven"
+                                    }
+                                    AssignmentRootCreationError::Unavailable => "unavailable",
+                                    AssignmentRootCreationError::CleanupFailed => "cleanup_failed",
+                                    AssignmentRootCreationError::RetainedClaimCleanup(site) => site,
+                                },
+                            );
+                        })
                         .map_err(|error| match error {
                             AssignmentRootCreationError::OwnershipUnproven => {
                                 AssignmentDecline::RunnerUnable(
@@ -455,11 +474,23 @@ impl AssignmentManager {
                             &root.execution,
                             continuation.prior_settlement_snapshot.as_ref(),
                         )
-                        .map_err(|_| environment_unavailable())?,
+                        .map_err(|_| {
+                            runtime.preparation_failure(
+                                &worker_offer,
+                                "continuation_snapshot",
+                                "capture_failed",
+                            );
+                            environment_unavailable()
+                        })?,
                     );
-                    let proof = root
-                        .retained_quiescence
-                        .ok_or_else(environment_unavailable)?;
+                    let proof = root.retained_quiescence.ok_or_else(|| {
+                        runtime.preparation_failure(
+                            &worker_offer,
+                            "continuation_quiescence",
+                            "proof_absent",
+                        );
+                        environment_unavailable()
+                    })?;
                     let snapshot = root
                         .continuation_snapshot
                         .as_ref()
@@ -467,7 +498,14 @@ impl AssignmentManager {
                     let proven_at = sleeper
                         .utc_now()
                         .format(&time::format_description::well_known::Rfc3339)
-                        .map_err(|_| environment_unavailable())?;
+                        .map_err(|_| {
+                            runtime.preparation_failure(
+                                &worker_offer,
+                                "continuation_clock",
+                                "format_failed",
+                            );
+                            environment_unavailable()
+                        })?;
                     root.continuation_proven_at = Some(proven_at.clone());
                     let id = runtime
                         .outbox
@@ -483,7 +521,14 @@ impl AssignmentManager {
                             }),
                             modified: snapshot.modified.clone(),
                         })
-                        .map_err(|_| environment_unavailable())?;
+                        .map_err(|_| {
+                            runtime.preparation_failure(
+                                &worker_offer,
+                                "continuation_ready_outbox",
+                                "enqueue_failed",
+                            );
+                            environment_unavailable()
+                        })?;
                     tokio::runtime::Handle::current().block_on(
                         runtime.outbox.wait_for_continuation_ready(
                             id,
@@ -496,7 +541,14 @@ impl AssignmentManager {
                 let separate_definition = worker_offer.execution_spec.schema_version == 3;
                 let clone_root = if worker_offer.continuation.is_some() || separate_definition {
                     let path = root.private.join("replacement-definition");
-                    std::fs::create_dir(&path).map_err(|_| environment_unavailable())?;
+                    std::fs::create_dir(&path).map_err(|error| {
+                        runtime.preparation_failure(
+                            &worker_offer,
+                            "replacement_definition_root",
+                            io_error_kind(&error),
+                        );
+                        environment_unavailable()
+                    })?;
                     path
                 } else {
                     workspace_path.clone()
@@ -510,7 +562,16 @@ impl AssignmentManager {
                     &clone_root,
                     &root.private,
                 )
-                .map_err(materialization_decline)?;
+                .map_err(|failure| {
+                    if worker_offer.continuation.is_some() {
+                        runtime.preparation_failure(
+                            &worker_offer,
+                            "continuation_source_checkout",
+                            materialization_failure_name(failure),
+                        );
+                    }
+                    materialization_decline(failure)
+                })?;
                 if separate_definition && worker_offer.continuation.is_none() {
                     let workspace_source = source.for_workspace(
                         &worker_offer
@@ -626,9 +687,18 @@ impl AssignmentManager {
                     match workflow_git {
                         Ok(workflow_git) => {
                             root.install_workflow_git(workflow_git.clone());
-                            if let Some(mut cleanup) = materialized.origin_cleanup.take() {
-                                cleanup.disarm();
+                            if worker_offer.continuation.is_none() {
+                                // Ordinary execution uses the clone as its workspace;
+                                // workflow-Git teardown now owns origin restoration.
+                                if let Some(mut cleanup) = materialized.origin_cleanup.take() {
+                                    cleanup.disarm();
+                                }
                             }
+                            // A continuation fetched its definition into private
+                            // replacement-definition, not the retained workspace.
+                            // Its preparation guard must restore that clone's
+                            // origin; workflow-Git teardown owns only the retained
+                            // primary worktree's newly installed relay wiring.
                             runtime.finish(
                                 &worker_offer,
                                 root,

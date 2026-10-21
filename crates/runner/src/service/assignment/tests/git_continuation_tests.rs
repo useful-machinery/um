@@ -115,37 +115,7 @@ exports:
         prior_settlement_snapshot: None,
     }));
     manager.handle_offer(successor.clone()).unwrap();
-    let mut prepare = prepare_for(&manager, &successor);
-    prepare.effect_id = "eff_01k0z6r1w8f4jy2m7q9v3x5abj".into();
-    let preparation = wait_for_offer_preparation(&mut manager).await;
-    manager.acknowledge_observation(preparation.id);
-    manager.handle_prepare(prepare).unwrap();
-    let mut ready_id = None;
-    with_watchdog(wait_for_manager_state(&mut manager, |manager| {
-        ready_id = manager
-            .pending_observations(&BTreeSet::new(), 100)
-            .into_iter()
-            .find_map(|pending| {
-                matches!(
-                    pending.observation,
-                    AssignmentObservation::ContinuationReady { .. }
-                )
-                .then_some(pending.id)
-            });
-        ready_id.is_some()
-    }))
-    .await
-    .expect("continuation readiness proof was not produced");
-    manager.acknowledge_observation(ready_id.unwrap());
-    with_watchdog(wait_for_manager_state(&mut manager, |manager| {
-        manager.drain_events();
-        !matches!(
-            manager.slot,
-            Some(LocalSlot::Preparing(_) | LocalSlot::Releasing(_))
-        )
-    }))
-    .await
-    .expect("continuation admission did not complete");
+    prepare_retained_continuation(&mut manager, &successor).await;
     let accepted = match &manager.slot {
         Some(LocalSlot::Accepted(accepted)) => accepted,
         _ => panic!(
@@ -187,4 +157,41 @@ exports:
         baseline
     );
     assert!(run_fixture_git(&workspace, &["status", "--porcelain"]).is_empty());
+}
+
+pub(super) async fn prepare_retained_continuation(
+    manager: &mut AssignmentManager,
+    successor: &AssignmentOffer,
+) {
+    let mut prepare = prepare_for(manager, successor);
+    prepare.effect_id = "eff_01k0z6r1w8f4jy2m7q9v3x5abj".into();
+    let preparation = wait_for_offer_preparation(manager).await;
+    manager.acknowledge_observation(preparation.id);
+    manager.handle_prepare(prepare).unwrap();
+    let mut ready_id = None;
+    with_watchdog(wait_for_manager_state(manager, |manager| {
+        ready_id = manager
+            .pending_observations(&BTreeSet::new(), 100)
+            .into_iter()
+            .find_map(|pending| {
+                matches!(
+                    pending.observation,
+                    AssignmentObservation::ContinuationReady { .. }
+                )
+                .then_some(pending.id)
+            });
+        ready_id.is_some()
+    }))
+    .await
+    .expect("continuation readiness proof was not produced");
+    manager.acknowledge_observation(ready_id.unwrap());
+    with_watchdog(wait_for_manager_state(manager, |manager| {
+        manager.drain_events();
+        !matches!(
+            manager.slot,
+            Some(LocalSlot::Preparing(_) | LocalSlot::Releasing(_))
+        )
+    }))
+    .await
+    .expect("continuation admission did not complete");
 }

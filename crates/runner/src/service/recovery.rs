@@ -532,6 +532,23 @@ impl RecoveryStore {
         Ok(root)
     }
 
+    // The origin assignment directory is absent beneath its still-present
+    // boot directory, which only release of that assignment produces.
+    fn origin_assignment_absent(&self, entry: &CatalogEntry) -> bool {
+        let root = &self.authority.shared.directory_lock;
+        let Ok(boot) = open_private_directory(root, &entry.origin_boot_id) else {
+            return false;
+        };
+        matches!(
+            statat(
+                &boot,
+                entry.origin_assignment_id.as_str(),
+                AtFlags::SYMLINK_NOFOLLOW
+            ),
+            Err(rustix::io::Errno::NOENT)
+        )
+    }
+
     fn private(&self, entry: &CatalogEntry) -> Result<File, RecoveryError> {
         let root = &self.authority.shared.directory_lock;
         let boot = open_private_directory(root, &entry.origin_boot_id)?;
@@ -661,7 +678,14 @@ impl RecoveryStore {
             return false;
         };
         root.catalog.iter().all(|entry| {
-            self.manifest(&entry.workspace_id).is_ok_and(|manifest| {
+            let manifest = self.manifest(&entry.workspace_id);
+            // An ordinary origin's catalog entry outlives its released
+            // assignment. Only that proven absence stops blocking unrelated
+            // cleanup; every other unreadable manifest stays fail-closed.
+            if manifest.is_err() && self.origin_assignment_absent(entry) {
+                return true;
+            }
+            manifest.is_ok_and(|manifest| {
                 manifest.claim.is_none()
                     || !manifest.lineage.iter().any(|link| {
                         let assignment = self

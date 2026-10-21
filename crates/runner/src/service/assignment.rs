@@ -540,6 +540,34 @@ struct AdmissionRuntime {
 }
 
 impl AdmissionRuntime {
+    // preparation_failure records which reviewed preparation operation failed
+    // before a generic decline. Operation and failure are closed vocabularies;
+    // never pass paths, peer text, or credentials.
+    fn preparation_failure(
+        &self,
+        offer: &AssignmentOffer,
+        operation: &'static str,
+        failure: &'static str,
+    ) {
+        if let Some(recorder) = &self.recorder {
+            recorder.record(
+                "runner.assignment_preparation_failure",
+                [
+                    opentelemetry::KeyValue::new(
+                        crate::telemetry::attribute::ASSIGNMENT_ID,
+                        offer.assignment_id.clone(),
+                    ),
+                    opentelemetry::KeyValue::new(
+                        crate::telemetry::attribute::RUN_ID,
+                        offer.run_id.clone(),
+                    ),
+                    opentelemetry::KeyValue::new("um.preparation.operation", operation),
+                    opentelemetry::KeyValue::new("um.preparation.failure", failure),
+                ],
+            );
+        }
+    }
+
     fn progress(
         &self,
         offer: &AssignmentOffer,
@@ -1608,3 +1636,29 @@ pub(crate) use nested_workflow_scenario::run_nested_workflow_delivery_failure_sc
 
 #[cfg(test)]
 mod tests;
+
+fn io_error_kind(error: &std::io::Error) -> &'static str {
+    match error.kind() {
+        std::io::ErrorKind::NotFound => "not_found",
+        std::io::ErrorKind::PermissionDenied => "permission_denied",
+        std::io::ErrorKind::AlreadyExists => "already_exists",
+        std::io::ErrorKind::ReadOnlyFilesystem => "read_only_filesystem",
+        std::io::ErrorKind::StorageFull => "storage_full",
+        _ => "other",
+    }
+}
+
+fn materialization_failure_name(failure: MaterializationFailure) -> &'static str {
+    match failure {
+        MaterializationFailure::ProviderUnavailable => "provider_unavailable",
+        MaterializationFailure::RepositoryUnavailable => "repository_unavailable",
+        MaterializationFailure::AssignmentFenced => "assignment_fenced",
+        MaterializationFailure::EnvironmentUnavailable => "environment_unavailable",
+        MaterializationFailure::CommitUnavailable => "commit_unavailable",
+        MaterializationFailure::CommitMismatch => "commit_mismatch",
+        MaterializationFailure::UnsupportedObjectFormat => "unsupported_object_format",
+        MaterializationFailure::DirtyCheckout => "dirty_checkout",
+        MaterializationFailure::WorkflowUnavailable => "workflow_unavailable",
+        MaterializationFailure::WorkflowDigestMismatch => "workflow_digest_mismatch",
+    }
+}

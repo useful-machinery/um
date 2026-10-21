@@ -810,7 +810,7 @@ fn align_offer_with_source_fixture(manager: &AssignmentManager, offered: &mut As
 
 fn has_offer_preparation(manager: &mut AssignmentManager) -> bool {
     manager
-        .pending_observations(&BTreeSet::new(), 10)
+        .pending_observations(&BTreeSet::new(), 100)
         .iter()
         .any(|pending| matches!(pending.observation, AssignmentObservation::Preparing { .. }))
 }
@@ -825,7 +825,7 @@ async fn wait_for_offer_preparation(
             tokio::pin!(notified);
             notified.as_mut().enable();
             if let Some(preparation) = manager
-                .pending_observations(&BTreeSet::new(), 10)
+                .pending_observations(&BTreeSet::new(), 100)
                 .into_iter()
                 .find(|pending| {
                     matches!(pending.observation, AssignmentObservation::Preparing { .. })

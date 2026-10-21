@@ -268,6 +268,8 @@ pub(super) enum AssignmentRootCreationError {
     Unavailable,
     CleanupFailed,
     OwnershipUnproven,
+    // A retained continuation claim failed at the named reviewed site.
+    RetainedClaimCleanup(&'static str),
 }
 
 pub(super) trait TreeRemover: Send + Sync {
@@ -1884,12 +1886,26 @@ impl WorkRootLease {
         // The new assignment owns private evidence but executes in the prior
         // workspace. Remove only its newly allocated empty directory.
         let empty_workspace = root.workspace.clone();
-        if empty_workspace
+        match empty_workspace
             .release_pending(ProcessQuiescence::Proven)
             .wait()
-            != CleanupResult::Released
         {
-            return Err(AssignmentRootCreationError::CleanupFailed);
+            CleanupResult::Released => {}
+            CleanupResult::Retained => {
+                return Err(AssignmentRootCreationError::RetainedClaimCleanup(
+                    "empty_workspace_retained",
+                ));
+            }
+            CleanupResult::Quarantined(_) => {
+                return Err(AssignmentRootCreationError::RetainedClaimCleanup(
+                    "empty_workspace_quarantined",
+                ));
+            }
+            CleanupResult::Preempted => {
+                return Err(AssignmentRootCreationError::RetainedClaimCleanup(
+                    "empty_workspace_preempted",
+                ));
+            }
         }
         root.workspace = WorkspaceLease::new(workspace, self.engine.clone());
         root.execution = workspace_path;
@@ -1909,17 +1925,18 @@ impl WorkRootLease {
         let (parent_record, _) = create_record_staging(
             root.assignment_tree
                 .directory()
-                .map_err(|_| AssignmentRootCreationError::CleanupFailed)?
+                .map_err(|_| {
+                    AssignmentRootCreationError::RetainedClaimCleanup("parent_record_directory")
+                })?
                 .as_ref(),
             ".retained-parent-staging-",
             prior_assignment_id.as_bytes(),
             32,
         )
-        .map_err(|_| AssignmentRootCreationError::CleanupFailed)?;
-        let root_directory = root
-            .assignment_tree
-            .directory()
-            .map_err(|_| AssignmentRootCreationError::CleanupFailed)?;
+        .map_err(|_| AssignmentRootCreationError::RetainedClaimCleanup("parent_record_staging"))?;
+        let root_directory = root.assignment_tree.directory().map_err(|_| {
+            AssignmentRootCreationError::RetainedClaimCleanup("parent_rename_directory")
+        })?;
         renameat_with(
             root_directory.as_ref(),
             &parent_record,
@@ -1927,9 +1944,9 @@ impl WorkRootLease {
             RETAINED_PARENT_NAME,
             RenameFlags::NOREPLACE,
         )
-        .map_err(|_| AssignmentRootCreationError::CleanupFailed)?;
+        .map_err(|_| AssignmentRootCreationError::RetainedClaimCleanup("parent_record_rename"))?;
         sync_directory(root_directory.as_ref())
-            .map_err(|_| AssignmentRootCreationError::CleanupFailed)?;
+            .map_err(|_| AssignmentRootCreationError::RetainedClaimCleanup("parent_record_sync"))?;
         Ok(proof)
     }
 
@@ -3060,7 +3077,9 @@ mod tests {
                     recorded_root: &previous_path,
                 }
             ),
-            Err(AssignmentRootCreationError::CleanupFailed)
+            Err(AssignmentRootCreationError::RetainedClaimCleanup(
+                "empty_workspace_quarantined"
+            ))
         ));
         let claim_path = directory
             .path()
