@@ -22,6 +22,7 @@ let
       ../schemas
       ../src
       ../tests
+      ../vendor
     ];
   };
 
@@ -31,7 +32,7 @@ let
     strictDeps = true;
   };
 
-  # The dependency-only build is keyed on the crate manifests alone. The
+  # The dependency-only build is keyed on crate manifests and vendored sources. The
   # rolling version and build identity change on every commit and must not
   # reach this derivation, or the cached dependency artifacts would be
   # invalidated by every source change.
@@ -39,6 +40,12 @@ let
     commonArgs
     // {
       version = "0.0.0-deps";
+      # Registry dependencies compile against this local patch, so its API must
+      # remain available while Crane replaces the application crates with stubs.
+      extraDummyScript = ''
+        rm -rf "$out/vendor/rustls-platform-verifier"
+        cp -R ${../vendor/rustls-platform-verifier} "$out/vendor/rustls-platform-verifier"
+      '';
     }
   );
 

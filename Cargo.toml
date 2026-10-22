@@ -24,6 +24,10 @@ members = [
   "crates/test-support",
 ]
 resolver = "3"
+exclude = ["vendor/rustls-platform-verifier"]
+
+[patch.crates-io]
+rustls-platform-verifier = { path = "vendor/rustls-platform-verifier" }
 
 [workspace.package]
 edition = "2024"
@@ -75,6 +79,7 @@ regress = "0.10.4"
 ring = "0.17.14"
 rustix = { version = "1.1.4", features = ["fs", "net", "process", "termios"] }
 rustls = { version = "0.23.42", default-features = false, features = ["ring", "std"] }
+rustls-platform-verifier = "=0.7.0"
 um-api = { path = "crates/api" }
 um-execution = { path = "crates/execution" }
 um-human-auth = { path = "crates/human-auth" }

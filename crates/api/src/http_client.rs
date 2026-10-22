@@ -10,12 +10,14 @@ use http_body_util::Full;
 use hyper::body::Bytes;
 use hyper::{Method, Request, StatusCode};
 use hyper_rustls::HttpsConnectorBuilder;
+// Keep the exact patched platform verifier in both production HTTPS backends.
 use hyper_util::client::legacy::Client as HyperClient;
 use hyper_util::rt::TokioExecutor;
 use reqwest::blocking::Client as BlockingClient;
 use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 use reqwest::header::{CONTENT_LENGTH, HeaderMap};
 use reqwest::{Client, Url};
+use rustls_platform_verifier as _;
 use zeroize::{Zeroize as _, Zeroizing};
 
 use super::generated::apis;
@@ -398,6 +400,9 @@ impl fmt::Display for HttpClientError {
         }
     }
 }
+
+#[cfg(all(test, target_vendor = "apple"))]
+mod native_distrust_tests;
 
 #[cfg(test)]
 #[allow(

@@ -228,6 +228,7 @@ import json
 from pathlib import Path
 import re
 import sys
+import tomllib
 
 root = Path(sys.argv[1]).resolve()
 metadata = json.loads(sys.argv[2])
@@ -243,7 +244,30 @@ for manifest in sorted(member_manifests):
         raise SystemExit(f"Cargo workspace member escapes the public source: {manifest}")
     text = manifest.read_text(encoding="utf-8")
     if re.search(r"^\s*\[(?:patch(?:\.|\])|replace\])", text, re.MULTILINE):
-        raise SystemExit(f"Cargo source overrides are not permitted: {manifest}")
+        document = tomllib.loads(text)
+        approved_patch = {
+            "crates-io": {
+                "rustls-platform-verifier": {"path": "vendor/rustls-platform-verifier"}
+            }
+        }
+        if (
+            manifest != root / "Cargo.toml"
+            or document.get("patch") != approved_patch
+            or "replace" in document
+        ):
+            raise SystemExit(f"Cargo source overrides are not permitted: {manifest}")
+
+# Both HTTP backends must resolve the exact, self-contained native-verifier fix.
+vendor = (root / "vendor/rustls-platform-verifier/Cargo.toml").resolve()
+if root not in vendor.parents:
+    raise SystemExit("The patched platform verifier escapes the public source boundary")
+vendor_manifest = tomllib.loads(vendor.read_text(encoding="utf-8"))
+if vendor_manifest["package"]["name"] != "rustls-platform-verifier" or vendor_manifest["package"]["version"] != "0.7.0":
+    raise SystemExit("The patched platform verifier package identity changed")
+lock = tomllib.loads((root / "Cargo.lock").read_text(encoding="utf-8"))
+verifiers = [package for package in lock["package"] if package["name"] == "rustls-platform-verifier"]
+if len(verifiers) != 1 or verifiers[0]["version"] != "0.7.0" or "source" in verifiers[0]:
+    raise SystemExit("All HTTP backends must use the single patched platform verifier")
 
 for identifier in workspace_ids:
     package = packages[identifier]
@@ -266,7 +290,7 @@ import re
 import sys
 
 root = Path(sys.argv[1]).resolve()
-source_roots = (root / "src", root / "crates", root / "tests")
+source_roots = (root / "src", root / "crates", root / "tests", root / "vendor")
 direct = re.compile(r'(?:include(?:_str|_bytes)?!\(|#\[path\s*=)\s*"([^"]+)"')
 manifest_relative = re.compile(
     r'env!\("CARGO_MANIFEST_DIR"\)\s*,\s*"([^"]+)"'
