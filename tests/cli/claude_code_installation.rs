@@ -161,7 +161,7 @@ fn doctor_reports_the_qualified_claude_code_snapshot_without_ambient_values() {
         quote(ambient_config.path().to_str().unwrap())
     );
     let fixture = ClaudeCodeFixture::with_execution_and_capability_hook(
-        "2.1.302 (Claude Code)",
+        "2.1.303 (Claude Code)",
         COMPLETE_HELP,
         true,
         "exit 97",
@@ -189,9 +189,9 @@ fn doctor_reports_the_qualified_claude_code_snapshot_without_ambient_values() {
     let check = &report["checks"][0];
     assert_eq!(check["id"], CLAUDE_CODE_CHECK_ID);
     assert_eq!(check["status"], "pass");
-    assert_eq!(check["details"]["version"], "2.1.302");
+    assert_eq!(check["details"]["version"], "2.1.303");
     assert_eq!(check["details"]["supportedRange"], ">=2.1.234 <2.2.0");
-    assert_eq!(check["details"]["qualificationVersion"], "2.1.302");
+    assert_eq!(check["details"]["qualificationVersion"], "2.1.303");
     assert_eq!(check["details"]["profile"], "ClaudeCodeStreamJsonV1");
     assert_eq!(check["details"]["capabilities"], REQUIRED_CAPABILITIES);
     assert_eq!(
@@ -301,7 +301,7 @@ fn doctor_reports_each_claude_code_installation_failure_without_fallback() {
         assert_eq!(report_code(&output), expected_code);
         let details = &report(&output)["checks"][0]["details"];
         assert_eq!(details["supportedRange"], ">=2.1.234 <2.2.0");
-        assert_eq!(details["qualificationVersion"], "2.1.302");
+        assert_eq!(details["qualificationVersion"], "2.1.303");
         if expected_code == "unsupported_claude_code_version" {
             assert_eq!(
                 details["version"],
