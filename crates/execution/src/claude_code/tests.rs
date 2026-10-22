@@ -137,7 +137,7 @@ fn fixture_version_matches_the_qualification_version() {
         installation.version().as_str(),
         CLAUDE_CODE_STREAM_JSON_V1_QUALIFICATION_VERSION
     );
-    assert_eq!(installation.version().numeric(), (2, 1, 303));
+    assert_eq!(installation.version().numeric(), (2, 1, 306));
 }
 
 // REQ-AGENT-2, REQ-AGENT-5, REQ-AGENT-7

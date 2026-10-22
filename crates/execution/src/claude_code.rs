@@ -16,7 +16,7 @@ use crate::process::CommandRunner;
 use crate::process::{CommandOutput, SystemCommandRunner};
 
 pub const CLAUDE_CODE_STREAM_JSON_V1_SUPPORTED_RANGE: &str = ">=2.1.234 <2.2.0";
-pub const CLAUDE_CODE_STREAM_JSON_V1_QUALIFICATION_VERSION: &str = "2.1.303";
+pub const CLAUDE_CODE_STREAM_JSON_V1_QUALIFICATION_VERSION: &str = "2.1.306";
 const CLAUDE_CODE_STREAM_JSON_V1_MINIMUM_VERSION: (u64, u64, u64) = (2, 1, 234);
 const CLAUDE_CODE_STREAM_JSON_V1_MAXIMUM_VERSION: (u64, u64, u64) = (2, 2, 0);
 const CAPABILITY_PROBE_ARGUMENTS: [&str; 1] = ["--help"];
@@ -126,7 +126,7 @@ impl ValidatedClaudeCodeInstallation {
             version: ClaudeCodeVersion::fixture(
                 2,
                 1,
-                303,
+                306,
                 CLAUDE_CODE_STREAM_JSON_V1_QUALIFICATION_VERSION,
             ),
             capabilities: ClaudeCodeStreamJsonV1Capabilities {

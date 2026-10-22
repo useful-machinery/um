@@ -379,12 +379,10 @@ async fn pinned_real_claude_code_01_normal_mode_loopback_conforms_from_a_synthet
             NATIVE_INSTRUCTION_MARKER,
             NATIVE_SKILL_MARKER,
             NATIVE_PLUGIN_MARKER,
-            NATIVE_MCP_MARKER,
         ] {
             assert!(
                 contains_string_fragment(request.body(), marker),
-                "native request omitted resource marker {marker}; tools={:?}; mcp={:?}",
-                request.body()["tools"], fs::read_to_string(&resources.mcp_observation)
+                "native request omitted resource marker {marker}"
             );
         }
         assert_eq!(
@@ -395,6 +393,11 @@ async fn pinned_real_claude_code_01_normal_mode_loopback_conforms_from_a_synthet
         let mcp_observation = fs::read_to_string(&resources.mcp_observation).unwrap();
         assert!(mcp_observation.starts_with("started\n"));
         assert!(mcp_observation.contains("tools/list"));
+        // This release defers MCP descriptions until the native tool search
+        // selects the tool. Exercise that path before the ordinary response.
+        request.release_tool_use("ToolSearch", json!({"query": "scherzo_native_resource"}));
+        let request = provider.next_request().await;
+        assert!(contains_string_fragment(request.body(), NATIVE_MCP_MARKER));
         request.release_text(RESPONSE);
 
         let output = child.wait_with_output().await.unwrap();
@@ -743,14 +746,25 @@ async fn pinned_real_claude_code_04_production_no_value_and_native_failure_are_t
             .next_request()
             .await
             .release_invalid_request();
-        // This qualification release retries an invalid provider request once. Keep
-        // both responses controlled so the terminal native failure can be observed.
-        let retry = failure_provider.next_request().await;
-        assert!(retry.used_placeholder_key());
-        assert!(retry.body()["messages"].is_array());
-        retry.release_invalid_request();
+        // Control every bounded native recovery attempt; the exact retry count
+        // is not part of the profile's typed terminal-failure contract.
+        let finish = failure.finish();
+        tokio::pin!(finish);
+        let mut attempts = 1;
+        let outcome = loop {
+            tokio::select! {
+                outcome = &mut finish => break outcome,
+                retry = failure_provider.next_request() => {
+                    attempts += 1;
+                    assert!(attempts <= 8, "native invalid-request recovery must be bounded");
+                    assert!(retry.used_placeholder_key());
+                    assert!(retry.body()["messages"].is_array());
+                    retry.release_invalid_request();
+                }
+            }
+        };
         assert_eq!(
-            failure.finish().await,
+            outcome,
             failed_agent_outcome(AgentFailureCause::HarnessFailed {
                 detail: AgentHarnessFailureDetail::ModelError,
             })

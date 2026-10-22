@@ -5,8 +5,8 @@
   "type": "module",
   "packageManager": "npm@11.13.0",
   "engines": {
-    "node": "24.16.x",
-    "npm": "11.13.x"
+    "node": "24.22.x",
+    "npm": "11.19.x"
   },
   "scripts": {
     "check": "npm run format:check && npm run lint && npm run typecheck && npm run fixture:check && npm run runtime:check && npm test",

@@ -12,6 +12,8 @@ let
   msrvToolchain = rustPackages.rust-bin.stable.${rustVersion}.minimal;
 in
 {
+  imports = [ ./devenv-security.nix ];
+
   # This environment deliberately duplicates the private repository's Rust and
   # structural-check tools because the exported CLI tree must validate without
   # importing or reading its parent repository.
