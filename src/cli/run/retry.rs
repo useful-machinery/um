@@ -6,8 +6,8 @@ use anyhow::Context;
 use clap::Args;
 use serde::Serialize;
 use um_api::{
-    RetryConflict, RunFailure, RunRetryReceipt, RunRetryRejection, RunRetryState,
-    UnreachableCategory,
+    RetryConflict, RunFailure, RunRetryFailureCode, RunRetryReceipt, RunRetryRejection,
+    RunRetryState, UnreachableCategory,
 };
 use um_human_auth::Deployment;
 
@@ -238,6 +238,32 @@ impl Command {
                                 )
                             });
                         }
+                        RunRetryState::Failed => {
+                            return finish_operation(control, || {
+                                let code = recovery
+                                    .receipt
+                                    .as_ref()
+                                    .and_then(|receipt| receipt.failure.as_ref())
+                                    .map(|failure| match failure.code {
+                                        RunRetryFailureCode::CoordinatorRejected => {
+                                            "coordinator_rejected"
+                                        }
+                                    })
+                                    .unwrap_or("protocol_error");
+                                render(
+                                    (
+                                        deployment,
+                                        &self.run.organization,
+                                        &self.run.run_id,
+                                        self.options.json,
+                                    ),
+                                    &recovery,
+                                    "failed",
+                                    Some(code),
+                                    ExitCode::GeneralFailure,
+                                )
+                            });
+                        }
                         RunRetryState::Pending => super::super::observation_poll_interval(),
                     }
                 }
@@ -455,6 +481,7 @@ fn render(
         let mut stderr = io::stderr().lock();
         let diagnostic = match outcome {
             "rejected" => "run retry rejected",
+            "failed" => "run retry command failed",
             "trigger_slot_conflict" | "retry_pending" => "run retry conflicts with current state",
             "timed_out" => "run retry observation timed out",
             "observation_stopped" => "run retry observation stopped",
@@ -470,6 +497,12 @@ fn render(
             writeln!(stderr, "request: {id}")?;
         } else {
             writeln!(stderr, "idempotency key: {}", recovery.key)?;
+        }
+        if let Some(error_type) = receipt
+            .and_then(|receipt| receipt.failure.as_ref())
+            .and_then(|failure| failure.diagnostic.error_type.as_deref())
+        {
+            writeln!(stderr, "error type: {error_type}")?;
         }
         writeln!(
             stderr,

@@ -178,8 +178,8 @@ pub use runs::{
     RunContinuationReplacement, RunContinuationReplacementSource, RunContinuationRequest,
     RunContinuationWorkspaceModified, RunCreationAcceptance, RunCreationPending, RunFailure,
     RunInterruption, RunInterruptionPhase, RunList, RunListFilter, RunObservation,
-    RunPublicationHandoffState, RunRead, RunRetryReceipt, RunRetryRejection, RunRetryState,
-    RunState, valid_integration_context,
+    RunPublicationHandoffState, RunRead, RunRetryFailureCode, RunRetryReceipt, RunRetryRejection,
+    RunRetryState, RunState, valid_integration_context,
 };
 pub use service_principals::{
     CreateServicePrincipalOutcome, IssueServiceCredentialOutcome, IssuedServiceApiKey,

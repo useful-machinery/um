@@ -615,7 +615,11 @@ mod retry_command_tests {
             "observedVersion": 7, "acceptedAt": "2026-08-10T12:00:00Z",
             "state": state, "fault": null,
             "resolvedAt": if state == "pending" { None } else { Some("2026-08-10T12:01:00Z") },
-            "rejection": rejection,
+            "rejection": if state == "rejected" { rejection } else { None },
+            "failure": if state == "failed" { serde_json::json!({
+                "code": "coordinator_rejected",
+                "diagnostic": {"errorType": rejection.unwrap_or("invariant_retry_source_missing")}
+            }) } else { serde_json::Value::Null },
             "attemptId": if state == "applied" { Some(ATTEMPT_ID) } else { None },
             "attemptNumber": if state == "applied" { Some(2) } else { None },
             "runVersion": if state == "applied" { Some(8) } else { None }
@@ -673,7 +677,7 @@ mod retry_command_tests {
                 });
                 let reply = match state.as_str() {
                     "lost" => None,
-                    "pending" | "applied" | "rejected" | "applied-post" => {
+                    "pending" | "applied" | "rejected" | "failed" | "applied-post" => {
                         let post = lines.starts_with("POST ");
                         let state = if state == "applied-post" {
                             "applied"
@@ -908,6 +912,38 @@ mod retry_command_tests {
     }
 
     // REQ-RETRY-36
+    #[test]
+    // REQ-RETRY-48, REQ-DIAG-35
+    fn coordinator_failure_stops_observation_and_preserves_diagnostic() {
+        let (output, requests) = execute(&[("pending", None), ("failed", None)], &args());
+        assert_eq!(output.status.code(), Some(1));
+        assert!(output.stderr.is_empty());
+        let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(json["outcome"], "failed");
+        assert_eq!(json["code"], "coordinator_rejected");
+        assert_eq!(
+            json["receipt"]["failure"]["diagnostic"]["errorType"],
+            "invariant_retry_source_missing"
+        );
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].starts_with("POST "));
+        assert!(requests[1].starts_with("GET "));
+    }
+
+    #[test]
+    // REQ-DIAG-35
+    fn invalid_coordinator_failure_diagnostic_is_a_protocol_error() {
+        let (output, requests) = execute(
+            &[("pending", None), ("failed", Some("unsafe\nreason"))],
+            &args(),
+        );
+        assert_eq!(output.status.code(), Some(1));
+        let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(json["outcome"], "error");
+        assert_eq!(json["code"], "protocol_error");
+        assert_eq!(requests.len(), 2);
+    }
+
     #[test]
     fn receipt_loss_and_authorization_loss_never_resubmit() {
         for (problem, code, exit) in [("not-found", "not_found", 1), ("forbidden", "forbidden", 1)]

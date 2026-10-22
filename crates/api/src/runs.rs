@@ -41,6 +41,7 @@ pub type RunContinuationWorkspaceModified = models::RunContinuationWorkspaceModi
 pub type RunRetryReceipt = models::RunRetryReceipt;
 pub type RunRetryState = models::run_retry_receipt::State;
 pub type RunRetryRejection = models::run_retry_receipt::Rejection;
+pub type RunRetryFailureCode = models::run_retry_failure::Code;
 pub type RunCancellation = models::RunCancellation;
 pub type RunInterruption = models::RunInterruption;
 pub type RunInterruptionPhase = models::run_interruption::Phase;
@@ -877,6 +878,7 @@ fn validate_retry_receipt(receipt: &RunRetryReceipt, run_id: &str) -> Result<(),
             RunRetryState::Pending => {
                 receipt.resolved_at.is_none()
                     && receipt.rejection.is_none()
+                    && receipt.failure.is_none()
                     && receipt.attempt_id.is_none()
                     && receipt.attempt_number.is_none()
                     && receipt.run_version.is_none()
@@ -884,6 +886,7 @@ fn validate_retry_receipt(receipt: &RunRetryReceipt, run_id: &str) -> Result<(),
             RunRetryState::Applied => {
                 receipt.resolved_at.is_some()
                     && receipt.rejection.is_none()
+                    && receipt.failure.is_none()
                     && receipt.fault.is_none()
                     && receipt.attempt_id.is_some()
                     && receipt.attempt_number.is_some()
@@ -892,6 +895,16 @@ fn validate_retry_receipt(receipt: &RunRetryReceipt, run_id: &str) -> Result<(),
             RunRetryState::Rejected => {
                 receipt.resolved_at.is_some()
                     && receipt.rejection.is_some()
+                    && receipt.failure.is_none()
+                    && receipt.fault.is_none()
+                    && receipt.attempt_id.is_none()
+                    && receipt.attempt_number.is_none()
+                    && receipt.run_version.is_none()
+            }
+            RunRetryState::Failed => {
+                receipt.resolved_at.is_some()
+                    && receipt.failure.as_deref().is_some_and(valid_retry_failure)
+                    && receipt.rejection.is_none()
                     && receipt.fault.is_none()
                     && receipt.attempt_id.is_none()
                     && receipt.attempt_number.is_none()
@@ -903,6 +916,20 @@ fn validate_retry_receipt(receipt: &RunRetryReceipt, run_id: &str) -> Result<(),
     } else {
         Err(RunFailure::protocol(false))
     }
+}
+
+fn valid_retry_failure(failure: &models::RunRetryFailure) -> bool {
+    failure
+        .diagnostic
+        .error_type
+        .as_deref()
+        .is_some_and(|value| {
+            let mut bytes = value.bytes();
+            value.len() <= 64
+                && bytes.next().is_some_and(|byte| byte.is_ascii_lowercase())
+                && bytes
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+        })
 }
 
 fn decode_create_response(
