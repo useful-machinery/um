@@ -37,6 +37,23 @@ pub type Publication = models::Publication;
 pub type PublicationList = models::PublicationList;
 pub type PublicationState = models::publication::State;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ExistingPublicationTarget<'a> {
+    pub number: i64,
+    pub expected_head: Option<&'a str>,
+}
+
+pub(super) fn target_selection(
+    target: ExistingPublicationTarget<'_>,
+) -> models::PublicationTargetSelection {
+    let mut selected = models::PublicationTargetSelection::new(
+        models::publication_target_selection::Kind::ExistingChangeRequest,
+    );
+    selected.number = Some(target.number);
+    selected.expected_head_oid = target.expected_head.map(str::to_owned);
+    selected
+}
+
 pub struct PublicationApi {
     configuration: apis::configuration::Configuration,
 }
@@ -69,6 +86,7 @@ impl PublicationApi {
         organization: &str,
         run_id: &str,
         export_name: &str,
+        target: Option<ExistingPublicationTarget<'_>>,
         idempotency_key: &str,
         begin_dispatch: impl Fn() -> bool,
     ) -> Result<Publication, PublicationFailure> {
@@ -78,7 +96,8 @@ impl PublicationApi {
             apis::urlencode(organization),
             apis::urlencode(run_id)
         );
-        let request = models::CreatePublicationRequest::new(export_name.to_owned());
+        let mut request = models::CreatePublicationRequest::new(export_name.to_owned());
+        request.target = target.map(|selection| Box::new(target_selection(selection)));
         let mut last_transport_failure = UnreachableCategory::Connection;
         for attempt in 0..CREATE_ATTEMPTS {
             if !begin_dispatch() {
@@ -571,6 +590,8 @@ fn decode_closed_publication_value(
         "target",
         if gitlab {
             GITLAB_TARGET_FIELDS
+        } else if value["target"]["kind"] == "existing_change_request" {
+            EXISTING_TARGET_FIELDS
         } else {
             TARGET_FIELDS
         },
@@ -683,6 +704,20 @@ const ARTIFACT_FIELDS: &[&str] = &[
     "expiresAt",
 ];
 const TARGET_FIELDS: &[&str] = &[
+    "kind",
+    "repositoryConnectionId",
+    "providerRepositoryId",
+    "fullName",
+    "baseBranch",
+    "destinationBranch",
+    "branchVersion",
+];
+const EXISTING_TARGET_FIELDS: &[&str] = &[
+    "kind",
+    "number",
+    "providerChangeRequestId",
+    "sourceRef",
+    "expectedHeadOid",
     "repositoryConnectionId",
     "providerRepositoryId",
     "fullName",
@@ -691,6 +726,7 @@ const TARGET_FIELDS: &[&str] = &[
     "branchVersion",
 ];
 const GITLAB_TARGET_FIELDS: &[&str] = &[
+    "kind",
     "repositoryConnectionId",
     "providerRepositoryId",
     "fullName",
@@ -895,16 +931,46 @@ fn validate_publication(
                 && publication.merge_request.is_none()
         }
         && valid_bounded_string(&publication.target.base_branch, 1, 1024)
-        && match publication.target.branch_version {
-            1 => {
-                publication.target.destination_branch
-                    == format!("scherzo/{requested_run_id}/{}", publication.export_name)
+        && match publication.target.kind {
+            models::publication_target::Kind::NewChangeRequest => {
+                publication.target.number.is_none()
+                    && publication.target.provider_change_request_id.is_none()
+                    && publication.target.source_ref.is_none()
+                    && publication.target.expected_head_oid.is_none()
+                    && match publication.target.branch_version {
+                        1 => {
+                            publication.target.destination_branch
+                                == format!("scherzo/{requested_run_id}/{}", publication.export_name)
+                        }
+                        2 => {
+                            publication.target.destination_branch
+                                == format!("um/{requested_run_id}/{}", publication.export_name)
+                        }
+                        _ => false,
+                    }
             }
-            2 => {
-                publication.target.destination_branch
-                    == format!("um/{requested_run_id}/{}", publication.export_name)
+            models::publication_target::Kind::ExistingChangeRequest => {
+                publication.provider_kind == ProviderKind::Github
+                    && publication.target.branch_version == 2
+                    && publication.target.number.is_some_and(|number| number > 0)
+                    && publication
+                        .target
+                        .provider_change_request_id
+                        .as_deref()
+                        .is_some_and(valid_provider_id)
+                    && publication.target.source_ref.as_deref()
+                        == Some(publication.target.destination_branch.as_str())
+                    && publication
+                        .target
+                        .source_ref
+                        .as_deref()
+                        .is_some_and(|source| valid_bounded_string(source, 1, 1024))
+                    && publication
+                        .target
+                        .expected_head_oid
+                        .as_deref()
+                        .is_some_and(|oid| um_support::is_lowercase_hex(oid, 40))
             }
-            _ => false,
         }
         && valid_bounded_string(&publication.target.destination_branch, 1, 1024)
         && if publication.provider_kind == ProviderKind::Gitlab {
@@ -945,6 +1011,16 @@ fn validate_publication(
                 branch.created_by.is_some()
             } else {
                 branch.created_by.is_none()
+                    && match publication.target.kind {
+                        models::publication_target::Kind::ExistingChangeRequest => matches!(
+                            branch.disposition,
+                            models::publication_branch::Disposition::Updated
+                                | models::publication_branch::Disposition::Reused
+                        ),
+                        models::publication_target::Kind::NewChangeRequest => {
+                            branch.disposition != models::publication_branch::Disposition::Updated
+                        }
+                    }
             }
     }) && publication
         .pull_request
@@ -996,7 +1072,11 @@ fn validate_publication(
                     && publication.failure.is_none()
                     && match publication.outcome {
                         Some(Outcome::NoChanges) => {
-                            publication.branch.is_none()
+                            (publication.target.kind
+                                != models::publication_target::Kind::ExistingChangeRequest
+                                || publication.target.expected_head_oid.as_deref()
+                                    == Some(publication.artifact.head_oid.as_str()))
+                                && publication.branch.is_none()
                                 && publication
                                     .pull_request
                                     .as_ref()
@@ -1005,6 +1085,29 @@ fn validate_publication(
                                     .merge_request
                                     .as_ref()
                                     .is_none_or(Option::is_none)
+                        }
+                        Some(Outcome::PullRequestUpdated)
+                            if publication.provider_kind == ProviderKind::Github
+                                && publication.target.kind
+                                    == models::publication_target::Kind::ExistingChangeRequest =>
+                        {
+                            publication
+                                .pull_request
+                                .as_ref()
+                                .and_then(Option::as_deref)
+                                .is_some_and(|request| {
+                                    publication.branch.is_some()
+                                        && i64::from(request.number)
+                                            == publication.target.number.unwrap_or_default()
+                                        && request.provider_id
+                                            == publication
+                                                .target
+                                                .provider_change_request_id
+                                                .as_deref()
+                                                .unwrap_or_default()
+                                        && request.state
+                                            == models::publication_pull_request::State::Open
+                                })
                         }
                         Some(Outcome::PullRequestPublished)
                             if publication.provider_kind == ProviderKind::Github =>
@@ -1144,16 +1247,22 @@ fn valid_publication_failure(
         | Code::PullRequestConflict
         | Code::MergeRequestConflict
         | Code::ProviderIdentityChanged
-        | Code::ProviderUnavailable => Some(true),
+        | Code::ProviderUnavailable
+        | Code::ChangeRequestUnavailable
+        | Code::TargetHeadChanged
+        | Code::CandidateNotFastForward
+        | Code::ProviderEffectUnconfirmed => Some(true),
         Code::InternalPublicationFailure => None,
     };
     let phase_valid = match failure.code {
         Code::ArtifactExpired => matches!(failure.phase, Phase::Artifact | Phase::Preflight),
         Code::ArtifactInvalid => failure.phase == Phase::Artifact,
         Code::ArtifactNotApplicable
-        | Code::WorkflowFileChangeUnsupported
         | Code::BaseBranchUnavailable
         | Code::BaseBranchIncompatible => failure.phase == Phase::Preflight,
+        Code::WorkflowFileChangeUnsupported => {
+            matches!(failure.phase, Phase::Preflight | Phase::Branch)
+        }
         Code::ActorAuthorityLost | Code::ProjectRepositoryChanged => {
             failure.phase == Phase::Branch || failure.phase == request_phase
         }
@@ -1162,6 +1271,12 @@ fn valid_publication_failure(
                 || failure.phase == request_phase
         }
         Code::TargetBranchConflict => failure.phase == Phase::Branch,
+        Code::CandidateNotFastForward => matches!(failure.phase, Phase::Preflight | Phase::Branch),
+        Code::TargetHeadChanged
+        | Code::ChangeRequestUnavailable
+        | Code::ProviderEffectUnconfirmed => {
+            matches!(failure.phase, Phase::Branch | Phase::PullRequest)
+        }
         Code::PullRequestConflict => failure.phase == Phase::PullRequest,
         Code::MergeRequestConflict => failure.phase == Phase::MergeRequest,
         Code::ProviderIdentityChanged => matches!(

@@ -619,11 +619,38 @@ fn normalized_agent_payload(
             AgentPresentationObservationKind::ValueRejected,
             format!("{} · {}", agent_value_kind(*kind), feedback),
         ),
-        AgentObservation::UnrecognizedHarnessEvent { .. } => (
+        AgentObservation::UnrecognizedHarnessEvent { event } => (
             AgentPresentationObservationKind::HarnessEvent,
-            "unrecognized harness event".to_owned(),
+            unrecognized_harness_event_payload(event),
         ),
     }
+}
+
+/// Names only the protocol tokens that identify a native event's kind: a Claude Code
+/// `type` and `subtype`, or a Codex `method`. Every other field is native content.
+fn unrecognized_harness_event_payload(event: &serde_json::Value) -> String {
+    const BARE: &str = "unrecognized harness event";
+    let field = |key: &str| event.get(key).and_then(serde_json::Value::as_str);
+    let tokens = match (field("type"), field("subtype"), field("method")) {
+        (Some(event_type), Some(subtype), _) => vec![event_type, subtype],
+        (Some(event_type), None, _) => vec![event_type],
+        (None, _, Some(method)) => vec![method],
+        (None, _, None) => Vec::new(),
+    };
+    if !tokens.iter().copied().all(is_native_kind_token) {
+        return BARE.to_owned();
+    }
+    std::iter::once(BARE)
+        .chain(tokens)
+        .collect::<Vec<_>>()
+        .join(" · ")
+}
+
+fn is_native_kind_token(token: &str) -> bool {
+    (1..=64).contains(&token.len())
+        && token
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"_-/.:".contains(&byte))
 }
 
 const fn agent_tool_call_phase(phase: AgentToolCallPhase) -> &'static str {

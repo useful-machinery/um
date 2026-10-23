@@ -155,7 +155,8 @@ pub use projects::{
     ProjectList, ProjectReadinessBlocker, ProjectRepository, ProjectRepositorySelector,
 };
 pub use publications::{
-    Publication, PublicationApi, PublicationFailure, PublicationList, PublicationState,
+    ExistingPublicationTarget, Publication, PublicationApi, PublicationFailure, PublicationList,
+    PublicationState,
 };
 pub use run_inputs::{
     InputAttachmentMetadata, InputFileMetadata, InputScalarMetadata, NamedInputMetadata,

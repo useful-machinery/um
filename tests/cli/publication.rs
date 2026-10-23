@@ -78,6 +78,7 @@ fn publication_body() -> serde_json::Value {
             "expiresAt": "2026-10-03T18:00:00Z"
         },
         "target": {
+            "kind": "new_change_request",
             "repositoryConnectionId": REPOSITORY_CONNECTION_ID,
             "providerRepositoryId": "123456",
             "fullName": "scherzo-systems/um",
@@ -679,6 +680,104 @@ fn publication_create_sends_the_closed_request_and_renders_plain_and_json_receip
         );
         assert!(!request.contains("targetBranch"));
         assert!(!request.contains("pullRequest"));
+    }
+}
+
+// REQ-PUBLISH-87, REQ-PUBLISH-92, REQ-PUBLISH-95
+#[test]
+fn publication_create_existing_target_sends_selection_and_reads_retained_binding() {
+    let mut body = publication_body();
+    let head = "0123456789abcdef0123456789abcdef01234567";
+    body["target"]["kind"] = serde_json::json!("existing_change_request");
+    body["target"]["number"] = serde_json::json!(42);
+    body["target"]["providerChangeRequestId"] = serde_json::json!("420");
+    body["target"]["destinationBranch"] = serde_json::json!("human/feature");
+    body["target"]["sourceRef"] = serde_json::json!("human/feature");
+    body["target"]["expectedHeadOid"] = serde_json::json!(head);
+    let (server, _directory, credential_path) =
+        prepared_publication(vec![accepted_response(&body)]);
+    let environment = deployment_environment(&server.api_url, &credential_path);
+    let mut args = create_args(true, true);
+    args.extend(["--change-request", "42", "--expected-head", head]);
+    let output = run_with_env(&args, &environment);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        assert_one_json_document(&output.stdout)["publication"],
+        body
+    );
+    let request = server.finish().remove(0);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(request.split_once("\r\n\r\n").unwrap().1)
+            .unwrap(),
+        serde_json::json!({"exportName": EXPORT_NAME, "target": {"kind":"existing_change_request","number":42,"expectedHeadOid":head}})
+    );
+}
+
+// REQ-PUBLISH-91: an existing-target path refusal is a branch-phase failure,
+// not an invalid server response, on every publication read path.
+#[test]
+fn existing_target_workflow_policy_failure_is_readable() {
+    let mut failed = publication_history().remove(3);
+    failed["id"] = serde_json::json!(PUBLICATION_ID);
+    failed["target"]["kind"] = serde_json::json!("existing_change_request");
+    failed["target"]["number"] = serde_json::json!(42);
+    failed["target"]["providerChangeRequestId"] = serde_json::json!("420");
+    failed["target"]["destinationBranch"] = serde_json::json!("human/feature");
+    failed["target"]["sourceRef"] = serde_json::json!("human/feature");
+    failed["target"]["expectedHeadOid"] =
+        serde_json::json!("0123456789abcdef0123456789abcdef01234567");
+    failed["failure"] = serde_json::json!({
+        "phase": "branch", "code": "workflow_file_change_unsupported",
+        "retryable": false, "diagnostic": {"stage": "path_policy"}
+    });
+    let page = serde_json::json!({"items": [failed.clone()]});
+    let mut queued = failed.clone();
+    queued["state"] = serde_json::json!("queued");
+    queued["version"] = serde_json::json!(1);
+    queued["failure"] = serde_json::Value::Null;
+    queued["startedAt"] = serde_json::Value::Null;
+    queued["terminalAt"] = serde_json::Value::Null;
+    for (args, responses, exit) in [
+        (
+            create_wait_args(true, true, None),
+            vec![accepted_response(&queued), ok_publication_response(&failed)],
+            1,
+        ),
+        (show_args(true), vec![ok_publication_response(&failed)], 0),
+        (
+            show_wait_args(true, None),
+            vec![ok_publication_response(&failed)],
+            0,
+        ),
+        (
+            list_args(true, false),
+            vec![ok_publication_response(&page)],
+            0,
+        ),
+    ] {
+        let (server, _directory, credential_path) = prepared_publication(responses);
+        let output = run_with_env(
+            &args,
+            &deployment_environment(&server.api_url, &credential_path),
+        );
+        assert_eq!(
+            output.status.code(),
+            Some(exit),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let document = assert_one_json_document(&output.stdout);
+        let observed = if args[1] == "list" {
+            &document["items"][0]
+        } else {
+            &document["publication"]
+        };
+        assert_eq!(observed["failure"], failed["failure"]);
+        server.finish();
     }
 }
 

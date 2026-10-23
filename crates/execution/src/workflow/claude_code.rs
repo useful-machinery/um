@@ -103,6 +103,7 @@ use super::agent::{
     CapturedJson, CompletedAgentInvocation, HarnessFailureDiagnostic, failed_agent_outcome,
     tool_call_observation,
 };
+use super::text_fit::ellipsize;
 #[cfg(test)]
 const QUALIFICATION_VERSION: &str =
     crate::claude_code::CLAUDE_CODE_STREAM_JSON_V1_QUALIFICATION_VERSION;
@@ -110,6 +111,12 @@ const QUALIFICATION_VERSION: &str =
 const MAXIMUM_FRAME_BYTES: u64 = 16 * 1024 * 1024;
 const MAXIMUM_DIAGNOSTIC_SEQUENCE: u64 = i64::MAX as u64;
 const PERMISSION_MODE: &str = "bypassPermissions";
+const MAXIMUM_TRACKED_TASKS: usize = 128;
+const MAXIMUM_OBSERVED_UNRECOGNIZED_KINDS: usize = 64;
+const MAXIMUM_UNRECOGNIZED_KIND_TOKEN_BYTES: usize = 64;
+// Display-width bounds on the harness-reported text a subagent diagnostic names.
+const MAXIMUM_SUBAGENT_DESCRIPTION_WIDTH: usize = 200;
+const MAXIMUM_SUBAGENT_TOKEN_WIDTH: usize = 64;
 const STRUCTURED_OUTPUT_TOOL_NAME: &str = "StructuredOutput";
 pub(crate) const RESULT_ENVELOPE_SCHEMA: &str = r#"{"type":"object","required":["result"],"properties":{"result":{}},"additionalProperties":true}"#;
 
@@ -411,8 +418,43 @@ struct BackgroundCommand {
     task_id: Arc<str>,
     tool_use_id: Arc<str>,
     run_id: Option<Arc<str>>,
+    /// Started with `is_backgrounded: true`, or moved to the background later by a
+    /// `task_updated` patch or by the tool result that names its `backgroundTaskId`. Only
+    /// a backgrounded command owes a `task_notification` before the stream may end.
+    backgrounded: bool,
     acknowledged: bool,
     notified: bool,
+}
+
+impl BackgroundCommand {
+    fn awaits_notification(&self) -> bool {
+        self.backgrounded && !self.notified
+    }
+}
+
+/// A foreground subagent the Agent tool started inside the active exchange. It is
+/// observational: settling it is not a completion condition, and the exchange's end
+/// forgets it.
+struct ForegroundSubagent {
+    task_id: Arc<str>,
+    tool_use_id: Arc<str>,
+    subagent_type: Option<Arc<str>>,
+    description: Option<Arc<str>>,
+}
+
+impl ForegroundSubagent {
+    fn message(&self, event: &str) -> String {
+        let mut message = String::from("subagent");
+        for token in self.subagent_type.iter().map(AsRef::as_ref).chain([event]) {
+            message.push(' ');
+            message.push_str(token);
+        }
+        if let Some(description) = &self.description {
+            message.push_str(" · ");
+            message.push_str(description);
+        }
+        message
+    }
 }
 
 pub(crate) struct ClaudeCodeStreamJsonV1Parser {
@@ -430,6 +472,9 @@ pub(crate) struct ClaudeCodeStreamJsonV1Parser {
     completed_exchanges: u64,
     bash_calls: Vec<Arc<str>>,
     background_commands: Vec<BackgroundCommand>,
+    foreground_subagents: Vec<ForegroundSubagent>,
+    /// Native `type`/`subtype` pairs already observed as unrecognized in this invocation.
+    observed_unrecognized_kinds: Vec<(Box<str>, Option<Box<str>>)>,
     active_message: Option<StreamedMessage>,
     final_main_message: Option<CompletedMainMessage>,
     exchange_structured_output_candidates: u64,
@@ -490,6 +535,8 @@ impl ClaudeCodeStreamJsonV1Parser {
             completed_exchanges: 0,
             bash_calls: Vec::new(),
             background_commands: Vec::new(),
+            foreground_subagents: Vec::new(),
+            observed_unrecognized_kinds: Vec::new(),
             active_message: None,
             final_main_message: None,
             exchange_structured_output_candidates: 0,
@@ -644,7 +691,10 @@ impl ClaudeCodeStreamJsonV1Parser {
             || self.completed_result_exchange.is_some()
             || self.result_decision_pending
             || self.completed_exchanges == 0
-            || self.background_commands.iter().any(|task| !task.notified)
+            || self
+                .background_commands
+                .iter()
+                .any(BackgroundCommand::awaits_notification)
         {
             return self.protocol_failure_outcome(
                 AgentFailureCause::HarnessProtocolFailed,
@@ -809,7 +859,7 @@ impl ClaudeCodeStreamJsonV1Parser {
                     != self
                         .background_commands
                         .iter()
-                        .filter(|task| !task.notified)
+                        .filter(|task| task.awaits_notification())
                         .count()
                 {
                     return Err(self.protocol_failure());
@@ -822,7 +872,7 @@ impl ClaudeCodeStreamJsonV1Parser {
                     if required_string(entry, "task_type") != Some("local_bash")
                         || seen.contains(&id)
                         || !self.background_commands.iter().any(|task| {
-                            !task.notified
+                            task.awaits_notification()
                                 && task.task_id.as_ref() == id
                                 && task.run_id.as_deref()
                                     == required_nonempty_string(entry, "run_id")
@@ -991,9 +1041,11 @@ impl ClaudeCodeStreamJsonV1Parser {
             required_u64(usage, "input_tokens").ok_or_else(|| self.protocol_failure())?;
         let output_tokens =
             required_u64(usage, "output_tokens").ok_or_else(|| self.protocol_failure())?;
+        // A subagent (a message under a `parent_tool_use_id`) runs on whatever model the
+        // harness's subagent facility chose for it; only the main thread must be the profile's.
         if required_string(message, "type") != Some("message")
             || required_string(message, "role") != Some("assistant")
-            || model != self.expected_model.as_ref()
+            || (parent_tool_use_id.is_none() && model != self.expected_model.as_ref())
             || required_array(message, "content").is_none_or(|content| !content.is_empty())
         {
             return Err(self.protocol_failure());
@@ -1485,7 +1537,9 @@ impl ClaudeCodeStreamJsonV1Parser {
             });
             return Ok(());
         }
-        if required_string(message, "model") != Some(self.expected_model.as_ref()) {
+        let model =
+            required_nonempty_string(message, "model").ok_or_else(|| self.protocol_failure())?;
+        if parent.is_none() && model != self.expected_model.as_ref() {
             return Err(self.protocol_failure());
         }
 
@@ -1601,7 +1655,15 @@ impl ClaudeCodeStreamJsonV1Parser {
                 if task.acknowledged {
                     return Err(self.protocol_failure());
                 }
+                // A result naming the task is the harness's word that the command runs in
+                // the background now, whether it started there or moved at its timeout.
+                task.backgrounded = true;
                 task.acknowledged = true;
+            } else {
+                // A result without a task is a foreground completion: the command's task,
+                // if the harness announced one, is over.
+                self.background_commands
+                    .retain(|task| task.tool_use_id.as_ref() != call_id);
             }
             let acknowledges_structured_output =
                 self.active_message.as_ref().is_some_and(|message| {
@@ -1671,34 +1733,51 @@ impl ClaudeCodeStreamJsonV1Parser {
                     self.observations
                         .push(lifecycle(AgentLifecycleMilestone::RetryStarted));
                 }
-                let message = required_string(object, "error").unwrap_or("provider retry");
                 self.observations.push(AgentObservation::Diagnostic {
                     level: AgentDiagnosticLevel::Warning,
-                    message: Arc::from(message),
+                    message: Arc::from(api_retry_message(object)),
                 });
             }
             "compact_boundary" => self
                 .observations
                 .push(lifecycle(AgentLifecycleMilestone::CompactionCompleted)),
             "task_started" => {
-                if required_string(object, "task_type") != Some("local_bash")
-                    || required_bool(object, "is_backgrounded") != Some(true)
+                if required_string(object, "task_type") == Some("local_agent")
+                    && required_bool(object, "is_backgrounded") != Some(true)
                 {
+                    return self.start_foreground_subagent(object);
+                }
+                if required_string(object, "task_type") != Some("local_bash") {
                     self.observe_unrecognized(value);
                     return Ok(());
                 }
-                if !self.exchange_active || self.active_message.is_some() {
+                // Every Bash call starts a `local_bash` task, foreground or not. The
+                // harness may start it as soon as the tool-use block closes, before the
+                // message's own `message_delta`, so an active message is not a violation.
+                // A foreground task is tracked so that the harness may move it to the
+                // background later (at its foreground timeout) without the parser losing
+                // the correlation; a start naming an unknown call is unrecognized unless
+                // it claims the background, which is a protocol failure as before.
+                let backgrounded = required_bool(object, "is_backgrounded") == Some(true);
+                if !self.exchange_active {
                     return Err(self.protocol_failure());
                 }
                 let task_id = required_nonempty_string(object, "task_id")
                     .ok_or_else(|| self.protocol_failure())?;
                 let tool_use_id = required_nonempty_string(object, "tool_use_id")
                     .ok_or_else(|| self.protocol_failure())?;
-                if !self.bash_calls.iter().any(|id| id.as_ref() == tool_use_id)
-                    || self.background_commands.len() >= 128
+                if !self.bash_calls.iter().any(|id| id.as_ref() == tool_use_id) {
+                    if backgrounded {
+                        return Err(self.protocol_failure());
+                    }
+                    self.observe_unrecognized(value);
+                    return Ok(());
+                }
+                if self.background_commands.len() >= MAXIMUM_TRACKED_TASKS
                     || self.background_commands.iter().any(|task| {
                         task.task_id.as_ref() == task_id || task.tool_use_id.as_ref() == tool_use_id
                     })
+                    || self.tracks_foreground_subagent(task_id)
                 {
                     return Err(self.protocol_failure());
                 }
@@ -1706,13 +1785,37 @@ impl ClaudeCodeStreamJsonV1Parser {
                     task_id: Arc::from(task_id),
                     tool_use_id: Arc::from(tool_use_id),
                     run_id: required_nonempty_string(object, "run_id").map(Arc::from),
+                    backgrounded,
                     acknowledged: false,
                     notified: false,
                 });
             }
+            "task_progress" => {
+                if !required_nonempty_string(object, "task_id")
+                    .is_some_and(|task_id| self.tracks_foreground_subagent(task_id))
+                {
+                    self.observe_unrecognized(value);
+                }
+            }
+            "background_tasks_changed" => {
+                let membership_is_tracked = required_array(object, "tasks").is_some_and(|tasks| {
+                    tasks.iter().all(|entry| {
+                        entry
+                            .as_object()
+                            .and_then(|entry| required_nonempty_string(entry, "task_id"))
+                            .is_some_and(|task_id| self.tracks_task(task_id))
+                    })
+                });
+                if !membership_is_tracked {
+                    self.observe_unrecognized(value);
+                }
+            }
             "task_updated" | "task_notification" => {
                 let task_id = required_nonempty_string(object, "task_id")
                     .ok_or_else(|| self.protocol_failure())?;
+                if self.tracks_foreground_subagent(task_id) {
+                    return self.settle_foreground_subagent(object, task_id);
+                }
                 let Some(task) = self
                     .background_commands
                     .iter_mut()
@@ -1727,20 +1830,118 @@ impl ClaudeCodeStreamJsonV1Parser {
                 if required_nonempty_string(object, "run_id") != task.run_id.as_deref() {
                     return Err(self.protocol_failure());
                 }
-                if required_string(object, "subtype") == Some("task_notification") {
-                    if !task.acknowledged
-                        || task.notified
-                        || required_nonempty_string(object, "tool_use_id")
-                            != Some(task.tool_use_id.as_ref())
-                        || required_nonempty_string(object, "status") != Some("completed")
+                if required_string(object, "subtype") == Some("task_updated") {
+                    // The harness moves a foreground command to the background when it
+                    // outlives the foreground timeout; the patch is the only announcement.
+                    if required_object(object, "patch")
+                        .and_then(|patch| required_bool(patch, "is_backgrounded"))
+                        == Some(true)
                     {
-                        return Err(self.protocol_failure());
+                        task.backgrounded = true;
                     }
-                    task.notified = true;
+                    return Ok(());
                 }
+                if required_nonempty_string(object, "tool_use_id")
+                    != Some(task.tool_use_id.as_ref())
+                    || required_nonempty_string(object, "status").is_none()
+                {
+                    return Err(self.protocol_failure());
+                }
+                if !task.backgrounded {
+                    // A foreground command's completion report precedes its tool result
+                    // and settles nothing: the result is what retires the call.
+                    let task_id: Arc<str> = Arc::clone(&task.task_id);
+                    self.background_commands
+                        .retain(|task| task.task_id != task_id);
+                    return Ok(());
+                }
+                // The status is the harness's classification of a background command's
+                // end (`completed`, or a stop at the background limit); any end settles it.
+                if !task.acknowledged || task.notified {
+                    return Err(self.protocol_failure());
+                }
+                task.notified = true;
             }
             _ => self.observe_unrecognized(value),
         }
+        Ok(())
+    }
+
+    fn tracks_foreground_subagent(&self, task_id: &str) -> bool {
+        self.foreground_subagents
+            .iter()
+            .any(|subagent| subagent.task_id.as_ref() == task_id)
+    }
+
+    fn tracks_task(&self, task_id: &str) -> bool {
+        self.tracks_foreground_subagent(task_id)
+            || self
+                .background_commands
+                .iter()
+                .any(|task| task.task_id.as_ref() == task_id)
+    }
+
+    fn start_foreground_subagent(
+        &mut self,
+        object: &Map<String, Value>,
+    ) -> Result<(), AgentFailureCause> {
+        if !self.exchange_active {
+            return Err(self.protocol_failure());
+        }
+        let task_id =
+            required_nonempty_string(object, "task_id").ok_or_else(|| self.protocol_failure())?;
+        let tool_use_id = required_nonempty_string(object, "tool_use_id")
+            .ok_or_else(|| self.protocol_failure())?;
+        if self.foreground_subagents.len() >= MAXIMUM_TRACKED_TASKS || self.tracks_task(task_id) {
+            return Err(self.protocol_failure());
+        }
+        let subagent = ForegroundSubagent {
+            task_id: Arc::from(task_id),
+            tool_use_id: Arc::from(tool_use_id),
+            subagent_type: required_nonempty_string(object, "subagent_type")
+                .map(|kind| Arc::from(ellipsize(kind, MAXIMUM_SUBAGENT_TOKEN_WIDTH))),
+            description: required_nonempty_string(object, "description")
+                .map(|text| Arc::from(ellipsize(text, MAXIMUM_SUBAGENT_DESCRIPTION_WIDTH))),
+        };
+        self.observations.push(AgentObservation::Diagnostic {
+            level: AgentDiagnosticLevel::Information,
+            message: Arc::from(subagent.message("started")),
+        });
+        self.foreground_subagents.push(subagent);
+        Ok(())
+    }
+
+    /// `task_updated` for a tracked subagent is recognized silently; its
+    /// `task_notification` names the status and retires it.
+    fn settle_foreground_subagent(
+        &mut self,
+        object: &Map<String, Value>,
+        task_id: &str,
+    ) -> Result<(), AgentFailureCause> {
+        if required_string(object, "subtype") != Some("task_notification") {
+            return Ok(());
+        }
+        let Some(index) = self
+            .foreground_subagents
+            .iter()
+            .position(|subagent| subagent.task_id.as_ref() == task_id)
+        else {
+            return Err(self.protocol_failure());
+        };
+        if required_nonempty_string(object, "tool_use_id")
+            .is_some_and(|id| id != self.foreground_subagents[index].tool_use_id.as_ref())
+        {
+            return Err(self.protocol_failure());
+        }
+        let subagent = self.foreground_subagents.remove(index);
+        let status = required_nonempty_string(object, "status").map_or_else(
+            || Arc::from("settled"),
+            |status| Arc::from(ellipsize(status, MAXIMUM_SUBAGENT_TOKEN_WIDTH)),
+        );
+        self.observations.push(AgentObservation::Diagnostic {
+            level: AgentDiagnosticLevel::Information,
+            message: Arc::from(subagent.message(&status)),
+        });
         Ok(())
     }
 
@@ -1778,6 +1979,13 @@ impl ClaudeCodeStreamJsonV1Parser {
             .ok_or_else(|| self.protocol_failure())?;
         let name =
             required_nonempty_string(object, "tool_name").ok_or_else(|| self.protocol_failure())?;
+        // A heartbeat for a long-running call carries the call's id with a
+        // `-heartbeat-<n>` suffix; the observation names the call itself.
+        let call_id = if required_bool(object, "heartbeat") == Some(true) {
+            heartbeat_call_id(call_id)
+        } else {
+            call_id
+        };
         self.observations.push(tool_call_observation(
             call_id,
             name,
@@ -1862,6 +2070,8 @@ impl ClaudeCodeStreamJsonV1Parser {
         self.complete_retry();
         self.exchange_initialized = false;
         self.exchange_active = false;
+        // A foreground subagent the exchange did not settle carries no completion duty.
+        self.foreground_subagents.clear();
         self.completed_exchanges = self
             .completed_exchanges
             .checked_add(1)
@@ -1926,7 +2136,33 @@ impl ClaudeCodeStreamJsonV1Parser {
         }
     }
 
+    /// Observes an unrecognized event once per native `type`/`subtype` kind. Kinds that
+    /// cannot be remembered, because a token is long or the set is full, are observed
+    /// every time.
     fn observe_unrecognized(&mut self, value: &Value) {
+        let kind = value.as_object().and_then(|object| {
+            let event_type = required_string(object, "type")?;
+            let subtype = required_string(object, "subtype");
+            (event_type.len() <= MAXIMUM_UNRECOGNIZED_KIND_TOKEN_BYTES
+                && subtype
+                    .is_none_or(|subtype| subtype.len() <= MAXIMUM_UNRECOGNIZED_KIND_TOKEN_BYTES))
+            .then_some((event_type, subtype))
+        });
+        if let Some((event_type, subtype)) = kind {
+            if self
+                .observed_unrecognized_kinds
+                .iter()
+                .any(|(seen_type, seen_subtype)| {
+                    seen_type.as_ref() == event_type && seen_subtype.as_deref() == subtype
+                })
+            {
+                return;
+            }
+            if self.observed_unrecognized_kinds.len() < MAXIMUM_OBSERVED_UNRECOGNIZED_KINDS {
+                self.observed_unrecognized_kinds
+                    .push((Box::from(event_type), subtype.map(Box::from)));
+            }
+        }
         self.observations
             .push(AgentObservation::UnrecognizedHarnessEvent {
                 event: Arc::new(value.clone()),
@@ -2407,6 +2643,26 @@ fn parent_tool_use_id(object: &Map<String, Value>) -> Option<Option<&str>> {
     }
 }
 
+/// Renders the facts a Claude Code `api_retry` event reports, in the order
+/// `api retry A/M · CLASS · HTTP S · next in D ms`, omitting absent facts.
+fn api_retry_message(object: &Map<String, Value>) -> String {
+    let counter = required_u64(object, "attempt")
+        .zip(required_u64(object, "max_retries"))
+        .map_or_else(
+            || "api retry".to_owned(),
+            |(attempt, maximum)| format!("api retry {attempt}/{maximum}"),
+        );
+    let class = required_string(object, "error").unwrap_or("provider retry");
+    let mut parts = vec![counter, class.to_owned()];
+    if let Some(status) = required_u64(object, "error_status") {
+        parts.push(format!("HTTP {status}"));
+    }
+    if let Some(delay) = required_u64(object, "retry_delay_ms") {
+        parts.push(format!("next in {delay} ms"));
+    }
+    parts.join(" · ")
+}
+
 fn lifecycle(milestone: AgentLifecycleMilestone) -> AgentObservation {
     AgentObservation::Lifecycle { milestone }
 }
@@ -2417,6 +2673,21 @@ fn failed(cause: AgentFailureCause) -> AgentOutcome {
 
 // These accessors and native identity checks stay profile-local because their callers
 // assign different lifecycle authority and failure timing to superficially similar fields.
+/// The call a `tool_progress` heartbeat belongs to: its `tool_use_id` is the call's id
+/// followed by `-heartbeat-` and a counter. Any other shape is returned as given.
+fn heartbeat_call_id(call_id: &str) -> &str {
+    match call_id.rsplit_once("-heartbeat-") {
+        Some((call, counter))
+            if !call.is_empty()
+                && !counter.is_empty()
+                && counter.bytes().all(|b| b.is_ascii_digit()) =>
+        {
+            call
+        }
+        _ => call_id,
+    }
+}
+
 fn required_string<'a>(object: &'a Map<String, Value>, key: &str) -> Option<&'a str> {
     object.get(key)?.as_str()
 }

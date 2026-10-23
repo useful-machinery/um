@@ -1616,7 +1616,7 @@ fn automatic_publication(outcome: &str) -> serde_json::Value {
         "target": {
             "repositoryConnectionId": REPOSITORY_CONNECTION_ID,
             "providerRepositoryId": "123456", "fullName": "example/repository",
-            "baseBranch": "main", "branchVersion": 2, "destinationBranch": format!("um/{RUN_ID}/changes")
+            "kind": "new_change_request", "baseBranch": "main", "branchVersion": 2, "destinationBranch": format!("um/{RUN_ID}/changes")
         },
         "pullRequestMetadata": {"title": "Review", "body": "Run publication", "titleSource": "default", "descriptionSource": "default"},
         "branch": branch, "pullRequest": pull_request, "outcome": outcome,
@@ -1635,6 +1635,35 @@ fn automatic_handoff(state: &str) -> serde_json::Value {
         } else { serde_json::Value::Null },
         "failure": null
     })
+}
+
+// REQ-PUBLISH-89, REQ-PUBLISH-92, REQ-PUBLISH-94
+#[test]
+fn run_show_preserves_the_bound_existing_request_in_handoff_history() {
+    let mut body = run_body_with_state("succeeded");
+    body["publication"] = automatic_handoff("pending");
+    body["publication"]["target"] = serde_json::json!({
+        "kind":"existing_change_request", "number":42, "providerChangeRequestId":"420",
+        "sourceRef":"human/feature", "expectedHeadOid":"0123456789abcdef0123456789abcdef01234567"
+    });
+    let (output, server) = run_show_with_response(run_response(body.clone()));
+    assert!(
+        output.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let shown: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        shown["run"]["publication"]["target"],
+        body["publication"]["target"]
+    );
+    server.finish();
+    let mut invalid = body;
+    invalid["publication"]["target"]["repository"] = serde_json::json!("untrusted/repo");
+    let (output, server) = run_show_with_response(run_response(invalid));
+    assert_eq!(output.status.code(), Some(1));
+    server.finish();
 }
 
 fn publication_response(body: serde_json::Value) -> Vec<u8> {
@@ -2805,6 +2834,41 @@ fn create_selects_exact_export_once_and_omission_is_artifact_only() {
     }
 }
 
+// REQ-PUBLISH-87, REQ-PUBLISH-95
+#[test]
+fn run_create_sends_bound_existing_request_intent_without_caller_ref() {
+    const HASH: &str = "0123456789abcdef0123456789abcdef01234567";
+    let (server, _directory, credential_path) = prepared_run(vec![acceptance_response(false)]);
+    let mut args = create_args(true);
+    args.splice(
+        args.len() - 1..args.len() - 1,
+        [
+            "--publish-export",
+            "changes",
+            "--publish-change-request",
+            "42",
+            "--publish-expected-head",
+            HASH,
+        ],
+    );
+    let output = run_with_env(
+        &args,
+        &deployment_environment(&server.api_url, &credential_path),
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let request = server.finish().remove(0);
+    assert_eq!(
+        request_body(&request)["publication"],
+        serde_json::json!({
+            "exportName":"changes", "target":{"kind":"existing_change_request","number":42,"expectedHeadOid":HASH}
+        })
+    );
+}
+
 // REQ-DIAG-28, REQ-DIAG-30
 // REQ-PUBLISH-62, REQ-PUBLISH-63
 #[test]
@@ -2919,7 +2983,7 @@ fn human_run_observation_reports_failed_automatic_publication() {
         "target": {
             "repositoryConnectionId": REPOSITORY_CONNECTION_ID,
             "providerRepositoryId": "123456", "fullName": "example/repository",
-            "baseBranch": "main", "branchVersion": 2, "destinationBranch": format!("um/{RUN_ID}/review")
+            "kind": "new_change_request", "baseBranch": "main", "branchVersion": 2, "destinationBranch": format!("um/{RUN_ID}/review")
         },
         "pullRequestMetadata": { "title": "Review", "body": "Run publication", "titleSource": "default", "descriptionSource": "default" },
         "branch": null, "pullRequest": null, "outcome": null,
@@ -3025,7 +3089,7 @@ fn human_run_observation_reports_successful_automatic_publication_url() {
         "target": {
             "repositoryConnectionId": REPOSITORY_CONNECTION_ID,
             "providerRepositoryId": "123456", "fullName": "example/repository",
-            "baseBranch": "main", "branchVersion": 2, "destinationBranch": format!("um/{RUN_ID}/review")
+            "kind": "new_change_request", "baseBranch": "main", "branchVersion": 2, "destinationBranch": format!("um/{RUN_ID}/review")
         },
         "pullRequestMetadata": { "title": "Review", "body": "Run publication", "titleSource": "default", "descriptionSource": "default" },
         "branch": {
@@ -3234,6 +3298,54 @@ fn run_wait_keeps_successful_execution_separate_from_failed_publication() {
             if operation == "create" { 3 } else { 2 }
         );
     }
+}
+
+// REQ-PUBLISH-91, REQ-PUBLISH-62: run waits preserve a terminal existing-target
+// path-policy refusal independently of the successful run.
+#[test]
+fn run_wait_decodes_existing_target_workflow_policy_failure() {
+    let mut run = run_body_with_state("succeeded");
+    run["publication"] = automatic_handoff("started");
+    let mut failed = automatic_publication("no_changes");
+    failed["state"] = serde_json::json!("failed");
+    failed["outcome"] = serde_json::Value::Null;
+    failed["target"]["kind"] = serde_json::json!("existing_change_request");
+    failed["target"]["number"] = serde_json::json!(42);
+    failed["target"]["providerChangeRequestId"] = serde_json::json!("420");
+    failed["target"]["destinationBranch"] = serde_json::json!("human/feature");
+    failed["target"]["sourceRef"] = serde_json::json!("human/feature");
+    failed["target"]["expectedHeadOid"] =
+        serde_json::json!("0123456789abcdef0123456789abcdef01234567");
+    failed["failure"] = serde_json::json!({
+        "phase": "branch", "code": "workflow_file_change_unsupported",
+        "retryable": false, "diagnostic": {"stage": "path_policy"}
+    });
+    let (server, _directory, credential_path) = prepared_run(vec![
+        run_response(run),
+        publication_response(failed.clone()),
+    ]);
+    let output = run_with_env(
+        &[
+            "run",
+            "show",
+            ORGANIZATION,
+            RUN_ID,
+            "--wait",
+            "--json",
+            "--allow-insecure-http",
+        ],
+        &deployment_environment(&server.api_url, &credential_path),
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let document: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(document["run"]["state"], "succeeded");
+    assert_eq!(document["publication"]["failure"], failed["failure"]);
+    server.finish();
 }
 
 // REQ-PUBLISH-76: the run wait uses the same tagged failure decoder as publication show.

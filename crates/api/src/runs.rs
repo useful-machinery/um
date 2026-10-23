@@ -70,6 +70,7 @@ pub struct CreateRunInput<'a> {
     pub display_name: Option<&'a str>,
     pub input_set_id: Option<&'a str>,
     pub publish_export: Option<&'a str>,
+    pub publish_target: Option<super::publications::ExistingPublicationTarget<'a>>,
     pub integration_context: Option<&'a BTreeMap<String, String>>,
 }
 
@@ -159,9 +160,13 @@ impl<'a> RunApi<'a> {
         };
         request.display_name = input.display_name.map(str::to_owned);
         request.input_set_id = input.input_set_id.map(|id| Some(id.to_owned()));
-        request.publication = input
-            .publish_export
-            .map(|name| Box::new(models::RunPublicationRequest::new(name.to_owned())));
+        request.publication = input.publish_export.map(|name| {
+            let mut publication = models::RunPublicationRequest::new(name.to_owned());
+            publication.target = input
+                .publish_target
+                .map(|target| Box::new(super::publications::target_selection(target)));
+            Box::new(publication)
+        });
         request.integration_context = input.integration_context.map(|context| {
             Some(
                 context
@@ -1358,6 +1363,21 @@ fn validate_run(run: Run, requested_run_id: &str) -> Result<Run, RunFailure> {
         && valid_portable_result(&run)
         && valid_staged_continuation(&run)
         && valid_workspace_recovery(run.workspace_recovery.as_deref())
+        && run.publication.as_deref().is_none_or(|handoff| {
+            handoff.target.as_deref().is_none_or(|target| {
+                target.number > 0
+                    && target.number <= 9_007_199_254_740_991
+                    && target
+                        .provider_change_request_id
+                        .parse::<i64>()
+                        .is_ok_and(|id| {
+                            id > 0 && id.to_string() == target.provider_change_request_id
+                        })
+                    && !target.source_ref.is_empty()
+                    && target.source_ref.len() <= 1024
+                    && lowercase_hex(&target.expected_head_oid, 40)
+            })
+        })
         && valid_timestamp(&run.created_at)
         && valid_timestamp(&run.updated_at);
     if valid {
@@ -1624,6 +1644,24 @@ fn valid_recovery_json_shape(bytes: &[u8]) -> bool {
     let Some(run) = run.as_object() else {
         return true; // Nullable envelope run; the typed envelope checks it.
     };
+    if let Some(target) = run
+        .get("publication")
+        .and_then(|handoff| handoff.get("target"))
+    {
+        let Some(object) = target.as_object() else {
+            return false;
+        };
+        let fields = [
+            "kind",
+            "number",
+            "providerChangeRequestId",
+            "sourceRef",
+            "expectedHeadOid",
+        ];
+        if object.len() != fields.len() || !fields.iter().all(|field| object.contains_key(*field)) {
+            return false;
+        }
+    }
     if let Some(status) = run.get("workspaceRecovery") {
         let Some(status) = status.as_object() else {
             return false;

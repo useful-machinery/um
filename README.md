@@ -1862,6 +1862,27 @@ um publication list \
   acme-labs "$run_id" --limit 50
 ```
 
+To update an existing open pull request from the run's connected GitHub repository,
+select its repository-local number. Cloud captures its head when the request is accepted;
+use the optional hash when the caller has already inspected that exact revision:
+
+```sh
+um publication create acme-labs "$run_id" --export changes \
+  --change-request 42 --expected-head "$inspected_head" --wait --json
+um run create acme-labs --project-id "$project" --workflow-path workflows/publish.yaml \
+  --publish-export changes --publish-change-request 42 \
+  --publish-expected-head "$inspected_head" --wait --json
+```
+
+An accepted update advances only the request's own source ref by a guarded fast-forward;
+it does not create another pull request or change its title, body, review state, labels,
+reviewers, draft status or base. Existing approvals **may still count** after the update,
+and preconfigured GitHub auto-merge or workflows **may proceed** under repository rules.
+Reviewers and repository owners must enforce their own approval policy; a successful
+Publication proves the guarded ref effect, not fresh human approval. A stale hash or
+ineligible request is refused at acceptance; a later race is reported on the separate
+Publication without changing the run's outcome.
+
 For a run submitted without publication intent, an explicit publication workflow
 first creates and waits for the run, then creates and waits for the selected Publication:
 

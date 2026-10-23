@@ -162,6 +162,16 @@ struct CreateCommand {
     )]
     publish_export: Option<String>,
 
+    #[arg(long, requires = "publish_export", value_name = "NUMBER",
+        value_parser = super::publication::parse_change_request,
+        help = "Update an existing GitHub pull request after the run succeeds")]
+    publish_change_request: Option<i64>,
+
+    #[arg(long, requires = "publish_change_request", value_name = "HASH",
+        value_parser = super::publication::parse_expected_head,
+        help = "Require the pull request to have this head commit at run admission")]
+    publish_expected_head: Option<String>,
+
     #[command(flatten)]
     wait: RunWaitArgs,
 
@@ -666,6 +676,12 @@ impl CreateCommand {
                         display_name: self.display_name.as_deref(),
                         input_set_id: input_set_id.as_deref(),
                         publish_export: self.publish_export.as_deref(),
+                        publish_target: self.publish_change_request.map(|number| {
+                            um_api::ExistingPublicationTarget {
+                                number,
+                                expected_head: self.publish_expected_head.as_deref(),
+                            }
+                        }),
                         integration_context: integration_context.as_ref(),
                     },
                     || control.begin_dispatch_with_recovery(dispatch_recovery.clone()),
@@ -2652,6 +2668,7 @@ mod tests {
                 display_name: None,
                 input_set_id: Some("ris_explicit"),
                 publish_export: None,
+                publish_target: None,
                 integration_context: None,
             },
             begin_dispatch,

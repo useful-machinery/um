@@ -245,6 +245,231 @@ fn parser_requires_matching_initialization_and_serialized_exchange_results() {
     );
 }
 
+fn system_event(subtype: &str, fields: Value) -> Value {
+    let mut frame = json!({"type": "system", "subtype": subtype, "session_id": SESSION_ID});
+    frame
+        .as_object_mut()
+        .unwrap()
+        .extend(fields.as_object().unwrap().clone());
+    frame
+}
+
+fn api_retry(fields: Value) -> Value {
+    system_event("api_retry", fields)
+}
+
+// REQ-AGENT-37
+#[test]
+fn api_retry_warning_names_the_reported_attempt_class_status_and_delay() {
+    let mut parser = parser(AgentValueKind::None, 1024);
+    let mut observations = Vec::new();
+    parser
+        .push_stdout(
+            &framed(&[
+                init(QUALIFICATION_VERSION, SESSION_ID),
+                api_retry(
+                    json!({"attempt": 2, "max_retries": 10, "retry_delay_ms": 4000,
+                    "error_status": 529, "error": "overloaded"}),
+                ),
+                api_retry(
+                    json!({"attempt": 3, "max_retries": 10, "retry_delay_ms": 8000,
+                    "error_status": null, "error": "unknown"}),
+                ),
+                api_retry(json!({"error": "rate_limit"})),
+            ]),
+            |observation| observations.push(observation),
+        )
+        .unwrap();
+
+    let retry_starts = observations
+        .iter()
+        .filter(|observation| **observation == lifecycle(AgentLifecycleMilestone::RetryStarted))
+        .count();
+    assert_eq!(retry_starts, 1);
+    let warnings = observations
+        .iter()
+        .filter_map(|observation| match observation {
+            AgentObservation::Diagnostic {
+                level: AgentDiagnosticLevel::Warning,
+                message,
+            } => Some(message.as_ref()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let [overloaded, unknown, uncounted] = warnings.as_slice() else {
+        panic!("each api_retry must yield one warning: {observations:?}");
+    };
+    for token in ["2/10", "overloaded", "HTTP 529", "4000"] {
+        assert!(overloaded.contains(token), "{overloaded:?} lacks {token:?}");
+    }
+    assert!(unknown.contains("3/10") && unknown.contains("unknown"));
+    assert!(!unknown.contains("HTTP"), "{unknown:?}");
+    assert!(uncounted.contains("rate_limit"), "{uncounted:?}");
+    assert!(!uncounted.contains('/'), "{uncounted:?}");
+}
+
+/// One exchange whose assistant turn calls the Agent tool, with `lifecycle` between the
+/// tool call and its result, ending in the final response `done`.
+fn agent_tool_exchange(lifecycle: &[Value]) -> Vec<Value> {
+    let mut values = vec![
+        init(QUALIFICATION_VERSION, SESSION_ID),
+        message_start("agent-turn"),
+    ];
+    values.extend([
+        stream_event(json!({"type":"content_block_start","index":0,"content_block":{
+            "type":"tool_use","id":"agent-call","name":"Agent","input":{}
+        }})),
+        stream_event(json!({"type":"content_block_delta","index":0,"delta":{
+            "type":"input_json_delta","partial_json":"{}"
+        }})),
+        stream_event(json!({"type":"content_block_stop","index":0})),
+        stream_event(json!({"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":1}})),
+        stream_event(json!({"type":"message_stop"})),
+    ]);
+    values.extend_from_slice(lifecycle);
+    values.push(
+        json!({"type":"user","session_id":SESSION_ID,"parent_tool_use_id":null,
+        "message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"agent-call",
+            "content":[{"type":"text","text":"subagent report"}],"is_error":false}]}}),
+    );
+    values.extend(text_message("final-answer", &["done"], true));
+    values.push(result(SESSION_ID));
+    values
+}
+
+fn subagent_started(fields: Value) -> Value {
+    let mut frame = system_event(
+        "task_started",
+        json!({"task_id": "t1", "tool_use_id": "agent-call", "task_type": "local_agent",
+            "description": "Review the diff", "subagent_type": "Explore"}),
+    );
+    frame
+        .as_object_mut()
+        .unwrap()
+        .extend(fields.as_object().unwrap().clone());
+    frame
+}
+
+fn information_diagnostics(observations: &[AgentObservation]) -> Vec<&str> {
+    observations
+        .iter()
+        .filter_map(|observation| match observation {
+            AgentObservation::Diagnostic {
+                level: AgentDiagnosticLevel::Information,
+                message,
+            } => Some(message.as_ref()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn unrecognized_events(observations: &[AgentObservation]) -> Vec<&Value> {
+    observations
+        .iter()
+        .filter_map(|observation| match observation {
+            AgentObservation::UnrecognizedHarnessEvent { event } => Some(event.as_ref()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn completed_response(outcome: &AgentOutcome) -> &str {
+    let AgentOutcome::Completed(CompletedAgentInvocation::Response(response)) = outcome else {
+        panic!("the exchange must complete with a response, got {outcome:?}");
+    };
+    response.as_str()
+}
+
+// REQ-AGENT-64, REQ-AGENT-38
+#[test]
+fn foreground_subagent_lifecycle_is_activity_without_unrecognized_events() {
+    let values = agent_tool_exchange(&[
+        subagent_started(json!({})),
+        system_event(
+            "task_progress",
+            json!({"task_id": "t1", "tool_use_id": "agent-call", "description": "Reading files",
+                "last_tool_name": "Read", "usage": {"total_tokens": 10, "tool_uses": 1}}),
+        ),
+        system_event(
+            "task_updated",
+            json!({"task_id": "t1", "patch": {"status": "running"}}),
+        ),
+        system_event(
+            "background_tasks_changed",
+            json!({"tasks": [{"task_id": "t1", "task_type": "local_agent"}]}),
+        ),
+        system_event(
+            "task_notification",
+            json!({"task_id": "t1", "tool_use_id": "agent-call", "status": "completed",
+                "summary": "Found two issues"}),
+        ),
+    ]);
+    let (observations, outcome) = replay(&framed(&values), AgentValueKind::Response, 1024);
+    assert_eq!(completed_response(&outcome), "done");
+    let information = information_diagnostics(&observations);
+    let [started, settled] = information.as_slice() else {
+        panic!("start and settlement must each yield one diagnostic: {observations:?}");
+    };
+    assert!(started.contains("Explore") && started.contains("Review the diff"));
+    assert!(settled.contains("Explore") && settled.contains("completed"));
+    assert!(!settled.contains("Found two issues"), "{settled:?}");
+    assert_eq!(unrecognized_events(&observations), Vec::<&Value>::new());
+
+    // A subagent the exchange ends without settling is forgotten, not a protocol failure.
+    let values = agent_tool_exchange(&[subagent_started(json!({"is_backgrounded": false}))]);
+    let (observations, outcome) = replay(&framed(&values), AgentValueKind::Response, 1024);
+    assert_eq!(completed_response(&outcome), "done");
+    assert_eq!(information_diagnostics(&observations).len(), 1);
+
+    // A second start for a tracked task is a protocol failure, as for background commands.
+    let values = agent_tool_exchange(&[subagent_started(json!({})), subagent_started(json!({}))]);
+    let (_, outcome) = replay(&framed(&values), AgentValueKind::Response, 1024);
+    assert_failed(outcome, AgentFailureCause::HarnessProtocolFailed);
+}
+
+// REQ-AGENT-64, REQ-AGENT-38
+#[test]
+fn backgrounded_subagents_and_other_task_kinds_stay_unrecognized() {
+    for start in [
+        subagent_started(json!({"is_backgrounded": true})),
+        subagent_started(json!({"task_type": "local_workflow"})),
+    ] {
+        let values = agent_tool_exchange(std::slice::from_ref(&start));
+        let (observations, outcome) = replay(&framed(&values), AgentValueKind::Response, 1024);
+        assert_eq!(completed_response(&outcome), "done");
+        assert_eq!(unrecognized_events(&observations), [&start]);
+        assert_eq!(information_diagnostics(&observations), Vec::<&str>::new());
+    }
+}
+
+// REQ-AGENT-38
+#[test]
+fn each_unrecognized_event_kind_is_observed_once_per_invocation() {
+    let hook = system_event("hook_started", json!({"hook_id": "h1"}));
+    let values = agent_tool_exchange(&[
+        hook.clone(),
+        system_event("hook_started", json!({"hook_id": "h2"})),
+        system_event("hook_response", json!({"hook_id": "h1"})),
+        json!({"type": "future_additive_event", "session_id": SESSION_ID}),
+        json!({"type": "future_additive_event", "session_id": SESSION_ID}),
+    ]);
+    let (observations, outcome) = replay(&framed(&values), AgentValueKind::Response, 1024);
+    assert_eq!(completed_response(&outcome), "done");
+    let kinds = unrecognized_events(&observations)
+        .into_iter()
+        .map(|event| (event["type"].as_str(), event["subtype"].as_str()))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        kinds,
+        [
+            (Some("system"), Some("hook_started")),
+            (Some("system"), Some("hook_response")),
+            (Some("future_additive_event"), None),
+        ]
+    );
+    assert_eq!(unrecognized_events(&observations)[0], &hook);
+}
+
 fn background_first_turn() -> Vec<Value> {
     let mut values = vec![
         init(QUALIFICATION_VERSION, SESSION_ID),
@@ -307,6 +532,184 @@ fn background_completion_during_foreground_work_does_not_require_another_init() 
         panic!("settled background work must not require a wakeup: {outcome:?}");
     };
     assert_eq!(response.as_str(), "intermediate");
+}
+
+fn bash_call_message(message_id: &str, call_id: &str) -> Vec<Value> {
+    vec![
+        message_start(message_id),
+        stream_event(
+            json!({"type":"content_block_start","index":0,"content_block":{
+                "type":"tool_use","id":call_id,"name":"Bash","input":{}
+            }}),
+        ),
+        stream_event(json!({"type":"content_block_delta","index":0,"delta":{
+            "type":"input_json_delta","partial_json":"{}"
+        }})),
+        stream_event(json!({"type":"content_block_stop","index":0})),
+    ]
+}
+
+fn message_end(stop_reason: &str) -> Vec<Value> {
+    vec![
+        stream_event(
+            json!({"type":"message_delta","delta":{"stop_reason":stop_reason},"usage":{"output_tokens":1}}),
+        ),
+        stream_event(json!({"type":"message_stop"})),
+    ]
+}
+
+fn bash_task_started(task_id: &str, call_id: &str, backgrounded: bool) -> Value {
+    json!({"type":"system","subtype":"task_started","session_id":SESSION_ID,
+        "task_id":task_id,"run_id":"run-1","task_type":"local_bash","tool_use_id":call_id,
+        "description":"long command","is_backgrounded":backgrounded})
+}
+
+fn bash_tool_result(call_id: &str, text: &str, background_task: Option<&str>) -> Value {
+    let mut event = json!({"type":"user","session_id":SESSION_ID,"parent_tool_use_id":null,
+        "message":{"role":"user","content":[{"type":"tool_result","tool_use_id":call_id,
+            "content":text,"is_error":false}]},
+        "tool_use_result":{"stdout":"","stderr":"","interrupted":false}});
+    if let Some(task_id) = background_task {
+        event["tool_use_result"]["backgroundTaskId"] = json!(task_id);
+        event["tool_use_result"]["timedOutAfterMs"] = json!(120000);
+    }
+    event
+}
+
+fn tool_call_ids(observations: &[AgentObservation]) -> Vec<String> {
+    observations
+        .iter()
+        .filter_map(|observation| match observation {
+            AgentObservation::ToolCall { call_id, .. } => Some(call_id.to_string()),
+            _ => None,
+        })
+        .collect()
+}
+
+// REQ-AGENT-35. The sequence Claude Code 2.1.302 emits when a foreground Bash call outlives
+// its foreground timeout, recorded from the qualified binary on 2026-10-22: the task starts
+// in the foreground, heartbeats name the call with a counter suffix, a `task_updated` patch
+// moves it to the background, and the tool result names the task; the notification arrives
+// after the exchange's result.
+#[test]
+fn foreground_bash_moved_to_the_background_at_its_timeout_settles() {
+    let mut values = vec![init(QUALIFICATION_VERSION, SESSION_ID)];
+    values.extend(bash_call_message("tool-turn", "bash-call"));
+    values.extend(message_end("tool_use"));
+    values.push(bash_task_started("task-1", "bash-call", false));
+    for index in 0..4 {
+        values.push(
+            json!({"type":"tool_progress","session_id":SESSION_ID,"parent_tool_use_id":null,
+            "tool_use_id":format!("bash-call-heartbeat-{index}"),"tool_name":"Bash",
+            "elapsed_time_seconds":30 * (index + 1),"heartbeat":true}),
+        );
+    }
+    values.push(json!({"type":"system","subtype":"background_tasks_changed","session_id":SESSION_ID,
+        "tasks":[{"task_id":"task-1","run_id":"run-1","task_type":"local_bash","description":"long command"}]}));
+    values.push(
+        json!({"type":"system","subtype":"task_updated","session_id":SESSION_ID,
+        "task_id":"task-1","run_id":"run-1","patch":{"is_backgrounded":true}}),
+    );
+    values.push(bash_tool_result(
+        "bash-call",
+        "moved to the background",
+        Some("task-1"),
+    ));
+    values.extend(text_message("first-answer", &["intermediate"], true));
+    values.push(result(SESSION_ID));
+    values.push(
+        json!({"type":"system","subtype":"task_updated","session_id":SESSION_ID,
+        "task_id":"task-1","run_id":"run-1","patch":{"status":"completed","end_time":1}}),
+    );
+    values.push(
+        json!({"type":"system","subtype":"task_notification","session_id":SESSION_ID,
+        "task_id":"task-1","run_id":"run-1","tool_use_id":"bash-call","status":"completed",
+        "output_file":"/tmp/task-1.output","summary":"Background command completed"}),
+    );
+    values.push(json!({"type":"system","subtype":"background_tasks_changed","session_id":SESSION_ID,"tasks":[]}));
+    let (observations, outcome) = replay(&framed(&values), AgentValueKind::Response, 1024);
+    assert_eq!(completed_response(&outcome), "intermediate");
+    assert!(
+        tool_call_ids(&observations)
+            .iter()
+            .all(|id| id == "bash-call"),
+        "heartbeats must name the call: {:?}",
+        tool_call_ids(&observations)
+    );
+    assert!(
+        unrecognized_events(&observations)
+            .iter()
+            .all(|event| event["subtype"] == "background_tasks_changed"),
+        "{:?}",
+        unrecognized_events(&observations)
+    );
+}
+
+// REQ-AGENT-35. The harness starts a tool as soon as its block closes; a backgrounded start
+// may therefore precede the message's own end.
+#[test]
+fn backgrounded_bash_start_before_the_message_ends_is_accepted() {
+    let mut values = vec![init(QUALIFICATION_VERSION, SESSION_ID)];
+    values.extend(bash_call_message("tool-turn", "bash-call"));
+    values.push(bash_task_started("task-1", "bash-call", true));
+    values.extend(message_end("tool_use"));
+    values.push(bash_tool_result(
+        "bash-call",
+        "running in the background",
+        Some("task-1"),
+    ));
+    values.extend(text_message("first-answer", &["intermediate"], true));
+    values.push(result(SESSION_ID));
+    values.push(
+        json!({"type":"system","subtype":"task_notification","session_id":SESSION_ID,
+        "task_id":"task-1","run_id":"run-1","tool_use_id":"bash-call","status":"completed"}),
+    );
+    let (_, outcome) = replay(&framed(&values), AgentValueKind::Response, 1024);
+    assert_eq!(completed_response(&outcome), "intermediate");
+}
+
+// REQ-AGENT-35. A foreground command's `task_notification` precedes its tool result and
+// settles nothing; the result retires the call and the stream may end without more.
+#[test]
+fn foreground_bash_notification_before_its_result_owes_nothing() {
+    let mut values = vec![init(QUALIFICATION_VERSION, SESSION_ID)];
+    values.extend(bash_call_message("tool-turn", "bash-call"));
+    values.extend(message_end("tool_use"));
+    values.push(bash_task_started("task-1", "bash-call", false));
+    values.push(
+        json!({"type":"system","subtype":"task_notification","session_id":SESSION_ID,
+        "task_id":"task-1","run_id":"run-1","tool_use_id":"bash-call","status":"completed",
+        "output_file":"","summary":"command completed"}),
+    );
+    values.push(bash_tool_result("bash-call", "finished", None));
+    values.extend(text_message("answer", &["done"], true));
+    values.push(result(SESSION_ID));
+    let (_, outcome) = replay(&framed(&values), AgentValueKind::Response, 1024);
+    assert_eq!(completed_response(&outcome), "done");
+}
+
+// REQ-AGENT-35. A background command stopped at the harness's background limit still
+// settles: the notification's status is the harness's classification, not a condition.
+#[test]
+fn background_bash_stopped_by_the_harness_still_settles() {
+    let mut values = background_first_turn();
+    values.push(
+        json!({"type":"system","subtype":"task_notification","session_id":SESSION_ID,
+        "task_id":"task-1","tool_use_id":"bash-call","status":"killed"}),
+    );
+    let (_, outcome) = replay(&framed(&values), AgentValueKind::Response, 1024);
+    assert_eq!(completed_response(&outcome), "intermediate");
+}
+
+// REQ-AGENT-35. A backgrounded start for a call the stream never made is still refused.
+#[test]
+fn backgrounded_start_for_an_unknown_call_is_refused() {
+    let mut values = vec![init(QUALIFICATION_VERSION, SESSION_ID)];
+    values.extend(bash_call_message("tool-turn", "bash-call"));
+    values.extend(message_end("tool_use"));
+    values.push(bash_task_started("task-1", "other-call", true));
+    let (_, outcome) = replay(&framed(&values), AgentValueKind::Response, 1024);
+    assert_failed(outcome, AgentFailureCause::HarnessProtocolFailed);
 }
 
 #[test]
@@ -1817,4 +2220,77 @@ fn rate_limit_events_warn_only_when_a_window_is_not_allowed() {
             "provider rate limit",
         ]
     );
+}
+
+// REQ-AGENT-26
+#[test]
+fn subagent_messages_may_run_on_another_model_while_the_main_thread_must_not() {
+    let subagent = |event: Value| {
+        json!({
+            "type": "stream_event",
+            "event": event,
+            "session_id": SESSION_ID,
+            "parent_tool_use_id": "tool-spawn-subagent",
+        })
+    };
+    let mut values = vec![
+        init(QUALIFICATION_VERSION, SESSION_ID),
+        subagent(json!({
+            "type": "message_start",
+            "message": {
+                "id": "msg-subagent",
+                "type": "message",
+                "role": "assistant",
+                "content": [],
+                "model": "builder-model",
+                "usage": {"input_tokens": 1, "output_tokens": 0},
+            },
+        })),
+        subagent(json!({
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {"type": "text", "text": ""},
+        })),
+        subagent(json!({
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "text_delta", "text": "subagent"},
+        })),
+        subagent(json!({"type": "content_block_stop", "index": 0})),
+        subagent(json!({
+            "type": "message_delta",
+            "delta": {"stop_reason": "end_turn"},
+            "usage": {"output_tokens": 1},
+        })),
+        subagent(json!({"type": "message_stop"})),
+        json!({
+            "type": "assistant",
+            "message": {
+                "id": "msg-subagent",
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "text", "text": "subagent"}],
+                "model": "builder-model",
+            },
+            "parent_tool_use_id": "tool-spawn-subagent",
+            "session_id": SESSION_ID,
+        }),
+    ];
+    values.extend(text_message("msg-final", &["final answer"], true));
+    values.push(result(SESSION_ID));
+    let (observations, outcome) = replay(&framed(&values), AgentValueKind::Response, 1024);
+    let AgentOutcome::Completed(CompletedAgentInvocation::Response(response)) = outcome else {
+        panic!("a subagent on another model must not reject the response, got {outcome:?}");
+    };
+    assert_eq!(response.as_str(), "final answer");
+    assert!(observations.iter().any(|observation| matches!(
+        observation,
+        AgentObservation::Model { name } if name.as_ref() == "builder-model"
+    )));
+
+    let mut main_start = message_start("msg-main");
+    main_start["event"]["message"]["model"] = json!("builder-model");
+    let values = [init(QUALIFICATION_VERSION, SESSION_ID), main_start];
+    let (_, outcome) = replay(&framed(&values), AgentValueKind::Response, 1024);
+    assert_failed(outcome, AgentFailureCause::HarnessProtocolFailed);
 }

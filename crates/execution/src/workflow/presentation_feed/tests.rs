@@ -142,13 +142,54 @@ fn agent_observations_are_typed_normalized_ordered_and_hide_native_events() {
     let native = feed.accept(
         timestamp("2026-08-04T12:00:00.002Z"),
         ExecutionObservation::<OffsetDateTime>::Agent(AgentObservationEnvelope::fixture(
-            identity,
+            identity.clone(),
             2,
             AgentObservation::UnrecognizedHarnessEvent {
-                event: Arc::new(serde_json::json!({"nativeSecret": "must-not-escape"})),
+                event: Arc::new(serde_json::json!({
+                    "type": "system",
+                    "subtype": "task_started",
+                    "nativeSecret": "must-not-escape",
+                })),
             },
         )),
     );
+    // Only the protocol tokens naming the native kind reach the line: a Claude Code
+    // `type` and `subtype`, a Codex `method`, and nothing for any other shape.
+    let kinds = [
+        (
+            serde_json::json!({"method": "item/started", "params": {"nativeSecret": "must-not-escape"}}),
+            "unrecognized harness event · item/started",
+        ),
+        (
+            serde_json::json!({"type": "future_event", "subtype": 7, "nativeSecret": "must-not-escape"}),
+            "unrecognized harness event · future_event",
+        ),
+        (
+            serde_json::json!({"type": "system", "subtype": "must-not-escape \u{1b}[2J"}),
+            "unrecognized harness event",
+        ),
+        (serde_json::json!({"type": 7}), "unrecognized harness event"),
+        (serde_json::json!({}), "unrecognized harness event"),
+    ]
+    .into_iter()
+    .zip(3..)
+    .map(|((event, expected), sequence)| {
+        let records = feed.accept(
+            timestamp("2026-08-04T12:00:00.003Z"),
+            ExecutionObservation::<OffsetDateTime>::Agent(AgentObservationEnvelope::fixture(
+                identity.clone(),
+                sequence,
+                AgentObservation::UnrecognizedHarnessEvent {
+                    event: Arc::new(event),
+                },
+            )),
+        );
+        let PresentationRecordKind::AgentObservation(record) = &records[0].kind else {
+            panic!("unknown harness events must be normalized");
+        };
+        (record.payload.clone(), format!("{record:?}"), expected)
+    })
+    .collect::<Vec<_>>();
 
     assert_eq!(assistant.len(), 2);
     assert_eq!(assistant[0].accepted_order.get(), 1);
@@ -168,8 +209,15 @@ fn agent_observations_are_typed_normalized_ordered_and_hide_native_events() {
     };
     assert_eq!(native.kind, AgentPresentationObservationKind::HarnessEvent);
     assert_eq!(native.observation_sequence, 2);
-    assert_eq!(native.payload, "unrecognized harness event");
-    assert!(!format!("{native:?}").contains("nativeSecret"));
+    assert_eq!(
+        native.payload,
+        "unrecognized harness event · system · task_started"
+    );
+    assert!(!format!("{native:?}").contains("must-not-escape"));
+    for (payload, debug, expected) in kinds {
+        assert_eq!(payload, expected);
+        assert!(!debug.contains("must-not-escape"), "{debug}");
+    }
 }
 
 // REQ-LOCALRUN-114, REQ-LOCALRUN-116, REQ-LOCALRUN-117

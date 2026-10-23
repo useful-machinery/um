@@ -7,8 +7,8 @@ use serde::Serialize;
 
 use crate::exit_code::{ExitCode, OutcomeClass};
 use um_api::{
-    HttpTransportPolicy, Publication, PublicationApi, PublicationFailure, PublicationList,
-    PublicationState,
+    ExistingPublicationTarget, HttpTransportPolicy, Publication, PublicationApi,
+    PublicationFailure, PublicationList, PublicationState,
 };
 use um_human_auth::Deployment;
 
@@ -71,6 +71,14 @@ struct CreateCommand {
         help = "Git branch export name (must be available)"
     )]
     export: String,
+
+    #[arg(long, value_name = "NUMBER", value_parser = parse_change_request,
+        help = "Update an existing GitHub pull request instead of opening a new one")]
+    change_request: Option<i64>,
+
+    #[arg(long, requires = "change_request", value_name = "HASH", value_parser = parse_expected_head,
+        help = "Require the existing pull request to have this head commit")]
+    expected_head: Option<String>,
 
     #[arg(
         long,
@@ -278,6 +286,10 @@ impl CreateCommand {
                     &self.run.organization,
                     &self.run.run_id,
                     &self.export,
+                    self.change_request.map(|number| ExistingPublicationTarget {
+                        number,
+                        expected_head: self.expected_head.as_deref(),
+                    }),
                     idempotency_key,
                     &begin_dispatch,
                 )
@@ -687,6 +699,23 @@ fn parse_publication_id(value: &str) -> Result<String, String> {
                 .to_owned(),
         )
     }
+}
+
+pub(super) fn parse_change_request(value: &str) -> Result<i64, String> {
+    let number = value
+        .parse::<i64>()
+        .map_err(|_| "expected a positive pull request number".to_owned())?;
+    if !(1..=9_007_199_254_740_991).contains(&number) {
+        return Err("expected a positive pull request number".to_owned());
+    }
+    Ok(number)
+}
+
+pub(super) fn parse_expected_head(value: &str) -> Result<String, String> {
+    if !um_support::is_lowercase_hex(value, 40) {
+        return Err("expected a lowercase 40-character Git commit hash".to_owned());
+    }
+    Ok(value.to_owned())
 }
 
 pub(super) fn parse_export_name(value: &str) -> Result<String, String> {
@@ -1356,6 +1385,7 @@ mod tests {
 
     use super::super::observation_test_support::ControlledObservationClock as ControlledClock;
     use super::*;
+    use clap::Parser;
 
     struct ScriptedObservationApi {
         responses: RefCell<VecDeque<Result<Publication, PublicationFailure>>>,
@@ -1422,6 +1452,70 @@ mod tests {
             &super::super::BlockingObservationControl::new(),
             clock,
         )
+    }
+
+    // REQ-PUBLISH-95
+    #[test]
+    fn existing_request_flags_require_an_export_and_number() {
+        const HASH: &str = "0123456789abcdef0123456789abcdef01234567";
+        let publication = |extras: &[&str]| {
+            let mut args = vec![
+                "um",
+                "publication",
+                "create",
+                "acme-labs",
+                "run_01k0z6r1w8f4jy2m7q9v3x5abc",
+                "--export",
+                "changes",
+            ];
+            args.extend_from_slice(extras);
+            super::super::Cli::try_parse_from(args).is_ok()
+        };
+        assert!(publication(&[]));
+        assert!(publication(&[
+            "--change-request",
+            "42",
+            "--expected-head",
+            HASH
+        ]));
+        assert!(!publication(&["--expected-head", HASH]));
+        assert!(!publication(&["--change-request", "0"]));
+        assert!(!publication(&["--change-request", "9007199254740992"]));
+        assert!(!publication(&[
+            "--change-request",
+            "42",
+            "--expected-head",
+            "ABC"
+        ]));
+        let run = |extras: &[&str]| {
+            let mut args = vec![
+                "um",
+                "run",
+                "create",
+                "acme-labs",
+                "--project-id",
+                "prj_01k0z6r1w8f4jy2m7q9v3x5abc",
+                "--workflow-path",
+                "workflow.yaml",
+            ];
+            args.extend_from_slice(extras);
+            super::super::Cli::try_parse_from(args).is_ok()
+        };
+        assert!(run(&[
+            "--publish-export",
+            "changes",
+            "--publish-change-request",
+            "42",
+            "--publish-expected-head",
+            HASH
+        ]));
+        assert!(!run(&["--publish-change-request", "42"]));
+        assert!(!run(&[
+            "--publish-export",
+            "changes",
+            "--publish-expected-head",
+            HASH
+        ]));
     }
 
     #[test]

@@ -40,6 +40,10 @@ Options:
           Read private immutable integration context from a JSON file, or - for standard input
       --publish-export <NAME>
           Request automatic publication of this exact Git branch export after success
+      --publish-change-request <NUMBER>
+          Update an existing GitHub pull request after the run succeeds
+      --publish-expected-head <HASH>
+          Require the pull request to have this head commit at run admission
       --wait
           Observe the run until it settles
       --timeout <DURATION>
