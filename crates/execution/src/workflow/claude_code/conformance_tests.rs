@@ -1179,6 +1179,14 @@ async fn pinned_real_claude_code_06c_background_completion_continuation() {
         let ready = FixtureSignal::create(root.private().join("background-ready"));
         let blocker = root.private().join("background-blocker");
         mkfifo(&blocker, Mode::S_IRUSR | Mode::S_IWUSR).unwrap();
+        let operations = root.private().join("sandbox-operations");
+        fs::create_dir_all(operations.join("empty")).unwrap();
+        fs::write(operations.join("edit.txt"), b"before\n").unwrap();
+        fs::write(operations.join("remove.txt"), b"remove me\n").unwrap();
+        // The synthetic root's /usr/bin:/bin PATH has no coreutils on NixOS.
+        // Supply only this command's pinned tools without changing fixture isolation.
+        let tools_path = std::env::var("UM_CLAUDE_CODE_CONFORMANCE_TOOLS_PATH")
+            .expect("CLI Devenv must supply the native conformance tools");
         let observations = RecordingObservationSink::default();
         let mut running = launch_recorded_response_lifecycle(
             executable, &root, &provider, &observations,
@@ -1187,8 +1195,8 @@ async fn pinned_real_claude_code_06c_background_completion_continuation() {
             "Bash",
             json!({
                 "command": format!(
-                    "printf 'ready\\n' > '{}'; IFS= read -r done < '{}'; printf 'background finished\\n'",
-                    ready.path().display(), blocker.display()
+                    "export PATH='{tools_path}'; printf 'ready\\n' > '{}' && IFS= read -r done < '{}' && sed -i 's/before/after/' '{}/edit.txt' && rm '{}/remove.txt' && rmdir '{}/empty' && printf 'background finished\\n'",
+                    ready.path().display(), blocker.display(), operations.display(), operations.display(), operations.display()
                 ),
                 "description": "Run a controlled background command",
                 "run_in_background": true,
@@ -1221,8 +1229,17 @@ async fn pinned_real_claude_code_06c_background_completion_continuation() {
             panic!("background continuation must settle, got {outcome:?}");
         };
         assert_eq!(response.as_str(), "final response");
+        assert_eq!(fs::read(operations.join("edit.txt")).unwrap(), b"after\n");
+        assert!(!operations.join("remove.txt").exists());
+        assert!(!operations.join("empty").exists());
         assert!(!provider.has_pending_request());
         assert_retained_native_session(&root, &["first response", "final response"]);
+        let transcript = fs::read_to_string(root.retained_transcript()).unwrap();
+        let records = transcript
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert!(!records.is_empty());
         provider.shutdown().await;
     }).await.expect("background probe watchdog expired");
 }

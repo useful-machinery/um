@@ -645,7 +645,7 @@ executable candidate in inherited `PATH` and pins its canonical absolute path, e
 observed version, profile, and capabilities for the run. Each harness admits a
 canonical stable release in its qualified range, `>=2.1.234 <2.2.0` for Claude Code, and
 also admits, as untested, any capability-compatible stable release newer than its
-qualification release (Pi 1.3.0, Claude Code 2.1.306, Codex 0.163.0); every native
+qualification release (Pi 1.3.0, Claude Code 2.1.309, Codex 0.163.0); every native
 Claude Code initialization frame must report the pinned observed version exactly. After
 admission succeeds and before any step runs, the command writes one stderr advisory line
 per selected untested harness naming the harness, the installed version, and the
@@ -2019,14 +2019,14 @@ outcomes have distinct report codes.
 
 The Claude Code check follows the same first-candidate and immutable-path rules for
 `claude`, admitting canonical stable releases in its qualified range `>=2.1.234 <2.2.0`
-and, as untested, any stable release newer than `2.1.306`. Useful Machinery does not
+and, as untested, any stable release newer than `2.1.309`. Useful Machinery does not
 install or upgrade that executable. Its isolated `--version` and `--help` probes require the closed stream
 input/output, partial-message, subagent-forwarding, explicit-session-identity,
 permission-mode, setting-source, model, effort, append-system-prompt-file, and JSON-schema
 capabilities used by `ClaudeCodeStreamJsonV1`. The report contains only status, profile,
 observed version, supported range, exact repository qualification version,
 qualification (`supported_range` or `untested`), closed capabilities, and the selected
-absolute path. Qualification remains pinned to `2.1.306`
+absolute path. Qualification remains pinned to `2.1.309`
 and does not claim that every admitted release or unexecuted host received exact-binary
 conformance. The report never exposes environment values, credentials, or loaded Claude
 settings. The JSON report has no `ready` field.
@@ -2106,7 +2106,7 @@ capability snapshot for the process lifetime: Pi admits `>=0.84.2 <0.88.0` or ex
 admits `>=2.1.234 <2.2.0`, and Codex admits capability-compatible stable
 `>=0.147.0 <0.164.0` with exact repository qualification anchor `0.163.0`. Each also
 keeps, as an untested compatible harness, a capability-compatible stable release newer
-than its qualification release (Pi `1.3.0`, Claude Code `2.1.306`, Codex `0.163.0`), and
+than its qualification release (Pi `1.3.0`, Claude Code `2.1.309`, Codex `0.163.0`), and
 Runner Serve records one `runner.harness_untested` telemetry event per untested
 installation on its stderr telemetry stream at startup, before its first connection
 attempt. Admission and invocation never repeat a lookup or probe. A missing

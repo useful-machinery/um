@@ -692,7 +692,33 @@ async fn run_reconnect_scenario() -> Vec<String> {
         "source preparation must retain its deadline fence"
     );
     events.retain(|event| event != preparation_deadline);
-    normalize_retention_reports(events)
+    normalize_retention_reports(normalize_offer_silence_timer_order(events))
+}
+
+fn normalize_offer_silence_timer_order(mut events: Vec<String>) -> Vec<String> {
+    let acknowledgement = event_position(
+        &events,
+        0,
+        "outbound:text:",
+        "\"type\":\"effect_acknowledged\"",
+    );
+    let disconnect = event_position(
+        &events,
+        acknowledgement + 1,
+        "inbound.queued:close:",
+        "disconnect before effect acknowledgement confirmation",
+    );
+    // The worker can publish assignment_preparing before or after the connection
+    // first polls its silence timer. Preserve both events and their causal bounds.
+    let pending = &mut events[acknowledgement + 1..disconnect];
+    assert_eq!(pending.len(), 2);
+    if pending[0] == "sleep.requested:2000ms" {
+        pending.swap(0, 1);
+    }
+    assert!(pending[0].starts_with("outbound:text:"));
+    assert!(pending[0].contains("\"type\":\"assignment_preparing\""));
+    assert_eq!(pending[1], "sleep.requested:2000ms");
+    events
 }
 
 fn normalize_retention_reports(mut events: Vec<String>) -> Vec<String> {
