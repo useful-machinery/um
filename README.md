@@ -642,9 +642,15 @@ credential-isolation policy. The CLI inspects the resolved agent steps and valid
 each required harness once: `pi` for PiJsonV1, `claude` for
 ClaudeCodeStreamJsonV1, and `codex` for CodexAppServerV1. Each search selects the first
 executable candidate in inherited `PATH` and pins its canonical absolute path, exact
-observed version, profile, and capabilities for the run. Claude Code must be a canonical
-stable release in `>=2.1.234 <2.2.0`, and every native initialization frame must report
-the pinned observed version exactly. Later `PATH` changes cannot switch an admitted
+observed version, profile, and capabilities for the run. Each harness admits a
+canonical stable release in its qualified range, `>=2.1.234 <2.2.0` for Claude Code, and
+also admits, as untested, any capability-compatible stable release newer than its
+qualification release (Pi 1.3.0, Claude Code 2.1.306, Codex 0.163.0); every native
+Claude Code initialization frame must report the pinned observed version exactly. After
+admission succeeds and before any step runs, the command writes one stderr advisory line
+per selected untested harness naming the harness, the installed version, and the
+qualification release, in every presentation mode and never per agent step; `--json`
+stdout remains the result document alone. Later `PATH` changes cannot switch an admitted
 executable. Command-only workflows probe no harness; each single-harness workflow
 requires no unrelated installation. A mixed workflow requires exactly its selected
 harnesses and never substitutes or falls back between them. Workflow definitions,
@@ -1981,7 +1987,10 @@ both report formats, including when the harness is missing or incompatible. Huma
 reports label an available observed version separately from a supported range or exact
 required version. When a range has a repository qualification release, the report shows
 that qualification version separately rather than presenting it as the only admitted
-release.
+release. A passing harness check also reports the detail `qualification`:
+`supported_range` for a release in the qualified range, or `untested` for a stable
+release newer than the qualification release. An untested installation still passes
+with code `ok`, and the command exits 0 when every selected check passes.
 
 Checks are registered statically by components compiled into this executable. The
 command does not load plugins, read human credentials, contact Useful Machinery, or change
@@ -1996,7 +2005,8 @@ the captured inherited `PATH`, fresh temporary Pi state and working-directory pa
 the required isolation controls. Retaining `PATH` lets an environment-based launcher
 resolve its interpreter without allowing another `pi` selection. It admits
 canonical stable versions in `>=0.84.2 <0.88.0` or exactly `0.99.1`, `1.2.0`, or `1.3.0`;
-the repository qualifies exact Pi 1.3.0. The capability probe accepts both the 0.84.2
+the repository qualifies exact Pi 1.3.0, and any stable release newer than 1.3.0 is
+admitted as untested when its capabilities pass. The capability probe accepts both the 0.84.2
 `pi [options] [@files...] [messages...]` usage line and the 0.84.3+
 `pi [options] [--] [@files...] [messages...]` line, while still requiring the JSON
 event, custom-session-directory, extension, system-prompt append, and
@@ -2008,23 +2018,25 @@ decisions. Missing, unexecutable, malformed, unsupported-version, and missing-ca
 outcomes have distinct report codes.
 
 The Claude Code check follows the same first-candidate and immutable-path rules for
-`claude`, admitting canonical stable releases in `>=2.1.234 <2.2.0`. Useful Machinery does not
+`claude`, admitting canonical stable releases in its qualified range `>=2.1.234 <2.2.0`
+and, as untested, any stable release newer than `2.1.306`. Useful Machinery does not
 install or upgrade that executable. Its isolated `--version` and `--help` probes require the closed stream
 input/output, partial-message, subagent-forwarding, explicit-session-identity,
 permission-mode, setting-source, model, effort, append-system-prompt-file, and JSON-schema
 capabilities used by `ClaudeCodeStreamJsonV1`. The report contains only status, profile,
-observed version, supported range, exact repository qualification version, closed
-capabilities, and the selected absolute path. Qualification remains pinned to `2.1.306`
+observed version, supported range, exact repository qualification version,
+qualification (`supported_range` or `untested`), closed capabilities, and the selected
+absolute path. Qualification remains pinned to `2.1.306`
 and does not claim that every admitted release or unexecuted host received exact-binary
 conformance. The report never exposes environment values, credentials, or loaded Claude
 settings. The JSON report has no `ready` field.
 
-The Codex check selects `codex` independently, accepts stable `>=0.147.0 <0.164.0`, and
-requires the generated App Server schema capability used by CodexAppServerV1. Its
+The Codex check selects `codex` independently, accepts stable `>=0.147.0 <0.164.0` and,
+as untested, any stable release newer than `0.163.0`, and requires the generated App Server schema capability used by CodexAppServerV1. Its
 isolated version and schema probes do not read ambient `CODEX_HOME`, provider
 credentials, or native configuration. The report contains the exact observed version,
-supported range, exact repository qualification version `0.163.0`, closed capabilities,
-and canonical executable without starting a thread. At execution, async-delivery
+supported range, exact repository qualification version `0.163.0`, qualification
+(`supported_range` or `untested`), closed capabilities, and canonical executable without starting a thread. At execution, async-delivery
 messages, structured asynchronous questions, form elicitation, and bounded additive
 events remain unattended and cannot settle, approve, assign a project, persist, or
 commit a workflow value.
@@ -2090,9 +2102,14 @@ artifact or runner state while transferring or verifying it.
 Runner startup selects `pi`, `claude`, and `codex` independently from its inherited
 operator-controlled `PATH`. Useful Machinery installs none of them. Each successful installation
 is validated once and retained as an immutable executable, exact-version, profile, and
-capability snapshot for the process lifetime: Pi requires `>=0.84.2 <0.88.0` or exactly `0.99.1`, `1.2.0`, or `1.3.0`, Claude Code
-requires `>=2.1.234 <2.2.0`, and Codex requires capability-compatible stable
-`>=0.147.0 <0.164.0` with exact repository qualification anchor `0.163.0`. Admission and invocation never repeat a lookup or probe. A missing
+capability snapshot for the process lifetime: Pi admits `>=0.84.2 <0.88.0` or exactly `0.99.1`, `1.2.0`, or `1.3.0`, Claude Code
+admits `>=2.1.234 <2.2.0`, and Codex admits capability-compatible stable
+`>=0.147.0 <0.164.0` with exact repository qualification anchor `0.163.0`. Each also
+keeps, as an untested compatible harness, a capability-compatible stable release newer
+than its qualification release (Pi `1.3.0`, Claude Code `2.1.306`, Codex `0.163.0`), and
+Runner Serve records one `runner.harness_untested` telemetry event per untested
+installation on its stderr telemetry stream at startup, before its first connection
+attempt. Admission and invocation never repeat a lookup or probe. A missing
 or incompatible installation leaves only that harness unavailable, so Runner Serve
 continues to accept command-only and other available-harness assignments. An assignment
 requiring the unavailable harness is rejected before launch, and selection never falls

@@ -226,18 +226,47 @@ fn doctor_reports_exact_codex_identity_without_credentials_or_native_configurati
     assert!(unselected.recorded_probes().is_empty());
 }
 
-// REQ-AGENT-3
+// REQ-AGENT-3, REQ-AGENT-68
 #[test]
 fn doctor_accepts_the_reviewed_codex_range_endpoints() {
     // The in-process installation unit test admits every reviewed minor line;
-    // the command only needs to prove it reports the range's endpoints.
-    for version in ["0.147.0", "0.163.999"] {
+    // the command only needs to prove it reports the range's endpoints. The
+    // upper endpoint is newer than the 0.163.0 anchor, so it is untested.
+    for (version, qualification) in [("0.147.0", "supported_range"), ("0.163.999", "untested")] {
         let fixture = CodexFixture::new(version, true, true);
         let output = doctor_json(fixture.path_directory(), &[]);
         assert!(output.status.success(), "{version}");
         let check = &report(&output)["checks"][0];
         assert_eq!(check["status"], "pass", "{version}");
         assert_eq!(check["details"]["version"], version, "{version}");
+        assert_eq!(
+            check["details"]["qualification"], qualification,
+            "{version}"
+        );
+        assert_eq!(fixture.recorded_probes(), CLOSED_PROBES, "{version}");
+    }
+}
+
+// REQ-AGENT-3, REQ-AGENT-65, REQ-AGENT-68
+#[test]
+fn doctor_passes_a_newer_codex_as_untested_and_reports_qualification() {
+    for (version, qualification) in [
+        ("0.164.0", "untested"),
+        ("1.0.0", "untested"),
+        ("0.163.0", "supported_range"),
+    ] {
+        let fixture = CodexFixture::new(version, true, true);
+        let output = doctor_json(fixture.path_directory(), &[]);
+        assert_eq!(output.status.code(), Some(0), "{version}");
+        let check = &report(&output)["checks"][0];
+        assert_eq!(check["status"], "pass", "{version}");
+        assert_eq!(check["code"], "ok", "{version}");
+        assert_eq!(check["details"]["version"], version, "{version}");
+        assert_eq!(
+            check["details"]["qualification"], qualification,
+            "{version}"
+        );
+        assert_eq!(check["details"]["qualificationVersion"], "0.163.0");
         assert_eq!(fixture.recorded_probes(), CLOSED_PROBES, "{version}");
     }
 }
@@ -324,7 +353,7 @@ fn doctor_rejects_out_of_range_decorated_and_schema_incompatible_codex() {
             b"--version\n".as_slice(),
         ),
         (
-            "0.164.0",
+            "0.146.0",
             true,
             true,
             "unsupported_codex_version",

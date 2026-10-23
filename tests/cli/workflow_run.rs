@@ -2682,6 +2682,170 @@ fn mixed_local_run_invokes_each_harness_once_and_publishes_both_exports() {
     );
 }
 
+fn two_pi_steps_and_claude_source() -> String {
+    mixed_harness_source().replace(
+        "exports:\n",
+        r#"  piSecond:
+    kind: agent
+    dependsOn: [piAnswer]
+    agent:
+      profile: piLocal
+      systemPrompt: pi-system.md
+      message:
+        text:
+          - file: message.md
+exports:
+"#,
+    )
+}
+
+fn run_two_pi_steps_and_claude(pi_version: &str) -> Output {
+    let pi = PiFixture::with_execution(pi_version, COMPLETE_HELP, true, &response_pi_execution());
+    let claude = ClaudeCodeFixture::with_execution(
+        "2.1.306 (Claude Code)",
+        CLAUDE_CODE_COMPLETE_HELP,
+        true,
+        &response_claude_code_execution_for_version("2.1.306"),
+    );
+    let path = fixture_path_with_host_tools(&[pi.path_directory(), claude.path_directory()]);
+    let bundle = RunBundle::new(&two_pi_steps_and_claude_source());
+    for path in ["pi-system.md", "claude-system.md", "message.md"] {
+        bundle.write_source(path, "fixture");
+    }
+    let destination = bundle.result("untested-advisory");
+    let mut args = bundle.args(&destination);
+    args.insert(args.len() - 1, "--json".to_owned());
+
+    let output = isolated_command(&args)
+        .env("PATH", path)
+        .env("CLAUDE_CONFIG_DIR", bundle.claude_config())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let terminal: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(terminal["outcome"], "succeeded");
+    output
+}
+
+// REQ-AGENT-66, SC-AGENT-6
+#[test]
+fn untested_harness_writes_one_stderr_advisory_per_selected_harness() {
+    let untested = run_two_pi_steps_and_claude("1.4.0");
+    let stderr = String::from_utf8(untested.stderr).unwrap();
+    let advisories = stderr
+        .lines()
+        .filter(|line| line.contains("1.4.0") && line.contains("1.3.0"))
+        .count();
+    assert_eq!(advisories, 1, "stderr: {stderr}");
+    assert!(
+        !stderr.lines().any(|line| line.contains("2.1.306")),
+        "stderr: {stderr}"
+    );
+
+    let qualified = run_two_pi_steps_and_claude("1.3.0");
+    let stderr = String::from_utf8(qualified.stderr).unwrap();
+    assert!(
+        !stderr.lines().any(|line| line.contains("1.3.0")),
+        "stderr: {stderr}"
+    );
+}
+
+fn untested_advisory_lines(output: &Output) -> usize {
+    String::from_utf8_lossy(&output.stderr)
+        .lines()
+        .filter(|line| line.contains("1.4.0") && line.contains("1.3.0"))
+        .count()
+}
+
+// REQ-AGENT-66, SC-AGENT-6
+#[test]
+fn retry_of_an_untested_harness_run_writes_the_advisory_once_more() {
+    let pi = PiFixture::with_execution("1.4.0", COMPLETE_HELP, true, &response_pi_execution());
+    let path = fixture_path_with_host_tools(&[pi.path_directory()]);
+    let bundle = RunBundle::new(
+        r#"schemaVersion: 1
+environmentPassthrough: [RETRY_PHASE]
+agentProfiles:
+  piLocal:
+    harness:
+      kind: pi
+      config:
+        model: fixture/pi
+        thinking: high
+steps:
+  piAnswer:
+    kind: agent
+    agent:
+      profile: piLocal
+      systemPrompt: pi-system.md
+      message:
+        text:
+          - file: message.md
+    outputs:
+      response:
+        kind: text
+        from: agent_response
+  gate:
+    kind: cmd
+    dependsOn: [piAnswer]
+    command:
+      argv: [sh, -c, 'test "$RETRY_PHASE" = retry']
+exports:
+  piResponse:
+    ref: outputs.piAnswer.response
+"#,
+    );
+    for source in ["pi-system.md", "message.md"] {
+        bundle.write_source(source, "fixture");
+    }
+    let run_directory = bundle.result("untested-retry");
+    let mut args = bundle.args(&run_directory);
+    args.insert(args.len() - 1, "--json".to_owned());
+    let initial = isolated_command(&args)
+        .env("PATH", &path)
+        .env("RETRY_PHASE", "initial")
+        .output()
+        .unwrap();
+    assert_eq!(initial.status.code(), Some(1));
+    let terminal: serde_json::Value = serde_json::from_slice(&initial.stdout).unwrap();
+    assert_eq!(terminal["outcome"], "failed");
+    assert_eq!(untested_advisory_lines(&initial), 1);
+
+    let retry = isolated_command(&[
+        "workflow".to_owned(),
+        "retry".to_owned(),
+        run_directory.to_string_lossy().into_owned(),
+        "--execution-root".to_owned(),
+        bundle.execution_root().to_string_lossy().into_owned(),
+        "--json".to_owned(),
+    ])
+    .env("PATH", &path)
+    .env("RETRY_PHASE", "retry")
+    .output()
+    .unwrap();
+    assert!(
+        retry.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&retry.stdout),
+        String::from_utf8_lossy(&retry.stderr)
+    );
+    let terminal: serde_json::Value = serde_json::from_slice(&retry.stdout).unwrap();
+    assert_eq!(terminal["command"], "um workflow retry");
+    assert_eq!(terminal["outcome"], "succeeded");
+    assert_eq!(terminal["attemptNumber"], 2);
+    assert_eq!(
+        untested_advisory_lines(&retry),
+        1,
+        "stderr: {}",
+        String::from_utf8_lossy(&retry.stderr)
+    );
+}
+
 #[test]
 fn mixed_pi_claude_and_codex_run_preserves_independent_dispatch_and_atomic_exports() {
     let pi = PiFixture::with_execution("0.84.2", COMPLETE_HELP, true, &response_pi_execution());

@@ -4,8 +4,8 @@ use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _, symlink};
 use std::path::{Path, PathBuf};
 
 use super::{
-    assert_human_doctor_detail_matches_json, private_credential_directory, run_with_env,
-    write_runner_config,
+    OneShotServer, assert_human_doctor_detail_matches_json, private_credential_directory,
+    run_with_env, write_runner_config,
 };
 
 const PI_CHECK_ID: &str = "execution.harness.pi-json-v1";
@@ -328,6 +328,31 @@ fn human_doctor_reports_pi_policy_when_missing_and_unsupported() {
     );
 }
 
+// REQ-AGENT-1, REQ-AGENT-65, REQ-AGENT-68
+#[test]
+fn doctor_passes_a_newer_pi_as_untested_and_reports_qualification() {
+    for (version, qualification) in [("1.4.0", "untested"), ("1.3.0", "supported_range")] {
+        let fixture = PiFixture::new(version, COMPLETE_HELP, true);
+        let json = pi_doctor_json(fixture.path_directory(), &[]);
+        assert_eq!(json.status.code(), Some(0), "{version}");
+        let report: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
+        let check = &report["checks"][0];
+        assert_eq!(check["status"], "pass", "{version}");
+        assert_eq!(check["code"], "ok", "{version}");
+        assert_eq!(check["details"]["version"], version, "{version}");
+        assert_eq!(
+            check["details"]["qualification"], qualification,
+            "{version}"
+        );
+        assert_eq!(check["details"]["qualificationVersion"], "1.3.0");
+        assert_eq!(fixture.recorded_probes(), CLOSED_PROBES, "{version}");
+
+        let human = pi_doctor_human(fixture.path_directory(), &[]);
+        assert_eq!(human.status.code(), Some(0), "{version}");
+        assert_human_doctor_detail_matches_json(&human, &report, "qualification", "qualification");
+    }
+}
+
 // REQ-AGENT-49
 #[test]
 fn human_doctor_reports_pi_qualification_anchor_when_missing() {
@@ -516,6 +541,58 @@ fn runner_initialization_probes_path_once_and_remains_command_capable_without_co
     assert!(output.stdout.is_empty());
     assert_invalid_runner_gateway(&output);
     assert_eq!(incompatible.recorded_probes(), b"--version\n");
+}
+
+fn runner_serve_stderr_against_terminating_gateway(fixture: &PiFixture) -> std::process::Output {
+    // The gateway rejects the upgrade so Runner Serve terminates after startup.
+    let gateway = OneShotServer::respond("400 Bad Request", None, &[]);
+    let gateway_url =
+        gateway
+            .api_url
+            .replacen("http://", "ws://", 1)
+            .replacen("/api", "/v1/runner/connect", 1);
+    // Runner control sockets require a short lexical Unix path.
+    let runner_directory = tempfile::tempdir_in("/tmp").expect("short runner directory");
+    fs::set_permissions(runner_directory.path(), fs::Permissions::from_mode(0o700))
+        .expect("protect short runner directory");
+    let config_path = write_runner_config(&runner_directory, &gateway_url);
+    let output = run_with_env(
+        &["runner", "serve", "--config", config_path.as_str()],
+        &[
+            ("PATH", fixture.path_directory().to_str().unwrap()),
+            ("OTEL_SDK_DISABLED", "true"),
+        ],
+    );
+    gateway.finish();
+    output
+}
+
+fn harness_untested_records(output: &std::process::Output) -> Vec<serde_json::Value> {
+    String::from_utf8_lossy(&output.stderr)
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|record| record["event.name"] == "runner.harness_untested")
+        .collect()
+}
+
+// REQ-AGENT-67, REQ-RUNNERENROLL-32
+#[test]
+fn runner_serve_records_harness_untested_for_a_newer_pi_and_still_fails_for_the_gateway() {
+    let untested = PiFixture::new("1.4.0", COMPLETE_HELP, true);
+    let output = runner_serve_stderr_against_terminating_gateway(&untested);
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(untested.recorded_probes(), CLOSED_PROBES);
+    let records = harness_untested_records(&output);
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0]["um.harness.profile"], "PiJsonV1");
+    assert_eq!(records[0]["um.harness.version"], "1.4.0");
+    assert_eq!(records[0]["um.harness.qualification_version"], "1.3.0");
+
+    let qualified = PiFixture::new("1.3.0", COMPLETE_HELP, true);
+    let output = runner_serve_stderr_against_terminating_gateway(&qualified);
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(qualified.recorded_probes(), CLOSED_PROBES);
+    assert!(harness_untested_records(&output).is_empty());
 }
 
 #[test]

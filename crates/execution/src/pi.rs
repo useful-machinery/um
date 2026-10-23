@@ -1,7 +1,7 @@
 use super::harness_installation::{
-    ExecutableValidationFailure, HarnessInstallationProfile, ProbeIsolation, StableVersion,
-    ValidatedInstallationParts, discover_and_validate_installation, parse_probe_line,
-    parse_probe_text,
+    ExecutableValidationFailure, HarnessInstallationProfile, HarnessQualification, ProbeIsolation,
+    StableVersion, UntestedHarnessAdvisory, ValidatedInstallationParts,
+    discover_and_validate_installation, parse_probe_line, parse_probe_text,
 };
 #[cfg(test)]
 use super::harness_installation::{
@@ -87,14 +87,33 @@ pub struct ValidatedPiInstallation {
     executable: PathBuf,
     version: PiVersion,
     capabilities: PiJsonV1Capabilities,
+    qualification: HarnessQualification,
 }
 
 impl ValidatedPiInstallation {
     #[cfg(any(test, feature = "test-fixtures"))]
     pub fn fixture(executable: PathBuf) -> Self {
+        Self::fixture_with_version(
+            executable,
+            PiInstallationProfile::QUALIFICATION_VERSION,
+            PI_JSON_V1_QUALIFICATION_VERSION,
+        )
+    }
+
+    #[cfg(any(test, feature = "test-fixtures"))]
+    pub fn fixture_with_version(
+        executable: PathBuf,
+        (major, minor, patch): (u64, u64, u64),
+        observed: &'static str,
+    ) -> Self {
+        let version = PiVersion::fixture(major, minor, patch, observed);
         Self {
             executable,
-            version: PiVersion::fixture(1, 3, 0, PI_JSON_V1_QUALIFICATION_VERSION),
+            qualification: HarnessQualification::of(
+                &version,
+                PiInstallationProfile::QUALIFICATION_VERSION,
+            ),
+            version,
             capabilities: PiJsonV1Capabilities {
                 required: REQUIRED_CAPABILITIES,
             },
@@ -115,6 +134,20 @@ impl ValidatedPiInstallation {
 
     pub const fn capabilities(&self) -> &PiJsonV1Capabilities {
         &self.capabilities
+    }
+
+    pub const fn qualification(&self) -> HarnessQualification {
+        self.qualification
+    }
+
+    pub fn untested_advisory(&self) -> Option<UntestedHarnessAdvisory> {
+        UntestedHarnessAdvisory::for_installation(
+            self.qualification,
+            "Pi",
+            self.profile(),
+            &self.version,
+            PI_JSON_V1_QUALIFICATION_VERSION,
+        )
     }
 }
 
@@ -201,6 +234,7 @@ impl HarnessInstallationProfile for PiInstallationProfile {
     type Failure = PiInstallationFailure;
 
     const EXECUTABLE_NAME: &'static str = "pi";
+    const QUALIFICATION_VERSION: (u64, u64, u64) = (1, 3, 0);
     const CAPABILITY_PROBE_ARGUMENTS: &'static [&'static str] = &CAPABILITY_PROBE_ARGUMENTS;
 
     fn probe_isolation(search_path: &OsStr) -> Result<ProbeIsolation, Self::Failure> {
@@ -256,11 +290,12 @@ impl HarnessInstallationProfile for PiInstallationProfile {
             Self::Capabilities,
         >,
     ) -> Self::Installation {
-        let (executable, version, _profile, capabilities) = parts.into_parts();
+        let (executable, version, _profile, capabilities, qualification) = parts.into_parts();
         ValidatedPiInstallation {
             executable,
             version,
             capabilities,
+            qualification,
         }
     }
 
@@ -312,7 +347,8 @@ fn parse_version_output(output: &CommandOutput) -> Result<PiVersion, PiInstallat
 fn compatibility_profile(version: &PiVersion) -> Option<AgentCompatibilityProfile> {
     ((version.numeric() >= PI_JSON_V1_MINIMUM_VERSION
         && version.numeric() < PI_JSON_V1_MAXIMUM_VERSION)
-        || PI_JSON_V1_EXACT_VERSIONS.contains(&version.numeric()))
+        || PI_JSON_V1_EXACT_VERSIONS.contains(&version.numeric())
+        || version.is_newer_than(PiInstallationProfile::QUALIFICATION_VERSION))
     .then_some(AgentCompatibilityProfile::PiJsonV1)
 }
 

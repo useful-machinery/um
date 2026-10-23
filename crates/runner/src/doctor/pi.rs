@@ -1,7 +1,8 @@
 use std::collections::BTreeMap;
 
 use super::{
-    CheckDescriptor, DoctorCheck, Outcome, capability_failure_details, compatible_harness_outcome,
+    CheckDescriptor, CompatibleHarness, DoctorCheck, Outcome, capability_failure_details,
+    compatible_harness_outcome,
 };
 use um_execution::{
     AgentCompatibilityProfile, PI_JSON_V1_QUALIFICATION_VERSION, PI_JSON_V1_SUPPORTED_RANGE,
@@ -22,15 +23,20 @@ impl DoctorCheck for PiCheck {
     fn run(&self) -> Outcome {
         match discover_and_validate_pi_installation() {
             Ok(installation) => compatible_harness_outcome(
-                "Pi",
-                installation.version().as_str(),
-                installation.profile().as_str(),
-                installation
-                    .capabilities()
-                    .required()
-                    .iter()
-                    .map(|capability| capability.as_str()),
-                installation.executable(),
+                CompatibleHarness {
+                    harness: "Pi",
+                    version: installation.version().as_str(),
+                    profile: installation.profile().as_str(),
+                    capabilities: installation
+                        .capabilities()
+                        .required()
+                        .iter()
+                        .map(|capability| capability.as_str())
+                        .collect(),
+                    executable: installation.executable(),
+                    qualification: installation.qualification(),
+                    untested: installation.untested_advisory(),
+                },
                 compatibility_details(),
             ),
             Err(failure) => failure_outcome(failure),

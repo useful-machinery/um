@@ -29,6 +29,9 @@ pub(crate) mod attribute {
     pub(crate) const EFFECTS_RECEIVED: &str = "um.runner.effects_received";
     pub(crate) const ERROR_TYPE: &str = "error.type";
     pub(crate) const FAILURE_KIND: &str = "um.connection.failure_kind";
+    pub(crate) const HARNESS_PROFILE: &str = "um.harness.profile";
+    pub(crate) const HARNESS_QUALIFICATION_VERSION: &str = "um.harness.qualification_version";
+    pub(crate) const HARNESS_VERSION: &str = "um.harness.version";
     pub(crate) const HANDSHAKE_COMPLETED: &str = "um.runner.handshake_completed";
     pub(crate) const OPENING_ACKNOWLEDGED: &str = "um.runner.opening_acknowledged";
     pub(crate) const RUN_ID: &str = "um.run.id";

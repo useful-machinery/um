@@ -44,6 +44,7 @@ use connection::{
 use control::{ControlServer, ControlServerError, ControlTimeouts, LiveStatus, ReloadRequest};
 use lease_clock::{LeaseClock, LeaseClockError};
 use um_execution::MAXIMUM_CANCELLATION_GRACE;
+use um_execution::untested_harness_advisories;
 
 type SleepFuture<'a> = Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
 type ConnectionFuture<'a> =
@@ -454,6 +455,9 @@ where
         + Send
         + 'static,
 {
+    // Recorded before work-root acquisition and the first connection attempt so an
+    // operator sees the advisory even when startup or the gateway then fails.
+    record_untested_harnesses(&dependencies.recorder, &dependencies.config);
     let work_root_path = dependencies.config.assignment().work_root().to_owned();
     let boot_id = dependencies.boot_id.clone();
     let work_root =
@@ -1537,6 +1541,33 @@ fn workspace_cleanup_failure(recorder: &Recorder, detail: Option<Vec<String>>) -
     ServiceError::WorkspaceCleanupFailed(detail)
 }
 
+fn record_untested_harnesses(recorder: &Recorder, config: &Config) {
+    let advisories = untested_harness_advisories(
+        config.pi_installation(),
+        config.claude_code_installation(),
+        config.codex_installation(),
+    );
+    for advisory in advisories {
+        recorder.record(
+            "runner.harness_untested",
+            [
+                KeyValue::new(
+                    telemetry::attribute::HARNESS_PROFILE,
+                    advisory.profile().as_str(),
+                ),
+                KeyValue::new(
+                    telemetry::attribute::HARNESS_VERSION,
+                    advisory.version().to_owned(),
+                ),
+                KeyValue::new(
+                    telemetry::attribute::HARNESS_QUALIFICATION_VERSION,
+                    advisory.qualification_version(),
+                ),
+            ],
+        );
+    }
+}
+
 fn record_optional_recovery_failure(
     recorder: &Recorder,
     error_type: &'static str,
@@ -1631,7 +1662,10 @@ mod tests {
     use crate::service::assignment::test_support::manager_with_dependencies as assignment_manager_with_dependencies;
     use crate::service::config::RepositoryUrlPolicy;
     use crate::telemetry::{TestCapture, test_recorder};
-    use um_execution::resolve;
+    use um_execution::{
+        ValidatedClaudeCodeInstallation, ValidatedCodexInstallation, ValidatedPiInstallation,
+        resolve,
+    };
 
     // REQ-RUNNERENROLL-65, REQ-RUNNERENROLL-71
     #[test]
@@ -3253,6 +3287,109 @@ mod tests {
         );
         assert!(headers.get("tracestate").is_none());
         assert!(headers.get("baggage").is_none());
+    }
+
+    async fn records_through_one_policy_closed_connection(
+        configure: impl FnOnce(Config) -> Config,
+    ) -> Vec<serde_json::Map<String, serde_json::Value>> {
+        let (listener, endpoint) = fixture_listener().await;
+        let server = tokio::spawn(async move {
+            let mut socket = accept_fixture_socket(&listener).await;
+            expect_opening_hello(&mut socket).await;
+            socket
+                .send(Message::Close(Some(CloseFrame {
+                    code: CloseCode::Policy,
+                    reason: "".into(),
+                })))
+                .await
+                .expect("send policy close");
+            while let Some(Ok(_)) = socket.next().await {}
+        });
+        let fixture =
+            ConfigFixture::new(&endpoint, test_credential(), true).expect("configure gateway");
+        let (sleeper, _sleep_requests) = controlled_sleeper();
+        let (recorder, capture) = test_recorder("rbt_00000000000000000000000001");
+        let (shutdown, _shutdown_trigger) = controlled_shutdown();
+        with_watchdog(run_until_cancelled_with_dependencies(
+            configure(fixture.cloned_config()),
+            deterministic_frame_source(),
+            sleeper,
+            recorder,
+            None,
+            shutdown,
+        ))
+        .await
+        .expect("runner retried a terminal policy close")
+        .expect_err("policy close did not stop the service");
+        server.await.expect("fixture server failed");
+        capture.records()
+    }
+
+    fn record_names(records: &[serde_json::Map<String, serde_json::Value>]) -> Vec<&str> {
+        records
+            .iter()
+            .filter_map(|record| record["event.name"].as_str())
+            .collect()
+    }
+
+    // REQ-AGENT-67, REQ-RUNNERENROLL-32
+    #[tokio::test]
+    async fn startup_records_harness_untested_once_per_untested_installation_before_connecting() {
+        let records = records_through_one_policy_closed_connection(|config| {
+            config
+                .with_pi_installation(ValidatedPiInstallation::fixture_with_version(
+                    PathBuf::from("/validated/pi"),
+                    (1, 4, 0),
+                    "1.4.0",
+                ))
+                .with_claude_code_installation(ValidatedClaudeCodeInstallation::fixture(
+                    PathBuf::from("/validated/claude"),
+                ))
+        })
+        .await;
+
+        let names = record_names(&records);
+        let untested: Vec<_> = records
+            .iter()
+            .filter(|record| record["event.name"] == "runner.harness_untested")
+            .collect();
+        assert_eq!(untested.len(), 1);
+        let record = untested[0];
+        assert_eq!(record["um.harness.profile"], "PiJsonV1");
+        assert_eq!(record["um.harness.version"], "1.4.0");
+        assert_eq!(record["um.harness.qualification_version"], "1.3.0");
+        assert_eq!(record["um.main"], false);
+        let untested_index = names
+            .iter()
+            .position(|name| *name == "runner.harness_untested")
+            .expect("untested record position");
+        let connection_index = names
+            .iter()
+            .position(|name| *name == "runner.gateway_connection")
+            .expect("gateway connection record");
+        assert!(untested_index < connection_index);
+    }
+
+    // REQ-AGENT-67, REQ-RUNNERENROLL-32
+    #[tokio::test]
+    async fn startup_records_no_harness_untested_for_qualified_installations() {
+        let records = records_through_one_policy_closed_connection(|config| {
+            config
+                .with_pi_installation(ValidatedPiInstallation::fixture(PathBuf::from(
+                    "/validated/pi",
+                )))
+                .with_claude_code_installation(ValidatedClaudeCodeInstallation::fixture(
+                    PathBuf::from("/validated/claude"),
+                ))
+                .with_codex_installation(ValidatedCodexInstallation::fixture(PathBuf::from(
+                    "/validated/codex",
+                )))
+        })
+        .await;
+
+        let names = record_names(&records);
+        assert!(names.contains(&"runner.gateway_connection"));
+        assert!(!names.contains(&"runner.harness_untested"));
     }
 
     #[tokio::test]

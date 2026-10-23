@@ -109,8 +109,12 @@ Claude Code maps canonical stable versions in
 qualifies exact release `2.1.306`. Codex maps stable `>=0.147.0 <0.164.0`
 installations with the maintained App Server schema capabilities into
 `ValidatedCodexInstallation`; the repository separately qualifies exact release
-`0.163.0`. Each immutable value carries the absolute path, exact
-observed version, closed profile, and closed capability set. Local and runner admission
+`0.163.0`. Each harness also maps a capability-compatible stable release strictly newer
+than its qualification release into the same validated type as untested; the shared
+validator computes that qualification (`supported_range` or `untested`) from the anchor,
+and the version probe still gates the capability probe. Each immutable value carries the
+absolute path, exact observed version, closed profile, qualification, and closed
+capability set. Local and runner admission
 inspect resolved workflows and require only each selected installation. Admission and
 later execution use those values without another `PATH` lookup or native probe, so later
 `PATH` changes cannot switch an active operation's executable. Claude execution also

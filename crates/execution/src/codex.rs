@@ -9,8 +9,9 @@ use serde_json::Value;
 #[cfg(test)]
 use super::harness_installation::validate_installation_with as validate_shared_installation;
 use super::harness_installation::{
-    ExecutableValidationFailure, HarnessInstallationProfile, ProbeIsolation, StableVersion,
-    ValidatedInstallationParts, discover_and_validate_installation, parse_probe_line,
+    ExecutableValidationFailure, HarnessInstallationProfile, HarnessQualification, ProbeIsolation,
+    StableVersion, UntestedHarnessAdvisory, ValidatedInstallationParts,
+    discover_and_validate_installation, parse_probe_line,
 };
 #[cfg(test)]
 use crate::process::CommandRunner;
@@ -114,15 +115,34 @@ impl CodexAppServerV1Capabilities {
 pub struct ValidatedCodexInstallation {
     identity: CodexInstallationIdentity,
     capabilities: CodexAppServerV1Capabilities,
+    qualification: HarnessQualification,
 }
 
 impl ValidatedCodexInstallation {
     #[cfg(any(test, feature = "test-fixtures"))]
     pub fn fixture(executable: PathBuf) -> Self {
+        Self::fixture_with_version(
+            executable,
+            CodexInstallationProfile::QUALIFICATION_VERSION,
+            CODEX_APP_SERVER_V1_QUALIFICATION_VERSION,
+        )
+    }
+
+    #[cfg(any(test, feature = "test-fixtures"))]
+    pub fn fixture_with_version(
+        executable: PathBuf,
+        (major, minor, patch): (u64, u64, u64),
+        observed: &'static str,
+    ) -> Self {
+        let version = CodexVersion::fixture(major, minor, patch, observed);
         Self {
+            qualification: HarnessQualification::of(
+                &version,
+                CodexInstallationProfile::QUALIFICATION_VERSION,
+            ),
             identity: CodexInstallationIdentity::from_parts(
                 executable,
-                CodexVersion::fixture(0, 163, 0, CODEX_APP_SERVER_V1_QUALIFICATION_VERSION),
+                version,
                 AgentCompatibilityProfile::CodexAppServerV1,
             ),
             capabilities: CodexAppServerV1Capabilities {
@@ -145,6 +165,20 @@ impl ValidatedCodexInstallation {
 
     pub const fn capabilities(&self) -> &CodexAppServerV1Capabilities {
         &self.capabilities
+    }
+
+    pub const fn qualification(&self) -> HarnessQualification {
+        self.qualification
+    }
+
+    pub fn untested_advisory(&self) -> Option<UntestedHarnessAdvisory> {
+        UntestedHarnessAdvisory::for_installation(
+            self.qualification,
+            "Codex",
+            self.profile(),
+            self.version(),
+            CODEX_APP_SERVER_V1_QUALIFICATION_VERSION,
+        )
     }
 }
 
@@ -301,6 +335,7 @@ impl HarnessInstallationProfile for CodexInstallationProfile {
     type Failure = CodexInstallationFailure;
 
     const EXECUTABLE_NAME: &'static str = "codex";
+    const QUALIFICATION_VERSION: (u64, u64, u64) = (0, 163, 0);
     const CAPABILITY_PROBE_ARGUMENTS: &'static [&'static str] = &CAPABILITY_PROBE_ARGUMENTS;
 
     // Codex owns its isolated native-state directories independently of Pi's trust policy.
@@ -372,10 +407,11 @@ impl HarnessInstallationProfile for CodexInstallationProfile {
             Self::Capabilities,
         >,
     ) -> Self::Installation {
-        let (executable, version, profile, capabilities) = parts.into_parts();
+        let (executable, version, profile, capabilities, qualification) = parts.into_parts();
         ValidatedCodexInstallation {
             identity: CodexInstallationIdentity::from_parts(executable, version, profile),
             capabilities,
+            qualification,
         }
     }
 
@@ -425,9 +461,10 @@ fn parse_version_output(output: &CommandOutput) -> Result<CodexVersion, CodexIns
 }
 
 fn compatibility_profile(version: &CodexVersion) -> Option<AgentCompatibilityProfile> {
-    (version.numeric() >= CODEX_APP_SERVER_V1_MINIMUM_VERSION
+    ((version.numeric() >= CODEX_APP_SERVER_V1_MINIMUM_VERSION
         && version.numeric() < CODEX_APP_SERVER_V1_MAXIMUM_VERSION)
-        .then_some(AgentCompatibilityProfile::CodexAppServerV1)
+        || version.is_newer_than(CodexInstallationProfile::QUALIFICATION_VERSION))
+    .then_some(AgentCompatibilityProfile::CodexAppServerV1)
 }
 
 pub(crate) fn compatibility_profile_for_version(
@@ -801,7 +838,7 @@ mod tests {
     #[test]
     fn admission_rejects_versions_outside_the_undecorated_stable_release_line() {
         let executable = std::env::current_exe().unwrap();
-        for unsupported in ["0.146.999", "0.164.0", "1.147.0"] {
+        for unsupported in ["0.146.999", "0.146.0", "0.99.0"] {
             let runner = compatible_runner(unsupported);
             assert_eq!(
                 validate_codex_installation_with(
@@ -842,6 +879,66 @@ mod tests {
                 "{malformed}"
             );
         }
+    }
+
+    // REQ-AGENT-3, REQ-AGENT-4, REQ-AGENT-65
+    // INV-HARNESS-1, INV-HARNESS-12
+    #[test]
+    fn stable_releases_newer_than_the_qualification_release_are_admitted_untested() {
+        let executable = std::env::current_exe().unwrap();
+        let both_probes = [
+            vec!["--version".to_owned()],
+            CAPABILITY_PROBE_ARGUMENTS.map(str::to_owned).to_vec(),
+        ];
+        for (version, expected) in [
+            ("0.163.1", HarnessQualification::Untested),
+            ("0.164.0", HarnessQualification::Untested),
+            ("1.0.0", HarnessQualification::Untested),
+            ("0.163.0", HarnessQualification::SupportedRange),
+        ] {
+            let runner = compatible_runner(version);
+            let installation = validate_codex_installation_with(
+                &executable,
+                OsStr::new("/controlled/bin"),
+                &runner,
+            )
+            .unwrap();
+
+            assert_eq!(installation.version().as_str(), version);
+            assert_eq!(
+                installation.profile(),
+                AgentCompatibilityProfile::CodexAppServerV1
+            );
+            assert_eq!(installation.qualification(), expected, "{version}");
+            assert_eq!(*runner.invocations.lock().unwrap(), both_probes);
+            let advisory = installation.untested_advisory();
+            if expected == HarnessQualification::Untested {
+                let advisory = advisory.unwrap();
+                assert_eq!(advisory.harness(), "Codex");
+                assert_eq!(advisory.version(), version);
+                assert_eq!(advisory.qualification_version(), "0.163.0");
+            } else {
+                assert_eq!(advisory, None);
+            }
+        }
+
+        let incompatible = FakeRunner {
+            schema_compatible: false,
+            ..compatible_runner("0.164.0")
+        };
+        assert!(matches!(
+            validate_codex_installation_with(
+                &executable,
+                OsStr::new("/controlled/bin"),
+                &incompatible,
+            ),
+            Err(CodexInstallationFailure::Unsupported {
+                incompatibility: CodexIncompatibility::Capability(
+                    CodexCapability::AppServerSchemaV1
+                ),
+                ..
+            })
+        ));
     }
 
     #[test]

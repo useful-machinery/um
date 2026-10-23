@@ -28,6 +28,7 @@ use super::resolution::ResolvedWorkflow;
 use super::validated::{ValidatedHarness, ValidatedRecoveryHandler, ValidatedStep};
 use crate::claude_code::ValidatedClaudeCodeInstallation;
 use crate::codex::ValidatedCodexInstallation;
+use crate::harness_installation::UntestedHarnessAdvisory;
 use crate::pi::ValidatedPiInstallation;
 
 const MAXIMUM_CAPTURED_FILES: usize = 1024;
@@ -1076,6 +1077,34 @@ impl ExecutionContext {
         self.codex_installation = Some(installation);
         self
     }
+
+    /// One advisory per validated installation admitted as untested, in Pi, Claude Code,
+    /// Codex order. The context holds one installation per selected harness.
+    pub fn untested_harness_advisories(&self) -> Vec<UntestedHarnessAdvisory> {
+        untested_harness_advisories(
+            self.pi_installation.as_ref(),
+            self.claude_code_installation.as_ref(),
+            self.codex_installation.as_ref(),
+        )
+    }
+}
+
+/// The advisories of the installations a local run's context or a runner's configuration
+/// keeps, in Pi, Claude Code, Codex order; an installation in its qualified range yields
+/// none.
+pub fn untested_harness_advisories(
+    pi: Option<&ValidatedPiInstallation>,
+    claude_code: Option<&ValidatedClaudeCodeInstallation>,
+    codex: Option<&ValidatedCodexInstallation>,
+) -> Vec<UntestedHarnessAdvisory> {
+    [
+        pi.and_then(ValidatedPiInstallation::untested_advisory),
+        claude_code.and_then(ValidatedClaudeCodeInstallation::untested_advisory),
+        codex.and_then(ValidatedCodexInstallation::untested_advisory),
+    ]
+    .into_iter()
+    .flatten()
+    .collect()
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2192,3 +2221,70 @@ fn canonical_execution_root(root: &Path) -> Result<AdmittedExecutionRoot, Admiss
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod untested_advisory_tests {
+    use std::path::PathBuf;
+    use std::time::Duration;
+
+    use super::{
+        CancellationPolicy, CancellationSource, EnvironmentSnapshot, ExecutionContext,
+        default_execution_policy_limits,
+    };
+    use crate::claude_code::ValidatedClaudeCodeInstallation;
+    use crate::codex::ValidatedCodexInstallation;
+    use crate::pi::ValidatedPiInstallation;
+
+    fn context() -> ExecutionContext {
+        ExecutionContext::new(
+            PathBuf::from("/execution-root"),
+            default_execution_policy_limits(1),
+            EnvironmentSnapshot::new(std::iter::empty::<(String, String)>()),
+            CancellationPolicy::new(CancellationSource::new(), Duration::from_secs(1)),
+        )
+    }
+
+    // REQ-AGENT-66
+    #[test]
+    fn untested_harness_advisories_name_each_untested_installation_once() {
+        let anchors = context()
+            .with_pi_installation(ValidatedPiInstallation::fixture(PathBuf::from("/bin/pi")))
+            .with_claude_code_installation(ValidatedClaudeCodeInstallation::fixture(PathBuf::from(
+                "/bin/claude",
+            )))
+            .with_codex_installation(ValidatedCodexInstallation::fixture(PathBuf::from(
+                "/bin/codex",
+            )));
+        assert_eq!(anchors.untested_harness_advisories(), []);
+
+        let untested = context()
+            .with_codex_installation(ValidatedCodexInstallation::fixture_with_version(
+                PathBuf::from("/bin/codex"),
+                (0, 164, 0),
+                "0.164.0",
+            ))
+            .with_claude_code_installation(ValidatedClaudeCodeInstallation::fixture(PathBuf::from(
+                "/bin/claude",
+            )))
+            .with_pi_installation(ValidatedPiInstallation::fixture_with_version(
+                PathBuf::from("/bin/pi"),
+                (1, 4, 0),
+                "1.4.0",
+            ));
+        let advisories = untested.untested_harness_advisories();
+        let named = advisories
+            .iter()
+            .map(|advisory| {
+                (
+                    advisory.harness(),
+                    advisory.version(),
+                    advisory.qualification_version(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            named,
+            [("Pi", "1.4.0", "1.3.0"), ("Codex", "0.164.0", "0.163.0")]
+        );
+    }
+}

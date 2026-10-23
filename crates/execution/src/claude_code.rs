@@ -7,9 +7,9 @@ use std::path::{Path, PathBuf};
 #[cfg(test)]
 use super::harness_installation::validate_installation_with as validate_shared_installation;
 use super::harness_installation::{
-    ExecutableValidationFailure, HarnessInstallationProfile, ProbeIsolation, StableVersion,
-    ValidatedInstallationParts, discover_and_validate_installation, parse_probe_line,
-    parse_probe_text,
+    ExecutableValidationFailure, HarnessInstallationProfile, HarnessQualification, ProbeIsolation,
+    StableVersion, UntestedHarnessAdvisory, ValidatedInstallationParts,
+    discover_and_validate_installation, parse_probe_line, parse_probe_text,
 };
 #[cfg(test)]
 use crate::process::CommandRunner;
@@ -116,19 +116,33 @@ pub struct ValidatedClaudeCodeInstallation {
     executable: PathBuf,
     version: ClaudeCodeVersion,
     capabilities: ClaudeCodeStreamJsonV1Capabilities,
+    qualification: HarnessQualification,
 }
 
 impl ValidatedClaudeCodeInstallation {
     #[cfg(any(test, feature = "test-fixtures"))]
     pub fn fixture(executable: PathBuf) -> Self {
+        Self::fixture_with_version(
+            executable,
+            ClaudeCodeInstallationProfile::QUALIFICATION_VERSION,
+            CLAUDE_CODE_STREAM_JSON_V1_QUALIFICATION_VERSION,
+        )
+    }
+
+    #[cfg(any(test, feature = "test-fixtures"))]
+    pub fn fixture_with_version(
+        executable: PathBuf,
+        (major, minor, patch): (u64, u64, u64),
+        observed: &'static str,
+    ) -> Self {
+        let version = ClaudeCodeVersion::fixture(major, minor, patch, observed);
         Self {
             executable,
-            version: ClaudeCodeVersion::fixture(
-                2,
-                1,
-                306,
-                CLAUDE_CODE_STREAM_JSON_V1_QUALIFICATION_VERSION,
+            qualification: HarnessQualification::of(
+                &version,
+                ClaudeCodeInstallationProfile::QUALIFICATION_VERSION,
             ),
+            version,
             capabilities: ClaudeCodeStreamJsonV1Capabilities {
                 required: REQUIRED_CAPABILITIES,
             },
@@ -149,6 +163,20 @@ impl ValidatedClaudeCodeInstallation {
 
     pub const fn capabilities(&self) -> &ClaudeCodeStreamJsonV1Capabilities {
         &self.capabilities
+    }
+
+    pub const fn qualification(&self) -> HarnessQualification {
+        self.qualification
+    }
+
+    pub fn untested_advisory(&self) -> Option<UntestedHarnessAdvisory> {
+        UntestedHarnessAdvisory::for_installation(
+            self.qualification,
+            "Claude Code",
+            self.profile(),
+            &self.version,
+            CLAUDE_CODE_STREAM_JSON_V1_QUALIFICATION_VERSION,
+        )
     }
 }
 
@@ -237,6 +265,7 @@ impl HarnessInstallationProfile for ClaudeCodeInstallationProfile {
     type Failure = ClaudeCodeInstallationFailure;
 
     const EXECUTABLE_NAME: &'static str = "claude";
+    const QUALIFICATION_VERSION: (u64, u64, u64) = (2, 1, 306);
     const CAPABILITY_PROBE_ARGUMENTS: &'static [&'static str] = &CAPABILITY_PROBE_ARGUMENTS;
 
     fn probe_isolation(search_path: &OsStr) -> Result<ProbeIsolation, Self::Failure> {
@@ -304,11 +333,12 @@ impl HarnessInstallationProfile for ClaudeCodeInstallationProfile {
             Self::Capabilities,
         >,
     ) -> Self::Installation {
-        let (executable, version, _profile, capabilities) = parts.into_parts();
+        let (executable, version, _profile, capabilities, qualification) = parts.into_parts();
         ValidatedClaudeCodeInstallation {
             executable,
             version,
             capabilities,
+            qualification,
         }
     }
 
@@ -357,9 +387,10 @@ fn parse_version_output(
 }
 
 fn compatibility_profile(version: &ClaudeCodeVersion) -> Option<AgentCompatibilityProfile> {
-    (version.numeric() >= CLAUDE_CODE_STREAM_JSON_V1_MINIMUM_VERSION
+    ((version.numeric() >= CLAUDE_CODE_STREAM_JSON_V1_MINIMUM_VERSION
         && version.numeric() < CLAUDE_CODE_STREAM_JSON_V1_MAXIMUM_VERSION)
-        .then_some(AgentCompatibilityProfile::ClaudeCodeStreamJsonV1)
+        || version.is_newer_than(ClaudeCodeInstallationProfile::QUALIFICATION_VERSION))
+    .then_some(AgentCompatibilityProfile::ClaudeCodeStreamJsonV1)
 }
 
 pub(crate) fn compatibility_profile_for_version(

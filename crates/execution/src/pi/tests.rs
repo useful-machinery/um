@@ -158,7 +158,6 @@ fn version_range_and_capabilities_are_both_required() {
     let executable = std::env::current_exe().unwrap();
     for unsupported in [
         "0.83.0", "0.84.1", "0.88.0", "0.95.0", "0.99.0", "0.99.2", "0.100.0", "1.1.0", "1.2.1",
-        "1.3.1",
     ] {
         let runner = FakeRunner {
             invocations: Mutex::new(Vec::new()),
@@ -234,4 +233,117 @@ fn version_range_and_capabilities_are_both_required() {
             ))
         );
     }
+}
+
+fn validate_with(
+    version: &str,
+    help: &str,
+) -> (
+    Result<ValidatedPiInstallation, PiInstallationFailure>,
+    Vec<Vec<String>>,
+) {
+    let runner = FakeRunner {
+        invocations: Mutex::new(Vec::new()),
+        version: output(format!("{version}\n").as_bytes()),
+        capabilities: output(help.as_bytes()),
+    };
+    let result = validate_pi_installation_with(
+        &std::env::current_exe().unwrap(),
+        OsStr::new("/controlled/bin"),
+        &runner,
+    );
+    let invocations = runner.invocations.into_inner().unwrap();
+    (result, invocations)
+}
+
+// REQ-AGENT-1, REQ-AGENT-4, REQ-AGENT-5, REQ-AGENT-7, REQ-AGENT-65
+// INV-HARNESS-1, INV-HARNESS-12
+#[test]
+fn stable_releases_newer_than_the_qualification_release_are_admitted_untested() {
+    let both_probes = [
+        vec!["--version".to_owned()],
+        CAPABILITY_PROBE_ARGUMENTS.map(str::to_owned).to_vec(),
+    ];
+    for version in ["1.3.1", "1.4.0", "2.0.0"] {
+        let (result, invocations) = validate_with(version, COMPLETE_HELP);
+        let installation = result.unwrap();
+
+        assert_eq!(installation.version().as_str(), version);
+        assert_eq!(installation.profile(), AgentCompatibilityProfile::PiJsonV1);
+        assert_eq!(installation.qualification(), HarnessQualification::Untested);
+        assert_eq!(
+            installation.capabilities().required(),
+            REQUIRED_CAPABILITIES
+        );
+        assert_eq!(invocations, both_probes);
+        let advisory = installation.untested_advisory().unwrap();
+        assert_eq!(advisory.harness(), "Pi");
+        assert_eq!(advisory.profile(), AgentCompatibilityProfile::PiJsonV1);
+        assert_eq!(advisory.version(), version);
+        assert_eq!(advisory.qualification_version(), "1.3.0");
+        let line = advisory.to_string();
+        assert!(line.contains(version) && line.contains("1.3.0"), "{line}");
+    }
+
+    for version in ["1.3.0", "0.99.1"] {
+        let (result, invocations) = validate_with(version, COMPLETE_HELP);
+        let installation = result.unwrap();
+        assert_eq!(
+            installation.qualification(),
+            HarnessQualification::SupportedRange
+        );
+        assert_eq!(installation.untested_advisory(), None);
+        assert_eq!(invocations, both_probes);
+    }
+
+    let (result, invocations) = validate_with(
+        "1.4.0",
+        &COMPLETE_HELP.replace("--approve, -a", "--permit, -p"),
+    );
+    assert_eq!(
+        result,
+        Err(PiInstallationFailure::Unsupported(
+            PiIncompatibility::Capability {
+                capability: PiCapability::InvocationScopedProjectTrust,
+                version: "1.4.0".to_owned(),
+            }
+        ))
+    );
+    assert_eq!(invocations, both_probes);
+
+    let (result, invocations) = validate_with("1.4.0-rc.1", COMPLETE_HELP);
+    assert_eq!(
+        result,
+        Err(PiInstallationFailure::Malformed {
+            probe: PiProbe::Version,
+            version: None,
+        })
+    );
+    assert_eq!(invocations, [vec!["--version".to_owned()]]);
+
+    for version in ["0.99.2", "1.2.1"] {
+        let (result, invocations) = validate_with(version, COMPLETE_HELP);
+        assert_eq!(
+            result,
+            Err(PiInstallationFailure::Unsupported(
+                PiIncompatibility::Version(version.to_owned())
+            ))
+        );
+        assert_eq!(invocations, [vec!["--version".to_owned()]]);
+    }
+}
+
+// INV-HARNESS-12
+#[test]
+fn version_fixtures_derive_the_qualification_by_the_admission_policy() {
+    let anchor = ValidatedPiInstallation::fixture(PathBuf::from("/pi"));
+    assert_eq!(anchor.version().as_str(), PI_JSON_V1_QUALIFICATION_VERSION);
+    assert_eq!(anchor.qualification(), HarnessQualification::SupportedRange);
+
+    let newer =
+        ValidatedPiInstallation::fixture_with_version(PathBuf::from("/pi"), (1, 4, 0), "1.4.0");
+    assert_eq!(newer.version().as_str(), "1.4.0");
+    assert_eq!(newer.qualification(), HarnessQualification::Untested);
+    assert_eq!(newer.profile(), anchor.profile());
+    assert_eq!(newer.capabilities(), anchor.capabilities());
 }

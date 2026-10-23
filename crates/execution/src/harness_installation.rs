@@ -1,4 +1,6 @@
+use std::borrow::Borrow;
 use std::ffi::{OsStr, OsString};
+use std::fmt;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -7,6 +9,7 @@ use std::time::Duration;
 use rustix::fs::{Access, AtFlags, CWD, accessat};
 
 use crate::process::{CommandOutput, CommandRunner};
+use crate::workflow::agent::AgentCompatibilityProfile;
 
 const MAXIMUM_VERSION_OUTPUT_BYTES: usize = 4 * 1024;
 const MAXIMUM_CAPABILITY_OUTPUT_BYTES: usize = 64 * 1024;
@@ -18,14 +21,97 @@ pub(crate) enum ExecutableValidationFailure {
     Unexecutable,
 }
 
+/// Whether an admitted installation is in its harness's qualified range or newer than the
+/// qualification release.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HarnessQualification {
+    SupportedRange,
+    Untested,
+}
+
+impl HarnessQualification {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::SupportedRange => "supported_range",
+            Self::Untested => "untested",
+        }
+    }
+
+    pub(crate) fn of(version: &StableVersion, qualification_version: (u64, u64, u64)) -> Self {
+        if version.is_newer_than(qualification_version) {
+            Self::Untested
+        } else {
+            Self::SupportedRange
+        }
+    }
+}
+
+/// The operator-facing facts about an installation admitted as untested.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UntestedHarnessAdvisory {
+    harness: &'static str,
+    profile: AgentCompatibilityProfile,
+    version: String,
+    qualification_version: &'static str,
+}
+
+impl UntestedHarnessAdvisory {
+    pub(crate) fn for_installation(
+        qualification: HarnessQualification,
+        harness: &'static str,
+        profile: AgentCompatibilityProfile,
+        version: &StableVersion,
+        qualification_version: &'static str,
+    ) -> Option<Self> {
+        (qualification == HarnessQualification::Untested).then(|| Self {
+            harness,
+            profile,
+            version: version.as_str().to_owned(),
+            qualification_version,
+        })
+    }
+
+    pub const fn harness(&self) -> &'static str {
+        self.harness
+    }
+
+    pub const fn profile(&self) -> AgentCompatibilityProfile {
+        self.profile
+    }
+
+    pub fn version(&self) -> &str {
+        &self.version
+    }
+
+    pub const fn qualification_version(&self) -> &'static str {
+        self.qualification_version
+    }
+}
+
+impl fmt::Display for UntestedHarnessAdvisory {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "{} {} is newer than its qualification release {} and is untested with {}",
+            self.harness,
+            self.version,
+            self.qualification_version,
+            self.profile.as_str()
+        )
+    }
+}
+
 pub(crate) trait HarnessInstallationProfile {
-    type Version;
+    type Version: Borrow<StableVersion>;
     type CompatibilityProfile;
     type Capabilities;
     type Installation;
     type Failure;
 
     const EXECUTABLE_NAME: &'static str;
+    /// Numeric form of the harness's qualification release; a newer admitted version is
+    /// untested.
+    const QUALIFICATION_VERSION: (u64, u64, u64);
     const CAPABILITY_PROBE_ARGUMENTS: &'static [&'static str];
 
     fn probe_isolation(search_path: &OsStr) -> Result<ProbeIsolation, Self::Failure>;
@@ -62,15 +148,25 @@ pub(crate) struct ValidatedInstallationParts<Version, Profile, Capabilities> {
     version: Version,
     profile: Profile,
     capabilities: Capabilities,
+    qualification: HarnessQualification,
 }
 
 impl<Version, Profile, Capabilities> ValidatedInstallationParts<Version, Profile, Capabilities> {
-    pub(crate) fn into_parts(self) -> (PathBuf, Version, Profile, Capabilities) {
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        PathBuf,
+        Version,
+        Profile,
+        Capabilities,
+        HarnessQualification,
+    ) {
         (
             self.executable,
             self.version,
             self.profile,
             self.capabilities,
+            self.qualification,
         )
     }
 }
@@ -114,6 +210,8 @@ pub(crate) fn validate_installation_with<Profile: HarnessInstallationProfile>(
         let version = Profile::parse_version_output(&version_output)?;
         let profile = Profile::compatibility_profile(&version)
             .ok_or_else(|| Profile::unsupported_version(&version))?;
+        let qualification =
+            HarnessQualification::of(version.borrow(), Profile::QUALIFICATION_VERSION);
         let capability_output = isolation
             .run(
                 runner,
@@ -135,6 +233,7 @@ pub(crate) fn validate_installation_with<Profile: HarnessInstallationProfile>(
             version,
             profile,
             capabilities,
+            qualification,
         }))
     })();
     isolation
@@ -294,6 +393,12 @@ impl StableVersion {
 
     pub(crate) const fn numeric(&self) -> (u64, u64, u64) {
         (self.major, self.minor, self.patch)
+    }
+
+    /// Whether this release is strictly newer than `baseline`, the admission predicate every
+    /// harness shares for releases past its qualification release.
+    pub(crate) fn is_newer_than(&self, baseline: (u64, u64, u64)) -> bool {
+        self.numeric() > baseline
     }
 }
 

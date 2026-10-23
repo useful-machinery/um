@@ -35,18 +35,19 @@ use um_execution::{
     RequestedPresentationMode, ResolvedAttachment, ResolvedFile, ResolvedInput, ResolvedInputs,
     ResolvedJsonInput, ResolvedWorkflow, RunOutcome, RunTimingObservation, RunTimingSnapshot,
     StepDiagnosticLog, SystemObservationClock, TerminalCapabilities, TerminalHostExit,
-    TransitionSequence, ValidatedHarness, ValidatedRecoveryHandler, ValidatedStep,
-    WorkflowExecutionResult, WorkflowExecutionStart, WorkflowNodeRole, WorkflowRunCancellation,
-    WorkflowRunCleanupResult, WorkflowRunFinalization, WorkflowRunFinalizationCancellation,
-    WorkflowRunId, WorkflowRunOutput, WorkflowRunPresentation, WorkflowRunPresentationResult,
-    WorkflowRunPublicationResult, WorkflowRunResult, WorkflowRunStep, WorkflowRunStepKind,
-    WorkflowRunTerminalResultV1, WorkflowRunTiming, WorkflowRunViewModel, WorkflowStepTiming,
-    WorkflowTerminalHost, admit_local_workflow, command_output_v1, default_execution_policy_limits,
+    TransitionSequence, UntestedHarnessAdvisory, ValidatedHarness, ValidatedRecoveryHandler,
+    ValidatedStep, WorkflowExecutionResult, WorkflowExecutionStart, WorkflowNodeRole,
+    WorkflowRunCancellation, WorkflowRunCleanupResult, WorkflowRunFinalization,
+    WorkflowRunFinalizationCancellation, WorkflowRunId, WorkflowRunOutput, WorkflowRunPresentation,
+    WorkflowRunPresentationResult, WorkflowRunPublicationResult, WorkflowRunResult,
+    WorkflowRunStep, WorkflowRunStepKind, WorkflowRunTerminalResultV1, WorkflowRunTiming,
+    WorkflowRunViewModel, WorkflowStepTiming, WorkflowTerminalHost, admit_local_workflow,
+    command_output_v1, default_execution_policy_limits,
     discover_and_validate_claude_code_installation, discover_and_validate_codex_installation,
     discover_and_validate_pi_installation, execute_workflow, prepare_attempt_result_destination,
     production_agent_dispatcher, publish_prepared_workflow_result,
     resolve_workflow_file_with_agent_profiles, step_recovery_summary_v1,
-    summary_disposition_matches,
+    summary_disposition_matches, write_untested_harness_advisories,
 };
 use um_execution::{
     AgentProfileReplacementDocument, AgentProfileReplacementV1,
@@ -190,6 +191,7 @@ impl Command {
                 return Err(anyhow!("prepare local workflow execution context").into());
             }
         };
+        let untested_advisories = context.untested_harness_advisories();
         let workflow_for_admission = workflow.clone();
         let admitted = match blocking_operation(move || {
             admit_local_workflow(workflow_for_admission, inputs, context)
@@ -215,6 +217,7 @@ impl Command {
             )
             .into());
         }
+        write_untested_advisories(&untested_advisories);
         let run_directory = self.run_dir.clone();
         let admitted_for_creation = admitted.clone();
         let owned_run = tokio::task::spawn_blocking(move || {
@@ -1033,6 +1036,13 @@ fn required_agent_harnesses(
             Some(harness)
         });
     node_harnesses.chain(recovery_harnesses)
+}
+
+/// REQ-AGENT-66: called only after admission succeeds, so a rejection leaves stderr to the
+/// rejection report, and before the attempt starts the terminal interface. The advisory is
+/// nonblocking, so a failed write does not stop the run.
+pub(super) fn write_untested_advisories(advisories: &[UntestedHarnessAdvisory]) {
+    let _ = write_untested_harness_advisories(&mut io::stderr(), advisories);
 }
 
 pub(super) fn execution_context_for_workflow(

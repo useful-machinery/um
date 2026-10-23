@@ -170,7 +170,7 @@ fn malformed_incompatible_and_missing_capability_outputs_are_distinct() {
         );
     }
 
-    for version in ["2.1.222", "2.1.233", "2.2.0", "3.0.0"] {
+    for version in ["2.1.222", "2.1.233"] {
         let incompatible = FakeRunner {
             invocations: Mutex::new(Vec::new()),
             version: output(format!("{version} (Claude Code)\n").as_bytes()),
@@ -214,4 +214,78 @@ fn malformed_incompatible_and_missing_capability_outputs_are_distinct() {
             }
         ))
     );
+}
+
+fn validate_with(
+    version: &str,
+    help: &str,
+) -> (
+    Result<ValidatedClaudeCodeInstallation, ClaudeCodeInstallationFailure>,
+    Vec<Vec<String>>,
+) {
+    let runner = FakeRunner {
+        invocations: Mutex::new(Vec::new()),
+        version: output(format!("{version} (Claude Code)\n").as_bytes()),
+        capabilities: output(help.as_bytes()),
+    };
+    let result = validate_claude_code_installation_with(
+        &std::env::current_exe().unwrap(),
+        OsStr::new("/controlled/bin"),
+        &runner,
+    );
+    let invocations = runner.invocations.into_inner().unwrap();
+    (result, invocations)
+}
+
+// REQ-AGENT-2, REQ-AGENT-4, REQ-AGENT-65
+// INV-HARNESS-1, INV-HARNESS-12
+#[test]
+fn stable_releases_newer_than_the_qualification_release_are_admitted_untested() {
+    let both_probes = [vec!["--version".to_owned()], vec!["--help".to_owned()]];
+    for version in ["2.1.307", "2.2.0", "3.0.0"] {
+        let (result, invocations) = validate_with(version, COMPLETE_HELP);
+        let installation = result.unwrap();
+
+        assert_eq!(installation.version().as_str(), version);
+        assert_eq!(
+            installation.profile(),
+            AgentCompatibilityProfile::ClaudeCodeStreamJsonV1
+        );
+        assert_eq!(installation.qualification(), HarnessQualification::Untested);
+        assert_eq!(invocations, both_probes);
+        let advisory = installation.untested_advisory().unwrap();
+        assert_eq!(advisory.harness(), "Claude Code");
+        assert_eq!(advisory.version(), version);
+        assert_eq!(advisory.qualification_version(), "2.1.306");
+    }
+
+    let (result, _) = validate_with("2.1.306", COMPLETE_HELP);
+    let installation = result.unwrap();
+    assert_eq!(
+        installation.qualification(),
+        HarnessQualification::SupportedRange
+    );
+    assert_eq!(installation.untested_advisory(), None);
+
+    let (result, invocations) =
+        validate_with("2.2.0", &COMPLETE_HELP.replace("--json-schema", "--schema"));
+    assert_eq!(
+        result,
+        Err(ClaudeCodeInstallationFailure::Unsupported(
+            ClaudeCodeIncompatibility::Capability {
+                capability: ClaudeCodeCapability::JsonSchema,
+                version: "2.2.0".to_owned(),
+            }
+        ))
+    );
+    assert_eq!(invocations, both_probes);
+
+    let (result, invocations) = validate_with("2.1.233", COMPLETE_HELP);
+    assert_eq!(
+        result,
+        Err(ClaudeCodeInstallationFailure::Unsupported(
+            ClaudeCodeIncompatibility::Version("2.1.233".to_owned())
+        ))
+    );
+    assert_eq!(invocations, [vec!["--version".to_owned()]]);
 }

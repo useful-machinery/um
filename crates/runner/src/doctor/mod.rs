@@ -6,6 +6,8 @@ mod pi;
 use std::collections::BTreeSet;
 use std::fmt;
 
+use um_execution::{HarnessQualification, UntestedHarnessAdvisory};
+
 use claude_code::ClaudeCodeCheck;
 use codex::CodexCheck;
 use git::GitCheck;
@@ -71,27 +73,48 @@ fn capability_failure_details(
     details
 }
 
+/// The facts a doctor check reports about an installation that admission accepted.
+struct CompatibleHarness<'a> {
+    harness: &'static str,
+    version: &'a str,
+    profile: &'a str,
+    capabilities: Vec<&'static str>,
+    executable: &'a std::path::Path,
+    qualification: HarnessQualification,
+    untested: Option<UntestedHarnessAdvisory>,
+}
+
 fn compatible_harness_outcome(
-    harness: &str,
-    version: &str,
-    profile: &str,
-    capabilities: impl IntoIterator<Item = &'static str>,
-    executable: &std::path::Path,
+    installation: CompatibleHarness<'_>,
     mut details: std::collections::BTreeMap<String, String>,
 ) -> Outcome {
-    details.insert(
-        "capabilities".to_owned(),
-        capabilities.into_iter().collect::<Vec<_>>().join(","),
-    );
+    let CompatibleHarness {
+        harness,
+        version,
+        profile,
+        capabilities,
+        executable,
+        qualification,
+        untested,
+    } = installation;
+    details.insert("capabilities".to_owned(), capabilities.join(","));
     details.insert("profile".to_owned(), profile.to_owned());
     details.insert("version".to_owned(), version.to_owned());
     if let Some(executable) = executable.to_str() {
         details.insert("executablePath".to_owned(), executable.to_owned());
     }
+    details.insert(
+        "qualification".to_owned(),
+        qualification.as_str().to_owned(),
+    );
+    let message = match untested {
+        Some(advisory) => format!("{advisory}."),
+        None => format!("{harness} {version} is compatible with {profile}."),
+    };
     Outcome {
         status: Status::Pass,
         code: "ok",
-        message: format!("{harness} {version} is compatible with {profile}."),
+        message,
         details,
     }
 }

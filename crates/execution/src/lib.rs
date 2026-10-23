@@ -41,6 +41,7 @@ pub use workflow::admission::{
     ResolvedInputs, ResolvedJsonInput, SourceRevisionProvenance, WorkflowCapacityBudget,
     admit_local_continuation_workflow, admit_local_workflow, admit_runner_workflow,
     default_execution_policy_limits, local_continuation_input_failures,
+    untested_harness_advisories,
 };
 pub use workflow::agent::WorkflowRunId;
 pub use workflow::agent::dispatch::{ProductionAgentDispatcher, production_agent_dispatcher};
@@ -101,6 +102,7 @@ pub use workflow::presentation::{
     PresentationMode, PublicationPresentation, RequestedPresentationMode, SystemObservationClock,
     TerminalCapabilities, WorkflowRunOutput, WorkflowRunPresentation,
     WorkflowRunPresentationResult, styled_terminal_text, visible_text,
+    write_untested_harness_advisories,
 };
 pub use workflow::presentation_feed::{DisplayDeadline, normalize_terminal_scalar};
 pub use workflow::process_group::{
@@ -170,6 +172,7 @@ pub use claude_code::ClaudeCodeCapability;
 pub use codex::CodexCapability;
 pub use codex::CodexInstallationIdentity;
 pub use harness_installation::StableVersion;
+pub use harness_installation::{HarnessQualification, UntestedHarnessAdvisory};
 pub use pi::PiCapability;
 pub use workflow::ClaudeCodeConfig;
 pub use workflow::PiConfig;

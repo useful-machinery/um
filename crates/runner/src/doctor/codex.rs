@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use super::{CheckDescriptor, DoctorCheck, Outcome, compatible_harness_outcome};
+use super::{CheckDescriptor, CompatibleHarness, DoctorCheck, Outcome, compatible_harness_outcome};
 use um_execution::{
     AgentCompatibilityProfile, CODEX_APP_SERVER_V1_QUALIFICATION_VERSION,
     CODEX_APP_SERVER_V1_SUPPORTED_RANGE, CodexIncompatibility, CodexInstallationFailure,
@@ -22,15 +22,20 @@ impl DoctorCheck for CodexCheck {
     fn run(&self) -> Outcome {
         match discover_and_validate_codex_installation() {
             Ok(installation) => compatible_harness_outcome(
-                "Codex CLI",
-                installation.version().as_str(),
-                installation.profile().as_str(),
-                installation
-                    .capabilities()
-                    .required()
-                    .iter()
-                    .map(|capability| capability.as_str()),
-                installation.executable(),
+                CompatibleHarness {
+                    harness: "Codex CLI",
+                    version: installation.version().as_str(),
+                    profile: installation.profile().as_str(),
+                    capabilities: installation
+                        .capabilities()
+                        .required()
+                        .iter()
+                        .map(|capability| capability.as_str())
+                        .collect(),
+                    executable: installation.executable(),
+                    qualification: installation.qualification(),
+                    untested: installation.untested_advisory(),
+                },
                 compatibility_details(),
             ),
             Err(failure) => failure_outcome(failure),

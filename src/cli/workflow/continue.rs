@@ -154,6 +154,7 @@ impl Command {
         } else {
             context
         };
+        let untested_advisories = context.untested_harness_advisories();
         let admitted = if let (Some(reexecuted), Some(projected_inputs)) =
             (candidate_reexecuted, inputs.as_ref().ok().cloned())
         {
@@ -212,6 +213,7 @@ impl Command {
             return fail_after_settlement(pending, &signal_task, "complete continuation admission")
                 .await;
         };
+        super::run::write_untested_advisories(&untested_advisories);
         if let Err(error) = pending.validate_execution_root(&admitted) {
             let settlement = tokio::task::spawn_blocking(move || pending.settle_abandoned()).await;
             signal_task.abort();

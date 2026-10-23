@@ -311,7 +311,7 @@ fn doctor_reports_each_claude_code_installation_failure_without_fallback() {
         assert_eq!(fixture.recorded_probes(), expected_probes);
     }
 
-    let incompatible = ClaudeCodeFixture::new("2.2.0 (Claude Code)", COMPLETE_HELP, true);
+    let incompatible = ClaudeCodeFixture::new("2.1.233 (Claude Code)", COMPLETE_HELP, true);
     let compatible = ClaudeCodeFixture::new("2.1.234 (Claude Code)", COMPLETE_HELP, true);
     let ordered_path =
         std::env::join_paths([incompatible.path_directory(), compatible.path_directory()]).unwrap();
@@ -320,6 +320,59 @@ fn doctor_reports_each_claude_code_installation_failure_without_fallback() {
     assert_eq!(report_code(&output), "unsupported_claude_code_version");
     assert_eq!(incompatible.recorded_probes(), b"--version\n");
     assert!(compatible.recorded_probes().is_empty());
+}
+
+// REQ-AGENT-2, REQ-AGENT-7, REQ-AGENT-65, REQ-AGENT-68
+// INV-HARNESS-11
+// SC-AGENT-1
+#[test]
+fn doctor_passes_a_newer_claude_code_as_untested_and_reports_qualification() {
+    let untested = ClaudeCodeFixture::new("2.2.0 (Claude Code)", COMPLETE_HELP, true);
+    let json = doctor_json(untested.path_directory(), &[CLAUDE_CODE_CHECK_ID], &[]);
+    assert_eq!(
+        json.status.code(),
+        Some(0),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&json.stdout),
+        String::from_utf8_lossy(&json.stderr)
+    );
+    let untested_report = report(&json);
+    let check = &untested_report["checks"][0];
+    assert_eq!(check["status"], "pass");
+    assert_eq!(check["code"], "ok");
+    assert_eq!(check["details"]["qualification"], "untested");
+    assert_eq!(check["details"]["version"], "2.2.0");
+    assert_eq!(check["details"]["qualificationVersion"], "2.1.306");
+    assert_eq!(check["details"]["supportedRange"], ">=2.1.234 <2.2.0");
+    assert_eq!(untested.recorded_probes(), CLOSED_PROBES);
+
+    let human = doctor_human(untested.path_directory(), &[CLAUDE_CODE_CHECK_ID], &[]);
+    assert_eq!(human.status.code(), Some(0));
+    assert_human_doctor_detail_matches_json(
+        &human,
+        &untested_report,
+        "qualification",
+        "qualification",
+    );
+
+    let qualified = ClaudeCodeFixture::new("2.1.306 (Claude Code)", COMPLETE_HELP, true);
+    let output = doctor_json(qualified.path_directory(), &[CLAUDE_CODE_CHECK_ID], &[]);
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        report(&output)["checks"][0]["details"]["qualification"],
+        "supported_range"
+    );
+
+    let missing_schema_help = COMPLETE_HELP.replace("--json-schema <schema>", "--schema <schema>");
+    let incapable = ClaudeCodeFixture::new("2.2.0 (Claude Code)", &missing_schema_help, true);
+    let output = doctor_json(incapable.path_directory(), &[CLAUDE_CODE_CHECK_ID], &[]);
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(report_code(&output), "unsupported_claude_code_capability");
+    assert!(
+        report(&output)["checks"][0]["details"]
+            .get("qualification")
+            .is_none()
+    );
 }
 
 // REQ-AGENT-47, REQ-AGENT-51

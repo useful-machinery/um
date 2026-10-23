@@ -107,6 +107,7 @@ fn write_harness_compatibility_details(
         ("supportedRange", "supported range"),
         ("expectedVersion", "required version"),
         ("qualificationVersion", "qualification version"),
+        ("qualification", "qualification"),
     ] {
         if let Some(value) = details.get(key) {
             writeln!(output, "  {label}: {value}")?;
@@ -208,6 +209,7 @@ mod tests {
         }
     }
 
+    // REQ-AGENT-49, REQ-AGENT-68
     #[test]
     fn human_harness_details_render_structured_compatibility_policy() {
         let report = Report {
@@ -220,6 +222,7 @@ mod tests {
                         ("version".to_owned(), "2.3.5".to_owned()),
                         ("supportedRange".to_owned(), ">=2.3.4 <2.4.0".to_owned()),
                         ("qualificationVersion".to_owned(), "2.3.4".to_owned()),
+                        ("qualification".to_owned(), "untested".to_owned()),
                     ]),
                 ),
                 result(
@@ -247,6 +250,7 @@ mod tests {
             "observed version: 2.3.5",
             "supported range: >=2.3.4 <2.4.0",
             "qualification version: 2.3.4",
+            "qualification: untested",
             "profile: ExactProfile",
             "required version: 7.8.9",
         ] {

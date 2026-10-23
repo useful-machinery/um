@@ -99,6 +99,7 @@ impl Command {
         if workflow.requires_git_capture() {
             context = context.with_local_git_baseline(pending.git_baseline().cloned());
         }
+        let untested_advisories = context.untested_harness_advisories();
         let workflow_for_admission = workflow.clone();
         let admitted = match super::run::blocking_operation(move || {
             admit_local_workflow(workflow_for_admission, inputs, context)
@@ -126,6 +127,7 @@ impl Command {
             signal_task.abort();
             return Err(anyhow::anyhow!("prepare local workflow retry paths").into());
         }
+        super::run::write_untested_advisories(&untested_advisories);
 
         let reused_attempts = match pending.reused_execution_root_attempts(&admitted) {
             Ok(attempts) => attempts,

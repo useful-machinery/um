@@ -41,6 +41,7 @@ use super::runtime::{
 use super::step_runtime::{CommandExecutionFailure, StepExecutionFailure, StepFailureCause};
 use super::validated::ValidatedStep;
 use crate::AgentHarnessInstallationFailure;
+use crate::harness_installation::UntestedHarnessAdvisory;
 
 const RUN_COMMAND: &str = "um workflow run";
 const RETRY_COMMAND: &str = "um workflow retry";
@@ -2633,5 +2634,64 @@ pub(crate) fn human_duration(duration: Duration) -> String {
     }
 }
 
+/// Writes one line per untested harness installation a local run admitted. The advisory is
+/// independent of the presentation mode: it precedes the attempt and the terminal interface,
+/// and `--json` keeps stdout for the result document because callers pass stderr.
+pub fn write_untested_harness_advisories(
+    output: &mut impl Write,
+    advisories: &[UntestedHarnessAdvisory],
+) -> io::Result<()> {
+    for advisory in advisories {
+        writeln!(output, "{advisory}")?;
+    }
+    output.flush()
+}
+
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod untested_advisory_tests {
+    use std::path::PathBuf;
+
+    use super::write_untested_harness_advisories;
+    use crate::claude_code::ValidatedClaudeCodeInstallation;
+    use crate::pi::ValidatedPiInstallation;
+
+    // REQ-AGENT-66
+    #[test]
+    fn each_untested_harness_advisory_is_one_stderr_line() {
+        let advisories = [
+            ValidatedPiInstallation::fixture_with_version(
+                PathBuf::from("/bin/pi"),
+                (1, 4, 0),
+                "1.4.0",
+            )
+            .untested_advisory()
+            .unwrap(),
+            ValidatedClaudeCodeInstallation::fixture_with_version(
+                PathBuf::from("/bin/claude"),
+                (2, 2, 0),
+                "2.2.0",
+            )
+            .untested_advisory()
+            .unwrap(),
+        ];
+        let mut output = Vec::new();
+
+        write_untested_harness_advisories(&mut output, &advisories).unwrap();
+
+        let output = String::from_utf8(output).unwrap();
+        let lines = output.lines().collect::<Vec<_>>();
+        assert_eq!(lines.len(), 2, "{output}");
+        assert!(output.ends_with('\n'));
+        for (line, (version, qualification)) in
+            lines.iter().zip([("1.4.0", "1.3.0"), ("2.2.0", "2.1.306")])
+        {
+            assert!(
+                line.contains(version) && line.contains(qualification),
+                "{line}"
+            );
+        }
+    }
+}
