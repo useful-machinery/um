@@ -574,7 +574,7 @@ set -- "$config"/projects/*
 [ "$#" -eq 1 ] && [ -d "$1" ]
 native_project=$1
 printf '{malformed retained transcript' > "$native_project/$session.jsonl"
-while IFS= read -r _; do :; done
+IFS= read -r _ || :
 printf '{"type":"system","subtype":"init","cwd":"%s","session_id":"%s","model":"%s","permissionMode":"bypassPermissions","claude_code_version":"2.1.300"}\n' "$PWD" "$session" "$model"
 printf '{"type":"stream_event","event":{"type":"message_start","message":{"id":"msg-local","type":"message","role":"assistant","content":[],"model":"%s","usage":{"input_tokens":1,"output_tokens":0}}},"session_id":"%s","parent_tool_use_id":null}\n' "$model" "$session"
 printf '{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}},"session_id":"%s","parent_tool_use_id":null}\n' "$session"

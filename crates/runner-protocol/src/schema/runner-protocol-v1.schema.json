@@ -5239,6 +5239,8 @@
             "frame_too_large",
             "frame_decode_failed",
             "frame_not_object",
+            "standard_input_write_failed",
+            "standard_input_write_timed_out",
             "initialization_invalid",
             "exchange_initialization_missing",
             "exchange_lifecycle_invalid",
@@ -5269,6 +5271,7 @@
           "enum": [
             "frame_read",
             "frame_decode",
+            "initial_input",
             "initialization",
             "exchange_lifecycle",
             "event_envelope",
@@ -5387,6 +5390,7 @@
                 "none",
                 "candidate",
                 "ambiguous_candidate",
+                "premature_candidate",
                 "missing_candidate",
                 "native_failure"
               ]
@@ -5401,6 +5405,22 @@
               "type": "boolean"
             },
             "retryActive": {
+              "type": "boolean"
+            },
+            "eventThread": {
+              "enum": [
+                "none",
+                "main",
+                "subagent"
+              ]
+            },
+            "outstandingBackgroundCommands": {
+              "$ref": "#/$defs/nonnegativeSequence"
+            },
+            "outstandingBackgroundSubagents": {
+              "$ref": "#/$defs/nonnegativeSequence"
+            },
+            "scheduledWakeupPending": {
               "type": "boolean"
             }
           },

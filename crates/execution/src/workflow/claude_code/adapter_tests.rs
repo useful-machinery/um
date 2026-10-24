@@ -18,8 +18,8 @@ use tokio::sync::{mpsc, watch};
 
 use super::adapter::{
     ClaudeCodeStreamJsonV1Adapter, MAXIMUM_INLINE_ATTACHMENT_FRAME_BYTES,
-    NATIVE_TRANSCRIPT_CAPTURE_MISSING_DIAGNOSTIC, STANDARD_INPUT_WRITE_TIMEOUT,
-    native_project_slug, prepare_launch,
+    NATIVE_TRANSCRIPT_CAPTURE_MISSING_DIAGNOSTIC, PREMATURE_CANDIDATE_FEEDBACK,
+    STANDARD_INPUT_WRITE_TIMEOUT, native_project_slug, prepare_launch,
 };
 use super::test_support::{
     FixtureSignal, PendingClock, RecordingObservationSink, admitted_adapter, invocation_identity,
@@ -52,7 +52,7 @@ set -eu
 for argument in "$@"; do
   printf '%s\0' "$argument"
 done > "$CLAUDE_FIXTURE_ARGUMENTS"
-cat > "$CLAUDE_FIXTURE_INPUT"
+head -n 1 > "$CLAUDE_FIXTURE_INPUT"
 prompt=
 model=
 session=
@@ -95,6 +95,7 @@ printf '{"type":"stream_event","event":{"type":"message_stop"},"session_id":"%s"
 printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":"completed","result":"convenience duplicate","session_id":"%s"}\n' "$session"
 )
 printf '%s\n' "$output"
+cat >> "$CLAUDE_FIXTURE_INPUT"
 "#;
 
 const CANCELLATION_FAKE_CLAUDE: &str = r#"#!/bin/sh
@@ -121,6 +122,13 @@ exec "$CLAUDE_FIXTURE_PROCESS_HELPER" \
 const BLOCKED_INPUT_FAKE_CLAUDE: &str = r#"#!/bin/sh
 exec "$CLAUDE_FIXTURE_PROCESS_HELPER" \
   --exact workflow::claude_code::adapter_tests::blocked_input_process_fixture \
+  --ignored --test-threads=1 \
+  3>&1 >/dev/null 2>&1
+"#;
+
+const BACKGROUND_SUBAGENT_FAKE_CLAUDE: &str = r#"#!/bin/sh
+exec "$CLAUDE_FIXTURE_PROCESS_HELPER" \
+  --exact workflow::claude_code::adapter_tests::background_subagent_response_process_fixture \
   --ignored --test-threads=1 \
   3>&1 >/dev/null 2>&1
 "#;
@@ -515,7 +523,7 @@ if [ "${CLAUDE_RESULT_MODE:-settle}" = exit-after-feedback ]; then
 fi
 cat >/dev/null
 case "${CLAUDE_RESULT_MODE:-settle}" in
-  settle) ;;
+  settle | background-subagent) ;;
   delayed-exit)
     printf 'ready\n' > "$CLAUDE_RESULT_SETTLEMENT_READY"
     IFS= read -r released < "$CLAUDE_RESULT_SETTLEMENT_RELEASE"
@@ -554,6 +562,10 @@ enum ResultFixtureMode {
     ExitAfterFeedback,
     PostWork,
     Hang,
+    /// The first exchange launches a backgrounded subagent before its candidate; after
+    /// the feedback frame the agent ends a turn without a candidate, the subagent's
+    /// notification arrives, and the notified turn submits the second candidate.
+    BackgroundSubagent,
 }
 
 impl ResultFixtureMode {
@@ -564,6 +576,7 @@ impl ResultFixtureMode {
             Self::ExitAfterFeedback => "exit-after-feedback",
             Self::PostWork => "post-work",
             Self::Hang => "hang",
+            Self::BackgroundSubagent => "background-subagent",
         }
     }
 }
@@ -609,18 +622,23 @@ impl ResultProcessFixture {
         let first_path = controls.join("first.jsonl");
         let second_path = controls.join("second.jsonl");
         let post_work_path = controls.join("post-work.jsonl");
-        std::fs::write(
-            &first_path,
-            result_exchange_transcript(&expected_cwd, 1, &first),
-        )
-        .unwrap();
-        std::fs::write(
-            &second_path,
-            second.as_ref().map_or_else(Vec::new, |exchange| {
-                result_exchange_transcript(&expected_cwd, 2, exchange)
-            }),
-        )
-        .unwrap();
+        let mut first_values = result_exchange_values(&expected_cwd, 1, &first);
+        let mut second_values = second.as_ref().map_or_else(Vec::new, |exchange| {
+            result_exchange_values(&expected_cwd, 2, exchange)
+        });
+        if matches!(mode, ResultFixtureMode::BackgroundSubagent) {
+            first_values.splice(1..1, backgrounded_subagent_launch(RESULT_FIXTURE_SESSION));
+            let waiting = ResultExchangeFixture {
+                candidate: None,
+                structured_tool_count: 0,
+                sibling_tool_use: false,
+            };
+            let mut paused = result_exchange_values(&expected_cwd, 2, &waiting);
+            paused.push(backgrounded_subagent_notification(RESULT_FIXTURE_SESSION));
+            second_values.splice(0..0, paused);
+        }
+        std::fs::write(&first_path, framed_result_values(&first_values)).unwrap();
+        std::fs::write(&second_path, framed_result_values(&second_values)).unwrap();
         std::fs::write(
             &post_work_path,
             framed_result_values(&[json!({
@@ -636,7 +654,7 @@ impl ResultProcessFixture {
                         "usage": {"input_tokens": 1, "output_tokens": 0},
                     },
                 },
-                "session_id": "00000000-0000-4000-8000-000000000001",
+                "session_id": RESULT_FIXTURE_SESSION,
                 "parent_tool_use_id": null,
             })]),
         )
@@ -734,17 +752,18 @@ impl ResultProcessFixture {
     }
 }
 
-fn result_exchange_transcript(
+const RESULT_FIXTURE_SESSION: &str = "00000000-0000-4000-8000-000000000001";
+
+fn result_exchange_values(
     expected_cwd: &std::path::Path,
     exchange: u64,
     fixture: &ResultExchangeFixture,
-) -> Vec<u8> {
-    const SESSION: &str = "00000000-0000-4000-8000-000000000001";
+) -> Vec<Value> {
     let stream_event = |event| {
         json!({
             "type": "stream_event",
             "event": event,
-            "session_id": SESSION,
+            "session_id": RESULT_FIXTURE_SESSION,
             "parent_tool_use_id": null,
         })
     };
@@ -752,7 +771,7 @@ fn result_exchange_transcript(
         "type": "system",
         "subtype": "init",
         "cwd": expected_cwd,
-        "session_id": SESSION,
+        "session_id": RESULT_FIXTURE_SESSION,
         "model": MODEL,
         "permissionMode": "bypassPermissions",
         "claude_code_version": QUALIFICATION_VERSION,
@@ -797,7 +816,7 @@ fn result_exchange_transcript(
                         "model": MODEL,
                     },
                     "parent_tool_use_id": null,
-                    "session_id": SESSION,
+                    "session_id": RESULT_FIXTURE_SESSION,
                 }),
                 stream_event(json!({
                     "type": "content_block_stop",
@@ -815,7 +834,7 @@ fn result_exchange_transcript(
                     }],
                 },
                 "parent_tool_use_id": null,
-                "session_id": SESSION,
+                "session_id": RESULT_FIXTURE_SESSION,
                 "tool_use_result": "structurally correlated acknowledgement",
             }));
         }
@@ -855,13 +874,13 @@ fn result_exchange_transcript(
         "is_error": false,
         "terminal_reason": "completed",
         "result": "structured result convenience text",
-        "session_id": SESSION,
+        "session_id": RESULT_FIXTURE_SESSION,
     });
     if let Some(candidate) = &fixture.candidate {
         result["structured_output"] = candidate.clone();
     }
     values.push(result);
-    framed_result_values(&values)
+    values
 }
 
 fn framed_result_values(values: &[Value]) -> Vec<u8> {
@@ -871,6 +890,76 @@ fn framed_result_values(values: &[Value]) -> Vec<u8> {
         bytes.push(b'\n');
     }
     bytes
+}
+
+/// A main-thread assistant message streamed as Claude Code emits it.
+fn fixture_stream_message(session: &str, id: &str, block: Value, stop_reason: &str) -> Vec<Value> {
+    let stream_event = |event| {
+        json!({
+            "type": "stream_event",
+            "event": event,
+            "session_id": session,
+            "parent_tool_use_id": null,
+        })
+    };
+    let delta = match block["type"].as_str() {
+        Some("text") => json!({"type": "text_delta", "text": block["text"]}),
+        _ => json!({"type": "input_json_delta", "partial_json": "{}"}),
+    };
+    let mut start = block;
+    if start["type"] == "text" {
+        start["text"] = json!("");
+    }
+    vec![
+        stream_event(json!({
+            "type": "message_start",
+            "message": {
+                "id": id,
+                "type": "message",
+                "role": "assistant",
+                "content": [],
+                "model": MODEL,
+                "usage": {"input_tokens": 1, "output_tokens": 0},
+            },
+        })),
+        stream_event(json!({"type": "content_block_start", "index": 0, "content_block": start})),
+        stream_event(json!({"type": "content_block_delta", "index": 0, "delta": delta})),
+        stream_event(json!({"type": "content_block_stop", "index": 0})),
+        stream_event(json!({
+            "type": "message_delta",
+            "delta": {"stop_reason": stop_reason},
+            "usage": {"output_tokens": 1},
+        })),
+        stream_event(json!({"type": "message_stop"})),
+    ]
+}
+
+/// The main-thread fragment that launches a backgrounded subagent: the Agent call, the
+/// backgrounded `task_started`, and the call's immediate tool result.
+fn backgrounded_subagent_launch(session: &str) -> Vec<Value> {
+    let mut values = fixture_stream_message(
+        session,
+        "msg-agent-call",
+        json!({"type": "tool_use", "id": "agent-call", "name": "Agent", "input": {}}),
+        "tool_use",
+    );
+    values.extend([
+        json!({"type": "system", "subtype": "task_started", "task_id": "t1",
+            "tool_use_id": "agent-call", "task_type": "local_agent",
+            "description": "Review the diff", "subagent_type": "Explore",
+            "is_backgrounded": true, "session_id": session}),
+        json!({"type": "user", "session_id": session, "parent_tool_use_id": null,
+            "message": {"role": "user", "content": [{"type": "tool_result",
+                "tool_use_id": "agent-call", "content": "Async agent launched",
+                "is_error": false}]}}),
+    ]);
+    values
+}
+
+fn backgrounded_subagent_notification(session: &str) -> Value {
+    json!({"type": "system", "subtype": "task_notification", "task_id": "t1",
+        "tool_use_id": "agent-call", "status": "completed", "summary": "No issues",
+        "session_id": session})
 }
 
 fn retained_schema(schema: Value) -> RetainedJsonSchema {
@@ -1047,6 +1136,96 @@ fn blocked_input_process_fixture() {
     loop {
         std::thread::park();
     }
+}
+
+fn write_fixture_frames(protocol: &mut std::fs::File, values: &[Value]) {
+    protocol.write_all(&framed_result_values(values)).unwrap();
+    protocol.flush().unwrap();
+}
+
+/// Each release is one line the test writes to the `release` FIFO beside the ready signal.
+fn await_fixture_release() {
+    let ready = PathBuf::from(std::env::var_os("CLAUDE_FIXTURE_READY").unwrap());
+    let release = std::fs::File::open(ready.with_file_name("release")).unwrap();
+    let mut line = String::new();
+    assert!(
+        std::io::BufReader::new(release)
+            .read_line(&mut line)
+            .unwrap()
+            > 0
+    );
+}
+
+#[test]
+#[ignore = "launched as the backgrounded-subagent Claude Code response fixture"]
+fn background_subagent_response_process_fixture() {
+    let session = std::env::var("CLAUDE_FIXTURE_SESSION").unwrap();
+    write_fixture_init();
+    let mut protocol = open_fixture_protocol();
+    let mut first_turn = backgrounded_subagent_launch(&session);
+    first_turn.extend(fixture_stream_message(
+        &session,
+        "msg-waiting",
+        json!({"type": "text", "text": "waiting"}),
+        "end_turn",
+    ));
+    first_turn.push(
+        json!({"type": "result", "subtype": "success", "is_error": false,
+        "terminal_reason": "completed", "result": "waiting", "session_id": session}),
+    );
+    write_fixture_frames(&mut protocol, &first_turn);
+    await_fixture_release();
+    write_fixture_frames(
+        &mut protocol,
+        &[json!({"type": "assistant", "session_id": session,
+            "parent_tool_use_id": "agent-call", "agent_id": "agent-1",
+            "subagent_type": "Explore", "task_description": "Review the diff",
+            "uuid": "00000000-0000-4000-8000-0000000000a1",
+            "timestamp": "2026-10-23T00:00:00Z",
+            "message": {"id": "msg-sub-1", "type": "message", "role": "assistant",
+                "model": MODEL, "content": [{"type": "text", "text": "No issues"}]}})],
+    );
+    await_fixture_release();
+    // The adapter has processed both chunks; a closed input is readable at once.
+    let standard_input = std::io::stdin();
+    let mut probe = [rustix::event::PollFd::new(
+        &standard_input,
+        rustix::event::PollFlags::IN | rustix::event::PollFlags::HUP,
+    )];
+    let ready = rustix::event::poll(
+        &mut probe,
+        Some(&rustix::event::Timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        }),
+    )
+    .unwrap();
+    write_process_fixture_signal(
+        "CLAUDE_FIXTURE_READY",
+        if ready == 0 {
+            &b"open\n"[..]
+        } else {
+            &b"closed\n"[..]
+        },
+    );
+    let mut final_turn = vec![backgrounded_subagent_notification(&session)];
+    write_fixture_frames(&mut protocol, &final_turn);
+    write_fixture_initialization(&mut protocol, &session, None);
+    final_turn = fixture_stream_message(
+        &session,
+        "msg-final",
+        json!({"type": "text", "text": "final"}),
+        "end_turn",
+    );
+    final_turn.push(
+        json!({"type": "result", "subtype": "success", "is_error": false,
+        "terminal_reason": "completed", "result": "final", "session_id": session}),
+    );
+    write_fixture_frames(&mut protocol, &final_turn);
+    // The step settles only when the adapter closes the input after the final result.
+    let mut remaining = Vec::new();
+    std::io::Read::read_to_end(&mut standard_input.lock(), &mut remaining).unwrap();
+    assert!(remaining.is_empty());
 }
 
 #[expect(
@@ -1666,6 +1845,109 @@ async fn post_acceptance_work_and_failed_settlement_discard_the_provisional_resu
             settlement_outcome,
             failed_agent_outcome(AgentFailureCause::ResultSettlementFailed)
         );
+    })
+    .await;
+}
+
+// REQ-AGENT-35
+// INV-HARNESS-7
+#[tokio::test]
+async fn premature_structured_result_is_returned_as_feedback_until_background_work_settles() {
+    with_watchdog(async {
+        let fixture = ResultProcessFixture::new(
+            type_schema("number"),
+            ResultExchangeFixture::standalone(json!({"result": 1})),
+            Some(ResultExchangeFixture::standalone(json!({"result": 7}))),
+            ResultFixtureMode::BackgroundSubagent,
+        );
+        let (fixture, outcome) =
+            run_result_fixture(fixture, PendingClock, InlineValidationWorker).await;
+        let AgentOutcome::Completed(CompletedAgentInvocation::Result(result)) = outcome else {
+            panic!("the notified turn's candidate must complete, got {outcome:?}");
+        };
+        assert_eq!(result.value(), &json!(7));
+
+        let rejections = fixture
+            .observations
+            .snapshot()
+            .into_iter()
+            .filter_map(|observation| match observation.observation() {
+                AgentObservation::ValueRejected {
+                    kind: AgentValueKind::Result,
+                    feedback,
+                } => Some(Arc::clone(feedback)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(rejections, [Arc::<str>::from(PREMATURE_CANDIDATE_FEEDBACK)]);
+        let input = std::fs::read_to_string(&fixture.captured_input).unwrap();
+        let frames = input
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(frames.len(), 2);
+        assert_eq!(
+            frames[1]["message"]["content"][0]["text"],
+            PREMATURE_CANDIDATE_FEEDBACK
+        );
+    })
+    .await;
+}
+
+// REQ-AGENT-35
+#[tokio::test]
+async fn response_mode_closes_standard_input_only_when_the_invocation_settles() {
+    with_watchdog(async {
+        let mut fixture = ProcessFixture::new(
+            AgentValueMode::Response {
+                output: Arc::from("response"),
+            },
+            1024,
+        );
+        let invocation = fixture.invocation.take().unwrap();
+        std::fs::write(
+            invocation.adapter().executable(),
+            BACKGROUND_SUBAGENT_FAKE_CLAUDE,
+        )
+        .unwrap();
+        let release = fixture.ready.path().with_file_name("release");
+        mkfifo(&release, Mode::S_IRUSR | Mode::S_IWUSR).unwrap();
+        let observations = fixture.observations.clone();
+        let (task, start, outcome) = start_process_fixture(invocation, fixture.diagnostics.clone());
+
+        observations
+            .wait_for(|observation| {
+                matches!(
+                    observation,
+                    AgentObservation::Lifecycle {
+                        milestone: AgentLifecycleMilestone::TurnCompleted,
+                    }
+                )
+            })
+            .await;
+        std::fs::write(&release, b"release\n").unwrap();
+        observations
+            .wait_for(|observation| {
+                matches!(
+                    observation,
+                    AgentObservation::AssistantText { text } if text.as_ref() == "No issues"
+                )
+            })
+            .await;
+        std::fs::write(&release, b"release\n").unwrap();
+        assert_eq!(
+            fixture.ready.receive().await,
+            b"open\n",
+            "the first result left a subagent outstanding, so the input must stay open"
+        );
+
+        task.await.unwrap();
+        let outcome = outcome.await.unwrap();
+        assert!(start.receive().await.is_ok());
+        let AgentOutcome::Completed(CompletedAgentInvocation::Response(response)) = outcome else {
+            panic!("the wakeup turn must complete the response, got {outcome:?}");
+        };
+        assert_eq!(response.as_str(), "final");
     })
     .await;
 }

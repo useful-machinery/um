@@ -1,3 +1,4 @@
+use std::cell::Cell;
 use std::fs;
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::os::unix::fs::PermissionsExt as _;
@@ -17,10 +18,11 @@ use serde_json::{Value, json};
 use tokio::io::AsyncWriteExt as _;
 use tokio::process::Command;
 
-use super::adapter::ClaudeCodeStreamJsonV1Adapter;
+use super::adapter::{ClaudeCodeStreamJsonV1Adapter, PREMATURE_CANDIDATE_FEEDBACK};
 use super::test_support::{
-    FixtureSignal, LoopbackBlock, LoopbackProvider, PendingClock, RecordingObservationSink,
-    SyntheticClaudeCodeRoot, admitted_adapter, invocation_identity, version_probe_environment,
+    ControlledProviderRequest, FixtureSignal, LoopbackBlock, LoopbackProvider, PendingClock,
+    RecordingObservationSink, SyntheticClaudeCodeRoot, admitted_adapter, invocation_identity,
+    version_probe_environment,
 };
 use super::*;
 use crate::workflow::admission::{CancellationReason, CancellationSource};
@@ -1242,6 +1244,325 @@ async fn pinned_real_claude_code_06c_background_completion_continuation() {
         assert!(!records.is_empty());
         provider.shutdown().await;
     }).await.expect("background probe watchdog expired");
+}
+
+const BACKGROUND_SUBAGENT_PROMPT: &str = "Run the controlled background subagent command.";
+const BACKGROUND_SUBAGENT_DESCRIPTION: &str = "Run a backgrounded subagent";
+const BACKGROUND_SUBAGENT_RESPONSE: &str = "background subagent finished";
+
+/// A subagent the main thread starts with `run_in_background`, whose own Bash call blocks
+/// on a fifo until the case releases it, so the main thread's turn ends while it runs.
+struct BackgroundSubagent {
+    ready: FixtureSignal,
+    blocker: PathBuf,
+}
+
+impl BackgroundSubagent {
+    fn new(root: &SyntheticClaudeCodeRoot) -> Self {
+        let ready = FixtureSignal::create(root.private().join("subagent-ready"));
+        let blocker = root.private().join("subagent-blocker");
+        mkfifo(&blocker, Mode::S_IRUSR | Mode::S_IWUSR).unwrap();
+        Self { ready, blocker }
+    }
+
+    /// Serves the main thread's `Agent` call and the subagent's blocking command, returning
+    /// the main thread's next request once the command is running. The subagent's request
+    /// may arrive before or after the main thread's.
+    async fn start(
+        &self,
+        provider: &mut LoopbackProvider,
+        terminal: &mut tokio::sync::oneshot::Receiver<AgentOutcome>,
+    ) -> ControlledProviderRequest {
+        provider.next_request().await.release_tool_use(
+            "Agent",
+            json!({
+                "description": BACKGROUND_SUBAGENT_DESCRIPTION,
+                "prompt": BACKGROUND_SUBAGENT_PROMPT,
+                "subagent_type": "general-purpose",
+                "run_in_background": true,
+            }),
+        );
+        let mut main_thread = None;
+        let mut subagent_started = false;
+        while main_thread.is_none() || !subagent_started {
+            let request = next_request_or_outcome(provider, terminal).await;
+            if request.opens_with(BACKGROUND_SUBAGENT_PROMPT) {
+                assert!(
+                    !subagent_started,
+                    "the subagent asked again before its command ran"
+                );
+                request.release_tool_use(
+                    "Bash",
+                    json!({
+                        "command": format!(
+                            "printf 'ready\\n' > '{}'; IFS= read -r done < '{}'; printf 'subagent command finished\\n'",
+                            self.ready.path().display(), self.blocker.display()
+                        ),
+                        "description": "Block the subagent until released",
+                    }),
+                );
+                subagent_started = true;
+            } else {
+                assert!(
+                    main_thread.is_none(),
+                    "the main thread asked twice before the subagent ran"
+                );
+                main_thread = Some(request);
+            }
+        }
+        assert_eq!(self.ready.receive().await, b"ready\n");
+        main_thread.unwrap()
+    }
+
+    /// Releases the subagent's command, serves its closing text, and returns the request of
+    /// the main-thread turn its notification starts.
+    async fn finish(
+        self,
+        provider: &mut LoopbackProvider,
+        terminal: &mut tokio::sync::oneshot::Receiver<AgentOutcome>,
+    ) -> ControlledProviderRequest {
+        let blocker = self.blocker;
+        tokio::task::spawn_blocking(move || fs::write(blocker, b"done\n").unwrap())
+            .await
+            .unwrap();
+        loop {
+            let request = next_request_or_outcome(provider, terminal).await;
+            if !request.opens_with(BACKGROUND_SUBAGENT_PROMPT) {
+                return request;
+            }
+            request.release_text(BACKGROUND_SUBAGENT_RESPONSE);
+        }
+    }
+}
+
+async fn next_request_or_outcome(
+    provider: &mut LoopbackProvider,
+    terminal: &mut tokio::sync::oneshot::Receiver<AgentOutcome>,
+) -> ControlledProviderRequest {
+    tokio::select! {
+        request = provider.next_request() => request,
+        outcome = terminal => panic!("invocation ended while the case awaited a request: {outcome:?}"),
+    }
+}
+
+fn completed_turns(observations: &RecordingObservationSink) -> usize {
+    observations
+        .snapshot()
+        .iter()
+        .filter(|envelope| {
+            matches!(
+                envelope.observation(),
+                AgentObservation::Lifecycle {
+                    milestone: AgentLifecycleMilestone::TurnCompleted,
+                }
+            )
+        })
+        .count()
+}
+
+async fn wait_for_completed_turns(observations: &RecordingObservationSink, turns: usize) {
+    while completed_turns(observations) < turns {
+        // `wait_for` evaluates the record from its start on each observation, so an
+        // evaluation past the length seen here is of a newer observation.
+        let seen = observations.snapshot().len();
+        let evaluated = Cell::new(0);
+        observations
+            .wait_for(|_| {
+                evaluated.set(evaluated.get() + 1);
+                evaluated.get() > seen
+            })
+            .await;
+    }
+}
+
+/// The subagent's start and settlement are information diagnostics, and its own tool runs
+/// are recognized rather than reported as unrecognized `task_started` events.
+fn assert_backgrounded_subagent_activity(observations: &RecordingObservationSink) {
+    let observations = observations.snapshot();
+    let information = observations
+        .iter()
+        .filter_map(|envelope| match envelope.observation() {
+            AgentObservation::Diagnostic {
+                level: AgentDiagnosticLevel::Information,
+                message,
+            } => Some(message.as_ref()),
+            _ => None,
+        })
+        .filter(|message| message.contains(BACKGROUND_SUBAGENT_DESCRIPTION))
+        .collect::<Vec<_>>();
+    for status in ["started", "completed"] {
+        assert!(
+            information
+                .iter()
+                .any(|message| message.split_whitespace().any(|token| token == status)),
+            "no subagent diagnostic names {status}: {information:?}"
+        );
+    }
+    assert!(!observations.iter().any(|envelope| matches!(
+        envelope.observation(),
+        AgentObservation::UnrecognizedHarnessEvent { event } if event["subtype"] == "task_started"
+    )));
+}
+
+// SC-AGENT-7
+// REQ-AGENT-35
+// REQ-AGENT-64
+#[expect(
+    clippy::disallowed_methods,
+    reason = "real time is only an anti-hang boundary for the native process"
+)]
+#[tokio::test]
+#[ignore = "requires pinned harness"]
+async fn pinned_real_claude_code_09_backgrounded_subagent_continues_the_invocation() {
+    let (executable, _exclusive) = exclusive_conformance_executable().await;
+    tokio::time::timeout(WATCHDOG, async {
+        let mut provider = LoopbackProvider::start().await;
+        let root = SyntheticClaudeCodeRoot::new();
+        let subagent = BackgroundSubagent::new(&root);
+        let observations = RecordingObservationSink::default();
+        let running =
+            launch_recorded_response_lifecycle(executable, &root, &provider, &observations).await;
+        let mut terminal = running.terminal;
+
+        subagent
+            .start(&mut provider, &mut terminal)
+            .await
+            .release_text("first response");
+        observations
+            .wait_for(|event| {
+                matches!(
+                    event,
+                    AgentObservation::Lifecycle {
+                        milestone: AgentLifecycleMilestone::TurnCompleted,
+                    }
+                )
+            })
+            .await;
+        assert!(matches!(
+            terminal.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+
+        subagent
+            .finish(&mut provider, &mut terminal)
+            .await
+            .release_text("final response");
+        let outcome = terminal.await.unwrap();
+        running.task.await.unwrap();
+        let AgentOutcome::Completed(CompletedAgentInvocation::Response(response)) = outcome else {
+            panic!("the notified turn must settle the invocation, got {outcome:?}");
+        };
+        assert_eq!(response.as_str(), "final response");
+        assert_backgrounded_subagent_activity(&observations);
+        assert!(!provider.has_pending_request());
+        assert_retained_native_session(&root, &["first response", "final response"]);
+        provider.shutdown().await;
+    })
+    .await
+    .expect("pinned Claude Code backgrounded-subagent watchdog expired");
+}
+
+// SC-AGENT-7
+// REQ-AGENT-35
+// INV-HARNESS-7
+#[expect(
+    clippy::disallowed_methods,
+    reason = "real time is only an anti-hang boundary for the native process"
+)]
+#[tokio::test]
+#[ignore = "requires pinned harness"]
+async fn pinned_real_claude_code_09c_premature_result_waits_for_the_backgrounded_subagent() {
+    let (executable, _exclusive) = exclusive_conformance_executable().await;
+    tokio::time::timeout(WATCHDOG, async {
+        let mut provider = LoopbackProvider::start().await;
+        let root = SyntheticClaudeCodeRoot::new();
+        let subagent = BackgroundSubagent::new(&root);
+        let schema_document = json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "integer",
+            "minimum": 1,
+        });
+        let schema_bytes = Arc::<[u8]>::from(serde_json::to_vec(&schema_document).unwrap());
+        let observations = RecordingObservationSink::default();
+        let running = RunningProductionClaudeCode::launch(
+            executable,
+            &root,
+            &provider,
+            AgentValueMode::Result {
+                output: Arc::from("result"),
+                schema: RetainedJsonSchema::compile(schema_bytes, Arc::new(schema_document))
+                    .unwrap(),
+            },
+            observations.clone(),
+        )
+        .await_started()
+        .await;
+        let mut terminal = running.terminal;
+
+        // A schema-valid candidate submitted while the subagent runs is still premature.
+        subagent
+            .start(&mut provider, &mut terminal)
+            .await
+            .release_structured_output(json!({"result": 1}));
+        observations
+            .wait_for(|event| {
+                matches!(
+                    event,
+                    AgentObservation::ValueRejected {
+                        kind: AgentValueKind::Result,
+                        ..
+                    }
+                )
+            })
+            .await;
+        let feedback = next_request_or_outcome(&mut provider, &mut terminal).await;
+        assert!(!feedback.opens_with(BACKGROUND_SUBAGENT_PROMPT));
+        assert!(contains_string_fragment(
+            feedback.body(),
+            PREMATURE_CANDIDATE_FEEDBACK
+        ));
+        feedback.release_text("waiting for the subagent");
+        // The agent ends the feedback turn to wait; any enforcement retry Claude Code makes
+        // within that turn is answered the same way.
+        loop {
+            tokio::select! {
+                request = next_request_or_outcome(&mut provider, &mut terminal) => {
+                    assert!(!request.opens_with(BACKGROUND_SUBAGENT_PROMPT));
+                    request.release_text("waiting for the subagent");
+                }
+                () = wait_for_completed_turns(&observations, 2) => break,
+            }
+        }
+        assert!(matches!(
+            terminal.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+
+        subagent
+            .finish(&mut provider, &mut terminal)
+            .await
+            .release_structured_output(json!({"result": 7}));
+        let outcome = terminal.await.unwrap();
+        running.task.await.unwrap();
+        let AgentOutcome::Completed(CompletedAgentInvocation::Result(result)) = outcome else {
+            panic!("the notified turn's candidate must complete, got {outcome:?}");
+        };
+        assert_eq!(result.value(), &json!(7));
+        let rejections = observations
+            .snapshot()
+            .into_iter()
+            .filter_map(|envelope| match envelope.observation() {
+                AgentObservation::ValueRejected { feedback, .. } => Some(Arc::clone(feedback)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(rejections, [Arc::<str>::from(PREMATURE_CANDIDATE_FEEDBACK)]);
+        assert_backgrounded_subagent_activity(&observations);
+        assert!(!provider.has_pending_request());
+        provider.shutdown().await;
+    })
+    .await
+    .expect("pinned Claude Code premature-result watchdog expired");
 }
 
 /// Ordered thinking segments deliberately carry multibyte, newline, tab, and trailing

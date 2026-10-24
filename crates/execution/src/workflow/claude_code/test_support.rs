@@ -446,6 +446,15 @@ impl ControlledProviderRequest {
         self.used_placeholder_key
     }
 
+    /// Whether the conversation this request continues opened with `fragment`. A
+    /// subagent's model calls reach the same provider as the main thread's, and only its
+    /// own prompt opens its conversation, so this tells the threads apart.
+    pub(super) fn opens_with(&self, fragment: &str) -> bool {
+        self.body["messages"]
+            .get(0)
+            .is_some_and(|first| first.to_string().contains(fragment))
+    }
+
     pub(super) fn release_text(self, text: &str) {
         self.release_blocks(vec![LoopbackBlock::text(text)]);
     }

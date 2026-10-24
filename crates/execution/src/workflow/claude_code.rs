@@ -264,6 +264,25 @@ pub(crate) struct ClaudeCodeStreamJsonV1RejectionState {
     result_accepted: bool,
     native_failure: bool,
     retry_active: bool,
+    // Records from runners before these facts existed omit them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    event_thread: Option<ClaudeCodeStreamJsonV1EventThread>,
+    #[serde(default)]
+    outstanding_background_commands: u64,
+    #[serde(default)]
+    outstanding_background_subagents: u64,
+    #[serde(default)]
+    scheduled_wakeup_pending: bool,
+}
+
+/// The thread the rejected frame belonged to, from its `parent_tool_use_id`: absent,
+/// `null`, or a tool call id.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ClaudeCodeStreamJsonV1EventThread {
+    None,
+    Main,
+    Subagent,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -288,6 +307,7 @@ pub(crate) enum ClaudeCodeStreamJsonV1CompletedResultExchangeState {
     Candidate,
     AmbiguousCandidate,
     MissingCandidate,
+    PrematureCandidate,
     NativeFailure,
 }
 
@@ -298,6 +318,7 @@ struct ClaudeCodeStreamJsonV1RejectionContext {
     stream_event: Option<ClaudeCodeStreamJsonV1StreamEventType>,
     content_index: Option<u64>,
     content_block: Option<ClaudeCodeStreamJsonV1ContentBlockKind>,
+    event_thread: Option<ClaudeCodeStreamJsonV1EventThread>,
 }
 
 impl Default for ClaudeCodeStreamJsonV1RejectionContext {
@@ -308,6 +329,7 @@ impl Default for ClaudeCodeStreamJsonV1RejectionContext {
             stream_event: None,
             content_index: None,
             content_block: None,
+            event_thread: None,
         }
     }
 }
@@ -411,6 +433,9 @@ pub(crate) enum CompletedResultExchange {
     Candidate(Arc<Value>),
     AmbiguousCandidate,
     MissingCandidate,
+    /// A structured result submitted while background work the step started still owes
+    /// its notification. It is never committed; the adapter returns it as feedback.
+    PrematureCandidate,
     NativeFailure,
 }
 
@@ -432,17 +457,26 @@ impl BackgroundCommand {
     }
 }
 
-/// A foreground subagent the Agent tool started inside the active exchange. It is
+/// A subagent the Agent tool started inside an active exchange. A foreground one is
 /// observational: settling it is not a completion condition, and the exchange's end
-/// forgets it.
-struct ForegroundSubagent {
+/// forgets it. A backgrounded one outlives the exchange: it owes a `task_notification`
+/// before the stream may end, and until then its messages and its own task events are
+/// accepted in the terminal drain.
+struct Subagent {
     task_id: Arc<str>,
     tool_use_id: Arc<str>,
+    run_id: Option<Arc<str>>,
     subagent_type: Option<Arc<str>>,
     description: Option<Arc<str>>,
+    backgrounded: bool,
+    notified: bool,
 }
 
-impl ForegroundSubagent {
+impl Subagent {
+    fn awaits_notification(&self) -> bool {
+        self.backgrounded && !self.notified
+    }
+
     fn message(&self, event: &str) -> String {
         let mut message = String::from("subagent");
         for token in self.subagent_type.iter().map(AsRef::as_ref).chain([event]) {
@@ -472,7 +506,7 @@ pub(crate) struct ClaudeCodeStreamJsonV1Parser {
     completed_exchanges: u64,
     bash_calls: Vec<Arc<str>>,
     background_commands: Vec<BackgroundCommand>,
-    foreground_subagents: Vec<ForegroundSubagent>,
+    subagents: Vec<Subagent>,
     /// Native `type`/`subtype` pairs already observed as unrecognized in this invocation.
     observed_unrecognized_kinds: Vec<(Box<str>, Option<Box<str>>)>,
     active_message: Option<StreamedMessage>,
@@ -480,6 +514,14 @@ pub(crate) struct ClaudeCodeStreamJsonV1Parser {
     exchange_structured_output_candidates: u64,
     completed_result_exchange: Option<CompletedResultExchange>,
     result_decision_pending: bool,
+    /// The pending decision is for a premature candidate, which may only be rejected.
+    premature_candidate_pending: bool,
+    /// A `command_lifecycle` `started` frame arrived in the drain while background work
+    /// was outstanding: a wakeup the agent scheduled authorizes the next `init`.
+    scheduled_wakeup_pending: bool,
+    /// The current or last exchange began on a scheduled wakeup whose `completed` frame
+    /// has not arrived yet.
+    scheduled_wakeup_turn: bool,
     accepted_result: Option<CapturedJson>,
     native_failure: Option<AgentHarnessFailureDetail>,
     native_api_error: Option<HarnessFailureDiagnostic>,
@@ -535,13 +577,16 @@ impl ClaudeCodeStreamJsonV1Parser {
             completed_exchanges: 0,
             bash_calls: Vec::new(),
             background_commands: Vec::new(),
-            foreground_subagents: Vec::new(),
+            subagents: Vec::new(),
             observed_unrecognized_kinds: Vec::new(),
             active_message: None,
             final_main_message: None,
             exchange_structured_output_candidates: 0,
             completed_result_exchange: None,
             result_decision_pending: false,
+            premature_candidate_pending: false,
+            scheduled_wakeup_pending: false,
+            scheduled_wakeup_turn: false,
             accepted_result: None,
             native_failure: None,
             native_api_error: None,
@@ -579,12 +624,14 @@ impl ClaudeCodeStreamJsonV1Parser {
             );
         }
         self.result_decision_pending = false;
+        self.premature_candidate_pending = false;
         Ok(())
     }
 
     pub(crate) fn accept_result(&mut self, result: CapturedJson) -> Result<(), AgentFailureCause> {
         if self.value_kind != AgentValueKind::Result
             || !self.result_decision_pending
+            || self.premature_candidate_pending
             || self.accepted_result.is_some()
             || self.exchange_active
             || self.exchange_initialized
@@ -691,19 +738,16 @@ impl ClaudeCodeStreamJsonV1Parser {
             || self.completed_result_exchange.is_some()
             || self.result_decision_pending
             || self.completed_exchanges == 0
-            || self
-                .background_commands
-                .iter()
-                .any(BackgroundCommand::awaits_notification)
         {
-            return self.protocol_failure_outcome(
-                AgentFailureCause::HarnessProtocolFailed,
-                ClaudeCodeStreamJsonV1RejectionReason::EndOfStreamInvariantInvalid,
-                ClaudeCodeStreamJsonV1ProtocolStage::EndOfStream,
-            );
+            return self.end_of_stream_invariant_failure();
         }
+        // A native terminal failure explains a stream that ends with background work still
+        // running (INV-HARNESS-5).
         if let Some(detail) = self.native_failure {
             return failed(AgentFailureCause::HarnessFailed { detail });
+        }
+        if self.awaits_background_work() {
+            return self.end_of_stream_invariant_failure();
         }
         if !exit_success {
             return failed(AgentFailureCause::HarnessFailed {
@@ -729,6 +773,14 @@ impl ClaudeCodeStreamJsonV1Parser {
                 |result| AgentOutcome::Completed(CompletedAgentInvocation::Result(result)),
             ),
         }
+    }
+
+    fn end_of_stream_invariant_failure(&self) -> AgentOutcome {
+        self.protocol_failure_outcome(
+            AgentFailureCause::HarnessProtocolFailed,
+            ClaudeCodeStreamJsonV1RejectionReason::EndOfStreamInvariantInvalid,
+            ClaudeCodeStreamJsonV1ProtocolStage::EndOfStream,
+        )
     }
 
     // Native parser state stays profile-local even though both profiles snapshot before
@@ -765,6 +817,13 @@ impl ClaudeCodeStreamJsonV1Parser {
         };
 
         self.rejection_context.outer_event = required_string(object, "type").map(claude_event_type);
+        self.rejection_context.event_thread = match object.get("parent_tool_use_id") {
+            None => Some(ClaudeCodeStreamJsonV1EventThread::None),
+            Some(_) => parent_tool_use_id(object).map(|parent| match parent {
+                None => ClaudeCodeStreamJsonV1EventThread::Main,
+                Some(_) => ClaudeCodeStreamJsonV1EventThread::Subagent,
+            }),
+        };
         if self.session_id.is_none() {
             self.rejection_context.stage = ClaudeCodeStreamJsonV1ProtocolStage::Initialization;
             return self.parse_initialization(object);
@@ -777,16 +836,26 @@ impl ClaudeCodeStreamJsonV1Parser {
         }
         if event_type == "system" && required_string(object, "subtype") == Some("init") {
             self.rejection_context.stage = ClaudeCodeStreamJsonV1ProtocolStage::Initialization;
-            if !self.exchange_active && self.value_kind != AgentValueKind::Result {
+            // A Result-mode correction turn is begun by the adapter before its init arrives;
+            // begin_exchange refuses this one while a decision is pending or a result is
+            // accepted (INV-HARNESS-7).
+            if !self.exchange_active {
+                let scheduled_wakeup = self.scheduled_wakeup_pending;
                 if self.native_failure.is_some()
-                    || !self.background_commands.iter().any(|task| task.notified)
+                    || !(scheduled_wakeup
+                        || self.background_commands.iter().any(|task| task.notified)
+                        || self.subagents.iter().any(|subagent| subagent.notified))
                 {
                     return Err(self.protocol_failure());
                 }
                 self.begin_exchange()?;
-                // Only completed tasks authorize this wakeup. Others remain owned by
-                // the invocation and may notify during the next native exchange.
+                // Only completed tasks and subagents, or a scheduled wakeup, authorize this
+                // turn. Others remain owned by the invocation and may notify during the
+                // next native exchange.
                 self.background_commands.retain(|task| !task.notified);
+                self.subagents.retain(|subagent| !subagent.notified);
+                self.scheduled_wakeup_pending = false;
+                self.scheduled_wakeup_turn |= scheduled_wakeup;
             }
             return self.parse_initialization(object);
         }
@@ -827,11 +896,38 @@ impl ClaudeCodeStreamJsonV1Parser {
                     ClaudeCodeStreamJsonV1ProtocolStage::ResultCorrelation;
                 self.parse_result(object)
             }
+            "command_lifecycle" => {
+                self.require_matching_session(object)?;
+                self.parse_command_lifecycle(object, &value);
+                Ok(())
+            }
             _ => {
                 self.require_matching_session(object)?;
                 self.observe_unrecognized(&value);
                 Ok(())
             }
+        }
+    }
+
+    /// A wakeup the agent scheduled runs as a queued command: `started` precedes its
+    /// `init` and `completed` follows its turn's `result`. Only a `started` frame arriving
+    /// after the exchange ended while background work keeps the harness alive is a
+    /// wakeup; any other lifecycle frame stays unrecognized.
+    fn parse_command_lifecycle(&mut self, object: &Map<String, Value>, value: &Value) {
+        match required_string(object, "state") {
+            Some("started") if !self.exchange_active && self.awaits_background_work() => {
+                if !self.scheduled_wakeup_pending {
+                    self.scheduled_wakeup_pending = true;
+                    self.observations.push(AgentObservation::Diagnostic {
+                        level: AgentDiagnosticLevel::Information,
+                        message: Arc::from("scheduled wakeup"),
+                    });
+                }
+            }
+            Some("completed") if self.scheduled_wakeup_turn => {
+                self.scheduled_wakeup_turn = false;
+            }
+            _ => self.observe_unrecognized(value),
         }
     }
 
@@ -842,48 +938,37 @@ impl ClaudeCodeStreamJsonV1Parser {
         value: &Value,
     ) -> Result<(), AgentFailureCause> {
         self.require_matching_session(object)?;
+        // A backgrounded subagent keeps working after the exchange that started it; its
+        // messages name its Agent call. A main-thread message stays invalid here.
+        let subagent_message = parent_tool_use_id(object)
+            .flatten()
+            .is_some_and(|parent| self.awaits_subagent(parent));
         match event_type {
+            "assistant" if subagent_message => {
+                self.rejection_context.stage = ClaudeCodeStreamJsonV1ProtocolStage::AssistantEvent;
+                self.parse_assistant(object, value)
+            }
+            "user" if subagent_message => {
+                self.rejection_context.stage = ClaudeCodeStreamJsonV1ProtocolStage::UserEvent;
+                self.parse_user(object, value)
+            }
             "system"
                 if matches!(
                     required_string(object, "subtype"),
-                    Some("status" | "task_updated" | "task_notification")
+                    Some("status" | "task_updated" | "task_notification" | "task_progress")
                 ) =>
             {
                 self.rejection_context.stage = ClaudeCodeStreamJsonV1ProtocolStage::SystemEvent;
                 self.parse_system(object, value)
             }
-            "system" if required_string(object, "subtype") == Some("background_tasks_changed") => {
-                let tasks =
-                    required_array(object, "tasks").ok_or_else(|| self.protocol_failure())?;
-                if tasks.len()
-                    != self
-                        .background_commands
-                        .iter()
-                        .filter(|task| task.awaits_notification())
-                        .count()
-                {
-                    return Err(self.protocol_failure());
-                }
-                let mut seen = Vec::new();
-                for entry in tasks {
-                    let entry = entry.as_object().ok_or_else(|| self.protocol_failure())?;
-                    let id = required_nonempty_string(entry, "task_id")
-                        .ok_or_else(|| self.protocol_failure())?;
-                    if required_string(entry, "task_type") != Some("local_bash")
-                        || seen.contains(&id)
-                        || !self.background_commands.iter().any(|task| {
-                            task.awaits_notification()
-                                && task.task_id.as_ref() == id
-                                && task.run_id.as_deref()
-                                    == required_nonempty_string(entry, "run_id")
-                        })
-                    {
-                        return Err(self.protocol_failure());
-                    }
-                    seen.push(id);
-                }
-                self.observe_unrecognized(value);
+            "system"
+                if required_string(object, "subtype") == Some("task_started")
+                    && required_bool(object, "owned_by_subagent") == Some(true) =>
+            {
                 Ok(())
+            }
+            "system" if required_string(object, "subtype") == Some("background_tasks_changed") => {
+                self.validate_drained_background_tasks(object)
             }
             "system" if required_string(object, "subtype") == Some("task_started") => self.reject(
                 ClaudeCodeStreamJsonV1RejectionReason::TerminalDrainEventInvalid,
@@ -893,11 +978,66 @@ impl ClaudeCodeStreamJsonV1Parser {
                 ClaudeCodeStreamJsonV1RejectionReason::TerminalDrainEventInvalid,
                 ClaudeCodeStreamJsonV1ProtocolStage::TerminalDrain,
             ),
+            "command_lifecycle" => {
+                self.parse_command_lifecycle(object, value);
+                Ok(())
+            }
             _ => {
                 self.observe_unrecognized(value);
                 Ok(())
             }
         }
+    }
+
+    /// In the drain the harness's task list must name exactly the outstanding commands
+    /// and subagents; an entry naming no tracked task is a subagent's own work while one
+    /// is outstanding.
+    fn validate_drained_background_tasks(
+        &self,
+        object: &Map<String, Value>,
+    ) -> Result<(), AgentFailureCause> {
+        let tasks = required_array(object, "tasks").ok_or_else(|| self.protocol_failure())?;
+        let mut seen = Vec::new();
+        for entry in tasks {
+            let entry = entry.as_object().ok_or_else(|| self.protocol_failure())?;
+            let id = required_nonempty_string(entry, "task_id")
+                .ok_or_else(|| self.protocol_failure())?;
+            if self.is_subagent_work(id) {
+                continue;
+            }
+            let run_id = required_nonempty_string(entry, "run_id");
+            let outstanding = match required_string(entry, "task_type") {
+                Some("local_bash") => self.background_commands.iter().any(|task| {
+                    task.awaits_notification()
+                        && task.task_id.as_ref() == id
+                        && task.run_id.as_deref() == run_id
+                }),
+                Some("local_agent") => self.subagents.iter().any(|subagent| {
+                    subagent.awaits_notification()
+                        && subagent.task_id.as_ref() == id
+                        && subagent.run_id.as_deref() == run_id
+                }),
+                _ => false,
+            };
+            if !outstanding || seen.contains(&id) {
+                return Err(self.protocol_failure());
+            }
+            seen.push(id);
+        }
+        let outstanding = self
+            .background_commands
+            .iter()
+            .filter(|task| task.awaits_notification())
+            .count()
+            + self
+                .subagents
+                .iter()
+                .filter(|subagent| subagent.awaits_notification())
+                .count();
+        if seen.len() != outstanding {
+            return Err(self.protocol_failure());
+        }
+        Ok(())
     }
 
     fn parse_initialization(
@@ -1642,11 +1782,14 @@ impl ClaudeCodeStreamJsonV1Parser {
                 .get("content")
                 .and_then(normalized_tool_result_content)
                 .ok_or_else(|| self.protocol_failure())?;
-            if let Some(task_id) = object
+            let background_task_id = object
                 .get("tool_use_result")
                 .and_then(Value::as_object)
-                .and_then(|result| required_nonempty_string(result, "backgroundTaskId"))
-            {
+                .and_then(|result| required_nonempty_string(result, "backgroundTaskId"));
+            if parent.is_some() {
+                // A subagent's tool result settles the subagent's own call; a task it
+                // names is the subagent's work, never a command this invocation tracks.
+            } else if let Some(task_id) = background_task_id {
                 let Some(task) = self.background_commands.iter_mut().find(|task| {
                     task.task_id.as_ref() == task_id && task.tool_use_id.as_ref() == call_id
                 }) else {
@@ -1742,10 +1885,13 @@ impl ClaudeCodeStreamJsonV1Parser {
                 .observations
                 .push(lifecycle(AgentLifecycleMilestone::CompactionCompleted)),
             "task_started" => {
-                if required_string(object, "task_type") == Some("local_agent")
-                    && required_bool(object, "is_backgrounded") != Some(true)
-                {
-                    return self.start_foreground_subagent(object);
+                // A subagent's own tool runs belong to the subagent, not to this
+                // invocation: they are never tracked and owe nothing.
+                if required_bool(object, "owned_by_subagent") == Some(true) {
+                    return Ok(());
+                }
+                if required_string(object, "task_type") == Some("local_agent") {
+                    return self.start_subagent(object);
                 }
                 if required_string(object, "task_type") != Some("local_bash") {
                     self.observe_unrecognized(value);
@@ -1777,7 +1923,7 @@ impl ClaudeCodeStreamJsonV1Parser {
                     || self.background_commands.iter().any(|task| {
                         task.task_id.as_ref() == task_id || task.tool_use_id.as_ref() == tool_use_id
                     })
-                    || self.tracks_foreground_subagent(task_id)
+                    || self.tracks_subagent(task_id)
                 {
                     return Err(self.protocol_failure());
                 }
@@ -1791,9 +1937,9 @@ impl ClaudeCodeStreamJsonV1Parser {
                 });
             }
             "task_progress" => {
-                if !required_nonempty_string(object, "task_id")
-                    .is_some_and(|task_id| self.tracks_foreground_subagent(task_id))
-                {
+                if !required_nonempty_string(object, "task_id").is_some_and(|task_id| {
+                    self.tracks_subagent(task_id) || self.is_subagent_work(task_id)
+                }) {
                     self.observe_unrecognized(value);
                 }
             }
@@ -1803,7 +1949,9 @@ impl ClaudeCodeStreamJsonV1Parser {
                         entry
                             .as_object()
                             .and_then(|entry| required_nonempty_string(entry, "task_id"))
-                            .is_some_and(|task_id| self.tracks_task(task_id))
+                            .is_some_and(|task_id| {
+                                self.tracks_task(task_id) || self.is_subagent_work(task_id)
+                            })
                     })
                 });
                 if !membership_is_tracked {
@@ -1813,14 +1961,18 @@ impl ClaudeCodeStreamJsonV1Parser {
             "task_updated" | "task_notification" => {
                 let task_id = required_nonempty_string(object, "task_id")
                     .ok_or_else(|| self.protocol_failure())?;
-                if self.tracks_foreground_subagent(task_id) {
-                    return self.settle_foreground_subagent(object, task_id);
+                if self.tracks_subagent(task_id) {
+                    return self.settle_subagent(object, task_id);
                 }
+                let subagent_work = self.is_subagent_work(task_id);
                 let Some(task) = self
                     .background_commands
                     .iter_mut()
                     .find(|task| task.task_id.as_ref() == task_id)
                 else {
+                    if subagent_work {
+                        return Ok(());
+                    }
                     if self.exchange_active {
                         self.observe_unrecognized(value);
                         return Ok(());
@@ -1867,24 +2019,43 @@ impl ClaudeCodeStreamJsonV1Parser {
         Ok(())
     }
 
-    fn tracks_foreground_subagent(&self, task_id: &str) -> bool {
-        self.foreground_subagents
+    fn tracks_subagent(&self, task_id: &str) -> bool {
+        self.subagents
             .iter()
             .any(|subagent| subagent.task_id.as_ref() == task_id)
     }
 
     fn tracks_task(&self, task_id: &str) -> bool {
-        self.tracks_foreground_subagent(task_id)
+        self.tracks_subagent(task_id)
             || self
                 .background_commands
                 .iter()
                 .any(|task| task.task_id.as_ref() == task_id)
     }
 
-    fn start_foreground_subagent(
-        &mut self,
-        object: &Map<String, Value>,
-    ) -> Result<(), AgentFailureCause> {
+    /// Whether the Agent call `tool_use_id` started a backgrounded subagent that has not
+    /// yet settled, so that a message naming it as parent is that subagent's activity.
+    fn awaits_subagent(&self, tool_use_id: &str) -> bool {
+        self.subagents.iter().any(|subagent| {
+            subagent.awaits_notification() && subagent.tool_use_id.as_ref() == tool_use_id
+        })
+    }
+
+    /// A task event naming no tracked task is a backgrounded subagent's own work while
+    /// one is outstanding; the subagent, not this invocation, owns it.
+    fn is_subagent_work(&self, task_id: &str) -> bool {
+        !self.tracks_task(task_id) && self.subagents.iter().any(Subagent::awaits_notification)
+    }
+
+    /// Background commands and backgrounded subagents that still owe a notification.
+    fn awaits_background_work(&self) -> bool {
+        self.background_commands
+            .iter()
+            .any(BackgroundCommand::awaits_notification)
+            || self.subagents.iter().any(Subagent::awaits_notification)
+    }
+
+    fn start_subagent(&mut self, object: &Map<String, Value>) -> Result<(), AgentFailureCause> {
         if !self.exchange_active {
             return Err(self.protocol_failure());
         }
@@ -1892,28 +2063,38 @@ impl ClaudeCodeStreamJsonV1Parser {
             required_nonempty_string(object, "task_id").ok_or_else(|| self.protocol_failure())?;
         let tool_use_id = required_nonempty_string(object, "tool_use_id")
             .ok_or_else(|| self.protocol_failure())?;
-        if self.foreground_subagents.len() >= MAXIMUM_TRACKED_TASKS || self.tracks_task(task_id) {
+        if self.subagents.len() >= MAXIMUM_TRACKED_TASKS
+            || self.tracks_task(task_id)
+            || self
+                .subagents
+                .iter()
+                .any(|subagent| subagent.tool_use_id.as_ref() == tool_use_id)
+        {
             return Err(self.protocol_failure());
         }
-        let subagent = ForegroundSubagent {
+        let subagent = Subagent {
             task_id: Arc::from(task_id),
             tool_use_id: Arc::from(tool_use_id),
+            run_id: required_nonempty_string(object, "run_id").map(Arc::from),
             subagent_type: required_nonempty_string(object, "subagent_type")
                 .map(|kind| Arc::from(ellipsize(kind, MAXIMUM_SUBAGENT_TOKEN_WIDTH))),
             description: required_nonempty_string(object, "description")
                 .map(|text| Arc::from(ellipsize(text, MAXIMUM_SUBAGENT_DESCRIPTION_WIDTH))),
+            backgrounded: required_bool(object, "is_backgrounded") == Some(true),
+            notified: false,
         };
         self.observations.push(AgentObservation::Diagnostic {
             level: AgentDiagnosticLevel::Information,
             message: Arc::from(subagent.message("started")),
         });
-        self.foreground_subagents.push(subagent);
+        self.subagents.push(subagent);
         Ok(())
     }
 
     /// `task_updated` for a tracked subagent is recognized silently; its
-    /// `task_notification` names the status and retires it.
-    fn settle_foreground_subagent(
+    /// `task_notification` names the status. A foreground subagent's notification retires
+    /// it; a backgrounded one's must correlate exactly and settles what it owes.
+    fn settle_subagent(
         &mut self,
         object: &Map<String, Value>,
         task_id: &str,
@@ -1922,19 +2103,27 @@ impl ClaudeCodeStreamJsonV1Parser {
             return Ok(());
         }
         let Some(index) = self
-            .foreground_subagents
+            .subagents
             .iter()
             .position(|subagent| subagent.task_id.as_ref() == task_id)
         else {
             return Err(self.protocol_failure());
         };
-        if required_nonempty_string(object, "tool_use_id")
-            .is_some_and(|id| id != self.foreground_subagents[index].tool_use_id.as_ref())
-        {
+        let subagent = &self.subagents[index];
+        let tool_use_id = required_nonempty_string(object, "tool_use_id");
+        let status = required_nonempty_string(object, "status");
+        let invalid = if subagent.backgrounded {
+            subagent.notified
+                || tool_use_id != Some(subagent.tool_use_id.as_ref())
+                || required_nonempty_string(object, "run_id") != subagent.run_id.as_deref()
+                || status.is_none()
+        } else {
+            tool_use_id.is_some_and(|id| id != subagent.tool_use_id.as_ref())
+        };
+        if invalid {
             return Err(self.protocol_failure());
         }
-        let subagent = self.foreground_subagents.remove(index);
-        let status = required_nonempty_string(object, "status").map_or_else(
+        let status = status.map_or_else(
             || Arc::from("settled"),
             |status| Arc::from(ellipsize(status, MAXIMUM_SUBAGENT_TOKEN_WIDTH)),
         );
@@ -1942,6 +2131,11 @@ impl ClaudeCodeStreamJsonV1Parser {
             level: AgentDiagnosticLevel::Information,
             message: Arc::from(subagent.message(&status)),
         });
+        if subagent.backgrounded {
+            self.subagents[index].notified = true;
+        } else {
+            self.subagents.remove(index);
+        }
         Ok(())
     }
 
@@ -2053,16 +2247,28 @@ impl ClaudeCodeStreamJsonV1Parser {
 
         let completes_harness = self.value_kind != AgentValueKind::Result;
         if !completes_harness {
-            self.completed_result_exchange = Some(if successful {
-                self.extract_result_candidate(object)
+            let exchange = if !successful {
+                Some(CompletedResultExchange::NativeFailure)
+            } else if !self.awaits_background_work() {
+                Some(self.extract_result_candidate(object))
+            } else if object.contains_key("structured_output") {
+                Some(CompletedResultExchange::PrematureCandidate)
             } else {
-                CompletedResultExchange::NativeFailure
-            });
-            self.result_decision_pending = successful
-                && !matches!(
-                    self.completed_result_exchange,
-                    Some(CompletedResultExchange::MissingCandidate)
-                );
+                // The agent ended its turn to wait for background work: the exchange
+                // pauses with no decision until a notification or wakeup begins the next.
+                None
+            };
+            self.result_decision_pending = matches!(
+                exchange,
+                Some(
+                    CompletedResultExchange::Candidate(_)
+                        | CompletedResultExchange::AmbiguousCandidate
+                        | CompletedResultExchange::PrematureCandidate
+                )
+            );
+            self.premature_candidate_pending =
+                matches!(exchange, Some(CompletedResultExchange::PrematureCandidate));
+            self.completed_result_exchange = exchange;
         } else if object.contains_key("structured_output") {
             return Err(self.protocol_failure());
         }
@@ -2070,15 +2276,19 @@ impl ClaudeCodeStreamJsonV1Parser {
         self.complete_retry();
         self.exchange_initialized = false;
         self.exchange_active = false;
-        // A foreground subagent the exchange did not settle carries no completion duty.
-        self.foreground_subagents.clear();
+        // A foreground subagent the exchange did not settle carries no completion duty; a
+        // backgrounded one still owes its notification.
+        self.subagents.retain(|subagent| subagent.backgrounded);
         self.completed_exchanges = self
             .completed_exchanges
             .checked_add(1)
             .ok_or_else(|| self.protocol_failure())?;
         self.observations
             .push(lifecycle(AgentLifecycleMilestone::TurnCompleted));
-        if completes_harness && self.background_commands.iter().all(|task| task.notified) {
+        if completes_harness
+            && self.background_commands.iter().all(|task| task.notified)
+            && self.subagents.iter().all(|subagent| subagent.notified)
+        {
             self.observations
                 .push(lifecycle(AgentLifecycleMilestone::HarnessCompleted));
         }
@@ -2174,6 +2384,7 @@ impl ClaudeCodeStreamJsonV1Parser {
         self.final_main_message = None;
         self.completed_result_exchange = None;
         self.result_decision_pending = false;
+        self.premature_candidate_pending = false;
         self.accepted_result = None;
     }
 
@@ -2264,10 +2475,13 @@ impl ClaudeCodeStreamJsonV1Parser {
                 stream_event: self.rejection_context.stream_event,
                 content_index: self.rejection_context.content_index,
                 content_block: self.rejection_context.content_block,
-                state: self
-                    .rejection_state_snapshot
-                    .clone()
-                    .unwrap_or_else(|| self.rejection_state()),
+                state: ClaudeCodeStreamJsonV1RejectionState {
+                    event_thread: self.rejection_context.event_thread,
+                    ..self
+                        .rejection_state_snapshot
+                        .clone()
+                        .unwrap_or_else(|| self.rejection_state())
+                },
             },
         )
     }
@@ -2347,6 +2561,19 @@ impl ClaudeCodeStreamJsonV1Parser {
             result_accepted: self.accepted_result.is_some(),
             native_failure: self.native_failure.is_some(),
             retry_active: self.retry_active,
+            // The rejected frame's thread is known only once it is decoded.
+            event_thread: None,
+            outstanding_background_commands: bounded_count(
+                self.background_commands
+                    .iter()
+                    .filter(|task| task.awaits_notification()),
+            ),
+            outstanding_background_subagents: bounded_count(
+                self.subagents
+                    .iter()
+                    .filter(|subagent| subagent.awaits_notification()),
+            ),
+            scheduled_wakeup_pending: self.scheduled_wakeup_pending,
         }
     }
 }
@@ -2487,6 +2714,9 @@ fn completed_result_exchange_state(
         Some(CompletedResultExchange::MissingCandidate) => {
             ClaudeCodeStreamJsonV1CompletedResultExchangeState::MissingCandidate
         }
+        Some(CompletedResultExchange::PrematureCandidate) => {
+            ClaudeCodeStreamJsonV1CompletedResultExchangeState::PrematureCandidate
+        }
         Some(CompletedResultExchange::NativeFailure) => {
             ClaudeCodeStreamJsonV1CompletedResultExchangeState::NativeFailure
         }
@@ -2495,6 +2725,10 @@ fn completed_result_exchange_state(
 
 fn bounded_sequence(value: u64) -> u64 {
     value.min(MAXIMUM_DIAGNOSTIC_SEQUENCE)
+}
+
+fn bounded_count<T>(items: impl Iterator<Item = T>) -> u64 {
+    bounded_sequence(u64::try_from(items.count()).unwrap_or(u64::MAX))
 }
 
 struct StreamedMessage {

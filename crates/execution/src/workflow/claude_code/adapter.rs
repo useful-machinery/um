@@ -49,6 +49,10 @@ pub(super) const STANDARD_INPUT_WRITE_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(30);
 const AMBIGUOUS_CANDIDATE_FEEDBACK: &str =
     "Result rejected: submit exactly one standalone structured result candidate.\n";
+// Model-visible workflow content: no counts or native identifiers.
+pub(super) const PREMATURE_CANDIDATE_FEEDBACK: &str = "Result rejected: background work you \
+started is still running. End your turn without submitting a result, and resubmit it after \
+the notification that the work has finished arrives.\n";
 pub(super) const NATIVE_TRANSCRIPT_CAPTURE_MISSING_DIAGNOSTIC: &str =
     "Claude Code native transcript capture missing";
 
@@ -754,7 +758,7 @@ where
             ClaudeExtra::Initial(progress) => {
                 self.initial_input_pending = false;
                 match progress {
-                    InitialInputProgress::Ready(input) => self.standard_input = input,
+                    InitialInputProgress::Ready(input) => self.standard_input = Some(input),
                     InitialInputProgress::Cancelled(reason) => {
                         state.cancelled.get_or_insert(reason);
                         state.parser_enabled = false;
@@ -795,6 +799,17 @@ where
         let (parsed, observations) = agent_process_driver::collect_stdout_observations(|emit| {
             self.parser.push_stdout(bytes, emit)
         });
+        // The parser reports HarnessCompleted only in Response and None modes, for a result
+        // that leaves no background work outstanding: the invocation has settled, so its
+        // input ends. Result mode settles on acceptance instead.
+        let settled = observations.iter().any(|observation| {
+            matches!(
+                observation,
+                AgentObservation::Lifecycle {
+                    milestone: AgentLifecycleMilestone::HarnessCompleted,
+                }
+            )
+        });
         if let Some(reason) = state.cancellation.cancellation_reason() {
             state.cancelled = Some(reason);
             state.parser_enabled = false;
@@ -828,6 +843,16 @@ where
             && let Err(cause) = parsed
         {
             self.failure = Some(cause);
+            state.parser_enabled = false;
+            state.force_group();
+        }
+        if state.parser_enabled
+            && settled
+            && close_standard_input(&mut self.standard_input)
+                .await
+                .is_err()
+        {
+            self.failure = Some(AgentFailureCause::HarnessProtocolFailed);
             state.parser_enabled = false;
             state.force_group();
         }
@@ -997,17 +1022,9 @@ where
     let (standard_input, output) = process.split();
     let cancellation = invocation.cancellation().clone();
     let initial_cancellation = cancellation.clone();
-    let close_after_write = invocation.value_mode().kind() != AgentValueKind::Result;
     let initial_clock = clock.clone();
     let initial_input = Box::pin(async move {
-        initialize_standard_input(
-            standard_input,
-            bytes,
-            close_after_write,
-            &initial_cancellation,
-            initial_clock,
-        )
-        .await
+        initialize_standard_input(standard_input, bytes, &initial_cancellation, initial_clock).await
     });
     let protocol = ClaudeProtocol {
         invocation,
@@ -1033,7 +1050,7 @@ where
 }
 
 enum InitialInputProgress {
-    Ready(Option<UnixStream>),
+    Ready(UnixStream),
     Cancelled(CancellationReason),
     Failed(ClaudeCodeStreamJsonV1RejectionReason),
 }
@@ -1072,45 +1089,17 @@ async fn write_with_cancellation<Clock: CoordinatorClock>(
 async fn initialize_standard_input<Clock: CoordinatorClock>(
     mut standard_input: UnixStream,
     bytes: &[u8],
-    close_after_write: bool,
     cancellation: &CancellationSource,
     clock: Clock,
 ) -> InitialInputProgress {
     if let Some(reason) = cancellation.cancellation_reason() {
         return InitialInputProgress::Cancelled(reason);
     }
+    // Standard input stays open after the prompt: Claude Code defers a turn's result while
+    // a backgrounded subagent is pending once its input has ended, so the adapter closes it
+    // only when the invocation settles.
     match write_with_cancellation(&mut standard_input, bytes, cancellation, clock).await {
-        WriteProgress::Completed if !close_after_write => {
-            InitialInputProgress::Ready(Some(standard_input))
-        }
-        WriteProgress::Completed => {
-            let shutdown = standard_input.shutdown();
-            tokio::pin!(shutdown);
-            let cancelled = cancellation.wait_for_cancellation();
-            tokio::pin!(cancelled);
-            tokio::select! {
-                biased;
-                reason = &mut cancelled => InitialInputProgress::Cancelled(reason),
-                result = &mut shutdown => {
-                    // NotConnected: see close_standard_input. A harness that
-                    // exited after reading its prompt has already observed
-                    // end of input.
-                    if result.is_ok()
-                        || result.is_err_and(|error| {
-                            error.kind() == io::ErrorKind::NotConnected
-                        })
-                    {
-                        InitialInputProgress::Ready(None)
-                    } else if let Some(reason) = cancellation.cancellation_reason() {
-                        InitialInputProgress::Cancelled(reason)
-                    } else {
-                        InitialInputProgress::Failed(
-                            ClaudeCodeStreamJsonV1RejectionReason::StandardInputCloseFailed,
-                        )
-                    }
-                }
-            }
-        }
+        WriteProgress::Completed => InitialInputProgress::Ready(standard_input),
         WriteProgress::Cancelled(reason) => InitialInputProgress::Cancelled(reason),
         WriteProgress::Failed => InitialInputProgress::Failed(
             ClaudeCodeStreamJsonV1RejectionReason::StandardInputWriteFailed,
@@ -1228,9 +1217,15 @@ where
                 }
             }
         }
-        CompletedResultExchange::AmbiguousCandidate => {
+        CompletedResultExchange::AmbiguousCandidate
+        | CompletedResultExchange::PrematureCandidate => {
+            let feedback = if matches!(exchange, CompletedResultExchange::AmbiguousCandidate) {
+                AMBIGUOUS_CANDIDATE_FEEDBACK
+            } else {
+                PREMATURE_CANDIDATE_FEEDBACK
+            };
             let feedback = bounded_feedback(
-                AMBIGUOUS_CANDIDATE_FEEDBACK,
+                feedback,
                 invocation
                     .limits()
                     .maximum_result_rejection_feedback_bytes()
