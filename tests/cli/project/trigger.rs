@@ -5,6 +5,89 @@ const EVALUATION: &str = "tev_01k0z6r1w8f4jy2m7q9v3x5abc";
 const GRANT: &str = "tgr_01k0z6r1w8f4jy2m7q9v3x5abc";
 const LINEAR_CONNECTION: &str = "lcn_01k0z6r1w8f4jy2m7q9v3x5abc";
 
+#[test]
+fn disabled_lifecycle_choice_reaches_create_and_update_api() {
+    let directory = tempfile::tempdir().unwrap();
+    let create_path = directory.path().join("create.json");
+    let update_path = directory.path().join("update.json");
+    let config = serde_json::json!({
+        "enabled":false, "source":{"type":"linear","connectionId":LINEAR_CONNECTION},
+        "target":{"workflowPath":".um/workflow.yaml","executionPrincipalId":"prn_01k0z6r1w8f4jy2m7q9v3x5abc"},
+        "conditions":[{"field":"event.action","operator":"eq","value":"update"}],
+        "inputs":{}, "integrationContext":{}, "linearLifecycle":{"enabled":false}
+    });
+    std::fs::write(&create_path, serde_json::to_vec(&config).unwrap()).unwrap();
+    std::fs::write(&update_path, br#"{"linearLifecycle":{"enabled":false}}"#).unwrap();
+    let trigger = serde_json::json!({
+        "id":TRIGGER, "projectId":PROJECT_ID, "version":1, "grantId":GRANT,
+        "createdAt":"2026-09-01T00:00:00Z", "updatedAt":"2026-09-01T00:00:00Z",
+        "enabled":false, "source":config["source"], "target":config["target"],
+        "conditions":config["conditions"], "inputs":{}, "integrationContext":{},
+        "linearLifecycle":{"enabled":false}
+    });
+    let (server, _credentials_dir, credential) = prepared_project(vec![
+        http_response_with_headers(
+            "201 Created",
+            Some("application/json"),
+            &[("Idempotency-Key", ECHO_IDEMPOTENCY_KEY)],
+            &serde_json::to_vec(&trigger).unwrap(),
+        ),
+        http_response_with_headers(
+            "200 OK",
+            Some("application/json"),
+            &[("Idempotency-Key", ECHO_IDEMPOTENCY_KEY)],
+            &serde_json::to_vec(&trigger).unwrap(),
+        ),
+    ]);
+    let created = run_project(
+        &[
+            "project",
+            "trigger",
+            "create",
+            ORGANIZATION,
+            PROJECT_ID,
+            "--config-file",
+            create_path.to_str().unwrap(),
+            "--json",
+            "--allow-insecure-http",
+        ],
+        &server,
+        &credential,
+    );
+    assert_json_success(&created, "created");
+    let updated = run_project(
+        &[
+            "project",
+            "trigger",
+            "update",
+            ORGANIZATION,
+            PROJECT_ID,
+            TRIGGER,
+            "--config-file",
+            update_path.to_str().unwrap(),
+            "--expected-version",
+            "1",
+            "--json",
+            "--allow-insecure-http",
+        ],
+        &server,
+        &credential,
+    );
+    assert_json_success(&updated, "updated");
+    let requests = server.finish();
+    assert_eq!(requests.len(), 2);
+    assert!(requests[0].starts_with("POST "));
+    assert!(requests[1].starts_with("PATCH "));
+    assert_eq!(
+        request_body(&requests[0])["linearLifecycle"],
+        serde_json::json!({"enabled":false})
+    );
+    assert_eq!(
+        request_body(&requests[1])["linearLifecycle"],
+        serde_json::json!({"enabled":false})
+    );
+}
+
 fn evaluation(state: &str, cycle: i32) -> serde_json::Value {
     let mut body = serde_json::json!({
         "id": EVALUATION, "triggerId": TRIGGER, "configurationVersion": 1,

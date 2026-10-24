@@ -27,7 +27,7 @@ fn session(status: &str) -> serde_json::Value {
 }
 fn connection() -> serde_json::Value {
     serde_json::json!({"id":CONNECTION,"organizationId":ORG_ID,"status":"active", "workspaceId":"workspace-1",
-        "workspaceName":"Research", "requiredScopes":["read"], "grantedScopes":["read"],
+        "workspaceName":"Research", "requiredScopes":["read"], "grantedScopes":["read"], "stateUpdatesConsented":false,
         "lifecycleGeneration":1,"createdAt":"2026-09-05T12:00:00Z","updatedAt":"2026-09-05T12:01:00Z", "token":SECRET})
 }
 fn assert_no_secret_output(output: &Output, secrets: &[&str]) {
@@ -49,7 +49,149 @@ fn lines(output: &Output) -> Vec<serde_json::Value> {
         .collect()
 }
 
-// REQ-CONNECTION-40
+// REQ-CONNECTION-40, REQ-CONNECTION-87
+#[test]
+fn write_consent_flag_and_effective_session_scopes_are_visible() {
+    let mut pending = session("pending");
+    pending.as_object_mut().unwrap().insert(
+        "requestedScopes".into(),
+        serde_json::json!(["read", "write"]),
+    );
+    let (server, _dir, credential) = prepared(vec![json_http_response("201 Created", pending)]);
+    let output = env_run(
+        &server,
+        &credential,
+        &[
+            "connection",
+            "linear",
+            "authorization",
+            "create",
+            ORG,
+            "--enable-state-updates",
+            "--no-wait",
+            "--json",
+            "--allow-insecure-http",
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let response = lines(&output);
+    assert_eq!(
+        response[0]["session"]["requestedScopes"],
+        serde_json::json!(["read", "write"])
+    );
+    let requests = server.finish();
+    let body: serde_json::Value =
+        serde_json::from_str(requests[0].split_once("\r\n\r\n").unwrap().1).unwrap();
+    assert_eq!(body["enableStateUpdates"], true);
+}
+
+#[test]
+fn team_and_state_discovery_preserve_paging_and_full_set_suggestions() {
+    let (server, _dir, credential) = prepared(vec![
+        json_http_response(
+            "200 OK",
+            serde_json::json!({"items":[{"id":"team","name":"Example"}],"nextCursor":"teams-page"}),
+        ),
+        json_http_response(
+            "200 OK",
+            serde_json::json!({"items":[{"id":"first","name":"Working","type":"started"}],
+            "nextCursor":"states-page","presetSuggestions":{"started":{"status":"suggested","stateId":"first"},
+            "succeeded":{"status":"suggested","stateId":"outside-page"},"failed":{"status":"ambiguous"}}}),
+        ),
+    ]);
+    let teams = env_run(
+        &server,
+        &credential,
+        &[
+            "connection",
+            "linear",
+            "team",
+            "list",
+            ORG,
+            CONNECTION,
+            "--limit",
+            "1",
+            "--json",
+            "--allow-insecure-http",
+        ],
+    );
+    assert!(
+        teams.status.success(),
+        "{}",
+        String::from_utf8_lossy(&teams.stderr)
+    );
+    assert_eq!(lines(&teams)[0]["nextCursor"], "teams-page");
+    let states = env_run(
+        &server,
+        &credential,
+        &[
+            "connection",
+            "linear",
+            "state",
+            "list",
+            ORG,
+            CONNECTION,
+            "team",
+            "--cursor",
+            "teams-page",
+            "--json",
+            "--allow-insecure-http",
+        ],
+    );
+    assert!(
+        states.status.success(),
+        "{}",
+        String::from_utf8_lossy(&states.stderr)
+    );
+    assert_eq!(
+        lines(&states)[0]["presetSuggestions"]["succeeded"]["stateId"],
+        "outside-page"
+    );
+    let requests = server.finish();
+    assert!(requests[0].contains(&format!("/connections/linear/{CONNECTION}/teams?limit=1")));
+    assert!(requests[1].contains(&format!(
+        "/connections/linear/{CONNECTION}/teams/team/states?cursor=teams-page"
+    )));
+}
+
+#[test]
+fn discovery_rejects_open_or_inconsistent_suggestion_records() {
+    for payload in [
+        serde_json::json!({"items":[],"presetSuggestions":{"started":{"status":"ambiguous","stateId":"unexpected"},
+            "succeeded":{"status":"not_found"},"failed":{"status":"not_found"}}}),
+        serde_json::json!({"items":[],"presetSuggestions":{"started":{"status":"suggested","stateId":"state","extra":"unknown"},
+            "succeeded":{"status":"not_found"},"failed":{"status":"not_found"}}}),
+    ] {
+        let (server, _dir, credential) = prepared(vec![json_http_response("200 OK", payload)]);
+        let output = env_run(
+            &server,
+            &credential,
+            &[
+                "connection",
+                "linear",
+                "state",
+                "list",
+                ORG,
+                CONNECTION,
+                "team",
+                "--json",
+                "--allow-insecure-http",
+            ],
+        );
+        assert!(!output.status.success());
+        assert!(
+            lines(&output)
+                .iter()
+                .all(|event| event["outcome"] != "listed")
+        );
+        server.finish();
+    }
+}
+
 #[test]
 fn consent_handoff_and_later_authorization_inspection_are_nonsecret() {
     let (server, _dir, credential) = prepared(vec![

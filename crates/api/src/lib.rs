@@ -121,8 +121,8 @@ pub use lifecycle::{
 pub use linear::{
     CreateLinearTriggerRequest, EvaluationFilters, LinearApi, LinearConnection,
     LinearConnectionList, LinearEvaluation, LinearEvaluationList, LinearEvaluationState,
-    LinearFailure, LinearSession, LinearSessionStatus, LinearTrigger, LinearTriggerList,
-    LinearTriggerRead, TriggerAction, UpdateLinearTriggerRequest,
+    LinearFailure, LinearSession, LinearSessionStatus, LinearTeamList, LinearTeamStateList,
+    LinearTrigger, LinearTriggerList, LinearTriggerRead, TriggerAction, UpdateLinearTriggerRequest,
 };
 pub use organizations::{
     AcceptInvitationOutcome, AcceptedInvitationMembership, AuditActor, AuditProjectionWarning,

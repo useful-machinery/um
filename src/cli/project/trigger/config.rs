@@ -62,6 +62,7 @@ fn validate(value: &Value, update: bool) -> Result<()> {
             "inputs",
             "integrationContext",
             "publication",
+            "linearLifecycle",
         ][..]
     } else {
         &[
@@ -72,6 +73,7 @@ fn validate(value: &Value, update: bool) -> Result<()> {
             "inputs",
             "integrationContext",
             "publication",
+            "linearLifecycle",
         ][..]
     };
     let required = if update { &[][..] } else { &allowed[..6] };
@@ -166,6 +168,12 @@ fn validate(value: &Value, update: bool) -> Result<()> {
                 return Err(anyhow!("invalid integration context key"));
             }
             literal_or_field(source, false, true)?;
+        }
+    }
+    if let Some(choice) = map.get("linearLifecycle") {
+        let fields = object(choice, &["enabled"], &["enabled"])?;
+        if fields["enabled"] != false {
+            return Err(anyhow!("only a disabled Linear lifecycle is supported"));
         }
     }
     if let Some(publication) = map.get("publication") {
@@ -264,6 +272,22 @@ mod tests {
             )
             .is_ok()
         );
+        let mut disabled = parse(base, false, None).unwrap();
+        disabled["linearLifecycle"] = serde_json::json!({"enabled":false});
+        assert!(create(disabled).is_ok());
+        assert!(
+            update(parse(br#"{"linearLifecycle":{"enabled":false}}"#, true, Some(1)).unwrap())
+                .is_ok()
+        );
+        for bad in [
+            r#"{}"#,
+            r#"{"enabled":null}"#,
+            r#"{"enabled":true}"#,
+            r#"{"enabled":false,"extra":0}"#,
+        ] {
+            let patch = format!(r#"{{"linearLifecycle":{bad}}}"#);
+            assert!(parse(patch.as_bytes(), true, Some(1)).is_err());
+        }
         assert!(create(parse(base, false, None).unwrap()).is_ok());
         for bad in [
             br#"{"inputs":{"x":{"kind":"text","source":{"type":"field","field":"current.comments"}}}}"#.as_slice(),

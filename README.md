@@ -1412,6 +1412,8 @@ It does not open a browser or listen for the callback. Use the selected human se
 ```sh
 um connection linear authorization create acme-labs
 um connection linear authorization create acme-labs --connection-id lcn_01k0z6r1w8f4jy2m7q9v3x5abc
+# To request write consent explicitly on a new or read-only connection:
+um connection linear authorization create acme-labs --enable-state-updates
 ```
 
 Open the URL in a browser as the initiating owner. By default, the command polls the
@@ -1426,12 +1428,21 @@ um connection linear authorization show acme-labs las_01k0z6r1w8f4jy2m7q9v3x5abc
 um connection linear authorization wait acme-labs las_01k0z6r1w8f4jy2m7q9v3x5abc --timeout 5m
 um connection linear list acme-labs
 um connection linear show acme-labs lcn_01k0z6r1w8f4jy2m7q9v3x5abc
+um connection linear team list acme-labs lcn_01k0z6r1w8f4jy2m7q9v3x5abc
+um connection linear state list acme-labs lcn_01k0z6r1w8f4jy2m7q9v3x5abc LINEAR_TEAM_ID
 um connection linear remove acme-labs lcn_01k0z6r1w8f4jy2m7q9v3x5abc --yes
 um connection linear delete acme-labs lcn_01k0z6r1w8f4jy2m7q9v3x5abc --yes
 ```
 
 Remove erases the credential but reserves the workspace binding; delete also
-releases that binding. Reauthorization targets the exact connection ID. Use `--json`
+releases that binding. Reauthorization targets the exact connection ID. Once write
+consent has been verified, a plain reauthorization requests it again even after
+credential loss; it is not a downgrade. Session `requestedScopes` and connection
+`stateUpdatesConsented` are nonsecret inspection metadata. Discovery pages require
+owner access and suggest states without installing rules or writing to Linear.
+New triggers on an active write-capable connection must explicitly supply
+`"linearLifecycle":{"enabled":false}` in their configuration until lifecycle
+rules and synchronization are available. Use `--json`
 for schema-version-1 newline-delimited events when starting or waiting and a single
 JSON line for inspection/lifecycle commands. A lost start response is retried only
 with the same internally generated request key during that invocation. If commitment

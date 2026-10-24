@@ -12,6 +12,8 @@ use super::{HttpTransportPolicy, UnreachableCategory, classify_reqwest_error, pr
 pub type LinearSession = models::LinearAuthorizationSession;
 pub type LinearConnection = models::LinearConnection;
 pub type LinearConnectionList = models::LinearConnectionList;
+pub type LinearTeamList = models::LinearTeamList;
+pub type LinearTeamStateList = models::LinearTeamStateList;
 pub type LinearEvaluation = models::LinearEvaluation;
 pub type LinearTrigger = models::LinearTrigger;
 pub type LinearTriggerList = models::LinearTriggerList;
@@ -88,6 +90,7 @@ impl LinearApi {
         organization: &str,
         connection_id: Option<&str>,
         key: &str,
+        enable_state_updates: bool,
     ) -> Result<LinearSession, LinearFailure> {
         let mut request =
             models::CreateLinearAuthorizationSessionRequest::new(match connection_id {
@@ -97,6 +100,9 @@ impl LinearApi {
                 None => models::create_linear_authorization_session_request::Operation::Connect,
             });
         request.connection_id = connection_id.map(str::to_owned);
+        if enable_state_updates {
+            request.enable_state_updates = Some(true);
+        }
         let session = apis::source_connections_api::create_linear_authorization_session(
             &self.configuration,
             organization,
@@ -170,6 +176,94 @@ impl LinearApi {
             validate_connection(connection.clone(), organization, None)?;
         }
         Ok(page)
+    }
+
+    pub fn teams(
+        &self,
+        organization: &str,
+        connection: &str,
+        limit: Option<i32>,
+        cursor: Option<&str>,
+    ) -> Result<LinearTeamList, LinearFailure> {
+        let endpoint = self.discovery_endpoint(organization, connection, None, limit, cursor)?;
+        let page: LinearTeamList = receive_closed_json_response(
+            super::generated_api_request(&self.configuration, reqwest::Method::GET, &endpoint),
+            StatusCode::OK,
+        )?;
+        if page
+            .items
+            .iter()
+            .any(|team| team.id.is_empty() || team.name.is_empty())
+        {
+            return Err(invalid());
+        }
+        Ok(page)
+    }
+
+    pub fn states(
+        &self,
+        organization: &str,
+        connection: &str,
+        team: &str,
+        limit: Option<i32>,
+        cursor: Option<&str>,
+    ) -> Result<LinearTeamStateList, LinearFailure> {
+        let endpoint =
+            self.discovery_endpoint(organization, connection, Some(team), limit, cursor)?;
+        let page: LinearTeamStateList = receive_closed_json_response(
+            super::generated_api_request(&self.configuration, reqwest::Method::GET, &endpoint),
+            StatusCode::OK,
+        )?;
+        if page
+            .items
+            .iter()
+            .any(|state| state.id.is_empty() || state.name.is_empty())
+        {
+            return Err(invalid());
+        }
+        for suggestion in [
+            &page.preset_suggestions.started,
+            &page.preset_suggestions.succeeded,
+            &page.preset_suggestions.failed,
+        ] {
+            use crate::generated::models::linear_preset_suggestion::Status;
+            if (suggestion.status == Status::Suggested) != suggestion.state_id.is_some() {
+                return Err(invalid());
+            }
+        }
+        Ok(page)
+    }
+
+    fn discovery_endpoint(
+        &self,
+        organization: &str,
+        connection: &str,
+        team: Option<&str>,
+        limit: Option<i32>,
+        cursor: Option<&str>,
+    ) -> Result<String, LinearFailure> {
+        let mut endpoint = format!(
+            "{}/v1/organizations/{}/connections/linear/{}/teams",
+            self.configuration.base_path.trim_end_matches('/'),
+            apis::urlencode(organization),
+            apis::urlencode(connection),
+        );
+        if let Some(team) = team {
+            endpoint.push('/');
+            endpoint.push_str(&apis::urlencode(team));
+            endpoint.push_str("/states");
+        }
+        let mut url = Url::parse(&endpoint).map_err(|_| invalid())?;
+        if limit.is_some() || cursor.is_some() {
+            let mut query = url.query_pairs_mut();
+            if let Some(limit) = limit {
+                query.append_pair("limit", &limit.to_string());
+            }
+            if let Some(cursor) = cursor {
+                query.append_pair("cursor", cursor);
+            }
+        }
+        Ok(url.to_string())
     }
 
     pub fn create_trigger(

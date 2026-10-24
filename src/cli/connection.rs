@@ -51,6 +51,10 @@ enum Leaf {
     Remove(ConfirmationTarget),
     #[command(about = "Show a Linear connection and its authorization state")]
     Show(Target),
+    #[command(about = "Discover accessible Linear team states")]
+    State(StateCommand),
+    #[command(about = "Discover accessible Linear teams")]
+    Team(TeamCommand),
 }
 #[derive(Debug, Args)]
 struct AuthorizationCommand {
@@ -68,6 +72,8 @@ enum AuthorizationLeaf {
 }
 #[derive(Debug, Args)]
 struct Start {
+    #[arg(long, help = "Request Linear state-update write permission")]
+    enable_state_updates: bool,
     #[arg(value_name = OrganizationArg::VALUE_NAME, help = OrganizationArg::HELP)]
     organization: OrganizationArg,
     #[arg(
@@ -130,6 +136,45 @@ struct List {
     options: Options,
 }
 
+#[derive(Debug, Args)]
+struct TeamCommand {
+    #[command(subcommand)]
+    command: Option<TeamLeaf>,
+}
+#[derive(Debug, Subcommand)]
+enum TeamLeaf {
+    #[command(about = "List accessible teams")]
+    List(DiscoveryList),
+}
+#[derive(Debug, Args)]
+struct StateCommand {
+    #[command(subcommand)]
+    command: Option<StateLeaf>,
+}
+#[derive(Debug, Subcommand)]
+enum StateLeaf {
+    #[command(about = "List accessible states for a team")]
+    List(StateList),
+}
+#[derive(Debug, Args)]
+struct DiscoveryList {
+    #[arg(value_name = OrganizationArg::VALUE_NAME, help = OrganizationArg::HELP)]
+    organization: OrganizationArg,
+    #[arg(value_name = "CONNECTION")]
+    connection: String,
+    #[command(flatten)]
+    page: super::PaginationArgs<100>,
+    #[command(flatten)]
+    options: Options,
+}
+#[derive(Debug, Args)]
+struct StateList {
+    #[command(flatten)]
+    teams: DiscoveryList,
+    #[arg(value_name = "TEAM")]
+    team: String,
+}
+
 impl Command {
     pub(super) fn execute(self) -> super::CommandResult {
         match self.command {
@@ -151,6 +196,14 @@ impl LinearCommand {
                 Some(AuthorizationLeaf::Wait(cmd)) => deployment(cmd, |cmd, d| cmd.wait(d)),
             },
             Some(Leaf::List(cmd)) => deployment(cmd, |cmd, d| cmd.execute(d)),
+            Some(Leaf::Team(cmd)) => match cmd.command {
+                None => super::print_help(&[NAME, "linear", "team"]),
+                Some(TeamLeaf::List(cmd)) => deployment(cmd, |cmd, d| cmd.list_teams(d)),
+            },
+            Some(Leaf::State(cmd)) => match cmd.command {
+                None => super::print_help(&[NAME, "linear", "state"]),
+                Some(StateLeaf::List(cmd)) => deployment(cmd, |cmd, d| cmd.list_states(d)),
+            },
             Some(Leaf::Show(cmd)) => deployment(cmd, |cmd, d| cmd.execute(d, Action::Show)),
             Some(Leaf::Remove(cmd)) => {
                 deployment(cmd, |cmd, d| cmd.target.execute(d, Action::Disconnect))
@@ -231,10 +284,18 @@ impl Start {
                 }
                 let result = with_api(&deployment, &self.options, |api| {
                     // A lost response may have committed the session. Replay only this key.
-                    match api.start(&self.organization, self.connection_id.as_deref(), &key) {
-                        Err(LinearFailure::Unreachable { .. }) => {
-                            api.start(&self.organization, self.connection_id.as_deref(), &key)
-                        }
+                    match api.start(
+                        &self.organization,
+                        self.connection_id.as_deref(),
+                        &key,
+                        self.enable_state_updates,
+                    ) {
+                        Err(LinearFailure::Unreachable { .. }) => api.start(
+                            &self.organization,
+                            self.connection_id.as_deref(),
+                            &key,
+                            self.enable_state_updates,
+                        ),
                         result => result,
                     }
                 })?;
@@ -667,6 +728,102 @@ impl List {
     }
 }
 
+impl DiscoveryList {
+    fn list_teams(self, d: Deployment) -> super::CommandResult {
+        let result = with_api(&d, &self.options, |api| {
+            api.teams(
+                &self.organization,
+                &self.connection,
+                self.page.limit.map(i32::from),
+                self.page.cursor.as_deref(),
+            )
+        })?;
+        match result {
+            Ok(page) => {
+                let write = || -> anyhow::Result<()> {
+                    if self.options.json {
+                        emit(
+                            &serde_json::json!({"schemaVersion":1,"deployment":d.fingerprint().api_url(),"organizationRef":self.organization.to_string(),"connectionId":self.connection,"outcome":"listed","items":page.items,"nextCursor":page.next_cursor}),
+                        )?;
+                    } else {
+                        let mut out = io::stdout().lock();
+                        for team in &page.items {
+                            writeln!(out, "{}  {}", team.id, team.name)?;
+                        }
+                        if let Some(cursor) = page.next_cursor {
+                            writeln!(out, "next cursor: {cursor}")?;
+                        }
+                    }
+                    Ok(())
+                };
+                write()?;
+                Ok(ExitCode::Success)
+            }
+            Err(failure) => failure_output(
+                &d,
+                &self.organization,
+                None,
+                None,
+                &failure,
+                self.options.authentication.kind(),
+                self.options.json,
+            )
+            .map_err(Into::into),
+        }
+    }
+}
+impl StateList {
+    fn list_states(self, d: Deployment) -> super::CommandResult {
+        let target = self.teams;
+        let result = with_api(&d, &target.options, |api| {
+            api.states(
+                &target.organization,
+                &target.connection,
+                &self.team,
+                target.page.limit.map(i32::from),
+                target.page.cursor.as_deref(),
+            )
+        })?;
+        match result {
+            Ok(page) => {
+                let write = || -> anyhow::Result<()> {
+                    if target.options.json {
+                        emit(
+                            &serde_json::json!({"schemaVersion":1,"deployment":d.fingerprint().api_url(),"organizationRef":target.organization.to_string(),"connectionId":target.connection,"teamId":self.team,"outcome":"listed","items":page.items,"presetSuggestions":page.preset_suggestions,"nextCursor":page.next_cursor}),
+                        )?;
+                    } else {
+                        let mut out = io::stdout().lock();
+                        for state in &page.items {
+                            writeln!(out, "{}  {}  {}", state.id, state.name, state.r#type)?;
+                        }
+                        writeln!(
+                            out,
+                            "suggestions: {}",
+                            serde_json::to_string(&page.preset_suggestions)?
+                        )?;
+                        if let Some(cursor) = page.next_cursor {
+                            writeln!(out, "next cursor: {cursor}")?;
+                        }
+                    }
+                    Ok(())
+                };
+                write()?;
+                Ok(ExitCode::Success)
+            }
+            Err(failure) => failure_output(
+                &d,
+                &target.organization,
+                None,
+                None,
+                &failure,
+                target.options.authentication.kind(),
+                target.options.json,
+            )
+            .map_err(Into::into),
+        }
+    }
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct SessionView<'a> {
@@ -677,6 +834,7 @@ struct SessionView<'a> {
     reason_code: Option<&'a um_api::linear_authorization_session::ReasonCode>,
     authorization_url: Option<&'a str>,
     expires_at: &'a str,
+    requested_scopes: Option<Vec<&'static str>>,
     result_connection: Option<ConnectionView<'a>>,
 }
 #[derive(Serialize)]
@@ -689,6 +847,7 @@ struct ConnectionView<'a> {
     app_user_id: Option<&'a str>,
     required_scopes: Vec<&'a um_api::linear_connection::RequiredScopes>,
     granted_scopes: &'a [String],
+    state_updates_consented: bool,
     lifecycle_generation: i64,
     activation_cutoff: Option<&'a str>,
     last_error: Option<&'a um_api::linear_connection_error::LinearConnectionError>,
@@ -702,6 +861,7 @@ fn connection_view(c: &LinearConnection) -> ConnectionView<'_> {
         app_user_id: c.app_user_id.as_deref(),
         required_scopes: c.required_scopes.iter().collect(),
         granted_scopes: &c.granted_scopes,
+        state_updates_consented: c.state_updates_consented,
         lifecycle_generation: c.lifecycle_generation,
         activation_cutoff: c.activation_cutoff.as_deref(),
         last_error: c.last_error.as_deref(),
@@ -716,6 +876,17 @@ fn session_view(s: &LinearSession) -> SessionView<'_> {
         reason_code: s.reason_code.as_ref(),
         authorization_url: s.authorization_url.as_deref(),
         expires_at: &s.expires_at,
+        requested_scopes: s.requested_scopes.as_ref().map(|scopes| {
+            let mut values: Vec<_> = scopes
+                .iter()
+                .map(|scope| match scope {
+                    um_api::linear_authorization_session::RequestedScopes::Read => "read",
+                    um_api::linear_authorization_session::RequestedScopes::Write => "write",
+                })
+                .collect();
+            values.sort_unstable();
+            values
+        }),
         result_connection: s.result_connection.as_deref().map(connection_view),
     }
 }
@@ -761,6 +932,9 @@ fn session_output(
             s.id,
             s.expires_at
         )?;
+        if let Some(scopes) = session_view(s).requested_scopes {
+            writeln!(out, "requested scopes: {}", scopes.join(", "))?;
+        }
         if let Some(connection) = &s.result_connection {
             writeln!(
                 out,
@@ -827,11 +1001,12 @@ fn connection_output(
         if let Some(c) = connection {
             writeln!(
                 out,
-                "status: {}\nworkspace: {} ({})\nrequired scopes: read\ngranted scopes: {}\ngeneration: {}",
+                "status: {}\nworkspace: {} ({})\nrequired scopes: read\ngranted scopes: {}\nstate updates consented: {}\ngeneration: {}",
                 status(&c.status),
                 c.workspace_name.as_deref().unwrap_or("(none)"),
                 c.workspace_id.as_deref().unwrap_or("(none)"),
                 c.granted_scopes.join(", "),
+                c.state_updates_consented,
                 c.lifecycle_generation
             )?;
             if let Some(app_user) = &c.app_user_id {
