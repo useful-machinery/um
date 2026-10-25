@@ -780,10 +780,27 @@ pub(crate) fn assignment_prepare() -> Message {
 }
 
 pub(crate) async fn effect_acknowledgement(socket: &mut FixtureSocket) -> Value {
-    let Some(Ok(Message::Text(message))) = socket.next().await else {
-        panic!("fixture did not receive effect acknowledgement");
-    };
-    serde_json::from_str(&message).expect("decode effect acknowledgement")
+    loop {
+        let Some(Ok(Message::Text(message))) = socket.next().await else {
+            panic!("fixture did not receive effect acknowledgement");
+        };
+        let frame: Value = serde_json::from_str(&message).expect("decode runner frame");
+        if matches!(
+            frame["type"].as_str(),
+            Some("workspace_inventory" | "workspace_inventory_complete")
+        ) {
+            socket
+                .send(effect_observation_acknowledgement(
+                    frame["messageId"].as_str().unwrap(),
+                    frame["sequence"].as_u64().unwrap(),
+                ))
+                .await
+                .expect("acknowledge optional startup discovery");
+            continue;
+        }
+        assert_eq!(frame["type"], "effect_acknowledged");
+        return frame;
+    }
 }
 
 pub(crate) async fn begin_assignment_preparation(socket: &mut FixtureSocket) -> Value {

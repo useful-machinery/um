@@ -397,6 +397,72 @@ impl FixtureGrant {
 }
 
 // INV-RUNNER-13
+// REQ-WORKSPACE-40
+#[test]
+fn discovery_covers_empty_present_and_unreadable_anchors_without_claiming() {
+    let temp = private_tempdir();
+    let owner = WorkRootLease::acquire_for_test(temp.path(), BOOT_A).unwrap();
+    owner.enable_recovery(RUNNER, fixture_host()).unwrap();
+    let store = owner.recovery().unwrap();
+    let mut failures = Vec::new();
+    let (root, empty) = store
+        .discovery(|error| failures.push((error.error_type(), error.diagnostic())))
+        .unwrap();
+    assert!(empty.is_empty());
+    let original = owner
+        .create_assignment_for_attempt(ASSIGNMENT, RUN, ATTEMPT, None)
+        .unwrap();
+    AssignmentProcessGuards::durable_recovery(
+        &original.private,
+        store.host_boot().unwrap(),
+        fixture_host(),
+    )
+    .unwrap();
+    let id = store
+        .register(Origin::from_assignment(&original, BOOT_A))
+        .unwrap();
+    let (_, present) = store
+        .discovery(|error| failures.push((error.error_type(), error.diagnostic())))
+        .unwrap();
+    assert_eq!(present.len(), 1);
+    assert_eq!(present[0]["workRootId"], root);
+    assert_eq!(present[0]["workspaceId"], id);
+    assert_eq!(present[0]["presence"], "present");
+    assert_eq!(present[0]["lastClaimGeneration"], 0);
+    assert_eq!(present[0]["discovery"], true);
+    let wire = |payload: serde_json::Value, message_id: &str, sequence| {
+        um_runner_protocol::encode_runner_frame(
+            &um_runner_protocol::RunnerFrame::WorkspaceInventory {
+                envelope: um_runner_protocol::RunnerEnvelope {
+                    message_id: message_id.into(),
+                    runner_id: RUNNER.into(),
+                    boot_id: BOOT_A.into(),
+                    sequence,
+                    sent_at: "2026-10-18T00:00:00Z".into(),
+                },
+                payload,
+            },
+        )
+        .unwrap()
+    };
+    wire(present[0].clone(), "rmsg_01k0z6r1w8f4jy2m7q9v3x5abc", 2);
+    assert!(store.manifest(&id).unwrap().claim.is_none());
+    fs::remove_file(original.private.join(MANIFEST)).unwrap();
+    let (_, unavailable) = store
+        .discovery(|error| failures.push((error.error_type(), error.diagnostic())))
+        .unwrap();
+    assert_eq!(failures.len(), 1);
+    assert_eq!(failures[0].0, "local_recovery_record_invalid");
+    assert!(!failures[0].1.contains(temp.path().to_str().unwrap()));
+    assert_eq!(unavailable.len(), 1);
+    assert_eq!(unavailable[0]["workspaceId"], id);
+    assert_eq!(unavailable[0]["presence"], "unavailable");
+    assert_eq!(unavailable[0]["recoveryReason"], "recovery_record_invalid");
+    assert!(unavailable[0]["lastClaimGeneration"].is_null());
+    assert!(unavailable[0]["observedClaim"].is_null());
+    wire(unavailable[0].clone(), "rmsg_01k0z6r1w8f4jy2m7q9v3x5abd", 3);
+}
+
 #[test]
 fn missing_or_corrupt_manifest_never_recreates_a_catalog_identity() {
     let temp = private_tempdir();

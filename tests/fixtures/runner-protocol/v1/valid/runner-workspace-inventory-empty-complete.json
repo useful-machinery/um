@@ -1,0 +1,16 @@
+{
+  "protocolVersion": 1,
+  "direction": "runner_to_cloud",
+  "messageId": "rmsg_01k0z6r1w8f4jy2m7q9v3x5abd",
+  "runnerId": "rnr_01k0z6r1w8f4jy2m7q9v3x5abc",
+  "bootId": "rbt_01k0z6r1w8f4jy2m7q9v3x5abc",
+  "sequence": 2,
+  "sentAt": "2026-08-02T12:01:44Z",
+  "type": "workspace_inventory_complete",
+  "payloadVersion": 1,
+  "payload": {
+    "schemaVersion": 1,
+    "workRootId": "rwr_01k0z6r1w8f4jy2m7q9v3x5abc",
+    "inventoryThroughSequence": 0
+  }
+}

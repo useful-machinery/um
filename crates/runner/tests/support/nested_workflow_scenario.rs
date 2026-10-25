@@ -1110,7 +1110,9 @@ async fn wait_for_terminal(
                     | AssignmentObservation::LeaseRenewalRequested { .. }
                     | AssignmentObservation::WorkspaceRetention { .. }
                     | AssignmentObservation::WorkspaceRegistration { .. }
-                    | AssignmentObservation::Artifact { .. } => None,
+                    | AssignmentObservation::Artifact { .. }
+                    | AssignmentObservation::DiscoveryInventory { .. }
+                    | AssignmentObservation::DiscoveryComplete { .. } => None,
                 })
                 .collect());
         }

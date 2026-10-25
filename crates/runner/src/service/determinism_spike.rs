@@ -969,15 +969,16 @@ fn deterministic_connection_loop_dependencies(
     let frame_source = deterministic_frame_source();
     let boot_id = frame_source.public_id("rbt_");
     let (recorder, _capture) = test_recorder(&boot_id);
-    ConnectionLoopDependencies::new(
+    ConnectionLoopDependencies {
         config,
         frame_source,
         sleeper,
         recorder,
-        fixture_lease_clock(),
+        lease_clock: fixture_lease_clock(),
         boot_id,
-        None,
-    )
+        source_broker: None,
+        recovery_host: super::recovery::host_fixture::fixture_host(),
+    }
 }
 
 async fn run_deterministic_connection_loop(

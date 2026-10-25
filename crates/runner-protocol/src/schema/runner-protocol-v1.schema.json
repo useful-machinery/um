@@ -933,6 +933,7 @@
           "type": "object", "additionalProperties": false,
           "properties": {
             "schemaVersion": {"const": 1},
+            "discovery": {"const": true},
             "workRootId": {"$ref": "#/$defs/workRootId"},
             "workspaceId": {"$ref": "#/$defs/workspaceId"},
             "runId": {"$ref": "#/$defs/runId"},

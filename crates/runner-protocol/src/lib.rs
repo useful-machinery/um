@@ -41,6 +41,12 @@ pub enum RunnerFrame {
     Hello {
         envelope: RunnerEnvelope,
         runner_version: String,
+        recovery_root: Option<Value>,
+    },
+    WorkspaceInventoryComplete {
+        envelope: RunnerEnvelope,
+        work_root_id: String,
+        inventory_through_sequence: u64,
     },
     WorkspaceInventory {
         envelope: RunnerEnvelope,
@@ -790,10 +796,23 @@ pub fn encode_runner_frame(frame: &RunnerFrame) -> Result<Vec<u8>, EncodeError> 
         RunnerFrame::Hello {
             envelope,
             runner_version,
+            recovery_root,
+        } => {
+            let mut payload = json!({ "runnerVersion": runner_version });
+            if let Some(root) = recovery_root {
+                payload["workspaceRecoveryVersion"] = json!(1);
+                payload["workspaceRecoveryRoot"] = root.clone();
+            }
+            runner_frame_value(envelope, "hello", payload)
+        }
+        RunnerFrame::WorkspaceInventoryComplete {
+            envelope,
+            work_root_id,
+            inventory_through_sequence,
         } => runner_frame_value(
             envelope,
-            "hello",
-            json!({ "runnerVersion": runner_version }),
+            "workspace_inventory_complete",
+            json!({ "schemaVersion": 1, "workRootId": work_root_id, "inventoryThroughSequence": inventory_through_sequence }),
         ),
         RunnerFrame::WorkspaceInventory { envelope, payload } => {
             runner_frame_value(envelope, "workspace_inventory", payload.clone())
@@ -1218,24 +1237,17 @@ fn decode_frame(bytes: &[u8]) -> Result<ValidatedFrame, DecodeError> {
     let generated = serde_json::from_value(value).map_err(|_| DecodeError::InvalidJson)?;
 
     match generated {
-        generated::RunnerProtocolVersion1::RunnerHello(frame) => {
-            if frame.payload.workspace_recovery_version.is_some()
-                || frame.payload.workspace_recovery_root.is_some()
-            {
-                return Err(DecodeError::InvalidFrame("workspaceRecoveryVersion"));
-            }
-            validate_runner_frame(
-                &frame.protocol_version,
-                &frame.payload_version,
-                &frame.direction,
-                frame.sent_at,
-            )
-        }
+        generated::RunnerProtocolVersion1::RunnerHello(frame) => validate_runner_frame(
+            &frame.protocol_version,
+            &frame.payload_version,
+            &frame.direction,
+            frame.sent_at,
+        ),
         generated::RunnerProtocolVersion1::RunnerWorkspaceInventory(frame) => {
             validated_runner_frame!(frame)
         }
-        generated::RunnerProtocolVersion1::RunnerWorkspaceInventoryComplete(_) => {
-            Err(DecodeError::InvalidFrame("workspaceRecoveryVersion"))
+        generated::RunnerProtocolVersion1::RunnerWorkspaceInventoryComplete(frame) => {
+            validated_runner_frame!(frame)
         }
         generated::RunnerProtocolVersion1::RunnerWorkspaceRetentionReport(frame) => {
             validated_runner_frame!(frame)
@@ -2066,8 +2078,6 @@ fn unactivated_recovery_frame(value: &Value) -> bool {
     let kind = value.get("type").and_then(Value::as_str);
     let payload = value.get("payload");
     match kind {
-        Some("workspace_inventory_complete") => true,
-        Some("hello") => payload.is_some_and(|body| body.get("workspaceRecoveryVersion").is_some()),
         Some("assignment_offer") => payload
             .and_then(|body| body.get("continuation"))
             .is_some_and(|continuation| continuation.get("schemaVersion").is_some()),
@@ -2125,6 +2135,9 @@ fn validate_closed_shape(value: &Value) -> Result<(), DecodeError> {
         .ok_or(DecodeError::InvalidFrame("payload"))?;
     let payload_keys: &[&str] = match frame_type {
         "hello" => &["runnerVersion"],
+        "workspace_inventory_complete" => {
+            &["schemaVersion", "workRootId", "inventoryThroughSequence"]
+        }
         "workspace_inventory" => &[
             "schemaVersion",
             "workRootId",
@@ -2284,19 +2297,18 @@ fn validate_closed_shape(value: &Value) -> Result<(), DecodeError> {
         "assignment_release" => &["effectId", "assignmentId", "runId", "attemptId", "reason"],
         _ => return Err(DecodeError::InvalidFrame("type")),
     };
-    let continuation = frame_type == "assignment_offer" && payload.contains_key("continuation");
-    let settlement =
-        frame_type == "workspace_retention_report" && payload.contains_key("settlementSnapshot");
-    let diagnostic = matches!(
-        frame_type,
-        "execution_transition" | "execution_finished" | "execution_interrupted"
-    ) && payload.contains_key("diagnostic");
-    if payload.len()
-        != payload_keys.len()
-            + usize::from(continuation)
-            + usize::from(settlement)
-            + usize::from(diagnostic)
-        || !payload_keys.iter().all(|key| payload.contains_key(*key))
+    let optional_keys: &[&str] = match frame_type {
+        "hello" => &["workspaceRecoveryVersion", "workspaceRecoveryRoot"],
+        "workspace_inventory" => &["discovery", "diagnostic"],
+        "execution_transition" | "execution_finished" | "execution_interrupted" => &["diagnostic"],
+        "assignment_offer" => &["continuation"],
+        "workspace_retention_report" => &["settlementSnapshot"],
+        _ => &[],
+    };
+    if !payload_keys.iter().all(|key| payload.contains_key(*key))
+        || !payload.keys().all(|key| {
+            payload_keys.contains(&key.as_str()) || optional_keys.contains(&key.as_str())
+        })
     {
         return Err(DecodeError::InvalidFrame("payload"));
     }
@@ -2647,14 +2659,14 @@ mod tests {
 
     // INV-RUNNER-1
     #[test]
-    fn unactivated_recovery_wire_fixtures_remain_closed() {
+    fn discovery_wire_fixtures_are_live_without_enabling_admission() {
         for fixture in [
             include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/fixtures/runner-protocol/v1/valid/runner-recovery-hello.json")).as_slice(),
             include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/fixtures/runner-protocol/v1/valid/runner-workspace-inventory-complete.json")).as_slice(),
         ] {
             assert!(serde_json::from_slice::<generated::RunnerProtocolVersion1>(fixture).is_ok());
             let result = decode_frame(fixture);
-            assert!(matches!(result, Err(DecodeError::InvalidFrame("workspaceRecoveryVersion"))), "{:?}", result.err());
+            assert!(matches!(result, Ok(ValidatedFrame::Runner)), "{:?}", result.err());
         }
     }
 
@@ -2769,6 +2781,7 @@ mod tests {
                 sent_at: "2026-07-23T00:00:00Z".to_owned(),
             },
             runner_version: "0.2.0".to_owned(),
+            recovery_root: None,
         };
 
         let encoded = encode_runner_frame(&frame).unwrap();

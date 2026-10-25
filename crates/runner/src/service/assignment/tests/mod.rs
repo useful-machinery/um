@@ -1722,7 +1722,9 @@ async fn wait_for_terminal(manager: &mut AssignmentManager) -> Vec<ExecutionRepo
                     | AssignmentObservation::LeaseRenewalRequested { .. }
                     | AssignmentObservation::WorkspaceRetention { .. }
                     | AssignmentObservation::WorkspaceRegistration { .. }
-                    | AssignmentObservation::Artifact { .. } => None,
+                    | AssignmentObservation::Artifact { .. }
+                    | AssignmentObservation::DiscoveryInventory { .. }
+                    | AssignmentObservation::DiscoveryComplete { .. } => None,
                 })
                 .collect();
         }
@@ -5923,6 +5925,45 @@ async fn runner_reservation_consumes_carried_capacity_without_node_arithmetic() 
         Err(environment_unavailable())
     );
     assert_eq!(outbox.lock().entries.len(), 32);
+}
+
+// REQ-RUNNERENROLL-84: discovery cannot use execution's reserved slots.
+#[test]
+fn optional_discovery_leaves_outbox_capacity_for_execution() {
+    let outbox = ObservationOutbox::new();
+    for _ in 0..(MAXIMUM_SERVICE_OBSERVATIONS - OBSERVATION_RESERVE_BASE) {
+        outbox
+            .enqueue(AssignmentObservation::Execution {
+                assignment_id: "asn_01k0z6r1w8f4jy2m7q9v3x5abc".into(),
+                attempt_id: "atm_01k0z6r1w8f4jy2m7q9v3x5abc".into(),
+                report: ExecutionReport::Started,
+            })
+            .unwrap();
+    }
+    let frame: serde_json::Value = serde_json::from_str(include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../tests/fixtures/runner-protocol/v1/valid/runner-workspace-discovery-present.json"
+    )))
+    .unwrap();
+    assert!(matches!(
+        outbox.enqueue(AssignmentObservation::DiscoveryInventory {
+            payload: frame["payload"].clone(),
+        }),
+        Err(OutboxFailure::Capacity)
+    ));
+    assert!(matches!(
+        outbox.enqueue(AssignmentObservation::DiscoveryComplete {
+            work_root_id: "rwr_01k0z6r1w8f4jy2m7q9v3x5abc".into(),
+        }),
+        Err(OutboxFailure::Capacity)
+    ));
+    outbox
+        .enqueue(AssignmentObservation::Execution {
+            assignment_id: "asn_01k0z6r1w8f4jy2m7q9v3x5abc".into(),
+            attempt_id: "atm_01k0z6r1w8f4jy2m7q9v3x5abc".into(),
+            report: ExecutionReport::Started,
+        })
+        .unwrap();
 }
 
 #[test]

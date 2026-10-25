@@ -271,6 +271,12 @@ pub(in crate::service) enum AssignmentObservation {
         assignment_id: String,
         payload: serde_json::Value,
     },
+    DiscoveryInventory {
+        payload: serde_json::Value,
+    },
+    DiscoveryComplete {
+        work_root_id: String,
+    },
     WorkspaceRetention {
         assignment_id: String,
         attempt_id: String,
@@ -298,6 +304,7 @@ impl AssignmentObservation {
             | Self::WorkspaceRetention { assignment_id, .. }
             | Self::WorkspaceRegistration { assignment_id, .. } => assignment_id,
             Self::Artifact { request, .. } => request.assignment_id(),
+            Self::DiscoveryInventory { .. } | Self::DiscoveryComplete { .. } => "",
         }
     }
 
@@ -373,9 +380,16 @@ impl AssignmentObservation {
                 attempt_id,
                 report,
             } => report.runner_frame(envelope, assignment_id.clone(), attempt_id.clone()),
-            Self::WorkspaceRegistration { payload, .. } => RunnerFrame::WorkspaceInventory {
+            Self::WorkspaceRegistration { payload, .. } | Self::DiscoveryInventory { payload } => {
+                RunnerFrame::WorkspaceInventory {
+                    envelope,
+                    payload: payload.clone(),
+                }
+            }
+            Self::DiscoveryComplete { work_root_id } => RunnerFrame::WorkspaceInventoryComplete {
                 envelope,
-                payload: payload.clone(),
+                work_root_id: work_root_id.clone(),
+                inventory_through_sequence: 0, // replaced at the serialized emission boundary
             },
             Self::WorkspaceRetention {
                 assignment_id,

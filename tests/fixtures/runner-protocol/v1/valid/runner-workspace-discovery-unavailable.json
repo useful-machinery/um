@@ -1,0 +1,29 @@
+{
+  "protocolVersion": 1,
+  "direction": "runner_to_cloud",
+  "messageId": "rmsg_01k0z6r1w8f4jy2m7q9v3x5abd",
+  "runnerId": "rnr_01k0z6r1w8f4jy2m7q9v3x5abc",
+  "bootId": "rbt_01k0z6r1w8f4jy2m7q9v3x5abc",
+  "sequence": 2,
+  "sentAt": "2026-08-02T12:01:43Z",
+  "type": "workspace_inventory",
+  "payloadVersion": 1,
+  "payload": {
+    "schemaVersion": 1,
+    "discovery": true,
+    "workRootId": "rwr_01k0z6r1w8f4jy2m7q9v3x5abc",
+    "workspaceId": "rws_01k0z6r1w8f4jy2m7q9v3x5abc",
+    "runId": "run_01k0z6r1w8f4jy2m7q9v3x5abc",
+    "priorAttemptId": "atm_01k0z6r1w8f4jy2m7q9v3x5abc",
+    "priorAssignmentId": "asn_01k0z6r1w8f4jy2m7q9v3x5abc",
+    "originRunnerBootId": "rbt_01k0z6r1w8f4jy2m7q9v3x5abc",
+    "originAssignmentId": "asn_01k0z6r1w8f4jy2m7q9v3x5abc",
+    "originAttemptId": "atm_01k0z6r1w8f4jy2m7q9v3x5abc",
+    "executionRoot": "/retained/work",
+    "observedClaim": null,
+    "lastClaimGeneration": null,
+    "presence": "unavailable",
+    "recoveryReason": "recovery_record_invalid",
+    "diagnostic": {"stage": "record_open"}
+  }
+}

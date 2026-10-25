@@ -255,6 +255,9 @@ impl<'a> ProtocolLog<'a> {
             RunnerFrame::WorkspaceInventory { envelope, .. } => {
                 (envelope, "workspace_inventory", None, None)
             }
+            RunnerFrame::WorkspaceInventoryComplete { envelope, .. } => {
+                (envelope, "workspace_inventory_complete", None, None)
+            }
             RunnerFrame::WorkspaceRetentionReport {
                 envelope,
                 assignment_id,
@@ -1391,6 +1394,9 @@ enum PendingObservationKind {
     AssignmentObservation {
         id: u64,
     },
+    Discovery {
+        id: u64,
+    },
     WorkspaceRegistration {
         id: u64,
         work_root_id: String,
@@ -2118,7 +2124,8 @@ where
                 .filter_map(|pending| match &pending.kind {
                     PendingObservationKind::AssignmentObservation { id }
                     | PendingObservationKind::WorkspaceRegistration { id, .. }
-                    | PendingObservationKind::ArtifactObservation { id, .. } => Some(*id),
+                    | PendingObservationKind::ArtifactObservation { id, .. }
+                    | PendingObservationKind::Discovery { id } => Some(*id),
                     PendingObservationKind::EffectReceipt => None,
                 })
                 .collect();
@@ -2485,7 +2492,8 @@ where
                             ConnectionCause::UnexpectedObservationAcknowledgement,
                         ));
                     }
-                    PendingObservationKind::AssignmentObservation { id } => {
+                    PendingObservationKind::AssignmentObservation { id }
+                    | PendingObservationKind::Discovery { id } => {
                         assignment_manager
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -2792,6 +2800,10 @@ where
     W: Sink<Message, Error = WebSocketError> + Unpin,
 {
     let kind = match &pending.observation {
+        AssignmentObservation::DiscoveryInventory { .. }
+        | AssignmentObservation::DiscoveryComplete { .. } => {
+            PendingObservationKind::Discovery { id: pending.id }
+        }
         AssignmentObservation::WorkspaceRegistration { payload, .. } => {
             PendingObservationKind::WorkspaceRegistration {
                 id: pending.id,
@@ -2825,7 +2837,26 @@ where
     };
     let sequence = envelope.sequence;
     let message_id = envelope.message_id.clone();
-    let frame = pending.observation.runner_frame(envelope.clone());
+    let mut frame = pending.observation.runner_frame(envelope.clone());
+    if matches!(
+        pending.observation,
+        AssignmentObservation::DiscoveryInventory { .. }
+    ) {
+        assignment_manager
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .mark_discovery_inventory(envelope.sequence);
+    }
+    if let RunnerFrame::WorkspaceInventoryComplete {
+        inventory_through_sequence,
+        ..
+    } = &mut frame
+    {
+        *inventory_through_sequence = assignment_manager
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .discovery_watermark();
+    }
     let encoded = match pending.retained_frame {
         Some(retained) => retained.encoded,
         None => {
@@ -2955,6 +2986,29 @@ where
     })
 }
 
+pub(crate) fn recovery_hello(
+    mut encoded: Vec<u8>,
+    root: Option<serde_json::Value>,
+) -> Result<Vec<u8>, ConnectionError> {
+    if let Some(root) = root {
+        let mut frame: serde_json::Value = serde_json::from_slice(&encoded).map_err(|_| {
+            ConnectionError::terminal(
+                ConnectionProgress::unacknowledged(),
+                ConnectionCause::EncodeOpeningHello,
+            )
+        })?;
+        frame["payload"]["workspaceRecoveryVersion"] = serde_json::json!(1);
+        frame["payload"]["workspaceRecoveryRoot"] = root;
+        encoded = serde_json::to_vec(&frame).map_err(|_| {
+            ConnectionError::terminal(
+                ConnectionProgress::unacknowledged(),
+                ConnectionCause::EncodeOpeningHello,
+            )
+        })?;
+    }
+    Ok(encoded)
+}
+
 pub(crate) fn opening_hello(
     frame_source: &dyn FrameSource,
     runner_id: &str,
@@ -2978,6 +3032,7 @@ pub(crate) fn opening_hello(
             sent_at,
         },
         runner_version: runner_version.to_owned(),
+        recovery_root: None,
     })
     .map_err(|_| {
         ConnectionError::terminal(
@@ -3268,6 +3323,95 @@ mod tests {
             );
         }
         window
+    }
+
+    #[tokio::test]
+    async fn discovery_completion_follows_acknowledged_inventory_and_uses_its_wire_sequence() {
+        let context = EstablishedTestContext::new();
+        let root = "rwr_01k0z6r1w8f4jy2m7q9v3x5abc";
+        let fixture: serde_json::Value = serde_json::from_str(include_str!("../../../../tests/fixtures/runner-protocol/v1/valid/runner-workspace-discovery-unavailable.json")).unwrap();
+        context
+            .assignment_manager
+            .lock()
+            .unwrap()
+            .begin_discovery(root.into(), vec![fixture["payload"].clone()]);
+        let mut next_sequence = 2;
+        let (inbound, mut outbound, established) =
+            established_fixture(&context, &mut next_sequence);
+        let peer = async {
+            let _opening = with_watchdog(outbound.recv()).await.expect("opening hello");
+            inbound.send(welcome());
+            inbound.send(observation_acknowledgement(OPENING_MESSAGE_ID, 1));
+            let Some(Message::Text(first)) =
+                with_watchdog(outbound.recv()).await.expect("discovery")
+            else {
+                panic!("missing discovery")
+            };
+            let first: serde_json::Value = serde_json::from_str(&first).unwrap();
+            assert_eq!(first["type"], "workspace_inventory");
+            assert_eq!(first["payload"]["presence"], "unavailable");
+            assert!(first["payload"]["lastClaimGeneration"].is_null());
+            inbound.send(observation_acknowledgement(
+                first["messageId"].as_str().unwrap(),
+                first["sequence"].as_u64().unwrap(),
+            ));
+            let Some(Message::Text(last)) =
+                with_watchdog(outbound.recv()).await.expect("completion")
+            else {
+                panic!("missing completion")
+            };
+            let last: serde_json::Value = serde_json::from_str(&last).unwrap();
+            assert_eq!(last["type"], "workspace_inventory_complete");
+            assert_eq!(
+                last["payload"]["inventoryThroughSequence"],
+                first["sequence"]
+            );
+            inbound.send(observation_acknowledgement(
+                last["messageId"].as_str().unwrap(),
+                last["sequence"].as_u64().unwrap(),
+            ));
+            inbound.send(Message::Close(None));
+        };
+        let (outcome, ()) = with_watchdog(async { tokio::join!(established, peer) })
+            .await
+            .expect("discovery transport");
+        outcome.expect("discovery transport closed unexpectedly");
+    }
+
+    #[tokio::test]
+    async fn empty_discovery_marks_zero_without_inventing_an_inventory_entry() {
+        let context = EstablishedTestContext::new();
+        context
+            .assignment_manager
+            .lock()
+            .unwrap()
+            .begin_discovery("rwr_01k0z6r1w8f4jy2m7q9v3x5abc".into(), vec![]);
+        let mut next_sequence = 2;
+        let (inbound, mut outbound, established) =
+            established_fixture(&context, &mut next_sequence);
+        let peer = async {
+            let _opening = with_watchdog(outbound.recv()).await.expect("opening hello");
+            inbound.send(welcome());
+            inbound.send(observation_acknowledgement(OPENING_MESSAGE_ID, 1));
+            let Some(Message::Text(marker)) = with_watchdog(outbound.recv())
+                .await
+                .expect("empty completion")
+            else {
+                panic!("missing empty marker")
+            };
+            let marker: serde_json::Value = serde_json::from_str(&marker).unwrap();
+            assert_eq!(marker["type"], "workspace_inventory_complete");
+            assert_eq!(marker["payload"]["inventoryThroughSequence"], 0);
+            inbound.send(observation_acknowledgement(
+                marker["messageId"].as_str().unwrap(),
+                marker["sequence"].as_u64().unwrap(),
+            ));
+            inbound.send(Message::Close(None));
+        };
+        let (outcome, ()) = with_watchdog(async { tokio::join!(established, peer) })
+            .await
+            .expect("empty transport");
+        outcome.expect("empty transport closed unexpectedly");
     }
 
     #[tokio::test]

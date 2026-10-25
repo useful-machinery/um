@@ -235,28 +235,7 @@ struct ConnectionLoopDependencies {
     lease_clock: LeaseClock,
     boot_id: String,
     source_broker: Option<Arc<dyn source::SourceCredentialBroker>>,
-}
-
-impl ConnectionLoopDependencies {
-    fn new(
-        config: Config,
-        frame_source: Arc<dyn FrameSource>,
-        sleeper: Arc<dyn Sleeper>,
-        recorder: Arc<Recorder>,
-        lease_clock: LeaseClock,
-        boot_id: String,
-        source_broker: Option<Arc<dyn source::SourceCredentialBroker>>,
-    ) -> Self {
-        Self {
-            config,
-            frame_source,
-            sleeper,
-            recorder,
-            lease_clock,
-            boot_id,
-            source_broker,
-        }
-    }
+    recovery_host: Arc<dyn recovery::RecoveryHost>,
 }
 
 #[derive(Debug)]
@@ -368,15 +347,16 @@ async fn run_until_cancelled(config: Config, service_version: &str) -> Result<()
     let lease_clock = LeaseClock::system().map_err(ServiceError::LeaseClock)?;
     let mut shutdown = ProcessShutdown::new()?;
     run_connection_loop(
-        ConnectionLoopDependencies::new(
+        ConnectionLoopDependencies {
             config,
             frame_source,
             sleeper,
             recorder,
             lease_clock,
             boot_id,
-            None,
-        ),
+            source_broker: None,
+            recovery_host: Arc::new(recovery::SystemRecoveryHost),
+        },
         &WebSocketConnector,
         Backoff::new(),
         &mut shutdown,
@@ -396,7 +376,7 @@ async fn run_until_cancelled_with_dependencies(
     let boot_id = frame_source.public_id("rbt_");
     let lease_clock = LeaseClock::system().map_err(ServiceError::LeaseClock)?;
     run_connection_loop_with_filesystem(
-        ConnectionLoopDependencies::new(
+        ConnectionLoopDependencies {
             config,
             frame_source,
             sleeper,
@@ -404,7 +384,8 @@ async fn run_until_cancelled_with_dependencies(
             lease_clock,
             boot_id,
             source_broker,
-        ),
+            recovery_host: recovery::host_fixture::fixture_host(),
+        },
         &WebSocketConnector,
         Backoff::new(),
         shutdown.as_mut(),
@@ -472,43 +453,21 @@ where
     // Recovery is optional for ordinary work. An invalid/missing host binding
     // cannot be treated as a newly initialized recovery root on this boot.
     let recovery_root = Arc::clone(&work_root);
+    let recovery_host = Arc::clone(&dependencies.recovery_host);
     let runner_id = dependencies.config.credential().runner_id().to_owned();
     let recovery_recorder = Arc::clone(&dependencies.recorder);
-    // Detached optional bookkeeping never delays the ordinary start handshake.
-    // A first assignment arriving before this completes uses the boot-only format.
-    tokio::task::spawn_blocking(move || {
-        if let Err(error) =
-            recovery_root.enable_recovery(&runner_id, Arc::new(recovery::SystemRecoveryHost))
-        {
+    // Verify before advertising a root. Failure is optional for ordinary
+    // work, but must not be reported as an exhaustive inventory.
+    let _ = tokio::task::spawn_blocking(move || {
+        if let Err(error) = recovery_root.enable_recovery(&runner_id, recovery_host) {
             record_optional_recovery_failure(
                 &recovery_recorder,
                 error.error_type(),
                 error.diagnostic(),
             );
-        } else if let Some(store) = recovery_root.recovery() {
-            match store.catalog() {
-                Ok(catalog) => {
-                    for workspace_id in catalog {
-                        let verified = store
-                            .manifest(&workspace_id)
-                            .and_then(|manifest| store.private_by_attempt(&manifest));
-                        if let Err(error) = verified {
-                            record_optional_recovery_failure(
-                                &recovery_recorder,
-                                error.error_type(),
-                                error.diagnostic(),
-                            );
-                        }
-                    }
-                }
-                Err(error) => record_optional_recovery_failure(
-                    &recovery_recorder,
-                    error.error_type(),
-                    error.diagnostic(),
-                ),
-            }
         }
-    });
+    })
+    .await;
     record_startup_retention(&dependencies.recorder, work_root.startup_retained());
     let result = run_connection_loop_with_work_root(
         dependencies,
@@ -539,7 +498,23 @@ async fn run_connection_loop_with_work_root(
         lease_clock,
         boot_id,
         source_broker,
+        recovery_host: _,
     } = dependencies;
+    let recovery_root = Arc::clone(&work_root);
+    let discovery_recorder = Arc::clone(&recorder);
+    let discovery = tokio::task::spawn_blocking(move || {
+        recovery_root.recovery().map(|store| {
+            store.discovery(|error| {
+                record_optional_recovery_failure(
+                    &discovery_recorder,
+                    error.error_type(),
+                    error.diagnostic(),
+                );
+            })
+        })
+    })
+    .await
+    .map_err(|_| ServiceError::BuildRuntime)?;
     let assignment_dependencies = AssignmentDependencies::production(
         &config,
         &boot_id,
@@ -553,6 +528,21 @@ async fn run_connection_loop_with_work_root(
         lease_clock,
         assignment_dependencies,
     )));
+    // Keep the manager's large owned state off the connection future's stack
+    // across later await points. The local scan ran off the current-thread runtime.
+    {
+        let mut manager = assignment_manager
+            .lock()
+            .map_err(|_| ServiceError::AssignmentShutdown)?;
+        match discovery {
+            Some(Ok((root, entries))) => manager.begin_discovery(root, entries),
+            Some(Err(error)) => {
+                record_optional_recovery_failure(&recorder, error.error_type(), error.diagnostic());
+                manager.unavailable_discovery();
+            }
+            None => manager.unavailable_discovery(),
+        }
+    }
     let live_status = Arc::new(LiveStatus::new(
         boot_id.clone(),
         config.credential().credential_id().to_owned(),
@@ -585,13 +575,20 @@ async fn run_connection_loop_with_work_root(
     let mut opening_sequence = 1;
     let sequence = Sequence::new(2);
     let mut opening_message_id = frame_source.public_id("rmsg_");
-    let mut opening = opening_hello(
-        frame_source.as_ref(),
-        config.credential().runner_id(),
-        &boot_id,
-        opening_message_id.clone(),
-        opening_sequence,
-        recorder.service_version(),
+    let mut opening = connection::recovery_hello(
+        opening_hello(
+            frame_source.as_ref(),
+            config.credential().runner_id(),
+            &boot_id,
+            opening_message_id.clone(),
+            opening_sequence,
+            recorder.service_version(),
+        )
+        .map_err(ServiceError::Connection)?,
+        assignment_manager
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .recovery_root(),
     )
     .map_err(ServiceError::Connection)?;
     let mut attempt = 1_u64;
@@ -946,13 +943,20 @@ async fn run_connection_loop_with_work_root(
         if progress.opening_acknowledged {
             opening_message_id = frame_source.public_id("rmsg_");
             opening_sequence = sequence.next().map_err(ServiceError::Connection)?;
-            opening = opening_hello(
-                frame_source.as_ref(),
-                config.credential().runner_id(),
-                &boot_id,
-                opening_message_id.clone(),
-                opening_sequence,
-                recorder.service_version(),
+            opening = connection::recovery_hello(
+                opening_hello(
+                    frame_source.as_ref(),
+                    config.credential().runner_id(),
+                    &boot_id,
+                    opening_message_id.clone(),
+                    opening_sequence,
+                    recorder.service_version(),
+                )
+                .map_err(ServiceError::Connection)?,
+                assignment_manager
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .recovery_root(),
             )
             .map_err(ServiceError::Connection)?;
         }
@@ -1295,13 +1299,20 @@ impl ReloadDependencies {
             .next()
             .map_err(|error| candidate_control_error(&connection_event, error))?;
         let opening_message_id = self.frame_source.public_id("rmsg_");
-        let opening = opening_hello(
-            self.frame_source.as_ref(),
-            config.credential().runner_id(),
-            &self.boot_id,
-            opening_message_id.clone(),
-            opening_sequence,
-            self.recorder.service_version(),
+        let opening = connection::recovery_hello(
+            opening_hello(
+                self.frame_source.as_ref(),
+                config.credential().runner_id(),
+                &self.boot_id,
+                opening_message_id.clone(),
+                opening_sequence,
+                self.recorder.service_version(),
+            )
+            .map_err(|error| candidate_control_error(&connection_event, error))?,
+            self.assignment_manager
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .recovery_root(),
         )
         .map_err(|error| candidate_control_error(&connection_event, error))?;
         let candidate = connection::authenticate_candidate(
@@ -1814,15 +1825,16 @@ mod tests {
         let boot_id = frame_source.public_id("rbt_");
         let (recorder, _capture) = test_recorder(&boot_id);
         let (sleeper, _sleep_requests) = controlled_sleeper();
-        let dependencies = ConnectionLoopDependencies::new(
-            config.cloned_config(),
+        let dependencies = ConnectionLoopDependencies {
+            config: config.cloned_config(),
             frame_source,
             sleeper,
             recorder,
-            fixture_lease_clock(),
-            boot_id.clone(),
-            None,
-        );
+            lease_clock: fixture_lease_clock(),
+            boot_id: boot_id.clone(),
+            source_broker: None,
+            recovery_host: super::recovery::host_fixture::fixture_host(),
+        };
         let remover = Arc::new(FailingBootRemover {
             calls: AtomicUsize::new(0),
         });
@@ -3393,6 +3405,91 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn empty_scan_keeps_verified_root_with_pending_or_acknowledged_completion() {
+        for acknowledge in [false, true] {
+            let (listener, endpoint) = fixture_listener().await;
+            let (disconnected, observed_disconnect) = tokio::sync::oneshot::channel();
+            let server = tokio::spawn(async move {
+                let mut socket = accept_fixture_socket(&listener).await;
+                let Some(Ok(Message::Text(first))) = socket.next().await else {
+                    panic!("missing opening hello")
+                };
+                let first: serde_json::Value = serde_json::from_str(&first).unwrap();
+                let root = &first["payload"]["workspaceRecoveryRoot"];
+                assert_eq!(root["bindingState"], "verified");
+                socket.send(welcome()).await.unwrap();
+                socket
+                    .send(observation_acknowledgement(
+                        first["messageId"].as_str().unwrap(),
+                        first["sequence"].as_u64().unwrap(),
+                    ))
+                    .await
+                    .unwrap();
+                let Some(Ok(Message::Text(marker))) = socket.next().await else {
+                    panic!("missing empty inventory completion")
+                };
+                let marker: serde_json::Value = serde_json::from_str(&marker).unwrap();
+                assert_eq!(marker["type"], "workspace_inventory_complete");
+                assert_eq!(marker["payload"]["inventoryThroughSequence"], 0);
+                if acknowledge {
+                    socket
+                        .send(observation_acknowledgement(
+                            marker["messageId"].as_str().unwrap(),
+                            marker["sequence"].as_u64().unwrap(),
+                        ))
+                        .await
+                        .unwrap();
+                    // Pong is a causal barrier: the runner processed the
+                    // preceding acknowledgement before this disconnect.
+                    socket
+                        .send(Message::Ping(b"scan-ack".to_vec().into()))
+                        .await
+                        .unwrap();
+                    let Some(Ok(Message::Pong(payload))) = socket.next().await else {
+                        panic!("runner did not process completed scan ack")
+                    };
+                    assert_eq!(payload.as_ref(), b"scan-ack");
+                }
+                drop(socket);
+                disconnected.send(()).unwrap();
+
+                let mut socket = accept_fixture_socket(&listener).await;
+                let Some(Ok(Message::Text(second))) = socket.next().await else {
+                    panic!("missing reconnect hello")
+                };
+                let second: serde_json::Value = serde_json::from_str(&second).unwrap();
+                assert_eq!(second["type"], "hello");
+                assert_eq!(second["payload"]["workspaceRecoveryRoot"], *root);
+                assert!(
+                    second["sequence"].as_u64().unwrap() > marker["sequence"].as_u64().unwrap()
+                );
+                if !acknowledge {
+                    socket.send(welcome()).await.unwrap();
+                    socket
+                        .send(observation_acknowledgement(
+                            second["messageId"].as_str().unwrap(),
+                            second["sequence"].as_u64().unwrap(),
+                        ))
+                        .await
+                        .unwrap();
+                    let Some(Ok(Message::Text(replayed))) = socket.next().await else {
+                        panic!("pending completion was not replayed")
+                    };
+                    let replayed: serde_json::Value = serde_json::from_str(&replayed).unwrap();
+                    assert_eq!(replayed, marker);
+                }
+            });
+            let (sleeper, mut sleep_requests) = controlled_sleeper();
+            let (service, _capture, _shutdown) = spawn_fixture_service(&endpoint, sleeper);
+            with_watchdog(observed_disconnect).await.unwrap().unwrap();
+            backoff_request(&mut sleep_requests).await.1.release();
+            let result = with_watchdog(server).await;
+            abort_service(service).await;
+            result.unwrap().unwrap();
+        }
+    }
+
+    #[tokio::test]
     async fn projects_resolved_build_version_across_initial_and_reconnect_telemetry() {
         let (listener, endpoint) = fixture_listener().await;
         let (failure_sent, failure_received) = tokio::sync::oneshot::channel();
@@ -3418,6 +3515,10 @@ mod tests {
                 .as_u64()
                 .expect("first opening sequence");
             assert_eq!(first_sequence, 1);
+            assert_eq!(
+                first_hello["payload"]["workspaceRecoveryRoot"]["bindingState"],
+                "verified"
+            );
 
             socket.send(welcome()).await.expect("send welcome");
             socket
@@ -3432,14 +3533,15 @@ mod tests {
                 .await
                 .expect("send assignment offer");
             let effect_acknowledgement = effect_acknowledgement(&mut socket).await;
-            assert_eq!(effect_acknowledgement["sequence"], 2);
+            let effect_sequence = effect_acknowledgement["sequence"].as_u64().unwrap();
+            assert!(effect_sequence >= 2);
             let Some(Ok(Message::Text(preparing))) = socket.next().await else {
                 panic!("fixture did not receive assignment preparation acknowledgement");
             };
             let preparing: serde_json::Value =
                 serde_json::from_str(&preparing).expect("decode assignment preparation");
             assert_eq!(preparing["type"], "assignment_preparing");
-            assert_eq!(preparing["sequence"], 3);
+            assert_eq!(preparing["sequence"], effect_sequence + 1);
 
             failure_sent
                 .send(())
@@ -3452,10 +3554,19 @@ mod tests {
             };
             let second_hello: serde_json::Value =
                 serde_json::from_str(&second_hello).expect("decode replacement opening hello");
-            assert_eq!(second_hello["messageId"], "rmsg_00000000000000000000000005");
+            assert!(
+                second_hello["messageId"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("rmsg_")
+            );
             assert_ne!(second_hello["messageId"], first_message_id);
-            assert_eq!(second_hello["sequence"], 4);
+            assert_eq!(second_hello["sequence"], effect_sequence + 2);
             assert_eq!(second_hello["sentAt"], "2026-07-23T00:00:00Z");
+            assert_eq!(
+                second_hello["payload"]["workspaceRecoveryRoot"],
+                first_hello["payload"]["workspaceRecoveryRoot"]
+            );
             assert_eq!(
                 second_hello["payload"]["runnerVersion"],
                 crate::telemetry::TEST_SERVICE_VERSION
@@ -3496,8 +3607,9 @@ mod tests {
         );
         assert_eq!(event["um.runner.opening_acknowledged"], true);
         assert_eq!(event["um.runner.handshake_completed"], true);
-        assert_eq!(event["um.cloud.text_frames_received"], 3);
-        assert_eq!(event["um.runner.text_frames_sent"], 3);
+        let sent = event["um.runner.text_frames_sent"].as_u64().unwrap();
+        assert!((3..=4).contains(&sent)); // verified roots also send an empty discovery marker
+        assert_eq!(event["um.cloud.text_frames_received"], sent);
         assert_eq!(event["um.runner.effects_received"], 1);
         assert_eq!(event["um.runner.effect_acknowledgements_confirmed"], 0);
         assert_eq!(
@@ -3613,13 +3725,21 @@ mod tests {
                 .await
                 .expect("send assignment offer");
             let _acknowledgement = effect_acknowledgement(&mut socket).await;
-            let pending_liveness_timer =
-                sleep_request(&mut sleep_requests, Duration::from_secs(2)).await;
             drop(second_liveness_timer);
-            pending_liveness_timer.release();
-
-            let close = expect_close_frame(&mut socket).await;
-            assert_eq!(close.code, CloseCode::Away);
+            // A verified startup root adds a discovery-ack liveness timer;
+            // drive all pending timers until the unacknowledged effect closes.
+            let mut close = Box::pin(expect_close_frame(&mut socket));
+            for _ in 0..3 {
+                tokio::select! {
+                    frame = &mut close => {
+                        assert_eq!(frame.code, CloseCode::Away);
+                        return sleep_requests;
+                    }
+                    timer = sleep_request(&mut sleep_requests, Duration::from_secs(2)) => timer.release(),
+                }
+            }
+            let frame = close.await;
+            assert_eq!(frame.code, CloseCode::Away);
             sleep_requests
         });
 

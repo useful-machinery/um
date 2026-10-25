@@ -743,6 +743,72 @@ impl RecoveryStore {
         })
     }
 
+    /// Snapshot only cataloged identities. A bad anchor remains visible as an
+    /// unavailable observation; a bad catalog aborts the entire scan.
+    pub(super) fn discovery(
+        &self,
+        mut on_unavailable: impl FnMut(&RecoveryError),
+    ) -> Result<(String, Vec<serde_json::Value>), RecoveryError> {
+        let root = self.root()?;
+        let mut observations = Vec::with_capacity(root.catalog.len());
+        for entry in &root.catalog {
+            let verified = self.manifest(&entry.workspace_id).and_then(|manifest| {
+                self.private_by_attempt(&manifest)?;
+                let prior = manifest
+                    .lineage
+                    .last()
+                    .cloned()
+                    .ok_or_else(|| invalid("lineage"))?;
+                Ok((manifest, prior))
+            });
+            let (prior, claim, generation, presence, reason) = match verified {
+                Ok((manifest, prior)) => (
+                    prior,
+                    serde_json::json!(manifest.claim),
+                    serde_json::json!(manifest.last_claim_generation),
+                    "present",
+                    serde_json::Value::Null,
+                ),
+                Err(error) => {
+                    let reason = if self.origin_assignment_absent(entry) {
+                        "workspace_not_found"
+                    } else {
+                        "recovery_record_invalid"
+                    };
+                    // The catalog's origin is the only trustworthy identity when
+                    // the manifest or inherited process journal cannot be read.
+                    let prior = Link {
+                        boot_id: entry.origin_boot_id.clone(),
+                        assignment_id: entry.origin_assignment_id.clone(),
+                        run_id: entry.origin_run_id.clone(),
+                        attempt_id: entry.origin_attempt_id.clone(),
+                    };
+                    on_unavailable(&error); // only classified safe facts reach local telemetry
+                    (
+                        prior,
+                        serde_json::Value::Null,
+                        serde_json::Value::Null,
+                        "unavailable",
+                        serde_json::json!(reason),
+                    )
+                }
+            };
+            observations.push(serde_json::json!({
+                "schemaVersion": 1, "discovery": true, "workRootId": root.work_root_id,
+                "workspaceId": entry.workspace_id, "runId": entry.origin_run_id,
+                "priorAttemptId": prior.attempt_id, "priorAssignmentId": prior.assignment_id,
+                "originRunnerBootId": entry.origin_boot_id,
+                "originAssignmentId": entry.origin_assignment_id,
+                "originAttemptId": entry.origin_attempt_id,
+                "executionRoot": entry.execution_root, "observedClaim": claim,
+                "lastClaimGeneration": generation, "presence": presence,
+                "recoveryReason": reason
+            }));
+        }
+        Ok((root.work_root_id, observations))
+    }
+
+    #[cfg(all(test, target_os = "linux"))]
     pub(super) fn catalog(&self) -> Result<Vec<String>, RecoveryError> {
         Ok(self
             .root()?

@@ -780,12 +780,58 @@ impl AssignmentManager {
         Ok(())
     }
 
+    pub(in crate::service) fn recovery_root(&self) -> Option<Value> {
+        self.recovery_root.clone()
+    }
+
+    pub(in crate::service) fn begin_discovery(&mut self, root: String, entries: Vec<Value>) {
+        self.recovery_root = Some(
+            serde_json::json!({"bindingState":"verified", "workRootId":root, "recoveryReason":null}),
+        );
+        self.discovery = entries
+            .into_iter()
+            .map(|payload| AssignmentObservation::DiscoveryInventory { payload })
+            .collect();
+        self.discovery
+            .push_back(AssignmentObservation::DiscoveryComplete { work_root_id: root });
+        self.queue_next_discovery();
+    }
+
+    pub(in crate::service) fn unavailable_discovery(&mut self) {
+        self.recovery_root = Some(
+            serde_json::json!({"bindingState":"unavailable", "workRootId":null, "recoveryReason":"root_identity_unavailable"}),
+        );
+    }
+
+    fn queue_next_discovery(&mut self) {
+        if self
+            .discovery
+            .front()
+            .cloned()
+            .is_some_and(|observation| self.outbox.enqueue(observation).is_ok())
+        {
+            self.discovery.pop_front();
+        }
+        // On capacity pressure leave the rest queued, never emit completion.
+    }
+
+    pub(in crate::service) fn discovery_watermark(&self) -> u64 {
+        self.discovery_through_sequence
+    }
+
+    pub(in crate::service) fn mark_discovery_inventory(&mut self, sequence: u64) {
+        self.discovery_through_sequence = sequence;
+    }
+
     pub(in crate::service) fn pending_observations(
         &mut self,
         in_flight: &BTreeSet<u64>,
         limit: usize,
     ) -> Vec<PendingAssignmentObservation> {
         self.drain_events();
+        if !self.discovery.is_empty() {
+            self.queue_next_discovery();
+        }
         self.outbox.pending(in_flight, limit)
     }
 
@@ -799,6 +845,13 @@ impl AssignmentManager {
         let Some(observation) = self.outbox.acknowledge(id) else {
             return;
         };
+        if matches!(
+            observation,
+            AssignmentObservation::DiscoveryInventory { .. }
+                | AssignmentObservation::DiscoveryComplete { .. }
+        ) {
+            self.queue_next_discovery();
+        }
         if let AssignmentObservation::Artifact {
             delivery_id,
             request: ArtifactRequest::ConfirmResult { .. },

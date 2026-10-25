@@ -81,11 +81,13 @@ impl ObservationOutbox {
         let retained_bytes = state.entries.iter().try_fold(0_u64, |total, entry| {
             total.checked_add(u64::try_from(entry.encoded_bytes).ok()?)
         });
-        // An optional registration may be dropped rather than consuming the
-        // slots and bytes reserved for mandatory execution observations.
+        // Optional registration and discovery may wait rather than consume
+        // the slots and bytes reserved for mandatory execution observations.
         let optional = matches!(
             observation,
             AssignmentObservation::WorkspaceRegistration { .. }
+                | AssignmentObservation::DiscoveryInventory { .. }
+                | AssignmentObservation::DiscoveryComplete { .. }
         );
         if state.entries.len() == MAXIMUM_SERVICE_OBSERVATIONS
             || (optional
