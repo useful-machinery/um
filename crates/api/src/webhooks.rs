@@ -506,6 +506,11 @@ fn valid_delivery(value: &WebhookDelivery) -> bool {
             | "step.cancelled"
             | "step.blocked"
             | "step.not_run"
+            | "publication.published"
+            | "publication.no_changes"
+            | "publication.already_merged"
+            | "publication.failed"
+            | "publication.unavailable"
     );
     let step = value.event_type.starts_with("step.");
     um_support::valid_typed_id(&value.id, "whd_")

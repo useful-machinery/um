@@ -972,6 +972,11 @@ fn acquire(path: &Path, patch: bool, credential_stdin: bool) -> anyhow::Result<M
                         "step.cancelled",
                         "step.blocked",
                         "step.not_run",
+                        "publication.published",
+                        "publication.no_changes",
+                        "publication.already_merged",
+                        "publication.failed",
+                        "publication.unavailable",
                     ]
                     .contains(&entry.as_str().unwrap_or(""))
                     {
