@@ -752,12 +752,19 @@ fn captured_requests(path: &Path) -> Vec<Value> {
         .collect()
 }
 
+async fn with_watchdog<Output>(future: impl Future<Output = Output>) -> Output {
+    with_watchdog_limit(future, Duration::from_secs(10)).await
+}
+
 #[expect(
     clippy::disallowed_methods,
     reason = "real time bounds fixture hangs but never makes an assertion safe"
 )]
-async fn with_watchdog<Output>(future: impl Future<Output = Output>) -> Output {
-    tokio::time::timeout(Duration::from_secs(10), future)
+async fn with_watchdog_limit<Output>(
+    future: impl Future<Output = Output>,
+    limit: Duration,
+) -> Output {
+    tokio::time::timeout(limit, future)
         .await
         .expect("CodexAppServerV1 fixture watchdog expired")
 }
@@ -4192,34 +4199,40 @@ for line in sys.stdin:
     #[tokio::test]
     #[ignore = "requires pinned harness"]
     async fn pinned_real_codex_structured_result_is_corrected_once_and_settles() {
-        with_watchdog(async {
-            let mut provider = LoopbackResponsesProvider::start_sequence(&[
-                r#"{"result":"-1"}"#,
-                r#"{"result":"7"}"#,
-            ])
-            .await;
-            let fixture = ProcessFixture::with_exact_binary(
-                provider.address,
-                result_mode(json!({
-                    "$schema": "https://json-schema.org/draft/2020-12/schema",
-                    "type": "integer",
-                    "minimum": 1,
-                })),
-            );
-            let run = tokio::spawn(run_fixture(fixture));
+        // Two native turns, process teardown and schema validation share this bound.
+        // The ordinary single-turn/fake-fixture watchdog remains ten seconds.
+        with_watchdog_limit(
+            async {
+                let mut provider = LoopbackResponsesProvider::start_sequence(&[
+                    r#"{"result":"-1"}"#,
+                    r#"{"result":"7"}"#,
+                ])
+                .await;
+                let fixture = ProcessFixture::with_exact_binary(
+                    provider.address,
+                    result_mode(json!({
+                        "$schema": "https://json-schema.org/draft/2020-12/schema",
+                        "type": "integer",
+                        "minimum": 1,
+                    })),
+                );
+                let run = tokio::spawn(run_fixture(fixture));
 
-            for _ in 0..2 {
-                assert_eq!(provider.next_request().await.path, "/responses");
-            }
-            let (_, outcome, started) = run.await.unwrap();
+                for _ in 0..2 {
+                    assert_eq!(provider.next_request().await.path, "/responses");
+                }
+                let (_, outcome, started) = run.await.unwrap();
 
-            assert!(started, "exact Codex outcome: {outcome:?}");
-            let AgentOutcome::Completed(CompletedAgentInvocation::Result(result)) = outcome else {
-                panic!("exact Codex must complete one corrected result: {outcome:?}");
-            };
-            assert_eq!(result.value(), &json!(7));
-            provider.shutdown().await;
-        })
+                assert!(started, "exact Codex outcome: {outcome:?}");
+                let AgentOutcome::Completed(CompletedAgentInvocation::Result(result)) = outcome
+                else {
+                    panic!("exact Codex must complete one corrected result: {outcome:?}");
+                };
+                assert_eq!(result.value(), &json!(7));
+                provider.shutdown().await;
+            },
+            Duration::from_secs(30),
+        )
         .await;
     }
 

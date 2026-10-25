@@ -16,7 +16,7 @@ use crate::process::CommandRunner;
 use crate::process::{CommandOutput, SystemCommandRunner};
 
 pub const CLAUDE_CODE_STREAM_JSON_V1_SUPPORTED_RANGE: &str = ">=2.1.234 <2.2.0";
-pub const CLAUDE_CODE_STREAM_JSON_V1_QUALIFICATION_VERSION: &str = "2.1.309";
+pub const CLAUDE_CODE_STREAM_JSON_V1_QUALIFICATION_VERSION: &str = "2.1.310";
 const CLAUDE_CODE_STREAM_JSON_V1_MINIMUM_VERSION: (u64, u64, u64) = (2, 1, 234);
 const CLAUDE_CODE_STREAM_JSON_V1_MAXIMUM_VERSION: (u64, u64, u64) = (2, 2, 0);
 const CAPABILITY_PROBE_ARGUMENTS: [&str; 1] = ["--help"];
@@ -265,7 +265,7 @@ impl HarnessInstallationProfile for ClaudeCodeInstallationProfile {
     type Failure = ClaudeCodeInstallationFailure;
 
     const EXECUTABLE_NAME: &'static str = "claude";
-    const QUALIFICATION_VERSION: (u64, u64, u64) = (2, 1, 309);
+    const QUALIFICATION_VERSION: (u64, u64, u64) = (2, 1, 310);
     const CAPABILITY_PROBE_ARGUMENTS: &'static [&'static str] = &CAPABILITY_PROBE_ARGUMENTS;
 
     fn probe_isolation(search_path: &OsStr) -> Result<ProbeIsolation, Self::Failure> {

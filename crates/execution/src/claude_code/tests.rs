@@ -137,7 +137,7 @@ fn fixture_version_matches_the_qualification_version() {
         installation.version().as_str(),
         CLAUDE_CODE_STREAM_JSON_V1_QUALIFICATION_VERSION
     );
-    assert_eq!(installation.version().numeric(), (2, 1, 309));
+    assert_eq!(installation.version().numeric(), (2, 1, 310));
 }
 
 // REQ-AGENT-2, REQ-AGENT-5, REQ-AGENT-7
@@ -242,7 +242,7 @@ fn validate_with(
 #[test]
 fn stable_releases_newer_than_the_qualification_release_are_admitted_untested() {
     let both_probes = [vec!["--version".to_owned()], vec!["--help".to_owned()]];
-    for version in ["2.1.310", "2.2.0", "3.0.0"] {
+    for version in ["2.1.311", "2.2.0", "3.0.0"] {
         let (result, invocations) = validate_with(version, COMPLETE_HELP);
         let installation = result.unwrap();
 
@@ -256,10 +256,10 @@ fn stable_releases_newer_than_the_qualification_release_are_admitted_untested() 
         let advisory = installation.untested_advisory().unwrap();
         assert_eq!(advisory.harness(), "Claude Code");
         assert_eq!(advisory.version(), version);
-        assert_eq!(advisory.qualification_version(), "2.1.309");
+        assert_eq!(advisory.qualification_version(), "2.1.310");
     }
 
-    let (result, _) = validate_with("2.1.309", COMPLETE_HELP);
+    let (result, _) = validate_with("2.1.310", COMPLETE_HELP);
     let installation = result.unwrap();
     assert_eq!(
         installation.qualification(),

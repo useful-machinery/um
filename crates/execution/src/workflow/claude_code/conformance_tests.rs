@@ -358,6 +358,9 @@ async fn pinned_real_claude_code_01_normal_mode_loopback_conforms_from_a_synthet
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         root.configure_command(&mut command, &provider);
+        // The unanswered elicitation is the behavior under test, not a readiness
+        // signal; bound the native wait and assert its correlated result below.
+        command.env("MCP_TOOL_TIMEOUT", "1000");
         let mut child = command.spawn().unwrap();
         let mut stdin = child.stdin.take().unwrap();
         stdin
@@ -395,14 +398,19 @@ async fn pinned_real_claude_code_01_normal_mode_loopback_conforms_from_a_synthet
         let mcp_observation = fs::read_to_string(&resources.mcp_observation).unwrap();
         assert!(mcp_observation.starts_with("started\n"));
         assert!(mcp_observation.contains("tools/list"));
-        // This release defers MCP descriptions until the native tool search
-        // selects the tool. Exercise that path before the ordinary response.
+        // Deferred tool selection precedes the MCP tool call. The server issues an
+        // elicitation that the headless client cannot answer; the native timeout
+        // must remain an ordinary tool error, not a protocol or session failure.
         request.release_tool_use("ToolSearch", json!({"query": "scherzo_native_resource"}));
         let request = provider.next_request().await;
         assert!(contains_string_fragment(request.body(), NATIVE_MCP_MARKER));
-        request.release_text(RESPONSE);
+        request.release_tool_use("mcp__scherzo-resource__scherzo_native_resource", json!({}));
+        provider.next_request().await.release_text(RESPONSE);
 
         let output = child.wait_with_output().await.unwrap();
+        let mcp_observation = fs::read_to_string(&resources.mcp_observation).unwrap();
+        assert!(mcp_observation.contains("\"method\":\"tools/call\""));
+        assert!(mcp_observation.contains("\"method\":\"notifications/cancelled\""));
         assert!(output.status.success());
         // The pinned release diagnoses the synthetic model on stderr. Its bytes are an
         // actionable process diagnostic, not protocol, and their wording is not a contract.
@@ -417,9 +425,37 @@ async fn pinned_real_claude_code_01_normal_mode_loopback_conforms_from_a_synthet
             crate::workflow::agent::AgentValueKind::Response,
             NonZeroU64::new(1024).unwrap(),
         );
+        let mut native_observations = Vec::new();
         for chunk in output.stdout.chunks(7) {
-            parser.push_stdout(chunk, drop).unwrap();
+            parser
+                .push_stdout(chunk, |observation| native_observations.push(observation))
+                .unwrap();
         }
+        let init: Value = serde_json::from_slice(
+            output.stdout.split(|byte| *byte == b'\n').next().unwrap(),
+        )
+        .unwrap();
+        assert!(init["tools"].as_array().unwrap().contains(&json!("Monitor")));
+        assert!(init["plugins"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|plugin| plugin["name"] == "scherzo-plugin"));
+        let mcp_call = native_observations
+            .iter()
+            .find_map(|observation| match observation {
+                AgentObservation::ToolCall { call_id, name, .. }
+                    if name.as_ref() == "mcp__scherzo-resource__scherzo_native_resource" =>
+                {
+                    Some(call_id)
+                }
+                _ => None,
+            })
+            .expect("native MCP call must be observed");
+        assert!(native_observations.iter().any(|observation| matches!(
+            observation,
+            AgentObservation::ToolResult { call_id, is_error: true, .. } if call_id == mcp_call
+        )));
         assert!(parser.session_id().is_some());
         assert_eq!(parser.completed_exchanges(), 1);
         let AgentOutcome::Completed(CompletedAgentInvocation::Response(response)) =

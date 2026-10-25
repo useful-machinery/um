@@ -2686,7 +2686,7 @@ mod untested_advisory_tests {
         assert_eq!(lines.len(), 2, "{output}");
         assert!(output.ends_with('\n'));
         for (line, (version, qualification)) in
-            lines.iter().zip([("1.4.0", "1.3.0"), ("2.2.0", "2.1.309")])
+            lines.iter().zip([("1.4.0", "1.3.0"), ("2.2.0", "2.1.310")])
         {
             assert!(
                 line.contains(version) && line.contains(qualification),

@@ -285,6 +285,9 @@ while IFS= read -r line; do
     *ping*)
       printf '{{"jsonrpc":"2.0","id":%s,"result":{{}}}}\n' "$id"
       ;;
+    *tools/call*)
+      printf '{{"jsonrpc":"2.0","id":"elicitation-probe","method":"elicitation/create","params":{{"message":"controlled question","requestedSchema":{{"type":"object","properties":{{"answer":{{"type":"string"}}}}}}}}}}\n'
+      ;;
     *)
       printf '{{"jsonrpc":"2.0","id":%s,"error":{{"code":-32601,"message":"Method not found"}}}}\n' "$id"
       ;;

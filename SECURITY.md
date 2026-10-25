@@ -157,8 +157,8 @@ project, home, Claude configuration, and XDG directories with a cleared child
 environment, inherited `PATH` only for launcher interpreter resolution, fixed update and
 nonessential-traffic disables, and deterministic no-color controls. It requires a
 canonical stable version in `>=2.1.234 <2.2.0`, or any stable version newer than
-`2.1.309`, and the closed non-model capabilities used by the production adapter. The
-repository's exact qualification package remains `2.1.309`; accepting the range does not
+`2.1.310`, and the closed non-model capabilities used by the production adapter. The
+repository's exact qualification package remains `2.1.310`; accepting the range does not
 claim exact-binary conformance for every release or host, and a newer release is admitted
 as untested, under the same isolation, launch identity check, and protocol validation,
 without any qualification evidence. The validator does not read ambient `CLAUDE_CONFIG_DIR`, provider credentials, or native
