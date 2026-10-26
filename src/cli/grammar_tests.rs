@@ -9,7 +9,10 @@ const LEAVES: &str = "accept activate begin cancel complete continue create decl
 const GROUPS: &str = "account action activation artifact audit auth authorization connection credential delegation deletion delivery github gitlab identity input input-set installation invitation linear member organization pool project publication repository run runner runner-pool service-principal setup state team trigger evaluation webhook workflow";
 const COMMON: [&str; 3] = ["json", "service-api-key-file", "allow-insecure-http"];
 // These endpoints have no limit/cursor contract; see cli/docs/output-style.md.
-const UNPAGINATED_LISTS: [&str; 2] = ["github installation list", "github repository list"];
+const UNPAGINATED_LISTS: [&str; 2] = [
+    "connection github installation list",
+    "connection github repository list",
+];
 
 // These identities are backed by shared Args or identifier argument types in cli/src/cli.rs
 // and cli/src/cli/entity.rs. A long spelling alone is never a help identity.
@@ -57,7 +60,9 @@ fn semantic_class(path: &str, long: &str) -> Option<String> {
         "json" => {
             // JsonArgs<F> is parameterized by output family; deletion cancellation
             // uses StreamingJson rather than DeletionJson.
-            let family = if path.starts_with("connection gitlab ") {
+            let family = if path.starts_with("connection github ") {
+                "github-connection"
+            } else if path.starts_with("connection gitlab ") {
                 "gitlab-connection"
             } else if matches!(
                 path,
@@ -384,6 +389,7 @@ fn destructive_leaves_require_confirmation_but_runner_modes_do_not() {
         ],
         &["auth", "identity", "remove", "identity"],
         &[
+            "connection",
             "github",
             "installation",
             "remove",
@@ -413,12 +419,43 @@ fn destructive_leaves_require_confirmation_but_runner_modes_do_not() {
     }
 }
 
+// REQ-CONNECTION-88
+#[test]
+fn github_connections_live_only_under_the_connection_family() {
+    let mut root = Cli::command();
+    root.build();
+    assert!(root.find_subcommand("github").is_none());
+    let github = root
+        .find_subcommand("connection")
+        .and_then(|connection| connection.find_subcommand("github"))
+        .unwrap();
+    for leaf in ["installation", "repository", "setup"] {
+        assert!(github.find_subcommand(leaf).is_some(), "{leaf}");
+    }
+    for path in [
+        &["github"][..],
+        &["github", "setup", "begin", "example"][..],
+        &["github", "installation", "list", "example"][..],
+    ] {
+        let input = std::iter::once("um").chain(path.iter().copied());
+        assert_eq!(
+            super::parse(input).unwrap_err().kind(),
+            clap::error::ErrorKind::InvalidSubcommand,
+            "{path:?}"
+        );
+    }
+}
+
 #[test]
 fn renamed_leaves_have_only_the_approved_verb_paths() {
     let mut root = Cli::command();
     root.build();
     for (family, replacement, old) in [
-        (&["github", "installation"][..], "remove", "disconnect"),
+        (
+            &["connection", "github", "installation"][..],
+            "remove",
+            "disconnect",
+        ),
         (&["project", "repository"][..], "remove", "detach"),
         (&["runner", "activation"][..], "issue", "create"),
     ] {
@@ -441,7 +478,7 @@ fn renamed_leaves_have_only_the_approved_verb_paths() {
         assert!(command.find_subcommand("create").is_none(), "{family:?}");
     }
     for path in [
-        &["github", "installation", "disconnect"][..],
+        &["connection", "github", "installation", "disconnect"][..],
         &["project", "repository", "detach"][..],
         &["runner", "activation", "create"][..],
     ] {

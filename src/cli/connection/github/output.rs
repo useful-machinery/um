@@ -28,7 +28,7 @@ pub(super) fn write_setup_begin(
     deployment: &str,
     organization: &str,
     result: &Result<GitHubSetupSession, GitHubFailure>,
-    authentication: super::super::PrincipalAuthenticationKind,
+    authentication: super::super::super::PrincipalAuthenticationKind,
     json: bool,
 ) -> anyhow::Result<ExitCode> {
     match result {
@@ -55,7 +55,7 @@ pub(super) fn write_setup_begin(
                 )?;
                 writeln!(
                     output,
-                    "\nThen copy the decimal installation ID from the browser return URL and run:\n  um github setup complete {organization} {} --provider-installation-id <INSTALLATION_ID>",
+                    "\nThen copy the decimal installation ID from the browser return URL and run:\n  um connection github setup complete {organization} {} --provider-installation-id <INSTALLATION_ID>",
                     session.id
                 )?;
             }
@@ -76,7 +76,7 @@ pub(super) fn write_installation_list(
     deployment: &str,
     organization: &str,
     result: &Result<Vec<GitHubInstallation>, GitHubFailure>,
-    authentication: super::super::PrincipalAuthenticationKind,
+    authentication: super::super::super::PrincipalAuthenticationKind,
     json: bool,
 ) -> anyhow::Result<ExitCode> {
     match result {
@@ -128,7 +128,7 @@ pub(super) fn write_installation(
     organization: &str,
     result: &Result<GitHubInstallation, GitHubFailure>,
     action: InstallationAction,
-    authentication: super::super::PrincipalAuthenticationKind,
+    authentication: super::super::super::PrincipalAuthenticationKind,
     json: bool,
 ) -> anyhow::Result<ExitCode> {
     match result {
@@ -174,7 +174,7 @@ pub(super) fn write_repository_list(
     deployment: &str,
     organization: &str,
     result: &Result<GitHubRepositoryList, GitHubFailure>,
-    authentication: super::super::PrincipalAuthenticationKind,
+    authentication: super::super::super::PrincipalAuthenticationKind,
     json: bool,
 ) -> anyhow::Result<ExitCode> {
     match result {
@@ -275,7 +275,7 @@ fn write_failure(
     organization: &str,
     failure: &GitHubFailure,
     action: FailureAction,
-    authentication: super::super::PrincipalAuthenticationKind,
+    authentication: super::super::super::PrincipalAuthenticationKind,
     json: bool,
 ) -> anyhow::Result<ExitCode> {
     let (outcome, category, human, class) = match failure {
@@ -323,7 +323,7 @@ fn write_failure(
                 "error: contact GitHub connection API at {deployment}: {}\n\nCheck network access to the deployment and try again.",
                 category.as_str()
             ),
-            super::super::unreachable_outcome_class(*category),
+            super::super::super::unreachable_outcome_class(*category),
         ),
         GitHubFailure::Protocol { .. } => (
             "invalid_response",
@@ -364,7 +364,7 @@ impl FailureAction {
     const fn conflict_message(self) -> &'static str {
         match self {
             Self::CompleteSetup => {
-                "error: GitHub setup conflicts with the current source connection\n\nCheck that the setup session is still pending and that the GitHub installation belongs to this organization. If the earlier session expired, begin a new one:\n  um github setup begin <ORGANIZATION>"
+                "error: GitHub setup conflicts with the current source connection\n\nCheck that the setup session is still pending and that the GitHub installation belongs to this organization. If the earlier session expired, begin a new one:\n  um connection github setup begin <ORGANIZATION>"
             }
             Self::DisconnectInstallation => {
                 "error: GitHub installation is unavailable for disconnection\n\nList installation bindings. Reconnect a disconnected binding through browser setup; a revoked installation requires a new GitHub installation."

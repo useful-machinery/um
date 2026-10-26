@@ -52,6 +52,32 @@ fn request_body(request: &str) -> &str {
         .expect("request should contain a body separator")
 }
 
+// REQ-CONNECTION-88
+#[test]
+fn removed_top_level_github_family_is_a_usage_error_without_contacting_the_deployment() {
+    let (server, _directory, credential_path) = prepared_github(Vec::new());
+    let environment = deployment_environment(&server.api_url, &credential_path);
+
+    for args in [
+        &["github"][..],
+        &["github", "installation", "list", ORGANIZATION][..],
+        &[
+            "github",
+            "setup",
+            "begin",
+            ORGANIZATION,
+            "--allow-insecure-http",
+        ][..],
+    ] {
+        let output = run_with_env(args, &environment);
+
+        assert_eq!(output.status.code(), Some(2), "{args:?}");
+        assert!(output.stdout.is_empty(), "{args:?}");
+        assert!(!output.stderr.is_empty(), "{args:?}");
+    }
+    assert!(server.finish().is_empty());
+}
+
 // REQ-CONNECTION-16, REQ-CONNECTION-17
 #[test]
 fn setup_begin_and_complete_preserve_the_browser_handoff() {
@@ -74,6 +100,7 @@ fn setup_begin_and_complete_preserve_the_browser_handoff() {
 
     let begin = run_with_env(
         &[
+            "connection",
             "github",
             "setup",
             "begin",
@@ -89,13 +116,14 @@ fn setup_begin_and_complete_preserve_the_browser_handoff() {
     assert!(human.contains(&format!("  Setup session: {SETUP_SESSION}\n")));
     assert!(human.contains(&format!("  {setup_url}\n")));
     assert!(human.contains(&format!(
-        "um github setup complete {ORGANIZATION} {SETUP_SESSION} --provider-installation-id <INSTALLATION_ID>"
+        "um connection github setup complete {ORGANIZATION} {SETUP_SESSION} --provider-installation-id <INSTALLATION_ID>"
     )));
     assert!(!human.contains("setup-response-sentinel"));
     assert!(begin.stderr.is_empty());
 
     let complete = run_with_env(
         &[
+            "connection",
             "github",
             "setup",
             "complete",
@@ -194,6 +222,7 @@ fn installation_and_repository_lists_expose_current_provider_state() {
 
     let installations = run_with_env(
         &[
+            "connection",
             "github",
             "installation",
             "list",
@@ -219,6 +248,7 @@ fn installation_and_repository_lists_expose_current_provider_state() {
 
     let repositories = run_with_env(
         &[
+            "connection",
             "github",
             "repository",
             "list",
@@ -302,6 +332,7 @@ fn github_successes_reject_mismatched_response_subjects() {
 
     let commands = [
         vec![
+            "connection",
             "github",
             "setup",
             "complete",
@@ -313,6 +344,7 @@ fn github_successes_reject_mismatched_response_subjects() {
             "--allow-insecure-http",
         ],
         vec![
+            "connection",
             "github",
             "installation",
             "remove",
@@ -323,6 +355,7 @@ fn github_successes_reject_mismatched_response_subjects() {
             "--allow-insecure-http",
         ],
         vec![
+            "connection",
             "github",
             "repository",
             "list",
@@ -363,6 +396,7 @@ fn replayable_connection_mutations_retry_one_ambiguous_transport_failure() {
     let cases = [
         (
             &[
+                "connection",
                 "github",
                 "setup",
                 "complete",
@@ -381,6 +415,7 @@ fn replayable_connection_mutations_retry_one_ambiguous_transport_failure() {
         ),
         (
             &[
+                "connection",
                 "github",
                 "installation",
                 "remove",
@@ -428,7 +463,14 @@ fn meaningful_api_failures_have_closed_json_and_exit_statuses() {
             409,
             "https://api.usefulmachinery.com/problems/source-connection-conflict",
         ),
-        vec!["github", "repository", "list", ORGANIZATION, INSTALLATION],
+        vec![
+            "connection",
+            "github",
+            "repository",
+            "list",
+            ORGANIZATION,
+            INSTALLATION,
+        ],
         "source_connection_conflict",
         1,
     )];
@@ -470,6 +512,7 @@ fn setup_conflict_is_actionable_on_standard_error_without_problem_prose() {
 
     let output = run_with_env(
         &[
+            "connection",
             "github",
             "setup",
             "complete",
@@ -487,7 +530,7 @@ fn setup_conflict_is_actionable_on_standard_error_without_problem_prose() {
     let diagnostic = String::from_utf8(output.stderr).unwrap();
     assert!(diagnostic.starts_with("error: "));
     assert!(diagnostic.contains("\n\n"));
-    assert!(diagnostic.contains("um github setup begin <ORGANIZATION>"));
+    assert!(diagnostic.contains("um connection github setup begin <ORGANIZATION>"));
     assert!(!diagnostic.contains("private-github"));
     assert!(!diagnostic.contains(TOKEN));
     assert_eq!(server.finish().len(), 1);
@@ -516,6 +559,7 @@ fn oversized_github_success_response_is_rejected() {
 
     let output = run_with_env(
         &[
+            "connection",
             "github",
             "repository",
             "list",
@@ -554,6 +598,7 @@ fn remote_insecure_setup_url_is_rejected_before_browser_handoff() {
 
     let output = run_with_env(
         &[
+            "connection",
             "github",
             "setup",
             "begin",
@@ -585,6 +630,7 @@ fn malformed_success_is_a_redacted_protocol_failure() {
 
     let output = run_with_env(
         &[
+            "connection",
             "github",
             "installation",
             "remove",

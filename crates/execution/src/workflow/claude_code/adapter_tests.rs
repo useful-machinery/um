@@ -1910,8 +1910,9 @@ async fn response_mode_closes_standard_input_only_when_the_invocation_settles() 
             BACKGROUND_SUBAGENT_FAKE_CLAUDE,
         )
         .unwrap();
-        let release = fixture.ready.path().with_file_name("release");
-        mkfifo(&release, Mode::S_IRUSR | Mode::S_IWUSR).unwrap();
+        // Keep a reader open while the child drains stdout between phases. Opening
+        // a write-only FIFO here could block the runtime that must drain that output.
+        let release = FixtureSignal::create(fixture.ready.path().with_file_name("release"));
         let observations = fixture.observations.clone();
         let (task, start, outcome) = start_process_fixture(invocation, fixture.diagnostics.clone());
 
@@ -1925,7 +1926,7 @@ async fn response_mode_closes_standard_input_only_when_the_invocation_settles() 
                 )
             })
             .await;
-        std::fs::write(&release, b"release\n").unwrap();
+        std::fs::write(release.path(), b"release\n").unwrap();
         observations
             .wait_for(|observation| {
                 matches!(
@@ -1934,7 +1935,7 @@ async fn response_mode_closes_standard_input_only_when_the_invocation_settles() 
                 )
             })
             .await;
-        std::fs::write(&release, b"release\n").unwrap();
+        std::fs::write(release.path(), b"release\n").unwrap();
         assert_eq!(
             fixture.ready.receive().await,
             b"open\n",

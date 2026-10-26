@@ -36,7 +36,6 @@ mod connection;
 mod delegation;
 mod deletion;
 mod entity;
-mod github;
 mod invitation;
 mod organization;
 mod principal;
@@ -550,8 +549,6 @@ enum Command {
     Connection(connection::Command),
     #[command(about = delegation::ABOUT)]
     Delegation(delegation::Command),
-    #[command(about = github::ABOUT)]
-    Github(github::Command),
     #[command(about = invitation::ABOUT)]
     Invitation(invitation::Command),
     #[command(about = organization::ABOUT)]
@@ -588,7 +585,6 @@ impl Cli {
             Some(Command::Artifact(command)) => command.execute(),
             Some(Command::Auth(command)) => command.execute(),
             Some(Command::Delegation(command)) => command.execute(),
-            Some(Command::Github(command)) => command.execute(),
             Some(Command::Connection(command)) => command.execute(),
             Some(Command::Invitation(command)) => command.execute(),
             Some(Command::Organization(command)) => command.execute(),
@@ -2380,6 +2376,15 @@ mod tests {
             "auth logout",
             "auth status",
             "connection",
+            "connection github",
+            "connection github installation",
+            "connection github installation list",
+            "connection github installation remove",
+            "connection github repository",
+            "connection github repository list",
+            "connection github setup",
+            "connection github setup begin",
+            "connection github setup complete",
             "connection gitlab",
             "connection gitlab create",
             "connection gitlab credential",
@@ -2413,15 +2418,6 @@ mod tests {
             "delegation list",
             "delegation propose",
             "delegation show",
-            "github",
-            "github installation",
-            "github installation list",
-            "github installation remove",
-            "github repository",
-            "github repository list",
-            "github setup",
-            "github setup begin",
-            "github setup complete",
             "invitation",
             "invitation accept",
             "invitation decline",

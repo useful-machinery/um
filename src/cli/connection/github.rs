@@ -7,10 +7,11 @@ use crate::exit_code::ExitCode;
 use um_api::{GitHubApi, GitHubFailure, HttpClient, HttpTransportPolicy};
 use um_human_auth::Deployment;
 
-use super::{InstallationArg, OrganizationArg};
+use super::super::{InstallationArg, OrganizationArg};
+use super::NAME;
 
 pub(super) const ABOUT: &str = "Manage GitHub connections";
-const NAME: &str = "github";
+const FAMILY: &str = "github";
 const ERROR_CONTEXT: &str = "configure Useful Machinery GitHub access";
 
 #[derive(Debug, Args)]
@@ -69,7 +70,8 @@ enum RepositoryLeaf {
     List(InstallationTarget),
 }
 
-type GitHubOptions = super::CommonArgs<super::GithubJson, super::PrincipalAuthenticationArgs>;
+type GitHubOptions =
+    super::super::CommonArgs<super::super::GithubJson, super::super::PrincipalAuthenticationArgs>;
 
 #[derive(Debug, Args)]
 struct OrganizationTarget {
@@ -120,13 +122,13 @@ struct InstallationRemoveCommand {
     target: InstallationTarget,
 
     #[command(flatten)]
-    confirmation: super::ConfirmationArgs,
+    confirmation: super::super::ConfirmationArgs,
 }
 
 impl Command {
-    pub(super) fn execute(self) -> super::CommandResult {
+    pub(super) fn execute(self) -> super::super::CommandResult {
         match self.command {
-            None => super::print_help(&[NAME]),
+            None => super::super::print_help(&[NAME, FAMILY]),
             Some(GitHubCommand::Setup(command)) => command.execute(),
             Some(GitHubCommand::Installation(command)) => command.execute(),
             Some(GitHubCommand::Repository(command)) => command.execute(),
@@ -135,18 +137,18 @@ impl Command {
 }
 
 impl SetupCommand {
-    fn execute(self) -> super::CommandResult {
+    fn execute(self) -> super::super::CommandResult {
         match self.command {
-            None => super::print_help(&[NAME, "setup"]),
-            Some(SetupLeaf::Begin(command)) => super::execute_deployment_leaf(
+            None => super::super::print_help(&[NAME, FAMILY, "setup"]),
+            Some(SetupLeaf::Begin(command)) => super::super::execute_deployment_leaf(
                 command,
-                &[NAME],
+                &[NAME, FAMILY],
                 ERROR_CONTEXT,
                 OrganizationTarget::begin_setup,
             ),
-            Some(SetupLeaf::Complete(command)) => super::execute_deployment_leaf(
+            Some(SetupLeaf::Complete(command)) => super::super::execute_deployment_leaf(
                 command,
-                &[NAME],
+                &[NAME, FAMILY],
                 ERROR_CONTEXT,
                 CompleteCommand::execute,
             ),
@@ -155,18 +157,18 @@ impl SetupCommand {
 }
 
 impl InstallationCommand {
-    fn execute(self) -> super::CommandResult {
+    fn execute(self) -> super::super::CommandResult {
         match self.command {
-            None => super::print_help(&[NAME, "installation"]),
-            Some(InstallationLeaf::List(command)) => super::execute_deployment_leaf(
+            None => super::super::print_help(&[NAME, FAMILY, "installation"]),
+            Some(InstallationLeaf::List(command)) => super::super::execute_deployment_leaf(
                 command,
-                &[NAME],
+                &[NAME, FAMILY],
                 ERROR_CONTEXT,
                 OrganizationTarget::list_installations,
             ),
-            Some(InstallationLeaf::Remove(command)) => super::execute_deployment_leaf(
+            Some(InstallationLeaf::Remove(command)) => super::super::execute_deployment_leaf(
                 command,
-                &[NAME],
+                &[NAME, FAMILY],
                 ERROR_CONTEXT,
                 InstallationRemoveCommand::remove,
             ),
@@ -175,12 +177,12 @@ impl InstallationCommand {
 }
 
 impl RepositoryCommand {
-    fn execute(self) -> super::CommandResult {
+    fn execute(self) -> super::super::CommandResult {
         match self.command {
-            None => super::print_help(&[NAME, "repository"]),
-            Some(RepositoryLeaf::List(command)) => super::execute_deployment_leaf(
+            None => super::super::print_help(&[NAME, FAMILY, "repository"]),
+            Some(RepositoryLeaf::List(command)) => super::super::execute_deployment_leaf(
                 command,
-                &[NAME],
+                &[NAME, FAMILY],
                 ERROR_CONTEXT,
                 InstallationTarget::list_repositories,
             ),
@@ -292,14 +294,14 @@ impl InstallationTarget {
 fn with_api<T>(
     deployment: &Deployment,
     transport_policy: HttpTransportPolicy,
-    authentication: &super::PrincipalAuthenticationArgs,
+    authentication: &super::super::PrincipalAuthenticationArgs,
     mut operation: impl FnMut(&GitHubApi) -> Result<T, GitHubFailure>,
 ) -> anyhow::Result<Result<T, GitHubFailure>> {
     let session_client = HttpClient::new(transport_policy)
         .map_err(|error| anyhow!(error))
         .context("prepare human session networking")?;
-    super::execute_selected_api_operation(
-        super::principal_api_context(
+    super::super::execute_selected_api_operation(
+        super::super::principal_api_context(
             &session_client,
             deployment,
             authentication,

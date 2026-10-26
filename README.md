@@ -1165,7 +1165,7 @@ Setup is deliberately split around browser consent. The CLI neither opens a brow
 listens for an inbound callback. Begin a ten-minute, single-use setup session:
 
 ```sh
-um github setup begin acme-labs
+um connection github setup begin acme-labs
 ```
 
 Open the reported URL in a browser and approve the GitHub account and repositories.
@@ -1173,7 +1173,7 @@ After GitHub returns from setup, copy the decimal installation ID from the brows
 URL and complete the same session as the same Useful Machinery principal:
 
 ```sh
-um github setup complete \
+um connection github setup complete \
   acme-labs \
   ghs_01k0z6r1w8f4jy2m7q9v3x5abc \
   --provider-installation-id 12345678
@@ -1190,7 +1190,7 @@ List the organization's stable installation bindings and their current `active`,
 `disconnected`, or `revoked` state:
 
 ```sh
-um github installation list acme-labs
+um connection github installation list acme-labs
 ```
 
 Discover the repositories currently authorized through one active binding. This is a
@@ -1198,7 +1198,7 @@ live provider-backed read and may update existing repository availability projec
 it does not bind a project or create repository connections eagerly:
 
 ```sh
-um github repository list \
+um connection github repository list \
   acme-labs \
   ghi_01k0z6r1w8f4jy2m7q9v3x5abc
 ```
@@ -1206,7 +1206,7 @@ um github repository list \
 Remove an installation binding from Useful Machinery with its stable binding ID:
 
 ```sh
-um github installation remove \
+um connection github installation remove \
   acme-labs \
   ghi_01k0z6r1w8f4jy2m7q9v3x5abc --yes
 ```
@@ -1467,10 +1467,10 @@ discovering those values:
 um organization list
 
 # Discover active and retained GitHub installation bindings for one organization.
-um github installation list acme-labs
+um connection github installation list acme-labs
 
 # Discover the repositories currently authorized for one installation.
-um github repository list \
+um connection github repository list \
   acme-labs \
   ghi_01k0z6r1w8f4jy2m7q9v3x5abc
 

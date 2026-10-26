@@ -251,11 +251,12 @@ Pagination:
   This command returns one page. Pass --cursor <CURSOR> to continue.
 ```
 
-  `github installation list` and `github repository list` cannot offer bounded
-  pagination: the public GitHub installation and installation-repository API
-  endpoints accept neither a limit nor a cursor and return arrays with no
-  continuation cursor. The repository-discovery endpoint also collects the
-  provider's selection before returning it. Client-side slicing would still
-  require fetching the entire unbounded response and would misrepresent the
-  API's continuation semantics. Do not advertise pagination for these leaves
-  until the API supports it; the exception does not make large lists safe.
+  `connection github installation list` and `connection github repository list`
+  cannot offer bounded pagination: the public GitHub installation and
+  installation-repository API endpoints accept neither a limit nor a cursor and
+  return arrays with no continuation cursor. The repository-discovery endpoint
+  also collects the provider's selection before returning it. Client-side
+  slicing would still require fetching the entire unbounded response and would
+  misrepresent the API's continuation semantics. Do not advertise pagination
+  for these leaves until the API supports it; the exception does not make
+  large lists safe.
