@@ -85,7 +85,7 @@ fn write_state(run_directory: &Path, state: &serde_json::Value) {
     fs::write(run_directory.join("state.json"), bytes).unwrap();
 }
 
-fn status_schema() -> jsonschema::Validator {
+pub(super) fn status_schema() -> jsonschema::Validator {
     let schema: serde_json::Value = serde_json::from_str(include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/schemas/workflow-status-result-v1.schema.json"

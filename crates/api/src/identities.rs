@@ -10,7 +10,8 @@ use super::generated::models as generated_models;
 use super::http_client::{HttpClient, HttpEndpointError};
 use super::http_util;
 use super::problem::{
-    self, ACCEPTED_MEDIA_TYPES, BAD_REQUEST, FORBIDDEN, JSON_MEDIA_TYPE, UNAUTHORIZED,
+    self, ACCEPTED_MEDIA_TYPES, BAD_REQUEST, FORBIDDEN, JSON_MEDIA_TYPE, QUANTITY_LIMIT_REACHED,
+    UNAUTHORIZED,
 };
 use super::{UnreachableCategory, bearer_authorization, classify_reqwest_error};
 use um_support::valid_typed_id;
@@ -27,8 +28,6 @@ const IDENTITY_REMOVAL_UNAVAILABLE: &str =
 const REAUTHENTICATION_REQUIRED: &str =
     "https://api.usefulmachinery.com/problems/reauthentication-required";
 const IDEMPOTENCY_CONFLICT: &str = "https://api.usefulmachinery.com/problems/idempotency-conflict";
-const QUANTITY_LIMIT_REACHED: &str =
-    "https://api.usefulmachinery.com/problems/quantity-limit-reached";
 const WORKLOAD_IDENTITY_LINKING_NOT_PERMITTED: &str =
     "https://api.usefulmachinery.com/problems/workload-identity-linking-not-permitted";
 const REQUEST_BODY_TOO_LARGE: &str =

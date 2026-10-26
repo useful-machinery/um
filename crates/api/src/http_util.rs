@@ -277,11 +277,7 @@ pub(crate) fn can_retry_ambiguous_mutation(
     maximum_attempts: usize,
     category: super::UnreachableCategory,
 ) -> bool {
-    attempt + 1 < maximum_attempts
-        && matches!(
-            category,
-            super::UnreachableCategory::Connection | super::UnreachableCategory::Timeout
-        )
+    attempt + 1 < maximum_attempts && category.retryable_mutation()
 }
 
 pub(crate) fn require_nonempty(value: &str, reason: &'static str) -> Result<(), &'static str> {

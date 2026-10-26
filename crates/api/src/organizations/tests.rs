@@ -263,6 +263,12 @@ fn create_classifies_its_operation_specific_failures() {
         (
             "409 Conflict",
             409,
+            MEMBERSHIP_LIMIT,
+            CreateOrganizationOutcome::MembershipLimitReached,
+        ),
+        (
+            "409 Conflict",
+            409,
             IDEMPOTENCY_CONFLICT,
             CreateOrganizationOutcome::IdempotencyConflict,
         ),

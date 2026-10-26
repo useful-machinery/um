@@ -79,6 +79,8 @@ pub enum GitLabFailure {
     CandidateUnavailable,
     IdentityMismatch,
     Unreachable(UnreachableCategory),
+    ProviderUnavailable,
+    ServiceUnavailable,
     Protocol,
 }
 
@@ -93,6 +95,15 @@ fn classify<E>(error: apis::Error<E>) -> GitLabFailure {
         apis::Error::Reqwest(error) => GitLabFailure::Unreachable(classify_reqwest_error(&error)),
         apis::Error::ResponseError(response) => {
             let status = response.status;
+            if status == StatusCode::SERVICE_UNAVAILABLE
+                && let Ok(p) = problem::decode(response.content.as_bytes(), status)
+            {
+                match p.r#type.as_str() {
+                    problem::PROVIDER_UNAVAILABLE => return GitLabFailure::ProviderUnavailable,
+                    problem::SERVICE_UNAVAILABLE => return GitLabFailure::ServiceUnavailable,
+                    _ => {}
+                }
+            }
             if status.is_server_error() {
                 return GitLabFailure::Unreachable(UnreachableCategory::Server);
             }

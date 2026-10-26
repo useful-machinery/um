@@ -71,23 +71,33 @@ fn run_gitlab(server: &ScriptedServer, credential: &str, args: &[&str]) -> Outpu
         &deployment_environment(&server.api_url, credential),
     )
 }
-fn single(output: &Output) -> serde_json::Value {
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+fn document(output: &Output) -> serde_json::Value {
     let documents: Vec<serde_json::Value> = output
         .stdout
         .split(|b| *b == b'\n')
         .filter(|line| !line.is_empty())
         .map(|line| serde_json::from_slice(line).unwrap())
         .collect();
-    assert_eq!(documents.len(), 1);
+    assert_eq!(documents.len(), 1, "{output:?}");
     assert_eq!(documents[0]["schemaVersion"], 1);
     assert!(!String::from_utf8_lossy(&output.stdout).contains(SECRET));
     assert!(!String::from_utf8_lossy(&output.stderr).contains(SECRET));
     documents.into_iter().next().unwrap()
+}
+fn single(output: &Output) -> serde_json::Value {
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    document(output)
+}
+fn failure(output: &Output, exit: i32) -> serde_json::Value {
+    assert_eq!(output.status.code(), Some(exit), "{output:?}");
+    let doc = document(output);
+    assert_eq!(doc["organizationRef"], ORG);
+    assert!(output.stderr.is_empty(), "{output:?}");
+    doc
 }
 fn request(
     request: &str,
@@ -199,9 +209,13 @@ fn connection_and_candidate_verbs_use_exact_resources_and_explicit_bodies() {
     // Activation's explicit review performs one GET before POST.
     for args in cases {
         let doc = single(&run_gitlab(&server, &credential, &args));
-        assert!(doc["outcome"].as_str().is_some());
+        let outcome = doc["outcome"].as_str().unwrap();
+        assert!(
+            !outcome.is_empty() && outcome.bytes().all(|b| b.is_ascii_lowercase() || b == b'_'),
+            "{outcome}"
+        );
         if args.contains(&"cancel") {
-            assert_eq!(doc["outcome"], "cancellation acknowledged");
+            assert_eq!(doc["outcome"], "cancellation_acknowledged");
             assert!(doc["result"].get("state").is_none());
             assert_eq!(doc["result"]["id"], CANDIDATE);
         }
@@ -286,6 +300,7 @@ fn repository_discovery_and_selection_use_exact_generated_actions() {
             "1",
         ],
     ));
+    assert_eq!(doc["outcome"], "repositories_listed");
     assert_eq!(doc["result"]["nextCursor"], "another-page");
     assert_eq!(doc["result"]["items"][0]["availability"], "unavailable");
     let human = run_with_env(
@@ -306,6 +321,7 @@ fn repository_discovery_and_selection_use_exact_generated_actions() {
     );
     assert!(human.status.success(), "{human:?}");
     let text = String::from_utf8(human.stdout).unwrap();
+    assert!(text.starts_with("GitLab repositories: repositories listed\n"));
     assert!(text.contains("123456789  group/subgroup/widget  main  selected  unavailable"));
     assert!(text.contains("next cursor: another-page"));
     let exact = single(&run_gitlab(
@@ -509,9 +525,13 @@ fn repository_selection_preconditions_conflicts_and_lost_response_replay() {
             "4",
         ],
     );
-    assert_eq!(output.status.code(), Some(6));
-    assert!(output.stdout.is_empty());
-    assert!(!String::from_utf8_lossy(&output.stderr).contains(SECRET));
+    let doc = failure(&output, 6);
+    assert_eq!(doc["outcome"], "conflict");
+    assert!(
+        doc["idempotencyKey"]
+            .as_str()
+            .is_some_and(|key| !key.is_empty())
+    );
     assert_eq!(server.finish().len(), 1);
 
     for verb in ["link", "remove"] {
@@ -749,8 +769,7 @@ fn mismatched_resource_response_cannot_authorize_identity_review() {
             "--dedicated-automation",
         ],
     );
-    assert_eq!(output.status.code(), Some(1));
-    assert!(output.stdout.is_empty());
+    assert_eq!(failure(&output, 1)["outcome"], "invalid_response");
     assert_eq!(server.finish().len(), 1);
 }
 
@@ -800,6 +819,8 @@ fn authentication_and_candidate_conflicts_have_distinct_exits() {
         problem("401 Unauthorized", 401, "unauthorized"),
         problem("409 Conflict", 409, "candidate-conflict"),
         problem("503 Service Unavailable", 503, "service-unavailable"),
+        problem("503 Service Unavailable", 503, "provider-unavailable"),
+        problem("500 Internal Server Error", 500, "internal"),
     ]);
     let service_path = dir.path().join("service.key");
     fs::write(
@@ -808,22 +829,82 @@ fn authentication_and_candidate_conflicts_have_distinct_exits() {
     )
     .unwrap();
     fs::set_permissions(&service_path, Permissions::from_mode(0o600)).unwrap();
-    for (args, exit) in [
-        (vec!["show", ORG, CONNECTION], 3),
-        (vec!["credential", "cancel", ORG, CONNECTION, CANDIDATE], 6),
-        (vec!["list", ORG], 4),
+    for (args, exit, outcome) in [
+        (vec!["show", ORG, CONNECTION], 3, "unauthenticated"),
+        (
+            vec!["credential", "cancel", ORG, CONNECTION, CANDIDATE],
+            6,
+            "conflict",
+        ),
+        (vec!["list", ORG], 4, "service_unavailable"),
+        (
+            vec!["repository", "list", ORG, CONNECTION],
+            4,
+            "provider_unavailable",
+        ),
+        (vec!["show", ORG, CONNECTION], 4, "unreachable"),
     ] {
+        let mutation = args.contains(&"cancel");
         let args = [
             args,
             vec!["--service-api-key-file", service_path.to_str().unwrap()],
         ]
         .concat();
-        let output = run_gitlab(&server, &credential, &args);
-        assert_eq!(output.status.code(), Some(exit));
-        assert!(output.stdout.is_empty());
-        assert!(!String::from_utf8_lossy(&output.stderr).contains(SECRET));
+        let doc = failure(&run_gitlab(&server, &credential, &args), exit);
+        assert_eq!(doc["outcome"], outcome);
+        assert!(doc["deployment"].as_str().is_some_and(|d| !d.is_empty()));
+        if mutation {
+            assert!(
+                doc["idempotencyKey"]
+                    .as_str()
+                    .is_some_and(|key| !key.is_empty())
+            );
+        } else {
+            assert!(doc["idempotencyKey"].is_null(), "{doc}");
+        }
+        if outcome == "unreachable" {
+            assert_eq!(doc["category"], "server");
+        } else {
+            assert!(doc.get("category").is_none(), "{doc}");
+        }
     }
-    assert_eq!(server.finish().len(), 3);
+    assert_eq!(server.finish().len(), 5);
+}
+
+// REQ-CONNECTION-74
+#[test]
+fn a_server_error_answer_to_a_mutation_is_not_repeated() {
+    // Only one answer is scripted: a repeat would find no listener and report `connection`.
+    let (server, _dir, credential) =
+        prepared(vec![http_response("500 Internal Server Error", None, b"")]);
+    let doc = failure(
+        &run_gitlab(
+            &server,
+            &credential,
+            &[
+                "credential",
+                "cancel",
+                ORG,
+                CONNECTION,
+                CANDIDATE,
+                "--idempotency-key",
+                "server-error-key",
+            ],
+        ),
+        4,
+    );
+    assert_eq!(doc["outcome"], "unreachable");
+    assert_eq!(doc["category"], "server");
+    assert_eq!(doc["idempotencyKey"], "server-error-key");
+    let requests = server.finish();
+    assert_eq!(requests.len(), 1);
+    request(
+        &requests[0],
+        "DELETE",
+        &format!("/{CONNECTION}/credential-candidates/{CANDIDATE}"),
+        None,
+        Some("server-error-key"),
+    );
 }
 
 // REQ-CONNECTION-57
@@ -1068,16 +1149,14 @@ fn generated_key_survives_two_lost_responses_and_recovers_on_later_invocation() 
         Vec::new(),
         json_http_response("201 Created", initial_connection()),
     ]);
-    let output = run_gitlab(&server, &credential, &["create", ORG, "https://gitlab.com"]);
-    assert_eq!(output.status.code(), Some(4));
-    assert!(output.stdout.is_empty());
-    let diagnostic = String::from_utf8_lossy(&output.stderr);
-    let key = diagnostic
-        .lines()
-        .find_map(|line| line.strip_prefix("request key: "))
-        .unwrap();
+    let lost = failure(
+        &run_gitlab(&server, &credential, &["create", ORG, "https://gitlab.com"]),
+        4,
+    );
+    assert_eq!(lost["outcome"], "unreachable");
+    assert_eq!(lost["category"], "connection");
+    let key = lost["idempotencyKey"].as_str().unwrap();
     assert!(!key.is_empty());
-    assert!(!diagnostic.contains(SECRET));
     let doc = single(&run_gitlab(
         &server,
         &credential,
@@ -1132,10 +1211,8 @@ fn explicit_activation_replay_recovers_after_terminal_or_missing_candidate() {
             "--idempotency-key",
             "activation-replay-key",
         ];
-        let first = run_gitlab(&server, &credential, &args);
-        assert_eq!(first.status.code(), Some(4));
-        assert!(first.stdout.is_empty());
-        assert!(String::from_utf8_lossy(&first.stderr).contains("activation-replay-key"));
+        let first = failure(&run_gitlab(&server, &credential, &args), 4);
+        assert_eq!(first["idempotencyKey"], "activation-replay-key");
         let replay = single(&run_gitlab(&server, &credential, &args));
         assert_eq!(replay["result"]["state"], "active");
         let calls = server.finish();
@@ -1163,7 +1240,7 @@ fn cancellation_acknowledges_an_already_activated_candidate_without_claiming_a_s
         &credential,
         &["credential", "cancel", ORG, CONNECTION, CANDIDATE],
     ));
-    assert_eq!(cancelled["outcome"], "cancellation acknowledged");
+    assert_eq!(cancelled["outcome"], "cancellation_acknowledged");
     assert_eq!(
         cancelled["result"],
         serde_json::json!({"id":CANDIDATE,"connectionId":CONNECTION})
@@ -1206,8 +1283,7 @@ fn vanished_candidate_is_unavailable_for_activation() {
                 "--dedicated-automation",
             ],
         );
-        assert_eq!(output.status.code(), Some(7));
-        assert!(output.stdout.is_empty());
+        assert_eq!(failure(&output, 7)["outcome"], "candidate_unavailable");
         assert_eq!(server.finish().len(), expected_calls);
     }
     let (server, _dir, credential) =
@@ -1260,9 +1336,7 @@ fn candidate_submission_and_activation_conflicts_do_not_retry() {
             token.to_str().unwrap(),
         ],
     );
-    assert_eq!(output.status.code(), Some(6));
-    assert!(output.stdout.is_empty());
-    assert!(!String::from_utf8_lossy(&output.stderr).contains(SECRET));
+    assert_eq!(failure(&output, 6)["outcome"], "conflict");
     assert_eq!(server.finish().len(), 1);
 
     let (server, _dir, credential) = prepared(vec![
@@ -1283,8 +1357,7 @@ fn candidate_submission_and_activation_conflicts_do_not_retry() {
             "--dedicated-automation",
         ],
     );
-    assert_eq!(output.status.code(), Some(6));
-    assert!(output.stdout.is_empty());
+    assert_eq!(failure(&output, 6)["outcome"], "conflict");
     assert_eq!(server.finish().len(), 2);
 }
 
@@ -1409,7 +1482,10 @@ fn pending_identity_mismatch_and_conflict_have_separate_exits() {
         json_http_response("200 OK", candidate("verified")),
         conflict,
     ]);
-    for (expected, code) in [("42", 7), ("41", 8)] {
+    for (expected, code, outcome) in [
+        ("42", 7, "candidate_unavailable"),
+        ("41", 8, "identity_mismatch"),
+    ] {
         let output = run_gitlab(
             &server,
             &credential,
@@ -1424,8 +1500,7 @@ fn pending_identity_mismatch_and_conflict_have_separate_exits() {
                 "--dedicated-automation",
             ],
         );
-        assert_eq!(output.status.code(), Some(code));
-        assert!(output.stdout.is_empty());
+        assert_eq!(failure(&output, code)["outcome"], outcome);
     }
     let output = run_gitlab(
         &server,
@@ -1439,7 +1514,6 @@ fn pending_identity_mismatch_and_conflict_have_separate_exits() {
             "--yes",
         ],
     );
-    assert_eq!(output.status.code(), Some(6));
-    assert!(output.stdout.is_empty());
+    assert_eq!(failure(&output, 6)["outcome"], "conflict");
     assert_eq!(server.finish().len(), 3);
 }

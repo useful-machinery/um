@@ -75,6 +75,15 @@ pub(super) fn write_create(
             OutcomeClass::GeneralFailure,
             json,
         ),
+        CreateOrganizationOutcome::MembershipLimitReached => write_failure(
+            deployment,
+            "membership_limit_reached",
+            None,
+            None,
+            "! The founding owner already holds the maximum number of organization memberships.\n\nLeave an organization the owner no longer needs, then retry.",
+            OutcomeClass::GeneralFailure,
+            json,
+        ),
         CreateOrganizationOutcome::RateLimited { retry_after } => write_failure(
             deployment,
             "rate_limited",

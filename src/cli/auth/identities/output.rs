@@ -310,7 +310,11 @@ impl LinkOutput {
                 deployment,
                 LinkTerminal::new("quantity_limit_reached")
                     .with_credential_state(credential_state),
-                "! The workload identity quantity limit has been reached.\n\nRemove an unused workload identity or ask the deployment operator to raise the limit.",
+                if service_authentication {
+                    "! The workload identity quantity limit has been reached.\n\nRemove an unused workload identity or ask the deployment operator to raise the limit."
+                } else {
+                    "! This account has reached its limit on linked identities, memberships, delegations and invitations.\n\nRemove an unused identity, then start the linking flow again:\n  um auth identity list"
+                },
                 OutcomeClass::GeneralFailure,
             ),
             LinkIdentityOutcome::IdempotencyConflict => self.write_terminal(

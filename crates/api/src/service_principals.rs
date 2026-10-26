@@ -13,7 +13,8 @@ use super::generated::models as generated_models;
 use super::http_client::{HttpClient, HttpEndpointError};
 use super::http_util::{self, ApiAttemptError, BufferedResponse};
 use super::problem::{
-    self, ACCEPTED_MEDIA_TYPES, BAD_REQUEST, FORBIDDEN, JSON_MEDIA_TYPE, NOT_FOUND, UNAUTHORIZED,
+    self, ACCEPTED_MEDIA_TYPES, BAD_REQUEST, FORBIDDEN, JSON_MEDIA_TYPE, NOT_FOUND,
+    QUANTITY_LIMIT_REACHED, UNAUTHORIZED,
 };
 use super::{UnreachableCategory, bearer_authorization, classify_reqwest_error};
 
@@ -21,8 +22,6 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 const READ_ATTEMPTS: usize = 1;
 const MUTATION_ATTEMPTS: usize = 2;
 const IDEMPOTENCY_CONFLICT: &str = "https://api.usefulmachinery.com/problems/idempotency-conflict";
-const QUANTITY_LIMIT_REACHED: &str =
-    "https://api.usefulmachinery.com/problems/quantity-limit-reached";
 const RATE_LIMIT_EXCEEDED: &str = "https://api.usefulmachinery.com/problems/rate-limit-exceeded";
 const REQUEST_BODY_TOO_LARGE: &str =
     "https://api.usefulmachinery.com/problems/request-body-too-large";

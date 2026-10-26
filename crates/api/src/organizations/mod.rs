@@ -15,7 +15,8 @@ use super::http_util;
 #[cfg(test)]
 use super::problem::PROBLEM_MEDIA_TYPE;
 use super::problem::{
-    self, ACCEPTED_MEDIA_TYPES, BAD_REQUEST, FORBIDDEN, JSON_MEDIA_TYPE, NOT_FOUND, UNAUTHORIZED,
+    self, ACCEPTED_MEDIA_TYPES, BAD_REQUEST, FORBIDDEN, JSON_MEDIA_TYPE, NOT_FOUND,
+    QUANTITY_LIMIT_REACHED, UNAUTHORIZED,
 };
 use super::{UnreachableCategory, classify_reqwest_error};
 
@@ -41,8 +42,6 @@ const HUMAN_DISPLAY_NAME_REQUIRED: &str =
 const CREATION_NOT_PERMITTED: &str =
     "https://api.usefulmachinery.com/problems/organization-creation-not-permitted";
 const SLUG_UNAVAILABLE: &str = "https://api.usefulmachinery.com/problems/slug-unavailable";
-const QUANTITY_LIMIT_REACHED: &str =
-    "https://api.usefulmachinery.com/problems/quantity-limit-reached";
 const RATE_LIMITED: &str = "https://api.usefulmachinery.com/problems/rate-limit-exceeded";
 const IDEMPOTENCY_CONFLICT: &str = "https://api.usefulmachinery.com/problems/idempotency-conflict";
 const MEMBERSHIP_TRANSITION_UNAVAILABLE: &str =
@@ -76,6 +75,7 @@ pub enum CreateOrganizationOutcome {
     HumanDisplayNameRequired,
     SlugUnavailable,
     QuantityLimitReached,
+    MembershipLimitReached,
     RateLimited { retry_after: u64 },
     IdempotencyConflict,
 }
@@ -156,6 +156,7 @@ pub enum IssueInvitationOutcome {
     NotFound,
     RecipientUnavailable,
     OutstandingLimitReached,
+    QuantityLimitReached,
     RateLimited { retry_after: u64 },
     IdempotencyConflict,
 }
@@ -187,6 +188,7 @@ pub enum AcceptInvitationOutcome {
     HumanDisplayNameRequired,
     Unavailable,
     MembershipLimitReached,
+    QuantityLimitReached,
     IdempotencyConflict,
 }
 
@@ -1382,6 +1384,7 @@ fn decode_issue_invitation_response(
             match problem_type.as_str() {
                 RECIPIENT_UNAVAILABLE => Ok(IssueInvitationOutcome::RecipientUnavailable),
                 OUTSTANDING_INVITATION_LIMIT => Ok(IssueInvitationOutcome::OutstandingLimitReached),
+                QUANTITY_LIMIT_REACHED => Ok(IssueInvitationOutcome::QuantityLimitReached),
                 IDEMPOTENCY_CONFLICT => Ok(IssueInvitationOutcome::IdempotencyConflict),
                 _ => Err(OrganizationError::protocol(
                     Operation::IssueInvitation,
@@ -1517,6 +1520,7 @@ fn decode_accept_invitation_response(
                 }
                 INVITATION_UNAVAILABLE => Ok(AcceptInvitationOutcome::Unavailable),
                 MEMBERSHIP_LIMIT => Ok(AcceptInvitationOutcome::MembershipLimitReached),
+                QUANTITY_LIMIT_REACHED => Ok(AcceptInvitationOutcome::QuantityLimitReached),
                 IDEMPOTENCY_CONFLICT => Ok(AcceptInvitationOutcome::IdempotencyConflict),
                 _ => Err(OrganizationError::protocol(
                     Operation::AcceptInvitation,
@@ -1833,6 +1837,7 @@ fn decode_create_response(
                 }
                 SLUG_UNAVAILABLE => Ok(CreateOrganizationOutcome::SlugUnavailable),
                 QUANTITY_LIMIT_REACHED => Ok(CreateOrganizationOutcome::QuantityLimitReached),
+                MEMBERSHIP_LIMIT => Ok(CreateOrganizationOutcome::MembershipLimitReached),
                 IDEMPOTENCY_CONFLICT => Ok(CreateOrganizationOutcome::IdempotencyConflict),
                 _ => Err(OrganizationError::protocol(
                     Operation::Create,

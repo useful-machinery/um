@@ -7,6 +7,7 @@ use reqwest::{StatusCode, Url};
 use super::generated::apis::{self, runners_api};
 use super::generated::models;
 use super::http_client::generated_configuration;
+use super::problem::QUANTITY_LIMIT_REACHED;
 use super::{HttpTransportPolicy, UnreachableCategory, classify_reqwest_error, problem};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
@@ -15,7 +16,6 @@ const UNAUTHORIZED: &str = "https://api.usefulmachinery.com/problems/unauthorize
 const FORBIDDEN: &str = "https://api.usefulmachinery.com/problems/forbidden";
 const NOT_FOUND: &str = "https://api.usefulmachinery.com/problems/not-found";
 const NAME_UNAVAILABLE: &str = "https://api.usefulmachinery.com/problems/runner-name-unavailable";
-const QUANTITY_LIMIT: &str = "https://api.usefulmachinery.com/problems/quantity-limit-reached";
 const RATE_LIMIT: &str = "https://api.usefulmachinery.com/problems/rate-limit-exceeded";
 const IDEMPOTENCY_CONFLICT: &str = "https://api.usefulmachinery.com/problems/idempotency-conflict";
 const CREDENTIAL_LIMIT: &str =
@@ -618,7 +618,7 @@ fn classify_runner_response(status: StatusCode, body: &[u8]) -> RunnerFailure {
         (StatusCode::FORBIDDEN, FORBIDDEN) => RunnerFailure::Forbidden,
         (StatusCode::NOT_FOUND, NOT_FOUND) => RunnerFailure::NotFound,
         (StatusCode::CONFLICT, NAME_UNAVAILABLE) => RunnerFailure::NameUnavailable,
-        (StatusCode::CONFLICT, QUANTITY_LIMIT) => RunnerFailure::QuantityLimitReached,
+        (StatusCode::CONFLICT, QUANTITY_LIMIT_REACHED) => RunnerFailure::QuantityLimitReached,
         (StatusCode::CONFLICT, IDEMPOTENCY_CONFLICT) => RunnerFailure::IdempotencyConflict,
         (StatusCode::CONFLICT, CREDENTIAL_LIMIT) => RunnerFailure::CredentialLimit,
         (StatusCode::CONFLICT, ACTIVATION_UNAVAILABLE) => RunnerFailure::ActivationUnavailable,

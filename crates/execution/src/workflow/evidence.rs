@@ -14,6 +14,7 @@ use super::agent_input::AgentInputStartFailure;
 use super::artifact::CaptureFailureKind;
 use super::git_capture::GitCaptureFailure;
 use super::input::InputPreparationFailureKind;
+use super::schema_common::is_identifier;
 use super::step_runtime::{
     CommandExecutionFailure, CommandLaunchFailure, CommandPreparationFailure, OutputCaptureFailure,
     StepExecutionFailure, StepFailureCause, StepStartFailure, WorkingDirectoryFailure,
@@ -361,7 +362,7 @@ impl FailureDetail {
         let input_valid = match self.input.as_deref() {
             None => !input_invalid_name,
             Some(input) if input_invalid_name => !input.is_empty() && input.len() <= 4_096,
-            Some(input) => input_preparation && is_workflow_value_identifier(input),
+            Some(input) => input_preparation && is_identifier(input),
         };
         let condition_failure = self.phase == Phase::Condition
             && self.code == Code::JsonPointerMissing
@@ -376,7 +377,7 @@ impl FailureDetail {
                 && self
                     .output
                     .as_deref()
-                    .is_none_or(|output| !is_workflow_value_identifier(output)))
+                    .is_none_or(|output| !is_identifier(output)))
             || (!output_failure && self.output.is_some())
             || (self.exit_code.is_some()
                 && (self.code != Code::CommandExit || self.exit_code == Some(0)))
@@ -1077,7 +1078,9 @@ fn code(phase: FailurePhase, code: FailureCode) -> FailureDetail {
 }
 
 fn is_condition_json_reference(value: &str) -> bool {
-    value == "finalization.context" || is_output_reference(value)
+    value == "finalization.context"
+        || value.strip_prefix("inputs.").is_some_and(is_identifier)
+        || is_output_reference(value)
 }
 
 fn valid_json_pointer(value: &str) -> bool {
@@ -1103,7 +1106,7 @@ fn is_output_reference(value: &str) -> bool {
     matches!(
         (segments.next(), segments.next(), segments.next(), segments.next()),
         (Some("outputs"), Some(node), Some(output), None)
-            if is_workflow_node_identifier(node) && is_workflow_value_identifier(output)
+            if is_workflow_node_identifier(node) && is_identifier(output)
     )
 }
 
@@ -1114,13 +1117,6 @@ fn is_workflow_node_identifier(value: &str) -> bool {
         && bytes[1..]
             .iter()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
-}
-
-fn is_workflow_value_identifier(value: &str) -> bool {
-    let bytes = value.as_bytes();
-    bytes.first().is_some_and(u8::is_ascii_lowercase)
-        && bytes.len() <= 64
-        && bytes[1..].iter().all(u8::is_ascii_alphanumeric)
 }
 
 pub(crate) fn deserialize_non_null_option<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>

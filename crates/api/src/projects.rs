@@ -12,7 +12,9 @@ use super::generated::apis;
 use super::generated::models;
 use super::http_client::generated_configuration;
 use super::http_util::{self, BoundedBodyError};
-use super::problem::{self, ACCEPTED_MEDIA_TYPES, JSON_MEDIA_TYPE};
+use super::problem::{
+    self, ACCEPTED_MEDIA_TYPES, JSON_MEDIA_TYPE, PROVIDER_UNAVAILABLE, QUANTITY_LIMIT_REACHED,
+};
 use super::{HttpTransportPolicy, UnreachableCategory, classify_reqwest_error};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
@@ -23,7 +25,6 @@ const FORBIDDEN: &str = "https://api.usefulmachinery.com/problems/forbidden";
 const NOT_FOUND: &str = "https://api.usefulmachinery.com/problems/not-found";
 const REPOSITORY_NOT_BOUND: &str = "https://api.usefulmachinery.com/problems/repository-not-bound";
 const NAME_UNAVAILABLE: &str = "https://api.usefulmachinery.com/problems/project-name-unavailable";
-const QUANTITY_LIMIT: &str = "https://api.usefulmachinery.com/problems/quantity-limit-reached";
 const RATE_LIMIT: &str = "https://api.usefulmachinery.com/problems/rate-limit-exceeded";
 const IDEMPOTENCY_CONFLICT: &str = "https://api.usefulmachinery.com/problems/idempotency-conflict";
 const SOURCE_CONFLICT: &str = "https://api.usefulmachinery.com/problems/source-connection-conflict";
@@ -659,12 +660,7 @@ fn retry_transport(
     error: &reqwest::Error,
 ) -> Result<UnreachableCategory, ProjectFailure> {
     let category = classify_reqwest_error(error);
-    if attempt + 1 < attempts
-        && matches!(
-            category,
-            UnreachableCategory::Connection | UnreachableCategory::Timeout
-        )
-    {
+    if http_util::can_retry_ambiguous_mutation(attempt, attempts, category) {
         um_support::sleep(um_support::short_retry_delay());
         Ok(category)
     } else {
@@ -711,6 +707,7 @@ pub enum ProjectFailure {
     NameUnavailable,
     QuantityLimitReached,
     RateLimited { retry_after: u64 },
+    ProviderUnavailable { retry_after: u64 },
     IdempotencyConflict,
     SourceConflict,
     RepositoryUnavailable,
@@ -741,6 +738,19 @@ impl ProjectFailure {
 
 fn classify_project_response(response: &ReceivedResponse, operation: Operation) -> ProjectFailure {
     let status = response.status;
+    if status == StatusCode::SERVICE_UNAVAILABLE
+        && matches!(
+            operation,
+            Operation::Create | Operation::BodyMutation | Operation::RepositoryUpdate
+        )
+        && problem::decode_header_parts(&response.body, status, response.content_type.as_ref())
+            .is_ok_and(|decoded| decoded.r#type == PROVIDER_UNAVAILABLE)
+    {
+        return parse_retry_after(response).map_or_else(
+            || ProjectFailure::protocol(false),
+            |retry_after| ProjectFailure::ProviderUnavailable { retry_after },
+        );
+    }
     if status.is_server_error() {
         return ProjectFailure::Unreachable(UnreachableCategory::Server);
     }
@@ -768,7 +778,7 @@ fn classify_project_response(response: &ReceivedResponse, operation: Operation) 
         (StatusCode::NOT_FOUND, NOT_FOUND) => ProjectFailure::NotFound,
         (StatusCode::NOT_FOUND, REPOSITORY_NOT_BOUND) => ProjectFailure::RepositoryNotBound,
         (StatusCode::CONFLICT, NAME_UNAVAILABLE) => ProjectFailure::NameUnavailable,
-        (StatusCode::CONFLICT, QUANTITY_LIMIT) => ProjectFailure::QuantityLimitReached,
+        (StatusCode::CONFLICT, QUANTITY_LIMIT_REACHED) => ProjectFailure::QuantityLimitReached,
         (StatusCode::CONFLICT, IDEMPOTENCY_CONFLICT) => ProjectFailure::IdempotencyConflict,
         (StatusCode::CONFLICT, SOURCE_CONFLICT) => ProjectFailure::SourceConflict,
         (StatusCode::CONFLICT, REPOSITORY_UNAVAILABLE) => ProjectFailure::RepositoryUnavailable,

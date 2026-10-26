@@ -15,7 +15,8 @@ use super::generated::models as generated_models;
 use super::http_client::{HttpClient, HttpEndpointError};
 use super::http_util::{self, ApiAttemptError, BufferedResponse};
 use super::problem::{
-    self, ACCEPTED_MEDIA_TYPES, BAD_REQUEST, FORBIDDEN, JSON_MEDIA_TYPE, NOT_FOUND, UNAUTHORIZED,
+    self, ACCEPTED_MEDIA_TYPES, BAD_REQUEST, FORBIDDEN, JSON_MEDIA_TYPE, NOT_FOUND,
+    QUANTITY_LIMIT_REACHED, UNAUTHORIZED,
 };
 use super::{UnreachableCategory, bearer_authorization, classify_reqwest_error};
 
@@ -94,6 +95,7 @@ pub enum ProposeDelegationOutcome {
     Proposed(Delegation),
     Common(CommonDelegationFailure),
     TransitionUnavailable,
+    QuantityLimitReached,
     IdempotencyConflict,
     RetryableConflict { retry_after: u64 },
 }
@@ -620,6 +622,7 @@ fn decode_propose(
                 DELEGATION_TRANSITION_UNAVAILABLE => {
                     Ok(ProposeDelegationOutcome::TransitionUnavailable)
                 }
+                QUANTITY_LIMIT_REACHED => Ok(ProposeDelegationOutcome::QuantityLimitReached),
                 IDEMPOTENCY_CONFLICT => Ok(ProposeDelegationOutcome::IdempotencyConflict),
                 _ => Err(unrecognized_conflict(Operation::Propose)),
             }

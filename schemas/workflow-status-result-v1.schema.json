@@ -3427,7 +3427,7 @@
     },
     "ConditionJsonReference": {
       "type": "string",
-      "pattern": "^outputs\\.[a-z][A-Za-z0-9]*\\.[a-z][A-Za-z0-9]*$|^finalization\\.context$"
+      "pattern": "^inputs\\.[a-z][A-Za-z0-9]*$|^outputs\\.[a-z][A-Za-z0-9]*\\.[a-z][A-Za-z0-9]*$|^finalization\\.context$"
     },
     "EvaluatedPredicate": {
       "type": "object",

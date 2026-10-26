@@ -306,6 +306,14 @@ fn write_failure(
             ),
             OutcomeClass::RateLimited,
         ),
+        ProjectFailure::ProviderUnavailable { retry_after } => (
+            "provider_unavailable",
+            None,
+            format!(
+                "error: GitHub or GitLab is temporarily unavailable\n\nTry again in {retry_after} seconds."
+            ),
+            OutcomeClass::Unreachable,
+        ),
         ProjectFailure::IdempotencyConflict => (
             "idempotency_conflict",
             None,
@@ -347,7 +355,8 @@ fn write_failure(
         ),
     };
     let retry_after = match failure {
-        ProjectFailure::RateLimited { retry_after } => Some(retry_after),
+        ProjectFailure::RateLimited { retry_after }
+        | ProjectFailure::ProviderUnavailable { retry_after } => Some(retry_after),
         _ => None,
     };
     super::super::write_api_failure(

@@ -768,11 +768,23 @@ fn link_keeps_the_preflight_acting_session_across_browser_proof() {
 // REQ-ACCOUNT-48, REQ-ACCOUNT-53
 #[test]
 fn link_reports_identity_unavailable_without_exposing_or_replacing_credentials() {
-    let conflict = identity_problem(
-        "409 Conflict",
-        409,
+    assert_link_refusal_leaves_credentials_unchanged(
         "https://api.usefulmachinery.com/problems/identity-unavailable",
+        "identity_unavailable",
     );
+}
+
+// REQ-ACCOUNT-67, REQ-ACCOUNT-53
+#[test]
+fn link_reports_quantity_limit_reached_without_exposing_or_replacing_credentials() {
+    assert_link_refusal_leaves_credentials_unchanged(
+        "https://api.usefulmachinery.com/problems/quantity-limit-reached",
+        "quantity_limit_reached",
+    );
+}
+
+fn assert_link_refusal_leaves_credentials_unchanged(problem_type: &str, expected_outcome: &str) {
+    let conflict = identity_problem("409 Conflict", 409, problem_type);
     let (server, _directory, credential_path) =
         prepared_identity_command(identity_link_flow_responses(vec![conflict]));
     let before = fs::read(&credential_path).unwrap();
@@ -799,7 +811,7 @@ fn link_reports_identity_unavailable_without_exposing_or_replacing_credentials()
         .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
         .collect::<Vec<_>>();
     assert_eq!(events.len(), 2);
-    assert_eq!(events[1]["outcome"], "identity_unavailable");
+    assert_eq!(events[1]["outcome"], expected_outcome);
     assert_eq!(events[1]["localSessionIdentity"], "unchanged");
     assert_eq!(fs::read(&credential_path).unwrap(), before);
     assert!(output.stderr.is_empty());

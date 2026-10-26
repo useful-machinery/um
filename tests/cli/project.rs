@@ -1108,6 +1108,40 @@ fn project_api_errors_have_closed_json_outcomes_and_exit_codes() {
             "rate_limited",
             4,
         ),
+        (
+            vec![
+                "project",
+                "create",
+                ORGANIZATION,
+                "--name",
+                "widget",
+                "--installation-id",
+                INSTALLATION_ID,
+                "--repository-id",
+                REPOSITORY_ID,
+            ],
+            "503 Service Unavailable",
+            "https://api.usefulmachinery.com/problems/provider-unavailable",
+            "provider_unavailable",
+            4,
+        ),
+        (
+            vec![
+                "project",
+                "repository",
+                "set",
+                ORGANIZATION,
+                PROJECT_ID,
+                "--installation-id",
+                INSTALLATION_ID,
+                "--repository-id",
+                REPOSITORY_ID,
+            ],
+            "503 Service Unavailable",
+            "https://api.usefulmachinery.com/problems/provider-unavailable",
+            "provider_unavailable",
+            4,
+        ),
     ];
 
     for (mut args, status, problem_type, expected_outcome, expected_status) in cases {
@@ -1117,11 +1151,16 @@ fn project_api_errors_have_closed_json_outcomes_and_exit_codes() {
             "status": status.split_whitespace().next().unwrap().parse::<u16>().unwrap(),
             "detail": "private-project-problem-detail"
         });
-        let response = if expected_outcome == "rate_limited" {
+        let retry_after = match expected_outcome {
+            "rate_limited" => Some(42),
+            "provider_unavailable" => Some(60),
+            _ => None,
+        };
+        let response = if let Some(retry_after) = retry_after {
             http_response_with_headers(
                 status,
                 Some("application/problem+json"),
-                &[("Retry-After", "42")],
+                &[("Retry-After", retry_after.to_string().as_str())],
                 &serde_json::to_vec(&problem).unwrap(),
             )
         } else {
@@ -1136,8 +1175,8 @@ fn project_api_errors_have_closed_json_outcomes_and_exit_codes() {
         assert!(output.stderr.is_empty());
         let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
         assert_eq!(value["outcome"], expected_outcome);
-        if expected_outcome == "rate_limited" {
-            assert_eq!(value["retryAfter"], 42);
+        if let Some(retry_after) = retry_after {
+            assert_eq!(value["retryAfter"], retry_after);
         } else {
             assert!(value.get("retryAfter").is_none());
         }
@@ -1203,6 +1242,55 @@ fn project_rate_limit_requires_a_positive_retry_after() {
             .unwrap_or_default();
         let response = http_response_with_headers(
             "429 Too Many Requests",
+            Some("application/problem+json"),
+            &headers,
+            &body,
+        );
+        let (server, _directory, credential_path) = prepared_project(vec![response]);
+
+        let output = run_project(
+            &[
+                "project",
+                "create",
+                ORGANIZATION,
+                "--name",
+                "widget",
+                "--installation-id",
+                INSTALLATION_ID,
+                "--repository-id",
+                REPOSITORY_ID,
+                "--json",
+                "--allow-insecure-http",
+            ],
+            &server,
+            &credential_path,
+        );
+
+        assert_eq!(output.status.code(), Some(1));
+        assert!(output.stderr.is_empty());
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()["outcome"],
+            "invalid_response"
+        );
+        server.finish();
+    }
+}
+
+// REQ-PROJECT-82
+#[test]
+fn project_provider_unavailable_requires_a_positive_retry_after() {
+    for retry_after in [None, Some("0"), Some("invalid")] {
+        let body = serde_json::to_vec(&serde_json::json!({
+            "type": "https://api.usefulmachinery.com/problems/provider-unavailable",
+            "title": "Provider unavailable",
+            "status": 503
+        }))
+        .unwrap();
+        let headers = retry_after
+            .map(|value| vec![("Retry-After", value)])
+            .unwrap_or_default();
+        let response = http_response_with_headers(
+            "503 Service Unavailable",
             Some("application/problem+json"),
             &headers,
             &body,

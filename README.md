@@ -1372,8 +1372,11 @@ if candidate metadata has expired: reuse the same key with the explicitly review
 provider ID and `--dedicated-automation`. A cancellation acknowledgement does not
 prove a terminal candidate was cancelled or undo activation. Neither create nor
 show polls. GitLab credential commands distinguish usage (exit 2), authentication
-(3), unavailable
-transport (4), conflict (6), candidate unavailability (7), and identity mismatch (8).
+(3), unavailable transport, provider or service (4), conflict (6), candidate
+unavailability (7), and identity mismatch (8). With `--json`, a failure is one JSON
+document on standard output whose `outcome` names it, such as `conflict`,
+`provider_unavailable` or `unreachable`, and which carries the request's
+`idempotencyKey`.
 
 Once an active connection has a usable credential, discover repositories by numeric
 provider ID, then explicitly select one before binding a project. Use `--selected`

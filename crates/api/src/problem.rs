@@ -10,6 +10,12 @@ pub(super) const BAD_REQUEST: &str = "https://api.usefulmachinery.com/problems/b
 pub(super) const UNAUTHORIZED: &str = "https://api.usefulmachinery.com/problems/unauthorized";
 pub(super) const FORBIDDEN: &str = "https://api.usefulmachinery.com/problems/forbidden";
 pub(super) const NOT_FOUND: &str = "https://api.usefulmachinery.com/problems/not-found";
+pub(super) const QUANTITY_LIMIT_REACHED: &str =
+    "https://api.usefulmachinery.com/problems/quantity-limit-reached";
+pub(super) const PROVIDER_UNAVAILABLE: &str =
+    "https://api.usefulmachinery.com/problems/provider-unavailable";
+pub(super) const SERVICE_UNAVAILABLE: &str =
+    "https://api.usefulmachinery.com/problems/service-unavailable";
 
 pub(super) fn decode_type(
     response: &super::http_util::BufferedResponse,

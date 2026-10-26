@@ -379,6 +379,15 @@ fn write_propose(
         ProposeDelegationOutcome::TransitionUnavailable => {
             write_transition_unavailable(deployment, json)
         }
+        ProposeDelegationOutcome::QuantityLimitReached => write_failure(
+            deployment,
+            "quantity_limit_reached",
+            None,
+            None,
+            "error: a participant's account limit has been reached\n\nYou or the service holds the maximum number of linked identities, memberships, delegations and invitations; end a delegation or remove an identity no longer needed before proposing again.",
+            OutcomeClass::GeneralFailure,
+            json,
+        ),
         ProposeDelegationOutcome::IdempotencyConflict => {
             write_idempotency_conflict(deployment, json)
         }

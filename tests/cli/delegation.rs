@@ -403,3 +403,32 @@ fn ended_and_inaccessible_delegations_have_stable_failures() {
     )));
     assert_authorization(&requests[1], HUMAN_TOKEN);
 }
+
+// REQ-DELEGATION-20
+#[test]
+fn proposal_at_the_per_principal_limit_reports_quantity_limit_reached() {
+    let (server, _directory, human_credentials, _service_key) = prepared(vec![problem_response(
+        "409 Conflict",
+        "https://api.usefulmachinery.com/problems/quantity-limit-reached",
+        409,
+    )]);
+    let environment = deployment_environment(&server.api_url, &human_credentials);
+
+    let output = run_with_env(
+        &[
+            "delegation",
+            "propose",
+            SERVICE_PRINCIPAL_ID,
+            "--json",
+            "--allow-insecure-http",
+        ],
+        &environment,
+    );
+
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let document: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(document["outcome"], "quantity_limit_reached");
+    assert!(document.get("retryAfter").is_none());
+    assert!(output.stderr.is_empty());
+    assert_eq!(server.finish().len(), 1);
+}

@@ -177,6 +177,54 @@ fn trigger_lifecycle_replaces_collections_and_reports_conflicts() {
     assert!(!String::from_utf8_lossy(&create.stdout).contains(SECRET));
 }
 
+// REQ-TRIGGER-84
+#[test]
+fn trigger_quota_source_and_workflow_refusals_are_classified() {
+    for (action, status, problem, outcome, exit) in [
+        (
+            "create",
+            "409 Conflict",
+            "quantity-limit-reached",
+            "conflict",
+            1,
+        ),
+        (
+            "enable",
+            "409 Conflict",
+            "workflow-source-unavailable",
+            "conflict",
+            1,
+        ),
+        (
+            "create",
+            "422 Unprocessable Entity",
+            "workflow-source-invalid",
+            "invalid_input",
+            2,
+        ),
+    ] {
+        let code: u16 = status[..3].parse().unwrap();
+        let (server, dir, credential) = prepared(vec![problem_http_response(
+            status,
+            serde_json::json!({"type":format!("https://api.usefulmachinery.com/problems/{problem}"),
+                "title":"Refused","status":code}),
+        )]);
+        let config_file = dir.path().join("config.json");
+        fs::write(&config_file, serde_json::to_vec(&configuration()).unwrap()).unwrap();
+        let mut args = vec!["project", "trigger", action, ORG, PROJECT];
+        if action == "create" {
+            args.extend(["--config-file", config_file.to_str().unwrap()]);
+        } else {
+            args.push(TRIGGER);
+        }
+        args.extend(["--json", "--allow-insecure-http"]);
+        let output = call(&server, &credential, &args);
+        assert_eq!(value(&output)["outcome"], outcome, "{action} {problem}");
+        assert_eq!(output.status.code(), Some(exit), "{action} {problem}");
+        assert_eq!(server.finish().len(), 1, "{action} {problem}");
+    }
+}
+
 // REQ-TRIGGER-85
 #[test]
 fn lost_lifecycle_response_reuses_one_key_and_never_reports_early_success() {

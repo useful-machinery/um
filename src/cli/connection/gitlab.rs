@@ -343,6 +343,16 @@ fn repository_id(value: &str) -> anyhow::Result<&str> {
     }
     Ok(value)
 }
+// Results and failures share one JSON envelope (REQ-CONNECTION-75, REQ-CONNECTION-77).
+fn envelope(d: &Deployment, base: &Base, outcome: &str, key: Option<&str>) -> Value {
+    json!({"schemaVersion":1,"deployment":d.fingerprint().api_url(),"organizationRef":base.organization.to_string(),"outcome":outcome,"idempotencyKey":key})
+}
+fn write_document(document: &Value) -> anyhow::Result<()> {
+    let mut out = io::stdout().lock();
+    serde_json::to_writer(&mut out, document)?;
+    writeln!(out)?;
+    Ok(())
+}
 fn result(
     d: &Deployment,
     base: &Base,
@@ -354,24 +364,22 @@ fn result(
         Ok(value) => {
             let write = || -> anyhow::Result<()> {
                 if base.options.json {
-                    serde_json::to_writer(
-                        io::stdout().lock(),
-                        &json!({"schemaVersion":1,"deployment":d.fingerprint().api_url(),"organizationRef":base.organization.to_string(),"outcome":outcome,"result":value,"idempotencyKey":key}),
-                    )?;
-                    println!();
+                    let mut document = envelope(d, base, outcome, key);
+                    document["result"] = value.clone();
+                    write_document(&document)?;
                 } else {
                     let mut out = io::stdout().lock();
-                    let kind = if outcome == "repositories listed" {
+                    let kind = if outcome == "repositories_listed" {
                         "GitLab repositories"
                     } else if value.get("connectionId").is_some() {
                         "GitLab credential candidate"
                     } else {
                         "GitLab connection"
                     };
-                    writeln!(out, "{kind}: {outcome}")?;
+                    writeln!(out, "{kind}: {}", outcome.replace('_', " "))?;
                     if let Some(items) = value.get("items").and_then(Value::as_array) {
                         for item in items {
-                            if outcome == "repositories listed" {
+                            if outcome == "repositories_listed" {
                                 writeln!(
                                     out,
                                     "{}  {}  {}  {}  {}",
@@ -476,54 +484,81 @@ fn result(
             Ok(ExitCode::Success)
         }
         Err(failure) => {
-            let (name, remedy, exit) = match failure {
+            let (outcome, name, remedy, exit) = match failure {
                 GitLabFailure::Unauthenticated => (
+                    "unauthenticated",
                     "authentication required",
                     "Sign in again or supply a current service API key.",
                     ExitCode::AuthenticationRequired,
                 ),
                 GitLabFailure::Forbidden => (
+                    "forbidden",
                     "access denied",
                     "Ask an organization owner for access.",
                     ExitCode::GeneralFailure,
                 ),
                 GitLabFailure::Conflict => (
+                    "conflict",
                     "connection conflict",
                     "Show the current connection or candidate before retrying with a new request key.",
                     ExitCode::Conflict,
                 ),
                 GitLabFailure::CandidateUnavailable => (
+                    "candidate_unavailable",
                     "candidate unavailable",
                     "Show the candidate after validation completes; expired or failed candidates cannot be activated.",
                     ExitCode::CandidateUnavailable,
                 ),
                 GitLabFailure::IdentityMismatch => (
+                    "identity_mismatch",
                     "identity mismatch",
                     "Review the verified provider user and provide its exact ID.",
                     ExitCode::IdentityMismatch,
                 ),
                 GitLabFailure::Unreachable(_) => (
+                    "unreachable",
                     "gitlab connection API unavailable",
                     "Show the resource before replaying a mutation with the same request key.",
                     ExitCode::Unavailable,
                 ),
+                GitLabFailure::ProviderUnavailable => (
+                    "provider_unavailable",
+                    "gitlab provider unavailable",
+                    "GitLab is temporarily unavailable or asked Cloud to wait. Show the resource, then repeat the request with the same request key.",
+                    ExitCode::Unavailable,
+                ),
+                GitLabFailure::ServiceUnavailable => (
+                    "service_unavailable",
+                    "gitlab connection service unavailable",
+                    "This deployment cannot serve this GitLab operation. Review the setup guide.",
+                    ExitCode::Unavailable,
+                ),
                 GitLabFailure::InvalidInput => (
+                    "invalid_input",
                     "invalid gitlab connection request",
                     "Review the setup guide and correct the request.",
                     ExitCode::UsageError,
                 ),
                 GitLabFailure::NotFound => (
+                    "not_found",
                     "gitlab connection or candidate not found",
                     "Check the organization and resource IDs.",
                     ExitCode::GeneralFailure,
                 ),
                 GitLabFailure::Protocol => (
+                    "invalid_response",
                     "invalid gitlab connection response",
                     "Check the deployment and try again later.",
                     ExitCode::GeneralFailure,
                 ),
             };
-            if let Some(key) = key {
+            if base.options.json {
+                let mut document = envelope(d, base, outcome, key);
+                if let GitLabFailure::Unreachable(category) = failure {
+                    document["category"] = category.as_str().into();
+                }
+                write_document(&document)?;
+            } else if let Some(key) = key {
                 writeln!(
                     io::stderr().lock(),
                     "error: {name}\nrequest key: {key}\n\n{remedy}\n{GUIDE}"
@@ -554,7 +589,10 @@ fn mutation(
             }
             let value = with_api(&d, &base, |api| {
                 let first = call(api, &key);
-                if matches!(first, Err(GitLabFailure::Unreachable(_))) {
+                if matches!(
+                    first,
+                    Err(GitLabFailure::Unreachable(category)) if category.retryable_mutation()
+                ) {
                     call(api, &key)
                 } else {
                     first
@@ -621,7 +659,7 @@ impl RepositoryList {
                     },
                 )
             })?;
-            result(&d, &cmd.target.base, "repositories listed", value, None)
+            result(&d, &cmd.target.base, "repositories_listed", value, None)
         })
     }
 }
@@ -849,7 +887,7 @@ impl Cancel {
                 d,
                 cmd.target.target.base,
                 key,
-                "cancellation acknowledged",
+                "cancellation_acknowledged",
                 move |api, key| api.cancel(&org, &id, &candidate, key),
             )
         })

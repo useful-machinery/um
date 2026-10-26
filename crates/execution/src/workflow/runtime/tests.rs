@@ -1048,6 +1048,83 @@ steps:
     );
 }
 
+// INV-ENGINE-16
+#[test]
+fn conditioned_node_is_not_ready_until_its_condition_passed() {
+    let nodes = r#"
+  alpha:
+    kind: cmd
+    command: {argv: ["true"]}
+  beta:
+    kind: cmd
+    command: {argv: ["true"]}
+  deploy:
+    kind: cmd
+    condition:
+      equals:
+        - {ref: inputs.request, pointer: /go}
+        - {value: true}
+    command: {argv: ["true"]}
+"#;
+    let header = "schemaVersion: 1\ninputs:\n  request: {kind: json}\n";
+
+    let (_temporary, admitted) = admit_test_workflow_with_inputs(
+        &format!("{header}steps:{nodes}"),
+        json_request(br#"{"go":true}"#),
+    );
+    let initialization = initialize::<String, String, String, TestDeadline>(&admitted, None);
+    assert_ready_only_after_condition(&initialization, ordinary_ready);
+
+    let (_temporary, admitted) = admit_test_workflow_with_inputs(
+        &format!(
+            r#"{header}steps:
+  setup:
+    kind: cmd
+    command: {{argv: ["true"]}}
+finalizers:{nodes}"#
+        ),
+        json_request(br#"{"go":true}"#),
+    );
+    let initialization = initialize::<String, String, String, TestDeadline>(&admitted, None);
+    let setup = started_step(&initialization, "setup").unwrap();
+    let mut state = initialization.state;
+    reduce_and_advance(
+        &mut state,
+        Occurrence::StepStarted {
+            step: "setup".into(),
+            action: setup,
+        },
+    );
+    let finalization = reduce_and_advance(
+        &mut state,
+        Occurrence::StepExecutionCompleted {
+            step: "setup".into(),
+            action: setup,
+            provisional: String::new(),
+        },
+    );
+    assert_ready_only_after_condition(&finalization, finalizer_ready);
+}
+
+/// Asserts that `alpha` and `beta` took both slots and that `deploy`, whose condition passed,
+/// is ready only while that pass is recorded.
+#[track_caller]
+fn assert_ready_only_after_condition(
+    reduction: &TestReduction,
+    ready: fn(&TestRuntimeState, &str, &RuntimeStep) -> bool,
+) {
+    assert!(started_step(reduction, "alpha").is_some());
+    assert!(started_step(reduction, "beta").is_some());
+    assert_step(&reduction.state, "deploy", StepStateKind::Pending);
+    let mut state = reduction.state.clone();
+    assert!(state.steps["deploy"].condition_passed);
+    let definition = state.definition.steps["deploy"].clone();
+    assert!(ready(&state, "deploy", &definition));
+
+    state.steps.get_mut("deploy").unwrap().condition_passed = false;
+    assert!(!ready(&state, "deploy", &definition));
+}
+
 fn json_request(source: &'static [u8]) -> ResolvedInputs {
     ResolvedInputs::new(BTreeMap::from([(
         "request".to_owned(),

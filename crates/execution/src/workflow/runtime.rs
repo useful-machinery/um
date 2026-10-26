@@ -2676,8 +2676,7 @@ fn condition_gate_ready<Cause, Output, Deadline>(
     let Some(runtime) = state.steps.get(id) else {
         return false;
     };
-    if definition.condition.is_none()
-        || runtime.condition_passed
+    if condition_cleared(definition, runtime)
         || !matches!(runtime.state, StepState::Pending)
         || !condition_phase_gate_open(state, definition)
         || !condition_blockers(state, definition).is_empty()
@@ -3020,11 +3019,10 @@ fn ordinary_unsatisfied_prerequisites<Cause, Output, Deadline>(
     definition: &RuntimeStep,
     failure_stopped: bool,
 ) -> Vec<Prerequisite> {
-    let condition_pending = definition.condition.is_some()
-        && state
-            .steps
-            .get(id)
-            .is_some_and(|runtime| !runtime.condition_passed);
+    let condition_pending = state
+        .steps
+        .get(id)
+        .is_some_and(|runtime| !condition_cleared(definition, runtime));
     let mut blockers = if condition_pending {
         condition_blockers(state, definition)
     } else {
@@ -3193,8 +3191,7 @@ fn next_finalizer_condition_block<Cause, Output, Deadline>(
     state.definition.finalizer_ids.iter().find_map(|id| {
         let definition = state.definition.steps.get(id)?;
         let runtime = state.steps.get(id)?;
-        if definition.condition.is_none()
-            || runtime.condition_passed
+        if condition_cleared(definition, runtime)
             || !matches!(runtime.state, StepState::Pending)
             || !condition_phase_gate_open(state, definition)
         {
@@ -3211,10 +3208,7 @@ fn next_input_unavailable<Cause, Output, Deadline>(
 ) -> Option<(String, Vec<String>)> {
     state.definition.finalizer_ids.iter().find_map(|id| {
         let definition = state.definition.steps.get(id)?;
-        let runtime = state.steps.get(id)?;
-        if !finalizer_ready(state, id, definition)
-            || definition.condition.is_some() && !runtime.condition_passed
-        {
+        if !finalizer_ready(state, id, definition) {
             return None;
         }
         let references = unavailable_references(state, definition);
@@ -3373,19 +3367,26 @@ where
         .collect()
 }
 
+// A node with a condition is selected to start only after that condition passed in the current
+// attempt (INV-ENGINE-16). An evaluation the reducer cannot settle leaves the node pending.
+fn condition_cleared<Cause, Output>(
+    definition: &RuntimeStep,
+    runtime: &StepRuntimeState<Cause, Output>,
+) -> bool {
+    definition.condition.is_none() || runtime.condition_passed
+}
+
 fn ordinary_ready<Cause, Output, Deadline>(
     state: &RuntimeState<Cause, Output, Deadline>,
     step_id: &str,
     definition: &RuntimeStep,
 ) -> bool {
-    state
-        .steps
-        .get(step_id)
-        .is_some_and(|step| matches!(step.state, StepState::Pending))
-        && definition
-            .prerequisites
-            .iter()
-            .all(|prerequisite| ordinary_prerequisite_satisfied(state, prerequisite))
+    state.steps.get(step_id).is_some_and(|step| {
+        matches!(step.state, StepState::Pending) && condition_cleared(definition, step)
+    }) && definition
+        .prerequisites
+        .iter()
+        .all(|prerequisite| ordinary_prerequisite_satisfied(state, prerequisite))
 }
 
 fn finalizer_ready<Cause, Output, Deadline>(
@@ -3396,11 +3397,9 @@ fn finalizer_ready<Cause, Output, Deadline>(
     let Some(finalization) = &state.finalization else {
         return false;
     };
-    state
-        .steps
-        .get(id)
-        .is_some_and(|step| matches!(step.state, StepState::Pending))
-        && definition.when.contains(&finalization.trigger)
+    state.steps.get(id).is_some_and(|step| {
+        matches!(step.state, StepState::Pending) && condition_cleared(definition, step)
+    }) && definition.when.contains(&finalization.trigger)
         && definition.prerequisites.iter().all(|prerequisite| {
             state
                 .steps

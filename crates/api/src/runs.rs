@@ -821,6 +821,11 @@ fn classify_continuation_failure(response: &ReceivedResponse) -> RunFailure {
             Err(_) => RunFailure::protocol(false),
         };
     }
+    // A continuation names no input set, so a gone input is never an input
+    // admission rejection here.
+    if response.status == StatusCode::GONE {
+        return validated_problem_failure(response, None, RunFailure::Gone, false);
+    }
     classify_failure(response, RunOperation::Create)
 }
 
@@ -1090,6 +1095,9 @@ fn input_admission_rejection(
         ) => "run-input-set-consumed",
         (StatusCode::GONE, "https://api.usefulmachinery.com/problems/run-input-set-expired") => {
             "run-input-set-expired"
+        }
+        (StatusCode::GONE, "https://api.usefulmachinery.com/problems/run-input-content-gone") => {
+            "run-input-content-gone"
         }
         _ => return None,
     };
@@ -1954,6 +1962,36 @@ mod recovery_read_tests {
         assert!(matches!(
             classify_continuation_failure(&response("ownership_unproven", "workspace_not_found")),
             RunFailure::Protocol { .. }
+        ));
+    }
+
+    // REQ-RUNINPUT-59, REQ-CONTINUE-72
+    #[test]
+    fn gone_input_content_is_a_create_admission_rejection_and_a_gone_continuation() {
+        let response = BufferedBlockingResponse {
+            status: StatusCode::GONE,
+            content_type: Some(HeaderValue::from_static("application/problem+json")),
+            idempotency_keys: vec![],
+            locations: vec![],
+            cache_controls: vec![],
+            retry_afters: vec![],
+            body: serde_json::to_vec(&serde_json::json!({
+                "type": "https://api.usefulmachinery.com/problems/run-input-content-gone",
+                "title": "Input content gone", "status": 410
+            }))
+            .unwrap(),
+        };
+        assert!(matches!(
+            classify_continuation_failure(&response),
+            RunFailure::Gone
+        ));
+        assert!(matches!(
+            classify_failure(&response, RunOperation::Create),
+            RunFailure::InputAdmissionRejected {
+                status: 410,
+                problem_type: "run-input-content-gone",
+                diagnostic: None,
+            }
         ));
     }
 

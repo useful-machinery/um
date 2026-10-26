@@ -58,6 +58,11 @@ impl UnreachableCategory {
     pub const fn retryable_observation(self) -> bool {
         matches!(self, Self::Connection | Self::Timeout | Self::Server)
     }
+
+    /// Only a failure that leaves delivery unknown lets a mutation repeat under its key.
+    pub const fn retryable_mutation(self) -> bool {
+        matches!(self, Self::Connection | Self::Timeout)
+    }
 }
 
 #[derive(Debug)]

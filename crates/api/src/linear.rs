@@ -803,8 +803,14 @@ fn classify_response(status: StatusCode, body: &[u8], retry_after: Option<u64>) 
         (StatusCode::NOT_FOUND, problem::NOT_FOUND) => LinearFailure::NotFound,
         (
             StatusCode::CONFLICT,
-            "https://api.usefulmachinery.com/problems/source-connection-conflict",
+            "https://api.usefulmachinery.com/problems/source-connection-conflict"
+            | problem::QUANTITY_LIMIT_REACHED
+            | "https://api.usefulmachinery.com/problems/workflow-source-unavailable",
         ) => LinearFailure::Conflict,
+        (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "https://api.usefulmachinery.com/problems/workflow-source-invalid",
+        ) => LinearFailure::InvalidInput,
         _ => invalid(),
     }
 }

@@ -360,13 +360,7 @@ impl WebhookApi {
                 Ok(response) => response,
                 Err(error) => {
                     last = classify_reqwest_error(&error);
-                    if attempt == 0
-                        && key.is_some()
-                        && matches!(
-                            last,
-                            UnreachableCategory::Connection | UnreachableCategory::Timeout
-                        )
-                    {
+                    if attempt == 0 && key.is_some() && last.retryable_mutation() {
                         continue;
                     }
                     return Err(WebhookFailure::Unreachable(last));

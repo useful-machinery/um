@@ -1564,7 +1564,7 @@ fn write_create(
                 "run-input-set-not-sealed" => {
                     "Seal the retained input set before submitting again."
                 }
-                "run-input-set-consumed" | "run-input-set-expired" => {
+                "run-input-set-consumed" | "run-input-set-expired" | "run-input-content-gone" => {
                     "Create and seal a new input set before submitting again."
                 }
                 _ => "Correct the named input's kind or schema and submit a corrected request.",

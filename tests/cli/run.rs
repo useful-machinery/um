@@ -3990,7 +3990,7 @@ fn create_input_admission_json_keeps_cloud_envelope_and_safe_diagnostic() {
     assert_eq!(server.finish().len(), 1);
 }
 
-// REQ-RUNINPUT-59
+// REQ-RUNINPUT-59, REQ-RUNINPUT-76, REQ-RUNINPUT-77
 #[test]
 fn create_input_set_rejections_without_diagnostic_retain_safe_http_facts() {
     for (status, kind, remedy) in [
@@ -4007,6 +4007,11 @@ fn create_input_set_rejections_without_diagnostic_retain_safe_http_facts() {
         (
             "410 Gone",
             "run-input-set-expired",
+            "Create and seal a new input set",
+        ),
+        (
+            "410 Gone",
+            "run-input-content-gone",
             "Create and seal a new input set",
         ),
     ] {

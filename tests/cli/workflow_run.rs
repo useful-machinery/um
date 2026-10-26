@@ -22,6 +22,7 @@ use super::claude_code_installation::{
 };
 use super::codex_installation::CodexFixture;
 use super::pi_installation::{COMPLETE_HELP, PiFixture, quote};
+use super::workflow_status::status_schema;
 use super::workflow_view::workflow_view_schema;
 use super::{
     CREDENTIALS_FILE_VARIABLE, DEPLOYMENT_VARIABLES, RUNNER_TELEMETRY_VARIABLES, poll_until,
@@ -1094,6 +1095,87 @@ finalizers:
         fs::read(bundle.execution_root.join("finalizer.txt")).unwrap(),
         b"finalizer"
     );
+}
+
+// REQ-WFCOND-6, REQ-WFCOND-24, REQ-WFCOND-25, REQ-EVIDENCE-1
+#[test]
+fn missing_json_input_pointer_fails_condition_before_step_starts() {
+    let bundle = RunBundle::new(
+        r#"schemaVersion: 1
+inputs:
+  request: {kind: json}
+steps:
+  deploy:
+    kind: cmd
+    condition:
+      equals:
+        - {ref: inputs.request, pointer: /decision}
+        - {value: run}
+    command:
+      argv: ["sh", "-c", "printf deployed > deployed.marker"]
+"#,
+    );
+    let destination = bundle.result("missing-input-pointer");
+    let mut args = bundle.args(&destination);
+    args.splice(
+        args.len() - 1..args.len() - 1,
+        [
+            "--input-json".to_owned(),
+            "request".to_owned(),
+            r#"{"other":null}"#.to_owned(),
+            "--json".to_owned(),
+        ],
+    );
+    let output = run(&args);
+    assert!(
+        !output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let terminal: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(terminal["outcome"], "failed");
+    let deploy = &terminal["result"]["steps"][0];
+    assert_eq!(deploy["id"], "deploy");
+    assert_eq!(deploy["state"], "failed");
+    assert_eq!(
+        deploy["detail"],
+        serde_json::json!({
+            "phase": "condition",
+            "code": "json_pointer_missing",
+            "ref": "inputs.request",
+            "pointer": "/decision",
+        })
+    );
+    assert!(deploy.get("startedAt").is_none());
+    assert!(!bundle.execution_root.join("deployed.marker").exists());
+
+    for (command, schema) in [
+        ("view", workflow_view_schema()),
+        ("status", status_schema()),
+    ] {
+        let inspected = run(&[
+            "workflow".to_owned(),
+            command.to_owned(),
+            destination.to_string_lossy().into_owned(),
+            "--json".to_owned(),
+        ]);
+        assert!(
+            inspected.status.success(),
+            "{command} stdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&inspected.stdout),
+            String::from_utf8_lossy(&inspected.stderr)
+        );
+        let inspected: serde_json::Value = serde_json::from_slice(&inspected.stdout).unwrap();
+        assert!(
+            schema.is_valid(&inspected),
+            "{command}: {:?}",
+            schema
+                .iter_errors(&inspected)
+                .map(|error| error.to_string())
+                .collect::<Vec<_>>()
+        );
+    }
 }
 
 // REQ-WFEXEC-23, REQ-WFEXEC-24, REQ-LOCALRUN-81

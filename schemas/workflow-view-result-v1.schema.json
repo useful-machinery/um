@@ -1315,13 +1315,70 @@
             },
             "required": [
               "state"
-            ]
+            ],
+            "not": {
+              "properties": {
+                "detail": {
+                  "properties": {
+                    "phase": {
+                      "const": "condition"
+                    }
+                  },
+                  "required": [
+                    "phase"
+                  ]
+                }
+              },
+              "required": [
+                "detail"
+              ]
+            }
           },
           "then": {
             "required": [
               "startedAt",
               "durationMilliseconds"
             ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "detail": {
+                "properties": {
+                  "phase": {
+                    "const": "condition"
+                  }
+                },
+                "required": [
+                  "phase"
+                ]
+              }
+            },
+            "required": [
+              "detail"
+            ]
+          },
+          "then": {
+            "not": {
+              "anyOf": [
+                {
+                  "required": [
+                    "startedAt"
+                  ]
+                },
+                {
+                  "required": [
+                    "durationMilliseconds"
+                  ]
+                },
+                {
+                  "required": [
+                    "commandOutput"
+                  ]
+                }
+              ]
+            }
           }
         },
         {
@@ -3129,7 +3186,7 @@
     },
     "ConditionJsonReference": {
       "type": "string",
-      "pattern": "^outputs\\.[a-z][A-Za-z0-9]*\\.[a-z][A-Za-z0-9]*$|^finalization\\.context$"
+      "pattern": "^inputs\\.[a-z][A-Za-z0-9]*$|^outputs\\.[a-z][A-Za-z0-9]*\\.[a-z][A-Za-z0-9]*$|^finalization\\.context$"
     },
     "EvaluatedPredicate": {
       "type": "object",

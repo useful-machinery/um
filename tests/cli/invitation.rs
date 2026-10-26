@@ -645,6 +645,18 @@ fn invitation_api_failures_use_stable_outcomes_and_exit_codes() {
             409,
             &[],
         ),
+        problem_response_with_headers(
+            "409 Conflict",
+            "https://api.usefulmachinery.com/problems/quantity-limit-reached",
+            409,
+            &[],
+        ),
+        problem_response_with_headers(
+            "409 Conflict",
+            "https://api.usefulmachinery.com/problems/quantity-limit-reached",
+            409,
+            &[],
+        ),
     ]);
     let environment = deployment_environment(&server.api_url, &credential_path);
 
@@ -689,6 +701,33 @@ fn invitation_api_failures_use_stable_outcomes_and_exit_codes() {
             "idempotency_conflict",
             None,
         ),
+        (
+            vec![
+                "organization",
+                "invitation",
+                "issue",
+                ORG_ID,
+                "--principal-id",
+                PRINCIPAL_ID,
+                "--json",
+                "--allow-insecure-http",
+            ],
+            1,
+            "quantity_limit_reached",
+            None,
+        ),
+        (
+            vec![
+                "invitation",
+                "accept",
+                INVITATION_ID,
+                "--json",
+                "--allow-insecure-http",
+            ],
+            1,
+            "quantity_limit_reached",
+            None,
+        ),
     ];
 
     for (arguments, exit_code, outcome, retry_after) in cases {
@@ -703,5 +742,5 @@ fn invitation_api_failures_use_stable_outcomes_and_exit_codes() {
         }
     }
 
-    assert_eq!(server.finish().len(), 3);
+    assert_eq!(server.finish().len(), 5);
 }

@@ -21,7 +21,7 @@
           "detail": {
             "phase": "condition",
             "code": "json_pointer_missing",
-            "ref": "outputs.plan.result",
+            "ref": "inputs.request",
             "pointer": "/missing"
           }
         }
