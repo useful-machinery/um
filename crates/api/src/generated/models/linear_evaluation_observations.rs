@@ -58,6 +58,8 @@ pub struct LinearEvaluationObservations {
     /// SHA-256 of canonical generated snapshot bytes for a snapshot mapping, or the selected mapping context's JSON encoding otherwise; not a retrievable content URL.
     #[serde(rename = "contextSha256", skip_serializing_if = "Option::is_none")]
     pub context_sha256: Option<String>,
+    #[serde(rename = "requester", skip_serializing_if = "Option::is_none")]
+    pub requester: Option<Box<models::LinearEvaluationObservationsRequester>>,
 }
 
 impl LinearEvaluationObservations {
@@ -72,6 +74,7 @@ impl LinearEvaluationObservations {
             context_started_at: None,
             context_completed_at: None,
             context_sha256: None,
+            requester: None,
         }
     }
 }

@@ -1864,6 +1864,11 @@ fn write_run_human(deployment: &str, heading: &str, run: &Run) -> anyhow::Result
         "workspace branch: {}",
         run.workspace_branch.as_deref().unwrap_or("none")
     )?;
+    let actor = enum_text(&run.actor.kind)?;
+    match run.actor.requester_principal_id.as_deref() {
+        Some(principal) => writeln!(stdout, "actor: {actor} {principal}")?,
+        None => writeln!(stdout, "actor: {actor}")?,
+    }
     writeln!(stdout, "\nworkflow source:")?;
     writeln!(
         stdout,
@@ -2541,6 +2546,7 @@ mod tests {
                 "availability": "available"
             },
             "integrationContext": {},
+            "actor": {"kind": "app"},
             "publication": null,
             "cancellation": null,
             "interruption": null,

@@ -1564,12 +1564,25 @@ fn validate_run(run: Run, requested_run_id: &str) -> Result<Run, RunFailure> {
                     && lowercase_hex(&target.expected_head_oid, 40)
             })
         })
+        && valid_run_actor(&run.actor)
         && valid_timestamp(&run.created_at)
         && valid_timestamp(&run.updated_at);
     if valid {
         Ok(run)
     } else {
         Err(RunFailure::protocol(false))
+    }
+}
+
+// REQ-RUN-82: an app run names no requester; a member's run names the
+// requester's principal.
+fn valid_run_actor(actor: &models::RunActor) -> bool {
+    match actor.kind {
+        models::run_actor::Kind::App => actor.requester_principal_id.is_none(),
+        models::run_actor::Kind::Member => actor
+            .requester_principal_id
+            .as_deref()
+            .is_some_and(|id| um_support::valid_typed_id(id, "prn_")),
     }
 }
 

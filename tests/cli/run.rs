@@ -1561,6 +1561,7 @@ fn run_body_with_state(state: &str) -> serde_json::Value {
             "issueId": "issue-private-context-sentinel",
             "source": "linear"
         },
+        "actor": {"kind": "app"},
         "publication": null,
         "cancellation": null,
         "interruption": interruption,
@@ -1664,6 +1665,59 @@ fn run_show_preserves_the_bound_existing_request_in_handoff_history() {
     let (output, server) = run_show_with_response(run_response(invalid));
     assert_eq!(output.status.code(), Some(1));
     server.finish();
+}
+
+// SC-RUN-6, REQ-RUN-82: `um run show` shows the run's actor, passes it through in JSON,
+// and reports a run without a well-formed actor as an invalid response.
+#[test]
+fn run_show_reports_the_run_actor() {
+    let principal = "prn_01k0z6r1w8f4jy2m7q9v3x5abc";
+    for (actor, line) in [
+        (
+            serde_json::json!({"kind": "member", "requesterPrincipalId": principal}),
+            format!("actor: member {principal}"),
+        ),
+        (serde_json::json!({"kind": "app"}), "actor: app".to_owned()),
+    ] {
+        let mut body = run_body();
+        body["actor"] = actor.clone();
+        let (output, server) = run_show_with_response(run_response(body.clone()));
+        assert!(output.status.success());
+        let shown: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(shown["run"]["actor"], actor);
+        server.finish();
+
+        let (server, _directory, credential_path) = prepared_run(vec![run_response(body)]);
+        let environment = deployment_environment(&server.api_url, &credential_path);
+        let output = run_with_env(
+            &["run", "show", ORGANIZATION, RUN_ID, "--allow-insecure-http"],
+            &environment,
+        );
+        assert!(output.status.success());
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        assert!(
+            stdout.lines().any(|candidate| candidate == line),
+            "missing {line:?} in {stdout:?}"
+        );
+        server.finish();
+    }
+    for actor in [
+        None,
+        Some(serde_json::json!({"kind": "member"})),
+        Some(serde_json::json!({"kind": "member", "requesterPrincipalId": "prn_short"})),
+        Some(serde_json::json!({"kind": "app", "requesterPrincipalId": principal})),
+    ] {
+        let mut body = run_body();
+        match actor {
+            Some(actor) => body["actor"] = actor,
+            None => {
+                body.as_object_mut().unwrap().remove("actor");
+            }
+        }
+        let (output, server) = run_show_with_response(run_response(body));
+        assert_invalid_response(&output);
+        server.finish();
+    }
 }
 
 // REQ-COMPAT-16

@@ -78,6 +78,7 @@
       "issueId": "abc-123",
       "source": "linear"
     },
+    "actor": { "kind": "app" },
     "publication": null,
     "cancellation": null,
     "interruption": null,

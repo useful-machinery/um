@@ -62,6 +62,8 @@ pub struct Run {
     /// Complete private immutable run metadata supplied by the caller or trigger, except keys beginning `um.`, which only Useful Machinery sets, such as a Google Docs launch's `um.integration`. Keys and values cannot contain U+0000. Encoded size uses compact UTF-8 JSON with the shortest JSON-required escapes; `<`, `>`, `&`, U+2028, and U+2029 retain their literal UTF-8 size.
     #[serde(rename = "integrationContext")]
     pub integration_context: std::collections::HashMap<String, String>,
+    #[serde(rename = "actor")]
+    pub actor: Box<models::RunActor>,
     #[serde(rename = "publication", deserialize_with = "Option::deserialize")]
     pub publication: Option<Box<models::RunPublicationHandoff>>,
     #[serde(rename = "cancellation", deserialize_with = "Option::deserialize")]
@@ -111,6 +113,7 @@ impl Run {
         source_display_snapshot: Option<models::SourceDisplaySnapshot>,
         inputs: models::RunInputSummary,
         integration_context: std::collections::HashMap<String, String>,
+        actor: models::RunActor,
         publication: Option<models::RunPublicationHandoff>,
         cancellation: Option<models::RunCancellation>,
         interruption: Option<models::RunInterruption>,
@@ -141,6 +144,7 @@ impl Run {
             source_display_snapshot: source_display_snapshot.map(Box::new),
             inputs: Box::new(inputs),
             integration_context,
+            actor: Box::new(actor),
             publication: publication.map(Box::new),
             cancellation: cancellation.map(Box::new),
             interruption: interruption.map(Box::new),
