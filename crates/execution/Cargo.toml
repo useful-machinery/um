@@ -25,6 +25,7 @@ jsonschema.workspace = true
 libc.workspace = true
 nix.workspace = true
 ratatui.workspace = true
+regex.workspace = true
 ring.workspace = true
 rustix.workspace = true
 um-support.workspace = true

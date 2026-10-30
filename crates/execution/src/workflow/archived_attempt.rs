@@ -1724,11 +1724,8 @@ fn archived_export_unavailable_reason(step: &ArchivedStep) -> Option<ExportUnava
         (ArchivedStepDetail::Evidence(NodeDetail::Failed(_)), _) => {
             Some(ExportUnavailableReasonV1::Failed)
         }
-        (ArchivedStepDetail::Evidence(NodeDetail::Blocked(_)), WorkflowNodeRole::Step) => {
+        (ArchivedStepDetail::Evidence(NodeDetail::Blocked(_)), _) => {
             Some(ExportUnavailableReasonV1::Blocked)
-        }
-        (ArchivedStepDetail::Evidence(NodeDetail::Blocked(_)), WorkflowNodeRole::Finalizer) => {
-            Some(ExportUnavailableReasonV1::InputUnavailable)
         }
         (ArchivedStepDetail::Evidence(NodeDetail::NotRun(detail)), WorkflowNodeRole::Step)
             if detail.code == NonExecutionCode::FailureStop =>

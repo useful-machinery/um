@@ -512,13 +512,16 @@ impl PrincipalAuthenticationArgs {
     }
 }
 
+const WAIT_TIMEOUT_HELP: &str =
+    "Stop waiting after a positive duration (units: ms, s, m, or h; a bare number means seconds)";
+
 #[derive(Debug, Args)]
 struct WaitTimeoutArgs {
     #[arg(
         long,
         value_name = "DURATION",
         value_parser = parse_wait_timeout,
-        help = "Stop waiting after a positive duration (units: ms, s, m, or h)"
+        help = WAIT_TIMEOUT_HELP
     )]
     timeout: Option<Duration>,
 }
@@ -579,6 +582,7 @@ where
 
 impl Cli {
     pub(crate) fn execute(self) -> CommandResult {
+        um_api::identify_client(crate::build_info::VERSION);
         match self.command {
             None => print_help(&[]),
             Some(Command::Account(command)) => command.execute(),
@@ -1212,14 +1216,13 @@ fn parse_wait_timeout(value: &str) -> Result<Duration, String> {
     } else {
         (value, 1_000)
     };
-    let quantity = quantity
-        .parse::<u64>()
-        .map_err(|_| "duration must be a positive integer followed by ms, s, m, or h".to_owned())?;
     let total_milliseconds = quantity
-        .checked_mul(milliseconds)
+        .parse::<u64>()
+        .ok()
+        .and_then(|quantity| quantity.checked_mul(milliseconds))
         .filter(|duration| *duration > 0)
         .ok_or_else(|| {
-            "duration must be a positive integer followed by ms, s, m, or h".to_owned()
+            "duration must be a positive integer, optionally followed by ms, s, m, or h".to_owned()
         })?;
     Ok(Duration::from_millis(total_milliseconds))
 }
@@ -2463,6 +2466,17 @@ mod tests {
             "project runner-pool",
             "project runner-pool remove",
             "project runner-pool set",
+            "project schedule",
+            "project schedule create",
+            "project schedule delete",
+            "project schedule disable",
+            "project schedule enable",
+            "project schedule list",
+            "project schedule occurrence",
+            "project schedule occurrence list",
+            "project schedule occurrence show",
+            "project schedule show",
+            "project schedule update",
             "project show",
             "project trigger",
             "project trigger create",
@@ -2509,6 +2523,10 @@ mod tests {
             "run input-set seal",
             "run input-set show",
             "run input-set upload",
+            "run linear",
+            "run linear history",
+            "run linear retry",
+            "run linear show",
             "run list",
             "run retry",
             "run show",

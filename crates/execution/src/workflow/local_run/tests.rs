@@ -4465,22 +4465,19 @@ fn archived_attempt_loads_valid_result_larger_than_state_document_limit() {
 
 #[test]
 fn artifact_set_carrier_boundary_is_shared_by_archive_and_portable_inspection() {
-    let prefix = "a/b;x=";
-    let value_count = 128 - prefix.chars().count();
-    let media_type = format!("{prefix}{}", "\u{1f600}".repeat(value_count));
-    let source_media_type = media_type.clone();
+    // REQ-WFFORMAT-76 bounds the reachable metadata: the largest declared media types that fit
+    // a 1 MiB workflow file beside 4,096 maximal export names.
+    let media_type = format!("a/b;x={}", "\u{1f600}".repeat(20));
     let mut source = String::from(
         "schemaVersion: 1\nsteps:\n  produce:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n    outputs:\n",
     );
     for index in 0..4_096 {
-        source.push_str(&format!("      o{index:04}:\n        kind: file\n        from: path\n        path: p{index:04}.bin\n        mediaType: \"{source_media_type}\"\n"));
+        source.push_str(&format!("      o{index:04}: {{kind: file, from: path, path: p{index:04}.bin, mediaType: \"{media_type}\"}}\n"));
     }
     source.push_str("exports:\n");
     for index in 0..4_096 {
         let name = format!("e{}{index:04}", "a".repeat(59));
-        source.push_str(&format!(
-            "  {name}:\n    ref: outputs.produce.o{index:04}\n"
-        ));
+        source.push_str(&format!("  {name}: {{ref: outputs.produce.o{index:04}}}\n"));
     }
     let fixture = AdmittedFixture::from_source(&source);
     let run_path = fixture.run_path("large-result");

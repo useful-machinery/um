@@ -1,0 +1,537 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://docs.usefulmachinery.com/schemas/workflow-run-result-v1.schema.json",
+  "title": "Useful Machinery Workflow Run Result Schema 1",
+  "oneOf": [
+    {
+      "$ref": "#/$defs/CompletedAttempt"
+    },
+    {
+      "$ref": "#/$defs/WorkflowRejection"
+    },
+    {
+      "$ref": "#/$defs/AttemptRejection"
+    },
+    {
+      "$ref": "#/$defs/ContinuationRefusal"
+    }
+  ],
+  "$defs": {
+    "AbsolutePath": {
+      "$ref": "workflow-view-result-v1.schema.json#/$defs/AbsolutePath"
+    },
+    "RelativePath": {
+      "$ref": "workflow-view-result-v1.schema.json#/$defs/RelativePath"
+    },
+    "AttemptNumber": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "Code": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_]*$"
+    },
+    "Message": {
+      "type": "string",
+      "minLength": 1
+    },
+    "CompletedAttempt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schemaVersion",
+        "command",
+        "outcome",
+        "exitStatus",
+        "runDirectory",
+        "attemptNumber",
+        "resultDirectory",
+        "result"
+      ],
+      "properties": {
+        "schemaVersion": {
+          "const": 1
+        },
+        "command": {
+          "enum": [
+            "um workflow run",
+            "um workflow retry",
+            "um workflow continue"
+          ]
+        },
+        "outcome": {
+          "enum": [
+            "succeeded",
+            "failed",
+            "cancelled"
+          ]
+        },
+        "exitStatus": {
+          "enum": [
+            0,
+            1,
+            130,
+            143
+          ]
+        },
+        "runDirectory": {
+          "$ref": "#/$defs/AbsolutePath"
+        },
+        "attemptNumber": {
+          "$ref": "#/$defs/AttemptNumber"
+        },
+        "resultDirectory": {
+          "$ref": "#/$defs/AbsolutePath"
+        },
+        "result": {
+          "$ref": "workflow-view-result-v1.schema.json#/$defs/WorkflowResult"
+        }
+      }
+    },
+    "RejectionLocation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind"
+      ],
+      "properties": {
+        "kind": {
+          "$ref": "#/$defs/Code"
+        },
+        "step": {
+          "type": "string",
+          "minLength": 1
+        },
+        "finalizer": {
+          "type": "string",
+          "minLength": 1
+        },
+        "index": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "input": {
+          "type": "string",
+          "minLength": 1
+        },
+        "output": {
+          "type": "string",
+          "minLength": 1
+        },
+        "profile": {
+          "type": "string",
+          "minLength": 1
+        },
+        "version": {
+          "type": "string",
+          "minLength": 1
+        },
+        "executablePath": {
+          "type": "string",
+          "minLength": 1
+        },
+        "export": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "RejectionDiagnostic": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "code",
+        "message",
+        "location"
+      ],
+      "properties": {
+        "code": {
+          "$ref": "#/$defs/Code"
+        },
+        "message": {
+          "$ref": "#/$defs/Message"
+        },
+        "location": {
+          "$ref": "#/$defs/RejectionLocation"
+        }
+      }
+    },
+    "WorkflowRejection": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schemaVersion",
+        "command",
+        "outcome",
+        "exitStatus",
+        "phase",
+        "workflow",
+        "diagnostics"
+      ],
+      "properties": {
+        "schemaVersion": {
+          "const": 1
+        },
+        "command": {
+          "enum": [
+            "um workflow run",
+            "um workflow retry"
+          ]
+        },
+        "outcome": {
+          "const": "rejected"
+        },
+        "exitStatus": {
+          "const": 1
+        },
+        "phase": {
+          "enum": [
+            "resolution",
+            "installation",
+            "admission"
+          ]
+        },
+        "runDirectory": {
+          "$ref": "#/$defs/AbsolutePath"
+        },
+        "workflow": {
+          "oneOf": [
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "path"
+              ],
+              "properties": {
+                "path": {
+                  "$ref": "#/$defs/RelativePath"
+                }
+              }
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "diagnostics": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 1,
+          "items": {
+            "$ref": "#/$defs/RejectionDiagnostic"
+          }
+        }
+      },
+      "if": {
+        "properties": {
+          "command": {
+            "const": "um workflow retry"
+          }
+        },
+        "required": [
+          "command"
+        ]
+      },
+      "then": {
+        "required": [
+          "runDirectory"
+        ]
+      },
+      "else": {
+        "not": {
+          "required": [
+            "runDirectory"
+          ]
+        }
+      }
+    },
+    "AttemptLocation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "attemptNumber"
+      ],
+      "properties": {
+        "kind": {
+          "const": "attempt"
+        },
+        "attemptNumber": {
+          "$ref": "#/$defs/AttemptNumber"
+        },
+        "guardIds": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "ownershipReason": {
+          "enum": [
+            "execution_host_identity_unavailable",
+            "process_identity_inspection_unavailable"
+          ]
+        }
+      }
+    },
+    "AttemptRejection": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schemaVersion",
+        "command",
+        "outcome",
+        "exitStatus",
+        "phase",
+        "runDirectory",
+        "attemptNumber",
+        "diagnostics"
+      ],
+      "properties": {
+        "schemaVersion": {
+          "const": 1
+        },
+        "command": {
+          "enum": [
+            "um workflow retry",
+            "um workflow continue"
+          ]
+        },
+        "outcome": {
+          "const": "rejected"
+        },
+        "exitStatus": {
+          "const": 1
+        },
+        "phase": {
+          "enum": [
+            "retry",
+            "continuation"
+          ]
+        },
+        "runDirectory": {
+          "$ref": "#/$defs/AbsolutePath"
+        },
+        "attemptNumber": {
+          "$ref": "#/$defs/AttemptNumber"
+        },
+        "diagnostics": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 1,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "code",
+              "message",
+              "location"
+            ],
+            "properties": {
+              "code": {
+                "$ref": "#/$defs/Code"
+              },
+              "message": {
+                "$ref": "#/$defs/Message"
+              },
+              "location": {
+                "$ref": "#/$defs/AttemptLocation"
+              }
+            }
+          }
+        }
+      },
+      "oneOf": [
+        {
+          "properties": {
+            "command": {
+              "const": "um workflow retry"
+            },
+            "phase": {
+              "const": "retry"
+            }
+          }
+        },
+        {
+          "properties": {
+            "command": {
+              "const": "um workflow continue"
+            },
+            "phase": {
+              "const": "continuation"
+            }
+          }
+        }
+      ]
+    },
+    "ContinuationViolation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "code",
+        "location"
+      ],
+      "properties": {
+        "code": {
+          "$ref": "#/$defs/Code"
+        },
+        "location": {
+          "oneOf": [
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "kind",
+                "id"
+              ],
+              "properties": {
+                "kind": {
+                  "const": "from_step"
+                },
+                "id": {
+                  "type": "string",
+                  "minLength": 1
+                }
+              }
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "kind",
+                "id",
+                "priorState"
+              ],
+              "properties": {
+                "kind": {
+                  "const": "step"
+                },
+                "id": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "priorState": {
+                  "enum": [
+                    "succeeded",
+                    "skipped",
+                    "inherited",
+                    "unsatisfied",
+                    null
+                  ]
+                }
+              }
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "kind",
+                "consumer",
+                "producer"
+              ],
+              "properties": {
+                "kind": {
+                  "const": "required_skipped"
+                },
+                "consumer": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "producer": {
+                  "type": "string",
+                  "minLength": 1
+                }
+              }
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "kind",
+                "reference"
+              ],
+              "properties": {
+                "kind": {
+                  "const": "reference"
+                },
+                "reference": {
+                  "type": "string",
+                  "minLength": 1
+                }
+              }
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "kind",
+                "name"
+              ],
+              "properties": {
+                "kind": {
+                  "const": "input"
+                },
+                "name": {
+                  "type": "string",
+                  "minLength": 1
+                }
+              }
+            }
+          ]
+        }
+      }
+    },
+    "ContinuationRefusal": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schemaVersion",
+        "command",
+        "outcome",
+        "exitStatus",
+        "phase",
+        "runDirectory",
+        "attemptNumber",
+        "diagnostics"
+      ],
+      "properties": {
+        "schemaVersion": {
+          "const": 1
+        },
+        "command": {
+          "const": "um workflow continue"
+        },
+        "outcome": {
+          "const": "rejected"
+        },
+        "exitStatus": {
+          "const": 1
+        },
+        "phase": {
+          "const": "continuation"
+        },
+        "runDirectory": {
+          "$ref": "#/$defs/AbsolutePath"
+        },
+        "attemptNumber": {
+          "$ref": "#/$defs/AttemptNumber"
+        },
+        "diagnostics": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "oneOf": [
+              {
+                "$ref": "#/$defs/ContinuationViolation"
+              },
+              {
+                "$ref": "#/$defs/RejectionDiagnostic"
+              }
+            ]
+          }
+        }
+      }
+    }
+  }
+}

@@ -17,9 +17,7 @@ use um_human_auth::{BoundRequiredOperation, Deployment, SessionBinding};
 use crate::exit_code::ExitCode;
 
 use super::super::{ObservationClock, ObservationControl, OrganizationArg, ProjectArg};
-
-type Options =
-    super::super::CommonArgs<super::super::ProjectJson, super::super::PrincipalAuthenticationArgs>;
+use super::Options;
 
 // Clap's explicit nested groups mirror the webhook grammar; each leaf owns its own flags.
 #[derive(Debug, Args)]
@@ -77,7 +75,7 @@ struct Retry {
     )]
     idempotency_key: Option<String>,
     #[arg(long, value_name = "DURATION", value_parser = super::super::parse_wait_timeout,
-        help = "Stop waiting after a positive duration (units: ms, s, m, or h)")]
+        help = super::super::WAIT_TIMEOUT_HELP)]
     timeout: Option<Duration>,
     #[command(flatten)]
     options: Options,
@@ -530,7 +528,7 @@ fn failure_code(failure: &LinearFailure, acceptance_unknown: bool) -> (&'static 
         LinearFailure::Forbidden => ("forbidden", ExitCode::GeneralFailure),
         LinearFailure::NotFound => ("not_found", ExitCode::GeneralFailure),
         LinearFailure::Conflict => ("ineligible", ExitCode::GeneralFailure),
-        LinearFailure::InvalidInput => ("invalid_input", ExitCode::UsageError),
+        LinearFailure::InvalidInput { .. } => ("invalid_input", ExitCode::UsageError),
         LinearFailure::RateLimited { .. } => ("rate_limited", ExitCode::Unavailable),
         LinearFailure::Unreachable { .. } => (
             if acceptance_unknown {

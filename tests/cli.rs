@@ -72,6 +72,8 @@ mod runner_administration;
 mod runner_enrollment;
 #[path = "cli/runner_status.rs"]
 mod runner_status;
+#[path = "cli/schedule.rs"]
+mod schedule;
 #[path = "cli/service_principal.rs"]
 mod service_principal;
 #[path = "cli/trigger.rs"]
@@ -1150,6 +1152,27 @@ fn status_without_a_credential_still_contacts_the_server_without_authorization()
     assert!(output.stderr.is_empty());
     let request = server.finish();
     assert!(!request.contains("authorization:"));
+}
+
+// REQ-COMPAT-16
+#[test]
+fn async_client_requests_name_the_cli_version_in_the_user_agent() {
+    let body = br#"{"type":"https://api.usefulmachinery.com/problems/unauthorized","title":"Unauthorized","status":401}"#;
+    let server = OneShotServer::respond("401 Unauthorized", Some("application/problem+json"), body);
+    let credential_directory = private_credential_directory();
+    let credential_path = credential_directory.path().join("credentials.json");
+    let environment = deployment_environment(&server.api_url, credential_path.to_str().unwrap());
+
+    let output = run_with_env(
+        &["auth", "status", "--json", "--allow-insecure-http"],
+        &environment,
+    );
+
+    assert_eq!(output.status.code(), Some(3));
+    assert_eq!(
+        header_value(&server.finish(), "user-agent"),
+        format!("um/{BUILD_VERSION}")
+    );
 }
 
 // REQ-AUTH-43

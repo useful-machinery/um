@@ -418,7 +418,7 @@ fn diagnostic_message(code: ArtifactDiagnosticCode) -> &'static str {
         ArtifactDiagnosticCode::GitZeroDeltaInvalid => "The zero-delta Git artifact is invalid.",
         ArtifactDiagnosticCode::GitBundleHeaderInvalid => "The Git bundle header is invalid.",
         ArtifactDiagnosticCode::GitBundleProfileInvalid => {
-            "The Git bundle does not satisfy the Scherzo profile."
+            "The Git bundle does not satisfy a supported bundle profile."
         }
         ArtifactDiagnosticCode::GitPackInvalid => "The Git pack stream is invalid.",
         ArtifactDiagnosticCode::GitPackChecksumMismatch => "The Git pack checksum does not match.",

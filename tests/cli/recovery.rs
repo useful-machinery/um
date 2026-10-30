@@ -398,6 +398,50 @@ fn gave_up_and_handler_failure_preserve_the_raw_target_failure() {
     }
 }
 
+// REQ-WFRECOVERY-60, REQ-WFRECOVERY-62
+#[test]
+fn handler_launch_refusal_is_classified_like_a_step_command() {
+    let bundle = RunBundle::new(
+        "schemaVersion: 1\nsteps:\n  verify:\n    kind: cmd\n    recovery:\n      retries: 1\n      handler:\n        kind: cmd\n        cwd: elsewhere\n        command:\n          argv: [./repairs/handler.sh]\n    command:\n      argv: [/bin/sh, -c, 'exit 75']\n",
+    );
+    fs::create_dir(bundle.execution_root().join("elsewhere")).unwrap();
+    let run_directory = bundle.result("handler-not-found");
+    let output = run(&json_run_args(&bundle, &run_directory));
+    assert_eq!(output.status.code(), Some(1));
+    let terminal: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let step = &terminal["result"]["steps"][0];
+    assert_eq!(step["detail"]["code"], "command_exit");
+    let termination = &step["recovery"]["termination"];
+    assert_eq!(termination["kind"], "handler_failed");
+    assert_eq!(
+        termination["handlerFailure"],
+        serde_json::json!({
+            "phase": "start",
+            "cause": {"code": "command_launch_not_found"}
+        })
+    );
+    assert_eq!(
+        step["recovery"]["rounds"][0]["handler"]["failure"],
+        termination["handlerFailure"]
+    );
+    let handler = &step["invocations"][1];
+    assert_eq!(handler["role"], "recovery_handler");
+    let streams = handler["diagnostics"].as_array().unwrap();
+    assert_eq!(streams.len(), 2);
+    assert!(streams.iter().all(|stream| stream["stream"]["data"] == ""));
+
+    let view = run(&[
+        "workflow".to_owned(),
+        "view".to_owned(),
+        "--json".to_owned(),
+        run_directory.to_string_lossy().into_owned(),
+    ]);
+    assert!(view.status.success());
+    let view: serde_json::Value = serde_json::from_slice(&view.stdout).unwrap();
+    assert!(schema("schemas/workflow-view-result-v1.schema.json").is_valid(&view));
+    assert_eq!(view["result"]["steps"][0], *step);
+}
+
 // REQ-WFRECOVERY-1, REQ-WFRECOVERY-4, REQ-WFRECOVERY-36, REQ-WFRECOVERY-55
 #[test]
 fn exhaustion_remains_terminal_until_retry_starts_fresh_execution_one() {

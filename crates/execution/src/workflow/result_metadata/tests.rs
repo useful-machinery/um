@@ -551,6 +551,57 @@ fn unavailable_inherited_exports_require_a_resolved_skipped_source() {
     );
 }
 
+// REQ-EXPORTS-3
+#[test]
+fn continuation_export_of_a_blocked_finalizer_is_source_blocked() {
+    let mut document = continuation_result_fixture();
+    document["finalization"] = json!({
+        "trigger": "succeeded",
+        "finalizers": [{
+            "id": "prepare",
+            "role": "finalizer",
+            "kind": "agent",
+            "failurePolicy": "advisory",
+            "state": "failed",
+            "startedAt": "2026-08-02T12:01:45Z",
+            "durationMilliseconds": 100,
+            "detail": {"phase": "execution", "code": "harness_failed"}
+        }, {
+            "id": "consume",
+            "role": "finalizer",
+            "kind": "cmd",
+            "failurePolicy": "advisory",
+            "state": "blocked",
+            "detail": {
+                "code": "prerequisites_unsatisfied",
+                "prerequisites": [{"kind": "body", "ref": "outputs.prepare.payload"}]
+            }
+        }],
+        "issues": [
+            {"node": {"id": "prepare", "role": "finalizer"}, "impact": "advisory"},
+            {"node": {"id": "consume", "role": "finalizer"}, "impact": "advisory"}
+        ],
+        "forceAbort": false
+    });
+    document["exportSources"] = json!({
+        "receipt": {
+            "node": {"id": "consume", "role": "finalizer"},
+            "output": "receipt"
+        }
+    });
+    document["exports"] = json!({
+        "receipt": {"state": "unavailable", "reason": "source_blocked"}
+    });
+    assert!(decode(&encode(&document)).is_ok());
+
+    document["exports"]["receipt"]["reason"] = json!("source_failed");
+    let mismatched: WorkflowResultV1 = serde_json::from_value(document).unwrap();
+    assert_eq!(
+        validate_with_invariant(&mismatched),
+        Err(RunResultInvariant::ExportMetadata)
+    );
+}
+
 #[test]
 fn cloud_continuation_preserves_typed_attempt_ids_and_export_producers() {
     let mut document = continuation_result_fixture();
@@ -1053,55 +1104,172 @@ fn recovery_duration_uses_monotonic_time_even_when_wall_clock_moves() {
     assert_eq!(decoded.steps[0].invocations[0].duration_milliseconds, 100);
 }
 
+fn launch_failed_result_with_command_handler() -> Value {
+    let mut result = recovered_result_fixture();
+    let detail = json!({ "phase": "start", "code": "harness_start_failed" });
+    result["outcome"] = json!("failed");
+    result["exports"] = json!({});
+    result["steps"][0]["state"] = json!("failed");
+    result["steps"][0]["detail"] = detail.clone();
+    result["primaryIssue"] = json!({
+        "node": { "id": "produce", "role": "step" },
+        "state": "failed",
+        "detail": detail
+    });
+    result["steps"][0]["recovery"]["handlerKind"] = json!("cmd");
+    result["steps"][0]["recovery"]["rounds"][0]["failedExecution"]["failure"] = json!({
+        "phase": "start",
+        "cause": {
+            "code": "harness_start_failed"
+        }
+    });
+    result["steps"][0]["invocations"]
+        .as_array_mut()
+        .unwrap()
+        .pop();
+    result["steps"][0]["invocations"]
+        .as_array_mut()
+        .unwrap()
+        .push(handler_invocation_fixture());
+    result
+}
+
+fn handler_failed_result(failure: &Value) -> Value {
+    let mut result = launch_failed_result_with_command_handler();
+    result["steps"][0]["recovery"]["rounds"][0]["handler"] = json!({
+        "kind": "cmd", "invocationId": 2, "outcome": "failed",
+        "failure": failure
+    });
+    result["steps"][0]["recovery"]["termination"] = json!({
+        "kind": "handler_failed", "round": 1, "handlerFailure": failure
+    });
+    result
+}
+
 #[test]
 fn launch_failure_with_terminal_recovery_validates_for_publication() {
-    for termination in ["gave_up", "handler_failed"] {
-        let mut result = recovered_result_fixture();
-        let detail = json!({ "phase": "start", "code": "harness_start_failed" });
-        result["outcome"] = json!("failed");
-        result["exports"] = json!({});
-        result["steps"][0]["state"] = json!("failed");
-        result["steps"][0]["detail"] = detail.clone();
-        result["primaryIssue"] = json!({
-            "node": { "id": "produce", "role": "step" },
-            "state": "failed",
-            "detail": detail
-        });
-        result["steps"][0]["recovery"]["handlerKind"] = json!("cmd");
-        result["steps"][0]["recovery"]["rounds"][0]["failedExecution"]["failure"] = json!({
-            "phase": "start",
-            "cause": {
-                "code": "harness_start_failed"
-            }
-        });
-        result["steps"][0]["invocations"]
-            .as_array_mut()
-            .unwrap()
-            .pop();
-        result["steps"][0]["invocations"]
-            .as_array_mut()
-            .unwrap()
-            .push(handler_invocation_fixture());
-        if termination == "gave_up" {
-            result["steps"][0]["recovery"]["rounds"][0]["handler"] = json!({
-                "kind": "cmd", "invocationId": 2, "outcome": "gave_up",
-                "summary": "No repair.", "reason": "Cannot recheck."
-            });
-            result["steps"][0]["recovery"]["termination"] =
-                json!({ "kind": "gave_up", "round": 1 });
-        } else {
-            let failure = json!({ "phase": "start", "cause": { "code": "context_unavailable" } });
-            result["steps"][0]["recovery"]["rounds"][0]["handler"] = json!({
-                "kind": "cmd", "invocationId": 2, "outcome": "failed",
-                "failure": failure
-            });
-            result["steps"][0]["recovery"]["termination"] = json!({
-                "kind": "handler_failed", "round": 1, "handlerFailure": failure
-            });
-        }
-
+    let mut gave_up = launch_failed_result_with_command_handler();
+    gave_up["steps"][0]["recovery"]["rounds"][0]["handler"] = json!({
+        "kind": "cmd", "invocationId": 2, "outcome": "gave_up",
+        "summary": "No repair.", "reason": "Cannot recheck."
+    });
+    gave_up["steps"][0]["recovery"]["termination"] = json!({ "kind": "gave_up", "round": 1 });
+    let handler_failed = handler_failed_result(
+        &json!({ "phase": "start", "cause": { "code": "context_unavailable" } }),
+    );
+    for (termination, result) in [("gave_up", gave_up), ("handler_failed", handler_failed)] {
         let decoded = decode(&encode(&result)).expect(termination);
         assert_eq!(validate_with_invariant(&decoded), Ok(()));
+    }
+}
+
+// REQ-WFRECOVERY-60, REQ-WFRECOVERY-62
+#[test]
+fn handler_launch_diagnostic_accompanies_only_command_launch_failed() {
+    let spawn = json!({ "launchFailure": "spawn", "osError": 35 });
+    for (cause, valid) in [
+        (
+            json!({ "code": "command_launch_failed", "diagnostic": spawn }),
+            true,
+        ),
+        (
+            json!({
+                "code": "command_launch_failed",
+                "diagnostic": { "launchFailure": "process_identity" }
+            }),
+            true,
+        ),
+        // A result an earlier CLI wrote carries the code alone and stays readable.
+        (json!({ "code": "command_launch_failed" }), true),
+        (
+            json!({ "code": "command_launch_failed", "diagnostic": { "launchFailure": "" } }),
+            false,
+        ),
+        (
+            json!({ "code": "command_launch_failed", "diagnostic": { "launchFailure": "Spawn" } }),
+            false,
+        ),
+        (
+            json!({ "code": "command_launch_failed", "diagnostic": { "osError": 35 } }),
+            false,
+        ),
+        (json!({ "code": "command_launch_not_found" }), true),
+        (json!({ "code": "command_launch_permission_denied" }), true),
+        (json!({ "code": "command_launch_invalid_input" }), true),
+        (
+            json!({ "code": "command_launch_not_found", "diagnostic": spawn }),
+            false,
+        ),
+        (
+            json!({ "code": "command_launch_not_found", "exitCode": 9 }),
+            false,
+        ),
+        (
+            json!({ "code": "command_exit_failed", "exitCode": 9, "diagnostic": spawn }),
+            false,
+        ),
+        (
+            json!({ "code": "context_unavailable", "diagnostic": spawn }),
+            false,
+        ),
+    ] {
+        let result = handler_failed_result(&json!({ "phase": "start", "cause": cause }));
+        let decoded = decode(&encode(&result));
+        assert_eq!(decoded.is_ok(), valid, "{cause}");
+        if let Ok(decoded) = decoded {
+            assert_eq!(validate_with_invariant(&decoded), Ok(()), "{cause}");
+        }
+    }
+}
+
+// REQ-DIAG-38, REQ-WFRECOVERY-62
+#[test]
+fn handler_launch_refusal_projects_its_cause_and_operating_system_error() {
+    use crate::workflow::recovery::RecoveryHandlerFailure;
+    use crate::workflow::runtime::RecoveryHandlerFailurePhase;
+    use crate::workflow::step_runtime::{
+        CommandLaunchCause, CommandLaunchFailure, CommandLaunchRefusal, StepFailureCause,
+    };
+
+    let project = |failure| {
+        let projected = super::super::publication::recovery_handler_failure_v1(
+            RecoveryHandlerFailurePhase::Start,
+            &StepFailureCause::RecoveryHandler(RecoveryHandlerFailure::CommandLaunch(failure)),
+        )
+        .unwrap();
+        serde_json::to_value(projected.cause).unwrap()
+    };
+    assert_eq!(
+        project(CommandLaunchFailure::Other(CommandLaunchRefusal {
+            cause: CommandLaunchCause::Spawn,
+            os_error: Some(35),
+        })),
+        json!({
+            "code": "command_launch_failed",
+            "diagnostic": { "launchFailure": "spawn", "osError": 35 }
+        })
+    );
+    assert_eq!(
+        project(CommandLaunchFailure::Other(CommandLaunchRefusal::new(
+            CommandLaunchCause::ProcessIdentity
+        ))),
+        json!({
+            "code": "command_launch_failed",
+            "diagnostic": { "launchFailure": "process_identity" }
+        })
+    );
+    for (failure, code) in [
+        (CommandLaunchFailure::NotFound, "command_launch_not_found"),
+        (
+            CommandLaunchFailure::PermissionDenied,
+            "command_launch_permission_denied",
+        ),
+        (
+            CommandLaunchFailure::InvalidInput,
+            "command_launch_invalid_input",
+        ),
+    ] {
+        assert_eq!(project(failure), json!({ "code": code }));
     }
 }
 

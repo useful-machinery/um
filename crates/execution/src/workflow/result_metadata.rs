@@ -7,7 +7,7 @@ use serde::de::{Error as _, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer};
 use serde_json::Value;
 
-use um_support::valid_typed_id;
+use um_support::{is_diagnostic_slug, valid_typed_id};
 
 use super::MAXIMUM_PARALLEL_STEPS;
 use super::document::FailurePolicy;
@@ -1451,11 +1451,22 @@ fn validate_handler_summary(
 fn valid_handler_failure(failure: &super::publication::RecoveryHandlerFailureV1) -> bool {
     let decision = failure.cause.decision_rejection.is_some();
     let exit = failure.cause.exit_code.is_some();
+    // A `diagnostic` accompanies `command_launch_failed` alone (REQ-WFRECOVERY-62); a result
+    // written before the diagnostic existed carries that code without one and stays valid.
+    let diagnostic = failure.cause.diagnostic.as_ref();
     match failure.cause.code {
-        RecoveryHandlerFailureCodeV1::CommandExitFailed => !decision,
+        RecoveryHandlerFailureCodeV1::CommandExitFailed => !decision && diagnostic.is_none(),
         RecoveryHandlerFailureCodeV1::DecisionInvalid
-        | RecoveryHandlerFailureCodeV1::AgentResultInvalid => decision && !exit,
-        _ => !decision && !exit,
+        | RecoveryHandlerFailureCodeV1::AgentResultInvalid => {
+            decision && !exit && diagnostic.is_none()
+        }
+        RecoveryHandlerFailureCodeV1::CommandLaunchFailed => {
+            !decision
+                && !exit
+                && diagnostic
+                    .is_none_or(|diagnostic| is_diagnostic_slug(&diagnostic.launch_failure))
+        }
+        _ => !decision && !exit && diagnostic.is_none(),
     }
 }
 
@@ -1907,12 +1918,8 @@ pub(super) fn unavailable_export_source_matches(
                 ExportUnavailableReasonV1::Failed
             ) | (
                 WorkflowStepStateV1::Blocked,
-                WorkflowNodeRoleV1::Step,
+                _,
                 ExportUnavailableReasonV1::Blocked
-            ) | (
-                WorkflowStepStateV1::Blocked,
-                WorkflowNodeRoleV1::Finalizer,
-                ExportUnavailableReasonV1::InputUnavailable
             ) | (
                 WorkflowStepStateV1::NotRun,
                 WorkflowNodeRoleV1::Step,

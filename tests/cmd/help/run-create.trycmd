@@ -47,7 +47,7 @@ Options:
       --wait
           Observe the run until it settles
       --timeout <DURATION>
-          Stop waiting after a positive duration (units: ms, s, m, or h)
+          Stop waiting after a positive duration (units: ms, s, m, or h; a bare number means seconds)
       --json
           Print the run result as JSON
       --service-api-key-file <PATH|->

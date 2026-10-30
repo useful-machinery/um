@@ -2538,7 +2538,7 @@ fn bounded_native_error_prose_does_not_replace_structured_identity() {
     );
 }
 
-// REQ-DIAG-24, REQ-AGENT-45
+// REQ-DIAG-24, REQ-DIAG-36, REQ-AGENT-45, REQ-AGENT-70
 #[test]
 fn structured_codex_failures_project_safe_runner_diagnostics() {
     use crate::workflow::evidence::{FailurePhase, failure_detail};
@@ -2547,25 +2547,32 @@ fn structured_codex_failures_project_safe_runner_diagnostics() {
     for (info, expected) in [
         (
             json!("contextWindowExceeded"),
-            json!({"harnessError": "context_window_exceeded"}),
+            json!({"harnessError": "context_window_exceeded", "harnessFailure": "model_error"}),
         ),
         (
             json!("usageLimitExceeded"),
-            json!({"harnessError": "usage_limit_exceeded"}),
+            json!({"harnessError": "usage_limit_exceeded", "harnessFailure": "model_error"}),
         ),
         (
             json!("unauthorized"),
-            json!({"harnessError": "unauthorized"}),
+            json!({"harnessError": "unauthorized", "harnessFailure": "model_error"}),
         ),
         (
             json!("serverOverloaded"),
-            json!({"harnessError": "overloaded"}),
+            json!({"harnessError": "overloaded", "harnessFailure": "model_error"}),
         ),
         (
             json!({"responseStreamDisconnected": {"httpStatusCode": 503}}),
-            json!({"harnessError": "stream_disconnected", "httpStatus": 503}),
+            json!({
+                "harnessError": "stream_disconnected",
+                "harnessFailure": "model_output_truncated",
+                "httpStatus": 503
+            }),
         ),
-        (json!("flexUnavailable"), json!({"harnessError": "other"})),
+        (
+            json!("flexUnavailable"),
+            json!({"harnessError": "other", "harnessFailure": "model_error"}),
+        ),
     ] {
         let mut parser = running_parser(AgentValueKind::None, 1024);
         feed(

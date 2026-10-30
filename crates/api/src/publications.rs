@@ -11,7 +11,10 @@ use time::format_description::well_known::Rfc3339;
 use super::generated::{apis, models};
 use super::http_client::generated_configuration;
 use super::http_util::{self, BoundedBodyError, BufferedBlockingResponse};
-use super::problem::{self, BAD_REQUEST, FORBIDDEN, JSON_MEDIA_TYPE, NOT_FOUND, UNAUTHORIZED};
+use super::problem::{
+    self, BAD_REQUEST, FORBIDDEN, IDEMPOTENCY_CONFLICT, JSON_MEDIA_TYPE, NOT_FOUND,
+    REQUEST_BODY_TOO_LARGE, UNAUTHORIZED,
+};
 use super::{HttpTransportPolicy, UnreachableCategory, classify_reqwest_error};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
@@ -19,14 +22,11 @@ const CREATE_ATTEMPTS: usize = 2;
 const DEFAULT_LIST_LIMIT: usize = 50;
 const PRIVATE_CACHE_CONTROL: &str = "private, no-store";
 const GONE: &str = "https://api.usefulmachinery.com/problems/gone";
-const IDEMPOTENCY_CONFLICT: &str = "https://api.usefulmachinery.com/problems/idempotency-conflict";
 const RUN_NOT_PUBLISHABLE: &str = "https://api.usefulmachinery.com/problems/run-not-publishable";
 const EXPORT_NOT_PUBLISHABLE: &str =
     "https://api.usefulmachinery.com/problems/export-not-publishable";
 const TARGET_MISMATCH: &str =
     "https://api.usefulmachinery.com/problems/publication-target-mismatch";
-const REQUEST_BODY_TOO_LARGE: &str =
-    "https://api.usefulmachinery.com/problems/request-body-too-large";
 const UNSUPPORTED_MEDIA_TYPE: &str =
     "https://api.usefulmachinery.com/problems/unsupported-media-type";
 const INTERNAL_SERVER_ERROR: &str =
@@ -812,14 +812,7 @@ fn valid_publication_diagnostic_member(key: &str, value: &serde_json::Value) -> 
                     byte.is_ascii_alphanumeric() || matches!(byte, b':' | b'.' | b'_' | b'-')
                 })
         }),
-        _ => value.as_str().is_some_and(|slug| {
-            let bytes = slug.as_bytes();
-            (1..=64).contains(&bytes.len())
-                && bytes[0].is_ascii_lowercase()
-                && bytes[1..]
-                    .iter()
-                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'_')
-        }),
+        _ => value.as_str().is_some_and(um_support::is_diagnostic_slug),
     }
 }
 

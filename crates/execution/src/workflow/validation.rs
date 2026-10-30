@@ -9,9 +9,9 @@ use super::condition::{
 };
 use super::document::{
     Agent, AgentProfile, CommonNode, ConditionOperand, ConditionPredicate, ExportPresentation,
-    FailurePolicy, FinalizerDefinition, HarnessDefinition, InputDeclaration, MessageSource,
-    NodeBody, Output, OutputReference, PresentationSource, RecoveryHandler, StepDefinition,
-    StepRecovery, ValueReference, WorkflowDocument,
+    FailurePolicy, FinalizerDefinition, InputDeclaration, MessageSource, NodeBody, Output,
+    OutputReference, PresentationSource, RecoveryHandler, StepDefinition, StepRecovery,
+    ValueReference, WorkflowDocument,
 };
 use super::evidence::{MAXIMUM_PREREQUISITES, Prerequisite};
 use super::export_presentation::{Field, resolve_text};
@@ -23,7 +23,6 @@ use super::validated::{
     ValidatedRecoveryHandler, ValidatedStep, ValidatedStepRecovery, ValidatedWorkflow,
     WorkflowNode, WorkflowNodeRole, WorkflowValueType,
 };
-use super::{claude_code, codex, pi};
 
 const MAXIMUM_WORKFLOW_NODES: usize = 256;
 const MAXIMUM_CONDITION_DEPTH: usize = 16;
@@ -35,18 +34,14 @@ const MAXIMUM_WORKFLOW_CONDITION_NODES: usize = 4_096;
 pub(crate) enum ValidationFailureKind {
     MissingDependency,
     SelfDependency,
-    DuplicateDependency,
     DependencyCycle,
-    InvalidAgentProfileConfig,
     UnknownAgentProfile,
     UnknownReplacementProfile,
-    InvalidReplacementProfileConfig,
     UnknownInput,
     UnknownOutputStep,
     UnknownOutput,
     MessageTypeMismatch,
     TerminalOutputReference,
-    IllegalCommandOutput,
     ExcessAgentResponseOutput,
     ExcessAgentResultOutput,
     ConflictingAgentValueOutputs,
@@ -59,12 +54,9 @@ pub(crate) enum ValidationFailureKind {
     InvalidExportPresentationTarget,
     TooManyNodes,
     DuplicateNodeId,
-    InvalidSourceOrder,
     CrossPhaseOutputReference,
     InvalidFinalizerAfterTarget,
-    InvalidFinalizerTrigger,
     IncompatibleFinalizerTriggers,
-    InvalidFinalizationContext,
     FinalizerExportTrigger,
     TooManyPrerequisites,
     InvalidCondition,
@@ -81,7 +73,6 @@ pub(crate) enum ValidationFailureKind {
 pub(crate) enum ValidationLocation {
     WorkflowGraph,
     WorkflowNamespace,
-    AgentProfile { profile: String },
     AgentProfileReplacement { profile: String },
     AgentProfileReference { step: String },
     RecoveryAgentProfileReference { step: String },
@@ -141,17 +132,21 @@ pub(crate) fn validate(document: WorkflowDocument) -> Result<ValidatedWorkflow, 
 
 /// Validate a document, replacing declared agent profiles as a whole by name.
 ///
-/// Replacement happens after every declared profile is syntax-validated and before any
-/// step, finalizer, or recovery-handler reference is pinned, so each reference to a
-/// replaced name pins the replacement. Unknown names and invalid configurations are
-/// rejected in ascending name order.
+/// Replacement happens before any step, finalizer, or recovery-handler reference is
+/// pinned, so each reference to a replaced name pins the replacement. Decoding has
+/// already typed every declared and replacement profile; unknown names are rejected in
+/// ascending name order.
 pub(crate) fn validate_with_replacement(
     document: WorkflowDocument,
     replacement: Option<&BTreeMap<String, AgentProfile>>,
 ) -> Result<ValidatedWorkflow, ValidationFailure> {
     validate_node_namespace(&document)?;
     validate_workflow_condition_bounds(&document)?;
-    let mut agent_profiles = validate_agent_profiles(&document)?;
+    let mut agent_profiles = document
+        .agent_profiles
+        .iter()
+        .map(|(name, profile)| (name.clone(), profile.harness.clone()))
+        .collect::<BTreeMap<_, _>>();
     let mut replaced_agent_profiles = BTreeMap::new();
     for (name, profile) in replacement.into_iter().flatten() {
         if !agent_profiles.contains_key(name) {
@@ -162,16 +157,8 @@ pub(crate) fn validate_with_replacement(
                 },
             ));
         }
-        let harness = validate_harness(&profile.harness).ok_or_else(|| {
-            ValidationFailure::new(
-                ValidationFailureKind::InvalidReplacementProfileConfig,
-                ValidationLocation::AgentProfileReplacement {
-                    profile: name.clone(),
-                },
-            )
-        })?;
-        agent_profiles.insert(name.clone(), harness.clone());
-        replaced_agent_profiles.insert(name.clone(), harness);
+        agent_profiles.insert(name.clone(), profile.harness.clone());
+        replaced_agent_profiles.insert(name.clone(), profile.harness.clone());
     }
     let step_graph = validate_step_graph(&document)?;
     let finalizer_graph = validate_finalizer_graph(&document)?;
@@ -308,22 +295,6 @@ fn validate_node_namespace(document: &WorkflowDocument) -> Result<(), Validation
     {
         return Err(namespace_failure(ValidationFailureKind::DuplicateNodeId));
     }
-    validate_source_order(&document.steps, &document.step_order)?;
-    validate_source_order(&document.finalizers, &document.finalizer_order)?;
-    Ok(())
-}
-
-fn validate_source_order<T>(
-    nodes: &BTreeMap<String, T>,
-    source_order: &[String],
-) -> Result<(), ValidationFailure> {
-    let unique = source_order.iter().collect::<BTreeSet<_>>();
-    if source_order.len() != nodes.len()
-        || unique.len() != source_order.len()
-        || source_order.iter().any(|id| !nodes.contains_key(id))
-    {
-        return Err(namespace_failure(ValidationFailureKind::InvalidSourceOrder));
-    }
     Ok(())
 }
 
@@ -429,13 +400,11 @@ fn resolve_step_prerequisites(
     step: &StepDefinition,
     document: &WorkflowDocument,
 ) -> Result<Vec<ResolvedDirectPrerequisite>, ValidationFailure> {
-    let mut control_dependencies = BTreeSet::new();
     let mut prerequisites = BTreeMap::<String, ResolvedDirectPrerequisite>::new();
     for (index, dependency) in step.control_dependencies.iter().enumerate() {
         insert_control_prerequisite(
             step_name,
             dependency,
-            &mut control_dependencies,
             &mut prerequisites,
             document.steps.contains_key(dependency),
             ValidationFailureKind::MissingDependency,
@@ -467,20 +436,11 @@ fn resolve_finalizer_prerequisites(
     finalizer: &FinalizerDefinition,
     document: &WorkflowDocument,
 ) -> Result<Vec<ResolvedDirectPrerequisite>, ValidationFailure> {
-    if finalizer.when.is_empty() {
-        return Err(ValidationFailure::new(
-            ValidationFailureKind::InvalidFinalizerTrigger,
-            ValidationLocation::WorkflowGraph,
-        ));
-    }
-
-    let mut after = BTreeSet::new();
     let mut prerequisites = BTreeMap::<String, ResolvedDirectPrerequisite>::new();
     for (index, dependency) in finalizer.after.iter().enumerate() {
         insert_control_prerequisite(
             finalizer_name,
             dependency,
-            &mut after,
             &mut prerequisites,
             document.finalizers.contains_key(dependency),
             ValidationFailureKind::InvalidFinalizerAfterTarget,
@@ -510,7 +470,6 @@ fn resolve_finalizer_prerequisites(
 fn insert_control_prerequisite(
     consumer: &str,
     dependency: &String,
-    seen: &mut BTreeSet<String>,
     prerequisites: &mut BTreeMap<String, ResolvedDirectPrerequisite>,
     target_exists: bool,
     missing_kind: ValidationFailureKind,
@@ -519,9 +478,6 @@ fn insert_control_prerequisite(
     let failure = |kind| ValidationFailure::new(kind, location.clone());
     if dependency == consumer {
         return Err(failure(ValidationFailureKind::SelfDependency));
-    }
-    if !seen.insert(dependency.clone()) {
-        return Err(failure(ValidationFailureKind::DuplicateDependency));
     }
     if !target_exists {
         return Err(failure(missing_kind));
@@ -864,7 +820,6 @@ fn infer_body_prerequisites(
                     document,
                     prerequisites,
                     node_input_location(consumer_name, consumer_role, input),
-                    consumer_role == WorkflowNodeRole::Finalizer,
                 )?;
             }
         }
@@ -877,7 +832,6 @@ fn infer_body_prerequisites(
                     document,
                     prerequisites,
                     node_message_location(consumer_name, consumer_role, index, false),
-                    false,
                 )?;
             }
             for (index, source) in agent.agent.message.attachments.iter().enumerate() {
@@ -888,7 +842,6 @@ fn infer_body_prerequisites(
                     document,
                     prerequisites,
                     node_message_location(consumer_name, consumer_role, index, true),
-                    consumer_role == WorkflowNodeRole::Finalizer,
                 )?;
             }
         }
@@ -903,7 +856,6 @@ fn infer_message_prerequisite(
     document: &WorkflowDocument,
     prerequisites: &mut BTreeMap<String, ResolvedDirectPrerequisite>,
     location: ValidationLocation,
-    context_allowed: bool,
 ) -> Result<(), ValidationFailure> {
     if let MessageSource::Reference(reference) = source {
         infer_reference_prerequisite(
@@ -913,7 +865,6 @@ fn infer_message_prerequisite(
             document,
             prerequisites,
             location,
-            context_allowed,
         )?;
     }
     Ok(())
@@ -926,20 +877,11 @@ fn infer_reference_prerequisite(
     document: &WorkflowDocument,
     prerequisites: &mut BTreeMap<String, ResolvedDirectPrerequisite>,
     location: ValidationLocation,
-    context_allowed: bool,
 ) -> Result<(), ValidationFailure> {
     match reference {
-        ValueReference::Input { .. } => return Ok(()),
-        ValueReference::FinalizationContext => {
-            return if context_allowed {
-                Ok(())
-            } else {
-                Err(ValidationFailure::new(
-                    ValidationFailureKind::InvalidFinalizationContext,
-                    location,
-                ))
-            };
-        }
+        // The structural schema admits `finalization.context` only where a finalizer may
+        // bind it, and the engine value adds no prerequisite.
+        ValueReference::Input { .. } | ValueReference::FinalizationContext => return Ok(()),
         ValueReference::Output(reference) => {
             let (producer_role, producer_body, output) =
                 declared_output(document, reference, location.clone())?;
@@ -1042,53 +984,37 @@ fn validate_node_outputs(
         }
     }
 
-    match body {
-        NodeBody::Command(command) => {
-            for (output_name, output) in &command.common.outputs {
-                if matches!(
-                    output,
-                    Output::TextAgentResponse | Output::JsonAgentResult { .. }
-                ) {
-                    return Err(output_failure(
-                        ValidationFailureKind::IllegalCommandOutput,
-                        name,
-                        role,
-                        output_name,
-                    ));
-                }
-            }
-        }
-        NodeBody::Agent(agent) => {
-            let mut response_count = 0;
-            let mut result_count = 0;
-            for (output_name, output) in &agent.common.outputs {
-                let failure_kind = match output {
-                    Output::TextAgentResponse => {
-                        response_count += 1;
-                        if response_count > 1 {
-                            Some(ValidationFailureKind::ExcessAgentResponseOutput)
-                        } else {
-                            (result_count > 0)
-                                .then_some(ValidationFailureKind::ConflictingAgentValueOutputs)
-                        }
+    // The structural schema admits agent-only output sources only on agent nodes.
+    if let NodeBody::Agent(agent) = body {
+        let mut response_count = 0;
+        let mut result_count = 0;
+        for (output_name, output) in &agent.common.outputs {
+            let failure_kind = match output {
+                Output::TextAgentResponse => {
+                    response_count += 1;
+                    if response_count > 1 {
+                        Some(ValidationFailureKind::ExcessAgentResponseOutput)
+                    } else {
+                        (result_count > 0)
+                            .then_some(ValidationFailureKind::ConflictingAgentValueOutputs)
                     }
-                    Output::JsonAgentResult { .. } => {
-                        result_count += 1;
-                        if result_count > 1 {
-                            Some(ValidationFailureKind::ExcessAgentResultOutput)
-                        } else {
-                            (response_count > 0)
-                                .then_some(ValidationFailureKind::ConflictingAgentValueOutputs)
-                        }
-                    }
-                    Output::TextPath { .. }
-                    | Output::JsonPath { .. }
-                    | Output::FilePath { .. }
-                    | Output::GitBranchWorkspace => None,
-                };
-                if let Some(kind) = failure_kind {
-                    return Err(output_failure(kind, name, role, output_name));
                 }
+                Output::JsonAgentResult { .. } => {
+                    result_count += 1;
+                    if result_count > 1 {
+                        Some(ValidationFailureKind::ExcessAgentResultOutput)
+                    } else {
+                        (response_count > 0)
+                            .then_some(ValidationFailureKind::ConflictingAgentValueOutputs)
+                    }
+                }
+                Output::TextPath { .. }
+                | Output::JsonPath { .. }
+                | Output::FilePath { .. }
+                | Output::GitBranchWorkspace => None,
+            };
+            if let Some(kind) = failure_kind {
+                return Err(output_failure(kind, name, role, output_name));
             }
         }
     }
@@ -1369,7 +1295,6 @@ fn resolve_condition_reference(
         document,
         required_inputs,
         condition_location(node_name, role),
-        role == WorkflowNodeRole::Finalizer,
     )?;
     let kind = match resolved.value_type {
         WorkflowValueType::Text => ConditionValueKind::Text,
@@ -1600,7 +1525,6 @@ fn validate_command_inputs(
                 document,
                 required_inputs,
                 node_input_location(node_name, role, input_name),
-                role == WorkflowNodeRole::Finalizer,
             )
             .map(|input| (input_name.clone(), input))
         })
@@ -1612,7 +1536,6 @@ fn resolve_value_reference(
     document: &WorkflowDocument,
     required_inputs: &mut RequiredInputs,
     location: ValidationLocation,
-    context_allowed: bool,
 ) -> Result<ResolvedValueReference, ValidationFailure> {
     match reference {
         ValueReference::Input { name } => {
@@ -1642,14 +1565,10 @@ fn resolve_value_reference(
                 value_type,
             })
         }
-        ValueReference::FinalizationContext if context_allowed => Ok(ResolvedValueReference {
+        ValueReference::FinalizationContext => Ok(ResolvedValueReference {
             source: ResolvedValueSource::FinalizationContext,
             value_type: WorkflowValueType::Json,
         }),
-        ValueReference::FinalizationContext => Err(ValidationFailure::new(
-            ValidationFailureKind::InvalidFinalizationContext,
-            location,
-        )),
     }
 }
 
@@ -1666,39 +1585,6 @@ fn declared_output<'a>(
         .get(&reference.output)
         .ok_or_else(|| ValidationFailure::new(ValidationFailureKind::UnknownOutput, location))?;
     Ok((role, body, output))
-}
-
-fn validate_agent_profiles(
-    document: &WorkflowDocument,
-) -> Result<BTreeMap<String, ValidatedHarness>, ValidationFailure> {
-    document
-        .agent_profiles
-        .iter()
-        .map(|(name, profile)| {
-            let invalid_config = || {
-                ValidationFailure::new(
-                    ValidationFailureKind::InvalidAgentProfileConfig,
-                    ValidationLocation::AgentProfile {
-                        profile: name.clone(),
-                    },
-                )
-            };
-            let harness = validate_harness(&profile.harness).ok_or_else(invalid_config)?;
-            Ok((name.clone(), harness))
-        })
-        .collect()
-}
-
-fn validate_harness(harness: &HarnessDefinition) -> Option<ValidatedHarness> {
-    match harness {
-        HarnessDefinition::Pi { config } => pi::resolve_config(config).map(ValidatedHarness::Pi),
-        HarnessDefinition::ClaudeCode { config } => {
-            claude_code::resolve_config(config).map(ValidatedHarness::ClaudeCode)
-        }
-        HarnessDefinition::Codex { config } => {
-            codex::resolve_config(config).map(ValidatedHarness::Codex)
-        }
-    }
 }
 
 fn resolve_agent_profile(
@@ -1795,13 +1681,7 @@ fn validate_message_source(
         }
         MessageSource::Reference(reference) => reference,
     };
-    let value = resolve_value_reference(
-        reference,
-        document,
-        required_inputs,
-        location.clone(),
-        role == WorkflowNodeRole::Finalizer && attachment,
-    )?;
+    let value = resolve_value_reference(reference, document, required_inputs, location.clone())?;
     let compatible = match destination {
         MessageDestination::Text => value.value_type == WorkflowValueType::Text,
         MessageDestination::Attachment => matches!(

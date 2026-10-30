@@ -1,0 +1,7 @@
+schemaVersion: 1
+inputs: {settings: {kind: json}}
+steps:
+  prepare:
+    kind: cmd
+    command: {argv: ["true"]}
+    condition: {equals: [{ref: inputs.settings, pointer: /threshold}, {value: 1.5}]}

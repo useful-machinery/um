@@ -756,17 +756,12 @@ async fn with_watchdog<Output>(future: impl Future<Output = Output>) -> Output {
     with_watchdog_limit(future, Duration::from_secs(10)).await
 }
 
-#[expect(
-    clippy::disallowed_methods,
-    reason = "real time bounds fixture hangs but never makes an assertion safe"
-)]
 async fn with_watchdog_limit<Output>(
     future: impl Future<Output = Output>,
     limit: Duration,
 ) -> Output {
-    tokio::time::timeout(limit, future)
+    crate::workflow::test_support::host_scaled_watchdog("CodexAppServerV1 fixture", limit, future)
         .await
-        .expect("CodexAppServerV1 fixture watchdog expired")
 }
 
 // The child-guard process has no in-process readiness channel. This bounded OS-boundary
@@ -4199,8 +4194,9 @@ for line in sys.stdin:
     #[tokio::test]
     #[ignore = "requires pinned harness"]
     async fn pinned_real_codex_structured_result_is_corrected_once_and_settles() {
-        // Two native turns, process teardown and schema validation share this bound.
-        // The ordinary single-turn/fake-fixture watchdog remains ten seconds.
+        // Two native turns, process teardown and schema validation share this bound. The
+        // 30 s is the idle-host base, which the shared watchdog scales by the host's load;
+        // the ordinary single-turn/fake-fixture base remains ten seconds.
         with_watchdog_limit(
             async {
                 let mut provider = LoopbackResponsesProvider::start_sequence(&[

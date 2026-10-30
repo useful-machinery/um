@@ -9,9 +9,10 @@ impl AssignmentManager {
         disposition: WorkspaceDisposition,
         fenced: bool,
     ) {
-        if let Some(event) = self.run_events.remove(&assignment_id) {
-            event.finish(Some(if fenced { "fenced" } else { "aborted" }));
-        }
+        self.finish_run_event(
+            &assignment_id,
+            Some(if fenced { "fenced" } else { "aborted" }),
+        );
         self.retire_assignment_observations(&assignment_id);
         self.cleanup_retained_root(
             assignment_id,
@@ -223,13 +224,21 @@ impl AssignmentManager {
         identity: &AssignmentIdentity,
         reason: &str,
     ) -> Result<u64, OutboxFailure> {
-        self.outbox.enqueue(AssignmentObservation::Execution {
+        let id = self.outbox.enqueue(AssignmentObservation::Execution {
             assignment_id: identity.assignment_id.clone(),
             attempt_id: identity.attempt_id.clone(),
             report: ExecutionReport::AssignmentInterrupted {
                 reason: reason.to_owned(),
             },
-        })
+        })?;
+        if let Some(event) = self.run_events.get(&identity.assignment_id) {
+            event.result("interrupted");
+            event.set(KeyValue::new(
+                crate::telemetry::attribute::INTERRUPTION_CAUSE,
+                reason.to_owned(),
+            ));
+        }
+        Ok(id)
     }
 
     pub(super) fn finish_before_execution(
@@ -238,9 +247,12 @@ impl AssignmentManager {
         root: AssignmentRoot,
         reason: &str,
     ) -> Result<(), AssignmentManagerFailure> {
-        let final_observation_id = self
-            .enqueue_assignment_interruption(&identity, reason)
-            .map_err(|_| AssignmentManagerFailure::DecisionCapacity)?;
+        let Ok(final_observation_id) = self.enqueue_assignment_interruption(&identity, reason)
+        else {
+            // No report will end the run, and the slot is given up.
+            self.finish_run_event(&identity.assignment_id, Some("aborted"));
+            return Err(AssignmentManagerFailure::DecisionCapacity);
+        };
         let workspace_disposition = WorkspaceDisposition::Retain(match reason {
             "graceful_shutdown" => RetentionReason::Cancelled,
             "execution_lease_expired" => RetentionReason::Interrupted,

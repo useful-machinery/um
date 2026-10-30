@@ -1625,13 +1625,16 @@ mod tests {
     use std::fs;
     use std::io;
     use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::process::ExitStatusExt as _;
     use std::path::{Path, PathBuf};
+    use std::process::Stdio;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
     use base64::Engine as _;
     use futures_util::{SinkExt, StreamExt};
+    use rustix::process::{Signal, getpgid, kill_process_group};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio_tungstenite::accept_hdr_async;
     use tokio_tungstenite::tungstenite::Message;
@@ -1654,7 +1657,8 @@ mod tests {
         assignment_offer, begin_assignment_preparation, controlled_shutdown, controlled_sleeper,
         deterministic_frame_source, effect_acknowledgement, effect_observation_acknowledgement,
         expect_close_frame, expect_opening_hello, fixture_lease_clock, fixture_listener,
-        fixture_sleeper, observation_acknowledgement, offer_assignment_after_handshake,
+        fixture_sleeper, guarded_processes, holding_step_workflow, observation_acknowledgement,
+        offer_assignment_after_handshake, process_exists, require_internal_worker_executable,
         scripted_connector, sleep_request, terminal_observation_acknowledgement, welcome,
         with_watchdog,
     };
@@ -1689,6 +1693,35 @@ mod tests {
             assert!(error.requires_operator_recovery());
         }
         assert!(!ServiceError::BuildRuntime.requires_operator_recovery());
+    }
+
+    #[test]
+    fn recovery_file_system_cause_is_an_io_error_not_a_transport_fact() {
+        use super::recovery::RecoveryError;
+
+        let parse = |error: RecoveryError| -> serde_json::Value {
+            serde_json::from_str(&error.diagnostic()).unwrap()
+        };
+        assert_eq!(
+            parse(RecoveryError::Identity(io::Error::from(
+                io::ErrorKind::NotFound
+            ))),
+            serde_json::json!({
+                "errorType": "local_recovery_identity_unavailable",
+                "stage": "host_identity",
+                "ioError": "not_found",
+            })
+        );
+        assert_eq!(
+            parse(RecoveryError::Commit(io::Error::from(
+                io::ErrorKind::PermissionDenied
+            ))),
+            serde_json::json!({
+                "errorType": "local_recovery_commit_failed",
+                "stage": "record_commit",
+                "ioError": "permission_denied",
+            })
+        );
     }
 
     // REQ-RUNNERENROLL-72
@@ -2887,36 +2920,44 @@ mod tests {
         Message::Text(offer.to_string().into())
     }
 
-    fn accepted_assignment_config(endpoint: &str) -> AcceptedAssignmentFixture {
-        let temporary = tempfile::tempdir().expect("create service fixture root");
-        let source = temporary.path().join("source");
-        let work = temporary.path().join("work");
+    /// Commits `workflow` to a materialized source repository under `root` beside a
+    /// private runner work root, and returns both paths.
+    fn materialize_accepted_source(root: &Path, workflow: &str) -> (PathBuf, PathBuf) {
+        let source = root.join("source");
+        let work = root.join("work");
         fs::create_dir(&source).expect("create materialized source fixture");
         fs::create_dir(&work).expect("create runner work root");
         fs::set_permissions(&work, fs::Permissions::from_mode(0o700))
             .expect("make runner work root private");
-        fs::write(
-            source.join("workflow.yaml"),
-            "schemaVersion: 1\nsteps:\n  check:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n",
-        )
-        .expect("write materialized workflow fixture");
+        fs::write(source.join("workflow.yaml"), workflow)
+            .expect("write materialized workflow fixture");
         initialize_accepted_repository(&source);
-        let offer = accepted_assignment_offer(&source);
-        let source_broker = fixture_source_broker(&source);
-        let assignment = AssignmentConfig::new(&work).expect("configure assignment");
-        let config = Config::new(
+        (source, work)
+    }
+
+    fn accepted_assignment_service_config(endpoint: &str, work: &Path) -> Config {
+        let assignment = AssignmentConfig::new(work).expect("configure assignment");
+        Config::new(
             endpoint,
             test_credential(),
             true,
             assignment,
             RepositoryUrlPolicy::with_file_repositories(true),
         )
-        .expect("configure gateway");
+        .expect("configure gateway")
+    }
+
+    fn accepted_assignment_config(endpoint: &str) -> AcceptedAssignmentFixture {
+        let temporary = tempfile::tempdir().expect("create service fixture root");
+        let (source, work) = materialize_accepted_source(
+            temporary.path(),
+            "schemaVersion: 1\nsteps:\n  check:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n",
+        );
         AcceptedAssignmentFixture {
+            config: accepted_assignment_service_config(endpoint, &work),
+            source_broker: fixture_source_broker(&source),
+            offer: accepted_assignment_offer(&source),
             temporary,
-            config,
-            source_broker,
-            offer,
         }
     }
 
@@ -3011,6 +3052,23 @@ mod tests {
         accepted_sent: tokio::sync::oneshot::Sender<()>,
         offer: Message,
     ) -> (FixtureSocket, serde_json::Value, serde_json::Value) {
+        let (mut socket, accepted) = accept_offered_assignment(listener, offer).await;
+        accepted_sent
+            .send(())
+            .expect("report assignment acceptance");
+
+        let interrupted =
+            next_semantic_assignment_frame(&mut socket, "assignment_interrupted", true).await;
+        assert_eq!(interrupted["payload"]["reason"], "graceful_shutdown");
+        (socket, accepted, interrupted)
+    }
+
+    /// Opens the runner's session, offers and prepares `offer`, and returns the
+    /// unacknowledged `assignment_accepted` frame.
+    async fn accept_offered_assignment(
+        listener: &tokio::net::TcpListener,
+        offer: Message,
+    ) -> (FixtureSocket, serde_json::Value) {
         let mut socket = accept_opened_fixture_socket(listener).await;
         socket.send(welcome()).await.expect("send welcome");
         socket
@@ -3032,14 +3090,7 @@ mod tests {
         .await;
         let accepted =
             next_semantic_assignment_frame(&mut socket, "assignment_accepted", true).await;
-        accepted_sent
-            .send(())
-            .expect("report assignment acceptance");
-
-        let interrupted =
-            next_semantic_assignment_frame(&mut socket, "assignment_interrupted", true).await;
-        assert_eq!(interrupted["payload"]["reason"], "graceful_shutdown");
-        (socket, accepted, interrupted)
+        (socket, accepted)
     }
 
     fn spawn_fixture_service(
@@ -3758,7 +3809,9 @@ mod tests {
         abort_service(service).await;
 
         let connection =
-            assert_attempt_event_pair(&capture, "timeout", Some("gateway_liveness_timeout"), 1, 2);
+            assert_attempt_event_pair(&capture, "timeout", Some("gateway_liveness_timeout"), 1, 3);
+        // Aborting the service drops the offered run unprepared.
+        assert_eq!(capture.event("runner.run")["um.run.result"], "aborted");
         assert_eq!(connection["um.outcome"], "timeout");
         assert_eq!(connection["error.type"], "gateway_liveness_timeout");
 
@@ -3856,6 +3909,249 @@ mod tests {
             .expect("gateway fixture failed");
     }
 
+    const SERVING_OWNER_FIXTURE: &str = "service::tests::serving_owner_fixture";
+    const SERVING_OWNER_ENDPOINT: &str = "UM_TEST_SERVING_OWNER_ENDPOINT";
+    const SERVING_OWNER_SOURCE: &str = "UM_TEST_SERVING_OWNER_SOURCE";
+    const SERVING_OWNER_WORK_ROOT: &str = "UM_TEST_SERVING_OWNER_WORK_ROOT";
+
+    /// The serving runner that `abrupt_serving_owner_death_terminates_guarded_processes`
+    /// kills: the production connection loop, assignment manager and engine in a process
+    /// of their own, with only the source broker replaced by the fixture repository.
+    #[test]
+    #[ignore = "launched only as the serving runner that the abrupt owner-death test kills"]
+    fn serving_owner_fixture() {
+        let variable = |name| std::env::var_os(name).expect("serving owner fixture variable");
+        let endpoint = variable(SERVING_OWNER_ENDPOINT)
+            .into_string()
+            .expect("serving owner endpoint should be UTF-8");
+        let config = accepted_assignment_service_config(
+            &endpoint,
+            Path::new(&variable(SERVING_OWNER_WORK_ROOT)),
+        );
+        let source_broker = fixture_source_broker(Path::new(&variable(SERVING_OWNER_SOURCE)));
+        let (recorder, _capture) = test_recorder("rbt_00000000000000000000000001");
+        // The held trigger keeps shutdown pending, so only the kill ends this process.
+        let (shutdown, _shutdown_trigger) = controlled_shutdown();
+        let outcome = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build serving owner runtime")
+            .block_on(run_until_cancelled_with_dependencies(
+                config,
+                deterministic_frame_source(),
+                fixture_sleeper(),
+                recorder,
+                Some(source_broker),
+                shutdown,
+            ));
+        panic!("serving owner stopped before it was killed: {outcome:?}");
+    }
+
+    struct ServingOwner {
+        child: std::process::Child,
+        log: PathBuf,
+    }
+
+    impl ServingOwner {
+        fn spawn(root: &Path, endpoint: &str, source: &Path, work: &Path) -> Self {
+            // The owner runs a guarded command step, so it needs the built worker
+            // executable that `cli/scripts/check-suite` supplies; without it the
+            // fallback launches this test binary as the worker and the step never
+            // holds, which would surface only as the watchdog firing.
+            let worker = require_internal_worker_executable();
+            let log = root.join("serving-owner.stderr");
+            let child = std::process::Command::new(
+                std::env::current_exe().expect("locate the runner test executable"),
+            )
+            .args(["--ignored", "--exact", SERVING_OWNER_FIXTURE, "--nocapture"])
+            .env("UM_TEST_INTERNAL_WORKER_EXECUTABLE", &worker)
+            .env(SERVING_OWNER_ENDPOINT, endpoint)
+            .env(SERVING_OWNER_SOURCE, source)
+            .env(SERVING_OWNER_WORK_ROOT, work)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(fs::File::create(&log).expect("create serving owner log"))
+            .spawn()
+            .expect("launch the serving owner fixture");
+            Self { child, log }
+        }
+
+        fn diagnostics(&self) -> String {
+            fs::read_to_string(&self.log).unwrap_or_default()
+        }
+    }
+
+    impl Drop for ServingOwner {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+
+    fn cloud_frame(message_type: &str, message_id: &str, payload: serde_json::Value) -> Message {
+        Message::Text(
+            serde_json::json!({
+                "protocolVersion": 1,
+                "direction": "cloud_to_runner",
+                "messageId": message_id,
+                "sentAt": "2026-07-23T00:00:05Z",
+                "type": message_type,
+                "payloadVersion": 1,
+                "payload": payload,
+            })
+            .to_string()
+            .into(),
+        )
+    }
+
+    /// The leader and descendant process ids the guarded step records once it holds.
+    /// Acknowledges every runner observation and keeps the session live until `observe`
+    /// yields, answering the runner's `execution_started` with `authorization`.
+    async fn serve_started_assignment<T>(
+        socket: &mut FixtureSocket,
+        mut authorization: Option<Message>,
+        mut observe: impl FnMut() -> Option<T>,
+    ) -> T {
+        let sleeper = fixture_sleeper();
+        let mut polls = 0_u32;
+        loop {
+            if let Some(observed) = observe() {
+                return observed;
+            }
+            let next = tokio::select! {
+                frame = socket.next() => frame,
+                _ = sleeper.sleep(Duration::from_millis(10)) => {
+                    polls += 1;
+                    if polls.is_multiple_of(50) {
+                        socket.send(Message::Ping(vec![4, 5, 6].into())).await
+                            .expect("send fixture keepalive");
+                    }
+                    continue;
+                }
+            };
+            match next {
+                Some(Ok(Message::Text(frame))) => {
+                    let frame: serde_json::Value =
+                        serde_json::from_str(&frame).expect("decode runner frame");
+                    if frame["type"] == "workspace_inventory" {
+                        reject_fixture_registration(socket, &frame).await;
+                        continue;
+                    }
+                    if let (Some(message_id), Some(sequence)) =
+                        (frame["messageId"].as_str(), frame["sequence"].as_u64())
+                    {
+                        socket
+                            .send(observation_acknowledgement(message_id, sequence))
+                            .await
+                            .expect("acknowledge runner observation");
+                    }
+                    if frame["type"] == "execution_started"
+                        && let Some(authorization) = authorization.take()
+                    {
+                        socket
+                            .send(authorization)
+                            .await
+                            .expect("authorize execution start");
+                    }
+                }
+                Some(Ok(Message::Ping(payload))) => socket
+                    .send(Message::Pong(payload))
+                    .await
+                    .expect("answer runner keepalive"),
+                Some(Ok(_)) => {}
+                other => panic!("runner connection ended before the guarded step held: {other:?}"),
+            }
+        }
+    }
+
+    // REQ-RUNNERENROLL-78
+    #[tokio::test]
+    async fn abrupt_serving_owner_death_terminates_guarded_processes() {
+        let temporary = tempfile::tempdir().expect("create owner-death fixture root");
+        // The step's shell leads its guarded process group and holds a descendant in it.
+        let record = temporary.path().join("guarded-processes");
+        let (source, work) =
+            materialize_accepted_source(temporary.path(), &holding_step_workflow(&record));
+        let offer = accepted_assignment_offer(&source);
+        let Message::Text(encoded) = &offer else {
+            panic!("assignment offer fixture should be text");
+        };
+        let offered: serde_json::Value =
+            serde_json::from_str(encoded).expect("decode assignment offer fixture");
+        let identity = |effect_id: &str| {
+            let offered = &offered["payload"];
+            serde_json::json!({
+                "effectId": effect_id,
+                "assignmentId": offered["assignmentId"],
+                "runId": offered["runId"],
+                "attemptId": offered["attemptId"],
+            })
+        };
+        let mut start = identity("eff_01k0z6r1w8f4jy2m7q9v3x5abj");
+        start["executionSpecId"] = offered["payload"]["executionSpec"]["executionSpecId"].clone();
+        start["lease"] = serde_json::json!({ "leaseSequence": 1 });
+        let authorization = cloud_frame(
+            "execution_start_authorized",
+            "cmsg_01k0z6r1w8f4jy2m7q9v3x5abr",
+            identity("eff_01k0z6r1w8f4jy2m7q9v3x5abk"),
+        );
+
+        let (listener, endpoint) = fixture_listener().await;
+        let mut owner = ServingOwner::spawn(temporary.path(), &endpoint, &source, &work);
+        let (mut socket, accepted) = with_watchdog(accept_offered_assignment(&listener, offer))
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "serving owner did not accept the assignment: {}",
+                    owner.diagnostics()
+                )
+            });
+        socket
+            .send(observation_acknowledgement(
+                accepted["messageId"].as_str().unwrap(),
+                accepted["sequence"].as_u64().unwrap(),
+            ))
+            .await
+            .expect("acknowledge assignment acceptance");
+        socket
+            .send(cloud_frame(
+                "assignment_start",
+                "cmsg_01k0z6r1w8f4jy2m7q9v3x5abn",
+                start,
+            ))
+            .await
+            .expect("start the accepted assignment");
+        let (leader, descendant) = with_watchdog(serve_started_assignment(
+            &mut socket,
+            Some(authorization),
+            || guarded_processes(&record),
+        ))
+        .await
+        .unwrap_or_else(|_| panic!("guarded step did not hold: {}", owner.diagnostics()));
+        for member in [leader, descendant] {
+            assert_eq!(
+                getpgid(Some(member)),
+                Ok(leader),
+                "the step must run in its own guarded process group"
+            );
+        }
+
+        owner.child.kill().expect("kill the serving owner");
+        let status = owner.child.wait().expect("reap the serving owner");
+        assert_eq!(status.signal(), Some(Signal::KILL.as_raw()));
+        let quiesced = with_watchdog(async {
+            let sleeper = fixture_sleeper();
+            while [leader, descendant].into_iter().any(process_exists) {
+                sleeper.sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        if quiesced.is_err() {
+            let _ = kill_process_group(leader, Signal::KILL);
+            panic!("guarded processes outlived the serving owner");
+        }
+    }
+
     #[tokio::test]
     async fn classifies_pending_effect_event_cancellation() {
         let (listener, endpoint) = fixture_listener().await;
@@ -3901,7 +4197,17 @@ mod tests {
             .expect("fixture server did not observe shutdown")
             .expect("fixture server failed");
 
-        let connection = assert_attempt_event_pair(&capture, "cancelled", None, 2, 4);
+        let connection = assert_attempt_event_pair(&capture, "cancelled", None, 2, 6);
+        assert_eq!(capture.event("runner.run")["um.run.result"], "rejected");
+        let checkout = capture.event("runner.run.checkout");
+        assert_eq!(checkout["um.outcome"], "failure");
+        assert_eq!(checkout["error.type"], "runner_phase_failed");
+        assert!(
+            capture
+                .events()
+                .iter()
+                .all(|event| event["event.name"] != "runner.run.preparation")
+        );
         assert_eq!(capture.span_count("runner.assignment_preparation"), 1);
         assert_eq!(connection["um.outcome"], "cancelled");
         assert_eq!(connection["um.runner.opening_acknowledged"], true);

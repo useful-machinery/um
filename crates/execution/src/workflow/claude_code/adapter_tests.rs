@@ -19,7 +19,7 @@ use tokio::sync::{mpsc, watch};
 use super::adapter::{
     ClaudeCodeStreamJsonV1Adapter, MAXIMUM_INLINE_ATTACHMENT_FRAME_BYTES,
     NATIVE_TRANSCRIPT_CAPTURE_MISSING_DIAGNOSTIC, PREMATURE_CANDIDATE_FEEDBACK,
-    STANDARD_INPUT_WRITE_TIMEOUT, native_project_slug, prepare_launch,
+    native_project_slug, prepare_launch,
 };
 use super::test_support::{
     FixtureSignal, PendingClock, RecordingObservationSink, admitted_adapter, invocation_identity,
@@ -27,10 +27,9 @@ use super::test_support::{
 use super::*;
 use crate::workflow::admission::{CancellationReason, CancellationSource, EnvironmentSnapshot};
 use crate::workflow::agent::{
-    AgentAdapter, AgentCompatibilityProfile, AgentHarnessSetupStage, AgentInvocation,
-    AgentInvocationLimits, AgentInvocationStaging, AgentProcessContext, AgentPrompt,
-    AgentStartReceiver, AgentValueMode, PositiveDuration, RetainedJsonSchema,
-    StagedAgentAttachment, agent_start_channel,
+    AgentAdapter, AgentCompatibilityProfile, AgentInvocation, AgentInvocationLimits,
+    AgentInvocationStaging, AgentProcessContext, AgentPrompt, AgentStartReceiver, AgentValueMode,
+    PositiveDuration, RetainedJsonSchema, StagedAgentAttachment, agent_start_channel,
 };
 use crate::workflow::agent_diagnostics::{AgentDiagnosticSession, AgentDiagnosticSessionStore};
 use crate::workflow::coordinator::CoordinatorClock;
@@ -41,8 +40,8 @@ use crate::workflow::private_staging::open_directory_path;
 use crate::workflow::process_group::{ProcessGuardRegistry, process_group_is_quiescent};
 use crate::workflow::result_validation::ResultValidationWorker;
 use crate::workflow::test_support::{
-    process_fixture_interrupt_receiver, spawn_process_fixture, write_process_fixture_id,
-    write_process_fixture_signal,
+    host_scaled_watchdog, process_fixture_interrupt_receiver, spawn_process_fixture,
+    write_process_fixture_id, write_process_fixture_signal,
 };
 
 const MODEL: &str = "scherzo-loopback";
@@ -122,6 +121,13 @@ exec "$CLAUDE_FIXTURE_PROCESS_HELPER" \
 const BLOCKED_INPUT_FAKE_CLAUDE: &str = r#"#!/bin/sh
 exec "$CLAUDE_FIXTURE_PROCESS_HELPER" \
   --exact workflow::claude_code::adapter_tests::blocked_input_process_fixture \
+  --ignored --test-threads=1 \
+  3>&1 >/dev/null 2>&1
+"#;
+
+const DELAYED_INPUT_FAKE_CLAUDE: &str = r#"#!/bin/sh
+exec "$CLAUDE_FIXTURE_PROCESS_HELPER" \
+  --exact workflow::claude_code::adapter_tests::delayed_input_process_fixture \
   --ignored --test-threads=1 \
   3>&1 >/dev/null 2>&1
 "#;
@@ -529,6 +535,12 @@ case "${CLAUDE_RESULT_MODE:-settle}" in
     IFS= read -r released < "$CLAUDE_RESULT_SETTLEMENT_RELEASE"
     ;;
   post-work) cat "$CLAUDE_RESULT_POST_WORK" ;;
+  epilogue)
+    sed '$d' "$CLAUDE_RESULT_POST_WORK"
+    printf 'ready\n' > "$CLAUDE_RESULT_SETTLEMENT_READY"
+    IFS= read -r released < "$CLAUDE_RESULT_SETTLEMENT_RELEASE"
+    tail -n 1 "$CLAUDE_RESULT_POST_WORK"
+    ;;
   hang)
     trap '' INT TERM
     IFS= read -r unexpected < "$CLAUDE_RESULT_SETTLEMENT_RELEASE"
@@ -566,6 +578,10 @@ enum ResultFixtureMode {
     /// the feedback frame the agent ends a turn without a candidate, the subagent's
     /// notification arrives, and the notified turn submits the second candidate.
     BackgroundSubagent,
+    /// The first exchange launches a backgrounded subagent that settles before the
+    /// candidate; after acceptance the turn its notification announced (an epilogue)
+    /// opens, holds until the case releases it, and ends with its `result`.
+    Epilogue,
 }
 
 impl ResultFixtureMode {
@@ -577,6 +593,7 @@ impl ResultFixtureMode {
             Self::PostWork => "post-work",
             Self::Hang => "hang",
             Self::BackgroundSubagent => "background-subagent",
+            Self::Epilogue => "epilogue",
         }
     }
 }
@@ -637,11 +654,31 @@ impl ResultProcessFixture {
             paused.push(backgrounded_subagent_notification(RESULT_FIXTURE_SESSION));
             second_values.splice(0..0, paused);
         }
+        let mut post_work = Vec::new();
+        if matches!(mode, ResultFixtureMode::Epilogue) {
+            let mut launch = backgrounded_subagent_launch(RESULT_FIXTURE_SESSION);
+            launch.push(backgrounded_subagent_notification(RESULT_FIXTURE_SESSION));
+            first_values.splice(1..1, launch);
+            let waiting = ResultExchangeFixture {
+                candidate: None,
+                structured_tool_count: 0,
+                sibling_tool_use: false,
+            };
+            post_work = result_exchange_values(&expected_cwd, 2, &waiting);
+            post_work.splice(
+                1..1,
+                fixture_stream_message(
+                    RESULT_FIXTURE_SESSION,
+                    "msg-epilogue",
+                    json!({"type": "text", "text": "noted"}),
+                    "end_turn",
+                ),
+            );
+        }
         std::fs::write(&first_path, framed_result_values(&first_values)).unwrap();
         std::fs::write(&second_path, framed_result_values(&second_values)).unwrap();
-        std::fs::write(
-            &post_work_path,
-            framed_result_values(&[json!({
+        if post_work.is_empty() {
+            post_work.push(json!({
                 "type": "stream_event",
                 "event": {
                     "type": "message_start",
@@ -656,9 +693,9 @@ impl ResultProcessFixture {
                 },
                 "session_id": RESULT_FIXTURE_SESSION,
                 "parent_tool_use_id": null,
-            })]),
-        )
-        .unwrap();
+            }));
+        }
+        std::fs::write(&post_work_path, framed_result_values(&post_work)).unwrap();
         let captured_input = controls.join("input.jsonl");
         let process = controls.join("process.pid");
         let process_ready = FixtureSignal::create(controls.join("process.ready"));
@@ -1133,9 +1170,19 @@ fn stdout_before_input_process_fixture() {
 #[test]
 #[ignore = "launched as the blocked-input Claude Code process fixture"]
 fn blocked_input_process_fixture() {
+    write_process_fixture_id("CLAUDE_FIXTURE_ARGUMENTS");
+    write_process_fixture_signal("CLAUDE_FIXTURE_READY", b"ready\n");
     loop {
         std::thread::park();
     }
+}
+
+#[test]
+#[ignore = "launched as the delayed-input Claude Code process fixture"]
+fn delayed_input_process_fixture() {
+    write_process_fixture_signal("CLAUDE_FIXTURE_READY", b"ready\n");
+    await_fixture_release();
+    stdout_before_input_process_fixture();
 }
 
 fn write_fixture_frames(protocol: &mut std::fs::File, values: &[Value]) {
@@ -1228,14 +1275,13 @@ fn background_subagent_response_process_fixture() {
     assert!(remaining.is_empty());
 }
 
-#[expect(
-    clippy::disallowed_methods,
-    reason = "real time is used only as an anti-hang watchdog, never as success evidence"
-)]
 async fn with_watchdog<Output>(future: impl Future<Output = Output>) -> Output {
-    tokio::time::timeout(Duration::from_secs(10), future)
-        .await
-        .expect("ClaudeCodeStreamJsonV1 fixture watchdog expired")
+    host_scaled_watchdog(
+        "ClaudeCodeStreamJsonV1 fixture",
+        Duration::from_secs(10),
+        future,
+    )
+    .await
 }
 
 #[test]
@@ -1531,17 +1577,52 @@ async fn initial_input_is_written_while_large_stdout_is_pumped() {
     .await;
 }
 
+// REQ-AGENT-62
 #[tokio::test]
-async fn stalled_initial_input_write_reaches_a_typed_deadline() {
+async fn slow_startup_does_not_expire_initial_input_delivery() {
     with_watchdog(async {
         let mut fixture =
-            process_fixture_with_large_native_attachment(BLOCKED_INPUT_FAKE_CLAUDE, 0x24);
+            process_fixture_with_large_native_attachment(DELAYED_INPUT_FAKE_CLAUDE, 0x24);
+        let release_input = fixture.ready.path().with_file_name("release");
+        mkfifo(&release_input, Mode::S_IRUSR | Mode::S_IWUSR).unwrap();
         let invocation = fixture.invocation.take().unwrap();
-        let (clock, mut registered, release) = controlled_clock();
+        let (clock, _registered, expire) = controlled_clock();
+        // Every ordinary deadline is already expired. A large initial frame must
+        // still wait for the gated reader, rather than fail before system/init.
+        expire.send_replace(true);
         let adapter = ClaudeCodeStreamJsonV1Adapter::with_worker(
             fixture.diagnostics.clone(),
             NonZeroU64::new(1024).unwrap(),
             clock,
+            NoopExecutionObserver,
+            InlineValidationWorker,
+        );
+        let (started, start) = agent_start_channel();
+        let mut task = tokio::spawn(async move { adapter.invoke(invocation, started).await });
+        tokio::select! {
+            ready = fixture.ready.receive() => assert_eq!(ready, b"ready\n"),
+            outcome = &mut task => panic!("initial input ended before the reader was released: {outcome:?}"),
+        }
+        tokio::task::spawn_blocking(move || std::fs::write(release_input, b"release\n"))
+            .await.unwrap().unwrap();
+        assert_eq!(task.await.unwrap(), AgentOutcome::Completed(CompletedAgentInvocation::NoValue));
+        assert!(start.receive().await.is_ok());
+    })
+    .await;
+}
+
+// REQ-AGENT-46, REQ-AGENT-62
+#[tokio::test]
+async fn cancellation_during_initial_input_quiesces_the_process_group() {
+    with_watchdog(async {
+        let mut fixture =
+            process_fixture_with_large_native_attachment(BLOCKED_INPUT_FAKE_CLAUDE, 0x24);
+        let invocation = fixture.invocation.take().unwrap();
+        let cancellation = invocation.cancellation().clone();
+        let adapter = ClaudeCodeStreamJsonV1Adapter::with_worker(
+            fixture.diagnostics.clone(),
+            NonZeroU64::new(1024).unwrap(),
+            PendingClock,
             NoopExecutionObserver,
             InlineValidationWorker,
         );
@@ -1551,26 +1632,14 @@ async fn stalled_initial_input_write_reaches_a_typed_deadline() {
             let _ = terminal.send(adapter.invoke(invocation, started).await);
         });
 
-        assert_eq!(registered.recv().await, Some(STANDARD_INPUT_WRITE_TIMEOUT));
-        release.send_replace(true);
+        assert_eq!(fixture.ready.receive().await, b"ready\n");
+        let process = fixture_process(&fixture.arguments);
+        assert!(cancellation.request_cancellation(CancellationReason::UserRequest));
         task.await.unwrap();
         let outcome = outcome.await.unwrap();
         assert!(start.receive().await.is_err());
-        assert_agent_failure(
-            &outcome,
-            AgentFailureCause::HarnessSetupFailed {
-                stage: AgentHarnessSetupStage::Initialization,
-            },
-        );
-        let AgentOutcome::Failed(failure) = outcome else {
-            panic!("stalled stdin write did not fail");
-        };
-        let rejection = serde_json::to_value(failure.protocol_rejection().unwrap()).unwrap();
-        assert_eq!(rejection["detail"]["stage"], "initial_input");
-        assert_eq!(
-            rejection["detail"]["reason"],
-            "standard_input_write_timed_out"
-        );
+        assert_user_cancelled(outcome);
+        assert!(process_group_is_quiescent(process));
     })
     .await;
 }
@@ -1844,6 +1913,55 @@ async fn post_acceptance_work_and_failed_settlement_discard_the_provisional_resu
         assert_eq!(
             settlement_outcome,
             failed_agent_outcome(AgentFailureCause::ResultSettlementFailed)
+        );
+    })
+    .await;
+}
+
+// REQ-AGENT-76
+// INV-HARNESS-7
+#[tokio::test]
+async fn an_announced_epilogue_suspends_the_settlement_grace_and_the_accepted_result_stands() {
+    with_watchdog(async {
+        let (clock, mut registered, _release) = controlled_clock();
+        let fixture = ResultProcessFixture::new(
+            type_schema("number"),
+            ResultExchangeFixture::standalone(json!({"result": 1})),
+            None,
+            ResultFixtureMode::Epilogue,
+        );
+        let ready = fixture.settlement_ready.clone();
+        let release = fixture.settlement_release.clone();
+        let observations = fixture.observations.clone();
+        let task = tokio::spawn(run_result_fixture(fixture, clock, InlineValidationWorker));
+        // The validation deadline, then the grace armed at acceptance.
+        assert_eq!(registered.recv().await, Some(Duration::from_secs(1)));
+        assert_eq!(registered.recv().await, Some(Duration::from_secs(1)));
+
+        assert_eq!(ready.receive().await, b"ready\n");
+        observations
+            .wait_for(|observation| {
+                matches!(
+                    observation,
+                    AgentObservation::AssistantText { text } if text.as_ref() == "noted"
+                )
+            })
+            .await;
+        assert!(
+            registered.try_recv().is_err(),
+            "no settlement wait may run while the epilogue is open"
+        );
+        std::fs::write(release, b"release\n").unwrap();
+
+        let (_, outcome) = task.await.unwrap();
+        let AgentOutcome::Completed(CompletedAgentInvocation::Result(result)) = outcome else {
+            panic!("the accepted result must stand after the epilogue, got {outcome:?}");
+        };
+        assert_eq!(result.value(), &json!(1));
+        assert_eq!(
+            registered.try_recv().ok(),
+            Some(Duration::from_secs(1)),
+            "the grace restarts in full once the epilogue has settled"
         );
     })
     .await;
@@ -2328,7 +2446,7 @@ async fn production_failure_matrix_uses_only_existing_typed_outcomes() {
     );
 }
 
-// REQ-AGENT-42
+// REQ-AGENT-42, REQ-AGENT-71
 #[tokio::test]
 async fn parser_rejection_is_surfaced_and_retained_beside_claude_invocation_metadata() {
     let fixture = ProcessFixture::new(AgentValueMode::None, 1024);
@@ -2360,7 +2478,7 @@ async fn parser_rejection_is_surfaced_and_retained_beside_claude_invocation_meta
     });
     std::fs::write(
         fixture.invocation.as_ref().unwrap().adapter().executable(),
-        production_transcript_script(&[rejected], false, 0, session.as_str()),
+        production_transcript_script(std::slice::from_ref(&rejected), false, 0, session.as_str()),
     )
     .unwrap();
 
@@ -2383,9 +2501,28 @@ async fn parser_rejection_is_surfaced_and_retained_beside_claude_invocation_meta
 
     let retained_bytes =
         std::fs::read(fixture.diagnostic_directory.join("protocol-rejection.json")).unwrap();
-    let retained: Value = serde_json::from_slice(&retained_bytes).unwrap();
+    let mut retained: Value = serde_json::from_slice(&retained_bytes).unwrap();
+    assert!(retained_bytes.len() < 64 * 1024);
+    // Only the file keeps the stream excerpt and the tracked work beside the surfaced
+    // diagnostic (REQ-AGENT-71, REQ-AGENT-74).
+    let members = retained.as_object_mut().unwrap();
+    let rejected_line = members.remove("rejectedLine").unwrap();
+    let preceding_lines = members.remove("precedingLines").unwrap();
+    let tracked_work = members.remove("trackedWork").unwrap();
+    assert_eq!(
+        tracked_work,
+        serde_json::to_value(failure.tracked_work().unwrap()).unwrap()
+    );
     assert_eq!(retained, surfaced);
-    assert!(retained_bytes.len() < 16 * 1024);
+    assert_eq!(
+        rejected_line["text"],
+        serde_json::to_string(&rejected).unwrap()
+    );
+    let preceding_lines = preceding_lines.as_array().unwrap();
+    let preceding: Value =
+        serde_json::from_str(preceding_lines.last().unwrap()["text"].as_str().unwrap()).unwrap();
+    assert_eq!(preceding["subtype"], "init");
+    assert_eq!(preceding["session_id"], session.as_str());
     let metadata: Value = serde_json::from_slice(
         &std::fs::read(fixture.diagnostic_directory.join("metadata.json")).unwrap(),
     )

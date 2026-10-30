@@ -75,6 +75,11 @@ impl AssignmentManager {
                                     ReleaseAfter::PreExecutionCancellation(Box::new(identity)),
                                 );
                             } else {
+                                self.finish_offered_run(
+                                    &assignment_id,
+                                    &preparing.run_event,
+                                    "aborted",
+                                );
                                 self.begin_assignment_cleanup(
                                     assignment_id,
                                     root,
@@ -94,6 +99,11 @@ impl AssignmentManager {
                                     .clone(),
                             };
                             if self.outbox.enqueue(preparation).is_err() {
+                                self.finish_offered_run(
+                                    &assignment_id,
+                                    &preparing.run_event,
+                                    "aborted",
+                                );
                                 self.begin_assignment_cleanup(
                                     assignment_id,
                                     root,
@@ -126,6 +136,11 @@ impl AssignmentManager {
                                     }
                                     _ => environment_unavailable(),
                                 };
+                                self.finish_offered_run(
+                                    &assignment_id,
+                                    &preparing.run_event,
+                                    "rejected",
+                                );
                                 let response = rejected(&offer, decline);
                                 if let Err(failure) = self.retain_decision(offer, response) {
                                     self.lease_clock_failed |=
@@ -136,6 +151,12 @@ impl AssignmentManager {
                             {
                                 self.complete_pre_execution_cancellation(
                                     AssignmentIdentity::from_offer(&preparing.offer),
+                                );
+                            } else {
+                                self.finish_offered_run(
+                                    &assignment_id,
+                                    &preparing.run_event,
+                                    "aborted",
                                 );
                             }
                             self.outbox.wake();
@@ -159,6 +180,17 @@ impl AssignmentManager {
                         if let Some(event) = preparing.preparation_event.take() {
                             event.finish(TelemetryOutcome::Cancelled);
                         }
+                        // The deadline fence cancels the same capture as a
+                        // gateway cancellation or a shutdown; only those two
+                        // leave state of their own behind. A release has
+                        // already ended the run, so its leave finds nothing.
+                        if self.has_pending_pre_execution_cancellation(&offer.assignment_id)
+                            || self.shutting_down
+                        {
+                            preparing.run_event.leave(PhaseEnd::Cancelled);
+                        } else {
+                            preparing.run_event.leave(PhaseEnd::TimedOut);
+                        }
                         let root = match *admission {
                             Ok(accepted) => accepted.root,
                             Err(failure) => failure.0,
@@ -173,6 +205,11 @@ impl AssignmentManager {
                                 ReleaseAfter::PreExecutionCancellation(Box::new(identity)),
                             );
                         } else {
+                            self.finish_offered_run(
+                                &offer.assignment_id,
+                                &preparing.run_event,
+                                "aborted",
+                            );
                             self.begin_assignment_cleanup(
                                 offer.assignment_id.clone(),
                                 root,
@@ -182,13 +219,15 @@ impl AssignmentManager {
                         }
                         continue;
                     }
+                    let end = if admission.is_ok() {
+                        PhaseEnd::Succeeded
+                    } else {
+                        PhaseEnd::Failed
+                    };
                     if let Some(event) = preparing.preparation_event.take() {
-                        event.finish(if admission.is_ok() {
-                            TelemetryOutcome::Success
-                        } else {
-                            TelemetryOutcome::Failure
-                        });
+                        event.finish(end.outcome());
                     }
+                    preparing.run_event.leave(end);
                     match *admission {
                         Ok(accepted) => {
                             self.slot = Some(LocalSlot::Accepted(Box::new(accepted)));
@@ -204,6 +243,11 @@ impl AssignmentManager {
                                 self.lease_clock_failed |=
                                     failure == AssignmentManagerFailure::LeaseClock;
                                 if let Some(LocalSlot::Accepted(accepted)) = self.slot.take() {
+                                    self.finish_offered_run(
+                                        accepted.assignment_id(),
+                                        &preparing.run_event,
+                                        "aborted",
+                                    );
                                     self.begin_assignment_cleanup(
                                         accepted.identity.assignment_id.clone(),
                                         accepted.root,
@@ -215,6 +259,11 @@ impl AssignmentManager {
                         }
                         Err(failure) => {
                             let (root, decline) = *failure;
+                            self.finish_offered_run(
+                                &offer.assignment_id,
+                                &preparing.run_event,
+                                "rejected",
+                            );
                             let response = AssignmentDecision::Rejected {
                                 effect_id: prepare_effect_id,
                                 assignment_id: offer.assignment_id.clone(),
@@ -337,9 +386,10 @@ impl AssignmentManager {
                             let after = if final_observation_id.is_some() {
                                 ReleaseAfter::Reporting(Box::new(identity))
                             } else {
-                                if let Some(event) = self.run_events.remove(&assignment_id) {
-                                    event.finish(Some(if fenced { "fenced" } else { "aborted" }));
-                                }
+                                self.finish_run_event(
+                                    &assignment_id,
+                                    Some(if fenced { "fenced" } else { "aborted" }),
+                                );
                                 self.retire_assignment_observations(&assignment_id);
                                 ReleaseAfter::Idle
                             };
@@ -449,9 +499,7 @@ impl AssignmentManager {
                         let after = if continue_reporting {
                             ReleaseAfter::Reporting(Box::new(finishing.identity))
                         } else {
-                            if let Some(event) = self.run_events.remove(&assignment_id) {
-                                event.finish(Some("aborted"));
-                            }
+                            self.finish_run_event(&assignment_id, Some("aborted"));
                             self.retire_assignment_observations(&assignment_id);
                             ReleaseAfter::Idle
                         };
@@ -580,10 +628,35 @@ impl AssignmentManager {
         }
     }
 
-    pub(super) fn retire_assignment_observations(&mut self, assignment_id: &str) {
+    // Ends the assignment's `runner.run` record once; a later call finds
+    // nothing and writes nothing.
+    pub(super) fn finish_run_event(&mut self, assignment_id: &str, result: Option<&'static str>) {
         if let Some(event) = self.run_events.remove(assignment_id) {
-            event.finish(Some("fenced"));
+            event.finish(result);
         }
+    }
+
+    // Ends `run`, the run opened for an offer the runner is giving up, and
+    // forgets it only while it is still the assignment's recorded run: a
+    // declined duplicate offer must not end a live run of the same assignment.
+    pub(super) fn finish_offered_run(
+        &mut self,
+        assignment_id: &str,
+        run: &RunEvent,
+        result: &'static str,
+    ) {
+        if self
+            .run_events
+            .get(assignment_id)
+            .is_some_and(|recorded| recorded.is(run))
+        {
+            self.run_events.remove(assignment_id);
+        }
+        run.finish(Some(result));
+    }
+
+    pub(super) fn retire_assignment_observations(&mut self, assignment_id: &str) {
+        self.finish_run_event(assignment_id, Some("fenced"));
         self.outbox.fence_assignment(assignment_id);
         self.artifact_delivery.cancel_assignment(assignment_id);
         for decision in &mut self.decisions {
@@ -683,9 +756,12 @@ impl AssignmentManager {
     }
 
     pub(super) fn admission_runtime(&self) -> AdmissionRuntime {
-        let preparation_event = match &self.slot {
-            Some(LocalSlot::Preparing(preparing)) => preparing.preparation_event.clone(),
-            _ => None,
+        let (preparation_event, run_event) = match &self.slot {
+            Some(LocalSlot::Preparing(preparing)) => (
+                preparing.preparation_event.clone(),
+                preparing.run_event.clone(),
+            ),
+            _ => (None, RunEvent::default()),
         };
         AdmissionRuntime {
             pi_installation: self.pi_installation.clone(),
@@ -697,6 +773,7 @@ impl AssignmentManager {
             guard_processes: self.guard_processes,
             recorder: self.recorder.clone(),
             preparation_event,
+            run_event,
             work_root: Arc::clone(&self.work_root),
         }
     }

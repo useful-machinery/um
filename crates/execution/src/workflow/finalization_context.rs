@@ -69,8 +69,8 @@ struct FailureFact<'a> {
     exit_code: Option<i32>,
     input: Option<&'a str>,
     output: Option<&'a str>,
-    // Only the classified, bounded runner sidecar is safe to project. Other
-    // diagnostics stay in the authoritative result/observation surfaces.
+    // Only the classified, bounded runner sidecar and the kept reset time are safe to
+    // project. Other diagnostics stay in the authoritative result/observation surfaces.
     diagnostic: Option<serde_json::Value>,
 }
 
@@ -95,7 +95,7 @@ pub(crate) fn serialize(context: FinalizationContext<'_>) -> Arc<[u8]> {
                 exit_code: detail.exit_code,
                 input: detail.input.as_deref().filter(|value| value.len() <= 128),
                 output: detail.output.as_deref().filter(|value| value.len() <= 128),
-                diagnostic: detail.runner_diagnostic(),
+                diagnostic: detail.finalization_diagnostic(),
             }),
             blocked_code: issue.blocked_code,
         })
@@ -120,7 +120,7 @@ pub(crate) fn serialize(context: FinalizationContext<'_>) -> Arc<[u8]> {
 mod tests {
     use super::*;
 
-    // REQ-WFFINALIZE-5
+    // REQ-WFFINALIZE-5, REQ-DIAG-36, REQ-DIAG-38
     #[test]
     fn classified_runner_diagnostic_is_projected_without_raw_cause() {
         use super::super::agent::{
@@ -128,7 +128,10 @@ mod tests {
             HarnessFailureDiagnostic,
         };
         use super::super::evidence::{FailurePhase, failure_detail};
-        use super::super::step_runtime::{StepExecutionFailure, StepFailureCause};
+        use super::super::step_runtime::{
+            CommandLaunchCause, CommandLaunchFailure, CommandLaunchRefusal, StepExecutionFailure,
+            StepFailureCause, StepStartFailure,
+        };
         let cause = StepFailureCause::Execution(StepExecutionFailure::Agent(AgentFailure::new(
             AgentFailureCause::HarnessFailed {
                 detail: AgentHarnessFailureDetail::Classified {
@@ -138,6 +141,71 @@ mod tests {
             },
         )));
         let failure = failure_detail(FailurePhase::Execution, &cause).unwrap();
+        let launch = StepFailureCause::Start(StepStartFailure::CommandLaunch(
+            CommandLaunchFailure::Other(CommandLaunchRefusal {
+                cause: CommandLaunchCause::Spawn,
+                os_error: Some(35),
+            }),
+        ));
+        let launch = failure_detail(FailurePhase::Start, &launch).unwrap();
+        let issue = |step_id: &str, failure| OrdinaryIssue {
+            step_id: step_id.to_owned(),
+            failure_policy: FailurePolicy::Required,
+            disposition: OrdinaryIssueDisposition::Failed,
+            failure: Some(failure),
+            blocked_code: None,
+        };
+        let issues = [issue("work", failure), issue("launch", launch)];
+        let bytes = serialize(FinalizationContext {
+            run_id: "run-1",
+            attempt_id: "attempt-1",
+            trigger: FinalizationTrigger::Failed,
+            primary_issue_step_id: Some("work"),
+            cancellation_reason: None,
+            ordinary_issues: &issues,
+        });
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            value["ordinaryIssues"][0]["failure"]["diagnostic"],
+            serde_json::json!({"launchFailure": "spawn", "osError": 35})
+        );
+        assert_eq!(
+            value["ordinaryIssues"][1]["failure"]["diagnostic"],
+            serde_json::json!({
+                "harnessError": "rate_limited",
+                "harnessFailure": "model_error",
+                "httpStatus": 429
+            })
+        );
+        assert!(!String::from_utf8_lossy(&bytes).contains("rate_limit_error"));
+    }
+
+    // REQ-WFFINALIZE-5, REQ-AGENT-72
+    #[test]
+    fn issue_diagnostic_carries_the_kept_reset_time_the_runner_diagnostic_omits() {
+        use super::super::agent::{
+            AgentFailure, AgentFailureCause, AgentHarnessFailureDetail, CanonicalHarnessFailure,
+            HarnessFailureDiagnostic,
+        };
+        use super::super::evidence::{FailurePhase, failure_detail};
+        use super::super::step_runtime::{StepExecutionFailure, StepFailureCause};
+        let mut diagnostic = HarnessFailureDiagnostic::from_code("rate_limit", Some(429));
+        diagnostic.resets_at = Some(1_761_336_000);
+        let cause = StepFailureCause::Execution(StepExecutionFailure::Agent(AgentFailure::new(
+            AgentFailureCause::HarnessFailed {
+                detail: AgentHarnessFailureDetail::Classified {
+                    canonical: CanonicalHarnessFailure::ModelError,
+                    diagnostic,
+                },
+            },
+        )));
+        let failure = failure_detail(FailurePhase::Execution, &cause).unwrap();
+        let runner = serde_json::json!({
+            "harnessError": "rate_limited",
+            "harnessFailure": "model_error",
+            "httpStatus": 429
+        });
+        assert_eq!(failure.runner_diagnostic(), Some(runner));
         let issues = [OrdinaryIssue {
             step_id: "work".to_owned(),
             failure_policy: FailurePolicy::Required,
@@ -156,9 +224,13 @@ mod tests {
         let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(
             value["ordinaryIssues"][0]["failure"]["diagnostic"],
-            serde_json::json!({"harnessError": "rate_limited", "httpStatus": 429})
+            serde_json::json!({
+                "harnessError": "rate_limited",
+                "harnessFailure": "model_error",
+                "httpStatus": 429,
+                "resetsAt": "2025-10-24T20:00:00Z"
+            })
         );
-        assert!(!String::from_utf8_lossy(&bytes).contains("rate_limit_error"));
     }
 
     // REQ-WFEXEC-35, REQ-WFEXEC-36

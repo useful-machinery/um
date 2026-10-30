@@ -7,17 +7,14 @@ use reqwest::{StatusCode, Url};
 use super::generated::apis::{self, runners_api};
 use super::generated::models;
 use super::http_client::generated_configuration;
-use super::problem::QUANTITY_LIMIT_REACHED;
+use super::problem::{
+    BAD_REQUEST, FORBIDDEN, IDEMPOTENCY_CONFLICT, NOT_FOUND, QUANTITY_LIMIT_REACHED,
+    RATE_LIMIT_EXCEEDED, UNAUTHORIZED,
+};
 use super::{HttpTransportPolicy, UnreachableCategory, classify_reqwest_error, problem};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
-const BAD_REQUEST: &str = "https://api.usefulmachinery.com/problems/bad-request";
-const UNAUTHORIZED: &str = "https://api.usefulmachinery.com/problems/unauthorized";
-const FORBIDDEN: &str = "https://api.usefulmachinery.com/problems/forbidden";
-const NOT_FOUND: &str = "https://api.usefulmachinery.com/problems/not-found";
 const NAME_UNAVAILABLE: &str = "https://api.usefulmachinery.com/problems/runner-name-unavailable";
-const RATE_LIMIT: &str = "https://api.usefulmachinery.com/problems/rate-limit-exceeded";
-const IDEMPOTENCY_CONFLICT: &str = "https://api.usefulmachinery.com/problems/idempotency-conflict";
 const CREDENTIAL_LIMIT: &str =
     "https://api.usefulmachinery.com/problems/runner-credential-limit-reached";
 const ACTIVATION_UNAVAILABLE: &str =
@@ -626,7 +623,7 @@ fn classify_runner_response(status: StatusCode, body: &[u8]) -> RunnerFailure {
             RunnerFailure::CredentialTransitionUnavailable
         }
         (StatusCode::CONFLICT, POOL_MOVE_UNAVAILABLE) => RunnerFailure::PoolMoveUnavailable,
-        (StatusCode::TOO_MANY_REQUESTS, RATE_LIMIT) => RunnerFailure::RateLimited,
+        (StatusCode::TOO_MANY_REQUESTS, RATE_LIMIT_EXCEEDED) => RunnerFailure::RateLimited,
         _ => RunnerFailure::Protocol,
     }
 }

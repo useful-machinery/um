@@ -3,6 +3,7 @@ pub(crate) mod agent;
 pub(crate) mod agent_diagnostics;
 pub(crate) mod agent_input;
 mod agent_process_driver;
+pub(crate) mod agent_stream_excerpt;
 pub(crate) mod archived_attempt;
 pub(crate) mod archived_presentation;
 pub(crate) mod artifact;
@@ -106,7 +107,13 @@ pub(crate) enum DecodeFailureKind {
     MalformedYaml,
     ForbiddenYaml,
     StructuralContract,
+    WorkflowFileTooLarge,
+    WorkflowNestingTooDeep,
 }
+
+/// Largest workflow file, in bytes, that decoding accepts; the Gateway's
+/// `maximumWorkflowDocumentBytes` holds the same bound.
+const MAXIMUM_WORKFLOW_FILE_BYTES: usize = 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct DecodeFailure {
@@ -139,6 +146,20 @@ impl DecodeFailure {
             diagnostic: "workflow document violates the Workflow V1 structural contract",
         }
     }
+
+    fn workflow_file_too_large() -> Self {
+        Self {
+            kind: DecodeFailureKind::WorkflowFileTooLarge,
+            diagnostic: "workflow document exceeds 1 MiB",
+        }
+    }
+
+    fn workflow_nesting_too_deep() -> Self {
+        Self {
+            kind: DecodeFailureKind::WorkflowNestingTooDeep,
+            diagnostic: "workflow document nests values more than 100 levels deep",
+        }
+    }
 }
 
 impl fmt::Display for DecodeFailure {
@@ -150,6 +171,9 @@ impl fmt::Display for DecodeFailure {
 impl std::error::Error for DecodeFailure {}
 
 pub(crate) fn decode(bytes: &[u8]) -> Result<WorkflowDocument, DecodeFailure> {
+    if bytes.len() > MAXIMUM_WORKFLOW_FILE_BYTES {
+        return Err(DecodeFailure::workflow_file_too_large());
+    }
     let parsed = strict_yaml::parse(bytes)?;
     let validator = structural_validator().ok_or_else(DecodeFailure::structural_contract)?;
     if !validator.is_valid(&parsed.value) {

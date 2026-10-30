@@ -718,7 +718,7 @@ fn native_retry_observations_do_not_override_the_final_response() {
     )));
 }
 
-// REQ-AGENT-45
+// REQ-AGENT-45, REQ-DIAG-36
 #[test]
 fn pi_structured_error_code_projects_only_safe_fields() {
     for (code, status, expected) in [
@@ -764,7 +764,11 @@ fn pi_structured_error_code_projects_only_safe_fields() {
         )
         .unwrap();
         let projected = detail.runner_diagnostic().unwrap();
-        assert_eq!(projected["harnessError"], expected);
+        let mut exact = json!({"harnessError": expected, "harnessFailure": "model_error"});
+        if let Some(status) = status {
+            exact["httpStatus"] = json!(status);
+        }
+        assert_eq!(projected, exact);
         assert!(!projected.to_string().contains("sentinel"));
     }
 }

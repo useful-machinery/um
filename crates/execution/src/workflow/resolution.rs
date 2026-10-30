@@ -50,7 +50,6 @@ pub(crate) enum ResolutionFailureKind {
     InvalidResultSchemaReference,
     InvalidResultSchema,
     DigestInputTooLarge,
-    CapacityArithmeticOverflow,
     GeneralTransitionCapacityExceeded,
     CloudTransitionCapacityExceeded,
 }
@@ -318,8 +317,9 @@ fn resolve_loaded_workflow(
             ResolutionLocation::Workflow,
         )
     })?;
-    // The selected workflow's own declared profiles are validated first so that a
-    // defective definition is reported as such rather than as a replacement failure.
+    // Decoding the selected workflow types its declared profiles before the replacement
+    // is decoded, so a defective definition is reported as such rather than as a
+    // replacement failure.
     let decoded_replacement = replacement
         .map(|document| {
             profile_replacement::decode(document.bytes()).map_err(|failure| {
@@ -373,10 +373,10 @@ fn resolve_loaded_workflow(
         resolve_workflow_capacity(&definition, content_digest.clone(), source_closure_bytes)
             .map_err(|failure| {
                 let kind = match failure {
-                    CapacityCalculationFailure::ArithmeticOverflow => {
-                        ResolutionFailureKind::CapacityArithmeticOverflow
-                    }
-                    CapacityCalculationFailure::GeneralTransitionCapacityExceeded => {
+                    // Checked arithmetic overflows only far past the 256-node and
+                    // 10-round bounds, so an overflow is a transition-capacity excess.
+                    CapacityCalculationFailure::ArithmeticOverflow
+                    | CapacityCalculationFailure::GeneralTransitionCapacityExceeded => {
                         ResolutionFailureKind::GeneralTransitionCapacityExceeded
                     }
                     CapacityCalculationFailure::CloudTransitionCapacityExceeded => {

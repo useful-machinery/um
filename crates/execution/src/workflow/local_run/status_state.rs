@@ -3,6 +3,7 @@ use std::io::{self, Write};
 use serde::Serialize;
 use serde_json::Value;
 
+use super::super::archived_presentation::safe_text;
 use super::super::evidence::{FailureDetail, NodeDetail};
 use super::super::publication::{
     RecoveryHandlerOutcomeV1, RecoveryInvocationRoleV1, RecoveryTerminationV1, WorkflowResultV1,
@@ -60,7 +61,7 @@ impl LocalStatusStateView {
             writeln!(
                 writer,
                 "step recovery: {} · {detail} · rounds {}/{}",
-                step.id,
+                safe_text(&step.id),
                 recovery.rounds.len(),
                 recovery.configured_retries
             )?;

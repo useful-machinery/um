@@ -30,6 +30,14 @@ threads-required = 2
 slow-timeout = { period = "60s", terminate-after = 2 }
 
 [[profile.default.overrides]]
+# The stubborn-descendant fixture has a 30-second idle-host watchdog base that
+# host_scaled_watchdog multiplies by the host's load, up to four times; it
+# receives the integration-test backstop so the watchdog's diagnosis, not this
+# termination, is what a loaded host reports.
+filter = "package(um-execution) & test(=workflow::pi::adapter_tests::stubborn_descendant_is_forced_at_the_injected_deadline_before_terminal_report)"
+slow-timeout = { period = "60s", terminate-after = 2 }
+
+[[profile.default.overrides]]
 # On macOS, the process-heavy tests below use the wider group instead. Only
 # the group differs; the later overrides still set their timeouts.
 platform = 'cfg(target_os = "macos")'

@@ -235,6 +235,61 @@ pub(super) struct RunEvent(Arc<Mutex<RunEventState>>);
 struct RunEventState {
     event: Option<TelemetryEvent>,
     result: Option<&'static str>,
+    // The run, assignment and attempt IDs, built once at `start`.
+    ids: Vec<KeyValue>,
+    // The open phase child of `event`; at most one at a time.
+    phase: Option<TelemetryEvent>,
+}
+
+// The phases of a run, each recorded as a child of `runner.run`
+// (REQ-TELEMETRY-39).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum RunPhase {
+    Checkout,
+    Preparation,
+    Execution,
+    Upload,
+    Teardown,
+}
+
+impl RunPhase {
+    const fn event_name(self) -> &'static str {
+        match self {
+            Self::Checkout => "runner.run.checkout",
+            Self::Preparation => "runner.run.preparation",
+            Self::Execution => "runner.run.execution",
+            Self::Upload => "runner.run.upload",
+            Self::Teardown => "runner.run.teardown",
+        }
+    }
+}
+
+// How a run phase ended, as its record states it (REQ-TELEMETRY-39).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum PhaseEnd {
+    Succeeded,
+    Failed,
+    Cancelled,
+    TimedOut,
+}
+
+impl PhaseEnd {
+    fn outcome(self) -> TelemetryOutcome {
+        match self {
+            Self::Succeeded => TelemetryOutcome::Success,
+            Self::Failed => TelemetryOutcome::Failure,
+            Self::Cancelled => TelemetryOutcome::Cancelled,
+            Self::TimedOut => TelemetryOutcome::Timeout,
+        }
+    }
+
+    fn error_type(self) -> Option<&'static str> {
+        match self {
+            Self::Succeeded | Self::Cancelled => None,
+            Self::Failed => Some("runner_phase_failed"),
+            Self::TimedOut => Some("runner_phase_timeout"),
+        }
+    }
 }
 
 pub(super) fn lease_clock_cause(error: LeaseClockError) -> &'static str {
@@ -250,46 +305,77 @@ pub(super) fn lease_clock_cause(error: LeaseClockError) -> &'static str {
 }
 
 impl RunEvent {
+    fn state(&self) -> std::sync::MutexGuard<'_, RunEventState> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    // Whether `other` is this same handle rather than another run's.
+    fn is(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+
     fn start(
         &self,
         recorder: &crate::telemetry::Recorder,
         identity: &AssignmentIdentity,
         runner_id: &str,
     ) {
-        let mut state = self
-            .0
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut state = self.state();
         if state.event.is_none() {
-            state.event = Some(recorder.start(
-                "runner.run",
-                [
-                    KeyValue::new(crate::telemetry::attribute::RUN_ID, identity.run_id.clone()),
-                    KeyValue::new(
-                        crate::telemetry::attribute::ASSIGNMENT_ID,
-                        identity.assignment_id.clone(),
-                    ),
-                    KeyValue::new(
-                        crate::telemetry::attribute::ATTEMPT_ID,
-                        identity.attempt_id.clone(),
-                    ),
-                    KeyValue::new(crate::telemetry::attribute::RUNNER_ID, runner_id.to_owned()),
-                    KeyValue::new(
-                        crate::telemetry::attribute::RUNNER_BOOT_ID,
-                        recorder.boot_id().to_owned(),
-                    ),
-                ],
-            ));
+            state.ids = vec![
+                KeyValue::new(crate::telemetry::attribute::RUN_ID, identity.run_id.clone()),
+                KeyValue::new(
+                    crate::telemetry::attribute::ASSIGNMENT_ID,
+                    identity.assignment_id.clone(),
+                ),
+                KeyValue::new(
+                    crate::telemetry::attribute::ATTEMPT_ID,
+                    identity.attempt_id.clone(),
+                ),
+            ];
+            let attributes = state.ids.iter().cloned().chain([
+                KeyValue::new(crate::telemetry::attribute::RUNNER_ID, runner_id.to_owned()),
+                KeyValue::new(
+                    crate::telemetry::attribute::RUNNER_BOOT_ID,
+                    recorder.boot_id().to_owned(),
+                ),
+            ]);
+            state.event = Some(recorder.start("runner.run", attributes));
         }
     }
 
     pub(super) fn set(&self, attribute: KeyValue) {
-        let state = self
-            .0
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(event) = &state.event {
+        if let Some(event) = &self.state().event {
             event.set(attribute);
+        }
+    }
+
+    // Opens `phase` as a child of the run, closing an open phase as
+    // `success`. Does nothing once the run has ended or when it never began.
+    pub(super) fn enter(&self, phase: RunPhase) {
+        let mut state = self.state();
+        let Some(run) = state.event.clone() else {
+            return;
+        };
+        if let Some(open) = state.phase.take() {
+            open.finish(TelemetryOutcome::Success);
+        }
+        state.phase = Some(run.child(phase.event_name(), state.ids.clone()));
+    }
+
+    // Closes the open phase; does nothing when none is open.
+    pub(super) fn leave(&self, end: PhaseEnd) {
+        let open = self.state().phase.take();
+        if let Some(event) = open {
+            if let Some(error_type) = end.error_type() {
+                event.set(KeyValue::new(
+                    crate::telemetry::attribute::ERROR_TYPE,
+                    error_type,
+                ));
+            }
+            event.finish(end.outcome());
         }
     }
 
@@ -311,10 +397,7 @@ impl RunEvent {
     }
 
     pub(super) fn result(&self, result: &'static str) {
-        let mut state = self
-            .0
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut state = self.state();
         state.result = Some(result);
         if let Some(event) = &state.event {
             event.set(KeyValue::new(
@@ -325,21 +408,24 @@ impl RunEvent {
     }
 
     fn finish(&self, override_result: Option<&'static str>) {
-        let mut state = self
-            .0
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut state = self.state();
         let result = override_result.or(state.result).unwrap_or("aborted");
+        let outcome = match result {
+            "succeeded" => TelemetryOutcome::Success,
+            "cancelled" | "interrupted" => TelemetryOutcome::Cancelled,
+            "rejected" => TelemetryOutcome::Rejected,
+            _ => TelemetryOutcome::Failure,
+        };
+        // A phase still open when the run ends closes with the run's outcome.
+        if let Some(phase) = state.phase.take() {
+            phase.finish(outcome);
+        }
         if let Some(event) = state.event.take() {
             event.set(KeyValue::new(
                 crate::telemetry::attribute::RUN_RESULT,
                 result,
             ));
-            event.finish(match result {
-                "succeeded" => TelemetryOutcome::Success,
-                "cancelled" | "interrupted" => TelemetryOutcome::Cancelled,
-                _ => TelemetryOutcome::Failure,
-            });
+            event.finish(outcome);
         }
     }
 }
@@ -366,6 +452,7 @@ struct PreparingAssignment {
     root: Option<AssignmentRoot>,
     prepare_effect_id: Option<String>,
     preparation_event: Option<TelemetryEvent>,
+    run_event: RunEvent,
 }
 
 struct PreparationFence {
@@ -536,6 +623,7 @@ struct AdmissionRuntime {
     guard_processes: bool,
     recorder: Option<Arc<crate::telemetry::Recorder>>,
     preparation_event: Option<TelemetryEvent>,
+    run_event: RunEvent,
     work_root: Arc<WorkRootLease>,
 }
 

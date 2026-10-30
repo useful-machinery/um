@@ -496,6 +496,7 @@ fn execution_and_runner_receive_identity_without_reading_root_build_policy() {
     let root = cli_root();
     let mut violations = Vec::new();
     for owner in [
+        "crates/api/src",
         "crates/execution/src",
         "crates/runner/src",
         "crates/human-auth/src",

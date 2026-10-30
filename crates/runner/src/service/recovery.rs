@@ -52,7 +52,7 @@ impl RecoveryError {
                 std::io::ErrorKind::InvalidData => "invalid_data",
                 _ => "io_error",
             };
-            diagnostic["transportError"] = serde_json::json!(cause);
+            diagnostic["ioError"] = serde_json::json!(cause);
         }
         diagnostic.to_string()
     }

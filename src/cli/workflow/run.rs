@@ -44,10 +44,10 @@ use um_execution::{
     WorkflowRunViewModel, WorkflowStepTiming, WorkflowTerminalHost, admit_local_workflow,
     command_output_v1, default_execution_policy_limits,
     discover_and_validate_claude_code_installation, discover_and_validate_codex_installation,
-    discover_and_validate_pi_installation, execute_workflow, prepare_attempt_result_destination,
-    production_agent_dispatcher, publish_prepared_workflow_result,
-    resolve_workflow_file_with_agent_profiles, step_recovery_summary_v1,
-    summary_disposition_matches, write_untested_harness_advisories,
+    discover_and_validate_pi_installation, execute_workflow, normalize_terminal_path,
+    prepare_attempt_result_destination, production_agent_dispatcher,
+    publish_prepared_workflow_result, resolve_workflow_file_with_agent_profiles,
+    step_recovery_summary_v1, summary_disposition_matches, write_untested_harness_advisories,
 };
 use um_execution::{
     AgentProfileReplacementDocument, AgentProfileReplacementV1,
@@ -226,7 +226,12 @@ impl Command {
         .await
         .map_err(anyhow::Error::new)
         .and_then(|result| result.map_err(anyhow::Error::new))
-        .with_context(|| format!("create workflow run {}", self.run_dir.display()))?;
+        .with_context(|| {
+            format!(
+                "create workflow run {}",
+                normalize_terminal_path(&self.run_dir)
+            )
+        })?;
         execute_owned_attempt(
             workflow,
             admitted,

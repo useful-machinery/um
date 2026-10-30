@@ -31,10 +31,10 @@ use rustix::termios::Winsize;
 
 #[cfg(target_os = "linux")]
 use super::poll_until;
-use super::workflow_run::isolated_command;
+use super::workflow_run::{RunBundle, isolated_command, run};
 #[cfg(target_os = "linux")]
 use super::workflow_run::{
-    RunBundle, TuiProcess, finalizer_signal_bundle, open_tui_pty, run, signal_bundle, spawn_tui_run,
+    TuiProcess, finalizer_signal_bundle, open_tui_pty, signal_bundle, spawn_tui_run,
 };
 
 pub(super) fn workflow_view_schema() -> jsonschema::Validator {
@@ -465,6 +465,110 @@ fn view_selects_current_and_historical_attempts_without_blocking_status_or_retry
     assert!(failed_plain.stderr.is_empty());
     assert!(String::from_utf8_lossy(&failed_plain.stdout).contains("primary issue:"));
     assert_eq!(durable_files(&run_directory), settled_before);
+}
+
+// REQ-EXPORTS-10, REQ-EXPORTS-11, REQ-LOCALRUN-156
+#[test]
+fn json_view_carries_resolved_export_presentation_valid_against_its_schema() {
+    let bundle = RunBundle::new(
+        r#"schemaVersion: 1
+steps:
+  report:
+    kind: cmd
+    command:
+      argv: ["/bin/sh", "-c", "printf 'Weekly report' > title.txt && printf body > report.md"]
+    outputs:
+      title:
+        kind: text
+        from: path
+        path: title.txt
+      body:
+        kind: file
+        from: path
+        path: report.md
+        mediaType: text/markdown
+finalizers:
+  notes:
+    kind: cmd
+    when: [succeeded]
+    command:
+      argv: ["/bin/sh", "-c", "exit 5"]
+    outputs:
+      notes:
+        kind: file
+        from: path
+        path: notes.md
+        mediaType: text/markdown
+  summarize:
+    kind: cmd
+    failurePolicy: advisory
+    when: [succeeded]
+    command:
+      argv: ["/bin/sh", "-c", "printf summary > summary.txt; exit 3"]
+    outputs:
+      summary:
+        kind: text
+        from: path
+        path: summary.txt
+exports:
+  report:
+    ref: outputs.report.body
+    presentation:
+      title:
+        ref: outputs.report.title
+      description:
+        ref: outputs.summarize.summary
+  notes:
+    ref: outputs.notes.notes
+    presentation:
+      title:
+        value: Notes
+"#,
+    );
+    let run_directory = bundle.result("resolved-presentation");
+    let produced = run(&bundle.args(&run_directory));
+    assert!(
+        run_directory
+            .join("attempts/000001/result/result.json")
+            .is_file(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&produced.stdout),
+        String::from_utf8_lossy(&produced.stderr)
+    );
+
+    let output = isolated_command(&view_args(&run_directory, &["--json"]))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let view: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let schema = workflow_view_schema();
+    let errors = schema
+        .iter_errors(&view)
+        .map(|error| format!("{} at {}", error, error.instance_path()))
+        .collect::<Vec<_>>();
+    assert!(errors.is_empty(), "{errors:#?}");
+    let exports = &view["result"]["exports"];
+    assert_eq!(exports["report"]["state"], "available");
+    assert_eq!(
+        exports["report"]["presentation"],
+        serde_json::json!({
+            "title": {"state": "available", "value": "Weekly report"},
+            "description": {"state": "unavailable", "reason": "source_failed"}
+        })
+    );
+    assert_eq!(
+        exports["notes"],
+        serde_json::json!({
+            "state": "unavailable",
+            "reason": "source_failed",
+            "presentation": {"title": {"state": "available", "value": "Notes"}}
+        })
+    );
 }
 
 // REQ-LOCALRUN-63, REQ-LOCALRUN-65, REQ-EVIDENCE-13, REQ-WFFINALIZE-20

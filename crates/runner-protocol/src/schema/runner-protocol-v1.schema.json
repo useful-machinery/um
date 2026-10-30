@@ -705,10 +705,16 @@
         "gitCommand": {"$ref": "#/$defs/diagnosticSlug"},
         "gitExitCode": {"$ref": "#/$defs/diagnosticInteger"},
         "limitMs": {"$ref": "#/$defs/diagnosticInteger"},
+        "limitBytes": {"$ref": "#/$defs/diagnosticInteger"},
+        "observedBytes": {"$ref": "#/$defs/diagnosticInteger"},
         "httpStatus": {"$ref": "#/$defs/diagnosticInteger"},
         "transportError": {"$ref": "#/$defs/diagnosticSlug"},
         "harnessError": {"$ref": "#/$defs/diagnosticSlug"},
-        "declineCause": {"$ref": "#/$defs/diagnosticSlug"}
+        "harnessFailure": {"$ref": "#/$defs/diagnosticSlug"},
+        "harnessInput": {"$ref": "#/$defs/diagnosticSlug"},
+        "declineCause": {"$ref": "#/$defs/diagnosticSlug"},
+        "launchFailure": {"$ref": "#/$defs/diagnosticSlug"},
+        "osError": {"$ref": "#/$defs/diagnosticInteger"}
       }
     },
     "diagnosticSlug": {
@@ -3451,6 +3457,9 @@
                 "handler_unavailable",
                 "working_directory_unavailable",
                 "command_preparation_failed",
+                "command_launch_not_found",
+                "command_launch_permission_denied",
+                "command_launch_invalid_input",
                 "command_launch_failed",
                 "command_wait_failed",
                 "command_exit_failed",
@@ -3487,6 +3496,9 @@
                 "empty_reason",
                 "reason_too_long"
               ]
+            },
+            "diagnostic": {
+              "$ref": "#/$defs/RecoveryHandlerLaunchDiagnostic"
             }
           },
           "required": [
@@ -3497,6 +3509,21 @@
       "required": [
         "phase",
         "cause"
+      ]
+    },
+    "RecoveryHandlerLaunchDiagnostic": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "launchFailure": {
+          "$ref": "#/$defs/diagnosticSlug"
+        },
+        "osError": {
+          "$ref": "#/$defs/diagnosticInteger"
+        }
+      },
+      "required": [
+        "launchFailure"
       ]
     },
     "RecoveryHandlerSummary": {

@@ -696,7 +696,7 @@ pub(crate) fn safe_text(value: &str) -> String {
     normalize_terminal_scalar(value.as_bytes())
 }
 
-pub(crate) fn safe_path(value: &Path) -> String {
+pub fn safe_path(value: &Path) -> String {
     normalize_terminal_scalar(value.as_os_str().as_bytes())
 }
 

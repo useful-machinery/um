@@ -6,9 +6,11 @@ use std::process::Stdio;
 
 use rustix::process::{Pid, Signal, kill_process};
 
+use super::workflow_continue::GIT_CONTINUATION_SOURCE;
 use super::workflow_run::{
-    RunBundle, assert_attempt_resources_released, assert_executor_fault_before_execution,
-    isolated_command, run, run_with_unusable_tui, signal_bundle,
+    RunBundle, assert_attempt_resources_released, assert_executor_fault_before_execution, git,
+    initialize_git_repository, isolated_command, run, run_with_unusable_tui, signal_bundle,
+    workflow_run_schema,
 };
 
 fn retry_args(run_directory: &Path, execution_root: &Path, options: &[&str]) -> Vec<String> {
@@ -121,6 +123,7 @@ fn retry_uses_the_immutable_bundle_current_environment_and_fresh_attempt() {
     assert_eq!(rejected.status.code(), Some(1));
     assert!(rejected.stderr.is_empty());
     let rejected: serde_json::Value = serde_json::from_slice(&rejected.stdout).unwrap();
+    assert!(workflow_run_schema().is_valid(&rejected), "{rejected}");
     assert_eq!(rejected["command"], "um workflow retry");
     assert_eq!(rejected["phase"], "admission");
     assert_eq!(
@@ -149,6 +152,7 @@ fn retry_uses_the_immutable_bundle_current_environment_and_fresh_attempt() {
         String::from_utf8_lossy(&output.stderr)
     );
     let terminal: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(workflow_run_schema().is_valid(&terminal), "{terminal}");
     assert_eq!(terminal["command"], "um workflow retry");
     assert_eq!(terminal["outcome"], "succeeded");
     assert_eq!(terminal["attemptNumber"], 2);
@@ -188,6 +192,7 @@ fn retry_uses_the_immutable_bundle_current_environment_and_fresh_attempt() {
     assert_eq!(rejected.status.code(), Some(1));
     assert!(rejected.stderr.is_empty());
     let rejected: serde_json::Value = serde_json::from_slice(&rejected.stdout).unwrap();
+    assert!(workflow_run_schema().is_valid(&rejected), "{rejected}");
     assert_eq!(rejected["command"], "um workflow retry");
     assert_eq!(rejected["phase"], "retry");
     assert_eq!(rejected["attemptNumber"], 2);
@@ -492,6 +497,7 @@ fn ownership_unproven_rejection_preserves_the_predecessor() {
     assert_eq!(output.status.code(), Some(1));
     assert!(output.stderr.is_empty());
     let rejection: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(workflow_run_schema().is_valid(&rejection), "{rejection}");
     assert_eq!(rejection["phase"], "retry");
     assert_eq!(rejection["diagnostics"][0]["code"], "ownership_unproven");
     assert_eq!(
@@ -683,4 +689,66 @@ fn retry_warns_about_a_reused_execution_root_without_inspecting_it() {
         fs::read_to_string(reused_root.join("phases")).unwrap(),
         "initial\nretry\n"
     );
+}
+
+// REQ-LOCALRUN-168, REQ-OUTPUTS-24
+#[test]
+fn retry_git_capture_keeps_the_recorded_baseline_after_head_advances() {
+    let bundle = RunBundle::new(GIT_CONTINUATION_SOURCE);
+    initialize_git_repository(bundle.execution_root());
+    let baseline = git(bundle.execution_root(), &["rev-parse", "HEAD"])
+        .trim()
+        .to_owned();
+    let run_directory = bundle.result("git-baseline-retry");
+    let mut initial = bundle.args(&run_directory);
+    initial.insert(initial.len() - 1, "--json".to_owned());
+    let first = isolated_command(&initial)
+        .env("PHASE", "initial")
+        .output()
+        .unwrap();
+    assert_eq!(
+        first.status.code(),
+        Some(1),
+        "{} {}",
+        String::from_utf8_lossy(&first.stdout),
+        String::from_utf8_lossy(&first.stderr)
+    );
+    fs::write(bundle.execution_root().join("tracked.txt"), "advanced\n").unwrap();
+    git(bundle.execution_root(), &["add", "tracked.txt"]);
+    git(
+        bundle.execution_root(),
+        &["commit", "--quiet", "-m", "advance"],
+    );
+    let head = git(bundle.execution_root(), &["rev-parse", "HEAD"])
+        .trim()
+        .to_owned();
+    assert_ne!(baseline, head);
+
+    let retried = isolated_command(&retry_args(
+        &run_directory,
+        bundle.execution_root(),
+        &["--json"],
+    ))
+    .env("PHASE", "continuation")
+    .output()
+    .unwrap();
+    assert!(
+        retried.status.success(),
+        "{} {}",
+        String::from_utf8_lossy(&retried.stdout),
+        String::from_utf8_lossy(&retried.stderr)
+    );
+
+    let local_run: serde_json::Value =
+        serde_json::from_slice(&fs::read(run_directory.join("run.json")).unwrap()).unwrap();
+    assert_eq!(
+        local_run["gitBaseline"],
+        serde_json::json!({"status": "available", "objectFormat": "sha1", "commitOid": baseline})
+    );
+    let result: serde_json::Value = serde_json::from_slice(
+        &fs::read(run_directory.join("attempts/000002/result/result.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(result["exports"]["branch"]["baseOid"], baseline);
+    assert_eq!(result["exports"]["branch"]["headOid"], head);
 }

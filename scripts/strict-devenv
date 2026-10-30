@@ -36,6 +36,8 @@ fi
 # CARGO_HOME and CARGO_TARGET_DIR let a caller-owned persistent registry and
 # build cache survive the boundary instead of recompiling from cold each run;
 # CARGO_INCREMENTAL lets the owner of that cache keep incremental state in it.
+# UM_CLI_SUITE_TESTS_RUN_BY carries a caller's declaration that another step
+# already builds and runs the test suite on this source; see scripts/check-suite.
 keep_variables=(
   CARGO_BUILD_JOBS
   CARGO_HOME
@@ -45,6 +47,7 @@ keep_variables=(
   DEVENV_TUI
   HOME
   RUSTC_WRAPPER
+  UM_CLI_SUITE_TESTS_RUN_BY
   UM_STRICT_DEVENV_BINARY
 )
 printf -v keep_list '%s,' "${keep_variables[@]}"

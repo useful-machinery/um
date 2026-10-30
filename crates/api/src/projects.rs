@@ -13,20 +13,15 @@ use super::generated::models;
 use super::http_client::generated_configuration;
 use super::http_util::{self, BoundedBodyError};
 use super::problem::{
-    self, ACCEPTED_MEDIA_TYPES, JSON_MEDIA_TYPE, PROVIDER_UNAVAILABLE, QUANTITY_LIMIT_REACHED,
+    self, ACCEPTED_MEDIA_TYPES, BAD_REQUEST, FORBIDDEN, IDEMPOTENCY_CONFLICT, JSON_MEDIA_TYPE,
+    NOT_FOUND, PROVIDER_UNAVAILABLE, QUANTITY_LIMIT_REACHED, RATE_LIMIT_EXCEEDED, UNAUTHORIZED,
 };
 use super::{HttpTransportPolicy, UnreachableCategory, classify_reqwest_error};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 const MUTATION_ATTEMPTS: usize = 2;
-const BAD_REQUEST: &str = "https://api.usefulmachinery.com/problems/bad-request";
-const UNAUTHORIZED: &str = "https://api.usefulmachinery.com/problems/unauthorized";
-const FORBIDDEN: &str = "https://api.usefulmachinery.com/problems/forbidden";
-const NOT_FOUND: &str = "https://api.usefulmachinery.com/problems/not-found";
 const REPOSITORY_NOT_BOUND: &str = "https://api.usefulmachinery.com/problems/repository-not-bound";
 const NAME_UNAVAILABLE: &str = "https://api.usefulmachinery.com/problems/project-name-unavailable";
-const RATE_LIMIT: &str = "https://api.usefulmachinery.com/problems/rate-limit-exceeded";
-const IDEMPOTENCY_CONFLICT: &str = "https://api.usefulmachinery.com/problems/idempotency-conflict";
 const SOURCE_CONFLICT: &str = "https://api.usefulmachinery.com/problems/source-connection-conflict";
 const REPOSITORY_UNAVAILABLE: &str =
     "https://api.usefulmachinery.com/problems/repository-unavailable";
@@ -763,7 +758,7 @@ fn classify_project_response(response: &ReceivedResponse, operation: Operation) 
     if !operation.permits_failure(status, &decoded.r#type) {
         return ProjectFailure::protocol(credential_rejected);
     }
-    if status == StatusCode::TOO_MANY_REQUESTS && decoded.r#type == RATE_LIMIT {
+    if status == StatusCode::TOO_MANY_REQUESTS && decoded.r#type == RATE_LIMIT_EXCEEDED {
         return parse_retry_after(response).map_or_else(
             || ProjectFailure::protocol(false),
             |retry_after| ProjectFailure::RateLimited { retry_after },

@@ -9,7 +9,9 @@ use ring::digest::{Context as DigestContext, SHA256};
 use serde::{Deserialize, Serialize};
 
 use super::bearer_authorization;
-use super::http_client::{HttpEndpointError, HttpTransportPolicy, categorized_dns_resolver};
+use super::http_client::{
+    HttpEndpointError, HttpTransportPolicy, categorized_dns_resolver, user_agent,
+};
 use super::{UnreachableCategory, classify_reqwest_error, http_util};
 
 const API_REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
@@ -159,6 +161,7 @@ fn build_http_client(
     request_timeout: Option<Duration>,
 ) -> Result<Client, ArtifactApiError> {
     Client::builder()
+        .user_agent(user_agent())
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(connect_timeout)
         .timeout(request_timeout)

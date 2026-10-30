@@ -58,6 +58,9 @@ struct CloudError<'a> {
     problem_type: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     diagnostic: Option<InputAdmissionDiagnostic<'a>>,
+    /// The rejected response's `X-Request-ID`; `request_id` names a cancellation request.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    correlation_id: Option<&'a str>,
 }
 
 #[derive(Serialize)]
@@ -66,18 +69,22 @@ struct InputAdmissionDiagnostic<'a> {
     input: &'a str,
 }
 
-pub(super) struct InputAdmissionProblem<'a> {
+/// A reviewed create-admission rejection: only closed codes, slugs and validated ids,
+/// never server prose.
+pub(super) struct AdmissionProblem<'a> {
+    pub code: &'static str,
     pub status: u16,
     pub problem_type: &'a str,
     pub diagnostic: Option<(&'a str, &'a str)>,
+    pub correlation_id: Option<&'a str>,
 }
 
-pub(super) fn write_input_admission_failure(
+pub(super) fn write_admission_failure(
     deployment: &str,
     organization: &str,
     input_set_id: Option<&str>,
     key: Option<&str>,
-    problem: InputAdmissionProblem<'_>,
+    problem: AdmissionProblem<'_>,
 ) -> anyhow::Result<()> {
     let result = CloudResult {
         schema_version: 1,
@@ -92,7 +99,7 @@ pub(super) fn write_input_admission_failure(
         cancellation_request: None,
         replayed: None,
         error: Some(CloudError {
-            code: "input_admission_rejected",
+            code: problem.code,
             idempotency_key: key,
             requested_mode: None,
             request_id: None,
@@ -104,6 +111,7 @@ pub(super) fn write_input_admission_failure(
             diagnostic: problem
                 .diagnostic
                 .map(|(code, input)| InputAdmissionDiagnostic { code, input }),
+            correlation_id: problem.correlation_id,
         }),
     };
     let mut stdout = io::stdout().lock();
@@ -159,6 +167,7 @@ pub(super) fn write_cloud(
                 http_status: None,
                 problem_type: None,
                 diagnostic: None,
+                correlation_id: None,
             }),
         };
         let stdout = io::stdout();

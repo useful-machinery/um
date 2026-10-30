@@ -24,6 +24,17 @@ pub fn is_identifier(value: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric())
 }
 
+/// The closed-cause slug a diagnostic names, `^[a-z][a-z0-9_]{0,63}$`: the contracts'
+/// `diagnosticSlug`, a retry failure's `errorType` and a recovery handler's `launchFailure`.
+pub fn is_diagnostic_slug(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() <= 64
+        && bytes.first().is_some_and(u8::is_ascii_lowercase)
+        && bytes
+            .iter()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'_')
+}
+
 pub fn is_valid_input_display_name(value: Option<&str>) -> bool {
     value.is_none_or(|value| {
         !matches!(value, "" | "." | "..")

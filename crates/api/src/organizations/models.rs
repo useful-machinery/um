@@ -205,12 +205,16 @@ pub enum OrganizationAuditSubjectKind {
     LinearAuthorizationSession,
     LinearConnection,
     LinearEvaluation,
+    LinearTrigger,
+    LinearLifecycleUpdate,
+    LinearLifecycleBinding,
     Project,
     GoogleDocsAction,
     WebhookSubscription,
     WebhookDelivery,
     RepositoryConnection,
     Assignment,
+    Schedule,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -453,7 +457,7 @@ impl TryFrom<models::InvitationPartyIdentity> for InvitationPartyIdentity {
             models::invitation_party_identity::NameState::Unavailable => NameState::Unavailable,
         };
         if value.display_name.is_some()
-            != matches!(name_state, NameState::Live | NameState::Snapshot)
+            && !matches!(name_state, NameState::Live | NameState::Snapshot)
             || value
                 .display_name
                 .as_deref()
@@ -1190,6 +1194,13 @@ impl TryFrom<models::OrganizationAuditSubject> for OrganizationAuditSubject {
             ),
             Kind::LinearConnection => (OrganizationAuditSubjectKind::LinearConnection, "lcn_"),
             Kind::LinearEvaluation => (OrganizationAuditSubjectKind::LinearEvaluation, "tev_"),
+            Kind::LinearTrigger => (OrganizationAuditSubjectKind::LinearTrigger, "trg_"),
+            Kind::LinearLifecycleUpdate => {
+                (OrganizationAuditSubjectKind::LinearLifecycleUpdate, "llu_")
+            }
+            Kind::LinearLifecycleBinding => {
+                (OrganizationAuditSubjectKind::LinearLifecycleBinding, "run_")
+            }
             Kind::Project => (OrganizationAuditSubjectKind::Project, "prj_"),
             Kind::GoogleDocsAction => (OrganizationAuditSubjectKind::GoogleDocsAction, "gda_"),
             Kind::WebhookSubscription => {
@@ -1200,6 +1211,7 @@ impl TryFrom<models::OrganizationAuditSubject> for OrganizationAuditSubject {
                 (OrganizationAuditSubjectKind::RepositoryConnection, "rpc_")
             }
             Kind::Assignment => (OrganizationAuditSubjectKind::Assignment, "asn_"),
+            Kind::Schedule => (OrganizationAuditSubjectKind::Schedule, "sch_"),
         };
         if !um_support::valid_typed_id(&value.id, prefix) {
             return Err("the organization audit subject is invalid");
@@ -1244,6 +1256,9 @@ impl From<models::OrganizationAuditChange> for OrganizationAuditChange {
             Field::TriggerId => "trigger_id",
             Field::GrantId => "grant_id",
             Field::EvaluationId => "evaluation_id",
+            Field::DesiredStateId => "desired_state_id",
+            Field::ObservedStateId => "observed_state_id",
+            Field::ConfirmedStateId => "confirmed_state_id",
             Field::AuthorizerId => "authorizer_id",
             Field::ServicePrincipalId => "service_principal_id",
             Field::HeadOid => "head_oid",

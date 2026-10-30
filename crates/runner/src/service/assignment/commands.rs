@@ -372,9 +372,13 @@ impl AssignmentManager {
             tokio::sync::watch::channel(None);
         let workflow_git = accepted.workflow_git.clone();
         let engine_terminal = Arc::new(AtomicBool::new(false));
-        let run_event = RunEvent::default();
-        self.run_events
-            .insert(accepted.assignment_id().to_owned(), run_event.clone());
+        // Open since the offer; a handle that was never offered starts empty
+        // and opens at start authorization.
+        let run_event = self
+            .run_events
+            .entry(accepted.assignment_id().to_owned())
+            .or_default()
+            .clone();
         self.slot = Some(LocalSlot::Running(Box::new(RunningAssignment {
             identity: accepted.identity.clone(),
             cancellation,
@@ -733,6 +737,7 @@ impl AssignmentManager {
                 event.finish(TelemetryOutcome::Cancelled);
             }
             let offer = preparing.offer.clone();
+            self.finish_offered_run(assignment_id, &preparing.run_event, "rejected");
             let response = rejected(
                 &offer,
                 AssignmentDecline::RunnerUnable(RunnerUnableReason::SourceServiceUnavailable),
@@ -881,9 +886,7 @@ impl AssignmentManager {
             if self.cleanup_failure_report == Some(id) {
                 self.cleanup_failure_report = None;
             }
-            if let Some(event) = self.run_events.remove(observation.assignment_id()) {
-                event.finish(None);
-            }
+            self.finish_run_event(observation.assignment_id(), None);
             if self.lease_clock_failure_report == Some(id) {
                 self.lease_clock_failure_report = None;
             }
@@ -997,7 +1000,14 @@ impl AssignmentManager {
                         .root_preparation
                         .as_ref()
                         .is_some_and(|handoff| handoff.detach());
-                if !detached_root_preparation {
+                if detached_root_preparation {
+                    // The offer is given up unanswered.
+                    self.finish_offered_run(
+                        &preparing.offer.assignment_id,
+                        &preparing.run_event,
+                        "aborted",
+                    );
+                } else {
                     self.slot = Some(LocalSlot::Preparing(preparing));
                 }
             }

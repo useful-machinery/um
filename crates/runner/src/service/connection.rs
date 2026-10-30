@@ -5491,11 +5491,29 @@ mod tests {
         assert_eq!(event["um.runner.sequence"], 2);
         assert_eq!(event["um.outcome"], "success");
         let encoded = serde_json::to_string(event).expect("encode effect event");
-        // An effect acknowledgement does not itself claim an execution result.
+        // An effect acknowledgement does not itself claim an execution result;
+        // the declined offer's run does.
+        let runs = all_events
+            .iter()
+            .filter(|event| event["event.name"] == "runner.run")
+            .collect::<Vec<_>>();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0]["um.run.result"], "rejected");
+        assert_eq!(runs[0]["um.outcome"], "rejected");
+        // Source materialization failed, so checkout failed and preparation
+        // never began.
+        let checkouts = all_events
+            .iter()
+            .filter(|event| event["event.name"] == "runner.run.checkout")
+            .collect::<Vec<_>>();
+        assert_eq!(checkouts.len(), 1);
+        assert_eq!(checkouts[0]["um.outcome"], "failure");
+        assert_eq!(checkouts[0]["error.type"], "runner_phase_failed");
+        assert_eq!(checkouts[0]["parent_span_id"], runs[0]["span_id"]);
         assert!(
             all_events
                 .iter()
-                .all(|event| event["event.name"] != "runner.run")
+                .all(|event| event["event.name"] != "runner.run.preparation")
         );
         assert!(!encoded.contains("accepted"));
         assert!(!encoded.contains("executed"));
@@ -5612,7 +5630,17 @@ mod tests {
         server.await.expect("join fixture server");
 
         let events = capture.events();
-        assert_eq!(events.len(), 1);
+        assert_eq!(events.len(), 2);
+        // The offered run never prepared; dropping the manager aborts it.
+        let run = events
+            .iter()
+            .find(|event| event["event.name"] == "runner.run")
+            .expect("offered run event");
+        assert_eq!(run["um.run.result"], "aborted");
+        let events = events
+            .into_iter()
+            .filter(|event| event["event.name"] != "runner.run")
+            .collect::<Vec<_>>();
         assert_eq!(events[0]["event.name"], "runner.effect_acknowledgement");
         assert_eq!(events[0]["um.outcome"], "disconnected");
         assert_eq!(

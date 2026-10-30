@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::env;
 use std::ffi::OsString;
@@ -36,6 +37,7 @@ use crate::workflow::agent_input::AgentInputStaging;
 use crate::workflow::artifact::{ArtifactReadFailure, ArtifactStaging};
 use crate::workflow::coordinator::CoordinatorClock;
 use crate::workflow::diagnostic::StepDiagnosticLog;
+use crate::workflow::document::FailurePolicy;
 use crate::workflow::evidence::{
     BlockedDetail, CancellationDetail, FailureCode, NonExecutionCode, NonExecutionDetail,
     Prerequisite,
@@ -53,17 +55,28 @@ use crate::workflow::recovery::{
 use crate::workflow::resolution;
 use crate::workflow::runtime::{
     ExportValue, FailurePhase, RecoveryHandlerOutcome, StepState, StepStateKind, TransitionEvent,
+    TransitionSequence, WorkflowState,
 };
 use crate::workflow::step_runtime::{AgentExecution, StepFailureCause};
 use crate::workflow::test_support::{
-    AdmittedFixture,
+    AdmittedFixture, host_scaled_watchdog_with_diagnosis,
     step_clock::{TestClock, TestInstant},
 };
+use crate::workflow::validated::WorkflowNodeRole;
 
 const FIXTURE_TEST_NAME: &str = "workflow::step_runtime::tests::command_fixture_process";
 const STDIN_FIXTURE_TEST_NAME: &str = "workflow::execution::tests::command_stdin_fixture_process";
 const FIXTURE_ARGUMENT: &str = "literal * $HOME; [not-a-glob]";
+/// The idle-host base of every scenario's anti-hang watchdog; `with_watchdog` scales it
+/// by the host's load (INV-TESTING-18).
 const TEST_WATCHDOG: Duration = Duration::from_secs(10);
+
+thread_local! {
+    /// The last transition a `RecordingObserver` saw on this test thread, which the
+    /// watchdog names when it expires. Scenarios run on `#[tokio::test]`'s current-thread
+    /// runtime, so the thread is the scenario.
+    static LAST_TRANSITION: RefCell<Option<String>> = const { RefCell::new(None) };
+}
 
 type RecordedObservations = Arc<Mutex<Vec<ExecutionObservation<TestInstant>>>>;
 type ObservationReceiver = mpsc::UnboundedReceiver<ExecutionObservation<TestInstant>>;
@@ -167,6 +180,11 @@ impl ExecutionObserver<TestInstant> for RecordingObserver {
         &self,
         observation: ExecutionObservation<TestInstant>,
     ) -> impl Future<Output = ()> + Send {
+        if let ExecutionObservation::Transition(transition) = &observation {
+            LAST_TRANSITION.with(|last| {
+                *last.borrow_mut() = Some(describe_transition(&transition.event));
+            });
+        }
         self.entries
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -597,15 +615,131 @@ async fn wait_for_step_transition(
     }
 }
 
-#[expect(
-    clippy::disallowed_methods,
-    reason = "real time is allowed only as an anti-hang watchdog, not a behavior assertion"
-)]
 async fn with_watchdog<Output>(future: impl Future<Output = Output>) -> Output {
-    match tokio::time::timeout(TEST_WATCHDOG, future).await {
-        Ok(output) => output,
-        Err(_) => panic!("workflow execution test watchdog expired"),
+    with_watchdog_base(TEST_WATCHDOG, future).await
+}
+
+/// Runs a scenario under the shared host-scaled watchdog; an expiry names the last
+/// transition the scenario's observer saw, so a real hang is diagnosable.
+async fn with_watchdog_base<Output>(
+    base: Duration,
+    future: impl Future<Output = Output>,
+) -> Output {
+    LAST_TRANSITION.with(|last| last.borrow_mut().take());
+    host_scaled_watchdog_with_diagnosis(
+        "workflow execution scenario",
+        base,
+        || {
+            let last = LAST_TRANSITION.with(|last| last.borrow().clone());
+            Some(format!(
+                "last observed transition: {}",
+                last.as_deref().unwrap_or("none")
+            ))
+        },
+        future,
+    )
+    .await
+}
+
+fn describe_transition(event: &TransitionEvent<TestInstant>) -> String {
+    let workflow_state = |state: &WorkflowState<TestInstant>| match state {
+        WorkflowState::Executing { .. } => "Executing",
+        WorkflowState::Finalizing { .. } => "Finalizing",
+        WorkflowState::Succeeded => "Succeeded",
+        WorkflowState::Failed { .. } => "Failed",
+        WorkflowState::Cancelled { .. } => "Cancelled",
+    };
+    match event {
+        TransitionEvent::Step {
+            sequence,
+            step,
+            from,
+            to,
+            ..
+        } => format!("#{} step {step} {from:?} -> {to:?}", sequence.get()),
+        TransitionEvent::Workflow { sequence, from, to } => format!(
+            "#{} workflow {} -> {}",
+            sequence.get(),
+            workflow_state(from),
+            workflow_state(to)
+        ),
+        TransitionEvent::CancellationAccepted {
+            sequence, reason, ..
+        } => format!("#{} cancellation accepted ({reason:?})", sequence.get()),
+        TransitionEvent::FinalizationCancellationAccepted {
+            sequence, reason, ..
+        } => format!(
+            "#{} finalization cancellation accepted ({reason:?})",
+            sequence.get()
+        ),
+        TransitionEvent::ForceAbortAccepted {
+            sequence,
+            reason,
+            phase,
+        } => format!(
+            "#{} force abort accepted ({reason:?}, {phase:?})",
+            sequence.get()
+        ),
     }
+}
+
+// INV-TESTING-18
+#[tokio::test]
+async fn watchdog_expiry_names_the_last_observed_transition() {
+    let (observer, _entries, _observed) = RecordingObserver::new();
+    let transition = |sequence: u64, from, to| {
+        ExecutionObservation::Transition(Box::new(TransitionObservation {
+            event: TransitionEvent::Step {
+                sequence: TransitionSequence(sequence),
+                step: "plan".to_owned(),
+                role: WorkflowNodeRole::Step,
+                failure_policy: FailurePolicy::Required,
+                from,
+                to,
+            },
+            step: None,
+        }))
+    };
+    observer
+        .observe(transition(
+            1,
+            StepStateKind::Pending,
+            StepStateKind::Starting,
+        ))
+        .await;
+    let expired = tokio::spawn({
+        let observer = observer.clone();
+        with_watchdog_base(Duration::from_millis(1), async move {
+            observer
+                .observe(transition(
+                    2,
+                    StepStateKind::Starting,
+                    StepStateKind::Running,
+                ))
+                .await;
+            std::future::pending::<()>().await;
+        })
+    })
+    .await
+    .unwrap_err();
+    let message = expired.into_panic().downcast::<String>().unwrap();
+    assert!(
+        message.starts_with("workflow execution scenario watchdog expired after")
+            && message.ends_with("; last observed transition: #2 step plan Starting -> Running"),
+        "{message:?}"
+    );
+
+    let unobserved = tokio::spawn(with_watchdog_base(
+        Duration::from_millis(1),
+        std::future::pending::<()>(),
+    ))
+    .await
+    .unwrap_err();
+    let message = unobserved.into_panic().downcast::<String>().unwrap();
+    assert!(
+        message.ends_with("; last observed transition: none"),
+        "{message:?}"
+    );
 }
 
 const AGENT_PROFILE: &str = r#"agentProfiles:

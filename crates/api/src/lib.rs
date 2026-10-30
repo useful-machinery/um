@@ -24,9 +24,11 @@ mod problem;
 mod profile;
 mod projects;
 mod publications;
+mod resource;
 mod run_inputs;
 mod runners;
 mod runs;
+mod schedules;
 mod service_principals;
 mod signup;
 mod webhooks;
@@ -102,6 +104,7 @@ pub use gitlab::{
 pub use google_docs_actions::{ActionApi, ActionFailure, ActionRead, Lifecycle as ActionLifecycle};
 pub use http_client::{
     HttpCancellation, HttpClient, HttpClientError, HttpEndpointError, HttpTransportPolicy,
+    identify_client,
 };
 pub use http_util::{
     BoundedBodyError, InvalidHeaderText, MAX_RESPONSE_BODY_BYTES, media_type, read_bounded_body,
@@ -158,6 +161,7 @@ pub use publications::{
     ExistingPublicationTarget, Publication, PublicationApi, PublicationFailure, PublicationList,
     PublicationState,
 };
+pub use resource::{LifecycleAction, ResourceFailure};
 pub use run_inputs::{
     InputAttachmentMetadata, InputFileMetadata, InputScalarMetadata, NamedInputMetadata,
     RetainedRunInputs, RunInputManifest, RunInputObjectMetadata, RunInputSet, RunInputUpload,
@@ -178,9 +182,15 @@ pub use runs::{
     RunContinuationEnvelope, RunContinuationPreparation, RunContinuationReceipt,
     RunContinuationReplacement, RunContinuationReplacementSource, RunContinuationRequest,
     RunContinuationWorkspaceModified, RunCreationAcceptance, RunCreationPending, RunFailure,
-    RunInterruption, RunInterruptionPhase, RunList, RunListFilter, RunObservation,
-    RunPublicationHandoffState, RunRead, RunRetryFailureCode, RunRetryReceipt, RunRetryRejection,
-    RunRetryState, RunState, valid_integration_context,
+    RunInterruption, RunInterruptionPhase, RunLinearLifecycle, RunLinearLifecycleOwnershipEvent,
+    RunLinearLifecycleUpdate, RunList, RunListFilter, RunObservation, RunPublicationHandoffState,
+    RunRead, RunRetryFailureCode, RunRetryReceipt, RunRetryRejection, RunRetryState, RunState,
+    valid_integration_context,
+};
+pub use schedules::{
+    CreateScheduleRequest, Schedule, ScheduleApi, ScheduleApiError, ScheduleList,
+    ScheduleOccurrence, ScheduleOccurrenceFilters, ScheduleOccurrenceList, ScheduleOccurrenceState,
+    ScheduleRead, ScheduleTombstone, UpdateScheduleRequest,
 };
 pub use service_principals::{
     CreateServicePrincipalOutcome, IssueServiceCredentialOutcome, IssuedServiceApiKey,

@@ -15,8 +15,8 @@ use super::http_util;
 #[cfg(test)]
 use super::problem::PROBLEM_MEDIA_TYPE;
 use super::problem::{
-    self, ACCEPTED_MEDIA_TYPES, BAD_REQUEST, FORBIDDEN, JSON_MEDIA_TYPE, NOT_FOUND,
-    QUANTITY_LIMIT_REACHED, UNAUTHORIZED,
+    self, ACCEPTED_MEDIA_TYPES, BAD_REQUEST, FORBIDDEN, IDEMPOTENCY_CONFLICT, JSON_MEDIA_TYPE,
+    NOT_FOUND, QUANTITY_LIMIT_REACHED, RATE_LIMIT_EXCEEDED, REQUEST_BODY_TOO_LARGE, UNAUTHORIZED,
 };
 use super::{UnreachableCategory, classify_reqwest_error};
 
@@ -42,8 +42,6 @@ const HUMAN_DISPLAY_NAME_REQUIRED: &str =
 const CREATION_NOT_PERMITTED: &str =
     "https://api.usefulmachinery.com/problems/organization-creation-not-permitted";
 const SLUG_UNAVAILABLE: &str = "https://api.usefulmachinery.com/problems/slug-unavailable";
-const RATE_LIMITED: &str = "https://api.usefulmachinery.com/problems/rate-limit-exceeded";
-const IDEMPOTENCY_CONFLICT: &str = "https://api.usefulmachinery.com/problems/idempotency-conflict";
 const MEMBERSHIP_TRANSITION_UNAVAILABLE: &str =
     "https://api.usefulmachinery.com/problems/membership-transition-unavailable";
 const HUMAN_OWNER_REQUIRED: &str = "https://api.usefulmachinery.com/problems/human-owner-required";
@@ -54,8 +52,6 @@ const INVITATION_UNAVAILABLE: &str =
 const OUTSTANDING_INVITATION_LIMIT: &str =
     "https://api.usefulmachinery.com/problems/outstanding-invitation-limit-reached";
 const MEMBERSHIP_LIMIT: &str = "https://api.usefulmachinery.com/problems/membership-limit-reached";
-const REQUEST_BODY_TOO_LARGE: &str =
-    "https://api.usefulmachinery.com/problems/request-body-too-large";
 const UNSUPPORTED_MEDIA_TYPE: &str =
     "https://api.usefulmachinery.com/problems/unsupported-media-type";
 
@@ -1394,7 +1390,12 @@ fn decode_issue_invitation_response(
             }
         }
         StatusCode::TOO_MANY_REQUESTS => {
-            require_problem(Operation::IssueInvitation, &response, RATE_LIMITED, false)?;
+            require_problem(
+                Operation::IssueInvitation,
+                &response,
+                RATE_LIMIT_EXCEEDED,
+                false,
+            )?;
             parse_retry_after(Operation::IssueInvitation, &response)
                 .map(|retry_after| IssueInvitationOutcome::RateLimited { retry_after })
         }
@@ -1847,7 +1848,7 @@ fn decode_create_response(
             }
         }
         StatusCode::TOO_MANY_REQUESTS => {
-            require_problem(Operation::Create, &response, RATE_LIMITED, false)?;
+            require_problem(Operation::Create, &response, RATE_LIMIT_EXCEEDED, false)?;
             let retry_after = response
                 .retry_after
                 .as_ref()

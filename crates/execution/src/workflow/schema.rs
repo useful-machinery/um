@@ -6,10 +6,12 @@ use serde_json::Value;
 use super::document::{
     Agent, AgentMessage, AgentNode, AgentProfile, CommandNode, CommonNode, ConditionOperand,
     ConditionPredicate, ConditionSelector, ExportDefinition, ExportPresentation, FailurePolicy,
-    FinalizationTrigger, FinalizerDefinition, HarnessDefinition, InputDeclaration, MessageSource,
-    NodeBody, Output, OutputReference, PresentationSource, RecoveryHandler, StepDefinition,
-    StepRecovery, ValueReference, WorkflowDocument,
+    FinalizationTrigger, FinalizerDefinition, InputDeclaration, MessageSource, NodeBody, Output,
+    OutputReference, PresentationSource, RecoveryHandler, StepDefinition, StepRecovery,
+    ValueReference, WorkflowDocument,
 };
+use super::validated::ValidatedHarness;
+use super::{claude_code, codex, pi};
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -155,7 +157,7 @@ enum RecoveryHandlerDto {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct AgentProfileDto {
+pub(super) struct AgentProfileDto {
     harness: HarnessDto,
 }
 
@@ -433,11 +435,7 @@ impl WorkflowDto {
                 (name, declaration)
             })
             .collect();
-        let agent_profiles = self
-            .agent_profiles
-            .into_iter()
-            .map(|(name, profile)| (name, profile.into_agent_profile()))
-            .collect();
+        let agent_profiles = AgentProfileDto::into_agent_profiles(self.agent_profiles)?;
         let steps = self
             .steps
             .into_iter()
@@ -663,19 +661,30 @@ impl RecoveryHandlerDto {
 }
 
 impl AgentProfileDto {
-    fn into_agent_profile(self) -> AgentProfile {
-        AgentProfile {
-            harness: self.harness.into_harness(),
-        }
+    /// Types each profile's native harness configuration, for the workflow and the
+    /// replacement decoder alike. The structural schema already closes each config, so
+    /// this refuses only what the schema refuses.
+    pub(super) fn into_agent_profiles(
+        profiles: BTreeMap<String, Self>,
+    ) -> Option<BTreeMap<String, AgentProfile>> {
+        profiles
+            .into_iter()
+            .map(|(name, profile)| {
+                let harness = profile.harness.into_harness()?;
+                Some((name, AgentProfile { harness }))
+            })
+            .collect()
     }
 }
 
 impl HarnessDto {
-    fn into_harness(self) -> HarnessDefinition {
+    fn into_harness(self) -> Option<ValidatedHarness> {
         match self {
-            Self::Pi { config } => HarnessDefinition::Pi { config },
-            Self::ClaudeCode { config } => HarnessDefinition::ClaudeCode { config },
-            Self::Codex { config } => HarnessDefinition::Codex { config },
+            Self::Pi { config } => pi::resolve_config(&config).map(ValidatedHarness::Pi),
+            Self::ClaudeCode { config } => {
+                claude_code::resolve_config(&config).map(ValidatedHarness::ClaudeCode)
+            }
+            Self::Codex { config } => codex::resolve_config(&config).map(ValidatedHarness::Codex),
         }
     }
 }

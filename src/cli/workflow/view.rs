@@ -1,5 +1,4 @@
 use std::num::NonZeroU64;
-use std::os::unix::ffi::OsStrExt as _;
 use std::path::Path;
 
 use anyhow::{Context, anyhow};
@@ -9,8 +8,8 @@ use crate::exit_code::{ExitCode, OutcomeClass};
 use um_execution::{
     ArchivedAttemptLoadError, ArchivedTerminalHostExit, ArchivedViewOutput,
     ArchivedWorkflowTerminalHost, PresentationConfig, PresentationFailure, PresentationMode,
-    TerminalCapabilities, ineligibility_code, load_local_archived_attempt,
-    normalize_terminal_scalar, operational_error_code,
+    TerminalCapabilities, ineligibility_code, load_local_archived_attempt, normalize_terminal_path,
+    operational_error_code,
 };
 
 pub(super) const ABOUT: &str = "View a published local workflow attempt";
@@ -185,13 +184,13 @@ fn load_error(requested: &Path, error: ArchivedAttemptLoadError) -> anyhow::Erro
             let run_directory = error.run_directory.as_deref().unwrap_or(requested);
             anyhow!(operational_error_code(error.code)).context(format!(
                 "workflow view cannot load run {}",
-                safe_path(run_directory)
+                normalize_terminal_path(run_directory)
             ))
         }
         ArchivedAttemptLoadError::Ineligible(error) => anyhow!(ineligibility_code(error.reason))
             .context(format!(
                 "workflow view cannot open run {} attempt {}",
-                safe_path(&error.run_directory),
+                normalize_terminal_path(&error.run_directory),
                 error.attempt_number
             )),
     }
@@ -210,10 +209,6 @@ fn terminal_failure(failure: &PresentationFailure) -> anyhow::Error {
             )
         },
     )
-}
-
-fn safe_path(path: &Path) -> String {
-    normalize_terminal_scalar(path.as_os_str().as_bytes())
 }
 
 #[cfg(test)]

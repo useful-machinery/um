@@ -38,6 +38,32 @@ const CODEX_TURN_ID: &str = "turn-fixture";
 const CODEX_CORRECTION_TURN_ID: &str = "turn-correction";
 const CODEX_PROVIDER: &str = "fixture-provider";
 
+/// Validates the `--json` document of run, retry and continue. The view schema is
+/// registered under its `$id` so the run schema's `$ref` resolves without retrieval.
+pub(super) fn workflow_run_schema() -> jsonschema::Validator {
+    let view: serde_json::Value = serde_json::from_str(include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/schemas/workflow-view-result-v1.schema.json"
+    )))
+    .unwrap();
+    let schema: serde_json::Value = serde_json::from_str(include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/schemas/workflow-run-result-v1.schema.json"
+    )))
+    .unwrap();
+    let view_id = view["$id"].as_str().unwrap().to_owned();
+    let registry = jsonschema::Registry::new()
+        .add(view_id, view)
+        .unwrap()
+        .prepare()
+        .unwrap();
+    jsonschema::options()
+        .with_draft(jsonschema::Draft::Draft202012)
+        .with_registry(&registry)
+        .build(&schema)
+        .unwrap()
+}
+
 #[cfg(target_os = "linux")]
 fn process_state(process: Pid) -> Option<u8> {
     fs::read(
@@ -1580,7 +1606,7 @@ fn settled_failed_run_is_published_with_recovery_finalization_and_truthful_expor
     assert_eq!(view["result"], *result);
 }
 
-// REQ-WFEXEC-31, REQ-WFEXEC-33, REQ-EVIDENCE-9, REQ-EVIDENCE-15, REQ-EXPORTS-3
+// REQ-WFEXEC-31, REQ-WFEXEC-33, REQ-EVIDENCE-9, REQ-EVIDENCE-15, REQ-EXPORTS-3, REQ-EXPORTS-4, REQ-LOCALRUN-127
 #[test]
 fn finalizer_input_unavailability_is_preserved_in_summary_and_exports() {
     let bundle = RunBundle::new(
@@ -1635,6 +1661,7 @@ exports:
         String::from_utf8_lossy(&output.stderr)
     );
     let terminal: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(workflow_run_schema().is_valid(&terminal), "{terminal}");
     let result = &terminal["result"];
     assert_eq!(result["outcome"], "failed");
     assert_eq!(result["primaryIssue"]["node"]["id"], "produce");
@@ -1664,6 +1691,24 @@ exports:
     );
     let progress = String::from_utf8(output.stderr).unwrap();
     assert!(progress.contains("prerequisites_unsatisfied · body outputs.produce.payload"));
+
+    let view = isolated_command(&[
+        "workflow".to_owned(),
+        "view".to_owned(),
+        destination.to_string_lossy().into_owned(),
+        "--json".to_owned(),
+    ])
+    .output()
+    .unwrap();
+    assert!(
+        view.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&view.stdout),
+        String::from_utf8_lossy(&view.stderr)
+    );
+    let view: serde_json::Value = serde_json::from_slice(&view.stdout).unwrap();
+    assert!(workflow_view_schema().is_valid(&view));
+    assert_eq!(view["result"], *result);
 }
 
 // REQ-LOCALRUN-95
@@ -3849,7 +3894,7 @@ fn local_run_forwards_only_declared_host_environment() {
     }
 }
 
-// REQ-WFEXEC-5, REQ-WFEXEC-19, REQ-LOCALRUN-82, REQ-LOCALRUN-86, REQ-LOCALRUN-93, REQ-LOCALRUN-94, REQ-LOCALRUN-99, REQ-LOCALRUN-102, REQ-LOCALRUN-121, REQ-LOCALRUN-126, REQ-LOCALRUN-127
+// REQ-WFEXEC-5, REQ-WFEXEC-19, REQ-LOCALRUN-82, REQ-LOCALRUN-86, REQ-LOCALRUN-93, REQ-LOCALRUN-94, REQ-LOCALRUN-99, REQ-LOCALRUN-102, REQ-LOCALRUN-121, REQ-LOCALRUN-126, REQ-LOCALRUN-127, REQ-LOCALRUN-168
 #[test]
 fn json_run_executes_named_inputs_closed_stdin_publication_and_offline_boundaries() {
     let bundle = RunBundle::new(producer_consumer_source());
@@ -3902,6 +3947,7 @@ fn json_run_executes_named_inputs_closed_stdin_publication_and_offline_boundarie
         String::from_utf8_lossy(&output.stderr)
     );
     let terminal: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(workflow_run_schema().is_valid(&terminal), "{terminal}");
     assert_eq!(terminal["schemaVersion"], 1);
     assert_eq!(terminal["command"], "um workflow run");
     assert_eq!(terminal["outcome"], "succeeded");
@@ -3934,6 +3980,10 @@ fn json_run_executes_named_inputs_closed_stdin_publication_and_offline_boundarie
             "workflowDigest",
             "workflowManifestDigest",
         ])
+    );
+    assert_eq!(
+        run_document["gitBaseline"],
+        serde_json::json!({"status": "unavailable", "reason": "not_work_tree"})
     );
     let state: serde_json::Value =
         serde_json::from_slice(&fs::read(destination.join("state.json")).unwrap()).unwrap();
@@ -4331,6 +4381,7 @@ fn failure_rejection_usage_and_result_preconditions_keep_their_outcome_precedenc
     let output = run(&args);
     assert_eq!(output.status.code(), Some(1));
     let rejection: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(workflow_run_schema().is_valid(&rejection), "{rejection}");
     assert_eq!(rejection["outcome"], "rejected");
     assert_eq!(rejection["phase"], "admission");
     assert_eq!(
@@ -4369,6 +4420,7 @@ fn failure_rejection_usage_and_result_preconditions_keep_their_outcome_precedenc
     let output = run(&args);
     assert_eq!(output.status.code(), Some(1));
     let rejection: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(workflow_run_schema().is_valid(&rejection), "{rejection}");
     assert_eq!(rejection["outcome"], "rejected");
     assert_eq!(rejection["phase"], "resolution");
     assert_eq!(rejection["diagnostics"][0]["code"], "malformed_yaml");

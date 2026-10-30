@@ -10,8 +10,9 @@ use um_execution::{
     ArchivedAttemptLoadError, ColorChoice, LocalRecoveryStatus, LocalRetryEligibility,
     LocalRunStatusSnapshot, LocalStatusError, LocalStatusResult, PresentationConfig,
     RequestedPresentationMode, RetryIneligibilityReason, TerminalCapabilities,
-    load_local_archived_attempt, operational_error_code, read_local_run_status,
-    reconcile_current_result_publication, styled_terminal_text as styled,
+    load_local_archived_attempt, normalize_terminal_path, normalize_terminal_scalar,
+    operational_error_code, read_local_run_status, reconcile_current_result_publication,
+    styled_terminal_text as styled,
 };
 
 pub(super) const ABOUT: &str = "Show local workflow run status";
@@ -53,10 +54,15 @@ impl Command {
                 let snapshot = snapshot
                     .map_err(|error| anyhow!(error.code.message()))
                     .with_context(|| {
-                        format!("inspect workflow run {}", self.run.run_dir.display())
+                        format!(
+                            "inspect workflow run {}",
+                            normalize_terminal_path(&self.run.run_dir)
+                        )
                     })?;
-                reconciliation
-                    .map_err(|error| anyhow!("finalize workflow result publication: {error:?}"))?;
+                reconciliation.map_err(|error| {
+                    anyhow!(reconciliation_error_code(&error))
+                        .context("finalize workflow result publication")
+                })?;
                 let color = self.plain_color_enabled();
                 render_plain(&snapshot, color).context("write workflow status output")?
             };
@@ -202,12 +208,7 @@ fn render_json(
 ) -> io::Result<ExitCode> {
     match (snapshot, reconciliation) {
         (Ok(snapshot), Err(error)) => {
-            let code = match error {
-                ArchivedAttemptLoadError::Operational(error) => operational_error_code(error.code),
-                // A concurrent change to the selected attempt invalidated the
-                // pending selection between the two stable snapshot reads.
-                ArchivedAttemptLoadError::Ineligible(_) => "status_snapshot_unstable",
-            };
+            let code = reconciliation_error_code(&error);
             write_json(&StatusErrorOutput {
                 schema_version: 1,
                 command: COMMAND,
@@ -261,6 +262,15 @@ fn render_json(
     }
 }
 
+const fn reconciliation_error_code(error: &ArchivedAttemptLoadError) -> &'static str {
+    match error {
+        ArchivedAttemptLoadError::Operational(error) => operational_error_code(error.code),
+        // A concurrent change to the selected attempt invalidated the
+        // pending selection between the two stable snapshot reads.
+        ArchivedAttemptLoadError::Ineligible(_) => "status_snapshot_unstable",
+    }
+}
+
 fn write_json(value: &impl Serialize) -> io::Result<()> {
     super::super::write_pretty_json(value)
 }
@@ -278,7 +288,11 @@ fn write_plain_snapshot(
     snapshot: &LocalRunStatusSnapshot,
     color: bool,
 ) -> io::Result<()> {
-    writeln!(writer, "run: {}", snapshot.run_directory.display())?;
+    writeln!(
+        writer,
+        "run: {}",
+        normalize_terminal_path(&snapshot.run_directory)
+    )?;
     writeln!(writer, "attempt: {}", snapshot.current_attempt_number)?;
     writeln!(
         writer,
@@ -333,6 +347,10 @@ fn write_plain_snapshot(
     if let LocalRecoveryStatus::OwnershipUnproven { guard_ids, reason } = &snapshot.recovery {
         writeln!(writer, "ownership reason: {}", reason.as_str())?;
         writeln!(writer, "remedy: {}", reason.remedy())?;
+        let guard_ids = guard_ids
+            .iter()
+            .map(|id| normalize_terminal_scalar(id.as_bytes()))
+            .collect::<Vec<_>>();
         writeln!(writer, "guard ids: {}", guard_ids.join(", "))?;
     }
     writeln!(writer)?;
@@ -372,8 +390,9 @@ fn styled_result(result: &LocalStatusResult, color: bool) -> String {
             styled(&format!("not_published ({reason})"), STYLE_BLOCKED, color)
         }
         LocalStatusResult::Published { relative_directory } => format!(
-            "{} ({relative_directory})",
-            styled("published", STYLE_SUCCESS, color)
+            "{} ({})",
+            styled("published", STYLE_SUCCESS, color),
+            normalize_terminal_scalar(relative_directory.as_bytes())
         ),
         LocalStatusResult::PublicationFailed { phase } => styled(
             &format!("publication_failed ({phase})"),

@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::condition::TerminalDisposition;
+use super::validated::ValidatedHarness;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct WorkflowDocument {
@@ -104,7 +105,7 @@ impl FinalizationTrigger {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct AgentProfile {
-    pub(crate) harness: HarnessDefinition,
+    pub(crate) harness: ValidatedHarness,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -210,11 +211,4 @@ pub(crate) struct AgentMessage {
 pub(crate) enum MessageSource {
     File { path: String },
     Reference(ValueReference),
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum HarnessDefinition {
-    Pi { config: Value },
-    ClaudeCode { config: Value },
-    Codex { config: Value },
 }

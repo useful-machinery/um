@@ -54,7 +54,7 @@ struct PublicationWaitArgs {
         requires = "wait",
         value_name = "DURATION",
         value_parser = super::parse_wait_timeout,
-        help = "Stop waiting after a positive duration (units: ms, s, m, or h)"
+        help = super::WAIT_TIMEOUT_HELP
     )]
     timeout: Option<Duration>,
 }

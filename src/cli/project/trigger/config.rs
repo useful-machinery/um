@@ -1,11 +1,12 @@
 //! Validate the closed request grammar before handing a typed request to the generated transport.
 //! Generated untagged unions accept extra properties and may default missing fields.
-use std::io::{self, Read};
 use std::path::Path;
 
 use anyhow::{Result, anyhow};
 use serde_json::{Map, Value};
 use um_api::{CreateLinearTriggerRequest, UpdateLinearTriggerRequest};
+
+use super::super::resource;
 
 fn object<'a>(
     value: &'a Value,
@@ -49,6 +50,99 @@ fn literal_or_field(value: &Value, snapshot: bool, text: bool) -> Result<()> {
             object(value, &["type"], &["type"])?;
         }
         _ => return Err(anyhow!("invalid mapping source for kind")),
+    }
+    Ok(())
+}
+
+/// Advisory copy of the shared lifecycle catalog; the Gateway owns it and answers 400 on drift.
+const LIFECYCLE_EVENT_TYPES: [&str; 19] = [
+    "run.queued",
+    "run.started",
+    "run.succeeded",
+    "run.failed",
+    "run.cancelled",
+    "run.interrupted",
+    "run.rejected",
+    "step.started",
+    "step.succeeded",
+    "step.failed",
+    "step.skipped",
+    "step.cancelled",
+    "step.blocked",
+    "step.not_run",
+    "publication.published",
+    "publication.no_changes",
+    "publication.already_merged",
+    "publication.failed",
+    "publication.unavailable",
+];
+
+fn nonempty_string(value: &Value) -> bool {
+    value.as_str().is_some_and(|s| !s.is_empty())
+}
+
+/// Mirrors REQ-TRIGGER-104 except the `publication.*` rule, which the Gateway checks against the
+/// merged candidate because a PATCH may omit `publication`.
+fn lifecycle(choice: &Value) -> Result<()> {
+    let fields = object(choice, &["enabled"], &["enabled", "teamMappings"])?;
+    match fields["enabled"].as_bool() {
+        Some(false) if fields.len() == 1 => return Ok(()),
+        Some(true) => {}
+        _ => return Err(anyhow!("invalid Linear lifecycle policy")),
+    }
+    let teams = fields
+        .get("teamMappings")
+        .and_then(Value::as_array)
+        .filter(|teams| !teams.is_empty())
+        .ok_or_else(|| anyhow!("an enabled Linear lifecycle requires team mappings"))?;
+    let mut team_ids = std::collections::HashSet::new();
+    for team in teams {
+        let mapping = object(team, &["teamId", "rules"], &["teamId", "rules"])?;
+        if !nonempty_string(&mapping["teamId"]) || !team_ids.insert(&mapping["teamId"]) {
+            return Err(anyhow!(
+                "Linear lifecycle team IDs must be nonempty and unique"
+            ));
+        }
+        let rules = mapping["rules"]
+            .as_array()
+            .filter(|rules| !rules.is_empty())
+            .ok_or_else(|| anyhow!("a Linear lifecycle team mapping requires rules"))?;
+        // Each (eventType, node) pair once; node `None` is the all-node rule.
+        let mut selected: Vec<(&Value, Option<&Value>, &Value)> = Vec::new();
+        for rule in rules {
+            let fields = object(
+                rule,
+                &["eventType", "stateId"],
+                &["eventType", "node", "stateId"],
+            )?;
+            let event = fields["eventType"].as_str().unwrap_or("");
+            if !LIFECYCLE_EVENT_TYPES.contains(&event) || !nonempty_string(&fields["stateId"]) {
+                return Err(anyhow!("invalid Linear lifecycle rule"));
+            }
+            let node = fields.get("node");
+            if let Some(node) = node {
+                let selector = object(node, &["scope", "role", "id"], &["scope", "role", "id"])?;
+                if !event.starts_with("step.")
+                    || !selector["scope"]
+                        .as_array()
+                        .is_some_and(|scope| scope.iter().all(Value::is_string))
+                    || !["step", "finalizer"].contains(&selector["role"].as_str().unwrap_or(""))
+                    || !selector["id"].is_string()
+                {
+                    return Err(anyhow!("invalid Linear lifecycle node selector"));
+                }
+            }
+            let state = &fields["stateId"];
+            let conflict = selected.iter().any(|(other, other_node, other_state)| {
+                *other == &fields["eventType"]
+                    && (*other_node == node
+                        || (other_node.is_none() != node.is_none() && *other_state != state))
+            });
+            if conflict {
+                return Err(anyhow!("conflicting Linear lifecycle rules"));
+            }
+            selected.push((&fields["eventType"], node, state));
+        }
     }
     Ok(())
 }
@@ -171,10 +265,7 @@ fn validate(value: &Value, update: bool) -> Result<()> {
         }
     }
     if let Some(choice) = map.get("linearLifecycle") {
-        let fields = object(choice, &["enabled"], &["enabled"])?;
-        if fields["enabled"] != false {
-            return Err(anyhow!("only a disabled Linear lifecycle is supported"));
-        }
+        lifecycle(choice)?;
     }
     if let Some(publication) = map.get("publication") {
         let fields = object(publication, &["exportName"], &["exportName"])?;
@@ -185,46 +276,16 @@ fn validate(value: &Value, update: bool) -> Result<()> {
     Ok(())
 }
 
-fn parse(bytes: &[u8], update: bool, expected: Option<i32>) -> Result<Value> {
-    let mut value: Value =
-        serde_json::from_slice(bytes).map_err(|_| anyhow!("invalid configuration JSON"))?;
-    validate(&value, update)?;
-    if update {
-        let version = expected.ok_or_else(|| anyhow!("expected version required"))?;
-        if version < 1 {
-            return Err(anyhow!("expected version must be positive"));
-        }
-        value
-            .as_object_mut()
-            .ok_or_else(|| anyhow!("invalid configuration"))?
-            .insert("expectedVersion".into(), version.into());
-    }
-    Ok(value)
+fn parse(bytes: &[u8], expected: Option<i32>) -> Result<Value> {
+    resource::parse_configuration(bytes, expected, validate)
 }
 
-pub(super) fn read(
-    path: &Path,
-    update: bool,
-    expected: Option<i32>,
-    stdin_claimed: bool,
-) -> Result<Value> {
-    if path == Path::new("-") && stdin_claimed {
-        return Err(anyhow!(
-            "configuration and authentication cannot both read stdin"
-        ));
-    }
-    let mut bytes = Vec::new();
-    if path == Path::new("-") {
-        io::stdin().take(1024 * 1024 + 1).read_to_end(&mut bytes)?;
-    } else {
-        std::fs::File::open(path)?
-            .take(1024 * 1024 + 1)
-            .read_to_end(&mut bytes)?;
-    }
-    if bytes.len() > 1024 * 1024 {
-        return Err(anyhow!("configuration exceeds 1 MiB"));
-    }
-    parse(&bytes, update, expected)
+/// Reads a create configuration, or with its `expected` version an update's fields.
+pub(super) fn read(path: &Path, expected: Option<i32>, stdin_claimed: bool) -> Result<Value> {
+    parse(
+        &resource::read_configuration(path, stdin_claimed)?,
+        expected,
+    )
 }
 
 pub(super) fn create(value: Value) -> Result<CreateLinearTriggerRequest> {
@@ -240,7 +301,7 @@ mod tests {
     #[test]
     fn closed_configuration_and_null_values() {
         let base = br#"{"enabled":false,"source":{"type":"linear","connectionId":"lcn_1"},"target":{"workflowPath":".um/a.yaml","executionPrincipalId":"prn_1"},"conditions":[{"field":"event.action","operator":"eq","value":"update"}],"inputs":{"ticket":{"kind":"file","source":{"type":"snapshot"}},"data":{"kind":"json","source":{"type":"literal","value":null}}},"integrationContext":{"key":{"type":"field","field":"current.title"}}}"#;
-        let mut value = parse(base, false, None).unwrap();
+        let mut value = parse(base, None).unwrap();
         value["inputs"]["message"] =
             serde_json::json!({"kind":"text","source":{"type":"literal","value":"ready"}});
         value["inputs"]["title"] =
@@ -256,28 +317,20 @@ mod tests {
             br#"{"unknown":1}"#.as_slice(),
             br#"{"inputs":{"x":{"kind":"file","source":{"type":"snapshot","field":"oops"}}}}"#,
         ] {
-            assert!(parse(bad, true, Some(1)).is_err());
+            assert!(parse(bad, Some(1)).is_err());
         }
-        assert!(parse(br#"{"inputs":{}}"#, true, Some(5)).is_ok());
-        assert!(parse(br#"{"inputs":null}"#, true, Some(5)).is_err());
-        assert!(parse(br#"{"expectedVersion":2}"#, true, Some(5)).is_err());
+        assert!(parse(br#"{"inputs":{}}"#, Some(5)).is_ok());
+        assert!(parse(br#"{"inputs":null}"#, Some(5)).is_err());
+        assert!(parse(br#"{"expectedVersion":2}"#, Some(5)).is_err());
         assert!(
-            update(
-                parse(
-                    br#"{"publication":{"exportName":"published"}}"#,
-                    true,
-                    Some(5)
-                )
-                .unwrap()
-            )
-            .is_ok()
+            update(parse(br#"{"publication":{"exportName":"published"}}"#, Some(5)).unwrap())
+                .is_ok()
         );
-        let mut disabled = parse(base, false, None).unwrap();
+        let mut disabled = parse(base, None).unwrap();
         disabled["linearLifecycle"] = serde_json::json!({"enabled":false});
         assert!(create(disabled).is_ok());
         assert!(
-            update(parse(br#"{"linearLifecycle":{"enabled":false}}"#, true, Some(1)).unwrap())
-                .is_ok()
+            update(parse(br#"{"linearLifecycle":{"enabled":false}}"#, Some(1)).unwrap()).is_ok()
         );
         for bad in [
             r#"{}"#,
@@ -286,15 +339,89 @@ mod tests {
             r#"{"enabled":false,"extra":0}"#,
         ] {
             let patch = format!(r#"{{"linearLifecycle":{bad}}}"#);
-            assert!(parse(patch.as_bytes(), true, Some(1)).is_err());
+            assert!(parse(patch.as_bytes(), Some(1)).is_err());
         }
-        assert!(create(parse(base, false, None).unwrap()).is_ok());
+        assert!(create(parse(base, None).unwrap()).is_ok());
         for bad in [
             br#"{"inputs":{"x":{"kind":"text","source":{"type":"field","field":"current.comments"}}}}"#.as_slice(),
             br#"{"inputs":{"x":{"kind":"text","source":{"type":"literal","value":null}}}}"#,
             br#"{"integrationContext":{"x":{"type":"snapshot"}}}"#,
         ] {
-            if let Ok(value) = parse(bad, true, Some(1)) { assert!(update(value).is_err()); }
+            if let Ok(value) = parse(bad, Some(1)) { assert!(update(value).is_err()); }
+        }
+    }
+
+    // REQ-TRIGGER-104: the local mirror accepts the enabled policy and rejects its invalid forms.
+    #[test]
+    fn enabled_lifecycle_policy_shape() {
+        let policy = serde_json::json!({"enabled":true,"teamMappings":[{"teamId":"LINEAR_TEAM_ID","rules":[
+            {"eventType":"run.started","stateId":"WORKING_STATE_ID"},
+            {"eventType":"step.succeeded","node":{"scope":[],"role":"step","id":"review"},"stateId":"REVIEWED_STATE_ID"},
+            {"eventType":"publication.published","stateId":"IN_REVIEW_STATE_ID"},
+            {"eventType":"publication.no_changes","stateId":"TRIAGE_STATE_ID"},
+            {"eventType":"run.failed","stateId":"TRIAGE_STATE_ID"}]}]});
+        let mut config = serde_json::json!({"enabled":false,"source":{"type":"linear","connectionId":"lcn_1"},"target":{"workflowPath":".um/a.yaml","executionPrincipalId":"prn_1"},"conditions":[{"field":"event.action","operator":"eq","value":"update"}],"inputs":{},"integrationContext":{},"publication":{"exportName":"published"}});
+        config["linearLifecycle"] = policy.clone();
+        let created = create(parse(config.to_string().as_bytes(), None).unwrap()).unwrap();
+        assert_eq!(
+            serde_json::to_value(created).unwrap()["linearLifecycle"],
+            policy
+        );
+        let patch = |policy: &Value| {
+            let body = serde_json::json!({"linearLifecycle": policy}).to_string();
+            parse(body.as_bytes(), Some(1))
+        };
+        let updated = update(patch(&policy).unwrap()).unwrap();
+        assert_eq!(
+            serde_json::to_value(updated).unwrap()["linearLifecycle"],
+            policy
+        );
+        let rule = |extra: Value| {
+            let mut rule = serde_json::json!({"eventType":"step.failed","stateId":"S"});
+            rule.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            rule
+        };
+        let node = serde_json::json!({"scope":["c"],"role":"finalizer","id":"n"});
+        let team = |rules: Vec<Value>| serde_json::json!({"teamId":"T","rules":rules});
+        let enabled = |teams: Vec<Value>| serde_json::json!({"enabled":true,"teamMappings":teams});
+        // An all-node rule may sit beside a node-bearing rule for the same type and destination.
+        let shared = rule(serde_json::json!({"node":node}));
+        assert!(
+            patch(&enabled(vec![team(vec![
+                rule(serde_json::json!({})),
+                shared.clone()
+            ])]))
+            .is_ok()
+        );
+        for bad in [
+            serde_json::json!({"enabled":false,"teamMappings":[]}),
+            enabled(vec![]),
+            enabled(vec![team(vec![])]),
+            enabled(vec![team(vec![rule(
+                serde_json::json!({"eventType":"webhook.test"}),
+            )])]),
+            enabled(vec![team(vec![rule(
+                serde_json::json!({"eventType":"run.failed","node":node}),
+            )])]),
+            enabled(vec![team(vec![rule(
+                serde_json::json!({"node":{"scope":[],"role":"step"}}),
+            )])]),
+            enabled(vec![team(vec![rule(serde_json::json!({"node":null}))])]),
+            enabled(vec![team(vec![rule(serde_json::json!({"stateId":""}))])]),
+            enabled(vec![team(vec![rule(serde_json::json!({"extra":1}))])]),
+            enabled(vec![
+                team(vec![rule(serde_json::json!({}))]),
+                team(vec![rule(serde_json::json!({}))]),
+            ]),
+            enabled(vec![team(vec![shared.clone(), shared.clone()])]),
+            enabled(vec![team(vec![
+                shared,
+                rule(serde_json::json!({"stateId":"X"})),
+            ])]),
+        ] {
+            assert!(patch(&bad).is_err(), "{bad}");
         }
     }
 }

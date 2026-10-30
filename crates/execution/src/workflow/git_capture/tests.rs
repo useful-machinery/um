@@ -399,6 +399,8 @@ fn changed_capture_has_verified_bundle_profile_metadata_size_and_digest() {
     fixture.commit_file("tracked.txt", b"changed\n", "change");
     let head = git_oid(&fixture.repository, "HEAD");
     let tree = git_oid(&fixture.repository, "HEAD^{tree}");
+    let refs = ["for-each-ref", "--format=%(refname) %(objectname)"];
+    let refs_before = git(&fixture.repository, &refs);
 
     let candidates = fixture.capture().unwrap();
     let branch = candidates.outputs()["changes"].as_git_branch().unwrap();
@@ -438,13 +440,8 @@ fn changed_capture_has_verified_bundle_profile_metadata_size_and_digest() {
     let body = &bytes[bundle_header(&baseline, &head).len()..];
     assert_eq!(&body[..4], b"PACK");
     assert_eq!(u32::from_be_bytes(body[4..8].try_into().unwrap()), 2);
-    assert_eq!(
-        git(
-            &fixture.repository,
-            &["for-each-ref", "--format=%(refname)", "refs/scherzo"]
-        ),
-        ""
-    );
+    assert_eq!(git(&fixture.repository, &refs), refs_before);
+    assert_eq!(git_oid(&fixture.repository, "HEAD"), head);
     assert_eq!(git(&fixture.repository, &["status", "--porcelain=v1"]), "");
 
     assert_eq!(fixture.artifacts.git_reservation_usage().0, 1);

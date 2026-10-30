@@ -78,6 +78,7 @@ use crate::workflow::agent::{AgentOutcome, AgentValueKind};
 use crate::workflow::artifact::{
     ArtifactReadFailure, CaptureCancellation, CaptureDeclaration, CapturedArtifact,
 };
+use crate::workflow::claude_code::ClaudeCodeStreamJsonV1Parser;
 use crate::workflow::diagnostic::{CapturedDiagnosticStream, StepDiagnostic};
 use crate::workflow::evidence::{
     CancellationDetail, PrimaryIssue, failure_detail as canonical_failure_detail,
@@ -2306,6 +2307,48 @@ fn structured_agent_failure_keeps_protocol_rejection_out_of_node_detail() {
     let projected = serde_json::to_value(projected).unwrap();
     assert_eq!(projected["code"], "harness_protocol_failed");
     assert!(projected.get("protocolRejection").is_none());
+    assert!(!projected.to_string().contains("sensitive sentinel"));
+}
+
+// REQ-DIAG-39, REQ-EVIDENCE-12
+#[test]
+fn claude_stream_excerpt_stays_out_of_node_detail() {
+    let version = crate::claude_code::CLAUDE_CODE_STREAM_JSON_V1_QUALIFICATION_VERSION;
+    let session = "00000000-0000-4000-8000-00000000000c";
+    let mut parser = ClaudeCodeStreamJsonV1Parser::profile(
+        Arc::from("/execution/worktree"),
+        Arc::from("model"),
+        Arc::from(session),
+        Arc::from(version),
+        AgentValueKind::None,
+        NonZeroU64::MIN,
+    );
+    let frames = [
+        json!({"type": "system", "subtype": "init", "cwd": "/execution/worktree",
+            "session_id": session, "model": "model", "permissionMode": "bypassPermissions",
+            "claude_code_version": version}),
+        json!({"type": "system", "subtype": "status", "status": "sensitive sentinel",
+            "session_id": session}),
+    ];
+    let mut stdout = String::new();
+    for frame in frames {
+        stdout.push_str(&format!("{frame}\n"));
+    }
+    stdout.push_str("not-json sensitive sentinel\n");
+    assert!(parser.push_stdout(stdout.as_bytes(), drop).is_err());
+    let AgentOutcome::Failed(failure) = parser.finish(true) else {
+        panic!("an undecodable frame must fail");
+    };
+    let excerpt = serde_json::to_string(failure.stream_excerpt().unwrap()).unwrap();
+    assert_eq!(excerpt.matches("sensitive sentinel").count(), 2);
+    assert!(failure.tracked_work().is_some());
+
+    let source = StepFailureCause::Execution(StepExecutionFailure::Agent(failure));
+    let projected = canonical_failure_detail(FailurePhase::Execution, &source).unwrap();
+    let projected = serde_json::to_value(projected).unwrap();
+    assert_eq!(projected["code"], "harness_protocol_failed");
+    assert!(projected.get("protocolRejection").is_none());
+    assert!(projected.get("trackedWork").is_none());
     assert!(!projected.to_string().contains("sensitive sentinel"));
 }
 

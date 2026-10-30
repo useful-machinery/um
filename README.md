@@ -345,9 +345,9 @@ Download the customer OpenAPI contract from its stable public URL:
 The hosted file describes the API deployed at `https://api.usefulmachinery.com`. A particular CLI
 build remains self-contained: it uses the generated Rust client committed under
 `crates/api/src/generated/` and does not fetch the hosted contract at build time or run time. Each
-generated source header records the OpenAPI Generator version and SHA-256 digest of the
-canonical contract used for that client, so its provenance identifies the contract used by
-that CLI build even when the deployed API contract has since changed.
+generated source header records the OpenAPI Generator version and the canonical contract's
+path, and the contract a CLI build used is the one committed beside the client at that
+build's source commit, even when the deployed API contract has since changed.
 
 ## Local workflow validation
 
@@ -525,7 +525,10 @@ removed after settlement, and no Codex-native thread or file is retained. A Code
 protocol failure may retain the same bounded structural rejection document as the other
 profiles. The run-directory path is the local run handle. Add `--json` for one terminal
 schema-version-1 object on stdout while the live presentation remains on stderr, or
-`--plain` to force the line presentation on stdout.
+`--plain` to force the line presentation on stdout. The `--json` object of run, retry,
+and continue conforms to
+[`schemas/workflow-run-result-v1.schema.json`](schemas/workflow-run-result-v1.schema.json),
+whose completed-attempt `result` refers to the view schema's `WorkflowResult`.
 
 Retained harness diagnostics can contain sensitive prompts, model output, tool activity,
 paths, and extension or provider state. Native sessions or diagnostic files may be
@@ -699,8 +702,10 @@ um workflow continue ./runs/check-001 --from verify \
 `--workflow` selects a replacement within the original retained source-root boundary;
 without it the immediately prior attempt's retained definition is used. The execution
 root is selected independently and defaults to the prior attempt's root. Accepted
-`--json` writes the terminal result as one stdout object and emits the same accepted
-partition record to stderr before execution. The initial
+`--json` writes the terminal result as one stdout object conforming to
+[`schemas/workflow-run-result-v1.schema.json`](schemas/workflow-run-result-v1.schema.json)
+and emits the same accepted partition record to stderr before execution; a refused
+continuation writes its rejection document under the same schema. The initial
 run inputs and primary-workspace Git baseline remain immutable. A continuation is
 allowed only from an eligible latest failed, cancelled, or interrupted attempt, after
 all retained process groups are proven quiescent. Before actions run, plain output
@@ -1339,6 +1344,61 @@ interrupted observation does not cancel a cycle. A result reports the final
 run, nonmatch, overlap, stopped, or failed state and its safe reason code;
 unknown acceptance never claims a run was created.
 
+## Schedules and occurrences
+
+Any active organization member, person or service principal, may list and show a project's
+schedules and their occurrences; only an organization owner may create, update, enable, disable
+or delete a schedule. Create requires a complete JSON object with explicit `name`, `enabled`,
+`timing`, `target`, `inputs`, and `integrationContext`. For example:
+
+```json
+{
+  "name": "Code hygiene",
+  "enabled": true,
+  "timing": {"cron": "0 6 * * 1-5", "timeZone": "Europe/London"},
+  "target": {"workflowPath": ".um/cloud/code-hygiene.yaml", "executionPrincipalId": "prn_01k0z6r1w8f4jy2m7q9v3x5abc"},
+  "inputs": {"publish": "file-tickets"},
+  "integrationContext": {}
+}
+```
+
+`timing` is a five-field cron expression evaluated in an IANA time zone, and `target` names
+the workflow and the service principal its runs execute as. The optional `publication` object
+(`{"exportName":"name"}`) names a Git branch export of the target workflow that each scheduled
+run requests. Update files contain only the members to replace, each replacing the whole value,
+never `enabled` or `expectedVersion`; `"publication": null` removes the publication:
+
+```sh
+um project schedule create ORG PROJECT --config-file schedule.json
+um project schedule list ORG PROJECT --limit 50 --cursor CURSOR
+um project schedule show ORG PROJECT SCHEDULE
+um project schedule update ORG PROJECT SCHEDULE --config-file changes.json --expected-version 3
+um project schedule disable ORG PROJECT SCHEDULE
+um project schedule enable ORG PROJECT SCHEDULE
+um project schedule delete ORG PROJECT SCHEDULE --yes
+um project schedule occurrence list ORG PROJECT SCHEDULE --state skipped_active --limit 50
+um project schedule occurrence show ORG PROJECT SCHEDULE OCCURRENCE
+```
+
+Use `--config-file -` for stdin unless the service API key also reads stdin. A configuration
+file that is not the API's configuration shape is rejected before sending a request; every
+other rule is Cloud's. A schedule may match at most once every five minutes, and
+`integrationContext` keys beginning `um.` are reserved; Cloud refuses a denser or invalid
+timing, a reserved key, or a workflow with file or attachments inputs, and the CLI reports the refusal as
+`invalid_input` with the typed problem, such as `timing-too-frequent`, as `reason`. A version
+conflict requires showing the schedule and deliberately updating the current version.
+
+Lists return only one page; pass the printed opaque next cursor with the same filters for
+another page. Without `--json`, `show` prints the timing, the next due time and the upcoming
+times, and `occurrence list` prints one line per occurrence with its due time, state, reason
+and created or blocking run. `--json` emits one schema-version-1 result with `deployment`,
+`organizationRef`, `outcome`, and the schedule, occurrence or `items`, plus `nextCursor`
+while more remain; a deleted schedule reads as a tombstone for 30 days. Disabling or deleting
+a schedule stops its pending and retrying occurrences, not runs already created. If a mutation's response
+is lost, the CLI resends it once with the same key; when the outcome stays unknown,
+`commitment_unknown` reports its `idempotencyKey`. Show the schedule before deciding whether
+to repeat the operation.
+
 ## GitLab.com connections and credential candidates
 
 GitLab setup is CLI-only for now. Credential activation and GitLab run admission remain
@@ -1443,9 +1503,14 @@ consent has been verified, a plain reauthorization requests it again even after
 credential loss; it is not a downgrade. Session `requestedScopes` and connection
 `stateUpdatesConsented` are nonsecret inspection metadata. Discovery pages require
 owner access and suggest states without installing rules or writing to Linear.
-New triggers on an active write-capable connection must explicitly supply
-`"linearLifecycle":{"enabled":false}` in their configuration until lifecycle
-rules and synchronization are available. Use `--json`
+New triggers on an active write-capable connection must state `linearLifecycle`
+in their configuration: either `{"enabled":false}`, or `{"enabled":true,"teamMappings":[…]}`
+mapping each Linear team ID to rules of a lifecycle `eventType`, an optional `node`
+selector for `step.*` events, and a destination `stateId`. `trigger create` and
+`trigger update` check this shape locally before sending. The Gateway verifies every
+mapped team and state against Linear, and answers 503 with `Retry-After` when Linear
+is unavailable. Enabled policies synchronize newly admitted Linear-triggered runs;
+existing runs are never retrofitted. Use `--json`
 for schema-version-1 newline-delimited events when starting or waiting and a single
 JSON line for inspection/lifecycle commands. A lost start response is retried only
 with the same internally generated request key during that invocation. If commitment
@@ -1650,6 +1715,14 @@ um run show \
 um run show acme-labs run_01k0z6r1w8f4jy2m7q9v3x5abc \
   --wait --timeout 30m
 
+# Read the Linear lifecycle binding a trigger admitted the run with; outcome not_found when none.
+um run linear show acme-labs run_01k0z6r1w8f4jy2m7q9v3x5abc --json
+# List the binding's retained desired-state updates, newest first; --cursor continues a page.
+um run linear history acme-labs run_01k0z6r1w8f4jy2m7q9v3x5abc --limit 50 --json
+# Open the next cycle of an exhausted retryable update; the key is generated when omitted.
+um run linear retry acme-labs run_01k0z6r1w8f4jy2m7q9v3x5abc \
+  llu_01k0z6r1w8f4jy2m7q9v3x5abc --json
+
 # Continue from selected steps on the same retained runner boot. Admission is not execution.
 um run continue acme-labs run_01k0z6r1w8f4jy2m7q9v3x5abc \
   --from build --from test --expected-version 7 --json
@@ -1809,6 +1882,14 @@ schema-version-1 object with `operation`, `deployment`, `organizationRef`,
 nullable `runId`, `outcome`, full nullable `run`,
 `publication`, `cancellationRequest`, nullable create `replayed`, and nullable `error`.
 The error includes `code`, `idempotencyKey`, `requestedMode`, and `requestId` (nullable).
+A create that Cloud definitely refuses at source admission (a `409` or `422`
+`workspace-selection-unsupported`, `workflow-source-unavailable`, `workflow-source-invalid`,
+`workspace-source-unavailable`, or `workspace-membership-unproven` problem) exits 1 with
+code `admission_rejected`; its error adds `httpStatus`, the full `problemType` URI, and
+`correlationId`, the response's `X-Request-ID` (omitted when absent or not a `req_` id), and
+human mode prints the same facts with a remedy. Such a refusal created no run and is never
+`acceptance_unknown`, which a create reports with its key and exit 4 only when the outcome
+is unconfirmed: a transport failure, a `5xx`, or an unreadable response after dispatch.
 Progress goes to stderr. Human create/show results show the Run's automatic publication
 handoff and any observed Publication state, outcome, receipt disposition, failure, and
 redacted confirmed pull-request URL separately from execution. On failure, inspect the existing publication or handoff

@@ -23,7 +23,7 @@ pub(super) struct Command {
         help = "Require this positive run version at admission")]
     expected_version: Option<i64>,
     #[arg(long, value_name = "DURATION", value_parser = super::super::parse_wait_timeout,
-        help = "Stop waiting after a positive duration (units: ms, s, m, or h)")]
+        help = super::super::WAIT_TIMEOUT_HELP)]
     timeout: Option<Duration>,
     #[command(flatten)]
     options: RunOptions,

@@ -587,7 +587,7 @@ impl FeedbackBuilder {
 
     fn push(&mut self, text: &str) {
         let remaining = self.maximum_bytes.saturating_sub(self.bytes.len());
-        let end = floor_char_boundary(text, remaining.min(text.len()));
+        let end = text.floor_char_boundary(remaining);
         self.bytes.push_str(&text[..end]);
     }
 
@@ -608,13 +608,6 @@ fn bounded_feedback(feedback: String, maximum_bytes: u64) -> Arc<str> {
     let mut bounded = FeedbackBuilder::new(maximum_bytes);
     bounded.push(&feedback);
     bounded.finish()
-}
-
-fn floor_char_boundary(value: &str, mut index: usize) -> usize {
-    while !value.is_char_boundary(index) {
-        index -= 1;
-    }
-    index
 }
 
 fn compile_validator(schema: &Value) -> Result<Validator, ()> {

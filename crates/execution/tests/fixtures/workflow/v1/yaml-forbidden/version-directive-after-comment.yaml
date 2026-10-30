@@ -1,0 +1,7 @@
+# Review workflow
+
+%YAML 1.1
+---
+schemaVersion: 1
+steps:
+  prepare: {kind: cmd, command: {argv: ["true"]}}

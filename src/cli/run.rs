@@ -22,6 +22,7 @@ mod acquisition;
 mod continuation;
 mod input_set;
 mod inputs;
+mod linear_lifecycle;
 mod list;
 mod observation;
 mod output;
@@ -71,6 +72,8 @@ enum RunCommand {
     Input(inputs::Command),
     #[command(about = input_set::ABOUT)]
     InputSet(input_set::Command),
+    #[command(about = linear_lifecycle::ABOUT)]
+    Linear(linear_lifecycle::Command),
     #[command(about = "List Useful Machinery runs")]
     List(ListCommand),
     #[command(about = "Retry a run")]
@@ -184,7 +187,7 @@ struct RunWaitArgs {
     #[arg(long, help = "Observe the run until it settles")]
     wait: bool,
     #[arg(long, requires = "wait", value_name = "DURATION", value_parser = super::parse_wait_timeout,
-        help = "Stop waiting after a positive duration (units: ms, s, m, or h)")]
+        help = super::WAIT_TIMEOUT_HELP)]
     timeout: Option<Duration>,
 }
 
@@ -270,6 +273,7 @@ impl Command {
                 |command, deployment| command.execute(deployment.clone()),
             ),
             Some(RunCommand::InputSet(command)) => command.execute(),
+            Some(RunCommand::Linear(command)) => command.execute(),
             Some(RunCommand::Input(command)) => command.execute(),
             Some(RunCommand::Show(command)) => super::execute_deployment_command(
                 Some(command),
@@ -1246,10 +1250,14 @@ fn failure_code(
         RunFailure::InputAdmissionRejected { .. } => {
             ("input_admission_rejected", ExitCode::GeneralFailure)
         }
+        RunFailure::AdmissionRejected { .. } => ("admission_rejected", ExitCode::GeneralFailure),
         RunFailure::RetryAfter(_)
         | RunFailure::RetryAmbiguousRateLimited
         | RunFailure::RetryAmbiguousAuthentication
         | RunFailure::ContinuationAcceptanceUnknown => ("unavailable", ExitCode::Unavailable),
+        RunFailure::LinearLifecycleRetryAcceptanceUnknown => {
+            ("acceptance_unknown", ExitCode::Unavailable)
+        }
         RunFailure::CreationRejected => ("creation_rejected", ExitCode::GeneralFailure),
         RunFailure::Unreachable(_) => ("unavailable", ExitCode::Unavailable),
         RunFailure::Protocol { .. } => ("protocol_error", ExitCode::GeneralFailure),
@@ -1538,17 +1546,19 @@ fn write_create(
     }) = &result
     {
         if json {
-            output::write_input_admission_failure(
+            output::write_admission_failure(
                 deployment,
                 organization,
                 input_set_id,
                 key,
-                output::InputAdmissionProblem {
+                output::AdmissionProblem {
+                    code: "input_admission_rejected",
                     status: *status,
                     problem_type,
                     diagnostic: diagnostic
                         .as_ref()
                         .map(|(code, input)| (*code, input.as_str())),
+                    correlation_id: None,
                 },
             )?;
         } else {
@@ -1574,6 +1584,54 @@ fn write_create(
                 "input set: {}\n\nInspect the input set with `um run input-set show`. {remedy} This rejection did not create a run.",
                 input_set_id.unwrap_or("none")
             )?;
+        }
+        return Ok(ExitCode::GeneralFailure);
+    }
+    // REQ-RUN-80: a definite source-admission rejection is rendered before the
+    // dispatched-failure arm below, so it can never be reported as acceptance_unknown.
+    if let Err(RunFailure::AdmissionRejected {
+        status,
+        problem_type,
+        request_id,
+    }) = &result
+    {
+        if json {
+            output::write_admission_failure(
+                deployment,
+                organization,
+                input_set_id,
+                key,
+                output::AdmissionProblem {
+                    code: "admission_rejected",
+                    status: *status,
+                    problem_type,
+                    diagnostic: None,
+                    correlation_id: request_id.as_deref(),
+                },
+            )?;
+        } else {
+            let remedy = match *problem_type {
+                "workspace-selection-unsupported" => {
+                    "This deployment does not admit an explicit workspace selection. Omit --workspace-branch and --workspace-commit and keep --source-branch; the workspace is then pinned at the workflow definition commit, which the acceptance receipt reports."
+                }
+                "workflow-source-unavailable" => {
+                    "Check that the source branch exists, the workflow path exists on it and the repository can be read."
+                }
+                "workflow-source-invalid" => {
+                    "Correct the workflow definition at the selected source."
+                }
+                _ => {
+                    "Check that the selected workspace branch or commit exists on a connected branch of the repository."
+                }
+            };
+            writeln!(
+                io::stderr().lock(),
+                "error: Cloud run admission rejected (HTTP {status})\nproblem type: https://api.usefulmachinery.com/problems/{problem_type}\nrequest id: {}\n\n{remedy} This rejection did not create a run.",
+                request_id.as_deref().unwrap_or("none")
+            )?;
+        }
+        if let Some(input_set_id) = input_set_id {
+            write_staging_guidance(organization, input_set_id)?;
         }
         return Ok(ExitCode::GeneralFailure);
     }
@@ -2008,6 +2066,10 @@ fn write_run_human(deployment: &str, heading: &str, run: &Run) -> anyhow::Result
     } else {
         writeln!(stdout, "\nassignment and reported progress: unavailable")?;
     }
+    if let Some(view) = run.linear_lifecycle.as_deref() {
+        writeln!(stdout, "\nlinear lifecycle:")?;
+        linear_lifecycle::write_view(&mut stdout, view, "  ")?;
+    }
     writeln!(stdout, "deployment: {deployment}")?;
     Ok(())
 }
@@ -2088,6 +2150,11 @@ fn write_failure_with_input_set(
             "error: Cloud run input admission rejected\n\nCorrect the named input and submit a corrected request.".to_owned(),
             OutcomeClass::GeneralFailure,
         ),
+        RunFailure::AdmissionRejected { .. } => (
+            "admission_rejected", None,
+            "error: Cloud run admission rejected\n\nCorrect the run's source selection and submit a new request.".to_owned(),
+            OutcomeClass::GeneralFailure,
+        ),
         RunFailure::CreationRejected => (
             "creation_rejected",
             None,
@@ -2103,7 +2170,8 @@ fn write_failure_with_input_set(
         RunFailure::RetryAfter(_)
         | RunFailure::RetryAmbiguousRateLimited
         | RunFailure::RetryAmbiguousAuthentication
-        | RunFailure::ContinuationAcceptanceUnknown => (
+        | RunFailure::ContinuationAcceptanceUnknown
+        | RunFailure::LinearLifecycleRetryAcceptanceUnknown => (
             "unreachable", None,
             "error: Cloud run API is temporarily unavailable\n\nTry again after the reported interval.".to_owned(),
             OutcomeClass::RateLimited,
@@ -3053,6 +3121,7 @@ mod tests {
         clock.assert_single_poll();
     }
 
+    // REQ-RUN-62
     #[test]
     fn wait_timeout_parser_accepts_documented_units_and_rejects_zero() {
         assert_eq!(

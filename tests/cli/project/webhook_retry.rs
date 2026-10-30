@@ -91,20 +91,46 @@ fn human_uncertainty_and_metadata_only_use_safe_known_identity() {
 // REQ-WEBHOOK-82
 #[test]
 fn webhook_generic_conflict_and_rate_limit_preserve_structured_outcomes() {
-    for (status, problem_type, outcome, retry) in [
-        ("409 Conflict", "webhook-conflict", "conflict", false),
+    for (status, code, problem_type, outcome, retry_after) in [
+        ("409 Conflict", 409, "webhook-conflict", "conflict", None),
+        (
+            "409 Conflict",
+            409,
+            "idempotency-conflict",
+            "conflict",
+            None,
+        ),
         (
             "429 Too Many Requests",
-            "rate-limited",
+            429,
+            "rate-limit-exceeded",
             "rate_limited",
-            true,
+            Some(17),
+        ),
+        (
+            "413 Payload Too Large",
+            413,
+            "request-body-too-large",
+            "invalid_input",
+            None,
+        ),
+        (
+            "429 Too Many Requests",
+            429,
+            "rate-limited",
+            "invalid_response",
+            None,
         ),
     ] {
-        let body = serde_json::json!({"type": format!("https://api.usefulmachinery.com/problems/{problem_type}"), "title": "No secret here", "status": if retry {429} else {409}});
+        let body = serde_json::json!({"type": format!("https://api.usefulmachinery.com/problems/{problem_type}"), "title": "No secret here", "status": code});
         let response = http_response_with_headers(
             status,
             Some("application/problem+json"),
-            if retry { &[("Retry-After", "17")] } else { &[] },
+            if code == 429 {
+                &[("Retry-After", "17")]
+            } else {
+                &[]
+            },
             &serde_json::to_vec(&body).unwrap(),
         );
         let server = ScriptedServer::respond(vec![response]);
@@ -116,9 +142,9 @@ fn webhook_generic_conflict_and_rate_limit_preserve_structured_outcomes() {
         );
         assert!(!output.status.success());
         let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-        assert_eq!(value["outcome"], outcome);
-        if retry {
-            assert_eq!(value["retryAfter"], 17);
+        assert_eq!(value["outcome"], outcome, "{problem_type}");
+        if let Some(retry_after) = retry_after {
+            assert_eq!(value["retryAfter"], retry_after);
         }
         assert!(!String::from_utf8_lossy(&output.stdout).contains("No secret here"));
         assert_eq!(server.finish().len(), 1);

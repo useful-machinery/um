@@ -6,7 +6,7 @@ use clap::{Arg, ArgAction, Command, CommandFactory};
 use super::Cli;
 
 const LEAVES: &str = "accept activate begin cancel complete continue create decline delete disable doctor download drain enable end enroll history issue leave link list login logout move preview propose reference remove rename replay request retire retry revoke revoke-previous-secret rotate-secret run schema seal serve set show signup status test update upload validate version view wait";
-const GROUPS: &str = "account action activation artifact audit auth authorization connection credential delegation deletion delivery github gitlab identity input input-set installation invitation linear member organization pool project publication repository run runner runner-pool service-principal setup state team trigger evaluation webhook workflow";
+const GROUPS: &str = "account action activation artifact audit auth authorization connection credential delegation deletion delivery github gitlab identity input input-set installation invitation linear member occurrence organization pool project publication repository run runner runner-pool schedule service-principal setup state team trigger evaluation webhook workflow";
 const COMMON: [&str; 3] = ["json", "service-api-key-file", "allow-insecure-http"];
 // These endpoints have no limit/cursor contract; see cli/docs/output-style.md.
 const UNPAGINATED_LISTS: [&str; 2] = [

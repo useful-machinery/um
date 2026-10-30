@@ -11,7 +11,8 @@ use time::format_description::well_known::Rfc3339;
 use super::http_client::{HttpClient, HttpEndpointError};
 use super::http_util::{self, BufferedResponseError};
 use super::problem::{
-    self, ACCEPTED_MEDIA_TYPES, BAD_REQUEST, FORBIDDEN, JSON_MEDIA_TYPE, NOT_FOUND, UNAUTHORIZED,
+    self, ACCEPTED_MEDIA_TYPES, BAD_REQUEST, FORBIDDEN, IDEMPOTENCY_CONFLICT, JSON_MEDIA_TYPE,
+    NOT_FOUND, UNAUTHORIZED,
 };
 use super::{UnreachableCategory, bearer_authorization, classify_reqwest_error};
 
@@ -23,7 +24,6 @@ const REAUTHENTICATION_REQUIRED: &str =
 const HUMAN_OWNER_REQUIRED: &str = "https://api.usefulmachinery.com/problems/human-owner-required";
 const TRANSITION_UNAVAILABLE: &str =
     "https://api.usefulmachinery.com/problems/lifecycle-transition-unavailable";
-const IDEMPOTENCY_CONFLICT: &str = "https://api.usefulmachinery.com/problems/idempotency-conflict";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]

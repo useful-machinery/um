@@ -776,3 +776,45 @@ fn invalid_run_directory_is_structured_and_missing_lock_is_not_created() {
     assert_eq!(unavailable["error"]["code"], "run_directory_unavailable");
     assert!(unavailable.get("runDirectory").is_none());
 }
+
+// REQ-LOCALRUN-118, REQ-LOCALRUN-145, REQ-LOCALRUN-95
+#[test]
+fn plain_status_and_run_diagnostics_escape_host_run_directory_names() {
+    // A doubled ESC abandons the first sequence, so the name keeps a visible
+    // `\x1b` (REQ-LOCALRUN-115) and its override shows as `\u{202e}`
+    // (REQ-LOCALRUN-116); raw, the second ESC would still colour the terminal.
+    let hostile = "\u{1b}\u{1b}[31m-\u{202e}";
+    let escaped = "\\x1b\\x1b[31m-\\u{202e}";
+    let (bundle, run_directory) = completed_run(&format!("run-{hostile}"));
+
+    let plain = status(&run_directory, &["--plain", "--color", "never"]);
+    assert!(
+        plain.status.success(),
+        "{}",
+        String::from_utf8_lossy(&plain.stderr)
+    );
+    assert!(!plain.stdout.contains(&0x1b));
+    assert!(
+        String::from_utf8(plain.stdout)
+            .unwrap()
+            .contains(&format!("run-{escaped}"))
+    );
+
+    let missing = status(&bundle.result(&format!("absent-{hostile}")), &[]);
+    assert_eq!(missing.status.code(), Some(1));
+    assert!(!missing.stderr.contains(&0x1b));
+    assert!(
+        String::from_utf8(missing.stderr)
+            .unwrap()
+            .contains(&format!("absent-{escaped}"))
+    );
+
+    let existing = run(&bundle.args(&run_directory));
+    assert_eq!(existing.status.code(), Some(1));
+    assert!(!existing.stderr.contains(&0x1b));
+    assert!(
+        String::from_utf8(existing.stderr)
+            .unwrap()
+            .contains(&format!("run-{escaped}"))
+    );
+}

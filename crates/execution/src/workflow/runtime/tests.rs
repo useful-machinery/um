@@ -4444,13 +4444,22 @@ fn force_abort_escalation_preserves_the_graceful_reason_and_deadline() {
 fn trace_advisory_issue_context_is_exact_sorted_and_immutable() {
     let definition = finalizer_definition(
         &[("lint", FailurePolicy::Advisory, &[], &[], &[])],
-        &[(
-            "notify",
-            FailurePolicy::Advisory,
-            &[FinalizationTrigger::Succeeded],
-            &[("context", "finalization.context")],
-            &[],
-        )],
+        &[
+            (
+                "notify",
+                FailurePolicy::Advisory,
+                &[FinalizationTrigger::Succeeded],
+                &[("context", "finalization.context")],
+                &[],
+            ),
+            (
+                "archive",
+                FailurePolicy::Advisory,
+                &[FinalizationTrigger::Succeeded],
+                &[("context", "finalization.context")],
+                &["notify"],
+            ),
+        ],
         1,
     );
     let mut state = initialize_test(definition).state;
@@ -4477,9 +4486,10 @@ fn trace_advisory_issue_context_is_exact_sorted_and_immutable() {
         panic!()
     };
     assert_eq!(bytes.as_ref(), br#"{"schemaVersion":2,"runId":"run-1","attemptId":"attempt-1","trigger":"succeeded","primaryIssueStepId":null,"cancellationReason":null,"ordinaryIssues":[{"stepId":"lint","failurePolicy":"advisory","disposition":"failed","failure":{"phase":"execution","code":"command_wait_failed","exitCode":null,"input":null,"output":null,"diagnostic":null},"blockedCode":null}]}"#);
-    let retained = Arc::clone(bytes);
+    // `archive` starts only after `notify` settles, so a context rebuilt from later state
+    // would differ from, or at least not be, the bytes fixed at the finalization boundary.
     let notify = boundary.actions[0].id;
-    reduce_and_advance(
+    let later = reduce_and_advance(
         &mut state,
         Occurrence::StepStartFailed {
             step: "notify".into(),
@@ -4487,7 +4497,20 @@ fn trace_advisory_issue_context_is_exact_sorted_and_immutable() {
             cause: "later".into(),
         },
     );
-    assert_eq!(retained.as_ref(), bytes.as_ref());
+    let Action::StartStep {
+        step,
+        inputs: later_inputs,
+        ..
+    } = &later.actions[0].action
+    else {
+        panic!()
+    };
+    assert_eq!(step, "archive");
+    let ActionInput::FinalizationContext(later_bytes) = &later_inputs["context"] else {
+        panic!()
+    };
+    assert_eq!(later_bytes.as_ref(), bytes.as_ref());
+    assert!(Arc::ptr_eq(later_bytes, bytes));
 }
 
 // REQ-WFEXEC-30

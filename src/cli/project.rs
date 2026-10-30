@@ -1,5 +1,7 @@
 mod action;
 mod output;
+mod resource;
+mod schedule;
 mod trigger;
 mod webhook;
 
@@ -43,6 +45,8 @@ enum ProjectCommand {
     Repository(RepositoryCommand),
     #[command(about = "Manage a project's runner pool")]
     RunnerPool(RunnerPoolCommand),
+    #[command(about = "Manage a project's schedules")]
+    Schedule(schedule::Command),
     #[command(about = "Show a project")]
     Show(ShowCommand),
     #[command(about = "Manage a project's Linear triggers")]
@@ -284,6 +288,7 @@ impl Command {
             ProjectCommand::Rename(command) => execute_leaf(command, RenameCommand::execute),
             ProjectCommand::Repository(command) => command.execute(),
             ProjectCommand::RunnerPool(command) => command.execute(),
+            ProjectCommand::Schedule(command) => command.execute(),
             ProjectCommand::Trigger(command) => command.execute(),
             ProjectCommand::Webhook(command) => command.execute(),
         }

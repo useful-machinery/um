@@ -62,8 +62,10 @@ repository changes.
 
 Identifiers use lower camel case, contain 1 through 64 ASCII letters or digits, and
 match `^[a-z][A-Za-z0-9]*$`. Ordinary step and finalizer IDs share a namespace. V1
-rejects duplicate or non-string keys, anchors, aliases, merge keys, custom tags, and
-multiple YAML documents.
+rejects duplicate or non-string keys, anchors, aliases, merge keys, custom tags,
+multiple YAML documents, `%YAML` and unknown directives, and floating-point numbers
+(write `1`, not `1.0`). A workflow file is at most 1 MiB and nests values at most
+100 levels deep.
 
 Execution inherits only `PATH`, `HOME`, `USER`, `LOGNAME`, `LANG`, `LC_ALL`,
 `LC_CTYPE`, `TERM`, and `TMPDIR` from the launching process by default. Add
@@ -170,7 +172,7 @@ inputs:
 | --- | --- |
 | `inputs.<name>` | The exact required declared Text, JSON, File, or attachment-collection value. |
 | `outputs.<node>.<output>` | The declared output's exact type. |
-| `finalization.context` | Engine-owned JSON; finalizer command input or agent attachment only. Context schema version 2 contains stable run/attempt IDs and bounded classified failed/blocked ordinary-step facts; unavailable diagnostics are null, not inferred. Resuming an attempt retains identity; retry/continuation uses a new attempt ID. |
+| `finalization.context` | Engine-owned JSON; finalizer command input, agent attachment, or condition only. Context schema version 2 contains stable run/attempt IDs and bounded classified failed/blocked ordinary-step facts; unavailable diagnostics are null, not inferred. Resuming an attempt retains identity; retry/continuation uses a new attempt ID. |
 
 Nodes reference inputs and ordinary outputs; finalizers may also reference finalizer
 outputs and `finalization.context`. Inputs add no edges. Conditions admit only Text/JSON

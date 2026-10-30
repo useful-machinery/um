@@ -28,7 +28,7 @@ fn organization_cancellation_response() -> Vec<u8> {
         &serde_json::to_vec(&serde_json::json!({
             "id": ORGANIZATION_ID,
             "kind": "organization",
-            "state": "suspended",
+            "state": "active",
             "updatedAt": "2026-09-08T10:45:00Z"
         }))
         .unwrap(),
@@ -233,7 +233,7 @@ fn organization_deletion_cancellation_uses_browser_proof_without_replacing_the_s
         "code: KEEP-ORG",
         "✓ Organization deletion cancelled.",
         &format!("organization: {ORGANIZATION_ID}"),
-        "state: suspended",
+        "state: active",
         "updated: 2026-09-08T10:45:00Z",
         "local credential: unchanged",
         "cancellation proof credential: not stored",

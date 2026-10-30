@@ -1,10 +1,14 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use super::claude_code::{ClaudeCodeConfig, ClaudeCodeEffort};
+use super::codex::CodexConfig;
 use super::document::{
-    FailurePolicy, FinalizationTrigger, HarnessDefinition, MessageSource, NodeBody, Output,
-    OutputReference, RecoveryHandler, ValueReference,
+    FailurePolicy, FinalizationTrigger, MessageSource, NodeBody, Output, OutputReference,
+    RecoveryHandler, ValueReference,
 };
+use super::pi::{PiConfig, Thinking};
+use super::validated::ValidatedHarness;
 use super::*;
 
 fn fixture_root() -> PathBuf {
@@ -193,12 +197,10 @@ fn canonical_workflow_decodes_into_the_complete_execution_document() {
     assert_eq!(workflow.exports.len(), 2);
     assert_eq!(
         workflow.agent_profiles["coding"].harness,
-        HarnessDefinition::Pi {
-            config: serde_json::json!({
-                "model": "openai/gpt-5",
-                "thinking": "high",
-            }),
-        }
+        ValidatedHarness::Pi(PiConfig {
+            model: "openai/gpt-5".to_owned(),
+            thinking: Thinking::High,
+        })
     );
 
     let prepare = &workflow.steps["prepare"];
@@ -369,30 +371,24 @@ fn workflow_v1_decodes_all_three_closed_agent_profiles() {
     assert_eq!(workflow.agent_profiles.len(), 3);
     assert_eq!(
         workflow.agent_profiles["claudeCoding"].harness,
-        HarnessDefinition::ClaudeCode {
-            config: serde_json::json!({
-                "model": "claude-opus-4-1",
-                "effort": "xhigh",
-            }),
-        }
+        ValidatedHarness::ClaudeCode(ClaudeCodeConfig {
+            model: "claude-opus-4-1".to_owned(),
+            effort: ClaudeCodeEffort::XHigh,
+        })
     );
     assert_eq!(
         workflow.agent_profiles["piCoding"].harness,
-        HarnessDefinition::Pi {
-            config: serde_json::json!({
-                "model": "openai/gpt-5",
-                "thinking": "high",
-            }),
-        }
+        ValidatedHarness::Pi(PiConfig {
+            model: "openai/gpt-5".to_owned(),
+            thinking: Thinking::High,
+        })
     );
     assert_eq!(
         workflow.agent_profiles["codexCoding"].harness,
-        HarnessDefinition::Codex {
-            config: serde_json::json!({
-                "model": "gpt-5.4",
-                "effort": "xhigh",
-            }),
-        }
+        ValidatedHarness::Codex(CodexConfig {
+            model: "gpt-5.4".to_owned(),
+            effort: "xhigh".to_owned(),
+        })
     );
 }
 
@@ -517,6 +513,33 @@ fn every_canonical_invalid_fixture_is_a_structural_failure() {
     }
 }
 
+// REQ-WFFORMAT-4, REQ-WFFORMAT-5, REQ-WFFORMAT-75, REQ-WFCOND-3
+#[test]
+fn every_canonical_forbidden_yaml_fixture_is_refused() {
+    let forbidden_root = fixture_root().join("yaml-forbidden");
+    let fixtures = fs::read_dir(&forbidden_root)
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert!(!fixtures.is_empty());
+
+    let misclassified = fixtures
+        .into_iter()
+        .map(|fixture| fixture.path())
+        .filter_map(|path| {
+            let kind = decode(&fs::read(&path).unwrap())
+                .map(|_| ())
+                .map_err(|error| error.kind());
+            (kind != Err(DecodeFailureKind::ForbiddenYaml))
+                .then(|| format!("{}: {kind:?}", path.display()))
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        misclassified.is_empty(),
+        "fixtures not refused as forbidden YAML: {misclassified:#?}"
+    );
+}
+
 // REQ-WFFORMAT-63
 #[test]
 fn finalization_context_is_structurally_restricted_to_finalizer_inputs_and_attachments() {
@@ -549,6 +572,51 @@ steps:
             decode(source.as_bytes()).unwrap_err().kind(),
             DecodeFailureKind::StructuralContract
         );
+    }
+}
+
+// REQ-WFFORMAT-56
+#[test]
+fn agent_only_output_sources_are_structurally_refused_on_command_nodes() {
+    let agent_profile = "agentProfiles:
+  reporting:
+    harness:
+      kind: pi
+      config: { model: openai/gpt-5, thinking: high }
+";
+    let command_body = "    kind: cmd
+    command: { argv: [\"true\"] }
+";
+    let agent_body = "    kind: agent
+    agent:
+      profile: reporting
+      systemPrompt: system.md
+      message:
+        text: [{ file: message.md }]
+";
+    for output in [
+        "{ kind: text, from: agent_response }",
+        "{ kind: json, from: agent_result, schema: result.json }",
+    ] {
+        let node = |body: &str| format!("  node:\n{body}    outputs:\n      value: {output}\n");
+        let ordinary =
+            |body: &str| format!("schemaVersion: 1\n{agent_profile}steps:\n{}", node(body));
+        let finalizer = |body: &str| {
+            format!(
+                "schemaVersion: 1\n{agent_profile}steps:\n  work:\n{command_body}finalizers:\n{}",
+                node(body)
+            )
+        };
+        for source in [ordinary(command_body), finalizer(command_body)] {
+            assert_eq!(
+                decode(source.as_bytes()).unwrap_err().kind(),
+                DecodeFailureKind::StructuralContract,
+                "{source}"
+            );
+        }
+        for source in [ordinary(agent_body), finalizer(agent_body)] {
+            assert!(decode(source.as_bytes()).is_ok(), "{source}");
+        }
     }
 }
 
@@ -621,8 +689,24 @@ fn forbidden_yaml_features_are_not_normalized() {
             "%YAML 1.1\n---\nschemaVersion: 1\nsteps: {prepare: {kind: cmd, command: {argv: [true]}}}\n",
         ),
         (
+            "YAML 1.2 directive",
+            "%YAML 1.2\n---\nschemaVersion: 1\nsteps: {prepare: {kind: cmd, command: {argv: [true]}}}\n",
+        ),
+        (
+            "unknown directive",
+            "%FOO bar\n---\nschemaVersion: 1\nsteps: {prepare: {kind: cmd, command: {argv: [true]}}}\n",
+        ),
+        (
             "non-JSON core float",
             "schemaVersion: 1\ndescription: .nan\nsteps: {prepare: {kind: cmd, command: {argv: [true]}}}\n",
+        ),
+        (
+            "plain float schemaVersion",
+            "schemaVersion: 1.\nsteps: {prepare: {kind: cmd, command: {argv: [true]}}}\n",
+        ),
+        (
+            "tagged float schemaVersion",
+            "schemaVersion: !!float 1\nsteps: {prepare: {kind: cmd, command: {argv: [true]}}}\n",
         ),
     ];
 
@@ -640,7 +724,7 @@ fn forbidden_yaml_features_are_not_normalized() {
 #[test]
 fn yaml_1_2_core_does_not_apply_legacy_scalar_coercions() {
     let workflow = decode(
-        b"%YAML 1.2\n---\nschemaVersion: 01\ndescription: yes\nsteps: {prepare: {kind: cmd, command: {argv: [\"true\"]}}}\n",
+        b"schemaVersion: 01\ndescription: yes\nsteps: {prepare: {kind: cmd, command: {argv: [\"true\"]}}}\n",
     )
     .unwrap();
 
@@ -658,10 +742,9 @@ fn yaml_1_2_core_does_not_apply_legacy_scalar_coercions() {
     assert_eq!(workflow.description.as_deref(), Some("+.nan"));
 
     let workflow = decode(
-        b"schemaVersion: 1.\ndescription: +0x1\nsteps: {prepare: {kind: cmd, command: {argv: [\"true\"]}}}\n",
+        b"schemaVersion: 1\ndescription: +0x1\nsteps: {prepare: {kind: cmd, command: {argv: [\"true\"]}}}\n",
     )
     .unwrap();
-    assert_eq!(workflow.schema_version, 1);
     assert_eq!(workflow.description.as_deref(), Some("+0x1"));
 
     assert_eq!(
@@ -670,19 +753,43 @@ fn yaml_1_2_core_does_not_apply_legacy_scalar_coercions() {
         )
         .unwrap_err()
         .kind(),
-        DecodeFailureKind::StructuralContract
+        DecodeFailureKind::ForbiddenYaml
     );
 }
 
-// REQ-WFFORMAT-3
+// REQ-WFFORMAT-3, REQ-WFFORMAT-5
 #[test]
-fn schema_version_does_not_round_to_one() {
+fn float_schema_version_is_forbidden_yaml() {
     let error = decode(
         b"schemaVersion: 1.0000000000000001\nsteps: {prepare: {kind: cmd, command: {argv: [\"true\"]}}}\n",
     )
-    .expect_err("a distinct Core float must not satisfy the schemaVersion const");
+    .expect_err("a float schemaVersion must not be accepted");
 
-    assert_eq!(error.kind(), DecodeFailureKind::StructuralContract);
+    assert_eq!(error.kind(), DecodeFailureKind::ForbiddenYaml);
+}
+
+// REQ-WFFORMAT-4
+#[test]
+fn tag_directive_is_accepted() {
+    let workflow = decode(
+        b"%TAG !e! tag:example.com,2026:\n---\nschemaVersion: 1\nsteps: {prepare: {kind: cmd, command: {argv: [\"true\"]}}}\n",
+    )
+    .expect("a %TAG directive is allowed");
+
+    assert_eq!(workflow.schema_version, 1);
+    assert!(workflow.steps.contains_key("prepare"));
+}
+
+// REQ-WFFORMAT-75
+#[test]
+fn byte_order_mark_prefix_is_accepted() {
+    let source = b"schemaVersion: 1\nsteps: {prepare: {kind: cmd, command: {argv: [\"true\"]}}}\n";
+    let mut prefixed = b"\xEF\xBB\xBF".to_vec();
+    prefixed.extend_from_slice(source);
+
+    let workflow = decode(&prefixed).expect("a leading byte order mark is not content");
+
+    assert_eq!(workflow, decode(source).unwrap());
 }
 
 // REQ-WFFORMAT-5
@@ -699,6 +806,41 @@ fn explicit_yaml_core_tags_are_accepted() {
         panic!("prepare must be a command step");
     };
     assert_eq!(prepare.argv, ["true"]);
+}
+
+// REQ-WFFORMAT-76
+#[test]
+fn workflow_file_size_and_nesting_limits_match_cloud_boundaries() {
+    let source = "schemaVersion: 1\nsteps: {prepare: {kind: cmd, command: {argv: [\"true\"]}}}\n";
+    let maximum = 1024 * 1024;
+    let at_limit = format!("{source}#{}\n", "x".repeat(maximum - source.len() - 2));
+    assert_eq!(at_limit.len(), maximum);
+    decode(at_limit.as_bytes()).expect("a 1 MiB workflow file is accepted");
+    assert_eq!(
+        decode(format!("{at_limit}#").as_bytes())
+            .unwrap_err()
+            .kind(),
+        DecodeFailureKind::WorkflowFileTooLarge
+    );
+
+    let nested = |depth: usize| {
+        format!(
+            "schemaVersion: 1\ndescription: {}{}\nsteps: {{prepare: {{kind: cmd, command: {{argv: [\"true\"]}}}}}}\n",
+            "[".repeat(depth),
+            "]".repeat(depth)
+        )
+    };
+    assert_eq!(
+        decode(nested(100).as_bytes()).unwrap_err().kind(),
+        DecodeFailureKind::StructuralContract
+    );
+    for depth in [101, 300] {
+        assert_eq!(
+            decode(nested(depth).as_bytes()).unwrap_err().kind(),
+            DecodeFailureKind::WorkflowNestingTooDeep,
+            "{depth} nested flow sequences"
+        );
+    }
 }
 
 // REQ-WFFORMAT-6

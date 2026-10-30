@@ -1211,6 +1211,25 @@ pub(crate) struct RecoveryHandlerFailureCauseV1 {
         skip_serializing_if = "Option::is_none"
     )]
     pub(crate) decision_rejection: Option<RecoveryDecisionRejectionV1>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub(crate) diagnostic: Option<RecoveryHandlerLaunchDiagnosticV1>,
+}
+
+/// What refused a recovery command handler's unclassified launch (REQ-WFRECOVERY-62).
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct RecoveryHandlerLaunchDiagnosticV1 {
+    pub(crate) launch_failure: String,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub(crate) os_error: Option<i32>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1220,6 +1239,9 @@ pub(crate) enum RecoveryHandlerFailureCodeV1 {
     HandlerUnavailable,
     WorkingDirectoryUnavailable,
     CommandPreparationFailed,
+    CommandLaunchNotFound,
+    CommandLaunchPermissionDenied,
+    CommandLaunchInvalidInput,
     CommandLaunchFailed,
     CommandWaitFailed,
     CommandExitFailed,
@@ -1910,8 +1932,6 @@ pub(crate) enum ExportUnavailableReasonV1 {
     Failed,
     #[serde(rename = "source_blocked")]
     Blocked,
-    #[serde(rename = "source_input_unavailable")]
-    InputUnavailable,
     #[serde(rename = "source_skipped")]
     Skipped,
     #[serde(rename = "source_not_run")]
@@ -3297,13 +3317,14 @@ pub(crate) fn recovery_handler_kind_v1(kind: RecoveryHandlerKind) -> RecoveryHan
     }
 }
 
-fn recovery_handler_failure_v1(
+pub(crate) fn recovery_handler_failure_v1(
     phase: RecoveryHandlerFailurePhase,
     cause: &StepFailureCause,
 ) -> Result<RecoveryHandlerFailureV1, LocalPublicationError> {
     let StepFailureCause::RecoveryHandler(cause) = cause else {
         return Err(invalid_run_result(RunResultInvariant::Recovery));
     };
+    let mut diagnostic = None;
     let (code, exit_code, decision_rejection) = match cause {
         super::recovery::RecoveryHandlerFailure::ContextUnavailable => {
             (RecoveryHandlerFailureCodeV1::ContextUnavailable, None, None)
@@ -3321,11 +3342,27 @@ fn recovery_handler_failure_v1(
             None,
             None,
         ),
-        super::recovery::RecoveryHandlerFailure::CommandLaunchFailed => (
-            RecoveryHandlerFailureCodeV1::CommandLaunchFailed,
-            None,
-            None,
-        ),
+        super::recovery::RecoveryHandlerFailure::CommandLaunch(failure) => {
+            let code = match failure {
+                CommandLaunchFailure::NotFound => {
+                    RecoveryHandlerFailureCodeV1::CommandLaunchNotFound
+                }
+                CommandLaunchFailure::PermissionDenied => {
+                    RecoveryHandlerFailureCodeV1::CommandLaunchPermissionDenied
+                }
+                CommandLaunchFailure::InvalidInput => {
+                    RecoveryHandlerFailureCodeV1::CommandLaunchInvalidInput
+                }
+                CommandLaunchFailure::Other(refusal) => {
+                    diagnostic = Some(RecoveryHandlerLaunchDiagnosticV1 {
+                        launch_failure: refusal.cause.slug().to_owned(),
+                        os_error: refusal.os_error,
+                    });
+                    RecoveryHandlerFailureCodeV1::CommandLaunchFailed
+                }
+            };
+            (code, None, None)
+        }
         super::recovery::RecoveryHandlerFailure::CommandWaitFailed => {
             (RecoveryHandlerFailureCodeV1::CommandWaitFailed, None, None)
         }
@@ -3384,6 +3421,7 @@ fn recovery_handler_failure_v1(
             code,
             exit_code,
             decision_rejection,
+            diagnostic,
         },
     })
 }
@@ -3493,7 +3531,7 @@ fn start_failure_cause(
             CommandLaunchFailure::NotFound => FailureCodeV1::CommandLaunchNotFound,
             CommandLaunchFailure::PermissionDenied => FailureCodeV1::CommandLaunchPermissionDenied,
             CommandLaunchFailure::InvalidInput => FailureCodeV1::CommandLaunchInvalidInput,
-            CommandLaunchFailure::Other => FailureCodeV1::CommandLaunchFailed,
+            CommandLaunchFailure::Other(_) => FailureCodeV1::CommandLaunchFailed,
         }),
     };
     Ok(cause)

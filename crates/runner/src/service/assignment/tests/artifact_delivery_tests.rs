@@ -108,6 +108,7 @@ async fn unknown_artifact_observation_acknowledgement_does_not_consume_delivery(
     ));
 }
 
+// REQ-TELEMETRY-39
 #[tokio::test]
 async fn decoded_v2_assignment_delivers_multiple_carriers_before_the_result() {
     let workflow = r#"schemaVersion: 1
@@ -134,6 +135,8 @@ exports:
     ref: outputs.write.second
 "#;
     let (_temporary, mut manager) = manager_fixture(workflow);
+    let (recorder, capture) = crate::telemetry::test_recorder("rbt_fixture");
+    manager.recorder = Some(recorder);
     manager.artifact_delivery = ArtifactDeliveryBroker::new(
         manager.outbox.clone(),
         Arc::clone(&manager.sleeper),
@@ -290,8 +293,12 @@ exports:
         offered
             .execution_spec
             .source_display_snapshot
+            .as_ref()
             .unwrap()
             .project_name
     );
     acknowledge_terminal_and_settle(&mut manager).await;
+    for name in ["runner.run.execution", "runner.run.upload"] {
+        assert_run_phase(&capture, &offered, name, "success", None);
+    }
 }

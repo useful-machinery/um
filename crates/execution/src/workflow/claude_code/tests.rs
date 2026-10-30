@@ -1,5 +1,5 @@
 use std::ffi::OsString;
-use std::num::NonZeroU64;
+use std::num::{NonZeroU64, NonZeroUsize};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -281,11 +281,10 @@ fn api_retry_warning_names_the_reported_attempt_class_status_and_delay() {
         )
         .unwrap();
 
-    let retry_starts = observations
-        .iter()
-        .filter(|observation| **observation == lifecycle(AgentLifecycleMilestone::RetryStarted))
-        .count();
-    assert_eq!(retry_starts, 1);
+    assert_eq!(
+        milestone_count(&observations, AgentLifecycleMilestone::RetryStarted),
+        1
+    );
     let warnings = observations
         .iter()
         .filter_map(|observation| match observation {
@@ -547,6 +546,634 @@ fn backgrounded_subagent_activity_continues_after_the_exchange_and_its_notificat
     )));
 }
 
+/// One main-thread message calling `SendMessage` as `send-1`, addressed to the subagent
+/// `t1`, followed by the task events Claude Code 2.1.310 emits when the addressee has
+/// already finished: the subagent is resumed as a new run (`agent-run-2`) under the
+/// message's tool call, announced before the call's own result returns.
+fn send_message_to_finished_subagent() -> Vec<Value> {
+    vec![
+        message_start("send-turn"),
+        stream_event(
+            json!({"type":"content_block_start","index":0,"content_block":{
+                "type":"tool_use","id":"send-1","name":"SendMessage","input":{}
+            }}),
+        ),
+        stream_event(json!({"type":"content_block_delta","index":0,"delta":{
+            "type":"input_json_delta","partial_json":"{\"to\":\"t1\",\"message\":\"Report once more\"}"
+        }})),
+        stream_event(json!({"type":"content_block_stop","index":0})),
+        stream_event(
+            json!({"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":1}}),
+        ),
+        stream_event(json!({"type":"message_stop"})),
+        system_event(
+            "background_tasks_changed",
+            json!({"tasks": [{"task_id": "t1", "run_id": "agent-run-2", "task_type": "local_agent",
+                "subagent_type": "Explore", "description": "Review the diff"}]}),
+        ),
+        subagent_started(json!({"run_id": "agent-run-2", "tool_use_id": "send-1",
+            "is_backgrounded": true, "spawn_depth": 1, "prompt": "Report once more"})),
+        json!({"type":"user","session_id":SESSION_ID,"parent_tool_use_id":null,
+            "message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"send-1",
+                "content":[{"type":"text","text":"{\"success\":true,\"resumedAgentId\":\"t1\"}"}],
+                "is_error":false}]}}),
+    ]
+}
+
+/// The resumed run's activity and settlement: its message still names the Agent call as
+/// its parent, while its `task_notification` names the resuming call and the new run.
+fn resumed_subagent_settlement() -> Vec<Value> {
+    vec![
+        subagent_message(
+            "assistant",
+            json!({"id": "msg-sub-3", "type": "message", "role": "assistant",
+                "model": "subagent-model", "content": [{"type": "text", "text": "Still no issues"}]}),
+        ),
+        system_event(
+            "task_updated",
+            json!({"task_id": "t1", "run_id": "agent-run-2",
+                "patch": {"status": "completed", "end_time": 2}}),
+        ),
+        system_event(
+            "task_notification",
+            json!({"task_id": "t1", "run_id": "agent-run-2", "tool_use_id": "send-1",
+                "status": "completed", "output_file": "/tmp/t1.output", "summary": "Still no issues"}),
+        ),
+        system_event("background_tasks_changed", json!({"tasks": []})),
+    ]
+}
+
+/// Sanitized from the stream Claude Code 2.1.310 emits when the main thread, inside the
+/// turn in which a backgrounded subagent's notification arrived, sends that subagent a
+/// message: the resume's `task_started` repeats the subagent's `task_id`, and the resumed
+/// run reports and notifies again after the main thread ends its turn to wait.
+fn resumed_subagent_transcript() -> Vec<Value> {
+    let base = backgrounded_subagent_transcript();
+    let final_answer = position_of(&base, |value| {
+        value["event"]["message"]["id"] == "final-answer"
+    });
+    let first_result = position_of(&base, |value| value["type"] == "result");
+    let wakeup = base
+        .iter()
+        .rposition(|value| value["subtype"] == "init")
+        .unwrap();
+    // The exchange that launched the subagent stays open through its settlement.
+    let mut values = base[..final_answer].to_vec();
+    values.extend_from_slice(&base[first_result + 1..wakeup]);
+    values.extend(send_message_to_finished_subagent());
+    values.extend(text_message("waiting-turn", &["waiting"], true));
+    values.push(result(SESSION_ID));
+    values.extend(resumed_subagent_settlement());
+    values.extend_from_slice(&base[wakeup..]);
+    values
+}
+
+/// The statuses the subagent `Review the diff` reported, in order.
+fn subagent_statuses(observations: &[AgentObservation]) -> Vec<String> {
+    test_support::subagent_statuses(observations, "Review the diff")
+}
+
+// REQ-AGENT-64, REQ-AGENT-35, REQ-AGENT-38
+#[test]
+fn messaging_a_finished_backgrounded_subagent_resumes_it_and_the_resumed_run_settles_the_step() {
+    let values = resumed_subagent_transcript();
+    let (observations, outcome) = replay(&framed(&values), AgentValueKind::Response, 1024);
+    assert_eq!(completed_response(&outcome), "final");
+    assert_eq!(
+        subagent_statuses(&observations),
+        ["started", "completed", "resumed", "completed"]
+    );
+    assert_eq!(unrecognized_events(&observations), Vec::<&Value>::new());
+    assert!(observations.iter().any(|observation| matches!(
+        observation,
+        AgentObservation::AssistantText { text } if text.as_ref() == "Still no issues"
+    )));
+
+    // The resumed run owes its own notification: a stream that ends without it, or a
+    // wakeup it did not announce, fails as for any backgrounded subagent.
+    let resumed_notification = position_of(&values, |value| {
+        value["subtype"] == "task_notification" && value["run_id"] == "agent-run-2"
+    });
+    let (_, outcome) = replay(
+        &framed(&values[..resumed_notification]),
+        AgentValueKind::Response,
+        1024,
+    );
+    assert_eq!(
+        protocol_rejection_value(&outcome)["detail"]["reason"],
+        "end_of_stream_invariant_invalid"
+    );
+}
+
+// REQ-AGENT-69
+#[test]
+fn a_task_started_repeating_a_running_subagents_task_id_stays_a_protocol_failure() {
+    let base = resumed_subagent_transcript();
+    let first_notification = position_of(&base, |value| value["subtype"] == "task_notification");
+    let resume = position_of(&base, |value| {
+        value["subtype"] == "task_started" && value["run_id"] == "agent-run-2"
+    });
+    // The subagent has not notified when the repeat arrives.
+    let mut running = base[..first_notification].to_vec();
+    running.push(base[resume].clone());
+    let (_, outcome) = replay(&framed(&running), AgentValueKind::Response, 1024);
+    let rejection = protocol_rejection_value(&outcome);
+    assert_eq!(rejection["detail"]["reason"], "system_event_invalid");
+    assert_eq!(
+        rejection["detail"]["state"]["outstandingBackgroundSubagents"],
+        1
+    );
+
+    // A resume under a tool call another tracked subagent holds is a duplicate as before.
+    let mut held = base.clone();
+    held[resume]["tool_use_id"] = json!("agent-call");
+    held.insert(
+        resume,
+        subagent_started(json!({"task_id": "t2", "tool_use_id": "agent-call-2",
+            "run_id": "agent-run-3", "is_backgrounded": true})),
+    );
+    held[resume + 1]["tool_use_id"] = json!("agent-call-2");
+    let (_, outcome) = replay(&framed(&held), AgentValueKind::Response, 1024);
+    assert_eq!(
+        protocol_rejection_value(&outcome)["detail"]["reason"],
+        "system_event_invalid"
+    );
+}
+
+/// The same message sent from the turn the subagent's notification woke: the wakeup's
+/// `init` forgot the subagent as outstanding work, and the resumed run's messages still
+/// name the Agent call that launched it.
+fn resumed_after_wakeup_subagent_transcript() -> Vec<Value> {
+    let base = backgrounded_subagent_transcript();
+    let wakeup = base
+        .iter()
+        .rposition(|value| value["subtype"] == "init")
+        .unwrap();
+    let mut values = base[..=wakeup].to_vec();
+    values.extend(send_message_to_finished_subagent());
+    values.extend(text_message("waiting-turn", &["waiting"], true));
+    values.push(result(SESSION_ID));
+    values.extend(resumed_subagent_settlement());
+    values.extend_from_slice(&base[wakeup..]);
+    values
+}
+
+// REQ-AGENT-64, REQ-AGENT-35
+#[test]
+fn messaging_a_finished_subagent_from_the_turn_its_notification_woke_resumes_it_too() {
+    let values = resumed_after_wakeup_subagent_transcript();
+    let (observations, outcome) = replay(&framed(&values), AgentValueKind::Response, 1024);
+    assert_eq!(completed_response(&outcome), "final");
+    assert_eq!(
+        subagent_statuses(&observations),
+        ["started", "completed", "resumed", "completed"]
+    );
+    assert!(observations.iter().any(|observation| matches!(
+        observation,
+        AgentObservation::AssistantText { text } if text.as_ref() == "Still no issues"
+    )));
+
+    // The forgotten subagent authorizes no further wakeup: a second `init` before the
+    // resumed run notifies is the protocol failure it always was.
+    let resumed_notification = position_of(&values, |value| {
+        value["subtype"] == "task_notification" && value["run_id"] == "agent-run-2"
+    });
+    let mut early_wakeup = values[..resumed_notification].to_vec();
+    early_wakeup.push(init(QUALIFICATION_VERSION, SESSION_ID));
+    let (_, outcome) = replay(&framed(&early_wakeup), AgentValueKind::Response, 1024);
+    assert_eq!(
+        protocol_rejection_value(&outcome)["detail"]["reason"],
+        "initialization_invalid"
+    );
+}
+
+/// The woken turn's message on 2.1.310 when the lead messages the finished subagent and
+/// submits the value in one round, `[text, SendMessage, StructuredOutput]`: both calls run
+/// inside the streamed message, the resume's frames and the `SendMessage` result ahead of the
+/// structured output's acknowledgement, and the `result` carries the structured output while
+/// the resumed run is outstanding (the capture UM-3111 records).
+fn same_round_resume_and_submission() -> Vec<Value> {
+    let submission = structured_output_exchange_after(&[
+        json!({"type": "text", "text": "Messaging the subagent and submitting."}),
+        json!({"type": "tool_use", "id": "send-1", "name": "SendMessage",
+            "input": {"to": "t1", "message": "Report once more"}}),
+    ]);
+    let acknowledgement = position_of(&submission, |value| {
+        value["message"]["content"][0]["tool_use_id"] == "tool-structured-output"
+    });
+    let resume = send_message_to_finished_subagent();
+    let resume_frames = position_of(&resume, |value| {
+        value["subtype"] == "background_tasks_changed"
+    });
+    let mut values = submission[1..acknowledgement].to_vec();
+    values.extend_from_slice(&resume[resume_frames..]);
+    values.extend_from_slice(&submission[acknowledgement..]);
+    values
+}
+
+// REQ-AGENT-64, REQ-AGENT-69, REQ-AGENT-35 (UM-3111)
+#[test]
+fn a_subagents_frame_in_the_correction_window_is_its_work() {
+    let base = backgrounded_subagent_transcript();
+    let wakeup = base
+        .iter()
+        .rposition(|value| value["subtype"] == "init")
+        .unwrap();
+    let mut values = base[..=wakeup].to_vec();
+    values.extend(same_round_resume_and_submission());
+    let settlement = resumed_subagent_settlement();
+    let candidate = Some(CompletedResultExchange::Candidate(Arc::new(json!(7))));
+
+    // The premature candidate is rejected and the adapter begins the correction turn; the
+    // resumed run's first frame lands before that turn's `init` and is the subagent's work.
+    let mut window = parser(AgentValueKind::Result, 1024);
+    let mut observations = Vec::new();
+    window
+        .push_stdout(&framed(&values), |observation| {
+            observations.push(observation)
+        })
+        .unwrap();
+    assert_eq!(
+        window.take_completed_result_exchange(),
+        Some(CompletedResultExchange::PrematureCandidate)
+    );
+    window.reject_result_candidate().unwrap();
+    window.begin_exchange().unwrap();
+    window
+        .push_stdout(&framed(&settlement[..1]), |observation| {
+            observations.push(observation);
+        })
+        .unwrap();
+    window
+        .push_stdout(
+            &framed(&text_turn("correction", "waiting")),
+            |observation| {
+                observations.push(observation);
+            },
+        )
+        .unwrap();
+    assert_eq!(window.take_completed_result_exchange(), None);
+    window
+        .push_stdout(&framed(&settlement[1..]), |observation| {
+            observations.push(observation);
+        })
+        .unwrap();
+    window
+        .push_stdout(
+            &framed(&structured_output_exchange_after(&[])),
+            |observation| observations.push(observation),
+        )
+        .unwrap();
+    assert_eq!(window.take_completed_result_exchange(), candidate);
+    window
+        .accept_result(CapturedJson::fixture(Arc::new(json!(7))))
+        .unwrap();
+    assert!(matches!(
+        window.finish(true),
+        AgentOutcome::Completed(CompletedAgentInvocation::Result(_))
+    ));
+    assert_eq!(
+        subagent_statuses(&observations),
+        ["started", "completed", "resumed", "completed"]
+    );
+    assert!(observations.iter().any(|observation| matches!(
+        observation,
+        AgentObservation::AssistantText { text } if text.as_ref() == "Still no issues"
+    )));
+    // The resume's task list names the forgotten subagent, the one unrecognized frame.
+    assert!(
+        unrecognized_events(&observations)
+            .iter()
+            .all(|event| event["subtype"] == "background_tasks_changed")
+    );
+
+    // The main thread cannot speak before its `init`: its frame in the window stays the
+    // protocol failure.
+    let mut early = parser(AgentValueKind::Result, 1024);
+    early.push_stdout(&framed(&values), drop).unwrap();
+    early.take_completed_result_exchange();
+    early.reject_result_candidate().unwrap();
+    early.begin_exchange().unwrap();
+    assert!(
+        early
+            .push_stdout(&framed(&[message_start("too-early")]), drop)
+            .is_err()
+    );
+    let rejection = protocol_rejection_value(&early.finish(false));
+    assert_eq!(
+        rejection["detail"]["reason"],
+        "exchange_initialization_missing"
+    );
+    assert_eq!(rejection["detail"]["state"]["eventThread"], "main");
+    assert_eq!(rejection["detail"]["state"]["exchangeActive"], true);
+}
+
+// REQ-AGENT-69 (UM-3111)
+#[test]
+fn a_stopped_subagents_interruption_in_the_correction_window_is_its_work() {
+    // The turn that launched the backgrounded subagent stops it on its next round beside the
+    // answer and the value, `[text, TaskStop, StructuredOutput]`: the subagent settles
+    // (`stopped`) before the stop's result, the candidate is ambiguous, and the subagent
+    // thread's interruption lands after the `result`, in the correction window.
+    let base = backgrounded_subagent_transcript();
+    let launched = position_of(&base, |value| {
+        value["message"]["content"][0]["tool_use_id"] == "agent-call"
+    });
+    let mut values = base[..=launched].to_vec();
+    let stop = structured_output_exchange_after(&[
+        json!({"type": "text", "text": "Stopping the subagent and submitting."}),
+        json!({"type": "tool_use", "id": "stop-1", "name": "TaskStop",
+            "input": {"task_id": "t1"}}),
+    ]);
+    let acknowledgement = position_of(&stop, |value| {
+        value["message"]["content"][0]["tool_use_id"] == "tool-structured-output"
+    });
+    values.extend_from_slice(&stop[1..acknowledgement]);
+    values.extend([
+        system_event(
+            "task_notification",
+            json!({"task_id": "t1", "run_id": "agent-run", "tool_use_id": "agent-call",
+                "status": "stopped", "output_file": "/tmp/t1.output", "summary": "Review the diff"}),
+        ),
+        json!({"type":"user","session_id":SESSION_ID,"parent_tool_use_id":null,
+            "message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"stop-1",
+                "content":[{"type":"text","text":"{\"message\":\"Successfully stopped task: t1\"}"}],
+                "is_error":false}]}}),
+    ]);
+    values.extend_from_slice(&stop[acknowledgement..]);
+    let interruption = subagent_message(
+        "user",
+        json!({"role": "user", "content": [{"type": "text", "text": "[Request interrupted by user]"}]}),
+    );
+
+    let mut window = parser(AgentValueKind::Result, 1024);
+    let mut observations = Vec::new();
+    window
+        .push_stdout(&framed(&values), |observation| {
+            observations.push(observation)
+        })
+        .unwrap();
+    assert_eq!(
+        window.take_completed_result_exchange(),
+        Some(CompletedResultExchange::AmbiguousCandidate)
+    );
+    window.reject_result_candidate().unwrap();
+    window.begin_exchange().unwrap();
+    window
+        .push_stdout(&framed(&[interruption]), |observation| {
+            observations.push(observation);
+        })
+        .unwrap();
+    window
+        .push_stdout(
+            &framed(&structured_output_exchange_after(&[])),
+            |observation| observations.push(observation),
+        )
+        .unwrap();
+    assert!(matches!(
+        window.take_completed_result_exchange(),
+        Some(CompletedResultExchange::Candidate(candidate)) if *candidate == json!(7)
+    ));
+    window
+        .accept_result(CapturedJson::fixture(Arc::new(json!(7))))
+        .unwrap();
+    assert!(matches!(
+        window.finish(true),
+        AgentOutcome::Completed(CompletedAgentInvocation::Result(_))
+    ));
+    assert_eq!(subagent_statuses(&observations), ["started", "stopped"]);
+    // The interruption is the turn's unrecognized subagent frame, as when it wins the race.
+    assert!(
+        unrecognized_events(&observations)
+            .iter()
+            .any(|event| event["type"] == "user" && event["parent_tool_use_id"] == "agent-call")
+    );
+}
+
+/// The backgrounded-subagent transcript with the launch registered in the foreground
+/// (`is_backgrounded: false`), as Claude Code 2.1.310 may register an `Agent` call made with
+/// `run_in_background`, and the move to the background announced only by `moved`: the
+/// `task_updated` patch its schema names, or the `Agent` call's own result reporting an
+/// asynchronous launch, which also stands alone when the harness announced no start.
+fn registered_foreground_subagent_transcript(moved: SubagentMove) -> Vec<Value> {
+    let mut values = backgrounded_subagent_transcript();
+    let started = position_of(&values, |value| {
+        value["subtype"] == "task_started" && value["task_id"] == "t1"
+    });
+    values[started]["is_backgrounded"] = json!(false);
+    let tasks_changed = position_of(&values, |value| {
+        value["subtype"] == "background_tasks_changed" && value["tasks"][0]["task_id"] == "t1"
+    });
+    let agent_result = position_of(&values, |value| {
+        value["type"] == "user" && value["message"]["content"][0]["tool_use_id"] == "agent-call"
+    });
+    let async_launch = json!({
+        "status": "async_launched", "isAsync": true, "agentId": "t1",
+        "description": "Review the diff", "prompt": "Review the diff",
+        "outputFile": "/tmp/t1.output",
+    });
+    match moved {
+        SubagentMove::TaskUpdatedPatch => values.insert(
+            tasks_changed + 1,
+            system_event(
+                "task_updated",
+                json!({"task_id": "t1", "run_id": "agent-run",
+                    "patch": {"is_backgrounded": true}}),
+            ),
+        ),
+        SubagentMove::AsyncAgentResult => {
+            values[agent_result]["tool_use_result"] = async_launch;
+        }
+        SubagentMove::AsyncAgentResultWithoutStart => {
+            values[agent_result]["tool_use_result"] = async_launch;
+            values.remove(tasks_changed);
+            values.remove(started);
+        }
+    }
+    values
+}
+
+#[derive(Clone, Copy, Debug)]
+enum SubagentMove {
+    TaskUpdatedPatch,
+    AsyncAgentResult,
+    /// No `task_started` at all: the result alone tracks the subagent, and its
+    /// notification names the run.
+    AsyncAgentResultWithoutStart,
+}
+
+// REQ-AGENT-35, REQ-AGENT-64
+// UM-3077: a backgrounded builder registered in the foreground was forgotten by the
+// exchange's `result`, so the Result-mode exchange produced `MissingCandidate`, the adapter
+// closed stdin and the builder's notified turn began with an `init` nothing authorized.
+#[test]
+fn a_subagent_moved_to_the_background_after_its_start_is_background_work() {
+    for moved in [
+        SubagentMove::TaskUpdatedPatch,
+        SubagentMove::AsyncAgentResult,
+        SubagentMove::AsyncAgentResultWithoutStart,
+    ] {
+        let values = registered_foreground_subagent_transcript(moved);
+        let first_result = position_of(&values, |value| value["type"] == "result");
+        let notified_wakeup = values
+            .iter()
+            .rposition(|value| value["subtype"] == "init")
+            .unwrap();
+
+        // Result mode: the exchange pauses on the moved subagent instead of reporting a
+        // missing candidate, and the notified turn's candidate settles the step.
+        let mut paused = parser(AgentValueKind::Result, 1024);
+        paused
+            .push_stdout(&framed(&values[..=first_result]), drop)
+            .unwrap();
+        assert_eq!(
+            paused.take_completed_result_exchange(),
+            None,
+            "{moved:?}: the result must pause on the moved subagent"
+        );
+        paused
+            .push_stdout(&framed(&values[first_result + 1..notified_wakeup]), drop)
+            .unwrap();
+        paused
+            .push_stdout(&framed(&structured_output_exchange_after(&[])), drop)
+            .unwrap();
+        assert_eq!(
+            paused.take_completed_result_exchange(),
+            Some(CompletedResultExchange::Candidate(Arc::new(json!(7)))),
+            "{moved:?}"
+        );
+
+        // Response mode: the drain accepts the subagent's activity and the notified turn
+        // completes the step, with the start and settlement as diagnostics.
+        let (observations, outcome) = replay(&framed(&values), AgentValueKind::Response, 1024);
+        assert_eq!(completed_response(&outcome), "final", "{moved:?}");
+        let information = information_diagnostics(&observations);
+        assert_eq!(information.len(), 2, "{moved:?}: {information:?}");
+        assert!(information[0].contains("started") && information[1].contains("completed"));
+        assert_eq!(
+            unrecognized_events(&observations),
+            Vec::<&Value>::new(),
+            "{moved:?}"
+        );
+    }
+}
+
+// REQ-AGENT-74, REQ-AGENT-42
+// UM-3077: the record of a refused `init` names the work the parser was waiting for.
+#[test]
+fn a_refused_init_records_the_tracked_work_the_parser_held() {
+    // The first builder's notification wakes the lead, whose turn starts a backgrounded
+    // command and a second backgrounded subagent and ends waiting; an `init` nothing
+    // announced is then refused.
+    let base = backgrounded_subagent_transcript();
+    let notified_wakeup = base
+        .iter()
+        .rposition(|value| value["subtype"] == "init")
+        .unwrap();
+    let mut values = base[..=notified_wakeup].to_vec();
+    values.push(message_start("second-turn"));
+    values.extend([
+        stream_event(json!({"type":"content_block_start","index":0,"content_block":{
+            "type":"tool_use","id":"bash-2","name":"Bash","input":{}
+        }})),
+        stream_event(json!({"type":"content_block_stop","index":0})),
+        stream_event(json!({"type":"content_block_start","index":1,"content_block":{
+            "type":"tool_use","id":"agent-2","name":"Agent","input":{}
+        }})),
+        stream_event(json!({"type":"content_block_stop","index":1})),
+        stream_event(json!({"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":1}})),
+        stream_event(json!({"type":"message_stop"})),
+        bash_task_started("task-2", "bash-2", true),
+        json!({"type":"user","session_id":SESSION_ID,"parent_tool_use_id":null,
+            "message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"bash-2",
+                "content":[{"type":"text","text":"background"}],"is_error":false}]},
+            "tool_use_result":{"backgroundTaskId":"task-2"}}),
+        system_event(
+            "task_started",
+            json!({"task_id": "t2", "tool_use_id": "agent-2", "task_type": "local_agent",
+                "run_id": "run-2", "is_backgrounded": true, "description": "Build slice 2",
+                "subagent_type": "general-purpose"}),
+        ),
+        json!({"type":"user","session_id":SESSION_ID,"parent_tool_use_id":null,
+            "message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"agent-2",
+                "content":[{"type":"text","text":"Async agent launched successfully."}],"is_error":false}]},
+            "tool_use_result":{"status":"async_launched","agentId":"t2"}}),
+    ]);
+    values.extend(text_message("second-answer", &["waiting"], true));
+    values.push(result(SESSION_ID));
+    values.push(init(QUALIFICATION_VERSION, SESSION_ID));
+
+    let (_, outcome) = replay(&framed(&values), AgentValueKind::Result, 1024);
+    assert_eq!(
+        protocol_rejection_value(&outcome)["detail"]["reason"],
+        "initialization_invalid"
+    );
+    let AgentOutcome::Failed(failure) = &outcome else {
+        panic!("the refused init must fail the invocation, got {outcome:?}");
+    };
+    let tracked = serde_json::to_value(failure.tracked_work().unwrap()).unwrap();
+    assert_eq!(
+        tracked,
+        json!({
+            "backgroundCommands": [{"taskId": "task-2", "toolUseId": "bash-2", "runId": "run-1",
+                "backgrounded": true, "acknowledged": true, "notified": false, "monitor": false}],
+            "subagents": [{"taskId": "t2", "agentCallId": "agent-2", "toolUseId": "agent-2",
+                "runId": "run-2", "backgrounded": true, "notified": false}],
+            "forgottenSubagents": ["t1"],
+            "truncated": false,
+        })
+    );
+}
+
+// REQ-AGENT-74
+// The record keeps the newest 16 entries of each list and says when a list was cut.
+#[test]
+fn the_recorded_tracked_work_keeps_the_newest_sixteen_of_each_list() {
+    let base = backgrounded_subagent_transcript();
+    let notified_wakeup = base
+        .iter()
+        .rposition(|value| value["subtype"] == "init")
+        .unwrap();
+    let mut values = base[..=notified_wakeup].to_vec();
+    values.push(message_start("second-turn"));
+    let commands = 17;
+    for index in 0..commands {
+        values.extend([
+            stream_event(
+                json!({"type":"content_block_start","index":index,"content_block":{
+                    "type":"tool_use","id":format!("bash-{index}"),"name":"Bash","input":{}
+                }}),
+            ),
+            stream_event(json!({"type":"content_block_stop","index":index})),
+        ]);
+    }
+    values.extend([
+        stream_event(json!({"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":1}})),
+        stream_event(json!({"type":"message_stop"})),
+    ]);
+    for index in 0..commands {
+        let task_id = format!("task-{index}");
+        let call_id = format!("bash-{index}");
+        values.push(bash_task_started(&task_id, &call_id, true));
+        values.push(bash_tool_result(&call_id, "background", Some(&task_id)));
+    }
+    values.extend(text_message("second-answer", &["waiting"], true));
+    values.push(result(SESSION_ID));
+    values.push(init(QUALIFICATION_VERSION, SESSION_ID));
+
+    let (_, outcome) = replay(&framed(&values), AgentValueKind::Result, 1024);
+    let AgentOutcome::Failed(failure) = &outcome else {
+        panic!("the refused init must fail the invocation, got {outcome:?}");
+    };
+    let tracked = serde_json::to_value(failure.tracked_work().unwrap()).unwrap();
+    let recorded = tracked["backgroundCommands"].as_array().unwrap();
+    assert_eq!(recorded.len(), 16);
+    assert_eq!(recorded[0]["taskId"], "task-1");
+    assert_eq!(recorded[15]["taskId"], "task-16");
+    assert_eq!(tracked["subagents"], json!([]));
+    assert_eq!(tracked["truncated"], true);
+}
+
 /// A subagent's own Bash call moving to the background: its task start and the tool
 /// result naming that task's `backgroundTaskId`, neither of which this invocation tracks.
 fn subagent_backgrounded_bash_run() -> [Value; 2] {
@@ -646,6 +1273,27 @@ fn terminal_drain_refuses_work_no_outstanding_subagent_owns() {
     ));
     let (_, outcome) = replay(&framed(&late), AgentValueKind::Response, 1024);
     assert_failed(outcome, AgentFailureCause::HarnessProtocolFailed);
+
+    // A drain start naming a subagent neither tracked nor forgotten resumes nothing, and a
+    // task list naming a command no subagent's start introduced names nothing owed.
+    let unknown_start = subagent_started(json!({"task_id": "t9", "run_id": "agent-run-9",
+        "tool_use_id": "agent-call-9", "is_backgrounded": true}));
+    let unknown_command = system_event(
+        "background_tasks_changed",
+        json!({"tasks": [{"task_id": "other-task", "run_id": "other-run",
+            "task_type": "local_bash", "description": "Watch tests"}]}),
+    );
+    for frame in [unknown_start, unknown_command] {
+        let mut unowned = base[..wakeup].to_vec();
+        unowned.push(frame);
+        let (_, outcome) = replay(&framed(&unowned), AgentValueKind::Response, 1024);
+        let rejection = protocol_rejection_value(&outcome);
+        assert_eq!(
+            rejection["detail"]["reason"],
+            "terminal_drain_event_invalid"
+        );
+        assert_eq!(rejection["detail"]["outerEvent"], "system");
+    }
 }
 
 fn command_lifecycle(state: &str) -> Value {
@@ -769,6 +1417,552 @@ fn result_mode_pauses_on_outstanding_background_work_and_settles_on_the_wakeup_t
     );
 }
 
+/// One exchange whose Agent call starts a backgrounded subagent that settles inside the
+/// exchange, before the main thread's final message `done`, followed by the further turn
+/// Claude Code 2.1.310 begins to deliver the queued `<task-notification>` once the
+/// exchange has ended: an empty task list, an `init`, the text `noted` and a `result`.
+/// The drain turn is `epilogue`; the frames before it are the first exchange.
+fn subagent_settled_in_the_exchange_transcript(epilogue: &[Value]) -> Vec<Value> {
+    let mut values = agent_tool_exchange(&[
+        subagent_started(json!({"run_id": "agent-run", "is_backgrounded": true,
+            "spawn_depth": 1, "prompt": "Review the diff"})),
+        system_event(
+            "task_updated",
+            json!({"task_id": "t1", "run_id": "agent-run",
+                "patch": {"status": "completed", "end_time": 1}}),
+        ),
+        system_event(
+            "task_notification",
+            json!({"task_id": "t1", "run_id": "agent-run", "tool_use_id": "agent-call",
+                "status": "completed", "output_file": "/tmp/t1.output", "summary": "No issues"}),
+        ),
+    ]);
+    values.push(system_event(
+        "background_tasks_changed",
+        json!({"tasks": []}),
+    ));
+    values.extend_from_slice(epilogue);
+    values
+}
+
+fn epilogue_turn() -> Vec<Value> {
+    let mut values = vec![init(QUALIFICATION_VERSION, SESSION_ID)];
+    values.extend(text_message("epilogue", &["noted"], true));
+    values.push(result(SESSION_ID));
+    values
+}
+
+fn milestone_count(observations: &[AgentObservation], milestone: AgentLifecycleMilestone) -> usize {
+    observations
+        .iter()
+        .filter(|observation| **observation == lifecycle(milestone))
+        .count()
+}
+
+fn assert_epilogue_observed(observations: &[AgentObservation], turns: usize) {
+    assert_eq!(unrecognized_events(observations), Vec::<&Value>::new());
+    assert!(
+        observations.iter().any(|observation| matches!(
+            observation,
+            AgentObservation::AssistantText { text } if text.as_ref() == "noted"
+        )),
+        "the epilogue's text must appear as activity: {observations:?}"
+    );
+    for milestone in [
+        AgentLifecycleMilestone::TurnStarted,
+        AgentLifecycleMilestone::TurnCompleted,
+    ] {
+        assert_eq!(
+            milestone_count(observations, milestone),
+            turns,
+            "{milestone:?}"
+        );
+    }
+}
+
+// REQ-AGENT-76, REQ-AGENT-69, REQ-AGENT-35
+#[test]
+fn a_turn_a_settled_subagent_announced_after_the_value_settled_is_an_epilogue() {
+    let transcript = subagent_settled_in_the_exchange_transcript(&epilogue_turn());
+    for kind in [AgentValueKind::Response, AgentValueKind::None] {
+        let (observations, outcome) = replay(&framed(&transcript), kind, 1024);
+        match kind {
+            AgentValueKind::Response => assert_eq!(completed_response(&outcome), "done"),
+            _ => assert!(
+                matches!(
+                    outcome,
+                    AgentOutcome::Completed(CompletedAgentInvocation::NoValue)
+                ),
+                "{outcome:?}"
+            ),
+        }
+        assert_epilogue_observed(&observations, 2);
+        assert_eq!(
+            milestone_count(&observations, AgentLifecycleMilestone::HarnessCompleted),
+            1
+        );
+    }
+
+    // In Result mode the accepted candidate is the value; the epilogue's own submission
+    // is no candidate, and the settlement grace waits while the epilogue is open.
+    let final_answer = position_of(&transcript, |value| {
+        value["event"]["message"]["id"] == "final-answer"
+    });
+    let mut first_turn = transcript[..final_answer].to_vec();
+    first_turn.extend_from_slice(&structured_output_exchange_after(&[])[1..]);
+    let mut epilogue = vec![system_event(
+        "background_tasks_changed",
+        json!({"tasks": []}),
+    )];
+    epilogue.push(init(QUALIFICATION_VERSION, SESSION_ID));
+    epilogue.extend(text_message("epilogue", &["noted"], true));
+    let resubmission = structured_output_exchange_with(&json!({"result": 8}), &[]);
+    let mut observations = Vec::new();
+    let mut parser = parser(AgentValueKind::Result, 1024);
+    parser
+        .push_stdout(&framed(&first_turn), |observation| {
+            observations.push(observation);
+        })
+        .unwrap();
+    assert_eq!(
+        parser.take_completed_result_exchange(),
+        Some(CompletedResultExchange::Candidate(Arc::new(json!(7))))
+    );
+    parser
+        .accept_result(CapturedJson::fixture(Arc::new(json!(7))))
+        .unwrap();
+    assert!(parser.settling());
+    parser
+        .push_stdout(&framed(&epilogue), |observation| {
+            observations.push(observation);
+        })
+        .unwrap();
+    assert!(!parser.settling(), "an open epilogue suspends the grace");
+    parser
+        .push_stdout(&framed(&resubmission[1..]), |observation| {
+            observations.push(observation);
+        })
+        .unwrap();
+    assert_eq!(parser.take_completed_result_exchange(), None);
+    assert!(parser.settling());
+    assert_epilogue_observed(&observations, 2);
+    let AgentOutcome::Completed(CompletedAgentInvocation::Result(result)) = parser.finish(true)
+    else {
+        panic!("the accepted result must stand");
+    };
+    assert_eq!(result.value(), &json!(7));
+
+    // A native failure the epilogue reports is a warning; the settled value stands.
+    let mut failing = epilogue_turn();
+    *failing.last_mut().unwrap() = json!({"type": "result", "subtype": "error_during_execution",
+        "is_error": true, "terminal_reason": "rate_limit", "session_id": SESSION_ID});
+    let transcript = subagent_settled_in_the_exchange_transcript(&failing);
+    let (observations, outcome) = replay(&framed(&transcript), AgentValueKind::Response, 1024);
+    assert_eq!(completed_response(&outcome), "done");
+    assert!(
+        observations.iter().any(|observation| matches!(
+            observation,
+            AgentObservation::Diagnostic { level: AgentDiagnosticLevel::Warning, message }
+                if message.contains("rate_limited")
+        )),
+        "{observations:?}"
+    );
+}
+
+/// Sanitized from the stream Claude Code 2.1.310 emits when a backgrounded subagent starts
+/// its own `run_in_background` Bash and closes its turn without awaiting it. The drain
+/// before the wakeup `init` names only the leftover command in the task list. After the
+/// main thread's final `result`, the leftover's completion is reported, Claude Code resumes
+/// the finished subagent on its own to deliver that report (no `SendMessage` call; the
+/// resume's `prompt` is the command's `<task-notification>`), the resumed run settles, and
+/// a further main-thread turn (`noted`) begins and ends before the process exits.
+fn backgrounded_subagent_leaving_its_command_running_transcript() -> Vec<Value> {
+    let mut values = backgrounded_subagent_transcript();
+    let closing_text = position_of(&values, |value| value["message"]["id"] == "msg-sub-2");
+    values.splice(closing_text..closing_text, subagent_backgrounded_bash_run());
+    let wakeup = values
+        .iter()
+        .rposition(|value| value["subtype"] == "init")
+        .unwrap();
+    values[wakeup - 1] = system_event(
+        "background_tasks_changed",
+        json!({"tasks": [{"task_id": "sub-watch-task", "run_id": "sub-watch-run",
+            "task_type": "local_bash", "description": "Watch tests", "parent_task_id": "t1"}]}),
+    );
+    values.extend(leftover_command_report());
+    values.push(system_event(
+        "background_tasks_changed",
+        json!({"tasks": []}),
+    ));
+    values.extend(harness_resume_delivering_the_report("agent-run-2"));
+    values.extend(epilogue_turn());
+    values
+}
+
+/// The completion Claude Code reports for the command the subagent left running
+/// (`sub-watch-task`, from `subagent_backgrounded_bash_run`): silent as the subagent's work.
+fn leftover_command_report() -> [Value; 2] {
+    [
+        system_event(
+            "task_updated",
+            json!({"task_id": "sub-watch-task", "run_id": "sub-watch-run",
+                "patch": {"status": "completed", "end_time": 2}}),
+        ),
+        system_event(
+            "task_notification",
+            json!({"task_id": "sub-watch-task", "run_id": "sub-watch-run",
+                "tool_use_id": "sub-watch", "status": "completed",
+                "output_file": "/tmp/sub-watch-task.output",
+                "summary": "Background command \"Watch tests\" completed (exit code 0)"}),
+        ),
+    ]
+}
+
+/// The resume Claude Code 2.1.310 begins on its own, in the drain, to deliver the leftover
+/// command's report to the finished subagent: the announcement naming the subagent with the
+/// new `run_id`, the `task_started` whose `prompt` is the report (no `SendMessage` call),
+/// the resumed run's text, and its settlement under the new run.
+fn harness_resume_delivering_the_report(run_id: &str) -> Vec<Value> {
+    vec![
+        system_event(
+            "background_tasks_changed",
+            json!({"tasks": [{"task_id": "t1", "run_id": run_id, "task_type": "local_agent",
+                "subagent_type": "Explore", "description": "Review the diff"}]}),
+        ),
+        subagent_started(json!({"run_id": run_id, "is_backgrounded": true,
+            "spawn_depth": 1, "prompt": "<task-notification>\n<task-id>sub-watch-task</task-id>\n\
+            <tool-use-id>sub-watch</tool-use-id>\n\
+            <output-file>/tmp/sub-watch-task.output</output-file>\n<status>completed</status>\n\
+            <summary>Background command \"Watch tests\" completed (exit code 0)</summary>\n\
+            </task-notification>"})),
+        subagent_message(
+            "assistant",
+            json!({"id": "msg-sub-report", "type": "message", "role": "assistant",
+                "model": "subagent-model",
+                "content": [{"type": "text", "text": "The tests passed"}]}),
+        ),
+        system_event(
+            "task_updated",
+            json!({"task_id": "t1", "run_id": run_id,
+                "patch": {"status": "completed", "end_time": 3}}),
+        ),
+        system_event(
+            "task_notification",
+            json!({"task_id": "t1", "run_id": run_id, "tool_use_id": "agent-call",
+                "status": "completed", "output_file": "/tmp/t1.output", "summary": "No issues",
+                "usage": {"duration_ms": 210, "tool_uses": 1, "total_tokens": 7}}),
+        ),
+        system_event("background_tasks_changed", json!({"tasks": []})),
+    ]
+}
+
+/// Sanitized from the stream Claude Code 2.1.310 emits when the main thread messages
+/// (`SendMessage`) a finished backgrounded subagent that had left its own `run_in_background`
+/// Bash running: the leftover's report arrives while the messaged run is outstanding, the
+/// messaged run settles in the drain, and before any `init` Claude Code resumes the subagent
+/// once more to deliver that report, announced by a `background_tasks_changed` naming a
+/// subagent the parser still tracks as settled (no wakeup `init` has forgotten it). The
+/// second resumed run's notification wakes the final turn.
+fn messaged_subagent_resumed_again_for_its_commands_report_transcript() -> Vec<Value> {
+    let mut values = resumed_subagent_transcript();
+    let closing_text = position_of(&values, |value| value["message"]["id"] == "msg-sub-2");
+    values.splice(closing_text..closing_text, subagent_backgrounded_bash_run());
+    let send_result = position_of(&values, |value| value["type"] == "result");
+    values.splice(send_result + 1..send_result + 1, leftover_command_report());
+    let wakeup = values
+        .iter()
+        .rposition(|value| value["subtype"] == "init")
+        .unwrap();
+    let mut drain = harness_resume_delivering_the_report("agent-run-3");
+    drain.extend(empty_notification_turn());
+    values.splice(wakeup..wakeup, drain);
+    values
+}
+
+/// The turn Claude Code 2.1.310 opens for the messaged run's queued notification, which
+/// its own resume of the subagent superseded, and closes without a model call: an `init`
+/// and a `result` with `num_turns: 0`, an empty `result` text and no `terminal_reason`.
+/// The announcement stands for the next `init`, which delivers the resumed run's.
+fn empty_notification_turn() -> [Value; 2] {
+    [
+        init(QUALIFICATION_VERSION, SESSION_ID),
+        json!({"type": "result", "subtype": "success", "is_error": false, "num_turns": 0,
+            "stop_reason": null, "result": "", "duration_api_ms": 0, "session_id": SESSION_ID,
+            "origin": {"kind": "task-notification", "producer": "session-task",
+                "runId": "agent-run-2"}}),
+    ]
+}
+
+// REQ-AGENT-64, REQ-AGENT-35, REQ-AGENT-69
+#[test]
+fn a_messaged_subagent_resumed_again_in_the_drain_for_its_commands_report_stays_its_work() {
+    let values = messaged_subagent_resumed_again_for_its_commands_report_transcript();
+    for kind in [AgentValueKind::Response, AgentValueKind::None] {
+        let (observations, outcome) = replay(&framed(&values), kind, 1024);
+        match kind {
+            AgentValueKind::Response => assert_eq!(completed_response(&outcome), "final"),
+            _ => assert!(
+                matches!(
+                    outcome,
+                    AgentOutcome::Completed(CompletedAgentInvocation::NoValue)
+                ),
+                "{outcome:?}"
+            ),
+        }
+        assert_eq!(
+            subagent_statuses(&observations),
+            [
+                "started",
+                "completed",
+                "resumed",
+                "completed",
+                "resumed",
+                "completed"
+            ]
+        );
+        assert_eq!(unrecognized_events(&observations), Vec::<&Value>::new());
+        assert!(observations.iter().any(|observation| matches!(
+            observation,
+            AgentObservation::AssistantText { text } if text.as_ref() == "The tests passed"
+        )));
+        // The launching turn, the empty turn and the notified turn.
+        for milestone in [
+            AgentLifecycleMilestone::TurnStarted,
+            AgentLifecycleMilestone::TurnCompleted,
+        ] {
+            assert_eq!(
+                milestone_count(&observations, milestone),
+                3,
+                "{milestone:?}"
+            );
+        }
+        assert_eq!(
+            milestone_count(&observations, AgentLifecycleMilestone::HarnessCompleted),
+            1
+        );
+    }
+
+    // The empty turn settles nothing: a stream that ends on it never delivered the
+    // notification whose announcement it consumed.
+    let final_wakeup = values
+        .iter()
+        .rposition(|value| value["subtype"] == "init")
+        .unwrap();
+    let (_, outcome) = replay(
+        &framed(&values[..final_wakeup]),
+        AgentValueKind::Response,
+        1024,
+    );
+    assert_eq!(
+        protocol_rejection_value(&outcome)["detail"]["reason"],
+        "end_of_stream_invariant_invalid"
+    );
+
+    // The second resumed run owes its notification as the first did: a wakeup before it
+    // is unannounced.
+    let second_notification = position_of(&values, |value| {
+        value["subtype"] == "task_notification" && value["run_id"] == "agent-run-3"
+    });
+    let mut early_wakeup = values[..second_notification].to_vec();
+    early_wakeup.push(init(QUALIFICATION_VERSION, SESSION_ID));
+    let (_, outcome) = replay(&framed(&early_wakeup), AgentValueKind::Response, 1024);
+    assert_eq!(
+        protocol_rejection_value(&outcome)["detail"]["reason"],
+        "initialization_invalid"
+    );
+}
+
+/// Captured from Claude Code 2.1.310 with a `UserPromptSubmit` hook that exits 2: the first
+/// turn ends with no model call and a `result` of the empty turn's shape (`num_turns: 0`,
+/// `is_error: false`, `subtype: success`, no `terminal_reason`) whose `result` text is the
+/// hook's refusal. Nothing announced the turn, so it is no empty turn: the step fails as it
+/// did before empty turns were drained (conformance `06d`).
+// REQ-AGENT-69
+#[test]
+fn a_first_turn_a_hook_blocked_is_a_protocol_failure_not_an_empty_turn() {
+    let values = [
+        init(QUALIFICATION_VERSION, SESSION_ID),
+        system_event(
+            "informational",
+            json!({"content": "UserPromptSubmit operation blocked by hook", "level": "warning",
+                "prevent_continuation": true,
+                "prompt_submit_outcome": {"kind": "blocked_by_hook", "prompt_kept": false}}),
+        ),
+        json!({"type": "result", "subtype": "success", "is_error": false, "num_turns": 0,
+            "stop_reason": null, "duration_api_ms": 0, "session_id": SESSION_ID,
+            "result": "UserPromptSubmit operation blocked by hook"}),
+    ];
+    for kind in [
+        AgentValueKind::None,
+        AgentValueKind::Response,
+        AgentValueKind::Result,
+    ] {
+        let (observations, outcome) = replay(&framed(&values), kind, 1024);
+        let rejection = protocol_rejection_value(&outcome);
+        assert_eq!(
+            rejection["detail"]["reason"], "result_correlation_invalid",
+            "{kind:?}: {rejection}"
+        );
+        assert_eq!(rejection["detail"]["state"]["completedExchanges"], 0);
+        assert_eq!(
+            milestone_count(&observations, AgentLifecycleMilestone::TurnCompleted),
+            0,
+            "{kind:?}: the blocked turn completes nothing"
+        );
+    }
+}
+
+fn assert_subagent_resumed_to_deliver_its_commands_report(observations: &[AgentObservation]) {
+    assert_eq!(
+        information_diagnostics(observations),
+        [
+            "subagent Explore started · Review the diff",
+            "subagent Explore completed · Review the diff",
+            "subagent Explore resumed · Review the diff",
+            "subagent Explore completed · Review the diff",
+        ]
+    );
+    assert_epilogue_observed(observations, 3);
+    assert!(observations.iter().any(|observation| matches!(
+        observation,
+        AgentObservation::AssistantText { text } if text.as_ref() == "The tests passed"
+    )));
+}
+
+// REQ-AGENT-64, REQ-AGENT-73, REQ-AGENT-76
+#[test]
+fn a_backgrounded_subagents_command_outliving_it_stays_its_work_and_its_report_opens_an_epilogue() {
+    let transcript = backgrounded_subagent_leaving_its_command_running_transcript();
+    for kind in [AgentValueKind::Response, AgentValueKind::None] {
+        let (observations, outcome) = replay(&framed(&transcript), kind, 1024);
+        match kind {
+            AgentValueKind::Response => assert_eq!(completed_response(&outcome), "final"),
+            _ => assert!(
+                matches!(
+                    outcome,
+                    AgentOutcome::Completed(CompletedAgentInvocation::NoValue)
+                ),
+                "{outcome:?}"
+            ),
+        }
+        assert_subagent_resumed_to_deliver_its_commands_report(&observations);
+        assert_eq!(
+            milestone_count(&observations, AgentLifecycleMilestone::HarnessCompleted),
+            1
+        );
+    }
+
+    // In Result mode the notified turn submits the value; the epilogue's submission is
+    // no candidate.
+    let first_result = position_of(&transcript, |value| value["type"] == "result");
+    let after_first_result = &transcript[first_result + 1..];
+    let wakeup =
+        first_result + 1 + position_of(after_first_result, |value| value["subtype"] == "init");
+    let notified_result =
+        first_result + 1 + position_of(after_first_result, |value| value["type"] == "result");
+    let epilogue = transcript
+        .iter()
+        .rposition(|value| value["subtype"] == "init")
+        .unwrap();
+    let mut observations = Vec::new();
+    let mut parser = parser(AgentValueKind::Result, 1024);
+    for frames in [
+        &transcript[..=first_result],
+        &transcript[first_result + 1..wakeup],
+    ] {
+        parser
+            .push_stdout(&framed(frames), |observation| {
+                observations.push(observation)
+            })
+            .unwrap();
+        assert_eq!(parser.take_completed_result_exchange(), None);
+    }
+    parser
+        .push_stdout(
+            &framed(&structured_output_exchange_after(&[])),
+            |observation| {
+                observations.push(observation);
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        parser.take_completed_result_exchange(),
+        Some(CompletedResultExchange::Candidate(Arc::new(json!(7))))
+    );
+    parser
+        .accept_result(CapturedJson::fixture(Arc::new(json!(7))))
+        .unwrap();
+    let mut tail = transcript[notified_result + 1..=epilogue].to_vec();
+    tail.extend(text_message("epilogue", &["noted"], true));
+    tail.extend_from_slice(&structured_output_exchange_with(&json!({"result": 8}), &[])[1..]);
+    parser
+        .push_stdout(&framed(&tail), |observation| observations.push(observation))
+        .unwrap();
+    assert_eq!(parser.take_completed_result_exchange(), None);
+    let AgentOutcome::Completed(CompletedAgentInvocation::Result(result)) = parser.finish(true)
+    else {
+        panic!("the accepted result must stand");
+    };
+    assert_eq!(result.value(), &json!(7));
+    assert_subagent_resumed_to_deliver_its_commands_report(&observations);
+}
+
+// REQ-AGENT-75, REQ-AGENT-45
+// INV-HARNESS-5
+#[test]
+fn a_turn_begun_after_a_native_failure_ends_the_stream_with_the_native_failure() {
+    let base = backgrounded_subagent_transcript();
+    let first_result = position_of(&base, |value| value["type"] == "result");
+    let notified_init = base
+        .iter()
+        .rposition(|value| value["subtype"] == "init")
+        .unwrap();
+    let mut failing = base[..first_result].to_vec();
+    failing.push(
+        json!({"type": "result", "subtype": "error_during_execution",
+        "is_error": true, "terminal_reason": "rate_limit", "session_id": SESSION_ID}),
+    );
+    let rate_limited = AgentFailureCause::HarnessFailed {
+        detail: AgentHarnessFailureDetail::Classified {
+            canonical: CanonicalHarnessFailure::ModelError,
+            diagnostic: HarnessFailureDiagnostic::from_code("rate_limit", None),
+        },
+    };
+
+    // Result mode: the adapter takes the native failure and closes stdin, the subagent's
+    // drain goes on, and the turn its notification begins ends the stream with the failure
+    // the result reported, not with a rejection of the init and its record.
+    let mut notified = parser(AgentValueKind::Result, 1024);
+    notified.push_stdout(&framed(&failing), drop).unwrap();
+    assert_eq!(
+        notified.take_completed_result_exchange(),
+        Some(CompletedResultExchange::NativeFailure)
+    );
+    notified
+        .push_stdout(&framed(&base[first_result + 1..notified_init]), drop)
+        .unwrap();
+    assert_eq!(
+        notified.push_stdout(&framed(&base[notified_init..=notified_init]), drop),
+        Err(rate_limited.clone())
+    );
+    let AgentOutcome::Failed(failure) = notified.finish(false) else {
+        panic!("expected the native failure");
+    };
+    assert_eq!(failure.cause(), &rate_limited);
+    assert!(failure.protocol_rejection().is_none());
+
+    // Response mode keeps stdin open after the failure; a main-thread message in the drain,
+    // which the parser would otherwise refuse, ends the stream the same way.
+    let mut unexplained = failing;
+    unexplained.extend(text_message("after-failure", &["late"], true));
+    let (_, outcome) = replay(&framed(&unexplained), AgentValueKind::Response, 1024);
+    let AgentOutcome::Failed(failure) = outcome else {
+        panic!("expected the native failure");
+    };
+    assert_eq!(failure.cause(), &rate_limited);
+    assert!(failure.protocol_rejection().is_none());
+}
+
 // REQ-AGENT-38
 #[test]
 fn each_unrecognized_event_kind_is_observed_once_per_invocation() {
@@ -862,15 +2056,21 @@ fn background_completion_during_foreground_work_does_not_require_another_init() 
 }
 
 fn bash_call_message(message_id: &str, call_id: &str) -> Vec<Value> {
+    tool_call_message(message_id, call_id, "Bash", &json!({}))
+}
+
+/// A main-thread message opening with one `tool_use` block named `name`, whose input
+/// streams as one `input_json_delta`; the message's end is left to the caller.
+fn tool_call_message(message_id: &str, call_id: &str, name: &str, input: &Value) -> Vec<Value> {
     vec![
         message_start(message_id),
         stream_event(
             json!({"type":"content_block_start","index":0,"content_block":{
-                "type":"tool_use","id":call_id,"name":"Bash","input":{}
+                "type":"tool_use","id":call_id,"name":name,"input":{}
             }}),
         ),
         stream_event(json!({"type":"content_block_delta","index":0,"delta":{
-            "type":"input_json_delta","partial_json":"{}"
+            "type":"input_json_delta","partial_json":input.to_string()
         }})),
         stream_event(json!({"type":"content_block_stop","index":0})),
     ]
@@ -901,6 +2101,28 @@ fn bash_tool_result(call_id: &str, text: &str, background_task: Option<&str>) ->
         event["tool_use_result"]["timedOutAfterMs"] = json!(120000);
     }
     event
+}
+
+/// The `Monitor` call Claude Code 2.1.310 streams: a `tool_use` block whose input is the
+/// command to watch and its description.
+fn monitor_call_message(message_id: &str, call_id: &str) -> Vec<Value> {
+    tool_call_message(
+        message_id,
+        call_id,
+        "Monitor",
+        &json!({"command": "./watch-the-build", "description": "watch the build"}),
+    )
+}
+
+/// The `Monitor` call's result as 2.1.310 emits it: the acknowledgement names the task as
+/// `taskId`, where a backgrounded Bash call's names it as `backgroundTaskId`.
+fn monitor_tool_result(call_id: &str, task_id: &str) -> Value {
+    json!({"type":"user","session_id":SESSION_ID,"parent_tool_use_id":null,
+        "message":{"role":"user","content":[{"type":"tool_result","tool_use_id":call_id,
+            "content":format!("Monitor started (task {task_id}, expires in 5m unless the source \
+                ends first). You will be notified on each event."),
+            "is_error":false}]},
+        "tool_use_result":{"taskId":task_id,"timeoutMs":300000,"persistent":false}})
 }
 
 fn tool_call_ids(observations: &[AgentObservation]) -> Vec<String> {
@@ -1037,6 +2259,197 @@ fn backgrounded_start_for_an_unknown_call_is_refused() {
     values.push(bash_task_started("task-1", "other-call", true));
     let (_, outcome) = replay(&framed(&values), AgentValueKind::Response, 1024);
     assert_failed(outcome, AgentFailureCause::HarnessProtocolFailed);
+}
+
+/// A main-thread `Monitor` call as Claude Code 2.1.310 emits it, captured for UM-3104: the
+/// task list names the monitor's `local_bash` task, which starts backgrounded under the
+/// call; the result acknowledges it as `taskId`; the turn ends paused. An event the command
+/// prints opens a turn that nothing on the stream announces. When the command ends, the
+/// task settles, the list empties, and the notified turn ends with `final`.
+fn monitor_transcript() -> Vec<Value> {
+    let mut values = vec![init(QUALIFICATION_VERSION, SESSION_ID)];
+    values.extend(monitor_call_message("monitor-turn", "monitor-call"));
+    values.extend([
+        system_event(
+            "background_tasks_changed",
+            json!({"tasks": [{"task_id": "monitor-task", "run_id": "run-1",
+                "task_type": "local_bash", "description": "long command"}]}),
+        ),
+        bash_task_started("monitor-task", "monitor-call", true),
+    ]);
+    values.extend(message_end("tool_use"));
+    values.push(monitor_tool_result("monitor-call", "monitor-task"));
+    values.extend(text_message("first-answer", &["watching"], true));
+    values.push(result(SESSION_ID));
+    values.extend(text_turn("event-answer", "still watching"));
+    values.extend([
+        system_event(
+            "task_updated",
+            json!({"task_id": "monitor-task", "run_id": "run-1",
+                "patch": {"status": "completed", "end_time": 1}}),
+        ),
+        system_event(
+            "task_notification",
+            json!({"task_id": "monitor-task", "run_id": "run-1", "tool_use_id": "monitor-call",
+                "status": "completed", "output_file": "/tmp/monitor-task.output",
+                "summary": "Monitor \"long command\" stream ended"}),
+        ),
+        system_event("background_tasks_changed", json!({"tasks": []})),
+    ]);
+    values.extend(text_turn("final-answer", "final"));
+    values
+}
+
+// REQ-AGENT-35, REQ-AGENT-69
+// UM-3104: 2.1.310 starts a `Monitor` call's task as a backgrounded `local_bash` task, which
+// the parser refused as a backgrounded start under a call that was no Bash call.
+#[test]
+fn a_monitors_task_is_background_work_whose_events_open_turns() {
+    let values = monitor_transcript();
+    let result_at = |nth: usize| {
+        values
+            .iter()
+            .enumerate()
+            .filter(|(_, value)| value["type"] == "result")
+            .nth(nth)
+            .unwrap()
+            .0
+    };
+    let (first_result, event_result) = (result_at(0), result_at(1));
+    let notified_turn = values
+        .iter()
+        .rposition(|value| value["subtype"] == "init")
+        .unwrap();
+
+    // Response mode: the monitor's event turn and its notified turn are accepted and the
+    // last turn's text is the response. The only unrecognized frame is the task list that
+    // names the monitor's task before its start.
+    let (observations, outcome) = replay(&framed(&values), AgentValueKind::Response, 1024);
+    assert_eq!(completed_response(&outcome), "final");
+    let early_list = &values[position_of(&values, |value| {
+        value["subtype"] == "background_tasks_changed"
+    })];
+    assert_eq!(unrecognized_events(&observations), [early_list]);
+
+    // Result mode: neither the first turn nor the event turn completes an exchange while
+    // the monitor runs, and the notified turn's candidate settles the step.
+    let mut paused = parser(AgentValueKind::Result, 1024);
+    paused
+        .push_stdout(&framed(&values[..=first_result]), drop)
+        .unwrap();
+    assert_eq!(paused.take_completed_result_exchange(), None);
+    paused
+        .push_stdout(&framed(&values[first_result + 1..=event_result]), drop)
+        .unwrap();
+    assert_eq!(paused.take_completed_result_exchange(), None);
+    paused
+        .push_stdout(&framed(&values[event_result + 1..notified_turn]), drop)
+        .unwrap();
+    paused
+        .push_stdout(&framed(&structured_output_exchange_after(&[])), drop)
+        .unwrap();
+    assert_eq!(
+        paused.take_completed_result_exchange(),
+        Some(CompletedResultExchange::Candidate(Arc::new(json!(7))))
+    );
+}
+
+// REQ-AGENT-35
+// UM-3104: a `Monitor` call's `taskId` acknowledges only the task tracked under that call,
+// as a Bash call's `backgroundTaskId` does.
+#[test]
+fn a_monitors_result_naming_an_untracked_task_is_a_protocol_failure() {
+    let mut values = vec![init(QUALIFICATION_VERSION, SESSION_ID)];
+    values.extend(monitor_call_message("monitor-turn", "monitor-call"));
+    values.push(bash_task_started("monitor-task", "monitor-call", true));
+    values.extend(message_end("tool_use"));
+    values.push(monitor_tool_result("monitor-call", "other-task"));
+    let (_, outcome) = replay(&framed(&values), AgentValueKind::Response, 1024);
+    assert_eq!(
+        protocol_rejection_value(&outcome)["detail"]["reason"],
+        "user_event_invalid"
+    );
+}
+
+// REQ-AGENT-38
+// UM-3104: a task of a kind the parser does not model (neither `local_bash` nor
+// `local_agent`) is recorded as unrecognized wherever a frame names it; the drain refused its
+// task list as `terminal_drain_event_invalid`.
+#[test]
+fn a_task_of_an_unmodeled_kind_is_activity_in_the_exchange_and_the_drain() {
+    let task = json!({"task_id": "other-task", "run_id": "run-1"});
+    let with = |fields: Value| {
+        let mut frame = task.clone();
+        frame
+            .as_object_mut()
+            .unwrap()
+            .extend(fields.as_object().unwrap().clone());
+        frame
+    };
+    let listed = system_event(
+        "background_tasks_changed",
+        json!({"tasks": [with(json!({"task_type": "local_other", "description": "long command"}))]}),
+    );
+    let mut acknowledgement = monitor_tool_result("monitor-call", "other-task");
+    acknowledgement["tool_use_result"]
+        .as_object_mut()
+        .unwrap()
+        .remove("taskId");
+    let mut values = vec![init(QUALIFICATION_VERSION, SESSION_ID)];
+    values.extend(monitor_call_message("monitor-turn", "monitor-call"));
+    values.extend([
+        listed.clone(),
+        system_event(
+            "task_started",
+            with(
+                json!({"task_type": "local_other", "tool_use_id": "monitor-call",
+                "description": "long command", "is_backgrounded": true}),
+            ),
+        ),
+    ]);
+    values.extend(message_end("tool_use"));
+    values.extend([
+        acknowledgement,
+        system_event(
+            "task_updated",
+            with(json!({"patch": {"status": "running"}})),
+        ),
+        system_event(
+            "task_progress",
+            with(json!({"description": "still running"})),
+        ),
+    ]);
+    values.extend(text_message("first-answer", &["watching"], true));
+    values.extend([
+        result(SESSION_ID),
+        listed,
+        system_event(
+            "task_updated",
+            with(json!({"patch": {"status": "completed", "end_time": 1}})),
+        ),
+        system_event(
+            "task_notification",
+            with(json!({"tool_use_id": "monitor-call", "status": "completed",
+                "output_file": "/tmp/other-task.output", "summary": "ended"})),
+        ),
+    ]);
+
+    let (observations, outcome) = replay(&framed(&values), AgentValueKind::Response, 1024);
+    assert_eq!(completed_response(&outcome), "watching");
+    let kinds: Vec<_> = unrecognized_events(&observations)
+        .into_iter()
+        .map(|event| event["subtype"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        kinds,
+        [
+            "background_tasks_changed",
+            "task_started",
+            "task_updated",
+            "task_progress",
+            "task_notification",
+        ]
+    );
 }
 
 #[test]
@@ -1273,9 +2686,16 @@ fn background_continuation_rejects_unrelated_and_unsettled_work() {
     terminal["terminal_reason"] = json!("error_during_execution");
     failed_turn.push(background_notification());
     failed_turn.push(init(QUALIFICATION_VERSION, SESSION_ID));
+    // The notified turn after a failed one ends the stream with the native failure, not
+    // with a rejection of its init (REQ-AGENT-75).
     assert_failed(
         replay(&framed(&failed_turn), AgentValueKind::Response, 1024).1,
-        AgentFailureCause::HarnessProtocolFailed,
+        AgentFailureCause::HarnessFailed {
+            detail: AgentHarnessFailureDetail::Classified {
+                canonical: CanonicalHarnessFailure::ModelError,
+                diagnostic: HarnessFailureDiagnostic::from_code("other", None),
+            },
+        },
     );
     let mut forged = first.clone();
     forged.push(background_notification());
@@ -1679,7 +3099,7 @@ fn parser_rejections_report_stable_profile_owned_structural_context() {
     missing_exchange_init.begin_exchange().unwrap();
     assert!(
         missing_exchange_init
-            .push_stdout(&framed(&[status(SESSION_ID)]), drop)
+            .push_stdout(&framed(&[message_start("msg-early")]), drop)
             .is_err()
     );
     let missing_exchange_init = protocol_rejection_value(&missing_exchange_init.finish(false));
@@ -1693,7 +3113,7 @@ fn parser_rejections_report_stable_profile_owned_structural_context() {
     );
     assert_eq!(
         missing_exchange_init["detail"]["state"]["eventThread"],
-        "none"
+        "main"
     );
     assert_rejection_matches_schemas(&missing_exchange_init);
 
@@ -1981,7 +3401,7 @@ fn initialization_identity_and_exchange_boundaries_are_unambiguous() {
     missing_exchange_init.begin_exchange().unwrap();
     assert_eq!(
         missing_exchange_init
-            .push_stdout(&framed(&[status(SESSION_ID)]), drop)
+            .push_stdout(&framed(&[message_start("msg-early")]), drop)
             .unwrap_err(),
         AgentFailureCause::HarnessProtocolFailed
     );
@@ -2014,8 +3434,135 @@ fn frame_limit_is_enforced_while_reading_bytes() {
 
     let mut over_limit = make_parser();
     assert!(over_limit.push_stdout(b"{}      X", drop).is_err());
-    let over_limit = protocol_rejection_value(&over_limit.finish(true));
-    assert_eq!(over_limit["detail"]["reason"], "frame_too_large");
+    let over_limit = over_limit.finish(true);
+    assert_eq!(
+        protocol_rejection_value(&over_limit)["detail"]["reason"],
+        "frame_too_large"
+    );
+    // REQ-AGENT-71: the overrun buffer, without the byte that overran it, is the rejected line.
+    assert_eq!(
+        stream_excerpt_value(&over_limit),
+        json!({"rejectedLine": retained_line(b"{}      ", 8192), "precedingLines": []})
+    );
+}
+
+fn excerpt_parser(limits: ClaudeCodeStreamJsonV1ProtocolLimits) -> ClaudeCodeStreamJsonV1Parser {
+    ClaudeCodeStreamJsonV1Parser::new(
+        Arc::from(CWD),
+        Arc::from(MODEL),
+        Arc::from(SESSION_ID),
+        Arc::from(QUALIFICATION_VERSION),
+        AgentValueKind::None,
+        NonZeroU64::new(1024).unwrap(),
+        limits,
+    )
+}
+
+fn stream_excerpt_value(outcome: &AgentOutcome) -> Value {
+    let AgentOutcome::Failed(failure) = outcome else {
+        panic!("expected agent failure, got {outcome:?}");
+    };
+    serde_json::to_value(
+        failure
+            .stream_excerpt()
+            .expect("a protocol rejection must carry its stream excerpt"),
+    )
+    .unwrap()
+}
+
+/// The retained form of an ASCII `frame` at `maximum_bytes`.
+fn retained_line(frame: &[u8], maximum_bytes: usize) -> Value {
+    let text = std::str::from_utf8(frame).unwrap();
+    json!({
+        "text": &text[..text.len().min(maximum_bytes)],
+        "bytes": frame.len(),
+        "truncated": text.len() > maximum_bytes,
+    })
+}
+
+// REQ-AGENT-42, REQ-AGENT-71
+#[test]
+fn rejection_retains_the_redacted_rejected_line_and_the_bounded_tail_before_it() {
+    let bound = |bytes| NonZeroUsize::new(bytes).unwrap();
+    let mut parser = excerpt_parser(ClaudeCodeStreamJsonV1ProtocolLimits::with_excerpt_bounds(
+        bound(8),
+        bound(64),
+        bound(256),
+    ));
+    let mut values = vec![init(QUALIFICATION_VERSION, SESSION_ID)];
+    values.extend((0..10).map(|index| {
+        let mut frame = status(SESSION_ID);
+        frame["status"] = json!(format!("{index}-requesting"));
+        frame
+    }));
+    parser.push_stdout(&framed(&values), drop).unwrap();
+    let rejected = format!(
+        "not-json Authorization: Bearer sk-ant-sentinel-token {}",
+        "x".repeat(300)
+    );
+    assert_eq!(
+        parser.push_stdout(format!("{rejected}\n").as_bytes(), drop),
+        Err(AgentFailureCause::HarnessProtocolFailed)
+    );
+    let outcome = parser.finish(true);
+
+    let excerpt = stream_excerpt_value(&outcome);
+    let rejected_line = &excerpt["rejectedLine"];
+    let text = rejected_line["text"].as_str().unwrap();
+    assert!(text.contains("[redacted]"), "{text}");
+    assert!(!text.contains("sentinel"), "{text}");
+    assert!(text.len() <= 256);
+    assert_eq!(rejected_line["truncated"], true);
+    assert_eq!(rejected_line["bytes"], rejected.len());
+    let preceding = values[3..]
+        .iter()
+        .map(|value| retained_line(&serde_json::to_vec(value).unwrap(), 64))
+        .collect::<Vec<_>>();
+    assert_eq!(preceding.len(), 8);
+    assert!(preceding.iter().all(|line| line["truncated"] == true));
+    assert_eq!(excerpt["precedingLines"], Value::Array(preceding));
+
+    let rejection = protocol_rejection_value(&outcome);
+    assert_eq!(rejection["detail"]["reason"], "frame_decode_failed");
+    let mut members = rejection.as_object().unwrap().keys().collect::<Vec<_>>();
+    members.sort();
+    assert_eq!(members, ["detail", "profile", "schemaVersion"]);
+    assert!(!rejection.to_string().contains("requesting"));
+    assert_rejection_matches_schemas(&rejection);
+}
+
+// REQ-AGENT-71
+#[test]
+fn excerpt_keeps_the_open_buffer_at_end_of_stream_and_an_accepted_stream_keeps_none() {
+    let (_, accepted) = replay(
+        &framed(&[init(QUALIFICATION_VERSION, SESSION_ID), result(SESSION_ID)]),
+        AgentValueKind::None,
+        1024,
+    );
+    assert_eq!(
+        accepted,
+        AgentOutcome::Completed(CompletedAgentInvocation::NoValue)
+    );
+
+    let values = [init(QUALIFICATION_VERSION, SESSION_ID), status(SESSION_ID)];
+    let mut transcript = framed(&values);
+    let partial = serde_json::to_vec(&result(SESSION_ID)).unwrap();
+    transcript.extend_from_slice(&partial);
+    let (_, outcome) = replay(&transcript, AgentValueKind::None, 1024);
+    assert_eq!(
+        protocol_rejection_value(&outcome)["detail"]["reason"],
+        "partial_frame_at_end_of_stream"
+    );
+    assert_eq!(
+        stream_excerpt_value(&outcome),
+        json!({
+            "rejectedLine": retained_line(&partial, 8192),
+            "precedingLines": values
+                .iter()
+                .map(|value| retained_line(&serde_json::to_vec(value).unwrap(), 1024))
+                .collect::<Vec<_>>(),
+        })
+    );
 }
 
 #[test]
@@ -2294,7 +3841,12 @@ fn result_candidate_requires_correlated_success_acknowledgement() {
 /// blocks, each given as a complete `content_block_start` block, acknowledged
 /// successfully and ended by a result carrying the same envelope.
 fn structured_output_exchange_after(siblings: &[Value]) -> Vec<Value> {
-    let envelope = json!({"result": 7});
+    structured_output_exchange_with(&json!({"result": 7}), siblings)
+}
+
+/// As `structured_output_exchange_after`, submitting `envelope`.
+fn structured_output_exchange_with(envelope: &Value, siblings: &[Value]) -> Vec<Value> {
+    let envelope = envelope.clone();
     let call_id = "tool-structured-output";
     let mut terminal_result = result(SESSION_ID);
     terminal_result["structured_output"] = envelope.clone();
@@ -2475,7 +4027,7 @@ fn structured_claude_terminal_reason_is_classified_without_result_text() {
     }
 }
 
-// REQ-AGENT-40
+// REQ-AGENT-40, REQ-DIAG-36
 #[test]
 fn unsuccessful_native_result_and_exit_use_existing_typed_failures() {
     let native_error = framed(&[
@@ -2592,11 +4144,11 @@ fn unsuccessful_native_result_and_exit_use_existing_typed_failures() {
         )
         .unwrap();
         let projected = detail.runner_diagnostic().unwrap();
-        assert_eq!(projected["harnessError"], expected);
-        assert_eq!(
-            projected.get("httpStatus").cloned(),
-            selected_status.map(|s| json!(s))
-        );
+        let mut exact = json!({"harnessError": expected, "harnessFailure": "model_error"});
+        if let Some(status) = selected_status {
+            exact["httpStatus"] = json!(status);
+        }
+        assert_eq!(projected, exact);
         assert!(!projected.to_string().contains("sentinel"));
     }
 
@@ -2613,6 +4165,56 @@ fn unsuccessful_native_result_and_exit_use_existing_typed_failures() {
             detail: AgentHarnessFailureDetail::UnsuccessfulExit,
         },
     );
+}
+
+// REQ-AGENT-40, REQ-AGENT-45, REQ-DIAG-24
+#[test]
+fn synthetic_api_error_without_request_id_is_classified() {
+    // Claude Code 2.1.306 answers a login-less first exchange with a `<synthetic>` api-error
+    // message that carries no `request_id`, since no request reached the API.
+    let not_logged_in = framed(&[
+        init(QUALIFICATION_VERSION, SESSION_ID),
+        json!({
+            "type": "assistant",
+            "message": {
+                "id": "msg-not-logged-in",
+                "model": "<synthetic>",
+                "role": "assistant",
+                "type": "message",
+                "content": [{"type": "text", "text": "Not logged in · Please run /login"}],
+            },
+            "parent_tool_use_id": null,
+            "session_id": SESSION_ID,
+            "error": "authentication_failed",
+            "is_api_error_message": true,
+        }),
+        json!({
+            "type": "result",
+            "subtype": "success",
+            "is_error": true,
+            "terminal_reason": "api_error",
+            "api_error_status": null,
+            "result": "Not logged in · Please run /login",
+            "session_id": SESSION_ID,
+        }),
+    ]);
+    let (observations, outcome) = replay(&not_logged_in, AgentValueKind::None, 1024);
+    assert_failed(
+        outcome,
+        AgentFailureCause::HarnessFailed {
+            detail: AgentHarnessFailureDetail::Classified {
+                canonical: CanonicalHarnessFailure::ModelError,
+                diagnostic: HarnessFailureDiagnostic::from_code("authentication_failed", None),
+            },
+        },
+    );
+    assert!(observations.iter().any(|observation| matches!(
+        observation,
+        AgentObservation::Diagnostic {
+            level: AgentDiagnosticLevel::Error,
+            message,
+        } if message.as_ref() == "Not logged in · Please run /login"
+    )));
 }
 
 #[test]
@@ -2647,6 +4249,86 @@ fn rate_limit_events_warn_only_when_a_window_is_not_allowed() {
             "provider rate limit",
         ]
     );
+}
+
+// REQ-AGENT-72
+#[test]
+fn rejected_window_reset_time_is_kept_only_for_a_limit_failure() {
+    fn rate_limit(info: Value) -> Value {
+        json!({"type": "rate_limit_event", "rate_limit_info": info, "session_id": SESSION_ID})
+    }
+    fn api_error(code: &str, status: u16) -> [Value; 2] {
+        [
+            json!({"type": "assistant", "message": {
+                "id": "msg-api-error", "model": "<synthetic>", "role": "assistant",
+                "type": "message", "content": [{"type": "text", "text": "private sentinel"}]},
+                "parent_tool_use_id": null, "session_id": SESSION_ID,
+                "error": code, "api_error_status": status,
+                "request_id": "req-controlled", "is_api_error_message": true}),
+            json!({"type": "result", "subtype": "success", "is_error": true,
+                "terminal_reason": "api_error", "result": "private sentinel",
+                "session_id": SESSION_ID}),
+        ]
+    }
+    fn diagnostic(frames: &[Value]) -> HarnessFailureDiagnostic {
+        let mut values = vec![init(QUALIFICATION_VERSION, SESSION_ID)];
+        values.extend_from_slice(frames);
+        let (_, outcome) = replay(&framed(&values), AgentValueKind::None, 1024);
+        let AgentOutcome::Failed(failure) = outcome else {
+            panic!("expected harness failure");
+        };
+        let AgentFailureCause::HarnessFailed {
+            detail:
+                AgentHarnessFailureDetail::Classified {
+                    canonical: CanonicalHarnessFailure::ModelError,
+                    diagnostic,
+                },
+        } = failure.cause()
+        else {
+            panic!("expected classified model error");
+        };
+        *diagnostic
+    }
+    let rejected = rate_limit(json!({
+        "status": "rejected", "rateLimitType": "seven_day", "resetsAt": 1_761_336_000,
+    }));
+
+    let [message, result] = api_error("rate_limit", 429);
+    let limited = diagnostic(&[rejected.clone(), message, result]);
+    assert_eq!(limited.harness_error, Some("rate_limited"));
+    assert_eq!(limited.http_status, Some(429));
+    assert_eq!(limited.resets_at, Some(1_761_336_000));
+
+    // A later allowed report does not clear the kept reset; a structured result reason
+    // carries it as the api-error message does.
+    let structured = diagnostic(&[
+        rejected.clone(),
+        rate_limit(json!({"status": "allowed", "rateLimitType": "five_hour", "resetsAt": 1})),
+        json!({"type": "result", "subtype": "error_during_execution", "is_error": true,
+            "terminal_reason": "rate_limit", "session_id": SESSION_ID}),
+    ]);
+    assert_eq!(structured.harness_error, Some("rate_limited"));
+    assert_eq!(structured.resets_at, Some(1_761_336_000));
+
+    for window in [
+        json!({"status": "allowed", "rateLimitType": "seven_day", "resetsAt": 1_761_336_000}),
+        json!({"status": "rejected", "rateLimitType": "seven_day"}),
+        json!({"status": "rejected", "rateLimitType": "seven_day", "resetsAt": -1}),
+    ] {
+        let [message, result] = api_error("rate_limit", 429);
+        let unknown = diagnostic(&[rate_limit(window), message, result]);
+        assert_eq!(unknown.harness_error, Some("rate_limited"));
+        assert_eq!(unknown.resets_at, None);
+        assert_eq!(
+            unknown,
+            HarnessFailureDiagnostic::from_code("rate_limit", Some(429))
+        );
+    }
+
+    let [message, result] = api_error("authentication_failed", 401);
+    let unauthorized = diagnostic(&[rejected, message, result]);
+    assert_eq!(unauthorized.harness_error, Some("unauthorized"));
+    assert_eq!(unauthorized.resets_at, None);
 }
 
 // REQ-AGENT-26

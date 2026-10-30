@@ -14,7 +14,8 @@ use serde::Deserialize;
 use serde_json::Value;
 use std::sync::Arc;
 
-use super::document::{AgentProfile, HarnessDefinition};
+use super::document::AgentProfile;
+use super::schema::AgentProfileDto;
 use super::validated::ValidatedHarness;
 use super::{DecodeFailure, strict_yaml};
 
@@ -68,24 +69,7 @@ struct ReplacementDto {
     #[serde(rename = "schemaVersion")]
     schema_version: u8,
     #[serde(rename = "agentProfiles")]
-    agent_profiles: BTreeMap<String, ProfileDto>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ProfileDto {
-    harness: HarnessDto,
-}
-
-#[derive(Deserialize)]
-#[serde(tag = "kind")]
-enum HarnessDto {
-    #[serde(rename = "pi")]
-    Pi { config: Value },
-    #[serde(rename = "claude_code")]
-    ClaudeCode { config: Value },
-    #[serde(rename = "codex")]
-    Codex { config: Value },
+    agent_profiles: BTreeMap<String, AgentProfileDto>,
 }
 
 pub(crate) fn decode(bytes: &[u8]) -> Result<DecodedAgentProfileReplacement, DecodeFailure> {
@@ -99,18 +83,8 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<DecodedAgentProfileReplacement, Dec
     if dto.schema_version != 1 || dto.agent_profiles.is_empty() {
         return Err(DecodeFailure::structural_contract());
     }
-    let profiles = dto
-        .agent_profiles
-        .into_iter()
-        .map(|(name, profile)| {
-            let harness = match profile.harness {
-                HarnessDto::Pi { config } => HarnessDefinition::Pi { config },
-                HarnessDto::ClaudeCode { config } => HarnessDefinition::ClaudeCode { config },
-                HarnessDto::Codex { config } => HarnessDefinition::Codex { config },
-            };
-            (name, AgentProfile { harness })
-        })
-        .collect();
+    let profiles = AgentProfileDto::into_agent_profiles(dto.agent_profiles)
+        .ok_or_else(DecodeFailure::structural_contract)?;
     Ok(DecodedAgentProfileReplacement { profiles })
 }
 
@@ -138,7 +112,7 @@ mod tests {
         assert_eq!(decoded.profiles.len(), 1);
         assert!(matches!(
             decoded.profiles["coding"].harness,
-            HarnessDefinition::ClaudeCode { .. }
+            ValidatedHarness::ClaudeCode(_)
         ));
 
         let rejected = [

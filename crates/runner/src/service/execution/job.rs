@@ -158,6 +158,7 @@ impl ExecutionJob {
     }
 
     pub(super) async fn finish_execution(self, mut completion: ExecutionCompletion) {
+        self.run_event.enter(RunPhase::Teardown);
         let assignment_id = self.accepted.assignment_id().to_owned();
         let attempt_id = self.accepted.attempt_id().to_owned();
         let guards = self.accepted.process_guards.clone();
@@ -238,9 +239,10 @@ impl ExecutionJob {
                 }
             }
         }
-        let _ = self
+        let release = self
             .release_workspace(quiescence, completion.workspace_disposition)
             .await;
+        self.run_event.leave(teardown_end(quiescence, release));
         let retained_root = self.accepted.root;
         let _ = self.manager_events.send(ManagerEvent::Finished {
             assignment_id,
@@ -1011,5 +1013,23 @@ impl ExecutionJob {
                 reason: reason.to_owned(),
             },
         )
+    }
+}
+
+// How the teardown phase ended (REQ-TELEMETRY-39): `Succeeded` once process
+// quiescence is proven and the workspace is released or retained as asked,
+// `Cancelled` when a shutdown preempted a proven release, and `Failed` when
+// quiescence was not proven or the cleanup quarantined the workspace.
+fn teardown_end(
+    quiescence: super::super::workspace::ProcessQuiescence,
+    release: super::super::workspace::CleanupResult,
+) -> PhaseEnd {
+    use super::super::workspace::{CleanupResult, ProcessQuiescence};
+    match (quiescence, release) {
+        (ProcessQuiescence::Failed, _) | (_, CleanupResult::Quarantined(_)) => PhaseEnd::Failed,
+        (ProcessQuiescence::Proven, CleanupResult::Preempted) => PhaseEnd::Cancelled,
+        (ProcessQuiescence::Proven, CleanupResult::Released | CleanupResult::Retained) => {
+            PhaseEnd::Succeeded
+        }
     }
 }

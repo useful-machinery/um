@@ -186,12 +186,8 @@ async fn failed_gitlab_assignment_continues_with_fresh_grants_and_retained_works
     let (_temporary, mut manager, initial, broker, read_url) = gitlab_assignment_fixture(workflow);
     manager.handle_offer(initial.clone()).unwrap();
     prepare_current(&mut manager, &initial).await;
-    let workspace = match &mut manager.slot {
-        Some(LocalSlot::Accepted(accepted)) => {
-            accepted.process_guards =
-                AssignmentProcessGuards::durable(&accepted.root.private).unwrap();
-            accepted.root.execution.clone()
-        }
+    let workspace = match &manager.slot {
+        Some(LocalSlot::Accepted(accepted)) => accepted.root.execution.clone(),
         _ => panic!("initial GitLab assignment was not admitted"),
     };
     let reports = execute_to_terminal(&mut manager, &initial).await;

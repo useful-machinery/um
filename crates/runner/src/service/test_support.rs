@@ -1,6 +1,7 @@
 use std::future::Future;
 use std::ops::Deref;
 use std::os::unix::fs::PermissionsExt as _;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -8,6 +9,8 @@ use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use futures_util::{Sink, SinkExt, Stream, StreamExt};
+use rustix::io::Errno;
+use rustix::process::{Pid, test_kill_process};
 use serde_json::{Value, json};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Notify, mpsc};
@@ -28,6 +31,57 @@ use crate::service::{
 pub(crate) type FixtureSocket = WebSocketStream<TcpStream>;
 
 const TEST_WATCHDOG: Duration = Duration::from_secs(10);
+const INTERNAL_WORKER_EXECUTABLE_VARIABLE: &str = "UM_TEST_INTERNAL_WORKER_EXECUTABLE";
+
+/// The built `internal-worker` example that guards every command step a runner test
+/// executes, as `cli/scripts/check-suite` exports it. Without it the execution crate's
+/// test-fixture fallback re-executes this test binary in the guard role, where it runs
+/// the whole suite in a nested process instead of guarding anything, and every process
+/// that nesting leaves behind is an orphan on the host. A runner fixture therefore
+/// refuses to exist before any step can launch rather than leak.
+pub(crate) fn require_internal_worker_executable() -> PathBuf {
+    let Some(worker) = std::env::var_os(INTERNAL_WORKER_EXECUTABLE_VARIABLE) else {
+        panic!(
+            "{INTERNAL_WORKER_EXECUTABLE_VARIABLE} must name the built internal-worker example: \
+             run through cli/scripts/check-suite, or build it with `cargo build --locked \
+             --workspace --all-features --bins --example internal-worker` and export its path"
+        );
+    };
+    let worker = PathBuf::from(worker);
+    assert!(
+        worker.is_file(),
+        "test worker executable is unavailable: {}",
+        worker.display()
+    );
+    worker
+}
+
+/// A workflow whose one `cmd` step leads a guarded process group and holds a descendant
+/// in it, recording `<leader> <descendant>` to `record` once both exist.
+pub(crate) fn holding_step_workflow(record: &Path) -> String {
+    let argv = serde_json::to_string(&[
+        "sh",
+        "-c",
+        "sleep 300 & printf '%s %s\\n' \"$$\" \"$!\" > \"$0\"; wait",
+        record.to_str().expect("fixture path should be UTF-8"),
+    ])
+    .expect("encode guarded step argv");
+    format!("schemaVersion: 1\nsteps:\n  hold:\n    kind: cmd\n    command:\n      argv: {argv}\n")
+}
+
+/// The leader and descendant a `holding_step_workflow` step recorded, once it has.
+pub(crate) fn guarded_processes(record: &Path) -> Option<(Pid, Pid)> {
+    let recorded = std::fs::read_to_string(record).ok()?;
+    let (leader, descendant) = recorded.strip_suffix('\n')?.split_once(' ')?;
+    Some((
+        Pid::from_raw(leader.parse().ok()?)?,
+        Pid::from_raw(descendant.parse().ok()?)?,
+    ))
+}
+
+pub(crate) fn process_exists(process: Pid) -> bool {
+    !matches!(test_kill_process(process), Err(Errno::SRCH))
+}
 
 pub(crate) struct ConfigFixture {
     config: Config,
@@ -40,9 +94,9 @@ impl ConfigFixture {
         credential: Credential,
         allow_insecure_http: bool,
     ) -> Result<Self, ConfigError> {
-        let manifest =
-            std::fs::canonicalize(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../.."))
-                .map_err(|_| ConfigError::WorkRootUnavailable)?;
+        require_internal_worker_executable();
+        let manifest = std::fs::canonicalize(Path::new(env!("CARGO_MANIFEST_DIR")).join("../.."))
+            .map_err(|_| ConfigError::WorkRootUnavailable)?;
         // The test boundary preserves TMPDIR, which may be inside this checkout.
         // Runner fixtures must not follow it back into the source tree.
         let work_root =

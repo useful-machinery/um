@@ -15,6 +15,7 @@ use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinSet;
 
+use super::super::test_support::host_scaled_watchdog;
 use super::adapter::PiJsonV1Adapter;
 use super::*;
 use crate::pi::{PI_JSON_V1_QUALIFICATION_VERSION, validate_pi_installation};
@@ -944,16 +945,12 @@ fn pinned_real_pi_01_qualification_anchor_is_exact_and_supported() {
     );
 }
 
-#[expect(
-    clippy::disallowed_methods,
-    reason = "real time is used only as an anti-hang watchdog, never as success evidence"
-)]
 // REQ-AGENT-16, REQ-AGENT-17, REQ-AGENT-22
 #[tokio::test]
 #[ignore = "requires pinned harness"]
 async fn pinned_real_pi_02_launch_resources_attachments_and_response_conform() {
     let _executable = require_conformance_executable();
-    tokio::time::timeout(PINNED_TEST_WATCHDOG, async {
+    host_scaled_watchdog("Pi launch conformance", PINNED_TEST_WATCHDOG, async {
         let fixture = RealPiFixture::new(
             AgentValueMode::Response {
                 output: Arc::from("response"),
@@ -1097,19 +1094,14 @@ async fn pinned_real_pi_02_launch_resources_attachments_and_response_conform() {
         assert_ne!(repeated.session_directory, first_session_directory);
         repeated.controller.shutdown().await;
     })
-    .await
-    .expect("pinned real-Pi launch conformance watchdog expired");
+    .await;
 }
 
-#[expect(
-    clippy::disallowed_methods,
-    reason = "real time is used only as an anti-hang watchdog, never as success evidence"
-)]
 #[tokio::test]
 #[ignore = "requires pinned harness"]
 async fn pinned_real_pi_02_nested_tool_events_are_observational() {
     let _executable = require_conformance_executable();
-    tokio::time::timeout(PINNED_TEST_WATCHDOG, async {
+    host_scaled_watchdog("Pi nested-call", PINNED_TEST_WATCHDOG, async {
         let fixture = RealPiFixture::new(
             AgentValueMode::Response {
                 output: Arc::from("response"),
@@ -1167,19 +1159,14 @@ async fn pinned_real_pi_02_nested_tool_events_are_observational() {
         fixture.assert_configuration_unchanged();
         fixture.controller.shutdown().await;
     })
-    .await
-    .expect("pinned real-Pi nested-call watchdog expired");
+    .await;
 }
 
-#[expect(
-    clippy::disallowed_methods,
-    reason = "real time is used only as an anti-hang watchdog, never as success evidence"
-)]
 #[tokio::test]
 #[ignore = "requires pinned harness"]
 async fn pinned_real_pi_02_bash_only_skills_and_tool_cwd_conform() {
     let _executable = require_conformance_executable();
-    tokio::time::timeout(PINNED_TEST_WATCHDOG, async {
+    host_scaled_watchdog("Pi bash-only conformance", PINNED_TEST_WATCHDOG, async {
         let fixture = RealPiFixture::with_bash_only_tools(AgentValueMode::None);
         let mut running = RunningRealPi::launch(fixture);
         let startup = running.release_startup().await;
@@ -1230,19 +1217,14 @@ async fn pinned_real_pi_02_bash_only_skills_and_tool_cwd_conform() {
         fixture.assert_configuration_unchanged();
         fixture.controller.shutdown().await;
     })
-    .await
-    .expect("pinned real-Pi bash-only conformance watchdog expired");
+    .await;
 }
 
-#[expect(
-    clippy::disallowed_methods,
-    reason = "real time is used only as an anti-hang watchdog, never as success evidence"
-)]
 #[tokio::test]
 #[ignore = "requires pinned harness"]
 async fn pinned_real_pi_03_no_value_and_typed_terminal_failures_conform() {
     let _executable = require_conformance_executable();
-    tokio::time::timeout(PINNED_TEST_WATCHDOG, async {
+    host_scaled_watchdog("Pi terminal conformance", PINNED_TEST_WATCHDOG, async {
         let cases = [
             (
                 AgentValueMode::None,
@@ -1285,8 +1267,7 @@ async fn pinned_real_pi_03_no_value_and_typed_terminal_failures_conform() {
             fixture.controller.shutdown().await;
         }
     })
-    .await
-    .expect("pinned real-Pi terminal conformance watchdog expired");
+    .await;
 }
 
 #[tokio::test]
@@ -1373,15 +1354,11 @@ async fn pinned_real_pi_03_pre_settlement_continuation_conforms() {
     }
 }
 
-#[expect(
-    clippy::disallowed_methods,
-    reason = "real time is used only as an anti-hang watchdog, never as success evidence"
-)]
 #[tokio::test]
 #[ignore = "requires pinned harness"]
 async fn pinned_real_pi_04_result_rejection_sibling_correction_and_termination_conform() {
     let _executable = require_conformance_executable();
-    tokio::time::timeout(PINNED_TEST_WATCHDOG, async {
+    host_scaled_watchdog("Pi result conformance", PINNED_TEST_WATCHDOG, async {
         let (mut running, first, tool_name) = launch_result_case().await;
         // Keep the candidate valid under the model-facing compatibility
         // projection so Pi invokes Scherzo's authoritative validator.
@@ -1453,19 +1430,14 @@ async fn pinned_real_pi_04_result_rejection_sibling_correction_and_termination_c
         let (fixture, outcome) = running.finish().await;
         assert_count_one_result(fixture, outcome).await;
     })
-    .await
-    .expect("pinned real-Pi result conformance watchdog expired");
+    .await;
 }
 
-#[expect(
-    clippy::disallowed_methods,
-    reason = "real time is used only as an anti-hang watchdog, never as success evidence"
-)]
 #[tokio::test]
 #[ignore = "requires pinned harness"]
 async fn pinned_real_pi_04_malformed_tool_arguments_cannot_settle_a_result() {
     let _executable = require_conformance_executable();
-    tokio::time::timeout(PINNED_TEST_WATCHDOG, async {
+    host_scaled_watchdog("Pi malformed-call", PINNED_TEST_WATCHDOG, async {
         let (mut running, first, tool_name) = launch_result_case().await;
         let raw = "{\"result\":{\"count\":1},";
         first.release(json!({
@@ -1496,19 +1468,14 @@ async fn pinned_real_pi_04_malformed_tool_arguments_cannot_settle_a_result() {
         let (fixture, outcome) = running.finish().await;
         assert_count_one_result(fixture, outcome).await;
     })
-    .await
-    .expect("pinned real-Pi malformed-call watchdog expired");
+    .await;
 }
 
-#[expect(
-    clippy::disallowed_methods,
-    reason = "real time is used only as an anti-hang watchdog, never as success evidence"
-)]
 #[tokio::test]
 #[ignore = "requires pinned harness"]
 async fn pinned_real_pi_04_codemode_only_keeps_terminal_result_direct() {
     let _executable = require_conformance_executable();
-    tokio::time::timeout(PINNED_TEST_WATCHDOG, async {
+    host_scaled_watchdog("Pi codemode result", PINNED_TEST_WATCHDOG, async {
         let fixture = RealPiFixture::with_codemode_only(result_mode());
         let mut running = RunningRealPi::launch(fixture);
         running.release_startup().await;
@@ -1527,19 +1494,14 @@ async fn pinned_real_pi_04_codemode_only_keeps_terminal_result_direct() {
         let (fixture, outcome) = running.finish().await;
         assert_count_one_result(fixture, outcome).await;
     })
-    .await
-    .expect("pinned real-Pi codemode result watchdog expired");
+    .await;
 }
 
-#[expect(
-    clippy::disallowed_methods,
-    reason = "real time is used only as an anti-hang watchdog, never as success evidence"
-)]
 #[tokio::test]
 #[ignore = "requires pinned harness"]
 async fn pinned_real_pi_04_accepted_result_cancels_threshold_compaction() {
     let _executable = require_conformance_executable();
-    tokio::time::timeout(PINNED_TEST_WATCHDOG, async {
+    host_scaled_watchdog("Pi compaction settlement", PINNED_TEST_WATCHDOG, async {
         let fixture = RealPiFixture::with_threshold_compaction(result_mode());
         let mut running = RunningRealPi::launch(fixture);
         running.release_startup().await;
@@ -1597,19 +1559,14 @@ async fn pinned_real_pi_04_accepted_result_cancels_threshold_compaction() {
         assert!(compaction_completed < harness_quiescent);
         assert_count_one_result(fixture, outcome).await;
     })
-    .await
-    .expect("pinned real-Pi threshold-compaction settlement watchdog expired");
+    .await;
 }
 
-#[expect(
-    clippy::disallowed_methods,
-    reason = "real time is used only as an anti-hang watchdog, never as success evidence"
-)]
 #[tokio::test]
 #[ignore = "requires pinned harness"]
 async fn pinned_real_pi_04_provider_finalized_thinking_reaches_result_settlement() {
     let _executable = require_conformance_executable();
-    tokio::time::timeout(PINNED_TEST_WATCHDOG, async {
+    host_scaled_watchdog("Pi streamed-result conformance", PINNED_TEST_WATCHDOG, async {
         const FIRST_REASONING_SUMMARY: &str = "Inspecting the requested result shape.";
         const SECOND_REASONING_SUMMARY: &str = "Submitting one nested result call.";
         const FINALIZED_THINKING: &str =
@@ -1741,19 +1698,14 @@ async fn pinned_real_pi_04_provider_finalized_thinking_reaches_result_settlement
         fixture.assert_configuration_unchanged();
         fixture.controller.shutdown().await;
     })
-    .await
-    .expect("pinned real-Pi streamed-result conformance watchdog expired");
+    .await;
 }
 
-#[expect(
-    clippy::disallowed_methods,
-    reason = "real time is used only as an anti-hang watchdog, never as success evidence"
-)]
 #[tokio::test]
 #[ignore = "requires pinned harness"]
 async fn pinned_real_pi_04_tolerates_thinking_end_snapshot_disagreement() {
     let _executable = require_conformance_executable();
-    tokio::time::timeout(PINNED_TEST_WATCHDOG, async {
+    host_scaled_watchdog("Pi thinking-end tolerance", PINNED_TEST_WATCHDOG, async {
         const STREAMED_THINKING: &str = "An observational reasoning summary.";
         const FINALIZED_THINKING: &str = "The provider-finalized thinking snapshot.";
         const MISMATCHED_EVENT_CONTENT: &str = "A different thinking-end event snapshot.";
@@ -1812,19 +1764,14 @@ async fn pinned_real_pi_04_tolerates_thinking_end_snapshot_disagreement() {
         fixture.assert_retained_diagnostic_state();
         fixture.controller.shutdown().await;
     })
-    .await
-    .expect("pinned real-Pi thinking-end tolerance watchdog expired");
+    .await;
 }
 
-#[expect(
-    clippy::disallowed_methods,
-    reason = "real time is used only as an anti-hang watchdog, never as success evidence"
-)]
 #[tokio::test]
 #[ignore = "requires pinned harness"]
 async fn pinned_real_pi_recovers_after_a_partial_tool_call_transport_failure() {
     let _executable = require_conformance_executable();
-    tokio::time::timeout(PINNED_TEST_WATCHDOG, async {
+    host_scaled_watchdog("Pi partial-call retry", PINNED_TEST_WATCHDOG, async {
         let fixture = RealPiFixture::with_immediate_retry(result_mode());
         let mut running = RunningRealPi::launch(fixture);
         running.release_startup().await;
@@ -1932,19 +1879,14 @@ async fn pinned_real_pi_recovers_after_a_partial_tool_call_transport_failure() {
         fixture.assert_configuration_unchanged();
         fixture.controller.shutdown().await;
     })
-    .await
-    .expect("pinned real-Pi partial-call retry watchdog expired");
+    .await;
 }
 
-#[expect(
-    clippy::disallowed_methods,
-    reason = "real time is used only as an anti-hang watchdog, never as success evidence"
-)]
 #[tokio::test]
 #[ignore = "requires pinned harness"]
 async fn pinned_real_pi_recovers_after_a_truncated_result_tool_call() {
     let _executable = require_conformance_executable();
-    tokio::time::timeout(PINNED_TEST_WATCHDOG, async {
+    host_scaled_watchdog("Pi truncated result", PINNED_TEST_WATCHDOG, async {
         let (mut running, first, tool_name) = launch_result_case().await;
         first.release(json!({
             "kind": "truncatedToolCall",
@@ -1979,8 +1921,7 @@ async fn pinned_real_pi_recovers_after_a_truncated_result_tool_call() {
         task.await.unwrap();
         assert_count_one_result(fixture, outcome).await;
     })
-    .await
-    .expect("pinned real-Pi truncated result recovery watchdog expired");
+    .await;
 }
 
 fn launch_with_blocking_validation(
@@ -2026,15 +1967,11 @@ async fn cancel_and_finish(running: RunningRealPi) -> RealPiFixture {
     running.fixture
 }
 
-#[expect(
-    clippy::disallowed_methods,
-    reason = "real time is used only as an anti-hang watchdog, never as success evidence"
-)]
 #[tokio::test]
 #[ignore = "requires pinned harness"]
 async fn pinned_real_pi_05_cancellation_quiesces_model_tool_retry_validation_and_settlement() {
     let _executable = require_conformance_executable();
-    tokio::time::timeout(PINNED_TEST_WATCHDOG, async {
+    host_scaled_watchdog("Pi cancellation conformance", PINNED_TEST_WATCHDOG, async {
         // Keep each controlled request alive until cancellation settles so controller EOF
         // cannot race the process interrupt and manufacture a different terminal phase.
         // Model phase: the provider request itself is the barrier.
@@ -2123,8 +2060,7 @@ async fn pinned_real_pi_05_cancellation_quiesces_model_tool_retry_validation_and
         drop(blocked_settlement);
         fixture.controller.shutdown().await;
     })
-    .await
-    .expect("pinned real-Pi cancellation conformance watchdog expired");
+    .await;
 }
 
 #[test]
@@ -2139,10 +2075,6 @@ fn stubborn_descendant_process_fixture() {
     }
 }
 
-#[expect(
-    clippy::disallowed_methods,
-    reason = "real time is used only as an anti-hang watchdog, never as success evidence"
-)]
 #[tokio::test]
 #[ignore = "requires pinned harness"]
 async fn pinned_real_pi_06_cancellation_kills_a_stubborn_process_group_descendant() {
@@ -2151,7 +2083,7 @@ async fn pinned_real_pi_06_cancellation_kills_a_stubborn_process_group_descendan
     // descendant when Pi exits so the process-group probe can reap it itself.
     #[cfg(target_os = "linux")]
     nix::sys::prctl::set_child_subreaper(true).unwrap();
-    tokio::time::timeout(PINNED_TEST_WATCHDOG, async {
+    host_scaled_watchdog("Pi stubborn-descendant", PINNED_TEST_WATCHDOG, async {
         let fixture = RealPiFixture::new(AgentValueMode::None, false, false);
         let mut running = RunningRealPi::launch(fixture);
         running.release_startup().await;
@@ -2192,8 +2124,7 @@ async fn pinned_real_pi_06_cancellation_kills_a_stubborn_process_group_descendan
         running.fixture.assert_configuration_unchanged();
         running.fixture.controller.shutdown().await;
     })
-    .await
-    .expect("pinned real-Pi stubborn-descendant watchdog expired");
+    .await;
 }
 
 fn descendant_has_no_live_task(descendant: Pid, expected_group: Pid) -> bool {

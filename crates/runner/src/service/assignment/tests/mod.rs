@@ -4,11 +4,12 @@ use std::fs;
 use std::io::{self, Read as _, Write as _};
 use std::net::TcpStream as StandardTcpStream;
 use std::os::unix::fs::PermissionsExt;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use rustix::process::Pid;
+use rustix::process::{Pid, Signal, kill_process_group};
 use serde_json::json;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::TcpListener;
@@ -24,7 +25,10 @@ use crate::service::source::{
     CommitAvailability, CredentialBrokerFailure, ProviderCredential, WorkflowGitRevocation,
     test_support::{fixture_source_broker, unavailable_source_broker},
 };
-use crate::service::test_support::{controlled_sleeper, fixture_lease_clock, with_watchdog};
+use crate::service::test_support::{
+    controlled_sleeper, fixture_lease_clock, fixture_sleeper, guarded_processes,
+    holding_step_workflow, process_exists, require_internal_worker_executable, with_watchdog,
+};
 use crate::service::workspace::{
     CleanupCancellation, CleanupSleeper, OwnedTree, TreeRemover, WorkRootHook, WorkspaceFilesystem,
 };
@@ -683,7 +687,7 @@ fn codex_process_fixture() {
 }
 
 // Keep commands alive until the test observes them. Bare `true` and `false`
-// commands can exit before the direct-child test path captures their process identity.
+// commands can exit before the test observes them running.
 #[test]
 #[ignore = "launched only as the assignment workflow command fixture"]
 fn command_fixture_process() {
@@ -1060,6 +1064,7 @@ fn initialize_source_repository(source: &Path) {
 }
 
 fn base_manager_config(workflow: &str) -> (tempfile::TempDir, PathBuf, Config) {
+    require_internal_worker_executable();
     let temporary = tempfile::tempdir().unwrap();
     let source = temporary.path().join("source");
     let work = temporary.path().join("work");
@@ -1104,7 +1109,11 @@ fn manager_with_fixture_source(
         None,
         Arc::from(crate::telemetry::TEST_SERVICE_VERSION),
         None,
-        false,
+        // Guard command steps as the production runner does
+        // (`AssignmentDependencies::production`): the guard worker kills and reaps a
+        // step's process group when a test drops the engine, panicking or not, so a
+        // failing test leaves no process behind on a shared host.
+        true,
     );
     AssignmentManager::new(config, fixture_lease_clock(), dependencies)
 }
@@ -1180,7 +1189,7 @@ fn assert_codex_fixture_quiescent(temporary: &tempfile::TempDir) {
         let path = temporary.path().join(name);
         if path.exists() {
             assert!(
-                rustix::process::test_kill_process(fixture_pid(&path)).is_err(),
+                !process_exists(fixture_pid(&path)),
                 "{name} remained live after runner terminal reporting"
             );
         }
@@ -1768,6 +1777,60 @@ fn assert_acknowledged_run(
     assert_eq!(runs[0]["um.run.result"], result);
 }
 
+// REQ-RUNNERENROLL-78
+/// A test that panics while a guarded step runs unwinds through its runtime, which drops
+/// the engine and with it the owner side of the step's guard, as an abruptly dying runner
+/// would; the guard worker then kills and reaps the step's process group, so the panic
+/// leaves no process behind on the host.
+#[test]
+fn guarded_step_processes_do_not_outlive_a_panicking_test() {
+    let temporary = tempfile::tempdir().unwrap();
+    let record = temporary.path().join("guarded-processes");
+    let workflow = holding_step_workflow(&record);
+    let outcome = catch_unwind(AssertUnwindSafe(|| {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let (_temporary, mut manager) = manager_fixture(&workflow);
+            let offered = offer("bg");
+            offer_then_prepare(&mut manager, &offered).await;
+            execution_job(&mut manager, &offered).spawn();
+            let sleeper = fixture_sleeper();
+            let processes = with_watchdog(async {
+                loop {
+                    if let Some(processes) = guarded_processes(&record) {
+                        break processes;
+                    }
+                    sleeper.sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("guarded step did not hold");
+            panic!("simulated test failure while the guarded step holds {processes:?}");
+        })
+    }));
+    assert!(outcome.is_err(), "the fixture test must have panicked");
+
+    let (leader, descendant) =
+        guarded_processes(&record).expect("the step recorded its processes before the panic");
+    let quiesced = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(with_watchdog(async {
+            let sleeper = fixture_sleeper();
+            while [leader, descendant].into_iter().any(process_exists) {
+                sleeper.sleep(Duration::from_millis(10)).await;
+            }
+        }));
+    if quiesced.is_err() {
+        let _ = kill_process_group(leader, Signal::KILL);
+        panic!("guarded processes outlived the panicking test: {leader:?} {descendant:?}");
+    }
+}
+
 fn command_fixture_arguments() -> Vec<String> {
     command_fixture_arguments_for(COMMAND_FIXTURE_TEST_NAME)
 }
@@ -2310,6 +2373,7 @@ async fn prepared_event_after_absolute_deadline_cannot_retain_acceptance() {
         root: None,
         prepare_effect_id: Some("eff_01k0z6r1w8f4jy2m7q9v3x5acz".to_owned()),
         preparation_event: None,
+        run_event: RunEvent::default(),
     })));
     manager
         .event_sender
@@ -3265,6 +3329,7 @@ async fn cancellation_before_continuation_ready_releases_the_claim_without_an_ac
         root: None, // The preparation worker owns the claimed root until it reports.
         prepare_effect_id: Some(prepare.effect_id.clone()),
         preparation_event: None,
+        run_event: RunEvent::default(),
     })));
     let id = manager
         .outbox
@@ -3559,6 +3624,289 @@ async fn run_event_ends_once_at_terminal_ack_or_fence() {
     assert_eq!(runs[0]["um.run.result"], "fenced");
 }
 
+// REQ-TELEMETRY-39
+#[tokio::test]
+async fn run_phases_are_recorded_as_children_of_the_run() {
+    let workflow =
+        "schemaVersion: 1\nsteps:\n  check:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n";
+    let (_temporary, mut manager, offered, _job, capture) = run_event_fixture(workflow).await;
+    let id = manager
+        .outbox
+        .enqueue(AssignmentObservation::Execution {
+            assignment_id: offered.assignment_id.clone(),
+            attempt_id: offered.attempt_id.clone(),
+            report: ExecutionReport::Aborted {
+                last_execution_event_sequence: 0,
+                reason: "runner_internal_failure".to_owned(),
+            },
+        })
+        .unwrap();
+    manager.acknowledge_observation(id);
+
+    let events = capture.events();
+    let named = |name: &str| {
+        events
+            .iter()
+            .filter(|event| event["event.name"] == name)
+            .collect::<Vec<_>>()
+    };
+    for name in ["runner.run.checkout", "runner.run.preparation"] {
+        assert_run_phase(&capture, &offered, name, "success", None);
+    }
+    for name in [
+        "runner.run.execution",
+        "runner.run.upload",
+        "runner.run.teardown",
+    ] {
+        assert!(named(name).is_empty(), "{name}");
+    }
+}
+
+// REQ-TELEMETRY-39
+#[tokio::test]
+async fn a_declined_offer_writes_one_rejected_run() {
+    let workflow =
+        "schemaVersion: 1\nsteps:\n  check:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n";
+    let (_temporary, mut manager) = manager_fixture(workflow);
+    let (recorder, capture) = crate::telemetry::test_recorder("rbt_fixture");
+    manager.recorder = Some(recorder);
+    manager.source_broker = Some(unavailable_source_broker());
+    let offered = offer("bg");
+    offer_then_prepare(&mut manager, &offered).await;
+    settle_cleanup(&mut manager).await;
+
+    let runs = capture
+        .events()
+        .into_iter()
+        .filter(|event| event["event.name"] == "runner.run")
+        .collect::<Vec<_>>();
+    assert_eq!(runs.len(), 1);
+    let run = &runs[0];
+    assert_eq!(run["um.run.result"], "rejected");
+    assert_eq!(run["um.outcome"], "rejected");
+    assert!(run.get("error.type").is_none());
+    assert_eq!(run["um.run.id"], offered.run_id);
+    assert_eq!(run["um.assignment.id"], offered.assignment_id);
+    assert_eq!(run["um.attempt.id"], offered.attempt_id);
+    assert_eq!(run["um.runner.boot_id"], "rbt_fixture");
+    assert_eq!(
+        capture.event("runner.assignment_preparation")["um.outcome"],
+        "failure"
+    );
+    let spans = capture.spans();
+    let run_spans = spans
+        .iter()
+        .filter(|span| span.name == "runner.run")
+        .collect::<Vec<_>>();
+    assert_eq!(run_spans.len(), 1);
+    assert_eq!(run_spans[0].status, opentelemetry::trace::Status::Unset);
+}
+
+fn captured_events(
+    capture: &crate::telemetry::TestCapture,
+    name: &str,
+) -> Vec<serde_json::Map<String, Value>> {
+    capture
+        .events()
+        .into_iter()
+        .filter(|event| event["event.name"] == name)
+        .collect()
+}
+
+// Asserts exactly one `name` phase record, ended with `outcome` and
+// `error_type`, as a child of the one `runner.run` record of `offered`.
+fn assert_run_phase(
+    capture: &crate::telemetry::TestCapture,
+    offered: &AssignmentOffer,
+    name: &str,
+    outcome: &str,
+    error_type: Option<&str>,
+) {
+    let runs = captured_events(capture, "runner.run");
+    assert_eq!(runs.len(), 1);
+    let run = &runs[0];
+    let phase = assert_phase_record(capture, offered, name, outcome, error_type);
+    assert_eq!(phase["trace_id"], run["trace_id"], "{name}");
+    assert_eq!(phase["parent_span_id"], run["span_id"], "{name}");
+}
+
+// Asserts exactly one `name` phase record of `offered`, ended with `outcome`
+// and `error_type` and carrying the run's IDs, and returns it; the record is
+// written when the phase ends, before the `runner.run` record it belongs to.
+fn assert_phase_record(
+    capture: &crate::telemetry::TestCapture,
+    offered: &AssignmentOffer,
+    name: &str,
+    outcome: &str,
+    error_type: Option<&str>,
+) -> serde_json::Map<String, Value> {
+    let phases = captured_events(capture, name);
+    assert_eq!(phases.len(), 1, "{name}");
+    let phase = &phases[0];
+    assert_eq!(phase["um.outcome"], outcome, "{name}");
+    assert_eq!(
+        phase.get("error.type").and_then(Value::as_str),
+        error_type,
+        "{name}"
+    );
+    assert_eq!(phase["um.run.id"], offered.run_id, "{name}");
+    assert_eq!(phase["um.assignment.id"], offered.assignment_id, "{name}");
+    assert_eq!(phase["um.attempt.id"], offered.attempt_id, "{name}");
+    assert!(phase.get("um.runner.id").is_none(), "{name}");
+    assert!(phase.get("um.runner.boot_id").is_none(), "{name}");
+    assert!(phase["parent_span_id"].is_string(), "{name}");
+    phase.clone()
+}
+
+// Starts a prepare whose source materialization blocks until the capture is
+// cancelled, with telemetry recorded.
+async fn blocked_checkout_fixture(
+    sleeper: Option<Arc<dyn Sleeper>>,
+) -> (
+    tempfile::TempDir,
+    AssignmentManager,
+    AssignmentOffer,
+    BlockingSourceFixture,
+    crate::telemetry::TestCapture,
+) {
+    let workflow =
+        "schemaVersion: 1\nsteps:\n  check:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n";
+    let (temporary, mut manager) = manager_fixture(workflow);
+    let (recorder, capture) = crate::telemetry::test_recorder("rbt_fixture");
+    manager.recorder = Some(recorder);
+    if let Some(sleeper) = sleeper {
+        manager.sleeper = sleeper;
+    }
+    let source = BlockingSourceFixture::new();
+    manager.source_broker = Some(source.broker());
+    let mut offered = offer("bg");
+    align_offer_with_source_fixture(&manager, &mut offered);
+    manager.handle_offer(offered.clone()).unwrap();
+    begin_preparation(&mut manager, &offered).await;
+    source.wait_until_started();
+    (temporary, manager, offered, source, capture)
+}
+
+async fn wait_until_not_preparing(manager: &mut AssignmentManager) {
+    with_watchdog(wait_for_manager_state(manager, |manager| {
+        manager.drain_events();
+        !matches!(manager.slot, Some(LocalSlot::Preparing(_)))
+    }))
+    .await
+    .expect("blocked source preparation did not finish");
+}
+
+// REQ-TELEMETRY-39
+#[tokio::test]
+async fn a_preparation_deadline_times_out_the_phase_and_a_cancellation_cancels_it() {
+    let (sleeper, mut sleep_requests) = controlled_sleeper();
+    let (_temporary, mut manager, _offered, source, capture) =
+        blocked_checkout_fixture(Some(sleeper)).await;
+    let (_, deadline_release) = sleep_requests
+        .recv()
+        .await
+        .expect("preparation fence should register its deadline sleep");
+    deadline_release.release();
+    source.wait_until_stopped();
+    wait_until_not_preparing(&mut manager).await;
+    settle_cleanup(&mut manager).await;
+    let checkouts = captured_events(&capture, "runner.run.checkout");
+    assert_eq!(checkouts.len(), 1);
+    assert_eq!(checkouts[0]["um.outcome"], "timeout");
+    assert_eq!(checkouts[0]["error.type"], "runner_phase_timeout");
+
+    let (_temporary, mut manager, offered, source, capture) = blocked_checkout_fixture(None).await;
+    manager
+        .handle_cancel(cancel_for(&offered, CancellationMode::Graceful, "bm"))
+        .unwrap();
+    source.wait_until_stopped();
+    wait_until_not_preparing(&mut manager).await;
+    let checkouts = captured_events(&capture, "runner.run.checkout");
+    assert_eq!(checkouts.len(), 1);
+    assert_eq!(checkouts[0]["um.outcome"], "cancelled");
+    assert!(checkouts[0].get("error.type").is_none());
+}
+
+// REQ-TELEMETRY-39
+#[tokio::test]
+async fn a_rejected_resent_offer_leaves_the_live_run_open() {
+    let workflow =
+        "schemaVersion: 1\nsteps:\n  check:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n";
+    let (_temporary, mut manager, offered, _job, capture) = run_event_fixture(workflow).await;
+    // Once its retained decision is evicted, a re-sent offer passes the replay
+    // guard and the occupied slot declines it.
+    manager.decisions.clear();
+    manager.handle_offer(offered.clone()).unwrap();
+    assert!(
+        manager
+            .pending_observations(&BTreeSet::new(), 100)
+            .iter()
+            .any(|pending| matches!(
+                &pending.observation,
+                AssignmentObservation::Decision(AssignmentDecision::Rejected {
+                    assignment_id, ..
+                }) if assignment_id == &offered.assignment_id
+            ))
+    );
+    assert!(captured_events(&capture, "runner.run").is_empty());
+
+    let id = manager
+        .outbox
+        .enqueue(AssignmentObservation::Execution {
+            assignment_id: offered.assignment_id.clone(),
+            attempt_id: offered.attempt_id.clone(),
+            report: ExecutionReport::Aborted {
+                last_execution_event_sequence: 0,
+                reason: "runner_internal_failure".to_owned(),
+            },
+        })
+        .unwrap();
+    manager.acknowledge_observation(id);
+    let runs = captured_events(&capture, "runner.run");
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0]["um.run.result"], "aborted");
+}
+
+// REQ-TELEMETRY-39
+#[tokio::test]
+async fn shutdown_ends_a_run_it_gives_up_before_execution() {
+    let (_temporary, mut manager, offered, mut root_preparation_started, release_root_preparation) =
+        gated_root_preparation_fixture();
+    let (recorder, capture) = crate::telemetry::test_recorder("rbt_fixture");
+    manager.recorder = Some(recorder);
+    manager.handle_offer(offered.clone()).unwrap();
+    root_preparation_started
+        .recv()
+        .await
+        .expect("assignment root preparation did not start");
+    manager.begin_shutdown().unwrap();
+    assert!(manager.slot.is_none());
+    let runs = captured_events(&capture, "runner.run");
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0]["um.run.result"], "aborted");
+    assert_eq!(runs[0]["um.assignment.id"], offered.assignment_id);
+    release_root_preparation
+        .send(())
+        .expect("release assignment root preparation");
+
+    // An accepted assignment whose interruption cannot be enqueued.
+    let workflow =
+        "schemaVersion: 1\nsteps:\n  check:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n";
+    let (_temporary, mut manager) = manager_fixture(workflow);
+    let (recorder, capture) = crate::telemetry::test_recorder("rbt_fixture");
+    manager.recorder = Some(recorder);
+    offer_then_prepare(&mut manager, &offered).await;
+    assert!(matches!(manager.slot, Some(LocalSlot::Accepted(_))));
+    manager.outbox.maximum_encoded_bytes = 0;
+    assert_eq!(
+        manager.begin_shutdown(),
+        Err(AssignmentManagerFailure::DecisionCapacity)
+    );
+    let runs = captured_events(&capture, "runner.run");
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0]["um.run.result"], "aborted");
+}
+
 #[tokio::test]
 async fn fenced_completion_keeps_its_disposition_without_a_report() {
     let workflow =
@@ -3670,6 +4018,7 @@ async fn terminal_grace_wait_failure_classifies_the_retained_run() {
     assert_eq!(event["um.diagnostic.stage"], "terminal_acknowledgement");
 }
 
+// REQ-TELEMETRY-39
 #[tokio::test]
 async fn authorized_execution_reports_one_run_after_acknowledgement() {
     for (command, expected) in [("true", "succeeded"), ("false", "failed")] {
@@ -3689,7 +4038,36 @@ async fn authorized_execution_reports_one_run_after_acknowledgement() {
             reports.iter().filter(|report| report.is_terminal()).count(),
             1
         );
+        // The teardown record is written before `Finished`, after the
+        // terminal report is enqueued.
+        wait_for_execution_finalization(&mut manager).await;
         assert_acknowledged_run(&mut manager, &capture, expected);
+        for name in ["runner.run.checkout", "runner.run.preparation"] {
+            assert_run_phase(&capture, &offered, name, "success", None);
+        }
+        let execution = if expected == "succeeded" {
+            ("success", None)
+        } else {
+            ("failure", Some("runner_phase_failed"))
+        };
+        assert_run_phase(
+            &capture,
+            &offered,
+            "runner.run.execution",
+            execution.0,
+            execution.1,
+        );
+        // The fixture's Cloud declines every artifact registration.
+        assert_run_phase(
+            &capture,
+            &offered,
+            "runner.run.upload",
+            "failure",
+            Some("runner_phase_failed"),
+        );
+        // Quiescence is proven and the workspace is released or retained as
+        // asked, so the teardown succeeds even when the run failed.
+        assert_run_phase(&capture, &offered, "runner.run.teardown", "success", None);
         if expected == "failed" {
             let run = capture.event("runner.run");
             assert!(run["um.failure.phase"].is_string());
@@ -5092,7 +5470,6 @@ async fn accepted_runner_assignment_enables_stopped_spawn_registration() {
     let workflow =
         "schemaVersion: 1\nsteps:\n  check:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n";
     let (_temporary, mut manager) = manager_fixture(workflow);
-    manager.guard_processes = true;
     let offered = offer("bg");
     offer_then_prepare(&mut manager, &offered).await;
     assert!(matches!(
@@ -5114,7 +5491,6 @@ async fn ordinary_admission_prepares_recovery_journal_without_a_start_gate() {
             crate::service::recovery::host_fixture::fixture_host(),
         )
         .unwrap();
-    manager.guard_processes = true;
     let offered = offer("bg");
     offer_then_prepare(&mut manager, &offered).await;
     assert!(matches!(&manager.slot, Some(LocalSlot::Accepted(accepted))
@@ -5629,11 +6005,14 @@ async fn finish_with_stubborn_guard(
     AssignmentManager,
     Arc<crate::service::execution::FixtureGuardProcessControl>,
     Vec<ExecutionReport>,
+    AssignmentOffer,
+    crate::telemetry::TestCapture,
 ) {
     let workflow =
         "schemaVersion: 1\nsteps:\n  check:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n";
     let (temporary, mut manager) = manager_fixture(workflow);
-    manager.guard_processes = true;
+    let (recorder, capture) = crate::telemetry::test_recorder("rbt_fixture");
+    manager.recorder = Some(recorder);
     let offered = offer("bg");
     offer_then_prepare(&mut manager, &offered).await;
     let job = execution_job(&mut manager, &offered);
@@ -5654,27 +6033,35 @@ async fn finish_with_stubborn_guard(
     let reports = with_watchdog(wait_for_terminal(&mut manager))
         .await
         .expect("guard did not produce a terminal report");
-    (temporary, manager, control, reports)
+    (temporary, manager, control, reports, offered, capture)
 }
 
+// REQ-TELEMETRY-39
 #[tokio::test]
 async fn post_success_guard_containment_releases_workspace_and_slot() {
-    let (_temporary, mut manager, control, reports) = finish_with_stubborn_guard(true, false).await;
+    let (_temporary, mut manager, control, reports, offered, capture) =
+        finish_with_stubborn_guard(true, false).await;
     assert_eq!(control.kill_count.load(Ordering::Acquire), 1);
     assert_normal_success_and_reuse(&mut manager, &reports).await;
+    // A forced containment that proves quiescence is a succeeded teardown.
+    assert_run_phase(&capture, &offered, "runner.run.teardown", "success", None);
 }
 
+// REQ-TELEMETRY-39
 #[tokio::test]
 async fn last_containment_wait_observes_departed_guard_before_fencing() {
-    let (_temporary, mut manager, control, reports) = finish_with_stubborn_guard(false, true).await;
+    let (_temporary, mut manager, control, reports, offered, capture) =
+        finish_with_stubborn_guard(false, true).await;
     assert_eq!(control.kill_count.load(Ordering::Acquire), 1);
     assert_normal_success_and_reuse(&mut manager, &reports).await;
+    assert_run_phase(&capture, &offered, "runner.run.teardown", "success", None);
 }
 
 // REQ-RUNNERENROLL-71
+// REQ-TELEMETRY-39
 #[tokio::test]
 async fn uncontainable_guard_is_named_in_terminal_report_and_fences_offers() {
-    let (_temporary, mut manager, control, reports) =
+    let (_temporary, mut manager, control, reports, offered, capture) =
         finish_with_stubborn_guard(false, false).await;
     assert!(
         matches!(reports.last(), Some(ExecutionReport::Finished { outcome, .. })
@@ -5685,6 +6072,15 @@ async fn uncontainable_guard_is_named_in_terminal_report_and_fences_offers() {
     wait_for_execution_finalization(&mut manager).await;
     assert_eq!(control.kill_count.load(Ordering::Acquire), 1);
     assert!(manager.cleanup_failed);
+    // The terminal report is not acknowledged here, so the `runner.run` record
+    // is still open; the teardown child is already written.
+    assert_phase_record(
+        &capture,
+        &offered,
+        "runner.run.teardown",
+        "failure",
+        Some("runner_phase_failed"),
+    );
     let detail = manager.quiescence_failure();
     let (recorder, _capture) = crate::telemetry::test_recorder("quiescence-exit");
     let exit = crate::service::workspace_cleanup_failure(&recorder, detail);

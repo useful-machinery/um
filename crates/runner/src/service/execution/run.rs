@@ -166,6 +166,7 @@ impl ExecutionJob {
         {
             return completion;
         }
+        self.run_event.enter(RunPhase::Execution);
 
         let started_at = RunnerExecutionClock.now();
         let diagnostics = StepDiagnosticLog::default();
@@ -217,6 +218,7 @@ impl ExecutionJob {
             {
                 Ok(Ok(seed)) => Some(seed),
                 _ => {
+                    self.run_event.leave(PhaseEnd::Failed);
                     return self.execution_environment_lost(
                         assignment_id,
                         attempt_id,
@@ -236,6 +238,7 @@ impl ExecutionJob {
                 let record = match self.continuation_record() {
                     Ok(Some(record)) => record,
                     _ => {
+                        self.run_event.leave(PhaseEnd::Failed);
                         return self.execution_environment_lost(
                             assignment_id,
                             attempt_id,
@@ -274,6 +277,7 @@ impl ExecutionJob {
                 let (admitted, seed) = match bound {
                     Ok(Ok(bound)) => bound,
                     _ => {
+                        self.run_event.leave(PhaseEnd::Failed);
                         return self.execution_environment_lost(
                             assignment_id,
                             attempt_id,
@@ -327,6 +331,7 @@ impl ExecutionJob {
                 Ok(dispatcher) => dispatcher,
                 Err(error) => {
                     let cause = dispatcher_cause(&error);
+                    self.run_event.leave(PhaseEnd::Failed);
                     self.collapse("runner_internal_failure", cause, "harness_start");
                     return self.abort_retained(
                         assignment_id,
@@ -406,6 +411,21 @@ impl ExecutionJob {
         };
         self.accepted.workflow_git.disable();
 
+        let phase_end = match &execution {
+            LeaseExecution::Completed {
+                output: Ok(result), ..
+            } => match &result.outcome {
+                RunOutcome::Succeeded => PhaseEnd::Succeeded,
+                RunOutcome::Failed { .. } => PhaseEnd::Failed,
+                RunOutcome::Cancelled {
+                    reason: CancellationReason::ExecutionLeaseExpired,
+                } => PhaseEnd::TimedOut,
+                RunOutcome::Cancelled { .. } => PhaseEnd::Cancelled,
+            },
+            LeaseExecution::Completed { output: Err(_), .. }
+            | LeaseExecution::LeaseClockFailed { .. } => PhaseEnd::Failed,
+            LeaseExecution::ContainmentDeadline => PhaseEnd::TimedOut,
+        };
         let (result, infrastructure_interruption) = match execution {
             LeaseExecution::Completed {
                 output: Ok(result),
@@ -414,6 +434,7 @@ impl ExecutionJob {
             LeaseExecution::Completed {
                 output: Err(error), ..
             } => {
+                self.run_event.leave(phase_end);
                 self.collapse(
                     "runner_internal_failure",
                     coordination_cause(error),
@@ -430,9 +451,11 @@ impl ExecutionJob {
                     .await;
             }
             LeaseExecution::ContainmentDeadline => {
+                self.run_event.leave(phase_end);
                 return ExecutionCompletion::fenced(None);
             }
             LeaseExecution::LeaseClockFailed { quiescent, error } => {
+                self.run_event.leave(phase_end);
                 self.lease_clock_failure(error);
                 let report = quiescent.then(|| {
                     self.abort(
@@ -446,6 +469,7 @@ impl ExecutionJob {
             }
         };
         if let Some(fault) = observer.fault() {
+            self.run_event.leave(PhaseEnd::Failed);
             self.collapse(
                 "runner_internal_failure",
                 fault.cause(),
@@ -461,6 +485,7 @@ impl ExecutionJob {
                 )
                 .await;
         }
+        self.run_event.leave(phase_end);
         let last_sequence = observer.last_sequence();
         let has_finalizers = !self
             .accepted
@@ -656,8 +681,21 @@ impl ExecutionJob {
         };
         let delivery = match (prepared, carriers_ready) {
             (Some(prepared), true) => {
-                self.deliver_artifacts(assignment_id, attempt_id, &artifacts, prepared)
-                    .await
+                self.run_event.enter(RunPhase::Upload);
+                let delivery = self
+                    .deliver_artifacts(assignment_id, attempt_id, &artifacts, prepared)
+                    .await;
+                self.run_event.leave(match &delivery {
+                    Ok(
+                        ArtifactDeliveryOutcome::Delivered { .. }
+                        | ArtifactDeliveryOutcome::Prepared { .. },
+                    ) => PhaseEnd::Succeeded,
+                    Ok(
+                        ArtifactDeliveryOutcome::Failed(_) | ArtifactDeliveryOutcome::AuthorityLost,
+                    )
+                    | Err(_) => PhaseEnd::Failed,
+                });
+                delivery
             }
             _ => Ok(internal_delivery_failure("preparation")),
         };

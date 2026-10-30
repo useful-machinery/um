@@ -50,6 +50,7 @@ pub use workflow::agent_input::AgentInputStaging;
 pub use workflow::archived_attempt::{
     ArchivedAttemptLoadError, load_local_archived_attempt, reconcile_current_result_publication,
 };
+pub use workflow::archived_presentation::safe_path as normalize_terminal_path;
 pub use workflow::archived_presentation::{
     ArchivedViewOutput, ineligibility_code, operational_error_code,
 };

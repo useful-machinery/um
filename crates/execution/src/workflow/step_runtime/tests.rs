@@ -4525,6 +4525,29 @@ async fn send_fixture_control(stream: &TcpStream, control: u8) -> bool {
     }
 }
 
+// REQ-WFRECOVERY-62
+#[test]
+fn recovery_handler_launch_refusal_keeps_its_cause() {
+    assert_eq!(
+        recovery_handler_launch_failure(StepStartFailure::CommandLaunch(
+            CommandLaunchFailure::NotFound
+        )),
+        RecoveryHandlerFailure::CommandLaunch(CommandLaunchFailure::NotFound)
+    );
+    assert_eq!(
+        recovery_handler_launch_failure(StepStartFailure::WorkingDirectory(
+            WorkingDirectoryFailure::ExecutionRootRebound
+        )),
+        RecoveryHandlerFailure::WorkingDirectoryUnavailable
+    );
+    assert_eq!(
+        recovery_handler_launch_failure(StepStartFailure::StepUnavailable),
+        RecoveryHandlerFailure::CommandLaunch(CommandLaunchFailure::Other(
+            CommandLaunchRefusal::new(CommandLaunchCause::LaunchTaskFailed)
+        ))
+    );
+}
+
 #[expect(
     clippy::disallowed_methods,
     reason = "real time is allowed only as an anti-hang watchdog, not a behavior assertion"

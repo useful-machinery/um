@@ -3,6 +3,7 @@
   fetchurl,
   lib,
   npmBuildPatch,
+  patchelf,
   python3,
   stdenv,
   stdenvNoCC,
@@ -29,6 +30,25 @@ let
     };
   };
   release = releases.${stdenvNoCC.hostPlatform.system};
+  # Nixpkgs' default patchelf (0.19.2 on current rolling) corrupts this prebuilt
+  # `node`: growing its program-header table moves .interp, the notes, .gnu.hash,
+  # .dynsym, .dynstr and .dynamic into a new writable first PT_LOAD that overlaps
+  # the original read-only one. The loader maps the later segment over the overlap,
+  # .dynamic becomes read-only, and node dies with SIGSEGV before printing anything
+  # (NixOS/patchelf#531, NixOS/nixpkgs#579143; the overlap fix NixOS/patchelf#672
+  # is not in a released patchelf yet). patchelf 0.15.2, Nixpkgs' default until
+  # 2026, keeps node's layout intact. Listed before autoPatchelfHook, it precedes
+  # the stdenv's patchelf on PATH for auto-patchelf and for the fixup phase's
+  # RPATH shrinking alike.
+  patchelf_0_15 = patchelf.overrideAttrs (
+    finalAttrs: _previousAttrs: {
+      version = "0.15.2";
+      src = fetchurl {
+        url = "https://github.com/NixOS/patchelf/releases/download/${finalAttrs.version}/patchelf-${finalAttrs.version}.tar.bz2";
+        hash = "sha256-F3RfVkFZyOIo/EEtplogSLhGxLa0Igt3y/IkFuAvLXw=";
+      };
+    }
+  );
 in
 stdenvNoCC.mkDerivation {
   pname = "nodejs";
@@ -50,7 +70,10 @@ stdenvNoCC.mkDerivation {
   postPatch = ''
     patch -d lib/node_modules/npm -p3 < ${npmBuildPatch}
   '';
-  nativeBuildInputs = lib.optionals stdenvNoCC.hostPlatform.isLinux [ autoPatchelfHook ];
+  nativeBuildInputs = lib.optionals stdenvNoCC.hostPlatform.isLinux [
+    patchelf_0_15
+    autoPatchelfHook
+  ];
   buildInputs = lib.optionals stdenvNoCC.hostPlatform.isLinux [ stdenv.cc.cc.lib ];
   installPhase = ''
     runHook preInstall

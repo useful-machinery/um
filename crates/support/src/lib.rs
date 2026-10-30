@@ -16,6 +16,6 @@ pub use workflow_contract::strict_json::{
     from_slice as strict_json_from_slice, from_str as strict_json_from_str,
 };
 pub use workflow_contract::{
-    is_identifier, is_lowercase_hex, is_valid_input_display_name, is_valid_media_type,
-    lowercase_hex,
+    is_diagnostic_slug, is_identifier, is_lowercase_hex, is_valid_input_display_name,
+    is_valid_media_type, lowercase_hex,
 };

@@ -89,7 +89,70 @@ pub enum CommandLaunchFailure {
     NotFound,
     PermissionDenied,
     InvalidInput,
-    Other,
+    Other(CommandLaunchRefusal),
+}
+
+/// What refused an unclassified command launch, projected as `launchFailure` and `osError`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CommandLaunchRefusal {
+    pub cause: CommandLaunchCause,
+    pub os_error: Option<i32>,
+}
+
+impl CommandLaunchRefusal {
+    pub const fn new(cause: CommandLaunchCause) -> Self {
+        Self {
+            cause,
+            os_error: None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CommandLaunchCause {
+    Spawn,
+    ProcessIdentity,
+    GuardRegistration,
+    GuardRelease,
+    StreamsUnavailable,
+    Cancelled,
+    LaunchTaskFailed,
+}
+
+impl CommandLaunchCause {
+    pub const fn slug(self) -> &'static str {
+        match self {
+            Self::Spawn => "spawn",
+            Self::ProcessIdentity => "process_identity",
+            Self::GuardRegistration => "guard_registration",
+            Self::GuardRelease => "guard_release",
+            Self::StreamsUnavailable => "streams_unavailable",
+            Self::Cancelled => "cancelled",
+            Self::LaunchTaskFailed => "launch_task_failed",
+        }
+    }
+}
+
+const fn command_launch_refused(cause: CommandLaunchCause) -> StepStartFailure {
+    StepStartFailure::CommandLaunch(CommandLaunchFailure::Other(CommandLaunchRefusal::new(
+        cause,
+    )))
+}
+
+/// A recovery handler's launch keeps a step command's classification (REQ-WFRECOVERY-62). A
+/// working directory the spawn refuses, the execution root rebound after the handler resolved
+/// it, is the handler's own `working_directory_unavailable`; any other refusal, which the
+/// launch does not produce today, is reported as an incomplete launch task.
+fn recovery_handler_launch_failure(failure: StepStartFailure) -> RecoveryHandlerFailure {
+    match failure {
+        StepStartFailure::CommandLaunch(failure) => RecoveryHandlerFailure::CommandLaunch(failure),
+        StepStartFailure::WorkingDirectory(_) => {
+            RecoveryHandlerFailure::WorkingDirectoryUnavailable
+        }
+        _ => RecoveryHandlerFailure::CommandLaunch(CommandLaunchFailure::Other(
+            CommandLaunchRefusal::new(CommandLaunchCause::LaunchTaskFailed),
+        )),
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1004,8 +1067,8 @@ where
                 }
                 CommandLaunchBoundary::Failed(failure.failure)
             }
-            Err(_) => CommandLaunchBoundary::Failed(StepStartFailure::CommandLaunch(
-                CommandLaunchFailure::Other,
+            Err(_) => CommandLaunchBoundary::Failed(command_launch_refused(
+                CommandLaunchCause::LaunchTaskFailed,
             )),
         }
     }
@@ -1036,14 +1099,14 @@ where
                 drop(context);
                 return Ok(());
             }
-            CommandLaunchBoundary::Failed(_) => {
+            CommandLaunchBoundary::Failed(failure) => {
                 drop(context);
                 return self
                     .settle_recovery_start_failure(
                         step,
                         round,
                         action,
-                        RecoveryHandlerFailure::CommandLaunchFailed,
+                        recovery_handler_launch_failure(failure),
                     )
                     .await;
             }
@@ -1057,7 +1120,9 @@ where
                     step,
                     round,
                     action,
-                    RecoveryHandlerFailure::CommandLaunchFailed,
+                    RecoveryHandlerFailure::CommandLaunch(CommandLaunchFailure::Other(
+                        CommandLaunchRefusal::new(CommandLaunchCause::ProcessIdentity),
+                    )),
                 )
                 .await;
         };
@@ -1417,7 +1482,7 @@ where
                 .settle_start_failure(
                     step,
                     action,
-                    StepStartFailure::CommandLaunch(CommandLaunchFailure::Other),
+                    command_launch_refused(CommandLaunchCause::ProcessIdentity),
                 )
                 .await;
         };
@@ -3566,14 +3631,14 @@ impl PreparedCommand {
             None => {
                 return Err(BlockingCommandLaunchFailure::after_launch(
                     launched,
-                    StepStartFailure::CommandLaunch(CommandLaunchFailure::Other),
+                    command_launch_refused(CommandLaunchCause::ProcessIdentity),
                 ));
             }
         };
         if cancellation.is_cancelled() {
             return Err(BlockingCommandLaunchFailure::after_launch(
                 launched,
-                StepStartFailure::CommandLaunch(CommandLaunchFailure::Other),
+                command_launch_refused(CommandLaunchCause::Cancelled),
             ));
         }
         let registration = match process_guards.register(
@@ -3585,7 +3650,7 @@ impl PreparedCommand {
             Err(_) => {
                 return Err(BlockingCommandLaunchFailure::after_launch(
                     launched,
-                    StepStartFailure::CommandLaunch(CommandLaunchFailure::Other),
+                    command_launch_refused(CommandLaunchCause::GuardRegistration),
                 ));
             }
         };
@@ -3593,7 +3658,7 @@ impl PreparedCommand {
         if cancellation.is_cancelled() {
             return Err(BlockingCommandLaunchFailure::after_launch(
                 launched,
-                StepStartFailure::CommandLaunch(CommandLaunchFailure::Other),
+                command_launch_refused(CommandLaunchCause::Cancelled),
             ));
         }
         if let Err(failure) = launched.release(cancellation) {
@@ -3630,7 +3695,7 @@ impl PreparedCommand {
             observer,
         } = parameters;
         if cancellation.is_cancelled() {
-            return Err(StepStartFailure::CommandLaunch(CommandLaunchFailure::Other));
+            return Err(command_launch_refused(CommandLaunchCause::Cancelled));
         }
         if !cwd.validate_execution_root() {
             return Err(StepStartFailure::WorkingDirectory(
@@ -3655,7 +3720,10 @@ impl PreparedCommand {
                     },
                 )
                 .map_err(|failure| {
-                    StepStartFailure::CommandLaunch(classify_launch_failure(&failure))
+                    StepStartFailure::CommandLaunch(classify_launch_failure(
+                        &failure,
+                        CommandLaunchCause::Spawn,
+                    ))
                 })?,
             )
         } else {
@@ -3670,7 +3738,10 @@ impl PreparedCommand {
             command.as_std_mut().process_group(0);
             cwd.bind_command(command.as_std_mut());
             let child = command.spawn().map_err(|failure| {
-                StepStartFailure::CommandLaunch(classify_launch_failure(&failure))
+                StepStartFailure::CommandLaunch(classify_launch_failure(
+                    &failure,
+                    CommandLaunchCause::Spawn,
+                ))
             })?;
             CommandChild::direct(child)?
         };
@@ -3726,7 +3797,7 @@ impl CommandChild {
                 let _ = kill_process_group(process_group, Signal::KILL);
             }
             let _ = child.start_kill();
-            return Err(StepStartFailure::CommandLaunch(CommandLaunchFailure::Other));
+            return Err(command_launch_refused(CommandLaunchCause::ProcessIdentity));
         };
         Ok(Self::Direct {
             child,
@@ -3775,7 +3846,9 @@ impl LaunchedStepBody {
         let (Some(standard_output), Some(standard_error)) =
             (child.take_stdout(), child.take_stderr())
         else {
-            return Err(StepStartFailure::CommandLaunch(CommandLaunchFailure::Other));
+            return Err(command_launch_refused(
+                CommandLaunchCause::StreamsUnavailable,
+            ));
         };
         let diagnostic = diagnostic_log.start_capture(
             step,
@@ -3841,13 +3914,19 @@ impl LaunchedStepBody {
                 if let CommandChild::Guarded(child) = child {
                     child
                         .continue_execution_cancellable(cancellation)
-                        .map_err(|failure| classify_launch_failure(&failure))?;
+                        .map_err(|failure| {
+                            classify_launch_failure(&failure, CommandLaunchCause::GuardRelease)
+                        })?;
                 }
-                registration
-                    .mark_released()
-                    .map_err(|_| CommandLaunchFailure::Other)
+                registration.mark_released().map_err(|_| {
+                    CommandLaunchFailure::Other(CommandLaunchRefusal::new(
+                        CommandLaunchCause::GuardRelease,
+                    ))
+                })
             }
-            Self::Command { .. } => Err(CommandLaunchFailure::Other),
+            Self::Command { .. } => Err(CommandLaunchFailure::Other(CommandLaunchRefusal::new(
+                CommandLaunchCause::GuardRelease,
+            ))),
         }
     }
 
@@ -4008,12 +4087,18 @@ fn resolve_program(
     Err(StepStartFailure::CommandPreparation(failure))
 }
 
-fn classify_launch_failure(failure: &io::Error) -> CommandLaunchFailure {
+pub(super) fn classify_launch_failure(
+    failure: &io::Error,
+    cause: CommandLaunchCause,
+) -> CommandLaunchFailure {
     match failure.kind() {
         io::ErrorKind::NotFound | io::ErrorKind::NotADirectory => CommandLaunchFailure::NotFound,
         io::ErrorKind::PermissionDenied => CommandLaunchFailure::PermissionDenied,
         io::ErrorKind::InvalidInput => CommandLaunchFailure::InvalidInput,
-        _ => CommandLaunchFailure::Other,
+        _ => CommandLaunchFailure::Other(CommandLaunchRefusal {
+            cause,
+            os_error: failure.raw_os_error(),
+        }),
     }
 }
 

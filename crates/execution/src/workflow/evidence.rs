@@ -7,9 +7,7 @@ use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize};
 
 use super::admission::CancellationReason;
-use super::agent::{
-    AgentFailure, AgentFailureCause, AgentHarnessFailureDetail, HarnessFailureDiagnostic,
-};
+use super::agent::{AgentFailure, AgentFailureCause};
 use super::agent_input::AgentInputStartFailure;
 use super::artifact::CaptureFailureKind;
 use super::git_capture::GitCaptureFailure;
@@ -162,8 +160,24 @@ pub struct FailureDetail {
     )]
     pub(crate) pointer: Option<Arc<str>>,
     // Transport-only sidecar. Not canonical node evidence or part of its equality.
+    // Boxed so the rarely present facts do not enlarge every node detail.
     #[serde(skip)]
-    harness_diagnostic: Option<HarnessFailureDiagnostic>,
+    diagnostic_facts: Option<Box<DiagnosticFacts>>,
+}
+
+/// Closed, safe facts projected into the runner diagnostic beside the node detail.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct DiagnosticFacts {
+    harness_error: Option<&'static str>,
+    http_status: Option<u16>,
+    harness_failure: Option<&'static str>,
+    harness_input: Option<&'static str>,
+    limit_bytes: Option<u64>,
+    observed_bytes: Option<u64>,
+    /// Finalization-only: the closed runner diagnostic never carries it (REQ-AGENT-72).
+    resets_at: Option<u64>,
+    launch_failure: Option<&'static str>,
+    os_error: Option<i32>,
 }
 
 impl PartialEq for FailureDetail {
@@ -220,7 +234,7 @@ impl<'de> Deserialize<'de> for FailureDetail {
             exit_code: wire.exit_code,
             r#ref: wire.r#ref,
             pointer: wire.pointer.map(Arc::from),
-            harness_diagnostic: None,
+            diagnostic_facts: None,
         };
         detail.validate().map_err(D::Error::custom)?;
         Ok(detail)
@@ -238,7 +252,7 @@ impl FailureDetail {
             exit_code: None,
             r#ref: None,
             pointer: None,
-            harness_diagnostic: None,
+            diagnostic_facts: None,
         }
     }
 
@@ -260,7 +274,7 @@ impl FailureDetail {
             exit_code,
             r#ref: None,
             pointer: None,
-            harness_diagnostic: None,
+            diagnostic_facts: None,
         };
         detail.validate()?;
         Ok(detail)
@@ -268,15 +282,51 @@ impl FailureDetail {
 
     /// Safe runner-protocol sibling; no message, provider text, or canonical fields.
     pub fn runner_diagnostic(&self) -> Option<serde_json::Value> {
-        let diagnostic = self.harness_diagnostic?;
+        let facts = **self.diagnostic_facts.as_ref()?;
         let mut object = serde_json::Map::new();
-        if let Some(error) = diagnostic.harness_error {
-            object.insert("harnessError".to_owned(), serde_json::json!(error));
+        let slugs = [
+            ("harnessError", facts.harness_error),
+            ("harnessFailure", facts.harness_failure),
+            ("harnessInput", facts.harness_input),
+            ("launchFailure", facts.launch_failure),
+        ];
+        for (name, slug) in slugs {
+            if let Some(slug) = slug {
+                object.insert(name.to_owned(), serde_json::json!(slug));
+            }
         }
-        if let Some(status) = diagnostic.http_status {
+        if let Some(status) = facts.http_status {
             object.insert("httpStatus".to_owned(), serde_json::json!(status));
         }
+        if let Some(os_error) = facts.os_error {
+            object.insert("osError".to_owned(), serde_json::json!(os_error));
+        }
+        // The protocol's diagnosticInteger is signed 32-bit; a larger size is omitted.
+        let sizes = [
+            ("limitBytes", facts.limit_bytes),
+            ("observedBytes", facts.observed_bytes),
+        ];
+        for (name, size) in sizes {
+            if let Some(size) = size.and_then(|size| i32::try_from(size).ok()) {
+                object.insert(name.to_owned(), serde_json::json!(size));
+            }
+        }
         (!object.is_empty()).then_some(serde_json::Value::Object(object))
+    }
+
+    /// The finalization context's issue diagnostic: the runner diagnostic plus the
+    /// provider's kept reset time as `resetsAt` (REQ-WFFINALIZE-5, REQ-AGENT-72).
+    pub(crate) fn finalization_diagnostic(&self) -> Option<serde_json::Value> {
+        let mut diagnostic = self.runner_diagnostic();
+        let reset = self
+            .diagnostic_facts
+            .as_ref()
+            .and_then(|facts| facts.resets_at)
+            .and_then(super::agent::reset_timestamp);
+        if let (Some(serde_json::Value::Object(object)), Some(reset)) = (&mut diagnostic, reset) {
+            object.insert("resetsAt".to_owned(), serde_json::json!(reset));
+        }
+        diagnostic
     }
 
     fn validate(&self) -> Result<(), EvidenceError> {
@@ -875,20 +925,31 @@ fn start_failure_detail(source: &StepStartFailure) -> Result<FailureDetail, Evid
                 }
             },
         ),
-        StepStartFailure::CommandLaunch(source) => code(
-            FailurePhase::Start,
-            match source {
-                CommandLaunchFailure::NotFound => FailureCode::CommandLaunchNotFound,
-                CommandLaunchFailure::PermissionDenied => {
-                    FailureCode::CommandLaunchPermissionDenied
-                }
-                CommandLaunchFailure::InvalidInput => FailureCode::CommandLaunchInvalidInput,
-                CommandLaunchFailure::Other => FailureCode::CommandLaunchFailed,
-            },
-        ),
+        StepStartFailure::CommandLaunch(source) => command_launch_detail(source),
     };
     detail.validate()?;
     Ok(detail)
+}
+
+fn command_launch_detail(source: &CommandLaunchFailure) -> FailureDetail {
+    let mut detail = code(
+        FailurePhase::Start,
+        match source {
+            CommandLaunchFailure::NotFound => FailureCode::CommandLaunchNotFound,
+            CommandLaunchFailure::PermissionDenied => FailureCode::CommandLaunchPermissionDenied,
+            CommandLaunchFailure::InvalidInput => FailureCode::CommandLaunchInvalidInput,
+            CommandLaunchFailure::Other(_) => FailureCode::CommandLaunchFailed,
+        },
+    );
+    // Only the unclassified launch carries facts; the classified codes name their cause.
+    if let CommandLaunchFailure::Other(refusal) = source {
+        detail.diagnostic_facts = Some(Box::new(DiagnosticFacts {
+            launch_failure: Some(refusal.cause.slug()),
+            os_error: refusal.os_error,
+            ..DiagnosticFacts::default()
+        }));
+    }
+    detail
 }
 
 fn agent_input_failure_detail(source: &AgentInputStartFailure) -> FailureDetail {
@@ -964,11 +1025,32 @@ fn agent_failure_detail(phase: FailurePhase, source: &AgentFailure) -> FailureDe
             AgentFailureCause::ResultSettlementFailed => FailureCode::ResultSettlementFailed,
         },
     );
-    if let AgentFailureCause::HarnessFailed {
-        detail: AgentHarnessFailureDetail::Classified { diagnostic, .. },
-    } = source.cause()
-    {
-        detail.harness_diagnostic = Some(*diagnostic);
+    match source.cause() {
+        AgentFailureCause::HarnessFailed {
+            detail: harness_detail,
+        } => {
+            let classified = harness_detail.diagnostic();
+            detail.diagnostic_facts = Some(Box::new(DiagnosticFacts {
+                harness_error: classified.and_then(|diagnostic| diagnostic.harness_error),
+                http_status: classified.and_then(|diagnostic| diagnostic.http_status),
+                harness_failure: Some(harness_detail.slug()),
+                resets_at: classified.and_then(|diagnostic| diagnostic.resets_at),
+                ..DiagnosticFacts::default()
+            }));
+        }
+        AgentFailureCause::HarnessInputTooLarge {
+            input,
+            admitted_bytes,
+            observed_bytes,
+        } => {
+            detail.diagnostic_facts = Some(Box::new(DiagnosticFacts {
+                harness_input: Some(input.slug()),
+                limit_bytes: Some(admitted_bytes.get()),
+                observed_bytes: Some(*observed_bytes),
+                ..DiagnosticFacts::default()
+            }));
+        }
+        _ => {}
     }
     detail
 }
@@ -1131,6 +1213,7 @@ where
 mod tests {
     use serde_json::json;
 
+    use super::super::agent::{AgentHarnessFailureDetail, HarnessFailureDiagnostic};
     use super::*;
 
     // REQ-EVIDENCE-12
@@ -1168,13 +1251,24 @@ mod tests {
         assert_eq!(classified, unclassified);
         assert_eq!(
             classified.runner_diagnostic(),
-            Some(json!({"harnessError": "rate_limited", "httpStatus": 429}))
+            Some(json!({
+                "harnessError": "rate_limited",
+                "harnessFailure": "model_error",
+                "httpStatus": 429
+            }))
         );
         assert_eq!(
             other.runner_diagnostic(),
-            Some(json!({"harnessError": "other", "httpStatus": 429}))
+            Some(json!({
+                "harnessError": "other",
+                "harnessFailure": "model_error",
+                "httpStatus": 429
+            }))
         );
-        assert_eq!(unclassified.runner_diagnostic(), None);
+        assert_eq!(
+            unclassified.runner_diagnostic(),
+            Some(json!({"harnessFailure": "model_error"}))
+        );
         assert_eq!(
             serde_json::to_value(&classified).unwrap(),
             serde_json::to_value(&unclassified).unwrap()
@@ -1183,6 +1277,155 @@ mod tests {
             !serde_json::to_string(&other.runner_diagnostic())
                 .unwrap()
                 .contains("sentinel")
+        );
+    }
+
+    // REQ-DIAG-37, REQ-EVIDENCE-12, REQ-DIAG-4
+    #[test]
+    fn harness_input_too_large_projects_the_input_and_both_sizes_beside_its_code() {
+        use super::super::agent::AgentInputKind;
+        use std::num::NonZeroU64;
+
+        let detail = |input, observed_bytes| {
+            failure_detail(
+                FailurePhase::Start,
+                &StepFailureCause::Start(StepStartFailure::Agent(AgentFailure::new(
+                    AgentFailureCause::HarnessInputTooLarge {
+                        input,
+                        admitted_bytes: NonZeroU64::new(1_048_576).unwrap(),
+                        observed_bytes,
+                    },
+                ))),
+            )
+            .unwrap()
+        };
+        let message = detail(AgentInputKind::Message, 1_048_577);
+        let system_prompt = detail(AgentInputKind::SystemPrompt, u64::from(u32::MAX));
+        assert_eq!(
+            serde_json::to_value(&message).unwrap(),
+            json!({"phase": "start", "code": "harness_input_too_large"})
+        );
+        assert_eq!(
+            message.runner_diagnostic(),
+            Some(json!({
+                "harnessInput": "message",
+                "limitBytes": 1_048_576,
+                "observedBytes": 1_048_577
+            }))
+        );
+        assert_eq!(
+            system_prompt.runner_diagnostic(),
+            Some(json!({"harnessInput": "system_prompt", "limitBytes": 1_048_576}))
+        );
+        let bare = FailureDetail::code(FailurePhase::Start, FailureCode::HarnessInputTooLarge);
+        assert_eq!(message, bare);
+        assert_eq!(system_prompt, bare);
+    }
+
+    // REQ-DIAG-38, REQ-DIAG-2
+    #[test]
+    fn unclassified_command_launch_projects_its_cause_and_os_error_beside_its_code() {
+        use super::super::step_runtime::{
+            CommandLaunchCause, CommandLaunchRefusal, classify_launch_failure,
+        };
+        use std::io;
+
+        // EAGAIN, which the operating system returns when it refuses another process.
+        let eagain = if cfg!(target_os = "macos") { 35 } else { 11 };
+        let refused = io::Error::from_raw_os_error(eagain);
+        assert_eq!(refused.kind(), io::ErrorKind::WouldBlock);
+        let detail = |failure| {
+            failure_detail(
+                FailurePhase::Start,
+                &StepFailureCause::Start(StepStartFailure::CommandLaunch(failure)),
+            )
+            .unwrap()
+        };
+        let spawn = detail(classify_launch_failure(&refused, CommandLaunchCause::Spawn));
+        let identity = detail(CommandLaunchFailure::Other(CommandLaunchRefusal::new(
+            CommandLaunchCause::ProcessIdentity,
+        )));
+        assert_eq!(
+            spawn.runner_diagnostic(),
+            Some(json!({"launchFailure": "spawn", "osError": eagain}))
+        );
+        assert_eq!(
+            identity.runner_diagnostic(),
+            Some(json!({"launchFailure": "process_identity"}))
+        );
+        let bare = json!({"phase": "start", "code": "command_launch_failed"});
+        assert_eq!(serde_json::to_value(&spawn).unwrap(), bare);
+        assert_eq!(serde_json::to_value(&identity).unwrap(), bare);
+        let classified = detail(classify_launch_failure(
+            &io::Error::from(io::ErrorKind::NotFound),
+            CommandLaunchCause::Spawn,
+        ));
+        assert_eq!(classified.code, FailureCode::CommandLaunchNotFound);
+        assert_eq!(classified.runner_diagnostic(), None);
+    }
+
+    // REQ-DIAG-36, REQ-AGENT-70, REQ-EVIDENCE-12
+    #[test]
+    fn harness_failure_projects_the_slug_of_its_canonical_detail() {
+        use super::super::agent::CanonicalHarnessFailure;
+
+        let rows = [
+            (
+                AgentHarnessFailureDetail::ModelError,
+                json!({"harnessFailure": "model_error"}),
+            ),
+            (
+                AgentHarnessFailureDetail::ModelOutputTruncated,
+                json!({"harnessFailure": "model_output_truncated"}),
+            ),
+            (
+                AgentHarnessFailureDetail::ModelAborted,
+                json!({"harnessFailure": "model_aborted"}),
+            ),
+            (
+                AgentHarnessFailureDetail::UnsuccessfulExit,
+                json!({"harnessFailure": "unsuccessful_exit"}),
+            ),
+            (
+                AgentHarnessFailureDetail::UnexpectedTerminalToolUse,
+                json!({"harnessFailure": "unexpected_terminal_tool_use"}),
+            ),
+            (
+                AgentHarnessFailureDetail::Classified {
+                    canonical: CanonicalHarnessFailure::ModelOutputTruncated,
+                    diagnostic: HarnessFailureDiagnostic::from_code(
+                        "responseStreamDisconnected",
+                        None,
+                    ),
+                },
+                json!({
+                    "harnessFailure": "model_output_truncated",
+                    "harnessError": "stream_disconnected"
+                }),
+            ),
+        ];
+        let mut serialized = Vec::new();
+        for (harness_detail, expected) in rows {
+            let detail = failure_detail(
+                FailurePhase::Execution,
+                &StepFailureCause::Execution(StepExecutionFailure::Agent(AgentFailure::new(
+                    AgentFailureCause::HarnessFailed {
+                        detail: harness_detail,
+                    },
+                ))),
+            )
+            .unwrap();
+            assert_eq!(
+                detail.runner_diagnostic(),
+                Some(expected),
+                "{harness_detail:?}"
+            );
+            serialized.push(serde_json::to_value(&detail).unwrap());
+        }
+        assert!(
+            serialized
+                .iter()
+                .all(|value| value == &json!({"phase": "execution", "code": "harness_failed"}))
         );
     }
 

@@ -7,6 +7,10 @@ use reqwest::{Method, StatusCode, Url};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
+use super::generated::models::run_linear_lifecycle::{
+    OwnershipState as LifecycleState, ReasonCode as LifecycleReason,
+};
+use super::generated::models::run_linear_lifecycle_ownership_event::EventType as LifecycleEvent;
 use super::generated::{apis, models};
 use super::http_client::{HttpClient, generated_configuration};
 use super::http_util::{self, BoundedBodyError, BufferedBlockingResponse};
@@ -26,6 +30,11 @@ const MAX_RUN_LIST_BODY_BYTES: usize = 16 * 1024 * 1024;
 pub type Run = models::Run;
 pub type RunList = models::RunList;
 pub type RunObservation = models::RunObservation;
+pub type RunLinearLifecycle = models::RunLinearLifecycle;
+pub type RunLinearLifecycleOwnershipEvent = models::RunLinearLifecycleOwnershipEvent;
+pub type RunLinearLifecycleUpdate = models::RunLinearLifecycleUpdate;
+pub(crate) type RunLinearLifecycleUpdateList = models::RunLinearLifecycleUpdateList;
+pub(crate) type RunLinearLifecycleRetryReceipt = models::RunLinearLifecycleRetryReceipt;
 pub type RunState = models::run::State;
 pub type RunCreationAcceptance = models::RunCreationAcceptance;
 pub type RunCreationPending = models::RunCreationPending;
@@ -470,6 +479,107 @@ impl<'a> RunApi<'a> {
         Ok(receipt)
     }
 
+    pub fn get_linear_lifecycle(
+        &self,
+        organization: &str,
+        run_id: &str,
+    ) -> Result<RunLinearLifecycle, RunFailure> {
+        let endpoint = format!(
+            "{}/{}/linear-lifecycle",
+            self.collection_endpoint(organization),
+            apis::urlencode(run_id)
+        );
+        let response = self.read_response(&endpoint, None)?;
+        if response.status != StatusCode::OK {
+            return Err(classify_failure(&response, RunOperation::Get));
+        }
+        require_media_type(&response, JSON_MEDIA_TYPE, false)?;
+        require_exact_header(response.cache_controls.iter(), PRIVATE_CACHE_CONTROL)?;
+        let view: RunLinearLifecycle =
+            serde_json::from_slice(&response.body).map_err(|_| RunFailure::protocol(false))?;
+        if validate_linear_lifecycle(&view) {
+            Ok(view)
+        } else {
+            Err(RunFailure::protocol(false))
+        }
+    }
+
+    pub fn list_linear_lifecycle_updates(
+        &self,
+        organization: &str,
+        run_id: &str,
+        limit: Option<u32>,
+        cursor: Option<&str>,
+    ) -> Result<RunLinearLifecycleUpdateList, RunFailure> {
+        let mut endpoint = Url::parse(&format!(
+            "{}/{}/linear-lifecycle/updates",
+            self.collection_endpoint(organization),
+            apis::urlencode(run_id)
+        ))
+        .map_err(|_| RunFailure::protocol(false))?;
+        // Opening the query writes a `?` even when no pair follows.
+        if limit.is_some() || cursor.is_some() {
+            let mut query = endpoint.query_pairs_mut();
+            if let Some(limit) = limit {
+                query.append_pair("limit", &limit.to_string());
+            }
+            if let Some(cursor) = cursor {
+                query.append_pair("cursor", cursor);
+            }
+        }
+        decode_linear_lifecycle_update_list(self.read_response(endpoint.as_str(), None)?)
+    }
+
+    /// Sends one keyed owner retry; transport recovery replays the same key, and
+    /// no unsuccessful replay establishes whether an ambiguous first request
+    /// opened the cycle.
+    pub fn retry_linear_lifecycle_update(
+        &self,
+        organization: &str,
+        run_id: &str,
+        update_id: &str,
+        key: &str,
+        begin_dispatch: impl Fn() -> bool,
+    ) -> Result<RunLinearLifecycleRetryReceipt, RunFailure> {
+        let endpoint = format!(
+            "{}/{}/linear-lifecycle/updates/{}/retry",
+            self.collection_endpoint(organization),
+            apis::urlencode(run_id),
+            apis::urlencode(update_id)
+        );
+        let (response, ambiguous) = self
+            .send_api_request_with_statuses(
+                &[StatusCode::ACCEPTED],
+                Some(key),
+                begin_dispatch,
+                || {
+                    self.request(Method::POST, &endpoint)
+                        .header("Idempotency-Key", key)
+                },
+            )
+            .map_err(|(failure, ambiguous)| {
+                if ambiguous {
+                    RunFailure::LinearLifecycleRetryAcceptanceUnknown
+                } else {
+                    failure
+                }
+            })?;
+        if response.status != StatusCode::ACCEPTED {
+            return Err(if ambiguous {
+                RunFailure::LinearLifecycleRetryAcceptanceUnknown
+            } else {
+                classify_failure(&response, RunOperation::LinearLifecycleRetry)
+            });
+        }
+        require_media_type(&response, JSON_MEDIA_TYPE, false)?;
+        require_exact_header(response.idempotency_keys.iter(), key)?;
+        require_exact_header(response.cache_controls.iter(), PRIVATE_CACHE_CONTROL)?;
+        let receipt: RunLinearLifecycleRetryReceipt =
+            serde_json::from_slice(&response.body).map_err(|_| RunFailure::protocol(false))?;
+        validate_linear_lifecycle_retry_receipt(&receipt, run_id, update_id)?;
+        Ok(receipt)
+    }
+
     pub fn cancel(
         &self,
         organization: &str,
@@ -694,6 +804,13 @@ pub enum RunFailure {
         problem_type: &'static str,
         diagnostic: Option<(&'static str, String)>,
     },
+    /// Reviewed source-admission problem fields only; never carry server prose.
+    /// `request_id` is the response's `X-Request-ID` when it is a `req_` typed id.
+    AdmissionRejected {
+        status: u16,
+        problem_type: &'static str,
+        request_id: Option<String>,
+    },
     IdempotencyConflict,
     CreationRejected,
     RetryConflict(RetryConflict),
@@ -701,6 +818,7 @@ pub enum RunFailure {
     RetryAmbiguousRateLimited,
     RetryAmbiguousAuthentication,
     ContinuationAcceptanceUnknown,
+    LinearLifecycleRetryAcceptanceUnknown,
     ContinuationAdmissionInvalid(Vec<models::ContinuationAdmissionViolation>),
     Gone,
     Unreachable(UnreachableCategory),
@@ -933,13 +1051,7 @@ fn valid_retry_failure(failure: &models::RunRetryFailure) -> bool {
         .diagnostic
         .error_type
         .as_deref()
-        .is_some_and(|value| {
-            let mut bytes = value.bytes();
-            value.len() <= 64
-                && bytes.next().is_some_and(|byte| byte.is_ascii_lowercase())
-                && bytes
-                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
-        })
+        .is_some_and(um_support::is_diagnostic_slug)
 }
 
 fn decode_create_response(
@@ -1005,6 +1117,7 @@ pub(super) enum RunOperation {
     Create,
     Get,
     Input,
+    LinearLifecycleRetry,
 }
 
 pub(super) fn classify_failure(response: &ReceivedResponse, operation: RunOperation) -> RunFailure {
@@ -1027,6 +1140,10 @@ pub(super) fn classify_failure(response: &ReceivedResponse, operation: RunOperat
         StatusCode::NOT_FOUND => {
             validated_problem_failure(response, Some(NOT_FOUND), RunFailure::NotFound, false)
         }
+        // Every retry rejection is one conflict, whatever problem type it carries.
+        StatusCode::CONFLICT if operation == RunOperation::LinearLifecycleRetry => {
+            validated_problem_failure(response, None, RunFailure::Conflict, false)
+        }
         StatusCode::CONFLICT if matches!(operation, RunOperation::Create | RunOperation::Input) => {
             match problem::decode_header_parts(
                 &response.body,
@@ -1040,9 +1157,23 @@ pub(super) fn classify_failure(response: &ReceivedResponse, operation: RunOperat
                     RunFailure::IdempotencyConflict
                 }
                 Ok(problem) if operation == RunOperation::Create => {
-                    input_admission_rejection(response, problem).unwrap_or(RunFailure::Conflict)
+                    input_admission_rejection(response, problem.clone())
+                        .or_else(|| source_admission_rejection(response, problem))
+                        .unwrap_or(RunFailure::Conflict)
                 }
                 Ok(_) => RunFailure::Conflict,
+                Err(_) => RunFailure::protocol(false),
+            }
+        }
+        StatusCode::UNPROCESSABLE_ENTITY if operation == RunOperation::Create => {
+            match problem::decode_header_parts(
+                &response.body,
+                response.status,
+                response.content_type.as_ref(),
+            ) {
+                Ok(problem) => {
+                    source_admission_rejection(response, problem).unwrap_or(RunFailure::Conflict)
+                }
                 Err(_) => RunFailure::protocol(false),
             }
         }
@@ -1126,6 +1257,48 @@ fn input_admission_rejection(
         status: response.status.as_u16(),
         problem_type,
         diagnostic,
+    })
+}
+
+// A definite source-admission rejection names only its reviewed type and the
+// response's typed request id. Server detail and title are never used.
+fn source_admission_rejection(
+    response: &ReceivedResponse,
+    problem: models::Problem,
+) -> Option<RunFailure> {
+    let problem_type = match (response.status, problem.r#type.as_str()) {
+        (
+            StatusCode::CONFLICT,
+            "https://api.usefulmachinery.com/problems/workspace-selection-unsupported",
+        ) => "workspace-selection-unsupported",
+        (
+            StatusCode::CONFLICT,
+            "https://api.usefulmachinery.com/problems/workflow-source-unavailable",
+        ) => "workflow-source-unavailable",
+        (
+            StatusCode::CONFLICT,
+            "https://api.usefulmachinery.com/problems/workspace-source-unavailable",
+        ) => "workspace-source-unavailable",
+        (
+            StatusCode::CONFLICT,
+            "https://api.usefulmachinery.com/problems/workspace-membership-unproven",
+        ) => "workspace-membership-unproven",
+        (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "https://api.usefulmachinery.com/problems/workflow-source-invalid",
+        ) => "workflow-source-invalid",
+        _ => return None,
+    };
+    let request_id = response
+        .request_ids
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .find(|value| um_support::valid_typed_id(value, "req_"))
+        .map(str::to_owned);
+    Some(RunFailure::AdmissionRejected {
+        status: response.status.as_u16(),
+        problem_type,
+        request_id,
     })
 }
 
@@ -1371,6 +1544,10 @@ fn validate_run(run: Run, requested_run_id: &str) -> Result<Run, RunFailure> {
         && valid_portable_result(&run)
         && valid_staged_continuation(&run)
         && valid_workspace_recovery(run.workspace_recovery.as_deref())
+        && run
+            .linear_lifecycle
+            .as_deref()
+            .is_none_or(validate_linear_lifecycle)
         && run.publication.as_deref().is_none_or(|handoff| {
             handoff.target.as_deref().is_none_or(|target| {
                 target.number > 0
@@ -1752,6 +1929,256 @@ fn valid_recovery_pair(
     valid_recovery_reason_for_code(code, reason)
 }
 
+// The "Binding ownership states and reason codes" table: each code names the one
+// ownership state it may accompany; awaiting_event and current carry none.
+const LINEAR_LIFECYCLE_REASON_STATES: [(LifecycleReason, LifecycleState); 18] = [
+    (LifecycleReason::TeamUnmapped, LifecycleState::Skipped),
+    (LifecycleReason::SupersededRun, LifecycleState::Superseded),
+    (
+        LifecycleReason::IssueStateChanged,
+        LifecycleState::Relinquished,
+    ),
+    (LifecycleReason::TeamChanged, LifecycleState::Stopped),
+    (LifecycleReason::LifecycleDisabled, LifecycleState::Stopped),
+    (LifecycleReason::TriggerDisabled, LifecycleState::Stopped),
+    (LifecycleReason::TriggerDeleted, LifecycleState::Stopped),
+    (LifecycleReason::GrantReplaced, LifecycleState::Stopped),
+    (
+        LifecycleReason::ConnectionDisconnected,
+        LifecycleState::Stopped,
+    ),
+    (LifecycleReason::ConnectionDeleted, LifecycleState::Stopped),
+    (LifecycleReason::ConnectionRevoked, LifecycleState::Stopped),
+    (
+        LifecycleReason::ConnectionRecoveryRequired,
+        LifecycleState::Stopped,
+    ),
+    (
+        LifecycleReason::WritePermissionLost,
+        LifecycleState::Stopped,
+    ),
+    (LifecycleReason::TeamAccessLost, LifecycleState::Stopped),
+    (
+        LifecycleReason::PrincipalUnavailable,
+        LifecycleState::Stopped,
+    ),
+    (LifecycleReason::MembershipLost, LifecycleState::Stopped),
+    (LifecycleReason::PermissionLost, LifecycleState::Stopped),
+    (
+        LifecycleReason::OrganizationUnavailable,
+        LifecycleState::Stopped,
+    ),
+];
+
+fn valid_linear_lifecycle_reason(state: LifecycleState, code: Option<LifecycleReason>) -> bool {
+    match code {
+        None => matches!(
+            state,
+            LifecycleState::AwaitingEvent | LifecycleState::Current
+        ),
+        Some(code) => LINEAR_LIFECYCLE_REASON_STATES.contains(&(code, state)),
+    }
+}
+
+// The "Update states and reason codes" table, by wire name: each code names the
+// update states it may accompany.
+const LINEAR_LIFECYCLE_UPDATE_REASON_STATES: [(&str, &[&str]); 27] = [
+    ("superseded_run", &["skipped"]),
+    ("superseded_attempt", &["skipped"]),
+    ("superseded_event", &["skipped"]),
+    ("cancellation_preserves_state", &["preserved"]),
+    ("issue_state_changed", &["stopped"]),
+    ("team_changed", &["stopped"]),
+    ("lifecycle_disabled", &["stopped"]),
+    ("trigger_disabled", &["stopped"]),
+    ("trigger_deleted", &["stopped"]),
+    ("grant_replaced", &["stopped"]),
+    ("connection_disconnected", &["stopped"]),
+    ("connection_deleted", &["stopped"]),
+    ("connection_revoked", &["stopped"]),
+    ("connection_recovery_required", &["stopped"]),
+    ("write_permission_lost", &["stopped"]),
+    ("team_access_lost", &["stopped"]),
+    ("principal_unavailable", &["stopped"]),
+    ("membership_lost", &["stopped"]),
+    ("permission_lost", &["stopped"]),
+    ("organization_unavailable", &["stopped"]),
+    ("provider_unavailable", &["retry_waiting"]),
+    ("rate_limited", &["retry_waiting"]),
+    ("issue_unavailable", &["failed"]),
+    ("state_unavailable", &["failed"]),
+    ("outcome_unresolved", &["pending", "retry_waiting"]),
+    ("internal_sync_failure", &["retry_waiting", "failed"]),
+    ("retry_exhausted", &["failed"]),
+];
+
+fn wire_name(value: impl serde::Serialize) -> Option<String> {
+    serde_json::to_value(value)
+        .ok()?
+        .as_str()
+        .map(str::to_owned)
+}
+
+fn valid_linear_lifecycle_update_reason(state: &str, code: Option<&str>) -> bool {
+    match code {
+        None => matches!(state, "pending" | "applied" | "already_satisfied"),
+        Some(code) => LINEAR_LIFECYCLE_UPDATE_REASON_STATES
+            .iter()
+            .any(|(known, states)| *known == code && states.contains(&state)),
+    }
+}
+
+// Mirrors cloudrun.LinearLifecycleUpdate.Validate: the schema closes the enums,
+// but not the reason and state pair, the preserved-only absent desired state,
+// the step-exact node, the blocking update's reason, or a diagnostic with no
+// facts.
+fn validate_linear_lifecycle_update(update: &RunLinearLifecycleUpdate) -> bool {
+    let (Some(state), Some(event_type)) = (wire_name(update.state), wire_name(update.event_type))
+    else {
+        return false;
+    };
+    let code = update.reason_code.and_then(wire_name);
+    if update.reason_code.is_some() && code.is_none() {
+        return false;
+    }
+    let nonempty = |value: &Option<String>| value.as_deref().is_none_or(|value| !value.is_empty());
+    um_support::valid_typed_id(&update.id, "llu_")
+        && um_support::valid_typed_id(&update.attempt_id, "atm_")
+        && update.attempt_number >= 1
+        && !update.event_id.is_empty()
+        && update.event_sequence >= 1
+        && valid_timestamp(&update.event_occurred_at)
+        && valid_timestamp(&update.created_at)
+        && valid_timestamp(&update.updated_at)
+        && update.cycle_number >= 1
+        && valid_timestamp(&update.cycle_deadline)
+        && update.request_count >= 0
+        && update
+            .next_attempt_at
+            .as_deref()
+            .is_none_or(valid_timestamp)
+        && valid_linear_lifecycle_update_reason(&state, code.as_deref())
+        && match update.node.as_deref() {
+            Some(node) => event_type.starts_with("step.") && !node.id.is_empty(),
+            None => !event_type.starts_with("step."),
+        }
+        && update.desired_state_id.is_none() == (state == "preserved")
+        && nonempty(&update.desired_state_id)
+        && nonempty(&update.observed_state_id)
+        && nonempty(&update.confirmed_state_id)
+        && update.blocking_update.as_deref().is_none_or(|blocking| {
+            code.as_deref() == Some("outcome_unresolved")
+                && um_support::valid_typed_id(&blocking.run_id, "run_")
+                && um_support::valid_typed_id(&blocking.update_id, "llu_")
+        })
+        && update.diagnostic.as_deref().is_none_or(|facts| {
+            let nonempty_text =
+                |value: &Option<String>| value.as_deref().is_none_or(|text| !text.is_empty());
+            (facts.cause.is_some()
+                || facts.provider_status.is_some()
+                || facts.transport_error.is_some()
+                || facts.retry_after.is_some())
+                && nonempty_text(&facts.cause)
+                && nonempty_text(&facts.transport_error)
+                && facts.retry_after.as_deref().is_none_or(valid_timestamp)
+        })
+}
+
+// Accepts one page of a run's update history: at most 100 updates, each valid
+// as the view's latest update, and a nonempty bounded cursor when present.
+fn decode_linear_lifecycle_update_list(
+    response: ReceivedResponse,
+) -> Result<RunLinearLifecycleUpdateList, RunFailure> {
+    if response.status != StatusCode::OK {
+        return Err(classify_failure(&response, RunOperation::Get));
+    }
+    require_media_type(&response, JSON_MEDIA_TYPE, false)?;
+    require_exact_header(response.cache_controls.iter(), PRIVATE_CACHE_CONTROL)?;
+    let list: RunLinearLifecycleUpdateList =
+        serde_json::from_slice(&response.body).map_err(|_| RunFailure::protocol(false))?;
+    let valid_cursor = list
+        .next_cursor
+        .as_deref()
+        .is_none_or(|cursor| !cursor.is_empty() && cursor.len() <= 2048);
+    if list.items.len() <= 100
+        && valid_cursor
+        && list.items.iter().all(validate_linear_lifecycle_update)
+    {
+        Ok(list)
+    } else {
+        Err(RunFailure::protocol(false))
+    }
+}
+
+// Mirrors cloudrun.LinearLifecycleRetryReceipt.Validate and binds the receipt to
+// the route it answers.
+fn validate_linear_lifecycle_retry_receipt(
+    receipt: &RunLinearLifecycleRetryReceipt,
+    run_id: &str,
+    update_id: &str,
+) -> Result<(), RunFailure> {
+    if receipt.run_id == run_id
+        && receipt.update_id == update_id
+        && receipt.cycle_number >= 2
+        && valid_timestamp(&receipt.accepted_at)
+        && valid_timestamp(&receipt.cycle_deadline)
+    {
+        Ok(())
+    } else {
+        Err(RunFailure::protocol(false))
+    }
+}
+
+// Mirrors cloudrun.LinearLifecycle.Validate: the schema closes the enums, but not
+// the reason and state pair, the attempt pair, the step-only event node, or the
+// latest update's own rules.
+fn validate_linear_lifecycle(view: &RunLinearLifecycle) -> bool {
+    let step_event = |event_type: LifecycleEvent| {
+        matches!(
+            event_type,
+            LifecycleEvent::StepStarted
+                | LifecycleEvent::StepSucceeded
+                | LifecycleEvent::StepFailed
+                | LifecycleEvent::StepSkipped
+                | LifecycleEvent::StepCancelled
+                | LifecycleEvent::StepBlocked
+                | LifecycleEvent::StepNotRun
+        )
+    };
+    um_support::valid_typed_id(&view.trigger_id, "trg_")
+        && view.configuration_version >= 1
+        && um_support::valid_typed_id(&view.connection_id, "lcn_")
+        && !view.workspace_id.is_empty()
+        && !view.issue_id.is_empty()
+        && valid_linear_lifecycle_reason(view.ownership_state, view.reason_code)
+        && match (view.attempt_id.as_deref(), view.attempt_number) {
+            (None, None) => true,
+            (Some(attempt_id), Some(number)) => {
+                um_support::valid_typed_id(attempt_id, "atm_") && number >= 1
+            }
+            _ => false,
+        }
+        && view.controlling_run_id.as_deref().is_none_or(|run_id| {
+            view.ownership_state == LifecycleState::Superseded
+                && um_support::valid_typed_id(run_id, "run_")
+        })
+        && view
+            .latest_update
+            .as_deref()
+            .is_none_or(validate_linear_lifecycle_update)
+        && view.ownership_event.as_deref().is_none_or(|event| {
+            !event.event_id.is_empty()
+                && event.sequence >= 1
+                && valid_timestamp(&event.occurred_at)
+                && um_support::valid_typed_id(&event.attempt_id, "atm_")
+                && event.attempt_number >= 1
+                && event
+                    .node
+                    .as_deref()
+                    .is_none_or(|node| step_event(event.event_type) && !node.id.is_empty())
+        })
+}
+
 fn valid_recovery_reason_for_code(code: &str, reason: models::RecoveryReason) -> bool {
     use models::RecoveryReason as Reason;
     let unavailable = matches!(
@@ -1796,6 +2223,7 @@ mod recovery_read_tests {
                 locations: vec![],
                 cache_controls: vec![HeaderValue::from_static(PRIVATE_CACHE_CONTROL)],
                 retry_afters: vec![],
+                request_ids: vec![],
                 body: serde_json::to_vec(&document).unwrap(),
             },
             run_id,
@@ -1828,6 +2256,7 @@ mod recovery_read_tests {
                     locations: vec![],
                     cache_controls: vec![HeaderValue::from_static(PRIVATE_CACHE_CONTROL)],
                     retry_afters: vec![],
+                    request_ids: vec![],
                     body: serde_json::to_vec(value).unwrap(),
                 },
                 &run_id,
@@ -1943,6 +2372,7 @@ mod recovery_read_tests {
             locations: vec![],
             cache_controls: vec![],
             retry_afters: vec![],
+            request_ids: vec![],
             body: serde_json::to_vec(&serde_json::json!({
                 "type": "https://api.usefulmachinery.com/problems/continuation-admission-invalid",
                 "title": "Admission invalid", "status": 409,
@@ -1975,6 +2405,7 @@ mod recovery_read_tests {
             locations: vec![],
             cache_controls: vec![],
             retry_afters: vec![],
+            request_ids: vec![],
             body: serde_json::to_vec(&serde_json::json!({
                 "type": "https://api.usefulmachinery.com/problems/run-input-content-gone",
                 "title": "Input content gone", "status": 410
@@ -2044,6 +2475,7 @@ mod recovery_read_tests {
             locations: vec![],
             cache_controls: vec![HeaderValue::from_static(PRIVATE_CACHE_CONTROL)],
             retry_afters: vec![],
+            request_ids: vec![],
             body: serde_json::to_vec(run).unwrap(),
         };
         assert!(matches!(
@@ -2171,6 +2603,122 @@ mod recovery_read_tests {
             .unwrap()
             .remove("targetRunnerBootId");
         assert!(serde_json::from_value::<models::RunContinuationEnvelope>(document).is_err());
+    }
+
+    fn create_problem_response(
+        status: StatusCode,
+        slug: &str,
+        request_ids: &[&'static str],
+    ) -> BufferedBlockingResponse {
+        BufferedBlockingResponse {
+            status,
+            content_type: Some(HeaderValue::from_static("application/problem+json")),
+            idempotency_keys: vec![],
+            locations: vec![],
+            cache_controls: vec![],
+            retry_afters: vec![],
+            request_ids: request_ids
+                .iter()
+                .map(|value| HeaderValue::from_static(value))
+                .collect(),
+            body: serde_json::to_vec(&serde_json::json!({
+                "type": format!("https://api.usefulmachinery.com/problems/{slug}"),
+                "title": "Server title", "status": status.as_u16(),
+                "detail": "Server detail"
+            }))
+            .unwrap(),
+        }
+    }
+
+    // REQ-RUN-80
+    #[test]
+    fn source_admission_problem_on_create_is_a_definite_rejection_with_request_id() {
+        let request_id = "req_01m622k6qsf09npetkmdkdj51j";
+        assert_eq!(
+            classify_failure(
+                &create_problem_response(
+                    StatusCode::CONFLICT,
+                    "workspace-selection-unsupported",
+                    &[request_id],
+                ),
+                RunOperation::Create,
+            ),
+            RunFailure::AdmissionRejected {
+                status: 409,
+                problem_type: "workspace-selection-unsupported",
+                request_id: Some(request_id.to_owned()),
+            }
+        );
+    }
+
+    // REQ-RUN-80
+    #[test]
+    fn source_admission_rejection_omits_an_absent_or_untyped_request_id() {
+        for request_ids in [&["not-an-id"][..], &[]] {
+            assert_eq!(
+                classify_failure(
+                    &create_problem_response(
+                        StatusCode::CONFLICT,
+                        "workspace-selection-unsupported",
+                        request_ids,
+                    ),
+                    RunOperation::Create,
+                ),
+                RunFailure::AdmissionRejected {
+                    status: 409,
+                    problem_type: "workspace-selection-unsupported",
+                    request_id: None,
+                }
+            );
+        }
+    }
+
+    // REQ-RUN-80
+    #[test]
+    fn invalid_workflow_source_on_create_is_a_definite_rejection() {
+        assert_eq!(
+            classify_failure(
+                &create_problem_response(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "workflow-source-invalid",
+                    &[],
+                ),
+                RunOperation::Create,
+            ),
+            RunFailure::AdmissionRejected {
+                status: 422,
+                problem_type: "workflow-source-invalid",
+                request_id: None,
+            }
+        );
+    }
+
+    // REQ-RUN-80
+    #[test]
+    fn unlisted_create_conflict_stays_a_conflict() {
+        assert_eq!(
+            classify_failure(
+                &create_problem_response(StatusCode::CONFLICT, "project-not-ready", &[]),
+                RunOperation::Create,
+            ),
+            RunFailure::Conflict
+        );
+    }
+
+    // REQ-RUN-57
+    #[test]
+    fn source_resolution_outage_on_create_stays_unconfirmed() {
+        assert_eq!(
+            classify_failure(
+                &create_problem_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "source-resolution-unavailable",
+                    &["req_01m622k6qsf09npetkmdkdj51j"],
+                ),
+                RunOperation::Create,
+            ),
+            RunFailure::Unreachable(UnreachableCategory::Server)
+        );
     }
 }
 
@@ -2331,5 +2879,397 @@ impl fmt::Display for RunApiError {
             ),
             Self::BuildClient(error) => write!(formatter, "prepare Cloud run networking: {error}"),
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::disallowed_macros,
+    clippy::unwrap_used,
+    reason = "lifecycle view tests use assertions and fixture extraction"
+)]
+mod linear_lifecycle_tests {
+    use super::*;
+
+    const STATES: [&str; 6] = [
+        "awaiting_event",
+        "current",
+        "skipped",
+        "superseded",
+        "relinquished",
+        "stopped",
+    ];
+    // The "Binding ownership states and reason codes" table, one row per code.
+    const TABLE: [(&str, &str); 18] = [
+        ("team_unmapped", "skipped"),
+        ("superseded_run", "superseded"),
+        ("issue_state_changed", "relinquished"),
+        ("team_changed", "stopped"),
+        ("lifecycle_disabled", "stopped"),
+        ("trigger_disabled", "stopped"),
+        ("trigger_deleted", "stopped"),
+        ("grant_replaced", "stopped"),
+        ("connection_disconnected", "stopped"),
+        ("connection_deleted", "stopped"),
+        ("connection_revoked", "stopped"),
+        ("connection_recovery_required", "stopped"),
+        ("write_permission_lost", "stopped"),
+        ("team_access_lost", "stopped"),
+        ("principal_unavailable", "stopped"),
+        ("membership_lost", "stopped"),
+        ("permission_lost", "stopped"),
+        ("organization_unavailable", "stopped"),
+    ];
+
+    fn view(state: &str, code: Option<&str>) -> serde_json::Value {
+        let mut view = serde_json::json!({
+            "triggerId": "trg_01k0z6r1w8f4jy2m7q9v3x5abc",
+            "configurationVersion": 1,
+            "connectionId": "lcn_01k0z6r1w8f4jy2m7q9v3x5abc",
+            "workspaceId": "a3b2c1d0-1111-4222-8333-944455556666",
+            "issueId": "b4c3d2e1-2222-4333-8444-955566667777",
+            "ownershipState": state,
+        });
+        if let Some(code) = code {
+            view["reasonCode"] = serde_json::json!(code);
+        }
+        view
+    }
+
+    fn accepted(value: &serde_json::Value) -> bool {
+        serde_json::from_value::<RunLinearLifecycle>(value.clone())
+            .is_ok_and(|view| validate_linear_lifecycle(&view))
+    }
+
+    // REQ-TRIGGER-107
+    #[test]
+    fn linear_lifecycle_accepts_exactly_the_reason_and_state_table() {
+        for state in STATES {
+            assert_eq!(
+                accepted(&view(state, None)),
+                matches!(state, "awaiting_event" | "current"),
+                "{state} without a code"
+            );
+        }
+        for (code, required) in TABLE {
+            for state in STATES {
+                assert_eq!(
+                    accepted(&view(state, Some(code))),
+                    state == required,
+                    "{code} with {state}"
+                );
+            }
+        }
+        assert!(!accepted(&view("stopped", Some("unclassified"))));
+        assert!(!accepted(&view("released", None)));
+    }
+
+    // REQ-TRIGGER-107
+    #[test]
+    fn linear_lifecycle_refuses_half_attempts_stray_nodes_and_bad_identities() {
+        let event = serde_json::json!({
+            "eventId": "evt-1", "eventType": "step.started", "sequence": 4,
+            "occurredAt": "2026-10-26T12:00:00Z",
+            "attemptId": "atm_01k0z6r1w8f4jy2m7q9v3x5abc", "attemptNumber": 1,
+            "node": {"scope": [], "role": "step", "id": "build"}
+        });
+        let mut complete = view("current", None);
+        complete["attemptId"] = serde_json::json!("atm_01k0z6r1w8f4jy2m7q9v3x5abc");
+        complete["attemptNumber"] = serde_json::json!(1);
+        complete["ownershipEvent"] = event;
+        assert!(accepted(&complete));
+        for member in ["attemptId", "attemptNumber"] {
+            let mut half = complete.clone();
+            half.as_object_mut().unwrap().remove(member);
+            assert!(!accepted(&half), "attempt pair without {member}");
+        }
+        for event_type in ["run.started", "publication.published"] {
+            let mut stray = complete.clone();
+            stray["ownershipEvent"]["eventType"] = serde_json::json!(event_type);
+            assert!(!accepted(&stray), "node on {event_type}");
+            stray["ownershipEvent"]
+                .as_object_mut()
+                .unwrap()
+                .remove("node");
+            assert!(accepted(&stray), "{event_type} without a node");
+        }
+        let mut incomplete = complete.clone();
+        incomplete["ownershipEvent"]
+            .as_object_mut()
+            .unwrap()
+            .remove("sequence");
+        assert!(!accepted(&incomplete));
+        let mut controlling = complete.clone();
+        controlling["controllingRunId"] = serde_json::json!("run_01k0z6r1w8f4jy2m7q9v3x5abc");
+        assert!(!accepted(&controlling)); // Only a superseded binding names a controller.
+        for (member, value) in [
+            ("triggerId", serde_json::json!("trigger-1")),
+            (
+                "connectionId",
+                serde_json::json!("rpc_01k0z6r1w8f4jy2m7q9v3x5abc"),
+            ),
+            ("configurationVersion", serde_json::json!(0)),
+            ("workspaceId", serde_json::json!("")),
+        ] {
+            let mut invalid = view("awaiting_event", None);
+            invalid[member] = value;
+            assert!(!accepted(&invalid), "{member}");
+        }
+    }
+
+    const UPDATE_STATES: [&str; 8] = [
+        "pending",
+        "retry_waiting",
+        "applied",
+        "already_satisfied",
+        "preserved",
+        "skipped",
+        "failed",
+        "stopped",
+    ];
+    // The "Update states and reason codes" table, one row per code.
+    const UPDATE_TABLE: [(&str, &[&str]); 27] = [
+        ("superseded_run", &["skipped"]),
+        ("superseded_attempt", &["skipped"]),
+        ("superseded_event", &["skipped"]),
+        ("cancellation_preserves_state", &["preserved"]),
+        ("issue_state_changed", &["stopped"]),
+        ("team_changed", &["stopped"]),
+        ("lifecycle_disabled", &["stopped"]),
+        ("trigger_disabled", &["stopped"]),
+        ("trigger_deleted", &["stopped"]),
+        ("grant_replaced", &["stopped"]),
+        ("connection_disconnected", &["stopped"]),
+        ("connection_deleted", &["stopped"]),
+        ("connection_revoked", &["stopped"]),
+        ("connection_recovery_required", &["stopped"]),
+        ("write_permission_lost", &["stopped"]),
+        ("team_access_lost", &["stopped"]),
+        ("principal_unavailable", &["stopped"]),
+        ("membership_lost", &["stopped"]),
+        ("permission_lost", &["stopped"]),
+        ("organization_unavailable", &["stopped"]),
+        ("provider_unavailable", &["retry_waiting"]),
+        ("rate_limited", &["retry_waiting"]),
+        ("issue_unavailable", &["failed"]),
+        ("state_unavailable", &["failed"]),
+        ("outcome_unresolved", &["pending", "retry_waiting"]),
+        ("internal_sync_failure", &["retry_waiting", "failed"]),
+        ("retry_exhausted", &["failed"]),
+    ];
+
+    // A view whose latest update is in state with code; the desired state
+    // follows the preserved rule so only the pair varies.
+    fn with_update(state: &str, code: Option<&str>) -> serde_json::Value {
+        let mut update = serde_json::json!({
+            "id": "llu_01k0z6r1w8f4jy2m7q9v3x5abc",
+            "attemptId": "atm_01k0z6r1w8f4jy2m7q9v3x5abc", "attemptNumber": 1,
+            "eventId": "evt-2", "eventType": "run.started", "eventSequence": 2,
+            "eventOccurredAt": "2026-10-26T12:01:00Z",
+            "createdAt": "2026-10-26T12:01:01Z", "updatedAt": "2026-10-26T12:01:01Z",
+            "state": state, "cycleNumber": 1, "cycleDeadline": "2026-10-27T12:01:00Z",
+            "requestCount": 0, "retryable": false,
+        });
+        if state != "preserved" {
+            update["desiredStateId"] = serde_json::json!("state-progress");
+        }
+        if let Some(code) = code {
+            update["reasonCode"] = serde_json::json!(code);
+        }
+        let mut view = view("awaiting_event", None);
+        view["latestUpdate"] = update;
+        view
+    }
+
+    // REQ-TRIGGER-111
+    #[test]
+    fn linear_lifecycle_update_accepts_exactly_the_reason_and_state_table() {
+        for state in UPDATE_STATES {
+            assert_eq!(
+                accepted(&with_update(state, None)),
+                matches!(state, "pending" | "applied" | "already_satisfied"),
+                "{state} without a code"
+            );
+        }
+        for (code, allowed) in UPDATE_TABLE {
+            for state in UPDATE_STATES {
+                assert_eq!(
+                    accepted(&with_update(state, Some(code))),
+                    allowed.contains(&state),
+                    "{code} with {state}"
+                );
+            }
+        }
+        assert!(!accepted(&with_update("failed", Some("unclassified"))));
+        assert!(!accepted(&with_update("queued", None)));
+    }
+
+    // REQ-TRIGGER-111
+    #[test]
+    fn linear_lifecycle_update_refuses_stray_members() {
+        let mut complete = with_update("retry_waiting", Some("outcome_unresolved"));
+        let update = &mut complete["latestUpdate"];
+        update["eventType"] = serde_json::json!("step.failed");
+        update["node"] = serde_json::json!({"scope": [], "role": "step", "id": "build"});
+        update["observedStateId"] = serde_json::json!("state-todo");
+        update["confirmedStateId"] = serde_json::json!("state-todo");
+        update["nextAttemptAt"] = serde_json::json!("2026-10-26T12:05:00Z");
+        update["requestCount"] = serde_json::json!(2);
+        update["retryable"] = serde_json::json!(true);
+        update["blockingUpdate"] = serde_json::json!({
+            "runId": "run_01k0z6r1w8f4jy2m7q9v3x5abc",
+            "updateId": "llu_01k0z6r1w8f4jy2m7q9v3x5abd"
+        });
+        assert!(accepted(&complete));
+        let refused = |member: &str, value: Option<serde_json::Value>| {
+            let mut changed = complete.clone();
+            let update = changed["latestUpdate"].as_object_mut().unwrap();
+            match value {
+                Some(value) => update.insert(member.to_owned(), value),
+                None => update.remove(member),
+            };
+            !accepted(&changed)
+        };
+        assert!(refused("node", None), "step event without its node");
+        assert!(refused("eventType", Some(serde_json::json!("run.failed"))));
+        assert!(refused("id", Some(serde_json::json!("update-1"))));
+        assert!(refused("cycleNumber", Some(serde_json::json!(0))));
+        assert!(refused("requestCount", Some(serde_json::json!(-1))));
+        assert!(refused("desiredStateId", None));
+        assert!(refused("desiredStateId", Some(serde_json::json!(""))));
+        assert!(refused(
+            "cycleDeadline",
+            Some(serde_json::json!("tomorrow"))
+        ));
+        assert!(refused(
+            "reasonCode",
+            Some(serde_json::json!("rate_limited"))
+        ));
+        assert!(refused(
+            "blockingUpdate",
+            Some(
+                serde_json::json!({"runId": "run-1", "updateId": "llu_01k0z6r1w8f4jy2m7q9v3x5abd"})
+            )
+        ));
+        let mut preserved = with_update("preserved", Some("cancellation_preserves_state"));
+        assert!(accepted(&preserved));
+        preserved["latestUpdate"]["desiredStateId"] = serde_json::json!("state-done");
+        assert!(
+            !accepted(&preserved),
+            "preserved update with a desired state"
+        );
+    }
+
+    // REQ-TRIGGER-111
+    #[test]
+    fn linear_lifecycle_update_refuses_an_empty_diagnostic() {
+        let mut exhausted = with_update("failed", Some("retry_exhausted"));
+        exhausted["latestUpdate"]["retryable"] = serde_json::json!(true);
+        exhausted["latestUpdate"]["diagnostic"] = serde_json::json!({
+            "cause": "provider_unavailable", "providerStatus": 503,
+            "transportError": "timed_out", "retryAfter": "2026-10-26T12:10:00Z"
+        });
+        assert!(accepted(&exhausted));
+        let with_diagnostic = |diagnostic: serde_json::Value| {
+            let mut changed = exhausted.clone();
+            changed["latestUpdate"]["diagnostic"] = diagnostic;
+            accepted(&changed)
+        };
+        assert!(with_diagnostic(
+            serde_json::json!({"cause": "provider_unavailable"})
+        ));
+        assert!(!with_diagnostic(serde_json::json!({})), "empty diagnostic");
+        assert!(!with_diagnostic(serde_json::json!({"cause": ""})));
+        assert!(!with_diagnostic(serde_json::json!({"retryAfter": "later"})));
+        assert!(!with_diagnostic(
+            serde_json::json!({"providerStatus": "503"})
+        ));
+    }
+
+    fn history_response(
+        page: &serde_json::Value,
+        cache_control: Option<&'static str>,
+    ) -> ReceivedResponse {
+        BufferedBlockingResponse {
+            status: StatusCode::OK,
+            content_type: Some(HeaderValue::from_static("application/json")),
+            idempotency_keys: vec![],
+            locations: vec![],
+            cache_controls: cache_control
+                .into_iter()
+                .map(HeaderValue::from_static)
+                .collect(),
+            retry_afters: vec![],
+            request_ids: vec![],
+            body: serde_json::to_vec(page).unwrap(),
+        }
+    }
+
+    // REQ-TRIGGER-118, REQ-TRIGGER-111
+    #[test]
+    fn linear_lifecycle_history_accepts_only_valid_pages() {
+        let update =
+            |state: &str, code: Option<&str>| with_update(state, code)["latestUpdate"].clone();
+        let mut exhausted = update("failed", Some("retry_exhausted"));
+        exhausted["retryable"] = serde_json::json!(true);
+        exhausted["diagnostic"] = serde_json::json!({"cause": "provider_unavailable"});
+        let page = serde_json::json!({
+            "items": [update("pending", None), exhausted],
+            "nextCursor": "opaque-cursor"
+        });
+        let read = |page: &serde_json::Value| {
+            decode_linear_lifecycle_update_list(history_response(page, Some(PRIVATE_CACHE_CONTROL)))
+        };
+        let list = read(&page).unwrap();
+        assert_eq!(list.items.len(), 2);
+        assert_eq!(list.next_cursor.as_deref(), Some("opaque-cursor"));
+        assert_eq!(
+            list.items[1]
+                .diagnostic
+                .as_deref()
+                .and_then(|facts| facts.cause.as_deref()),
+            Some("provider_unavailable")
+        );
+        assert!(
+            read(&serde_json::json!({"items": []})).is_ok_and(|list| list.next_cursor.is_none())
+        );
+        assert!(
+            decode_linear_lifecycle_update_list(history_response(&page, None)).is_err(),
+            "missing Cache-Control"
+        );
+        let refused = |change: &dyn Fn(&mut serde_json::Value)| {
+            let mut changed = page.clone();
+            change(&mut changed);
+            read(&changed).is_err()
+        };
+        assert!(refused(
+            &|page| page["items"][0]["state"] = serde_json::json!("skipped")
+        ));
+        assert!(refused(
+            &|page| page["items"][1]["diagnostic"] = serde_json::json!({})
+        ));
+        assert!(refused(&|page| page["nextCursor"] = serde_json::json!("")));
+        assert!(refused(&|page| {
+            page["items"] = serde_json::Value::Array(vec![update("pending", None); 101]);
+        }));
+    }
+
+    // REQ-TRIGGER-107
+    #[test]
+    fn linear_lifecycle_invalid_view_makes_the_run_read_invalid() {
+        let mut document: serde_json::Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/run-continuation-pending.json"
+        ))
+        .unwrap();
+        let run = &mut document["run"];
+        let run_id = run["id"].as_str().unwrap().to_owned();
+        let valid = |value: &serde_json::Value| {
+            let run: models::Run = serde_json::from_value(value.clone()).unwrap();
+            validate_run(run, &run_id).is_ok()
+        };
+        run["linearLifecycle"] = view("skipped", Some("team_unmapped"));
+        assert!(valid(run));
+        run["linearLifecycle"] = view("awaiting_event", Some("team_unmapped"));
+        assert!(!valid(run));
     }
 }

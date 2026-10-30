@@ -104,6 +104,7 @@ const DROPPED_COUNT: &str = "um.telemetry.dropped_count";
 const DURATION_MS: &str = "duration_ms";
 const TRACE_ID: &str = "trace_id";
 const SPAN_ID: &str = "span_id";
+const PARENT_SPAN_ID: &str = "parent_span_id";
 const EVENT_QUEUE_CAPACITY: usize = 128;
 const EVENT_QUEUE_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(50);
 
@@ -114,6 +115,9 @@ pub(crate) enum Outcome {
     Cancelled,
     Timeout,
     Disconnected,
+    // An offer the runner took and then rejected: not an error, as the
+    // gateway treats a 4xx response (REQ-TELEMETRY-6).
+    Rejected,
 }
 
 impl Outcome {
@@ -124,6 +128,7 @@ impl Outcome {
             Self::Cancelled => "cancelled",
             Self::Timeout => "timeout",
             Self::Disconnected => "disconnected",
+            Self::Rejected => "rejected",
         }
     }
 
@@ -285,11 +290,19 @@ impl<W: Write> FramedWriter<W> {
 
 pub(crate) struct Recorder {
     provider: SdkTracerProvider,
+    source: EventSource,
+}
+
+// EventSource is what starting an event needs: the tracer, the sink and the
+// service identity. The recorder holds one and every event keeps a clone, so a
+// child event starts from its parent without a recorder handle.
+#[derive(Clone)]
+struct EventSource {
     tracer: SdkTracer,
     writer: Arc<dyn EventWriter>,
+    dropped_count: Arc<AtomicU64>,
     service_version: Arc<str>,
     service_instance_id: Arc<str>,
-    dropped_count: Arc<AtomicU64>,
 }
 
 impl fmt::Debug for Recorder {
@@ -322,11 +335,11 @@ impl Recorder {
     }
 
     pub(crate) fn service_version(&self) -> &str {
-        &self.service_version
+        &self.source.service_version
     }
 
     pub(crate) fn boot_id(&self) -> &str {
-        &self.service_instance_id
+        &self.source.service_instance_id
     }
 
     #[cfg(test)]
@@ -355,14 +368,51 @@ impl Recorder {
         let tracer = provider.tracer("um-runner");
         Self {
             provider,
-            tracer,
-            writer,
-            service_version: Arc::from(service_version),
-            service_instance_id: Arc::from(service_instance_id),
-            dropped_count,
+            source: EventSource {
+                tracer,
+                writer,
+                dropped_count,
+                service_version: Arc::from(service_version),
+                service_instance_id: Arc::from(service_instance_id),
+            },
         }
     }
 
+    pub(crate) fn start(
+        &self,
+        name: &'static str,
+        attributes: impl IntoIterator<Item = KeyValue>,
+    ) -> Event {
+        self.source.start(&Context::new(), name, attributes)
+    }
+
+    // record writes one instantaneous, reviewed diagnostic without creating a
+    // main event or span. Protocol call sites pass decoded fields only; this
+    // interface must never receive credentials, raw frames, or peer reasons.
+    pub(crate) fn record(
+        &self,
+        name: &'static str,
+        attributes: impl IntoIterator<Item = KeyValue>,
+    ) {
+        let mut fields = Map::new();
+        for attribute in self
+            .source
+            .common_attributes(false)
+            .into_iter()
+            .chain(attributes)
+        {
+            if let Some(value) = json_value(&attribute.value) {
+                fields.insert(attribute.key.as_str().to_owned(), value);
+            }
+        }
+        fields.insert(EVENT_NAME.to_owned(), Value::String(name.to_owned()));
+        if self.source.writer.write(&fields).is_err() {
+            self.source.dropped_count.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+}
+
+impl EventSource {
     fn common_attributes(&self, main: bool) -> [KeyValue; 5] {
         [
             KeyValue::new(MAIN, main),
@@ -373,8 +423,13 @@ impl Recorder {
         ]
     }
 
-    pub(crate) fn start(
+    // start opens one main event whose span is a child of the span in
+    // `parent`, or a root when `parent` carries no valid span. A child's local
+    // record names its parent as `parent_span_id` from the start, so the two
+    // sinks link the same way; `trace_id` and `span_id` are written at finish.
+    fn start(
         &self,
+        parent: &Context,
         name: &'static str,
         attributes: impl IntoIterator<Item = KeyValue>,
     ) -> Event {
@@ -387,18 +442,24 @@ impl Recorder {
             }
         }
         fields.insert(EVENT_NAME.to_owned(), Value::String(name.to_owned()));
+        let parent_span_context = parent.span().span_context().clone();
+        if parent_span_context.is_valid() {
+            fields.insert(
+                PARENT_SPAN_ID.to_owned(),
+                Value::String(parent_span_context.span_id().to_string()),
+            );
+        }
 
         let span = self
             .tracer
             .span_builder(name)
             .with_kind(SpanKind::Internal)
             .with_attributes(span_attributes)
-            .start_with_context(&self.tracer, &Context::new());
+            .start_with_context(&self.tracer, parent);
         Event {
             inner: Arc::new(EventInner {
                 context: Context::new().with_span(span),
-                writer: Arc::clone(&self.writer),
-                dropped_count: Arc::clone(&self.dropped_count),
+                source: self.clone(),
                 started_at: um_support::monotonic_now(),
                 state: Mutex::new(EventState {
                     fields,
@@ -406,26 +467,6 @@ impl Recorder {
                 }),
                 name,
             }),
-        }
-    }
-
-    // record writes one instantaneous, reviewed diagnostic without creating a
-    // main event or span. Protocol call sites pass decoded fields only; this
-    // interface must never receive credentials, raw frames, or peer reasons.
-    pub(crate) fn record(
-        &self,
-        name: &'static str,
-        attributes: impl IntoIterator<Item = KeyValue>,
-    ) {
-        let mut fields = Map::new();
-        for attribute in self.common_attributes(false).into_iter().chain(attributes) {
-            if let Some(value) = json_value(&attribute.value) {
-                fields.insert(attribute.key.as_str().to_owned(), value);
-            }
-        }
-        fields.insert(EVENT_NAME.to_owned(), Value::String(name.to_owned()));
-        if self.writer.write(&fields).is_err() {
-            self.dropped_count.fetch_add(1, Ordering::AcqRel);
         }
     }
 }
@@ -447,8 +488,7 @@ pub(crate) struct Event {
 
 struct EventInner {
     context: Context,
-    writer: Arc<dyn EventWriter>,
-    dropped_count: Arc<AtomicU64>,
+    source: EventSource,
     started_at: Instant,
     state: Mutex<EventState>,
     name: &'static str,
@@ -469,6 +509,18 @@ impl fmt::Debug for Event {
 }
 
 impl Event {
+    // child starts a main event whose span is a child of this event's span,
+    // with the same attribute shape as `Recorder::start`.
+    pub(crate) fn child(
+        &self,
+        name: &'static str,
+        attributes: impl IntoIterator<Item = KeyValue>,
+    ) -> Event {
+        self.inner
+            .source
+            .start(&self.inner.context, name, attributes)
+    }
+
     pub(crate) fn inject_trace_context(&self, injector: &mut dyn Injector) {
         TraceContextPropagator::new().inject_context(&self.inner.context, injector);
     }
@@ -517,7 +569,7 @@ impl Event {
                 .fields
                 .insert(DURATION_MS.to_owned(), Value::Number(duration_ms.into()));
             let span = self.inner.context.span();
-            let prior_dropped_count = self.inner.dropped_count.swap(0, Ordering::AcqRel);
+            let prior_dropped_count = self.inner.source.dropped_count.swap(0, Ordering::AcqRel);
             if prior_dropped_count > 0 {
                 let count = integer(prior_dropped_count);
                 state
@@ -550,8 +602,9 @@ impl Event {
             (event, prior_dropped_count)
         };
 
-        if self.inner.writer.write(&event).is_err() {
+        if self.inner.source.writer.write(&event).is_err() {
             self.inner
+                .source
                 .dropped_count
                 .fetch_add(prior_dropped_count.saturating_add(1), Ordering::AcqRel);
         }
@@ -698,11 +751,12 @@ mod tests {
     use std::thread;
 
     use opentelemetry::KeyValue;
+    use opentelemetry::trace::SpanId;
     use serde_json::Value;
 
     use super::{
-        DROPPED_COUNT, EventWriter, FramedWriter, Outcome, QueuedWriter, Recorder, TestCapture,
-        test_recorder,
+        DROPPED_COUNT, EventWriter, FramedWriter, Outcome, QueuedWriter, Recorder,
+        TEST_SERVICE_VERSION, TestCapture, test_recorder,
     };
 
     // REQ-TELEMETRY-2
@@ -763,6 +817,74 @@ mod tests {
         assert_eq!(
             span_attribute("um.outcome"),
             Some(&opentelemetry::Value::String("success".into()))
+        );
+    }
+
+    // REQ-TELEMETRY-24
+    #[test]
+    fn a_child_event_is_linked_to_its_parent_on_both_sinks() {
+        let (recorder, capture) = test_recorder("rbt_fixture");
+        let parent = recorder.start("runner.run", [KeyValue::new("fixture.run", "run_1")]);
+        let child = parent.child(
+            "runner.run.checkout",
+            [KeyValue::new("fixture.phase", "checkout")],
+        );
+        child.finish(Outcome::Rejected);
+        parent.finish(Outcome::Success);
+
+        let child_event = capture.event("runner.run.checkout");
+        let parent_event = capture.event("runner.run");
+        assert_eq!(child_event["trace_id"], parent_event["trace_id"]);
+        assert_eq!(child_event["parent_span_id"], parent_event["span_id"]);
+        assert!(child_event["span_id"].is_string());
+        assert_ne!(child_event["span_id"], parent_event["span_id"]);
+        assert!(parent_event.get("parent_span_id").is_none());
+        assert_eq!(child_event["um.main"], true);
+        assert_eq!(child_event["um.event.schema_version"], 1);
+        assert_eq!(child_event["service.name"], "um-runner");
+        assert_eq!(child_event["service.version"], TEST_SERVICE_VERSION);
+        assert_eq!(child_event["service.instance.id"], "rbt_fixture");
+        assert_eq!(child_event["fixture.phase"], "checkout");
+        assert_eq!(child_event["um.outcome"], "rejected");
+
+        let spans = capture.spans();
+        assert_eq!(spans.len(), 2);
+        let span = |name: &str| {
+            spans
+                .iter()
+                .find(|span| &*span.name == name)
+                .unwrap_or_else(|| panic!("span {name} exported"))
+        };
+        let parent_span = span("runner.run");
+        let child_span = span("runner.run.checkout");
+        assert_eq!(
+            child_span.span_context.trace_id(),
+            parent_span.span_context.trace_id()
+        );
+        assert_eq!(
+            child_span.parent_span_id,
+            parent_span.span_context.span_id()
+        );
+        assert_eq!(parent_span.parent_span_id, SpanId::INVALID);
+        assert_eq!(
+            child_event["span_id"],
+            child_span.span_context.span_id().to_string()
+        );
+        assert_eq!(child_span.status, opentelemetry::trace::Status::Unset);
+        let child_attribute = |name: &str| {
+            child_span
+                .attributes
+                .iter()
+                .find(|attribute| attribute.key.as_str() == name)
+                .map(|attribute| &attribute.value)
+        };
+        assert_eq!(
+            child_attribute("um.main"),
+            Some(&opentelemetry::Value::Bool(true))
+        );
+        assert_eq!(
+            child_attribute("um.outcome"),
+            Some(&opentelemetry::Value::String("rejected".into()))
         );
     }
 

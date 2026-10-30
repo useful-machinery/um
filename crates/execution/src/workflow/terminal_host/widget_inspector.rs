@@ -311,13 +311,8 @@ pub(super) fn selected_step_status_title<Step: StepProjection>(
         style,
     ));
     if let Some(timing) = step.timing() {
-        let duration = if timing.frozen && step_state_is_active(step.state()) {
-            format!("{} interrupted", human_duration(timing.duration))
-        } else {
-            human_duration(timing.duration)
-        };
         spans.push(Span::styled(" · ", style));
-        spans.push(Span::styled(duration, style));
+        spans.push(Span::styled(human_duration(timing.duration), style));
     }
     Line::from(spans)
 }

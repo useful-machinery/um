@@ -1,9 +1,11 @@
 use std::fs;
 use std::path::Path;
 
-use super::workflow_run::{RunBundle, git, initialize_git_repository, isolated_command};
+use super::workflow_run::{
+    RunBundle, git, initialize_git_repository, isolated_command, workflow_run_schema,
+};
 
-const GIT_CONTINUATION_SOURCE: &str = r#"schemaVersion: 1
+pub(super) const GIT_CONTINUATION_SOURCE: &str = r#"schemaVersion: 1
 steps:
   capture:
     kind: cmd
@@ -288,6 +290,7 @@ fn replacement_resolution_failure_uses_the_continuation_diagnostic_vocabulary() 
     let output = isolated_command(&request).output().unwrap();
     assert_eq!(output.status.code(), Some(1));
     let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(workflow_run_schema().is_valid(&result), "{result}");
     assert_eq!(result["command"], "um workflow continue");
     assert_eq!(result["phase"], "continuation");
     assert_eq!(
@@ -326,6 +329,7 @@ fn invalid_selection_keeps_independent_immutable_input_diagnostics() {
     let output = isolated_command(&request).output().unwrap();
     assert_eq!(output.status.code(), Some(1));
     let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(workflow_run_schema().is_valid(&result), "{result}");
     assert_eq!(result["diagnostics"].as_array().unwrap().len(), 2);
     assert_eq!(
         result["diagnostics"][0]["code"],
@@ -1173,7 +1177,7 @@ fn chained_continuation_keeps_original_producer_and_reruns_finalizers() {
     assert!(!run.join("attempts/000003/values/step/producer").exists());
 }
 
-// REQ-CONTINUE-1, REQ-CONTINUE-2, REQ-CONTINUE-3, REQ-CONTINUE-15, REQ-CONTINUE-19, REQ-CONTINUE-20, REQ-CONTINUE-21, REQ-CONTINUE-26, REQ-CONTINUE-29, REQ-CONTINUE-31
+// REQ-CONTINUE-1, REQ-CONTINUE-2, REQ-CONTINUE-3, REQ-CONTINUE-15, REQ-CONTINUE-19, REQ-CONTINUE-20, REQ-CONTINUE-21, REQ-CONTINUE-26, REQ-CONTINUE-28, REQ-CONTINUE-29, REQ-CONTINUE-31, REQ-LOCALRUN-127
 #[test]
 fn workflow_continue_inherits_prior_output_and_executes_only_downstream() {
     let bundle = RunBundle::new(
@@ -1218,6 +1222,7 @@ fn workflow_continue_inherits_prior_output_and_executes_only_downstream() {
     assert_eq!(event["event"], "continuation_partition");
     assert_eq!(event["continuation"], continuation["continuation"]);
     let terminal: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(workflow_run_schema().is_valid(&terminal), "{terminal}");
     assert_eq!(terminal["command"], "um workflow continue");
     assert_eq!(
         terminal["result"]["continuation"],
@@ -1348,6 +1353,7 @@ fn workflow_continue_inherits_prior_output_and_executes_only_downstream() {
         .unwrap();
     assert_eq!(rejected.status.code(), Some(1));
     let diagnostic: serde_json::Value = serde_json::from_slice(&rejected.stdout).unwrap();
+    assert!(workflow_run_schema().is_valid(&diagnostic), "{diagnostic}");
     assert_eq!(
         diagnostic["diagnostics"][0]["code"],
         "continuation_disposition_ineligible"

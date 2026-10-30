@@ -14,7 +14,9 @@ use tokio::sync::{Mutex as AsyncMutex, mpsc, oneshot};
 
 use super::admission::{CancellationReason, CancellationSource, EnvironmentSnapshot};
 use super::agent_diagnostics::AgentDiagnosticSession;
+use super::agent_stream_excerpt::RejectedStreamExcerpt;
 use super::cancellation::CancellationFlag;
+use super::claude_code::ClaudeCodeStreamJsonV1TrackedWork;
 use super::execution_root::{AdmittedWorkingDirectory, WorkingDirectorySelectionFailure};
 use super::process_group::ProcessGuardRegistry;
 use super::result_validation::ResultValidationFatal;
@@ -896,6 +898,16 @@ pub(crate) enum AgentInputKind {
     Message,
 }
 
+impl AgentInputKind {
+    /// The closed `harnessInput` diagnostic slug.
+    pub(crate) fn slug(self) -> &'static str {
+        match self {
+            Self::SystemPrompt => "system_prompt",
+            Self::Message => "message",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq)]
 pub(crate) enum AgentHarnessFailureDetail {
     ModelOutputTruncated,
@@ -931,6 +943,32 @@ impl AgentHarnessFailureDetail {
             detail => detail,
         }
     }
+
+    /// The closed `harnessFailure` diagnostic slug of the canonical detail.
+    pub(crate) fn slug(self) -> &'static str {
+        match self {
+            Self::ModelError
+            | Self::Classified {
+                canonical: CanonicalHarnessFailure::ModelError,
+                ..
+            } => "model_error",
+            Self::ModelOutputTruncated
+            | Self::Classified {
+                canonical: CanonicalHarnessFailure::ModelOutputTruncated,
+                ..
+            } => "model_output_truncated",
+            Self::ModelAborted => "model_aborted",
+            Self::UnsuccessfulExit => "unsuccessful_exit",
+            Self::UnexpectedTerminalToolUse => "unexpected_terminal_tool_use",
+        }
+    }
+
+    pub(crate) fn diagnostic(self) -> Option<HarnessFailureDiagnostic> {
+        match self {
+            Self::Classified { diagnostic, .. } => Some(diagnostic),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -945,6 +983,10 @@ pub(crate) enum CanonicalHarnessFailure {
 pub(crate) struct HarnessFailureDiagnostic {
     pub(crate) harness_error: Option<&'static str>,
     pub(crate) http_status: Option<u16>,
+    /// The provider's reset time, Unix seconds, kept for a `rate_limited` or
+    /// `usage_limit_exceeded` class only (REQ-AGENT-72). The recovery and finalization
+    /// contexts carry it; the closed runner diagnostic never does.
+    pub(crate) resets_at: Option<u64>,
 }
 
 impl HarnessFailureDiagnostic {
@@ -971,8 +1013,28 @@ impl HarnessFailureDiagnostic {
         Self {
             harness_error: Some(harness_error),
             http_status,
+            resets_at: None,
         }
     }
+
+    /// Attaches a reset time the harness reported when the class is a usage limit.
+    pub(crate) fn with_limit_reset(mut self, resets_at: Option<u64>) -> Self {
+        if matches!(
+            self.harness_error,
+            Some("rate_limited" | "usage_limit_exceeded")
+        ) {
+            self.resets_at = resets_at;
+        }
+        self
+    }
+}
+
+/// Renders a kept reset time as the RFC 3339 UTC `resetsAt` the recovery and finalization
+/// contexts carry; a time outside the representable range is omitted.
+pub(crate) fn reset_timestamp(resets_at: u64) -> Option<String> {
+    let seconds = i64::try_from(resets_at).ok()?;
+    let instant = time::OffsetDateTime::from_unix_timestamp(seconds).ok()?;
+    super::schema_common::utc_timestamp(instant).ok()
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1063,6 +1125,11 @@ pub(crate) enum AgentProtocolRejectionProfile {
 pub struct AgentFailure {
     cause: AgentFailureCause,
     protocol_rejection: Option<Box<AgentProtocolRejectionDiagnostic>>,
+    /// Retained beside the protocol rejection on the runner host only; never projected.
+    stream_excerpt: Option<Box<RejectedStreamExcerpt>>,
+    /// The work the Claude Code parser held when it refused; retained beside the protocol
+    /// rejection on the runner host only, never projected.
+    tracked_work: Option<Box<ClaudeCodeStreamJsonV1TrackedWork>>,
 }
 
 impl AgentFailure {
@@ -1070,6 +1137,8 @@ impl AgentFailure {
         Self {
             cause,
             protocol_rejection: None,
+            stream_excerpt: None,
+            tracked_work: None,
         }
     }
 
@@ -1080,7 +1149,14 @@ impl AgentFailure {
         Self {
             cause,
             protocol_rejection: Some(Box::new(protocol_rejection)),
+            stream_excerpt: None,
+            tracked_work: None,
         }
+    }
+
+    pub(crate) fn with_stream_excerpt(mut self, excerpt: RejectedStreamExcerpt) -> Self {
+        self.stream_excerpt = Some(Box::new(excerpt));
+        self
     }
 
     pub(crate) fn cause(&self) -> &AgentFailureCause {
@@ -1089,6 +1165,22 @@ impl AgentFailure {
 
     pub(crate) fn protocol_rejection(&self) -> Option<&AgentProtocolRejectionDiagnostic> {
         self.protocol_rejection.as_deref()
+    }
+
+    pub(crate) fn stream_excerpt(&self) -> Option<&RejectedStreamExcerpt> {
+        self.stream_excerpt.as_deref()
+    }
+
+    pub(crate) fn with_tracked_work(
+        mut self,
+        tracked_work: ClaudeCodeStreamJsonV1TrackedWork,
+    ) -> Self {
+        self.tracked_work = Some(Box::new(tracked_work));
+        self
+    }
+
+    pub(crate) fn tracked_work(&self) -> Option<&ClaudeCodeStreamJsonV1TrackedWork> {
+        self.tracked_work.as_deref()
     }
 }
 

@@ -1,5 +1,7 @@
 {
-  buildIdentity ? "unknown",
+  # Defaults to the hash part of the source fileset's store path, so the
+  # identity changes with the CLI source and with nothing else.
+  buildIdentity ? null,
   cacert,
   craneLib,
   git,
@@ -26,6 +28,14 @@ let
     ];
   };
 
+  resolvedBuildIdentity =
+    if buildIdentity != null then
+      buildIdentity
+    else
+      builtins.head (
+        lib.splitString "-" (baseNameOf (builtins.unsafeDiscardStringContext (toString src)))
+      );
+
   commonArgs = {
     pname = "um";
     inherit src;
@@ -33,9 +43,9 @@ let
   };
 
   # The dependency-only build is keyed on crate manifests and vendored sources. The
-  # rolling version and build identity change on every commit and must not
-  # reach this derivation, or the cached dependency artifacts would be
-  # invalidated by every source change.
+  # build identity changes with every CLI source change and must not reach this
+  # derivation, or the cached dependency artifacts would be invalidated by
+  # every source change.
   cargoArtifacts = craneLib.buildDepsOnly (
     commonArgs
     // {
@@ -53,10 +63,11 @@ let
     SSL_CERT_FILE = "${cacert}/etc/ssl/certs/ca-bundle.crt";
   };
 
-  # The test gate injects fixed values shaped like the rolling version and
-  # build identity, so its result is reused until the CLI source changes rather
-  # than rerun for every commit. The tests compare the binary with whichever
-  # values were injected, and the package's postInstall verifies the real ones.
+  # The test gate injects fixed values shaped like a rolling version and build
+  # identity, so its result is independent of the package's identity. The tests
+  # compare the binary with whichever values were injected, and the package's
+  # postInstall verifies the real ones. `checks.um-cli` in the flake requires
+  # this derivation; the package itself does not.
   testVersion = "0.0.0-dev.0+rev.0000000000000000000000000000000000000000";
   testBuildIdentity = "0000000000000000000000000000000000000000";
 
@@ -104,15 +115,9 @@ craneLib.buildPackage (
     nativeBuildInputs = [ jq ];
 
     env = certificateEnv // {
-      UM_BUILD_IDENTITY = buildIdentity;
+      UM_BUILD_IDENTITY = resolvedBuildIdentity;
       UM_VERSION = version;
     };
-
-    # A direct production package build must first realize the nextest
-    # derivation. The test gate cannot be bypassed through the package output.
-    preBuild = ''
-      test -d ${nextestTests}
-    '';
 
     passthru = {
       inherit cargoArtifacts nextestTests;
@@ -131,7 +136,7 @@ craneLib.buildPackage (
 
       json="$($out/bin/um version --json)"
       if ! printf '%s\n' "$json" | jq --exit-status \
-        --arg buildIdentity ${lib.escapeShellArg buildIdentity} \
+        --arg buildIdentity ${lib.escapeShellArg resolvedBuildIdentity} \
         --arg executablePath "$out/bin/um" \
         --arg version ${lib.escapeShellArg version} \
         '. == {

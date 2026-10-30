@@ -1105,7 +1105,7 @@ fn failure_output(
             OutcomeClass::Forbidden,
             "Ask an active organization owner to inspect this connection or session.",
         ),
-        LinearFailure::InvalidInput => (
+        LinearFailure::InvalidInput { .. } => (
             "invalid_input",
             OutcomeClass::GeneralFailure,
             "Check the organization and connection identifiers.",

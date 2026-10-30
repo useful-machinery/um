@@ -840,6 +840,9 @@
                 "handler_unavailable",
                 "working_directory_unavailable",
                 "command_preparation_failed",
+                "command_launch_not_found",
+                "command_launch_permission_denied",
+                "command_launch_invalid_input",
                 "command_launch_failed",
                 "command_wait_failed",
                 "command_exit_failed",
@@ -874,8 +877,29 @@
                 "empty_reason",
                 "reason_too_long"
               ]
+            },
+            "diagnostic": {
+              "$ref": "#/$defs/RecoveryHandlerLaunchDiagnostic"
             }
           }
+        }
+      }
+    },
+    "RecoveryHandlerLaunchDiagnostic": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "launchFailure"
+      ],
+      "properties": {
+        "launchFailure": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_]{0,63}$"
+        },
+        "osError": {
+          "type": "integer",
+          "minimum": -2147483648,
+          "maximum": 2147483647
         }
       }
     },
@@ -1733,7 +1757,8 @@
           "$ref": "#/$defs/Digest"
         },
         "provenance": {"const": "inherited"},
-        "producer": {"$ref": "#/$defs/OutputProducer"}
+        "producer": {"$ref": "#/$defs/OutputProducer"},
+        "presentation": {"$ref": "#/$defs/ResolvedExportPresentation"}
       }
     },
     "GitCarrier": {
@@ -1803,7 +1828,8 @@
           "$ref": "#/$defs/GitCarrier"
         },
         "provenance": {"const": "inherited"},
-        "producer": {"$ref": "#/$defs/OutputProducer"}
+        "producer": {"$ref": "#/$defs/OutputProducer"},
+        "presentation": {"$ref": "#/$defs/ResolvedExportPresentation"}
       }
     },
     "UnavailableExport": {
@@ -1821,14 +1847,126 @@
           "enum": [
             "source_failed",
             "source_blocked",
-            "source_input_unavailable",
             "source_skipped",
             "source_not_run",
             "source_trigger_not_selected",
             "source_cancelled"
           ]
+        },
+        "presentation": {
+          "$ref": "#/$defs/ResolvedExportPresentation"
         }
       }
+    },
+    "ResolvedExportPresentation": {
+      "type": "object",
+      "additionalProperties": false,
+      "minProperties": 1,
+      "properties": {
+        "title": {
+          "$ref": "#/$defs/ResolvedTitle"
+        },
+        "description": {
+          "$ref": "#/$defs/ResolvedDescription"
+        }
+      }
+    },
+    "ResolvedTitle": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "state",
+            "value"
+          ],
+          "properties": {
+            "state": {
+              "const": "available"
+            },
+            "value": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 255
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "state",
+            "reason"
+          ],
+          "properties": {
+            "state": {
+              "const": "unavailable"
+            },
+            "reason": {
+              "enum": [
+                "source_failed",
+                "source_blocked",
+                "source_input_unavailable",
+                "source_not_run",
+                "source_trigger_not_selected",
+                "source_cancelled",
+                "blank",
+                "control_character",
+                "too_large",
+                "multiline_title"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "ResolvedDescription": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "state",
+            "value"
+          ],
+          "properties": {
+            "state": {
+              "const": "available"
+            },
+            "value": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 8192
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "state",
+            "reason"
+          ],
+          "properties": {
+            "state": {
+              "const": "unavailable"
+            },
+            "reason": {
+              "enum": [
+                "source_failed",
+                "source_blocked",
+                "source_input_unavailable",
+                "source_not_run",
+                "source_trigger_not_selected",
+                "source_cancelled",
+                "blank",
+                "control_character",
+                "too_large"
+              ]
+            }
+          }
+        }
+      ]
     },
     "Export": {
       "oneOf": [

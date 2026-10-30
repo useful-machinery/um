@@ -2,8 +2,8 @@ use std::error::Error;
 use std::fmt;
 use std::future::Future;
 use std::io;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use http_body_util::Full;
@@ -22,6 +22,19 @@ use zeroize::{Zeroize as _, Zeroizing};
 
 use super::generated::apis;
 use super::http_util;
+
+static USER_AGENT: OnceLock<String> = OnceLock::new();
+
+/// Names this `um` release in the `User-Agent` of every Cloud API request as
+/// `um/<version>`. The root records its resolved version once before dispatch;
+/// a later call keeps the first.
+pub fn identify_client(version: &str) {
+    USER_AGENT.get_or_init(|| format!("um/{version}"));
+}
+
+pub(super) fn user_agent() -> &'static str {
+    USER_AGENT.get().map_or("um", String::as_str)
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum HttpTransportPolicy {
@@ -98,6 +111,7 @@ impl HttpClient {
             .build()
             .map_err(HttpClientError::BuildRuntime)?;
         let client = Client::builder()
+            .user_agent(user_agent())
             .redirect(reqwest::redirect::Policy::none())
             .retry(reqwest::retry::never())
             .dns_resolver(categorized_dns_resolver())
@@ -302,6 +316,7 @@ fn blocking_client_builder(
     timeout: Duration,
 ) -> reqwest::blocking::ClientBuilder {
     BlockingClient::builder()
+        .user_agent(user_agent())
         .redirect(reqwest::redirect::Policy::none())
         .retry(reqwest::retry::never())
         .timeout(timeout)
@@ -320,6 +335,7 @@ pub(super) fn generated_configuration(
     let mut configuration = apis::configuration::Configuration::new();
     configuration.base_path = api_url.trim_end_matches('/').to_owned();
     configuration.bearer_access_token = Some(access_token.to_owned());
+    configuration.user_agent = Some(user_agent().to_owned());
     configuration.client = client;
     Ok(configuration)
 }

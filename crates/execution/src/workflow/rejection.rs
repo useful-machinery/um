@@ -184,10 +184,6 @@ impl<'a> RejectionLocation<'a> {
         match location {
             ValidationLocation::WorkflowGraph => Self::simple("workflow_graph"),
             ValidationLocation::WorkflowNamespace => Self::simple("workflow_namespace"),
-            ValidationLocation::AgentProfile { profile } => Self {
-                profile: Some(profile),
-                ..Self::simple("agent_profile")
-            },
             ValidationLocation::AgentProfileReplacement { profile } => Self {
                 profile: Some(profile),
                 ..Self::simple("agent_profile_replacement")
@@ -444,10 +440,6 @@ fn resolution_classification(kind: ResolutionFailureKind) -> (&'static str, &'st
             "source_closure_too_large",
             "Reduce the total size of the workflow definition and its static source files.",
         ),
-        ResolutionFailureKind::CapacityArithmeticOverflow => (
-            "workflow_capacity_overflow",
-            "Reduce the workflow size or configured recovery rounds.",
-        ),
         ResolutionFailureKind::GeneralTransitionCapacityExceeded => (
             "workflow_transition_capacity_exceeded",
             "Reduce the workflow size or configured recovery rounds.",
@@ -467,11 +459,19 @@ fn decode_classification(kind: DecodeFailureKind) -> (&'static str, &'static str
         ),
         DecodeFailureKind::ForbiddenYaml => (
             "forbidden_yaml",
-            "Remove forbidden YAML features such as aliases, custom tags, or duplicate keys.",
+            "Remove forbidden YAML such as directives, anchors, aliases, custom tags, duplicate keys, or floats.",
         ),
         DecodeFailureKind::StructuralContract => (
             "invalid_workflow_structure",
             "Correct the workflow fields and values to match the workflow contract.",
+        ),
+        DecodeFailureKind::WorkflowFileTooLarge => (
+            "workflow_file_too_large",
+            "Keep the workflow file within 1 MiB; move long text into referenced static files.",
+        ),
+        DecodeFailureKind::WorkflowNestingTooDeep => (
+            "workflow_nesting_too_deep",
+            "Nest workflow values at most 100 levels below the document root.",
         ),
     }
 }
@@ -486,17 +486,9 @@ fn validation_classification(kind: ValidationFailureKind) -> (&'static str, &'st
             "self_dependency",
             "Remove the step's dependency on or output reference to itself.",
         ),
-        ValidationFailureKind::DuplicateDependency => (
-            "duplicate_dependency",
-            "List each direct step dependency only once.",
-        ),
         ValidationFailureKind::DependencyCycle => (
             "dependency_cycle",
             "Remove dependency edges until the workflow step graph is acyclic.",
-        ),
-        ValidationFailureKind::InvalidAgentProfileConfig => (
-            "invalid_agent_profile_config",
-            "Correct the agent profile's harness configuration.",
         ),
         ValidationFailureKind::UnknownAgentProfile => (
             "unknown_agent_profile",
@@ -505,10 +497,6 @@ fn validation_classification(kind: ValidationFailureKind) -> (&'static str, &'st
         ValidationFailureKind::UnknownReplacementProfile => (
             "unknown_replacement_profile",
             "Replace only agent profiles declared by the selected workflow.",
-        ),
-        ValidationFailureKind::InvalidReplacementProfileConfig => (
-            "invalid_replacement_profile_config",
-            "Correct the replacement profile's harness configuration.",
         ),
         ValidationFailureKind::UnknownInput => (
             "unknown_input",
@@ -529,10 +517,6 @@ fn validation_classification(kind: ValidationFailureKind) -> (&'static str, &'st
         ValidationFailureKind::TerminalOutputReference => (
             "terminal_output_reference",
             "Export git_branch directly; it cannot bind a downstream step value.",
-        ),
-        ValidationFailureKind::IllegalCommandOutput => (
-            "illegal_command_output",
-            "Declare only file or git_branch outputs on command steps.",
         ),
         ValidationFailureKind::ExcessAgentResponseOutput => (
             "excess_agent_response_output",
@@ -586,10 +570,6 @@ fn validation_classification(kind: ValidationFailureKind) -> (&'static str, &'st
             "duplicate_workflow_node_id",
             "Give every step and finalizer a globally unique ID.",
         ),
-        ValidationFailureKind::InvalidSourceOrder => (
-            "invalid_workflow_source_order",
-            "Declare every workflow node exactly once.",
-        ),
         ValidationFailureKind::CrossPhaseOutputReference => (
             "cross_phase_output_reference",
             "Ordinary steps cannot reference finalizer outputs.",
@@ -598,17 +578,9 @@ fn validation_classification(kind: ValidationFailureKind) -> (&'static str, &'st
             "invalid_finalizer_after_target",
             "Reference only declared finalizers from after.",
         ),
-        ValidationFailureKind::InvalidFinalizerTrigger => (
-            "invalid_finalizer_trigger",
-            "Select at least one finalization trigger.",
-        ),
         ValidationFailureKind::IncompatibleFinalizerTriggers => (
             "incompatible_finalizer_triggers",
             "Make the consumer trigger set a subset of its output producer's trigger set.",
-        ),
-        ValidationFailureKind::InvalidFinalizationContext => (
-            "invalid_finalization_context",
-            "Reference finalization.context only from a finalizer command input or agent attachment.",
         ),
         ValidationFailureKind::FinalizerExportTrigger => (
             "finalizer_export_trigger",
@@ -790,10 +762,6 @@ fn admission_classification(kind: AdmissionFailureKind) -> Option<(&'static str,
             "execution_root_not_directory",
             "The execution root must identify a directory.",
         )),
-        AdmissionFailureKind::GitContextRequired => Some((
-            "git_context_required",
-            "Use an execution adapter that supplies Git branch capture context.",
-        )),
         AdmissionFailureKind::GitContextUnavailable => Some((
             "git_context_unavailable",
             "Make Git available before running a workflow with git_branch output.",
@@ -814,7 +782,10 @@ fn admission_classification(kind: AdmissionFailureKind) -> Option<(&'static str,
             "git_baseline_unavailable",
             "Check out a readable baseline commit before running the workflow.",
         )),
-        AdmissionFailureKind::GitInitialWorkspaceDirty
+        // Every caller supplies a Git capture context when a `git_branch` output needs one,
+        // so `GitContextRequired` is an adapter defect with no author remedy.
+        AdmissionFailureKind::GitContextRequired
+        | AdmissionFailureKind::GitInitialWorkspaceDirty
         | AdmissionFailureKind::GitWorkflowDigestMismatch
         | AdmissionFailureKind::NonPositiveParallelism
         | AdmissionFailureKind::NonPositiveCapturedFiles
@@ -901,7 +872,6 @@ mod tests {
         let validation = [
             ValidationLocation::WorkflowGraph,
             ValidationLocation::WorkflowNamespace,
-            ValidationLocation::AgentProfile { profile: text() },
             ValidationLocation::AgentProfileReplacement { profile: text() },
             ValidationLocation::AgentProfileReference { step: text() },
             ValidationLocation::RecoveryAgentProfileReference { step: text() },
@@ -1041,7 +1011,6 @@ mod tests {
             "system_prompt",
             "message_text",
             "message_attachment",
-            "agent_profile",
             "agent_profile_reference",
             "agent_profile_replacement",
             "agent_harness",

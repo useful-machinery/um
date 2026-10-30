@@ -1,13 +1,16 @@
 use std::collections::BTreeMap;
 use std::io::{self, Cursor, Read};
-use std::sync::{Arc, Mutex};
+use std::pin::Pin;
+use std::sync::{Arc, Mutex, PoisonError};
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use crate::telemetry::{self, Recorder};
 use base64::Engine as _;
+use bytes::Bytes;
+use http_body::{Frame, SizeHint};
 use opentelemetry::KeyValue;
 use reqwest::StatusCode;
-use reqwest::blocking::Body;
 use reqwest::header::{
     CONTENT_LENGTH, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue, IF_NONE_MATCH,
 };
@@ -32,8 +35,73 @@ use um_runner_protocol::{
 const CHECKSUM_HEADER: HeaderName = HeaderName::from_static("x-amz-checksum-sha256");
 const MAXIMUM_DELIVERY_RETRIES: u8 = 3;
 const PREPARATION_POLL_INTERVAL: Duration = Duration::from_secs(2);
+const UPLOAD_CHUNK_BYTES: usize = 64 * 1024;
 
 type UploadReader = Box<dyn Read + Send>;
+
+/// Streams an opened upload body as the provider PUT's request body.
+///
+/// The body is polled by the request itself, on the runtime `UploadWork::run`
+/// builds, so a failed connect is reported as the request's error (REQ-DIAG-6).
+/// Reqwest's blocking client instead pumps a reader body from a separate task
+/// and awaits that pump before the response, so a connect failure that drops
+/// the request first surfaced as the pump's disconnection and lost its class.
+/// The reader is `Send` but not `Sync`; the mutex supplies the `Sync` that
+/// `reqwest::Body::wrap` requires and is reached through `get_mut` without
+/// locking, since polling has the body exclusively.
+struct UploadBody {
+    reader: Mutex<Option<UploadReader>>,
+    size_bytes: u64,
+}
+
+impl UploadBody {
+    fn new(reader: UploadReader, size_bytes: u64) -> Self {
+        Self {
+            reader: Mutex::new(Some(reader)),
+            size_bytes,
+        }
+    }
+}
+
+impl http_body::Body for UploadBody {
+    type Data = Bytes;
+    type Error = io::Error;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        _: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, io::Error>>> {
+        let slot = self
+            .get_mut()
+            .reader
+            .get_mut()
+            .unwrap_or_else(PoisonError::into_inner);
+        let Some(reader) = slot.as_mut() else {
+            return Poll::Ready(None);
+        };
+        let mut chunk = vec![0_u8; UPLOAD_CHUNK_BYTES];
+        let count = loop {
+            match reader.read(&mut chunk) {
+                Ok(count) => break count,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(error) => {
+                    *slot = None;
+                    return Poll::Ready(Some(Err(error)));
+                }
+            }
+        };
+        if count == 0 {
+            *slot = None;
+            return Poll::Ready(None);
+        }
+        chunk.truncate(count);
+        Poll::Ready(Some(Ok(Frame::data(Bytes::from(chunk)))))
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        SizeHint::with_exact(self.size_bytes)
+    }
+}
 
 pub(super) trait ArtifactUploadBody: Send + Sync {
     fn open(&self) -> io::Result<UploadReader>;
@@ -1305,21 +1373,29 @@ impl UploadWork {
             headers.insert(name, value);
         }
         um_support::install_provider();
-        let client = reqwest::blocking::Client::builder()
+        // This runs inside a blocking task, so the PUT gets its own
+        // current-thread runtime and polls its body there (see `UploadBody`).
+        // The client is built and dropped inside that runtime's context, which
+        // its connection pool requires.
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|_| ())?;
+        let _runtime_context = runtime.enter();
+        let client = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(300))
             .build()
             .map_err(|_| ())?;
+        let request = client
+            .put(&self.capability.url)
+            .headers(headers)
+            .body(reqwest::Body::wrap(UploadBody::new(body, self.size_bytes)));
         // Every completed provider attempt is confirmed through Cloud: a success
         // may lose its response, 412 may mean the first PUT won, and any other
         // status or transport failure may still have stored the exact bytes.
-        match client
-            .put(&self.capability.url)
-            .headers(headers)
-            .body(Body::new(body))
-            .send()
-        {
+        match runtime.block_on(request.send()) {
             Ok(response)
                 if response.status().is_success()
                     || response.status() == StatusCode::PRECONDITION_FAILED =>
@@ -1331,20 +1407,53 @@ impl UploadWork {
                 "httpStatus": response.status().as_u16(),
             }))),
             Err(error) => {
-                // Reqwest's connect bucket also includes DNS and TLS failures;
-                // it does not reliably distinguish them without parsing error text.
-                let class = if error.is_timeout() {
-                    "timed_out"
-                } else {
-                    "transport_failed"
-                };
-                Ok(Some(serde_json::json!({
-                    "stage": "artifact_upload",
-                    "transportError": class,
-                })))
+                let mut diagnostic = serde_json::json!({"stage": "artifact_upload"});
+                if let Some(class) = transport_error_class(&error) {
+                    diagnostic["transportError"] = serde_json::json!(class);
+                }
+                Ok(Some(diagnostic))
             }
         }
     }
+}
+
+/// Classifies a failed provider PUT from typed errors only (REQ-DIAG-6).
+///
+/// Reqwest's default resolver reports DNS failures as uncategorized I/O
+/// errors and proxy failures are untyped, so both stay unclassified rather
+/// than being guessed from error text. A connect-only class is never taken
+/// from a later I/O error, such as a failed read of the local body file.
+fn transport_error_class(error: &reqwest::Error) -> Option<&'static str> {
+    if error.is_timeout() {
+        return Some("timed_out");
+    }
+    let connecting = error.is_connect();
+    let mut class = None;
+    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(error);
+    while let Some(current) = source {
+        // Hyper and reqwest wrap the I/O error more than once.
+        let mut nested = current.downcast_ref::<io::Error>();
+        while let Some(io_error) = nested {
+            match io_error.kind() {
+                io::ErrorKind::TimedOut => return Some("timed_out"),
+                io::ErrorKind::ConnectionReset => class = class.or(Some("connection_reset")),
+                io::ErrorKind::InvalidData if connecting => class = class.or(Some("tls_failed")),
+                io::ErrorKind::ConnectionRefused
+                | io::ErrorKind::HostUnreachable
+                | io::ErrorKind::NetworkUnreachable
+                    if connecting =>
+                {
+                    class = class.or(Some("connect_failed"));
+                }
+                _ => {}
+            }
+            nested = io_error
+                .get_ref()
+                .and_then(|inner| inner.downcast_ref::<io::Error>());
+        }
+        source = current.source();
+    }
+    class
 }
 
 fn validate_capability(
@@ -1466,6 +1575,21 @@ mod tests {
         )
     }
 
+    fn loopback_upload(spec: &ArtifactDeliverySpec, address: std::net::SocketAddr) -> UploadWork {
+        let capability = ArtifactUploadCapability {
+            url: format!("http://{address}/secret-path"),
+            content_length: spec.size_bytes.to_string(),
+            content_type: spec.media_type.clone(),
+            if_none_match: "*".to_owned(),
+            checksum_sha256: checksum_base64(&spec.sha256).unwrap(),
+            expires_at: "2026-08-20T00:05:00Z".to_owned(),
+        };
+        let mut work = UploadWork::new(1, spec, capability);
+        work.allow_insecure_loopback = true;
+        work
+    }
+
+    // REQ-DIAG-6
     #[test]
     fn upload_put_diagnostic_contains_only_status_or_transport_class() {
         use std::io::{Read as _, Write as _};
@@ -1509,29 +1633,133 @@ mod tests {
                     stream.write_all(b"HTTP/1.1 503 Unavailable\r\nContent-Length: 23\r\n\r\nsecret provider message").unwrap();
                 }
             });
-            let capability = ArtifactUploadCapability {
-                url: format!("http://{address}/secret-path"),
-                content_length: spec.size_bytes.to_string(),
-                content_type: spec.media_type.clone(),
-                if_none_match: "*".to_owned(),
-                checksum_sha256: checksum_base64(&spec.sha256).unwrap(),
-                expires_at: "2026-08-20T00:05:00Z".to_owned(),
-            };
-            let mut work = UploadWork::new(1, &spec, capability);
-            work.allow_insecure_loopback = true;
-            let result = work.run();
+            let result = loopback_upload(&spec, address).run();
             // Unblock accept if the client failed before connecting; this connection
             // cannot make a failed PUT succeed because its result is already fixed.
             let _ = TcpStream::connect_timeout(&address, Duration::from_secs(1));
             server.join().unwrap();
             let diagnostic = result.unwrap().unwrap();
-            assert_eq!(diagnostic["stage"], "artifact_upload");
             if respond {
-                assert_eq!(diagnostic["httpStatus"], 503);
+                assert_eq!(
+                    diagnostic,
+                    serde_json::json!({"stage": "artifact_upload", "httpStatus": 503})
+                );
             } else {
-                assert_eq!(diagnostic["transportError"], "transport_failed");
+                // A peer that closes without answering is no typed transport class.
+                assert_eq!(diagnostic, serde_json::json!({"stage": "artifact_upload"}));
             }
-            assert!(!diagnostic.to_string().contains("secret"));
+        }
+
+        let (_holder, _peer, _accepted, address) = refused_port();
+        let diagnostic = loopback_upload(&spec, address).run().unwrap().unwrap();
+        assert_eq!(
+            diagnostic,
+            serde_json::json!({"stage": "artifact_upload", "transportError": "connect_failed"})
+        );
+    }
+
+    /// Holds a loopback port that refuses every connect for as long as the
+    /// returned sockets live. Nothing may listen there: a dropped listener frees
+    /// its port for a parallel test's next bind, which would then answer the PUT.
+    /// A socket that is bound but never listens is refused on Linux but macOS
+    /// drops its SYNs until the connect times out, and the client end of a live
+    /// connection is refused on both but Linux can hand its auto-assigned port
+    /// to the PUT's own connect, which then reaches itself. So the holder is
+    /// bound explicitly, which Linux never reuses as a source port, and then
+    /// connected, which both kernels answer with a reset.
+    fn refused_port() -> (
+        rustix::fd::OwnedFd,
+        std::net::TcpListener,
+        std::net::TcpStream,
+        std::net::SocketAddr,
+    ) {
+        let holder = rustix::net::socket(
+            rustix::net::AddressFamily::INET,
+            rustix::net::SocketType::STREAM,
+            None,
+        )
+        .unwrap();
+        rustix::net::bind(
+            &holder,
+            &std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 0)),
+        )
+        .unwrap();
+        let address =
+            std::net::SocketAddr::try_from(rustix::net::getsockname(&holder).unwrap()).unwrap();
+        let peer = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        rustix::net::connect(&holder, &peer.local_addr().unwrap()).unwrap();
+        let (accepted, _) = peer.accept().unwrap();
+        (holder, peer, accepted, address)
+    }
+
+    // The streamed body reaches the provider whole across several chunks, so an
+    // upload larger than one chunk still stores the bytes the set is sealed to
+    // (REQ-ARTIFACT-1).
+    #[test]
+    fn upload_streams_a_body_longer_than_one_chunk() {
+        use std::io::{Read as _, Write as _};
+        use std::net::TcpListener;
+
+        let payload: Vec<u8> = (0..UPLOAD_CHUNK_BYTES * 3 + 17)
+            .map(|index| u8::try_from(index % 251).unwrap())
+            .collect();
+        let spec = ArtifactDeliverySpec::result(
+            "asn_01k0z6r1w8f4jy2m7q9v3x5abh".to_owned(),
+            "atm_01k0z6r1w8f4jy2m7q9v3x5abk".to_owned(),
+            Arc::from(payload.as_slice()),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let expected = payload.clone();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 65536];
+            let header_end = loop {
+                let count = stream.read(&mut buffer).unwrap();
+                assert!(count > 0, "PUT closed before its body");
+                request.extend_from_slice(&buffer[..count]);
+                if let Some(end) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+                    break end + 4;
+                }
+            };
+            let length = format!("content-length: {}\r\n", expected.len());
+            assert!(
+                String::from_utf8_lossy(&request[..header_end])
+                    .to_ascii_lowercase()
+                    .contains(&length)
+            );
+            while request.len() - header_end < expected.len() {
+                let count = stream.read(&mut buffer).unwrap();
+                assert!(count > 0, "PUT closed before its body");
+                request.extend_from_slice(&buffer[..count]);
+            }
+            assert!(request[header_end..] == expected[..]);
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                .unwrap();
+        });
+        let result = loopback_upload(&spec, address).run();
+        server.join().unwrap();
+        assert_eq!(result, Ok(None));
+    }
+
+    // REQ-DIAG-6: the connect failure keeps its class on every upload, not only
+    // when it is observed before the body stream notices the dropped request.
+    #[test]
+    fn refused_upload_is_classified_as_connect_failed_every_time() {
+        let spec = result_spec();
+        let (_holder, _peer, _accepted, address) = refused_port();
+        for attempt in 0..200 {
+            let diagnostic = loopback_upload(&spec, address).run().unwrap().unwrap();
+            assert_eq!(
+                diagnostic,
+                serde_json::json!({"stage": "artifact_upload", "transportError": "connect_failed"}),
+                "upload {attempt} lost its connect class"
+            );
         }
     }
 

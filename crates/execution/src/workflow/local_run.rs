@@ -35,6 +35,7 @@ use super::admission::{
 };
 use super::agent::AgentCompatibilityProfile;
 use super::agent_diagnostics::AgentDiagnosticSessionStore;
+use super::archived_presentation::safe_path;
 use super::artifact::{
     ArtifactStaging, CaptureCancellation, CaptureCandidateDeclaration, CarrierDestination,
     CarrierProducer, GitBranchCaptureDeclaration, GitBranchMetadata, GitObjectFormat,
@@ -299,18 +300,18 @@ impl fmt::Display for LocalRunDirectoryError {
                 path,
                 operation,
                 source,
-            } => write!(formatter, "{operation} {}: {source}", path.display()),
+            } => write!(formatter, "{operation} {}: {source}", safe_path(path)),
             Self::StateFile {
                 path,
                 operation,
                 source,
-            } => write!(formatter, "{operation} {}: {source}", path.display()),
+            } => write!(formatter, "{operation} {}: {source}", safe_path(path)),
             Self::Json { operation, source } => write!(formatter, "{operation}: {source}"),
             Self::Artifact {
                 path,
                 operation,
                 source,
-            } => write!(formatter, "{operation} {}: {source}", path.display()),
+            } => write!(formatter, "{operation} {}: {source}", safe_path(path)),
             // Variant names are stable, narrow invariant identifiers; split words for CLI prose.
             other => {
                 let name = format!("{other:?}");

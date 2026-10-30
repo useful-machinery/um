@@ -846,6 +846,16 @@ where
             state.parser_enabled = false;
             state.force_group();
         }
+        // After acceptance the grace measures idle time only: an epilogue turn or the
+        // background work it awaits suspends it, and it restarts in full once both have
+        // settled (INV-HARNESS-7, REQ-AGENT-76).
+        if state.parser_enabled && self.parser.result_accepted() {
+            if !self.parser.settling() {
+                self.settlement_deadline = None;
+            } else if self.settlement_deadline.is_none() {
+                self.arm_settlement_deadline(&mut state.clock);
+            }
+        }
         if state.parser_enabled
             && settled
             && close_standard_input(&mut self.standard_input)
@@ -871,11 +881,7 @@ where
             {
                 ResultExchangeProgress::Continue => {}
                 ResultExchangeProgress::Accepted => {
-                    let deadline = state.clock.now().add(self.settlement_grace.get());
-                    let deadline_clock = state.clock.clone();
-                    self.settlement_deadline = Some(Box::pin(async move {
-                        deadline_clock.wait_until(deadline).await;
-                    }));
+                    self.arm_settlement_deadline(&mut state.clock);
                     match emit_observations(
                         self.invocation.observations(),
                         self.started,
@@ -994,6 +1000,20 @@ where
     }
 }
 
+impl<Clock, Worker> ClaudeProtocol<'_, Clock, Worker>
+where
+    Clock: CoordinatorClock,
+{
+    /// Starts the full settlement grace from now (INV-HARNESS-7).
+    fn arm_settlement_deadline(&mut self, clock: &mut Clock) {
+        let deadline = clock.now().add(self.settlement_grace.get());
+        let deadline_clock = clock.clone();
+        self.settlement_deadline = Some(Box::pin(async move {
+            deadline_clock.wait_until(deadline).await;
+        }));
+    }
+}
+
 struct ClaudeDriverInput<'a, Clock, Worker> {
     bytes: &'a [u8],
     validator: Option<&'a AuthoritativeResultValidator<Clock, Worker>>,
@@ -1022,9 +1042,8 @@ where
     let (standard_input, output) = process.split();
     let cancellation = invocation.cancellation().clone();
     let initial_cancellation = cancellation.clone();
-    let initial_clock = clock.clone();
     let initial_input = Box::pin(async move {
-        initialize_standard_input(standard_input, bytes, &initial_cancellation, initial_clock).await
+        initialize_standard_input(standard_input, bytes, &initial_cancellation).await
     });
     let protocol = ClaudeProtocol {
         invocation,
@@ -1086,11 +1105,10 @@ async fn write_with_cancellation<Clock: CoordinatorClock>(
     }
 }
 
-async fn initialize_standard_input<Clock: CoordinatorClock>(
+async fn initialize_standard_input(
     mut standard_input: UnixStream,
     bytes: &[u8],
     cancellation: &CancellationSource,
-    clock: Clock,
 ) -> InitialInputProgress {
     if let Some(reason) = cancellation.cancellation_reason() {
         return InitialInputProgress::Cancelled(reason);
@@ -1098,14 +1116,20 @@ async fn initialize_standard_input<Clock: CoordinatorClock>(
     // Standard input stays open after the prompt: Claude Code defers a turn's result while
     // a backgrounded subagent is pending once its input has ended, so the adapter closes it
     // only when the invocation settles.
-    match write_with_cancellation(&mut standard_input, bytes, cancellation, clock).await {
-        WriteProgress::Completed => InitialInputProgress::Ready(standard_input),
-        WriteProgress::Cancelled(reason) => InitialInputProgress::Cancelled(reason),
-        WriteProgress::Failed => InitialInputProgress::Failed(
+    // A full socket can mean the harness is still starting. Applying the feedback
+    // write deadline here would impose a startup timeout only on large prompts.
+    let result = tokio::select! {
+        biased;
+        reason = cancellation.wait_for_cancellation() => return InitialInputProgress::Cancelled(reason),
+        result = standard_input.write_all(bytes) => result,
+    };
+    if let Some(reason) = cancellation.cancellation_reason() {
+        return InitialInputProgress::Cancelled(reason);
+    }
+    match result {
+        Ok(()) => InitialInputProgress::Ready(standard_input),
+        Err(_) => InitialInputProgress::Failed(
             ClaudeCodeStreamJsonV1RejectionReason::StandardInputWriteFailed,
-        ),
-        WriteProgress::TimedOut => InitialInputProgress::Failed(
-            ClaudeCodeStreamJsonV1RejectionReason::StandardInputWriteTimedOut,
         ),
     }
 }
@@ -1295,11 +1319,7 @@ async fn reject_and_continue<Clock: CoordinatorClock>(
 
 fn bounded_feedback(feedback: &str, maximum_bytes: u64) -> Arc<str> {
     let maximum_bytes = usize::try_from(maximum_bytes).unwrap_or(usize::MAX);
-    let mut end = feedback.len().min(maximum_bytes);
-    while !feedback.is_char_boundary(end) {
-        end -= 1;
-    }
-    Arc::from(&feedback[..end])
+    Arc::from(&feedback[..feedback.floor_char_boundary(maximum_bytes)])
 }
 
 async fn wait_for_optional_deadline(wait: &mut Option<SettlementDeadlineWait>) {

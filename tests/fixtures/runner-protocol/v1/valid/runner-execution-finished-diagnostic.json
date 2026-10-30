@@ -61,7 +61,13 @@
     "diagnostic": {
       "stage": "harness_execution",
       "harnessError": "future_safe_value",
-      "gitExitCode": -2147483648
+      "harnessFailure": "model_error",
+      "harnessInput": "message",
+      "limitBytes": 1048576,
+      "observedBytes": 2147483647,
+      "gitExitCode": -2147483648,
+      "launchFailure": "spawn",
+      "osError": 35
     }
   }
 }

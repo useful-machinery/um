@@ -2809,11 +2809,7 @@ fn codex_result_correction_feedback(feedback: Arc<str>, maximum_bytes: NonZeroU6
 
 fn push_bounded(destination: &mut String, value: &str, maximum_bytes: usize) {
     let remaining = maximum_bytes.saturating_sub(destination.len());
-    let mut end = remaining.min(value.len());
-    while !value.is_char_boundary(end) {
-        end -= 1;
-    }
-    destination.push_str(&value[..end]);
+    destination.push_str(&value[..value.floor_char_boundary(remaining)]);
 }
 
 fn weak_json_schema() -> Value {

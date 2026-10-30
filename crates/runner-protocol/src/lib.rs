@@ -2494,6 +2494,11 @@ mod tests {
             env!("CARGO_MANIFEST_DIR"),
             "/../../tests/fixtures/runner-protocol/v1/valid/runner-execution-finished-recovery.json"
         )),
+        // REQ-WFRECOVERY-62
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/runner-protocol/v1/valid/runner-execution-finished-recovery-handler-launch.json"
+        )),
         include_bytes!(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/../../tests/fixtures/runner-protocol/v1/valid/runner-execution-finished-user-cancelled.json"
@@ -2624,6 +2629,11 @@ mod tests {
         include_bytes!(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/../../tests/fixtures/runner-protocol/v1/invalid/runner-execution-finished-recovery-version.json"
+        )),
+        // REQ-WFRECOVERY-62
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/runner-protocol/v1/invalid/runner-execution-finished-recovery-handler-launch-missing-launch-failure.json"
         )),
         include_bytes!(concat!(
             env!("CARGO_MANIFEST_DIR"),

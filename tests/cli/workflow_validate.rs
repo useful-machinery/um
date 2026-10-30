@@ -369,12 +369,28 @@ fn finalizer_diagnostics_preserve_the_node_role() {
     );
 }
 
-// REQ-WFFORMAT-6, REQ-WFFORMAT-17, REQ-WFFORMAT-18, REQ-WFFORMAT-38, REQ-WFFORMAT-55, REQ-WFFORMAT-56, REQ-WFFORMAT-57, REQ-WFFORMAT-67, REQ-WFFORMAT-69, REQ-WFFORMAT-70, REQ-WFFORMAT-72, REQ-WFFORMAT-77
+// REQ-WFFORMAT-6, REQ-WFFORMAT-17, REQ-WFFORMAT-18, REQ-WFFORMAT-38, REQ-WFFORMAT-55, REQ-WFFORMAT-56, REQ-WFFORMAT-57, REQ-WFFORMAT-67, REQ-WFFORMAT-69, REQ-WFFORMAT-70, REQ-WFFORMAT-72, REQ-WFFORMAT-76, REQ-WFFORMAT-77
 // REQ-WFFORMAT-71
 #[test]
 fn malformed_semantic_missing_escaping_and_schema_failures_are_bounded_results() {
     let malformed = WorkflowBundle::valid();
     malformed.replace_workflow("schemaVersion: [\n");
+
+    let oversized = WorkflowBundle::valid();
+    let source =
+        fs::read_to_string(oversized.workflow_path()).expect("workflow should be readable");
+    let over_limit = 1024 * 1024 + 1;
+    let padded = format!("{source}#{}\n", "x".repeat(over_limit - source.len() - 2));
+    assert_eq!(padded.len(), over_limit);
+    oversized.replace_workflow(&padded);
+
+    let deeply_nested = WorkflowBundle::valid();
+    let source =
+        fs::read_to_string(deeply_nested.workflow_path()).expect("workflow should be readable");
+    deeply_nested.replace_workflow(&source.replace(
+        &format!("description: {WORKFLOW_SENTINEL}"),
+        &format!("description: {}{}", "[".repeat(101), "]".repeat(101)),
+    ));
 
     let semantic = WorkflowBundle::valid();
     semantic.replace_workflow(
@@ -413,6 +429,8 @@ fn malformed_semantic_missing_escaping_and_schema_failures_are_bounded_results()
 
     for (bundle, expected_code, expected_location) in [
         (malformed, "malformed_yaml", "workflow"),
+        (oversized, "workflow_file_too_large", "workflow"),
+        (deeply_nested, "workflow_nesting_too_deep", "workflow"),
         (semantic, "missing_dependency", "step_dependency"),
         (
             conflicting_agent_values,

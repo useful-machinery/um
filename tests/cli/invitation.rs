@@ -168,7 +168,8 @@ fn organization_invitation_list_preserves_terminal_history_and_cursor() {
     accepted["acceptingPrincipalId"] = "prn_01k0z6r1w8f4jy2m7q9v3x5abd".into();
     accepted["acceptedMembershipId"] = "mem_01k0z6r1w8f4jy2m7q9v3x5abc".into();
     accepted["issuerIdentity"] = serde_json::json!({"principalId": PRINCIPAL_ID, "nameState": "snapshot", "displayName": "At issue", "linkedEmails": [{"email": "issuer@example.test", "verified": false}]});
-    accepted["acceptingIdentity"] = serde_json::json!({"principalId": "prn_01k0z6r1w8f4jy2m7q9v3x5abd", "nameState": "live", "displayName": "Now"});
+    let accepting_identity = serde_json::json!({"principalId": "prn_01k0z6r1w8f4jy2m7q9v3x5abd", "nameState": "live", "displayName": "Now", "linkedEmails": [{"email": "accepter@example.test", "verified": true}]});
+    accepted["acceptingIdentity"] = accepting_identity.clone();
     let mut revoked = invitation("revoked", Some("2026-01-04T03:04:05Z"));
     revoked["id"] = "inv_01k0z6r1w8f4jy2m7q9v3x5abd".into();
     revoked["targetKind"] = "email".into();
@@ -176,10 +177,14 @@ fn organization_invitation_list_preserves_terminal_history_and_cursor() {
     let mut expired = invitation("expired", Some("2026-01-09T03:04:05Z"));
     expired["id"] = "inv_01k0z6r1w8f4jy2m7q9v3x5abe".into();
     expired["targetKind"] = "email".into(); // Older erased offer remains unavailable.
+    let mut principal_target = invitation("revoked", Some("2026-01-05T03:04:05Z"));
+    principal_target["id"] = "inv_01k0z6r1w8f4jy2m7q9v3x5abf".into();
+    let target_identity = serde_json::json!({"principalId": "prn_01k0z6r1w8f4jy2m7q9v3x5abe", "nameState": "unavailable"});
+    principal_target["targetIdentity"] = target_identity.clone();
     let (server, _directory, _path, credential_path) = prepared(vec![json_http_response(
         "200 OK",
         serde_json::json!({
-            "items": [accepted, revoked, expired],
+            "items": [accepted, revoked, expired, principal_target],
             "nextCursor": "page-two"
         }),
     )]);
@@ -192,7 +197,7 @@ fn organization_invitation_list_preserves_terminal_history_and_cursor() {
             "list",
             ORG_ID,
             "--limit",
-            "3",
+            "4",
             "--cursor",
             "page-one",
             "--json",
@@ -230,9 +235,10 @@ fn organization_invitation_list_preserves_terminal_history_and_cursor() {
         false
     );
     assert_eq!(
-        document["items"][0]["acceptingIdentity"]["displayName"],
-        "Now"
+        document["items"][0]["acceptingIdentity"],
+        accepting_identity
     );
+    assert_eq!(document["items"][3]["targetIdentity"], target_identity);
     assert_eq!(
         document["items"][1]["targetEmail"],
         "not-joined@example.test"
@@ -243,7 +249,7 @@ fn organization_invitation_list_preserves_terminal_history_and_cursor() {
     assert!(output.stderr.is_empty());
     let request = server.finish().pop().unwrap();
     assert!(request.starts_with(&format!(
-        "GET /api/v1/organizations/{ORG_ID}/invitations?limit=3&cursor=page-one HTTP/1.1\r\n"
+        "GET /api/v1/organizations/{ORG_ID}/invitations?limit=4&cursor=page-one HTTP/1.1\r\n"
     )));
     assert_authenticated(&request);
 }
@@ -279,6 +285,70 @@ fn organization_invitation_history_human_labels_recorded_and_unavailable_links()
     assert!(stdout.contains("accepted by: prn_01k0z6r1w8f4jy2m7q9v3x5abd"));
     assert!(stdout.contains("accepted membership: mem_01k0z6r1w8f4jy2m7q9v3x5abc"));
     assert!(stdout.contains("acceptance link: unavailable"));
+    server.finish();
+}
+
+// REQ-INVITE-89
+#[test]
+fn organization_invitation_history_human_reads_each_party_by_its_name_state() {
+    let mut nameless = invitation("accepted", Some("2026-01-03T03:04:05Z"));
+    nameless["targetKind"] = "email".into();
+    nameless["targetEmail"] = "delivered@example.test".into();
+    nameless["issuerIdentity"] = serde_json::json!({"principalId": PRINCIPAL_ID, "nameState": "live", "linkedEmails": [{"email": "issuer@example.test", "verified": true}]});
+    nameless["acceptingIdentity"] = serde_json::json!({"principalId": "prn_01k0z6r1w8f4jy2m7q9v3x5abd", "nameState": "snapshot", "displayName": "At acceptance"});
+    let mut principal_target = invitation("revoked", Some("2026-01-04T03:04:05Z"));
+    principal_target["id"] = "inv_01k0z6r1w8f4jy2m7q9v3x5abd".into();
+    principal_target["targetIdentity"] = serde_json::json!({"principalId": "prn_01k0z6r1w8f4jy2m7q9v3x5abe", "nameState": "unavailable"});
+    let mut unrecorded = invitation("expired", Some("2026-01-09T03:04:05Z"));
+    unrecorded["id"] = "inv_01k0z6r1w8f4jy2m7q9v3x5abe".into();
+    unrecorded["targetKind"] = "email".into();
+    let (server, _directory, _path, credential_path) = prepared(vec![json_http_response(
+        "200 OK",
+        serde_json::json!({ "items": [nameless, principal_target, unrecorded] }),
+    )]);
+    let environment = deployment_environment(&server.api_url, &credential_path);
+    let output = run_with_env(
+        &[
+            "organization",
+            "invitation",
+            "list",
+            ORG_ID,
+            "--allow-insecure-http",
+        ],
+        &environment,
+    );
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    // Each invitation's lines, so that a line from another invitation cannot satisfy them.
+    let block = |id: &str| -> Vec<&str> {
+        stdout
+            .split("\n\n")
+            .find(|block| block.starts_with(&format!("invitation: {id} ")))
+            .unwrap_or_else(|| panic!("no block for {id} in {stdout}"))
+            .lines()
+            .collect()
+    };
+    let nameless = block(INVITATION_ID);
+    for line in [
+        "issuer identity: no name".to_owned(),
+        format!("issuer identity principal: {PRINCIPAL_ID}"),
+        "issuer identity login email: issuer@example.test".to_owned(),
+        "accepting identity: At acceptance".to_owned(),
+    ] {
+        assert!(nameless.contains(&line.as_str()), "{line} in {nameless:?}");
+    }
+    let principal_target = block("inv_01k0z6r1w8f4jy2m7q9v3x5abd");
+    for line in [
+        "recipient identity: unavailable",
+        "recipient identity principal: prn_01k0z6r1w8f4jy2m7q9v3x5abe",
+    ] {
+        assert!(
+            principal_target.contains(&line),
+            "{line} in {principal_target:?}"
+        );
+    }
+    let unrecorded = block("inv_01k0z6r1w8f4jy2m7q9v3x5abe");
+    assert!(unrecorded.contains(&"issuer identity: unavailable"));
     server.finish();
 }
 

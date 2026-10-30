@@ -48,9 +48,9 @@ use crate::workflow::test_support::pi_clock::TestClock;
 use crate::workflow::test_support::pi_sink::{ObservationGate, RecordingObservationSink};
 use crate::workflow::test_support::pi_validation::DeadlineValidationWorker;
 use crate::workflow::test_support::{
-    process_fixture_interrupt_receiver, process_fixture_output, run_with_stalled_child_guard,
-    spawn_process_fixture, wait_for_stalled_child_guard, write_process_fixture_id,
-    write_process_fixture_signal,
+    host_scaled_watchdog, process_fixture_interrupt_receiver, process_fixture_output,
+    run_with_stalled_child_guard, spawn_process_fixture, wait_for_stalled_child_guard,
+    write_process_fixture_id, write_process_fixture_signal,
 };
 
 const MAXIMUM_INPUT_BYTES: u64 = MAXIMUM_AGENT_PROMPT_BYTES;
@@ -923,6 +923,7 @@ async fn validation_socket_raw_exchange(socket_address: &Path, request: Value) -
 
 struct RunningResultFixture {
     _temporary: tempfile::TempDir,
+    _group_detached: fs::File,
     task: tokio::task::JoinHandle<()>,
     terminal: tokio::sync::oneshot::Receiver<AgentOutcome>,
     socket_path: PathBuf,
@@ -1083,6 +1084,11 @@ where
     Worker: ResultValidationWorker,
 {
     fs::write(fixture.invocation.adapter().executable(), RESULT_BRIDGE_PI).unwrap();
+    // A descendant signals group-detached only after settlement readiness, so the
+    // injected settlement deadline can kill the leader before it opens the FIFO.
+    // Holding it open keeps that handoff from waiting forever on a dead leader.
+    let group_detached =
+        open_fifo_reader(&fixture.process.parent().unwrap().join("group-detached"));
     let cancellation = fixture.invocation.cancellation().clone();
     let socket_path = fixture.result_endpoint.join("result-validation.sock");
     let extension_path = fixture
@@ -1107,6 +1113,7 @@ where
     let socket_address = validation_socket_address(&extension_path);
     RunningResultFixture {
         _temporary: fixture._temporary,
+        _group_detached: group_detached,
         task,
         terminal,
         socket_path,
@@ -2557,8 +2564,9 @@ async fn cancellation_keeps_the_admitted_deadline_when_observation_delivery_is_b
 // INV-HARNESS-8
 #[tokio::test]
 async fn stubborn_descendant_is_forced_at_the_injected_deadline_before_terminal_report() {
-    // Detached process startup can contend with the other nextest fixtures in the
-    // package build. This limit is an anti-hang watchdog, not the cancellation grace.
+    // Detached process startup is slower than the other fixtures, so this anti-hang
+    // watchdog, not the cancellation grace, has a 30-second idle-host base that
+    // `host_scaled_watchdog` scales by the host's load.
     with_watchdog_duration(Duration::from_secs(30), async {
         let fixture = ProcessFixture::new("success", "system".to_owned(), "message".to_owned());
         fs::write(
@@ -2781,18 +2789,11 @@ async fn with_watchdog<Output>(future: impl Future<Output = Output>) -> Output {
     with_watchdog_duration(TEST_WATCHDOG, future).await
 }
 
-#[expect(
-    clippy::disallowed_methods,
-    reason = "real time is allowed only as an anti-hang watchdog, not a behavior assertion"
-)]
 async fn with_watchdog_duration<Output>(
     timeout: Duration,
     future: impl Future<Output = Output>,
 ) -> Output {
-    match tokio::time::timeout(timeout, future).await {
-        Ok(output) => output,
-        Err(_) => panic!("PiJsonV1 process fixture watchdog expired"),
-    }
+    host_scaled_watchdog("PiJsonV1 process fixture", timeout, future).await
 }
 
 #[test]

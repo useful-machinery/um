@@ -1,8 +1,12 @@
 use serde_json::{Map, Number, Value};
 use yaml_rust2::parser::{Event, MarkedEventReceiver, Parser, Tag};
-use yaml_rust2::scanner::{Marker, Scanner, TScalarStyle, TokenType};
+use yaml_rust2::scanner::{Marker, ScanError, Scanner, TScalarStyle, TokenType};
 
 use super::DecodeFailure;
+
+/// Deepest level below the document root, which sits at 0, that a value may
+/// occupy; the Gateway's `maximumWorkflowDocumentDepth` holds the same bound.
+const MAXIMUM_NODE_DEPTH: usize = 100;
 
 pub(super) struct ParsedYaml {
     pub(super) value: Value,
@@ -12,6 +16,8 @@ pub(super) struct ParsedYaml {
 
 pub(super) fn parse(bytes: &[u8]) -> Result<ParsedYaml, DecodeFailure> {
     let source = std::str::from_utf8(bytes).map_err(|_| DecodeFailure::malformed_yaml())?;
+    // A leading byte order mark is not content; the Cloud decoder skips it too.
+    let source = source.strip_prefix('\u{FEFF}').unwrap_or(source);
     reject_forbidden_tokens(source)?;
 
     let mut receiver = JsonEventReceiver::default();
@@ -39,9 +45,7 @@ pub(super) fn parse(bytes: &[u8]) -> Result<ParsedYaml, DecodeFailure> {
 fn reject_forbidden_tokens(source: &str) -> Result<(), DecodeFailure> {
     let mut scanner = Scanner::new(source.chars());
     loop {
-        let token = scanner
-            .next_token()
-            .map_err(|_| DecodeFailure::malformed_yaml())?;
+        let token = scanner.next_token().map_err(|error| scan_failure(&error))?;
         let Some(token) = token else {
             return Ok(());
         };
@@ -50,10 +54,27 @@ fn reject_forbidden_tokens(source: &str) -> Result<(), DecodeFailure> {
             TokenType::Anchor(_) | TokenType::Alias(_) => {
                 return Err(DecodeFailure::forbidden_yaml());
             }
-            TokenType::VersionDirective(1, 2) => {}
+            // yaml-rust2 reports a directive YAML does not define as a tag directive
+            // with an empty handle; a real `%TAG` always has a `!` handle.
             TokenType::VersionDirective(_, _) => return Err(DecodeFailure::forbidden_yaml()),
+            TokenType::TagDirective(handle, _) if handle.is_empty() => {
+                return Err(DecodeFailure::forbidden_yaml());
+            }
             _ => {}
         }
+    }
+}
+
+/// yaml-rust2 keeps its flow level in a `u8` and fails with this error once
+/// 255 flow collections are open. It reads ahead through a whole flow
+/// collection before yielding its first token, so no token count can refuse
+/// the nesting earlier. A value that deep always exceeds the depth limit;
+/// shallower excess nesting reaches the receiver, which applies the exact rule.
+fn scan_failure(error: &ScanError) -> DecodeFailure {
+    if error.info() == "recursion limit exceeded" {
+        DecodeFailure::workflow_nesting_too_deep()
+    } else {
+        DecodeFailure::malformed_yaml()
     }
 }
 
@@ -88,6 +109,7 @@ enum OrderedMapping {
 enum BuildError {
     Malformed,
     Forbidden,
+    TooDeep,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -107,6 +129,7 @@ impl BuildError {
         match self {
             Self::Malformed => DecodeFailure::malformed_yaml(),
             Self::Forbidden => DecodeFailure::forbidden_yaml(),
+            Self::TooDeep => DecodeFailure::workflow_nesting_too_deep(),
         }
     }
 }
@@ -114,6 +137,14 @@ impl BuildError {
 impl MarkedEventReceiver for JsonEventReceiver {
     fn on_event(&mut self, event: Event, _mark: Marker) {
         if self.error.is_some() {
+            return;
+        }
+        if matches!(
+            event,
+            Event::Scalar(..) | Event::SequenceStart(..) | Event::MappingStart(..)
+        ) && self.stack.len() > MAXIMUM_NODE_DEPTH
+        {
+            self.error = Some(BuildError::TooDeep);
             return;
         }
 
@@ -324,8 +355,8 @@ fn resolve_scalar(
     if let Some(integer) = parse_core_integer(&value)? {
         return Ok(Value::Number(integer));
     }
-    if let Some(float) = parse_core_float(&value, false)? {
-        return Ok(Value::Number(float));
+    if is_non_json_core_float(&value) || is_core_float(&value) {
+        return Err(BuildError::Forbidden);
     }
 
     Ok(Value::String(value))
@@ -341,10 +372,9 @@ fn resolve_tagged_scalar(value: String, tag: CoreTag) -> Result<Value, BuildErro
         CoreTag::Integer => parse_core_integer(&value)?
             .map(Value::Number)
             .ok_or(BuildError::Forbidden),
-        CoreTag::Float => parse_core_float(&value, true)?
-            .map(Value::Number)
-            .ok_or(BuildError::Forbidden),
-        CoreTag::Null | CoreTag::Sequence | CoreTag::Mapping => Err(BuildError::Forbidden),
+        CoreTag::Null | CoreTag::Float | CoreTag::Sequence | CoreTag::Mapping => {
+            Err(BuildError::Forbidden)
+        }
     }
 }
 
@@ -399,85 +429,6 @@ fn parse_core_integer(value: &str) -> Result<Option<Number>, BuildError> {
     } else {
         Ok(Some(Number::from(magnitude)))
     }
-}
-
-fn parse_core_float(value: &str, allow_integer: bool) -> Result<Option<Number>, BuildError> {
-    if is_non_json_core_float(value) {
-        return Err(BuildError::Forbidden);
-    }
-    if !(is_core_float(value) || allow_integer && is_core_decimal_integer(value)) {
-        return Ok(None);
-    }
-
-    value
-        .parse::<f64>()
-        .ok()
-        .filter(|number| number.is_finite())
-        .and_then(|number| number_from_finite_float(value, number))
-        .map(Some)
-        .ok_or(BuildError::Forbidden)
-}
-
-fn number_from_finite_float(source: &str, value: f64) -> Option<Number> {
-    if value.fract() == 0.0 && core_float_is_integral(source) {
-        let decimal = value.to_string();
-        if let Ok(integer) = decimal.parse::<i64>() {
-            return Some(Number::from(integer));
-        }
-        if let Ok(integer) = decimal.parse::<u64>() {
-            return Some(Number::from(integer));
-        }
-    }
-    Number::from_f64(value)
-}
-
-fn core_float_is_integral(value: &str) -> bool {
-    let (_, unsigned) = without_sign(value);
-    let mut parts = unsigned.split(['e', 'E']);
-    let base = parts.next().unwrap_or_default();
-    let exponent = parts.next().unwrap_or("0");
-    let fractional_digits = base
-        .split_once('.')
-        .map_or(0, |(_, fraction)| fraction.len());
-    let (negative_exponent, magnitude) = without_sign(exponent);
-    let Ok(magnitude) = magnitude.parse::<usize>() else {
-        return if negative_exponent {
-            coefficient_is_zero(base)
-        } else {
-            true
-        };
-    };
-
-    let trailing_fractional_digits = if negative_exponent {
-        let Some(digits) = fractional_digits.checked_add(magnitude) else {
-            return coefficient_is_zero(base);
-        };
-        digits
-    } else {
-        fractional_digits.saturating_sub(magnitude)
-    };
-    coefficient_has_trailing_zeroes(base, trailing_fractional_digits)
-}
-
-fn coefficient_has_trailing_zeroes(base: &str, count: usize) -> bool {
-    let digit_count = base.len() - usize::from(base.contains('.'));
-    if count >= digit_count {
-        return coefficient_is_zero(base);
-    }
-    base.bytes()
-        .filter(|byte| *byte != b'.')
-        .rev()
-        .take(count)
-        .all(|byte| byte == b'0')
-}
-
-fn coefficient_is_zero(base: &str) -> bool {
-    base.bytes().all(|byte| matches!(byte, b'.' | b'0'))
-}
-
-fn is_core_decimal_integer(value: &str) -> bool {
-    let (_, unsigned) = without_sign(value);
-    !unsigned.is_empty() && unsigned.bytes().all(|byte| byte.is_ascii_digit())
 }
 
 fn is_non_json_core_float(value: &str) -> bool {

@@ -213,6 +213,16 @@ impl AssignmentManager {
 
         let root_offer = offer.clone();
         let root_preparation = Arc::new(AssignmentRootPreparationHandoff::new());
+        let run_event = RunEvent::default();
+        if let Some(recorder) = &self.recorder {
+            run_event.start(
+                recorder,
+                &AssignmentIdentity::from_offer(&offer),
+                &self.runner_id,
+            );
+        }
+        self.run_events
+            .insert(offer.assignment_id.clone(), run_event.clone());
         self.slot = Some(LocalSlot::Preparing(Box::new(PreparingAssignment {
             offer,
             cancellation: CaptureCancellation::default(),
@@ -220,6 +230,7 @@ impl AssignmentManager {
             root: None,
             prepare_effect_id: None,
             preparation_event: None,
+            run_event,
         })));
         if self
             .begin_workspace_preparation(root_offer, root_preparation)
@@ -229,6 +240,7 @@ impl AssignmentManager {
                 return Err(AssignmentManagerFailure::DecisionCapacity);
             };
             let offer = preparing.offer;
+            self.finish_offered_run(&offer.assignment_id, &preparing.run_event, "rejected");
             let response = rejected(&offer, environment_unavailable());
             return self.retain_decision(offer, response);
         }
@@ -274,6 +286,7 @@ impl AssignmentManager {
             self.sleeper.now(),
         ) else {
             preparing.cancellation.cancel();
+            self.finish_offered_run(&offer.assignment_id, &preparing.run_event, "aborted");
             self.begin_assignment_cleanup(
                 offer.assignment_id,
                 root,
@@ -308,7 +321,10 @@ impl AssignmentManager {
             phase: "source_materialization".to_owned(),
         };
         if self.outbox.enqueue(progress).is_err() {
-            self.slot = Some(LocalSlot::Preparing(preparing));
+            if let Some(event) = preparing.preparation_event.take() {
+                event.finish(TelemetryOutcome::Failure);
+            }
+            self.finish_offered_run(&offer.assignment_id, &preparing.run_event, "aborted");
             self.begin_assignment_cleanup(
                 offer.assignment_id,
                 root,
@@ -317,6 +333,8 @@ impl AssignmentManager {
             );
             return Err(AssignmentManagerFailure::DecisionCapacity);
         }
+        // Checkout begins once Cloud can see its progress.
+        preparing.run_event.enter(RunPhase::Checkout);
         preparing.prepare_effect_id = Some(prepare.effect_id.clone());
         self.slot = Some(LocalSlot::Preparing(preparing));
         self.begin_source_admission(offer, root, prepare.effect_id, deadline)
@@ -354,6 +372,12 @@ impl AssignmentManager {
         decline: AssignmentDecline,
     ) -> Result<(), AssignmentManagerFailure> {
         self.finish_preparation_event(TelemetryOutcome::Failure);
+        let run_event = match &self.slot {
+            Some(LocalSlot::Preparing(preparing)) => preparing.run_event.clone(),
+            _ => RunEvent::default(),
+        };
+        run_event.leave(PhaseEnd::Failed);
+        self.finish_offered_run(&offer.assignment_id, &run_event, "rejected");
         let response = AssignmentDecision::Rejected {
             effect_id: prepare_effect_id,
             assignment_id: offer.assignment_id.clone(),
@@ -593,6 +617,7 @@ impl AssignmentManager {
                     )
                     .map_err(materialization_decline)?;
                 }
+                runtime.run_event.enter(RunPhase::Preparation);
                 runtime.progress(&worker_offer, 2, "input_download")?;
                 let inputs = super::super::run_inputs::materialize(
                     input_broker.as_deref(),

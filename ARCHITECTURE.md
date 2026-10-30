@@ -28,22 +28,26 @@ establishes only the selected closed harness installation, not complete runner r
 
 ## One executable with separate roles
 
-`um` will initially provide one installation and command tree. A thin command
-entrypoint will dispatch to components with distinct responsibilities:
+`um` provides one installation and command tree. The root binary's thin command
+entrypoint under `src/cli/` dispatches to unpublished workspace crates with distinct
+responsibilities, whose dependency graph chapter 12 pins:
 
-- human-facing commands will perform short-lived public API operations;
-- the public API client will encode requests and decode responses from versioned
-  generated assets;
-- the runner service will maintain an outbound connection, enforce its single-assignment
-  limit, accept assignments, and report observations;
-- the runner protocol component will encode, order, acknowledge, and validate runner
-  messages; and
-- the new Useful Machinery execution engine will implement the one-run contract,
-  workflow scheduler, execution roots, checkpoints, and agent execution in Rust.
+- human-facing commands in `src/cli/` perform short-lived public API operations, with
+  human sign-in and credential storage in `crates/human-auth`;
+- the public API client in `crates/api` encodes requests and decodes responses through
+  the committed client generated from the versioned customer contract;
+- the runner service in `crates/runner` maintains an outbound connection, enforces its
+  single-assignment limit, accepts assignments, orders and acknowledges runner messages,
+  and reports observations;
+- the runner protocol component in `crates/runner-protocol` encodes, decodes, and
+  validates runner frames against the embedded runner protocol schema through its
+  committed generated codec; and
+- the Useful Machinery execution engine in `crates/execution` implements the one-run
+  contract, workflow scheduler, execution roots, checkpoints, and agent execution in
+  Rust.
 
 The long-running runner starts only through an explicit command such as
-`um runner serve`. Bare `um runner` will not implicitly start a
-service.
+`um runner serve`. Bare `um runner` prints help and does not start a service.
 
 ## Local workflow validation
 
@@ -157,8 +161,8 @@ handshake progress, attempt-local frame and effect counts, a closed connection c
 and retry backoff selected by the service. `runner.effect_acknowledgement` bounds one
 offer from receipt through gateway confirmation of the transport acknowledgement. It
 includes safe effect, assignment, run, runner, boot, sequence, and lease context, but it
-does not represent assignment acceptance or execution. The name `runner.run` remains
-reserved until the execution component exists.
+does not represent assignment acceptance or execution. `runner.run` bounds one
+assignment's execution, from its start authorization to its terminal observation.
 
 Telemetry call sites accept only reviewed scalar attributes and closed classifications.
 They do not copy credentials, complete endpoints, protocol frames, peer close reasons,
@@ -331,8 +335,11 @@ local and CI entrypoint for this invariant.
 ## Generated contracts
 
 Versioned OpenAPI and runner protocol contracts define the interface with the Useful
-Machinery control plane. Generated clients, types, and codecs needed to build this
-executable will be committed here.
+Machinery control plane. The generated client, types, and codecs needed to build this
+executable are committed here: the public API client beneath `crates/api/src/generated`
+and the runner protocol codec in `crates/runner-protocol/src/generated.rs`, which
+monorepo tooling generates from the canonical runner protocol schema that the crate
+embeds as `crates/runner-protocol/src/schema/runner-protocol-v1.schema.json`.
 
 A normal public build consumes the committed client beneath
 `crates/api/src/generated` and does not require the contract source files or generator. The client is generated only

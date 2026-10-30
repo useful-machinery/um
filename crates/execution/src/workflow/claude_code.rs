@@ -89,7 +89,7 @@ mod config_tests {
 pub(crate) mod adapter;
 
 use std::ffi::OsString;
-use std::num::NonZeroU64;
+use std::num::{NonZeroU64, NonZeroUsize};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -103,12 +103,16 @@ use super::agent::{
     CapturedJson, CompletedAgentInvocation, HarnessFailureDiagnostic, failed_agent_outcome,
     tool_call_observation,
 };
+use super::agent_stream_excerpt::{RejectedStreamExcerpt, RetainedStreamLine, StreamTail};
 use super::text_fit::ellipsize;
 #[cfg(test)]
 const QUALIFICATION_VERSION: &str =
     crate::claude_code::CLAUDE_CODE_STREAM_JSON_V1_QUALIFICATION_VERSION;
 
 const MAXIMUM_FRAME_BYTES: u64 = 16 * 1024 * 1024;
+const RETAINED_PRECEDING_LINES: usize = 8;
+const MAXIMUM_PRECEDING_LINE_BYTES: usize = 1024;
+const MAXIMUM_REJECTED_LINE_BYTES: usize = 8 * 1024;
 const MAXIMUM_DIAGNOSTIC_SEQUENCE: u64 = i64::MAX as u64;
 const PERMISSION_MODE: &str = "bypassPermissions";
 const MAXIMUM_TRACKED_TASKS: usize = 128;
@@ -117,6 +121,10 @@ const MAXIMUM_UNRECOGNIZED_KIND_TOKEN_BYTES: usize = 64;
 // Display-width bounds on the harness-reported text a subagent diagnostic names.
 const MAXIMUM_SUBAGENT_DESCRIPTION_WIDTH: usize = 200;
 const MAXIMUM_SUBAGENT_TOKEN_WIDTH: usize = 64;
+/// Entries of each tracked-work list `protocol-rejection.json` keeps (REQ-AGENT-74).
+const MAXIMUM_RETAINED_TRACKED_WORK: usize = 16;
+/// Width of a task, call or run identifier in the retained tracked work.
+const MAXIMUM_TRACKED_WORK_ID_WIDTH: usize = 128;
 const STRUCTURED_OUTPUT_TOOL_NAME: &str = "StructuredOutput";
 pub(crate) const RESULT_ENVELOPE_SCHEMA: &str = r#"{"type":"object","required":["result"],"properties":{"result":{}},"additionalProperties":true}"#;
 
@@ -339,6 +347,17 @@ impl Default for ClaudeCodeStreamJsonV1RejectionContext {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ClaudeCodeStreamJsonV1ProtocolLimits {
     maximum_frame_bytes: NonZeroU64,
+    /// Accepted frames kept, oldest first, as the lines before a rejected one.
+    retained_preceding_lines: NonZeroUsize,
+    maximum_preceding_line_bytes: NonZeroUsize,
+    maximum_rejected_line_bytes: NonZeroUsize,
+}
+
+const fn nonzero_bound(bytes: usize) -> NonZeroUsize {
+    match NonZeroUsize::new(bytes) {
+        Some(value) => value,
+        None => NonZeroUsize::MIN,
+    }
 }
 
 impl ClaudeCodeStreamJsonV1ProtocolLimits {
@@ -349,6 +368,9 @@ impl ClaudeCodeStreamJsonV1ProtocolLimits {
         };
         Self {
             maximum_frame_bytes,
+            retained_preceding_lines: nonzero_bound(RETAINED_PRECEDING_LINES),
+            maximum_preceding_line_bytes: nonzero_bound(MAXIMUM_PRECEDING_LINE_BYTES),
+            maximum_rejected_line_bytes: nonzero_bound(MAXIMUM_REJECTED_LINE_BYTES),
         }
     }
 
@@ -356,11 +378,38 @@ impl ClaudeCodeStreamJsonV1ProtocolLimits {
     const fn with_maximum_frame_bytes(maximum_frame_bytes: NonZeroU64) -> Self {
         Self {
             maximum_frame_bytes,
+            ..Self::profile()
+        }
+    }
+
+    #[cfg(test)]
+    const fn with_excerpt_bounds(
+        retained_preceding_lines: NonZeroUsize,
+        maximum_preceding_line_bytes: NonZeroUsize,
+        maximum_rejected_line_bytes: NonZeroUsize,
+    ) -> Self {
+        Self {
+            retained_preceding_lines,
+            maximum_preceding_line_bytes,
+            maximum_rejected_line_bytes,
+            ..Self::profile()
         }
     }
 
     pub(crate) const fn maximum_frame_bytes(self) -> NonZeroU64 {
         self.maximum_frame_bytes
+    }
+
+    pub(crate) const fn retained_preceding_lines(self) -> NonZeroUsize {
+        self.retained_preceding_lines
+    }
+
+    pub(crate) const fn maximum_preceding_line_bytes(self) -> NonZeroUsize {
+        self.maximum_preceding_line_bytes
+    }
+
+    pub(crate) const fn maximum_rejected_line_bytes(self) -> NonZeroUsize {
+        self.maximum_rejected_line_bytes
     }
 }
 
@@ -439,16 +488,77 @@ pub(crate) enum CompletedResultExchange {
     NativeFailure,
 }
 
+/// The background commands and subagents the parser held when it refused a frame, and the
+/// subagents an earlier wakeup `init` forgot, by identity: the wait the parser expected.
+/// Retained beside the protocol rejection in `protocol-rejection.json` on the runner host
+/// only (REQ-AGENT-74); never projected into a frame, a run or a published result
+/// (REQ-DIAG-39). Each list keeps its newest `MAXIMUM_RETAINED_TRACKED_WORK` entries.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ClaudeCodeStreamJsonV1TrackedWork {
+    background_commands: Vec<ClaudeCodeStreamJsonV1TrackedCommand>,
+    subagents: Vec<ClaudeCodeStreamJsonV1TrackedSubagent>,
+    forgotten_subagents: Vec<String>,
+    truncated: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ClaudeCodeStreamJsonV1TrackedCommand {
+    task_id: String,
+    tool_use_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    run_id: Option<String>,
+    backgrounded: bool,
+    acknowledged: bool,
+    notified: bool,
+    monitor: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ClaudeCodeStreamJsonV1TrackedSubagent {
+    task_id: String,
+    agent_call_id: String,
+    tool_use_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    run_id: Option<String>,
+    backgrounded: bool,
+    notified: bool,
+}
+
+fn tracked_work_id(id: &str) -> String {
+    ellipsize(id, MAXIMUM_TRACKED_WORK_ID_WIDTH)
+}
+
+/// The newest `MAXIMUM_RETAINED_TRACKED_WORK` items of a ledger, and whether it was cut.
+fn newest_tracked<T, U>(items: &[T], retain: impl Fn(&T) -> U) -> (Vec<U>, bool) {
+    let skipped = items.len().saturating_sub(MAXIMUM_RETAINED_TRACKED_WORK);
+    (items[skipped..].iter().map(retain).collect(), skipped > 0)
+}
+
+/// A main-thread call whose `local_bash` task the parser tracks: a Bash call, or a
+/// `Monitor` call (`monitor`), whose task watches a command and whose result names it as
+/// `taskId` rather than `backgroundTaskId`.
+struct CommandCall {
+    id: Arc<str>,
+    monitor: bool,
+}
+
 struct BackgroundCommand {
     task_id: Arc<str>,
     tool_use_id: Arc<str>,
     run_id: Option<Arc<str>>,
     /// Started with `is_backgrounded: true`, or moved to the background later by a
-    /// `task_updated` patch or by the tool result that names its `backgroundTaskId`. Only
-    /// a backgrounded command owes a `task_notification` before the stream may end.
+    /// `task_updated` patch or by the tool result that names its `backgroundTaskId` (its
+    /// `taskId`, for a monitor). Only a backgrounded command owes a `task_notification`
+    /// before the stream may end.
     backgrounded: bool,
     acknowledged: bool,
     notified: bool,
+    /// The task a `Monitor` call started: each line its command prints opens a turn that
+    /// nothing on the stream announces, until its `task_notification` settles it.
+    monitor: bool,
 }
 
 impl BackgroundCommand {
@@ -461,13 +571,27 @@ impl BackgroundCommand {
 /// observational: settling it is not a completion condition, and the exchange's end
 /// forgets it. A backgrounded one outlives the exchange: it owes a `task_notification`
 /// before the stream may end, and until then its messages and its own task events are
-/// accepted in the terminal drain.
+/// accepted in the terminal drain. A subagent is backgrounded when its `task_started`
+/// says `is_backgrounded: true`, or later, when a `task_updated` patch moves it or the
+/// Agent call's result reports an asynchronous launch; that result also tracks a subagent
+/// whose start the harness never announced, by its `agentId`, with no run id (`None`),
+/// so its notification and task entries match by task id and tool call alone. A message
+/// the agent sends a finished backgrounded subagent resumes it as a new run under the
+/// message's tool call; its messages keep naming the Agent call as their parent.
 struct Subagent {
     task_id: Arc<str>,
+    /// The Agent call that launched the subagent, which its messages name as
+    /// `parent_tool_use_id` through every run.
+    agent_call_id: Arc<str>,
+    /// The tool call that started the current run: the Agent call, or the `SendMessage`
+    /// call that resumed the subagent, which its `task_notification` names.
     tool_use_id: Arc<str>,
     run_id: Option<Arc<str>>,
     subagent_type: Option<Arc<str>>,
     description: Option<Arc<str>>,
+    /// Whether a `task_started` announced the current run; false for a subagent the Agent
+    /// call's asynchronous-launch result tracked alone, whose late start is adopted.
+    announced: bool,
     backgrounded: bool,
     notified: bool,
 }
@@ -475,6 +599,22 @@ struct Subagent {
 impl Subagent {
     fn awaits_notification(&self) -> bool {
         self.backgrounded && !self.notified
+    }
+
+    /// Moves the subagent's current run to the tool call that resumed it, which the
+    /// resumed run's `task_notification` names, and reports the resume.
+    fn resume(
+        &mut self,
+        tool_use_id: &str,
+        run_id: Option<Arc<str>>,
+        backgrounded: bool,
+    ) -> String {
+        self.tool_use_id = Arc::from(tool_use_id);
+        self.run_id = run_id;
+        self.announced = true;
+        self.backgrounded = backgrounded;
+        self.notified = false;
+        self.message("resumed")
     }
 
     fn message(&self, event: &str) -> String {
@@ -504,9 +644,24 @@ pub(crate) struct ClaudeCodeStreamJsonV1Parser {
     exchange_initialized: bool,
     exchange_active: bool,
     completed_exchanges: u64,
-    bash_calls: Vec<Arc<str>>,
+    /// Main-thread Bash and `Monitor` calls awaiting their results (at most 128), whose
+    /// `local_bash` task starts are tracked.
+    command_calls: Vec<CommandCall>,
     background_commands: Vec<BackgroundCommand>,
     subagents: Vec<Subagent>,
+    /// Backgrounded subagents a wakeup `init` forgot as outstanding work, kept by identity
+    /// (newest last, at most `MAXIMUM_TRACKED_TASKS`) so that a later message to one
+    /// resumes it under the Agent call its messages still name.
+    forgotten_subagents: Vec<Subagent>,
+    /// Task ids that `task_started owned_by_subagent: true` introduced (newest last, at most
+    /// `MAXIMUM_TRACKED_TASKS`): a subagent's own work stays its work after the subagent
+    /// settles, so a command it left running is silent wherever its events land.
+    subagent_owned_tasks: Vec<Arc<str>>,
+    /// Task ids whose `task_started` named a `task_type` the parser does not model, neither
+    /// `local_bash` nor `local_agent` (newest last, at most `MAXIMUM_TRACKED_TASKS`): every
+    /// later frame naming one is its activity, unrecognized and never a protocol failure,
+    /// and nothing waits for it.
+    unmodeled_tasks: Vec<Arc<str>>,
     /// Native `type`/`subtype` pairs already observed as unrecognized in this invocation.
     observed_unrecognized_kinds: Vec<(Box<str>, Option<Box<str>>)>,
     active_message: Option<StreamedMessage>,
@@ -523,13 +678,35 @@ pub(crate) struct ClaudeCodeStreamJsonV1Parser {
     /// has not arrived yet.
     scheduled_wakeup_turn: bool,
     accepted_result: Option<CapturedJson>,
+    /// The step's value has settled: the result was accepted in Result mode, or in
+    /// Response and None modes a result left nothing the step waits on outstanding.
+    /// A turn announced after that is an epilogue (REQ-AGENT-76).
+    value_settled: bool,
+    /// The open turn is an epilogue: its messages are activity and its result is no value.
+    epilogue: bool,
+    /// Main-thread messages completed in the open turn; a turn that ends with none and
+    /// `num_turns: 0` is an empty turn.
+    exchange_main_messages: u32,
+    /// An empty turn consumed the announcement of a notified task without a model call;
+    /// the announcement stands for the next `init`.
+    announced_turn_pending: bool,
+    /// A notified command or subagent announced the open turn, which an empty turn may
+    /// consume; a first exchange, a wakeup turn or the adapter's correction turn is not
+    /// announced, and ending it without a model call stays a protocol failure.
+    announced_exchange: bool,
     native_failure: Option<AgentHarnessFailureDetail>,
     native_api_error: Option<HarnessFailureDiagnostic>,
+    /// The newest reset time a usage window not `allowed` reported (REQ-AGENT-72).
+    latest_reset: Option<u64>,
     retry_active: bool,
     observations: Vec<AgentObservation>,
     rejection_context: ClaudeCodeStreamJsonV1RejectionContext,
     rejection_state_snapshot: Option<ClaudeCodeStreamJsonV1RejectionState>,
     protocol_rejection: Option<AgentProtocolRejectionDiagnostic>,
+    /// The most recent accepted frames, kept for the stream excerpt of a rejection.
+    stream_tail: StreamTail,
+    /// The frame, overrun buffer or open buffer the stream was rejected on.
+    rejected_line: Option<RetainedStreamLine>,
     failure: Option<AgentFailureCause>,
 }
 
@@ -568,6 +745,11 @@ impl ClaudeCodeStreamJsonV1Parser {
             expected_claude_code_version,
             value_kind,
             maximum_response_bytes,
+            stream_tail: StreamTail::new(
+                limits.retained_preceding_lines(),
+                limits.maximum_preceding_line_bytes(),
+            ),
+            rejected_line: None,
             limits,
             frame: Vec::new(),
             expected_session_id,
@@ -575,9 +757,12 @@ impl ClaudeCodeStreamJsonV1Parser {
             exchange_initialized: false,
             exchange_active: true,
             completed_exchanges: 0,
-            bash_calls: Vec::new(),
+            command_calls: Vec::new(),
             background_commands: Vec::new(),
             subagents: Vec::new(),
+            forgotten_subagents: Vec::new(),
+            subagent_owned_tasks: Vec::new(),
+            unmodeled_tasks: Vec::new(),
             observed_unrecognized_kinds: Vec::new(),
             active_message: None,
             final_main_message: None,
@@ -588,8 +773,14 @@ impl ClaudeCodeStreamJsonV1Parser {
             scheduled_wakeup_pending: false,
             scheduled_wakeup_turn: false,
             accepted_result: None,
+            value_settled: false,
+            epilogue: false,
+            exchange_main_messages: 0,
+            announced_turn_pending: false,
+            announced_exchange: false,
             native_failure: None,
             native_api_error: None,
+            latest_reset: None,
             retry_active: false,
             observations: Vec::new(),
             rejection_context: ClaudeCodeStreamJsonV1RejectionContext::default(),
@@ -643,6 +834,7 @@ impl ClaudeCodeStreamJsonV1Parser {
         }
         self.result_decision_pending = false;
         self.accepted_result = Some(result);
+        self.value_settled = true;
         Ok(())
     }
 
@@ -667,10 +859,24 @@ impl ClaudeCodeStreamJsonV1Parser {
         }
         self.exchange_active = true;
         self.final_main_message = None;
+        self.reset_exchange_state();
+        Ok(())
+    }
+
+    /// Begins a turn a settled subagent or command announced after the step's value
+    /// settled. The final main-thread message stays the value's (REQ-AGENT-76).
+    fn begin_epilogue(&mut self) {
+        self.exchange_active = true;
+        self.epilogue = true;
+        self.reset_exchange_state();
+    }
+
+    fn reset_exchange_state(&mut self) {
         self.exchange_structured_output_candidates = 0;
+        self.exchange_main_messages = 0;
+        self.announced_exchange = false;
         self.native_failure = None;
         self.native_api_error = None;
-        Ok(())
     }
 
     /// Consumes arbitrary stdout chunks while retaining at most one bounded JSONL frame.
@@ -689,11 +895,12 @@ impl ClaudeCodeStreamJsonV1Parser {
             if byte == b'\n' {
                 let frame = std::mem::take(&mut self.frame);
                 if let Err(failure) = self.parse_frame(&frame) {
+                    self.rejected_line = Some(self.retained_rejected_line(&frame));
                     self.invalidate_values();
                     self.observations.clear();
-                    self.failure = Some(failure.clone());
-                    return Err(failure);
+                    return Err(self.fail_stream(failure));
                 }
+                self.stream_tail.push(&frame);
                 for observation in self.observations.drain(..) {
                     observe(observation);
                 }
@@ -702,10 +909,12 @@ impl ClaudeCodeStreamJsonV1Parser {
 
             let retained = u64::try_from(self.frame.len()).unwrap_or(u64::MAX);
             if retained >= self.limits.maximum_frame_bytes().get() {
-                return self.fail_protocol(
+                self.rejected_line = Some(self.retained_rejected_line(&self.frame));
+                let failure = self.record_protocol_failure(
                     ClaudeCodeStreamJsonV1RejectionReason::FrameTooLarge,
                     ClaudeCodeStreamJsonV1ProtocolStage::FrameRead,
                 );
+                return Err(self.fail_stream(failure));
             }
             self.frame.push(byte);
         }
@@ -714,12 +923,14 @@ impl ClaudeCodeStreamJsonV1Parser {
 
     pub(crate) fn finish(mut self, exit_success: bool) -> AgentOutcome {
         if self.failure.is_none() && !self.frame.is_empty() {
+            self.rejected_line = Some(self.retained_rejected_line(&self.frame));
             self.prepare_rejection(ClaudeCodeStreamJsonV1ProtocolStage::EndOfStream);
             self.record_rejection(
                 ClaudeCodeStreamJsonV1RejectionReason::PartialFrameAtEndOfStream,
                 ClaudeCodeStreamJsonV1ProtocolStage::EndOfStream,
             );
-            self.failure = Some(self.protocol_failure());
+            let failure = self.protocol_failure();
+            self.fail_stream(failure);
             self.invalidate_values();
         }
         if let Some(failure) = self.failure.clone() {
@@ -737,6 +948,7 @@ impl ClaudeCodeStreamJsonV1Parser {
             || self.active_message.is_some()
             || self.completed_result_exchange.is_some()
             || self.result_decision_pending
+            || self.announced_turn_pending
             || self.completed_exchanges == 0
         {
             return self.end_of_stream_invariant_failure();
@@ -838,22 +1050,36 @@ impl ClaudeCodeStreamJsonV1Parser {
             self.rejection_context.stage = ClaudeCodeStreamJsonV1ProtocolStage::Initialization;
             // A Result-mode correction turn is begun by the adapter before its init arrives;
             // begin_exchange refuses this one while a decision is pending or a result is
-            // accepted (INV-HARNESS-7).
+            // accepted (INV-HARNESS-7). Once the value has settled, the announced turn is
+            // an epilogue instead (REQ-AGENT-76).
             if !self.exchange_active {
                 let scheduled_wakeup = self.scheduled_wakeup_pending;
-                if self.native_failure.is_some()
-                    || !(scheduled_wakeup
-                        || self.background_commands.iter().any(|task| task.notified)
-                        || self.subagents.iter().any(|subagent| subagent.notified))
-                {
+                // An empty turn's announcement stands for this one.
+                // An outstanding monitor announces the turn too: each line its command
+                // prints opens one, with nothing on the stream before its `init`.
+                let announced = self.announced_turn_pending
+                    || self
+                        .background_commands
+                        .iter()
+                        .any(|task| task.notified || (task.monitor && task.awaits_notification()))
+                    || self.subagents.iter().any(|subagent| subagent.notified);
+                // After a native failure the refusal ends the stream with that failure
+                // (`fail_stream`), whatever announced the turn.
+                if self.native_failure.is_some() || !(scheduled_wakeup || announced) {
                     return Err(self.protocol_failure());
                 }
-                self.begin_exchange()?;
+                self.announced_turn_pending = false;
+                if self.value_settled {
+                    self.begin_epilogue();
+                } else {
+                    self.begin_exchange()?;
+                }
+                self.announced_exchange = announced;
                 // Only completed tasks and subagents, or a scheduled wakeup, authorize this
                 // turn. Others remain owned by the invocation and may notify during the
                 // next native exchange.
                 self.background_commands.retain(|task| !task.notified);
-                self.subagents.retain(|subagent| !subagent.notified);
+                self.forget_notified_subagents();
                 self.scheduled_wakeup_pending = false;
                 self.scheduled_wakeup_turn |= scheduled_wakeup;
             }
@@ -864,7 +1090,15 @@ impl ClaudeCodeStreamJsonV1Parser {
             self.rejection_context.stage = ClaudeCodeStreamJsonV1ProtocolStage::TerminalDrain;
             return self.parse_terminal_drain(event_type, object, &value);
         }
-        if !self.exchange_initialized {
+        // The adapter has begun the correction turn (`begin_exchange`) and Claude Code has
+        // not yet written its `init`. A subagent thread's frame or a task frame that lands
+        // in that window is the turn's to read: a resumed run's first message or a stopped
+        // subagent's interruption is the subagent's work (REQ-AGENT-64, REQ-AGENT-69), parsed
+        // below as it would be after the `init`. The main thread cannot speak before its
+        // `init`, so its frame stays the protocol failure.
+        if !self.exchange_initialized
+            && !correction_window_admits(event_type, self.rejection_context.event_thread)
+        {
             return self.reject(
                 ClaudeCodeStreamJsonV1RejectionReason::ExchangeInitializationMissing,
                 ClaudeCodeStreamJsonV1ProtocolStage::ExchangeLifecycle,
@@ -965,10 +1199,34 @@ impl ClaudeCodeStreamJsonV1Parser {
                 if required_string(object, "subtype") == Some("task_started")
                     && required_bool(object, "owned_by_subagent") == Some(true) =>
             {
+                self.remember_subagent_work(object);
                 Ok(())
             }
             "system" if required_string(object, "subtype") == Some("background_tasks_changed") => {
-                self.validate_drained_background_tasks(object)
+                if self.validate_drained_background_tasks(object)? {
+                    self.observe_unrecognized(value);
+                }
+                Ok(())
+            }
+            // Claude Code resumes a finished subagent on its own to deliver the report of a
+            // command the subagent left running: a `local_agent` start naming a settled
+            // subagent, still tracked or forgotten, whose resumed run is outstanding work
+            // again (REQ-AGENT-64).
+            "system"
+                if required_string(object, "subtype") == Some("task_started")
+                    && required_string(object, "task_type") == Some("local_agent")
+                    && required_nonempty_string(object, "task_id")
+                        .is_some_and(|task_id| self.settled_subagent(task_id)) =>
+            {
+                self.rejection_context.stage = ClaudeCodeStreamJsonV1ProtocolStage::SystemEvent;
+                self.resume_settled_subagent(object)
+            }
+            "system"
+                if required_string(object, "subtype") == Some("task_started")
+                    && unmodeled_task_type(object) =>
+            {
+                self.remember_unmodeled_task(object, value);
+                Ok(())
             }
             "system" if required_string(object, "subtype") == Some("task_started") => self.reject(
                 ClaudeCodeStreamJsonV1RejectionReason::TerminalDrainEventInvalid,
@@ -991,18 +1249,27 @@ impl ClaudeCodeStreamJsonV1Parser {
 
     /// In the drain the harness's task list must name exactly the outstanding commands
     /// and subagents; an entry naming no tracked task is a subagent's own work while one
-    /// is outstanding.
+    /// is outstanding or when a subagent's start introduced it, and an entry naming a
+    /// settled subagent, still tracked or forgotten, announces the resume that delivers
+    /// its command's report. An entry naming a task of a kind the parser does not model is
+    /// that task's activity; the result says whether the list named one, so that the
+    /// caller records the frame as unrecognized.
     fn validate_drained_background_tasks(
         &self,
         object: &Map<String, Value>,
-    ) -> Result<(), AgentFailureCause> {
+    ) -> Result<bool, AgentFailureCause> {
         let tasks = required_array(object, "tasks").ok_or_else(|| self.protocol_failure())?;
         let mut seen = Vec::new();
+        let mut names_unmodeled_task = false;
         for entry in tasks {
             let entry = entry.as_object().ok_or_else(|| self.protocol_failure())?;
             let id = required_nonempty_string(entry, "task_id")
                 .ok_or_else(|| self.protocol_failure())?;
-            if self.is_subagent_work(id) {
+            if self.is_subagent_work(id) || self.settled_subagent(id) {
+                continue;
+            }
+            if self.is_unmodeled_task(id) || (unmodeled_task_type(entry) && !self.tracks_task(id)) {
+                names_unmodeled_task = true;
                 continue;
             }
             let run_id = required_nonempty_string(entry, "run_id");
@@ -1015,7 +1282,10 @@ impl ClaudeCodeStreamJsonV1Parser {
                 Some("local_agent") => self.subagents.iter().any(|subagent| {
                     subagent.awaits_notification()
                         && subagent.task_id.as_ref() == id
-                        && subagent.run_id.as_deref() == run_id
+                        && subagent
+                            .run_id
+                            .as_deref()
+                            .is_none_or(|known| Some(known) == run_id)
                 }),
                 _ => false,
             };
@@ -1037,7 +1307,7 @@ impl ClaudeCodeStreamJsonV1Parser {
         if seen.len() != outstanding {
             return Err(self.protocol_failure());
         }
-        Ok(())
+        Ok(names_unmodeled_task)
     }
 
     fn parse_initialization(
@@ -1296,13 +1566,21 @@ impl ClaudeCodeStreamJsonV1Parser {
                 else {
                     return Err(self.protocol_failure());
                 };
-                if name == "Bash" {
-                    if self.bash_calls.len() >= 128
-                        || self.bash_calls.iter().any(|id| id.as_ref() == call_id)
+                // A subagent's `Monitor` is its own work, whose task starts are its own.
+                let monitor = name == "Monitor" && message.parent_tool_use_id.is_none();
+                if name == "Bash" || monitor {
+                    if self.command_calls.len() >= 128
+                        || self
+                            .command_calls
+                            .iter()
+                            .any(|call| call.id.as_ref() == call_id)
                     {
                         return Err(self.protocol_failure());
                     }
-                    self.bash_calls.push(Arc::from(call_id));
+                    self.command_calls.push(CommandCall {
+                        id: Arc::from(call_id),
+                        monitor,
+                    });
                 }
                 self.observations.push(AgentObservation::ToolCall {
                     call_id: Arc::from(call_id),
@@ -1597,6 +1875,9 @@ impl ClaudeCodeStreamJsonV1Parser {
             return Err(self.protocol_failure());
         }
         if message.parent_tool_use_id.is_none() {
+            self.exchange_main_messages = self.exchange_main_messages.saturating_add(1);
+        }
+        if message.parent_tool_use_id.is_none() && !self.epilogue {
             self.final_main_message = Some(CompletedMainMessage {
                 text_blocks: message.text_blocks,
                 tool_use_blocks: message.tool_use_blocks,
@@ -1659,18 +1940,21 @@ impl ClaudeCodeStreamJsonV1Parser {
             let diagnostic = required_nonempty_string(block, "text")
                 .filter(|_| required_string(block, "type") == Some("text"))
                 .ok_or_else(|| self.protocol_failure())?;
-            if self.active_message.is_some()
-                || required_nonempty_string(object, "request_id").is_none()
-            {
+            if self.active_message.is_some() {
                 return Err(self.protocol_failure());
             }
+            // `request_id` is absent when no request reached the API (the login-less
+            // `authentication_failed` answer); it is never required.
             let code =
                 required_nonempty_string(object, "error").ok_or_else(|| self.protocol_failure())?;
             let http_status = object
                 .get("api_error_status")
                 .and_then(Value::as_u64)
                 .and_then(|status| u16::try_from(status).ok());
-            self.native_api_error = Some(HarnessFailureDiagnostic::from_code(code, http_status));
+            self.native_api_error = Some(
+                HarnessFailureDiagnostic::from_code(code, http_status)
+                    .with_limit_reset(self.latest_reset),
+            );
             self.observations.push(AgentObservation::Diagnostic {
                 level: AgentDiagnosticLevel::Error,
                 message: Arc::from(diagnostic),
@@ -1782,10 +2066,21 @@ impl ClaudeCodeStreamJsonV1Parser {
                 .get("content")
                 .and_then(normalized_tool_result_content)
                 .ok_or_else(|| self.protocol_failure())?;
+            // A Bash call's result names its background task as `backgroundTaskId`; a
+            // `Monitor` call's names its task as `taskId`, and the two acknowledge alike.
+            let task_field = if self
+                .command_calls
+                .iter()
+                .any(|call| call.monitor && call.id.as_ref() == call_id)
+            {
+                "taskId"
+            } else {
+                "backgroundTaskId"
+            };
             let background_task_id = object
                 .get("tool_use_result")
                 .and_then(Value::as_object)
-                .and_then(|result| required_nonempty_string(result, "backgroundTaskId"));
+                .and_then(|result| required_nonempty_string(result, task_field));
             if parent.is_some() {
                 // A subagent's tool result settles the subagent's own call; a task it
                 // names is the subagent's work, never a command this invocation tracks.
@@ -1807,6 +2102,16 @@ impl ClaudeCodeStreamJsonV1Parser {
                 // if the harness announced one, is over.
                 self.background_commands
                     .retain(|task| task.tool_use_id.as_ref() != call_id);
+                // An Agent call's result reporting an asynchronous launch is the harness's
+                // word that the subagent runs in the background, whether or not its
+                // `task_started` said so, or was emitted at all.
+                if let Some(launch) = object
+                    .get("tool_use_result")
+                    .and_then(Value::as_object)
+                    .filter(|result| async_agent_launch(result))
+                {
+                    self.adopt_async_agent_launch(call_id, launch)?;
+                }
             }
             let acknowledges_structured_output =
                 self.active_message.as_ref().is_some_and(|message| {
@@ -1845,8 +2150,12 @@ impl ClaudeCodeStreamJsonV1Parser {
             // A foreground Bash result no longer needs correlation state. A
             // background result has already been paired with task_started above;
             // its task identity remains until notification/continuation.
-            if let Some(index) = self.bash_calls.iter().position(|id| id.as_ref() == call_id) {
-                self.bash_calls.remove(index);
+            if let Some(index) = self
+                .command_calls
+                .iter()
+                .position(|call| call.id.as_ref() == call_id)
+            {
+                self.command_calls.remove(index);
             }
         }
         Ok(())
@@ -1888,19 +2197,21 @@ impl ClaudeCodeStreamJsonV1Parser {
                 // A subagent's own tool runs belong to the subagent, not to this
                 // invocation: they are never tracked and owe nothing.
                 if required_bool(object, "owned_by_subagent") == Some(true) {
+                    self.remember_subagent_work(object);
                     return Ok(());
                 }
                 if required_string(object, "task_type") == Some("local_agent") {
                     return self.start_subagent(object);
                 }
-                if required_string(object, "task_type") != Some("local_bash") {
-                    self.observe_unrecognized(value);
+                if unmodeled_task_type(object) {
+                    self.remember_unmodeled_task(object, value);
                     return Ok(());
                 }
-                // Every Bash call starts a `local_bash` task, foreground or not. The
-                // harness may start it as soon as the tool-use block closes, before the
-                // message's own `message_delta`, so an active message is not a violation.
-                // A foreground task is tracked so that the harness may move it to the
+                // Every Bash call starts a `local_bash` task, foreground or not, and so does
+                // a `Monitor` call, backgrounded, for the command it watches. The harness
+                // may start it as soon as the tool-use block closes, before the message's
+                // own `message_delta`, so an active message is not a violation. A
+                // foreground task is tracked so that the harness may move it to the
                 // background later (at its foreground timeout) without the parser losing
                 // the correlation; a start naming an unknown call is unrecognized unless
                 // it claims the background, which is a protocol failure as before.
@@ -1912,13 +2223,18 @@ impl ClaudeCodeStreamJsonV1Parser {
                     .ok_or_else(|| self.protocol_failure())?;
                 let tool_use_id = required_nonempty_string(object, "tool_use_id")
                     .ok_or_else(|| self.protocol_failure())?;
-                if !self.bash_calls.iter().any(|id| id.as_ref() == tool_use_id) {
+                let Some(monitor) = self
+                    .command_calls
+                    .iter()
+                    .find(|call| call.id.as_ref() == tool_use_id)
+                    .map(|call| call.monitor)
+                else {
                     if backgrounded {
                         return Err(self.protocol_failure());
                     }
                     self.observe_unrecognized(value);
                     return Ok(());
-                }
+                };
                 if self.background_commands.len() >= MAXIMUM_TRACKED_TASKS
                     || self.background_commands.iter().any(|task| {
                         task.task_id.as_ref() == task_id || task.tool_use_id.as_ref() == tool_use_id
@@ -1934,6 +2250,7 @@ impl ClaudeCodeStreamJsonV1Parser {
                     backgrounded,
                     acknowledged: false,
                     notified: false,
+                    monitor,
                 });
             }
             "task_progress" => {
@@ -1973,7 +2290,7 @@ impl ClaudeCodeStreamJsonV1Parser {
                     if subagent_work {
                         return Ok(());
                     }
-                    if self.exchange_active {
+                    if self.exchange_active || self.is_unmodeled_task(task_id) {
                         self.observe_unrecognized(value);
                         return Ok(());
                     }
@@ -2019,6 +2336,18 @@ impl ClaudeCodeStreamJsonV1Parser {
         Ok(())
     }
 
+    /// A wakeup `init` forgets the notified subagents as outstanding work; their identity
+    /// is kept, newest last, so that a later message to one resumes it (`start_subagent`).
+    fn forget_notified_subagents(&mut self) {
+        let (forgotten, outstanding): (Vec<_>, Vec<_>) = self
+            .subagents
+            .drain(..)
+            .partition(|subagent| subagent.notified);
+        self.subagents = outstanding;
+        self.forgotten_subagents.extend(forgotten);
+        keep_newest(&mut self.forgotten_subagents);
+    }
+
     fn tracks_subagent(&self, task_id: &str) -> bool {
         self.subagents
             .iter()
@@ -2037,14 +2366,98 @@ impl ClaudeCodeStreamJsonV1Parser {
     /// yet settled, so that a message naming it as parent is that subagent's activity.
     fn awaits_subagent(&self, tool_use_id: &str) -> bool {
         self.subagents.iter().any(|subagent| {
-            subagent.awaits_notification() && subagent.tool_use_id.as_ref() == tool_use_id
+            subagent.awaits_notification() && subagent.agent_call_id.as_ref() == tool_use_id
         })
     }
 
-    /// A task event naming no tracked task is a backgrounded subagent's own work while
-    /// one is outstanding; the subagent, not this invocation, owns it.
+    /// Keeps the task id a `task_started owned_by_subagent: true` introduced, so that the
+    /// subagent's own work stays its work after the subagent settles.
+    fn remember_subagent_work(&mut self, object: &Map<String, Value>) {
+        if let Some(task_id) = self.untracked_task_id(object) {
+            remember_task_id(&mut self.subagent_owned_tasks, task_id);
+        }
+    }
+
+    /// Records the start of a task of a kind the parser does not model as unrecognized and
+    /// keeps its id, so that every later frame naming it is its activity (REQ-AGENT-38).
+    fn remember_unmodeled_task(&mut self, object: &Map<String, Value>, value: &Value) {
+        self.observe_unrecognized(value);
+        if let Some(task_id) = self.untracked_task_id(object) {
+            remember_task_id(&mut self.unmodeled_tasks, task_id);
+        }
+    }
+
+    /// The `task_id` a task frame names, unless it names a tracked command or subagent.
+    fn untracked_task_id<'a>(&self, object: &'a Map<String, Value>) -> Option<&'a str> {
+        required_nonempty_string(object, "task_id").filter(|task_id| !self.tracks_task(task_id))
+    }
+
+    /// A task of a kind the parser does not model, which no tracked task shadows.
+    fn is_unmodeled_task(&self, task_id: &str) -> bool {
+        !self.tracks_task(task_id)
+            && self
+                .unmodeled_tasks
+                .iter()
+                .any(|known| known.as_ref() == task_id)
+    }
+
+    /// A task event naming no tracked task is a subagent's own work when a subagent's
+    /// start introduced it, or while a backgrounded subagent is outstanding; the subagent,
+    /// not this invocation, owns it.
     fn is_subagent_work(&self, task_id: &str) -> bool {
-        !self.tracks_task(task_id) && self.subagents.iter().any(Subagent::awaits_notification)
+        !self.tracks_task(task_id)
+            && (self
+                .subagent_owned_tasks
+                .iter()
+                .any(|known| known.as_ref() == task_id)
+                || self.subagents.iter().any(Subagent::awaits_notification))
+    }
+
+    fn forgotten_subagent(&self, task_id: &str) -> Option<usize> {
+        self.forgotten_subagents
+            .iter()
+            .position(|subagent| subagent.task_id.as_ref() == task_id)
+    }
+
+    /// A subagent that has settled and may be resumed: a tracked one that is notified
+    /// (no wakeup `init` has forgotten it yet) or a forgotten one.
+    fn settled_subagent(&self, task_id: &str) -> bool {
+        self.subagents
+            .iter()
+            .any(|subagent| subagent.task_id.as_ref() == task_id && subagent.notified)
+            || self.forgotten_subagent(task_id).is_some()
+    }
+
+    pub(crate) const fn result_accepted(&self) -> bool {
+        self.accepted_result.is_some()
+    }
+
+    /// Whether nothing is open or outstanding: no exchange or epilogue is under way and no
+    /// background work owes a notification. The adapter's settlement grace runs only then
+    /// (INV-HARNESS-7).
+    pub(crate) fn settling(&self) -> bool {
+        !self.exchange_active && !self.announced_turn_pending && !self.awaits_background_work()
+    }
+
+    /// A turn a notified task announced that Claude Code opened and closed without a model
+    /// call: `init`, then a `result` with `num_turns: 0` and no main-thread message
+    /// (2.1.310 emits one for a backgrounded subagent's notification that its own resume
+    /// superseded, with no `terminal_reason`). The turn decides and settles nothing, and
+    /// the announcement it consumed stands for the next `init`, which delivers the
+    /// notification (REQ-AGENT-69). The same `result` in a turn nothing announced, the
+    /// shape of a first prompt a hook blocked, never reaches here.
+    fn complete_empty_turn(&mut self) -> Result<(), AgentFailureCause> {
+        self.epilogue = false;
+        self.exchange_initialized = false;
+        self.exchange_active = false;
+        self.announced_turn_pending = true;
+        self.completed_exchanges = self
+            .completed_exchanges
+            .checked_add(1)
+            .ok_or_else(|| self.protocol_failure())?;
+        self.observations
+            .push(lifecycle(AgentLifecycleMilestone::TurnCompleted));
+        Ok(())
     }
 
     /// Background commands and backgrounded subagents that still owe a notification.
@@ -2063,24 +2476,60 @@ impl ClaudeCodeStreamJsonV1Parser {
             required_nonempty_string(object, "task_id").ok_or_else(|| self.protocol_failure())?;
         let tool_use_id = required_nonempty_string(object, "tool_use_id")
             .ok_or_else(|| self.protocol_failure())?;
+        let run_id = required_nonempty_string(object, "run_id").map(Arc::from);
+        let backgrounded = required_bool(object, "is_backgrounded") == Some(true);
+        let holds_tool_use = |subagent: &Subagent| subagent.tool_use_id.as_ref() == tool_use_id;
+        if let Some(index) = self
+            .subagents
+            .iter()
+            .position(|subagent| subagent.task_id.as_ref() == task_id)
+        {
+            // A message the agent sends a finished backgrounded subagent (`SendMessage`)
+            // resumes it: the harness announces the resume as a `task_started` naming the
+            // subagent's `task_id` under the message's `tool_use_id` and a new `run_id`, and
+            // the resumed run owes a notification of its own. A message to a subagent still
+            // running is queued for it and starts nothing, so a repeat of a `task_id` that
+            // is not yet notified stays a protocol failure, as does one under a
+            // `tool_use_id` another tracked subagent holds.
+            let tracked = &mut self.subagents[index];
+            if !tracked.announced && holds_tool_use(tracked) {
+                // The start of a launch the Agent call's result already announced
+                // (`adopt_async_agent_launch`): it names the run and the subagent.
+                tracked.announced = true;
+                tracked.run_id = run_id;
+                tracked.backgrounded |= backgrounded;
+                tracked.subagent_type = required_nonempty_string(object, "subagent_type")
+                    .map(|kind| Arc::from(ellipsize(kind, MAXIMUM_SUBAGENT_TOKEN_WIDTH)));
+                if let Some(description) = required_nonempty_string(object, "description") {
+                    tracked.description = Some(Arc::from(ellipsize(
+                        description,
+                        MAXIMUM_SUBAGENT_DESCRIPTION_WIDTH,
+                    )));
+                }
+                return Ok(());
+            }
+            return self.resume_subagent(index, object);
+        }
+        if let Some(index) = self.forgotten_subagent(task_id) {
+            return self.resume_forgotten_subagent(index, object);
+        }
         if self.subagents.len() >= MAXIMUM_TRACKED_TASKS
             || self.tracks_task(task_id)
-            || self
-                .subagents
-                .iter()
-                .any(|subagent| subagent.tool_use_id.as_ref() == tool_use_id)
+            || self.subagents.iter().any(holds_tool_use)
         {
             return Err(self.protocol_failure());
         }
         let subagent = Subagent {
             task_id: Arc::from(task_id),
+            agent_call_id: Arc::from(tool_use_id),
             tool_use_id: Arc::from(tool_use_id),
-            run_id: required_nonempty_string(object, "run_id").map(Arc::from),
+            run_id,
             subagent_type: required_nonempty_string(object, "subagent_type")
                 .map(|kind| Arc::from(ellipsize(kind, MAXIMUM_SUBAGENT_TOKEN_WIDTH))),
             description: required_nonempty_string(object, "description")
                 .map(|text| Arc::from(ellipsize(text, MAXIMUM_SUBAGENT_DESCRIPTION_WIDTH))),
-            backgrounded: required_bool(object, "is_backgrounded") == Some(true),
+            announced: true,
+            backgrounded,
             notified: false,
         };
         self.observations.push(AgentObservation::Diagnostic {
@@ -2091,7 +2540,121 @@ impl ClaudeCodeStreamJsonV1Parser {
         Ok(())
     }
 
-    /// `task_updated` for a tracked subagent is recognized silently; its
+    /// Resumes the tracked subagent at `index`, which must have settled, under the tool
+    /// call the start names (a `SendMessage` call, or any call no other tracked subagent
+    /// holds when Claude Code resumes it on its own), and reports the resume; the resumed
+    /// run owes a notification of its own.
+    fn resume_subagent(
+        &mut self,
+        index: usize,
+        object: &Map<String, Value>,
+    ) -> Result<(), AgentFailureCause> {
+        let tool_use_id = required_nonempty_string(object, "tool_use_id")
+            .ok_or_else(|| self.protocol_failure())?;
+        let other_holds_tool_use = self.subagents.iter().enumerate().any(|(other, subagent)| {
+            other != index && subagent.tool_use_id.as_ref() == tool_use_id
+        });
+        if !self.subagents[index].notified || other_holds_tool_use {
+            return Err(self.protocol_failure());
+        }
+        let message = self.subagents[index].resume(
+            tool_use_id,
+            required_nonempty_string(object, "run_id").map(Arc::from),
+            required_bool(object, "is_backgrounded") == Some(true),
+        );
+        self.observations.push(AgentObservation::Diagnostic {
+            level: AgentDiagnosticLevel::Information,
+            message: Arc::from(message),
+        });
+        Ok(())
+    }
+
+    /// The same resume from a later turn, or the one Claude Code begins in the drain to
+    /// deliver the report of a command the subagent left running: the `init` its
+    /// notification authorized forgot the subagent as outstanding work, but its resumed
+    /// run's messages still name the Agent call that launched it, so it is tracked again
+    /// under that call.
+    fn resume_forgotten_subagent(
+        &mut self,
+        index: usize,
+        object: &Map<String, Value>,
+    ) -> Result<(), AgentFailureCause> {
+        if self.subagents.len() >= MAXIMUM_TRACKED_TASKS {
+            return Err(self.protocol_failure());
+        }
+        let subagent = self.forgotten_subagents.remove(index);
+        self.subagents.push(subagent);
+        self.resume_subagent(self.subagents.len() - 1, object)
+    }
+
+    /// The drain's harness-initiated resume of a settled subagent (`settled_subagent`):
+    /// in place while the subagent is still tracked, else from the forgotten list.
+    fn resume_settled_subagent(
+        &mut self,
+        object: &Map<String, Value>,
+    ) -> Result<(), AgentFailureCause> {
+        let task_id =
+            required_nonempty_string(object, "task_id").ok_or_else(|| self.protocol_failure())?;
+        if let Some(index) = self
+            .subagents
+            .iter()
+            .position(|subagent| subagent.task_id.as_ref() == task_id)
+        {
+            return self.resume_subagent(index, object);
+        }
+        let index = self
+            .forgotten_subagent(task_id)
+            .ok_or_else(|| self.protocol_failure())?;
+        self.resume_forgotten_subagent(index, object)
+    }
+
+    /// The Agent call `call_id` returned `status: async_launched`: the subagent it started is
+    /// background work from here on. The subagent its `task_started` tracked is promoted;
+    /// when no start announced it, the result's `agentId` (the task id) tracks it under the
+    /// call, with no run id, matched by task id and tool call alone.
+    fn adopt_async_agent_launch(
+        &mut self,
+        call_id: &str,
+        launch: &Map<String, Value>,
+    ) -> Result<(), AgentFailureCause> {
+        if let Some(subagent) = self
+            .subagents
+            .iter_mut()
+            .find(|subagent| subagent.tool_use_id.as_ref() == call_id)
+        {
+            subagent.backgrounded = true;
+            return Ok(());
+        }
+        let Some(task_id) = required_nonempty_string(launch, "agentId") else {
+            return Ok(());
+        };
+        if self.subagents.len() >= MAXIMUM_TRACKED_TASKS || self.tracks_task(task_id) {
+            return Err(self.protocol_failure());
+        }
+        let subagent = Subagent {
+            task_id: Arc::from(task_id),
+            agent_call_id: Arc::from(call_id),
+            tool_use_id: Arc::from(call_id),
+            run_id: None,
+            subagent_type: None,
+            description: required_nonempty_string(launch, "description")
+                .map(|text| Arc::from(ellipsize(text, MAXIMUM_SUBAGENT_DESCRIPTION_WIDTH))),
+            announced: false,
+            backgrounded: true,
+            notified: false,
+        };
+        self.observations.push(AgentObservation::Diagnostic {
+            level: AgentDiagnosticLevel::Information,
+            message: Arc::from(subagent.message("started")),
+        });
+        self.subagents.push(subagent);
+        Ok(())
+    }
+
+    /// `task_updated` for a tracked subagent is recognized silently, save a
+    /// `patch.is_backgrounded: true` for the current run, which moves the subagent to the
+    /// background as it does a command: Claude Code registers an `Agent` call made with
+    /// `run_in_background` in the foreground at times and announces the move only so. Its
     /// `task_notification` names the status. A foreground subagent's notification retires
     /// it; a backgrounded one's must correlate exactly and settles what it owes.
     fn settle_subagent(
@@ -2099,9 +2662,6 @@ impl ClaudeCodeStreamJsonV1Parser {
         object: &Map<String, Value>,
         task_id: &str,
     ) -> Result<(), AgentFailureCause> {
-        if required_string(object, "subtype") != Some("task_notification") {
-            return Ok(());
-        }
         let Some(index) = self
             .subagents
             .iter()
@@ -2109,13 +2669,26 @@ impl ClaudeCodeStreamJsonV1Parser {
         else {
             return Err(self.protocol_failure());
         };
+        if required_string(object, "subtype") != Some("task_notification") {
+            let moved = required_object(object, "patch")
+                .and_then(|patch| required_bool(patch, "is_backgrounded"))
+                == Some(true)
+                && required_nonempty_string(object, "run_id")
+                    == self.subagents[index].run_id.as_deref();
+            if moved {
+                self.subagents[index].backgrounded = true;
+            }
+            return Ok(());
+        }
         let subagent = &self.subagents[index];
         let tool_use_id = required_nonempty_string(object, "tool_use_id");
         let status = required_nonempty_string(object, "status");
         let invalid = if subagent.backgrounded {
             subagent.notified
                 || tool_use_id != Some(subagent.tool_use_id.as_ref())
-                || required_nonempty_string(object, "run_id") != subagent.run_id.as_deref()
+                || subagent.run_id.as_deref().is_some_and(|run_id| {
+                    required_nonempty_string(object, "run_id") != Some(run_id)
+                })
                 || status.is_none()
         } else {
             tool_use_id.is_some_and(|id| id != subagent.tool_use_id.as_ref())
@@ -2150,6 +2723,12 @@ impl ClaudeCodeStreamJsonV1Parser {
         let status = info.and_then(|info| required_nonempty_string(info, "status"));
         if status == Some("allowed") {
             return Ok(());
+        }
+        if let Some(reset) = info
+            .and_then(|info| info.get("resetsAt"))
+            .and_then(Value::as_u64)
+        {
+            self.latest_reset = Some(reset);
         }
         let window = info.and_then(|info| required_nonempty_string(info, "rateLimitType"));
         let message = match (status, window) {
@@ -2193,11 +2772,20 @@ impl ClaudeCodeStreamJsonV1Parser {
             || self.active_message.is_some()
             || self.completed_result_exchange.is_some()
             || self.result_decision_pending
-            || self.accepted_result.is_some()
+            || (self.accepted_result.is_some() && !self.epilogue)
         {
             return Err(self.protocol_failure());
         }
         self.require_matching_session(object)?;
+        if self.announced_exchange
+            && self.exchange_main_messages == 0
+            && object.get("num_turns").and_then(Value::as_u64) == Some(0)
+            && required_bool(object, "is_error") == Some(false)
+            && required_nonempty_string(object, "subtype") == Some("success")
+        {
+            return self.complete_empty_turn();
+        }
+        let epilogue = std::mem::take(&mut self.epilogue);
         let subtype =
             required_nonempty_string(object, "subtype").ok_or_else(|| self.protocol_failure())?;
         let is_error = required_bool(object, "is_error").ok_or_else(|| self.protocol_failure())?;
@@ -2237,16 +2825,28 @@ impl ClaudeCodeStreamJsonV1Parser {
                     .unwrap_or_else(|| HarnessFailureDiagnostic::from_code(code, None))
             } else {
                 HarnessFailureDiagnostic::from_code(code, None)
-            };
+            }
+            .with_limit_reset(self.latest_reset);
             diagnostic.http_status = http_status.or(diagnostic.http_status);
-            self.native_failure = Some(AgentHarnessFailureDetail::Classified {
-                canonical: CanonicalHarnessFailure::ModelError,
-                diagnostic,
-            });
+            if epilogue {
+                // The value settled before this turn began: its failure is reported and
+                // the value stands (REQ-AGENT-76).
+                self.observations.push(AgentObservation::Diagnostic {
+                    level: AgentDiagnosticLevel::Warning,
+                    message: Arc::from(epilogue_failure_message(diagnostic)),
+                });
+            } else {
+                self.native_failure = Some(AgentHarnessFailureDetail::Classified {
+                    canonical: CanonicalHarnessFailure::ModelError,
+                    diagnostic,
+                });
+            }
         }
 
         let completes_harness = self.value_kind != AgentValueKind::Result;
-        if !completes_harness {
+        if epilogue {
+            // An epilogue's result, structured output included, never replaces the value.
+        } else if !completes_harness {
             let exchange = if !successful {
                 Some(CompletedResultExchange::NativeFailure)
             } else if !self.awaits_background_work() {
@@ -2286,9 +2886,11 @@ impl ClaudeCodeStreamJsonV1Parser {
         self.observations
             .push(lifecycle(AgentLifecycleMilestone::TurnCompleted));
         if completes_harness
+            && !self.value_settled
             && self.background_commands.iter().all(|task| task.notified)
             && self.subagents.iter().all(|subagent| subagent.notified)
         {
+            self.value_settled = true;
             self.observations
                 .push(lifecycle(AgentLifecycleMilestone::HarnessCompleted));
         }
@@ -2388,6 +2990,24 @@ impl ClaudeCodeStreamJsonV1Parser {
         self.accepted_result = None;
     }
 
+    /// Records `failure` as the stream's, unless a native failure already ended the
+    /// invocation: every frame after a failed `result` is the drain of work that failure
+    /// has doomed, so a frame refused there, the `init` of the turn Claude Code begins when
+    /// the work finishes first among them, ends the stream with the native failure and no
+    /// rejection record (INV-HARNESS-5, REQ-AGENT-75).
+    fn fail_stream(&mut self, failure: AgentFailureCause) -> AgentFailureCause {
+        let failure = match self.native_failure {
+            Some(detail) => {
+                self.protocol_rejection = None;
+                self.rejected_line = None;
+                AgentFailureCause::HarnessFailed { detail }
+            }
+            None => failure,
+        };
+        self.failure = Some(failure.clone());
+        failure
+    }
+
     // Claude initialization, rather than Pi's session-plus-agent-start sequence, owns the
     // start-to-protocol failure transition; keep that authority in this parser.
     fn protocol_failure(&self) -> AgentFailureCause {
@@ -2415,8 +3035,56 @@ impl ClaudeCodeStreamJsonV1Parser {
 
     fn agent_failure(&self, cause: AgentFailureCause) -> AgentFailure {
         match &self.protocol_rejection {
-            Some(rejection) => AgentFailure::with_protocol_rejection(cause, rejection.clone()),
+            Some(rejection) => AgentFailure::with_protocol_rejection(cause, rejection.clone())
+                .with_stream_excerpt(self.stream_excerpt())
+                .with_tracked_work(self.tracked_work()),
             None => AgentFailure::new(cause),
+        }
+    }
+
+    fn retained_rejected_line(&self, line: &[u8]) -> RetainedStreamLine {
+        RetainedStreamLine::retain(line, self.limits.maximum_rejected_line_bytes())
+    }
+
+    fn stream_excerpt(&self) -> RejectedStreamExcerpt {
+        RejectedStreamExcerpt::new(self.rejected_line.clone(), self.stream_tail.lines())
+    }
+
+    /// The ledger as the parser holds it when it refuses: no refusing path mutates the
+    /// ledger first, so this agrees with the counts the rejection state took before the
+    /// frame.
+    fn tracked_work(&self) -> ClaudeCodeStreamJsonV1TrackedWork {
+        let (background_commands, commands_cut) =
+            newest_tracked(&self.background_commands, |task| {
+                ClaudeCodeStreamJsonV1TrackedCommand {
+                    task_id: tracked_work_id(&task.task_id),
+                    tool_use_id: tracked_work_id(&task.tool_use_id),
+                    run_id: task.run_id.as_deref().map(tracked_work_id),
+                    backgrounded: task.backgrounded,
+                    acknowledged: task.acknowledged,
+                    notified: task.notified,
+                    monitor: task.monitor,
+                }
+            });
+        let (subagents, subagents_cut) = newest_tracked(&self.subagents, |subagent| {
+            ClaudeCodeStreamJsonV1TrackedSubagent {
+                task_id: tracked_work_id(&subagent.task_id),
+                agent_call_id: tracked_work_id(&subagent.agent_call_id),
+                tool_use_id: tracked_work_id(&subagent.tool_use_id),
+                run_id: subagent.run_id.as_deref().map(tracked_work_id),
+                backgrounded: subagent.backgrounded,
+                notified: subagent.notified,
+            }
+        });
+        let (forgotten_subagents, forgotten_cut) =
+            newest_tracked(&self.forgotten_subagents, |subagent| {
+                tracked_work_id(&subagent.task_id)
+            });
+        ClaudeCodeStreamJsonV1TrackedWork {
+            background_commands,
+            subagents,
+            forgotten_subagents,
+            truncated: commands_cut || subagents_cut || forgotten_cut,
         }
     }
 
@@ -2443,12 +3111,20 @@ impl ClaudeCodeStreamJsonV1Parser {
         reason: ClaudeCodeStreamJsonV1RejectionReason,
         stage: ClaudeCodeStreamJsonV1ProtocolStage,
     ) -> Result<T, AgentFailureCause> {
+        Err(self.record_protocol_failure(reason, stage))
+    }
+
+    fn record_protocol_failure(
+        &mut self,
+        reason: ClaudeCodeStreamJsonV1RejectionReason,
+        stage: ClaudeCodeStreamJsonV1ProtocolStage,
+    ) -> AgentFailureCause {
         self.prepare_rejection(stage);
         let failure = self.protocol_failure();
         self.record_rejection(reason, stage);
         self.invalidate_values();
         self.failure = Some(failure.clone());
-        Err(failure)
+        failure
     }
 
     fn record_rejection(
@@ -2492,20 +3168,24 @@ impl ClaudeCodeStreamJsonV1Parser {
         reason: ClaudeCodeStreamJsonV1RejectionReason,
         stage: ClaudeCodeStreamJsonV1ProtocolStage,
     ) -> AgentOutcome {
-        AgentOutcome::Failed(AgentFailure::with_protocol_rejection(
-            cause,
-            AgentProtocolRejectionDiagnostic::claude_code_stream_json_v1(
-                ClaudeCodeStreamJsonV1ProtocolRejection {
-                    reason,
-                    stage,
-                    outer_event: None,
-                    stream_event: None,
-                    content_index: None,
-                    content_block: None,
-                    state: self.rejection_state(),
-                },
-            ),
-        ))
+        AgentOutcome::Failed(
+            AgentFailure::with_protocol_rejection(
+                cause,
+                AgentProtocolRejectionDiagnostic::claude_code_stream_json_v1(
+                    ClaudeCodeStreamJsonV1ProtocolRejection {
+                        reason,
+                        stage,
+                        outer_event: None,
+                        stream_event: None,
+                        content_index: None,
+                        content_block: None,
+                        state: self.rejection_state(),
+                    },
+                ),
+            )
+            .with_stream_excerpt(self.stream_excerpt())
+            .with_tracked_work(self.tracked_work()),
+        )
     }
 
     fn rejection_state(&self) -> ClaudeCodeStreamJsonV1RejectionState {
@@ -2869,6 +3549,30 @@ fn normalized_tool_result_content(value: &Value) -> Option<String> {
     }
 }
 
+/// Whether an Agent call's `tool_use_result` reports an asynchronous launch: Claude Code's
+/// `status: "async_launched"` result, which also carries `isAsync: true` when present.
+fn async_agent_launch(result: &Map<String, Value>) -> bool {
+    required_string(result, "status") == Some("async_launched")
+        || required_bool(result, "isAsync") == Some(true)
+}
+
+/// Whether a frame that lands between a rejected candidate's `result` and the correction
+/// turn's `init` is read as the turn reads it: a subagent thread's message, tool result or
+/// progress, or a `system` task frame. A main-thread message, stream event or `result` is not.
+/// The thread is the one `push_stdout` records for the frame before dispatching it.
+fn correction_window_admits(
+    event_type: &str,
+    thread: Option<ClaudeCodeStreamJsonV1EventThread>,
+) -> bool {
+    match event_type {
+        "assistant" | "user" | "tool_progress" => {
+            thread == Some(ClaudeCodeStreamJsonV1EventThread::Subagent)
+        }
+        "system" => true,
+        _ => false,
+    }
+}
+
 fn parent_tool_use_id(object: &Map<String, Value>) -> Option<Option<&str>> {
     match object.get("parent_tool_use_id")? {
         Value::Null => Some(None),
@@ -2895,6 +3599,15 @@ fn api_retry_message(object: &Map<String, Value>) -> String {
         parts.push(format!("next in {delay} ms"));
     }
     parts.join(" · ")
+}
+
+/// The warning an epilogue's native failure yields: its closed classification only.
+fn epilogue_failure_message(diagnostic: HarnessFailureDiagnostic) -> String {
+    let class = diagnostic.harness_error.unwrap_or("other");
+    match diagnostic.http_status {
+        Some(status) => format!("turn after the settled value failed: {class} (HTTP {status})"),
+        None => format!("turn after the settled value failed: {class}"),
+    }
 }
 
 fn lifecycle(milestone: AgentLifecycleMilestone) -> AgentObservation {
@@ -2934,6 +3647,31 @@ fn required_bool(object: &Map<String, Value>, key: &str) -> Option<bool> {
     object.get(key)?.as_bool()
 }
 
+/// Whether a task start or task-list entry names a `task_type` the parser does not model:
+/// neither a shell command (`local_bash`, which a `Monitor` call's task also is) nor a
+/// subagent (`local_agent`).
+fn unmodeled_task_type(object: &Map<String, Value>) -> bool {
+    !matches!(
+        required_string(object, "task_type"),
+        Some("local_bash" | "local_agent")
+    )
+}
+
+/// Keeps `task_id` in `known`, newest last, at most `MAXIMUM_TRACKED_TASKS`.
+fn remember_task_id(known: &mut Vec<Arc<str>>, task_id: &str) {
+    if known.iter().any(|known| known.as_ref() == task_id) {
+        return;
+    }
+    known.push(Arc::from(task_id));
+    keep_newest(known);
+}
+
+/// Drops the oldest of `items`, newest last, beyond `MAXIMUM_TRACKED_TASKS`.
+fn keep_newest<T>(items: &mut Vec<T>) {
+    let excess = items.len().saturating_sub(MAXIMUM_TRACKED_TASKS);
+    items.drain(..excess);
+}
+
 fn required_u64(object: &Map<String, Value>, key: &str) -> Option<u64> {
     object.get(key)?.as_u64()
 }
@@ -2968,6 +3706,8 @@ fn valid_session_id(value: &str) -> bool {
 mod adapter_tests;
 #[cfg(test)]
 mod conformance_tests;
+#[cfg(test)]
+mod lifecycle_matrix;
 #[cfg(test)]
 mod test_support;
 #[cfg(test)]

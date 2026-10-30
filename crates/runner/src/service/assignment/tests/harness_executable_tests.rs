@@ -374,7 +374,6 @@ async fn run_codex_with_stubborn_descendant(
     let (temporary, mut manager) =
         manager_fixture_with_harnesses(CODEX_ONLY_WORKFLOW, None, None, Some(SUCCESSFUL_CODEX));
     select_codex_scenario(&mut manager, scenario);
-    manager.guard_processes = true;
     let offered = offer("bg");
     offer_then_prepare(&mut manager, &offered).await;
     spawn_execution(&mut manager, &offered);
@@ -419,7 +418,7 @@ fn assert_codex_failure_diagnostic(reports: &[ExecutionReport]) {
                 && workflow_event["to"] == "failed"
                 && workflow_event["detail"]["code"] == "harness_failed"
                 && workflow_event.get("diagnostic").is_none()
-                && diagnostic == &json!({"harnessError": "unauthorized"})
+                && diagnostic == &json!({"harnessError": "unauthorized", "harnessFailure": "model_error"})
     )));
     assert!(matches!(
         reports.last(),
@@ -427,7 +426,7 @@ fn assert_codex_failure_diagnostic(reports: &[ExecutionReport]) {
             if outcome["outcome"] == "failed"
                 && outcome["primaryIssue"]["detail"]["code"] == "harness_failed"
                 && outcome["primaryIssue"].get("diagnostic").is_none()
-                && diagnostic == &json!({"harnessError": "unauthorized"})
+                && diagnostic == &json!({"harnessError": "unauthorized", "harnessFailure": "model_error"})
     ));
     for (sequence, report) in reports.iter().enumerate() {
         if matches!(
@@ -467,7 +466,6 @@ async fn codex_runner_cancellation_reports_only_after_stubborn_descendants_quies
     let (temporary, mut manager) =
         manager_fixture_with_harnesses(CODEX_ONLY_WORKFLOW, None, None, Some(SUCCESSFUL_CODEX));
     select_codex_scenario(&mut manager, "cancellation-stubborn");
-    manager.guard_processes = true;
     let offered = offer("bg");
     offer_then_prepare(&mut manager, &offered).await;
     let reports = start_then_shut_down_and_wait(

@@ -11,6 +11,7 @@ Commands:
   rename       Rename a project
   repository   Manage a project's repository binding
   runner-pool  Manage a project's runner pool
+  schedule     Manage a project's schedules
   show         Show a project
   trigger      Manage a project's Linear triggers
   webhook      Manage a project's signed webhooks

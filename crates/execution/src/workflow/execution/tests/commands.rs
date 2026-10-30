@@ -1,43 +1,47 @@
 use super::*;
+use crate::workflow::step_runtime::CommandLaunchFailure;
 
 // REQ-WFEXEC-22
 #[tokio::test]
 async fn command_environment_requires_declared_passthrough() {
-    for (declaration, expected) in [
-        ("", b"unset".as_slice()),
-        (
-            "environmentPassthrough: [TEST_SENTINEL]\n",
-            b"present".as_slice(),
-        ),
-    ] {
-        let source = format!(
-            "schemaVersion: 1\n{declaration}steps:\n  check:\n    kind: cmd\n    command:\n      argv: [/bin/sh, -c, 'printf %s \"${{TEST_SENTINEL-unset}}\" > observed.txt']\n"
-        );
-        let fixture = execution_fixture(
-            &source,
-            ResolvedInputs::default(),
-            EnvironmentSnapshot::new([("PATH", "/bin:/usr/bin"), ("TEST_SENTINEL", "present")]),
-            CancellationSource::new(),
-            1,
-            1024,
-        );
-        let result = execute_workflow(
-            fixture.admitted,
-            &fixture.artifacts,
-            &fixture.inputs,
-            &StepDiagnosticLog::default(),
-            AgentExecution::disabled(),
-            TestClock,
-            NoopExecutionObserver,
-        )
-        .await
-        .unwrap();
-        assert_eq!(result.outcome, RunOutcome::Succeeded);
-        assert_eq!(
-            fs::read(fixture.execution_root.join("observed.txt")).unwrap(),
-            expected
-        );
-    }
+    with_watchdog(async {
+        for (declaration, expected) in [
+            ("", b"unset".as_slice()),
+            (
+                "environmentPassthrough: [TEST_SENTINEL]\n",
+                b"present".as_slice(),
+            ),
+        ] {
+            let source = format!(
+                "schemaVersion: 1\n{declaration}steps:\n  check:\n    kind: cmd\n    command:\n      argv: [/bin/sh, -c, 'printf %s \"${{TEST_SENTINEL-unset}}\" > observed.txt']\n"
+            );
+            let fixture = execution_fixture(
+                &source,
+                ResolvedInputs::default(),
+                EnvironmentSnapshot::new([("PATH", "/bin:/usr/bin"), ("TEST_SENTINEL", "present")]),
+                CancellationSource::new(),
+                1,
+                1024,
+            );
+            let result = execute_workflow(
+                fixture.admitted,
+                &fixture.artifacts,
+                &fixture.inputs,
+                &StepDiagnosticLog::default(),
+                AgentExecution::disabled(),
+                TestClock,
+                NoopExecutionObserver,
+            )
+            .await
+            .unwrap();
+            assert_eq!(result.outcome, RunOutcome::Succeeded);
+            assert_eq!(
+                fs::read(fixture.execution_root.join("observed.txt")).unwrap(),
+                expected
+            );
+        }
+    })
+    .await;
 }
 
 // REQ-WFRECOVERY-7, REQ-WFRECOVERY-8, REQ-WFRECOVERY-9, REQ-WFRECOVERY-21, REQ-WFRECOVERY-30, REQ-WFRECOVERY-39, REQ-WFRECOVERY-59
@@ -543,7 +547,7 @@ exports:
     .await;
 }
 
-// REQ-WFRECOVERY-10, REQ-WFRECOVERY-23, REQ-WFRECOVERY-26
+// REQ-WFRECOVERY-10, REQ-WFRECOVERY-23, REQ-WFRECOVERY-26, REQ-WFRECOVERY-62
 #[tokio::test]
 async fn command_handler_failures_stop_once_without_authorizing_recheck() {
     with_watchdog(async {
@@ -552,7 +556,7 @@ async fn command_handler_failures_stop_once_without_authorizing_recheck() {
                 "start",
                 r#"command:
           argv: [/definitely-missing-recovery-handler]"#,
-                RecoveryHandlerFailure::CommandLaunchFailed,
+                RecoveryHandlerFailure::CommandLaunch(CommandLaunchFailure::NotFound),
             ),
             (
                 "execution",
@@ -640,44 +644,47 @@ async fn command_handler_failures_stop_once_without_authorizing_recheck() {
 
 #[tokio::test]
 async fn configured_inactive_local_recovery_preserves_target_execution() {
-    let source = "schemaVersion: 1\nsteps:\n  guarded:\n    kind: cmd\n    recovery:\n      retries: 1\n    command:\n      argv: [\"/bin/sh\", \"-c\", \": > target-started\"]\n";
-    let fixture = execution_fixture(
-        source,
-        ResolvedInputs::default(),
-        EnvironmentSnapshot::new([("PATH", "/bin:/usr/bin")]),
-        CancellationSource::new(),
-        1,
-        32,
-    );
-    let admitted = admit_local_workflow(
-        resolution::resolve(&fixture.source_root, Path::new("workflow.yaml")).unwrap(),
-        ResolvedInputs::default(),
-        ExecutionContext::new(
-            fixture.execution_root.clone(),
-            ExecutionPolicyLimits::new(
-                1,
-                CaptureLimits::new(16, 1024 * 1024, 8 * 1024 * 1024),
-                InputLimits::new(16, 1024 * 1024, 8 * 1024 * 1024, 8 * 1024 * 1024),
-                32,
-            ),
+    with_watchdog(async {
+        let source = "schemaVersion: 1\nsteps:\n  guarded:\n    kind: cmd\n    recovery:\n      retries: 1\n    command:\n      argv: [\"/bin/sh\", \"-c\", \": > target-started\"]\n";
+        let fixture = execution_fixture(
+            source,
+            ResolvedInputs::default(),
             EnvironmentSnapshot::new([("PATH", "/bin:/usr/bin")]),
-            CancellationPolicy::new(CancellationSource::new(), Duration::from_secs(1)),
-        ),
-    )
-    .unwrap();
+            CancellationSource::new(),
+            1,
+            32,
+        );
+        let admitted = admit_local_workflow(
+            resolution::resolve(&fixture.source_root, Path::new("workflow.yaml")).unwrap(),
+            ResolvedInputs::default(),
+            ExecutionContext::new(
+                fixture.execution_root.clone(),
+                ExecutionPolicyLimits::new(
+                    1,
+                    CaptureLimits::new(16, 1024 * 1024, 8 * 1024 * 1024),
+                    InputLimits::new(16, 1024 * 1024, 8 * 1024 * 1024, 8 * 1024 * 1024),
+                    32,
+                ),
+                EnvironmentSnapshot::new([("PATH", "/bin:/usr/bin")]),
+                CancellationPolicy::new(CancellationSource::new(), Duration::from_secs(1)),
+            ),
+        )
+        .unwrap();
 
-    let result = execute_workflow(
-        admitted,
-        &fixture.artifacts,
-        &fixture.inputs,
-        &StepDiagnosticLog::default(),
-        AgentExecution::disabled(),
-        TestClock,
-        NoopExecutionObserver,
-    )
+        let result = execute_workflow(
+            admitted,
+            &fixture.artifacts,
+            &fixture.inputs,
+            &StepDiagnosticLog::default(),
+            AgentExecution::disabled(),
+            TestClock,
+            NoopExecutionObserver,
+        )
+        .await;
+        assert_eq!(result.unwrap().outcome, RunOutcome::Succeeded);
+        assert!(fixture.execution_root.join("target-started").exists());
+    })
     .await;
-    assert_eq!(result.unwrap().outcome, RunOutcome::Succeeded);
-    assert!(fixture.execution_root.join("target-started").exists());
 }
 
 // REQ-WFEXEC-28, REQ-WFEXEC-35

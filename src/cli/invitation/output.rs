@@ -479,7 +479,7 @@ fn write_party_identity(
         Some(identity) => {
             let name = match identity.name_state {
                 NameState::Live | NameState::Snapshot => {
-                    identity.display_name.as_deref().unwrap_or("unavailable")
+                    identity.display_name.as_deref().unwrap_or("no name")
                 }
                 NameState::Missing => "no name",
                 NameState::Unavailable => "unavailable",

@@ -23,8 +23,8 @@ use super::artifact_delivery::{
 };
 use super::assignment::{
     AcceptedAssignment, AssignmentObservation, CausalLease, ExecutionReport, LeaseAuthority,
-    ManagerEvent, ObservationOutbox, OutboxFailure, RenewalRequestFailure, RunEvent,
-    lease_clock_cause,
+    ManagerEvent, ObservationOutbox, OutboxFailure, PhaseEnd, RenewalRequestFailure, RunEvent,
+    RunPhase, lease_clock_cause,
 };
 use super::lease_clock::{
     LeaseClock, LeaseClockError, LeaseInstant, LeaseWait, LeaseWaitCancellation,

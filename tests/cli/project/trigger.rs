@@ -7,6 +7,25 @@ const LINEAR_CONNECTION: &str = "lcn_01k0z6r1w8f4jy2m7q9v3x5abc";
 
 #[test]
 fn disabled_lifecycle_choice_reaches_create_and_update_api() {
+    lifecycle_policy_reaches_create_and_update_api(serde_json::json!({"enabled":false}));
+}
+
+// REQ-TRIGGER-104: an enabled policy reaches the Gateway unchanged on create and update.
+#[test]
+fn enabled_lifecycle_policy_reaches_create_and_update_api() {
+    lifecycle_policy_reaches_create_and_update_api(serde_json::json!({
+        "enabled":true,
+        "teamMappings":[{"teamId":"LINEAR_TEAM_ID","rules":[
+            {"eventType":"run.started","stateId":"WORKING_STATE_ID"},
+            {"eventType":"step.succeeded","node":{"scope":[],"role":"step","id":"review"},"stateId":"REVIEWED_STATE_ID"},
+            {"eventType":"publication.published","stateId":"IN_REVIEW_STATE_ID"},
+            {"eventType":"publication.no_changes","stateId":"TRIAGE_STATE_ID"},
+            {"eventType":"run.failed","stateId":"TRIAGE_STATE_ID"}
+        ]}]
+    }));
+}
+
+fn lifecycle_policy_reaches_create_and_update_api(policy: serde_json::Value) {
     let directory = tempfile::tempdir().unwrap();
     let create_path = directory.path().join("create.json");
     let update_path = directory.path().join("update.json");
@@ -14,16 +33,18 @@ fn disabled_lifecycle_choice_reaches_create_and_update_api() {
         "enabled":false, "source":{"type":"linear","connectionId":LINEAR_CONNECTION},
         "target":{"workflowPath":".um/workflow.yaml","executionPrincipalId":"prn_01k0z6r1w8f4jy2m7q9v3x5abc"},
         "conditions":[{"field":"event.action","operator":"eq","value":"update"}],
-        "inputs":{}, "integrationContext":{}, "linearLifecycle":{"enabled":false}
+        "inputs":{}, "integrationContext":{}, "publication":{"exportName":"published"},
+        "linearLifecycle":policy
     });
     std::fs::write(&create_path, serde_json::to_vec(&config).unwrap()).unwrap();
-    std::fs::write(&update_path, br#"{"linearLifecycle":{"enabled":false}}"#).unwrap();
+    let patch = serde_json::json!({ "linearLifecycle": policy });
+    std::fs::write(&update_path, serde_json::to_vec(&patch).unwrap()).unwrap();
     let trigger = serde_json::json!({
         "id":TRIGGER, "projectId":PROJECT_ID, "version":1, "grantId":GRANT,
         "createdAt":"2026-09-01T00:00:00Z", "updatedAt":"2026-09-01T00:00:00Z",
         "enabled":false, "source":config["source"], "target":config["target"],
         "conditions":config["conditions"], "inputs":{}, "integrationContext":{},
-        "linearLifecycle":{"enabled":false}
+        "publication":config["publication"], "linearLifecycle":policy
     });
     let (server, _credentials_dir, credential) = prepared_project(vec![
         http_response_with_headers(
@@ -78,14 +99,8 @@ fn disabled_lifecycle_choice_reaches_create_and_update_api() {
     assert_eq!(requests.len(), 2);
     assert!(requests[0].starts_with("POST "));
     assert!(requests[1].starts_with("PATCH "));
-    assert_eq!(
-        request_body(&requests[0])["linearLifecycle"],
-        serde_json::json!({"enabled":false})
-    );
-    assert_eq!(
-        request_body(&requests[1])["linearLifecycle"],
-        serde_json::json!({"enabled":false})
-    );
+    assert_eq!(request_body(&requests[0])["linearLifecycle"], policy);
+    assert_eq!(request_body(&requests[1])["linearLifecycle"], policy);
 }
 
 fn evaluation(state: &str, cycle: i32) -> serde_json::Value {

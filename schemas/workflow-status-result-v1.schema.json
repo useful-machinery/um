@@ -859,6 +859,9 @@
                 "handler_unavailable",
                 "working_directory_unavailable",
                 "command_preparation_failed",
+                "command_launch_not_found",
+                "command_launch_permission_denied",
+                "command_launch_invalid_input",
                 "command_launch_failed",
                 "command_wait_failed",
                 "command_exit_failed",
@@ -893,8 +896,29 @@
                 "empty_reason",
                 "reason_too_long"
               ]
+            },
+            "diagnostic": {
+              "$ref": "#/$defs/RecoveryHandlerLaunchDiagnostic"
             }
           }
+        }
+      }
+    },
+    "RecoveryHandlerLaunchDiagnostic": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "launchFailure"
+      ],
+      "properties": {
+        "launchFailure": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_]{0,63}$"
+        },
+        "osError": {
+          "type": "integer",
+          "minimum": -2147483648,
+          "maximum": 2147483647
         }
       }
     },

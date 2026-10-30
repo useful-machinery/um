@@ -10,7 +10,8 @@ use super::http_client::{HttpClient, HttpEndpointError};
 use super::http_util::{self, BufferedResponseError};
 use super::principal_profile::{self, PrincipalProfile};
 use super::problem::{
-    self, ACCEPTED_MEDIA_TYPES, BAD_REQUEST, FORBIDDEN, JSON_MEDIA_TYPE, UNAUTHORIZED,
+    self, ACCEPTED_MEDIA_TYPES, BAD_REQUEST, FORBIDDEN, IDEMPOTENCY_CONFLICT, JSON_MEDIA_TYPE,
+    REQUEST_BODY_TOO_LARGE, UNAUTHORIZED,
 };
 use super::{UnreachableCategory, bearer_authorization, classify_reqwest_error};
 
@@ -20,9 +21,6 @@ const MERGE_PATCH_MEDIA_TYPE: &str = "application/merge-patch+json";
 const HUMAN_DISPLAY_NAME_REQUIRED: &str =
     "https://api.usefulmachinery.com/problems/human-display-name-required";
 const INVALID_DISPLAY_NAME: &str = "https://api.usefulmachinery.com/problems/invalid-display-name";
-const IDEMPOTENCY_CONFLICT: &str = "https://api.usefulmachinery.com/problems/idempotency-conflict";
-const REQUEST_BODY_TOO_LARGE: &str =
-    "https://api.usefulmachinery.com/problems/request-body-too-large";
 const UNSUPPORTED_MEDIA_TYPE: &str =
     "https://api.usefulmachinery.com/problems/unsupported-media-type";
 

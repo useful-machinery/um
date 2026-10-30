@@ -22,6 +22,7 @@ pub(crate) struct BufferedBlockingResponse {
     pub locations: Vec<HeaderValue>,
     pub cache_controls: Vec<HeaderValue>,
     pub retry_afters: Vec<HeaderValue>,
+    pub request_ids: Vec<HeaderValue>,
     pub body: Vec<u8>,
 }
 
@@ -178,6 +179,12 @@ pub(crate) fn buffer_blocking_response_with_limit(
         .iter()
         .cloned()
         .collect();
+    let request_ids = response
+        .headers()
+        .get_all("X-Request-ID")
+        .iter()
+        .cloned()
+        .collect();
     let body = read_bounded_blocking_body_with_limit(response, limit)?;
     Ok(BufferedBlockingResponse {
         status,
@@ -186,6 +193,7 @@ pub(crate) fn buffer_blocking_response_with_limit(
         locations,
         cache_controls,
         retry_afters,
+        request_ids,
         body,
     })
 }

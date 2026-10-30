@@ -11,6 +11,107 @@ async fn v3_continuation_executes_in_claimed_workspace_not_definition_checkout()
 }
 
 async fn exercise_retained_cloud_git_continuation(v3: bool) {
+    let (_temporary, mut manager, initial, workspace, baseline) =
+        retained_initial_attempt(v3).await;
+    let successor = continuation_successor(&manager, &initial, &workspace);
+    manager.handle_offer(successor.clone()).unwrap();
+    prepare_retained_continuation(&mut manager, &successor).await;
+    let accepted = match &manager.slot {
+        Some(LocalSlot::Accepted(accepted)) => accepted,
+        _ => panic!(
+            "retained Git workflow was not admitted: {:?}",
+            manager
+                .decisions
+                .iter()
+                .map(|decision| &decision.response)
+                .collect::<Vec<_>>()
+        ),
+    };
+    assert_eq!(accepted.root.execution, workspace);
+    assert_eq!(
+        accepted.admitted.git_capture().unwrap().baseline_oid(),
+        baseline
+    );
+    let job = start_continuation(&mut manager, &successor);
+    job.spawn();
+    let reports = with_watchdog(wait_for_terminal(&mut manager))
+        .await
+        .unwrap();
+    assert!(
+        matches!(reports.last(), Some(ExecutionReport::Finished { outcome, .. })
+        if outcome["outcome"] == "succeeded"),
+        "{reports:?}"
+    );
+    acknowledge_terminal_and_settle(&mut manager).await;
+    assert_eq!(
+        fs::read(workspace.join("change.txt")).unwrap(),
+        b"retained edits\n"
+    );
+    assert_ne!(
+        run_fixture_git(&workspace, &["rev-parse", "HEAD"]),
+        baseline
+    );
+    assert!(run_fixture_git(&workspace, &["status", "--porcelain"]).is_empty());
+}
+
+// REQ-TELEMETRY-39
+#[tokio::test]
+async fn execution_lost_before_the_engine_starts_ends_the_execution_phase_failed() {
+    let (_temporary, mut manager, initial, workspace, _baseline) =
+        retained_initial_attempt(false).await;
+    let (recorder, capture) = crate::telemetry::test_recorder("rbt_fixture");
+    manager.recorder = Some(recorder);
+    let successor = continuation_successor(&manager, &initial, &workspace);
+    manager.handle_offer(successor.clone()).unwrap();
+    prepare_retained_continuation(&mut manager, &successor).await;
+    let private = match &manager.slot {
+        Some(LocalSlot::Accepted(accepted)) => accepted.root.private.path().to_path_buf(),
+        _ => panic!("retained Git workflow was not admitted"),
+    };
+    let job = start_continuation(&mut manager, &successor);
+    // The run binds its continuation context as a new file in the attempt's
+    // private root; one already there loses the execution environment after
+    // the execution phase has opened and before the engine starts.
+    fs::write(private.join("continuation-context.json"), b"{}").unwrap();
+    job.spawn();
+    let reports = with_watchdog(wait_for_terminal(&mut manager))
+        .await
+        .unwrap();
+    assert!(
+        reports.iter().any(|report| matches!(
+            report,
+            ExecutionReport::Aborted { reason, .. } if reason == "execution_environment_lost"
+        )),
+        "{reports:?}"
+    );
+    assert_acknowledged_run(&mut manager, &capture, "aborted");
+    assert_run_phase(
+        &capture,
+        &successor,
+        "runner.run.execution",
+        "failure",
+        Some("runner_phase_failed"),
+    );
+}
+
+// Runs the initial attempt of a retained Cloud Git workflow to its failed
+// terminal report and settles it, leaving its workspace retained for a
+// continuation. Returns the manager, the initial offer, the workspace and
+// its baseline commit.
+async fn retained_initial_attempt(
+    v3: bool,
+) -> (
+    tempfile::TempDir,
+    AssignmentManager,
+    AssignmentOffer,
+    PathBuf,
+    String,
+) {
+    // The `edit` script uses only shell builtins (`test`, `printf`, `:` and
+    // redirection), so its failing branch forks nothing and cannot be lost to a
+    // host that refuses `fork`. Exit 75 is the intended first failure; 76 means
+    // the workspace was retained but the marker is gone; 99 means the marker
+    // could not be written.
     let workflow = r#"schemaVersion: 1
 steps:
   edit:
@@ -19,7 +120,7 @@ steps:
       argv:
         - /bin/sh
         - -c
-        - 'if test -f .git/fixture-failed; then exit 0; fi; printf "retained edits\n" > change.txt; touch .git/fixture-failed; exit 75'
+        - 'if test -f .git/fixture-failed; then exit 0; fi; if test -f change.txt; then exit 76; fi; printf "retained edits\n" > change.txt; : > .git/fixture-failed || exit 99; exit 75'
   capture:
     kind: cmd
     dependsOn: [edit]
@@ -33,7 +134,7 @@ steps:
 exports:
   changes: {ref: outputs.capture.branch}
 "#;
-    let (_temporary, mut manager) = manager_fixture(workflow);
+    let (temporary, mut manager) = manager_fixture(workflow);
     resolve(&source_fixture_path(&manager), Path::new("workflow.yaml")).unwrap();
     let mut initial = offer("bg");
     align_offer_with_source_fixture(&manager, &mut initial);
@@ -65,15 +166,8 @@ exports:
     }
     manager.handle_offer(initial.clone()).unwrap();
     prepare_current(&mut manager, &initial).await;
-    let workspace = match &mut manager.slot {
-        Some(LocalSlot::Accepted(accepted)) => {
-            // Unit fixtures run commands directly rather than invoking the CLI's
-            // private child helper. Retention still needs a durable guard journal
-            // for the real workspace-claim and quiescence admission path.
-            accepted.process_guards =
-                AssignmentProcessGuards::durable(&accepted.root.private).unwrap();
-            accepted.root.execution.clone()
-        }
+    let workspace = match &manager.slot {
+        Some(LocalSlot::Accepted(accepted)) => accepted.root.execution.clone(),
         _ => panic!(
             "initial Git workflow was not admitted: {:?}",
             manager.pending_observations(&BTreeSet::new(), 100)
@@ -90,7 +184,15 @@ exports:
         b"retained edits\n"
     );
     assert!(!run_fixture_git(&workspace, &["status", "--porcelain"]).is_empty());
+    (temporary, manager, initial, workspace, baseline)
+}
 
+// The continuation offer of `initial`'s retained workspace on this runner boot.
+fn continuation_successor(
+    manager: &AssignmentManager,
+    initial: &AssignmentOffer,
+    workspace: &Path,
+) -> AssignmentOffer {
     let mut successor = initial.clone();
     successor.effect_id = "eff_01k0z6r1w8f4jy2m7q9v3x5abm".into();
     successor.assignment_id = "asn_01k0z6r1w8f4jy2m7q9v3x5abh".into();
@@ -114,49 +216,22 @@ exports:
         inherited_steps: Vec::new(),
         prior_settlement_snapshot: None,
     }));
-    manager.handle_offer(successor.clone()).unwrap();
-    prepare_retained_continuation(&mut manager, &successor).await;
-    let accepted = match &manager.slot {
-        Some(LocalSlot::Accepted(accepted)) => accepted,
-        _ => panic!(
-            "retained Git workflow was not admitted: {:?}",
-            manager
-                .decisions
-                .iter()
-                .map(|decision| &decision.response)
-                .collect::<Vec<_>>()
-        ),
-    };
-    assert_eq!(accepted.root.execution, workspace);
-    assert_eq!(
-        accepted.admitted.git_capture().unwrap().baseline_oid(),
-        baseline
-    );
-    let mut start = start_for(&successor);
+    successor
+}
+
+// Starts and authorizes the admitted continuation `successor`, returning its
+// job unspawned.
+fn start_continuation(
+    manager: &mut AssignmentManager,
+    successor: &AssignmentOffer,
+) -> ExecutionJob {
+    let mut start = start_for(successor);
     start.effect_id = "eff_01k0z6r1w8f4jy2m7q9v3x5abn".into();
     let job = manager.handle_start(start).unwrap().unwrap();
-    let mut authorization = start_authorization_for(&successor);
+    let mut authorization = start_authorization_for(successor);
     authorization.effect_id = "eff_01k0z6r1w8f4jy2m7q9v3x5abp".into();
     manager.handle_start_authorized(authorization).unwrap();
-    job.spawn();
-    let reports = with_watchdog(wait_for_terminal(&mut manager))
-        .await
-        .unwrap();
-    assert!(
-        matches!(reports.last(), Some(ExecutionReport::Finished { outcome, .. })
-        if outcome["outcome"] == "succeeded"),
-        "{reports:?}"
-    );
-    acknowledge_terminal_and_settle(&mut manager).await;
-    assert_eq!(
-        fs::read(workspace.join("change.txt")).unwrap(),
-        b"retained edits\n"
-    );
-    assert_ne!(
-        run_fixture_git(&workspace, &["rev-parse", "HEAD"]),
-        baseline
-    );
-    assert!(run_fixture_git(&workspace, &["status", "--porcelain"]).is_empty());
+    job
 }
 
 pub(super) async fn prepare_retained_continuation(

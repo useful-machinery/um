@@ -12,7 +12,9 @@ use crate::workflow::admission::{
     CancellationPolicy, CancellationSource, CaptureLimits, EnvironmentSnapshot, ExecutionContext,
     ExecutionPolicyLimits, InputLimits, ResolvedInputs, admit_workflow,
 };
-use crate::workflow::agent::AgentFailureCause;
+use crate::workflow::agent::{
+    AgentFailureCause, AgentHarnessFailureDetail, CanonicalHarnessFailure, HarnessFailureDiagnostic,
+};
 use crate::workflow::resolution;
 use crate::workflow::runtime::{
     ProvisionalTargetFailure, RecoveryHandlerKind, RecoveryHandlerRecord, TargetExecutionNumber,
@@ -299,7 +301,85 @@ fn lossy_projection_classifies_agent_adapter_start_failure_without_internal_deta
             kind: "agent_failure".to_owned(),
             exit_code: None,
             detail: None,
+            harness_error: None,
+            http_status: None,
+            resets_at: None,
         }
+    );
+}
+
+/// REQ-WFRECOVERY-61, REQ-AGENT-72: an agent failure's cause carries the harness failure's
+/// classified class, HTTP status and kept reset time, and an unclassified agent failure
+/// carries none of them.
+#[test]
+fn agent_failure_cause_carries_classified_harness_error_and_http_status() {
+    let classified = project_cause(
+        FailurePhase::Execution,
+        &StepFailureCause::Execution(StepExecutionFailure::Agent(
+            AgentFailureCause::HarnessFailed {
+                detail: AgentHarnessFailureDetail::Classified {
+                    canonical: CanonicalHarnessFailure::ModelError,
+                    diagnostic: HarnessFailureDiagnostic::from_code("rate_limit", Some(429)),
+                },
+            }
+            .into(),
+        )),
+    );
+    assert_eq!(
+        classified,
+        RecoveryCause {
+            kind: "agent_failure".to_owned(),
+            exit_code: None,
+            detail: None,
+            harness_error: Some("rate_limited".to_owned()),
+            http_status: Some(429),
+            resets_at: None,
+        }
+    );
+    assert_eq!(
+        serde_json::to_value(&classified).unwrap(),
+        json!({"kind": "agent_failure", "harnessError": "rate_limited", "httpStatus": 429})
+    );
+
+    let mut limited = HarnessFailureDiagnostic::from_code("rate_limit", Some(429));
+    limited.resets_at = Some(1_761_336_000);
+    let with_reset = project_cause(
+        FailurePhase::Execution,
+        &StepFailureCause::Execution(StepExecutionFailure::Agent(
+            AgentFailureCause::HarnessFailed {
+                detail: AgentHarnessFailureDetail::Classified {
+                    canonical: CanonicalHarnessFailure::ModelError,
+                    diagnostic: limited,
+                },
+            }
+            .into(),
+        )),
+    );
+    assert_eq!(
+        serde_json::to_value(&with_reset).unwrap(),
+        json!({
+            "kind": "agent_failure",
+            "harnessError": "rate_limited",
+            "httpStatus": 429,
+            "resetsAt": "2025-10-24T20:00:00Z",
+        })
+    );
+
+    let unclassified = project_cause(
+        FailurePhase::Execution,
+        &StepFailureCause::Execution(StepExecutionFailure::Agent(
+            AgentFailureCause::HarnessFailed {
+                detail: AgentHarnessFailureDetail::ModelError,
+            }
+            .into(),
+        )),
+    );
+    assert_eq!(unclassified.harness_error, None);
+    assert_eq!(unclassified.http_status, None);
+    assert_eq!(unclassified.resets_at, None);
+    assert_eq!(
+        serde_json::to_value(&unclassified).unwrap(),
+        json!({"kind": "agent_failure"})
     );
 }
 

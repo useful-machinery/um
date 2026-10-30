@@ -1666,6 +1666,19 @@ fn run_show_preserves_the_bound_existing_request_in_handoff_history() {
     server.finish();
 }
 
+// REQ-COMPAT-16
+#[test]
+fn generated_client_requests_name_the_cli_version_in_the_user_agent() {
+    let (output, server) = run_show_with_response(run_response(run_body_with_state("succeeded")));
+
+    assert!(output.status.success());
+    let request = server.finish().pop().unwrap();
+    assert_eq!(
+        header_value(&request, "user-agent"),
+        format!("um/{BUILD_VERSION}")
+    );
+}
+
 fn publication_response(body: serde_json::Value) -> Vec<u8> {
     http_response_with_headers(
         "200 OK",
@@ -6604,6 +6617,592 @@ fn run_show_reports_the_complete_projection_in_plain_and_json_modes() {
     }
 }
 
+const LIFECYCLE_TRIGGER_ID: &str = "trg_01k0z6r1w8f4jy2m7q9v3x5abc";
+const LIFECYCLE_CONNECTION_ID: &str = "lcn_01k0z6r1w8f4jy2m7q9v3x5abc";
+const LIFECYCLE_WORKSPACE_ID: &str = "a3b2c1d0-1111-4222-8333-944455556666";
+const LIFECYCLE_ISSUE_ID: &str = "b4c3d2e1-2222-4333-8444-955566667777";
+
+fn linear_lifecycle_body(state: &str, code: Option<&str>) -> serde_json::Value {
+    let mut view = serde_json::json!({
+        "triggerId": LIFECYCLE_TRIGGER_ID,
+        "configurationVersion": 1,
+        "connectionId": LIFECYCLE_CONNECTION_ID,
+        "workspaceId": LIFECYCLE_WORKSPACE_ID,
+        "issueId": LIFECYCLE_ISSUE_ID,
+        "ownershipState": state,
+    });
+    if let Some(code) = code {
+        view["reasonCode"] = serde_json::json!(code);
+    }
+    view
+}
+
+fn linear_lifecycle_command(responses: Vec<Vec<u8>>, args: &[&str]) -> (Output, ScriptedServer) {
+    let (server, _directory, credential_path) = prepared_run(responses);
+    let environment = deployment_environment(&server.api_url, &credential_path);
+    let mut command = vec!["run", "linear"];
+    command.extend_from_slice(args);
+    command.push("--allow-insecure-http");
+    (run_with_env(&command, &environment), server)
+}
+
+fn linear_lifecycle_show(response: Vec<u8>, json: bool) -> (Output, ScriptedServer) {
+    let mut args = vec!["show", ORGANIZATION, RUN_ID];
+    if json {
+        args.push("--json");
+    }
+    linear_lifecycle_command(vec![response], &args)
+}
+
+fn lifecycle_identity_lines(indent: &str) -> Vec<String> {
+    vec![
+        format!("{indent}trigger: {LIFECYCLE_TRIGGER_ID}"),
+        format!("{indent}configuration version: 1"),
+        format!("{indent}connection: {LIFECYCLE_CONNECTION_ID}"),
+        format!("{indent}workspace: {LIFECYCLE_WORKSPACE_ID}"),
+        format!("{indent}issue: {LIFECYCLE_ISSUE_ID}"),
+    ]
+}
+
+// REQ-TRIGGER-108
+#[test]
+fn linear_lifecycle_show_writes_the_view_unchanged_and_one_line_per_member() {
+    let view = linear_lifecycle_body("skipped", Some("team_unmapped"));
+    let (output, server) = linear_lifecycle_show(run_response(view.clone()), true);
+    assert!(output.status.success());
+    assert!(output.stderr.is_empty());
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap(),
+        serde_json::json!({
+            "schemaVersion": 1,
+            "operation": "show",
+            "deployment": server.api_url,
+            "organizationRef": ORGANIZATION,
+            "runId": RUN_ID,
+            "outcome": "found",
+            "linearLifecycle": view,
+            "error": null
+        })
+    );
+    let request = server.finish().pop().unwrap();
+    assert!(request.starts_with(&format!(
+        "GET /api/v1/organizations/{ORGANIZATION}/runs/{RUN_ID}/linear-lifecycle HTTP/1.1\r\n"
+    )));
+
+    let (output, server) = linear_lifecycle_show(
+        run_response(linear_lifecycle_body("awaiting_event", None)),
+        false,
+    );
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let mut expected = lifecycle_identity_lines("");
+    expected.push("ownership state: awaiting_event".to_owned());
+    for field in expected {
+        assert!(
+            stdout.lines().any(|line| line == field),
+            "missing {field:?} in {stdout:?}"
+        );
+    }
+    assert!(!stdout.contains("reason code"), "{stdout:?}");
+    server.finish();
+}
+
+// REQ-TRIGGER-108
+#[test]
+fn linear_lifecycle_show_writes_the_latest_update_under_the_view() {
+    let mut view = linear_lifecycle_body("awaiting_event", None);
+    view["latestUpdate"] = serde_json::json!({
+        "id": "llu_01k0z6r1w8f4jy2m7q9v3x5abd",
+        "attemptId": "atm_01k0z6r1w8f4jy2m7q9v3x5abc",
+        "attemptNumber": 2,
+        "eventId": "evt-7",
+        "eventType": "step.failed",
+        "eventSequence": 7,
+        "eventOccurredAt": "2026-10-26T12:07:00Z",
+        "node": {"scope": ["deploy"], "role": "step", "id": "build"},
+        "createdAt": "2026-10-26T12:07:01Z",
+        "updatedAt": "2026-10-26T12:08:00Z",
+        "state": "retry_waiting",
+        "reasonCode": "outcome_unresolved",
+        "cycleNumber": 1,
+        "cycleDeadline": "2026-10-27T12:07:00Z",
+        "requestCount": 1,
+        "retryable": true,
+        "desiredStateId": "state-blocked",
+        "observedStateId": "state-progress",
+        "nextAttemptAt": "2026-10-26T12:09:00Z",
+        "blockingUpdate": {
+            "runId": "run_01k0z6r1w8f4jy2m7q9v3x5abe",
+            "updateId": "llu_01k0z6r1w8f4jy2m7q9v3x5abf"
+        }
+    });
+    let (output, server) = linear_lifecycle_show(run_response(view.clone()), true);
+    assert!(output.status.success());
+    let shown: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(shown["linearLifecycle"], view);
+    server.finish();
+
+    let (output, server) = linear_lifecycle_show(run_response(view), false);
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let lines: Vec<&str> = stdout.lines().collect();
+    let block = lines
+        .iter()
+        .position(|line| *line == "latest update:")
+        .unwrap_or_else(|| panic!("no latest update block in {stdout:?}"));
+    for field in [
+        "  id: llu_01k0z6r1w8f4jy2m7q9v3x5abd",
+        "  attempt: atm_01k0z6r1w8f4jy2m7q9v3x5abc",
+        "  attempt number: 2",
+        "  event: evt-7",
+        "  event type: step.failed",
+        "  event sequence: 7",
+        "  event occurred: 2026-10-26T12:07:00Z",
+        "  node: step deploy/build",
+        "  created: 2026-10-26T12:07:01Z",
+        "  updated: 2026-10-26T12:08:00Z",
+        "  state: retry_waiting",
+        "  reason code: outcome_unresolved",
+        "  cycle number: 1",
+        "  cycle deadline: 2026-10-27T12:07:00Z",
+        "  request count: 1",
+        "  retryable: true",
+        "  desired state: state-blocked",
+        "  observed state: state-progress",
+        "  next attempt: 2026-10-26T12:09:00Z",
+        "  blocking update: llu_01k0z6r1w8f4jy2m7q9v3x5abf (run run_01k0z6r1w8f4jy2m7q9v3x5abe)",
+    ] {
+        assert!(
+            lines[block + 1..].contains(&field),
+            "missing {field:?} under the latest update in {stdout:?}"
+        );
+    }
+    assert!(!stdout.contains("confirmed state"), "{stdout:?}");
+    server.finish();
+}
+
+// REQ-TRIGGER-108
+#[test]
+fn linear_lifecycle_show_reports_absence_and_refuses_a_wrong_pair() {
+    let (output, server) = linear_lifecycle_show(
+        problem_http_response(
+            "404 Not Found",
+            serde_json::json!({
+                "type": "https://api.usefulmachinery.com/problems/not-found",
+                "title": "Not found",
+                "status": 404
+            }),
+        ),
+        true,
+    );
+    assert_eq!(output.status.code(), Some(1));
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["operation"], "show");
+    assert_eq!(result["outcome"], "not_found");
+    assert_eq!(result["error"]["code"], "not_found");
+    assert!(result["linearLifecycle"].is_null());
+    server.finish();
+
+    let (output, server) = linear_lifecycle_show(
+        run_response(linear_lifecycle_body(
+            "awaiting_event",
+            Some("team_unmapped"),
+        )),
+        true,
+    );
+    assert_invalid_response(&output);
+    server.finish();
+}
+
+const LIFECYCLE_UPDATE_ID: &str = "llu_01k0z6r1w8f4jy2m7q9v3x5abd";
+const LIFECYCLE_OLDER_UPDATE_ID: &str = "llu_01k0z6r1w8f4jy2m7q9v3x5abe";
+
+fn lifecycle_update(id: &str, state: &str, code: Option<&str>) -> serde_json::Value {
+    let mut update = serde_json::json!({
+        "id": id,
+        "attemptId": ATTEMPT_ID,
+        "attemptNumber": 1,
+        "eventId": "evt-9",
+        "eventType": "run.succeeded",
+        "eventSequence": 9,
+        "eventOccurredAt": "2026-10-26T12:09:00Z",
+        "createdAt": "2026-10-26T12:09:01Z",
+        "updatedAt": "2026-10-27T12:09:00Z",
+        "state": state,
+        "cycleNumber": 1,
+        "cycleDeadline": "2026-10-27T12:09:00Z",
+        "requestCount": 3,
+        "retryable": false,
+        "desiredStateId": "state-done"
+    });
+    if let Some(code) = code {
+        update["reasonCode"] = serde_json::json!(code);
+    }
+    update
+}
+
+fn lifecycle_history_page() -> serde_json::Value {
+    let mut exhausted = lifecycle_update(LIFECYCLE_UPDATE_ID, "failed", Some("retry_exhausted"));
+    exhausted["retryable"] = serde_json::json!(true);
+    exhausted["diagnostic"] =
+        serde_json::json!({"cause": "provider_unavailable", "providerStatus": 503});
+    serde_json::json!({
+        "items": [exhausted, lifecycle_update(LIFECYCLE_OLDER_UPDATE_ID, "applied", None)],
+        "nextCursor": "page-3"
+    })
+}
+
+fn lifecycle_retry_receipt() -> serde_json::Value {
+    serde_json::json!({
+        "runId": RUN_ID,
+        "updateId": LIFECYCLE_UPDATE_ID,
+        "cycleNumber": 2,
+        "acceptedAt": "2026-10-27T13:00:00Z",
+        "cycleDeadline": "2026-10-28T13:00:00Z"
+    })
+}
+
+fn lifecycle_retry_response(receipt: &serde_json::Value, key: &str) -> Vec<u8> {
+    http_response_with_headers(
+        "202 Accepted",
+        Some("application/json"),
+        &[
+            ("Idempotency-Key", key),
+            ("Cache-Control", "private, no-store"),
+        ],
+        &serde_json::to_vec(receipt).unwrap(),
+    )
+}
+
+fn lifecycle_problem(status: &str, problem: &str) -> Vec<u8> {
+    let number: u16 = status.split(' ').next().unwrap().parse().unwrap();
+    problem_http_response(
+        status,
+        serde_json::json!({
+            "type": format!("https://api.usefulmachinery.com/problems/{problem}"),
+            "title": "Problem",
+            "status": number
+        }),
+    )
+}
+
+// REQ-TRIGGER-108, REQ-TRIGGER-118
+#[test]
+fn linear_lifecycle_history_writes_the_page_unchanged_and_each_update_as_show_does() {
+    let page = lifecycle_history_page();
+    let (output, server) = linear_lifecycle_command(
+        vec![run_response(page.clone())],
+        &[
+            "history",
+            ORGANIZATION,
+            RUN_ID,
+            "--limit",
+            "2",
+            "--cursor",
+            "page-2",
+            "--json",
+        ],
+    );
+    assert!(output.status.success(), "{output:?}");
+    assert!(output.stderr.is_empty());
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap(),
+        serde_json::json!({
+            "schemaVersion": 1,
+            "operation": "history",
+            "deployment": server.api_url,
+            "organizationRef": ORGANIZATION,
+            "runId": RUN_ID,
+            "outcome": "found",
+            "updates": page,
+            "error": null
+        })
+    );
+    let request = server.finish().pop().unwrap();
+    assert!(
+        request.starts_with(&format!(
+            "GET /api/v1/organizations/{ORGANIZATION}/runs/{RUN_ID}/linear-lifecycle/updates?limit=2&cursor=page-2 HTTP/1.1\r\n"
+        )),
+        "{request:?}"
+    );
+
+    let (output, server) =
+        linear_lifecycle_command(vec![run_response(page)], &["history", ORGANIZATION, RUN_ID]);
+    assert!(output.status.success(), "{output:?}");
+    let request = server.finish().pop().unwrap();
+    assert!(request.starts_with(&format!(
+        "GET /api/v1/organizations/{ORGANIZATION}/runs/{RUN_ID}/linear-lifecycle/updates HTTP/1.1\r\n"
+    )));
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let blocks: Vec<Vec<&str>> = stdout
+        .split("\n\n")
+        .map(|block| block.lines().collect())
+        .collect();
+    assert_eq!(blocks.len(), 3, "{stdout:?}");
+    for field in [
+        format!("id: {LIFECYCLE_UPDATE_ID}"),
+        "state: failed".to_owned(),
+        "reason code: retry_exhausted".to_owned(),
+        "retryable: true".to_owned(),
+        "diagnostic: cause provider_unavailable, provider status 503".to_owned(),
+    ] {
+        assert!(
+            blocks[0].contains(&field.as_str()),
+            "{field:?} in {stdout:?}"
+        );
+    }
+    for field in [
+        format!("id: {LIFECYCLE_OLDER_UPDATE_ID}"),
+        "state: applied".to_owned(),
+        "request count: 3".to_owned(),
+    ] {
+        assert!(
+            blocks[1].contains(&field.as_str()),
+            "{field:?} in {stdout:?}"
+        );
+    }
+    assert_eq!(blocks[2], ["next cursor: page-3"]);
+
+    let mut last = lifecycle_history_page();
+    last.as_object_mut().unwrap().remove("nextCursor");
+    last["items"].as_array_mut().unwrap().truncate(1);
+    let (output, server) =
+        linear_lifecycle_command(vec![run_response(last)], &["history", ORGANIZATION, RUN_ID]);
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(!stdout.contains("next cursor"), "{stdout:?}");
+    assert!(!stdout.contains("\n\n"), "{stdout:?}");
+    server.finish();
+}
+
+// REQ-TRIGGER-108, REQ-TRIGGER-111, REQ-TRIGGER-118
+#[test]
+fn linear_lifecycle_history_reports_absence_and_refuses_invalid_updates() {
+    let (output, server) = linear_lifecycle_command(
+        vec![lifecycle_problem("404 Not Found", "not-found")],
+        &["history", ORGANIZATION, RUN_ID, "--json"],
+    );
+    assert_eq!(output.status.code(), Some(1));
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["operation"], "history");
+    assert_eq!(result["outcome"], "not_found");
+    assert_eq!(result["error"]["code"], "not_found");
+    assert!(result["updates"].is_null());
+    server.finish();
+
+    let wrong_pair = |page: &mut serde_json::Value| {
+        page["items"][1]["reasonCode"] = serde_json::json!("retry_exhausted");
+    };
+    let empty_diagnostic = |page: &mut serde_json::Value| {
+        page["items"][0]["diagnostic"] = serde_json::json!({});
+    };
+    for change in [
+        &wrong_pair as &dyn Fn(&mut serde_json::Value),
+        &empty_diagnostic,
+    ] {
+        let mut page = lifecycle_history_page();
+        change(&mut page);
+        let (output, server) = linear_lifecycle_command(
+            vec![run_response(page)],
+            &["history", ORGANIZATION, RUN_ID, "--json"],
+        );
+        assert_invalid_response(&output);
+        server.finish();
+    }
+
+    for limit in ["0", "101"] {
+        let output = run(&[
+            "run",
+            "linear",
+            "history",
+            ORGANIZATION,
+            RUN_ID,
+            "--limit",
+            limit,
+        ]);
+        assert_eq!(output.status.code(), Some(2), "--limit {limit}");
+        assert!(output.stdout.is_empty());
+    }
+}
+
+// REQ-TRIGGER-108, REQ-TRIGGER-119
+#[test]
+fn linear_lifecycle_retry_sends_one_keyed_post_and_writes_the_receipt() {
+    let receipt = lifecycle_retry_receipt();
+    let (output, server) = linear_lifecycle_command(
+        vec![lifecycle_retry_response(&receipt, "owner-key-1")],
+        &[
+            "retry",
+            ORGANIZATION,
+            RUN_ID,
+            LIFECYCLE_UPDATE_ID,
+            "--idempotency-key",
+            "owner-key-1",
+            "--json",
+        ],
+    );
+    assert!(output.status.success(), "{output:?}");
+    assert!(output.stderr.is_empty());
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap(),
+        serde_json::json!({
+            "schemaVersion": 1,
+            "operation": "retry",
+            "deployment": server.api_url,
+            "organizationRef": ORGANIZATION,
+            "runId": RUN_ID,
+            "outcome": "accepted",
+            "idempotencyKey": "owner-key-1",
+            "receipt": receipt,
+            "error": null
+        })
+    );
+    let requests = server.finish();
+    assert_eq!(requests.len(), 1);
+    assert!(requests[0].starts_with(&format!(
+        "POST /api/v1/organizations/{ORGANIZATION}/runs/{RUN_ID}/linear-lifecycle/updates/{LIFECYCLE_UPDATE_ID}/retry HTTP/1.1\r\n"
+    )));
+    assert_eq!(header_value(&requests[0], "idempotency-key"), "owner-key-1");
+    assert_eq!(requests[0].split("\r\n\r\n").nth(1), Some(""));
+
+    // The first connection closes without a response; the replay carries the same key.
+    let (output, server) = linear_lifecycle_command(
+        vec![
+            Vec::new(),
+            lifecycle_retry_response(&receipt, ECHO_IDEMPOTENCY_KEY),
+        ],
+        &["retry", ORGANIZATION, RUN_ID, LIFECYCLE_UPDATE_ID],
+    );
+    assert!(output.status.success(), "{output:?}");
+    let requests = server.finish();
+    assert_eq!(requests.len(), 2);
+    let key = header_value(&requests[0], "idempotency-key");
+    assert!(
+        key.len() == 64
+            && key
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+        "{key:?}"
+    );
+    assert_eq!(header_value(&requests[1], "idempotency-key"), key);
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    for field in [
+        format!("run: {RUN_ID}"),
+        format!("update: {LIFECYCLE_UPDATE_ID}"),
+        "cycle number: 2".to_owned(),
+        "accepted: 2026-10-27T13:00:00Z".to_owned(),
+        "cycle deadline: 2026-10-28T13:00:00Z".to_owned(),
+        format!("idempotency key: {key}"),
+    ] {
+        assert!(
+            stdout.lines().any(|line| line == field),
+            "missing {field:?} in {stdout:?}"
+        );
+    }
+}
+
+// REQ-TRIGGER-108, REQ-TRIGGER-119
+#[test]
+fn linear_lifecycle_retry_refuses_a_receipt_off_the_route_and_reports_rejections() {
+    let retry = ["retry", ORGANIZATION, RUN_ID, LIFECYCLE_UPDATE_ID, "--json"];
+    for (member, value) in [
+        ("runId", serde_json::json!("run_01k0z6r1w8f4jy2m7q9v3x5abe")),
+        ("updateId", serde_json::json!(LIFECYCLE_OLDER_UPDATE_ID)),
+        ("cycleNumber", serde_json::json!(1)),
+    ] {
+        let mut receipt = lifecycle_retry_receipt();
+        receipt[member] = value;
+        let (output, server) = linear_lifecycle_command(
+            vec![lifecycle_retry_response(&receipt, ECHO_IDEMPOTENCY_KEY)],
+            &retry,
+        );
+        assert_invalid_response(&output);
+        server.finish();
+    }
+    let (output, server) = linear_lifecycle_command(
+        vec![lifecycle_retry_response(
+            &lifecycle_retry_receipt(),
+            "another-key",
+        )],
+        &retry,
+    );
+    assert_invalid_response(&output);
+    server.finish();
+
+    for (response, outcome) in [
+        (
+            lifecycle_problem("409 Conflict", "linear-lifecycle-retry-conflict"),
+            "conflict",
+        ),
+        (lifecycle_problem("404 Not Found", "not-found"), "not_found"),
+    ] {
+        let (output, server) = linear_lifecycle_command(vec![response], &retry);
+        assert_eq!(output.status.code(), Some(1), "{output:?}");
+        let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(result["operation"], "retry");
+        assert_eq!(result["outcome"], outcome);
+        assert!(result["receipt"].is_null());
+        assert_eq!(server.finish().len(), 1);
+    }
+
+    let output = run(&[
+        "run",
+        "linear",
+        "retry",
+        ORGANIZATION,
+        RUN_ID,
+        LIFECYCLE_UPDATE_ID,
+        "--idempotency-key",
+        "two words",
+    ]);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+}
+
+// REQ-RUN-59, REQ-TRIGGER-108
+#[test]
+fn run_show_carries_the_linear_lifecycle_binding_only_when_present() {
+    let mut body = run_body();
+    body["linearLifecycle"] = linear_lifecycle_body("awaiting_event", None);
+    let (output, server) = run_show_with_response(run_response(body.clone()));
+    assert!(output.status.success());
+    let shown: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(shown["outcome"], "found");
+    assert_eq!(shown["run"], body);
+    server.finish();
+
+    for with_binding in [true, false] {
+        let mut body = run_body();
+        if with_binding {
+            body["linearLifecycle"] = linear_lifecycle_body("awaiting_event", None);
+        }
+        let (server, _directory, credential_path) = prepared_run(vec![run_response(body)]);
+        let environment = deployment_environment(&server.api_url, &credential_path);
+        let output = run_with_env(
+            &["run", "show", ORGANIZATION, RUN_ID, "--allow-insecure-http"],
+            &environment,
+        );
+        assert!(output.status.success());
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        assert_eq!(
+            stdout.lines().any(|line| line == "linear lifecycle:"),
+            with_binding,
+            "{stdout:?}"
+        );
+        if with_binding {
+            let mut expected = lifecycle_identity_lines("  ");
+            expected.push("  ownership state: awaiting_event".to_owned());
+            for field in expected {
+                assert!(
+                    stdout.lines().any(|line| line == field),
+                    "missing {field:?} in {stdout:?}"
+                );
+            }
+        }
+        server.finish();
+    }
+}
+
 #[test]
 fn run_show_displays_terminal_failure_and_rejection() {
     for (state, field, evidence, expected) in [
@@ -6638,6 +7237,48 @@ fn run_show_displays_terminal_failure_and_rejection() {
         );
         let text = String::from_utf8(output.stdout).unwrap();
         assert!(text.contains(expected), "{text}");
+        assert_eq!(server.finish().len(), 1);
+    }
+}
+
+// REQ-DIAG-29, REQ-DIAG-30
+#[test]
+fn run_show_json_keeps_harness_failure_and_input_size_diagnostic() {
+    let mut body = run_body_with_state("failed");
+    body["failure"] = serde_json::json!({
+        "node": {"id": "agent", "role": "step"}, "state": "failed",
+        "detail": {"phase": "start", "code": "harness_input_too_large"},
+        "diagnostic": {"harnessFailure": "diagnostic_failure_member",
+            "harnessInput": "diagnostic_input_member", "limitBytes": 1048576,
+            "observedBytes": 1048577}
+    });
+    for json in [true, false] {
+        let (server, _directory, credential_path) = prepared_run(vec![run_response(body.clone())]);
+        let environment = deployment_environment(&server.api_url, &credential_path);
+        let mut arguments = vec!["run", "show", ORGANIZATION, RUN_ID];
+        if json {
+            arguments.push("--json");
+        }
+        arguments.push("--allow-insecure-http");
+        let output = run_with_env(&arguments, &environment);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        if json {
+            let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(result["run"]["failure"], body["failure"]);
+        } else {
+            let text = String::from_utf8(output.stdout).unwrap();
+            assert!(text.contains("harness_input_too_large"), "{text}");
+            for member in ["diagnostic_", "1048576", "1048577"] {
+                assert!(
+                    !text.contains(member),
+                    "runner diagnostic rendered in {text}"
+                );
+            }
+        }
         assert_eq!(server.finish().len(), 1);
     }
 }
@@ -7103,6 +7744,137 @@ fn pre_dispatch_refresh_outage_is_not_run_acceptance_unknown() {
             assert!(requests[0].starts_with("POST /auth/oauth/token HTTP/1.1"));
         }
     }
+}
+
+const WORKSPACE_COMMIT: &str = "a3d0e2d3abc0bf0742be096155f683bf985e485a";
+const CREATE_REQUEST_ID: &str = "req_01m622k6qsf09npetkmdkdj51j";
+
+fn create_args_with_workspace_commit(json: bool) -> Vec<&'static str> {
+    let mut args = create_args(json);
+    let insertion = args.len() - 1;
+    args.splice(
+        insertion..insertion,
+        ["--workspace-commit", WORKSPACE_COMMIT],
+    );
+    args
+}
+
+fn create_problem_response(status: &str, kind: &str, request_id: Option<&str>) -> Vec<u8> {
+    let status_number: u16 = status.split(' ').next().unwrap().parse().unwrap();
+    let body = serde_json::json!({
+        "type": format!("https://api.usefulmachinery.com/problems/{kind}"),
+        "title": "server title sentinel",
+        "status": status_number,
+        "detail": "server detail sentinel"
+    });
+    let headers: Vec<(&str, &str)> = request_id
+        .map(|id| ("X-Request-ID", id))
+        .into_iter()
+        .collect();
+    http_response_with_headers(
+        status,
+        Some("application/problem+json"),
+        &headers,
+        &serde_json::to_vec(&body).unwrap(),
+    )
+}
+
+// REQ-RUN-80
+#[test]
+fn unsupported_workspace_selection_is_a_definite_admission_rejection() {
+    for json in [false, true] {
+        let (server, _directory, credential_path) = prepared_run(vec![create_problem_response(
+            "409 Conflict",
+            "workspace-selection-unsupported",
+            Some(CREATE_REQUEST_ID),
+        )]);
+        let output = run_with_env(
+            &create_args_with_workspace_commit(json),
+            &deployment_environment(&server.api_url, &credential_path),
+        );
+        assert_eq!(output.status.code(), Some(1));
+        if json {
+            let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(result["operation"], "create");
+            assert_eq!(result["outcome"], "error");
+            assert!(result["runId"].is_null());
+            assert_eq!(result["error"]["code"], "admission_rejected");
+            assert_eq!(result["error"]["httpStatus"], 409);
+            assert_eq!(
+                result["error"]["problemType"],
+                "https://api.usefulmachinery.com/problems/workspace-selection-unsupported"
+            );
+            assert_eq!(result["error"]["correlationId"], CREATE_REQUEST_ID);
+        } else {
+            assert!(output.stdout.is_empty());
+            let diagnostic = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                diagnostic.contains(
+                    "https://api.usefulmachinery.com/problems/workspace-selection-unsupported"
+                ) && diagnostic.contains(CREATE_REQUEST_ID)
+                    && diagnostic.contains("HTTP 409"),
+                "{diagnostic}"
+            );
+            assert!(!diagnostic.contains("acceptance_unknown"), "{diagnostic}");
+        }
+        assert_no_secret_output(
+            &output,
+            &["server title sentinel", "server detail sentinel"],
+        );
+        let requests = server.finish();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].contains(WORKSPACE_COMMIT));
+    }
+}
+
+// REQ-RUN-80
+#[test]
+fn admission_rejection_without_request_id_omits_correlation_id() {
+    let (server, _directory, credential_path) = prepared_run(vec![create_problem_response(
+        "422 Unprocessable Entity",
+        "workflow-source-invalid",
+        None,
+    )]);
+    let output = run_with_env(
+        &create_args(true),
+        &deployment_environment(&server.api_url, &credential_path),
+    );
+    assert_eq!(output.status.code(), Some(1));
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["outcome"], "error");
+    assert_eq!(result["error"]["code"], "admission_rejected");
+    assert_eq!(result["error"]["httpStatus"], 422);
+    assert_eq!(
+        result["error"]["problemType"],
+        "https://api.usefulmachinery.com/problems/workflow-source-invalid"
+    );
+    // The member is omitted, not null, like `httpStatus` and `problemType` outside a rejection.
+    assert!(result["error"].get("correlationId").is_none());
+    assert_eq!(server.finish().len(), 1);
+}
+
+// REQ-RUN-57
+#[test]
+fn create_server_error_after_dispatch_remains_acceptance_unknown() {
+    let (server, _directory, credential_path) = prepared_run(vec![create_problem_response(
+        "503 Service Unavailable",
+        "source-resolution-unavailable",
+        Some(CREATE_REQUEST_ID),
+    )]);
+    let output = run_with_env(
+        &create_args_with_workspace_commit(true),
+        &deployment_environment(&server.api_url, &credential_path),
+    );
+    assert_eq!(output.status.code(), Some(4));
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["outcome"], "acceptance_unknown");
+    assert_eq!(result["error"]["code"], "acceptance_unknown");
+    let requests = server.finish();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(
+        result["error"]["idempotencyKey"],
+        header_value(&requests[0], "idempotency-key")
+    );
 }
 
 // REQ-RUN-57

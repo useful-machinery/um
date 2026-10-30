@@ -1,13 +1,16 @@
 //! Nonsecret Linear connection projections over the generated source-connection client.
 use std::fmt;
-use std::time::Duration;
 
 use reqwest::{StatusCode, Url};
 
 use super::generated::{apis, models};
-use super::http_client::{generated_configuration, zeroize_generated_bearer_access_token};
-use super::http_util::{self, BoundedBodyError};
-use super::{HttpTransportPolicy, UnreachableCategory, classify_reqwest_error, problem};
+use super::http_client::zeroize_generated_bearer_access_token;
+use super::resource::{
+    LifecycleAction, ProblemVocabulary, ResourceFailure, classify_error, decode_closed_json,
+    invalid, mutation_request, receive_closed_json_response, receive_confirmed_json_response,
+    receive_json_response, receive_response, resource_configuration, validate_mutation_key,
+};
+use super::{HttpTransportPolicy, problem};
 
 pub type LinearSession = models::LinearAuthorizationSession;
 pub type LinearConnection = models::LinearConnection;
@@ -41,29 +44,18 @@ pub struct LinearApi {
     configuration: apis::configuration::Configuration,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum LinearFailure {
-    Unauthenticated,
-    Forbidden,
-    InvalidInput,
-    NotFound,
-    Conflict,
-    Unreachable { category: UnreachableCategory },
-    RateLimited { retry_after: Option<u64> },
-    InvalidResponse { credential_rejected: bool },
-}
+pub type LinearFailure = ResourceFailure;
+pub type TriggerAction = LifecycleAction;
 
-impl LinearFailure {
-    pub const fn credential_rejected(&self) -> bool {
-        matches!(
-            self,
-            Self::Unauthenticated
-                | Self::InvalidResponse {
-                    credential_rejected: true
-                }
-        )
-    }
-}
+const LINEAR: ProblemVocabulary = ProblemVocabulary {
+    bad_request: &[problem::BAD_REQUEST],
+    unprocessable: &["https://api.usefulmachinery.com/problems/workflow-source-invalid"],
+    conflict: &[
+        "https://api.usefulmachinery.com/problems/source-connection-conflict",
+        problem::QUANTITY_LIMIT_REACHED,
+        "https://api.usefulmachinery.com/problems/workflow-source-unavailable",
+    ],
+};
 
 impl LinearApi {
     pub fn new(
@@ -71,17 +63,13 @@ impl LinearApi {
         token: &str,
         policy: HttpTransportPolicy,
     ) -> Result<Self, LinearApiError> {
-        let parsed = Url::parse(api_url).map_err(|_| LinearApiError::InvalidEndpoint)?;
-        if !policy.permits(&parsed)
-            || parsed.cannot_be_a_base()
-            || parsed.query().is_some()
-            || parsed.fragment().is_some()
-        {
-            return Err(LinearApiError::InvalidEndpoint);
-        }
-        let configuration =
-            generated_configuration(api_url, token, policy, Duration::from_secs(20))
-                .map_err(LinearApiError::BuildClient)?;
+        let configuration = resource_configuration(
+            api_url,
+            token,
+            policy,
+            LinearApiError::InvalidEndpoint,
+            LinearApiError::BuildClient,
+        )?;
         Ok(Self { configuration })
     }
 
@@ -109,7 +97,7 @@ impl LinearApi {
             key,
             request,
         )
-        .map_err(classify_error)?;
+        .map_err(|error| classify_error(error, &LINEAR))?;
         let session = validate_session(session, organization, None)?;
         let matches_operation = match connection_id {
             Some(id) => {
@@ -140,7 +128,7 @@ impl LinearApi {
         if let Some(token) = &self.configuration.bearer_access_token {
             request = request.bearer_auth(token);
         }
-        let body = receive_json_response(request, StatusCode::OK)?;
+        let body = receive_json_response(request, StatusCode::OK, &LINEAR)?;
         let session = serde_json::from_slice(&body).map_err(|_| invalid())?;
         validate_session(session, organization, Some(id))
     }
@@ -155,7 +143,7 @@ impl LinearApi {
             organization,
             id,
         )
-        .map_err(classify_error)?;
+        .map_err(|error| classify_error(error, &LINEAR))?;
         validate_connection(connection, organization, Some(id))
     }
 
@@ -171,7 +159,7 @@ impl LinearApi {
             limit,
             cursor,
         )
-        .map_err(classify_error)?;
+        .map_err(|error| classify_error(error, &LINEAR))?;
         for connection in &page.items {
             validate_connection(connection.clone(), organization, None)?;
         }
@@ -189,6 +177,7 @@ impl LinearApi {
         let page: LinearTeamList = receive_closed_json_response(
             super::generated_api_request(&self.configuration, reqwest::Method::GET, &endpoint),
             StatusCode::OK,
+            &LINEAR,
         )?;
         if page
             .items
@@ -213,6 +202,7 @@ impl LinearApi {
         let page: LinearTeamStateList = receive_closed_json_response(
             super::generated_api_request(&self.configuration, reqwest::Method::GET, &endpoint),
             StatusCode::OK,
+            &LINEAR,
         )?;
         if page
             .items
@@ -277,7 +267,7 @@ impl LinearApi {
         let request = self
             .mutation_request(reqwest::Method::POST, &endpoint, key)
             .json(&request);
-        receive_confirmed_json_response(request, StatusCode::CREATED, key)
+        receive_confirmed_json_response(request, StatusCode::CREATED, key, &LINEAR)
             .and_then(|value| validate_trigger(value, project, None))
     }
 
@@ -293,7 +283,7 @@ impl LinearApi {
         let request = self
             .mutation_request(reqwest::Method::PATCH, &endpoint, key)
             .json(&request);
-        receive_confirmed_json_response(request, StatusCode::OK, key)
+        receive_confirmed_json_response(request, StatusCode::OK, key, &LINEAR)
             .and_then(|value| validate_trigger(value, project, Some(id)))
     }
 
@@ -309,6 +299,7 @@ impl LinearApi {
         let body = receive_json_response(
             super::generated_api_request(&self.configuration, reqwest::Method::GET, &endpoint),
             StatusCode::OK,
+            &LINEAR,
         )?;
         let value: serde_json::Value = serde_json::from_slice(&body).map_err(|_| invalid())?;
         if value.get("deleted").is_some() {
@@ -327,13 +318,10 @@ impl LinearApi {
             }
             Ok(LinearTriggerRead::Deleted(tombstone))
         } else {
-            let active: LinearTrigger =
-                serde_json::from_value(value.clone()).map_err(|_| invalid())?;
             // Generated models can drop unknown properties (including new mapping
-            // vocabulary) rather than fail. Never present a partial configuration.
-            if serde_json::to_value(&active).map_err(|_| invalid())? != value {
-                return Err(invalid());
-            }
+            // vocabulary) rather than fail; the closed decode never presents a partial
+            // configuration.
+            let active: LinearTrigger = decode_closed_json(&body)?;
             validate_trigger(active, project, Some(id)).map(LinearTriggerRead::Active)
         }
     }
@@ -359,7 +347,8 @@ impl LinearApi {
         if let Some(cursor) = cursor {
             request = request.query(&[("cursor", cursor)]);
         }
-        let page: LinearTriggerList = receive_closed_json_response(request, StatusCode::OK)?;
+        let page: LinearTriggerList =
+            receive_closed_json_response(request, StatusCode::OK, &LINEAR)?;
         for item in &page.items {
             validate_trigger(item.clone(), project, None)?;
         }
@@ -388,11 +377,12 @@ impl LinearApi {
                     request,
                     StatusCode::OK,
                     key,
+                    &LINEAR,
                 )?)
             }
             TriggerAction::Delete => {
                 let request = self.mutation_request(reqwest::Method::DELETE, &endpoint, key);
-                let (body, headers) = receive_response(request, StatusCode::NO_CONTENT)?;
+                let (body, headers) = receive_response(request, StatusCode::NO_CONTENT, &LINEAR)?;
                 validate_mutation_key(&headers, key)?;
                 if !body.is_empty() {
                     return Err(invalid());
@@ -425,8 +415,7 @@ impl LinearApi {
         endpoint: &str,
         key: &str,
     ) -> reqwest::blocking::RequestBuilder {
-        super::generated_api_request(&self.configuration, method, endpoint)
-            .header("Idempotency-Key", key)
+        mutation_request(&self.configuration, method, endpoint, key)
     }
 
     pub fn evaluations(
@@ -457,7 +446,8 @@ impl LinearApi {
                 request = request.query(&[(name, value)]);
             }
         }
-        let page: LinearEvaluationList = receive_closed_json_response(request, StatusCode::OK)?;
+        let page: LinearEvaluationList =
+            receive_closed_json_response(request, StatusCode::OK, &LINEAR)?;
         for item in &page.items {
             validate_evaluation(item.clone(), trigger, &item.id, None)?;
         }
@@ -532,9 +522,9 @@ impl LinearApi {
             request = request.header("Idempotency-Key", key);
         }
         if let Some(key) = key {
-            receive_confirmed_json_response(request, expected_status, key)
+            receive_confirmed_json_response(request, expected_status, key, &LINEAR)
         } else {
-            receive_closed_json_response(request, expected_status)
+            receive_closed_json_response(request, expected_status, &LINEAR)
         }
     }
 
@@ -550,7 +540,7 @@ impl LinearApi {
             id,
             key,
         )
-        .map_err(classify_error)?;
+        .map_err(|error| classify_error(error, &LINEAR))?;
         validate_connection(connection, organization, Some(id))
     }
 
@@ -561,15 +551,8 @@ impl LinearApi {
             id,
             key,
         )
-        .map_err(classify_error)
+        .map_err(|error| classify_error(error, &LINEAR))
     }
-}
-
-#[derive(Clone, Copy)]
-pub enum TriggerAction {
-    Enable,
-    Disable,
-    Delete,
 }
 
 fn validate_trigger(
@@ -600,98 +583,6 @@ impl Drop for LinearApi {
     }
 }
 
-fn receive_closed_json_response<T: serde::de::DeserializeOwned + serde::Serialize>(
-    request: reqwest::blocking::RequestBuilder,
-    expected_status: StatusCode,
-) -> Result<T, LinearFailure> {
-    let (body, headers) = receive_response(request, expected_status)?;
-    validate_json_media_type(&headers)?;
-    decode_closed_json(&body)
-}
-
-fn receive_confirmed_json_response<T: serde::de::DeserializeOwned + serde::Serialize>(
-    request: reqwest::blocking::RequestBuilder,
-    expected_status: StatusCode,
-    key: &str,
-) -> Result<T, LinearFailure> {
-    let (body, headers) = receive_response(request, expected_status)?;
-    validate_mutation_key(&headers, key)?;
-    validate_json_media_type(&headers)?;
-    decode_closed_json(&body)
-}
-
-fn validate_mutation_key(
-    headers: &reqwest::header::HeaderMap,
-    key: &str,
-) -> Result<(), LinearFailure> {
-    let keys = headers.get_all("Idempotency-Key");
-    if keys.iter().count() != 1
-        || keys
-            .iter()
-            .next()
-            .is_none_or(|value| value.as_bytes() != key.as_bytes())
-    {
-        return Err(invalid());
-    }
-    Ok(())
-}
-
-fn decode_closed_json<T: serde::de::DeserializeOwned + serde::Serialize>(
-    body: &[u8],
-) -> Result<T, LinearFailure> {
-    let raw: serde_json::Value = serde_json::from_slice(body).map_err(|_| invalid())?;
-    let decoded: T = serde_json::from_value(raw.clone()).map_err(|_| invalid())?;
-    if serde_json::to_value(&decoded).map_err(|_| invalid())? != raw {
-        return Err(invalid());
-    }
-    Ok(decoded)
-}
-
-fn receive_json_response(
-    request: reqwest::blocking::RequestBuilder,
-    expected_status: StatusCode,
-) -> Result<Vec<u8>, LinearFailure> {
-    let (body, headers) = receive_response(request, expected_status)?;
-    validate_json_media_type(&headers)?;
-    Ok(body)
-}
-
-fn validate_json_media_type(headers: &reqwest::header::HeaderMap) -> Result<(), LinearFailure> {
-    http_util::require_header_media_type(
-        headers.get(reqwest::header::CONTENT_TYPE),
-        problem::JSON_MEDIA_TYPE,
-    )
-    .map_err(|_| invalid())
-}
-
-fn receive_response(
-    request: reqwest::blocking::RequestBuilder,
-    expected_status: StatusCode,
-) -> Result<(Vec<u8>, reqwest::header::HeaderMap), LinearFailure> {
-    let response = request.send().map_err(|error| LinearFailure::Unreachable {
-        category: classify_reqwest_error(&error),
-    })?;
-    let status = response.status();
-    let headers = response.headers().clone();
-    let retry_after = response
-        .headers()
-        .get("Retry-After")
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.parse::<u64>().ok());
-    let body = http_util::read_bounded_blocking_body(response).map_err(|error| match error {
-        BoundedBodyError::TooLarge => LinearFailure::InvalidResponse {
-            credential_rejected: status == StatusCode::UNAUTHORIZED,
-        },
-        BoundedBodyError::Transport(error) => LinearFailure::Unreachable {
-            category: classify_reqwest_error(&error),
-        },
-    })?;
-    if status != expected_status {
-        return Err(classify_response(status, &body, retry_after));
-    }
-    Ok((body, headers))
-}
-
 fn validate_evaluation(
     evaluation: LinearEvaluation,
     trigger: &str,
@@ -708,12 +599,6 @@ fn validate_evaluation(
         return Err(invalid());
     }
     Ok(evaluation)
-}
-
-fn invalid() -> LinearFailure {
-    LinearFailure::InvalidResponse {
-        credential_rejected: false,
-    }
 }
 
 fn validate_connection(
@@ -768,51 +653,6 @@ fn validate_session(
         validate_connection((**connection).clone(), organization, None)?;
     }
     Ok(value)
-}
-
-fn classify_error<E>(error: apis::Error<E>) -> LinearFailure {
-    match error {
-        apis::Error::Reqwest(error) => LinearFailure::Unreachable {
-            category: classify_reqwest_error(&error),
-        },
-        apis::Error::ResponseError(response) => {
-            classify_response(response.status, response.content.as_bytes(), None)
-        }
-        apis::Error::Serde(_) | apis::Error::Io(_) => invalid(),
-    }
-}
-
-fn classify_response(status: StatusCode, body: &[u8], retry_after: Option<u64>) -> LinearFailure {
-    if status == StatusCode::TOO_MANY_REQUESTS {
-        return LinearFailure::RateLimited { retry_after };
-    }
-    if status.is_server_error() {
-        return LinearFailure::Unreachable {
-            category: UnreachableCategory::Server,
-        };
-    }
-    let Ok(decoded) = problem::decode(body, status) else {
-        return LinearFailure::InvalidResponse {
-            credential_rejected: status == StatusCode::UNAUTHORIZED,
-        };
-    };
-    match (status, decoded.r#type.as_str()) {
-        (StatusCode::BAD_REQUEST, problem::BAD_REQUEST) => LinearFailure::InvalidInput,
-        (StatusCode::UNAUTHORIZED, problem::UNAUTHORIZED) => LinearFailure::Unauthenticated,
-        (StatusCode::FORBIDDEN, problem::FORBIDDEN) => LinearFailure::Forbidden,
-        (StatusCode::NOT_FOUND, problem::NOT_FOUND) => LinearFailure::NotFound,
-        (
-            StatusCode::CONFLICT,
-            "https://api.usefulmachinery.com/problems/source-connection-conflict"
-            | problem::QUANTITY_LIMIT_REACHED
-            | "https://api.usefulmachinery.com/problems/workflow-source-unavailable",
-        ) => LinearFailure::Conflict,
-        (
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "https://api.usefulmachinery.com/problems/workflow-source-invalid",
-        ) => LinearFailure::InvalidInput,
-        _ => invalid(),
-    }
 }
 
 #[derive(Debug)]

@@ -398,38 +398,23 @@ impl WebhookApi {
                 let decoded = problem::decode(&bytes, status)
                     .map_err(|_| protocol(status == StatusCode::UNAUTHORIZED))?;
                 let failure = match (status, decoded.r#type.as_str()) {
-                    (
-                        StatusCode::UNAUTHORIZED,
-                        "https://api.usefulmachinery.com/problems/unauthorized",
-                    ) => WebhookFailure::Unauthenticated,
-                    (
-                        StatusCode::FORBIDDEN,
-                        "https://api.usefulmachinery.com/problems/forbidden",
-                    ) => WebhookFailure::Forbidden,
-                    (
-                        StatusCode::NOT_FOUND,
-                        "https://api.usefulmachinery.com/problems/not-found",
-                    ) => WebhookFailure::NotFound,
-                    (
-                        StatusCode::BAD_REQUEST,
-                        "https://api.usefulmachinery.com/problems/bad-request",
-                    )
-                    | (
-                        StatusCode::PAYLOAD_TOO_LARGE,
-                        "https://api.usefulmachinery.com/problems/payload-too-large",
-                    )
+                    (StatusCode::UNAUTHORIZED, problem::UNAUTHORIZED) => {
+                        WebhookFailure::Unauthenticated
+                    }
+                    (StatusCode::FORBIDDEN, problem::FORBIDDEN) => WebhookFailure::Forbidden,
+                    (StatusCode::NOT_FOUND, problem::NOT_FOUND) => WebhookFailure::NotFound,
+                    (StatusCode::BAD_REQUEST, problem::BAD_REQUEST)
+                    | (StatusCode::PAYLOAD_TOO_LARGE, problem::REQUEST_BODY_TOO_LARGE)
                     | (
                         StatusCode::UNSUPPORTED_MEDIA_TYPE,
                         "https://api.usefulmachinery.com/problems/unsupported-media-type",
                     ) => WebhookFailure::InvalidInput,
                     (
                         StatusCode::CONFLICT,
-                        "https://api.usefulmachinery.com/problems/webhook-conflict",
+                        "https://api.usefulmachinery.com/problems/webhook-conflict"
+                        | problem::IDEMPOTENCY_CONFLICT,
                     ) => WebhookFailure::Conflict,
-                    (
-                        StatusCode::TOO_MANY_REQUESTS,
-                        "https://api.usefulmachinery.com/problems/rate-limited",
-                    ) => {
+                    (StatusCode::TOO_MANY_REQUESTS, problem::RATE_LIMIT_EXCEEDED) => {
                         let delay = headers
                             .get("Retry-After")
                             .and_then(|v| v.to_str().ok())

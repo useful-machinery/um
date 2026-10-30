@@ -290,7 +290,7 @@ fn rate_limit_requires_matching_problem_and_positive_retry_after() {
     let valid = ScriptedHttpServer::respond(problem_response(
         "429 Too Many Requests",
         429,
-        RATE_LIMITED,
+        RATE_LIMIT_EXCEEDED,
         &[("Retry-After", "42")],
     ));
     let outcome = create_organization(&http_client(), &valid.api_url, TOKEN, KEY, "Acme", None)
@@ -310,7 +310,7 @@ fn rate_limit_requires_matching_problem_and_positive_retry_after() {
         let server = ScriptedHttpServer::respond(problem_response(
             "429 Too Many Requests",
             429,
-            RATE_LIMITED,
+            RATE_LIMIT_EXCEEDED,
             &headers,
         ));
         let error = create_organization(&http_client(), &server.api_url, TOKEN, KEY, "Acme", None)
