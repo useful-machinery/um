@@ -521,6 +521,15 @@ fn position_of(values: &[Value], predicate: impl Fn(&Value) -> bool) -> usize {
     values.iter().position(predicate).unwrap()
 }
 
+/// The index of the last `init`: the turn the drain wakes, before which a fixture splices the
+/// drain it builds.
+fn last_init(values: &[Value]) -> usize {
+    values
+        .iter()
+        .rposition(|value| value["subtype"] == "init")
+        .unwrap()
+}
+
 // REQ-AGENT-35, REQ-AGENT-64, REQ-AGENT-38
 #[test]
 fn backgrounded_subagent_activity_continues_after_the_exchange_and_its_notification_authorizes_the_wakeup()
@@ -613,10 +622,7 @@ fn resumed_subagent_transcript() -> Vec<Value> {
         value["event"]["message"]["id"] == "final-answer"
     });
     let first_result = position_of(&base, |value| value["type"] == "result");
-    let wakeup = base
-        .iter()
-        .rposition(|value| value["subtype"] == "init")
-        .unwrap();
+    let wakeup = last_init(&base);
     // The exchange that launched the subagent stays open through its settlement.
     let mut values = base[..final_answer].to_vec();
     values.extend_from_slice(&base[first_result + 1..wakeup]);
@@ -705,10 +711,7 @@ fn a_task_started_repeating_a_running_subagents_task_id_stays_a_protocol_failure
 /// name the Agent call that launched it.
 fn resumed_after_wakeup_subagent_transcript() -> Vec<Value> {
     let base = backgrounded_subagent_transcript();
-    let wakeup = base
-        .iter()
-        .rposition(|value| value["subtype"] == "init")
-        .unwrap();
+    let wakeup = last_init(&base);
     let mut values = base[..=wakeup].to_vec();
     values.extend(send_message_to_finished_subagent());
     values.extend(text_message("waiting-turn", &["waiting"], true));
@@ -775,10 +778,7 @@ fn same_round_resume_and_submission() -> Vec<Value> {
 #[test]
 fn a_subagents_frame_in_the_correction_window_is_its_work() {
     let base = backgrounded_subagent_transcript();
-    let wakeup = base
-        .iter()
-        .rposition(|value| value["subtype"] == "init")
-        .unwrap();
+    let wakeup = last_init(&base);
     let mut values = base[..=wakeup].to_vec();
     values.extend(same_round_resume_and_submission());
     let settlement = resumed_subagent_settlement();
@@ -1015,10 +1015,7 @@ fn a_subagent_moved_to_the_background_after_its_start_is_background_work() {
     ] {
         let values = registered_foreground_subagent_transcript(moved);
         let first_result = position_of(&values, |value| value["type"] == "result");
-        let notified_wakeup = values
-            .iter()
-            .rposition(|value| value["subtype"] == "init")
-            .unwrap();
+        let notified_wakeup = last_init(&values);
 
         // Result mode: the exchange pauses on the moved subagent instead of reporting a
         // missing candidate, and the notified turn's candidate settles the step.
@@ -1066,10 +1063,7 @@ fn a_refused_init_records_the_tracked_work_the_parser_held() {
     // command and a second backgrounded subagent and ends waiting; an `init` nothing
     // announced is then refused.
     let base = backgrounded_subagent_transcript();
-    let notified_wakeup = base
-        .iter()
-        .rposition(|value| value["subtype"] == "init")
-        .unwrap();
+    let notified_wakeup = last_init(&base);
     let mut values = base[..=notified_wakeup].to_vec();
     values.push(message_start("second-turn"));
     values.extend([
@@ -1130,10 +1124,7 @@ fn a_refused_init_records_the_tracked_work_the_parser_held() {
 #[test]
 fn the_recorded_tracked_work_keeps_the_newest_sixteen_of_each_list() {
     let base = backgrounded_subagent_transcript();
-    let notified_wakeup = base
-        .iter()
-        .rposition(|value| value["subtype"] == "init")
-        .unwrap();
+    let notified_wakeup = last_init(&base);
     let mut values = base[..=notified_wakeup].to_vec();
     values.push(message_start("second-turn"));
     let commands = 17;
@@ -1262,10 +1253,7 @@ fn terminal_drain_refuses_work_no_outstanding_subagent_owns() {
     );
 
     // Once the subagent has settled, an unknown task's notification is a failure again.
-    let wakeup = base
-        .iter()
-        .rposition(|value| value["subtype"] == "init")
-        .unwrap();
+    let wakeup = last_init(&base);
     let mut late = base[..wakeup].to_vec();
     late.push(system_event(
         "task_notification",
@@ -1316,10 +1304,7 @@ fn result_mode_pauses_on_outstanding_background_work_and_settles_on_the_wakeup_t
     let first_answer = position_of(&base, |value| {
         value["event"]["message"]["id"] == "final-answer"
     });
-    let notified_wakeup = base
-        .iter()
-        .rposition(|value| value["subtype"] == "init")
-        .unwrap();
+    let notified_wakeup = last_init(&base);
     let first_turn = framed(&base[..=first_result]);
     let drain = framed(&base[first_result + 1..notified_wakeup]);
     let submission = structured_output_exchange_after(&[]);
@@ -1385,13 +1370,19 @@ fn result_mode_pauses_on_outstanding_background_work_and_settles_on_the_wakeup_t
     assert_eq!(information.len(), 3, "{information:?}");
     assert!(information[1].contains("wakeup"));
 
-    // With nothing outstanding a scheduled wakeup announces no turn.
+    // With nothing outstanding a scheduled wakeup announces no turn: the late turn opens
+    // after the value settled, so it is an epilogue and the settled response stands
+    // (REQ-AGENT-76).
     let lifecycle = command_lifecycle("started");
     let mut idle = text_turn("only", "only");
     idle.push(lifecycle.clone());
     idle.extend(text_turn("unannounced", "late"));
     let (observations, outcome) = replay(&framed(&idle), AgentValueKind::Response, 1024);
-    assert_failed(outcome, AgentFailureCause::HarnessProtocolFailed);
+    assert_eq!(completed_response(&outcome), "only");
+    assert_eq!(
+        milestone_count(&observations, AgentLifecycleMilestone::TurnCompleted),
+        2
+    );
     assert_eq!(unrecognized_events(&observations), [&lifecycle]);
 
     // A native terminal failure explains a stream that ends with the subagent working.
@@ -1580,10 +1571,7 @@ fn backgrounded_subagent_leaving_its_command_running_transcript() -> Vec<Value> 
     let mut values = backgrounded_subagent_transcript();
     let closing_text = position_of(&values, |value| value["message"]["id"] == "msg-sub-2");
     values.splice(closing_text..closing_text, subagent_backgrounded_bash_run());
-    let wakeup = values
-        .iter()
-        .rposition(|value| value["subtype"] == "init")
-        .unwrap();
+    let wakeup = last_init(&values);
     values[wakeup - 1] = system_event(
         "background_tasks_changed",
         json!({"tasks": [{"task_id": "sub-watch-task", "run_id": "sub-watch-run",
@@ -1664,17 +1652,34 @@ fn harness_resume_delivering_the_report(run_id: &str) -> Vec<Value> {
 /// subagent the parser still tracks as settled (no wakeup `init` has forgotten it). The
 /// second resumed run's notification wakes the final turn.
 fn messaged_subagent_resumed_again_for_its_commands_report_transcript() -> Vec<Value> {
+    let mut drain = harness_resume_delivering_the_report("agent-run-3");
+    drain.extend(empty_notification_turn());
+    messaged_subagent_resumed_again_with_drain(drain)
+}
+
+/// As `messaged_subagent_resumed_again_for_its_commands_report_transcript`, with the two
+/// turns Claude Code opens for the subagent's two queued notifications in the other order:
+/// the notified turn first, then the empty turn for the superseded notification after the
+/// notified turn's `result`. Inferred from the merge-queue build #3433 rejection record
+/// (AUTO-54), whose every field fits this order; the capture is gone.
+fn messaged_subagent_notified_before_its_superseded_notifications_empty_turn_transcript()
+-> Vec<Value> {
+    let mut values = messaged_subagent_resumed_again_with_drain(
+        harness_resume_delivering_the_report("agent-run-3"),
+    );
+    values.extend(empty_notification_turn());
+    values
+}
+
+/// `resumed_subagent_transcript` with the messaged subagent's leftover command and its
+/// report, and `drain` spliced before the final `init`.
+fn messaged_subagent_resumed_again_with_drain(drain: Vec<Value>) -> Vec<Value> {
     let mut values = resumed_subagent_transcript();
     let closing_text = position_of(&values, |value| value["message"]["id"] == "msg-sub-2");
     values.splice(closing_text..closing_text, subagent_backgrounded_bash_run());
     let send_result = position_of(&values, |value| value["type"] == "result");
     values.splice(send_result + 1..send_result + 1, leftover_command_report());
-    let wakeup = values
-        .iter()
-        .rposition(|value| value["subtype"] == "init")
-        .unwrap();
-    let mut drain = harness_resume_delivering_the_report("agent-run-3");
-    drain.extend(empty_notification_turn());
+    let wakeup = last_init(&values);
     values.splice(wakeup..wakeup, drain);
     values
 }
@@ -1744,10 +1749,7 @@ fn a_messaged_subagent_resumed_again_in_the_drain_for_its_commands_report_stays_
 
     // The empty turn settles nothing: a stream that ends on it never delivered the
     // notification whose announcement it consumed.
-    let final_wakeup = values
-        .iter()
-        .rposition(|value| value["subtype"] == "init")
-        .unwrap();
+    let final_wakeup = last_init(&values);
     let (_, outcome) = replay(
         &framed(&values[..final_wakeup]),
         AgentValueKind::Response,
@@ -1770,6 +1772,86 @@ fn a_messaged_subagent_resumed_again_in_the_drain_for_its_commands_report_stays_
         protocol_rejection_value(&outcome)["detail"]["reason"],
         "initialization_invalid"
     );
+}
+
+// REQ-AGENT-76, REQ-AGENT-69, REQ-AGENT-64
+#[test]
+fn a_superseded_notifications_empty_turn_after_the_notified_turn_is_an_epilogue() {
+    let values =
+        messaged_subagent_notified_before_its_superseded_notifications_empty_turn_transcript();
+    for kind in [AgentValueKind::Response, AgentValueKind::None] {
+        let (observations, outcome) = replay(&framed(&values), kind, 1024);
+        match kind {
+            AgentValueKind::Response => assert_eq!(completed_response(&outcome), "final"),
+            _ => assert!(
+                matches!(
+                    outcome,
+                    AgentOutcome::Completed(CompletedAgentInvocation::NoValue)
+                ),
+                "{outcome:?}"
+            ),
+        }
+        assert_eq!(
+            subagent_statuses(&observations),
+            [
+                "started",
+                "completed",
+                "resumed",
+                "completed",
+                "resumed",
+                "completed"
+            ]
+        );
+        assert_eq!(unrecognized_events(&observations), Vec::<&Value>::new());
+        // The launching turn, the notified turn and the empty turn.
+        for milestone in [
+            AgentLifecycleMilestone::TurnStarted,
+            AgentLifecycleMilestone::TurnCompleted,
+        ] {
+            assert_eq!(
+                milestone_count(&observations, milestone),
+                3,
+                "{milestone:?}"
+            );
+        }
+        assert_eq!(
+            milestone_count(&observations, AgentLifecycleMilestone::HarnessCompleted),
+            1
+        );
+    }
+}
+
+// REQ-AGENT-76, REQ-AGENT-69, REQ-AGENT-64
+#[test]
+fn a_superseded_notifications_empty_turn_after_the_accepted_result_is_an_epilogue() {
+    let values =
+        messaged_subagent_notified_before_its_superseded_notifications_empty_turn_transcript();
+    // The notified turn's `init`, the last before the empty turn's.
+    let empty_turn = values.len() - empty_notification_turn().len();
+    let notified_wakeup = last_init(&values[..empty_turn]);
+    let mut notified_turn = values[..=notified_wakeup].to_vec();
+    notified_turn.extend_from_slice(&structured_output_exchange_after(&[])[1..]);
+    let mut parser = parser(AgentValueKind::Result, 1024);
+    parser.push_stdout(&framed(&notified_turn), drop).unwrap();
+    assert_eq!(
+        parser.take_completed_result_exchange(),
+        Some(CompletedResultExchange::Candidate(Arc::new(json!(7))))
+    );
+    parser
+        .accept_result(CapturedJson::fixture(Arc::new(json!(7))))
+        .unwrap();
+    assert!(parser.settling());
+    // The empty turn after settlement leaves no announcement standing: the grace runs on.
+    parser
+        .push_stdout(&framed(&empty_notification_turn()), drop)
+        .unwrap();
+    assert!(parser.settling());
+    assert_eq!(parser.take_completed_result_exchange(), None);
+    let AgentOutcome::Completed(CompletedAgentInvocation::Result(result)) = parser.finish(true)
+    else {
+        panic!("the accepted result must stand");
+    };
+    assert_eq!(result.value(), &json!(7));
 }
 
 /// Captured from Claude Code 2.1.310 with a `UserPromptSubmit` hook that exits 2: the first
@@ -1860,10 +1942,7 @@ fn a_backgrounded_subagents_command_outliving_it_stays_its_work_and_its_report_o
         first_result + 1 + position_of(after_first_result, |value| value["subtype"] == "init");
     let notified_result =
         first_result + 1 + position_of(after_first_result, |value| value["type"] == "result");
-    let epilogue = transcript
-        .iter()
-        .rposition(|value| value["subtype"] == "init")
-        .unwrap();
+    let epilogue = last_init(&transcript);
     let mut observations = Vec::new();
     let mut parser = parser(AgentValueKind::Result, 1024);
     for frames in [
@@ -1913,10 +1992,7 @@ fn a_backgrounded_subagents_command_outliving_it_stays_its_work_and_its_report_o
 fn a_turn_begun_after_a_native_failure_ends_the_stream_with_the_native_failure() {
     let base = backgrounded_subagent_transcript();
     let first_result = position_of(&base, |value| value["type"] == "result");
-    let notified_init = base
-        .iter()
-        .rposition(|value| value["subtype"] == "init")
-        .unwrap();
+    let notified_init = last_init(&base);
     let mut failing = base[..first_result].to_vec();
     failing.push(
         json!({"type": "result", "subtype": "error_during_execution",
@@ -2316,10 +2392,7 @@ fn a_monitors_task_is_background_work_whose_events_open_turns() {
             .0
     };
     let (first_result, event_result) = (result_at(0), result_at(1));
-    let notified_turn = values
-        .iter()
-        .rposition(|value| value["subtype"] == "init")
-        .unwrap();
+    let notified_turn = last_init(&values);
 
     // Response mode: the monitor's event turn and its notified turn are accepted and the
     // last turn's text is the response. The only unrecognized frame is the task list that

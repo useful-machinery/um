@@ -444,6 +444,19 @@ impl LifecycleCell {
         )
     }
 
+    /// A messaged subagent whose own backgrounded command outlives it, released in the drain
+    /// and not cancelled: the messaged run settles in the drain and Claude Code's own resume
+    /// that delivers the command's report follows at once, so two notifications are queued for
+    /// the main thread, the messaged run's, which the resume supersedes, and the report run's
+    /// (chapter 14's "command outliving it" row). The binary opens the superseded
+    /// notification's empty turn and the notified turn in either order; the driver notes which
+    /// came first.
+    const fn queues_two_notifications(&self) -> bool {
+        self.outlives_its_subagent_in_the_drain()
+            && self.followup.resumes() > 0
+            && !self.ending.cancels()
+    }
+
     /// The turns a settling cell completes on 2.1.310, where the matrix pins the count: a
     /// wakeup cell's and a same-round cell's. In Result mode a same-round answer submits the
     /// value beside the followup's call, which the adapter rejects (an ambiguous candidate
@@ -1694,6 +1707,15 @@ async fn drive(
             "the stopped subagent's thread did not report before the turn's result".into()
         });
     }
+    if cell.queues_two_notifications()
+        && let Some(followed) = empty_turn_followed_the_notified_turn(&session.observations)
+    {
+        facts.notes.push(if followed {
+            "the superseded notification's empty turn followed the notified turn".into()
+        } else {
+            "the superseded notification's empty turn preceded the notified turn".into()
+        });
+    }
     session.provider.shutdown().await;
     (outcome, facts)
 }
@@ -2254,6 +2276,44 @@ fn stopped_thread_reported_in_the_turn(observations: &RecordingObservationSink) 
             matches!(observation, AgentObservation::UnrecognizedHarnessEvent { event }
                 if !event["parent_tool_use_id"].is_null())
         })
+}
+
+/// Whether the last turn the parser opened, from its `TurnStarted` to its `TurnCompleted`,
+/// carried no main-thread message: the superseded notification's empty turn, which makes no
+/// model call, came after the notified turn rather than before it. `None` when no turn was
+/// opened, so a cell that failed before its first `init` keeps its own failure as its report
+/// rather than a panic here.
+fn empty_turn_followed_the_notified_turn(observations: &RecordingObservationSink) -> Option<bool> {
+    let snapshot = observations.snapshot();
+    let observations: Vec<_> = snapshot
+        .iter()
+        .map(|envelope| envelope.observation())
+        .collect();
+    let last_turn = observations.iter().rposition(|observation| {
+        matches!(
+            observation,
+            AgentObservation::Lifecycle {
+                milestone: AgentLifecycleMilestone::TurnStarted,
+            }
+        )
+    })?;
+    let followed = !observations[last_turn..]
+        .iter()
+        .take_while(|observation| {
+            !matches!(
+                observation,
+                AgentObservation::Lifecycle {
+                    milestone: AgentLifecycleMilestone::TurnCompleted,
+                }
+            )
+        })
+        .any(|observation| {
+            matches!(
+                observation,
+                AgentObservation::AssistantText { .. } | AgentObservation::ToolCall { .. }
+            )
+        });
+    Some(followed)
 }
 
 /// Whether the invocation failed as a protocol failure with the rejection `reason`.

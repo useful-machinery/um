@@ -863,8 +863,8 @@ impl ClaudeCodeStreamJsonV1Parser {
         Ok(())
     }
 
-    /// Begins a turn a settled subagent or command announced after the step's value
-    /// settled. The final main-thread message stays the value's (REQ-AGENT-76).
+    /// Begins a turn Claude Code opens after the step's value settled, announced or not.
+    /// The final main-thread message stays the value's (REQ-AGENT-76).
     fn begin_epilogue(&mut self) {
         self.exchange_active = true;
         self.epilogue = true;
@@ -1050,8 +1050,11 @@ impl ClaudeCodeStreamJsonV1Parser {
             self.rejection_context.stage = ClaudeCodeStreamJsonV1ProtocolStage::Initialization;
             // A Result-mode correction turn is begun by the adapter before its init arrives;
             // begin_exchange refuses this one while a decision is pending or a result is
-            // accepted (INV-HARNESS-7). Once the value has settled, the announced turn is
-            // an epilogue instead (REQ-AGENT-76).
+            // accepted (INV-HARNESS-7). Once the value has settled, the turn is an epilogue
+            // whatever announced it, or nothing did (REQ-AGENT-76): Claude Code may open a
+            // turn for a notification the parser has already spent on another, as when two
+            // settled runs of one subagent queue two notifications against its one
+            // `notified` bit.
             if !self.exchange_active {
                 let scheduled_wakeup = self.scheduled_wakeup_pending;
                 // An empty turn's announcement stands for this one.
@@ -1065,7 +1068,9 @@ impl ClaudeCodeStreamJsonV1Parser {
                     || self.subagents.iter().any(|subagent| subagent.notified);
                 // After a native failure the refusal ends the stream with that failure
                 // (`fail_stream`), whatever announced the turn.
-                if self.native_failure.is_some() || !(scheduled_wakeup || announced) {
+                if self.native_failure.is_some()
+                    || !(scheduled_wakeup || announced || self.value_settled)
+                {
                     return Err(self.protocol_failure());
                 }
                 self.announced_turn_pending = false;
@@ -2439,18 +2444,20 @@ impl ClaudeCodeStreamJsonV1Parser {
         !self.exchange_active && !self.announced_turn_pending && !self.awaits_background_work()
     }
 
-    /// A turn a notified task announced that Claude Code opened and closed without a model
-    /// call: `init`, then a `result` with `num_turns: 0` and no main-thread message
-    /// (2.1.310 emits one for a backgrounded subagent's notification that its own resume
-    /// superseded, with no `terminal_reason`). The turn decides and settles nothing, and
-    /// the announcement it consumed stands for the next `init`, which delivers the
-    /// notification (REQ-AGENT-69). The same `result` in a turn nothing announced, the
-    /// shape of a first prompt a hook blocked, never reaches here.
+    /// A turn a notified task announced, or an epilogue, that Claude Code opened and closed
+    /// without a model call: `init`, then a `result` with `num_turns: 0` and no main-thread
+    /// message (2.1.310 emits one for a backgrounded subagent's notification that its own
+    /// resume superseded, with no `terminal_reason`). The turn decides and settles nothing.
+    /// Before the value settled, the announcement it consumed stands for the next `init`,
+    /// which delivers the notification (REQ-AGENT-69); after it no `init` needs one
+    /// (REQ-AGENT-76), so a trailing empty turn leaves the parser `settling()` for the grace
+    /// (INV-HARNESS-7) and `finish` clean. The same `result` in a turn nothing announced
+    /// before settlement, the shape of a first prompt a hook blocked, never reaches here.
     fn complete_empty_turn(&mut self) -> Result<(), AgentFailureCause> {
         self.epilogue = false;
         self.exchange_initialized = false;
         self.exchange_active = false;
-        self.announced_turn_pending = true;
+        self.announced_turn_pending = !self.value_settled;
         self.completed_exchanges = self
             .completed_exchanges
             .checked_add(1)
@@ -2777,7 +2784,7 @@ impl ClaudeCodeStreamJsonV1Parser {
             return Err(self.protocol_failure());
         }
         self.require_matching_session(object)?;
-        if self.announced_exchange
+        if (self.announced_exchange || self.epilogue)
             && self.exchange_main_messages == 0
             && object.get("num_turns").and_then(Value::as_u64) == Some(0)
             && required_bool(object, "is_error") == Some(false)
