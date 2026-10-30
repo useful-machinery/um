@@ -19,7 +19,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinSet;
 
 use super::adapter::ClaudeCodeStreamJsonV1Adapter;
-use super::{ClaudeCodeStreamJsonV1ProtocolLimits, FIXED_INVOCATION_ENVIRONMENT};
+use super::{ClaudeCodeStreamJsonV1ProtocolLimits, FIXED_INVOCATION_ENVIRONMENT, OutstandingWork};
 use crate::claude_code::CLAUDE_CODE_STREAM_JSON_V1_QUALIFICATION_VERSION as QUALIFICATION_VERSION;
 use crate::workflow::admission::{CancellationSource, EnvironmentSnapshot};
 use crate::workflow::agent::{
@@ -1072,6 +1072,13 @@ pub(super) const BACKGROUND_SUBAGENT_PROMPT: &str =
     "Run the controlled background subagent command.";
 pub(super) const BACKGROUND_SUBAGENT_DESCRIPTION: &str = "Run a backgrounded subagent";
 pub(super) const BACKGROUND_SUBAGENT_RESPONSE: &str = "background subagent finished";
+/// The work a backgrounded subagent alone leaves outstanding, which its premature result's
+/// feedback names (REQ-AGENT-35).
+pub(super) const SUBAGENT_OUTSTANDING: OutstandingWork = OutstandingWork {
+    commands: false,
+    monitors: false,
+    subagents: true,
+};
 
 /// A subagent the main thread starts with `run_in_background`, whose own Bash call blocks
 /// on a fifo until the case releases it, so the main thread's turn ends while it runs.

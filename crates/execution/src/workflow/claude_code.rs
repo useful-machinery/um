@@ -483,9 +483,19 @@ pub(crate) enum CompletedResultExchange {
     AmbiguousCandidate,
     MissingCandidate,
     /// A structured result submitted while background work the step started still owes
-    /// its notification. It is never committed; the adapter returns it as feedback.
-    PrematureCandidate,
+    /// its notification. It is never committed; the adapter returns it as feedback that
+    /// names the kinds of work outstanding.
+    PrematureCandidate(OutstandingWork),
     NativeFailure,
+}
+
+/// The kinds of background work a premature result candidate found still owing its
+/// notification (REQ-AGENT-35): kinds only, never counts or native identifiers.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct OutstandingWork {
+    pub(crate) commands: bool,
+    pub(crate) monitors: bool,
+    pub(crate) subagents: bool,
 }
 
 /// The background commands and subagents the parser held when it refused a frame, and the
@@ -537,12 +547,23 @@ fn newest_tracked<T, U>(items: &[T], retain: impl Fn(&T) -> U) -> (Vec<U>, bool)
     (items[skipped..].iter().map(retain).collect(), skipped > 0)
 }
 
-/// A main-thread call whose `local_bash` task the parser tracks: a Bash call, or a
-/// `Monitor` call (`monitor`), whose task watches a command and whose result names it as
-/// `taskId` rather than `backgroundTaskId`.
+/// A call the parser correlates by id until its result: one whose `local_bash` task it
+/// tracks, or a `TaskStop` call whose result reports the task it stopped.
 struct CommandCall {
     id: Arc<str>,
-    monitor: bool,
+    kind: CommandCallKind,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum CommandCallKind {
+    /// A Bash call, whose task its result names as `backgroundTaskId` when backgrounded.
+    Bash,
+    /// A main-thread `Monitor` call, whose task watches a command and whose result names
+    /// it as `taskId`.
+    Monitor,
+    /// A main-thread `TaskStop` call, which starts no task; its result reports the task
+    /// it stopped (REQ-AGENT-77).
+    TaskStop,
 }
 
 struct BackgroundCommand {
@@ -556,6 +577,10 @@ struct BackgroundCommand {
     backgrounded: bool,
     acknowledged: bool,
     notified: bool,
+    /// Settled by the result of the `TaskStop` call that stopped it before Claude Code's
+    /// own report of the stop arrived; that report is still owed and accepted once, and
+    /// announces no turn (REQ-AGENT-77).
+    stopped_by_result: bool,
     /// The task a `Monitor` call started: each line its command prints opens a turn that
     /// nothing on the stream announces, until its `task_notification` settles it.
     monitor: bool,
@@ -648,6 +673,9 @@ pub(crate) struct ClaudeCodeStreamJsonV1Parser {
     maximum_response_bytes: NonZeroU64,
     limits: ClaudeCodeStreamJsonV1ProtocolLimits,
     frame: Vec<u8>,
+    /// The bytes of a stdout chunk after a `result` that left a decision pending, read before
+    /// the next chunk once the adapter has decided.
+    deferred_stdout: Vec<u8>,
     expected_session_id: Arc<str>,
     session_id: Option<Arc<str>>,
     exchange_initialized: bool,
@@ -786,6 +814,7 @@ impl ClaudeCodeStreamJsonV1Parser {
             rejected_line: None,
             limits,
             frame: Vec::new(),
+            deferred_stdout: Vec::new(),
             expected_session_id,
             session_id: None,
             exchange_initialized: false,
@@ -927,7 +956,11 @@ impl ClaudeCodeStreamJsonV1Parser {
         self.native_api_error = None;
     }
 
-    /// Consumes arbitrary stdout chunks while retaining at most one bounded JSONL frame.
+    /// Consumes arbitrary stdout chunks while retaining at most one bounded JSONL frame. A
+    /// `result` that leaves a decision pending ends the read: the rest of the chunk is
+    /// deferred and read first by the next call, which the adapter makes once it has
+    /// decided (`has_deferred_stdout`), so a turn Claude Code begins at once after that
+    /// `result` is read after the decision.
     // Pi and Claude intentionally retain independent native state machines; sharing
     // this byte loop would couple their profile-specific failure transitions.
     pub(crate) fn push_stdout(
@@ -938,9 +971,15 @@ impl ClaudeCodeStreamJsonV1Parser {
         if let Some(failure) = &self.failure {
             return Err(failure.clone());
         }
+        if !self.deferred_stdout.is_empty() {
+            let mut deferred = std::mem::take(&mut self.deferred_stdout);
+            deferred.extend_from_slice(bytes);
+            return self.push_stdout(&deferred, observe);
+        }
 
-        for &byte in bytes {
+        for (index, &byte) in bytes.iter().enumerate() {
             if byte == b'\n' {
+                let undecided = self.result_decision_pending;
                 let frame = std::mem::take(&mut self.frame);
                 if let Err(failure) = self.parse_frame(&frame) {
                     self.rejected_line = Some(self.retained_rejected_line(&frame));
@@ -951,6 +990,10 @@ impl ClaudeCodeStreamJsonV1Parser {
                 self.stream_tail.push(&frame);
                 for observation in self.observations.drain(..) {
                     observe(observation);
+                }
+                if !undecided && self.result_decision_pending {
+                    self.deferred_stdout.extend_from_slice(&bytes[index + 1..]);
+                    return Ok(());
                 }
                 continue;
             }
@@ -967,6 +1010,11 @@ impl ClaudeCodeStreamJsonV1Parser {
             self.frame.push(byte);
         }
         Ok(())
+    }
+
+    /// Whether a pending decision ended the last read with bytes of its chunk unread.
+    pub(crate) fn has_deferred_stdout(&self) -> bool {
+        !self.deferred_stdout.is_empty()
     }
 
     pub(crate) fn finish(mut self, exit_success: bool) -> AgentOutcome {
@@ -998,6 +1046,7 @@ impl ClaudeCodeStreamJsonV1Parser {
             || self.result_decision_pending
             || self.announced_turn_pending
             || self.correction_pending
+            || !self.deferred_stdout.is_empty()
             || self.completed_exchanges == 0
         {
             return self.end_of_stream_invariant_failure();
@@ -1098,7 +1147,7 @@ impl ClaudeCodeStreamJsonV1Parser {
         if event_type == "system" && required_string(object, "subtype") == Some("init") {
             self.rejection_context.stage = ClaudeCodeStreamJsonV1ProtocolStage::Initialization;
             // A Result-mode correction turn is begun by the adapter before its init arrives;
-            // begin_exchange refuses this one while a decision is pending or a result is
+            // begin_turn refuses this one while a decision is pending or a result is
             // accepted (INV-HARNESS-7). Once the value has settled, the turn is an epilogue
             // whatever announced it, or nothing did (REQ-AGENT-76): Claude Code may open a
             // turn for a notification the parser has already spent on another, as when two
@@ -1128,19 +1177,23 @@ impl ClaudeCodeStreamJsonV1Parser {
                 // turn consumes one, oldest first. An empty turn's announcement stands for
                 // the newer notification that superseded it, consumed with it; then a
                 // notification a resume carried past; then the correction prompt whose
-                // exchange an empty turn consumed; then the completed tasks and subagents
+                // exchange an empty turn or a queued notification's turn consumed; then the completed tasks and subagents
                 // and the scheduled wakeup together, as one turn. Others remain owned by
-                // the invocation and may notify during the next native exchange.
+                // the invocation and may notify during the next native exchange. A command a
+                // `TaskStop` result settled is kept until its own report of the stop arrives
+                // (REQ-AGENT-77).
                 if self.announced_turn_pending {
                     self.announced_turn_pending = false;
-                    self.background_commands.retain(|task| !task.notified);
+                    self.background_commands
+                        .retain(|task| !task.notified || task.stopped_by_result);
                     self.forget_notified_subagents();
                 } else if !self.carried_notifications.is_empty() {
                     self.carried_notifications.remove(0);
                 } else if self.correction_pending {
                     self.correction_pending = false;
                 } else {
-                    self.background_commands.retain(|task| !task.notified);
+                    self.background_commands
+                        .retain(|task| !task.notified || task.stopped_by_result);
                     self.forget_notified_subagents();
                     self.scheduled_wakeup_pending = false;
                     self.scheduled_wakeup_turn |= scheduled_wakeup;
@@ -1341,7 +1394,8 @@ impl ClaudeCodeStreamJsonV1Parser {
             let entry = entry.as_object().ok_or_else(|| self.protocol_failure())?;
             let id = required_nonempty_string(entry, "task_id")
                 .ok_or_else(|| self.protocol_failure())?;
-            if self.is_subagent_work(id) || self.settled_subagent(id) {
+            if self.is_subagent_work(id) || self.settled_subagent(id) || self.stopped_by_result(id)
+            {
                 continue;
             }
             if self.is_unmodeled_task(id) || (unmodeled_task_type(entry) && !self.tracks_task(id)) {
@@ -1659,9 +1713,16 @@ impl ClaudeCodeStreamJsonV1Parser {
                 else {
                     return Err(self.protocol_failure());
                 };
-                // A subagent's `Monitor` is its own work, whose task starts are its own.
-                let monitor = name == "Monitor" && message.parent_tool_use_id.is_none();
-                if name == "Bash" || monitor {
+                // A subagent's `Monitor` is its own work, whose task starts are its own,
+                // and what a subagent's `TaskStop` stops is its own work too.
+                let main_thread = message.parent_tool_use_id.is_none();
+                let kind = match name {
+                    "Bash" => Some(CommandCallKind::Bash),
+                    "Monitor" if main_thread => Some(CommandCallKind::Monitor),
+                    "TaskStop" if main_thread => Some(CommandCallKind::TaskStop),
+                    _ => None,
+                };
+                if let Some(kind) = kind {
                     if self.command_calls.len() >= 128
                         || self
                             .command_calls
@@ -1672,7 +1733,7 @@ impl ClaudeCodeStreamJsonV1Parser {
                     }
                     self.command_calls.push(CommandCall {
                         id: Arc::from(call_id),
-                        monitor,
+                        kind,
                     });
                 }
                 self.observations.push(AgentObservation::ToolCall {
@@ -2162,13 +2223,20 @@ impl ClaudeCodeStreamJsonV1Parser {
                 .get("content")
                 .and_then(normalized_tool_result_content)
                 .ok_or_else(|| self.protocol_failure())?;
-            // A Bash call's result names its background task as `backgroundTaskId`; a
-            // `Monitor` call's names its task as `taskId`, and the two acknowledge alike.
-            let task_field = if self
+            // `is_error` is optional on a native tool result and absent means success, as
+            // in the Messages API block shape; a present value must still be a boolean.
+            let is_error = match block.get("is_error") {
+                None => false,
+                Some(is_error) => is_error.as_bool().ok_or_else(|| self.protocol_failure())?,
+            };
+            let call_kind = self
                 .command_calls
                 .iter()
-                .any(|call| call.monitor && call.id.as_ref() == call_id)
-            {
+                .find(|call| call.id.as_ref() == call_id)
+                .map(|call| call.kind);
+            // A Bash call's result names its background task as `backgroundTaskId`; a
+            // `Monitor` call's names its task as `taskId`, and the two acknowledge alike.
+            let task_field = if call_kind == Some(CommandCallKind::Monitor) {
                 "taskId"
             } else {
                 "backgroundTaskId"
@@ -2180,6 +2248,10 @@ impl ClaudeCodeStreamJsonV1Parser {
             if parent.is_some() {
                 // A subagent's tool result settles the subagent's own call; a task it
                 // names is the subagent's work, never a command this invocation tracks.
+            } else if call_kind == Some(CommandCallKind::TaskStop) {
+                if !is_error {
+                    self.settle_stopped_command(object);
+                }
             } else if let Some(task_id) = background_task_id {
                 let Some(task) = self.background_commands.iter_mut().find(|task| {
                     task.task_id.as_ref() == task_id && task.tool_use_id.as_ref() == call_id
@@ -2216,12 +2288,6 @@ impl ClaudeCodeStreamJsonV1Parser {
                         .iter()
                         .any(|expected| expected.as_ref() == call_id)
                 });
-            // `is_error` is optional on a native tool result and absent means success, as
-            // in the Messages API block shape; a present value must still be a boolean.
-            let is_error = match block.get("is_error") {
-                None => false,
-                Some(is_error) => is_error.as_bool().ok_or_else(|| self.protocol_failure())?,
-            };
             if acknowledges_structured_output {
                 let message = self
                     .active_message
@@ -2245,7 +2311,8 @@ impl ClaudeCodeStreamJsonV1Parser {
             });
             // A foreground Bash result no longer needs correlation state. A
             // background result has already been paired with task_started above;
-            // its task identity remains until notification/continuation.
+            // its task identity remains until notification/continuation. A `TaskStop`
+            // call is done with its result.
             if let Some(index) = self
                 .command_calls
                 .iter()
@@ -2319,11 +2386,14 @@ impl ClaudeCodeStreamJsonV1Parser {
                     .ok_or_else(|| self.protocol_failure())?;
                 let tool_use_id = required_nonempty_string(object, "tool_use_id")
                     .ok_or_else(|| self.protocol_failure())?;
+                // A `TaskStop` call starts no task, so a start naming one names no command.
                 let Some(monitor) = self
                     .command_calls
                     .iter()
-                    .find(|call| call.id.as_ref() == tool_use_id)
-                    .map(|call| call.monitor)
+                    .find(|call| {
+                        call.id.as_ref() == tool_use_id && call.kind != CommandCallKind::TaskStop
+                    })
+                    .map(|call| call.kind == CommandCallKind::Monitor)
                 else {
                     if backgrounded {
                         return Err(self.protocol_failure());
@@ -2346,6 +2416,7 @@ impl ClaudeCodeStreamJsonV1Parser {
                     backgrounded,
                     acknowledged: false,
                     notified: false,
+                    stopped_by_result: false,
                     monitor,
                 });
             }
@@ -2420,6 +2491,12 @@ impl ClaudeCodeStreamJsonV1Parser {
                         .retain(|task| task.task_id != task_id);
                     return Ok(());
                 }
+                // A `TaskStop` result settled the command before this, the harness's own
+                // report of the stop, which is accepted once (REQ-AGENT-77).
+                if task.stopped_by_result {
+                    task.stopped_by_result = false;
+                    return Ok(());
+                }
                 // The status is the harness's classification of a background command's
                 // end (`completed`, or a stop at the background limit); any end settles it.
                 if !task.acknowledged || task.notified {
@@ -2435,14 +2512,15 @@ impl ClaudeCodeStreamJsonV1Parser {
     /// Whether a notification stands that announces a drain `init`: an empty turn's
     /// announcement, a notification a resume carried past, a completed background command
     /// or subagent, or an outstanding monitor, each line of whose command opens a turn with
-    /// nothing on the stream before its `init`.
+    /// nothing on the stream before its `init`. A command a `TaskStop` result settled
+    /// announces none (REQ-AGENT-77).
     fn notification_announces_a_turn(&self) -> bool {
         self.announced_turn_pending
             || !self.carried_notifications.is_empty()
-            || self
-                .background_commands
-                .iter()
-                .any(|task| task.notified || (task.monitor && task.awaits_notification()))
+            || self.background_commands.iter().any(|task| {
+                (task.notified && !task.stopped_by_result)
+                    || (task.monitor && task.awaits_notification())
+            })
             || self.subagents.iter().any(|subagent| subagent.notified)
     }
 
@@ -2475,6 +2553,40 @@ impl ClaudeCodeStreamJsonV1Parser {
                 .background_commands
                 .iter()
                 .any(|task| task.task_id.as_ref() == task_id)
+    }
+
+    /// Whether a `TaskStop` result settled the tracked command `task_id` before Claude
+    /// Code's own report of the stop, which a task list may still name until then.
+    fn stopped_by_result(&self, task_id: &str) -> bool {
+        self.background_commands
+            .iter()
+            .any(|task| task.task_id.as_ref() == task_id && task.stopped_by_result)
+    }
+
+    /// A main-thread `TaskStop` call's successful result whose `tool_use_result` names a
+    /// tracked backgrounded command or monitor (`task_type: local_bash`) by `task_id`
+    /// settles it as its notification would (REQ-AGENT-77). A stop of a subagent, which
+    /// settles on its own notification, or of anything not outstanding, or a result
+    /// without `tool_use_result`, changes nothing and is silent.
+    fn settle_stopped_command(&mut self, object: &Map<String, Value>) {
+        let Some(stopped) = object.get("tool_use_result").and_then(Value::as_object) else {
+            return;
+        };
+        if required_string(stopped, "task_type") != Some("local_bash") {
+            return;
+        }
+        let Some(task_id) = required_nonempty_string(stopped, "task_id") else {
+            return;
+        };
+        if let Some(task) = self.background_commands.iter_mut().find(|task| {
+            task.task_id.as_ref() == task_id
+                && task.backgrounded
+                && task.acknowledged
+                && !task.notified
+        }) {
+            task.notified = true;
+            task.stopped_by_result = true;
+        }
     }
 
     /// Whether the Agent call `tool_use_id` started a backgrounded subagent that has not
@@ -2547,8 +2659,8 @@ impl ClaudeCodeStreamJsonV1Parser {
         self.accepted_result.is_some()
     }
 
-    /// Whether nothing is open or outstanding: no exchange or epilogue is under way and no
-    /// background work owes a notification. The adapter's settlement grace runs only then
+    /// Whether nothing is open or outstanding: no exchange or epilogue is under way or owed,
+    /// and no background work owes a notification. The adapter's settlement grace runs only then
     /// (INV-HARNESS-7).
     pub(crate) fn settling(&self) -> bool {
         !self.exchange_active
@@ -2595,6 +2707,26 @@ impl ClaudeCodeStreamJsonV1Parser {
             .iter()
             .any(BackgroundCommand::awaits_notification)
             || self.subagents.iter().any(Subagent::awaits_notification)
+    }
+
+    fn outstanding_work(&self) -> OutstandingWork {
+        let mut outstanding = OutstandingWork {
+            commands: false,
+            monitors: false,
+            subagents: self.subagents.iter().any(Subagent::awaits_notification),
+        };
+        for command in self
+            .background_commands
+            .iter()
+            .filter(|command| command.awaits_notification())
+        {
+            if command.monitor {
+                outstanding.monitors = true;
+            } else {
+                outstanding.commands = true;
+            }
+        }
+        outstanding
     }
 
     fn start_subagent(&mut self, object: &Map<String, Value>) -> Result<(), AgentFailureCause> {
@@ -2994,7 +3126,9 @@ impl ClaudeCodeStreamJsonV1Parser {
             } else if !self.awaits_background_work() {
                 Some(self.extract_result_candidate(object))
             } else if object.contains_key("structured_output") {
-                Some(CompletedResultExchange::PrematureCandidate)
+                Some(CompletedResultExchange::PrematureCandidate(
+                    self.outstanding_work(),
+                ))
             } else {
                 // The agent ended its turn to wait for background work: the exchange
                 // pauses with no decision until a notification or wakeup begins the next.
@@ -3005,11 +3139,13 @@ impl ClaudeCodeStreamJsonV1Parser {
                 Some(
                     CompletedResultExchange::Candidate(_)
                         | CompletedResultExchange::AmbiguousCandidate
-                        | CompletedResultExchange::PrematureCandidate
+                        | CompletedResultExchange::PrematureCandidate(_)
                 )
             );
-            self.premature_candidate_pending =
-                matches!(exchange, Some(CompletedResultExchange::PrematureCandidate));
+            self.premature_candidate_pending = matches!(
+                exchange,
+                Some(CompletedResultExchange::PrematureCandidate(_))
+            );
             self.completed_result_exchange = exchange;
         } else if object.contains_key("structured_output") {
             return Err(self.protocol_failure());
@@ -3018,12 +3154,21 @@ impl ClaudeCodeStreamJsonV1Parser {
         self.complete_retry();
         self.exchange_initialized = false;
         self.exchange_active = false;
-        self.correction_pending = false;
-        // A turn with a model call in the correction window discharges the correction
-        // prompt's duty, whichever prompt it answered; the notification it was opened for,
-        // which it did not consume, stays the allowance that admits the correction turn.
-        if let Some(notified_after) = self.correction_window_notification.take() {
-            self.carried_notifications.insert(0, notified_after);
+        if self.correction_pending && opened_by_a_notification(object) {
+            // The turn names a notification Claude Code had queued ahead of the adapter's
+            // correction prompt as its origin: it consumed that notification, and the prompt
+            // is still queued and owed, the next `init`'s once the items queued ahead of it
+            // have opened theirs (REQ-AGENT-69).
+            self.correction_window_notification = None;
+        } else {
+            // Any other turn with a model call in the correction window discharges the
+            // correction prompt's duty, whichever prompt it answered; the notification it
+            // was opened for, which it did not consume, stays the allowance that admits the
+            // correction turn.
+            self.correction_pending = false;
+            if let Some(notified_after) = self.correction_window_notification.take() {
+                self.carried_notifications.insert(0, notified_after);
+            }
         }
         // A foreground subagent the exchange did not settle carries no completion duty; a
         // backgrounded one still owes its notification.
@@ -3543,7 +3688,7 @@ fn completed_result_exchange_state(
         Some(CompletedResultExchange::MissingCandidate) => {
             ClaudeCodeStreamJsonV1CompletedResultExchangeState::MissingCandidate
         }
-        Some(CompletedResultExchange::PrematureCandidate) => {
+        Some(CompletedResultExchange::PrematureCandidate(_)) => {
             ClaudeCodeStreamJsonV1CompletedResultExchangeState::PrematureCandidate
         }
         Some(CompletedResultExchange::NativeFailure) => {
@@ -3782,6 +3927,16 @@ fn heartbeat_call_id(call_id: &str) -> &str {
         }
         _ => call_id,
     }
+}
+
+/// Whether a `result` names its turn's origin as a queued `<task-notification>`
+/// (`origin.kind`); a turn a user message opened names none.
+fn opened_by_a_notification(object: &Map<String, Value>) -> bool {
+    object
+        .get("origin")
+        .and_then(Value::as_object)
+        .and_then(|origin| required_string(origin, "kind"))
+        == Some("task-notification")
 }
 
 fn required_string<'a>(object: &'a Map<String, Value>, key: &str) -> Option<&'a str> {

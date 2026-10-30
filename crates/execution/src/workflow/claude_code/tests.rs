@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use serde_json::{Value, json};
 
+use super::test_support::SUBAGENT_OUTSTANDING;
 use super::*;
 
 const SESSION_ID: &str = "00000000-0000-4000-8000-000000000001";
@@ -795,7 +796,9 @@ fn a_subagents_frame_in_the_correction_window_is_its_work() {
         .unwrap();
     assert_eq!(
         window.take_completed_result_exchange(),
-        Some(CompletedResultExchange::PrematureCandidate)
+        Some(CompletedResultExchange::PrematureCandidate(
+            SUBAGENT_OUTSTANDING
+        ))
     );
     window.reject_result_candidate().unwrap();
     window.begin_exchange().unwrap();
@@ -866,6 +869,108 @@ fn a_subagents_frame_in_the_correction_window_is_its_work() {
     );
     assert_eq!(rejection["detail"]["state"]["eventThread"], "main");
     assert_eq!(rejection["detail"]["state"]["exchangeActive"], true);
+}
+
+// REQ-AGENT-69, REQ-AGENT-76
+#[test]
+fn a_notification_turn_ahead_of_the_correction_leaves_the_correction_turn_queued() {
+    // Sanitized from 2.1.310 under load: after the premature candidate is rejected, the
+    // messaged run settles and Claude Code resumes the subagent once more before the
+    // correction turn's `init`, but the messaged run's notification was queued ahead of the
+    // adapter's correction message, so its turn comes first (its `result` names that
+    // notification as its origin), then the correction's, then the second resumed run's.
+    // Each queued turn begins at once after the `result` before it, in the same chunk.
+    let base = backgrounded_subagent_transcript();
+    let wakeup = base
+        .iter()
+        .rposition(|value| value["subtype"] == "init")
+        .unwrap();
+    let mut premature = base[..=wakeup].to_vec();
+    premature.extend(same_round_resume_and_submission());
+    let mut window = resumed_subagent_settlement();
+    let resume = harness_resume_delivering_the_report("agent-run-3");
+    window.extend_from_slice(&resume[..2]);
+    let mut notification_turn = structured_output_exchange_after(&[]);
+    notification_turn.splice(1..1, resume[2..].iter().cloned());
+    notification_turn.last_mut().unwrap()["origin"] =
+        json!({"kind": "task-notification", "producer": "session-task", "runId": "agent-run-2"});
+    let mut after_acceptance = structured_output_exchange_after(&[]);
+    let mut resumed_run_turn = epilogue_turn();
+    resumed_run_turn.last_mut().unwrap()["origin"] =
+        json!({"kind": "task-notification", "producer": "session-task", "runId": "agent-run-3"});
+    after_acceptance.extend(resumed_run_turn);
+
+    let accepted = |observations: &mut Vec<AgentObservation>| {
+        let mut parser = parser(AgentValueKind::Result, 1024);
+        parser
+            .push_stdout(&framed(&premature), |observation| {
+                observations.push(observation);
+            })
+            .unwrap();
+        assert_eq!(
+            parser.take_completed_result_exchange(),
+            Some(CompletedResultExchange::PrematureCandidate(
+                SUBAGENT_OUTSTANDING
+            ))
+        );
+        parser.reject_result_candidate().unwrap();
+        parser.begin_exchange().unwrap();
+        let chunk = [
+            window.clone(),
+            notification_turn.clone(),
+            after_acceptance.clone(),
+        ]
+        .concat();
+        parser
+            .push_stdout(&framed(&chunk), |observation| {
+                observations.push(observation);
+            })
+            .unwrap();
+        // The candidate's `result` ended the read: the turns after it wait for the decision.
+        assert!(parser.has_deferred_stdout());
+        assert_eq!(
+            parser.take_completed_result_exchange(),
+            Some(CompletedResultExchange::Candidate(Arc::new(json!(7))))
+        );
+        parser
+            .accept_result(CapturedJson::fixture(Arc::new(json!(7))))
+            .unwrap();
+        parser
+    };
+
+    let mut observations = Vec::new();
+    let mut parser = accepted(&mut observations);
+    // The correction message is still queued: its turn is owed, so the grace waits for it.
+    assert!(!parser.settling());
+    parser
+        .push_stdout(&[], |observation| observations.push(observation))
+        .unwrap();
+    assert!(!parser.has_deferred_stdout());
+    assert!(parser.settling());
+    assert!(matches!(
+        parser.finish(true),
+        AgentOutcome::Completed(CompletedAgentInvocation::Result(_))
+    ));
+    assert_eq!(
+        subagent_statuses(&observations),
+        [
+            "started",
+            "completed",
+            "resumed",
+            "completed",
+            "resumed",
+            "completed"
+        ]
+    );
+    // The launching, premature, notification, correction and resumed run's turns.
+    assert_eq!(
+        milestone_count(&observations, AgentLifecycleMilestone::TurnCompleted),
+        5
+    );
+    assert!(observations.iter().any(|observation| matches!(
+        observation,
+        AgentObservation::AssistantText { text } if text.as_ref() == "noted"
+    )));
 }
 
 // REQ-AGENT-69 (UM-3111)
@@ -1334,7 +1439,9 @@ fn result_mode_pauses_on_outstanding_background_work_and_settles_on_the_wakeup_t
     premature.push_stdout(&framed(&early), drop).unwrap();
     assert_eq!(
         premature.take_completed_result_exchange(),
-        Some(CompletedResultExchange::PrematureCandidate)
+        Some(CompletedResultExchange::PrematureCandidate(
+            SUBAGENT_OUTSTANDING
+        ))
     );
     premature.reject_result_candidate().unwrap();
     premature.begin_exchange().unwrap();
@@ -1898,7 +2005,9 @@ fn a_notification_a_subagents_resume_carried_past_still_opens_its_turn() {
             .unwrap();
         assert_eq!(
             parser.take_completed_result_exchange(),
-            Some(CompletedResultExchange::PrematureCandidate)
+            Some(CompletedResultExchange::PrematureCandidate(
+                SUBAGENT_OUTSTANDING
+            ))
         );
         parser.reject_result_candidate().unwrap();
         parser.begin_exchange().unwrap();
@@ -2717,6 +2826,168 @@ fn a_monitors_result_naming_an_untracked_task_is_a_protocol_failure() {
     );
 }
 
+/// A `TaskStop` call's `tool_result` as Claude Code 2.1.310 emits it for a stopped
+/// `local_bash` task, a backgrounded command's or a monitor's.
+fn task_stop_result(call_id: &str, task_id: &str, command: &str) -> Value {
+    let stopped = json!({"message": format!("Successfully stopped task: {task_id} ({command})"),
+        "task_id": task_id, "task_type": "local_bash", "command": command});
+    json!({"type":"user","session_id":SESSION_ID,"parent_tool_use_id":null,
+        "message":{"role":"user","content":[{"type":"tool_result","tool_use_id":call_id,
+            "content":stopped.to_string()}]},
+        "tool_use_result":stopped})
+}
+
+/// A main-thread message whose one `TaskStop` call stops `task_id`, and the call's result.
+fn task_stop_round(call_id: &str, task_id: &str, command: &str) -> Vec<Value> {
+    let mut values = tool_call_message(
+        &format!("{call_id}-message"),
+        call_id,
+        "TaskStop",
+        &json!({"task_id": task_id}),
+    );
+    values.extend(message_end("tool_use"));
+    values.push(task_stop_result(call_id, task_id, command));
+    values
+}
+
+/// Over `first`, frames ending in a premature candidate while the backgrounded command or
+/// monitor `task_id` under the call `work_call_id` runs, the correction turn stops it with
+/// `TaskStop` and resubmits the result in the round after the stop's result, before Claude
+/// Code's own report of the stop, which arrives after the value settled.
+fn assert_a_task_stop_result_settles(
+    first: &[Value],
+    work_call_id: &str,
+    task_id: &str,
+    command: &str,
+) {
+    let mut stopped = parser(AgentValueKind::Result, 1024);
+    stopped.push_stdout(&framed(first), drop).unwrap();
+    assert!(matches!(
+        stopped.take_completed_result_exchange(),
+        Some(CompletedResultExchange::PrematureCandidate(_))
+    ));
+    stopped.reject_result_candidate().unwrap();
+    stopped.begin_exchange().unwrap();
+
+    // No `task_updated` or `task_notification` precedes the stop's result. A second stop
+    // of the same task and a stop naming a task nothing tracks change nothing, silently.
+    let mut correction = vec![init(QUALIFICATION_VERSION, SESSION_ID)];
+    correction.extend(task_stop_round("stop-call", task_id, command));
+    correction.extend(task_stop_round("stop-again-call", task_id, command));
+    correction.extend(task_stop_round("stop-unknown-call", "unknown-task", "true"));
+    correction.extend_from_slice(&structured_output_exchange_after(&[])[1..]);
+    let mut observations = Vec::new();
+    stopped
+        .push_stdout(&framed(&correction), |observation| {
+            observations.push(observation);
+        })
+        .unwrap();
+    assert_eq!(
+        stopped.take_completed_result_exchange(),
+        Some(CompletedResultExchange::Candidate(Arc::new(json!(7))))
+    );
+    stopped
+        .accept_result(CapturedJson::fixture(Arc::new(json!(7))))
+        .unwrap();
+
+    // Claude Code's own report of the stop, after the result, is accepted once.
+    let late = [
+        system_event(
+            "task_updated",
+            json!({"task_id": task_id, "run_id": "run-1",
+                "patch": {"status": "killed", "end_time": 1}}),
+        ),
+        system_event(
+            "task_notification",
+            json!({"task_id": task_id, "run_id": "run-1", "tool_use_id": work_call_id,
+                "status": "stopped", "summary": "long command"}),
+        ),
+        system_event("background_tasks_changed", json!({"tasks": []})),
+    ];
+    stopped
+        .push_stdout(&framed(&late), |observation| {
+            observations.push(observation);
+        })
+        .unwrap();
+    assert_eq!(unrecognized_events(&observations), Vec::<&Value>::new());
+    assert!(stopped.settling());
+    assert!(matches!(
+        stopped.finish(true),
+        AgentOutcome::Completed(CompletedAgentInvocation::Result(_))
+    ));
+}
+
+// REQ-AGENT-77, REQ-AGENT-35
+// AUTO-41: no code path read a `TaskStop` result, so a stopped command or monitor settled
+// only when Claude Code's own report of the stop preceded the result.
+#[test]
+fn a_task_stop_result_settles_the_stopped_command_before_its_notification() {
+    assert_a_task_stop_result_settles(
+        &premature_candidate_over_a_monitor(),
+        "monitor-call",
+        "monitor-task",
+        "./watch-the-build",
+    );
+    assert_a_task_stop_result_settles(
+        &premature_candidate_over_a_background_command(),
+        "bash-call",
+        "task-1",
+        "sleep 600",
+    );
+}
+
+/// A monitor's first turn, which ends paused, and its event turn, which submits the result
+/// while the monitor runs.
+fn premature_candidate_over_a_monitor() -> Vec<Value> {
+    let monitor = monitor_transcript();
+    let first_result = position_of(&monitor, |value| value["type"] == "result");
+    let mut premature = monitor[..=first_result].to_vec();
+    premature.extend(structured_output_exchange_after(&[]));
+    premature
+}
+
+/// A backgrounded Bash command whose starting turn submits the result while it runs.
+fn premature_candidate_over_a_background_command() -> Vec<Value> {
+    let mut premature = vec![init(QUALIFICATION_VERSION, SESSION_ID)];
+    premature.extend(bash_call_message("tool-turn", "bash-call"));
+    premature.push(bash_task_started("task-1", "bash-call", true));
+    premature.extend(message_end("tool_use"));
+    premature.push(bash_tool_result("bash-call", "running", Some("task-1")));
+    premature.extend_from_slice(&structured_output_exchange_after(&[])[1..]);
+    premature
+}
+
+// REQ-AGENT-35
+// AUTO-41: the premature rejection named no work, so its feedback could not say what to stop.
+#[test]
+fn a_premature_candidate_reports_the_kinds_of_work_outstanding() {
+    let outstanding = |values: &[Value]| {
+        let mut premature = parser(AgentValueKind::Result, 1024);
+        premature.push_stdout(&framed(values), drop).unwrap();
+        premature.take_completed_result_exchange()
+    };
+    assert_eq!(
+        outstanding(&premature_candidate_over_a_monitor()),
+        Some(CompletedResultExchange::PrematureCandidate(
+            OutstandingWork {
+                commands: false,
+                monitors: true,
+                subagents: false,
+            }
+        ))
+    );
+    assert_eq!(
+        outstanding(&premature_candidate_over_a_background_command()),
+        Some(CompletedResultExchange::PrematureCandidate(
+            OutstandingWork {
+                commands: true,
+                monitors: false,
+                subagents: false,
+            }
+        ))
+    );
+}
+
 // REQ-AGENT-38
 // UM-3104: a task of a kind the parser does not model (neither `local_bash` nor
 // `local_agent`) is recorded as unrecognized wherever a frame names it; the drain refused its
@@ -2903,7 +3174,13 @@ fn structured_result_can_follow_settled_background_work_but_not_new_work() {
     premature.push_stdout(&framed(&late), drop).unwrap();
     assert_eq!(
         premature.take_completed_result_exchange(),
-        Some(CompletedResultExchange::PrematureCandidate)
+        Some(CompletedResultExchange::PrematureCandidate(
+            OutstandingWork {
+                commands: true,
+                monitors: false,
+                subagents: false,
+            }
+        ))
     );
     assert_eq!(
         premature.accept_result(CapturedJson::fixture(Arc::new(json!(7)))),

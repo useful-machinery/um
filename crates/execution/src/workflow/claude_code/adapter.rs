@@ -19,7 +19,7 @@ use tokio::sync::mpsc;
 
 use super::{
     ClaudeCodeStreamJsonV1Parser, ClaudeCodeStreamJsonV1RejectionReason, CompletedResultExchange,
-    FIXED_INVOCATION_ENVIRONMENT, initial_user_text_frame, normal_mode_arguments,
+    FIXED_INVOCATION_ENVIRONMENT, OutstandingWork, initial_user_text_frame, normal_mode_arguments,
     result_mode_arguments, user_content_frame,
 };
 use crate::claude_code::compatibility_profile_for_version;
@@ -49,10 +49,6 @@ pub(super) const STANDARD_INPUT_WRITE_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(30);
 const AMBIGUOUS_CANDIDATE_FEEDBACK: &str =
     "Result rejected: submit exactly one standalone structured result candidate.\n";
-// Model-visible workflow content: no counts or native identifiers.
-pub(super) const PREMATURE_CANDIDATE_FEEDBACK: &str = "Result rejected: background work you \
-started is still running. End your turn without submitting a result, and resubmit it after \
-the notification that the work has finished arrives.\n";
 pub(super) const NATIVE_TRANSCRIPT_CAPTURE_MISSING_DIAGNOSTIC: &str =
     "Claude Code native transcript capture missing";
 
@@ -796,6 +792,101 @@ where
     }
 
     async fn on_stdout(&mut self, bytes: &[u8], state: &mut agent_process_driver::State<Clock>) {
+        self.read_stdout(bytes, state).await;
+        // A `result` awaiting a decision ended the parser's read of the chunk; the frames after
+        // it are read once `read_stdout` has made that decision.
+        while state.parser_enabled && self.parser.has_deferred_stdout() {
+            self.read_stdout(&[], state).await;
+        }
+    }
+
+    fn classify_read_failure(&mut self) {
+        self.failure = Some(self.parser.protocol_failure());
+    }
+    fn cancellation_precedes_read_failure(&self) -> bool {
+        true
+    }
+
+    async fn on_wait_error(&mut self, state: &mut agent_process_driver::State<Clock>) {
+        if state.cancelled.is_none() {
+            self.failure.get_or_insert(self.parser.protocol_failure());
+        }
+        state.force_group();
+    }
+
+    fn needs_group(&self, state: &agent_process_driver::State<Clock>) -> bool {
+        self.initial_input_pending || !state.group_quiescent
+    }
+
+    fn probe_group(&self, state: &agent_process_driver::State<Clock>) -> bool {
+        state.output_closed
+            && (state.completion.is_some() || state.wait_failed)
+            && !state.group_quiescent
+    }
+
+    fn on_group_quiescent(&mut self, _state: &mut agent_process_driver::State<Clock>) {
+        self.settlement_deadline = None;
+    }
+
+    fn on_group_live(&mut self, state: &mut agent_process_driver::State<Clock>) {
+        if self.settlement_deadline.is_none() && !state.termination_requested {
+            if state.cancelled.is_none() {
+                self.failure
+                    .get_or_insert(AgentFailureCause::HarnessProtocolFailed);
+            }
+            state.parser_enabled = false;
+            state.force_group();
+        }
+    }
+
+    async fn finish(
+        self,
+        mut state: agent_process_driver::State<Clock>,
+        supervisor_quiesced: bool,
+    ) -> AgentOutcome {
+        if state.cancelled.is_none() {
+            state.cancelled = state.cancellation.cancellation_reason();
+        }
+        if let Some(reason) = state.cancelled {
+            return AgentOutcome::Cancelled { reason };
+        }
+        if let Some(cause) = self.failure {
+            return AgentOutcome::Failed(self.parser.agent_failure(cause));
+        }
+        if state.wait_failed || !supervisor_quiesced {
+            return failed_agent_outcome(AgentFailureCause::HarnessProtocolFailed);
+        }
+        match emit_observations(
+            self.invocation.observations(),
+            self.started,
+            vec![AgentObservation::Lifecycle {
+                milestone: AgentLifecycleMilestone::HarnessQuiescent,
+            }],
+            &state.cancellation,
+        )
+        .await
+        {
+            ObservationProgress::Completed => {}
+            ObservationProgress::Cancelled(reason) => return AgentOutcome::Cancelled { reason },
+            ObservationProgress::Failed => {
+                return failed_agent_outcome(AgentFailureCause::HarnessProtocolFailed);
+            }
+        }
+        let Some(status) = state.completion else {
+            return failed_agent_outcome(AgentFailureCause::HarnessProtocolFailed);
+        };
+        self.parser.finish(status.success())
+    }
+}
+
+impl<Clock, Worker> ClaudeProtocol<'_, Clock, Worker>
+where
+    Clock: CoordinatorClock,
+    Worker: ResultValidationWorker,
+{
+    /// Reads one stdout chunk, or with no bytes the rest a pending decision deferred, and
+    /// acts on what it completed.
+    async fn read_stdout(&mut self, bytes: &[u8], state: &mut agent_process_driver::State<Clock>) {
         let (parsed, observations) = agent_process_driver::collect_stdout_observations(|emit| {
             self.parser.push_stdout(bytes, emit)
         });
@@ -921,89 +1012,6 @@ where
         }
     }
 
-    fn classify_read_failure(&mut self) {
-        self.failure = Some(self.parser.protocol_failure());
-    }
-    fn cancellation_precedes_read_failure(&self) -> bool {
-        true
-    }
-
-    async fn on_wait_error(&mut self, state: &mut agent_process_driver::State<Clock>) {
-        if state.cancelled.is_none() {
-            self.failure.get_or_insert(self.parser.protocol_failure());
-        }
-        state.force_group();
-    }
-
-    fn needs_group(&self, state: &agent_process_driver::State<Clock>) -> bool {
-        self.initial_input_pending || !state.group_quiescent
-    }
-
-    fn probe_group(&self, state: &agent_process_driver::State<Clock>) -> bool {
-        state.output_closed
-            && (state.completion.is_some() || state.wait_failed)
-            && !state.group_quiescent
-    }
-
-    fn on_group_quiescent(&mut self, _state: &mut agent_process_driver::State<Clock>) {
-        self.settlement_deadline = None;
-    }
-
-    fn on_group_live(&mut self, state: &mut agent_process_driver::State<Clock>) {
-        if self.settlement_deadline.is_none() && !state.termination_requested {
-            if state.cancelled.is_none() {
-                self.failure
-                    .get_or_insert(AgentFailureCause::HarnessProtocolFailed);
-            }
-            state.parser_enabled = false;
-            state.force_group();
-        }
-    }
-
-    async fn finish(
-        self,
-        mut state: agent_process_driver::State<Clock>,
-        supervisor_quiesced: bool,
-    ) -> AgentOutcome {
-        if state.cancelled.is_none() {
-            state.cancelled = state.cancellation.cancellation_reason();
-        }
-        if let Some(reason) = state.cancelled {
-            return AgentOutcome::Cancelled { reason };
-        }
-        if let Some(cause) = self.failure {
-            return AgentOutcome::Failed(self.parser.agent_failure(cause));
-        }
-        if state.wait_failed || !supervisor_quiesced {
-            return failed_agent_outcome(AgentFailureCause::HarnessProtocolFailed);
-        }
-        match emit_observations(
-            self.invocation.observations(),
-            self.started,
-            vec![AgentObservation::Lifecycle {
-                milestone: AgentLifecycleMilestone::HarnessQuiescent,
-            }],
-            &state.cancellation,
-        )
-        .await
-        {
-            ObservationProgress::Completed => {}
-            ObservationProgress::Cancelled(reason) => return AgentOutcome::Cancelled { reason },
-            ObservationProgress::Failed => {
-                return failed_agent_outcome(AgentFailureCause::HarnessProtocolFailed);
-            }
-        }
-        let Some(status) = state.completion else {
-            return failed_agent_outcome(AgentFailureCause::HarnessProtocolFailed);
-        };
-        self.parser.finish(status.success())
-    }
-}
-
-impl<Clock, Worker> ClaudeProtocol<'_, Clock, Worker>
-where
-    Clock: CoordinatorClock,
-{
     /// Starts the full settlement grace from now (INV-HARNESS-7).
     fn arm_settlement_deadline(&mut self, clock: &mut Clock) {
         let deadline = clock.now().add(self.settlement_grace.get());
@@ -1242,14 +1250,15 @@ where
             }
         }
         CompletedResultExchange::AmbiguousCandidate
-        | CompletedResultExchange::PrematureCandidate => {
-            let feedback = if matches!(exchange, CompletedResultExchange::AmbiguousCandidate) {
-                AMBIGUOUS_CANDIDATE_FEEDBACK
-            } else {
-                PREMATURE_CANDIDATE_FEEDBACK
+        | CompletedResultExchange::PrematureCandidate(_) => {
+            let feedback = match exchange {
+                CompletedResultExchange::PrematureCandidate(outstanding) => {
+                    premature_candidate_feedback(outstanding)
+                }
+                _ => AMBIGUOUS_CANDIDATE_FEEDBACK.to_owned(),
             };
             let feedback = bounded_feedback(
-                feedback,
+                &feedback,
                 invocation
                     .limits()
                     .maximum_result_rejection_feedback_bytes()
@@ -1315,6 +1324,28 @@ async fn reject_and_continue<Clock: CoordinatorClock>(
             ResultExchangeProgress::Failed(AgentFailureCause::HarnessProtocolFailed)
         }
     }
+}
+
+/// The premature candidate's rejection: the kinds of work still running and the two routes
+/// to a result it can settle (REQ-AGENT-35, REQ-AGENT-77). Model-visible workflow content: no
+/// counts or native identifiers.
+pub(super) fn premature_candidate_feedback(outstanding: OutstandingWork) -> String {
+    let kinds = [
+        (outstanding.commands, "a background command"),
+        (outstanding.monitors, "a monitor"),
+        (outstanding.subagents, "a backgrounded subagent"),
+    ]
+    .into_iter()
+    .filter_map(|(running, kind)| running.then_some(kind))
+    .collect::<Vec<_>>()
+    .join(" and ");
+    format!(
+        "Result rejected: background work you started is still running: {kinds}. Either end \
+         your turn without submitting a result and resubmit it after the notification that \
+         the work has finished arrives, or stop the work with TaskStop and resubmit the \
+         result in the round after the stop's result: no notification follows a stopped \
+         command or monitor.\n"
+    )
 }
 
 fn bounded_feedback(feedback: &str, maximum_bytes: u64) -> Arc<str> {

@@ -17,16 +17,17 @@ use tokio::io::AsyncWriteExt as _;
 use tokio::process::Command;
 
 use super::super::test_support::host_scaled_watchdog;
-use super::adapter::{ClaudeCodeStreamJsonV1Adapter, PREMATURE_CANDIDATE_FEEDBACK};
+use super::adapter::{ClaudeCodeStreamJsonV1Adapter, premature_candidate_feedback};
 use super::lifecycle_matrix::{self, enforcement_nags, tool_names};
 use super::test_support::{
     BACKGROUND_SUBAGENT_DESCRIPTION, BACKGROUND_SUBAGENT_PROMPT, BACKGROUND_SUBAGENT_RESPONSE,
     BackgroundSubagent, FixtureSignal, LoopbackBlock, LoopbackProvider, MODEL, PendingClock,
     RecordingObservationSink, RunningProductionClaudeCode, RunningStartedClaudeCode,
-    SyntheticClaudeCodeRoot, WATCHDOG, admitted_adapter, assert_backgrounded_subagent_activity,
-    assistant_text, backgrounded_subagent_statuses, conformance_executable, conformance_limits,
-    exclusive_conformance_executable, invocation_identity, launched_agent_id,
-    next_request_or_outcome, version_probe_environment, wait_for_completed_turns,
+    SUBAGENT_OUTSTANDING, SyntheticClaudeCodeRoot, WATCHDOG, admitted_adapter,
+    assert_backgrounded_subagent_activity, assistant_text, backgrounded_subagent_statuses,
+    conformance_executable, conformance_limits, exclusive_conformance_executable,
+    invocation_identity, launched_agent_id, next_request_or_outcome, version_probe_environment,
+    wait_for_completed_turns,
 };
 use super::*;
 use crate::workflow::admission::{CancellationReason, CancellationSource};
@@ -1297,7 +1298,7 @@ async fn pinned_real_claude_code_09c_premature_result_waits_for_the_backgrounded
         assert!(!feedback.opens_with(BACKGROUND_SUBAGENT_PROMPT));
         assert!(contains_string_fragment(
             feedback.body(),
-            PREMATURE_CANDIDATE_FEEDBACK
+            &premature_candidate_feedback(SUBAGENT_OUTSTANDING)
         ));
         feedback.release_text("waiting for the subagent");
         // The agent ends the feedback turn to wait; any enforcement retry Claude Code makes
@@ -1334,7 +1335,12 @@ async fn pinned_real_claude_code_09c_premature_result_waits_for_the_backgrounded
                 _ => None,
             })
             .collect::<Vec<_>>();
-        assert_eq!(rejections, [Arc::<str>::from(PREMATURE_CANDIDATE_FEEDBACK)]);
+        assert_eq!(
+            rejections,
+            [Arc::<str>::from(premature_candidate_feedback(
+                SUBAGENT_OUTSTANDING
+            ))]
+        );
         assert_backgrounded_subagent_activity(&observations);
         assert!(!provider.has_pending_request());
         provider.shutdown().await;
@@ -1387,7 +1393,7 @@ async fn pinned_real_claude_code_09f_a_builder_launched_in_a_notified_turn_after
         let feedback = next_request_or_outcome(&mut provider, &mut terminal).await;
         assert!(contains_string_fragment(
             feedback.body(),
-            PREMATURE_CANDIDATE_FEEDBACK
+            &premature_candidate_feedback(SUBAGENT_OUTSTANDING)
         ));
         feedback.release_text("waiting for the first builder");
         loop {
@@ -1440,7 +1446,12 @@ async fn pinned_real_claude_code_09f_a_builder_launched_in_a_notified_turn_after
                 _ => None,
             })
             .collect::<Vec<_>>();
-        assert_eq!(rejections, [Arc::<str>::from(PREMATURE_CANDIDATE_FEEDBACK)]);
+        assert_eq!(
+            rejections,
+            [Arc::<str>::from(premature_candidate_feedback(
+                SUBAGENT_OUTSTANDING
+            ))]
+        );
         assert_eq!(
             backgrounded_subagent_statuses(&observations),
             ["started", "completed", "started", "completed"]

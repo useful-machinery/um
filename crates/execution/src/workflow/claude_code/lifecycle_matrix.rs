@@ -58,6 +58,8 @@ const PROMOTION_TIMEOUT: (&str, &str) = ("CLAUDE_CODE_AUTO_BACKGROUND_TIMEOUT_MS
 const RESPONSE: &str = "lifecycle cell complete";
 const RESULT: i64 = 7;
 const WAITING: &str = "waiting for the work to report";
+/// How the adapter's feedback for a rejected result candidate begins.
+const RESULT_REJECTED: &str = "Result rejected:";
 /// The opening of the enforcement nag, the synthetic user text 2.1.310 sends in Result mode
 /// after a turn that ended without `StructuredOutput`.
 const ENFORCEMENT_NAG: &str = "[structured-output-enforce]";
@@ -213,6 +215,16 @@ impl Work {
         )
     }
 
+    /// How the premature-result feedback names the main thread's backgrounded command or
+    /// monitor (REQ-AGENT-35). Every feedback's shared tail names both, so the kind is pinned
+    /// by its phrase.
+    const fn rejected_as_running(self) -> &'static str {
+        match self {
+            Self::Monitor => "a monitor",
+            _ => "a background command",
+        }
+    }
+
     fn name(self) -> String {
         match self {
             Self::Nothing => "nothing".to_owned(),
@@ -240,6 +252,12 @@ pub(super) enum Followup {
     /// `TaskStop` result, before the stopped subagent's queued `<task-notification>` reaches
     /// the main thread, so that it opens an epilogue after the `result` (REQ-AGENT-76).
     TaskStopUnawaited,
+    /// A premature result submitted while the main thread's backgrounded command or monitor
+    /// runs, which the adapter rejects with feedback naming the work's kind, then `TaskStop`
+    /// on it from the correction turn, answered on the round that returns the `TaskStop`
+    /// result: no notification follows a stopped command or monitor (REQ-AGENT-77,
+    /// REQ-AGENT-35).
+    TaskStopAfterRejection,
     /// `ScheduleWakeup` while the work runs.
     ScheduleWakeup,
     ResumeThenWakeup,
@@ -255,12 +273,13 @@ pub(super) enum Followup {
 }
 
 impl Followup {
-    pub(super) const ALL: [Self; 8] = [
+    pub(super) const ALL: [Self; 9] = [
         Self::None,
         Self::Resume,
         Self::ResumeTwice,
         Self::TaskStop,
         Self::TaskStopUnawaited,
+        Self::TaskStopAfterRejection,
         Self::ScheduleWakeup,
         Self::ResumeThenWakeup,
         Self::ResumeUnawaited,
@@ -273,6 +292,7 @@ impl Followup {
             Self::ResumeTwice => "resume-twice",
             Self::TaskStop => "task-stop",
             Self::TaskStopUnawaited => "task-stop-unawaited",
+            Self::TaskStopAfterRejection => "rejected-then-task-stop",
             Self::ScheduleWakeup => "schedule-wakeup",
             Self::ResumeThenWakeup => "resume-then-wakeup",
             Self::ResumeUnawaited => "resume-unawaited",
@@ -292,6 +312,7 @@ impl Followup {
                 work,
                 Work::BackgroundBash | Work::Monitor | Work::BackgroundAgent { .. }
             ),
+            Self::TaskStopAfterRejection => matches!(work, Work::BackgroundBash | Work::Monitor),
             // Only a command that outlives its subagent has Claude Code resume the subagent
             // on its own, superseding the messaged run's notification.
             Self::ResumeUnawaited => matches!(
@@ -310,14 +331,21 @@ impl Followup {
         match self {
             Self::Resume | Self::ResumeThenWakeup | Self::ResumeUnawaited => 1,
             Self::ResumeTwice => 2,
-            Self::None | Self::TaskStop | Self::TaskStopUnawaited | Self::ScheduleWakeup => 0,
+            Self::None
+            | Self::TaskStop
+            | Self::TaskStopUnawaited
+            | Self::TaskStopAfterRejection
+            | Self::ScheduleWakeup => 0,
         }
     }
 
     /// Whether the followup stops the work with `TaskStop`, so the subagent ends `stopped`
     /// and no resume delivers its leftover command's report.
     const fn stops_the_work(self) -> bool {
-        matches!(self, Self::TaskStop | Self::TaskStopUnawaited)
+        matches!(
+            self,
+            Self::TaskStop | Self::TaskStopUnawaited | Self::TaskStopAfterRejection
+        )
     }
 
     const fn waits_for_a_wakeup(self) -> bool {
@@ -479,10 +507,10 @@ impl LifecycleCell {
     }
 
     /// The turns a settling cell completes on 2.1.310, where the matrix pins the count: a
-    /// wakeup cell's and a same-round cell's. In Result mode a same-round answer submits the
-    /// value beside the followup's call, which the adapter rejects (an ambiguous candidate
-    /// beside `TaskStop`, a premature one while the work runs), and the correction turn
-    /// submits it again.
+    /// wakeup cell's, a same-round cell's and a rejected premature value's. In Result mode a
+    /// same-round answer submits the value beside the followup's call, which the adapter
+    /// rejects (an ambiguous candidate beside `TaskStop`, a premature one while the work
+    /// runs), and the correction turn submits it again.
     const fn expected_turns(&self) -> Option<usize> {
         let correction =
             matches!((self.mode, self.round), (Mode::Result, Round::SameRound)) as usize;
@@ -493,12 +521,21 @@ impl LifecycleCell {
         }
         // The first turn ends paused on the monitor and its event opens the second, which
         // ends paused again until the command's end wakes the third; a `TaskStop` from the
-        // event turn settles that turn instead.
+        // event turn settles that turn instead. A premature value from the event turn is
+        // rejected, and its correction turn, the third, stops the monitor and settles.
         if matches!(self.work, Work::Monitor) && !self.ending.cancels() {
             return Some(match self.followup {
                 Followup::TaskStop => 2 + correction,
                 _ => 3,
             });
+        }
+        // The first turn submits the premature value with the command outstanding, and its
+        // correction turn stops the command and settles.
+        if matches!(
+            (self.followup, self.work),
+            (Followup::TaskStopAfterRejection, Work::BackgroundBash)
+        ) {
+            return Some(2);
         }
         // The answer's turn ends with the report's resumed run outstanding and the messaged
         // run's notification queued: its turn (with a model call, or empty), in Result mode
@@ -561,6 +598,9 @@ impl LifecycleCell {
         }
         match self.followup {
             Followup::TaskStop | Followup::TaskStopUnawaited | Followup::ResumeUnawaited => false,
+            // The monitor's first turn ends paused with text; the command's submits the
+            // premature value instead.
+            Followup::TaskStopAfterRejection => matches!(self.work, Work::Monitor),
             Followup::Resume
             | Followup::ResumeTwice
             | Followup::ScheduleWakeup
@@ -602,7 +642,7 @@ pub(super) struct PruneRule {
     pub(super) forbids: fn(&LifecycleCell) -> bool,
 }
 
-pub(super) const PRUNE_RULES: [PruneRule; 9] = [
+pub(super) const PRUNE_RULES: [PruneRule; 10] = [
     PruneRule {
         name: "followup-without-leftover-work",
         reason: "a followup acts on a backgrounded command or subagent the first turn left",
@@ -658,6 +698,14 @@ pub(super) const PRUNE_RULES: [PruneRule; 9] = [
         forbids: |cell| {
             cell.work.subagent() == Some(SubagentWork::Monitor)
                 && !matches!(cell.followup, Followup::None | Followup::TaskStop)
+        },
+    },
+    PruneRule {
+        name: "rejection-followup-outside-result",
+        reason: "a premature candidate exists in Result mode alone, so a stop from the \
+                 correction turn of its rejection is driven there",
+        forbids: |cell| {
+            cell.followup == Followup::TaskStopAfterRejection && cell.mode != Mode::Result
         },
     },
     PruneRule {
@@ -1057,6 +1105,9 @@ struct Session {
     nags_in_the_last_request: usize,
     /// The nags `wait_out_turn` answered with text.
     nags_refused: usize,
+    /// A main-thread request that arrived while the driver awaited the subagent's, kept
+    /// unanswered for the next main-thread read.
+    deferred_main_request: Option<ControlledProviderRequest>,
 }
 
 impl Session {
@@ -1075,12 +1126,15 @@ impl Session {
     /// in `ended`.
     async fn next_turn_or_end(&mut self) -> Option<ControlledProviderRequest> {
         loop {
-            let request = tokio::select! {
-                request = self.provider.next_request() => request,
-                outcome = &mut self.terminal => {
-                    self.ended = Some(outcome.unwrap());
-                    return None;
-                }
+            let request = match self.deferred_main_request.take() {
+                Some(request) => request,
+                None => tokio::select! {
+                    request = self.provider.next_request() => request,
+                    outcome = &mut self.terminal => {
+                        self.ended = Some(outcome.unwrap());
+                        return None;
+                    }
+                },
             };
             match &mut self.subagent {
                 Some(subagent) if request.opens_with(subagent.prompt) => subagent.answer(request),
@@ -1241,10 +1295,12 @@ impl Session {
         );
         self.subagent().hold_its_turn();
         let held = self.next_main_request().await;
-        self.serve_the_subagent_until_it_holds_a_request().await;
+        self.serve_the_subagent_until_it_holds_a_request(false)
+            .await;
         self.close_the_subagents_turn();
         self.subagent().hold_its_turn();
-        self.serve_the_subagent_until_it_holds_a_request().await;
+        self.serve_the_subagent_until_it_holds_a_request(false)
+            .await;
         let observations = self.observations.clone();
         self.serve_subagent_until(wait_for_subagent_status(&observations, "resumed", 2))
             .await;
@@ -1302,7 +1358,9 @@ impl Session {
 
     /// Once the main thread's turn after `turns` has completed, closes the subagent's turn the
     /// driver holds, as soon as its request is held; a no-op when the subagent holds none.
-    /// The main thread must not ask meanwhile.
+    /// Claude Code runs the main thread's next turn (a Result-mode correction, a queued
+    /// notification's, an epilogue) beside the resumed run, so that turn's request may come
+    /// first; it is deferred to the next main-thread read.
     async fn close_its_held_turn_after(&mut self, turns: usize) {
         if !self
             .subagent
@@ -1314,13 +1372,14 @@ impl Session {
         let observations = self.observations.clone();
         self.serve_subagent_until(wait_for_completed_turns(&observations, turns + 1))
             .await;
-        self.serve_the_subagent_until_it_holds_a_request().await;
+        self.serve_the_subagent_until_it_holds_a_request(true).await;
         self.close_the_subagents_turn();
     }
 
-    /// Serves the subagent until its thread holds a request; the main thread must not ask
-    /// meanwhile.
-    async fn serve_the_subagent_until_it_holds_a_request(&mut self) {
+    /// Serves the subagent until its thread holds a request. The main thread must not ask
+    /// meanwhile unless `defer_the_main_thread`, when its one request is kept unanswered
+    /// (`deferred_main_request`).
+    async fn serve_the_subagent_until_it_holds_a_request(&mut self, defer_the_main_thread: bool) {
         while !self.subagent().holds_a_request() {
             let request = tokio::select! {
                 request = self.provider.next_request() => request,
@@ -1329,6 +1388,13 @@ impl Session {
                     describe(&outcome.unwrap())
                 ),
             };
+            if defer_the_main_thread && !request.opens_with(self.subagent().prompt) {
+                assert!(
+                    self.deferred_main_request.replace(request).is_none(),
+                    "the main thread asked twice while the subagent's request was awaited"
+                );
+                continue;
+            }
             let subagent = self.subagent();
             assert!(
                 request.opens_with(subagent.prompt),
@@ -1437,7 +1503,8 @@ impl Session {
     /// `release_the_subagents_command`). The main thread must not ask meanwhile; the cell's
     /// watchdog bounds the wait.
     async fn await_the_subagents_promotion(&mut self, command: &BlockedCommand) {
-        self.serve_the_subagent_until_it_holds_a_request().await;
+        self.serve_the_subagent_until_it_holds_a_request(false)
+            .await;
         self.release_the_subagents_command(command).await;
     }
 
@@ -1552,22 +1619,52 @@ impl Session {
         }
     }
 
+    /// Submits the final value from the main thread's `request` while `work` runs, a premature
+    /// candidate the adapter rejects, and hands back the correction turn's request, whose
+    /// newest message must be the feedback naming the work's kind (REQ-AGENT-35). The call is
+    /// the message's second block (see `release_second`): as its only block it would reuse the
+    /// work's own call id, and its result would retire the work as a foreground completion.
+    async fn submit_prematurely(
+        &mut self,
+        request: ControlledProviderRequest,
+        work: Work,
+    ) -> ControlledProviderRequest {
+        release_second(
+            request,
+            "submitting the result",
+            STRUCTURED_OUTPUT_TOOL_NAME,
+            json!({"result": RESULT}),
+        );
+        let correction = self.next_main_request().await;
+        let kind = work.rejected_as_running();
+        assert!(
+            rejection_feedback(correction.body()).is_some_and(|feedback| feedback.contains(kind)),
+            "the correction turn's request carries no rejection naming {kind}: {}",
+            last_message(correction.body())
+        );
+        correction
+    }
+
     /// Serves the subagent until the invocation ends. A main-thread request after the final
     /// answer is answered the same way and noted in the cell's line: the outcome decides.
     async fn outcome(&mut self) -> AgentOutcome {
         loop {
-            tokio::select! {
-                request = self.provider.next_request() => match &mut self.subagent {
-                    Some(subagent) if request.opens_with(subagent.prompt) => subagent.answer(request),
-                    _ => {
-                        self.notes.push(format!(
-                            "the main thread asked again after the final answer: {}",
-                            last_message(request.body())
-                        ));
-                        self.settle(request);
-                    }
+            let request = match self.deferred_main_request.take() {
+                Some(request) => request,
+                None => tokio::select! {
+                    request = self.provider.next_request() => request,
+                    outcome = &mut self.terminal => return outcome.unwrap(),
                 },
-                outcome = &mut self.terminal => return outcome.unwrap(),
+            };
+            match &mut self.subagent {
+                Some(subagent) if request.opens_with(subagent.prompt) => subagent.answer(request),
+                _ => {
+                    self.notes.push(format!(
+                        "the main thread asked again after the final answer: {}",
+                        last_message(request.body())
+                    ));
+                    self.settle(request);
+                }
             }
         }
     }
@@ -1595,6 +1692,22 @@ fn last_message(body: &Value) -> String {
         .map(Value::to_string)
         .unwrap_or_default();
     message.chars().take(600).collect()
+}
+
+/// The adapter's result-rejection feedback among the texts of a request's newest message.
+fn rejection_feedback(body: &Value) -> Option<&str> {
+    let content = &body["messages"].as_array()?.last()?["content"];
+    let texts = match content {
+        Value::String(text) => vec![text.as_str()],
+        Value::Array(blocks) => blocks
+            .iter()
+            .filter_map(|block| block["text"].as_str())
+            .collect(),
+        _ => Vec::new(),
+    };
+    texts
+        .into_iter()
+        .find(|text| text.starts_with(RESULT_REJECTED))
 }
 
 /// The input schema of the tool `name` in the request's `tools[]`.
@@ -1735,6 +1848,7 @@ async fn drive(
         nags_in_conversation: 0,
         nags_in_the_last_request: 0,
         nags_refused: 0,
+        deferred_main_request: None,
     };
     let Handoff { request, blocked } = drive_work(&mut session, cell, &root).await;
     assert_eq!(
@@ -1925,6 +2039,8 @@ async fn drive_work(
 /// Continues from the main thread's `main_thread` request, the round after the call that
 /// left the main thread's `command` running in the background: the followup acts on it
 /// (`TaskStop` names the task the call's acknowledgement reports), then the turn ends on it.
+/// A rejected premature value's correction turn stops the command instead, and the value
+/// goes out on the round that returns the `TaskStop` result (REQ-AGENT-77).
 async fn continue_over_the_command(
     session: &mut Session,
     cell: LifecycleCell,
@@ -1938,6 +2054,13 @@ async fn continue_over_the_command(
                 .stop_the_work(main_thread, &task_id, false, cell.round, command)
                 .await;
         }
+        Followup::TaskStopAfterRejection => {
+            let task_id = background_task_id(main_thread.body());
+            let correction = session.submit_prematurely(main_thread, cell.work).await;
+            return session
+                .stop_the_work(correction, &task_id, false, Round::AnotherRound, command)
+                .await;
+        }
         Followup::ScheduleWakeup => session.schedule_wakeup(main_thread, cell.round).await,
         _ => main_thread.release_text(WAITING),
     }
@@ -1949,8 +2072,9 @@ async fn continue_over_the_command(
 /// back there. Otherwise the first turn ends with text, paused on the monitor, and the event
 /// opens the next turn with nothing on the stream announcing it but the outstanding monitor
 /// (REQ-AGENT-69). `TaskStop` stops the monitor from that event turn, naming the task the
-/// call's acknowledgement reports; otherwise the event turn ends with text too, the drain
-/// pauses on the monitor again, and `end_the_turn_on` continues as for a backgrounded
+/// call's acknowledgement reports, or, after the event turn's premature value is rejected,
+/// from its correction turn (REQ-AGENT-77); otherwise the event turn ends with text too, the
+/// drain pauses on the monitor again, and `end_the_turn_on` continues as for a backgrounded
 /// command.
 async fn continue_over_the_monitor(
     session: &mut Session,
@@ -1965,10 +2089,19 @@ async fn continue_over_the_monitor(
     main_thread.release_text(WAITING);
     session.wait_out_turn(1).await;
     let event_turn = session.next_main_request().await;
-    if cell.followup == Followup::TaskStop {
-        return session
-            .stop_the_work(event_turn, &task_id, false, cell.round, command)
-            .await;
+    match cell.followup {
+        Followup::TaskStop => {
+            return session
+                .stop_the_work(event_turn, &task_id, false, cell.round, command)
+                .await;
+        }
+        Followup::TaskStopAfterRejection => {
+            let correction = session.submit_prematurely(event_turn, cell.work).await;
+            return session
+                .stop_the_work(correction, &task_id, false, Round::AnotherRound, command)
+                .await;
+        }
+        _ => {}
     }
     event_turn.release_text(WAITING);
     session.wait_out_turn(2).await;
@@ -2566,6 +2699,26 @@ fn verify(
             return Err(format!("{completed} turns completed, expected {turns}"));
         }
     }
+    // The premature value submitted while the command or monitor ran is the one rejection, and
+    // its feedback names the work's kind (REQ-AGENT-35); the value on the `TaskStop` round
+    // settles (REQ-AGENT-77).
+    if cell.followup == Followup::TaskStopAfterRejection {
+        let kind = cell.work.rejected_as_running();
+        let rejections = snapshot
+            .iter()
+            .filter_map(|envelope| match envelope.observation() {
+                AgentObservation::ValueRejected { feedback, .. } => Some(&**feedback),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        if !matches!(rejections.as_slice(), [feedback]
+            if feedback.starts_with(RESULT_REJECTED) && feedback.contains(kind))
+        {
+            return Err(format!(
+                "value rejections {rejections:?}, expected one naming {kind}"
+            ));
+        }
+    }
     // A wakeup scheduled while the work runs: Claude Code's `command_lifecycle` `started` in
     // the drain is the parser's `scheduled wakeup`, and its turn ends paused, so the work's
     // notification wakes one turn more.
@@ -2720,6 +2873,7 @@ fn selected(cell: &LifecycleCell, filter: Option<&str>) -> bool {
 // REQ-AGENT-64
 // REQ-AGENT-73
 // REQ-AGENT-76
+// REQ-AGENT-77
 // SC-AGENT-7
 #[tokio::test]
 #[ignore = "requires pinned harness"]
@@ -2908,6 +3062,28 @@ fn lifecycle_matrix_enumerates_every_dimension_value_once() {
         );
     }
     assert!(names.contains("result/background-bash/task-stop/same-round/settle"));
+
+    // A premature result rejected while a main-thread command or monitor runs, then `TaskStop`
+    // from the correction turn and the value on the stop's round (REQ-AGENT-77, REQ-AGENT-35):
+    // a premature candidate exists in Result mode alone, so the followup is driven there,
+    // over those two works, once each.
+    assert!(
+        PRUNE_RULES
+            .iter()
+            .any(|rule| rule.name == "rejection-followup-outside-result")
+    );
+    let rejected_then_stopped = cells
+        .iter()
+        .filter(|cell| cell.followup == Followup::TaskStopAfterRejection)
+        .map(LifecycleCell::name)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        rejected_then_stopped,
+        [
+            "result/background-bash/rejected-then-task-stop/settle",
+            "result/monitor/rejected-then-task-stop/settle",
+        ]
+    );
 
     // Every rule removes some combination of the product the generator would otherwise
     // produce.

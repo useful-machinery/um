@@ -18,8 +18,7 @@ use tokio::sync::{mpsc, watch};
 
 use super::adapter::{
     ClaudeCodeStreamJsonV1Adapter, MAXIMUM_INLINE_ATTACHMENT_FRAME_BYTES,
-    NATIVE_TRANSCRIPT_CAPTURE_MISSING_DIAGNOSTIC, PREMATURE_CANDIDATE_FEEDBACK,
-    native_project_slug, prepare_launch,
+    NATIVE_TRANSCRIPT_CAPTURE_MISSING_DIAGNOSTIC, native_project_slug, prepare_launch,
 };
 use super::test_support::{
     FixtureSignal, PendingClock, RecordingObservationSink, admitted_adapter, invocation_identity,
@@ -1997,7 +1996,13 @@ async fn premature_structured_result_is_returned_as_feedback_until_background_wo
                 _ => None,
             })
             .collect::<Vec<_>>();
-        assert_eq!(rejections, [Arc::<str>::from(PREMATURE_CANDIDATE_FEEDBACK)]);
+        let [feedback] = rejections.as_slice() else {
+            panic!("exactly one premature rejection, got {rejections:?}");
+        };
+        // The feedback names the kind of work that blocks the result and the stop route.
+        assert!(feedback.starts_with("Result rejected:"), "{feedback}");
+        assert!(feedback.contains("subagent"), "{feedback}");
+        assert!(feedback.contains("TaskStop"), "{feedback}");
         let input = std::fs::read_to_string(&fixture.captured_input).unwrap();
         let frames = input
             .lines()
@@ -2006,7 +2011,7 @@ async fn premature_structured_result_is_returned_as_feedback_until_background_wo
         assert_eq!(frames.len(), 2);
         assert_eq!(
             frames[1]["message"]["content"][0]["text"],
-            PREMATURE_CANDIDATE_FEEDBACK
+            Value::from(&**feedback)
         );
     })
     .await;
