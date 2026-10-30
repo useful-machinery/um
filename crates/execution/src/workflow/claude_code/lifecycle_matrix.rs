@@ -35,7 +35,7 @@ use super::test_support::{
     ControlledProviderRequest, FixtureSignal, LoopbackBlock, LoopbackProvider, MODEL,
     RecordingObservationSink, RunningProductionClaudeCode, SyntheticClaudeCodeRoot, WATCHDOG,
     backgrounded_subagent_statuses, completed_turns, exclusive_conformance_executable,
-    launched_agent_id, wait_for_completed_turns,
+    launched_agent_id, wait_for_completed_turns, wait_for_subagent_status,
 };
 use super::{
     STRUCTURED_OUTPUT_TOOL_NAME, initial_user_text_frame, normal_mode_arguments,
@@ -243,10 +243,19 @@ pub(super) enum Followup {
     /// `ScheduleWakeup` while the work runs.
     ScheduleWakeup,
     ResumeThenWakeup,
+    /// A `SendMessage` to the finished backgrounded subagent whose own command outlived it,
+    /// answered on the round after the message's result while the messaged run's queued
+    /// notification stands and Claude Code's own resume of the subagent for the command's
+    /// report is outstanding: the notification's turn follows the answer's, with a model call
+    /// when it is dequeued before the report run has queued its own notification (every
+    /// drive on 2.1.310) and empty otherwise. In Result mode the candidate is premature and
+    /// the adapter's feedback joins Claude Code's queue behind the notification, so its turn
+    /// precedes the correction turn (AUTO-64).
+    ResumeUnawaited,
 }
 
 impl Followup {
-    pub(super) const ALL: [Self; 7] = [
+    pub(super) const ALL: [Self; 8] = [
         Self::None,
         Self::Resume,
         Self::ResumeTwice,
@@ -254,6 +263,7 @@ impl Followup {
         Self::TaskStopUnawaited,
         Self::ScheduleWakeup,
         Self::ResumeThenWakeup,
+        Self::ResumeUnawaited,
     ];
 
     const fn slug(self) -> &'static str {
@@ -265,6 +275,7 @@ impl Followup {
             Self::TaskStopUnawaited => "task-stop-unawaited",
             Self::ScheduleWakeup => "schedule-wakeup",
             Self::ResumeThenWakeup => "resume-then-wakeup",
+            Self::ResumeUnawaited => "resume-unawaited",
         }
     }
 
@@ -281,13 +292,23 @@ impl Followup {
                 work,
                 Work::BackgroundBash | Work::Monitor | Work::BackgroundAgent { .. }
             ),
+            // Only a command that outlives its subagent has Claude Code resume the subagent
+            // on its own, superseding the messaged run's notification.
+            Self::ResumeUnawaited => matches!(
+                work,
+                Work::BackgroundAgent {
+                    subagent: SubagentWork::BackgroundBash {
+                        released: Release::InDrain,
+                    },
+                }
+            ),
         }
     }
 
     /// How many times the followup messages the finished subagent.
     const fn resumes(self) -> usize {
         match self {
-            Self::Resume | Self::ResumeThenWakeup => 1,
+            Self::Resume | Self::ResumeThenWakeup | Self::ResumeUnawaited => 1,
             Self::ResumeTwice => 2,
             Self::None | Self::TaskStop | Self::TaskStopUnawaited | Self::ScheduleWakeup => 0,
         }
@@ -479,6 +500,13 @@ impl LifecycleCell {
                 _ => 3,
             });
         }
+        // The answer's turn ends with the report's resumed run outstanding and the messaged
+        // run's notification queued: its turn (with a model call, or empty), in Result mode
+        // the correction turn for the rejected premature candidate, and the report run's
+        // notified turn follow.
+        if matches!(self.followup, Followup::ResumeUnawaited) {
+            return Some(4 + matches!(self.mode, Mode::Result) as usize);
+        }
         if !matches!(self.round, Round::SameRound) {
             return None;
         }
@@ -532,7 +560,7 @@ impl LifecycleCell {
             return false;
         }
         match self.followup {
-            Followup::TaskStop | Followup::TaskStopUnawaited => false,
+            Followup::TaskStop | Followup::TaskStopUnawaited | Followup::ResumeUnawaited => false,
             Followup::Resume
             | Followup::ResumeTwice
             | Followup::ScheduleWakeup
@@ -1186,6 +1214,92 @@ impl Session {
         self.next_turn_or_end().await
     }
 
+    /// The in-drain resume answered before the report (AUTO-64): messages the finished
+    /// backgrounded subagent from `request`'s turn, and while the main thread's next round
+    /// is held, closes the messaged run, whose notification is queued for the main thread
+    /// and superseded when Claude Code resumes the subagent once more for its command's
+    /// report; holds that resumed run and answers the held round with the mode's value while
+    /// it is outstanding. In Result mode the candidate is premature and the adapter's
+    /// correction prompt joins the queue behind the superseded notification. The resumed run
+    /// is closed once the turn has ended (after the rejection in Result mode), and the main
+    /// thread's next request is returned once the parser has seen the run complete, or
+    /// `None` once the invocation has ended.
+    async fn resume_unawaited(
+        &mut self,
+        request: ControlledProviderRequest,
+    ) -> Option<ControlledProviderRequest> {
+        let agent_id = self
+            .agent_id
+            .clone()
+            .expect("the cell launched a backgrounded subagent");
+        let turns = self.completed_turns();
+        release_second(
+            request,
+            "messaging the finished subagent",
+            "SendMessage",
+            send_message(&agent_id),
+        );
+        self.subagent().hold_its_turn();
+        let held = self.next_main_request().await;
+        self.serve_the_subagent_until_it_holds_a_request().await;
+        self.close_the_subagents_turn();
+        self.subagent().hold_its_turn();
+        self.serve_the_subagent_until_it_holds_a_request().await;
+        let observations = self.observations.clone();
+        self.serve_subagent_until(wait_for_subagent_status(&observations, "resumed", 2))
+            .await;
+        self.settle(held);
+        let ended = wait_for_completed_turns(&observations, turns + 1);
+        tokio::pin!(ended);
+        tokio::select! {
+            request = self.next_turn_or_end() => {
+                let request = request?;
+                panic!("the main thread asked again before its turn ended: {}", last_message(request.body()));
+            }
+            () = &mut ended => {}
+        }
+        if self.mode == Mode::Result {
+            let rejected = observations.wait_for(|observation| {
+                matches!(observation, AgentObservation::ValueRejected { .. })
+            });
+            tokio::pin!(rejected);
+            tokio::select! {
+                request = self.next_turn_or_end() => {
+                    let request = request?;
+                    panic!("the main thread asked before the candidate was rejected: {}", last_message(request.body()));
+                }
+                () = &mut rejected => {}
+            }
+        }
+        self.close_the_subagents_turn();
+        let mut pending = None;
+        let completed = wait_for_subagent_status(&observations, "completed", 3);
+        tokio::pin!(completed);
+        loop {
+            tokio::select! {
+                request = self.next_turn_or_end() => match request {
+                    Some(request) => {
+                        assert!(pending.replace(request).is_none(), "the main thread asked twice");
+                    }
+                    None => return None,
+                },
+                () = &mut completed => break,
+            }
+        }
+        let request = match pending {
+            Some(request) => request,
+            None => self.next_turn_or_end().await?,
+        };
+        if self.mode == Mode::Result {
+            self.notes.push(if carries_a_notification(&request) {
+                "the queued notification's turn came before the correction turn".into()
+            } else {
+                "the correction turn came before the queued notification's".into()
+            });
+        }
+        Some(request)
+    }
+
     /// Once the main thread's turn after `turns` has completed, closes the subagent's turn the
     /// driver holds, as soon as its request is held; a no-op when the subagent holds none.
     /// The main thread must not ask meanwhile.
@@ -1649,13 +1763,14 @@ async fn drive(
         let mut request = Some(request.expect("a settling cell's script ends on the final turn"));
         for _ in 0..cell.followup.resumes() {
             if let Some(turn) = request.take() {
-                request = match cell.round {
-                    Round::AnotherRound => {
+                request = match (cell.followup, cell.round) {
+                    (Followup::ResumeUnawaited, _) => session.resume_unawaited(turn).await,
+                    (_, Round::AnotherRound) => {
                         session
                             .resume(turn, cell.followup == Followup::ResumeThenWakeup)
                             .await
                     }
-                    Round::SameRound => session.resume_in_the_same_round(turn).await,
+                    (_, Round::SameRound) => session.resume_in_the_same_round(turn).await,
                 };
             }
         }

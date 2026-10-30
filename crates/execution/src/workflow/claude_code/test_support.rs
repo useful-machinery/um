@@ -1224,17 +1224,39 @@ pub(super) async fn wait_for_completed_turns(
     turns: usize,
 ) {
     while completed_turns(observations) < turns {
-        // `wait_for` evaluates the record from its start on each observation, so an
-        // evaluation past the length seen here is of a newer observation.
-        let seen = observations.snapshot().len();
-        let evaluated = Cell::new(0);
-        observations
-            .wait_for(|_| {
-                evaluated.set(evaluated.get() + 1);
-                evaluated.get() > seen
-            })
-            .await;
+        wait_for_a_newer_observation(observations).await;
     }
+}
+
+/// Waits until the backgrounded subagent has reported `status` `count` times.
+pub(super) async fn wait_for_subagent_status(
+    observations: &RecordingObservationSink,
+    status: &str,
+    count: usize,
+) {
+    let reported = || {
+        backgrounded_subagent_statuses(observations)
+            .iter()
+            .filter(|reported| reported.as_str() == status)
+            .count()
+    };
+    while reported() < count {
+        wait_for_a_newer_observation(observations).await;
+    }
+}
+
+/// Waits for an observation past those recorded so far: `wait_for` evaluates the record
+/// from its start on each observation, so an evaluation past the length seen here is of a
+/// newer observation.
+async fn wait_for_a_newer_observation(observations: &RecordingObservationSink) {
+    let seen = observations.snapshot().len();
+    let evaluated = Cell::new(0);
+    observations
+        .wait_for(|_| {
+            evaluated.set(evaluated.get() + 1);
+            evaluated.get() > seen
+        })
+        .await;
 }
 
 /// The subagent's start and settlement are information diagnostics, and its own tool runs

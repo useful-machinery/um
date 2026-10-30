@@ -594,6 +594,15 @@ struct Subagent {
     announced: bool,
     backgrounded: bool,
     notified: bool,
+    /// The main-thread `user` frames the parser had read when the current run's
+    /// notification arrived, and whether a main-thread tool round of the same turn has taken
+    /// a `user` frame since: Claude Code appends a queued notification to the user message
+    /// of the main thread's next tool round, which stream-json does not echo, instead of
+    /// opening a turn for it, while a turn's first request carries only the item it was
+    /// opened for. A notification not delivered that way is still queued when the subagent
+    /// is resumed, and its turn is carried past the resume (`carried_notifications`).
+    notified_after_user_frames: u64,
+    delivered: bool,
 }
 
 impl Subagent {
@@ -690,6 +699,31 @@ pub(crate) struct ClaudeCodeStreamJsonV1Parser {
     /// An empty turn consumed the announcement of a notified task without a model call;
     /// the announcement stands for the next `init`.
     announced_turn_pending: bool,
+    /// Notifications of a subagent's earlier runs that its resume carried past, oldest first,
+    /// each the count of main-thread `user` frames read when it arrived: each was still
+    /// queued at Claude Code when the subagent ran again, and each still opens a turn, with
+    /// a model call or, once a newer notification of the subagent queued behind it, without
+    /// one (the empty turn), unless a main-thread tool round takes it first (a main-thread
+    /// `user` frame past that count, then a main-thread message start), which drops it. An
+    /// allowance for a drain `init`, never a duty: Claude Code may have appended one to a
+    /// tool round the parser cannot see.
+    carried_notifications: Vec<u64>,
+    /// The adapter's correction prompt is on stdin and its turn has not ended: `begin_exchange`
+    /// set it, and the turn's `result` clears it. An empty turn read inside the correction
+    /// window consumes the exchange but not this, so the next drain `init` is still the
+    /// correction turn's; a stream that ends with it set is invalid.
+    correction_pending: bool,
+    /// The carried notification whose turn an `init` in the correction window opened: Claude
+    /// Code dequeued it ahead of the correction prompt, so its first request carried it and
+    /// no tool round of the turn delivers it. Set aside from `carried_notifications` for the
+    /// turn; its `result` with a model call returns it, the allowance that admits the
+    /// correction turn, and an empty turn's `result` consumes it.
+    correction_window_notification: Option<u64>,
+    /// Main-thread `user` frames read so far, and the count when the open turn's `init`
+    /// arrived, against which a notification's delivery to a tool round of the turn is told
+    /// (`Subagent::delivered`).
+    main_user_frames: u64,
+    turn_main_user_frames: u64,
     /// A notified command or subagent announced the open turn, which an empty turn may
     /// consume; a first exchange, a wakeup turn or the adapter's correction turn is not
     /// announced, and ending it without a model call stays a protocol failure.
@@ -777,6 +811,11 @@ impl ClaudeCodeStreamJsonV1Parser {
             epilogue: false,
             exchange_main_messages: 0,
             announced_turn_pending: false,
+            carried_notifications: Vec::new(),
+            correction_pending: false,
+            correction_window_notification: None,
+            main_user_frames: 0,
+            turn_main_user_frames: 0,
             announced_exchange: false,
             native_failure: None,
             native_api_error: None,
@@ -839,8 +878,17 @@ impl ClaudeCodeStreamJsonV1Parser {
     }
 
     /// Begins the next serialized user exchange after the preceding result was rejected.
-    /// The same process and session remain authoritative for the invocation.
+    /// The same process and session remain authoritative for the invocation. The correction
+    /// prompt's turn is owed until a `result` ends it (`correction_pending`).
     pub(crate) fn begin_exchange(&mut self) -> Result<(), AgentFailureCause> {
+        self.begin_turn()?;
+        self.correction_pending = true;
+        Ok(())
+    }
+
+    /// Begins a turn before the step's value has settled: the adapter's correction turn, or
+    /// one a notification, a wakeup or a carried notification announced in the drain.
+    fn begin_turn(&mut self) -> Result<(), AgentFailureCause> {
         if let Some(failure) = &self.failure {
             return Err(failure.clone());
         }
@@ -949,6 +997,7 @@ impl ClaudeCodeStreamJsonV1Parser {
             || self.completed_result_exchange.is_some()
             || self.result_decision_pending
             || self.announced_turn_pending
+            || self.correction_pending
             || self.completed_exchanges == 0
         {
             return self.end_of_stream_invariant_failure();
@@ -1057,37 +1106,59 @@ impl ClaudeCodeStreamJsonV1Parser {
             // `notified` bit.
             if !self.exchange_active {
                 let scheduled_wakeup = self.scheduled_wakeup_pending;
-                // An empty turn's announcement stands for this one.
-                // An outstanding monitor announces the turn too: each line its command
-                // prints opens one, with nothing on the stream before its `init`.
-                let announced = self.announced_turn_pending
-                    || self
-                        .background_commands
-                        .iter()
-                        .any(|task| task.notified || (task.monitor && task.awaits_notification()))
-                    || self.subagents.iter().any(|subagent| subagent.notified);
+                let announced = self.notification_announces_a_turn();
                 // After a native failure the refusal ends the stream with that failure
                 // (`fail_stream`), whatever announced the turn.
                 if self.native_failure.is_some()
-                    || !(scheduled_wakeup || announced || self.value_settled)
+                    || !(scheduled_wakeup
+                        || announced
+                        || self.correction_pending
+                        || self.value_settled)
                 {
                     return Err(self.protocol_failure());
                 }
-                self.announced_turn_pending = false;
                 if self.value_settled {
                     self.begin_epilogue();
                 } else {
-                    self.begin_exchange()?;
+                    self.begin_turn()?;
                 }
                 self.announced_exchange = announced;
-                // Only completed tasks and subagents, or a scheduled wakeup, authorize this
-                // turn. Others remain owned by the invocation and may notify during the
-                // next native exchange.
-                self.background_commands.retain(|task| !task.notified);
-                self.forget_notified_subagents();
-                self.scheduled_wakeup_pending = false;
-                self.scheduled_wakeup_turn |= scheduled_wakeup;
+                // Claude Code keeps one queue of pending inputs, notifications and the
+                // adapter's prompt alike, and opens one turn per item it dequeues: this
+                // turn consumes one, oldest first. An empty turn's announcement stands for
+                // the newer notification that superseded it, consumed with it; then a
+                // notification a resume carried past; then the correction prompt whose
+                // exchange an empty turn consumed; then the completed tasks and subagents
+                // and the scheduled wakeup together, as one turn. Others remain owned by
+                // the invocation and may notify during the next native exchange.
+                if self.announced_turn_pending {
+                    self.announced_turn_pending = false;
+                    self.background_commands.retain(|task| !task.notified);
+                    self.forget_notified_subagents();
+                } else if !self.carried_notifications.is_empty() {
+                    self.carried_notifications.remove(0);
+                } else if self.correction_pending {
+                    self.correction_pending = false;
+                } else {
+                    self.background_commands.retain(|task| !task.notified);
+                    self.forget_notified_subagents();
+                    self.scheduled_wakeup_pending = false;
+                    self.scheduled_wakeup_turn |= scheduled_wakeup;
+                }
+            } else if !self.exchange_initialized && self.correction_pending {
+                // The adapter has begun the correction turn, but a notification queued
+                // ahead of its prompt opens its turn first, which this `init` may be: a
+                // `result` without a model call then ends an empty turn, not the correction.
+                // The notification Claude Code dequeued for this turn is the oldest carried
+                // one; a tool round of the turn cannot deliver it again, so it is set aside
+                // from the delivery inference until the turn ends.
+                self.announced_exchange = self.notification_announces_a_turn();
+                if !self.carried_notifications.is_empty() {
+                    self.correction_window_notification =
+                        Some(self.carried_notifications.remove(0));
+                }
             }
+            self.turn_main_user_frames = self.main_user_frames;
             return self.parse_initialization(object);
         }
 
@@ -1466,6 +1537,23 @@ impl ClaudeCodeStreamJsonV1Parser {
             return Err(self.protocol_failure());
         }
         self.complete_retry();
+        if parent_tool_use_id.is_none() {
+            // A tool round of this turn whose user message came after a subagent's
+            // notification carries that notification to the model: Claude Code opens no turn
+            // for it, whether the subagent still holds it or a resume has carried it. A
+            // `user` frame of an earlier turn delivers nothing: the turn after it was opened
+            // for one dequeued item, and its first request carries that item alone.
+            let frames = self.main_user_frames;
+            let turn_start = self.turn_main_user_frames;
+            let delivered = |notified_after: u64| notified_after.max(turn_start) < frames;
+            for subagent in &mut self.subagents {
+                if subagent.notified && delivered(subagent.notified_after_user_frames) {
+                    subagent.delivered = true;
+                }
+            }
+            self.carried_notifications
+                .retain(|&notified_after| !delivered(notified_after));
+        }
         self.active_message = Some(StreamedMessage {
             id: Arc::from(id),
             parent_tool_use_id: parent_tool_use_id.map(Arc::from),
@@ -2051,6 +2139,9 @@ impl ClaudeCodeStreamJsonV1Parser {
         if required_string(message, "role") != Some("user") {
             return Err(self.protocol_failure());
         }
+        if parent.is_none() {
+            self.main_user_frames = self.main_user_frames.saturating_add(1);
+        }
         for block in content {
             let Some(block) = block.as_object() else {
                 return Err(self.protocol_failure());
@@ -2341,14 +2432,33 @@ impl ClaudeCodeStreamJsonV1Parser {
         Ok(())
     }
 
+    /// Whether a notification stands that announces a drain `init`: an empty turn's
+    /// announcement, a notification a resume carried past, a completed background command
+    /// or subagent, or an outstanding monitor, each line of whose command opens a turn with
+    /// nothing on the stream before its `init`.
+    fn notification_announces_a_turn(&self) -> bool {
+        self.announced_turn_pending
+            || !self.carried_notifications.is_empty()
+            || self
+                .background_commands
+                .iter()
+                .any(|task| task.notified || (task.monitor && task.awaits_notification()))
+            || self.subagents.iter().any(|subagent| subagent.notified)
+    }
+
     /// A wakeup `init` forgets the notified subagents as outstanding work; their identity
     /// is kept, newest last, so that a later message to one resumes it (`start_subagent`).
     fn forget_notified_subagents(&mut self) {
-        let (forgotten, outstanding): (Vec<_>, Vec<_>) = self
+        let (mut forgotten, outstanding): (Vec<_>, Vec<_>) = self
             .subagents
             .drain(..)
             .partition(|subagent| subagent.notified);
         self.subagents = outstanding;
+        // The turn this `init` opens delivers their notifications: a later resume carries
+        // nothing past.
+        for subagent in &mut forgotten {
+            subagent.delivered = true;
+        }
         self.forgotten_subagents.extend(forgotten);
         keep_newest(&mut self.forgotten_subagents);
     }
@@ -2441,7 +2551,10 @@ impl ClaudeCodeStreamJsonV1Parser {
     /// background work owes a notification. The adapter's settlement grace runs only then
     /// (INV-HARNESS-7).
     pub(crate) fn settling(&self) -> bool {
-        !self.exchange_active && !self.announced_turn_pending && !self.awaits_background_work()
+        !self.exchange_active
+            && !self.announced_turn_pending
+            && !self.correction_pending
+            && !self.awaits_background_work()
     }
 
     /// A turn a notified task announced, or an epilogue, that Claude Code opened and closed
@@ -2449,15 +2562,24 @@ impl ClaudeCodeStreamJsonV1Parser {
     /// message (2.1.310 emits one for a backgrounded subagent's notification that its own
     /// resume superseded, with no `terminal_reason`). The turn decides and settles nothing.
     /// Before the value settled, the announcement it consumed stands for the next `init`,
-    /// which delivers the notification (REQ-AGENT-69); after it no `init` needs one
-    /// (REQ-AGENT-76), so a trailing empty turn leaves the parser `settling()` for the grace
-    /// (INV-HARNESS-7) and `finish` clean. The same `result` in a turn nothing announced
-    /// before settlement, the shape of a first prompt a hook blocked, never reaches here.
+    /// which delivers the notification (REQ-AGENT-69); read in the correction window it
+    /// consumes the carried notification it was and the correction prompt stays owed. After
+    /// the value settled no `init` needs one (REQ-AGENT-76), so a trailing empty turn leaves
+    /// the parser `settling()` for the grace (INV-HARNESS-7) and `finish` clean. The same
+    /// `result` in a turn nothing announced before settlement, the shape of a first prompt a
+    /// hook blocked, never reaches here.
     fn complete_empty_turn(&mut self) -> Result<(), AgentFailureCause> {
+        if self.correction_pending {
+            // Read in the correction window, the turn was the carried notification's, which
+            // it consumes here; the correction prompt stays owed (`correction_pending`) and
+            // announces the next `init` itself, so no announcement is carried over.
+            self.correction_window_notification = None;
+        } else {
+            self.announced_turn_pending = !self.value_settled;
+        }
         self.epilogue = false;
         self.exchange_initialized = false;
         self.exchange_active = false;
-        self.announced_turn_pending = !self.value_settled;
         self.completed_exchanges = self
             .completed_exchanges
             .checked_add(1)
@@ -2538,6 +2660,8 @@ impl ClaudeCodeStreamJsonV1Parser {
             announced: true,
             backgrounded,
             notified: false,
+            notified_after_user_frames: 0,
+            delivered: false,
         };
         self.observations.push(AgentObservation::Diagnostic {
             level: AgentDiagnosticLevel::Information,
@@ -2563,6 +2687,12 @@ impl ClaudeCodeStreamJsonV1Parser {
         });
         if !self.subagents[index].notified || other_holds_tool_use {
             return Err(self.protocol_failure());
+        }
+        // The notification of the run that ended is still queued unless a main-thread tool
+        // round took it: its turn is carried past the resume (REQ-AGENT-69).
+        if !self.subagents[index].delivered {
+            self.carried_notifications
+                .push(self.subagents[index].notified_after_user_frames);
         }
         let message = self.subagents[index].resume(
             tool_use_id,
@@ -2649,6 +2779,8 @@ impl ClaudeCodeStreamJsonV1Parser {
             announced: false,
             backgrounded: true,
             notified: false,
+            notified_after_user_frames: 0,
+            delivered: false,
         };
         self.observations.push(AgentObservation::Diagnostic {
             level: AgentDiagnosticLevel::Information,
@@ -2712,7 +2844,10 @@ impl ClaudeCodeStreamJsonV1Parser {
             message: Arc::from(subagent.message(&status)),
         });
         if subagent.backgrounded {
-            self.subagents[index].notified = true;
+            let subagent = &mut self.subagents[index];
+            subagent.notified = true;
+            subagent.notified_after_user_frames = self.main_user_frames;
+            subagent.delivered = false;
         } else {
             self.subagents.remove(index);
         }
@@ -2883,6 +3018,13 @@ impl ClaudeCodeStreamJsonV1Parser {
         self.complete_retry();
         self.exchange_initialized = false;
         self.exchange_active = false;
+        self.correction_pending = false;
+        // A turn with a model call in the correction window discharges the correction
+        // prompt's duty, whichever prompt it answered; the notification it was opened for,
+        // which it did not consume, stays the allowance that admits the correction turn.
+        if let Some(notified_after) = self.correction_window_notification.take() {
+            self.carried_notifications.insert(0, notified_after);
+        }
         // A foreground subagent the exchange did not settle carries no completion duty; a
         // backgrounded one still owes its notification.
         self.subagents.retain(|subagent| subagent.backgrounded);

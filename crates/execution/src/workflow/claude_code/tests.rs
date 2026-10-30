@@ -1760,17 +1760,290 @@ fn a_messaged_subagent_resumed_again_in_the_drain_for_its_commands_report_stays_
         "end_of_stream_invariant_invalid"
     );
 
-    // The second resumed run owes its notification as the first did: a wakeup before it
-    // is unannounced.
-    let second_notification = position_of(&values, |value| {
-        value["subtype"] == "task_notification" && value["run_id"] == "agent-run-3"
+    // A wakeup before the second resumed run's notification is the messaged run's own turn,
+    // which its resume carried past (`a_notification_a_subagents_resume_carried_past_…`).
+    // None stands after the report run's turn: the first run's notification, which the
+    // message's resume carried, was taken by the round that returned the message's result
+    // and opens no turn, and the empty turn and the report run's turn consumed the two the
+    // drain had queued. An `init` there opens an epilogue whatever stands (REQ-AGENT-76), so
+    // the allowance is read from the parser.
+    let mut parser = parser(AgentValueKind::Response, 1024);
+    parser.push_stdout(&framed(&values), drop).unwrap();
+    assert_eq!(parser.carried_notifications, Vec::<u64>::new());
+}
+
+/// The turn Claude Code 2.1.310 opens for the messaged run's queued notification when it
+/// dequeues it before the report run has queued its own (the `resume-unawaited` cells,
+/// AUTO-64): delivered with a model call, as any notification is, rather than as the
+/// empty turn a superseded notification becomes.
+fn carried_notification_turn(text: &str) -> Vec<Value> {
+    text_turn("carried-turn", text)
+}
+
+/// The report run's start, its message and its settlement, and the empty turn, as
+/// `messaged_subagent_resumed_again_for_its_commands_report_transcript` orders them.
+struct ReportResume {
+    started: usize,
+    settled: usize,
+    empty_turn: usize,
+}
+
+fn report_resume(values: &[Value]) -> ReportResume {
+    let started = position_of(values, |value| {
+        value["subtype"] == "task_started" && value["run_id"] == "agent-run-3"
     });
-    let mut early_wakeup = values[..second_notification].to_vec();
-    early_wakeup.push(init(QUALIFICATION_VERSION, SESSION_ID));
-    let (_, outcome) = replay(&framed(&early_wakeup), AgentValueKind::Response, 1024);
+    let settled = started
+        + 1
+        + position_of(&values[started + 1..], |value| {
+            value["subtype"] == "background_tasks_changed"
+                && value["tasks"].as_array().is_some_and(Vec::is_empty)
+        });
+    let empty_turn = position_of(values, |value| value["num_turns"] == 0) - 1;
+    ReportResume {
+        started,
+        settled,
+        empty_turn,
+    }
+}
+
+/// Result mode's `[structured-output-enforce]` nag as 2.1.310 echoes it: a synthetic
+/// main-thread `user` frame with a text block, drawn by a turn that ends without the
+/// `StructuredOutput` call, after which the model takes a further round.
+fn enforcement_nag() -> Value {
+    json!({
+        "type": "user",
+        "message": {
+            "role": "user",
+            "content": [{"type": "text", "text": "[structured-output-enforce] Submit the result."}],
+        },
+        "parent_tool_use_id": null,
+        "session_id": SESSION_ID,
+        "isSynthetic": true,
+    })
+}
+
+// REQ-AGENT-69, REQ-AGENT-64, REQ-AGENT-76 (AUTO-64)
+#[test]
+fn a_notification_a_subagents_resume_carried_past_still_opens_its_turn() {
+    let base = messaged_subagent_resumed_again_for_its_commands_report_transcript();
+    let resume = report_resume(&base);
+    assert_eq!(base[resume.empty_turn]["subtype"], "init");
+
+    // The messaged run's notification turn with a model call, dequeued after the report run
+    // settled (its frames reached the parser first) or before it: the notification the
+    // resume carried past still announces the turn, and the report run's notification wakes
+    // the one after it.
+    let mut late = base[..resume.empty_turn].to_vec();
+    late.extend(carried_notification_turn("carried"));
+    late.extend_from_slice(&base[resume.empty_turn + 2..]);
+    let mut early = base[..=resume.started].to_vec();
+    early.extend(carried_notification_turn("carried"));
+    early.extend_from_slice(&base[resume.started + 1..resume.empty_turn]);
+    early.extend_from_slice(&base[resume.empty_turn + 2..]);
+    for (values, response) in [(&late, "carried"), (&early, "final")] {
+        for kind in [AgentValueKind::Response, AgentValueKind::None] {
+            let (observations, outcome) = replay(&framed(values), kind, 1024);
+            match kind {
+                AgentValueKind::Response => assert_eq!(completed_response(&outcome), response),
+                _ => assert!(
+                    matches!(
+                        outcome,
+                        AgentOutcome::Completed(CompletedAgentInvocation::NoValue)
+                    ),
+                    "{outcome:?}"
+                ),
+            }
+            assert_eq!(
+                subagent_statuses(&observations),
+                [
+                    "started",
+                    "completed",
+                    "resumed",
+                    "completed",
+                    "resumed",
+                    "completed"
+                ]
+            );
+            // The launching turn, the carried notification's turn and the report run's.
+            assert_eq!(
+                milestone_count(&observations, AgentLifecycleMilestone::TurnCompleted),
+                3
+            );
+            assert_eq!(
+                milestone_count(&observations, AgentLifecycleMilestone::HarnessCompleted),
+                1
+            );
+        }
+    }
+
+    // Result mode: the main thread submits while the report run is outstanding, after the
+    // messaged run's notification queued, so the rejection's feedback queues behind that
+    // notification and its turn precedes the correction turn.
+    let message_result = position_of(&base, |value| {
+        value["message"]["content"][0]["tool_use_id"] == "send-1"
+    });
+    let first_result = position_of(&base, |value| value["type"] == "result");
+    let mut values = base[..=message_result].to_vec();
+    values.extend_from_slice(&base[first_result + 1..=resume.started]);
+    let submission = structured_output_exchange_after(&[]);
+    values.extend_from_slice(&submission[1..]);
+    let report_settlement = &base[resume.started + 1..=resume.settled];
+    let candidate = Some(CompletedResultExchange::Candidate(Arc::new(json!(7))));
+    let rejected = |observations: &mut Vec<AgentObservation>| {
+        let mut parser = parser(AgentValueKind::Result, 1024);
+        parser
+            .push_stdout(&framed(&values), |observation| {
+                observations.push(observation)
+            })
+            .unwrap();
+        assert_eq!(
+            parser.take_completed_result_exchange(),
+            Some(CompletedResultExchange::PrematureCandidate)
+        );
+        parser.reject_result_candidate().unwrap();
+        parser.begin_exchange().unwrap();
+        parser
+    };
+
+    // Dequeued before the report run settled: its turn is read in the correction window, the
+    // report run settles inside it and the turn's candidate is accepted; the report run's
+    // notification and then the feedback each open an epilogue.
+    let mut observations = Vec::new();
+    let mut parser = rejected(&mut observations);
+    let mut carried_turn = vec![init(QUALIFICATION_VERSION, SESSION_ID)];
+    carried_turn.extend_from_slice(report_settlement);
+    carried_turn.extend_from_slice(&submission[1..]);
+    parser
+        .push_stdout(&framed(&carried_turn), |observation| {
+            observations.push(observation);
+        })
+        .unwrap();
+    assert_eq!(parser.take_completed_result_exchange(), candidate);
+    parser
+        .accept_result(CapturedJson::fixture(Arc::new(json!(7))))
+        .unwrap();
+    parser
+        .push_stdout(
+            &framed(&text_turn("report-turn", "report")),
+            |observation| {
+                observations.push(observation);
+            },
+        )
+        .unwrap();
+    parser
+        .push_stdout(&framed(&submission), |observation| {
+            observations.push(observation);
+        })
+        .unwrap();
+    assert_eq!(parser.take_completed_result_exchange(), None);
+    assert!(matches!(
+        parser.finish(true),
+        AgentOutcome::Completed(CompletedAgentInvocation::Result(_))
+    ));
     assert_eq!(
-        protocol_rejection_value(&outcome)["detail"]["reason"],
-        "initialization_invalid"
+        subagent_statuses(&observations),
+        [
+            "started",
+            "completed",
+            "resumed",
+            "completed",
+            "resumed",
+            "completed"
+        ]
+    );
+    assert_eq!(
+        milestone_count(&observations, AgentLifecycleMilestone::TurnCompleted),
+        4
+    );
+
+    // Dequeued before the report run settled and answered with text first: the nag, a
+    // main-thread `user` frame of the turn, and the round after it deliver nothing to the
+    // notification that opened the turn, whose allowance still admits the correction turn;
+    // the report run, settling after the nag, opens its own turn after the correction's.
+    let mut observations = Vec::new();
+    let mut parser = rejected(&mut observations);
+    let mut nagged_turn = vec![init(QUALIFICATION_VERSION, SESSION_ID)];
+    nagged_turn.extend(text_message("carried-text", &["noted"], true));
+    nagged_turn.push(enforcement_nag());
+    nagged_turn.extend_from_slice(report_settlement);
+    nagged_turn.extend_from_slice(&submission[1..]);
+    parser
+        .push_stdout(&framed(&nagged_turn), |observation| {
+            observations.push(observation);
+        })
+        .unwrap();
+    assert_eq!(parser.take_completed_result_exchange(), candidate);
+    parser
+        .accept_result(CapturedJson::fixture(Arc::new(json!(7))))
+        .unwrap();
+    let mut epilogues = text_turn("correction-turn", "corrected");
+    epilogues.extend(text_turn("report-turn", "report"));
+    parser
+        .push_stdout(&framed(&epilogues), |observation| {
+            observations.push(observation);
+        })
+        .unwrap();
+    assert!(matches!(
+        parser.finish(true),
+        AgentOutcome::Completed(CompletedAgentInvocation::Result(_))
+    ));
+    assert_eq!(
+        milestone_count(&observations, AgentLifecycleMilestone::TurnCompleted),
+        4
+    );
+
+    // Dequeued once the report run had queued its own notification: the empty turn is read in
+    // the correction window, consumes the carried notification and leaves the correction
+    // prompt owed; the correction turn submits the value, and the report run's notification
+    // opens the epilogue.
+    let mut observations = Vec::new();
+    let mut parser = rejected(&mut observations);
+    let mut settled_first = report_settlement.to_vec();
+    settled_first.extend(empty_notification_turn());
+    parser
+        .push_stdout(&framed(&settled_first), |observation| {
+            observations.push(observation);
+        })
+        .unwrap();
+    assert_eq!(parser.take_completed_result_exchange(), None);
+    parser
+        .push_stdout(&framed(&submission), |observation| {
+            observations.push(observation);
+        })
+        .unwrap();
+    assert_eq!(parser.take_completed_result_exchange(), candidate);
+    parser
+        .accept_result(CapturedJson::fixture(Arc::new(json!(7))))
+        .unwrap();
+    parser
+        .push_stdout(
+            &framed(&text_turn("report-turn", "report")),
+            |observation| {
+                observations.push(observation);
+            },
+        )
+        .unwrap();
+    assert!(matches!(
+        parser.finish(true),
+        AgentOutcome::Completed(CompletedAgentInvocation::Result(_))
+    ));
+    assert_eq!(
+        milestone_count(&observations, AgentLifecycleMilestone::TurnCompleted),
+        4
+    );
+
+    // A stream that ends with the correction turn still owed, after the empty turn consumed
+    // its exchange, is as invalid as one that ends inside it.
+    let mut observations = Vec::new();
+    let mut parser = rejected(&mut observations);
+    parser
+        .push_stdout(&framed(&settled_first), |observation| {
+            observations.push(observation);
+        })
+        .unwrap();
+    assert_eq!(
+        protocol_rejection_value(&parser.finish(true))["detail"]["reason"],
+        "end_of_stream_invariant_invalid"
     );
 }
 
