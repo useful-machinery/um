@@ -11,6 +11,7 @@ mod delegations;
 mod github;
 mod gitlab;
 mod google_docs_actions;
+mod grants;
 mod http_client;
 mod http_util;
 mod human_principal;
@@ -92,6 +93,9 @@ pub use generated::models::{
 };
 pub use generated::models::{CreateWebhookSubscriptionRequest, PatchWebhookSubscriptionRequest};
 pub use generated::models::{
+    create_grant_session_request, provider_grant, provider_grant_session, provider_grant_use,
+};
+pub use generated::models::{
     linear_authorization_session, linear_connection, linear_connection_error,
 };
 pub use github::{
@@ -102,6 +106,10 @@ pub use gitlab::{
     GitLabApi, GitLabFailure, GitLabRepositoryQuery, GitLabSelection, GitLabSubmission,
 };
 pub use google_docs_actions::{ActionApi, ActionFailure, ActionRead, Lifecycle as ActionLifecycle};
+pub use grants::{
+    Grant, GrantApi, GrantApiError, GrantFailure, GrantList, GrantProvider, GrantSession,
+    GrantSessionReason, GrantSessionStatus, GrantState, GrantUse, GrantUseList,
+};
 pub use http_client::{
     HttpCancellation, HttpClient, HttpClientError, HttpEndpointError, HttpTransportPolicy,
     identify_client,
@@ -111,7 +119,7 @@ pub use http_util::{
 };
 pub use human_principal::HumanPrincipal;
 pub use identities::{
-    CommonIdentityFailure, IdentityApiError, IdentityKind, LinkIdentityOutcome,
+    CommonIdentityFailure, IdentityApiError, IdentityGrant, IdentityKind, LinkIdentityOutcome,
     ListIdentitiesOutcome, OidcIdentity, RemoveIdentityOutcome, link_identity, list_identities,
     remove_identity,
 };

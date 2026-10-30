@@ -46,6 +46,8 @@ mod delegation;
 mod github;
 #[path = "cli/gitlab.rs"]
 mod gitlab;
+#[path = "cli/grants.rs"]
+mod grants;
 #[path = "cli/identities.rs"]
 mod identities;
 #[path = "cli/invitation.rs"]
@@ -563,6 +565,18 @@ fn header_value<'a>(request: &'a str, name: &str) -> &'a str {
         .find_map(|line| line.strip_prefix(&prefix))
         .expect("request should contain expected header")
         .trim_end_matches('\r')
+}
+
+/// Neither stream of a finished command may carry any of `secrets`.
+fn assert_no_secret_output(output: &Output, secrets: &[&str]) {
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    for secret in secrets {
+        assert!(
+            !stdout.contains(secret) && !stderr.contains(secret),
+            "output exposed secret {secret:?}"
+        );
+    }
 }
 
 fn request_form(request: &str) -> std::collections::HashMap<String, String> {

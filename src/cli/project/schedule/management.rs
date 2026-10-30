@@ -3,7 +3,6 @@ use std::path::PathBuf;
 
 use anyhow::{Context, anyhow};
 use clap::Args;
-use serde::Serialize;
 use um_api::{
     HttpTransportPolicy, LifecycleAction, ScheduleApi, ScheduleOccurrence,
     ScheduleOccurrenceFilters, ScheduleRead,
@@ -318,14 +317,6 @@ fn report(write: impl FnOnce(&mut dyn Write) -> io::Result<()>) -> cli::CommandR
     Ok(ExitCode::Success)
 }
 
-/// The wire name of a generated enum value.
-fn wire(value: &impl Serialize) -> String {
-    serde_json::to_value(value)
-        .ok()
-        .and_then(|value| value.as_str().map(str::to_owned))
-        .unwrap_or_default()
-}
-
 fn show(out: &mut dyn Write, read: &ScheduleRead) -> io::Result<()> {
     writeln!(out, "schedule: shown")?;
     let schedule = match read {
@@ -368,7 +359,7 @@ fn show(out: &mut dyn Write, read: &ScheduleRead) -> io::Result<()> {
         "last occurrence: {} · {} · {}",
         last.id,
         last.due_at,
-        wire(&last.state)
+        um_support::wire_name(last.state).unwrap_or_default()
     )?;
     if let Some(reason) = &last.reason_code {
         write!(out, " · {reason}")?;
@@ -380,7 +371,13 @@ fn show(out: &mut dyn Write, read: &ScheduleRead) -> io::Result<()> {
 }
 
 fn occurrence_line(out: &mut dyn Write, item: &ScheduleOccurrence) -> io::Result<()> {
-    write!(out, "{} · {} · {}", item.id, item.due_at, wire(&item.state))?;
+    write!(
+        out,
+        "{} · {} · {}",
+        item.id,
+        item.due_at,
+        um_support::wire_name(item.state).unwrap_or_default()
+    )?;
     if let Some(reason) = &item.reason_code {
         write!(out, " · {reason}")?;
     }

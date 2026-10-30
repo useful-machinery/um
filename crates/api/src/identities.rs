@@ -45,6 +45,17 @@ pub struct OidcIdentity {
     pub email_verified: Option<bool>,
     pub created_at: String,
     pub current: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub grant: Option<IdentityGrant>,
+}
+
+/// The provider grant bound to a listed identity, with its wire provider and state names.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IdentityGrant {
+    pub id: String,
+    pub provider: String,
+    pub state: String,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -689,7 +700,7 @@ fn optional_identity_field_is_null(value: &serde_json::Value) -> bool {
         .and_then(serde_json::Value::as_array)
         .is_some_and(|items| {
             items.iter().any(|item| {
-                ["assertedEmail", "emailVerified"]
+                ["assertedEmail", "emailVerified", "grant"]
                     .into_iter()
                     .any(|field| item.get(field).is_some_and(serde_json::Value::is_null))
             })
@@ -704,7 +715,7 @@ fn decode_identity(
     let value: serde_json::Value = serde_json::from_slice(&response.body).map_err(|_| {
         IdentityApiError::protocol(operation, "the identity response body is invalid", false)
     })?;
-    if ["assertedEmail", "emailVerified"]
+    if ["assertedEmail", "emailVerified", "grant"]
         .into_iter()
         .any(|field| value.get(field).is_some_and(serde_json::Value::is_null))
     {
@@ -742,6 +753,10 @@ impl TryFrom<generated_models::OidcIdentityLink> for OidcIdentity {
             generated_models::oidc_identity_link::Kind::Oidc => IdentityKind::Oidc,
             generated_models::oidc_identity_link::Kind::WorkloadOidc => IdentityKind::WorkloadOidc,
         };
+        let grant = value
+            .grant
+            .map(|grant| IdentityGrant::try_from(*grant))
+            .transpose()?;
         Ok(Self {
             id: value.id,
             kind,
@@ -751,6 +766,34 @@ impl TryFrom<generated_models::OidcIdentityLink> for OidcIdentity {
             email_verified: value.email_verified,
             created_at: value.created_at,
             current: value.current,
+            grant,
+        })
+    }
+}
+
+impl TryFrom<generated_models::OidcIdentityLinkGrant> for IdentityGrant {
+    type Error = &'static str;
+
+    fn try_from(value: generated_models::OidcIdentityLinkGrant) -> Result<Self, Self::Error> {
+        use generated_models::oidc_identity_link_grant::{Provider, State};
+
+        if !valid_typed_id(&value.id, "pgr_") {
+            return Err("the identity grant ID is invalid");
+        }
+        let provider = match value.provider {
+            Provider::OIDCIdentityLinkGrantProviderGithub => "github",
+            Provider::OIDCIdentityLinkGrantProviderGitlabCom => "gitlab.com",
+            Provider::OIDCIdentityLinkGrantProviderLinear => "linear",
+        };
+        let state = match value.state {
+            State::OIDCIdentityLinkGrantStateActive => "active",
+            State::OIDCIdentityLinkGrantStateReconnectRequired => "reconnect_required",
+            State::OIDCIdentityLinkGrantStateRevoked => "revoked",
+        };
+        Ok(Self {
+            id: value.id,
+            provider: provider.to_owned(),
+            state: state.to_owned(),
         })
     }
 }

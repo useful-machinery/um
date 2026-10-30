@@ -1224,10 +1224,7 @@ fn write_json(value: &impl Serialize) -> anyhow::Result<()> {
 }
 
 fn write_json_line(value: &impl Serialize) -> anyhow::Result<()> {
-    let mut stdout = io::stdout().lock();
-    serde_json::to_writer(&mut stdout, value).context("serialize JSON deletion event")?;
-    writeln!(stdout).context("write JSON deletion event")?;
-    stdout.flush().context("write JSON deletion event")
+    super::write_json_line(value).context("write JSON deletion event")
 }
 
 pub(super) const fn account_about() -> &'static str {

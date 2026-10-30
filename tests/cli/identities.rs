@@ -215,6 +215,57 @@ fn list_returns_one_exact_page_with_current_and_provenance_fields() {
     );
 }
 
+// REQ-ACCOUNT-41
+#[test]
+fn list_passes_through_an_identity_grant_and_prints_its_state_and_id() {
+    let grant = serde_json::json!({
+        "id": "pgr_01k0z6r1w8f4jy2m7q9v3x5abc",
+        "provider": "github",
+        "state": "active"
+    });
+    let mut granted = identity(CURRENT_IDENTITY_ID, "https://github.com", "12345", true);
+    granted["grant"] = grant.clone();
+    let ungranted = identity(
+        LINKED_IDENTITY_ID,
+        "https://work.example/",
+        "ada-work",
+        false,
+    );
+    let items = serde_json::json!([granted, ungranted]);
+
+    for json in [true, false] {
+        let (server, _directory, path) =
+            prepared_identity_command(vec![identity_page(items.clone(), None)]);
+        let environment = deployment_environment_with_issuer(
+            &server.api_url,
+            &server.issuer,
+            path.to_str().unwrap(),
+        );
+        let mut args = vec!["auth", "identity", "list", "--allow-insecure-http"];
+        if json {
+            args.push("--json");
+        }
+        let output = run_with_env(&args, &environment);
+        assert!(output.status.success());
+        assert!(output.stderr.is_empty());
+        if json {
+            let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(result["items"][0]["grant"], grant);
+            assert!(result["items"][1].get("grant").is_none());
+        } else {
+            let text = String::from_utf8(output.stdout).unwrap();
+            let lines = text
+                .lines()
+                .filter(|line| line.starts_with("grant:"))
+                .collect::<Vec<_>>();
+            assert_eq!(lines, ["grant: active (pgr_01k0z6r1w8f4jy2m7q9v3x5abc)"]);
+            let first_block = text.split("── identity ──").nth(1).unwrap();
+            assert!(first_block.contains("grant: active (pgr_01k0z6r1w8f4jy2m7q9v3x5abc)"));
+        }
+        server.finish();
+    }
+}
+
 // REQ-ACCOUNT-44
 #[test]
 fn list_presents_only_exact_auth0_human_namespaces_without_changing_api_fields() {
@@ -248,17 +299,51 @@ fn list_presents_only_exact_auth0_human_namespaces_without_changing_api_fields()
             "oauth2|um-gitlab-com-signin|um-gitlab-com:abc",
             false,
         ),
+        // Links a grant consent creates carry the provider's own issuer and raw user id.
+        identity(
+            "idn_01k0z6r1w8f4jy2m7q9v3x5abk",
+            "https://linear.app",
+            "usr_123",
+            false,
+        ),
+        identity(
+            "idn_01k0z6r1w8f4jy2m7q9v3x5abm",
+            "https://github.com",
+            "12345",
+            false,
+        ),
+        identity(
+            "idn_01k0z6r1w8f4jy2m7q9v3x5abn",
+            "https://gitlab.com",
+            "67890",
+            false,
+        ),
+        identity(
+            "idn_01k0z6r1w8f4jy2m7q9v3x5abp",
+            "https://linear.app/",
+            "usr_123",
+            false,
+        ),
     ];
+    let providers = [
+        ("github", "GitHub"),
+        ("google", "Google"),
+        ("gitlab.com", "GitLab.com"),
+        ("unknown", "Other"),
+        ("unknown", "Other"),
+        ("unknown", "Other"),
+        ("unknown", "Other"),
+        ("linear", "Linear"),
+        ("github", "GitHub"),
+        ("gitlab.com", "GitLab.com"),
+        ("unknown", "Other"),
+    ];
+    assert_eq!(providers.len(), items.len());
     let expected = items
         .iter()
         .cloned()
-        .enumerate()
-        .map(|(index, item)| match index {
-            0 => with_provider(item, "github"),
-            1 => with_provider(item, "google"),
-            2 => with_provider(item, "gitlab.com"),
-            _ => with_provider(item, "unknown"),
-        })
+        .zip(providers)
+        .map(|(item, (provider, _))| with_provider(item, provider))
         .collect::<Vec<_>>();
 
     for json in [true, false] {
@@ -295,15 +380,7 @@ fn list_presents_only_exact_auth0_human_namespaces_without_changing_api_fields()
             );
         } else {
             let text = String::from_utf8(output.stdout).unwrap();
-            for (item, label) in items.iter().zip([
-                "GitHub",
-                "Google",
-                "GitLab.com",
-                "Other",
-                "Other",
-                "Other",
-                "Other",
-            ]) {
+            for (item, (_, label)) in items.iter().zip(providers) {
                 let block = format!(
                     "identity: {}\nsign-in method: {label}\ncurrent: {}\nissuer: {}\nsubject: {}",
                     item["id"].as_str().unwrap(),

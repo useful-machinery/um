@@ -318,6 +318,7 @@ json_family!(DelegationJson, "delegation");
 json_family!(DeletionJson, "deletion");
 json_family!(GithubJson, "GitHub");
 json_family!(GitlabJson, "GitLab connection");
+json_family!(GrantJson, "grant");
 json_family!(IdentityJson, "identity");
 json_family!(InvitationJson, "invitation");
 json_family!(OrganizationJson, "organization");
@@ -723,6 +724,16 @@ fn write_pretty_json(value: &impl Serialize) -> io::Result<()> {
     stdout.flush()
 }
 
+/// One compact JSON document on its own line, for commands whose output is a stream of events.
+fn write_json_line(value: &impl Serialize) -> io::Result<()> {
+    let mut bytes = serde_json::to_vec(value).map_err(io::Error::other)?;
+    bytes.push(b'\n');
+    let stdout = io::stdout();
+    let mut stdout = stdout.lock();
+    stdout.write_all(&bytes)?;
+    stdout.flush()
+}
+
 fn write_api_failure(
     deployment: &str,
     outcome: &'static str,
@@ -1050,6 +1061,40 @@ impl ObservationClock for SystemObservationClock {
     fn sleep(&self, duration: Duration) {
         um_support::sleep(duration);
     }
+}
+
+// A ceremony the member completes elsewhere (a Linear authorization, a provider grant
+// consent) is polled at this cadence.
+const CEREMONY_POLL_INTERVAL: Duration = Duration::from_secs(5);
+const POLL_WAIT_SLICE: Duration = Duration::from_millis(100);
+
+fn ceremony_poll_interval() -> Duration {
+    um_support::poll_interval(CEREMONY_POLL_INTERVAL)
+}
+
+/// Waits `delay` in short slices so a signal ends the wait; false once the operation is
+/// cancelled.
+fn wait_for_poll<R>(
+    control: &OperationControl<R>,
+    delay: Duration,
+    clock: &impl ObservationClock,
+) -> bool {
+    let started = clock.now();
+    loop {
+        if control.is_cancelled() {
+            return false;
+        }
+        let remaining = delay.saturating_sub(clock.now().saturating_duration_since(started));
+        if remaining.is_zero() {
+            return true;
+        }
+        clock.sleep(remaining.min(POLL_WAIT_SLICE));
+    }
+}
+
+/// The wait after a rate-limited poll: the server's `Retry-After`, never under the cadence.
+fn retry_delay(retry_after: Option<u64>) -> Duration {
+    Duration::from_secs(retry_after.unwrap_or(0)).max(ceremony_poll_interval())
 }
 
 #[cfg(test)]
@@ -2371,6 +2416,11 @@ mod tests {
             "artifact list",
             "artifact validate",
             "auth",
+            "auth grant",
+            "auth grant create",
+            "auth grant list",
+            "auth grant revoke",
+            "auth grant uses",
             "auth identity",
             "auth identity link",
             "auth identity list",

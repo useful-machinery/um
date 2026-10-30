@@ -2,6 +2,7 @@ mod idempotency;
 mod public_id;
 mod timing;
 mod tls;
+mod wire;
 mod workflow_contract;
 
 pub use idempotency::generate_idempotency_key;
@@ -12,6 +13,7 @@ pub use timing::{
     async_sleep, elapsed, monotonic_now, poll_interval, short_retry_delay, sleep, utc_now,
 };
 pub use tls::install_provider;
+pub use wire::wire_name;
 pub use workflow_contract::strict_json::{
     from_slice as strict_json_from_slice, from_str as strict_json_from_str,
 };

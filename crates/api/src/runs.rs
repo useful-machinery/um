@@ -16,6 +16,7 @@ use super::http_client::{HttpClient, generated_configuration};
 use super::http_util::{self, BoundedBodyError, BufferedBlockingResponse};
 use super::problem::{self, BAD_REQUEST, FORBIDDEN, JSON_MEDIA_TYPE, NOT_FOUND, UNAUTHORIZED};
 use super::{HttpTransportPolicy, UnreachableCategory, classify_reqwest_error};
+use um_support::wire_name;
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 const CREATE_ATTEMPTS: usize = 2;
@@ -2011,13 +2012,6 @@ const LINEAR_LIFECYCLE_UPDATE_REASON_STATES: [(&str, &[&str]); 27] = [
     ("internal_sync_failure", &["retry_waiting", "failed"]),
     ("retry_exhausted", &["failed"]),
 ];
-
-fn wire_name(value: impl serde::Serialize) -> Option<String> {
-    serde_json::to_value(value)
-        .ok()?
-        .as_str()
-        .map(str::to_owned)
-}
 
 fn valid_linear_lifecycle_update_reason(state: &str, code: Option<&str>) -> bool {
     match code {

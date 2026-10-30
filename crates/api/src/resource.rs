@@ -160,11 +160,18 @@ pub(crate) fn validate_json_media_type(
     .map_err(|_| invalid())
 }
 
-pub(crate) fn receive_response(
+/// A response whose status the caller classifies itself, read within the body bound.
+pub(crate) struct RawResponse {
+    pub status: StatusCode,
+    pub body: Vec<u8>,
+    pub headers: reqwest::header::HeaderMap,
+    pub retry_after: Option<u64>,
+}
+
+/// Sends the request and reads its bounded body; only transport and an oversized body fail.
+pub(crate) fn receive_raw(
     request: reqwest::blocking::RequestBuilder,
-    expected_status: StatusCode,
-    vocabulary: &ProblemVocabulary,
-) -> Result<(Vec<u8>, reqwest::header::HeaderMap), ResourceFailure> {
+) -> Result<RawResponse, ResourceFailure> {
     let response = request
         .send()
         .map_err(|error| ResourceFailure::Unreachable {
@@ -181,10 +188,29 @@ pub(crate) fn receive_response(
             category: classify_reqwest_error(&error),
         },
     })?;
-    if status != expected_status {
-        return Err(classify_response(status, &body, retry_after, vocabulary));
+    Ok(RawResponse {
+        status,
+        body,
+        headers,
+        retry_after,
+    })
+}
+
+pub(crate) fn receive_response(
+    request: reqwest::blocking::RequestBuilder,
+    expected_status: StatusCode,
+    vocabulary: &ProblemVocabulary,
+) -> Result<(Vec<u8>, reqwest::header::HeaderMap), ResourceFailure> {
+    let response = receive_raw(request)?;
+    if response.status != expected_status {
+        return Err(classify_response(
+            response.status,
+            &response.body,
+            response.retry_after,
+            vocabulary,
+        ));
     }
-    Ok((body, headers))
+    Ok((response.body, response.headers))
 }
 
 /// The delay-seconds form of `Retry-After`; an HTTP date or malformed value is absent.

@@ -206,13 +206,18 @@ separate entity family.
   `end`, `enroll`, `history`, `issue`, `leave`, `link`, `list`, `login`,
   `logout`, `move`, `preview`, `propose`, `reference`, `remove`, `rename`,
   `request`, `retire`, `retry`, `revoke`, `run`, `schema`, `seal`, `serve`,
-  `set`, `show`, `signup`, `status`, `update`, `upload`, `validate`, `version`,
-  `view`, `wait`. A new leaf verb requires an amendment to this list; an
-  existing command is not precedent for adding one.
+  `set`, `show`, `signup`, `status`, `update`, `upload`, `uses` (the record of
+  tokens issued from a grant), `validate`, `version`, `view`, `wait`. A new leaf
+  verb requires an amendment to this list; an existing command is not precedent
+  for adding one.
 - **Minting:** choose the creation verb from the immediate sibling leaf set. If
   that set contains `revoke`, the creation leaf is `issue`; otherwise it is
   `create`. This makes bearer secrets and capabilities, which can be
-  withdrawn, `issue`/`revoke` pairs.
+  withdrawn, `issue`/`revoke` pairs. The rule governs what the deployment
+  mints, a secret or capability it issues. A leaf that begins a ceremony the
+  member completes at a third party keeps `create`, as `auth grant create
+  PROVIDER` does for an OAuth consent, since nothing is issued until the
+  member consents.
 - **Rename or update:** use `rename` when the entity's complete set of mutable
   attributes is exactly `{name}`. Use `update` when two or more entity
   attributes are mutable. A family does not expose both verbs.
@@ -250,6 +255,9 @@ separate entity family.
 Pagination:
   This command returns one page. Pass --cursor <CURSOR> to continue.
 ```
+
+  A `uses` leaf pages as a `list` leaf does: it takes `--cursor` and `--limit`
+  and includes the same after-help section.
 
   `connection github installation list` and `connection github repository list`
   cannot offer bounded pagination: the public GitHub installation and

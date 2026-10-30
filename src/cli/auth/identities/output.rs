@@ -485,6 +485,9 @@ fn write_identity_fields(output: &mut impl Write, identity: &OidcIdentity) -> io
         "current: {}",
         if identity.current { "yes" } else { "no" }
     )?;
+    if let Some(grant) = &identity.grant {
+        writeln!(output, "grant: {} ({})", grant.state, grant.id)?;
+    }
     writeln!(output, "issuer: {}", identity.issuer)?;
     writeln!(output, "subject: {}", identity.subject)?;
     if let Some(email) = &identity.asserted_email {
@@ -509,14 +512,22 @@ fn write_json(value: &impl Serialize) -> anyhow::Result<()> {
 // connection (UM-2562); production must reproduce it before that connection is bound.
 const AUTH0_ISSUER: &str = "https://auth.usefulmachinery.com/";
 const GITLAB_SUBJECT_PREFIX: &str = "oauth2|um-gitlab-com-signin|um-gitlab-com:";
+// A link a grant consent creates carries the provider's own issuer, as
+// gateway/internal/providertable/providers.json declares it, and the provider's raw user id.
+const PROVIDER_ISSUERS: [(&str, Provider); 3] = [
+    ("https://github.com", Provider::Github),
+    ("https://gitlab.com", Provider::Gitlab),
+    ("https://linear.app", Provider::Linear),
+];
 
-#[derive(Serialize)]
+#[derive(Clone, Copy, Serialize)]
 #[serde(rename_all = "lowercase")]
 enum Provider {
     Github,
     Google,
     #[serde(rename = "gitlab.com")]
     Gitlab,
+    Linear,
     Unknown,
 }
 
@@ -526,26 +537,34 @@ impl Provider {
             return None;
         }
         let subject = identity.subject.as_str();
-        Some(if identity.issuer != AUTH0_ISSUER {
-            Self::Unknown
-        } else if subject
-            .strip_prefix("github|")
-            .is_some_and(|id| !id.is_empty())
-        {
-            Self::Github
-        } else if subject
-            .strip_prefix("google-oauth2|")
-            .is_some_and(|id| !id.is_empty())
-        {
-            Self::Google
-        } else if subject
-            .strip_prefix(GITLAB_SUBJECT_PREFIX)
-            .is_some_and(|id| !id.is_empty() && id.bytes().all(|byte| byte.is_ascii_digit()))
-        {
-            Self::Gitlab
-        } else {
-            Self::Unknown
-        })
+        if identity.issuer != AUTH0_ISSUER {
+            return Some(
+                PROVIDER_ISSUERS
+                    .iter()
+                    .find(|(issuer, _)| *issuer == identity.issuer && !subject.is_empty())
+                    .map_or(Self::Unknown, |(_, provider)| *provider),
+            );
+        }
+        Some(
+            if subject
+                .strip_prefix("github|")
+                .is_some_and(|id| !id.is_empty())
+            {
+                Self::Github
+            } else if subject
+                .strip_prefix("google-oauth2|")
+                .is_some_and(|id| !id.is_empty())
+            {
+                Self::Google
+            } else if subject
+                .strip_prefix(GITLAB_SUBJECT_PREFIX)
+                .is_some_and(|id| !id.is_empty() && id.bytes().all(|byte| byte.is_ascii_digit()))
+            {
+                Self::Gitlab
+            } else {
+                Self::Unknown
+            },
+        )
     }
 
     const fn label(&self) -> &'static str {
@@ -553,6 +572,7 @@ impl Provider {
             Self::Github => "GitHub",
             Self::Google => "Google",
             Self::Gitlab => "GitLab.com",
+            Self::Linear => "Linear",
             Self::Unknown => "Other",
         }
     }

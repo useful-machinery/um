@@ -30,13 +30,6 @@ fn connection() -> serde_json::Value {
         "workspaceName":"Research", "requiredScopes":["read"], "grantedScopes":["read"], "stateUpdatesConsented":false,
         "lifecycleGeneration":1,"createdAt":"2026-09-05T12:00:00Z","updatedAt":"2026-09-05T12:01:00Z", "token":SECRET})
 }
-fn assert_no_secret_output(output: &Output, secrets: &[&str]) {
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    for secret in secrets {
-        assert!(!stdout.contains(secret) && !stderr.contains(secret));
-    }
-}
 fn env_run(server: &ScriptedServer, credential: &str, args: &[&str]) -> Output {
     run_with_env(args, &deployment_environment(&server.api_url, credential))
 }

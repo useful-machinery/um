@@ -20,6 +20,11 @@ pub(super) const QUANTITY_LIMIT_REACHED: &str =
     "https://api.usefulmachinery.com/problems/quantity-limit-reached";
 pub(super) const PROVIDER_UNAVAILABLE: &str =
     "https://api.usefulmachinery.com/problems/provider-unavailable";
+pub(super) const IDENTITY_NOT_FOUND: &str =
+    "https://api.usefulmachinery.com/problems/identity-not-found";
+pub(super) const GRANT_NOT_FOUND: &str = "https://api.usefulmachinery.com/problems/grant-not-found";
+pub(super) const GRANT_SESSION_NOT_FOUND: &str =
+    "https://api.usefulmachinery.com/problems/grant-session-not-found";
 pub(super) const SERVICE_UNAVAILABLE: &str =
     "https://api.usefulmachinery.com/problems/service-unavailable";
 

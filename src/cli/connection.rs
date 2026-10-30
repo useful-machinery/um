@@ -14,7 +14,10 @@ use um_api::{
 };
 use um_human_auth::Deployment;
 
-use super::{OrganizationArg, PrincipalAuthenticationArgs};
+use super::{
+    OrganizationArg, PrincipalAuthenticationArgs, ceremony_poll_interval, retry_delay,
+    wait_for_poll,
+};
 
 pub(super) const ABOUT: &str = "Manage source connections";
 const NAME: &str = "connection";
@@ -340,7 +343,7 @@ impl Start {
                     &session.id,
                     &self.options,
                     control,
-                    poll_interval(),
+                    ceremony_poll_interval(),
                 )
             },
             move |signal, snapshot| {
@@ -412,7 +415,7 @@ fn observe(
         let result = with_api(d, options, |api| api.session(org, id))?;
         match result {
             Ok(session) if session.status == LinearSessionStatus::LinearSessionPending => {
-                next = poll_interval()
+                next = ceremony_poll_interval()
             }
             Ok(session) => {
                 return finish(control, || session_output(d, org, &session, options.json));
@@ -435,45 +438,17 @@ fn observe(
     }
 }
 
-const POLL_INTERVAL: Duration = Duration::from_secs(5);
-const POLL_WAIT_SLICE: Duration = Duration::from_millis(100);
-
-fn poll_interval() -> Duration {
-    um_support::poll_interval(POLL_INTERVAL)
-}
-
-fn wait_for_poll(
-    control: &super::OperationControl<Recovery>,
-    delay: Duration,
-    clock: &impl super::ObservationClock,
-) -> bool {
-    let started = clock.now();
-    loop {
-        if control.is_cancelled() {
-            return false;
-        }
-        let remaining = delay.saturating_sub(clock.now().saturating_duration_since(started));
-        if remaining.is_zero() {
-            return true;
-        }
-        clock.sleep(remaining.min(POLL_WAIT_SLICE));
-    }
-}
-
-fn retry_delay(retry_after: Option<u64>) -> Duration {
-    Duration::from_secs(retry_after.unwrap_or(0)).max(poll_interval())
-}
-
 #[cfg(test)]
 mod tests {
+    use super::super::{CEREMONY_POLL_INTERVAL, POLL_WAIT_SLICE};
     use super::*;
 
     #[test]
     fn polling_rate_limit_never_precedes_retry_after() {
         assert_eq!(retry_delay(Some(9)), Duration::from_secs(9));
-        assert_eq!(retry_delay(None), POLL_INTERVAL);
-        assert_eq!(retry_delay(Some(0)), POLL_INTERVAL);
-        assert_eq!(retry_delay(Some(3)), POLL_INTERVAL);
+        assert_eq!(retry_delay(None), CEREMONY_POLL_INTERVAL);
+        assert_eq!(retry_delay(Some(0)), CEREMONY_POLL_INTERVAL);
+        assert_eq!(retry_delay(Some(3)), CEREMONY_POLL_INTERVAL);
         assert_eq!(retry_delay(Some(600)), Duration::from_secs(600));
         assert_eq!(stop_outcome(ExitCode::GeneralFailure), "timed_out");
         assert_eq!(stop_outcome(ExitCode::Interrupted), "observation_stopped");
@@ -485,7 +460,7 @@ mod tests {
             um_support::monotonic_now(),
         );
         let control = super::super::OperationControl::new(Recovery { session: None });
-        assert!(wait_for_poll(&control, POLL_INTERVAL, &clock));
+        assert!(wait_for_poll(&control, CEREMONY_POLL_INTERVAL, &clock));
         assert!(wait_for_poll(&control, retry_delay(Some(9)), &clock));
         let sleeps = clock.into_sleeps();
         assert!(sleeps.iter().all(|slice| *slice <= POLL_WAIT_SLICE));
@@ -905,10 +880,7 @@ fn status(s: &um_api::linear_connection::Status) -> &'static str {
     }
 }
 fn emit(value: &impl Serialize) -> anyhow::Result<()> {
-    let mut bytes = serde_json::to_vec(value)?;
-    bytes.push(b'\n');
-    io::stdout().lock().write_all(&bytes)?;
-    Ok(())
+    super::write_json_line(value).context("write JSON connection event")
 }
 fn session_output(
     d: &Deployment,

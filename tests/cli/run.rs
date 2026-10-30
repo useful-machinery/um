@@ -2724,15 +2724,6 @@ fn request_body(request: &str) -> serde_json::Value {
     serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap()
 }
 
-fn assert_no_secret_output(output: &Output, secrets: &[&str]) {
-    let mut bytes = output.stdout.clone();
-    bytes.extend_from_slice(&output.stderr);
-    let text = String::from_utf8_lossy(&bytes);
-    for secret in secrets {
-        assert!(!text.contains(secret), "output exposed secret {secret:?}");
-    }
-}
-
 fn assert_create_invalid_input(output: &Output) {
     assert_eq!(output.status.code(), Some(1));
     let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();

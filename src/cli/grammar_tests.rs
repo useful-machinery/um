@@ -5,8 +5,8 @@ use clap::{Arg, ArgAction, Command, CommandFactory};
 
 use super::Cli;
 
-const LEAVES: &str = "accept activate begin cancel complete continue create decline delete disable doctor download drain enable end enroll history issue leave link list login logout move preview propose reference remove rename replay request retire retry revoke revoke-previous-secret rotate-secret run schema seal serve set show signup status test update upload validate version view wait";
-const GROUPS: &str = "account action activation artifact audit auth authorization connection credential delegation deletion delivery github gitlab identity input input-set installation invitation linear member occurrence organization pool project publication repository run runner runner-pool schedule service-principal setup state team trigger evaluation webhook workflow";
+const LEAVES: &str = "accept activate begin cancel complete continue create decline delete disable doctor download drain enable end enroll history issue leave link list login logout move preview propose reference remove rename replay request retire retry revoke revoke-previous-secret rotate-secret run schema seal serve set show signup status test update upload uses validate version view wait";
+const GROUPS: &str = "account action activation artifact audit auth authorization connection credential delegation deletion delivery github gitlab grant identity input input-set installation invitation linear member occurrence organization pool project publication repository run runner runner-pool schedule service-principal setup state team trigger evaluation webhook workflow";
 const COMMON: [&str; 3] = ["json", "service-api-key-file", "allow-insecure-http"];
 // These endpoints have no limit/cursor contract; see cli/docs/output-style.md.
 const UNPAGINATED_LISTS: [&str; 2] = [
@@ -41,6 +41,8 @@ fn semantic_class(path: &str, long: &str) -> Option<String> {
         "limit" => match path {
             "organization audit list" => "limit:100",
             "artifact list"
+            | "auth grant list"
+            | "auth grant uses"
             | "auth identity list"
             | "delegation list"
             | "invitation list"
@@ -67,6 +69,7 @@ fn semantic_class(path: &str, long: &str) -> Option<String> {
             } else if matches!(
                 path,
                 "auth login"
+                    | "auth grant create"
                     | "auth identity link"
                     | "account deletion cancel"
                     | "organization deletion cancel"
@@ -74,6 +77,8 @@ fn semantic_class(path: &str, long: &str) -> Option<String> {
                 "streaming-events"
             } else if matches!(path, "auth logout" | "auth status") {
                 "sign-in"
+            } else if path.starts_with("auth grant ") {
+                "grant"
             } else if path.starts_with("auth identity ") {
                 "identity"
             } else if path.starts_with("organization invitation ") {
@@ -307,6 +312,12 @@ fn entity_identifier_flags_match_the_command_tree_and_parser() {
                 "prn_01k0z6r1w8f4jy2m7q9v3x5abc",
             ],
         ),
+        (
+            &["auth", "grant", "create"],
+            "identity-id",
+            "identity",
+            &["github", "--identity-id", "idn_01k0z6r1w8f4jy2m7q9v3x5abc"],
+        ),
     ];
 
     for &(path, replacement, removed, arguments) in cases {
@@ -352,6 +363,7 @@ fn entity_identifier_flags_match_the_command_tree_and_parser() {
 
 // REQ-ACCOUNT-61
 // REQ-SERVICEPRINCIPAL-20
+// REQ-GRANT-6
 #[test]
 fn destructive_leaves_require_confirmation_but_runner_modes_do_not() {
     let gated: &[&[&str]] = &[
@@ -387,6 +399,7 @@ fn destructive_leaves_require_confirmation_but_runner_modes_do_not() {
             "runner",
             "activation",
         ],
+        &["auth", "grant", "revoke", "pgr_01k0z6r1w8f4jy2m7q9v3x5abc"],
         &["auth", "identity", "remove", "identity"],
         &[
             "connection",
