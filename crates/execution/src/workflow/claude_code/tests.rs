@@ -1667,6 +1667,91 @@ fn a_turn_a_settled_subagent_announced_after_the_value_settled_is_an_epilogue() 
     );
 }
 
+/// The driver hands the parser whatever one read carried, and 2.1.310 writes a queued
+/// notification's turn close behind a `result` (AUTO-63's experiment saw a `result` and the
+/// next turn's `init` in one 8 KiB read). A `result` that leaves a decision for the adapter
+/// ends what the parser reads from that chunk: the rest waits until the decision is taken,
+/// so an `init` behind the `result` is read after acceptance, as an epilogue, or after
+/// rejection, as the correction turn's, and never while the decision is pending.
+// REQ-AGENT-76, REQ-AGENT-69
+// INV-HARNESS-7
+#[test]
+fn an_init_in_the_read_that_carried_a_candidates_result_waits_for_the_decision() {
+    let transcript = subagent_settled_in_the_exchange_transcript(&epilogue_turn());
+    let final_answer = position_of(&transcript, |value| {
+        value["event"]["message"]["id"] == "final-answer"
+    });
+    let mut first_turn = transcript[..final_answer].to_vec();
+    first_turn.extend_from_slice(&structured_output_exchange_after(&[])[1..]);
+    let mut announced_turn = vec![system_event(
+        "background_tasks_changed",
+        json!({"tasks": []}),
+    )];
+    announced_turn.push(init(QUALIFICATION_VERSION, SESSION_ID));
+    announced_turn.extend(text_message("epilogue", &["noted"], true));
+    announced_turn
+        .extend_from_slice(&structured_output_exchange_with(&json!({"result": 8}), &[])[1..]);
+    let mut one_read = framed(&first_turn);
+    one_read.extend_from_slice(&framed(&announced_turn));
+    let candidate = Some(CompletedResultExchange::Candidate(Arc::new(json!(7))));
+
+    // Accepted: the held remainder opens an epilogue, whose submission is no candidate.
+    let mut observations = Vec::new();
+    let mut accepting = parser(AgentValueKind::Result, 1024);
+    accepting
+        .push_stdout(&one_read, |observation| observations.push(observation))
+        .unwrap();
+    assert_eq!(accepting.take_completed_result_exchange(), candidate);
+    assert!(
+        accepting.has_deferred_stdout(),
+        "the rest of the read waits for the decision"
+    );
+    assert_eq!(
+        milestone_count(&observations, AgentLifecycleMilestone::TurnStarted),
+        1,
+        "nothing past the result is read before the decision"
+    );
+    accepting
+        .accept_result(CapturedJson::fixture(Arc::new(json!(7))))
+        .unwrap();
+    accepting
+        .push_stdout(&[], |observation| observations.push(observation))
+        .unwrap();
+    assert_eq!(accepting.take_completed_result_exchange(), None);
+    assert!(!accepting.has_deferred_stdout());
+    assert_epilogue_observed(&observations, 2);
+    let AgentOutcome::Completed(CompletedAgentInvocation::Result(result)) = accepting.finish(true)
+    else {
+        panic!("the accepted result must stand");
+    };
+    assert_eq!(result.value(), &json!(7));
+
+    // Rejected: the held remainder is the correction turn, read as one that arrives in its
+    // own read after `begin_exchange`, and its submission is the next candidate.
+    let mut rejecting = parser(AgentValueKind::Result, 1024);
+    rejecting.push_stdout(&one_read, drop).unwrap();
+    assert_eq!(rejecting.take_completed_result_exchange(), candidate);
+    assert!(rejecting.has_deferred_stdout());
+    rejecting.reject_result_candidate().unwrap();
+    rejecting.begin_exchange().unwrap();
+    rejecting.push_stdout(&[], drop).unwrap();
+    assert_eq!(
+        rejecting.take_completed_result_exchange(),
+        Some(CompletedResultExchange::Candidate(Arc::new(json!(8))))
+    );
+
+    // A stream that ends with bytes still held was cut inside the decision.
+    let mut cut = parser(AgentValueKind::Result, 1024);
+    cut.push_stdout(&one_read, drop).unwrap();
+    assert_eq!(cut.take_completed_result_exchange(), candidate);
+    cut.accept_result(CapturedJson::fixture(Arc::new(json!(7))))
+        .unwrap();
+    assert_eq!(
+        protocol_rejection_value(&cut.finish(true))["detail"]["reason"],
+        "end_of_stream_invariant_invalid"
+    );
+}
+
 /// Sanitized from the stream Claude Code 2.1.310 emits when a backgrounded subagent starts
 /// its own `run_in_background` Bash and closes its turn without awaiting it. The drain
 /// before the wakeup `init` names only the leftover command in the task list. After the
@@ -1805,12 +1890,18 @@ fn empty_notification_turn() -> [Value; 2] {
     ]
 }
 
-// REQ-AGENT-64, REQ-AGENT-35, REQ-AGENT-69
+// REQ-AGENT-64, REQ-AGENT-35, REQ-AGENT-69, REQ-AGENT-76
 #[test]
 fn a_messaged_subagent_resumed_again_in_the_drain_for_its_commands_report_stays_its_work() {
     let values = messaged_subagent_resumed_again_for_its_commands_report_transcript();
-    for kind in [AgentValueKind::Response, AgentValueKind::None] {
-        let (observations, outcome) = replay(&framed(&values), kind, 1024);
+    // The other order is an epilogue once the notified turn has settled the value
+    // (`a_superseded_notifications_empty_turn_after_the_notified_turn_is_an_epilogue`).
+    let empty_turn_last =
+        messaged_subagent_notified_before_its_superseded_notifications_empty_turn_transcript();
+    for (values, kind) in [&values, &empty_turn_last].into_iter().flat_map(|values| {
+        [AgentValueKind::Response, AgentValueKind::None].map(|kind| (values, kind))
+    }) {
+        let (observations, outcome) = replay(&framed(values), kind, 1024);
         match kind {
             AgentValueKind::Response => assert_eq!(completed_response(&outcome), "final"),
             _ => assert!(
@@ -2291,6 +2382,69 @@ fn assert_subagent_resumed_to_deliver_its_commands_report(observations: &[AgentO
         observation,
         AgentObservation::AssistantText { text } if text.as_ref() == "The tests passed"
     )));
+}
+
+// REQ-AGENT-35, REQ-AGENT-64, INV-HARNESS-7
+#[test]
+fn an_abandoned_resume_at_end_of_stream_after_the_accepted_result_is_refused() {
+    // AUTO-90: Buildkite build #3492's `result/background-agent[monitor]/none/settle` ended
+    // after the accepted result with `completedExchanges=2` and one backgrounded subagent
+    // outstanding; its transcript was not retained, so the frames are those of the outliving
+    // command's row up to Claude Code's own resume of the finished subagent, then end of
+    // stream. The resumed run is work the step waits for, so the accepted value does not stand.
+    let transcript = backgrounded_subagent_leaving_its_command_running_transcript();
+    let first_result = position_of(&transcript, |value| value["type"] == "result");
+    let after_first_result = &transcript[first_result + 1..];
+    let wakeup =
+        first_result + 1 + position_of(after_first_result, |value| value["subtype"] == "init");
+    let notified_result =
+        first_result + 1 + position_of(after_first_result, |value| value["type"] == "result");
+    let resume = position_of(&transcript, |value| {
+        value["subtype"] == "task_started" && value["run_id"] == "agent-run-2"
+    });
+    let mut observations = Vec::new();
+    let mut parser = parser(AgentValueKind::Result, 1024);
+    for frames in [
+        &transcript[..=first_result],
+        &transcript[first_result + 1..wakeup],
+        &structured_output_exchange_after(&[]),
+    ] {
+        parser
+            .push_stdout(&framed(frames), |observation| {
+                observations.push(observation)
+            })
+            .unwrap();
+    }
+    assert_eq!(
+        parser.take_completed_result_exchange(),
+        Some(CompletedResultExchange::Candidate(Arc::new(json!(7))))
+    );
+    parser
+        .accept_result(CapturedJson::fixture(Arc::new(json!(7))))
+        .unwrap();
+    parser
+        .push_stdout(
+            &framed(&transcript[notified_result + 1..=resume]),
+            |observation| observations.push(observation),
+        )
+        .unwrap();
+    assert_eq!(
+        subagent_statuses(&observations),
+        ["started", "completed", "resumed"]
+    );
+    let outcome = parser.finish(true);
+    let rejection = protocol_rejection_value(&outcome);
+    assert_eq!(
+        rejection["detail"]["reason"],
+        "end_of_stream_invariant_invalid"
+    );
+    assert_eq!(rejection["detail"]["stage"], "end_of_stream");
+    assert_eq!(rejection["detail"]["state"]["resultAccepted"], true);
+    assert_eq!(rejection["detail"]["state"]["completedExchanges"], 2);
+    assert_eq!(
+        rejection["detail"]["state"]["outstandingBackgroundSubagents"],
+        1
+    );
 }
 
 // REQ-AGENT-64, REQ-AGENT-73, REQ-AGENT-76

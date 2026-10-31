@@ -98,8 +98,9 @@ fn abandoned_preflight_is_removed_on_next_destination_validation() {
     let abandoned = parent.join(name);
     // Dropping the handle simulates process death before preflight cleanup.
     drop(locked);
-    prepare_result_destination(&parent.join("result")).unwrap();
-    assert!(!abandoned.exists());
+    assert_removed_by_validation(&[&abandoned], || {
+        prepare_result_destination(&parent.join("result")).unwrap();
+    });
 
     let private = parent.join("private");
     fs::create_dir(&private).unwrap();
@@ -118,15 +119,15 @@ fn abandoned_preflight_is_removed_on_next_destination_validation() {
     let (source_name, locked) = create_validation_directory(&staging_parent).unwrap();
     let abandoned_source = private.join(source_name);
     drop(locked);
-    prepare_attempt_result_destination(
-        &parent.join("result"),
-        &private,
-        &result_parent,
-        &staging_parent,
-    )
-    .unwrap();
-    assert!(!abandoned_target.exists());
-    assert!(!abandoned_source.exists());
+    assert_removed_by_validation(&[&abandoned_target, &abandoned_source], || {
+        prepare_attempt_result_destination(
+            &parent.join("result"),
+            &private,
+            &result_parent,
+            &staging_parent,
+        )
+        .unwrap();
+    });
 
     // A concurrent publisher's preflight must not be mistaken for a crash.
     let (source_name, live) = create_validation_directory(&staging_parent).unwrap();
@@ -140,14 +141,35 @@ fn abandoned_preflight_is_removed_on_next_destination_validation() {
     .unwrap();
     assert!(abandoned_source.exists());
     drop(live);
-    prepare_attempt_result_destination(
-        &parent.join("result"),
-        &private,
-        &result_parent,
-        &staging_parent,
-    )
-    .unwrap();
-    assert!(!abandoned_source.exists());
+    assert_removed_by_validation(&[&abandoned_source], || {
+        prepare_attempt_result_destination(
+            &parent.join("result"),
+            &private,
+            &result_parent,
+            &staging_parent,
+        )
+        .unwrap();
+    });
+}
+
+/// Validates the destination until every abandoned preflight directory is gone.
+///
+/// Cleanup skips a preflight directory whose lock is still held, since a live publisher
+/// holds its lock through preflight. A dropped lock outlives its handle while another
+/// thread of this process spawns a child: the child shares the open file description
+/// until its exec closes the `CLOEXEC` descriptor. The mechanism removes such a directory
+/// at the next validation, so the test asserts removal by a later validation rather than
+/// the first, which the suite's process-spawning tests make nondeterministic under plain
+/// `cargo test` (one process for every test, unlike nextest).
+fn assert_removed_by_validation(abandoned: &[&Path], mut validate: impl FnMut()) {
+    const ATTEMPTS: usize = 50;
+    for _ in 0..ATTEMPTS {
+        validate();
+        if abandoned.iter().all(|path| !path.exists()) {
+            return;
+        }
+    }
+    panic!("abandoned preflights survived {ATTEMPTS} destination validations: {abandoned:?}");
 }
 
 struct PublicationFixture {

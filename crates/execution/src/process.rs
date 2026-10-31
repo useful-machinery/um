@@ -24,13 +24,32 @@ pub(crate) fn internal_worker_executable() -> io::Result<PathBuf> {
                 io::Error::other("supplied test internal-worker executable unavailable")
             });
         }
-        if cfg!(test) {
-            return Err(io::Error::other(
-                "test internal-worker executable not supplied",
-            ));
-        }
+        #[cfg(test)]
+        return test_build_worker_example(&env::current_exe()?);
     }
     env::current_exe()
+}
+
+/// The execution crate's own unit-test build takes the worker from the `internal-worker`
+/// example beside the test executable, `<profile>/examples/internal-worker` for a test
+/// executable at `<profile>/deps/<crate>-<hash>`, which a plain `cargo test -p um-execution`
+/// builds. A `--all-targets` build compiles the example as a test harness instead, so such a
+/// run builds the ordinary example and names it in `UM_TEST_INTERNAL_WORKER_EXECUTABLE`, as
+/// `cli/scripts/check-suite` does. The test binary itself is never the worker: it would run
+/// the suite in the guard role (INV-TESTING-20).
+#[cfg(test)]
+fn test_build_worker_example(test_executable: &Path) -> io::Result<PathBuf> {
+    let example = test_executable
+        .parent()
+        .and_then(Path::parent)
+        .map(|profile| profile.join("examples").join("internal-worker"));
+    match example {
+        Some(example) if example.is_file() => Ok(example),
+        _ => Err(io::Error::other(
+            "test internal-worker executable not supplied: set \
+             UM_TEST_INTERNAL_WORKER_EXECUTABLE or build the um-execution internal-worker example",
+        )),
+    }
 }
 
 pub struct ManagedProcessGroup {
@@ -309,9 +328,52 @@ mod tests {
     use nix::sys::stat::Mode;
     use nix::unistd::mkfifo;
 
-    use super::{CommandProbeError, CommandRequest, CommandRunner, SystemCommandRunner};
+    use super::{
+        CommandProbeError, CommandRequest, CommandRunner, SystemCommandRunner,
+        test_build_worker_example,
+    };
 
     const FIXTURE_STDOUT_LIMIT: usize = 8 * 1024;
+
+    // INV-TESTING-20
+    #[test]
+    fn test_build_resolves_the_worker_example_beside_the_test_executable() {
+        let target = tempfile::tempdir().unwrap();
+        let profile = target.path().join("debug");
+        std::fs::create_dir_all(profile.join("deps")).unwrap();
+        std::fs::create_dir_all(profile.join("examples")).unwrap();
+        let test_executable = profile.join("deps").join("um_execution-0123abcd");
+        std::fs::write(&test_executable, b"").unwrap();
+        let example = profile.join("examples").join("internal-worker");
+        std::fs::write(&example, b"").unwrap();
+
+        assert_eq!(
+            test_build_worker_example(&test_executable).unwrap(),
+            example
+        );
+    }
+
+    // INV-TESTING-20
+    #[test]
+    fn test_build_without_a_worker_fails_as_a_spawn_refusal() {
+        let target = tempfile::tempdir().unwrap();
+        let profile = target.path().join("debug");
+        std::fs::create_dir_all(profile.join("deps")).unwrap();
+        std::fs::create_dir_all(profile.join("examples")).unwrap();
+        let test_executable = profile.join("deps").join("um_execution-0123abcd");
+        std::fs::write(&test_executable, b"").unwrap();
+        std::fs::create_dir_all(profile.join("examples").join("internal-worker")).unwrap();
+
+        let error = test_build_worker_example(&test_executable).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::Other);
+        assert_eq!(error.raw_os_error(), None);
+        assert_eq!(
+            test_build_worker_example(Path::new("/um_execution-0123abcd"))
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::Other
+        );
+    }
 
     #[cfg(unix)]
     #[test]

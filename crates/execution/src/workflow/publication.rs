@@ -4344,7 +4344,10 @@ fn cleanup_abandoned_preflights(parent: &OwnedFd) -> Result<(), LocalPublication
         };
         if let Ok(directory) = openat(parent, name, directory_open_flags(), Mode::empty()) {
             // The publisher holds a lock through preflight cleanup; only an
-            // abandoned directory can be removed by a competing attempt.
+            // abandoned directory can be removed by a competing attempt. A child
+            // this process spawns meanwhile shares a dropped lock's open file
+            // description until its exec closes it, so an abandoned directory can
+            // survive one validation; the next removes it.
             match flock(&directory, FlockOperation::NonBlockingLockExclusive) {
                 Ok(()) => {}
                 Err(Errno::AGAIN | Errno::ACCESS) => continue,

@@ -4552,9 +4552,14 @@ fn recovery_handler_launch_refusal_keeps_its_cause() {
     clippy::disallowed_methods,
     reason = "real time is allowed only as an anti-hang watchdog, not a behavior assertion"
 )]
-async fn with_watchdog<Output>(future: impl Future<Output = Output>) -> Output {
-    match tokio::time::timeout(TEST_WATCHDOG, future).await {
-        Ok(output) => output,
-        Err(_) => panic!("workflow test watchdog expired"),
+fn with_watchdog<Output>(future: impl Future<Output = Output>) -> impl Future<Output = Output> {
+    // Heap-pinned before the returned future exists, as `test_support::host_scaled_watchdog`
+    // explains, so no wrapper state holds the body.
+    let future = Box::pin(future);
+    async move {
+        match tokio::time::timeout(TEST_WATCHDOG, future).await {
+            Ok(output) => output,
+            Err(_) => panic!("workflow test watchdog expired"),
+        }
     }
 }

@@ -2785,15 +2785,17 @@ impl Drop for DetachedFixtureCleanup {
     }
 }
 
-async fn with_watchdog<Output>(future: impl Future<Output = Output>) -> Output {
-    with_watchdog_duration(TEST_WATCHDOG, future).await
+// Plain functions, not `async fn`: the body reaches `host_scaled_watchdog`'s heap pin before
+// any wrapper state holds it.
+fn with_watchdog<Output>(future: impl Future<Output = Output>) -> impl Future<Output = Output> {
+    with_watchdog_duration(TEST_WATCHDOG, future)
 }
 
-async fn with_watchdog_duration<Output>(
+fn with_watchdog_duration<Output>(
     timeout: Duration,
     future: impl Future<Output = Output>,
-) -> Output {
-    host_scaled_watchdog("PiJsonV1 process fixture", timeout, future).await
+) -> impl Future<Output = Output> {
+    host_scaled_watchdog("PiJsonV1 process fixture", timeout, future)
 }
 
 #[test]

@@ -21,7 +21,8 @@ use super::adapter::{
     NATIVE_TRANSCRIPT_CAPTURE_MISSING_DIAGNOSTIC, native_project_slug, prepare_launch,
 };
 use super::test_support::{
-    FixtureSignal, PendingClock, RecordingObservationSink, admitted_adapter, invocation_identity,
+    FixtureSignal, PendingClock, RecordingObservationSink, admitted_adapter, completed_turns,
+    invocation_identity,
 };
 use super::*;
 use crate::workflow::admission::{CancellationReason, CancellationSource, EnvironmentSnapshot};
@@ -523,6 +524,9 @@ fi
 if [ -s "$CLAUDE_RESULT_SECOND" ]; then
   cat "$CLAUDE_RESULT_SECOND"
 fi
+if [ -s "$CLAUDE_RESULT_SHARED_READ" ]; then
+  cat "$CLAUDE_RESULT_SHARED_READ"
+fi
 if [ "${CLAUDE_RESULT_MODE:-settle}" = exit-after-feedback ]; then
   exit 0
 fi
@@ -533,7 +537,7 @@ case "${CLAUDE_RESULT_MODE:-settle}" in
     printf 'ready\n' > "$CLAUDE_RESULT_SETTLEMENT_READY"
     IFS= read -r released < "$CLAUDE_RESULT_SETTLEMENT_RELEASE"
     ;;
-  post-work) cat "$CLAUDE_RESULT_POST_WORK" ;;
+  post-work | epilogue-in-the-results-read) cat "$CLAUDE_RESULT_POST_WORK" ;;
   epilogue)
     sed '$d' "$CLAUDE_RESULT_POST_WORK"
     printf 'ready\n' > "$CLAUDE_RESULT_SETTLEMENT_READY"
@@ -581,6 +585,10 @@ enum ResultFixtureMode {
     /// candidate; after acceptance the turn its notification announced (an epilogue)
     /// opens, holds until the case releases it, and ends with its `result`.
     Epilogue,
+    /// As `Epilogue`, but the candidate's `result` and the epilogue's `init` are written
+    /// together so one read carries both; the epilogue's remaining frames follow once the
+    /// input has closed.
+    EpilogueInTheResultsRead,
 }
 
 impl ResultFixtureMode {
@@ -593,6 +601,7 @@ impl ResultFixtureMode {
             Self::Hang => "hang",
             Self::BackgroundSubagent => "background-subagent",
             Self::Epilogue => "epilogue",
+            Self::EpilogueInTheResultsRead => "epilogue-in-the-results-read",
         }
     }
 }
@@ -674,7 +683,33 @@ impl ResultProcessFixture {
                 ),
             );
         }
+        let mut shared_read = Vec::new();
+        if matches!(mode, ResultFixtureMode::EpilogueInTheResultsRead) {
+            let mut launch = backgrounded_subagent_launch(RESULT_FIXTURE_SESSION);
+            launch.push(backgrounded_subagent_notification(RESULT_FIXTURE_SESSION));
+            first_values.splice(1..1, launch);
+            let candidate_result = first_values.pop().unwrap();
+            let waiting = ResultExchangeFixture {
+                candidate: None,
+                structured_tool_count: 0,
+                sibling_tool_use: false,
+            };
+            post_work = result_exchange_values(&expected_cwd, 2, &waiting);
+            let epilogue_init = post_work.remove(0);
+            shared_read = vec![candidate_result, epilogue_init];
+            post_work.splice(
+                0..0,
+                fixture_stream_message(
+                    RESULT_FIXTURE_SESSION,
+                    "msg-epilogue",
+                    json!({"type": "text", "text": "noted"}),
+                    "end_turn",
+                ),
+            );
+        }
+        let shared_read_path = controls.join("shared-read.jsonl");
         std::fs::write(&first_path, framed_result_values(&first_values)).unwrap();
+        std::fs::write(&shared_read_path, framed_result_values(&shared_read)).unwrap();
         std::fs::write(&second_path, framed_result_values(&second_values)).unwrap();
         if post_work.is_empty() {
             post_work.push(json!({
@@ -739,6 +774,10 @@ impl ResultProcessFixture {
             (
                 OsString::from("CLAUDE_RESULT_POST_WORK"),
                 post_work_path.into_os_string(),
+            ),
+            (
+                OsString::from("CLAUDE_RESULT_SHARED_READ"),
+                shared_read_path.into_os_string(),
             ),
             (
                 OsString::from("CLAUDE_RESULT_READ_FEEDBACK"),
@@ -1274,13 +1313,14 @@ fn background_subagent_response_process_fixture() {
     assert!(remaining.is_empty());
 }
 
-async fn with_watchdog<Output>(future: impl Future<Output = Output>) -> Output {
+// A plain function, not an `async fn`: the body reaches `host_scaled_watchdog`'s heap pin
+// before any wrapper state holds it.
+fn with_watchdog<Output>(future: impl Future<Output = Output>) -> impl Future<Output = Output> {
     host_scaled_watchdog(
         "ClaudeCodeStreamJsonV1 fixture",
         Duration::from_secs(10),
         future,
     )
-    .await
 }
 
 #[test]
@@ -1962,6 +2002,46 @@ async fn an_announced_epilogue_suspends_the_settlement_grace_and_the_accepted_re
             Some(Duration::from_secs(1)),
             "the grace restarts in full once the epilogue has settled"
         );
+    })
+    .await;
+}
+
+/// 2.1.310 writes a queued notification's turn close behind a `result` (AUTO-63's
+/// experiment saw a `result` and the next turn's `init` in one 8 KiB read). The fake Claude
+/// writes the candidate's `result` and the epilogue's `init` in one write, so one read
+/// carries both: the adapter decides on the candidate before the parser reads the `init`,
+/// which then opens the epilogue.
+// REQ-AGENT-76
+// INV-HARNESS-7
+#[tokio::test]
+async fn an_epilogue_init_in_the_same_read_as_the_accepted_result_is_read_after_acceptance() {
+    with_watchdog(async {
+        let fixture = ResultProcessFixture::new(
+            type_schema("number"),
+            ResultExchangeFixture::standalone(json!({"result": 1})),
+            None,
+            ResultFixtureMode::EpilogueInTheResultsRead,
+        );
+        let observations = fixture.observations.clone();
+        let task = tokio::spawn(run_result_fixture(
+            fixture,
+            PendingClock,
+            InlineValidationWorker,
+        ));
+        let (_, outcome) = task.await.unwrap();
+        let AgentOutcome::Completed(CompletedAgentInvocation::Result(result)) = outcome else {
+            panic!("the accepted result must stand after the epilogue, got {outcome:?}");
+        };
+        assert_eq!(result.value(), &json!(1));
+        let observed = observations.snapshot();
+        assert!(
+            observed.iter().any(|envelope| matches!(
+                envelope.observation(),
+                AgentObservation::AssistantText { text } if text.as_ref() == "noted"
+            )),
+            "the epilogue's text must appear as activity: {observed:?}"
+        );
+        assert_eq!(completed_turns(&observations), 2);
     })
     .await;
 }

@@ -673,8 +673,12 @@ pub(crate) struct ClaudeCodeStreamJsonV1Parser {
     maximum_response_bytes: NonZeroU64,
     limits: ClaudeCodeStreamJsonV1ProtocolLimits,
     frame: Vec<u8>,
-    /// The bytes of a stdout chunk after a `result` that left a decision pending, read before
-    /// the next chunk once the adapter has decided.
+    /// The rest of the stdout chunk that carried a `result` whose exchange awaits the
+    /// adapter's decision (`completed_result_exchange`). Nothing behind that `result` is
+    /// parsed until the adapter has decided, whatever the read carried, so an `init`
+    /// written close behind it is read after `accept_result` or `begin_exchange`, as it
+    /// would be from a read of its own (REQ-AGENT-76, REQ-AGENT-69). The next
+    /// `push_stdout` reads it first (`has_deferred_stdout`).
     deferred_stdout: Vec<u8>,
     expected_session_id: Arc<str>,
     session_id: Option<Arc<str>>,
@@ -957,10 +961,10 @@ impl ClaudeCodeStreamJsonV1Parser {
     }
 
     /// Consumes arbitrary stdout chunks while retaining at most one bounded JSONL frame. A
-    /// `result` that leaves a decision pending ends the read: the rest of the chunk is
-    /// deferred and read first by the next call, which the adapter makes once it has
-    /// decided (`has_deferred_stdout`), so a turn Claude Code begins at once after that
-    /// `result` is read after the decision.
+    /// `result` that completes an exchange for the adapter to decide on ends the read: the
+    /// rest of the chunk is deferred and read first by the next call, which the adapter
+    /// makes once it has decided (`has_deferred_stdout`), so a turn Claude Code begins at
+    /// once after that `result` is read after the decision.
     // Pi and Claude intentionally retain independent native state machines; sharing
     // this byte loop would couple their profile-specific failure transitions.
     pub(crate) fn push_stdout(
@@ -979,7 +983,7 @@ impl ClaudeCodeStreamJsonV1Parser {
 
         for (index, &byte) in bytes.iter().enumerate() {
             if byte == b'\n' {
-                let undecided = self.result_decision_pending;
+                let undecided = self.completed_result_exchange.is_some();
                 let frame = std::mem::take(&mut self.frame);
                 if let Err(failure) = self.parse_frame(&frame) {
                     self.rejected_line = Some(self.retained_rejected_line(&frame));
@@ -991,7 +995,9 @@ impl ClaudeCodeStreamJsonV1Parser {
                 for observation in self.observations.drain(..) {
                     observe(observation);
                 }
-                if !undecided && self.result_decision_pending {
+                if !undecided && self.completed_result_exchange.is_some() {
+                    // The adapter decides this exchange before anything behind its
+                    // `result` is read, whatever the read carried.
                     self.deferred_stdout.extend_from_slice(&bytes[index + 1..]);
                     return Ok(());
                 }
@@ -1012,7 +1018,8 @@ impl ClaudeCodeStreamJsonV1Parser {
         Ok(())
     }
 
-    /// Whether a pending decision ended the last read with bytes of its chunk unread.
+    /// Whether a `result` awaiting the adapter's decision ended the last read with bytes of
+    /// its chunk unread.
     pub(crate) fn has_deferred_stdout(&self) -> bool {
         !self.deferred_stdout.is_empty()
     }

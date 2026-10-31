@@ -457,10 +457,15 @@ fn internal_worker_uses_the_supported_validator_and_bounded_feedback() {
     clippy::disallowed_methods,
     reason = "real time is allowed only as an anti-hang watchdog, not a behavior assertion"
 )]
-async fn with_watchdog<Output>(future: impl Future<Output = Output>) -> Output {
-    match tokio::time::timeout(TEST_WATCHDOG, future).await {
-        Ok(output) => output,
-        Err(_) => panic!("result validation test watchdog expired"),
+fn with_watchdog<Output>(future: impl Future<Output = Output>) -> impl Future<Output = Output> {
+    // Heap-pinned before the returned future exists, as `test_support::host_scaled_watchdog`
+    // explains, so no wrapper state holds the body.
+    let future = Box::pin(future);
+    async move {
+        match tokio::time::timeout(TEST_WATCHDOG, future).await {
+            Ok(output) => output,
+            Err(_) => panic!("result validation test watchdog expired"),
+        }
     }
 }
 

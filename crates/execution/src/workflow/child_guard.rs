@@ -1289,14 +1289,18 @@ mod tests {
         assert!(matches!(result, Err(error) if error.kind() == io::ErrorKind::Interrupted));
     }
 
+    // INV-TESTING-20
     #[tokio::test]
     async fn guarded_child_can_receive_streaming_standard_input() {
-        let supplied_worker = std::env::var_os("UM_TEST_INTERNAL_WORKER_EXECUTABLE")
-            .expect("test worker executable must be supplied by the test runner");
-        assert_eq!(
-            child_guard_worker_executable().unwrap().as_os_str(),
-            supplied_worker
-        );
+        let worker = child_guard_worker_executable().unwrap();
+        match std::env::var_os("UM_TEST_INTERNAL_WORKER_EXECUTABLE") {
+            Some(supplied_worker) => assert_eq!(worker.as_os_str(), supplied_worker),
+            None => assert!(
+                worker.ends_with("examples/internal-worker"),
+                "unsupplied worker must be the example beside the test executable: {worker:?}"
+            ),
+        }
+        assert_ne!(worker, std::env::current_exe().unwrap());
         let arguments = [
             OsString::from("-c"),
             OsString::from("IFS= read -r line; printf 'received:%s\\n' \"$line\""),

@@ -752,16 +752,38 @@ fn captured_requests(path: &Path) -> Vec<Value> {
         .collect()
 }
 
-async fn with_watchdog<Output>(future: impl Future<Output = Output>) -> Output {
-    with_watchdog_limit(future, Duration::from_secs(10)).await
+// The idle-host base of one fake fixture launch and its assertions, which
+// `host_scaled_watchdog` scales by the host's load.
+const FIXTURE_WATCHDOG_CASE: &str = "CodexAppServerV1 fixture";
+const FIXTURE_WATCHDOG_BASE: Duration = Duration::from_secs(10);
+
+// Plain functions, not `async fn`: the body reaches `host_scaled_watchdog`'s heap pin before
+// any wrapper state holds it.
+fn with_watchdog<Output>(future: impl Future<Output = Output>) -> impl Future<Output = Output> {
+    with_watchdog_limit(future, FIXTURE_WATCHDOG_BASE)
 }
 
-async fn with_watchdog_limit<Output>(
+fn with_watchdog_limit<Output>(
     future: impl Future<Output = Output>,
     limit: Duration,
-) -> Output {
-    crate::workflow::test_support::host_scaled_watchdog("CodexAppServerV1 fixture", limit, future)
-        .await
+) -> impl Future<Output = Output> {
+    crate::workflow::test_support::host_scaled_watchdog(FIXTURE_WATCHDOG_CASE, limit, future)
+}
+
+// A launch slows with the tests running beside it while the one-minute load the watchdog
+// scales by lags them, so a test that drives several fixtures in sequence bounds each
+// launch on its own and the expiry names the scenario that hung. The body is heap-pinned
+// before the block that owns the scenario's case name exists, so that block holds a pointer.
+fn with_scenario_watchdog<Output>(
+    scenario: &str,
+    future: impl Future<Output = Output>,
+) -> impl Future<Output = Output> {
+    let case = format!("{FIXTURE_WATCHDOG_CASE} {scenario}");
+    let future = Box::pin(future);
+    async move {
+        crate::workflow::test_support::host_scaled_watchdog(&case, FIXTURE_WATCHDOG_BASE, future)
+            .await
+    }
 }
 
 // The child-guard process has no in-process readiness channel. This bounded OS-boundary
@@ -2396,9 +2418,12 @@ async fn serve_provider_request(
 pub(super) mod normal {
     use super::*;
 
-    async fn assert_fixture_completed_without_value(fixture: ProcessFixture) {
-        let (_, outcome, started) = run_fixture(fixture).await;
-        assert_completed_without_value(outcome, started);
+    async fn assert_fixture_completed_without_value(scenario: &str, fixture: ProcessFixture) {
+        with_scenario_watchdog(scenario, async {
+            let (_, outcome, started) = run_fixture(fixture).await;
+            assert_completed_without_value(outcome, started);
+        })
+        .await;
     }
 
     // INV-HARNESS-3, INV-HARNESS-9
@@ -2588,37 +2613,26 @@ pub(super) mod normal {
 
     #[tokio::test]
     async fn startup_notifications_may_precede_their_responses() {
-        with_watchdog(async {
-            for scenario in [
-                "thread-warning-before-response",
-                "thread-started-before-response",
-                "turn-started-before-response",
-            ] {
-                let fixture = ProcessFixture::new(scenario, AgentValueMode::None, 1024);
-                assert_fixture_completed_without_value(fixture).await;
-            }
-        })
-        .await;
+        for scenario in [
+            "thread-warning-before-response",
+            "thread-started-before-response",
+            "turn-started-before-response",
+        ] {
+            let fixture = ProcessFixture::new(scenario, AgentValueMode::None, 1024);
+            assert_fixture_completed_without_value(scenario, fixture).await;
+        }
     }
 
     #[tokio::test]
     async fn accepted_non_anchor_version_is_retained_through_native_setup() {
-        with_watchdog(async {
-            let fixture = ProcessFixture::with_version(
-                "no-value",
-                AgentValueMode::None,
-                1024,
-                None,
-                "0.147.23",
-            );
-            assert_eq!(
-                fixture.invocation.as_ref().unwrap().adapter().version(),
-                "0.147.23"
-            );
+        let fixture =
+            ProcessFixture::with_version("no-value", AgentValueMode::None, 1024, None, "0.147.23");
+        assert_eq!(
+            fixture.invocation.as_ref().unwrap().adapter().version(),
+            "0.147.23"
+        );
 
-            assert_fixture_completed_without_value(fixture).await;
-        })
-        .await;
+        assert_fixture_completed_without_value("no-value", fixture).await;
     }
 
     #[tokio::test]
@@ -4270,66 +4284,64 @@ pub(super) mod response_authority {
     use super::*;
 
     async fn run_response_fixture(scenario: &str) -> (AgentOutcome, bool) {
-        let (_, outcome, started) = run_response_process(scenario, 5).await;
-        (outcome, started)
+        with_scenario_watchdog(scenario, async {
+            let (_, outcome, started) = run_response_process(scenario, 5).await;
+            (outcome, started)
+        })
+        .await
     }
 
     #[tokio::test]
     async fn only_the_bounded_settled_completed_message_commits() {
-        with_watchdog(async {
-            for scenario in ["absent", "empty", "async-only"] {
-                let (outcome, started) = run_response_fixture(scenario).await;
-                assert!(started);
-                assert_eq!(
-                    outcome,
-                    AgentOutcome::Completed(CompletedAgentInvocation::NoResponse),
-                    "{scenario}"
-                );
-            }
-
-            let (outcome, started) = run_response_fixture("exact-limit").await;
+        for scenario in ["absent", "empty", "async-only"] {
+            let (outcome, started) = run_response_fixture(scenario).await;
             assert!(started);
-            let AgentOutcome::Completed(CompletedAgentInvocation::Response(response)) = outcome
-            else {
-                panic!("exact-limit response must complete");
-            };
-            assert_eq!(response.as_str(), "12345");
+            assert_eq!(
+                outcome,
+                AgentOutcome::Completed(CompletedAgentInvocation::NoResponse),
+                "{scenario}"
+            );
+        }
 
-            let (outcome, started) = run_response_fixture("async-before-final").await;
-            assert!(started);
-            let AgentOutcome::Completed(CompletedAgentInvocation::Response(response)) = outcome
-            else {
-                panic!("the ordinary final response after async delivery must complete");
-            };
-            assert_eq!(response.as_str(), "12345");
+        let (outcome, started) = run_response_fixture("exact-limit").await;
+        assert!(started);
+        let AgentOutcome::Completed(CompletedAgentInvocation::Response(response)) = outcome else {
+            panic!("exact-limit response must complete");
+        };
+        assert_eq!(response.as_str(), "12345");
 
-            for (scenario, expected) in [
-                ("oversized", AgentFailureCause::CapturedValueTooLarge),
-                ("delta-only", AgentFailureCause::HarnessProtocolFailed),
-                (
-                    "failure-after-output",
-                    AgentFailureCause::HarnessFailed {
-                        detail: AgentHarnessFailureDetail::ModelError,
-                    },
-                ),
-                (
-                    "interruption-after-output",
-                    AgentFailureCause::HarnessFailed {
-                        detail: AgentHarnessFailureDetail::ModelAborted,
-                    },
-                ),
-                (
-                    "nonzero-after-output",
-                    AgentFailureCause::HarnessFailed {
-                        detail: AgentHarnessFailureDetail::UnsuccessfulExit,
-                    },
-                ),
-            ] {
-                let (outcome, started) = run_response_fixture(scenario).await;
-                assert_started_failure(scenario, outcome, started, expected);
-            }
-        })
-        .await;
+        let (outcome, started) = run_response_fixture("async-before-final").await;
+        assert!(started);
+        let AgentOutcome::Completed(CompletedAgentInvocation::Response(response)) = outcome else {
+            panic!("the ordinary final response after async delivery must complete");
+        };
+        assert_eq!(response.as_str(), "12345");
+
+        for (scenario, expected) in [
+            ("oversized", AgentFailureCause::CapturedValueTooLarge),
+            ("delta-only", AgentFailureCause::HarnessProtocolFailed),
+            (
+                "failure-after-output",
+                AgentFailureCause::HarnessFailed {
+                    detail: AgentHarnessFailureDetail::ModelError,
+                },
+            ),
+            (
+                "interruption-after-output",
+                AgentFailureCause::HarnessFailed {
+                    detail: AgentHarnessFailureDetail::ModelAborted,
+                },
+            ),
+            (
+                "nonzero-after-output",
+                AgentFailureCause::HarnessFailed {
+                    detail: AgentHarnessFailureDetail::UnsuccessfulExit,
+                },
+            ),
+        ] {
+            let (outcome, started) = run_response_fixture(scenario).await;
+            assert_started_failure(scenario, outcome, started, expected);
+        }
     }
 }
 
@@ -4347,15 +4359,15 @@ pub(super) mod structured_result {
     // REQ-AGENT-32
     #[tokio::test]
     async fn authoritative_validation_accepts_every_json_root_category() {
-        with_watchdog(async {
-            for (scenario, root_type, expected) in [
-                ("result-root-object", "object", json!({"answer": 7})),
-                ("result-root-array", "array", json!([1, 2])),
-                ("result-root-string", "string", json!("value")),
-                ("result-root-number", "number", json!(7)),
-                ("result-root-boolean", "boolean", json!(true)),
-                ("result-root-null", "null", Value::Null),
-            ] {
+        for (scenario, root_type, expected) in [
+            ("result-root-object", "object", json!({"answer": 7})),
+            ("result-root-array", "array", json!([1, 2])),
+            ("result-root-string", "string", json!("value")),
+            ("result-root-number", "number", json!(7)),
+            ("result-root-boolean", "boolean", json!(true)),
+            ("result-root-null", "null", Value::Null),
+        ] {
+            with_scenario_watchdog(scenario, async {
                 let fixture = ProcessFixture::new(
                     scenario,
                     result_mode(json!({
@@ -4371,14 +4383,14 @@ pub(super) mod structured_result {
                     panic!("{scenario} must produce one accepted result");
                 };
                 assert_eq!(result.value(), &expected, "{scenario}");
-            }
-        })
-        .await;
+            })
+            .await;
+        }
     }
 
     #[tokio::test]
     async fn async_delivery_is_excluded_from_structured_result_authority() {
-        with_watchdog(async {
+        with_scenario_watchdog("result-async-before-final", async {
             let fixture = ProcessFixture::new(
                 "result-async-before-final",
                 result_mode(positive_integer_schema()),
@@ -4390,7 +4402,10 @@ pub(super) mod structured_result {
                 panic!("the ordinary structured result after async delivery must complete");
             };
             assert_eq!(result.value(), &json!(7));
+        })
+        .await;
 
+        with_scenario_watchdog("result-async-only", async {
             let fixture = ProcessFixture::new(
                 "result-async-only",
                 result_mode(positive_integer_schema()),
@@ -4505,7 +4520,7 @@ pub(super) mod structured_result {
     // REQ-AGENT-30, REQ-AGENT-31
     #[tokio::test]
     async fn oversized_exhausted_missing_and_failed_corrections_commit_no_candidate() {
-        with_watchdog(async {
+        with_scenario_watchdog("result-oversized", async {
             let oversized = ProcessFixture::new(
                 "result-oversized",
                 result_mode(json!({
@@ -4520,30 +4535,33 @@ pub(super) mod structured_result {
                 panic!("oversized candidate must be corrected: {outcome:?}");
             };
             assert_eq!(result.value(), &json!("ok"));
+        })
+        .await;
 
-            for (scenario, expected) in [
-                ("result-exhausted", AgentFailureCause::MissingResult),
-                ("result-missing", AgentFailureCause::MissingResult),
-                (
-                    "result-correction-failed",
-                    AgentFailureCause::HarnessFailed {
-                        detail: AgentHarnessFailureDetail::ModelError,
-                    },
-                ),
-                (
-                    "result-correction-interrupted",
-                    AgentFailureCause::HarnessFailed {
-                        detail: AgentHarnessFailureDetail::ModelAborted,
-                    },
-                ),
-            ] {
+        for (scenario, expected) in [
+            ("result-exhausted", AgentFailureCause::MissingResult),
+            ("result-missing", AgentFailureCause::MissingResult),
+            (
+                "result-correction-failed",
+                AgentFailureCause::HarnessFailed {
+                    detail: AgentHarnessFailureDetail::ModelError,
+                },
+            ),
+            (
+                "result-correction-interrupted",
+                AgentFailureCause::HarnessFailed {
+                    detail: AgentHarnessFailureDetail::ModelAborted,
+                },
+            ),
+        ] {
+            with_scenario_watchdog(scenario, async {
                 let fixture =
                     ProcessFixture::new(scenario, result_mode(positive_integer_schema()), 1024);
                 let (_, outcome, started) = run_fixture(fixture).await;
                 assert_started_failure(scenario, outcome, started, expected);
-            }
-        })
-        .await;
+            })
+            .await;
+        }
     }
 }
 
@@ -4570,7 +4588,7 @@ pub(super) mod start_failure {
     // INV-HARNESS-5
     #[tokio::test]
     async fn every_launch_and_setup_stage_is_typed_and_quiescent() {
-        with_watchdog(async {
+        with_scenario_watchdog("launch-failure", async {
             let launch = ProcessFixture::new("launch-failure", AgentValueMode::None, 1024);
             let (_, outcome, started) = run_fixture(launch).await;
             assert!(!started);
@@ -4584,44 +4602,47 @@ pub(super) mod start_failure {
                     .into(),
                 )
             );
+        })
+        .await;
 
-            for (scenario, stage, message) in [
-                (
-                    "initialize-rejected",
-                    AgentHarnessSetupStage::Initialization,
-                    Some("rejected"),
-                ),
-                (
-                    "initialize-eof",
-                    AgentHarnessSetupStage::Initialization,
-                    None,
-                ),
-                (
-                    "config-read-rejected",
-                    AgentHarnessSetupStage::EffectiveConfiguration,
-                    Some("config failed"),
-                ),
-                (
-                    "thread-start-rejected",
-                    AgentHarnessSetupStage::ThreadStart,
-                    Some("thread failed"),
-                ),
-                (
-                    "turn-start-rejected",
-                    AgentHarnessSetupStage::TurnStart,
-                    Some("turn failed"),
-                ),
-                (
-                    "premature-turn-started",
-                    AgentHarnessSetupStage::TurnStart,
-                    None,
-                ),
-                (
-                    "mismatched-turn-started",
-                    AgentHarnessSetupStage::StartAcknowledgement,
-                    None,
-                ),
-            ] {
+        for (scenario, stage, message) in [
+            (
+                "initialize-rejected",
+                AgentHarnessSetupStage::Initialization,
+                Some("rejected"),
+            ),
+            (
+                "initialize-eof",
+                AgentHarnessSetupStage::Initialization,
+                None,
+            ),
+            (
+                "config-read-rejected",
+                AgentHarnessSetupStage::EffectiveConfiguration,
+                Some("config failed"),
+            ),
+            (
+                "thread-start-rejected",
+                AgentHarnessSetupStage::ThreadStart,
+                Some("thread failed"),
+            ),
+            (
+                "turn-start-rejected",
+                AgentHarnessSetupStage::TurnStart,
+                Some("turn failed"),
+            ),
+            (
+                "premature-turn-started",
+                AgentHarnessSetupStage::TurnStart,
+                None,
+            ),
+            (
+                "mismatched-turn-started",
+                AgentHarnessSetupStage::StartAcknowledgement,
+                None,
+            ),
+        ] {
+            with_scenario_watchdog(scenario, async {
                 let fixture = ProcessFixture::new(scenario, AgentValueMode::None, 1024);
                 let (fixture, outcome, started) = run_fixture(fixture).await;
                 assert!(!started, "{scenario}");
@@ -4650,9 +4671,9 @@ pub(super) mod start_failure {
                 }
                 assert!(fixture.protocol_rejection().is_file());
                 assert_no_native_rollout(&fixture);
-            }
-        })
-        .await;
+            })
+            .await;
+        }
     }
 }
 
@@ -4663,14 +4684,14 @@ pub(super) mod unattended_requests {
     // INV-HARNESS-6
     #[tokio::test]
     async fn known_requests_receive_only_the_fixed_unattended_response() {
-        with_watchdog(async {
-            for scenario in [
-                "request-file-approval",
-                "request-permissions",
-                "request-user-input",
-                "request-user-input-async",
-                "request-mcp-elicitation",
-            ] {
+        for scenario in [
+            "request-file-approval",
+            "request-permissions",
+            "request-user-input",
+            "request-user-input-async",
+            "request-mcp-elicitation",
+        ] {
+            with_scenario_watchdog(scenario, async {
                 let fixture = ProcessFixture::new(scenario, AgentValueMode::None, 1024);
                 let requests = fixture.requests.clone();
                 let (fixture, outcome, started) = run_fixture(fixture).await;
@@ -4697,9 +4718,9 @@ pub(super) mod unattended_requests {
                 ] {
                     assert!(!serialized.contains(granted), "{scenario}: {serialized}");
                 }
-            }
-        })
-        .await;
+            })
+            .await;
+        }
     }
 
     // REQ-AGENT-25, REQ-AGENT-38
@@ -4855,12 +4876,12 @@ pub(super) mod adversarial_lifecycle {
 
     #[tokio::test]
     async fn malformed_output_after_a_candidate_never_commits() {
-        with_watchdog(async {
-            for (scenario, reason) in [
-                ("malformed-after-output", "frame_decode_failed"),
-                ("invalid-utf8-after-output", "frame_decode_failed"),
-                ("truncated-after-output", "partial_frame_at_end_of_stream"),
-            ] {
+        for (scenario, reason) in [
+            ("malformed-after-output", "frame_decode_failed"),
+            ("invalid-utf8-after-output", "frame_decode_failed"),
+            ("truncated-after-output", "partial_frame_at_end_of_stream"),
+        ] {
+            with_scenario_watchdog(scenario, async {
                 let (fixture, outcome, started) = run_response_process(scenario, 1024).await;
                 assert!(started, "{scenario}: {outcome:?}");
                 assert_failure_cause(outcome, AgentFailureCause::HarnessProtocolFailed, scenario);
@@ -4870,9 +4891,9 @@ pub(super) mod adversarial_lifecycle {
                     serde_json::from_slice(&std::fs::read(fixture.protocol_rejection()).unwrap())
                         .unwrap();
                 assert_eq!(rejection["detail"]["reason"], reason, "{scenario}");
-            }
-        })
-        .await;
+            })
+            .await;
+        }
     }
 
     // REQ-AGENT-24
@@ -4979,70 +5000,71 @@ pub(super) mod cancellation {
     }
 
     async fn assert_prestart_cancellation(scenario: &str, expected_requests: usize) {
-        let fixture = ProcessFixture::new(scenario, AgentValueMode::None, 1024);
-        let mut running = RunningCancellationFixture::start(fixture);
-        wait_for_fixture_file(&running.fixture.ready).await;
-        running.cancel();
-        let start = running.start.take().unwrap();
-        let (fixture, outcome) = running.finish().await;
-        assert!(start.receive().await.is_err());
-        assert_user_cancelled(outcome);
-        assert_eq!(
-            captured_requests(&fixture.requests).len(),
-            expected_requests
-        );
-        assert_fixture_quiescent(&fixture);
+        with_scenario_watchdog(scenario, async {
+            let fixture = ProcessFixture::new(scenario, AgentValueMode::None, 1024);
+            let mut running = RunningCancellationFixture::start(fixture);
+            wait_for_fixture_file(&running.fixture.ready).await;
+            running.cancel();
+            let start = running.start.take().unwrap();
+            let (fixture, outcome) = running.finish().await;
+            assert!(start.receive().await.is_err());
+            assert_user_cancelled(outcome);
+            assert_eq!(
+                captured_requests(&fixture.requests).len(),
+                expected_requests
+            );
+            assert_fixture_quiescent(&fixture);
+        })
+        .await;
+    }
+
+    // One started turn cancelled at the fixture's ready file, bounded as one launch.
+    async fn cancel_active_turn(
+        scenario: &str,
+        value_mode: AgentValueMode,
+    ) -> (ProcessFixture, AgentOutcome) {
+        with_scenario_watchdog(scenario, async {
+            let fixture = ProcessFixture::new(scenario, value_mode, 1024);
+            let mut running = RunningCancellationFixture::start(fixture);
+            running.await_started().await;
+            wait_for_fixture_file(&running.fixture.ready).await;
+            running.cancel();
+            running.finish().await
+        })
+        .await
     }
 
     async fn assert_active_cancellation_discards_response(scenario: &str) {
-        let fixture = ProcessFixture::new(scenario, response_mode(), 1024);
-        let mut running = RunningCancellationFixture::start(fixture);
-        running.await_started().await;
-        wait_for_fixture_file(&running.fixture.ready).await;
-        running.cancel();
-        let (fixture, outcome) = running.finish().await;
+        let (fixture, outcome) = cancel_active_turn(scenario, response_mode()).await;
         assert_cancelled_without_native_rollout(&fixture, outcome);
     }
 
     #[tokio::test]
     async fn pre_start_and_active_turn_cancellation_use_the_native_boundary() {
-        with_watchdog(async {
-            assert_prestart_cancellation("cancel-before-initialize", 1).await;
-            assert_prestart_cancellation("cancel-during-thread-start", 4).await;
+        assert_prestart_cancellation("cancel-before-initialize", 1).await;
+        assert_prestart_cancellation("cancel-during-thread-start", 4).await;
 
-            let fixture = ProcessFixture::new("cancellation-blocked", AgentValueMode::None, 1024);
-            let mut running = RunningCancellationFixture::start(fixture);
-            running.await_started().await;
-            wait_for_fixture_file(&running.fixture.ready).await;
-            running.cancel();
-            let (fixture, outcome) = running.finish().await;
-            assert_eq!(
-                captured_requests(&fixture.requests).last().unwrap()["method"],
-                "turn/interrupt",
-            );
-            assert_cancelled_without_native_rollout(&fixture, outcome);
+        let (fixture, outcome) =
+            cancel_active_turn("cancellation-blocked", AgentValueMode::None).await;
+        assert_eq!(
+            captured_requests(&fixture.requests).last().unwrap()["method"],
+            "turn/interrupt",
+        );
+        assert_cancelled_without_native_rollout(&fixture, outcome);
 
-            assert_active_cancellation_discards_response("cancellation-interrupted-with-error")
-                .await;
-            assert_active_cancellation_discards_response("cancellation-after-async").await;
+        assert_active_cancellation_discards_response("cancellation-interrupted-with-error").await;
+        assert_active_cancellation_discards_response("cancellation-after-async").await;
 
-            let fixture =
-                ProcessFixture::new("cancellation-pending-request", AgentValueMode::None, 1024);
-            let mut running = RunningCancellationFixture::start(fixture);
-            running.await_started().await;
-            wait_for_fixture_file(&running.fixture.ready).await;
-            running.cancel();
-            let (fixture, outcome) = running.finish().await;
-            let requests = captured_requests(&fixture.requests);
-            assert_eq!(requests.last().unwrap()["method"], "turn/interrupt");
-            if requests.len() == 7 {
-                assert_eq!(requests[5]["result"], json!({"decision": "decline"}));
-            } else {
-                assert_eq!(requests.len(), 6, "{requests:?}");
-            }
-            assert_cancelled_without_native_rollout(&fixture, outcome);
-        })
-        .await;
+        let (fixture, outcome) =
+            cancel_active_turn("cancellation-pending-request", AgentValueMode::None).await;
+        let requests = captured_requests(&fixture.requests);
+        assert_eq!(requests.last().unwrap()["method"], "turn/interrupt");
+        if requests.len() == 7 {
+            assert_eq!(requests[5]["result"], json!({"decision": "decline"}));
+        } else {
+            assert_eq!(requests.len(), 6, "{requests:?}");
+        }
+        assert_cancelled_without_native_rollout(&fixture, outcome);
     }
 
     #[tokio::test]
@@ -5110,9 +5132,9 @@ pub(super) mod cancellation {
     // INV-HARNESS-8
     #[tokio::test]
     async fn cancellation_discards_partial_output_and_force_cleans_stubborn_descendants() {
-        with_watchdog(async {
-            assert_active_cancellation_discards_response("cancellation-after-output").await;
+        assert_active_cancellation_discards_response("cancellation-after-output").await;
 
+        with_scenario_watchdog("cancellation-stubborn", async {
             let fixture = ProcessFixture::new("cancellation-stubborn", AgentValueMode::None, 1024);
             let mut running = RunningCancellationFixture::start(fixture);
             running.await_started().await;

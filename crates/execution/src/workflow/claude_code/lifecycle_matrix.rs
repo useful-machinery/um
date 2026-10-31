@@ -12,8 +12,13 @@
 //!   contains one of them run.
 //! - `UM_CLAUDE_CODE_CONFORMANCE_SKIP_SLOW_CELLS=1`: the slow tier (any `ScheduleWakeup`,
 //!   a subagent's two-minute promotion) prints `skipped` instead of running.
+//!
+//! A failed cell's native transcript, observations and rejection are retained under
+//! `UM_CLAUDE_CODE_LIFECYCLE_RETAIN_DIR` when that variable is set, which the qualification
+//! script does so that a CI job can upload them, otherwise under the temporary directory.
 
 use std::collections::VecDeque;
+use std::ffi::OsStr;
 use std::io::Write as _;
 use std::os::unix::fs::OpenOptionsExt as _;
 use std::panic::AssertUnwindSafe;
@@ -52,6 +57,7 @@ use crate::workflow::process_group::process_group_is_quiescent;
 
 const CELL_FILTER: &str = "UM_CLAUDE_CODE_LIFECYCLE_CELLS";
 const SKIP_SLOW_CELLS: &str = "UM_CLAUDE_CODE_CONFORMANCE_SKIP_SLOW_CELLS";
+const RETAIN_DIRECTORY: &str = "UM_CLAUDE_CODE_LIFECYCLE_RETAIN_DIR";
 /// Claude Code's foreground-to-background promotion timeout. 2.1.310 reads it for the main
 /// agent only and floors it at 2000 ms, so only a main-thread promotion is fast.
 const PROMOTION_TIMEOUT: (&str, &str) = ("CLAUDE_CODE_AUTO_BACKGROUND_TIMEOUT_MS", "2000");
@@ -106,6 +112,11 @@ impl Mode {
 pub(super) enum Release {
     InExchange,
     InDrain,
+    /// After the main thread's answer: the subagent completes with its task still running,
+    /// the notified turn settles the value, and the driver releases the task once the value
+    /// has settled, in Claude Code's wind-down, where the task's end has the binary resume the
+    /// finished subagent to deliver it or exit first (AUTO-90).
+    AfterTheAnswer,
 }
 
 /// What the subagent's own turn does.
@@ -120,12 +131,15 @@ pub(super) enum SubagentWork {
     PromotedBash,
     /// A command run under 2.1.310's deferred `Monitor` tool, still running when the
     /// subagent closes its turn; it prints nothing before its release, so the monitor's
-    /// only notification is its end.
-    Monitor,
+    /// only notification is its end. Released in the drain or after the answer, never in
+    /// the exchange.
+    Monitor {
+        released: Release,
+    },
 }
 
 impl SubagentWork {
-    pub(super) const ALL: [Self; 5] = [
+    pub(super) const ALL: [Self; 7] = [
         Self::ForegroundBash,
         Self::BackgroundBash {
             released: Release::InExchange,
@@ -134,7 +148,15 @@ impl SubagentWork {
             released: Release::InDrain,
         },
         Self::PromotedBash,
-        Self::Monitor,
+        Self::Monitor {
+            released: Release::InDrain,
+        },
+        Self::BackgroundBash {
+            released: Release::AfterTheAnswer,
+        },
+        Self::Monitor {
+            released: Release::AfterTheAnswer,
+        },
     ];
 
     const fn slug(self) -> &'static str {
@@ -146,9 +168,30 @@ impl SubagentWork {
             Self::BackgroundBash {
                 released: Release::InDrain,
             } => "background-bash-in-drain",
+            Self::BackgroundBash {
+                released: Release::AfterTheAnswer,
+            } => "background-bash-after-the-answer",
             Self::PromotedBash => "promoted-bash",
-            Self::Monitor => "monitor",
+            Self::Monitor {
+                released: Release::InDrain | Release::InExchange,
+            } => "monitor",
+            Self::Monitor {
+                released: Release::AfterTheAnswer,
+            } => "monitor-after-the-answer",
         }
+    }
+
+    /// Whether the subagent's own task is released after the main thread's answer, once the
+    /// value has settled (AUTO-90).
+    const fn released_after_the_answer(self) -> bool {
+        matches!(
+            self,
+            Self::BackgroundBash {
+                released: Release::AfterTheAnswer,
+            } | Self::Monitor {
+                released: Release::AfterTheAnswer,
+            }
+        )
     }
 }
 
@@ -182,9 +225,12 @@ impl Work {
             Self::BackgroundBash,
             Self::Monitor,
         ];
+        // A foreground subagent's leftover task is stopped at its completion, so a release
+        // after the answer has nothing to release there.
         work.extend(
             SubagentWork::ALL
                 .into_iter()
+                .filter(|subagent| !subagent.released_after_the_answer())
                 .map(|subagent| Self::ForegroundAgent { subagent }),
         );
         work.extend(
@@ -629,9 +675,25 @@ impl LifecycleCell {
             Work::BackgroundAgent {
                 subagent: SubagentWork::BackgroundBash {
                     released: Release::InDrain,
-                } | SubagentWork::Monitor,
+                } | SubagentWork::Monitor {
+                    released: Release::InDrain,
+                },
             }
         )
+    }
+
+    /// A backgrounded subagent whose own backgrounded command or monitor is released after
+    /// the answer: the subagent completes with the task still running, the notified turn
+    /// settles the value, and the task's end reaches Claude Code in its wind-down, with stdin
+    /// closed. The binary decides whether it exits first or resumes the finished subagent to
+    /// deliver the end and opens an epilogue (REQ-AGENT-76); the driver notes the side. A
+    /// resume it announces and abandons at end of stream is AUTO-90's shape, which the
+    /// adapter rejects and the cell fails on, retaining the transcript.
+    const fn released_after_the_answer(&self) -> bool {
+        match self.work {
+            Work::BackgroundAgent { subagent } => subagent.released_after_the_answer(),
+            _ => false,
+        }
     }
 }
 
@@ -642,7 +704,7 @@ pub(super) struct PruneRule {
     pub(super) forbids: fn(&LifecycleCell) -> bool,
 }
 
-pub(super) const PRUNE_RULES: [PruneRule; 10] = [
+pub(super) const PRUNE_RULES: [PruneRule; 11] = [
     PruneRule {
         name: "followup-without-leftover-work",
         reason: "a followup acts on a backgrounded command or subagent the first turn left",
@@ -696,7 +758,7 @@ pub(super) const PRUNE_RULES: [PruneRule; 10] = [
         reason: "a monitoring subagent is paired with the plainest companions: no followup, \
                  or `TaskStop` on the subagent that runs the monitor",
         forbids: |cell| {
-            cell.work.subagent() == Some(SubagentWork::Monitor)
+            matches!(cell.work.subagent(), Some(SubagentWork::Monitor { .. }))
                 && !matches!(cell.followup, Followup::None | Followup::TaskStop)
         },
     },
@@ -719,6 +781,16 @@ pub(super) const PRUNE_RULES: [PruneRule; 10] = [
                     cell.followup,
                     Followup::Resume | Followup::TaskStop | Followup::ScheduleWakeup
                 )
+        },
+    },
+    PruneRule {
+        name: "release-after-the-answer-companions",
+        reason: "a subagent's task released after the answer is driven alone: nothing acts on \
+                 it before the answer, and a cancellation before the answer is the in-drain \
+                 cell's",
+        forbids: |cell| {
+            cell.released_after_the_answer()
+                && (cell.followup != Followup::None || cell.ending != Ending::Settle)
         },
     },
 ];
@@ -815,10 +887,12 @@ impl BlockedCommand {
         Self { signal, blocker }
     }
 
-    /// The shell command; `printf` and `read` are builtins, so it needs no coreutils.
+    /// The shell command; `printf` and `read` are builtins, so it needs no coreutils. The
+    /// blocker is opened for reading and writing, which does not wait for a writer, before
+    /// `ready` is reported, so a `release` after `started` always finds the command's reader.
     fn script(&self) -> String {
         format!(
-            "printf 'ready %s\\n' \"$$\" > '{signal}'; IFS= read -r done < '{blocker}'; printf 'finished\\n' > '{signal}'; printf 'command finished\\n'",
+            "{{ printf 'ready %s\\n' \"$$\" > '{signal}'; IFS= read -r done; }} <> '{blocker}'; printf 'finished\\n' > '{signal}'; printf 'command finished\\n'",
             signal = self.signal.path().display(),
             blocker = self.blocker.display(),
         )
@@ -1565,6 +1639,7 @@ impl Session {
             return Handoff {
                 request,
                 blocked: vec![command],
+                released_after_the_answer: None,
             };
         }
         release_second(request, "stopping the work", "TaskStop", input);
@@ -1608,6 +1683,32 @@ impl Session {
             "the harness stopped the work's command before its release"
         );
         Handoff::turn(self.next_main_request().await)
+    }
+
+    /// Releases the subagent's own task once the value has settled, the adapter's
+    /// `HarnessCompleted` (acceptance in Result mode, the settling `result` otherwise), so
+    /// that the task's end reaches Claude Code in its wind-down with stdin closed (AUTO-90).
+    async fn release_once_settled(&mut self, command: &BlockedCommand) {
+        let observations = self.observations.clone();
+        let settled = observations.wait_for(|observation| {
+            matches!(
+                observation,
+                AgentObservation::Lifecycle {
+                    milestone: AgentLifecycleMilestone::HarnessCompleted,
+                }
+            )
+        });
+        tokio::select! {
+            () = settled => {}
+            outcome = &mut self.terminal => panic!(
+                "the invocation ended before the value settled: {}",
+                describe(&outcome.unwrap())
+            ),
+        }
+        assert!(
+            command.release().await,
+            "the harness stopped the subagent's task before the value settled"
+        );
     }
 
     /// Answers with the mode's final value, which a `Settle` cell submits only on the turn
@@ -1850,7 +1951,11 @@ async fn drive(
         nags_refused: 0,
         deferred_main_request: None,
     };
-    let Handoff { request, blocked } = drive_work(&mut session, cell, &root).await;
+    let Handoff {
+        request,
+        blocked,
+        released_after_the_answer,
+    } = drive_work(&mut session, cell, &root).await;
     assert_eq!(
         request.is_some(),
         cell.ending != Ending::CancelInDrain && session.ended.is_none(),
@@ -1893,6 +1998,9 @@ async fn drive(
                 let turns = session.completed_turns();
                 session.settle(request);
                 session.close_its_held_turn_after(turns).await;
+                if let Some(command) = &released_after_the_answer {
+                    session.release_once_settled(command).await;
+                }
                 session.outcome().await
             }
             None => session.ended.take().expect("the invocation ended"),
@@ -1936,6 +2044,27 @@ async fn drive(
             "the stopped subagent's thread did not report before the turn's result".into()
         });
     }
+    if cell.released_after_the_answer() {
+        let statuses = backgrounded_subagent_statuses(&session.observations);
+        let resumed = statuses
+            .iter()
+            .filter(|status| *status == "resumed")
+            .count();
+        let completed = statuses
+            .iter()
+            .filter(|status| *status == "completed")
+            .count();
+        facts.notes.push(match (resumed, completed) {
+            (0, _) => "Claude Code exited before the task's end it released reached it".into(),
+            (1, 2) => "Claude Code resumed the subagent for the task's end after the value \
+                       settled and the resumed run completed"
+                .into(),
+            _ => format!(
+                "Claude Code resumed the subagent for the task's end after the value settled; \
+                 its statuses were {statuses:?}"
+            ),
+        });
+    }
     if cell.queues_two_notifications()
         && let Some(followed) = empty_turn_followed_the_notified_turn(&session.observations)
     {
@@ -1959,6 +2088,9 @@ struct Handoff {
     /// end: by the cancellation, by the `TaskStop` call, or, for a foreground subagent's own
     /// backgrounded command, at the subagent's completion.
     blocked: Vec<BlockedCommand>,
+    /// A backgrounded subagent's own task, still blocked, that `drive` releases once the
+    /// answer has settled the value (`Release::AfterTheAnswer`).
+    released_after_the_answer: Option<BlockedCommand>,
 }
 
 impl Handoff {
@@ -1966,6 +2098,7 @@ impl Handoff {
         Self {
             request: Some(request),
             blocked: Vec::new(),
+            released_after_the_answer: None,
         }
     }
 
@@ -1973,6 +2106,7 @@ impl Handoff {
         Self {
             request,
             blocked: vec![blocked],
+            released_after_the_answer: None,
         }
     }
 }
@@ -2166,13 +2300,21 @@ async fn drive_foreground_agent(
             Handoff::turn(session.next_main_request().await)
         }
         SubagentWork::BackgroundBash {
+            released: Release::AfterTheAnswer,
+        }
+        | SubagentWork::Monitor {
+            released: Release::InExchange | Release::AfterTheAnswer,
+        } => panic!("the generator keeps {subagent:?} from a foreground subagent"),
+        SubagentWork::BackgroundBash {
             released: Release::InDrain,
         }
-        | SubagentWork::Monitor => {
+        | SubagentWork::Monitor {
+            released: Release::InDrain,
+        } => {
             // The subagent holds its turn until its own command or monitor is running, then
             // closes it with the command still blocked, and the main thread continues from the
             // Agent call's result. 2.1.310 stops the command when the subagent completes.
-            let calls = if subagent == SubagentWork::Monitor {
+            let calls = if matches!(subagent, SubagentWork::Monitor { .. }) {
                 monitor_calls(&command).to_vec()
             } else {
                 vec![(
@@ -2258,7 +2400,7 @@ async fn drive_background_agent(
         // As a command released in the drain: the subagent closes its turn with its monitor
         // still running once the main thread's first turn has ended, or holds it through that
         // turn when the cell cancels in the drain.
-        SubagentWork::Monitor => {
+        SubagentWork::Monitor { .. } => {
             SubagentThread::new(BACKGROUND_SUBAGENT_PROMPT, monitor_calls(&command))
                 .awaiting_its_notification()
         }
@@ -2294,7 +2436,10 @@ async fn drive_background_agent(
     }
     match (subagent, ending) {
         (SubagentWork::ForegroundBash, _)
-        | (SubagentWork::BackgroundBash { .. } | SubagentWork::Monitor, Ending::CancelInDrain) => {
+        | (
+            SubagentWork::BackgroundBash { .. } | SubagentWork::Monitor { .. },
+            Ending::CancelInDrain,
+        ) => {
             main_thread.release_text(WAITING);
             session.end_the_turn_on(command, ending).await
         }
@@ -2310,7 +2455,9 @@ async fn drive_background_agent(
             SubagentWork::BackgroundBash {
                 released: Release::InDrain,
             }
-            | SubagentWork::Monitor,
+            | SubagentWork::Monitor {
+                released: Release::InDrain,
+            },
             Ending::CancelInExchange,
         ) => {
             session.close_the_subagents_turn();
@@ -2320,12 +2467,41 @@ async fn drive_background_agent(
             SubagentWork::BackgroundBash {
                 released: Release::InDrain,
             }
-            | SubagentWork::Monitor,
+            | SubagentWork::Monitor {
+                released: Release::InDrain,
+            },
             Ending::Settle,
         ) => {
             main_thread.release_text(WAITING);
             release_after_the_subagent(session, command).await
         }
+        (
+            SubagentWork::BackgroundBash {
+                released: Release::AfterTheAnswer,
+            }
+            | SubagentWork::Monitor {
+                released: Release::AfterTheAnswer,
+            },
+            Ending::Settle,
+        ) => {
+            main_thread.release_text(WAITING);
+            hand_back_before_the_release(session, command).await
+        }
+        (
+            SubagentWork::BackgroundBash {
+                released: Release::AfterTheAnswer,
+            }
+            | SubagentWork::Monitor {
+                released: Release::InExchange | Release::AfterTheAnswer,
+            },
+            Ending::CancelInExchange,
+        )
+        | (
+            SubagentWork::Monitor {
+                released: Release::InExchange,
+            },
+            Ending::Settle,
+        ) => panic!("the generator keeps {subagent:?} from {ending:?}"),
         (SubagentWork::PromotedBash, _) => {
             main_thread.release_text(WAITING);
             session.wait_out_turn(1).await;
@@ -2389,11 +2565,12 @@ async fn stop_the_subagent(
 }
 
 /// The backgrounded subagent closes its turn once the main thread's first turn has ended,
-/// leaving its own backgrounded `command` blocked, so the subagent's completion alone
-/// pauses the drain. The command is released after that completion, once the notified
-/// turn has begun, so it outlives the subagent; the notified turn's request is handed back
-/// once the command has finished.
-async fn release_after_the_subagent(session: &mut Session, command: BlockedCommand) -> Handoff {
+/// leaving its own task blocked, and its completion alone wakes the notified turn, which is
+/// returned with the task still blocked.
+async fn notified_turn_with_the_task_blocked(
+    session: &mut Session,
+    command: &BlockedCommand,
+) -> ControlledProviderRequest {
     session.wait_out_turn(1).await;
     session.close_the_subagents_turn();
     let Some(notified) = session.next_turn_or_end().await else {
@@ -2405,12 +2582,35 @@ async fn release_after_the_subagent(session: &mut Session, command: BlockedComma
             describe(session.ended.as_ref().expect("the invocation ended"))
         );
     };
+    notified
+}
+
+/// The backgrounded subagent closes its turn once the main thread's first turn has ended,
+/// leaving its own backgrounded `command` blocked, so the subagent's completion alone
+/// pauses the drain. The command is released after that completion, once the notified
+/// turn has begun, so it outlives the subagent; the notified turn's request is handed back
+/// once the command has finished.
+async fn release_after_the_subagent(session: &mut Session, command: BlockedCommand) -> Handoff {
+    let notified = notified_turn_with_the_task_blocked(session, &command).await;
     assert!(
         command.release().await,
         "the harness stopped the subagent's command at the subagent's completion"
     );
     command.finished().await;
     Handoff::turn(notified)
+}
+
+/// The backgrounded subagent closes its turn once the main thread's first turn has ended,
+/// leaving its own task blocked, and its completion alone wakes the notified turn, which is
+/// handed back with the task still running: `drive` answers it, and releases the task once the
+/// value has settled, in Claude Code's wind-down (`Release::AfterTheAnswer`, AUTO-90).
+async fn hand_back_before_the_release(session: &mut Session, command: BlockedCommand) -> Handoff {
+    let notified = notified_turn_with_the_task_blocked(session, &command).await;
+    Handoff {
+        request: Some(notified),
+        blocked: Vec::new(),
+        released_after_the_answer: Some(command),
+    }
 }
 
 /// The id of the background command whose launch the request's newest `tool_result`
@@ -2678,7 +2878,14 @@ fn verify(
             expected.extend(["resumed", "completed"]);
         }
         let statuses = backgrounded_subagent_statuses(observations);
-        if statuses != expected {
+        // A task released after the answer ends in Claude Code's wind-down: the binary exits
+        // before the end reaches it, or resumes the finished subagent to deliver it and the
+        // resumed run completes (REQ-AGENT-76); the driver notes the side.
+        let mut resumed_in_the_wind_down = expected.clone();
+        resumed_in_the_wind_down.extend(["resumed", "completed"]);
+        let accepted = statuses == expected
+            || (cell.released_after_the_answer() && statuses == resumed_in_the_wind_down);
+        if !accepted {
             return Err(format!(
                 "backgrounded subagent statuses {statuses:?}, expected {expected:?}"
             ));
@@ -2771,8 +2978,7 @@ fn retain_failure(
     outcome: Option<&AgentOutcome>,
     reason: &str,
 ) -> PathBuf {
-    let directory = std::env::temp_dir()
-        .join("um-claude-code-lifecycle-matrix")
+    let directory = retention_root(std::env::var_os(RETAIN_DIRECTORY).as_deref())
         .join(cell.name().replace(['/', '[', ']'], "_"));
     std::fs::create_dir_all(&directory).unwrap();
     std::fs::write(directory.join("reason.txt"), reason).unwrap();
@@ -2798,6 +3004,17 @@ fn retain_failure(
         .unwrap();
     }
     directory
+}
+
+/// Where failed cells are retained: the directory `UM_CLAUDE_CODE_LIFECYCLE_RETAIN_DIR` names
+/// when `configured`, so that the qualification script can keep a CI job's evidence as its
+/// artifacts (AUTO-90), otherwise `um-claude-code-lifecycle-matrix` under the temporary
+/// directory. An empty value is unset.
+fn retention_root(configured: Option<&OsStr>) -> PathBuf {
+    match configured {
+        Some(directory) if !directory.is_empty() => PathBuf::from(directory),
+        _ => std::env::temp_dir().join("um-claude-code-lifecycle-matrix"),
+    }
 }
 
 #[expect(
@@ -2912,6 +3129,19 @@ async fn pinned_real_claude_code_11_lifecycle_matrix_drives_every_cell() {
 }
 
 // INV-HARNESS-13
+#[test]
+fn retention_root_prefers_the_retain_directory_variable() {
+    let configured = Path::new("/ci/artifacts/claude-code-lifecycle-matrix");
+    assert_eq!(
+        retention_root(Some(configured.as_os_str())),
+        configured.to_path_buf()
+    );
+    let fallback = std::env::temp_dir().join("um-claude-code-lifecycle-matrix");
+    assert_eq!(retention_root(None), fallback);
+    assert_eq!(retention_root(Some(OsStr::new(""))), fallback);
+}
+
+// INV-HARNESS-13
 // REQ-AGENT-35
 // REQ-AGENT-69
 // REQ-AGENT-73
@@ -2985,12 +3215,48 @@ fn lifecycle_matrix_enumerates_every_dimension_value_once() {
     assert!(
         cells
             .iter()
-            .any(|cell| cell.work.subagent() == Some(SubagentWork::Monitor))
+            .any(|cell| matches!(cell.work.subagent(), Some(SubagentWork::Monitor { .. })))
     );
     assert!(!cells.iter().any(|cell| {
-        cell.work.subagent() == Some(SubagentWork::Monitor)
+        matches!(cell.work.subagent(), Some(SubagentWork::Monitor { .. }))
             && !matches!(cell.followup, Followup::None | Followup::TaskStop)
     }));
+    // A backgrounded subagent's command or monitor released after the answer is driven alone,
+    // settling in every mode, never under a foreground subagent (AUTO-90).
+    assert!(
+        PRUNE_RULES
+            .iter()
+            .any(|rule| rule.name == "release-after-the-answer-companions")
+    );
+    for mode in Mode::ALL {
+        for slug in [
+            "background-bash-after-the-answer",
+            "monitor-after-the-answer",
+        ] {
+            assert!(
+                names.contains(&format!(
+                    "{}/background-agent[{slug}]/none/settle",
+                    mode.slug()
+                )),
+                "{mode:?} {slug}"
+            );
+        }
+    }
+    assert!(!cells.iter().any(|cell| {
+        cell.work
+            .subagent()
+            .is_some_and(SubagentWork::released_after_the_answer)
+            && (cell.followup != Followup::None
+                || cell.ending != Ending::Settle
+                || !matches!(cell.work, Work::BackgroundAgent { .. }))
+    }));
+    assert_eq!(
+        cells
+            .iter()
+            .filter(|cell| cell.released_after_the_answer())
+            .count(),
+        6
+    );
     // A main-thread monitor is background work (REQ-AGENT-35) whose outstanding task
     // announces its event turns (REQ-AGENT-69): it is stopped from its event turn in both
     // rounds and cancelled in the exchange and in the drain it pauses, while a wakeup over it

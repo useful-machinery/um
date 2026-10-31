@@ -64,10 +64,10 @@ steps:
               if IFS= read -r unexpected; then exit 91; fi
               test -r "$UM_RECOVERY_CONTEXT"
               test ! -w "$UM_RECOVERY_CONTEXT"
-              /bin/grep -q '"schemaVersion": 1' "$UM_RECOVERY_CONTEXT"
-              /bin/grep -q '"recoveryRound": 1' "$UM_RECOVERY_CONTEXT"
-              /bin/grep -q '"executionNumber": 1' "$UM_RECOVERY_CONTEXT"
-              /bin/grep -q '"command_stderr"' "$UM_RECOVERY_CONTEXT"
+              grep -q '"schemaVersion": 1' "$UM_RECOVERY_CONTEXT"
+              grep -q '"recoveryRound": 1' "$UM_RECOVERY_CONTEXT"
+              grep -q '"executionNumber": 1' "$UM_RECOVERY_CONTEXT"
+              grep -q '"command_stderr"' "$UM_RECOVERY_CONTEXT"
               test -z "${UM_INHERITED+x}"
               printf '%s\n%s\n' UM_RECOVERY_CONTEXT UM_RECOVERY_RESULT > recovery-environment.txt
               printf '%s\n%s\n' "$UM_RECOVERY_CONTEXT" "$UM_RECOVERY_RESULT" > recovery-private-paths.txt

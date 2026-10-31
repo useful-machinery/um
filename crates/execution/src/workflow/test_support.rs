@@ -372,12 +372,20 @@ pub(crate) fn watchdog_expiry_message(expiry: &WatchdogExpiry<'_>) -> String {
 /// Bounds a harness test case against hangs: the case's idle-host `base` multiplied by
 /// the host-load factor, re-evaluated when the bound expires, never more than
 /// `MAX_WATCHDOG_SCALE` times the base. Expiry panics with `watchdog_expiry_message`.
-pub(crate) async fn host_scaled_watchdog<Output>(
+///
+/// A plain function, not an `async fn`, as are the `with_watchdog` wrappers the suites put in
+/// front of it. An `async fn` keeps its `future` argument in its own state, and an unoptimized
+/// build keeps every move of that state in the frame that moves it, so a case body that
+/// embedded two adapter `invoke` futures (about 100 KiB unoptimized) cost about 2 MiB across
+/// the `#[tokio::test]` wrapper and the test's own async frame and overflowed libtest's
+/// default thread stack before its fixture ran. Pinning the body on the heap before any
+/// wrapper's state exists leaves those frames holding a pointer.
+pub(crate) fn host_scaled_watchdog<Output>(
     case: &str,
     base: Duration,
     future: impl Future<Output = Output>,
-) -> Output {
-    host_scaled_watchdog_with_diagnosis(case, base, || None, future).await
+) -> impl Future<Output = Output> {
+    host_scaled_watchdog_with_diagnosis(case, base, || None, future)
 }
 
 /// `host_scaled_watchdog` whose expiry message ends with the suite's own `diagnosis`,
@@ -386,48 +394,50 @@ pub(crate) async fn host_scaled_watchdog<Output>(
     clippy::disallowed_methods,
     reason = "real time is used only as an anti-hang watchdog, never as success evidence"
 )]
-pub(crate) async fn host_scaled_watchdog_with_diagnosis<Output>(
+pub(crate) fn host_scaled_watchdog_with_diagnosis<Output>(
     case: &str,
     base: Duration,
     diagnosis: impl FnOnce() -> Option<String>,
     future: impl Future<Output = Output>,
-) -> Output {
-    let started = std::time::Instant::now();
-    // Heap-pinned: a large fixture future kept on the stack beside this loop's state overflows
-    // libtest's default thread stack in debug builds.
+) -> impl Future<Output = Output> {
+    // Heap-pinned before the returned future exists (see `host_scaled_watchdog`), so neither
+    // this loop's state nor any wrapper's holds the body.
     let mut future = Box::pin(future);
-    let mut scale = watchdog_scale(host_load().as_ref());
-    loop {
-        let bound = base * scale;
-        if let Ok(output) =
-            tokio::time::timeout(bound.saturating_sub(started.elapsed()), future.as_mut()).await
-        {
-            return output;
+    async move {
+        let started = std::time::Instant::now();
+        let mut scale = watchdog_scale(host_load().as_ref());
+        loop {
+            let bound = base * scale;
+            if let Ok(output) =
+                tokio::time::timeout(bound.saturating_sub(started.elapsed()), future.as_mut()).await
+            {
+                return output;
+            }
+            let load = host_load();
+            let rescaled = watchdog_scale(load.as_ref());
+            if rescaled > scale {
+                scale = rescaled;
+                continue;
+            }
+            let schedule = std::env::var_os("UM_REPO_CHECK_SCHEDULE")
+                .and_then(|path| fs::read_to_string(path).ok());
+            let own_step =
+                std::env::var_os("UM_REPO_CHECK_STEP").and_then(|step| step.into_string().ok());
+            let diagnosis = diagnosis();
+            panic!(
+                "{}",
+                watchdog_expiry_message(&WatchdogExpiry {
+                    case,
+                    elapsed: started.elapsed(),
+                    base,
+                    scale,
+                    load: load.as_ref(),
+                    schedule: schedule.as_deref(),
+                    own_step: own_step.as_deref(),
+                    diagnosis: diagnosis.as_deref(),
+                })
+            );
         }
-        let load = host_load();
-        let rescaled = watchdog_scale(load.as_ref());
-        if rescaled > scale {
-            scale = rescaled;
-            continue;
-        }
-        let schedule = std::env::var_os("UM_REPO_CHECK_SCHEDULE")
-            .and_then(|path| fs::read_to_string(path).ok());
-        let own_step =
-            std::env::var_os("UM_REPO_CHECK_STEP").and_then(|step| step.into_string().ok());
-        let diagnosis = diagnosis();
-        panic!(
-            "{}",
-            watchdog_expiry_message(&WatchdogExpiry {
-                case,
-                elapsed: started.elapsed(),
-                base,
-                scale,
-                load: load.as_ref(),
-                schedule: schedule.as_deref(),
-                own_step: own_step.as_deref(),
-                diagnosis: diagnosis.as_deref(),
-            })
-        );
     }
 }
 

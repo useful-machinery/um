@@ -794,7 +794,9 @@ where
     async fn on_stdout(&mut self, bytes: &[u8], state: &mut agent_process_driver::State<Clock>) {
         self.read_stdout(bytes, state).await;
         // A `result` awaiting a decision ended the parser's read of the chunk; the frames after
-        // it are read once `read_stdout` has made that decision.
+        // it are read once `read_stdout` has made that decision, so an `init` behind that
+        // `result` opens an epilogue or the correction turn and never meets a pending decision
+        // (REQ-AGENT-76, REQ-AGENT-69).
         while state.parser_enabled && self.parser.has_deferred_stdout() {
             self.read_stdout(&[], state).await;
         }

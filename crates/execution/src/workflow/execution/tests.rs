@@ -615,18 +615,19 @@ async fn wait_for_step_transition(
     }
 }
 
-async fn with_watchdog<Output>(future: impl Future<Output = Output>) -> Output {
-    with_watchdog_base(TEST_WATCHDOG, future).await
+// Plain functions, not `async fn`: the body reaches the shared watchdog's heap pin before any
+// wrapper state holds it (see `host_scaled_watchdog`).
+fn with_watchdog<Output>(future: impl Future<Output = Output>) -> impl Future<Output = Output> {
+    with_watchdog_base(TEST_WATCHDOG, future)
 }
 
 /// Runs a scenario under the shared host-scaled watchdog; an expiry names the last
 /// transition the scenario's observer saw, so a real hang is diagnosable.
-async fn with_watchdog_base<Output>(
+fn with_watchdog_base<Output>(
     base: Duration,
     future: impl Future<Output = Output>,
-) -> Output {
-    LAST_TRANSITION.with(|last| last.borrow_mut().take());
-    host_scaled_watchdog_with_diagnosis(
+) -> impl Future<Output = Output> {
+    let bounded = host_scaled_watchdog_with_diagnosis(
         "workflow execution scenario",
         base,
         || {
@@ -637,8 +638,11 @@ async fn with_watchdog_base<Output>(
             ))
         },
         future,
-    )
-    .await
+    );
+    async move {
+        LAST_TRANSITION.with(|last| last.borrow_mut().take());
+        bounded.await
+    }
 }
 
 fn describe_transition(event: &TransitionEvent<TestInstant>) -> String {
