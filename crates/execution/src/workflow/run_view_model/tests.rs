@@ -8,7 +8,7 @@ use time::format_description::well_known::Rfc3339;
 
 use super::*;
 use crate::workflow::observation::{
-    CommandOutputObservation, SourceSequence, TransitionObservation,
+    CommandOutputObservation, ObservedExecutions, SourceSequence, TransitionObservation,
 };
 use crate::workflow::resolution;
 use crate::workflow::runtime::{
@@ -128,6 +128,7 @@ fn step_transition(
             to,
         },
         step: detail,
+        executions: ObservedExecutions::default(),
     }))
 }
 
@@ -142,6 +143,7 @@ fn workflow_transition(
             to: Box::new(to),
         },
         step: None,
+        executions: ObservedExecutions::default(),
     }))
 }
 
@@ -153,6 +155,7 @@ fn cancellation(deadline: OffsetDateTime) -> ExecutionObservation<OffsetDateTime
             deadline,
         },
         step: None,
+        executions: ObservedExecutions::default(),
     }))
 }
 
@@ -406,6 +409,7 @@ finalizers:
                 deadline,
             },
             step: None,
+            executions: ObservedExecutions::default(),
         },
     )))
     .await;
@@ -432,6 +436,7 @@ finalizers:
                 phase: crate::workflow::runtime::RunCancellationPhase::Finalization,
             },
             step: None,
+            executions: ObservedExecutions::default(),
         },
     )))
     .await;

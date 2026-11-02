@@ -21,8 +21,8 @@ use super::runtime::{
     RecoveryRoundNumber, RecoveryRoundRecord,
 };
 use super::step_runtime::{
-    CommandExecutionFailure, CommandLaunchFailure, StepExecutionFailure, StepFailureCause,
-    StepStartFailure,
+    CommandExecutionFailure, CommandLaunchFailure, RecoveryFailureKind, StepExecutionFailure,
+    StepFailureCause, StepStartFailure,
 };
 use super::validated::{ValidatedStep, ValidatedStepRecovery};
 
@@ -722,12 +722,13 @@ fn project_failed_execution(
 }
 
 fn project_cause(phase: FailurePhase, cause: &StepFailureCause) -> RecoveryCause {
+    let kind = RecoveryFailureKind::classify(phase, cause);
     match cause {
         StepFailureCause::Execution(StepExecutionFailure::Command(
             CommandExecutionFailure::UnsuccessfulExit { code },
         )) => RecoveryCause {
             exit_code: *code,
-            ..RecoveryCause::of_kind("command_exit")
+            ..RecoveryCause::of_kind(kind)
         },
         StepFailureCause::Start(StepStartFailure::Agent(failure))
         | StepFailureCause::Execution(StepExecutionFailure::Agent(failure)) => {
@@ -743,40 +744,26 @@ fn project_cause(phase: FailurePhase, cause: &StepFailureCause) -> RecoveryCause
                 resets_at: classified
                     .and_then(|diagnostic| diagnostic.resets_at)
                     .and_then(reset_timestamp),
-                ..RecoveryCause::of_kind("agent_failure")
+                ..RecoveryCause::of_kind(kind)
             }
         }
-        StepFailureCause::Start(_) => RecoveryCause::of_kind("start_failure"),
-        StepFailureCause::Execution(_) => RecoveryCause::of_kind("execution_failure"),
-        StepFailureCause::OutputCapture(_) => RecoveryCause::of_kind("output_capture_failure"),
-        StepFailureCause::RecoveryHandler(_) => RecoveryCause::of_kind("other"),
+        StepFailureCause::Start(_)
+        | StepFailureCause::Execution(_)
+        | StepFailureCause::OutputCapture(_)
+        | StepFailureCause::RecoveryHandler(_) => RecoveryCause::of_kind(kind),
     }
-    .with_phase_fallback(phase)
 }
 
 impl RecoveryCause {
-    fn of_kind(kind: &str) -> Self {
+    fn of_kind(kind: RecoveryFailureKind) -> Self {
         Self {
-            kind: kind.to_owned(),
+            kind: kind.as_str().to_owned(),
             exit_code: None,
             detail: None,
             harness_error: None,
             http_status: None,
             resets_at: None,
         }
-    }
-
-    fn with_phase_fallback(mut self, phase: FailurePhase) -> Self {
-        if self.kind == "other" {
-            self.kind = match phase {
-                FailurePhase::Start => "start_failure",
-                FailurePhase::Condition => "condition_failure",
-                FailurePhase::Execution => "execution_failure",
-                FailurePhase::OutputCapture => "output_capture_failure",
-            }
-            .to_owned();
-        }
-        self
     }
 }
 

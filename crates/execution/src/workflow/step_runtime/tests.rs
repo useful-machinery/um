@@ -939,6 +939,7 @@ async fn workflow_execution_dispatches_start_actions_to_the_step_runtime() {
                 }),
                 recovery: None,
                 condition_passed: false,
+                failure_kind: None,
             }
         );
         assert_eq!(

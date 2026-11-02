@@ -6,6 +6,10 @@ use std::sync::Arc;
 use super::*;
 use crate::service::lease_clock::{LeaseTimerRelease, controlled_lease_clock};
 use crate::service::test_support::{controlled_sleeper, sleep_request, with_watchdog};
+use um_execution::{
+    ExecutionSettlement, ObservedExecutions, RecoveryFailureKind, SettledExecution,
+    StartedExecution, StepFailureKind,
+};
 use um_runner_protocol::{MAXIMUM_ORDINARY_FRAME_BYTES, RunnerEnvelope, RunnerFrame};
 
 #[test]
@@ -750,6 +754,7 @@ fn recovery_agent_allocation_failure_retains_harness_stderr_without_native_sessi
             recovery_agent_steps: BTreeSet::from(["verify".to_owned()]),
             ..RunnerInvocationEvidence::default()
         },
+        RunEvent::default(),
     );
     let diagnostic = StepDiagnostic::from_streams(
         um_execution::CapturedDiagnosticStream::from_parts(b"".as_slice(), 0, true),
@@ -813,6 +818,7 @@ async fn recovery_cancellation_preserves_bounded_invocation_evidence() {
         PostStopFence::with_workflow_git(None),
         CancellationSource::new(),
         RunnerInvocationEvidence::default(),
+        RunEvent::default(),
     );
     let target = ActionId {
         transition_sequence: TransitionSequence(1),
@@ -832,6 +838,7 @@ async fn recovery_cancellation_preserves_bounded_invocation_evidence() {
                     to: StepStateKind::Starting,
                 },
                 step: None,
+                executions: ObservedExecutions::default(),
             },
         )))
         .await;
@@ -862,6 +869,7 @@ async fn recovery_cancellation_preserves_bounded_invocation_evidence() {
                     handler_state: Some(RecoveryHandlerActivity::Starting),
                     decision: None,
                 }),
+                executions: ObservedExecutions::default(),
             },
         )))
         .await;
@@ -909,6 +917,7 @@ async fn recovery_cancellation_preserves_bounded_invocation_evidence() {
                         to,
                     },
                     step: Some(step),
+                    executions: ObservedExecutions::default(),
                 },
             )))
             .await;
@@ -945,6 +954,7 @@ async fn observer_retains_encoding_fault_and_stops_emitting_transitions() {
         PostStopFence::with_workflow_git(None),
         CancellationSource::new(),
         RunnerInvocationEvidence::default(),
+        RunEvent::default(),
     );
     for sequence in [0, 1] {
         observer
@@ -959,6 +969,7 @@ async fn observer_retains_encoding_fault_and_stops_emitting_transitions() {
                         to: StepStateKind::Starting,
                     },
                     step: None,
+                    executions: ObservedExecutions::default(),
                 },
             )))
             .await;
@@ -987,6 +998,7 @@ async fn post_stop_fence_rejects_late_success_but_allows_lease_terminal() {
         fence.clone(),
         CancellationSource::new(),
         RunnerInvocationEvidence::default(),
+        RunEvent::default(),
     );
     fence.fence();
     observer
@@ -1000,6 +1012,7 @@ async fn post_stop_fence_rejects_late_success_but_allows_lease_terminal() {
                     to: Box::new(WorkflowState::Succeeded),
                 },
                 step: None,
+                executions: ObservedExecutions::default(),
             },
         )))
         .await;
@@ -1020,6 +1033,7 @@ async fn post_stop_fence_rejects_late_success_but_allows_lease_terminal() {
             }),
         },
         step: None,
+        executions: ObservedExecutions::default(),
     };
     assert!(is_lease_loss_terminal_transition(&lease_terminal));
 }
@@ -1040,6 +1054,7 @@ async fn post_stop_fence_rearms_lease_loss_at_finalization_boundary() {
         fence,
         cancellation.clone(),
         RunnerInvocationEvidence::default(),
+        RunEvent::default(),
     );
     observer
         .observe(ExecutionObservation::Transition(Box::new(
@@ -1059,6 +1074,7 @@ async fn post_stop_fence_rearms_lease_loss_at_finalization_boundary() {
                     }),
                 },
                 step: None,
+                executions: ObservedExecutions::default(),
             },
         )))
         .await;
@@ -1104,6 +1120,7 @@ fn advisory_step_transition_preserves_policy_and_raw_disposition() {
         step: Some(ObservedStepTransition::Blocked {
             detail: BlockedDetail::new([Prerequisite::control("analyze").unwrap()]).unwrap(),
         }),
+        executions: ObservedExecutions::default(),
     };
 
     assert_eq!(
@@ -1192,4 +1209,511 @@ fn invalid_result_publication_retains_the_original_command_failure() {
         BASE64_STANDARD.decode(stderr).unwrap(),
         b"publication failed"
     );
+}
+
+fn step_execution_observer(
+    run_event: RunEvent,
+    outbox: ObservationOutbox,
+) -> RunnerExecutionObserver {
+    RunnerExecutionObserver::new(
+        "asn_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned(),
+        "atm_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned(),
+        32,
+        outbox,
+        PostStopFence::with_workflow_git(None),
+        CancellationSource::new(),
+        RunnerInvocationEvidence::default(),
+        run_event,
+    )
+}
+
+fn step_execution_run_event() -> (RunEvent, crate::telemetry::TestCapture) {
+    let (recorder, capture) = crate::telemetry::test_recorder("rbt_fixture");
+    let run_event = RunEvent::started_fixture(
+        &recorder,
+        "run_01k0z6r1w8f4jy2m7q9v3x5abc",
+        "asn_01k0z6r1w8f4jy2m7q9v3x5abc",
+        "atm_01k0z6r1w8f4jy2m7q9v3x5abc",
+    );
+    (run_event, capture)
+}
+
+fn invocation(sequence: u64) -> ActionId {
+    ActionId {
+        transition_sequence: TransitionSequence(sequence),
+    }
+}
+
+fn target(execution_number: u8) -> ActiveStepInvocation {
+    ActiveStepInvocation::Target {
+        execution_number: TargetExecutionNumber::fixture(execution_number),
+    }
+}
+
+fn handler(round: u8) -> ActiveStepInvocation {
+    ActiveStepInvocation::RecoveryHandler {
+        round: RecoveryRoundNumber::fixture(round),
+    }
+}
+
+fn started_execution(
+    sequence: u64,
+    role: ActiveStepInvocation,
+    recovery_failure_kind: Option<RecoveryFailureKind>,
+) -> Option<StartedExecution> {
+    Some(StartedExecution {
+        invocation: invocation(sequence),
+        role,
+        recovery_failure_kind,
+    })
+}
+
+fn settled_execution(
+    sequence: u64,
+    role: ActiveStepInvocation,
+    settlement: ExecutionSettlement,
+) -> Option<SettledExecution> {
+    Some(SettledExecution {
+        invocation: invocation(sequence),
+        role,
+        settlement,
+    })
+}
+
+// One step transition at `sequence` whose wire projection is `observed` and
+// whose physical executions are `settled` and `started`.
+fn step_execution_transition(
+    sequence: u64,
+    (step, role): (&str, WorkflowNodeRole),
+    (from, to): (StepStateKind, StepStateKind),
+    observed: Option<ObservedStepTransition>,
+    settled: Option<SettledExecution>,
+    started: Option<StartedExecution>,
+) -> TransitionObservation<RunnerExecutionInstant> {
+    TransitionObservation {
+        event: TransitionEvent::Step {
+            sequence: TransitionSequence(sequence),
+            step: step.to_owned(),
+            role,
+            failure_policy: FailurePolicy::Required,
+            from,
+            to,
+        },
+        step: observed,
+        executions: ObservedExecutions { settled, started },
+    }
+}
+
+fn recovery_progress(
+    active: (u64, ActiveStepInvocation),
+    settled: (u64, ActiveStepInvocation),
+    decision: Option<RecoveryDecisionKind>,
+) -> Option<ObservedStepTransition> {
+    Some(ObservedStepTransition::Recovery {
+        active: active.1,
+        active_invocation_id: invocation(active.0),
+        settled_invocation: Some((invocation(settled.0), settled.1)),
+        configured_rounds: 1,
+        handler_kind: Some(RecoveryHandlerKind::Command),
+        handler_state: decision
+            .is_none()
+            .then_some(RecoveryHandlerActivity::Starting),
+        decision,
+    })
+}
+
+async fn observe_all(
+    observer: &RunnerExecutionObserver,
+    transitions: &[TransitionObservation<RunnerExecutionInstant>],
+) {
+    for transition in transitions {
+        observer
+            .observe(ExecutionObservation::Transition(Box::new(
+                transition.clone(),
+            )))
+            .await;
+    }
+}
+
+fn step_execution_records(
+    capture: &crate::telemetry::TestCapture,
+) -> Vec<serde_json::Map<String, Value>> {
+    capture
+        .events()
+        .into_iter()
+        .filter(|event| event["event.name"] == "runner.step_execution")
+        .collect()
+}
+
+// The enqueued workflow events, without the wall-clock times of their
+// invocation evidence.
+fn enqueued_workflow_events(outbox: &ObservationOutbox) -> Vec<Value> {
+    outbox
+        .pending(&BTreeSet::new(), 64)
+        .into_iter()
+        .map(|entry| match entry.observation {
+            AssignmentObservation::Execution {
+                report:
+                    ExecutionReport::Transition {
+                        mut workflow_event, ..
+                    },
+                ..
+            } => {
+                if let Some(evidence) = workflow_event
+                    .get_mut("invocationEvidence")
+                    .and_then(Value::as_object_mut)
+                {
+                    for key in ["startedAt", "finishedAt", "durationMilliseconds"] {
+                        evidence.remove(key);
+                    }
+                }
+                workflow_event
+            }
+            _ => panic!("expected a transition observation"),
+        })
+        .collect()
+}
+
+// A finalizer `wrap` that succeeds, then a step `implement` whose first target
+// fails its command, whose recovery handler succeeds and whose recheck succeeds.
+fn finalizer_and_recovered_step() -> Vec<TransitionObservation<RunnerExecutionInstant>> {
+    use StepStateKind::{CapturingOutputs, Pending, Recovering, Running, Starting, Succeeded};
+    let wrap = ("wrap", WorkflowNodeRole::Finalizer);
+    let implement = ("implement", WorkflowNodeRole::Step);
+    vec![
+        step_execution_transition(
+            1,
+            wrap,
+            (Pending, Starting),
+            None,
+            None,
+            started_execution(1, target(1), None),
+        ),
+        step_execution_transition(
+            2,
+            wrap,
+            (CapturingOutputs, Succeeded),
+            None,
+            settled_execution(1, target(1), ExecutionSettlement::Succeeded),
+            None,
+        ),
+        step_execution_transition(
+            3,
+            implement,
+            (Pending, Starting),
+            None,
+            None,
+            started_execution(3, target(1), None),
+        ),
+        step_execution_transition(
+            4,
+            implement,
+            (Running, Recovering),
+            recovery_progress((4, handler(1)), (3, target(1)), None),
+            settled_execution(
+                3,
+                target(1),
+                ExecutionSettlement::Failed(StepFailureKind::Command),
+            ),
+            started_execution(4, handler(1), None),
+        ),
+        step_execution_transition(
+            5,
+            implement,
+            (Recovering, Starting),
+            recovery_progress(
+                (5, target(2)),
+                (4, handler(1)),
+                Some(RecoveryDecisionKind::Recheck),
+            ),
+            settled_execution(4, handler(1), ExecutionSettlement::Succeeded),
+            started_execution(5, target(2), Some(RecoveryFailureKind::CommandExit)),
+        ),
+        step_execution_transition(
+            6,
+            implement,
+            (CapturingOutputs, Succeeded),
+            None,
+            settled_execution(5, target(2), ExecutionSettlement::Succeeded),
+            None,
+        ),
+    ]
+}
+
+fn span_attribute_json(value: &opentelemetry::Value) -> Value {
+    match value {
+        opentelemetry::Value::Bool(value) => json!(value),
+        opentelemetry::Value::I64(value) => json!(value),
+        opentelemetry::Value::String(value) => json!(value.as_str()),
+        other => panic!("unexpected span attribute {other:?}"),
+    }
+}
+
+fn is_step_execution_attribute(key: &str) -> bool {
+    key.starts_with("um.") || key == "error.type"
+}
+
+// REQ-TELEMETRY-41
+// REQ-TELEMETRY-42
+// REQ-TELEMETRY-43
+#[tokio::test]
+async fn settled_step_executions_are_root_records_on_both_sinks() {
+    let (run_event, capture) = step_execution_run_event();
+    let observer = step_execution_observer(run_event, ObservationOutbox::new());
+    observe_all(&observer, &finalizer_and_recovered_step()).await;
+    assert_eq!(observer.fault(), None);
+    assert_eq!(observer.last_sequence(), 6);
+
+    let records = step_execution_records(&capture);
+    assert_eq!(records.len(), 4);
+    let expected = [
+        ("wrap", "finalizer", 1, None, None, "success", None),
+        (
+            "implement",
+            "ordinary",
+            1,
+            None,
+            None,
+            "failure",
+            Some("step_command_failed"),
+        ),
+        (
+            "implement",
+            "recovery_handler",
+            1,
+            Some(1),
+            None,
+            "success",
+            None,
+        ),
+        (
+            "implement",
+            "ordinary",
+            2,
+            None,
+            Some("command_exit"),
+            "success",
+            None,
+        ),
+    ];
+    for (record, (step, role, execution_number, round, failure_kind, outcome, error_type)) in
+        records.iter().zip(expected)
+    {
+        assert_eq!(record["um.run.id"], "run_01k0z6r1w8f4jy2m7q9v3x5abc");
+        assert_eq!(record["um.assignment.id"], "asn_01k0z6r1w8f4jy2m7q9v3x5abc");
+        assert_eq!(record["um.attempt.id"], "atm_01k0z6r1w8f4jy2m7q9v3x5abc");
+        assert_eq!(record["um.step.id"], step);
+        assert_eq!(record["um.step.role"], role);
+        assert_eq!(record["um.step.execution_number"], execution_number);
+        assert_eq!(
+            record.get("um.step.recovery_round").and_then(Value::as_i64),
+            round
+        );
+        assert_eq!(
+            record
+                .get("um.step.recovery_failure_kind")
+                .and_then(Value::as_str),
+            failure_kind
+        );
+        assert_eq!(record["um.outcome"], outcome);
+        assert_eq!(record.get("error.type").and_then(Value::as_str), error_type);
+        assert!(record.get("parent_span_id").is_none());
+        assert!(record.get("um.runner.id").is_none());
+    }
+
+    let spans = capture
+        .spans()
+        .into_iter()
+        .filter(|span| span.name == "runner.step_execution")
+        .collect::<Vec<_>>();
+    assert_eq!(spans.len(), 4);
+    for record in &records {
+        let span = spans
+            .iter()
+            .find(|span| {
+                span.span_context.span_id().to_string() == record["span_id"].as_str().unwrap()
+            })
+            .expect("each record has its span");
+        assert_eq!(
+            span.span_context.trace_id().to_string(),
+            record["trace_id"].as_str().unwrap()
+        );
+        assert_eq!(span.parent_span_id, opentelemetry::trace::SpanId::INVALID);
+        let span_attributes = span
+            .attributes
+            .iter()
+            .filter(|attribute| is_step_execution_attribute(attribute.key.as_str()))
+            .map(|attribute| {
+                (
+                    attribute.key.as_str().to_owned(),
+                    span_attribute_json(&attribute.value),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let record_attributes = record
+            .iter()
+            .filter(|(key, _)| is_step_execution_attribute(key))
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(span_attributes, record_attributes);
+    }
+
+    let first_implement = records
+        .iter()
+        .filter(|record| {
+            record["um.step.role"] == "ordinary"
+                && record["um.step.id"] == "implement"
+                && record["um.step.execution_number"] == 1
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(first_implement.len(), 1);
+    assert_eq!(first_implement[0]["um.outcome"], "failure");
+}
+
+// REQ-TELEMETRY-41
+#[tokio::test]
+async fn unexecuted_steps_and_starts_without_an_execution_write_nothing() {
+    use StepStateKind::{Blocked, NotRun, Pending, Skipped, Starting};
+    let (run_event, capture) = step_execution_run_event();
+    let observer = step_execution_observer(run_event, ObservationOutbox::new());
+    let step = WorkflowNodeRole::Step;
+    let transitions = [
+        step_execution_transition(
+            1,
+            ("blocked", step),
+            (Pending, Blocked),
+            Some(ObservedStepTransition::Blocked {
+                detail: BlockedDetail::new([Prerequisite::control("analyze").unwrap()]).unwrap(),
+            }),
+            None,
+            None,
+        ),
+        step_execution_transition(
+            2,
+            ("not_run", step),
+            (Pending, NotRun),
+            Some(ObservedStepTransition::NotRun {
+                detail: serde_json::from_value(json!({"code": "failure_stop"})).unwrap(),
+            }),
+            None,
+            None,
+        ),
+        step_execution_transition(
+            3,
+            ("skipped", step),
+            (Pending, Skipped),
+            Some(ObservedStepTransition::Skipped {
+                detail: serde_json::from_value(json!({
+                    "code": "condition_false",
+                    "evaluatedPredicates": [{"path": "", "result": false}],
+                }))
+                .unwrap(),
+            }),
+            None,
+            None,
+        ),
+        step_execution_transition(4, ("starting", step), (Pending, Starting), None, None, None),
+    ];
+    observe_all(&observer, &transitions).await;
+    assert_eq!(observer.fault(), None);
+    assert_eq!(observer.last_sequence(), 4);
+    assert!(step_execution_records(&capture).is_empty());
+    assert_eq!(capture.span_count("runner.step_execution"), 0);
+}
+
+// REQ-TELEMETRY-43
+#[tokio::test]
+async fn step_execution_outcome_follows_the_settlement_kind() {
+    let cancelled = |code| {
+        Some(ObservedStepTransition::Cancelled {
+            detail: serde_json::from_value(json!({"code": code})).unwrap(),
+        })
+    };
+    for (role, (from, to), observed, settlement, outcome, error_type) in [
+        (
+            target(1),
+            (StepStateKind::Cancelling, StepStateKind::Cancelled),
+            cancelled("execution_lease_expired"),
+            ExecutionSettlement::Cancelled(CancellationReason::ExecutionLeaseExpired),
+            "timeout",
+            Some("step_execution_timeout"),
+        ),
+        (
+            target(1),
+            (StepStateKind::Cancelling, StepStateKind::Cancelled),
+            cancelled("user_request"),
+            ExecutionSettlement::Cancelled(CancellationReason::UserRequest),
+            "cancelled",
+            None,
+        ),
+        (
+            handler(1),
+            (StepStateKind::Running, StepStateKind::Failed),
+            Some(ObservedStepTransition::Failed {
+                detail: serde_json::from_value(json!({
+                    "phase": "execution", "code": "command_exit", "exitCode": 1,
+                }))
+                .unwrap(),
+            }),
+            ExecutionSettlement::Failed(StepFailureKind::RecoveryHandler),
+            "failure",
+            Some("step_recovery_handler_failed"),
+        ),
+    ] {
+        let (run_event, capture) = step_execution_run_event();
+        let observer = step_execution_observer(run_event, ObservationOutbox::new());
+        let verify = ("verify", WorkflowNodeRole::Step);
+        observe_all(
+            &observer,
+            &[
+                step_execution_transition(
+                    1,
+                    verify,
+                    (StepStateKind::Pending, StepStateKind::Starting),
+                    None,
+                    None,
+                    started_execution(1, role, None),
+                ),
+                step_execution_transition(
+                    2,
+                    verify,
+                    (from, to),
+                    observed,
+                    settled_execution(1, role, settlement),
+                    None,
+                ),
+            ],
+        )
+        .await;
+        assert_eq!(observer.fault(), None, "{settlement:?}");
+        assert_eq!(observer.last_sequence(), 2, "{settlement:?}");
+        let records = step_execution_records(&capture);
+        assert_eq!(records.len(), 1, "{settlement:?}");
+        assert_eq!(records[0]["um.outcome"], outcome, "{settlement:?}");
+        assert_eq!(
+            records[0].get("error.type").and_then(Value::as_str),
+            error_type,
+            "{settlement:?}"
+        );
+    }
+}
+
+// REQ-TELEMETRY-41
+#[tokio::test]
+async fn step_executions_without_a_recorder_leave_the_transition_stream_unchanged() {
+    let transitions = finalizer_and_recovered_step();
+    let (run_event, _capture) = step_execution_run_event();
+    let recorded_outbox = ObservationOutbox::new();
+    let recorded = step_execution_observer(run_event, recorded_outbox.clone());
+    observe_all(&recorded, &transitions).await;
+
+    let outbox = ObservationOutbox::new();
+    let observer = step_execution_observer(RunEvent::default(), outbox.clone());
+    observe_all(&observer, &transitions).await;
+
+    assert_eq!(observer.fault(), None);
+    assert_eq!(observer.last_sequence(), 6);
+    let events = enqueued_workflow_events(&outbox);
+    assert_eq!(events.len(), 6);
+    assert_eq!(events, enqueued_workflow_events(&recorded_outbox));
 }

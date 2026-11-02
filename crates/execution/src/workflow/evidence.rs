@@ -15,7 +15,8 @@ use super::input::InputPreparationFailureKind;
 use super::schema_common::is_identifier;
 use super::step_runtime::{
     CommandExecutionFailure, CommandLaunchFailure, CommandPreparationFailure, OutputCaptureFailure,
-    StepExecutionFailure, StepFailureCause, StepStartFailure, WorkingDirectoryFailure,
+    StepExecutionFailure, StepFailureCause, StepFailureKind, StepStartFailure,
+    WorkingDirectoryFailure,
 };
 use super::validated::WorkflowNode;
 #[cfg(test)]
@@ -825,11 +826,17 @@ impl std::error::Error for EvidenceError {}
 
 pub(crate) trait NodeFailureSource {
     fn node_failure_detail(&self, phase: FailurePhase) -> Result<FailureDetail, EvidenceError>;
+
+    fn failure_kind(&self) -> StepFailureKind;
 }
 
 impl NodeFailureSource for StepFailureCause {
     fn node_failure_detail(&self, phase: FailurePhase) -> Result<FailureDetail, EvidenceError> {
         failure_detail(phase, self)
+    }
+
+    fn failure_kind(&self) -> StepFailureKind {
+        StepFailureKind::of(self)
     }
 }
 
@@ -842,6 +849,10 @@ impl NodeFailureSource for String {
             FailurePhase::Execution => FailureCode::CommandWaitFailed,
         };
         FailureDetail::new(phase, code, None, None, None, None)
+    }
+
+    fn failure_kind(&self) -> StepFailureKind {
+        StepFailureKind::Execution
     }
 }
 

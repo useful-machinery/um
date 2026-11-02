@@ -91,6 +91,11 @@ pub(crate) mod attribute {
     pub(crate) const PROTOCOL_TIMER: &str = "um.protocol.timer";
     pub(crate) const PROTOCOL_VERSION: &str = "um.protocol.version";
     pub(crate) const RUNNER_SESSION_ID: &str = "um.runner.session_id";
+    pub(crate) const STEP_ID: &str = "um.step.id";
+    pub(crate) const STEP_ROLE: &str = "um.step.role";
+    pub(crate) const STEP_EXECUTION_NUMBER: &str = "um.step.execution_number";
+    pub(crate) const STEP_RECOVERY_ROUND: &str = "um.step.recovery_round";
+    pub(crate) const STEP_RECOVERY_FAILURE_KIND: &str = "um.step.recovery_failure_kind";
 }
 
 const EVENT_NAME: &str = "event.name";

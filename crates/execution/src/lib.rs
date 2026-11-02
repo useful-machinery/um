@@ -92,7 +92,8 @@ pub use workflow::local_run::{
     read_local_run_status, retain_cloud_continuation_evidence, retain_cloud_workflow_evidence,
 };
 pub use workflow::observation::{
-    ExecutionObservation, ExecutionObserver, ObservedStepTransition, TransitionObservation,
+    ExecutionObservation, ExecutionObserver, ExecutionSettlement, ObservedExecutions,
+    ObservedStepTransition, SettledExecution, StartedExecution, TransitionObservation,
 };
 pub use workflow::portable_artifact::{
     ArtifactDiagnostic, ArtifactValidationSummary, PortableArtifactValidation,
@@ -148,7 +149,9 @@ pub use workflow::runtime::{
 };
 pub use workflow::runtime::{RecoveryRoundNumber, TargetExecutionNumber};
 pub use workflow::step_runtime::spawn_isolated_command_launch;
-pub use workflow::step_runtime::{AgentExecution, StepFailureCause, WorkflowExecutionStart};
+pub use workflow::step_runtime::{
+    AgentExecution, RecoveryFailureKind, StepFailureCause, StepFailureKind, WorkflowExecutionStart,
+};
 pub use workflow::terminal_host::archived::{
     ArchivedTerminalHostExit, ArchivedWorkflowTerminalHost,
 };

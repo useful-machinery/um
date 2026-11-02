@@ -1,5 +1,9 @@
 use super::*;
-use crate::workflow::step_runtime::CommandLaunchFailure;
+use crate::workflow::observation::{ExecutionSettlement, SettledExecution, StartedExecution};
+use crate::workflow::runtime::{
+    ActionId, ActiveStepInvocation, RecoveryRoundNumber, TargetExecutionNumber,
+};
+use crate::workflow::step_runtime::{CommandLaunchFailure, RecoveryFailureKind, StepFailureKind};
 
 // REQ-WFEXEC-22
 #[tokio::test]
@@ -44,11 +48,9 @@ async fn command_environment_requires_declared_passthrough() {
     .await;
 }
 
-// REQ-WFRECOVERY-7, REQ-WFRECOVERY-8, REQ-WFRECOVERY-9, REQ-WFRECOVERY-21, REQ-WFRECOVERY-30, REQ-WFRECOVERY-39, REQ-WFRECOVERY-59
-#[tokio::test]
-async fn source_neutral_command_handler_repairs_and_rechecks_with_private_authority() {
-    with_watchdog(async {
-        let source = r#"schemaVersion: 1
+/// A command target that fails once, then passes after a command handler repairs the
+/// workspace and decides to recheck.
+const SOURCE_NEUTRAL_COMMAND_RECOVERY: &str = r#"schemaVersion: 1
 steps:
   repair:
     kind: cmd
@@ -96,8 +98,13 @@ exports:
   artifact:
     ref: outputs.repair.artifact
 "#;
+
+// REQ-WFRECOVERY-7, REQ-WFRECOVERY-8, REQ-WFRECOVERY-9, REQ-WFRECOVERY-21, REQ-WFRECOVERY-30, REQ-WFRECOVERY-39, REQ-WFRECOVERY-59
+#[tokio::test]
+async fn source_neutral_command_handler_repairs_and_rechecks_with_private_authority() {
+    with_watchdog(async {
         let fixture = execution_fixture(
-            source,
+            SOURCE_NEUTRAL_COMMAND_RECOVERY,
             ResolvedInputs::default(),
             EnvironmentSnapshot::new([
                 ("PATH", "/bin:/usr/bin"),
@@ -135,16 +142,26 @@ exports:
             fs::read_to_string(fixture.execution_root.join("recovery-environment.txt")).unwrap(),
             "UM_RECOVERY_CONTEXT\nUM_RECOVERY_RESULT\n"
         );
-        let private_paths = fs::read_to_string(
-            fixture.execution_root.join("recovery-private-paths.txt"),
-        )
-        .unwrap();
+        let private_paths =
+            fs::read_to_string(fixture.execution_root.join("recovery-private-paths.txt")).unwrap();
         assert!(private_paths.lines().all(|path| !Path::new(path).exists()));
-        assert_eq!(fs::read(fixture.execution_root.join("repaired.marker")).unwrap(), b"repaired");
+        assert_eq!(
+            fs::read(fixture.execution_root.join("repaired.marker")).unwrap(),
+            b"repaired"
+        );
         let invocations = diagnostics.invocation_ids("repair");
         assert_eq!(invocations.len(), 3);
-        assert_eq!(invocations.iter().copied().collect::<std::collections::BTreeSet<_>>().len(), 3);
-        let handler_diagnostic = diagnostics.get_invocation("repair", invocations[1]).unwrap();
+        assert_eq!(
+            invocations
+                .iter()
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            3
+        );
+        let handler_diagnostic = diagnostics
+            .get_invocation("repair", invocations[1])
+            .unwrap();
         assert_eq!(
             handler_diagnostic.standard_output().bytes(),
             b"handler ordinary output is diagnostic only"
@@ -1153,6 +1170,463 @@ async fn initial_cancellation_is_observed_without_starting_a_step() {
                     }
                 )
         ));
+    })
+    .await;
+}
+
+type ObservedStepExecutions = (
+    String,
+    WorkflowNodeRole,
+    StepStateKind,
+    StepStateKind,
+    ObservedExecutions,
+);
+
+/// Every step transition's observed executions in order; a transition that is not a step's
+/// carries none.
+fn observed_step_executions(entries: &RecordedObservations) -> Vec<ObservedStepExecutions> {
+    entries
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .iter()
+        .filter_map(|entry| match entry {
+            ExecutionObservation::Transition(transition) => match &transition.event {
+                TransitionEvent::Step {
+                    step,
+                    role,
+                    from,
+                    to,
+                    ..
+                } => Some((step.clone(), *role, *from, *to, transition.executions)),
+                _ => {
+                    assert_eq!(transition.executions, ObservedExecutions::default());
+                    None
+                }
+            },
+            _ => None,
+        })
+        .collect()
+}
+
+/// The step transitions that start or settle a physical execution, as `(from, to, executions)`.
+fn stated_executions(
+    observed: &[ObservedStepExecutions],
+    expected_step: &str,
+) -> Vec<(StepStateKind, StepStateKind, ObservedExecutions)> {
+    observed
+        .iter()
+        .filter(|(step, _, _, _, executions)| {
+            step == expected_step && *executions != ObservedExecutions::default()
+        })
+        .map(|(_, _, from, to, executions)| (*from, *to, *executions))
+        .collect()
+}
+
+fn started_invocation(executions: &ObservedExecutions) -> ActionId {
+    executions
+        .started
+        .expect("the transition starts an execution")
+        .invocation
+}
+
+const fn target(execution_number: u8) -> ActiveStepInvocation {
+    ActiveStepInvocation::Target {
+        execution_number: TargetExecutionNumber::fixture(execution_number),
+    }
+}
+
+const fn handler(round: u8) -> ActiveStepInvocation {
+    ActiveStepInvocation::RecoveryHandler {
+        round: RecoveryRoundNumber::fixture(round),
+    }
+}
+
+const fn starts(
+    invocation: ActionId,
+    role: ActiveStepInvocation,
+    recovery_failure_kind: Option<RecoveryFailureKind>,
+) -> Option<StartedExecution> {
+    Some(StartedExecution {
+        invocation,
+        role,
+        recovery_failure_kind,
+    })
+}
+
+const fn settles(
+    invocation: ActionId,
+    role: ActiveStepInvocation,
+    settlement: ExecutionSettlement,
+) -> Option<SettledExecution> {
+    Some(SettledExecution {
+        invocation,
+        role,
+        settlement,
+    })
+}
+
+async fn run_observed(
+    source: &str,
+) -> (
+    WorkflowExecutionResult<TestInstant>,
+    Vec<ObservedStepExecutions>,
+) {
+    let fixture = execution_fixture(
+        source,
+        ResolvedInputs::default(),
+        EnvironmentSnapshot::new([(OsString::from("PATH"), env::var_os("PATH").unwrap())]),
+        CancellationSource::new(),
+        1,
+        1024,
+    );
+    let (observer, entries, _observed) = RecordingObserver::new();
+    let result = execute_workflow(
+        fixture.admitted,
+        &fixture.artifacts,
+        &fixture.inputs,
+        &StepDiagnosticLog::default(),
+        AgentExecution::disabled(),
+        TestClock,
+        observer,
+    )
+    .await
+    .unwrap();
+    (result, observed_step_executions(&entries))
+}
+
+// REQ-TELEMETRY-41, REQ-TELEMETRY-42
+#[tokio::test]
+async fn recovered_command_states_each_physical_execution_start_and_settlement() {
+    with_watchdog(async {
+        let (result, observed) = run_observed(SOURCE_NEUTRAL_COMMAND_RECOVERY).await;
+        assert_eq!(result.outcome, RunOutcome::Succeeded);
+        let stated = stated_executions(&observed, "repair");
+        assert_eq!(stated.len(), 4, "{stated:?}");
+        let target_1 = started_invocation(&stated[0].2);
+        let handler_1 = started_invocation(&stated[1].2);
+        let target_2 = started_invocation(&stated[2].2);
+        assert_eq!(
+            [target_1, handler_1, target_2]
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            3
+        );
+        assert_eq!(
+            stated,
+            [
+                (
+                    StepStateKind::Pending,
+                    StepStateKind::Starting,
+                    ObservedExecutions {
+                        settled: None,
+                        started: starts(target_1, target(1), None),
+                    },
+                ),
+                (
+                    StepStateKind::Running,
+                    StepStateKind::Recovering,
+                    ObservedExecutions {
+                        settled: settles(
+                            target_1,
+                            target(1),
+                            ExecutionSettlement::Failed(StepFailureKind::Command),
+                        ),
+                        started: starts(handler_1, handler(1), None),
+                    },
+                ),
+                (
+                    StepStateKind::Recovering,
+                    StepStateKind::Starting,
+                    ObservedExecutions {
+                        settled: settles(handler_1, handler(1), ExecutionSettlement::Succeeded),
+                        started: starts(
+                            target_2,
+                            target(2),
+                            Some(RecoveryFailureKind::CommandExit),
+                        ),
+                    },
+                ),
+                (
+                    StepStateKind::CapturingOutputs,
+                    StepStateKind::Succeeded,
+                    ObservedExecutions {
+                        settled: settles(target_2, target(2), ExecutionSettlement::Succeeded),
+                        started: None,
+                    },
+                ),
+            ]
+        );
+    })
+    .await;
+}
+
+// REQ-TELEMETRY-41, REQ-TELEMETRY-43
+#[tokio::test]
+async fn failed_retried_and_finalizer_commands_settle_their_executions() {
+    with_watchdog(async {
+        let (result, observed) = run_observed(
+            "schemaVersion: 1\nsteps:\n  fail:\n    kind: cmd\n    command:\n      argv: [/bin/sh, -c, 'exit 3']\n",
+        )
+        .await;
+        assert!(matches!(result.outcome, RunOutcome::Failed { .. }));
+        let stated = stated_executions(&observed, "fail");
+        let target_1 = started_invocation(&stated[0].2);
+        assert_eq!(
+            stated,
+            [
+                (
+                    StepStateKind::Pending,
+                    StepStateKind::Starting,
+                    ObservedExecutions {
+                        settled: None,
+                        started: starts(target_1, target(1), None),
+                    },
+                ),
+                (
+                    StepStateKind::Running,
+                    StepStateKind::Failed,
+                    ObservedExecutions {
+                        settled: settles(
+                            target_1,
+                            target(1),
+                            ExecutionSettlement::Failed(StepFailureKind::Command),
+                        ),
+                        started: None,
+                    },
+                ),
+            ]
+        );
+
+        let (result, observed) = run_observed(
+            "schemaVersion: 1\nsteps:\n  retry:\n    kind: cmd\n    recovery:\n      retries: 1\n    command:\n      argv: [/bin/sh, -c, 'exit 75']\n",
+        )
+        .await;
+        assert!(matches!(result.outcome, RunOutcome::Failed { .. }));
+        let stated = stated_executions(&observed, "retry");
+        assert_eq!(stated.len(), 3, "{stated:?}");
+        let target_1 = started_invocation(&stated[0].2);
+        let target_2 = started_invocation(&stated[1].2);
+        assert_ne!(target_1, target_2);
+        assert_eq!(
+            stated[1..],
+            [
+                (
+                    StepStateKind::Running,
+                    StepStateKind::Starting,
+                    ObservedExecutions {
+                        settled: settles(
+                            target_1,
+                            target(1),
+                            ExecutionSettlement::Failed(StepFailureKind::Command),
+                        ),
+                        started: starts(
+                            target_2,
+                            target(2),
+                            Some(RecoveryFailureKind::CommandExit),
+                        ),
+                    },
+                ),
+                (
+                    StepStateKind::Running,
+                    StepStateKind::Failed,
+                    ObservedExecutions {
+                        settled: settles(
+                            target_2,
+                            target(2),
+                            ExecutionSettlement::Failed(StepFailureKind::Command),
+                        ),
+                        started: None,
+                    },
+                ),
+            ]
+        );
+
+        let (result, observed) = run_observed(
+            "schemaVersion: 1\nsteps:\n  work:\n    kind: cmd\n    command:\n      argv: [/bin/sh, -c, 'true']\nfinalizers:\n  release:\n    kind: cmd\n    command:\n      argv: [/bin/sh, -c, 'true']\n",
+        )
+        .await;
+        assert_eq!(result.outcome, RunOutcome::Succeeded);
+        let settled = observed
+            .iter()
+            .filter(|(step, _, _, _, executions)| {
+                step == "release" && executions.settled.is_some()
+            })
+            .map(|(_, role, _, to, executions)| (*role, *to, executions.settled))
+            .collect::<Vec<_>>();
+        let release = observed
+            .iter()
+            .find(|(step, ..)| step == "release")
+            .map(|(.., executions)| started_invocation(executions))
+            .unwrap();
+        assert_eq!(
+            settled,
+            [(
+                WorkflowNodeRole::Finalizer,
+                StepStateKind::Succeeded,
+                settles(release, target(1), ExecutionSettlement::Succeeded),
+            )]
+        );
+    })
+    .await;
+}
+
+// REQ-TELEMETRY-41, REQ-TELEMETRY-43
+#[tokio::test]
+async fn failed_command_handler_settles_as_a_handler_failure() {
+    with_watchdog(async {
+        for handler_command in [
+            "argv: [/definitely-missing-recovery-handler]",
+            "argv: [/bin/sh, -c, \"exit 9\"]",
+        ] {
+            let source = format!(
+                "schemaVersion: 1\nsteps:\n  repair:\n    kind: cmd\n    recovery:\n      retries: 1\n      handler:\n        kind: cmd\n        command:\n          {handler_command}\n    command:\n      argv: [/bin/sh, -c, \"exit 75\"]\n"
+            );
+            let (result, observed) = run_observed(&source).await;
+            assert!(matches!(result.outcome, RunOutcome::Failed { .. }));
+            let stated = stated_executions(&observed, "repair");
+            assert_eq!(stated.len(), 3, "{handler_command}: {stated:?}");
+            let handler_1 = started_invocation(&stated[1].2);
+            assert_eq!(
+                stated[2],
+                (
+                    StepStateKind::Recovering,
+                    StepStateKind::Failed,
+                    ObservedExecutions {
+                        settled: settles(
+                            handler_1,
+                            handler(1),
+                            ExecutionSettlement::Failed(StepFailureKind::RecoveryHandler),
+                        ),
+                        started: None,
+                    },
+                ),
+                "{handler_command}"
+            );
+        }
+    })
+    .await;
+}
+
+// REQ-TELEMETRY-41, REQ-TELEMETRY-43
+#[tokio::test]
+async fn handler_that_gives_up_settles_as_a_completed_handler_execution() {
+    with_watchdog(async {
+        let (result, observed) = run_observed(
+            r#"schemaVersion: 1
+steps:
+  repair:
+    kind: cmd
+    recovery:
+      retries: 1
+      handler:
+        kind: cmd
+        command:
+          argv:
+            - /bin/sh
+            - -c
+            - |
+              printf '%s' '{"schemaVersion":1,"decision":"gave_up","summary":"unrepairable","reason":"the target cannot pass"}' > "$UM_RECOVERY_RESULT"
+    command:
+      argv: [/bin/sh, -c, "exit 75"]
+"#,
+        )
+        .await;
+        assert!(matches!(result.outcome, RunOutcome::Failed { .. }));
+        let stated = stated_executions(&observed, "repair");
+        assert_eq!(stated.len(), 3, "{stated:?}");
+        let target_1 = started_invocation(&stated[0].2);
+        let handler_1 = started_invocation(&stated[1].2);
+        assert_eq!(
+            stated[1..],
+            [
+                (
+                    StepStateKind::Running,
+                    StepStateKind::Recovering,
+                    ObservedExecutions {
+                        settled: settles(
+                            target_1,
+                            target(1),
+                            ExecutionSettlement::Failed(StepFailureKind::Command),
+                        ),
+                        started: starts(handler_1, handler(1), None),
+                    },
+                ),
+                (
+                    StepStateKind::Recovering,
+                    StepStateKind::Failed,
+                    ObservedExecutions {
+                        settled: settles(handler_1, handler(1), ExecutionSettlement::Succeeded),
+                        started: None,
+                    },
+                ),
+            ]
+        );
+    })
+    .await;
+}
+
+// REQ-TELEMETRY-41, REQ-TELEMETRY-43
+#[tokio::test]
+async fn cancelled_command_settles_its_open_execution_with_the_reason() {
+    with_watchdog(async {
+        let cancellation = CancellationSource::new();
+        let fixture = execution_fixture(
+            "schemaVersion: 1\nsteps:\n  active:\n    kind: cmd\n    command:\n      argv: [/bin/sh, -c, 'exec sleep 30']\n  pending:\n    kind: cmd\n    dependsOn: [active]\n    command:\n      argv: [/bin/sh, -c, 'true']\n",
+            ResolvedInputs::default(),
+            EnvironmentSnapshot::new([(OsString::from("PATH"), env::var_os("PATH").unwrap())]),
+            cancellation.clone(),
+            1,
+            1024,
+        );
+        let (observer, entries, mut observed, mut terminal_reached, release_terminal) =
+            RecordingObserver::with_terminal_gate();
+        let artifacts = fixture.artifacts.clone();
+        let inputs = fixture.inputs.clone();
+        let execution = tokio::spawn(async move {
+            execute_workflow(
+                fixture.admitted,
+                &artifacts,
+                &inputs,
+                &StepDiagnosticLog::default(),
+                AgentExecution::disabled(),
+                TestClock,
+                observer,
+            )
+            .await
+        });
+        wait_for_step_transition(&mut observed, "active", StepStateKind::Running).await;
+        assert!(cancellation.request_cancellation(CancellationReason::UserRequest));
+        terminal_reached.recv().await.unwrap();
+        release_terminal.send(true).unwrap();
+        let result = execution.await.unwrap().unwrap();
+        assert_eq!(
+            result.outcome,
+            RunOutcome::Cancelled {
+                reason: CancellationReason::UserRequest
+            }
+        );
+
+        let observed = observed_step_executions(&entries);
+        assert!(stated_executions(&observed, "pending").is_empty());
+        let stated = stated_executions(&observed, "active");
+        assert_eq!(stated.len(), 2, "{stated:?}");
+        let target_1 = started_invocation(&stated[0].2);
+        assert_eq!(
+            stated[1],
+            (
+                StepStateKind::Cancelling,
+                StepStateKind::Cancelled,
+                ObservedExecutions {
+                    settled: settles(
+                        target_1,
+                        target(1),
+                        ExecutionSettlement::Cancelled(CancellationReason::UserRequest),
+                    ),
+                    started: None,
+                },
+            )
+        );
     })
     .await;
 }

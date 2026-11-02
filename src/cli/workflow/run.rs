@@ -2588,8 +2588,8 @@ mod tests {
 
     use super::*;
     use um_execution::{
-        ObservationTime, SchedulingGate, StepStateKind, TransitionEvent, TransitionObservation,
-        TransitionSequence, WorkflowState, resolve,
+        ObservationTime, ObservedExecutions, SchedulingGate, StepStateKind, TransitionEvent,
+        TransitionObservation, TransitionSequence, WorkflowState, resolve,
     };
 
     #[derive(Clone)]
@@ -3554,6 +3554,7 @@ mod tests {
                 to,
             },
             step: None,
+            executions: ObservedExecutions::default(),
         }))
     }
 
@@ -3567,6 +3568,7 @@ mod tests {
                 to: Box::new(WorkflowState::Succeeded),
             },
             step: None,
+            executions: ObservedExecutions::default(),
         }))
     }
 }

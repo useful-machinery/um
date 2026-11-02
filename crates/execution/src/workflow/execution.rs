@@ -9,16 +9,17 @@ use super::coordinator::{CommitPort, CommittedReduction, CoordinationError, Coor
 use super::diagnostic::StepDiagnosticLog;
 use super::input::InputStaging;
 use super::observation::{
-    ExecutionObservation, ExecutionObserver, ObservedStepTransition, TransitionObservation,
+    ExecutionObservation, ExecutionObserver, ExecutionSettlement, ObservedExecutions,
+    ObservedStepTransition, SettledExecution, StartedExecution, TransitionObservation,
 };
 use super::resolution::{WorkflowContentDigest, WorkflowSourceProvenance};
 use super::runtime::{
-    ExportSet, OutputProducer, RunOutcome, RuntimeState, StepState, StepStateKind, TransitionEvent,
-    WorkflowState,
+    ActionId, ActiveStepInvocation, ExportSet, OutputProducer, RecoveryTerminalDisposition,
+    RunOutcome, RuntimeState, StepState, StepStateKind, TransitionEvent, WorkflowState,
 };
 use super::step_runtime::{
-    AgentExecution, StepFailureCause, WorkflowAgentDispatcher, WorkflowCommitPort,
-    WorkflowExecutionStart, execute_workflow_observed,
+    AgentExecution, RecoveryFailureKind, StepFailureCause, StepFailureKind,
+    WorkflowAgentDispatcher, WorkflowCommitPort, WorkflowExecutionStart, execute_workflow_observed,
 };
 use super::value::CapturedValue;
 
@@ -186,9 +187,14 @@ where
             committed.await?;
             for event in events {
                 let step = observed_step_transition(&event, &state);
+                let executions = observed_executions(&event, &state);
                 observer
                     .observe(ExecutionObservation::Transition(Box::new(
-                        TransitionObservation { event, step },
+                        TransitionObservation {
+                            event,
+                            step,
+                            executions,
+                        },
                     )))
                     .await;
             }
@@ -299,6 +305,141 @@ fn observed_step_transition<Deadline>(
         }
         _ => None,
     }
+}
+
+/// The physical target, finalizer or recovery-handler execution a committed step transition
+/// settles and the one it starts, read from the post-commit step state (REQ-TELEMETRY-41).
+fn observed_executions<Deadline>(
+    event: &TransitionEvent<Deadline>,
+    state: &RuntimeState<StepFailureCause, CapturedValue, Deadline>,
+) -> ObservedExecutions {
+    let TransitionEvent::Step { step, from, to, .. } = event else {
+        return ObservedExecutions::default();
+    };
+    let Some(runtime) = state.steps.get(step) else {
+        return ObservedExecutions::default();
+    };
+    let settles = |(invocation, role): (ActionId, ActiveStepInvocation), settlement| {
+        Some(SettledExecution {
+            invocation,
+            role,
+            settlement,
+        })
+    };
+    let target = runtime.target_execution.zip(runtime.target_invocation).map(
+        |(execution_number, invocation)| {
+            (
+                invocation,
+                ActiveStepInvocation::Target { execution_number },
+            )
+        },
+    );
+    let recovery = runtime.recovery.as_ref();
+    let round = recovery.and_then(|recovery| recovery.rounds.last());
+    let handler = round.and_then(|round| {
+        round.handler.as_ref().map(|handler| {
+            (
+                handler.invocation,
+                ActiveStepInvocation::RecoveryHandler {
+                    round: round.number,
+                },
+            )
+        })
+    });
+    let failed_target = round.and_then(|round| {
+        let failed = &round.failed_execution;
+        settles(
+            (
+                failed.invocation,
+                ActiveStepInvocation::Target {
+                    execution_number: failed.execution_number,
+                },
+            ),
+            ExecutionSettlement::Failed(StepFailureKind::of(&failed.cause)),
+        )
+    });
+    let (settled, started) = match to {
+        StepStateKind::Starting => {
+            let recovery_failure_kind = runtime
+                .target_execution
+                .filter(|execution| execution.get() > 1)
+                .and(round)
+                .map(|round| {
+                    RecoveryFailureKind::classify(
+                        round.failed_execution.phase,
+                        &round.failed_execution.cause,
+                    )
+                });
+            let settled = match from {
+                StepStateKind::Pending => None,
+                StepStateKind::Recovering => {
+                    handler.and_then(|handler| settles(handler, ExecutionSettlement::Succeeded))
+                }
+                _ => failed_target
+                    .filter(|failed| Some(failed.invocation) != runtime.target_invocation),
+            };
+            let started = target.map(|(invocation, role)| StartedExecution {
+                invocation,
+                role,
+                recovery_failure_kind,
+            });
+            (settled, started)
+        }
+        StepStateKind::Recovering if *from != StepStateKind::Recovering => (
+            failed_target,
+            handler.map(|(invocation, role)| StartedExecution {
+                invocation,
+                role,
+                recovery_failure_kind: None,
+            }),
+        ),
+        StepStateKind::Succeeded => (
+            target.and_then(|target| settles(target, ExecutionSettlement::Succeeded)),
+            None,
+        ),
+        StepStateKind::Failed => {
+            let settled = match recovery.and_then(|recovery| recovery.terminal_disposition) {
+                Some(RecoveryTerminalDisposition::GaveUp { .. }) => {
+                    handler.and_then(|handler| settles(handler, ExecutionSettlement::Succeeded))
+                }
+                Some(RecoveryTerminalDisposition::HandlerFailed { .. }) => {
+                    handler.and_then(|handler| {
+                        settles(
+                            handler,
+                            ExecutionSettlement::Failed(StepFailureKind::RecoveryHandler),
+                        )
+                    })
+                }
+                _ => target.and_then(|target| {
+                    settles(
+                        target,
+                        ExecutionSettlement::Failed(
+                            runtime.failure_kind.unwrap_or(StepFailureKind::Execution),
+                        ),
+                    )
+                }),
+            };
+            (settled, None)
+        }
+        StepStateKind::Cancelled => {
+            let StepState::Cancelled { detail } = &runtime.state else {
+                return ObservedExecutions::default();
+            };
+            let open = match recovery.and_then(|recovery| recovery.terminal_disposition) {
+                Some(RecoveryTerminalDisposition::Cancelled {
+                    active: ActiveStepInvocation::RecoveryHandler { .. },
+                    ..
+                }) => handler,
+                _ => target,
+            };
+            (
+                open.and_then(|open| settles(open, ExecutionSettlement::Cancelled(detail.code))),
+                None,
+            )
+        }
+        _ => (None, None),
+    };
+    ObservedExecutions { settled, started }
 }
 
 #[expect(

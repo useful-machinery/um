@@ -7,7 +7,9 @@ use super::*;
 use crate::workflow::agent::{
     AgentInvocationIdentity, AgentObservation, AgentObservationEnvelope, WorkflowRunId,
 };
-use crate::workflow::observation::{CommandOutputSource, ObservedStepTransition};
+use crate::workflow::observation::{
+    CommandOutputSource, ObservedExecutions, ObservedStepTransition,
+};
 use crate::workflow::resolution;
 use crate::workflow::runtime::{FailurePhase, StepStateKind, TransitionSequence};
 use crate::workflow::step_runtime::{
@@ -50,6 +52,7 @@ fn step_transition(
             to,
         },
         step: detail,
+        executions: ObservedExecutions::default(),
     }))
 }
 
@@ -377,6 +380,7 @@ steps:
                         ..
                     },
                     step: None,
+                    ..
                 }
             )
     ));
@@ -391,6 +395,7 @@ steps:
                         ..
                     },
                     step: None,
+                    ..
                 }
             )
     ));
@@ -405,6 +410,7 @@ steps:
                         ..
                     },
                     step: Some(ObservedStepTransition::Failed { detail }),
+                    ..
                 } if detail
                     == &crate::workflow::evidence::failure_detail(
                         FailurePhase::Execution,

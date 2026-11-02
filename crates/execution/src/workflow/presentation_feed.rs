@@ -561,6 +561,7 @@ fn normalize_transition<Deadline: DisplayDeadline>(
     PresentationTransition {
         event,
         step: transition.step,
+        executions: transition.executions,
     }
 }
 

@@ -19,6 +19,7 @@ use super::evidence::{
 use super::finalization_context::{
     self, FinalizationContext, OrdinaryIssue, OrdinaryIssueDisposition,
 };
+use super::step_runtime::StepFailureKind;
 use super::validated::{
     ResolvedDirectPrerequisite, ResolvedValueSource, ValidatedCommonStep, ValidatedFinalizer,
     ValidatedMessageSource, ValidatedRecoveryHandler, ValidatedStep, ValidatedStepRecovery,
@@ -604,6 +605,9 @@ pub(crate) struct StepRuntimeState<Cause, Output> {
     pub(crate) active_invocation: Option<ActiveStepInvocation>,
     pub(crate) recovery: Option<StepRecoveryState<Cause>>,
     pub(crate) condition_passed: bool,
+    // The kind of the failure that settled the target without a recovery round, which the
+    // terminal transition reports once the cause itself is no longer retained.
+    pub(crate) failure_kind: Option<StepFailureKind>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1231,6 +1235,7 @@ where
                             terminal_disposition: None,
                         }),
                     condition_passed: false,
+                    failure_kind: None,
                 },
             )
         })
@@ -2076,6 +2081,9 @@ where
     }
     if definition.recovery.is_some() {
         mark_recovery_exhausted(&mut reduction.state, &step);
+    }
+    if let Some(runtime) = reduction.state.steps.get_mut(&step) {
+        runtime.failure_kind = Some(cause.failure_kind());
     }
     settle_target_failure(reduction, step, definition, detail);
     true

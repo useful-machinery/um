@@ -46,7 +46,7 @@ use crate::workflow::input::InputStaging;
 use crate::workflow::invocation_accounting::{InvocationAccountingLog, InvocationUsage};
 use crate::workflow::observation::{
     CommandOutputSource, ExecutionObservation, ExecutionObserver, NoopExecutionObserver,
-    TransitionObservation,
+    ObservedExecutions, TransitionObservation,
 };
 use crate::workflow::recovery::{
     RECOVERY_AGENT_INSTRUCTIONS, RECOVERY_CONTEXT_VARIABLE, RecoveryDecisionFailureKind,
@@ -702,6 +702,7 @@ async fn watchdog_expiry_names_the_last_observed_transition() {
                 to,
             },
             step: None,
+            executions: ObservedExecutions::default(),
         }))
     };
     observer

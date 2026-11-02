@@ -239,6 +239,9 @@ struct RunEventState {
     ids: Vec<KeyValue>,
     // The open phase child of `event`; at most one at a time.
     phase: Option<TelemetryEvent>,
+    // The recorder `event` was started with, which starts the run's
+    // `runner.step_execution` records.
+    recorder: Option<Arc<crate::telemetry::Recorder>>,
 }
 
 // The phases of a run, each recorded as a child of `runner.run`
@@ -318,7 +321,7 @@ impl RunEvent {
 
     fn start(
         &self,
-        recorder: &crate::telemetry::Recorder,
+        recorder: &Arc<crate::telemetry::Recorder>,
         identity: &AssignmentIdentity,
         runner_id: &str,
     ) {
@@ -343,7 +346,49 @@ impl RunEvent {
                 ),
             ]);
             state.event = Some(recorder.start("runner.run", attributes));
+            state.recorder = Some(Arc::clone(recorder));
         }
+    }
+
+    // A run event started for the given IDs, for tests outside this module.
+    #[cfg(test)]
+    pub(super) fn started_fixture(
+        recorder: &Arc<crate::telemetry::Recorder>,
+        run_id: &str,
+        assignment_id: &str,
+        attempt_id: &str,
+    ) -> Self {
+        let event = Self::default();
+        let identity = AssignmentIdentity {
+            assignment_id: assignment_id.to_owned(),
+            run_id: run_id.to_owned(),
+            project_id: String::new(),
+            attempt_id: attempt_id.to_owned(),
+            execution_spec_id: String::new(),
+            source_branch: String::new(),
+            source_display_snapshot: None,
+            repository_connection_id: String::new(),
+            source_object_format: String::new(),
+            source_commit_oid: String::new(),
+        };
+        event.start(recorder, &identity, "rnr_fixture");
+        event
+    }
+
+    // Starts one root `runner.step_execution` record carrying the run's IDs
+    // and `attributes` (REQ-TELEMETRY-41, REQ-TELEMETRY-42); `None` when the
+    // run never began or has ended.
+    pub(super) fn step_execution(
+        &self,
+        attributes: impl IntoIterator<Item = KeyValue>,
+    ) -> Option<TelemetryEvent> {
+        let state = self.state();
+        state.event.as_ref()?;
+        let recorder = state.recorder.as_ref()?;
+        Some(recorder.start(
+            "runner.step_execution",
+            state.ids.iter().cloned().chain(attributes),
+        ))
     }
 
     pub(super) fn set(&self, attribute: KeyValue) {

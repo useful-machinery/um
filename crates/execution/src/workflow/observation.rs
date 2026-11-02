@@ -1,6 +1,7 @@
 use std::future::{Future, ready};
 use std::sync::Arc;
 
+use super::admission::CancellationReason;
 use super::agent::AgentObservationEnvelope;
 use super::evidence::{
     BlockedDetail, CancellationDetail, ConditionFalseDetail, FailureDetail, NonExecutionDetail,
@@ -9,6 +10,7 @@ use super::runtime::{
     ActionId, ActiveStepInvocation, RecoveryDecisionKind, RecoveryHandlerActivity,
     RecoveryHandlerKind, TransitionEvent,
 };
+use super::step_runtime::{RecoveryFailureKind, StepFailureKind};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum CommandOutputSource {
@@ -84,10 +86,45 @@ pub enum ObservedStepTransition {
     },
 }
 
+/// How one physical target, finalizer or recovery-handler execution ended.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExecutionSettlement {
+    /// The execution completed, a handler that decided either way included.
+    Succeeded,
+    Failed(StepFailureKind),
+    Cancelled(CancellationReason),
+}
+
+/// The physical execution a step transition settles.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SettledExecution {
+    pub invocation: ActionId,
+    pub role: ActiveStepInvocation,
+    pub settlement: ExecutionSettlement,
+}
+
+/// The physical execution a step transition starts; a recheck names the kind of the failure
+/// it follows, the kind a handler's context names.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StartedExecution {
+    pub invocation: ActionId,
+    pub role: ActiveStepInvocation,
+    pub recovery_failure_kind: Option<RecoveryFailureKind>,
+}
+
+/// The physical executions one committed transition settles and starts; empty for every
+/// transition that neither ends nor begins a target, finalizer or recovery-handler execution.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ObservedExecutions {
+    pub settled: Option<SettledExecution>,
+    pub started: Option<StartedExecution>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TransitionObservation<Deadline> {
     pub event: TransitionEvent<Deadline>,
     pub step: Option<ObservedStepTransition>,
+    pub executions: ObservedExecutions,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

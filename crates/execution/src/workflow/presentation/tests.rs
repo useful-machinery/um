@@ -17,8 +17,8 @@ use crate::workflow::admission::{
 use crate::workflow::artifact::ArtifactStaging;
 use crate::workflow::diagnostic::{CapturedDiagnosticStream, StepDiagnostic};
 use crate::workflow::observation::{
-    CommandOutputClosedObservation, CommandOutputObservation, CommandOutputSource, SourceSequence,
-    TransitionObservation,
+    CommandOutputClosedObservation, CommandOutputObservation, CommandOutputSource,
+    ObservedExecutions, SourceSequence, TransitionObservation,
 };
 use crate::workflow::publication::{
     WorkflowRunCancellation, WorkflowRunStepKind, WorkflowRunTiming, WorkflowStepTiming,
@@ -424,6 +424,7 @@ fn step_transition(
             to,
         },
         step: detail,
+        executions: ObservedExecutions::default(),
     }))
 }
 
@@ -776,6 +777,7 @@ async fn live_stream_labels_normalized_output_and_orders_cancellation_acknowledg
                     deadline: timestamp("2026-08-02T12:01:58Z"),
                 },
                 step: None,
+                executions: ObservedExecutions::default(),
             },
         )))
         .await;

@@ -190,6 +190,7 @@ impl ExecutionJob {
                     .collect(),
                 recovery_agent_steps,
             },
+            self.run_event.clone(),
         );
         let process_guard_registry = self
             .accepted

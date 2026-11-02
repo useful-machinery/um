@@ -4076,6 +4076,42 @@ async fn authorized_execution_reports_one_run_after_acknowledgement() {
     }
 }
 
+// REQ-TELEMETRY-41
+#[tokio::test]
+async fn a_completed_run_writes_one_step_execution_per_executed_node() {
+    let workflow = "schemaVersion: 1\nsteps:\n  check:\n    kind: cmd\n    command:\n      argv: [\"true\"]\nfinalizers:\n  cleanup:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n";
+    let (_temporary, mut manager) = manager_fixture(workflow);
+    let (recorder, capture) = crate::telemetry::test_recorder("rbt_fixture");
+    manager.recorder = Some(recorder);
+    let offered = offer("bg");
+    offer_then_prepare(&mut manager, &offered).await;
+    spawn_execution(&mut manager, &offered);
+    with_watchdog(wait_for_terminal(&mut manager))
+        .await
+        .unwrap();
+    wait_for_execution_finalization(&mut manager).await;
+    assert_acknowledged_run(&mut manager, &capture, "succeeded");
+
+    let records = captured_events(&capture, "runner.step_execution");
+    assert_eq!(records.len(), 2);
+    for (step, role) in [("check", "ordinary"), ("cleanup", "finalizer")] {
+        let named = records
+            .iter()
+            .filter(|record| record["um.step.id"] == step)
+            .collect::<Vec<_>>();
+        assert_eq!(named.len(), 1, "{step}");
+        let record = named[0];
+        assert_eq!(record["um.step.role"], role, "{step}");
+        assert_eq!(record["um.step.execution_number"], 1, "{step}");
+        assert_eq!(record["um.outcome"], "success", "{step}");
+        assert_eq!(record["um.run.id"], offered.run_id, "{step}");
+        assert_eq!(record["um.assignment.id"], offered.assignment_id, "{step}");
+        assert_eq!(record["um.attempt.id"], offered.attempt_id, "{step}");
+        assert!(record.get("parent_span_id").is_none(), "{step}");
+    }
+    assert_eq!(capture.span_count("runner.step_execution"), 2);
+}
+
 // REQ-CANCEL-31
 #[tokio::test]
 async fn cancellation_during_result_delivery_reports_execution_terminal() {

@@ -59,8 +59,8 @@ use super::recovery::{
     parse_recovery_decision, recovery_definition, recovery_handler_cwd,
 };
 use super::runtime::{
-    Action, ActionId, ActionInput, ProvisionalStepResources, RecoveryDecision, RecoveryRoundNumber,
-    RecoveryRoundRecord, RequestedAction,
+    Action, ActionId, ActionInput, FailurePhase, ProvisionalStepResources, RecoveryDecision,
+    RecoveryRoundNumber, RecoveryRoundRecord, RequestedAction,
 };
 use super::validated::{
     ResolvedOutputSource, ResolvedValueSource, ValidatedAgentStep, ValidatedCommandStep,
@@ -210,6 +210,75 @@ pub enum StepFailureCause {
     Execution(StepExecutionFailure),
     OutputCapture(OutputCaptureFailure),
     RecoveryHandler(RecoveryHandlerFailure),
+}
+
+/// The closed kind of a `StepFailureCause`, which telemetry reports without its text
+/// (REQ-TELEMETRY-43).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StepFailureKind {
+    Start,
+    Command,
+    Agent,
+    OutputCapture,
+    RecoveryHandler,
+    Execution,
+}
+
+impl StepFailureKind {
+    pub fn of(cause: &StepFailureCause) -> Self {
+        match cause {
+            StepFailureCause::Start(_) => Self::Start,
+            StepFailureCause::Execution(StepExecutionFailure::Command(_)) => Self::Command,
+            StepFailureCause::Execution(StepExecutionFailure::Agent(_)) => Self::Agent,
+            StepFailureCause::Execution(StepExecutionFailure::TaskUnavailable) => Self::Execution,
+            StepFailureCause::OutputCapture(_) => Self::OutputCapture,
+            StepFailureCause::RecoveryHandler(_) => Self::RecoveryHandler,
+        }
+    }
+}
+
+/// The closed kind of the failure a recovery handler is given: the `kind` its context
+/// document carries and the kind a recheck reports (REQ-TELEMETRY-42).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RecoveryFailureKind {
+    CommandExit,
+    AgentFailure,
+    StartFailure,
+    ConditionFailure,
+    ExecutionFailure,
+    OutputCaptureFailure,
+}
+
+impl RecoveryFailureKind {
+    pub(crate) fn classify(phase: FailurePhase, cause: &StepFailureCause) -> Self {
+        match cause {
+            StepFailureCause::Execution(StepExecutionFailure::Command(
+                CommandExecutionFailure::UnsuccessfulExit { .. },
+            )) => Self::CommandExit,
+            StepFailureCause::Start(StepStartFailure::Agent(_))
+            | StepFailureCause::Execution(StepExecutionFailure::Agent(_)) => Self::AgentFailure,
+            StepFailureCause::Start(_) => Self::StartFailure,
+            StepFailureCause::Execution(_) => Self::ExecutionFailure,
+            StepFailureCause::OutputCapture(_) => Self::OutputCaptureFailure,
+            StepFailureCause::RecoveryHandler(_) => match phase {
+                FailurePhase::Start => Self::StartFailure,
+                FailurePhase::Condition => Self::ConditionFailure,
+                FailurePhase::Execution => Self::ExecutionFailure,
+                FailurePhase::OutputCapture => Self::OutputCaptureFailure,
+            },
+        }
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::CommandExit => "command_exit",
+            Self::AgentFailure => "agent_failure",
+            Self::StartFailure => "start_failure",
+            Self::ConditionFailure => "condition_failure",
+            Self::ExecutionFailure => "execution_failure",
+            Self::OutputCaptureFailure => "output_capture_failure",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -4110,3 +4179,122 @@ fn unsuccessful_exit(status: ExitStatus) -> CommandExecutionFailure {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod failure_kind_tests {
+    use super::*;
+
+    fn agent_failure() -> AgentFailure {
+        AgentFailure::new(AgentFailureCause::start_failure("spawn", "unavailable"))
+    }
+
+    // REQ-TELEMETRY-43
+    #[test]
+    fn failure_kinds_classify_every_step_failure_cause() {
+        let handler = || StepFailureCause::RecoveryHandler(RecoveryHandlerFailure::ResultMissing);
+        let cases = [
+            (
+                StepFailureCause::Start(StepStartFailure::StepUnavailable),
+                FailurePhase::Start,
+                StepFailureKind::Start,
+                RecoveryFailureKind::StartFailure,
+            ),
+            (
+                StepFailureCause::Start(StepStartFailure::Agent(agent_failure())),
+                FailurePhase::Start,
+                StepFailureKind::Start,
+                RecoveryFailureKind::AgentFailure,
+            ),
+            (
+                StepFailureCause::Execution(StepExecutionFailure::Command(
+                    CommandExecutionFailure::UnsuccessfulExit { code: Some(75) },
+                )),
+                FailurePhase::Execution,
+                StepFailureKind::Command,
+                RecoveryFailureKind::CommandExit,
+            ),
+            (
+                StepFailureCause::Execution(StepExecutionFailure::Command(
+                    CommandExecutionFailure::Wait,
+                )),
+                FailurePhase::Execution,
+                StepFailureKind::Command,
+                RecoveryFailureKind::ExecutionFailure,
+            ),
+            (
+                StepFailureCause::Execution(StepExecutionFailure::Agent(agent_failure())),
+                FailurePhase::Execution,
+                StepFailureKind::Agent,
+                RecoveryFailureKind::AgentFailure,
+            ),
+            (
+                StepFailureCause::Execution(StepExecutionFailure::TaskUnavailable),
+                FailurePhase::Execution,
+                StepFailureKind::Execution,
+                RecoveryFailureKind::ExecutionFailure,
+            ),
+            (
+                StepFailureCause::OutputCapture(OutputCaptureFailure::TaskUnavailable),
+                FailurePhase::OutputCapture,
+                StepFailureKind::OutputCapture,
+                RecoveryFailureKind::OutputCaptureFailure,
+            ),
+            (
+                handler(),
+                FailurePhase::Start,
+                StepFailureKind::RecoveryHandler,
+                RecoveryFailureKind::StartFailure,
+            ),
+            (
+                handler(),
+                FailurePhase::Condition,
+                StepFailureKind::RecoveryHandler,
+                RecoveryFailureKind::ConditionFailure,
+            ),
+            (
+                handler(),
+                FailurePhase::Execution,
+                StepFailureKind::RecoveryHandler,
+                RecoveryFailureKind::ExecutionFailure,
+            ),
+            (
+                handler(),
+                FailurePhase::OutputCapture,
+                StepFailureKind::RecoveryHandler,
+                RecoveryFailureKind::OutputCaptureFailure,
+            ),
+        ];
+        for (cause, phase, kind, recovery_kind) in cases {
+            assert_eq!(StepFailureKind::of(&cause), kind, "{cause:?}");
+            assert_eq!(
+                RecoveryFailureKind::classify(phase, &cause),
+                recovery_kind,
+                "{cause:?} in {phase:?}"
+            );
+        }
+    }
+
+    // REQ-TELEMETRY-43
+    #[test]
+    fn recovery_failure_kinds_keep_the_handler_context_strings() {
+        assert_eq!(
+            [
+                RecoveryFailureKind::CommandExit,
+                RecoveryFailureKind::AgentFailure,
+                RecoveryFailureKind::StartFailure,
+                RecoveryFailureKind::ConditionFailure,
+                RecoveryFailureKind::ExecutionFailure,
+                RecoveryFailureKind::OutputCaptureFailure,
+            ]
+            .map(RecoveryFailureKind::as_str),
+            [
+                "command_exit",
+                "agent_failure",
+                "start_failure",
+                "condition_failure",
+                "execution_failure",
+                "output_capture_failure",
+            ]
+        );
+    }
+}

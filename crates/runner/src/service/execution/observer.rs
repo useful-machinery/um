@@ -9,6 +9,7 @@ pub(super) struct RunnerExecutionObserver {
     post_stop_fence: PostStopFence,
     cancellation: CancellationSource,
     invocation_evidence: RunnerInvocationEvidence,
+    run_event: RunEvent,
     state: Arc<Mutex<ObserverState>>,
 }
 
@@ -30,6 +31,9 @@ pub(super) struct ObserverState {
     step_timings: BTreeMap<String, RunnerStepTiming>,
     active_invocations: BTreeMap<String, RunnerActiveInvocation>,
     settled_invocations: BTreeMap<u64, (String, RecoveryInvocationV1)>,
+    // The open `runner.step_execution` records, keyed by the transition
+    // sequence of the invocation each one records.
+    step_executions: BTreeMap<u64, telemetry::Event>,
     fault: Option<ObserverFault>,
 }
 
@@ -78,6 +82,10 @@ pub(super) struct RunnerStepTiming {
 }
 
 impl RunnerExecutionObserver {
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the observer receives each assignment boundary it reports through explicitly"
+    )]
     pub(super) fn new(
         assignment_id: String,
         attempt_id: String,
@@ -86,6 +94,7 @@ impl RunnerExecutionObserver {
         post_stop_fence: PostStopFence,
         cancellation: CancellationSource,
         invocation_evidence: RunnerInvocationEvidence,
+        run_event: RunEvent,
     ) -> Self {
         Self {
             assignment_id,
@@ -95,6 +104,7 @@ impl RunnerExecutionObserver {
             post_stop_fence,
             cancellation,
             invocation_evidence,
+            run_event,
             state: Arc::new(Mutex::new(ObserverState {
                 transition_count: 0,
                 last_sequence: 0,
@@ -105,6 +115,7 @@ impl RunnerExecutionObserver {
                 step_timings: BTreeMap::new(),
                 active_invocations: BTreeMap::new(),
                 settled_invocations: BTreeMap::new(),
+                step_executions: BTreeMap::new(),
                 fault: None,
             })),
         }
@@ -279,6 +290,100 @@ impl RunnerExecutionObserver {
         self.state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+// How a settled execution's `runner.step_execution` record ends
+// (REQ-TELEMETRY-43): its outcome and the closed `error.type`, if any.
+fn step_execution_end(
+    settlement: ExecutionSettlement,
+) -> (telemetry::Outcome, Option<&'static str>) {
+    match settlement {
+        ExecutionSettlement::Succeeded => (telemetry::Outcome::Success, None),
+        ExecutionSettlement::Cancelled(CancellationReason::ExecutionLeaseExpired) => {
+            (telemetry::Outcome::Timeout, Some("step_execution_timeout"))
+        }
+        ExecutionSettlement::Cancelled(_) => (telemetry::Outcome::Cancelled, None),
+        ExecutionSettlement::Failed(kind) => (
+            telemetry::Outcome::Failure,
+            Some(match kind {
+                StepFailureKind::Start => "step_start_failed",
+                StepFailureKind::Command => "step_command_failed",
+                StepFailureKind::Agent => "step_agent_failed",
+                StepFailureKind::OutputCapture => "step_output_capture_failed",
+                StepFailureKind::RecoveryHandler => "step_recovery_handler_failed",
+                StepFailureKind::Execution => "step_execution_failed",
+            }),
+        ),
+    }
+}
+
+// The attributes a started execution's record carries beside the run's IDs
+// (REQ-TELEMETRY-42).
+fn step_execution_attributes(
+    step: &str,
+    node_role: WorkflowNodeRole,
+    started: StartedExecution,
+) -> Vec<KeyValue> {
+    let (role, execution_number, recovery_round) = match started.role {
+        ActiveStepInvocation::Target { execution_number } => {
+            ("ordinary", execution_number.get(), None)
+        }
+        ActiveStepInvocation::RecoveryHandler { round } => {
+            ("recovery_handler", round.get(), Some(round.get()))
+        }
+    };
+    let role = match node_role {
+        WorkflowNodeRole::Finalizer => "finalizer",
+        WorkflowNodeRole::Step => role,
+    };
+    let mut attributes = vec![
+        KeyValue::new(telemetry::attribute::STEP_ID, step.to_owned()),
+        KeyValue::new(telemetry::attribute::STEP_ROLE, role),
+        KeyValue::new(
+            telemetry::attribute::STEP_EXECUTION_NUMBER,
+            telemetry::integer(u64::from(execution_number)),
+        ),
+    ];
+    if let Some(round) = recovery_round {
+        attributes.push(KeyValue::new(
+            telemetry::attribute::STEP_RECOVERY_ROUND,
+            telemetry::integer(u64::from(round)),
+        ));
+    }
+    if let Some(kind) = started.recovery_failure_kind {
+        attributes.push(KeyValue::new(
+            telemetry::attribute::STEP_RECOVERY_FAILURE_KIND,
+            kind.as_str(),
+        ));
+    }
+    attributes
+}
+
+// Finishes the record of the execution a committed transition settles, then
+// opens one for the execution it starts (REQ-TELEMETRY-41). An execution
+// still open when the run ends is never finished and writes nothing.
+fn record_step_executions(
+    run_event: &RunEvent,
+    open: &mut BTreeMap<u64, telemetry::Event>,
+    step: &str,
+    node_role: WorkflowNodeRole,
+    executions: ObservedExecutions,
+) {
+    if let Some(settled) = executions.settled
+        && let Some(event) = open.remove(&settled.invocation.transition_sequence.get())
+    {
+        let (outcome, error_type) = step_execution_end(settled.settlement);
+        if let Some(error_type) = error_type {
+            event.set(KeyValue::new(telemetry::attribute::ERROR_TYPE, error_type));
+        }
+        event.finish(outcome);
+    }
+    if let Some(started) = executions.started
+        && let Some(event) =
+            run_event.step_execution(step_execution_attributes(step, node_role, started))
+    {
+        open.insert(started.invocation.transition_sequence.get(), event);
     }
 }
 
@@ -542,6 +647,15 @@ impl ExecutionObserver<RunnerExecutionInstant> for RunnerExecutionObserver {
             if let Err(error) = enqueued {
                 state.fault = Some(ObserverFault::Outbox(error));
                 return;
+            }
+            if let TransitionEvent::Step { step, role, .. } = &transition.event {
+                record_step_executions(
+                    &observer.run_event,
+                    &mut state.step_executions,
+                    step,
+                    *role,
+                    transition.executions,
+                );
             }
             match &transition.event {
                 TransitionEvent::Step {
