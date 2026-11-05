@@ -1175,7 +1175,9 @@ impl CodexAppServerV1Parser {
         }
         let provider = optional_string(config, "model_provider")
             .ok_or_else(|| self.failure_for_current_phase())?;
+        // Codex leaves the setting null when it uses its built-in OpenAI provider.
         self.effective_model_provider = provider
+            .or(Some("openai"))
             .filter(|provider| !provider.is_empty())
             .map(Arc::from);
         if self.synthetic_model_provider.is_some()

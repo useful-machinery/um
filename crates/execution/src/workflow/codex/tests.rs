@@ -312,6 +312,27 @@ fn setup_requests_preserve_native_resources_and_only_fixtures_select_a_provider(
     assert_eq!(thread["params"]["modelProvider"], "loopback");
 }
 
+// REQ-AGENT-15
+#[test]
+fn implicit_openai_provider_matches_the_native_thread() {
+    let mut parser = parser(AgentValueKind::None, 1024, None);
+    initialize(&mut parser);
+    feed(
+        &mut parser,
+        json!({
+            "id": 2,
+            "result": {
+                "config": {"model_provider": null, "sqlite_home": SQLITE_HOME},
+                "origins": {}
+            }
+        }),
+    )
+    .unwrap();
+    let thread = take_json(&mut parser);
+    assert!(thread["params"].get("modelProvider").is_none());
+    thread_response(&mut parser, "openai");
+}
+
 #[test]
 fn admitted_text_attachment_fits_the_initial_native_turn() {
     let attachment = "x".repeat(usize::try_from(MAXIMUM_FRAME_BYTES).unwrap());
