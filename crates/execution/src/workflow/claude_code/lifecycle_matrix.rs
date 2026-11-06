@@ -685,15 +685,28 @@ impl LifecycleCell {
     /// A backgrounded subagent whose own backgrounded command or monitor is released after
     /// the answer: the subagent completes with the task still running, the notified turn
     /// settles the value, and the task's end reaches Claude Code in its wind-down, with stdin
-    /// closed. The binary decides whether it exits first or resumes the finished subagent to
-    /// deliver the end and opens an epilogue (REQ-AGENT-76); the driver notes the side. A
-    /// resume it announces and abandons at end of stream is AUTO-90's shape, which the
-    /// adapter rejects and the cell fails on, retaining the transcript.
+    /// closed. The task's report races Claude Code's exit (`leftover_report_races_the_exit`).
     const fn released_after_the_answer(&self) -> bool {
         match self.work {
             Work::BackgroundAgent { subagent } => subagent.released_after_the_answer(),
             _ => false,
         }
+    }
+
+    /// A backgrounded subagent's leftover task whose report reaches Claude Code after the final
+    /// answer, with stdin closed: the task outlives the subagent in the drain with no followup,
+    /// or is released after the answer. Claude Code enqueues the task's `<task-notification>`
+    /// only after the turn's model response, and its print-mode park loop exits once no task
+    /// runs and its queue is empty: it does not wait for a terminal `local_bash` task's
+    /// notification. So the binary exits before the report reaches the finished subagent
+    /// (`started`, `completed`), resumes it and abandons the resumed run at exit (`resumed`,
+    /// which the adapter reports as a warning), or resumes it and the resumed run completes,
+    /// opening an epilogue (REQ-AGENT-64, REQ-AGENT-76); the driver notes the side.
+    const fn leftover_report_races_the_exit(&self) -> bool {
+        (self.outlives_its_subagent_in_the_drain()
+            && matches!(self.followup, Followup::None)
+            && matches!(self.ending, Ending::Settle))
+            || self.released_after_the_answer()
     }
 }
 
@@ -2044,7 +2057,7 @@ async fn drive(
             "the stopped subagent's thread did not report before the turn's result".into()
         });
     }
-    if cell.released_after_the_answer() {
+    if cell.leftover_report_races_the_exit() {
         let statuses = backgrounded_subagent_statuses(&session.observations);
         let resumed = statuses
             .iter()
@@ -2058,6 +2071,10 @@ async fn drive(
             (0, _) => "Claude Code exited before the task's end it released reached it".into(),
             (1, 2) => "Claude Code resumed the subagent for the task's end after the value \
                        settled and the resumed run completed"
+                .into(),
+            (1, 1) => "Claude Code announced its resume of the subagent for the task's end and \
+                       exited before the resumed run completed; the adapter reported the \
+                       abandoned run as a warning"
                 .into(),
             _ => format!(
                 "Claude Code resumed the subagent for the task's end after the value settled; \
@@ -2797,6 +2814,50 @@ fn documented_unrecognized(mode: Mode, event: &Value) -> bool {
     }
 }
 
+/// The status lists a non-cancelled backgrounded-subagent cell accepts. A cancelled subagent
+/// reports `started` alone, a stopped one `stopped`; each resume a further `resumed`,
+/// `completed`, and so does Claude Code's own resume that delivers the report of a task the
+/// subagent left running (REQ-AGENT-64), unless `TaskStop` stopped the task with the
+/// subagent. Where that report races Claude Code's exit, the report run may be missing or
+/// abandoned after its `resumed` (REQ-AGENT-76, `leftover_report_races_the_exit`).
+fn accepted_subagent_endings(cell: &LifecycleCell) -> Vec<Vec<&'static str>> {
+    let end = if cell.followup.stops_the_work() {
+        "stopped"
+    } else {
+        "completed"
+    };
+    let mut settled = vec!["started", end];
+    for _ in 0..cell.followup.resumes() {
+        settled.extend(["resumed", "completed"]);
+    }
+    let reported = (cell.outlives_its_subagent_in_the_drain() && !cell.followup.stops_the_work())
+        || cell.released_after_the_answer();
+    let report: &[&str] = if reported {
+        &["resumed", "completed"]
+    } else {
+        &[]
+    };
+    let shortest = if cell.leftover_report_races_the_exit() {
+        0
+    } else {
+        report.len()
+    };
+    (shortest..=report.len())
+        .map(|delivered| [settled.as_slice(), &report[..delivered]].concat())
+        .collect()
+}
+
+/// Whether a backgrounded subagent's statuses are one of the cell's accepted endings
+/// (REQ-AGENT-64, REQ-AGENT-76).
+fn accepted_subagent_statuses(cell: &LifecycleCell, statuses: &[String]) -> bool {
+    accepted_subagent_endings(cell).iter().any(|ending| {
+        ending
+            .iter()
+            .copied()
+            .eq(statuses.iter().map(String::as_str))
+    })
+}
+
 fn verify(
     cell: LifecycleCell,
     outcome: &AgentOutcome,
@@ -2860,34 +2921,12 @@ fn verify(
     if !unrecognized.is_empty() {
         return Err(format!("unrecognized harness events: {unrecognized:?}"));
     }
-    // A cancelled subagent reports `started` alone, a stopped one `stopped`; each resume a
-    // further `resumed`, `completed`, and so does Claude Code's own resume that delivers the
-    // report of a command the subagent left running (REQ-AGENT-64), unless `TaskStop`
-    // stopped the command with the subagent.
     if matches!(cell.work, Work::BackgroundAgent { .. }) && !cell.ending.cancels() {
-        let end = if cell.followup.stops_the_work() {
-            "stopped"
-        } else {
-            "completed"
-        };
-        let mut expected = vec!["started", end];
-        for _ in 0..cell.followup.resumes() {
-            expected.extend(["resumed", "completed"]);
-        }
-        if cell.outlives_its_subagent_in_the_drain() && !cell.followup.stops_the_work() {
-            expected.extend(["resumed", "completed"]);
-        }
         let statuses = backgrounded_subagent_statuses(observations);
-        // A task released after the answer ends in Claude Code's wind-down: the binary exits
-        // before the end reaches it, or resumes the finished subagent to deliver it and the
-        // resumed run completes (REQ-AGENT-76); the driver notes the side.
-        let mut resumed_in_the_wind_down = expected.clone();
-        resumed_in_the_wind_down.extend(["resumed", "completed"]);
-        let accepted = statuses == expected
-            || (cell.released_after_the_answer() && statuses == resumed_in_the_wind_down);
-        if !accepted {
+        if !accepted_subagent_statuses(&cell, &statuses) {
             return Err(format!(
-                "backgrounded subagent statuses {statuses:?}, expected {expected:?}"
+                "backgrounded subagent statuses {statuses:?}, expected one of {:?}",
+                accepted_subagent_endings(&cell)
             ));
         }
     }
@@ -3139,6 +3178,69 @@ fn retention_root_prefers_the_retain_directory_variable() {
     let fallback = std::env::temp_dir().join("um-claude-code-lifecycle-matrix");
     assert_eq!(retention_root(None), fallback);
     assert_eq!(retention_root(Some(OsStr::new(""))), fallback);
+}
+
+// REQ-AGENT-64
+// REQ-AGENT-76
+#[test]
+fn wind_down_endings_are_accepted_where_the_leftover_report_races_the_exit() {
+    let cells = lifecycle_cells();
+    assert_eq!(
+        cells
+            .iter()
+            .filter(|cell| cell.leftover_report_races_the_exit())
+            .count(),
+        12
+    );
+    let cell = |name: &str| {
+        cells
+            .iter()
+            .find(|cell| cell.name() == name)
+            .unwrap_or_else(|| panic!("no cell {name}"))
+    };
+    let accepts = |name: &str, statuses: &[&str]| {
+        let statuses = statuses
+            .iter()
+            .map(|status| (*status).to_owned())
+            .collect::<Vec<_>>();
+        accepted_subagent_statuses(cell(name), &statuses)
+    };
+    let no_resume: &[&str] = &["started", "completed"];
+    let abandoned: &[&str] = &["started", "completed", "resumed"];
+    let resumed: &[&str] = &["started", "completed", "resumed", "completed"];
+    let unfinished: &[&str] = &["started"];
+    let resumed_again: &[&str] = &["started", "completed", "resumed", "completed", "resumed"];
+    for name in [
+        "response/background-agent[background-bash-in-drain]/none/settle",
+        "none/background-agent[monitor]/none/settle",
+        "result/background-agent[monitor-after-the-answer]/none/settle",
+    ] {
+        for ending in [no_resume, abandoned, resumed] {
+            assert!(accepts(name, ending), "{name} {ending:?}");
+        }
+        for ending in [unfinished, resumed_again] {
+            assert!(!accepts(name, ending), "{name} {ending:?}");
+        }
+    }
+    // The messaged run's report resume happens before settlement, with stdin open.
+    let messaged = "response/background-agent[background-bash-in-drain]/resume/settle";
+    let reported = [
+        "started",
+        "completed",
+        "resumed",
+        "completed",
+        "resumed",
+        "completed",
+    ];
+    assert!(accepts(messaged, &reported));
+    for ending in [no_resume, abandoned, resumed, resumed_again, &reported[..5]] {
+        assert!(!accepts(messaged, ending), "{messaged} {ending:?}");
+    }
+    let in_exchange = "response/background-agent[background-bash-in-exchange]/none/settle";
+    assert!(accepts(in_exchange, no_resume));
+    for ending in [unfinished, abandoned, resumed] {
+        assert!(!accepts(in_exchange, ending), "{in_exchange} {ending:?}");
+    }
 }
 
 // INV-HARNESS-13

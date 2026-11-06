@@ -2384,14 +2384,29 @@ fn assert_subagent_resumed_to_deliver_its_commands_report(observations: &[AgentO
     )));
 }
 
-// REQ-AGENT-35, REQ-AGENT-64, INV-HARNESS-7
+/// The single warning `abandoned_work_warnings` reports for the subagent `Review the diff`
+/// when Claude Code exits with its resumed run outstanding after the value settled.
+fn assert_one_abandoned_subagent_warning(warnings: &[AgentObservation]) {
+    assert!(
+        matches!(
+            warnings,
+            [AgentObservation::Diagnostic { level: AgentDiagnosticLevel::Warning, message }]
+                if message.contains("Review the diff")
+        ),
+        "{warnings:?}"
+    );
+}
+
+// REQ-AGENT-35, REQ-AGENT-64, REQ-AGENT-69, REQ-AGENT-76, INV-HARNESS-7
 #[test]
-fn an_abandoned_resume_at_end_of_stream_after_the_accepted_result_is_refused() {
-    // AUTO-90: Buildkite build #3492's `result/background-agent[monitor]/none/settle` ended
-    // after the accepted result with `completedExchanges=2` and one backgrounded subagent
-    // outstanding; its transcript was not retained, so the frames are those of the outliving
-    // command's row up to Claude Code's own resume of the finished subagent, then end of
-    // stream. The resumed run is work the step waits for, so the accepted value does not stand.
+fn an_abandoned_resume_at_end_of_stream_after_the_accepted_result_completes_with_it() {
+    // AUTO-90, decided by AUTO-171: Buildkite build #3492's
+    // `result/background-agent[monitor]/none/settle` ended after the accepted result with
+    // `completedExchanges=2` and one backgrounded subagent outstanding; its transcript was
+    // not retained, so the frames are those of the outliving command's row up to Claude
+    // Code's own resume of the finished subagent, then end of stream. The resumed run began
+    // after the value settled, so Claude Code's exit abandons it: the step completes with the
+    // accepted value and the abandoned run is a warning.
     let transcript = backgrounded_subagent_leaving_its_command_running_transcript();
     let first_result = position_of(&transcript, |value| value["type"] == "result");
     let after_first_result = &transcript[first_result + 1..];
@@ -2428,10 +2443,87 @@ fn an_abandoned_resume_at_end_of_stream_after_the_accepted_result_is_refused() {
             |observation| observations.push(observation),
         )
         .unwrap();
+    let warnings = parser.abandoned_work_warnings();
+    assert_one_abandoned_subagent_warning(&warnings);
+    observations.extend(warnings);
     assert_eq!(
         subagent_statuses(&observations),
         ["started", "completed", "resumed"]
     );
+    let outcome = parser.finish(true);
+    assert!(
+        matches!(
+            &outcome,
+            AgentOutcome::Completed(CompletedAgentInvocation::Result(result))
+                if result.value() == &json!(7)
+        ),
+        "the accepted value stands: {outcome:?}"
+    );
+}
+
+// REQ-AGENT-64, REQ-AGENT-69, REQ-AGENT-76, INV-HARNESS-7
+#[test]
+fn an_abandoned_resume_at_end_of_stream_after_the_settling_result_completes_with_the_response() {
+    // AUTO-171: Buildkite build #3571's shape (`resultAccepted: false`): in Response and None
+    // modes the notified turn's `result` settles the value, and Claude Code exits after it
+    // has begun the resume that delivers the leftover command's report, before the resumed
+    // run settles.
+    let transcript = backgrounded_subagent_leaving_its_command_running_transcript();
+    let resume = position_of(&transcript, |value| {
+        value["subtype"] == "task_started" && value["run_id"] == "agent-run-2"
+    });
+    for kind in [AgentValueKind::Response, AgentValueKind::None] {
+        let mut observations = Vec::new();
+        let mut parser = parser(kind, 1024);
+        parser
+            .push_stdout(&framed(&transcript[..=resume]), |observation| {
+                observations.push(observation)
+            })
+            .unwrap();
+        assert_eq!(
+            milestone_count(&observations, AgentLifecycleMilestone::HarnessCompleted),
+            1,
+            "{kind:?}"
+        );
+        let warnings = parser.abandoned_work_warnings();
+        assert_one_abandoned_subagent_warning(&warnings);
+        observations.extend(warnings);
+        assert_eq!(
+            subagent_statuses(&observations),
+            ["started", "completed", "resumed"],
+            "{kind:?}"
+        );
+        let outcome = parser.finish(true);
+        match kind {
+            AgentValueKind::Response => assert_eq!(completed_response(&outcome), "final"),
+            _ => assert!(
+                matches!(
+                    outcome,
+                    AgentOutcome::Completed(CompletedAgentInvocation::NoValue)
+                ),
+                "{outcome:?}"
+            ),
+        }
+    }
+}
+
+// REQ-AGENT-69, REQ-AGENT-35
+#[test]
+fn a_stream_ending_with_a_resumed_run_outstanding_before_settlement_is_still_refused() {
+    // AUTO-171 keeps the refusal before settlement: the stream ends after the first `result`
+    // while the subagent's first run still owes its notification, so no value has settled
+    // and nothing is abandoned.
+    let transcript = backgrounded_subagent_leaving_its_command_running_transcript();
+    let first_result = position_of(&transcript, |value| value["type"] == "result");
+    let first_notification = position_of(&transcript, |value| {
+        value["subtype"] == "task_notification" && value["run_id"] == "agent-run"
+    });
+    assert!(first_result < first_notification);
+    let mut parser = parser(AgentValueKind::Response, 1024);
+    parser
+        .push_stdout(&framed(&transcript[..first_notification]), |_| {})
+        .unwrap();
+    assert_eq!(parser.abandoned_work_warnings(), Vec::new());
     let outcome = parser.finish(true);
     let rejection = protocol_rejection_value(&outcome);
     assert_eq!(
@@ -2439,8 +2531,6 @@ fn an_abandoned_resume_at_end_of_stream_after_the_accepted_result_is_refused() {
         "end_of_stream_invariant_invalid"
     );
     assert_eq!(rejection["detail"]["stage"], "end_of_stream");
-    assert_eq!(rejection["detail"]["state"]["resultAccepted"], true);
-    assert_eq!(rejection["detail"]["state"]["completedExchanges"], 2);
     assert_eq!(
         rejection["detail"]["state"]["outstandingBackgroundSubagents"],
         1

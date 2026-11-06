@@ -1063,7 +1063,9 @@ impl ClaudeCodeStreamJsonV1Parser {
         if let Some(detail) = self.native_failure {
             return failed(AgentFailureCause::HarnessFailed { detail });
         }
-        if self.awaits_background_work() {
+        // Once the value has settled, work Claude Code's exit abandons is reported by
+        // `abandoned_work_warnings` and the value stands (REQ-AGENT-76).
+        if self.awaits_background_work() && !self.value_settled {
             return self.end_of_stream_invariant_failure();
         }
         if !exit_success {
@@ -2725,6 +2727,41 @@ impl ClaudeCodeStreamJsonV1Parser {
             .iter()
             .any(BackgroundCommand::awaits_notification)
             || self.subagents.iter().any(Subagent::awaits_notification)
+    }
+
+    /// Once the value has settled, one warning per piece of background work that still owes
+    /// a notification: Claude Code exiting abandons it, and the step completes with the
+    /// settled value (REQ-AGENT-76). Empty before settlement, when such work at end of stream
+    /// fails the step (REQ-AGENT-69). `finish` consumes the parser, so the adapter emits
+    /// these before its quiescence milestone.
+    pub(crate) fn abandoned_work_warnings(&self) -> Vec<AgentObservation> {
+        if !self.value_settled {
+            return Vec::new();
+        }
+        let commands = self
+            .background_commands
+            .iter()
+            .filter(|command| command.awaits_notification())
+            .map(|command| {
+                let kind = if command.monitor {
+                    "monitor"
+                } else {
+                    "background command"
+                };
+                format!("{kind} {} abandoned", command.task_id)
+            });
+        let subagents = self
+            .subagents
+            .iter()
+            .filter(|subagent| subagent.awaits_notification())
+            .map(|subagent| subagent.message("abandoned"));
+        commands
+            .chain(subagents)
+            .map(|message| AgentObservation::Diagnostic {
+                level: AgentDiagnosticLevel::Warning,
+                message: Arc::from(message),
+            })
+            .collect()
     }
 
     fn outstanding_work(&self) -> OutstandingWork {

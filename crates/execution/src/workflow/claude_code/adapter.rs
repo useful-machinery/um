@@ -858,12 +858,17 @@ where
         if state.wait_failed || !supervisor_quiesced {
             return failed_agent_outcome(AgentFailureCause::HarnessProtocolFailed);
         }
+        // Background work still outstanding once the value has settled is abandoned by
+        // Claude Code's exit: each piece is reported before quiescence, and the step
+        // completes with the settled value (REQ-AGENT-76).
+        let mut observations = self.parser.abandoned_work_warnings();
+        observations.push(AgentObservation::Lifecycle {
+            milestone: AgentLifecycleMilestone::HarnessQuiescent,
+        });
         match emit_observations(
             self.invocation.observations(),
             self.started,
-            vec![AgentObservation::Lifecycle {
-                milestone: AgentLifecycleMilestone::HarnessQuiescent,
-            }],
+            observations,
             &state.cancellation,
         )
         .await
