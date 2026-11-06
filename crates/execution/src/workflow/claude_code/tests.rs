@@ -5180,3 +5180,118 @@ fn subagent_messages_may_run_on_another_model_while_the_main_thread_must_not() {
     let (_, outcome) = replay(&framed(&values), AgentValueKind::Response, 1024);
     assert_failed(outcome, AgentFailureCause::HarnessProtocolFailed);
 }
+
+/// Claude Code keeps the Bash tool's working directory between commands and reports it as
+/// the session's `cwd` on the next `init`, so an agent that ran `cd gateway && …` before
+/// submitting its result begins its epilogue, or the turn a notified task announced, with
+/// `cwd` inside the step's working directory (AUTO-168, Claude Code 2.1.310).
+fn init_at(cwd: &str) -> Value {
+    let mut initialization = init(QUALIFICATION_VERSION, SESSION_ID);
+    initialization["cwd"] = json!(cwd);
+    initialization
+}
+
+// REQ-AGENT-78, REQ-AGENT-76
+#[test]
+fn a_later_init_whose_cwd_moved_inside_the_working_directory_is_accepted() {
+    // Result mode: the epilogue after the accepted result begins where the shell moved.
+    let mut parser = parser(AgentValueKind::Result, 1024);
+    let mut observations = Vec::new();
+    parser
+        .push_stdout(
+            &framed(&structured_output_exchange_after(&[])),
+            |observation| {
+                observations.push(observation);
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        parser.take_completed_result_exchange(),
+        Some(CompletedResultExchange::Candidate(Arc::new(json!(7))))
+    );
+    parser
+        .accept_result(CapturedJson::fixture(Arc::new(json!(7))))
+        .unwrap();
+    let mut epilogue = vec![init_at(&format!("{CWD}/gateway"))];
+    epilogue.extend(text_message("epilogue", &["noted"], true));
+    epilogue.push(result(SESSION_ID));
+    parser
+        .push_stdout(&framed(&epilogue), |observation| {
+            observations.push(observation);
+        })
+        .unwrap();
+    assert_epilogue_observed(&observations, 2);
+    let AgentOutcome::Completed(CompletedAgentInvocation::Result(result)) = parser.finish(true)
+    else {
+        panic!("the accepted result must stand");
+    };
+    assert_eq!(result.value(), &json!(7));
+
+    // Response and None modes: the turn a settled subagent announced begins deeper inside.
+    let mut epilogue = epilogue_turn();
+    epilogue[0] = init_at(&format!("{CWD}/gateway/internal/store"));
+    let transcript = subagent_settled_in_the_exchange_transcript(&epilogue);
+    for kind in [AgentValueKind::Response, AgentValueKind::None] {
+        let (observations, outcome) = replay(&framed(&transcript), kind, 1024);
+        match kind {
+            AgentValueKind::Response => assert_eq!(completed_response(&outcome), "done"),
+            _ => assert!(
+                matches!(
+                    outcome,
+                    AgentOutcome::Completed(CompletedAgentInvocation::NoValue)
+                ),
+                "{outcome:?}"
+            ),
+        }
+        assert_epilogue_observed(&observations, 2);
+    }
+}
+
+// REQ-AGENT-78
+#[test]
+fn an_init_whose_cwd_lies_outside_the_working_directory_is_initialization_invalid() {
+    // A later init: a sibling sharing the string prefix, another directory, the parent, a
+    // path that climbs out through `..`, and a relative path are all outside.
+    for cwd in [
+        format!("{CWD}-other"),
+        String::from("/synthetic/other"),
+        String::from("/synthetic"),
+        format!("{CWD}/../other"),
+        String::from("synthetic/project/gateway"),
+    ] {
+        let mut parser = parser(AgentValueKind::Result, 1024);
+        parser
+            .push_stdout(&framed(&structured_output_exchange_after(&[])), drop)
+            .unwrap();
+        assert_eq!(
+            parser.take_completed_result_exchange(),
+            Some(CompletedResultExchange::Candidate(Arc::new(json!(7))))
+        );
+        parser
+            .accept_result(CapturedJson::fixture(Arc::new(json!(7))))
+            .unwrap();
+        assert_eq!(
+            parser
+                .push_stdout(&framed(&[init_at(&cwd)]), drop)
+                .unwrap_err(),
+            AgentFailureCause::HarnessProtocolFailed,
+            "{cwd}"
+        );
+        let rejection = protocol_rejection_value(&parser.finish(false));
+        assert_eq!(
+            rejection["detail"]["reason"], "initialization_invalid",
+            "{cwd}"
+        );
+        assert_eq!(rejection["detail"]["stage"], "initialization", "{cwd}");
+    }
+
+    // The first init still names the working directory itself.
+    let (_, outcome) = replay(
+        &framed(&[init_at(&format!("{CWD}/gateway"))]),
+        AgentValueKind::Response,
+        1024,
+    );
+    let rejection = protocol_rejection_value(&outcome);
+    assert_eq!(rejection["detail"]["reason"], "initialization_invalid");
+    assert_eq!(rejection["detail"]["stage"], "initialization");
+}

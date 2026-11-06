@@ -883,6 +883,33 @@ async fn run_connection_loop_with_work_root(
                             .quiescence_failure();
                         return Err(workspace_cleanup_failure(&recorder, detail));
                     }
+                    if shutting_down {
+                        // The credential cannot hold a session, so the stop can only
+                        // end here: at once when nothing is owed, otherwise at the
+                        // deadline or a second signal, never on a reload.
+                        let Some(deadline) = shutdown_deadline.as_mut() else {
+                            return Err(ServiceError::AssignmentShutdown);
+                        };
+                        if assignment_manager
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .shutdown_complete()
+                        {
+                            return finish_shutdown_cleanup(
+                                &work_root, &recorder, shutdown, deadline,
+                            )
+                            .await;
+                        }
+                        wait_for_shutdown_progress(
+                            &assignment_manager,
+                            &work_root,
+                            shutdown,
+                            deadline,
+                            None,
+                        )
+                        .await?;
+                        continue;
+                    }
                     tokio::select! {
                         () = &mut notified => {}
                         Some(request) = reload_requests.recv() => {
@@ -3907,6 +3934,81 @@ mod tests {
             .await
             .expect("gateway fixture did not observe forced exit")
             .expect("gateway fixture failed");
+    }
+
+    // REQ-RUNNERENROLL-39, REQ-RUNNERENROLL-85
+    #[tokio::test]
+    async fn stop_signal_during_reconnect_backoff_exits_without_a_session() {
+        let (listener, endpoint) = fixture_listener().await;
+        let server = tokio::spawn(async move {
+            // Every session ends before welcome, as a Gateway whose store cannot
+            // admit the hello closes it: the runner never completes a handshake.
+            loop {
+                let mut socket = accept_fixture_socket(&listener).await;
+                expect_opening_hello(&mut socket).await;
+                socket
+                    .send(Message::Close(Some(CloseFrame {
+                        code: CloseCode::Error,
+                        reason: "store_failure".into(),
+                    })))
+                    .await
+                    .expect("send pre-welcome close");
+                while let Some(Ok(_)) = socket.next().await {}
+            }
+        });
+
+        let (sleeper, mut sleep_requests) = controlled_sleeper();
+        let (service, _capture, shutdown_trigger) = spawn_fixture_service(&endpoint, sleeper);
+        let (_delay, _held_backoff) = backoff_request(&mut sleep_requests).await;
+        shutdown_trigger.notify_one();
+
+        // No controlled sleep is released: neither the backoff nor the shutdown
+        // deadline can elapse, so a return here is an exit that waited on nothing.
+        with_watchdog(service)
+            .await
+            .expect("runner kept running past a stop signal received in reconnect backoff")
+            .expect("runner service task failed")
+            .expect("runner service returned an error");
+        server.abort();
+    }
+
+    // REQ-RUNNERENROLL-54, REQ-RUNNERENROLL-85
+    #[tokio::test]
+    async fn stop_signal_after_credential_revocation_exits_without_a_session() {
+        let (listener, endpoint) = fixture_listener().await;
+        let server = tokio::spawn(async move {
+            // A revoked credential is refused at every upgrade.
+            loop {
+                let (mut stream, _) = listener.accept().await.expect("accept fixture connection");
+                let mut request = [0_u8; 4096];
+                let _ = stream
+                    .read(&mut request)
+                    .await
+                    .expect("read upgrade request");
+                stream
+                    .write_all(b"HTTP/1.1 401 Unauthorized\r\ncontent-length: 0\r\n\r\n")
+                    .await
+                    .expect("refuse revoked credential");
+            }
+        });
+
+        let (sleeper, _sleep_requests) = controlled_sleeper();
+        let (service, capture, shutdown_trigger) = spawn_fixture_service(&endpoint, sleeper);
+        with_watchdog(capture.wait_for_event("runner.gateway_connection"))
+            .await
+            .expect("runner did not record the refused connection");
+        assert_eq!(
+            capture.event("runner.gateway_connection")["um.connection.failure_kind"],
+            "terminal_authentication"
+        );
+        shutdown_trigger.notify_one();
+
+        with_watchdog(service)
+            .await
+            .expect("runner kept running past a stop signal received after revocation")
+            .expect("runner service task failed")
+            .expect("runner service returned an error");
+        server.abort();
     }
 
     const SERVING_OWNER_FIXTURE: &str = "service::tests::serving_owner_fixture";

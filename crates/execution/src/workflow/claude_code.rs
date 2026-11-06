@@ -90,7 +90,7 @@ pub(crate) mod adapter;
 
 use std::ffi::OsString;
 use std::num::{NonZeroU64, NonZeroUsize};
-use std::path::Path;
+use std::path::{Component, Path};
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
@@ -1453,6 +1453,18 @@ impl ClaudeCodeStreamJsonV1Parser {
     ) -> Result<(), AgentFailureCause> {
         self.rejection_context.stage = ClaudeCodeStreamJsonV1ProtocolStage::Initialization;
         let session_id = required_string(object, "session_id");
+        let first_initialization = self.session_id.is_none();
+        // The first init names the step's working directory itself; a later init of the
+        // session may name a directory inside it, where the agent's Bash `cd` left the
+        // shell, since Claude Code reports the shell's directory as the session's `cwd`
+        // (REQ-AGENT-78).
+        let cwd_accepted = required_string(object, "cwd").is_some_and(|cwd| {
+            if first_initialization {
+                cwd == self.expected_cwd.as_ref()
+            } else {
+                within_working_directory(&self.expected_cwd, cwd)
+            }
+        });
         if !self.exchange_active
             || self.exchange_initialized
             || self.active_message.is_some()
@@ -1460,7 +1472,7 @@ impl ClaudeCodeStreamJsonV1Parser {
             || required_string(object, "subtype") != Some("init")
             || required_string(object, "claude_code_version")
                 != Some(self.expected_claude_code_version.as_ref())
-            || required_string(object, "cwd") != Some(self.expected_cwd.as_ref())
+            || !cwd_accepted
             || required_string(object, "model") != Some(self.expected_model.as_ref())
             || required_string(object, "permissionMode") != Some(PERMISSION_MODE)
             || !session_id.is_some_and(|session_id| {
@@ -1470,7 +1482,6 @@ impl ClaudeCodeStreamJsonV1Parser {
             return Err(self.protocol_failure());
         }
 
-        let first_initialization = self.session_id.is_none();
         match (&self.session_id, session_id) {
             (None, Some(session_id)) => self.session_id = Some(Arc::from(session_id)),
             (Some(expected), Some(session_id)) if expected.as_ref() == session_id => {}
@@ -3996,6 +4007,19 @@ fn required_object<'a>(
 
 fn required_array<'a>(object: &'a Map<String, Value>, key: &str) -> Option<&'a [Value]> {
     object.get(key)?.as_array().map(Vec::as_slice)
+}
+
+/// Whether `cwd`, as a later `init` of the session reports it, is the step's working
+/// directory or a directory inside it. Compared by path component, so a sibling that shares
+/// a string prefix, a relative path and a path that climbs out through `..` are outside.
+fn within_working_directory(expected_cwd: &str, cwd: &str) -> bool {
+    Path::new(cwd)
+        .strip_prefix(expected_cwd)
+        .is_ok_and(|inside| {
+            inside
+                .components()
+                .all(|component| matches!(component, Component::Normal(_)))
+        })
 }
 
 fn valid_session_id(value: &str) -> bool {

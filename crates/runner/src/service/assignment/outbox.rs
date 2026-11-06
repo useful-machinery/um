@@ -304,11 +304,13 @@ impl ObservationOutbox {
         self.lock().entries.iter().any(|entry| entry.id == id)
     }
 
+    /// Every replayable run observation has reached a session. Boot inventory is
+    /// replayable too but is not an obligation: it never holds shutdown or exit.
     pub(super) fn replay_obligations_dispatched(&self) -> bool {
         self.lock()
             .entries
             .iter()
-            .filter(|entry| entry.replayable)
+            .filter(|entry| entry.replayable && !entry.observation.is_boot_inventory())
             .all(|entry| entry.encoded)
     }
 

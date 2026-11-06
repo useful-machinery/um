@@ -312,6 +312,16 @@ impl AssignmentObservation {
         matches!(self, Self::Execution { report, .. } if report.is_terminal())
     }
 
+    /// The boot's scan of its work root: replayed on every session, but owed to no
+    /// run. A boot that ends before reporting it leaves nothing behind, since the
+    /// next boot scans and reports again (REQ-RUNNERENROLL-84, REQ-RUNNERENROLL-85).
+    pub(super) fn is_boot_inventory(&self) -> bool {
+        matches!(
+            self,
+            Self::DiscoveryInventory { .. } | Self::DiscoveryComplete { .. }
+        )
+    }
+
     pub(super) fn is_condition_evidence_transition(&self) -> bool {
         matches!(self, Self::Execution { report, .. } if report.is_condition_evidence_transition())
     }

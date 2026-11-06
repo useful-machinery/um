@@ -4627,6 +4627,26 @@ async fn shutdown_starts_finishing_cleanup_before_the_five_second_reserve() {
     assert!(manager.shutdown_complete());
 }
 
+// REQ-RUNNERENROLL-85
+#[tokio::test]
+async fn shutdown_completes_while_boot_inventory_is_still_unreported() {
+    let (_temporary, mut manager) = manager_fixture("schemaVersion: 1\nsteps: {}\n");
+    manager.begin_discovery("rwr_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned(), Vec::new());
+    assert!(
+        !manager
+            .pending_observations(&BTreeSet::new(), 10)
+            .is_empty(),
+        "the boot's inventory completion must be queued for the next session"
+    );
+
+    manager.begin_shutdown().unwrap();
+
+    assert!(
+        manager.shutdown_complete(),
+        "inventory a boot has not reported is not outstanding work"
+    );
+}
+
 // REQ-RUNNERENROLL-73
 #[tokio::test]
 async fn shutdown_requests_runner_cancellation_for_running_work() {

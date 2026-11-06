@@ -850,11 +850,7 @@ impl AssignmentManager {
         let Some(observation) = self.outbox.acknowledge(id) else {
             return;
         };
-        if matches!(
-            observation,
-            AssignmentObservation::DiscoveryInventory { .. }
-                | AssignmentObservation::DiscoveryComplete { .. }
-        ) {
+        if observation.is_boot_inventory() {
             self.queue_next_discovery();
         }
         if let AssignmentObservation::Artifact {
