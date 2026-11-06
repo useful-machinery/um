@@ -271,6 +271,12 @@ impl FailureReport {
                 "Run the command again; it sends a new request key.",
                 OutcomeClass::GeneralFailure,
             ),
+            GrantFailure::ConsentInProgress => report(
+                "consent_in_progress",
+                "error: a consent for this provider is already in progress",
+                "Finish that consent or wait for it to expire, then list your provider grants:\n  um auth grant list",
+                OutcomeClass::GeneralFailure,
+            ),
             GrantFailure::ProviderUnavailable => report(
                 "provider_unavailable",
                 "error: this deployment does not serve grants for that provider",

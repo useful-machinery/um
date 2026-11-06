@@ -254,7 +254,8 @@ impl ActionApi {
                         }
                         (
                             StatusCode::CONFLICT,
-                            "https://api.usefulmachinery.com/problems/source-connection-conflict",
+                            "https://api.usefulmachinery.com/problems/google-docs-action-conflict"
+                            | "https://api.usefulmachinery.com/problems/idempotency-conflict",
                         ) => ActionFailure::Conflict,
                         _ => protocol(status == StatusCode::UNAUTHORIZED),
                     },

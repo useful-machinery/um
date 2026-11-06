@@ -1201,12 +1201,23 @@ impl ClaudeCodeStreamJsonV1Parser {
                 } else if self.correction_pending {
                     self.correction_pending = false;
                 } else {
-                    self.background_commands
-                        .retain(|task| !task.notified || task.stopped_by_result);
-                    self.forget_notified_subagents();
-                    self.scheduled_wakeup_pending = false;
-                    self.scheduled_wakeup_turn |= scheduled_wakeup;
+                    self.consume_notified_work(scheduled_wakeup);
                 }
+            } else if self.epilogue && self.exchange_initialized && self.active_message.is_none() {
+                // Claude Code may dequeue its next queued input while an epilogue turn is
+                // still open, its `init` arriving with no `result` between (build #3560):
+                // the open epilogue ends where it stands, as its `result` would, and this
+                // `init` opens the next epilogue, consuming the notified work as an
+                // unannounced drain `init` does (REQ-AGENT-76). Before settlement a second
+                // `init` inside an open turn stays refused (REQ-AGENT-69).
+                if self.native_failure.is_some() {
+                    return Err(self.protocol_failure());
+                }
+                let scheduled_wakeup = self.scheduled_wakeup_pending;
+                self.close_turn_without_decision()?;
+                self.begin_epilogue();
+                self.announced_exchange = self.notification_announces_a_turn();
+                self.consume_notified_work(scheduled_wakeup);
             } else if !self.exchange_initialized && self.correction_pending {
                 // The adapter has begun the correction turn, but a notification queued
                 // ahead of its prompt opens its turn first, which this `init` may be: a
@@ -2544,6 +2555,17 @@ impl ClaudeCodeStreamJsonV1Parser {
             || self.subagents.iter().any(|subagent| subagent.notified)
     }
 
+    /// An unannounced-item `init` consumes the completed tasks and subagents and the
+    /// scheduled wakeup together, as one turn; a command a `TaskStop` result settled is kept
+    /// until its own report of the stop arrives (REQ-AGENT-77).
+    fn consume_notified_work(&mut self, scheduled_wakeup: bool) {
+        self.background_commands
+            .retain(|task| !task.notified || task.stopped_by_result);
+        self.forget_notified_subagents();
+        self.scheduled_wakeup_pending = false;
+        self.scheduled_wakeup_turn |= scheduled_wakeup;
+    }
+
     /// A wakeup `init` forgets the notified subagents as outstanding work; their identity
     /// is kept, newest last, so that a later message to one resumes it (`start_subagent`).
     fn forget_notified_subagents(&mut self) {
@@ -2709,6 +2731,12 @@ impl ClaudeCodeStreamJsonV1Parser {
         } else {
             self.announced_turn_pending = !self.value_settled;
         }
+        self.close_turn_without_decision()
+    }
+
+    /// Ends the open turn with no decision and no value: an empty turn at its `result`, or
+    /// an epilogue the next `init` cuts (REQ-AGENT-76).
+    fn close_turn_without_decision(&mut self) -> Result<(), AgentFailureCause> {
         self.epilogue = false;
         self.exchange_initialized = false;
         self.exchange_active = false;

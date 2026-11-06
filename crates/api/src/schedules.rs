@@ -337,20 +337,13 @@ mod tests {
     use reqwest::StatusCode;
     use reqwest::header::{HeaderMap, HeaderValue};
 
-    use super::super::resource::{ResourceFailure, classify_response, retry_after};
+    use super::super::resource::{
+        ResourceFailure, classify_response, problem_fixture, retry_after,
+    };
     use super::{SCHEDULE, Schedule, ScheduleOccurrence, validate_occurrence, validate_schedule};
 
     const PROJECT: &str = "prj_01k0z6r1w8f4jy2m7q9v3x5abc";
     const SCHEDULE_ID: &str = "sch_01k0z6r1w8f4jy2m7q9v3x5abc";
-
-    fn problem(status: u16, kind: &str) -> Vec<u8> {
-        serde_json::to_vec(&serde_json::json!({
-            "type": format!("https://api.usefulmachinery.com/problems/{kind}"),
-            "title": "Refused",
-            "status": status,
-        }))
-        .expect("problem fixture")
-    }
 
     fn classify(status: StatusCode, body: &[u8], headers: &HeaderMap) -> ResourceFailure {
         classify_response(status, body, retry_after(headers), &SCHEDULE)
@@ -390,7 +383,7 @@ mod tests {
         assert_eq!(
             classify(
                 StatusCode::BAD_REQUEST,
-                &problem(400, "timing-too-frequent"),
+                &problem_fixture(400, "timing-too-frequent"),
                 &none
             ),
             ResourceFailure::InvalidInput {
@@ -398,12 +391,16 @@ mod tests {
             }
         );
         assert_eq!(
-            classify(StatusCode::BAD_REQUEST, &problem(400, "bad-request"), &none),
+            classify(
+                StatusCode::BAD_REQUEST,
+                &problem_fixture(400, "bad-request"),
+                &none
+            ),
             ResourceFailure::InvalidInput { problem: None }
         );
         for kind in ["source-connection-conflict", "idempotency-conflict"] {
             assert_eq!(
-                classify(StatusCode::CONFLICT, &problem(409, kind), &none),
+                classify(StatusCode::CONFLICT, &problem_fixture(409, kind), &none),
                 ResourceFailure::Conflict
             );
         }
@@ -412,7 +409,7 @@ mod tests {
         assert_eq!(
             classify(
                 StatusCode::TOO_MANY_REQUESTS,
-                &problem(429, "rate-limited"),
+                &problem_fixture(429, "rate-limited"),
                 &headers
             ),
             ResourceFailure::RateLimited {
@@ -422,7 +419,7 @@ mod tests {
         assert!(matches!(
             classify(
                 StatusCode::BAD_REQUEST,
-                &problem(400, "timing-later"),
+                &problem_fixture(400, "timing-later"),
                 &none
             ),
             ResourceFailure::InvalidResponse { .. }

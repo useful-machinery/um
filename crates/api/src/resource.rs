@@ -285,3 +285,16 @@ pub(crate) fn classify_response(
         _ => invalid(),
     }
 }
+
+/// A problem-details body of the given status whose `type` is the API problem `kind`, for the
+/// vocabulary tests of each resource client.
+#[cfg(test)]
+#[allow(clippy::expect_used, reason = "test fixture construction")]
+pub(crate) fn problem_fixture(status: u16, kind: &str) -> Vec<u8> {
+    serde_json::to_vec(&serde_json::json!({
+        "type": format!("https://api.usefulmachinery.com/problems/{kind}"),
+        "title": "Refused",
+        "status": status,
+    }))
+    .expect("problem fixture")
+}

@@ -602,8 +602,10 @@ impl LifecycleCell {
             // one more turn. The resume goes out from the first turn when the subagent's
             // command was released in the exchange, from the second otherwise; for a command
             // outliving the subagent, Claude Code's own resume that delivers its report adds
-            // an empty turn for the messaged run's notification and the notified turn. In
-            // Result mode the premature candidate's correction turn adds one.
+            // a turn for the messaged run's notification and the notified turn: the first may
+            // be an empty turn or, once the value has settled, a turn with a model call that
+            // the report's notified `init` cuts (build #3560). In Result mode the premature
+            // candidate's correction turn adds one.
             (
                 Followup::Resume,
                 Work::BackgroundAgent {

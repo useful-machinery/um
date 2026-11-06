@@ -514,6 +514,12 @@ fn create_reports_refused_starts_without_a_further_request() {
             "idempotency_conflict",
             1,
         ),
+        (
+            &["create", "github", "--json"][..],
+            grant_problem("409 Conflict", 409, "grant-session-conflict"),
+            "consent_in_progress",
+            1,
+        ),
     ];
     for (arguments, response, outcome, code) in cases {
         let (server, _directory, credential) = prepared(vec![response]);

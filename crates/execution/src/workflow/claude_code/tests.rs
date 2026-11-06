@@ -2327,6 +2327,109 @@ fn a_superseded_notifications_empty_turn_after_the_accepted_result_is_an_epilogu
     assert_eq!(result.value(), &json!(7));
 }
 
+/// AUTO-174: the order merge-queue build #3560 recorded in
+/// `result/background-agent[background-bash-in-drain]/resume/same-round/settle`. After the
+/// accepted result, the messaged run's notification opens an epilogue in which Claude Code
+/// resumes the subagent to deliver its command's report and the main thread resubmits; the
+/// resumed run settles, and the report run's notified `init` follows with no `result`
+/// closing the epilogue. That `init` ends the open epilogue and opens the next one.
+// REQ-AGENT-35, REQ-AGENT-64, REQ-AGENT-76
+// INV-HARNESS-7
+#[test]
+fn an_init_inside_an_open_epilogue_ends_it_and_opens_the_next_epilogue() {
+    let values =
+        messaged_subagent_notified_before_its_superseded_notifications_empty_turn_transcript();
+    let empty_turn = values.len() - empty_notification_turn().len();
+    let notified_wakeup = last_init(&values[..empty_turn]);
+    let mut notified_turn = values[..=notified_wakeup].to_vec();
+    notified_turn.extend_from_slice(&structured_output_exchange_after(&[])[1..]);
+    let mut observations = Vec::new();
+    let mut parser = parser(AgentValueKind::Result, 1024);
+    parser
+        .push_stdout(&framed(&notified_turn), |observation| {
+            observations.push(observation);
+        })
+        .unwrap();
+    assert_eq!(
+        parser.take_completed_result_exchange(),
+        Some(CompletedResultExchange::Candidate(Arc::new(json!(7))))
+    );
+    parser
+        .accept_result(CapturedJson::fixture(Arc::new(json!(7))))
+        .unwrap();
+    assert!(parser.settling());
+
+    let resume = harness_resume_delivering_the_report("agent-run-4");
+    let resubmission = structured_output_exchange_with(&json!({"result": 8}), &[]);
+    let mut epilogue = vec![init(QUALIFICATION_VERSION, SESSION_ID)];
+    epilogue.extend_from_slice(&resume[..3]);
+    epilogue.extend_from_slice(&resubmission[1..resubmission.len() - 1]);
+    epilogue.extend_from_slice(&resume[3..]);
+    epilogue.push(init(QUALIFICATION_VERSION, SESSION_ID));
+    assert_eq!(
+        parser.push_stdout(&framed(&epilogue), |observation| {
+            observations.push(observation);
+        }),
+        Ok(())
+    );
+    assert!(!parser.settling(), "the next epilogue is open");
+
+    let mut report = text_message("report", &["noted"], true);
+    report.push(result(SESSION_ID));
+    parser
+        .push_stdout(&framed(&report), |observation| {
+            observations.push(observation);
+        })
+        .unwrap();
+    assert!(parser.settling());
+    assert_eq!(parser.take_completed_result_exchange(), None);
+    // Inside a turn, the resume's announcement naming a forgotten subagent is recorded as
+    // unrecognized, as for a `SendMessage` resume; nothing else is.
+    assert_eq!(unrecognized_events(&observations), [&resume[0]]);
+    assert!(
+        information_diagnostics(&observations).ends_with(&[
+            "subagent Explore resumed · Review the diff",
+            "subagent Explore completed · Review the diff",
+        ]),
+        "{observations:?}"
+    );
+    assert!(parser.abandoned_work_warnings().is_empty());
+    // The launching turn, the notified turn, the cut epilogue and the next epilogue.
+    for milestone in [
+        AgentLifecycleMilestone::TurnStarted,
+        AgentLifecycleMilestone::TurnCompleted,
+    ] {
+        assert_eq!(
+            milestone_count(&observations, milestone),
+            4,
+            "{milestone:?}"
+        );
+    }
+    let AgentOutcome::Completed(CompletedAgentInvocation::Result(result)) = parser.finish(true)
+    else {
+        panic!("the accepted result must stand");
+    };
+    assert_eq!(result.value(), &json!(7));
+}
+
+/// Before the value has settled, an `init` inside an open, initialized turn is no new turn:
+/// the boundary the epilogue's cut (`an_init_inside_an_open_epilogue_ends_it_and_opens_the_next_epilogue`)
+/// leaves in place.
+// REQ-AGENT-69
+#[test]
+fn an_init_inside_an_open_turn_before_settlement_stays_refused() {
+    let mut values = vec![init(QUALIFICATION_VERSION, SESSION_ID)];
+    values.extend(text_message("first", &["hello"], true));
+    values.push(init(QUALIFICATION_VERSION, SESSION_ID));
+    let (_, outcome) = replay(&framed(&values), AgentValueKind::Response, 1024);
+    let rejection = protocol_rejection_value(&outcome);
+    assert_eq!(rejection["detail"]["reason"], "initialization_invalid");
+    let state = &rejection["detail"]["state"];
+    assert_eq!(state["exchangeInitialized"], true);
+    assert_eq!(state["resultAccepted"], false);
+    assert_eq!(state["completedExchanges"], 0);
+}
+
 /// Captured from Claude Code 2.1.310 with a `UserPromptSubmit` hook that exits 2: the first
 /// turn ends with no model call and a `result` of the empty turn's shape (`num_turns: 0`,
 /// `is_error: false`, `subtype: success`, no `terminal_reason`) whose `result` text is the

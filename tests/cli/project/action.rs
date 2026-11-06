@@ -571,12 +571,10 @@ fn rejected_replay_does_not_settle_a_lost_create_reply() {
 
 #[test]
 fn action_conflict_is_not_a_protocol_failure() {
-    // The current Gateway uses the shared source-connection-conflict problem for
-    // both a stale expectedVersion and a reused request identity.
     let (_dir, path) = file(r#"{"description":"changed"}"#);
     let conflict = problem_http_response(
         "409 Conflict",
-        serde_json::json!({"type":"https://api.usefulmachinery.com/problems/source-connection-conflict","title":"private","status":409}),
+        serde_json::json!({"type":"https://api.usefulmachinery.com/problems/google-docs-action-conflict","title":"private","status":409}),
     );
     let (server, _credentials, credential) = prepared(vec![conflict]);
     let output = run(

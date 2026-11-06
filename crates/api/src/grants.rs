@@ -31,6 +31,7 @@ pub enum GrantFailure {
     InvalidInput,
     NotFound,
     IdempotencyConflict,
+    ConsentInProgress,
     ProviderUnavailable,
     RateLimited { retry_after: Option<u64> },
     Unreachable { category: UnreachableCategory },
@@ -72,7 +73,7 @@ const fn invalid() -> GrantFailure {
 
 /// The problems a grant operation answers, by status and type. Anything else is outside
 /// the contract.
-const PROBLEMS: [(StatusCode, &str, GrantFailure); 9] = [
+const PROBLEMS: [(StatusCode, &str, GrantFailure); 10] = [
     (
         StatusCode::BAD_REQUEST,
         problem::BAD_REQUEST,
@@ -112,6 +113,11 @@ const PROBLEMS: [(StatusCode, &str, GrantFailure); 9] = [
         StatusCode::CONFLICT,
         problem::IDEMPOTENCY_CONFLICT,
         GrantFailure::IdempotencyConflict,
+    ),
+    (
+        StatusCode::CONFLICT,
+        problem::GRANT_SESSION_CONFLICT,
+        GrantFailure::ConsentInProgress,
     ),
     (
         StatusCode::SERVICE_UNAVAILABLE,
@@ -408,6 +414,28 @@ mod tests {
             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
             body.len()
         )
+    }
+
+    // REQ-GRANT-1, REQ-API-7
+    #[test]
+    fn a_pending_consent_conflict_is_not_a_reused_key() {
+        for (slug, want) in [
+            (
+                problem::GRANT_SESSION_CONFLICT,
+                GrantFailure::ConsentInProgress,
+            ),
+            (
+                problem::IDEMPOTENCY_CONFLICT,
+                GrantFailure::IdempotencyConflict,
+            ),
+        ] {
+            let body = serde_json::json!({"type": slug, "title": "Conflict", "status": 409});
+            assert_eq!(
+                classify(StatusCode::CONFLICT, body.to_string().as_bytes(), None),
+                want,
+                "{slug}"
+            );
+        }
     }
 
     // REQ-GRANT-1

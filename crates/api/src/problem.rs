@@ -25,6 +25,8 @@ pub(super) const IDENTITY_NOT_FOUND: &str =
 pub(super) const GRANT_NOT_FOUND: &str = "https://api.usefulmachinery.com/problems/grant-not-found";
 pub(super) const GRANT_SESSION_NOT_FOUND: &str =
     "https://api.usefulmachinery.com/problems/grant-session-not-found";
+pub(super) const GRANT_SESSION_CONFLICT: &str =
+    "https://api.usefulmachinery.com/problems/grant-session-conflict";
 pub(super) const SERVICE_UNAVAILABLE: &str =
     "https://api.usefulmachinery.com/problems/service-unavailable";
 

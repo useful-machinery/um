@@ -52,6 +52,7 @@ const LINEAR: ProblemVocabulary = ProblemVocabulary {
     unprocessable: &["https://api.usefulmachinery.com/problems/workflow-source-invalid"],
     conflict: &[
         "https://api.usefulmachinery.com/problems/source-connection-conflict",
+        problem::IDEMPOTENCY_CONFLICT,
         problem::QUANTITY_LIMIT_REACHED,
         "https://api.usefulmachinery.com/problems/workflow-source-unavailable",
     ],
@@ -672,3 +673,44 @@ impl fmt::Display for LinearApiError {
     }
 }
 impl std::error::Error for LinearApiError {}
+
+#[cfg(test)]
+#[allow(
+    clippy::disallowed_macros,
+    clippy::expect_used,
+    reason = "Linear client unit tests use Rust test assertions and fixture extraction"
+)]
+mod tests {
+    use reqwest::StatusCode;
+
+    use super::super::resource::{ResourceFailure, classify_response, problem_fixture};
+    use super::LINEAR;
+
+    fn classify(status: StatusCode, body: &[u8]) -> ResourceFailure {
+        classify_response(status, body, None, &LINEAR)
+    }
+
+    // REQ-API-7
+    #[test]
+    fn linear_conflicts_classify_with_the_linear_vocabulary() {
+        for kind in [
+            "source-connection-conflict",
+            "idempotency-conflict",
+            "quantity-limit-reached",
+            "workflow-source-unavailable",
+        ] {
+            assert_eq!(
+                classify(StatusCode::CONFLICT, &problem_fixture(409, kind)),
+                ResourceFailure::Conflict,
+                "{kind}"
+            );
+        }
+        assert!(matches!(
+            classify(
+                StatusCode::CONFLICT,
+                &problem_fixture(409, "candidate-conflict")
+            ),
+            ResourceFailure::InvalidResponse { .. }
+        ));
+    }
+}
