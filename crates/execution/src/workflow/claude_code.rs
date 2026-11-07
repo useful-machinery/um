@@ -601,8 +601,9 @@ impl BackgroundCommand {
 /// Agent call's result reports an asynchronous launch; that result also tracks a subagent
 /// whose start the harness never announced, by its `agentId`, with no run id (`None`),
 /// so its notification and task entries match by task id and tool call alone. A message
-/// the agent sends a finished backgrounded subagent resumes it as a new run under the
-/// message's tool call; its messages keep naming the Agent call as their parent.
+/// the agent sends a finished subagent, foreground or backgrounded, resumes it as a new run
+/// under the message's tool call; its messages keep naming the Agent call as their parent,
+/// so a settled subagent is kept by identity (`forgotten_subagents`) until a resume names it.
 struct Subagent {
     task_id: Arc<str>,
     /// The Agent call that launched the subagent, which its messages name as
@@ -690,9 +691,11 @@ pub(crate) struct ClaudeCodeStreamJsonV1Parser {
     command_calls: Vec<CommandCall>,
     background_commands: Vec<BackgroundCommand>,
     subagents: Vec<Subagent>,
-    /// Backgrounded subagents a wakeup `init` forgot as outstanding work, kept by identity
-    /// (newest last, at most `MAXIMUM_TRACKED_TASKS`) so that a later message to one
-    /// resumes it under the Agent call its messages still name.
+    /// Settled subagents no longer tracked as work: backgrounded ones a wakeup `init`
+    /// forgot as outstanding, and foreground ones their notification or the end of their
+    /// exchange retired. Kept by identity (newest last, at most `MAXIMUM_TRACKED_TASKS`) so
+    /// that a later message to one, or the harness's own resume, reopens it under the Agent
+    /// call its messages still name (REQ-AGENT-64).
     forgotten_subagents: Vec<Subagent>,
     /// Task ids that `task_started owned_by_subagent: true` introduced (newest last, at most
     /// `MAXIMUM_TRACKED_TASKS`): a subagent's own work stays its work after the subagent
@@ -2459,13 +2462,17 @@ impl ClaudeCodeStreamJsonV1Parser {
                 }
             }
             "background_tasks_changed" => {
+                // An entry naming a forgotten subagent announces the resume whose
+                // `task_started` follows (REQ-AGENT-64).
                 let membership_is_tracked = required_array(object, "tasks").is_some_and(|tasks| {
                     tasks.iter().all(|entry| {
                         entry
                             .as_object()
                             .and_then(|entry| required_nonempty_string(entry, "task_id"))
                             .is_some_and(|task_id| {
-                                self.tracks_task(task_id) || self.is_subagent_work(task_id)
+                                self.tracks_task(task_id)
+                                    || self.is_subagent_work(task_id)
+                                    || self.forgotten_subagent(task_id).is_some()
                             })
                     })
                 });
@@ -2568,19 +2575,23 @@ impl ClaudeCodeStreamJsonV1Parser {
 
     /// A wakeup `init` forgets the notified subagents as outstanding work; their identity
     /// is kept, newest last, so that a later message to one resumes it (`start_subagent`).
+    /// The turn this `init` opens delivers their notifications: a later resume carries
+    /// nothing past.
     fn forget_notified_subagents(&mut self) {
-        let (mut forgotten, outstanding): (Vec<_>, Vec<_>) = self
+        self.retire_subagents(|subagent| !subagent.notified);
+    }
+
+    /// Retires every tracked subagent `outstanding` does not keep, by identity
+    /// (`forget_subagent`).
+    fn retire_subagents(&mut self, outstanding: impl Fn(&Subagent) -> bool) {
+        let (kept, retired): (Vec<_>, Vec<_>) = self
             .subagents
             .drain(..)
-            .partition(|subagent| subagent.notified);
-        self.subagents = outstanding;
-        // The turn this `init` opens delivers their notifications: a later resume carries
-        // nothing past.
-        for subagent in &mut forgotten {
-            subagent.delivered = true;
+            .partition(|subagent| outstanding(subagent));
+        self.subagents = kept;
+        for subagent in retired {
+            self.forget_subagent(subagent);
         }
-        self.forgotten_subagents.extend(forgotten);
-        keep_newest(&mut self.forgotten_subagents);
     }
 
     fn tracks_subagent(&self, task_id: &str) -> bool {
@@ -2921,11 +2932,12 @@ impl ClaudeCodeStreamJsonV1Parser {
         Ok(())
     }
 
-    /// The same resume from a later turn, or the one Claude Code begins in the drain to
-    /// deliver the report of a command the subagent left running: the `init` its
-    /// notification authorized forgot the subagent as outstanding work, but its resumed
-    /// run's messages still name the Agent call that launched it, so it is tracked again
-    /// under that call.
+    /// The same resume of a subagent the parser no longer tracks: a backgrounded one the
+    /// `init` its notification authorized forgot as outstanding work, a foreground one its
+    /// settlement or its exchange's end retired, or the one Claude Code begins in the drain
+    /// to deliver the report of a command the subagent left running. The resumed run's
+    /// messages still name the Agent call that launched it, so it is tracked again under
+    /// that call.
     fn resume_forgotten_subagent(
         &mut self,
         index: usize,
@@ -3064,9 +3076,23 @@ impl ClaudeCodeStreamJsonV1Parser {
             subagent.notified_after_user_frames = self.main_user_frames;
             subagent.delivered = false;
         } else {
-            self.subagents.remove(index);
+            let settled = self.subagents.remove(index);
+            self.forget_subagent(settled);
         }
         Ok(())
+    }
+
+    /// Retires a subagent whose run is over, keeping it by identity so that a message the
+    /// agent sends it (`SendMessage`) or the harness's own resume reopens it under the Agent
+    /// call its messages still name (REQ-AGENT-64). A resume carries no notification past:
+    /// a foreground subagent's report reached the main thread as the Agent call's result,
+    /// and a notified backgrounded one's notification is delivered by the turn the wakeup
+    /// `init` that forgot it opens.
+    fn forget_subagent(&mut self, mut subagent: Subagent) {
+        subagent.notified = true;
+        subagent.delivered = true;
+        self.forgotten_subagents.push(subagent);
+        keep_newest(&mut self.forgotten_subagents);
     }
 
     fn parse_rate_limit_event(
@@ -3253,9 +3279,9 @@ impl ClaudeCodeStreamJsonV1Parser {
                 self.carried_notifications.insert(0, notified_after);
             }
         }
-        // A foreground subagent the exchange did not settle carries no completion duty; a
-        // backgrounded one still owes its notification.
-        self.subagents.retain(|subagent| subagent.backgrounded);
+        // A foreground subagent the exchange did not settle carries no completion duty and
+        // is retired by identity; a backgrounded one still owes its notification.
+        self.retire_subagents(|subagent| subagent.backgrounded);
         self.completed_exchanges = self
             .completed_exchanges
             .checked_add(1)

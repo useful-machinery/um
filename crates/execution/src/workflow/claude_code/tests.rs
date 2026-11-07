@@ -751,6 +751,108 @@ fn messaging_a_finished_subagent_from_the_turn_its_notification_woke_resumes_it_
     );
 }
 
+/// Sanitized from the five 2026-11-07 build runs AUTO-231 records: the lead's `Agent` call
+/// runs the builder in the foreground, the builder hands back with a question, and the lead
+/// messages it from the same turn. The builder's settlement retired the adapter's record of
+/// it; the resume's `task_started` repeats its `task_id` under the `SendMessage` call with
+/// `is_backgrounded: true`, and the resumed run's messages name the `Agent` call that
+/// launched it. The turn stays open after the hand-back.
+fn foreground_subagent_hand_back_turn() -> Vec<Value> {
+    let base = agent_tool_exchange(&[
+        subagent_started(json!({"is_backgrounded": false})),
+        subagent_message(
+            "assistant",
+            json!({"id": "msg-sub-1", "type": "message", "role": "assistant",
+                "model": "subagent-model", "content": [{"type": "text", "text": "Which file?"}]}),
+        ),
+        system_event(
+            "task_notification",
+            json!({"task_id": "t1", "tool_use_id": "agent-call", "status": "completed",
+                "summary": "Which file?"}),
+        ),
+    ]);
+    let hand_back = position_of(&base, |value| {
+        value["type"] == "user" && value["message"]["content"][0]["tool_use_id"] == "agent-call"
+    });
+    base[..=hand_back].to_vec()
+}
+
+/// The lead messages the settled foreground builder, ends its turn to wait, and the resumed
+/// run reports and settles in the drain under the `Agent` call, waking the final turn.
+fn foreground_subagent_resumed_by_message_transcript() -> Vec<Value> {
+    let mut values = foreground_subagent_hand_back_turn();
+    values.extend(send_message_to_finished_subagent());
+    values.extend(text_message("waiting-turn", &["waiting"], true));
+    values.push(result(SESSION_ID));
+    values.extend(resumed_subagent_settlement());
+    values.push(init(QUALIFICATION_VERSION, SESSION_ID));
+    values.extend(text_message("final-turn", &["final"], true));
+    values.push(result(SESSION_ID));
+    values
+}
+
+// REQ-AGENT-64, REQ-AGENT-35, REQ-AGENT-69 (AUTO-231)
+#[test]
+fn messaging_a_finished_foreground_subagent_resumes_it_under_its_agent_call() {
+    let values = foreground_subagent_resumed_by_message_transcript();
+    let (observations, outcome) = replay(&framed(&values), AgentValueKind::Response, 1024);
+    assert_eq!(completed_response(&outcome), "final");
+    assert_eq!(
+        subagent_statuses(&observations),
+        ["started", "completed", "resumed", "completed"]
+    );
+    // The task list announcing the resume names the retired subagent and is its activity.
+    assert_eq!(unrecognized_events(&observations), Vec::<&Value>::new());
+    assert!(observations.iter().any(|observation| matches!(
+        observation,
+        AgentObservation::AssistantText { text } if text.as_ref() == "Still no issues"
+    )));
+
+    // The recorded Result-mode shape: the lead submits in the round that messaged the
+    // builder, the premature candidate is rejected, the correction turn ends with the
+    // resumed run outstanding, and its frames in the drain settle it and wake the turn
+    // that resubmits.
+    let mut values = foreground_subagent_hand_back_turn();
+    values.extend(same_round_resume_and_submission());
+    let mut window = parser(AgentValueKind::Result, 1024);
+    window.push_stdout(&framed(&values), drop).unwrap();
+    assert_eq!(
+        window.take_completed_result_exchange(),
+        Some(CompletedResultExchange::PrematureCandidate(
+            SUBAGENT_OUTSTANDING
+        ))
+    );
+    window.reject_result_candidate().unwrap();
+    window.begin_exchange().unwrap();
+    window
+        .push_stdout(&framed(&text_turn("correction", "waiting")), drop)
+        .unwrap();
+    assert_eq!(window.take_completed_result_exchange(), None);
+    window
+        .push_stdout(&framed(&resumed_subagent_settlement()), drop)
+        .unwrap();
+    window
+        .push_stdout(&framed(&structured_output_exchange_after(&[])), drop)
+        .unwrap();
+    assert_eq!(
+        window.take_completed_result_exchange(),
+        Some(CompletedResultExchange::Candidate(Arc::new(json!(7))))
+    );
+
+    // The resumed run is owned under the `Agent` call alone: a drain frame naming the
+    // `SendMessage` call as its parent is work no outstanding subagent owns (REQ-AGENT-69).
+    let mut values = foreground_subagent_resumed_by_message_transcript();
+    let first_resumed_frame = position_of(&values, |value| value["message"]["id"] == "msg-sub-3");
+    values[first_resumed_frame]["parent_tool_use_id"] = json!("send-1");
+    let (_, outcome) = replay(&framed(&values), AgentValueKind::Response, 1024);
+    let rejection = protocol_rejection_value(&outcome);
+    assert_eq!(
+        rejection["detail"]["reason"],
+        "terminal_drain_event_invalid"
+    );
+    assert_eq!(rejection["detail"]["state"]["eventThread"], "subagent");
+}
+
 /// The woken turn's message on 2.1.310 when the lead messages the finished subagent and
 /// submits the value in one round, `[text, SendMessage, StructuredOutput]`: both calls run
 /// inside the streamed message, the resume's frames and the `SendMessage` result ahead of the
@@ -843,12 +945,8 @@ fn a_subagents_frame_in_the_correction_window_is_its_work() {
         observation,
         AgentObservation::AssistantText { text } if text.as_ref() == "Still no issues"
     )));
-    // The resume's task list names the forgotten subagent, the one unrecognized frame.
-    assert!(
-        unrecognized_events(&observations)
-            .iter()
-            .all(|event| event["subtype"] == "background_tasks_changed")
-    );
+    // The resume's task list names the forgotten subagent: its activity, not unrecognized.
+    assert_eq!(unrecognized_events(&observations), Vec::<&Value>::new());
 
     // The main thread cannot speak before its `init`: its frame in the window stays the
     // protocol failure.
@@ -2383,9 +2481,9 @@ fn an_init_inside_an_open_epilogue_ends_it_and_opens_the_next_epilogue() {
         .unwrap();
     assert!(parser.settling());
     assert_eq!(parser.take_completed_result_exchange(), None);
-    // Inside a turn, the resume's announcement naming a forgotten subagent is recorded as
-    // unrecognized, as for a `SendMessage` resume; nothing else is.
-    assert_eq!(unrecognized_events(&observations), [&resume[0]]);
+    // Inside a turn, the resume's announcement naming a forgotten subagent is its
+    // activity, as for a `SendMessage` resume; nothing is unrecognized.
+    assert_eq!(unrecognized_events(&observations), Vec::<&Value>::new());
     assert!(
         information_diagnostics(&observations).ends_with(&[
             "subagent Explore resumed · Review the diff",
