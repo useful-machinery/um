@@ -150,7 +150,8 @@ fn runner_startup_discovers_claude_before_rejecting_invalid_operator_configurati
     assert_eq!(fixture.recorded_probes(), CLOSED_PROBES);
 }
 
-// REQ-AGENT-2, REQ-AGENT-13, REQ-AGENT-48, REQ-AGENT-49
+// REQ-AGENT-2, REQ-AGENT-4, REQ-AGENT-13, REQ-AGENT-48, REQ-AGENT-49
+// SC-AGENT-1
 #[test]
 fn doctor_reports_the_qualified_claude_code_snapshot_without_ambient_values() {
     let ambient_config = tempfile::tempdir().unwrap();
@@ -161,7 +162,7 @@ fn doctor_reports_the_qualified_claude_code_snapshot_without_ambient_values() {
         quote(ambient_config.path().to_str().unwrap())
     );
     let fixture = ClaudeCodeFixture::with_execution_and_capability_hook(
-        "2.1.310 (Claude Code)",
+        "2.1.321 (Claude Code)",
         COMPLETE_HELP,
         true,
         "exit 97",
@@ -189,9 +190,9 @@ fn doctor_reports_the_qualified_claude_code_snapshot_without_ambient_values() {
     let check = &report["checks"][0];
     assert_eq!(check["id"], CLAUDE_CODE_CHECK_ID);
     assert_eq!(check["status"], "pass");
-    assert_eq!(check["details"]["version"], "2.1.310");
+    assert_eq!(check["details"]["version"], "2.1.321");
     assert_eq!(check["details"]["supportedRange"], ">=2.1.234 <2.2.0");
-    assert_eq!(check["details"]["qualificationVersion"], "2.1.310");
+    assert_eq!(check["details"]["qualificationVersion"], "2.1.321");
     assert_eq!(check["details"]["profile"], "ClaudeCodeStreamJsonV1");
     assert_eq!(check["details"]["capabilities"], REQUIRED_CAPABILITIES);
     assert_eq!(
@@ -244,7 +245,7 @@ fn doctor_rejects_missing_explicit_session_capability() {
     assert_eq!(report_code(&output), "unsupported_claude_code_capability");
 }
 
-// REQ-AGENT-2, REQ-AGENT-5, REQ-AGENT-6, REQ-AGENT-50
+// REQ-AGENT-2, REQ-AGENT-4, REQ-AGENT-5, REQ-AGENT-6, REQ-AGENT-50
 // INV-HARNESS-11
 #[test]
 fn doctor_reports_each_claude_code_installation_failure_without_fallback() {
@@ -301,7 +302,7 @@ fn doctor_reports_each_claude_code_installation_failure_without_fallback() {
         assert_eq!(report_code(&output), expected_code);
         let details = &report(&output)["checks"][0]["details"];
         assert_eq!(details["supportedRange"], ">=2.1.234 <2.2.0");
-        assert_eq!(details["qualificationVersion"], "2.1.310");
+        assert_eq!(details["qualificationVersion"], "2.1.321");
         if expected_code == "unsupported_claude_code_version" {
             assert_eq!(
                 details["version"],
@@ -322,7 +323,7 @@ fn doctor_reports_each_claude_code_installation_failure_without_fallback() {
     assert!(compatible.recorded_probes().is_empty());
 }
 
-// REQ-AGENT-2, REQ-AGENT-7, REQ-AGENT-65, REQ-AGENT-68
+// REQ-AGENT-2, REQ-AGENT-4, REQ-AGENT-7, REQ-AGENT-65, REQ-AGENT-68
 // INV-HARNESS-11
 // SC-AGENT-1
 #[test]
@@ -342,7 +343,7 @@ fn doctor_passes_a_newer_claude_code_as_untested_and_reports_qualification() {
     assert_eq!(check["code"], "ok");
     assert_eq!(check["details"]["qualification"], "untested");
     assert_eq!(check["details"]["version"], "2.2.0");
-    assert_eq!(check["details"]["qualificationVersion"], "2.1.310");
+    assert_eq!(check["details"]["qualificationVersion"], "2.1.321");
     assert_eq!(check["details"]["supportedRange"], ">=2.1.234 <2.2.0");
     assert_eq!(untested.recorded_probes(), CLOSED_PROBES);
 
@@ -355,7 +356,7 @@ fn doctor_passes_a_newer_claude_code_as_untested_and_reports_qualification() {
         "qualification",
     );
 
-    let qualified = ClaudeCodeFixture::new("2.1.310 (Claude Code)", COMPLETE_HELP, true);
+    let qualified = ClaudeCodeFixture::new("2.1.321 (Claude Code)", COMPLETE_HELP, true);
     let output = doctor_json(qualified.path_directory(), &[CLAUDE_CODE_CHECK_ID], &[]);
     assert_eq!(output.status.code(), Some(0));
     assert_eq!(

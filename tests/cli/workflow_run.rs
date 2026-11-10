@@ -2829,10 +2829,10 @@ exports:
 fn run_two_pi_steps_and_claude(pi_version: &str) -> Output {
     let pi = PiFixture::with_execution(pi_version, COMPLETE_HELP, true, &response_pi_execution());
     let claude = ClaudeCodeFixture::with_execution(
-        "2.1.310 (Claude Code)",
+        "2.1.321 (Claude Code)",
         CLAUDE_CODE_COMPLETE_HELP,
         true,
-        &response_claude_code_execution_for_version("2.1.310"),
+        &response_claude_code_execution_for_version("2.1.321"),
     );
     let path = fixture_path_with_host_tools(&[pi.path_directory(), claude.path_directory()]);
     let bundle = RunBundle::new(&two_pi_steps_and_claude_source());
@@ -2870,7 +2870,7 @@ fn untested_harness_writes_one_stderr_advisory_per_selected_harness() {
         .count();
     assert_eq!(advisories, 1, "stderr: {stderr}");
     assert!(
-        !stderr.lines().any(|line| line.contains("2.1.310")),
+        !stderr.lines().any(|line| line.contains("2.1.321")),
         "stderr: {stderr}"
     );
 

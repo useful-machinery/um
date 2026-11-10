@@ -464,7 +464,7 @@ pub(super) enum Expectation {
     /// keeps for the next gap a drive finds.
     #[allow(
         dead_code,
-        reason = "no cell is a known gap on 2.1.310; INV-HARNESS-13 keeps the form"
+        reason = "no cell is a known gap on 2.1.321; INV-HARNESS-13 keeps the form"
     )]
     KnownGap {
         reason: &'static str,
@@ -514,7 +514,7 @@ impl LifecycleCell {
         }
     }
 
-    /// What 2.1.310 does with the cell: every cell settles. A Result-mode same-round resume
+    /// What 2.1.321 does with the cell: every cell settles. A Result-mode same-round resume
     /// submits the value while the resumed run is outstanding; the adapter rejects the
     /// premature candidate and begins the correction exchange, and the resumed run's first
     /// frame, which arrives before that exchange's `init`, is read as the turn's (UM-3111).
@@ -552,7 +552,7 @@ impl LifecycleCell {
             && !self.ending.cancels()
     }
 
-    /// The turns a settling cell completes on 2.1.310, where the matrix pins the count: a
+    /// The turns a settling cell completes on 2.1.321, where the matrix pins the count: a
     /// wakeup cell's, a same-round cell's and a rejected premature value's. In Result mode a
     /// same-round answer submits the value beside the followup's call, which the adapter
     /// rejects (an ambiguous candidate beside `TaskStop`, a premature one while the work
@@ -862,7 +862,7 @@ enum Verdict {
     /// A known gap met its rejection; no cell is one today (see `Expectation::KnownGap`).
     #[allow(
         dead_code,
-        reason = "no cell is a known gap on 2.1.310; INV-HARNESS-13 keeps the form"
+        reason = "no cell is a known gap on 2.1.321; INV-HARNESS-13 keeps the form"
     )]
     Gap(&'static str),
 }

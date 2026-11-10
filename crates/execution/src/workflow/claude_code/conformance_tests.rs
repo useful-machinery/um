@@ -257,6 +257,11 @@ async fn pinned_real_claude_code_01_normal_mode_loopback_conforms_from_a_synthet
         // The unanswered elicitation is the behavior under test, not a readiness
         // signal; bound the native wait and assert its correlated result below.
         command.env("MCP_TOOL_TIMEOUT", "1000");
+        // 2.1.321 keeps a skill's description in the listing only within a budget of 1% of
+        // the context window, and its bundled skills' descriptions use it up, so the synthetic
+        // project and plugin skills are listed by name only. The descriptions carry the
+        // markers asserted below; raise the budget so the listing shows them.
+        command.env("SLASH_COMMAND_TOOL_CHAR_BUDGET", "100000");
         let mut child = command.spawn().unwrap();
         let mut stdin = child.stdin.take().unwrap();
         stdin
@@ -1721,7 +1726,7 @@ async fn pinned_real_claude_code_09g_a_lead_that_loads_send_message_before_messa
             !tool_names(wakeup.body())
                 .iter()
                 .any(|name| name == "SendMessage"),
-            "2.1.310 defers SendMessage: {:?}",
+            "2.1.321 defers SendMessage: {:?}",
             tool_names(wakeup.body())
         );
         wakeup.release_blocks(vec![
