@@ -1,0 +1,9 @@
+{"type":"system","subtype":"status","status":"requesting","session_id":"00000000-0000-4000-8000-000000000001","uuid":"6f1c2a8e-3b4d-4e5f-8a9b-0c1d2e3f4a01"}
+{"type":"system","subtype":"status","status":"compacting","compact_output_chars":0,"session_id":"00000000-0000-4000-8000-000000000001","uuid":"6f1c2a8e-3b4d-4e5f-8a9b-0c1d2e3f4a02"}
+{"type":"system","subtype":"status","status":"compacting","compact_output_chars":8501,"session_id":"00000000-0000-4000-8000-000000000001","uuid":"6f1c2a8e-3b4d-4e5f-8a9b-0c1d2e3f4a03"}
+{"type":"system","subtype":"status","status":"compacting","compact_output_chars":17399,"session_id":"00000000-0000-4000-8000-000000000001","uuid":"6f1c2a8e-3b4d-4e5f-8a9b-0c1d2e3f4a04"}
+{"type":"system","subtype":"status","status":"compacting","compact_output_chars":26151,"session_id":"00000000-0000-4000-8000-000000000001","uuid":"6f1c2a8e-3b4d-4e5f-8a9b-0c1d2e3f4a05"}
+{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","resetsAt":1794336000,"rateLimitType":"five_hour","overageStatus":"rejected","overageDisabledReason":"org_level_disabled","isUsingOverage":false},"session_id":"00000000-0000-4000-8000-000000000001","uuid":"6f1c2a8e-3b4d-4e5f-8a9b-0c1d2e3f4a06"}
+{"type":"system","subtype":"status","status":null,"compact_result":"success","session_id":"00000000-0000-4000-8000-000000000001","uuid":"6f1c2a8e-3b4d-4e5f-8a9b-0c1d2e3f4a07"}
+{"type":"system","subtype":"compact_boundary","uuid":"6f1c2a8e-3b4d-4e5f-8a9b-0c1d2e3f4a08","compact_metadata":{"trigger":"auto","pre_tokens":180000},"session_id":"00000000-0000-4000-8000-000000000001"}
+{"type":"system","subtype":"status","status":"requesting","session_id":"00000000-0000-4000-8000-000000000001","uuid":"6f1c2a8e-3b4d-4e5f-8a9b-0c1d2e3f4a09"}

@@ -15,6 +15,7 @@ const RESPONSE_FIXTURE: &[u8] = include_bytes!("fixtures/response-duplicates-and
 const CONTRADICTORY_INIT: &[u8] = include_bytes!("fixtures/contradictory-init.jsonl");
 const MISSING_INIT: &[u8] = include_bytes!("fixtures/missing-init.jsonl");
 const MALFORMED: &[u8] = include_bytes!("fixtures/malformed.jsonl");
+const COMPACTION_COMPLETION: &[u8] = include_bytes!("fixtures/compaction-completion.jsonl");
 
 fn init(version: &str, session_id: &str) -> Value {
     json!({
@@ -286,16 +287,7 @@ fn api_retry_warning_names_the_reported_attempt_class_status_and_delay() {
         milestone_count(&observations, AgentLifecycleMilestone::RetryStarted),
         1
     );
-    let warnings = observations
-        .iter()
-        .filter_map(|observation| match observation {
-            AgentObservation::Diagnostic {
-                level: AgentDiagnosticLevel::Warning,
-                message,
-            } => Some(message.as_ref()),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
+    let warnings = warning_diagnostics(&observations);
     let [overloaded, unknown, uncounted] = warnings.as_slice() else {
         panic!("each api_retry must yield one warning: {observations:?}");
     };
@@ -306,6 +298,137 @@ fn api_retry_warning_names_the_reported_attempt_class_status_and_delay() {
     assert!(!unknown.contains("HTTP"), "{unknown:?}");
     assert!(uncounted.contains("rate_limit"), "{uncounted:?}");
     assert!(!uncounted.contains('/'), "{uncounted:?}");
+}
+
+/// The frames of `COMPACTION_COMPLETION`, with its completion report and the
+/// `compact_boundary` after it replaced by `completion`.
+fn compaction_ending_with(completion: &Value) -> Vec<u8> {
+    let frames = COMPACTION_COMPLETION
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .map(|line| serde_json::from_slice::<Value>(line).unwrap())
+        .filter(|frame| frame["subtype"] != "compact_boundary")
+        .map(|frame| {
+            if frame.get("compact_result").is_some() {
+                completion.clone()
+            } else {
+                frame
+            }
+        })
+        .collect::<Vec<_>>();
+    framed(&frames)
+}
+
+/// Feeds a Result-mode parser `init`, then `compaction` mid-turn, then the rest of a
+/// StructuredOutput exchange; settles the candidate it submits and returns the
+/// observations, with none of them an unrecognized event.
+fn settled_result_after(compaction: &[u8]) -> Vec<AgentObservation> {
+    let submission = structured_output_exchange_after(&[]);
+    let mut parser = parser(AgentValueKind::Result, 1024);
+    let mut observations = Vec::new();
+    for bytes in [
+        framed(&[init(QUALIFICATION_VERSION, SESSION_ID)]),
+        compaction.to_vec(),
+        framed(&submission[1..]),
+    ] {
+        parser
+            .push_stdout(&bytes, |observation| observations.push(observation))
+            .unwrap();
+    }
+    assert_eq!(
+        parser.take_completed_result_exchange(),
+        Some(CompletedResultExchange::Candidate(Arc::new(json!(7))))
+    );
+    parser
+        .accept_result(CapturedJson::fixture(Arc::new(json!(7))))
+        .unwrap();
+    assert!(matches!(
+        parser.finish(true),
+        AgentOutcome::Completed(CompletedAgentInvocation::Result(_))
+    ));
+    assert_eq!(unrecognized_events(&observations), Vec::<&Value>::new());
+    observations
+}
+
+// REQ-AGENT-37, REQ-AGENT-79
+#[test]
+fn a_compaction_that_completes_mid_turn_is_activity_and_the_turn_settles_its_result() {
+    let observations = settled_result_after(COMPACTION_COMPLETION);
+    assert_eq!(
+        milestone_count(&observations, AgentLifecycleMilestone::CompactionCompleted),
+        1
+    );
+    assert_eq!(warning_diagnostics(&observations), Vec::<&str>::new());
+    assert_eq!(
+        information_diagnostics(&observations),
+        [
+            "requesting",
+            "compacting",
+            "compacting",
+            "compacting",
+            "compacting",
+            "requesting"
+        ]
+    );
+}
+
+// REQ-AGENT-71, REQ-AGENT-79
+#[test]
+fn a_status_frame_outside_the_compaction_shapes_is_refused_with_its_line_retained() {
+    for fields in [
+        json!({}),
+        json!({"status": 7}),
+        json!({"status": ""}),
+        json!({"status": "compacting", "compact_result": "success"}),
+        json!({"status": null, "compact_result": "partial"}),
+        json!({"status": null, "compact_result": 1}),
+        json!({"status": null, "compact_error": "x"}),
+        json!({"status": null, "compact_result": "success", "compact_error": "x"}),
+        json!({"status": null, "compact_result": "failed", "compact_error": 5}),
+    ] {
+        let frame = system_event("status", fields);
+        let (_, outcome) = replay(
+            &framed(&[init(QUALIFICATION_VERSION, SESSION_ID), frame.clone()]),
+            AgentValueKind::Response,
+            1024,
+        );
+        let rejection = protocol_rejection_value(&outcome);
+        assert_eq!(
+            rejection["detail"]["reason"], "system_event_invalid",
+            "{frame}"
+        );
+        assert_eq!(rejection["detail"]["stage"], "system_event", "{frame}");
+        assert_eq!(
+            stream_excerpt_value(&outcome)["rejectedLine"]["text"],
+            serde_json::to_string(&frame).unwrap(),
+            "{frame}"
+        );
+    }
+}
+
+// REQ-AGENT-79
+#[test]
+fn a_failed_or_cleared_compaction_status_is_activity_and_only_the_turns_outcome_counts() {
+    let marker = "compaction marker: the summary request was refused";
+    let failed = settled_result_after(&compaction_ending_with(&system_event(
+        "status",
+        json!({"status": null, "compact_result": "failed", "compact_error": marker}),
+    )));
+    let cleared = settled_result_after(&compaction_ending_with(&system_event(
+        "status",
+        json!({"status": null}),
+    )));
+    for observations in [&failed, &cleared] {
+        assert_eq!(
+            milestone_count(observations, AgentLifecycleMilestone::CompactionCompleted),
+            0
+        );
+    }
+    let [warning] = warning_diagnostics(&failed)[..] else {
+        panic!("a failed compaction must yield one warning: {failed:?}");
+    };
+    assert!(warning.contains(marker), "{warning:?}");
+    assert_eq!(warning_diagnostics(&cleared), Vec::<&str>::new());
 }
 
 /// One exchange whose assistant turn calls the Agent tool, with `lifecycle` between the
@@ -351,13 +474,20 @@ fn subagent_started(fields: Value) -> Value {
 }
 
 fn information_diagnostics(observations: &[AgentObservation]) -> Vec<&str> {
+    diagnostics_at(observations, AgentDiagnosticLevel::Information)
+}
+
+fn warning_diagnostics(observations: &[AgentObservation]) -> Vec<&str> {
+    diagnostics_at(observations, AgentDiagnosticLevel::Warning)
+}
+
+fn diagnostics_at(observations: &[AgentObservation], wanted: AgentDiagnosticLevel) -> Vec<&str> {
     observations
         .iter()
         .filter_map(|observation| match observation {
-            AgentObservation::Diagnostic {
-                level: AgentDiagnosticLevel::Information,
-                message,
-            } => Some(message.as_ref()),
+            AgentObservation::Diagnostic { level, message } if *level == wanted => {
+                Some(message.as_ref())
+            }
             _ => None,
         })
         .collect()
@@ -5299,18 +5429,8 @@ fn rate_limit_events_warn_only_when_a_window_is_not_allowed() {
         result(SESSION_ID),
     ]);
     let (observations, _) = replay(&transcript, AgentValueKind::None, 1024);
-    let warnings: Vec<&str> = observations
-        .iter()
-        .filter_map(|observation| match observation {
-            AgentObservation::Diagnostic {
-                level: AgentDiagnosticLevel::Warning,
-                message,
-            } => Some(message.as_ref()),
-            _ => None,
-        })
-        .collect();
     assert_eq!(
-        warnings,
+        warning_diagnostics(&observations),
         [
             "provider rate limit allowed_warning (seven_day)",
             "provider rate limit rejected",

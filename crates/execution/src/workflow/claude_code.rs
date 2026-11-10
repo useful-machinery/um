@@ -121,6 +121,8 @@ const MAXIMUM_UNRECOGNIZED_KIND_TOKEN_BYTES: usize = 64;
 // Display-width bounds on the harness-reported text a subagent diagnostic names.
 const MAXIMUM_SUBAGENT_DESCRIPTION_WIDTH: usize = 200;
 const MAXIMUM_SUBAGENT_TOKEN_WIDTH: usize = 64;
+/// Display-width bound on the error a failed compaction's warning carries.
+const MAXIMUM_COMPACTION_ERROR_WIDTH: usize = 200;
 /// Entries of each tracked-work list `protocol-rejection.json` keeps (REQ-AGENT-74).
 const MAXIMUM_RETAINED_TRACKED_WORK: usize = 16;
 /// Width of a task, call or run identifier in the retained tracked work.
@@ -2366,12 +2368,28 @@ impl ClaudeCodeStreamJsonV1Parser {
         self.require_matching_session(object)?;
         match required_string(object, "subtype").ok_or_else(|| self.protocol_failure())? {
             "status" => {
-                let status = required_nonempty_string(object, "status")
-                    .ok_or_else(|| self.protocol_failure())?;
-                self.observations.push(AgentObservation::Diagnostic {
-                    level: AgentDiagnosticLevel::Information,
-                    message: Arc::from(status),
-                });
+                // A status is text or `null`, which clears it. Only beside `null` does
+                // Claude Code report how a compaction ended: `compact_result` `success`,
+                // whose `compact_boundary` follows, or `failed`, optionally with a text
+                // `compact_error`. Every other shape is refused (REQ-AGENT-79).
+                let compact_result = object.get("compact_result").map(Value::as_str);
+                let compact_error = object.get("compact_error").map(Value::as_str);
+                match (object.get("status"), compact_result, compact_error) {
+                    (Some(Value::String(status)), None, None) if !status.is_empty() => {
+                        self.observations.push(AgentObservation::Diagnostic {
+                            level: AgentDiagnosticLevel::Information,
+                            message: Arc::from(status.as_str()),
+                        });
+                    }
+                    (Some(Value::Null), None | Some(Some("success")), None) => {}
+                    (Some(Value::Null), Some(Some("failed")), error @ (None | Some(Some(_)))) => {
+                        self.observations.push(AgentObservation::Diagnostic {
+                            level: AgentDiagnosticLevel::Warning,
+                            message: Arc::from(compaction_failure_message(error.flatten())),
+                        });
+                    }
+                    _ => return Err(self.protocol_failure()),
+                }
             }
             "api_retry" => {
                 if !self.exchange_active {
@@ -4002,6 +4020,18 @@ fn api_retry_message(object: &Map<String, Value>) -> String {
         parts.push(format!("next in {delay} ms"));
     }
     parts.join(" · ")
+}
+
+/// The warning a compaction Claude Code reports as failed yields, carrying the
+/// `compact_error` it names when there is one.
+fn compaction_failure_message(error: Option<&str>) -> String {
+    match error.filter(|error| !error.is_empty()) {
+        Some(error) => format!(
+            "context compaction failed: {}",
+            ellipsize(error, MAXIMUM_COMPACTION_ERROR_WIDTH)
+        ),
+        None => String::from("context compaction failed"),
+    }
 }
 
 /// The warning an epilogue's native failure yields: its closed classification only.
