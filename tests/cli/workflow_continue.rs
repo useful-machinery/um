@@ -38,6 +38,166 @@ fn continue_args(run: &Path, from: &[&str]) -> Vec<String> {
     args
 }
 
+// REQ-WFFORMAT-84, REQ-CONTINUE-9, REQ-CONTINUE-15: a child's admitted empty JSON
+// survives the retained-record round trip without applying its object schema to null.
+#[test]
+fn continuation_preserves_an_omitted_schema_constrained_child_input() {
+    let bundle = TreeBundle::new(
+        "schemaVersion: 1\nsteps:\n  build:\n    kind: workflow\n    workflow: child.yaml\n    on:\n      succeeded: exit.succeeded\n      failed: exit.failed\n",
+    );
+    bundle.write_source(
+        "findings.schema.json",
+        r#"{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object"}"#,
+    );
+    bundle.write_source(
+        "child.yaml",
+        r#"schemaVersion: 1
+inputs:
+  findings: {kind: json, optional: true, schema: findings.schema.json}
+steps:
+  prepare:
+    kind: cmd
+    command:
+      argv: ["sh", "-c", "printf prepared > prepared.txt"]
+    outputs:
+      text: {kind: text, from: path, path: prepared.txt}
+  gate:
+    kind: cmd
+    dependsOn: [prepare]
+    inputs:
+      prior: {ref: outputs.prepare.text}
+      findings: {ref: inputs.findings}
+    command:
+      argv:
+        - sh
+        - -c
+        - 'test -e ready && test "$(cat "$UM_STEP_INPUTS/values/findings")" = null && cp "$UM_STEP_INPUTS/values/prior" final.txt'
+"#,
+    );
+    let run = bundle.result("optional-child");
+    let initial = isolated_command(&bundle.args(&run)).output().unwrap();
+    assert_eq!(initial.status.code(), Some(0), "{initial:?}");
+    assert_eq!(run_record(&run)["outcome"], "failed");
+    let child = run.join("children/build/000001");
+    let manifest_path = child.join("workflow/manifest.json");
+    let original_manifest = fs::read(&manifest_path).unwrap();
+    fs::write(bundle.execution_root().join("prepared.txt"), "changed").unwrap();
+    fs::write(bundle.execution_root().join("ready"), "").unwrap();
+
+    let output = isolated_command(&continue_args(&child, &["gate"]))
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert_eq!(
+        fs::read_to_string(bundle.execution_root().join("final.txt")).unwrap(),
+        "prepared"
+    );
+    assert_eq!(fs::read(manifest_path).unwrap(), original_manifest);
+    let result = read_json(&child.join("attempts/000002/result/result.json"));
+    assert_eq!(result["outcome"], "succeeded", "{result}");
+    assert_eq!(result["steps"][0]["state"], "inherited", "{result}");
+
+    // An explicit null remains invalid during fresh admission.
+    let explicit_run = bundle.result("explicit-null");
+    let mut explicit = bundle.args_for(&explicit_run, "child.yaml");
+    explicit.extend([
+        "--input-json".to_owned(),
+        "findings".to_owned(),
+        "null".to_owned(),
+    ]);
+    let output = isolated_command(&explicit).output().unwrap();
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let rejected: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(rejected["outcome"], "rejected", "{rejected}");
+    assert!(!explicit_run.join("state.json").exists());
+}
+
+// REQ-CONTINUE-9, REQ-CONTINUE-10: recovering an omitted empty value must not
+// waive a replacement's changed schema, requiredness or default.
+#[test]
+fn continuation_rejects_incompatible_replacements_of_optional_json_inputs() {
+    for (name, original_schema, explicit_null, replacement_declaration, replacement_schema) in [
+        (
+            "required",
+            r#"{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object"}"#,
+            false,
+            "kind: json, schema: findings.schema.json",
+            r#"{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object"}"#,
+        ),
+        (
+            "new-default",
+            r#"{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object"}"#,
+            false,
+            "kind: json, default: {}, schema: findings.schema.json",
+            r#"{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object"}"#,
+        ),
+        (
+            "changed-schema",
+            r#"{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object"}"#,
+            false,
+            "kind: json, optional: true, schema: findings.schema.json",
+            r#"{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"string"}"#,
+        ),
+        (
+            "explicit-null",
+            r#"{"$schema":"https://json-schema.org/draft/2020-12/schema","type":["object","null"]}"#,
+            true,
+            "kind: json, optional: true, schema: findings.schema.json",
+            r#"{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object"}"#,
+        ),
+    ] {
+        let bundle = RunBundle::new(
+            "schemaVersion: 1\ninputs:\n  findings: {kind: json, optional: true, schema: findings.schema.json}\nsteps:\n  fail:\n    kind: cmd\n    command: {argv: ['false']}\n",
+        );
+        let schema_path = bundle.source_root().join("findings.schema.json");
+        fs::write(&schema_path, original_schema).unwrap();
+        let run = bundle.result(name);
+        let mut initial = bundle.args(&run);
+        if explicit_null {
+            initial.extend([
+                "--input-json".to_owned(),
+                "findings".to_owned(),
+                "null".to_owned(),
+            ]);
+        }
+        let output = isolated_command(&initial).output().unwrap();
+        assert_eq!(output.status.code(), Some(1), "{name}: {output:?}");
+        assert!(run.join("state.json").exists(), "{name}: {output:?}");
+
+        fs::write(schema_path, replacement_schema).unwrap();
+        let replacement = bundle.source_root().join("candidate.yaml");
+        fs::write(
+            &replacement,
+            format!(
+                "schemaVersion: 1\ninputs:\n  findings: {{{replacement_declaration}}}\nsteps:\n  fail:\n    kind: cmd\n    command: {{argv: ['false']}}\n"
+            ),
+        )
+        .unwrap();
+        let mut request = continue_args(&run, &["fail"]);
+        request.extend([
+            "--workflow".to_owned(),
+            replacement.to_string_lossy().into_owned(),
+        ]);
+        let output = isolated_command(&request).output().unwrap();
+        assert_eq!(output.status.code(), Some(1), "{name}: {output:?}");
+        let rejected: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert!(
+            rejected["diagnostics"].as_array().unwrap().iter().any(|d| {
+                d["code"] == "continuation_inputs_unsatisfied"
+                    && d["location"]["input"] == "findings"
+            }),
+            "{name}: {rejected}"
+        );
+        assert_eq!(
+            read_json(&run.join("state.json"))["attempts"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+}
+
 // REQ-CONTINUE-10, REQ-CONTINUE-13
 #[test]
 fn continuation_collects_all_missing_candidate_harness_profiles() {

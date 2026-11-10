@@ -44,6 +44,12 @@ pub struct CreateRunRequest {
         skip_serializing_if = "Option::is_none"
     )]
     pub integration_context: Option<Option<std::collections::HashMap<String, String>>>,
+    /// Steps and finalizers the runner may execute at once; omission means 1.
+    #[serde(
+        rename = "maximumParallelSteps",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub maximum_parallel_steps: Option<i32>,
 }
 
 impl CreateRunRequest {
@@ -57,6 +63,7 @@ impl CreateRunRequest {
             input_set_id: None,
             publication: None,
             integration_context: None,
+            maximum_parallel_steps: None,
         }
     }
 }

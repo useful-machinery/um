@@ -82,6 +82,7 @@ pub struct CreateRunInput<'a> {
     pub publish_export: Option<&'a str>,
     pub publish_target: Option<super::publications::ExistingPublicationTarget<'a>>,
     pub integration_context: Option<&'a BTreeMap<String, String>>,
+    pub maximum_parallel_steps: Option<u8>,
 }
 
 pub struct RunListFilter<'a> {
@@ -185,6 +186,7 @@ impl<'a> RunApi<'a> {
                     .collect(),
             )
         });
+        request.maximum_parallel_steps = input.maximum_parallel_steps.map(i32::from);
         let endpoint = self.collection_endpoint(organization);
         let response = self.send_api_request(
             StatusCode::ACCEPTED,
@@ -2656,6 +2658,58 @@ mod recovery_read_tests {
                 request_id: Some(request_id.to_owned()),
             }
         );
+    }
+
+    // REQ-RUN-84
+    #[test]
+    fn create_sends_the_parallel_step_limit_only_when_asked() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let body = br#"{"type":"https://api.usefulmachinery.com/problems/validation-failed","title":"Invalid","status":400}"#;
+        let mut response = format!(
+            "HTTP/1.1 400 Bad Request\r\nContent-Type: application/problem+json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        response.extend_from_slice(body);
+        let server = um_test_support::ScriptedHttpServer::respond_in_sequence(vec![
+            response.clone(),
+            response,
+        ]);
+        let storage = HttpClient::new(HttpTransportPolicy::AllowInsecureHttp).unwrap();
+        let api = RunApi::new(
+            &server.api_url,
+            "fixture-token",
+            HttpTransportPolicy::AllowInsecureHttp,
+            &storage,
+        )
+        .unwrap();
+        for maximum_parallel_steps in [Some(4), None] {
+            let _ = api.create(
+                "acme",
+                "fixture-key",
+                CreateRunInput {
+                    project_id: "prj_01k0z6r1w8f4jy2m7q9v3x5abc",
+                    workflow_path: ".um/workflows/build.yaml",
+                    source_branch: None,
+                    workspace_branch: None,
+                    workspace_commit: None,
+                    display_name: None,
+                    input_set_id: None,
+                    publish_export: None,
+                    publish_target: None,
+                    integration_context: None,
+                    maximum_parallel_steps,
+                },
+                || true,
+            );
+        }
+        let bodies: Vec<serde_json::Value> = server
+            .finish()
+            .iter()
+            .map(|request| serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap())
+            .collect();
+        assert_eq!(bodies[0]["maximumParallelSteps"], serde_json::json!(4));
+        assert!(bodies[1].get("maximumParallelSteps").is_none());
     }
 
     // REQ-RUN-80

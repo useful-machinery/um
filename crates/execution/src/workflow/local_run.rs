@@ -2022,9 +2022,32 @@ impl PendingLocalContinuation {
         super::continuation::project_input_candidates(
             &workflow.definition,
             &self.initial_workflow.definition,
-            &self.inputs,
+            &self.continuation_input_values(workflow),
         )
         .0
+    }
+
+    /// An optional null rejected by its original schema can only be the empty value
+    /// admission supplied after checking inputs. Preserve that omission for an unchanged
+    /// optional contract, so admission completes it again without validating the sentinel.
+    fn continuation_input_values(&self, workflow: &ResolvedWorkflow) -> ResolvedInputs {
+        let prior = &self.initial_workflow;
+        let mut values = self.inputs.values().clone();
+        values.retain(|name, value| {
+            let ResolvedInput::Json(json) = value else {
+                return true;
+            };
+            !(json.value().is_null()
+                && prior.definition.optional_inputs.contains(name)
+                && workflow.definition.optional_inputs.contains(name)
+                && !prior.definition.input_defaults.contains_key(name)
+                && !workflow.definition.input_defaults.contains_key(name)
+                && prior.input_json_schema(name).is_some_and(|schema| {
+                    !schema.is_valid(json.value())
+                        && Some(schema) == workflow.input_json_schema(name)
+                }))
+        });
+        ResolvedInputs::new(values)
     }
 
     /// A later admission rejection still settles an abandoned owner, without claiming

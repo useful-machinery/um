@@ -159,6 +159,14 @@ struct CreateCommand {
 
     #[arg(
         long,
+        value_name = "COUNT",
+        value_parser = clap::value_parser!(u8).range(1..=64),
+        help = "Maximum simultaneous workflow steps (1 to 64; 1 when omitted)"
+    )]
+    max_parallel: Option<u8>,
+
+    #[arg(
+        long,
         value_name = "NAME",
         value_parser = super::publication::parse_export_name,
         help = "Request automatic publication of this exact Git branch export after success"
@@ -687,6 +695,7 @@ impl CreateCommand {
                             }
                         }),
                         integration_context: integration_context.as_ref(),
+                        maximum_parallel_steps: self.max_parallel,
                     },
                     || control.begin_dispatch_with_recovery(dispatch_recovery.clone()),
                 )
@@ -2744,6 +2753,7 @@ mod tests {
                 publish_export: None,
                 publish_target: None,
                 integration_context: None,
+                maximum_parallel_steps: None,
             },
             begin_dispatch,
         )
