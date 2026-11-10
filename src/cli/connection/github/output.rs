@@ -55,7 +55,7 @@ pub(super) fn write_setup_begin(
                 )?;
                 writeln!(
                     output,
-                    "\nThen copy the decimal installation ID from the browser return URL and run:\n  um connection github setup complete {organization} {} --provider-installation-id <INSTALLATION_ID>",
+                    "\nThe Useful Machinery page GitHub returns to shows the installation ID and this command.\nThen run it with that installation ID:\n  um connection github setup complete {organization} {} --provider-installation-id <INSTALLATION_ID>",
                     session.id
                 )?;
             }

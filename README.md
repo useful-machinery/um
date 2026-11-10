@@ -1174,8 +1174,9 @@ um connection github setup begin acme-labs
 ```
 
 Open the reported URL in a browser and approve the GitHub account and repositories.
-After GitHub returns from setup, copy the decimal installation ID from the browser return
-URL and complete the same session as the same Useful Machinery principal:
+GitHub then returns the browser to a Useful Machinery setup page that shows the decimal
+installation ID and the completion command. Run that command with the ID to complete the
+same session as the same Useful Machinery principal:
 
 ```sh
 um connection github setup complete \

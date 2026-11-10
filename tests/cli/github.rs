@@ -118,6 +118,9 @@ fn setup_begin_and_complete_preserve_the_browser_handoff() {
     assert!(human.contains(&format!(
         "um connection github setup complete {ORGANIZATION} {SETUP_SESSION} --provider-installation-id <INSTALLATION_ID>"
     )));
+    // The callback page erases its query string, so the hint points at the page, not the URL.
+    assert!(human.contains("installation ID"));
+    assert!(!human.contains("return URL"));
     assert!(!human.contains("setup-response-sentinel"));
     assert!(begin.stderr.is_empty());
 
