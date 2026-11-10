@@ -22,7 +22,9 @@ pub(super) const AFTER_HELP: &str = "Retry eligibility:
 A run waiting for repair is retried from the stage that failed: the retry is recorded,
 with the replacement profiles of --agent-profiles when given, and the run continues as
 resume continues it, in the previous attempt's execution root unless --execution-root
-names another.";
+names another. A stage whose child run failed continues that child in place, inheriting
+its completed steps and rerunning the rest; in another execution root the stage starts
+afresh. No separate resume is needed.";
 
 const COMMAND: &str = "um workflow run retry";
 

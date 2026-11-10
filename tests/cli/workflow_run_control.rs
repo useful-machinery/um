@@ -1,4 +1,5 @@
 use std::fs;
+use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Output, Stdio};
 
@@ -1916,4 +1917,789 @@ fn an_upgraded_fan_out_resumes_at_its_element() {
     assert_eq!(records(&second), before);
     assert_eq!(run_directories(&runs), directories);
     assert_eq!(run_record(&second)["state"], "waiting");
+}
+
+/// A root whose `design` stage child plans and then routes, and whose physically failed
+/// child waits for a repair at `design` itself (SC-CONTINUE-10). `design` maps the resolving
+/// control's `notes`, and the root exports the child's `plan`.
+const STAGE_TREE_ROOT: &str = "schemaVersion: 1
+programs: [bin]
+outcomes: [landed, failed]
+steps:
+  design:
+    kind: workflow
+    workflow: design.yaml
+    inputs:
+      notes:
+        ref: wait.notes
+    on:
+      planned: exit.landed
+      failed:
+        wait: repair
+        then: design
+exports:
+  plan:
+    ref: outputs.design.plan
+";
+
+/// The stage tree's root fanning `design` out over its `parts` input, one element per part,
+/// each continuing to `merge` once it plans.
+const STAGE_FAN_OUT_ROOT: &str = "schemaVersion: 1
+programs: [bin]
+inputs:
+  parts:
+    kind: json
+outcomes: [landed, failed]
+steps:
+  design:
+    kind: workflow
+    workflow: design.yaml
+    forEach: inputs.parts
+    inputs:
+      part:
+        ref: item.name
+    on:
+      planned: merge
+      failed:
+        wait: repair
+        then: design
+  merge:
+    kind: workflow
+    workflow: merge.yaml
+    on:
+      landed: exit.landed
+      failed: exit.failed
+";
+
+/// The stage tree's root whose failed `design` waits for a repair that continues at an
+/// earlier `setup` stage instead.
+const STAGE_SETUP_ROOT: &str = "schemaVersion: 1
+programs: [bin]
+outcomes: [landed, failed]
+steps:
+  setup:
+    kind: workflow
+    workflow: merge.yaml
+    on:
+      landed: design
+      failed: exit.failed
+  design:
+    kind: workflow
+    workflow: design.yaml
+    on:
+      planned: exit.landed
+      failed:
+        wait: repair
+        then: setup
+";
+
+/// The stage child: `read` and `plan` produce text outputs, `route` reads the plan and
+/// succeeds only once the workspace's plan file reads `fenced`, `effect` runs after it, and
+/// the `close` finalizer fails while `close-fails` exists. `findings` is an optional
+/// object-schema JSON input no root maps, and `unused` a profile no step uses.
+const STAGE_TREE_DESIGN: &str = "schemaVersion: 1
+agentProfiles:
+  unused:
+    harness:
+      kind: pi
+      config:
+        model: fixture/model
+        thinking: low
+inputs:
+  part:
+    kind: text
+    optional: true
+  notes:
+    kind: text
+    optional: true
+  findings:
+    kind: json
+    optional: true
+    schema: findings.schema.json
+outcomes: [planned, failed]
+outcome:
+  from: outputs.route.verdict
+  onFailure: failed
+steps:
+  read:
+    kind: cmd
+    command:
+      argv: [stage, read]
+    outputs:
+      text:
+        kind: text
+        from: path
+        path: read.txt
+  plan:
+    kind: cmd
+    inputs:
+      read:
+        ref: outputs.read.text
+    command:
+      argv: [stage, plan]
+    outputs:
+      text:
+        kind: text
+        from: path
+        path: plan.txt
+  route:
+    kind: cmd
+    inputs:
+      plan:
+        ref: outputs.plan.text
+      part:
+        ref: inputs.part
+      findings:
+        ref: inputs.findings
+    command:
+      argv: [stage, route]
+    outputs:
+      verdict:
+        kind: text
+        from: path
+        path: verdict.txt
+  effect:
+    kind: cmd
+    dependsOn: [route]
+    inputs:
+      part:
+        ref: inputs.part
+    command:
+      argv: [stage, effect]
+finalizers:
+  close:
+    kind: cmd
+    command:
+      argv: [stage, close]
+exports:
+  plan:
+    ref: outputs.plan.text
+";
+
+const STAGE_TREE_MERGE: &str = "schemaVersion: 1
+outcomes: [landed, failed]
+outcome:
+  from: outputs.decide.verdict
+  onFailure: failed
+steps:
+  decide:
+    kind: cmd
+    command:
+      argv: [sh, -c, printf landed > verdict-merge.txt]
+    outputs:
+      verdict:
+        kind: text
+        from: path
+        path: verdict-merge.txt
+";
+
+/// `stage STEP` counts its runs in `count-<STEP>`; `plan` and `route` record the value they
+/// received as `seen-read[-<part>]` and `seen-plan[-<part>]`; `route` requires the omitted
+/// `findings` to read `null` and `plan[-<part>].md` to read `fenced`; `effect` appends one
+/// line to `effects`.
+const STAGE_TREE_PROGRAM: &str = "#!/bin/sh
+set -eu
+count=$(($(cat \"count-$1\" 2>/dev/null || printf 0) + 1))
+printf '%s' \"$count\" > \"count-$1\"
+part=$(cat \"${UM_STEP_INPUTS:-/nonexistent}/values/part\" 2>/dev/null || true)
+suffix=${part:+-$part}
+case \"$1\" in
+  read) printf 'read-%s' \"$count\" > read.txt ;;
+  plan)
+    cat \"$UM_STEP_INPUTS/values/read\" > \"seen-read$suffix\"
+    printf 'plan-%s' \"$count\" > plan.txt ;;
+  route)
+    cat \"$UM_STEP_INPUTS/values/plan\" > \"seen-plan$suffix\"
+    test \"$(cat \"$UM_STEP_INPUTS/values/findings\")\" = null
+    grep -qx fenced \"plan$suffix.md\"
+    printf planned > verdict.txt ;;
+  effect) printf 'effect%s\\n' \"$suffix\" >> effects ;;
+  close) test ! -e close-fails ;;
+esac
+";
+
+fn stage_tree(root: &str) -> TreeBundle {
+    let bundle = TreeBundle::new(root);
+    bundle.write_source("design.yaml", STAGE_TREE_DESIGN);
+    bundle.write_source("merge.yaml", STAGE_TREE_MERGE);
+    bundle.write_source(
+        "findings.schema.json",
+        r#"{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object"}"#,
+    );
+    bundle.write_program("bin/stage", STAGE_TREE_PROGRAM);
+    bundle
+}
+
+/// How often each of `read`, `plan` and `route` ran in `root`.
+fn stage_counts(root: &Path) -> [u32; 3] {
+    ["read", "plan", "route"].map(|step| {
+        fs::read_to_string(root.join(format!("count-{step}")))
+            .map_or(0, |count| count.parse().unwrap())
+    })
+}
+
+/// Creates the stage tree's run with `args`, which waits for a repair: its directory and wait.
+fn repair_waiting_stage(
+    bundle: &TreeBundle,
+    name: &str,
+    args: &[&str],
+) -> (PathBuf, serde_json::Value) {
+    let destination = bundle.result(name);
+    let terminal = completed(
+        &isolated_command(&bundle.args(&destination))
+            .args(args)
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(terminal["outcome"], "waiting", "{terminal}");
+    assert_eq!(terminal["wait"]["kind"], "repair", "{terminal}");
+    (
+        fs::canonicalize(&destination).unwrap(),
+        terminal["wait"].clone(),
+    )
+}
+
+/// The last document a chaining `retry` or `resume` wrote; it exited 0.
+fn last_document(output: &Output) -> serde_json::Value {
+    chained(output).pop().unwrap()
+}
+
+fn attempt_result(run: &Path, attempt: u64) -> serde_json::Value {
+    read_json(&run.join(format!("attempts/{attempt:06}/result/result.json")))
+}
+
+/// Each step's id and state in a published result.
+fn step_states(result: &serde_json::Value) -> Vec<(String, String)> {
+    result["steps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|step| {
+            (
+                step["id"].as_str().unwrap().to_owned(),
+                step["state"].as_str().unwrap().to_owned(),
+            )
+        })
+        .collect()
+}
+
+fn states(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+    pairs
+        .iter()
+        .map(|(id, state)| ((*id).to_owned(), (*state).to_owned()))
+        .collect()
+}
+
+/// Every file under `directory`, by relative path, with its bytes.
+fn file_tree(directory: &Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
+    let mut files = std::collections::BTreeMap::new();
+    let mut pending = vec![directory.to_owned()];
+    while let Some(next) = pending.pop() {
+        for entry in fs::read_dir(&next).unwrap() {
+            let path = entry.unwrap().path();
+            if fs::symlink_metadata(&path).unwrap().is_dir() {
+                pending.push(path);
+            } else if path.file_name().is_some_and(|name| name != "run.lock") {
+                let relative = path.strip_prefix(directory).unwrap().to_owned();
+                files.insert(relative, fs::read(&path).unwrap_or_default());
+            }
+        }
+    }
+    files
+}
+
+// SC-CONTINUE-10, REQ-CONTINUE-81, REQ-LOCALRUN-184, REQ-LOCALRUN-177, REQ-CONTINUE-9,
+// REQ-CONTINUE-15, REQ-CONTINUE-16, INV-ENGINE-27: a repair retry continues the physically
+// failed child in place: the same child's next attempts inherit `read` and `plan` from
+// attempt 1, re-execute `route` and `effect` with reason `retry`, and the parent lands with
+// the child's export; the profile replacement of the last retry resolves the child's
+// re-executed attempt.
+#[test]
+fn a_repair_retry_continues_the_failed_child_without_repeating_its_completed_steps() {
+    let bundle = stage_tree(STAGE_TREE_ROOT);
+    let root = bundle.execution_root();
+    fs::write(root.join("plan.md"), "unfenced").unwrap();
+    let (run, wait) = repair_waiting_stage(&bundle, "repaired", &[]);
+    assert_eq!(wait["payload"]["child"], "children/design/000001", "{wait}");
+    let child = run.join("children/design/000001");
+    let child_id = run_record(&child)["id"].clone();
+    let first_attempt = file_tree(&child.join("attempts/000001"));
+    assert_eq!(stage_counts(root), [1, 1, 1]);
+
+    // Unrepaired, the retry continues the same child, whose route fails again.
+    let waiting = last_document(&run_control(None, "retry", &run, &[]));
+    assert_eq!(waiting["outcome"], "waiting", "{waiting}");
+    assert_eq!(
+        waiting["wait"]["payload"]["child"],
+        "children/design/000001"
+    );
+    assert_eq!(stage_counts(root), [1, 1, 2]);
+    assert_eq!(ordinals_of(&run.join("children/design")), ["000001"]);
+    assert_eq!(attempt_count(&child), 2);
+
+    // The operator repairs only the workspace; the workspace copy of `plan`'s file changes
+    // too, but its retained output is what `route` reads.
+    fs::write(root.join("plan.md"), "fenced").unwrap();
+    fs::write(root.join("plan.txt"), "replaced").unwrap();
+    let replacement = bundle.result("replacement.json");
+    fs::create_dir_all(replacement.parent().unwrap()).unwrap();
+    fs::write(
+        &replacement,
+        serde_json::to_vec(&serde_json::json!({
+            "schemaVersion": 1,
+            "agentProfiles": {"unused": {"harness": {
+                "kind": "claude_code",
+                "config": {"model": "fixture/claude", "effort": "low"}
+            }}}
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let output = run_control(
+        None,
+        "retry",
+        &run,
+        &["--agent-profiles", replacement.to_str().unwrap()],
+    );
+    let terminal = last_document(&output);
+    assert_eq!(terminal["outcome"], "succeeded", "{terminal}");
+    assert_eq!(terminal["result"]["continuation"]["reason"], "retry");
+    let export = Path::new(terminal["resultDirectory"].as_str().unwrap()).join(
+        terminal["result"]["exports"]["plan"]["path"]
+            .as_str()
+            .unwrap(),
+    );
+    assert_eq!(fs::read_to_string(export).unwrap(), "plan-1", "{terminal}");
+    assert_eq!(run_record(&run)["outcome"], "landed");
+    assert_eq!(attempt_count(&run), 3);
+
+    assert_eq!(ordinals_of(&run.join("children/design")), ["000001"]);
+    assert_eq!(run_record(&child)["id"], child_id);
+    assert_eq!(run_record(&child)["outcome"], "planned");
+    assert_eq!(attempt_count(&child), 3);
+    for attempt in [2, 3] {
+        let result = attempt_result(&child, attempt);
+        assert_eq!(result["continuation"]["reason"], "retry", "{result}");
+        assert_eq!(
+            result["continuation"]["reexecutedSteps"],
+            serde_json::json!(["route", "effect"]),
+            "{result}"
+        );
+    }
+    let last = attempt_result(&child, 3);
+    assert_eq!(last["outcome"], "succeeded", "{last}");
+    assert_eq!(
+        step_states(&last),
+        states(&[
+            ("read", "inherited"),
+            ("plan", "inherited"),
+            ("route", "succeeded"),
+            ("effect", "succeeded"),
+        ])
+    );
+    assert_eq!(
+        last["workflow"]["agentProfileReplacement"]["profiles"]["unused"]["harness"]["kind"],
+        "claude_code",
+        "{last}"
+    );
+    assert_eq!(stage_counts(root), [1, 1, 3]);
+    assert_eq!(
+        fs::read_to_string(root.join("seen-read")).unwrap(),
+        "read-1"
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("seen-plan")).unwrap(),
+        "plan-1"
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("effects")).unwrap(),
+        "effect\n"
+    );
+    // The child's first attempt and its retained outputs are unchanged.
+    assert_eq!(file_tree(&child.join("attempts/000001")), first_attempt);
+}
+
+// SC-CONTINUE-10, REQ-CONTINUE-81, REQ-WFEXEC-68: at a fan-out's second element the retry
+// continues that element's child; the first element is not run again and the third runs once,
+// after the repaired second plans.
+#[test]
+fn a_repair_retry_continues_the_failed_fan_out_element_before_the_next() {
+    let bundle = stage_tree(STAGE_FAN_OUT_ROOT);
+    let root = bundle.execution_root();
+    for (part, plan) in [("a", "fenced"), ("b", "unfenced"), ("c", "fenced")] {
+        fs::write(root.join(format!("plan-{part}.md")), plan).unwrap();
+    }
+    let (run, wait) = repair_waiting_stage(
+        &bundle,
+        "fan-out",
+        &[
+            "--input-json",
+            "parts",
+            r#"[{"name":"a"},{"name":"b"},{"name":"c"}]"#,
+        ],
+    );
+    assert_eq!(wait["step"], serde_json::json!(["design", {"item": 2}]));
+    assert_eq!(wait["payload"]["child"], "children/design/000002/000001");
+    assert!(!run.join("children/design/000003").exists());
+    assert_eq!(stage_counts(root), [2, 2, 2]);
+
+    fs::write(root.join("plan-b.md"), "fenced").unwrap();
+    let terminal = last_document(&run_control(None, "retry", &run, &[]));
+    assert_eq!(terminal["outcome"], "succeeded", "{terminal}");
+    assert_eq!(run_record(&run)["outcome"], "landed");
+    let element = |n: &str| run.join("children/design").join(n);
+    for n in ["000001", "000002", "000003"] {
+        assert_eq!(ordinals_of(&element(n)), ["000001"], "element {n}");
+    }
+    assert_eq!(attempt_count(&element("000001").join("000001")), 1);
+    assert_eq!(attempt_count(&element("000002").join("000001")), 2);
+    assert_eq!(attempt_count(&element("000003").join("000001")), 1);
+    assert_eq!(stage_counts(root), [3, 3, 4]);
+    assert_eq!(
+        fs::read_to_string(root.join("seen-plan-b")).unwrap(),
+        "plan-2"
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("effects")).unwrap(),
+        "effect-a\neffect-b\neffect-c\n"
+    );
+}
+
+/// What a refused repair continuation must leave as it was: the parent's records, its child
+/// directories, the child's attempts, the counters and the workspace's files.
+struct StageSnapshot {
+    attempts: usize,
+    children: Vec<String>,
+    child: std::collections::BTreeMap<PathBuf, Vec<u8>>,
+    workspace: std::collections::BTreeMap<PathBuf, Vec<u8>>,
+}
+
+impl StageSnapshot {
+    fn take(run: &Path, root: &Path) -> Self {
+        Self {
+            attempts: attempt_count(run),
+            children: ordinals_of(&run.join("children/design")),
+            child: file_tree(&run.join("children/design/000001/attempts")),
+            workspace: file_tree(root),
+        }
+    }
+
+    fn assert_unchanged(&self, run: &Path, root: &Path, case: &str) {
+        assert_eq!(attempt_count(run), self.attempts, "{case}");
+        assert_eq!(
+            ordinals_of(&run.join("children/design")),
+            self.children,
+            "{case}"
+        );
+        assert_eq!(
+            file_tree(&run.join("children/design/000001/attempts")),
+            self.child,
+            "{case}"
+        );
+        assert_eq!(file_tree(root), self.workspace, "{case}");
+        assert_eq!(run_record(run)["state"], "waiting", "{case}");
+        assert!(run.join("wait.json").exists(), "{case}");
+    }
+}
+
+/// Rewrites the JSON file at `path` with `change`, making it writable first.
+fn rewrite_json(path: &Path, change: impl FnOnce(&mut serde_json::Value)) {
+    let mut document = read_json(path);
+    change(&mut document);
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+    fs::write(path, serde_json::to_vec_pretty(&document).unwrap()).unwrap();
+}
+
+/// The retained carrier of the child's first `plan` output, the one value of its first
+/// attempt that holds exactly `plan-1`.
+fn plan_carrier(child: &Path) -> PathBuf {
+    let attempt = child.join("attempts/000001");
+    let carriers = file_tree(&attempt)
+        .into_iter()
+        .filter(|(path, bytes)| path.starts_with("values") && bytes == b"plan-1")
+        .map(|(path, _)| attempt.join(path))
+        .collect::<Vec<_>>();
+    assert_eq!(carriers.len(), 1, "{carriers:?}");
+    carriers.into_iter().next().unwrap()
+}
+
+// REQ-CONTINUE-82, REQ-LOCALRUN-184, INV-ENGINE-27: a retry whose wait names a child the run
+// does not own for that step, or whose child's record, tree, retained outputs or lock do not
+// match, is refused before the parent's wait is consumed: no child step runs, no attempt
+// begins and no file changes, and the recorded retry control still resolves the wait for a
+// later resume.
+#[test]
+fn a_repair_retry_refuses_an_unowned_or_altered_child() {
+    type Alteration = fn(&Path, &Path);
+    let cases: [(&str, Alteration, Option<&str>); 8] = [
+        (
+            "another ordinal",
+            |run, _| {
+                rewrite_json(&run.join("wait.json"), |wait| {
+                    wait["payload"]["child"] = "children/design/000002".into();
+                });
+            },
+            Some("continuation_definition_invalid"),
+        ),
+        (
+            "an escaping locator",
+            |run, _| {
+                rewrite_json(&run.join("wait.json"), |wait| {
+                    wait["payload"]["child"] = "children/design/../design/000001".into();
+                });
+            },
+            Some("continuation_definition_invalid"),
+        ),
+        (
+            "another parent step",
+            |_, child| {
+                rewrite_json(&child.join("run.json"), |record| {
+                    record["parent"]["step"] = "review".into();
+                });
+            },
+            Some("continuation_definition_invalid"),
+        ),
+        (
+            "another child workflow",
+            |_, child| {
+                rewrite_json(&child.join("run.json"), |record| {
+                    record["workflow"] = "merge.yaml".into();
+                });
+            },
+            Some("continuation_definition_invalid"),
+        ),
+        (
+            "a changed tree copy",
+            |_, child| {
+                let design = child.join("workflow/tree/design.yaml");
+                fs::set_permissions(design.parent().unwrap(), fs::Permissions::from_mode(0o700))
+                    .unwrap();
+                fs::set_permissions(&design, fs::Permissions::from_mode(0o600)).unwrap();
+                let mut bytes = fs::read(&design).unwrap();
+                bytes.extend_from_slice(b"# changed\n");
+                fs::write(&design, bytes).unwrap();
+            },
+            Some("tree_copy_modified"),
+        ),
+        (
+            "a changed retained output",
+            |_, child| {
+                let carrier = plan_carrier(child);
+                fs::set_permissions(&carrier, fs::Permissions::from_mode(0o600)).unwrap();
+                fs::write(&carrier, "plan-9").unwrap();
+            },
+            None,
+        ),
+        (
+            "a missing retained output",
+            |_, child| {
+                let carrier = plan_carrier(child);
+                fs::set_permissions(carrier.parent().unwrap(), fs::Permissions::from_mode(0o700))
+                    .unwrap();
+                fs::remove_file(carrier).unwrap();
+            },
+            None,
+        ),
+        ("a live child lock", |_, _| {}, Some("run_locked")),
+    ];
+    for (case, alter, code) in cases {
+        let bundle = stage_tree(STAGE_TREE_ROOT);
+        let root = bundle.execution_root();
+        fs::write(root.join("plan.md"), "unfenced").unwrap();
+        let (run, _) = repair_waiting_stage(&bundle, "refused", &[]);
+        let child = run.join("children/design/000001");
+        fs::write(root.join("plan.md"), "fenced").unwrap();
+        fs::write(root.join("sentinel"), case).unwrap();
+        let held = (case == "a live child lock").then(|| {
+            let lock = fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(child.join("run.lock"))
+                .unwrap();
+            rustix::fs::fcntl_lock(&lock, rustix::fs::FlockOperation::NonBlockingLockExclusive)
+                .unwrap();
+            lock
+        });
+        alter(&run, &child);
+        let before = StageSnapshot::take(&run, root);
+
+        let output = run_control(None, "retry", &run, &[]);
+        assert_eq!(output.status.code(), Some(1), "{case}: {output:?}");
+        if let Some(code) = code {
+            let document = json(&output);
+            assert_eq!(document["outcome"], "rejected", "{case}: {document}");
+            assert_eq!(
+                document["diagnostics"][0]["code"], code,
+                "{case}: {document}"
+            );
+        }
+        before.assert_unchanged(&run, root, case);
+        assert_eq!(stage_counts(root), [1, 1, 1], "{case}");
+        assert_eq!(control_count(&run), 1, "{case}");
+
+        // Once the lock is released, the recorded control continues the same child.
+        if held.is_some() {
+            drop(held);
+            let terminal = completed(&resume(&run));
+            assert_eq!(terminal["outcome"], "succeeded", "{case}: {terminal}");
+            assert_eq!(ordinals_of(&run.join("children/design")), ["000001"]);
+            assert_eq!(attempt_count(&child), 2, "{case}");
+            assert_eq!(stage_counts(root), [1, 1, 2], "{case}");
+        }
+    }
+}
+
+// REQ-CONTINUE-82, INV-ENGINE-27: the inputs the waiting step would map for the child must be
+// the ones its run retained; a resolving control whose `notes` change them is refused before
+// the parent's wait is consumed, and once the inputs are restored the recorded control
+// continues the same child.
+#[test]
+fn a_repair_continuation_refuses_changed_mapped_inputs() {
+    let bundle = stage_tree(STAGE_TREE_ROOT);
+    let root = bundle.execution_root();
+    fs::write(root.join("plan.md"), "unfenced").unwrap();
+    let (run, wait) = repair_waiting_stage(&bundle, "changed-inputs", &[]);
+    let child = run.join("children/design/000001");
+    let mut control = serde_json::json!({
+        "source": "um",
+        "event": "control.retry",
+        "run": run_record(&run)["id"],
+        "by": OPERATOR,
+        "at": "2026-11-07T12:00:00Z",
+        "wait": wait_id(&wait),
+        "payload": {"notes": "changed"},
+    });
+    assert_eq!(control_count(&run), 0);
+    fs::create_dir(run.join("controls")).unwrap();
+    fs::set_permissions(run.join("controls"), fs::Permissions::from_mode(0o700)).unwrap();
+    let control_path = run.join("controls/0001-retry.json");
+    fs::write(&control_path, serde_json::to_vec(&control).unwrap()).unwrap();
+    fs::write(root.join("plan.md"), "fenced").unwrap();
+    let before = StageSnapshot::take(&run, root);
+
+    let output = resume(&run);
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let refusal = json(&output);
+    assert_eq!(refusal["outcome"], "rejected", "{refusal}");
+    assert_eq!(
+        refusal["diagnostics"][0]["code"], "continuation_inputs_unsatisfied",
+        "{refusal}"
+    );
+    before.assert_unchanged(&run, root, "changed inputs");
+    assert_eq!(stage_counts(root), [1, 1, 1]);
+    assert_eq!(control_count(&run), 1);
+
+    control["payload"] = serde_json::json!({});
+    fs::write(&control_path, serde_json::to_vec(&control).unwrap()).unwrap();
+    let terminal = completed(&resume(&run));
+    assert_eq!(terminal["outcome"], "succeeded", "{terminal}");
+    assert_eq!(ordinals_of(&run.join("children/design")), ["000001"]);
+    assert_eq!(attempt_count(&child), 2);
+    assert_eq!(stage_counts(root), [1, 1, 2]);
+}
+
+// REQ-CONTINUE-81, REQ-LOCALRUN-184: automatic continuation stays in the retained execution
+// root; a same-path root the retained path no longer resolves to is refused, and an explicit
+// other root starts the stage afresh there, leaving the original workspace intact.
+#[test]
+fn a_repair_retry_in_another_execution_root_starts_a_fresh_child() {
+    let bundle = stage_tree(STAGE_TREE_ROOT);
+    let root = bundle.execution_root().to_owned();
+    fs::write(root.join("plan.md"), "unfenced").unwrap();
+    let (run, _) = repair_waiting_stage(&bundle, "other-root", &[]);
+    fs::write(root.join("sentinel"), "original").unwrap();
+    let original = root.with_file_name("execution-original");
+    let replacement = root.with_file_name("execution-replacement");
+    fs::rename(&root, &original).unwrap();
+    fs::create_dir(&replacement).unwrap();
+    fs::write(replacement.join("plan.md"), "fenced").unwrap();
+    std::os::unix::fs::symlink(&replacement, &root).unwrap();
+    let workspace = file_tree(&original);
+
+    let output = run_control(None, "retry", &run, &[]);
+    let refusal = json(&output);
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert_eq!(
+        refusal["diagnostics"][0]["code"], "continuation_definition_invalid",
+        "{refusal}"
+    );
+    assert_eq!(attempt_count(&run), 1);
+    assert_eq!(ordinals_of(&run.join("children/design")), ["000001"]);
+    assert!(!replacement.join("count-read").exists());
+
+    let mut args = continue_command(&run);
+    args.extend([
+        "--execution-root".to_owned(),
+        replacement.to_string_lossy().into_owned(),
+    ]);
+    let terminal = completed(&isolated_command(&args).output().unwrap());
+    assert_eq!(terminal["outcome"], "succeeded", "{terminal}");
+    assert_eq!(
+        ordinals_of(&run.join("children/design")),
+        ["000001", "000002"]
+    );
+    assert_eq!(stage_counts(&replacement), [1, 1, 1]);
+    assert_eq!(file_tree(&original), workspace);
+    assert_eq!(
+        fs::read_to_string(original.join("sentinel")).unwrap(),
+        "original"
+    );
+}
+
+/// `um workflow run resume RUN --json`.
+fn continue_command(run: &Path) -> Vec<String> {
+    vec![
+        "workflow".to_owned(),
+        "run".to_owned(),
+        "resume".to_owned(),
+        run.to_string_lossy().into_owned(),
+        "--json".to_owned(),
+    ]
+}
+
+// REQ-CONTINUE-75, REQ-LOCALRUN-184: a repair wait that continues at another step runs that
+// step and the failed stage afresh, as a new stage evaluation.
+#[test]
+fn a_repair_retry_targeting_another_step_runs_fresh_children() {
+    let bundle = stage_tree(STAGE_SETUP_ROOT);
+    let root = bundle.execution_root();
+    fs::write(root.join("plan.md"), "unfenced").unwrap();
+    let (run, wait) = repair_waiting_stage(&bundle, "setup", &[]);
+    assert_eq!(wait["then"], "setup");
+    fs::write(root.join("plan.md"), "fenced").unwrap();
+    let terminal = last_document(&run_control(None, "retry", &run, &[]));
+    assert_eq!(terminal["outcome"], "succeeded", "{terminal}");
+    assert_eq!(
+        ordinals_of(&run.join("children/setup")),
+        ["000001", "000002"]
+    );
+    assert_eq!(
+        ordinals_of(&run.join("children/design")),
+        ["000001", "000002"]
+    );
+    assert_eq!(stage_counts(root), [2, 2, 2]);
+}
+
+// REQ-CONTINUE-81, REQ-CONTINUE-82: a child whose ordinary steps all succeeded and whose
+// required finalizer failed leaves no unfinished step to continue from, so the retry is refused
+// rather than starting the stage afresh or continuing nothing.
+#[test]
+fn a_repair_retry_refuses_a_child_that_failed_only_in_its_finalizer() {
+    let bundle = stage_tree(STAGE_TREE_ROOT);
+    let root = bundle.execution_root();
+    fs::write(root.join("plan.md"), "fenced").unwrap();
+    fs::write(root.join("close-fails"), "").unwrap();
+    let (run, _) = repair_waiting_stage(&bundle, "finalizer", &[]);
+    let before = StageSnapshot::take(&run, root);
+    let output = run_control(None, "retry", &run, &[]);
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert_eq!(
+        json(&output)["diagnostics"][0]["code"],
+        "continuation_definition_invalid"
+    );
+    before.assert_unchanged(&run, root, "finalizer");
+    assert_eq!(
+        fs::read_to_string(root.join("effects")).unwrap(),
+        "effect\n"
+    );
 }

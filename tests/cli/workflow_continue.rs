@@ -2373,9 +2373,10 @@ fn a_fan_out_waits_at_its_element_and_resumes_the_same_element() {
     );
 }
 
-// REQ-CONTINUE-75, REQ-WFEXEC-68, REQ-LOCALRUN-184: a repair retry consumes a child
-// completed independently after the wait, preserving earlier elements and continuing the
-// remaining fan-out, and runs the element afresh when the child's repair attempt failed again.
+// REQ-CONTINUE-75, REQ-CONTINUE-81, REQ-WFEXEC-68, REQ-LOCALRUN-184: a repair retry consumes
+// a child completed independently after the wait, preserving earlier elements and continuing
+// the remaining fan-out, and, when the child's repair attempt failed again, continues that
+// child with a new attempt rather than adopting it.
 // A repaired child whose status cannot be read fails the retry before an attempt begins, and
 // the recorded retry adopts it once it reads again.
 #[test]
@@ -2488,7 +2489,7 @@ fn a_repair_retry_adopts_its_independently_completed_child() {
                 ["000001"]
             );
         }
-        let expected = if matches!(mode, "completed" | "unreadable") {
+        let expected = if matches!(mode, "completed" | "unreadable" | "refailed") {
             vec!["000001"]
         } else {
             vec!["000001", "000002"]
@@ -2498,10 +2499,15 @@ fn a_repair_retry_adopts_its_independently_completed_child() {
             expected,
             "{mode}"
         );
-        assert_eq!(
-            attempt_count(&child),
-            if mode == "unrepaired" { 1 } else { 2 }
-        );
+        let attempts = match mode {
+            "unrepaired" => 1,
+            "refailed" => 3,
+            _ => 2,
+        };
+        assert_eq!(attempt_count(&child), attempts, "{mode}");
+        if mode == "refailed" {
+            assert_eq!(run_record(&child)["outcome"], "built");
+        }
         if mode == "profiles" {
             let fresh = read_json(
                 &run.join("children/build/000002/000002/attempts/000001/result/result.json"),

@@ -114,6 +114,12 @@ pub(crate) struct PiJsonV1ProtocolRejection {
     state: PiJsonV1RejectionState,
 }
 
+impl PiJsonV1ProtocolRejection {
+    pub(crate) const fn reason(&self) -> PiJsonV1RejectionReason {
+        self.reason
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum PiJsonV1ProtocolStage {

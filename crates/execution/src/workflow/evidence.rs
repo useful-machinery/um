@@ -1035,25 +1035,28 @@ fn working_directory_detail(source: &WorkingDirectoryFailure) -> FailureDetail {
     )
 }
 
+/// The committed failure code (REQ-AGENT-39) an agent failure's node reports; the recovery
+/// context's cause names the same code (REQ-WFRECOVERY-61).
+pub(crate) fn agent_failure_code(cause: &AgentFailureCause) -> FailureCode {
+    match cause {
+        AgentFailureCause::HarnessStartFailed { .. }
+        | AgentFailureCause::HarnessSetupFailed { .. }
+        | AgentFailureCause::HarnessSetupRejected { .. } => FailureCode::HarnessStartFailed,
+        AgentFailureCause::HarnessInputTooLarge { .. } => FailureCode::HarnessInputTooLarge,
+        AgentFailureCause::HarnessFailed { .. } => FailureCode::HarnessFailed,
+        AgentFailureCause::HarnessProtocolFailed => FailureCode::HarnessProtocolFailed,
+        AgentFailureCause::MissingResponse => FailureCode::MissingResponse,
+        AgentFailureCause::MissingResult => FailureCode::MissingResult,
+        AgentFailureCause::ResultValidationLimitExceeded { .. } => {
+            FailureCode::ResultValidationLimitExceeded
+        }
+        AgentFailureCause::CapturedValueTooLarge => FailureCode::CapturedValueTooLarge,
+        AgentFailureCause::ResultSettlementFailed => FailureCode::ResultSettlementFailed,
+    }
+}
+
 fn agent_failure_detail(phase: FailurePhase, source: &AgentFailure) -> FailureDetail {
-    let mut detail = code(
-        phase,
-        match source.cause() {
-            AgentFailureCause::HarnessStartFailed { .. }
-            | AgentFailureCause::HarnessSetupFailed { .. }
-            | AgentFailureCause::HarnessSetupRejected { .. } => FailureCode::HarnessStartFailed,
-            AgentFailureCause::HarnessInputTooLarge { .. } => FailureCode::HarnessInputTooLarge,
-            AgentFailureCause::HarnessFailed { .. } => FailureCode::HarnessFailed,
-            AgentFailureCause::HarnessProtocolFailed => FailureCode::HarnessProtocolFailed,
-            AgentFailureCause::MissingResponse => FailureCode::MissingResponse,
-            AgentFailureCause::MissingResult => FailureCode::MissingResult,
-            AgentFailureCause::ResultValidationLimitExceeded { .. } => {
-                FailureCode::ResultValidationLimitExceeded
-            }
-            AgentFailureCause::CapturedValueTooLarge => FailureCode::CapturedValueTooLarge,
-            AgentFailureCause::ResultSettlementFailed => FailureCode::ResultSettlementFailed,
-        },
-    );
+    let mut detail = code(phase, agent_failure_code(source.cause()));
     match source.cause() {
         AgentFailureCause::HarnessFailed {
             detail: harness_detail,

@@ -1,5 +1,6 @@
 mod answer;
 mod approve;
+mod child_recovery;
 mod condition;
 mod control;
 mod create;

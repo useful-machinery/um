@@ -40,7 +40,7 @@ pub use workflow::admission::{
     OrdinaryCancellationRequestResult, ResolvedAttachment, ResolvedFile, ResolvedInput,
     ResolvedInputs, ResolvedJsonInput, SourceRevisionProvenance, WorkflowCapacityBudget,
     admit_local_continuation_workflow, admit_local_workflow, admit_runner_workflow,
-    default_execution_policy_limits, local_continuation_input_failures,
+    completed_inputs_match, default_execution_policy_limits, local_continuation_input_failures,
     untested_harness_advisories,
 };
 pub use workflow::agent::WorkflowRunId;
@@ -92,16 +92,17 @@ pub use workflow::invocation_accounting::InvocationAccountingLog;
 pub use workflow::local_run::{
     AttemptControls, CANCELED_OUTCOME, CarryMiss, ChildRun, ChildRunParent,
     ContinuationDefinitionMode, DurableDeadline, DurableInvocationStateV1, DurableInvocationV1,
-    InitialLocalRun, ListedRun, LocalAttemptOwner, LocalAttemptOwnershipReleased,
-    LocalContinuationOpen, LocalRecoveryStatus, LocalRetryBeginError, LocalRetryEligibility,
-    LocalRetryOpen, LocalRetryRejection, LocalRunStatusSnapshot, LocalStatusError,
-    LocalStatusResult, PendingLocalContinuation, PublicationFailurePhaseV1, ResolvedBy,
-    RetryIneligibilityReason, RunListing, SUPERSEDED_OUTCOME, SuccessorCarry, WITHDRAWN_OUTCOME,
+    FailedAttemptRestart, InitialLocalRun, ListedRun, LocalAttemptOwner,
+    LocalAttemptOwnershipReleased, LocalContinuationOpen, LocalRecoveryStatus,
+    LocalRetryBeginError, LocalRetryEligibility, LocalRetryOpen, LocalRetryRejection,
+    LocalRunStatusSnapshot, LocalStatusError, LocalStatusResult, PendingLocalContinuation,
+    PublicationFailurePhaseV1, ResolvedBy, RetryIneligibilityReason, RunListing,
+    SUPERSEDED_OUTCOME, SuccessorCarry, TreeCopyMismatch, WITHDRAWN_OUTCOME, WaitChild,
     WaitInspection, WaitProbe, acquire_local_continuation, acquire_local_retry, attempt_controls,
     await_run_lock_gate, bind_cloud_continuation_context, child_runs, inspect_wait, is_run_id,
-    latest_child_run, list_runs, load_cloud_continuation_seed, locate_run, lock_holder,
-    positioned_element, read_local_run_status, retain_cloud_continuation_evidence,
-    retain_cloud_workflow_evidence,
+    latest_attempt_failed, latest_child_run, list_runs, load_cloud_continuation_seed, locate_run,
+    lock_holder, positioned_element, read_local_run_status, retain_cloud_continuation_evidence,
+    retain_cloud_workflow_evidence, wait_child,
 };
 pub use workflow::observation::{
     ExecutionObservation, ExecutionObserver, ExecutionSettlement, ObservedExecutions,

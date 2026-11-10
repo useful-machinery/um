@@ -1111,6 +1111,21 @@ impl AgentProtocolRejectionDiagnostic {
             profile: AgentProtocolRejectionProfile::CodexAppServerV1(diagnostic),
         }
     }
+
+    /// The closed `snake_case` name of the adapter's rejection reason (REQ-AGENT-42).
+    pub(crate) fn reason_name(&self) -> Option<String> {
+        match &self.profile {
+            AgentProtocolRejectionProfile::PiJsonV1(rejection) => {
+                um_support::wire_name(rejection.reason())
+            }
+            AgentProtocolRejectionProfile::ClaudeCodeStreamJsonV1(rejection) => {
+                um_support::wire_name(rejection.reason())
+            }
+            AgentProtocolRejectionProfile::CodexAppServerV1(rejection) => {
+                um_support::wire_name(rejection.reason())
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

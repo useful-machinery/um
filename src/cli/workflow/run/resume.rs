@@ -475,6 +475,7 @@ pub(super) async fn continue_run(
         pending.previous_definition().clone()
     };
     let selection_edge = selection;
+    let explicit_root = execution_root.is_some();
     let candidate = ContinuationCandidate {
         inputs: pending.candidate_inputs(&workflow),
         workflow: &workflow,
@@ -508,9 +509,42 @@ pub(super) async fn continue_run(
     };
     super::create::write_untested_advisories(&untested_advisories);
     if let Err(error) = pending.validate_execution_root(&admitted) {
-        settle(pending, &signal_task).await?;
-        return super::create::diagnose(error);
+        return diagnose_after_settlement(pending, &signal_task, error).await;
     }
+    // REQ-CONTINUE-81, REQ-CONTINUE-82, INV-ENGINE-27: a repair wait's retry at the waiting
+    // step continues the failed child the wait names, verified and admitted here, under both
+    // locks, before `begin` consumes the parent's wait.
+    let child_recovery = match (child_recovery, &selection_edge) {
+        (Some(recovery), _) => Some(recovery),
+        (
+            None,
+            Selection::Wait {
+                target,
+                reason: ContinuationReasonV1::Retry,
+                ..
+            },
+        ) if replacement_workflow.is_none() => {
+            let repair = super::child_recovery::Repair {
+                parent: &pending,
+                admitted: &admitted,
+                target,
+                explicit_root,
+            };
+            match super::child_recovery::prepare(repair, &cancellation, (&config, leaf)).await {
+                Ok(recovery) => recovery,
+                Err(super::child_recovery::Unprepared::Rejected(result)) => {
+                    return reject_after_settlement(pending, &signal_task, result).await;
+                }
+                Err(super::child_recovery::Unprepared::Failed(message)) => {
+                    return fail_after_settlement(pending, &signal_task, message).await;
+                }
+                Err(super::child_recovery::Unprepared::Diagnosed(error)) => {
+                    return diagnose_after_settlement(pending, &signal_task, error).await;
+                }
+            }
+        }
+        (None, _) => None,
+    };
     let definition_mode = if replacement_workflow.is_some() {
         ContinuationDefinitionMode::Replaced
     } else if run_definition {
@@ -862,6 +896,18 @@ pub(super) async fn admit_continuation(
     pending: &PendingLocalContinuation,
     candidate: ContinuationCandidate<'_>,
     cancellation: &CancellationSource,
+    output: (&um_execution::PresentationConfig, ExecutionLeaf),
+) -> Result<(AdmittedWorkflow, Vec<UntestedHarnessAdvisory>), Unadmitted> {
+    admit_continuation_in(pending, candidate, None, cancellation, output).await
+}
+
+/// `admit_continuation` launched from `environment` rather than the host's: a child's repair
+/// continuation keeps its parent's admitted environment (REQ-WFEXEC-59, INV-ENGINE-27).
+pub(super) async fn admit_continuation_in(
+    pending: &PendingLocalContinuation,
+    candidate: ContinuationCandidate<'_>,
+    environment: Option<um_execution::EnvironmentSnapshot>,
+    cancellation: &CancellationSource,
     (config, leaf): (&um_execution::PresentationConfig, ExecutionLeaf),
 ) -> Result<(AdmittedWorkflow, Vec<UntestedHarnessAdvisory>), Unadmitted> {
     let ContinuationCandidate {
@@ -888,6 +934,7 @@ pub(super) async fn admit_continuation(
             execution_root,
             maximum_parallel_steps,
             context_cancellation,
+            environment,
         )
     })
     .await
@@ -972,6 +1019,15 @@ async fn error_after_settlement(
 ) -> super::super::super::CommandResult {
     settle(pending, signal_task).await?;
     Err(error.into())
+}
+
+async fn diagnose_after_settlement(
+    pending: PendingLocalContinuation,
+    signal_task: &tokio::task::JoinHandle<()>,
+    error: um_execution::LocalRunDirectoryError,
+) -> super::super::super::CommandResult {
+    settle(pending, signal_task).await?;
+    super::create::diagnose(error)
 }
 
 async fn reject_after_settlement(

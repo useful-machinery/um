@@ -16,6 +16,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 
 use super::admission::{
     AdmittedWorkflow, CancellationReason, CancellationSource, EnvironmentSnapshot, ResolvedInput,
+    ResolvedInputs,
 };
 use super::agent::dispatch::AgentInvocationDispatcher;
 use super::agent::{
@@ -2532,163 +2533,25 @@ where
         Ok(PreparedStep { body })
     }
 
-    /// The children a `workflow` step runs: its one child or, for a `forEach` step, one per
-    /// element of the list from the element a continuation at the waiting step resumes
-    /// (REQ-WFEXEC-66, REQ-WFEXEC-68). Every element's `item` inputs are resolved here, when
-    /// the step starts, so a value no element can supply fails the step at `start` before
-    /// its first child is created (REQ-WFEXEC-67).
+    /// The children a `workflow` step runs (`child_run_requests`), with the run's admitted
+    /// inputs and the control values this attempt resolved.
     fn prepare_child_run(
         &self,
         step: &str,
         workflow: &ValidatedWorkflowStep,
         action_inputs: &BTreeMap<String, ActionInput<CapturedValue>>,
     ) -> Result<PreparedChildRun, StepStartFailure> {
-        let inputs = self.resolve_child_inputs(step, workflow, action_inputs)?;
-        let request = |inputs, item| ChildRunRequest {
-            step: step.to_owned(),
-            workflow: workflow.workflow.clone(),
-            inputs,
-            item,
-        };
-        let Some(for_each) = &workflow.for_each else {
-            return Ok(PreparedChildRun {
-                requests: vec![request(inputs, None)],
-                empty: None,
-            });
-        };
-        let elements =
-            self.fan_out_list(&for_each.items.source, action_inputs.get(FOR_EACH_INPUT))?;
-        if elements.is_empty() {
-            return match &for_each.empty {
-                Some(outcome) => Ok(PreparedChildRun {
-                    requests: Vec::new(),
-                    empty: Some(outcome.clone()),
-                }),
-                None => Err(StepStartFailure::InputsUnavailable),
-            };
-        }
-        let resumed = match &self.children {
-            ChildRuns::Enabled { controls, .. } => controls
-                .resume_item
-                .as_ref()
-                .filter(|(resumed, _)| resumed == step)
-                .map(|(_, item)| *item),
-            ChildRuns::Disabled => None,
-        };
-        let start = resumed
-            .and_then(|item| usize::try_from(item).ok())
-            .filter(|item| (1..=elements.len()).contains(item))
-            .unwrap_or(1);
-        let mut requests = Vec::with_capacity(elements.len() - start + 1);
-        for (index, element) in elements.iter().enumerate().skip(start - 1) {
-            let mut inputs = inputs.clone();
-            resolve_item_inputs(workflow, element, &mut inputs)?;
-            let item = u64::try_from(index + 1).map_err(|_| StepStartFailure::InputsUnavailable)?;
-            requests.push(request(inputs, Some(item)));
-        }
-        Ok(PreparedChildRun {
-            requests,
-            empty: None,
-        })
-    }
-
-    /// A `forEach` step's list: the `json` root input or export it references, which must
-    /// be a JSON array (REQ-WFEXEC-67).
-    fn fan_out_list(
-        &self,
-        source: &ResolvedValueSource,
-        list: Option<&ActionInput<CapturedValue>>,
-    ) -> Result<Vec<serde_json::Value>, StepStartFailure> {
-        let value = match (source, list) {
-            (ResolvedValueSource::Input(name), Some(ActionInput::WorkflowInput)) => {
-                match self.admitted.inputs().get(name) {
-                    Some(ResolvedInput::Json(json)) => json.value_arc(),
-                    _ => return Err(StepStartFailure::InputsUnavailable),
-                }
-            }
-            (
-                ResolvedValueSource::Output(_),
-                Some(ActionInput::Output(CapturedValue::Json(json))),
-            ) => Arc::new(json.value().clone()),
-            _ => return Err(StepStartFailure::InputsUnavailable),
-        };
-        match value.as_ref() {
-            serde_json::Value::Array(elements) => Ok(elements.clone()),
-            _ => Err(StepStartFailure::InputsUnavailable),
-        }
-    }
-
-    /// The mapped inputs of a `workflow` step's child (REQ-WFFORMAT-90, REQ-WFEXEC-60) but
-    /// its `item` inputs, which each element resolves: an unavailable value omits an input
-    /// the child may go without and otherwise fails the step's start with
-    /// `inputs_unavailable`. A `wait.<field>` value is the resolving control's field when the
-    /// wait continues at this step, and `controls.answers` the step's recorded answers
-    /// (REQ-WFEXEC-63); both are the same for every element.
-    fn resolve_child_inputs(
-        &self,
-        step: &str,
-        workflow: &ValidatedWorkflowStep,
-        action_inputs: &BTreeMap<String, ActionInput<CapturedValue>>,
-    ) -> Result<BTreeMap<String, ChildInputValue>, StepStartFailure> {
-        if workflow.inputs.keys().ne(action_inputs
-            .keys()
-            .filter(|name| name.as_str() != FOR_EACH_INPUT))
-        {
-            return Err(StepStartFailure::InputsUnavailable);
-        }
         let controls = match &self.children {
             ChildRuns::Enabled { controls, .. } => Some(controls),
             ChildRuns::Disabled => None,
         };
-        let mut inputs = BTreeMap::new();
-        for (name, input) in &workflow.inputs {
-            let value = match (&input.reference.source, &action_inputs[name]) {
-                (ResolvedValueSource::Item { .. }, _) => continue,
-                (ResolvedValueSource::Wait(field), ActionInput::Unavailable) => controls
-                    .and_then(|controls| controls.wait.as_ref())
-                    .filter(|(waiting, _)| waiting == step)
-                    .and_then(|(_, payload)| payload.get(field))
-                    .map(|text| ChildInputValue::Text(Arc::from(text.as_str()))),
-                (ResolvedValueSource::ControlsAnswers, ActionInput::Unavailable) => controls
-                    .and_then(|controls| controls.answers.get(step))
-                    .map(|answers| ChildInputValue::Json(Arc::clone(answers))),
-                (ResolvedValueSource::Input(source), ActionInput::WorkflowInput) => {
-                    match self.admitted.inputs().get(source) {
-                        Some(ResolvedInput::Text(text)) => {
-                            Some(ChildInputValue::Text(text.clone()))
-                        }
-                        Some(ResolvedInput::Json(json)) => {
-                            Some(ChildInputValue::Json(json.value_arc()))
-                        }
-                        Some(ResolvedInput::File(_) | ResolvedInput::Attachments(_)) => {
-                            return Err(StepStartFailure::InputsUnavailable);
-                        }
-                        None => None,
-                    }
-                }
-                (ResolvedValueSource::Output(_), ActionInput::Output(value)) => match value {
-                    CapturedValue::Text(text) => {
-                        Some(ChildInputValue::Text(Arc::from(text.as_str())))
-                    }
-                    CapturedValue::Json(json) => {
-                        Some(ChildInputValue::Json(Arc::new(json.value().clone())))
-                    }
-                    CapturedValue::File(_) | CapturedValue::GitBranch(_) => {
-                        return Err(StepStartFailure::InputsUnavailable);
-                    }
-                },
-                (_, ActionInput::Unavailable) => None,
-                _ => return Err(StepStartFailure::InputsUnavailable),
-            };
-            match value {
-                Some(value) => {
-                    inputs.insert(name.clone(), value);
-                }
-                None if input.may_be_omitted => {}
-                None => return Err(StepStartFailure::InputsUnavailable),
-            }
-        }
-        Ok(inputs)
+        child_run_requests(
+            self.admitted.inputs(),
+            controls,
+            step,
+            workflow,
+            action_inputs,
+        )
     }
 
     fn resolve_input_values<'a>(
@@ -4394,6 +4257,217 @@ enum PreparedStepBody {
     Command(PreparedCommand),
     Agent(Box<PreparedAgent>),
     Workflow(PreparedChildRun),
+}
+
+/// The children a `workflow` step runs: its one child or, for a `forEach` step, one per
+/// element of the list from the element a continuation at the waiting step resumes
+/// (REQ-WFEXEC-66, REQ-WFEXEC-68). Every element's `item` inputs are resolved here, when
+/// the step starts, so a value no element can supply fails the step at `start` before
+/// its first child is created (REQ-WFEXEC-67). `root_inputs` are the run's admitted inputs
+/// and `controls` the control values the attempt resolved. The step runtime and a repair
+/// continuation's preflight (`child_preflight_inputs`) share this one mapper.
+fn child_run_requests(
+    root_inputs: &ResolvedInputs,
+    controls: Option<&ControlContext>,
+    step: &str,
+    workflow: &ValidatedWorkflowStep,
+    action_inputs: &BTreeMap<String, ActionInput<CapturedValue>>,
+) -> Result<PreparedChildRun, StepStartFailure> {
+    let inputs = resolve_child_inputs(root_inputs, controls, step, workflow, action_inputs)?;
+    let request = |inputs, item| ChildRunRequest {
+        step: step.to_owned(),
+        workflow: workflow.workflow.clone(),
+        inputs,
+        item,
+    };
+    let Some(for_each) = &workflow.for_each else {
+        return Ok(PreparedChildRun {
+            requests: vec![request(inputs, None)],
+            empty: None,
+        });
+    };
+    let elements = fan_out_list(
+        root_inputs,
+        &for_each.items.source,
+        action_inputs.get(FOR_EACH_INPUT),
+    )?;
+    if elements.is_empty() {
+        return match &for_each.empty {
+            Some(outcome) => Ok(PreparedChildRun {
+                requests: Vec::new(),
+                empty: Some(outcome.clone()),
+            }),
+            None => Err(StepStartFailure::InputsUnavailable),
+        };
+    }
+    let resumed = controls
+        .and_then(|controls| controls.resume_item.as_ref())
+        .filter(|(resumed, _)| resumed == step)
+        .map(|(_, item)| *item);
+    let start = resumed
+        .and_then(|item| usize::try_from(item).ok())
+        .filter(|item| (1..=elements.len()).contains(item))
+        .unwrap_or(1);
+    let mut requests = Vec::with_capacity(elements.len() - start + 1);
+    for (index, element) in elements.iter().enumerate().skip(start - 1) {
+        let mut inputs = inputs.clone();
+        resolve_item_inputs(workflow, element, &mut inputs)?;
+        let item = u64::try_from(index + 1).map_err(|_| StepStartFailure::InputsUnavailable)?;
+        requests.push(request(inputs, Some(item)));
+    }
+    Ok(PreparedChildRun {
+        requests,
+        empty: None,
+    })
+}
+
+/// A `forEach` step's list: the `json` root input or export it references, which must
+/// be a JSON array (REQ-WFEXEC-67).
+fn fan_out_list(
+    root_inputs: &ResolvedInputs,
+    source: &ResolvedValueSource,
+    list: Option<&ActionInput<CapturedValue>>,
+) -> Result<Vec<serde_json::Value>, StepStartFailure> {
+    let value = match (source, list) {
+        (ResolvedValueSource::Input(name), Some(ActionInput::WorkflowInput)) => {
+            match root_inputs.get(name) {
+                Some(ResolvedInput::Json(json)) => json.value_arc(),
+                _ => return Err(StepStartFailure::InputsUnavailable),
+            }
+        }
+        (ResolvedValueSource::Output(_), Some(ActionInput::Output(CapturedValue::Json(json)))) => {
+            Arc::new(json.value().clone())
+        }
+        _ => return Err(StepStartFailure::InputsUnavailable),
+    };
+    match value.as_ref() {
+        serde_json::Value::Array(elements) => Ok(elements.clone()),
+        _ => Err(StepStartFailure::InputsUnavailable),
+    }
+}
+
+/// The mapped inputs of a `workflow` step's child (REQ-WFFORMAT-90, REQ-WFEXEC-60) but
+/// its `item` inputs, which each element resolves: an unavailable value omits an input
+/// the child may go without and otherwise fails the step's start with
+/// `inputs_unavailable`. A `wait.<field>` value is the resolving control's field when the
+/// wait continues at this step, and `controls.answers` the step's recorded answers
+/// (REQ-WFEXEC-63); both are the same for every element.
+fn resolve_child_inputs(
+    root_inputs: &ResolvedInputs,
+    controls: Option<&ControlContext>,
+    step: &str,
+    workflow: &ValidatedWorkflowStep,
+    action_inputs: &BTreeMap<String, ActionInput<CapturedValue>>,
+) -> Result<BTreeMap<String, ChildInputValue>, StepStartFailure> {
+    if workflow.inputs.keys().ne(action_inputs
+        .keys()
+        .filter(|name| name.as_str() != FOR_EACH_INPUT))
+    {
+        return Err(StepStartFailure::InputsUnavailable);
+    }
+    let mut inputs = BTreeMap::new();
+    for (name, input) in &workflow.inputs {
+        let value = match (&input.reference.source, &action_inputs[name]) {
+            (ResolvedValueSource::Item { .. }, _) => continue,
+            (ResolvedValueSource::Wait(field), ActionInput::Unavailable) => controls
+                .and_then(|controls| controls.wait.as_ref())
+                .filter(|(waiting, _)| waiting == step)
+                .and_then(|(_, payload)| payload.get(field))
+                .map(|text| ChildInputValue::Text(Arc::from(text.as_str()))),
+            (ResolvedValueSource::ControlsAnswers, ActionInput::Unavailable) => controls
+                .and_then(|controls| controls.answers.get(step))
+                .map(|answers| ChildInputValue::Json(Arc::clone(answers))),
+            (ResolvedValueSource::Input(source), ActionInput::WorkflowInput) => {
+                match root_inputs.get(source) {
+                    Some(ResolvedInput::Text(text)) => Some(ChildInputValue::Text(text.clone())),
+                    Some(ResolvedInput::Json(json)) => {
+                        Some(ChildInputValue::Json(json.value_arc()))
+                    }
+                    Some(ResolvedInput::File(_) | ResolvedInput::Attachments(_)) => {
+                        return Err(StepStartFailure::InputsUnavailable);
+                    }
+                    None => None,
+                }
+            }
+            (ResolvedValueSource::Output(_), ActionInput::Output(value)) => match value {
+                CapturedValue::Text(text) => Some(ChildInputValue::Text(Arc::from(text.as_str()))),
+                CapturedValue::Json(json) => {
+                    Some(ChildInputValue::Json(Arc::new(json.value().clone())))
+                }
+                CapturedValue::File(_) | CapturedValue::GitBranch(_) => {
+                    return Err(StepStartFailure::InputsUnavailable);
+                }
+            },
+            (_, ActionInput::Unavailable) => None,
+            _ => return Err(StepStartFailure::InputsUnavailable),
+        };
+        match value {
+            Some(value) => {
+                inputs.insert(name.clone(), value);
+            }
+            None if input.may_be_omitted => {}
+            None => return Err(StepStartFailure::InputsUnavailable),
+        }
+    }
+    Ok(inputs)
+}
+
+/// The mapped inputs `admitted`'s `workflow` step `step` would give its child for element
+/// `item` when a continuation starts it with `controls`, read before the step runs
+/// (REQ-CONTINUE-82): the step's input sources are made available as the engine makes them
+/// (`resolved_action_inputs`), each output reference from `output`, and mapped by
+/// `child_run_requests`, the mapper the step itself runs. `None` when the step forms no
+/// request for that element; an error of `output` is returned as it is.
+pub(crate) fn child_preflight_inputs<Error>(
+    admitted: &AdmittedWorkflow,
+    step: &str,
+    item: Option<u64>,
+    controls: &ControlContext,
+    mut output: impl FnMut(&ResolvedOutputSource) -> Result<Option<CapturedValue>, Error>,
+) -> Result<Option<BTreeMap<String, ChildInputValue>>, Error> {
+    let Some(ValidatedStep::Workflow(workflow)) = admitted.workflow().definition.steps.get(step)
+    else {
+        return Ok(None);
+    };
+    let mut action_inputs = BTreeMap::new();
+    let sources = workflow
+        .inputs
+        .iter()
+        .map(|(name, input)| (name.clone(), &input.reference.source))
+        .chain(
+            workflow
+                .for_each
+                .as_ref()
+                .map(|for_each| (FOR_EACH_INPUT.to_owned(), &for_each.items.source)),
+        );
+    for (name, source) in sources {
+        let value = match source {
+            ResolvedValueSource::Input(_) => ActionInput::WorkflowInput,
+            ResolvedValueSource::Output(source) => {
+                output(source)?.map_or(ActionInput::Unavailable, ActionInput::Output)
+            }
+            ResolvedValueSource::Wait(_)
+            | ResolvedValueSource::ControlsAnswers
+            | ResolvedValueSource::Item { .. }
+            | ResolvedValueSource::FinalizationContext => ActionInput::Unavailable,
+        };
+        action_inputs.insert(name, value);
+    }
+    Ok(child_run_requests(
+        admitted.inputs(),
+        Some(controls),
+        step,
+        workflow,
+        &action_inputs,
+    )
+    .ok()
+    .and_then(|prepared| {
+        prepared
+            .requests
+            .into_iter()
+            .find(|request| request.item == item)
+    })
+    .map(|request| request.inputs))
 }
 
 /// The children a `workflow` step runs, one at a time and in order: its one child or each

@@ -1825,11 +1825,15 @@ pub(super) fn execution_context_for_workflow(
     }
 }
 
+/// The admission context of a continuation, every missing harness collected: the launching
+/// environment is the host's, or for a child's repair continuation `environment`, its
+/// parent's admitted environment (REQ-WFEXEC-59).
 pub(super) fn continuation_execution_context(
     workflow: &ResolvedWorkflow,
     root: PathBuf,
     maximum_parallel_steps: usize,
     cancellation: CancellationSource,
+    environment: Option<EnvironmentSnapshot>,
 ) -> (ExecutionContext, Vec<AgentHarnessInstallationFailure>) {
     execution_context_with_profile_failures(
         workflow,
@@ -1837,7 +1841,7 @@ pub(super) fn continuation_execution_context(
         maximum_parallel_steps,
         cancellation,
         true,
-        EnvironmentSnapshot::new(env::vars_os()),
+        environment.unwrap_or_else(|| EnvironmentSnapshot::new(env::vars_os())),
     )
 }
 
@@ -1943,12 +1947,13 @@ fn child_run_outcome(
     }
 }
 
-/// The child run a parent's continuation takes over from its abandoned attempt rather than
-/// starting another (REQ-CONTINUE-76): one that exited is adopted, one left running gets a
-/// new attempt in place, and an element whose child was never created runs afresh. A repair
-/// retry likewise adopts the child an independent repair completed after its wait began
-/// (REQ-CONTINUE-75). `item` is the fan-out element, at which the continuation resumes the
-/// step (REQ-WFEXEC-68).
+/// The child run a parent's continuation takes over rather than starting another: from an
+/// abandoned attempt (REQ-CONTINUE-76) one that exited is adopted, one left running gets a
+/// new attempt in place, and an element whose child was never created runs afresh; a repair
+/// retry adopts the child an independent repair completed after its wait began
+/// (REQ-CONTINUE-75), and otherwise, for a repair wait's retry (REQ-CONTINUE-81), the failed
+/// child the wait names continues with the partition its preflight admitted. `item` is the
+/// fan-out element, at which the continuation resumes the step (REQ-WFEXEC-68).
 pub(super) enum ChildRecovery {
     Fresh {
         step: String,
@@ -1964,6 +1969,11 @@ pub(super) enum ChildRecovery {
         item: Option<u64>,
         directory: PathBuf,
     },
+    Continue {
+        step: String,
+        item: Option<u64>,
+        continuation: Box<super::child_recovery::ChildContinuation>,
+    },
 }
 
 impl ChildRecovery {
@@ -1971,7 +1981,8 @@ impl ChildRecovery {
         match self {
             Self::Fresh { step, item }
             | Self::Adopt { step, item, .. }
-            | Self::Retry { step, item, .. } => (step, *item),
+            | Self::Retry { step, item, .. }
+            | Self::Continue { step, item, .. } => (step, *item),
         }
     }
 }
@@ -2058,11 +2069,7 @@ impl LocalChildRunDispatcher {
         let environment = admitted.execution().environment().clone();
         let replacement = replacement
             .map(|(step, profiles)| {
-                serde_json::to_vec(&serde_json::json!({
-                    "schemaVersion": 1,
-                    "agentProfiles": profiles,
-                }))
-                .map(|bytes| (step, AgentProfileReplacementDocument::new(bytes)))
+                control_replacement_document(profiles).map(|document| (step, document))
             })
             .transpose()
             .context("prepare the control's agent-profile replacement")?;
@@ -2094,6 +2101,17 @@ impl LocalChildRunDispatcher {
             .ok()
             .and_then(|started| started.get(step).cloned())
     }
+}
+
+/// The replacement document a `control.retry`'s `payload.agentProfiles` names (REQ-AGENT-59).
+pub(super) fn control_replacement_document(
+    profiles: serde_json::Value,
+) -> serde_json::Result<AgentProfileReplacementDocument> {
+    serde_json::to_vec(&serde_json::json!({
+        "schemaVersion": 1,
+        "agentProfiles": profiles,
+    }))
+    .map(AgentProfileReplacementDocument::new)
 }
 
 impl LocalChildRunParent {
@@ -2176,6 +2194,19 @@ async fn run_local_child(
         Some(ChildRecovery::Retry { directory, .. }) => (
             blocking_operation(move || {
                 prepare_child_retry(&preparation_parent, &directory, preparation_cancellation)
+            })
+            .await,
+            ExecutionLeaf::Retry,
+        ),
+        // REQ-CONTINUE-81, INV-ENGINE-27: the failed child the repair wait named, whose
+        // continuation its preflight admitted and still holds locked.
+        Some(ChildRecovery::Continue { continuation, .. }) => (
+            blocking_operation(move || {
+                super::child_recovery::begin(
+                    *continuation,
+                    &preparation_request,
+                    preparation_cancellation,
+                )
             })
             .await,
             ExecutionLeaf::Retry,
@@ -2320,21 +2351,9 @@ fn prepare_local_child(
             .map_or("tree_invalid", |diagnostic| diagnostic.code)
             .to_owned()
     })?;
-    let mut inputs = BTreeMap::new();
-    for (name, value) in &request.inputs {
-        let input = match value {
-            ChildInputValue::Text(text) => ResolvedInput::Text(Arc::clone(text)),
-            ChildInputValue::Json(json) => ResolvedInput::Json(
-                serde_json::to_vec(json.as_ref())
-                    .ok()
-                    .and_then(|source| ResolvedJsonInput::from_source(Arc::from(source)).ok())
-                    .ok_or_else(|| "input_kind_mismatch".to_owned())?,
-            ),
-        };
-        inputs.insert(name.clone(), input);
-    }
+    let inputs = child_request_inputs(request)?;
     let context = child_execution_context(parent, &workflow, tree, cancellation)?;
-    let admitted = admit_local_workflow(workflow.clone(), ResolvedInputs::new(inputs), context)
+    let admitted = admit_local_workflow(workflow.clone(), inputs, context)
         .map_err(|failure| child_admission_code(&failure))?;
     // REQ-LOCALRUN-177: a fan-out element's child nests under its element.
     let record = WorkflowRunRecord::child_of(
@@ -2348,6 +2367,25 @@ fn prepare_local_child(
         .create_child(&request.step, request.item, &admitted, &record)
         .map_err(|_| "child_run_directory_unavailable".to_owned())?;
     Ok((workflow, admitted, run))
+}
+
+/// A child request's mapped inputs as the child's resolved inputs; a JSON value that does not
+/// round-trip is the child's `input_kind_mismatch`.
+pub(super) fn child_request_inputs(request: &ChildRunRequest) -> Result<ResolvedInputs, String> {
+    let mut inputs = BTreeMap::new();
+    for (name, value) in &request.inputs {
+        let input = match value {
+            ChildInputValue::Text(text) => ResolvedInput::Text(Arc::clone(text)),
+            ChildInputValue::Json(json) => ResolvedInput::Json(
+                serde_json::to_vec(json.as_ref())
+                    .ok()
+                    .and_then(|source| ResolvedJsonInput::from_source(Arc::from(source)).ok())
+                    .ok_or_else(|| "input_kind_mismatch".to_owned())?,
+            ),
+        };
+        inputs.insert(name.clone(), input);
+    }
+    Ok(ResolvedInputs::new(inputs))
 }
 
 /// A new attempt of the child run at `directory` the parent's abandoned attempt left

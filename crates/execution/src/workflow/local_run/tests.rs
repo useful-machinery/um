@@ -3025,6 +3025,82 @@ fn stop_wait_record() -> WaitRecord {
     .unwrap()
 }
 
+/// A repair wait at `step`'s position whose payload names `child`.
+fn repair_wait_naming(step: Value, child: Value) -> WaitRecord {
+    serde_json::from_value(json!({
+        "kind": "repair",
+        "since": "2026-11-10T12:00:00Z",
+        "step": step,
+        "then": "design",
+        "rule": {
+            "source": "um",
+            "event": ["control.retry", "control.withdraw"],
+            "where": "event.run == run.id and event.wait == wait.id"
+        },
+        "payload": {"outcome": "failed", "child": child}
+    }))
+    .unwrap()
+}
+
+// REQ-CONTINUE-82, REQ-LOCALRUN-177: a wait's child locator is owned only in the exact
+// canonical form of the waiting step's child, and of its element for a fan-out.
+#[test]
+fn a_wait_names_its_own_child_only_by_the_canonical_locator() {
+    let plain = json!(["design"]);
+    let element = json!(["design", {"item": 2}]);
+    let owned = |locator: &str, item| WaitChild::Owned {
+        locator: PathBuf::from(locator),
+        item,
+    };
+    for (step, child, expected) in [
+        (
+            &plain,
+            json!("children/design/000001"),
+            owned("children/design/000001", None),
+        ),
+        (
+            &element,
+            json!("children/design/000002/000003"),
+            owned("children/design/000002/000003", Some(2)),
+        ),
+        (&plain, json!("children/review/000001"), WaitChild::Unowned),
+        (&plain, json!("children/design/1"), WaitChild::Unowned),
+        (&plain, json!("children/design/000000"), WaitChild::Unowned),
+        (
+            &plain,
+            json!("children/design/../design/000001"),
+            WaitChild::Unowned,
+        ),
+        (&plain, json!("/children/design/000001"), WaitChild::Unowned),
+        (&plain, json!("children/design/000001/"), WaitChild::Unowned),
+        (
+            &plain,
+            json!("children/design/000002/000001"),
+            WaitChild::Unowned,
+        ),
+        (
+            &element,
+            json!("children/design/000001/000001"),
+            WaitChild::Unowned,
+        ),
+        (
+            &element,
+            json!("children/design/000001"),
+            WaitChild::Unowned,
+        ),
+        (&plain, json!(1), WaitChild::Unowned),
+    ] {
+        assert_eq!(
+            wait_child(&repair_wait_naming(step.clone(), child.clone())),
+            expected,
+            "{step} {child}"
+        );
+    }
+    let mut absent = repair_wait_naming(plain, json!(null));
+    absent.payload.remove("child");
+    assert_eq!(wait_child(&absent), WaitChild::Absent);
+}
+
 // REQ-LOCALRUN-180
 #[test]
 fn a_run_id_locates_its_run_under_the_home_and_the_home_lists_every_run() {

@@ -244,6 +244,12 @@ pub(crate) struct CodexAppServerV1ProtocolRejection {
     start_acknowledged: bool,
 }
 
+impl CodexAppServerV1ProtocolRejection {
+    pub(super) const fn reason(&self) -> CodexAppServerV1RejectionReason {
+        self.reason
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(super) enum CodexAppServerV1RejectionReason {

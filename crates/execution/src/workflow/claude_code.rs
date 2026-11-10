@@ -154,6 +154,12 @@ pub(crate) struct ClaudeCodeStreamJsonV1ProtocolRejection {
     state: ClaudeCodeStreamJsonV1RejectionState,
 }
 
+impl ClaudeCodeStreamJsonV1ProtocolRejection {
+    pub(crate) const fn reason(&self) -> ClaudeCodeStreamJsonV1RejectionReason {
+        self.reason
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ClaudeCodeStreamJsonV1ProtocolStage {

@@ -13,8 +13,10 @@ use crate::workflow::admission::{
     ExecutionPolicyLimits, InputLimits, ResolvedInputs, admit_workflow,
 };
 use crate::workflow::agent::{
-    AgentFailureCause, AgentHarnessFailureDetail, CanonicalHarnessFailure, HarnessFailureDiagnostic,
+    AgentFailureCause, AgentHarnessFailureDetail, AgentOutcome, AgentValueKind,
+    CanonicalHarnessFailure, HarnessFailureDiagnostic,
 };
+use crate::workflow::pi::{PiJsonV1Parser, PiJsonV1ProcessCompletion};
 use crate::workflow::resolution;
 use crate::workflow::runtime::{
     ProvisionalTargetFailure, RecoveryHandlerKind, RecoveryHandlerRecord, TargetExecutionNumber,
@@ -299,6 +301,8 @@ fn lossy_projection_classifies_agent_adapter_start_failure_without_internal_deta
         cause,
         RecoveryCause {
             kind: "agent_failure".to_owned(),
+            code: Some("harness_start_failed".to_owned()),
+            rejection_reason: None,
             exit_code: None,
             detail: None,
             harness_error: None,
@@ -306,6 +310,116 @@ fn lossy_projection_classifies_agent_adapter_start_failure_without_internal_deta
             resets_at: None,
         }
     );
+}
+
+/// REQ-WFRECOVERY-61: an agent failure's cause names the failed execution's closed failure
+/// code for every agent failure, and a command failure's cause carries no code.
+#[test]
+fn agent_failure_cause_names_the_failed_execution_failure_code() {
+    let agent_cause = |cause: AgentFailureCause| {
+        project_cause(
+            FailurePhase::Execution,
+            &StepFailureCause::Execution(StepExecutionFailure::Agent(cause.into())),
+        )
+    };
+
+    let protocol = agent_cause(AgentFailureCause::HarnessProtocolFailed);
+    assert_eq!(protocol.code.as_deref(), Some("harness_protocol_failed"));
+    assert_eq!(
+        serde_json::to_value(&protocol).unwrap(),
+        json!({"kind": "agent_failure", "code": "harness_protocol_failed"})
+    );
+
+    let limited = agent_cause(AgentFailureCause::HarnessFailed {
+        detail: AgentHarnessFailureDetail::Classified {
+            canonical: CanonicalHarnessFailure::ModelError,
+            diagnostic: HarnessFailureDiagnostic::from_code("rate_limit", Some(429)),
+        },
+    });
+    assert_eq!(
+        serde_json::to_value(&limited).unwrap(),
+        json!({
+            "kind": "agent_failure",
+            "code": "harness_failed",
+            "harnessError": "rate_limited",
+            "httpStatus": 429,
+        })
+    );
+
+    let missing = agent_cause(AgentFailureCause::MissingResult);
+    assert_eq!(missing.code.as_deref(), Some("missing_result"));
+
+    let command = project_cause(
+        FailurePhase::Execution,
+        &StepFailureCause::Execution(StepExecutionFailure::Command(
+            CommandExecutionFailure::UnsuccessfulExit { code: Some(75) },
+        )),
+    );
+    assert_eq!(command.code, None);
+    assert_eq!(
+        serde_json::to_value(&command).unwrap(),
+        json!({"kind": "command_exit", "exitCode": 75})
+    );
+}
+
+/// REQ-WFRECOVERY-61: an agent failure the adapter recorded a protocol rejection for names
+/// that rejection's closed reason as `rejectionReason`, so a handler can tell a refused
+/// stream shape from a stream that ended early.
+#[test]
+fn agent_failure_cause_names_the_protocol_rejection_reason() {
+    let projected = |frames: &[serde_json::Value], tail: &[u8]| {
+        let mut stdout = Vec::new();
+        for frame in frames {
+            serde_json::to_writer(&mut stdout, frame).unwrap();
+            stdout.push(b'\n');
+        }
+        stdout.extend_from_slice(tail);
+        let mut parser =
+            PiJsonV1Parser::profile(Arc::from("/execution/worktree"), AgentValueKind::None);
+        let _ = parser.push_stdout(&stdout, drop);
+        let AgentOutcome::Failed(failure) = parser.finish(PiJsonV1ProcessCompletion::exited(false))
+        else {
+            panic!("a rejected Pi stream must fail");
+        };
+        let reason = serde_json::to_value(failure.protocol_rejection().unwrap()).unwrap()["detail"]
+            ["reason"]
+            .clone();
+        let cause = project_cause(
+            FailurePhase::Execution,
+            &StepFailureCause::Execution(StepExecutionFailure::Agent(failure)),
+        );
+        (reason, serde_json::to_value(&cause).unwrap())
+    };
+    let session = json!({
+        "type": "session",
+        "version": 3,
+        "id": "00000000-0000-4000-8000-000000000004",
+        "timestamp": "2026-07-30T12:00:00Z",
+        "cwd": "/execution/worktree"
+    });
+    let started = [session.clone(), json!({"type": "agent_start"})];
+
+    let (reason, refused) = projected(&[started[0].clone(), started[1].clone(), session], b"");
+    assert_eq!(reason, "session_event_repeated");
+    assert_eq!(
+        refused,
+        json!({
+            "kind": "agent_failure",
+            "code": "harness_protocol_failed",
+            "rejectionReason": reason,
+        })
+    );
+
+    let (reason, ended_early) = projected(&started, b"{");
+    assert_eq!(reason, "partial_frame_at_end_of_stream");
+    assert_eq!(ended_early["code"], "harness_protocol_failed");
+    assert_eq!(ended_early["rejectionReason"], reason);
+
+    // A rejection before the agent started is a start failure that still names its reason.
+    let (reason, unstarted) = projected(&[json!({})], b"");
+    assert_eq!(reason, "session_header_invalid");
+    assert_eq!(unstarted["code"], "harness_start_failed");
+    assert_eq!(unstarted["rejectionReason"], reason);
 }
 
 /// REQ-WFRECOVERY-61, REQ-AGENT-72: an agent failure's cause carries the harness failure's
@@ -329,6 +443,8 @@ fn agent_failure_cause_carries_classified_harness_error_and_http_status() {
         classified,
         RecoveryCause {
             kind: "agent_failure".to_owned(),
+            code: Some("harness_failed".to_owned()),
+            rejection_reason: None,
             exit_code: None,
             detail: None,
             harness_error: Some("rate_limited".to_owned()),
@@ -338,7 +454,12 @@ fn agent_failure_cause_carries_classified_harness_error_and_http_status() {
     );
     assert_eq!(
         serde_json::to_value(&classified).unwrap(),
-        json!({"kind": "agent_failure", "harnessError": "rate_limited", "httpStatus": 429})
+        json!({
+            "kind": "agent_failure",
+            "code": "harness_failed",
+            "harnessError": "rate_limited",
+            "httpStatus": 429,
+        })
     );
 
     let mut limited = HarnessFailureDiagnostic::from_code("rate_limit", Some(429));
@@ -359,6 +480,7 @@ fn agent_failure_cause_carries_classified_harness_error_and_http_status() {
         serde_json::to_value(&with_reset).unwrap(),
         json!({
             "kind": "agent_failure",
+            "code": "harness_failed",
             "harnessError": "rate_limited",
             "httpStatus": 429,
             "resetsAt": "2025-10-24T20:00:00Z",
@@ -379,7 +501,7 @@ fn agent_failure_cause_carries_classified_harness_error_and_http_status() {
     assert_eq!(unclassified.resets_at, None);
     assert_eq!(
         serde_json::to_value(&unclassified).unwrap(),
-        json!({"kind": "agent_failure"})
+        json!({"kind": "agent_failure", "code": "harness_failed"})
     );
 }
 

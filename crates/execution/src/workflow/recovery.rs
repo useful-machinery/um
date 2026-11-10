@@ -12,9 +12,10 @@ use serde::de::{IgnoredAny, MapAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 
 use super::admission::AdmittedWorkflow;
-use super::agent::{AgentFailureCause, reset_timestamp};
+use super::agent::{AgentFailureCause, AgentProtocolRejectionDiagnostic, reset_timestamp};
 use super::diagnostic::{DiagnosticTruncation, StepDiagnostic, StepDiagnosticLog};
 use super::document::FailurePolicy;
+use super::evidence::agent_failure_code;
 use super::private_staging::{open_directory_path, remove_open_tree_at};
 use super::runtime::{
     ActionId, FailurePhase, RecoveryDecision, RecoveryDecisionKind, RecoveryHandlerOutcome,
@@ -74,6 +75,12 @@ pub(crate) struct RecoveryFailedExecution {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct RecoveryCause {
     pub(crate) kind: String,
+    /// The failed agent execution's closed failure code (REQ-AGENT-39), never harness text.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) code: Option<String>,
+    /// The adapter's closed protocol rejection reason (REQ-AGENT-42), never stream text.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) rejection_reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) exit_code: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -732,6 +739,10 @@ fn project_cause(phase: FailurePhase, cause: &StepFailureCause) -> RecoveryCause
                 _ => None,
             };
             RecoveryCause {
+                code: um_support::wire_name(agent_failure_code(failure.cause())),
+                rejection_reason: failure
+                    .protocol_rejection()
+                    .and_then(AgentProtocolRejectionDiagnostic::reason_name),
                 harness_error: classified
                     .and_then(|diagnostic| diagnostic.harness_error)
                     .map(str::to_owned),
@@ -753,6 +764,8 @@ impl RecoveryCause {
     fn of_kind(kind: RecoveryFailureKind) -> Self {
         Self {
             kind: kind.as_str().to_owned(),
+            code: None,
+            rejection_reason: None,
             exit_code: None,
             detail: None,
             harness_error: None,

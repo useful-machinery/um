@@ -1486,6 +1486,15 @@ impl AdmittedWorkflow {
         self
     }
 
+    /// The same admission observing `source` for cancellation and force abort: a child
+    /// continuation admitted before its parent's attempt begins observes the cancellation of
+    /// the step that dispatches it (REQ-WFEXEC-59, INV-ENGINE-27).
+    pub fn with_cancellation_source(mut self, source: CancellationSource) -> Self {
+        self.execution.cancellation =
+            CancellationPolicy::new(source, self.execution.cancellation.grace());
+        self
+    }
+
     /// The tree this run was admitted from, when it was (REQ-LOCALRUN-169).
     pub fn tree(&self) -> Option<&AdmittedTree> {
         self.tree.as_deref()
@@ -1792,6 +1801,31 @@ pub fn local_continuation_input_failures(
     inputs: &ResolvedInputs,
 ) -> Vec<AdmissionFailure> {
     collect_input_admission_failures(workflow, inputs)
+}
+
+/// Whether `supplied`, a child's mapped inputs, are the inputs its run retained, once
+/// admission completes each omitted optional or defaulted input of `workflow` as it did for
+/// the retained ones (REQ-WFFORMAT-84, REQ-CONTINUE-82): the same names, the same text and the
+/// same canonical JSON.
+pub fn completed_inputs_match(
+    workflow: &ResolvedWorkflow,
+    supplied: ResolvedInputs,
+    retained: &ResolvedInputs,
+) -> bool {
+    let completed = complete_inputs(workflow, supplied);
+    completed.values.len() == retained.values.len()
+        && completed
+            .values
+            .iter()
+            .all(|(name, value)| match (value, retained.get(name)) {
+                (ResolvedInput::Text(supplied), Some(ResolvedInput::Text(retained))) => {
+                    supplied == retained
+                }
+                (ResolvedInput::Json(supplied), Some(ResolvedInput::Json(retained))) => {
+                    supplied.canonical() == retained.canonical()
+                }
+                _ => false,
+            })
 }
 
 pub fn admit_local_continuation_workflow(

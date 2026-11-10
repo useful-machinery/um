@@ -1600,6 +1600,17 @@ pub struct CarryMiss {
     pub message: String,
 }
 
+/// What `PendingLocalContinuation::failed_attempt_restart` finds (REQ-CONTINUE-81).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum FailedAttemptRestart {
+    /// The latest attempt did not end `failed`.
+    NotFailed,
+    /// The ordinary steps the failed attempt left unfinished, in presentation order.
+    Steps(Vec<String>),
+    /// The failed attempt finished every ordinary step; only a finalizer failed.
+    FinalizerOnly,
+}
+
 pub struct PendingLocalContinuation {
     normalized: PathBuf,
     root: OwnedFd,
@@ -2099,6 +2110,106 @@ impl PendingLocalContinuation {
         super::continuation::partition(&workflow.definition, from, &self.unfinished_steps())
             .ok()
             .map(|partition| partition.reexecuted)
+    }
+
+    /// The mapped inputs this run's continuation, admitted as `admitted`, would give the
+    /// child of its `workflow` step `step` for element `item` under `controls`, read before
+    /// the continuation begins (REQ-CONTINUE-82): the same mapper the step runs, with every
+    /// referenced output read from the prior attempt's retained carrier as the continuation
+    /// would inherit it. `None` when the step forms no request for that element.
+    pub fn child_request_inputs(
+        &self,
+        admitted: &AdmittedWorkflow,
+        step: &str,
+        item: Option<u64>,
+        controls: &super::step_runtime::ControlContext,
+    ) -> Result<
+        Option<BTreeMap<String, super::step_runtime::ChildInputValue>>,
+        LocalRunDirectoryError,
+    > {
+        super::step_runtime::child_preflight_inputs(admitted, step, item, controls, |source| {
+            self.retained_output_value(&source.node.id, &source.output)
+        })
+    }
+
+    /// The `text` or `json` value of `producer`'s output `output` the prior attempt
+    /// succeeded or inherited, read through its carrier and checked against it; `None` for
+    /// any other output.
+    fn retained_output_value(
+        &self,
+        producer: &str,
+        output: &str,
+    ) -> Result<Option<super::value::CapturedValue>, LocalRunDirectoryError> {
+        let Some(prior) = self.state.attempts.last() else {
+            return Ok(None);
+        };
+        let Some(retained) = prior
+            .progress
+            .steps
+            .iter()
+            .find(|step| step.id == producer)
+            .and_then(|step| completed_step_output(prior, step, output))
+        else {
+            return Ok(None);
+        };
+        match &retained {
+            RetainedOutputV1::Text { .. } => {
+                let bytes = read_retained_carrier(&self.root, &self.state, &retained)?;
+                let text =
+                    String::from_utf8(bytes).map_err(|_| LocalRunDirectoryError::StateInvalid)?;
+                Ok(Some(super::value::CapturedValue::text(Arc::from(text))))
+            }
+            RetainedOutputV1::Json { .. } => {
+                let bytes = read_retained_carrier(&self.root, &self.state, &retained)?;
+                let value = serde_json::from_slice::<Value>(&bytes)
+                    .map_err(|_| LocalRunDirectoryError::StateInvalid)?;
+                super::value::CapturedJson::unconstrained(Arc::new(value), Arc::from(bytes))
+                    .map(super::value::CapturedValue::json)
+                    .map(Some)
+                    .ok_or(LocalRunDirectoryError::StateInvalid)
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// What a repair continuation of this run would restart (REQ-CONTINUE-81): when the
+    /// latest attempt ended `failed`, every ordinary step of its definition, in presentation
+    /// order, it left other than `succeeded`, `skipped` or `inherited`. A latest attempt that
+    /// did not fail during execution, such as one that succeeded with a declared outcome, is
+    /// `NotFailed`; a failed attempt that left no such step, whose failure was a finalizer's,
+    /// is `FinalizerOnly`, which names no step to continue from.
+    pub fn failed_attempt_restart(&self) -> FailedAttemptRestart {
+        let Some(prior) = self
+            .state
+            .attempts
+            .last()
+            .filter(|prior| prior.state == AttemptStateV1::WorkflowFailed)
+        else {
+            return FailedAttemptRestart::NotFailed;
+        };
+        let steps = self
+            .prior_workflow
+            .definition
+            .presentation_order
+            .iter()
+            .filter(|id| {
+                !prior.progress.steps.iter().any(|step| {
+                    step.id == **id
+                        && matches!(
+                            step.state,
+                            AttemptStepStateV1::Succeeded
+                                | AttemptStepStateV1::Skipped
+                                | AttemptStepStateV1::Inherited
+                        )
+                })
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if steps.is_empty() {
+            FailedAttemptRestart::FinalizerOnly
+        } else {
+            FailedAttemptRestart::Steps(steps)
+        }
     }
 
     /// The steps the prior attempt left neither succeeded nor inherited, which an
@@ -6443,6 +6554,78 @@ pub fn attempt_controls(
         resolved.controls.wait = Some((target, fields));
     }
     Ok(resolved)
+}
+
+/// What a wait record's `payload.child` names (REQ-CONTINUE-82, INV-ENGINE-27).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum WaitChild {
+    /// The payload names no child.
+    Absent,
+    /// The waiting step's own child: the canonical `children/<step>/<NNNNNN>` or, for a
+    /// fan-out waiting at element n, `children/<step>/<n>/<NNNNNN>`, relative to the run
+    /// directory (REQ-LOCALRUN-177).
+    Owned { locator: PathBuf, item: Option<u64> },
+    /// Anything else: another step's or element's child, a path that is not canonical, or a
+    /// value that is not a path.
+    Unowned,
+}
+
+/// Reads the child `wait`'s payload names against the waiting step and element the record
+/// itself holds. The locator is evidence to check, never a path to follow: nothing is opened,
+/// and only the exact canonical form of the waiting step's child is `Owned`.
+pub fn wait_child(wait: &WaitRecord) -> WaitChild {
+    let Some(locator) = wait.payload.get("child") else {
+        return WaitChild::Absent;
+    };
+    let (step, element) = match wait.step.as_slice() {
+        [Value::String(step)] => (step, None),
+        [Value::String(step), element] => match element.get("item").and_then(Value::as_u64) {
+            Some(item) => (step, Some(item)),
+            None => return WaitChild::Unowned,
+        },
+        _ => return WaitChild::Unowned,
+    };
+    let Some(locator) = locator.as_str() else {
+        return WaitChild::Unowned;
+    };
+    if !super::schema_common::is_identifier(step) {
+        return WaitChild::Unowned;
+    }
+    let segments = locator.split('/').collect::<Vec<_>>();
+    let expected_element = element.and_then(attempt_directory_name);
+    let ordinal = match (segments.as_slice(), expected_element.as_deref()) {
+        ([CHILDREN_DIRECTORY, named, ordinal], None) if *named == step.as_str() => *ordinal,
+        ([CHILDREN_DIRECTORY, named, named_element, ordinal], Some(expected))
+            if *named == step.as_str() && *named_element == expected =>
+        {
+            *ordinal
+        }
+        _ => return WaitChild::Unowned,
+    };
+    let canonical = ordinal
+        .parse::<u64>()
+        .ok()
+        .filter(|ordinal| *ordinal < 1_000_000)
+        .and_then(attempt_directory_name);
+    if canonical.as_deref() != Some(ordinal) {
+        return WaitChild::Unowned;
+    }
+    WaitChild::Owned {
+        locator: PathBuf::from(locator),
+        item: element,
+    }
+}
+
+/// Whether the latest attempt of the run at `requested` ended `failed`, read without the run
+/// lock: the evidence that selects a repair continuation over a fresh child, which the
+/// continuation reads again under the lock (REQ-CONTINUE-81).
+pub fn latest_attempt_failed(requested: &Path) -> Result<bool, LocalRunDirectoryError> {
+    let (_, root) = open_run_root(requested)?;
+    let state = read_state(&root)?;
+    Ok(state
+        .attempts
+        .last()
+        .is_some_and(|attempt| attempt.state == AttemptStateV1::WorkflowFailed))
 }
 
 /// The latest child run of `step` under the run at `requested` (REQ-LOCALRUN-177), its run
