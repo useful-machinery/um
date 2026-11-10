@@ -592,7 +592,9 @@ impl WorkflowRunViewState {
                     | WorkflowState::Finalizing { .. }
                     | WorkflowState::Succeeded
                     | WorkflowState::Failed { .. }
-                    | WorkflowState::Cancelled { .. } => None,
+                    | WorkflowState::Cancelled { .. }
+                    | WorkflowState::Waiting { .. }
+                    | WorkflowState::Continued { .. } => None,
                 };
                 self.workflow = WorkflowState::Executing {
                     gate: SchedulingGate::Cancelling {
@@ -1097,6 +1099,8 @@ fn workflow_state_from_outcome(outcome: &RunOutcome) -> WorkflowState<OffsetDate
             later_cancellation: *later_cancellation,
         },
         RunOutcome::Cancelled { reason } => WorkflowState::Cancelled { reason: *reason },
+        RunOutcome::Waiting { wait } => WorkflowState::Waiting { wait: wait.clone() },
+        RunOutcome::Continued { edge } => WorkflowState::Continued { edge: edge.clone() },
     }
 }
 

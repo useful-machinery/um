@@ -82,12 +82,22 @@ mod service_principal;
 mod trigger;
 #[path = "cli/workflow_continue.rs"]
 mod workflow_continue;
+#[path = "cli/workflow_definition.rs"]
+mod workflow_definition;
+#[path = "cli/workflow_mirror.rs"]
+mod workflow_mirror;
 #[path = "cli/workflow_reference.rs"]
 mod workflow_reference;
 #[path = "cli/workflow_retry.rs"]
 mod workflow_retry;
 #[path = "cli/workflow_run.rs"]
 mod workflow_run;
+#[path = "cli/workflow_run_control.rs"]
+mod workflow_run_control;
+#[path = "cli/workflow_run_create.rs"]
+mod workflow_run_create;
+#[path = "cli/workflow_run_list.rs"]
+mod workflow_run_list;
 #[path = "cli/workflow_schema.rs"]
 mod workflow_schema;
 #[path = "cli/workflow_status.rs"]

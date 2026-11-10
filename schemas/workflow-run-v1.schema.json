@@ -1,0 +1,177 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://docs.usefulmachinery.com/schemas/workflow-run-v1.schema.json",
+  "title": "Useful Machinery Workflow Run Record V1",
+  "description": "The run.json record of one run of a workflow definition. A stage run is the same record with a parent. Every field is present; a field without a value is written as null.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "id",
+    "definition",
+    "revision",
+    "tree",
+    "workflow",
+    "subject",
+    "parent",
+    "owner",
+    "state",
+    "position",
+    "outcome",
+    "startedAt",
+    "attempts",
+    "predecessor",
+    "successor",
+    "external",
+    "edges"
+  ],
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "id": { "$ref": "#/$defs/RunId" },
+    "definition": {
+      "description": "The definition, fixed for the life of the run; null for a run started by path, which has no definition.",
+      "oneOf": [
+        { "type": "null" },
+        { "$ref": "#/$defs/DefinitionId" }
+      ]
+    },
+    "revision": {
+      "description": "The definition revision, fixed for the life of the run; null for a run started by path, which has no definition.",
+      "oneOf": [
+        { "type": "null" },
+        { "type": "integer", "minimum": 1 }
+      ]
+    },
+    "tree": {
+      "$ref": "#/$defs/Digest",
+      "description": "The revision's tree digest, fixed for the life of the run."
+    },
+    "workflow": {
+      "$ref": "#/$defs/TreePath",
+      "description": "The file in the tree this run executes: workflow.yaml for a root run, the stage file for a stage run."
+    },
+    "subject": { "type": ["string", "null"] },
+    "parent": {
+      "description": "The parent run and step of a stage run, or null for a root run.",
+      "oneOf": [
+        { "type": "null" },
+        { "$ref": "#/$defs/Parent" }
+      ]
+    },
+    "owner": { "type": "string", "minLength": 1 },
+    "state": { "enum": ["running", "waiting", "exited"] },
+    "position": {
+      "type": "array",
+      "description": "The path of the workflow step whose child last started, with the one-based element of a forEach step; empty before any child has started and once the run has exited.",
+      "items": { "$ref": "#/$defs/PositionElement" }
+    },
+    "outcome": {
+      "description": "The chosen outcome once exited (one of the workflow's declared or implicit outcomes, or an engine outcome `withdrawn`, `canceled` or `superseded`), or null while running or waiting.",
+      "oneOf": [
+        { "type": "null" },
+        { "$ref": "#/$defs/Name" }
+      ]
+    },
+    "startedAt": { "type": "string", "format": "date-time" },
+    "attempts": { "type": "integer", "minimum": 1 },
+    "predecessor": {
+      "oneOf": [
+        { "type": "null" },
+        { "$ref": "#/$defs/RunId" }
+      ]
+    },
+    "successor": {
+      "oneOf": [
+        { "type": "null" },
+        { "$ref": "#/$defs/RunId" }
+      ]
+    },
+    "external": {
+      "type": "object",
+      "description": "External references by name, such as branch and pullRequest; the names differ by workflow.",
+      "additionalProperties": { "type": "string" }
+    },
+    "edges": {
+      "type": "object",
+      "description": "The continuations each limited edge of the workflow started under its limit, by `<step>.<outcome>`; empty for a run that took none.",
+      "propertyNames": { "pattern": "^[a-z][A-Za-z0-9]*\\.[a-z][a-z0-9_]*$" },
+      "additionalProperties": { "type": "integer", "minimum": 1 }
+    }
+  },
+  "if": {
+    "properties": { "definition": { "type": "null" } }
+  },
+  "then": {
+    "properties": { "revision": { "type": "null" } }
+  },
+  "else": {
+    "properties": { "revision": { "type": "integer" } }
+  },
+  "$defs": {
+    "Identifier": {
+      "type": "string",
+      "maxLength": 64,
+      "pattern": "^[a-z][A-Za-z0-9]*$"
+    },
+    "Name": {
+      "type": "string",
+      "maxLength": 64,
+      "pattern": "^[a-z][a-z0-9_]*$"
+    },
+    "DefinitionId": {
+      "type": "string",
+      "pattern": "^def_[0-7][0-9a-hjkmnp-tv-z]{25}$"
+    },
+    "RunId": {
+      "type": "string",
+      "pattern": "^run_[0-7][0-9a-hjkmnp-tv-z]{25}$"
+    },
+    "Digest": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "TreePath": {
+      "type": "string",
+      "minLength": 1,
+      "not": {
+        "anyOf": [
+          { "pattern": "^/" },
+          { "pattern": "^\\\\" },
+          { "pattern": "^~[/\\\\]" },
+          { "pattern": "^[A-Za-z]:[/\\\\]" },
+          { "pattern": "(^|[/\\\\])\\.\\.([/\\\\]|$)" },
+          { "pattern": "[\\n\\r\\t]" },
+          { "pattern": "\u0000" }
+        ]
+      },
+      "description": "A static path inside the definition's tree."
+    },
+    "PositionElement": {
+      "oneOf": [
+        { "$ref": "#/$defs/Identifier" },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["item"],
+          "properties": {
+            "item": { "type": "integer", "minimum": 1 }
+          }
+        }
+      ]
+    },
+    "Parent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["run", "step"],
+      "properties": {
+        "run": { "$ref": "#/$defs/RunId" },
+        "step": { "$ref": "#/$defs/Identifier" },
+        "item": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "The one-based element of the parent's forEach step the child runs for."
+        }
+      }
+    }
+  }
+}

@@ -733,6 +733,39 @@ fn a_symbolic_link_source_root_normalizes_an_absolute_selected_path() {
     );
 }
 
+// REQ-WFFORMAT-18
+#[cfg(unix)]
+#[test]
+fn a_missing_workflow_file_is_named_under_the_canonical_source_root() {
+    use std::os::unix::fs::symlink;
+
+    let bundle = FixtureBundle::new();
+    let root_alias = bundle.root.parent().unwrap().join("source-alias");
+    symlink(&bundle.root, &root_alias).unwrap();
+    let canonical_root = fs::canonicalize(&bundle.root).unwrap();
+    assert_ne!(canonical_root, root_alias);
+
+    for (root, selected) in [
+        (
+            root_alias.clone(),
+            root_alias.join("workflows/missing.yaml"),
+        ),
+        (
+            root_alias.clone(),
+            root_alias.join("workflows/./nested/../missing.yaml"),
+        ),
+    ] {
+        let failure = resolve_workflow_file(&root, &selected).unwrap_err();
+        assert_eq!(failure.kind(), ResolutionFailureKind::SourceUnavailable);
+        assert_eq!(failure.location(), &ResolutionLocation::Workflow);
+        assert_eq!(
+            failure.source_path(),
+            Some(canonical_root.join("workflows/missing.yaml").as_path()),
+            "{selected:?}"
+        );
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn an_absolute_selected_path_cannot_hide_a_symbolic_link_escape_with_parent_traversal() {
@@ -1126,6 +1159,67 @@ fn input_schema_enforces_the_shared_parser_depth() {
     );
 }
 
+// REQ-WFFORMAT-24, REQ-WFFORMAT-83
+#[test]
+fn json_input_defaults_are_confined_strict_and_checked_against_the_input_schema() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().join("source");
+    for directory in ["workflows", "schemas", "policy"] {
+        fs::create_dir_all(root.join(directory)).unwrap();
+    }
+    fs::write(
+        root.join("schemas/policy.schema.json"),
+        r#"{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","properties":{"reviewers":{"type":"integer"}},"required":["reviewers"]}"#,
+    )
+    .unwrap();
+    fs::write(root.join("policy/engineering.json"), br#"{"reviewers": 1}"#).unwrap();
+    fs::write(
+        root.join("policy/duplicate.json"),
+        br#"{"reviewers": 1, "reviewers": 2}"#,
+    )
+    .unwrap();
+    fs::write(root.join("policy/wrong.json"), br#"{"reviewers": "many"}"#).unwrap();
+    let with_default = |default: &str| {
+        fs::write(
+            root.join("workflows/workflow.yaml"),
+            format!(
+                "schemaVersion: 1\ninputs:\n  policy: {{kind: json, schema: ../schemas/policy.schema.json, default: {default}}}\nsteps:\n  work:\n    kind: cmd\n    command: {{argv: [\"true\"]}}\n"
+            ),
+        )
+        .unwrap();
+        resolve(&root, Path::new("workflows/workflow.yaml"))
+    };
+    let assert_rejected = |default: &str, code: &str| {
+        let failure = with_default(default).unwrap_err();
+        let diagnostic = serde_json::to_value(
+            crate::workflow::rejection::RejectionDiagnostic::from_resolution(&failure),
+        )
+        .unwrap();
+        assert_eq!(diagnostic["code"], code, "{default}");
+        assert_eq!(
+            diagnostic["location"],
+            serde_json::json!({"kind": "input_default", "input": "policy"}),
+            "{default}"
+        );
+    };
+
+    let resolved = with_default("../policy/engineering.json").unwrap();
+    assert!(resolved.required_inputs().is_empty());
+    assert!(
+        resolved
+            .source_closure
+            .contains_key("policy/engineering.json")
+    );
+    assert!(with_default("{reviewers: 3}").is_ok());
+
+    assert_rejected("../../outside.json", "source_path_escape");
+    assert_rejected("../policy/missing.json", "source_unavailable");
+    assert_rejected("../policy/duplicate.json", "invalid_input_default_json");
+    assert_rejected("../policy/wrong.json", "invalid_input_default");
+    assert_rejected("{reviewers: many}", "invalid_input_default");
+    assert_rejected("null", "invalid_input_default");
+}
+
 // REQ-WFFORMAT-22
 #[cfg(unix)]
 #[test]
@@ -1155,4 +1249,202 @@ fn assert_failure_kind(
     kind: ResolutionFailureKind,
 ) {
     assert_eq!(result.unwrap_err().kind(), kind);
+}
+
+const PARENT_WORKFLOW: &str = "schemaVersion: 1
+inputs:
+  ticket:
+    kind: text
+outcomes: [landed, failed]
+steps:
+  design:
+    kind: workflow
+    workflow: design.yaml
+    inputs:
+      ticket:
+        ref: inputs.ticket
+    on:
+      planned: exit.landed
+      failed: exit.failed
+";
+const CHILD_WORKFLOW: &str = "schemaVersion: 1
+inputs:
+  ticket:
+    kind: text
+outcomes: [planned, failed]
+outcome:
+  from: outputs.plan.verdict
+  onFailure: failed
+agentProfiles:
+  coding:
+    harness:
+      kind: pi
+      config:
+        model: openai/gpt-5
+        thinking: xhigh
+steps:
+  plan:
+    kind: agent
+    agent:
+      profile: coding
+      systemPrompt: prompts/design.md
+      message:
+        text:
+          - ref: inputs.ticket
+    outputs:
+      verdict:
+        kind: text
+        from: agent_response
+exports:
+  plan:
+    ref: outputs.plan.verdict
+";
+
+struct ChildBundle {
+    _temporary: TempDir,
+    root: PathBuf,
+}
+
+impl ChildBundle {
+    fn new(parent: &str) -> Self {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("source");
+        fs::create_dir_all(root.join("prompts")).unwrap();
+        fs::write(root.join("workflow.yaml"), parent).unwrap();
+        fs::write(root.join("design.yaml"), CHILD_WORKFLOW).unwrap();
+        fs::write(root.join("prompts/design.md"), b"Design the change.\n").unwrap();
+        Self {
+            _temporary: temporary,
+            root,
+        }
+    }
+
+    fn resolve(&self, file: &str) -> Result<ResolvedWorkflow, ResolutionFailure> {
+        resolve_workflow_file(&self.root, &self.root.join(file))
+    }
+}
+
+fn step_workflow(step: &str) -> ResolutionLocation {
+    ResolutionLocation::Semantic(ValidationLocation::StepWorkflow {
+        step: step.to_owned(),
+    })
+}
+
+// REQ-WFFORMAT-89
+#[test]
+fn a_child_workflow_resolves_beside_the_root_and_joins_its_closure() {
+    let bundle = ChildBundle::new(PARENT_WORKFLOW);
+    let resolved = bundle.resolve("workflow.yaml").unwrap();
+
+    let ValidatedStep::Workflow(design) = &resolved.definition.steps["design"] else {
+        panic!("design resolves as a workflow step");
+    };
+    assert_eq!(design.workflow, "design.yaml");
+    assert_eq!(
+        resolved.source_closure.keys().collect::<Vec<_>>(),
+        ["design.yaml", "prompts/design.md", "workflow.yaml"]
+    );
+    assert_eq!(
+        resolved.source_closure["design.yaml"].as_ref(),
+        CHILD_WORKFLOW.as_bytes()
+    );
+
+    // A retained closure resolves the child from the closure, not from the source root.
+    fs::remove_file(bundle.root.join("design.yaml")).unwrap();
+    let retained = resolve_retained(
+        bundle.root.clone(),
+        "workflow.yaml",
+        resolved.source_closure.clone(),
+        None,
+    )
+    .unwrap();
+    assert_eq!(retained.content_digest, resolved.content_digest);
+
+    fs::write(
+        bundle.root.join("design.yaml"),
+        CHILD_WORKFLOW.replace("onFailure: failed", "onFailure: planned"),
+    )
+    .unwrap();
+    let changed = bundle.resolve("workflow.yaml").unwrap();
+    assert_ne!(changed.content_digest, resolved.content_digest);
+}
+
+// REQ-WFFORMAT-89
+#[test]
+fn a_child_workflow_outside_the_tree_missing_or_invalid_fails_at_its_step() {
+    for (path, selected) in [
+        ("sub/design.yaml", "workflow.yaml"),
+        ("workflow.yaml", "workflow.yaml"),
+        ("stage.yaml", "stage.yaml"),
+        ("design.json", "workflow.yaml"),
+    ] {
+        let bundle = ChildBundle::new(&PARENT_WORKFLOW.replace("design.yaml", path));
+        fs::create_dir_all(bundle.root.join("sub")).unwrap();
+        fs::write(bundle.root.join("sub/design.yaml"), CHILD_WORKFLOW).unwrap();
+        if selected != "workflow.yaml" {
+            fs::copy(
+                bundle.root.join("workflow.yaml"),
+                bundle.root.join(selected),
+            )
+            .unwrap();
+        }
+        assert_failure(
+            bundle.resolve(selected),
+            ResolutionFailureKind::InvalidWorkflowDefinition(
+                ValidationFailureKind::ChildWorkflowNotInTree,
+            ),
+            step_workflow("design"),
+        );
+    }
+
+    // A `design.yaml` that is a symbolic link to a file outside the root is not a file of
+    // the tree, whatever it points at.
+    let escaping = ChildBundle::new(PARENT_WORKFLOW);
+    let outside = escaping.root.parent().unwrap().join("outside.yaml");
+    fs::write(&outside, CHILD_WORKFLOW).unwrap();
+    fs::remove_file(escaping.root.join("design.yaml")).unwrap();
+    std::os::unix::fs::symlink(&outside, escaping.root.join("design.yaml")).unwrap();
+    assert_failure(
+        escaping.resolve("workflow.yaml"),
+        ResolutionFailureKind::InvalidWorkflowDefinition(
+            ValidationFailureKind::ChildWorkflowNotInTree,
+        ),
+        step_workflow("design"),
+    );
+
+    let missing = ChildBundle::new(PARENT_WORKFLOW);
+    fs::remove_file(missing.root.join("design.yaml")).unwrap();
+    assert_failure(
+        missing.resolve("workflow.yaml"),
+        ResolutionFailureKind::InvalidWorkflowDefinition(
+            ValidationFailureKind::ChildWorkflowUnavailable,
+        ),
+        step_workflow("design"),
+    );
+
+    let invalid = ChildBundle::new(PARENT_WORKFLOW);
+    fs::write(
+        invalid.root.join("design.yaml"),
+        CHILD_WORKFLOW.replace("ref: inputs.ticket", "ref: inputs.missing"),
+    )
+    .unwrap();
+    let failure = invalid.resolve("workflow.yaml").unwrap_err();
+    assert_eq!(
+        (failure.kind(), failure.location()),
+        (
+            ResolutionFailureKind::InvalidWorkflowDefinition(
+                ValidationFailureKind::ChildWorkflowInvalid,
+            ),
+            &step_workflow("design"),
+        )
+    );
+    let child = failure.child_failure().unwrap();
+    assert_eq!(
+        child.kind(),
+        ResolutionFailureKind::InvalidWorkflowDefinition(ValidationFailureKind::UnknownInput)
+    );
+    assert_eq!(child.workflow_path(), Some("design.yaml"));
+    let remedy = crate::workflow::rejection::human_resolution_remedy(&failure);
+    assert!(remedy.contains("unknown_input"), "{remedy}");
+    assert!(remedy.contains("design.yaml"), "{remedy}");
 }

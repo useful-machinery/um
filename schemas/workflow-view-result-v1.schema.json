@@ -11,6 +11,34 @@
     }
   ],
   "$defs": {
+    "ContinuationEdge": {
+      "description": "The backward or limited edge an `edge` continuation took: the step and child outcome whose edge it was, the step the attempt starts from, and whether the taking was counted in run.json edges.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "step",
+        "outcome",
+        "target",
+        "counted"
+      ],
+      "properties": {
+        "step": {
+          "type": "string",
+          "minLength": 1
+        },
+        "outcome": {
+          "type": "string",
+          "minLength": 1
+        },
+        "target": {
+          "type": "string",
+          "minLength": 1
+        },
+        "counted": {
+          "type": "boolean"
+        }
+      }
+    },
     "AbsolutePath": {
       "type": "string",
       "minLength": 1,
@@ -274,8 +302,10 @@
         "command_launch_permission_denied",
         "command_launch_invalid_input",
         "command_launch_failed",
+        "child_admission_rejected",
         "command_exit",
         "command_wait_failed",
+        "child_run_interrupted",
         "output_unsupported",
         "capture_task_unavailable",
         "output_path_absolute",
@@ -290,6 +320,7 @@
         "output_invalid_json",
         "output_duplicate_json_member",
         "output_json_schema_mismatch",
+        "outcome_undeclared",
         "captured_file_count_limit",
         "captured_file_size_limit",
         "captured_total_size_limit",
@@ -915,7 +946,8 @@
         "kind": {
           "enum": [
             "cmd",
-            "agent"
+            "agent",
+            "workflow"
           ]
         },
         "invocationId": {
@@ -1102,7 +1134,8 @@
         "handlerKind": {
           "enum": [
             "cmd",
-            "agent"
+            "agent",
+            "workflow"
           ]
         },
         "rounds": {
@@ -1241,7 +1274,8 @@
         "kind": {
           "enum": [
             "cmd",
-            "agent"
+            "agent",
+            "workflow"
           ]
         },
         "failurePolicy": {
@@ -1312,7 +1346,10 @@
           "if": {
             "properties": {
               "kind": {
-                "const": "agent"
+                "enum": [
+                  "agent",
+                  "workflow"
+                ]
               }
             },
             "required": [
@@ -2204,6 +2241,17 @@
               }
             }
           },
+          "reason": {
+            "enum": [
+              "resume",
+              "retry",
+              "edge",
+              "restart"
+            ]
+          },
+          "edge": {
+            "$ref": "#/$defs/ContinuationEdge"
+          },
           "fromSteps": {
             "type": "array",
             "minItems": 1,
@@ -2463,7 +2511,9 @@
           "enum": [
             "succeeded",
             "failed",
-            "cancelled"
+            "cancelled",
+            "waiting",
+            "continued"
           ]
         },
         "cancellation": {
@@ -2572,8 +2622,131 @@
               }
             ]
           }
+        },
+        {
+          "if": {
+            "properties": {
+              "outcome": {
+                "enum": [
+                  "waiting",
+                  "continued"
+                ]
+              }
+            },
+            "required": [
+              "outcome"
+            ]
+          },
+          "then": {
+            "not": {
+              "anyOf": [
+                {
+                  "required": [
+                    "finalization"
+                  ]
+                },
+                {
+                  "required": [
+                    "cancellation"
+                  ]
+                }
+              ]
+            }
+          }
         }
       ]
+    },
+    "WaitRecord": {
+      "description": "The wait record wait.json, whose shape contracts/jsonschema/workflow-run-wait-v1.schema.json publishes.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "since",
+        "step",
+        "then",
+        "rule",
+        "payload"
+      ],
+      "properties": {
+        "kind": {
+          "enum": [
+            "answer",
+            "approval",
+            "repair",
+            "stop",
+            "external",
+            "children"
+          ]
+        },
+        "since": {
+          "type": "string",
+          "minLength": 1
+        },
+        "step": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "oneOf": [
+              {
+                "type": "string",
+                "minLength": 1
+              },
+              {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "item"
+                ],
+                "properties": {
+                  "item": {
+                    "type": "integer",
+                    "minimum": 1
+                  }
+                }
+              }
+            ]
+          }
+        },
+        "then": {
+          "type": "string",
+          "minLength": 1
+        },
+        "onHandBack": {
+          "type": "string",
+          "minLength": 1
+        },
+        "rule": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "source",
+            "event",
+            "where"
+          ],
+          "properties": {
+            "source": {
+              "type": "string",
+              "minLength": 1
+            },
+            "event": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "type": "string",
+                "minLength": 1
+              }
+            },
+            "where": {
+              "type": "string",
+              "minLength": 1
+            }
+          }
+        },
+        "payload": {
+          "type": "object"
+        }
+      }
     },
     "ViewSuccess": {
       "type": "object",
@@ -2597,7 +2770,7 @@
           "const": 1
         },
         "command": {
-          "const": "um workflow view"
+          "const": "um workflow run view"
         },
         "outcome": {
           "const": "view"
@@ -2633,7 +2806,9 @@
           "enum": [
             "succeeded",
             "workflow_failed",
-            "cancelled"
+            "cancelled",
+            "waiting",
+            "continued"
           ]
         },
         "resultDirectory": {
@@ -2641,6 +2816,10 @@
         },
         "result": {
           "$ref": "#/$defs/WorkflowResult"
+        },
+        "wait": {
+          "description": "The attempt's wait record attempts/<N>/wait.json, present when the attempt ended in a wait.",
+          "$ref": "#/$defs/WaitRecord"
         }
       },
       "allOf": [
@@ -2712,6 +2891,52 @@
               }
             }
           }
+        },
+        {
+          "if": {
+            "properties": {
+              "attemptState": {
+                "const": "waiting"
+              }
+            },
+            "required": [
+              "attemptState"
+            ]
+          },
+          "then": {
+            "properties": {
+              "result": {
+                "properties": {
+                  "outcome": {
+                    "const": "waiting"
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "attemptState": {
+                "const": "continued"
+              }
+            },
+            "required": [
+              "attemptState"
+            ]
+          },
+          "then": {
+            "properties": {
+              "result": {
+                "properties": {
+                  "outcome": {
+                    "const": "continued"
+                  }
+                }
+              }
+            }
+          }
         }
       ]
     },
@@ -2730,7 +2955,7 @@
           "const": 1
         },
         "command": {
-          "const": "um workflow view"
+          "const": "um workflow run view"
         },
         "outcome": {
           "const": "error"
@@ -2757,6 +2982,8 @@
               "enum": [
                 "run_directory_unavailable",
                 "run_directory_invalid",
+                "run_not_found",
+                "home_unavailable",
                 "recovery_schema_unsupported",
                 "lock_query_failed",
                 "status_snapshot_unstable",
@@ -2864,7 +3091,8 @@
                 "command_launch_not_found",
                 "command_launch_permission_denied",
                 "command_launch_invalid_input",
-                "command_launch_failed"
+                "command_launch_failed",
+                "child_admission_rejected"
               ]
             }
           },
@@ -2995,7 +3223,8 @@
             },
             "code": {
               "enum": [
-                "command_wait_failed"
+                "command_wait_failed",
+                "child_run_interrupted"
               ]
             }
           },
@@ -3045,6 +3274,7 @@
                 "output_invalid_json",
                 "output_duplicate_json_member",
                 "output_json_schema_mismatch",
+                "outcome_undeclared",
                 "captured_file_count_limit",
                 "captured_file_size_limit",
                 "captured_total_size_limit",
@@ -3192,7 +3422,10 @@
       "additionalProperties": false,
       "properties": {
         "code": {
-          "const": "failure_stop"
+          "enum": [
+            "failure_stop",
+            "not_reached"
+          ]
         }
       },
       "required": [

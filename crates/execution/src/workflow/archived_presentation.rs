@@ -19,7 +19,7 @@ use super::publication::{CancellationReasonV1, WorkflowOutcomeV1, WorkflowStepSt
 use super::publication::{FinalizationTriggerV1, WorkflowResultV1};
 use super::validated::WorkflowNodeRole;
 
-const COMMAND: &str = "um workflow view";
+const COMMAND: &str = "um workflow run view";
 use super::render_style::{
     STYLE_BLOCKED, STYLE_FAILURE, STYLE_MUTED, STYLE_PRIMARY, STYLE_SECONDARY, STYLE_SUCCESS,
 };
@@ -402,6 +402,9 @@ struct WorkflowViewSuccess<'a> {
     attempt_state: &'static str,
     result_directory: &'a str,
     result: &'a WorkflowResultV1,
+    /// The attempt's wait record when it ended in a wait (REQ-LOCALRUN-179).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    wait: Option<&'a super::wait::WaitRecord>,
 }
 
 #[derive(Serialize)]
@@ -453,6 +456,7 @@ fn serialize_json_success(
         attempt_state: archived_attempt_state(attempt.state),
         result_directory,
         result: &loaded.result,
+        wait: loaded.wait.as_ref(),
     })
 }
 
@@ -597,6 +601,8 @@ pub(super) const fn archived_attempt_state(state: AttemptStateV1) -> &'static st
         AttemptStateV1::Cancelling => "cancelling",
         AttemptStateV1::Interrupted => "interrupted",
         AttemptStateV1::Rejected => "rejected",
+        AttemptStateV1::Waiting => "waiting",
+        AttemptStateV1::Continued => "continued",
     }
 }
 
@@ -605,6 +611,8 @@ pub(crate) const fn archived_outcome(outcome: WorkflowOutcomeV1) -> &'static str
         WorkflowOutcomeV1::Succeeded => "succeeded",
         WorkflowOutcomeV1::Failed => "failed",
         WorkflowOutcomeV1::Cancelled => "cancelled",
+        WorkflowOutcomeV1::Waiting => "waiting",
+        WorkflowOutcomeV1::Continued => "continued",
     }
 }
 
@@ -638,6 +646,7 @@ pub(crate) const fn archived_step_kind(step: &WorkflowPresentationStep) -> &'sta
     match step {
         WorkflowPresentationStep::Command { .. } => "cmd",
         WorkflowPresentationStep::Agent { .. } => "agent",
+        WorkflowPresentationStep::Workflow { .. } => "workflow",
     }
 }
 
@@ -711,8 +720,11 @@ const fn attempt_state_style(state: AttemptStateV1) -> &'static str {
         AttemptStateV1::Cancelled
         | AttemptStateV1::Cancelling
         | AttemptStateV1::Interrupted
-        | AttemptStateV1::Rejected => STYLE_BLOCKED,
-        AttemptStateV1::Created | AttemptStateV1::Running => STYLE_MUTED,
+        | AttemptStateV1::Rejected
+        | AttemptStateV1::Waiting => STYLE_BLOCKED,
+        AttemptStateV1::Created | AttemptStateV1::Running | AttemptStateV1::Continued => {
+            STYLE_MUTED
+        }
     }
 }
 
@@ -720,7 +732,8 @@ const fn outcome_style(outcome: WorkflowOutcomeV1) -> &'static str {
     match outcome {
         WorkflowOutcomeV1::Succeeded => STYLE_SUCCESS,
         WorkflowOutcomeV1::Failed => STYLE_FAILURE,
-        WorkflowOutcomeV1::Cancelled => STYLE_BLOCKED,
+        WorkflowOutcomeV1::Cancelled | WorkflowOutcomeV1::Waiting => STYLE_BLOCKED,
+        WorkflowOutcomeV1::Continued => STYLE_MUTED,
     }
 }
 
@@ -865,6 +878,7 @@ mod tests {
         let loaded = LoadedLocalArchivedAttempt {
             projection,
             result: serde_json::from_value(result_value.clone()).unwrap(),
+            wait: None,
         };
 
         let bytes = serialize_json_success(&loaded).unwrap();

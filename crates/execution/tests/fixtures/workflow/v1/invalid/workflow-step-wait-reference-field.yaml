@@ -1,0 +1,11 @@
+schemaVersion: 1
+steps:
+  fix:
+    kind: workflow
+    workflow: build.yaml
+    inputs:
+      notes:
+        ref: wait.Notes
+    on:
+      succeeded: exit.succeeded
+      failed: exit.failed

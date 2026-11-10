@@ -42,7 +42,7 @@ use super::result_metadata;
 use super::runtime::{
     ActiveStepInvocation, ExportSet, ExportUnavailableReason, ExportValue, FailurePhase,
     OutputProducer, RecoveryHandlerFailurePhase, RecoveryHandlerKind, RecoveryHandlerOutcome,
-    RecoveryTerminalDisposition, RunOutcome, StepRecoveryState, StepState,
+    RecoveryTerminalDisposition, RunOutcome, StepRecoveryState, StepState, TakenEdgeRecord,
 };
 use super::schema_common::{lowercase_hex, utc_timestamp};
 use super::step_runtime::{
@@ -57,9 +57,11 @@ use super::validated::{
 use super::value::CapturedValue;
 use super::workspace_snapshot::WorkspaceSnapshotV1;
 
-const COMMAND: &str = "um workflow run";
-const RETRY_COMMAND: &str = "um workflow retry";
-const CONTINUE_COMMAND: &str = "um workflow continue";
+const COMMAND: &str = "um workflow run create";
+const RETRY_COMMAND: &str = "um workflow run retry";
+const RESUME_COMMAND: &str = "um workflow run resume";
+const RESTART_COMMAND: &str = "um workflow run restart";
+const UPGRADE_COMMAND: &str = "um workflow run upgrade";
 const RESULT_FILE: &str = "result.json";
 const EXPORT_DIRECTORY: &str = "exports";
 const STAGING_ATTEMPTS: usize = 16;
@@ -87,6 +89,9 @@ pub struct WorkflowRunCancellation {
 pub enum WorkflowRunStepKind {
     Command,
     Agent,
+    /// A step that runs a child workflow; like an agent it has no command output
+    /// (REQ-WFEXEC-60).
+    Workflow,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -127,6 +132,56 @@ pub struct ContinuationRecordV1 {
     pub(crate) inherited_steps: Vec<ContinuationInheritedStepV1>,
     pub(crate) definition_source: ContinuationDefinitionSourceV1,
     pub(crate) workspace: ContinuationWorkspaceV1,
+    /// Why the attempt continues (REQ-CONTINUE-77): every local continuation writes it; a
+    /// record written before it existed, and a Cloud continuation's, has none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) reason: Option<ContinuationReasonV1>,
+    /// The edge a `reason` `edge` continuation took (REQ-CONTINUE-77, REQ-WFEXEC-64).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) edge: Option<ContinuationEdgeV1>,
+}
+
+/// A continuation's `reason` (REQ-CONTINUE-77): `retry` for a `repair` wait resolved by
+/// `control.retry`, `edge` for an attempt a backward or limited edge started, `restart` for
+/// the first own attempt of a successor run (REQ-CONTINUE-79), `resume` for every other
+/// local continuation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContinuationReasonV1 {
+    Resume,
+    Retry,
+    Edge,
+    Restart,
+}
+
+/// The edge a continuation took (REQ-CONTINUE-77): the step and child outcome whose edge it
+/// was, the step the attempt starts from and whether the taking was counted in `run.json`
+/// `edges` (REQ-WFEXEC-64, REQ-LOCALRUN-175).
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ContinuationEdgeV1 {
+    pub step: String,
+    pub outcome: String,
+    pub target: String,
+    pub counted: bool,
+}
+
+impl From<TakenEdgeRecord> for ContinuationEdgeV1 {
+    fn from(edge: TakenEdgeRecord) -> Self {
+        Self {
+            step: edge.step,
+            outcome: edge.outcome,
+            target: edge.target,
+            counted: edge.counted,
+        }
+    }
+}
+
+impl ContinuationEdgeV1 {
+    /// The edge's key in `run.json` `edges` (REQ-WFDEF-4).
+    pub fn key(&self) -> String {
+        super::runtime::edge_key(&self.step, &self.outcome)
+    }
 }
 
 /// Evidence captured after the authenticated retained-workspace claim and
@@ -190,6 +245,8 @@ pub fn cloud_continuation_record(
         inherited_steps,
         definition_source,
         workspace,
+        reason: None,
+        edge: None,
     };
     if super::result_metadata::validate_continuation_record(&record) {
         Ok(record)
@@ -205,6 +262,10 @@ impl ContinuationRecordV1 {
 
     pub fn inherited_step_ids(&self) -> impl Iterator<Item = &str> {
         self.inherited_steps.iter().map(|step| step.id.as_str())
+    }
+
+    pub fn reason(&self) -> Option<ContinuationReasonV1> {
+        self.reason
     }
 }
 
@@ -685,6 +746,10 @@ pub(crate) enum WorkflowOutcomeV1 {
     Succeeded,
     Failed,
     Cancelled,
+    /// The attempt ended on a wait (REQ-WFEXEC-15, REQ-WFEXEC-61).
+    Waiting,
+    /// The attempt took a backward or limited edge (REQ-WFEXEC-15, REQ-WFEXEC-64).
+    Continued,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -700,6 +765,9 @@ pub struct WorkflowRunTerminalResultV1 {
     attempt_number: u64,
     result_directory: String,
     result: WorkflowResultV1,
+    /// The wait record an attempt that ended `waiting` wrote (REQ-LOCALRUN-127).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    wait: Option<super::wait::WaitRecord>,
 }
 
 impl WorkflowRunTerminalResultV1 {
@@ -724,8 +792,25 @@ impl WorkflowRunTerminalResultV1 {
         self.command = RETRY_COMMAND;
     }
 
-    pub fn mark_continue(&mut self) {
-        self.command = CONTINUE_COMMAND;
+    pub fn mark_resume(&mut self) {
+        self.command = RESUME_COMMAND;
+    }
+
+    /// Names `um workflow run restart`, whose successor's first own attempt this is
+    /// (REQ-LOCALRUN-194).
+    pub fn mark_restart(&mut self) {
+        self.command = RESTART_COMMAND;
+    }
+
+    /// Names `um workflow run upgrade`, which starts no attempt of its own; an attempt of an
+    /// upgraded successor is a `resume` or `retry` (REQ-LOCALRUN-197).
+    pub fn mark_upgrade(&mut self) {
+        self.command = UPGRADE_COMMAND;
+    }
+
+    /// Carries the wait record the attempt wrote (REQ-LOCALRUN-127).
+    pub fn set_wait(&mut self, wait: super::wait::WaitRecord) {
+        self.wait = Some(wait);
     }
 }
 
@@ -1471,9 +1556,11 @@ pub(crate) enum FailureCodeV1 {
     CommandLaunchPermissionDenied,
     CommandLaunchInvalidInput,
     CommandLaunchFailed,
+    ChildAdmissionRejected,
     CommandExit,
     CommandWaitFailed,
     ExecutionTaskUnavailable,
+    ChildRunInterrupted,
     OutputUnsupported,
     CaptureTaskUnavailable,
     OutputPathAbsolute,
@@ -1488,6 +1575,7 @@ pub(crate) enum FailureCodeV1 {
     OutputInvalidJson,
     OutputDuplicateJsonMember,
     OutputJsonSchemaMismatch,
+    OutcomeUndeclared,
     CapturedFileCountLimit,
     CapturedFileSizeLimit,
     CapturedTotalSizeLimit,
@@ -2378,6 +2466,7 @@ fn publish_prepared_with_observer(
         attempt_number: run.attempt_number,
         result_directory: target.normalized.clone(),
         result,
+        wait: None,
     };
     Ok(terminal)
 }
@@ -2884,6 +2973,8 @@ fn build_result_with_provenance(
             (WorkflowOutcomeV1::Failed, Some(primary_issue.clone()))
         }
         RunOutcome::Cancelled { .. } => (WorkflowOutcomeV1::Cancelled, None),
+        RunOutcome::Waiting { .. } => (WorkflowOutcomeV1::Waiting, None),
+        RunOutcome::Continued { .. } => (WorkflowOutcomeV1::Continued, None),
     };
     let cancellation = run
         .cancellation
@@ -3111,7 +3202,7 @@ fn step_v1(step: &WorkflowRunStep) -> Result<WorkflowStepV1, LocalPublicationErr
         .map(command_output_v1)
         .transpose()?;
 
-    if step.kind == WorkflowRunStepKind::Agent && command_output.is_some() {
+    if step.kind != WorkflowRunStepKind::Command && command_output.is_some() {
         return Err(invalid_run_result(RunResultInvariant::StepMetadata));
     }
 
@@ -3121,6 +3212,7 @@ fn step_v1(step: &WorkflowRunStep) -> Result<WorkflowStepV1, LocalPublicationErr
         kind: match step.kind {
             WorkflowRunStepKind::Command => "cmd",
             WorkflowRunStepKind::Agent => "agent",
+            WorkflowRunStepKind::Workflow => "workflow",
         }
         .to_owned(),
         failure_policy: step.failure_policy,
@@ -3533,6 +3625,9 @@ fn start_failure_cause(
             CommandLaunchFailure::InvalidInput => FailureCodeV1::CommandLaunchInvalidInput,
             CommandLaunchFailure::Other(_) => FailureCodeV1::CommandLaunchFailed,
         }),
+        StepStartFailure::ChildAdmission { .. } => {
+            FailureCauseV1::code(FailureCodeV1::ChildAdmissionRejected)
+        }
     };
     Ok(cause)
 }
@@ -3613,6 +3708,9 @@ fn execution_failure_cause(failure: &StepExecutionFailure) -> FailureCauseV1 {
         StepExecutionFailure::TaskUnavailable => {
             FailureCauseV1::code(FailureCodeV1::ExecutionTaskUnavailable)
         }
+        StepExecutionFailure::ChildInterrupted => {
+            FailureCauseV1::code(FailureCodeV1::ChildRunInterrupted)
+        }
     }
 }
 
@@ -3626,6 +3724,11 @@ fn output_capture_failure_cause(failure: &OutputCaptureFailure) -> FailureCauseV
         }
         OutputCaptureFailure::TaskUnavailable => {
             FailureCauseV1::code(FailureCodeV1::CaptureTaskUnavailable)
+        }
+        OutputCaptureFailure::OutcomeUndeclared { output } => {
+            let mut cause = FailureCauseV1::code(FailureCodeV1::OutcomeUndeclared);
+            cause.output = Some(output.clone());
+            cause
         }
         OutputCaptureFailure::Capture(failure) => {
             let code = match failure.kind() {
@@ -3808,7 +3911,11 @@ fn execution_outcome(run: &WorkflowRunResult, outcome: WorkflowOutcomeV1) -> Exe
         return ExecutionOutcome::Failed;
     }
     match outcome {
-        WorkflowOutcomeV1::Succeeded => ExecutionOutcome::Succeeded,
+        // A wait or a continuing edge exits 0 like a success (REQ-WFEXEC-40); the chained
+        // attempt's result decides the command's exit (REQ-WFEXEC-64).
+        WorkflowOutcomeV1::Succeeded
+        | WorkflowOutcomeV1::Waiting
+        | WorkflowOutcomeV1::Continued => ExecutionOutcome::Succeeded,
         WorkflowOutcomeV1::Failed => ExecutionOutcome::Failed,
         WorkflowOutcomeV1::Cancelled => match &run.outcome {
             RunOutcome::Cancelled {
@@ -3825,7 +3932,9 @@ fn execution_outcome(run: &WorkflowRunResult, outcome: WorkflowOutcomeV1) -> Exe
                     | CancellationReason::ForceAbort,
             }
             | RunOutcome::Succeeded
-            | RunOutcome::Failed { .. } => ExecutionOutcome::Failed,
+            | RunOutcome::Failed { .. }
+            | RunOutcome::Waiting { .. }
+            | RunOutcome::Continued { .. } => ExecutionOutcome::Failed,
         },
     }
 }

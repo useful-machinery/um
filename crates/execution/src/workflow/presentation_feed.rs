@@ -113,6 +113,13 @@ pub(crate) enum WorkflowPresentationStep {
         direct_dependencies: Vec<String>,
         outputs: BTreeMap<String, Output>,
     },
+    /// A step that runs the tree-relative workflow `file` as a child run (REQ-WFEXEC-60).
+    Workflow {
+        file: String,
+        failure_policy: FailurePolicy,
+        direct_dependencies: Vec<String>,
+        outputs: BTreeMap<String, Output>,
+    },
 }
 
 impl WorkflowPresentationStep {
@@ -125,21 +132,27 @@ impl WorkflowPresentationStep {
             | Self::Agent {
                 direct_dependencies,
                 ..
+            }
+            | Self::Workflow {
+                direct_dependencies,
+                ..
             } => direct_dependencies,
         }
     }
 
     pub(crate) fn failure_policy(&self) -> FailurePolicy {
         match self {
-            Self::Command { failure_policy, .. } | Self::Agent { failure_policy, .. } => {
-                *failure_policy
-            }
+            Self::Command { failure_policy, .. }
+            | Self::Agent { failure_policy, .. }
+            | Self::Workflow { failure_policy, .. } => *failure_policy,
         }
     }
 
     pub(crate) fn outputs(&self) -> &BTreeMap<String, Output> {
         match self {
-            Self::Command { outputs, .. } | Self::Agent { outputs, .. } => outputs,
+            Self::Command { outputs, .. }
+            | Self::Agent { outputs, .. }
+            | Self::Workflow { outputs, .. } => outputs,
         }
     }
 }
@@ -239,6 +252,17 @@ fn presentation_step(step: &ValidatedStep) -> WorkflowPresentationStep {
                 outputs: presentation_outputs(&agent.common.outputs),
             }
         }
+        ValidatedStep::Workflow(workflow) => WorkflowPresentationStep::Workflow {
+            file: workflow.workflow.clone(),
+            failure_policy: workflow.common.failure_policy,
+            direct_dependencies: workflow
+                .common
+                .prerequisites
+                .iter()
+                .map(|prerequisite| prerequisite.producer.clone())
+                .collect(),
+            outputs: presentation_outputs(&workflow.common.outputs),
+        },
     }
 }
 

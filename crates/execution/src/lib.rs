@@ -68,8 +68,14 @@ pub use workflow::continuation::{
     AdmissionViolation as ContinuationAdmissionViolation, PriorState as ContinuationPriorState,
 };
 pub use workflow::coordinator::{CoordinationError, CoordinatorClock};
+pub use workflow::definition_store::{
+    BindingsFile, BindingsSnapshot, BoundBinding, DefinitionError, DefinitionRecord, EnabledChange,
+    PublishTarget, Published, RevisionRecord, StoredDefinition, WorkflowHome, list_definitions,
+    publish, read_current_bindings, read_definition, read_revision_bindings, set_enabled,
+};
 pub use workflow::diagnostic::StepDiagnosticLog;
 pub use workflow::diagnostic::{CapturedDiagnosticStream, StepDiagnostic};
+pub use workflow::document::BindingKind;
 pub use workflow::document::FailurePolicy;
 pub use workflow::document::FinalizationTrigger;
 pub use workflow::evidence::{BlockedDetail, Prerequisite};
@@ -77,19 +83,25 @@ pub use workflow::evidence::{
     FailureDetail, InheritedDetail, InheritedPriorState, NodeDetail, PrimaryIssue,
 };
 pub use workflow::execution::{
-    CloudStepCommitPort, NoopCommitPort, WorkflowExecutionResult, execute_workflow,
+    CloudStepCommitPort, NoopCommitPort, WorkflowExecutionResult, chosen_outcome, execute_workflow,
+    execute_workflow_with_children, failure_outcome,
 };
 pub use workflow::git_capture::CloudGitCaptureProjection;
 pub use workflow::input::InputStaging;
 pub use workflow::invocation_accounting::InvocationAccountingLog;
 pub use workflow::local_run::{
-    DurableDeadline, DurableInvocationStateV1, DurableInvocationV1, InitialLocalRun,
-    LocalAttemptOwner, LocalAttemptOwnershipReleased, LocalContinuationOpen, LocalRecoveryStatus,
-    LocalRetryBeginError, LocalRetryEligibility, LocalRetryOpen, LocalRetryRejection,
-    LocalRunStatusSnapshot, LocalStatusError, LocalStatusResult, PendingLocalContinuation,
-    PublicationFailurePhaseV1, RetryIneligibilityReason, acquire_local_continuation,
-    acquire_local_retry, bind_cloud_continuation_context, load_cloud_continuation_seed,
-    read_local_run_status, retain_cloud_continuation_evidence, retain_cloud_workflow_evidence,
+    AttemptControls, CANCELED_OUTCOME, CarryMiss, ChildRun, ChildRunParent,
+    ContinuationDefinitionMode, DurableDeadline, DurableInvocationStateV1, DurableInvocationV1,
+    InitialLocalRun, ListedRun, LocalAttemptOwner, LocalAttemptOwnershipReleased,
+    LocalContinuationOpen, LocalRecoveryStatus, LocalRetryBeginError, LocalRetryEligibility,
+    LocalRetryOpen, LocalRetryRejection, LocalRunStatusSnapshot, LocalStatusError,
+    LocalStatusResult, PendingLocalContinuation, PublicationFailurePhaseV1, ResolvedBy,
+    RetryIneligibilityReason, RunListing, SUPERSEDED_OUTCOME, SuccessorCarry, WITHDRAWN_OUTCOME,
+    WaitInspection, WaitProbe, acquire_local_continuation, acquire_local_retry, attempt_controls,
+    await_run_lock_gate, bind_cloud_continuation_context, child_runs, inspect_wait, is_run_id,
+    latest_child_run, list_runs, load_cloud_continuation_seed, locate_run, lock_holder,
+    positioned_element, read_local_run_status, retain_cloud_continuation_evidence,
+    retain_cloud_workflow_evidence,
 };
 pub use workflow::observation::{
     ExecutionObservation, ExecutionObserver, ExecutionSettlement, ObservedExecutions,
@@ -103,8 +115,8 @@ pub use workflow::presentation::{
     ColorChoice, PresentationConfig, PresentationFailure, PresentationFailureOperation,
     PresentationMode, PublicationPresentation, RequestedPresentationMode, SystemObservationClock,
     TerminalCapabilities, WorkflowRunOutput, WorkflowRunPresentation,
-    WorkflowRunPresentationResult, styled_terminal_text, visible_text,
-    write_untested_harness_advisories,
+    WorkflowRunPresentationResult, styled_terminal_text, superseded_rejection_message,
+    visible_text, write_untested_harness_advisories,
 };
 pub use workflow::presentation_feed::{DisplayDeadline, normalize_terminal_scalar};
 pub use workflow::process_group::{
@@ -134,6 +146,7 @@ pub use workflow::result_validation::{
     internal_worker_requested as result_validation_worker_requested,
     run_internal_worker as run_result_validation_worker,
 };
+pub use workflow::run_record::{RunParent, RunState, WorkflowRunRecord};
 pub use workflow::run_timing::ObservationTime;
 pub use workflow::run_timing::{ObservationClock, RunTimingObservation, RunTimingSnapshot};
 pub use workflow::run_view_model::{
@@ -141,16 +154,20 @@ pub use workflow::run_view_model::{
 };
 pub use workflow::runtime::ExportValue;
 pub use workflow::runtime::{
-    ActionId, ActiveStepInvocation, ExecutionSeed, FinalizationGate, FinalizationSummary,
-    FinalizerResult, ForceAbortEvidence, InheritedDisposition, OutputProducer,
+    ActionId, ActiveStepInvocation, EnteredWait, ExecutionSeed, FinalizationGate,
+    FinalizationSummary, FinalizerResult, ForceAbortEvidence, InheritedDisposition, OutputProducer,
     RecoveryDecisionKind, RecoveryHandlerActivity, RecoveryHandlerKind, RunOutcome, SchedulingGate,
-    StepRecoveryState, StepState, StepStateKind, TransitionEvent, TransitionSequence,
-    WorkflowState,
+    StepRecoveryState, StepState, StepStateKind, TakenEdgeRecord, TransitionEvent,
+    TransitionSequence, WorkflowState,
 };
 pub use workflow::runtime::{RecoveryRoundNumber, TargetExecutionNumber};
 pub use workflow::step_runtime::spawn_isolated_command_launch;
 pub use workflow::step_runtime::{
     AgentExecution, RecoveryFailureKind, StepFailureCause, StepFailureKind, WorkflowExecutionStart,
+};
+pub use workflow::subject_index::{
+    SlotHolder, SubjectClaim, SubjectError, check as check_subject, claim as claim_subject,
+    is_subject, slot as subject_slot,
 };
 pub use workflow::terminal_host::archived::{
     ArchivedTerminalHostExit, ArchivedWorkflowTerminalHost,
@@ -160,9 +177,17 @@ pub use workflow::terminal_host::{
     TerminalLifecycleEvent, TerminalRect, WorkflowTerminalBoundary, WorkflowTerminalHost,
 };
 pub use workflow::validated::{
-    ValidatedHarness, ValidatedRecoveryHandler, ValidatedStep, WorkflowNodeRole, WorkflowValueType,
+    Scheduling, ValidatedHarness, ValidatedRecoveryHandler, ValidatedStep, WorkflowNodeRole,
+    WorkflowValueType,
 };
 pub use workflow::value::CapturedValue;
+pub use workflow::wait::{
+    CONTROL_ANSWER, CONTROL_APPROVE, CONTROL_CANCEL, CONTROL_HAND_BACK, CONTROL_LIFT,
+    CONTROL_RELEASE, CONTROL_RETRY, CONTROL_STOP, CONTROL_WITHDRAW, ConditionError,
+    ConditionSource, ControlEvent, Event, ExternalEvent, NoConditions, RuleError, WaitKind,
+    WaitRecord, WaitRule, append_control, evaluate, event_literal, position_path, read_controls,
+    read_numbered_controls, stop_in_force, wait_payload,
+};
 pub use workflow::workspace_snapshot::{
     CloudContinuationSnapshot, capture_cloud_continuation_snapshot,
     capture_cloud_settlement_snapshot,
@@ -170,6 +195,16 @@ pub use workflow::workspace_snapshot::{
 pub use workflow::{
     MAXIMUM_PARALLEL_STEPS, STRUCTURAL_SCHEMA, is_input_name, is_lowercase_hex,
     is_valid_input_display_name, is_valid_media_type, lowercase_hex,
+};
+pub use workflow::{
+    Mirror, MirrorAction, MirrorBlock, MirrorFailure, MirrorGuard, MirrorGuardError,
+    MirrorGuardOperator, MirrorHook, MirrorSkipReason, MirrorState, MirrorTarget, MirrorWrite,
+    MirrorWriteOutcome, Template, TemplateError, TemplateSegment, hook_variables,
+    read_mirror_writes, read_numbered_mirror_writes,
+};
+pub use workflow::{
+    TreeDiagnostic, TreeFile, TreeLocation, TreeTriggerKind, ValidatedTree, is_workflow_tree,
+    validate_workflow_tree,
 };
 
 pub use claude_code::ClaudeCodeCapability;
@@ -182,6 +217,7 @@ pub use workflow::ClaudeCodeConfig;
 pub use workflow::PiConfig;
 pub use workflow::admission::AdmittedExecutionContext;
 pub use workflow::admission::AdmittedHarness;
+pub use workflow::admission::AdmittedTree;
 pub use workflow::admission::AdmittedWorkflowCapacity;
 pub use workflow::admission::ExecutionLimits;
 pub use workflow::admission::ExecutionPolicyLimits;
@@ -197,6 +233,7 @@ pub use workflow::archived_attempt::ArchivedAttemptOperationalErrorCode;
 pub use workflow::archived_attempt::LoadedLocalArchivedAttempt;
 pub use workflow::archived_attempt::LocalArchivedAttempt;
 pub use workflow::archived_attempt::ProjectionInvariant;
+pub use workflow::archived_attempt::adopted_child_outcome;
 pub use workflow::archived_presentation::ArchivedViewOutputFailure;
 pub use workflow::artifact::ArtifactReadFailure;
 pub use workflow::artifact::ArtifactReleaseFailure;
@@ -228,6 +265,7 @@ pub use workflow::publication::CommandOutputV1;
 pub use workflow::publication::PreparedResultDestination;
 pub use workflow::publication::StepRecoverySummaryV1;
 pub use workflow::publication::WorkflowStepV1;
+pub use workflow::publication::{ContinuationEdgeV1, ContinuationReasonV1};
 pub use workflow::rejection::RejectionLocation;
 pub use workflow::resolution::ContentDigestAlgorithm;
 pub use workflow::resolution::WorkflowContentDigest;
@@ -239,6 +277,10 @@ pub use workflow::run_view_model::WorkflowRunViewSnapshot;
 pub use workflow::runtime::FinalizationCancellation;
 pub use workflow::runtime::RunCancellationPhase;
 pub use workflow::step_runtime::NoAgentDispatcher;
+pub use workflow::step_runtime::{
+    ChildInputValue, ChildRunControl, ChildRunDispatcher, ChildRunOutcome, ChildRunRequest,
+    ChildRunStarted, ChildRuns, ControlContext, NoChildRunDispatcher,
+};
 pub use workflow::terminal_host::archived::ArchivedTerminalExitRequest;
 pub use workflow::validated::ResolvedOutputSource;
 pub use workflow::validated::ValidatedAgent;

@@ -367,6 +367,35 @@ fn cancellation_source_rearms_graceful_cancellation_and_authorizes_one_force_abo
     );
 }
 
+// REQ-WFEXEC-59: a child run's source answers a force abort that follows a graceful
+// cancellation, which its graceful reason alone cannot show.
+#[tokio::test]
+async fn a_force_abort_after_a_graceful_cancellation_wakes_a_force_abort_waiter() {
+    crate::workflow::test_support::host_scaled_watchdog(
+        "a_force_abort_after_a_graceful_cancellation_wakes_a_force_abort_waiter",
+        Duration::from_secs(10),
+        async {
+            let source = CancellationSource::new();
+            assert!(source.request_cancellation(CancellationReason::UserRequest));
+            let mut force_abort = std::pin::pin!(source.wait_for_force_abort());
+            assert!(
+                poll_fn(|context| {
+                    std::task::Poll::Ready(force_abort.as_mut().poll(context).is_pending())
+                })
+                .await
+            );
+
+            assert!(source.request_force_abort());
+            force_abort.await;
+            assert_eq!(
+                source.wait_for_cancellation().await,
+                CancellationReason::UserRequest
+            );
+        },
+    )
+    .await;
+}
+
 #[test]
 fn admission_partitions_durable_stream_bytes_before_capture() {
     let mut source = String::from("schemaVersion: 1\nsteps:\n");
@@ -1634,6 +1663,162 @@ fn cloud_source_revision_replaces_inherited_reserved_values_while_local_has_none
     );
 }
 
+const REQUIRED_TOOL: &str = "no-such-tool-for-um-tests";
+
+fn tree_root_workflow(programs: &str) -> String {
+    format!(
+        "schemaVersion: 1\nprograms: {programs}\nrequires:\n  tools: [{REQUIRED_TOOL}]\nsteps:\n  check:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n"
+    )
+}
+
+fn write_program(path: &Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt as _;
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(path, "#!/bin/sh\nexit 0\n").unwrap();
+    fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+}
+
+fn validated_tree(root: &Path) -> crate::workflow::ValidatedTree {
+    crate::workflow::validate_workflow_tree(root)
+        .unwrap_or_else(|diagnostics| panic!("tree should be valid: {diagnostics:?}"))
+}
+
+fn environment_variable<'a>(admitted: &'a AdmittedWorkflow, name: &str) -> Option<&'a OsStr> {
+    admitted
+        .execution()
+        .environment()
+        .variable(OsStr::new(name))
+}
+
+// REQ-WFEXEC-55
+#[test]
+fn a_tree_run_rejects_a_missing_required_tool_by_name() {
+    let fixture = WorkflowFixture::new(&tree_root_workflow("[bin]"));
+    let tool = fixture.source_root.join("bin").join(REQUIRED_TOOL);
+    // Present but not executable: the lookup skips it as REQ-WFEXEC-20 does.
+    write_program(&tool, 0o644);
+    let admit = |environment: EnvironmentSnapshot| {
+        admit_local_workflow(
+            fixture.resolve(),
+            ResolvedInputs::default(),
+            ExecutionContext::new(
+                fixture.execution_root.clone(),
+                default_execution_policy_limits(1),
+                environment,
+                CancellationPolicy::new(CancellationSource::new(), Duration::from_secs(1)),
+            )
+            .with_tree(validated_tree(&fixture.source_root)),
+        )
+    };
+    assert_failure(
+        admit(EnvironmentSnapshot::default()),
+        AdmissionFailureKind::RequiredToolUnavailable,
+        AdmissionLocation::RequiredTool {
+            name: REQUIRED_TOOL.to_owned(),
+        },
+    );
+
+    let host = tempfile::tempdir().unwrap();
+    write_program(&host.path().join(REQUIRED_TOOL), 0o755);
+    admit(EnvironmentSnapshot::new([("PATH", host.path())]))
+        .expect("a tool on the launching PATH admits");
+
+    write_program(&tool, 0o755);
+    let admitted =
+        admit(EnvironmentSnapshot::default()).expect("a tool under a programs directory admits");
+    assert_eq!(
+        admitted.tree().map(AdmittedTree::required_tools),
+        Some(&[REQUIRED_TOOL.to_owned()][..])
+    );
+}
+
+// REQ-WFEXEC-53
+#[test]
+fn a_bound_tree_copy_leads_path_and_sets_um_workflow_root() {
+    let fixture = WorkflowFixture::new(&tree_root_workflow("[bin, scripts]"));
+    write_program(&fixture.source_root.join("bin").join(REQUIRED_TOOL), 0o755);
+    write_program(&fixture.source_root.join("scripts/report"), 0o755);
+    let tree = validated_tree(&fixture.source_root);
+    let context = ExecutionContext::new(
+        fixture.execution_root.clone(),
+        default_execution_policy_limits(1),
+        EnvironmentSnapshot::new([("PATH", "/usr/bin:/bin")]),
+        CancellationPolicy::new(CancellationSource::new(), Duration::from_secs(1)),
+    );
+
+    let without_tree = admit_local_workflow(
+        fixture.resolve(),
+        ResolvedInputs::default(),
+        context.clone(),
+    )
+    .unwrap();
+    assert!(without_tree.tree().is_none());
+    assert_eq!(
+        environment_variable(&without_tree, "PATH"),
+        Some(OsStr::new("/usr/bin:/bin"))
+    );
+    assert!(environment_variable(&without_tree, "UM_WORKFLOW_ROOT").is_none());
+
+    let admitted = admit_local_workflow(
+        fixture.resolve(),
+        ResolvedInputs::default(),
+        context.with_tree(tree.clone()),
+    )
+    .unwrap();
+    let admitted_tree = admitted.tree().expect("admission records the tree");
+    assert_eq!(admitted_tree.root(), tree.root);
+    assert_eq!(admitted_tree.digest(), &tree.digest);
+    assert_eq!(admitted_tree.programs(), ["bin", "scripts"]);
+    assert_eq!(admitted_tree.files(), &tree.files);
+
+    let copy = fixture.execution_root.join("run/workflow/tree");
+    let bound = admitted.with_tree_copy(&copy).unwrap();
+    let mut expected = copy.join("bin").into_os_string();
+    expected.push(":");
+    expected.push(copy.join("scripts"));
+    expected.push(":/usr/bin:/bin");
+    assert_eq!(environment_variable(&bound, "PATH"), Some(&*expected));
+    assert_eq!(
+        environment_variable(&bound, "UM_WORKFLOW_ROOT"),
+        Some(copy.as_os_str())
+    );
+}
+
+// REQ-WFEXEC-22
+#[test]
+fn a_launching_um_workflow_root_never_reaches_a_step() {
+    let fixture = WorkflowFixture::new(&tree_root_workflow("[bin]"));
+    write_program(&fixture.source_root.join("bin").join(REQUIRED_TOOL), 0o755);
+    let context = ExecutionContext::new(
+        fixture.execution_root.clone(),
+        default_execution_policy_limits(1),
+        EnvironmentSnapshot::new([("PATH", "/bin"), ("UM_WORKFLOW_ROOT", "/launching/tree")]),
+        CancellationPolicy::new(CancellationSource::new(), Duration::from_secs(1)),
+    );
+
+    let without_tree = admit_local_workflow(
+        fixture.resolve(),
+        ResolvedInputs::default(),
+        context.clone(),
+    )
+    .unwrap();
+    assert!(environment_variable(&without_tree, "UM_WORKFLOW_ROOT").is_none());
+
+    let admitted = admit_local_workflow(
+        fixture.resolve(),
+        ResolvedInputs::default(),
+        context.with_tree(validated_tree(&fixture.source_root)),
+    )
+    .unwrap();
+    assert!(environment_variable(&admitted, "UM_WORKFLOW_ROOT").is_none());
+    let copy = fixture.execution_root.join("copy");
+    let bound = admitted.with_tree_copy(&copy).unwrap();
+    assert_eq!(
+        environment_variable(&bound, "UM_WORKFLOW_ROOT"),
+        Some(copy.as_os_str())
+    );
+}
+
 // REQ-WFFORMAT-33
 #[test]
 fn direct_commit_selection_omits_workspace_branch_but_retains_definition_provenance() {
@@ -1764,7 +1949,7 @@ fn assert_failure(
 // REQ-OUTPUTS-13
 #[test]
 fn default_policy_admits_the_capture_and_agent_payload_limits() {
-    // The default policy is what `um workflow run` and the runner hand to admission.
+    // The default policy is what `um workflow run create` and the runner hand to admission.
     let fixture = WorkflowFixture::new(AGENT_WORKFLOW);
     let admitted = admit_workflow(
         fixture.resolve(),
@@ -1796,4 +1981,169 @@ fn default_policy_admits_the_capture_and_agent_payload_limits() {
         8 * 1024 * 1024
     );
     assert_eq!(agent.limits().maximum_result_bytes().get(), 8 * 1024 * 1024);
+}
+
+const CHILD_STEP_WORKFLOW: &str = "schemaVersion: 1
+outcomes: [landed, failed]
+steps:
+  design:
+    kind: workflow
+    workflow: design.yaml
+    on:
+      planned: exit.landed
+      failed: exit.failed
+";
+
+const WAITING_CHILD_STEP_WORKFLOW: &str = "schemaVersion: 1
+outcomes: [landed, failed]
+steps:
+  design:
+    kind: workflow
+    workflow: design.yaml
+    on:
+      planned: exit.landed
+      failed:
+        wait: external
+        then: exit.failed
+        rule:
+          source: github
+          event: pull_request.queue_settled
+          where: 'event.state == \"merged\"'
+";
+
+const CHILD_DESIGN_WORKFLOW: &str = "schemaVersion: 1
+outcomes: [planned, failed]
+outcome:
+  from: outputs.decide.verdict
+  onFailure: failed
+steps:
+  decide:
+    kind: cmd
+    command:
+      argv: [\"true\"]
+    outputs:
+      verdict:
+        kind: text
+        from: path
+        path: verdict.txt
+";
+
+fn child_step_fixture(source: &str) -> WorkflowFixture {
+    let fixture = WorkflowFixture::new(source);
+    fs::write(
+        fixture.source_root.join("design.yaml"),
+        CHILD_DESIGN_WORKFLOW,
+    )
+    .unwrap();
+    fixture
+}
+
+fn design_step() -> AdmissionLocation {
+    AdmissionLocation::Step {
+        step: "design".to_owned(),
+    }
+}
+
+// REQ-WFEXEC-59: a local run of a workflow with `workflow` steps comes from a tree, and
+// Cloud runs none.
+#[test]
+fn workflow_steps_need_a_tree_locally_and_are_refused_by_runner_admission() {
+    let fixture = child_step_fixture(CHILD_STEP_WORKFLOW);
+    let context = || fixture.context(1, Duration::from_secs(1));
+    assert_failure(
+        admit_local_workflow(fixture.resolve(), ResolvedInputs::default(), context()),
+        AdmissionFailureKind::WorkflowStepRequiresTree,
+        design_step(),
+    );
+    let tree = super::super::tree::validate_workflow_tree(&fixture.source_root).unwrap();
+    assert!(
+        admit_local_workflow(
+            fixture.resolve(),
+            ResolvedInputs::default(),
+            context().with_tree(tree),
+        )
+        .is_ok()
+    );
+    assert_failure(
+        admit_runner_workflow(fixture.resolve(), ResolvedInputs::default(), context()),
+        AdmissionFailureKind::WorkflowStepUnsupported,
+        design_step(),
+    );
+}
+
+// REQ-WFEXEC-59, REQ-WFFORMAT-92: an edge whose target is a wait is refused at admission.
+#[test]
+fn an_edge_to_a_wait_is_refused_at_admission() {
+    let fixture = child_step_fixture(WAITING_CHILD_STEP_WORKFLOW);
+    let tree = super::super::tree::validate_workflow_tree(&fixture.source_root).unwrap();
+    assert_failure(
+        admit_local_workflow(
+            fixture.resolve(),
+            ResolvedInputs::default(),
+            fixture.context(1, Duration::from_secs(1)).with_tree(tree),
+        ),
+        AdmissionFailureKind::WaitTargetUnsupported,
+        design_step(),
+    );
+}
+
+// REQ-WFEXEC-59: a local wait continues at a step, so an `answer`, `approval`, `repair` or
+// `stop` wait whose `then` is an exit is refused; the same wait continuing at its own step
+// admits (REQ-WFFORMAT-92).
+#[test]
+fn a_wait_that_continues_at_an_exit_is_refused_at_admission() {
+    let admit = |then: &str| {
+        let fixture = child_step_fixture(
+            &WAITING_CHILD_STEP_WORKFLOW
+                .replace("wait: external", "wait: repair")
+                .split("        rule:\n")
+                .next()
+                .unwrap()
+                .replace("then: exit.failed", &format!("then: {then}")),
+        );
+        let tree = super::super::tree::validate_workflow_tree(&fixture.source_root).unwrap();
+        admit_local_workflow(
+            fixture.resolve(),
+            ResolvedInputs::default(),
+            fixture.context(1, Duration::from_secs(1)).with_tree(tree),
+        )
+    };
+    assert_failure(
+        admit("exit.failed"),
+        AdmissionFailureKind::WaitTargetUnsupported,
+        design_step(),
+    );
+    assert!(admit("design").is_ok());
+}
+
+// REQ-WFEXEC-59, REQ-WFEXEC-65: an `external` wait admits when the caller's condition
+// sources evaluate its rule's `source` and `event`, and is refused at the step otherwise.
+#[test]
+fn an_external_wait_admits_only_on_a_supported_condition() {
+    let external = WAITING_CHILD_STEP_WORKFLOW.replace("then: exit.failed", "then: design");
+    let admit = |workflow: &str, conditions: &[(&str, &str)]| {
+        let fixture = child_step_fixture(workflow);
+        let tree = super::super::tree::validate_workflow_tree(&fixture.source_root).unwrap();
+        admit_local_workflow(
+            fixture.resolve(),
+            ResolvedInputs::default(),
+            fixture
+                .context(1, Duration::from_secs(1))
+                .with_tree(tree)
+                .with_conditions(conditions.iter().copied()),
+        )
+    };
+    let queue_settled = ("github", "pull_request.queue_settled");
+    assert!(admit(&external, &[queue_settled]).is_ok());
+    for conditions in [
+        &[][..],
+        &[("github", "issue.closed")],
+        &[("gitlab", queue_settled.1)],
+    ] {
+        assert_failure(
+            admit(&external, conditions),
+            AdmissionFailureKind::WaitConditionUnsupported,
+            design_step(),
+        );
+    }
 }

@@ -125,10 +125,7 @@ pub(crate) fn resolve_workflow_capacity(
                 .values()
                 .map(|finalizer| &finalizer.body),
         )
-        .filter(|step| match step {
-            super::validated::ValidatedStep::Command(step) => step.common.condition.is_some(),
-            super::validated::ValidatedStep::Agent(step) => step.common.condition.is_some(),
-        })
+        .filter(|step| step.common().condition.is_some())
         .count();
     if conditional_nodes != 0 {
         let evidence = calculate_condition_evidence_capacity(source_closure_bytes)

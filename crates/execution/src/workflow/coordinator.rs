@@ -194,6 +194,10 @@ where
             digest.write_tag(10);
             write_step_action(&mut digest, step, *action);
         }
+        Occurrence::StopEntered { step, action } => {
+            digest.write_tag(11);
+            write_step_action(&mut digest, step, *action);
+        }
         Occurrence::CancellationOperationRequested { deadline, .. }
         | Occurrence::OrdinaryCancellationOperationRequested { deadline, .. }
         | Occurrence::ForceAbortRequested { deadline, .. } => match *deadline {},
@@ -348,6 +352,10 @@ where
     pub(crate) fn step_quiesced(step: String, action: ActionId) -> Self {
         Self::new(Occurrence::StepQuiesced { step, action })
     }
+
+    pub(crate) fn stop_entered(step: String, action: ActionId) -> Self {
+        Self::new(Occurrence::StopEntered { step, action })
+    }
 }
 
 impl<Provisional, Cause, Output> DriverOccurrence<Provisional, Cause, Output> {
@@ -446,6 +454,7 @@ impl<Provisional, Cause, Output> DriverOccurrence<Provisional, Cause, Output> {
                 cause,
             },
             Occurrence::StepQuiesced { step, action } => Occurrence::StepQuiesced { step, action },
+            Occurrence::StopEntered { step, action } => Occurrence::StopEntered { step, action },
             Occurrence::CancellationOperationRequested {
                 operation: _,
                 deadline,
@@ -477,6 +486,7 @@ enum DriverOccurrenceKind {
     RecoveryHandlerCompleted,
     RecoveryHandlerExecutionFailed,
     StepQuiesced,
+    StopEntered,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -529,6 +539,9 @@ impl<Provisional, Cause, Output> DriverOccurrence<Provisional, Cause, Output> {
             ),
             Occurrence::StepQuiesced { action, .. } => {
                 (*action, DriverOccurrenceKind::StepQuiesced, None)
+            }
+            Occurrence::StopEntered { action, .. } => {
+                (*action, DriverOccurrenceKind::StopEntered, None)
             }
             Occurrence::CancellationOperationRequested { deadline, .. }
             | Occurrence::OrdinaryCancellationOperationRequested { deadline, .. }
@@ -1280,6 +1293,8 @@ where
             WorkflowState::Succeeded
                 | WorkflowState::Failed { .. }
                 | WorkflowState::Cancelled { .. }
+                | WorkflowState::Waiting { .. }
+                | WorkflowState::Continued { .. }
         );
         let entered_finalization = events.iter().any(|event| match event {
             TransitionEvent::Workflow { to, .. } => {

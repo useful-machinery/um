@@ -1,0 +1,39 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://docs.usefulmachinery.com/schemas/workflow-run-control-v1.schema.json",
+  "title": "Useful Machinery Workflow Run Control Event V1",
+  "description": "One controls/NNNN-<name>.json event on source um that acts on a run. `wait` names the wait the control acts on as kind@since, present when the run waits on it and the control concerns that wait, whether or not the wait's rule resolves on it; `payload` carries the event's fields, such as a hand-back's notes, the answers, or a stop's before and reason.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["source", "event", "run", "by", "at"],
+  "properties": {
+    "source": { "const": "um" },
+    "event": {
+      "enum": [
+        "control.answer",
+        "control.approve",
+        "control.hand_back",
+        "control.retry",
+        "control.stop",
+        "control.lift",
+        "control.withdraw",
+        "control.cancel",
+        "control.release"
+      ]
+    },
+    "run": { "$ref": "#/$defs/RunId" },
+    "by": { "type": "string", "minLength": 1 },
+    "at": { "type": "string", "format": "date-time" },
+    "wait": {
+      "type": "string",
+      "pattern": "^(answer|approval|repair|stop|external|children)@\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(\\.\\d+)?(Z|[+-]\\d{2}:\\d{2})$"
+    },
+    "payload": { "type": "object" }
+  },
+  "$defs": {
+    "RunId": {
+      "type": "string",
+      "pattern": "^run_[0-7][0-9a-hjkmnp-tv-z]{25}$"
+    }
+  }
+}

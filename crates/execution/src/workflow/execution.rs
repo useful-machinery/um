@@ -16,11 +16,15 @@ use super::resolution::{WorkflowContentDigest, WorkflowSourceProvenance};
 use super::runtime::{
     ActionId, ActiveStepInvocation, ExportSet, OutputProducer, RecoveryTerminalDisposition,
     RunOutcome, RuntimeState, StepState, StepStateKind, TransitionEvent, WorkflowState,
+    step_outputs,
 };
 use super::step_runtime::{
-    AgentExecution, RecoveryFailureKind, StepFailureCause, StepFailureKind,
-    WorkflowAgentDispatcher, WorkflowCommitPort, WorkflowExecutionStart, execute_workflow_observed,
+    AgentExecution, ChildRunDispatcher, ChildRuns, NoChildRunDispatcher, RecoveryFailureKind,
+    StepFailureCause, StepFailureKind, WorkflowAgentDispatcher, WorkflowCommitPort,
+    WorkflowExecutionStart, execute_workflow_observed_with_children,
 };
+use super::validated::{Scheduling, ValidatedEdgeTarget, ValidatedStep, ValidatedWorkflow};
+use super::validation::CHILD_OUTCOME_OUTPUT;
 use super::value::CapturedValue;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -34,6 +38,92 @@ pub struct WorkflowExecutionResult<Deadline = ()> {
     pub exports: ExportSet<CapturedValue>,
     pub provenance: WorkflowSourceProvenance,
     pub content_digest: WorkflowContentDigest,
+}
+
+/// The outcome an attempt records on the run record (REQ-WFEXEC-57): `canceled` for a
+/// cancelled run; for a workflow that declares `outcome`, the text of its `from` output when
+/// the run succeeded and `onFailure` when it failed; for an edge-scheduled workflow the exit
+/// outcome its walk took when it succeeded and `failed` when it failed; otherwise
+/// `succeeded` or `failed`. A waiting or continued attempt chooses no outcome and the run
+/// record's stays null (REQ-WFEXEC-57), so callers do not ask for one; the call is logged and
+/// answered with the failure outcome.
+pub fn chosen_outcome<Deadline>(
+    workflow: &ValidatedWorkflow,
+    result: &WorkflowExecutionResult<Deadline>,
+) -> String {
+    let declared = match (&result.outcome, &workflow.outcome) {
+        (RunOutcome::Cancelled { .. }, _) => return "canceled".to_owned(),
+        (RunOutcome::Failed { .. }, _) => return failure_outcome(workflow).to_owned(),
+        (RunOutcome::Waiting { wait }, _) => {
+            tracing::error!(event = "chosen_outcome_waiting", step = %wait.step());
+            return failure_outcome(workflow).to_owned();
+        }
+        (RunOutcome::Continued { edge }, _) => {
+            tracing::error!(event = "chosen_outcome_continued", step = %edge.step);
+            return failure_outcome(workflow).to_owned();
+        }
+        (RunOutcome::Succeeded, _) if matches!(workflow.scheduling, Scheduling::Edges { .. }) => {
+            return exit_outcome(workflow, result)
+                .unwrap_or("failed")
+                .to_owned();
+        }
+        (RunOutcome::Succeeded, None) => return "succeeded".to_owned(),
+        (RunOutcome::Succeeded, Some(declared)) => declared,
+    };
+    let outputs = result
+        .steps
+        .get(&declared.source.node.id)
+        .and_then(step_outputs);
+    match outputs.and_then(|outputs| outputs.get(&declared.source.output)) {
+        Some(CapturedValue::Text(text)) => text.as_str().to_owned(),
+        // Validation and the capture-time check (INV-ENGINE-17) leave a succeeded run's
+        // source holding a declared text, so this is never reached; the exit still records
+        // a declared name.
+        _ => {
+            tracing::error!(
+                event = "chosen_outcome_source_unavailable",
+                source = %declared.source.reference(),
+            );
+            declared.on_failure.clone()
+        }
+    }
+}
+
+/// The exit an edge-scheduled walk took: the `exit.<name>` edge of the settled `workflow`
+/// step whose recorded outcome leads there (REQ-WFEXEC-58). A walk that ended without one
+/// (`edge_walk_unrouted`) has none.
+fn exit_outcome<'a, Deadline>(
+    workflow: &'a ValidatedWorkflow,
+    result: &WorkflowExecutionResult<Deadline>,
+) -> Option<&'a str> {
+    workflow.steps.iter().find_map(|(id, step)| {
+        let ValidatedStep::Workflow(step) = step else {
+            return None;
+        };
+        // An inherited step routes nothing (REQ-WFEXEC-58), so only a step that succeeded in
+        // this attempt can have taken the exit.
+        let StepState::Succeeded { outputs } = result.steps.get(id)? else {
+            return None;
+        };
+        let Some(CapturedValue::Text(outcome)) = outputs.get(CHILD_OUTCOME_OUTPUT) else {
+            return None;
+        };
+        match step.edges.get(outcome.as_str())? {
+            ValidatedEdgeTarget::Exit(name) => Some(name.as_str()),
+            ValidatedEdgeTarget::Step(_)
+            | ValidatedEdgeTarget::Limited { .. }
+            | ValidatedEdgeTarget::Wait { .. } => None,
+        }
+    })
+}
+
+/// The outcome an attempt that fails, or ends without a published result, records
+/// (REQ-WFEXEC-57): the declared `onFailure`, or `failed`.
+pub fn failure_outcome(workflow: &ValidatedWorkflow) -> &str {
+    workflow
+        .outcome
+        .as_ref()
+        .map_or("failed", |declared| declared.on_failure.as_str())
 }
 
 pub struct NoopCommitPort;
@@ -466,10 +556,51 @@ where
     Observer: ExecutionObserver<Clock::Instant>,
     Dispatcher: WorkflowAgentDispatcher<Clock::Instant, Observer>,
 {
+    execute_workflow_with_children(
+        admitted,
+        artifacts,
+        inputs,
+        diagnostics,
+        agents,
+        ChildRuns::<NoChildRunDispatcher>::Disabled,
+        clock,
+        commits,
+        observer,
+        start,
+    )
+    .await
+}
+
+/// `execute_workflow` running `workflow` steps through `children` (REQ-WFEXEC-59); with
+/// `ChildRuns::Disabled` a `workflow` step fails at `start` with `child_admission_rejected`.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the local adapter additionally supplies durable process-guard registration"
+)]
+pub async fn execute_workflow_with_children<Clock, Commits, Observer, Dispatcher, Children>(
+    admitted: AdmittedWorkflow,
+    artifacts: &ArtifactStaging,
+    inputs: &InputStaging,
+    diagnostics: &StepDiagnosticLog,
+    agents: AgentExecution<Dispatcher>,
+    children: ChildRuns<Children>,
+    clock: Clock,
+    commits: Commits,
+    observer: Observer,
+    start: impl Into<WorkflowExecutionStart>,
+) -> Result<WorkflowExecutionResult<Clock::Instant>, CoordinationError>
+where
+    Clock: CoordinatorClock,
+    Clock::Instant: Sync,
+    Commits: WorkflowCommitPort<Clock>,
+    Observer: ExecutionObserver<Clock::Instant>,
+    Dispatcher: WorkflowAgentDispatcher<Clock::Instant, Observer>,
+    Children: ChildRunDispatcher,
+{
     let provenance = admitted.workflow().source.clone();
     let content_digest = admitted.workflow().content_digest.clone();
     let start = start.into();
-    let coordinated = execute_workflow_observed(
+    let coordinated = execute_workflow_observed_with_children(
         admitted,
         artifacts,
         inputs,
@@ -481,6 +612,7 @@ where
         },
         observer,
         agents,
+        children,
         start,
     )
     .await?;
@@ -494,6 +626,8 @@ where
             later_cancellation,
         },
         WorkflowState::Cancelled { reason } => RunOutcome::Cancelled { reason },
+        WorkflowState::Waiting { wait } => RunOutcome::Waiting { wait },
+        WorkflowState::Continued { edge } => RunOutcome::Continued { edge },
         WorkflowState::Executing { .. } | WorkflowState::Finalizing { .. } => {
             return Err(CoordinationError::ReducerStateUnavailable);
         }

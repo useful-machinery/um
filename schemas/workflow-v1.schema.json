@@ -50,17 +50,25 @@
         {
           "type": "object",
           "additionalProperties": false,
-          "properties": { "kind": { "const": "text" } },
-          "required": ["kind"]
+          "properties": {
+            "kind": { "const": "text" },
+            "optional": { "const": true },
+            "default": { "type": "string" }
+          },
+          "required": ["kind"],
+          "not": { "required": ["optional", "default"] }
         },
         {
           "type": "object",
           "additionalProperties": false,
           "properties": {
             "kind": { "const": "json" },
-            "schema": { "$ref": "#/$defs/SourceRelativePath" }
+            "schema": { "$ref": "#/$defs/SourceRelativePath" },
+            "optional": { "const": true },
+            "default": {}
           },
-          "required": ["kind"]
+          "required": ["kind"],
+          "not": { "required": ["optional", "default"] }
         },
         {
           "type": "object",
@@ -74,7 +82,10 @@
         {
           "type": "object",
           "additionalProperties": false,
-          "properties": { "kind": { "const": "attachments" } },
+          "properties": {
+            "kind": { "const": "attachments" },
+            "optional": { "const": true }
+          },
           "required": ["kind"]
         }
       ]
@@ -86,6 +97,14 @@
       "additionalProperties": { "$ref": "#/$defs/InputDeclaration" }
     },
     "InputOrOutputReferenceString": {
+      "type": "string",
+      "pattern": "^inputs\\.[a-z][A-Za-z0-9]*$|^outputs\\.[a-z][A-Za-z0-9]*\\.[a-z][A-Za-z0-9]*$"
+    },
+    "WorkflowStepInputReferenceString": {
+      "type": "string",
+      "pattern": "^inputs\\.[a-z][A-Za-z0-9]*$|^outputs\\.[a-z][A-Za-z0-9]*\\.[a-z][A-Za-z0-9]*$|^wait\\.[a-z][A-Za-z0-9]*$|^controls\\.answers$|^item$|^item\\.[a-z][A-Za-z0-9]*$"
+    },
+    "ForEachReferenceString": {
       "type": "string",
       "pattern": "^inputs\\.[a-z][A-Za-z0-9]*$|^outputs\\.[a-z][A-Za-z0-9]*\\.[a-z][A-Za-z0-9]*$"
     },
@@ -316,6 +335,15 @@
       "required": ["ref"],
       "description": "A step-local value reference. An outputs reference creates a direct data prerequisite on its producer; an inputs reference creates no step prerequisite."
     },
+    "WorkflowStepInputReference": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "ref": { "$ref": "#/$defs/WorkflowStepInputReferenceString" }
+      },
+      "required": ["ref"],
+      "description": "A value mapped onto a child workflow input: a root input, an earlier step's output, wait.<field> of the control that resolved the wait leading to this step, controls.answers recorded for this step's questions, or, on a forEach step, item or item.<field> of the element the child runs for."
+    },
     "FinalizerValueReference": {
       "type": "object",
       "additionalProperties": false,
@@ -390,6 +418,11 @@
       "type": "object",
       "propertyNames": { "$ref": "#/$defs/Identifier" },
       "additionalProperties": { "$ref": "#/$defs/InputOrOutputReference" }
+    },
+    "WorkflowStepInputBindings": {
+      "type": "object",
+      "propertyNames": { "$ref": "#/$defs/Identifier" },
+      "additionalProperties": { "$ref": "#/$defs/WorkflowStepInputReference" }
     },
     "FinalizerInputBindings": {
       "type": "object",
@@ -720,10 +753,120 @@
       },
       "required": ["kind", "agent"]
     },
+    "EdgeTargetString": {
+      "type": "string",
+      "maxLength": 70,
+      "pattern": "^([a-z][A-Za-z0-9]*|exit\\.[a-z][a-z0-9_]*)$",
+      "description": "A step id, or exit.<outcome> naming one of the workflow's outcomes."
+    },
+    "WaitEventName": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*)+$"
+    },
+    "WaitRule": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "source": {
+          "type": "string",
+          "minLength": 1,
+          "description": "The provider whose condition resolves the wait; never um."
+        },
+        "event": {
+          "oneOf": [
+            { "$ref": "#/$defs/WaitEventName" },
+            {
+              "type": "array",
+              "minItems": 1,
+              "uniqueItems": true,
+              "items": { "$ref": "#/$defs/WaitEventName" }
+            }
+          ]
+        },
+        "where": {
+          "type": "string",
+          "minLength": 1,
+          "description": "A conjunction of equalities; inputs.<name> and outputs.<step>.<output> name the run's text values."
+        }
+      },
+      "required": ["source", "event", "where"],
+      "description": "The rule an external wait is resolved by."
+    },
+    "WaitTarget": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "wait": { "enum": ["answer", "approval", "repair", "external"] },
+        "then": { "$ref": "#/$defs/EdgeTargetString" },
+        "onHandBack": { "$ref": "#/$defs/Identifier" },
+        "rule": { "$ref": "#/$defs/WaitRule" }
+      },
+      "required": ["wait", "then"]
+    },
+    "LimitedTarget": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "then": { "$ref": "#/$defs/EdgeTargetString" },
+        "limit": { "type": "integer", "minimum": 1, "maximum": 64 },
+        "else": {
+          "oneOf": [
+            { "$ref": "#/$defs/EdgeTargetString" },
+            { "$ref": "#/$defs/WaitTarget" }
+          ]
+        }
+      },
+      "required": ["then", "limit", "else"],
+      "description": "An edge taken as then while its per-run count is below limit, and as else once it reaches it; then must name a step."
+    },
+    "EdgeTarget": {
+      "oneOf": [
+        { "$ref": "#/$defs/EdgeTargetString" },
+        { "$ref": "#/$defs/LimitedTarget" },
+        { "$ref": "#/$defs/WaitTarget" }
+      ]
+    },
+    "Edges": {
+      "type": "object",
+      "minProperties": 1,
+      "maxProperties": 64,
+      "propertyNames": { "$ref": "#/$defs/OutcomeName" },
+      "additionalProperties": { "$ref": "#/$defs/EdgeTarget" },
+      "description": "Each of the child workflow's outcomes mapped to the target the parent takes next."
+    },
+    "ForEach": {
+      "oneOf": [
+        { "$ref": "#/$defs/ForEachReferenceString" },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "items": { "$ref": "#/$defs/ForEachReferenceString" },
+            "empty": { "$ref": "#/$defs/OutcomeName" }
+          },
+          "required": ["items"]
+        }
+      ],
+      "description": "The json list a workflow step runs one child for each element of: a reference, or {items, empty} naming the child outcome taken for an empty list."
+    },
+    "WorkflowStep": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "kind": { "const": "workflow" },
+        "workflow": { "$ref": "#/$defs/TreePath" },
+        "inputs": { "$ref": "#/$defs/WorkflowStepInputBindings" },
+        "on": { "$ref": "#/$defs/Edges" },
+        "forEach": { "$ref": "#/$defs/ForEach" }
+      },
+      "required": ["kind", "workflow", "on"],
+      "description": "A step that runs another workflow file of the same tree as a child run and routes on its outcome."
+    },
     "Step": {
       "oneOf": [
         { "$ref": "#/$defs/CommandStep" },
-        { "$ref": "#/$defs/AgentStep" }
+        { "$ref": "#/$defs/AgentStep" },
+        { "$ref": "#/$defs/WorkflowStep" }
       ]
     },
     "CommandFinalizer": {
@@ -769,11 +912,234 @@
       "propertyNames": { "$ref": "#/$defs/Identifier" },
       "additionalProperties": { "$ref": "#/$defs/OutputReference" }
     },
+    "OutcomeName": {
+      "type": "string",
+      "maxLength": 64,
+      "pattern": "^[a-z][a-z0-9_]*$",
+      "not": { "enum": ["withdrawn", "canceled", "superseded"] },
+      "description": "A run outcome name in the run record's Name form; the engine outcomes are never declared."
+    },
+    "Outcomes": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 64,
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/OutcomeName" }
+    },
+    "Outcome": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["from", "onFailure"],
+      "properties": {
+        "from": { "$ref": "#/$defs/OutputReferenceString" },
+        "onFailure": { "$ref": "#/$defs/OutcomeName" }
+      }
+    },
+    "TreePath": {
+      "type": "string",
+      "minLength": 1,
+      "not": {
+        "anyOf": [
+          { "pattern": "^/" },
+          { "pattern": "^\\\\" },
+          { "pattern": "^~[/\\\\]" },
+          { "pattern": "^[A-Za-z]:[/\\\\]" },
+          { "pattern": "(^|[/\\\\])\\.\\.([/\\\\]|$)" },
+          { "pattern": "[\\n\\r\\t]" },
+          { "pattern": "\u0000" }
+        ]
+      },
+      "description": "A static path inside the definition's tree."
+    },
+    "BindingReference": {
+      "type": "string",
+      "maxLength": 65,
+      "pattern": "^\\$[a-z][A-Za-z0-9]*$",
+      "description": "A reference to a declared binding, written `$` followed by the binding key."
+    },
+    "BindingKind": {
+      "enum": ["connection", "linear.team", "linear.state", "github.repository"]
+    },
+    "EventName": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*)+$"
+    },
+    "ControlName": {
+      "enum": ["answer", "approve", "hand_back", "retry", "stop", "lift", "withdraw", "cancel", "release"]
+    },
+    "Programs": {
+      "type": "array",
+      "description": "Tree directories placed first on PATH for command steps and handlers.",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/TreePath" }
+    },
+    "Exclude": {
+      "type": "array",
+      "description": "Gitignore-style patterns kept in the tree but outside its digest and pinned copy.",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "Requires": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["tools"],
+      "properties": {
+        "tools": {
+          "type": "array",
+          "description": "Host-provided programs probed at admission.",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._+-]*$" }
+        }
+      }
+    },
+    "Binding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind"],
+      "properties": {
+        "kind": { "$ref": "#/$defs/BindingKind" },
+        "default": { "type": "string" }
+      }
+    },
+    "Bindings": {
+      "type": "object",
+      "description": "Environment-specific values, keyed by binding name; every revision carries a snapshot.",
+      "minProperties": 1,
+      "propertyNames": { "$ref": "#/$defs/Identifier" },
+      "additionalProperties": { "$ref": "#/$defs/Binding" }
+    },
+    "TriggerRule": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source", "event"],
+      "properties": {
+        "source": { "$ref": "#/$defs/BindingReference" },
+        "event": { "$ref": "#/$defs/EventName" },
+        "where": { "type": "string", "minLength": 1 }
+      }
+    },
+    "StartTrigger": {
+      "type": "object",
+      "description": "A trigger that starts a run of the workflow.",
+      "additionalProperties": false,
+      "required": ["on", "inputs"],
+      "properties": {
+        "on": { "$ref": "#/$defs/TriggerRule" },
+        "subject": { "type": "string", "minLength": 1 },
+        "inputs": {
+          "type": "object",
+          "minProperties": 1,
+          "propertyNames": { "$ref": "#/$defs/Identifier" },
+          "additionalProperties": { "type": "string" }
+        }
+      }
+    },
+    "ControlTrigger": {
+      "type": "object",
+      "description": "A trigger that acts on the live run for the event's subject instead of starting one.",
+      "additionalProperties": false,
+      "required": ["on", "control"],
+      "properties": {
+        "on": { "$ref": "#/$defs/TriggerRule" },
+        "control": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["run", "action"],
+          "properties": {
+            "run": { "const": "bySubject" },
+            "action": {
+              "oneOf": [
+                { "$ref": "#/$defs/ControlName" },
+                {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["when", "then", "else"],
+                  "properties": {
+                    "when": { "type": "string", "minLength": 1 },
+                    "then": { "$ref": "#/$defs/ControlName" },
+                    "else": { "$ref": "#/$defs/ControlName" }
+                  }
+                }
+              ]
+            }
+          }
+        }
+      }
+    },
+    "Trigger": {
+      "oneOf": [
+        { "$ref": "#/$defs/StartTrigger" },
+        { "$ref": "#/$defs/ControlTrigger" }
+      ]
+    },
+    "Triggers": {
+      "type": "object",
+      "minProperties": 1,
+      "propertyNames": { "$ref": "#/$defs/Identifier" },
+      "additionalProperties": { "$ref": "#/$defs/Trigger" }
+    },
+    "Template": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 4096,
+      "description": "Text with `{{<variable>}}` placeholders; which variables resolve depends on the hook."
+    },
+    "MirrorComment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["comment"],
+      "properties": {
+        "comment": { "$ref": "#/$defs/Template" }
+      }
+    },
+    "MirrorState": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["state"],
+      "properties": {
+        "state": { "$ref": "#/$defs/BindingReference" },
+        "unless": { "type": "string", "minLength": 1 }
+      }
+    },
+    "MirrorOutcomes": {
+      "type": "object",
+      "description": "The state each outcome moves the issue to, keyed by outcome name.",
+      "minProperties": 1,
+      "propertyNames": { "type": "string", "maxLength": 64, "pattern": "^[a-z][a-z0-9_]*$" },
+      "additionalProperties": { "$ref": "#/$defs/MirrorState" }
+    },
+    "MirrorLinear": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["issue"],
+      "properties": {
+        "issue": { "type": "string", "pattern": "^inputs\\.[a-z][A-Za-z0-9]*$" },
+        "onStart": { "$ref": "#/$defs/MirrorComment" },
+        "onStage": { "$ref": "#/$defs/MirrorComment" },
+        "onWait": { "$ref": "#/$defs/MirrorComment" },
+        "onOutcome": { "$ref": "#/$defs/MirrorOutcomes" }
+      }
+    },
+    "Mirror": {
+      "type": "object",
+      "description": "What Linear sees of a run of the root: a comment per hook and a state per outcome, each state a binding reference.",
+      "additionalProperties": false,
+      "required": ["linear"],
+      "properties": {
+        "linear": { "$ref": "#/$defs/MirrorLinear" }
+      }
+    },
     "Workflow": {
       "type": "object",
       "additionalProperties": false,
       "properties": {
         "schemaVersion": { "const": 1 },
+        "name": { "$ref": "#/$defs/Identifier" },
+        "version": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "subject": { "$ref": "#/$defs/Identifier" },
         "description": { "type": "string" },
         "environmentPassthrough": {
           "type": "array",
@@ -799,7 +1165,15 @@
           "propertyNames": { "$ref": "#/$defs/Identifier" },
           "additionalProperties": { "$ref": "#/$defs/Finalizer" }
         },
-        "exports": { "$ref": "#/$defs/Exports" }
+        "exports": { "$ref": "#/$defs/Exports" },
+        "outcomes": { "$ref": "#/$defs/Outcomes" },
+        "outcome": { "$ref": "#/$defs/Outcome" },
+        "programs": { "$ref": "#/$defs/Programs" },
+        "exclude": { "$ref": "#/$defs/Exclude" },
+        "requires": { "$ref": "#/$defs/Requires" },
+        "bindings": { "$ref": "#/$defs/Bindings" },
+        "triggers": { "$ref": "#/$defs/Triggers" },
+        "mirror": { "$ref": "#/$defs/Mirror" }
       },
       "required": ["schemaVersion", "steps"]
     }

@@ -433,6 +433,10 @@ pub(super) fn workflow_state(state: &WorkflowState<RunnerExecutionInstant>) -> V
             "state": "cancelled",
             "reason": cancellation_reason(*reason),
         }),
+        // Cloud admission refuses `workflow` steps, so no runner attempt waits or continues.
+        WorkflowState::Waiting { .. } | WorkflowState::Continued { .. } => {
+            json!({ "state": "failed" })
+        }
     }
 }
 
@@ -466,6 +470,8 @@ pub(super) fn retain_result_publication_failure(
         RunOutcome::Succeeded => ("succeeded", None),
         RunOutcome::Failed { primary_issue, .. } => ("failed", Some(workflow_issue(primary_issue))),
         RunOutcome::Cancelled { .. } => ("cancelled", None),
+        // Cloud admission refuses `workflow` steps, so no runner attempt waits or continues.
+        RunOutcome::Waiting { .. } | RunOutcome::Continued { .. } => ("failed", None),
     };
     let failed_node = primary_issue.as_ref().and_then(|issue| issue.get("node"));
     let step = failed_node.and_then(|node| {
@@ -506,6 +512,7 @@ pub(super) fn retain_result_publication_failure(
             "kind": match step.kind {
                 WorkflowRunStepKind::Command => "cmd",
                 WorkflowRunStepKind::Agent => "agent",
+                WorkflowRunStepKind::Workflow => "workflow",
             },
             "timingPresent": step.timing.is_some(),
             "commandOutputPresent": step.command_output.is_some(),

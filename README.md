@@ -179,14 +179,14 @@ um workflow validate \
   --source-root . \
   .um/workflows/review.yaml
 
-um workflow run \
-  --source-root . \
+um workflow run create \
+  --path . \
+  --workflow .um/workflows/review.yaml \
   --execution-root . \
-  --run-dir ~/.um/runs/review-001 \
-  .um/workflows/review.yaml
+  --run-dir ~/.um/runs/review-001
 
-um workflow status ~/.um/runs/review-001
-um workflow view ~/.um/runs/review-001
+um workflow run status ~/.um/runs/review-001
+um workflow run view ~/.um/runs/review-001
 ```
 
 During execution, Useful Machinery schedules ready steps, supervises each command or fresh agent
@@ -361,7 +361,7 @@ um workflow validate \
 ```
 
 `workflow validate` accepts the same `--agent-profiles <PATH>` replacement document as
-`workflow run`, applies it identically, and reports the replaced profile names without
+`workflow run create`, applies it identically, and reports the replaced profile names without
 retaining the document.
 
 Ready-to-run command and agent bundles are available under
@@ -494,18 +494,18 @@ return 2 and do not inspect the artifact directory.
 
 ## Local workflow execution
 
-Use `um workflow run` to execute a mixed command, PiJsonV1,
+Use `um workflow run create` to execute a mixed command, PiJsonV1,
 ClaudeCodeStreamJsonV1, and CodexAppServerV1 agent Workflow V1 DAG in an existing
 caller-owned directory and create one durable local run
 directory:
 
 ```sh
-um workflow run \
-  --source-root ./my-repository \
+um workflow run create \
+  --path ./my-repository \
+  --workflow .um/workflows/check.yaml \
   --execution-root ./my-checkout \
   --run-dir ./runs/check-001 \
-  --max-parallel 2 \
-  ./my-repository/.um/workflows/check.yaml
+  --max-parallel 2
 ```
 
 The run directory must not exist and must be disjoint from the execution root. The CLI
@@ -525,8 +525,8 @@ removed after settlement, and no Codex-native thread or file is retained. A Code
 protocol failure may retain the same bounded structural rejection document as the other
 profiles. The run-directory path is the local run handle. Add `--json` for one terminal
 schema-version-1 object on stdout while the live presentation remains on stderr, or
-`--plain` to force the line presentation on stdout. The `--json` object of run, retry,
-and continue conforms to
+`--plain` to force the line presentation on stdout. The `--json` object of `run create`,
+`run retry` and `run resume` conforms to
 [`schemas/workflow-run-result-v1.schema.json`](schemas/workflow-run-result-v1.schema.json),
 whose completed-attempt `result` refers to the view schema's `WorkflowResult`.
 
@@ -566,18 +566,18 @@ profile is replaced as a whole, so every step, finalizer, and recovery handler t
 references it runs on the replacement; unnamed profiles keep their declarations. A
 replacement may select a different harness kind, and only the harnesses the effective
 profiles select must be installed. The document never changes the source-closure digest.
-Its exact bytes are retained with the run and reapplied by `retry` and `continue`, and
+Its exact bytes are retained with the run and reapplied by `run retry` and `run resume`, and
 `result.json` records the digest and effective configuration under
 `workflow.agentProfileReplacement`. The structural contract is
 [`schemas/agent-profile-replacement-v1.schema.json`](schemas/agent-profile-replacement-v1.schema.json).
 
 ```sh
-um workflow run \
-  --source-root . \
+um workflow run create \
+  --path . \
+  --workflow .um/workflows/review.yaml \
   --execution-root . \
   --run-dir ~/.um/runs/review-002 \
-  --agent-profiles ~/.um/profiles/claude.yaml \
-  .um/workflows/review.yaml
+  --agent-profiles ~/.um/profiles/claude.yaml
 ```
 
 Without `--plain` or `--json`, run uses the interactive terminal interface when stdin and
@@ -599,7 +599,7 @@ is active. Once the retained attempt is complete, the interface remains open for
 post-run inspection until `q`; Useful Machinery then restores raw mode, the alternate screen, and
 the cursor before invoking the shared standard plain-summary renderer. The summary and
 process status are therefore the same contracts used by forced plain output. Inspect the
-durable run later with `workflow status <RUN_DIR>`; retry is always explicit.
+durable run later with `workflow run status <RUN_DIR>`; retry is always explicit.
 
 A Claude Code profile is configured independently from Pi:
 
@@ -680,22 +680,22 @@ Inspect the durable state and retry eligibility of an existing local run without
 it:
 
 ```sh
-um workflow status ./runs/check-001
+um workflow run status ./runs/check-001
 ```
 
 The run-directory positional is an ordinary host path resolved from the process's
 initial working directory. Retry uses the same durable handle explicitly:
 
 ```sh
-um workflow retry ./runs/check-001 --execution-root ./my-checkout
+um workflow run retry ./runs/check-001 --execution-root ./my-checkout
 ```
 
 To reexecute a selected ordinary step and its downstream ordinary dependents,
 inherit the other eligible ordinary steps by reference, and rerun all finalizers:
 
 ```sh
-um workflow continue ./runs/check-001 --from build --from verify
-um workflow continue ./runs/check-001 --from verify \
+um workflow run resume ./runs/check-001 --from build --from verify
+um workflow run resume ./runs/check-001 --from verify \
   --workflow ./revised-workflow.yaml --execution-root ./another-checkout
 ```
 
@@ -715,11 +715,11 @@ file; initial runs and explicit retries do not receive this variable. A continue
 step starts fresh; an inherited step has neither a new invocation nor a copied log.
 A required body-data consumer of an inherited skipped output is rejected, while
 conditions, advisory consumers, finalizers, and exports retain their normal
-unavailable-value behavior. `workflow status` reports only base continuation
+unavailable-value behavior. `workflow run status` reports only base continuation
 eligibility, not request-specific admission; an unavailable or incomparable historical
 workspace snapshot yields `workspaceModified: "unknown"`.
 
-Status reads only the closed `run.json` and `state.json` contracts and an existing
+Status reads only the closed `local-run.json` and `state.json` contracts and an existing
 regular `run.lock`. For activated step recovery, plain and JSON snapshots report the
 active or terminal target/handler role, round, target execution, decision, invocation
 accounting and usage, raw terminal disposition, output ownership, and retry eligibility.
@@ -753,7 +753,7 @@ respectively.
 View a successfully published terminal attempt from one stable read-only snapshot:
 
 ```sh
-um workflow view ./runs/check-001 [--attempt 1] [--plain | --json]
+um workflow run view ./runs/check-001 [--attempt 1] [--plain | --json]
 ```
 
 Omitting `--attempt` selects the current attempt from the snapshot. Without an explicit

@@ -4,8 +4,10 @@ use std::path::{Path, PathBuf};
 use super::claude_code::{ClaudeCodeConfig, ClaudeCodeEffort};
 use super::codex::CodexConfig;
 use super::document::{
-    FailurePolicy, FinalizationTrigger, MessageSource, NodeBody, Output, OutputReference,
-    RecoveryHandler, ValueReference,
+    Binding, BindingKind, EdgeTarget, FailurePolicy, FinalizationTrigger, ForEach,
+    InputDeclaration, JsonDefault, MessageSource, NodeBody, OutcomeDeclaration, Output,
+    OutputReference, RecoveryHandler, Trigger, TriggerControlAction, ValueReference, WaitKind,
+    WaitRule, WorkflowNode,
 };
 use super::pi::{PiConfig, Thinking};
 use super::validated::ValidatedHarness;
@@ -491,7 +493,356 @@ finalizers:
     );
 }
 
-// REQ-WFFORMAT-2, REQ-WFFORMAT-8, REQ-WFFORMAT-11, REQ-WFFORMAT-34, REQ-WFFORMAT-36, REQ-WFFORMAT-37, REQ-WFFORMAT-41, REQ-WFFORMAT-42, REQ-WFFORMAT-45, REQ-WFFORMAT-46, REQ-WFFORMAT-53, REQ-WFFORMAT-54, REQ-WFFORMAT-61, REQ-WFRECOVERY-56, REQ-WFRECOVERY-57
+// REQ-WFFORMAT-1, REQ-WFFORMAT-7, REQ-WFFORMAT-28, REQ-WFFORMAT-82, REQ-WFFORMAT-101
+#[test]
+fn root_workflow_decodes_name_version_root_blocks_and_input_completion() {
+    let workflow =
+        decode(&fs::read(fixture_root().join("valid/root-workflow.yaml")).unwrap()).unwrap();
+
+    assert_eq!(workflow.name.as_deref(), Some("engineering"));
+    assert_eq!(workflow.version.as_deref(), Some("1.0.0"));
+    let root = workflow.root.as_ref().unwrap();
+    assert_eq!(root.programs, ["scripts"]);
+    assert_eq!(root.exclude, ["tests/", "**/__pycache__/"]);
+    assert_eq!(
+        root.requires.as_ref().unwrap().tools,
+        ["git", "gh", "python3"]
+    );
+    assert_eq!(root.bindings.len(), 7);
+    assert_eq!(
+        root.bindings["connection"],
+        Binding {
+            kind: BindingKind::Connection,
+            default: None
+        }
+    );
+    assert_eq!(
+        root.bindings["ownedState"],
+        Binding {
+            kind: BindingKind::LinearState,
+            default: Some("Engineering".to_owned())
+        }
+    );
+    let Trigger::Start {
+        on,
+        subject,
+        inputs,
+    } = &root.triggers["start"]
+    else {
+        panic!("start must be a start trigger");
+    };
+    assert_eq!(on.source, "$connection");
+    assert_eq!(on.event, "issue.state_entered");
+    assert_eq!(
+        on.condition.as_deref(),
+        Some("event.team == $linearTeam and event.state == $ownedState")
+    );
+    assert_eq!(subject.as_deref(), Some("event.issue.identifier"));
+    assert_eq!(inputs["baseBranch"], "main");
+    let Trigger::Control { on, control } = &root.triggers["release"] else {
+        panic!("release must be a control trigger");
+    };
+    assert_eq!(on.event, "issue.state_left");
+    assert_eq!(
+        *control,
+        TriggerControlAction::Conditional {
+            when: "event.to == $canceled".to_owned(),
+            then: "cancel".to_owned(),
+            otherwise: "withdraw".to_owned(),
+        }
+    );
+    // The mirror block keeps its templates and guards as written (REQ-WFFORMAT-101).
+    let state = |state: &str, unless: Option<&str>| MirrorState {
+        state: state.to_owned(),
+        unless: unless.map(str::to_owned),
+    };
+    assert_eq!(
+        root.mirror,
+        Some(MirrorBlock {
+            issue: "ticket".to_owned(),
+            on_start: Some("Engineering started by {{operator}}. Run: {{run.url}}".to_owned()),
+            on_stage: Some("{{stage}}: {{summary}}".to_owned()),
+            on_wait: Some("Waiting for {{wait.kind}}: {{wait.summary}}".to_owned()),
+            on_outcome: [
+                ("landed", state("done", None)),
+                (
+                    "withdrawn",
+                    state("backlog", Some("issue.state != $ownedState")),
+                ),
+                (
+                    "canceled",
+                    state("canceled", Some("issue.state != $ownedState")),
+                ),
+            ]
+            .into_iter()
+            .map(|(outcome, state)| (outcome.to_owned(), state))
+            .collect(),
+        })
+    );
+
+    assert_eq!(
+        workflow.inputs["ticket"],
+        InputDeclaration::Text {
+            optional: false,
+            default: None
+        }
+    );
+    assert_eq!(
+        workflow.inputs["baseBranch"],
+        InputDeclaration::Text {
+            optional: false,
+            default: Some("main".to_owned())
+        }
+    );
+    assert_eq!(
+        workflow.inputs["policy"],
+        InputDeclaration::Json {
+            schema: None,
+            optional: false,
+            default: Some(JsonDefault::File("policy/engineering.json".to_owned()))
+        }
+    );
+    assert_eq!(
+        workflow.inputs["branch"],
+        InputDeclaration::Text {
+            optional: true,
+            default: None
+        }
+    );
+    assert_eq!(
+        workflow.inputs["answers"],
+        InputDeclaration::Json {
+            schema: None,
+            optional: true,
+            default: None
+        }
+    );
+
+    // A JSON default that is not text is the literal value, `null` included.
+    for (literal, expected) in [
+        ("null", serde_json::Value::Null),
+        ("{retries: 2}", serde_json::json!({"retries": 2})),
+    ] {
+        let source = format!(
+            "schemaVersion: 1\ninputs: {{policy: {{kind: json, default: {literal}}}}}\n\
+             steps: {{prepare: {{kind: cmd, command: {{argv: [\"true\"]}}}}}}\n"
+        );
+        let workflow = decode(source.as_bytes()).unwrap();
+        assert_eq!(
+            workflow.inputs["policy"],
+            InputDeclaration::Json {
+                schema: None,
+                optional: false,
+                default: Some(JsonDefault::Literal(expected))
+            }
+        );
+        assert!(workflow.root.is_none());
+    }
+}
+
+// REQ-WFFORMAT-87, REQ-WFFORMAT-88
+#[test]
+fn typed_outcomes_decode_the_names_and_the_outcome_source() {
+    let workflow =
+        decode(&fs::read(fixture_root().join("valid/typed-outcomes.yaml")).unwrap()).unwrap();
+
+    assert_eq!(workflow.outcomes, ["planned", "blocked", "failed"]);
+    assert_eq!(
+        workflow.outcome,
+        Some(OutcomeDeclaration {
+            from: OutputReference {
+                node: "decide".to_owned(),
+                output: "verdict".to_owned(),
+            },
+            on_failure: "failed".to_owned(),
+        })
+    );
+
+    let plain = decode(&canonical_valid_fixture()).unwrap();
+    assert!(plain.outcomes.is_empty());
+    assert_eq!(plain.outcome, None);
+}
+
+// REQ-WFFORMAT-89, REQ-WFFORMAT-92
+#[test]
+fn workflow_steps_decode_the_child_file_inputs_and_edges() {
+    let workflow =
+        decode(&fs::read(fixture_root().join("valid/workflow-step.yaml")).unwrap()).unwrap();
+
+    assert_eq!(workflow.step_order, ["design", "build"]);
+    assert_eq!(workflow.outcomes, ["landed", "failed"]);
+    assert_eq!(
+        workflow.steps["design"].body,
+        NodeBody::Workflow(WorkflowNode {
+            workflow: "design.yaml".to_owned(),
+            inputs: [(
+                "ticket".to_owned(),
+                ValueReference::Input {
+                    name: "ticket".to_owned(),
+                },
+            )]
+            .into(),
+            edges: [
+                ("planned".to_owned(), EdgeTarget::Step("build".to_owned())),
+                ("blocked".to_owned(), EdgeTarget::Exit("failed".to_owned())),
+                (
+                    "failed".to_owned(),
+                    EdgeTarget::Wait {
+                        kind: WaitKind::Repair,
+                        then: Box::new(EdgeTarget::Exit("failed".to_owned())),
+                        on_hand_back: None,
+                        rule: None,
+                    },
+                ),
+            ]
+            .into(),
+            for_each: None,
+        })
+    );
+    assert!(workflow.steps["design"].control_dependencies.is_empty());
+    assert_eq!(workflow.steps["design"].recovery, None);
+    let NodeBody::Workflow(build) = &workflow.steps["build"].body else {
+        panic!("build decodes as a workflow step");
+    };
+    assert_eq!(
+        build.inputs["parts"],
+        ValueReference::Output(OutputReference {
+            node: "design".to_owned(),
+            output: "parts".to_owned(),
+        })
+    );
+}
+
+// REQ-WFFORMAT-92, REQ-WFFORMAT-95
+#[test]
+fn workflow_steps_decode_hand_backs_and_control_references() {
+    let workflow =
+        decode(&fs::read(fixture_root().join("valid/workflow-step-waits.yaml")).unwrap()).unwrap();
+
+    assert_eq!(workflow.step_order, ["design", "review", "fix", "merge"]);
+    let workflow_node = |step: &str| {
+        let NodeBody::Workflow(node) = &workflow.steps[step].body else {
+            panic!("{step} decodes as a workflow step");
+        };
+        node.clone()
+    };
+    assert_eq!(
+        workflow_node("review").edges["approve"],
+        EdgeTarget::Wait {
+            kind: WaitKind::Approval,
+            then: Box::new(EdgeTarget::Step("merge".to_owned())),
+            on_hand_back: Some("fix".to_owned()),
+            rule: None,
+        }
+    );
+    assert_eq!(
+        workflow_node("design").edges["blocked"],
+        EdgeTarget::Wait {
+            kind: WaitKind::Answer,
+            then: Box::new(EdgeTarget::Step("design".to_owned())),
+            on_hand_back: None,
+            rule: None,
+        }
+    );
+    assert_eq!(
+        workflow_node("design").inputs["answers"],
+        ValueReference::ControlsAnswers
+    );
+    assert_eq!(
+        workflow_node("fix").inputs["notes"],
+        ValueReference::Wait {
+            field: "notes".to_owned(),
+        }
+    );
+}
+
+// REQ-WFFORMAT-98, REQ-WFFORMAT-99
+#[test]
+fn workflow_steps_decode_for_each_and_item_references() {
+    let workflow =
+        decode(&fs::read(fixture_root().join("valid/workflow-step-for-each.yaml")).unwrap())
+            .unwrap();
+
+    let workflow_node = |step: &str| {
+        let NodeBody::Workflow(node) = &workflow.steps[step].body else {
+            panic!("{step} decodes as a workflow step");
+        };
+        node.clone()
+    };
+    let parts = ValueReference::Output(OutputReference {
+        node: "design".to_owned(),
+        output: "parts".to_owned(),
+    });
+    assert_eq!(workflow_node("design").for_each, None);
+    assert_eq!(
+        workflow_node("build").for_each,
+        Some(ForEach {
+            items: parts.clone(),
+            empty: None,
+        })
+    );
+    assert_eq!(
+        workflow_node("build").inputs["part"],
+        ValueReference::Item {
+            field: Some("name".to_owned()),
+        }
+    );
+    assert_eq!(
+        workflow_node("review").for_each,
+        Some(ForEach {
+            items: parts,
+            empty: Some("approved".to_owned()),
+        })
+    );
+    assert_eq!(
+        workflow_node("review").inputs["part"],
+        ValueReference::Item { field: None }
+    );
+}
+
+// REQ-WFFORMAT-92, REQ-WFFORMAT-96, REQ-WFFORMAT-97
+#[test]
+fn workflow_steps_decode_backward_limited_and_external_edges() {
+    let workflow =
+        decode(&fs::read(fixture_root().join("valid/workflow-step-loops.yaml")).unwrap()).unwrap();
+
+    assert_eq!(workflow.step_order, ["design", "review", "fix", "merge"]);
+    let edge = |step: &str, outcome: &str| {
+        let NodeBody::Workflow(node) = &workflow.steps[step].body else {
+            panic!("{step} decodes as a workflow step");
+        };
+        node.edges[outcome].clone()
+    };
+    assert_eq!(edge("fix", "built"), EdgeTarget::Step("review".to_owned()));
+    assert_eq!(
+        edge("review", "hand_back"),
+        EdgeTarget::Limited {
+            then: "fix".to_owned(),
+            limit: 2,
+            else_: Box::new(EdgeTarget::Wait {
+                kind: WaitKind::Repair,
+                then: Box::new(EdgeTarget::Step("review".to_owned())),
+                on_hand_back: None,
+                rule: None,
+            }),
+        }
+    );
+    assert_eq!(
+        edge("merge", "admitted"),
+        EdgeTarget::Wait {
+            kind: WaitKind::External,
+            then: Box::new(EdgeTarget::Step("merge".to_owned())),
+            on_hand_back: None,
+            rule: Some(WaitRule {
+                source: "github".to_owned(),
+                event: vec!["pull_request.queue_settled".to_owned()],
+                where_: "event.pullRequest == outputs.design.pullRequest".to_owned(),
+            }),
+        }
+    );
+}
+
+// REQ-WFFORMAT-2, REQ-WFFORMAT-8, REQ-WFFORMAT-11, REQ-WFFORMAT-34, REQ-WFFORMAT-36, REQ-WFFORMAT-37, REQ-WFFORMAT-41, REQ-WFFORMAT-42, REQ-WFFORMAT-45, REQ-WFFORMAT-46, REQ-WFFORMAT-53, REQ-WFFORMAT-54, REQ-WFFORMAT-61, REQ-WFRECOVERY-56, REQ-WFRECOVERY-57, REQ-WFFORMAT-28, REQ-WFFORMAT-82, REQ-WFFORMAT-89, REQ-WFFORMAT-92, REQ-WFFORMAT-95, REQ-WFFORMAT-96
 #[test]
 fn every_canonical_invalid_fixture_is_a_structural_failure() {
     let invalid_root = fixture_root().join("invalid");

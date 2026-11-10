@@ -1,0 +1,66 @@
+schemaVersion: 1
+inputs:
+  ticket:
+    kind: text
+outcomes: [landed]
+steps:
+  design:
+    kind: workflow
+    workflow: design.yaml
+    inputs:
+      ticket:
+        ref: inputs.ticket
+    on:
+      planned: review
+      failed:
+        wait: repair
+        then: design
+  review:
+    kind: workflow
+    workflow: review.yaml
+    on:
+      proceed: merge
+      hand_back:
+        then: fix
+        limit: 2
+        else:
+          wait: repair
+          then: review
+      failed:
+        wait: repair
+        then: review
+  fix:
+    kind: workflow
+    workflow: build.yaml
+    inputs:
+      findings:
+        ref: outputs.review.findings
+    on:
+      built: review
+      failed:
+        wait: repair
+        then: fix
+  merge:
+    kind: workflow
+    workflow: merge.yaml
+    on:
+      admitted:
+        wait: external
+        then: merge
+        rule:
+          source: github
+          event: pull_request.queue_settled
+          where: "event.pullRequest == outputs.design.pullRequest"
+      landed: exit.landed
+      repaired:
+        then: merge
+        limit: 3
+        else:
+          wait: repair
+          then: merge
+      dequeued:
+        wait: repair
+        then: merge
+      failed:
+        wait: repair
+        then: merge

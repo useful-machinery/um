@@ -8,21 +8,23 @@ use super::condition::{
     ConditionValueKind, JsonPointer, ResolvedOperand, ResolvedPredicate, ResolvedSelector,
 };
 use super::document::{
-    Agent, AgentProfile, CommonNode, ConditionOperand, ConditionPredicate, ExportPresentation,
-    FailurePolicy, FinalizerDefinition, InputDeclaration, MessageSource, NodeBody, Output,
-    OutputReference, PresentationSource, RecoveryHandler, StepDefinition, StepRecovery,
-    ValueReference, WorkflowDocument,
+    Agent, AgentProfile, CommonNode, ConditionOperand, ConditionPredicate, EdgeTarget,
+    ExportPresentation, FailurePolicy, FinalizerDefinition, ForEach, InputDeclaration, JsonDefault,
+    MessageSource, NodeBody, Output, OutputReference, PresentationSource, RecoveryHandler,
+    StepDefinition, StepRecovery, ValueReference, WaitKind, WaitRule, WorkflowDocument,
 };
 use super::evidence::{MAXIMUM_PREREQUISITES, Prerequisite};
 use super::export_presentation::{Field, resolve_text};
 use super::validated::{
-    RequiredInputs, ResolvedDirectPrerequisite, ResolvedOutputSource, ResolvedValueReference,
-    ResolvedValueSource, ValidatedAgent, ValidatedAgentMessage, ValidatedAgentStep,
-    ValidatedCommandStep, ValidatedCommonStep, ValidatedExportPresentation, ValidatedFinalizer,
-    ValidatedHarness, ValidatedMessageSource, ValidatedOutput, ValidatedPresentationField,
-    ValidatedRecoveryHandler, ValidatedStep, ValidatedStepRecovery, ValidatedWorkflow,
-    WorkflowNode, WorkflowNodeRole, WorkflowValueType,
+    DeclaredInputs, ResolvedDirectPrerequisite, ResolvedOutputSource, ResolvedValueReference,
+    ResolvedValueSource, Scheduling, ValidatedAgent, ValidatedAgentMessage, ValidatedAgentStep,
+    ValidatedChildInput, ValidatedCommandStep, ValidatedCommonStep, ValidatedEdgeTarget,
+    ValidatedExportPresentation, ValidatedFinalizer, ValidatedForEach, ValidatedHarness,
+    ValidatedInputDefault, ValidatedMessageSource, ValidatedOutcome, ValidatedOutput,
+    ValidatedPresentationField, ValidatedRecoveryHandler, ValidatedStep, ValidatedStepRecovery,
+    ValidatedWorkflow, ValidatedWorkflowStep, WorkflowNode, WorkflowNodeRole, WorkflowValueType,
 };
+use super::wait::{Operand, parse_where};
 
 const MAXIMUM_WORKFLOW_NODES: usize = 256;
 const MAXIMUM_CONDITION_DEPTH: usize = 16;
@@ -52,6 +54,8 @@ pub(crate) enum ValidationFailureKind {
     AdvisoryExportTarget,
     InvalidExportPresentation,
     InvalidExportPresentationTarget,
+    InvalidOutcomeDeclaration,
+    InvalidOutcomeSource,
     TooManyNodes,
     DuplicateNodeId,
     CrossPhaseOutputReference,
@@ -67,12 +71,43 @@ pub(crate) enum ValidationFailureKind {
     ConditionNodeLimitExceeded,
     ConditionChildLimitExceeded,
     WorkflowConditionNodeLimitExceeded,
+    ChildWorkflowNotInTree,
+    ChildWorkflowUnavailable,
+    ChildWorkflowInvalid,
+    ChildWorkflowNested,
+    ChildWorkflowRootBlocks,
+    ChildInputUndeclared,
+    ChildInputMissing,
+    ChildInputTypeMismatch,
+    ChildInputUnsupported,
+    ChildExportReserved,
+    EdgeOutcomeUndeclared,
+    EdgeOutcomeMissing,
+    EdgeTargetUnknown,
+    EdgeLimitTargetInvalid,
+    EdgeExitUndeclared,
+    EdgeSchedulingKind,
+    StepUnreachable,
+    WaitHandBackRequired,
+    WaitHandBackUnsupported,
+    WaitRuleRequired,
+    WaitRuleUnsupported,
+    WaitRuleInvalid,
+    WaitRuleReferenceInvalid,
+    ControlReferenceRequiresOptional,
+    ForEachReferenceInvalid,
+    ForEachEmptyUndeclared,
+    ItemReferenceRequiresForEach,
+    SubjectInputUndeclared,
+    SubjectInputNotText,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum ValidationLocation {
+    Workflow { key: &'static str },
     WorkflowGraph,
     WorkflowNamespace,
+    Step { step: String },
     AgentProfileReplacement { profile: String },
     AgentProfileReference { step: String },
     RecoveryAgentProfileReference { step: String },
@@ -83,6 +118,9 @@ pub(crate) enum ValidationLocation {
     MessageAttachment { step: String, index: usize },
     StepOutput { step: String, output: String },
     StepCondition { step: String },
+    StepWorkflow { step: String },
+    StepEdge { step: String, outcome: String },
+    StepForEach { step: String },
     FinalizerAfter { finalizer: String, index: usize },
     FinalizerInput { finalizer: String, input: String },
     FinalizerMessageText { finalizer: String, index: usize },
@@ -90,6 +128,7 @@ pub(crate) enum ValidationLocation {
     FinalizerOutput { finalizer: String, output: String },
     FinalizerCondition { finalizer: String },
     Export { name: String },
+    Outcome,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -120,6 +159,70 @@ impl fmt::Display for ValidationFailure {
 
 impl std::error::Error for ValidationFailure {}
 
+/// What a parent's validation needs to know of a child workflow file (REQ-WFFORMAT-89 to
+/// REQ-WFFORMAT-92); resolution builds one per file a `workflow` step names.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ChildWorkflowSummary {
+    /// The declared outcomes, or the implicit `succeeded` and `failed`.
+    pub(crate) outcomes: Vec<String>,
+    pub(crate) exports: BTreeMap<String, WorkflowValueType>,
+    /// Each declared input's kind and whether a run may omit it.
+    pub(crate) inputs: BTreeMap<String, (WorkflowValueType, bool)>,
+    pub(crate) has_workflow_steps: bool,
+    pub(crate) has_root_blocks: bool,
+    /// The canonical paths the child's resolution reached, its own file included; empty
+    /// for a nested child, which is not resolved.
+    pub(crate) paths: BTreeSet<String>,
+}
+
+impl ChildWorkflowSummary {
+    pub(crate) fn of(child: &ValidatedWorkflow, paths: BTreeSet<String>) -> Self {
+        Self {
+            outcomes: child.outcome.as_ref().map_or_else(
+                || vec!["succeeded".to_owned(), "failed".to_owned()],
+                |outcome| outcome.names.clone(),
+            ),
+            exports: child
+                .exports
+                .iter()
+                .map(|(name, source)| (name.clone(), source.value_type))
+                .collect(),
+            inputs: child
+                .declared_inputs
+                .iter()
+                .map(|(name, value_type)| {
+                    (
+                        name.clone(),
+                        (*value_type, child.input_may_be_omitted(name)),
+                    )
+                })
+                .collect(),
+            has_workflow_steps: child
+                .steps
+                .values()
+                .any(|step| matches!(step, ValidatedStep::Workflow(_))),
+            has_root_blocks: child.root.is_some()
+                || child.name.is_some()
+                || child.version.is_some()
+                || child.subject.is_some(),
+            paths,
+        }
+    }
+
+    /// A child that itself declares a `workflow` step; nothing else of it is read, since
+    /// it cannot be validated alone.
+    pub(crate) fn nested() -> Self {
+        Self {
+            outcomes: Vec::new(),
+            exports: BTreeMap::new(),
+            inputs: BTreeMap::new(),
+            has_workflow_steps: true,
+            has_root_blocks: false,
+            paths: BTreeSet::new(),
+        }
+    }
+}
+
 struct ValidatedGraph {
     direct_prerequisites: BTreeMap<String, Vec<ResolvedDirectPrerequisite>>,
     presentation_order: Vec<String>,
@@ -130,17 +233,31 @@ pub(crate) fn validate(document: WorkflowDocument) -> Result<ValidatedWorkflow, 
     validate_with_replacement(document, None)
 }
 
+/// Validate a single file: a `workflow` step in it has no child summary and fails
+/// `child_workflow_unavailable`.
+#[cfg(test)]
+pub(crate) fn validate_with_replacement(
+    document: WorkflowDocument,
+    replacement: Option<&BTreeMap<String, AgentProfile>>,
+) -> Result<ValidatedWorkflow, ValidationFailure> {
+    validate_with_children(document, replacement, &BTreeMap::new())
+}
+
 /// Validate a document, replacing declared agent profiles as a whole by name.
 ///
 /// Replacement happens before any step, finalizer, or recovery-handler reference is
 /// pinned, so each reference to a replaced name pins the replacement. Decoding has
 /// already typed every declared and replacement profile; unknown names are rejected in
-/// ascending name order.
-pub(crate) fn validate_with_replacement(
-    document: WorkflowDocument,
+/// ascending name order. `children` summarizes each child file a `workflow` step names,
+/// keyed by the step's `workflow` path.
+pub(crate) fn validate_with_children(
+    mut document: WorkflowDocument,
     replacement: Option<&BTreeMap<String, AgentProfile>>,
+    children: &BTreeMap<String, ChildWorkflowSummary>,
 ) -> Result<ValidatedWorkflow, ValidationFailure> {
     validate_node_namespace(&document)?;
+    let scheduling = validate_scheduling(&document)?;
+    document.derived_outputs = derive_child_outputs(&document, children);
     validate_workflow_condition_bounds(&document)?;
     let mut agent_profiles = document
         .agent_profiles
@@ -164,30 +281,70 @@ pub(crate) fn validate_with_replacement(
     let finalizer_graph = validate_finalizer_graph(&document)?;
     validate_output_rules(&document)?;
 
-    let mut required_inputs = document
+    let mut declared_inputs = document
         .inputs
         .iter()
         .map(|(name, declaration)| {
             let value_type = match declaration {
-                InputDeclaration::Text => WorkflowValueType::Text,
+                InputDeclaration::Text { .. } => WorkflowValueType::Text,
                 InputDeclaration::Json { .. } => WorkflowValueType::Json,
                 InputDeclaration::File { .. } => WorkflowValueType::File,
-                InputDeclaration::Attachments => WorkflowValueType::AttachmentCollection,
+                InputDeclaration::Attachments { .. } => WorkflowValueType::AttachmentCollection,
             };
             (name.clone(), value_type)
         })
-        .collect::<RequiredInputs>();
+        .collect::<DeclaredInputs>();
+    validate_subject(document.subject.as_deref(), &declared_inputs)?;
+    let optional_inputs = document
+        .inputs
+        .iter()
+        .filter(|(_, declaration)| {
+            matches!(
+                declaration,
+                InputDeclaration::Text { optional: true, .. }
+                    | InputDeclaration::Json { optional: true, .. }
+                    | InputDeclaration::Attachments { optional: true }
+            )
+        })
+        .map(|(name, _)| name.clone())
+        .collect();
+    let input_defaults = document
+        .inputs
+        .iter()
+        .filter_map(|(name, declaration)| {
+            let default = match declaration {
+                InputDeclaration::Text {
+                    default: Some(text),
+                    ..
+                } => ValidatedInputDefault::Text(text.clone()),
+                InputDeclaration::Json {
+                    default: Some(JsonDefault::File(path)),
+                    ..
+                } => ValidatedInputDefault::JsonFile(path.clone()),
+                InputDeclaration::Json {
+                    default: Some(JsonDefault::Literal(value)),
+                    ..
+                } => ValidatedInputDefault::JsonLiteral(value.clone()),
+                InputDeclaration::Text { default: None, .. }
+                | InputDeclaration::Json { default: None, .. }
+                | InputDeclaration::File { .. }
+                | InputDeclaration::Attachments { .. } => return None,
+            };
+            Some((name.clone(), default))
+        })
+        .collect();
     let input_json_schema_paths = document
         .inputs
         .iter()
         .filter_map(|(name, declaration)| match declaration {
             InputDeclaration::Json {
                 schema: Some(schema),
+                ..
             } => Some((name.clone(), schema.clone())),
-            InputDeclaration::Text
-            | InputDeclaration::Json { schema: None }
+            InputDeclaration::Text { .. }
+            | InputDeclaration::Json { schema: None, .. }
             | InputDeclaration::File { .. }
-            | InputDeclaration::Attachments => None,
+            | InputDeclaration::Attachments { .. } => None,
         })
         .collect();
     let input_file_media_types = document
@@ -197,24 +354,40 @@ pub(crate) fn validate_with_replacement(
             InputDeclaration::File {
                 media_type: Some(media_type),
             } => Some((name.clone(), media_type.clone())),
-            InputDeclaration::Text
+            InputDeclaration::Text { .. }
             | InputDeclaration::Json { .. }
             | InputDeclaration::File { media_type: None }
-            | InputDeclaration::Attachments => None,
+            | InputDeclaration::Attachments { .. } => None,
         })
         .collect();
     let mut steps = BTreeMap::new();
     let mut recoveries = BTreeMap::new();
-    for (step_name, step) in &document.steps {
-        let body = validate_body(
-            step_name,
-            WorkflowNodeRole::Step,
-            &step.body,
-            &step_graph.direct_prerequisites[step_name],
-            &document,
-            &agent_profiles,
-            &mut required_inputs,
-        )?;
+    // An edge-scheduled workflow is checked step by step in document order, each child
+    // before the steps that read it.
+    let step_names = match scheduling {
+        Scheduling::Dataflow => document.steps.keys().collect::<Vec<_>>(),
+        Scheduling::Edges { .. } => document.step_order.iter().collect(),
+    };
+    for step_name in step_names {
+        let step = &document.steps[step_name];
+        let body = match &step.body {
+            NodeBody::Workflow(node) => ValidatedStep::Workflow(validate_workflow_step(
+                step_name,
+                node,
+                &document,
+                &mut declared_inputs,
+                children,
+            )?),
+            NodeBody::Command(_) | NodeBody::Agent(_) => validate_body(
+                step_name,
+                WorkflowNodeRole::Step,
+                &step.body,
+                &step_graph.direct_prerequisites[step_name],
+                &document,
+                &agent_profiles,
+                &mut declared_inputs,
+            )?,
+        };
         let recovery = validate_recovery(step_name, step.recovery.as_ref(), &agent_profiles)?;
         steps.insert(step_name.clone(), body);
         recoveries.insert(step_name.clone(), recovery);
@@ -229,7 +402,7 @@ pub(crate) fn validate_with_replacement(
             &finalizer_graph.direct_prerequisites[finalizer_name],
             &document,
             &agent_profiles,
-            &mut required_inputs,
+            &mut declared_inputs,
         )?;
         finalizers.insert(
             finalizer_name.clone(),
@@ -259,6 +432,13 @@ pub(crate) fn validate_with_replacement(
         })
         .collect::<Result<_, _>>()?;
 
+    let outcome = match scheduling {
+        Scheduling::Dataflow => resolve_outcome(&document)?,
+        // The exit edge a run reaches chooses its outcome (REQ-WFFORMAT-88).
+        Scheduling::Edges { .. } => None,
+    };
+    validate_reachability(&document, &scheduling)?;
+
     Ok(ValidatedWorkflow {
         schema_version: document.schema_version,
         description: document.description,
@@ -272,11 +452,526 @@ pub(crate) fn validate_with_replacement(
         finalizer_presentation_order: finalizer_graph.presentation_order,
         exports,
         export_presentation,
-        required_inputs,
+        outcome,
+        declared_inputs,
+        optional_inputs,
+        input_defaults,
         input_json_schema_paths,
         input_file_media_types,
         replaced_agent_profiles,
+        name: document.name,
+        version: document.version,
+        subject: document.subject,
+        root: document.root,
+        scheduling,
     })
+}
+
+/// `subject` names a declared root input of kind `text` (REQ-WFFORMAT-100).
+fn validate_subject(
+    subject: Option<&str>,
+    declared_inputs: &DeclaredInputs,
+) -> Result<(), ValidationFailure> {
+    let kind = match subject.map(|name| declared_inputs.get(name)) {
+        None | Some(Some(WorkflowValueType::Text)) => return Ok(()),
+        Some(None) => ValidationFailureKind::SubjectInputUndeclared,
+        Some(Some(_)) => ValidationFailureKind::SubjectInputNotText,
+    };
+    Err(ValidationFailure::new(
+        kind,
+        ValidationLocation::Workflow { key: "subject" },
+    ))
+}
+
+/// A workflow with a `workflow` step is edge-scheduled from its first step: every ordinary
+/// step is a `workflow` step and the exit edges, not an `outcome` block, choose the
+/// outcome (REQ-WFFORMAT-93, REQ-WFFORMAT-88).
+fn validate_scheduling(document: &WorkflowDocument) -> Result<Scheduling, ValidationFailure> {
+    let is_workflow = |step: &str| matches!(document.steps[step].body, NodeBody::Workflow(_));
+    if !document.step_order.iter().any(|step| is_workflow(step)) {
+        return Ok(Scheduling::Dataflow);
+    }
+    if let Some(step) = document.step_order.iter().find(|step| !is_workflow(step)) {
+        return Err(ValidationFailure::new(
+            ValidationFailureKind::EdgeSchedulingKind,
+            ValidationLocation::Step { step: step.clone() },
+        ));
+    }
+    if document.outcome.is_some() {
+        return Err(ValidationFailure::new(
+            ValidationFailureKind::InvalidOutcomeDeclaration,
+            ValidationLocation::Outcome,
+        ));
+    }
+    Ok(Scheduling::Edges {
+        entry: document.step_order[0].clone(),
+    })
+}
+
+/// The outputs of each `workflow` step whose child is summarized: the child's `text` and
+/// `json` exports and the implicit `outcome` (REQ-WFFORMAT-91).
+fn derive_child_outputs(
+    document: &WorkflowDocument,
+    children: &BTreeMap<String, ChildWorkflowSummary>,
+) -> BTreeMap<String, BTreeMap<String, Output>> {
+    document
+        .steps
+        .iter()
+        .filter_map(|(step, definition)| {
+            let NodeBody::Workflow(node) = &definition.body else {
+                return None;
+            };
+            let child = children.get(&node.workflow)?;
+            let mut outputs = child
+                .exports
+                .iter()
+                .filter(|(_, value_type)| {
+                    matches!(
+                        value_type,
+                        WorkflowValueType::Text | WorkflowValueType::Json
+                    )
+                })
+                .map(|(name, value_type)| {
+                    (
+                        name.clone(),
+                        Output::ChildExport {
+                            value_type: *value_type,
+                        },
+                    )
+                })
+                .collect::<BTreeMap<_, _>>();
+            outputs.insert(CHILD_OUTCOME_OUTPUT.to_owned(), Output::ChildOutcome);
+            Some((step.clone(), outputs))
+        })
+        .collect()
+}
+
+/// The implicit output that carries a child's recorded outcome (REQ-WFFORMAT-91).
+pub(crate) const CHILD_OUTCOME_OUTPUT: &str = "outcome";
+
+fn validate_workflow_step(
+    step_name: &str,
+    node: &super::document::WorkflowNode,
+    document: &WorkflowDocument,
+    declared_inputs: &mut DeclaredInputs,
+    children: &BTreeMap<String, ChildWorkflowSummary>,
+) -> Result<ValidatedWorkflowStep, ValidationFailure> {
+    let step_failure = |kind| {
+        ValidationFailure::new(
+            kind,
+            ValidationLocation::StepWorkflow {
+                step: step_name.to_owned(),
+            },
+        )
+    };
+    let child = children
+        .get(&node.workflow)
+        .ok_or_else(|| step_failure(ValidationFailureKind::ChildWorkflowUnavailable))?;
+    if child.has_workflow_steps {
+        return Err(step_failure(ValidationFailureKind::ChildWorkflowNested));
+    }
+    if child.has_root_blocks {
+        return Err(step_failure(ValidationFailureKind::ChildWorkflowRootBlocks));
+    }
+    let for_each = node
+        .for_each
+        .as_ref()
+        .map(|for_each| validate_for_each(step_name, for_each, document, declared_inputs, child))
+        .transpose()?;
+
+    let mut inputs = BTreeMap::new();
+    for (input, reference) in &node.inputs {
+        let location = ValidationLocation::StepInput {
+            step: step_name.to_owned(),
+            input: input.clone(),
+        };
+        let failure = |kind| ValidationFailure::new(kind, location.clone());
+        let Some(&(value_type, may_be_omitted)) = child.inputs.get(input) else {
+            return Err(failure(ValidationFailureKind::ChildInputUndeclared));
+        };
+        if !matches!(
+            value_type,
+            WorkflowValueType::Text | WorkflowValueType::Json
+        ) {
+            return Err(failure(ValidationFailureKind::ChildInputUnsupported));
+        }
+        let mut reference = resolve_child_input_reference(
+            step_name,
+            reference,
+            document,
+            declared_inputs,
+            location.clone(),
+        )?;
+        // An element takes the child input's kind; the step checks the value when it
+        // starts (REQ-WFFORMAT-99).
+        if matches!(reference.source, ResolvedValueSource::Item { .. }) {
+            if for_each.is_none() {
+                return Err(failure(ValidationFailureKind::ItemReferenceRequiresForEach));
+            }
+            reference.value_type = value_type;
+        }
+        if reference.value_type != value_type {
+            return Err(failure(ValidationFailureKind::ChildInputTypeMismatch));
+        }
+        // A control value may be absent when the step starts (REQ-WFFORMAT-95).
+        if matches!(
+            reference.source,
+            ResolvedValueSource::Wait(_) | ResolvedValueSource::ControlsAnswers
+        ) && !may_be_omitted
+        {
+            return Err(failure(
+                ValidationFailureKind::ControlReferenceRequiresOptional,
+            ));
+        }
+        inputs.insert(
+            input.clone(),
+            ValidatedChildInput {
+                reference,
+                may_be_omitted,
+            },
+        );
+    }
+    if let Some((input, _)) = child
+        .inputs
+        .iter()
+        .find(|(input, (_, may_be_omitted))| !may_be_omitted && !node.inputs.contains_key(*input))
+    {
+        return Err(ValidationFailure::new(
+            ValidationFailureKind::ChildInputMissing,
+            ValidationLocation::StepInput {
+                step: step_name.to_owned(),
+                input: input.clone(),
+            },
+        ));
+    }
+
+    if child.exports.contains_key(CHILD_OUTCOME_OUTPUT) {
+        return Err(step_failure(ValidationFailureKind::ChildExportReserved));
+    }
+
+    let edges = validate_edges(step_name, node, child, document)?;
+    let outputs = document
+        .derived_outputs
+        .get(step_name)
+        .into_iter()
+        .flatten()
+        .map(|(name, output)| {
+            (
+                name.clone(),
+                ValidatedOutput {
+                    definition: output.clone(),
+                    value_type: output_value_type(output),
+                },
+            )
+        })
+        .collect();
+    Ok(ValidatedWorkflowStep {
+        common: ValidatedCommonStep {
+            failure_policy: FailurePolicy::Required,
+            condition: None,
+            condition_values: BTreeMap::new(),
+            prerequisites: Vec::new(),
+            evidence_prerequisites: Vec::new(),
+            cwd: None,
+            outputs,
+        },
+        workflow: node.workflow.clone(),
+        child_paths: child.paths.clone(),
+        inputs,
+        edges,
+        for_each,
+    })
+}
+
+/// `forEach` names a `json` root input or a `json` export of an earlier `workflow` step,
+/// and `empty` one of the child's outcomes (REQ-WFFORMAT-98).
+fn validate_for_each(
+    step_name: &str,
+    for_each: &ForEach,
+    document: &WorkflowDocument,
+    declared_inputs: &mut DeclaredInputs,
+    child: &ChildWorkflowSummary,
+) -> Result<ValidatedForEach, ValidationFailure> {
+    let location = ValidationLocation::StepForEach {
+        step: step_name.to_owned(),
+    };
+    let failure = |kind| ValidationFailure::new(kind, location.clone());
+    // Every failure to resolve the reference is the one closed answer.
+    let items = resolve_child_input_reference(
+        step_name,
+        &for_each.items,
+        document,
+        declared_inputs,
+        location.clone(),
+    )
+    .ok()
+    .filter(|items| {
+        matches!(
+            items.source,
+            ResolvedValueSource::Input(_) | ResolvedValueSource::Output(_)
+        ) && items.value_type == WorkflowValueType::Json
+    })
+    .ok_or_else(|| failure(ValidationFailureKind::ForEachReferenceInvalid))?;
+    if let Some(empty) = &for_each.empty
+        && !child.outcomes.contains(empty)
+    {
+        return Err(failure(ValidationFailureKind::ForEachEmptyUndeclared));
+    }
+    Ok(ValidatedForEach {
+        items,
+        empty: for_each.empty.clone(),
+    })
+}
+
+/// A mapped child input reads a root input, an output of an earlier step, or a control
+/// value (REQ-WFFORMAT-95); it adds no dependency (REQ-WFFORMAT-90, REQ-WFFORMAT-93).
+fn resolve_child_input_reference(
+    step_name: &str,
+    reference: &ValueReference,
+    document: &WorkflowDocument,
+    declared_inputs: &mut DeclaredInputs,
+    location: ValidationLocation,
+) -> Result<ResolvedValueReference, ValidationFailure> {
+    if let ValueReference::Output(output) = reference {
+        let failure = |kind| ValidationFailure::new(kind, location.clone());
+        if document.finalizers.contains_key(&output.node) {
+            return Err(failure(ValidationFailureKind::CrossPhaseOutputReference));
+        }
+        if output.node == step_name {
+            return Err(failure(ValidationFailureKind::SelfDependency));
+        }
+        // A later step has not run when the walk first reaches this one.
+        if step_index(document, &output.node) > step_index(document, step_name) {
+            return Err(failure(ValidationFailureKind::UnknownOutputStep));
+        }
+    }
+    resolve_value_reference(reference, document, declared_inputs, location)
+}
+
+fn step_index(document: &WorkflowDocument, step: &str) -> Option<usize> {
+    document.step_order.iter().position(|id| id == step)
+}
+
+/// Every child outcome has exactly one edge, and each target is a step of the workflow
+/// (later, the step itself or earlier), a parent outcome, a limited edge whose `then` is a
+/// step and whose `else` is an unlimited target (REQ-WFFORMAT-96), or a wait whose `then`
+/// is a step or an exit, whose `onHandBack`, present exactly for `approval`, is a step,
+/// and whose `rule`, present exactly for `external`, is checked (REQ-WFFORMAT-92,
+/// REQ-WFFORMAT-97).
+fn validate_edges(
+    step_name: &str,
+    node: &super::document::WorkflowNode,
+    child: &ChildWorkflowSummary,
+    document: &WorkflowDocument,
+) -> Result<BTreeMap<String, ValidatedEdgeTarget>, ValidationFailure> {
+    let edge_failure = |kind, outcome: &str| {
+        ValidationFailure::new(
+            kind,
+            ValidationLocation::StepEdge {
+                step: step_name.to_owned(),
+                outcome: outcome.to_owned(),
+            },
+        )
+    };
+    if let Some(outcome) = node.edges.keys().find(|key| !child.outcomes.contains(key)) {
+        return Err(edge_failure(
+            ValidationFailureKind::EdgeOutcomeUndeclared,
+            outcome,
+        ));
+    }
+    if let Some(outcome) = child
+        .outcomes
+        .iter()
+        .find(|outcome| !node.edges.contains_key(*outcome))
+    {
+        return Err(edge_failure(
+            ValidationFailureKind::EdgeOutcomeMissing,
+            outcome,
+        ));
+    }
+    let position = step_index(document, step_name);
+    node.edges
+        .iter()
+        .map(|(outcome, target)| {
+            validate_edge_target(target, position, document)
+                .map(|target| (outcome.clone(), target))
+                .map_err(|kind| edge_failure(kind, outcome))
+        })
+        .collect()
+}
+
+fn validate_edge_target(
+    target: &EdgeTarget,
+    position: Option<usize>,
+    document: &WorkflowDocument,
+) -> Result<ValidatedEdgeTarget, ValidationFailureKind> {
+    match target {
+        EdgeTarget::Step(step) => {
+            validate_step_target(step, document).map(ValidatedEdgeTarget::Step)
+        }
+        EdgeTarget::Exit(outcome) => {
+            let declared = if document.outcomes.is_empty() {
+                matches!(outcome.as_str(), "succeeded" | "failed")
+            } else {
+                document.outcomes.contains(outcome)
+            };
+            declared
+                .then(|| ValidatedEdgeTarget::Exit(outcome.clone()))
+                .ok_or(ValidationFailureKind::EdgeExitUndeclared)
+        }
+        EdgeTarget::Limited { then, limit, else_ } => {
+            // The schema admits only a step id or an exit as `then`, and no limited `else`.
+            if then.starts_with("exit.") || matches!(else_.as_ref(), EdgeTarget::Limited { .. }) {
+                return Err(ValidationFailureKind::EdgeLimitTargetInvalid);
+            }
+            Ok(ValidatedEdgeTarget::Limited {
+                then: validate_step_target(then, document)?,
+                limit: *limit,
+                else_: Box::new(validate_edge_target(else_, position, document)?),
+            })
+        }
+        EdgeTarget::Wait {
+            kind,
+            then,
+            on_hand_back,
+            rule,
+        } => {
+            match (kind, on_hand_back) {
+                (WaitKind::Approval, None) => {
+                    return Err(ValidationFailureKind::WaitHandBackRequired);
+                }
+                (WaitKind::Approval, Some(_)) | (_, None) => {}
+                (_, Some(_)) => return Err(ValidationFailureKind::WaitHandBackUnsupported),
+            }
+            let rule = match (kind, rule) {
+                (WaitKind::External, None) => return Err(ValidationFailureKind::WaitRuleRequired),
+                (WaitKind::External, Some(rule)) => {
+                    validate_wait_rule(rule, position, document)?;
+                    Some(rule.clone())
+                }
+                (_, Some(_)) => return Err(ValidationFailureKind::WaitRuleUnsupported),
+                (_, None) => None,
+            };
+            Ok(ValidatedEdgeTarget::Wait {
+                kind: *kind,
+                then: Box::new(validate_edge_target(then, position, document)?),
+                on_hand_back: on_hand_back
+                    .as_deref()
+                    .map(|step| validate_step_target(step, document))
+                    .transpose()?,
+                rule,
+            })
+        }
+    }
+}
+
+/// A step target names any step of the workflow: a later one starts in the attempt, the
+/// step itself or an earlier one continues the run (REQ-WFFORMAT-92).
+fn validate_step_target(
+    step: &str,
+    document: &WorkflowDocument,
+) -> Result<String, ValidationFailureKind> {
+    step_index(document, step)
+        .map(|_| step.to_owned())
+        .ok_or(ValidationFailureKind::EdgeTargetUnknown)
+}
+
+/// An `external` wait's authored rule (REQ-WFFORMAT-97): a provider other than `um`, at
+/// least one event, a `where` in the matcher's grammar, and each `inputs.<name>` a declared
+/// `text` input and each `outputs.<step>.<output>` a `text` export of a `workflow` step
+/// earlier than the waiting one, the values the wait record resolves.
+fn validate_wait_rule(
+    rule: &WaitRule,
+    position: Option<usize>,
+    document: &WorkflowDocument,
+) -> Result<(), ValidationFailureKind> {
+    if rule.source.is_empty() || rule.source == "um" || rule.event.is_empty() {
+        return Err(ValidationFailureKind::WaitRuleInvalid);
+    }
+    let conjuncts =
+        parse_where(&rule.where_).map_err(|_| ValidationFailureKind::WaitRuleInvalid)?;
+    let admitted = |operand: &Operand| match operand {
+        Operand::Inputs(name) => matches!(
+            document.inputs.get(name),
+            Some(InputDeclaration::Text { .. })
+        ),
+        Operand::Outputs { step, output } => {
+            step_index(document, step)
+                .is_some_and(|index| position.is_some_and(|waiting| index < waiting))
+                && matches!(
+                    document
+                        .derived_outputs
+                        .get(step)
+                        .and_then(|outputs| outputs.get(output)),
+                    Some(Output::ChildExport {
+                        value_type: WorkflowValueType::Text
+                    })
+                )
+        }
+        Operand::Event(_)
+        | Operand::RunId
+        | Operand::Wait(_)
+        | Operand::Literal(_)
+        | Operand::Bool(_) => true,
+    };
+    conjuncts
+        .iter()
+        .all(|(left, right)| admitted(left) && admitted(right))
+        .then_some(())
+        .ok_or(ValidationFailureKind::WaitRuleReferenceInvalid)
+}
+
+/// In an edge-scheduled workflow every step but the entry is the step target of some
+/// other step's edge, through a wait's `then` or `onHandBack` or a limited edge's `then` or
+/// `else` as well; an edge naming its own step reaches nothing new (REQ-WFFORMAT-92,
+/// REQ-WFFORMAT-93, REQ-WFFORMAT-96).
+fn validate_reachability(
+    document: &WorkflowDocument,
+    scheduling: &Scheduling,
+) -> Result<(), ValidationFailure> {
+    let Scheduling::Edges { entry } = scheduling else {
+        return Ok(());
+    };
+    fn step_targets<'a>(target: &'a EdgeTarget, targeted: &mut BTreeSet<&'a str>) {
+        match target {
+            EdgeTarget::Step(step) => {
+                targeted.insert(step);
+            }
+            EdgeTarget::Exit(_) => {}
+            EdgeTarget::Limited { then, else_, .. } => {
+                targeted.insert(then);
+                step_targets(else_, targeted);
+            }
+            EdgeTarget::Wait {
+                then, on_hand_back, ..
+            } => {
+                targeted.extend(on_hand_back.as_deref());
+                step_targets(then, targeted);
+            }
+        }
+    }
+    let mut targeted = BTreeSet::new();
+    for (id, step) in &document.steps {
+        if let NodeBody::Workflow(node) = &step.body {
+            let mut own = BTreeSet::new();
+            for target in node.edges.values() {
+                step_targets(target, &mut own);
+            }
+            own.remove(id.as_str());
+            targeted.extend(own);
+        }
+    }
+    match document
+        .step_order
+        .iter()
+        .find(|step| *step != entry && !targeted.contains(step.as_str()))
+    {
+        Some(step) => Err(ValidationFailure::new(
+            ValidationFailureKind::StepUnreachable,
+            ValidationLocation::Step { step: step.clone() },
+        )),
+        None => Ok(()),
+    }
 }
 
 fn validate_node_namespace(document: &WorkflowDocument) -> Result<(), ValidationFailure> {
@@ -674,7 +1369,7 @@ fn infer_condition_value_reference(
         ValueReference::Input { name }
             if matches!(
                 document.inputs.get(name),
-                Some(InputDeclaration::Text | InputDeclaration::Json { .. })
+                Some(InputDeclaration::Text { .. } | InputDeclaration::Json { .. })
             ) =>
         {
             Ok(())
@@ -686,7 +1381,12 @@ fn infer_condition_value_reference(
         ValueReference::FinalizationContext if consumer_role == WorkflowNodeRole::Finalizer => {
             Ok(())
         }
-        ValueReference::FinalizationContext => Err(ValidationFailure::new(
+        // The structural schema admits the control values and the element only in a
+        // `workflow` step's inputs, never in a condition.
+        ValueReference::FinalizationContext
+        | ValueReference::Wait { .. }
+        | ValueReference::ControlsAnswers
+        | ValueReference::Item { .. } => Err(ValidationFailure::new(
             ValidationFailureKind::InvalidConditionReference,
             location,
         )),
@@ -694,11 +1394,8 @@ fn infer_condition_value_reference(
             let (producer_role, producer_body, output) =
                 declared_output(document, reference, location.clone())?;
             if !matches!(
-                output,
-                Output::TextPath { .. }
-                    | Output::TextAgentResponse
-                    | Output::JsonPath { .. }
-                    | Output::JsonAgentResult { .. }
+                output_value_type(output),
+                WorkflowValueType::Text | WorkflowValueType::Json
             ) || reference.node == consumer_name && producer_role == consumer_role
                 || consumer_role == WorkflowNodeRole::Step
                     && producer_role == WorkflowNodeRole::Finalizer
@@ -845,6 +1542,8 @@ fn infer_body_prerequisites(
                 )?;
             }
         }
+        // References supply values and never order an edge-scheduled step (REQ-WFFORMAT-93).
+        NodeBody::Workflow(_) => {}
     }
     Ok(())
 }
@@ -880,8 +1579,13 @@ fn infer_reference_prerequisite(
 ) -> Result<(), ValidationFailure> {
     match reference {
         // The structural schema admits `finalization.context` only where a finalizer may
-        // bind it, and the engine value adds no prerequisite.
-        ValueReference::Input { .. } | ValueReference::FinalizationContext => return Ok(()),
+        // bind it and the control values only in a `workflow` step's inputs, and an engine
+        // value adds no prerequisite.
+        ValueReference::Input { .. }
+        | ValueReference::FinalizationContext
+        | ValueReference::Wait { .. }
+        | ValueReference::ControlsAnswers
+        | ValueReference::Item { .. } => return Ok(()),
         ValueReference::Output(reference) => {
             let (producer_role, producer_body, output) =
                 declared_output(document, reference, location.clone())?;
@@ -1011,7 +1715,9 @@ fn validate_node_outputs(
                 Output::TextPath { .. }
                 | Output::JsonPath { .. }
                 | Output::FilePath { .. }
-                | Output::GitBranchWorkspace => None,
+                | Output::GitBranchWorkspace
+                | Output::ChildExport { .. }
+                | Output::ChildOutcome => None,
             };
             if let Some(kind) = failure_kind {
                 return Err(output_failure(kind, name, role, output_name));
@@ -1026,9 +1732,11 @@ fn output_path(output: &Output) -> Option<&str> {
         Output::TextPath { path }
         | Output::JsonPath { path, .. }
         | Output::FilePath { path, .. } => Some(path),
-        Output::TextAgentResponse | Output::JsonAgentResult { .. } | Output::GitBranchWorkspace => {
-            None
-        }
+        Output::TextAgentResponse
+        | Output::JsonAgentResult { .. }
+        | Output::GitBranchWorkspace
+        | Output::ChildExport { .. }
+        | Output::ChildOutcome => None,
     }
 }
 
@@ -1093,19 +1801,19 @@ fn resolve_condition_predicate(
     node_name: &str,
     role: WorkflowNodeRole,
     document: &WorkflowDocument,
-    required_inputs: &mut RequiredInputs,
+    declared_inputs: &mut DeclaredInputs,
     condition_values: &mut BTreeMap<String, ResolvedValueSource>,
 ) -> Result<ResolvedPredicate, ValidationFailure> {
     let resolve_child =
         |child: &ConditionPredicate,
-         required_inputs: &mut RequiredInputs,
+         declared_inputs: &mut DeclaredInputs,
          condition_values: &mut BTreeMap<String, ResolvedValueSource>| {
             resolve_condition_predicate(
                 child,
                 node_name,
                 role,
                 document,
-                required_inputs,
+                declared_inputs,
                 condition_values,
             )
         };
@@ -1113,20 +1821,20 @@ fn resolve_condition_predicate(
         ConditionPredicate::All(children) => Ok(ResolvedPredicate::All(
             children
                 .iter()
-                .map(|child| resolve_child(child, required_inputs, condition_values))
+                .map(|child| resolve_child(child, declared_inputs, condition_values))
                 .collect::<Result<Vec<_>, _>>()?
                 .into(),
         )),
         ConditionPredicate::Any(children) => Ok(ResolvedPredicate::Any(
             children
                 .iter()
-                .map(|child| resolve_child(child, required_inputs, condition_values))
+                .map(|child| resolve_child(child, declared_inputs, condition_values))
                 .collect::<Result<Vec<_>, _>>()?
                 .into(),
         )),
         ConditionPredicate::Not(child) => Ok(ResolvedPredicate::Not(Box::new(resolve_child(
             child,
-            required_inputs,
+            declared_inputs,
             condition_values,
         )?))),
         ConditionPredicate::Equals(operands) => resolve_condition_equals(
@@ -1134,7 +1842,7 @@ fn resolve_condition_predicate(
             node_name,
             role,
             document,
-            required_inputs,
+            declared_inputs,
             condition_values,
         ),
         ConditionPredicate::Exists(selector) => {
@@ -1143,7 +1851,7 @@ fn resolve_condition_predicate(
                 node_name,
                 role,
                 document,
-                required_inputs,
+                declared_inputs,
             )?;
             if kind != ConditionValueKind::Json {
                 return Err(ValidationFailure::new(
@@ -1182,7 +1890,7 @@ fn resolve_condition_equals(
     node_name: &str,
     role: WorkflowNodeRole,
     document: &WorkflowDocument,
-    required_inputs: &mut RequiredInputs,
+    declared_inputs: &mut DeclaredInputs,
     condition_values: &mut BTreeMap<String, ResolvedValueSource>,
 ) -> Result<ResolvedPredicate, ValidationFailure> {
     struct ReferenceResolution {
@@ -1197,7 +1905,7 @@ fn resolve_condition_equals(
             continue;
         };
         let (canonical, source, kind) =
-            resolve_condition_reference(reference, node_name, role, document, required_inputs)?;
+            resolve_condition_reference(reference, node_name, role, document, declared_inputs)?;
         if kind == ConditionValueKind::Text && pointer.is_some() {
             return Err(ValidationFailure::new(
                 ValidationFailureKind::InvalidConditionType,
@@ -1288,12 +1996,12 @@ fn resolve_condition_reference(
     node_name: &str,
     role: WorkflowNodeRole,
     document: &WorkflowDocument,
-    required_inputs: &mut RequiredInputs,
+    declared_inputs: &mut DeclaredInputs,
 ) -> Result<(String, ResolvedValueSource, ConditionValueKind), ValidationFailure> {
     let resolved = resolve_value_reference(
         reference,
         document,
-        required_inputs,
+        declared_inputs,
         condition_location(node_name, role),
     )?;
     let kind = match resolved.value_type {
@@ -1312,6 +2020,10 @@ fn resolve_condition_reference(
         ResolvedValueSource::Input(name) => format!("inputs.{name}"),
         ResolvedValueSource::Output(output) => output.reference(),
         ResolvedValueSource::FinalizationContext => "finalization.context".to_owned(),
+        ResolvedValueSource::Wait(field) => format!("wait.{field}"),
+        ResolvedValueSource::ControlsAnswers => "controls.answers".to_owned(),
+        ResolvedValueSource::Item { field: None } => "item".to_owned(),
+        ResolvedValueSource::Item { field: Some(field) } => format!("item.{field}"),
     };
     Ok((canonical, resolved.source, kind))
 }
@@ -1323,7 +2035,7 @@ fn validate_body(
     prerequisites: &[ResolvedDirectPrerequisite],
     document: &WorkflowDocument,
     agent_profiles: &BTreeMap<String, ValidatedHarness>,
-    required_inputs: &mut RequiredInputs,
+    declared_inputs: &mut DeclaredInputs,
 ) -> Result<ValidatedStep, ValidationFailure> {
     let mut condition_values = BTreeMap::new();
     let condition = common_node(body)
@@ -1335,7 +2047,7 @@ fn validate_body(
                 node_name,
                 role,
                 document,
-                required_inputs,
+                declared_inputs,
                 &mut condition_values,
             )
         })
@@ -1355,7 +2067,7 @@ fn validate_body(
                 role,
                 &command.inputs,
                 document,
-                required_inputs,
+                declared_inputs,
             )?,
             argv: command.argv.clone(),
         })),
@@ -1373,7 +2085,7 @@ fn validate_body(
                 role,
                 &agent.agent,
                 document,
-                required_inputs,
+                declared_inputs,
                 harness,
             )?;
             Ok(ValidatedStep::Agent(ValidatedAgentStep {
@@ -1381,6 +2093,12 @@ fn validate_body(
                 agent: validated_agent,
             }))
         }
+        NodeBody::Workflow(_) => Err(ValidationFailure::new(
+            ValidationFailureKind::EdgeSchedulingKind,
+            ValidationLocation::Step {
+                step: node_name.to_owned(),
+            },
+        )),
     }
 }
 
@@ -1421,6 +2139,7 @@ fn evidence_prerequisites(
                 }
             }
         }
+        NodeBody::Workflow(_) => {}
     }
     descriptors.sort();
     descriptors.dedup();
@@ -1515,7 +2234,7 @@ fn validate_command_inputs(
     role: WorkflowNodeRole,
     inputs: &BTreeMap<String, ValueReference>,
     document: &WorkflowDocument,
-    required_inputs: &mut RequiredInputs,
+    declared_inputs: &mut DeclaredInputs,
 ) -> Result<BTreeMap<String, ResolvedValueReference>, ValidationFailure> {
     inputs
         .iter()
@@ -1523,7 +2242,7 @@ fn validate_command_inputs(
             resolve_value_reference(
                 reference,
                 document,
-                required_inputs,
+                declared_inputs,
                 node_input_location(node_name, role, input_name),
             )
             .map(|input| (input_name.clone(), input))
@@ -1534,12 +2253,12 @@ fn validate_command_inputs(
 fn resolve_value_reference(
     reference: &ValueReference,
     document: &WorkflowDocument,
-    required_inputs: &mut RequiredInputs,
+    declared_inputs: &mut DeclaredInputs,
     location: ValidationLocation,
 ) -> Result<ResolvedValueReference, ValidationFailure> {
     match reference {
         ValueReference::Input { name } => {
-            let Some(value_type) = required_inputs.get(name).copied() else {
+            let Some(value_type) = declared_inputs.get(name).copied() else {
                 return Err(ValidationFailure::new(
                     ValidationFailureKind::UnknownInput,
                     location,
@@ -1569,6 +2288,23 @@ fn resolve_value_reference(
             source: ResolvedValueSource::FinalizationContext,
             value_type: WorkflowValueType::Json,
         }),
+        // Only a `workflow` step's inputs decode these (REQ-WFFORMAT-95).
+        ValueReference::Wait { field } => Ok(ResolvedValueReference {
+            source: ResolvedValueSource::Wait(field.clone()),
+            value_type: WorkflowValueType::Text,
+        }),
+        ValueReference::ControlsAnswers => Ok(ResolvedValueReference {
+            source: ResolvedValueSource::ControlsAnswers,
+            value_type: WorkflowValueType::Json,
+        }),
+        // An element is any JSON value; the child input it maps onto gives it its kind
+        // (REQ-WFFORMAT-99).
+        ValueReference::Item { field } => Ok(ResolvedValueReference {
+            source: ResolvedValueSource::Item {
+                field: field.clone(),
+            },
+            value_type: WorkflowValueType::Json,
+        }),
     }
 }
 
@@ -1580,8 +2316,7 @@ fn declared_output<'a>(
     let (role, body) = node_body(document, &reference.node).ok_or_else(|| {
         ValidationFailure::new(ValidationFailureKind::UnknownOutputStep, location.clone())
     })?;
-    let output = common_node(body)
-        .outputs
+    let output = node_outputs(document, &reference.node, body)
         .get(&reference.output)
         .ok_or_else(|| ValidationFailure::new(ValidationFailureKind::UnknownOutput, location))?;
     Ok((role, body, output))
@@ -1611,7 +2346,7 @@ fn validate_agent(
     role: WorkflowNodeRole,
     agent: &Agent,
     document: &WorkflowDocument,
-    required_inputs: &mut RequiredInputs,
+    declared_inputs: &mut DeclaredInputs,
     harness: ValidatedHarness,
 ) -> Result<ValidatedAgent, ValidationFailure> {
     let text = agent
@@ -1626,7 +2361,7 @@ fn validate_agent(
                 index,
                 source,
                 document,
-                required_inputs,
+                declared_inputs,
                 MessageDestination::Text,
             )
         })
@@ -1643,7 +2378,7 @@ fn validate_agent(
                 index,
                 source,
                 document,
-                required_inputs,
+                declared_inputs,
                 MessageDestination::Attachment,
             )
         })
@@ -1669,7 +2404,7 @@ fn validate_message_source(
     index: usize,
     source: &MessageSource,
     document: &WorkflowDocument,
-    required_inputs: &mut RequiredInputs,
+    declared_inputs: &mut DeclaredInputs,
     destination: MessageDestination,
 ) -> Result<ValidatedMessageSource, ValidationFailure> {
     let attachment = matches!(destination, MessageDestination::Attachment);
@@ -1681,7 +2416,7 @@ fn validate_message_source(
         }
         MessageSource::Reference(reference) => reference,
     };
-    let value = resolve_value_reference(reference, document, required_inputs, location.clone())?;
+    let value = resolve_value_reference(reference, document, declared_inputs, location.clone())?;
     let compatible = match destination {
         MessageDestination::Text => value.value_type == WorkflowValueType::Text,
         MessageDestination::Attachment => matches!(
@@ -1712,7 +2447,7 @@ fn resolve_export(
     let Some((role, body)) = node_body(document, &reference.node) else {
         return Err(invalid_export(name));
     };
-    let Some(output) = common_node(body).outputs.get(&reference.output) else {
+    let Some(output) = node_outputs(document, &reference.node, body).get(&reference.output) else {
         return Err(invalid_export(name));
     };
     if common_node(body).failure_policy == FailurePolicy::Advisory {
@@ -1745,6 +2480,52 @@ fn resolve_export(
     })
 }
 
+/// Resolve `outcomes` and `outcome` (REQ-WFFORMAT-87, REQ-WFFORMAT-88). The source must
+/// be a `text` output of a required ordinary step without a `condition`, so that a succeeded
+/// run always holds its value.
+fn resolve_outcome(
+    document: &WorkflowDocument,
+) -> Result<Option<ValidatedOutcome>, ValidationFailure> {
+    let failure = |kind| ValidationFailure::new(kind, ValidationLocation::Outcome);
+    let declaration = match (&document.outcome, document.outcomes.is_empty()) {
+        (None, true) => return Ok(None),
+        (Some(declaration), false) => declaration,
+        _ => return Err(failure(ValidationFailureKind::InvalidOutcomeDeclaration)),
+    };
+    if !document.outcomes.contains(&declaration.on_failure) {
+        return Err(failure(ValidationFailureKind::InvalidOutcomeDeclaration));
+    }
+    let reference = &declaration.from;
+    let source = match node_body(document, &reference.node) {
+        Some((WorkflowNodeRole::Step, body)) => {
+            let common = common_node(body);
+            common
+                .outputs
+                .get(&reference.output)
+                .filter(|output| {
+                    common.failure_policy != FailurePolicy::Advisory
+                        && common.condition.is_none()
+                        && output_value_type(output) == WorkflowValueType::Text
+                })
+                .map(|_| ResolvedOutputSource {
+                    node: WorkflowNode {
+                        id: reference.node.clone(),
+                        role: WorkflowNodeRole::Step,
+                    },
+                    output: reference.output.clone(),
+                    value_type: WorkflowValueType::Text,
+                })
+        }
+        Some((WorkflowNodeRole::Finalizer, _)) | None => None,
+    }
+    .ok_or_else(|| failure(ValidationFailureKind::InvalidOutcomeSource))?;
+    Ok(Some(ValidatedOutcome {
+        names: document.outcomes.clone(),
+        source,
+        on_failure: declaration.on_failure.clone(),
+    }))
+}
+
 fn resolve_export_presentation(
     name: &str,
     presentation: &ExportPresentation,
@@ -1775,8 +2556,7 @@ fn resolve_export_presentation(
                         location.clone(),
                     )
                 })?;
-                let output = common_node(body)
-                    .outputs
+                let output = node_outputs(document, &reference.node, body)
                     .get(&reference.output)
                     .ok_or_else(|| {
                         ValidationFailure::new(
@@ -1858,10 +2638,34 @@ fn node_common<'a>(
     }
 }
 
+/// A `workflow` step is required, unconditional and declares no outputs of its own.
+static WORKFLOW_STEP_COMMON: CommonNode = CommonNode {
+    failure_policy: FailurePolicy::Required,
+    condition: None,
+    cwd: None,
+    outputs: BTreeMap::new(),
+};
+
 fn common_node(body: &NodeBody) -> &CommonNode {
     match body {
         NodeBody::Command(command) => &command.common,
         NodeBody::Agent(agent) => &agent.common,
+        NodeBody::Workflow(_) => &WORKFLOW_STEP_COMMON,
+    }
+}
+
+/// A node's declared outputs, or a `workflow` step's derived ones.
+fn node_outputs<'a>(
+    document: &'a WorkflowDocument,
+    name: &str,
+    body: &'a NodeBody,
+) -> &'a BTreeMap<String, Output> {
+    match body {
+        NodeBody::Workflow(_) => document
+            .derived_outputs
+            .get(name)
+            .unwrap_or(&WORKFLOW_STEP_COMMON.outputs),
+        NodeBody::Command(_) | NodeBody::Agent(_) => &common_node(body).outputs,
     }
 }
 
@@ -1923,6 +2727,8 @@ fn output_value_type(output: &Output) -> WorkflowValueType {
         Output::JsonPath { .. } | Output::JsonAgentResult { .. } => WorkflowValueType::Json,
         Output::FilePath { .. } => WorkflowValueType::File,
         Output::GitBranchWorkspace => WorkflowValueType::GitBranch,
+        Output::ChildExport { value_type } => *value_type,
+        Output::ChildOutcome => WorkflowValueType::Text,
     }
 }
 

@@ -55,27 +55,27 @@ command, captures text, JSON, and file outputs from paths, and supplies all thre
 to a downstream command:
 
 ```sh
-um workflow run \
-  --source-root . \
+um workflow run create \
+  --path . \
+  --workflow command-dataflow.yaml \
   --execution-root "$execution_root" \
   --run-dir "$run_dir" \
   --input-text-file request prompts/command-dataflow-request.md \
   --input-attachment evidence text/plain attachments/aurora-brief.txt \
-  --plain \
-  command-dataflow.yaml
+  --plain
 ```
 
 The Claude attachment workflow includes `attachments/aurora-brief.txt` statically and
 accepts required named instructions and updates:
 
 ```sh
-um workflow run \
-  --source-root . \
+um workflow run create \
+  --path . \
+  --workflow agent-claude-attachment.yaml \
   --execution-root "$execution_root" \
   --run-dir "$run_dir" \
   --input-text-file request prompts/claude-attachment-focus.md \
-  --input-attachment updates text/plain attachments/aurora-update.txt \
-  agent-claude-attachment.yaml
+  --input-attachment updates text/plain attachments/aurora-update.txt
 ```
 
 Each command must use a new run directory. The execution root must meet the selected
@@ -133,25 +133,25 @@ run through both status and archived-view commands:
     --source-root . \
     "$workflow"
 
-  um workflow run \
-    --source-root . \
+  um workflow run create \
+    --path . \
+    --workflow "$workflow" \
     --execution-root "$execution_root" \
     --run-dir "$run_dir" \
     --max-parallel 4 \
-    --json \
-    "$workflow"
+    --json
 
-  um workflow status "$run_dir" --json
-  um workflow view "$run_dir" --plain
+  um workflow run status "$run_dir" --json
+  um workflow run view "$run_dir" --plain
 )
 ```
 
-`workflow run` refuses to overwrite an existing run directory. To retry a retained run
-whose latest attempt failed or was cancelled, first use `workflow status` to confirm
+`workflow run create` refuses to overwrite an existing run directory. To retry a retained run
+whose latest attempt failed or was cancelled, first use `workflow run status` to confirm
 that it is eligible, then run:
 
 ```sh
-um workflow retry \
+um workflow run retry \
   "$run_dir" \
   --execution-root "$execution_root" \
   --json

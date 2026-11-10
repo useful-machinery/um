@@ -1,0 +1,13 @@
+schemaVersion: 1
+inputs:
+  ticket:
+    kind: text
+steps:
+  prepare:
+    kind: cmd
+    command:
+      argv: ["true"]
+mirror:
+  linear:
+    issue: inputs.ticket
+    onExit: {comment: "Exited"}

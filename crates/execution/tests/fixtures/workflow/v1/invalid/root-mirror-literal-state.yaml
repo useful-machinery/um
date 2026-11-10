@@ -1,0 +1,16 @@
+schemaVersion: 1
+inputs:
+  ticket:
+    kind: text
+steps:
+  prepare:
+    kind: cmd
+    command:
+      argv: ["true"]
+bindings:
+  done: {kind: linear.state, default: "Done"}
+mirror:
+  linear:
+    issue: inputs.ticket
+    onOutcome:
+      succeeded: {state: Done}

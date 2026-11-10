@@ -37,6 +37,7 @@ fn schema(path: &str) -> jsonschema::Validator {
 fn retry_args(run_directory: &Path, execution_root: &Path) -> Vec<String> {
     vec![
         "workflow".to_owned(),
+        "run".to_owned(),
         "retry".to_owned(),
         "--json".to_owned(),
         "--execution-root".to_owned(),
@@ -162,6 +163,7 @@ fn local_handlerless_and_command_repair_publish_exact_recovery_evidence() {
 
         let status = run(&[
             "workflow".to_owned(),
+            "run".to_owned(),
             "status".to_owned(),
             "--json".to_owned(),
             run_directory.to_string_lossy().into_owned(),
@@ -175,6 +177,7 @@ fn local_handlerless_and_command_repair_publish_exact_recovery_evidence() {
         );
         let view = run(&[
             "workflow".to_owned(),
+            "run".to_owned(),
             "view".to_owned(),
             "--json".to_owned(),
             run_directory.to_string_lossy().into_owned(),
@@ -185,6 +188,7 @@ fn local_handlerless_and_command_repair_publish_exact_recovery_evidence() {
         assert_eq!(view["result"]["steps"][0], *step);
         let plain_status = run(&[
             "workflow".to_owned(),
+            "run".to_owned(),
             "status".to_owned(),
             "--plain".to_owned(),
             "--color".to_owned(),
@@ -196,6 +200,7 @@ fn local_handlerless_and_command_repair_publish_exact_recovery_evidence() {
         assert!(plain_status.contains(&format!("invocations: {invocations} observed")));
         let plain_view = run(&[
             "workflow".to_owned(),
+            "run".to_owned(),
             "view".to_owned(),
             "--plain".to_owned(),
             "--color".to_owned(),
@@ -432,6 +437,7 @@ fn handler_launch_refusal_is_classified_like_a_step_command() {
 
     let view = run(&[
         "workflow".to_owned(),
+        "run".to_owned(),
         "view".to_owned(),
         "--json".to_owned(),
         run_directory.to_string_lossy().into_owned(),
@@ -523,6 +529,7 @@ fn active_status_reports_handler_kind_and_recheck_decision() {
     );
     let handler_status = run(&[
         "workflow".to_owned(),
+        "run".to_owned(),
         "status".to_owned(),
         "--plain".to_owned(),
         "--color".to_owned(),
@@ -548,6 +555,7 @@ fn active_status_reports_handler_kind_and_recheck_decision() {
     );
     let target_status = run(&[
         "workflow".to_owned(),
+        "run".to_owned(),
         "status".to_owned(),
         "--plain".to_owned(),
         "--color".to_owned(),
@@ -634,6 +642,7 @@ fn status_and_view_dispatch_unsupported_recovery_versions_without_rewriting() {
     let unsupported_state_bytes = fs::read(run_directory.join("state.json")).unwrap();
     let status = run(&[
         "workflow".to_owned(),
+        "run".to_owned(),
         "status".to_owned(),
         "--json".to_owned(),
         run_directory.to_string_lossy().into_owned(),
@@ -672,6 +681,7 @@ fn status_and_view_dispatch_unsupported_recovery_versions_without_rewriting() {
 
     let view = run(&[
         "workflow".to_owned(),
+        "run".to_owned(),
         "view".to_owned(),
         "--json".to_owned(),
         run_directory.to_string_lossy().into_owned(),
@@ -703,6 +713,7 @@ fn terminal_pending_publication_reconciles_the_committed_result() {
 
     let status = run(&[
         "workflow".to_owned(),
+        "run".to_owned(),
         "status".to_owned(),
         "--json".to_owned(),
         run_directory.to_string_lossy().into_owned(),
@@ -719,6 +730,7 @@ fn terminal_pending_publication_reconciles_the_committed_result() {
 
     let view = run(&[
         "workflow".to_owned(),
+        "run".to_owned(),
         "view".to_owned(),
         "--json".to_owned(),
         run_directory.to_string_lossy().into_owned(),
@@ -751,6 +763,7 @@ fn archived_view_rejects_invocation_bytes_that_disagree_with_durable_evidence() 
 
     let view = run(&[
         "workflow".to_owned(),
+        "run".to_owned(),
         "view".to_owned(),
         "--json".to_owned(),
         run_directory.to_string_lossy().into_owned(),

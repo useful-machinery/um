@@ -5,13 +5,15 @@ use clap::{Arg, ArgAction, Command, CommandFactory};
 
 use super::Cli;
 
-const LEAVES: &str = "accept activate begin cancel complete continue create decline delete disable doctor download drain enable end enroll history issue leave link list login logout move preview propose reference remove rename replay request retire retry revoke revoke-previous-secret rotate-secret run schema seal serve set show signup status test update upload uses validate version view wait";
-const GROUPS: &str = "account action activation artifact audit auth authorization connection credential delegation deletion delivery github gitlab grant identity input input-set installation invitation linear member occurrence organization pool project publication repository run runner runner-pool schedule service-principal setup state team trigger evaluation webhook workflow";
+const LEAVES: &str = "accept activate answer approve begin cancel complete continue create decline delete disable doctor download drain enable end enroll hand-back history issue leave lift link list login logout move preview propose publish reference release remove rename replay request restart resume retire retry revoke revoke-previous-secret rotate-secret run schema seal serve set show signup status stop test update upgrade upload uses validate version view wait withdraw";
+const GROUPS: &str = "account action activation artifact audit auth authorization connection credential definition delegation deletion delivery github gitlab grant identity input input-set installation invitation linear member occurrence organization pool project publication repository run runner runner-pool schedule service-principal setup state team trigger evaluation webhook workflow";
 const COMMON: [&str; 3] = ["json", "service-api-key-file", "allow-insecure-http"];
-// These endpoints have no limit/cursor contract; see cli/docs/output-style.md.
-const UNPAGINATED_LISTS: [&str; 2] = [
+// These leaves have no limit/cursor contract; see cli/docs/output-style.md.
+const UNPAGINATED_LISTS: [&str; 4] = [
     "connection github installation list",
     "connection github repository list",
+    "workflow definition list",
+    "workflow run list",
 ];
 
 // These identities are backed by shared Args or identifier argument types in cli/src/cli.rs
@@ -28,7 +30,6 @@ fn semantic_class(path: &str, long: &str) -> Option<String> {
         | "repository-id"
         | "timeout"
         | "yes"
-        | "input-text"
         | "input-text-file"
         | "input-json"
         | "input-json-file"
@@ -58,6 +59,12 @@ fn semantic_class(path: &str, long: &str) -> Option<String> {
             | "runner list"
             | "service-principal credential list" => "limit:200",
             _ => return None,
+        },
+        // `run restart` replaces one input of the successor's current revision, not a
+        // required input of a new run.
+        "input-text" => match path {
+            "workflow run restart" => "input-text:restart",
+            _ => "input-text",
         },
         "json" => {
             // JsonArgs<F> is parameterized by output family; deletion cancellation

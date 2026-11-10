@@ -98,10 +98,12 @@ pub(crate) enum FailureCode {
     CommandLaunchPermissionDenied,
     CommandLaunchInvalidInput,
     CommandLaunchFailed,
+    ChildAdmissionRejected,
     JsonPointerMissing,
     CommandExit,
     CommandWaitFailed,
     ExecutionTaskUnavailable,
+    ChildRunInterrupted,
     OutputUnsupported,
     CaptureTaskUnavailable,
     OutputPathAbsolute,
@@ -116,6 +118,7 @@ pub(crate) enum FailureCode {
     OutputInvalidJson,
     OutputDuplicateJsonMember,
     OutputJsonSchemaMismatch,
+    OutcomeUndeclared,
     CapturedFileCountLimit,
     CapturedFileSizeLimit,
     CapturedTotalSizeLimit,
@@ -348,9 +351,10 @@ impl FailureDetail {
             | Code::ResultSettlementFailed => {
                 matches!(self.phase, Phase::Start | Phase::Execution)
             }
-            Code::CommandExit | Code::CommandWaitFailed | Code::ExecutionTaskUnavailable => {
-                self.phase == Phase::Execution
-            }
+            Code::CommandExit
+            | Code::CommandWaitFailed
+            | Code::ExecutionTaskUnavailable
+            | Code::ChildRunInterrupted => self.phase == Phase::Execution,
             Code::OutputUnsupported
             | Code::CaptureTaskUnavailable
             | Code::OutputPathAbsolute
@@ -365,6 +369,7 @@ impl FailureDetail {
             | Code::OutputInvalidJson
             | Code::OutputDuplicateJsonMember
             | Code::OutputJsonSchemaMismatch
+            | Code::OutcomeUndeclared
             | Code::CapturedFileCountLimit
             | Code::CapturedFileSizeLimit
             | Code::CapturedTotalSizeLimit
@@ -584,6 +589,8 @@ impl BlockedDetail {
 pub(crate) enum NonExecutionCode {
     FailureStop,
     FinalizerTriggerNotSelected,
+    /// An edge-scheduled walk exited before reaching the step (REQ-WFEXEC-58).
+    NotReached,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -605,6 +612,12 @@ impl NonExecutionDetail {
         }
     }
 
+    pub(crate) const fn not_reached() -> Self {
+        Self {
+            code: NonExecutionCode::NotReached,
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn for_role(
         role: WorkflowNodeRole,
@@ -612,11 +625,13 @@ impl NonExecutionDetail {
     ) -> Result<Self, EvidenceError> {
         if matches!(
             (role, code),
-            (WorkflowNodeRole::Step, NonExecutionCode::FailureStop)
-                | (
-                    WorkflowNodeRole::Finalizer,
-                    NonExecutionCode::FinalizerTriggerNotSelected
-                )
+            (
+                WorkflowNodeRole::Step,
+                NonExecutionCode::FailureStop | NonExecutionCode::NotReached
+            ) | (
+                WorkflowNodeRole::Finalizer,
+                NonExecutionCode::FinalizerTriggerNotSelected
+            )
         ) {
             Ok(Self { code })
         } else {
@@ -937,6 +952,9 @@ fn start_failure_detail(source: &StepStartFailure) -> Result<FailureDetail, Evid
             },
         ),
         StepStartFailure::CommandLaunch(source) => command_launch_detail(source),
+        StepStartFailure::ChildAdmission { .. } => {
+            code(FailurePhase::Start, FailureCode::ChildAdmissionRejected)
+        }
     };
     detail.validate()?;
     Ok(detail)
@@ -1085,6 +1103,9 @@ fn execution_failure_detail(source: &StepExecutionFailure) -> FailureDetail {
             FailurePhase::Execution,
             FailureCode::ExecutionTaskUnavailable,
         ),
+        StepExecutionFailure::ChildInterrupted => {
+            code(FailurePhase::Execution, FailureCode::ChildRunInterrupted)
+        }
     }
 }
 
@@ -1093,6 +1114,9 @@ fn output_capture_failure_detail(source: &OutputCaptureFailure) -> FailureDetail
         OutputCaptureFailure::StepUnavailable => (FailureCode::StepUnavailable, None),
         OutputCaptureFailure::UnsupportedOutput => (FailureCode::OutputUnsupported, None),
         OutputCaptureFailure::TaskUnavailable => (FailureCode::CaptureTaskUnavailable, None),
+        OutputCaptureFailure::OutcomeUndeclared { output } => {
+            (FailureCode::OutcomeUndeclared, Some(output.clone()))
+        }
         OutputCaptureFailure::Capture(source) => (
             match source.kind() {
                 CaptureFailureKind::AbsolutePath => FailureCode::OutputPathAbsolute,
@@ -1226,6 +1250,69 @@ mod tests {
 
     use super::super::agent::{AgentHarnessFailureDetail, HarnessFailureDiagnostic};
     use super::*;
+
+    // REQ-WFEXEC-58
+    #[test]
+    fn a_step_an_edge_walk_never_reached_validates_in_a_succeeded_result() {
+        let result = |code: &str| {
+            let document = json!({
+                "schemaVersion": 1,
+                "attemptNumber": 1,
+                "workflow": {
+                    "path": "workflow.yaml",
+                    "provenance": { "kind": "local", "sourceRoot": "/tmp/source" },
+                    "digest": { "algorithm": "sha256", "value": "1".repeat(64) }
+                },
+                "execution": {
+                    "executionRoot": "/tmp/execution",
+                    "maximumParallelSteps": 1,
+                    "startedAt": "2026-08-02T12:01:44Z",
+                    "finishedAt": "2026-08-02T12:01:45Z",
+                    "durationMilliseconds": 1000
+                },
+                "commandOutputPolicy": {
+                    "encoding": "base64",
+                    "maximumRetainedBytesPerStream": super::super::MAXIMUM_RETAINED_BYTES_PER_STREAM
+                },
+                "outcome": "succeeded",
+                "forceAbort": null,
+                "steps": [{
+                    "id": "design",
+                    "role": "step",
+                    "kind": "agent",
+                    "failurePolicy": "required",
+                    "state": "succeeded",
+                    "startedAt": "2026-08-02T12:01:44Z",
+                    "durationMilliseconds": 1000
+                }, {
+                    "id": "build",
+                    "role": "step",
+                    "kind": "agent",
+                    "failurePolicy": "required",
+                    "state": "not_run",
+                    "detail": { "code": code }
+                }],
+                "exports": {}
+            });
+            let mut bytes = serde_json::to_vec_pretty(&document).unwrap();
+            bytes.push(b'\n');
+            super::super::result_metadata::decode(&bytes)
+        };
+        let reached = result("not_reached").unwrap();
+        assert_eq!(
+            reached.steps[1].detail,
+            Some(NodeDetail::NotRun(NonExecutionDetail::not_reached()))
+        );
+        // A failure stop never belongs to a succeeded run.
+        assert_eq!(
+            result("failure_stop").map(|_| ()),
+            Err(super::super::result_metadata::ResultMetadataError)
+        );
+        assert_eq!(
+            NonExecutionDetail::for_role(WorkflowNodeRole::Finalizer, NonExecutionCode::NotReached),
+            Err(EvidenceError::NodeRoleMismatch)
+        );
+    }
 
     // REQ-EVIDENCE-12
     #[test]

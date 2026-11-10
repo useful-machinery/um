@@ -116,6 +116,8 @@ impl RunTimingObservation {
                     WorkflowState::Succeeded
                         | WorkflowState::Failed { .. }
                         | WorkflowState::Cancelled { .. }
+                        | WorkflowState::Waiting { .. }
+                        | WorkflowState::Continued { .. }
                 ) =>
             {
                 timing.terminal.get_or_insert(observed_at);
@@ -159,6 +161,8 @@ fn observation_needs_timing_sample<Deadline>(observation: &ExecutionObservation<
             WorkflowState::Succeeded
                 | WorkflowState::Failed { .. }
                 | WorkflowState::Cancelled { .. }
+                | WorkflowState::Waiting { .. }
+                | WorkflowState::Continued { .. }
         ),
         TransitionEvent::Step { .. } => false,
     }

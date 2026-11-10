@@ -1,0 +1,27 @@
+schemaVersion: 1
+inputs:
+  ticket:
+    kind: text
+outcomes: [landed, failed]
+steps:
+  design:
+    kind: workflow
+    workflow: design.yaml
+    inputs:
+      ticket:
+        ref: inputs.ticket
+    on:
+      planned: build
+      blocked: exit.failed
+      failed:
+        wait: repair
+        then: exit.failed
+  build:
+    kind: workflow
+    workflow: build.yaml
+    inputs:
+      parts:
+        ref: outputs.design.parts
+    on:
+      built: exit.landed
+      failed: exit.failed

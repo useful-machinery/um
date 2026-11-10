@@ -4,12 +4,15 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use super::document::{
-    Agent, AgentMessage, AgentNode, AgentProfile, CommandNode, CommonNode, ConditionOperand,
-    ConditionPredicate, ConditionSelector, ExportDefinition, ExportPresentation, FailurePolicy,
-    FinalizationTrigger, FinalizerDefinition, InputDeclaration, MessageSource, NodeBody, Output,
-    OutputReference, PresentationSource, RecoveryHandler, StepDefinition, StepRecovery,
-    ValueReference, WorkflowDocument,
+    Agent, AgentMessage, AgentNode, AgentProfile, Binding, BindingKind, CommandNode, CommonNode,
+    ConditionOperand, ConditionPredicate, ConditionSelector, EdgeTarget, ExportDefinition,
+    ExportPresentation, FailurePolicy, FinalizationTrigger, FinalizerDefinition, ForEach,
+    InputDeclaration, JsonDefault, MessageSource, NodeBody, OutcomeDeclaration, Output,
+    OutputReference, PresentationSource, RecoveryHandler, RootBlocks, RootRequires, StepDefinition,
+    StepRecovery, Trigger, TriggerControlAction, TriggerRule, ValueReference, WaitKind, WaitRule,
+    WorkflowDocument, WorkflowNode,
 };
+use super::mirror::{MirrorBlock, MirrorState};
 use super::validated::ValidatedHarness;
 use super::{claude_code, codex, pi};
 
@@ -34,22 +37,243 @@ pub(super) struct WorkflowDto {
     finalizers: BTreeMap<String, FinalizerDto>,
     #[serde(default)]
     exports: BTreeMap<String, ExportDto>,
+    #[serde(default)]
+    outcomes: Vec<String>,
+    outcome: Option<OutcomeDto>,
+    name: Option<String>,
+    version: Option<String>,
+    subject: Option<String>,
+    programs: Option<Vec<String>>,
+    exclude: Option<Vec<String>>,
+    requires: Option<RequiresDto>,
+    bindings: Option<BTreeMap<String, BindingDto>>,
+    triggers: Option<BTreeMap<String, TriggerDto>>,
+    mirror: Option<MirrorDto>,
 }
 
 #[derive(Deserialize)]
 #[serde(tag = "kind", deny_unknown_fields)]
 enum InputDeclarationDto {
     #[serde(rename = "text")]
-    Text,
+    Text {
+        optional: Option<bool>,
+        default: Option<String>,
+    },
     #[serde(rename = "json")]
-    Json { schema: Option<String> },
+    Json {
+        schema: Option<String>,
+        optional: Option<bool>,
+        // A present `null` is a literal default, distinct from an absent one.
+        #[serde(default, deserialize_with = "deserialize_present_value")]
+        default: Option<Value>,
+    },
     #[serde(rename = "file")]
     File {
         #[serde(rename = "mediaType")]
         media_type: Option<String>,
     },
     #[serde(rename = "attachments")]
-    Attachments,
+    Attachments { optional: Option<bool> },
+}
+
+fn deserialize_present_value<'de, D>(deserializer: D) -> Result<Option<Value>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Value::deserialize(deserializer).map(Some)
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RequiresDto {
+    tools: Vec<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BindingDto {
+    kind: BindingKind,
+    default: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MirrorDto {
+    linear: MirrorLinearDto,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct MirrorLinearDto {
+    issue: String,
+    on_start: Option<MirrorCommentDto>,
+    on_stage: Option<MirrorCommentDto>,
+    on_wait: Option<MirrorCommentDto>,
+    #[serde(default)]
+    on_outcome: BTreeMap<String, MirrorStateDto>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MirrorCommentDto {
+    comment: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MirrorStateDto {
+    state: String,
+    unless: Option<String>,
+}
+
+impl MirrorDto {
+    /// The block with its strings as written: the schema fixed `issue` as `inputs.<name>`
+    /// and each state as `$<key>`; templates and guards are checked with the tree.
+    fn into_block(self) -> MirrorBlock {
+        let linear = self.linear;
+        let unprefixed = |value: String, prefix: &str| match value.strip_prefix(prefix) {
+            Some(rest) => rest.to_owned(),
+            None => value,
+        };
+        let comment = |hook: Option<MirrorCommentDto>| hook.map(|hook| hook.comment);
+        MirrorBlock {
+            issue: unprefixed(linear.issue, "inputs."),
+            on_start: comment(linear.on_start),
+            on_stage: comment(linear.on_stage),
+            on_wait: comment(linear.on_wait),
+            on_outcome: linear
+                .on_outcome
+                .into_iter()
+                .map(|(outcome, state)| {
+                    (
+                        outcome,
+                        MirrorState {
+                            state: unprefixed(state.state, "$"),
+                            unless: state.unless,
+                        },
+                    )
+                })
+                .collect(),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum TriggerDto {
+    Start(StartTriggerDto),
+    Control(ControlTriggerDto),
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StartTriggerDto {
+    on: TriggerRuleDto,
+    subject: Option<String>,
+    inputs: BTreeMap<String, String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ControlTriggerDto {
+    on: TriggerRuleDto,
+    control: TriggerControlDto,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TriggerRuleDto {
+    source: String,
+    event: String,
+    #[serde(rename = "where")]
+    condition: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TriggerControlDto {
+    // The schema admits only `bySubject`.
+    #[serde(rename = "run")]
+    _run: String,
+    action: TriggerControlActionDto,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum TriggerControlActionDto {
+    Named(String),
+    Conditional(ConditionalControlActionDto),
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConditionalControlActionDto {
+    when: String,
+    then: String,
+    #[serde(rename = "else")]
+    otherwise: String,
+}
+
+impl TriggerRuleDto {
+    fn into_rule(self) -> TriggerRule {
+        TriggerRule {
+            source: self.source,
+            event: self.event,
+            condition: self.condition,
+        }
+    }
+}
+
+impl TriggerDto {
+    fn into_trigger(self) -> Trigger {
+        match self {
+            Self::Start(start) => Trigger::Start {
+                on: start.on.into_rule(),
+                subject: start.subject,
+                inputs: start.inputs,
+            },
+            Self::Control(control) => Trigger::Control {
+                on: control.on.into_rule(),
+                control: match control.control.action {
+                    TriggerControlActionDto::Named(name) => TriggerControlAction::Named(name),
+                    TriggerControlActionDto::Conditional(action) => {
+                        TriggerControlAction::Conditional {
+                            when: action.when,
+                            then: action.then,
+                            otherwise: action.otherwise,
+                        }
+                    }
+                },
+            },
+        }
+    }
+}
+
+impl InputDeclarationDto {
+    fn into_declaration(self) -> InputDeclaration {
+        match self {
+            Self::Text { optional, default } => InputDeclaration::Text {
+                optional: optional == Some(true),
+                default,
+            },
+            Self::Json {
+                schema,
+                optional,
+                default,
+            } => InputDeclaration::Json {
+                schema,
+                optional: optional == Some(true),
+                default: default.map(|value| match value {
+                    Value::String(path) => JsonDefault::File(path),
+                    literal => JsonDefault::Literal(literal),
+                }),
+            },
+            Self::File { media_type } => InputDeclaration::File { media_type },
+            Self::Attachments { optional } => InputDeclaration::Attachments {
+                optional: optional == Some(true),
+            },
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -71,6 +295,119 @@ enum StepDto {
         control_dependencies: Vec<String>,
         recovery: Option<RecoveryDto>,
     },
+    #[serde(rename = "workflow")]
+    Workflow {
+        workflow: String,
+        #[serde(default)]
+        inputs: BTreeMap<String, ReferenceDto>,
+        on: BTreeMap<String, EdgeTargetDto>,
+        #[serde(rename = "forEach", default)]
+        for_each: Option<ForEachDto>,
+    },
+}
+
+/// `forEach` is a reference string like `outcome.from`, not a `{ref}` object, or the
+/// object `{items, empty}` (REQ-WFFORMAT-98).
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum ForEachDto {
+    Reference(String),
+    Object(ForEachObjectDto),
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ForEachObjectDto {
+    items: String,
+    #[serde(default)]
+    empty: Option<String>,
+}
+
+impl ForEachDto {
+    fn into_for_each(self) -> Option<ForEach> {
+        let (items, empty) = match self {
+            Self::Reference(items) => (items, None),
+            Self::Object(ForEachObjectDto { items, empty }) => (items, empty),
+        };
+        Some(ForEach {
+            items: parse_value_reference(&items)?,
+            empty,
+        })
+    }
+}
+
+/// Untagged variants are tried in order; the objects deny unknown fields, so a `limit` on
+/// a wait or a limited `else` decodes as neither.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum EdgeTargetDto {
+    Limited(LimitedTargetDto),
+    Wait(WaitTargetDto),
+    Target(String),
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LimitedTargetDto {
+    then: String,
+    limit: u32,
+    #[serde(rename = "else")]
+    else_: ElseTargetDto,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum ElseTargetDto {
+    Wait(WaitTargetDto),
+    Target(String),
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WaitTargetDto {
+    wait: WaitKind,
+    then: String,
+    #[serde(default, rename = "onHandBack")]
+    on_hand_back: Option<String>,
+    #[serde(default)]
+    rule: Option<WaitRule>,
+}
+
+impl EdgeTargetDto {
+    fn into_target(self) -> EdgeTarget {
+        match self {
+            Self::Target(target) => parse_edge_target(target),
+            Self::Wait(wait) => wait.into_target(),
+            Self::Limited(limited) => EdgeTarget::Limited {
+                then: limited.then,
+                limit: limited.limit,
+                else_: Box::new(match limited.else_ {
+                    ElseTargetDto::Target(target) => parse_edge_target(target),
+                    ElseTargetDto::Wait(wait) => wait.into_target(),
+                }),
+            },
+        }
+    }
+}
+
+impl WaitTargetDto {
+    fn into_target(self) -> EdgeTarget {
+        EdgeTarget::Wait {
+            kind: self.wait,
+            then: Box::new(parse_edge_target(self.then)),
+            on_hand_back: self.on_hand_back,
+            rule: self.rule,
+        }
+    }
+}
+
+/// `exit.<outcome>` names an outcome of the workflow; anything else is a step id, which
+/// never contains a `.`.
+fn parse_edge_target(target: String) -> EdgeTarget {
+    match target.strip_prefix("exit.") {
+        Some(outcome) => EdgeTarget::Exit(outcome.to_owned()),
+        None => EdgeTarget::Step(target),
+    }
 }
 
 #[derive(Deserialize)]
@@ -385,6 +722,14 @@ struct ExportDto {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct OutcomeDto {
+    from: String,
+    #[serde(rename = "onFailure")]
+    on_failure: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ExportPresentationDto {
     title: Option<PresentationSourceDto>,
     description: Option<PresentationSourceDto>,
@@ -423,18 +768,42 @@ impl WorkflowDto {
         let inputs = self
             .inputs
             .into_iter()
-            .map(|(name, declaration)| {
-                let declaration = match declaration {
-                    InputDeclarationDto::Text => InputDeclaration::Text,
-                    InputDeclarationDto::Json { schema } => InputDeclaration::Json { schema },
-                    InputDeclarationDto::File { media_type } => {
-                        InputDeclaration::File { media_type }
-                    }
-                    InputDeclarationDto::Attachments => InputDeclaration::Attachments,
-                };
-                (name, declaration)
-            })
+            .map(|(name, declaration)| (name, declaration.into_declaration()))
             .collect();
+        let root = (self.programs.is_some()
+            || self.exclude.is_some()
+            || self.requires.is_some()
+            || self.bindings.is_some()
+            || self.triggers.is_some()
+            || self.mirror.is_some())
+        .then(|| RootBlocks {
+            programs: self.programs.unwrap_or_default(),
+            exclude: self.exclude.unwrap_or_default(),
+            requires: self.requires.map(|requires| RootRequires {
+                tools: requires.tools,
+            }),
+            bindings: self
+                .bindings
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(key, binding)| {
+                    (
+                        key,
+                        Binding {
+                            kind: binding.kind,
+                            default: binding.default,
+                        },
+                    )
+                })
+                .collect(),
+            triggers: self
+                .triggers
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(name, trigger)| (name, trigger.into_trigger()))
+                .collect(),
+            mirror: self.mirror.map(MirrorDto::into_block),
+        });
         let agent_profiles = AgentProfileDto::into_agent_profiles(self.agent_profiles)?;
         let steps = self
             .steps
@@ -481,6 +850,14 @@ impl WorkflowDto {
             })
             .collect::<Option<_>>()?;
 
+        let outcome = match self.outcome {
+            Some(outcome) => Some(OutcomeDeclaration {
+                from: parse_output_reference(&outcome.from)?,
+                on_failure: outcome.on_failure,
+            }),
+            None => None,
+        };
+
         Some(WorkflowDocument {
             schema_version: self.schema_version,
             description: self.description,
@@ -492,6 +869,13 @@ impl WorkflowDto {
             finalizers,
             finalizer_order,
             exports,
+            outcomes: self.outcomes,
+            outcome,
+            name: self.name,
+            version: self.version,
+            subject: self.subject,
+            root,
+            derived_outputs: BTreeMap::new(),
         })
     }
 }
@@ -509,6 +893,27 @@ impl StepDto {
                 control_dependencies,
                 recovery,
             } => (body.into_body()?, control_dependencies, recovery),
+            Self::Workflow {
+                workflow,
+                inputs,
+                on,
+                for_each,
+            } => (
+                NodeBody::Workflow(WorkflowNode {
+                    workflow,
+                    inputs: parse_references(inputs, parse_workflow_step_reference)?,
+                    edges: on
+                        .into_iter()
+                        .map(|(outcome, target)| (outcome, target.into_target()))
+                        .collect(),
+                    for_each: match for_each {
+                        Some(for_each) => Some(for_each.into_for_each()?),
+                        None => None,
+                    },
+                }),
+                Vec::new(),
+                None,
+            ),
         };
         Some(StepDefinition {
             body,
@@ -532,7 +937,7 @@ impl CommandNodeDto {
     fn into_body(self) -> Option<NodeBody> {
         Some(NodeBody::Command(CommandNode {
             common: self.common.into_common_node()?,
-            inputs: parse_references(self.inputs)?,
+            inputs: parse_references(self.inputs, parse_value_reference)?,
             argv: self.command.argv,
         }))
     }
@@ -622,12 +1027,11 @@ impl ConditionOperandDto {
 
 fn parse_references(
     references: BTreeMap<String, ReferenceDto>,
+    parse: fn(&str) -> Option<ValueReference>,
 ) -> Option<BTreeMap<String, ValueReference>> {
     references
         .into_iter()
-        .map(|(name, reference)| {
-            parse_value_reference(&reference.reference).map(|reference| (name, reference))
-        })
+        .map(|(name, reference)| parse(&reference.reference).map(|reference| (name, reference)))
         .collect()
 }
 
@@ -759,6 +1163,30 @@ fn parse_value_reference(reference: &str) -> Option<ValueReference> {
     }
 
     parse_output_reference(reference).map(ValueReference::Output)
+}
+
+/// A `workflow` step's inputs also read the control that resolved a wait and the
+/// answers recorded for the step (REQ-WFFORMAT-95), and the element a `forEach` step's
+/// child runs for (REQ-WFFORMAT-99); the structural schema admits these forms nowhere
+/// else.
+fn parse_workflow_step_reference(reference: &str) -> Option<ValueReference> {
+    if reference == "controls.answers" {
+        return Some(ValueReference::ControlsAnswers);
+    }
+    if reference == "item" {
+        return Some(ValueReference::Item { field: None });
+    }
+    if let Some(field) = reference.strip_prefix("item.") {
+        return um_support::is_identifier(field).then(|| ValueReference::Item {
+            field: Some(field.to_owned()),
+        });
+    }
+    if let Some(field) = reference.strip_prefix("wait.") {
+        return Some(ValueReference::Wait {
+            field: field.to_owned(),
+        });
+    }
+    parse_value_reference(reference)
 }
 
 fn parse_output_reference(reference: &str) -> Option<OutputReference> {

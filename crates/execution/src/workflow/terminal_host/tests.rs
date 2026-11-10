@@ -2782,6 +2782,51 @@ fn responsive_rows_drop_detail_before_kind_and_then_ellipsize_identity() {
     );
 }
 
+// REQ-LOCALRUN-19, REQ-LOCALRUN-20
+#[test]
+fn kind_column_widens_to_fit_workflow_steps_and_keeps_durations_aligned() {
+    let mut snapshot = snapshot_from_yaml(
+        "schemaVersion: 1\nsteps:\n  build:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n  child:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n",
+    );
+    let only_commands = DagLayout::for_steps(&snapshot.steps);
+    assert_eq!(
+        StepColumns::for_steps(80, only_commands.gutter_width(), &snapshot.steps).kind_width,
+        5
+    );
+    snapshot.steps[1].definition = WorkflowPresentationStep::Workflow {
+        file: "child.yaml".to_owned(),
+        failure_policy: FailurePolicy::Required,
+        direct_dependencies: Vec::new(),
+        outputs: BTreeMap::new(),
+    };
+    for step in &mut snapshot.steps {
+        step.state = StepStateKind::Succeeded;
+        step.timing = Some(WorkflowRunElapsed {
+            started_at: time::OffsetDateTime::UNIX_EPOCH,
+            duration: Duration::from_secs(4),
+            frozen: true,
+        });
+    }
+    let graph = DagLayout::for_steps(&snapshot.steps);
+
+    let columns = StepColumns::for_steps(80, graph.gutter_width(), &snapshot.steps);
+    assert!(columns.kind);
+    assert_eq!(columns.kind_width, display_width("workflow"));
+
+    let rendered = render_steps_lines(&snapshot, &HostInteraction::default(), 80, 8);
+    let command_row = rendered.iter().find(|line| line.contains("build")).unwrap();
+    let workflow_row = rendered.iter().find(|line| line.contains("child")).unwrap();
+    assert!(workflow_row.contains("workflow"));
+    assert_eq!(
+        column_of(workflow_row, "workflow") + 8 + 2,
+        column_of(workflow_row, "4.0s")
+    );
+    assert_eq!(
+        column_of(command_row, "4.0s"),
+        column_of(workflow_row, "4.0s")
+    );
+}
+
 // REQ-LOCALRUN-21, REQ-LOCALRUN-23
 #[test]
 fn scrolling_and_resize_keep_selection_visible_with_boundary_connectors() {

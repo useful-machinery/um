@@ -1,0 +1,15 @@
+schemaVersion: 1
+steps:
+  design:
+    kind: workflow
+    workflow: design.yaml
+    on:
+      succeeded: build
+      failed: exit.failed
+  build:
+    kind: workflow
+    workflow: build.yaml
+    dependsOn: [design]
+    on:
+      succeeded: exit.succeeded
+      failed: exit.failed

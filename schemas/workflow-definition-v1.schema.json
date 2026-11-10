@@ -1,0 +1,58 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://docs.usefulmachinery.com/schemas/workflow-definition-v1.schema.json",
+  "title": "Useful Machinery Workflow Definition Record V1",
+  "description": "The definition.json record that wires a workflow tree to one environment. Each revision pins a tree digest and a bindings snapshot digest. `current` names one of the listed revisions, and revisions are listed newest first.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "id", "name", "enabled", "current", "revisions", "cloudId"],
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "id": { "$ref": "#/$defs/DefinitionId" },
+    "name": {
+      "$ref": "#/$defs/Identifier",
+      "description": "The root workflow's name; how publish finds the record. A label, not the key."
+    },
+    "enabled": { "type": "boolean" },
+    "current": { "type": "integer", "minimum": 1 },
+    "revisions": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/Revision" }
+    },
+    "cloudId": {
+      "description": "The Cloud definition this one was republished as, or null.",
+      "oneOf": [
+        { "type": "null" },
+        { "$ref": "#/$defs/DefinitionId" }
+      ]
+    }
+  },
+  "$defs": {
+    "Identifier": {
+      "type": "string",
+      "maxLength": 64,
+      "pattern": "^[a-z][A-Za-z0-9]*$"
+    },
+    "DefinitionId": {
+      "type": "string",
+      "pattern": "^def_[0-7][0-9a-hjkmnp-tv-z]{25}$"
+    },
+    "Digest": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "Revision": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["n", "tree", "bindings", "publishedAt", "by"],
+      "properties": {
+        "n": { "type": "integer", "minimum": 1 },
+        "tree": { "$ref": "#/$defs/Digest" },
+        "bindings": { "$ref": "#/$defs/Digest" },
+        "publishedAt": { "type": "string", "format": "date-time" },
+        "by": { "type": "string", "minLength": 1 }
+      }
+    }
+  }
+}

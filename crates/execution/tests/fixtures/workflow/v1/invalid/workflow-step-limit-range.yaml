@@ -1,0 +1,12 @@
+schemaVersion: 1
+steps:
+  review:
+    kind: workflow
+    workflow: review.yaml
+    on:
+      hand_back:
+        then: review
+        limit: 0
+        else: exit.failed
+      succeeded: exit.succeeded
+      failed: exit.failed

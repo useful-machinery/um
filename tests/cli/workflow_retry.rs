@@ -1,6 +1,7 @@
 use std::fs;
 use std::io::Read;
 use std::net::TcpListener;
+use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
@@ -8,14 +9,15 @@ use rustix::process::{Pid, Signal, kill_process};
 
 use super::workflow_continue::GIT_CONTINUATION_SOURCE;
 use super::workflow_run::{
-    RunBundle, assert_attempt_resources_released, assert_executor_fault_before_execution, git,
-    initialize_git_repository, isolated_command, run, run_with_unusable_tui, signal_bundle,
-    workflow_run_schema,
+    RunBundle, TreeBundle, assert_attempt_resources_released,
+    assert_executor_fault_before_execution, git, initialize_git_repository, isolated_command, run,
+    run_record, run_with_unusable_tui, signal_bundle, spawn_held_child_tree, workflow_run_schema,
 };
 
 fn retry_args(run_directory: &Path, execution_root: &Path, options: &[&str]) -> Vec<String> {
     let mut args = vec![
         "workflow".to_owned(),
+        "run".to_owned(),
         "retry".to_owned(),
         run_directory.to_string_lossy().into_owned(),
         "--execution-root".to_owned(),
@@ -73,6 +75,7 @@ fn retry_acquires_after_pre_rename_publication_crash() {
 
     let status = isolated_command(&[
         "workflow".to_owned(),
+        "run".to_owned(),
         "status".to_owned(),
         run_directory.to_string_lossy().into_owned(),
         "--json".to_owned(),
@@ -111,7 +114,7 @@ fn retry_uses_the_immutable_bundle_current_environment_and_fresh_attempt() {
     let bundle = environment_retry_bundle();
     let run_directory = initial_failed_run(&bundle, "fresh");
     fs::write(
-        bundle.source_root().join("workflow.yaml"),
+        bundle.source_root().join("main.yaml"),
         b"not: the retained workflow\n",
     )
     .unwrap();
@@ -124,7 +127,7 @@ fn retry_uses_the_immutable_bundle_current_environment_and_fresh_attempt() {
     assert!(rejected.stderr.is_empty());
     let rejected: serde_json::Value = serde_json::from_slice(&rejected.stdout).unwrap();
     assert!(workflow_run_schema().is_valid(&rejected), "{rejected}");
-    assert_eq!(rejected["command"], "um workflow retry");
+    assert_eq!(rejected["command"], "um workflow run retry");
     assert_eq!(rejected["phase"], "admission");
     assert_eq!(
         rejected["diagnostics"][0]["code"],
@@ -153,7 +156,7 @@ fn retry_uses_the_immutable_bundle_current_environment_and_fresh_attempt() {
     );
     let terminal: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert!(workflow_run_schema().is_valid(&terminal), "{terminal}");
-    assert_eq!(terminal["command"], "um workflow retry");
+    assert_eq!(terminal["command"], "um workflow run retry");
     assert_eq!(terminal["outcome"], "succeeded");
     assert_eq!(terminal["attemptNumber"], 2);
     assert_eq!(terminal["result"]["attemptNumber"], 2);
@@ -193,7 +196,7 @@ fn retry_uses_the_immutable_bundle_current_environment_and_fresh_attempt() {
     assert!(rejected.stderr.is_empty());
     let rejected: serde_json::Value = serde_json::from_slice(&rejected.stdout).unwrap();
     assert!(workflow_run_schema().is_valid(&rejected), "{rejected}");
-    assert_eq!(rejected["command"], "um workflow retry");
+    assert_eq!(rejected["command"], "um workflow run retry");
     assert_eq!(rejected["phase"], "retry");
     assert_eq!(rejected["attemptNumber"], 2);
     assert_eq!(
@@ -325,7 +328,7 @@ fn finalizer_retry_reruns_both_graphs_with_a_fresh_attempt() {
         String::from_utf8_lossy(&retried.stderr)
     );
     let retried: serde_json::Value = serde_json::from_slice(&retried.stdout).unwrap();
-    assert_eq!(retried["command"], "um workflow retry");
+    assert_eq!(retried["command"], "um workflow run retry");
     assert_eq!(retried["attemptNumber"], 2);
     assert_eq!(retried["result"]["finalization"]["trigger"], "failed");
     assert_eq!(
@@ -740,7 +743,7 @@ fn retry_git_capture_keeps_the_recorded_baseline_after_head_advances() {
     );
 
     let local_run: serde_json::Value =
-        serde_json::from_slice(&fs::read(run_directory.join("run.json")).unwrap()).unwrap();
+        serde_json::from_slice(&fs::read(run_directory.join("local-run.json")).unwrap()).unwrap();
     assert_eq!(
         local_run["gitBaseline"],
         serde_json::json!({"status": "available", "objectFormat": "sha1", "commitOid": baseline})
@@ -751,4 +754,225 @@ fn retry_git_capture_keeps_the_recorded_baseline_after_head_advances() {
     .unwrap();
     assert_eq!(result["exports"]["branch"]["baseOid"], baseline);
     assert_eq!(result["exports"]["branch"]["headOid"], head);
+}
+
+// REQ-LOCALRUN-171
+#[test]
+fn a_retry_of_a_tree_run_rejects_a_modified_copy() {
+    let script = "#!/bin/sh\nset -eu\nprintf '%s' \"$UM_WORKFLOW_ROOT\" > workflow-root\ntest \"$RETRY_PHASE\" = retry\n";
+    let bundle = TreeBundle::new(
+        "schemaVersion: 1\nenvironmentPassthrough: [RETRY_PHASE]\nprograms: [bin]\nsteps:\n  report:\n    kind: cmd\n    command:\n      argv: [\"report\"]\n",
+    );
+    bundle.write_program("bin/report", script);
+    let destination = bundle.result("tree-retry");
+    let output = isolated_command(&bundle.args(&destination))
+        .env("RETRY_PHASE", "initial")
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let run_directory = fs::canonicalize(&destination).unwrap();
+    let copy = run_directory.join("workflow/tree");
+    let program = copy.join("bin/report");
+    let workflow_root = bundle.execution_root().join("workflow-root");
+    fs::remove_file(&workflow_root).unwrap();
+
+    fs::set_permissions(&program, fs::Permissions::from_mode(0o755)).unwrap();
+    fs::write(&program, "#!/bin/sh\nexit 0\n").unwrap();
+    let rejected = isolated_command(&retry_args(
+        &run_directory,
+        bundle.execution_root(),
+        &["--json"],
+    ))
+    .env("RETRY_PHASE", "retry")
+    .output()
+    .unwrap();
+    assert_eq!(rejected.status.code(), Some(1));
+    let rejection: serde_json::Value = serde_json::from_slice(&rejected.stdout).unwrap();
+    assert!(workflow_run_schema().is_valid(&rejection), "{rejection}");
+    assert_eq!(rejection["command"], "um workflow run retry");
+    assert_eq!(rejection["phase"], "tree");
+    assert_eq!(rejection["diagnostics"][0]["code"], "tree_copy_modified");
+    assert_eq!(rejection["runDirectory"], run_directory.to_str().unwrap());
+    assert!(!run_directory.join("attempts/000002").exists());
+    assert!(!workflow_root.exists());
+
+    fs::write(&program, script).unwrap();
+    fs::set_permissions(&program, fs::Permissions::from_mode(0o555)).unwrap();
+    let output = isolated_command(&retry_args(
+        &run_directory,
+        bundle.execution_root(),
+        &["--json"],
+    ))
+    .env("RETRY_PHASE", "retry")
+    .output()
+    .unwrap();
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let terminal: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(terminal["attemptNumber"], 2);
+    assert_eq!(
+        fs::read_to_string(&workflow_root).unwrap(),
+        copy.to_str().unwrap()
+    );
+}
+
+// REQ-LOCALRUN-177: a retry of a parent that runs a `workflow` step again creates the
+// step's next child ordinal.
+#[test]
+fn retrying_a_parent_runs_its_workflow_step_as_the_next_child() {
+    let (bundle, destination, mut parent) = spawn_held_child_tree("retried-parent");
+    let pid = Pid::from_raw(i32::try_from(parent.id()).unwrap()).unwrap();
+    kill_process(pid, Signal::KILL).unwrap();
+    assert!(!parent.wait().unwrap().success());
+    fs::remove_file(bundle.execution_root().join("hold")).unwrap();
+
+    let first = destination.join("children/design/000001");
+    super::poll_until(
+        "the killed parent's attempt is retryable",
+        || {
+            run(&retry_args(
+                &destination,
+                bundle.execution_root(),
+                &["--json"],
+            ))
+        },
+        |output| output.status.success(),
+    );
+
+    assert_eq!(run_record(&first)["state"], "running");
+    let second = run_record(&destination.join("children/design/000002"));
+    assert_eq!(second["state"], "exited");
+    assert_eq!(second["outcome"], "planned");
+    assert_eq!(run_record(&destination)["outcome"], "landed");
+}
+
+fn resume_args(run_directory: &Path) -> Vec<String> {
+    vec![
+        "workflow".to_owned(),
+        "run".to_owned(),
+        "resume".to_owned(),
+        run_directory.to_string_lossy().into_owned(),
+        "--json".to_owned(),
+    ]
+}
+
+/// Kills the held child tree's parent while `design`'s child runs and releases the hold.
+fn killed_parent(name: &str) -> (TreeBundle, PathBuf) {
+    let (bundle, destination, mut parent) = spawn_held_child_tree(name);
+    let pid = Pid::from_raw(i32::try_from(parent.id()).unwrap()).unwrap();
+    kill_process(pid, Signal::KILL).unwrap();
+    assert!(!parent.wait().unwrap().success());
+    fs::remove_file(bundle.execution_root().join("hold")).unwrap();
+    (bundle, fs::canonicalize(&destination).unwrap())
+}
+
+fn resumed(destination: &Path) -> serde_json::Value {
+    let output = super::poll_until(
+        "the killed parent's attempt is resumable",
+        || run(&resume_args(destination)),
+        |output| output.status.success(),
+    );
+    let terminal: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(workflow_run_schema().is_valid(&terminal), "{terminal}");
+    let event: serde_json::Value =
+        serde_json::from_slice(output.stderr.split(|byte| *byte == b'\n').next().unwrap()).unwrap();
+    assert_eq!(
+        event["continuation"]["fromSteps"],
+        serde_json::json!(["design"])
+    );
+    assert_eq!(event["continuation"]["reason"], "resume");
+    terminal
+}
+
+// REQ-CONTINUE-76: resuming a parent killed while its child ran starts a new attempt of
+// that child in place and routes on its outcome.
+#[test]
+fn resuming_an_abandoned_parent_retries_its_running_child_in_place() {
+    let (_bundle, destination) = killed_parent("abandoned-running");
+    let child = destination.join("children/design/000001");
+    assert_eq!(run_record(&child)["state"], "running");
+
+    let terminal = resumed(&destination);
+    assert_eq!(terminal["attemptNumber"], 2);
+    assert!(child.join("attempts/000002").is_dir());
+    assert!(!destination.join("children/design/000002").exists());
+    let record = run_record(&child);
+    assert_eq!(record["state"], "exited");
+    assert_eq!(record["outcome"], "planned");
+    let parent = run_record(&destination);
+    assert_eq!(parent["state"], "exited");
+    assert_eq!(parent["outcome"], "landed");
+    assert_eq!(parent["attempts"], 2);
+}
+
+// REQ-CONTINUE-76: a child that exited after its parent was killed is adopted: the step
+// settles from the child's recorded outcome and exports without another child attempt.
+#[test]
+fn resuming_an_abandoned_parent_adopts_its_exited_child() {
+    let (bundle, destination) = killed_parent("abandoned-exited");
+    let child = destination.join("children/design/000001");
+    super::poll_until(
+        "the killed parent's child is retryable",
+        || run(&retry_args(&child, bundle.execution_root(), &["--json"])),
+        |output| output.status.success(),
+    );
+    assert_eq!(run_record(&child)["outcome"], "planned");
+
+    let terminal = resumed(&destination);
+    let design = super::workflow_run::result_step(&terminal, "design");
+    assert_eq!(design["state"], "succeeded", "{terminal}");
+    assert!(!child.join("attempts/000003").exists());
+    assert!(!destination.join("children/design/000002").exists());
+    assert!(destination.join("children/build/000001").is_dir());
+    let parent = run_record(&destination);
+    assert_eq!(parent["outcome"], "landed");
+    assert_eq!(parent["attempts"], 2);
+}
+
+// REQ-CONTINUE-76: a parent whose process is alive is refused `run_locked`.
+#[test]
+fn resuming_a_live_parent_is_refused_run_locked() {
+    let (_bundle, destination, mut parent) = spawn_held_child_tree("live-parent");
+    let output = run(&resume_args(&destination));
+    let pid = Pid::from_raw(i32::try_from(parent.id()).unwrap()).unwrap();
+    kill_process(pid, Signal::KILL).unwrap();
+    let _ = parent.wait();
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let rejection: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(workflow_run_schema().is_valid(&rejection), "{rejection}");
+    assert_eq!(rejection["diagnostics"][0]["code"], "run_locked");
+    assert!(!destination.join("attempts/000002").exists());
+}
+
+// REQ-LOCALRUN-180, REQ-LOCALRUN-131: an id no run under the home has is a run-directory
+// failure, which retry and resume report on stderr only, writing no document.
+#[test]
+fn retry_and_resume_refuse_an_unknown_run_id_on_stderr_only() {
+    let home = tempfile::tempdir().unwrap();
+    let execution_root = tempfile::tempdir().unwrap();
+    let unknown = Path::new("run_7zzzzzzzzzzzzzzzzzzzzzzzzz");
+    for args in [
+        retry_args(unknown, execution_root.path(), &["--json"]),
+        resume_args(unknown),
+    ] {
+        let output = isolated_command(&args)
+            .env("UM_HOME", home.path())
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(1), "{args:?}: {output:?}");
+        assert!(output.stdout.is_empty(), "{args:?}: {output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("run_not_found"),
+            "{args:?}: {output:?}"
+        );
+    }
 }

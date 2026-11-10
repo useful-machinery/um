@@ -44,7 +44,9 @@ pub(super) fn finalization_signal_action(
         }
         | WorkflowState::Succeeded
         | WorkflowState::Failed { .. }
-        | WorkflowState::Cancelled { .. } => FinalizationSignalAction::Inert,
+        | WorkflowState::Cancelled { .. }
+        | WorkflowState::Waiting { .. }
+        | WorkflowState::Continued { .. } => FinalizationSignalAction::Inert,
     }
 }
 
@@ -156,6 +158,8 @@ pub(super) fn workflow_status<Deadline>(workflow: &WorkflowState<Deadline>) -> &
         WorkflowState::Succeeded => "succeeded",
         WorkflowState::Failed { .. } => "failed",
         WorkflowState::Cancelled { .. } => "cancelled",
+        WorkflowState::Waiting { .. } => "waiting",
+        WorkflowState::Continued { .. } => "continued",
     }
 }
 
@@ -167,13 +171,15 @@ pub(super) fn workflow_tone<Deadline>(workflow: &WorkflowState<Deadline>) -> Ton
             gate: SchedulingGate::FailureStopped { .. },
         } => Tone::Failure,
         WorkflowState::Cancelled { .. }
+        | WorkflowState::Waiting { .. }
         | WorkflowState::Executing {
             gate: SchedulingGate::Cancelling { .. },
         } => Tone::Blocked,
         WorkflowState::Executing {
             gate: SchedulingGate::Open,
         }
-        | WorkflowState::Finalizing { .. } => Tone::Active,
+        | WorkflowState::Finalizing { .. }
+        | WorkflowState::Continued { .. } => Tone::Active,
     }
 }
 

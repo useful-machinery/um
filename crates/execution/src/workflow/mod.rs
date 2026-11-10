@@ -20,6 +20,7 @@ pub(crate) mod codex;
 pub(crate) mod condition;
 pub(crate) mod continuation;
 pub(crate) mod coordinator;
+pub(crate) mod definition_store;
 pub(crate) mod diagnostic;
 pub(crate) mod document;
 pub(crate) mod evidence;
@@ -34,6 +35,7 @@ mod identity;
 pub(crate) mod input;
 pub(crate) mod invocation_accounting;
 pub(crate) mod local_run;
+pub(crate) mod mirror;
 pub(crate) mod observation;
 pub(crate) mod pi;
 pub(crate) mod portable_artifact;
@@ -49,6 +51,7 @@ mod render_style;
 pub(crate) mod resolution;
 mod result_metadata;
 pub(crate) mod result_validation;
+pub(crate) mod run_record;
 pub(crate) mod run_timing;
 pub(crate) mod run_view_model;
 pub(crate) mod runtime;
@@ -56,13 +59,17 @@ mod schema;
 mod schema_common;
 pub(crate) mod step_runtime;
 mod strict_yaml;
+pub(crate) mod subject_index;
 pub(crate) mod terminal_host;
 #[cfg(test)]
 mod test_support;
 mod text_fit;
+mod tree;
+mod tree_copy;
 pub(crate) mod validated;
 pub(crate) mod validation;
 pub(crate) mod value;
+pub(crate) mod wait;
 pub(crate) mod workspace_snapshot;
 
 use std::fmt;
@@ -75,10 +82,20 @@ use document::WorkflowDocument;
 
 pub use canonical_json::CanonicalJsonError;
 pub use claude_code::ClaudeCodeConfig;
+pub use mirror::{
+    Mirror, MirrorAction, MirrorBlock, MirrorFailure, MirrorGuard, MirrorGuardError,
+    MirrorGuardOperator, MirrorHook, MirrorSkipReason, MirrorState, MirrorTarget, MirrorWrite,
+    MirrorWriteOutcome, Template, TemplateError, TemplateSegment, hook_variables,
+    read_mirror_writes, read_numbered_mirror_writes,
+};
 pub use pi::PiConfig;
 pub use profile_replacement::{
     AGENT_PROFILE_REPLACEMENT_SCHEMA, AgentProfileReplacementDocument,
     MAXIMUM_AGENT_PROFILE_REPLACEMENT_BYTES, ResolvedAgentProfileReplacement,
+};
+pub use tree::{
+    TreeDiagnostic, TreeFile, TreeLocation, TreeTriggerKind, ValidatedTree, is_workflow_tree,
+    validate_workflow_tree,
 };
 
 pub const STRUCTURAL_SCHEMA: &str = include_str!(concat!(

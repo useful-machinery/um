@@ -5,6 +5,30 @@ use time::{OffsetDateTime, UtcOffset};
 
 pub(super) use um_support::{is_identifier, is_lowercase_hex, lowercase_hex};
 
+/// The prefix of a `sha256:<hex>` digest as the definition and run records carry it.
+pub(super) const DIGEST_PREFIX: &str = "sha256:";
+const ULID_LENGTH: usize = 26;
+
+/// The hex of a `sha256:<hex>` digest, or `None` for any other form.
+pub(super) fn digest_hex(digest: &str) -> Option<&str> {
+    digest
+        .strip_prefix(DIGEST_PREFIX)
+        .filter(|hex| is_lowercase_hex(hex, 64))
+}
+
+/// `prefix` and a lowercase Crockford ULID: 26 characters, the first `0` to `7`, the record
+/// ids of the definition store (`def_`) and the run record (`run_`).
+pub(super) fn is_prefixed_ulid(value: &str, prefix: &str) -> bool {
+    value.strip_prefix(prefix).is_some_and(|ulid| {
+        ulid.len() == ULID_LENGTH
+            && ulid.starts_with(|first: char| ('0'..='7').contains(&first))
+            && ulid.bytes().all(|byte| {
+                byte.is_ascii_digit()
+                    || (byte.is_ascii_lowercase() && !matches!(byte, b'i' | b'l' | b'o' | b'u'))
+            })
+    })
+}
+
 pub(super) fn utc_timestamp(value: OffsetDateTime) -> Result<String, time::error::Format> {
     value.to_offset(UtcOffset::UTC).format(&Rfc3339)
 }

@@ -1,0 +1,9 @@
+schemaVersion: 1
+steps:
+  prepare:
+    kind: cmd
+    command:
+      argv: ["true"]
+requires:
+  tools: [git]
+  network: true

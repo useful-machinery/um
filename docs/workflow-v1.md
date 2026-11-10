@@ -30,7 +30,7 @@ repository changes.
 5. **Validate without running.** Invoke `workflow validate --json` with an explicit
    source root and workflow path. Treat only its structured `valid` outcome as success.
 6. **Report and stop.** Report the path, outcome, graph, outputs, exports, and
-   finalizers. Execution and source-control mutation require separate authorization.
+   finalizers. Do not run it.
 
 ## Mental model
 
@@ -41,7 +41,8 @@ repository changes.
 - The execution root is separate. Commands, agents, working directories, and runtime
   outputs operate below it when a run is separately authorized.
 - Ordinary steps form a DAG. After all ordinary steps are terminal, matching finalizers
-  form a second DAG.
+  form a second DAG. A workflow whose steps run child workflows is instead walked along
+  the edges its steps declare (see [Child workflows and edges](#child-workflows-and-edges)).
 - References carry typed values and infer data dependencies. They do not interpolate
   text, read files implicitly, or grant authority.
 - Definition validation resolves source bytes and checks the contract. It does not run
@@ -53,12 +54,17 @@ repository changes.
 | --- | --- | --- |
 | `schemaVersion` | yes | Integer `1`. |
 | `description` | no | Human metadata with no execution effect. |
-| `inputs` | no | Named Text, JSON, File, or attachments; optional JSON schema or exact File media type. |
+| `name` | no | Lowercase identifier naming a tree's definition; not a run identity. |
+| `version` | no | Label for people, 1 to 64 characters. |
+| `subject` | no | Root only: the declared `text` input naming the run's subject. |
+| `inputs` | no | Named Text, JSON, File, or attachments; optional JSON schema or exact File media type; may be `optional` or carry a `default`. |
 | `environmentPassthrough` | no | Unique host environment variable names explicitly forwarded to all steps, agents, and recovery handlers. |
 | `agentProfiles` | no | Workflow-local harness configurations. |
-| `steps` | yes | At least one ordinary `cmd` or `agent` node. |
+| `steps` | yes | At least one ordinary `cmd`, `agent`, or `workflow` node. |
 | `finalizers` | no | Nodes considered after the ordinary phase. |
 | `exports` | no | Stable names selecting declared outputs. |
+| `outcomes`, `outcome` | no | Declared run outcome names and the `text` output that chooses one; declared together. |
+| `programs`, `exclude`, `requires`, `bindings`, `triggers`, `mirror` | no | Root-only tree blocks: program directories, digest excludes, required `tools`, typed bindings with optional text `default`, start or control triggers on a `$binding` source, and the Linear writes a run makes. |
 
 Identifiers use lower camel case, contain 1 through 64 ASCII letters or digits, and
 match `^[a-z][A-Za-z0-9]*$`. Ordinary step and finalizer IDs share a namespace. V1
@@ -79,8 +85,8 @@ all workflow code, including recovery. Guard and recovery scratch directories
 use `TMPDIR` when set (otherwise the system temporary directory); the guard's
 launch manifest never records environment values.
 
-Both ordinary node kinds may declare `failurePolicy`, `recovery`, `dependsOn`, `cwd`,
-and `outputs`. `failurePolicy` is `required` by default or may be `advisory`.
+The `cmd` and `agent` node kinds may declare `failurePolicy`, `recovery`, `dependsOn`,
+`cwd`, and `outputs`. `failurePolicy` is `required` by default or may be `advisory`.
 `recovery.retries` is 1 through 10. It either omits `handler` for an immediate unchanged
 target recheck, names one closed command handler, or names one fresh-agent handler with
 an existing profile and retained prompt. A command handler reads the bounded private
@@ -176,7 +182,9 @@ inputs:
 
 Nodes reference inputs and ordinary outputs; finalizers may also reference finalizer
 outputs and `finalization.context`. Inputs add no edges. Conditions admit only Text/JSON
-values. All inputs are required, including explicit empties. Files require a supplied
+values. An input is required unless `optional: true` or defaulted. A JSON default string
+is a path relative to the workflow file, any other value a literal; a Text default is
+text. Never both; File inputs take neither. Supplied empties are explicit values. Files require a supplied
 valid media type. Its parameter separators are only space or tab, and parameter values
 permit Unicode but not `;`, U+0000 through U+001F, or U+007F. A declared `mediaType`
 matches exactly—no normalization, inference, wildcards, or sniffing. Exports reference
@@ -270,6 +278,23 @@ That `$schema` belongs in the separate result-schema JSON file. Do not add a roo
 required nodes. A finalizer export also requires `succeeded` in that finalizer's trigger
 set.
 
+`outcomes` lists between 1 and 64 distinct names a run may end with. Each name
+matches `^[a-z][a-z0-9_]*$`, has at most 64 characters, and is not one of the engine
+outcomes `withdrawn`, `canceled`, or `superseded`. `outcome` names where the choice comes
+from: `from` is an `outputs.<step>.<output>` reference and `onFailure` is the name a
+failed run takes. Declare both keys or neither; `onFailure` must be one of `outcomes`, or
+validation fails with `invalid_outcome_declaration`. The source must be a declared `text`
+output of a required ordinary step without a `condition`, otherwise validation fails with
+`invalid_outcome_source`. Without the declaration a workflow has the implicit outcomes
+`succeeded` and `failed`.
+
+```yaml
+outcomes: [planned, blocked, failed]
+outcome:
+  from: outputs.decide.verdict
+  onFailure: failed
+```
+
 Finalizers replace ordinary `dependsOn` with:
 
 - `when`: a nonempty unique set of `succeeded`, `failed`, and/or `cancelled`; omission
@@ -280,6 +305,115 @@ Finalizer output references infer edges within the finalizer DAG. A consumer's `
 set must be a subset of a referenced finalizer producer's set. A required finalizer
 issue turns an ordinary success into failure; advisory finalizer issues stay visible but
 do not replace the ordinary outcome.
+
+## Child workflows and edges
+
+A step of `kind: workflow` runs another workflow file of the same tree as a child run
+and routes on the outcome the child ends with. It accepts exactly `workflow`, `inputs`,
+`on` and `forEach`.
+
+```yaml
+outcomes: [landed, failed]
+steps:
+  design:
+    kind: workflow
+    workflow: design.yaml
+    inputs:
+      ticket:
+        ref: inputs.ticket
+    on:
+      planned: build
+      blocked: exit.failed
+      failed: exit.failed
+  build:
+    kind: workflow
+    workflow: build.yaml
+    inputs:
+      plan:
+        ref: outputs.design.plan
+    on:
+      built: exit.landed
+      failed: exit.failed
+```
+
+- `workflow` names a `.yaml` or `.yml` file directly under the source root, other than
+  `workflow.yaml` and the file itself (`child_workflow_not_in_tree`); an unreadable file
+  is `child_workflow_unavailable`. The child is validated as its own workflow file and a
+  failure there is `child_workflow_invalid`, whose remedy names the child's own code and
+  location. A child may not declare `workflow` steps (`child_workflow_nested`) or carry
+  `name`, `version`, `subject`, or a root-only block (`child_workflow_root_blocks`). The
+  child file and the static files it names join the parent's closure and digest. These
+  failures are at location `step_workflow`.
+- `inputs` maps the child's input names to references of the parent's inputs or of an
+  earlier step's outputs. Every child input that is neither optional nor defaulted must
+  be mapped (`child_input_missing`), only declared names may be mapped
+  (`child_input_undeclared`), kinds must match (`child_input_type_mismatch`), and a child
+  `file` or `attachments` input cannot be mapped (`child_input_unsupported`). These
+  failures are at location `step_input`.
+- A `workflow` step's `inputs` may also reference `wait.<field>`, a `text` value: the
+  named field of the control that resolved the wait whose `then` or `onHandBack` is this
+  step. `controls.answers` is a `json` value: the answers recorded for this step's
+  questions. Either may be absent when the step starts, so the child input it maps onto
+  must be optional or defaulted (`control_reference_requires_optional` at `step_input`),
+  and kinds must match as above. `cmd` and `agent` steps accept neither form.
+- On a `forEach` step, `inputs` may also reference `item`, the element, or
+  `item.<field>`, a top-level field of an object element. Either takes the kind of the
+  `text` or `json` child input it maps onto; a `text` input needs a JSON string, checked
+  when the step starts. Without `forEach` it is `item_reference_requires_for_each`.
+- The step declares no `outputs`. Its outputs are the child's `text` and `json` exports
+  with their types, plus the `text` output `outcome`, the child's recorded outcome. A
+  child may not export `outcome` (`child_export_reserved`). Other names, including a
+  child's `file` or `git_branch` exports, fail `unknown_output` where they are referenced.
+- `on` maps each of the child's outcomes (its `outcomes`, or `succeeded` and `failed`) to
+  one target: a step ID, `exit.<outcome>` naming one of this workflow's outcomes
+  (`succeeded` or `failed` when it declares none), a limited edge, or a wait
+  `{wait: answer|approval|repair|external, then: <target>}`. An `approval`
+  wait also names `onHandBack: <step>`, the step a hand-back continues at
+  (`wait_hand_back_required` without it); any other wait may not
+  (`wait_hand_back_unsupported`). Validation reports `edge_outcome_undeclared`,
+  `edge_outcome_missing`, `edge_target_unknown`, `edge_exit_undeclared`,
+  `edge_limit_target_invalid`, `wait_rule_required`, `wait_rule_unsupported`,
+  `wait_rule_invalid` and `wait_rule_reference_invalid` at location `step_edge`, which
+  names the step and the outcome. A wait's `then` and `onHandBack` are checked as
+  targets; a step reached only through one of them, or through a limited edge's `then`
+  or `else`, is reachable.
+- A step target may be a later step, which starts in the same attempt, or the step
+  itself or an earlier step, from which the run continues in a new attempt.
+- A limited edge `{then: <step>, limit: <1..64>, else: <target>}` takes `then` while the
+  run has taken it fewer than `limit` times, then `else`: a step ID, an exit or a wait,
+  never another limited edge. An exit as `then` is `edge_limit_target_invalid`.
+- An `external` wait carries `rule: {source, event, where}` and no other wait may
+  (`wait_rule_required`, `wait_rule_unsupported`). `source` names a provider other than
+  `um`, `event` one event name or a list, and `where` equalities joined by ` and ` over
+  `event.<path>`, quoted literals, `true`, `false`, `inputs.<name>` (a `text` input) and
+  `outputs.<step>.<output>` (a `text` export of an earlier step), for example
+  `event.pullRequest == outputs.design.pullRequest`. Anything else in the rule is
+  `wait_rule_invalid`; an operand naming another value is `wait_rule_reference_invalid`.
+
+`forEach` runs the child once per element of a `json` list, in order. It is a reference
+or `{items: <reference>, empty: <outcome>}`, `empty` the outcome for an empty list:
+
+```yaml
+  build:
+    kind: workflow
+    workflow: build.yaml
+    forEach: outputs.design.parts
+    inputs:
+      part: { ref: item.name }
+    on: { built: exit.landed, failed: exit.failed }
+```
+
+It names a `json` root input or a `json` export of an earlier step; anything else is
+`for_each_reference_invalid`, and an `empty` the child lacks `for_each_empty_undeclared`,
+both at location `step_for_each`.
+
+A workflow with a `workflow` step is edge-scheduled. Every ordinary step in it must be a
+`workflow` step (`edge_scheduling_kind`), the first step in document order is the entry,
+and every other step must be the target of some edge (`step_unreachable`); both failures
+are at location `step`. References supply values but add no dependency. `outcomes` may be
+declared alone, because the `exit` edge a run reaches chooses the outcome; an `outcome`
+block is `invalid_outcome_declaration`. Finalizers work as in any workflow. Cloud does
+not run workflows with `workflow` steps.
 
 ## Complete example
 

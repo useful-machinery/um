@@ -9,7 +9,7 @@ use super::condition::{
     self, ConditionDispositions, ConditionEvaluation, ConditionValues, ResolvedPredicate,
     TerminalDisposition,
 };
-use super::document::{FailurePolicy, FinalizationTrigger};
+use super::document::{FailurePolicy, FinalizationTrigger, WaitKind, WaitRule};
 pub(crate) use super::evidence::FailurePhase;
 use super::evidence::{
     BlockedDetail, CancellationDetail, ConditionFalseDetail, EvaluatedPredicateEvidence,
@@ -21,10 +21,11 @@ use super::finalization_context::{
 };
 use super::step_runtime::StepFailureKind;
 use super::validated::{
-    ResolvedDirectPrerequisite, ResolvedValueSource, ValidatedCommonStep, ValidatedFinalizer,
-    ValidatedMessageSource, ValidatedRecoveryHandler, ValidatedStep, ValidatedStepRecovery,
-    ValidatedWorkflow, WorkflowNode, WorkflowNodeRole,
+    ResolvedDirectPrerequisite, ResolvedValueSource, Scheduling, ValidatedEdgeTarget,
+    ValidatedFinalizer, ValidatedMessageSource, ValidatedRecoveryHandler, ValidatedStep,
+    ValidatedStepRecovery, ValidatedWorkflow, WorkflowNode, WorkflowNodeRole,
 };
+use super::validation::CHILD_OUTCOME_OUTPUT;
 use super::value::CapturedValue;
 
 pub(crate) trait ConditionOutput {
@@ -333,6 +334,86 @@ pub enum WorkflowState<Deadline = ()> {
     Cancelled {
         reason: CancellationReason,
     },
+    /// The edge-scheduled walk entered a wait and the attempt ended on it (REQ-WFEXEC-61,
+    /// REQ-WFEXEC-62, INV-ENGINE-20).
+    Waiting {
+        wait: EnteredWait,
+    },
+    /// The edge-scheduled walk took a backward or limited edge and the attempt ended on it;
+    /// the run continues from the edge's target in a new attempt (REQ-WFEXEC-64,
+    /// INV-ENGINE-20, INV-ENGINE-22).
+    Continued {
+        edge: TakenEdgeRecord,
+    },
+}
+
+/// The continuing edge an attempt ended on (REQ-WFEXEC-64, REQ-CONTINUE-77): the step that
+/// took it, the recorded child outcome, the step the run continues from and whether the
+/// taking counts against the edge's limit (a limited edge's `then`).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TakenEdgeRecord {
+    pub step: String,
+    pub outcome: String,
+    pub target: String,
+    pub counted: bool,
+}
+
+impl TakenEdgeRecord {
+    /// The edge's key in the run record's `edges` counts (REQ-WFDEF-4).
+    pub fn key(&self) -> String {
+        edge_key(&self.step, &self.outcome)
+    }
+}
+
+/// `<step>.<outcome>`, the key an edge is counted under (REQ-WFDEF-4).
+pub(crate) fn edge_key(step: &str, outcome: &str) -> String {
+    format!("{step}.{outcome}")
+}
+
+/// The wait an attempt ended on (REQ-WFEXEC-61, REQ-WFEXEC-62): the step it waits at, the
+/// recorded child outcome whose edge was the wait (`None` for a `stop` wait, which no edge
+/// enters), its kind, the target the run continues at once it resolves, for an approval the
+/// step a hand-back continues at and, for an `external` wait, its authored rule as the
+/// format spells it (REQ-WFFORMAT-97), which the wait record resolves (REQ-WFEXEC-65).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EnteredWait {
+    pub(crate) step: String,
+    pub(crate) outcome: Option<String>,
+    pub(crate) kind: WaitKind,
+    pub(crate) then: String,
+    pub(crate) on_hand_back: Option<String>,
+    pub(crate) rule: Option<WaitRule>,
+}
+
+impl EnteredWait {
+    pub fn step(&self) -> &str {
+        &self.step
+    }
+
+    pub fn outcome(&self) -> Option<&str> {
+        self.outcome.as_deref()
+    }
+
+    pub const fn kind(&self) -> WaitKind {
+        self.kind
+    }
+
+    /// The kind's name as the format spells it (REQ-WFFORMAT-92).
+    pub const fn kind_name(&self) -> &'static str {
+        self.kind.name()
+    }
+
+    pub fn then(&self) -> &str {
+        &self.then
+    }
+
+    pub fn on_hand_back(&self) -> Option<&str> {
+        self.on_hand_back.as_deref()
+    }
+
+    pub fn rule(&self) -> Option<&WaitRule> {
+        self.rule.as_ref()
+    }
 }
 
 impl<Deadline> WorkflowState<Deadline> {
@@ -371,6 +452,8 @@ impl<Deadline> WorkflowState<Deadline> {
                 later_cancellation,
             },
             Self::Cancelled { reason } => WorkflowState::Cancelled { reason },
+            Self::Waiting { wait } => WorkflowState::Waiting { wait },
+            Self::Continued { edge } => WorkflowState::Continued { edge },
         }
     }
 }
@@ -401,6 +484,11 @@ pub(crate) struct InheritedStepSeed<Output> {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ExecutionSeed<Output> {
     steps: BTreeMap<String, InheritedStepSeed<Output>>,
+    /// The step a continuation of an edge-scheduled workflow starts at instead of the
+    /// definition's entry (REQ-CONTINUE-3, REQ-WFEXEC-58).
+    entry: Option<String>,
+    /// The run's limited-edge counts by `<step>.<outcome>` (REQ-WFEXEC-64, INV-ENGINE-22).
+    edge_counts: BTreeMap<String, u64>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -416,7 +504,25 @@ impl<Output> ExecutionSeed<Output> {
     pub(crate) fn empty() -> Self {
         Self {
             steps: BTreeMap::new(),
+            entry: None,
+            edge_counts: BTreeMap::new(),
         }
+    }
+
+    /// Names the step an edge-scheduled continuation starts at; a dataflow workflow has no
+    /// entry and ignores it (REQ-WFEXEC-58, INV-ENGINE-18).
+    #[must_use]
+    pub fn with_entry(mut self, step: impl Into<String>) -> Self {
+        self.entry = Some(step.into());
+        self
+    }
+
+    /// Carries the run record's edge counts, which decide a limited edge's `then` or `else`
+    /// (REQ-WFEXEC-64, INV-ENGINE-22).
+    #[must_use]
+    pub fn with_edge_counts(mut self, counts: BTreeMap<String, u64>) -> Self {
+        self.edge_counts = counts;
+        self
     }
 
     pub(crate) fn new(
@@ -459,7 +565,11 @@ impl<Output> ExecutionSeed<Output> {
                 return Err(ExecutionSeedError::InvalidProducer);
             }
         }
-        Ok(Self { steps })
+        Ok(Self {
+            steps,
+            entry: None,
+            edge_counts: BTreeMap::new(),
+        })
     }
 }
 
@@ -616,6 +726,10 @@ struct RuntimeRecovery {
     handler_kind: Option<RecoveryHandlerKind>,
 }
 
+/// The action input carrying a `forEach` step's list to the child-run driver: not an
+/// identifier, so no child input name collides with it.
+pub(crate) const FOR_EACH_INPUT: &str = "@forEach";
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct RuntimeStep {
     role: WorkflowNodeRole,
@@ -629,6 +743,71 @@ struct RuntimeStep {
     declared_outputs: BTreeSet<String>,
     recovery: Option<RuntimeRecovery>,
     when: BTreeSet<FinalizationTrigger>,
+    /// A `workflow` step's edges by child outcome; `None` for every other step.
+    edges: Option<Arc<BTreeMap<String, RuntimeEdgeTarget>>>,
+}
+
+/// How the ordinary steps are selected (REQ-WFFORMAT-93): by satisfied prerequisites, or
+/// along the edges of an edge-scheduled workflow from its entry (REQ-WFEXEC-58).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum RuntimeScheduling {
+    Dataflow,
+    Edges { entry: String },
+}
+
+/// Where a settled `workflow` step's recorded outcome leads: a step, an exit, a limited
+/// edge, or a wait the run enters (REQ-WFEXEC-58, REQ-WFEXEC-61, REQ-WFEXEC-64). A wait's
+/// `then` is its target as the format spells it, a step id or `exit.<name>`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum RuntimeEdgeTarget {
+    Step(String),
+    Exit(String),
+    Limited {
+        then: String,
+        limit: u32,
+        else_: Box<RuntimeEdgeTarget>,
+    },
+    Wait {
+        kind: WaitKind,
+        then: String,
+        on_hand_back: Option<String>,
+        rule: Option<WaitRule>,
+    },
+}
+
+impl RuntimeEdgeTarget {
+    fn from_validated(target: &ValidatedEdgeTarget) -> Self {
+        match target {
+            ValidatedEdgeTarget::Step(step) => Self::Step(step.clone()),
+            ValidatedEdgeTarget::Exit(name) => Self::Exit(name.clone()),
+            ValidatedEdgeTarget::Limited { then, limit, else_ } => Self::Limited {
+                then: then.clone(),
+                limit: *limit,
+                else_: Box::new(Self::from_validated(else_)),
+            },
+            ValidatedEdgeTarget::Wait {
+                kind,
+                then,
+                on_hand_back,
+                rule,
+            } => Self::Wait {
+                kind: *kind,
+                then: edge_target_text(then),
+                on_hand_back: on_hand_back.clone(),
+                rule: rule.clone(),
+            },
+        }
+    }
+}
+
+fn edge_target_text(target: &ValidatedEdgeTarget) -> String {
+    match target {
+        ValidatedEdgeTarget::Step(step) | ValidatedEdgeTarget::Limited { then: step, .. } => {
+            step.clone()
+        }
+        ValidatedEdgeTarget::Exit(name) => format!("exit.{name}"),
+        ValidatedEdgeTarget::Wait { then, .. } => edge_target_text(then),
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -648,6 +827,12 @@ pub(crate) struct RuntimeDefinition {
     maximum_transitions: u64,
     text_inputs: BTreeMap<String, Arc<str>>,
     json_inputs: BTreeMap<String, Arc<serde_json::Value>>,
+    scheduling: RuntimeScheduling,
+    /// The ordinary steps in document order; an edge to a step not later than its producer
+    /// continues the run (REQ-WFEXEC-64).
+    step_order: Vec<String>,
+    /// The run's limited-edge counts, from the seed (REQ-WFEXEC-64, INV-ENGINE-22).
+    edge_counts: BTreeMap<String, u64>,
 }
 
 impl RuntimeDefinition {
@@ -733,6 +918,14 @@ impl RuntimeDefinition {
             maximum_transitions,
             text_inputs: BTreeMap::new(),
             json_inputs: BTreeMap::new(),
+            scheduling: match &workflow.scheduling {
+                Scheduling::Dataflow => RuntimeScheduling::Dataflow,
+                Scheduling::Edges { entry } => RuntimeScheduling::Edges {
+                    entry: entry.clone(),
+                },
+            },
+            step_order: workflow.source_order.clone(),
+            edge_counts: BTreeMap::new(),
         }
     }
 }
@@ -752,7 +945,7 @@ fn runtime_step(
     recovery: Option<&ValidatedStepRecovery>,
     when: BTreeSet<FinalizationTrigger>,
 ) -> RuntimeStep {
-    let common = common_step(step);
+    let common = step.common();
     RuntimeStep {
         role,
         is_agent: matches!(step, ValidatedStep::Agent(_)),
@@ -766,6 +959,19 @@ fn runtime_step(
                 .inputs
                 .iter()
                 .map(|(name, reference)| (name.clone(), reference.source.clone()))
+                .collect(),
+            // A fan-out's list reaches the child-run driver as the action input `@forEach`,
+            // a key no child input can take (REQ-WFEXEC-66).
+            ValidatedStep::Workflow(workflow) => workflow
+                .inputs
+                .iter()
+                .map(|(name, input)| (name.clone(), input.reference.source.clone()))
+                .chain(
+                    workflow
+                        .for_each
+                        .as_ref()
+                        .map(|for_each| (FOR_EACH_INPUT.to_owned(), for_each.items.source.clone())),
+                )
                 .collect(),
             ValidatedStep::Agent(agent) => agent
                 .agent
@@ -782,7 +988,10 @@ fn runtime_step(
                             "finalization.context".to_owned(),
                             ResolvedValueSource::FinalizationContext,
                         )),
-                        ResolvedValueSource::Input(_) => None,
+                        ResolvedValueSource::Input(_)
+                        | ResolvedValueSource::Wait(_)
+                        | ResolvedValueSource::ControlsAnswers
+                        | ResolvedValueSource::Item { .. } => None,
                     },
                     ValidatedMessageSource::File { .. } => None,
                 })
@@ -797,13 +1006,18 @@ fn runtime_step(
                 .map(RecoveryHandlerKind::from_validated),
         }),
         when,
-    }
-}
-
-fn common_step(step: &ValidatedStep) -> &ValidatedCommonStep {
-    match step {
-        ValidatedStep::Command(command) => &command.common,
-        ValidatedStep::Agent(agent) => &agent.common,
+        edges: match step {
+            ValidatedStep::Workflow(workflow) => Some(Arc::new(
+                workflow
+                    .edges
+                    .iter()
+                    .map(|(outcome, target)| {
+                        (outcome.clone(), RuntimeEdgeTarget::from_validated(target))
+                    })
+                    .collect(),
+            )),
+            ValidatedStep::Command(_) | ValidatedStep::Agent(_) => None,
+        },
     }
 }
 
@@ -832,6 +1046,12 @@ enum OrdinaryOutcome {
     },
     Cancelled {
         reason: CancellationReason,
+    },
+    Waiting {
+        wait: EnteredWait,
+    },
+    Continued {
+        edge: TakenEdgeRecord,
     },
 }
 
@@ -903,6 +1123,15 @@ pub(crate) struct RuntimeState<Cause, Output, Deadline = ()> {
     pub(crate) last_cancellation_operation: Option<CancellationOperationId>,
     pub(crate) last_transition_sequence: TransitionSequence,
     transition_capacity_exceeded: bool,
+    /// The exit an edge-scheduled walk took (REQ-WFEXEC-58); `None` until then, and after
+    /// a walk that ended without one.
+    pub(crate) exit_outcome: Option<String>,
+    /// The wait the walk entered (REQ-WFEXEC-61, REQ-WFEXEC-62); once set no step is
+    /// authorized and the attempt ends `waiting` (INV-ENGINE-20).
+    pub(crate) wait: Option<EnteredWait>,
+    /// The continuing edge the walk took (REQ-WFEXEC-64); once set no step is authorized and
+    /// the attempt ends `continued` (INV-ENGINE-20).
+    pub(crate) continued: Option<TakenEdgeRecord>,
 }
 
 impl<Cause, Output, Deadline> RuntimeState<Cause, Output, Deadline> {
@@ -1009,6 +1238,12 @@ pub(crate) enum Occurrence<Provisional, Cause, Output, Deadline> {
         step: String,
         action: ActionId,
     },
+    /// A stop control in force for a `workflow` step the reducer authorized: the step does
+    /// not start and the run enters a `stop` wait at it (REQ-WFEXEC-62).
+    StopEntered {
+        step: String,
+        action: ActionId,
+    },
 }
 
 // Runtime and terminal outcomes intentionally remain distinct: the former exists only while
@@ -1022,6 +1257,15 @@ pub enum RunOutcome {
     },
     Cancelled {
         reason: CancellationReason,
+    },
+    /// The attempt ended on a wait (REQ-WFEXEC-15, REQ-WFEXEC-61): no finalizer ran.
+    Waiting {
+        wait: EnteredWait,
+    },
+    /// The attempt took a backward or limited edge (REQ-WFEXEC-15, REQ-WFEXEC-64): no
+    /// finalizer ran and the run continues from the edge's target.
+    Continued {
+        edge: TakenEdgeRecord,
     },
 }
 
@@ -1189,7 +1433,7 @@ pub(in crate::workflow) struct ExecutionStart<Deadline> {
 }
 
 pub(in crate::workflow) fn initialize_seeded_definition<Provisional, Cause, Output, Deadline>(
-    start: ExecutionStart<Deadline>,
+    mut start: ExecutionStart<Deadline>,
     seed: ExecutionSeed<Output>,
 ) -> Reduction<Provisional, Cause, Output, Deadline>
 where
@@ -1197,6 +1441,15 @@ where
     Output: Clone + ConditionOutput,
     Deadline: Clone,
 {
+    // A continuation of an edge-scheduled workflow starts the step it names, so that step
+    // is the walk's entry for this attempt (REQ-CONTINUE-3, INV-ENGINE-18).
+    if let (RuntimeScheduling::Edges { entry }, Some(named)) =
+        (&mut start.definition.scheduling, &seed.entry)
+        && start.definition.ordinary_ids.contains(named)
+    {
+        entry.clone_from(named);
+    }
+    start.definition.edge_counts.clone_from(&seed.edge_counts);
     let output_producers = seed
         .steps
         .iter()
@@ -1256,6 +1509,9 @@ where
             last_cancellation_operation: None,
             last_transition_sequence: TransitionSequence::default(),
             transition_capacity_exceeded: false,
+            exit_outcome: None,
+            wait: None,
+            continued: None,
         },
         events: Vec::new(),
         actions: Vec::new(),
@@ -1290,7 +1546,11 @@ where
 {
     if matches!(
         &current.workflow,
-        WorkflowState::Succeeded | WorkflowState::Failed { .. } | WorkflowState::Cancelled { .. }
+        WorkflowState::Succeeded
+            | WorkflowState::Failed { .. }
+            | WorkflowState::Cancelled { .. }
+            | WorkflowState::Waiting { .. }
+            | WorkflowState::Continued { .. }
     ) {
         return discard_occurrence(current, occurrence);
     }
@@ -1355,7 +1615,7 @@ fn apply_occurrence<Provisional, Cause, Output, Deadline>(
 where
     Provisional: ProvisionalStepResources,
     Cause: Clone + NodeFailureSource,
-    Output: Clone,
+    Output: Clone + ConditionOutput,
     Deadline: Clone,
 {
     match occurrence {
@@ -1596,7 +1856,72 @@ where
             );
             clear_active_invocation(&mut reduction.state, &step);
         }
+        Occurrence::StopEntered { step, action } => {
+            return enter_stop_wait(reduction, step, action);
+        }
     }
+    true
+}
+
+// A stop is entered instead of starting a `workflow` step the walk authorized: the step
+// never started, so it drops its target invocation and becomes `not_reached` with every
+// other unstarted step, and the attempt ends on a `stop` wait whose `then` is the step
+// (REQ-WFEXEC-62, INV-ENGINE-20).
+fn enter_stop_wait<Provisional, Cause, Output, Deadline>(
+    reduction: &mut Reduction<Provisional, Cause, Output, Deadline>,
+    step: String,
+    action: ActionId,
+) -> bool
+where
+    Cause: Clone,
+    Output: Clone,
+    Deadline: Clone,
+{
+    let edge_step = matches!(
+        reduction.state.definition.scheduling,
+        RuntimeScheduling::Edges { .. }
+    ) && reduction
+        .state
+        .definition
+        .steps
+        .get(&step)
+        .is_some_and(|definition| definition.edges.is_some());
+    if !edge_step
+        || reduction.state.wait.is_some()
+        || reduction.state.continued.is_some()
+        || reduction.state.exit_outcome.is_some()
+        || !matches!(
+            &reduction.state.workflow,
+            WorkflowState::Executing {
+                gate: SchedulingGate::Open
+            }
+        )
+        || !step_accepts(&reduction.state, &step, StepStateKind::Starting, action)
+    {
+        return false;
+    }
+    if let Some(runtime) = reduction.state.steps.get_mut(&step) {
+        runtime.target_execution = None;
+        runtime.target_invocation = None;
+        runtime.active_invocation = None;
+    }
+    transition_step(
+        reduction,
+        &step,
+        StepState::NotRun {
+            detail: NonExecutionDetail::not_reached(),
+        },
+        None,
+    );
+    reduction.state.wait = Some(EnteredWait {
+        step: step.clone(),
+        outcome: None,
+        kind: WaitKind::Stop,
+        then: step,
+        on_hand_back: None,
+        rule: None,
+    });
+    mark_unstarted_not_reached(reduction);
     true
 }
 
@@ -1657,7 +1982,9 @@ where
         }
         | WorkflowState::Succeeded
         | WorkflowState::Failed { .. }
-        | WorkflowState::Cancelled { .. } => false,
+        | WorkflowState::Cancelled { .. }
+        | WorkflowState::Waiting { .. }
+        | WorkflowState::Continued { .. } => false,
     }
 }
 
@@ -1786,7 +2113,9 @@ where
         WorkflowState::Finalizing { .. } => RunCancellationPhase::Finalization,
         WorkflowState::Succeeded
         | WorkflowState::Failed { .. }
-        | WorkflowState::Cancelled { .. } => return false,
+        | WorkflowState::Cancelled { .. }
+        | WorkflowState::Waiting { .. }
+        | WorkflowState::Continued { .. } => return false,
     };
     reduction.state.force_abort = Some(ForceAbortEvidence {
         reason: CancellationReason::ForceAbort,
@@ -1845,7 +2174,9 @@ where
         }
         WorkflowState::Succeeded
         | WorkflowState::Failed { .. }
-        | WorkflowState::Cancelled { .. } => return false,
+        | WorkflowState::Cancelled { .. }
+        | WorkflowState::Waiting { .. }
+        | WorkflowState::Continued { .. } => return false,
     }
 
     let sequence = next_sequence(&mut reduction.state);
@@ -2574,6 +2905,7 @@ fn stabilize<Provisional, Cause, Output, Deadline>(
                 propagate_ordinary_pending_dispositions(reduction);
                 evaluate_ready_conditions(reduction, WorkflowNodeRole::Step);
                 propagate_ordinary_pending_dispositions(reduction);
+                end_edge_walk(reduction);
                 select_ready_nodes(reduction, WorkflowNodeRole::Step);
                 enter_finalization_or_finish(reduction);
             }
@@ -2601,7 +2933,9 @@ fn stabilize<Provisional, Cause, Output, Deadline>(
             }
             WorkflowState::Succeeded
             | WorkflowState::Failed { .. }
-            | WorkflowState::Cancelled { .. } => {}
+            | WorkflowState::Cancelled { .. }
+            | WorkflowState::Waiting { .. }
+            | WorkflowState::Continued { .. } => {}
         }
         if reduction.state.last_transition_sequence == before {
             break;
@@ -2748,6 +3082,10 @@ fn condition_sources_available<Cause, Output, Deadline>(
                     || state.definition.json_inputs.contains_key(name)
             }
             ResolvedValueSource::FinalizationContext => state.finalization.is_some(),
+            // A condition never reads a control value (REQ-WFFORMAT-95).
+            ResolvedValueSource::Wait(_)
+            | ResolvedValueSource::ControlsAnswers
+            | ResolvedValueSource::Item { .. } => false,
             ResolvedValueSource::Output(source) => state
                 .steps
                 .get(&source.node.id)
@@ -2781,6 +3119,9 @@ where
                     values.insert_json_value(canonical.as_str(), context);
                 }
             }
+            ResolvedValueSource::Wait(_)
+            | ResolvedValueSource::ControlsAnswers
+            | ResolvedValueSource::Item { .. } => {}
             ResolvedValueSource::Output(source) => {
                 let Some(output) = state
                     .steps
@@ -2829,7 +3170,7 @@ fn step_data_available<Output>(state: &StepState<Output>) -> bool {
         )
 }
 
-fn step_outputs<Output>(state: &StepState<Output>) -> Option<&OutputSet<Output>> {
+pub(crate) fn step_outputs<Output>(state: &StepState<Output>) -> Option<&OutputSet<Output>> {
     match state {
         StepState::Succeeded { outputs }
         | StepState::Inherited {
@@ -3254,7 +3595,7 @@ fn select_ready_nodes<Provisional, Cause, Output, Deadline>(
     role: WorkflowNodeRole,
 ) where
     Cause: Clone,
-    Output: Clone,
+    Output: Clone + ConditionOutput,
     Deadline: Clone,
 {
     let gate_open = matches!(
@@ -3355,6 +3696,11 @@ where
         .map(|(input, source)| {
             let value = match source {
                 ResolvedValueSource::Input(_) => ActionInput::WorkflowInput,
+                // The child-run driver resolves the control values (REQ-WFEXEC-63) and each
+                // fan-out element's `item` values (REQ-WFEXEC-67) itself.
+                ResolvedValueSource::Wait(_)
+                | ResolvedValueSource::ControlsAnswers
+                | ResolvedValueSource::Item { .. } => ActionInput::Unavailable,
                 ResolvedValueSource::FinalizationContext => state
                     .finalization
                     .as_ref()
@@ -3388,13 +3734,248 @@ fn ordinary_ready<Cause, Output, Deadline>(
     state: &RuntimeState<Cause, Output, Deadline>,
     step_id: &str,
     definition: &RuntimeStep,
-) -> bool {
+) -> bool
+where
+    Output: ConditionOutput,
+{
     state.steps.get(step_id).is_some_and(|step| {
         matches!(step.state, StepState::Pending) && condition_cleared(definition, step)
     }) && definition
         .prerequisites
         .iter()
         .all(|prerequisite| ordinary_prerequisite_satisfied(state, prerequisite))
+        && edge_authorized(state, step_id)
+}
+
+// In an edge-scheduled workflow the entry, or the step a continuation's seed names, is
+// authorized from the start and any other step only as the `Step` target of the edge a
+// `workflow` step that settled in this attempt took; an inherited step routes nothing, and
+// nothing is authorized once the walk has exited, entered a wait or taken a continuing edge
+// (REQ-WFEXEC-58, REQ-WFEXEC-64, INV-ENGINE-18, INV-ENGINE-20). A step leaves `Pending` when
+// it starts, so each taken edge starts its target once; a continuing edge's target starts in
+// the next attempt, never in this one.
+fn edge_authorized<Cause, Output, Deadline>(
+    state: &RuntimeState<Cause, Output, Deadline>,
+    step_id: &str,
+) -> bool
+where
+    Output: ConditionOutput,
+{
+    match &state.definition.scheduling {
+        RuntimeScheduling::Dataflow => true,
+        RuntimeScheduling::Edges { entry } => {
+            state.exit_outcome.is_none()
+                && state.wait.is_none()
+                && state.continued.is_none()
+                && (entry == step_id
+                    || state.definition.ordinary_ids.iter().any(|producer| {
+                        taken_edge(state, producer)
+                            .is_some_and(|(_, edge)| edge == TakenEdge::Step(step_id))
+                    }))
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TakenEdge<'a> {
+    Step(&'a str),
+    Exit(&'a str),
+    /// The edge is a wait the run enters (REQ-WFEXEC-61).
+    Wait(&'a RuntimeEdgeTarget),
+    /// The edge names the producer itself or an earlier step, or is a limited edge's `then`
+    /// under its count: the run continues from `target` in a new attempt (REQ-WFEXEC-64).
+    Continue {
+        target: &'a str,
+        counted: bool,
+    },
+    // The recorded outcome names no edge.
+    Unrouted,
+}
+
+/// The recorded outcome of a `workflow` step that succeeded in this attempt and the edge it
+/// took; `None` for any other step or state, an inherited step among them (REQ-WFEXEC-58).
+fn taken_edge<'a, Cause, Output, Deadline>(
+    state: &'a RuntimeState<Cause, Output, Deadline>,
+    producer: &str,
+) -> Option<(Option<&'a str>, TakenEdge<'a>)>
+where
+    Output: ConditionOutput,
+{
+    let edges = state.definition.steps.get(producer)?.edges.as_ref()?;
+    let StepState::Succeeded { outputs } = &state.steps.get(producer)?.state else {
+        return None;
+    };
+    let outcome = outputs
+        .get(CHILD_OUTCOME_OUTPUT)
+        .and_then(ConditionOutput::condition_text);
+    let edge = match outcome.and_then(|outcome| Some((outcome, edges.get(outcome)?))) {
+        // The count is compared before the taking: `limit: 2` continues twice and takes
+        // `else` the third time (REQ-WFEXEC-64).
+        Some((outcome, RuntimeEdgeTarget::Limited { then, limit, else_ })) => {
+            let count = state
+                .definition
+                .edge_counts
+                .get(&edge_key(producer, outcome))
+                .copied()
+                .unwrap_or(0);
+            if count < u64::from(*limit) {
+                TakenEdge::Continue {
+                    target: then,
+                    counted: true,
+                }
+            } else {
+                ordinary_edge(&state.definition, producer, else_)
+            }
+        }
+        Some((_, target)) => ordinary_edge(&state.definition, producer, target),
+        None => TakenEdge::Unrouted,
+    };
+    Some((outcome, edge))
+}
+
+/// An edge target taken as the format spells it: a step later in document order than the
+/// producer starts in this attempt, the producer itself or an earlier step continues the run
+/// (REQ-WFEXEC-58, REQ-WFEXEC-64). Validation admits no limited edge inside another.
+/// Whether `target` is a step later than `producer` in `order`, the document order: the
+/// comparison that makes a `Step` edge start its target in the attempt rather than continue
+/// (REQ-WFEXEC-58) and a fan-out go on to its next element (REQ-WFEXEC-66).
+pub(crate) fn later_step(order: &[String], producer: &str, target: &str) -> bool {
+    let position = |id: &str| order.iter().position(|step| step == id);
+    matches!(
+        (position(producer), position(target)),
+        (Some(producer), Some(target)) if target > producer
+    )
+}
+
+fn ordinary_edge<'a>(
+    definition: &RuntimeDefinition,
+    producer: &str,
+    target: &'a RuntimeEdgeTarget,
+) -> TakenEdge<'a> {
+    match target {
+        RuntimeEdgeTarget::Step(step) if later_step(&definition.step_order, producer, step) => {
+            TakenEdge::Step(step)
+        }
+        RuntimeEdgeTarget::Step(step) => TakenEdge::Continue {
+            target: step,
+            counted: false,
+        },
+        RuntimeEdgeTarget::Exit(name) => TakenEdge::Exit(name),
+        RuntimeEdgeTarget::Wait { .. } => TakenEdge::Wait(target),
+        RuntimeEdgeTarget::Limited { .. } => TakenEdge::Unrouted,
+    }
+}
+
+// A taken edge that is not a `Step` ends the walk, and every step that has not started
+// becomes `not_run` `not_reached`: an `Exit` records the exit outcome and ends the ordinary
+// phase as a success (REQ-WFEXEC-58), a `Wait` records the wait the attempt ends on
+// (REQ-WFEXEC-61), and a `Continue` records the edge the attempt ends `continued` on
+// (REQ-WFEXEC-64, INV-ENGINE-22). Validation leaves no outcome without an edge, so the remaining case is
+// logged and ends the walk with no exit outcome, which the run record reports as `failed`.
+fn end_edge_walk<Provisional, Cause, Output, Deadline>(
+    reduction: &mut Reduction<Provisional, Cause, Output, Deadline>,
+) where
+    Cause: Clone,
+    Output: Clone + ConditionOutput,
+    Deadline: Clone,
+{
+    if !matches!(
+        reduction.state.definition.scheduling,
+        RuntimeScheduling::Edges { .. }
+    ) || !matches!(
+        &reduction.state.workflow,
+        WorkflowState::Executing {
+            gate: SchedulingGate::Open
+        }
+    ) || reduction.state.exit_outcome.is_some()
+        || reduction.state.wait.is_some()
+        || reduction.state.continued.is_some()
+    {
+        return;
+    }
+    let ended = reduction
+        .state
+        .definition
+        .ordinary_ids
+        .iter()
+        .find_map(|producer| {
+            let (outcome, edge) = taken_edge(&reduction.state, producer)?;
+            let ending = match edge {
+                TakenEdge::Step(_) => return None,
+                TakenEdge::Exit(name) => WalkEnding::Exit(name.to_owned()),
+                TakenEdge::Continue { target, counted } => WalkEnding::Continue(TakenEdgeRecord {
+                    step: producer.clone(),
+                    outcome: outcome.unwrap_or_default().to_owned(),
+                    target: target.to_owned(),
+                    counted,
+                }),
+                TakenEdge::Wait(RuntimeEdgeTarget::Wait {
+                    kind,
+                    then,
+                    on_hand_back,
+                    rule,
+                }) => WalkEnding::Wait(EnteredWait {
+                    step: producer.clone(),
+                    outcome: outcome.map(str::to_owned),
+                    kind: *kind,
+                    then: then.clone(),
+                    on_hand_back: on_hand_back.clone(),
+                    rule: rule.clone(),
+                }),
+                TakenEdge::Wait(_) | TakenEdge::Unrouted => WalkEnding::Unrouted(producer.clone()),
+            };
+            Some(ending)
+        });
+    match ended {
+        None => return,
+        Some(WalkEnding::Exit(name)) => reduction.state.exit_outcome = Some(name),
+        Some(WalkEnding::Wait(wait)) => reduction.state.wait = Some(wait),
+        Some(WalkEnding::Continue(edge)) => reduction.state.continued = Some(edge),
+        Some(WalkEnding::Unrouted(producer)) => {
+            tracing::error!(event = "edge_walk_unrouted", step = %producer);
+        }
+    }
+    mark_unstarted_not_reached(reduction);
+}
+
+enum WalkEnding {
+    Exit(String),
+    Wait(EnteredWait),
+    Continue(TakenEdgeRecord),
+    Unrouted(String),
+}
+
+fn mark_unstarted_not_reached<Provisional, Cause, Output, Deadline>(
+    reduction: &mut Reduction<Provisional, Cause, Output, Deadline>,
+) where
+    Cause: Clone,
+    Output: Clone,
+    Deadline: Clone,
+{
+    let pending = reduction
+        .state
+        .definition
+        .ordinary_ids
+        .iter()
+        .filter(|id| {
+            reduction
+                .state
+                .steps
+                .get(*id)
+                .is_some_and(|runtime| matches!(runtime.state, StepState::Pending))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    for step in pending {
+        transition_step(
+            reduction,
+            &step,
+            StepState::NotRun {
+                detail: NonExecutionDetail::not_reached(),
+            },
+            None,
+        );
+    }
 }
 
 fn finalizer_ready<Cause, Output, Deadline>(
@@ -3441,22 +4022,63 @@ fn enter_finalization_or_finish<Provisional, Cause, Output, Deadline>(
         finish_run(reduction, ordinary_outcome, None);
         return;
     }
+    // A wait or a continuing edge ends the attempt without finalization: every finalizer is
+    // `not_run` with `finalizer_trigger_not_selected` and the attempt has no finalization
+    // summary (REQ-WFEXEC-61, REQ-WFEXEC-64, INV-ENGINE-20).
+    if matches!(
+        ordinary_outcome,
+        OrdinaryOutcome::Waiting { .. } | OrdinaryOutcome::Continued { .. }
+    ) {
+        let finalizers = reduction
+            .state
+            .definition
+            .finalizer_presentation_order
+            .iter()
+            .filter(|id| {
+                reduction
+                    .state
+                    .steps
+                    .get(*id)
+                    .is_some_and(|runtime| matches!(runtime.state, StepState::Pending))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        for finalizer in finalizers {
+            transition_step(
+                reduction,
+                &finalizer,
+                StepState::NotRun {
+                    detail: NonExecutionDetail::finalizer_trigger_not_selected(),
+                },
+                None,
+            );
+        }
+        finish_run(reduction, ordinary_outcome, None);
+        return;
+    }
     let trigger = match &ordinary_outcome {
-        OrdinaryOutcome::Succeeded => FinalizationTrigger::Succeeded,
+        OrdinaryOutcome::Succeeded
+        | OrdinaryOutcome::Waiting { .. }
+        | OrdinaryOutcome::Continued { .. } => FinalizationTrigger::Succeeded,
         OrdinaryOutcome::Failed { .. } => FinalizationTrigger::Failed,
         OrdinaryOutcome::Cancelled { .. } => FinalizationTrigger::Cancelled,
     };
     let ordinary_issues = ordinary_issues(&reduction.state);
     let primary_issue_step_id = match &ordinary_outcome {
         OrdinaryOutcome::Failed { primary_issue, .. } => Some(primary_issue.node.id.as_str()),
-        OrdinaryOutcome::Succeeded | OrdinaryOutcome::Cancelled { .. } => None,
+        OrdinaryOutcome::Succeeded
+        | OrdinaryOutcome::Cancelled { .. }
+        | OrdinaryOutcome::Waiting { .. }
+        | OrdinaryOutcome::Continued { .. } => None,
     };
     let ordinary_cancellation = match &ordinary_outcome {
         OrdinaryOutcome::Failed {
             later_cancellation, ..
         } => *later_cancellation,
         OrdinaryOutcome::Cancelled { reason } => Some(*reason),
-        OrdinaryOutcome::Succeeded => None,
+        OrdinaryOutcome::Succeeded
+        | OrdinaryOutcome::Waiting { .. }
+        | OrdinaryOutcome::Continued { .. } => None,
     };
     let (run_id, attempt_id) = reduction
         .state
@@ -3475,7 +4097,10 @@ fn enter_finalization_or_finish<Provisional, Cause, Output, Deadline>(
     });
     let primary_issue = match &ordinary_outcome {
         OrdinaryOutcome::Failed { primary_issue, .. } => Some(primary_issue.clone()),
-        OrdinaryOutcome::Succeeded | OrdinaryOutcome::Cancelled { .. } => None,
+        OrdinaryOutcome::Succeeded
+        | OrdinaryOutcome::Cancelled { .. }
+        | OrdinaryOutcome::Waiting { .. }
+        | OrdinaryOutcome::Continued { .. } => None,
     };
     let force_abort = reduction
         .state
@@ -3529,7 +4154,11 @@ where
     Some(match &state.workflow {
         WorkflowState::Executing {
             gate: SchedulingGate::Open,
-        } => OrdinaryOutcome::Succeeded,
+        } => match (&state.wait, &state.continued) {
+            (Some(wait), _) => OrdinaryOutcome::Waiting { wait: wait.clone() },
+            (None, Some(edge)) => OrdinaryOutcome::Continued { edge: edge.clone() },
+            (None, None) => OrdinaryOutcome::Succeeded,
+        },
         WorkflowState::Executing {
             gate: SchedulingGate::FailureStopped { primary_issue },
         } => OrdinaryOutcome::Failed {
@@ -3556,7 +4185,9 @@ where
         WorkflowState::Finalizing { .. }
         | WorkflowState::Succeeded
         | WorkflowState::Failed { .. }
-        | WorkflowState::Cancelled { .. } => return None,
+        | WorkflowState::Cancelled { .. }
+        | WorkflowState::Waiting { .. }
+        | WorkflowState::Continued { .. } => return None,
     })
 }
 
@@ -3694,6 +4325,8 @@ where
             }),
         },
         OrdinaryOutcome::Cancelled { reason } => OrdinaryOutcome::Cancelled { reason: *reason },
+        OrdinaryOutcome::Waiting { wait } => OrdinaryOutcome::Waiting { wait: wait.clone() },
+        OrdinaryOutcome::Continued { edge } => OrdinaryOutcome::Continued { edge: edge.clone() },
         OrdinaryOutcome::Succeeded => match &state.workflow {
             WorkflowState::Finalizing {
                 primary_issue: Some(primary_issue),
@@ -3746,6 +4379,14 @@ fn finish_run<Provisional, Cause, Output, Deadline>(
             WorkflowState::Cancelled { reason },
             RunOutcome::Cancelled { reason },
         ),
+        OrdinaryOutcome::Waiting { wait } => (
+            WorkflowState::Waiting { wait: wait.clone() },
+            RunOutcome::Waiting { wait },
+        ),
+        OrdinaryOutcome::Continued { edge } => (
+            WorkflowState::Continued { edge: edge.clone() },
+            RunOutcome::Continued { edge },
+        ),
     };
     let from = reduction.state.workflow.clone();
     let sequence = next_sequence(&mut reduction.state);
@@ -3776,8 +4417,24 @@ where
         .map(|(name, source)| {
             let step = state.steps.get(&source.step)?;
             let value = match &step.state {
-                StepState::Succeeded { outputs } => ExportValue::Available {
-                    output: outputs.get(&source.output)?.clone(),
+                StepState::Succeeded { outputs } => match outputs.get(&source.output) {
+                    Some(output) => ExportValue::Available {
+                        output: output.clone(),
+                    },
+                    // A `workflow` step commits only the child exports that were available,
+                    // so an export of one it left out is unavailable, as for an inherited
+                    // step whose output was not retained.
+                    None if state
+                        .definition
+                        .steps
+                        .get(&source.step)
+                        .is_some_and(|definition| definition.edges.is_some()) =>
+                    {
+                        ExportValue::Unavailable {
+                            reason: ExportUnavailableReason::Failed,
+                        }
+                    }
+                    None => return None,
                 },
                 StepState::Inherited {
                     disposition: InheritedDisposition::Succeeded,
@@ -3854,16 +4511,33 @@ fn step_declares_outputs<Cause, Output, Deadline>(
         .is_some_and(|definition| !definition.declared_outputs.is_empty())
 }
 
+// A `workflow` step commits the subset of its derived outputs its child made available, which
+// always includes the text `outcome` its edges route on (REQ-WFEXEC-58); every other step
+// commits exactly its declared outputs.
 fn outputs_match_declaration<Cause, Output, Deadline>(
     state: &RuntimeState<Cause, Output, Deadline>,
     step: &str,
     outputs: &OutputSet<Output>,
-) -> bool {
+) -> bool
+where
+    Output: ConditionOutput,
+{
     state
         .definition
         .steps
         .get(step)
-        .is_some_and(|definition| outputs.keys().eq(definition.declared_outputs.iter()))
+        .is_some_and(|definition| match &definition.edges {
+            None => outputs.keys().eq(definition.declared_outputs.iter()),
+            Some(_) => {
+                outputs
+                    .keys()
+                    .all(|name| definition.declared_outputs.contains(name))
+                    && outputs
+                        .get(CHILD_OUTCOME_OUTPUT)
+                        .and_then(ConditionOutput::condition_text)
+                        .is_some()
+            }
+        })
 }
 
 fn set_current_action<Cause, Output, Deadline>(

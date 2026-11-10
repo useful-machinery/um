@@ -1,0 +1,13 @@
+schemaVersion: 1
+steps:
+  design:
+    kind: workflow
+    workflow: design.yaml
+    on:
+      succeeded: exit.succeeded
+      failed: exit.failed
+    outputs:
+      plan:
+        kind: text
+        from: path
+        path: plan.txt

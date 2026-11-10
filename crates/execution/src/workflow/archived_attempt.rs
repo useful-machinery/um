@@ -28,7 +28,8 @@ use super::local_run::{
     AttemptTriggerV1, LocalAttemptV1, LocalStatusError, LocalStatusErrorCode, RetainedReadBudget,
     StableLocalRunSnapshot, attempt_result_relative_path,
     load_attempt_retained_execution_with_budget, mark_validated_result_published,
-    open_directory_at, read_stable_local_run_snapshot, retained_output_matches_export,
+    open_directory_at, read_attempt_wait_record, read_stable_local_run_snapshot,
+    retained_output_matches_export, retained_output_present,
     validate_retained_outputs_against_definition, verify_retained_output_evidence,
 };
 use super::presentation_feed::WorkflowPresentationDefinition;
@@ -194,6 +195,9 @@ pub(crate) struct ArchivedFinalization {
 pub struct LoadedLocalArchivedAttempt {
     pub projection: LocalArchivedAttempt,
     pub result: WorkflowResultV1,
+    /// The attempt's wait copy `attempts/<N>/wait.json` when it ended in a wait
+    /// (REQ-LOCALRUN-179).
+    pub wait: Option<super::wait::WaitRecord>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -228,6 +232,63 @@ pub fn load_local_archived_attempt(
     requested_attempt: Option<NonZeroU64>,
 ) -> Result<LoadedLocalArchivedAttempt, ArchivedAttemptLoadError> {
     load_local_archived_attempt_with(requested, requested_attempt, &mut NoopArchiveReadObserver)
+}
+
+/// How the finished child run at `child` ended, for a parent that recovers from abandonment
+/// without running it again (REQ-CONTINUE-76): `Cancelled` for a child whose run record
+/// reads `canceled` or whose published result is cancelled, `Exited` with the recorded
+/// outcome and the published result's available `text` and `json` exports, and
+/// `Interrupted` for a child with no outcome or no readable published result.
+pub fn adopted_child_outcome(child: &Path) -> super::step_runtime::ChildRunOutcome {
+    use super::step_runtime::ChildRunOutcome;
+    let Some(outcome) = super::local_run::open_run_root(child)
+        .and_then(|(_, root)| super::local_run::read_run_record(&root))
+        .ok()
+        .and_then(|record| record.outcome)
+    else {
+        return ChildRunOutcome::Interrupted;
+    };
+    // `chosen_outcome`'s outcome for a cancelled run (REQ-WFEXEC-57).
+    if outcome == "canceled" {
+        return ChildRunOutcome::Cancelled;
+    }
+    let Ok(loaded) = load_local_archived_attempt(child, None) else {
+        return ChildRunOutcome::Interrupted;
+    };
+    if loaded.result.outcome == WorkflowOutcomeV1::Cancelled {
+        return ChildRunOutcome::Cancelled;
+    }
+    let mut exports = BTreeMap::new();
+    for (name, export) in &loaded.result.exports {
+        let ExportV1::Available { kind, path, .. } = export else {
+            continue;
+        };
+        let Ok(bytes) = std::fs::read(loaded.projection.result_directory.join(path)) else {
+            return ChildRunOutcome::Interrupted;
+        };
+        let value = match kind.as_str() {
+            "text" => match String::from_utf8(bytes) {
+                Ok(text) => super::value::CapturedValue::text(Arc::from(text)),
+                Err(_) => return ChildRunOutcome::Interrupted,
+            },
+            "json" => match adopted_json(&bytes) {
+                Some(value) => value,
+                None => return ChildRunOutcome::Interrupted,
+            },
+            _ => continue,
+        };
+        exports.insert(name.clone(), value);
+    }
+    ChildRunOutcome::Exited { outcome, exports }
+}
+
+/// A published `json` export as an unconstrained captured value, as a live child's export
+/// reaches its parent.
+fn adopted_json(bytes: &[u8]) -> Option<super::value::CapturedValue> {
+    let value: serde_json::Value = serde_json::from_slice(bytes).ok()?;
+    let carrier = super::canonical_json::to_bounded_bytes(&value, u64::MAX).ok()?;
+    super::value::CapturedJson::unconstrained(Arc::new(value), carrier)
+        .map(super::value::CapturedValue::json)
 }
 
 pub fn reconcile_current_result_publication(
@@ -418,6 +479,8 @@ fn load_local_archived_attempt_with(
         maximum_parallel_steps,
     )
     .map_err(|invariant| result_invalid(&snapshot.run_directory, invariant))?;
+    let wait = read_attempt_wait_record(&snapshot.root, attempt.attempt_number)
+        .map_err(|_| result_invalid(&snapshot.run_directory, ProjectionInvariant::Outcome))?;
     let projection = LocalArchivedAttempt {
         run_directory: snapshot.run_directory.clone(),
         current_attempt_number: snapshot.state.current_attempt_number,
@@ -463,7 +526,11 @@ fn load_local_archived_attempt_with(
         finalization: validated.finalization,
         steps: validated.steps,
     };
-    Ok(LoadedLocalArchivedAttempt { projection, result })
+    Ok(LoadedLocalArchivedAttempt {
+        projection,
+        result,
+        wait,
+    })
 }
 
 fn select_published_attempt(
@@ -493,7 +560,11 @@ fn select_published_attempt(
         AttemptStateV1::Rejected => {
             return Err(ineligible(ArchivedAttemptIneligibilityReason::Rejected));
         }
-        AttemptStateV1::Succeeded | AttemptStateV1::WorkflowFailed | AttemptStateV1::Cancelled => {}
+        AttemptStateV1::Succeeded
+        | AttemptStateV1::WorkflowFailed
+        | AttemptStateV1::Cancelled
+        | AttemptStateV1::Waiting
+        | AttemptStateV1::Continued => {}
     }
     match attempt.result {
         AttemptResultV1::Published { .. } => Ok((attempt, false)),
@@ -639,6 +710,8 @@ fn validate_and_project_result(
         (AttemptStateV1::Succeeded, WorkflowOutcomeV1::Succeeded)
             | (AttemptStateV1::WorkflowFailed, WorkflowOutcomeV1::Failed)
             | (AttemptStateV1::Cancelled, WorkflowOutcomeV1::Cancelled)
+            | (AttemptStateV1::Waiting, WorkflowOutcomeV1::Waiting)
+            | (AttemptStateV1::Continued, WorkflowOutcomeV1::Continued)
     );
     if !valid_outcome {
         return Err(ProjectionInvariant::Outcome);
@@ -659,7 +732,11 @@ fn validate_and_project_result(
         .as_ref()
         .map(|finalization| finalization.trigger)
         .unwrap_or(match result.outcome {
-            WorkflowOutcomeV1::Succeeded => FinalizationTriggerV1::Succeeded,
+            // A waiting or continued attempt's steps are terminal as a success's are
+            // (REQ-WFEXEC-61, REQ-WFEXEC-64).
+            WorkflowOutcomeV1::Succeeded
+            | WorkflowOutcomeV1::Waiting
+            | WorkflowOutcomeV1::Continued => FinalizationTriggerV1::Succeeded,
             WorkflowOutcomeV1::Failed => FinalizationTriggerV1::Failed,
             WorkflowOutcomeV1::Cancelled => FinalizationTriggerV1::Cancelled,
         });
@@ -821,7 +898,17 @@ fn project_finalization(
     workflow: &super::resolution::ResolvedWorkflow,
 ) -> Result<(Option<ArchivedFinalization>, Vec<ArchivedStep>), ()> {
     let (wire, durable) = match (&result.finalization, &attempt.finalization) {
-        (None, None) if workflow.definition.finalizers.is_empty() => return Ok((None, Vec::new())),
+        // A waiting or continued attempt runs no finalizer and records no finalization
+        // (REQ-WFEXEC-61, REQ-WFEXEC-64).
+        (None, None)
+            if workflow.definition.finalizers.is_empty()
+                || matches!(
+                    result.outcome,
+                    WorkflowOutcomeV1::Waiting | WorkflowOutcomeV1::Continued
+                ) =>
+        {
+            return Ok((None, Vec::new()));
+        }
         (Some(wire), Some(AttemptFinalizationV1::Complete(durable)))
             if !workflow.definition.finalizers.is_empty() =>
         {
@@ -960,14 +1047,28 @@ fn finalizer_disposition_matches_definition(
 }
 
 fn consumed_output_sources(step: &ValidatedStep) -> Vec<&super::validated::ResolvedOutputSource> {
+    fn output_source(
+        source: &ResolvedValueSource,
+    ) -> Option<&super::validated::ResolvedOutputSource> {
+        match source {
+            ResolvedValueSource::Output(source) => Some(source),
+            ResolvedValueSource::Input(_)
+            | ResolvedValueSource::FinalizationContext
+            | ResolvedValueSource::Wait(_)
+            | ResolvedValueSource::ControlsAnswers
+            | ResolvedValueSource::Item { .. } => None,
+        }
+    }
     match step {
         ValidatedStep::Command(command) => command
             .inputs
             .values()
-            .filter_map(|reference| match &reference.source {
-                ResolvedValueSource::Output(source) => Some(source),
-                ResolvedValueSource::Input(_) | ResolvedValueSource::FinalizationContext => None,
-            })
+            .filter_map(|reference| output_source(&reference.source))
+            .collect(),
+        ValidatedStep::Workflow(workflow) => workflow
+            .inputs
+            .values()
+            .filter_map(|input| output_source(&input.reference.source))
             .collect(),
         ValidatedStep::Agent(agent) => agent
             .agent
@@ -982,7 +1083,11 @@ fn consumed_output_sources(step: &ValidatedStep) -> Vec<&super::validated::Resol
                 } => Some(source),
                 ValidatedMessageSource::Reference {
                     source:
-                        ResolvedValueSource::Input(_) | ResolvedValueSource::FinalizationContext,
+                        ResolvedValueSource::Input(_)
+                        | ResolvedValueSource::FinalizationContext
+                        | ResolvedValueSource::Wait(_)
+                        | ResolvedValueSource::ControlsAnswers
+                        | ResolvedValueSource::Item { .. },
                     ..
                 }
                 | ValidatedMessageSource::File { .. } => None,
@@ -1301,11 +1406,13 @@ fn project_step(
         (WorkflowStepStateV1::NotRun, Some(NodeDetail::NotRun(value))) => {
             if !matches!(
                 (role, value.code),
-                (WorkflowNodeRole::Step, NonExecutionCode::FailureStop)
-                    | (
-                        WorkflowNodeRole::Finalizer,
-                        NonExecutionCode::FinalizerTriggerNotSelected
-                    )
+                (
+                    WorkflowNodeRole::Step,
+                    NonExecutionCode::FailureStop | NonExecutionCode::NotReached
+                ) | (
+                    WorkflowNodeRole::Finalizer,
+                    NonExecutionCode::FinalizerTriggerNotSelected
+                )
             ) {
                 return Err(());
             }
@@ -1321,8 +1428,11 @@ fn project_step(
         (Some(output), ValidatedStep::Command(_)) => {
             Some(project_command_output(output, maximum_stream_bytes)?)
         }
-        (None, ValidatedStep::Command(_) | ValidatedStep::Agent(_)) => None,
-        (Some(_), ValidatedStep::Agent(_)) => return Err(()),
+        (
+            None,
+            ValidatedStep::Command(_) | ValidatedStep::Agent(_) | ValidatedStep::Workflow(_),
+        ) => None,
+        (Some(_), ValidatedStep::Agent(_) | ValidatedStep::Workflow(_)) => return Err(()),
     };
     let timing_present = started_at.is_some();
     let output_present = command_output.is_some();
@@ -1341,7 +1451,7 @@ fn project_step(
         WorkflowStepStateV1::Cancelled => !output_present || timing_present,
     };
     let valid_output = match (definition, &detail) {
-        (ValidatedStep::Agent(_), _) => !output_present,
+        (ValidatedStep::Agent(_) | ValidatedStep::Workflow(_), _) => !output_present,
         (ValidatedStep::Command(_), ArchivedStepDetail::Succeeded) => output_present,
         (ValidatedStep::Command(_), ArchivedStepDetail::Evidence(NodeDetail::Failed(failure))) => {
             output_present
@@ -1422,7 +1532,10 @@ fn project_primary_issue(
     steps: &[ArchivedStep],
 ) -> Result<Option<PrimaryIssue>, ()> {
     match result.outcome {
-        WorkflowOutcomeV1::Succeeded | WorkflowOutcomeV1::Cancelled
+        WorkflowOutcomeV1::Succeeded
+        | WorkflowOutcomeV1::Cancelled
+        | WorkflowOutcomeV1::Waiting
+        | WorkflowOutcomeV1::Continued
             if result.primary_issue.is_some() =>
         {
             Err(())
@@ -1449,7 +1562,10 @@ fn project_primary_issue(
             }
             Ok(Some(primary.clone()))
         }
-        WorkflowOutcomeV1::Succeeded | WorkflowOutcomeV1::Cancelled => Ok(None),
+        WorkflowOutcomeV1::Succeeded
+        | WorkflowOutcomeV1::Cancelled
+        | WorkflowOutcomeV1::Waiting
+        | WorkflowOutcomeV1::Continued => Ok(None),
     }
 }
 
@@ -1473,14 +1589,10 @@ fn validate_failure_binding(detail: &FailureDetail, definition: &ValidatedStep) 
             return Err(());
         }
     }
-    if let Some(output) = detail.output.as_deref() {
-        let outputs = match definition {
-            ValidatedStep::Command(command) => &command.common.outputs,
-            ValidatedStep::Agent(agent) => &agent.common.outputs,
-        };
-        if !outputs.contains_key(output) {
-            return Err(());
-        }
+    if let Some(output) = detail.output.as_deref()
+        && !definition.common().outputs.contains_key(output)
+    {
+        return Err(());
     }
     Ok(())
 }
@@ -1620,7 +1732,17 @@ fn validate_exports(
             WorkflowNodeRole::Step => AttemptNodeRoleV1::Step,
             WorkflowNodeRole::Finalizer => AttemptNodeRoleV1::Finalizer,
         };
-        let source_available = archived_step_data_available(source_step);
+        // A `workflow` step commits only the child exports that were available, so an
+        // export of one it left out is unavailable with `source_failed` (REQ-WFEXEC-58).
+        let left_out = archived_step_data_available(source_step)
+            && attempt.definition.is_some()
+            && source.node.role == WorkflowNodeRole::Step
+            && matches!(
+                workflow.definition.steps.get(&source.node.id),
+                Some(ValidatedStep::Workflow(_))
+            )
+            && !retained_output_present(attempt, retained_role, &source.node.id, &source.output);
+        let source_available = archived_step_data_available(source_step) && !left_out;
         if source_available
             && attempt.definition.is_some()
             && !retained_output_matches_export(
@@ -1705,7 +1827,12 @@ fn validate_exports(
                 }
             }
             ExportV1::Unavailable { reason, .. } => {
-                if Some(*reason) != archived_export_unavailable_reason(source_step) {
+                let expected = if left_out {
+                    Some(ExportUnavailableReasonV1::Failed)
+                } else {
+                    archived_export_unavailable_reason(source_step)
+                };
+                if Some(*reason) != expected {
                     return Err(());
                 }
             }
@@ -1728,7 +1855,10 @@ fn archived_export_unavailable_reason(step: &ArchivedStep) -> Option<ExportUnava
             Some(ExportUnavailableReasonV1::Blocked)
         }
         (ArchivedStepDetail::Evidence(NodeDetail::NotRun(detail)), WorkflowNodeRole::Step)
-            if detail.code == NonExecutionCode::FailureStop =>
+            if matches!(
+                detail.code,
+                NonExecutionCode::FailureStop | NonExecutionCode::NotReached
+            ) =>
         {
             Some(ExportUnavailableReasonV1::NotRun)
         }
@@ -1780,14 +1910,19 @@ fn export_media_type<'a>(
                 .map(|finalizer| &finalizer.body)
         })
         .ok_or(())?;
-    let output = match step {
-        ValidatedStep::Command(command) => command.common.outputs.get(&source.output),
-        ValidatedStep::Agent(agent) => agent.common.outputs.get(&source.output),
-    }
-    .ok_or(())?;
+    let output = step.common().outputs.get(&source.output).ok_or(())?;
     Ok(match &output.definition {
-        Output::TextPath { .. } | Output::TextAgentResponse => "text/plain; charset=utf-8",
+        Output::TextPath { .. } | Output::TextAgentResponse | Output::ChildOutcome => {
+            "text/plain; charset=utf-8"
+        }
         Output::JsonPath { .. } | Output::JsonAgentResult { .. } => "application/json",
+        Output::ChildExport { value_type } => match value_type {
+            WorkflowValueType::Json => "application/json",
+            WorkflowValueType::Text
+            | WorkflowValueType::File
+            | WorkflowValueType::GitBranch
+            | WorkflowValueType::AttachmentCollection => "text/plain; charset=utf-8",
+        },
         Output::FilePath { media_type, .. } => media_type,
         Output::GitBranchWorkspace => "application/vnd.git.bundle",
     })
@@ -1796,7 +1931,9 @@ fn export_media_type<'a>(
 fn step_kind_matches(kind: &str, definition: &ValidatedStep) -> bool {
     matches!(
         (kind, definition),
-        ("cmd", ValidatedStep::Command(_)) | ("agent", ValidatedStep::Agent(_))
+        ("cmd", ValidatedStep::Command(_))
+            | ("agent", ValidatedStep::Agent(_))
+            | ("workflow", ValidatedStep::Workflow(_))
     )
 }
 
@@ -1820,17 +1957,11 @@ fn step_state_matches(result: WorkflowStepStateV1, durable: AttemptStepStateV1) 
 }
 
 fn step_failure_policy(step: &ValidatedStep) -> FailurePolicy {
-    match step {
-        ValidatedStep::Command(command) => command.common.failure_policy,
-        ValidatedStep::Agent(agent) => agent.common.failure_policy,
-    }
+    step.common().failure_policy
 }
 
 fn direct_prerequisites(step: &ValidatedStep) -> &[ResolvedDirectPrerequisite] {
-    match step {
-        ValidatedStep::Command(command) => &command.common.prerequisites,
-        ValidatedStep::Agent(agent) => &agent.common.prerequisites,
-    }
+    &step.common().prerequisites
 }
 
 fn prerequisite_satisfied(
@@ -1858,12 +1989,17 @@ fn prerequisite_satisfied(
     (!prerequisite.control || control_satisfied) && (!prerequisite.data || succeeded)
 }
 
+// A step an edge-scheduled walk never reached is part of a success (REQ-WFEXEC-58).
 fn step_succeeds_workflow(step: &ArchivedStep) -> bool {
     matches!(
         step.state,
         WorkflowStepStateV1::Succeeded
             | WorkflowStepStateV1::Inherited
             | WorkflowStepStateV1::Skipped
+    ) || matches!(
+        &step.detail,
+        ArchivedStepDetail::Evidence(NodeDetail::NotRun(detail))
+            if detail.code == NonExecutionCode::NotReached
     ) || (step.failure_policy == FailurePolicy::Advisory
         && matches!(
             step.state,
@@ -1914,5 +2050,109 @@ mod tests {
             archived_export_unavailable_reason(&unavailable),
             Some(ExportUnavailableReasonV1::Skipped)
         );
+    }
+
+    // REQ-WFEXEC-58
+    #[test]
+    fn a_step_an_edge_walk_never_reached_reads_back_with_an_unrun_export_source() {
+        let workflow = super::super::validation::validate(
+            super::super::decode(
+                b"schemaVersion: 1\nsteps:\n  build:\n    kind: cmd\n    command: {argv: [\"true\"]}\n",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let step: WorkflowStepV1 = serde_json::from_value(serde_json::json!({
+            "id": "build",
+            "role": "step",
+            "kind": "cmd",
+            "failurePolicy": "required",
+            "state": "not_run",
+            "detail": {"code": "not_reached"}
+        }))
+        .unwrap();
+        let project = |role| project_step(&step, &workflow.steps["build"], role, 1024, false);
+
+        let archived = project(WorkflowNodeRole::Step).unwrap();
+        assert_eq!(
+            archived.detail,
+            ArchivedStepDetail::Evidence(NodeDetail::NotRun(
+                super::super::evidence::NonExecutionDetail::not_reached()
+            ))
+        );
+        assert!(step_succeeds_workflow(&archived));
+        assert_eq!(
+            archived_export_unavailable_reason(&archived),
+            Some(ExportUnavailableReasonV1::NotRun)
+        );
+        assert_eq!(project(WorkflowNodeRole::Finalizer), Err(()));
+    }
+
+    // REQ-WFEXEC-58
+    #[test]
+    fn a_child_export_a_succeeded_workflow_step_left_out_is_source_failed() {
+        let source: super::super::publication::ExportSourceV1 =
+            serde_json::from_value(serde_json::json!({
+                "node": {"id": "design", "role": "step"},
+                "output": "parts"
+            }))
+            .unwrap();
+        let producer = |output: &str| -> super::super::runtime::OutputProducer {
+            serde_json::from_value(serde_json::json!({
+                "attemptId": "00000000-0000-0000-0000-000000000001",
+                "attemptNumber": 1,
+                "node": "design",
+                "output": output
+            }))
+            .unwrap()
+        };
+        let producers = |outputs: &[&str]| {
+            BTreeMap::from([(
+                "design".to_owned(),
+                outputs
+                    .iter()
+                    .map(|output| ((*output).to_owned(), producer(output)))
+                    .collect::<BTreeMap<_, _>>(),
+            )])
+        };
+        let matches = |producers: &BTreeMap<_, _>, state, prior, reason| {
+            result_metadata::unavailable_export_source_matches(
+                producers, &source, state, prior, true, reason,
+            )
+        };
+        let succeeded = Some(super::super::evidence::InheritedPriorState::Succeeded);
+
+        // A re-executed step that settled without the export.
+        assert!(matches(
+            &BTreeMap::new(),
+            WorkflowStepStateV1::Succeeded,
+            None,
+            ExportUnavailableReasonV1::Failed,
+        ));
+        assert!(!matches(
+            &BTreeMap::new(),
+            WorkflowStepStateV1::Succeeded,
+            None,
+            ExportUnavailableReasonV1::Skipped,
+        ));
+        // An inherited one carries the outcome it routed from, and never the export.
+        assert!(matches(
+            &producers(&["outcome"]),
+            WorkflowStepStateV1::Inherited,
+            succeeded,
+            ExportUnavailableReasonV1::Failed,
+        ));
+        assert!(!matches(
+            &producers(&["message"]),
+            WorkflowStepStateV1::Inherited,
+            succeeded,
+            ExportUnavailableReasonV1::Failed,
+        ));
+        assert!(!matches(
+            &producers(&["outcome", "parts"]),
+            WorkflowStepStateV1::Inherited,
+            succeeded,
+            ExportUnavailableReasonV1::Failed,
+        ));
     }
 }

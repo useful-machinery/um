@@ -111,6 +111,8 @@ pub(super) fn log_channel_options(step: &WorkflowRunStepView) -> &'static [LogCh
     match &step.definition {
         WorkflowPresentationStep::Command { .. } => &COMMAND_LOG_CHANNELS,
         WorkflowPresentationStep::Agent { .. } => &AGENT_LOG_CHANNELS,
+        // A step that runs a child workflow keeps no log of its own; the child run does.
+        WorkflowPresentationStep::Workflow { .. } => &[],
     }
 }
 

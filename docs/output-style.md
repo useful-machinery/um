@@ -31,7 +31,7 @@ An error has two parts: a **diagnostic line** and an optional **remedy block**.
 error: cannot retry run: attempt 1 succeeded
 
 A succeeded run cannot be retried. Start a new run instead:
-  um workflow run --run-dir <NEW_DIR> <WORKFLOW>
+  um workflow run create --path <DIR> --execution-root <PATH> --run-dir <NEW_DIR>
 ```
 
 Diagnostic line rules:
@@ -79,7 +79,7 @@ Before and after:
 **stdout carries the product; stderr carries commentary about producing it.**
 
 - Reports, state dumps, JSON, and execution logs go to stdout. A
-  `workflow run` step log is the product of running a workflow. The answer
+  `workflow run create` step log is the product of running a workflow. The answer
   `auth status` prints is the status you asked for, even when the answer is
   "not signed in".
 - Errors, warnings, and transient progress ("Connecting…") go to stderr.
@@ -176,7 +176,7 @@ Banned from human prose:
   defaults in prose.
 - Contract-grade precision (snapshot semantics, eligibility rules, mode
   selection) goes in after-help sections, in full sentences — the model is
-  `workflow run`'s "Interactive mode:" section.
+  `workflow run create`'s "Interactive mode:" section.
 
 ## Command grammar
 
@@ -249,7 +249,7 @@ separate entity family.
   relative-order check.
 - **Pagination:** every `list` leaf takes `--cursor` and `--limit` and
   includes this exact after-help section (once per leaf), except for the
-  specific API-limited leaves below:
+  specific leaves below:
 
 ```
 Pagination:
@@ -268,3 +268,8 @@ Pagination:
   misrepresent the API's continuation semantics. Do not advertise pagination
   for these leaves until the API supports it; the exception does not make
   large lists safe.
+
+  `workflow definition list` and `workflow run list` read the definitions and
+  runs under the local `um` home, not an API, so there is no continuation to
+  page through: each prints every definition or run the home holds in one
+  listing.

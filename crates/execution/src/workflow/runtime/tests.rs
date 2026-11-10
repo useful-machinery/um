@@ -77,6 +77,7 @@ fn definition(
                             .collect(),
                         recovery: None,
                         when: BTreeSet::new(),
+                        edges: None,
                     },
                 )
             })
@@ -100,6 +101,12 @@ fn definition(
         maximum_transitions: 10_000,
         text_inputs: BTreeMap::new(),
         json_inputs: BTreeMap::new(),
+        scheduling: RuntimeScheduling::Dataflow,
+        step_order: steps
+            .iter()
+            .map(|(step, _, _)| (*step).to_owned())
+            .collect(),
+        edge_counts: BTreeMap::new(),
     }
 }
 
@@ -171,6 +178,8 @@ fn inherited_seed(
                 producers,
             },
         )]),
+        entry: None,
+        edge_counts: BTreeMap::new(),
     }
 }
 
@@ -410,6 +419,7 @@ fn finalizer_definition(
                     declared_outputs: outputs.iter().map(|output| (*output).to_owned()).collect(),
                     recovery: None,
                     when: BTreeSet::new(),
+                    edges: None,
                 },
             )
         })
@@ -471,6 +481,7 @@ fn finalizer_definition(
                     declared_outputs: BTreeSet::new(),
                     recovery: None,
                     when: when.iter().copied().collect(),
+                    edges: None,
                 },
             )
         }))
@@ -485,6 +496,9 @@ fn finalizer_definition(
         maximum_transitions: 10_000,
         text_inputs: BTreeMap::new(),
         json_inputs: BTreeMap::new(),
+        scheduling: RuntimeScheduling::Dataflow,
+        step_order: steps.iter().map(|(id, ..)| (*id).to_owned()).collect(),
+        edge_counts: BTreeMap::new(),
     }
 }
 
@@ -6009,4 +6023,704 @@ steps:
 
     assert!(matches!(state.workflow, WorkflowState::Failed { .. }));
     assert!(state.last_transition_sequence.get() <= 17);
+}
+
+/// A fixture `workflow` step: its id, its `(outcome, target)` edges, an `exit.<name>` target
+/// ending the walk, `wait:<kind>:<then>[:<onHandBack>]` entering a wait and
+/// `limit:<then>:<n>:<else>` a limited edge, and its derived outputs.
+type EdgeStep<'a> = (&'a str, &'a [(&'a str, &'a str)], &'a [&'a str]);
+
+fn edge_target(target: &str) -> RuntimeEdgeTarget {
+    if let Some(limited) = target.strip_prefix("limit:") {
+        let mut parts = limited.splitn(3, ':');
+        return RuntimeEdgeTarget::Limited {
+            then: parts.next().unwrap().to_owned(),
+            limit: parts.next().unwrap().parse().unwrap(),
+            else_: Box::new(edge_target(parts.next().unwrap())),
+        };
+    }
+    if let Some(wait) = target.strip_prefix("wait:") {
+        let mut parts = wait.split(':');
+        let kind = match parts.next().unwrap() {
+            "answer" => WaitKind::Answer,
+            "approval" => WaitKind::Approval,
+            "repair" => WaitKind::Repair,
+            "stop" => WaitKind::Stop,
+            other => panic!("fixture wait kind {other}"),
+        };
+        return RuntimeEdgeTarget::Wait {
+            kind,
+            then: parts.next().unwrap().to_owned(),
+            on_hand_back: parts.next().map(str::to_owned),
+            rule: None,
+        };
+    }
+    target.strip_prefix("exit.").map_or_else(
+        || RuntimeEdgeTarget::Step(target.to_owned()),
+        |name| RuntimeEdgeTarget::Exit(name.to_owned()),
+    )
+}
+
+/// An edge-scheduled definition whose first step is the entry.
+fn edge_definition(steps: &[EdgeStep<'_>], maximum_parallel_steps: usize) -> RuntimeDefinition {
+    let mut definition = definition(
+        &steps
+            .iter()
+            .map(|(step, _, outputs)| (*step, &[] as &[&str], *outputs))
+            .collect::<Vec<_>>(),
+        &[],
+        maximum_parallel_steps,
+    );
+    definition.scheduling = RuntimeScheduling::Edges {
+        entry: steps[0].0.to_owned(),
+    };
+    for (step, edges, _) in steps {
+        let edges = edges
+            .iter()
+            .map(|(outcome, target)| ((*outcome).to_owned(), edge_target(target)))
+            .collect();
+        definition.steps.get_mut(*step).unwrap().edges = Some(Arc::new(edges));
+    }
+    definition
+}
+
+fn design_build_review() -> RuntimeDefinition {
+    edge_definition(
+        &[
+            (
+                "design",
+                &[("planned", "build"), ("blocked", "exit.failed")],
+                &["outcome", "parts"],
+            ),
+            (
+                "build",
+                &[("built", "review"), ("failed", "exit.failed")],
+                &["outcome"],
+            ),
+            ("review", &[("approve", "exit.landed")], &["outcome"]),
+        ],
+        4,
+    )
+}
+
+/// Starts the entry `design` and brings it to output capture; the capture action is 3.
+fn design_capturing() -> TestRuntimeState {
+    design_capturing_in(design_build_review())
+}
+
+fn design_capturing_in(definition: RuntimeDefinition) -> TestRuntimeState {
+    design_capturing_seeded(definition, ExecutionSeed::empty())
+}
+
+/// `design_capturing_in` whose seed carries the run's edge counts or a continuation entry.
+fn design_capturing_seeded(
+    definition: RuntimeDefinition,
+    seed: ExecutionSeed<String>,
+) -> TestRuntimeState {
+    let initialization = ReductionBuilder::<String, TestDeadline>::new(definition)
+        .seeded(seed)
+        .build::<String, String>();
+    let mut state = initialization.state;
+    reduce_and_advance(
+        &mut state,
+        Occurrence::StepStarted {
+            step: "design".to_owned(),
+            action: action_id(1),
+        },
+    );
+    let completed = reduce_and_advance(
+        &mut state,
+        Occurrence::StepExecutionCompleted {
+            step: "design".to_owned(),
+            action: action_id(1),
+            provisional: "child exited".to_owned(),
+        },
+    );
+    assert_eq!(
+        completed.actions,
+        [capture_action(3, "design", "child exited")]
+    );
+    state
+}
+
+fn routed_capture(outputs: &[(&str, &str)]) -> TestOccurrence {
+    Occurrence::OutputsCaptured {
+        step: "design".to_owned(),
+        action: action_id(3),
+        outputs: output_set(outputs),
+    }
+}
+
+fn not_reached() -> StepState<String> {
+    not_run_state(WorkflowNodeRole::Step, NonExecutionCode::NotReached)
+}
+
+// REQ-WFEXEC-58, INV-ENGINE-18
+#[test]
+fn edge_scheduling_starts_the_entry_alone_and_then_only_the_routed_target() {
+    let initialization = initialize_test(design_build_review());
+    assert_eq!(initialization.actions, [start_action(1, "design")]);
+    assert_step(&initialization.state, "build", StepStateKind::Pending);
+    assert_step(&initialization.state, "review", StepStateKind::Pending);
+
+    let mut state = design_capturing();
+    let routed = reduce_and_advance(
+        &mut state,
+        routed_capture(&[("outcome", "planned"), ("parts", "[1]")]),
+    );
+    assert!(routed.occurrence_accepted);
+    assert_eq!(routed.actions, [start_action(5, "build")]);
+    assert_step(&state, "design", StepStateKind::Succeeded);
+    assert_step(&state, "review", StepStateKind::Pending);
+    assert_eq!(state.exit_outcome, None);
+}
+
+// REQ-WFEXEC-58, INV-ENGINE-18
+#[test]
+fn an_exit_edge_records_the_exit_outcome_and_leaves_unstarted_steps_not_reached() {
+    let mut state = design_capturing();
+    // A `workflow` step commits the subset of its derived outputs the child made available.
+    let exited = reduce_and_advance(&mut state, routed_capture(&[("outcome", "blocked")]));
+    assert!(exited.occurrence_accepted);
+    assert_eq!(
+        state.steps["design"].state,
+        StepState::Succeeded {
+            outputs: output_set(&[("outcome", "blocked")]),
+        }
+    );
+    assert_eq!(state.steps["build"].state, not_reached());
+    assert_eq!(state.steps["review"].state, not_reached());
+    assert_eq!(state.workflow, WorkflowState::Succeeded);
+    assert_eq!(state.exit_outcome.as_deref(), Some("failed"));
+    assert!(matches!(
+        exited.actions.as_slice(),
+        [RequestedAction {
+            action: Action::FinishRun {
+                outcome: RunOutcome::Succeeded,
+                ..
+            },
+            ..
+        }]
+    ));
+}
+
+// REQ-WFEXEC-58
+#[test]
+fn a_workflow_step_capture_without_its_outcome_is_stale() {
+    let state = design_capturing();
+    for occurrence in [
+        routed_capture(&[("parts", "[1]")]),
+        routed_capture(&[("outcome", "planned"), ("undeclared", "x")]),
+    ] {
+        assert_noop(&state, &reduce(&state, occurrence));
+    }
+}
+
+/// `design_build_review` whose `blocked` edge is an `answer` wait continuing at `design`,
+/// with a finalizer selected by every trigger.
+fn design_waiting_on_answers() -> RuntimeDefinition {
+    let mut definition = edge_definition(
+        &[
+            (
+                "design",
+                &[("planned", "build"), ("blocked", "wait:answer:design")],
+                &["outcome", "parts"],
+            ),
+            (
+                "build",
+                &[("built", "review"), ("failed", "exit.failed")],
+                &["outcome"],
+            ),
+            ("review", &[("approve", "exit.landed")], &["outcome"]),
+        ],
+        4,
+    );
+    let finalizers = finalizer_definition(
+        &[],
+        &[(
+            "notify",
+            FailurePolicy::Required,
+            &[
+                FinalizationTrigger::Succeeded,
+                FinalizationTrigger::Failed,
+                FinalizationTrigger::Cancelled,
+            ],
+            &[],
+            &[],
+        )],
+        1,
+    );
+    definition.steps.extend(finalizers.steps);
+    definition.finalizer_ids = finalizers.finalizer_ids;
+    definition.finalizer_presentation_order = finalizers.finalizer_presentation_order;
+    definition
+}
+
+// REQ-WFEXEC-61, INV-ENGINE-20
+#[test]
+fn a_wait_edge_ends_the_attempt_waiting_without_finalization() {
+    let mut state = design_capturing_in(design_waiting_on_answers());
+    let waiting = reduce_and_advance(&mut state, routed_capture(&[("outcome", "blocked")]));
+    assert!(waiting.occurrence_accepted);
+    assert_step(&state, "design", StepStateKind::Succeeded);
+    assert_eq!(state.steps["build"].state, not_reached());
+    assert_eq!(state.steps["review"].state, not_reached());
+    let wait = EnteredWait {
+        step: "design".to_owned(),
+        outcome: Some("blocked".to_owned()),
+        kind: WaitKind::Answer,
+        then: "design".to_owned(),
+        on_hand_back: None,
+        rule: None,
+    };
+    assert_eq!(
+        state.workflow,
+        WorkflowState::Waiting { wait: wait.clone() }
+    );
+    assert_eq!(state.wait.as_ref(), Some(&wait));
+    assert_eq!(state.exit_outcome, None);
+    assert_eq!(
+        state.steps["notify"].state,
+        not_run_state(
+            WorkflowNodeRole::Finalizer,
+            NonExecutionCode::FinalizerTriggerNotSelected
+        )
+    );
+    assert_eq!(state.finalization_summary, None);
+    assert!(
+        waiting
+            .actions
+            .iter()
+            .all(|requested| !matches!(requested.action, Action::StartStep { .. }))
+    );
+    assert!(matches!(
+        waiting.actions.as_slice(),
+        [RequestedAction {
+            action: Action::FinishRun {
+                outcome: RunOutcome::Waiting { wait: finished },
+                ..
+            },
+            ..
+        }] if *finished == wait
+    ));
+}
+
+// REQ-WFEXEC-62, INV-ENGINE-20
+#[test]
+fn a_stop_entered_before_an_authorized_step_ends_the_attempt_waiting() {
+    let initialization = initialize_test(design_build_review());
+    assert_eq!(initialization.actions, [start_action(1, "design")]);
+    let initial = initialization.state;
+
+    // Only the step the walk authorized can stop; any other is a stale occurrence.
+    for step in ["build", "review"] {
+        let stale = reduce(
+            &initial,
+            Occurrence::StopEntered {
+                step: step.to_owned(),
+                action: action_id(1),
+            },
+        );
+        assert!(!stale.occurrence_accepted);
+        assert_noop(&initial, &stale);
+    }
+
+    let mut state = initial;
+    let stopped = reduce_and_advance(
+        &mut state,
+        Occurrence::StopEntered {
+            step: "design".to_owned(),
+            action: action_id(1),
+        },
+    );
+    assert!(stopped.occurrence_accepted);
+    for step in ["design", "build", "review"] {
+        assert_eq!(state.steps[step].state, not_reached(), "{step}");
+    }
+    assert_eq!(state.steps["design"].target_invocation, None);
+    assert_eq!(
+        state.workflow,
+        WorkflowState::Waiting {
+            wait: EnteredWait {
+                step: "design".to_owned(),
+                outcome: None,
+                kind: WaitKind::Stop,
+                then: "design".to_owned(),
+                on_hand_back: None,
+                rule: None,
+            },
+        }
+    );
+    assert!(matches!(
+        stopped.actions.as_slice(),
+        [RequestedAction {
+            action: Action::FinishRun {
+                outcome: RunOutcome::Waiting { .. },
+                ..
+            },
+            ..
+        }]
+    ));
+}
+
+// REQ-WFEXEC-63, REQ-CONTINUE-3, INV-ENGINE-18
+#[test]
+fn a_continuation_starts_the_step_its_seed_names() {
+    let initialization = ReductionBuilder::<String, TestDeadline>::new(design_build_review())
+        .seeded(
+            inherited_seed(
+                "design",
+                crate::workflow::evidence::InheritedPriorState::Succeeded,
+                InheritedDisposition::Succeeded,
+                output_set(&[("outcome", "planned")]),
+            )
+            .with_entry("review"),
+        )
+        .build::<String, String>();
+    assert_eq!(initialization.actions, [start_action(1, "review")]);
+    let mut state = initialization.state;
+    assert_step(&state, "design", StepStateKind::Inherited);
+    assert_step(&state, "build", StepStateKind::Pending);
+
+    reduce_and_advance(
+        &mut state,
+        Occurrence::StepStarted {
+            step: "review".to_owned(),
+            action: action_id(1),
+        },
+    );
+    reduce_and_advance(
+        &mut state,
+        Occurrence::StepExecutionCompleted {
+            step: "review".to_owned(),
+            action: action_id(1),
+            provisional: "child exited".to_owned(),
+        },
+    );
+    let landed = reduce_and_advance(
+        &mut state,
+        Occurrence::OutputsCaptured {
+            step: "review".to_owned(),
+            action: action_id(3),
+            outputs: output_set(&[("outcome", "approve")]),
+        },
+    );
+    assert!(
+        landed
+            .actions
+            .iter()
+            .all(|requested| !matches!(requested.action, Action::StartStep { .. }))
+    );
+    assert_eq!(state.steps["build"].state, not_reached());
+    assert_eq!(state.workflow, WorkflowState::Succeeded);
+    assert_eq!(state.exit_outcome.as_deref(), Some("landed"));
+}
+
+// REQ-WFEXEC-58, REQ-WFEXEC-63
+#[test]
+fn an_inherited_workflow_step_routes_nothing() {
+    let definition = edge_definition(
+        &[
+            ("design", &[("planned", "build")], &["outcome"]),
+            ("build", &[("built", "review")], &["outcome"]),
+            (
+                "review",
+                &[("approve", "wait:approval:merge:fix")],
+                &["outcome"],
+            ),
+            ("fix", &[("built", "merge")], &["outcome"]),
+            ("merge", &[("landed", "exit.landed")], &["outcome"]),
+        ],
+        4,
+    );
+    let initialization = ReductionBuilder::<String, TestDeadline>::new(definition)
+        .seeded(
+            inherited_seed(
+                "review",
+                crate::workflow::evidence::InheritedPriorState::Succeeded,
+                InheritedDisposition::Succeeded,
+                output_set(&[("outcome", "approve")]),
+            )
+            .with_entry("merge"),
+        )
+        .build::<String, String>();
+    // The inherited `review`'s wait edge neither ends the walk nor starts its `then`.
+    assert_eq!(initialization.actions, [start_action(1, "merge")]);
+    assert_eq!(initialization.state.wait, None);
+    assert_step(&initialization.state, "fix", StepStateKind::Pending);
+    assert_step(&initialization.state, "design", StepStateKind::Pending);
+    assert!(matches!(
+        initialization.state.workflow,
+        WorkflowState::Executing {
+            gate: SchedulingGate::Open
+        }
+    ));
+}
+
+// REQ-WFEXEC-58
+#[test]
+fn an_outcome_without_an_edge_ends_the_walk_without_an_exit_outcome() {
+    let mut state = design_capturing();
+    let unrouted = reduce_and_advance(&mut state, routed_capture(&[("outcome", "unexpected")]));
+    assert!(unrouted.occurrence_accepted);
+    assert_step(&state, "design", StepStateKind::Succeeded);
+    assert_eq!(state.steps["build"].state, not_reached());
+    assert_eq!(state.steps["review"].state, not_reached());
+    assert_eq!(state.workflow, WorkflowState::Succeeded);
+    assert_eq!(state.exit_outcome, None);
+}
+
+// REQ-WFEXEC-58
+#[test]
+fn a_failed_workflow_step_stops_the_walk_as_a_required_failure() {
+    let initialization = initialize_test(design_build_review());
+    let mut state = initialization.state;
+    reduce_and_advance(
+        &mut state,
+        Occurrence::StepStarted {
+            step: "design".to_owned(),
+            action: action_id(1),
+        },
+    );
+    reduce_and_advance(
+        &mut state,
+        Occurrence::StepExecutionFailed {
+            step: "design".to_owned(),
+            action: action_id(1),
+            cause: "child interrupted".to_owned(),
+        },
+    );
+    assert_step(&state, "design", StepStateKind::Failed);
+    let failure_stop = not_run_state(WorkflowNodeRole::Step, NonExecutionCode::FailureStop);
+    assert_eq!(state.steps["build"].state, failure_stop);
+    assert_eq!(state.steps["review"].state, failure_stop);
+    assert!(matches!(state.workflow, WorkflowState::Failed { .. }));
+    assert_eq!(state.exit_outcome, None);
+}
+
+/// `design_build_review` whose `review` also routes `hand_back` to `target`, with a finalizer
+/// selected by every trigger.
+fn design_build_review_handing_back(target: &str) -> RuntimeDefinition {
+    let mut definition = edge_definition(
+        &[
+            (
+                "design",
+                &[("planned", "build"), ("blocked", "exit.failed")],
+                &["outcome", "parts"],
+            ),
+            (
+                "build",
+                &[("built", "review"), ("failed", "exit.failed")],
+                &["outcome"],
+            ),
+            (
+                "review",
+                &[("approve", "exit.landed"), ("hand_back", target)],
+                &["outcome"],
+            ),
+        ],
+        4,
+    );
+    let finalizers = finalizer_definition(
+        &[],
+        &[(
+            "notify",
+            FailurePolicy::Required,
+            &[
+                FinalizationTrigger::Succeeded,
+                FinalizationTrigger::Failed,
+                FinalizationTrigger::Cancelled,
+            ],
+            &[],
+            &[],
+        )],
+        1,
+    );
+    definition.steps.extend(finalizers.steps);
+    definition.finalizer_ids = finalizers.finalizer_ids;
+    definition.finalizer_presentation_order = finalizers.finalizer_presentation_order;
+    definition
+}
+
+/// Continues `definition` at `review` with `design` inherited and settles `review` with
+/// `outcome`; `build` is never started.
+fn review_settling(
+    definition: RuntimeDefinition,
+    outcome: &str,
+) -> (TestRuntimeState, TestReduction) {
+    let initialization = ReductionBuilder::<String, TestDeadline>::new(definition)
+        .seeded(
+            inherited_seed(
+                "design",
+                crate::workflow::evidence::InheritedPriorState::Succeeded,
+                InheritedDisposition::Succeeded,
+                output_set(&[("outcome", "planned")]),
+            )
+            .with_entry("review"),
+        )
+        .build::<String, String>();
+    assert_eq!(initialization.actions, [start_action(1, "review")]);
+    let mut state = initialization.state;
+    reduce_and_advance(
+        &mut state,
+        Occurrence::StepStarted {
+            step: "review".to_owned(),
+            action: action_id(1),
+        },
+    );
+    reduce_and_advance(
+        &mut state,
+        Occurrence::StepExecutionCompleted {
+            step: "review".to_owned(),
+            action: action_id(1),
+            provisional: "child exited".to_owned(),
+        },
+    );
+    let settled = reduce_and_advance(
+        &mut state,
+        Occurrence::OutputsCaptured {
+            step: "review".to_owned(),
+            action: action_id(3),
+            outputs: output_set(&[("outcome", outcome)]),
+        },
+    );
+    (state, settled)
+}
+
+fn assert_continued(state: &TestRuntimeState, reduction: &TestReduction, edge: &TakenEdgeRecord) {
+    assert!(reduction.occurrence_accepted);
+    assert!(
+        reduction
+            .actions
+            .iter()
+            .all(|requested| !matches!(requested.action, Action::StartStep { .. }))
+    );
+    assert_eq!(
+        state.workflow,
+        WorkflowState::Continued { edge: edge.clone() }
+    );
+    assert_eq!(state.continued.as_ref(), Some(edge));
+    assert_eq!(state.exit_outcome, None);
+    assert_eq!(state.wait, None);
+    assert_eq!(state.finalization_summary, None);
+    assert!(matches!(
+        reduction.actions.as_slice(),
+        [RequestedAction {
+            action: Action::FinishRun {
+                outcome: RunOutcome::Continued { edge: finished },
+                ..
+            },
+            ..
+        }] if finished == edge
+    ));
+}
+
+fn taken(step: &str, outcome: &str, target: &str, counted: bool) -> TakenEdgeRecord {
+    TakenEdgeRecord {
+        step: step.to_owned(),
+        outcome: outcome.to_owned(),
+        target: target.to_owned(),
+        counted,
+    }
+}
+
+// REQ-WFEXEC-64, INV-ENGINE-20, INV-ENGINE-22: an edge naming an earlier step, or the step
+// itself, ends the attempt `continued` without finalization; the next attempt starts there.
+#[test]
+fn a_backward_or_self_edge_ends_the_attempt_continued() {
+    for target in ["design", "review"] {
+        let (state, settled) =
+            review_settling(design_build_review_handing_back(target), "hand_back");
+        assert_step(&state, "review", StepStateKind::Succeeded);
+        assert_step(&state, "design", StepStateKind::Inherited);
+        assert_eq!(state.steps["build"].state, not_reached(), "{target}");
+        assert_eq!(
+            state.steps["notify"].state,
+            not_run_state(
+                WorkflowNodeRole::Finalizer,
+                NonExecutionCode::FinalizerTriggerNotSelected
+            )
+        );
+        assert_continued(
+            &state,
+            &settled,
+            &taken("review", "hand_back", target, false),
+        );
+    }
+}
+
+/// `design_build_review` whose `planned` edge is `target`, seeded with `design.planned`'s
+/// count.
+fn design_planned_through(target: &str, count: u64) -> TestRuntimeState {
+    let definition = edge_definition(
+        &[
+            (
+                "design",
+                &[("planned", target), ("blocked", "exit.failed")],
+                &["outcome", "parts"],
+            ),
+            (
+                "build",
+                &[("built", "review"), ("failed", "exit.failed")],
+                &["outcome"],
+            ),
+            ("review", &[("approve", "exit.landed")], &["outcome"]),
+        ],
+        4,
+    );
+    design_capturing_seeded(
+        definition,
+        ExecutionSeed::empty()
+            .with_edge_counts(BTreeMap::from([("design.planned".to_owned(), count)])),
+    )
+}
+
+// REQ-WFEXEC-64, INV-ENGINE-22: a limited edge under its count takes `then` as a counted
+// continuation, a later step included; at its count it takes `else` as an ordinary target.
+#[test]
+fn a_limited_edge_continues_under_its_count_and_takes_else_at_it() {
+    let mut state = design_planned_through("limit:build:2:exit.failed", 0);
+    let continued = reduce_and_advance(&mut state, routed_capture(&[("outcome", "planned")]));
+    assert_step(&state, "design", StepStateKind::Succeeded);
+    assert_eq!(state.steps["build"].state, not_reached());
+    assert_eq!(state.steps["review"].state, not_reached());
+    assert_continued(
+        &state,
+        &continued,
+        &taken("design", "planned", "build", true),
+    );
+
+    // The count is compared before the taking: at the limit the `else` exit is taken.
+    let mut state = design_planned_through("limit:build:2:exit.failed", 2);
+    let exited = reduce_and_advance(&mut state, routed_capture(&[("outcome", "planned")]));
+    assert_eq!(state.continued, None);
+    assert_eq!(state.exit_outcome.as_deref(), Some("failed"));
+    assert_eq!(state.workflow, WorkflowState::Succeeded);
+    assert_eq!(state.steps["build"].state, not_reached());
+    assert!(matches!(
+        exited.actions.as_slice(),
+        [RequestedAction {
+            action: Action::FinishRun {
+                outcome: RunOutcome::Succeeded,
+                ..
+            },
+            ..
+        }]
+    ));
+
+    // A later `else` step starts in the same attempt.
+    let mut state = design_planned_through("limit:review:2:build", 2);
+    let routed = reduce_and_advance(&mut state, routed_capture(&[("outcome", "planned")]));
+    assert_eq!(routed.actions, [start_action(5, "build")]);
+    assert_step(&state, "review", StepStateKind::Pending);
+    assert_eq!(state.continued, None);
+
+    // A wait `else` enters the wait.
+    let mut state = design_planned_through("limit:build:2:wait:repair:design", 2);
+    reduce_and_advance(&mut state, routed_capture(&[("outcome", "planned")]));
+    assert_eq!(state.continued, None);
+    assert!(matches!(
+        &state.workflow,
+        WorkflowState::Waiting { wait } if wait.kind == WaitKind::Repair && wait.then == "design"
+    ));
 }

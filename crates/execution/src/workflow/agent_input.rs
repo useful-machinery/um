@@ -1194,7 +1194,9 @@ fn resolve_value_mode(
             Output::TextPath { .. }
             | Output::JsonPath { .. }
             | Output::FilePath { .. }
-            | Output::GitBranchWorkspace => None,
+            | Output::GitBranchWorkspace
+            | Output::ChildExport { .. }
+            | Output::ChildOutcome => None,
         };
         if let Some(candidate) = candidate {
             if mode.is_some() {

@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::env;
 use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::future::{Future as _, poll_fn};
@@ -18,17 +19,22 @@ use super::claude_code::ClaudeCodeConfig;
 use super::claude_code::ClaudeCodeStreamJsonV1ProtocolLimits;
 use super::codex::CodexAppServerV1ProtocolLimits;
 use super::codex::CodexConfig;
+use super::document::WaitRule;
 use super::execution_root::{AdmittedExecutionRoot, ExecutionRootAdmissionFailure};
 use super::git_capture::{
     CloudGitCaptureProjection, GitCaptureContext, GitWorkspaceAdmissionFailure, LocalGitBaseline,
 };
 use super::pi::PiConfig;
 use super::pi::PiJsonV1ProtocolLimits;
-use super::resolution::ResolvedWorkflow;
-use super::validated::{ValidatedHarness, ValidatedRecoveryHandler, ValidatedStep};
+use super::resolution::{ResolvedWorkflow, WorkflowContentDigest};
+use super::tree::{TreeFile, ValidatedTree};
+use super::validated::{
+    ValidatedEdgeTarget, ValidatedHarness, ValidatedRecoveryHandler, ValidatedStep,
+};
 use crate::claude_code::ValidatedClaudeCodeInstallation;
 use crate::codex::ValidatedCodexInstallation;
 use crate::harness_installation::UntestedHarnessAdvisory;
+use crate::harness_installation::is_executable_file;
 use crate::pi::ValidatedPiInstallation;
 
 const MAXIMUM_CAPTURED_FILES: usize = 1024;
@@ -300,6 +306,20 @@ impl CancellationSource {
                 return reason;
             }
             let _ = subscription.changed().await;
+        }
+    }
+
+    /// Resolves once a force abort has been requested, even when a graceful cancellation
+    /// preceded it and so remains the source's reason.
+    pub async fn wait_for_force_abort(&self) {
+        let mut operations = self.subscribe_operations();
+        loop {
+            while let Some(operation) = operations.next_operation() {
+                if matches!(operation, CancellationOperation::ForceAbort { .. }) {
+                    return;
+                }
+            }
+            let _ = operations.changed().await;
         }
     }
 
@@ -592,6 +612,15 @@ impl ResolvedJsonInput {
         })
     }
 
+    /// JSON `null`, the value an omitted optional JSON input receives.
+    fn null() -> Self {
+        Self {
+            source: Arc::from(&b"null"[..]),
+            value: Arc::new(Value::Null),
+            canonical: Arc::from(&b"null"[..]),
+        }
+    }
+
     pub fn source(&self) -> &[u8] {
         &self.source
     }
@@ -651,6 +680,12 @@ impl ResolvedInputs {
 
     pub fn get(&self, name: &str) -> Option<&ResolvedInput> {
         self.values.get(name)
+    }
+
+    /// Sets the input `name` to `value`, replacing any value it had: a successor's
+    /// `--input-text` on top of the projected inputs (REQ-LOCALRUN-194).
+    pub fn insert(&mut self, name: String, value: ResolvedInput) {
+        self.values.insert(name, value);
     }
 }
 
@@ -1001,6 +1036,8 @@ pub struct ExecutionContext {
     git_capture: GitCaptureAdmission,
     continuation_reexecuted: Option<BTreeSet<String>>,
     capacity_budget: WorkflowCapacityBudget,
+    tree: Option<ValidatedTree>,
+    conditions: BTreeSet<(String, String)>,
 }
 
 impl ExecutionContext {
@@ -1022,7 +1059,30 @@ impl ExecutionContext {
             git_capture: GitCaptureAdmission::None,
             continuation_reexecuted: None,
             capacity_budget: WorkflowCapacityBudget::supported_maximum(),
+            tree: None,
+            conditions: BTreeSet::new(),
         }
+    }
+
+    /// The `(source, event)` pairs the caller's condition sources evaluate, against which
+    /// admission checks each `external` wait's rule (REQ-WFEXEC-59, REQ-WFEXEC-65); none
+    /// unless given.
+    pub fn with_conditions<'a>(
+        mut self,
+        supported: impl IntoIterator<Item = (&'a str, &'a str)>,
+    ) -> Self {
+        self.conditions = supported
+            .into_iter()
+            .map(|(source, event)| (source.to_owned(), event.to_owned()))
+            .collect();
+        self
+    }
+
+    /// Admission from a tree: probe its `requires.tools` and record it for the run copy
+    /// (REQ-WFEXEC-53, REQ-WFEXEC-55).
+    pub fn with_tree(mut self, tree: ValidatedTree) -> Self {
+        self.tree = Some(tree);
+        self
     }
 
     pub fn with_source_revision(mut self, source_revision: SourceRevisionProvenance) -> Self {
@@ -1299,6 +1359,91 @@ impl AdmittedHarness {
     }
 }
 
+/// The tree a run was admitted from: what its run copy is written from and what
+/// `AdmittedWorkflow::with_tree_copy` binds (REQ-WFEXEC-53).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdmittedTree {
+    root: PathBuf,
+    digest: WorkflowContentDigest,
+    programs: Vec<String>,
+    required_tools: Vec<String>,
+    files: BTreeMap<String, TreeFile>,
+}
+
+impl AdmittedTree {
+    fn new(tree: ValidatedTree) -> Self {
+        Self {
+            root: tree.root,
+            digest: tree.digest,
+            programs: tree.programs,
+            required_tools: tree.required_tools,
+            files: tree.files,
+        }
+    }
+
+    /// The canonical source tree root admission validated and probed.
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    pub fn digest(&self) -> &WorkflowContentDigest {
+        &self.digest
+    }
+
+    /// The root's `programs` directories, tree-relative, in declared order.
+    pub fn programs(&self) -> &[String] {
+        &self.programs
+    }
+
+    pub fn required_tools(&self) -> &[String] {
+        &self.required_tools
+    }
+
+    /// Every kept file by tree-relative `/` path, `workflow.yaml` included.
+    pub fn files(&self) -> &BTreeMap<String, TreeFile> {
+        &self.files
+    }
+
+    /// Each `programs` directory under `root`, in declared order.
+    fn program_directories<'a>(&'a self, root: &'a Path) -> impl Iterator<Item = PathBuf> + 'a {
+        self.programs
+            .iter()
+            .map(move |program| root.join(program.trim_end_matches('/')))
+    }
+
+    /// REQ-WFEXEC-55: each required tool is an executable regular file in a `programs`
+    /// directory of the source tree or on the inherited `PATH`, looked up as a step looks
+    /// up a bare program (REQ-WFEXEC-20); a relative `PATH` entry is taken from the
+    /// execution root, a step's default working directory.
+    fn probe_required_tools(
+        &self,
+        environment: &EnvironmentSnapshot,
+        execution_root: &Path,
+    ) -> Result<(), AdmissionFailure> {
+        let directories = self
+            .program_directories(&self.root)
+            .chain(
+                environment
+                    .variable(OsStr::new("PATH"))
+                    .into_iter()
+                    .flat_map(env::split_paths),
+            )
+            .map(|directory| execution_root.join(directory))
+            .collect::<Vec<_>>();
+        match self.required_tools.iter().find(|tool| {
+            !directories
+                .iter()
+                .any(|directory| is_executable_file(&directory.join(tool)))
+        }) {
+            Some(tool) => Err(AdmissionFailure::new(
+                AdmissionFailureKind::RequiredToolUnavailable,
+                AdmissionLocation::RequiredTool { name: tool.clone() },
+            )),
+            None => Ok(()),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct AdmittedWorkflow {
     workflow: Arc<ResolvedWorkflow>,
@@ -1308,6 +1453,7 @@ pub struct AdmittedWorkflow {
     recovery_handlers: Arc<BTreeMap<String, AdmittedHarness>>,
     capacity: AdmittedWorkflowCapacity,
     git_capture: Option<Arc<GitCaptureContext>>,
+    tree: Option<Arc<AdmittedTree>>,
 }
 
 impl AdmittedWorkflow {
@@ -1315,7 +1461,7 @@ impl AdmittedWorkflow {
         &self.workflow
     }
 
-    pub(crate) fn inputs(&self) -> &ResolvedInputs {
+    pub fn inputs(&self) -> &ResolvedInputs {
         &self.inputs
     }
 
@@ -1338,6 +1484,37 @@ impl AdmittedWorkflow {
                 path.as_os_str().to_owned(),
             );
         self
+    }
+
+    /// The tree this run was admitted from, when it was (REQ-LOCALRUN-169).
+    pub fn tree(&self) -> Option<&AdmittedTree> {
+        self.tree.as_deref()
+    }
+
+    /// Binds the run's copy of the admitted tree once it exists (REQ-WFEXEC-53): `PATH`
+    /// is led by `<copy_root>/<program>` for each `programs` directory in declared order,
+    /// ahead of the inherited value, and `UM_WORKFLOW_ROOT` names `copy_root`. Every
+    /// command, recovery handler and agent child reads this environment. A run admitted
+    /// without a tree is returned unchanged. A copy root that cannot be a `PATH` entry,
+    /// one containing `:`, fails with the cause.
+    pub fn with_tree_copy(mut self, copy_root: &Path) -> Result<Self, env::JoinPathsError> {
+        let Some(tree) = self.tree.clone() else {
+            return Ok(self);
+        };
+        let mut environment = self
+            .execution
+            .environment
+            .with_variable("UM_WORKFLOW_ROOT".into(), copy_root.as_os_str().to_owned());
+        if !tree.programs.is_empty() {
+            let mut path = env::join_paths(tree.program_directories(copy_root))?;
+            if let Some(inherited) = self.execution.environment.variable(OsStr::new("PATH")) {
+                path.push(":");
+                path.push(inherited);
+            }
+            environment = environment.with_variable("PATH".into(), path);
+        }
+        self.execution.environment = environment;
+        Ok(self)
     }
 
     pub(crate) fn agent_step(&self, step: &str) -> Option<&AdmittedHarness> {
@@ -1410,6 +1587,17 @@ pub enum AdmissionFailureKind {
     NativeSessionRetentionCapacityUnavailable,
     AggregateRetentionCapacityUnavailable,
     EncodedOutboxCapacityUnavailable,
+    RequiredToolUnavailable,
+    /// An edge of a `workflow` step targets a wait whose `then` is an exit, which this
+    /// release does not run.
+    WaitTargetUnsupported,
+    /// An edge of a `workflow` step targets an `external` wait whose rule names a `source`
+    /// and `event` pair no condition source of the caller evaluates (REQ-WFEXEC-65).
+    WaitConditionUnsupported,
+    /// A workflow with `workflow` steps was not admitted from a tree.
+    WorkflowStepRequiresTree,
+    /// Cloud runs no `workflow` step.
+    WorkflowStepUnsupported,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1439,6 +1627,7 @@ pub(crate) enum AdmissionLocation {
     NativeSessionRetention,
     AggregateRetention,
     EncodedOutbox,
+    RequiredTool { name: String },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1491,12 +1680,108 @@ impl fmt::Display for AdmissionFailure {
 
 impl std::error::Error for AdmissionFailure {}
 
+/// Admits a local run (REQ-WFEXEC-59): a workflow with `workflow` steps runs only from a
+/// tree, since its children read the run's tree copy.
 pub fn admit_local_workflow(
     workflow: ResolvedWorkflow,
     inputs: ResolvedInputs,
     context: ExecutionContext,
 ) -> Result<AdmittedWorkflow, AdmissionFailure> {
+    if context.tree.is_none()
+        && let Some(step) = first_workflow_step(&workflow)
+    {
+        return Err(AdmissionFailure::new(
+            AdmissionFailureKind::WorkflowStepRequiresTree,
+            AdmissionLocation::Step {
+                step: step.to_owned(),
+            },
+        ));
+    }
     admit_local_workflow_for(workflow, inputs, context)
+}
+
+fn first_workflow_step(workflow: &ResolvedWorkflow) -> Option<&str> {
+    workflow
+        .definition
+        .source_order
+        .iter()
+        .find(|step| {
+            matches!(
+                workflow.definition.steps.get(step.as_str()),
+                Some(ValidatedStep::Workflow(_))
+            )
+        })
+        .map(String::as_str)
+}
+
+/// The refusals every admission applies to `workflow` steps (REQ-WFEXEC-59): Cloud runs
+/// none, and no admission runs an edge whose target is a wait whose `then` is an exit, or
+/// an `external` wait whose rule names a `source` and `event` pair
+/// outside `conditions` (REQ-WFEXEC-65), at any depth of a wait's `then` or a limited
+/// edge's `else`.
+fn admit_workflow_steps(
+    workflow: &ResolvedWorkflow,
+    execution_contract: WorkflowExecutionContract,
+    conditions: &BTreeSet<(String, String)>,
+) -> Result<(), AdmissionFailure> {
+    fn waits(target: &ValidatedEdgeTarget) -> bool {
+        match target {
+            // A local wait continues at a step: its published record's `then` is a step.
+            ValidatedEdgeTarget::Wait { then, .. }
+                if matches!(then.as_ref(), ValidatedEdgeTarget::Exit(_)) =>
+            {
+                true
+            }
+            ValidatedEdgeTarget::Wait { then, .. } => waits(then),
+            ValidatedEdgeTarget::Limited { else_, .. } => waits(else_),
+            ValidatedEdgeTarget::Step(_) | ValidatedEdgeTarget::Exit(_) => false,
+        }
+    }
+    fn rules<'a>(target: &'a ValidatedEdgeTarget, found: &mut Vec<&'a WaitRule>) {
+        match target {
+            ValidatedEdgeTarget::Wait { then, rule, .. } => {
+                found.extend(rule);
+                rules(then, found);
+            }
+            ValidatedEdgeTarget::Limited { else_, .. } => rules(else_, found),
+            ValidatedEdgeTarget::Step(_) | ValidatedEdgeTarget::Exit(_) => {}
+        }
+    }
+    let unsupported = |target: &ValidatedEdgeTarget| {
+        let mut found = Vec::new();
+        rules(target, &mut found);
+        found.iter().any(|rule| {
+            rule.event
+                .iter()
+                .any(|event| !conditions.contains(&(rule.source.clone(), event.clone())))
+        })
+    };
+    for step in &workflow.definition.source_order {
+        let Some(ValidatedStep::Workflow(child)) = workflow.definition.steps.get(step.as_str())
+        else {
+            continue;
+        };
+        let location = || AdmissionLocation::Step { step: step.clone() };
+        if execution_contract == WorkflowExecutionContract::WorkflowV1CloudInputsArtifactsV1 {
+            return Err(AdmissionFailure::new(
+                AdmissionFailureKind::WorkflowStepUnsupported,
+                location(),
+            ));
+        }
+        if child.edges.values().any(waits) {
+            return Err(AdmissionFailure::new(
+                AdmissionFailureKind::WaitTargetUnsupported,
+                location(),
+            ));
+        }
+        if child.edges.values().any(unsupported) {
+            return Err(AdmissionFailure::new(
+                AdmissionFailureKind::WaitConditionUnsupported,
+                location(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Continuation discovery already reports missing harness installations separately.
@@ -1563,19 +1848,21 @@ pub fn admit_runner_workflow(
     )
 }
 
+/// Admits a workflow as a local run does, without the local requirement that a workflow
+/// with `workflow` steps comes from a tree.
 pub fn admit_workflow(
     workflow: ResolvedWorkflow,
     inputs: ResolvedInputs,
     context: ExecutionContext,
 ) -> Result<AdmittedWorkflow, AdmissionFailure> {
-    admit_local_workflow(workflow, inputs, context)
+    admit_local_workflow_for(workflow, inputs, context)
 }
 
 fn collect_input_admission_failures(
     workflow: &ResolvedWorkflow,
     inputs: &ResolvedInputs,
 ) -> Vec<AdmissionFailure> {
-    let declared = workflow.required_inputs();
+    let declared = workflow.declared_inputs();
     let mut failures = Vec::new();
     for name in declared
         .keys()
@@ -1585,6 +1872,7 @@ fn collect_input_admission_failures(
         let declaration = declared.get(name.as_str());
         let supplied = inputs.get(name);
         match (declaration, supplied) {
+            (Some(_), None) if workflow.definition.input_may_be_omitted(name) => {}
             (Some(_), None) => failures.push(AdmissionFailure::new(
                 AdmissionFailureKind::MissingRequiredInput,
                 AdmissionLocation::Input { name: name.clone() },
@@ -1656,6 +1944,39 @@ fn collect_input_admission_failures(
     failures
 }
 
+/// Completes the supplied inputs with every omitted optional or defaulted one, after the
+/// input check, so no schema applies to an engine-supplied empty value (REQ-WFFORMAT-84).
+fn complete_inputs(workflow: &ResolvedWorkflow, inputs: ResolvedInputs) -> ResolvedInputs {
+    let mut values = inputs.values;
+    for (name, kind) in workflow.declared_inputs() {
+        if values.contains_key(name) || !workflow.definition.input_may_be_omitted(name) {
+            continue;
+        }
+        let value = if let Some(default) = workflow.json_input_default(name) {
+            ResolvedInput::Json(default.clone())
+        } else if let Some(super::validated::ValidatedInputDefault::Text(text)) =
+            workflow.definition.input_defaults.get(name)
+        {
+            ResolvedInput::Text(Arc::from(text.as_str()))
+        } else {
+            match kind {
+                super::validated::WorkflowValueType::Text => ResolvedInput::Text(Arc::from("")),
+                super::validated::WorkflowValueType::Json => {
+                    ResolvedInput::Json(ResolvedJsonInput::null())
+                }
+                super::validated::WorkflowValueType::AttachmentCollection => {
+                    ResolvedInput::Attachments(Arc::from(Vec::new()))
+                }
+                // The format admits neither `optional` nor `default` on these kinds.
+                super::validated::WorkflowValueType::File
+                | super::validated::WorkflowValueType::GitBranch => continue,
+            }
+        };
+        values.insert(name.clone(), value);
+    }
+    ResolvedInputs::new(values)
+}
+
 fn admit_workflow_for(
     workflow: ResolvedWorkflow,
     inputs: ResolvedInputs,
@@ -1664,6 +1985,7 @@ fn admit_workflow_for(
     admit_harnesses_first: bool,
     validate_inputs: bool,
 ) -> Result<AdmittedWorkflow, AdmissionFailure> {
+    admit_workflow_steps(&workflow, execution_contract, &context.conditions)?;
     let capacity = admit_capacity(&workflow, context.capacity_budget, execution_contract)?;
     if validate_inputs
         && let Some(failure) = collect_input_admission_failures(&workflow, &inputs)
@@ -1672,6 +1994,7 @@ fn admit_workflow_for(
     {
         return Err(failure);
     }
+    let inputs = complete_inputs(&workflow, inputs);
     let admitted_harnesses = if admit_harnesses_first {
         let available_harnesses = AvailableHarnesses::new(
             context.pi_installation.as_ref(),
@@ -1826,6 +2149,10 @@ fn admit_workflow_for(
                 );
         }
     }
+    let tree = context.tree.map(AdmittedTree::new).map(Arc::new);
+    if let Some(tree) = &tree {
+        tree.probe_required_tools(&environment, root.provenance_path())?;
+    }
     let execution = AdmittedExecutionContext {
         root,
         limits: ExecutionLimits {
@@ -1925,6 +2252,7 @@ fn admit_workflow_for(
         recovery_handlers: Arc::new(recovery_handlers),
         capacity,
         git_capture,
+        tree,
     })
 }
 
@@ -1992,11 +2320,7 @@ fn admit_capacity(
 }
 
 pub(crate) fn has_git_output(step: &ValidatedStep) -> bool {
-    let common = match step {
-        ValidatedStep::Command(node) => &node.common,
-        ValidatedStep::Agent(node) => &node.common,
-    };
-    common.outputs.values().any(|output| {
+    step.common().outputs.values().any(|output| {
         matches!(
             output.definition,
             super::document::Output::GitBranchWorkspace

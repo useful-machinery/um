@@ -32,7 +32,7 @@ impl<'a> RejectionDiagnostic<'a> {
         }
     }
 
-    pub(crate) fn from_admission(failure: &'a AdmissionFailure) -> Option<Self> {
+    pub fn from_admission(failure: &'a AdmissionFailure) -> Option<Self> {
         let (code, message) = admission_classification(failure.kind())?;
         Some(Self {
             code,
@@ -41,9 +41,7 @@ impl<'a> RejectionDiagnostic<'a> {
         })
     }
 
-    pub(crate) fn from_agent_harness_installation(
-        failure: &'a AgentHarnessInstallationFailure,
-    ) -> Self {
+    pub fn from_agent_harness_installation(failure: &'a AgentHarnessInstallationFailure) -> Self {
         let (code, message, profile, version, executable_path) = match failure {
             AgentHarnessInstallationFailure::Pi(failure) => {
                 let (code, message) = pi_installation_classification(failure);
@@ -95,6 +93,8 @@ pub struct RejectionLocation<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     output: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    outcome: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     profile: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     version: Option<&'a str>,
@@ -102,6 +102,11 @@ pub struct RejectionLocation<'a> {
     executable_path: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     export: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool: Option<&'a str>,
+    /// A root field of the workflow file.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    key: Option<&'a str>,
 }
 
 impl<'a> RejectionLocation<'a> {
@@ -113,10 +118,13 @@ impl<'a> RejectionLocation<'a> {
             index: None,
             input: None,
             output: None,
+            outcome: None,
             profile: None,
             version: None,
             executable_path: None,
             export: None,
+            tool: None,
+            key: None,
         }
     }
 
@@ -155,6 +163,10 @@ impl<'a> RejectionLocation<'a> {
                 input: Some(input),
                 ..Self::simple("input_schema")
             },
+            ResolutionLocation::InputDefault { input } => Self {
+                input: Some(input),
+                ..Self::simple("input_default")
+            },
             ResolutionLocation::ResultSchema { step, output } => Self {
                 output: Some(output),
                 ..Self::for_step("result_schema", step)
@@ -182,8 +194,13 @@ impl<'a> RejectionLocation<'a> {
 
     fn from_validation(location: &'a ValidationLocation) -> Self {
         match location {
+            ValidationLocation::Workflow { key } => Self {
+                key: Some(key),
+                ..Self::simple("workflow")
+            },
             ValidationLocation::WorkflowGraph => Self::simple("workflow_graph"),
             ValidationLocation::WorkflowNamespace => Self::simple("workflow_namespace"),
+            ValidationLocation::Step { step } => Self::for_step("step", step),
             ValidationLocation::AgentProfileReplacement { profile } => Self {
                 profile: Some(profile),
                 ..Self::simple("agent_profile_replacement")
@@ -218,6 +235,12 @@ impl<'a> RejectionLocation<'a> {
                 ..Self::for_step("step_output", step)
             },
             ValidationLocation::StepCondition { step } => Self::for_step("step_condition", step),
+            ValidationLocation::StepWorkflow { step } => Self::for_step("step_workflow", step),
+            ValidationLocation::StepEdge { step, outcome } => Self {
+                outcome: Some(outcome),
+                ..Self::for_step("step_edge", step)
+            },
+            ValidationLocation::StepForEach { step } => Self::for_step("step_for_each", step),
             ValidationLocation::FinalizerAfter { finalizer, index } => Self {
                 index: Some(*index),
                 ..Self::for_finalizer("finalizer_after", finalizer)
@@ -245,6 +268,7 @@ impl<'a> RejectionLocation<'a> {
                 export: Some(name),
                 ..Self::simple("export")
             },
+            ValidationLocation::Outcome => Self::simple("outcome"),
         }
     }
 
@@ -265,6 +289,10 @@ impl<'a> RejectionLocation<'a> {
             }
             AdmissionLocation::ExecutionRoot => Some(Self::simple("execution_root")),
             AdmissionLocation::GitContext => Some(Self::simple("git_context")),
+            AdmissionLocation::RequiredTool { name } => Some(Self {
+                tool: Some(name),
+                ..Self::simple("required_tool")
+            }),
             AdmissionLocation::MaximumParallelSteps
             | AdmissionLocation::MaximumCapturedFiles
             | AdmissionLocation::MaximumCapturedFileBytes
@@ -300,6 +328,9 @@ impl RejectionLocation<'_> {
         if let Some(output) = self.output {
             write!(formatter, ", output {output}")?;
         }
+        if let Some(outcome) = self.outcome {
+            write!(formatter, ", outcome {outcome}")?;
+        }
         formatter.write_str(")")
     }
 }
@@ -328,8 +359,10 @@ impl fmt::Display for RejectionLocation<'_> {
                 )?;
             }
             formatter.write_str(")")?;
-        } else if let Some(name) = self.export {
+        } else if let Some(name) = self.export.or(self.tool) {
             write!(formatter, " ({name})")?;
+        } else if let Some(key) = self.key {
+            write!(formatter, " (key {key})")?;
         }
         Ok(())
     }
@@ -337,6 +370,17 @@ impl fmt::Display for RejectionLocation<'_> {
 
 pub fn human_resolution_remedy(failure: &ResolutionFailure) -> String {
     let default = resolution_classification(failure.kind()).1;
+    // The author sees the child's own cause without validating the child by hand.
+    if let Some(child) = failure.child_failure() {
+        let diagnostic = RejectionDiagnostic::from_resolution(child);
+        let path = normalize_terminal_scalar(child.workflow_path().unwrap_or("").as_bytes());
+        return format!(
+            "Correct the child workflow {path}: {} at {}. {}",
+            diagnostic.code,
+            diagnostic.location,
+            human_resolution_remedy(child)
+        );
+    }
     let Some(source_path) = failure.source_path() else {
         return default.to_owned();
     };
@@ -415,6 +459,14 @@ fn resolution_classification(kind: ResolutionFailureKind) -> (&'static str, &'st
         ResolutionFailureKind::InvalidInputSchema => (
             "invalid_input_schema",
             "Correct the input schema so it is a valid Draft 2020-12 schema.",
+        ),
+        ResolutionFailureKind::InvalidInputDefaultJson => (
+            "invalid_input_default_json",
+            "Provide a strict JSON document for the input default.",
+        ),
+        ResolutionFailureKind::InvalidInputDefault => (
+            "invalid_input_default",
+            "Correct the input default so it satisfies the input schema.",
         ),
         ResolutionFailureKind::InvalidResultSchemaEncoding => (
             "invalid_result_schema_encoding",
@@ -558,6 +610,14 @@ fn validation_classification(kind: ValidationFailureKind) -> (&'static str, &'st
             "advisory_export_target",
             "Export an output from a required workflow node.",
         ),
+        ValidationFailureKind::InvalidOutcomeDeclaration => (
+            "invalid_outcome_declaration",
+            "Declare outcomes and outcome together, with onFailure one of the outcomes.",
+        ),
+        ValidationFailureKind::InvalidOutcomeSource => (
+            "invalid_outcome_source",
+            "Take the outcome from a text output of a required, unconditional step.",
+        ),
         ValidationFailureKind::TooManyNodes => (
             "too_many_workflow_nodes",
             "Reduce the combined number of steps and finalizers to 256.",
@@ -599,6 +659,122 @@ fn validation_classification(kind: ValidationFailureKind) -> (&'static str, &'st
         | ValidationFailureKind::WorkflowConditionNodeLimitExceeded => (
             "condition_limit_exceeded",
             "Reduce the workflow condition structure to the version-1 limits.",
+        ),
+        ValidationFailureKind::ChildWorkflowNotInTree => (
+            "child_workflow_not_in_tree",
+            "Name a .yaml or .yml file directly under the source root, other than workflow.yaml and this file.",
+        ),
+        ValidationFailureKind::ChildWorkflowUnavailable => (
+            "child_workflow_unavailable",
+            "Add or make readable the child workflow file the step names.",
+        ),
+        ValidationFailureKind::ChildWorkflowInvalid => (
+            "child_workflow_invalid",
+            "Correct the child workflow file so it validates on its own.",
+        ),
+        ValidationFailureKind::ChildWorkflowNested => (
+            "child_workflow_nested",
+            "Remove the workflow steps from the child workflow; a child cannot run children.",
+        ),
+        ValidationFailureKind::ChildWorkflowRootBlocks => (
+            "child_workflow_root_blocks",
+            "Remove name, version and the root-only blocks from the child workflow.",
+        ),
+        ValidationFailureKind::ChildInputUndeclared => (
+            "child_input_undeclared",
+            "Map only inputs the child workflow declares.",
+        ),
+        ValidationFailureKind::ChildInputMissing => (
+            "child_input_missing",
+            "Map every child input that is neither optional nor defaulted.",
+        ),
+        ValidationFailureKind::ChildInputTypeMismatch => (
+            "child_input_type_mismatch",
+            "Map a value of the kind the child input declares.",
+        ),
+        ValidationFailureKind::ChildInputUnsupported => (
+            "child_input_unsupported",
+            "Leave child file and attachments inputs unmapped; only text and json inputs map.",
+        ),
+        ValidationFailureKind::ChildExportReserved => (
+            "child_export_reserved",
+            "Rename the child export outcome; the step's outcome output is reserved.",
+        ),
+        ValidationFailureKind::EdgeOutcomeUndeclared => (
+            "edge_outcome_undeclared",
+            "Route only outcomes the child workflow declares.",
+        ),
+        ValidationFailureKind::EdgeOutcomeMissing => (
+            "edge_outcome_missing",
+            "Route every outcome of the child workflow to one target.",
+        ),
+        ValidationFailureKind::EdgeTargetUnknown => (
+            "edge_target_unknown",
+            "Route the outcome to a declared step or to exit.<outcome>.",
+        ),
+        ValidationFailureKind::EdgeLimitTargetInvalid => (
+            "edge_limit_target_invalid",
+            "Name a step as the limited edge's then, and an unlimited target as its else.",
+        ),
+        ValidationFailureKind::EdgeExitUndeclared => (
+            "edge_exit_undeclared",
+            "Exit with one of this workflow's outcomes.",
+        ),
+        ValidationFailureKind::EdgeSchedulingKind => (
+            "edge_scheduling_kind",
+            "Make every step of a workflow with workflow steps a workflow step.",
+        ),
+        ValidationFailureKind::StepUnreachable => (
+            "step_unreachable",
+            "Route an outcome of an earlier step to this step, or remove it.",
+        ),
+        ValidationFailureKind::WaitHandBackRequired => (
+            "wait_hand_back_required",
+            "Name the step a hand-back continues at in the approval wait's onHandBack.",
+        ),
+        ValidationFailureKind::WaitHandBackUnsupported => (
+            "wait_hand_back_unsupported",
+            "Remove onHandBack; only an approval wait names one.",
+        ),
+        ValidationFailureKind::WaitRuleRequired => (
+            "wait_rule_required",
+            "Give the external wait a rule: {source, event, where}.",
+        ),
+        ValidationFailureKind::WaitRuleUnsupported => (
+            "wait_rule_unsupported",
+            "Remove rule; only an external wait carries one.",
+        ),
+        ValidationFailureKind::WaitRuleInvalid => (
+            "wait_rule_invalid",
+            "Name a provider other than um, and write where as equalities joined by and.",
+        ),
+        ValidationFailureKind::WaitRuleReferenceInvalid => (
+            "wait_rule_reference_invalid",
+            "Name a text input, or a text export of an earlier workflow step, in where.",
+        ),
+        ValidationFailureKind::ControlReferenceRequiresOptional => (
+            "control_reference_requires_optional",
+            "Map wait.<field> or controls.answers only onto an optional or defaulted child input.",
+        ),
+        ValidationFailureKind::ForEachReferenceInvalid => (
+            "for_each_reference_invalid",
+            "Reference a json root input or an earlier workflow step's json export.",
+        ),
+        ValidationFailureKind::ForEachEmptyUndeclared => (
+            "for_each_empty_undeclared",
+            "Name one of the child workflow's outcomes as the empty-list outcome.",
+        ),
+        ValidationFailureKind::ItemReferenceRequiresForEach => (
+            "item_reference_requires_for_each",
+            "Reference item only on a workflow step that declares forEach.",
+        ),
+        ValidationFailureKind::SubjectInputUndeclared => (
+            "subject_input_undeclared",
+            "Name a declared root input as the workflow's subject.",
+        ),
+        ValidationFailureKind::SubjectInputNotText => (
+            "subject_input_not_text",
+            "Name a text input as the workflow's subject.",
         ),
     }
 }
@@ -782,6 +958,26 @@ fn admission_classification(kind: AdmissionFailureKind) -> Option<(&'static str,
             "git_baseline_unavailable",
             "Check out a readable baseline commit before running the workflow.",
         )),
+        AdmissionFailureKind::RequiredToolUnavailable => Some((
+            "required_tool_unavailable",
+            "Install the tool the root workflow's `requires.tools` names, or put it on the launching `PATH`.",
+        )),
+        AdmissionFailureKind::WaitTargetUnsupported => Some((
+            "wait_target_unsupported",
+            "A wait that continues at an exit is not supported by this release; route the outcome to a step, an exit or a wait that continues at a step.",
+        )),
+        AdmissionFailureKind::WaitConditionUnsupported => Some((
+            "wait_condition_unsupported",
+            "This CLI evaluates no condition for the external wait's `source` and `event`; name a supported pair, such as `github` and `pull_request.queue_settled`, or route the outcome to another target.",
+        )),
+        AdmissionFailureKind::WorkflowStepRequiresTree => Some((
+            "workflow_step_requires_tree",
+            "Run a workflow with workflow steps from a tree.",
+        )),
+        AdmissionFailureKind::WorkflowStepUnsupported => Some((
+            "workflow_step_unsupported",
+            "Cloud does not run workflow steps.",
+        )),
         // Every caller supplies a Git capture context when a `git_branch` output needs one,
         // so `GitContextRequired` is an adapter defect with no author remedy.
         AdmissionFailureKind::GitContextRequired
@@ -813,6 +1009,26 @@ fn admission_classification(kind: AdmissionFailureKind) -> Option<(&'static str,
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // REQ-WFFORMAT-100
+    #[test]
+    fn subject_failures_are_reported_at_the_workflow_subject_key() {
+        let codes = [
+            ValidationFailureKind::SubjectInputUndeclared,
+            ValidationFailureKind::SubjectInputNotText,
+        ]
+        .map(|kind| validation_classification(kind).0);
+        assert_eq!(
+            codes,
+            ["subject_input_undeclared", "subject_input_not_text"]
+        );
+        let location = ValidationLocation::Workflow { key: "subject" };
+        let location = RejectionLocation::from_validation(&location);
+        assert_eq!(
+            serde_json::to_value(&location).unwrap(),
+            serde_json::json!({"kind": "workflow", "key": "subject"})
+        );
+    }
 
     #[test]
     fn codex_installation_rejection_uses_the_closed_profile_identity() {
@@ -870,6 +1086,7 @@ mod tests {
     fn every_diagnostic_location_kind_is_in_the_closed_set() {
         let text = || "a".to_owned();
         let validation = [
+            ValidationLocation::Workflow { key: "subject" },
             ValidationLocation::WorkflowGraph,
             ValidationLocation::WorkflowNamespace,
             ValidationLocation::AgentProfileReplacement { profile: text() },
@@ -897,6 +1114,13 @@ mod tests {
                 output: text(),
             },
             ValidationLocation::StepCondition { step: text() },
+            ValidationLocation::Step { step: text() },
+            ValidationLocation::StepWorkflow { step: text() },
+            ValidationLocation::StepEdge {
+                step: text(),
+                outcome: text(),
+            },
+            ValidationLocation::StepForEach { step: text() },
             ValidationLocation::FinalizerAfter {
                 finalizer: text(),
                 index: 0,
@@ -919,6 +1143,7 @@ mod tests {
             },
             ValidationLocation::FinalizerCondition { finalizer: text() },
             ValidationLocation::Export { name: text() },
+            ValidationLocation::Outcome,
         ];
         let resolution = [
             ResolutionLocation::SourceRoot,
@@ -934,6 +1159,7 @@ mod tests {
                 index: 0,
             },
             ResolutionLocation::InputSchema { input: text() },
+            ResolutionLocation::InputDefault { input: text() },
             ResolutionLocation::ResultSchema {
                 step: text(),
                 output: text(),
@@ -965,6 +1191,7 @@ mod tests {
             AdmissionLocation::RecoveryHandler { step: text() },
             AdmissionLocation::ExecutionRoot,
             AdmissionLocation::GitContext,
+            AdmissionLocation::RequiredTool { name: text() },
         ];
         let harness =
             AgentHarnessInstallationFailure::Codex(CodexInstallationFailure::Unsupported {
@@ -1001,6 +1228,7 @@ mod tests {
             "content_digest",
             "input",
             "input_schema",
+            "input_default",
             "input_attachment",
             "result_schema",
             "step",
@@ -1008,6 +1236,9 @@ mod tests {
             "step_input",
             "step_output",
             "step_condition",
+            "step_workflow",
+            "step_edge",
+            "step_for_each",
             "system_prompt",
             "message_text",
             "message_attachment",
@@ -1024,7 +1255,9 @@ mod tests {
             "finalizer_output",
             "finalizer_condition",
             "export",
+            "outcome",
             "git_context",
+            "required_tool",
         ]);
         assert_eq!(kinds, closed);
     }

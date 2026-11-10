@@ -598,6 +598,8 @@ fn archived_summary(attempt: &LocalArchivedAttempt) -> Vec<ArchivedSummaryLine> 
         crate::workflow::local_run::AttemptStateV1::Cancelling => "cancelling",
         crate::workflow::local_run::AttemptStateV1::Interrupted => "interrupted",
         crate::workflow::local_run::AttemptStateV1::Rejected => "rejected",
+        crate::workflow::local_run::AttemptStateV1::Waiting => "waiting",
+        crate::workflow::local_run::AttemptStateV1::Continued => "continued",
     };
     let (outcome, outcome_tone) = archived_outcome_status(attempt.outcome);
     let mut lines = vec![
@@ -753,6 +755,8 @@ fn archived_outcome_status(outcome: WorkflowOutcomeV1) -> (&'static str, Tone) {
         WorkflowOutcomeV1::Succeeded => ("succeeded", Tone::Success),
         WorkflowOutcomeV1::Failed => ("failed", Tone::Failure),
         WorkflowOutcomeV1::Cancelled => ("cancelled", Tone::Blocked),
+        WorkflowOutcomeV1::Waiting => ("waiting", Tone::Blocked),
+        WorkflowOutcomeV1::Continued => ("continued", Tone::Muted),
     }
 }
 
@@ -831,6 +835,18 @@ fn safe_definition(mut definition: WorkflowPresentationStep) -> WorkflowPresenta
             }
             normalize_outputs(outputs);
         }
+        WorkflowPresentationStep::Workflow {
+            file,
+            direct_dependencies,
+            outputs,
+            ..
+        } => {
+            *file = safe_text(file);
+            for dependency in direct_dependencies {
+                *dependency = safe_text(dependency);
+            }
+            normalize_outputs(outputs);
+        }
     }
     definition
 }
@@ -838,7 +854,10 @@ fn safe_definition(mut definition: WorkflowPresentationStep) -> WorkflowPresenta
 fn normalize_outputs(outputs: &mut std::collections::BTreeMap<String, WorkflowOutput>) {
     for output in outputs.values_mut() {
         match output {
-            WorkflowOutput::TextAgentResponse | WorkflowOutput::GitBranchWorkspace => {}
+            WorkflowOutput::TextAgentResponse
+            | WorkflowOutput::GitBranchWorkspace
+            | WorkflowOutput::ChildExport { .. }
+            | WorkflowOutput::ChildOutcome => {}
             WorkflowOutput::TextPath { path } => *path = safe_text(path),
             WorkflowOutput::JsonPath { path, schema } => {
                 *path = safe_text(path);

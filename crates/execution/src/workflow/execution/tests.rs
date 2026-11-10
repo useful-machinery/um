@@ -652,6 +652,8 @@ fn describe_transition(event: &TransitionEvent<TestInstant>) -> String {
         WorkflowState::Succeeded => "Succeeded",
         WorkflowState::Failed { .. } => "Failed",
         WorkflowState::Cancelled { .. } => "Cancelled",
+        WorkflowState::Waiting { .. } => "Waiting",
+        WorkflowState::Continued { .. } => "Continued",
     };
     match event {
         TransitionEvent::Step {
@@ -745,6 +747,177 @@ async fn watchdog_expiry_names_the_last_observed_transition() {
         message.ends_with("; last observed transition: none"),
         "{message:?}"
     );
+}
+
+/// A workflow declaring outcomes, whose `decide` step reports `planned` and then exits
+/// with `status`.
+fn declared_outcome_source(status: u8) -> String {
+    format!(
+        "schemaVersion: 1\noutcomes: [planned, blocked]\noutcome:\n  from: outputs.decide.verdict\n  onFailure: blocked\nsteps:\n  decide:\n    kind: cmd\n    command:\n      argv: [/bin/sh, -c, \"printf '%s' planned > verdict.txt; exit {status}\"]\n    outputs:\n      verdict:\n        kind: text\n        from: path\n        path: verdict.txt\n"
+    )
+}
+
+async fn executed_definition(
+    source: &str,
+) -> (
+    crate::workflow::validated::ValidatedWorkflow,
+    WorkflowExecutionResult<TestInstant>,
+) {
+    let fixture = execution_fixture(
+        source,
+        ResolvedInputs::default(),
+        EnvironmentSnapshot::new([("PATH", "/bin:/usr/bin")]),
+        CancellationSource::new(),
+        1,
+        1024,
+    );
+    let definition = fixture.admitted.workflow().definition.clone();
+    let result = execute_workflow(
+        fixture.admitted,
+        &fixture.artifacts,
+        &fixture.inputs,
+        &StepDiagnosticLog::default(),
+        AgentExecution::disabled(),
+        TestClock,
+        NoopExecutionObserver,
+    )
+    .await
+    .unwrap();
+    (definition, result)
+}
+
+// REQ-WFEXEC-57
+#[tokio::test]
+async fn chosen_outcome_names_the_declared_implicit_or_engine_outcome() {
+    with_watchdog(async {
+        let (declared, mut succeeded) = executed_definition(&declared_outcome_source(0)).await;
+        assert_eq!(succeeded.outcome, RunOutcome::Succeeded);
+        assert_eq!(chosen_outcome(&declared, &succeeded), "planned");
+
+        // A source step inherited from an earlier attempt still holds the value.
+        let StepState::Succeeded { outputs } = succeeded.steps["decide"].clone() else {
+            panic!("decide did not succeed: {:?}", succeeded.steps["decide"]);
+        };
+        succeeded.steps.insert(
+            "decide".to_owned(),
+            StepState::Inherited {
+                detail: crate::workflow::evidence::InheritedDetail {
+                    prior_attempt_id: "00000000-0000-4000-8000-000000000001".to_owned(),
+                    prior_attempt_number: 1,
+                    prior_state: crate::workflow::evidence::InheritedPriorState::Succeeded,
+                    definition_changed: false,
+                },
+                disposition: crate::workflow::runtime::InheritedDisposition::Succeeded,
+                outputs,
+            },
+        );
+        assert_eq!(chosen_outcome(&declared, &succeeded), "planned");
+
+        let (_, failed) = executed_definition(&declared_outcome_source(3)).await;
+        assert!(matches!(failed.outcome, RunOutcome::Failed { .. }));
+        assert_eq!(chosen_outcome(&declared, &failed), "blocked");
+
+        let mut cancelled = succeeded.clone();
+        cancelled.outcome = RunOutcome::Cancelled {
+            reason: CancellationReason::UserRequest,
+        };
+        assert_eq!(chosen_outcome(&declared, &cancelled), "canceled");
+
+        let mut implicit = declared.clone();
+        implicit.outcome = None;
+        assert_eq!(chosen_outcome(&implicit, &succeeded), "succeeded");
+        assert_eq!(chosen_outcome(&implicit, &failed), "failed");
+        assert_eq!(chosen_outcome(&implicit, &cancelled), "canceled");
+    })
+    .await;
+}
+
+const EDGE_PARENT: &str = "schemaVersion: 1
+outcomes: [landed, failed]
+steps:
+  design:
+    kind: workflow
+    workflow: design.yaml
+    on:
+      planned: build
+      blocked: exit.failed
+      failed: exit.failed
+  build:
+    kind: workflow
+    workflow: build.yaml
+    on:
+      built: exit.landed
+      failed: exit.failed
+";
+
+fn edge_child(outcomes: &str) -> String {
+    format!(
+        "schemaVersion: 1\noutcomes: [{outcomes}]\noutcome:\n  from: outputs.decide.verdict\n  onFailure: failed\nsteps:\n  decide:\n    kind: cmd\n    command:\n      argv: [/bin/true]\n    outputs:\n      verdict:\n        kind: text\n        from: path\n        path: verdict.txt\n"
+    )
+}
+
+fn routed(outcome: &str) -> StepState<CapturedValue> {
+    StepState::Succeeded {
+        outputs: BTreeMap::from([(
+            "outcome".to_owned(),
+            CapturedValue::text(Arc::from(outcome)),
+        )]),
+    }
+}
+
+// REQ-WFEXEC-57, REQ-WFEXEC-58
+#[tokio::test]
+async fn chosen_outcome_of_an_edge_scheduled_run_is_its_exit_outcome() {
+    with_watchdog(async {
+        let design = edge_child("planned, blocked, failed");
+        let build = edge_child("built, failed");
+        let fixture = execution_fixture_with_source_files(
+            EDGE_PARENT,
+            &[
+                ("design.yaml", design.as_bytes()),
+                ("build.yaml", build.as_bytes()),
+            ],
+            ResolvedInputs::default(),
+            EnvironmentSnapshot::new([("PATH", "/bin:/usr/bin")]),
+            CancellationSource::new(),
+            1,
+            1024,
+        );
+        let workflow = fixture.admitted.workflow().definition.clone();
+        let (_, mut result) = executed_definition(&declared_outcome_source(0)).await;
+
+        result.steps = BTreeMap::from([
+            ("design".to_owned(), routed("planned")),
+            ("build".to_owned(), routed("built")),
+        ]);
+        assert_eq!(chosen_outcome(&workflow, &result), "landed");
+
+        result.steps = BTreeMap::from([
+            ("design".to_owned(), routed("blocked")),
+            (
+                "build".to_owned(),
+                StepState::NotRun {
+                    detail: NonExecutionDetail::not_reached(),
+                },
+            ),
+        ]);
+        assert_eq!(chosen_outcome(&workflow, &result), "failed");
+
+        // A walk that ended without an exit (`edge_walk_unrouted`) records `failed`.
+        result.steps = BTreeMap::from([("design".to_owned(), routed("unexpected"))]);
+        assert_eq!(chosen_outcome(&workflow, &result), "failed");
+
+        let (_, failed) = executed_definition(&declared_outcome_source(3)).await;
+        assert!(matches!(failed.outcome, RunOutcome::Failed { .. }));
+        assert_eq!(chosen_outcome(&workflow, &failed), "failed");
+
+        let mut cancelled = result.clone();
+        cancelled.outcome = RunOutcome::Cancelled {
+            reason: CancellationReason::UserRequest,
+        };
+        assert_eq!(chosen_outcome(&workflow, &cancelled), "canceled");
+    })
+    .await;
 }
 
 const AGENT_PROFILE: &str = r#"agentProfiles:

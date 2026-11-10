@@ -16,9 +16,12 @@ use tokio::sync::{oneshot, watch};
 
 use super::super::ExecutionOutcome;
 use super::admission::{AdmissionFailure, CancellationReason};
+use super::definition_store::DefinitionError;
 use super::document::FailurePolicy;
 use super::evidence::{BlockedDetail, FailureDetail, Prerequisite, PrimaryIssueDetail};
-use super::local_run::{LocalRetryRejection, RetryIneligibilityReason};
+use super::local_run::{
+    CarryMiss, LocalRetryRejection, RetryIneligibilityReason, TreeCopyMismatch,
+};
 use super::observation::{ExecutionObservation, ExecutionObserver, ObservedStepTransition};
 use super::presentation_feed::{
     AcceptedRecordOrder, AgentPresentationHarness, DisplayDeadline, NormalizedAgentObservation,
@@ -39,13 +42,16 @@ use super::runtime::{
 };
 #[cfg(test)]
 use super::step_runtime::{CommandExecutionFailure, StepExecutionFailure, StepFailureCause};
+use super::tree::{TreeDiagnostic, TreeLocation};
 use super::validated::ValidatedStep;
 use crate::AgentHarnessInstallationFailure;
 use crate::harness_installation::UntestedHarnessAdvisory;
 
-const RUN_COMMAND: &str = "um workflow run";
-const RETRY_COMMAND: &str = "um workflow retry";
-const CONTINUE_COMMAND: &str = "um workflow continue";
+const RUN_COMMAND: &str = "um workflow run create";
+const RETRY_COMMAND: &str = "um workflow run retry";
+const RESUME_COMMAND: &str = "um workflow run resume";
+const RESTART_COMMAND: &str = "um workflow run restart";
+const UPGRADE_COMMAND: &str = "um workflow run upgrade";
 const EVENT_TOKEN_WIDTH: usize = 10;
 const MIN_INLINE_DETAIL_WIDTH: usize = 24;
 const STACKED_DETAIL_INDENT: usize = 2;
@@ -338,10 +344,37 @@ where
         self
     }
 
-    pub fn for_continue(mut self, run_directory: &Path) -> Self {
-        self.command = CONTINUE_COMMAND;
+    pub fn for_resume(mut self, run_directory: &Path) -> Self {
+        self.command = RESUME_COMMAND;
         self.retry_run_directory = run_directory.to_str().map(str::to_owned);
         self
+    }
+
+    /// The documents of `um workflow run restart` of the run at `run_directory`, the
+    /// predecessor until the successor exists (REQ-LOCALRUN-194).
+    pub fn for_restart(mut self, run_directory: &Path) -> Self {
+        self.command = RESTART_COMMAND;
+        self.retry_run_directory = run_directory.to_str().map(str::to_owned);
+        self
+    }
+
+    /// The documents of `um workflow run upgrade` of the run at `run_directory`, the
+    /// predecessor until the successor exists (REQ-LOCALRUN-197).
+    pub fn for_upgrade(mut self, run_directory: &Path) -> Self {
+        self.command = UPGRADE_COMMAND;
+        self.retry_run_directory = run_directory.to_str().map(str::to_owned);
+        self
+    }
+
+    /// The command a continuation's refusal names: `restart` and `upgrade` report a refused
+    /// continuation as `resume` does, under their own names (REQ-LOCALRUN-194,
+    /// REQ-LOCALRUN-197).
+    fn continuation_command(&self) -> &'static str {
+        if self.command == RESTART_COMMAND || self.command == UPGRADE_COMMAND {
+            self.command
+        } else {
+            RESUME_COMMAND
+        }
     }
 
     pub fn render_resolution_rejection(
@@ -404,6 +437,260 @@ where
         )
     }
 
+    /// A source root that is a tree and failed validation (REQ-LOCALRUN-169): phase `tree`
+    /// with every failure the validator found (REQ-LOCALRUN-128).
+    pub fn render_tree_rejection(
+        self,
+        workflow_path: Option<&str>,
+        diagnostics: &[TreeDiagnostic],
+    ) -> WorkflowRunPresentationResult {
+        let diagnostics = diagnostics
+            .iter()
+            .map(|diagnostic| TreeRejectionDiagnosticV1 {
+                code: diagnostic.code,
+                message: diagnostic
+                    .remedy()
+                    .unwrap_or_else(|| tree_code_message(diagnostic.code).to_owned()),
+                location: TreeRejectionLocationV1::Tree(&diagnostic.location),
+                workflow_location: diagnostic.workflow_location(),
+            })
+            .collect();
+        self.write_tree_rejection(workflow_path, diagnostics)
+    }
+
+    /// The selected workflow file resolved but is not one of the tree's workflow files.
+    pub fn render_workflow_not_in_tree(self, workflow_path: &str) -> WorkflowRunPresentationResult {
+        self.write_tree_rejection(
+            Some(workflow_path),
+            vec![TreeRejectionDiagnosticV1 {
+                code: "workflow_not_in_tree",
+                message: tree_code_message("workflow_not_in_tree").to_owned(),
+                location: TreeRejectionLocationV1::Workflow {
+                    kind: "workflow",
+                    path: workflow_path,
+                },
+                workflow_location: None,
+            }],
+        )
+    }
+
+    /// A retry or continuation whose run copy no longer has the digest the manifest
+    /// recorded (REQ-LOCALRUN-171).
+    pub fn render_tree_copy_rejection(
+        self,
+        workflow_path: &str,
+        mismatch: &TreeCopyMismatch,
+    ) -> WorkflowRunPresentationResult {
+        let digest = |value: &str| format!("sha256:{value}");
+        self.write_tree_rejection(
+            Some(workflow_path),
+            vec![TreeRejectionDiagnosticV1 {
+                code: "tree_copy_modified",
+                message: tree_code_message("tree_copy_modified").to_owned(),
+                location: TreeRejectionLocationV1::Copy {
+                    kind: "tree_copy",
+                    expected_digest: digest(mismatch.expected_digest()),
+                    actual_digest: mismatch.actual_digest().map(digest),
+                },
+                workflow_location: None,
+            }],
+        )
+    }
+
+    /// A definition run refused before admission (REQ-LOCALRUN-173): phase `definition`
+    /// with the one code and the definition, revision and path it concerns.
+    pub fn render_definition_rejection(
+        self,
+        error: &DefinitionError,
+    ) -> WorkflowRunPresentationResult {
+        let message = error.to_string();
+        self.write_definition_rejection(DefinitionRejectionDiagnosticV1 {
+            code: error.code(),
+            message: &message,
+            definition: error.id(),
+            revision: error.revision(),
+            path: error.path().map(|path| path.to_string_lossy().into_owned()),
+            run: None,
+        })
+    }
+
+    /// A run refused for its subject (REQ-LOCALRUN-173, REQ-WFDEF-28): phase `definition`
+    /// with `code` (`subject_invalid`, `subject_busy` or `subject_settled`), the definition
+    /// and revision, and `run`, the id of the run that holds the slot.
+    pub fn render_subject_rejection(
+        self,
+        code: &'static str,
+        message: &str,
+        definition: Option<&str>,
+        revision: Option<u64>,
+        run: Option<&str>,
+    ) -> WorkflowRunPresentationResult {
+        self.write_definition_rejection(DefinitionRejectionDiagnosticV1 {
+            code,
+            message,
+            definition,
+            revision,
+            path: None,
+            run,
+        })
+    }
+
+    /// A `um workflow run restart` or `upgrade` refused before the successor exists
+    /// (REQ-LOCALRUN-194, REQ-LOCALRUN-197): phase `successor` with the one `code`, its
+    /// `message` and `run`, the predecessor's id when it has a run record.
+    pub fn render_successor_refusal(
+        self,
+        code: &'static str,
+        message: &str,
+        run: Option<&str>,
+    ) -> WorkflowRunPresentationResult {
+        let run_directory = self.retry_run_directory.clone();
+        self.write_single_rejection(
+            "successor",
+            "successor not created",
+            run_directory.as_deref(),
+            DefinitionRejectionDiagnosticV1 {
+                code,
+                message,
+                definition: None,
+                revision: None,
+                path: None,
+                run,
+            },
+        )
+    }
+
+    /// A `um workflow run upgrade` refused before the successor exists because the run's
+    /// carried state does not resolve against the current revision (REQ-LOCALRUN-197): phase
+    /// `successor` with one diagnostic per miss, each carrying its `code`, `message` and
+    /// `run`, the predecessor's id.
+    pub fn render_successor_refusals(
+        mut self,
+        misses: &[CarryMiss],
+        run: &str,
+    ) -> WorkflowRunPresentationResult {
+        let safe =
+            |value: &str| super::presentation_feed::normalize_terminal_scalar(value.as_bytes());
+        let mut human = format!(
+            "successor not created\nrun: {}\nNo workflow steps were executed.",
+            safe(run)
+        );
+        for miss in misses {
+            human.push_str(&format!("\n\n{}: {}", miss.code, safe(&miss.message)));
+        }
+        let diagnostics = misses
+            .iter()
+            .map(|miss| DefinitionRejectionDiagnosticV1 {
+                code: miss.code,
+                message: &miss.message,
+                definition: None,
+                revision: None,
+                path: None,
+                run: Some(run),
+            })
+            .collect::<Vec<_>>();
+        let run_directory = self.retry_run_directory.clone();
+        let rejection = TerminalRejectionV1 {
+            schema_version: 1,
+            command: self.command,
+            outcome: "rejected",
+            exit_status: 1,
+            phase: "successor",
+            run_directory: run_directory.as_deref(),
+            workflow: None,
+            diagnostics,
+        };
+        self.write_rejection(&rejection, &human)
+    }
+
+    fn write_definition_rejection(
+        self,
+        diagnostic: DefinitionRejectionDiagnosticV1<'_>,
+    ) -> WorkflowRunPresentationResult {
+        self.write_single_rejection(
+            "definition",
+            "workflow definition rejected",
+            None,
+            diagnostic,
+        )
+    }
+
+    /// A rejection at `phase` with one diagnostic, naming `run_directory` when given.
+    fn write_single_rejection(
+        mut self,
+        phase: &'static str,
+        heading: &str,
+        run_directory: Option<&str>,
+        diagnostic: DefinitionRejectionDiagnosticV1<'_>,
+    ) -> WorkflowRunPresentationResult {
+        let safe =
+            |value: &str| super::presentation_feed::normalize_terminal_scalar(value.as_bytes());
+        let mut human = format!("{heading}\ncode: {}", diagnostic.code);
+        if let Some(definition) = diagnostic.definition {
+            human.push_str(&format!("  definition: {}", safe(definition)));
+        }
+        if let Some(revision) = diagnostic.revision {
+            human.push_str(&format!("  revision: {revision}"));
+        }
+        if let Some(path) = &diagnostic.path {
+            human.push_str(&format!("  path: {}", safe(path)));
+        }
+        if let Some(run) = diagnostic.run {
+            human.push_str(&format!("  run: {}", safe(run)));
+        }
+        human.push_str("\nNo workflow steps were executed.\n\n");
+        human.push_str(&safe(diagnostic.message));
+        let rejection = TerminalRejectionV1 {
+            schema_version: 1,
+            command: self.command,
+            outcome: "rejected",
+            exit_status: 1,
+            phase,
+            run_directory,
+            workflow: None,
+            diagnostics: [diagnostic],
+        };
+        self.write_rejection(&rejection, &human)
+    }
+
+    fn write_tree_rejection(
+        mut self,
+        workflow_path: Option<&str>,
+        diagnostics: Vec<TreeRejectionDiagnosticV1<'_>>,
+    ) -> WorkflowRunPresentationResult {
+        let mut human = String::from("workflow tree rejected");
+        let mut remedies = Vec::new();
+        for diagnostic in &diagnostics {
+            human.push_str(&format!(
+                "\ncode: {}  location: {}",
+                diagnostic.code, diagnostic.location
+            ));
+            if let Some(location) = &diagnostic.workflow_location {
+                human.push_str(&format!("; {location}"));
+            }
+            if !remedies.contains(&&diagnostic.message) {
+                remedies.push(&diagnostic.message);
+            }
+        }
+        human.push_str("\nNo workflow steps were executed.");
+        for remedy in remedies {
+            human.push_str("\n\n");
+            human.push_str(remedy);
+        }
+        let retry_run_directory = self.retry_run_directory.clone();
+        let rejection = TerminalRejectionV1 {
+            schema_version: 1,
+            command: self.command,
+            outcome: "rejected",
+            exit_status: 1,
+            phase: "tree",
+            run_directory: retry_run_directory.as_deref(),
+            workflow: workflow_path.map(|path| RejectedWorkflowV1 { path }),
+            diagnostics: &diagnostics,
+        };
+        self.write_rejection(&rejection, &human)
+    }
+
     fn write_workflow_rejection(
         mut self,
         phase: &'static str,
@@ -440,8 +727,12 @@ where
                 PresentationFailureOperation::InvalidTerminalResult,
             ));
         };
-        let continuing = self.command == CONTINUE_COMMAND;
-        let message = if continuing {
+        let continuing = [RESUME_COMMAND, RESTART_COMMAND, UPGRADE_COMMAND].contains(&self.command);
+        let superseded;
+        let message = if rejection.reason() == RetryIneligibilityReason::RunSuperseded {
+            superseded = superseded_rejection_message(rejection.successor());
+            superseded.as_str()
+        } else if continuing {
             match rejection.reason() {
                 RetryIneligibilityReason::LatestAttemptSucceeded
                 | RetryIneligibilityReason::LatestAttemptRejected => {
@@ -477,11 +768,7 @@ where
             command: self.command,
             outcome: "rejected",
             exit_status: 1,
-            phase: if self.command == CONTINUE_COMMAND {
-                "continuation"
-            } else {
-                "retry"
-            },
+            phase: if continuing { "continuation" } else { "retry" },
             run_directory,
             attempt_number: rejection.attempt_number(),
             diagnostics: [diagnostic],
@@ -494,6 +781,44 @@ where
         } else {
             human_retry_rejection(rejection)
         };
+        self.write_rejection(&terminal, &human)
+    }
+
+    /// A `um workflow run resume` without `--from` refused at the run's latest attempt
+    /// (REQ-CONTINUE-29, REQ-CONTINUE-74, REQ-CONTINUE-76): phase `continuation` and one
+    /// diagnostic with `code`, `message` and the attempt.
+    pub fn render_continuation_refusal(
+        mut self,
+        run_directory: &Path,
+        attempt_number: u64,
+        code: &'static str,
+        message: &str,
+    ) -> WorkflowRunPresentationResult {
+        let Some(run_directory) = run_directory.to_str() else {
+            return WorkflowRunPresentationResult::Failed(PresentationFailure::operation(
+                PresentationFailureOperation::InvalidTerminalResult,
+            ));
+        };
+        let terminal = RetryRejectionV1 {
+            schema_version: 1,
+            command: self.continuation_command(),
+            outcome: "rejected",
+            exit_status: 1,
+            phase: "continuation",
+            run_directory,
+            attempt_number,
+            diagnostics: [RetryDiagnosticV1 {
+                code,
+                message,
+                location: RetryLocationV1 {
+                    kind: "attempt",
+                    attempt_number,
+                    guard_ids: &[],
+                    ownership_reason: None,
+                },
+            }],
+        };
+        let human = format!("continuation blocked: attempt {attempt_number} ({code})\n\n{message}");
         self.write_rejection(&terminal, &human)
     }
 
@@ -609,7 +934,7 @@ where
         });
         let terminal = serde_json::json!({
             "schemaVersion": 1,
-            "command": CONTINUE_COMMAND,
+            "command": self.continuation_command(),
             "outcome": "rejected",
             "exitStatus": 1,
             "phase": "continuation",
@@ -722,9 +1047,11 @@ where
     }
 }
 
+/// The rejection document of REQ-LOCALRUN-128: one diagnostic for resolution,
+/// installation and admission, every failure for phase `tree`.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-struct TerminalRejectionV1<'a> {
+struct TerminalRejectionV1<'a, Diagnostics> {
     schema_version: u8,
     command: &'static str,
     outcome: &'static str,
@@ -733,7 +1060,126 @@ struct TerminalRejectionV1<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     run_directory: Option<&'a str>,
     workflow: Option<RejectedWorkflowV1<'a>>,
-    diagnostics: [RejectionDiagnostic<'a>; 1],
+    diagnostics: Diagnostics,
+}
+
+#[derive(Serialize)]
+struct DefinitionRejectionDiagnosticV1<'a> {
+    code: &'static str,
+    message: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    definition: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    revision: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    path: Option<String>,
+    /// The run that holds the subject's slot (REQ-WFDEF-28).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    run: Option<&'a str>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TreeRejectionDiagnosticV1<'a> {
+    code: &'static str,
+    message: String,
+    location: TreeRejectionLocationV1<'a>,
+    /// Where inside a workflow file a per-file resolution failure sits, as
+    /// `um workflow definition validate` reports it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    workflow_location: Option<super::rejection::RejectionLocation<'a>>,
+}
+
+#[derive(Serialize)]
+#[serde(untagged)]
+enum TreeRejectionLocationV1<'a> {
+    Tree(&'a TreeLocation),
+    Workflow {
+        kind: &'static str,
+        path: &'a str,
+    },
+    Copy {
+        kind: &'static str,
+        #[serde(rename = "expectedDigest")]
+        expected_digest: String,
+        #[serde(rename = "actualDigest")]
+        actual_digest: Option<String>,
+    },
+}
+
+impl fmt::Display for TreeRejectionLocationV1<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Tree(location) => fmt::Display::fmt(location, formatter),
+            Self::Workflow { kind, path } => write!(
+                formatter,
+                "{kind} {}",
+                super::presentation_feed::normalize_terminal_scalar(path.as_bytes())
+            ),
+            Self::Copy {
+                kind,
+                expected_digest,
+                actual_digest,
+            } => write!(
+                formatter,
+                "{kind} (expected {expected_digest}, found {})",
+                actual_digest.as_deref().unwrap_or("an invalid tree")
+            ),
+        }
+    }
+}
+
+/// The message of a tree failure that carries no resolution remedy of its own.
+fn tree_code_message(code: &str) -> &'static str {
+    match code {
+        "tree_root_missing" => "Add workflow.yaml directly under the tree root.",
+        "tree_root_excluded" => "Remove the `exclude` pattern that matches workflow.yaml.",
+        "exclude_pattern_invalid" => {
+            "Write each `exclude` pattern without a leading `/`, a `..` segment or `!`."
+        }
+        "tree_entry_not_regular" => {
+            "Replace the symbolic link or special file with a regular file, or exclude it."
+        }
+        "invalid_canonical_path" => "Rename the path so every component is UTF-8.",
+        "tree_too_large" => {
+            "Keep the tree's files within 64 MiB, or exclude what the workflow does not need."
+        }
+        "root_only_block_outside_root" => {
+            "Move the root-only block into the tree's root workflow.yaml."
+        }
+        "program_directory_missing" => {
+            "Create the directory the root's `programs` names, or remove the entry."
+        }
+        "binding_undeclared" => "Declare the binding under the root's `bindings`.",
+        "binding_kind_mismatch" => {
+            "Name a `connection` binding as a trigger's source and a `linear.state` one in `mirror`."
+        }
+        "literal_where_binding_expected" => {
+            "Replace the quoted literal with a declared `$binding`."
+        }
+        "trigger_input_undeclared" => "Name only declared root inputs in the trigger's `inputs`.",
+        "trigger_input_missing" => {
+            "Supply every input the root workflow requires in the trigger's `inputs`."
+        }
+        "mirror_issue_input_undeclared" => "Name a declared root input in `mirror.linear.issue`.",
+        "mirror_issue_input_not_text" => "Name a `text` root input in `mirror.linear.issue`.",
+        "mirror_outcome_undeclared" => {
+            "Map only the root's outcomes, `failed`, `withdrawn` or `canceled` in `onOutcome`."
+        }
+        "mirror_guard_invalid" => {
+            "Write the guard as `issue.state != $key` or `issue.state == $key`."
+        }
+        "mirror_variable_unknown" => {
+            "Use only `{{name}}` placeholders the hook supplies in the mirror template."
+        }
+        "workflow_not_in_tree" => {
+            "Select workflow.yaml or a workflow file directly under the tree root."
+        }
+        "tree_copy_modified" => {
+            "The run's read-only tree copy changed after the run was created; start a new run."
+        }
+        _ => "Correct the workflow tree.",
+    }
 }
 
 #[derive(Serialize)]
@@ -752,7 +1198,7 @@ struct RetryRejectionV1<'a> {
 #[derive(Serialize)]
 struct RetryDiagnosticV1<'a> {
     code: &'static str,
-    message: &'static str,
+    message: &'a str,
     location: RetryLocationV1<'a>,
 }
 
@@ -774,15 +1220,26 @@ fn human_retry_rejection(rejection: &LocalRetryRejection) -> String {
             "retry blocked: attempt {attempt} has an active execution owner\n\nWait for the current attempt to finish, then retry."
         ),
         RetryIneligibilityReason::LatestAttemptSucceeded => format!(
-            "cannot retry run: attempt {attempt} succeeded\n\nA succeeded run cannot be retried. Start a new run instead:\n  um workflow run --run-dir <NEW_DIR> <WORKFLOW>"
+            "cannot retry run: attempt {attempt} succeeded\n\nA succeeded run cannot be retried. Start a new run instead:\n  um workflow run create --path <DIR> --execution-root <PATH> --run-dir <NEW_DIR>"
         ),
         RetryIneligibilityReason::LatestAttemptRejected => format!(
-            "cannot retry run: attempt {attempt} was rejected\n\nStart a new run with a corrected workflow definition instead:\n  um workflow run --run-dir <NEW_DIR> <WORKFLOW>"
+            "cannot retry run: attempt {attempt} was rejected\n\nStart a new run with a corrected workflow definition instead:\n  um workflow run create --path <DIR> --execution-root <PATH> --run-dir <NEW_DIR>"
         ),
         RetryIneligibilityReason::OwnershipUnproven => format!(
             "retry blocked: process ownership for attempt {attempt} is unproven\n\nNo safe retry remedy is available for this run."
         ),
+        RetryIneligibilityReason::RunSuperseded => format!(
+            "cannot retry run: attempt {attempt} belongs to a superseded run\n\n{}",
+            superseded_rejection_message(rejection.successor())
+        ),
     }
+}
+
+/// The diagnostic message for a superseded run, naming its successor and the outcome
+/// `superseded` (REQ-CONTINUE-29, REQ-LOCALRUN-129).
+pub fn superseded_rejection_message(successor: Option<&str>) -> String {
+    let successor = successor.unwrap_or("its successor");
+    format!("The run was superseded by run {successor}; address the successor instead.")
 }
 
 const fn retry_rejection_message(reason: RetryIneligibilityReason) -> &'static str {
@@ -798,6 +1255,9 @@ const fn retry_rejection_message(reason: RetryIneligibilityReason) -> &'static s
         }
         RetryIneligibilityReason::OwnershipUnproven => {
             "The predecessor process groups cannot be proven safe to quiesce."
+        }
+        RetryIneligibilityReason::RunSuperseded => {
+            "The run was superseded; address its successor instead."
         }
     }
 }
@@ -1269,9 +1729,9 @@ impl PresentationDefinition {
                         success: StepSuccessPresentation::Command,
                         outputs: presentation_outputs(&command.common.outputs)?,
                     },
-                    ValidatedStep::Agent(agent) => PresentationStep {
+                    ValidatedStep::Agent(_) | ValidatedStep::Workflow(_) => PresentationStep {
                         success: StepSuccessPresentation::Agent,
-                        outputs: presentation_outputs(&agent.common.outputs)?,
+                        outputs: presentation_outputs(&step.common().outputs)?,
                     },
                 };
                 Ok((id.clone(), presentation))
@@ -1908,11 +2368,14 @@ where
             RunOutcome::Succeeded => "succeeded",
             RunOutcome::Failed { .. } => "failed",
             RunOutcome::Cancelled { .. } => "cancelled",
+            RunOutcome::Waiting { .. } => "waiting",
+            RunOutcome::Continued { .. } => "continued",
         };
         let role = match &run.outcome {
             RunOutcome::Succeeded => TokenRole::Success,
             RunOutcome::Failed { .. } => TokenRole::Failure,
-            RunOutcome::Cancelled { .. } => TokenRole::Blocked,
+            RunOutcome::Cancelled { .. } | RunOutcome::Waiting { .. } => TokenRole::Blocked,
+            RunOutcome::Continued { .. } => TokenRole::Active,
         };
         let mut outcome_line = match publication {
             PublicationPresentation::Published(terminal) => format!(
@@ -1979,6 +2442,38 @@ where
                     "{} {}\n",
                     self.styled_token("cancellation:", TokenRole::Blocked),
                     self.styled_text(cancellation_reason(*reason), TextTone::Secondary),
+                );
+                self.write_line_bytes(line.as_bytes())?;
+            }
+            RunOutcome::Waiting { wait } => {
+                let line = format!(
+                    "{} {}\n",
+                    self.styled_token("wait:", TokenRole::Blocked),
+                    self.styled_text(
+                        &format!(
+                            "{} · step {} · then {}",
+                            wait.kind_name(),
+                            visible_text(wait.step()),
+                            visible_text(wait.then()),
+                        ),
+                        TextTone::Secondary,
+                    ),
+                );
+                self.write_line_bytes(line.as_bytes())?;
+            }
+            RunOutcome::Continued { edge } => {
+                let line = format!(
+                    "{} {}\n",
+                    self.styled_token("edge:", TokenRole::Active),
+                    self.styled_text(
+                        &format!(
+                            "{}.{} · then {}",
+                            visible_text(&edge.step),
+                            visible_text(&edge.outcome),
+                            visible_text(&edge.target),
+                        ),
+                        TextTone::Secondary,
+                    ),
                 );
                 self.write_line_bytes(line.as_bytes())?;
             }
@@ -2235,6 +2730,7 @@ fn start_detail(step: &WorkflowPresentationStep) -> String {
                 format!("agent · {profile} · codex · {model} · effort={effort}")
             }
         },
+        WorkflowPresentationStep::Workflow { file, .. } => format!("workflow · {file}"),
     };
     visible_text(&detail)
 }
@@ -2243,6 +2739,7 @@ pub(crate) fn step_kind(step: &WorkflowPresentationStep) -> &'static str {
     match step {
         WorkflowPresentationStep::Command { .. } => "cmd",
         WorkflowPresentationStep::Agent { .. } => "agent",
+        WorkflowPresentationStep::Workflow { .. } => "workflow",
     }
 }
 

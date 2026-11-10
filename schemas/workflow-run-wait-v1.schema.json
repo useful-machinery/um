@@ -1,0 +1,83 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://docs.usefulmachinery.com/schemas/workflow-run-wait-v1.schema.json",
+  "title": "Useful Machinery Workflow Run Wait Record V1",
+  "description": "The wait.json record of a suspended run: what it waits for, since when, at which step, where it continues, and the rule whose matching event resumes it.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["kind", "since", "step", "then", "rule", "payload"],
+  "properties": {
+    "kind": { "$ref": "#/$defs/WaitKind" },
+    "since": { "type": "string", "format": "date-time" },
+    "step": {
+      "type": "array",
+      "description": "The position of the waiting step, with the one-based element of a forEach step.",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/PositionElement" }
+    },
+    "then": {
+      "$ref": "#/$defs/Identifier",
+      "description": "The step the run continues at once the wait resolves."
+    },
+    "onHandBack": {
+      "$ref": "#/$defs/Identifier",
+      "description": "For an approval, the step a hand-back continues at."
+    },
+    "rule": { "$ref": "#/$defs/WaitRule" },
+    "payload": {
+      "type": "object",
+      "description": "The kind's content."
+    }
+  },
+  "$defs": {
+    "Identifier": {
+      "type": "string",
+      "maxLength": 64,
+      "pattern": "^[a-z][A-Za-z0-9]*$"
+    },
+    "EventName": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*)+$"
+    },
+    "WaitKind": {
+      "enum": ["answer", "approval", "repair", "stop", "external", "children"]
+    },
+    "PositionElement": {
+      "oneOf": [
+        { "$ref": "#/$defs/Identifier" },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["item"],
+          "properties": {
+            "item": { "type": "integer", "minimum": 1 }
+          }
+        }
+      ]
+    },
+    "WaitRule": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source", "event"],
+      "properties": {
+        "source": {
+          "type": "string",
+          "minLength": 1,
+          "description": "The resolved source name: um for the derived kinds, a provider for an external wait."
+        },
+        "event": {
+          "oneOf": [
+            { "$ref": "#/$defs/EventName" },
+            {
+              "type": "array",
+              "minItems": 1,
+              "uniqueItems": true,
+              "items": { "$ref": "#/$defs/EventName" }
+            }
+          ]
+        },
+        "where": { "type": "string", "minLength": 1 }
+      }
+    }
+  }
+}

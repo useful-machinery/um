@@ -399,6 +399,16 @@ pub(super) fn inspector_fields<Step: StepProjection>(
             });
             direct_dependencies
         }
+        WorkflowPresentationStep::Workflow {
+            file,
+            direct_dependencies,
+            ..
+        } => {
+            push_inspector_field(&mut fields, maximum_fields, || {
+                InspectorField::new("workflow", file, Tone::Neutral)
+            });
+            direct_dependencies
+        }
     };
 
     let timing = inspector_timing(step);
@@ -562,6 +572,17 @@ pub(super) fn semantic_output_kind(output: &WorkflowOutput) -> &'static str {
         WorkflowOutput::JsonPath { .. } | WorkflowOutput::JsonAgentResult { .. } => "json",
         WorkflowOutput::FilePath { .. } => "file",
         WorkflowOutput::GitBranchWorkspace => "git_branch",
+        WorkflowOutput::ChildOutcome => "text",
+        WorkflowOutput::ChildExport { value_type } => {
+            use crate::workflow::validated::WorkflowValueType;
+            match value_type {
+                WorkflowValueType::Text => "text",
+                WorkflowValueType::Json => "json",
+                WorkflowValueType::File => "file",
+                WorkflowValueType::GitBranch => "git_branch",
+                WorkflowValueType::AttachmentCollection => "attachments",
+            }
+        }
     }
 }
 

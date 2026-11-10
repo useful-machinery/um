@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read};
@@ -8,6 +8,7 @@ use std::sync::Arc;
 use ring::digest::{Context, SHA256};
 use serde_json::Value;
 
+use super::admission::ResolvedJsonInput;
 use super::capacity::{CapacityCalculationFailure, WorkflowCapacity, resolve_workflow_capacity};
 use super::profile_replacement::{
     self, AgentProfileReplacementDocument, ResolvedAgentProfileReplacement,
@@ -15,11 +16,12 @@ use super::profile_replacement::{
 use super::result_validation::{JsonSchemaSupportFailure, RetainedJsonSchema};
 use super::schema_common::lowercase_hex;
 use super::validated::{
-    RequiredInputs, ValidatedMessageSource, ValidatedStep, ValidatedWorkflow, WorkflowNodeRole,
+    DeclaredInputs, ValidatedInputDefault, ValidatedMessageSource, ValidatedStep,
+    ValidatedWorkflow, WorkflowNodeRole,
 };
-use super::validation::{ValidationFailureKind, ValidationLocation};
+use super::validation::{ChildWorkflowSummary, ValidationFailureKind, ValidationLocation};
 use super::{DecodeFailureKind, decode, validation};
-use crate::workflow::document::Output;
+use crate::workflow::document::{NodeBody, Output, WorkflowDocument};
 
 const CONTENT_CLOSURE_DOMAIN: &[u8] = b"scherzo.workflow.content-closure.v1\0";
 pub(crate) const MAX_SOURCE_CLOSURE_BYTES: u64 = 64 * 1024 * 1024;
@@ -44,6 +46,8 @@ pub(crate) enum ResolutionFailureKind {
     InvalidInputSchemaDialect,
     InvalidInputSchemaReference,
     InvalidInputSchema,
+    InvalidInputDefaultJson,
+    InvalidInputDefault,
     InvalidResultSchemaEncoding,
     InvalidResultSchemaJson,
     InvalidResultSchemaDialect,
@@ -64,6 +68,7 @@ pub(crate) enum ResolutionLocation {
     MessageText { step: String, index: usize },
     MessageAttachment { step: String, index: usize },
     InputSchema { input: String },
+    InputDefault { input: String },
     ResultSchema { step: String, output: String },
     FinalizerSystemPrompt { finalizer: String },
     FinalizerMessageText { finalizer: String, index: usize },
@@ -80,6 +85,8 @@ pub struct ResolutionFailure {
     location: ResolutionLocation,
     workflow_path: Option<String>,
     source_path: Option<PathBuf>,
+    /// The child workflow's own failure behind `child_workflow_invalid`.
+    child: Option<Box<ResolutionFailure>>,
 }
 
 impl ResolutionFailure {
@@ -99,12 +106,18 @@ impl ResolutionFailure {
         self.source_path.as_deref()
     }
 
+    /// The failure of the child workflow a `child_workflow_invalid` step names.
+    pub(crate) fn child_failure(&self) -> Option<&ResolutionFailure> {
+        self.child.as_deref()
+    }
+
     fn new(kind: ResolutionFailureKind, location: ResolutionLocation) -> Self {
         Self {
             kind,
             location,
             workflow_path: None,
             source_path: None,
+            child: None,
         }
     }
 
@@ -160,8 +173,13 @@ pub struct WorkflowSourceProvenance {
 pub struct ResolvedWorkflow {
     pub definition: ValidatedWorkflow,
     pub(crate) source_closure: BTreeMap<String, Arc<[u8]>>,
+    /// The canonical paths this resolution read or found already read, a subset of
+    /// `source_closure`; a parent records a child's on the step that names it.
+    pub(crate) reached_paths: BTreeSet<String>,
     json_schemas: BTreeMap<(String, String), RetainedJsonSchema>,
     input_json_schemas: BTreeMap<String, RetainedJsonSchema>,
+    /// Each JSON input default, literal or file, parsed and checked at resolution.
+    json_input_defaults: BTreeMap<String, ResolvedJsonInput>,
     pub source: WorkflowSourceProvenance,
     pub content_digest: WorkflowContentDigest,
     pub capacity: WorkflowCapacity,
@@ -170,8 +188,23 @@ pub struct ResolvedWorkflow {
 }
 
 impl ResolvedWorkflow {
-    pub fn required_inputs(&self) -> &RequiredInputs {
-        &self.definition.required_inputs
+    /// The declared inputs a run must supply: neither optional nor defaulted
+    /// (REQ-WFFORMAT-31).
+    pub fn required_inputs(&self) -> DeclaredInputs {
+        self.definition
+            .declared_inputs
+            .iter()
+            .filter(|(name, _)| !self.definition.input_may_be_omitted(name))
+            .map(|(name, kind)| (name.clone(), *kind))
+            .collect()
+    }
+
+    pub(crate) fn declared_inputs(&self) -> &DeclaredInputs {
+        &self.definition.declared_inputs
+    }
+
+    pub(crate) fn json_input_default(&self, input: &str) -> Option<&ResolvedJsonInput> {
+        self.json_input_defaults.get(input)
     }
 
     pub fn source_bytes(&self, canonical_path: &str) -> Option<&[u8]> {
@@ -201,12 +234,11 @@ impl ResolvedWorkflow {
                     .values()
                     .map(|finalizer| &finalizer.body),
             )
+            // A `workflow` step derives only text and json outputs: a child's branch
+            // stays the child's.
             .any(|node| {
-                let outputs = match node {
-                    ValidatedStep::Command(node) => &node.common.outputs,
-                    ValidatedStep::Agent(node) => &node.common.outputs,
-                };
-                outputs
+                node.common()
+                    .outputs
                     .values()
                     .any(|output| matches!(output.definition, Output::GitBranchWorkspace))
             })
@@ -307,16 +339,31 @@ fn resolve_with_sources(
 }
 
 fn resolve_loaded_workflow(
-    mut sources: SourceResolver,
+    sources: SourceResolver,
     workflow_source: LoadedSource,
     replacement: Option<&AgentProfileReplacementDocument>,
 ) -> Result<ResolvedWorkflow, ResolutionFailure> {
-    let document = decode(&workflow_source.bytes).map_err(|failure| {
+    let document = decode_workflow(&workflow_source)?;
+    resolve_decoded_workflow(sources, workflow_source, document, replacement)
+}
+
+fn decode_workflow(workflow_source: &LoadedSource) -> Result<WorkflowDocument, ResolutionFailure> {
+    decode(&workflow_source.bytes).map_err(|failure| {
         ResolutionFailure::new(
             ResolutionFailureKind::InvalidWorkflowDocument(failure.kind()),
             ResolutionLocation::Workflow,
         )
-    })?;
+    })
+}
+
+fn resolve_decoded_workflow(
+    mut sources: SourceResolver,
+    workflow_source: LoadedSource,
+    document: WorkflowDocument,
+    replacement: Option<&AgentProfileReplacementDocument>,
+) -> Result<ResolvedWorkflow, ResolutionFailure> {
+    let (children, child_export_schemas) =
+        resolve_children(&document, &workflow_source.canonical_path, &mut sources)?;
     // Decoding the selected workflow types its declared profiles before the replacement
     // is decoded, so a defective definition is reported as such rather than as a
     // replacement failure.
@@ -330,11 +377,12 @@ fn resolve_loaded_workflow(
             })
         })
         .transpose()?;
-    let mut definition = validation::validate_with_replacement(
+    let mut definition = validation::validate_with_children(
         document,
         decoded_replacement
             .as_ref()
             .map(|replacement| &replacement.profiles),
+        &children,
     )
     .map_err(|failure| {
         ResolutionFailure::new(
@@ -357,10 +405,17 @@ fn resolve_loaded_workflow(
             ResolutionLocation::Workflow,
         ));
     };
-    let resolved_schemas =
+    let mut resolved_schemas =
         resolve_static_sources(&mut definition, workflow_directory, &mut sources)?;
+    resolved_schemas
+        .outputs
+        .extend(workflow_step_export_schemas(
+            &definition,
+            &child_export_schemas,
+        ));
 
     let source_root = sources.canonical_root.clone();
+    let reached_paths = std::mem::take(&mut sources.reached);
     let source_closure = sources.finish();
     let content_digest = digest_source_closure(&source_closure)?;
     let source_closure_bytes = source_closure
@@ -391,8 +446,10 @@ fn resolve_loaded_workflow(
     Ok(ResolvedWorkflow {
         definition,
         source_closure,
+        reached_paths,
         json_schemas: resolved_schemas.outputs,
         input_json_schemas: resolved_schemas.inputs,
+        json_input_defaults: resolved_schemas.input_defaults,
         source: WorkflowSourceProvenance {
             source_root,
             workflow_path: workflow_source.canonical_path,
@@ -401,6 +458,130 @@ fn resolve_loaded_workflow(
         capacity,
         agent_profile_replacement,
     })
+}
+
+/// The schema of each child's `json` export, by child workflow path and export name.
+type ChildExportSchemas = BTreeMap<String, BTreeMap<String, RetainedJsonSchema>>;
+
+/// Resolve each child workflow file a `workflow` step names (REQ-WFFORMAT-89): check its
+/// path, read it through the same sources, resolve it as its own workflow, fold its closure
+/// into the parent's so the parent's digest covers it, and summarize it for validation. A
+/// child that itself declares a `workflow` step is summarized as nested without resolving
+/// it, so resolution never recurses past one level. The schemas of a resolved child's
+/// `json` exports are kept for the `workflow` steps that run it.
+fn resolve_children(
+    document: &WorkflowDocument,
+    workflow_path: &str,
+    sources: &mut SourceResolver,
+) -> Result<(BTreeMap<String, ChildWorkflowSummary>, ChildExportSchemas), ResolutionFailure> {
+    let mut children = BTreeMap::new();
+    let mut export_schemas = ChildExportSchemas::new();
+    for step in &document.step_order {
+        let NodeBody::Workflow(node) = &document.steps[step].body else {
+            continue;
+        };
+        if children.contains_key(&node.workflow) {
+            continue;
+        }
+        let location =
+            ResolutionLocation::Semantic(ValidationLocation::StepWorkflow { step: step.clone() });
+        let failure = |kind| {
+            ResolutionFailure::new(
+                ResolutionFailureKind::InvalidWorkflowDefinition(kind),
+                location.clone(),
+            )
+        };
+        if !is_child_workflow_path(&node.workflow, workflow_path) {
+            return Err(failure(ValidationFailureKind::ChildWorkflowNotInTree));
+        }
+        let candidate = sources.canonical_root.join(&node.workflow);
+        let loaded = sources
+            .load(&candidate, location.clone())
+            .map_err(|cause| match cause.kind {
+                ResolutionFailureKind::DigestInputTooLarge
+                | ResolutionFailureKind::SourceChangedDuringResolution => cause,
+                // A link or path that leaves the root names no file of the tree.
+                ResolutionFailureKind::SymbolicLinkEscape
+                | ResolutionFailureKind::LexicalSourceEscape => {
+                    failure(ValidationFailureKind::ChildWorkflowNotInTree)
+                }
+                _ => {
+                    let unavailable = failure(ValidationFailureKind::ChildWorkflowUnavailable);
+                    match cause.source_path {
+                        Some(path) => unavailable.with_source_path(path),
+                        None => unavailable,
+                    }
+                }
+            })?;
+        let child_path = loaded.canonical_path.clone();
+        let invalid = |cause: ResolutionFailure| ResolutionFailure {
+            child: Some(Box::new(cause.with_workflow_path(child_path.clone()))),
+            ..failure(ValidationFailureKind::ChildWorkflowInvalid)
+        };
+        let child_document = decode_workflow(&loaded).map_err(invalid)?;
+        let nested = child_document
+            .steps
+            .values()
+            .any(|step| matches!(step.body, NodeBody::Workflow(_)));
+        let summary = if nested {
+            ChildWorkflowSummary::nested()
+        } else {
+            let child = resolve_decoded_workflow(sources.fork(), loaded, child_document, None)
+                .map_err(invalid)?;
+            sources.fold(&child.source_closure, &location)?;
+            export_schemas.insert(
+                node.workflow.clone(),
+                child
+                    .definition
+                    .exports
+                    .iter()
+                    .filter_map(|(export, source)| {
+                        child
+                            .json_schema(&source.node.id, &source.output)
+                            .map(|schema| (export.clone(), schema.clone()))
+                    })
+                    .collect(),
+            );
+            // The child's own file was read by this resolver before the fork.
+            let mut paths = child.reached_paths;
+            paths.insert(child_path);
+            ChildWorkflowSummary::of(&child.definition, paths)
+        };
+        children.insert(node.workflow.clone(), summary);
+    }
+    Ok((children, export_schemas))
+}
+
+/// A `workflow` step's `json` output carries the schema of the child export it derives from,
+/// so a value it committed can be reloaded and checked when a continuation inherits it.
+fn workflow_step_export_schemas(
+    definition: &ValidatedWorkflow,
+    child_export_schemas: &ChildExportSchemas,
+) -> Vec<((String, String), RetainedJsonSchema)> {
+    let steps = definition.steps.iter().chain(
+        definition
+            .finalizers
+            .iter()
+            .map(|(name, finalizer)| (name, &finalizer.body)),
+    );
+    steps
+        .filter_map(|(name, step)| match step {
+            ValidatedStep::Workflow(workflow) => Some((name, workflow)),
+            ValidatedStep::Command(_) | ValidatedStep::Agent(_) => None,
+        })
+        .flat_map(|(name, workflow)| {
+            child_export_schemas
+                .get(&workflow.workflow)
+                .into_iter()
+                .flatten()
+                .map(|(export, schema)| ((name.clone(), export.clone()), schema.clone()))
+        })
+        .collect()
+}
+
+/// A child is a workflow file beside the root (REQ-WFDEF-8) other than the file naming it.
+fn is_child_workflow_path(path: &str, workflow_path: &str) -> bool {
+    super::tree::is_workflow_file_beside_root(path) && path != workflow_path
 }
 
 struct LoadedSource {
@@ -413,6 +594,8 @@ struct SourceResolver {
     canonical_root: PathBuf,
     supplied_root: PathBuf,
     closure: BTreeMap<String, Arc<[u8]>>,
+    /// The canonical paths `load` returned or `fold` added, for this resolution alone.
+    reached: BTreeSet<String>,
     retained_bytes: u64,
     retained_only: bool,
 }
@@ -454,6 +637,7 @@ impl SourceResolver {
             canonical_root,
             supplied_root,
             closure: BTreeMap::new(),
+            reached: BTreeSet::new(),
             retained_bytes: 0,
             retained_only: false,
         })
@@ -484,6 +668,7 @@ impl SourceResolver {
             supplied_root: canonical_root.clone(),
             canonical_root,
             closure,
+            reached: BTreeSet::new(),
             retained_bytes,
             retained_only: true,
         })
@@ -502,10 +687,13 @@ impl SourceResolver {
         let location = ResolutionLocation::Workflow;
         let supplied_workflow = workflow_file.to_owned();
         let canonical_workflow = fs::canonicalize(&supplied_workflow).map_err(|_| {
+            // The remedy names the missing file as `load` names a missing static
+            // source: under the canonical root, so a root reached through a
+            // symbolic link is named by its target rather than as it was spelled.
+            let resolved_workflow = self.path_from_root(&supplied_workflow);
             ResolutionFailure::new(ResolutionFailureKind::SourceUnavailable, location.clone())
                 .with_source_path(
-                    lexical_normalize(&supplied_workflow)
-                        .unwrap_or_else(|| supplied_workflow.clone()),
+                    lexical_normalize(&resolved_workflow).unwrap_or(resolved_workflow),
                 )
         })?;
         if canonical_workflow.starts_with(&self.canonical_root) {
@@ -553,6 +741,7 @@ impl SourceResolver {
                 ResolutionFailure::new(ResolutionFailureKind::SourceUnavailable, location)
                     .with_source_path(canonical_host_path.clone())
             })?;
+            self.reached.insert(canonical_path.clone());
             return Ok(LoadedSource {
                 canonical_host_path,
                 canonical_path,
@@ -618,6 +807,7 @@ impl SourceResolver {
                 )
             })?;
         if let Some(bytes) = self.closure.get(&canonical_path) {
+            self.reached.insert(canonical_path.clone());
             return Ok(LoadedSource {
                 canonical_host_path,
                 canonical_path,
@@ -648,6 +838,7 @@ impl SourceResolver {
         let bytes = Arc::<[u8]>::from(bytes);
         self.closure
             .insert(canonical_path.clone(), Arc::clone(&bytes));
+        self.reached.insert(canonical_path.clone());
         Ok(LoadedSource {
             canonical_host_path,
             canonical_path,
@@ -658,10 +849,44 @@ impl SourceResolver {
     fn finish(self) -> BTreeMap<String, Arc<[u8]>> {
         self.closure
     }
+
+    /// A resolver over the same root and the closure read so far, for a child workflow.
+    fn fork(&self) -> Self {
+        Self {
+            canonical_root: self.canonical_root.clone(),
+            supplied_root: self.supplied_root.clone(),
+            closure: self.closure.clone(),
+            reached: BTreeSet::new(),
+            retained_bytes: self.retained_bytes,
+            retained_only: self.retained_only,
+        }
+    }
+
+    /// Add a child's closure to this one; a path both read holds the same bytes.
+    fn fold(
+        &mut self,
+        closure: &BTreeMap<String, Arc<[u8]>>,
+        location: &ResolutionLocation,
+    ) -> Result<(), ResolutionFailure> {
+        for (path, bytes) in closure {
+            self.reached.insert(path.clone());
+            if self.closure.contains_key(path) {
+                continue;
+            }
+            self.retained_bytes = u64::try_from(bytes.len())
+                .ok()
+                .and_then(|length| self.retained_bytes.checked_add(length))
+                .filter(|total| *total <= MAX_SOURCE_CLOSURE_BYTES)
+                .ok_or_else(|| source_closure_too_large(location.clone()))?;
+            self.closure.insert(path.clone(), Arc::clone(bytes));
+        }
+        Ok(())
+    }
 }
 
 struct ResolvedJsonSchemas {
     inputs: BTreeMap<String, RetainedJsonSchema>,
+    input_defaults: BTreeMap<String, ResolvedJsonInput>,
     outputs: BTreeMap<(String, String), RetainedJsonSchema>,
 }
 
@@ -677,6 +902,7 @@ fn resolve_static_sources(
         recoveries,
         finalizers,
         input_json_schema_paths,
+        input_defaults,
         ..
     } = definition;
     for (input, schema) in input_json_schema_paths {
@@ -687,6 +913,50 @@ fn resolve_static_sources(
             resolve_json_schema(schema, workflow_directory, sources, location)?;
         *schema = canonical_path;
         input_json_schemas.insert(input.clone(), retained);
+    }
+    let mut json_input_defaults = BTreeMap::new();
+    for (input, default) in input_defaults {
+        let location = ResolutionLocation::InputDefault {
+            input: input.clone(),
+        };
+        let value = match default {
+            ValidatedInputDefault::Text(_) => continue,
+            ValidatedInputDefault::JsonLiteral(value) => {
+                let source = serde_json::to_vec(value).map_err(|_| {
+                    ResolutionFailure::new(
+                        ResolutionFailureKind::InvalidInputDefault,
+                        location.clone(),
+                    )
+                })?;
+                ResolvedJsonInput::from_source(Arc::from(source)).map_err(|_| {
+                    ResolutionFailure::new(
+                        ResolutionFailureKind::InvalidInputDefault,
+                        location.clone(),
+                    )
+                })?
+            }
+            ValidatedInputDefault::JsonFile(path) => {
+                let loaded =
+                    load_static_source(path, workflow_directory, sources, location.clone())?;
+                *path = loaded.canonical_path;
+                ResolvedJsonInput::from_source(loaded.bytes).map_err(|_| {
+                    ResolutionFailure::new(
+                        ResolutionFailureKind::InvalidInputDefaultJson,
+                        location.clone(),
+                    )
+                })?
+            }
+        };
+        if input_json_schemas
+            .get(input)
+            .is_some_and(|schema: &RetainedJsonSchema| !schema.is_valid(value.value()))
+        {
+            return Err(ResolutionFailure::new(
+                ResolutionFailureKind::InvalidInputDefault,
+                location,
+            ));
+        }
+        json_input_defaults.insert(input.clone(), value);
     }
     for (node_name, step) in steps {
         if let Some(super::validated::ValidatedStepRecovery {
@@ -724,6 +994,7 @@ fn resolve_static_sources(
     }
     Ok(ResolvedJsonSchemas {
         inputs: input_json_schemas,
+        input_defaults: json_input_defaults,
         outputs: json_schemas,
     })
 }
@@ -770,17 +1041,15 @@ fn resolve_node_static_sources(
         )?;
     }
 
-    let outputs = match node {
-        ValidatedStep::Command(node) => &mut node.common.outputs,
-        ValidatedStep::Agent(node) => &mut node.common.outputs,
-    };
-    for (output_name, output) in outputs {
+    for (output_name, output) in &mut node.common_mut().outputs {
         let schema = match &mut output.definition {
             Output::JsonPath { schema, .. } | Output::JsonAgentResult { schema } => schema,
             Output::TextPath { .. }
             | Output::TextAgentResponse
             | Output::FilePath { .. }
-            | Output::GitBranchWorkspace => continue,
+            | Output::GitBranchWorkspace
+            | Output::ChildExport { .. }
+            | Output::ChildOutcome => continue,
         };
         let location = match role {
             WorkflowNodeRole::Step => ResolutionLocation::ResultSchema {

@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://docs.usefulmachinery.com/schemas/agent-profile-replacement-v1.schema.json",
   "title": "Useful Machinery agent profile replacement version 1",
-  "description": "Structural contract for the closed document supplied through `um workflow run --agent-profiles`. Each key names an agent profile declared by the selected workflow; its value replaces that declaration as a whole.",
+  "description": "Structural contract for the closed document supplied through `um workflow run create --agent-profiles`. Each key names an agent profile declared by the selected workflow; its value replaces that declaration as a whole.",
   "type": "object",
   "additionalProperties": false,
   "required": ["schemaVersion", "agentProfiles"],

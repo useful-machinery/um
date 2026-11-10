@@ -22,13 +22,14 @@ use super::claude_code_installation::{
 };
 use super::codex_installation::CodexFixture;
 use super::pi_installation::{COMPLETE_HELP, PiFixture, quote};
+use super::workflow_definition::{read_json, schema};
 use super::workflow_status::status_schema;
 use super::workflow_view::workflow_view_schema;
 use super::{
     CREDENTIALS_FILE_VARIABLE, DEPLOYMENT_VARIABLES, RUNNER_TELEMETRY_VARIABLES, poll_until,
 };
 
-const WORKFLOW_PATH: &str = "workflow.yaml";
+const WORKFLOW_PATH: &str = "main.yaml";
 const OVERSIZED_AGENT_MESSAGE_BYTES: usize = 512 * 1024;
 const OVERSIZED_AGENT_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 const OVERSIZED_AGENT_SYSTEM_PROMPT_BYTES: usize = 256 * 1024;
@@ -37,6 +38,17 @@ const CODEX_THREAD_ID: &str = "018f7f1e-7b5a-7d13-8f19-2b6a4c8d0e12";
 const CODEX_TURN_ID: &str = "turn-fixture";
 const CODEX_CORRECTION_TURN_ID: &str = "turn-correction";
 const CODEX_PROVIDER: &str = "fixture-provider";
+
+/// The run record `run.json` of `run_directory`, checked against its published schema
+/// (REQ-LOCALRUN-175, REQ-WFDEF-4).
+pub(super) fn run_record(run_directory: &Path) -> serde_json::Value {
+    let record = read_json(&run_directory.join("run.json"));
+    assert!(
+        schema("workflow-run-v1.schema.json").is_valid(&record),
+        "{record}"
+    );
+    record
+}
 
 /// Validates the `--json` document of run, retry and continue. The view schema is
 /// registered under its `$id` so the run schema's `$ref` resolves without retrieval.
@@ -272,23 +284,116 @@ impl RunBundle {
         &self.claude_config
     }
 
+    /// `um workflow run create --path` over the source root. `--workflow=FILE` is the last
+    /// argument and a single one, so a caller may insert options before it.
     pub(super) fn args(&self, result: &Path) -> Vec<String> {
         vec![
             "workflow".to_owned(),
             "run".to_owned(),
-            "--source-root".to_owned(),
+            "create".to_owned(),
+            "--path".to_owned(),
             self.source_root.to_string_lossy().into_owned(),
             "--execution-root".to_owned(),
             self.execution_root.to_string_lossy().into_owned(),
             "--run-dir".to_owned(),
             result.to_string_lossy().into_owned(),
-            self.source_root
-                .join(WORKFLOW_PATH)
-                .to_string_lossy()
-                .into_owned(),
+            format!("--workflow={WORKFLOW_PATH}"),
         ]
     }
 }
+
+/// A source root that is a workflow tree: `workflow.yaml` sits directly under it
+/// (REQ-LOCALRUN-169). Dropping it restores write permission on the read-only run copies
+/// so the temporary directory can be removed.
+pub(super) struct TreeBundle {
+    temporary: TempDir,
+    source_root: PathBuf,
+    execution_root: PathBuf,
+}
+
+impl TreeBundle {
+    pub(super) fn new(root_workflow: &str) -> Self {
+        let temporary = tempfile::tempdir().unwrap();
+        let source_root = temporary.path().join("tree");
+        let execution_root = temporary.path().join("execution");
+        for directory in [&source_root, &execution_root] {
+            fs::create_dir(directory).unwrap();
+        }
+        fs::write(source_root.join("workflow.yaml"), root_workflow).unwrap();
+        Self {
+            temporary,
+            source_root,
+            execution_root,
+        }
+    }
+
+    pub(super) fn write_program(&self, path: &str, script: &str) {
+        let destination = self.source_root.join(path);
+        fs::create_dir_all(destination.parent().unwrap()).unwrap();
+        fs::write(&destination, script).unwrap();
+        fs::set_permissions(&destination, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    pub(super) fn write_source(&self, path: &str, bytes: &str) {
+        let destination = self.source_root.join(path);
+        fs::create_dir_all(destination.parent().unwrap()).unwrap();
+        fs::write(destination, bytes).unwrap();
+    }
+
+    pub(super) fn result(&self, name: &str) -> PathBuf {
+        self.temporary.path().join("results").join(name)
+    }
+
+    pub(super) fn execution_root(&self) -> &Path {
+        &self.execution_root
+    }
+
+    pub(super) fn source_root(&self) -> &Path {
+        &self.source_root
+    }
+
+    pub(super) fn args(&self, result: &Path) -> Vec<String> {
+        self.args_for(result, "workflow.yaml")
+    }
+
+    /// As `RunBundle::args`, with `--json`.
+    pub(super) fn args_for(&self, result: &Path, workflow: &str) -> Vec<String> {
+        vec![
+            "workflow".to_owned(),
+            "run".to_owned(),
+            "create".to_owned(),
+            "--path".to_owned(),
+            self.source_root.to_string_lossy().into_owned(),
+            "--execution-root".to_owned(),
+            self.execution_root.to_string_lossy().into_owned(),
+            "--run-dir".to_owned(),
+            result.to_string_lossy().into_owned(),
+            "--json".to_owned(),
+            format!("--workflow={workflow}"),
+        ]
+    }
+}
+
+impl Drop for TreeBundle {
+    fn drop(&mut self) {
+        fn writable(path: &Path) {
+            let Ok(metadata) = fs::symlink_metadata(path) else {
+                return;
+            };
+            if metadata.is_dir() {
+                let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o700));
+                for entry in fs::read_dir(path).into_iter().flatten().flatten() {
+                    writable(&entry.path());
+                }
+            }
+        }
+        writable(self.temporary.path());
+    }
+}
+
+/// The operator's Linear key and endpoint never reach a test's `um`: a mirrored run
+/// writes to Linear only through a stub the test points it at (REQ-LOCALRUN-192).
+const MIRROR_VARIABLES: [&str; 2] = ["LINEAR_API_KEY", "UM_LINEAR_API_URL"];
 
 pub(super) fn isolated_command(args: &[String]) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_um"));
@@ -302,6 +407,7 @@ pub(super) fn isolated_command(args: &[String]) -> Command {
     for variable in DEPLOYMENT_VARIABLES
         .into_iter()
         .chain(RUNNER_TELEMETRY_VARIABLES)
+        .chain(MIRROR_VARIABLES)
     {
         command.env_remove(variable);
     }
@@ -1002,6 +1108,7 @@ fn conditional_skips_persist_for_steps_and_finalizers() {
 
     let status = run(&[
         "workflow".to_owned(),
+        "run".to_owned(),
         "status".to_owned(),
         destination.to_string_lossy().into_owned(),
         "--json".to_owned(),
@@ -1182,6 +1289,7 @@ steps:
     ] {
         let inspected = run(&[
             "workflow".to_owned(),
+            "run".to_owned(),
             command.to_owned(),
             destination.to_string_lossy().into_owned(),
             "--json".to_owned(),
@@ -1367,6 +1475,7 @@ steps:
 
     let status = isolated_command(&[
         "workflow".to_owned(),
+        "run".to_owned(),
         "status".to_owned(),
         destination.to_string_lossy().into_owned(),
         "--json".to_owned(),
@@ -1463,6 +1572,7 @@ fn finalization_runs_after_ordinary_failure_and_is_durable_before_publication() 
     );
     let status = isolated_command(&[
         "workflow".to_owned(),
+        "run".to_owned(),
         "status".to_owned(),
         destination.to_string_lossy().into_owned(),
         "--json".to_owned(),
@@ -1572,6 +1682,7 @@ fn settled_failed_run_is_published_with_recovery_finalization_and_truthful_expor
 
     let status = isolated_command(&[
         "workflow".to_owned(),
+        "run".to_owned(),
         "status".to_owned(),
         destination.to_string_lossy().into_owned(),
         "--json".to_owned(),
@@ -1589,6 +1700,7 @@ fn settled_failed_run_is_published_with_recovery_finalization_and_truthful_expor
 
     let view = isolated_command(&[
         "workflow".to_owned(),
+        "run".to_owned(),
         "view".to_owned(),
         destination.to_string_lossy().into_owned(),
         "--json".to_owned(),
@@ -1694,6 +1806,7 @@ exports:
 
     let view = isolated_command(&[
         "workflow".to_owned(),
+        "run".to_owned(),
         "view".to_owned(),
         destination.to_string_lossy().into_owned(),
         "--json".to_owned(),
@@ -1730,22 +1843,25 @@ fn existing_run_directory_diagnostic_names_requested_path() {
     );
 }
 
-// REQ-LOCALRUN-76, REQ-LOCALRUN-77
+// REQ-LOCALRUN-76, REQ-LOCALRUN-77: `--path` and `--run-dir` resolve from the initial working
+// directory; `--workflow` is relative to the `--path` directory.
 #[test]
-fn workflow_file_and_run_directory_resolve_from_the_initial_working_directory() {
+fn path_and_run_directory_resolve_from_the_initial_working_directory() {
     let bundle = RunBundle::new(
         "schemaVersion: 1\nsteps:\n  complete:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n",
     );
     let args = [
         "workflow",
         "run",
-        "--source-root",
+        "create",
+        "--path",
         "source",
         "--execution-root",
         "execution",
         "--run-dir",
         "results/completable",
-        "source/workflow.yaml",
+        "--workflow",
+        "main.yaml",
         "--json",
     ];
     let output = isolated_command(&args.map(str::to_owned))
@@ -1983,6 +2099,7 @@ exports:
     );
     let archived = run(&[
         "workflow".to_owned(),
+        "run".to_owned(),
         "view".to_owned(),
         destination.to_string_lossy().into_owned(),
         "--json".to_owned(),
@@ -2326,6 +2443,7 @@ fn claude_code_only_run_pins_the_validated_executable_without_pi_or_path_fallbac
     fs::remove_file(diagnostic.join("session/transcript.jsonl")).unwrap();
     let status = isolated_command(&[
         "workflow".to_owned(),
+        "run".to_owned(),
         "status".to_owned(),
         destination.to_string_lossy().into_owned(),
         "--json".to_owned(),
@@ -2401,6 +2519,7 @@ fn local_claude_execution_rejects_a_version_that_contradicts_the_validated_snaps
     );
     let view = isolated_command(&[
         "workflow".to_owned(),
+        "run".to_owned(),
         "view".to_owned(),
         destination.to_string_lossy().into_owned(),
         "--json".to_owned(),
@@ -2609,6 +2728,7 @@ fn codex_only_response_and_no_value_use_the_selected_production_dispatcher() {
         if scenario == "response" {
             let status = isolated_command(&[
                 "workflow".to_owned(),
+                "run".to_owned(),
                 "status".to_owned(),
                 destination.to_string_lossy().into_owned(),
                 "--json".to_owned(),
@@ -2945,6 +3065,7 @@ exports:
 
     let retry = isolated_command(&[
         "workflow".to_owned(),
+        "run".to_owned(),
         "retry".to_owned(),
         run_directory.to_string_lossy().into_owned(),
         "--execution-root".to_owned(),
@@ -2962,7 +3083,7 @@ exports:
         String::from_utf8_lossy(&retry.stderr)
     );
     let terminal: serde_json::Value = serde_json::from_slice(&retry.stdout).unwrap();
-    assert_eq!(terminal["command"], "um workflow retry");
+    assert_eq!(terminal["command"], "um workflow run retry");
     assert_eq!(terminal["outcome"], "succeeded");
     assert_eq!(terminal["attemptNumber"], 2);
     assert_eq!(
@@ -3247,6 +3368,7 @@ fn interrupted_agent_can_be_abandoned_and_retried_without_an_active_ledger_entry
     );
     let retry = isolated_command(&[
         "workflow".to_owned(),
+        "run".to_owned(),
         "retry".to_owned(),
         destination.to_string_lossy().into_owned(),
         "--execution-root".to_owned(),
@@ -3381,7 +3503,7 @@ fn compatible_path_pi_is_validated_once_and_pinned_after_path_order_changes() {
     let metadata: serde_json::Value =
         serde_json::from_slice(&fs::read(diagnostic.join("metadata.json")).unwrap()).unwrap();
     let run: serde_json::Value =
-        serde_json::from_slice(&fs::read(destination.join("run.json")).unwrap()).unwrap();
+        serde_json::from_slice(&fs::read(destination.join("local-run.json")).unwrap()).unwrap();
     assert_eq!(metadata["localRunId"], run["localRunId"]);
     assert_eq!(metadata["attemptNumber"], 1);
     assert_eq!(metadata["stepId"], "answer");
@@ -3949,7 +4071,7 @@ fn json_run_executes_named_inputs_closed_stdin_publication_and_offline_boundarie
     let terminal: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert!(workflow_run_schema().is_valid(&terminal), "{terminal}");
     assert_eq!(terminal["schemaVersion"], 1);
-    assert_eq!(terminal["command"], "um workflow run");
+    assert_eq!(terminal["command"], "um workflow run create");
     assert_eq!(terminal["outcome"], "succeeded");
     assert_eq!(terminal["exitStatus"], 0);
     let normalized_run = normalized_run_directory(&destination);
@@ -3964,7 +4086,7 @@ fn json_run_executes_named_inputs_closed_stdin_publication_and_offline_boundarie
     assert_eq!(terminal["result"], result_json(&destination));
     assert_eq!(terminal["result"]["execution"]["maximumParallelSteps"], 2);
     let run_document: serde_json::Value =
-        serde_json::from_slice(&fs::read(destination.join("run.json")).unwrap()).unwrap();
+        serde_json::from_slice(&fs::read(destination.join("local-run.json")).unwrap()).unwrap();
     assert_eq!(
         run_document
             .as_object()
@@ -4178,6 +4300,7 @@ fn tui_releases_ownership_and_restores_before_summary_handoff() {
 
     let status_args = vec![
         "workflow".to_owned(),
+        "run".to_owned(),
         "status".to_owned(),
         destination.to_string_lossy().into_owned(),
         "--json".to_owned(),
@@ -4450,6 +4573,7 @@ fn failure_rejection_usage_and_result_preconditions_keep_their_outcome_precedenc
     let usage = run(&[
         "workflow".to_owned(),
         "run".to_owned(),
+        "create".to_owned(),
         "--plain".to_owned(),
         "--json".to_owned(),
     ]);
@@ -4876,7 +5000,7 @@ fn run_directory_may_have_a_nonexistent_parent_suffix() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(destination.join("run.json").is_file());
+    assert!(destination.join("local-run.json").is_file());
 }
 
 // REQ-LOCALRUN-4, REQ-LOCALRUN-100
@@ -5380,6 +5504,7 @@ fn abrupt_owner_loss_terminates_reaps_and_exposes_an_abandoned_attempt() {
     ));
     let status = isolated_command(&[
         "workflow".to_owned(),
+        "run".to_owned(),
         "status".to_owned(),
         destination.to_string_lossy().into_owned(),
         "--json".to_owned(),
@@ -5723,6 +5848,23 @@ pub(super) fn finalizer_signal_bundle() -> RunBundle {
     let argv = fixture_argv();
     RunBundle::new(&format!(
         "schemaVersion: 1\nsteps:\n  complete:\n    kind: cmd\n    command:\n      argv: [\"true\"]\nfinalizers:\n  active:\n    kind: cmd\n    command:\n      argv: {argv}\n"
+    ))
+}
+
+/// `finalizer_signal_bundle` as a tree, so the run holds a run record. A tree's command
+/// names its program without a path, so `sh` execs the fixture.
+pub(super) fn tree_finalizer_signal_bundle() -> TreeBundle {
+    let fixture: Vec<String> = serde_json::from_str(&fixture_argv()).unwrap();
+    let argv = serde_json::to_string(
+        &["sh", "-c", "exec \"$0\" \"$@\""]
+            .map(str::to_owned)
+            .into_iter()
+            .chain(fixture)
+            .collect::<Vec<_>>(),
+    )
+    .unwrap();
+    TreeBundle::new(&format!(
+        "schemaVersion: 1\nenvironmentPassthrough: [WORKFLOW_RUN_FIXTURE_SOCKET, WORKFLOW_RUN_FIXTURE_MODE]\nsteps:\n  complete:\n    kind: cmd\n    command:\n      argv: [\"true\"]\nfinalizers:\n  active:\n    kind: cmd\n    command:\n      argv: {argv}\n"
     ))
 }
 
@@ -6175,6 +6317,7 @@ fn agent_profile_replacement_pins_the_replacement_harness_and_records_provenance
 
     let view = isolated_command(&[
         "workflow".to_owned(),
+        "run".to_owned(),
         "view".to_owned(),
         destination.to_string_lossy().into_owned(),
         "--json".to_owned(),
@@ -6413,4 +6556,1049 @@ fn agent_profile_document_is_read_from_the_initial_directory_and_bounded() {
             "{document}"
         );
     }
+}
+
+// REQ-WFFORMAT-84, REQ-LOCALRUN-91
+#[test]
+fn omitted_optional_and_defaulted_inputs_reach_steps_completed() {
+    let bundle = RunBundle::new(
+        r#"schemaVersion: 1
+inputs:
+  ticket: {kind: text}
+  baseBranch: {kind: text, default: main}
+  policy: {kind: json, default: policy/engineering.json}
+  branch: {kind: text, optional: true}
+  answers: {kind: json, optional: true, schema: answers.schema.json}
+steps:
+  observe:
+    kind: cmd
+    inputs:
+      ticket: {ref: inputs.ticket}
+      base: {ref: inputs.baseBranch}
+      policy: {ref: inputs.policy}
+      branch: {ref: inputs.branch}
+      answers: {ref: inputs.answers}
+    command:
+      argv: ["sh", "-c", "set -eu; for name in ticket base policy branch answers; do cat \"$UM_STEP_INPUTS/values/$name\" > \"observed-$name\"; done"]
+"#,
+    );
+    bundle.write_source("policy/engineering.json", br#"{"reviewers":1}"#);
+    bundle.write_source(
+        "answers.schema.json",
+        r#"{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object"}"#,
+    );
+
+    let missing_destination = bundle.result("missing-ticket");
+    let mut args = bundle.args(&missing_destination);
+    args.insert(args.len() - 1, "--json".to_owned());
+    let output = run(&args);
+    assert_eq!(output.status.code(), Some(1));
+    let rejection: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(rejection["outcome"], "rejected");
+    assert_eq!(rejection["phase"], "admission");
+    assert_eq!(
+        rejection["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|diagnostic| (
+                diagnostic["code"].as_str().unwrap(),
+                diagnostic["location"]["input"].as_str().unwrap()
+            ))
+            .collect::<Vec<_>>(),
+        [("missing_required_input", "ticket")]
+    );
+    assert!(!missing_destination.exists());
+
+    let destination = bundle.result("completed");
+    let mut args = bundle.args(&destination);
+    args.splice(
+        args.len() - 1..args.len() - 1,
+        [
+            "--input-text".to_owned(),
+            "ticket".to_owned(),
+            "AUTO-199".to_owned(),
+            "--json".to_owned(),
+        ],
+    );
+    let output = run(&args);
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let observed = |name: &str| fs::read(bundle.execution_root().join(format!("observed-{name}")));
+    assert_eq!(observed("ticket").unwrap(), b"AUTO-199");
+    assert_eq!(observed("base").unwrap(), b"main");
+    assert_eq!(observed("policy").unwrap(), br#"{"reviewers":1}"#);
+    assert_eq!(observed("branch").unwrap(), b"");
+    assert_eq!(observed("answers").unwrap(), b"null");
+}
+
+const TREE_REPORT_WORKFLOW: &str = "schemaVersion: 1\nprograms: [bin]\nsteps:\n  report:\n    kind: cmd\n    command:\n      argv: [\"report\"]\n";
+
+const TREE_REPORT_PROGRAM: &str = "#!/bin/sh\nset -eu\nprintf '%s' \"$UM_WORKFLOW_ROOT\" > workflow-root\nprintf '%s' \"$(command -v report)\" > report-path\n";
+
+pub(super) fn tree_rejection(output: &Output) -> serde_json::Value {
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let rejection: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(workflow_run_schema().is_valid(&rejection), "{rejection}");
+    assert_eq!(rejection["outcome"], "rejected");
+    assert_eq!(rejection["exitStatus"], 1);
+    rejection
+}
+
+// REQ-LOCALRUN-169, REQ-LOCALRUN-170, REQ-WFEXEC-53, SC-LOCALRUN-8
+#[test]
+fn a_tree_run_executes_the_copys_programs_under_um_workflow_root() {
+    let bundle = TreeBundle::new(TREE_REPORT_WORKFLOW);
+    bundle.write_program("bin/report", TREE_REPORT_PROGRAM);
+    let destination = bundle.result("tree");
+
+    let output = isolated_command(&bundle.args(&destination))
+        .env("UM_WORKFLOW_ROOT", "/launching/value/never/reaches/a/step")
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let copy = normalized_run_directory(&destination).join("workflow/tree");
+    let observed = |name: &str| fs::read_to_string(bundle.execution_root().join(name)).unwrap();
+    assert_eq!(observed("workflow-root"), copy.to_str().unwrap());
+    assert_eq!(
+        observed("report-path"),
+        copy.join("bin/report").to_str().unwrap()
+    );
+    let mode = fs::metadata(copy.join("bin/report"))
+        .unwrap()
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o777, 0o555);
+}
+
+// REQ-WFEXEC-54, REQ-LOCALRUN-169, REQ-LOCALRUN-128
+#[test]
+fn a_path_argv_under_a_tree_root_is_rejected_at_phase_tree() {
+    let bundle = TreeBundle::new(
+        "schemaVersion: 1\nsteps:\n  work:\n    kind: cmd\n    command:\n      argv: [\"/bin/sh\", \"-c\", \"true\"]\n",
+    );
+    let destination = bundle.result("path-argv");
+
+    let rejection = tree_rejection(&run(&bundle.args(&destination)));
+
+    assert_eq!(rejection["command"], "um workflow run create");
+    assert_eq!(rejection["phase"], "tree");
+    assert_eq!(rejection["workflow"], serde_json::Value::Null);
+    let diagnostics = rejection["diagnostics"].as_array().unwrap();
+    let path = diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic["code"] == "command_program_is_path")
+        .unwrap_or_else(|| panic!("{rejection}"));
+    assert_eq!(path["location"]["path"], "workflow.yaml");
+    assert_eq!(path["location"]["step"], "work");
+    assert!(
+        path["message"]
+            .as_str()
+            .is_some_and(|text| !text.is_empty())
+    );
+    assert!(!destination.exists());
+}
+
+// REQ-LOCALRUN-169
+#[test]
+fn a_workflow_file_outside_the_trees_workflow_files_is_rejected() {
+    let bundle = TreeBundle::new(
+        "schemaVersion: 1\nsteps:\n  work:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n",
+    );
+    bundle.write_source(
+        "nested/other.yaml",
+        "schemaVersion: 1\nsteps:\n  other:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n",
+    );
+    let destination = bundle.result("nested");
+
+    let rejection = tree_rejection(&run(&bundle.args_for(&destination, "nested/other.yaml")));
+
+    assert_eq!(rejection["phase"], "tree");
+    assert_eq!(rejection["workflow"]["path"], "nested/other.yaml");
+    assert_eq!(rejection["diagnostics"][0]["code"], "workflow_not_in_tree");
+    assert!(!destination.exists());
+}
+
+// REQ-WFEXEC-55
+#[test]
+fn a_missing_required_tool_rejects_the_run() {
+    let bundle = TreeBundle::new(
+        "schemaVersion: 1\nrequires:\n  tools: [um-test-no-such-tool]\nsteps:\n  work:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n",
+    );
+    let destination = bundle.result("missing-tool");
+
+    let rejection = tree_rejection(&run(&bundle.args(&destination)));
+
+    assert_eq!(rejection["phase"], "admission");
+    assert_eq!(
+        rejection["diagnostics"][0]["code"],
+        "required_tool_unavailable"
+    );
+    assert_eq!(
+        rejection["diagnostics"][0]["location"],
+        serde_json::json!({"kind": "required_tool", "tool": "um-test-no-such-tool"})
+    );
+    assert!(!destination.exists());
+}
+
+const TREE_SUCCESS_WORKFLOW: &str =
+    "schemaVersion: 1\nsteps:\n  work:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n";
+
+/// `um workflow run create --path` over `root` with `--json` and `options`.
+pub(super) fn path_args(root: &Path, execution_root: &Path, options: &[&str]) -> Vec<String> {
+    let mut args = vec![
+        "workflow".to_owned(),
+        "run".to_owned(),
+        "create".to_owned(),
+        "--path".to_owned(),
+        root.to_string_lossy().into_owned(),
+        "--execution-root".to_owned(),
+        execution_root.to_string_lossy().into_owned(),
+        "--json".to_owned(),
+    ];
+    args.extend(options.iter().map(|option| (*option).to_owned()));
+    args
+}
+
+pub(super) fn succeeded(output: &Output) -> serde_json::Value {
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let terminal: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(workflow_run_schema().is_valid(&terminal), "{terminal}");
+    terminal
+}
+
+pub(super) fn assert_usage_error(args: &[String]) {
+    let output = run(args);
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "{args:?}: stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stdout.is_empty(), "{args:?}");
+}
+
+// REQ-LOCALRUN-172, REQ-LOCALRUN-80, REQ-LOCALRUN-181, REQ-LOCALRUN-188, REQ-LOCALRUN-189
+#[test]
+fn the_former_run_spellings_are_usage_errors_and_run_is_a_group() {
+    let bundle = RunBundle::new(TREE_SUCCESS_WORKFLOW);
+    let source = bundle.source_root().to_string_lossy().into_owned();
+    let execution = bundle.execution_root().to_string_lossy().into_owned();
+    let run_directory = bundle.result("former").to_string_lossy().into_owned();
+    let workflow_file = bundle
+        .source_root()
+        .join(WORKFLOW_PATH)
+        .to_string_lossy()
+        .into_owned();
+    for former in [
+        vec![
+            "workflow",
+            "run",
+            "--source-root",
+            &source,
+            "--execution-root",
+            &execution,
+            "--run-dir",
+            &run_directory,
+            &workflow_file,
+        ],
+        vec!["workflow", "continue", &run_directory, "--from", "x"],
+        vec![
+            "workflow",
+            "retry",
+            &run_directory,
+            "--execution-root",
+            &execution,
+        ],
+        vec!["workflow", "status", &run_directory],
+        vec!["workflow", "view", &run_directory],
+    ] {
+        assert_usage_error(&former.into_iter().map(str::to_owned).collect::<Vec<_>>());
+    }
+    assert!(!bundle.result("former").exists());
+
+    let group = run(&["workflow".to_owned(), "run".to_owned()]);
+    assert!(
+        group.status.success(),
+        "{}",
+        String::from_utf8_lossy(&group.stderr)
+    );
+    let help = String::from_utf8(group.stdout).unwrap();
+    // REQ-LOCALRUN-181: the control commands are leaves of the group.
+    let expected = [
+        "answer",
+        "approve",
+        "cancel",
+        "create",
+        "hand-back",
+        "lift",
+        "list",
+        "release",
+        "resume",
+        "retry",
+        "show",
+        "status",
+        "stop",
+        "view",
+        "withdraw",
+    ];
+    let leaves = help
+        .lines()
+        .filter_map(|line| line.split_whitespace().next())
+        .filter(|word| expected.contains(word))
+        .collect::<Vec<_>>();
+    assert_eq!(leaves, expected, "{help}");
+}
+
+// REQ-LOCALRUN-174, REQ-LOCALRUN-175
+#[test]
+fn a_path_run_of_a_tree_records_itself_in_run_json() {
+    let bundle = TreeBundle::new(TREE_SUCCESS_WORKFLOW);
+    let destination = bundle.result("recorded");
+    let run_directory = destination.to_string_lossy().into_owned();
+
+    let output = isolated_command(&path_args(
+        bundle.source_root(),
+        bundle.execution_root(),
+        &["--run-dir", &run_directory],
+    ))
+    .env("USER", "um-run-owner")
+    .output()
+    .unwrap();
+
+    let terminal = succeeded(&output);
+    assert_eq!(terminal["command"], "um workflow run create");
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(destination.join("workflow/manifest.json")).unwrap())
+            .unwrap();
+    let record = run_record(&destination);
+    assert!(record["id"].as_str().unwrap().starts_with("run_"));
+    assert_eq!(record["definition"], serde_json::Value::Null);
+    assert_eq!(record["revision"], serde_json::Value::Null);
+    assert_eq!(
+        record["tree"],
+        format!(
+            "{}:{}",
+            manifest["tree"]["digest"]["algorithm"].as_str().unwrap(),
+            manifest["tree"]["digest"]["value"].as_str().unwrap()
+        )
+    );
+    assert_eq!(record["workflow"], "workflow.yaml");
+    assert_eq!(record["owner"], "um-run-owner");
+    assert_eq!(record["state"], "exited");
+    assert_eq!(record["attempts"], 1);
+}
+
+const TREE_OUTCOME_WORKFLOW: &str = "schemaVersion: 1\nprograms: [bin]\noutcomes: [planned, blocked, failed]\noutcome:\n  from: outputs.decide.verdict\n  onFailure: failed\nsteps:\n  decide:\n    kind: cmd\n    command:\n      argv: [\"decide\"]\n    outputs:\n      verdict:\n        kind: text\n        from: path\n        path: verdict.txt\n";
+
+/// A `--json` path run of the declared-outcome tree whose `decide` step reports the
+/// execution root's `verdict-input`, written as `verdict` first; returns the bundle and the
+/// run directory with the command's output.
+fn run_outcome_tree(verdict: &str) -> (TreeBundle, PathBuf, Output) {
+    let bundle = TreeBundle::new(TREE_OUTCOME_WORKFLOW);
+    bundle.write_program(
+        "bin/decide",
+        "#!/bin/sh\nset -eu\ncat verdict-input > verdict.txt\n",
+    );
+    fs::write(bundle.execution_root().join("verdict-input"), verdict).unwrap();
+    let destination = bundle.result("outcome");
+    let run_directory = destination.to_string_lossy().into_owned();
+    let output = run(&path_args(
+        bundle.source_root(),
+        bundle.execution_root(),
+        &["--run-dir", &run_directory],
+    ));
+    (bundle, destination, output)
+}
+
+// REQ-WFEXEC-56, REQ-WFEXEC-12
+#[test]
+fn an_outcome_value_outside_the_declared_outcomes_fails_the_run() {
+    let (_bundle, _destination, output) = run_outcome_tree("shipped");
+
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let terminal: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(workflow_run_schema().is_valid(&terminal), "{terminal}");
+    let result = &terminal["result"];
+    assert_eq!(result["outcome"], "failed");
+    assert_eq!(result["primaryIssue"]["node"]["id"], "decide");
+    let expected = serde_json::json!({
+        "phase": "output_capture",
+        "code": "outcome_undeclared",
+        "output": "verdict",
+    });
+    let primary = &result["primaryIssue"]["detail"];
+    for key in ["phase", "code", "output"] {
+        assert_eq!(primary[key], expected[key], "{terminal}");
+    }
+    let step = result["steps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|step| step["id"] == "decide")
+        .unwrap_or_else(|| panic!("{terminal}"));
+    for key in ["phase", "code", "output"] {
+        assert_eq!(step["detail"][key], expected[key], "{terminal}");
+    }
+
+    let terminal = succeeded(&run_outcome_tree("planned").2);
+    assert_eq!(terminal["result"]["outcome"], "succeeded");
+}
+
+// REQ-LOCALRUN-175, REQ-WFEXEC-57
+#[test]
+fn the_run_record_carries_the_attempts_chosen_outcome_once_exited() {
+    let exited = |destination: &Path| {
+        let record = run_record(destination);
+        assert_eq!(record["state"], "exited", "{record}");
+        record
+    };
+    // The declared outcome the step reports, or `onFailure` when the run fails.
+    for (verdict, outcome) in [("planned", "planned"), ("shipped", "failed")] {
+        let (_bundle, destination, _output) = run_outcome_tree(verdict);
+        assert_eq!(exited(&destination)["outcome"], outcome, "{verdict}");
+    }
+    // A workflow without the declaration has the implicit outcomes.
+    let bundle = TreeBundle::new(TREE_SUCCESS_WORKFLOW);
+    let destination = bundle.result("implicit");
+    succeeded(&run(&bundle.args(&destination)));
+    assert_eq!(exited(&destination)["outcome"], "succeeded");
+
+    // A retry or a resume writes its own attempt's outcome when it returns.
+    for command in ["retry", "resume"] {
+        let (bundle, destination, _output) = run_outcome_tree("shipped");
+        let destination = fs::canonicalize(destination).unwrap();
+        assert_eq!(exited(&destination)["outcome"], "failed", "{command}");
+        fs::write(bundle.execution_root().join("verdict-input"), "planned").unwrap();
+        let mut args = vec![
+            "workflow".to_owned(),
+            "run".to_owned(),
+            command.to_owned(),
+            destination.to_string_lossy().into_owned(),
+        ];
+        if command == "retry" {
+            args.extend([
+                "--execution-root".to_owned(),
+                bundle.execution_root().to_string_lossy().into_owned(),
+            ]);
+        } else {
+            args.extend(["--from".to_owned(), "decide".to_owned()]);
+        }
+        args.push("--json".to_owned());
+        succeeded(&run(&args));
+        let record = exited(&destination);
+        assert_eq!(record["outcome"], "planned", "{command}");
+        assert_eq!(record["attempts"], 2, "{command}");
+    }
+}
+
+// REQ-LOCALRUN-174, REQ-LOCALRUN-175, REQ-LOCALRUN-169
+#[test]
+fn a_path_run_selects_a_tree_workflow_file_with_workflow() {
+    let bundle = TreeBundle::new(TREE_SUCCESS_WORKFLOW);
+    bundle.write_source(
+        "design.yaml",
+        "schemaVersion: 1\nsteps:\n  design:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n",
+    );
+    let destination = bundle.result("design");
+    let run_directory = destination.to_string_lossy().into_owned();
+
+    let terminal = succeeded(&run(&path_args(
+        bundle.source_root(),
+        bundle.execution_root(),
+        &["--run-dir", &run_directory, "--workflow", "design.yaml"],
+    )));
+
+    assert_eq!(terminal["result"]["workflow"]["path"], "design.yaml");
+    assert_eq!(run_record(&destination)["workflow"], "design.yaml");
+
+    let missing = bundle.result("missing");
+    let rejection = tree_rejection(&run(&path_args(
+        bundle.source_root(),
+        bundle.execution_root(),
+        &[
+            "--run-dir",
+            missing.to_str().unwrap(),
+            "--workflow",
+            "missing.yaml",
+        ],
+    )));
+    assert_eq!(rejection["diagnostics"][0]["code"], "workflow_not_in_tree");
+    assert!(!missing.exists());
+}
+
+// REQ-LOCALRUN-174, REQ-LOCALRUN-175
+#[test]
+fn a_path_without_a_root_workflow_runs_the_closure_form() {
+    let bundle = RunBundle::new(TREE_SUCCESS_WORKFLOW);
+    let unresolved = bundle.result("unresolved");
+
+    let output = run(&path_args(
+        bundle.source_root(),
+        bundle.execution_root(),
+        &["--run-dir", unresolved.to_str().unwrap()],
+    ));
+
+    assert_eq!(output.status.code(), Some(1));
+    let rejection: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(workflow_run_schema().is_valid(&rejection), "{rejection}");
+    assert_eq!(rejection["phase"], "resolution");
+    assert_eq!(rejection["diagnostics"][0]["code"], "source_unavailable");
+    let mut plain = path_args(
+        bundle.source_root(),
+        bundle.execution_root(),
+        &["--run-dir", unresolved.to_str().unwrap(), "--plain"],
+    );
+    plain.retain(|argument| argument != "--json");
+    let output = run(&plain);
+    assert_eq!(output.status.code(), Some(1));
+    let named = fs::canonicalize(bundle.source_root())
+        .unwrap()
+        .join("workflow.yaml");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains(named.to_str().unwrap()),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!unresolved.exists());
+
+    let destination = bundle.result("closure");
+    succeeded(&run(&path_args(
+        bundle.source_root(),
+        bundle.execution_root(),
+        &[
+            "--run-dir",
+            destination.to_str().unwrap(),
+            "--workflow",
+            WORKFLOW_PATH,
+        ],
+    )));
+    assert!(destination.join("local-run.json").exists());
+    assert!(!destination.join("run.json").exists());
+}
+
+// REQ-LOCALRUN-80, REQ-LOCALRUN-174
+#[test]
+fn run_create_argument_conflicts_are_usage_errors() {
+    let bundle = TreeBundle::new(TREE_SUCCESS_WORKFLOW);
+    let destination = bundle.result("conflict");
+    let run_directory = destination.to_string_lossy().into_owned();
+    let execution = bundle.execution_root().to_string_lossy().into_owned();
+    let definition = "def_01jc0000000000000000000000";
+    for args in [
+        path_args(bundle.source_root(), bundle.execution_root(), &[]),
+        vec![
+            "workflow".to_owned(),
+            "run".to_owned(),
+            "create".to_owned(),
+            definition.to_owned(),
+            "--execution-root".to_owned(),
+            execution.clone(),
+            "--run-dir".to_owned(),
+            run_directory.clone(),
+        ],
+        path_args(
+            bundle.source_root(),
+            bundle.execution_root(),
+            &[definition, "--run-dir", &run_directory],
+        ),
+        path_args(
+            bundle.source_root(),
+            bundle.execution_root(),
+            &["--run-dir", &run_directory, "--workflow", "/workflow.yaml"],
+        ),
+        path_args(
+            bundle.source_root(),
+            bundle.execution_root(),
+            &[
+                "--run-dir",
+                &run_directory,
+                "--workflow",
+                "../tree/workflow.yaml",
+            ],
+        ),
+    ] {
+        assert_usage_error(&args);
+    }
+    assert!(!destination.exists());
+}
+
+pub(super) const CHILD_TREE_ROOT: &str = "schemaVersion: 1
+programs: [bin]
+inputs:
+  ticket:
+    kind: text
+outcomes: [landed, failed]
+steps:
+  design:
+    kind: workflow
+    workflow: design.yaml
+    inputs:
+      ticket:
+        ref: inputs.ticket
+    on:
+      planned: build
+      blocked: exit.failed
+      failed: exit.failed
+  build:
+    kind: workflow
+    workflow: build.yaml
+    inputs:
+      plan:
+        ref: outputs.design.plan
+    on:
+      built: exit.landed
+      failed: exit.failed
+";
+
+const CHILD_TREE_DESIGN: &str = "schemaVersion: 1
+inputs:
+  ticket:
+    kind: text
+outcomes: [planned, blocked, failed]
+outcome:
+  from: outputs.decide.verdict
+  onFailure: failed
+steps:
+  decide:
+    kind: cmd
+    inputs:
+      ticket:
+        ref: inputs.ticket
+    command:
+      argv: [decide]
+    outputs:
+      verdict:
+        kind: text
+        from: path
+        path: verdict.txt
+      plan:
+        kind: text
+        from: path
+        path: plan.txt
+exports:
+  plan:
+    ref: outputs.decide.plan
+";
+
+const CHILD_TREE_BUILD: &str = "schemaVersion: 1
+inputs:
+  plan:
+    kind: text
+outcomes: [built, failed]
+outcome:
+  from: outputs.make.verdict
+  onFailure: failed
+steps:
+  make:
+    kind: cmd
+    command:
+      argv: [sh, -c, 'printf built > built.txt']
+    outputs:
+      verdict:
+        kind: text
+        from: path
+        path: built.txt
+";
+
+/// `decide` reports the execution root's `verdict-input` and writes `plan: <ticket>` when
+/// the verdict is `planned`.
+pub(super) const CHILD_TREE_DECIDE: &str = "#!/bin/sh
+set -eu
+verdict=$(cat verdict-input)
+printf %s \"$verdict\" > verdict.txt
+if [ \"$verdict\" = planned ]; then
+  printf 'plan: %s' \"$(cat \"$UM_STEP_INPUTS/values/ticket\")\" > plan.txt
+else
+  rm -f plan.txt
+  : > plan.txt
+fi
+";
+
+/// A tree whose root runs `design.yaml` and then `build.yaml` as child runs
+/// (REQ-WFEXEC-58, REQ-WFEXEC-59), with `decide` as `bin/decide`.
+pub(super) fn child_tree(decide: &str) -> TreeBundle {
+    let bundle = TreeBundle::new(CHILD_TREE_ROOT);
+    bundle.write_source("design.yaml", CHILD_TREE_DESIGN);
+    bundle.write_source("build.yaml", CHILD_TREE_BUILD);
+    bundle.write_program("bin/decide", decide);
+    bundle
+}
+
+pub(super) fn child_tree_args(bundle: &TreeBundle, destination: &Path) -> Vec<String> {
+    path_args(
+        bundle.source_root(),
+        bundle.execution_root(),
+        &[
+            "--run-dir",
+            destination.to_str().unwrap(),
+            "--input-text",
+            "ticket",
+            "AUTO-1",
+        ],
+    )
+}
+
+fn run_child_tree(verdict: &str) -> (TreeBundle, PathBuf, Output) {
+    let bundle = child_tree(CHILD_TREE_DECIDE);
+    fs::write(bundle.execution_root().join("verdict-input"), verdict).unwrap();
+    let destination = bundle.result("parent");
+    let output = run(&child_tree_args(&bundle, &destination));
+    (bundle, destination, output)
+}
+
+pub(super) fn result_step<'a>(terminal: &'a serde_json::Value, id: &str) -> &'a serde_json::Value {
+    terminal["result"]["steps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|step| step["id"] == id)
+        .unwrap_or_else(|| panic!("{terminal}"))
+}
+
+fn carrier_names(run_directory: &Path, step: &str) -> Vec<String> {
+    let mut names = fs::read_dir(
+        run_directory
+            .join("attempts/000001/values/steps")
+            .join(step),
+    )
+    .unwrap()
+    .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+    .collect::<Vec<_>>();
+    names.sort();
+    names
+}
+
+// REQ-WFEXEC-58, REQ-WFEXEC-59, REQ-WFEXEC-60, REQ-LOCALRUN-177
+#[test]
+fn workflow_steps_run_child_runs_and_route_on_their_outcomes() {
+    let (bundle, destination, output) = run_child_tree("planned");
+    let terminal = succeeded(&output);
+    assert_eq!(terminal["result"]["outcome"], "succeeded");
+    for id in ["design", "build"] {
+        let step = result_step(&terminal, id);
+        assert_eq!(step["kind"], "workflow", "{terminal}");
+        assert_eq!(step["state"], "succeeded", "{terminal}");
+        assert!(step.get("commandOutput").is_none(), "{terminal}");
+    }
+    let parent = run_record(&destination);
+    assert_eq!(parent["outcome"], "landed");
+    for (step, workflow, outcome) in [
+        ("design", "design.yaml", "planned"),
+        ("build", "build.yaml", "built"),
+    ] {
+        let child = run_record(&destination.join("children").join(step).join("000001"));
+        assert_eq!(
+            child["parent"],
+            serde_json::json!({"run": parent["id"], "step": step})
+        );
+        assert_eq!(child["workflow"], workflow);
+        assert_eq!(child["tree"], parent["tree"]);
+        assert_ne!(child["id"], parent["id"]);
+        assert_eq!(child["state"], "exited");
+        assert_eq!(child["outcome"], outcome);
+    }
+    let child_copy = destination.join("children/design/000001/workflow/tree");
+    assert!(child_copy.join("bin/decide").is_file());
+    assert_eq!(carrier_names(&destination, "design"), ["outcome", "plan"]);
+    drop(bundle);
+
+    // The child reached `blocked`: the parent exits through `exit.failed`, still a
+    // succeeded run, and `build` is never reached.
+    let (_bundle, destination, output) = run_child_tree("blocked");
+    let terminal = succeeded(&output);
+    assert_eq!(terminal["result"]["outcome"], "succeeded");
+    let build = result_step(&terminal, "build");
+    assert_eq!(build["state"], "not_run", "{terminal}");
+    assert_eq!(build["detail"]["code"], "not_reached", "{terminal}");
+    assert_eq!(carrier_names(&destination, "design"), ["outcome", "plan"]);
+    assert_eq!(run_record(&destination)["outcome"], "failed");
+    assert!(!destination.join("children/build").exists());
+}
+
+// REQ-WFEXEC-59: a child reads the parent's pinned tree copy, so a source file renamed
+// away after the run pinned its tree changes nothing.
+#[test]
+fn a_child_run_reads_the_parents_tree_copy() {
+    let bundle = child_tree(CHILD_TREE_DECIDE);
+    let source = bundle.source_root().join("build.yaml");
+    bundle.write_program(
+        "bin/decide",
+        &format!(
+            "{CHILD_TREE_DECIDE}mv '{0}' '{0}.moved'\n",
+            source.display()
+        ),
+    );
+    fs::write(bundle.execution_root().join("verdict-input"), "planned").unwrap();
+    let destination = bundle.result("renamed");
+    let terminal = succeeded(&run(&child_tree_args(&bundle, &destination)));
+
+    assert!(!source.exists());
+    assert_eq!(result_step(&terminal, "build")["state"], "succeeded");
+    assert_eq!(run_record(&destination)["outcome"], "landed");
+}
+
+/// `decide` that, while the execution root holds `hold`, marks `started` and sleeps.
+pub(super) const HOLDING_CHILD_DECIDE: &str = "#!/bin/sh
+set -eu
+if [ -e hold ]; then
+  : > started
+  exec sleep 30
+fi
+verdict=$(cat verdict-input)
+printf %s \"$verdict\" > verdict.txt
+printf 'plan: %s' \"$(cat \"$UM_STEP_INPUTS/values/ticket\")\" > plan.txt
+";
+
+/// Starts the child tree with `design`'s child held in `decide` and returns once it runs.
+pub(super) fn spawn_held_child_tree(name: &str) -> (TreeBundle, PathBuf, std::process::Child) {
+    let bundle = child_tree(HOLDING_CHILD_DECIDE);
+    fs::write(bundle.execution_root().join("verdict-input"), "planned").unwrap();
+    fs::write(bundle.execution_root().join("hold"), "").unwrap();
+    let destination = bundle.result(name);
+    let child = isolated_command(&child_tree_args(&bundle, &destination))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let started = bundle.execution_root().join("started");
+    poll_until(
+        "the child's decide starts",
+        || started.exists(),
+        |exists| *exists,
+    );
+    (bundle, destination, child)
+}
+
+// REQ-WFEXEC-59: a cancellation of the parent reaches the child, which records `canceled`,
+// and the step ends `cancelled`.
+#[test]
+fn cancelling_the_parent_cancels_its_running_child() {
+    let (_bundle, destination, child) = spawn_held_child_tree("cancelled");
+    let pid = Pid::from_raw(i32::try_from(child.id()).unwrap()).unwrap();
+    kill_process(pid, Signal::INT).unwrap();
+    let output = child.wait_with_output().unwrap();
+
+    assert_eq!(
+        output.status.code(),
+        Some(130),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let terminal: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(workflow_run_schema().is_valid(&terminal), "{terminal}");
+    assert_eq!(result_step(&terminal, "design")["state"], "cancelled");
+    let child = run_record(&destination.join("children/design/000001"));
+    assert_eq!(child["state"], "exited");
+    assert_eq!(child["outcome"], "canceled");
+    assert_eq!(run_record(&destination)["outcome"], "canceled");
+}
+
+const AGENT_CHILD_ROOT: &str = "schemaVersion: 1
+steps:
+  design:
+    kind: workflow
+    workflow: design.yaml
+    on:
+      succeeded: exit.succeeded
+      failed: exit.failed
+";
+
+/// A tree whose only child runs a Pi agent, so the child's admission needs a Pi
+/// installation the root's does not.
+pub(super) fn agent_child_tree() -> TreeBundle {
+    let bundle = TreeBundle::new(AGENT_CHILD_ROOT);
+    bundle.write_source("design.yaml", response_agent_source());
+    bundle.write_source("system.md", "system");
+    bundle.write_source("message.md", "prompt");
+    bundle
+}
+
+// REQ-WFEXEC-60: a child that cannot be admitted fails the step at `start` with
+// `child_admission_rejected`, and the parent fails.
+#[test]
+fn a_child_that_cannot_be_admitted_fails_the_step_at_start() {
+    let bundle = agent_child_tree();
+    let destination = bundle.result("rejected");
+    let missing_path = tempfile::tempdir().unwrap();
+    let output = isolated_command(&path_args(
+        bundle.source_root(),
+        bundle.execution_root(),
+        &["--run-dir", destination.to_str().unwrap()],
+    ))
+    .env("PATH", missing_path.path())
+    .output()
+    .unwrap();
+
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let terminal: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(workflow_run_schema().is_valid(&terminal), "{terminal}");
+    let design = result_step(&terminal, "design");
+    assert_eq!(design["state"], "failed", "{terminal}");
+    assert_eq!(
+        design["detail"],
+        serde_json::json!({"phase": "start", "code": "child_admission_rejected"})
+    );
+    assert_eq!(run_record(&destination)["outcome"], "failed");
+    assert!(!destination.join("children/design").exists());
+}
+
+// REQ-WFEXEC-59, REQ-WFEXEC-61, REQ-WFEXEC-40: admission admits an `answer` wait target,
+// which the run enters and ends `waiting` with exit 0.
+#[test]
+fn admission_admits_an_answer_wait_target() {
+    let bundle = child_tree(CHILD_TREE_DECIDE);
+    bundle.write_source(
+        "workflow.yaml",
+        &CHILD_TREE_ROOT.replace(
+            "      blocked: exit.failed\n",
+            "      blocked:\n        wait: answer\n        then: build\n",
+        ),
+    );
+    fs::write(bundle.execution_root().join("verdict-input"), "blocked").unwrap();
+    let destination = bundle.result("answer");
+    let output = run(&child_tree_args(&bundle, &destination));
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let terminal: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(workflow_run_schema().is_valid(&terminal), "{terminal}");
+    assert_eq!(terminal["outcome"], "waiting", "{terminal}");
+    assert_eq!(terminal["result"]["outcome"], "waiting", "{terminal}");
+    assert!(
+        terminal["result"].get("finalization").is_none(),
+        "{terminal}"
+    );
+    assert_eq!(result_step(&terminal, "design")["state"], "succeeded");
+    let build = result_step(&terminal, "build");
+    assert_eq!(build["state"], "not_run", "{terminal}");
+    assert_eq!(build["detail"]["code"], "not_reached", "{terminal}");
+}
+
+// REQ-WFEXEC-59, REQ-WFEXEC-65: admission admits an `external` wait on a condition the CLI
+// evaluates, whose record resolves the rule's input operand to its value, and refuses one
+// on any other pair with `wait_condition_unsupported`.
+#[test]
+fn admission_admits_an_external_wait_only_on_a_supported_condition() {
+    let bundle = child_tree(CHILD_TREE_DECIDE);
+    let external = |event: &str| {
+        CHILD_TREE_ROOT.replace(
+            "      blocked: exit.failed\n",
+            &format!(
+                "      blocked:\n        wait: external\n        then: build\n        rule:\n          source: github\n          event: {event}\n          where: event.ticket == inputs.ticket\n"
+            ),
+        )
+    };
+    fs::write(bundle.execution_root().join("verdict-input"), "blocked").unwrap();
+    bundle.write_source("workflow.yaml", &external("pull_request.queue_settled"));
+    let destination = bundle.result("queue-settled");
+    let output = run(&child_tree_args(&bundle, &destination));
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let terminal: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(workflow_run_schema().is_valid(&terminal), "{terminal}");
+    assert_eq!(terminal["outcome"], "waiting", "{terminal}");
+    assert_eq!(terminal["wait"]["kind"], "external", "{terminal}");
+    assert_eq!(
+        terminal["wait"]["rule"]["where"],
+        "event.ticket == \"AUTO-1\""
+    );
+
+    bundle.write_source("workflow.yaml", &external("issue.closed"));
+    let destination = bundle.result("issue-closed");
+    let output = run(&child_tree_args(&bundle, &destination));
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let terminal: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(workflow_run_schema().is_valid(&terminal), "{terminal}");
+    assert_eq!(terminal["phase"], "admission", "{terminal}");
+    assert_eq!(
+        terminal["diagnostics"][0]["code"],
+        "wait_condition_unsupported"
+    );
+    assert!(!destination.exists());
+}
+
+// REQ-WFEXEC-59: admission refuses a wait target that continues at an exit, and a workflow
+// step run without a tree.
+#[test]
+fn admission_refuses_wait_targets_and_workflow_steps_outside_a_tree() {
+    let bundle = child_tree(CHILD_TREE_DECIDE);
+    bundle.write_source(
+        "workflow.yaml",
+        &CHILD_TREE_ROOT.replace(
+            "      blocked: exit.failed\n",
+            "      blocked:\n        wait: external\n        then: exit.failed\n        rule:\n          source: github\n          event: pull_request.queue_settled\n          where: 'event.state == \"merged\"'\n",
+        ),
+    );
+    let destination = bundle.result("waiting");
+    let output = run(&child_tree_args(&bundle, &destination));
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let terminal: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(workflow_run_schema().is_valid(&terminal), "{terminal}");
+    assert_eq!(terminal["phase"], "admission", "{terminal}");
+    assert_eq!(
+        terminal["diagnostics"][0]["code"],
+        "wait_target_unsupported"
+    );
+    assert!(!destination.exists());
+
+    // A directory without `workflow.yaml` is no tree; its selected file still names
+    // workflow steps.
+    let loose = tempfile::tempdir().unwrap();
+    fs::write(
+        loose.path().join("main.yaml"),
+        CHILD_TREE_ROOT.replace("programs: [bin]\n", ""),
+    )
+    .unwrap();
+    fs::write(loose.path().join("design.yaml"), CHILD_TREE_DESIGN).unwrap();
+    fs::write(loose.path().join("build.yaml"), CHILD_TREE_BUILD).unwrap();
+    let destination = bundle.result("loose");
+    let output = run(&path_args(
+        loose.path(),
+        bundle.execution_root(),
+        &[
+            "--run-dir",
+            destination.to_str().unwrap(),
+            "--workflow",
+            "main.yaml",
+            "--input-text",
+            "ticket",
+            "AUTO-1",
+        ],
+    ));
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let terminal: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(workflow_run_schema().is_valid(&terminal), "{terminal}");
+    assert_eq!(terminal["phase"], "admission", "{terminal}");
+    assert_eq!(
+        terminal["diagnostics"][0]["code"],
+        "workflow_step_requires_tree"
+    );
+    assert!(!destination.exists());
 }

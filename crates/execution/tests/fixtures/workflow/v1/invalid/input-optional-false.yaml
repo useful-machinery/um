@@ -1,0 +1,10 @@
+schemaVersion: 1
+steps:
+  prepare:
+    kind: cmd
+    command:
+      argv: ["true"]
+inputs:
+  branch:
+    kind: text
+    optional: false

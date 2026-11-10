@@ -13,6 +13,8 @@ use um_execution::{
 };
 
 pub(super) const ABOUT: &str = "View a published local workflow attempt";
+
+const COMMAND: &str = "um workflow run view";
 pub(super) const AFTER_HELP: &str = "Presentation mode:
   Without an explicit mode, an eligible terminal opens the interactive viewer. Every
   other stream arrangement receives a frozen plain summary.
@@ -41,16 +43,28 @@ pub(super) struct Command {
 }
 
 impl Command {
-    pub(super) fn execute(self) -> super::super::CommandResult {
+    pub(super) fn execute(self) -> super::super::super::CommandResult {
         super::execute_with_abandonable_runtime("view", self.execute_async())
     }
 
-    async fn execute_async(self) -> super::super::CommandResult {
+    async fn execute_async(self) -> super::super::super::CommandResult {
         let (mut interrupt, mut terminate) = super::observe_workflow_signals("view")?;
 
         let config = viewer_config(&self.presentation, TerminalCapabilities::detect());
         let mode = config.mode();
-        let requested = self.run.run_dir;
+        let requested = match self.run.resolve() {
+            Ok(requested) => requested,
+            // REQ-LOCALRUN-180: a run id the home does not answer is a view `error` document.
+            Err(error) if mode == PresentationMode::Json => {
+                return write_noninteractive(
+                    move || error.write_error_document(COMMAND),
+                    &mut interrupt,
+                    &mut terminate,
+                )
+                .await;
+            }
+            Err(error) => return Err(anyhow::Error::new(error).into()),
+        };
         let load_path = requested.clone();
         let selected_attempt = self.attempt;
         let mut load = tokio::task::spawn_blocking(move || {
@@ -66,7 +80,7 @@ impl Command {
                     Ok(Ok(attempt)) => attempt,
                     Ok(Err(error)) if mode == PresentationMode::Json => {
                         return write_noninteractive(
-                            ArchivedViewOutput::JsonError(error),
+                            move || ArchivedViewOutput::JsonError(error).write_stdout(),
                             &mut interrupt,
                             &mut terminate,
                         ).await;
@@ -82,19 +96,21 @@ impl Command {
         };
 
         if mode == PresentationMode::Plain {
+            let output = ArchivedViewOutput::Plain {
+                attempt: Box::new(attempt.projection),
+                color: config.color_enabled(),
+            };
             return write_noninteractive(
-                ArchivedViewOutput::Plain {
-                    attempt: Box::new(attempt.projection),
-                    color: config.color_enabled(),
-                },
+                move || output.write_stdout(),
                 &mut interrupt,
                 &mut terminate,
             )
             .await;
         }
         if mode == PresentationMode::Json {
+            let output = ArchivedViewOutput::JsonSuccess(Box::new(attempt));
             return write_noninteractive(
-                ArchivedViewOutput::JsonSuccess(Box::new(attempt)),
+                move || output.write_stdout(),
                 &mut interrupt,
                 &mut terminate,
             )
@@ -136,7 +152,7 @@ fn viewer_config(
     presentation: &super::PresentationOptions,
     capabilities: TerminalCapabilities,
 ) -> PresentationConfig {
-    super::run::presentation_config_with(presentation, false, capabilities)
+    super::create::presentation_config_with(presentation, false, capabilities)
 }
 
 async fn first_view_signal(
@@ -159,12 +175,17 @@ fn viewer_exit_code(exit: ArchivedTerminalHostExit) -> ExitCode {
     .exit_code()
 }
 
-async fn write_noninteractive(
-    output: ArchivedViewOutput,
+/// Runs `write` off the runtime so SIGINT or SIGTERM still ends a view whose output blocks.
+async fn write_noninteractive<Outcome, Failure>(
+    write: impl FnOnce() -> Result<Outcome, Failure> + Send + 'static,
     interrupt: &mut tokio::signal::unix::Signal,
     terminate: &mut tokio::signal::unix::Signal,
-) -> super::super::CommandResult {
-    let mut job = tokio::task::spawn_blocking(move || output.write_stdout());
+) -> super::super::super::CommandResult
+where
+    Outcome: Into<ExitCode> + Send + 'static,
+    Failure: std::error::Error + Send + Sync + 'static,
+{
+    let mut job = tokio::task::spawn_blocking(write);
     tokio::select! {
         biased;
         result = &mut job => match result {

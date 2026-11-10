@@ -125,11 +125,11 @@ fn write_human_invalid(failure: &ResolutionFailure) -> anyhow::Result<()> {
 }
 
 fn human_required_inputs(workflow: &ResolvedWorkflow) -> String {
-    if workflow.required_inputs().is_empty() {
+    let required_inputs = workflow.required_inputs();
+    if required_inputs.is_empty() {
         return "none".to_owned();
     }
-    workflow
-        .required_inputs()
+    required_inputs
         .iter()
         .map(|(name, kind)| format!("{name}:{}", input_kind(*kind)))
         .collect::<Vec<_>>()
@@ -147,8 +147,8 @@ fn input_kind(kind: um_execution::WorkflowValueType) -> &'static str {
 }
 
 fn write_json_valid(workflow: &ResolvedWorkflow) -> anyhow::Result<()> {
-    let required_inputs = workflow
-        .required_inputs()
+    let declared_required_inputs = workflow.required_inputs();
+    let required_inputs = declared_required_inputs
         .iter()
         .map(|(name, kind)| (name.as_str(), input_kind(*kind)))
         .collect::<BTreeMap<_, _>>();

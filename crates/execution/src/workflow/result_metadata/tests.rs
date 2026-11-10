@@ -602,6 +602,29 @@ fn continuation_export_of_a_blocked_finalizer_is_source_blocked() {
     );
 }
 
+// REQ-EXPORTS-3
+#[test]
+fn continuation_source_failed_export_of_a_succeeded_step_requires_a_workflow_step() {
+    let mut document = continuation_result_fixture();
+    document["exportSources"] = json!({
+        "report": {
+            "node": {"id": "rerun", "role": "step"},
+            "output": "report"
+        }
+    });
+    document["exports"] = json!({
+        "report": {"state": "unavailable", "reason": "source_failed"}
+    });
+    let agent_step: WorkflowResultV1 = serde_json::from_value(document.clone()).unwrap();
+    assert_eq!(
+        validate_with_invariant(&agent_step),
+        Err(RunResultInvariant::ExportMetadata)
+    );
+
+    document["steps"][1]["kind"] = json!("workflow");
+    assert!(decode(&encode(&document)).is_ok());
+}
+
 #[test]
 fn cloud_continuation_preserves_typed_attempt_ids_and_export_producers() {
     let mut document = continuation_result_fixture();

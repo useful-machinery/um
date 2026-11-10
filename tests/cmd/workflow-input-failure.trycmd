@@ -1,5 +1,5 @@
 ```console
-$ um workflow run --source-root . --execution-root . --run-dir unused-input-failure --input-json request not-json absent.yaml
+$ um workflow run create --path . --execution-root . --run-dir unused-input-failure --workflow absent.yaml --input-json request not-json
 ? 1
 Error: acquire local workflow input request: input is not valid JSON
 

@@ -24,6 +24,7 @@ mod principal_profile;
 mod problem;
 mod profile;
 mod projects;
+mod provider_http;
 mod publications;
 mod resource;
 mod run_inputs;
@@ -165,6 +166,7 @@ pub use projects::{
     GitHubRepositoryList as ProjectGitHubRepositoryList, Project, ProjectApi, ProjectFailure,
     ProjectList, ProjectReadinessBlocker, ProjectRepository, ProjectRepositorySelector,
 };
+pub use provider_http::{ProviderRequestError, ProviderResponse, provider_get, provider_post_json};
 pub use publications::{
     ExistingPublicationTarget, Publication, PublicationApi, PublicationFailure, PublicationList,
     PublicationState,

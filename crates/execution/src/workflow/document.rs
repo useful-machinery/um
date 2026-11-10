@@ -1,10 +1,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 
 use super::condition::TerminalDisposition;
-use super::validated::ValidatedHarness;
+use super::mirror::MirrorBlock;
+use super::validated::{ValidatedHarness, WorkflowValueType};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct WorkflowDocument {
@@ -18,12 +19,111 @@ pub(crate) struct WorkflowDocument {
     pub(crate) finalizers: BTreeMap<String, FinalizerDefinition>,
     pub(crate) finalizer_order: Vec<String>,
     pub(crate) exports: BTreeMap<String, ExportDefinition>,
+    /// The declared outcome names (REQ-WFFORMAT-87); empty when the workflow declares none.
+    pub(crate) outcomes: Vec<String>,
+    pub(crate) outcome: Option<OutcomeDeclaration>,
+    pub(crate) name: Option<String>,
+    pub(crate) version: Option<String>,
+    /// The root input whose value is a run's subject (REQ-WFFORMAT-100).
+    pub(crate) subject: Option<String>,
+    pub(crate) root: Option<RootBlocks>,
+    /// The outputs of each `workflow` step, derived from its child's summary when the
+    /// document is validated (REQ-WFFORMAT-91); decoding leaves it empty.
+    pub(crate) derived_outputs: BTreeMap<String, BTreeMap<String, Output>>,
+}
+
+/// The root-only blocks of a workflow file (REQ-WFFORMAT-82). A run acts on none of them
+/// but `mirror` (REQ-WFFORMAT-86); an absent block is empty, since the schema admits no
+/// empty block.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct RootBlocks {
+    pub programs: Vec<String>,
+    pub exclude: Vec<String>,
+    pub requires: Option<RootRequires>,
+    pub bindings: BTreeMap<String, Binding>,
+    pub triggers: BTreeMap<String, Trigger>,
+    pub mirror: Option<MirrorBlock>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RootRequires {
+    pub tools: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Binding {
+    pub kind: BindingKind,
+    pub default: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum BindingKind {
+    #[serde(rename = "connection")]
+    Connection,
+    #[serde(rename = "linear.team")]
+    LinearTeam,
+    #[serde(rename = "linear.state")]
+    LinearState,
+    #[serde(rename = "github.repository")]
+    GithubRepository,
+}
+
+impl BindingKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Connection => "connection",
+            Self::LinearTeam => "linear.team",
+            Self::LinearState => "linear.state",
+            Self::GithubRepository => "github.repository",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Trigger {
+    /// Starts a run of the workflow.
+    Start {
+        on: TriggerRule,
+        subject: Option<String>,
+        inputs: BTreeMap<String, String>,
+    },
+    /// Acts on the live run for the event's subject.
+    Control {
+        on: TriggerRule,
+        control: TriggerControlAction,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TriggerRule {
+    /// A binding reference, `$` followed by the binding key.
+    pub source: String,
+    pub event: String,
+    pub condition: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TriggerControlAction {
+    Named(String),
+    Conditional {
+        when: String,
+        then: String,
+        otherwise: String,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ExportDefinition {
     pub(crate) source: OutputReference,
     pub(crate) presentation: Option<ExportPresentation>,
+}
+
+/// The `outcome` block (REQ-WFFORMAT-88): the output that names a succeeded run's outcome
+/// and the name a failed run takes.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct OutcomeDeclaration {
+    pub(crate) from: OutputReference,
+    pub(crate) on_failure: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -40,10 +140,29 @@ pub(crate) enum PresentationSource {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum InputDeclaration {
-    Text,
-    Json { schema: Option<String> },
-    File { media_type: Option<String> },
-    Attachments,
+    Text {
+        optional: bool,
+        default: Option<String>,
+    },
+    Json {
+        schema: Option<String>,
+        optional: bool,
+        default: Option<JsonDefault>,
+    },
+    File {
+        media_type: Option<String>,
+    },
+    Attachments {
+        optional: bool,
+    },
+}
+
+/// A JSON input's default: a file path relative to the workflow file, or the literal value
+/// when the YAML value is not text (REQ-WFFORMAT-28).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum JsonDefault {
+    File(String),
+    Literal(Value),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -112,6 +231,103 @@ pub(crate) struct AgentProfile {
 pub(crate) enum NodeBody {
     Command(CommandNode),
     Agent(AgentNode),
+    Workflow(WorkflowNode),
+}
+
+/// A step that runs another workflow file of the same tree as a child run
+/// (REQ-WFFORMAT-89). It has no `CommonNode`: its outputs are derived from the child and
+/// its edges, not dataflow, order it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct WorkflowNode {
+    pub(crate) workflow: String,
+    pub(crate) inputs: BTreeMap<String, ValueReference>,
+    pub(crate) edges: BTreeMap<String, EdgeTarget>,
+    pub(crate) for_each: Option<ForEach>,
+}
+
+/// A `workflow` step's `forEach` (REQ-WFFORMAT-98): the list the step runs one child for
+/// each element of, and the child outcome taken for an empty list. The reference string
+/// form decodes with `empty` absent.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ForEach {
+    pub(crate) items: ValueReference,
+    pub(crate) empty: Option<String>,
+}
+
+/// Where an `on` edge leads (REQ-WFFORMAT-92): a step, which may be the step itself or an
+/// earlier one, an exit, a limited edge (REQ-WFFORMAT-96) or a wait. A wait names the step
+/// a hand-back continues at in `on_hand_back`, required for `approval` and refused
+/// otherwise, and carries `rule` exactly when it is `external` (REQ-WFFORMAT-97).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum EdgeTarget {
+    Step(String),
+    Exit(String),
+    /// `{then, limit, else}`: `then` as authored, which validation requires to be a step,
+    /// and `else_` an unlimited target.
+    Limited {
+        then: String,
+        limit: u32,
+        else_: Box<EdgeTarget>,
+    },
+    Wait {
+        kind: WaitKind,
+        then: Box<EdgeTarget>,
+        on_hand_back: Option<String>,
+        rule: Option<WaitRule>,
+    },
+}
+
+/// A wait's rule `{source, event, where}` (REQ-WFFORMAT-97, REQ-WFDEF-5): authored on an
+/// `external` wait, derived for the local kinds. `event` is read as one name or a list and
+/// always written as a list.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct WaitRule {
+    pub source: String,
+    #[serde(deserialize_with = "one_or_many")]
+    pub event: Vec<String>,
+    #[serde(rename = "where")]
+    pub where_: String,
+}
+
+pub(crate) fn one_or_many<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Vec<String>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum OneOrMany {
+        One(String),
+        Many(Vec<String>),
+    }
+    Ok(match OneOrMany::deserialize(deserializer)? {
+        OneOrMany::One(event) => vec![event],
+        OneOrMany::Many(events) => events,
+    })
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WaitKind {
+    Answer,
+    Approval,
+    Repair,
+    Stop,
+    External,
+    Children,
+}
+
+impl WaitKind {
+    /// The kind's name as the format and the records spell it (REQ-WFFORMAT-92).
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Answer => "answer",
+            Self::Approval => "approval",
+            Self::Repair => "repair",
+            Self::Stop => "stop",
+            Self::External => "external",
+            Self::Children => "children",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -171,11 +387,19 @@ pub(crate) struct ConditionSelector {
     pub(crate) pointer: String,
 }
 
+/// A `{ref}` value. `Wait` (`wait.<field>`, a field of the control that resolved the wait
+/// leading to the step) and `ControlsAnswers` (`controls.answers`, the answers recorded
+/// for the step's questions) decode only in a `workflow` step's inputs (REQ-WFFORMAT-95),
+/// as does `Item` (`item`, or `item.<field>` with `field` set), the element a `forEach`
+/// step's child runs for (REQ-WFFORMAT-99).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum ValueReference {
     Input { name: String },
     Output(OutputReference),
     FinalizationContext,
+    Wait { field: String },
+    ControlsAnswers,
+    Item { field: Option<String> },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -184,6 +408,9 @@ pub(crate) struct OutputReference {
     pub(crate) output: String,
 }
 
+/// A declared output, or one a `workflow` step derives from its child: `ChildExport` is
+/// a `text` or `json` export of the child and `ChildOutcome` the child's recorded outcome
+/// (REQ-WFFORMAT-91).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum Output {
     TextPath { path: String },
@@ -192,6 +419,8 @@ pub(crate) enum Output {
     JsonAgentResult { schema: String },
     FilePath { path: String, media_type: String },
     GitBranchWorkspace,
+    ChildExport { value_type: WorkflowValueType },
+    ChildOutcome,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

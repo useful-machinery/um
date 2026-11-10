@@ -21,6 +21,7 @@ use crate::workflow::archived_attempt::{
     ArchivedAttemptOperationalErrorCode, ArchivedStepDetail, ProjectionInvariant,
     load_local_archived_attempt, load_local_archived_attempt_observed,
 };
+use crate::workflow::definition_store::WorkflowHome;
 use crate::workflow::resolution;
 
 struct AdmittedFixture {
@@ -102,6 +103,37 @@ impl AdmittedFixture {
         environment: EnvironmentSnapshot,
         git: bool,
     ) -> Self {
+        Self::build(
+            source,
+            inputs,
+            maximum_step_log_bytes,
+            environment,
+            git,
+            None,
+        )
+    }
+
+    /// A run admitted from a tree: `source` is the root `workflow.yaml` and each
+    /// `(path, contents, mode)` is written under the source root before validation.
+    fn from_tree(source: &str, files: &[(&str, &str, u32)]) -> Self {
+        Self::build(
+            source,
+            ResolvedInputs::default(),
+            1024,
+            EnvironmentSnapshot::default(),
+            false,
+            Some(files),
+        )
+    }
+
+    fn build(
+        source: &str,
+        inputs: ResolvedInputs,
+        maximum_step_log_bytes: u64,
+        environment: EnvironmentSnapshot,
+        git: bool,
+        tree_files: Option<&[(&str, &str, u32)]>,
+    ) -> Self {
         let temporary = tempfile::tempdir().unwrap();
         let source_root = temporary.path().join("source");
         let execution_root = temporary.path().join("execution");
@@ -131,19 +163,23 @@ impl AdmittedFixture {
             run_git(&["commit", "--quiet", "-m", "baseline"]);
         }
         fs::write(source_root.join("workflow.yaml"), source).unwrap();
+        for (path, contents, mode) in tree_files.unwrap_or_default() {
+            let path = source_root.join(path);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, contents).unwrap();
+            fs::set_permissions(&path, Permissions::from_mode(*mode)).unwrap();
+        }
+        let tree = tree_files.map(|_| {
+            crate::workflow::validate_workflow_tree(&source_root)
+                .unwrap_or_else(|diagnostics| panic!("tree should be valid: {diagnostics:?}"))
+        });
         let workflow = resolution::resolve(&source_root, Path::new("workflow.yaml")).unwrap();
         let admitted = admit_workflow(workflow, inputs, {
-            let context = ExecutionContext::new(
-                execution_root.clone(),
-                ExecutionPolicyLimits::new(
-                    2,
-                    CaptureLimits::new(16, 1024, 4096),
-                    InputLimits::new(16, 1024, 4096, 4096),
-                    maximum_step_log_bytes,
-                ),
-                environment,
-                CancellationPolicy::new(CancellationSource::new(), Duration::from_secs(10)),
-            );
+            let context = fixture_context(&execution_root, maximum_step_log_bytes, environment);
+            let context = match tree {
+                Some(tree) => context.with_tree(tree),
+                None => context,
+            };
             if git {
                 context.with_local_git_capture()
             } else {
@@ -162,6 +198,40 @@ impl AdmittedFixture {
     fn run_path(&self, name: &str) -> PathBuf {
         self.run_parent.join(name)
     }
+
+    /// A child run's admission as the CLI's dispatcher makes it: `workflow` resolved from
+    /// the parent's tree copy and admitted with that copy as its tree, against the fixture's
+    /// execution root.
+    fn admit_child(&self, tree_copy: &Path, workflow: &str) -> AdmittedWorkflow {
+        let tree = crate::workflow::validate_workflow_tree(tree_copy)
+            .unwrap_or_else(|diagnostics| panic!("copy should be a tree: {diagnostics:?}"));
+        let resolved = resolution::resolve(tree_copy, Path::new(workflow)).unwrap();
+        admit_workflow(
+            resolved,
+            ResolvedInputs::default(),
+            fixture_context(&self.execution_root, 1024, EnvironmentSnapshot::default())
+                .with_tree(tree),
+        )
+        .unwrap()
+    }
+}
+
+fn fixture_context(
+    execution_root: &Path,
+    maximum_step_log_bytes: u64,
+    environment: EnvironmentSnapshot,
+) -> ExecutionContext {
+    ExecutionContext::new(
+        execution_root.to_owned(),
+        ExecutionPolicyLimits::new(
+            2,
+            CaptureLimits::new(16, 1024, 4096),
+            InputLimits::new(16, 1024, 4096, 4096),
+            maximum_step_log_bytes,
+        ),
+        environment,
+        CancellationPolicy::new(CancellationSource::new(), Duration::from_secs(10)),
+    )
 }
 
 struct AssertLockedPublication {
@@ -184,17 +254,18 @@ fn retry_ineligibility_uses_the_closed_precedence_order() {
         reason: OwnershipUnprovenReason::ProcessIdentityInspectionUnavailable,
     };
     assert_eq!(
-        retry_eligibility(AttemptStateV1::Succeeded, &ownership_unproven, true),
+        retry_eligibility(AttemptStateV1::Succeeded, &ownership_unproven, true, false),
         LocalRetryEligibility::Ineligible(RetryIneligibilityReason::RunLocked)
     );
     assert_eq!(
-        retry_eligibility(AttemptStateV1::Succeeded, &ownership_unproven, false),
+        retry_eligibility(AttemptStateV1::Succeeded, &ownership_unproven, false, false),
         LocalRetryEligibility::Ineligible(RetryIneligibilityReason::OwnershipUnproven)
     );
     assert_eq!(
         retry_eligibility(
             AttemptStateV1::Succeeded,
             &LocalRecoveryStatus::Settled,
+            false,
             false,
         ),
         LocalRetryEligibility::Ineligible(RetryIneligibilityReason::LatestAttemptSucceeded)
@@ -203,6 +274,7 @@ fn retry_ineligibility_uses_the_closed_precedence_order() {
         retry_eligibility(
             AttemptStateV1::Rejected,
             &LocalRecoveryStatus::Settled,
+            false,
             false,
         ),
         LocalRetryEligibility::Ineligible(RetryIneligibilityReason::LatestAttemptRejected)
@@ -213,10 +285,39 @@ fn retry_ineligibility_uses_the_closed_precedence_order() {
         AttemptStateV1::Interrupted,
     ] {
         assert_eq!(
-            retry_eligibility(state, &LocalRecoveryStatus::Settled, false),
+            retry_eligibility(state, &LocalRecoveryStatus::Settled, false, false),
             LocalRetryEligibility::Eligible
         );
     }
+    // REQ-LOCALRUN-129, REQ-LOCALRUN-196: a superseded record yields to the lock and to
+    // unproven ownership, and refuses a last attempt `waiting` that a record without
+    // `successor` admits.
+    assert_eq!(
+        retry_eligibility(AttemptStateV1::Waiting, &ownership_unproven, true, true),
+        LocalRetryEligibility::Ineligible(RetryIneligibilityReason::RunLocked)
+    );
+    assert_eq!(
+        retry_eligibility(AttemptStateV1::Waiting, &ownership_unproven, false, true),
+        LocalRetryEligibility::Ineligible(RetryIneligibilityReason::OwnershipUnproven)
+    );
+    assert_eq!(
+        retry_eligibility(
+            AttemptStateV1::Waiting,
+            &LocalRecoveryStatus::Settled,
+            false,
+            true
+        ),
+        LocalRetryEligibility::Ineligible(RetryIneligibilityReason::RunSuperseded)
+    );
+    assert_eq!(
+        retry_eligibility(
+            AttemptStateV1::Waiting,
+            &LocalRecoveryStatus::Settled,
+            false,
+            false,
+        ),
+        LocalRetryEligibility::Eligible
+    );
 }
 
 struct FixtureRecoveryAuthority {
@@ -405,6 +506,7 @@ fn retained_manifest_rejects_source_files_out_of_canonical_order() {
         ],
         inputs: BTreeMap::new(),
         agent_profile_replacement: None,
+        tree: None,
     };
 
     assert_eq!(
@@ -437,7 +539,7 @@ fn retained_manifest_rejects_duplicate_named_input_keys() {
     fs::set_permissions(&manifest_path, Permissions::from_mode(0o600)).unwrap();
     fs::write(&manifest_path, duplicate_manifest.as_bytes()).unwrap();
 
-    let run_file = run_path.join(RUN_FILE);
+    let run_file = run_path.join(LOCAL_RUN_FILE);
     let mut run_document: LocalRunV1 = decode_schema_one(&fs::read(&run_file).unwrap()).unwrap();
     run_document.workflow_manifest_digest = DigestV1::sha256(duplicate_manifest.as_bytes());
     fs::set_permissions(&run_file, Permissions::from_mode(0o600)).unwrap();
@@ -459,7 +561,7 @@ fn initial_publication_retains_the_staging_lock_and_immutable_execution_bytes() 
     let run_path = fixture.run_path("retained");
     let mut observer = AssertLockedPublication { observed: false };
 
-    let run = create_with_observer(&run_path, &fixture.admitted, &mut observer).unwrap();
+    let run = create_with_observer(&run_path, &fixture.admitted, None, &mut observer).unwrap();
 
     assert!(observer.observed);
     assert_eq!(run.run_directory(), fs::canonicalize(&run_path).unwrap());
@@ -467,16 +569,21 @@ fn initial_publication_retains_the_staging_lock_and_immutable_execution_bytes() 
         fs::metadata(&run_path).unwrap().permissions().mode() & 0o7777,
         0o700
     );
-    assert!(run_path.join(RUN_FILE).is_file());
+    assert!(run_path.join(LOCAL_RUN_FILE).is_file());
     assert!(run_path.join(STATE_FILE).is_file());
     assert!(run_path.join(LOCK_FILE).is_file());
     assert!(run_path.join("attempts/000001").is_dir());
     assert!(!run.result_directory().exists());
+    assert_eq!(
+        directory_names(&run_path.join("workflow")),
+        ["files", "manifest.json"]
+    );
 
     let manifest: Value =
         serde_json::from_slice(&fs::read(run_path.join("workflow/manifest.json")).unwrap())
             .unwrap();
     assert_eq!(manifest["schemaVersion"], 1);
+    assert!(manifest.get("tree").is_none());
     assert_eq!(manifest["workflowPath"], "workflow.yaml");
     assert_eq!(manifest["maximumParallelSteps"], 2);
     assert_eq!(manifest["sourceFiles"][0]["relativeFile"], "files/0001");
@@ -551,6 +658,2755 @@ fn singular_file_input_is_retained_and_reused_for_retry() {
     };
     assert_eq!(file.media_type(), "application/octet-stream");
     assert_eq!(file.bytes(), [0_u8, 0xff, 7]);
+    assert!(pending.tree_copy().is_none());
+    assert!(pending.verify_tree_copy().is_none());
+}
+
+fn directory_names(directory: &Path) -> Vec<String> {
+    let mut names = fs::read_dir(directory)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .collect::<Vec<_>>();
+    names.sort();
+    names
+}
+
+fn mode(path: &Path) -> u32 {
+    fs::symlink_metadata(path).unwrap().permissions().mode() & 0o7777
+}
+
+/// Restores write permission under a run's read-only `workflow/tree` before the
+/// temporary directory holding it drops: `tempfile` ignores a removal failure and
+/// would leave the copy behind. Declare it after the fixture so it drops first.
+struct WritableTreeCopyOnDrop(PathBuf);
+
+impl Drop for WritableTreeCopyOnDrop {
+    fn drop(&mut self) {
+        fn restore(directory: &Path) {
+            if fs::set_permissions(directory, Permissions::from_mode(0o755)).is_err() {
+                return;
+            }
+            for entry in fs::read_dir(directory).into_iter().flatten().flatten() {
+                if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                    restore(&entry.path());
+                }
+            }
+        }
+        restore(&self.0.join("workflow/tree"));
+        // A successor's imported attempt holds its predecessor's copy (REQ-LOCALRUN-195).
+        for attempt in fs::read_dir(self.0.join(ATTEMPTS_DIRECTORY))
+            .into_iter()
+            .flatten()
+            .flatten()
+        {
+            restore(&attempt.path().join("workflow/tree"));
+        }
+    }
+}
+
+const TREE_ROOT_WORKFLOW: &str = "schemaVersion: 1\nprograms: [bin]\nexclude: [\"tests/\"]\nsteps:\n  first:\n    kind: cmd\n    command:\n      argv: [\"hello\"]\n  second:\n    kind: cmd\n    dependsOn: [first]\n    command:\n      argv: [\"true\"]\n";
+const TREE_PROGRAM: &str = "#!/bin/sh\necho hello\n";
+
+fn tree_fixture() -> AdmittedFixture {
+    AdmittedFixture::from_tree(
+        TREE_ROOT_WORKFLOW,
+        &[
+            ("bin/hello", TREE_PROGRAM, 0o755),
+            ("prompts/a.md", "A prompt.\n", 0o644),
+            ("tests/t.py", "assert True\n", 0o644),
+        ],
+    )
+}
+
+// REQ-LOCALRUN-170, REQ-LOCALRUN-98
+#[test]
+fn a_tree_run_directory_pins_the_tree_read_only_beside_the_closure() {
+    let fixture = tree_fixture();
+    let run_path = fixture.run_path("tree");
+    let _writable = WritableTreeCopyOnDrop(run_path.clone());
+
+    let run = InitialLocalRun::create(&run_path, &fixture.admitted).unwrap();
+    drop(run);
+
+    let workflow = run_path.join("workflow");
+    assert_eq!(
+        directory_names(&workflow),
+        ["files", "manifest.json", "tree"]
+    );
+    let tree = workflow.join("tree");
+    assert_eq!(directory_names(&tree), ["bin", "prompts", "workflow.yaml"]);
+    assert_eq!(
+        fs::read(tree.join("bin/hello")).unwrap(),
+        TREE_PROGRAM.as_bytes()
+    );
+    assert_eq!(mode(&tree.join("bin/hello")), 0o555);
+    assert_eq!(fs::read(tree.join("prompts/a.md")).unwrap(), b"A prompt.\n");
+    assert_eq!(mode(&tree.join("prompts/a.md")), 0o444);
+    assert_eq!(
+        fs::read(tree.join("workflow.yaml")).unwrap(),
+        TREE_ROOT_WORKFLOW.as_bytes()
+    );
+    assert_eq!(mode(&tree.join("workflow.yaml")), 0o444);
+    assert!(!tree.join("tests").exists());
+    for directory in [&tree, &tree.join("bin"), &tree.join("prompts")] {
+        assert_eq!(mode(directory), 0o555, "{}", directory.display());
+    }
+    // The closure is retained as before, beside the copy.
+    assert_eq!(
+        fs::read(workflow.join("files/0001")).unwrap(),
+        TREE_ROOT_WORKFLOW.as_bytes()
+    );
+
+    let manifest: Value =
+        serde_json::from_slice(&fs::read(workflow.join("manifest.json")).unwrap()).unwrap();
+    let admitted_tree = fixture.admitted.tree().unwrap();
+    assert_eq!(
+        manifest["tree"],
+        json!({
+            "digest": {
+                "algorithm": "sha256",
+                "value": admitted_tree.digest().value,
+            },
+            "relativeDirectory": "tree",
+            "programs": ["bin"],
+            "requiredTools": [],
+        })
+    );
+}
+
+const EDGE_ROOT_WORKFLOW: &str = "schemaVersion: 1\nsteps:\n  design:\n    kind: workflow\n    workflow: design.yaml\n    on:\n      succeeded: build\n      failed: exit.failed\n  build:\n    kind: workflow\n    workflow: build.yaml\n    on:\n      succeeded: exit.succeeded\n      failed: exit.failed\nexports:\n  parts:\n    ref: outputs.design.parts\n";
+const EDGE_CHILD_WORKFLOW: &str = "schemaVersion: 1\nsteps:\n  work:\n    kind: cmd\n    command: {argv: [\"true\"]}\n    outputs:\n      parts: {kind: text, from: path, path: parts.txt}\nexports:\n  parts:\n    ref: outputs.work.parts\n";
+
+fn retained_text(node: &str, output: &str, bytes: &[u8]) -> RetainedOutputV1 {
+    RetainedOutputV1::Text {
+        name: output.to_owned(),
+        producer: None,
+        carrier: RetainedCarrierV1 {
+            relative_path: retained_value_relative_path(AttemptNodeRoleV1::Step, node, output),
+            media_type: "text/plain; charset=utf-8".to_owned(),
+            size_bytes: u64::try_from(bytes.len()).unwrap(),
+            digest: DigestV1::sha256(bytes),
+        },
+    }
+}
+
+impl DurableDeadline for crate::workflow::test_support::step_clock::TestInstant {
+    fn deadline_utc(&self) -> OffsetDateTime {
+        OffsetDateTime::UNIX_EPOCH + self.0
+    }
+}
+
+/// A child dispatcher with a stop control in force for every step (REQ-WFEXEC-62).
+#[derive(Clone)]
+struct StoppingChildDispatcher;
+
+impl crate::workflow::step_runtime::ChildRunDispatcher for StoppingChildDispatcher {
+    async fn run(
+        &self,
+        _request: crate::workflow::step_runtime::ChildRunRequest,
+        _control: crate::workflow::step_runtime::ChildRunControl,
+    ) -> crate::workflow::step_runtime::ChildRunOutcome {
+        crate::workflow::step_runtime::ChildRunOutcome::Interrupted
+    }
+
+    async fn stop_before(&self, _step: &str) -> bool {
+        true
+    }
+}
+
+fn edge_tree_fixture() -> AdmittedFixture {
+    AdmittedFixture::from_tree(
+        EDGE_ROOT_WORKFLOW,
+        &[
+            ("design.yaml", EDGE_CHILD_WORKFLOW, 0o644),
+            ("build.yaml", EDGE_CHILD_WORKFLOW, 0o644),
+        ],
+    )
+}
+
+/// Executes `run`'s attempt with a stop in force before every step, so it ends on the
+/// `stop` wait entered before `design` (REQ-WFEXEC-62).
+async fn execute_to_a_stop_wait(
+    fixture: &AdmittedFixture,
+    run: &InitialLocalRun,
+) -> crate::workflow::runtime::EnteredWait {
+    let artifacts =
+        ArtifactStaging::create(fixture.admitted.execution(), run.private_directory()).unwrap();
+    let inputs = crate::workflow::input::InputStaging::create(
+        fixture.admitted.execution(),
+        run.private_directory(),
+    )
+    .unwrap();
+    let diagnostics = crate::workflow::diagnostic::StepDiagnosticLog::default();
+    let result = crate::workflow::execution::execute_workflow_with_children(
+        fixture.admitted.clone(),
+        &artifacts,
+        &inputs,
+        &diagnostics,
+        crate::workflow::step_runtime::AgentExecution::disabled(),
+        crate::workflow::step_runtime::ChildRuns::Enabled {
+            dispatcher: StoppingChildDispatcher,
+            controls: crate::workflow::step_runtime::ControlContext::default(),
+        },
+        crate::workflow::test_support::step_clock::TestClock,
+        run.commit_port(
+            diagnostics.clone(),
+            InvocationAccountingLog::default(),
+            artifacts.clone(),
+        ),
+        crate::workflow::observation::NoopExecutionObserver,
+        crate::workflow::step_runtime::WorkflowExecutionStart::initial(
+            run.process_guard_registry(),
+        ),
+    )
+    .await
+    .unwrap();
+    match result.outcome {
+        crate::workflow::runtime::RunOutcome::Waiting { wait } => wait,
+        other => panic!("the attempt did not end on the stop wait: {other:?}"),
+    }
+}
+
+// REQ-WFEXEC-61, INV-ENGINE-20
+#[tokio::test]
+async fn a_committed_wait_settles_the_attempt_waiting_with_a_settlement_snapshot() {
+    let fixture = edge_tree_fixture();
+    let run_path = fixture.run_path("waiting");
+    let _writable = WritableTreeCopyOnDrop(run_path.clone());
+    let run = InitialLocalRun::create(&run_path, &fixture.admitted).unwrap();
+    execute_to_a_stop_wait(&fixture, &run).await;
+
+    let attempt = read_state(run.root_handle()).unwrap().attempts.remove(0);
+    assert_eq!(attempt.state, AttemptStateV1::Waiting);
+    assert!(attempt.state.is_terminal());
+    assert!(attempt.settled_at.is_some());
+    assert_eq!(
+        attempt.settlement_snapshot.unwrap().settled_by,
+        Some(WorkspaceSnapshotSettlementV1::Engine)
+    );
+    assert!(attempt.finalization.is_none());
+    assert!(attempt.progress.steps.iter().all(|step| {
+        step.state == AttemptStepStateV1::NotRun
+            && step.detail
+                == Some(NodeDetail::NotRun(
+                    crate::workflow::evidence::NonExecutionDetail::not_reached(),
+                ))
+    }));
+}
+
+// REQ-WFEXEC-58
+#[test]
+fn an_inherited_workflow_step_retains_the_outcome_a_continuation_routes_from() {
+    let fixture = AdmittedFixture::from_tree(
+        EDGE_ROOT_WORKFLOW,
+        &[
+            ("design.yaml", EDGE_CHILD_WORKFLOW, 0o644),
+            ("build.yaml", EDGE_CHILD_WORKFLOW, 0o644),
+        ],
+    );
+    let run_path = fixture.run_path("edge");
+    let _writable = WritableTreeCopyOnDrop(run_path.clone());
+    let run = InitialLocalRun::create(&run_path, &fixture.admitted).unwrap();
+    let mut attempt = read_state(run.root_handle()).unwrap().attempts.remove(0);
+    drop(run);
+    let workflow = fixture.admitted.workflow();
+    let design = attempt
+        .progress
+        .steps
+        .iter()
+        .position(|step| step.id == "design")
+        .unwrap();
+
+    // A succeeded `workflow` step commits its outcome and only the child exports that were
+    // available; one without its outcome is not a committed child result.
+    attempt.progress.steps[design].state = AttemptStepStateV1::Succeeded;
+    attempt.progress.steps[design].outputs =
+        Some(vec![retained_text("design", "outcome", b"succeeded")]);
+    assert!(validate_retained_outputs_against_definition(&attempt, workflow).is_ok());
+    attempt.progress.steps[design].outputs = Some(vec![retained_text("design", "parts", b"parts")]);
+    assert!(validate_retained_outputs_against_definition(&attempt, workflow).is_err());
+
+    // Inherited, its outcome is loaded beside the exported output whatever the re-executed
+    // steps read; a step that inherited a skip retains no outcome to load.
+    attempt.progress.steps[design].state = AttemptStepStateV1::Inherited;
+    attempt.progress.steps[design].outputs =
+        Some(vec![retained_text("design", "outcome", b"succeeded")]);
+    assert_eq!(
+        required_inherited_outputs(&attempt, workflow).unwrap(),
+        BTreeSet::from([
+            ("design".to_owned(), "outcome".to_owned()),
+            ("design".to_owned(), "parts".to_owned()),
+        ])
+    );
+    attempt.progress.steps[design].outputs = Some(Vec::new());
+    assert_eq!(
+        required_inherited_outputs(&attempt, workflow).unwrap(),
+        BTreeSet::from([("design".to_owned(), "parts".to_owned())])
+    );
+}
+
+fn run_record_validator() -> jsonschema::Validator {
+    let path =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../schemas/workflow-run-v1.schema.json");
+    let schema = serde_json::from_slice::<Value>(&fs::read(path).unwrap()).unwrap();
+    jsonschema::draft202012::new(&schema).unwrap()
+}
+
+fn tree_record(fixture: &AdmittedFixture, definition: Option<(String, u64)>) -> WorkflowRunRecord {
+    let digest = format!("sha256:{}", fixture.admitted.tree().unwrap().digest().value);
+    WorkflowRunRecord::new(definition, &digest, "workflow.yaml", "tester")
+}
+
+fn assert_layout_refused(run_path: &Path) {
+    match verify_existing_run_layout(&open_directory_path(run_path).unwrap()) {
+        Err(LocalRunDirectoryError::StateFile { source, .. })
+            if matches!(*source, LocalRunDirectoryError::StateInvalid) => {}
+        other => panic!("the layout check accepted or misreported the directory: {other:?}"),
+    }
+}
+
+// REQ-LOCALRUN-175, REQ-LOCALRUN-98, REQ-WFDEF-4
+#[test]
+fn a_tree_run_created_with_a_record_holds_run_json_beside_local_run_json() {
+    let fixture = tree_fixture();
+    let validator = run_record_validator();
+    let definition = "def_01jcf8y6m3q7v2k9x4t5r8w0zp";
+    for (name, admitted_definition) in [
+        ("definition-run", Some((definition.to_owned(), 3))),
+        ("path-run", None),
+    ] {
+        let run_path = fixture.run_path(name);
+        let _writable = WritableTreeCopyOnDrop(run_path.clone());
+        let record = tree_record(&fixture, admitted_definition.clone());
+        let run = InitialLocalRun::create_with_record(&run_path, &fixture.admitted, Some(&record))
+            .unwrap();
+        drop(run);
+
+        assert_eq!(
+            directory_names(&run_path),
+            [
+                ".private",
+                "attempts",
+                "local-run.json",
+                "run.json",
+                "run.lock",
+                "state.json",
+                "workflow"
+            ]
+        );
+        assert_eq!(mode(&run_path.join(RUN_RECORD_FILE)), 0o600);
+        let bytes = fs::read(run_path.join(RUN_RECORD_FILE)).unwrap();
+        assert_eq!(bytes.last(), Some(&b'\n'));
+        let document = serde_json::from_slice::<Value>(&bytes).unwrap();
+        assert!(
+            validator.is_valid(&document),
+            "{name}: {:?}",
+            validator.iter_errors(&document).collect::<Vec<_>>()
+        );
+        let parsed = serde_json::from_slice::<WorkflowRunRecord>(&bytes).unwrap();
+        assert_eq!(parsed, record);
+        assert!(parsed.is_valid());
+        let (definition_value, revision_value) = match &admitted_definition {
+            Some((id, revision)) => (json!(id), json!(revision)),
+            None => (Value::Null, Value::Null),
+        };
+        assert_eq!(
+            document,
+            json!({
+                "schemaVersion": 1,
+                "id": record.id,
+                "definition": definition_value,
+                "revision": revision_value,
+                "tree": format!("sha256:{}", fixture.admitted.tree().unwrap().digest().value),
+                "workflow": "workflow.yaml",
+                "subject": null,
+                "parent": null,
+                "owner": "tester",
+                "state": "running",
+                "position": [],
+                "outcome": null,
+                "startedAt": record.started_at,
+                "attempts": 1,
+                "predecessor": null,
+                "successor": null,
+                "external": {},
+                "edges": {},
+            })
+        );
+        verify_existing_run_layout(&open_directory_path(&run_path).unwrap()).unwrap();
+    }
+}
+
+const CHILD_PARENT_WORKFLOW: &str = "schemaVersion: 1\nprograms: [bin]\nsteps:\n  design:\n    kind: workflow\n    workflow: design.yaml\n    on:\n      succeeded: exit.succeeded\n      failed: exit.failed\n";
+const CHILD_DESIGN_WORKFLOW: &str = "schemaVersion: 1\nsteps:\n  first:\n    kind: cmd\n    command: {argv: [\"hello\"]}\n  second:\n    kind: cmd\n    dependsOn: [first]\n    command: {argv: [\"true\"]}\n";
+
+/// Every file under `root` by relative path, with its bytes and mode.
+fn tree_files(root: &Path) -> BTreeMap<String, (Vec<u8>, u32)> {
+    fn walk(root: &Path, directory: &Path, files: &mut BTreeMap<String, (Vec<u8>, u32)>) {
+        for entry in fs::read_dir(directory).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                walk(root, &path, files);
+            } else {
+                let relative = path
+                    .strip_prefix(root)
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .to_owned();
+                files.insert(relative, (fs::read(&path).unwrap(), mode(&path)));
+            }
+        }
+    }
+    let mut files = BTreeMap::new();
+    walk(root, root, &mut files);
+    files
+}
+
+fn manifest_tree(run_path: &Path) -> Value {
+    serde_json::from_slice::<Value>(&fs::read(run_path.join("workflow/manifest.json")).unwrap())
+        .unwrap()["tree"]
+        .clone()
+}
+
+// REQ-LOCALRUN-177, REQ-LOCALRUN-98, REQ-LOCALRUN-101, REQ-WFDEF-4
+// INV-ENGINE-19
+#[test]
+fn a_child_run_nests_under_its_parent_with_the_next_ordinal_and_the_parents_tree() {
+    let fixture = AdmittedFixture::from_tree(
+        CHILD_PARENT_WORKFLOW,
+        &[
+            ("bin/hello", TREE_PROGRAM, 0o755),
+            ("design.yaml", CHILD_DESIGN_WORKFLOW, 0o644),
+            ("prompts/a.md", "A prompt.\n", 0o644),
+        ],
+    );
+    let validator = run_record_validator();
+    let parent_path = fixture.run_path("parent");
+    let _writable_parent = WritableTreeCopyOnDrop(parent_path.clone());
+    let parent_record = tree_record(
+        &fixture,
+        Some(("def_01jcf8y6m3q7v2k9x4t5r8w0zp".to_owned(), 3)),
+    );
+    let parent =
+        InitialLocalRun::create_with_record(&parent_path, &fixture.admitted, Some(&parent_record))
+            .unwrap();
+    assert_eq!(next_child_ordinal(&parent, "design").unwrap(), 1);
+    let parent_copy = parent.tree_copy_directory();
+    let parent_files = tree_files(&parent_copy);
+
+    let mut children = Vec::new();
+    for ordinal in ["000001", "000002"] {
+        let admitted = fixture.admit_child(&parent_copy, "design.yaml");
+        let record = WorkflowRunRecord::child_of(&parent_record, "design", "design.yaml", None);
+        let child = create_child(&parent, "design", None, &admitted, &record).unwrap();
+        let child_path = parent_path.join("children/design").join(ordinal);
+        assert_eq!(child.run_directory(), child_path.canonicalize().unwrap());
+        children.push((
+            WritableTreeCopyOnDrop(child_path.clone()),
+            child_path,
+            child,
+        ));
+    }
+    assert_eq!(directory_names(&parent_path.join("children")), ["design"]);
+    assert_eq!(
+        directory_names(&parent_path.join("children/design")),
+        ["000001", "000002"]
+    );
+    assert_eq!(mode(&parent_path.join("children")), 0o700);
+    assert_eq!(mode(&parent_path.join("children/design")), 0o700);
+    assert_eq!(next_child_ordinal(&parent, "design").unwrap(), 3);
+    assert_eq!(next_child_ordinal(&parent, "build").unwrap(), 1);
+
+    let mut child_ids = BTreeSet::new();
+    for (_, child_path, _) in &children {
+        verify_existing_run_layout(&open_directory_path(child_path).unwrap()).unwrap();
+        let child_copy = child_path.join("workflow/tree");
+        assert_eq!(tree_files(&child_copy), parent_files);
+        assert_eq!(manifest_tree(child_path), manifest_tree(&parent_path));
+
+        let document =
+            serde_json::from_slice::<Value>(&fs::read(child_path.join(RUN_RECORD_FILE)).unwrap())
+                .unwrap();
+        assert!(
+            validator.is_valid(&document),
+            "{:?}",
+            validator.iter_errors(&document).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            document["parent"],
+            json!({"run": parent_record.id, "step": "design"})
+        );
+        for field in ["definition", "revision", "tree", "owner"] {
+            assert_eq!(
+                document[field],
+                serde_json::to_value(&parent_record).unwrap()[field],
+                "{field}"
+            );
+        }
+        assert_eq!(document["workflow"], "design.yaml");
+        assert_eq!(document["state"], "running");
+        let id = document["id"].as_str().unwrap().to_owned();
+        assert_ne!(id, parent_record.id);
+        assert!(child_ids.insert(id));
+    }
+
+    // The parent admits `children/` beside its run record, and only as a directory.
+    assert_eq!(
+        directory_names(&parent_path),
+        [
+            ".private",
+            "attempts",
+            "children",
+            "local-run.json",
+            "run.json",
+            "run.lock",
+            "state.json",
+            "workflow"
+        ]
+    );
+    verify_existing_run_layout(&open_directory_path(&parent_path).unwrap()).unwrap();
+    fs::write(parent_path.join("children.txt"), b"stray").unwrap();
+    assert_layout_refused(&parent_path);
+    fs::remove_file(parent_path.join("children.txt")).unwrap();
+    fs::rename(parent_path.join("children"), parent_path.join("moved")).unwrap();
+    fs::write(parent_path.join("children"), b"not a directory").unwrap();
+    assert_layout_refused(&parent_path);
+    fs::remove_file(parent_path.join("children")).unwrap();
+    fs::rename(parent_path.join("moved"), parent_path.join("children")).unwrap();
+
+    // A child is a run by its own path: one that failed is retried from its retained copy
+    // while its parent never settled.
+    let (_writable_child, child_path, child) = children.remove(0);
+    settle_as_workflow_failed(&child);
+    drop(child);
+    drop(parent);
+    let LocalRetryOpen::Acquired(pending) = acquire_local_retry(&child_path).unwrap() else {
+        panic!("a failed child run should be retryable by its own path");
+    };
+    assert_eq!(
+        pending.verify_tree_copy().unwrap().unwrap().digest.value,
+        fixture.admitted.tree().unwrap().digest().value
+    );
+}
+
+// REQ-LOCALRUN-177
+#[test]
+fn a_child_run_whose_record_does_not_descend_from_the_parent_is_refused() {
+    let fixture = AdmittedFixture::from_tree(
+        CHILD_PARENT_WORKFLOW,
+        &[
+            ("bin/hello", TREE_PROGRAM, 0o755),
+            ("design.yaml", CHILD_DESIGN_WORKFLOW, 0o644),
+        ],
+    );
+    let parent_path = fixture.run_path("parent");
+    let _writable_parent = WritableTreeCopyOnDrop(parent_path.clone());
+    let parent_record = tree_record(&fixture, None);
+    let parent =
+        InitialLocalRun::create_with_record(&parent_path, &fixture.admitted, Some(&parent_record))
+            .unwrap();
+    let admitted = fixture.admit_child(&parent.tree_copy_directory(), "design.yaml");
+    let child_of = WorkflowRunRecord::child_of(&parent_record, "design", "design.yaml", None);
+    let unrelated =
+        WorkflowRunRecord::child_of(&tree_record(&fixture, None), "design", "design.yaml", None);
+    let mut other_owner = child_of.clone();
+    other_owner.owner = "someone-else".to_owned();
+    let mut other_tree = child_of.clone();
+    other_tree.tree = format!("sha256:{}", "0".repeat(64));
+    for (step, record) in [
+        ("build", &child_of),
+        ("design", &unrelated),
+        ("design", &other_owner),
+        ("design", &other_tree),
+        ("../design", &child_of),
+    ] {
+        assert!(
+            matches!(
+                create_child(&parent, step, None, &admitted, record),
+                Err(LocalRunDirectoryError::StateInvalid | LocalRunDirectoryError::InvalidPath)
+            ),
+            "{step}: {record:?}"
+        );
+    }
+    assert!(!parent_path.join("children/design/000001").exists());
+}
+
+// REQ-LOCALRUN-177, REQ-WFDEF-4, REQ-WFEXEC-66, REQ-WFEXEC-68
+// INV-ENGINE-19, INV-ENGINE-23
+#[test]
+fn a_fan_out_child_nests_under_its_element_and_the_parent_position_names_it() {
+    let fixture = AdmittedFixture::from_tree(
+        CHILD_PARENT_WORKFLOW,
+        &[
+            ("bin/hello", TREE_PROGRAM, 0o755),
+            ("build.yaml", CHILD_DESIGN_WORKFLOW, 0o644),
+            ("design.yaml", CHILD_DESIGN_WORKFLOW, 0o644),
+        ],
+    );
+    let validator = run_record_validator();
+    let parent_path = fixture.run_path("parent");
+    let _writable_parent = WritableTreeCopyOnDrop(parent_path.clone());
+    let parent_record = tree_record(&fixture, Some((HOME_DEFINITION.to_owned(), 1)));
+    let parent =
+        InitialLocalRun::create_with_record(&parent_path, &fixture.admitted, Some(&parent_record))
+            .unwrap();
+    let parent_copy = parent.tree_copy_directory();
+    let position = || {
+        serde_json::from_slice::<Value>(&fs::read(parent_path.join(RUN_RECORD_FILE)).unwrap())
+            .unwrap()["position"]
+            .clone()
+    };
+    assert_eq!(position(), json!([]));
+
+    // A record and a directory disagree about the element: refused before anything is written.
+    let admitted = fixture.admit_child(&parent_copy, "build.yaml");
+    for (item, record_item) in [(Some(2), None), (None, Some(2)), (Some(2), Some(3))] {
+        let record =
+            WorkflowRunRecord::child_of(&parent_record, "build", "build.yaml", record_item);
+        assert!(
+            matches!(
+                create_child(&parent, "build", item, &admitted, &record),
+                Err(LocalRunDirectoryError::StateInvalid)
+            ),
+            "{item:?} {record_item:?}"
+        );
+    }
+    assert!(!parent_path.join("children/build").exists());
+    assert_eq!(position(), json!([]));
+
+    let mut created = Vec::new();
+    for (step, workflow, item, directory, expected_position) in [
+        (
+            "build",
+            "build.yaml",
+            Some(3),
+            "children/build/000003/000001",
+            json!(["build", {"item": 3}]),
+        ),
+        (
+            "build",
+            "build.yaml",
+            Some(2),
+            "children/build/000002/000001",
+            json!(["build", {"item": 2}]),
+        ),
+        (
+            "build",
+            "build.yaml",
+            Some(2),
+            "children/build/000002/000002",
+            json!(["build", {"item": 2}]),
+        ),
+        (
+            "design",
+            "design.yaml",
+            None,
+            "children/design/000001",
+            json!(["design"]),
+        ),
+    ] {
+        let admitted = fixture.admit_child(&parent_copy, workflow);
+        let record = WorkflowRunRecord::child_of(&parent_record, step, workflow, item);
+        let child = create_child(&parent, step, item, &admitted, &record).unwrap();
+        let child_path = parent_path.join(directory);
+        assert_eq!(child.run_directory(), child_path.canonicalize().unwrap());
+        // The parent's position names the element; it is written before the child exists.
+        assert_eq!(position(), expected_position, "{directory}");
+        let document =
+            serde_json::from_slice::<Value>(&fs::read(child_path.join(RUN_RECORD_FILE)).unwrap())
+                .unwrap();
+        assert!(
+            validator.is_valid(&document),
+            "{:?}",
+            validator.iter_errors(&document).collect::<Vec<_>>()
+        );
+        let mut parent_field = json!({"run": parent_record.id, "step": step});
+        if let Some(item) = item {
+            parent_field["item"] = json!(item);
+        }
+        assert_eq!(document["parent"], parent_field);
+        created.push((
+            WritableTreeCopyOnDrop(child_path.clone()),
+            (step.to_owned(), item, child_path, record.id.clone()),
+            child,
+        ));
+        if step == "build" && item == Some(2) {
+            // The element the position names, not the highest element, holds the latest child.
+            let (latest, state, latest_item) =
+                latest_child_run(&parent_path, "build").unwrap().unwrap();
+            assert_eq!(latest, parent_path.join(directory).canonicalize().unwrap());
+            assert_eq!((state, latest_item), (RunState::Running, Some(2)));
+        }
+    }
+    assert_eq!(
+        directory_names(&parent_path.join("children/build")),
+        ["000002", "000003"]
+    );
+    assert_eq!(mode(&parent_path.join("children/build/000002")), 0o700);
+    assert_eq!(mode(&parent_path.join("children/build/000003")), 0o700);
+
+    // Without a position naming the step, the highest element's latest child is the latest.
+    let (latest, _, latest_item) = latest_child_run(&parent_path, "build").unwrap().unwrap();
+    assert_eq!(
+        (latest, latest_item),
+        (
+            parent_path
+                .join("children/build/000003/000001")
+                .canonicalize()
+                .unwrap(),
+            Some(3)
+        )
+    );
+    let (latest, _, latest_item) = latest_child_run(&parent_path, "design").unwrap().unwrap();
+    assert_eq!(
+        (latest, latest_item),
+        (
+            parent_path
+                .join("children/design/000001")
+                .canonicalize()
+                .unwrap(),
+            None
+        )
+    );
+    assert_eq!(latest_child_run(&parent_path, "review").unwrap(), None);
+
+    // `child_runs` lists step, then element, then ordinal.
+    let listed = child_runs(&parent_path)
+        .unwrap()
+        .into_iter()
+        .map(|child| {
+            (
+                child.step,
+                child.item,
+                child.ordinal,
+                child.directory,
+                child.record.id,
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut expected = created
+        .iter()
+        .map(|(_, (step, item, path, id), _)| {
+            let ordinal = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap()
+                .parse::<u64>()
+                .unwrap();
+            (
+                step.clone(),
+                *item,
+                ordinal,
+                path.canonicalize().unwrap(),
+                id.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+    expected.sort_by(|left, right| (&left.0, left.1, left.2).cmp(&(&right.0, right.1, right.2)));
+    assert_eq!(listed, expected);
+
+    // The position is kept while the run lives and cleared once it exits.
+    parent
+        .update_run_record(RunState::Waiting, 1, None)
+        .unwrap();
+    assert_eq!(position(), json!(["design"]));
+    parent
+        .update_run_record(RunState::Exited, 1, Some("succeeded"))
+        .unwrap();
+    assert_eq!(position(), json!([]));
+
+    // A position element or parent item below 1, or a non-identifier step, is not a record.
+    for position in [
+        json!([{"item": 0}]),
+        json!(["build", {"item": 0}]),
+        json!(["build", {"item": 2, "index": 1}]),
+        json!(["Build"]),
+        json!([7]),
+    ] {
+        let mut record = parent_record.clone();
+        record.position = position.as_array().unwrap().clone();
+        assert!(!record.is_valid(), "{position}");
+    }
+    let mut record = parent_record.clone();
+    record.position = vec![json!("build"), json!({"item": 2})];
+    assert!(record.is_valid());
+    let mut child = WorkflowRunRecord::child_of(&parent_record, "build", "build.yaml", Some(1));
+    assert!(child.is_valid());
+    child.parent.as_mut().unwrap().item = Some(0);
+    assert!(!child.is_valid());
+}
+
+/// A tree run with a run record whose first attempt ended on the `stop` wait before
+/// `design`, left as the CLI leaves it: the wait record written, then `run.json` reading
+/// `waiting` (REQ-LOCALRUN-178, INV-ENGINE-20).
+async fn waiting_tree_run(
+    fixture: &AdmittedFixture,
+    name: &str,
+) -> (PathBuf, WaitRecord, WritableTreeCopyOnDrop) {
+    waiting_tree_run_on(fixture, name, |stop| stop).await
+}
+
+/// `waiting_tree_run` with the recorded wait `record` makes of the stop wait's record.
+async fn waiting_tree_run_on(
+    fixture: &AdmittedFixture,
+    name: &str,
+    record_of: impl FnOnce(WaitRecord) -> WaitRecord,
+) -> (PathBuf, WaitRecord, WritableTreeCopyOnDrop) {
+    let run_path = fixture.run_path(name);
+    let writable = WritableTreeCopyOnDrop(run_path.clone());
+    let record = tree_record(fixture, None);
+    let run =
+        InitialLocalRun::create_with_record(&run_path, &fixture.admitted, Some(&record)).unwrap();
+    let wait = execute_to_a_stop_wait(fixture, &run).await;
+    let payload = json!({"by": "saeed", "payload": {"before": "design"}});
+    let wait = record_of(
+        WaitRecord::entered(
+            &wait,
+            None,
+            payload.as_object().unwrap().clone(),
+            um_support::utc_now(),
+            &ResolvedInputs::default(),
+            &BTreeMap::new(),
+        )
+        .unwrap(),
+    );
+    run.record_wait(&wait).unwrap();
+    run.update_run_record(RunState::Waiting, 1, None).unwrap();
+    drop(run);
+    (run_path, wait, writable)
+}
+
+/// A condition source that answers every observation with `answer` and counts them.
+struct ScriptedConditions {
+    answer:
+        Result<Vec<crate::workflow::wait::ExternalEvent>, crate::workflow::wait::ConditionError>,
+    observed: std::cell::Cell<usize>,
+}
+
+impl ScriptedConditions {
+    fn answering(
+        answer: Result<
+            Vec<crate::workflow::wait::ExternalEvent>,
+            crate::workflow::wait::ConditionError,
+        >,
+    ) -> Self {
+        Self {
+            answer,
+            observed: std::cell::Cell::new(0),
+        }
+    }
+}
+
+impl crate::workflow::wait::ConditionSource for ScriptedConditions {
+    fn supports(&self, _source: &str, _event: &str) -> bool {
+        true
+    }
+
+    fn observe(
+        &self,
+        _wait: &WaitRecord,
+    ) -> Result<Vec<crate::workflow::wait::ExternalEvent>, crate::workflow::wait::ConditionError>
+    {
+        self.observed.set(self.observed.get() + 1);
+        self.answer.clone()
+    }
+}
+
+const QUEUED_PULL_REQUEST: &str = "https://github.com/useful-machinery/platform/pull/3958";
+
+fn queue_settled(state: &str) -> crate::workflow::wait::ExternalEvent {
+    crate::workflow::wait::ExternalEvent {
+        source: "github".to_owned(),
+        event: "pull_request.queue_settled".to_owned(),
+        at: "2026-11-07T22:30:00Z".to_owned(),
+        payload: json!({"pullRequest": QUEUED_PULL_REQUEST, "state": state, "headSha": "4f2a"})
+            .as_object()
+            .unwrap()
+            .clone(),
+    }
+}
+
+// REQ-CONTINUE-74, REQ-WFEXEC-65: a waiting run's `external` wait is resolved by the events
+// its condition source observes, never by the controls; a condition the source cannot read
+// is reported as such, and a local wait never asks the source.
+#[tokio::test]
+async fn inspect_wait_asks_the_condition_source_for_an_external_wait_alone() {
+    let fixture = edge_tree_fixture();
+    let (run_path, wait, _writable) =
+        waiting_tree_run_on(&fixture, "external", |stop| WaitRecord {
+            kind: crate::workflow::wait::WaitKind::External,
+            rule: crate::workflow::wait::WaitRule {
+                source: "github".to_owned(),
+                event: vec!["pull_request.queue_settled".to_owned()],
+                where_: format!(
+                    "event.pullRequest == \"{QUEUED_PULL_REQUEST}\" and event.state == \"merged\""
+                ),
+            },
+            ..stop
+        })
+        .await;
+    let inspect = |conditions: &ScriptedConditions| {
+        let inspection = inspect_wait(&run_path, conditions).unwrap().inspection;
+        assert_eq!(conditions.observed.get(), 1, "{inspection:?}");
+        inspection
+    };
+    assert_eq!(
+        inspect(&ScriptedConditions::answering(Ok(Vec::new()))),
+        WaitInspection::Held { wait: wait.clone() }
+    );
+    assert_eq!(
+        inspect(&ScriptedConditions::answering(Ok(vec![queue_settled(
+            "dequeued"
+        )]))),
+        WaitInspection::Held { wait: wait.clone() }
+    );
+    let merged = queue_settled("merged");
+    assert_eq!(
+        inspect(&ScriptedConditions::answering(Ok(vec![
+            queue_settled("dequeued"),
+            merged.clone(),
+        ]))),
+        WaitInspection::Satisfied {
+            wait: wait.clone(),
+            by: ResolvedBy::External(merged),
+        }
+    );
+    let error = crate::workflow::wait::ConditionError::unavailable("GitHub answered HTTP 500");
+    assert_eq!(
+        inspect(&ScriptedConditions::answering(Err(error.clone()))),
+        WaitInspection::ConditionUnavailable { wait, error }
+    );
+
+    // An `answer` wait on source `um` reads the controls and never the condition source.
+    let (run_path, wait, _writable) = waiting_tree_run_on(&fixture, "answer", |stop| WaitRecord {
+        kind: crate::workflow::wait::WaitKind::Answer,
+        rule: crate::workflow::wait::derive_rule(crate::workflow::wait::WaitKind::Answer, false)
+            .unwrap(),
+        ..stop
+    })
+    .await;
+    let conditions = ScriptedConditions::answering(Ok(vec![queue_settled("merged")]));
+    assert_eq!(
+        inspect_wait(&run_path, &conditions).unwrap().inspection,
+        WaitInspection::Held { wait }
+    );
+    assert_eq!(conditions.observed.get(), 0);
+}
+
+fn run_record_document(run_path: &Path) -> Value {
+    let document =
+        serde_json::from_slice::<Value>(&fs::read(run_path.join(RUN_RECORD_FILE)).unwrap())
+            .unwrap();
+    let validator = run_record_validator();
+    assert!(validator.is_valid(&document), "{document}");
+    document
+}
+
+// REQ-LOCALRUN-178, REQ-LOCALRUN-175, REQ-LOCALRUN-98, INV-ENGINE-20
+#[tokio::test]
+async fn a_waiting_run_holds_its_wait_record_until_a_continuation_begins() {
+    let fixture = edge_tree_fixture();
+    let (run_path, wait, _writable) = waiting_tree_run(&fixture, "waiting-record").await;
+    let root_record = run_path.join(WAIT_RECORD_FILE);
+    let attempt_record = run_path.join("attempts/000001").join(WAIT_RECORD_FILE);
+    let bytes = fs::read(&root_record).unwrap();
+    assert_eq!(bytes, fs::read(&attempt_record).unwrap());
+    assert_eq!(serde_json::from_slice::<WaitRecord>(&bytes).unwrap(), wait);
+    for path in [&root_record, &attempt_record] {
+        assert_eq!(mode(path) & 0o077, 0, "{}", path.display());
+    }
+    assert!(
+        !run_path
+            .join(PRIVATE_DIRECTORY)
+            .join(WAIT_RECORD_TEMPORARY_FILE)
+            .exists()
+    );
+    let record = run_record_document(&run_path);
+    assert_eq!(
+        (&record["state"], &record["outcome"], &record["attempts"]),
+        (&json!("waiting"), &Value::Null, &json!(1))
+    );
+
+    // The wait record and the controls beside it are part of the run directory.
+    let lift = crate::workflow::wait::ControlEvent {
+        source: "um".to_owned(),
+        event: "control.lift".to_owned(),
+        run: record["id"].as_str().unwrap().to_owned(),
+        by: "saeed".to_owned(),
+        at: wait.since.clone(),
+        wait: None,
+        payload: json!({"before": "design"}).as_object().cloned(),
+    };
+    crate::workflow::wait::append_control(&run_path, &lift).unwrap();
+    verify_existing_run_layout(&open_directory_path(&run_path).unwrap()).unwrap();
+
+    let LocalContinuationOpen::Acquired(pending) = acquire_local_continuation(&run_path).unwrap()
+    else {
+        panic!("a waiting run should be continuable");
+    };
+    assert_eq!(pending.wait().unwrap(), Some(wait));
+    let owned = pending
+        .begin(
+            &fixture.admitted,
+            vec!["design".to_owned()],
+            ContinuationDefinitionMode::Inherited,
+            crate::workflow::publication::ContinuationReasonV1::Resume,
+            None,
+        )
+        .unwrap();
+    assert!(!root_record.exists());
+    assert_eq!(fs::read(&attempt_record).unwrap(), bytes);
+    drop(owned);
+
+    // `wait.json` is admitted only as a regular file.
+    fs::create_dir(&root_record).unwrap();
+    assert_layout_refused(&run_path);
+}
+
+// REQ-LOCALRUN-197, REQ-LOCALRUN-195: under the lock, `resolving_control` finds the control
+// that resolves the run's wait, recorded after the run was inspected and the lock taken, and
+// not one that names another run, as a copied control would on a successor.
+#[tokio::test]
+async fn a_pending_continuation_reads_the_control_that_resolves_its_wait_under_the_lock() {
+    let fixture = edge_tree_fixture();
+    let stopped_at = "2026-11-06T16:01:17Z";
+    let (run_path, wait, _writable) =
+        waiting_tree_run_on(&fixture, "resolving-control", |mut stop| {
+            stop.payload.insert("at".to_owned(), json!(stopped_at));
+            stop
+        })
+        .await;
+    let record = run_record_document(&run_path);
+    let lift = |run: &str| crate::workflow::wait::ControlEvent {
+        source: "um".to_owned(),
+        event: crate::workflow::wait::CONTROL_LIFT.to_owned(),
+        run: run.to_owned(),
+        by: "saeed".to_owned(),
+        at: "2026-11-06T17:00:00Z".to_owned(),
+        wait: Some(wait.id()),
+        payload: json!({"before": "design", "stop": stopped_at})
+            .as_object()
+            .cloned(),
+    };
+    let LocalContinuationOpen::Acquired(pending) = acquire_local_continuation(&run_path).unwrap()
+    else {
+        panic!("a waiting run should be continuable");
+    };
+    assert_eq!(pending.resolving_control(&wait).unwrap(), None);
+
+    crate::workflow::wait::append_control(&run_path, &lift("run_01j0000000000000000000zzzz"))
+        .unwrap();
+    assert_eq!(pending.resolving_control(&wait).unwrap(), None);
+
+    let own = lift(record["id"].as_str().unwrap());
+    crate::workflow::wait::append_control(&run_path, &own).unwrap();
+    assert_eq!(pending.resolving_control(&wait).unwrap(), Some(own));
+    assert_eq!(pending.wait().unwrap(), Some(wait));
+    pending.settle_abandoned().unwrap();
+}
+
+// REQ-WFDEF-4, REQ-LOCALRUN-175, REQ-CONTINUE-77, REQ-WFEXEC-64: an `edge` continuation
+// records the edge it took, and a counted one increments its count in `run.json` in the write
+// that bumps `attempts`.
+#[tokio::test]
+async fn an_edge_continuation_records_the_edge_and_counts_a_counted_one() {
+    let fixture = edge_tree_fixture();
+    let (run_path, _, _writable) = waiting_tree_run(&fixture, "edge-counts").await;
+    let edge = |counted| crate::workflow::publication::ContinuationEdgeV1 {
+        step: "build".to_owned(),
+        outcome: "hand_back".to_owned(),
+        target: "design".to_owned(),
+        counted,
+    };
+    let begin = |counted| {
+        let LocalContinuationOpen::Acquired(pending) =
+            acquire_local_continuation(&run_path).unwrap()
+        else {
+            panic!("the run should be continuable");
+        };
+        drop(
+            pending
+                .begin(
+                    &fixture.admitted,
+                    vec!["design".to_owned()],
+                    ContinuationDefinitionMode::Inherited,
+                    crate::workflow::publication::ContinuationReasonV1::Edge,
+                    Some(edge(counted)),
+                )
+                .unwrap(),
+        );
+        let record = run_record_document(&run_path);
+        (record["edges"].clone(), record["attempts"].clone())
+    };
+    assert_eq!(begin(true), (json!({"build.hand_back": 1}), json!(2)));
+    assert_eq!(begin(true), (json!({"build.hand_back": 2}), json!(3)));
+    // An uncounted edge, a backward one, leaves the count; `attempts` follows the caller.
+    assert_eq!(begin(false), (json!({"build.hand_back": 2}), json!(3)));
+
+    let state = read_state(&open_directory_path(&run_path).unwrap()).unwrap();
+    for (attempt, counted) in state.attempts[1..].iter().zip([true, true, false]) {
+        let continuation = attempt.continuation.as_ref().unwrap();
+        assert_eq!(
+            continuation.reason,
+            Some(crate::workflow::publication::ContinuationReasonV1::Edge)
+        );
+        assert_eq!(continuation.edge, Some(edge(counted)));
+        let document = serde_json::to_value(continuation).unwrap();
+        assert_eq!(document["reason"], json!("edge"));
+        assert_eq!(
+            document["edge"],
+            json!({"step": "build", "outcome": "hand_back", "target": "design", "counted": counted})
+        );
+    }
+}
+
+// REQ-LOCALRUN-178, REQ-LOCALRUN-175, REQ-CONTINUE-75
+#[tokio::test]
+async fn ending_a_waiting_run_exits_it_without_another_attempt() {
+    type End = fn(PendingLocalContinuation) -> Result<(), LocalRunDirectoryError>;
+    let withdraw: End = PendingLocalContinuation::withdraw;
+    let cancel: End = |pending| pending.end_waiting(CANCELED_OUTCOME);
+    let fixture = edge_tree_fixture();
+    for (name, end, outcome) in [
+        ("withdrawn", withdraw, "withdrawn"),
+        ("canceled", cancel, "canceled"),
+    ] {
+        let (run_path, wait, _writable) = waiting_tree_run(&fixture, name).await;
+        let state = fs::read(run_path.join(STATE_FILE)).unwrap();
+        let waiting = run_record_document(&run_path);
+
+        let LocalContinuationOpen::Acquired(pending) =
+            acquire_local_continuation(&run_path).unwrap()
+        else {
+            panic!("a waiting run should be continuable");
+        };
+        end(*pending).unwrap();
+
+        let mut ended = waiting;
+        ended["state"] = json!("exited");
+        ended["outcome"] = json!(outcome);
+        assert_eq!(run_record_document(&run_path), ended, "{name}");
+        assert!(!run_path.join(WAIT_RECORD_FILE).exists());
+        assert_eq!(
+            serde_json::from_slice::<WaitRecord>(
+                &fs::read(run_path.join("attempts/000001").join(WAIT_RECORD_FILE)).unwrap()
+            )
+            .unwrap(),
+            wait
+        );
+        assert_eq!(
+            directory_names(&run_path.join(ATTEMPTS_DIRECTORY)),
+            ["000001"]
+        );
+        assert_eq!(fs::read(run_path.join(STATE_FILE)).unwrap(), state);
+
+        // A run that no longer waits cannot be ended again.
+        let LocalContinuationOpen::Acquired(pending) =
+            acquire_local_continuation(&run_path).unwrap()
+        else {
+            panic!("the lock was not released");
+        };
+        assert_eq!(end(*pending), Err(LocalRunDirectoryError::StateConflict));
+    }
+}
+
+// REQ-LOCALRUN-178
+#[tokio::test]
+async fn a_retry_of_a_waiting_run_removes_the_root_wait_record() {
+    let fixture = edge_tree_fixture();
+    let (run_path, _, _writable) = waiting_tree_run(&fixture, "retried").await;
+    let LocalRetryOpen::Acquired(pending) = acquire_local_retry(&run_path).unwrap() else {
+        panic!("a waiting run should be retryable");
+    };
+    let Ok(owned) = pending.begin(&fixture.admitted) else {
+        panic!("the retry of a waiting run did not begin");
+    };
+    assert!(!run_path.join(WAIT_RECORD_FILE).exists());
+    assert!(
+        run_path
+            .join("attempts/000001")
+            .join(WAIT_RECORD_FILE)
+            .exists()
+    );
+    drop(owned);
+}
+
+/// `TREE_ROOT_WORKFLOW` with `second` changed: a later revision of the same definition.
+const REVISED_TREE_ROOT_WORKFLOW: &str = "schemaVersion: 1\nprograms: [bin]\nexclude: [\"tests/\"]\nsteps:\n  first:\n    kind: cmd\n    command:\n      argv: [\"hello\"]\n  second:\n    kind: cmd\n    dependsOn: [first]\n    command:\n      argv: [\"false\"]\n";
+/// `TREE_ROOT_WORKFLOW` with `second` changed another way: a replacement or a stray revision.
+const REPLACED_TREE_ROOT_WORKFLOW: &str = "schemaVersion: 1\nprograms: [bin]\nexclude: [\"tests/\"]\nsteps:\n  first:\n    kind: cmd\n    command:\n      argv: [\"hello\"]\n  second:\n    kind: cmd\n    dependsOn: [first]\n    command:\n      argv: [\"hello\"]\n";
+
+fn revised_tree_fixture() -> AdmittedFixture {
+    AdmittedFixture::from_tree(
+        REVISED_TREE_ROOT_WORKFLOW,
+        &[
+            ("bin/hello", TREE_PROGRAM, 0o755),
+            ("prompts/a.md", "A prompt.\n", 0o644),
+        ],
+    )
+}
+
+/// `fixture`'s root workflow rewritten to `source` in its own source root and admitted again
+/// against its execution root, as a replacement read from beside the original is.
+fn readmitted(fixture: &AdmittedFixture, source: &str) -> AdmittedWorkflow {
+    let source_root = fixture.admitted.workflow().source.source_root.clone();
+    fs::write(source_root.join("workflow.yaml"), source).unwrap();
+    let tree = crate::workflow::validate_workflow_tree(&source_root).unwrap();
+    let workflow = resolution::resolve(&source_root, Path::new("workflow.yaml")).unwrap();
+    admit_workflow(
+        workflow,
+        ResolvedInputs::default(),
+        fixture_context(
+            &fixture.execution_root,
+            1024,
+            EnvironmentSnapshot::default(),
+        )
+        .with_tree(tree),
+    )
+    .unwrap()
+}
+
+/// Settles `owner`'s attempt `waiting` on the stop before `second` (REQ-WFEXEC-61) with
+/// `first` succeeded unless the attempt inherited it, then records the wait and sets
+/// `run.json` `waiting`, as the CLI leaves a run whose attempt ended on a wait
+/// (INV-ENGINE-20).
+fn settle_waiting_before_second(owner: &LocalAttemptOwner) {
+    settle_waiting_before_second_on(owner, &stop_wait_record());
+}
+
+/// Settles the owner's attempt waiting before `second` on `wait`, `first` succeeded.
+fn settle_waiting_before_second_on(owner: &LocalAttemptOwner, wait: &WaitRecord) {
+    owner
+        .state
+        .update(|state| {
+            let attempt = current_attempt_mut(state)?;
+            let settled = attempt.created_at.clone();
+            attempt.started_at = Some(settled.clone());
+            attempt.settled_at = Some(settled);
+            attempt.settlement_snapshot = Some(fixture_settlement_snapshot());
+            attempt.state = AttemptStateV1::Waiting;
+            for step in &mut attempt.progress.steps {
+                match (step.id.as_str(), step.state) {
+                    (_, AttemptStepStateV1::Inherited) => {}
+                    ("first", _) => step.state = AttemptStepStateV1::Succeeded,
+                    _ => {
+                        step.state = AttemptStepStateV1::NotRun;
+                        step.detail = Some(NodeDetail::NotRun(
+                            crate::workflow::evidence::NonExecutionDetail::not_reached(),
+                        ));
+                    }
+                }
+            }
+            attempt.result = AttemptResultV1::NotPublished {
+                reason: ResultAbsentReasonV1::PublicationPending,
+            };
+            Ok(())
+        })
+        .unwrap();
+    owner.record_wait(wait).unwrap();
+    owner
+        .update_run_record(RunState::Waiting, owner.attempt_number(), None)
+        .unwrap();
+}
+
+/// A definition run of `fixture` for the subject `AUTO-1` whose first attempt entered an
+/// `answer` wait before `second` that a recorded `control.answer` with `answers` resolved
+/// (REQ-LOCALRUN-182), and that `second` is waiting at.
+fn answered_predecessor(
+    fixture: &AdmittedFixture,
+    name: &str,
+) -> (PathBuf, WorkflowRunRecord, WritableTreeCopyOnDrop) {
+    let wait = answer_wait_record();
+    let (run_path, record, writable) = predecessor_waiting_on(fixture, name, &wait);
+    let answer = crate::workflow::wait::ControlEvent {
+        source: "um".to_owned(),
+        event: crate::workflow::wait::CONTROL_ANSWER.to_owned(),
+        run: record.id.clone(),
+        by: "saeed".to_owned(),
+        at: "2026-11-06T16:31:00Z".to_owned(),
+        wait: Some(wait.id()),
+        payload:
+            json!({"question": "1", "text": "keep", "complete": true, "answers": {"1": "keep"}})
+                .as_object()
+                .cloned(),
+    };
+    crate::workflow::wait::append_control(&run_path, &answer).unwrap();
+    (run_path, record, writable)
+}
+
+/// A definition run of `fixture` for the subject `AUTO-1` whose first attempt waits before
+/// `second` on `wait` with `first` succeeded, holding no control yet.
+fn predecessor_waiting_on(
+    fixture: &AdmittedFixture,
+    name: &str,
+    wait: &WaitRecord,
+) -> (PathBuf, WorkflowRunRecord, WritableTreeCopyOnDrop) {
+    let run_path = fixture.run_path(name);
+    let writable = WritableTreeCopyOnDrop(run_path.clone());
+    let mut record = tree_record(fixture, Some((HOME_DEFINITION.to_owned(), 1)));
+    record.subject = Some("AUTO-1".to_owned());
+    let run =
+        InitialLocalRun::create_with_record(&run_path, &fixture.admitted, Some(&record)).unwrap();
+    settle_waiting_before_second_on(&run, wait);
+    drop(run);
+    (run_path, record, writable)
+}
+
+/// A definition run of `fixture` for the subject `AUTO-1` whose first attempt waits before
+/// `second` with `first` succeeded, holding one stop control (REQ-LOCALRUN-185).
+fn waiting_predecessor(
+    fixture: &AdmittedFixture,
+    name: &str,
+) -> (PathBuf, WorkflowRunRecord, WritableTreeCopyOnDrop) {
+    let (run_path, record, writable) = predecessor_waiting_on(fixture, name, &stop_wait_record());
+    let stop = crate::workflow::wait::ControlEvent {
+        source: "um".to_owned(),
+        event: "control.stop".to_owned(),
+        run: record.id.clone(),
+        by: "saeed".to_owned(),
+        at: "2026-11-06T16:01:17Z".to_owned(),
+        wait: None,
+        payload: json!({"before": "second"}).as_object().cloned(),
+    };
+    crate::workflow::wait::append_control(&run_path, &stop).unwrap();
+    (run_path, record, writable)
+}
+
+/// The record `restart` writes for a successor of `predecessor` on `revised`'s revision 2.
+fn successor_record(
+    revised: &AdmittedFixture,
+    predecessor: &WorkflowRunRecord,
+    attempts: u64,
+) -> WorkflowRunRecord {
+    let mut record = tree_record(revised, Some((HOME_DEFINITION.to_owned(), 2)));
+    record.subject.clone_from(&predecessor.subject);
+    record.predecessor = Some(predecessor.id.clone());
+    record.attempts = attempts;
+    record
+}
+
+fn acquired(run_path: &Path) -> Box<PendingLocalContinuation> {
+    match acquire_local_continuation(run_path).unwrap() {
+        LocalContinuationOpen::Acquired(pending) => pending,
+        LocalContinuationOpen::Rejected(rejection) => {
+            panic!("the run should be continuable: {:?}", rejection.reason())
+        }
+    }
+}
+
+fn file_contents(directory: &Path) -> BTreeMap<String, Vec<u8>> {
+    directory_names(directory)
+        .into_iter()
+        .map(|name| {
+            let bytes = fs::read(directory.join(&name)).unwrap();
+            (name, bytes)
+        })
+        .collect()
+}
+
+// REQ-LOCALRUN-195, INV-ENGINE-26
+#[test]
+fn a_successor_imports_the_predecessors_attempts_and_relocates_their_definitions() {
+    let fixture = tree_fixture();
+    let revised = revised_tree_fixture();
+    assert_ne!(
+        revised.admitted.workflow().content_digest,
+        fixture.admitted.workflow().content_digest
+    );
+    let (predecessor_path, predecessor_record, _predecessor_writable) =
+        waiting_predecessor(&fixture, "predecessor");
+    let predecessor_root = open_directory_path(&predecessor_path).unwrap();
+    let predecessor_run = read_run(&predecessor_root).unwrap();
+    let predecessor_state = read_state(&predecessor_root).unwrap();
+    let predecessor_bytes = |name: &str| fs::read(predecessor_path.join(name)).unwrap();
+    let unchanged = [STATE_FILE, RUN_RECORD_FILE, WAIT_RECORD_FILE].map(predecessor_bytes);
+
+    let successor_path = fixture.run_path("successor");
+    let _successor_writable = WritableTreeCopyOnDrop(successor_path.clone());
+    let record = successor_record(&revised, &predecessor_record, 1);
+    let pending = acquired(&predecessor_path);
+    let created = InitialLocalRun::create_successor(
+        &successor_path,
+        &revised.admitted,
+        &record,
+        &pending,
+        SuccessorCarry::Continue,
+    )
+    .unwrap();
+    assert_eq!(created, fs::canonicalize(&successor_path).unwrap());
+    drop(pending);
+
+    // The predecessor is untouched until it is superseded.
+    assert_eq!(
+        [STATE_FILE, RUN_RECORD_FILE, WAIT_RECORD_FILE].map(predecessor_bytes),
+        unchanged
+    );
+
+    assert_eq!(
+        directory_names(&successor_path),
+        [
+            ".private",
+            "attempts",
+            "controls",
+            "local-run.json",
+            "run.json",
+            "run.lock",
+            "state.json",
+            "workflow"
+        ]
+    );
+    let root = open_directory_path(&successor_path).unwrap();
+    let run = read_run(&root).unwrap();
+    assert_eq!(run.git_baseline, predecessor_run.git_baseline);
+    assert_eq!(
+        run.workflow_digest.value,
+        revised.admitted.workflow().content_digest.value
+    );
+    assert_ne!(run.local_run_id, predecessor_run.local_run_id);
+    assert_eq!(read_run_record(&root).unwrap(), record);
+
+    // Each attempt is the predecessor's, marked imported, the one that ran under the
+    // predecessor's definition now locating it under its own directory.
+    let state = read_state(&root).unwrap();
+    assert_eq!(state.local_run_id, run.local_run_id);
+    assert_eq!(state.revision, 1);
+    assert_eq!(
+        state.current_attempt_number,
+        predecessor_state.current_attempt_number
+    );
+    let mut expected = predecessor_state.attempts.clone();
+    expected[0].imported = Some(ImportedAttemptV1 {
+        run: predecessor_record.id.clone(),
+    });
+    expected[0].definition = Some(AttemptDefinitionV1 {
+        digest: predecessor_run.workflow_digest.clone(),
+        manifest_digest: predecessor_run.workflow_manifest_digest.clone(),
+        locator: AttemptDefinitionLocatorV1::Attempt { attempt_number: 1 },
+    });
+    assert_eq!(state.attempts, expected);
+    assert_eq!(state.diagnostics, predecessor_state.diagnostics);
+    let document =
+        serde_json::from_slice::<Value>(&fs::read(successor_path.join(STATE_FILE)).unwrap())
+            .unwrap();
+    assert_eq!(
+        document["attempts"][0]["imported"],
+        json!({"run": predecessor_record.id})
+    );
+    assert_eq!(
+        document["attempts"][0]["definition"]["locator"],
+        json!({"kind": "attempt", "attemptNumber": 1})
+    );
+
+    // The attempt directories are the predecessor's, with its definition under the first.
+    let attempt = successor_path.join("attempts/000001");
+    assert_eq!(
+        fs::read(attempt.join("workflow/manifest.json")).unwrap(),
+        predecessor_bytes("workflow/manifest.json")
+    );
+    assert_eq!(
+        tree_files(&attempt.join("workflow/tree")),
+        tree_files(&predecessor_path.join("workflow/tree"))
+    );
+    assert_eq!(
+        file_contents(&attempt.join("workflow/files")),
+        file_contents(&predecessor_path.join("workflow/files"))
+    );
+    assert_eq!(
+        fs::read(attempt.join(WAIT_RECORD_FILE)).unwrap(),
+        predecessor_bytes("attempts/000001/wait.json")
+    );
+    assert_eq!(
+        mode(&attempt.join(WAIT_RECORD_FILE)),
+        mode(&predecessor_path.join("attempts/000001/wait.json"))
+    );
+    // The controls are copied verbatim; the wait is not.
+    assert_eq!(
+        file_contents(&successor_path.join(CONTROLS_DIRECTORY)),
+        file_contents(&predecessor_path.join(CONTROLS_DIRECTORY))
+    );
+    verify_existing_run_layout(&root).unwrap();
+
+    // The imported attempt passes the run-and-state check its re-located definition would
+    // otherwise fail, and names the predecessor; the predecessor's own attempt does not.
+    let pending = acquired(&successor_path);
+    assert_eq!(
+        pending.imported_prior(),
+        Some(predecessor_record.id.as_str())
+    );
+    assert_eq!(pending.prior_attempt_number(), 1);
+    assert_eq!(pending.wait().unwrap(), None);
+    assert_eq!(
+        pending.previous_definition().content_digest,
+        fixture.admitted.workflow().content_digest
+    );
+    drop(pending);
+    assert_eq!(acquired(&predecessor_path).imported_prior(), None);
+}
+
+// REQ-WFEXEC-63, REQ-LOCALRUN-195: the control recorded on the predecessor that resolved an
+// imported attempt's wait still resolves its copy on the successor, so the successor's
+// `controls.answers` carries the predecessor's answers; a second import keeps the mark
+// naming the run the attempt was recorded under, so a chain of successors keeps finding them.
+#[test]
+fn a_successors_imported_wait_copy_resolves_by_the_control_recorded_under_its_run() {
+    let fixture = tree_fixture();
+    let revised = revised_tree_fixture();
+    let (predecessor_path, predecessor_record, _predecessor_writable) =
+        answered_predecessor(&fixture, "predecessor");
+    let answers = json!({"1": "keep"});
+    let predecessor_controls = attempt_controls(&predecessor_path, 2).unwrap().controls;
+    assert_eq!(
+        predecessor_controls
+            .answers
+            .get("second")
+            .map(|value| (**value).clone()),
+        Some(answers.clone())
+    );
+
+    let successor_path = fixture.run_path("successor");
+    let _successor_writable = WritableTreeCopyOnDrop(successor_path.clone());
+    let record = successor_record(&revised, &predecessor_record, 1);
+    let pending = acquired(&predecessor_path);
+    InitialLocalRun::create_successor(
+        &successor_path,
+        &revised.admitted,
+        &record,
+        &pending,
+        SuccessorCarry::Continue,
+    )
+    .unwrap();
+    drop(pending);
+
+    // The copied control names the predecessor and resolves the imported attempt's copy.
+    let controls = attempt_controls(&successor_path, 2).unwrap().controls;
+    assert_eq!(
+        controls
+            .answers
+            .get("second")
+            .map(|value| (**value).clone()),
+        Some(answers)
+    );
+    assert_eq!(
+        controls.wait.as_ref().map(|(step, _)| step.as_str()),
+        Some("second")
+    );
+
+    // Imported again, the attempt keeps the mark of the run it was recorded under.
+    let root = open_directory_path(&successor_path).unwrap();
+    let run = read_run(&root).unwrap();
+    let state = read_state(&root).unwrap();
+    let (relocated, holder) = relocate_run_definitions(&run, &state, &record.id).unwrap();
+    assert_eq!(holder, None);
+    assert_eq!(
+        relocated[0].imported,
+        Some(ImportedAttemptV1 {
+            run: predecessor_record.id.clone(),
+        })
+    );
+    assert_eq!(relocated[0].definition, state.attempts[0].definition);
+}
+
+// REQ-WFEXEC-63, REQ-LOCALRUN-195, REQ-LOCALRUN-197: a wait carried by `upgrade` is resolved
+// by a control naming the successor that carried it, not the run the attempt was recorded
+// under; the next successor along the chain imports that control and the attempt's copy
+// together and still carries the answers.
+#[test]
+fn a_chains_successor_carries_the_answer_recorded_on_the_run_that_carried_the_wait() {
+    let fixture = tree_fixture();
+    let revised = revised_tree_fixture();
+    let wait = answer_wait_record();
+    let (origin_path, _, _origin_writable) = predecessor_waiting_on(&fixture, "origin", &wait);
+    let origin_record = read_run_record(&open_directory_path(&origin_path).unwrap()).unwrap();
+
+    // The wait is carried to the first successor and answered there, under its id.
+    let carrier_path = fixture.run_path("carrier");
+    let _carrier_writable = WritableTreeCopyOnDrop(carrier_path.clone());
+    let mut carrier_record = successor_record(&revised, &origin_record, 1);
+    carrier_record.state = RunState::Waiting;
+    carrier_record.position.clone_from(&origin_record.position);
+    let pending = acquired(&origin_path);
+    InitialLocalRun::create_successor(
+        &carrier_path,
+        &revised.admitted,
+        &carrier_record,
+        &pending,
+        SuccessorCarry::Wait,
+    )
+    .unwrap();
+    pending.supersede(&carrier_record.id).unwrap();
+    let answers = json!({"1": "keep"});
+    let answer = crate::workflow::wait::ControlEvent {
+        source: "um".to_owned(),
+        event: crate::workflow::wait::CONTROL_ANSWER.to_owned(),
+        run: carrier_record.id.clone(),
+        by: "saeed".to_owned(),
+        at: "2026-11-06T17:00:00Z".to_owned(),
+        wait: Some(wait.id()),
+        payload: json!({"question": "1", "text": "keep", "complete": true, "answers": answers})
+            .as_object()
+            .cloned(),
+    };
+    crate::workflow::wait::append_control(&carrier_path, &answer).unwrap();
+    let carried = |run_path: &Path| {
+        let controls = attempt_controls(run_path, 2).unwrap().controls;
+        (
+            controls
+                .answers
+                .get("second")
+                .map(|value| (**value).clone()),
+            controls.wait.map(|(step, _)| step),
+        )
+    };
+    let expected = (Some(answers), Some("second".to_owned()));
+    assert_eq!(carried(&carrier_path), expected);
+
+    // The next successor imports the attempt, marked with the run it was recorded under,
+    // and the copied answer, which still resolves the attempt's wait copy.
+    let successor_path = fixture.run_path("successor");
+    let _successor_writable = WritableTreeCopyOnDrop(successor_path.clone());
+    let record = successor_record(&revised, &carrier_record, 1);
+    let pending = acquired(&carrier_path);
+    InitialLocalRun::create_successor(
+        &successor_path,
+        &revised.admitted,
+        &record,
+        &pending,
+        SuccessorCarry::Continue,
+    )
+    .unwrap();
+    drop(pending);
+    let state = read_state(&open_directory_path(&successor_path).unwrap()).unwrap();
+    assert_eq!(
+        state.attempts[0].imported,
+        Some(ImportedAttemptV1 {
+            run: origin_record.id.clone(),
+        })
+    );
+    assert_eq!(carried(&successor_path), expected);
+}
+
+// REQ-CONTINUE-79, REQ-CONTINUE-77, INV-ENGINE-26
+#[test]
+fn a_successor_begins_a_run_definition_continuation_after_its_predecessor_is_deleted() {
+    let fixture = tree_fixture();
+    let revised = revised_tree_fixture();
+    let (predecessor_path, predecessor_record, predecessor_writable) =
+        waiting_predecessor(&fixture, "predecessor");
+    let predecessor_run = read_run(&open_directory_path(&predecessor_path).unwrap()).unwrap();
+    let predecessor_attempt = read_state(&open_directory_path(&predecessor_path).unwrap())
+        .unwrap()
+        .attempts
+        .remove(0);
+    let successor_path = fixture.run_path("successor");
+    let _successor_writable = WritableTreeCopyOnDrop(successor_path.clone());
+    let record = successor_record(&revised, &predecessor_record, 1);
+    let pending = acquired(&predecessor_path);
+    InitialLocalRun::create_successor(
+        &successor_path,
+        &revised.admitted,
+        &record,
+        &pending,
+        SuccessorCarry::Continue,
+    )
+    .unwrap();
+
+    // Superseding exits the predecessor and names the successor, and nothing else.
+    let waiting = run_record_document(&predecessor_path);
+    let state = fs::read(predecessor_path.join(STATE_FILE)).unwrap();
+    let controls = file_contents(&predecessor_path.join(CONTROLS_DIRECTORY));
+    pending.supersede(&record.id).unwrap();
+    let mut superseded = waiting;
+    superseded["state"] = json!("exited");
+    superseded["outcome"] = json!(SUPERSEDED_OUTCOME);
+    superseded["successor"] = json!(record.id);
+    assert_eq!(run_record_document(&predecessor_path), superseded);
+    assert_eq!(superseded["outcome"], json!("superseded"));
+    assert_eq!(superseded["attempts"], json!(1));
+    assert!(!predecessor_path.join(WAIT_RECORD_FILE).exists());
+    assert_eq!(fs::read(predecessor_path.join(STATE_FILE)).unwrap(), state);
+    assert_eq!(
+        file_contents(&predecessor_path.join(CONTROLS_DIRECTORY)),
+        controls
+    );
+    assert_eq!(
+        directory_names(&predecessor_path.join(ATTEMPTS_DIRECTORY)),
+        ["000001"]
+    );
+    assert!(!predecessor_path.join(MIRROR_DIRECTORY).exists());
+    // A superseded run is refused every continuation, naming its successor, so it is never
+    // superseded again (REQ-CONTINUE-29, REQ-LOCALRUN-196).
+    match acquire_local_continuation(&predecessor_path).unwrap() {
+        LocalContinuationOpen::Rejected(rejection) => {
+            assert_eq!(rejection.reason(), RetryIneligibilityReason::RunSuperseded);
+            assert_eq!(rejection.successor(), Some(record.id.as_str()));
+        }
+        LocalContinuationOpen::Acquired(_) => panic!("a superseded run was acquired"),
+    }
+
+    // The successor stands alone once the predecessor is gone.
+    drop(predecessor_writable);
+    fs::remove_dir_all(&predecessor_path).unwrap();
+    let owned = acquired(&successor_path)
+        .begin(
+            &revised.admitted,
+            vec!["second".to_owned()],
+            ContinuationDefinitionMode::Run,
+            crate::workflow::publication::ContinuationReasonV1::Restart,
+            None,
+        )
+        .unwrap();
+    assert_eq!(owned.attempt_number(), 2);
+    let root = open_directory_path(&successor_path).unwrap();
+    let run = read_run(&root).unwrap();
+    let state = read_state(&root).unwrap();
+    let attempt = &state.attempts[1];
+    assert_eq!(attempt.imported, None);
+    assert_eq!(attempt.definition, Some(attempt_definition_for_run(&run)));
+    assert!(!successor_path.join("attempts/000002/workflow").exists());
+    let continuation = attempt.continuation.as_ref().unwrap();
+    assert_eq!(continuation.reexecuted_steps, ["second"]);
+    let document = serde_json::to_value(continuation).unwrap();
+    assert_eq!(document["reason"], json!("restart"));
+    assert_eq!(document["request"]["definition"], json!("inherited"));
+    assert_eq!(
+        document["definitionSource"],
+        json!({
+            "kind": "replaced",
+            "manifestDigest": run.workflow_manifest_digest,
+            "priorManifestDigest": predecessor_run.workflow_manifest_digest,
+        })
+    );
+    assert_eq!(
+        document["inheritedSteps"],
+        json!([{"id": "first", "priorState": "succeeded", "definitionChanged": false}])
+    );
+    // The inherited step is read from the imported attempt.
+    let first = attempt
+        .progress
+        .steps
+        .iter()
+        .find(|step| step.id == "first")
+        .unwrap();
+    assert_eq!(first.state, AttemptStepStateV1::Inherited);
+    let Some(NodeDetail::Inherited(detail)) = &first.detail else {
+        panic!("the inherited step has no inherited detail");
+    };
+    assert_eq!(
+        (
+            detail.prior_attempt_number,
+            detail.prior_attempt_id.as_str()
+        ),
+        (1, predecessor_attempt.attempt_id.as_str())
+    );
+    drop(owned);
+}
+
+// REQ-CONTINUE-79
+#[test]
+fn a_successor_begun_by_resume_records_reason_restart() {
+    let fixture = tree_fixture();
+    let revised = revised_tree_fixture();
+    let (predecessor_path, predecessor_record, _predecessor_writable) =
+        waiting_predecessor(&fixture, "predecessor");
+    let successor_path = fixture.run_path("successor");
+    let _successor_writable = WritableTreeCopyOnDrop(successor_path.clone());
+    let record = successor_record(&revised, &predecessor_record, 1);
+    let pending = acquired(&predecessor_path);
+    InitialLocalRun::create_successor(
+        &successor_path,
+        &revised.admitted,
+        &record,
+        &pending,
+        SuccessorCarry::Continue,
+    )
+    .unwrap();
+    pending.supersede(&record.id).unwrap();
+
+    // A restart interrupted before its first own attempt is finished by `resume --from`.
+    let owned = acquired(&successor_path)
+        .begin(
+            &revised.admitted,
+            vec!["second".to_owned()],
+            ContinuationDefinitionMode::Run,
+            crate::workflow::publication::ContinuationReasonV1::Resume,
+            None,
+        )
+        .unwrap();
+    assert_eq!(owned.attempt_number(), 2);
+    drop(owned);
+    let state = read_state(&open_directory_path(&successor_path).unwrap()).unwrap();
+    assert_eq!(state.attempts.len(), 2);
+    let document = serde_json::to_value(state.attempts[1].continuation.as_ref().unwrap()).unwrap();
+    assert_eq!(document["reason"], json!("restart"));
+    assert_eq!(document["request"]["definition"], json!("inherited"));
+    assert_eq!(document["definitionSource"]["kind"], json!("replaced"));
+}
+
+// REQ-CONTINUE-79, REQ-LOCALRUN-195
+#[test]
+fn a_run_definition_continuation_refuses_another_definition_and_a_replaced_attempt_keeps_its_own() {
+    let fixture = tree_fixture();
+    let revised = revised_tree_fixture();
+    let (predecessor_path, predecessor_record, _predecessor_writable) =
+        waiting_predecessor(&fixture, "predecessor");
+    // The predecessor's second attempt ran under a replacement.
+    let replacement = readmitted(&fixture, REPLACED_TREE_ROOT_WORKFLOW);
+    let owned = acquired(&predecessor_path)
+        .begin(
+            &replacement,
+            vec!["second".to_owned()],
+            ContinuationDefinitionMode::Replaced,
+            crate::workflow::publication::ContinuationReasonV1::Resume,
+            None,
+        )
+        .unwrap();
+    settle_waiting_before_second(&owned);
+    drop(owned);
+    let predecessor_root = open_directory_path(&predecessor_path).unwrap();
+    let predecessor_run = read_run(&predecessor_root).unwrap();
+    let predecessor_state = read_state(&predecessor_root).unwrap();
+    let replaced = predecessor_state.attempts[1].definition.clone().unwrap();
+    assert_eq!(
+        replaced.locator,
+        AttemptDefinitionLocatorV1::Attempt { attempt_number: 2 }
+    );
+
+    let successor_path = fixture.run_path("successor");
+    let _successor_writable = WritableTreeCopyOnDrop(successor_path.clone());
+    let record = successor_record(&revised, &predecessor_record, 2);
+    let pending = acquired(&predecessor_path);
+    InitialLocalRun::create_successor(
+        &successor_path,
+        &revised.admitted,
+        &record,
+        &pending,
+        SuccessorCarry::Continue,
+    )
+    .unwrap();
+    drop(pending);
+    let state = read_state(&open_directory_path(&successor_path).unwrap()).unwrap();
+    assert_eq!(
+        state
+            .attempts
+            .iter()
+            .map(|attempt| attempt.definition.clone().unwrap())
+            .collect::<Vec<_>>(),
+        [
+            AttemptDefinitionV1 {
+                digest: predecessor_run.workflow_digest.clone(),
+                manifest_digest: predecessor_run.workflow_manifest_digest.clone(),
+                locator: AttemptDefinitionLocatorV1::Attempt { attempt_number: 1 },
+            },
+            replaced.clone(),
+        ]
+    );
+    assert!(state.attempts.iter().all(|attempt| attempt.imported
+        == Some(ImportedAttemptV1 {
+            run: predecessor_record.id.clone(),
+        })));
+    for (successor, predecessor) in [
+        ("attempts/000001/workflow", "workflow"),
+        ("attempts/000002/workflow", "attempts/000002/workflow"),
+    ] {
+        assert_eq!(
+            fs::read(successor_path.join(successor).join(WORKFLOW_MANIFEST_FILE)).unwrap(),
+            fs::read(
+                predecessor_path
+                    .join(predecessor)
+                    .join(WORKFLOW_MANIFEST_FILE)
+            )
+            .unwrap(),
+            "{successor}"
+        );
+    }
+
+    // The run-definition mode admits only the successor's own definition.
+    let stray = readmitted(&revised, REPLACED_TREE_ROOT_WORKFLOW);
+    assert_ne!(
+        stray.workflow().content_digest,
+        revised.admitted.workflow().content_digest
+    );
+    assert!(matches!(
+        acquired(&successor_path).begin(
+            &stray,
+            vec!["second".to_owned()],
+            ContinuationDefinitionMode::Run,
+            crate::workflow::publication::ContinuationReasonV1::Restart,
+            None,
+        ),
+        Err(LocalRunDirectoryError::StateConflict)
+    ));
+    assert!(!successor_path.join("attempts/000003").exists());
+
+    // Its prior definition is the replacement the last imported attempt ran under.
+    let owned = acquired(&successor_path)
+        .begin(
+            &revised.admitted,
+            vec!["second".to_owned()],
+            ContinuationDefinitionMode::Run,
+            crate::workflow::publication::ContinuationReasonV1::Restart,
+            None,
+        )
+        .unwrap();
+    let state = read_state(&open_directory_path(&successor_path).unwrap()).unwrap();
+    let document = serde_json::to_value(state.attempts[2].continuation.as_ref().unwrap()).unwrap();
+    assert_eq!(
+        document["definitionSource"]["priorManifestDigest"],
+        json!(replaced.manifest_digest)
+    );
+    assert_eq!(document["definitionSource"]["kind"], json!("replaced"));
+    drop(owned);
+}
+
+/// The predecessor `waiting_predecessor` builds, its record rewritten as a run that took the
+/// counted edge `first.failed` once and waits at `second` would read.
+fn waiting_predecessor_with_position_and_edges(
+    fixture: &AdmittedFixture,
+    name: &str,
+) -> (PathBuf, WorkflowRunRecord, WritableTreeCopyOnDrop) {
+    let (run_path, _, writable) = waiting_predecessor(fixture, name);
+    let pending = acquired(&run_path);
+    rewrite_run_record(&pending.root, |record| {
+        record.position = vec![json!("second")];
+        record.edges = BTreeMap::from([("first.failed".to_owned(), 1)]);
+        Ok(())
+    })
+    .unwrap();
+    drop(pending);
+    let record = read_run_record(&open_directory_path(&run_path).unwrap()).unwrap();
+    (run_path, record, writable)
+}
+
+// REQ-LOCALRUN-195, REQ-CONTINUE-80, INV-ENGINE-26
+#[test]
+fn an_upgraded_successor_carries_the_wait_position_and_edges() {
+    let fixture = tree_fixture();
+    let revised = revised_tree_fixture();
+    let (predecessor_path, predecessor_record, _predecessor_writable) =
+        waiting_predecessor_with_position_and_edges(&fixture, "predecessor");
+    let predecessor_wait = fs::read(predecessor_path.join(WAIT_RECORD_FILE)).unwrap();
+    let predecessor_run = read_run(&open_directory_path(&predecessor_path).unwrap()).unwrap();
+
+    let successor_path = fixture.run_path("successor");
+    let _successor_writable = WritableTreeCopyOnDrop(successor_path.clone());
+    let mut record = successor_record(&revised, &predecessor_record, 1);
+    record.state = RunState::Waiting;
+    record.position.clone_from(&predecessor_record.position);
+    record.edges.clone_from(&predecessor_record.edges);
+    record.external.clone_from(&predecessor_record.external);
+    let pending = acquired(&predecessor_path);
+
+    // The carry and the record's state agree, or nothing is staged.
+    let mut running = record.clone();
+    running.state = RunState::Running;
+    for (record, carry) in [
+        (&running, SuccessorCarry::Wait),
+        (&record, SuccessorCarry::Continue),
+    ] {
+        assert_eq!(
+            InitialLocalRun::create_successor(
+                &successor_path,
+                &revised.admitted,
+                record,
+                &pending,
+                carry
+            ),
+            Err(LocalRunDirectoryError::StateInvalid)
+        );
+        assert!(!successor_path.exists());
+    }
+
+    InitialLocalRun::create_successor(
+        &successor_path,
+        &revised.admitted,
+        &record,
+        &pending,
+        SuccessorCarry::Wait,
+    )
+    .unwrap();
+    assert_eq!(
+        directory_names(&successor_path),
+        [
+            ".private",
+            "attempts",
+            "controls",
+            "local-run.json",
+            "run.json",
+            "run.lock",
+            "state.json",
+            "wait.json",
+            "workflow"
+        ]
+    );
+    assert_eq!(
+        fs::read(successor_path.join(WAIT_RECORD_FILE)).unwrap(),
+        predecessor_wait
+    );
+    assert_eq!(
+        mode(&successor_path.join(WAIT_RECORD_FILE)),
+        mode(&predecessor_path.join(WAIT_RECORD_FILE))
+    );
+    let document = run_record_document(&successor_path);
+    assert_eq!(document["state"], json!("waiting"));
+    assert_eq!(document["position"], json!(["second"]));
+    assert_eq!(document["edges"], json!({"first.failed": 1}));
+    assert_eq!(document["attempts"], json!(1));
+    assert_eq!(document["outcome"], Value::Null);
+    assert_eq!(document["predecessor"], json!(predecessor_record.id));
+    assert_eq!(
+        directory_names(&successor_path.join(ATTEMPTS_DIRECTORY)),
+        ["000001"]
+    );
+    assert_eq!(
+        fs::read(successor_path.join("attempts/000001/wait.json")).unwrap(),
+        predecessor_wait
+    );
+    verify_existing_run_layout(&open_directory_path(&successor_path).unwrap()).unwrap();
+
+    // The carried wait is the successor's own, and the copied control resolves nothing.
+    let wait = stop_wait_record();
+    assert_eq!(
+        inspect_wait(&successor_path, &crate::workflow::wait::NoConditions)
+            .unwrap()
+            .inspection,
+        WaitInspection::Held { wait: wait.clone() }
+    );
+
+    // Superseding exits the predecessor as for a restart.
+    pending.supersede(&record.id).unwrap();
+    let superseded = run_record_document(&predecessor_path);
+    assert_eq!(superseded["state"], json!("exited"));
+    assert_eq!(superseded["outcome"], json!(SUPERSEDED_OUTCOME));
+    assert_eq!(superseded["successor"], json!(record.id));
+    assert_eq!(superseded["position"], json!([]));
+    assert!(!predecessor_path.join(WAIT_RECORD_FILE).exists());
+
+    // A control recorded on the successor resolves the carried wait.
+    let lift = crate::workflow::wait::ControlEvent {
+        source: "um".to_owned(),
+        event: crate::workflow::wait::CONTROL_LIFT.to_owned(),
+        run: record.id.clone(),
+        by: "saeed".to_owned(),
+        at: "2026-11-06T17:00:00Z".to_owned(),
+        wait: Some(wait.id()),
+        payload: json!({"before": "second", "stop": "2026-11-06T16:01:17Z"})
+            .as_object()
+            .cloned(),
+    };
+    crate::workflow::wait::append_control(&successor_path, &lift).unwrap();
+    assert_eq!(
+        inspect_wait(&successor_path, &crate::workflow::wait::NoConditions)
+            .unwrap()
+            .inspection,
+        WaitInspection::Satisfied {
+            wait,
+            by: ResolvedBy::Control(lift),
+        }
+    );
+    assert_eq!(
+        attempt_controls(&successor_path, 2)
+            .unwrap()
+            .controls
+            .wait
+            .map(|(step, _)| step),
+        Some("second".to_owned())
+    );
+
+    // Its first own attempt continues from `then` under the successor's definition.
+    let owned = acquired(&successor_path)
+        .begin(
+            &revised.admitted,
+            vec![wait_then()],
+            ContinuationDefinitionMode::Run,
+            crate::workflow::publication::ContinuationReasonV1::Resume,
+            None,
+        )
+        .unwrap();
+    assert_eq!(owned.attempt_number(), 2);
+    drop(owned);
+    assert!(!successor_path.join(WAIT_RECORD_FILE).exists());
+    let root = open_directory_path(&successor_path).unwrap();
+    let run = read_run(&root).unwrap();
+    let state = read_state(&root).unwrap();
+    let document = serde_json::to_value(state.attempts[1].continuation.as_ref().unwrap()).unwrap();
+    assert_eq!(document["reason"], json!("resume"));
+    assert_eq!(document["request"]["definition"], json!("inherited"));
+    assert_eq!(
+        document["definitionSource"],
+        json!({
+            "kind": "replaced",
+            "manifestDigest": run.workflow_manifest_digest,
+            "priorManifestDigest": predecessor_run.workflow_manifest_digest,
+        })
+    );
+    assert_eq!(
+        document["inheritedSteps"],
+        json!([{"id": "first", "priorState": "succeeded", "definitionChanged": false}])
+    );
+    assert_eq!(read_run_record(&root).unwrap().edges, record.edges);
+}
+
+/// The step the stop wait of `stop_wait_record` continues at.
+fn wait_then() -> String {
+    stop_wait_record().then
+}
+
+/// An edge-scheduled root: `design` plans a list of parts, `build` fans out over it and
+/// waits for approval, `merge` lands.
+const CARRY_ROOT_WORKFLOW: &str = "schemaVersion: 1\noutcomes: [landed, failed]\nsteps:\n  design:\n    kind: workflow\n    workflow: design.yaml\n    on:\n      planned: build\n      failed: exit.failed\n  build:\n    kind: workflow\n    workflow: build.yaml\n    forEach: outputs.design.parts\n    on:\n      built: merge\n      review:\n        wait: approval\n        then: merge\n        onHandBack: build\n      failed: exit.failed\n  merge:\n    kind: workflow\n    workflow: merge.yaml\n    on:\n      landed: exit.landed\n      failed: exit.failed\n";
+/// `CARRY_ROOT_WORKFLOW` without `merge`, with `design` routing `drafted` rather than
+/// `planned` and with `build` no longer fanning out.
+const UNRESOLVED_CARRY_ROOT_WORKFLOW: &str = "schemaVersion: 1\noutcomes: [landed, failed]\nsteps:\n  design:\n    kind: workflow\n    workflow: draft.yaml\n    on:\n      drafted: build\n      failed: exit.failed\n  build:\n    kind: workflow\n    workflow: build.yaml\n    on:\n      built: exit.landed\n      review:\n        wait: approval\n        then: build\n        onHandBack: build\n      failed: exit.failed\n";
+const CARRY_DESIGN_WORKFLOW: &str = "schemaVersion: 1\noutcomes: [planned, failed]\noutcome:\n  from: outputs.decide.verdict\n  onFailure: failed\nsteps:\n  decide:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n    outputs:\n      verdict:\n        kind: text\n        from: path\n        path: verdict-design.txt\n      parts:\n        kind: json\n        from: path\n        path: parts.json\n        schema: parts.schema.json\nexports:\n  parts:\n    ref: outputs.decide.parts\n";
+const CARRY_DRAFT_WORKFLOW: &str = "schemaVersion: 1\noutcomes: [drafted, failed]\noutcome:\n  from: outputs.decide.verdict\n  onFailure: failed\nsteps:\n  decide:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n    outputs:\n      verdict:\n        kind: text\n        from: path\n        path: verdict-design.txt\n";
+const CARRY_BUILD_WORKFLOW: &str = "schemaVersion: 1\noutcomes: [built, review, failed]\noutcome:\n  from: outputs.decide.verdict\n  onFailure: failed\nsteps:\n  decide:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n    outputs:\n      verdict:\n        kind: text\n        from: path\n        path: verdict-build.txt\n";
+const CARRY_MERGE_WORKFLOW: &str = "schemaVersion: 1\noutcomes: [landed, failed]\noutcome:\n  from: outputs.decide.verdict\n  onFailure: failed\nsteps:\n  decide:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n    outputs:\n      verdict:\n        kind: text\n        from: path\n        path: verdict-merge.txt\n";
+const CARRY_PARTS_SCHEMA: &str =
+    r#"{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"array"}"#;
+const CARRY_PARTS: &[u8] = br#"[{"name":"a"},{"name":"b"},{"name":"c"}]"#;
+
+fn carry_tree_fixture(root: &str) -> AdmittedFixture {
+    AdmittedFixture::from_tree(
+        root,
+        &[
+            ("design.yaml", CARRY_DESIGN_WORKFLOW, 0o644),
+            ("draft.yaml", CARRY_DRAFT_WORKFLOW, 0o644),
+            ("build.yaml", CARRY_BUILD_WORKFLOW, 0o644),
+            ("merge.yaml", CARRY_MERGE_WORKFLOW, 0o644),
+            ("parts.schema.json", CARRY_PARTS_SCHEMA, 0o644),
+        ],
+    )
+}
+
+/// The approval `build` waits on at its second element: approved it continues at `merge`,
+/// handed back at `build`.
+fn fan_out_approval_wait() -> WaitRecord {
+    serde_json::from_value(json!({
+        "kind": "approval",
+        "since": "2026-11-06T16:30:02Z",
+        "step": ["build", {"item": 2}],
+        "then": "merge",
+        "onHandBack": "build",
+        "rule": {
+            "source": "um",
+            "event": ["control.approve", "control.hand_back"],
+            "where": "event.run == run.id and event.wait == wait.id"
+        },
+        "payload": {}
+    }))
+    .unwrap()
+}
+
+/// Settles `owner`'s attempt `waiting` on `fan_out_approval_wait` with `design` succeeded,
+/// retaining the outcome `planned` and the three-element `parts`, unless the attempt
+/// inherited it, and sets `run.json` `waiting` at `["build", {"item": 2}]`.
+fn settle_waiting_at_the_second_element(owner: &LocalAttemptOwner) {
+    let inherited = read_state(owner.root_handle())
+        .unwrap()
+        .attempts
+        .last()
+        .unwrap()
+        .progress
+        .steps
+        .iter()
+        .any(|step| step.id == "design" && step.state == AttemptStepStateV1::Inherited);
+    let outputs = (!inherited).then(|| {
+        vec![
+            write_retained_carrier(owner, "design", "outcome", b"planned", false),
+            write_retained_carrier(owner, "design", "parts", CARRY_PARTS, true),
+        ]
+    });
+    owner
+        .state
+        .update(|state| {
+            let attempt = current_attempt_mut(state)?;
+            let settled = attempt.created_at.clone();
+            attempt.started_at = Some(settled.clone());
+            attempt.settled_at = Some(settled);
+            attempt.settlement_snapshot = Some(fixture_settlement_snapshot());
+            attempt.state = AttemptStateV1::Waiting;
+            for step in &mut attempt.progress.steps {
+                match (step.id.as_str(), step.state) {
+                    (_, AttemptStepStateV1::Inherited) => {}
+                    ("design", _) => {
+                        step.state = AttemptStepStateV1::Succeeded;
+                        step.outputs.clone_from(&outputs);
+                    }
+                    _ => {
+                        step.state = AttemptStepStateV1::NotRun;
+                        step.detail = Some(NodeDetail::NotRun(
+                            crate::workflow::evidence::NonExecutionDetail::not_reached(),
+                        ));
+                    }
+                }
+            }
+            attempt.result = AttemptResultV1::NotPublished {
+                reason: ResultAbsentReasonV1::PublicationPending,
+            };
+            Ok(())
+        })
+        .unwrap();
+    owner.record_wait(&fan_out_approval_wait()).unwrap();
+    rewrite_run_record(owner.root_handle(), |record| {
+        record.state = RunState::Waiting;
+        record.attempts = owner.attempt_number();
+        record.position = vec![json!("build"), json!({"item": 2})];
+        Ok(())
+    })
+    .unwrap();
+}
+
+/// A definition run of `CARRY_ROOT_WORKFLOW` waiting as
+/// `settle_waiting_at_the_second_element` leaves it.
+fn waiting_fan_out_predecessor(
+    fixture: &AdmittedFixture,
+    name: &str,
+) -> (PathBuf, WritableTreeCopyOnDrop) {
+    let run_path = fixture.run_path(name);
+    let writable = WritableTreeCopyOnDrop(run_path.clone());
+    let record = tree_record(fixture, Some((HOME_DEFINITION.to_owned(), 1)));
+    let run =
+        InitialLocalRun::create_with_record(&run_path, &fixture.admitted, Some(&record)).unwrap();
+    settle_waiting_at_the_second_element(&run);
+    drop(run);
+    (run_path, writable)
+}
+
+// REQ-LOCALRUN-197
+#[test]
+fn the_resolve_check_lists_every_miss() {
+    let fixture = carry_tree_fixture(CARRY_ROOT_WORKFLOW);
+    let unresolved = carry_tree_fixture(UNRESOLVED_CARRY_ROOT_WORKFLOW);
+    let (run_path, _writable) = waiting_fan_out_predecessor(&fixture, "predecessor");
+    let pending = acquired(&run_path);
+    let inputs = ResolvedInputs::default();
+    assert_eq!(
+        pending
+            .resolve_carry(fixture.admitted.workflow(), &inputs)
+            .unwrap(),
+        Vec::new()
+    );
+    let misses = pending
+        .resolve_carry(unresolved.admitted.workflow(), &inputs)
+        .unwrap();
+    assert_eq!(
+        misses.iter().map(|miss| miss.code).collect::<Vec<_>>(),
+        [
+            "position_unresolved",
+            "wait_target_unresolved",
+            "outcome_unrouted",
+            "items_unresolved"
+        ]
+    );
+    for (miss, named) in misses.iter().zip(["build", "merge", "planned", "build"]) {
+        assert!(miss.message.contains(named), "{miss:?}");
+    }
+
+    // A run that does not wait carries nothing to resolve.
+    drop(pending);
+    let pending = acquired(&run_path);
+    remove_root_wait_record(&pending.root).unwrap();
+    assert_eq!(
+        pending.resolve_carry(fixture.admitted.workflow(), &inputs),
+        Err(LocalRunDirectoryError::StateConflict)
+    );
+}
+
+// REQ-LOCALRUN-197
+#[test]
+fn the_carried_readers_answer_retained_child_outcomes_and_fan_out_lengths() {
+    let fixture = carry_tree_fixture(CARRY_ROOT_WORKFLOW);
+    let (run_path, _writable) = waiting_fan_out_predecessor(&fixture, "predecessor");
+    let workflow = fixture.admitted.workflow();
+    let inputs = ResolvedInputs::default();
+    let assert_readers = |pending: &PendingLocalContinuation| {
+        assert_eq!(
+            pending.inherited_child_outcomes().unwrap(),
+            BTreeMap::from([("design".to_owned(), "planned".to_owned())])
+        );
+        assert_eq!(
+            pending
+                .inherited_items_length(workflow, "build", &inputs)
+                .unwrap(),
+            Some(3)
+        );
+        for step in ["design", "merge", "absent"] {
+            assert_eq!(
+                pending
+                    .inherited_items_length(workflow, step, &inputs)
+                    .unwrap(),
+                None,
+                "{step}"
+            );
+        }
+    };
+    assert_readers(&acquired(&run_path));
+
+    // An inherited step's outputs are read from the attempt that produced them.
+    let owned = acquired(&run_path)
+        .begin(
+            &fixture.admitted,
+            vec!["build".to_owned()],
+            ContinuationDefinitionMode::Inherited,
+            crate::workflow::publication::ContinuationReasonV1::Resume,
+            None,
+        )
+        .unwrap();
+    settle_waiting_at_the_second_element(&owned);
+    drop(owned);
+    let pending = acquired(&run_path);
+    let design = pending.state.attempts[1]
+        .progress
+        .steps
+        .iter()
+        .find(|step| step.id == "design")
+        .unwrap();
+    assert_eq!(design.state, AttemptStepStateV1::Inherited);
+    assert_readers(&pending);
+    assert_eq!(
+        pending.resolve_carry(workflow, &inputs).unwrap(),
+        Vec::new()
+    );
+
+    // A carrier that no longer matches its record is refused rather than read.
+    fs::write(
+        run_path
+            .join("attempts/000001")
+            .join(retained_value_relative_path(
+                AttemptNodeRoleV1::Step,
+                "design",
+                "outcome",
+            )),
+        b"drafted",
+    )
+    .unwrap();
+    assert_eq!(
+        pending.inherited_child_outcomes(),
+        Err(LocalRunDirectoryError::StateInvalid)
+    );
+}
+
+const HOME_DEFINITION: &str = "def_01jcf8y6m3q7v2k9x4t5r8w0zp";
+const OTHER_HOME_DEFINITION: &str = "def_01jcf8y6m3q7v2k9x4t5r8w0zq";
+const UNKNOWN_RUN_ID: &str = "run_7zzzzzzzzzzzzzzzzzzzzzzzzz";
+
+/// A valid `stop` wait record, as the contract fixture spells one.
+/// An `answer` wait before `second` with the wait tree's one text question.
+fn answer_wait_record() -> WaitRecord {
+    serde_json::from_value(json!({
+        "kind": "answer",
+        "since": "2026-11-06T16:30:02Z",
+        "step": ["second"],
+        "then": "second",
+        "rule": {
+            "source": "um",
+            "event": ["control.answer"],
+            "where": "event.run == run.id and event.wait == wait.id and event.payload.complete == true"
+        },
+        "payload": {"questions": "keep the cache?"}
+    }))
+    .unwrap()
+}
+
+fn stop_wait_record() -> WaitRecord {
+    serde_json::from_value(json!({
+        "kind": "stop",
+        "since": "2026-11-06T16:30:02Z",
+        "step": ["second"],
+        "then": "second",
+        "rule": {
+            "source": "um",
+            "event": ["control.lift"],
+            "where": "event.run == run.id and event.payload.before == wait.then and event.payload.stop == wait.payload.at"
+        },
+        "payload": {"by": "saeed", "at": "2026-11-06T16:01:17Z", "payload": {"before": "second"}}
+    }))
+    .unwrap()
+}
+
+// REQ-LOCALRUN-180
+#[test]
+fn a_run_id_locates_its_run_under_the_home_and_the_home_lists_every_run() {
+    let fixture = tree_fixture();
+    let home_root = fixture.run_path("home");
+    let home = WorkflowHome::from_lookup(|name| {
+        (name == "UM_HOME").then(|| home_root.clone().into_os_string())
+    })
+    .unwrap();
+    assert_eq!(
+        locate_run(&home, UNKNOWN_RUN_ID),
+        Err(LocalRunDirectoryError::RunNotFound)
+    );
+    let empty = list_runs(&home).unwrap();
+    assert!(empty.runs.is_empty() && empty.unreadable.is_empty());
+
+    let mut created = Vec::new();
+    for definition in [HOME_DEFINITION, HOME_DEFINITION, OTHER_HOME_DEFINITION] {
+        let runs = home.runs_directory(definition);
+        fs::create_dir_all(&runs).unwrap();
+        let record = tree_record(&fixture, Some((definition.to_owned(), 1)));
+        let directory = runs.join(&record.id);
+        let writable = WritableTreeCopyOnDrop(directory.clone());
+        let run = InitialLocalRun::create_with_record(&directory, &fixture.admitted, Some(&record))
+            .unwrap();
+        created.push((run, directory.canonicalize().unwrap(), record, writable));
+    }
+    let wait = stop_wait_record();
+    created[1].0.record_wait(&wait).unwrap();
+    let created = created
+        .into_iter()
+        .map(|(run, directory, record, writable)| {
+            drop(run);
+            (directory, record, writable)
+        })
+        .collect::<Vec<_>>();
+    // A `runs/` entry without `run.json` is no run, even under a run id's name.
+    let unreadable = home
+        .runs_directory(OTHER_HOME_DEFINITION)
+        .join("run_0aaaaaaaaaaaaaaaaaaaaaaaaa");
+    fs::create_dir(&unreadable).unwrap();
+
+    for (directory, record, _) in &created {
+        assert_eq!(locate_run(&home, &record.id).as_ref(), Ok(directory));
+    }
+    for missing in [UNKNOWN_RUN_ID, "run_0aaaaaaaaaaaaaaaaaaaaaaaaa"] {
+        assert_eq!(
+            locate_run(&home, missing),
+            Err(LocalRunDirectoryError::RunNotFound),
+            "{missing}"
+        );
+    }
+    for invalid in [
+        "",
+        "../run",
+        "run_short",
+        HOME_DEFINITION,
+        "RUN_7ZZZZZZZZZZZZZZZZZZZZZZZZZ",
+    ] {
+        assert_eq!(
+            locate_run(&home, invalid),
+            Err(LocalRunDirectoryError::InvalidPath),
+            "{invalid}"
+        );
+    }
+
+    let listing = list_runs(&home).unwrap();
+    let mut expected = created
+        .iter()
+        .enumerate()
+        .map(|(index, (directory, record, _))| {
+            (
+                directory.clone(),
+                record.clone(),
+                (index == 1).then(|| wait.clone()),
+            )
+        })
+        .collect::<Vec<_>>();
+    expected.sort_by(|left, right| left.1.id.cmp(&right.1.id));
+    assert_eq!(
+        listing
+            .runs
+            .into_iter()
+            .map(|run| (run.directory, run.record, run.wait))
+            .collect::<Vec<_>>(),
+        expected
+    );
+    assert_eq!(listing.unreadable.len(), 1, "{:?}", listing.unreadable);
+    assert_eq!(listing.unreadable[0].0.file_name(), unreadable.file_name());
+}
+
+// REQ-LOCALRUN-177
+#[test]
+fn child_runs_lists_every_child_by_step_then_ordinal() {
+    let fixture = AdmittedFixture::from_tree(
+        CHILD_PARENT_WORKFLOW,
+        &[
+            ("bin/hello", TREE_PROGRAM, 0o755),
+            ("design.yaml", CHILD_DESIGN_WORKFLOW, 0o644),
+        ],
+    );
+    let parent_path = fixture.run_path("parent");
+    let _writable_parent = WritableTreeCopyOnDrop(parent_path.clone());
+    let parent_record = tree_record(&fixture, Some((HOME_DEFINITION.to_owned(), 1)));
+    let parent =
+        InitialLocalRun::create_with_record(&parent_path, &fixture.admitted, Some(&parent_record))
+            .unwrap();
+    assert_eq!(child_runs(&parent_path).unwrap(), Vec::new());
+
+    let parent_copy = parent.tree_copy_directory();
+    let mut expected = Vec::new();
+    let mut writable = Vec::new();
+    for (step, ordinal) in [("review", 1), ("design", 1), ("design", 2)] {
+        let admitted = fixture.admit_child(&parent_copy, "design.yaml");
+        let record = WorkflowRunRecord::child_of(&parent_record, step, "design.yaml", None);
+        let child = create_child(&parent, step, None, &admitted, &record).unwrap();
+        writable.push(WritableTreeCopyOnDrop(child.run_directory().to_owned()));
+        let outcome = (step == "design" && ordinal == 1).then_some("blocked");
+        if let Some(outcome) = outcome {
+            child
+                .update_run_record(RunState::Exited, 1, Some(outcome))
+                .unwrap();
+        }
+        expected.push((
+            step.to_owned(),
+            ordinal,
+            child.run_directory().to_owned(),
+            record.id.clone(),
+            if outcome.is_some() {
+                RunState::Exited
+            } else {
+                RunState::Running
+            },
+            outcome.map(str::to_owned),
+        ));
+    }
+    drop(parent);
+    expected.sort_by(|left, right| (&left.0, left.1).cmp(&(&right.0, right.1)));
+
+    let children = child_runs(&parent_path)
+        .unwrap()
+        .into_iter()
+        .map(|child| {
+            (
+                child.step,
+                child.ordinal,
+                child.directory,
+                child.record.id,
+                child.record.state,
+                child.record.outcome,
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(children, expected);
+}
+
+const LOCK_HOLDER_RUN: &str = "UM_TEST_LOCK_HOLDER_RUN";
+
+/// The process fixture of `lock_holder_names_the_process_that_holds_the_run_lock`: holds
+/// the lock of the run at `$UM_TEST_LOCK_HOLDER_RUN` through `acquire_local_retry`, creates
+/// `<run>.held` once it does, and keeps the lock until standard input closes.
+#[test]
+#[ignore = "process fixture of lock_holder_names_the_process_that_holds_the_run_lock"]
+fn lock_holder_process_fixture() {
+    let Some(run_path) = std::env::var_os(LOCK_HOLDER_RUN).map(PathBuf::from) else {
+        return;
+    };
+    let LocalRetryOpen::Acquired(pending) = acquire_local_retry(&run_path).unwrap() else {
+        panic!("the fixture run should be retryable");
+    };
+    fs::write(run_path.with_extension("held"), b"").unwrap();
+    let _ = io::stdin().read_to_end(&mut Vec::new());
+    drop(pending);
+}
+
+// REQ-LOCALRUN-175
+#[tokio::test]
+async fn lock_holder_names_the_process_that_holds_the_run_lock() {
+    let fixture = edge_tree_fixture();
+    let (run_path, _, _writable) = waiting_tree_run(&fixture, "locked").await;
+    assert_eq!(lock_holder(&run_path), Ok(None));
+
+    // A process's own `fcntl` lock never blocks its own query, so another process holds it.
+    let ready = run_path.with_extension("held");
+    let mut holder = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "workflow::local_run::tests::lock_holder_process_fixture",
+            "--ignored",
+            "--test-threads=1",
+        ])
+        .env(LOCK_HOLDER_RUN, &run_path)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let started = um_support::monotonic_now();
+    while !ready.exists() {
+        assert!(
+            holder.try_wait().unwrap().is_none(),
+            "the holder exited early"
+        );
+        assert!(um_support::elapsed(started) < Duration::from_secs(10));
+        um_support::sleep(Duration::from_millis(10));
+    }
+    let holder_pid = rustix::process::Pid::from_raw(i32::try_from(holder.id()).unwrap());
+    assert_eq!(lock_holder(&run_path), Ok(holder_pid));
+
+    drop(holder.stdin.take());
+    assert!(holder.wait().unwrap().success());
+    assert_eq!(lock_holder(&run_path), Ok(None));
+}
+
+// REQ-LOCALRUN-175
+#[test]
+fn update_run_record_rewrites_state_attempts_and_outcome_and_nothing_else() {
+    let fixture = tree_fixture();
+    let run_path = fixture.run_path("record-update");
+    let _writable = WritableTreeCopyOnDrop(run_path.clone());
+    let record = tree_record(&fixture, None);
+    let run =
+        InitialLocalRun::create_with_record(&run_path, &fixture.admitted, Some(&record)).unwrap();
+    let record_path = run_path.join(RUN_RECORD_FILE);
+    let created = fs::read_to_string(&record_path).unwrap();
+    let validator = run_record_validator();
+    let assert_record_valid = |text: &str| {
+        let document = serde_json::from_str::<Value>(text).unwrap();
+        assert!(validator.is_valid(&document), "{document}");
+    };
+    // A temporary left by an interrupted rewrite is private and replaced.
+    let temporary_path = run_path
+        .join(PRIVATE_DIRECTORY)
+        .join(RUN_RECORD_TEMPORARY_FILE);
+    fs::write(&temporary_path, b"interrupted").unwrap();
+
+    run.update_run_record(RunState::Exited, 1, Some("planned"))
+        .unwrap();
+    let exited = fs::read_to_string(&record_path).unwrap();
+    assert_eq!(
+        exited,
+        created
+            .replace("\"state\": \"running\"", "\"state\": \"exited\"")
+            .replace("\"outcome\": null", "\"outcome\": \"planned\"")
+    );
+    assert_record_valid(&exited);
+    assert_eq!(mode(&record_path), 0o600);
+    assert!(!temporary_path.exists());
+
+    // A record that does not validate is refused at its path and left as it is.
+    let invalid = created.replace("\"owner\": \"tester\"", "\"owner\": \"\"");
+    fs::write(&record_path, &invalid).unwrap();
+    match run.update_run_record(RunState::Exited, 2, Some("failed")) {
+        Err(LocalRunDirectoryError::StateFile { path, source, .. })
+            if path == record_path.canonicalize().unwrap()
+                && matches!(*source, LocalRunDirectoryError::StateInvalid) => {}
+        other => panic!("an invalid run record was rewritten: {other:?}"),
+    }
+    assert_eq!(fs::read_to_string(&record_path).unwrap(), invalid);
+    fs::write(&record_path, &exited).unwrap();
+
+    settle_as_workflow_failed(&run);
+    drop(run);
+    let LocalRetryOpen::Acquired(pending) = acquire_local_retry(&run_path).unwrap() else {
+        panic!("a failed tree run should be retryable");
+    };
+    // A live attempt has no outcome yet.
+    pending
+        .update_run_record(RunState::Running, 2, None)
+        .unwrap();
+    drop(pending);
+    let retried = fs::read_to_string(&record_path).unwrap();
+    assert_eq!(
+        retried,
+        created.replace("\"attempts\": 1", "\"attempts\": 2")
+    );
+    assert_record_valid(&retried);
+
+    let LocalContinuationOpen::Acquired(pending) = acquire_local_continuation(&run_path).unwrap()
+    else {
+        panic!("a failed tree run should be continuable");
+    };
+    pending
+        .update_run_record(RunState::Exited, 3, Some("planned"))
+        .unwrap();
+    drop(pending);
+    assert_eq!(
+        fs::read_to_string(&record_path).unwrap(),
+        exited.replace("\"attempts\": 1", "\"attempts\": 3")
+    );
+    verify_existing_run_layout(&open_directory_path(&run_path).unwrap()).unwrap();
+}
+
+// REQ-LOCALRUN-175, REQ-LOCALRUN-98
+#[test]
+fn a_run_created_without_a_record_has_no_run_json_and_the_old_layout_is_refused() {
+    let fixture = AdmittedFixture::new();
+    let run_path = fixture.run_path("closure");
+    let run = InitialLocalRun::create(&run_path, &fixture.admitted).unwrap();
+    assert_eq!(
+        directory_names(&run_path),
+        [
+            ".private",
+            "attempts",
+            "local-run.json",
+            "run.lock",
+            "state.json",
+            "workflow"
+        ]
+    );
+    run.update_run_record(RunState::Exited, 1, Some("failed"))
+        .unwrap();
+    assert!(!run_path.join(RUN_RECORD_FILE).exists());
+    settle_as_workflow_failed(&run);
+    drop(run);
+    verify_existing_run_layout(&open_directory_path(&run_path).unwrap()).unwrap();
+    let LocalRetryOpen::Acquired(pending) = acquire_local_retry(&run_path).unwrap() else {
+        panic!("a failed closure run should be retryable");
+    };
+    pending
+        .update_run_record(RunState::Running, 2, None)
+        .unwrap();
+    drop(pending);
+    assert!(!run_path.join(RUN_RECORD_FILE).exists());
+
+    // The layout before the run record: the identity record as `run.json`.
+    fs::rename(
+        run_path.join(LOCAL_RUN_FILE),
+        run_path.join(RUN_RECORD_FILE),
+    )
+    .unwrap();
+    assert_layout_refused(&run_path);
+    match acquire_local_retry(&run_path) {
+        Err(LocalRunDirectoryError::StateFile { source, .. })
+            if matches!(*source, LocalRunDirectoryError::StateInvalid) => {}
+        Err(other) => panic!("the old layout produced the wrong failure: {other:?}"),
+        Ok(_) => panic!("retry accepted a run directory without local-run.json"),
+    }
+}
+
+// REQ-LOCALRUN-171
+#[test]
+fn a_modified_tree_copy_is_rejected_on_reopen() {
+    let fixture = tree_fixture();
+    let run_path = fixture.run_path("tree-modified");
+    let _writable = WritableTreeCopyOnDrop(run_path.clone());
+    let run = InitialLocalRun::create(&run_path, &fixture.admitted).unwrap();
+    settle_as_workflow_failed(&run);
+    drop(run);
+    let expected = &fixture.admitted.tree().unwrap().digest().value;
+
+    let LocalRetryOpen::Acquired(pending) = acquire_local_retry(&run_path).unwrap() else {
+        panic!("a failed tree run should be retryable");
+    };
+    let (copy, record) = pending
+        .tree_copy()
+        .expect("the retained read reports the tree");
+    assert_eq!(copy, run_path.join("workflow/tree").canonicalize().unwrap());
+    assert_eq!(record.digest(), expected);
+    let verified = pending.verify_tree_copy().unwrap().unwrap();
+    assert_eq!(&verified.digest.value, expected);
+    assert_eq!(verified.programs, ["bin"]);
+    drop(pending);
+
+    let program = run_path.join("workflow/tree/bin/hello");
+    fs::set_permissions(program.parent().unwrap(), Permissions::from_mode(0o755)).unwrap();
+    fs::set_permissions(&program, Permissions::from_mode(0o755)).unwrap();
+    fs::write(&program, "#!/bin/sh\necho modified\n").unwrap();
+
+    let LocalRetryOpen::Acquired(pending) = acquire_local_retry(&run_path).unwrap() else {
+        panic!("the retained read does not judge the copy's contents");
+    };
+    let (_, record) = pending.tree_copy().unwrap();
+    assert_eq!(record.digest(), expected);
+    let mismatch = pending.verify_tree_copy().unwrap().unwrap_err();
+    assert_eq!(mismatch.expected_digest(), expected);
+    let actual = mismatch
+        .actual_digest()
+        .expect("the modified copy is still a tree");
+    assert_ne!(actual, expected);
+    assert!(mismatch.diagnostics().is_empty());
+    assert!(!run_path.join("attempts/000002").exists());
 }
 
 // REQ-LOCALRUN-97
@@ -1119,7 +3975,8 @@ fn schema_one_documents_without_continuation_foundation_fields_remain_readable()
     settle_as_succeeded(&run);
 
     let mut run_document: serde_json::Value =
-        serde_json::from_slice(&read_regular_file(run.root_handle(), RUN_FILE).unwrap()).unwrap();
+        serde_json::from_slice(&read_regular_file(run.root_handle(), LOCAL_RUN_FILE).unwrap())
+            .unwrap();
     run_document.as_object_mut().unwrap().remove("gitBaseline");
     assert!(decode_run(&json_bytes(run_document)).is_ok());
 
@@ -1157,6 +4014,7 @@ fn archived_attempt_loads_schema_one_state_without_retained_output_foundation() 
     assert_eq!(archived.projection.state, AttemptStateV1::WorkflowFailed);
 }
 
+// REQ-LOCALRUN-168, REQ-LOCALRUN-98
 #[test]
 fn run_retains_original_git_baseline_for_descendant_retries() {
     let fixture = AdmittedFixture::new_with_environment(EnvironmentSnapshot::new([(
@@ -1198,6 +4056,14 @@ fn run_retains_original_git_baseline_for_descendant_retries() {
             commit_oid: original.clone(),
         })
     );
+    // REQ-LOCALRUN-168, REQ-LOCALRUN-98: the identity record is `local-run.json`.
+    let identity: Value =
+        serde_json::from_slice(&fs::read(run_path.join("local-run.json")).unwrap()).unwrap();
+    assert_eq!(
+        identity["gitBaseline"],
+        json!({"status": "available", "objectFormat": "sha1", "commitOid": original})
+    );
+    assert!(!run_path.join("run.json").exists());
     settle_as_workflow_failed(&run);
     drop(run);
     let LocalRetryOpen::Acquired(pending) = acquire_local_retry(&run_path).unwrap() else {
@@ -2650,7 +5516,13 @@ fn abandoned_continuation_claim_settles_and_claims_in_one_state_revision() {
         panic!("unowned created attempt must be recoverable");
     };
     let owned = pending
-        .begin(&fixture.admitted, vec!["first".to_owned()], false)
+        .begin(
+            &fixture.admitted,
+            vec!["first".to_owned()],
+            ContinuationDefinitionMode::Inherited,
+            crate::workflow::publication::ContinuationReasonV1::Resume,
+            None,
+        )
         .unwrap();
     let state = read_state(owned.state.root.as_ref()).unwrap();
     assert_eq!(state.revision, 2);
@@ -2691,7 +5563,13 @@ fn continuation_context_rejects_a_rebound_run_path() {
         panic!("eligible failed run");
     };
     let owned = pending
-        .begin(&fixture.admitted, vec!["first".to_owned()], false)
+        .begin(
+            &fixture.admitted,
+            vec!["first".to_owned()],
+            ContinuationDefinitionMode::Inherited,
+            crate::workflow::publication::ContinuationReasonV1::Resume,
+            None,
+        )
         .unwrap();
 
     fs::rename(&path, moved).unwrap();
@@ -2718,7 +5596,13 @@ fn continuation_context_rejects_a_symlink_rebound_run_path() {
         panic!("eligible failed run");
     };
     let owned = pending
-        .begin(&fixture.admitted, vec!["first".to_owned()], false)
+        .begin(
+            &fixture.admitted,
+            vec!["first".to_owned()],
+            ContinuationDefinitionMode::Inherited,
+            crate::workflow::publication::ContinuationReasonV1::Resume,
+            None,
+        )
         .unwrap();
 
     fs::rename(&path, &moved).unwrap();
@@ -2742,7 +5626,13 @@ fn postclaim_owner_loss_remains_auditable_and_can_be_settled_again() {
         panic!("eligible failed run");
     };
     let owned = pending
-        .begin(&fixture.admitted, vec!["first".to_owned()], false)
+        .begin(
+            &fixture.admitted,
+            vec!["first".to_owned()],
+            ContinuationDefinitionMode::Inherited,
+            crate::workflow::publication::ContinuationReasonV1::Resume,
+            None,
+        )
         .unwrap();
     drop(owned); // Simulate owner death before seed/dispatch.
     let LocalContinuationOpen::Acquired(pending) = acquire_local_continuation(&path).unwrap()
@@ -2794,7 +5684,13 @@ fn continuation_claim_commits_one_partitioned_attempt_after_failed_run() {
         panic!("failed run should allow claim");
     };
     let owned = pending
-        .begin(&fixture.admitted, vec!["first".to_owned()], false)
+        .begin(
+            &fixture.admitted,
+            vec!["first".to_owned()],
+            ContinuationDefinitionMode::Inherited,
+            crate::workflow::publication::ContinuationReasonV1::Resume,
+            None,
+        )
         .unwrap();
     assert_eq!(owned.attempt_number(), 2);
     let state = read_state(owned.state.root.as_ref()).unwrap();
@@ -2850,7 +5746,13 @@ fn continuation_claim_rechecks_immutable_source_and_execution_policy() {
         panic!("failed run should allow claim inspection");
     };
     assert!(matches!(
-        pending.begin(&altered_policy, vec!["first".to_owned()], false),
+        pending.begin(
+            &altered_policy,
+            vec!["first".to_owned()],
+            ContinuationDefinitionMode::Inherited,
+            crate::workflow::publication::ContinuationReasonV1::Resume,
+            None,
+        ),
         Err(LocalRunDirectoryError::StateConflict)
     ));
 
@@ -2889,7 +5791,13 @@ fn continuation_claim_rechecks_immutable_source_and_execution_policy() {
         panic!("failed run should remain available after rejected claim");
     };
     assert!(matches!(
-        pending.begin(&altered_source, vec!["first".to_owned()], true),
+        pending.begin(
+            &altered_source,
+            vec!["first".to_owned()],
+            ContinuationDefinitionMode::Replaced,
+            crate::workflow::publication::ContinuationReasonV1::Resume,
+            None,
+        ),
         Err(LocalRunDirectoryError::StateConflict)
     ));
     assert_eq!(
@@ -3004,7 +5912,7 @@ fn continuation_acquisition_keeps_run_locked_during_partition_admission() {
     let changed = pending.definition_changes(&revised, &["first".to_owned()]);
     assert_eq!(changed.get("first"), Some(&true));
     let mut subset = pending.previous_definition().clone();
-    subset.definition.required_inputs.remove("request");
+    subset.definition.declared_inputs.remove("request");
     assert!(
         pending
             .projected_inputs(&subset)
@@ -3012,7 +5920,7 @@ fn continuation_acquisition_keeps_run_locked_during_partition_admission() {
             .get("request")
             .is_none()
     );
-    subset.definition.required_inputs.insert(
+    subset.definition.declared_inputs.insert(
         "extra".to_owned(),
         super::super::validated::WorkflowValueType::Text,
     );
@@ -3090,7 +5998,8 @@ fn continuation_admission_follows_skipped_disposition_through_inherited_history(
     assert_eq!(skipped, BTreeSet::from(["first".to_owned()]));
     let workflow = &fixture.admitted.workflow().definition;
     let partition =
-        super::super::continuation::partition(workflow, &["second".to_owned()]).unwrap();
+        super::super::continuation::partition(workflow, &["second".to_owned()], &BTreeSet::new())
+            .unwrap();
     let violations = super::super::continuation::check_inheritance(
         workflow,
         workflow,
@@ -3394,26 +6303,7 @@ fn retain_text_output_for_step(
     output_name: &str,
     bytes: &[u8],
 ) {
-    let state = read_state(run.root_handle()).unwrap();
-    let attempt_name = attempt_directory_name(state.current_attempt_number).unwrap();
-    let relative_path = retained_value_relative_path(AttemptNodeRoleV1::Step, step_id, output_name);
-    let path = run
-        .run_directory()
-        .join(ATTEMPTS_DIRECTORY)
-        .join(attempt_name)
-        .join(&relative_path);
-    fs::create_dir_all(path.parent().unwrap()).unwrap();
-    fs::write(path, bytes).unwrap();
-    let retained = RetainedOutputV1::Text {
-        name: output_name.to_owned(),
-        producer: None,
-        carrier: RetainedCarrierV1 {
-            relative_path,
-            media_type: "text/plain; charset=utf-8".to_owned(),
-            size_bytes: u64::try_from(bytes.len()).unwrap(),
-            digest: DigestV1::sha256(bytes),
-        },
-    };
+    let retained = write_retained_carrier(run, step_id, output_name, bytes, false);
     run.state
         .update(|state| {
             let step = current_attempt_mut(state)?
@@ -3426,6 +6316,47 @@ fn retain_text_output_for_step(
             Ok(())
         })
         .unwrap();
+}
+
+/// Writes `bytes` as the carrier of `step_id`'s output `output_name` under `run`'s current
+/// attempt and answers its descriptor: a `json` output when `json`, a `text` one otherwise.
+fn write_retained_carrier(
+    run: &LocalAttemptOwner,
+    step_id: &str,
+    output_name: &str,
+    bytes: &[u8],
+    json: bool,
+) -> RetainedOutputV1 {
+    let state = read_state(run.root_handle()).unwrap();
+    let attempt_name = attempt_directory_name(state.current_attempt_number).unwrap();
+    let relative_path = retained_value_relative_path(AttemptNodeRoleV1::Step, step_id, output_name);
+    let path = run
+        .run_directory()
+        .join(ATTEMPTS_DIRECTORY)
+        .join(attempt_name)
+        .join(&relative_path);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(path, bytes).unwrap();
+    let carrier = |media_type: &str| RetainedCarrierV1 {
+        relative_path: relative_path.clone(),
+        media_type: media_type.to_owned(),
+        size_bytes: u64::try_from(bytes.len()).unwrap(),
+        digest: DigestV1::sha256(bytes),
+    };
+    let name = output_name.to_owned();
+    if json {
+        RetainedOutputV1::Json {
+            name,
+            producer: None,
+            carrier: carrier("application/json"),
+        }
+    } else {
+        RetainedOutputV1::Text {
+            name,
+            producer: None,
+            carrier: carrier("text/plain; charset=utf-8"),
+        }
+    }
 }
 
 fn retain_file_outputs_for_step(

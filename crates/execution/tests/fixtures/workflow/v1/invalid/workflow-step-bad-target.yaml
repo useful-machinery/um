@@ -1,0 +1,7 @@
+schemaVersion: 1
+steps:
+  design:
+    kind: workflow
+    workflow: design.yaml
+    on:
+      planned: "Exit.x"

@@ -1,0 +1,12 @@
+schemaVersion: 1
+outcomes: [landed, failed]
+steps:
+  design:
+    kind: workflow
+    workflow: design.yaml
+    on:
+      planned: exit.landed
+      blocked:
+        wait: children
+        then: design
+      failed: exit.failed

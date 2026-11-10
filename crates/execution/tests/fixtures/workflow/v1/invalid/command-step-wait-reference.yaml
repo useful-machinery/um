@@ -1,0 +1,9 @@
+schemaVersion: 1
+steps:
+  prepare:
+    kind: cmd
+    inputs:
+      notes:
+        ref: wait.notes
+    command:
+      argv: ["printf", "ok"]

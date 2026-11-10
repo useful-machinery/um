@@ -538,6 +538,21 @@ pub(super) fn validate_continuation_record(record: &ContinuationRecordV1) -> boo
                 prior_manifest_digest,
             },
         ) => valid_digest(manifest_digest) && manifest_digest == prior_manifest_digest,
+        // The first own attempt of a successor names no replacement but runs under the
+        // successor's own definition, which differs from the prior attempt's, whatever
+        // resolved it: a restart (REQ-CONTINUE-79) or the carried wait of an upgrade
+        // (REQ-CONTINUE-80).
+        (
+            ContinuationRequestedDefinitionV1::Inherited(_),
+            ContinuationDefinitionSourceV1::Replaced {
+                manifest_digest,
+                prior_manifest_digest,
+            },
+        ) => {
+            valid_digest(manifest_digest)
+                && valid_digest(prior_manifest_digest)
+                && manifest_digest != prior_manifest_digest
+        }
         (
             ContinuationRequestedDefinitionV1::Replaced { replaced },
             ContinuationDefinitionSourceV1::Replaced {
@@ -621,8 +636,21 @@ pub(super) fn validate_continuation_record(record: &ContinuationRecordV1) -> boo
                 )
         }
     };
+    // An `edge` continuation records the edge it took and starts from its target; no other
+    // reason records one (REQ-CONTINUE-77).
+    let edge_valid = match (&record.reason, &record.edge) {
+        (Some(super::publication::ContinuationReasonV1::Edge), Some(edge)) => {
+            is_identifier(&edge.step)
+                && is_identifier(&edge.target)
+                && !edge.outcome.is_empty()
+                && record.from_steps == [edge.target.clone()]
+        }
+        (Some(super::publication::ContinuationReasonV1::Edge), None) | (_, Some(_)) => false,
+        (_, None) => true,
+    };
     recovery_valid
         && definition_valid
+        && edge_valid
         && record
             .request
             .execution_root
@@ -675,6 +703,20 @@ fn validate_outcome(result: &WorkflowResultV1) -> Result<(), ResultMetadataError
             || parse_canonical_utc_timestamp(&cancellation.force_stop_deadline).is_none())
     {
         return Err(ResultMetadataError);
+    }
+    // A waiting or continued attempt ran no finalizer and every step is terminal as in a
+    // success (REQ-WFEXEC-15, REQ-WFEXEC-61, REQ-WFEXEC-64).
+    if matches!(
+        result.outcome,
+        WorkflowOutcomeV1::Waiting | WorkflowOutcomeV1::Continued
+    ) {
+        return (result.finalization.is_none()
+            && result.primary_issue.is_none()
+            && result.cancellation.is_none()
+            && result.force_abort.is_none()
+            && result.steps.iter().all(step_succeeds_workflow))
+        .then_some(())
+        .ok_or(ResultMetadataError);
     }
 
     let ordinary_trigger = if let Some(finalization) = &result.finalization {
@@ -885,10 +927,14 @@ fn primary_node_detail(primary: &super::evidence::PrimaryIssue) -> NodeDetail {
     }
 }
 
+// A step an edge-scheduled walk never reached is part of a success (REQ-WFEXEC-58).
 fn step_succeeds_workflow(step: &WorkflowStepV1) -> bool {
     matches!(
         step.state,
         WorkflowStepStateV1::Succeeded | WorkflowStepStateV1::Skipped
+    ) || matches!(
+        &step.detail,
+        Some(NodeDetail::NotRun(detail)) if detail.code == NonExecutionCode::NotReached
     ) || matches!(
         &step.detail,
         Some(NodeDetail::Inherited(detail))
@@ -1073,7 +1119,7 @@ fn validate_steps(
         if !is_identifier(&step.id)
             || !ids.insert(step.id.clone())
             || step.role != expected_role
-            || !matches!(step.kind.as_str(), "cmd" | "agent")
+            || !matches!(step.kind.as_str(), "cmd" | "agent" | "workflow")
         {
             return Err(ResultMetadataError);
         }
@@ -1099,7 +1145,10 @@ fn validate_steps(
                 WorkflowNodeRoleV1::Step,
                 WorkflowStepStateV1::NotRun,
                 Some(NodeDetail::NotRun(detail)),
-            ) => detail.code == NonExecutionCode::FailureStop,
+            ) => matches!(
+                detail.code,
+                NonExecutionCode::FailureStop | NonExecutionCode::NotReached
+            ),
             (
                 WorkflowNodeRoleV1::Finalizer,
                 WorkflowStepStateV1::NotRun,
@@ -1135,7 +1184,8 @@ fn validate_steps(
             _ => None,
         };
         let output_valid = match (step.kind.as_str(), step.state) {
-            ("agent", _) => !output_present,
+            // A `workflow` step, like an agent, has no command output (REQ-WFEXEC-60).
+            ("agent" | "workflow", _) => !output_present,
             ("cmd", WorkflowStepStateV1::Succeeded) => output_present,
             ("cmd", WorkflowStepStateV1::Failed) => {
                 output_present
@@ -1538,6 +1588,7 @@ pub(crate) fn is_output_failure_code(code: FailureCodeV1) -> bool {
             | FailureCodeV1::OutputInvalidJson
             | FailureCodeV1::OutputDuplicateJsonMember
             | FailureCodeV1::OutputJsonSchemaMismatch
+            | FailureCodeV1::OutcomeUndeclared
             | FailureCodeV1::CapturedFileCountLimit
             | FailureCodeV1::CapturedFileSizeLimit
             | FailureCodeV1::CapturedTotalSizeLimit
@@ -1579,9 +1630,9 @@ fn simple_failure_phase(code: FailureCodeV1, phase: FailurePhaseV1) -> bool {
         | FailureCodeV1::ResultSettlementFailed => {
             matches!(phase, FailurePhaseV1::Start | FailurePhaseV1::Execution)
         }
-        FailureCodeV1::CommandWaitFailed | FailureCodeV1::ExecutionTaskUnavailable => {
-            phase == FailurePhaseV1::Execution
-        }
+        FailureCodeV1::CommandWaitFailed
+        | FailureCodeV1::ExecutionTaskUnavailable
+        | FailureCodeV1::ChildRunInterrupted => phase == FailurePhaseV1::Execution,
         FailureCodeV1::OutputUnsupported | FailureCodeV1::CaptureTaskUnavailable => {
             phase == FailurePhaseV1::OutputCapture
         }
@@ -1607,6 +1658,7 @@ fn simple_failure_phase(code: FailureCodeV1, phase: FailurePhaseV1) -> bool {
         | FailureCodeV1::OutputInvalidJson
         | FailureCodeV1::OutputDuplicateJsonMember
         | FailureCodeV1::OutputJsonSchemaMismatch
+        | FailureCodeV1::OutcomeUndeclared
         | FailureCodeV1::CapturedFileCountLimit
         | FailureCodeV1::CapturedFileSizeLimit
         | FailureCodeV1::CapturedTotalSizeLimit
@@ -1658,7 +1710,8 @@ fn simple_failure_phase(code: FailureCodeV1, phase: FailurePhaseV1) -> bool {
         | FailureCodeV1::CommandLaunchNotFound
         | FailureCodeV1::CommandLaunchPermissionDenied
         | FailureCodeV1::CommandLaunchInvalidInput
-        | FailureCodeV1::CommandLaunchFailed => phase == FailurePhaseV1::Start,
+        | FailureCodeV1::CommandLaunchFailed
+        | FailureCodeV1::ChildAdmissionRejected => phase == FailurePhaseV1::Start,
     }
 }
 
@@ -1871,6 +1924,7 @@ fn valid_unavailable_export_source(
         source,
         step.state,
         inherited_prior_state(step),
+        step.kind == "workflow",
         reason,
     )
 }
@@ -1887,6 +1941,7 @@ pub(super) fn unavailable_export_source_matches(
     source: &ExportSourceV1,
     source_state: WorkflowStepStateV1,
     inherited_prior_state: Option<super::evidence::InheritedPriorState>,
+    source_is_workflow_step: bool,
     reason: ExportUnavailableReasonV1,
 ) -> bool {
     if !is_identifier(&source.node.id)
@@ -1905,7 +1960,24 @@ pub(super) fn unavailable_export_source_matches(
             }
             Some(super::evidence::InheritedPriorState::Succeeded) | None => false,
         };
-    inherited_source_skipped && reason == ExportUnavailableReasonV1::Skipped
+    // A `workflow` step commits only the child exports that were available, so an export of
+    // one it left out is `source_failed` though the step succeeded (REQ-WFEXEC-58,
+    // REQ-EXPORTS-3); an inherited one still carries the `outcome` it routed from.
+    let child_export_left_out =
+        source_is_workflow_step
+            && source.node.role == WorkflowNodeRoleV1::Step
+            && reason == ExportUnavailableReasonV1::Failed
+            && match source_state {
+                WorkflowStepStateV1::Succeeded => true,
+                WorkflowStepStateV1::Inherited => output_producers
+                    .get(&source.node.id)
+                    .is_some_and(|outputs| {
+                        outputs.contains_key(super::validation::CHILD_OUTCOME_OUTPUT)
+                    }),
+                _ => false,
+            };
+    child_export_left_out
+        || inherited_source_skipped && reason == ExportUnavailableReasonV1::Skipped
         || matches!(
             (source_state, source.node.role, reason),
             (
@@ -2094,3 +2166,110 @@ impl<'de> Visitor<'de> for UniqueValueVisitor {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod waiting_tests {
+    use serde_json::{Value, json};
+
+    // A waiting result of an edge-scheduled walk: `design` succeeded and entered the wait.
+    fn waiting_result() -> Value {
+        let not_reached = |id: &str| {
+            json!({
+                "id": id,
+                "role": "step",
+                "kind": "workflow",
+                "failurePolicy": "required",
+                "state": "not_run",
+                "detail": {"code": "not_reached"}
+            })
+        };
+        json!({
+            "schemaVersion": 1,
+            "attemptNumber": 1,
+            "workflow": {
+                "path": "workflow.yaml",
+                "provenance": {"kind": "local", "sourceRoot": "/tmp/source"},
+                "digest": {"algorithm": "sha256", "value": "1".repeat(64)}
+            },
+            "execution": {
+                "executionRoot": "/tmp/execution",
+                "maximumParallelSteps": 1,
+                "startedAt": "2026-08-02T12:01:44Z",
+                "finishedAt": "2026-08-02T12:01:45Z",
+                "durationMilliseconds": 1000
+            },
+            "commandOutputPolicy": {
+                "encoding": "base64",
+                "maximumRetainedBytesPerStream": super::super::MAXIMUM_RETAINED_BYTES_PER_STREAM
+            },
+            "outcome": "waiting",
+            "forceAbort": null,
+            "steps": [
+                {
+                    "id": "design",
+                    "role": "step",
+                    "kind": "workflow",
+                    "failurePolicy": "required",
+                    "state": "succeeded",
+                    "startedAt": "2026-08-02T12:01:44Z",
+                    "durationMilliseconds": 1000
+                },
+                not_reached("review"),
+                not_reached("merge")
+            ],
+            "exports": {}
+        })
+    }
+
+    fn validates(result: &Value) -> bool {
+        let mut bytes = serde_json::to_vec_pretty(result).unwrap();
+        bytes.push(b'\n');
+        super::decode(&bytes).is_ok_and(|decoded| super::validate(&decoded).is_ok())
+    }
+
+    // REQ-WFEXEC-15
+    #[test]
+    fn a_waiting_result_has_only_terminal_success_steps_and_no_finalization() {
+        let result = waiting_result();
+        assert!(validates(&result));
+
+        let mut failed = result.clone();
+        failed["steps"][1] = json!({
+            "id": "review",
+            "role": "step",
+            "kind": "workflow",
+            "failurePolicy": "required",
+            "state": "failed",
+            "startedAt": "2026-08-02T12:01:44Z",
+            "durationMilliseconds": 1000,
+            "detail": {"phase": "execution", "code": "child_run_interrupted"}
+        });
+        assert!(!validates(&failed));
+    }
+
+    // REQ-WFEXEC-15, REQ-WFEXEC-64: a continued attempt, like a waiting one, ran no finalizer,
+    // has no primary issue and leaves every step terminal as in a success.
+    #[test]
+    fn a_continued_result_has_only_terminal_success_steps_and_no_finalization() {
+        let mut result = waiting_result();
+        result["outcome"] = json!("continued");
+        assert!(validates(&result));
+
+        let mut failed = result.clone();
+        failed["steps"][1] = json!({
+            "id": "review",
+            "role": "step",
+            "kind": "workflow",
+            "failurePolicy": "required",
+            "state": "failed",
+            "startedAt": "2026-08-02T12:01:44Z",
+            "durationMilliseconds": 1000,
+            "detail": {"phase": "execution", "code": "child_run_interrupted"}
+        });
+        assert!(!validates(&failed));
+
+        let mut finalized = result;
+        finalized["finalization"] = json!({"trigger": "succeeded", "finalizers": []});
+        assert!(!validates(&finalized));
+    }
+}

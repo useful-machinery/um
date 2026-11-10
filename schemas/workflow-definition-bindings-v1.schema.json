@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://docs.usefulmachinery.com/schemas/workflow-definition-bindings-v1.schema.json",
+  "title": "Useful Machinery Workflow Definition Bindings Snapshot V1",
+  "description": "A revision's bindings.json: each binding the root workflow declares, keyed by its name, with its kind and the value bound for the environment. An empty object is the snapshot of a root workflow that declares no bindings.",
+  "type": "object",
+  "propertyNames": { "$ref": "#/$defs/Identifier" },
+  "additionalProperties": { "$ref": "#/$defs/BoundBinding" },
+  "$defs": {
+    "Identifier": {
+      "type": "string",
+      "maxLength": 64,
+      "pattern": "^[a-z][A-Za-z0-9]*$"
+    },
+    "BindingKind": {
+      "enum": ["connection", "linear.team", "linear.state", "github.repository"]
+    },
+    "BoundBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "value"],
+      "properties": {
+        "kind": { "$ref": "#/$defs/BindingKind" },
+        "value": { "type": "string", "minLength": 1 }
+      }
+    }
+  }
+}

@@ -422,6 +422,9 @@ impl ExecutionJob {
                     reason: CancellationReason::ExecutionLeaseExpired,
                 } => PhaseEnd::TimedOut,
                 RunOutcome::Cancelled { .. } => PhaseEnd::Cancelled,
+                // Cloud admission refuses `workflow` steps, so no runner attempt waits or
+                // continues.
+                RunOutcome::Waiting { .. } | RunOutcome::Continued { .. } => PhaseEnd::Failed,
             },
             LeaseExecution::Completed { output: Err(_), .. }
             | LeaseExecution::LeaseClockFailed { .. } => PhaseEnd::Failed,
@@ -724,9 +727,11 @@ impl ExecutionJob {
             RunOutcome::Cancelled {
                 reason: CancellationReason::ExecutionLeaseExpired,
             } => Some(InfrastructureInterruption::ExecutionLeaseExpired),
-            RunOutcome::Succeeded | RunOutcome::Failed { .. } | RunOutcome::Cancelled { .. } => {
-                None
-            }
+            RunOutcome::Succeeded
+            | RunOutcome::Failed { .. }
+            | RunOutcome::Cancelled { .. }
+            | RunOutcome::Waiting { .. }
+            | RunOutcome::Continued { .. } => None,
         });
         let workspace_disposition = match (&result.outcome, &delivery) {
             (RunOutcome::Succeeded, ArtifactDeliveryOutcome::Prepared { .. }) => {
@@ -735,7 +740,12 @@ impl ExecutionJob {
             (RunOutcome::Succeeded, _) => {
                 WorkspaceDisposition::Retain(RetentionReason::ArtifactDeliveryFailed)
             }
-            (RunOutcome::Failed { .. }, _) => WorkspaceDisposition::Retain(RetentionReason::Failed),
+            (
+                RunOutcome::Failed { .. }
+                | RunOutcome::Waiting { .. }
+                | RunOutcome::Continued { .. },
+                _,
+            ) => WorkspaceDisposition::Retain(RetentionReason::Failed),
             (RunOutcome::Cancelled { .. }, _) if infrastructure_interruption.is_some() => {
                 WorkspaceDisposition::Retain(RetentionReason::Interrupted)
             }
@@ -851,6 +861,24 @@ impl ExecutionJob {
                     return ExecutionCompletion::containment_gated(report, workspace_disposition);
                 }
                 report
+            }
+            // Cloud admission refuses `workflow` steps, so no runner attempt waits or
+            // continues; one that did is an internal failure.
+            RunOutcome::Waiting { .. } | RunOutcome::Continued { .. } => {
+                self.collapse(
+                    "runner_internal_failure",
+                    "unexpected_waiting_outcome",
+                    "harness_execution",
+                );
+                return self
+                    .abort_unless_fenced(
+                        &post_stop_fence,
+                        assignment_id,
+                        attempt_id,
+                        last_sequence,
+                        "runner_internal_failure",
+                    )
+                    .await;
             }
         };
         ExecutionCompletion::containment_gated(report, workspace_disposition)

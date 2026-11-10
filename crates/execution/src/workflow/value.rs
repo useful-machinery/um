@@ -166,16 +166,21 @@ impl CapturedJson {
         self.inner.capture_lease.as_ref().map(CaptureLease::carrier)
     }
 
+    /// A JSON value validated against no constraint, with `carrier` its canonical bytes: a
+    /// child's `json` export as it reaches the parent, live or read back from the child's
+    /// published result, so that the parent's capture never reaches into the child's staging.
+    pub(crate) fn unconstrained(value: Arc<Value>, carrier: Arc<[u8]>) -> Option<Self> {
+        const UNCONSTRAINED: &str = r#"{"$schema":"https://json-schema.org/draft/2020-12/schema"}"#;
+        let document = Arc::new(serde_json::from_str(UNCONSTRAINED).ok()?);
+        let schema =
+            RetainedJsonSchema::compile(Arc::from(UNCONSTRAINED.as_bytes()), document).ok()?;
+        Some(Self::from_validated(value, carrier, schema))
+    }
+
     #[cfg(test)]
     pub(crate) fn fixture(value: Arc<Value>) -> Self {
-        let schema_document = Arc::new(serde_json::json!({
-            "$schema": "https://json-schema.org/draft/2020-12/schema"
-        }));
-        let schema_bytes =
-            Arc::from(br#"{"$schema":"https://json-schema.org/draft/2020-12/schema"}"#.as_slice());
-        let schema = RetainedJsonSchema::compile(schema_bytes, schema_document).unwrap();
         let carrier = canonical_json::to_bounded_bytes(&value, u64::MAX).unwrap();
-        Self::from_validated(value, carrier, schema)
+        Self::unconstrained(value, carrier).unwrap()
     }
 }
 

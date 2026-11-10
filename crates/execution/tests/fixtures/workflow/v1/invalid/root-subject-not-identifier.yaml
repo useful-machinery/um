@@ -1,0 +1,10 @@
+schemaVersion: 1
+subject: Ticket-ID
+inputs:
+  ticket:
+    kind: text
+steps:
+  prepare:
+    kind: cmd
+    command:
+      argv: ["true"]

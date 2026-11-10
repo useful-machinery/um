@@ -421,7 +421,9 @@ fn normalize_executable(selected: &Path) -> Result<PathBuf, ExecutableValidation
     Ok(executable)
 }
 
-fn is_executable_file(candidate: &Path) -> bool {
+/// A regular file, following links, that this process may execute: how a harness
+/// executable and a required tool (REQ-WFEXEC-55) are both recognized.
+pub(crate) fn is_executable_file(candidate: &Path) -> bool {
     fs::metadata(candidate).is_ok_and(|metadata| metadata.is_file())
         && accessat(CWD, candidate, Access::EXEC_OK, AtFlags::EACCESS).is_ok()
 }

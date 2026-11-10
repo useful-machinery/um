@@ -15,9 +15,12 @@ use rustix::process::{Pid, Signal, kill_process};
 
 #[cfg(target_os = "linux")]
 use super::poll_until;
+use super::workflow_definition::{Home, Tree, read_json};
 use super::workflow_run::{
-    RunBundle, finalizer_signal_bundle, isolated_command, run, signal_bundle,
+    RunBundle, child_tree, child_tree_args, finalizer_signal_bundle, isolated_command, run,
+    run_record, signal_bundle, spawn_held_child_tree, tree_finalizer_signal_bundle,
 };
+use super::workflow_view::workflow_view_schema;
 
 fn successful_bundle() -> RunBundle {
     RunBundle::new(
@@ -40,6 +43,7 @@ fn completed_run(name: &str) -> (RunBundle, PathBuf) {
 fn status_args(run_directory: &Path, options: &[&str]) -> Vec<String> {
     let mut args = vec![
         "workflow".to_owned(),
+        "run".to_owned(),
         "status".to_owned(),
         run_directory.to_string_lossy().into_owned(),
     ];
@@ -186,15 +190,28 @@ steps:
     }
 }
 
-// REQ-WFFINALIZE-19, REQ-WFEXEC-50
+// REQ-WFFINALIZE-19, REQ-WFEXEC-50, REQ-LOCALRUN-146, REQ-LOCALRUN-175
 #[test]
 fn live_finalization_status_is_incomplete_role_aware_and_retry_ineligible() {
+    // A closure run has no run record; a tree run's names no outcome while it is live.
+    let closure = finalizer_signal_bundle();
+    let closure_directory = closure.result("live-finalization");
+    let mut closure_args = closure.args(&closure_directory);
+    closure_args.insert(closure_args.len() - 1, "--json".to_owned());
+    let tree = tree_finalizer_signal_bundle();
+    let tree_directory = tree.result("live-finalization");
+    let tree_args = tree.args(&tree_directory);
+    for (args, run_directory, tree_run) in [
+        (closure_args, closure_directory, false),
+        (tree_args, tree_directory, true),
+    ] {
+        assert_live_finalization_status(&args, &run_directory, tree_run);
+    }
+}
+
+fn assert_live_finalization_status(args: &[String], run_directory: &Path, tree_run: bool) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let bundle = finalizer_signal_bundle();
-    let run_directory = bundle.result("live-finalization");
-    let mut args = bundle.args(&run_directory);
-    args.insert(args.len() - 1, "--json".to_owned());
-    let child = isolated_command(&args)
+    let child = isolated_command(args)
         .env(
             "WORKFLOW_RUN_FIXTURE_SOCKET",
             listener.local_addr().unwrap().to_string(),
@@ -209,9 +226,16 @@ fn live_finalization_status_is_incomplete_role_aware_and_retry_ineligible() {
     control.read_exact(&mut ready).unwrap();
     assert_eq!(ready, [1]);
 
-    let (output, result) = status_json(&run_directory);
+    let (output, result) = status_json(run_directory);
     assert!(output.status.success());
-    assert!(status_schema().is_valid(&result));
+    assert!(status_schema().is_valid(&result), "{result}");
+    if tree_run {
+        assert_eq!(result["record"], run_record(run_directory));
+        assert_eq!(result["record"]["state"], "running", "{result}");
+        assert_eq!(result["record"]["outcome"], serde_json::Value::Null);
+    } else {
+        assert_eq!(result["record"], serde_json::Value::Null, "{result}");
+    }
     assert_eq!(result["state"]["attempts"][0]["state"], "running");
     assert_eq!(
         result["state"]["attempts"][0]["finalization"]["complete"],
@@ -239,9 +263,16 @@ fn live_finalization_status_is_incomplete_role_aware_and_retry_ineligible() {
     kill_process(owner, Signal::INT).unwrap();
     assert_eq!(child.wait_with_output().unwrap().status.code(), Some(130));
 
-    let (output, settled) = status_json(&run_directory);
+    let (output, settled) = status_json(run_directory);
     assert!(output.status.success());
-    assert!(status_schema().is_valid(&settled));
+    assert!(status_schema().is_valid(&settled), "{settled}");
+    if tree_run {
+        assert_eq!(settled["record"], run_record(run_directory));
+        assert_eq!(settled["record"]["state"], "exited", "{settled}");
+        assert_eq!(settled["record"]["outcome"], "canceled");
+    } else {
+        assert_eq!(settled["record"], serde_json::Value::Null, "{settled}");
+    }
     assert_eq!(settled["state"]["attempts"][0]["state"], "cancelled");
     assert_eq!(
         settled["state"]["attempts"][0]["finalization"]["complete"],
@@ -369,7 +400,7 @@ fn status_json_reports_invalid_committed_pending_result() {
 #[test]
 fn status_json_and_plain_are_closed_read_only_snapshots() {
     let (_bundle, run_directory) = completed_run("settled");
-    let run_before = fs::read(run_directory.join("run.json")).unwrap();
+    let run_before = fs::read(run_directory.join("local-run.json")).unwrap();
     let state_before = fs::read(run_directory.join("state.json")).unwrap();
     let lock_before = fs::metadata(run_directory.join("run.lock")).unwrap();
 
@@ -392,19 +423,23 @@ fn status_json_and_plain_are_closed_read_only_snapshots() {
             "continuation",
             "exitStatus",
             "outcome",
+            "record",
             "recovery",
             "retry",
             "run",
             "runDirectory",
             "schemaVersion",
             "state",
+            "wait",
             "workspaceModified",
         ]
     );
     assert_eq!(result["schemaVersion"], 1);
-    assert_eq!(result["command"], "um workflow status");
+    assert_eq!(result["command"], "um workflow run status");
     assert_eq!(result["outcome"], "status");
     assert_eq!(result["exitStatus"], 0);
+    assert_eq!(result["record"], serde_json::Value::Null);
+    assert_eq!(result["wait"], serde_json::Value::Null);
     assert_eq!(result["recovery"], serde_json::json!({"status": "settled"}));
     assert_eq!(result["workspaceModified"], "unknown");
     assert_eq!(result["continuation"]["requestAdmission"], "not_evaluated");
@@ -439,7 +474,7 @@ fn status_json_and_plain_are_closed_read_only_snapshots() {
     );
 
     assert_eq!(
-        fs::read(run_directory.join("run.json")).unwrap(),
+        fs::read(run_directory.join("local-run.json")).unwrap(),
         run_before
     );
     assert_eq!(
@@ -728,16 +763,17 @@ fn signals_interrupt_blocked_status_output_without_a_valid_object() {
 #[test]
 fn status_usage_errors_return_two_without_a_status_object() {
     for args in [
-        vec!["workflow", "status", "--json"],
-        vec!["workflow", "status", "/tmp/run", "--plain", "--json"],
+        vec!["workflow", "run", "status", "--json"],
+        vec!["workflow", "run", "status", "/tmp/run", "--plain", "--json"],
         vec![
             "workflow",
+            "run",
             "status",
             "/tmp/run",
             "--execution-root",
             "/tmp/execution",
         ],
-        vec!["workflow", "status", "--run-dir", "/tmp/run"],
+        vec!["workflow", "run", "status", "--run-dir", "/tmp/run"],
     ] {
         let args = args.into_iter().map(str::to_owned).collect::<Vec<_>>();
         let output = isolated_command(&args).output().unwrap();
@@ -816,5 +852,223 @@ fn plain_status_and_run_diagnostics_escape_host_run_directory_names() {
         String::from_utf8(existing.stderr)
             .unwrap()
             .contains(&format!("run-{escaped}"))
+    );
+}
+
+// REQ-LOCALRUN-177, REQ-WFEXEC-50: a parent with `workflow` steps and each child read on
+// their own, the steps reported as kind `workflow`.
+#[test]
+fn status_and_view_read_a_parent_and_its_child_runs() {
+    let bundle = child_tree(super::workflow_run::HOLDING_CHILD_DECIDE);
+    fs::write(bundle.execution_root().join("verdict-input"), "planned").unwrap();
+    let destination = bundle.result("completed-parent");
+    let output = run(&child_tree_args(&bundle, &destination));
+    assert!(output.status.success(), "{output:?}");
+
+    let (output, parent) = status_json(&destination);
+    assert!(output.status.success(), "{output:?}");
+    assert!(status_schema().is_valid(&parent), "{parent}");
+    let view = isolated_command(&[
+        "workflow".to_owned(),
+        "run".to_owned(),
+        "view".to_owned(),
+        destination.to_string_lossy().into_owned(),
+        "--json".to_owned(),
+    ])
+    .output()
+    .unwrap();
+    assert!(view.status.success(), "{view:?}");
+    let view: serde_json::Value = serde_json::from_slice(&view.stdout).unwrap();
+    assert!(workflow_view_schema().is_valid(&view), "{view}");
+    let kinds = view["result"]["steps"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{view}"))
+        .iter()
+        .map(|step| step["kind"].as_str().unwrap().to_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(kinds, ["workflow", "workflow"], "{view}");
+
+    let child = destination.join("children/design/000001");
+    let (output, result) = status_json(&child);
+    assert!(output.status.success(), "{output:?}");
+    assert!(status_schema().is_valid(&result), "{result}");
+    assert_eq!(run_record(&child)["state"], "exited");
+}
+
+// REQ-LOCALRUN-177, REQ-LOCALRUN-147: a parent killed while its child runs leaves the
+// child `running` with an abandoned attempt.
+#[test]
+fn a_child_whose_parent_was_killed_reports_an_abandoned_attempt() {
+    let (_bundle, destination, mut parent) = spawn_held_child_tree("killed-parent");
+    let pid = Pid::from_raw(i32::try_from(parent.id()).unwrap()).unwrap();
+    kill_process(pid, Signal::KILL).unwrap();
+    assert!(!parent.wait().unwrap().success());
+
+    let child = destination.join("children/design/000001");
+    assert_eq!(run_record(&child)["state"], "running");
+    let (output, result) = super::poll_until(
+        "the child's attempt is abandoned",
+        || status_json(&child),
+        |(_, result)| result["recovery"]["status"] == "abandoned",
+    );
+    assert!(output.status.success(), "{output:?}");
+    assert!(status_schema().is_valid(&result), "{result}");
+}
+
+// REQ-LOCALRUN-179, REQ-LOCALRUN-146, REQ-LOCALRUN-145: a run whose attempt ended in a wait
+// reports the attempt `waiting`, its wait record and an eligible continuation, and the
+// archived view marks the outcome `waiting` and carries the attempt's wait record.
+#[test]
+fn status_and_view_report_a_waiting_run() {
+    let bundle = child_tree(super::workflow_run::CHILD_TREE_DECIDE);
+    bundle.write_source(
+        "workflow.yaml",
+        &super::workflow_run::CHILD_TREE_ROOT.replace(
+            "      blocked: exit.failed\n",
+            "      blocked:\n        wait: answer\n        then: build\n",
+        ),
+    );
+    fs::write(bundle.execution_root().join("verdict-input"), "blocked").unwrap();
+    let destination = bundle.result("waiting");
+    let output = run(&child_tree_args(&bundle, &destination));
+    assert!(output.status.success(), "{output:?}");
+
+    let (output, snapshot) = status_json(&destination);
+    assert!(output.status.success(), "{output:?}");
+    assert!(status_schema().is_valid(&snapshot), "{snapshot}");
+    let wait: serde_json::Value =
+        serde_json::from_slice(&fs::read(destination.join("wait.json")).unwrap()).unwrap();
+    assert_eq!(snapshot["wait"], wait);
+    assert_eq!(
+        snapshot["state"]["attempts"][0]["state"], "waiting",
+        "{snapshot}"
+    );
+    assert_eq!(snapshot["continuation"]["eligible"], true, "{snapshot}");
+    assert_eq!(snapshot["record"]["state"], "waiting", "{snapshot}");
+
+    let plain = status(&destination, &["--plain", "--color", "never"]);
+    assert!(plain.status.success(), "{plain:?}");
+    let plain = String::from_utf8(plain.stdout).unwrap();
+    assert!(
+        plain
+            .lines()
+            .any(|line| line.contains("answer") && line.contains("design")),
+        "{plain}"
+    );
+
+    let view = isolated_command(&[
+        "workflow".to_owned(),
+        "run".to_owned(),
+        "view".to_owned(),
+        destination.to_string_lossy().into_owned(),
+        "--plain".to_owned(),
+        "--color".to_owned(),
+        "never".to_owned(),
+    ])
+    .output()
+    .unwrap();
+    assert!(view.status.success(), "{view:?}");
+    assert!(
+        String::from_utf8(view.stdout).unwrap().contains("waiting"),
+        "view marks the outcome waiting"
+    );
+
+    let view = isolated_command(&[
+        "workflow".to_owned(),
+        "run".to_owned(),
+        "view".to_owned(),
+        destination.to_string_lossy().into_owned(),
+        "--json".to_owned(),
+    ])
+    .output()
+    .unwrap();
+    assert!(view.status.success(), "{view:?}");
+    let view: serde_json::Value = serde_json::from_slice(&view.stdout).unwrap();
+    assert!(workflow_view_schema().is_valid(&view), "{view}");
+    assert_eq!(view["attemptState"], "waiting", "{view}");
+    assert_eq!(view["result"]["outcome"], "waiting", "{view}");
+    let attempt_wait: serde_json::Value =
+        serde_json::from_slice(&fs::read(destination.join("attempts/000001/wait.json")).unwrap())
+            .unwrap();
+    assert_eq!(view["wait"], attempt_wait, "{view}");
+}
+
+const ADDRESSED_ROOT_WORKFLOW: &str = "schemaVersion: 1\nname: addressed\nprograms: [scripts]\nsteps:\n  complete:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n";
+
+/// `um workflow run ARGS` against the `um` home `home`.
+fn run_under_home(home: &Home, args: &[&str]) -> std::process::Output {
+    let args = ["workflow", "run"]
+        .iter()
+        .chain(args)
+        .map(|arg| (*arg).to_owned())
+        .collect::<Vec<_>>();
+    isolated_command(&args)
+        .env("UM_HOME", home.path())
+        .output()
+        .unwrap()
+}
+
+// REQ-LOCALRUN-180, REQ-LOCALRUN-172
+#[test]
+fn status_addresses_a_run_under_the_home_by_its_id() {
+    let tree = Tree::engineering();
+    tree.write("workflow.yaml", ADDRESSED_ROOT_WORKFLOW);
+    let home = Home::new();
+    let report = home.publish(&tree, &[]);
+    let definition = report["definition"]["id"].as_str().unwrap();
+    let execution_root = tempfile::tempdir().unwrap();
+    let created = run_under_home(
+        &home,
+        &[
+            "create",
+            definition,
+            "--execution-root",
+            execution_root.path().to_str().unwrap(),
+            "--json",
+        ],
+    );
+    assert!(created.status.success(), "{created:?}");
+    let created: serde_json::Value = serde_json::from_slice(&created.stdout).unwrap();
+    let run_directory = PathBuf::from(created["runDirectory"].as_str().unwrap());
+    assert_eq!(
+        run_directory.parent(),
+        Some(
+            home.definition_directory(definition)
+                .join("runs")
+                .canonicalize()
+                .unwrap()
+                .as_path()
+        )
+    );
+    let id = read_json(&run_directory.join("run.json"))["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let by_id = run_under_home(&home, &["status", &id, "--json"]);
+    assert_eq!(by_id.status.code(), Some(0), "{by_id:?}");
+    let by_id: serde_json::Value = serde_json::from_slice(&by_id.stdout).unwrap();
+    assert!(status_schema().is_valid(&by_id), "{by_id}");
+    assert_eq!(by_id["command"], "um workflow run status");
+    assert_eq!(by_id["runDirectory"], created["runDirectory"]);
+    assert_eq!(by_id["record"]["id"], id.as_str());
+
+    let unknown = "run_7zzzzzzzzzzzzzzzzzzzzzzzzz";
+    let missing = run_under_home(&home, &["status", unknown, "--json"]);
+    assert_eq!(missing.status.code(), Some(1), "{missing:?}");
+    let missing: serde_json::Value = serde_json::from_slice(&missing.stdout).unwrap();
+    assert_eq!(missing["command"], "um workflow run status");
+    assert_eq!(missing["outcome"], "error");
+    assert_eq!(missing["exitStatus"], 1);
+    assert_eq!(missing["error"]["code"], "run_not_found", "{missing}");
+    assert!(status_schema().is_valid(&missing), "{missing}");
+    assert!(missing.get("runDirectory").is_none(), "{missing}");
+
+    let plain = run_under_home(&home, &["status", unknown]);
+    assert_eq!(plain.status.code(), Some(1), "{plain:?}");
+    assert!(plain.stdout.is_empty());
+    assert!(
+        String::from_utf8_lossy(&plain.stderr).contains("run_not_found"),
+        "{plain:?}"
     );
 }

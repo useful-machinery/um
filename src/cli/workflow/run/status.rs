@@ -17,7 +17,7 @@ use um_execution::{
 
 pub(super) const ABOUT: &str = "Show local workflow run status";
 
-const COMMAND: &str = "um workflow status";
+const COMMAND: &str = "um workflow run status";
 const STYLE_ACTIVE: &str = "38;2;137;180;250";
 const STYLE_SUCCESS: &str = "38;2;166;227;161";
 const STYLE_FAILURE: &str = "38;2;243;139;168";
@@ -35,19 +35,34 @@ pub(super) struct Command {
 }
 
 impl Command {
-    pub(super) fn execute(self) -> super::super::CommandResult {
-        super::super::execute_read_only_with_signals("workflow status", move |control| {
+    pub(super) fn execute(self) -> super::super::super::CommandResult {
+        super::super::super::execute_read_only_with_signals("workflow status", move |control| {
             self.execute_blocking(control)
         })
     }
 
     fn execute_blocking(
         &self,
-        control: &super::super::OperationControl<()>,
-    ) -> super::super::CommandResult {
-        let reconciliation = reconcile_current_result_publication(&self.run.run_dir);
-        let snapshot = read_local_run_status(&self.run.run_dir);
-        super::super::complete_read_only_output(control, || {
+        control: &super::super::super::OperationControl<()>,
+    ) -> super::super::super::CommandResult {
+        let run_directory = match self.run.resolve() {
+            Ok(run_directory) => run_directory,
+            Err(error) => {
+                return super::super::super::complete_read_only_output(control, || {
+                    if self.presentation.output.json {
+                        error
+                            .write_error_document(COMMAND)
+                            .context("write workflow status output")
+                            .map_err(Into::into)
+                    } else {
+                        Err(anyhow::Error::new(error).into())
+                    }
+                });
+            }
+        };
+        let reconciliation = reconcile_current_result_publication(&run_directory);
+        let snapshot = read_local_run_status(&run_directory);
+        super::super::super::complete_read_only_output(control, || {
             let exit = if self.presentation.output.json {
                 render_json(snapshot, reconciliation).context("write workflow status output")?
             } else {
@@ -56,7 +71,7 @@ impl Command {
                     .with_context(|| {
                         format!(
                             "inspect workflow run {}",
-                            normalize_terminal_path(&self.run.run_dir)
+                            normalize_terminal_path(&run_directory)
                         )
                     })?;
                 reconciliation.map_err(|error| {
@@ -95,6 +110,11 @@ struct StatusSuccess<'a> {
     run_directory: &'a str,
     run: &'a Value,
     state: &'a Value,
+    /// The run record `run.json`, or null for a run without one (REQ-LOCALRUN-146).
+    record: &'a Option<Value>,
+    /// The root wait record `wait.json`, or null while the run does not wait
+    /// (REQ-LOCALRUN-146).
+    wait: Option<&'a um_execution::WaitRecord>,
     recovery: RecoveryOutput<'a>,
     retry: RetryOutput,
     continuation: ContinuationOutput,
@@ -173,7 +193,8 @@ impl From<LocalRetryEligibility> for ContinuationOutput {
                 eligible: false,
                 reason: Some(match reason {
                     RetryIneligibilityReason::LatestAttemptSucceeded
-                    | RetryIneligibilityReason::LatestAttemptRejected => {
+                    | RetryIneligibilityReason::LatestAttemptRejected
+                    | RetryIneligibilityReason::RunSuperseded => {
                         "continuation_disposition_ineligible"
                     }
                     _ => reason.as_str(),
@@ -235,6 +256,8 @@ fn render_json(
                 run_directory,
                 run: &snapshot.run,
                 state: &snapshot.state,
+                record: &snapshot.record,
+                wait: snapshot.wait.as_ref(),
                 recovery: RecoveryOutput::from(&snapshot.recovery),
                 retry: snapshot.retry.into(),
                 continuation: snapshot.continuation.into(),
@@ -272,7 +295,7 @@ const fn reconciliation_error_code(error: &ArchivedAttemptLoadError) -> &'static
 }
 
 fn write_json(value: &impl Serialize) -> io::Result<()> {
-    super::super::write_pretty_json(value)
+    super::super::super::write_pretty_json(value)
 }
 
 fn render_plain(snapshot: &LocalRunStatusSnapshot, color: bool) -> io::Result<ExitCode> {
@@ -299,6 +322,20 @@ fn write_plain_snapshot(
         "state: {}",
         styled_state(snapshot.current_attempt_state, color)
     )?;
+    // REQ-LOCALRUN-145: the wait the run is in.
+    if let Some(wait) = &snapshot.wait {
+        writeln!(
+            writer,
+            "wait: {} at step {} since {}",
+            styled(
+                &normalize_terminal_scalar(wait.kind_name().as_bytes()),
+                STYLE_BLOCKED,
+                color
+            ),
+            normalize_terminal_scalar(wait.step_path().as_bytes()),
+            normalize_terminal_scalar(wait.since.as_bytes())
+        )?;
+    }
     writeln!(
         writer,
         "result: {}",
@@ -317,7 +354,8 @@ fn write_plain_snapshot(
             LocalRetryEligibility::Eligible => styled("eligible", STYLE_SUCCESS, color),
             LocalRetryEligibility::Ineligible(
                 RetryIneligibilityReason::LatestAttemptSucceeded
-                | RetryIneligibilityReason::LatestAttemptRejected,
+                | RetryIneligibilityReason::LatestAttemptRejected
+                | RetryIneligibilityReason::RunSuperseded,
             ) => styled(
                 "ineligible (continuation_disposition_ineligible)",
                 STYLE_BLOCKED,
@@ -375,10 +413,10 @@ fn styled_state(state: &str, color: bool) -> String {
         state
     };
     let style = match state {
-        "created" | "running" | "cancelling" => STYLE_ACTIVE,
+        "created" | "running" | "cancelling" | "continued" => STYLE_ACTIVE,
         "succeeded" => STYLE_SUCCESS,
         "workflow_failed" | "interrupted" | "rejected" => STYLE_FAILURE,
-        "cancelled" => STYLE_BLOCKED,
+        "cancelled" | "waiting" => STYLE_BLOCKED,
         _ => STYLE_FAILURE,
     };
     styled(shown, style, color)
@@ -429,5 +467,6 @@ const fn retry_reason_style(reason: RetryIneligibilityReason) -> &'static str {
         RetryIneligibilityReason::LatestAttemptSucceeded => STYLE_SUCCESS,
         RetryIneligibilityReason::LatestAttemptRejected
         | RetryIneligibilityReason::OwnershipUnproven => STYLE_FAILURE,
+        RetryIneligibilityReason::RunSuperseded => STYLE_BLOCKED,
     }
 }

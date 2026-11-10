@@ -158,7 +158,9 @@ pub(super) fn live_step_phase_boundary(
             WorkflowState::Executing { .. }
             | WorkflowState::Succeeded
             | WorkflowState::Failed { .. }
-            | WorkflowState::Cancelled { .. } => None,
+            | WorkflowState::Cancelled { .. }
+            | WorkflowState::Waiting { .. }
+            | WorkflowState::Continued { .. } => None,
         })
         .map(finalization_trigger);
     Some(StepPhaseBoundary {

@@ -83,7 +83,7 @@ pub(super) fn render_projected_steps<Step: StepProjection>(
         if columns.kind {
             spans.push(Span::raw("  "));
             spans.push(Span::styled(
-                format!("{:<KIND_COLUMN_WIDTH$}", step_kind(step.definition())),
+                padded_text(step_kind(step.definition()), columns.kind_width),
                 tone_style(color, Tone::Muted),
             ));
         }
@@ -136,6 +136,7 @@ pub(super) fn step_state_is_active(state: StepStateKind) -> bool {
 pub(super) struct StepColumns {
     pub(super) id_width: usize,
     pub(super) kind: bool,
+    pub(super) kind_width: usize,
     pub(super) duration_width: usize,
     pub(super) detail: bool,
     pub(super) detail_width: usize,
@@ -152,6 +153,10 @@ impl StepColumns {
             .map(|step| display_width(&visible_text(step.id())))
             .max()
             .unwrap_or(0);
+        let kind_width = steps
+            .iter()
+            .map(|step| display_width(step_kind(step.definition())))
+            .fold(MINIMUM_KIND_COLUMN_WIDTH, usize::max);
         let duration_width = steps
             .iter()
             .map(|step| {
@@ -164,7 +169,7 @@ impl StepColumns {
         let exact_with_kind = prefix_width
             .saturating_add(id_width)
             .saturating_add(2)
-            .saturating_add(KIND_COLUMN_WIDTH)
+            .saturating_add(kind_width)
             .saturating_add(2)
             .saturating_add(duration_width);
         let detail = available
@@ -175,6 +180,7 @@ impl StepColumns {
             return Self {
                 id_width,
                 kind: true,
+                kind_width,
                 duration_width,
                 detail: true,
                 detail_width: available.saturating_sub(exact_with_kind.saturating_add(2)),
@@ -184,6 +190,7 @@ impl StepColumns {
             return Self {
                 id_width,
                 kind: true,
+                kind_width,
                 duration_width,
                 detail: false,
                 detail_width: 0,
@@ -195,6 +202,7 @@ impl StepColumns {
         Self {
             id_width: id_width.min(available.saturating_sub(fixed_width)),
             kind: false,
+            kind_width,
             duration_width,
             detail: false,
             detail_width: 0,

@@ -432,6 +432,11 @@ fn workflow_step_kind_policy(step: &ValidatedStep) -> (WorkflowRunStepKind, Fail
             (WorkflowRunStepKind::Command, command.common.failure_policy)
         }
         ValidatedStep::Agent(agent) => (WorkflowRunStepKind::Agent, agent.common.failure_policy),
+        // Cloud admission refuses a `workflow` step (REQ-WFFORMAT-94) before one runs.
+        ValidatedStep::Workflow(workflow) => (
+            WorkflowRunStepKind::Workflow,
+            workflow.common.failure_policy,
+        ),
     }
 }
 

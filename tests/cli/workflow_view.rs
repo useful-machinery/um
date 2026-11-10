@@ -49,6 +49,7 @@ pub(super) fn workflow_view_schema() -> jsonschema::Validator {
 fn view_args(run_directory: &Path, options: &[&str]) -> Vec<String> {
     let mut args = vec![
         "workflow".to_owned(),
+        "run".to_owned(),
         "view".to_owned(),
         run_directory.to_string_lossy().into_owned(),
     ];
@@ -60,6 +61,7 @@ fn view_args(run_directory: &Path, options: &[&str]) -> Vec<String> {
 fn retry_args(run_directory: &Path, execution_root: &Path) -> Vec<String> {
     vec![
         "workflow".to_owned(),
+        "run".to_owned(),
         "retry".to_owned(),
         run_directory.to_string_lossy().into_owned(),
         "--execution-root".to_owned(),
@@ -74,6 +76,7 @@ fn retry_args(run_directory: &Path, execution_root: &Path) -> Vec<String> {
 fn status_args(run_directory: &Path) -> Vec<String> {
     vec![
         "workflow".to_owned(),
+        "run".to_owned(),
         "status".to_owned(),
         run_directory.to_string_lossy().into_owned(),
         "--json".to_owned(),
@@ -148,7 +151,7 @@ fn automatic_and_explicit_plain_and_json_are_complete_frozen_snapshots() {
     let plain = String::from_utf8(automatic.stdout).unwrap();
     for expected in [
         "attempt 1 of 1 · current · initial · state succeeded · outcome succeeded",
-        "workflow workflow.yaml · 1 node · concurrency 1",
+        "workflow main.yaml · 1 node · concurrency 1",
         "ordinary phase",
         "node complete · role step · kind cmd · policy required · state succeeded",
         "terminal counts: 1 succeeded",
@@ -205,7 +208,7 @@ fn automatic_and_explicit_plain_and_json_are_complete_frozen_snapshots() {
         serde_json::from_slice(&fs::read(selected_result).unwrap()).unwrap();
     assert!(workflow_view_schema().is_valid(&view));
     assert_eq!(view["schemaVersion"], 1);
-    assert_eq!(view["command"], "um workflow view");
+    assert_eq!(view["command"], "um workflow run view");
     assert_eq!(view["outcome"], "view");
     assert_eq!(view["exitStatus"], 0);
     assert_eq!(view["currentAttemptNumber"], 1);
@@ -259,7 +262,7 @@ fn workflow_view_schema_accepts_valid_tilde_workflow_path() {
         "schemaVersion: 1\nsteps:\n  complete:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n",
     );
     fs::rename(
-        bundle.source_root().join("workflow.yaml"),
+        bundle.source_root().join("main.yaml"),
         bundle.source_root().join("~"),
     )
     .unwrap();
@@ -267,17 +270,15 @@ fn workflow_view_schema_accepts_valid_tilde_workflow_path() {
     let produced = run(&[
         "workflow".to_owned(),
         "run".to_owned(),
-        "--source-root".to_owned(),
+        "create".to_owned(),
+        "--path".to_owned(),
         bundle.source_root().to_string_lossy().into_owned(),
         "--execution-root".to_owned(),
         bundle.execution_root().to_string_lossy().into_owned(),
         "--run-dir".to_owned(),
         run_directory.to_string_lossy().into_owned(),
-        bundle
-            .source_root()
-            .join("~")
-            .to_string_lossy()
-            .into_owned(),
+        "--workflow".to_owned(),
+        "~".to_owned(),
         "--plain".to_owned(),
     ]);
     assert!(
@@ -327,6 +328,27 @@ fn view_accepts_explicit_noninteractive_modes_and_rejects_their_conflict() {
         .unwrap();
     assert_eq!(conflict.status.code(), Some(2));
     assert!(conflict.stdout.is_empty());
+}
+
+// REQ-LOCALRUN-180, REQ-LOCALRUN-166
+#[test]
+fn json_view_refuses_an_unknown_run_id_with_its_error_document() {
+    let home = tempfile::tempdir().unwrap();
+    let output = isolated_command(&view_args(
+        Path::new("run_7zzzzzzzzzzzzzzzzzzzzzzzzz"),
+        &["--json"],
+    ))
+    .env("UM_HOME", home.path())
+    .output()
+    .unwrap();
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(output.stderr.is_empty(), "{output:?}");
+    let error: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(workflow_view_schema().is_valid(&error), "{error}");
+    assert_eq!(error["command"], "um workflow run view");
+    assert_eq!(error["outcome"], "error");
+    assert_eq!(error["error"]["code"], "run_not_found", "{error}");
+    assert!(error.get("runDirectory").is_none(), "{error}");
 }
 
 // REQ-LOCALRUN-63, REQ-LOCALRUN-152
@@ -380,7 +402,7 @@ fn view_selects_current_and_historical_attempts_without_blocking_status_or_retry
     let run_directory = bundle.result("history");
     let initial = run(&bundle.args(&run_directory));
     assert_eq!(initial.status.code(), Some(1));
-    fs::remove_file(bundle.source_root().join("workflow.yaml")).unwrap();
+    fs::remove_file(bundle.source_root().join("main.yaml")).unwrap();
 
     let failed_before = durable_files(&run_directory);
     let failed_view = TuiSession::start(&view_args(&run_directory, &[]));

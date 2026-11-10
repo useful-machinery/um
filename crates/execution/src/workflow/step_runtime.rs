@@ -14,7 +14,9 @@ use rustix::process::{Pid, Signal, kill_process_group};
 use tokio::process::{Child, Command};
 use tokio::sync::{mpsc, oneshot, watch};
 
-use super::admission::{AdmittedWorkflow, CancellationReason, EnvironmentSnapshot, ResolvedInput};
+use super::admission::{
+    AdmittedWorkflow, CancellationReason, CancellationSource, EnvironmentSnapshot, ResolvedInput,
+};
 use super::agent::dispatch::AgentInvocationDispatcher;
 use super::agent::{
     AgentFailure, AgentFailureCause, AgentInvocation, AgentInvocationIdentity,
@@ -59,14 +61,16 @@ use super::recovery::{
     parse_recovery_decision, recovery_definition, recovery_handler_cwd,
 };
 use super::runtime::{
-    Action, ActionId, ActionInput, FailurePhase, ProvisionalStepResources, RecoveryDecision,
-    RecoveryRoundNumber, RecoveryRoundRecord, RequestedAction,
+    Action, ActionId, ActionInput, FOR_EACH_INPUT, FailurePhase, ProvisionalStepResources,
+    RecoveryDecision, RecoveryRoundNumber, RecoveryRoundRecord, RequestedAction, later_step,
 };
 use super::validated::{
     ResolvedOutputSource, ResolvedValueSource, ValidatedAgentStep, ValidatedCommandStep,
-    ValidatedCommonStep, ValidatedMessageSource, ValidatedRecoveryHandler, ValidatedStep,
+    ValidatedCommonStep, ValidatedEdgeTarget, ValidatedMessageSource, ValidatedRecoveryHandler,
+    ValidatedStep, ValidatedWorkflowStep, WorkflowValueType,
 };
-use super::value::CapturedValue;
+use super::validation::CHILD_OUTCOME_OUTPUT;
+use super::value::{CapturedJson, CapturedValue};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum WorkingDirectoryFailure {
@@ -168,6 +172,11 @@ pub enum StepStartFailure {
     WorkingDirectory(WorkingDirectoryFailure),
     CommandPreparation(CommandPreparationFailure),
     CommandLaunch(CommandLaunchFailure),
+    /// A `workflow` step's child could not be admitted or its run directory created
+    /// (REQ-WFEXEC-60); `code` is the child's own rejection code, kept for the diagnostic.
+    ChildAdmission {
+        code: String,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -190,6 +199,8 @@ pub enum StepExecutionFailure {
     Command(CommandExecutionFailure),
     Agent(AgentFailure),
     TaskUnavailable,
+    /// A `workflow` step's child ended without a published result (REQ-WFEXEC-60).
+    ChildInterrupted,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -200,6 +211,11 @@ pub enum OutputCaptureFailure {
     Git {
         output: String,
         failure: GitCaptureFailure,
+    },
+    /// The text of the output that `outcome.from` names is not one of the workflow's
+    /// declared `outcomes` (REQ-WFEXEC-56).
+    OutcomeUndeclared {
+        output: String,
     },
     TaskUnavailable,
 }
@@ -230,7 +246,9 @@ impl StepFailureKind {
             StepFailureCause::Start(_) => Self::Start,
             StepFailureCause::Execution(StepExecutionFailure::Command(_)) => Self::Command,
             StepFailureCause::Execution(StepExecutionFailure::Agent(_)) => Self::Agent,
-            StepFailureCause::Execution(StepExecutionFailure::TaskUnavailable) => Self::Execution,
+            StepFailureCause::Execution(
+                StepExecutionFailure::TaskUnavailable | StepExecutionFailure::ChildInterrupted,
+            ) => Self::Execution,
             StepFailureCause::OutputCapture(_) => Self::OutputCapture,
             StepFailureCause::RecoveryHandler(_) => Self::RecoveryHandler,
         }
@@ -546,6 +564,152 @@ where
 {
 }
 
+/// A value a `workflow` step maps to one of its child's inputs (REQ-WFFORMAT-90).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ChildInputValue {
+    Text(Arc<str>),
+    Json(Arc<serde_json::Value>),
+}
+
+/// What a `workflow` step asks its dispatcher to run (REQ-WFEXEC-59): the tree-relative
+/// child file and the mapped inputs, an omitted optional or defaulted input absent, and for
+/// a `forEach` step the one-based element the child runs for (REQ-WFEXEC-66).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ChildRunRequest {
+    pub step: String,
+    pub workflow: String,
+    pub inputs: BTreeMap<String, ChildInputValue>,
+    pub item: Option<u64>,
+}
+
+/// The child's run directory, reported once it exists.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ChildRunStarted {
+    pub run_directory: PathBuf,
+}
+
+/// The driver's side of a child run: the child's own cancellation source, which the driver
+/// cancels or force-aborts when the parent's `CancelStep` or `ForceAbortStep` for the step
+/// arrives, and the notice that the child has started.
+pub struct ChildRunControl {
+    cancellation: CancellationSource,
+    started: Option<oneshot::Sender<ChildRunStarted>>,
+}
+
+impl ChildRunControl {
+    pub fn cancellation(&self) -> &CancellationSource {
+        &self.cancellation
+    }
+
+    /// Reports that the child's run directory exists; the step is `running` from here.
+    pub fn report_started(&mut self, run_directory: PathBuf) {
+        if let Some(started) = self.started.take() {
+            let _ = started.send(ChildRunStarted { run_directory });
+        }
+    }
+}
+
+/// How a child run ended (REQ-WFEXEC-60).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ChildRunOutcome {
+    /// The child published a result recording `outcome`; `exports` holds its available
+    /// `text` and `json` exports.
+    Exited {
+        outcome: String,
+        exports: BTreeMap<String, CapturedValue>,
+    },
+    /// The child could not be admitted or its directory created.
+    Rejected { code: String },
+    /// The child ended without a published result.
+    Interrupted,
+    /// The child was cancelled.
+    Cancelled,
+}
+
+/// Runs a `workflow` step's child; the CLI implements it, since the crate holds no
+/// presentation, and the runner runs none.
+pub trait ChildRunDispatcher: Clone + Send + Sync + 'static {
+    fn run(
+        &self,
+        request: ChildRunRequest,
+        control: ChildRunControl,
+    ) -> impl Future<Output = ChildRunOutcome> + Send;
+
+    /// Whether a stop control is in force for `step`, which then does not start and the
+    /// run enters a `stop` wait at it (REQ-WFEXEC-62).
+    fn stop_before(&self, step: &str) -> impl Future<Output = bool> + Send;
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct NoChildRunDispatcher;
+
+impl ChildRunDispatcher for NoChildRunDispatcher {
+    async fn run(&self, _request: ChildRunRequest, _control: ChildRunControl) -> ChildRunOutcome {
+        ChildRunOutcome::Rejected {
+            code: CHILD_RUNS_DISABLED.to_owned(),
+        }
+    }
+
+    async fn stop_before(&self, _step: &str) -> bool {
+        false
+    }
+}
+
+const CHILD_RUNS_DISABLED: &str = "workflow_step_unsupported";
+
+/// The control values a `workflow` step's inputs may map (REQ-WFFORMAT-95, REQ-WFEXEC-63):
+/// `wait`, the step the resolved wait continues at and the string fields of the resolving
+/// control's payload, and `answers`, each step's latest recorded answers.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ControlContext {
+    pub wait: Option<(String, BTreeMap<String, String>)>,
+    pub answers: BTreeMap<String, Arc<serde_json::Value>>,
+    /// The step and one-based element a continuation at the waiting step resumes a fan-out
+    /// at (REQ-WFEXEC-68): the element the resolved wait recorded in its `step`.
+    pub resume_item: Option<(String, u64)>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub enum ChildRuns<Dispatcher> {
+    #[default]
+    Disabled,
+    Enabled {
+        dispatcher: Dispatcher,
+        controls: ControlContext,
+    },
+}
+
+/// What the driver interrupts and forces when a running step is cancelled: an agent's
+/// process control, or a child run's own cancellation source.
+#[derive(Clone)]
+enum ExecutionControl {
+    Agent(AgentProcessControl),
+    Child(CancellationSource),
+}
+
+impl ExecutionControl {
+    fn interrupt(&self, reason: CancellationReason) {
+        match self {
+            Self::Agent(control) => control.interrupt(),
+            Self::Child(cancellation) if reason == CancellationReason::ForceAbort => {
+                let _ = cancellation.request_force_abort();
+            }
+            Self::Child(cancellation) => {
+                let _ = cancellation.request_cancellation(reason);
+            }
+        }
+    }
+
+    fn force(&self) {
+        match self {
+            Self::Agent(control) => control.force(),
+            Self::Child(cancellation) => {
+                let _ = cancellation.request_force_abort();
+            }
+        }
+    }
+}
+
 #[derive(Clone)]
 struct OwnedTasks {
     active: watch::Sender<usize>,
@@ -594,10 +758,12 @@ pub(crate) struct StepRuntime<
     Clock,
     Observer = NoopExecutionObserver,
     Dispatcher = NoAgentDispatcher,
+    Children = NoChildRunDispatcher,
 > where
     Clock: CoordinatorClock,
     Observer: ExecutionObserver<Clock::Instant>,
     Dispatcher: Clone,
+    Children: Clone,
 {
     admitted: AdmittedWorkflow,
     artifacts: ArtifactStaging,
@@ -605,6 +771,7 @@ pub(crate) struct StepRuntime<
     occurrences: OccurrenceSender<ProvisionalStepOutputs, StepFailureCause, CapturedValue>,
     inputs: InputStaging,
     agents: AgentExecution<Dispatcher>,
+    children: ChildRuns<Children>,
     clock: Clock,
     observer: Observer,
     work: Arc<Mutex<CommandWorkRegistry<Clock::Instant>>>,
@@ -776,6 +943,7 @@ where
             occurrences,
             inputs,
             agents,
+            children: ChildRuns::Disabled,
             clock,
             observer,
             work: Arc::new(Mutex::new(CommandWorkRegistry::new())),
@@ -787,6 +955,42 @@ where
         }
     }
 
+    /// The same runtime running `workflow` steps through `children` (REQ-WFEXEC-59).
+    fn with_children<Children>(
+        self,
+        children: ChildRuns<Children>,
+    ) -> StepRuntime<Clock, Observer, Dispatcher, Children>
+    where
+        Children: ChildRunDispatcher,
+    {
+        StepRuntime {
+            admitted: self.admitted,
+            artifacts: self.artifacts,
+            diagnostics: self.diagnostics,
+            occurrences: self.occurrences,
+            inputs: self.inputs,
+            agents: self.agents,
+            children,
+            clock: self.clock,
+            observer: self.observer,
+            work: self.work,
+            capture_work: self.capture_work,
+            capture_requests: self.capture_requests,
+            tasks: self.tasks,
+            process_guards: self.process_guards,
+            step_task_boundary: self.step_task_boundary,
+        }
+    }
+}
+
+impl<Clock, Observer, Dispatcher, Children> StepRuntime<Clock, Observer, Dispatcher, Children>
+where
+    Clock: CoordinatorClock,
+    Clock::Instant: Sync,
+    Observer: ExecutionObserver<Clock::Instant>,
+    Dispatcher: WorkflowAgentDispatcher<Clock::Instant, Observer>,
+    Children: ChildRunDispatcher,
+{
     #[cfg(test)]
     pub(crate) async fn execute_step(
         &self,
@@ -893,6 +1097,19 @@ where
     ) -> Result<(), StepRuntimeError> {
         let preparation_runtime = self.clone();
         let preparation_step = step.clone();
+        // A stop control in force for a `workflow` step enters a `stop` wait instead of
+        // starting the step (REQ-WFEXEC-62).
+        if let ChildRuns::Enabled { dispatcher, .. } = &self.children
+            && matches!(
+                workflow_node(&self.admitted, &step).map(StepBody::from),
+                Some(StepBody::Workflow(_))
+            )
+            && dispatcher.stop_before(&step).await
+        {
+            return self
+                .settle_unlaunched(action, DriverOccurrence::stop_entered(step, action))
+                .await;
+        }
         let prepared = tokio::task::spawn_blocking(move || {
             preparation_runtime.prepare_step(&preparation_step, action, &inputs)
         })
@@ -922,6 +1139,10 @@ where
             }
             PreparedStepBody::Agent(agent) => {
                 self.execute_prepared_agent(step, action, *agent, cancellation)
+                    .await
+            }
+            PreparedStepBody::Workflow(child) => {
+                self.execute_prepared_child(step, action, child, cancellation)
                     .await
             }
         }
@@ -1754,6 +1975,214 @@ where
         self.settle_agent_occurrence(action, occurrence).await
     }
 
+    /// Runs a `workflow` step's child through the dispatcher (REQ-WFEXEC-59): the step is
+    /// `running` once the child's directory exists, a cancellation of the step cancels the
+    /// child through its own source, and the child's outcome and available exports settle
+    /// through the capture path (REQ-WFEXEC-60). A fan-out runs its elements' children one at
+    /// a time under the step's one launch, start report and cancellation source, goes on past
+    /// an element only while its outcome routes to a later step, and settles the element it
+    /// ends at as a plain step settles its child (REQ-WFEXEC-66).
+    async fn execute_prepared_child(
+        &self,
+        step: String,
+        action: ActionId,
+        child: PreparedChildRun,
+        mut cancellation: oneshot::Receiver<()>,
+    ) -> Result<(), StepRuntimeError> {
+        let ChildRuns::Enabled { dispatcher, .. } = &self.children else {
+            return self
+                .settle_start_failure(
+                    step,
+                    action,
+                    StepStartFailure::ChildAdmission {
+                        code: CHILD_RUNS_DISABLED.to_owned(),
+                    },
+                )
+                .await;
+        };
+        let dispatcher = dispatcher.clone();
+        let child_cancellation = CancellationSource::new();
+        match self.with_work(|work| work.record_child_launch(action, child_cancellation.clone())) {
+            RecordLaunch::Running => {}
+            RecordLaunch::Cancelled { cancellation, .. } => {
+                return self.quiesce_unlaunched(action, cancellation).await;
+            }
+            RecordLaunch::Gone => return Ok(()),
+        }
+
+        let PreparedChildRun { requests, empty } = child;
+        let mut requests = requests.into_iter();
+        let run_child = |request: ChildRunRequest, started| {
+            let dispatcher = dispatcher.clone();
+            let control = ChildRunControl {
+                cancellation: child_cancellation.clone(),
+                started,
+            };
+            tokio::spawn(async move { dispatcher.run(request, control).await })
+        };
+        // An empty fan-out runs no child and is `running` at once.
+        let mut child_task = None;
+        if let Some(request) = requests.next() {
+            let (started_sender, started) = oneshot::channel();
+            let mut task = run_child(request, Some(started_sender));
+            tokio::pin!(started);
+            let started = tokio::select! {
+                biased;
+                started = &mut started => started.is_ok(),
+                outcome = &mut task => {
+                    let outcome = outcome.unwrap_or(ChildRunOutcome::Interrupted);
+                    return self.settle_unstarted_child(step, action, outcome).await;
+                }
+            };
+            if !started {
+                let outcome = (&mut task).await.unwrap_or(ChildRunOutcome::Interrupted);
+                return self.settle_unstarted_child(step, action, outcome).await;
+            }
+            child_task = Some(task);
+        }
+
+        let delivery = self
+            .report_step_started(&step, action, &mut cancellation)
+            .await;
+        if !matches!(delivery, Ok(StartDelivery::Published))
+            && let Some(task) = child_task.as_mut()
+        {
+            let _ = task.await;
+        }
+        match delivery {
+            Ok(StartDelivery::Published) => {
+                self.with_work(|work| work.record_started(action));
+            }
+            Ok(StartDelivery::Cancelled(cancellation)) => {
+                return self.finish_cancellation(action, cancellation).await;
+            }
+            Ok(StartDelivery::Gone) => {
+                self.with_work(|work| work.abandon(action));
+                return Ok(());
+            }
+            Err(failure) => {
+                self.with_work(|work| work.abandon(action));
+                return Err(failure);
+            }
+        }
+
+        // The child observes the step's cancellation through its own source, which the
+        // cancel action already reached, so the driver awaits it rather than racing it.
+        let mut outcome = match child_task {
+            Some(task) => task.await.unwrap_or(ChildRunOutcome::Interrupted),
+            None => ChildRunOutcome::Exited {
+                outcome: empty.unwrap_or_default(),
+                exports: BTreeMap::new(),
+            },
+        };
+        // The last element's outcome ends the step whatever its edge.
+        while self.continues_fan_out(&step, &outcome) {
+            let Some(request) = requests.next() else {
+                break;
+            };
+            if child_cancellation.is_cancelled() {
+                outcome = ChildRunOutcome::Cancelled;
+                break;
+            }
+            outcome = run_child(request, None)
+                .await
+                .unwrap_or(ChildRunOutcome::Interrupted);
+        }
+        let occurrence = match self.child_outputs(&step, outcome) {
+            Ok(values) => DriverOccurrence::step_execution_completed(
+                step,
+                action,
+                ProvisionalStepOutputs {
+                    values,
+                    agent_staging: None,
+                },
+            ),
+            Err(failure) => DriverOccurrence::step_execution_failed(
+                step,
+                action,
+                StepFailureCause::Execution(failure),
+            ),
+        };
+        self.settle_agent_occurrence(action, occurrence).await
+    }
+
+    /// Whether a fan-out goes on past an element that ended with `outcome`: the child
+    /// exited with an outcome whose edge is a step later in document order than `step`
+    /// (REQ-WFEXEC-66), the same comparison an ordinary edge makes (REQ-WFEXEC-58).
+    fn continues_fan_out(&self, step: &str, outcome: &ChildRunOutcome) -> bool {
+        let ChildRunOutcome::Exited { outcome, .. } = outcome else {
+            return false;
+        };
+        let Some(ValidatedStep::Workflow(workflow)) = workflow_node(&self.admitted, step) else {
+            return false;
+        };
+        let Some(ValidatedEdgeTarget::Step(target)) = workflow.edges.get(outcome) else {
+            return false;
+        };
+        later_step(
+            &self.admitted.workflow().definition.source_order,
+            step,
+            target,
+        )
+    }
+
+    /// A child that ended before its directory existed fails the step at `start`; one the
+    /// step's own cancellation stopped settles the cancellation.
+    async fn settle_unstarted_child(
+        &self,
+        step: String,
+        action: ActionId,
+        outcome: ChildRunOutcome,
+    ) -> Result<(), StepRuntimeError> {
+        if let Some(cancellation) = self.cancellation_for(action) {
+            return self.finish_cancellation(action, cancellation).await;
+        }
+        let code = match outcome {
+            ChildRunOutcome::Rejected { code } => code,
+            ChildRunOutcome::Exited { .. }
+            | ChildRunOutcome::Interrupted
+            | ChildRunOutcome::Cancelled => "child_start_unreported".to_owned(),
+        };
+        self.settle_start_failure(step, action, StepStartFailure::ChildAdmission { code })
+            .await
+    }
+
+    /// The values a child that exited commits for the step: `outcome` and each declared
+    /// `text` or `json` export the child made available, detached from the child's staging.
+    /// An outcome the step routes nowhere, or any other ending, is an interrupted child.
+    fn child_outputs(
+        &self,
+        step: &str,
+        outcome: ChildRunOutcome,
+    ) -> Result<BTreeMap<String, CapturedValue>, StepExecutionFailure> {
+        let ChildRunOutcome::Exited { outcome, exports } = outcome else {
+            return Err(StepExecutionFailure::ChildInterrupted);
+        };
+        let Some(ValidatedStep::Workflow(workflow)) = workflow_node(&self.admitted, step) else {
+            return Err(StepExecutionFailure::ChildInterrupted);
+        };
+        if !workflow.edges.contains_key(&outcome) {
+            tracing::error!(event = "child_outcome_unrouted", step, outcome = %outcome);
+            return Err(StepExecutionFailure::ChildInterrupted);
+        }
+        let mut values = BTreeMap::new();
+        for (name, value) in exports {
+            let declared = workflow
+                .common
+                .outputs
+                .get(&name)
+                .is_some_and(|output| matches!(output.definition, Output::ChildExport { .. }));
+            if declared && let Some(value) = detached_child_value(&value) {
+                values.insert(name, value);
+            }
+        }
+        values.insert(
+            CHILD_OUTCOME_OUTPUT.to_owned(),
+            CapturedValue::text(Arc::from(outcome)),
+        );
+        Ok(values)
+    }
+
     async fn settle_agent_cancellation(
         &self,
         step: String,
@@ -2091,8 +2520,175 @@ where
                 );
                 PreparedStepBody::Agent(Box::new(PreparedAgent { materialized }))
             }
+            StepBody::Workflow(workflow) => {
+                if matches!(self.children, ChildRuns::Disabled) {
+                    return Err(StepStartFailure::ChildAdmission {
+                        code: CHILD_RUNS_DISABLED.to_owned(),
+                    });
+                }
+                PreparedStepBody::Workflow(self.prepare_child_run(step, workflow, action_inputs)?)
+            }
         };
         Ok(PreparedStep { body })
+    }
+
+    /// The children a `workflow` step runs: its one child or, for a `forEach` step, one per
+    /// element of the list from the element a continuation at the waiting step resumes
+    /// (REQ-WFEXEC-66, REQ-WFEXEC-68). Every element's `item` inputs are resolved here, when
+    /// the step starts, so a value no element can supply fails the step at `start` before
+    /// its first child is created (REQ-WFEXEC-67).
+    fn prepare_child_run(
+        &self,
+        step: &str,
+        workflow: &ValidatedWorkflowStep,
+        action_inputs: &BTreeMap<String, ActionInput<CapturedValue>>,
+    ) -> Result<PreparedChildRun, StepStartFailure> {
+        let inputs = self.resolve_child_inputs(step, workflow, action_inputs)?;
+        let request = |inputs, item| ChildRunRequest {
+            step: step.to_owned(),
+            workflow: workflow.workflow.clone(),
+            inputs,
+            item,
+        };
+        let Some(for_each) = &workflow.for_each else {
+            return Ok(PreparedChildRun {
+                requests: vec![request(inputs, None)],
+                empty: None,
+            });
+        };
+        let elements =
+            self.fan_out_list(&for_each.items.source, action_inputs.get(FOR_EACH_INPUT))?;
+        if elements.is_empty() {
+            return match &for_each.empty {
+                Some(outcome) => Ok(PreparedChildRun {
+                    requests: Vec::new(),
+                    empty: Some(outcome.clone()),
+                }),
+                None => Err(StepStartFailure::InputsUnavailable),
+            };
+        }
+        let resumed = match &self.children {
+            ChildRuns::Enabled { controls, .. } => controls
+                .resume_item
+                .as_ref()
+                .filter(|(resumed, _)| resumed == step)
+                .map(|(_, item)| *item),
+            ChildRuns::Disabled => None,
+        };
+        let start = resumed
+            .and_then(|item| usize::try_from(item).ok())
+            .filter(|item| (1..=elements.len()).contains(item))
+            .unwrap_or(1);
+        let mut requests = Vec::with_capacity(elements.len() - start + 1);
+        for (index, element) in elements.iter().enumerate().skip(start - 1) {
+            let mut inputs = inputs.clone();
+            resolve_item_inputs(workflow, element, &mut inputs)?;
+            let item = u64::try_from(index + 1).map_err(|_| StepStartFailure::InputsUnavailable)?;
+            requests.push(request(inputs, Some(item)));
+        }
+        Ok(PreparedChildRun {
+            requests,
+            empty: None,
+        })
+    }
+
+    /// A `forEach` step's list: the `json` root input or export it references, which must
+    /// be a JSON array (REQ-WFEXEC-67).
+    fn fan_out_list(
+        &self,
+        source: &ResolvedValueSource,
+        list: Option<&ActionInput<CapturedValue>>,
+    ) -> Result<Vec<serde_json::Value>, StepStartFailure> {
+        let value = match (source, list) {
+            (ResolvedValueSource::Input(name), Some(ActionInput::WorkflowInput)) => {
+                match self.admitted.inputs().get(name) {
+                    Some(ResolvedInput::Json(json)) => json.value_arc(),
+                    _ => return Err(StepStartFailure::InputsUnavailable),
+                }
+            }
+            (
+                ResolvedValueSource::Output(_),
+                Some(ActionInput::Output(CapturedValue::Json(json))),
+            ) => Arc::new(json.value().clone()),
+            _ => return Err(StepStartFailure::InputsUnavailable),
+        };
+        match value.as_ref() {
+            serde_json::Value::Array(elements) => Ok(elements.clone()),
+            _ => Err(StepStartFailure::InputsUnavailable),
+        }
+    }
+
+    /// The mapped inputs of a `workflow` step's child (REQ-WFFORMAT-90, REQ-WFEXEC-60) but
+    /// its `item` inputs, which each element resolves: an unavailable value omits an input
+    /// the child may go without and otherwise fails the step's start with
+    /// `inputs_unavailable`. A `wait.<field>` value is the resolving control's field when the
+    /// wait continues at this step, and `controls.answers` the step's recorded answers
+    /// (REQ-WFEXEC-63); both are the same for every element.
+    fn resolve_child_inputs(
+        &self,
+        step: &str,
+        workflow: &ValidatedWorkflowStep,
+        action_inputs: &BTreeMap<String, ActionInput<CapturedValue>>,
+    ) -> Result<BTreeMap<String, ChildInputValue>, StepStartFailure> {
+        if workflow.inputs.keys().ne(action_inputs
+            .keys()
+            .filter(|name| name.as_str() != FOR_EACH_INPUT))
+        {
+            return Err(StepStartFailure::InputsUnavailable);
+        }
+        let controls = match &self.children {
+            ChildRuns::Enabled { controls, .. } => Some(controls),
+            ChildRuns::Disabled => None,
+        };
+        let mut inputs = BTreeMap::new();
+        for (name, input) in &workflow.inputs {
+            let value = match (&input.reference.source, &action_inputs[name]) {
+                (ResolvedValueSource::Item { .. }, _) => continue,
+                (ResolvedValueSource::Wait(field), ActionInput::Unavailable) => controls
+                    .and_then(|controls| controls.wait.as_ref())
+                    .filter(|(waiting, _)| waiting == step)
+                    .and_then(|(_, payload)| payload.get(field))
+                    .map(|text| ChildInputValue::Text(Arc::from(text.as_str()))),
+                (ResolvedValueSource::ControlsAnswers, ActionInput::Unavailable) => controls
+                    .and_then(|controls| controls.answers.get(step))
+                    .map(|answers| ChildInputValue::Json(Arc::clone(answers))),
+                (ResolvedValueSource::Input(source), ActionInput::WorkflowInput) => {
+                    match self.admitted.inputs().get(source) {
+                        Some(ResolvedInput::Text(text)) => {
+                            Some(ChildInputValue::Text(text.clone()))
+                        }
+                        Some(ResolvedInput::Json(json)) => {
+                            Some(ChildInputValue::Json(json.value_arc()))
+                        }
+                        Some(ResolvedInput::File(_) | ResolvedInput::Attachments(_)) => {
+                            return Err(StepStartFailure::InputsUnavailable);
+                        }
+                        None => None,
+                    }
+                }
+                (ResolvedValueSource::Output(_), ActionInput::Output(value)) => match value {
+                    CapturedValue::Text(text) => {
+                        Some(ChildInputValue::Text(Arc::from(text.as_str())))
+                    }
+                    CapturedValue::Json(json) => {
+                        Some(ChildInputValue::Json(Arc::new(json.value().clone())))
+                    }
+                    CapturedValue::File(_) | CapturedValue::GitBranch(_) => {
+                        return Err(StepStartFailure::InputsUnavailable);
+                    }
+                },
+                (_, ActionInput::Unavailable) => None,
+                _ => return Err(StepStartFailure::InputsUnavailable),
+            };
+            match value {
+                Some(value) => {
+                    inputs.insert(name.clone(), value);
+                }
+                None if input.may_be_omitted => {}
+                None => return Err(StepStartFailure::InputsUnavailable),
+            }
+        }
+        Ok(inputs)
     }
 
     fn resolve_input_values<'a>(
@@ -2151,9 +2747,10 @@ where
         &self,
         step: String,
         action: ActionId,
+        reason: CancellationReason,
         deadline: Clock::Instant,
     ) -> CancellationRegistration<Clock::Instant> {
-        self.with_work(|work| work.cancel(step, action, deadline))
+        self.with_work(|work| work.cancel(step, action, reason, deadline))
     }
 
     fn cancellation_for(&self, action: ActionId) -> Option<CommandCancellation<Clock::Instant>> {
@@ -2334,7 +2931,10 @@ impl CaptureWorker {
             .filter(|(_, output)| {
                 matches!(
                     output.definition,
-                    Output::TextAgentResponse | Output::JsonAgentResult { .. }
+                    Output::TextAgentResponse
+                        | Output::JsonAgentResult { .. }
+                        | Output::ChildExport { .. }
+                        | Output::ChildOutcome
                 )
             })
             .map(|(output_identity, _)| output_identity.clone())
@@ -2379,7 +2979,10 @@ impl CaptureWorker {
                 Output::GitBranchWorkspace => {
                     Some(Some(GitAwareCaptureDeclaration::GitBranch(output_identity)))
                 }
-                Output::TextAgentResponse | Output::JsonAgentResult { .. } => None,
+                Output::TextAgentResponse
+                | Output::JsonAgentResult { .. }
+                | Output::ChildExport { .. }
+                | Output::ChildOutcome => None,
             })
             .collect::<Option<Vec<_>>>()
             .ok_or(CaptureWorkerFailure::Failed(
@@ -2472,13 +3075,26 @@ impl CaptureWorker {
             self.settle_cancelled(action, started).await;
             return;
         }
-        self.with_work(|work| work.begin_delivery(action));
         values.extend(
             candidates
                 .outputs()
                 .iter()
                 .map(|(name, output)| (name.clone(), output.clone())),
         );
+        if let Some(failure) = undeclared_outcome(&self.admitted, &step, &values) {
+            candidates.abort();
+            let request = CaptureRequest {
+                step,
+                action,
+                provisional: ProvisionalStepOutputs {
+                    values: BTreeMap::new(),
+                    agent_staging,
+                },
+            };
+            self.settle_failure(request, failure, started).await;
+            return;
+        }
+        self.with_work(|work| work.begin_delivery(action));
         let occurrence = DriverOccurrence::outputs_captured(step, action, values);
         let _ = started.send(());
         match self.occurrences.send_acknowledged(occurrence).await {
@@ -2570,6 +3186,28 @@ impl CaptureWorker {
             ))
             .await;
     }
+}
+
+/// The failure a capture of `step` settles as when `step` is the source of the workflow's
+/// `outcome` and the captured text is not one of its declared names (REQ-WFEXEC-56,
+/// INV-ENGINE-17). Validation admits only a text output as the source, so any other shape
+/// is refused the same way rather than committed.
+fn undeclared_outcome(
+    admitted: &AdmittedWorkflow,
+    step: &str,
+    values: &BTreeMap<String, CapturedValue>,
+) -> Option<OutputCaptureFailure> {
+    let outcome = admitted.workflow().definition.outcome.as_ref()?;
+    if outcome.source.node.id != step {
+        return None;
+    }
+    let declared = match values.get(&outcome.source.output) {
+        Some(CapturedValue::Text(text)) => outcome.names.iter().any(|name| name == text.as_str()),
+        _ => false,
+    };
+    (!declared).then(|| OutputCaptureFailure::OutcomeUndeclared {
+        output: outcome.source.output.clone(),
+    })
 }
 
 #[derive(Clone)]
@@ -2744,7 +3382,7 @@ struct CommandWork<Deadline> {
     step: String,
     phase: WorkPhase,
     process_group: Option<AuthenticatedProcessGroup>,
-    agent_process_control: Option<AgentProcessControl>,
+    control: Option<ExecutionControl>,
     agent_deadline_shutdown: Option<oneshot::Sender<()>>,
     agent_deadline_finished: Option<oneshot::Receiver<()>>,
     cancellation: Option<CommandCancellation<Deadline>>,
@@ -2789,7 +3427,7 @@ where
                 step,
                 phase: WorkPhase::Prelaunch,
                 process_group: None,
-                agent_process_control: None,
+                control: None,
                 agent_deadline_shutdown: None,
                 agent_deadline_finished: None,
                 cancellation: None,
@@ -2855,11 +3493,27 @@ where
         action: ActionId,
         process_control: AgentProcessControl,
     ) -> RecordLaunch<Deadline> {
+        self.record_controlled_launch(action, ExecutionControl::Agent(process_control))
+    }
+
+    fn record_child_launch(
+        &mut self,
+        action: ActionId,
+        cancellation: CancellationSource,
+    ) -> RecordLaunch<Deadline> {
+        self.record_controlled_launch(action, ExecutionControl::Child(cancellation))
+    }
+
+    fn record_controlled_launch(
+        &mut self,
+        action: ActionId,
+        control: ExecutionControl,
+    ) -> RecordLaunch<Deadline> {
         let Some(work) = self.active.get_mut(&action) else {
             return RecordLaunch::Gone;
         };
         work.phase = WorkPhase::Running;
-        work.agent_process_control = Some(process_control);
+        work.control = Some(control);
         match work.cancellation.clone() {
             Some(cancellation) => RecordLaunch::Cancelled {
                 cancellation,
@@ -2894,6 +3548,7 @@ where
         &mut self,
         step: String,
         action: ActionId,
+        reason: CancellationReason,
         deadline: Deadline,
     ) -> CancellationRegistration<Deadline> {
         if !self.known_actions.insert(action) {
@@ -2927,8 +3582,8 @@ where
             }
             _ => None,
         };
-        let agent_deadline = work.agent_process_control.clone().map(|process_control| {
-            process_control.interrupt();
+        let agent_deadline = work.control.clone().map(|process_control| {
+            process_control.interrupt(reason);
             let (shutdown, deadline_shutdown) = oneshot::channel();
             let (deadline_finished, finished) = oneshot::channel();
             work.agent_deadline_shutdown = Some(shutdown);
@@ -2986,7 +3641,7 @@ where
         ForceAbortRegistration::Active {
             wake: work.cancellation_wake.take(),
             process_group: work.process_group.clone(),
-            agent_process_control: work.agent_process_control.clone(),
+            agent_process_control: work.control.clone(),
         }
     }
 
@@ -3011,6 +3666,11 @@ where
             });
             if let Some(launch_cancellation) = &work.launch_cancellation {
                 launch_cancellation.cancel();
+            }
+            // A child run observes only its own cancellation source, so a revoked
+            // `workflow` step cancels its child here.
+            if let Some(control @ ExecutionControl::Child(_)) = &work.control {
+                control.interrupt(CancellationReason::RunnerShutdown);
             }
             let interrupt = match (work.phase, work.process_group.clone()) {
                 (WorkPhase::Running | WorkPhase::Started, Some(process_group))
@@ -3162,7 +3822,7 @@ enum CompletionClaim<Deadline> {
 }
 
 struct AgentCancellationDeadline<Deadline> {
-    process_control: AgentProcessControl,
+    process_control: ExecutionControl,
     deadline: Deadline,
     shutdown: oneshot::Receiver<()>,
     finished: oneshot::Sender<()>,
@@ -3172,7 +3832,7 @@ enum ForceAbortRegistration {
     Active {
         wake: Option<oneshot::Sender<()>>,
         process_group: Option<AuthenticatedProcessGroup>,
-        agent_process_control: Option<AgentProcessControl>,
+        agent_process_control: Option<ExecutionControl>,
     },
     Quiesced,
     Duplicate,
@@ -3195,15 +3855,16 @@ fn lock_registry<Registry>(registry: &Mutex<Registry>) -> MutexGuard<'_, Registr
     }
 }
 
-impl<Clock, Observer, Dispatcher>
+impl<Clock, Observer, Dispatcher, Children>
     ActionPort<
         RequestedAction<ProvisionalStepOutputs, StepFailureCause, CapturedValue, Clock::Instant>,
-    > for StepRuntime<Clock, Observer, Dispatcher>
+    > for StepRuntime<Clock, Observer, Dispatcher, Children>
 where
     Clock: CoordinatorClock,
     Clock::Instant: Sync,
     Observer: ExecutionObserver<Clock::Instant>,
     Dispatcher: WorkflowAgentDispatcher<Clock::Instant, Observer>,
+    Children: ChildRunDispatcher,
 {
     fn release(
         &mut self,
@@ -3270,53 +3931,60 @@ where
                         },
                     );
                 }
-                Action::CancelStep { step, deadline, .. } => {
-                    match runtime.request_capture_cancellation(&step, requested.id) {
-                        CaptureCancellationRegistration::Active
-                        | CaptureCancellationRegistration::Duplicate => {}
-                        CaptureCancellationRegistration::NotFound => {
-                            match runtime.request_cancellation(step.clone(), requested.id, deadline)
-                            {
-                                CancellationRegistration::Active {
-                                    wake,
-                                    interrupt,
-                                    agent_deadline,
-                                } => {
-                                    if let Some(group) = interrupt {
-                                        let _ = interrupt_authenticated_process_group(&group);
-                                    }
-                                    if let Some(agent_deadline) = agent_deadline {
-                                        let clock = runtime.clock.clone();
-                                        let tasks = runtime.tasks.clone();
-                                        tasks.spawn(async move {
-                                            let AgentCancellationDeadline {
-                                                process_control,
-                                                deadline,
-                                                mut shutdown,
-                                                finished,
-                                            } = agent_deadline;
-                                            let deadline = clock.wait_until(deadline);
-                                            tokio::pin!(deadline);
-                                            tokio::select! {
-                                                biased;
-                                                () = &mut deadline => process_control.force(),
-                                                _ = &mut shutdown => {}
-                                            }
-                                            let _ = finished.send(());
-                                        });
-                                    }
-                                    if let Some(wake) = wake {
-                                        let _ = wake.send(());
-                                    }
+                Action::CancelStep {
+                    step,
+                    reason,
+                    deadline,
+                    ..
+                } => match runtime.request_capture_cancellation(&step, requested.id) {
+                    CaptureCancellationRegistration::Active
+                    | CaptureCancellationRegistration::Duplicate => {}
+                    CaptureCancellationRegistration::NotFound => {
+                        match runtime.request_cancellation(
+                            step.clone(),
+                            requested.id,
+                            reason,
+                            deadline,
+                        ) {
+                            CancellationRegistration::Active {
+                                wake,
+                                interrupt,
+                                agent_deadline,
+                            } => {
+                                if let Some(group) = interrupt {
+                                    let _ = interrupt_authenticated_process_group(&group);
                                 }
-                                CancellationRegistration::Quiesced => {
-                                    runtime.schedule_quiesced_report(step, requested.id);
+                                if let Some(agent_deadline) = agent_deadline {
+                                    let clock = runtime.clock.clone();
+                                    let tasks = runtime.tasks.clone();
+                                    tasks.spawn(async move {
+                                        let AgentCancellationDeadline {
+                                            process_control,
+                                            deadline,
+                                            mut shutdown,
+                                            finished,
+                                        } = agent_deadline;
+                                        let deadline = clock.wait_until(deadline);
+                                        tokio::pin!(deadline);
+                                        tokio::select! {
+                                            biased;
+                                            () = &mut deadline => process_control.force(),
+                                            _ = &mut shutdown => {}
+                                        }
+                                        let _ = finished.send(());
+                                    });
                                 }
-                                CancellationRegistration::Duplicate => {}
+                                if let Some(wake) = wake {
+                                    let _ = wake.send(());
+                                }
                             }
+                            CancellationRegistration::Quiesced => {
+                                runtime.schedule_quiesced_report(step, requested.id);
+                            }
+                            CancellationRegistration::Duplicate => {}
                         }
                     }
-                }
+                },
                 Action::ForceAbortStep { step, deadline, .. } => {
                     match runtime.request_capture_force_abort(&step, requested.id) {
                         CaptureCancellationRegistration::Active
@@ -3441,6 +4109,7 @@ where
     .await
 }
 
+#[cfg(test)]
 #[expect(
     clippy::too_many_arguments,
     reason = "the shared operation receives each adapter-owned resource explicitly"
@@ -3462,6 +4131,51 @@ where
     Commits: WorkflowCommitPort<Clock>,
     Observer: ExecutionObserver<Clock::Instant>,
     Dispatcher: WorkflowAgentDispatcher<Clock::Instant, Observer>,
+{
+    execute_workflow_observed_with_children(
+        admitted,
+        artifacts,
+        inputs,
+        diagnostics,
+        clock,
+        commits,
+        observer,
+        agents,
+        ChildRuns::<NoChildRunDispatcher>::Disabled,
+        start,
+    )
+    .await
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the shared operation receives each adapter-owned resource explicitly"
+)]
+pub(super) async fn execute_workflow_observed_with_children<
+    Clock,
+    Commits,
+    Observer,
+    Dispatcher,
+    Children,
+>(
+    admitted: AdmittedWorkflow,
+    artifacts: &ArtifactStaging,
+    inputs: &InputStaging,
+    diagnostics: &StepDiagnosticLog,
+    clock: Clock,
+    commits: Commits,
+    observer: Observer,
+    agents: AgentExecution<Dispatcher>,
+    children: ChildRuns<Children>,
+    start: impl Into<WorkflowExecutionStart>,
+) -> Result<CoordinationResult<StepFailureCause, CapturedValue, Clock::Instant>, CoordinationError>
+where
+    Clock: CoordinatorClock,
+    Clock::Instant: Sync,
+    Commits: WorkflowCommitPort<Clock>,
+    Observer: ExecutionObserver<Clock::Instant>,
+    Dispatcher: WorkflowAgentDispatcher<Clock::Instant, Observer>,
+    Children: ChildRunDispatcher,
 {
     let WorkflowExecutionStart {
         process_guards,
@@ -3497,7 +4211,8 @@ where
         observer,
         agents,
         process_guards,
-    );
+    )
+    .with_children(children);
     let lifecycle = actions.clone();
     let result = Coordinator::new_seeded(admitted, receiver, clock, commits, actions, seed)
         .with_finalization_identity(finalization_identity)
@@ -3517,6 +4232,7 @@ where
 enum StepBody<'a> {
     Command(&'a super::validated::ValidatedCommandStep),
     Agent(&'a super::validated::ValidatedAgentStep),
+    Workflow(&'a super::validated::ValidatedWorkflowStep),
 }
 
 impl<'a> From<&'a ValidatedStep> for StepBody<'a> {
@@ -3524,6 +4240,7 @@ impl<'a> From<&'a ValidatedStep> for StepBody<'a> {
         match step {
             ValidatedStep::Command(command) => Self::Command(command),
             ValidatedStep::Agent(agent) => Self::Agent(agent),
+            ValidatedStep::Workflow(workflow) => Self::Workflow(workflow),
         }
     }
 }
@@ -3533,6 +4250,7 @@ impl StepBody<'_> {
         match self {
             Self::Command(command) => &command.common,
             Self::Agent(agent) => &agent.common,
+            Self::Workflow(workflow) => &workflow.common,
         }
     }
 }
@@ -3546,6 +4264,20 @@ fn workflow_node<'a>(admitted: &'a AdmittedWorkflow, id: &str) -> Option<&'a Val
             .get(id)
             .map(|finalizer| &finalizer.body)
     })
+}
+
+/// A child's exported `text` or `json` value as a value of the parent's own, so that the
+/// parent's capture never reaches into the child's released staging.
+fn detached_child_value(value: &CapturedValue) -> Option<CapturedValue> {
+    match value {
+        CapturedValue::Text(text) => Some(CapturedValue::text(Arc::from(text.as_str()))),
+        CapturedValue::Json(json) => CapturedJson::unconstrained(
+            Arc::new(json.value().clone()),
+            Arc::from(json.canonical_json()),
+        )
+        .map(CapturedValue::json),
+        CapturedValue::File(_) | CapturedValue::GitBranch(_) => None,
+    }
 }
 
 fn resolve_agent_upstream_outputs(
@@ -3567,7 +4299,12 @@ fn resolve_agent_upstream_outputs(
             } => Some(source.clone()),
             ValidatedMessageSource::File { .. }
             | ValidatedMessageSource::Reference {
-                source: ResolvedValueSource::Input(_) | ResolvedValueSource::FinalizationContext,
+                source:
+                    ResolvedValueSource::Input(_)
+                    | ResolvedValueSource::FinalizationContext
+                    | ResolvedValueSource::Wait(_)
+                    | ResolvedValueSource::ControlsAnswers
+                    | ResolvedValueSource::Item { .. },
                 ..
             } => None,
         })
@@ -3656,6 +4393,52 @@ struct PreparedStep {
 enum PreparedStepBody {
     Command(PreparedCommand),
     Agent(Box<PreparedAgent>),
+    Workflow(PreparedChildRun),
+}
+
+/// The children a `workflow` step runs, one at a time and in order: its one child or each
+/// fan-out element from the one the step starts at (REQ-WFEXEC-66). An empty fan-out has
+/// none and commits `empty`, the outcome its `forEach` declares for an empty list.
+struct PreparedChildRun {
+    requests: Vec<ChildRunRequest>,
+    empty: Option<String>,
+}
+
+/// Adds a fan-out element's `item` and `item.<field>` inputs to `inputs` (REQ-WFEXEC-67):
+/// the element, or the field of an element that is an object, a `text` input taking only a
+/// string. An absent value omits an input the child may go without and otherwise fails the
+/// step's start with `inputs_unavailable`.
+fn resolve_item_inputs(
+    workflow: &ValidatedWorkflowStep,
+    element: &serde_json::Value,
+    inputs: &mut BTreeMap<String, ChildInputValue>,
+) -> Result<(), StepStartFailure> {
+    for (name, input) in &workflow.inputs {
+        let ResolvedValueSource::Item { field } = &input.reference.source else {
+            continue;
+        };
+        let value = match field {
+            None => Some(element),
+            Some(field) => element.as_object().and_then(|object| object.get(field)),
+        };
+        let value = match (input.reference.value_type, value) {
+            (WorkflowValueType::Text, Some(serde_json::Value::String(text))) => {
+                Some(ChildInputValue::Text(Arc::from(text.as_str())))
+            }
+            (WorkflowValueType::Json, Some(value)) => {
+                Some(ChildInputValue::Json(Arc::new(value.clone())))
+            }
+            _ => None,
+        };
+        match value {
+            Some(value) => {
+                inputs.insert(name.clone(), value);
+            }
+            None if input.may_be_omitted => {}
+            None => return Err(StepStartFailure::InputsUnavailable),
+        }
+    }
+    Ok(())
 }
 
 struct PreparedAgent {

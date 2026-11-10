@@ -1,0 +1,13 @@
+schemaVersion: 1
+steps:
+  prepare:
+    kind: cmd
+    command:
+      argv: ["true"]
+bindings:
+  connection: {kind: connection}
+triggers:
+  start:
+    on: {source: linear, event: issue.state_entered}
+    inputs:
+      ticket: event.issue.identifier

@@ -6551,7 +6551,8 @@
                 "command_launch_not_found",
                 "command_launch_permission_denied",
                 "command_launch_invalid_input",
-                "command_launch_failed"
+                "command_launch_failed",
+                "child_admission_rejected"
               ]
             }
           },
@@ -6681,7 +6682,8 @@
             },
             "code": {
               "enum": [
-                "command_wait_failed"
+                "command_wait_failed",
+                "child_run_interrupted"
               ]
             }
           },
@@ -6731,6 +6733,7 @@
                 "output_invalid_json",
                 "output_duplicate_json_member",
                 "output_json_schema_mismatch",
+                "outcome_undeclared",
                 "captured_file_count_limit",
                 "captured_file_size_limit",
                 "captured_total_size_limit",
@@ -6873,7 +6876,10 @@
       "additionalProperties": false,
       "properties": {
         "code": {
-          "const": "failure_stop"
+          "enum": [
+            "failure_stop",
+            "not_reached"
+          ]
         }
       },
       "required": [
@@ -7152,6 +7158,7 @@
                 "output_invalid_json",
                 "output_duplicate_json_member",
                 "output_json_schema_mismatch",
+                "outcome_undeclared",
                 "output_file_count_limit_exceeded",
                 "output_file_size_limit_exceeded",
                 "output_total_size_limit_exceeded",

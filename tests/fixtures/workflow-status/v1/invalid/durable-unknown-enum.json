@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "command": "um workflow status",
+  "command": "um workflow run status",
   "outcome": "status",
   "exitStatus": 0,
   "runDirectory": "/tmp/runs/example",
@@ -64,6 +64,7 @@
     ],
     "diagnostics": []
   },
+  "record": null,
   "recovery": {
     "status": "settled"
   },

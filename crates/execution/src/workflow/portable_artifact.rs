@@ -828,6 +828,7 @@ fn inspect_metadata_reader(
                     role: step.role,
                     state: step.state,
                     inherited_prior_state,
+                    workflow_step: step.kind == "workflow",
                 },
             )
             .is_some()
@@ -1075,6 +1076,7 @@ struct PortableSourceState {
     role: super::publication::WorkflowNodeRoleV1,
     state: super::publication::WorkflowStepStateV1,
     inherited_prior_state: Option<super::evidence::InheritedPriorState>,
+    workflow_step: bool,
 }
 
 type PortableSourceStates = BTreeMap<String, PortableSourceState>;
@@ -1106,6 +1108,7 @@ fn portable_source_states(document: &Value) -> Option<PortableSourceStates> {
                     role: step.role,
                     state: step.state,
                     inherited_prior_state,
+                    workflow_step: step.kind == "workflow",
                 },
             )
             .is_some()
@@ -1194,6 +1197,7 @@ fn inspect_exports(
             source_state: source_state.map(|state| state.state),
             source_inherited_prior_state: source_state
                 .and_then(|state| state.inherited_prior_state),
+            source_is_workflow_step: source_state.is_some_and(|state| state.workflow_step),
         };
         let shape_valid = if !is_identifier(name) {
             false
@@ -1323,6 +1327,7 @@ struct PortableExportOrigin<'a> {
     source: Option<&'a super::publication::ExportSourceV1>,
     source_state: Option<super::publication::WorkflowStepStateV1>,
     source_inherited_prior_state: Option<super::evidence::InheritedPriorState>,
+    source_is_workflow_step: bool,
 }
 
 fn valid_unavailable_entry(entry: &Value, origin: PortableExportOrigin<'_>) -> bool {
@@ -1355,6 +1360,7 @@ fn valid_unavailable_entry(entry: &Value, origin: PortableExportOrigin<'_>) -> b
         source,
         source_state,
         origin.source_inherited_prior_state,
+        origin.source_is_workflow_step,
         reason,
     )
 }
@@ -2061,6 +2067,7 @@ mod tests {
                 source_inherited_prior_state: Some(
                     super::super::evidence::InheritedPriorState::Succeeded,
                 ),
+                source_is_workflow_step: false,
             };
             let valid =
                 |entry: &Value| exact_export_keys(entry.as_object().unwrap(), &base, origin);
@@ -2102,6 +2109,7 @@ mod tests {
             source: Some(&source),
             source_state: Some(super::super::publication::WorkflowStepStateV1::Inherited),
             source_inherited_prior_state: Some(prior_state),
+            source_is_workflow_step: false,
         };
 
         assert!(!valid_unavailable_entry(
@@ -2138,8 +2146,38 @@ mod tests {
                 source_inherited_prior_state: Some(
                     super::super::evidence::InheritedPriorState::Inherited,
                 ),
+                source_is_workflow_step: false,
             }
         ));
+    }
+
+    // REQ-EXPORTS-3
+    #[test]
+    fn succeeded_source_failed_shape_requires_a_workflow_step_source() {
+        let source = super::super::publication::ExportSourceV1 {
+            node: super::super::publication::WorkflowNodeV1 {
+                id: "rerun".to_owned(),
+                role: super::super::publication::WorkflowNodeRoleV1::Step,
+            },
+            output: "report".to_owned(),
+        };
+        let entry = serde_json::json!({
+            "state": "unavailable",
+            "reason": "source_failed"
+        });
+        let output_producers = BTreeMap::new();
+        let origin = |source_is_workflow_step| PortableExportOrigin {
+            continuation: true,
+            workflow_provenance: None,
+            output_producers: Some(&output_producers),
+            source: Some(&source),
+            source_state: Some(super::super::publication::WorkflowStepStateV1::Succeeded),
+            source_inherited_prior_state: None,
+            source_is_workflow_step,
+        };
+
+        assert!(!valid_unavailable_entry(&entry, origin(false)));
+        assert!(valid_unavailable_entry(&entry, origin(true)));
     }
 
     // REQ-ARTIFACTSET-19, REQ-ARTIFACTSET-20

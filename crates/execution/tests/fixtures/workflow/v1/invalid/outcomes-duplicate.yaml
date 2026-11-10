@@ -1,0 +1,15 @@
+schemaVersion: 1
+outcomes: [planned, failed, planned]
+outcome:
+  from: outputs.decide.verdict
+  onFailure: failed
+steps:
+  decide:
+    kind: cmd
+    command:
+      argv: ["./scripts/decide.sh"]
+    outputs:
+      verdict:
+        kind: text
+        from: path
+        path: verdict.txt

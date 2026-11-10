@@ -1,16 +1,19 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use super::super::claude_code::{ClaudeCodeConfig, ClaudeCodeEffort};
 use super::super::condition::{ResolvedOperand, ResolvedPredicate};
-use super::super::document::{FailurePolicy, FinalizationTrigger, NodeBody, ValueReference};
+use super::super::document::{
+    FailurePolicy, FinalizationTrigger, NodeBody, Output, ValueReference, WaitKind, WaitRule,
+};
 use super::super::pi::{PiConfig, Thinking};
 use super::super::validated::{
-    ResolvedDirectPrerequisite, ResolvedOutputSource, ResolvedValueSource, ValidatedHarness,
-    ValidatedMessageSource, ValidatedStep, ValidatedWorkflow, WorkflowNode, WorkflowNodeRole,
-    WorkflowValueType,
+    ResolvedDirectPrerequisite, ResolvedOutputSource, ResolvedValueReference, ResolvedValueSource,
+    Scheduling, ValidatedEdgeTarget, ValidatedForEach, ValidatedHarness, ValidatedMessageSource,
+    ValidatedOutcome, ValidatedStep, ValidatedWorkflow, ValidatedWorkflowStep, WorkflowNode,
+    WorkflowNodeRole, WorkflowValueType,
 };
 use super::super::{DecodeFailureKind, decode};
-use super::{ValidationFailureKind, ValidationLocation};
+use super::{ChildWorkflowSummary, ValidationFailureKind, ValidationLocation};
 
 fn validate_yaml(source: &str) -> Result<ValidatedWorkflow, super::ValidationFailure> {
     super::validate(decode(source.as_bytes()).unwrap())
@@ -316,7 +319,7 @@ steps:
           - file: prompts/message.md
 ";
     let workflow = validate_yaml(source).unwrap();
-    assert!(workflow.required_inputs.is_empty());
+    assert!(workflow.declared_inputs.is_empty());
     let ValidatedStep::Agent(agent) = &workflow.steps["agent"] else {
         panic!("agent must be an agent step");
     };
@@ -625,7 +628,7 @@ exports:
     };
     assert!(consumer.common.prerequisites.is_empty());
     assert_eq!(
-        workflow.required_inputs.get("request"),
+        workflow.declared_inputs.get("request"),
         Some(&WorkflowValueType::Text)
     );
     assert_eq!(workflow.presentation_order, ["consumer", "producer"]);
@@ -651,6 +654,34 @@ steps:
             step: "consumer".to_owned(),
             input: "value".to_owned(),
         },
+    );
+}
+
+// REQ-WFFORMAT-100
+#[test]
+fn subject_names_a_declared_text_input() {
+    let workflow = |subject: &str| {
+        format!(
+            "schemaVersion: 1\nsubject: {subject}\ninputs:\n  ticket:\n    kind: text\n  \
+             payload:\n    kind: json\nsteps:\n{}",
+            command_step("prepare", "")
+        )
+    };
+    let validated = validate_yaml(&workflow("ticket")).unwrap();
+    assert_eq!(validated.subject.as_deref(), Some("ticket"));
+    // Like `name`, `subject` keeps a file from being a `workflow` step's child
+    // (REQ-WFFORMAT-89).
+    assert!(ChildWorkflowSummary::of(&validated, BTreeSet::new()).has_root_blocks);
+    let at_subject = ValidationLocation::Workflow { key: "subject" };
+    assert_failure(
+        &workflow("nothing"),
+        ValidationFailureKind::SubjectInputUndeclared,
+        at_subject.clone(),
+    );
+    assert_failure(
+        &workflow("payload"),
+        ValidationFailureKind::SubjectInputNotText,
+        at_subject,
     );
 }
 
@@ -750,7 +781,9 @@ finalizers:
     ] {
         let common = match step {
             ValidatedStep::Command(step) => &step.common,
-            ValidatedStep::Agent(_) => panic!("{name} must be a command"),
+            ValidatedStep::Agent(_) | ValidatedStep::Workflow(_) => {
+                panic!("{name} must be a command")
+            }
         };
         assert_eq!(
             common.condition_values.get("inputs.request"),
@@ -1259,7 +1292,7 @@ exports:
     let workflow = validate_yaml(source).unwrap();
 
     assert_eq!(
-        workflow.required_inputs,
+        workflow.declared_inputs,
         std::collections::BTreeMap::from([
             (
                 "evidence".to_owned(),
@@ -1628,6 +1661,1130 @@ exports:
     }
 }
 
+const OUTCOME_WORKFLOW: &str = "schemaVersion: 1
+inputs:
+  request: {kind: text}
+#outcomes
+steps:
+  decide:
+    kind: cmd
+    command: {argv: [\"true\"]}
+    outputs:
+      verdict: {kind: text, from: path, path: verdict.txt}
+      structured: {kind: json, from: path, path: verdict.json, schema: verdict.schema.json}
+      report: {kind: file, from: path, path: report.txt, mediaType: text/plain}
+      changes: {kind: git_branch, from: workspace}
+  advise:
+    kind: cmd
+    failurePolicy: advisory
+    command: {argv: [\"true\"]}
+    outputs:
+      verdict: {kind: text, from: path, path: advice.txt}
+  gated:
+    kind: cmd
+    condition:
+      equals:
+        - ref: inputs.request
+        - value: exact
+    command: {argv: [\"true\"]}
+    outputs:
+      verdict: {kind: text, from: path, path: gated.txt}
+finalizers:
+  report:
+    kind: cmd
+    command: {argv: [\"true\"]}
+    outputs:
+      verdict: {kind: text, from: path, path: final.txt}
+";
+
+fn outcome_workflow(declaration: &str) -> String {
+    OUTCOME_WORKFLOW.replace("#outcomes\n", declaration)
+}
+
+fn declared_outcome(from: &str, on_failure: &str) -> String {
+    outcome_workflow(&format!(
+        "outcomes: [planned, failed]\noutcome: {{from: {from}, onFailure: {on_failure}}}\n"
+    ))
+}
+
+// REQ-WFFORMAT-87, REQ-WFFORMAT-88
+#[test]
+fn outcomes_and_outcome_are_declared_together_with_a_member_failure_name() {
+    for source in [
+        outcome_workflow("outcome: {from: outputs.decide.verdict, onFailure: failed}\n"),
+        outcome_workflow("outcomes: [planned, failed]\n"),
+        declared_outcome("outputs.decide.verdict", "shipped"),
+    ] {
+        assert_failure(
+            &source,
+            ValidationFailureKind::InvalidOutcomeDeclaration,
+            ValidationLocation::Outcome,
+        );
+    }
+
+    let workflow = validate_yaml(&declared_outcome("outputs.decide.verdict", "failed")).unwrap();
+    assert_eq!(
+        workflow.outcome,
+        Some(ValidatedOutcome {
+            names: vec!["planned".to_owned(), "failed".to_owned()],
+            source: ResolvedOutputSource {
+                node: WorkflowNode {
+                    id: "decide".to_owned(),
+                    role: WorkflowNodeRole::Step,
+                },
+                output: "verdict".to_owned(),
+                value_type: WorkflowValueType::Text,
+            },
+            on_failure: "failed".to_owned(),
+        })
+    );
+
+    let undeclared = validate_yaml(&outcome_workflow("")).unwrap();
+    assert_eq!(undeclared.outcome, None);
+}
+
+// REQ-WFFORMAT-88
+#[test]
+fn the_outcome_source_is_a_text_output_of_a_required_unconditional_step() {
+    for from in [
+        "outputs.missing.verdict",
+        "outputs.decide.missing",
+        "outputs.decide.structured",
+        "outputs.decide.report",
+        "outputs.decide.changes",
+        "outputs.advise.verdict",
+        "outputs.report.verdict",
+        "outputs.gated.verdict",
+    ] {
+        let failure = validate_yaml(&declared_outcome(from, "failed")).unwrap_err();
+        assert_eq!(
+            (failure.kind(), failure.location()),
+            (
+                ValidationFailureKind::InvalidOutcomeSource,
+                &ValidationLocation::Outcome
+            ),
+            "unexpected failure for {from}"
+        );
+    }
+}
+
+const EDGE_WORKFLOW: &str = "schemaVersion: 1
+inputs:
+  ticket:
+    kind: text
+  policy:
+    kind: json
+outcomes: [landed, failed]
+steps:
+  design:
+    kind: workflow
+    workflow: design.yaml
+    inputs:
+      ticket:
+        ref: inputs.ticket
+    on:
+      planned: build
+      blocked: exit.failed
+      failed: exit.failed
+  build:
+    kind: workflow
+    workflow: build.yaml
+    inputs:
+      parts:
+        ref: outputs.design.parts
+    on:
+      built: exit.landed
+      failed: exit.failed
+";
+
+fn design_summary() -> ChildWorkflowSummary {
+    ChildWorkflowSummary {
+        outcomes: ["planned", "blocked", "failed"].map(str::to_owned).to_vec(),
+        exports: [
+            ("parts", WorkflowValueType::Json),
+            ("plan", WorkflowValueType::Text),
+            ("report", WorkflowValueType::File),
+            ("branch", WorkflowValueType::GitBranch),
+        ]
+        .into_iter()
+        .map(|(name, value_type)| (name.to_owned(), value_type))
+        .collect(),
+        inputs: [
+            ("ticket", (WorkflowValueType::Text, false)),
+            ("notes", (WorkflowValueType::Text, true)),
+            ("answers", (WorkflowValueType::Json, true)),
+            ("brief", (WorkflowValueType::File, true)),
+            ("evidence", (WorkflowValueType::AttachmentCollection, true)),
+        ]
+        .into_iter()
+        .map(|(name, input)| (name.to_owned(), input))
+        .collect(),
+        has_workflow_steps: false,
+        has_root_blocks: false,
+        paths: BTreeSet::new(),
+    }
+}
+
+fn build_summary() -> ChildWorkflowSummary {
+    ChildWorkflowSummary {
+        outcomes: vec!["built".to_owned(), "failed".to_owned()],
+        exports: BTreeMap::new(),
+        inputs: [
+            ("parts", (WorkflowValueType::Json, false)),
+            ("part", (WorkflowValueType::Text, true)),
+            ("answers", (WorkflowValueType::Json, true)),
+        ]
+        .into_iter()
+        .map(|(name, input)| (name.to_owned(), input))
+        .collect(),
+        has_workflow_steps: false,
+        has_root_blocks: false,
+        paths: BTreeSet::new(),
+    }
+}
+
+fn child_summaries() -> BTreeMap<String, ChildWorkflowSummary> {
+    [
+        ("design.yaml".to_owned(), design_summary()),
+        ("build.yaml".to_owned(), build_summary()),
+    ]
+    .into()
+}
+
+fn validate_with_children(
+    source: &str,
+    children: &BTreeMap<String, ChildWorkflowSummary>,
+) -> Result<ValidatedWorkflow, super::ValidationFailure> {
+    super::validate_with_children(decode(source.as_bytes()).unwrap(), None, children)
+}
+
+fn assert_edge_failure(
+    source: &str,
+    children: &BTreeMap<String, ChildWorkflowSummary>,
+    kind: ValidationFailureKind,
+    location: ValidationLocation,
+) {
+    let failure = validate_with_children(source, children).unwrap_err();
+    assert_eq!(
+        (failure.kind(), failure.location()),
+        (kind, &location),
+        "unexpected failure for:\n{source}"
+    );
+}
+
+fn edge_workflow(from: &str, to: &str) -> String {
+    assert!(EDGE_WORKFLOW.contains(from), "{from}");
+    EDGE_WORKFLOW.replacen(from, to, 1)
+}
+
+fn step_input(step: &str, input: &str) -> ValidationLocation {
+    ValidationLocation::StepInput {
+        step: step.to_owned(),
+        input: input.to_owned(),
+    }
+}
+
+fn step_edge(step: &str, outcome: &str) -> ValidationLocation {
+    ValidationLocation::StepEdge {
+        step: step.to_owned(),
+        outcome: outcome.to_owned(),
+    }
+}
+
+fn workflow_step<'a>(workflow: &'a ValidatedWorkflow, step: &str) -> &'a ValidatedWorkflowStep {
+    let ValidatedStep::Workflow(step) = &workflow.steps[step] else {
+        panic!("{step} validates as a workflow step");
+    };
+    step
+}
+
+// REQ-WFFORMAT-90
+#[test]
+fn workflow_step_inputs_map_the_child_declaration_with_its_kinds() {
+    let workflow = validate_with_children(EDGE_WORKFLOW, &child_summaries()).unwrap();
+    let design = workflow_step(&workflow, "design");
+    assert_eq!(design.workflow, "design.yaml");
+    assert_eq!(
+        design.inputs.keys().collect::<Vec<_>>(),
+        ["ticket"],
+        "unmapped optional and defaulted child inputs are omitted"
+    );
+    assert_eq!(
+        design.inputs["ticket"].reference.source,
+        ResolvedValueSource::Input("ticket".to_owned())
+    );
+    assert!(!design.inputs["ticket"].may_be_omitted);
+    let build = workflow_step(&workflow, "build");
+    assert_eq!(
+        build.inputs["parts"].reference.value_type,
+        WorkflowValueType::Json
+    );
+
+    let ticket_mapping = "    inputs:\n      ticket:\n        ref: inputs.ticket\n";
+    for (source, kind, location) in [
+        (
+            edge_workflow(
+                ticket_mapping,
+                &format!("{ticket_mapping}      extra:\n        ref: inputs.ticket\n"),
+            ),
+            ValidationFailureKind::ChildInputUndeclared,
+            step_input("design", "extra"),
+        ),
+        (
+            edge_workflow(ticket_mapping, ""),
+            ValidationFailureKind::ChildInputMissing,
+            step_input("design", "ticket"),
+        ),
+        (
+            edge_workflow("ref: inputs.ticket", "ref: inputs.policy"),
+            ValidationFailureKind::ChildInputTypeMismatch,
+            step_input("design", "ticket"),
+        ),
+        (
+            edge_workflow(
+                ticket_mapping,
+                &format!("{ticket_mapping}      brief:\n        ref: inputs.ticket\n"),
+            ),
+            ValidationFailureKind::ChildInputUnsupported,
+            step_input("design", "brief"),
+        ),
+        (
+            edge_workflow(
+                ticket_mapping,
+                &format!("{ticket_mapping}      evidence:\n        ref: inputs.policy\n"),
+            ),
+            ValidationFailureKind::ChildInputUnsupported,
+            step_input("design", "evidence"),
+        ),
+    ] {
+        assert_edge_failure(&source, &child_summaries(), kind, location);
+    }
+}
+
+// REQ-WFFORMAT-91
+#[test]
+fn workflow_step_outputs_are_the_child_text_and_json_exports_and_its_outcome() {
+    let workflow = validate_with_children(EDGE_WORKFLOW, &child_summaries()).unwrap();
+    let outputs = &workflow_step(&workflow, "design").common.outputs;
+    assert_eq!(
+        outputs
+            .iter()
+            .map(|(name, output)| (name.as_str(), output.value_type))
+            .collect::<Vec<_>>(),
+        [
+            ("outcome", WorkflowValueType::Text),
+            ("parts", WorkflowValueType::Json),
+            ("plan", WorkflowValueType::Text),
+        ]
+    );
+    assert_eq!(outputs["outcome"].definition, Output::ChildOutcome);
+    assert!(matches!(
+        outputs["parts"].definition,
+        Output::ChildExport { .. }
+    ));
+    let design = workflow_step(&workflow, "design");
+    assert!(design.common.prerequisites.is_empty());
+    assert!(design.common.evidence_prerequisites.is_empty());
+
+    let mut reserved = child_summaries();
+    reserved
+        .get_mut("design.yaml")
+        .unwrap()
+        .exports
+        .insert("outcome".to_owned(), WorkflowValueType::Text);
+    assert_edge_failure(
+        EDGE_WORKFLOW,
+        &reserved,
+        ValidationFailureKind::ChildExportReserved,
+        ValidationLocation::StepWorkflow {
+            step: "design".to_owned(),
+        },
+    );
+
+    for unexported in ["report", "branch", "missing"] {
+        assert_edge_failure(
+            &edge_workflow(
+                "ref: outputs.design.parts",
+                &format!("ref: outputs.design.{unexported}"),
+            ),
+            &child_summaries(),
+            ValidationFailureKind::UnknownOutput,
+            step_input("build", "parts"),
+        );
+    }
+}
+
+// REQ-WFFORMAT-92
+#[test]
+fn workflow_step_edges_route_every_child_outcome_to_one_target() {
+    for (source, kind, location) in [
+        (
+            edge_workflow(
+                "      blocked: exit.failed\n",
+                "      blocked: exit.failed\n      shipped: exit.failed\n",
+            ),
+            ValidationFailureKind::EdgeOutcomeUndeclared,
+            step_edge("design", "shipped"),
+        ),
+        (
+            edge_workflow("      blocked: exit.failed\n", ""),
+            ValidationFailureKind::EdgeOutcomeMissing,
+            step_edge("design", "blocked"),
+        ),
+        (
+            edge_workflow("planned: build", "planned: review"),
+            ValidationFailureKind::EdgeTargetUnknown,
+            step_edge("design", "planned"),
+        ),
+        (
+            edge_workflow("built: exit.landed", "built: exit.shipped"),
+            ValidationFailureKind::EdgeExitUndeclared,
+            step_edge("build", "built"),
+        ),
+        (
+            edge_workflow("built: exit.landed", "built: exit.succeeded"),
+            ValidationFailureKind::EdgeExitUndeclared,
+            step_edge("build", "built"),
+        ),
+        (
+            edge_workflow("outcomes: [landed, failed]\n", ""),
+            ValidationFailureKind::EdgeExitUndeclared,
+            step_edge("build", "built"),
+        ),
+        (
+            edge_workflow(
+                "      blocked: exit.failed\n",
+                "      blocked:\n        wait: repair\n        then: review\n",
+            ),
+            ValidationFailureKind::EdgeTargetUnknown,
+            step_edge("design", "blocked"),
+        ),
+        (
+            edge_workflow(
+                "      blocked: exit.failed\n",
+                "      blocked:\n        wait: answer\n        then: exit.shipped\n",
+            ),
+            ValidationFailureKind::EdgeExitUndeclared,
+            step_edge("design", "blocked"),
+        ),
+    ] {
+        assert_edge_failure(&source, &child_summaries(), kind, location);
+    }
+
+    // A step target may name the step itself or an earlier step.
+    for target in ["design", "build"] {
+        let workflow = validate_with_children(
+            &edge_workflow("built: exit.landed", &format!("built: {target}")),
+            &child_summaries(),
+        )
+        .unwrap();
+        assert_eq!(
+            workflow_step(&workflow, "build").edges["built"],
+            ValidatedEdgeTarget::Step(target.to_owned())
+        );
+    }
+
+    let implicit = edge_workflow("outcomes: [landed, failed]\n", "")
+        .replace("built: exit.landed", "built: exit.succeeded");
+    let workflow = validate_with_children(&implicit, &child_summaries()).unwrap();
+    assert_eq!(
+        workflow_step(&workflow, "build").edges["built"],
+        ValidatedEdgeTarget::Exit("succeeded".to_owned())
+    );
+
+    let waiting = edge_workflow(
+        "      blocked: exit.failed\n",
+        "      blocked:\n        wait: repair\n        then: build\n",
+    );
+    let workflow = validate_with_children(&waiting, &child_summaries()).unwrap();
+    let design = workflow_step(&workflow, "design");
+    assert_eq!(
+        design.edges["blocked"],
+        ValidatedEdgeTarget::Wait {
+            kind: WaitKind::Repair,
+            then: Box::new(ValidatedEdgeTarget::Step("build".to_owned())),
+            on_hand_back: None,
+            rule: None,
+        }
+    );
+    assert_eq!(
+        design.edges["planned"],
+        ValidatedEdgeTarget::Step("build".to_owned())
+    );
+}
+
+// REQ-WFFORMAT-92
+#[test]
+fn an_approval_wait_names_a_hand_back_step_and_no_other_wait_does() {
+    for (source, kind, location) in [
+        (
+            edge_workflow(
+                "      blocked: exit.failed\n",
+                "      blocked:\n        wait: approval\n        then: build\n",
+            ),
+            ValidationFailureKind::WaitHandBackRequired,
+            step_edge("design", "blocked"),
+        ),
+        (
+            edge_workflow(
+                "      blocked: exit.failed\n",
+                "      blocked:\n        wait: answer\n        then: build\n        onHandBack: build\n",
+            ),
+            ValidationFailureKind::WaitHandBackUnsupported,
+            step_edge("design", "blocked"),
+        ),
+        (
+            edge_workflow(
+                "      blocked: exit.failed\n",
+                "      blocked:\n        wait: approval\n        then: build\n        onHandBack: review\n",
+            ),
+            ValidationFailureKind::EdgeTargetUnknown,
+            step_edge("design", "blocked"),
+        ),
+    ] {
+        assert_edge_failure(&source, &child_summaries(), kind, location);
+    }
+
+    // A hand-back may continue at an earlier step.
+    let earlier = edge_workflow(
+        "built: exit.landed",
+        "built:\n        wait: approval\n        then: exit.landed\n        onHandBack: design",
+    );
+    let workflow = validate_with_children(&earlier, &child_summaries()).unwrap();
+    assert_eq!(
+        workflow_step(&workflow, "build").edges["built"],
+        ValidatedEdgeTarget::Wait {
+            kind: WaitKind::Approval,
+            then: Box::new(ValidatedEdgeTarget::Exit("landed".to_owned())),
+            on_hand_back: Some("design".to_owned()),
+            rule: None,
+        }
+    );
+
+    // `fix` is the target of no edge but the hand-back of `build`'s approval wait.
+    let hand_back = edge_workflow(
+        "built: exit.landed",
+        "built:\n        wait: approval\n        then: exit.landed\n        onHandBack: fix",
+    ) + "  fix:
+    kind: workflow
+    workflow: build.yaml
+    inputs:
+      parts:
+        ref: outputs.design.parts
+    on:
+      built: exit.landed
+      failed: exit.failed
+";
+    let workflow = validate_with_children(&hand_back, &child_summaries()).unwrap();
+    assert_eq!(
+        workflow_step(&workflow, "build").edges["built"],
+        ValidatedEdgeTarget::Wait {
+            kind: WaitKind::Approval,
+            then: Box::new(ValidatedEdgeTarget::Exit("landed".to_owned())),
+            on_hand_back: Some("fix".to_owned()),
+            rule: None,
+        }
+    );
+}
+
+// REQ-WFFORMAT-92
+#[test]
+fn a_wait_may_continue_at_the_waiting_step_or_an_earlier_one() {
+    let repair_self = edge_workflow(
+        "      built: exit.landed\n      failed: exit.failed\n",
+        "      built: exit.landed\n      failed:\n        wait: repair\n        then: build\n",
+    );
+    let workflow = validate_with_children(&repair_self, &child_summaries()).unwrap();
+    assert_eq!(
+        workflow_step(&workflow, "build").edges["failed"],
+        ValidatedEdgeTarget::Wait {
+            kind: WaitKind::Repair,
+            then: Box::new(ValidatedEdgeTarget::Step("build".to_owned())),
+            on_hand_back: None,
+            rule: None,
+        }
+    );
+
+    let answer_self = edge_workflow(
+        "      blocked: exit.failed\n",
+        "      blocked:\n        wait: answer\n        then: design\n",
+    );
+    validate_with_children(&answer_self, &child_summaries()).unwrap();
+
+    let hand_back_self = edge_workflow(
+        "built: exit.landed",
+        "built:\n        wait: approval\n        then: exit.landed\n        onHandBack: build",
+    );
+    let workflow = validate_with_children(&hand_back_self, &child_summaries()).unwrap();
+    assert_eq!(
+        workflow_step(&workflow, "build").edges["built"],
+        ValidatedEdgeTarget::Wait {
+            kind: WaitKind::Approval,
+            then: Box::new(ValidatedEdgeTarget::Exit("landed".to_owned())),
+            on_hand_back: Some("build".to_owned()),
+            rule: None,
+        }
+    );
+
+    let answer_earlier = edge_workflow(
+        "      built: exit.landed\n",
+        "      built:\n        wait: answer\n        then: design\n",
+    );
+    let workflow = validate_with_children(&answer_earlier, &child_summaries()).unwrap();
+    assert_eq!(
+        workflow_step(&workflow, "build").edges["built"],
+        ValidatedEdgeTarget::Wait {
+            kind: WaitKind::Answer,
+            then: Box::new(ValidatedEdgeTarget::Step("design".to_owned())),
+            on_hand_back: None,
+            rule: None,
+        }
+    );
+
+    // A step whose only targeting edge is its own wait is not reached.
+    assert_edge_failure(
+        &edge_workflow(
+            "      built: exit.landed\n      failed: exit.failed\n",
+            "      built: exit.landed\n      failed:\n        wait: repair\n        then: build\n",
+        )
+        .replace("planned: build", "planned: exit.landed"),
+        &child_summaries(),
+        ValidationFailureKind::StepUnreachable,
+        ValidationLocation::Step {
+            step: "build".to_owned(),
+        },
+    );
+}
+
+// REQ-WFFORMAT-96
+#[test]
+fn a_limited_edge_continues_at_a_step_until_its_limit_and_then_takes_else() {
+    let limited = |then: &str, else_: &str| {
+        format!("planned:\n        then: {then}\n        limit: 2\n        else: {else_}")
+    };
+    for (source, kind) in [
+        (
+            edge_workflow("planned: build", &limited("exit.landed", "build")),
+            ValidationFailureKind::EdgeLimitTargetInvalid,
+        ),
+        (
+            edge_workflow("planned: build", &limited("build", "review")),
+            ValidationFailureKind::EdgeTargetUnknown,
+        ),
+        (
+            edge_workflow("planned: build", &limited("review", "build")),
+            ValidationFailureKind::EdgeTargetUnknown,
+        ),
+        (
+            edge_workflow("planned: build", &limited("build", "exit.shipped")),
+            ValidationFailureKind::EdgeExitUndeclared,
+        ),
+    ] {
+        assert_edge_failure(
+            &source,
+            &child_summaries(),
+            kind,
+            step_edge("design", "planned"),
+        );
+    }
+
+    // `build` is reached only through the limited edge's `then`, or only through its `else`.
+    let through_then = edge_workflow("planned: build", &limited("build", "exit.failed"));
+    let workflow = validate_with_children(&through_then, &child_summaries()).unwrap();
+    assert_eq!(
+        workflow_step(&workflow, "design").edges["planned"],
+        ValidatedEdgeTarget::Limited {
+            then: "build".to_owned(),
+            limit: 2,
+            else_: Box::new(ValidatedEdgeTarget::Exit("failed".to_owned())),
+        }
+    );
+    let through_else = edge_workflow(
+        "planned: build",
+        "planned:\n        then: design\n        limit: 2\n        else:\n          wait: repair\n          then: build",
+    );
+    let workflow = validate_with_children(&through_else, &child_summaries()).unwrap();
+    assert_eq!(
+        workflow_step(&workflow, "design").edges["planned"],
+        ValidatedEdgeTarget::Limited {
+            then: "design".to_owned(),
+            limit: 2,
+            else_: Box::new(ValidatedEdgeTarget::Wait {
+                kind: WaitKind::Repair,
+                then: Box::new(ValidatedEdgeTarget::Step("build".to_owned())),
+                on_hand_back: None,
+                rule: None,
+            }),
+        }
+    );
+}
+
+const EXTERNAL_WAIT_WORKFLOW: &str = r#"schemaVersion: 1
+inputs:
+  ticket:
+    kind: text
+  policy:
+    kind: json
+outcomes: [landed, failed]
+steps:
+  design:
+    kind: workflow
+    workflow: design.yaml
+    inputs:
+      ticket:
+        ref: inputs.ticket
+    on:
+      planned: review
+      blocked: exit.failed
+      failed: exit.failed
+  review:
+    kind: workflow
+    workflow: review.yaml
+    on:
+      proceed: merge
+      failed: exit.failed
+  merge:
+    kind: workflow
+    workflow: merge.yaml
+    on:
+      admitted:
+        wait: external
+        then: merge
+        rule:
+          source: github
+          event: pull_request.queue_settled
+          where: 'event.pullRequest == outputs.design.pullRequest and event.state == "merged"'
+      landed: exit.landed
+      failed: exit.failed
+"#;
+
+fn external_wait_summaries() -> BTreeMap<String, ChildWorkflowSummary> {
+    let mut design = design_summary();
+    design
+        .exports
+        .insert("pullRequest".to_owned(), WorkflowValueType::Text);
+    let child = |outcomes: &[&str], exports: &[(&str, WorkflowValueType)]| ChildWorkflowSummary {
+        outcomes: outcomes
+            .iter()
+            .map(|outcome| (*outcome).to_owned())
+            .collect(),
+        exports: exports
+            .iter()
+            .map(|(name, value_type)| ((*name).to_owned(), *value_type))
+            .collect(),
+        inputs: BTreeMap::new(),
+        has_workflow_steps: false,
+        has_root_blocks: false,
+        paths: BTreeSet::new(),
+    };
+    [
+        ("design.yaml".to_owned(), design),
+        (
+            "review.yaml".to_owned(),
+            child(
+                &["proceed", "failed"],
+                &[("findings", WorkflowValueType::Json)],
+            ),
+        ),
+        (
+            "merge.yaml".to_owned(),
+            child(
+                &["admitted", "landed", "failed"],
+                &[("pullRequest", WorkflowValueType::Text)],
+            ),
+        ),
+    ]
+    .into()
+}
+
+fn external_wait(from: &str, to: &str) -> String {
+    assert!(EXTERNAL_WAIT_WORKFLOW.contains(from), "{from}");
+    EXTERNAL_WAIT_WORKFLOW.replacen(from, to, 1)
+}
+
+// REQ-WFFORMAT-97
+#[test]
+fn an_external_wait_carries_a_rule_over_earlier_text_values() {
+    let where_ = "outputs.design.pullRequest and event.state";
+    for (source, kind) in [
+        (
+            external_wait(
+                "        rule:\n          source: github\n          event: pull_request.queue_settled\n          where: 'event.pullRequest == outputs.design.pullRequest and event.state == \"merged\"'\n",
+                "",
+            ),
+            ValidationFailureKind::WaitRuleRequired,
+        ),
+        (
+            external_wait("wait: external", "wait: repair"),
+            ValidationFailureKind::WaitRuleUnsupported,
+        ),
+        (
+            external_wait("source: github", "source: um"),
+            ValidationFailureKind::WaitRuleInvalid,
+        ),
+        (
+            external_wait(
+                "'event.pullRequest == outputs.design.pullRequest and event.state == \"merged\"'",
+                "'event.x != run.id'",
+            ),
+            ValidationFailureKind::WaitRuleInvalid,
+        ),
+        (
+            external_wait(where_, "outputs.review.findings and event.state"),
+            ValidationFailureKind::WaitRuleReferenceInvalid,
+        ),
+        (
+            external_wait(where_, "outputs.merge.pullRequest and event.state"),
+            ValidationFailureKind::WaitRuleReferenceInvalid,
+        ),
+        (
+            external_wait(where_, "outputs.design.branch and event.state"),
+            ValidationFailureKind::WaitRuleReferenceInvalid,
+        ),
+        (
+            external_wait(where_, "inputs.repository and event.state"),
+            ValidationFailureKind::WaitRuleReferenceInvalid,
+        ),
+        (
+            external_wait(where_, "inputs.policy and event.state"),
+            ValidationFailureKind::WaitRuleReferenceInvalid,
+        ),
+    ] {
+        assert_edge_failure(
+            &source,
+            &external_wait_summaries(),
+            kind,
+            step_edge("merge", "admitted"),
+        );
+    }
+
+    let workflow =
+        validate_with_children(EXTERNAL_WAIT_WORKFLOW, &external_wait_summaries()).unwrap();
+    assert_eq!(
+        workflow_step(&workflow, "merge").edges["admitted"],
+        ValidatedEdgeTarget::Wait {
+            kind: WaitKind::External,
+            then: Box::new(ValidatedEdgeTarget::Step("merge".to_owned())),
+            on_hand_back: None,
+            rule: Some(WaitRule {
+                source: "github".to_owned(),
+                event: vec!["pull_request.queue_settled".to_owned()],
+                where_:
+                    "event.pullRequest == outputs.design.pullRequest and event.state == \"merged\""
+                        .to_owned(),
+            }),
+        }
+    );
+    validate_with_children(
+        &external_wait(where_, "inputs.ticket and event.state"),
+        &external_wait_summaries(),
+    )
+    .unwrap();
+}
+
+// REQ-WFFORMAT-95
+#[test]
+fn control_references_map_onto_optional_child_inputs_of_their_kind() {
+    let ticket_mapping = "    inputs:\n      ticket:\n        ref: inputs.ticket\n";
+    let mapped = |notes: &str, answers: &str| {
+        edge_workflow(
+            ticket_mapping,
+            &format!(
+                "{ticket_mapping}      notes:\n        ref: {notes}\n      answers:\n        ref: {answers}\n"
+            ),
+        )
+    };
+    let workflow = validate_with_children(
+        &mapped("wait.notes", "controls.answers"),
+        &child_summaries(),
+    )
+    .unwrap();
+    let design = workflow_step(&workflow, "design");
+    assert_eq!(
+        (
+            &design.inputs["notes"].reference.source,
+            design.inputs["notes"].reference.value_type,
+        ),
+        (
+            &ResolvedValueSource::Wait("notes".to_owned()),
+            WorkflowValueType::Text
+        )
+    );
+    assert_eq!(
+        (
+            &design.inputs["answers"].reference.source,
+            design.inputs["answers"].reference.value_type,
+        ),
+        (
+            &ResolvedValueSource::ControlsAnswers,
+            WorkflowValueType::Json
+        )
+    );
+
+    for input in ["notes", "answers"] {
+        let mut required = child_summaries();
+        required
+            .get_mut("design.yaml")
+            .unwrap()
+            .inputs
+            .get_mut(input)
+            .unwrap()
+            .1 = false;
+        assert_edge_failure(
+            &mapped("wait.notes", "controls.answers"),
+            &required,
+            ValidationFailureKind::ControlReferenceRequiresOptional,
+            step_input("design", input),
+        );
+    }
+    assert_edge_failure(
+        &mapped("inputs.ticket", "wait.notes"),
+        &child_summaries(),
+        ValidationFailureKind::ChildInputTypeMismatch,
+        step_input("design", "answers"),
+    );
+    assert_edge_failure(
+        &mapped("controls.answers", "inputs.policy"),
+        &child_summaries(),
+        ValidationFailureKind::ChildInputTypeMismatch,
+        step_input("design", "notes"),
+    );
+}
+
+const BUILD_MAPPING: &str =
+    "    workflow: build.yaml\n    inputs:\n      parts:\n        ref: outputs.design.parts\n";
+
+/// `EDGE_WORKFLOW` whose `build` step carries `for_each` (omitted when empty) and maps
+/// `part` and `answers` onto the references given.
+fn fan_out_workflow(for_each: &str, part: &str, answers: &str) -> String {
+    edge_workflow(
+        BUILD_MAPPING,
+        &format!(
+            "    workflow: build.yaml\n{for_each}    inputs:\n      parts:\n        ref: outputs.design.parts\n      part:\n        ref: {part}\n      answers:\n        ref: {answers}\n"
+        ),
+    )
+}
+
+fn step_for_each(step: &str) -> ValidationLocation {
+    ValidationLocation::StepForEach {
+        step: step.to_owned(),
+    }
+}
+
+// REQ-WFFORMAT-98, REQ-WFFORMAT-99
+#[test]
+fn for_each_iterates_a_json_value_and_maps_item_onto_child_inputs() {
+    let over_parts = "    forEach: outputs.design.parts\n";
+    let workflow = validate_with_children(
+        &fan_out_workflow(over_parts, "item.name", "item"),
+        &child_summaries(),
+    )
+    .unwrap();
+    let build = workflow_step(&workflow, "build");
+    assert_eq!(
+        build.for_each,
+        Some(ValidatedForEach {
+            items: ResolvedValueReference {
+                source: ResolvedValueSource::Output(ResolvedOutputSource {
+                    node: WorkflowNode {
+                        id: "design".to_owned(),
+                        role: WorkflowNodeRole::Step,
+                    },
+                    output: "parts".to_owned(),
+                    value_type: WorkflowValueType::Json,
+                }),
+                value_type: WorkflowValueType::Json,
+            },
+            empty: None,
+        })
+    );
+    let input = |name: &str| {
+        (
+            build.inputs[name].reference.source.clone(),
+            build.inputs[name].reference.value_type,
+        )
+    };
+    assert_eq!(
+        input("part"),
+        (
+            ResolvedValueSource::Item {
+                field: Some("name".to_owned())
+            },
+            WorkflowValueType::Text
+        )
+    );
+    assert_eq!(
+        input("answers"),
+        (
+            ResolvedValueSource::Item { field: None },
+            WorkflowValueType::Json
+        )
+    );
+
+    let object = |empty: &str| {
+        fan_out_workflow(
+            &format!("    forEach:\n      items: outputs.design.parts\n      empty: {empty}\n"),
+            "item.name",
+            "item",
+        )
+    };
+    let workflow = validate_with_children(&object("built"), &child_summaries()).unwrap();
+    assert_eq!(
+        workflow_step(&workflow, "build")
+            .for_each
+            .as_ref()
+            .unwrap()
+            .empty
+            .as_deref(),
+        Some("built")
+    );
+    assert_edge_failure(
+        &object("shipped"),
+        &child_summaries(),
+        ValidationFailureKind::ForEachEmptyUndeclared,
+        step_for_each("build"),
+    );
+
+    for items in [
+        "outputs.design.plan",
+        "inputs.ticket",
+        "outputs.build.parts",
+    ] {
+        assert_edge_failure(
+            &fan_out_workflow(&format!("    forEach: {items}\n"), "item.name", "item"),
+            &child_summaries(),
+            ValidationFailureKind::ForEachReferenceInvalid,
+            step_for_each("build"),
+        );
+    }
+    // The structural schema admits only `inputs.` and `outputs.` forms; the validator
+    // refuses an engine value there all the same.
+    for items in [
+        ValueReference::Wait {
+            field: "notes".to_owned(),
+        },
+        ValueReference::ControlsAnswers,
+        ValueReference::Item { field: None },
+        ValueReference::FinalizationContext,
+    ] {
+        let mut document =
+            decode(fan_out_workflow(over_parts, "item.name", "item").as_bytes()).unwrap();
+        let NodeBody::Workflow(node) = &mut document.steps.get_mut("build").unwrap().body else {
+            panic!("build decodes as a workflow step");
+        };
+        node.for_each.as_mut().unwrap().items = items;
+        let failure =
+            super::validate_with_children(document, None, &child_summaries()).unwrap_err();
+        assert_eq!(
+            (failure.kind(), failure.location()),
+            (
+                ValidationFailureKind::ForEachReferenceInvalid,
+                &step_for_each("build")
+            )
+        );
+    }
+
+    assert_edge_failure(
+        &fan_out_workflow("", "item.name", "inputs.policy"),
+        &child_summaries(),
+        ValidationFailureKind::ItemReferenceRequiresForEach,
+        step_input("build", "part"),
+    );
+}
+
+// REQ-WFFORMAT-93
+#[test]
+fn a_workflow_with_workflow_steps_is_scheduled_by_its_edges() {
+    let workflow = validate_with_children(EDGE_WORKFLOW, &child_summaries()).unwrap();
+    assert_eq!(
+        workflow.scheduling,
+        Scheduling::Edges {
+            entry: "design".to_owned()
+        }
+    );
+    assert_eq!(workflow.presentation_order, ["design", "build"]);
+    assert_eq!(workflow.outcome, None);
+    let dataflow = validate_yaml(&format!(
+        "schemaVersion: 1\nsteps:\n{}",
+        command_step("only", "")
+    ))
+    .unwrap();
+    assert_eq!(dataflow.scheduling, Scheduling::Dataflow);
+
+    let with_command = format!("{EDGE_WORKFLOW}{}", command_step("tidy", ""));
+    assert_edge_failure(
+        &with_command,
+        &child_summaries(),
+        ValidationFailureKind::EdgeSchedulingKind,
+        ValidationLocation::Step {
+            step: "tidy".to_owned(),
+        },
+    );
+    assert_edge_failure(
+        &edge_workflow("planned: build", "planned: exit.landed"),
+        &child_summaries(),
+        ValidationFailureKind::StepUnreachable,
+        ValidationLocation::Step {
+            step: "build".to_owned(),
+        },
+    );
+    // A step reached only through a wait's `then` is reachable.
+    validate_with_children(
+        &edge_workflow(
+            "planned: build",
+            "planned:\n        wait: repair\n        then: build",
+        ),
+        &child_summaries(),
+    )
+    .unwrap();
+    assert_edge_failure(
+        &edge_workflow(
+            "outcomes: [landed, failed]\n",
+            "outcomes: [landed, failed]\noutcome: {from: outputs.build.outcome, onFailure: failed}\n",
+        ),
+        &child_summaries(),
+        ValidationFailureKind::InvalidOutcomeDeclaration,
+        ValidationLocation::Outcome,
+    );
+}
+
+// REQ-WFFORMAT-89
+#[test]
+fn a_child_workflow_is_a_readable_stage_without_workflow_steps_or_root_blocks() {
+    let design = || ValidationLocation::StepWorkflow {
+        step: "design".to_owned(),
+    };
+    let mut nested = child_summaries();
+    nested.get_mut("design.yaml").unwrap().has_workflow_steps = true;
+    assert_edge_failure(
+        EDGE_WORKFLOW,
+        &nested,
+        ValidationFailureKind::ChildWorkflowNested,
+        design(),
+    );
+    let mut rooted = child_summaries();
+    rooted.get_mut("design.yaml").unwrap().has_root_blocks = true;
+    assert_edge_failure(
+        EDGE_WORKFLOW,
+        &rooted,
+        ValidationFailureKind::ChildWorkflowRootBlocks,
+        design(),
+    );
+    let mut missing = child_summaries();
+    missing.remove("design.yaml");
+    assert_edge_failure(
+        EDGE_WORKFLOW,
+        &missing,
+        ValidationFailureKind::ChildWorkflowUnavailable,
+        design(),
+    );
+    assert_failure(
+        EDGE_WORKFLOW,
+        ValidationFailureKind::ChildWorkflowUnavailable,
+        design(),
+    );
+}
+
 #[test]
 fn structurally_decoded_references_are_not_reparsed_during_validation() {
     let mut document =
@@ -1638,7 +2795,10 @@ fn structurally_decoded_references_are_not_reparsed_during_validation() {
     };
     document.inputs.insert(
         "request".to_owned(),
-        super::super::document::InputDeclaration::Text,
+        super::super::document::InputDeclaration::Text {
+            optional: false,
+            default: None,
+        },
     );
     command.inputs.insert(
         "prompt".to_owned(),
@@ -2103,10 +3263,7 @@ fn workflow_node_evidence_definition_limit_applies_to_steps_and_finalizers() {
                 } else {
                     &workflow.steps["consume"]
                 };
-                let common = match step {
-                    ValidatedStep::Command(command) => &command.common,
-                    ValidatedStep::Agent(agent) => &agent.common,
-                };
+                let common = step.common();
                 assert_eq!(common.evidence_prerequisites.len(), 1_024);
                 assert!(common.evidence_prerequisites.iter().all(|descriptor| {
                     descriptor.kind() == super::super::evidence::PrerequisiteKind::Body
@@ -2249,7 +3406,7 @@ fn agent_profile_replacement_rejects_an_undeclared_name_at_the_replacement() {
 
 // REQ-WFFORMAT-7
 #[test]
-fn description_is_inert_and_a_workflow_declares_no_identifier() {
+fn description_name_and_version_are_inert_and_a_workflow_declares_no_identifier() {
     let source = format!(
         "schemaVersion: 1\nsteps:\n{}{}",
         command_step("prepare", ""),
@@ -2257,17 +3414,22 @@ fn description_is_inert_and_a_workflow_declares_no_identifier() {
     );
     let described = source.replacen(
         "schemaVersion: 1\n",
-        "schemaVersion: 1\ndescription: \"Release train: run publish when prepare succeeds\"\n",
+        "schemaVersion: 1\ndescription: \"Release train: run publish when prepare succeeds\"\n\
+         name: release\nversion: \"2.1\"\n",
         1,
     );
 
     let plain = validate_yaml(&source).unwrap();
     let mut described = validate_yaml(&described).unwrap();
     assert!(described.description.is_some());
+    assert_eq!(described.name.as_deref(), Some("release"));
+    assert_eq!(described.version.as_deref(), Some("2.1"));
     described.description = None;
+    described.name = None;
+    described.version = None;
     assert_eq!(described, plain);
 
-    for identifier in ["id: release", "name: release", "workflowId: release"] {
+    for identifier in ["id: release", "workflowId: release"] {
         assert_structurally_invalid(&source.replacen(
             "schemaVersion: 1\n",
             &format!("schemaVersion: 1\n{identifier}\n"),

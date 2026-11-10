@@ -2197,12 +2197,21 @@ mod tests {
         let execution = round.join("workspace");
         let run = round.join("run");
         fs::create_dir_all(&execution).unwrap();
+        // The assignment workspace holds `workflow.yaml`, so `--path` on it would admit it as
+        // a tree and refuse the fixture's path programs (REQ-LOCALRUN-174). The nested run
+        // takes its file from a directory of its own, admitted from the file's closure.
+        let source = round.join("source");
+        fs::create_dir_all(&source).unwrap();
+        fs::copy(workspace.join("nested.yaml"), source.join("nested.yaml")).unwrap();
         let arguments = vec![
             OsString::from("um"),
             OsString::from("workflow"),
             OsString::from("run"),
-            OsString::from("--source-root"),
-            workspace.clone().into_os_string(),
+            OsString::from("create"),
+            OsString::from("--path"),
+            source.into_os_string(),
+            OsString::from("--workflow"),
+            OsString::from("nested.yaml"),
             OsString::from("--execution-root"),
             execution.into_os_string(),
             OsString::from("--run-dir"),
@@ -2210,7 +2219,6 @@ mod tests {
             OsString::from("--json"),
             OsString::from("--color"),
             OsString::from("never"),
-            workspace.join("nested.yaml").into_os_string(),
         ];
         let outcome = match parse(arguments).unwrap().execute() {
             Ok(outcome) => outcome,
@@ -2616,14 +2624,34 @@ mod tests {
             "service-principal credential revoke",
             "version",
             "workflow",
-            "workflow continue",
+            "workflow definition",
+            "workflow definition disable",
+            "workflow definition enable",
+            "workflow definition list",
+            "workflow definition publish",
+            "workflow definition show",
+            "workflow definition validate",
             "workflow reference",
-            "workflow retry",
             "workflow run",
+            "workflow run answer",
+            "workflow run approve",
+            "workflow run cancel",
+            "workflow run create",
+            "workflow run hand-back",
+            "workflow run lift",
+            "workflow run list",
+            "workflow run release",
+            "workflow run restart",
+            "workflow run resume",
+            "workflow run retry",
+            "workflow run show",
+            "workflow run status",
+            "workflow run stop",
+            "workflow run upgrade",
+            "workflow run view",
+            "workflow run withdraw",
             "workflow schema",
-            "workflow status",
             "workflow validate",
-            "workflow view",
         ];
 
         assert_eq!(actual, expected);

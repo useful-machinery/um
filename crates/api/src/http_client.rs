@@ -311,7 +311,7 @@ pub(super) enum SignedStorageGetError {
     Server,
 }
 
-fn blocking_client_builder(
+pub(super) fn blocking_client_builder(
     transport_policy: HttpTransportPolicy,
     timeout: Duration,
 ) -> reqwest::blocking::ClientBuilder {

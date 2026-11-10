@@ -1,0 +1,55 @@
+schemaVersion: 1
+inputs:
+  ticket:
+    kind: text
+outcomes: [landed]
+steps:
+  design:
+    kind: workflow
+    workflow: design.yaml
+    inputs:
+      ticket:
+        ref: inputs.ticket
+      answers:
+        ref: controls.answers
+    on:
+      planned: review
+      blocked:
+        wait: answer
+        then: design
+      failed:
+        wait: repair
+        then: design
+  review:
+    kind: workflow
+    workflow: review.yaml
+    inputs:
+      plan:
+        ref: outputs.design.plan
+    on:
+      approve:
+        wait: approval
+        then: merge
+        onHandBack: fix
+      failed:
+        wait: repair
+        then: review
+  fix:
+    kind: workflow
+    workflow: build.yaml
+    inputs:
+      notes:
+        ref: wait.notes
+    on:
+      built: merge
+      failed:
+        wait: repair
+        then: fix
+  merge:
+    kind: workflow
+    workflow: merge.yaml
+    on:
+      landed: exit.landed
+      failed:
+        wait: repair
+        then: merge

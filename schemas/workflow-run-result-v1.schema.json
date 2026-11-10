@@ -10,10 +10,25 @@
       "$ref": "#/$defs/WorkflowRejection"
     },
     {
+      "$ref": "#/$defs/TreeRejection"
+    },
+    {
+      "$ref": "#/$defs/DefinitionRejection"
+    },
+    {
       "$ref": "#/$defs/AttemptRejection"
     },
     {
       "$ref": "#/$defs/ContinuationRefusal"
+    },
+    {
+      "$ref": "#/$defs/UnattemptedResume"
+    },
+    {
+      "$ref": "#/$defs/SuccessorRefusal"
+    },
+    {
+      "$ref": "#/$defs/UpgradedRun"
     }
   ],
   "$defs": {
@@ -54,16 +69,19 @@
         },
         "command": {
           "enum": [
-            "um workflow run",
-            "um workflow retry",
-            "um workflow continue"
+            "um workflow run create",
+            "um workflow run retry",
+            "um workflow run resume",
+            "um workflow run restart"
           ]
         },
         "outcome": {
           "enum": [
             "succeeded",
             "failed",
-            "cancelled"
+            "cancelled",
+            "waiting",
+            "continued"
           ]
         },
         "exitStatus": {
@@ -85,6 +103,96 @@
         },
         "result": {
           "$ref": "workflow-view-result-v1.schema.json#/$defs/WorkflowResult"
+        },
+        "wait": {
+          "$ref": "workflow-view-result-v1.schema.json#/$defs/WaitRecord"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "outcome": {
+                "const": "waiting"
+              }
+            },
+            "required": [
+              "outcome"
+            ]
+          },
+          "then": {
+            "required": [
+              "wait"
+            ]
+          },
+          "else": {
+            "not": {
+              "required": [
+                "wait"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "UnattemptedResume": {
+      "description": "A resume without --from, or a retry of a run waiting for repair, that created no attempt: a wait no control resolves, with its record, or a run a control withdrew.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schemaVersion",
+        "command",
+        "outcome",
+        "exitStatus",
+        "runDirectory",
+        "attemptNumber"
+      ],
+      "properties": {
+        "schemaVersion": {
+          "const": 1
+        },
+        "command": {
+          "enum": [
+            "um workflow run resume",
+            "um workflow run retry"
+          ]
+        },
+        "outcome": {
+          "enum": [
+            "waiting",
+            "withdrawn"
+          ]
+        },
+        "exitStatus": {
+          "const": 0
+        },
+        "runDirectory": {
+          "$ref": "#/$defs/AbsolutePath"
+        },
+        "attemptNumber": {
+          "$ref": "#/$defs/AttemptNumber"
+        },
+        "wait": {
+          "$ref": "workflow-view-result-v1.schema.json#/$defs/WaitRecord"
+        }
+      },
+      "if": {
+        "properties": {
+          "outcome": {
+            "const": "waiting"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "wait"
+        ]
+      },
+      "else": {
+        "not": {
+          "required": [
+            "wait"
+          ]
         }
       }
     },
@@ -133,6 +241,14 @@
         "export": {
           "type": "string",
           "minLength": 1
+        },
+        "tool": {
+          "type": "string",
+          "minLength": 1
+        },
+        "key": {
+          "type": "string",
+          "minLength": 1
         }
       }
     },
@@ -156,6 +272,256 @@
         }
       }
     },
+    "RejectedWorkflow": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "path"
+          ],
+          "properties": {
+            "path": {
+              "$ref": "#/$defs/RelativePath"
+            }
+          }
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "TreeRejection": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schemaVersion",
+        "command",
+        "outcome",
+        "exitStatus",
+        "phase",
+        "workflow",
+        "diagnostics"
+      ],
+      "properties": {
+        "schemaVersion": {
+          "const": 1
+        },
+        "command": {
+          "enum": [
+            "um workflow run create",
+            "um workflow run retry",
+            "um workflow run resume",
+            "um workflow run restart",
+            "um workflow run upgrade"
+          ]
+        },
+        "outcome": {
+          "const": "rejected"
+        },
+        "exitStatus": {
+          "const": 1
+        },
+        "phase": {
+          "const": "tree"
+        },
+        "runDirectory": {
+          "$ref": "#/$defs/AbsolutePath"
+        },
+        "workflow": {
+          "$ref": "#/$defs/RejectedWorkflow"
+        },
+        "diagnostics": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/TreeRejectionDiagnostic"
+          }
+        }
+      },
+      "if": {
+        "properties": {
+          "command": {
+            "const": "um workflow run create"
+          }
+        },
+        "required": [
+          "command"
+        ]
+      },
+      "then": {
+        "not": {
+          "required": [
+            "runDirectory"
+          ]
+        }
+      },
+      "else": {
+        "required": [
+          "runDirectory"
+        ]
+      }
+    },
+    "DefinitionRejection": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schemaVersion",
+        "command",
+        "outcome",
+        "exitStatus",
+        "phase",
+        "workflow",
+        "diagnostics"
+      ],
+      "properties": {
+        "schemaVersion": {
+          "const": 1
+        },
+        "command": {
+          "enum": [
+            "um workflow run create",
+            "um workflow run restart",
+            "um workflow run upgrade"
+          ]
+        },
+        "outcome": {
+          "const": "rejected"
+        },
+        "exitStatus": {
+          "const": 1
+        },
+        "phase": {
+          "const": "definition"
+        },
+        "workflow": {
+          "type": "null"
+        },
+        "diagnostics": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 1,
+          "items": {
+            "$ref": "#/$defs/DefinitionRejectionDiagnostic"
+          }
+        }
+      }
+    },
+    "DefinitionRejectionDiagnostic": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "code",
+        "message"
+      ],
+      "properties": {
+        "code": {
+          "$ref": "#/$defs/Code"
+        },
+        "message": {
+          "$ref": "#/$defs/Message"
+        },
+        "definition": {
+          "type": "string",
+          "minLength": 1
+        },
+        "revision": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "path": {
+          "type": "string",
+          "minLength": 1
+        },
+        "run": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "TreeRejectionDiagnostic": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "code",
+        "message",
+        "location"
+      ],
+      "properties": {
+        "code": {
+          "$ref": "#/$defs/Code"
+        },
+        "message": {
+          "$ref": "#/$defs/Message"
+        },
+        "location": {
+          "$ref": "#/$defs/TreeRejectionLocation"
+        },
+        "workflowLocation": {
+          "$ref": "#/$defs/RejectionLocation"
+        }
+      }
+    },
+    "TreeRejectionLocation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind"
+      ],
+      "properties": {
+        "kind": {
+          "$ref": "#/$defs/Code"
+        },
+        "path": {
+          "type": "string",
+          "minLength": 1
+        },
+        "step": {
+          "type": "string",
+          "minLength": 1
+        },
+        "key": {
+          "type": "string",
+          "minLength": 1
+        },
+        "trigger": {
+          "type": "string",
+          "minLength": 1
+        },
+        "binding": {
+          "type": "string",
+          "minLength": 1
+        },
+        "input": {
+          "type": "string",
+          "minLength": 1
+        },
+        "program": {
+          "type": "string",
+          "minLength": 1
+        },
+        "pattern": {
+          "type": "string"
+        },
+        "expectedDigest": {
+          "$ref": "#/$defs/TreeDigest"
+        },
+        "actualDigest": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/TreeDigest"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "TreeDigest": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
     "WorkflowRejection": {
       "type": "object",
       "additionalProperties": false,
@@ -174,8 +540,8 @@
         },
         "command": {
           "enum": [
-            "um workflow run",
-            "um workflow retry"
+            "um workflow run create",
+            "um workflow run retry"
           ]
         },
         "outcome": {
@@ -195,23 +561,7 @@
           "$ref": "#/$defs/AbsolutePath"
         },
         "workflow": {
-          "oneOf": [
-            {
-              "type": "object",
-              "additionalProperties": false,
-              "required": [
-                "path"
-              ],
-              "properties": {
-                "path": {
-                  "$ref": "#/$defs/RelativePath"
-                }
-              }
-            },
-            {
-              "type": "null"
-            }
-          ]
+          "$ref": "#/$defs/RejectedWorkflow"
         },
         "diagnostics": {
           "type": "array",
@@ -225,7 +575,7 @@
       "if": {
         "properties": {
           "command": {
-            "const": "um workflow retry"
+            "const": "um workflow run retry"
           }
         },
         "required": [
@@ -294,8 +644,10 @@
         },
         "command": {
           "enum": [
-            "um workflow retry",
-            "um workflow continue"
+            "um workflow run retry",
+            "um workflow run resume",
+            "um workflow run restart",
+            "um workflow run upgrade"
           ]
         },
         "outcome": {
@@ -346,7 +698,7 @@
         {
           "properties": {
             "command": {
-              "const": "um workflow retry"
+              "const": "um workflow run retry"
             },
             "phase": {
               "const": "retry"
@@ -356,7 +708,11 @@
         {
           "properties": {
             "command": {
-              "const": "um workflow continue"
+              "enum": [
+                "um workflow run resume",
+                "um workflow run restart",
+                "um workflow run upgrade"
+              ]
             },
             "phase": {
               "const": "continuation"
@@ -482,6 +838,113 @@
         }
       }
     },
+    "SuccessorRefusal": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schemaVersion",
+        "command",
+        "outcome",
+        "exitStatus",
+        "phase",
+        "runDirectory",
+        "workflow",
+        "diagnostics"
+      ],
+      "properties": {
+        "schemaVersion": {
+          "const": 1
+        },
+        "command": {
+          "enum": [
+            "um workflow run restart",
+            "um workflow run upgrade"
+          ]
+        },
+        "outcome": {
+          "const": "rejected"
+        },
+        "exitStatus": {
+          "const": 1
+        },
+        "phase": {
+          "const": "successor"
+        },
+        "runDirectory": {
+          "$ref": "#/$defs/AbsolutePath"
+        },
+        "workflow": {
+          "type": "null"
+        },
+        "diagnostics": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "code",
+              "message"
+            ],
+            "properties": {
+              "code": {
+                "$ref": "#/$defs/Code"
+              },
+              "message": {
+                "$ref": "#/$defs/Message"
+              },
+              "run": {
+                "type": "string",
+                "minLength": 1
+              }
+            }
+          }
+        }
+      }
+    },
+    "UpgradedRun": {
+      "description": "A successor um workflow run upgrade created on the definition's current revision, waiting on its predecessor's wait; no attempt was started.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schemaVersion",
+        "command",
+        "outcome",
+        "exitStatus",
+        "runDirectory",
+        "run",
+        "predecessor",
+        "wait"
+      ],
+      "properties": {
+        "schemaVersion": {
+          "const": 1
+        },
+        "command": {
+          "const": "um workflow run upgrade"
+        },
+        "outcome": {
+          "const": "upgraded"
+        },
+        "exitStatus": {
+          "const": 0
+        },
+        "runDirectory": {
+          "$ref": "#/$defs/AbsolutePath"
+        },
+        "run": {
+          "type": "string",
+          "minLength": 1
+        },
+        "predecessor": {
+          "type": "string",
+          "minLength": 1
+        },
+        "wait": {
+          "$ref": "workflow-view-result-v1.schema.json#/$defs/WaitRecord"
+        }
+      }
+    },
     "ContinuationRefusal": {
       "type": "object",
       "additionalProperties": false,
@@ -500,7 +963,11 @@
           "const": 1
         },
         "command": {
-          "const": "um workflow continue"
+          "enum": [
+            "um workflow run resume",
+            "um workflow run restart",
+            "um workflow run upgrade"
+          ]
         },
         "outcome": {
           "const": "rejected"

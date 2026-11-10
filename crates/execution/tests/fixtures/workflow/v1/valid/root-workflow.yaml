@@ -1,0 +1,78 @@
+# The Sketches engineering root workflow: name, version, subject, the root-only blocks with
+# mirror and optional or defaulted inputs (REQ-WFFORMAT-1, REQ-WFFORMAT-28, REQ-WFFORMAT-82,
+# REQ-WFFORMAT-100, REQ-WFFORMAT-101).
+schemaVersion: 1
+name: engineering
+version: "1.0.0"
+subject: ticket                     # the input whose value is a run's subject (REQ-WFFORMAT-100)
+programs: [scripts]                 # first on PATH for cmd steps and handlers; argv names programs bare
+exclude: [tests/, "**/__pycache__/"] # in the tree, outside the digest and the pinned copy
+
+requires:
+  tools: [git, gh, python3]           # host-provided, probed at admission; harnesses stay probed per step as today
+
+bindings:                           # environment-specific values; every revision carries a snapshot
+  connection:      {kind: connection}                             # locally the operator's credentials; in Cloud a configured connection
+  linearTeam:      {kind: linear.team}
+  ownedState:      {kind: linear.state, default: "Engineering"}   # the one state this lifecycle owns tickets in
+  backlog:         {kind: linear.state, default: "Backlog"}
+  canceled:        {kind: linear.state, default: "Canceled"}
+  done:            {kind: linear.state, default: "Done"}
+  repository:      {kind: github.repository}
+
+triggers:                           # intent; a revision binds it; rules name bindings, never literals
+  start:                              # starts this workflow
+    on:      {source: $connection, event: issue.state_entered,
+              where: "event.team == $linearTeam and event.state == $ownedState"}
+    subject: event.issue.identifier   # one live run per subject per definition; otherwise skipped: subject_busy
+    inputs:
+      ticket:     event.issue.identifier
+      baseBranch: "main"
+  release:                            # leaving the owned state, for any destination, ends ownership
+    on:      {source: $connection, event: issue.state_left,
+              where: "event.team == $linearTeam and event.state == $ownedState"}
+    control:                          # acts on the live run instead of starting one
+      run:    bySubject
+      action: {when: "event.to == $canceled", then: cancel, else: withdraw}
+
+mirror:                             # what Linear sees of a run; every state is a linear.state binding
+  linear:
+    issue: inputs.ticket
+    onStart:   {comment: "Engineering started by {{operator}}. Run: {{run.url}}"}
+    onStage:   {comment: "{{stage}}: {{summary}}"}
+    onWait:    {comment: "Waiting for {{wait.kind}}: {{wait.summary}}"}
+    onOutcome:
+      landed:    {state: $done}
+      withdrawn: {state: $backlog, unless: issue.state != $ownedState}
+      canceled:  {state: $canceled, unless: issue.state != $ownedState}
+      # no superseded: a superseded run is never mirrored, so the ticket stays for its successor
+
+inputs:
+  ticket:
+    kind: text
+  baseBranch:
+    kind: text
+    default: main
+  policy:
+    kind: json
+    default: policy/engineering.json
+  branch:
+    kind: text
+    optional: true
+  answers:
+    kind: json
+    optional: true
+steps:
+  prepare:
+    kind: cmd
+    command:
+      argv: ["sh", "-c", "printf landed > verdict.txt"]
+    outputs:
+      verdict:
+        kind: text
+        from: path
+        path: verdict.txt
+outcomes: [landed, failed]          # the outcomes the mirror maps besides the engine's (REQ-WFFORMAT-87)
+outcome:
+  from: outputs.prepare.verdict
+  onFailure: failed

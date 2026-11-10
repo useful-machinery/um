@@ -369,6 +369,165 @@ fn finalizer_diagnostics_preserve_the_node_role() {
     );
 }
 
+// REQ-WFFORMAT-80, REQ-WFFORMAT-88
+#[test]
+fn outcome_diagnostics_name_the_outcome_location() {
+    let bundle = WorkflowBundle::valid();
+    let workflow = |from: &str, on_failure: &str| {
+        format!(
+            "schemaVersion: 1\noutcomes: [planned, failed]\noutcome: {{ from: {from}, onFailure: {on_failure} }}\nsteps:\n  decide:\n    kind: cmd\n    command: {{ argv: [\"true\"] }}\n    outputs:\n      verdict: {{ kind: text, from: path, path: verdict.txt }}\n  advise:\n    kind: cmd\n    failurePolicy: advisory\n    command: {{ argv: [\"true\"] }}\n    outputs:\n      verdict: {{ kind: text, from: path, path: advice.txt }}\n"
+        )
+    };
+
+    for (source, expected_code) in [
+        (
+            workflow("outputs.decide.verdict", "shipped"),
+            "invalid_outcome_declaration",
+        ),
+        (
+            workflow("outputs.advise.verdict", "failed"),
+            "invalid_outcome_source",
+        ),
+    ] {
+        bundle.replace_workflow(&source);
+        let output = validate(&bundle, true);
+        assert_eq!(output.status.code(), Some(1));
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        let diagnostics = report["diagnostics"].as_array().unwrap();
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0]["code"], expected_code);
+        assert_eq!(diagnostics[0]["location"]["kind"], "outcome");
+    }
+
+    bundle.replace_workflow(&workflow("outputs.decide.verdict", "failed"));
+    assert!(validate(&bundle, true).status.success());
+}
+
+// REQ-WFFORMAT-80, REQ-WFFORMAT-92
+#[test]
+fn edge_diagnostics_name_the_step_and_the_outcome() {
+    let bundle = WorkflowBundle::valid();
+    fs::write(
+        bundle.root.join("design.yaml"),
+        "schemaVersion: 1\noutcomes: [planned, blocked, failed]\noutcome: { from: outputs.decide.verdict, onFailure: failed }\nsteps:\n  decide:\n    kind: cmd\n    command: { argv: [\"true\"] }\n    outputs:\n      verdict: { kind: text, from: path, path: verdict.txt }\n",
+    )
+    .expect("child workflow should be written");
+    bundle.replace_workflow(
+        "schemaVersion: 1\noutcomes: [landed, failed]\nsteps:\n  design:\n    kind: workflow\n    workflow: design.yaml\n    on:\n      planned: exit.landed\n      failed: exit.failed\n",
+    );
+
+    let output = validate(&bundle, true);
+    assert_eq!(output.status.code(), Some(1));
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let diagnostics = report["diagnostics"].as_array().unwrap();
+    assert_eq!(diagnostics.len(), 1);
+    assert_eq!(diagnostics[0]["code"], "edge_outcome_missing");
+    let location = &diagnostics[0]["location"];
+    assert_eq!(location["kind"], "step_edge");
+    assert_eq!(location["step"], "design");
+    assert_eq!(location["outcome"], "blocked");
+
+    bundle.replace_workflow(
+        "schemaVersion: 1\noutcomes: [landed, failed]\nsteps:\n  design:\n    kind: workflow\n    workflow: design.yaml\n    on:\n      planned:\n        wait: approval\n        then: exit.landed\n      blocked: exit.failed\n      failed: exit.failed\n",
+    );
+    let output = validate(&bundle, true);
+    assert_eq!(output.status.code(), Some(1));
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let diagnostics = report["diagnostics"].as_array().unwrap();
+    assert_eq!(diagnostics.len(), 1);
+    assert_eq!(diagnostics[0]["code"], "wait_hand_back_required");
+    let location = &diagnostics[0]["location"];
+    assert_eq!(location["kind"], "step_edge");
+    assert_eq!(location["step"], "design");
+    assert_eq!(location["outcome"], "planned");
+}
+
+// REQ-WFFORMAT-98, REQ-WFFORMAT-99
+#[test]
+fn for_each_diagnostics_name_the_step_and_its_input() {
+    let bundle = WorkflowBundle::valid();
+    let child = |outcomes: &str, inputs: &str| {
+        format!(
+            "schemaVersion: 1\n{inputs}outcomes: [{outcomes}]\noutcome: {{ from: outputs.decide.verdict, onFailure: failed }}\nsteps:\n  decide:\n    kind: cmd\n    command: {{ argv: [\"true\"] }}\n    outputs:\n      verdict: {{ kind: text, from: path, path: verdict.txt }}\n      plan: {{ kind: text, from: path, path: plan.txt }}\nexports:\n  plan: {{ ref: outputs.decide.plan }}\n"
+        )
+    };
+    fs::write(
+        bundle.root.join("design.yaml"),
+        child("planned, failed", ""),
+    )
+    .expect("child workflow should be written");
+    fs::write(
+        bundle.root.join("build.yaml"),
+        child(
+            "built, failed",
+            "inputs:\n  part: { kind: text, optional: true }\n",
+        ),
+    )
+    .expect("child workflow should be written");
+    let root = |for_each: &str| {
+        format!(
+            "schemaVersion: 1\ninputs:\n  parts: {{ kind: json }}\noutcomes: [landed, failed]\nsteps:\n  design:\n    kind: workflow\n    workflow: design.yaml\n    on:\n      planned: build\n      failed: exit.failed\n  build:\n    kind: workflow\n    workflow: build.yaml\n{for_each}    inputs:\n      part: {{ ref: item }}\n    on:\n      built: exit.landed\n      failed: exit.failed\n"
+        )
+    };
+
+    for (for_each, code, location) in [
+        (
+            "    forEach: outputs.design.plan\n",
+            "for_each_reference_invalid",
+            serde_json::json!({ "kind": "step_for_each", "step": "build" }),
+        ),
+        (
+            "    forEach: { items: inputs.parts, empty: shipped }\n",
+            "for_each_empty_undeclared",
+            serde_json::json!({ "kind": "step_for_each", "step": "build" }),
+        ),
+        (
+            "",
+            "item_reference_requires_for_each",
+            serde_json::json!({ "kind": "step_input", "step": "build", "input": "part" }),
+        ),
+    ] {
+        bundle.replace_workflow(&root(for_each));
+        let output = validate(&bundle, true);
+        assert_eq!(output.status.code(), Some(1), "{for_each}");
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        let diagnostics = report["diagnostics"].as_array().unwrap();
+        assert_eq!(diagnostics.len(), 1, "{report}");
+        assert_eq!(diagnostics[0]["code"], code, "{report}");
+        assert_eq!(diagnostics[0]["location"], location, "{report}");
+    }
+
+    bundle.replace_workflow(&root(
+        "    forEach: { items: inputs.parts, empty: built }\n",
+    ));
+    assert!(validate(&bundle, true).status.success());
+}
+
+// REQ-WFFORMAT-97
+#[test]
+fn an_external_wait_without_a_rule_is_reported_at_its_edge() {
+    let bundle = WorkflowBundle::valid();
+    fs::write(
+        bundle.root.join("merge.yaml"),
+        "schemaVersion: 1\noutcomes: [admitted, landed, failed]\noutcome: { from: outputs.decide.verdict, onFailure: failed }\nsteps:\n  decide:\n    kind: cmd\n    command: { argv: [\"true\"] }\n    outputs:\n      verdict: { kind: text, from: path, path: verdict.txt }\n",
+    )
+    .expect("child workflow should be written");
+    bundle.replace_workflow(
+        "schemaVersion: 1\noutcomes: [landed, failed]\nsteps:\n  merge:\n    kind: workflow\n    workflow: merge.yaml\n    on:\n      admitted:\n        wait: external\n        then: merge\n      landed: exit.landed\n      failed: exit.failed\n",
+    );
+
+    let output = validate(&bundle, true);
+    assert_eq!(output.status.code(), Some(1));
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let diagnostics = report["diagnostics"].as_array().unwrap();
+    assert_eq!(diagnostics.len(), 1);
+    assert_eq!(diagnostics[0]["code"], "wait_rule_required");
+    let location = &diagnostics[0]["location"];
+    assert_eq!(location["kind"], "step_edge");
+    assert_eq!(location["step"], "merge");
+    assert_eq!(location["outcome"], "admitted");
+}
+
 // REQ-WFFORMAT-6, REQ-WFFORMAT-17, REQ-WFFORMAT-18, REQ-WFFORMAT-38, REQ-WFFORMAT-55, REQ-WFFORMAT-56, REQ-WFFORMAT-57, REQ-WFFORMAT-67, REQ-WFFORMAT-69, REQ-WFFORMAT-70, REQ-WFFORMAT-72, REQ-WFFORMAT-76, REQ-WFFORMAT-77
 // REQ-WFFORMAT-71
 #[test]
@@ -670,4 +829,46 @@ fn agent_profile_replacement_is_applied_and_reported_without_retention() {
         report["diagnostics"][0]["location"],
         serde_json::json!({"kind": "agent_profile_replacement", "profile": "missing"})
     );
+}
+
+// REQ-WFFORMAT-24, REQ-WFFORMAT-68, REQ-WFFORMAT-84
+#[test]
+fn optional_and_defaulted_inputs_are_not_required_and_a_default_file_joins_the_digest() {
+    let bundle = WorkflowBundle::valid();
+    bundle.replace_workflow(
+        r#"schemaVersion: 1
+inputs:
+  ticket: {kind: text}
+  baseBranch: {kind: text, default: main}
+  policy: {kind: json, default: policy/engineering.json}
+  branch: {kind: text, optional: true}
+steps:
+  work:
+    kind: cmd
+    command:
+      argv: ["true"]
+"#,
+    );
+    let policy = bundle.root.join("workflows/policy/engineering.json");
+    fs::create_dir_all(policy.parent().unwrap()).expect("policy directory should exist");
+    fs::write(&policy, br#"{"reviewers": 1}"#).expect("policy should be written");
+
+    let digest = |bundle: &WorkflowBundle| {
+        let json = validate(bundle, true);
+        assert!(
+            json.status.success(),
+            "stdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&json.stdout),
+            String::from_utf8_lossy(&json.stderr)
+        );
+        let report: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
+        assert_eq!(
+            report["requiredInputs"],
+            serde_json::json!({"ticket": "text"})
+        );
+        report["digest"]["value"].clone()
+    };
+    let first = digest(&bundle);
+    fs::write(&policy, br#"{"reviewers": 2}"#).expect("policy should be rewritten");
+    assert_ne!(digest(&bundle), first);
 }

@@ -649,6 +649,7 @@ fn build_context(
             kind: match definition {
                 ValidatedStep::Command(_) => "cmd",
                 ValidatedStep::Agent(_) => "agent",
+                ValidatedStep::Workflow(_) => "workflow",
             }
             .to_owned(),
             failure_policy: match common_failure_policy(definition) {
@@ -666,17 +667,11 @@ fn build_context(
 }
 
 fn common_failure_policy(step: &ValidatedStep) -> FailurePolicy {
-    match step {
-        ValidatedStep::Command(command) => command.common.failure_policy,
-        ValidatedStep::Agent(agent) => agent.common.failure_policy,
-    }
+    step.common().failure_policy
 }
 
 fn common_cwd(step: &ValidatedStep) -> Option<&str> {
-    match step {
-        ValidatedStep::Command(command) => command.common.cwd.as_deref(),
-        ValidatedStep::Agent(agent) => agent.common.cwd.as_deref(),
-    }
+    step.common().cwd.as_deref()
 }
 
 fn prior_round(

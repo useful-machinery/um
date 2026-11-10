@@ -1,0 +1,11 @@
+schemaVersion: 1
+steps:
+  prepare:
+    kind: cmd
+    command:
+      argv: ["true"]
+inputs:
+  baseBranch:
+    kind: text
+    optional: true
+    default: main

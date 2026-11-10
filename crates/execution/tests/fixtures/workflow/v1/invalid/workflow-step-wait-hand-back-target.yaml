@@ -1,0 +1,17 @@
+schemaVersion: 1
+steps:
+  review:
+    kind: workflow
+    workflow: review.yaml
+    on:
+      approve:
+        wait: approval
+        then: merge
+        onHandBack: exit.failed
+      failed: exit.failed
+  merge:
+    kind: workflow
+    workflow: merge.yaml
+    on:
+      succeeded: exit.succeeded
+      failed: exit.failed
