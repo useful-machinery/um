@@ -917,6 +917,7 @@ mod tests {
         assert_eq!(retained["rejectedLine"]["text"], "not-json");
         assert_eq!(retained["precedingLines"][0]["text"], init.to_string());
         assert_eq!(retained["trackedWork"]["backgroundCommands"], json!([]));
+        assert_eq!(retained["trackedWork"]["subagentTasks"], json!([]));
 
         // The largest excerpt the profile admits, every byte escaped, is still written.
         let limits = ClaudeCodeStreamJsonV1ProtocolLimits::profile();

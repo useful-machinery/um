@@ -1447,6 +1447,7 @@ fn a_refused_init_records_the_tracked_work_the_parser_held() {
             "subagents": [{"taskId": "t2", "agentCallId": "agent-2", "toolUseId": "agent-2",
                 "runId": "run-2", "backgrounded": true, "notified": false}],
             "forgottenSubagents": ["t1"],
+            "subagentTasks": [{"taskId": "sub-task", "backgrounded": false, "notified": true}],
             "truncated": false,
         })
     );
@@ -2196,6 +2197,268 @@ fn a_messaged_subagent_resumed_again_in_the_drain_for_its_commands_report_stays_
     let mut parser = parser(AgentValueKind::Response, 1024);
     parser.push_stdout(&framed(&values), drop).unwrap();
     assert_eq!(parser.carried_notifications, Vec::<u64>::new());
+}
+
+/// `resumed_subagent_transcript` up to the notified turn's `init`, the messaged run having
+/// started its own backgrounded command (`subagent_backgrounded_bash_run`) before its
+/// closing text: the run's notification, the interim stop Claude Code 2.1.310 reports as
+/// "waiting on its own background work", arrives with `sub-watch-task` running.
+fn messaged_subagent_stopping_with_its_own_work_running() -> Vec<Value> {
+    let mut values = resumed_subagent_transcript();
+    let closing_text = position_of(&values, |value| value["message"]["id"] == "msg-sub-3");
+    values.splice(closing_text..closing_text, subagent_backgrounded_bash_run());
+    values.truncate(last_init(&values));
+    values
+}
+
+/// The notified turn as the JOSH-10 build leads waited it (AUTO-297): text, Claude Code's
+/// enforcement nag, text again, and a `result` without `structured_output`.
+fn turn_waiting_for_the_subagent() -> Vec<Value> {
+    let mut values = vec![init(QUALIFICATION_VERSION, SESSION_ID)];
+    values.extend(text_message("still-waiting", &["still waiting"], true));
+    values.push(enforcement_nag());
+    values.extend(text_message("not-submitting", &["waiting"], true));
+    values.push(result(SESSION_ID));
+    values
+}
+
+// REQ-AGENT-80, REQ-AGENT-31, REQ-AGENT-64, REQ-AGENT-69, INV-HARNESS-14 (AUTO-297)
+#[test]
+fn a_turn_that_waits_for_a_subagents_own_background_work_holds_the_step() {
+    let stopped = framed(&messaged_subagent_stopping_with_its_own_work_running());
+    let waiting = framed(&turn_waiting_for_the_subagent());
+    let mut report = leftover_command_report().to_vec();
+    report.push(system_event(
+        "background_tasks_changed",
+        json!({"tasks": []}),
+    ));
+    let report = framed(&report);
+    let resume = framed(&harness_resume_delivering_the_report("agent-run-3"));
+    let submission = framed(&structured_output_exchange_after(&[]));
+    let candidate = Some(CompletedResultExchange::Candidate(Arc::new(json!(7))));
+
+    // The waiting turn holds the step; the command's report, Claude Code's own resume and
+    // the report run's notification wake the turn that submits.
+    let mut held = parser(AgentValueKind::Result, 1024);
+    let mut observations = Vec::new();
+    for bytes in [&stopped, &waiting] {
+        held.push_stdout(bytes, |observation| observations.push(observation))
+            .unwrap();
+    }
+    assert_eq!(held.take_completed_result_exchange(), None);
+    for bytes in [&report, &resume, &submission] {
+        held.push_stdout(bytes, |observation| observations.push(observation))
+            .unwrap();
+    }
+    assert_eq!(held.take_completed_result_exchange(), candidate);
+    held.accept_result(CapturedJson::fixture(Arc::new(json!(7))))
+        .unwrap();
+    assert!(matches!(
+        held.finish(true),
+        AgentOutcome::Completed(CompletedAgentInvocation::Result(_))
+    ));
+    assert!(
+        subagent_statuses(&observations)
+            .ends_with(&[String::from("resumed"), String::from("completed")]),
+        "{:?}",
+        subagent_statuses(&observations)
+    );
+    // Result mode observes the enforcement nag's text frame; nothing else is unrecognized.
+    assert_eq!(unrecognized_events(&observations), [&enforcement_nag()]);
+
+    // A stream that ends while the wait is held is the outstanding-work failure, and its
+    // record names the subagent's task the wait was held on.
+    let mut cut = parser(AgentValueKind::Result, 1024);
+    for bytes in [&stopped, &waiting] {
+        cut.push_stdout(bytes, drop).unwrap();
+    }
+    assert_eq!(cut.take_completed_result_exchange(), None);
+    let outcome = cut.finish(true);
+    assert_eq!(
+        protocol_rejection_value(&outcome)["detail"]["reason"],
+        "end_of_stream_invariant_invalid"
+    );
+    let AgentOutcome::Failed(failure) = &outcome else {
+        panic!("the cut stream must fail, got {outcome:?}");
+    };
+    let tracked = serde_json::to_value(failure.tracked_work().unwrap()).unwrap();
+    assert!(
+        tracked["subagentTasks"].as_array().unwrap().contains(
+            &json!({"taskId": "sub-watch-task", "backgrounded": true, "notified": false})
+        ),
+        "{tracked}"
+    );
+
+    // Once the subagent's task has reported, the same turn has nothing to wait for.
+    let mut reported = parser(AgentValueKind::Result, 1024);
+    let mut leftover_reported = messaged_subagent_stopping_with_its_own_work_running();
+    leftover_reported.extend(leftover_command_report());
+    for bytes in [&framed(&leftover_reported), &waiting] {
+        reported.push_stdout(bytes, drop).unwrap();
+    }
+    assert_eq!(
+        reported.take_completed_result_exchange(),
+        Some(CompletedResultExchange::MissingCandidate)
+    );
+
+    // A candidate submitted while only the subagent's own task runs is decided as with
+    // nothing outstanding.
+    let mut submitted = parser(AgentValueKind::Result, 1024);
+    for bytes in [&stopped, &submission] {
+        submitted.push_stdout(bytes, drop).unwrap();
+    }
+    assert_eq!(submitted.take_completed_result_exchange(), candidate);
+
+    // A wakeup the agent scheduled begins a turn while the wait is held.
+    let mut wakeup_turn = vec![command_lifecycle("started")];
+    wakeup_turn.extend(text_turn("wakeup", "still waiting"));
+    wakeup_turn.push(command_lifecycle("completed"));
+    let mut woken = parser(AgentValueKind::Result, 1024);
+    let mut observations = Vec::new();
+    for bytes in [&stopped, &waiting, &framed(&wakeup_turn)] {
+        woken
+            .push_stdout(bytes, |observation| observations.push(observation))
+            .unwrap();
+        assert_eq!(woken.take_completed_result_exchange(), None);
+    }
+    assert_eq!(unrecognized_events(&observations), [&enforcement_nag()]);
+
+    // A step that returns a response completes on the turn's end, as before.
+    let mut response = parser(AgentValueKind::Response, 1024);
+    let mut observations = Vec::new();
+    for bytes in [
+        &stopped,
+        &framed(&text_turn("waiting-turn", "still waiting")),
+    ] {
+        response
+            .push_stdout(bytes, |observation| observations.push(observation))
+            .unwrap();
+    }
+    assert_eq!(
+        milestone_count(&observations, AgentLifecycleMilestone::HarnessCompleted),
+        1
+    );
+}
+
+/// Feeds a Result-mode parser `before`, then `turn` up to its closing `result`, then that
+/// `result`; returns the observations the `result` alone yielded and the exchange it ended.
+fn the_turns_result_reported(
+    before: &[Value],
+    turn: &[Value],
+) -> (Vec<AgentObservation>, Option<CompletedResultExchange>) {
+    let (closing, opening) = turn.split_last().unwrap();
+    let mut parser = parser(AgentValueKind::Result, 1024);
+    parser.push_stdout(&framed(before), drop).unwrap();
+    parser.push_stdout(&framed(opening), drop).unwrap();
+    let mut observations = Vec::new();
+    parser
+        .push_stdout(&framed(std::slice::from_ref(closing)), |observation| {
+            observations.push(observation)
+        })
+        .unwrap();
+    (observations, parser.take_completed_result_exchange())
+}
+
+// REQ-AGENT-81 (AUTO-297)
+#[test]
+fn a_missing_result_and_a_held_wait_are_reported_as_activity() {
+    let waiting = turn_waiting_for_the_subagent();
+
+    // The held wait says so, with the count of the subagent's tasks it waits on.
+    let (observations, exchange) = the_turns_result_reported(
+        &messaged_subagent_stopping_with_its_own_work_running(),
+        &waiting,
+    );
+    assert_eq!(exchange, None);
+    let [wait] = information_diagnostics(&observations)[..] else {
+        panic!("a held wait must yield one information diagnostic: {observations:?}");
+    };
+    assert!(wait.contains('1'), "{wait:?}");
+    assert_eq!(warning_diagnostics(&observations), Vec::<&str>::new());
+
+    // Once the subagent's task has reported, the same turn is a missing result, warned.
+    let mut reported = messaged_subagent_stopping_with_its_own_work_running();
+    reported.extend(leftover_command_report());
+    let (observations, exchange) = the_turns_result_reported(&reported, &waiting);
+    assert_eq!(exchange, Some(CompletedResultExchange::MissingCandidate));
+    assert_eq!(
+        warning_diagnostics(&observations).len(),
+        1,
+        "{observations:?}"
+    );
+
+    // So is a first turn that ends without a candidate and with no work at all.
+    let (observations, exchange) = the_turns_result_reported(&[], &text_turn("plain", "no result"));
+    assert_eq!(exchange, Some(CompletedResultExchange::MissingCandidate));
+    assert_eq!(
+        warning_diagnostics(&observations).len(),
+        1,
+        "{observations:?}"
+    );
+    assert_eq!(information_diagnostics(&observations), Vec::<&str>::new());
+}
+
+// REQ-AGENT-80, INV-HARNESS-14 (AUTO-297)
+#[test]
+fn each_announcement_that_a_subagents_task_runs_in_the_background_holds_the_wait() {
+    let waiting = turn_waiting_for_the_subagent();
+    let is_start =
+        |value: &Value| value["subtype"] == "task_started" && value["task_id"] == "sub-watch-task";
+    let is_tool_result =
+        |value: &Value| value["tool_use_result"]["backgroundTaskId"] == "sub-watch-task";
+    let decided = |edit: &dyn Fn(&mut Vec<Value>)| {
+        let mut stopped = messaged_subagent_stopping_with_its_own_work_running();
+        edit(&mut stopped);
+        the_turns_result_reported(&stopped, &waiting).1
+    };
+    // The subagent's command as one it started in the foreground, whose tool result names
+    // no background task; returns where its start stands.
+    let started_in_the_foreground = |values: &mut Vec<Value>| {
+        let start = position_of(values, is_start);
+        values[start]["is_backgrounded"] = json!(false);
+        let tool_result = position_of(values, is_tool_result);
+        values[tool_result]
+            .as_object_mut()
+            .unwrap()
+            .remove("tool_use_result");
+        start
+    };
+
+    // The start's `is_backgrounded: true` alone.
+    assert_eq!(
+        decided(&|values| values.retain(|value| !is_tool_result(value))),
+        None
+    );
+    // The subagent's tool result naming `backgroundTaskId` alone, no start having
+    // introduced the task.
+    assert_eq!(
+        decided(&|values| values.retain(|value| !is_start(value))),
+        None
+    );
+    // A `task_updated` patch moving a command the subagent started in the foreground, the
+    // two-minute promotion.
+    assert_eq!(
+        decided(&|values| {
+            let start = started_in_the_foreground(values);
+            values.insert(
+                start + 1,
+                system_event(
+                    "task_updated",
+                    json!({"task_id": "sub-watch-task", "run_id": "sub-watch-run",
+                        "patch": {"is_backgrounded": true}}),
+                ),
+            );
+        }),
+        None
+    );
+    // A command that stays in the foreground never holds the wait: it may send no
+    // notification of its own.
+    assert_eq!(
+        decided(&|values| {
+            started_in_the_foreground(values);
+        }),
+        Some(CompletedResultExchange::MissingCandidate)
+    );
 }
 
 /// The turn Claude Code 2.1.310 opens for the messaged run's queued notification when it

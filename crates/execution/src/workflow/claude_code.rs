@@ -506,8 +506,9 @@ pub(crate) struct OutstandingWork {
     pub(crate) subagents: bool,
 }
 
-/// The background commands and subagents the parser held when it refused a frame, and the
-/// subagents an earlier wakeup `init` forgot, by identity: the wait the parser expected.
+/// The background commands and subagents the parser held when it refused a frame, the
+/// subagents an earlier wakeup `init` forgot, and the subagents' own tasks it knew, by
+/// identity: the wait the parser expected.
 /// Retained beside the protocol rejection in `protocol-rejection.json` on the runner host
 /// only (REQ-AGENT-74); never projected into a frame, a run or a published result
 /// (REQ-DIAG-39). Each list keeps its newest `MAXIMUM_RETAINED_TRACKED_WORK` entries.
@@ -517,6 +518,7 @@ pub(crate) struct ClaudeCodeStreamJsonV1TrackedWork {
     background_commands: Vec<ClaudeCodeStreamJsonV1TrackedCommand>,
     subagents: Vec<ClaudeCodeStreamJsonV1TrackedSubagent>,
     forgotten_subagents: Vec<String>,
+    subagent_tasks: Vec<ClaudeCodeStreamJsonV1TrackedSubagentTask>,
     truncated: bool,
 }
 
@@ -541,6 +543,16 @@ pub(crate) struct ClaudeCodeStreamJsonV1TrackedSubagent {
     tool_use_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     run_id: Option<String>,
+    backgrounded: bool,
+    notified: bool,
+}
+
+/// A subagent's own task: never outstanding work of the invocation, but a backgrounded one
+/// that has not reported holds a Result-mode waiting turn (REQ-AGENT-80).
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ClaudeCodeStreamJsonV1TrackedSubagentTask {
+    task_id: String,
     backgrounded: bool,
     notified: bool,
 }
@@ -596,6 +608,26 @@ struct BackgroundCommand {
 
 impl BackgroundCommand {
     fn awaits_notification(&self) -> bool {
+        self.backgrounded && !self.notified
+    }
+}
+
+/// A task a subagent started for itself (`task_started owned_by_subagent: true`), or one
+/// its own tool result names as `backgroundTaskId`. It is the subagent's work, never
+/// outstanding work of the invocation (REQ-AGENT-64); a backgrounded one that has not
+/// reported is what a Result-mode turn that ends without a candidate waits on
+/// (REQ-AGENT-80). A foreground one never counts: it may send no notification of its own.
+struct SubagentTask {
+    task_id: Arc<str>,
+    /// Started with `is_backgrounded: true`, or moved by a `task_updated` patch or by the
+    /// subagent's tool result naming it as `backgroundTaskId`.
+    backgrounded: bool,
+    /// Its `task_notification` arrived, whatever its status: the task is over.
+    notified: bool,
+}
+
+impl SubagentTask {
+    fn running_in_background(&self) -> bool {
         self.backgrounded && !self.notified
     }
 }
@@ -705,10 +737,18 @@ pub(crate) struct ClaudeCodeStreamJsonV1Parser {
     /// that a later message to one, or the harness's own resume, reopens it under the Agent
     /// call its messages still name (REQ-AGENT-64).
     forgotten_subagents: Vec<Subagent>,
-    /// Task ids that `task_started owned_by_subagent: true` introduced (newest last, at most
-    /// `MAXIMUM_TRACKED_TASKS`): a subagent's own work stays its work after the subagent
-    /// settles, so a command it left running is silent wherever its events land.
-    subagent_owned_tasks: Vec<Arc<str>>,
+    /// Tasks that `task_started owned_by_subagent: true` or a subagent's own tool result
+    /// introduced (newest last, at most `MAXIMUM_TRACKED_TASKS`): a subagent's own work
+    /// stays its work after the subagent settles, so a command it left running is silent
+    /// wherever its events land, and one still running in the background holds a
+    /// Result-mode waiting turn (`subagent_work_wait`).
+    subagent_owned_tasks: Vec<SubagentTask>,
+    /// A Result-mode `result` without `structured_output` left nothing the step started
+    /// outstanding while a subagent's own backgrounded task had not reported: the agent
+    /// ended its turn to wait for it, and the exchange ended with no decision
+    /// (REQ-AGENT-80, INV-HARNESS-14). The next `init` clears it; until then a scheduled
+    /// wakeup's `started` is a wakeup and a stream that ends is invalid.
+    subagent_work_wait: bool,
     /// Task ids whose `task_started` named a `task_type` the parser does not model, neither
     /// `local_bash` nor `local_agent` (newest last, at most `MAXIMUM_TRACKED_TASKS`): every
     /// later frame naming one is its activity, unrecognized and never a protocol failure,
@@ -840,6 +880,7 @@ impl ClaudeCodeStreamJsonV1Parser {
             subagents: Vec::new(),
             forgotten_subagents: Vec::new(),
             subagent_owned_tasks: Vec::new(),
+            subagent_work_wait: false,
             unmodeled_tasks: Vec::new(),
             observed_unrecognized_kinds: Vec::new(),
             active_message: None,
@@ -1076,7 +1117,8 @@ impl ClaudeCodeStreamJsonV1Parser {
         }
         // Once the value has settled, work Claude Code's exit abandons is reported by
         // `abandoned_work_warnings` and the value stands (REQ-AGENT-76).
-        if self.awaits_background_work() && !self.value_settled {
+        // A held wait is outstanding work of its own here, and only here (REQ-AGENT-80).
+        if (self.awaits_background_work() || self.subagent_work_wait) && !self.value_settled {
             return self.end_of_stream_invariant_failure();
         }
         if !exit_success {
@@ -1191,6 +1233,8 @@ impl ClaudeCodeStreamJsonV1Parser {
                 } else {
                     self.begin_turn()?;
                 }
+                // The turn the wait was held for has begun (REQ-AGENT-80).
+                self.subagent_work_wait = false;
                 self.announced_exchange = announced;
                 // Claude Code keeps one queue of pending inputs, notifications and the
                 // adapter's prompt alike, and opens one turn per item it dequeues: this
@@ -1305,11 +1349,15 @@ impl ClaudeCodeStreamJsonV1Parser {
 
     /// A wakeup the agent scheduled runs as a queued command: `started` precedes its
     /// `init` and `completed` follows its turn's `result`. Only a `started` frame arriving
-    /// after the exchange ended while background work keeps the harness alive is a
-    /// wakeup; any other lifecycle frame stays unrecognized.
+    /// after the exchange ended while background work keeps the harness alive, or while a
+    /// Result-mode turn waits on a subagent's own work (REQ-AGENT-80), is a wakeup; any
+    /// other lifecycle frame stays unrecognized.
     fn parse_command_lifecycle(&mut self, object: &Map<String, Value>, value: &Value) {
         match required_string(object, "state") {
-            Some("started") if !self.exchange_active && self.awaits_background_work() => {
+            Some("started")
+                if !self.exchange_active
+                    && (self.awaits_background_work() || self.subagent_work_wait) =>
+            {
                 if !self.scheduled_wakeup_pending {
                     self.scheduled_wakeup_pending = true;
                     self.observations.push(AgentObservation::Diagnostic {
@@ -2289,7 +2337,11 @@ impl ClaudeCodeStreamJsonV1Parser {
                 .and_then(|result| required_nonempty_string(result, task_field));
             if parent.is_some() {
                 // A subagent's tool result settles the subagent's own call; a task it
-                // names is the subagent's work, never a command this invocation tracks.
+                // names is the subagent's work, never a command this invocation tracks,
+                // and runs in the background now (REQ-AGENT-80).
+                if let Some(task_id) = background_task_id {
+                    self.background_subagent_task(task_id);
+                }
             } else if call_kind == Some(CommandCallKind::TaskStop) {
                 if !is_error {
                     self.settle_stopped_command(object);
@@ -2517,6 +2569,7 @@ impl ClaudeCodeStreamJsonV1Parser {
                     .find(|task| task.task_id.as_ref() == task_id)
                 else {
                     if subagent_work {
+                        self.update_subagent_task(object, task_id);
                         return Ok(());
                     }
                     if self.exchange_active || self.is_unmodeled_task(task_id) {
@@ -2531,10 +2584,7 @@ impl ClaudeCodeStreamJsonV1Parser {
                 if required_string(object, "subtype") == Some("task_updated") {
                     // The harness moves a foreground command to the background when it
                     // outlives the foreground timeout; the patch is the only announcement.
-                    if required_object(object, "patch")
-                        .and_then(|patch| required_bool(patch, "is_backgrounded"))
-                        == Some(true)
-                    {
+                    if patch_moves_to_background(object) {
                         task.backgrounded = true;
                     }
                     return Ok(());
@@ -2674,12 +2724,68 @@ impl ClaudeCodeStreamJsonV1Parser {
         })
     }
 
-    /// Keeps the task id a `task_started owned_by_subagent: true` introduced, so that the
-    /// subagent's own work stays its work after the subagent settles.
+    /// Keeps the task a `task_started owned_by_subagent: true` introduced, with whether it
+    /// starts in the background, so that the subagent's own work stays its work after the
+    /// subagent settles.
     fn remember_subagent_work(&mut self, object: &Map<String, Value>) {
         if let Some(task_id) = self.untracked_task_id(object) {
-            remember_task_id(&mut self.subagent_owned_tasks, task_id);
+            let backgrounded = required_bool(object, "is_backgrounded") == Some(true);
+            self.subagent_task(task_id).backgrounded |= backgrounded;
         }
+    }
+
+    /// A subagent's own tool result names `task_id` as its `backgroundTaskId`: the task runs
+    /// in the background, introduced here when no start announced it.
+    fn background_subagent_task(&mut self, task_id: &str) {
+        if !self.tracks_task(task_id) {
+            self.subagent_task(task_id).backgrounded = true;
+        }
+    }
+
+    /// A `task_updated` or `task_notification` naming a subagent's own task: a patch moving
+    /// it to the background marks it so, and its notification, whatever its status, ends it.
+    /// A frame naming no known task introduces nothing.
+    fn update_subagent_task(&mut self, object: &Map<String, Value>, task_id: &str) {
+        let notification = required_string(object, "subtype") == Some("task_notification");
+        let moved = patch_moves_to_background(object);
+        if let Some(task) = self
+            .subagent_owned_tasks
+            .iter_mut()
+            .find(|task| task.task_id.as_ref() == task_id)
+        {
+            task.backgrounded |= moved;
+            task.notified |= notification;
+        }
+    }
+
+    /// The subagent's own task `task_id`, kept newest last, at most `MAXIMUM_TRACKED_TASKS`:
+    /// an evicted task simply stops holding a wait.
+    fn subagent_task(&mut self, task_id: &str) -> &mut SubagentTask {
+        let index = match self
+            .subagent_owned_tasks
+            .iter()
+            .position(|task| task.task_id.as_ref() == task_id)
+        {
+            Some(index) => index,
+            None => {
+                self.subagent_owned_tasks.push(SubagentTask {
+                    task_id: Arc::from(task_id),
+                    backgrounded: false,
+                    notified: false,
+                });
+                keep_newest(&mut self.subagent_owned_tasks);
+                self.subagent_owned_tasks.len() - 1
+            }
+        };
+        &mut self.subagent_owned_tasks[index]
+    }
+
+    /// The subagents' own tasks still running in the background.
+    fn subagent_tasks_running(&self) -> usize {
+        self.subagent_owned_tasks
+            .iter()
+            .filter(|task| task.running_in_background())
+            .count()
     }
 
     /// Records the start of a task of a kind the parser does not model as unrecognized and
@@ -2713,7 +2819,7 @@ impl ClaudeCodeStreamJsonV1Parser {
             && (self
                 .subagent_owned_tasks
                 .iter()
-                .any(|known| known.as_ref() == task_id)
+                .any(|known| known.task_id.as_ref() == task_id)
                 || self.subagents.iter().any(Subagent::awaits_notification))
     }
 
@@ -3060,9 +3166,7 @@ impl ClaudeCodeStreamJsonV1Parser {
             return Err(self.protocol_failure());
         };
         if required_string(object, "subtype") != Some("task_notification") {
-            let moved = required_object(object, "patch")
-                .and_then(|patch| required_bool(patch, "is_backgrounded"))
-                == Some(true)
+            let moved = patch_moves_to_background(object)
                 && required_nonempty_string(object, "run_id")
                     == self.subagents[index].run_id.as_deref();
             if moved {
@@ -3257,7 +3361,36 @@ impl ClaudeCodeStreamJsonV1Parser {
             let exchange = if !successful {
                 Some(CompletedResultExchange::NativeFailure)
             } else if !self.awaits_background_work() {
-                Some(self.extract_result_candidate(object))
+                let running = self.subagent_tasks_running();
+                if !object.contains_key("structured_output") && running > 0 {
+                    // The agent ended its turn to wait for a subagent's own background
+                    // work: the step's own work is done, so this is no premature candidate
+                    // and no missing one; the exchange ends with no decision and the next
+                    // turn is the one Claude Code's resume of the subagent announces
+                    // (REQ-AGENT-80, INV-HARNESS-14). The activity says so, closed text
+                    // and a count (REQ-AGENT-81).
+                    self.subagent_work_wait = true;
+                    self.observations.push(AgentObservation::Diagnostic {
+                        level: AgentDiagnosticLevel::Information,
+                        message: Arc::from(format!(
+                            "waiting for a subagent's background tasks: {running} running"
+                        )),
+                    });
+                    None
+                } else {
+                    let exchange = self.extract_result_candidate(object);
+                    if exchange == CompletedResultExchange::MissingCandidate {
+                        // The adapter closes stdin on this report: say why before the step
+                        // fails `missing_result` (REQ-AGENT-81).
+                        self.observations.push(AgentObservation::Diagnostic {
+                            level: AgentDiagnosticLevel::Warning,
+                            message: Arc::from(
+                                "turn ended with no structured result and nothing outstanding",
+                            ),
+                        });
+                    }
+                    Some(exchange)
+                }
             } else if object.contains_key("structured_output") {
                 Some(CompletedResultExchange::PrematureCandidate(
                     self.outstanding_work(),
@@ -3507,11 +3640,20 @@ impl ClaudeCodeStreamJsonV1Parser {
             newest_tracked(&self.forgotten_subagents, |subagent| {
                 tracked_work_id(&subagent.task_id)
             });
+        let (subagent_tasks, subagent_tasks_cut) =
+            newest_tracked(&self.subagent_owned_tasks, |task| {
+                ClaudeCodeStreamJsonV1TrackedSubagentTask {
+                    task_id: tracked_work_id(&task.task_id),
+                    backgrounded: task.backgrounded,
+                    notified: task.notified,
+                }
+            });
         ClaudeCodeStreamJsonV1TrackedWork {
             background_commands,
             subagents,
             forgotten_subagents,
-            truncated: commands_cut || subagents_cut || forgotten_cut,
+            subagent_tasks,
+            truncated: commands_cut || subagents_cut || forgotten_cut || subagent_tasks_cut,
         }
     }
 
@@ -4099,6 +4241,13 @@ fn required_bool(object: &Map<String, Value>, key: &str) -> Option<bool> {
 /// Whether a task start or task-list entry names a `task_type` the parser does not model:
 /// neither a shell command (`local_bash`, which a `Monitor` call's task also is) nor a
 /// subagent (`local_agent`).
+/// Whether a `task_updated` frame's patch moves its task to the background
+/// (`patch.is_backgrounded: true`), the only announcement of the move.
+fn patch_moves_to_background(object: &Map<String, Value>) -> bool {
+    required_object(object, "patch").and_then(|patch| required_bool(patch, "is_backgrounded"))
+        == Some(true)
+}
+
 fn unmodeled_task_type(object: &Map<String, Value>) -> bool {
     !matches!(
         required_string(object, "task_type"),
