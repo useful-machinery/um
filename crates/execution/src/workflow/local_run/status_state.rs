@@ -19,6 +19,20 @@ pub struct LocalStatusStateView {
 }
 
 impl LocalStatusStateView {
+    /// Whether the current attempt is a successful repair started after the parent's wait.
+    /// Compare parsed timestamps because canonical UTC permits varying fractional precision.
+    pub fn succeeded_after(&self, since: &str) -> io::Result<bool> {
+        let attempt = self.current()?;
+        let parse = super::super::schema_common::parse_canonical_utc_timestamp;
+        Ok(attempt.state == super::AttemptStateV1::Succeeded
+            && attempt
+                .started_at
+                .as_deref()
+                .and_then(parse)
+                .zip(parse(since))
+                .is_some_and(|(started, waited)| started > waited))
+    }
+
     fn current(&self) -> io::Result<&super::LocalAttemptV1> {
         self.state
             .attempts

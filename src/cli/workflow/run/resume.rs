@@ -341,7 +341,8 @@ pub(super) async fn continue_run(
         },
     };
     // REQ-CONTINUE-76, REQ-WFEXEC-68: the child run the abandoned step left, for a fan-out
-    // that of the element the run's `position` names, is adopted or retried.
+    // that of the element the run's `position` names, is adopted or retried; a repair retry
+    // adopts the child an independent repair completed (REQ-CONTINUE-75).
     let child_recovery = match (&selection, from.as_slice()) {
         (Selection::Abandoned, [step]) => {
             let run_directory = pending.run_directory().to_owned();
@@ -386,6 +387,20 @@ pub(super) async fn continue_run(
                     )
                     .await;
                 }
+            }
+        }
+        (
+            Selection::Wait {
+                reason: ContinuationReasonV1::Retry,
+                ..
+            },
+            [step],
+        ) if replacement_workflow.is_none()
+            && matches!(leaf, ExecutionLeaf::Resume | ExecutionLeaf::Retry) =>
+        {
+            match repaired_child(&pending, step) {
+                Ok(recovery) => recovery,
+                Err(error) => return error_after_settlement(pending, &signal_task, error).await,
             }
         }
         _ => None,
@@ -493,11 +508,7 @@ pub(super) async fn continue_run(
     };
     super::create::write_untested_advisories(&untested_advisories);
     if let Err(error) = pending.validate_execution_root(&admitted) {
-        let settlement = tokio::task::spawn_blocking(move || pending.settle_abandoned()).await;
-        signal_task.abort();
-        settlement
-            .map_err(anyhow::Error::new)?
-            .map_err(anyhow::Error::new)?;
+        settle(pending, &signal_task).await?;
         return super::create::diagnose(error);
     }
     let definition_mode = if replacement_workflow.is_some() {
@@ -702,6 +713,66 @@ fn still_waits(pending: &PendingLocalContinuation, wait: &str) -> bool {
     matches!(pending.wait(), Ok(Some(current)) if current.id() == wait)
 }
 
+/// REQ-CONTINUE-75: consume an independently completed repair only for the exact child
+/// named by this wait. A normal retry or requested profile replacement still runs afresh.
+fn repaired_child(
+    pending: &PendingLocalContinuation,
+    step: &str,
+) -> anyhow::Result<Option<ChildRecovery>> {
+    let Some(wait) = pending.wait()? else {
+        return Ok(None);
+    };
+    if wait.kind != um_execution::WaitKind::Repair
+        || wait.then != step
+        || wait.step.first().and_then(serde_json::Value::as_str) != Some(step)
+    {
+        return Ok(None);
+    }
+    let Some(control) = pending.resolving_control(&wait)? else {
+        return Ok(None);
+    };
+    if control.event != "control.retry"
+        || control
+            .payload
+            .as_ref()
+            .is_some_and(|payload| payload.contains_key("agentProfiles"))
+    {
+        return Ok(None);
+    }
+    let Some((directory, RunState::Exited, item)) =
+        latest_child_run(pending.run_directory(), step)?
+    else {
+        return Ok(None);
+    };
+    if wait
+        .payload
+        .get("child")
+        .and_then(serde_json::Value::as_str)
+        .map(Path::new)
+        != directory.strip_prefix(pending.run_directory()).ok()
+    {
+        return Ok(None);
+    }
+    let child = read_local_run_status(&directory).map_err(|error| {
+        anyhow::anyhow!(
+            "inspect repaired child {}: {}: {}",
+            directory.display(),
+            error.code.as_str(),
+            error.code.message()
+        )
+    })?;
+    if !matches!(child.recovery, um_execution::LocalRecoveryStatus::Settled)
+        || !child.status_state.succeeded_after(&wait.since)?
+    {
+        return Ok(None);
+    }
+    Ok(Some(ChildRecovery::Adopt {
+        step: step.to_owned(),
+        item,
+        directory,
+    }))
+}
+
 fn refusal(
     config: &um_execution::PresentationConfig,
     leaf: ExecutionLeaf,
@@ -890,12 +961,17 @@ async fn fail_after_settlement(
     signal_task: &tokio::task::JoinHandle<()>,
     message: &'static str,
 ) -> super::super::super::CommandResult {
-    let settlement = tokio::task::spawn_blocking(move || pending.settle_abandoned()).await;
-    signal_task.abort();
-    settlement
-        .map_err(anyhow::Error::new)?
-        .map_err(anyhow::Error::new)?;
-    Err(anyhow::anyhow!(message).into())
+    error_after_settlement(pending, signal_task, anyhow::anyhow!(message)).await
+}
+
+/// `fail_after_settlement` with the cause the caller read.
+async fn error_after_settlement(
+    pending: PendingLocalContinuation,
+    signal_task: &tokio::task::JoinHandle<()>,
+    error: anyhow::Error,
+) -> super::super::super::CommandResult {
+    settle(pending, signal_task).await?;
+    Err(error.into())
 }
 
 async fn reject_after_settlement(
@@ -903,10 +979,18 @@ async fn reject_after_settlement(
     signal_task: &tokio::task::JoinHandle<()>,
     result: WorkflowRunPresentationResult,
 ) -> super::super::super::CommandResult {
+    settle(pending, signal_task).await?;
+    super::create::rejection_exit(result)
+}
+
+/// Settles an abandoned owner for a continuation that ends without claiming an attempt.
+async fn settle(
+    pending: PendingLocalContinuation,
+    signal_task: &tokio::task::JoinHandle<()>,
+) -> anyhow::Result<()> {
     let settlement = tokio::task::spawn_blocking(move || pending.settle_abandoned()).await;
     signal_task.abort();
     settlement
         .map_err(anyhow::Error::new)?
-        .map_err(anyhow::Error::new)?;
-    super::create::rejection_exit(result)
+        .map_err(anyhow::Error::new)
 }

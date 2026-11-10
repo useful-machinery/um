@@ -1025,7 +1025,8 @@ struct AttemptSettings<Hooks> {
     /// A child run's attempt (REQ-WFEXEC-59): no presentation and no child runs of its own.
     quiet: bool,
     /// The child run an abandoned parent's continuation adopts or retries in place
-    /// (REQ-CONTINUE-76).
+    /// (REQ-CONTINUE-76), or the child an independent repair completed that a repair retry
+    /// adopts (REQ-CONTINUE-75).
     child_recovery: Option<ChildRecovery>,
 }
 
@@ -1090,7 +1091,8 @@ pub(super) async fn execute_owned_attempt(
 }
 
 /// `execute_owned_attempt` for a continuation whose `child_recovery` names the child run
-/// the abandoned attempt left behind (REQ-CONTINUE-76).
+/// the abandoned attempt left behind (REQ-CONTINUE-76) or the child an independent repair
+/// completed, which a repair retry adopts (REQ-CONTINUE-75).
 pub(super) async fn execute_recovering_attempt(
     workflow: ResolvedWorkflow,
     admitted: AdmittedWorkflow,
@@ -1418,7 +1420,8 @@ async fn execute_attempt_phases(
             BlockingOperationError::WorkerUnavailable => anyhow!("read the run's controls"),
         })
         .context("read the run's controls")?;
-        // REQ-WFEXEC-68: an abandoned fan-out resumes at the element of the child it left.
+        // REQ-WFEXEC-68: an abandoned fan-out resumes at the element of the child it left,
+        // and a repair retry at the element of the repaired child it adopts (REQ-CONTINUE-75).
         let mut context = controls.controls;
         if let Some((step, Some(item))) = child_recovery.as_ref().map(ChildRecovery::target) {
             context.resume_item = Some((step.to_owned(), item));
@@ -1942,8 +1945,10 @@ fn child_run_outcome(
 
 /// The child run a parent's continuation takes over from its abandoned attempt rather than
 /// starting another (REQ-CONTINUE-76): one that exited is adopted, one left running gets a
-/// new attempt in place, and an element whose child was never created runs afresh. `item`
-/// is the fan-out element, at which the continuation resumes the step (REQ-WFEXEC-68).
+/// new attempt in place, and an element whose child was never created runs afresh. A repair
+/// retry likewise adopts the child an independent repair completed after its wait began
+/// (REQ-CONTINUE-75). `item` is the fan-out element, at which the continuation resumes the
+/// step (REQ-WFEXEC-68).
 pub(super) enum ChildRecovery {
     Fresh {
         step: String,
@@ -2028,7 +2033,8 @@ struct LocalChildRunParent {
     /// The step a `control.retry` continues at and the agent-profile replacement its child
     /// resolves with (REQ-CONTINUE-75).
     replacement: Option<(String, AgentProfileReplacementDocument)>,
-    /// Taken by the first child run of its step and element (REQ-CONTINUE-76).
+    /// Taken by the first child run of its step and element: an abandoned parent's child
+    /// (REQ-CONTINUE-76) or the repaired child a repair retry adopts (REQ-CONTINUE-75).
     recovery: std::sync::Mutex<Option<ChildRecovery>>,
     /// The latest child run directory each step started and the fan-out element it ran
     /// for, for a wait's payload and step (REQ-WFEXEC-61).

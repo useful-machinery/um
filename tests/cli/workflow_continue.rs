@@ -2373,6 +2373,147 @@ fn a_fan_out_waits_at_its_element_and_resumes_the_same_element() {
     );
 }
 
+// REQ-CONTINUE-75, REQ-WFEXEC-68, REQ-LOCALRUN-184: a repair retry consumes a child
+// completed independently after the wait, preserving earlier elements and continuing the
+// remaining fan-out, and runs the element afresh when the child's repair attempt failed again.
+// A repaired child whose status cannot be read fails the retry before an attempt begins, and
+// the recorded retry adopts it once it reads again.
+#[test]
+fn a_repair_retry_adopts_its_independently_completed_child() {
+    for mode in [
+        "completed",
+        "unrepaired",
+        "profiles",
+        "refailed",
+        "unreadable",
+    ] {
+        let bundle = fan_out_tree();
+        bundle.write_source(
+            "workflow.yaml",
+            &FAN_OUT_TREE_ROOT.replace(
+                "      failed: exit.failed\n  merge:",
+                "      failed:\n        wait: repair\n        then: build\n  merge:",
+            ),
+        );
+        if mode != "unrepaired" {
+            bundle.write_program(
+                "bin/build-decide",
+                &format!("{FAN_OUT_TREE_DECIDE}\ntest \"$(cat verdict-build.txt)\" != failed\n"),
+            );
+        }
+        if mode == "profiles" {
+            bundle.write_source(
+                "build.yaml",
+                &FAN_OUT_TREE_BUILD.replacen(
+                    "schemaVersion: 1\n",
+                    &format!("schemaVersion: 1\n{UNUSED_PROFILE}"),
+                    1,
+                ),
+            );
+        }
+        let root = bundle.execution_root();
+        fs::write(root.join("verdict-build-b"), "failed").unwrap();
+        let destination = bundle.result("repaired-child");
+        let terminal = completed(
+            &isolated_command(&bundle.args(&destination))
+                .output()
+                .unwrap(),
+        );
+        assert_eq!(terminal["wait"]["kind"], "repair", "{terminal}");
+        let run = fs::canonicalize(&destination).unwrap();
+        let child = run.join("children/build/000002/000001");
+        if mode == "refailed" {
+            // The repair attempt fails again, so the retry must not adopt the child.
+            isolated_command(&continue_args(&child, &["decide"]))
+                .output()
+                .unwrap();
+            assert_eq!(run_record(&child)["outcome"], "failed");
+        }
+        fs::write(root.join("verdict-build-b"), "built").unwrap();
+        if matches!(mode, "completed" | "profiles" | "unreadable") {
+            let resumed = completed(
+                &isolated_command(&continue_args(&child, &["decide"]))
+                    .output()
+                    .unwrap(),
+            );
+            assert_eq!(resumed["outcome"], "succeeded", "{resumed}");
+            assert_eq!(run_record(&child)["outcome"], "built");
+        }
+        let profiles = root.join("replacement-profiles.json");
+        if mode == "profiles" {
+            fs::write(
+                &profiles,
+                serde_json::json!({
+                    "schemaVersion": 1,
+                    "agentProfiles": {"unused": {"harness": {
+                        "kind": "claude_code",
+                        "config": {"model": "fixture/claude", "effort": "low"}
+                    }}}
+                })
+                .to_string(),
+            )
+            .unwrap();
+        }
+        if matches!(mode, "completed" | "unreadable") {
+            // Only the child's retained result can finish b now; a fresh child would fail.
+            fs::remove_file(root.join("verdict-build-b")).unwrap();
+        }
+        let extra = if mode == "profiles" {
+            vec!["--agent-profiles", profiles.to_str().unwrap()]
+        } else {
+            Vec::new()
+        };
+        let (state, hidden) = (child.join("state.json"), root.join("hidden-state.json"));
+        if mode == "unreadable" {
+            fs::rename(&state, &hidden).unwrap();
+        }
+        let mut output = run_control(None, "retry", &run, &extra);
+        if mode == "unreadable" {
+            assert_ne!(output.status.code(), Some(0), "{output:?}");
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(stderr.contains("children/build/000002/000001"), "{stderr}");
+            assert_eq!(run_record(&run)["state"], "waiting");
+            assert!(run.join("wait.json").exists());
+            assert_eq!(attempt_count(&run), 1);
+            assert_eq!(ordinals_of(&run.join("children/build/000002")), ["000001"]);
+            fs::rename(&hidden, &state).unwrap();
+            output = resume(&run);
+        }
+        let retried = completed(&output);
+        assert_eq!(retried["outcome"], "succeeded", "{retried}");
+        assert_eq!(run_record(&run)["outcome"], "landed");
+        for item in ["000001", "000003"] {
+            assert_eq!(
+                ordinals_of(&run.join("children/build").join(item)),
+                ["000001"]
+            );
+        }
+        let expected = if matches!(mode, "completed" | "unreadable") {
+            vec!["000001"]
+        } else {
+            vec!["000001", "000002"]
+        };
+        assert_eq!(
+            ordinals_of(&run.join("children/build/000002")),
+            expected,
+            "{mode}"
+        );
+        assert_eq!(
+            attempt_count(&child),
+            if mode == "unrepaired" { 1 } else { 2 }
+        );
+        if mode == "profiles" {
+            let fresh = read_json(
+                &run.join("children/build/000002/000002/attempts/000001/result/result.json"),
+            );
+            assert_eq!(
+                fresh["workflow"]["agentProfileReplacement"]["profiles"]["unused"]["harness"]["kind"],
+                "claude_code"
+            );
+        }
+    }
+}
+
 /// A root whose plain `build` step maps the `parts` json export of its `design` child and
 /// waits for an answer when the build blocks.
 const JSON_EXPORT_TREE_ROOT: &str = "schemaVersion: 1
