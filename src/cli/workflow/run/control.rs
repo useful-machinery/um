@@ -80,7 +80,8 @@ pub(super) struct RecordedControl {
 }
 
 /// What a control command did: the control it appended, the run's wait afterwards, and the
-/// document's `outcome` (`recorded`, or the outcome the command ended the run with).
+/// document's `outcome` (`recorded`, the outcome the command ended the run with, or
+/// `interrupted`).
 pub(super) struct Acted {
     pub(super) control: RecordedControl,
     pub(super) wait: Option<WaitRecord>,
@@ -100,15 +101,7 @@ impl Acted {
 impl ControlTarget {
     /// The run's current wait, whether or not a control already resolves it.
     pub(super) fn wait(&self) -> Option<&WaitRecord> {
-        match &self.inspection {
-            WaitInspection::Held { wait }
-            | WaitInspection::Satisfied { wait, .. }
-            | WaitInspection::RuleInvalid { wait, .. }
-            | WaitInspection::ConditionUnavailable { wait, .. } => Some(wait),
-            WaitInspection::Locked(_)
-            | WaitInspection::NoWait { .. }
-            | WaitInspection::Continued { .. } => None,
-        }
+        inspected_wait(&self.inspection)
     }
 
     /// The wait of `kind` a resolving command (`answer`, `approve`, `hand-back`) acts on:
@@ -179,6 +172,26 @@ impl ControlTarget {
             wait: control.wait,
         })
     }
+}
+
+/// The wait `inspection` found, whether or not a control already resolves it.
+fn inspected_wait(inspection: &WaitInspection) -> Option<&WaitRecord> {
+    match inspection {
+        WaitInspection::Held { wait }
+        | WaitInspection::Satisfied { wait, .. }
+        | WaitInspection::RuleInvalid { wait, .. }
+        | WaitInspection::ConditionUnavailable { wait, .. } => Some(wait),
+        WaitInspection::Locked(_)
+        | WaitInspection::NoWait { .. }
+        | WaitInspection::Continued { .. } => None,
+    }
+}
+
+/// The current wait of the run at `run_directory`, inspected again without taking the run
+/// lock, for a command that reports where a run it signalled stopped (REQ-LOCALRUN-202).
+pub(super) fn current_wait(run_directory: &Path) -> Result<Option<WaitRecord>, ControlFailure> {
+    let probe = inspect_wait(run_directory, &NoConditions)?;
+    Ok(inspected_wait(&probe.inspection).cloned())
 }
 
 pub(super) fn run_locked() -> Refusal {

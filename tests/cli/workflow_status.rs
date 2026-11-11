@@ -377,6 +377,47 @@ fn status_schema_admits_a_closed_diagnostic_only_on_a_failed_node() {
     assert!(!status_schema().is_valid(&succeeded));
 }
 
+// REQ-LOCALRUN-201
+#[test]
+fn status_json_records_when_a_step_that_ran_started() {
+    let bundle = RunBundle::new(
+        "schemaVersion: 1\nsteps:\n  work:\n    kind: cmd\n    command: {argv: [\"false\"]}\n  after:\n    kind: cmd\n    dependsOn: [work]\n    command: {argv: [\"true\"]}\n",
+    );
+    let run_directory = bundle.result("status-step-started-at");
+    assert_eq!(run(&bundle.args(&run_directory)).status.code(), Some(1));
+    let (output, value) = status_json(&run_directory);
+    assert!(output.status.success());
+    assert!(status_schema().is_valid(&value), "{value}");
+    let attempt = &value["state"]["attempts"][0];
+    let utc = |field: &serde_json::Value| {
+        let text = field.as_str().unwrap();
+        assert!(text.ends_with('Z'), "{text}");
+        time::OffsetDateTime::parse(text, &time::format_description::well_known::Rfc3339).unwrap()
+    };
+    let steps = &attempt["progress"]["steps"];
+    assert_eq!(steps[0]["id"], "work");
+    assert_eq!(steps[0]["state"], "failed");
+    let started = utc(&steps[0]["startedAt"]);
+    assert!(utc(&attempt["createdAt"]) <= started);
+    assert!(started <= utc(&attempt["settledAt"]));
+    assert_eq!(steps[1]["id"], "after");
+    assert_eq!(steps[1]["state"], "blocked");
+    assert!(steps[1].get("startedAt").is_none(), "{}", steps[1]);
+
+    // The schema admits a start on a node that left `pending` and on no pending node.
+    let after = "/state/attempts/0/progress/steps/1";
+    let mut blocked = value.clone();
+    blocked.pointer_mut(after).unwrap()["startedAt"] = steps[0]["startedAt"].clone();
+    assert!(status_schema().is_valid(&blocked), "{blocked}");
+    let mut pending = value.clone();
+    let node = pending.pointer_mut(after).unwrap().as_object_mut().unwrap();
+    node.insert("state".to_owned(), "pending".into());
+    node.remove("detail").unwrap();
+    assert!(status_schema().is_valid(&pending), "{pending}");
+    pending.pointer_mut(after).unwrap()["startedAt"] = steps[0]["startedAt"].clone();
+    assert!(!status_schema().is_valid(&pending), "{pending}");
+}
+
 #[test]
 fn closed_status_schema_accepts_positive_and_rejects_negative_fixtures() {
     let validator = status_schema();

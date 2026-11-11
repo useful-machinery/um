@@ -279,7 +279,12 @@ pub fn adopted_child_outcome(child: &Path) -> super::step_runtime::ChildRunOutco
         };
         exports.insert(name.clone(), value);
     }
-    ChildRunOutcome::Exited { outcome, exports }
+    // An adopted child ran in an earlier attempt, so no interruption of this one failed it.
+    ChildRunOutcome::Exited {
+        outcome,
+        exports,
+        interruption: None,
+    }
 }
 
 /// A published `json` export as an unconstrained captured value, as a live child's export

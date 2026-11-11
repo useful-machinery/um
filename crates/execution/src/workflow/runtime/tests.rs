@@ -2623,6 +2623,476 @@ fn advisory_failure_before_cancellation_leaves_the_run_cancelled() {
     assert_step(&state, "lint", StepStateKind::Failed);
 }
 
+fn interrupted_detail(phase: FailurePhase) -> FailureDetail {
+    FailureDetail::new(
+        phase,
+        crate::workflow::evidence::FailureCode::Interrupted,
+        None,
+        None,
+        None,
+        None,
+    )
+    .unwrap()
+}
+
+fn interrupted_state(phase: FailurePhase) -> StepState<String> {
+    StepState::Failed {
+        detail: interrupted_detail(phase),
+    }
+}
+
+fn interruption(operation: u64, reason: CancellationReason, arbiter_tick: u64) -> TestOccurrence {
+    Occurrence::InterruptionOperationRequested {
+        operation: CancellationOperationId::fixture(operation),
+        reason,
+        deadline: deadline(arbiter_tick),
+    }
+}
+
+fn cancellation_operation(
+    operation: u64,
+    reason: CancellationReason,
+    arbiter_tick: u64,
+) -> TestOccurrence {
+    Occurrence::CancellationOperationRequested {
+        operation: CancellationOperationId::fixture(operation),
+        reason,
+        deadline: deadline(arbiter_tick),
+    }
+}
+
+fn finished_outcome(reduction: &TestReduction) -> Option<&RunOutcome> {
+    reduction
+        .actions
+        .iter()
+        .find_map(|action| match &action.action {
+            Action::FinishRun { outcome, .. } => Some(outcome),
+            _ => None,
+        })
+}
+
+// REQ-WFEXEC-69, REQ-WFEXEC-45, REQ-WFEXEC-47
+#[test]
+fn an_interruption_stops_the_active_step_as_a_cancellation_and_fails_it() {
+    let graph = finalizer_definition(
+        &[
+            ("aRunning", FailurePolicy::Required, &[], &[], &[]),
+            ("bPending", FailurePolicy::Required, &[], &[], &[]),
+        ],
+        &[(
+            "record",
+            FailurePolicy::Required,
+            &[FinalizationTrigger::Failed],
+            &[],
+            &[],
+        )],
+        1,
+    );
+    let initialization = initialize_test(graph);
+    let running = started_step(&initialization, "aRunning").unwrap();
+    assert!(started_step(&initialization, "bPending").is_none());
+    let mut state = initialization.state;
+    reduce_and_advance(
+        &mut state,
+        Occurrence::StepStarted {
+            step: "aRunning".to_owned(),
+            action: running,
+        },
+    );
+
+    let reason = CancellationReason::UserRequest;
+    let cancelled = reduce(&state, cancellation_operation(1, reason, 9_001));
+    let interrupted = reduce_and_advance(&mut state, interruption(1, reason, 9_001));
+    assert_eq!(interrupted.events, cancelled.events);
+    assert_eq!(interrupted.actions, cancelled.actions);
+    let [stop] = interrupted.actions.as_slice() else {
+        panic!("the interruption did not stop exactly the running step");
+    };
+    assert!(matches!(
+        &stop.action,
+        Action::CancelStep { step, reason: stop_reason, .. }
+            if step == "aRunning" && *stop_reason == reason
+    ));
+    assert_eq!(state.steps["bPending"].state, cancelled_state(reason));
+
+    let quiesced = reduce_and_advance(
+        &mut state,
+        Occurrence::StepQuiesced {
+            step: "aRunning".to_owned(),
+            action: stop.id,
+        },
+    );
+    assert_eq!(
+        state.steps["aRunning"].state,
+        interrupted_state(FailurePhase::Execution)
+    );
+    assert_eq!(state.steps["bPending"].state, cancelled_state(reason));
+    assert!(matches!(
+        state.workflow,
+        WorkflowState::Finalizing {
+            trigger: FinalizationTrigger::Failed,
+            ..
+        }
+    ));
+    let record = started_step(&quiesced, "record").unwrap();
+    reduce_and_advance(
+        &mut state,
+        Occurrence::StepStarted {
+            step: "record".to_owned(),
+            action: record,
+        },
+    );
+    let finished = reduce_and_advance(
+        &mut state,
+        Occurrence::StepExecutionFailed {
+            step: "record".to_owned(),
+            action: record,
+            cause: "record failed".to_owned(),
+        },
+    );
+    let primary_issue = PrimaryIssue::failed(
+        ordinary_node("aRunning"),
+        interrupted_detail(FailurePhase::Execution),
+    );
+    let terminal = WorkflowState::Failed {
+        primary_issue: primary_issue.clone(),
+        later_cancellation: Some(reason),
+    };
+    assert_eq!(state.workflow, terminal);
+    assert_eq!(
+        finished_outcome(&finished),
+        Some(&RunOutcome::Failed {
+            primary_issue,
+            later_cancellation: Some(reason),
+        })
+    );
+
+    // The same request made as a cancellation, as a Cloud run makes it, still cancels.
+    let mut cloud = cancelled.state;
+    reduce_and_advance(
+        &mut cloud,
+        Occurrence::StepQuiesced {
+            step: "aRunning".to_owned(),
+            action: stop.id,
+        },
+    );
+    assert_eq!(cloud.steps["aRunning"].state, cancelled_state(reason));
+    assert_eq!(cloud.workflow, WorkflowState::Cancelled { reason });
+}
+
+// REQ-WFEXEC-69
+#[test]
+fn an_interrupted_advisory_step_is_the_primary_issue() {
+    let mut graph = definition(&[("lint", &[], &[])], &[], 1);
+    graph.steps.get_mut("lint").unwrap().failure_policy = FailurePolicy::Advisory;
+    let initialization = initialize_test(graph);
+    let lint = started_step(&initialization, "lint").unwrap();
+    let mut state = initialization.state;
+    reduce_and_advance(
+        &mut state,
+        Occurrence::StepStarted {
+            step: "lint".to_owned(),
+            action: lint,
+        },
+    );
+    let reason = CancellationReason::TerminationRequest;
+    let interrupted = reduce_and_advance(&mut state, interruption(1, reason, 50));
+    let [stop] = interrupted.actions.as_slice() else {
+        panic!("the interruption did not stop the advisory step");
+    };
+    let finished = reduce_and_advance(
+        &mut state,
+        Occurrence::StepQuiesced {
+            step: "lint".to_owned(),
+            action: stop.id,
+        },
+    );
+    let primary_issue = PrimaryIssue::failed(
+        ordinary_node("lint"),
+        interrupted_detail(FailurePhase::Execution),
+    );
+    assert_eq!(
+        state.workflow,
+        WorkflowState::Failed {
+            primary_issue: primary_issue.clone(),
+            later_cancellation: Some(reason),
+        }
+    );
+    assert_eq!(
+        finished_outcome(&finished),
+        Some(&RunOutcome::Failed {
+            primary_issue,
+            later_cancellation: Some(reason),
+        })
+    );
+}
+
+// REQ-WFEXEC-69, REQ-WFEXEC-17
+#[test]
+fn a_required_issue_before_an_interruption_stays_the_primary_issue() {
+    let initialization = initialize_test(definition(
+        &[("aFail", &[], &[]), ("bActive", &[], &[])],
+        &[],
+        2,
+    ));
+    let a_fail = started_step(&initialization, "aFail").unwrap();
+    let b_active = started_step(&initialization, "bActive").unwrap();
+    let mut state = initialization.state;
+    for (step, action) in [("aFail", a_fail), ("bActive", b_active)] {
+        reduce_and_advance(
+            &mut state,
+            Occurrence::StepStarted {
+                step: step.to_owned(),
+                action,
+            },
+        );
+    }
+    reduce_and_advance(
+        &mut state,
+        Occurrence::StepExecutionFailed {
+            step: "aFail".to_owned(),
+            action: a_fail,
+            cause: "primary".to_owned(),
+        },
+    );
+    let reason = CancellationReason::UserRequest;
+    let interrupted = reduce_and_advance(&mut state, interruption(1, reason, 70));
+    let [stop] = interrupted.actions.as_slice() else {
+        panic!("the interruption did not stop the active sibling");
+    };
+    reduce_and_advance(
+        &mut state,
+        Occurrence::StepQuiesced {
+            step: "bActive".to_owned(),
+            action: stop.id,
+        },
+    );
+    assert_eq!(
+        state.steps["bActive"].state,
+        interrupted_state(FailurePhase::Execution)
+    );
+    assert_eq!(
+        state.workflow,
+        WorkflowState::Failed {
+            primary_issue: failure("aFail", FailurePhase::Execution, "primary"),
+            later_cancellation: Some(reason),
+        }
+    );
+}
+
+// REQ-WFEXEC-69
+#[test]
+fn an_interruption_with_no_active_step_fails_the_first_pending_step_at_start() {
+    let reason = CancellationReason::UserRequest;
+    // Document order differs from the lexical order the scheduler uses.
+    let reduction = ReductionBuilder::<String, TestDeadline>::new(definition(
+        &[("zFirst", &[], &[]), ("aSecond", &[], &[])],
+        &[],
+        2,
+    ))
+    .initially_cancelled(InitialCancellation::Interruption {
+        request: cancellation(reason, 5_000),
+        operation: None,
+    })
+    .build::<String, String>();
+
+    assert_eq!(
+        reduction.state.steps["zFirst"].state,
+        interrupted_state(FailurePhase::Start)
+    );
+    assert_eq!(
+        reduction.state.steps["aSecond"].state,
+        cancelled_state(reason)
+    );
+    let primary_issue = PrimaryIssue::failed(
+        ordinary_node("zFirst"),
+        interrupted_detail(FailurePhase::Start),
+    );
+    assert_eq!(
+        reduction.state.workflow,
+        WorkflowState::Failed {
+            primary_issue: primary_issue.clone(),
+            later_cancellation: Some(reason),
+        }
+    );
+    assert_eq!(
+        finished_outcome(&reduction),
+        Some(&RunOutcome::Failed {
+            primary_issue,
+            later_cancellation: Some(reason),
+        })
+    );
+    assert!(
+        reduction
+            .actions
+            .iter()
+            .all(|action| !matches!(action.action, Action::StartStep { .. }))
+    );
+}
+
+// REQ-WFEXEC-69
+#[test]
+fn an_interrupted_step_with_recovery_gets_no_recovery_round() {
+    let mut graph = definition(&[("fetch", &[], &["result"])], &[], 1);
+    configure_recovery(&mut graph, "fetch", 2, None, 1_000);
+    let initialization = initialize_test(graph);
+    let first = started_step(&initialization, "fetch").unwrap();
+    let mut state = initialization.state;
+    reduce_and_advance(
+        &mut state,
+        Occurrence::StepStarted {
+            step: "fetch".to_owned(),
+            action: first,
+        },
+    );
+    let interrupted = reduce_and_advance(
+        &mut state,
+        interruption(1, CancellationReason::UserRequest, 80),
+    );
+    let [stop] = interrupted.actions.as_slice() else {
+        panic!("the interruption did not stop the recovering target");
+    };
+    let quiesced = reduce_and_advance(
+        &mut state,
+        Occurrence::StepQuiesced {
+            step: "fetch".to_owned(),
+            action: stop.id,
+        },
+    );
+    assert_eq!(
+        state.steps["fetch"].state,
+        interrupted_state(FailurePhase::Execution)
+    );
+    assert!(
+        state.steps["fetch"]
+            .recovery
+            .as_ref()
+            .unwrap()
+            .rounds
+            .is_empty()
+    );
+    assert!(started_step(&quiesced, "fetch").is_none());
+    assert!(matches!(state.workflow, WorkflowState::Failed { .. }));
+
+    // A step already in a recovery round is not given another one either.
+    let mut graph = definition(&[("fetch", &[], &["result"])], &[], 1);
+    configure_recovery(&mut graph, "fetch", 2, None, 1_000);
+    let initialization = initialize_test(graph);
+    let first = started_step(&initialization, "fetch").unwrap();
+    let mut state = initialization.state;
+    reduce_and_advance(
+        &mut state,
+        Occurrence::StepStarted {
+            step: "fetch".to_owned(),
+            action: first,
+        },
+    );
+    let recheck = reduce_and_advance(
+        &mut state,
+        Occurrence::StepExecutionFailed {
+            step: "fetch".to_owned(),
+            action: first,
+            cause: "exit 75".to_owned(),
+        },
+    );
+    let second = started_step(&recheck, "fetch").unwrap();
+    reduce_and_advance(
+        &mut state,
+        Occurrence::StepStarted {
+            step: "fetch".to_owned(),
+            action: second,
+        },
+    );
+    let interrupted = reduce_and_advance(
+        &mut state,
+        interruption(1, CancellationReason::UserRequest, 90),
+    );
+    let [stop] = interrupted.actions.as_slice() else {
+        panic!("the interruption did not stop the second execution");
+    };
+    let quiesced = reduce_and_advance(
+        &mut state,
+        Occurrence::StepQuiesced {
+            step: "fetch".to_owned(),
+            action: stop.id,
+        },
+    );
+    assert_eq!(
+        state.steps["fetch"].state,
+        interrupted_state(FailurePhase::Execution)
+    );
+    assert_eq!(
+        state.steps["fetch"].recovery.as_ref().unwrap().rounds.len(),
+        1
+    );
+    assert!(started_step(&quiesced, "fetch").is_none());
+}
+
+// REQ-WFEXEC-69, REQ-WFFINALIZE-15
+#[test]
+fn an_interruption_while_finalizing_or_after_a_cancellation_acts_as_that_cancellation() {
+    let graph = finalizer_definition(
+        &[("work", FailurePolicy::Required, &[], &[], &[])],
+        &[(
+            "cleanup",
+            FailurePolicy::Required,
+            &[FinalizationTrigger::Failed],
+            &[],
+            &[],
+        )],
+        1,
+    );
+    let initialization = initialize_test(graph);
+    let work = started_step(&initialization, "work").unwrap();
+    let mut finalizing = initialization.state;
+    let boundary = reduce_and_advance(
+        &mut finalizing,
+        Occurrence::StepStartFailed {
+            step: "work".to_owned(),
+            action: work,
+            cause: "work failed".to_owned(),
+        },
+    );
+    let cleanup = started_step(&boundary, "cleanup").unwrap();
+    reduce_and_advance(
+        &mut finalizing,
+        Occurrence::StepStarted {
+            step: "cleanup".to_owned(),
+            action: cleanup,
+        },
+    );
+    assert!(matches!(
+        finalizing.workflow,
+        WorkflowState::Finalizing { .. }
+    ));
+    let reason = CancellationReason::UserRequest;
+    let as_cancellation = reduce(&finalizing, cancellation_operation(1, reason, 30));
+    assert!(!as_cancellation.actions.is_empty());
+    assert_eq!(
+        reduce(&finalizing, interruption(1, reason, 30)),
+        as_cancellation
+    );
+
+    let initialization = initialize_test(definition(&[("work", &[], &[])], &[], 1));
+    let work = started_step(&initialization, "work").unwrap();
+    let mut cancelling = initialization.state;
+    reduce_and_advance(
+        &mut cancelling,
+        Occurrence::StepStarted {
+            step: "work".to_owned(),
+            action: work,
+        },
+    );
+    reduce_and_advance(
+        &mut cancelling,
+        cancellation_operation(1, CancellationReason::RunnerShutdown, 40),
+    );
+    assert_eq!(
+        reduce(&cancelling, interruption(2, reason, 50)),
+        reduce(&cancelling, cancellation_operation(2, reason, 50))
+    );
+}
+
 // REQ-WFEXEC-16
 // INV-ENGINE-4
 #[test]
@@ -6272,6 +6742,7 @@ fn a_wait_edge_ends_the_attempt_waiting_without_finalization() {
         then: "design".to_owned(),
         on_hand_back: None,
         rule: None,
+        interrupted: None,
     };
     assert_eq!(
         state.workflow,
@@ -6348,6 +6819,7 @@ fn a_stop_entered_before_an_authorized_step_ends_the_attempt_waiting() {
                 then: "design".to_owned(),
                 on_hand_back: None,
                 rule: None,
+                interrupted: None,
             },
         }
     );
@@ -6723,4 +7195,180 @@ fn a_limited_edge_continues_under_its_count_and_takes_else_at_it() {
         &state.workflow,
         WorkflowState::Waiting { wait } if wait.kind == WaitKind::Repair && wait.then == "design"
     ));
+}
+
+/// `design` routing `planned` and `failed` to the given targets, then `build`.
+fn interrupted_route_definition(planned: &str, failed: &str) -> RuntimeDefinition {
+    edge_definition(
+        &[
+            (
+                "design",
+                &[("planned", planned), ("failed", failed)],
+                &["outcome"],
+            ),
+            ("build", &[("built", "exit.landed")], &["outcome"]),
+        ],
+        4,
+    )
+}
+
+/// Starts the entry `design` and interrupts the run while its child runs.
+fn design_interrupted(definition: RuntimeDefinition) -> TestRuntimeState {
+    let mut state = ReductionBuilder::<String, TestDeadline>::new(definition)
+        .build::<String, String>()
+        .state;
+    reduce_and_advance(
+        &mut state,
+        Occurrence::StepStarted {
+            step: "design".to_owned(),
+            action: action_id(1),
+        },
+    );
+    let interrupted = reduce_and_advance(
+        &mut state,
+        interruption(1, CancellationReason::UserRequest, 9_001),
+    );
+    assert!(
+        interrupted
+            .actions
+            .iter()
+            .any(|requested| matches!(requested.action, Action::CancelStep { .. }))
+    );
+    state
+}
+
+/// `design`'s child completion: `child:<outcome>`, with `:<step>` when an interruption
+/// failed the child at that step.
+fn child_completed(provisional: &str) -> TestOccurrence {
+    Occurrence::StepExecutionCompleted {
+        step: "design".to_owned(),
+        action: action_id(1),
+        provisional: provisional.to_owned(),
+    }
+}
+
+/// Commits the outcome the capture `completed` requested.
+fn capture_child_outcome(
+    state: &mut TestRuntimeState,
+    completed: &TestReduction,
+    outcome: &str,
+) -> TestReduction {
+    let [capture] = completed.actions.as_slice() else {
+        panic!("the completion requested {:?}", completed.actions);
+    };
+    assert!(matches!(capture.action, Action::CaptureOutputs { .. }));
+    reduce_and_advance(
+        state,
+        Occurrence::OutputsCaptured {
+            step: "design".to_owned(),
+            action: capture.id,
+            outputs: output_set(&[("outcome", outcome)]),
+        },
+    )
+}
+
+// REQ-WFEXEC-70, INV-ENGINE-29: an interrupted child's completion enters its `repair` wait,
+// which names the interruption, and any other edge fails the step `interrupted`.
+#[test]
+fn an_interrupted_child_enters_only_a_repair_wait() {
+    let mut state = design_interrupted(interrupted_route_definition("build", "wait:repair:design"));
+    assert_step(&state, "build", StepStateKind::Pending);
+    let completed = reduce_and_advance(&mut state, child_completed("child:failed:plan"));
+    assert!(completed.occurrence_accepted);
+    let waiting = capture_child_outcome(&mut state, &completed, "failed");
+    assert_step(&state, "design", StepStateKind::Succeeded);
+    assert_eq!(state.steps["build"].state, not_reached());
+    let WorkflowState::Waiting { wait } = &state.workflow else {
+        panic!("the run did not wait: {:?}", state.workflow);
+    };
+    assert_eq!(
+        (wait.kind, wait.then.as_str()),
+        (WaitKind::Repair, "design")
+    );
+    assert_eq!(
+        wait.interrupted(),
+        Some(&ChildInterruption {
+            reason: CancellationReason::UserRequest,
+            step: "plan".to_owned(),
+        })
+    );
+    assert!(matches!(
+        finished_outcome(&waiting),
+        Some(RunOutcome::Waiting { .. })
+    ));
+
+    for failed in [
+        "build",
+        "exit.failed",
+        "limit:design:2:wait:repair:design",
+        "wait:answer:design",
+    ] {
+        let mut state = design_interrupted(interrupted_route_definition("build", failed));
+        let completed = reduce_and_advance(&mut state, child_completed("child:failed:plan"));
+        assert!(completed.occurrence_accepted, "{failed}");
+        assert_eq!(
+            state.steps["design"].state,
+            interrupted_state(FailurePhase::Execution),
+            "{failed}"
+        );
+        assert_eq!(
+            state.steps["build"].state,
+            cancelled_state(CancellationReason::UserRequest),
+            "{failed}"
+        );
+        assert!(
+            matches!(
+                &state.workflow,
+                WorkflowState::Failed {
+                    later_cancellation: Some(CancellationReason::UserRequest),
+                    ..
+                }
+            ),
+            "{failed}"
+        );
+        assert_eq!(
+            (&state.exit_outcome, &state.wait, &state.continued),
+            (&None, &None, &None),
+            "{failed}"
+        );
+    }
+}
+
+// REQ-WFEXEC-70, REQ-WFEXEC-64: a child that completed on its own under an interruption
+// ends the attempt `continued` on an edge that would start a step, counted only as a limited
+// edge's `then`; under a cancellation its completion is stale and the step is cancelled.
+#[test]
+fn a_child_completing_under_an_interruption_continues_instead_of_starting_a_step() {
+    for (planned, counted) in [("build", false), ("limit:build:2:exit.failed", true)] {
+        let mut state =
+            design_interrupted(interrupted_route_definition(planned, "wait:repair:design"));
+        let completed = reduce_and_advance(&mut state, child_completed("child:planned"));
+        let settled = capture_child_outcome(&mut state, &completed, "planned");
+        assert_continued(
+            &state,
+            &settled,
+            &taken("design", "planned", "build", counted),
+        );
+        assert_eq!(state.steps["build"].state, not_reached(), "{planned}");
+    }
+
+    let mut state = ReductionBuilder::<String, TestDeadline>::new(interrupted_route_definition(
+        "build",
+        "wait:repair:design",
+    ))
+    .build::<String, String>()
+    .state;
+    reduce_and_advance(
+        &mut state,
+        Occurrence::StepStarted {
+            step: "design".to_owned(),
+            action: action_id(1),
+        },
+    );
+    reduce_and_advance(
+        &mut state,
+        cancellation_operation(1, CancellationReason::UserRequest, 9_001),
+    );
+    let stale = reduce(&state, child_completed("child:planned"));
+    assert!(!stale.occurrence_accepted);
 }

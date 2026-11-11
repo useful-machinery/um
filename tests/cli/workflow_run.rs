@@ -2848,7 +2848,8 @@ fn codex_native_failure_is_attributed_without_value_publication_or_fallback() {
     );
 }
 
-// REQ-AGENT-46
+// REQ-AGENT-46, REQ-WFEXEC-69: an interrupted Codex step quiesces before the result
+// publishes, failed `interrupted`.
 #[test]
 fn codex_cancellation_quiesces_before_atomic_publication() {
     let fixture = CodexFixture::with_execution("0.147.0");
@@ -2891,10 +2892,11 @@ fn codex_cancellation_quiesces_before_atomic_publication() {
 
     assert_eq!(output.status.code(), Some(130));
     let result = result_json(&destination);
-    assert_eq!(result["outcome"], "cancelled");
+    assert_eq!(result["outcome"], "failed");
+    assert_eq!(result["steps"][0]["detail"]["code"], "interrupted");
     assert_eq!(
         result["exports"]["response"],
-        serde_json::json!({"state": "unavailable", "reason": "source_cancelled"})
+        serde_json::json!({"state": "unavailable", "reason": "source_failed"})
     );
     assert!(
         fs::read_dir(destination.join(".private"))
@@ -3263,11 +3265,13 @@ fn local_claude_result_correction_publishes_only_the_authoritatively_valid_value
     );
 }
 
+// REQ-WFEXEC-69: a step's own failure and an interruption both publish only after the
+// harness group quiesces, each ending the run `failed`.
 #[test]
 fn mixed_local_failure_and_cancellation_publish_only_after_quiescence() {
     for (mode, expected_status, expected_outcome, unavailable_reason) in [
         ("failure", 1, "failed", "source_failed"),
-        ("cancellation", 130, "cancelled", "source_cancelled"),
+        ("cancellation", 130, "failed", "source_failed"),
     ] {
         let pi = PiFixture::with_execution("0.84.2", COMPLETE_HELP, true, &response_pi_execution());
         let claude = ClaudeCodeFixture::with_execution(
@@ -3680,11 +3684,19 @@ fn running_agent_process_group_is_durably_guarded() {
     ));
 }
 
+// REQ-WFEXEC-69, REQ-LOCALRUN-135, REQ-LOCALRUN-137: a signal interrupts the agent step and
+// an output failure cancels it; either way the Pi group quiesces before publication.
 #[test]
 fn agent_signal_and_output_failure_cancel_and_quiesce_the_pi_group() {
-    for (mode, expected_reason, expected_status) in [
-        ("signal", "user_request", 130),
-        ("output", "caller_output_failure", 1),
+    for (mode, expected_reason, expected_status, expected_outcome, expected_state) in [
+        ("signal", "user_request", 130, "failed", "workflow_failed"),
+        (
+            "output",
+            "caller_output_failure",
+            1,
+            "cancelled",
+            "cancelled",
+        ),
     ] {
         let pi = PiFixture::with_execution("0.84.2", COMPLETE_HELP, true, barrier_pi_execution());
         let bundle = RunBundle::new(response_agent_source());
@@ -3721,11 +3733,11 @@ fn agent_signal_and_output_failure_cancel_and_quiesce_the_pi_group() {
 
         assert_eq!(output.status.code(), Some(expected_status));
         let retained = result_json(&destination);
-        assert_eq!(retained["outcome"], "cancelled");
+        assert_eq!(retained["outcome"], expected_outcome);
         assert_eq!(retained["cancellation"]["reason"], expected_reason);
         let state: serde_json::Value =
             serde_json::from_slice(&fs::read(destination.join("state.json")).unwrap()).unwrap();
-        assert_eq!(state["attempts"][0]["state"], "cancelled");
+        assert_eq!(state["attempts"][0]["state"], expected_state);
         assert_eq!(
             state["attempts"][0]["progress"]["outstandingActions"],
             serde_json::json!([])
@@ -5359,9 +5371,11 @@ fn cancellation_settles_with_a_full_unread_presentation_pipe() {
     }
 }
 
-// REQ-WFEXEC-40, REQ-LOCALRUN-127, REQ-LOCALRUN-135, REQ-LOCALRUN-136
+// REQ-WFEXEC-40, REQ-WFEXEC-69, REQ-LOCALRUN-127, REQ-LOCALRUN-135, REQ-LOCALRUN-136: a signal
+// interrupts a `--path` run: its running step fails `interrupted`, the published result is
+// `failed` with the signal's reason as its cancellation, and the command exits by the signal.
 #[test]
-fn signal_cancellation_uses_authoritative_reason_status_and_published_result() {
+fn a_signal_interrupts_the_run_with_its_reason_status_and_published_result() {
     for (signal, expected_status, expected_reason) in [
         (Signal::INT, 130, "user_request"),
         (Signal::TERM, 143, "termination_request"),
@@ -5391,14 +5405,82 @@ fn signal_cancellation_uses_authoritative_reason_status_and_published_result() {
 
         assert_eq!(output.status.code(), Some(expected_status));
         let terminal: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-        assert_eq!(terminal["outcome"], "cancelled");
+        assert_eq!(terminal["outcome"], "failed", "{terminal}");
         assert_eq!(terminal["exitStatus"], expected_status);
         assert_eq!(
             terminal["result"]["cancellation"]["reason"],
             expected_reason
         );
+        let step = &terminal["result"]["steps"][0];
+        assert_eq!(step["id"], "active", "{terminal}");
+        assert_eq!(step["state"], "failed", "{terminal}");
+        assert_eq!(step["detail"]["phase"], "execution", "{terminal}");
+        assert_eq!(step["detail"]["code"], "interrupted", "{terminal}");
+        assert_eq!(terminal["result"]["primaryIssue"]["node"]["id"], "active");
         assert_eq!(terminal["result"], result_json(&destination));
     }
+}
+
+// SC-LOCALRUN-6, REQ-LOCALRUN-110, REQ-LOCALRUN-123, REQ-LOCALRUN-135, REQ-LOCALRUN-136:
+// SIGINT to a `--plain` run logs one `@workflow cancelling user_request` record before the
+// step's `cancelling` record, publishes the step `failed` `interrupted`, and the summary ends in
+// `cancellation: user_request`; the command exits 130.
+#[test]
+fn an_interrupted_plain_run_logs_the_stop_and_ends_its_summary_in_the_reason() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let bundle = signal_bundle();
+    let destination = bundle.result("plain-interrupted");
+    let mut args = bundle.args(&destination);
+    args.insert(args.len() - 1, "--plain".to_owned());
+    let child = isolated_command(&args)
+        .env(
+            "WORKFLOW_RUN_FIXTURE_SOCKET",
+            listener.local_addr().unwrap().to_string(),
+        )
+        .env("WORKFLOW_RUN_FIXTURE_MODE", "wait")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let (mut control, _) = listener.accept().unwrap();
+    let mut ready = [0_u8; 1];
+    control.read_exact(&mut ready).unwrap();
+    assert_eq!(ready, [1]);
+    let pid = Pid::from_raw(i32::try_from(child.id()).unwrap()).unwrap();
+    kill_process(pid, Signal::INT).unwrap();
+    let output = child.wait_with_output().unwrap();
+
+    assert_eq!(output.status.code(), Some(130), "{output:?}");
+    let log = String::from_utf8(output.stdout).unwrap();
+    let records = log
+        .lines()
+        .map(|line| line.split_whitespace().collect::<Vec<_>>())
+        .collect::<Vec<_>>();
+    let cancelling = |node: &str| {
+        records
+            .iter()
+            .position(|fields| fields.get(1..4) == Some(&[node, "cancelling", "user_request"]))
+    };
+    let acknowledgement = cancelling("@workflow").unwrap_or_else(|| panic!("{log}"));
+    let step = cancelling("active").unwrap_or_else(|| panic!("{log}"));
+    assert!(acknowledgement < step, "{log}");
+    assert_eq!(
+        records
+            .iter()
+            .filter(|fields| fields.get(1..3) == Some(&["@workflow", "cancelling"]))
+            .count(),
+        1,
+        "{log}"
+    );
+    assert_eq!(
+        records.last().unwrap().as_slice(),
+        ["cancellation:", "user_request"],
+        "{log}"
+    );
+    let result = result_json(&destination);
+    assert_eq!(result["outcome"], "failed");
+    assert_eq!(result["steps"][0]["state"], "failed");
+    assert_eq!(result["steps"][0]["detail"]["code"], "interrupted");
 }
 
 // REQ-WFFINALIZE-10, REQ-WFFINALIZE-11, REQ-WFFINALIZE-15, REQ-WFFINALIZE-16, REQ-WFFINALIZE-18
@@ -5722,7 +5804,7 @@ fn guardian_loss_cannot_leave_a_descendant_running() {
     );
 }
 
-// REQ-LOCALRUN-134
+// REQ-LOCALRUN-134, REQ-WFEXEC-69
 #[test]
 fn output_failure_after_a_signal_keeps_the_first_reason_but_forces_status_one() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -5756,7 +5838,8 @@ fn output_failure_after_a_signal_keeps_the_first_reason_but_forces_status_one() 
 
     assert_eq!(output.status.code(), Some(1));
     let retained = result_json(&destination);
-    assert_eq!(retained["outcome"], "cancelled");
+    assert_eq!(retained["outcome"], "failed");
+    assert_eq!(retained["steps"][0]["detail"]["code"], "interrupted");
     assert_eq!(retained["cancellation"]["reason"], "user_request");
     let stderr = String::from_utf8_lossy(&output.stderr);
     let resolved_destination = fs::canonicalize(&destination).unwrap();
@@ -6894,6 +6977,7 @@ fn the_former_run_spellings_are_usage_errors_and_run_is_a_group() {
         "cancel",
         "create",
         "hand-back",
+        "interrupt",
         "lift",
         "list",
         "release",
@@ -7385,6 +7469,78 @@ fn workflow_steps_run_child_runs_and_route_on_their_outcomes() {
     assert!(!destination.join("children/build").exists());
 }
 
+/// One progress stream record (REQ-LOCALRUN-106) split on whitespace: its scope, its token
+/// and the words of its detail.
+pub(super) struct ProgressRecord {
+    pub(super) scope: String,
+    pub(super) token: String,
+    pub(super) detail: Vec<String>,
+}
+
+/// The records of the progress stream in `stream`, in order; the header lines are not
+/// records.
+pub(super) fn progress_records(stream: &[u8]) -> Vec<ProgressRecord> {
+    String::from_utf8_lossy(stream)
+        .lines()
+        .filter(|line| line.starts_with('['))
+        .map(|line| {
+            let mut words = line.split_whitespace().skip(1).map(str::to_owned);
+            ProgressRecord {
+                scope: words.next().unwrap_or_default(),
+                token: words.next().unwrap_or_default(),
+                detail: words.collect(),
+            }
+        })
+        .collect()
+}
+
+/// The index of the first record in `records` with `scope` and `token`.
+pub(super) fn progress_position(records: &[ProgressRecord], scope: &str, token: &str) -> usize {
+    records
+        .iter()
+        .position(|record| record.scope == scope && record.token == token)
+        .unwrap_or_else(|| {
+            let seen = records
+                .iter()
+                .map(|record| format!("{} {}", record.scope, record.token))
+                .collect::<Vec<_>>();
+            panic!("no {scope} {token} record in {seen:#?}")
+        })
+}
+
+// REQ-LOCALRUN-200: while each child runs, the parent's progress stream carries its step's
+// state records scoped `<step>.<child step>`, between the parent step's own `start` and
+// `done`, and none of the child's output records.
+#[test]
+fn a_running_childs_step_states_appear_in_the_parents_progress_stream() {
+    let (_bundle, _destination, output) = run_child_tree("planned");
+    succeeded(&output);
+    let records = progress_records(&output.stderr);
+    for (step, child, program) in [
+        ("design", "design.decide", "decide"),
+        ("build", "build.make", "sh"),
+    ] {
+        let order = [
+            progress_position(&records, step, "start"),
+            progress_position(&records, child, "start"),
+            progress_position(&records, child, "done"),
+            progress_position(&records, step, "done"),
+        ];
+        assert!(order.windows(2).all(|pair| pair[0] < pair[1]), "{order:?}");
+        let start = &records[order[1]].detail;
+        assert_eq!(start.first().map(String::as_str), Some("cmd"), "{start:?}");
+        assert!(start.iter().any(|word| word == program), "{start:?}");
+        for token in ["stdout", "stderr", "output"] {
+            assert!(
+                !records
+                    .iter()
+                    .any(|record| record.scope == child && record.token == token),
+                "{child} {token}"
+            );
+        }
+    }
+}
+
 // REQ-WFEXEC-59: a child reads the parent's pinned tree copy, so a source file renamed
 // away after the run pinned its tree changes nothing.
 #[test]
@@ -7439,11 +7595,42 @@ pub(super) fn spawn_held_child_tree(name: &str) -> (TreeBundle, PathBuf, std::pr
     (bundle, destination, child)
 }
 
-// REQ-WFEXEC-59: a cancellation of the parent reaches the child, which records `canceled`,
-// and the step ends `cancelled`.
+// REQ-WFEXEC-59, REQ-LOCALRUN-186: a cancellation of the parent, `um workflow run cancel`'s
+// recorded cancel, reaches the child, which records `canceled`, and the step ends `cancelled`.
 #[test]
 fn cancelling_the_parent_cancels_its_running_child() {
     let (_bundle, destination, child) = spawn_held_child_tree("cancelled");
+    poll_until(
+        "the parent holds its run",
+        || um_execution::lock_holder(&destination).is_ok_and(|holder| holder.is_some()),
+        |held| *held,
+    );
+    let cancel = super::workflow_run_control::run_control(None, "cancel", &destination, &[]);
+    assert_eq!(cancel.status.code(), Some(0), "{cancel:?}");
+    let output = child.wait_with_output().unwrap();
+
+    assert_eq!(
+        output.status.code(),
+        Some(143),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let terminal: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(workflow_run_schema().is_valid(&terminal), "{terminal}");
+    assert_eq!(result_step(&terminal, "design")["state"], "cancelled");
+    let child = run_record(&destination.join("children/design/000001"));
+    assert_eq!(child["state"], "exited");
+    assert_eq!(child["outcome"], "canceled");
+    assert_eq!(run_record(&destination)["outcome"], "canceled");
+}
+
+// REQ-WFEXEC-70, REQ-WFEXEC-69, REQ-LOCALRUN-135: SIGINT interrupts the parent and its child;
+// the child's failure edge is an exit, not a `repair` wait, so the parent takes no edge: its
+// step fails `interrupted` and the run fails, exiting 130.
+#[test]
+fn interrupting_the_parent_fails_a_stage_without_a_repair_route() {
+    let (_bundle, destination, child) = spawn_held_child_tree("interrupted");
     let pid = Pid::from_raw(i32::try_from(child.id()).unwrap()).unwrap();
     kill_process(pid, Signal::INT).unwrap();
     let output = child.wait_with_output().unwrap();
@@ -7457,11 +7644,161 @@ fn cancelling_the_parent_cancels_its_running_child() {
     );
     let terminal: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert!(workflow_run_schema().is_valid(&terminal), "{terminal}");
-    assert_eq!(result_step(&terminal, "design")["state"], "cancelled");
+    assert_eq!(terminal["outcome"], "failed", "{terminal}");
+    let design = result_step(&terminal, "design");
+    assert_eq!(design["state"], "failed", "{terminal}");
+    assert_eq!(design["detail"]["phase"], "execution", "{terminal}");
+    assert_eq!(design["detail"]["code"], "interrupted", "{terminal}");
+    assert_eq!(terminal["result"]["cancellation"]["reason"], "user_request");
     let child = run_record(&destination.join("children/design/000001"));
     assert_eq!(child["state"], "exited");
-    assert_eq!(child["outcome"], "canceled");
-    assert_eq!(run_record(&destination)["outcome"], "canceled");
+    assert_eq!(child["outcome"], "failed");
+    let record = run_record(&destination);
+    assert_eq!(record["state"], "exited");
+    assert_ne!(record["outcome"], "canceled");
+}
+
+// REQ-LOCALRUN-189, REQ-LOCALRUN-201: `show` reports a running child's current attempt, its
+// recovery status and its in-flight steps with their start times, read from the child's
+// records without changing the run directory; a child that is no longer running has none.
+#[test]
+fn show_reports_a_running_childs_attempt_and_in_flight_steps() {
+    use super::workflow_run_control::run_control;
+    use super::workflow_run_list::{shown_plain, snapshot};
+
+    let (_bundle, destination, child) = spawn_held_child_tree("shown-running-child");
+    let run = fs::canonicalize(&destination).unwrap();
+    let show = || {
+        let output = run_control(None, "show", &run, &[]);
+        assert_eq!(output.status.code(), Some(0), "{output:?}");
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()
+    };
+    let design = |document: &serde_json::Value| {
+        let children = document["children"].as_array().unwrap();
+        assert_eq!(children.len(), 1, "{document}");
+        assert_eq!(children[0]["step"], "design", "{document}");
+        children[0].clone()
+    };
+    // The command has started before the child commits `decide` running; once it has, the
+    // held child writes nothing until it is interrupted.
+    let state = run.join("children/design/000001/state.json");
+    poll_until(
+        "the child commits decide running",
+        || read_json(&state)["attempts"][0]["progress"]["steps"].clone(),
+        |steps| {
+            steps.as_array().is_some_and(|steps| {
+                steps
+                    .iter()
+                    .any(|step| step["id"] == "decide" && step["state"] == "running")
+            })
+        },
+    );
+
+    let before = snapshot(&run);
+    let running = design(&show());
+    assert_eq!(snapshot(&run), before);
+    assert_eq!(running["state"], "running", "{running}");
+    let progress = running["progress"].as_object().unwrap();
+    // The JSON carries the recorded times and no elapsed value.
+    let mut keys = progress.keys().collect::<Vec<_>>();
+    keys.sort();
+    assert_eq!(
+        keys,
+        ["attempt", "recovery", "startedAt", "state", "steps"],
+        "{running}"
+    );
+    assert_eq!(progress["attempt"], 1);
+    assert_eq!(progress["recovery"], "active");
+    assert!(progress["startedAt"].is_string(), "{running}");
+    let steps = progress["steps"].as_array().unwrap();
+    assert_eq!(steps.len(), 1, "{running}");
+    let step = steps[0].as_object().unwrap();
+    let mut keys = step.keys().collect::<Vec<_>>();
+    keys.sort();
+    assert_eq!(keys, ["id", "role", "startedAt", "state"], "{running}");
+    assert_eq!(step["id"], "decide");
+    assert_eq!(step["role"], "step");
+    assert_eq!(step["state"], "running");
+    assert!(step["startedAt"].is_string(), "{running}");
+
+    let plain = shown_plain(&run);
+    let lines = plain.lines().collect::<Vec<_>>();
+    let row = lines
+        .iter()
+        .position(|line| line.starts_with("  design - 000001 "))
+        .unwrap_or_else(|| panic!("{plain}"));
+    let under = lines[row + 1..]
+        .iter()
+        .take_while(|line| line.starts_with("    "))
+        .collect::<Vec<_>>();
+    assert!(
+        under.iter().any(|line| {
+            let words = line.split([' ', '·']).collect::<Vec<_>>();
+            words.contains(&"decide") && words.contains(&"running")
+        }),
+        "{plain}"
+    );
+
+    let pid = Pid::from_raw(i32::try_from(child.id()).unwrap()).unwrap();
+    kill_process(pid, Signal::INT).unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert_eq!(output.status.code(), Some(130), "{output:?}");
+
+    let before = snapshot(&run);
+    let exited = design(&show());
+    assert_eq!(snapshot(&run), before);
+    assert_eq!(exited["state"], "exited", "{exited}");
+    assert_eq!(exited["progress"], serde_json::Value::Null, "{exited}");
+}
+
+// REQ-LOCALRUN-189: `show` reads a child whose record is `running` from the child's own
+// records: one whose attempt has settled has no in-flight step, and one whose state cannot
+// be read refuses the run `run_directory_invalid`, naming the child.
+#[test]
+fn show_refuses_a_run_whose_running_childs_state_is_unreadable() {
+    use super::workflow_run_control::{refused, run_control};
+
+    let (_bundle, destination, output) = run_child_tree("planned");
+    succeeded(&output);
+    let run = fs::canonicalize(&destination).unwrap();
+    let child = run.join("children/design/000001");
+    // The record a parent leaves when it dies before it records its child's exit.
+    let mut record = read_json(&child.join("run.json"));
+    record["state"] = "running".into();
+    record["outcome"] = serde_json::Value::Null;
+    fs::write(child.join("run.json"), serde_json::to_vec(&record).unwrap()).unwrap();
+
+    let output = run_control(None, "show", &run, &[]);
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let document: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let design = document["children"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|child| child["step"] == "design")
+        .unwrap_or_else(|| panic!("{document}"));
+    assert_eq!(design["state"], "running", "{document}");
+    assert_eq!(design["progress"]["recovery"], "settled", "{document}");
+    assert_eq!(
+        design["progress"]["steps"],
+        serde_json::json!([]),
+        "{document}"
+    );
+
+    fs::write(child.join("state.json"), "{}").unwrap();
+    let document = refused(
+        &run_control(None, "show", &run, &[]),
+        "show",
+        "run_directory_invalid",
+    );
+    assert_eq!(
+        document["runDirectory"],
+        run.to_str().unwrap(),
+        "{document}"
+    );
+    // The run directory is the parent's, so the diagnostic names the child that failed.
+    let message = document["diagnostics"][0]["message"].as_str().unwrap();
+    assert!(message.contains(child.to_str().unwrap()), "{document}");
 }
 
 const AGENT_CHILD_ROOT: &str = "schemaVersion: 1

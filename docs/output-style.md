@@ -203,8 +203,8 @@ separate entity family.
 - **Verb lexicon:** the final token of every leaf below a command group is one
   of this closed set: `accept`, `activate`, `begin`, `cancel`, `complete`, `create`,
   `decline`, `delete`, `disable`, `doctor`, `download`, `drain`, `enable`,
-  `end`, `enroll`, `history`, `issue`, `leave`, `link`, `list`, `login`,
-  `logout`, `move`, `preview`, `propose`, `reference`, `remove`, `rename`,
+  `end`, `enroll`, `history`, `interrupt`, `issue`, `leave`, `link`, `list`,
+  `login`, `logout`, `move`, `preview`, `propose`, `reference`, `remove`, `rename`,
   `request`, `retire`, `retry`, `revoke`, `run`, `schema`, `seal`, `serve`,
   `set`, `show`, `signup`, `status`, `update`, `upload`, `uses` (the record of
   tokens issued from a grant), `validate`, `version`, `view`, `wait`. A new leaf

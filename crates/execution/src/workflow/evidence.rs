@@ -104,6 +104,9 @@ pub(crate) enum FailureCode {
     CommandWaitFailed,
     ExecutionTaskUnavailable,
     ChildRunInterrupted,
+    /// The step was stopped, or never started, because the local CLI interrupted the run
+    /// (REQ-WFEXEC-69); not the attempt state `interrupted` nor `child_run_interrupted`.
+    Interrupted,
     OutputUnsupported,
     CaptureTaskUnavailable,
     OutputPathAbsolute,
@@ -261,6 +264,21 @@ impl FailureDetail {
         }
     }
 
+    /// A step the local CLI's interruption stopped while it ran (REQ-WFEXEC-69).
+    pub(crate) fn interrupted_in_execution() -> Self {
+        Self::code(FailurePhase::Execution, FailureCode::Interrupted)
+    }
+
+    /// The first pending step an interruption failed because no step was active
+    /// (REQ-WFEXEC-69).
+    pub(crate) fn interrupted_before_start() -> Self {
+        Self::code(FailurePhase::Start, FailureCode::Interrupted)
+    }
+
+    pub(crate) fn is_interrupted(&self) -> bool {
+        self.code == FailureCode::Interrupted
+    }
+
     #[cfg(test)]
     pub(crate) fn new(
         phase: FailurePhase,
@@ -350,9 +368,8 @@ impl FailureDetail {
             | Code::MissingResult
             | Code::ResultValidationLimitExceeded
             | Code::CapturedValueTooLarge
-            | Code::ResultSettlementFailed => {
-                matches!(self.phase, Phase::Start | Phase::Execution)
-            }
+            | Code::ResultSettlementFailed
+            | Code::Interrupted => matches!(self.phase, Phase::Start | Phase::Execution),
             Code::CommandExit
             | Code::CommandWaitFailed
             | Code::ExecutionTaskUnavailable

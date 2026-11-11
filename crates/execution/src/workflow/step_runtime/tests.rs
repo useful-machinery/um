@@ -1415,6 +1415,245 @@ exports:
     .await;
 }
 
+fn assert_interrupted(state: &StepState<CapturedValue>, phase: runtime::FailurePhase) {
+    let StepState::Failed { detail } = state else {
+        panic!("the interrupted step did not fail: {state:?}");
+    };
+    assert_eq!(
+        (detail.phase, detail.code),
+        (phase, FailureCode::Interrupted)
+    );
+}
+
+// REQ-WFEXEC-69
+#[tokio::test]
+async fn a_command_that_exits_zero_after_an_interruption_fails_interrupted_without_outputs() {
+    with_watchdog(async {
+        let temporary = tempfile::tempdir().unwrap();
+        let execution_root = temporary.path().join("execution");
+        fs::create_dir(&execution_root).unwrap();
+        fs::write(execution_root.join("report.bin"), b"candidate").unwrap();
+        let source = r#"schemaVersion: 1
+steps:
+  task:
+    kind: cmd
+    command:
+      argv: ["/bin/sh", "-c", "exit 0"]
+    outputs:
+      report:
+        kind: file
+        from: path
+        path: report.bin
+        mediaType: application/octet-stream
+exports:
+  reportExport:
+    ref: outputs.task.report
+"#;
+        let admitted = admit_fixture(
+            temporary.path(),
+            &execution_root,
+            source,
+            EnvironmentSnapshot::default(),
+            1,
+        );
+        let initialized = runtime::initialize::<
+            ProvisionalStepOutputs,
+            StepFailureCause,
+            CapturedValue,
+            TestInstant,
+        >(&admitted, None);
+        let start = initialized
+            .actions
+            .iter()
+            .find(|requested| matches!(requested.action, Action::StartStep { .. }))
+            .unwrap()
+            .clone();
+        let (sender, mut receiver) = occurrence_channel(NonZeroUsize::new(4).unwrap());
+        let artifacts = test_artifacts(&admitted);
+        let mut driver = StepRuntime::new(
+            admitted,
+            artifacts.staging.clone(),
+            artifacts.inputs.clone(),
+            sender,
+            TestClock,
+        );
+        driver.release(start.clone()).await;
+        let started = runtime::reduce(&initialized.state, next_occurrence(&mut receiver).await);
+        assert!(started.occurrence_accepted);
+        let interrupted = runtime::reduce::<
+            ProvisionalStepOutputs,
+            StepFailureCause,
+            CapturedValue,
+            TestInstant,
+        >(
+            &started.state,
+            Occurrence::InterruptionOperationRequested {
+                operation: CancellationOperationId::fixture(1),
+                reason: CancellationReason::UserRequest,
+                deadline: TestInstant(Duration::from_secs(1)),
+            },
+        );
+        let stop = interrupted
+            .actions
+            .iter()
+            .find(|requested| matches!(requested.action, Action::CancelStep { .. }))
+            .unwrap()
+            .clone();
+
+        // The command exits 0 only after the interruption was accepted.
+        let (completed, acknowledgement) = next_acknowledged_occurrence(&mut receiver).await;
+        assert!(matches!(
+            completed,
+            Occurrence::StepExecutionCompleted { .. }
+        ));
+        let late = runtime::reduce(&interrupted.state, completed);
+        assert!(!late.occurrence_accepted);
+        acknowledgement.resolve(late.occurrence_accepted).await;
+        driver.release(stop).await;
+        let terminal = runtime::reduce(&interrupted.state, next_occurrence(&mut receiver).await);
+
+        assert_interrupted(
+            &terminal.state.steps["task"].state,
+            runtime::FailurePhase::Execution,
+        );
+        assert!(matches!(
+            terminal.state.workflow,
+            WorkflowState::Failed {
+                later_cancellation: Some(CancellationReason::UserRequest),
+                ..
+            }
+        ));
+        assert!(matches!(
+            terminal.state.exports.as_ref().unwrap()["reportExport"],
+            ExportValue::Unavailable { .. }
+        ));
+        assert_eq!(artifacts.staging.staged_artifact_count(), 0);
+        assert_eq!(driver.active_work_count(), 0);
+    })
+    .await;
+}
+
+// REQ-WFEXEC-69
+#[tokio::test]
+async fn an_agent_cancelled_under_an_interruption_fails_interrupted() {
+    with_watchdog(async {
+        let temporary = tempfile::tempdir().unwrap();
+        let source_root = temporary.path().join("source");
+        let execution_root = temporary.path().join("execution");
+        let staging_root = temporary.path().join("staging");
+        fs::create_dir(&execution_root).unwrap();
+        fs::create_dir(&staging_root).unwrap();
+        let cancellation = CancellationSource::new();
+        let admitted = crate::workflow::test_support::AdmittedFixture::new(
+            &source_root,
+            r#"schemaVersion: 1
+agentProfiles:
+  coding:
+    harness:
+      kind: pi
+      config:
+        model: openai/gpt-5
+        thinking: high
+steps:
+  active:
+    kind: agent
+    agent:
+      profile: coding
+      systemPrompt: prompt.md
+      message:
+        text:
+          - file: prompt.md
+    outputs:
+      response:
+        kind: text
+        from: agent_response
+  pending:
+    kind: cmd
+    dependsOn: [active]
+    command:
+      argv: ["/bin/true"]
+"#,
+        )
+        .with_files(&[("prompt.md", b"remain active")])
+        .admit(
+            ResolvedInputs::default(),
+            ExecutionContext::new(
+                execution_root,
+                ExecutionPolicyLimits::new(
+                    1,
+                    CaptureLimits::new(16, 1024 * 1024, 8 * 1024 * 1024),
+                    InputLimits::new(16, 1024 * 1024, 8 * 1024 * 1024, 8 * 1024 * 1024),
+                    1024,
+                ),
+                EnvironmentSnapshot::default(),
+                CancellationPolicy::new(cancellation.clone(), Duration::from_secs(1)),
+            )
+            .with_pi_installation(crate::pi::ValidatedPiInstallation::fixture(
+                PathBuf::from("/validated/pi"),
+            )),
+        );
+        let artifacts = test_artifacts(&admitted);
+        let attempt_directory = temporary.path().join("run/attempts/000001");
+        fs::create_dir_all(&attempt_directory).unwrap();
+        let attempt_handle: std::os::fd::OwnedFd =
+            fs::File::open(&attempt_directory).unwrap().into();
+        let (adapter, mut control) = crate::workflow::agent::scripted::scripted_agent_dispatcher();
+        let agents = AgentExecution::enabled(
+            WorkflowRunId::from(Arc::from("run-fixed")),
+            AgentInputStaging::create(admitted.execution(), &staging_root).unwrap(),
+            AgentDiagnosticSessionStore::create(
+                &attempt_handle,
+                &attempt_directory,
+                Arc::from("00000000-0000-4000-8000-000000000001"),
+                1,
+            )
+            .unwrap(),
+            adapter,
+        );
+        let (commits, _committed) = mpsc::unbounded_channel();
+        let execution = tokio::spawn(async move {
+            execute_workflow_observed(
+                admitted,
+                &artifacts.staging,
+                &artifacts.inputs,
+                &StepDiagnosticLog::default(),
+                TestClock,
+                RecordingCommitPort { commits },
+                NoopExecutionObserver,
+                agents,
+                WorkflowExecutionStart::initial(ProcessGuardRegistry::default()),
+            )
+            .await
+        });
+
+        let started = control.wait_until_started().await.unwrap();
+        started.control().start().await.unwrap();
+        assert!(cancellation.request_interruption(CancellationReason::UserRequest));
+        let result = execution.await.unwrap().unwrap();
+
+        assert_interrupted(
+            &result.state.steps["active"].state,
+            runtime::FailurePhase::Execution,
+        );
+        assert_eq!(
+            result.state.steps["pending"].state,
+            StepState::Cancelled {
+                detail: crate::workflow::evidence::CancellationDetail::new(
+                    CancellationReason::UserRequest
+                ),
+            }
+        );
+        assert!(matches!(
+            result.state.workflow,
+            WorkflowState::Failed {
+                later_cancellation: Some(CancellationReason::UserRequest),
+                ..
+            }
+        ));
+    })
+    .await;
+}
+
 #[tokio::test]
 async fn rejected_candidate_cleanup_failure_quarantines_staging_before_quiescence() {
     with_watchdog(async {
@@ -4724,12 +4963,17 @@ struct ChildFixture {
 }
 
 fn admit_child_fixture() -> ChildFixture {
+    admit_child_parent(CHILD_PARENT_WORKFLOW)
+}
+
+/// `parent` admitted as the root, its `workflow` steps running `design.yaml`.
+fn admit_child_parent(parent: &str) -> ChildFixture {
     let temporary = tempfile::tempdir().unwrap();
     let source_root = temporary.path().join("source");
     let execution_root = temporary.path().join("root");
     fs::create_dir(&source_root).unwrap();
     fs::create_dir(&execution_root).unwrap();
-    fs::write(source_root.join("workflow.yaml"), CHILD_PARENT_WORKFLOW).unwrap();
+    fs::write(source_root.join("workflow.yaml"), parent).unwrap();
     fs::write(source_root.join("design.yaml"), CHILD_DESIGN_WORKFLOW).unwrap();
     let admitted = admit_workflow(
         resolution::resolve(&source_root, Path::new("workflow.yaml")).unwrap(),
@@ -4986,6 +5230,7 @@ async fn an_exited_child_commits_its_outcome_and_available_exports() {
                     "plan".to_owned(),
                     CapturedValue::text(Arc::from("plan: AUTO-1")),
                 )]),
+                interruption: None,
             },
             true,
         );
@@ -5133,16 +5378,20 @@ steps:
 ";
 
 fn admit_fan_out_fixture(for_each: &str, optional_part: bool) -> ChildFixture {
+    admit_fan_out_parent(
+        &FAN_OUT_PARENT_WORKFLOW.replace("{for_each}", for_each),
+        optional_part,
+    )
+}
+
+/// `parent` admitted as the root beside the fan-out fixture's child files.
+fn admit_fan_out_parent(parent: &str, optional_part: bool) -> ChildFixture {
     let temporary = tempfile::tempdir().unwrap();
     let source_root = temporary.path().join("source");
     let execution_root = temporary.path().join("root");
     fs::create_dir(&source_root).unwrap();
     fs::create_dir(&execution_root).unwrap();
-    fs::write(
-        source_root.join("workflow.yaml"),
-        FAN_OUT_PARENT_WORKFLOW.replace("{for_each}", for_each),
-    )
-    .unwrap();
+    fs::write(source_root.join("workflow.yaml"), parent).unwrap();
     fs::write(source_root.join("design.yaml"), FAN_OUT_DESIGN_WORKFLOW).unwrap();
     fs::write(
         source_root.join("parts.schema.json"),
@@ -5188,6 +5437,7 @@ fn exited(outcome: &str) -> ChildRunOutcome {
     ChildRunOutcome::Exited {
         outcome: outcome.to_owned(),
         exports: BTreeMap::new(),
+        interruption: None,
     }
 }
 
@@ -5205,6 +5455,7 @@ fn planned_with_parts(parts: serde_json::Value) -> ChildRunOutcome {
                 CapturedValue::text(Arc::from("one plan")),
             ),
         ]),
+        interruption: None,
     }
 }
 
@@ -5590,6 +5841,459 @@ async fn parent_cancellation_reaches_the_child_and_cancels_the_step() {
     .await;
 }
 
+/// A root whose `design` and `build` steps run `design.yaml` (REQ-WFEXEC-70): `{planned}` is
+/// `design`'s edge for its child's `planned` and `{failed}` its edge for `failed`.
+const INTERRUPTED_PARENT_WORKFLOW: &str = "schemaVersion: 1
+inputs:
+  ticket:
+    kind: text
+outcomes: [landed, failed]
+steps:
+  design:
+    kind: workflow
+    workflow: design.yaml
+    inputs:
+      ticket:
+        ref: inputs.ticket
+    on:
+      planned: {planned}
+      blocked: exit.failed
+      failed:{failed}
+  build:
+    kind: workflow
+    workflow: design.yaml
+    inputs:
+      ticket:
+        ref: inputs.ticket
+    on:
+      planned: exit.landed
+      blocked: exit.failed
+      failed: exit.failed
+";
+
+const REPAIR_AT_DESIGN: &str = "\n        wait: repair\n        then: design";
+const ANSWER_AT_DESIGN: &str = "\n        wait: answer\n        then: design";
+const LIMITED_TO_DESIGN: &str =
+    "\n        then: design\n        limit: 2\n        else: exit.failed";
+
+fn interrupted_parent(planned: &str, failed: &str) -> ChildFixture {
+    admit_child_parent(
+        &INTERRUPTED_PARENT_WORKFLOW
+            .replace("{planned}", planned)
+            .replace("{failed}", failed),
+    )
+}
+
+/// A child that published its failure outcome after an interruption failed its step `step`.
+fn interrupted_exit(outcome: &str, step: &str) -> ChildRunOutcome {
+    ChildRunOutcome::Exited {
+        outcome: outcome.to_owned(),
+        exports: BTreeMap::new(),
+        interruption: Some(runtime::ChildInterruption {
+            reason: CancellationReason::UserRequest,
+            step: step.to_owned(),
+        }),
+    }
+}
+
+enum HeldChildEvent {
+    Holding,
+    Stopped { interrupted: bool },
+}
+
+/// What the interruption tests' children saw: every request in order, whether the held
+/// child's stop was an interruption and a force abort reached it before it settled, and
+/// whether the driver awaited the parent's force-stop deadline at all.
+#[derive(Debug, Default)]
+struct HeldChildObservation {
+    requests: Vec<ChildRunRequest>,
+    interrupted: Option<bool>,
+    force_aborted: Option<bool>,
+    deadline_awaited: bool,
+}
+
+/// A child dispatcher answering its scripted endings in order, the last for every later
+/// child. The child at call `held`, counted from 0, holds until its source is stopped, then
+/// until the test releases it, so the parent's force-stop deadline can pass meanwhile.
+#[derive(Clone)]
+struct HeldChildDispatcher {
+    endings: Arc<std::sync::Mutex<std::collections::VecDeque<ChildRunOutcome>>>,
+    held: usize,
+    report_started: bool,
+    calls: Arc<std::sync::atomic::AtomicUsize>,
+    events: mpsc::UnboundedSender<HeldChildEvent>,
+    release: Arc<tokio::sync::Notify>,
+    observation: Arc<std::sync::Mutex<HeldChildObservation>>,
+}
+
+impl ChildRunDispatcher for HeldChildDispatcher {
+    async fn stop_before(&self, _step: &str) -> bool {
+        false
+    }
+
+    async fn run(&self, request: ChildRunRequest, mut control: ChildRunControl) -> ChildRunOutcome {
+        let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if self.report_started {
+            control.report_started(PathBuf::from(format!(
+                "children/{}/{call:06}",
+                request.step
+            )));
+        }
+        self.observation.lock().unwrap().requests.push(request);
+        if call == self.held {
+            let source = control.cancellation().clone();
+            let _ = self.events.send(HeldChildEvent::Holding);
+            let _ = source.wait_for_cancellation().await;
+            let _ = self.events.send(HeldChildEvent::Stopped {
+                interrupted: source.interruption_requested(),
+            });
+            self.release.notified().await;
+            let forced =
+                futures_util::FutureExt::now_or_never(source.wait_for_force_abort()).is_some();
+            self.observation.lock().unwrap().force_aborted = Some(forced);
+        }
+        let mut endings = self.endings.lock().unwrap();
+        if endings.len() > 1 {
+            endings.pop_front().unwrap()
+        } else {
+            endings.front().unwrap().clone()
+        }
+    }
+}
+
+/// Runs `fixture` with `endings` scripted, interrupts the run with `user_request` once the
+/// child at call `held` runs and, when `running` names it, its step is `running`, passes the
+/// parent's force-stop deadline while that child holds and then releases it
+/// (REQ-WFEXEC-70). A child whose step is not named never reports that it started.
+async fn interrupt_held_child(
+    fixture: &ChildFixture,
+    endings: Vec<ChildRunOutcome>,
+    held: usize,
+    running: Option<&str>,
+) -> (
+    crate::workflow::coordinator::CoordinationResult<StepFailureCause, CapturedValue, TestInstant>,
+    HeldChildObservation,
+) {
+    let parent = fixture.admitted.execution().cancellation().source().clone();
+    let (events, mut received) = mpsc::unbounded_channel();
+    let release = Arc::new(tokio::sync::Notify::new());
+    let observation = Arc::new(std::sync::Mutex::new(HeldChildObservation::default()));
+    let dispatcher = HeldChildDispatcher {
+        endings: Arc::new(std::sync::Mutex::new(endings.into())),
+        held,
+        report_started: running.is_some(),
+        calls: Arc::default(),
+        events,
+        release: Arc::clone(&release),
+        observation: Arc::clone(&observation),
+    };
+    let (clock, mut clock_control) = AdvancingClock::new(TestInstant(Duration::ZERO));
+    let artifacts = test_artifacts(&fixture.admitted);
+    let (commits, mut committed) = mpsc::unbounded_channel();
+    let diagnostics = StepDiagnosticLog::default();
+    let execution = execute_workflow_observed_with_children(
+        fixture.admitted.clone(),
+        &artifacts.staging,
+        &artifacts.inputs,
+        &diagnostics,
+        clock,
+        RecordingCommitPort { commits },
+        NoopExecutionObserver,
+        AgentExecution::disabled(),
+        ChildRuns::Enabled {
+            dispatcher,
+            controls: ControlContext::default(),
+        },
+        WorkflowExecutionStart::initial(ProcessGuardRegistry::default()),
+    );
+    let interrupt = async {
+        assert!(matches!(
+            received.recv().await,
+            Some(HeldChildEvent::Holding)
+        ));
+        if let Some(step) = running {
+            while !matches!(
+                committed.recv().await.unwrap().state.steps[step].state,
+                StepState::Running
+            ) {}
+        }
+        assert!(parent.request_interruption(CancellationReason::UserRequest));
+        let Some(HeldChildEvent::Stopped { interrupted }) = received.recv().await else {
+            panic!("the held child was not stopped");
+        };
+        // The parent's force-stop deadline passes while the child is still settling.
+        clock_control.advance_to(TestInstant(Duration::from_secs(3_600)));
+        release.notify_one();
+        interrupted
+    };
+    let (result, interrupted) = tokio::join!(execution, interrupt);
+    let mut observed = std::mem::take(&mut *observation.lock().unwrap());
+    observed.interrupted = Some(interrupted);
+    observed.deadline_awaited = clock_control.registrations.try_recv().is_ok();
+    (result.unwrap(), observed)
+}
+
+fn not_reached_step(
+    result: &crate::workflow::coordinator::CoordinationResult<
+        StepFailureCause,
+        CapturedValue,
+        TestInstant,
+    >,
+    step: &str,
+) -> bool {
+    matches!(
+        &result.state.steps[step].state,
+        StepState::NotRun { detail } if detail.code == crate::workflow::evidence::NonExecutionCode::NotReached
+    )
+}
+
+// REQ-WFEXEC-70: an interruption reaches the running child as an interruption, never forced
+// at the parent's deadline, and the child it failed routes the step to its `repair` wait,
+// whose payload names the interruption.
+#[tokio::test]
+async fn an_interrupted_child_routes_its_step_to_the_repair_wait() {
+    with_watchdog(async {
+        let fixture = interrupted_parent("build", REPAIR_AT_DESIGN);
+        let (result, observed) = interrupt_held_child(
+            &fixture,
+            vec![interrupted_exit("failed", "plan")],
+            0,
+            Some("design"),
+        )
+        .await;
+
+        assert_eq!(observed.interrupted, Some(true));
+        assert_eq!(observed.force_aborted, Some(false));
+        assert!(!observed.deadline_awaited);
+        assert_eq!(
+            committed_outcome(&result, "design"),
+            Some(CapturedValue::text(Arc::from("failed")))
+        );
+        let WorkflowState::Waiting { wait } = &result.state.workflow else {
+            panic!("the run did not wait: {:?}", result.state.workflow);
+        };
+        assert_eq!(
+            (wait.step(), wait.kind(), wait.then()),
+            (
+                "design",
+                crate::workflow::document::WaitKind::Repair,
+                "design"
+            )
+        );
+        assert_eq!(
+            wait.interrupted(),
+            Some(&runtime::ChildInterruption {
+                reason: CancellationReason::UserRequest,
+                step: "plan".to_owned(),
+            })
+        );
+        assert!(not_reached_step(&result, "build"));
+        assert_eq!(observed.requests.len(), 1);
+
+        let steps = result
+            .state
+            .steps
+            .iter()
+            .map(|(id, runtime)| (id.clone(), runtime.state.clone()))
+            .collect::<BTreeMap<_, _>>();
+        let payload =
+            crate::workflow::wait::wait_payload(wait, &steps, Some("children/design/000000"), None);
+        assert_eq!(payload["child"], "children/design/000000");
+        assert_eq!(payload["outcome"], "failed");
+        assert_eq!(
+            payload["interrupted"],
+            serde_json::json!({"reason": "user_request", "step": "plan"})
+        );
+        assert_eq!(
+            payload["summary"]
+                .as_str()
+                .and_then(|summary| summary.split_whitespace().next()),
+            Some("interrupted")
+        );
+    })
+    .await;
+}
+
+// REQ-WFEXEC-70: an interrupted child whose failure edge is a step, an exit, a limited edge
+// or an `answer` wait takes no edge: its step fails `interrupted` and the run fails.
+#[tokio::test]
+async fn an_interrupted_child_takes_no_edge_but_a_repair_wait() {
+    with_watchdog(async {
+        for failed in [
+            " build",
+            " exit.failed",
+            LIMITED_TO_DESIGN,
+            ANSWER_AT_DESIGN,
+        ] {
+            let fixture = interrupted_parent("build", failed);
+            let (result, observed) = interrupt_held_child(
+                &fixture,
+                vec![interrupted_exit("failed", "plan")],
+                0,
+                Some("design"),
+            )
+            .await;
+
+            assert_eq!(observed.interrupted, Some(true), "{failed}");
+            assert_interrupted(
+                &result.state.steps["design"].state,
+                runtime::FailurePhase::Execution,
+            );
+            assert!(
+                matches!(
+                    &result.state.workflow,
+                    WorkflowState::Failed {
+                        primary_issue,
+                        later_cancellation: Some(CancellationReason::UserRequest),
+                    } if primary_issue.node.id == "design"
+                ),
+                "{failed}: {:?}",
+                result.state.workflow
+            );
+            assert_eq!(result.state.exit_outcome, None, "{failed}");
+            assert_eq!(result.state.wait, None, "{failed}");
+            assert_eq!(result.state.continued, None, "{failed}");
+            assert!(matches!(
+                result.state.steps["build"].state,
+                StepState::Cancelled { .. }
+            ));
+            assert_eq!(observed.requests.len(), 1, "{failed}");
+        }
+    })
+    .await;
+}
+
+// REQ-WFEXEC-70, REQ-WFEXEC-64: a child that exits on its own under an interruption settles
+// its step; an edge that would start a step ends the attempt `continued`, uncounted, with
+// nothing started, and a wait or an exit edge is taken as without the interruption.
+#[tokio::test]
+async fn a_child_exiting_on_its_own_under_an_interruption_starts_no_step() {
+    with_watchdog(async {
+        let fixture = interrupted_parent("build", REPAIR_AT_DESIGN);
+        let (result, observed) =
+            interrupt_held_child(&fixture, vec![exited("planned")], 0, Some("design")).await;
+        assert_eq!(
+            committed_outcome(&result, "design"),
+            Some(CapturedValue::text(Arc::from("planned")))
+        );
+        assert_eq!(
+            result.state.workflow,
+            WorkflowState::Continued {
+                edge: runtime::TakenEdgeRecord {
+                    step: "design".to_owned(),
+                    outcome: "planned".to_owned(),
+                    target: "build".to_owned(),
+                    counted: false,
+                },
+            }
+        );
+        assert!(not_reached_step(&result, "build"));
+        assert_eq!(observed.requests.len(), 1);
+
+        let fixture = interrupted_parent("build", ANSWER_AT_DESIGN);
+        let (result, _) =
+            interrupt_held_child(&fixture, vec![exited("failed")], 0, Some("design")).await;
+        let WorkflowState::Waiting { wait } = &result.state.workflow else {
+            panic!("the run did not wait: {:?}", result.state.workflow);
+        };
+        assert_eq!(
+            (wait.kind(), wait.interrupted()),
+            (crate::workflow::document::WaitKind::Answer, None)
+        );
+        assert!(not_reached_step(&result, "build"));
+
+        let fixture = interrupted_parent("build", ANSWER_AT_DESIGN);
+        let (result, _) =
+            interrupt_held_child(&fixture, vec![exited("blocked")], 0, Some("design")).await;
+        assert_eq!(result.state.workflow, WorkflowState::Succeeded);
+        assert_eq!(result.state.exit_outcome.as_deref(), Some("failed"));
+        assert!(not_reached_step(&result, "build"));
+    })
+    .await;
+}
+
+// REQ-WFEXEC-70: a child that ends cancelled or without a result under an interruption
+// fails its step `interrupted` at `execution`, and a step whose child had not started fails
+// at `start`.
+#[tokio::test]
+async fn a_child_ending_without_an_outcome_under_an_interruption_fails_its_step() {
+    with_watchdog(async {
+        for ending in [ChildRunOutcome::Cancelled, ChildRunOutcome::Interrupted] {
+            let fixture = interrupted_parent("build", REPAIR_AT_DESIGN);
+            let (result, _) = interrupt_held_child(&fixture, vec![ending], 0, Some("design")).await;
+            assert_interrupted(
+                &result.state.steps["design"].state,
+                runtime::FailurePhase::Execution,
+            );
+            assert!(matches!(
+                result.state.workflow,
+                WorkflowState::Failed { .. }
+            ));
+        }
+
+        let fixture = interrupted_parent("build", REPAIR_AT_DESIGN);
+        let (result, observed) =
+            interrupt_held_child(&fixture, vec![interrupted_exit("failed", "plan")], 0, None).await;
+        assert_eq!(observed.interrupted, Some(true));
+        assert_interrupted(
+            &result.state.steps["design"].state,
+            runtime::FailurePhase::Start,
+        );
+        assert!(matches!(
+            result.state.workflow,
+            WorkflowState::Failed { .. }
+        ));
+        assert_eq!(result.state.wait, None);
+    })
+    .await;
+}
+
+// REQ-WFEXEC-70, REQ-WFEXEC-66, REQ-WFEXEC-68: a fan-out interrupted at element 2 ends there
+// on its `repair` wait and runs no element 3.
+#[tokio::test]
+async fn an_interrupted_fan_out_element_ends_the_step_on_its_repair_wait() {
+    with_watchdog(async {
+        let parent = FAN_OUT_PARENT_WORKFLOW
+            .replace("{for_each}", "outputs.design.parts")
+            .replace(
+                "      failed: exit.failed\n  land:",
+                "      failed:\n        wait: repair\n        then: build\n  land:",
+            );
+        let fixture = admit_fan_out_parent(&parent, false);
+        let (result, observed) = interrupt_held_child(
+            &fixture,
+            vec![
+                planned_with_parts(parts_abc()),
+                exited("built"),
+                interrupted_exit("failed", "plan"),
+            ],
+            2,
+            Some("build"),
+        )
+        .await;
+
+        assert_eq!(
+            observed
+                .requests
+                .iter()
+                .filter(|request| request.step == "build")
+                .map(|request| request.item)
+                .collect::<Vec<_>>(),
+            [Some(1), Some(2)]
+        );
+        let WorkflowState::Waiting { wait } = &result.state.workflow else {
+            panic!("the run did not wait: {:?}", result.state.workflow);
+        };
+        assert_eq!(
+            (wait.step(), wait.kind()),
+            ("build", crate::workflow::document::WaitKind::Repair)
+        );
+        assert!(wait.interrupted().is_some());
+        assert!(not_reached_step(&result, "land"));
+    })
+    .await;
+}
+
 // REQ-WFEXEC-62: a stop control in force for a `workflow` step enters a `stop` wait at it
 // instead of starting its child.
 #[tokio::test]
@@ -5600,6 +6304,7 @@ async fn a_stop_in_force_enters_a_stop_wait_and_runs_no_child() {
             ChildRunOutcome::Exited {
                 outcome: "planned".to_owned(),
                 exports: BTreeMap::new(),
+                interruption: None,
             },
             true,
         );
@@ -5750,6 +6455,7 @@ async fn control_values_reach_only_the_step_they_name() {
             ChildRunOutcome::Exited {
                 outcome: "done".to_owned(),
                 exports: BTreeMap::new(),
+                interruption: None,
             },
             true,
         );

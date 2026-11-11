@@ -695,6 +695,9 @@
         },
         "diagnostic": {
           "$ref": "#/$defs/FailureDiagnostic"
+        },
+        "startedAt": {
+          "$ref": "#/$defs/Timestamp"
         }
       },
       "allOf": [
@@ -708,6 +711,25 @@
             "properties": {
               "state": {
                 "const": "failed"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "required": [
+              "startedAt"
+            ]
+          },
+          "then": {
+            "properties": {
+              "state": {
+                "not": {
+                  "enum": [
+                    "pending",
+                    "inherited"
+                  ]
+                }
               }
             }
           }
@@ -1509,6 +1531,7 @@
             "command_exit",
             "command_wait_failed",
             "child_run_interrupted",
+            "interrupted",
             "output_unsupported",
             "capture_task_unavailable",
             "output_path_absolute",
@@ -3260,7 +3283,8 @@
                 "missing_result",
                 "result_validation_limit_exceeded",
                 "captured_value_too_large",
-                "result_settlement_failed"
+                "result_settlement_failed",
+                "interrupted"
               ]
             }
           },

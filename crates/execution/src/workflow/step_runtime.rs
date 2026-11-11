@@ -62,8 +62,9 @@ use super::recovery::{
     parse_recovery_decision, recovery_definition, recovery_handler_cwd,
 };
 use super::runtime::{
-    Action, ActionId, ActionInput, FOR_EACH_INPUT, FailurePhase, ProvisionalStepResources,
-    RecoveryDecision, RecoveryRoundNumber, RecoveryRoundRecord, RequestedAction, later_step,
+    Action, ActionId, ActionInput, ChildEnding, ChildInterruption, FOR_EACH_INPUT, FailurePhase,
+    ProvisionalStepResources, RecoveryDecision, RecoveryRoundNumber, RecoveryRoundRecord,
+    RequestedAction, later_step,
 };
 use super::validated::{
     ResolvedOutputSource, ResolvedValueSource, ValidatedAgentStep, ValidatedCommandStep,
@@ -309,6 +310,8 @@ pub(crate) enum StepRuntimeError {
 pub(crate) struct ProvisionalStepOutputs {
     values: BTreeMap<String, CapturedValue>,
     agent_staging: Option<Arc<AgentInputStagingLease>>,
+    /// How a `workflow` step's child ended (REQ-WFEXEC-70).
+    child: Option<ChildEnding>,
 }
 
 impl ProvisionalStepOutputs {
@@ -316,6 +319,7 @@ impl ProvisionalStepOutputs {
         Self {
             values: BTreeMap::new(),
             agent_staging: None,
+            child: None,
         }
     }
 
@@ -323,6 +327,7 @@ impl ProvisionalStepOutputs {
         Self {
             values,
             agent_staging: Some(Arc::new(staging)),
+            child: None,
         }
     }
 
@@ -334,6 +339,10 @@ impl ProvisionalStepOutputs {
 impl ProvisionalStepResources for ProvisionalStepOutputs {
     fn requires_release(&self) -> bool {
         self.agent_staging.is_some()
+    }
+
+    fn child_ending(&self) -> Option<ChildEnding> {
+        self.child.clone()
     }
 }
 
@@ -353,6 +362,7 @@ impl std::fmt::Debug for ProvisionalStepOutputs {
             .debug_struct("ProvisionalStepOutputs")
             .field("values", &self.values)
             .field("agent_staging", &agent_staging)
+            .field("child", &self.child)
             .finish()
     }
 }
@@ -360,6 +370,7 @@ impl std::fmt::Debug for ProvisionalStepOutputs {
 impl PartialEq for ProvisionalStepOutputs {
     fn eq(&self, other: &Self) -> bool {
         self.values == other.values
+            && self.child == other.child
             && match (&self.agent_staging, &other.agent_staging) {
                 (Some(left), Some(right)) => Arc::ptr_eq(left, right),
                 (None, None) => true,
@@ -400,6 +411,21 @@ impl DriverOccurrenceContent for ProvisionalStepOutputs {
                 digest.write_tag(1);
                 digest.write_bytes(root.as_bytes());
                 digest.write_bytes(view.as_bytes());
+            }
+            None => digest.write_tag(0),
+        }
+        match &self.child {
+            Some(child) => {
+                digest.write_tag(1);
+                digest.write_bytes(child.outcome.as_bytes());
+                match &child.interruption {
+                    Some(interruption) => {
+                        digest.write_tag(1);
+                        digest.write_bytes(interruption.reason.as_str().as_bytes());
+                        digest.write_bytes(interruption.step.as_bytes());
+                    }
+                    None => digest.write_tag(0),
+                }
             }
             None => digest.write_tag(0),
         }
@@ -614,10 +640,12 @@ impl ChildRunControl {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ChildRunOutcome {
     /// The child published a result recording `outcome`; `exports` holds its available
-    /// `text` and `json` exports.
+    /// `text` and `json` exports, and `interruption` the interruption that failed it, when
+    /// its primary issue is a step that failed `interrupted` (REQ-WFEXEC-70).
     Exited {
         outcome: String,
         exports: BTreeMap<String, CapturedValue>,
+        interruption: Option<ChildInterruption>,
     },
     /// The child could not be admitted or its directory created.
     Rejected { code: String },
@@ -689,16 +717,27 @@ enum ExecutionControl {
 }
 
 impl ExecutionControl {
-    fn interrupt(&self, reason: CancellationReason) {
+    /// Stops the work; a child run receives the parent's interruption as an interruption
+    /// and any other stop as a cancellation (REQ-WFEXEC-59, REQ-WFEXEC-70).
+    fn interrupt(&self, reason: CancellationReason, interruption: bool) {
         match self {
             Self::Agent(control) => control.interrupt(),
             Self::Child(cancellation) if reason == CancellationReason::ForceAbort => {
                 let _ = cancellation.request_force_abort();
             }
+            Self::Child(cancellation) if interruption => {
+                let _ = cancellation.request_interruption(reason);
+            }
             Self::Child(cancellation) => {
                 let _ = cancellation.request_cancellation(reason);
             }
         }
+    }
+
+    /// Whether the step's force-stop deadline forces this work: an interrupted child is
+    /// left to settle, its own grace period and finalizers included (REQ-WFEXEC-70).
+    const fn forced_at_deadline(&self, interruption: bool) -> bool {
+        !(interruption && matches!(self, Self::Child(_)))
     }
 
     fn force(&self) {
@@ -2074,9 +2113,11 @@ where
             None => ChildRunOutcome::Exited {
                 outcome: empty.unwrap_or_default(),
                 exports: BTreeMap::new(),
+                interruption: None,
             },
         };
-        // The last element's outcome ends the step whatever its edge.
+        // The last element's outcome ends the step whatever its edge, and an element an
+        // interruption failed ends it with that element's outcome (REQ-WFEXEC-70).
         while self.continues_fan_out(&step, &outcome) {
             let Some(request) = requests.next() else {
                 break;
@@ -2089,13 +2130,16 @@ where
                 .await
                 .unwrap_or(ChildRunOutcome::Interrupted);
         }
-        let occurrence = match self.child_outputs(&step, outcome) {
-            Ok(values) => DriverOccurrence::step_execution_completed(
+        let outputs = self.child_outputs(&step, outcome);
+        let completed = outputs.is_ok();
+        let occurrence = match outputs {
+            Ok((values, child)) => DriverOccurrence::step_execution_completed(
                 step,
                 action,
                 ProvisionalStepOutputs {
                     values,
                     agent_staging: None,
+                    child: Some(child),
                 },
             ),
             Err(failure) => DriverOccurrence::step_execution_failed(
@@ -2104,14 +2148,54 @@ where
                 StepFailureCause::Execution(failure),
             ),
         };
+        if completed && self.interruption_requested() {
+            return self.settle_interrupted_child(action, occurrence).await;
+        }
         self.settle_agent_occurrence(action, occurrence).await
+    }
+
+    /// Settles a `workflow` step's completion under the run's interruption as
+    /// `settle_agent_occurrence` does, except that a completion the stop reached is still
+    /// delivered: the reducer routes it on the step's edge or fails the step `interrupted`,
+    /// and the stop settles only when the reducer does not take it (REQ-WFEXEC-70).
+    async fn settle_interrupted_child(
+        &self,
+        action: ActionId,
+        occurrence: DriverOccurrence<ProvisionalStepOutputs, StepFailureCause, CapturedValue>,
+    ) -> Result<(), StepRuntimeError> {
+        let completed = occurrence.clone();
+        let completion = self.claim_completion_occurrence(action, occurrence).await?;
+        let Some(cancellation) = self.publish_claimed_completion(action, completion)? else {
+            return Ok(());
+        };
+        let cancellation = self.release_cancelled_work(action, cancellation).await;
+        match self.occurrences.send_acknowledged(completed).await {
+            Ok(DriverOccurrenceAcceptance::Accepted(finalization)) => {
+                finalization.finalize();
+                Ok(())
+            }
+            Ok(DriverOccurrenceAcceptance::Rejected(finalization)) => {
+                finalization.finalize();
+                self.send(DriverOccurrence::step_quiesced(
+                    cancellation.step,
+                    cancellation.action,
+                ))
+                .await
+            }
+            Err(_) => Err(StepRuntimeError::OccurrenceReceiverClosed),
+        }
     }
 
     /// Whether a fan-out goes on past an element that ended with `outcome`: the child
     /// exited with an outcome whose edge is a step later in document order than `step`
     /// (REQ-WFEXEC-66), the same comparison an ordinary edge makes (REQ-WFEXEC-58).
     fn continues_fan_out(&self, step: &str, outcome: &ChildRunOutcome) -> bool {
-        let ChildRunOutcome::Exited { outcome, .. } = outcome else {
+        let ChildRunOutcome::Exited {
+            outcome,
+            interruption: None,
+            ..
+        } = outcome
+        else {
             return false;
         };
         let Some(ValidatedStep::Workflow(workflow)) = workflow_node(&self.admitted, step) else {
@@ -2149,14 +2233,20 @@ where
     }
 
     /// The values a child that exited commits for the step: `outcome` and each declared
-    /// `text` or `json` export the child made available, detached from the child's staging.
+    /// `text` or `json` export the child made available, detached from the child's staging,
+    /// with the child's ending the reducer routes on under an interruption (REQ-WFEXEC-70).
     /// An outcome the step routes nowhere, or any other ending, is an interrupted child.
     fn child_outputs(
         &self,
         step: &str,
         outcome: ChildRunOutcome,
-    ) -> Result<BTreeMap<String, CapturedValue>, StepExecutionFailure> {
-        let ChildRunOutcome::Exited { outcome, exports } = outcome else {
+    ) -> Result<(BTreeMap<String, CapturedValue>, ChildEnding), StepExecutionFailure> {
+        let ChildRunOutcome::Exited {
+            outcome,
+            exports,
+            interruption,
+        } = outcome
+        else {
             return Err(StepExecutionFailure::ChildInterrupted);
         };
         let Some(ValidatedStep::Workflow(workflow)) = workflow_node(&self.admitted, step) else {
@@ -2179,9 +2269,15 @@ where
         }
         values.insert(
             CHILD_OUTCOME_OUTPUT.to_owned(),
-            CapturedValue::text(Arc::from(outcome)),
+            CapturedValue::text(Arc::from(outcome.as_str())),
         );
-        Ok(values)
+        Ok((
+            values,
+            ChildEnding {
+                outcome,
+                interruption,
+            },
+        ))
     }
 
     async fn settle_agent_cancellation(
@@ -2262,24 +2358,36 @@ where
         action: ActionId,
         completion: ClaimedCompletion<Clock::Instant>,
     ) -> Result<(), StepRuntimeError> {
+        match self.publish_claimed_completion(action, completion)? {
+            Some(cancellation) => self.finish_cancellation(action, cancellation).await,
+            None => Ok(()),
+        }
+    }
+
+    /// Publishes a claimed completion unless the step's stop reached it first, and returns
+    /// that stop.
+    fn publish_claimed_completion(
+        &self,
+        action: ActionId,
+        completion: ClaimedCompletion<Clock::Instant>,
+    ) -> Result<Option<CommandCancellation<Clock::Instant>>, StepRuntimeError> {
         let claim = match completion {
             ClaimedCompletion::Lifecycle(claim) => claim,
-            ClaimedCompletion::Cancelled(cancellation) => {
-                return self.finish_cancellation(action, cancellation).await;
-            }
-            ClaimedCompletion::Gone => return Ok(()),
+            ClaimedCompletion::Cancelled(cancellation) => return Ok(Some(cancellation)),
+            ClaimedCompletion::Gone => return Ok(None),
         };
         match self.with_work(|work| work.finish_completion(action)) {
             CompletionClaim::Lifecycle => claim
                 .publish()
+                .map(|()| None)
                 .map_err(|_| StepRuntimeError::OccurrenceReceiverClosed),
             CompletionClaim::Cancelled(cancellation) => {
                 claim.discard();
-                self.finish_cancellation(action, cancellation).await
+                Ok(Some(cancellation))
             }
             CompletionClaim::Gone => {
                 claim.discard();
-                Ok(())
+                Ok(None)
             }
         }
     }
@@ -2398,16 +2506,27 @@ where
         self.finish_cancellation(action, cancellation).await
     }
 
-    async fn finish_cancellation(
+    /// Retires a stopped step's work once its forced deadline, if any, has finished, and
+    /// returns the stop that settles it.
+    async fn release_cancelled_work(
         &self,
         action: ActionId,
         cancellation: CommandCancellation<Clock::Instant>,
-    ) -> Result<(), StepRuntimeError> {
+    ) -> CommandCancellation<Clock::Instant> {
         let (cancellation, deadline_finished) =
             self.with_work(|work| work.finish_cancellation(action, cancellation));
         if let Some(deadline_finished) = deadline_finished {
             let _ = deadline_finished.await;
         }
+        cancellation
+    }
+
+    async fn finish_cancellation(
+        &self,
+        action: ActionId,
+        cancellation: CommandCancellation<Clock::Instant>,
+    ) -> Result<(), StepRuntimeError> {
+        let cancellation = self.release_cancelled_work(action, cancellation).await;
         self.send(DriverOccurrence::step_quiesced(
             cancellation.step,
             cancellation.action,
@@ -2613,7 +2732,18 @@ where
         reason: CancellationReason,
         deadline: Clock::Instant,
     ) -> CancellationRegistration<Clock::Instant> {
-        self.with_work(|work| work.cancel(step, action, reason, deadline))
+        let interruption = self.interruption_requested();
+        self.with_work(|work| work.cancel(step, action, reason, deadline, interruption))
+    }
+
+    /// Whether the run's stop is an interruption (REQ-WFEXEC-69): the reducer settles its
+    /// stopped steps `interrupted` and routes a `workflow` step's child (REQ-WFEXEC-70).
+    fn interruption_requested(&self) -> bool {
+        self.admitted
+            .execution()
+            .cancellation()
+            .source()
+            .interruption_requested()
     }
 
     fn cancellation_for(&self, action: ActionId) -> Option<CommandCancellation<Clock::Instant>> {
@@ -2931,6 +3061,7 @@ impl CaptureWorker {
         let ProvisionalStepOutputs {
             mut values,
             agent_staging,
+            ..
         } = provisional;
         if self.with_work(|work| work.is_cancelled(action)) {
             candidates.abort();
@@ -2952,6 +3083,7 @@ impl CaptureWorker {
                 provisional: ProvisionalStepOutputs {
                     values: BTreeMap::new(),
                     agent_staging,
+                    child: None,
                 },
             };
             self.settle_failure(request, failure, started).await;
@@ -3413,6 +3545,7 @@ where
         action: ActionId,
         reason: CancellationReason,
         deadline: Deadline,
+        interruption: bool,
     ) -> CancellationRegistration<Deadline> {
         if !self.known_actions.insert(action) {
             return CancellationRegistration::Duplicate;
@@ -3445,19 +3578,25 @@ where
             }
             _ => None,
         };
-        let agent_deadline = work.control.clone().map(|process_control| {
-            process_control.interrupt(reason);
-            let (shutdown, deadline_shutdown) = oneshot::channel();
-            let (deadline_finished, finished) = oneshot::channel();
-            work.agent_deadline_shutdown = Some(shutdown);
-            work.agent_deadline_finished = Some(finished);
-            AgentCancellationDeadline {
-                process_control,
-                deadline,
-                shutdown: deadline_shutdown,
-                finished: deadline_finished,
-            }
-        });
+        if let Some(process_control) = &work.control {
+            process_control.interrupt(reason, interruption);
+        }
+        let agent_deadline = work
+            .control
+            .clone()
+            .filter(|process_control| process_control.forced_at_deadline(interruption))
+            .map(|process_control| {
+                let (shutdown, deadline_shutdown) = oneshot::channel();
+                let (deadline_finished, finished) = oneshot::channel();
+                work.agent_deadline_shutdown = Some(shutdown);
+                work.agent_deadline_finished = Some(finished);
+                AgentCancellationDeadline {
+                    process_control,
+                    deadline,
+                    shutdown: deadline_shutdown,
+                    finished: deadline_finished,
+                }
+            });
         CancellationRegistration::Active {
             wake: work.cancellation_wake.take(),
             interrupt,
@@ -3533,7 +3672,7 @@ where
             // A child run observes only its own cancellation source, so a revoked
             // `workflow` step cancels its child here.
             if let Some(control @ ExecutionControl::Child(_)) = &work.control {
-                control.interrupt(CancellationReason::RunnerShutdown);
+                control.interrupt(CancellationReason::RunnerShutdown, false);
             }
             let interrupt = match (work.phase, work.process_group.clone()) {
                 (WorkPhase::Running | WorkPhase::Started, Some(process_group))

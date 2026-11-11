@@ -819,7 +819,7 @@ fn validate_outcome(result: &WorkflowResultV1) -> Result<(), ResultMetadataError
         .any(|step| {
             step.id == primary.node.id
                 && step.role == role
-                && step.failure_policy == FailurePolicy::Required
+                && (step.failure_policy == FailurePolicy::Required || interrupted(&detail))
                 && step.state
                     == match primary.state {
                         PrimaryIssueState::Failed => WorkflowStepStateV1::Failed,
@@ -1459,7 +1459,9 @@ fn validate_step_recovery(
             round,
             active_role,
             execution_number,
-        } if step.state == WorkflowStepStateV1::Cancelled
+        } if (step.state == WorkflowStepStateV1::Cancelled
+            || step.state == WorkflowStepStateV1::Failed
+                && terminal_failure_detail(step).is_some_and(|detail| detail.is_interrupted()))
             && *round == last_round
             && ((*active_role == RecoveryInvocationRoleV1::Target
                 && execution_number.is_some_and(|execution| execution == maximum_target))
@@ -1474,6 +1476,11 @@ fn validate_step_recovery(
         _ => return Err(ResultMetadataError),
     }
     Ok(())
+}
+
+// An interrupted step is the primary issue whatever its failure policy (REQ-WFEXEC-69).
+fn interrupted(detail: &NodeDetail) -> bool {
+    matches!(detail, NodeDetail::Failed(detail) if detail.is_interrupted())
 }
 
 fn terminal_failure_detail(step: &WorkflowStepV1) -> Option<FailureDetail> {
@@ -1656,7 +1663,8 @@ fn simple_failure_phase(code: FailureCodeV1, phase: FailurePhaseV1) -> bool {
         | FailureCodeV1::MissingResult
         | FailureCodeV1::ResultValidationLimitExceeded
         | FailureCodeV1::CapturedValueTooLarge
-        | FailureCodeV1::ResultSettlementFailed => {
+        | FailureCodeV1::ResultSettlementFailed
+        | FailureCodeV1::Interrupted => {
             matches!(phase, FailurePhaseV1::Start | FailurePhaseV1::Execution)
         }
         FailureCodeV1::CommandWaitFailed

@@ -52,15 +52,16 @@ use um_execution::{
     write_untested_harness_advisories,
 };
 use um_execution::{
-    AgentProfileReplacementDocument, AgentProfileReplacementV1,
+    AgentProfileReplacementDocument, AgentProfileReplacementV1, ChildRunPresentation,
     MAXIMUM_AGENT_PROFILE_REPLACEMENT_BYTES,
 };
 use um_execution::{
-    CONTROL_STOP, CapturedValue, ChildInputValue, ChildRunControl, ChildRunDispatcher,
-    ChildRunOutcome, ChildRunParent, ChildRunRequest, ChildRuns, ControlEvent, EnteredWait,
-    ExportValue, LocalRetryBeginError, LocalRetryOpen, Mirror, RejectionDiagnostic, Scheduling,
-    WaitKind, WaitRecord, acquire_local_retry, adopted_child_outcome, append_control,
-    attempt_controls, position_path, read_controls, stop_in_force, wait_payload,
+    CONTROL_CANCEL, CONTROL_INTERRUPT, CONTROL_STOP, CapturedValue, ChildInputValue,
+    ChildRunControl, ChildRunDispatcher, ChildRunOutcome, ChildRunParent, ChildRunRequest,
+    ChildRuns, ControlEvent, EnteredWait, ExportValue, LocalRetryBeginError, LocalRetryOpen,
+    Mirror, RejectionDiagnostic, Scheduling, WaitKind, WaitRecord, acquire_local_retry,
+    adopted_child_outcome, append_control, attempt_controls, position_path, read_controls,
+    read_numbered_controls, stop_in_force, wait_payload,
 };
 use um_execution::{
     DefinitionError, SubjectClaim, SubjectError, WorkflowHome, check_subject, chosen_outcome,
@@ -197,21 +198,7 @@ impl Command {
 
         let inputs = acquire_inputs(&input_plan, &cancellation)
             .await
-            .map_err(|error| match cancellation.cancellation_reason() {
-                Some(CancellationReason::UserRequest) => {
-                    super::super::super::CommandFailure::for_outcome(
-                        error,
-                        OutcomeClass::Interrupted,
-                    )
-                }
-                Some(CancellationReason::TerminationRequest) => {
-                    super::super::super::CommandFailure::for_outcome(
-                        error,
-                        OutcomeClass::Terminated,
-                    )
-                }
-                _ => error.into(),
-            })?;
+            .map_err(|error| signalled_failure(error, cancellation.cancellation_reason()))?;
         let replacement = match &self.agent_profiles {
             Some(path) => Some(acquire_agent_profile_replacement(path, &cancellation)?),
             None => None,
@@ -392,54 +379,33 @@ impl Command {
         });
         let run_directory = destination.run_directory(record.as_ref())?;
         let started_record = record.clone();
-        let requested_run_directory = run_directory.clone();
-        let admitted_for_creation = admitted.clone();
-        let stop_before = self.stop_before.clone();
         let definition = destination.definition();
-        let created = tokio::task::spawn_blocking(move || {
-            destination.prepare().map_err(CreationFailure::Other)?;
-            // REQ-WFDEF-28: the slot is taken under the index's lock, held until the run
-            // directory exists, so of two creates for one subject one is refused.
-            let claim = match (&subject, &record) {
-                (Some(subject), Some(record)) => destination
-                    .take_subject_slot(subject, &record.id)
-                    .map_err(CreationFailure::Subject)?,
-                _ => None,
-            };
-            let owned_run = InitialLocalRun::create_with_record(
-                &requested_run_directory,
-                &admitted_for_creation,
-                record.as_ref(),
-            )
-            .map_err(|error| CreationFailure::Other(anyhow::Error::new(error)))?;
-            drop(claim);
-            // REQ-LOCALRUN-185: the stop is recorded before the first step starts.
-            if let (Some(step), Some(record)) = (stop_before, &record) {
-                let payload = serde_json::Map::from_iter([(
-                    "before".to_owned(),
-                    serde_json::Value::String(step),
-                )]);
-                let stop = ControlEvent::new(
-                    CONTROL_STOP,
-                    &record.id,
-                    &super::super::login_name(),
-                    None,
-                    Some(payload),
-                )
-                .map_err(|error| CreationFailure::Other(error.into()))?;
-                append_control(owned_run.run_directory(), &stop)
-                    .map_err(|error| CreationFailure::Other(error.into()))?;
-            }
-            Ok::<_, CreationFailure>(owned_run)
-        })
-        .await
-        .map_err(|error| CreationFailure::Other(anyhow::Error::new(error)))
-        .and_then(|result| result);
-        let owned_run = match created {
-            Ok(owned_run) => owned_run,
+        let creation = RunCreation {
+            destination,
+            subject,
+            record,
+            run_directory: run_directory.clone(),
+            admitted: admitted.clone(),
+            stop_before: self.stop_before.clone(),
+        };
+        let creation_cancellation = cancellation.clone();
+        let journals = signal_task
+            .0
+            .as_ref()
+            .map(|observation| observation.journals.clone())
+            .unwrap_or_default();
+        let created =
+            tokio::task::spawn_blocking(move || creation.create(&creation_cancellation, &journals))
+                .await
+                .map_err(|error| CreationFailure::Other(anyhow::Error::new(error)))
+                .and_then(|result| result);
+        // REQ-LOCALRUN-135: a signal reads the created run's control journal.
+        let (owned_run, _journal) = match created {
+            Ok(created) => created,
             Err(CreationFailure::Subject(error)) => {
                 return subject_rejection(presentation_config, definition, error);
             }
+            Err(CreationFailure::Signalled(failure)) => return Err(failure),
             Err(CreationFailure::Other(error)) => {
                 return Err(error
                     .context(format!(
@@ -589,10 +555,123 @@ impl RunDestination {
     }
 }
 
+/// The creation of an admitted run: its directory at `run_directory` under `destination`,
+/// its record and subject slot, and the stop `--stop-before` names.
+struct RunCreation {
+    destination: RunDestination,
+    subject: Option<String>,
+    record: Option<WorkflowRunRecord>,
+    run_directory: PathBuf,
+    admitted: AdmittedWorkflow,
+    stop_before: Option<String>,
+}
+
+impl RunCreation {
+    /// Creates the run directory, taking the subject's slot under the index's lock, and
+    /// returns the run with its control journal watched in `journals`. A signal
+    /// `cancellation` holds before the slot is taken or the directory is created refuses
+    /// the creation, so no run exists and the slot's claim is released. `journals` watches
+    /// the run directory from before the first of those checks, so a signal that arrives
+    /// after the last one, while the directory is made, is an interruption: the run it
+    /// could not refuse never ends `canceled` (REQ-LOCALRUN-135).
+    fn create(
+        self,
+        cancellation: &CancellationSource,
+        journals: &ControlJournals,
+    ) -> Result<(InitialLocalRun, WatchedJournal), CreationFailure> {
+        let Self {
+            destination,
+            subject,
+            record,
+            run_directory,
+            admitted,
+            stop_before,
+        } = self;
+        // The directory does not exist yet, so this journal holds no control and makes a
+        // signal an interruption; the created run's journal replaces it below.
+        let creating = journals.watch(&run_directory);
+        let refuse_when_signalled = || match cancellation.cancellation_reason() {
+            None => Ok(()),
+            reason => Err(CreationFailure::Signalled(signalled_before_creation(
+                reason,
+            ))),
+        };
+        refuse_when_signalled()?;
+        destination.prepare().map_err(CreationFailure::Other)?;
+        // REQ-WFDEF-28: the slot is taken under the index's lock, held until the run
+        // directory exists, so of two creates for one subject one is refused.
+        let claim = match (&subject, &record) {
+            (Some(subject), Some(record)) => destination
+                .take_subject_slot(subject, &record.id)
+                .map_err(CreationFailure::Subject)?,
+            _ => None,
+        };
+        // A refusal here drops the claim; the slot then names a run with no directory,
+        // which leaves it free (REQ-WFDEF-28).
+        refuse_when_signalled()?;
+        let owned_run =
+            InitialLocalRun::create_with_record(&run_directory, &admitted, record.as_ref())
+                .map_err(|error| CreationFailure::Other(anyhow::Error::new(error)))?;
+        drop(claim);
+        // REQ-LOCALRUN-185: the stop is recorded before the first step starts.
+        if let (Some(step), Some(record)) = (stop_before, &record) {
+            let payload = serde_json::Map::from_iter([(
+                "before".to_owned(),
+                serde_json::Value::String(step),
+            )]);
+            let stop = ControlEvent::new(
+                CONTROL_STOP,
+                &record.id,
+                &super::super::login_name(),
+                None,
+                Some(payload),
+            )
+            .map_err(|error| CreationFailure::Other(error.into()))?;
+            append_control(owned_run.run_directory(), &stop)
+                .map_err(|error| CreationFailure::Other(error.into()))?;
+        }
+        // A `control.cancel` appended from here on is new to this journal and cancels.
+        let journal = journals.watch(owned_run.run_directory());
+        drop(creating);
+        Ok((owned_run, journal))
+    }
+}
+
+/// The failure of a command a signal reached before the directory of the run it would
+/// create existed, `create`'s run or a successor: no run is created (REQ-LOCALRUN-135).
+pub(super) fn signalled_before_creation(
+    reason: Option<CancellationReason>,
+) -> super::super::super::CommandFailure {
+    signalled_failure(
+        anyhow!("workflow run not created: a signal arrived before its run directory existed"),
+        reason,
+    )
+}
+
+/// The failure of a command a signal stopped before its run's attempt, by the signal's
+/// `reason` (REQ-WFEXEC-40): 130 for `user_request`, 143 for `termination_request`, and a
+/// general failure for no signal.
+fn signalled_failure(
+    error: anyhow::Error,
+    reason: Option<CancellationReason>,
+) -> super::super::super::CommandFailure {
+    match reason {
+        Some(CancellationReason::UserRequest) => {
+            super::super::super::CommandFailure::for_outcome(error, OutcomeClass::Interrupted)
+        }
+        Some(CancellationReason::TerminationRequest) => {
+            super::super::super::CommandFailure::for_outcome(error, OutcomeClass::Terminated)
+        }
+        _ => error.into(),
+    }
+}
+
 /// Why the run directory of an admitted run was not created.
 enum CreationFailure {
     /// The subject's slot was refused under the index's lock (REQ-WFDEF-28).
     Subject(SubjectError),
+    /// A signal arrived before the run directory existed (REQ-LOCALRUN-135).
+    Signalled(super::super::super::CommandFailure),
     Other(anyhow::Error),
 }
 
@@ -842,12 +921,12 @@ where
     Ok(prepared)
 }
 
-struct AbortOnDrop(Option<tokio::task::JoinHandle<()>>);
+struct AbortOnDrop(Option<SignalObservation>);
 
 impl Drop for AbortOnDrop {
     fn drop(&mut self) {
-        if let Some(task) = self.0.take() {
-            task.abort();
+        if let Some(observation) = self.0.take() {
+            observation.abort();
         }
     }
 }
@@ -857,7 +936,7 @@ struct AttemptTeardown {
     /// The outcome the run record takes when the attempt ends without a published result
     /// (REQ-WFEXEC-57).
     failure_outcome: String,
-    signal_task: Option<tokio::task::JoinHandle<()>>,
+    signal_task: Option<SignalObservation>,
     private_staging: Option<um_execution::AttemptPrivateStaging>,
     artifacts: Option<ArtifactStaging>,
     inputs: Option<InputStaging>,
@@ -877,7 +956,7 @@ impl AttemptTeardown {
     fn new(
         run: LocalAttemptOwner,
         failure_outcome: &str,
-        signal_task: Option<tokio::task::JoinHandle<()>>,
+        signal_task: Option<SignalObservation>,
     ) -> Self {
         Self {
             run: Some(run),
@@ -1022,12 +1101,16 @@ struct AttemptSettings<Hooks> {
     presentation_config: PresentationConfig,
     leaf: ExecutionLeaf,
     hooks: Hooks,
-    /// A child run's attempt (REQ-WFEXEC-59): no presentation and no child runs of its own.
-    quiet: bool,
+    /// A child run's attempt (REQ-WFEXEC-59), with the presentation it has in its parent's
+    /// progress stream (REQ-LOCALRUN-200): no presentation and no child runs of its own.
+    child: Option<ChildPresentation>,
     /// The child run an abandoned parent's continuation adopts or retries in place
     /// (REQ-CONTINUE-76), or the child an independent repair completed that a repair retry
     /// adopts (REQ-CONTINUE-75).
     child_recovery: Option<ChildRecovery>,
+    /// The control journals the command's signal observer reads, which the attempt's run
+    /// directory and its children's join while they run (REQ-LOCALRUN-135).
+    journals: ControlJournals,
 }
 
 trait AttemptHooks {
@@ -1074,7 +1157,7 @@ pub(super) async fn execute_owned_attempt(
     admitted: AdmittedWorkflow,
     owned_run: LocalAttemptOwner,
     cancellation: CancellationSource,
-    signal_task: tokio::task::JoinHandle<()>,
+    signal_task: SignalObservation,
     presentation_config: PresentationConfig,
     leaf: ExecutionLeaf,
 ) -> super::super::super::CommandResult {
@@ -1098,10 +1181,11 @@ pub(super) async fn execute_recovering_attempt(
     admitted: AdmittedWorkflow,
     owned_run: LocalAttemptOwner,
     cancellation: CancellationSource,
-    signal_task: tokio::task::JoinHandle<()>,
+    signal_task: SignalObservation,
     (presentation_config, leaf): (PresentationConfig, ExecutionLeaf),
     child_recovery: Option<ChildRecovery>,
 ) -> super::super::super::CommandResult {
+    let journals = signal_task.journals.clone();
     execute_owned_attempt_with(
         workflow,
         admitted,
@@ -1112,8 +1196,9 @@ pub(super) async fn execute_recovering_attempt(
             presentation_config,
             leaf,
             hooks: (|_| Ok(()), WorkflowTerminalHost::start, || None),
-            quiet: false,
+            child: None,
             child_recovery,
+            journals,
         },
     )
     .await
@@ -1128,7 +1213,7 @@ async fn execute_owned_attempt_with(
     admitted: AdmittedWorkflow,
     owned_run: LocalAttemptOwner,
     cancellation: CancellationSource,
-    signal_task: tokio::task::JoinHandle<()>,
+    signal_task: SignalObservation,
     settings: AttemptSettings<impl AttemptHooks>,
 ) -> super::super::super::CommandResult {
     let run_directory = owned_run.run_directory().to_owned();
@@ -1161,7 +1246,15 @@ async fn execute_owned_attempt_with(
     }
     let result = result.unwrap_or_else(|error| Err(error.into()));
     match (attempt.continued.take(), &result) {
-        (Some(edge), Ok(ExitCode::Success)) => {
+        // REQ-LOCALRUN-135: an interruption holds back the next attempt, leaving the run
+        // `running` for `um workflow run resume` (REQ-CONTINUE-78).
+        (Some(edge), Ok(ExitCode::Success))
+            if !admitted
+                .execution()
+                .cancellation()
+                .source()
+                .interruption_requested() =>
+        {
             let signal_task = start_signal_observation(cancellation.clone(), UnixSignals::new()?);
             Box::pin(super::resume::continue_run(
                 super::resume::Continuation {
@@ -1193,9 +1286,12 @@ async fn execute_attempt_phases(
         presentation_config,
         leaf,
         mut hooks,
-        quiet,
+        child,
         child_recovery,
+        journals,
     } = settings;
+    let _journal = journals.watch(attempt.run()?.run_directory());
+    let quiet = child.is_some();
     let run_directory = attempt
         .run()?
         .run_directory()
@@ -1283,13 +1379,13 @@ async fn execute_attempt_phases(
 
     let run_clock = SystemObservationClock;
     let run_for_output = attempt.run()?;
-    let prepared =
-        initialize_execution_presentation(run_clock, || match presentation_config.mode() {
-            _ if quiet => {
+    let prepared = initialize_execution_presentation(run_clock, || {
+        match (child, presentation_config.mode()) {
+            (Some(child), _) => {
                 let timing_observation = RunTimingObservation::new(run_clock.sample());
                 Ok(PreparedExecutionPresentation {
                     observer: RunExecutionObserver::Quiet(TimingObserver::new(
-                        SilentPresentation,
+                        child,
                         cancellation.clone(),
                         timing_observation.clone(),
                         run_clock,
@@ -1298,7 +1394,7 @@ async fn execute_attempt_phases(
                     timing: timing_observation,
                 })
             }
-            PresentationMode::Tui => {
+            (None, PresentationMode::Tui) => {
                 let presentation_opened = run_clock.sample();
                 let timing_observation = RunTimingObservation::new(presentation_opened);
                 let view = WorkflowRunViewModel::new(
@@ -1324,7 +1420,7 @@ async fn execute_attempt_phases(
                     timing: timing_observation,
                 })
             }
-            PresentationMode::Plain | PresentationMode::Json => {
+            (None, PresentationMode::Plain | PresentationMode::Json) => {
                 let output = execution_output(presentation_config, run_for_output, leaf);
                 let presentation = output.start_for_result(
                     workflow,
@@ -1345,7 +1441,8 @@ async fn execute_attempt_phases(
                     timing: timing_observation,
                 })
             }
-        })?;
+        }
+    })?;
     let observer = prepared.observer;
     attempt.host = Some(prepared.host);
     attempt.host()?.await_ready().await?;
@@ -1431,8 +1528,14 @@ async fn execute_attempt_phases(
                 attempt.run()?,
                 admitted,
                 controls.replacement,
-                child_recovery,
-                attempt.mirror.clone(),
+                (child_recovery, attempt.mirror.clone()),
+                journals.clone(),
+                // REQ-LOCALRUN-200: a child's steps reach the parent's progress stream; the
+                // terminal interface shows none of them.
+                match attempt.host.as_ref() {
+                    Some(ActiveRunHost::Standard(presentation)) => Some(presentation.clone()),
+                    _ => None,
+                },
             )?,
             context,
         ))
@@ -1552,6 +1655,14 @@ async fn execute_attempt_phases(
     let publication_run = run.clone();
     let publication_artifacts = artifacts.clone();
     let published_wait = wait_record.clone();
+    // REQ-WFEXEC-40, REQ-LOCALRUN-135: a `continued` attempt under an interruption starts no
+    // next attempt and exits by the interruption's reason.
+    let source = admitted.execution().cancellation().source();
+    let held_back = source
+        .interruption_requested()
+        .then(|| source.cancellation_reason())
+        .flatten()
+        .filter(|_| continued);
     let owned_run = attempt
         .run
         .take()
@@ -1573,6 +1684,9 @@ async fn execute_attempt_phases(
                 }
                 if let Some(wait) = published_wait {
                     terminal.set_wait(wait);
+                }
+                if let Some(reason) = held_back {
+                    terminal.hold_back_continuation(reason);
                 }
             }
             let state_publication = match &publication {
@@ -1924,7 +2038,9 @@ fn has_workflow_steps(workflow: &ResolvedWorkflow) -> bool {
 
 /// How a child attempt that ran to its result ended, for the parent's step
 /// (REQ-WFEXEC-60): a cancelled child is `Cancelled`; any other child exited with the
-/// outcome it records and its available `text` and `json` exports.
+/// outcome it records and its available `text` and `json` exports, and with the
+/// interruption that failed it when its primary issue is an `interrupted` step
+/// (REQ-WFEXEC-70).
 fn child_run_outcome(
     outcome: &str,
     execution: &WorkflowExecutionResult<ExecutionInstant>,
@@ -1944,6 +2060,7 @@ fn child_run_outcome(
                 ExportValue::Available { .. } | ExportValue::Unavailable { .. } => None,
             })
             .collect(),
+        interruption: execution.outcome.interruption(),
     }
 }
 
@@ -1989,8 +2106,10 @@ impl ChildRecovery {
 
 /// The record of the wait an attempt ended on (REQ-WFEXEC-61, REQ-WFEXEC-62): the payload
 /// from the waiting step's outputs and child directory or, for a stop, from the stop control
-/// in force before the step, and for an `external` wait its rule's run-value operands
-/// resolved from the run's `inputs` and step outputs (REQ-WFEXEC-65).
+/// in force before the step, for an interrupted `repair` wait with the `control.interrupt`
+/// the signal observer acted on (REQ-WFEXEC-70, REQ-WFDEF-6), and for an `external` wait its
+/// rule's run-value operands resolved from the run's `inputs` and step outputs
+/// (REQ-WFEXEC-65).
 fn entered_wait_record(
     wait: &EnteredWait,
     inputs: &um_execution::ResolvedInputs,
@@ -1998,9 +2117,13 @@ fn entered_wait_record(
     run_directory: &Path,
     dispatcher: Option<&LocalChildRunDispatcher>,
 ) -> anyhow::Result<WaitRecord> {
-    let stop = if wait.kind() == WaitKind::Stop {
+    // REQ-WFDEF-6: an interrupted wait's payload names the `control.interrupt` whose
+    // interruption the signal observer requested.
+    let control = if wait.kind() == WaitKind::Stop {
         let controls = read_controls(run_directory).context("read the run's controls")?;
         stop_in_force(&controls, wait.step()).cloned()
+    } else if wait.interrupted().is_some() {
+        dispatcher.and_then(|dispatcher| dispatcher.parent.journals.interrupting_control())
     } else {
         None
     };
@@ -2018,7 +2141,7 @@ fn entered_wait_record(
                 item,
             )
         });
-    let payload = wait_payload(wait, steps, child.as_deref(), stop.as_ref());
+    let payload = wait_payload(wait, steps, child.as_deref(), control.as_ref());
     WaitRecord::entered(wait, item, payload, um_support::utc_now(), inputs, steps)
         .map_err(anyhow::Error::new)
         .context("record the local workflow wait")
@@ -2052,6 +2175,12 @@ struct LocalChildRunParent {
     started: std::sync::Mutex<BTreeMap<String, (PathBuf, Option<u64>)>>,
     /// The parent's mirror, which writes `onStage` as each child exits (REQ-LOCALRUN-191).
     mirror: Option<Arc<Mirror>>,
+    /// The journals the command's signal observer reads, which each child's run directory
+    /// joins while its attempt runs (REQ-LOCALRUN-135).
+    journals: ControlJournals,
+    /// The parent's progress stream, which carries each child's step state records
+    /// (REQ-LOCALRUN-200); none when the parent presents through the terminal interface.
+    presentation: Option<SystemPresentation>,
 }
 
 impl LocalChildRunDispatcher {
@@ -2059,8 +2188,9 @@ impl LocalChildRunDispatcher {
         run: &LocalAttemptOwner,
         admitted: &AdmittedWorkflow,
         replacement: Option<(String, serde_json::Value)>,
-        recovery: Option<ChildRecovery>,
-        mirror: Option<Arc<Mirror>>,
+        (recovery, mirror): (Option<ChildRecovery>, Option<Arc<Mirror>>),
+        journals: ControlJournals,
+        presentation: Option<SystemPresentation>,
     ) -> anyhow::Result<Self> {
         let parent = run
             .child_run_parent()
@@ -2089,6 +2219,8 @@ impl LocalChildRunDispatcher {
                 recovery: std::sync::Mutex::new(recovery),
                 started: std::sync::Mutex::new(BTreeMap::new()),
                 mirror,
+                journals,
+                presentation,
             }),
         })
     }
@@ -2241,6 +2373,18 @@ async fn run_local_child(
         attempt.teardown().await;
         return ChildRunOutcome::Interrupted;
     };
+    // REQ-LOCALRUN-200: a fresh, retried or continued child's steps reach the parent's
+    // progress stream under the parent's step and element. A child file whose definition the
+    // stream cannot describe stays silent rather than failing the child.
+    let presentation = parent
+        .presentation
+        .as_ref()
+        .and_then(|presentation| {
+            presentation
+                .child_scope(&workflow, &request.step, request.item)
+                .ok()
+        })
+        .map_or(ChildPresentation::Silent, ChildPresentation::Forwarding);
     let result = execute_attempt_phases(
         &workflow,
         &admitted,
@@ -2250,8 +2394,9 @@ async fn run_local_child(
             presentation_config: child_presentation_config(),
             leaf,
             hooks: (|_| Ok(()), WorkflowTerminalHost::start, || None),
-            quiet: true,
+            child: Some(presentation),
             child_recovery: None,
+            journals: parent.journals.clone(),
         },
     )
     .await;
@@ -2265,7 +2410,10 @@ async fn run_local_child(
     }
     .unwrap_or(ChildRunOutcome::Interrupted);
     // REQ-LOCALRUN-191: the stage transition's `onStage`, before the parent routes it.
-    if let ChildRunOutcome::Exited { outcome, exports } = &outcome {
+    if let ChildRunOutcome::Exited {
+        outcome, exports, ..
+    } = &outcome
+    {
         let stage = match request.item {
             Some(item) => position_path(&[
                 serde_json::Value::String(request.step.clone()),
@@ -2796,14 +2944,10 @@ pub(in crate::cli::workflow) fn acquire_agent_profile_replacement(
     };
     acquire().map_err(|kind| {
         let error = anyhow!("agent profile replacement document: {kind}");
-        match (kind, cancellation.cancellation_reason()) {
-            (InputAcquisitionFailureKind::Interrupted, Some(CancellationReason::UserRequest)) => {
-                super::super::super::CommandFailure::for_outcome(error, OutcomeClass::Interrupted)
+        match kind {
+            InputAcquisitionFailureKind::Interrupted => {
+                signalled_failure(error, cancellation.cancellation_reason())
             }
-            (
-                InputAcquisitionFailureKind::Interrupted,
-                Some(CancellationReason::TerminationRequest),
-            ) => super::super::super::CommandFailure::for_outcome(error, OutcomeClass::Terminated),
             _ => error.into(),
         }
     })
@@ -2944,6 +3088,7 @@ impl<T: AsFd> Drop for StdinFlags<'_, T> {
 pub(super) struct UnixSignals {
     interrupt: tokio::signal::unix::Signal,
     terminate: tokio::signal::unix::Signal,
+    wake_up: tokio::signal::unix::Signal,
 }
 
 impl UnixSignals {
@@ -2953,39 +3098,239 @@ impl UnixSignals {
                 .context("install local workflow interrupt observation")?,
             terminate: tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
                 .context("install local workflow termination observation")?,
+            wake_up: tokio::signal::unix::signal(tokio::signal::unix::SignalKind::from_raw(
+                libc::SIGURG,
+            ))
+            .context("install local workflow wake-up observation")?,
         })
     }
 }
 
+/// What the command's signal observer receives.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum SignalEvent {
+    /// SIGINT (`UserRequest`) or SIGTERM (`TerminationRequest`).
+    Signal(CancellationReason),
+    /// SIGURG, which carries no request of its own: the observer reads the watched control
+    /// journals for a new `control.interrupt` (REQ-WFDEF-6).
+    WakeUp,
+}
+
 pub(super) trait SignalEvents: Send + 'static {
-    fn next(&mut self) -> impl Future<Output = Option<CancellationReason>> + Send;
+    fn next(&mut self) -> impl Future<Output = Option<SignalEvent>> + Send;
 }
 
 impl SignalEvents for UnixSignals {
-    async fn next(&mut self) -> Option<CancellationReason> {
+    async fn next(&mut self) -> Option<SignalEvent> {
         tokio::select! {
             biased;
-            signal = self.interrupt.recv() => signal.map(|()| CancellationReason::UserRequest),
-            signal = self.terminate.recv() => signal.map(|()| CancellationReason::TerminationRequest),
+            signal = self.interrupt.recv() => {
+                signal.map(|()| SignalEvent::Signal(CancellationReason::UserRequest))
+            }
+            signal = self.terminate.recv() => {
+                signal.map(|()| SignalEvent::Signal(CancellationReason::TerminationRequest))
+            }
+            signal = self.wake_up.recv() => signal.map(|()| SignalEvent::WakeUp),
         }
     }
+}
+
+/// The run directories whose control journals the observer reads, a signal for a new
+/// `control.cancel` (REQ-LOCALRUN-135) and a wake-up for a new `control.interrupt`
+/// (REQ-WFDEF-6): the run the command owns once its directory is known, and each child run
+/// an attempt of it is executing. Empty before the run directory exists. It also holds the
+/// `control.interrupt` whose interruption the observer requested, for the wait payload.
+#[derive(Clone, Default)]
+pub(super) struct ControlJournals(Arc<std::sync::Mutex<JournalSlot>>);
+
+#[derive(Default)]
+struct JournalSlot {
+    next_watch: u64,
+    watched: Vec<Watched>,
+    interrupt: Option<ControlEvent>,
+}
+
+/// One watched run directory and the highest control ordinal its journal held when it was
+/// watched, `None` when the journal could not be read then, so that no control in it is new.
+#[derive(Clone)]
+struct Watched {
+    id: u64,
+    directory: PathBuf,
+    taken: Option<u64>,
+}
+
+impl ControlJournals {
+    /// Adds `directory` until the returned guard is dropped, noting the controls it already
+    /// holds, which no signal and no wake-up acts on.
+    fn watch(&self, directory: &Path) -> WatchedJournal {
+        let taken = read_numbered_controls(directory)
+            .ok()
+            .map(|controls| controls.last().map_or(0, |(ordinal, _)| *ordinal));
+        let id = self.0.lock().ok().map(|mut slot| {
+            let id = slot.next_watch;
+            slot.next_watch = slot.next_watch.wrapping_add(1);
+            slot.watched.push(Watched {
+                id,
+                directory: directory.to_owned(),
+                taken,
+            });
+            id
+        });
+        WatchedJournal {
+            journals: self.clone(),
+            id,
+        }
+    }
+
+    fn watched(&self) -> Vec<Watched> {
+        self.0
+            .lock()
+            .map(|slot| slot.watched.clone())
+            .unwrap_or_default()
+    }
+
+    /// Requests the interruption `control` asks for (REQ-WFDEF-6) and, when it is accepted
+    /// as an interruption, keeps `control` for the wait payload. Under the slot's lock, so
+    /// that a wait entered on the interruption finds it.
+    fn interrupt(&self, cancellation: &CancellationSource, control: ControlEvent) {
+        let Ok(mut slot) = self.0.lock() else {
+            return;
+        };
+        if cancellation.request_interruption(CancellationReason::TerminationRequest)
+            && cancellation.interruption_requested()
+        {
+            slot.interrupt = Some(control);
+        }
+    }
+
+    /// The `control.interrupt` whose interruption the observer requested, if any.
+    fn interrupting_control(&self) -> Option<ControlEvent> {
+        self.0.lock().ok().and_then(|slot| slot.interrupt.clone())
+    }
+}
+
+/// A run directory `ControlJournals` holds while it lives.
+pub(super) struct WatchedJournal {
+    journals: ControlJournals,
+    id: Option<u64>,
+}
+
+impl Drop for WatchedJournal {
+    fn drop(&mut self) {
+        if let Ok(mut slot) = self.journals.0.lock()
+            && let Some(index) = slot
+                .watched
+                .iter()
+                .position(|watched| Some(watched.id) == self.id)
+        {
+            slot.watched.remove(index);
+        }
+    }
+}
+
+/// The command's signal observer and the control journals it reads.
+pub(super) struct SignalObservation {
+    task: tokio::task::JoinHandle<()>,
+    journals: ControlJournals,
+}
+
+impl SignalObservation {
+    pub(super) fn abort(&self) {
+        self.task.abort();
+    }
+
+    /// Reads `directory`'s control journal on each signal until the guard is dropped.
+    pub(super) fn watch(&self, directory: &Path) -> WatchedJournal {
+        self.journals.watch(directory)
+    }
+}
+
+/// What a signal asks of the run's cancellation source.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SignalRequest {
+    /// No run exists yet, or the run's or its live child's journal holds a `control.cancel`
+    /// recorded since this process took that run.
+    Cancel,
+    /// Any other signal to a process that owns a run (REQ-LOCALRUN-135, REQ-WFEXEC-69).
+    Interrupt,
 }
 
 pub(super) fn start_signal_observation(
     cancellation: CancellationSource,
     mut signals: impl SignalEvents,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        while let Some(reason) = signals.next().await {
-            if handle_observed_signal(&cancellation, reason) {
-                return;
+) -> SignalObservation {
+    let journals = ControlJournals::default();
+    let observed = journals.clone();
+    let task = tokio::spawn(async move {
+        while let Some(event) = signals.next().await {
+            match event {
+                SignalEvent::Signal(reason) => {
+                    let request = signal_request(&observed).await;
+                    if handle_observed_signal(&cancellation, reason, request) {
+                        return;
+                    }
+                }
+                // REQ-WFDEF-6: a wake-up acts only on the journal; a second one, or one that
+                // finds no new `control.interrupt`, changes nothing.
+                SignalEvent::WakeUp => {
+                    if let Some(control) = recorded_interrupt(&observed).await {
+                        observed.interrupt(&cancellation, control);
+                    }
+                }
             }
         }
-    })
+    });
+    SignalObservation { task, journals }
 }
 
-fn handle_observed_signal(cancellation: &CancellationSource, reason: CancellationReason) -> bool {
-    if cancellation.request_cancellation(reason) {
+/// A cancel when no run directory is known yet or a watched journal holds a new
+/// `control.cancel`, which `um workflow run cancel` appends before it signals
+/// (REQ-LOCALRUN-186); otherwise an interruption (REQ-LOCALRUN-135).
+async fn signal_request(journals: &ControlJournals) -> SignalRequest {
+    let watched = journals.watched();
+    if watched.is_empty() || recorded_since(watched, CONTROL_CANCEL).await.is_some() {
+        SignalRequest::Cancel
+    } else {
+        SignalRequest::Interrupt
+    }
+}
+
+/// The new `control.interrupt` a wake-up acts on (REQ-WFDEF-6).
+async fn recorded_interrupt(journals: &ControlJournals) -> Option<ControlEvent> {
+    recorded_since(journals.watched(), CONTROL_INTERRUPT).await
+}
+
+/// The first `event` control one of the `watched` journals holds above the ordinal it held
+/// when it was watched. A control recorded before this process took the run was an earlier
+/// attempt's, acted on or ignored then, and never cancels or interrupts this one
+/// (REQ-LOCALRUN-135, REQ-WFDEF-6). A journal that cannot be read holds none.
+async fn recorded_since(watched: Vec<Watched>, event: &'static str) -> Option<ControlEvent> {
+    blocking_operation(move || {
+        Ok::<_, std::convert::Infallible>(watched.into_iter().find_map(|watched| {
+            let taken = watched.taken?;
+            read_numbered_controls(&watched.directory)
+                .ok()?
+                .into_iter()
+                .find(|(ordinal, control)| *ordinal > taken && control.event == event)
+                .map(|(_, control)| control)
+        }))
+    })
+    .await
+    .unwrap_or(None)
+}
+
+/// Requests the stop `request` names; a signal that changes nothing then force-aborts a
+/// cancelling finalization (REQ-WFFINALIZE-15), which ends the observation.
+fn handle_observed_signal(
+    cancellation: &CancellationSource,
+    reason: CancellationReason,
+    request: SignalRequest,
+) -> bool {
+    let requested = match request {
+        SignalRequest::Cancel => cancellation.request_cancellation(reason),
+        SignalRequest::Interrupt => cancellation.request_interruption(reason),
+    };
+    if requested {
         return false;
     }
     cancellation.finalization_cancellation_requested() && cancellation.request_force_abort()
@@ -3049,7 +3394,7 @@ type SystemPresentation = WorkflowRunPresentation<io::Stdout, io::Stderr, System
 enum RunExecutionObserver {
     Standard(TimingObserver<SystemPresentation, SystemObservationClock>),
     Tui(WorkflowRunViewModel<SystemObservationClock>),
-    Quiet(TimingObserver<SilentPresentation, SystemObservationClock>),
+    Quiet(TimingObserver<ChildPresentation, SystemObservationClock>),
 }
 
 impl RunExecutionObserver {
@@ -3062,21 +3407,36 @@ impl RunExecutionObserver {
     }
 }
 
-/// The presentation of a child run (REQ-WFEXEC-59): it renders nothing, so only the timing
-/// the published result needs is observed.
+/// The presentation of a child run (REQ-WFEXEC-59): silent under a parent that presents
+/// through the terminal interface, otherwise forwarding the child's step state records into
+/// the parent's progress stream (REQ-LOCALRUN-200, INV-ENGINE-28).
 #[derive(Clone)]
-struct SilentPresentation;
+enum ChildPresentation {
+    Silent,
+    Forwarding(ChildRunPresentation<io::Stdout, io::Stderr, SystemObservationClock>),
+}
 
-impl ExecutionObserver<ExecutionInstant> for SilentPresentation {
+impl ExecutionObserver<ExecutionInstant> for ChildPresentation {
     fn observe(
         &self,
-        _observation: ExecutionObservation<ExecutionInstant>,
+        observation: ExecutionObservation<ExecutionInstant>,
     ) -> impl Future<Output = ()> + Send {
-        std::future::ready(())
+        let forwarded = match self {
+            Self::Silent => None,
+            Self::Forwarding(presentation) => Some(presentation.observe(observation)),
+        };
+        async move {
+            if let Some(forwarded) = forwarded {
+                forwarded.await;
+            }
+        }
     }
 }
 
-impl PresentationFailureState for SilentPresentation {
+/// A child never fails on its parent's stream by itself: the parent's failure watcher
+/// cancels the parent with `caller_output_failure`, and that cancels the child
+/// (REQ-LOCALRUN-137).
+impl PresentationFailureState for ChildPresentation {
     fn presentation_failed(&self) -> bool {
         false
     }
@@ -3571,8 +3931,20 @@ fn build_run_result(
         .continuation_record()
         .map_err(|_| invalid_terminal_result_error())?;
     let timing = &evidence.timing;
+    // A walk an interrupted `workflow` step's child ended on its edge, a wait, a continuation
+    // or an exit, after the interruption was accepted carries no cancellation (REQ-WFEXEC-70).
+    let interrupted_walk = match &execution.outcome {
+        RunOutcome::Waiting { .. } | RunOutcome::Continued { .. } => true,
+        RunOutcome::Succeeded => admitted
+            .execution()
+            .cancellation()
+            .source()
+            .interruption_requested(),
+        RunOutcome::Failed { .. } | RunOutcome::Cancelled { .. } => false,
+    };
     let cancellation = match timing.cancellation {
         None => None,
+        Some(_) if interrupted_walk => None,
         Some((reason, deadline)) => {
             let retained_by_outcome = match &execution.outcome {
                 RunOutcome::Succeeded => false,
@@ -4160,7 +4532,10 @@ mod tests {
                 admitted,
                 run,
                 CancellationSource::new(),
-                tokio::spawn(std::future::pending()),
+                SignalObservation {
+                    task: tokio::spawn(std::future::pending()),
+                    journals: ControlJournals::default(),
+                },
                 AttemptSettings {
                     presentation_config: PresentationConfig {
                         requested_mode: RequestedPresentationMode::Automatic,
@@ -4177,8 +4552,9 @@ mod tests {
                         standard_input_reserved: false,
                     },
                     leaf: ExecutionLeaf::Run,
-                    quiet: false,
+                    child: None,
                     child_recovery: None,
+                    journals: ControlJournals::default(),
                     hooks: (
                         move |point| {
                             if Some(point) == target {
@@ -4219,6 +4595,255 @@ mod tests {
             assert!(private_staging_paths(&private_root).is_empty(), "{phase}");
             assert_eq!(restored.load(Ordering::SeqCst), start_host, "{phase}");
         }
+    }
+
+    // REQ-WFEXEC-69, REQ-WFEXEC-40, REQ-LOCALRUN-136
+    #[tokio::test]
+    async fn an_interruption_before_any_step_starts_publishes_the_failed_step_with_timing() {
+        let temporary = tempfile::tempdir().unwrap();
+        let source = temporary.path().join("source");
+        let execution_root = temporary.path().join("execution");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::create_dir(&execution_root).unwrap();
+        std::fs::write(
+            source.join("workflow.yaml"),
+            "schemaVersion: 1\nsteps:\n  first:\n    kind: cmd\n    command: {argv: [\"true\"]}\n  second:\n    kind: cmd\n    command: {argv: [\"true\"]}\n",
+        )
+        .unwrap();
+        let workflow = resolve(&source, Path::new("workflow.yaml")).unwrap();
+        let cancellation = CancellationSource::new();
+        assert!(cancellation.request_interruption(CancellationReason::UserRequest));
+        let admitted = admit_workflow(
+            workflow.clone(),
+            ResolvedInputs::default(),
+            execution_context_for_workflow(&workflow, execution_root, 1, cancellation.clone())
+                .unwrap(),
+        )
+        .unwrap();
+        let run = InitialLocalRun::create(&temporary.path().join("run"), &admitted).unwrap();
+        let result_directory = run.result_directory().to_owned();
+
+        let result = execute_owned_attempt_with(
+            workflow,
+            admitted,
+            run,
+            cancellation,
+            SignalObservation {
+                task: tokio::spawn(std::future::pending()),
+                journals: ControlJournals::default(),
+            },
+            AttemptSettings {
+                presentation_config: PresentationConfig {
+                    requested_mode: RequestedPresentationMode::Plain,
+                    color: ColorChoice::Never,
+                    capabilities: TerminalCapabilities {
+                        stdin_is_terminal: false,
+                        stdout_is_terminal: false,
+                        stderr_is_terminal: false,
+                        stdout_width: None,
+                        stderr_width: None,
+                        term: None,
+                        no_color: None,
+                    },
+                    standard_input_reserved: false,
+                },
+                leaf: ExecutionLeaf::Run,
+                child: None,
+                child_recovery: None,
+                journals: ControlJournals::default(),
+                hooks: (
+                    |_| Ok(()),
+                    |view, cancellation, color| {
+                        WorkflowTerminalHost::start_with_boundary(
+                            view,
+                            cancellation,
+                            color,
+                            RestoringBoundary(Arc::new(AtomicBool::new(false))),
+                        )
+                    },
+                    || None,
+                ),
+            },
+        )
+        .await;
+
+        let exit = match result {
+            Ok(exit) => exit,
+            Err(failure) => panic!("the interrupted attempt failed: {:#}", failure.error()),
+        };
+        assert_eq!(exit, ExitCode::Interrupted);
+        let bytes = std::fs::read(result_directory.join("result.json")).unwrap();
+        let published: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(published["outcome"], "failed");
+        let steps = published["steps"].as_array().unwrap();
+        let step = |id: &str| {
+            steps
+                .iter()
+                .find(|step| step["id"] == id)
+                .unwrap_or_else(|| panic!("{id} is missing from {published}"))
+        };
+        let first = step("first");
+        assert_eq!(first["state"], "failed");
+        assert_eq!(first["detail"]["phase"], "start");
+        assert_eq!(first["detail"]["code"], "interrupted");
+        assert!(first["startedAt"].is_string(), "{first}");
+        assert!(first["durationMilliseconds"].is_u64(), "{first}");
+        assert_eq!(step("second")["state"], "cancelled");
+    }
+
+    const SUBJECT_DEFINITION: &str = "def_01jz0000000000000000000000";
+    const SUBJECT: &str = "AUTO-1";
+
+    /// The creation of a one-step run of `SUBJECT` under `SUBJECT_DEFINITION` in a home
+    /// below `root`, admitted under `cancellation`, with that home and the run directory.
+    fn subject_creation(
+        root: &Path,
+        cancellation: &CancellationSource,
+    ) -> (RunCreation, WorkflowHome, PathBuf) {
+        let source = root.join("source");
+        let execution_root = root.join("execution");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::create_dir(&execution_root).unwrap();
+        std::fs::write(
+            source.join("workflow.yaml"),
+            "schemaVersion: 1\nsteps:\n  only:\n    kind: cmd\n    command: {argv: [\"true\"]}\n",
+        )
+        .unwrap();
+        let workflow = resolve(&source, Path::new("workflow.yaml")).unwrap();
+        let admitted = admit_workflow(
+            workflow.clone(),
+            ResolvedInputs::default(),
+            execution_context_for_workflow(&workflow, execution_root, 1, cancellation.clone())
+                .unwrap(),
+        )
+        .unwrap();
+        let home_root = root.join("home");
+        let home = WorkflowHome::from_lookup(|name| {
+            (name == "UM_HOME").then(|| home_root.clone().into_os_string())
+        })
+        .unwrap();
+        std::fs::create_dir_all(home.definition_directory(SUBJECT_DEFINITION)).unwrap();
+        let mut record = WorkflowRunRecord::new(
+            Some((SUBJECT_DEFINITION.to_owned(), 1)),
+            &format!("sha256:{}", "0".repeat(64)),
+            "workflow.yaml",
+            "tester",
+        );
+        record.subject = Some(SUBJECT.to_owned());
+        let destination = RunDestination::Definition {
+            home: home.clone(),
+            id: SUBJECT_DEFINITION.to_owned(),
+            revision: 1,
+        };
+        let run_directory = destination.run_directory(Some(&record)).unwrap();
+        let creation = RunCreation {
+            destination,
+            subject: Some(SUBJECT.to_owned()),
+            record: Some(record),
+            run_directory: run_directory.clone(),
+            admitted,
+            stop_before: None,
+        };
+        (creation, home, run_directory)
+    }
+
+    /// The failure of a creation a signal refused, which left no run under the destination
+    /// and the subject's slot free (REQ-LOCALRUN-135).
+    fn refused_creation(
+        created: Result<(InitialLocalRun, WatchedJournal), CreationFailure>,
+        home: &WorkflowHome,
+        run_directory: &Path,
+    ) -> super::super::super::super::CommandFailure {
+        let failure = match created {
+            Err(CreationFailure::Signalled(failure)) => failure,
+            Ok((run, _)) => panic!("created {}", run.run_directory().display()),
+            Err(CreationFailure::Subject(error)) => panic!("{error}"),
+            Err(CreationFailure::Other(error)) => panic!("{error:#}"),
+        };
+        assert!(!run_directory.exists());
+        let runs = std::fs::read_dir(home.runs_directory(SUBJECT_DEFINITION))
+            .map(|entries| entries.count())
+            .unwrap_or(0);
+        assert_eq!(runs, 0, "a run was left under the destination");
+        assert_eq!(
+            um_execution::subject_slot(home, SUBJECT_DEFINITION, SUBJECT).unwrap(),
+            None
+        );
+        failure
+    }
+
+    // REQ-LOCALRUN-135, REQ-WFEXEC-40
+    #[test]
+    fn a_signal_before_the_run_directory_exists_creates_no_run() {
+        for (reason, exit) in [
+            (CancellationReason::UserRequest, ExitCode::Interrupted),
+            (CancellationReason::TerminationRequest, ExitCode::Terminated),
+        ] {
+            let temporary = tempfile::tempdir().unwrap();
+            // While no journal is watched, a signal requests a cancel (`signal_request`).
+            let cancellation = CancellationSource::new();
+            assert!(cancellation.request_cancellation(reason));
+            let (creation, home, run_directory) = subject_creation(temporary.path(), &cancellation);
+
+            let created = creation.create(&cancellation, &ControlJournals::default());
+
+            let failure = refused_creation(created, &home, &run_directory);
+            assert_eq!(failure.exit_code(), exit, "{reason:?}");
+            assert!(
+                !home
+                    .definition_directory(SUBJECT_DEFINITION)
+                    .join("subjects")
+                    .join(SUBJECT)
+                    .exists(),
+                "{reason:?} took the subject slot"
+            );
+        }
+    }
+
+    // REQ-LOCALRUN-135, REQ-WFEXEC-40: from the moment `create` begins to make the run
+    // directory a signal is an interruption, never a cancel, so a run the creation still
+    // makes cannot end `canceled`; one the creation meets before the directory exists
+    // refuses it. The creation is held at the subject index's lock, as a concurrent create
+    // of the subject holds it.
+    #[tokio::test]
+    async fn a_signal_while_the_run_directory_is_created_interrupts() {
+        let temporary = tempfile::tempdir().unwrap();
+        let cancellation = CancellationSource::new();
+        let (creation, home, run_directory) = subject_creation(temporary.path(), &cancellation);
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        let observer = start_signal_observation(cancellation.clone(), InjectedSignals(receiver));
+        let index = SubjectClaim::take(&home, SUBJECT_DEFINITION, SUBJECT, None).unwrap();
+        let (journals, creating_cancellation) = (observer.journals.clone(), cancellation.clone());
+        let creating =
+            tokio::task::spawn_blocking(move || creation.create(&creating_cancellation, &journals));
+        let watched = observer.journals.clone();
+        let watching = tokio::task::spawn_blocking(move || {
+            let deadline = um_support::monotonic_now() + std::time::Duration::from_secs(10);
+            while watched.watched().is_empty() && um_support::monotonic_now() < deadline {
+                um_support::sleep(std::time::Duration::from_millis(5));
+            }
+            !watched.watched().is_empty()
+        })
+        .await
+        .unwrap();
+
+        sender
+            .send(SignalEvent::Signal(CancellationReason::UserRequest))
+            .unwrap();
+        assert_eq!(
+            cancellation.wait_for_cancellation().await,
+            CancellationReason::UserRequest
+        );
+        drop(index);
+        let created = creating.await.unwrap();
+
+        assert!(watching, "the creation watched no control journal");
+        assert!(cancellation.interruption_requested());
+        let failure = refused_creation(created, &home, &run_directory);
+        assert_eq!(failure.exit_code(), ExitCode::Interrupted);
+        assert!(observer.journals.watched().is_empty());
+        drop(sender);
+        observer.task.await.unwrap();
     }
 
     #[tokio::test]
@@ -4577,63 +5202,261 @@ mod tests {
     // REQ-WFFINALIZE-15, REQ-LOCALRUN-135
     #[test]
     fn repeated_signals_only_force_abort_a_cancelling_finalization() {
-        let ordinary = CancellationSource::new();
-        assert!(!handle_observed_signal(
-            &ordinary,
-            CancellationReason::UserRequest
-        ));
-        assert!(!handle_observed_signal(
-            &ordinary,
-            CancellationReason::TerminationRequest
-        ));
-        assert!(ordinary.request_force_abort());
+        for request in [SignalRequest::Cancel, SignalRequest::Interrupt] {
+            let ordinary = CancellationSource::new();
+            assert!(!handle_observed_signal(
+                &ordinary,
+                CancellationReason::UserRequest,
+                request
+            ));
+            assert!(!handle_observed_signal(
+                &ordinary,
+                CancellationReason::TerminationRequest,
+                request
+            ));
+            assert_eq!(
+                ordinary.interruption_requested(),
+                request == SignalRequest::Interrupt
+            );
+            assert!(ordinary.request_force_abort());
 
+            let finalization = CancellationSource::new();
+            assert!(finalization.fixture_begin_finalization_arm());
+            assert!(finalization.fixture_complete_finalization_arm());
+            assert!(!handle_observed_signal(
+                &finalization,
+                CancellationReason::UserRequest,
+                request
+            ));
+            assert!(handle_observed_signal(
+                &finalization,
+                CancellationReason::TerminationRequest,
+                request
+            ));
+            assert!(!finalization.interruption_requested());
+            assert!(!finalization.request_force_abort());
+        }
+    }
+
+    struct InjectedSignals(tokio::sync::mpsc::UnboundedReceiver<SignalEvent>);
+
+    impl SignalEvents for InjectedSignals {
+        async fn next(&mut self) -> Option<SignalEvent> {
+            self.0.recv().await
+        }
+    }
+
+    /// A directory shaped like a run root as far as its control journal needs.
+    fn control_journal() -> tempfile::TempDir {
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join(".private")).unwrap();
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        root
+    }
+
+    fn record_control(root: &Path, event: &str, reason: &str) -> ControlEvent {
+        let payload = serde_json::json!({"reason": reason, "before": "build"});
+        let control = ControlEvent::new(
+            event,
+            "run_01jcf9a4r7t2m8k3v6x1z5n0pq",
+            "saeed",
+            None,
+            payload.as_object().cloned(),
+        )
+        .unwrap();
+        append_control(root, &control).unwrap();
+        control
+    }
+
+    /// Delivers `events` to an observer of `cancellation` watching `root` once `before` was
+    /// recorded there and `after` once it watches, and returns the control it reported for
+    /// the wait payload after the observation ends.
+    async fn observe_journal(
+        cancellation: &CancellationSource,
+        root: &Path,
+        (before, after): (&[&str], &[&str]),
+        events: &[SignalEvent],
+    ) -> Option<ControlEvent> {
+        for event in before {
+            record_control(root, event, "earlier");
+        }
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        let observer = start_signal_observation(cancellation.clone(), InjectedSignals(receiver));
+        let journal = observer.watch(root);
+        for event in after {
+            record_control(root, event, "pausing for a fix");
+        }
+        for event in events {
+            sender.send(*event).unwrap();
+        }
+        drop(sender);
+        let SignalObservation { task, journals } = observer;
+        task.await.unwrap();
+        drop(journal);
+        journals.interrupting_control()
+    }
+
+    // REQ-WFDEF-6, REQ-LOCALRUN-135: a wake-up reads the journal and interrupts, with
+    // `termination_request`, for a `control.interrupt` recorded since the process took the
+    // run, which it reports for the wait payload; one that finds no such control, a second
+    // one, and one while finalization is cancelling request nothing more. A signal still
+    // reads `control.cancel` as a cancellation.
+    #[tokio::test]
+    async fn a_wake_up_interrupts_only_for_a_control_interrupt_recorded_since_the_run_was_taken() {
+        const INTERRUPT: &str = "control.interrupt";
+        let wake = [SignalEvent::WakeUp];
+        for (before, after) in [(&[][..], &[][..]), (&[INTERRUPT][..], &[CONTROL_STOP][..])] {
+            let cancellation = CancellationSource::new();
+            let root = control_journal();
+            let reported =
+                observe_journal(&cancellation, root.path(), (before, after), &wake).await;
+            assert_eq!(reported, None, "{before:?} then {after:?}");
+            assert_eq!(cancellation.cancellation_reason(), None);
+            assert!(!cancellation.interruption_requested());
+        }
+
+        let cancellation = CancellationSource::new();
+        let root = control_journal();
+        let reported = observe_journal(
+            &cancellation,
+            root.path(),
+            (&[INTERRUPT], &[CONTROL_STOP, INTERRUPT]),
+            &[SignalEvent::WakeUp, SignalEvent::WakeUp],
+        )
+        .await
+        .expect("the interrupting control");
+        assert_eq!(
+            cancellation.cancellation_reason(),
+            Some(CancellationReason::TerminationRequest)
+        );
+        assert!(cancellation.interruption_requested());
+        assert_eq!(
+            reported,
+            read_controls(root.path()).unwrap().pop().unwrap(),
+            "the control recorded after the watch"
+        );
+        assert_eq!(reported.by, "saeed");
+        assert_eq!(
+            reported.payload.as_ref().unwrap()["reason"],
+            "pausing for a fix"
+        );
+        assert!(cancellation.request_force_abort());
+
+        // While finalization is cancelling, the interrupt cancels it and a second wake-up
+        // forces nothing.
         let finalization = CancellationSource::new();
         assert!(finalization.fixture_begin_finalization_arm());
         assert!(finalization.fixture_complete_finalization_arm());
-        assert!(!handle_observed_signal(
+        let root = control_journal();
+        let reported = observe_journal(
             &finalization,
-            CancellationReason::UserRequest
-        ));
-        assert!(handle_observed_signal(
-            &finalization,
-            CancellationReason::TerminationRequest
-        ));
-        assert!(!finalization.request_force_abort());
+            root.path(),
+            (&[], &[INTERRUPT]),
+            &[SignalEvent::WakeUp, SignalEvent::WakeUp],
+        )
+        .await;
+        assert_eq!(reported, None);
+        assert_eq!(
+            finalization.cancellation_reason(),
+            Some(CancellationReason::TerminationRequest)
+        );
+        assert!(finalization.request_force_abort());
+
+        // SIGTERM with `control.cancel` recorded cancels (REQ-LOCALRUN-186).
+        let cancellation = CancellationSource::new();
+        let root = control_journal();
+        let reported = observe_journal(
+            &cancellation,
+            root.path(),
+            (&[], &[CONTROL_CANCEL]),
+            &[SignalEvent::Signal(CancellationReason::TerminationRequest)],
+        )
+        .await;
+        assert_eq!(reported, None);
+        assert_eq!(
+            cancellation.cancellation_reason(),
+            Some(CancellationReason::TerminationRequest)
+        );
+        assert!(!cancellation.interruption_requested());
+
+        // REQ-LOCALRUN-135: a `control.cancel` recorded before the process took the run is
+        // an earlier attempt's, so the signal interrupts.
+        let cancellation = CancellationSource::new();
+        let root = control_journal();
+        let reported = observe_journal(
+            &cancellation,
+            root.path(),
+            (&[CONTROL_CANCEL], &[]),
+            &[SignalEvent::Signal(CancellationReason::TerminationRequest)],
+        )
+        .await;
+        assert_eq!(reported, None);
+        assert_eq!(
+            cancellation.cancellation_reason(),
+            Some(CancellationReason::TerminationRequest)
+        );
+        assert!(cancellation.interruption_requested());
+    }
+
+    // REQ-LOCALRUN-135: before the run directory is known a signal cancels; once a watched
+    // journal holds no `control.cancel`, it interrupts.
+    #[tokio::test]
+    async fn a_signal_interrupts_once_a_run_directory_is_watched() {
+        let temporary = tempfile::tempdir().unwrap();
+        for watched in [false, true] {
+            let cancellation = CancellationSource::new();
+            let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+            let observer =
+                start_signal_observation(cancellation.clone(), InjectedSignals(receiver));
+            let journal = watched.then(|| observer.watch(temporary.path()));
+            sender
+                .send(SignalEvent::Signal(CancellationReason::UserRequest))
+                .unwrap();
+            assert_eq!(
+                cancellation.wait_for_cancellation().await,
+                CancellationReason::UserRequest
+            );
+            assert_eq!(cancellation.interruption_requested(), watched);
+            drop(journal);
+            assert!(observer.journals.watched().is_empty());
+            drop(sender);
+            observer.task.await.unwrap();
+        }
     }
 
     #[tokio::test]
     async fn injected_signals_map_once_to_the_closed_cancellation_reason() {
         let cancellation = CancellationSource::new();
-        struct InjectedSignals(tokio::sync::mpsc::UnboundedReceiver<CancellationReason>);
-        impl SignalEvents for InjectedSignals {
-            async fn next(&mut self) -> Option<CancellationReason> {
-                self.0.recv().await
-            }
-        }
         let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
         let observer = start_signal_observation(cancellation.clone(), InjectedSignals(receiver));
-        sender.send(CancellationReason::TerminationRequest).unwrap();
+        sender
+            .send(SignalEvent::Signal(CancellationReason::TerminationRequest))
+            .unwrap();
         assert_eq!(
             cancellation.wait_for_cancellation().await,
             CancellationReason::TerminationRequest
         );
         assert!(!cancellation.request_cancellation(CancellationReason::UserRequest));
         drop(sender);
-        observer.await.unwrap();
+        observer.task.await.unwrap();
 
         let finalization = CancellationSource::new();
         assert!(finalization.fixture_begin_finalization_arm());
         assert!(finalization.fixture_complete_finalization_arm());
         let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
         let observer = start_signal_observation(finalization.clone(), InjectedSignals(receiver));
-        sender.send(CancellationReason::UserRequest).unwrap();
+        sender
+            .send(SignalEvent::Signal(CancellationReason::UserRequest))
+            .unwrap();
         assert_eq!(
             finalization.wait_for_cancellation().await,
             CancellationReason::UserRequest
         );
-        sender.send(CancellationReason::TerminationRequest).unwrap();
-        observer.await.unwrap();
+        sender
+            .send(SignalEvent::Signal(CancellationReason::TerminationRequest))
+            .unwrap();
+        observer.task.await.unwrap();
         assert!(!finalization.request_force_abort());
     }
 

@@ -1,10 +1,11 @@
 use std::env;
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::io::{self, Read};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
 
@@ -14,30 +15,73 @@ use rustix::process::{Pid, Signal, WaitId, WaitIdOptions, kill_process_group, wa
 const WAIT_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const TEST_WORKER_EXECUTABLE: &str = "UM_TEST_INTERNAL_WORKER_EXECUTABLE";
 
+/// Set when the running executable asks, at startup, whether it was launched in an internal
+/// worker role: that executable dispatches the worker roles and may be its own worker.
+static DISPATCHES_WORKER_ROLES: AtomicBool = AtomicBool::new(false);
+
+/// Records that the running executable dispatches the internal worker roles. Only the two
+/// `internal_worker_requested` predicates call this; a test never does, because the record is
+/// process-wide and would make the whole harness its own worker (INV-TESTING-20).
+pub(crate) fn record_internal_worker_dispatch() {
+    DISPATCHES_WORKER_ROLES.store(true, Ordering::Relaxed);
+}
+
+/// The executable launched in the child-guard and result-validation worker roles. A shipped
+/// build is its own worker. A test build resolves it by INV-TESTING-20, see
+/// [`test_build_internal_worker_executable`].
 pub(crate) fn internal_worker_executable() -> io::Result<PathBuf> {
-    // Test binaries (including cross-crate callers with test-fixtures enabled)
-    // supply the ordinary worker explicitly. Shipped binaries use themselves.
     if cfg!(any(test, feature = "test-fixtures")) {
-        if let Some(path) = env::var_os(TEST_WORKER_EXECUTABLE) {
-            let path = PathBuf::from(path);
-            return path.is_file().then_some(path).ok_or_else(|| {
-                io::Error::other("supplied test internal-worker executable unavailable")
-            });
-        }
-        #[cfg(test)]
-        return test_build_worker_example(&env::current_exe()?);
+        return test_build_internal_worker_executable(
+            env::var_os(TEST_WORKER_EXECUTABLE),
+            dispatches_internal_worker_roles(),
+            &env::current_exe()?,
+        );
     }
     env::current_exe()
 }
 
-/// The execution crate's own unit-test build takes the worker from the `internal-worker`
-/// example beside the test executable, `<profile>/examples/internal-worker` for a test
-/// executable at `<profile>/deps/<crate>-<hash>`, which a plain `cargo test -p um-execution`
-/// builds. A `--all-targets` build compiles the example as a test harness instead, so such a
-/// run builds the ordinary example and names it in `UM_TEST_INTERNAL_WORKER_EXECUTABLE`, as
-/// `cli/scripts/check-suite` does. The test binary itself is never the worker: it would run
-/// the suite in the guard role (INV-TESTING-20).
-#[cfg(test)]
+/// The worker a test build resolves when no worker executable is supplied.
+#[cfg(feature = "test-fixtures")]
+pub(crate) fn unsupplied_internal_worker_executable() -> io::Result<PathBuf> {
+    test_build_internal_worker_executable(
+        None,
+        dispatches_internal_worker_roles(),
+        &env::current_exe()?,
+    )
+}
+
+/// Whether the running executable has asked for a worker role. No harness has, the execution
+/// crate's own included, because no test calls the predicates that record it.
+fn dispatches_internal_worker_roles() -> bool {
+    DISPATCHES_WORKER_ROLES.load(Ordering::Relaxed)
+}
+
+/// A test build takes a supplied worker when it is a file. Unsupplied, an executable that
+/// dispatches the worker roles at startup (the `um` binary or the `internal-worker` example)
+/// is its own worker; any other executable is a test harness, which would run its suite in a
+/// worker role and launch itself again, so it takes the example beside it (INV-TESTING-20).
+fn test_build_internal_worker_executable(
+    supplied: Option<OsString>,
+    dispatches_worker_roles: bool,
+    executable: &Path,
+) -> io::Result<PathBuf> {
+    if let Some(path) = supplied {
+        let path = PathBuf::from(path);
+        return path.is_file().then_some(path).ok_or_else(|| {
+            io::Error::other("supplied test internal-worker executable unavailable")
+        });
+    }
+    if dispatches_worker_roles {
+        return Ok(executable.to_path_buf());
+    }
+    test_build_worker_example(executable)
+}
+
+/// The `internal-worker` example beside a test harness, `<profile>/examples/internal-worker`
+/// for a harness at `<profile>/deps/<crate>-<hash>`, which a plain `cargo test -p um-execution`
+/// builds and no other package's test command does. A `--all-targets` build compiles the
+/// example as a test harness instead, so such a run builds the ordinary example and names it in
+/// `UM_TEST_INTERNAL_WORKER_EXECUTABLE`, as `cli/scripts/check-suite` does.
 fn test_build_worker_example(test_executable: &Path) -> io::Result<PathBuf> {
     let example = test_executable
         .parent()
@@ -322,7 +366,7 @@ fn drain(mut reader: impl Read) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use std::ffi::OsStr;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use std::time::Duration;
 
     use nix::sys::stat::Mode;
@@ -330,49 +374,92 @@ mod tests {
 
     use super::{
         CommandProbeError, CommandRequest, CommandRunner, SystemCommandRunner,
-        test_build_worker_example,
+        test_build_internal_worker_executable,
     };
 
     const FIXTURE_STDOUT_LIMIT: usize = 8 * 1024;
 
-    // INV-TESTING-20
-    #[test]
-    fn test_build_resolves_the_worker_example_beside_the_test_executable() {
+    /// A target directory with a test harness at `<profile>/deps/um-0123abcd`, a supplied
+    /// worker file, and, when `example_is_file`, the `internal-worker` example beside it.
+    struct WorkerLayout {
+        _target: tempfile::TempDir,
+        harness: PathBuf,
+        example: PathBuf,
+        supplied: PathBuf,
+    }
+
+    fn worker_layout(example_is_file: bool) -> WorkerLayout {
         let target = tempfile::tempdir().unwrap();
         let profile = target.path().join("debug");
         std::fs::create_dir_all(profile.join("deps")).unwrap();
         std::fs::create_dir_all(profile.join("examples")).unwrap();
-        let test_executable = profile.join("deps").join("um_execution-0123abcd");
-        std::fs::write(&test_executable, b"").unwrap();
+        let harness = profile.join("deps").join("um-0123abcd");
+        std::fs::write(&harness, b"").unwrap();
         let example = profile.join("examples").join("internal-worker");
-        std::fs::write(&example, b"").unwrap();
+        if example_is_file {
+            std::fs::write(&example, b"").unwrap();
+        } else {
+            std::fs::create_dir_all(&example).unwrap();
+        }
+        let supplied = target.path().join("supplied-worker");
+        std::fs::write(&supplied, b"").unwrap();
+        WorkerLayout {
+            _target: target,
+            harness,
+            example,
+            supplied,
+        }
+    }
 
+    // INV-TESTING-20
+    #[test]
+    fn an_unsupplied_test_harness_takes_the_worker_example_and_never_itself() {
+        let layout = worker_layout(true);
+        let worker = test_build_internal_worker_executable(None, false, &layout.harness).unwrap();
+        assert_eq!(worker, layout.example);
+        assert_ne!(worker, layout.harness);
+
+        let layout = worker_layout(false);
+        for harness in [layout.harness.as_path(), Path::new("/um-0123abcd")] {
+            let error = test_build_internal_worker_executable(None, false, harness).unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::Other);
+            assert_eq!(error.raw_os_error(), None);
+        }
+    }
+
+    // INV-TESTING-20
+    #[test]
+    fn an_unsupplied_executable_that_dispatches_the_worker_roles_is_its_own_worker() {
+        let layout = worker_layout(true);
         assert_eq!(
-            test_build_worker_example(&test_executable).unwrap(),
-            example
+            test_build_internal_worker_executable(None, true, &layout.harness).unwrap(),
+            layout.harness
         );
     }
 
     // INV-TESTING-20
     #[test]
-    fn test_build_without_a_worker_fails_as_a_spawn_refusal() {
-        let target = tempfile::tempdir().unwrap();
-        let profile = target.path().join("debug");
-        std::fs::create_dir_all(profile.join("deps")).unwrap();
-        std::fs::create_dir_all(profile.join("examples")).unwrap();
-        let test_executable = profile.join("deps").join("um_execution-0123abcd");
-        std::fs::write(&test_executable, b"").unwrap();
-        std::fs::create_dir_all(profile.join("examples").join("internal-worker")).unwrap();
-
-        let error = test_build_worker_example(&test_executable).unwrap_err();
-        assert_eq!(error.kind(), std::io::ErrorKind::Other);
-        assert_eq!(error.raw_os_error(), None);
-        assert_eq!(
-            test_build_worker_example(Path::new("/um_execution-0123abcd"))
-                .unwrap_err()
-                .kind(),
-            std::io::ErrorKind::Other
-        );
+    fn a_supplied_worker_file_wins_and_a_supplied_non_file_is_refused() {
+        let layout = worker_layout(true);
+        for dispatches in [false, true] {
+            assert_eq!(
+                test_build_internal_worker_executable(
+                    Some(layout.supplied.clone().into_os_string()),
+                    dispatches,
+                    &layout.harness,
+                )
+                .unwrap(),
+                layout.supplied
+            );
+            let error = test_build_internal_worker_executable(
+                Some(layout.example.with_file_name("absent").into_os_string()),
+                dispatches,
+                &layout.harness,
+            )
+            .unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::Other);
+            assert_eq!(error.raw_os_error(), None);
+        }
     }
 
     #[cfg(unix)]

@@ -92,6 +92,9 @@ impl Command {
             cancellation.clone(),
             super::create::UnixSignals::new()?,
         );
+        // REQ-LOCALRUN-135: a signal reads the run's control journal from here on, before the
+        // attempt begins, as `continue_run` does for a resume.
+        let _journal = signal_task.watch(&run_directory);
         let opened = match tokio::task::spawn_blocking(move || {
             reconcile_current_result_publication(&run_directory).map_err(|error| {
                 anyhow::anyhow!("finalize workflow result publication: {error:?}")

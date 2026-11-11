@@ -421,6 +421,13 @@ fn child_guard_worker_executable() -> io::Result<PathBuf> {
     crate::process::internal_worker_executable()
 }
 
+/// The child-guard and result-validation worker this test build resolves as if
+/// `UM_TEST_INTERNAL_WORKER_EXECUTABLE` were unset, without launching it (INV-TESTING-20).
+#[cfg(feature = "test-fixtures")]
+pub fn unsupplied_internal_worker_executable() -> io::Result<PathBuf> {
+    crate::process::unsupplied_internal_worker_executable()
+}
+
 fn create_activity_lease(root: &Path) -> io::Result<ActivityLease> {
     let file = OpenOptions::new()
         .read(true)
@@ -537,7 +544,11 @@ fn worker_boundary_timed_out(elapsed: Duration) -> bool {
     elapsed >= WORKER_BOUNDARY_TIMEOUT
 }
 
+/// Whether this process was launched in a child-guard worker role. Asking also records that
+/// the executable dispatches the worker roles, which lets a test build of it be its own worker
+/// (INV-TESTING-20): an executable's `main` asks, a test never does.
 pub fn internal_worker_requested() -> bool {
+    crate::process::record_internal_worker_dispatch();
     matches!(
         std::env::var(INTERNAL_WORKER_ENVIRONMENT).as_deref(),
         Ok(GUARD_WORKER | LEADER_WORKER)

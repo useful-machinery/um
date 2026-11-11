@@ -1019,9 +1019,10 @@ fn empty_log_preview_distinguishes_waiting_and_no_output() {
     }
 }
 
-// REQ-LOCALRUN-22, REQ-LOCALRUN-53
+// REQ-LOCALRUN-22, REQ-LOCALRUN-53: Ctrl-C during ordinary execution requests an
+// interruption with `user_request`.
 #[test]
-fn navigation_is_bounded_and_ctrl_c_uses_user_request() {
+fn navigation_is_bounded_and_ctrl_c_interrupts_with_user_request() {
     let cancellation = CancellationSource::new();
     let mut snapshot = direct_snapshot(long_log_step());
     snapshot.steps.push(snapshot.steps[0].clone());
@@ -1051,6 +1052,7 @@ fn navigation_is_bounded_and_ctrl_c_uses_user_request() {
         cancellation.cancellation_reason(),
         Some(CancellationReason::UserRequest)
     );
+    assert!(cancellation.interruption_requested());
 }
 
 // REQ-LOCALRUN-54
@@ -1326,6 +1328,7 @@ async fn scripted_input_keeps_q_inert_during_execution_and_restores_after_cancel
         cancellation.cancellation_reason(),
         Some(CancellationReason::UserRequest)
     );
+    assert!(cancellation.interruption_requested());
 }
 
 // REQ-LOCALRUN-61

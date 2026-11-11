@@ -1477,6 +1477,61 @@ fn advisory_issue_is_valid_on_success_but_cannot_be_primary() {
     assert_eq!(decode(&encode(&advisory)), Err(ResultMetadataError));
 }
 
+// REQ-WFEXEC-69
+#[test]
+fn an_interrupted_step_is_the_primary_issue_whatever_its_failure_policy() {
+    for phase in ["start", "execution"] {
+        for policy in ["required", "advisory"] {
+            let mut interrupted = failed_result_fixture(phase, json!({ "code": "interrupted" }));
+            interrupted["steps"][0]["failurePolicy"] = json!(policy);
+            interrupted["cancellation"] = json!({
+                "reason": "user_request",
+                "forceStopDeadline": "2026-08-02T12:01:46Z"
+            });
+            assert!(
+                decode(&encode(&interrupted)).is_ok(),
+                "{policy} step interrupted at {phase}"
+            );
+        }
+    }
+    let at_capture = failed_result_fixture("output_capture", json!({ "code": "interrupted" }));
+    assert_eq!(decode(&encode(&at_capture)), Err(ResultMetadataError));
+}
+
+// REQ-WFEXEC-69
+#[test]
+fn a_recovery_round_an_interruption_stopped_ends_failed_and_cancelled() {
+    let interrupted = |code: &str| {
+        let mut result = recovered_result_fixture();
+        let detail = json!({ "phase": "execution", "code": code });
+        result["outcome"] = json!("failed");
+        result["cancellation"] = json!({
+            "reason": "user_request",
+            "forceStopDeadline": "2026-08-02T12:01:46Z"
+        });
+        result["primaryIssue"] = json!({
+            "node": { "id": "produce", "role": "step" },
+            "state": "failed",
+            "detail": detail.clone()
+        });
+        result["steps"][0]["state"] = json!("failed");
+        result["steps"][0]["detail"] = detail;
+        result["steps"][0]["recovery"]["termination"] = json!({
+            "kind": "cancelled",
+            "round": 1,
+            "activeRole": "target",
+            "executionNumber": 2
+        });
+        result["steps"][0]["invocations"][1]["state"] = json!("cancelled");
+        result
+    };
+    assert!(decode(&encode(&interrupted("interrupted"))).is_ok());
+    assert_eq!(
+        decode(&encode(&interrupted("harness_failed"))),
+        Err(ResultMetadataError)
+    );
+}
+
 #[test]
 fn rejects_multiply_owned_alias_metadata() {
     let mut non_owner = result_fixture();

@@ -5,7 +5,7 @@
 use std::fs;
 use std::io::{BufRead as _, Read as _, Write as _};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 use std::sync::{Arc, Mutex};
 
 use serde_json::{Value, json};
@@ -13,6 +13,7 @@ use serde_json::{Value, json};
 use super::workflow_continue::{WAIT_TREE_ROOT, completed, decide, wait_tree};
 use super::workflow_definition::{Home, Tree, read_json};
 use super::workflow_run::{TreeBundle, isolated_command, run_record};
+use super::workflow_run_control::LiveRun;
 use super::workflow_run_create::Published;
 
 /// The login name the mirrored runs are created by, which `{{operator}}` renders.
@@ -491,6 +492,46 @@ impl MirroredWaitTree {
         stub.point(&mut command).output().unwrap()
     }
 
+    /// A run for `ticket` whose `design` stage holds its step: the live process.
+    fn held(&self, stub: &LinearStub, ticket: &str) -> LiveRun {
+        let execution = self.bundle.execution_root();
+        let _ = fs::remove_file(execution.join("held-design"));
+        fs::write(execution.join("hold-design"), "").unwrap();
+        decide(&self.bundle, "design", "planned");
+        let mut full = [
+            "workflow",
+            "run",
+            "create",
+            &self.definition,
+            "--execution-root",
+        ]
+        .map(str::to_owned)
+        .to_vec();
+        full.extend([
+            execution.to_str().unwrap().to_owned(),
+            "--input-text".to_owned(),
+            "ticket".to_owned(),
+            ticket.to_owned(),
+            "--json".to_owned(),
+        ]);
+        let mut command = isolated_command(&full);
+        command
+            .env("UM_HOME", self.home.path())
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let live = LiveRun {
+            process: stub.point(&mut command).spawn().unwrap(),
+            release: execution.join("release-design"),
+        };
+        super::poll_until(
+            "the stage's held step",
+            || execution.join("held-design").exists(),
+            |held| *held,
+        );
+        live
+    }
+
     /// A run for `ticket` whose `design` waits on an answer.
     fn waiting(&self, stub: &LinearStub, ticket: &str) -> PathBuf {
         decide(&self.bundle, "design", "blocked");
@@ -613,5 +654,68 @@ fn a_tickets_lifecycle_is_mirrored_and_show_lists_every_write() {
             .last()
             .unwrap(),
         "  0004 · outcome · state Canceled · written"
+    );
+}
+
+// SC-LOCALRUN-15, REQ-LOCALRUN-191, REQ-LOCALRUN-135, REQ-LOCALRUN-186: SIGINT to the process
+// of a mirrored run interrupts its stage, whose repair wait's `onWait` comment begins with the
+// interruption, and the run writes no `onOutcome`; a live run ended by `cancel` still writes
+// `onOutcome.canceled`.
+#[test]
+fn an_interrupted_run_mirrors_its_wait_and_a_cancelled_one_its_outcome() {
+    let tree = MirroredWaitTree::publish();
+    let stub = LinearStub::start();
+
+    let output = tree
+        .held(&stub, "AUTO-1")
+        .signal(rustix::process::Signal::INT);
+    assert_eq!(output.status.code(), Some(130), "{output:?}");
+    let terminal: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(terminal["wait"]["kind"], "repair", "{terminal}");
+    let run = PathBuf::from(terminal["runDirectory"].as_str().unwrap());
+    assert_eq!(run_record(&run)["state"], "waiting");
+    let writes = mirror_writes(&run);
+    let waits = writes
+        .iter()
+        .filter(|(name, _)| name.ends_with("-wait.json"))
+        .collect::<Vec<_>>();
+    assert_eq!(waits.len(), 1, "{writes:?}");
+    assert_eq!(waits[0].1["outcome"], "written", "{writes:?}");
+    assert!(
+        !writes
+            .iter()
+            .any(|(name, _)| name.ends_with("-outcome.json")),
+        "{writes:?}"
+    );
+    assert!(
+        comments(&stub)
+            .last()
+            .unwrap()
+            .starts_with("Waiting for repair: interrupted"),
+        "{:?}",
+        comments(&stub)
+    );
+    assert!(!stub.operations().contains(&"UpdateIssueState".to_owned()));
+
+    stub.clear();
+    let mut live = tree.held(&stub, "AUTO-2");
+    let output = tree.run(&stub, &["cancel", "AUTO-2", "--json"]);
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let exited = super::poll_until(
+        "the cancelled run's process exit",
+        || live.process.try_wait().unwrap(),
+        Option::is_some,
+    );
+    assert!(exited.is_some());
+    let shown: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let canceled = PathBuf::from(shown["runDirectory"].as_str().unwrap());
+    assert_eq!(run_record(&canceled)["outcome"], "canceled");
+    let writes = mirror_writes(&canceled);
+    let (name, write) = writes.last().unwrap();
+    assert!(name.ends_with("-outcome.json"), "{writes:?}");
+    assert_eq!(write["outcome"], "written", "{write}");
+    assert_eq!(
+        write["action"],
+        json!({"kind": "state", "state": "Canceled", "binding": "canceled"})
     );
 }

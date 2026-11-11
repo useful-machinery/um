@@ -470,7 +470,11 @@ async fn write_async_frame(
     destination.write_all(bytes).await
 }
 
+/// Whether this process was launched as the result-validation worker. Asking also records
+/// that the executable dispatches the worker roles, which lets a test build of it be its own
+/// worker (INV-TESTING-20): an executable's `main` asks, a test never does.
 pub fn internal_worker_requested() -> bool {
+    crate::process::record_internal_worker_dispatch();
     std::env::var(INTERNAL_WORKER_ENVIRONMENT).as_deref() == Ok(INTERNAL_WORKER_VERSION)
 }
 

@@ -240,7 +240,7 @@ fn list_shows_the_subject_and_the_drifted_runs() {
 }
 
 /// Every path under `directory` with its size and modification time.
-fn snapshot(directory: &Path) -> Vec<(PathBuf, u64, std::time::SystemTime)> {
+pub(super) fn snapshot(directory: &Path) -> Vec<(PathBuf, u64, std::time::SystemTime)> {
     let mut entries = Vec::new();
     let mut pending = vec![directory.to_owned()];
     while let Some(path) = pending.pop() {
@@ -324,6 +324,7 @@ fn show_prints_a_run_with_its_children_and_controls() {
             "state": "exited",
             "outcome": "blocked",
             "directory": child.to_str().unwrap(),
+            "progress": null,
         }])
     );
     let controls = document["controls"].as_array().unwrap();

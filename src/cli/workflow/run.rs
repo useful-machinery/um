@@ -5,6 +5,7 @@ mod condition;
 mod control;
 mod create;
 mod end;
+mod interrupt;
 mod list;
 mod mirror;
 mod restart;
@@ -46,6 +47,8 @@ enum RunCommand {
     Create(Box<create::Command>),
     #[command(about = approve::HAND_BACK_ABOUT)]
     HandBack(approve::HandBack),
+    #[command(about = interrupt::ABOUT)]
+    Interrupt(interrupt::Command),
     #[command(about = stop::LIFT_ABOUT)]
     Lift(stop::Lift),
     #[command(about = list::ABOUT)]
@@ -81,6 +84,7 @@ impl Command {
             Some(RunCommand::Cancel(command)) => command.cancel(),
             Some(RunCommand::Create(command)) => command.execute(),
             Some(RunCommand::HandBack(command)) => command.execute(),
+            Some(RunCommand::Interrupt(command)) => command.execute(),
             Some(RunCommand::Lift(command)) => command.execute(),
             Some(RunCommand::List(command)) => command.execute(),
             Some(RunCommand::Release(command)) => command.release(),

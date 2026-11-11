@@ -1697,6 +1697,76 @@ fn a_stopped_subagents_interruption_in_the_correction_window_is_its_work() {
     );
 }
 
+// REQ-AGENT-69, REQ-AGENT-76
+#[test]
+fn a_stopped_subagents_interruption_after_the_result_is_its_work() {
+    // The main thread answered on the round that returned the `TaskStop` result: the
+    // subagent settled (`stopped`) in the exchange, and its thread's interruption, the killed
+    // call's rejected `tool_result` and the interruption text, lost the race with the
+    // `result` and lands in the drain, before the epilogue its queued notification opens
+    // (lifecycle matrix `none/background-agent[foreground-bash]/task-stop-unawaited/settle`,
+    // build #3703).
+    let interruption = [
+        subagent_message(
+            "user",
+            json!({"role": "user", "content": [{"type": "tool_result",
+                "tool_use_id": "subagent-bash", "is_error": true,
+                "content": "The user doesn't want to proceed with this tool use."}]}),
+        ),
+        subagent_message(
+            "user",
+            json!({"role": "user", "content": [{"type": "text", "text": "[Request interrupted by user]"}]}),
+        ),
+    ];
+    let transcript_settled_as = |status: &str| {
+        let mut values = subagent_settled_in_the_exchange_transcript(&epilogue_turn());
+        let notification = position_of(&values, |value| value["subtype"] == "task_notification");
+        values[notification]["status"] = json!(status);
+        let first_result = position_of(&values, |value| value["type"] == "result");
+        values.splice(
+            first_result + 1..first_result + 1,
+            interruption.iter().cloned(),
+        );
+        values
+    };
+
+    let stopped = transcript_settled_as("stopped");
+    for kind in [AgentValueKind::Response, AgentValueKind::None] {
+        let (observations, outcome) = replay(&framed(&stopped), kind, 1024);
+        match kind {
+            AgentValueKind::Response => assert_eq!(completed_response(&outcome), "done"),
+            _ => assert!(
+                matches!(
+                    outcome,
+                    AgentOutcome::Completed(CompletedAgentInvocation::NoValue)
+                ),
+                "{outcome:?}"
+            ),
+        }
+        assert_eq!(subagent_statuses(&observations), ["started", "stopped"]);
+        assert!(observations.iter().any(|observation| matches!(
+            observation,
+            AgentObservation::ToolResult { call_id, is_error: true, .. }
+                if call_id.as_ref() == "subagent-bash"
+        )));
+        assert_eq!(
+            milestone_count(&observations, AgentLifecycleMilestone::TurnCompleted),
+            2
+        );
+    }
+
+    // A subagent that settled on its own has nothing to interrupt: its message after the
+    // `result` is still one the step is not waiting on.
+    let completed = transcript_settled_as("completed");
+    let (_, outcome) = replay(&framed(&completed), AgentValueKind::Response, 1024);
+    let rejection = protocol_rejection_value(&outcome);
+    assert_eq!(
+        rejection["detail"]["reason"],
+        "terminal_drain_event_invalid"
+    );
+    assert_eq!(rejection["detail"]["outerEvent"], "user");
+}
+
 /// The backgrounded-subagent transcript with the launch registered in the foreground
 /// (`is_backgrounded: false`), as Claude Code 2.1.310 may register an `Agent` call made with
 /// `run_in_background`, and the move to the background announced only by `moved`: the

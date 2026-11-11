@@ -6581,7 +6581,8 @@
                 "missing_result",
                 "result_validation_limit_exceeded",
                 "captured_value_too_large",
-                "result_settlement_failed"
+                "result_settlement_failed",
+                "interrupted"
               ]
             }
           },

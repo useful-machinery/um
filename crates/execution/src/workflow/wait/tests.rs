@@ -9,9 +9,10 @@ use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
 use super::*;
+use crate::workflow::admission::CancellationReason;
 use crate::workflow::admission::{ResolvedInput, ResolvedInputs};
 use crate::workflow::local_run::LocalRunDirectoryError;
-use crate::workflow::runtime::EnteredWait;
+use crate::workflow::runtime::{ChildInterruption, EnteredWait};
 
 const RUN: &str = "run_01jcf9a4r7t2m8k3v6x1z5n0pq";
 const OTHER_RUN: &str = "run_01jcfa3m6p9q2r5s8t1v4w7x0y";
@@ -45,6 +46,7 @@ fn entered(kind: WaitKind, step: &str, then: &str, on_hand_back: Option<&str>) -
         then: then.to_owned(),
         on_hand_back: on_hand_back.map(str::to_owned),
         rule: None,
+        interrupted: None,
     }
 }
 
@@ -371,6 +373,79 @@ fn a_wait_without_a_derived_rule_or_continuing_at_an_exit_has_no_record() {
 
 const PULL_REQUEST: &str = "https://github.com/useful-machinery/platform/pull/3958";
 
+// REQ-WFEXEC-70: a `repair` wait an interrupted child routed to carries the interruption,
+// and the engine's `summary`, which begins `interrupted`, replaces one the step committed.
+#[test]
+fn an_interrupted_repair_wait_payload_names_the_interruption_over_a_committed_summary() {
+    let wait = EnteredWait {
+        interrupted: Some(ChildInterruption {
+            reason: CancellationReason::TerminationRequest,
+            step: "implement".to_owned(),
+        }),
+        ..entered(WaitKind::Repair, "build", "build", None)
+    };
+    let steps = BTreeMap::from([(
+        "build".to_owned(),
+        StepState::Succeeded {
+            outputs: BTreeMap::from([
+                (
+                    "outcome".to_owned(),
+                    CapturedValue::text(Arc::from("failed")),
+                ),
+                (
+                    "summary".to_owned(),
+                    CapturedValue::text(Arc::from("the child's own summary")),
+                ),
+            ]),
+        },
+    )]);
+    let payload = wait_payload(&wait, &steps, Some("children/build/000001"), None);
+
+    assert_eq!(payload["outcome"], "failed");
+    assert_eq!(payload["child"], "children/build/000001");
+    assert_eq!(
+        payload["interrupted"],
+        json!({"reason": "termination_request", "step": "implement"})
+    );
+    let summary = payload["summary"].as_str().unwrap();
+    assert_eq!(summary.split_whitespace().next(), Some("interrupted"));
+    assert_ne!(summary, "the child's own summary");
+
+    // REQ-WFDEF-6: an interruption a `control.interrupt` requested carries that control's
+    // `by`, `at` and `payload`, and the summary names its reason.
+    let interrupt = control(
+        "control.interrupt",
+        RUN,
+        None,
+        Some(json!({"reason": "pausing for a fix"})),
+    );
+    let payload = wait_payload(&wait, &steps, None, Some(&interrupt));
+    assert_eq!(
+        payload["interrupted"],
+        json!({
+            "reason": "termination_request",
+            "step": "implement",
+            "control": {
+                "by": "saeed",
+                "at": "2026-11-07T22:00:00Z",
+                "payload": {"reason": "pausing for a fix"},
+            },
+        })
+    );
+    let summary = payload["summary"].as_str().unwrap();
+    assert_eq!(summary.split_whitespace().next(), Some("interrupted"));
+    assert!(summary.contains("pausing for a fix"), "{summary}");
+
+    let plain = wait_payload(
+        &entered(WaitKind::Repair, "build", "build", None),
+        &steps,
+        None,
+        None,
+    );
+    assert_eq!(plain["summary"], "the child's own summary");
+    assert!(!plain.contains_key("interrupted"));
+}
+
 /// The `merge` step's `admitted` edge: an `external` wait on the queue of the pull request
 /// `design` exported, continuing at `merge`.
 fn external_wait(where_: &str) -> EnteredWait {
@@ -595,6 +670,59 @@ fn append_control_writes_ordinal_files_that_read_controls_returns_in_order() {
     fs::remove_file(controls.join("0003-lift.json")).unwrap();
     fs::write(controls.join("notes.txt"), b"").unwrap();
     assert_control_invalid(root.path(), "notes.txt");
+}
+
+// REQ-WFDEF-6: `control.interrupt` is a control event of the published schema, written as
+// `controls/<NNNN>-interrupt.json`, and no wait's rule resolves on it.
+#[test]
+fn an_interrupt_is_a_recorded_control_that_resolves_no_wait() {
+    let validator = validator("workflow-run-control-v1.schema.json");
+    let root = run_root();
+    let interrupt = ControlEvent::new(
+        "control.interrupt",
+        RUN,
+        "saeed",
+        None,
+        Some(object(json!({"reason": "pausing for a fix"}))),
+    )
+    .unwrap();
+    let path = append_control(root.path(), &interrupt).unwrap();
+    assert_eq!(
+        path,
+        root.path()
+            .join("controls")
+            .canonicalize()
+            .unwrap()
+            .join("0001-interrupt.json")
+    );
+    assert_valid(
+        &validator,
+        &serde_json::from_slice::<Value>(&fs::read(&path).unwrap()).unwrap(),
+    );
+    assert_eq!(
+        read_numbered_controls(root.path()).unwrap(),
+        [(1, interrupt)]
+    );
+
+    for (kind, on_hand_back) in [
+        (WaitKind::Answer, None),
+        (WaitKind::Approval, Some("fix")),
+        (WaitKind::Repair, None),
+        (WaitKind::Stop, None),
+    ] {
+        let wait = record(kind, "design", "design", on_hand_back);
+        let interrupt = control(
+            "control.interrupt",
+            RUN,
+            Some(&wait.id()),
+            Some(json!({"reason": "pausing", "before": "design", "complete": true})),
+        );
+        assert_eq!(
+            evaluate(&wait.rule, RUN, &wait, std::slice::from_ref(&interrupt)),
+            Ok(None),
+            "{kind:?}"
+        );
+    }
 }
 
 // REQ-LOCALRUN-178, REQ-CONTINUE-74, INV-ENGINE-21

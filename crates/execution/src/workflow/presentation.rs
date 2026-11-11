@@ -22,11 +22,14 @@ use super::evidence::{BlockedDetail, FailureDetail, Prerequisite, PrimaryIssueDe
 use super::local_run::{
     CarryMiss, LocalRetryRejection, RetryIneligibilityReason, TreeCopyMismatch,
 };
-use super::observation::{ExecutionObservation, ExecutionObserver, ObservedStepTransition};
+use super::observation::{
+    ExecutionObservation, ExecutionObserver, ObservedStepTransition, TransitionObservation,
+};
 use super::presentation_feed::{
     AcceptedRecordOrder, AgentPresentationHarness, DisplayDeadline, NormalizedAgentObservation,
     NormalizedChildOutput, PresentationRecord, PresentationRecordKind, PresentationTransition,
-    WorkflowPresentationFeed, WorkflowPresentationStep, is_unicode_control,
+    WorkflowPresentationDefinition, WorkflowPresentationFeed, WorkflowPresentationStep,
+    is_unicode_control,
 };
 use super::publication::{
     LocalPublicationError, WorkflowRunResult, WorkflowRunStep, WorkflowRunTerminalResultV1,
@@ -44,6 +47,7 @@ use super::runtime::{
 use super::step_runtime::{CommandExecutionFailure, StepExecutionFailure, StepFailureCause};
 use super::tree::{TreeDiagnostic, TreeLocation};
 use super::validated::ValidatedStep;
+use super::wait::position_path;
 use crate::AgentHarnessInstallationFailure;
 use crate::harness_installation::UntestedHarnessAdvisory;
 
@@ -1643,6 +1647,30 @@ where
         &self,
         observation: ExecutionObservation<Deadline>,
     ) -> impl Future<Output = ()> + Send {
+        self.enqueue_render(move |state, observed_at| {
+            state.render_observation(observed_at, observation)
+        })
+    }
+}
+
+impl<StandardOutput, StandardError, Clock>
+    WorkflowRunPresentation<StandardOutput, StandardError, Clock>
+where
+    StandardOutput: Write + Send + 'static,
+    StandardError: Write + Send + 'static,
+    Clock: ObservationClock,
+{
+    /// Admits `render` behind every earlier message, observed now. A render that fails
+    /// records the presentation's failure, as a queue that cannot admit it does.
+    fn enqueue_render(
+        &self,
+        render: impl FnOnce(
+            &mut PresentationState<StandardOutput, StandardError>,
+            ObservationTime,
+        ) -> Result<(), PresentationFailure>
+        + Send
+        + 'static,
+    ) -> impl Future<Output = ()> + Send {
         let observed_at = self.clock.sample();
         let admission = {
             let queue = self
@@ -1655,7 +1683,7 @@ where
                     Box::new(move |state: &mut PresentationState<_, _>| {
                         if state.failure.is_none()
                             && !state.finished
-                            && let Err(failure) = state.render_observation(observed_at, observation)
+                            && let Err(failure) = render(state, observed_at)
                         {
                             state.record_failure(failure);
                         }
@@ -1668,6 +1696,130 @@ where
                 && let Err(kind) = admission.complete().await
             {
                 self.record_queue_failure(kind);
+            }
+        }
+    }
+
+    /// The presentation of the child run `step` started, for element `item` of a fan-out
+    /// (REQ-WFEXEC-66), whose resolved file is `workflow` (REQ-LOCALRUN-200).
+    pub fn child_scope(
+        &self,
+        workflow: &ResolvedWorkflow,
+        step: &str,
+        item: Option<u64>,
+    ) -> Result<ChildRunPresentation<StandardOutput, StandardError, Clock>, PresentationFailure>
+    {
+        let mut position = vec![serde_json::Value::String(step.to_owned())];
+        position.extend(item.map(|item| serde_json::json!({ "item": item })));
+        Ok(ChildRunPresentation {
+            parent: self.clone(),
+            scope: Arc::new(Mutex::new(ChildStepScope {
+                position,
+                workflow: WorkflowPresentationDefinition::from_workflow(workflow),
+                // A child's records name no result directory of their own.
+                definition: PresentationDefinition::from_workflow(workflow, "")?,
+                step_starts: BTreeMap::new(),
+            })),
+        })
+    }
+}
+
+/// A running child run's view of its parent's presentation (REQ-LOCALRUN-200,
+/// INV-ENGINE-28): the child's step and finalizer state records enqueue on the parent's
+/// queue, in observation order with the parent's own, scoped by the child step's position
+/// path under the parent's step. The child's output, agent events and workflow records
+/// present nothing, and a failed write is the parent's presentation failure.
+pub struct ChildRunPresentation<StandardOutput, StandardError, Clock> {
+    parent: WorkflowRunPresentation<StandardOutput, StandardError, Clock>,
+    scope: Arc<Mutex<ChildStepScope>>,
+}
+
+impl<StandardOutput, StandardError, Clock> Clone
+    for ChildRunPresentation<StandardOutput, StandardError, Clock>
+where
+    Clock: Clone,
+{
+    fn clone(&self) -> Self {
+        Self {
+            parent: self.parent.clone(),
+            scope: Arc::clone(&self.scope),
+        }
+    }
+}
+
+struct ChildStepScope {
+    /// The parent's step and, for a fan-out, its element.
+    position: Vec<serde_json::Value>,
+    workflow: WorkflowPresentationDefinition,
+    definition: PresentationDefinition,
+    step_starts: BTreeMap<String, Instant>,
+}
+
+impl ChildStepScope {
+    fn render<StandardOutput: Write, StandardError: Write, Deadline>(
+        &mut self,
+        state: &mut PresentationState<StandardOutput, StandardError>,
+        observed_at: ObservationTime,
+        transition: TransitionObservation<Deadline>,
+    ) -> Result<(), PresentationFailure> {
+        let TransitionEvent::Step {
+            step,
+            failure_policy,
+            to,
+            ..
+        } = transition.event
+        else {
+            return Ok(());
+        };
+        let records = StepRecords {
+            workflow: &self.workflow,
+            definition: &self.definition,
+            step_starts: &mut self.step_starts,
+            outputs: false,
+        }
+        .transition(
+            observed_at.monotonic,
+            &step,
+            failure_policy,
+            to,
+            transition.step,
+        );
+        let mut position = self.position.clone();
+        position.push(serde_json::Value::String(step));
+        state.write_step_records(observed_at.utc, &position_path(&position), records)?;
+        state.flush_line_writer()
+    }
+}
+
+impl<StandardOutput, StandardError, Clock, Deadline> ExecutionObserver<Deadline>
+    for ChildRunPresentation<StandardOutput, StandardError, Clock>
+where
+    StandardOutput: Write + Send + 'static,
+    StandardError: Write + Send + 'static,
+    Clock: ObservationClock,
+    Deadline: DisplayDeadline,
+{
+    fn observe(
+        &self,
+        observation: ExecutionObservation<Deadline>,
+    ) -> impl Future<Output = ()> + Send {
+        let forwarded = match observation {
+            ExecutionObservation::Transition(transition)
+                if matches!(transition.event, TransitionEvent::Step { .. }) =>
+            {
+                let scope = Arc::clone(&self.scope);
+                Some(self.parent.enqueue_render(move |state, observed_at| {
+                    scope
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .render(state, observed_at, *transition)
+                }))
+            }
+            _ => None,
+        };
+        async move {
+            if let Some(forwarded) = forwarded {
+                forwarded.await;
             }
         }
     }
@@ -1886,180 +2038,22 @@ where
                 failure_policy,
                 to,
                 ..
-            } => match to {
-                StepStateKind::Starting => {
-                    self.step_starts
-                        .entry(step.clone())
-                        .or_insert(observed_at.monotonic);
-                    let detail = observed_recovery_detail(transition.step).unwrap_or_else(|| {
-                        self.feed
-                            .definition()
-                            .steps
-                            .get(&step)
-                            .map_or_else(|| "cmd".to_owned(), start_detail)
-                    });
-                    self.write_event(observed_at.utc, &step, "start", &detail, TokenRole::Active)
+            } => {
+                let records = StepRecords {
+                    workflow: self.feed.definition(),
+                    definition: &self.definition,
+                    step_starts: &mut self.step_starts,
+                    outputs: true,
                 }
-                StepStateKind::Succeeded => {
-                    let outputs = match transition.step {
-                        Some(ObservedStepTransition::OutputsCommitted { outputs }) => outputs,
-                        _ => Vec::new(),
-                    };
-                    for output in &outputs {
-                        let detail = self
-                            .definition
-                            .steps
-                            .get(&step)
-                            .and_then(|definition| definition.outputs.get(output))
-                            .map_or_else(
-                                || format!("{} · committed", visible_text(output)),
-                                |declaration| format!("{} · {declaration}", visible_text(output)),
-                            );
-                        self.write_event(
-                            observed_at.utc,
-                            &step,
-                            "output",
-                            &detail,
-                            TokenRole::Output,
-                        )?;
-                    }
-                    let detail =
-                        self.definition
-                            .steps
-                            .get(&step)
-                            .map_or_else(String::new, |definition| {
-                                super::render_style::success_detail(
-                                    matches!(definition.success, StepSuccessPresentation::Command),
-                                    outputs.len(),
-                                )
-                            });
-                    let detail = completion_detail(
-                        detail,
-                        self.finish_step_duration(&step, observed_at.monotonic),
-                    );
-                    self.write_event(observed_at.utc, &step, "done", &detail, TokenRole::Success)
-                }
-                StepStateKind::Failed => {
-                    let detail = match transition.step {
-                        Some(ObservedStepTransition::Failed { detail }) => {
-                            canonical_failure_detail(&detail)
-                        }
-                        _ => "authoritative step failure".to_owned(),
-                    };
-                    let detail = completion_detail(
-                        detail,
-                        self.finish_step_duration(&step, observed_at.monotonic),
-                    );
-                    let detail = issue_detail(detail, failure_policy);
-                    self.write_event(
-                        observed_at.utc,
-                        &step,
-                        "failed",
-                        &detail,
-                        TokenRole::Failure,
-                    )
-                }
-                StepStateKind::Blocked => {
-                    let detail = match transition.step {
-                        Some(ObservedStepTransition::Blocked { detail }) => {
-                            canonical_blocked_detail(&detail)
-                        }
-                        _ => "dependency did not succeed".to_owned(),
-                    };
-                    let detail = issue_detail(detail, failure_policy);
-                    self.step_starts.remove(&step);
-                    self.write_event(
-                        observed_at.utc,
-                        &step,
-                        "blocked",
-                        &detail,
-                        TokenRole::Blocked,
-                    )
-                }
-                StepStateKind::Skipped => {
-                    self.step_starts.remove(&step);
-                    let detail = match transition.step {
-                        Some(ObservedStepTransition::Skipped { detail }) => format!(
-                            "condition_false · {} evaluated predicates",
-                            detail.evaluated_predicates.len()
-                        ),
-                        _ => "condition_false".to_owned(),
-                    };
-                    self.write_event(
-                        observed_at.utc,
-                        &step,
-                        "skipped",
-                        &detail,
-                        TokenRole::Neutral,
-                    )
-                }
-                StepStateKind::NotRun => {
-                    self.step_starts.remove(&step);
-                    let detail = match transition.step {
-                        Some(ObservedStepTransition::NotRun { detail }) => {
-                            snake_case_debug(detail.code)
-                        }
-                        None => "failure_stop".to_owned(),
-                        Some(_) => "not_run".to_owned(),
-                    };
-                    self.write_event(
-                        observed_at.utc,
-                        &step,
-                        "not-run",
-                        &detail,
-                        TokenRole::Neutral,
-                    )
-                }
-                StepStateKind::Cancelling => {
-                    let detail = match transition.step {
-                        Some(ObservedStepTransition::Cancelling { detail }) => {
-                            cancellation_reason(detail.code)
-                        }
-                        _ => "cancellation accepted",
-                    };
-                    self.write_event(
-                        observed_at.utc,
-                        &step,
-                        "cancelling",
-                        detail,
-                        TokenRole::Blocked,
-                    )
-                }
-                StepStateKind::Cancelled => {
-                    let detail = match transition.step {
-                        Some(ObservedStepTransition::Cancelled { detail }) => {
-                            cancellation_reason(detail.code)
-                        }
-                        _ => "cancelled",
-                    };
-                    let detail = completion_detail(
-                        detail.to_owned(),
-                        self.finish_step_duration(&step, observed_at.monotonic),
-                    );
-                    self.write_event(
-                        observed_at.utc,
-                        &step,
-                        "cancelled",
-                        &detail,
-                        TokenRole::Blocked,
-                    )
-                }
-                StepStateKind::Recovering => {
-                    let detail = observed_recovery_detail(transition.step)
-                        .unwrap_or_else(|| "recovery active".to_owned());
-                    self.write_event(
-                        observed_at.utc,
-                        &step,
-                        "recovering",
-                        &detail,
-                        TokenRole::Active,
-                    )
-                }
-                StepStateKind::Pending
-                | StepStateKind::Inherited
-                | StepStateKind::Running
-                | StepStateKind::CapturingOutputs => Ok(()),
-            },
+                .transition(
+                    observed_at.monotonic,
+                    &step,
+                    failure_policy,
+                    to,
+                    transition.step,
+                );
+                self.write_step_records(observed_at.utc, &step, records)
+            }
             TransitionEvent::Workflow { to, .. } => match *to {
                 super::runtime::WorkflowState::Finalizing { trigger, .. } => self.write_event(
                     observed_at.utc,
@@ -2073,10 +2067,16 @@ where
         }
     }
 
-    fn finish_step_duration(&mut self, step: &str, finished_at: Instant) -> Option<Duration> {
-        self.step_starts
-            .remove(step)
-            .map(|started_at| finished_at.saturating_duration_since(started_at))
+    fn write_step_records(
+        &mut self,
+        observed_at: OffsetDateTime,
+        scope: &str,
+        records: Vec<StepRecord>,
+    ) -> Result<(), PresentationFailure> {
+        for (token, detail, role) in records {
+            self.write_event(observed_at, scope, token, &detail, role)?;
+        }
+        Ok(())
     }
 
     fn render_child_output(
@@ -2412,7 +2412,10 @@ where
         self.write_line_bytes(outcome_line.as_bytes())?;
 
         match &run.outcome {
-            RunOutcome::Failed { primary_issue, .. } => {
+            RunOutcome::Failed {
+                primary_issue,
+                later_cancellation,
+            } => {
                 let detail = match &primary_issue.detail {
                     PrimaryIssueDetail::Failed(detail) => canonical_failure_detail(detail),
                     PrimaryIssueDetail::Blocked(detail) => canonical_blocked_detail(detail),
@@ -2436,15 +2439,13 @@ where
                     ),
                 );
                 self.write_line_bytes(line.as_bytes())?;
+                // A failed result that records a later cancellation or an interruption
+                // (REQ-WFEXEC-17, REQ-WFEXEC-69) names its reason too.
+                if let Some(reason) = later_cancellation {
+                    self.write_cancellation_line(*reason)?;
+                }
             }
-            RunOutcome::Cancelled { reason } => {
-                let line = format!(
-                    "{} {}\n",
-                    self.styled_token("cancellation:", TokenRole::Blocked),
-                    self.styled_text(cancellation_reason(*reason), TextTone::Secondary),
-                );
-                self.write_line_bytes(line.as_bytes())?;
-            }
+            RunOutcome::Cancelled { reason } => self.write_cancellation_line(*reason)?,
             RunOutcome::Waiting { wait } => {
                 let line = format!(
                     "{} {}\n",
@@ -2577,6 +2578,19 @@ where
         }
     }
 
+    /// The summary's `cancellation:` line for `reason` (REQ-LOCALRUN-123).
+    fn write_cancellation_line(
+        &mut self,
+        reason: CancellationReason,
+    ) -> Result<(), PresentationFailure> {
+        let line = format!(
+            "{} {}\n",
+            self.styled_token("cancellation:", TokenRole::Blocked),
+            self.styled_text(cancellation_reason(reason), TextTone::Secondary),
+        );
+        self.write_line_bytes(line.as_bytes())
+    }
+
     fn write_line_bytes(&mut self, bytes: &[u8]) -> Result<(), PresentationFailure> {
         self.line_writer().write_all(bytes).map_err(|error| {
             PresentationFailure::writer(PresentationFailureOperation::LineWriter, &error)
@@ -2651,6 +2665,151 @@ struct SummaryRow {
     duration: String,
     detail: String,
     role: TokenRole,
+}
+
+/// One state record of a step: its token, detail and role.
+type StepRecord = (&'static str, String, TokenRole);
+
+/// The state records of one workflow's steps and finalizers, rendered against that
+/// workflow's definitions and the starts observed for its steps: the root's own, or a
+/// running child's (REQ-LOCALRUN-200), whose `output` records the parent's stream leaves out.
+struct StepRecords<'a> {
+    workflow: &'a WorkflowPresentationDefinition,
+    definition: &'a PresentationDefinition,
+    step_starts: &'a mut BTreeMap<String, Instant>,
+    outputs: bool,
+}
+
+impl StepRecords<'_> {
+    fn transition(
+        &mut self,
+        observed_at: Instant,
+        step: &str,
+        failure_policy: FailurePolicy,
+        to: StepStateKind,
+        observed: Option<ObservedStepTransition>,
+    ) -> Vec<StepRecord> {
+        match to {
+            StepStateKind::Starting => {
+                self.step_starts
+                    .entry(step.to_owned())
+                    .or_insert(observed_at);
+                let detail = observed_recovery_detail(observed).unwrap_or_else(|| {
+                    self.workflow
+                        .steps
+                        .get(step)
+                        .map_or_else(|| "cmd".to_owned(), start_detail)
+                });
+                vec![("start", detail, TokenRole::Active)]
+            }
+            StepStateKind::Succeeded => {
+                let outputs = match observed {
+                    Some(ObservedStepTransition::OutputsCommitted { outputs }) => outputs,
+                    _ => Vec::new(),
+                };
+                let definition = self.definition.steps.get(step);
+                let mut records = Vec::new();
+                if self.outputs {
+                    records.extend(outputs.iter().map(|output| {
+                        let detail = definition
+                            .and_then(|definition| definition.outputs.get(output))
+                            .map_or_else(
+                                || format!("{} · committed", visible_text(output)),
+                                |declaration| format!("{} · {declaration}", visible_text(output)),
+                            );
+                        ("output", detail, TokenRole::Output)
+                    }));
+                }
+                let detail = definition.map_or_else(String::new, |definition| {
+                    super::render_style::success_detail(
+                        matches!(definition.success, StepSuccessPresentation::Command),
+                        outputs.len(),
+                    )
+                });
+                let detail = completion_detail(detail, self.finish(step, observed_at));
+                records.push(("done", detail, TokenRole::Success));
+                records
+            }
+            StepStateKind::Failed => {
+                let detail = match observed {
+                    Some(ObservedStepTransition::Failed { detail }) => {
+                        canonical_failure_detail(&detail)
+                    }
+                    _ => "authoritative step failure".to_owned(),
+                };
+                let detail = completion_detail(detail, self.finish(step, observed_at));
+                let detail = issue_detail(detail, failure_policy);
+                vec![("failed", detail, TokenRole::Failure)]
+            }
+            StepStateKind::Blocked => {
+                let detail = match observed {
+                    Some(ObservedStepTransition::Blocked { detail }) => {
+                        canonical_blocked_detail(&detail)
+                    }
+                    _ => "dependency did not succeed".to_owned(),
+                };
+                let detail = issue_detail(detail, failure_policy);
+                self.step_starts.remove(step);
+                vec![("blocked", detail, TokenRole::Blocked)]
+            }
+            StepStateKind::Skipped => {
+                self.step_starts.remove(step);
+                let detail = match observed {
+                    Some(ObservedStepTransition::Skipped { detail }) => format!(
+                        "condition_false · {} evaluated predicates",
+                        detail.evaluated_predicates.len()
+                    ),
+                    _ => "condition_false".to_owned(),
+                };
+                vec![("skipped", detail, TokenRole::Neutral)]
+            }
+            StepStateKind::NotRun => {
+                self.step_starts.remove(step);
+                let detail = match observed {
+                    Some(ObservedStepTransition::NotRun { detail }) => {
+                        snake_case_debug(detail.code)
+                    }
+                    None => "failure_stop".to_owned(),
+                    Some(_) => "not_run".to_owned(),
+                };
+                vec![("not-run", detail, TokenRole::Neutral)]
+            }
+            StepStateKind::Cancelling => {
+                let detail = match observed {
+                    Some(ObservedStepTransition::Cancelling { detail }) => {
+                        cancellation_reason(detail.code)
+                    }
+                    _ => "cancellation accepted",
+                };
+                vec![("cancelling", detail.to_owned(), TokenRole::Blocked)]
+            }
+            StepStateKind::Cancelled => {
+                let detail = match observed {
+                    Some(ObservedStepTransition::Cancelled { detail }) => {
+                        cancellation_reason(detail.code)
+                    }
+                    _ => "cancelled",
+                };
+                let detail = completion_detail(detail.to_owned(), self.finish(step, observed_at));
+                vec![("cancelled", detail, TokenRole::Blocked)]
+            }
+            StepStateKind::Recovering => {
+                let detail = observed_recovery_detail(observed)
+                    .unwrap_or_else(|| "recovery active".to_owned());
+                vec![("recovering", detail, TokenRole::Active)]
+            }
+            StepStateKind::Pending
+            | StepStateKind::Inherited
+            | StepStateKind::Running
+            | StepStateKind::CapturingOutputs => Vec::new(),
+        }
+    }
+
+    fn finish(&mut self, step: &str, finished_at: Instant) -> Option<Duration> {
+        self.step_starts
+            .remove(step)
+            .map(|started_at| finished_at.saturating_duration_since(started_at))
+    }
 }
 
 fn observation_timestamp(value: OffsetDateTime) -> String {
@@ -3112,7 +3271,8 @@ fn terminal_counts(run: &WorkflowRunResult) -> [(&'static str, usize); 7] {
     counts
 }
 
-pub(crate) fn human_duration(duration: Duration) -> String {
+/// A duration in the form REQ-LOCALRUN-124 states.
+pub fn human_duration(duration: Duration) -> String {
     let milliseconds = duration.as_millis();
     if milliseconds < 1000 {
         return format!("{milliseconds}ms");

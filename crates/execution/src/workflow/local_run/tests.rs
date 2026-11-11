@@ -4168,6 +4168,121 @@ fn a_failed_nodes_diagnostic_reads_back_and_is_refused_anywhere_else() {
     );
 }
 
+// REQ-LOCALRUN-201
+#[test]
+fn a_nodes_start_reads_back_and_is_refused_where_the_node_never_started() {
+    let fixture = AdmittedFixture::from_source(
+        "schemaVersion: 1\nsteps:\n  work:\n    kind: cmd\n    command:\n      argv: [\"false\"]\n",
+    );
+    let run = InitialLocalRun::create(&fixture.run_path("started-at"), &fixture.admitted).unwrap();
+    let pending = serde_json::to_value(read_state(run.root_handle()).unwrap()).unwrap();
+    let started = "2025-10-24T20:00:00.123456Z";
+    run.state
+        .update(|state| {
+            let attempt = current_attempt_mut(state)?;
+            let settled = attempt.created_at.clone();
+            attempt.started_at = Some(settled.clone());
+            attempt.settled_at = Some(settled);
+            attempt.settlement_snapshot = Some(fixture_settlement_snapshot());
+            attempt.state = AttemptStateV1::WorkflowFailed;
+            let step = &mut attempt.progress.steps[0];
+            step.state = AttemptStepStateV1::Failed;
+            step.detail = Some(NodeDetail::Failed(harness_failure_detail()));
+            step.started_at = Some(started.to_owned());
+            attempt.result = AttemptResultV1::NotPublished {
+                reason: ResultAbsentReasonV1::PublicationPending,
+            };
+            Ok(())
+        })
+        .unwrap();
+    let state = read_state(run.root_handle()).unwrap();
+    assert_eq!(
+        state.attempts[0].progress.steps[0].started_at.as_deref(),
+        Some(started)
+    );
+    let failed = serde_json::to_value(&state).unwrap();
+    let step = "/attempts/0/progress/steps/0";
+    assert_eq!(failed.pointer(step).unwrap()["startedAt"], started);
+    assert_eq!(decode_state(&json_bytes(failed.clone())).unwrap(), state);
+
+    // A state an earlier `um` wrote records no start and still reads.
+    let mut earlier = failed.clone();
+    earlier
+        .pointer_mut(step)
+        .unwrap()
+        .as_object_mut()
+        .unwrap()
+        .remove("startedAt")
+        .unwrap();
+    let earlier = decode_state(&json_bytes(earlier)).unwrap();
+    assert_eq!(earlier.attempts[0].progress.steps[0].started_at, None);
+
+    let refused = |document: &Value, started_at: &str| {
+        let mut document = document.clone();
+        document.pointer_mut(step).unwrap()["startedAt"] = json!(started_at);
+        decode_state(&json_bytes(document)).unwrap_err()
+    };
+    assert_eq!(
+        refused(&pending, started),
+        LocalRunDirectoryError::AttemptStepDetailInvalid
+    );
+    for invalid in [
+        "2025-10-24T20:00:00+00:00",
+        "2025-10-24T20:00:00",
+        "yesterday",
+        "",
+    ] {
+        assert_eq!(
+            refused(&failed, invalid),
+            LocalRunDirectoryError::AttemptStepDetailInvalid,
+            "{invalid}"
+        );
+    }
+}
+
+// REQ-LOCALRUN-201
+#[test]
+fn a_nodes_start_is_recorded_once_when_it_becomes_active() {
+    let fixture = AdmittedFixture::from_source(
+        "schemaVersion: 1\nsteps:\n  work:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n  after:\n    kind: cmd\n    dependsOn: [work]\n    command:\n      argv: [\"true\"]\n",
+    );
+    let run =
+        InitialLocalRun::create(&fixture.run_path("started-once"), &fixture.admitted).unwrap();
+    let mut nodes = read_state(run.root_handle()).unwrap().attempts[0]
+        .progress
+        .steps
+        .clone();
+    let runtime = |work: StepState<CapturedValue>| {
+        BTreeMap::from(
+            [("work", work), ("after", StepState::Pending)].map(|(id, state)| {
+                (
+                    id.to_owned(),
+                    super::super::runtime::StepRuntimeState::<StepFailureCause, CapturedValue> {
+                        state,
+                        current_action: None,
+                        target_execution: None,
+                        target_invocation: None,
+                        active_invocation: None,
+                        recovery: None,
+                        condition_passed: false,
+                        failure_kind: None,
+                    },
+                )
+            }),
+        )
+    };
+    let first = "2025-10-24T20:00:00Z";
+    for (state, now) in [
+        (StepState::Starting, first),
+        (StepState::Running, "2025-10-24T20:00:01Z"),
+        (StepState::CapturingOutputs, "2025-10-24T20:00:02Z"),
+    ] {
+        update_progress_nodes(&mut nodes, &runtime(state), &BTreeMap::new(), now).unwrap();
+        assert_eq!(nodes[0].started_at.as_deref(), Some(first));
+        assert_eq!(nodes[1].started_at, None);
+    }
+}
+
 #[test]
 fn schema_one_documents_without_continuation_foundation_fields_remain_readable() {
     let fixture = AdmittedFixture::new();
@@ -4855,9 +4970,11 @@ fn inherited_seed_loads_required_values_and_preserves_full_durable_references() 
             (AttemptNodeRoleV1::Step, "first".to_owned()),
             vec![retained_message],
         )]),
+        "2025-10-24T20:00:00Z",
     )
     .unwrap();
     assert_eq!(durable_nodes[0].outputs.as_ref(), Some(&retained));
+    assert_eq!(durable_nodes[0].started_at, None);
     assert!(
         !run.run_directory()
             .join("attempts/000002/values/steps/first/message")

@@ -14,7 +14,7 @@ pub(crate) use super::evidence::FailurePhase;
 use super::evidence::{
     BlockedDetail, CancellationDetail, ConditionFalseDetail, EvaluatedPredicateEvidence,
     FailureDetail, InheritedDetail, NodeFailureSource, NonExecutionCode, NonExecutionDetail,
-    Prerequisite, PrimaryIssue,
+    Prerequisite, PrimaryIssue, PrimaryIssueDetail,
 };
 use super::finalization_context::{
     self, FinalizationContext, OrdinaryIssue, OrdinaryIssueDisposition,
@@ -35,6 +35,12 @@ pub(crate) trait ConditionOutput {
 
 pub(crate) trait ProvisionalStepResources {
     fn requires_release(&self) -> bool;
+
+    /// How a `workflow` step's child ended, which the reducer routes on when the step's
+    /// completion arrives under an interruption (REQ-WFEXEC-70); `None` for any other step.
+    fn child_ending(&self) -> Option<ChildEnding> {
+        None
+    }
 }
 
 #[cfg(test)]
@@ -42,6 +48,35 @@ impl ProvisionalStepResources for String {
     fn requires_release(&self) -> bool {
         false
     }
+
+    // `child:<outcome>` names a child's ending in the reducer's tests, and
+    // `child:<outcome>:<step>` one an interruption with `user_request` failed at `step`.
+    fn child_ending(&self) -> Option<ChildEnding> {
+        let mut parts = self.strip_prefix("child:")?.splitn(2, ':');
+        Some(ChildEnding {
+            outcome: parts.next()?.to_owned(),
+            interruption: parts.next().map(|step| ChildInterruption {
+                reason: CancellationReason::UserRequest,
+                step: step.to_owned(),
+            }),
+        })
+    }
+}
+
+/// The interruption that failed a `workflow` step's child (REQ-WFEXEC-70): its reason and
+/// the child's interrupted step, the primary issue of the child's result.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ChildInterruption {
+    pub reason: CancellationReason,
+    pub step: String,
+}
+
+/// What a `workflow` step's child reported with the step's completion: the outcome it
+/// recorded and, when an interruption failed it, that interruption.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ChildEnding {
+    pub(crate) outcome: String,
+    pub(crate) interruption: Option<ChildInterruption>,
 }
 
 impl ConditionOutput for CapturedValue {
@@ -383,6 +418,9 @@ pub struct EnteredWait {
     pub(crate) then: String,
     pub(crate) on_hand_back: Option<String>,
     pub(crate) rule: Option<WaitRule>,
+    /// The interruption that failed the child whose `repair` edge this wait is
+    /// (REQ-WFEXEC-70); `None` for any other wait.
+    pub(crate) interrupted: Option<ChildInterruption>,
 }
 
 impl EnteredWait {
@@ -413,6 +451,10 @@ impl EnteredWait {
 
     pub fn rule(&self) -> Option<&WaitRule> {
         self.rule.as_ref()
+    }
+
+    pub fn interrupted(&self) -> Option<&ChildInterruption> {
+        self.interrupted.as_ref()
     }
 }
 
@@ -1121,6 +1163,16 @@ pub(crate) struct RuntimeState<Cause, Output, Deadline = ()> {
     finalization: Option<FinalizationRuntime<Deadline>>,
     pub(crate) force_abort: Option<ForceAbortEvidence>,
     pub(crate) last_cancellation_operation: Option<CancellationOperationId>,
+    /// Whether the ordinary stop was an interruption: its stopped steps settle `failed`
+    /// with `interrupted` instead of `cancelled` (REQ-WFEXEC-69).
+    pub(crate) interrupted: bool,
+    /// The `workflow` steps whose child had not started when the interruption was accepted:
+    /// stopped, they fail at `start` (REQ-WFEXEC-70).
+    unstarted_children: BTreeSet<String>,
+    /// The `workflow` step whose child's completion arrived under the interruption and is
+    /// routed on its edge, with the interruption that failed the child (REQ-WFEXEC-70,
+    /// INV-ENGINE-29): the walk may then end while the gate is `Cancelling`.
+    routed_child: Option<(String, Option<ChildInterruption>)>,
     pub(crate) last_transition_sequence: TransitionSequence,
     transition_capacity_exceeded: bool,
     /// The exit an edge-scheduled walk took (REQ-WFEXEC-58); `None` until then, and after
@@ -1230,6 +1282,13 @@ pub(crate) enum Occurrence<Provisional, Cause, Output, Deadline> {
         reason: CancellationReason,
         deadline: Deadline,
     },
+    /// The local CLI's interruption (REQ-WFEXEC-69): stops like a cancellation during
+    /// ordinary execution and acts as one in any other phase.
+    InterruptionOperationRequested {
+        operation: CancellationOperationId,
+        reason: CancellationReason,
+        deadline: Deadline,
+    },
     ForceAbortRequested {
         operation: CancellationOperationId,
         deadline: Deadline,
@@ -1267,6 +1326,28 @@ pub enum RunOutcome {
     Continued {
         edge: TakenEdgeRecord,
     },
+}
+
+impl RunOutcome {
+    /// The interruption that failed the attempt (REQ-WFEXEC-69): a `Failed` outcome whose
+    /// primary issue is a step that failed `interrupted`, with the reason the result records
+    /// as its cancellation. A child run reports it to its parent's step (REQ-WFEXEC-70).
+    pub fn interruption(&self) -> Option<ChildInterruption> {
+        let Self::Failed {
+            primary_issue,
+            later_cancellation: Some(reason),
+        } = self
+        else {
+            return None;
+        };
+        let PrimaryIssueDetail::Failed(detail) = &primary_issue.detail else {
+            return None;
+        };
+        detail.is_interrupted().then(|| ChildInterruption {
+            reason: *reason,
+            step: primary_issue.node.id.clone(),
+        })
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1383,6 +1464,10 @@ where
 
 pub(super) enum InitialCancellation<Deadline> {
     Graceful {
+        request: CancellationRequest<Deadline>,
+        operation: Option<CancellationOperationId>,
+    },
+    Interruption {
         request: CancellationRequest<Deadline>,
         operation: Option<CancellationOperationId>,
     },
@@ -1507,6 +1592,9 @@ where
             finalization: None,
             force_abort: None,
             last_cancellation_operation: None,
+            interrupted: false,
+            unstarted_children: BTreeSet::new(),
+            routed_child: None,
             last_transition_sequence: TransitionSequence::default(),
             transition_capacity_exceeded: false,
             exit_outcome: None,
@@ -1521,6 +1609,9 @@ where
         match cancellation {
             InitialCancellation::Graceful { request, operation } => {
                 apply_cancellation(&mut reduction, request, operation);
+            }
+            InitialCancellation::Interruption { request, operation } => {
+                apply_interruption(&mut reduction, request, operation);
             }
             InitialCancellation::ForceAbort {
                 operation,
@@ -1644,7 +1735,25 @@ where
             action,
             provisional,
         } => {
-            if !step_accepts(&reduction.state, &step, StepStateKind::Running, action) {
+            let routed = match interrupted_completion(&reduction.state, &step, action, &provisional)
+            {
+                InterruptedCompletion::Ordinary => false,
+                InterruptedCompletion::Route(interruption) => {
+                    reduction.state.routed_child = Some((step.clone(), interruption));
+                    true
+                }
+                InterruptedCompletion::Fail => {
+                    if provisional.requires_release() {
+                        reduction.actions.push(RequestedAction {
+                            id: action,
+                            action: Action::ReleaseStepResources { provisional },
+                        });
+                    }
+                    settle_interrupted(reduction, &step, FailureDetail::interrupted_in_execution());
+                    return true;
+                }
+            };
+            if !routed && !step_accepts(&reduction.state, &step, StepStateKind::Running, action) {
                 if provisional.requires_release() {
                     reduction.actions.push(RequestedAction {
                         id: action,
@@ -1825,6 +1934,22 @@ where
                 operation,
             );
         }
+        Occurrence::InterruptionOperationRequested {
+            operation,
+            reason,
+            deadline,
+        } => {
+            if reason == CancellationReason::ForceAbort
+                || stale_operation(&reduction.state, operation)
+            {
+                return false;
+            }
+            return apply_interruption(
+                reduction,
+                CancellationRequest { reason, deadline },
+                Some(operation),
+            );
+        }
         Occurrence::ForceAbortRequested {
             operation,
             deadline,
@@ -1846,15 +1971,29 @@ where
                 cancelling_reason
             };
             mark_recovery_cancelled(&mut reduction.state, &step, active);
-            transition_step(
-                reduction,
-                &step,
-                StepState::Cancelled {
-                    detail: CancellationDetail::new(terminal_reason),
-                },
-                None,
-            );
-            clear_active_invocation(&mut reduction.state, &step);
+            if reduction.state.interrupted
+                && !action.is_force_abort()
+                && step_role(&reduction.state, &step) == Some(WorkflowNodeRole::Step)
+            {
+                // A `workflow` step whose child had not started fails at `start`
+                // (REQ-WFEXEC-70).
+                let detail = if reduction.state.unstarted_children.contains(&step) {
+                    FailureDetail::interrupted_before_start()
+                } else {
+                    FailureDetail::interrupted_in_execution()
+                };
+                settle_interrupted(reduction, &step, detail);
+            } else {
+                transition_step(
+                    reduction,
+                    &step,
+                    StepState::Cancelled {
+                        detail: CancellationDetail::new(terminal_reason),
+                    },
+                    None,
+                );
+                clear_active_invocation(&mut reduction.state, &step);
+            }
         }
         Occurrence::StopEntered { step, action } => {
             return enter_stop_wait(reduction, step, action);
@@ -1920,6 +2059,7 @@ where
         then: step,
         on_hand_back: None,
         rule: None,
+        interrupted: None,
     });
     mark_unstarted_not_reached(reduction);
     true
@@ -1944,7 +2084,7 @@ where
         reduction.state.last_cancellation_operation = Some(operation);
         return matches!(&reduction.state.workflow, WorkflowState::Finalizing { .. });
     }
-    apply_ordinary_cancellation(reduction, cancellation, Some(operation))
+    apply_ordinary_cancellation(reduction, cancellation, Some(operation), false)
 }
 
 fn stale_operation<Cause, Output, Deadline>(
@@ -1970,7 +2110,7 @@ where
 {
     match &reduction.state.workflow {
         WorkflowState::Executing { .. } => {
-            apply_ordinary_cancellation(reduction, cancellation, operation)
+            apply_ordinary_cancellation(reduction, cancellation, operation, false)
         }
         WorkflowState::Finalizing {
             gate: FinalizationGate::Open,
@@ -1988,10 +2128,32 @@ where
     }
 }
 
+// An interruption accepted during ordinary execution stops exactly as a cancellation does
+// and differs only in how its stopped steps settle; in any other phase, or once a stop was
+// accepted, it is that cancellation (REQ-WFEXEC-69, REQ-WFFINALIZE-15).
+fn apply_interruption<Provisional, Cause, Output, Deadline>(
+    reduction: &mut Reduction<Provisional, Cause, Output, Deadline>,
+    cancellation: CancellationRequest<Deadline>,
+    operation: Option<CancellationOperationId>,
+) -> bool
+where
+    Cause: Clone,
+    Output: Clone,
+    Deadline: Clone,
+{
+    match &reduction.state.workflow {
+        WorkflowState::Executing { .. } => {
+            apply_ordinary_cancellation(reduction, cancellation, operation, true)
+        }
+        _ => apply_cancellation(reduction, cancellation, operation),
+    }
+}
+
 fn apply_ordinary_cancellation<Provisional, Cause, Output, Deadline>(
     reduction: &mut Reduction<Provisional, Cause, Output, Deadline>,
     cancellation: CancellationRequest<Deadline>,
     operation: Option<CancellationOperationId>,
+    interruption: bool,
 ) -> bool
 where
     Cause: Clone,
@@ -2027,6 +2189,19 @@ where
             reason: cancellation.reason,
             deadline: cancellation.deadline.clone(),
         });
+    // While a `workflow` step's child settles under an interruption, its edge may still end
+    // the walk and mark the unstarted steps `not_reached`, so they stay pending until the
+    // step settles (REQ-WFEXEC-70).
+    let mut keep_pending = false;
+    if interruption {
+        reduction.state.interrupted = true;
+        fail_first_pending_step_when_idle(reduction);
+        reduction.state.unstarted_children = active_workflow_steps(&reduction.state)
+            .filter(|(_, kind)| *kind == StepStateKind::Starting)
+            .map(|(step, _)| step.clone())
+            .collect();
+        keep_pending = active_workflow_steps(&reduction.state).next().is_some();
+    }
     cancel_nodes(
         reduction,
         WorkflowNodeRole::Step,
@@ -2034,8 +2209,20 @@ where
         Some(cancellation.deadline),
         false,
         operation,
+        keep_pending,
     );
     true
+}
+
+/// The ordinary `workflow` steps, those with edges, that are starting or running.
+fn active_workflow_steps<Cause, Output, Deadline>(
+    state: &RuntimeState<Cause, Output, Deadline>,
+) -> impl Iterator<Item = (&String, StepStateKind)> {
+    state.definition.ordinary_ids.iter().filter_map(|id| {
+        state.definition.steps.get(id)?.edges.as_ref()?;
+        let kind = state.steps.get(id)?.state.kind();
+        matches!(kind, StepStateKind::Starting | StepStateKind::Running).then_some((id, kind))
+    })
 }
 
 fn apply_finalization_cancellation<Provisional, Cause, Output, Deadline>(
@@ -2091,6 +2278,7 @@ where
         Some(cancellation.deadline),
         false,
         operation,
+        false,
     );
     true
 }
@@ -2196,6 +2384,7 @@ where
         Some(deadline),
         true,
         Some(operation),
+        false,
     );
     true
 }
@@ -2243,6 +2432,7 @@ fn cancel_nodes<Provisional, Cause, Output, Deadline>(
     deadline: Option<Deadline>,
     force: bool,
     operation: Option<CancellationOperationId>,
+    keep_pending: bool,
 ) where
     Cause: Clone,
     Output: Clone,
@@ -2271,6 +2461,7 @@ fn cancel_nodes<Provisional, Cause, Output, Deadline>(
     let mut containment_index = 1;
     for (step, state) in nodes {
         match state {
+            StepStateKind::Pending if keep_pending => {}
             StepStateKind::Pending => {
                 transition_step(
                     reduction,
@@ -2366,6 +2557,190 @@ fn cancel_nodes<Provisional, Cause, Output, Deadline>(
             | StepStateKind::NotRun
             | StepStateKind::Cancelled => {}
         }
+    }
+}
+
+fn step_role<Cause, Output, Deadline>(
+    state: &RuntimeState<Cause, Output, Deadline>,
+    step: &str,
+) -> Option<WorkflowNodeRole> {
+    state
+        .definition
+        .steps
+        .get(step)
+        .map(|definition| definition.role)
+}
+
+// An interruption that finds no ordinary step active fails the first pending one in
+// document order at `start`, so the attempt still names the step it stopped at; every other
+// pending step is then cancelled (REQ-WFEXEC-69).
+fn fail_first_pending_step_when_idle<Provisional, Cause, Output, Deadline>(
+    reduction: &mut Reduction<Provisional, Cause, Output, Deadline>,
+) where
+    Cause: Clone,
+    Output: Clone,
+    Deadline: Clone,
+{
+    let state = &reduction.state;
+    let ordinary = |id: &&String| state.definition.ordinary_ids.contains(*id);
+    if state
+        .steps
+        .iter()
+        .any(|(id, runtime)| ordinary(&id) && runtime.state.is_active())
+    {
+        return;
+    }
+    let Some(step) = state
+        .definition
+        .step_order
+        .iter()
+        .filter(ordinary)
+        .find(|id| {
+            state
+                .steps
+                .get(*id)
+                .is_some_and(|runtime| matches!(runtime.state, StepState::Pending))
+        })
+        .cloned()
+    else {
+        return;
+    };
+    settle_interrupted(reduction, &step, FailureDetail::interrupted_before_start());
+}
+
+// An interrupted ordinary step fails with no outputs and no recovery round; the first one
+// becomes the run's primary issue unless an issue was already recorded, whatever its
+// failure policy (REQ-WFEXEC-69, REQ-WFEXEC-17).
+fn settle_interrupted<Provisional, Cause, Output, Deadline>(
+    reduction: &mut Reduction<Provisional, Cause, Output, Deadline>,
+    step: &str,
+    detail: FailureDetail,
+) where
+    Cause: Clone,
+    Output: Clone,
+    Deadline: Clone,
+{
+    let Some(role) = step_role(&reduction.state, step) else {
+        return;
+    };
+    let primary_issue = PrimaryIssue::failed(
+        WorkflowNode {
+            id: step.to_owned(),
+            role,
+        },
+        detail.clone(),
+    );
+    transition_step(reduction, step, StepState::Failed { detail }, None);
+    clear_active_invocation(&mut reduction.state, step);
+    record_stopped_issue(reduction, primary_issue);
+}
+
+// The first step that fails while the interruption stops the run becomes its primary issue
+// unless one was already recorded, and the steps a settling `workflow` step kept pending are
+// cancelled (REQ-WFEXEC-69, REQ-WFEXEC-70).
+fn record_stopped_issue<Provisional, Cause, Output, Deadline>(
+    reduction: &mut Reduction<Provisional, Cause, Output, Deadline>,
+    primary_issue: PrimaryIssue,
+) where
+    Cause: Clone,
+    Output: Clone,
+    Deadline: Clone,
+{
+    let WorkflowState::Executing {
+        gate: SchedulingGate::Cancelling {
+            reason,
+            prior_issue,
+        },
+    } = &reduction.state.workflow
+    else {
+        return;
+    };
+    let reason = *reason;
+    if prior_issue.is_none() {
+        let from = reduction.state.workflow.clone();
+        let to = WorkflowState::Executing {
+            gate: SchedulingGate::Cancelling {
+                reason,
+                prior_issue: Some(primary_issue),
+            },
+        };
+        let sequence = next_sequence(&mut reduction.state);
+        reduction.state.workflow = to.clone();
+        reduction.events.push(TransitionEvent::Workflow {
+            sequence,
+            from,
+            to: Box::new(to),
+        });
+    }
+    cancel_pending_nodes(reduction, WorkflowNodeRole::Step, reason);
+}
+
+/// How the reducer takes a `workflow` step's completion that arrives under an
+/// interruption (REQ-WFEXEC-70, INV-ENGINE-29).
+enum InterruptedCompletion {
+    /// Not such a completion: it is accepted only as any completion is.
+    Ordinary,
+    /// The step commits the child's outcome and the walk ends on its edge.
+    Route(Option<ChildInterruption>),
+    /// The edge is not taken and the step fails `interrupted`.
+    Fail,
+}
+
+// While an interruption stops a `workflow` step, the completion its child reported is routed
+// before any output is committed: an interrupted child only to a `repair` wait, a child that
+// exited on its own on any edge, which `end_edge_walk` then ends the attempt on. The
+// completion may carry the step's start action, when it was claimed before the stop reached
+// the driver, or arrive after it.
+fn interrupted_completion<Provisional, Cause, Output, Deadline>(
+    state: &RuntimeState<Cause, Output, Deadline>,
+    step: &str,
+    action: ActionId,
+    provisional: &Provisional,
+) -> InterruptedCompletion
+where
+    Provisional: ProvisionalStepResources,
+{
+    let Some(runtime) = state.steps.get(step) else {
+        return InterruptedCompletion::Ordinary;
+    };
+    let Some(edges) = state
+        .definition
+        .steps
+        .get(step)
+        .and_then(|definition| definition.edges.as_ref())
+    else {
+        return InterruptedCompletion::Ordinary;
+    };
+    if !state.interrupted
+        || runtime.state.kind() != StepStateKind::Cancelling
+        || (runtime.current_action != Some(action) && runtime.target_invocation != Some(action))
+    {
+        return InterruptedCompletion::Ordinary;
+    }
+    let Some(ending) = provisional.child_ending() else {
+        return InterruptedCompletion::Ordinary;
+    };
+    let prior_issue = matches!(
+        &state.workflow,
+        WorkflowState::Executing {
+            gate: SchedulingGate::Cancelling {
+                prior_issue: Some(_),
+                ..
+            }
+        }
+    );
+    match (edges.get(&ending.outcome), ending.interruption) {
+        (None, _) => InterruptedCompletion::Fail,
+        _ if prior_issue => InterruptedCompletion::Fail,
+        (
+            Some(RuntimeEdgeTarget::Wait {
+                kind: WaitKind::Repair,
+                ..
+            }),
+            Some(interruption),
+        ) => InterruptedCompletion::Route(Some(interruption)),
+        (Some(_), Some(_)) => InterruptedCompletion::Fail,
+        (Some(_), None) => InterruptedCompletion::Route(None),
     }
 }
 
@@ -3879,28 +4254,75 @@ fn end_edge_walk<Provisional, Cause, Output, Deadline>(
     Output: Clone + ConditionOutput,
     Deadline: Clone,
 {
+    // Under an interruption only the routed `workflow` step's edge ends the walk, and an
+    // edge that would start a step ends the attempt `continued` instead (REQ-WFEXEC-70).
+    let routed = match &reduction.state.workflow {
+        WorkflowState::Executing {
+            gate: SchedulingGate::Open,
+        } => None,
+        WorkflowState::Executing {
+            gate:
+                SchedulingGate::Cancelling {
+                    reason,
+                    prior_issue: None,
+                },
+        } => match reduction.state.routed_child.clone() {
+            Some(routed) => Some((routed, *reason)),
+            None => return,
+        },
+        _ => return,
+    };
     if !matches!(
         reduction.state.definition.scheduling,
         RuntimeScheduling::Edges { .. }
-    ) || !matches!(
-        &reduction.state.workflow,
-        WorkflowState::Executing {
-            gate: SchedulingGate::Open
-        }
     ) || reduction.state.exit_outcome.is_some()
         || reduction.state.wait.is_some()
         || reduction.state.continued.is_some()
     {
         return;
     }
+    // A routed step whose capture failed routes nothing and fails the run.
+    if let Some(((step, _), _)) = &routed
+        && let Some(StepState::Failed { detail }) = reduction
+            .state
+            .steps
+            .get(step)
+            .map(|runtime| &runtime.state)
+    {
+        let primary_issue = PrimaryIssue::failed(
+            WorkflowNode {
+                id: step.clone(),
+                role: WorkflowNodeRole::Step,
+            },
+            detail.clone(),
+        );
+        record_stopped_issue(reduction, primary_issue);
+        return;
+    }
+    let interrupted = routed
+        .as_ref()
+        .and_then(|((_, interruption), _)| interruption.clone());
     let ended = reduction
         .state
         .definition
         .ordinary_ids
         .iter()
+        .filter(|producer| {
+            routed
+                .as_ref()
+                .is_none_or(|((step, _), _)| step == *producer)
+        })
         .find_map(|producer| {
             let (outcome, edge) = taken_edge(&reduction.state, producer)?;
             let ending = match edge {
+                TakenEdge::Step(target) if routed.is_some() => {
+                    WalkEnding::Continue(TakenEdgeRecord {
+                        step: producer.clone(),
+                        outcome: outcome.unwrap_or_default().to_owned(),
+                        target: target.to_owned(),
+                        counted: false,
+                    })
+                }
                 TakenEdge::Step(_) => return None,
                 TakenEdge::Exit(name) => WalkEnding::Exit(name.to_owned()),
                 TakenEdge::Continue { target, counted } => WalkEnding::Continue(TakenEdgeRecord {
@@ -3921,6 +4343,7 @@ fn end_edge_walk<Provisional, Cause, Output, Deadline>(
                     then: then.clone(),
                     on_hand_back: on_hand_back.clone(),
                     rule: rule.clone(),
+                    interrupted: interrupted.clone(),
                 }),
                 TakenEdge::Wait(_) | TakenEdge::Unrouted => WalkEnding::Unrouted(producer.clone()),
             };
@@ -4175,13 +4598,25 @@ where
             primary_issue: primary_issue.clone(),
             later_cancellation: Some(*reason),
         },
+        // A walk a routed `workflow` step ended under an interruption wins over the stop
+        // (REQ-WFEXEC-70).
         WorkflowState::Executing {
             gate:
                 SchedulingGate::Cancelling {
                     reason,
                     prior_issue: None,
                 },
-        } => OrdinaryOutcome::Cancelled { reason: *reason },
+        } => match (
+            &state.routed_child,
+            &state.wait,
+            &state.continued,
+            &state.exit_outcome,
+        ) {
+            (Some(_), Some(wait), _, _) => OrdinaryOutcome::Waiting { wait: wait.clone() },
+            (Some(_), None, Some(edge), _) => OrdinaryOutcome::Continued { edge: edge.clone() },
+            (Some(_), None, None, Some(_)) => OrdinaryOutcome::Succeeded,
+            _ => OrdinaryOutcome::Cancelled { reason: *reason },
+        },
         WorkflowState::Finalizing { .. }
         | WorkflowState::Succeeded
         | WorkflowState::Failed { .. }

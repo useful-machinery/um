@@ -60,6 +60,8 @@ pub use workflow::capacity::{
     ConditionCapacityBounds, MAXIMUM_ENCODED_OUTBOX_BYTES, RUNNER_TERMINAL_FRAME_BYTES,
     valid_condition_capacity,
 };
+#[cfg(feature = "test-fixtures")]
+pub use workflow::child_guard::unsupplied_internal_worker_executable;
 pub use workflow::child_guard::{
     internal_worker_requested as child_guard_worker_requested,
     run_internal_worker as run_child_guard_worker,
@@ -113,11 +115,11 @@ pub use workflow::portable_artifact::{
     PortableArtifactValidationFailure, validate_portable_artifact_set,
 };
 pub use workflow::presentation::{
-    ColorChoice, PresentationConfig, PresentationFailure, PresentationFailureOperation,
-    PresentationMode, PublicationPresentation, RequestedPresentationMode, SystemObservationClock,
-    TerminalCapabilities, WorkflowRunOutput, WorkflowRunPresentation,
-    WorkflowRunPresentationResult, styled_terminal_text, superseded_rejection_message,
-    visible_text, write_untested_harness_advisories,
+    ChildRunPresentation, ColorChoice, PresentationConfig, PresentationFailure,
+    PresentationFailureOperation, PresentationMode, PublicationPresentation,
+    RequestedPresentationMode, SystemObservationClock, TerminalCapabilities, WorkflowRunOutput,
+    WorkflowRunPresentation, WorkflowRunPresentationResult, human_duration, styled_terminal_text,
+    superseded_rejection_message, visible_text, write_untested_harness_advisories,
 };
 pub use workflow::presentation_feed::{DisplayDeadline, normalize_terminal_scalar};
 pub use workflow::process_group::{
@@ -183,8 +185,8 @@ pub use workflow::validated::{
 };
 pub use workflow::value::CapturedValue;
 pub use workflow::wait::{
-    CONTROL_ANSWER, CONTROL_APPROVE, CONTROL_CANCEL, CONTROL_HAND_BACK, CONTROL_LIFT,
-    CONTROL_RELEASE, CONTROL_RETRY, CONTROL_STOP, CONTROL_WITHDRAW, ConditionError,
+    CONTROL_ANSWER, CONTROL_APPROVE, CONTROL_CANCEL, CONTROL_HAND_BACK, CONTROL_INTERRUPT,
+    CONTROL_LIFT, CONTROL_RELEASE, CONTROL_RETRY, CONTROL_STOP, CONTROL_WITHDRAW, ConditionError,
     ConditionSource, ControlEvent, Event, ExternalEvent, NoConditions, RuleError, WaitKind,
     WaitRecord, WaitRule, append_control, evaluate, event_literal, position_path, read_controls,
     read_numbered_controls, stop_in_force, wait_payload,
@@ -257,9 +259,11 @@ pub use workflow::local_run::LocalRunCommitPort;
 pub use workflow::local_run::LocalRunDirectoryError;
 pub use workflow::local_run::LocalStatusAttempt;
 pub use workflow::local_run::LocalStatusErrorCode;
-pub use workflow::local_run::LocalStatusStateView;
 pub use workflow::local_run::OwnershipUnprovenReason;
 pub use workflow::local_run::PendingLocalRetry;
+pub use workflow::local_run::{
+    LocalStatusNode, LocalStatusProgress, LocalStatusStart, LocalStatusStateView,
+};
 pub use workflow::process_group::AuthenticatedSignalResult;
 pub use workflow::process_group::ProcessGuardRegistration;
 pub use workflow::publication::CommandOutputV1;

@@ -792,6 +792,18 @@ impl WorkflowRunTerminalResultV1 {
         self.command = RETRY_COMMAND;
     }
 
+    /// A `continued` attempt whose next attempt an interruption with `reason` held back exits
+    /// by that reason (REQ-WFEXEC-40, REQ-LOCALRUN-135), unless a local failure already
+    /// selected exit 1 (REQ-LOCALRUN-134).
+    pub fn hold_back_continuation(&mut self, reason: CancellationReason) {
+        if self.outcome == WorkflowOutcomeV1::Continued
+            && self.execution_outcome == ExecutionOutcome::Succeeded
+        {
+            self.execution_outcome = signal_outcome(reason);
+            self.exit_status = exit_status(self.execution_outcome);
+        }
+    }
+
     pub fn mark_resume(&mut self) {
         self.command = RESUME_COMMAND;
     }
@@ -1648,6 +1660,7 @@ pub(crate) enum FailureCodeV1 {
     CommandWaitFailed,
     ExecutionTaskUnavailable,
     ChildRunInterrupted,
+    Interrupted,
     OutputUnsupported,
     CaptureTaskUnavailable,
     OutputPathAbsolute,
@@ -4003,32 +4016,45 @@ fn execution_outcome(run: &WorkflowRunResult, outcome: WorkflowOutcomeV1) -> Exe
     {
         return ExecutionOutcome::Failed;
     }
-    match outcome {
-        // A wait or a continuing edge exits 0 like a success (REQ-WFEXEC-40); the chained
-        // attempt's result decides the command's exit (REQ-WFEXEC-64).
-        WorkflowOutcomeV1::Succeeded
-        | WorkflowOutcomeV1::Waiting
-        | WorkflowOutcomeV1::Continued => ExecutionOutcome::Succeeded,
-        WorkflowOutcomeV1::Failed => ExecutionOutcome::Failed,
-        WorkflowOutcomeV1::Cancelled => match &run.outcome {
-            RunOutcome::Cancelled {
-                reason: CancellationReason::UserRequest,
-            } => ExecutionOutcome::Interrupted,
-            RunOutcome::Cancelled {
-                reason: CancellationReason::TerminationRequest,
-            } => ExecutionOutcome::Terminated,
-            RunOutcome::Cancelled {
-                reason:
-                    CancellationReason::CallerOutputFailure
-                    | CancellationReason::RunnerShutdown
-                    | CancellationReason::ExecutionLeaseExpired
-                    | CancellationReason::ForceAbort,
-            }
-            | RunOutcome::Succeeded
-            | RunOutcome::Failed { .. }
-            | RunOutcome::Waiting { .. }
-            | RunOutcome::Continued { .. } => ExecutionOutcome::Failed,
-        },
+    match (outcome, &run.outcome) {
+        // An attempt an interruption ended exits by its reason, whether it failed on the
+        // interrupted step or waits on the repair an interrupted stage routed to
+        // (REQ-WFEXEC-40, REQ-WFEXEC-69, REQ-WFEXEC-70); a required failure recorded first
+        // is the primary issue and exits 1.
+        (WorkflowOutcomeV1::Failed, run_outcome) => run_outcome
+            .interruption()
+            .map_or(ExecutionOutcome::Failed, |interruption| {
+                signal_outcome(interruption.reason)
+            }),
+        (WorkflowOutcomeV1::Waiting, RunOutcome::Waiting { wait }) => wait
+            .interrupted()
+            .map_or(ExecutionOutcome::Succeeded, |interruption| {
+                signal_outcome(interruption.reason)
+            }),
+        // Any other wait or a continuing edge exits 0 like a success (REQ-WFEXEC-40); the
+        // chained attempt's result decides the command's exit (REQ-WFEXEC-64), unless the
+        // interruption held it back (`hold_back_continuation`).
+        (
+            WorkflowOutcomeV1::Succeeded
+            | WorkflowOutcomeV1::Waiting
+            | WorkflowOutcomeV1::Continued,
+            _,
+        ) => ExecutionOutcome::Succeeded,
+        (WorkflowOutcomeV1::Cancelled, RunOutcome::Cancelled { reason }) => signal_outcome(*reason),
+        (WorkflowOutcomeV1::Cancelled, _) => ExecutionOutcome::Failed,
+    }
+}
+
+/// The exit a signal's reason selects (REQ-WFEXEC-40): 130 for `user_request`, 143 for
+/// `termination_request`; any other reason is a failure.
+const fn signal_outcome(reason: CancellationReason) -> ExecutionOutcome {
+    match reason {
+        CancellationReason::UserRequest => ExecutionOutcome::Interrupted,
+        CancellationReason::TerminationRequest => ExecutionOutcome::Terminated,
+        CancellationReason::CallerOutputFailure
+        | CancellationReason::RunnerShutdown
+        | CancellationReason::ExecutionLeaseExpired
+        | CancellationReason::ForceAbort => ExecutionOutcome::Failed,
     }
 }
 

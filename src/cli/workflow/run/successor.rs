@@ -92,11 +92,16 @@ pub(super) async fn start(
         cancellation.clone(),
         super::create::UnixSignals::new()?,
     );
+    // REQ-LOCALRUN-135: a signal reads the predecessor's control journal from here on, so one
+    // that arrives while the successor is made is an interruption, never a cancel; the
+    // successor's own journal is watched once it continues.
+    let journal = signal_task.watch(&requested);
     match create(requested, request, &config, &cancellation).await {
         Ok(Created::Continue {
             continuation,
             restarted_element,
         }) => {
+            drop(journal);
             // REQ-LOCALRUN-199: written once the successor exists, so a refusal leaves stderr
             // to its report, and before the attempt; the advisory is nonblocking, so a failed
             // write does not stop the run.
@@ -455,6 +460,12 @@ async fn create(
     .await
     {
         Ok(admission) => {
+            // REQ-LOCALRUN-135: a signal before the successor's directory exists ends the
+            // command and creates no run; the predecessor is settled and still waits.
+            if let Some(reason) = cancellation.cancellation_reason() {
+                let failure = super::create::signalled_before_creation(Some(reason));
+                return Err(settled(pending, Err(failure)).await);
+            }
             let created =
                 tokio::task::spawn_blocking(move || create_and_supersede(admission, pending)).await;
             match created {

@@ -244,6 +244,37 @@ fn a_definition_run_starts_the_current_revision_under_the_home() {
     assert!(!published.scratch.path().join("elsewhere").exists());
 }
 
+// INV-TESTING-20
+#[test]
+fn the_um_binary_of_a_test_build_is_its_own_worker_when_none_is_supplied() {
+    let published = Published::engineering();
+    let execution_root = published.execution_root();
+
+    let output = published
+        .command(&[
+            "create",
+            &published.id,
+            "--execution-root",
+            execution_root.to_str().unwrap(),
+            "--json",
+            "--workflow",
+            "design.yaml",
+            "--input-text",
+            "ticket",
+            "AUTO-1",
+        ])
+        .env_remove("UM_TEST_INTERNAL_WORKER_EXECUTABLE")
+        .output()
+        .unwrap();
+    let terminal = succeeded(&output);
+    assert_eq!(terminal["outcome"], "succeeded", "{terminal}");
+    assert_eq!(terminal["result"]["steps"][0]["id"], "design", "{terminal}");
+    assert_eq!(
+        terminal["result"]["steps"][0]["state"], "succeeded",
+        "{terminal}"
+    );
+}
+
 // REQ-LOCALRUN-173
 #[test]
 fn a_definition_run_is_refused_at_phase_definition_without_a_run_directory() {

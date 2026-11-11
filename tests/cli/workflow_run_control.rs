@@ -4,15 +4,17 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Output, Stdio};
 
 use super::poll_until;
+use rustix::process::{Pid, Signal, kill_process};
+
 use super::workflow_continue::{
     FAN_OUT_TREE_ROOT, WAIT_TREE_ROOT, attempt_count, chained, completed, decide, decide_each,
-    fan_out_tree, ordinals_of, partition_event, read_json, resume, wait_tree,
+    fan_out_tree, ordinals_of, partition_event, read_json, resume, status_document, wait_tree,
     wait_tree_with_json_questions, waiting_run,
 };
 use super::workflow_definition::Home;
 use super::workflow_run::{
-    RunBundle, TreeBundle, assert_usage_error, isolated_command, run_record, tree_rejection,
-    workflow_run_schema,
+    RunBundle, TreeBundle, assert_usage_error, isolated_command, progress_position,
+    progress_records, run_record, tree_rejection, workflow_run_schema,
 };
 use super::workflow_run_list::shown_plain;
 
@@ -512,9 +514,44 @@ fn withdraw_cancel_and_release_end_and_release_runs() {
 }
 
 /// Kills the `um` process it holds if a test leaves it running, and lets a held step go.
-struct LiveRun {
-    process: Child,
-    release: PathBuf,
+pub(super) struct LiveRun {
+    pub(super) process: Child,
+    pub(super) release: PathBuf,
+}
+
+impl LiveRun {
+    /// Sends `signal` to the `um` process alone and returns its output once it exits.
+    pub(super) fn signal(&mut self, signal: Signal) -> Output {
+        kill_process(self.pid(), signal).unwrap();
+        self.output()
+    }
+
+    fn pid(&self) -> Pid {
+        Pid::from_raw(i32::try_from(self.process.id()).unwrap()).unwrap()
+    }
+
+    /// The `um` process's output once it exits.
+    fn output(&mut self) -> Output {
+        use std::io::Read as _;
+        let stderr = self.process.stderr.take().map(|mut pipe| {
+            std::thread::spawn(move || {
+                let mut bytes = Vec::new();
+                pipe.read_to_end(&mut bytes).unwrap();
+                bytes
+            })
+        });
+        let mut stdout = Vec::new();
+        if let Some(mut pipe) = self.process.stdout.take() {
+            pipe.read_to_end(&mut stdout).unwrap();
+        }
+        Output {
+            status: self.process.wait().unwrap(),
+            stdout,
+            stderr: stderr
+                .map(|reader| reader.join().unwrap())
+                .unwrap_or_default(),
+        }
+    }
 }
 
 impl Drop for LiveRun {
@@ -2448,6 +2485,31 @@ fn a_repair_retry_continues_the_failed_fan_out_element_before_the_next() {
     );
 }
 
+// REQ-LOCALRUN-200, REQ-WFEXEC-66: each fan-out element's child steps reach the parent's
+// progress stream scoped by the element, the first element's before the second's.
+#[test]
+fn a_fan_out_childs_step_states_are_scoped_by_their_element() {
+    let bundle = stage_tree(STAGE_FAN_OUT_ROOT);
+    for part in ["a", "b"] {
+        fs::write(
+            bundle.execution_root().join(format!("plan-{part}.md")),
+            "fenced",
+        )
+        .unwrap();
+    }
+    let destination = bundle.result("scoped");
+    let output = isolated_command(&bundle.args(&destination))
+        .args(["--input-json", "parts", r#"[{"name":"a"},{"name":"b"}]"#])
+        .output()
+        .unwrap();
+    assert_eq!(completed(&output)["outcome"], "succeeded");
+    let records = progress_records(&output.stderr);
+    assert!(
+        progress_position(&records, "design[1].read", "start")
+            < progress_position(&records, "design[2].read", "start")
+    );
+}
+
 /// What a refused repair continuation must leave as it was: the parent's records, its child
 /// directories, the child's attempts, the counters and the workspace's files.
 struct StageSnapshot {
@@ -2593,16 +2655,7 @@ fn a_repair_retry_refuses_an_unowned_or_altered_child() {
         let child = run.join("children/design/000001");
         fs::write(root.join("plan.md"), "fenced").unwrap();
         fs::write(root.join("sentinel"), case).unwrap();
-        let held = (case == "a live child lock").then(|| {
-            let lock = fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(child.join("run.lock"))
-                .unwrap();
-            rustix::fs::fcntl_lock(&lock, rustix::fs::FlockOperation::NonBlockingLockExclusive)
-                .unwrap();
-            lock
-        });
+        let held = (case == "a live child lock").then(|| hold_lock(&child));
         alter(&run, &child);
         let before = StageSnapshot::take(&run, root);
 
@@ -2785,4 +2838,566 @@ fn a_repair_retry_refuses_a_child_that_failed_only_in_its_finalizer() {
         fs::read_to_string(root.join("effects")).unwrap(),
         "effect\n"
     );
+}
+
+/// A root whose `build` stage child runs `prepare` and then the long-running `work`, and whose
+/// failed child waits for a repair at `build` itself (SC-LOCALRUN-15, SC-CONTINUE-11).
+const INTERRUPT_TREE_ROOT: &str = "schemaVersion: 1
+programs: [bin]
+outcomes: [landed, failed]
+steps:
+  build:
+    kind: workflow
+    workflow: build.yaml
+    on:
+      built: exit.landed
+      failed:
+        wait: repair
+        then: build
+";
+
+const INTERRUPT_TREE_BUILD: &str = "schemaVersion: 1
+outcomes: [built, failed]
+outcome:
+  from: outputs.work.verdict
+  onFailure: failed
+steps:
+  prepare:
+    kind: cmd
+    command:
+      argv: [build-step, prepare]
+  work:
+    kind: cmd
+    dependsOn: [prepare]
+    command:
+      argv: [build-step, work]
+    outputs:
+      verdict:
+        kind: text
+        from: path
+        path: verdict.txt
+";
+
+/// `build-step STEP` counts its runs in `count-<STEP>`; `prepare` writes the workspace file
+/// `prepared`; `work`, while the execution root holds `hold-work`, writes `held-work` and
+/// sleeps until `release-work` appears, then reports `built`.
+const INTERRUPT_TREE_PROGRAM: &str = "#!/bin/sh
+set -eu
+count=$(($(cat \"count-$1\" 2>/dev/null || printf 0) + 1))
+printf '%s' \"$count\" > \"count-$1\"
+case \"$1\" in
+  prepare) printf 'prepared-%s' \"$count\" > prepared ;;
+  work)
+    if [ -e hold-work ]; then
+      : > held-work
+      while [ ! -e release-work ]; do sleep 0.1; done
+    fi
+    printf built > verdict.txt ;;
+esac
+";
+
+/// The interrupt tree, its `work` held.
+fn interrupt_tree() -> TreeBundle {
+    let bundle = TreeBundle::new(INTERRUPT_TREE_ROOT);
+    bundle.write_source("build.yaml", INTERRUPT_TREE_BUILD);
+    bundle.write_program("bin/build-step", INTERRUPT_TREE_PROGRAM);
+    fs::write(bundle.execution_root().join("hold-work"), "").unwrap();
+    bundle
+}
+
+/// How often `prepare` and `work` ran in `root`.
+fn build_counts(root: &Path) -> [u32; 2] {
+    ["prepare", "work"].map(|step| {
+        fs::read_to_string(root.join(format!("count-{step}")))
+            .map_or(0, |count| count.parse().unwrap())
+    })
+}
+
+/// Starts the interrupt tree's run and returns its directory once its stage's `work` holds.
+fn held_stage(bundle: &TreeBundle, name: &str) -> (PathBuf, LiveRun) {
+    let execution = bundle.execution_root();
+    let destination = bundle.result(name);
+    let live = LiveRun {
+        process: isolated_command(&bundle.args(&destination))
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+        release: execution.join("release-work"),
+    };
+    poll_until(
+        "the stage's held step",
+        || {
+            execution.join("held-work").exists()
+                && um_execution::lock_holder(&destination).is_ok_and(|holder| holder.is_some())
+        },
+        |held| *held,
+    );
+    (fs::canonicalize(&destination).unwrap(), live)
+}
+
+/// Starts a later attempt of the interrupt tree's `run` with `leaf`, once the earlier
+/// attempt's process has ended, and returns it once its stage's `work` holds again.
+fn held_again(root: &Path, leaf: &str, run: &Path, args: &[&str]) -> LiveRun {
+    fs::remove_file(root.join("held-work")).unwrap();
+    let mut later = LiveRun {
+        process: control_command(None, leaf, run, args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+        release: root.join("release-work"),
+    };
+    let held = poll_until(
+        "the later attempt's held step",
+        || root.join("held-work").exists() || later.process.try_wait().unwrap().is_some(),
+        |held| *held,
+    );
+    assert!(
+        held && root.join("held-work").exists(),
+        "{:?}",
+        later.output()
+    );
+    later
+}
+
+/// A published step of `result` by id.
+fn result_step<'a>(result: &'a serde_json::Value, id: &str) -> &'a serde_json::Value {
+    result["steps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|step| step["id"] == id)
+        .unwrap()
+}
+
+// SC-LOCALRUN-15, SC-CONTINUE-11, REQ-LOCALRUN-135, REQ-WFEXEC-69, REQ-WFEXEC-70, REQ-WFEXEC-40,
+// REQ-CONTINUE-81, REQ-LOCALRUN-184: SIGINT or SIGTERM to the process of a staged run interrupts
+// it: the stage's running step fails `interrupted`, the root waits for a repair at the stage
+// with the interruption in its payload, no control is recorded and the command exits 130 or
+// 143; `retry` continues the same child from the interrupted step, `prepare` inherited and the
+// workspace kept, to the run's outcome.
+#[test]
+fn a_signal_interrupts_a_staged_run_and_retry_continues_its_stage() {
+    for (signal, status, reason) in [
+        (Signal::INT, 130, "user_request"),
+        (Signal::TERM, 143, "termination_request"),
+    ] {
+        let bundle = interrupt_tree();
+        let root = bundle.execution_root();
+        let (run, mut live) = held_stage(&bundle, reason);
+        let output = live.signal(signal);
+        assert_eq!(output.status.code(), Some(status), "{reason}: {output:?}");
+        let terminal = json(&output);
+        assert_eq!(terminal["outcome"], "waiting", "{terminal}");
+        assert_eq!(terminal["exitStatus"], status, "{terminal}");
+        let record = run_record(&run);
+        assert_eq!(record["state"], "waiting", "{record}");
+        assert_eq!(record["outcome"], serde_json::Value::Null, "{record}");
+        let wait = read_json(&run.join("wait.json"));
+        assert_eq!(wait["kind"], "repair", "{wait}");
+        assert_eq!(wait["step"], serde_json::json!(["build"]), "{wait}");
+        assert_eq!(
+            wait["payload"]["interrupted"],
+            serde_json::json!({"reason": reason, "step": "work"}),
+            "{wait}"
+        );
+        assert_eq!(wait["payload"]["child"], "children/build/000001", "{wait}");
+        assert_eq!(control_count(&run), 0);
+
+        let child = run.join("children/build/000001");
+        let child_id = run_record(&child)["id"].clone();
+        assert_eq!(
+            status_document(&child)["state"]["attempts"][0]["state"],
+            "workflow_failed"
+        );
+        let first = attempt_result(&child, 1);
+        let work = result_step(&first, "work");
+        assert_eq!(work["state"], "failed", "{first}");
+        assert_eq!(work["detail"]["phase"], "execution", "{first}");
+        assert_eq!(work["detail"]["code"], "interrupted", "{first}");
+        assert_eq!(build_counts(root), [1, 1]);
+
+        // SC-CONTINUE-11: the retry continues the same child at `work`.
+        fs::remove_file(root.join("hold-work")).unwrap();
+        let terminal = last_document(&run_control(None, "retry", &run, &[]));
+        assert_eq!(terminal["outcome"], "succeeded", "{terminal}");
+        assert_eq!(run_record(&run)["outcome"], "landed");
+        assert_eq!(ordinals_of(&run.join("children/build")), ["000001"]);
+        assert_eq!(run_record(&child)["id"], child_id);
+        assert_eq!(attempt_count(&child), 2);
+        let second = attempt_result(&child, 2);
+        assert_eq!(second["continuation"]["reason"], "retry", "{second}");
+        assert_eq!(
+            step_states(&second),
+            states(&[("prepare", "inherited"), ("work", "succeeded")])
+        );
+        assert_eq!(build_counts(root), [1, 2]);
+        assert_eq!(
+            fs::read_to_string(root.join("prepared")).unwrap(),
+            "prepared-1"
+        );
+    }
+}
+
+// REQ-LOCALRUN-135, REQ-WFEXEC-40: SIGINT or SIGTERM to a `restart` or an `upgrade` before its
+// successor's run directory exists ends the command with 130 or 143 and creates no successor,
+// so none is left `canceled`: the predecessor still waits, unchanged and holding its subject,
+// and the same command later moves it. The command is held between its inspection and the
+// predecessor's lock.
+#[test]
+fn a_signal_before_a_successor_exists_leaves_the_predecessor_waiting() {
+    let restart: &[&str] = &["--at", "review"];
+    for (leaf, args, signal, status) in [
+        ("restart", restart, Signal::INT, 130),
+        ("upgrade", &[], Signal::TERM, 143),
+    ] {
+        let published = PublishedWaitTree::with_subject();
+        let home = Some(&published.home);
+        let (predecessor, id) = published.waiting_for(&published.definition, "AUTO-1");
+        let review = published.bundle.source_root().join("review.yaml");
+        let changed = format!("{}# revision 2\n", fs::read_to_string(&review).unwrap());
+        published.bundle.write_source("review.yaml", &changed);
+        assert_eq!(published.republish(&[])["revision"]["n"], 2);
+        let before = records(&predecessor);
+
+        let gate = published.bundle.result("successor-lock-gate");
+        fs::create_dir_all(gate.parent().unwrap()).unwrap();
+        let mut command = LiveRun {
+            process: control_command(home, leaf, &id, args)
+                .env("UM_TEST_RUN_LOCK_GATE", &gate)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap(),
+            release: gate.clone(),
+        };
+        poll_until(
+            "the command's inspection",
+            || gate.with_extension("inspected").exists(),
+            |inspected| *inspected,
+        );
+        kill_process(command.pid(), signal).unwrap();
+        // The process is idle at the gate; give its observer time to take the signal.
+        um_support::sleep(std::time::Duration::from_millis(500));
+        fs::write(&gate, "").unwrap();
+        let output = command.output();
+
+        assert_eq!(output.status.code(), Some(status), "{leaf}: {output:?}");
+        assert_eq!(run_directories(predecessor.parent().unwrap()), 1);
+        assert_eq!(records(&predecessor), before);
+        assert_eq!(run_record(&predecessor)["state"], "waiting");
+        assert_eq!(control_count(&predecessor), 0);
+
+        decide(&published.bundle, "review", "approve");
+        let moved = run_control(home, leaf, &id, args);
+        assert!(moved.status.success(), "{leaf}: {moved:?}");
+        assert_eq!(run_record(&predecessor)["outcome"], "superseded");
+    }
+}
+
+// REQ-LOCALRUN-186, REQ-LOCALRUN-135: `cancel` on a live staged run records the cancel its
+// signal carries, so the run and its child end `canceled`; that recorded cancel does not make
+// a signal to a later attempt of the run a cancel; a run an interruption left waiting for a
+// repair is cancelled from its wait.
+#[test]
+fn cancel_still_cancels_a_live_staged_run_and_an_interrupted_one() {
+    let bundle = interrupt_tree();
+    let (run, mut live) = held_stage(&bundle, "canceled");
+    let output = run_control(None, "cancel", &run, &[]);
+    let document = recorded_as(&output, "cancel", "canceled", &run);
+    assert_eq!(document["control"]["event"], "control.cancel");
+    let record = run_record(&run);
+    assert_eq!(record["state"], "exited", "{record}");
+    assert_eq!(record["outcome"], "canceled", "{record}");
+    let child = run_record(&run.join("children/build/000001"));
+    assert_eq!(child["state"], "exited", "{child}");
+    assert_eq!(child["outcome"], "canceled", "{child}");
+    let exited = poll_until(
+        "the live run's process exit",
+        || live.process.try_wait().unwrap(),
+        Option::is_some,
+    );
+    assert_eq!(exited.unwrap().code(), Some(143));
+
+    // The cancel that ended that attempt is not a later attempt's: a signal to the process
+    // of a retry of the run interrupts it, with the `control.cancel` still in its journal.
+    let root = bundle.execution_root();
+    let mut later = held_again(
+        root,
+        "retry",
+        &run,
+        &["--execution-root", root.to_str().unwrap()],
+    );
+    assert_eq!(later.signal(Signal::INT).status.code(), Some(130));
+    let record = run_record(&run);
+    assert_eq!(record["state"], "waiting", "{record}");
+    assert_eq!(record["outcome"], serde_json::Value::Null, "{record}");
+    let wait = read_json(&run.join("wait.json"));
+    assert_eq!(wait["payload"]["interrupted"]["reason"], "user_request");
+    assert_eq!(ordinals_of(&run.join("controls")), ["0001-cancel.json"]);
+
+    let bundle = interrupt_tree();
+    let (run, mut live) = held_stage(&bundle, "interrupted");
+    assert_eq!(live.signal(Signal::INT).status.code(), Some(130));
+    assert_eq!(run_record(&run)["state"], "waiting");
+    let output = run_control(None, "cancel", &run, &[]);
+    recorded_as(&output, "cancel", "canceled", &run);
+    let record = run_record(&run);
+    assert_eq!(record["state"], "exited", "{record}");
+    assert_eq!(record["outcome"], "canceled", "{record}");
+}
+
+// SC-LOCALRUN-16, REQ-LOCALRUN-202, REQ-WFEXEC-70, REQ-WFEXEC-40, REQ-CONTINUE-81,
+// REQ-LOCALRUN-184: `interrupt` records `control.interrupt` and wakes the one process that
+// holds the run, which interrupts its stage with `termination_request` and parks the root on
+// its repair wait naming the control; another live run is untouched, and `retry` continues
+// the same child from the interrupted step.
+#[test]
+fn interrupt_parks_one_live_run_and_retry_continues_its_stage() {
+    let bundle = interrupt_tree();
+    let root = bundle.execution_root();
+    let (run, mut live) = held_stage(&bundle, "first");
+    let other_bundle = interrupt_tree();
+    let (other, other_live) = held_stage(&other_bundle, "second");
+
+    let output = run_control(None, "interrupt", &run, &["--reason", "pausing"]);
+    let document = recorded_as(&output, "interrupt", "interrupted", &run);
+    assert_eq!(document["control"]["event"], "control.interrupt");
+    assert_eq!(document["control"]["wait"], serde_json::Value::Null);
+    let control = control_file(&run, &document);
+    assert_eq!(control["payload"], serde_json::json!({"reason": "pausing"}));
+    let wait = &document["wait"];
+    assert_eq!(wait["kind"], "repair", "{document}");
+    assert_eq!(wait["step"], serde_json::json!(["build"]), "{document}");
+    assert_eq!(
+        wait["payload"]["interrupted"],
+        serde_json::json!({
+            "reason": "termination_request",
+            "step": "work",
+            "control": {"by": OPERATOR, "at": control["at"], "payload": {"reason": "pausing"}},
+        }),
+        "{document}"
+    );
+    assert_eq!(&read_json(&run.join("wait.json")), wait);
+
+    let interrupted = live.output();
+    assert_eq!(interrupted.status.code(), Some(143), "{interrupted:?}");
+    assert_eq!(json(&interrupted)["outcome"], "waiting");
+    assert_eq!(run_record(&run)["state"], "waiting");
+    let child = run.join("children/build/000001");
+    let child_id = run_record(&child)["id"].clone();
+    assert_eq!(control_count(&child), 0);
+
+    // The other run's process still holds it, running, with nothing recorded on it.
+    assert_eq!(run_record(&other)["state"], "running");
+    assert_eq!(
+        um_execution::lock_holder(&other).unwrap(),
+        Some(other_live.pid())
+    );
+    assert_eq!(control_count(&other), 0);
+    assert_eq!(control_count(&other.join("children/build/000001")), 0);
+    drop(other_live);
+
+    fs::remove_file(root.join("hold-work")).unwrap();
+    let terminal = last_document(&run_control(None, "retry", &run, &[]));
+    assert_eq!(terminal["outcome"], "succeeded", "{terminal}");
+    assert_eq!(run_record(&run)["outcome"], "landed");
+    assert_eq!(ordinals_of(&run.join("children/build")), ["000001"]);
+    assert_eq!(run_record(&child)["id"], child_id);
+    let second = attempt_result(&child, 2);
+    assert_eq!(
+        step_states(&second),
+        states(&[("prepare", "inherited"), ("work", "succeeded")])
+    );
+    assert_eq!(build_counts(root), [1, 2]);
+}
+
+/// Takes the `run.lock` of `run` in this process, as a live process would hold it; nothing
+/// here may open that lock file again while the lock is held.
+fn hold_lock(run: &Path) -> fs::File {
+    let lock = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(run.join("run.lock"))
+        .unwrap();
+    rustix::fs::fcntl_lock(&lock, rustix::fs::FlockOperation::NonBlockingLockExclusive).unwrap();
+    lock
+}
+
+/// `interrupt` on `run` refused with `code`, with no control written.
+fn interrupt_refused(run: &Path, code: &str) {
+    let before = control_count(run);
+    let output = run_control(None, "interrupt", run, &["--reason", "pausing"]);
+    refused(&output, "interrupt", code);
+    assert_eq!(control_count(run), before, "{code}");
+}
+
+// REQ-LOCALRUN-202, REQ-LOCALRUN-181: `interrupt` refuses, before writing anything, an exited
+// run, a waiting run of any kind, a `running` run whose process is gone, and a live root
+// whose positioned stage has no running child.
+#[test]
+fn interrupt_refuses_a_run_it_cannot_interrupt() {
+    let bundle = interrupt_tree();
+    fs::remove_file(bundle.execution_root().join("hold-work")).unwrap();
+    let destination = bundle.result("exited");
+    completed(
+        &isolated_command(&bundle.args(&destination))
+            .output()
+            .unwrap(),
+    );
+    interrupt_refused(&fs::canonicalize(&destination).unwrap(), "run_exited");
+
+    let bundle = wait_tree();
+    decide(&bundle, "review", "approve");
+    for (name, verdict) in [
+        ("answer", "blocked"),
+        ("repair", "failed"),
+        ("approval", "planned"),
+    ] {
+        let (run, terminal) = waiting_run(&bundle, name, verdict);
+        assert_eq!(terminal["wait"]["kind"], name, "{terminal}");
+        interrupt_refused(&run, "run_not_running");
+    }
+    let (answered, _) = waiting_run(&bundle, "answered", "blocked");
+    answer_the_one_question(&answered);
+    interrupt_refused(&answered, "run_not_running");
+
+    let bundle = interrupt_tree();
+    let (abandoned, mut live) = held_stage(&bundle, "abandoned");
+    live.process.kill().unwrap();
+    live.process.wait().unwrap();
+    assert_eq!(run_record(&abandoned)["state"], "running");
+    interrupt_refused(&abandoned, "run_not_live");
+
+    // A live root whose position names `design`, whose latest child exited, or `review`,
+    // which has no child.
+    let bundle = wait_tree();
+    let (run, _) = waiting_run(&bundle, "between-stages", "blocked");
+    let held = hold_lock(&run);
+    assert_eq!(run_record(&run)["position"], serde_json::json!(["design"]));
+    interrupt_refused(&run, "child_not_live");
+    rewrite_json(&run.join("run.json"), |record| {
+        record["position"] = serde_json::json!(["review"]);
+    });
+    interrupt_refused(&run, "child_not_live");
+    drop(held);
+}
+
+/// The test `LockHolder` launches.
+const LOCK_HOLDER_FIXTURE: &str = "workflow_run_control::run_lock_holder_fixture";
+const HELD_LOCKS_VARIABLE: &str = "UM_TEST_HELD_RUN_LOCKS";
+const HELD_LOCKS_RELEASE_VARIABLE: &str = "UM_TEST_HELD_RUN_LOCKS_RELEASE";
+
+/// A process that holds run locks and installs no signal handler, as a `um` that predates
+/// the wake-up does, until it is dropped.
+struct LockHolder {
+    process: Child,
+    release: PathBuf,
+}
+
+impl LockHolder {
+    /// Holds the `run.lock` of each of `runs` until `release` exists.
+    fn hold(runs: &[&Path], release: PathBuf) -> Self {
+        let locks = std::env::join_paths(runs.iter().map(|run| run.join("run.lock"))).unwrap();
+        let holder = Self {
+            process: std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--ignored", "--exact", LOCK_HOLDER_FIXTURE, "--nocapture"])
+                .env(HELD_LOCKS_VARIABLE, locks)
+                .env(HELD_LOCKS_RELEASE_VARIABLE, &release)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap(),
+            release,
+        };
+        let pid = holder.pid();
+        poll_until(
+            "the fixture's run locks",
+            || {
+                runs.iter()
+                    .all(|run| um_execution::lock_holder(run).is_ok_and(|held| held == Some(pid)))
+            },
+            |held| *held,
+        );
+        holder
+    }
+
+    fn pid(&self) -> Pid {
+        Pid::from_raw(i32::try_from(self.process.id()).unwrap()).unwrap()
+    }
+}
+
+impl Drop for LockHolder {
+    fn drop(&mut self) {
+        let _ = fs::write(&self.release, "");
+        let deadline = um_support::monotonic_now() + std::time::Duration::from_secs(10);
+        while self.process.try_wait().ok().flatten().is_none() {
+            if um_support::monotonic_now() >= deadline {
+                let _ = self.process.kill();
+                let _ = self.process.wait();
+                return;
+            }
+            um_support::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+}
+
+#[test]
+#[ignore = "launched as a process that holds run locks"]
+fn run_lock_holder_fixture() {
+    let locks = std::env::var_os(HELD_LOCKS_VARIABLE).unwrap();
+    let release = PathBuf::from(std::env::var_os(HELD_LOCKS_RELEASE_VARIABLE).unwrap());
+    let held = std::env::split_paths(&locks)
+        .map(|path| hold_lock(path.parent().unwrap()))
+        .collect::<Vec<_>>();
+    while !release.exists() {
+        um_support::sleep(std::time::Duration::from_millis(10));
+    }
+    drop(held);
+}
+
+// REQ-LOCALRUN-202, REQ-WFDEF-6: a process that does not act on the wake-up leaves the
+// interrupt `interrupt_pending` after the wait, recorded and the process alive; a later
+// attempt of the run, woken, does not act on that earlier control.
+#[test]
+fn an_unanswered_interrupt_is_pending_and_no_later_attempt_acts_on_it() {
+    let bundle = interrupt_tree();
+    let root = bundle.execution_root();
+    let (run, mut live) = held_stage(&bundle, "pending");
+    let child = run.join("children/build/000001");
+    live.process.kill().unwrap();
+    live.process.wait().unwrap();
+    let mut holder = LockHolder::hold(&[&run, &child], bundle.result("holder-release"));
+
+    // A shortened polling cadence shortens the wait for the release with it.
+    let output = control_command(None, "interrupt", &run, &["--reason", "pausing"])
+        .env("UM_TEST_POLL_INTERVAL_MILLISECONDS", "10")
+        .output()
+        .unwrap();
+    refused(&output, "interrupt", "interrupt_pending");
+    let controls = ordinals_of(&run.join("controls"));
+    assert_eq!(controls, ["0001-interrupt.json"]);
+    assert!(
+        holder.process.try_wait().unwrap().is_none(),
+        "the holder exited"
+    );
+    assert_eq!(run_record(&run)["state"], "running");
+    drop(holder);
+
+    // The killed process's `work` was stopped with it (its guard's parent-death protection),
+    // so a later attempt holds at `work` again.
+    let mut later = held_again(root, "resume", &run, &[]);
+    kill_process(later.pid(), Signal::URG).unwrap();
+    um_support::sleep(std::time::Duration::from_millis(500));
+    fs::write(&later.release, "").unwrap();
+    let output = later.output();
+    let terminal = chained(&output).pop().unwrap();
+    assert_eq!(terminal["outcome"], "succeeded", "{terminal}");
+    assert_eq!(run_record(&run)["outcome"], "landed");
+    assert_eq!(ordinals_of(&run.join("controls")), ["0001-interrupt.json"]);
 }

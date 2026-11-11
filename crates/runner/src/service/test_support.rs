@@ -34,11 +34,11 @@ const TEST_WATCHDOG: Duration = Duration::from_secs(10);
 const INTERNAL_WORKER_EXECUTABLE_VARIABLE: &str = "UM_TEST_INTERNAL_WORKER_EXECUTABLE";
 
 /// The built `internal-worker` example that guards every command step a runner test
-/// executes, as `cli/scripts/check-suite` exports it. Without it the execution crate's
-/// test-fixture fallback re-executes this test binary in the guard role, where it runs
-/// the whole suite in a nested process instead of guarding anything, and every process
-/// that nesting leaves behind is an orphan on the host. A runner fixture therefore
-/// refuses to exist before any step can launch rather than leak.
+/// executes, as `cli/scripts/check-suite` exports it. Without it the execution crate
+/// takes the example beside this test binary, never the binary itself (INV-TESTING-20),
+/// and `cargo test -p um-runner` does not build that example, so every step would fail
+/// at launch. A runner fixture therefore refuses to exist while the variable is unset,
+/// failing once with the build command before any step can launch.
 pub(crate) fn require_internal_worker_executable() -> PathBuf {
     let Some(worker) = std::env::var_os(INTERNAL_WORKER_EXECUTABLE_VARIABLE) else {
         panic!(

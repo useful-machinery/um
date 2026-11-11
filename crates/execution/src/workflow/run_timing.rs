@@ -5,7 +5,8 @@ use std::time::Instant;
 use time::OffsetDateTime;
 
 use super::admission::CancellationReason;
-use super::observation::ExecutionObservation;
+use super::evidence::FailurePhase;
+use super::observation::{ExecutionObservation, ObservedStepTransition};
 use super::presentation_feed::DisplayDeadline;
 use super::runtime::{StepStateKind, TransitionEvent, WorkflowState};
 
@@ -89,6 +90,22 @@ impl RunTimingObservation {
                         finished: None,
                     });
             }
+            // A step an interruption fails before it starts never passes through `starting`,
+            // yet every failure outside `condition` publishes timing (REQ-WFEXEC-40), so it
+            // starts and finishes at the failure (REQ-WFEXEC-69).
+            TransitionEvent::Step {
+                step,
+                to: StepStateKind::Failed,
+                ..
+            } if !timing.steps.contains_key(step) && failure_is_timed(transition.step.as_ref()) => {
+                timing.steps.insert(
+                    step.clone(),
+                    ObservedStepTiming {
+                        started: observed_at,
+                        finished: Some(observed_at.monotonic),
+                    },
+                );
+            }
             TransitionEvent::Step {
                 step,
                 to:
@@ -138,6 +155,14 @@ impl RunTimingObservation {
     }
 }
 
+fn failure_is_timed(step: Option<&ObservedStepTransition>) -> bool {
+    matches!(
+        step,
+        Some(ObservedStepTransition::Failed { detail })
+            if !matches!(detail.phase, FailurePhase::Condition)
+    )
+}
+
 fn observation_needs_timing_sample<Deadline>(observation: &ExecutionObservation<Deadline>) -> bool {
     let ExecutionObservation::Transition(transition) = observation else {
         return false;
@@ -172,4 +197,57 @@ fn lock_timing(timing: &Mutex<RunTimingSnapshot>) -> MutexGuard<'_, RunTimingSna
     timing
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::document::FailurePolicy;
+    use super::super::evidence::FailureDetail;
+    use super::super::observation::{ObservedExecutions, TransitionObservation};
+    use super::super::runtime::TransitionSequence;
+    use super::super::validated::WorkflowNodeRole;
+    use super::*;
+
+    fn failed(step: &str, detail: FailureDetail) -> ExecutionObservation<OffsetDateTime> {
+        ExecutionObservation::Transition(Box::new(TransitionObservation {
+            event: TransitionEvent::Step {
+                sequence: TransitionSequence(1),
+                step: step.to_owned(),
+                role: WorkflowNodeRole::Step,
+                failure_policy: FailurePolicy::Required,
+                from: StepStateKind::Pending,
+                to: StepStateKind::Failed,
+            },
+            step: Some(ObservedStepTransition::Failed { detail }),
+            executions: ObservedExecutions::default(),
+        }))
+    }
+
+    // REQ-WFEXEC-69, REQ-WFEXEC-40: a step an interruption fails before it starts is timed
+    // at that instant, while a `condition` failure, which never ran, stays untimed.
+    #[test]
+    fn a_failure_without_a_start_is_timed_unless_its_phase_is_condition() {
+        let observed_at = ObservationTime {
+            utc: OffsetDateTime::UNIX_EPOCH,
+            monotonic: um_support::monotonic_now(),
+        };
+        let timing = RunTimingObservation::new(observed_at);
+        timing.record(
+            &failed("interrupted", FailureDetail::interrupted_before_start()),
+            observed_at,
+        );
+        timing.record(
+            &failed(
+                "condition",
+                FailureDetail::json_pointer_missing("outputs.upstream.ready", "/ready").unwrap(),
+            ),
+            observed_at,
+        );
+
+        let snapshot = timing.snapshot();
+        let interrupted = snapshot.steps["interrupted"];
+        assert_eq!(interrupted.started.monotonic, observed_at.monotonic);
+        assert_eq!(interrupted.finished, Some(observed_at.monotonic));
+        assert!(!snapshot.steps.contains_key("condition"));
+    }
 }

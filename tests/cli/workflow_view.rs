@@ -812,12 +812,14 @@ fn stream_at_live_tui_cap_is_published_validated_and_viewable() {
     assert!(terminal_writes(&transcript).contains("attemptstatesucceeded·outcomesucceeded"));
 }
 
-// REQ-LOCALRUN-64, REQ-LOCALRUN-70, REQ-LOCALRUN-71
+// REQ-LOCALRUN-64, REQ-LOCALRUN-70, REQ-LOCALRUN-71, REQ-LOCALRUN-135: an attempt the
+// operator stopped with SIGINT, which the interruption failed, is inspectable with its
+// cancellation reason, and Ctrl-C in the viewer restores the terminal.
 #[cfg(target_os = "linux")]
 #[test]
-fn cancelled_attempt_is_inspectable_and_ctrl_c_restores_the_terminal() {
+fn interrupted_attempt_is_inspectable_and_ctrl_c_restores_the_terminal() {
     let bundle = signal_bundle();
-    let run_directory = bundle.result("cancelled");
+    let run_directory = bundle.result("interrupted");
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let child = isolated_command(&bundle.args(&run_directory))
         .env(
@@ -837,8 +839,8 @@ fn cancelled_attempt_is_inspectable_and_ctrl_c_restores_the_terminal() {
     kill_process(owner, Signal::INT).unwrap();
     control.read_exact(&mut event).unwrap();
     assert_eq!(event, [2]);
-    let cancelled = child.wait_with_output().unwrap();
-    assert_eq!(cancelled.status.code(), Some(130));
+    let interrupted = child.wait_with_output().unwrap();
+    assert_eq!(interrupted.status.code(), Some(130));
 
     let before = durable_files(&run_directory);
     let quit_view = TuiSession::start(&view_args(&run_directory, &[]));
@@ -846,7 +848,11 @@ fn cancelled_attempt_is_inspectable_and_ctrl_c_restores_the_terminal() {
     assert!(quit_status.success());
     let quit_writes = terminal_writes(&quit_transcript);
     assert!(
-        quit_writes.contains("attemptstatecancelled·outcomecancelled"),
+        quit_writes.contains("attemptstateworkflow_failed·outcomefailed"),
+        "{quit_writes:?}"
+    );
+    assert!(
+        quit_writes.contains("cancellationuser_request"),
         "{quit_writes:?}"
     );
 
@@ -854,7 +860,8 @@ fn cancelled_attempt_is_inspectable_and_ctrl_c_restores_the_terminal() {
     let (interrupted_status, interrupted_transcript) = interrupted_view.finish(b"\x03");
     assert_eq!(interrupted_status.code(), Some(130));
     assert!(
-        terminal_writes(&interrupted_transcript).contains("attemptstatecancelled·outcomecancelled")
+        terminal_writes(&interrupted_transcript)
+            .contains("attemptstateworkflow_failed·outcomefailed")
     );
 
     let plain = isolated_command(&view_args(&run_directory, &["--plain", "--color", "never"]))
@@ -863,7 +870,10 @@ fn cancelled_attempt_is_inspectable_and_ctrl_c_restores_the_terminal() {
     assert!(plain.status.success());
     assert!(plain.stderr.is_empty());
     let plain = String::from_utf8(plain.stdout).unwrap();
-    assert!(plain.contains("state cancelled · outcome cancelled"));
+    assert!(
+        plain.contains("state workflow_failed · outcome failed"),
+        "{plain}"
+    );
     assert!(plain.contains("cancellation: user_request"));
 
     let json = isolated_command(&view_args(&run_directory, &["--json"]))
@@ -873,8 +883,9 @@ fn cancelled_attempt_is_inspectable_and_ctrl_c_restores_the_terminal() {
     assert!(json.stderr.is_empty());
     let json: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
     assert!(workflow_view_schema().is_valid(&json));
-    assert_eq!(json["attemptState"], "cancelled");
-    assert_eq!(json["result"]["outcome"], "cancelled");
+    assert_eq!(json["attemptState"], "workflow_failed");
+    assert_eq!(json["result"]["outcome"], "failed");
+    assert_eq!(json["result"]["cancellation"]["reason"], "user_request");
     assert_eq!(durable_files(&run_directory), before);
 }
 

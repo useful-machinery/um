@@ -1,7 +1,9 @@
 use std::io::{self, Write};
+use std::time::Duration;
 
 use serde::Serialize;
 use serde_json::Value;
+use time::OffsetDateTime;
 
 use super::super::archived_presentation::safe_text;
 use super::super::evidence::{FailureDetail, NodeDetail};
@@ -9,13 +11,39 @@ use super::super::publication::{
     RecoveryHandlerOutcomeV1, RecoveryInvocationRoleV1, RecoveryTerminationV1, WorkflowResultV1,
     WorkspaceModifiedV1,
 };
-use super::{DurableStepRecoveryV1, LocalRunStateV1};
+use super::{AttemptFinalizationV1, AttemptStepV1, DurableStepRecoveryV1, LocalRunStateV1};
 
 // Keep the durable state typed at the status boundary. The separately serialized
 // state document in LocalRunStatusSnapshot is only used for the JSON response.
 #[derive(Clone, Debug, PartialEq)]
 pub struct LocalStatusStateView {
     pub(super) state: LocalRunStateV1,
+}
+
+/// A recorded start time and the time elapsed since it at a caller's `now`, zero for a start
+/// recorded after `now` (REQ-LOCALRUN-189).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LocalStatusStart {
+    pub at: String,
+    pub elapsed: Duration,
+}
+
+/// The current attempt's start and its in-flight nodes (REQ-LOCALRUN-189). A start the state
+/// does not record, as in a state an earlier `um` wrote (REQ-LOCALRUN-201), is `None`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LocalStatusProgress {
+    pub started: Option<LocalStatusStart>,
+    pub nodes: Vec<LocalStatusNode>,
+}
+
+/// A step or finalizer of the current attempt that is `starting`, `running`,
+/// `capturing_outputs` or `cancelling`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LocalStatusNode {
+    pub id: String,
+    pub role: String,
+    pub state: String,
+    pub started: Option<LocalStatusStart>,
 }
 
 impl LocalStatusStateView {
@@ -31,6 +59,35 @@ impl LocalStatusStateView {
                 .and_then(parse)
                 .zip(parse(since))
                 .is_some_and(|(started, waited)| started > waited))
+    }
+
+    /// The current attempt's start and its in-flight nodes, the steps first, then the
+    /// finalizers while finalization is in progress, with the time since each start at `now`.
+    pub fn in_flight(&self, now: OffsetDateTime) -> io::Result<LocalStatusProgress> {
+        let attempt = self.current()?;
+        let finalizers = match &attempt.finalization {
+            Some(AttemptFinalizationV1::Progress(progress)) => progress.finalizers.as_slice(),
+            _ => &[],
+        };
+        let nodes = attempt
+            .progress
+            .steps
+            .iter()
+            .chain(finalizers)
+            .filter(|node| node.state.is_in_flight())
+            .map(|node: &AttemptStepV1| {
+                Ok(LocalStatusNode {
+                    id: node.id.clone(),
+                    role: label(node.role)?,
+                    state: label(node.state)?,
+                    started: start(node.started_at.as_deref(), now),
+                })
+            })
+            .collect::<io::Result<_>>()?;
+        Ok(LocalStatusProgress {
+            started: start(attempt.started_at.as_deref(), now),
+            nodes,
+        })
     }
 
     fn current(&self) -> io::Result<&super::LocalAttemptV1> {
@@ -93,6 +150,16 @@ impl LocalStatusStateView {
         }
         Ok(())
     }
+}
+
+/// `at` with the time since it at `now`; validation admits only a canonical UTC timestamp.
+fn start(at: Option<&str>, now: OffsetDateTime) -> Option<LocalStatusStart> {
+    let at = at?;
+    let parsed = super::super::schema_common::parse_canonical_utc_timestamp(at)?;
+    Some(LocalStatusStart {
+        at: at.to_owned(),
+        elapsed: Duration::try_from(now - parsed).unwrap_or(Duration::ZERO),
+    })
 }
 
 fn label(value: impl Serialize) -> io::Result<String> {

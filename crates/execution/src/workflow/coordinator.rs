@@ -200,6 +200,7 @@ where
         }
         Occurrence::CancellationOperationRequested { deadline, .. }
         | Occurrence::OrdinaryCancellationOperationRequested { deadline, .. }
+        | Occurrence::InterruptionOperationRequested { deadline, .. }
         | Occurrence::ForceAbortRequested { deadline, .. } => match *deadline {},
     }
     let digest = context.finish();
@@ -464,6 +465,11 @@ impl<Provisional, Cause, Output> DriverOccurrence<Provisional, Cause, Output> {
                 operation: _,
                 deadline,
                 ..
+            }
+            | Occurrence::InterruptionOperationRequested {
+                operation: _,
+                deadline,
+                ..
             } => match deadline {},
             Occurrence::ForceAbortRequested {
                 operation: _,
@@ -545,6 +551,7 @@ impl<Provisional, Cause, Output> DriverOccurrence<Provisional, Cause, Output> {
             }
             Occurrence::CancellationOperationRequested { deadline, .. }
             | Occurrence::OrdinaryCancellationOperationRequested { deadline, .. }
+            | Occurrence::InterruptionOperationRequested { deadline, .. }
             | Occurrence::ForceAbortRequested { deadline, .. } => match *deadline {},
         };
         DriverOccurrenceIdentity {
@@ -867,6 +874,45 @@ pub(crate) fn occurrence_channel<Provisional, Cause, Output>(
     )
 }
 
+// A graceful operation's deadline is the grace period from now; a force abort's is now.
+fn cancellation_occurrence<Provisional, Cause, Output, Instant>(
+    operation: CancellationOperation,
+    now: Instant,
+    grace: Duration,
+) -> Occurrence<Provisional, Cause, Output, Instant>
+where
+    Instant: Add<Duration, Output = Instant> + Clone,
+{
+    let graceful = now.clone() + grace;
+    match operation {
+        CancellationOperation::Graceful { id, reason } => {
+            Occurrence::CancellationOperationRequested {
+                operation: id,
+                reason,
+                deadline: graceful,
+            }
+        }
+        CancellationOperation::OrdinaryOnly { id, reason } => {
+            Occurrence::OrdinaryCancellationOperationRequested {
+                operation: id,
+                reason,
+                deadline: graceful,
+            }
+        }
+        CancellationOperation::Interruption { id, reason } => {
+            Occurrence::InterruptionOperationRequested {
+                operation: id,
+                reason,
+                deadline: graceful,
+            }
+        }
+        CancellationOperation::ForceAbort { id } => Occurrence::ForceAbortRequested {
+            operation: id,
+            deadline: now,
+        },
+    }
+}
+
 pub trait CoordinatorClock: Clone + Send + Sync + 'static {
     type Instant: Add<Duration, Output = Self::Instant> + Clone + Send + 'static;
 
@@ -1032,6 +1078,15 @@ where
                 },
                 operation: Some(id),
             }),
+            Some(CancellationOperation::Interruption { id, reason }) => {
+                Some(runtime::InitialCancellation::Interruption {
+                    request: CancellationRequest {
+                        reason,
+                        deadline: self.clock.now() + grace,
+                    },
+                    operation: Some(id),
+                })
+            }
             Some(CancellationOperation::ForceAbort { id }) => {
                 Some(runtime::InitialCancellation::ForceAbort {
                     operation: id,
@@ -1087,29 +1142,11 @@ where
                         let Some(operation) = cancellation.next_operation() else {
                             continue;
                         };
-                        let occurrence = match operation {
-                            CancellationOperation::Graceful { id, reason } => {
-                                Occurrence::CancellationOperationRequested {
-                                    operation: id,
-                                    reason,
-                                    deadline: self.clock.now() + grace,
-                                }
-                            }
-                            CancellationOperation::OrdinaryOnly { id, reason } => {
-                                Occurrence::OrdinaryCancellationOperationRequested {
-                                    operation: id,
-                                    reason,
-                                    deadline: self.clock.now() + grace,
-                                }
-                            }
-                            CancellationOperation::ForceAbort { id } => {
-                                Occurrence::ForceAbortRequested {
-                                    operation: id,
-                                    deadline: self.clock.now(),
-                                }
-                            }
-                        };
-                        CoordinatorInput::Cancellation(occurrence)
+                        CoordinatorInput::Cancellation(cancellation_occurrence(
+                            operation,
+                            self.clock.now(),
+                            grace,
+                        ))
                     }
                     driver_occurrence = self.occurrences.recv_delivery() => {
                         let Some(driver_occurrence) = driver_occurrence else {
@@ -1119,29 +1156,11 @@ where
                         // before assigning a driver ordinal so cancellation cannot be skipped.
                         if let Some(operation) = cancellation.next_operation() {
                             self.occurrences.retain_delivery(driver_occurrence);
-                            let occurrence = match operation {
-                                CancellationOperation::Graceful { id, reason } => {
-                                    Occurrence::CancellationOperationRequested {
-                                        operation: id,
-                                        reason,
-                                        deadline: self.clock.now() + grace,
-                                    }
-                                }
-                                CancellationOperation::OrdinaryOnly { id, reason } => {
-                                    Occurrence::OrdinaryCancellationOperationRequested {
-                                        operation: id,
-                                        reason,
-                                        deadline: self.clock.now() + grace,
-                                    }
-                                }
-                                CancellationOperation::ForceAbort { id } => {
-                                    Occurrence::ForceAbortRequested {
-                                        operation: id,
-                                        deadline: self.clock.now(),
-                                    }
-                                }
-                            };
-                            CoordinatorInput::Cancellation(occurrence)
+                            CoordinatorInput::Cancellation(cancellation_occurrence(
+                                operation,
+                                self.clock.now(),
+                                grace,
+                            ))
                         } else {
                             let selected = driver_occurrence.select();
                             let ordinal_assigned = selected.is_resolved();

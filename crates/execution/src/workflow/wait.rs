@@ -51,6 +51,8 @@ pub const CONTROL_RETRY: &str = "control.retry";
 pub const CONTROL_STOP: &str = "control.stop";
 /// The control that lifts the stop in force before a step (REQ-LOCALRUN-185).
 pub const CONTROL_LIFT: &str = "control.lift";
+/// The control that interrupts a running run; it resolves no wait (REQ-WFDEF-6).
+pub const CONTROL_INTERRUPT: &str = "control.interrupt";
 /// The control that ends a waiting run instead of continuing it (REQ-CONTINUE-75).
 pub const CONTROL_WITHDRAW: &str = "control.withdraw";
 /// The control that cancels a run (REQ-LOCALRUN-186).
@@ -58,13 +60,14 @@ pub const CONTROL_CANCEL: &str = "control.cancel";
 /// The control that releases an exited run (REQ-LOCALRUN-187).
 pub const CONTROL_RELEASE: &str = "control.release";
 /// The events of the published control schema (REQ-WFDEF-6).
-const CONTROL_EVENTS: [&str; 9] = [
+const CONTROL_EVENTS: [&str; 10] = [
     CONTROL_ANSWER,
     CONTROL_APPROVE,
     CONTROL_HAND_BACK,
     CONTROL_RETRY,
     CONTROL_STOP,
     CONTROL_LIFT,
+    CONTROL_INTERRUPT,
     CONTROL_WITHDRAW,
     CONTROL_CANCEL,
     CONTROL_RELEASE,
@@ -617,24 +620,22 @@ fn resolve(operand: &Operand, run_id: &str, wait: &WaitRecord, event: &Value) ->
 /// A wait record's payload (REQ-WFEXEC-61, REQ-WFEXEC-62): for a `stop` wait the stop
 /// control's `by`, `at` and `payload`; otherwise the waiting step's committed outputs, its
 /// `outcome` and each `text` or `json` value, and `child`, the child run's directory
-/// relative to the run directory, when one ran.
+/// relative to the run directory, when one ran. A `repair` wait an interrupted child routed
+/// to also carries `interrupted`, the interruption's `reason` and the child's `step`, and a
+/// `summary` beginning `interrupted` in place of any the step committed (REQ-WFEXEC-70).
+/// `control` is the stop in force for a `stop` wait and, for an interrupted wait, the
+/// `control.interrupt` that requested the interruption: `interrupted` then also carries it
+/// as `control` and the `summary` names its `payload.reason`.
 pub fn wait_payload(
     wait: &EnteredWait,
     steps: &BTreeMap<String, StepState<CapturedValue>>,
     child: Option<&str>,
-    stop: Option<&ControlEvent>,
+    control: Option<&ControlEvent>,
 ) -> Map<String, Value> {
-    let mut payload = Map::new();
     if wait.kind == WaitKind::Stop {
-        if let Some(stop) = stop {
-            payload.insert("by".to_owned(), Value::String(stop.by.clone()));
-            payload.insert("at".to_owned(), Value::String(stop.at.clone()));
-            if let Some(control) = &stop.payload {
-                payload.insert("payload".to_owned(), Value::Object(control.clone()));
-            }
-        }
-        return payload;
+        return control.map(control_fields).unwrap_or_default();
     }
+    let mut payload = Map::new();
     for (name, value) in steps
         .get(wait.step())
         .and_then(step_outputs)
@@ -654,7 +655,37 @@ pub fn wait_payload(
     if let Some(child) = child {
         payload.insert("child".to_owned(), Value::String(child.to_owned()));
     }
+    if let Some(interrupted) = wait.interrupted() {
+        let reason = interrupted.reason.as_str();
+        let mut summary = format!("interrupted by {reason} at step {}", interrupted.step);
+        let mut record = serde_json::json!({"reason": reason, "step": interrupted.step});
+        if let Some(control) = control.filter(|control| control.event == CONTROL_INTERRUPT) {
+            if let Some(stated) = control
+                .payload
+                .as_ref()
+                .and_then(|payload| payload.get("reason"))
+                .and_then(Value::as_str)
+            {
+                summary = format!("{summary}: {stated}");
+            }
+            record["control"] = Value::Object(control_fields(control));
+        }
+        payload.insert("interrupted".to_owned(), record);
+        payload.insert("summary".to_owned(), Value::String(summary));
+    }
     payload
+}
+
+/// A control as a wait's payload names it: its `by`, `at` and, when it carries one,
+/// `payload`.
+fn control_fields(control: &ControlEvent) -> Map<String, Value> {
+    let mut fields = Map::new();
+    fields.insert("by".to_owned(), Value::String(control.by.clone()));
+    fields.insert("at".to_owned(), Value::String(control.at.clone()));
+    if let Some(payload) = &control.payload {
+        fields.insert("payload".to_owned(), Value::Object(payload.clone()));
+    }
+    fields
 }
 
 /// The first event, in order, that resolves the wait through `rule` (REQ-CONTINUE-74,

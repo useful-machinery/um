@@ -581,7 +581,9 @@ fn active_status_reports_handler_kind_and_recheck_decision() {
     );
 }
 
-// REQ-WFRECOVERY-36, REQ-WFRECOVERY-48, REQ-WFRECOVERY-49
+// REQ-WFRECOVERY-36, REQ-WFRECOVERY-48, REQ-WFRECOVERY-49, REQ-WFEXEC-69: SIGINT interrupts
+// the step while its handler runs; the handler is cancelled and quiesces, no recheck runs, and
+// the step fails `interrupted`.
 #[test]
 fn cancellation_quiesces_the_ready_handler_and_publishes_no_recheck() {
     let bundle = RunBundle::new(&fixture_source("recovery-cancellation.yaml"));
@@ -604,8 +606,10 @@ fn cancellation_quiesces_the_ready_handler_and_publishes_no_recheck() {
     assert_eq!(output.status.code(), Some(130));
     let terminal: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     let step = &terminal["result"]["steps"][0];
-    assert_eq!(terminal["outcome"], "cancelled");
-    assert_eq!(step["state"], "cancelled");
+    assert_eq!(terminal["outcome"], "failed");
+    assert_eq!(step["state"], "failed");
+    assert_eq!(step["detail"]["phase"], "execution");
+    assert_eq!(step["detail"]["code"], "interrupted");
     assert_eq!(step["recovery"]["termination"]["kind"], "cancelled");
     assert_eq!(
         step["recovery"]["termination"]["activeRole"],

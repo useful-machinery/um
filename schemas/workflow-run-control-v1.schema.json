@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://docs.usefulmachinery.com/schemas/workflow-run-control-v1.schema.json",
   "title": "Useful Machinery Workflow Run Control Event V1",
-  "description": "One controls/NNNN-<name>.json event on source um that acts on a run. `wait` names the wait the control acts on as kind@since, present when the run waits on it and the control concerns that wait, whether or not the wait's rule resolves on it; `payload` carries the event's fields, such as a hand-back's notes, the answers, or a stop's before and reason.",
+  "description": "One controls/NNNN-<name>.json event on source um that acts on a run. `wait` names the wait the control acts on as kind@since, present when the run waits on it and the control concerns that wait, whether or not the wait's rule resolves on it; `payload` carries the event's fields, such as a hand-back's notes, the answers, a stop's before and reason, or an interrupt's reason.",
   "type": "object",
   "additionalProperties": false,
   "required": ["source", "event", "run", "by", "at"],
@@ -16,6 +16,7 @@
         "control.retry",
         "control.stop",
         "control.lift",
+        "control.interrupt",
         "control.withdraw",
         "control.cancel",
         "control.release"

@@ -104,6 +104,12 @@ pub(crate) enum CancellationOperation {
         id: CancellationOperationId,
         reason: CancellationReason,
     },
+    /// A graceful stop that settles the stopped ordinary steps `failed` with `interrupted`
+    /// instead of `cancelled` (REQ-WFEXEC-69).
+    Interruption {
+        id: CancellationOperationId,
+        reason: CancellationReason,
+    },
     ForceAbort {
         id: CancellationOperationId,
     },
@@ -126,6 +132,7 @@ struct CancellationOperationState {
     pending_force_abort: bool,
     phase_reason: Option<CancellationReason>,
     force_abort_requested: bool,
+    interruption_requested: bool,
 }
 
 impl Default for CancellationOperationState {
@@ -139,6 +146,7 @@ impl Default for CancellationOperationState {
             pending_force_abort: false,
             phase_reason: None,
             force_abort_requested: false,
+            interruption_requested: false,
         }
     }
 }
@@ -216,6 +224,49 @@ impl CancellationSource {
             self.operation_version.send_replace(version);
         }
         true
+    }
+
+    /// Requests an interruption: the local CLI's stop for a signal or the terminal
+    /// interface (REQ-WFEXEC-69). Only `UserRequest` and `TerminationRequest` are accepted.
+    /// While finalization is armed or being armed, or once a stop was requested, it is
+    /// exactly `request_cancellation(reason)` (REQ-WFFINALIZE-15). The runner never makes it.
+    pub fn request_interruption(&self, reason: CancellationReason) -> bool {
+        if !matches!(
+            reason,
+            CancellationReason::UserRequest | CancellationReason::TerminationRequest
+        ) {
+            return false;
+        }
+        let version = {
+            let mut state = lock_cancellation_operations(&self.operations);
+            if state.finalization_arming
+                || state.finalization_armed
+                || state.phase_reason.is_some()
+                || state.force_abort_requested
+            {
+                None
+            } else {
+                let id = CancellationOperationId(state.next_id);
+                state.next_id = state.next_id.saturating_add(1);
+                state.phase_reason = Some(reason);
+                state.interruption_requested = true;
+                state
+                    .operations
+                    .push(CancellationOperation::Interruption { id, reason });
+                Some(u64::try_from(state.operations.len()).unwrap_or(u64::MAX))
+            }
+        };
+        let Some(version) = version else {
+            return self.request_cancellation(reason);
+        };
+        self.reason.send_replace(Some(reason));
+        self.operation_version.send_replace(version);
+        true
+    }
+
+    /// Whether an interruption, rather than a cancellation, stopped ordinary execution.
+    pub fn interruption_requested(&self) -> bool {
+        lock_cancellation_operations(&self.operations).interruption_requested
     }
 
     pub fn request_ordinary_cancellation(

@@ -4057,9 +4057,9 @@ mod tests {
     impl ServingOwner {
         fn spawn(root: &Path, endpoint: &str, source: &Path, work: &Path) -> Self {
             // The owner runs a guarded command step, so it needs the built worker
-            // executable that `cli/scripts/check-suite` supplies; without it the
-            // fallback launches this test binary as the worker and the step never
-            // holds, which would surface only as the watchdog firing.
+            // executable that `cli/scripts/check-suite` supplies; without it the step
+            // would fail at launch and never hold, which would surface only as the
+            // watchdog firing, so the fixture refuses first and names the build command.
             let worker = require_internal_worker_executable();
             let log = root.join("serving-owner.stderr");
             let child = std::process::Command::new(

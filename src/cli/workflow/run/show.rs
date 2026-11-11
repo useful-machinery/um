@@ -1,6 +1,7 @@
 //! `um workflow run show` (REQ-LOCALRUN-189): one run from its records, read as `status`
 //! reads it, without taking its lock or changing its directory, with its mirror writes
-//! (REQ-LOCALRUN-193).
+//! (REQ-LOCALRUN-193) and each running child's attempt and in-flight steps, read from the
+//! child's records the same way.
 
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -10,10 +11,11 @@ use clap::Args;
 use serde::Serialize;
 use serde_json::{Map, Value};
 use um_execution::{
-    ChildRun, ControlEvent, LocalStatusAttempt, LocalStatusResult, MirrorAction, MirrorSkipReason,
-    MirrorWrite, MirrorWriteOutcome, WaitRecord, WorkflowRunRecord, child_runs,
-    normalize_terminal_path, normalize_terminal_scalar, read_local_run_status,
-    read_numbered_controls, read_numbered_mirror_writes,
+    ChildRun, ControlEvent, LocalStatusAttempt, LocalStatusProgress, LocalStatusResult,
+    LocalStatusStart, MirrorAction, MirrorSkipReason, MirrorWrite, MirrorWriteOutcome, RunState,
+    WaitRecord, WorkflowRunRecord, child_runs, human_duration, normalize_terminal_path,
+    normalize_terminal_scalar, read_local_run_status, read_numbered_controls,
+    read_numbered_mirror_writes,
 };
 
 use super::control::{Refusal, write_refusal};
@@ -39,7 +41,7 @@ struct Shown {
     record: WorkflowRunRecord,
     wait: Option<WaitRecord>,
     attempts: Vec<Attempt>,
-    children: Vec<ChildRun>,
+    children: Vec<Child>,
     controls: Vec<(u64, ControlEvent)>,
     mirror: Vec<(u64, MirrorWrite)>,
 }
@@ -51,6 +53,20 @@ struct Attempt {
     reason: Option<Value>,
     edge: Option<Value>,
     imported: Option<Value>,
+}
+
+/// A child run with its progress while its record is `running`.
+struct Child {
+    run: ChildRun,
+    progress: Option<ChildProgress>,
+}
+
+/// A running child's current attempt, read from its own records (REQ-LOCALRUN-189).
+struct ChildProgress {
+    attempt: u64,
+    state: &'static str,
+    recovery: &'static str,
+    progress: LocalStatusProgress,
 }
 
 /// A run `show` refuses, with the run directory once `RUN` resolved.
@@ -99,7 +115,18 @@ impl Command {
         })?;
         let record: WorkflowRunRecord =
             serde_json::from_value(record).map_err(|error| invalid(error.to_string()))?;
-        let children = child_runs(&run_directory).map_err(|error| invalid(error.to_string()))?;
+        let now = um_support::utc_now();
+        let children = child_runs(&run_directory)
+            .map_err(|error| invalid(error.to_string()))?
+            .into_iter()
+            .map(|run| {
+                let progress = (run.record.state == RunState::Running)
+                    .then(|| child_progress(&run, now))
+                    .transpose()
+                    .map_err(invalid)?;
+                Ok(Child { run, progress })
+            })
+            .collect::<Result<_, Refused>>()?;
         let controls =
             read_numbered_controls(&run_directory).map_err(|error| invalid(error.to_string()))?;
         let mirror = read_numbered_mirror_writes(&run_directory)
@@ -132,6 +159,30 @@ impl Command {
             run_directory,
         })
     }
+}
+
+/// A running child's current attempt and its in-flight nodes, with the time since each start
+/// at `now`, or the reason its records cannot be read, naming the child: the refusal's run
+/// directory is the parent's.
+fn child_progress(child: &ChildRun, now: time::OffsetDateTime) -> Result<ChildProgress, String> {
+    let unreadable = |reason: &dyn std::fmt::Display| {
+        format!(
+            "Child run {}: {reason}",
+            normalize_terminal_path(&child.directory)
+        )
+    };
+    let snapshot = read_local_run_status(&child.directory)
+        .map_err(|error| unreadable(&error.code.message()))?;
+    let progress = snapshot
+        .status_state
+        .in_flight(now)
+        .map_err(|error| unreadable(&error))?;
+    Ok(ChildProgress {
+        attempt: snapshot.current_attempt_number,
+        state: snapshot.current_attempt_state,
+        recovery: snapshot.recovery.as_str(),
+        progress,
+    })
 }
 
 /// The `state.json` entry for attempt `number`, when it has one.
@@ -201,6 +252,27 @@ struct ShownChild<'a> {
     state: &'static str,
     outcome: Option<&'a str>,
     directory: &'a Path,
+    progress: Option<ShownProgress<'a>>,
+}
+
+/// A running child's progress: the recorded start times, never an elapsed time.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ShownProgress<'a> {
+    attempt: u64,
+    state: &'static str,
+    started_at: Option<&'a str>,
+    recovery: &'static str,
+    steps: Vec<ShownNode<'a>>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ShownNode<'a> {
+    id: &'a str,
+    role: &'a str,
+    state: &'a str,
+    started_at: Option<&'a str>,
 }
 
 #[derive(Serialize)]
@@ -257,14 +329,15 @@ fn document(shown: &Shown) -> ShowDocument<'_> {
         children: shown
             .children
             .iter()
-            .map(|child| ShownChild {
-                step: &child.step,
-                item: child.item,
-                ordinal: child.ordinal,
-                id: &child.record.id,
-                state: state_name(child.record.state),
-                outcome: child.record.outcome.as_deref(),
-                directory: &child.directory,
+            .map(|Child { run, progress }| ShownChild {
+                step: &run.step,
+                item: run.item,
+                ordinal: run.ordinal,
+                id: &run.record.id,
+                state: state_name(run.record.state),
+                outcome: run.record.outcome.as_deref(),
+                directory: &run.directory,
+                progress: progress.as_ref().map(shown_progress),
             })
             .collect(),
         controls: shown
@@ -288,6 +361,35 @@ fn document(shown: &Shown) -> ShowDocument<'_> {
             })
             .collect(),
     }
+}
+
+fn started_at(start: Option<&LocalStatusStart>) -> Option<&str> {
+    start.map(|start| start.at.as_str())
+}
+
+fn shown_progress(child: &ChildProgress) -> ShownProgress<'_> {
+    ShownProgress {
+        attempt: child.attempt,
+        state: child.state,
+        started_at: started_at(child.progress.started.as_ref()),
+        recovery: child.recovery,
+        steps: child
+            .progress
+            .nodes
+            .iter()
+            .map(|node| ShownNode {
+                id: &node.id,
+                role: &node.role,
+                state: &node.state,
+                started_at: started_at(node.started.as_ref()),
+            })
+            .collect(),
+    }
+}
+
+/// The time since a recorded start (REQ-LOCALRUN-124), `-` when the state records none.
+fn elapsed_text(start: Option<&LocalStatusStart>) -> String {
+    start.map_or_else(|| "-".to_owned(), |start| human_duration(start.elapsed))
 }
 
 fn text(value: &str) -> String {
@@ -446,20 +548,37 @@ fn write_plain(shown: &Shown) -> io::Result<()> {
     }
     writeln!(stdout)?;
     writeln!(stdout, "children:")?;
-    for child in &shown.children {
+    for Child { run, progress } in &shown.children {
         writeln!(
             stdout,
             "  {} {} {:06}  {}  {}  {}  {}",
-            text(&child.step),
-            child
-                .item
+            text(&run.step),
+            run.item
                 .map_or_else(|| "-".to_owned(), |item| item.to_string()),
-            child.ordinal,
-            text(&child.record.id),
-            state_name(child.record.state),
-            or_dash(child.record.outcome.as_deref()),
-            normalize_terminal_path(&child.directory)
+            run.ordinal,
+            text(&run.record.id),
+            state_name(run.record.state),
+            or_dash(run.record.outcome.as_deref()),
+            normalize_terminal_path(&run.directory)
         )?;
+        if let Some(child) = progress {
+            writeln!(
+                stdout,
+                "    attempt {} · {} · {}",
+                child.attempt,
+                child.recovery,
+                elapsed_text(child.progress.started.as_ref())
+            )?;
+            for node in &child.progress.nodes {
+                writeln!(
+                    stdout,
+                    "    {} · {} · {}",
+                    text(&node.id),
+                    node.state,
+                    elapsed_text(node.started.as_ref())
+                )?;
+            }
+        }
     }
     writeln!(stdout)?;
     writeln!(stdout, "controls:")?;

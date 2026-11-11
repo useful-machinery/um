@@ -1930,6 +1930,21 @@ mod tests {
     use crate::exit_code::{ExitCode, OutcomeClass};
     use um_api::UnreachableCategory;
 
+    // INV-TESTING-20
+    #[test]
+    fn a_unit_test_harness_is_never_its_own_internal_worker() {
+        match um_execution::unsupplied_internal_worker_executable() {
+            Ok(worker) => {
+                assert_ne!(worker, std::env::current_exe().unwrap());
+                assert!(
+                    worker.ends_with("examples/internal-worker"),
+                    "an unsupplied worker must be the example beside the harness: {worker:?}"
+                );
+            }
+            Err(error) => assert_eq!(error.raw_os_error(), None),
+        }
+    }
+
     #[test]
     fn completion_and_cancellation_each_win_one_controlled_output_race() {
         for signal_wins in [true, false] {
@@ -2638,6 +2653,7 @@ mod tests {
             "workflow run cancel",
             "workflow run create",
             "workflow run hand-back",
+            "workflow run interrupt",
             "workflow run lift",
             "workflow run list",
             "workflow run release",

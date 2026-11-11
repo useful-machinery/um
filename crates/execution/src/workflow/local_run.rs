@@ -827,6 +827,10 @@ pub(super) struct AttemptStepV1 {
         skip_serializing_if = "Option::is_none"
     )]
     pub(super) diagnostic: Option<FailureDiagnosticV1>,
+    /// The time of the commit that first moved the node out of `pending` in this attempt,
+    /// kept through recovery executions and after the node ends (REQ-LOCALRUN-201).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) started_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) recovery: Option<DurableStepRecoveryV1>,
 }
@@ -1216,6 +1220,18 @@ pub(super) enum AttemptStepStateV1 {
     Skipped,
     NotRun,
     Cancelled,
+}
+
+impl AttemptStepStateV1 {
+    /// Whether a node in this state has started and not ended: the states that record a
+    /// node's `startedAt` (REQ-LOCALRUN-201) and that `um workflow run show` reports as a
+    /// running child's in-flight nodes (REQ-LOCALRUN-189).
+    pub(super) const fn is_in_flight(self) -> bool {
+        matches!(
+            self,
+            Self::Starting | Self::Running | Self::CapturingOutputs | Self::Cancelling
+        )
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -2778,7 +2794,9 @@ pub enum LocalStatusResult {
 }
 
 mod status_state;
-pub use status_state::LocalStatusStateView;
+pub use status_state::{
+    LocalStatusNode, LocalStatusProgress, LocalStatusStart, LocalStatusStateView,
+};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct LocalRunStatusSnapshot {
@@ -3423,7 +3441,7 @@ impl StateStore {
                 attempt.progress.accepted_occurrence_ordinal = commit.occurrence_ordinal.get();
             }
             attempt.progress.last_transition_sequence = commit.state.last_transition_sequence.get();
-            update_step_progress(attempt, &commit.state, finalizers, &retained_outputs)?;
+            update_step_progress(attempt, &commit.state, finalizers, &retained_outputs, &now)?;
             update_invocation_ledger(self, attempt, commit, diagnostics, accounting, &now)?;
             update_recovery_progress(
                 &mut attempt.progress.steps,
@@ -5215,11 +5233,11 @@ fn update_invocation_ledger<Deadline>(
                 session.diagnostic_identity
             )
         });
-        let cancelled = commit
-            .state
-            .steps
-            .get(&step_id)
-            .is_some_and(|runtime| matches!(runtime.state, StepState::Cancelled { .. }));
+        // An interrupted step was stopped as a cancellation stops it (REQ-WFEXEC-69).
+        let cancelled = commit.state.steps.get(&step_id).is_some_and(|runtime| {
+            matches!(runtime.state, StepState::Cancelled { .. })
+                || matches!(&runtime.state, StepState::Failed { detail } if detail.is_interrupted())
+        });
         let invocation = &mut attempt.progress.invocations[index];
         invocation.state = if cancelled {
             DurableInvocationStateV1::Cancelled
@@ -5411,6 +5429,7 @@ fn update_step_progress<Deadline>(
     runtime: &super::runtime::RuntimeState<StepFailureCause, super::value::CapturedValue, Deadline>,
     finalizers: &[AttemptStepV1],
     retained_outputs: &RetainedOutputSets,
+    now: &str,
 ) -> Result<(), LocalRunDirectoryError>
 where
     Deadline: DurableDeadline,
@@ -5428,6 +5447,7 @@ where
         &mut attempt.progress.steps,
         &runtime.steps,
         retained_outputs,
+        now,
     )?;
 
     if let Some(summary) = &runtime.finalization_summary {
@@ -5526,13 +5546,21 @@ where
             progress.force_abort = *force_abort;
         }
     }
-    update_progress_nodes(&mut progress.finalizers, &runtime.steps, retained_outputs)
+    update_progress_nodes(
+        &mut progress.finalizers,
+        &runtime.steps,
+        retained_outputs,
+        now,
+    )
 }
 
+/// Projects the runtime state onto the durable nodes at a commit made at `now`. A node
+/// that becomes active records `now` as its start once and keeps it (REQ-LOCALRUN-201).
 fn update_progress_nodes<Cause, Output>(
     nodes: &mut [AttemptStepV1],
     runtime_steps: &BTreeMap<String, super::runtime::StepRuntimeState<Cause, Output>>,
     retained_outputs: &RetainedOutputSets,
+    now: &str,
 ) -> Result<(), LocalRunDirectoryError> {
     for node in nodes {
         let runtime = runtime_steps
@@ -5560,6 +5588,9 @@ fn update_progress_nodes<Cause, Output>(
                 .cloned()
                 .or_else(|| (next_state != AttemptStepStateV1::Succeeded).then(Vec::new)),
         };
+        if next_state.is_in_flight() {
+            node.started_at.get_or_insert_with(|| now.to_owned());
+        }
         node.state = next_state;
         if node.outputs.is_none() {
             return Err(LocalRunDirectoryError::StateConflict);
@@ -9229,6 +9260,7 @@ fn fresh_progress_node(
         outputs: Some(Vec::new()),
         detail: None,
         diagnostic: None,
+        started_at: None,
         recovery: None,
     })
 }
@@ -10162,6 +10194,7 @@ fn validate_attempt_step<'a>(
     }
     if !attempt_step_detail_valid(step.role, step.state, step.detail.as_ref())
         || !attempt_step_diagnostic_valid(step.state, step.diagnostic.as_ref())
+        || !attempt_step_started_at_valid(step.state, step.started_at.as_deref())
     {
         return Err(LocalRunDirectoryError::AttemptStepDetailInvalid);
     }
@@ -10649,6 +10682,10 @@ fn validate_attempt_finalization<'a>(
                             finalizer.state,
                             finalizer.diagnostic.as_ref(),
                         )
+                        || !attempt_step_started_at_valid(
+                            finalizer.state,
+                            finalizer.started_at.as_deref(),
+                        )
                         || !retained_output_set_valid(
                             finalizer.role,
                             &finalizer.id,
@@ -11129,6 +11166,17 @@ fn attempt_step_diagnostic_valid(
     diagnostic.is_none_or(|diagnostic| {
         state == AttemptStepStateV1::Failed
             && super::result_metadata::valid_failure_diagnostic(diagnostic)
+    })
+}
+
+/// A node that left `pending` in its attempt may carry the canonical UTC time it did;
+/// a pending or inherited node never does (REQ-LOCALRUN-201).
+fn attempt_step_started_at_valid(state: AttemptStepStateV1, started_at: Option<&str>) -> bool {
+    started_at.is_none_or(|started_at| {
+        !matches!(
+            state,
+            AttemptStepStateV1::Pending | AttemptStepStateV1::Inherited
+        ) && valid_timestamp(started_at)
     })
 }
 

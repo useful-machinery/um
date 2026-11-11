@@ -172,7 +172,7 @@ pub(super) async fn continue_run(
     continuation: Continuation,
     config: um_execution::PresentationConfig,
     cancellation: CancellationSource,
-    signal_task: tokio::task::JoinHandle<()>,
+    signal_task: super::create::SignalObservation,
 ) -> super::super::super::CommandResult {
     let Continuation {
         run_directory,
@@ -182,6 +182,8 @@ pub(super) async fn continue_run(
         leaf,
         edge,
     } = continuation;
+    // REQ-LOCALRUN-135: a signal reads the run's control journal.
+    let _journal = signal_task.watch(&run_directory);
     // REQ-LOCALRUN-196: a successor whose move did not finish is settled before anything
     // else; an edge continuation chains inside the process that already settled it.
     if edge.is_none() {
@@ -1005,7 +1007,7 @@ pub(super) async fn admit_continuation_in(
 
 async fn fail_after_settlement(
     pending: PendingLocalContinuation,
-    signal_task: &tokio::task::JoinHandle<()>,
+    signal_task: &super::create::SignalObservation,
     message: &'static str,
 ) -> super::super::super::CommandResult {
     error_after_settlement(pending, signal_task, anyhow::anyhow!(message)).await
@@ -1014,7 +1016,7 @@ async fn fail_after_settlement(
 /// `fail_after_settlement` with the cause the caller read.
 async fn error_after_settlement(
     pending: PendingLocalContinuation,
-    signal_task: &tokio::task::JoinHandle<()>,
+    signal_task: &super::create::SignalObservation,
     error: anyhow::Error,
 ) -> super::super::super::CommandResult {
     settle(pending, signal_task).await?;
@@ -1023,7 +1025,7 @@ async fn error_after_settlement(
 
 async fn diagnose_after_settlement(
     pending: PendingLocalContinuation,
-    signal_task: &tokio::task::JoinHandle<()>,
+    signal_task: &super::create::SignalObservation,
     error: um_execution::LocalRunDirectoryError,
 ) -> super::super::super::CommandResult {
     settle(pending, signal_task).await?;
@@ -1032,7 +1034,7 @@ async fn diagnose_after_settlement(
 
 async fn reject_after_settlement(
     pending: PendingLocalContinuation,
-    signal_task: &tokio::task::JoinHandle<()>,
+    signal_task: &super::create::SignalObservation,
     result: WorkflowRunPresentationResult,
 ) -> super::super::super::CommandResult {
     settle(pending, signal_task).await?;
@@ -1042,7 +1044,7 @@ async fn reject_after_settlement(
 /// Settles an abandoned owner for a continuation that ends without claiming an attempt.
 async fn settle(
     pending: PendingLocalContinuation,
-    signal_task: &tokio::task::JoinHandle<()>,
+    signal_task: &super::create::SignalObservation,
 ) -> anyhow::Result<()> {
     let settlement = tokio::task::spawn_blocking(move || pending.settle_abandoned()).await;
     signal_task.abort();

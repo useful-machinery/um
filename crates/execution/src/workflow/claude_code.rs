@@ -678,6 +678,10 @@ struct Subagent {
     /// is resumed, and its turn is carried past the resume (`carried_notifications`).
     notified_after_user_frames: u64,
     delivered: bool,
+    /// Whether the current run's notification reported `status: stopped`: a `TaskStop`
+    /// ended it, and the subagent thread may still report its interruption after the turn's
+    /// `result`, in the drain (REQ-AGENT-69).
+    stopped: bool,
 }
 
 impl Subagent {
@@ -698,6 +702,7 @@ impl Subagent {
         self.announced = true;
         self.backgrounded = backgrounded;
         self.notified = false;
+        self.stopped = false;
         self.message("resumed")
     }
 
@@ -1390,16 +1395,19 @@ impl ClaudeCodeStreamJsonV1Parser {
     ) -> Result<(), AgentFailureCause> {
         self.require_matching_session(object)?;
         // A backgrounded subagent keeps working after the exchange that started it; its
-        // messages name its Agent call. A main-thread message stays invalid here.
-        let subagent_message = parent_tool_use_id(object)
-            .flatten()
-            .is_some_and(|parent| self.awaits_subagent(parent));
+        // messages name its Agent call. A subagent a `TaskStop` stopped has settled, but its
+        // thread reports its interruption (the killed call's rejected `tool_result`, the
+        // interruption text) as a `user` frame that can lose the race with the turn's
+        // `result`. A main-thread message stays invalid here.
+        let parent = parent_tool_use_id(object).flatten();
+        let subagent_message = parent.is_some_and(|parent| self.awaits_subagent(parent));
+        let stopped_subagent_message = parent.is_some_and(|parent| self.stopped_subagent(parent));
         match event_type {
             "assistant" if subagent_message => {
                 self.rejection_context.stage = ClaudeCodeStreamJsonV1ProtocolStage::AssistantEvent;
                 self.parse_assistant(object, value)
             }
-            "user" if subagent_message => {
+            "user" if subagent_message || stopped_subagent_message => {
                 self.rejection_context.stage = ClaudeCodeStreamJsonV1ProtocolStage::UserEvent;
                 self.parse_user(object, value)
             }
@@ -2744,6 +2752,16 @@ impl ClaudeCodeStreamJsonV1Parser {
         })
     }
 
+    /// Whether the Agent call `tool_use_id` started a subagent, tracked or forgotten, whose
+    /// run a `TaskStop` stopped, so that a `user` frame naming it as parent in the drain is
+    /// that subagent's interruption (REQ-AGENT-69).
+    fn stopped_subagent(&self, tool_use_id: &str) -> bool {
+        self.subagents
+            .iter()
+            .chain(&self.forgotten_subagents)
+            .any(|subagent| subagent.agent_call_id.as_ref() == tool_use_id && subagent.stopped)
+    }
+
     /// Whether `subagent` is live: backgrounded and still owing its notification, or a
     /// foreground one, unsettled while tracked, whose launcher (`parent_task_id`) is a
     /// tracked subagent that is live, transitively (REQ-AGENT-82, INV-HARNESS-15). The walk
@@ -3075,6 +3093,7 @@ impl ClaudeCodeStreamJsonV1Parser {
             notified: false,
             notified_after_user_frames: 0,
             delivered: false,
+            stopped: false,
         };
         self.observations.push(AgentObservation::Diagnostic {
             level: AgentDiagnosticLevel::Information,
@@ -3196,6 +3215,7 @@ impl ClaudeCodeStreamJsonV1Parser {
             notified: false,
             notified_after_user_frames: 0,
             delivered: false,
+            stopped: false,
         };
         self.observations.push(AgentObservation::Diagnostic {
             level: AgentDiagnosticLevel::Information,
@@ -3261,6 +3281,7 @@ impl ClaudeCodeStreamJsonV1Parser {
             subagent.notified = true;
             subagent.notified_after_user_frames = self.main_user_frames;
             subagent.delivered = false;
+            subagent.stopped = &*status == "stopped";
         } else {
             let settled = self.subagents.remove(index);
             self.forget_subagent(settled);

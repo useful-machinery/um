@@ -719,6 +719,8 @@ steps:
 }
 
 // REQ-LOCALRUN-104, REQ-LOCALRUN-105, REQ-LOCALRUN-106, REQ-LOCALRUN-107, REQ-LOCALRUN-110, REQ-LOCALRUN-114
+// An accepted cancellation and an accepted interruption are the same `CancellationAccepted`
+// transition, so one `@workflow cancelling` record precedes the step's for either.
 #[tokio::test]
 async fn live_stream_labels_normalized_output_and_orders_cancellation_acknowledgement() {
     let fixture = Fixture::new(workflow_source());
@@ -1330,6 +1332,12 @@ async fn failed_and_cancelled_summaries_use_authoritative_terminal_facts() {
         .await;
     let failed_view = failed_output.text();
     assert!(failed_view.contains("failed · exit 1"));
+    // A failed result that records no cancellation has no `cancellation:` line.
+    assert!(
+        !failed_view
+            .lines()
+            .any(|line| line.starts_with("cancellation:"))
+    );
     assert!(
         failed_view.contains("primary issue: step b · Failed · execution · command_exit · exit 23")
     );
@@ -1398,6 +1406,81 @@ async fn failed_and_cancelled_summaries_use_authoritative_terminal_facts() {
         cancelled_output
             .text()
             .contains("cancellation: termination_request")
+    );
+}
+
+// SC-LOCALRUN-6, REQ-LOCALRUN-123, REQ-LOCALRUN-136, REQ-WFEXEC-69: the summary of a failed
+// result an interruption ended names the interrupted step as its primary issue and ends in its
+// `cancellation:` line.
+#[tokio::test]
+async fn an_interrupted_failed_summary_ends_in_its_cancellation() {
+    let fixture = Fixture::new(workflow_source());
+    let detail = crate::workflow::evidence::FailureDetail::interrupted_in_execution();
+    let mut interrupted = fixture.succeeded_run();
+    interrupted.steps[1].state = StepState::Failed {
+        detail: detail.clone(),
+    };
+    for step in &mut interrupted.steps[2..] {
+        step.state = StepState::Cancelled {
+            detail: crate::workflow::evidence::CancellationDetail::new(
+                CancellationReason::UserRequest,
+            ),
+        };
+        step.timing = None;
+        step.command_output = None;
+    }
+    interrupted.outcome = RunOutcome::Failed {
+        primary_issue: crate::workflow::evidence::PrimaryIssue::failed(
+            crate::workflow::validated::WorkflowNode {
+                id: "b".to_owned(),
+                role: WorkflowNodeRole::Step,
+            },
+            detail,
+        ),
+        later_cancellation: Some(CancellationReason::UserRequest),
+    };
+    interrupted.cancellation = Some(WorkflowRunCancellation {
+        reason: CancellationReason::UserRequest,
+        force_stop_deadline: timestamp("2026-08-02T12:01:55Z"),
+    });
+    let terminal = publish_workflow_result(
+        &fixture.destination("interrupted"),
+        &fixture.artifacts,
+        &interrupted,
+    )
+    .unwrap();
+    let output = SharedWriter::default();
+    let presentation = WorkflowRunOutput::new(
+        config(RequestedPresentationMode::Plain, ColorChoice::Never),
+        output.clone(),
+        SharedWriter::default(),
+    )
+    .start(
+        &fixture.workflow,
+        2,
+        TestClock::fixed("2026-08-02T12:01:44Z"),
+    )
+    .unwrap();
+    assert!(matches!(
+        presentation
+            .finish(&interrupted, PublicationPresentation::Published(&terminal))
+            .await,
+        WorkflowRunPresentationResult::Published {
+            outcome: ExecutionOutcome::Interrupted,
+            ..
+        }
+    ));
+    let text = output.text();
+    let lines = text.lines().collect::<Vec<_>>();
+    let primary = lines
+        .iter()
+        .position(|line| line.starts_with("primary issue: step b"))
+        .unwrap();
+    assert!(lines[primary].contains("interrupted"), "{text}");
+    assert_eq!(
+        lines.last().unwrap().split_whitespace().collect::<Vec<_>>(),
+        ["cancellation:", "user_request"],
+        "{text}"
     );
 }
 
@@ -1818,4 +1901,139 @@ steps:
     assert!(!output.contains(MESSAGE_SENTINEL));
     assert!(!output.contains("system.md"));
     assert!(!output.contains("message.md"));
+}
+
+// REQ-LOCALRUN-200, INV-ENGINE-28: a child scope writes the child's step state records into
+// the parent's stream under `<step>[n].<child step>`, after the parent's own, and drops the
+// child's output, committed-output and workflow records.
+#[tokio::test]
+async fn a_child_scope_writes_only_step_state_records_under_its_position() {
+    let parent = Fixture::new(workflow_source());
+    let child = Fixture::new(
+        "schemaVersion: 1
+steps:
+  produce:
+    kind: cmd
+    command:
+      argv: [\"true\"]
+    outputs:
+      report:
+        kind: text
+        from: path
+        path: report.txt
+",
+    );
+    let stdout = SharedWriter::default();
+    let presentation = WorkflowRunOutput::new(
+        config(RequestedPresentationMode::Plain, ColorChoice::Never),
+        stdout.clone(),
+        SharedWriter::default(),
+    )
+    .start(
+        &parent.workflow,
+        1,
+        TestClock::fixed("2026-08-02T12:01:44Z"),
+    )
+    .unwrap();
+    let scope = presentation
+        .child_scope(&child.workflow, "a", Some(2))
+        .unwrap();
+
+    presentation
+        .observe(step_transition("a", StepStateKind::Starting, None))
+        .await;
+    scope
+        .observe(step_transition("produce", StepStateKind::Starting, None))
+        .await;
+    scope
+        .observe(ExecutionObservation::<OffsetDateTime>::CommandOutput(
+            CommandOutputObservation {
+                step: "produce".to_owned(),
+                invocation: action(),
+                source: CommandOutputSource::StandardOutput,
+                sequence: SourceSequence::first(),
+                bytes: Arc::from(b"child output\n".as_slice()),
+            },
+        ))
+        .await;
+    scope
+        .observe(ExecutionObservation::Transition(Box::new(
+            TransitionObservation {
+                event: TransitionEvent::CancellationAccepted {
+                    sequence: TransitionSequence::default(),
+                    reason: CancellationReason::UserRequest,
+                    deadline: timestamp("2026-08-02T12:01:58Z"),
+                },
+                step: None,
+                executions: ObservedExecutions::default(),
+            },
+        )))
+        .await;
+    scope
+        .observe(step_transition(
+            "produce",
+            StepStateKind::Succeeded,
+            Some(ObservedStepTransition::OutputsCommitted {
+                outputs: vec!["report".to_owned()],
+            }),
+        ))
+        .await;
+    presentation.flush_pending().await;
+
+    let records = stdout
+        .text()
+        .lines()
+        .filter(|line| line.starts_with('['))
+        .map(|line| {
+            line.split_whitespace()
+                .skip(1)
+                .take(3)
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        records,
+        [
+            "a start cmd",
+            "a[2].produce start cmd",
+            "a[2].produce done exit"
+        ]
+    );
+    assert!(presentation.failure().is_none());
+}
+
+// REQ-LOCALRUN-200, INV-ENGINE-28: a destination that fails on a child's record is the
+// parent's presentation failure, the one its failure watcher cancels the run on
+// (REQ-LOCALRUN-137).
+#[tokio::test]
+async fn a_failed_write_of_a_childs_record_is_the_parents_presentation_failure() {
+    let parent = Fixture::new(workflow_source());
+    let stdout = SharedWriter::default();
+    let presentation = WorkflowRunOutput::new(
+        config(RequestedPresentationMode::Plain, ColorChoice::Never),
+        stdout.clone(),
+        SharedWriter::default(),
+    )
+    .start(
+        &parent.workflow,
+        1,
+        TestClock::fixed("2026-08-02T12:01:44Z"),
+    )
+    .unwrap();
+    let scope = presentation
+        .child_scope(&parent.workflow, "a", None)
+        .unwrap();
+    let failures = presentation.subscribe_failures();
+    presentation.flush_pending().await;
+    assert!(failures.borrow().is_none());
+
+    stdout.fail();
+    scope
+        .observe(step_transition("a", StepStateKind::Starting, None))
+        .await;
+    presentation.flush_pending().await;
+
+    let failure = failures.borrow().clone().unwrap();
+    assert_eq!(failure.error_kind, Some(io::ErrorKind::BrokenPipe));
 }

@@ -2706,3 +2706,129 @@ fn recovered_invocation_with_incomplete_diagnostics_selects_local_failure_status
         "an incomplete provisional invocation stream is a contracted local integrity failure"
     );
 }
+
+/// `run` failed by an interruption with `reason` at its `terminal` step (REQ-WFEXEC-69).
+fn make_interrupted(run: &mut WorkflowRunResult, reason: CancellationReason) {
+    let detail = crate::workflow::evidence::FailureDetail::interrupted_in_execution();
+    run.steps[1].state = StepState::Failed {
+        detail: detail.clone(),
+    };
+    run.outcome = RunOutcome::Failed {
+        primary_issue: PrimaryIssue::failed(
+            WorkflowNode {
+                id: "terminal".to_owned(),
+                role: WorkflowNodeRole::Step,
+            },
+            detail,
+        ),
+        later_cancellation: Some(reason),
+    };
+    run.cancellation = Some(WorkflowRunCancellation {
+        reason,
+        force_stop_deadline: timestamp_fixture("2026-08-02T12:01:55Z"),
+    });
+}
+
+/// A `repair` wait at `build`, entered for a child the interruption `interrupted` failed when
+/// it carries one (REQ-WFEXEC-70).
+fn repair_wait(interrupted: Option<CancellationReason>) -> RunOutcome {
+    RunOutcome::Waiting {
+        wait: super::super::runtime::EnteredWait {
+            step: "build".to_owned(),
+            outcome: Some("failed".to_owned()),
+            kind: crate::workflow::document::WaitKind::Repair,
+            then: "build".to_owned(),
+            on_hand_back: None,
+            rule: None,
+            interrupted: interrupted.map(|reason| super::super::runtime::ChildInterruption {
+                reason,
+                step: "work".to_owned(),
+            }),
+        },
+    }
+}
+
+// REQ-WFEXEC-40, REQ-WFEXEC-69, REQ-WFEXEC-70, SC-WFEXEC-4: an attempt an interruption ended
+// exits by its reason, 130 for `user_request` and 143 for `termination_request`, whether it
+// failed on the interrupted step or waits on the repair an interrupted stage routed to; a
+// required failure recorded before the interruption keeps exit 1, and any other wait exits 0.
+#[test]
+fn an_interrupted_attempt_exits_by_the_interruptions_reason() {
+    let fixture = PublicationFixture::new();
+    let base = run_fixture(&fixture);
+    for (reason, expected) in [
+        (
+            CancellationReason::UserRequest,
+            ExecutionOutcome::Interrupted,
+        ),
+        (
+            CancellationReason::TerminationRequest,
+            ExecutionOutcome::Terminated,
+        ),
+    ] {
+        let mut interrupted = base.clone();
+        make_interrupted(&mut interrupted, reason);
+        assert_eq!(
+            execution_outcome(&interrupted, WorkflowOutcomeV1::Failed),
+            expected
+        );
+        let mut waiting = base.clone();
+        waiting.outcome = repair_wait(Some(reason));
+        assert_eq!(
+            execution_outcome(&waiting, WorkflowOutcomeV1::Waiting),
+            expected
+        );
+    }
+
+    let mut required_first = base.clone();
+    make_failed(&mut required_first);
+    if let RunOutcome::Failed {
+        later_cancellation, ..
+    } = &mut required_first.outcome
+    {
+        *later_cancellation = Some(CancellationReason::UserRequest);
+    }
+    assert_eq!(
+        execution_outcome(&required_first, WorkflowOutcomeV1::Failed),
+        ExecutionOutcome::Failed
+    );
+    let mut waiting = base.clone();
+    waiting.outcome = repair_wait(None);
+    assert_eq!(
+        execution_outcome(&waiting, WorkflowOutcomeV1::Waiting),
+        ExecutionOutcome::Succeeded
+    );
+
+    // REQ-LOCALRUN-134: an undrained stream still exits 1.
+    let mut undrained = base.clone();
+    make_interrupted(&mut undrained, CancellationReason::UserRequest);
+    undrained.steps[0].command_output = Some(diagnostic(false));
+    assert_eq!(
+        execution_outcome(&undrained, WorkflowOutcomeV1::Failed),
+        ExecutionOutcome::Failed
+    );
+}
+
+// REQ-WFEXEC-40, REQ-LOCALRUN-135: a `continued` attempt whose next attempt the interruption
+// held back exits by the interruption's reason; one that continues exits 0.
+#[test]
+fn a_continued_attempt_held_back_by_an_interruption_exits_by_its_reason() {
+    let fixture = PublicationFixture::new();
+    let mut run = run_fixture(&fixture);
+    run.outcome = RunOutcome::Continued {
+        edge: super::super::runtime::TakenEdgeRecord {
+            step: "terminal".to_owned(),
+            outcome: "planned".to_owned(),
+            target: "terminal".to_owned(),
+            counted: false,
+        },
+    };
+    let mut terminal =
+        publish_workflow_result(&fixture.destination("continued"), &fixture.artifacts, &run)
+            .unwrap();
+    assert_eq!(terminal.exit_status(), 0);
+    terminal.hold_back_continuation(CancellationReason::TerminationRequest);
+    assert_eq!(terminal.exit_status(), 143);
+    assert_eq!(terminal.execution_outcome(), ExecutionOutcome::Terminated);
+    assert_eq!(serde_json::to_value(&terminal).unwrap()["exitStatus"], 143);
+}
