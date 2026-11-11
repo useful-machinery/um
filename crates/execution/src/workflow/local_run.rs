@@ -85,7 +85,7 @@ use super::step_runtime::StepFailureCause;
 use super::tree::{TreeDiagnostic, ValidatedTree, validate_workflow_tree};
 use super::tree_copy::{self, FileOperationError, TreeCopyError, file_locator, write_tree_copy};
 use super::value::CapturedValue;
-use super::wait::{ControlEvent, RuleError, WaitRecord};
+use super::wait::{ControlEvent, RuleError, WaitRecord, fan_out_element};
 use super::workspace_snapshot::{
     WorkspaceSnapshotSettlementV1, WorkspaceSnapshotV1, capture_settlement_snapshot,
     capture_start_snapshot, compare_continuation_snapshots,
@@ -1927,8 +1927,7 @@ impl PendingLocalContinuation {
                 }
             }
         }
-        if let [Value::String(step), element] = wait.step.as_slice()
-            && let Some(item) = element.get("item").and_then(Value::as_u64)
+        if let Some((step, item)) = wait.fan_out_element()
             && self
                 .inherited_items_length(workflow, step, inputs)?
                 .is_none_or(|length| length < item)
@@ -6573,9 +6572,8 @@ pub fn attempt_controls(
         if number + 1 != attempt_number {
             return Ok(resolved);
         }
-        if let [Value::String(step), element] = wait.step.as_slice()
-            && *step == target
-            && let Some(item) = element.get("item").and_then(Value::as_u64)
+        if let Some((step, item)) = fan_out_element(&wait.step)
+            && step == target
         {
             resolved.controls.resume_item = Some((target.clone(), item));
         }
@@ -6605,12 +6603,9 @@ pub fn wait_child(wait: &WaitRecord) -> WaitChild {
     let Some(locator) = wait.payload.get("child") else {
         return WaitChild::Absent;
     };
-    let (step, element) = match wait.step.as_slice() {
-        [Value::String(step)] => (step, None),
-        [Value::String(step), element] => match element.get("item").and_then(Value::as_u64) {
-            Some(item) => (step, Some(item)),
-            None => return WaitChild::Unowned,
-        },
+    let (step, element) = match (wait.step.as_slice(), wait.fan_out_element()) {
+        ([Value::String(step)], _) => (step.as_str(), None),
+        (_, Some((step, item))) => (step, Some(item)),
         _ => return WaitChild::Unowned,
     };
     let Some(locator) = locator.as_str() else {
@@ -6622,9 +6617,9 @@ pub fn wait_child(wait: &WaitRecord) -> WaitChild {
     let segments = locator.split('/').collect::<Vec<_>>();
     let expected_element = element.and_then(attempt_directory_name);
     let ordinal = match (segments.as_slice(), expected_element.as_deref()) {
-        ([CHILDREN_DIRECTORY, named, ordinal], None) if *named == step.as_str() => *ordinal,
+        ([CHILDREN_DIRECTORY, named, ordinal], None) if *named == step => *ordinal,
         ([CHILDREN_DIRECTORY, named, named_element, ordinal], Some(expected))
-            if *named == step.as_str() && *named_element == expected =>
+            if *named == step && *named_element == expected =>
         {
             *ordinal
         }
@@ -6711,14 +6706,9 @@ pub fn positioned_element(
 }
 
 fn position_element(root: &OwnedFd, step: &str) -> Result<Option<u64>, LocalRunDirectoryError> {
-    Ok(
-        read_optional_run_record(root)?.and_then(|record| match record.position.as_slice() {
-            [Value::String(named), element] if named == step => {
-                element.get("item").and_then(Value::as_u64)
-            }
-            _ => None,
-        }),
-    )
+    Ok(read_optional_run_record(root)?.and_then(|record| {
+        fan_out_element(&record.position).and_then(|(named, item)| (named == step).then_some(item))
+    }))
 }
 
 /// The lock a live process holds on the run whose root is `root`, read without taking it.

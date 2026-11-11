@@ -189,6 +189,25 @@ fn a_wait_entered_at_a_fan_out_element_names_the_element_in_its_step() {
     }
 }
 
+// REQ-WFDEF-5, REQ-WFEXEC-68, REQ-LOCALRUN-199
+#[test]
+fn a_position_names_a_fan_out_element_only_as_its_step_and_one_item() {
+    let mut record = record(WaitKind::Answer, "build", "build", None);
+    for (position, expected) in [
+        (json!(["build", {"item": 2}]), Some(("build", 2))),
+        (json!(["build"]), None),
+        (json!(["build", {"item": 2}, {"item": 3}]), None),
+        (json!(["build", {"item": "2"}]), None),
+        (json!(["build", {}]), None),
+        (json!([{"item": 2}]), None),
+    ] {
+        let position = position.as_array().unwrap().clone();
+        assert_eq!(fan_out_element(&position), expected, "{position:?}");
+        record.step = position;
+        assert_eq!(record.fan_out_element(), expected, "{:?}", record.step);
+    }
+}
+
 /// A run directory holding `run.json` and attempt 1's copy of `wait`, the wait an answer
 /// with `answers` and the string field `summary` resolves.
 fn answered_run(wait: &WaitRecord) -> tempfile::TempDir {

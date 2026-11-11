@@ -7,6 +7,7 @@
 //! `reconcile` completes or undoes a move a command died in (REQ-LOCALRUN-196).
 
 use std::ffi::OsString;
+use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -92,7 +93,16 @@ pub(super) async fn start(
         super::create::UnixSignals::new()?,
     );
     match create(requested, request, &config, &cancellation).await {
-        Ok(Created::Continue(continuation)) => {
+        Ok(Created::Continue {
+            continuation,
+            restarted_element,
+        }) => {
+            // REQ-LOCALRUN-199: written once the successor exists, so a refusal leaves stderr
+            // to its report, and before the attempt; the advisory is nonblocking, so a failed
+            // write does not stop the run.
+            if let Some(restarted) = restarted_element {
+                let _ = writeln!(io::stderr(), "{restarted}");
+            }
             continue_run(continuation, config, cancellation, signal_task).await
         }
         Ok(Created::Upgraded(upgraded)) => {
@@ -106,10 +116,49 @@ pub(super) async fn start(
     }
 }
 
-/// The successor once it exists: a restart's continuation, or an upgraded run to report.
+/// The successor once it exists: a restart's continuation, with the fan-out element it no
+/// longer waits at, or an upgraded run to report.
 enum Created {
-    Continue(Continuation),
+    Continue {
+        continuation: Continuation,
+        restarted_element: Option<RestartedElement>,
+    },
     Upgraded(Upgraded),
+}
+
+/// The fan-out step a restart names while its predecessor waits inside it at an element past
+/// its first (REQ-LOCALRUN-199): the step runs again from element 1, and its display is the
+/// advisory naming `upgrade`, which would have kept the wait at `element`.
+struct RestartedElement {
+    step: String,
+    element: u64,
+}
+
+impl RestartedElement {
+    /// The element of `from` the predecessor's `wait` holds, when `from` is the fan-out it
+    /// waits inside at element 2 or later.
+    fn of(wait: &WaitRecord, from: &str) -> Option<Self> {
+        let (step, element) = wait.fan_out_element()?;
+        (step == from && element >= 2).then(|| Self {
+            step: step.to_owned(),
+            element,
+        })
+    }
+}
+
+impl fmt::Display for RestartedElement {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let step = normalize_terminal_scalar(self.step.as_bytes());
+        let rerun = match self.element.saturating_sub(1) {
+            1 => "element 1".to_owned(),
+            last => format!("elements 1 to {last}"),
+        };
+        write!(
+            formatter,
+            "! Step {step} runs again from its first element, {rerun} included. To keep a waiting run at element {} instead, run um workflow run upgrade RUN and resolve its wait there.",
+            self.element
+        )
+    }
 }
 
 /// A successor `upgrade` created waiting on its predecessor's wait (REQ-LOCALRUN-197).
@@ -441,6 +490,7 @@ enum Next {
     Continue {
         from: String,
         execution_root: PathBuf,
+        restarted_element: Option<RestartedElement>,
     },
     /// `upgrade`: it carries `wait` and is reported.
     Report { wait: WaitRecord },
@@ -519,11 +569,13 @@ async fn precheck(
             }
             let execution_root =
                 execution_root.unwrap_or_else(|| pending.prior_execution_root().to_owned());
+            let restarted_element = RestartedElement::of(&predecessor.wait, &from);
             (
                 vec![from.clone()],
                 Next::Continue {
                     from,
                     execution_root,
+                    restarted_element,
                 },
             )
         }
@@ -709,14 +761,18 @@ fn create_and_supersede(
         Next::Continue {
             from,
             execution_root,
-        } => Created::Continue(Continuation {
-            run_directory: successor,
-            from_steps: vec![from],
-            workflow: None,
-            execution_root: Some(execution_root),
-            leaf: ExecutionLeaf::Restart,
-            edge: None,
-        }),
+            restarted_element,
+        } => Created::Continue {
+            continuation: Continuation {
+                run_directory: successor,
+                from_steps: vec![from],
+                workflow: None,
+                execution_root: Some(execution_root),
+                leaf: ExecutionLeaf::Restart,
+                edge: None,
+            },
+            restarted_element,
+        },
         Next::Report { wait } => Created::Upgraded(Upgraded {
             run_directory: successor,
             run: record.id,

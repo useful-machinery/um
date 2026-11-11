@@ -9,7 +9,7 @@ use super::successor::SuccessorRequest;
 use crate::exit_code::ExitCode;
 
 pub(super) const ABOUT: &str = "Move a waiting run to its definition's current revision";
-pub(super) const AFTER_HELP: &str = "Starts a successor of a waiting definition run on the definition's current revision. The successor inherits the results of the steps completed before --at STEP, runs STEP and its dependents again under the current revision, and takes the run's subject; the run exits superseded.
+pub(super) const AFTER_HELP: &str = "Starts a successor of a waiting definition run on the definition's current revision. The successor inherits the results of the steps completed before --at STEP, runs STEP and its dependents again under the current revision, and takes the run's subject; the run exits superseded. A fan-out STEP runs again from its first element; um workflow run upgrade keeps a run waiting inside one at its element.
 
 The run's inputs carry over to the inputs the current revision declares; --input-text sets a Text input on top of them, except the one the workflow names as its subject.";
 

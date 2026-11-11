@@ -1919,6 +1919,89 @@ fn an_upgraded_fan_out_resumes_at_its_element() {
     assert_eq!(run_record(&second)["state"], "waiting");
 }
 
+// REQ-LOCALRUN-199, REQ-LOCALRUN-194, REQ-WFEXEC-68: a restart at the fan-out a run waits
+// inside at element 2 runs the step again from its first element and advises `upgrade` on
+// standard error, its `--json` document unchanged on standard output; a restart at another
+// step, a refused restart and a restart of a run waiting at the fan-out's first element write
+// no advisory, and the refusal leaves the run waiting.
+#[test]
+fn a_restart_at_a_fan_out_waiting_past_its_first_element_advises_upgrade() {
+    let published = PublishedWaitTree::fan_out();
+    let home = Some(&published.home);
+    let waits_at_element = |run: &Path, item: u64| {
+        assert_eq!(run_record(run)["state"], "waiting");
+        let wait = read_json(&run.join("wait.json"));
+        assert_eq!(wait["kind"], "answer", "{wait}");
+        assert_eq!(
+            wait["step"],
+            serde_json::json!(["build", {"item": item}]),
+            "{wait}"
+        );
+    };
+    let restarted_at = |output: &Output, item: u64| {
+        let terminal = completed(output);
+        assert_eq!(terminal["command"], "um workflow run restart", "{terminal}");
+        assert_eq!(terminal["outcome"], "waiting", "{terminal}");
+        let successor = PathBuf::from(terminal["runDirectory"].as_str().unwrap());
+        waits_at_element(&successor, item);
+        (successor, String::from_utf8(output.stderr.clone()).unwrap())
+    };
+    let restarted = |output: &Output| restarted_at(output, 2);
+    let advises = |stderr: &str| stderr.contains("um workflow run upgrade");
+    let terminal = completed(&published.create(&[]));
+    let predecessor = PathBuf::from(terminal["runDirectory"].as_str().unwrap());
+    waits_at_element(&predecessor, 2);
+    let predecessor_id = run_record(&predecessor)["id"].as_str().unwrap().to_owned();
+
+    let (successor, stderr) = restarted(&run_control(
+        home,
+        "restart",
+        &predecessor_id,
+        &["--at", "build"],
+    ));
+    assert_eq!(
+        ordinals_of(&successor.join("children/build")),
+        ["000001", "000002"]
+    );
+    let advisory = stderr
+        .lines()
+        .find(|line| advises(line))
+        .unwrap_or_else(|| panic!("{stderr}"));
+    assert!(advisory.contains("build"), "{advisory}");
+    assert!(advisory.contains('2'), "{advisory}");
+    assert_eq!(stderr.lines().filter(|line| advises(line)).count(), 1);
+
+    let successor_id = run_record(&successor)["id"].as_str().unwrap().to_owned();
+    let before = records(&successor);
+    let refused = run_control(home, "restart", &successor_id, &["--at", "nosuch"]);
+    restart_refused(&refused, "continuation", "continuation_definition_invalid");
+    assert!(!advises(&String::from_utf8_lossy(&refused.stderr)));
+    assert_eq!(records(&successor), before);
+    waits_at_element(&successor, 2);
+
+    let (third, stderr) = restarted(&run_control(
+        home,
+        "restart",
+        &successor_id,
+        &["--at", "design"],
+    ));
+    assert!(!advises(&stderr), "{stderr}");
+
+    // A run waiting at the first element is where the restart starts anyway: once the first
+    // part blocks, the restart that leaves element 2 advises and the one that leaves element 1
+    // does not.
+    let blocked_first = published.bundle.execution_root().join("verdict-build-a");
+    fs::write(blocked_first, "blocked").unwrap();
+    let restart_at_build = |run: &Path| {
+        let id = run_record(run)["id"].as_str().unwrap().to_owned();
+        restarted_at(&run_control(home, "restart", &id, &["--at", "build"]), 1)
+    };
+    let (fourth, stderr) = restart_at_build(&third);
+    assert!(advises(&stderr), "{stderr}");
+    let (_, stderr) = restart_at_build(&fourth);
+    assert!(!advises(&stderr), "{stderr}");
+}
+
 /// A root whose `design` stage child plans and then routes, and whose physically failed
 /// child waits for a repair at `design` itself (SC-CONTINUE-10). `design` maps the resolving
 /// control's `notes`, and the root exports the child's `plan`.

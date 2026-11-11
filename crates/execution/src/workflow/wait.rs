@@ -340,6 +340,12 @@ impl WaitRecord {
         position_path(&self.step)
     }
 
+    /// The fan-out step and one-based element the wait is at, read from `step` as
+    /// `fan_out_element` reads a position.
+    pub fn fan_out_element(&self) -> Option<(&str, u64)> {
+        fan_out_element(&self.step)
+    }
+
     /// The facts this crate writes and relies on: a canonical `since`, a step position that
     /// starts with a step identifier and holds identifiers and fan-out elements of at least
     /// 1, step identifiers for `then` and `onHandBack`, and a rule with a source, distinct
@@ -941,5 +947,16 @@ pub fn position_path(position: &[Value]) -> String {
     }
     path
 }
+
+/// The fan-out step and element a position names (REQ-WFDEF-5, REQ-WFEXEC-68): its step and
+/// n exactly when the position is `[<step>, {"item": n}]`, and `None` for a bare `[<step>]`
+/// or any other shape.
+pub(crate) fn fan_out_element(position: &[Value]) -> Option<(&str, u64)> {
+    let [Value::String(step), Value::Object(element)] = position else {
+        return None;
+    };
+    Some((step, element.get("item").and_then(Value::as_u64)?))
+}
+
 #[cfg(test)]
 mod tests;
