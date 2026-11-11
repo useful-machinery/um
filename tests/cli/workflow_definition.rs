@@ -381,6 +381,25 @@ fn mirror_templates_name_only_their_hooks_variables() {
     assert_mirror_location(&location, "onWait.comment");
 }
 
+// REQ-WFFORMAT-101, REQ-WFDEF-10: `operator`, `run.id` and `run.url` are every hook's.
+#[test]
+fn mirror_templates_name_the_operator_and_the_run_in_every_hook() {
+    const EVERY_HOOK: &str = "{{operator}} {{run.id}} {{run.url}}";
+    let mut root = ROOT_WORKFLOW.to_owned();
+    for template in [
+        "Engineering started by {{operator}}. Run: {{run.url}}",
+        "{{stage}}: {{summary}}",
+        "Waiting for {{wait.kind}}: {{wait.summary}}",
+    ] {
+        assert!(root.contains(template), "{template:?}");
+        root = root.replacen(template, EVERY_HOOK, 1);
+    }
+    let tree = Tree::with(&root, DESIGN_WORKFLOW);
+    let output = validate(tree.path(), true);
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert_eq!(report(&output)["outcome"], "valid");
+}
+
 // REQ-WFFORMAT-101, REQ-WFDEF-10
 #[test]
 fn the_mirror_issue_names_a_declared_text_input() {

@@ -74,6 +74,7 @@ pub(super) fn mirror_for_run(
         issue,
         bindings,
         record.owner.clone(),
+        record.id.clone(),
         run_url,
         run_directory.to_owned(),
     ))

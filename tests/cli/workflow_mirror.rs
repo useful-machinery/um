@@ -55,7 +55,7 @@ bindings:
 mirror:
   linear:
     issue: inputs.ticket
-    onStart: {comment: "Engineering started by {{operator}}. Run: {{run.url}}"}
+    onStart: {comment: "Engineering started by {{operator}}. Run {{run.id}}: `um workflow run show {{run.id}}`"}
     onStage: {comment: "{{stage}}: {{summary}}"}
     onWait: {comment: "Waiting for {{wait.kind}}: {{wait.summary}}"}
     onOutcome:
@@ -513,8 +513,9 @@ impl MirroredWaitTree {
     }
 }
 
-// SC-LOCALRUN-12, REQ-LOCALRUN-191, REQ-LOCALRUN-192, REQ-LOCALRUN-186, REQ-LOCALRUN-189: a
-// mirrored run comments when it starts, when its stage exits and when it waits; `withdraw`
+// SC-LOCALRUN-12, REQ-LOCALRUN-191, REQ-LOCALRUN-192, REQ-LOCALRUN-186, REQ-LOCALRUN-189,
+// REQ-WFFORMAT-101: a mirrored run comments when it starts, naming the run by its id and the
+// command that shows it, when its stage exits and when it waits; `withdraw`
 // skips the state write when a person already moved the issue out of the owned state,
 // `cancel` moves an issue still in it to the bound `Canceled`, and `show` lists every write.
 #[test]
@@ -523,8 +524,10 @@ fn a_tickets_lifecycle_is_mirrored_and_show_lists_every_write() {
     let stub = LinearStub::start();
 
     let run = tree.waiting(&stub, "AUTO-1");
-    let run_url = url::Url::from_file_path(&run).unwrap().to_string();
-    let start = format!("Engineering started by {MIRROR_OPERATOR}. Run: {run_url}");
+    let run_id = run_record(&run)["id"].as_str().unwrap().to_owned();
+    let start = format!(
+        "Engineering started by {MIRROR_OPERATOR}. Run {run_id}: `um workflow run show {run_id}`"
+    );
     assert_eq!(
         comments(&stub),
         [

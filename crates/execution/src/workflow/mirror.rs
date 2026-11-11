@@ -84,9 +84,9 @@ impl MirrorHook {
 /// The variables a hook's template may name (REQ-WFFORMAT-101).
 pub fn hook_variables(hook: MirrorHook) -> &'static [&'static str] {
     match hook {
-        MirrorHook::Start | MirrorHook::Outcome => &["operator", "run.url"],
-        MirrorHook::Stage => &["operator", "run.url", "stage", "summary"],
-        MirrorHook::Wait => &["operator", "run.url", "wait.kind", "wait.summary"],
+        MirrorHook::Start | MirrorHook::Outcome => &["operator", "run.id", "run.url"],
+        MirrorHook::Stage => &["operator", "run.id", "run.url", "stage", "summary"],
+        MirrorHook::Wait => &["operator", "run.id", "run.url", "wait.kind", "wait.summary"],
     }
 }
 
@@ -477,16 +477,17 @@ pub fn read_numbered_mirror_writes(
 
 /// A run's mirror (REQ-LOCALRUN-193): the root's block, the issue identifier, the bound
 /// values of its revision's bindings snapshot by key (or why they cannot be had), the
-/// operator, the run directory as a `file://` URL and the run directory the records go
-/// under. Each hook performs the block's write when the block declares it and appends one
-/// record of how it ended; its only error is that record's own write failing, and a failed
-/// write is a record, never an error.
+/// operator, the run's id, the run directory as a `file://` URL and the run directory the
+/// records go under. Each hook performs the block's write when the block declares it and
+/// appends one record of how it ended; its only error is that record's own write failing,
+/// and a failed write is a record, never an error.
 #[derive(Clone, Debug)]
 pub struct Mirror {
     block: MirrorBlock,
     issue: String,
     bindings: Result<BTreeMap<String, String>, MirrorFailure>,
     operator: String,
+    run_id: String,
     run_url: String,
     run_directory: PathBuf,
 }
@@ -497,6 +498,7 @@ impl Mirror {
         issue: String,
         bindings: Result<BTreeMap<String, String>, MirrorFailure>,
         operator: String,
+        run_id: String,
         run_url: String,
         run_directory: PathBuf,
     ) -> Self {
@@ -505,6 +507,7 @@ impl Mirror {
             issue,
             bindings,
             operator,
+            run_id,
             run_url,
             run_directory,
         }
@@ -611,6 +614,7 @@ impl Mirror {
         };
         let value = |name: &str| match name {
             "operator" => Some(self.operator.as_str()),
+            "run.id" => Some(self.run_id.as_str()),
             "run.url" => Some(self.run_url.as_str()),
             _ => variables
                 .iter()
@@ -783,6 +787,7 @@ mod tests {
             "AUTO-143".to_owned(),
             bindings,
             "saeed".to_owned(),
+            "run_x".to_owned(),
             "file:///tmp/run_x".to_owned(),
             root.path().to_owned(),
         )
@@ -980,6 +985,7 @@ mod tests {
             "AUTO-143".to_owned(),
             Ok(engineering_bindings()),
             "saeed".to_owned(),
+            "run_x".to_owned(),
             "file:///tmp/run_x".to_owned(),
             root.path().to_owned(),
         );
@@ -1050,6 +1056,7 @@ mod tests {
             "AUTO-143".to_owned(),
             Ok(partial),
             "saeed".to_owned(),
+            "run_x".to_owned(),
             "file:///tmp/run_x".to_owned(),
             other.path().to_owned(),
         );
