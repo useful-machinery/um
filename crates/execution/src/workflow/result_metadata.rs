@@ -22,11 +22,12 @@ use super::force_abort_evidence::{
 use super::publication::{
     CancellationReasonV1, ContinuationDefinitionSourceV1, ContinuationPreparationV1,
     ContinuationRecordV1, ContinuationRequestedDefinitionV1, DiagnosticStreamV1,
-    ExportProvenanceV1, ExportSourceV1, ExportUnavailableReasonV1, ExportV1, FailureCodeV1,
-    FailurePhaseV1, FailureV1, FinalizationTriggerV1, ForceAbortPhaseV1,
-    RecoveryHandlerFailureCodeV1, RecoveryHandlerOutcomeV1, RecoveryInvocationRoleV1,
-    RecoveryInvocationStateV1, RecoveryTerminationV1, RunResultInvariant, WorkflowNodeRoleV1,
-    WorkflowOutcomeV1, WorkflowProvenanceV1, WorkflowResultV1, WorkflowStepStateV1, WorkflowStepV1,
+    ExportProvenanceV1, ExportSourceV1, ExportUnavailableReasonV1, ExportV1,
+    FAILURE_DIAGNOSTIC_HTTP_STATUS, FailureCodeV1, FailureDiagnosticV1, FailurePhaseV1, FailureV1,
+    FinalizationTriggerV1, ForceAbortPhaseV1, RecoveryHandlerFailureCodeV1,
+    RecoveryHandlerOutcomeV1, RecoveryInvocationRoleV1, RecoveryInvocationStateV1,
+    RecoveryTerminationV1, RunResultInvariant, WorkflowNodeRoleV1, WorkflowOutcomeV1,
+    WorkflowProvenanceV1, WorkflowResultV1, WorkflowStepStateV1, WorkflowStepV1,
 };
 use super::schema_common::{
     is_canonical_absolute_path, is_canonical_relative_path, is_identifier, is_lowercase_hex,
@@ -1207,9 +1208,14 @@ fn validate_steps(
             ("cmd", WorkflowStepStateV1::Cancelled) => true,
             _ => false,
         };
+        // Only a failed node carries the classified diagnostic (REQ-EVIDENCE-27).
+        let diagnostic_valid = step.diagnostic.as_ref().is_none_or(|diagnostic| {
+            step.state == WorkflowStepStateV1::Failed && valid_failure_diagnostic(diagnostic)
+        });
         if !exact_fields
             || !timing_valid
             || !output_valid
+            || !diagnostic_valid
             || step.command_output.as_ref().is_some_and(|output| {
                 !valid_stream(&output.stdout, maximum_stream_bytes)
                     || !valid_stream(&output.stderr, maximum_stream_bytes)
@@ -1220,6 +1226,29 @@ fn validate_steps(
         validate_step_recovery(step, maximum_stream_bytes)?;
     }
     Ok(())
+}
+
+pub(crate) fn valid_failure_diagnostic(diagnostic: &FailureDiagnosticV1) -> bool {
+    let size_valid = |size: Option<u32>| size.is_none_or(|size| i32::try_from(size).is_ok());
+    *diagnostic != FailureDiagnosticV1::default()
+        && [
+            &diagnostic.harness_error,
+            &diagnostic.harness_failure,
+            &diagnostic.harness_input,
+            &diagnostic.launch_failure,
+        ]
+        .into_iter()
+        .flatten()
+        .all(|slug| is_diagnostic_slug(slug))
+        && diagnostic
+            .http_status
+            .is_none_or(|status| FAILURE_DIAGNOSTIC_HTTP_STATUS.contains(&status))
+        && size_valid(diagnostic.limit_bytes)
+        && size_valid(diagnostic.observed_bytes)
+        && diagnostic
+            .resets_at
+            .as_deref()
+            .is_none_or(|resets_at| parse_canonical_utc_timestamp(resets_at).is_some())
 }
 
 fn validate_step_recovery(

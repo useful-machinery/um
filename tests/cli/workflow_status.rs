@@ -345,6 +345,38 @@ fn status_schema_bounds_result_publication_invariants() {
     assert!(!status_schema().is_valid(&interrupted));
 }
 
+// REQ-LOCALRUN-198
+#[test]
+fn status_schema_admits_a_closed_diagnostic_only_on_a_failed_node() {
+    let bundle = RunBundle::new(
+        "schemaVersion: 1\nsteps:\n  work:\n    kind: cmd\n    command: {argv: [\"false\"]}\nfinalizers:\n  cleanup:\n    kind: cmd\n    command: {argv: [\"false\"]}\n",
+    );
+    let run_directory = bundle.result("status-schema-failed-diagnostic");
+    assert_eq!(run(&bundle.args(&run_directory)).status.code(), Some(1));
+    let (output, failed) = status_json(&run_directory);
+    assert!(output.status.success());
+    let diagnostic = serde_json::json!({"harnessFailure": "model_error", "httpStatus": 429});
+    for node in ["/progress/steps/0", "/finalization/finalizers/0"] {
+        let pointer = format!("/state/attempts/0{node}");
+        let mut value = failed.clone();
+        let target = value.pointer_mut(&pointer).unwrap();
+        assert_eq!(target["state"], "failed", "{pointer}");
+        target["diagnostic"] = diagnostic.clone();
+        assert!(status_schema().is_valid(&value), "{pointer}");
+        for invalid in [serde_json::json!({}), serde_json::json!({"unknown": 1})] {
+            value.pointer_mut(&pointer).unwrap()["diagnostic"] = invalid;
+            assert!(!status_schema().is_valid(&value), "{pointer}");
+        }
+    }
+
+    let (_bundle, run_directory) = completed_run("status-schema-succeeded-diagnostic");
+    let (output, mut succeeded) = status_json(&run_directory);
+    assert!(output.status.success());
+    assert!(status_schema().is_valid(&succeeded));
+    succeeded["state"]["attempts"][0]["progress"]["steps"][0]["diagnostic"] = diagnostic;
+    assert!(!status_schema().is_valid(&succeeded));
+}
+
 #[test]
 fn closed_status_schema_accepts_positive_and_rejects_negative_fixtures() {
     let validator = status_schema();

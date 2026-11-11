@@ -2778,7 +2778,7 @@ fn codex_result_correction_publishes_only_the_schema_valid_value() {
     assert!(String::from_utf8_lossy(&output.stderr).contains("value_rejected"));
 }
 
-// REQ-OUTPUTS-10, REQ-EXPORTS-3, REQ-AGENT-40
+// REQ-OUTPUTS-10, REQ-EXPORTS-3, REQ-AGENT-40, REQ-EVIDENCE-27, REQ-LOCALRUN-198
 #[test]
 fn codex_native_failure_is_attributed_without_value_publication_or_fallback() {
     let fixture = CodexFixture::with_execution("0.147.0");
@@ -2804,6 +2804,47 @@ fn codex_native_failure_is_attributed_without_value_publication_or_fallback() {
             .matches("app-server --strict-config")
             .count(),
         1
+    );
+
+    let diagnostic = &result["steps"][0]["diagnostic"];
+    assert!(diagnostic["harnessFailure"].is_string(), "{diagnostic}");
+    let view = isolated_command(&[
+        "workflow".to_owned(),
+        "run".to_owned(),
+        "view".to_owned(),
+        destination.to_string_lossy().into_owned(),
+        "--json".to_owned(),
+    ])
+    .output()
+    .unwrap();
+    assert!(
+        view.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&view.stderr)
+    );
+    let view: serde_json::Value = serde_json::from_slice(&view.stdout).unwrap();
+    assert!(workflow_view_schema().is_valid(&view), "{view}");
+    assert_eq!(view["result"]["steps"][0]["diagnostic"], *diagnostic);
+
+    let status = isolated_command(&[
+        "workflow".to_owned(),
+        "run".to_owned(),
+        "status".to_owned(),
+        destination.to_string_lossy().into_owned(),
+        "--json".to_owned(),
+    ])
+    .output()
+    .unwrap();
+    assert!(
+        status.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+    let status: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert!(status_schema().is_valid(&status), "{status}");
+    assert_eq!(
+        status["state"]["attempts"][0]["progress"]["steps"][0]["diagnostic"],
+        *diagnostic
     );
 }
 

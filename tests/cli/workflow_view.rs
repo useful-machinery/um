@@ -253,6 +253,45 @@ fn closed_workflow_view_schema_accepts_valid_and_rejects_invalid_fixtures() {
             );
         }
     }
+
+    // REQ-EVIDENCE-27: only a failed node carries a closed, non-empty `diagnostic`.
+    let succeeded: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(root.join("valid/success-current.json")).unwrap())
+            .unwrap();
+    let detail = serde_json::json!({"phase": "execution", "code": "harness_failed"});
+    let mut failed = succeeded.clone();
+    failed["attemptState"] = "workflow_failed".into();
+    failed["result"]["outcome"] = "failed".into();
+    failed["result"]["primaryIssue"] = serde_json::json!({
+        "node": {"id": "complete", "role": "step"},
+        "state": "failed",
+        "detail": detail,
+    });
+    let step = failed["result"]["steps"][0].as_object_mut().unwrap();
+    step.insert("kind".to_owned(), "agent".into());
+    step.insert("state".to_owned(), "failed".into());
+    step.insert("detail".to_owned(), detail);
+    step.remove("commandOutput");
+    step.insert(
+        "diagnostic".to_owned(),
+        serde_json::json!({
+            "harnessError": "rate_limited",
+            "harnessFailure": "model_error",
+            "httpStatus": 429,
+            "resetsAt": "2025-10-24T20:00:00Z"
+        }),
+    );
+    assert!(validator.is_valid(&failed), "{failed}");
+    let mut on_succeeded = succeeded;
+    on_succeeded["result"]["steps"][0]["diagnostic"] =
+        serde_json::json!({"harnessFailure": "model_error"});
+    let mut unknown_member = failed.clone();
+    unknown_member["result"]["steps"][0]["diagnostic"]["message"] = "provider text".into();
+    let mut empty = failed;
+    empty["result"]["steps"][0]["diagnostic"] = serde_json::json!({});
+    for invalid in [on_succeeded, unknown_member, empty] {
+        assert!(!validator.is_valid(&invalid), "{invalid}");
+    }
 }
 
 #[cfg(target_os = "linux")]

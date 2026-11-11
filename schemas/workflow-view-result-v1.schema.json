@@ -934,6 +934,52 @@
         }
       }
     },
+    "FailureDiagnostic": {
+      "type": "object",
+      "additionalProperties": false,
+      "minProperties": 1,
+      "properties": {
+        "harnessError": {
+          "$ref": "#/$defs/DiagnosticSlug"
+        },
+        "harnessFailure": {
+          "$ref": "#/$defs/DiagnosticSlug"
+        },
+        "harnessInput": {
+          "$ref": "#/$defs/DiagnosticSlug"
+        },
+        "launchFailure": {
+          "$ref": "#/$defs/DiagnosticSlug"
+        },
+        "httpStatus": {
+          "type": "integer",
+          "minimum": 100,
+          "maximum": 599
+        },
+        "osError": {
+          "type": "integer",
+          "minimum": -2147483648,
+          "maximum": 2147483647
+        },
+        "limitBytes": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 2147483647
+        },
+        "observedBytes": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 2147483647
+        },
+        "resetsAt": {
+          "$ref": "#/$defs/Timestamp"
+        }
+      }
+    },
+    "DiagnosticSlug": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_]{0,63}$"
+    },
     "RecoveryHandler": {
       "type": "object",
       "additionalProperties": false,
@@ -1334,9 +1380,26 @@
             },
             {"$ref": "#/$defs/InheritedDetail"}
           ]
+        },
+        "diagnostic": {
+          "$ref": "#/$defs/FailureDiagnostic"
         }
       },
       "allOf": [
+        {
+          "if": {
+            "required": [
+              "diagnostic"
+            ]
+          },
+          "then": {
+            "properties": {
+              "state": {
+                "const": "failed"
+              }
+            }
+          }
+        },
         {"if": {"properties": {"state": {"const": "inherited"}}, "required": ["state"]},
          "then": {"required": ["detail"], "properties": {"detail": {"$ref": "#/$defs/InheritedDetail"}},
            "not": {"anyOf": [{"required": ["startedAt"]}, {"required": ["durationMilliseconds"]},

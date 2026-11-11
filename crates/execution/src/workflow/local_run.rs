@@ -68,8 +68,8 @@ use super::profile_replacement::{
     AgentProfileReplacementDocument, MAXIMUM_AGENT_PROFILE_REPLACEMENT_BYTES,
 };
 use super::publication::{
-    CancellationReasonV1, FinalizationTriggerV1, RunResultInvariant, cancellation_reason,
-    finalization_trigger,
+    CancellationReasonV1, FailureDiagnosticV1, FinalizationTriggerV1, RunResultInvariant,
+    cancellation_reason, finalization_trigger,
 };
 use super::resolution::{ResolvedWorkflow, resolve_retained};
 use super::run_record::{RunState, WorkflowRunRecord};
@@ -820,6 +820,13 @@ pub(super) struct AttemptStepV1 {
         skip_serializing_if = "Option::is_none"
     )]
     pub(super) detail: Option<NodeDetail>,
+    /// A failed node's classified facts, recorded when it failed (REQ-LOCALRUN-198).
+    #[serde(
+        default,
+        deserialize_with = "super::evidence::deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub(super) diagnostic: Option<FailureDiagnosticV1>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) recovery: Option<DurableStepRecoveryV1>,
 }
@@ -1170,6 +1177,13 @@ pub(super) struct DurableFinalizerV1 {
         skip_serializing_if = "Option::is_none"
     )]
     pub(super) detail: Option<NodeDetail>,
+    /// A failed node's classified facts, recorded when it failed (REQ-LOCALRUN-198).
+    #[serde(
+        default,
+        deserialize_with = "super::evidence::deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub(super) diagnostic: Option<FailureDiagnosticV1>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -5552,6 +5566,7 @@ fn update_progress_nodes<Cause, Output>(
             return Err(LocalRunDirectoryError::StateConflict);
         }
         node.detail = attempt_step_detail(&runtime.state);
+        node.diagnostic = attempt_step_diagnostic(&runtime.state)?;
     }
     Ok(())
 }
@@ -5711,6 +5726,18 @@ fn attempt_step_detail<Output>(state: &StepState<Output>) -> Option<NodeDetail> 
     }
 }
 
+/// A failed node's classified facts, projected while its failure detail is still in memory
+/// (REQ-LOCALRUN-198); an inherited node of a later attempt carries none.
+fn attempt_step_diagnostic<Output>(
+    state: &StepState<Output>,
+) -> Result<Option<FailureDiagnosticV1>, LocalRunDirectoryError> {
+    match state {
+        StepState::Failed { detail } => FailureDiagnosticV1::project(detail)
+            .map_err(|_| LocalRunDirectoryError::SerializationUnavailable),
+        _ => Ok(None),
+    }
+}
+
 fn durable_finalization_summary<Deadline>(
     summary: &FinalizationSummary<Deadline>,
 ) -> Result<AttemptFinalizationCompleteV1, LocalRunDirectoryError>
@@ -5767,6 +5794,7 @@ where
                 state,
                 outputs: Some(Vec::new()),
                 detail,
+                diagnostic: attempt_step_diagnostic(&finalizer.disposition)?,
             })
         })
         .collect::<Result<Vec<_>, LocalRunDirectoryError>>()?;
@@ -9210,6 +9238,7 @@ fn fresh_progress_node(
         state: AttemptStepStateV1::Pending,
         outputs: Some(Vec::new()),
         detail: None,
+        diagnostic: None,
         recovery: None,
     })
 }
@@ -10141,7 +10170,9 @@ fn validate_attempt_step<'a>(
     if !step_ids.insert(step.id.as_str()) {
         return Err(LocalRunDirectoryError::AttemptStepDuplicate);
     }
-    if !attempt_step_detail_valid(step.role, step.state, step.detail.as_ref()) {
+    if !attempt_step_detail_valid(step.role, step.state, step.detail.as_ref())
+        || !attempt_step_diagnostic_valid(step.state, step.diagnostic.as_ref())
+    {
         return Err(LocalRunDirectoryError::AttemptStepDetailInvalid);
     }
     if !retained_output_set_valid(
@@ -10624,6 +10655,10 @@ fn validate_attempt_finalization<'a>(
                             finalizer.state,
                             finalizer.detail.as_ref(),
                         )
+                        || !attempt_step_diagnostic_valid(
+                            finalizer.state,
+                            finalizer.diagnostic.as_ref(),
+                        )
                         || !retained_output_set_valid(
                             finalizer.role,
                             &finalizer.id,
@@ -11083,6 +11118,7 @@ fn retained_value_relative_path(role: AttemptNodeRoleV1, node: &str, output: &st
 
 fn durable_finalizer_valid(finalizer: &DurableFinalizerV1) -> bool {
     attempt_step_detail_valid(finalizer.role, finalizer.state, finalizer.detail.as_ref())
+        && attempt_step_diagnostic_valid(finalizer.state, finalizer.diagnostic.as_ref())
         && matches!(
             finalizer.state,
             AttemptStepStateV1::Succeeded
@@ -11092,6 +11128,18 @@ fn durable_finalizer_valid(finalizer: &DurableFinalizerV1) -> bool {
                 | AttemptStepStateV1::NotRun
                 | AttemptStepStateV1::Cancelled
         )
+}
+
+/// Only a failed node carries a classified diagnostic, and never an empty one
+/// (REQ-LOCALRUN-198).
+fn attempt_step_diagnostic_valid(
+    state: AttemptStepStateV1,
+    diagnostic: Option<&FailureDiagnosticV1>,
+) -> bool {
+    diagnostic.is_none_or(|diagnostic| {
+        state == AttemptStepStateV1::Failed
+            && super::result_metadata::valid_failure_diagnostic(diagnostic)
+    })
 }
 
 fn attempt_step_detail_valid(

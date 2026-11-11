@@ -31,7 +31,7 @@ use super::artifact::{ArtifactExposeFailure, ArtifactStaging, CaptureFailureKind
 use super::artifact_set;
 use super::diagnostic::{CapturedDiagnosticStream, StepDiagnostic};
 use super::document::{FailurePolicy, FinalizationTrigger};
-use super::evidence::{NodeDetail, PrimaryIssue};
+use super::evidence::{FailureDetail, NodeDetail, PrimaryIssue, deserialize_non_null_option};
 use super::execution_root::open_directory;
 use super::export_presentation::{ContentReason, Field, resolve_text};
 use super::git_capture::GitCaptureFailure;
@@ -1145,12 +1145,99 @@ pub struct WorkflowStepV1 {
         skip_serializing_if = "Option::is_none"
     )]
     pub detail: Option<NodeDetail>,
+    /// A failed node's classified facts in a local result only (REQ-EVIDENCE-27).
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub(crate) diagnostic: Option<FailureDiagnosticV1>,
     #[serde(
         default,
         deserialize_with = "deserialize_non_null_option",
         skip_serializing_if = "Option::is_none"
     )]
     pub(crate) command_output: Option<CommandOutputV1>,
+}
+
+/// The classified facts a failed node's failure reports, beside its `detail`
+/// (REQ-EVIDENCE-27): the closed decoding of `FailureDetail::finalization_diagnostic()`.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct FailureDiagnosticV1 {
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub(crate) harness_error: Option<String>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub(crate) harness_failure: Option<String>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub(crate) harness_input: Option<String>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub(crate) launch_failure: Option<String>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub(crate) http_status: Option<u16>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub(crate) os_error: Option<i32>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub(crate) limit_bytes: Option<u32>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub(crate) observed_bytes: Option<u32>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub(crate) resets_at: Option<String>,
+}
+
+/// An HTTP status the result can carry; a harness may report any 16-bit number.
+pub(crate) const FAILURE_DIAGNOSTIC_HTTP_STATUS: std::ops::RangeInclusive<u16> = 100..=599;
+
+impl FailureDiagnosticV1 {
+    /// Decodes the one projection the finalization context also carries, so the two cannot
+    /// drift; an HTTP status outside the published range is omitted.
+    pub(crate) fn project(detail: &FailureDetail) -> Result<Option<Self>, LocalPublicationError> {
+        let Some(projected) = detail.finalization_diagnostic() else {
+            return Ok(None);
+        };
+        let mut diagnostic = serde_json::from_value::<Self>(projected)
+            .map_err(|_| invalid_run_result(RunResultInvariant::StepMetadata))?;
+        diagnostic.http_status = diagnostic
+            .http_status
+            .filter(|status| FAILURE_DIAGNOSTIC_HTTP_STATUS.contains(status));
+        Ok((diagnostic != Self::default()).then_some(diagnostic))
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1640,14 +1727,6 @@ where
     T: Deserialize<'de>,
 {
     Option::<T>::deserialize(deserializer)
-}
-
-fn deserialize_non_null_option<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
-where
-    D: Deserializer<'de>,
-    T: Deserialize<'de>,
-{
-    T::deserialize(deserializer).map(Some)
 }
 
 impl FailureCauseV1 {
@@ -2993,12 +3072,18 @@ fn build_result_with_provenance(
             super::runtime::RunCancellationPhase::Finalization => ForceAbortPhaseV1::Finalization,
         },
     });
+    // A Cloud result keeps byte omission of the classified diagnostic (REQ-EVIDENCE-27).
+    let local = matches!(provenance, WorkflowProvenanceV1::Local { .. });
     let steps = run
         .steps
         .iter()
-        .map(step_v1)
+        .map(|step| step_v1(step, local))
         .collect::<Result<Vec<_>, _>>()?;
-    let finalization = run.finalization.as_ref().map(finalization_v1).transpose()?;
+    let finalization = run
+        .finalization
+        .as_ref()
+        .map(|finalization| finalization_v1(finalization, local))
+        .transpose()?;
     let export_sources = run
         .continuation
         .as_ref()
@@ -3103,11 +3188,12 @@ fn build_result_with_provenance(
 
 fn finalization_v1(
     finalization: &WorkflowRunFinalization,
+    local: bool,
 ) -> Result<FinalizationV1, LocalPublicationError> {
     let finalizers = finalization
         .finalizers
         .iter()
-        .map(step_v1)
+        .map(|finalizer| step_v1(finalizer, local))
         .collect::<Result<Vec<_>, _>>()?;
     if finalizers
         .iter()
@@ -3153,7 +3239,9 @@ fn finalization_v1(
     })
 }
 
-fn step_v1(step: &WorkflowRunStep) -> Result<WorkflowStepV1, LocalPublicationError> {
+/// `local` selects the classified `diagnostic` of a failed node, which only a local result
+/// carries (REQ-EVIDENCE-27).
+fn step_v1(step: &WorkflowRunStep, local: bool) -> Result<WorkflowStepV1, LocalPublicationError> {
     let (started_at, duration_milliseconds) = match &step.timing {
         Some(timing) => (
             Some(timestamp(timing.started_at)?),
@@ -3196,6 +3284,10 @@ fn step_v1(step: &WorkflowRunStep) -> Result<WorkflowStepV1, LocalPublicationErr
             return Err(invalid_run_result(RunResultInvariant::StepMetadata));
         }
     };
+    let diagnostic = match &step.state {
+        StepState::Failed { detail } if local => FailureDiagnosticV1::project(detail)?,
+        _ => None,
+    };
     let command_output = step
         .command_output
         .as_ref()
@@ -3222,6 +3314,7 @@ fn step_v1(step: &WorkflowRunStep) -> Result<WorkflowStepV1, LocalPublicationErr
         started_at,
         duration_milliseconds,
         detail,
+        diagnostic,
         command_output,
     })
 }

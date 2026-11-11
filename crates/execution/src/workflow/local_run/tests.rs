@@ -4043,6 +4043,131 @@ fn settle_as_workflow_failed(run: &InitialLocalRun) {
         .unwrap();
 }
 
+fn harness_failure_detail() -> crate::workflow::evidence::FailureDetail {
+    crate::workflow::evidence::FailureDetail::new(
+        crate::workflow::evidence::FailurePhase::Execution,
+        crate::workflow::evidence::FailureCode::HarnessFailed,
+        None,
+        None,
+        None,
+        None,
+    )
+    .unwrap()
+}
+
+fn rate_limited_diagnostic() -> crate::workflow::publication::FailureDiagnosticV1 {
+    crate::workflow::publication::FailureDiagnosticV1 {
+        harness_error: Some("rate_limited".to_owned()),
+        harness_failure: Some("model_error".to_owned()),
+        http_status: Some(429),
+        resets_at: Some("2025-10-24T20:00:00Z".to_owned()),
+        ..Default::default()
+    }
+}
+
+// REQ-LOCALRUN-198
+#[test]
+fn a_failed_nodes_diagnostic_reads_back_and_is_refused_anywhere_else() {
+    let fixture = AdmittedFixture::from_source(
+        "schemaVersion: 1\nsteps:\n  work:\n    kind: cmd\n    command:\n      argv: [\"false\"]\nfinalizers:\n  cleanup:\n    kind: cmd\n    command:\n      argv: [\"false\"]\n",
+    );
+    let run = InitialLocalRun::create(&fixture.run_path("diagnostic"), &fixture.admitted).unwrap();
+    let pending = serde_json::to_value(read_state(run.root_handle()).unwrap()).unwrap();
+    run.state
+        .update(|state| {
+            let attempt = current_attempt_mut(state)?;
+            let settled = attempt.created_at.clone();
+            attempt.started_at = Some(settled.clone());
+            attempt.settled_at = Some(settled);
+            attempt.settlement_snapshot = Some(fixture_settlement_snapshot());
+            attempt.state = AttemptStateV1::WorkflowFailed;
+            let step = &mut attempt.progress.steps[0];
+            step.state = AttemptStepStateV1::Failed;
+            step.detail = Some(NodeDetail::Failed(harness_failure_detail()));
+            step.diagnostic = Some(rate_limited_diagnostic());
+            let finalizers = vec![DurableFinalizerV1 {
+                id: "cleanup".to_owned(),
+                role: AttemptNodeRoleV1::Finalizer,
+                failure_policy: FailurePolicy::Required,
+                state: AttemptStepStateV1::Failed,
+                outputs: Some(Vec::new()),
+                detail: Some(NodeDetail::Failed(harness_failure_detail())),
+                diagnostic: Some(rate_limited_diagnostic()),
+            }];
+            attempt.finalization = Some(AttemptFinalizationV1::Complete(
+                AttemptFinalizationCompleteV1 {
+                    complete: true,
+                    trigger: FinalizationTriggerV1::Failed,
+                    issues: durable_finalization_issues(&finalizers),
+                    finalizers,
+                    cancellation: None,
+                    force_abort: false,
+                },
+            ));
+            attempt.result = AttemptResultV1::NotPublished {
+                reason: ResultAbsentReasonV1::PublicationPending,
+            };
+            Ok(())
+        })
+        .unwrap();
+    let state = read_state(run.root_handle()).unwrap();
+    let attempt = &state.attempts[0];
+    assert_eq!(
+        attempt.progress.steps[0].diagnostic,
+        Some(rate_limited_diagnostic())
+    );
+    let Some(AttemptFinalizationV1::Complete(complete)) = &attempt.finalization else {
+        panic!("finalization should be complete");
+    };
+    assert_eq!(
+        complete.finalizers[0].diagnostic,
+        Some(rate_limited_diagnostic())
+    );
+    let failed = serde_json::to_value(&state).unwrap();
+    assert_eq!(decode_state(&json_bytes(failed.clone())).unwrap(), state);
+    let step = "/attempts/0/progress/steps/0";
+    let finalizer = "/attempts/0/finalization/finalizers/0";
+
+    // A state an earlier `um` wrote carries no diagnostic anywhere and still reads.
+    let mut earlier = failed.clone();
+    for node in [step, finalizer] {
+        earlier
+            .pointer_mut(node)
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .remove("diagnostic")
+            .unwrap();
+    }
+    let earlier = decode_state(&json_bytes(earlier)).unwrap();
+    assert_eq!(earlier.attempts[0].progress.steps[0].diagnostic, None);
+
+    let refused = |document: &Value, pointer: &str, diagnostic: Value| {
+        let mut document = document.clone();
+        document.pointer_mut(pointer).unwrap()["diagnostic"] = diagnostic;
+        decode_state(&json_bytes(document)).unwrap_err()
+    };
+    assert_eq!(
+        refused(&failed, step, json!({})),
+        LocalRunDirectoryError::AttemptStepDetailInvalid
+    );
+    assert_eq!(
+        refused(&failed, finalizer, json!({})),
+        LocalRunDirectoryError::AttemptFinalizationCompleteInvalid
+    );
+    let unknown = json!({"harnessFailure": "model_error", "unknown": 1});
+    for pointer in [step, finalizer] {
+        assert!(matches!(
+            refused(&failed, pointer, unknown.clone()),
+            LocalRunDirectoryError::Json { .. }
+        ));
+    }
+    assert_eq!(
+        refused(&pending, step, json!({"harnessFailure": "model_error"})),
+        LocalRunDirectoryError::AttemptStepDetailInvalid
+    );
+}
+
 #[test]
 fn schema_one_documents_without_continuation_foundation_fields_remain_readable() {
     let fixture = AdmittedFixture::new();
@@ -5376,6 +5501,7 @@ fn finalizer_retry_uses_fresh_identity_and_omits_prior_finalization_bytes() {
                         state: AttemptStepStateV1::Succeeded,
                         outputs: Some(Vec::new()),
                         detail: None,
+                        diagnostic: None,
                     }],
                     issues: Vec::new(),
                     cancellation: None,
@@ -6562,6 +6688,7 @@ fn settle_as_force_cancelled_with_finalizer(
                                 CancellationReason::ForceAbort,
                             ),
                         )),
+                        diagnostic: None,
                     }],
                     issues: Vec::new(),
                     cancellation: Some(DurableFinalizationCancellationV1 {

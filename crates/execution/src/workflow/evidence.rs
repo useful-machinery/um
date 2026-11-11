@@ -178,7 +178,8 @@ struct DiagnosticFacts {
     harness_input: Option<&'static str>,
     limit_bytes: Option<u64>,
     observed_bytes: Option<u64>,
-    /// Finalization-only: the closed runner diagnostic never carries it (REQ-AGENT-72).
+    /// Finalization and local result only: the closed runner diagnostic never carries it
+    /// (REQ-AGENT-72).
     resets_at: Option<u64>,
     launch_failure: Option<&'static str>,
     os_error: Option<i32>,
@@ -318,8 +319,9 @@ impl FailureDetail {
         (!object.is_empty()).then_some(serde_json::Value::Object(object))
     }
 
-    /// The finalization context's issue diagnostic: the runner diagnostic plus the
-    /// provider's kept reset time as `resetsAt` (REQ-WFFINALIZE-5, REQ-AGENT-72).
+    /// The finalization context's issue diagnostic and a local result's failed-node
+    /// `diagnostic`: the runner diagnostic plus the provider's kept reset time as `resetsAt`
+    /// (REQ-WFFINALIZE-5, REQ-EVIDENCE-27, REQ-AGENT-72).
     pub(crate) fn finalization_diagnostic(&self) -> Option<serde_json::Value> {
         let mut diagnostic = self.runner_diagnostic();
         let reset = self

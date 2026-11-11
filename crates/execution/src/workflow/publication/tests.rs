@@ -2305,6 +2305,220 @@ fn parser_response_limit_failure_remains_valid_result_metadata() {
     assert!(!detail.contains_key("protocolRejection"));
 }
 
+/// Fails the `terminal` step as an agent whose harness failure is classified `rate_limit`
+/// with the HTTP status `http_status` and a kept provider reset time.
+fn make_harness_failed(run: &mut WorkflowRunResult, http_status: u16) {
+    use crate::workflow::agent::{
+        AgentHarnessFailureDetail, CanonicalHarnessFailure, HarnessFailureDiagnostic,
+    };
+    let mut diagnostic = HarnessFailureDiagnostic::from_code("rate_limit", Some(http_status));
+    diagnostic.resets_at = Some(1_761_336_000);
+    let cause = StepFailureCause::Execution(StepExecutionFailure::Agent(AgentFailure::new(
+        AgentFailureCause::HarnessFailed {
+            detail: AgentHarnessFailureDetail::Classified {
+                canonical: CanonicalHarnessFailure::ModelError,
+                diagnostic,
+            },
+        },
+    )));
+    let detail = canonical_failure_detail(FailurePhase::Execution, &cause).unwrap();
+    run.steps[1].kind = WorkflowRunStepKind::Agent;
+    run.steps[1].command_output = None;
+    run.steps[1].state = StepState::Failed {
+        detail: detail.clone(),
+    };
+    run.outcome = RunOutcome::Failed {
+        primary_issue: PrimaryIssue::failed(
+            WorkflowNode {
+                id: "terminal".to_owned(),
+                role: WorkflowNodeRole::Step,
+            },
+            detail,
+        ),
+        later_cancellation: None,
+    };
+}
+
+fn view_schema_definition(definition: &str) -> jsonschema::Validator {
+    let document: Value = serde_json::from_str(include_str!(
+        "../../../../../schemas/workflow-view-result-v1.schema.json"
+    ))
+    .unwrap();
+    let schema = json!({
+        "$schema": document["$schema"],
+        "$defs": document["$defs"],
+        "$ref": format!("#/$defs/{definition}"),
+    });
+    jsonschema::draft202012::new(&schema).unwrap()
+}
+
+// REQ-EVIDENCE-27, REQ-AGENT-72
+#[test]
+fn failed_node_of_a_local_result_carries_its_classified_diagnostic() {
+    let fixture = PublicationFixture::new();
+    let mut run = run_fixture(&fixture);
+    make_harness_failed(&mut run, 429);
+    let destination = fixture.destination("harness-failed");
+    publish_workflow_result(&destination, &fixture.artifacts, &run).unwrap();
+    let (bytes, published) = read_result(&destination);
+
+    assert_eq!(
+        published["steps"][1]["diagnostic"],
+        json!({
+            "harnessError": "rate_limited",
+            "harnessFailure": "model_error",
+            "httpStatus": 429,
+            "resetsAt": "2025-10-24T20:00:00Z"
+        })
+    );
+    assert_eq!(
+        published["steps"][1]["detail"],
+        json!({"phase": "execution", "code": "harness_failed"})
+    );
+    assert_eq!(
+        published["primaryIssue"]["detail"],
+        published["steps"][1]["detail"]
+    );
+    assert!(published["primaryIssue"].get("diagnostic").is_none());
+    assert!(published["steps"][0].get("diagnostic").is_none());
+    assert!(super::super::result_metadata::decode(&bytes).is_ok());
+    let view_result = view_schema_definition("WorkflowResult");
+    assert!(view_result.is_valid(&published), "{published}");
+
+    let corrupt_step = |index: usize, diagnostic: Value| {
+        let mut corrupt = published.clone();
+        corrupt["steps"][index]["diagnostic"] = diagnostic;
+        corrupt
+    };
+    let unknown_member = corrupt_step(
+        1,
+        json!({"harnessFailure": "model_error", "message": "provider text"}),
+    );
+    assert!(serde_json::from_value::<WorkflowResultV1>(unknown_member.clone()).is_err());
+    for (index, diagnostic) in [
+        (1, json!({})),
+        (0, json!({"harnessFailure": "model_error"})),
+    ] {
+        let corrupt = corrupt_step(index, diagnostic);
+        let typed = serde_json::from_value::<WorkflowResultV1>(corrupt.clone()).unwrap();
+        assert_eq!(
+            super::super::result_metadata::validate_with_invariant(&typed),
+            Err(RunResultInvariant::StepMetadata)
+        );
+    }
+    for corrupt in [
+        unknown_member,
+        corrupt_step(1, json!({})),
+        corrupt_step(0, json!({"harnessFailure": "model_error"})),
+    ] {
+        let mut encoded = serde_json::to_vec(&corrupt).unwrap();
+        encoded.push(b'\n');
+        assert!(super::super::result_metadata::decode(&encoded).is_err());
+        assert!(!view_result.is_valid(&corrupt), "{corrupt}");
+    }
+
+    let mut command_failed = run_fixture(&fixture);
+    make_failed(&mut command_failed);
+    let destination = fixture.destination("command-failed");
+    publish_workflow_result(&destination, &fixture.artifacts, &command_failed).unwrap();
+    let (_, published) = read_result(&destination);
+    assert_eq!(published["steps"][1]["detail"]["code"], "command_exit");
+    assert!(published["steps"][1].get("diagnostic").is_none());
+
+    set_cloud_capacity(&mut run, 0);
+    let cloud = prepare_cloud_workflow_result(
+        &run,
+        "prj_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned(),
+        "rpc_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned(),
+        "sha1".to_owned(),
+        "0123456789abcdef0123456789abcdef01234567".to_owned(),
+        None,
+    )
+    .unwrap();
+    let document: Value = serde_json::from_slice(&cloud.result_json).unwrap();
+    assert_eq!(document["steps"][1]["detail"]["code"], "harness_failed");
+    assert!(
+        document["steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|step| step.get("diagnostic").is_none())
+    );
+}
+
+// REQ-EVIDENCE-27
+#[test]
+fn failed_node_diagnostic_omits_an_http_status_outside_the_published_range() {
+    let fixture = PublicationFixture::new();
+    let view_result = view_schema_definition("WorkflowResult");
+    for status in [99, 600] {
+        let mut run = run_fixture(&fixture);
+        make_harness_failed(&mut run, status);
+        let StepState::Failed { detail } = &run.steps[1].state else {
+            panic!("the step should have failed");
+        };
+        assert_eq!(
+            detail.finalization_diagnostic().unwrap()["httpStatus"],
+            json!(status)
+        );
+        let destination = fixture.destination(&format!("harness-failed-{status}"));
+        publish_workflow_result(&destination, &fixture.artifacts, &run).unwrap();
+        let (bytes, published) = read_result(&destination);
+        assert_eq!(
+            published["steps"][1]["diagnostic"],
+            json!({
+                "harnessError": "rate_limited",
+                "harnessFailure": "model_error",
+                "resetsAt": "2025-10-24T20:00:00Z"
+            })
+        );
+        assert!(super::super::result_metadata::decode(&bytes).is_ok());
+        assert!(view_result.is_valid(&published), "{published}");
+    }
+}
+
+// REQ-EVIDENCE-27
+#[test]
+fn failed_node_diagnostic_decodes_the_input_and_launch_facts_of_the_one_projection() {
+    use crate::workflow::agent::AgentInputKind;
+    use crate::workflow::step_runtime::{CommandLaunchCause, classify_launch_failure};
+
+    // EAGAIN, which the operating system returns when it refuses another process.
+    let eagain = if cfg!(target_os = "macos") { 35 } else { 11 };
+    let oversized =
+        StepStartFailure::Agent(AgentFailure::new(AgentFailureCause::HarnessInputTooLarge {
+            input: AgentInputKind::Message,
+            admitted_bytes: NonZeroU64::new(1_048_576).unwrap(),
+            observed_bytes: 1_048_577,
+        }));
+    let refused = StepStartFailure::CommandLaunch(classify_launch_failure(
+        &std::io::Error::from_raw_os_error(eagain),
+        CommandLaunchCause::Spawn,
+    ));
+    let schema = view_schema_definition("FailureDiagnostic");
+    for (failure, expected) in [
+        (
+            oversized,
+            json!({"harnessInput": "message", "limitBytes": 1_048_576, "observedBytes": 1_048_577}),
+        ),
+        (
+            refused,
+            json!({"launchFailure": "spawn", "osError": eagain}),
+        ),
+    ] {
+        let detail =
+            canonical_failure_detail(FailurePhase::Start, &StepFailureCause::Start(failure))
+                .unwrap();
+        assert_eq!(detail.finalization_diagnostic(), Some(expected.clone()));
+        let diagnostic = FailureDiagnosticV1::project(&detail).unwrap().unwrap();
+        assert!(super::super::result_metadata::valid_failure_diagnostic(
+            &diagnostic
+        ));
+        assert_eq!(serde_json::to_value(&diagnostic).unwrap(), expected);
+        assert!(schema.is_valid(&expected), "{expected}");
+    }
+}
+
 // REQ-EVIDENCE-12
 #[test]
 fn structured_agent_failure_keeps_protocol_rejection_out_of_node_detail() {
