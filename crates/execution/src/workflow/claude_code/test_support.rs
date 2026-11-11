@@ -547,7 +547,12 @@ pub(super) enum LoopbackBlock {
     Text(String),
     Thinking(Vec<String>),
     RedactedThinking(String),
-    ToolUse { name: String, input: Value },
+    /// A tool call, its id `tool_scherzo_loopback_<index>` unless `id` names another.
+    ToolUse {
+        name: String,
+        input: Value,
+        id: Option<String>,
+    },
 }
 
 impl LoopbackBlock {
@@ -572,6 +577,18 @@ impl LoopbackBlock {
         Self::ToolUse {
             name: name.to_owned(),
             input,
+            id: None,
+        }
+    }
+
+    /// A tool call with an id of its own, for a call that must not share the default id
+    /// another thread's call carries, as a subagent's `Agent` call that would otherwise name
+    /// the main thread's.
+    pub(super) fn tool_use_with_id(id: &str, name: &str, input: Value) -> Self {
+        Self::ToolUse {
+            name: name.to_owned(),
+            input,
+            id: Some(id.to_owned()),
         }
     }
 }
@@ -861,10 +878,10 @@ fn content_block_events(index: usize, block: &LoopbackBlock) -> Vec<(&'static st
             json!({"type": "redacted_thinking", "data": data}),
             Vec::new(),
         ),
-        LoopbackBlock::ToolUse { name, input } => (
+        LoopbackBlock::ToolUse { name, input, id } => (
             json!({
                 "type": "tool_use",
-                "id": format!("tool_scherzo_loopback_{index}"),
+                "id": id.clone().unwrap_or_else(|| format!("tool_scherzo_loopback_{index}")),
                 "name": name,
                 "input": {},
             }),
@@ -1152,16 +1169,7 @@ impl BackgroundSubagent {
                     !subagent_started,
                     "the subagent asked again before its command ran"
                 );
-                request.release_tool_use(
-                    "Bash",
-                    json!({
-                        "command": format!(
-                            "printf 'ready\\n' > '{}'; IFS= read -r done < '{}'; printf 'subagent command finished\\n'",
-                            self.ready.path().display(), self.blocker.display()
-                        ),
-                        "description": "Block the subagent until released",
-                    }),
-                );
+                request.release_tool_use("Bash", self.blocking_command());
                 subagent_started = true;
             } else {
                 assert!(
@@ -1171,8 +1179,24 @@ impl BackgroundSubagent {
                 main_thread = Some(request);
             }
         }
-        assert_eq!(self.ready.receive().await, b"ready\n");
+        self.await_ready().await;
         main_thread.unwrap()
+    }
+
+    /// The Bash input that signals `ready` and blocks on the fifo until `release`.
+    pub(super) fn blocking_command(&self) -> Value {
+        json!({
+            "command": format!(
+                "printf 'ready\\n' > '{}'; IFS= read -r done < '{}'; printf 'subagent command finished\\n'",
+                self.ready.path().display(), self.blocker.display()
+            ),
+            "description": "Block the subagent until released",
+        })
+    }
+
+    /// Waits for the blocking command's `ready` signal.
+    pub(super) async fn await_ready(&self) {
+        assert_eq!(self.ready.receive().await, b"ready\n");
     }
 
     /// Releases the subagent's blocked command.

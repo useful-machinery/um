@@ -577,7 +577,13 @@ fn other_task_kinds_stay_unrecognized() {
 
 /// A message of the backgrounded subagent the Agent call `agent-call` started.
 fn subagent_message(kind: &str, message: Value) -> Value {
-    json!({"type": kind, "session_id": SESSION_ID, "parent_tool_use_id": "agent-call",
+    subagent_message_under("agent-call", kind, message)
+}
+
+/// A message of the subagent the Agent call `parent` started, which names it as its
+/// `parent_tool_use_id`.
+fn subagent_message_under(parent: &str, kind: &str, message: Value) -> Value {
+    json!({"type": kind, "session_id": SESSION_ID, "parent_tool_use_id": parent,
         "agent_id": "agent-1", "subagent_type": "Explore", "task_description": "Review the diff",
         "uuid": "00000000-0000-4000-8000-0000000000a1", "timestamp": "2026-10-23T00:00:00Z",
         "message": message})
@@ -684,6 +690,414 @@ fn backgrounded_subagent_activity_continues_after_the_exchange_and_its_notificat
         observation,
         AgentObservation::AssistantText { text } if text.as_ref() == "No issues"
     )));
+}
+
+const NESTED_DESCRIPTION: &str = "Read the parser";
+const NESTED_PROMPT: &str = "Read the parser and report its states";
+const NESTED_REPORT: &str = "The parser has five states";
+
+/// A message of the subagent that the backgrounded subagent `t1` launched with its own Agent
+/// call `nested-call`.
+fn nested_message(kind: &str, message: Value) -> Value {
+    subagent_message_under("nested-call", kind, message)
+}
+
+/// The backgrounded subagent's Agent call launching a subagent of its own, and its progress
+/// naming that call (N1, N2), sanitized from the loopback captures of Claude Code 2.1.310 and
+/// 2.1.321 (AUTO-283).
+fn nested_launch(subagent_type: &str, backgrounded: bool) -> [Value; 2] {
+    let mut input = json!({"description": NESTED_DESCRIPTION, "prompt": NESTED_PROMPT,
+        "subagent_type": subagent_type});
+    if backgrounded {
+        input["run_in_background"] = json!(true);
+    }
+    [
+        subagent_message(
+            "assistant",
+            json!({"id": "msg-sub-launch", "type": "message", "role": "assistant",
+                "model": "subagent-model", "content": [{"type": "tool_use", "id": "nested-call",
+                "name": "Agent", "input": input}]}),
+        ),
+        system_event(
+            "task_progress",
+            json!({"task_id": "t1", "run_id": "agent-run", "tool_use_id": "agent-call",
+                "description": "Delegating the parser", "subagent_type": "Explore",
+                "usage": {"total_tokens": 20, "tool_uses": 1}, "last_tool_name": "Agent"}),
+        ),
+    ]
+}
+
+/// The nested subagent's start (N3): `parent_task_id` names the launching subagent, and no
+/// `owned_by_subagent` marks it, which marks only a subagent's own commands.
+fn nested_subagent_started(subagent_type: &str, backgrounded: bool) -> Value {
+    system_event(
+        "task_started",
+        json!({"task_id": "nested-task", "run_id": "nested-run", "tool_use_id": "nested-call",
+            "task_type": "local_agent", "parent_task_id": "t1", "spawn_depth": 2,
+            "is_backgrounded": backgrounded, "subagent_type": subagent_type,
+            "description": NESTED_DESCRIPTION, "prompt": NESTED_PROMPT}),
+    )
+}
+
+/// The nested subagent's opening frame (N4): a `general-purpose` one's prompt as a text
+/// block, a fork's a `tool_result` for its own Agent call.
+fn nested_opening(subagent_type: &str) -> Value {
+    let content = if subagent_type == "fork" {
+        json!([{"type": "tool_result", "tool_use_id": "nested-call",
+            "content": [{"type": "text", "text": "Fork started"}]}])
+    } else {
+        json!([{"type": "text", "text": NESTED_PROMPT}])
+    };
+    nested_message("user", json!({"role": "user", "content": content}))
+}
+
+/// The nested subagent's run and settlement (N5 to N10): its progress, its Bash call and the
+/// call's result, its closing text, its `task_updated` and its `task_notification`.
+fn nested_run() -> [Value; 6] {
+    [
+        system_event(
+            "task_progress",
+            json!({"task_id": "nested-task", "run_id": "nested-run", "tool_use_id": "nested-call",
+                "description": "Listing files", "usage": {"total_tokens": 10, "tool_uses": 1},
+                "last_tool_name": "Bash"}),
+        ),
+        nested_message(
+            "assistant",
+            json!({"id": "msg-nested-1", "type": "message", "role": "assistant",
+                "model": "subagent-model", "content": [{"type": "tool_use", "id": "nested-bash",
+                "name": "Bash", "input": {"command": "ls"}}]}),
+        ),
+        nested_message(
+            "user",
+            json!({"role": "user", "content": [{"type": "tool_result",
+                "tool_use_id": "nested-bash", "content": "claude_code.rs", "is_error": false}]}),
+        ),
+        nested_message(
+            "assistant",
+            json!({"id": "msg-nested-2", "type": "message", "role": "assistant",
+                "model": "subagent-model", "content": [{"type": "text", "text": NESTED_REPORT}]}),
+        ),
+        system_event(
+            "task_updated",
+            json!({"task_id": "nested-task", "run_id": "nested-run",
+                "patch": {"status": "completed", "end_time": 1}}),
+        ),
+        system_event(
+            "task_notification",
+            json!({"task_id": "nested-task", "run_id": "nested-run", "tool_use_id": "nested-call",
+                "status": "completed", "output_file": "", "summary": NESTED_DESCRIPTION}),
+        ),
+    ]
+}
+
+/// The launching subagent's `user` frame with the nested Agent call's result (N11, B5).
+fn nested_call_result() -> Value {
+    subagent_message(
+        "user",
+        json!({"role": "user", "content": [{"type": "tool_result", "tool_use_id": "nested-call",
+            "content": [{"type": "text", "text": NESTED_REPORT}], "is_error": false}]}),
+    )
+}
+
+/// A foreground nested subagent from its launch to its result (N1 to N11).
+fn nested_foreground_frames(subagent_type: &str) -> Vec<Value> {
+    let mut values = nested_launch(subagent_type, false).to_vec();
+    values.extend([
+        nested_subagent_started(subagent_type, false),
+        nested_opening(subagent_type),
+    ]);
+    values.extend(nested_run());
+    values.push(nested_call_result());
+    values
+}
+
+/// `backgrounded_subagent_transcript()` with frames of the backgrounded subagent's nested
+/// subagent spliced in: `in_exchange` before the main thread takes its Agent call's result,
+/// `in_drain` right after the first `result`, ahead of the backgrounded subagent's Bash run.
+fn with_nested_frames(in_exchange: &[Value], in_drain: &[Value]) -> Vec<Value> {
+    let mut values = backgrounded_subagent_transcript();
+    let first_result = position_of(&values, |value| value["type"] == "result");
+    values.splice(first_result + 1..first_result + 1, in_drain.iter().cloned());
+    let agent_result = position_of(&values, |value| {
+        value["type"] == "user" && value["parent_tool_use_id"].is_null()
+    });
+    values.splice(agent_result..agent_result, in_exchange.iter().cloned());
+    values
+}
+
+/// A Response-mode replay of `values` completes with the final turn's text and shows both
+/// subagents' statuses, the nested subagent's work and, as unrecognized, only a nested
+/// `general-purpose` subagent's opening prompt.
+fn assert_nested_subagent_observed(values: &[Value], subagent_type: &str) {
+    let (observations, outcome) = replay(&framed(values), AgentValueKind::Response, 1024);
+    assert_eq!(completed_response(&outcome), "final", "{subagent_type}");
+    assert_eq!(subagent_statuses(&observations), ["started", "completed"]);
+    assert_eq!(
+        test_support::subagent_statuses(&observations, NESTED_DESCRIPTION),
+        ["started", "completed"],
+        "{subagent_type}"
+    );
+    let information = information_diagnostics(&observations);
+    assert_eq!(information.len(), 4, "{information:?}");
+    assert!(information[1].contains(subagent_type), "{information:?}");
+    assert!(tool_call_ids(&observations).contains(&String::from("nested-bash")));
+    assert!(observations.iter().any(|observation| matches!(
+        observation,
+        AgentObservation::ToolResult { call_id, .. } if call_id.as_ref() == "nested-bash"
+    )));
+    assert!(observations.iter().any(|observation| matches!(
+        observation,
+        AgentObservation::AssistantText { text } if text.as_ref() == NESTED_REPORT
+    )));
+    let opening = nested_opening(subagent_type);
+    let expected: Vec<&Value> = if subagent_type == "fork" {
+        Vec::new()
+    } else {
+        vec![&opening]
+    };
+    assert_eq!(
+        unrecognized_events(&observations),
+        expected,
+        "{subagent_type}"
+    );
+}
+
+// REQ-AGENT-82, REQ-AGENT-64, REQ-AGENT-35, REQ-AGENT-69, INV-HARNESS-15 (AUTO-283)
+// The order AUTO-254 failed in: the nested foreground subagent starts inside the turn and
+// keeps working after its `result`, where its first message was refused.
+#[test]
+fn a_subagents_own_subagent_started_in_the_exchange_keeps_working_after_it() {
+    for subagent_type in ["general-purpose", "fork"] {
+        let frames = nested_foreground_frames(subagent_type);
+        let values = with_nested_frames(&frames[..4], &frames[4..]);
+        assert_nested_subagent_observed(&values, subagent_type);
+    }
+}
+
+// REQ-AGENT-82, REQ-AGENT-64, REQ-AGENT-35, REQ-AGENT-69, INV-HARNESS-15 (AUTO-283)
+#[test]
+fn a_subagents_own_subagent_started_in_the_drain_is_tracked_as_in_the_exchange() {
+    for subagent_type in ["general-purpose", "fork"] {
+        let values = with_nested_frames(&[], &nested_foreground_frames(subagent_type));
+        assert_nested_subagent_observed(&values, subagent_type);
+    }
+}
+
+/// A task list naming `entries` by task id, run id and type, the nested subagent with its
+/// `parent_task_id`.
+fn listed_subagents(entries: &[&str]) -> Value {
+    let tasks: Vec<Value> = entries
+        .iter()
+        .map(|task_id| match *task_id {
+            "t1" => json!({"task_id": "t1", "run_id": "agent-run", "task_type": "local_agent"}),
+            _ => json!({"task_id": "nested-task", "run_id": "nested-run",
+                "task_type": "local_agent", "parent_task_id": "t1"}),
+        })
+        .collect();
+    system_event("background_tasks_changed", json!({"tasks": tasks}))
+}
+
+/// The three orders of a nested subagent the backgrounded subagent launches in the
+/// background, all in the drain, sanitized from the loopback captures of 2.1.310 and 2.1.321
+/// (AUTO-283), each with a name: the launching subagent finishing first with the two
+/// notifications queued together (an empty turn, then the notified turn; 2.1.321), the
+/// launching subagent finishing first with the nested one still running (the launcher's
+/// notification opens a turn with a model call; 2.1.310 and 2.1.321), and the nested one
+/// finishing first, reported to its launcher with no turn of its own.
+fn backgrounded_nested_subagent_transcripts() -> [(&'static str, Vec<Value>); 3] {
+    let base = backgrounded_subagent_transcript();
+    let first_result = position_of(&base, |value| value["type"] == "result");
+    let closing = position_of(&base, |value| value["message"]["id"] == "msg-sub-2");
+    let emptied = position_of(&base, |value| value["tasks"] == json!([]));
+    let outer_closing = &base[closing..emptied];
+    let tail = &base[emptied..];
+    let mut launch = base[..=first_result].to_vec();
+    launch.extend(nested_launch("general-purpose", true));
+    let mut launch_result = nested_call_result();
+    launch_result["tool_use_result"] =
+        json!({"status": "async_launched", "agentId": "nested-task"});
+    launch.extend([
+        listed_subagents(&["t1", "nested-task"]),
+        nested_subagent_started("general-purpose", true),
+        launch_result,
+    ]);
+    let run = nested_run();
+
+    let mut queued_together = launch.clone();
+    queued_together.extend_from_slice(outer_closing);
+    queued_together.push(listed_subagents(&["nested-task"]));
+    queued_together.extend_from_slice(&run[1..]);
+    queued_together.push(tail[0].clone());
+    let mut empty_turn = empty_notification_turn();
+    empty_turn[1]["origin"]["runId"] = json!("agent-run");
+    queued_together.extend(empty_turn);
+    queued_together.extend_from_slice(&tail[1..]);
+
+    let mut outliving = launch.clone();
+    outliving.extend_from_slice(outer_closing);
+    outliving.extend([listed_subagents(&["nested-task"]), run[1].clone()]);
+    outliving.extend(text_turn("notified-turn", "waiting"));
+    outliving.extend([
+        system_event(
+            "task_started",
+            json!({"task_id": "nested-bash-task", "run_id": "nested-bash-run",
+                "owned_by_subagent": true, "tool_use_id": "nested-bash", "description": "List files",
+                "is_backgrounded": false, "parent_task_id": "nested-task", "task_type": "local_bash"}),
+        ),
+        system_event(
+            "task_notification",
+            json!({"task_id": "nested-bash-task", "run_id": "nested-bash-run",
+                "tool_use_id": "nested-bash", "status": "completed", "output_file": "",
+                "summary": "List files"}),
+        ),
+    ]);
+    outliving.extend_from_slice(&run[2..]);
+    outliving.extend_from_slice(tail);
+
+    let mut finishing_first = launch;
+    finishing_first.push(subagent_message(
+        "assistant",
+        json!({"id": "msg-sub-wait", "type": "message", "role": "assistant",
+            "model": "subagent-model", "content": [{"type": "text", "text": "Waiting on the reader"}]}),
+    ));
+    finishing_first.extend_from_slice(&run[1..]);
+    finishing_first.push(listed_subagents(&["t1"]));
+    finishing_first.extend_from_slice(outer_closing);
+    finishing_first.extend_from_slice(tail);
+
+    [
+        ("queued together", queued_together),
+        ("outliving its launcher", outliving),
+        ("finishing first", finishing_first),
+    ]
+}
+
+// REQ-AGENT-82, REQ-AGENT-64, REQ-AGENT-35, REQ-AGENT-69, INV-HARNESS-15 (AUTO-283)
+#[test]
+fn a_backgrounded_subagent_a_subagent_started_is_background_work_of_the_step() {
+    for (order, values) in backgrounded_nested_subagent_transcripts() {
+        let (observations, outcome) = replay(&framed(&values), AgentValueKind::Response, 1024);
+        assert_eq!(completed_response(&outcome), "final", "{order}");
+        assert_eq!(subagent_statuses(&observations), ["started", "completed"]);
+        assert_eq!(
+            test_support::subagent_statuses(&observations, NESTED_DESCRIPTION),
+            ["started", "completed"],
+            "{order}"
+        );
+        // No turn before the last completes the step while the nested subagent runs.
+        let last_result = values
+            .iter()
+            .rposition(|value| value["type"] == "result")
+            .unwrap();
+        let (observations, _) = replay(
+            &framed(&values[..last_result]),
+            AgentValueKind::Response,
+            1024,
+        );
+        assert_eq!(
+            milestone_count(&observations, AgentLifecycleMilestone::HarnessCompleted),
+            0,
+            "{order}"
+        );
+        assert_eq!(
+            milestone_count(&observations, AgentLifecycleMilestone::TurnCompleted),
+            values[..last_result]
+                .iter()
+                .filter(|value| value["type"] == "result")
+                .count(),
+            "{order}"
+        );
+    }
+
+    // In Result mode the turn the launcher's notification opens, ending with a candidate
+    // while the nested subagent runs, submits prematurely.
+    let [_, (_, outliving), _] = backgrounded_nested_subagent_transcripts();
+    let waiting_turn = position_of(&outliving, |value| {
+        value["event"]["message"]["id"] == "notified-turn"
+    });
+    let mut premature = outliving[..waiting_turn - 1].to_vec();
+    premature.extend(structured_output_exchange_after(&[]));
+    let mut parser = parser(AgentValueKind::Result, 1024);
+    parser.push_stdout(&framed(&premature), drop).unwrap();
+    assert_eq!(
+        parser.take_completed_result_exchange(),
+        Some(CompletedResultExchange::PrematureCandidate(
+            OutstandingWork {
+                commands: false,
+                monitors: false,
+                subagents: true,
+            }
+        ))
+    );
+}
+
+// REQ-AGENT-82, REQ-AGENT-64, REQ-AGENT-35, REQ-AGENT-69, REQ-AGENT-74, INV-HARNESS-15 (AUTO-283)
+#[test]
+fn a_nested_subagent_no_live_subagent_owns_is_refused() {
+    let base = backgrounded_subagent_transcript();
+    let first_result = position_of(&base, |value| value["type"] == "result");
+    let wakeup = last_init(&base);
+    let closing = position_of(&base, |value| value["message"]["id"] == "msg-sub-2");
+    let emptied = position_of(&base, |value| value["tasks"] == json!([]));
+    let foreground = nested_foreground_frames("general-purpose");
+    let late_message = nested_message(
+        "assistant",
+        json!({"id": "msg-nested-late", "type": "message", "role": "assistant",
+            "model": "subagent-model", "content": [{"type": "text", "text": "One more thing"}]}),
+    );
+
+    // A drain start whose launcher is no tracked task, and one whose launcher has notified.
+    let mut untracked_launcher = base[..=first_result].to_vec();
+    untracked_launcher.extend(nested_launch("general-purpose", false));
+    let mut start = nested_subagent_started("general-purpose", false);
+    start["parent_task_id"] = json!("untracked-task");
+    untracked_launcher.push(start);
+    let mut notified_launcher = base[..wakeup].to_vec();
+    notified_launcher.push(nested_subagent_started("general-purpose", false));
+    // A message under the nested call after the nested subagent's own notification.
+    let mut settled = foreground[..10].to_vec();
+    settled.push(late_message.clone());
+    let settled = with_nested_frames(&[], &settled);
+    // A message under the nested call once its launcher has notified, the nested one
+    // unsettled.
+    let mut orphaned = base[..=first_result].to_vec();
+    orphaned.extend_from_slice(&foreground[..8]);
+    orphaned.extend_from_slice(&base[closing..emptied]);
+    orphaned.push(late_message);
+
+    for (values, outer_event) in [
+        (&untracked_launcher, "system"),
+        (&notified_launcher, "system"),
+        (&settled, "assistant"),
+        (&orphaned, "assistant"),
+    ] {
+        let (_, outcome) = replay(&framed(values), AgentValueKind::Response, 1024);
+        let rejection = protocol_rejection_value(&outcome);
+        assert_eq!(
+            rejection["detail"]["reason"], "terminal_drain_event_invalid",
+            "{outer_event}"
+        );
+        assert_eq!(rejection["detail"]["outerEvent"], outer_event);
+    }
+
+    // The record names the orphaned subagent's launcher.
+    let (_, outcome) = replay(&framed(&orphaned), AgentValueKind::Response, 1024);
+    let AgentOutcome::Failed(failure) = &outcome else {
+        panic!("the orphaned message must fail the invocation, got {outcome:?}");
+    };
+    let tracked = serde_json::to_value(failure.tracked_work().unwrap()).unwrap();
+    let nested = tracked["subagents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|subagent| subagent["taskId"] == "nested-task")
+        .unwrap();
+    assert_eq!(
+        nested,
+        &json!({"taskId": "nested-task", "agentCallId": "nested-call",
+            "toolUseId": "nested-call", "runId": "nested-run", "backgrounded": false,
+            "notified": false, "parentTaskId": "t1"})
+    );
 }
 
 /// One main-thread message calling `SendMessage` as `send-1`, addressed to the subagent

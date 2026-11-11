@@ -545,6 +545,10 @@ pub(crate) struct ClaudeCodeStreamJsonV1TrackedSubagent {
     run_id: Option<String>,
     backgrounded: bool,
     notified: bool,
+    /// The task of the subagent that launched this one, for a subagent's own subagent
+    /// (REQ-AGENT-74, REQ-AGENT-82).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parent_task_id: Option<String>,
 }
 
 /// A subagent's own task: never outstanding work of the invocation, but a backgrounded one
@@ -632,9 +636,10 @@ impl SubagentTask {
     }
 }
 
-/// A subagent the Agent tool started inside an active exchange. A foreground one is
-/// observational: settling it is not a completion condition, and the exchange's end
-/// forgets it. A backgrounded one outlives the exchange: it owes a `task_notification`
+/// A subagent the Agent tool started inside an active exchange, or that a live subagent
+/// started in the drain (REQ-AGENT-82). A foreground one is observational: settling it is
+/// not a completion condition, and the exchange's end forgets it unless a live subagent
+/// launched it. A backgrounded one outlives the exchange: it owes a `task_notification`
 /// before the stream may end, and until then its messages and its own task events are
 /// accepted in the terminal drain. A subagent is backgrounded when its `task_started`
 /// says `is_backgrounded: true`, or later, when a `task_updated` patch moves it or the
@@ -653,6 +658,10 @@ struct Subagent {
     /// call that resumed the subagent, which its `task_notification` names.
     tool_use_id: Arc<str>,
     run_id: Option<Arc<str>>,
+    /// The task of the subagent that launched this one, from its start's `parent_task_id`:
+    /// a subagent's own subagent, tracked in the drain as in the exchange while it is live
+    /// (`subagent_is_live`, REQ-AGENT-82). `None` for a subagent of the main thread.
+    parent_task_id: Option<Arc<str>>,
     subagent_type: Option<Arc<str>>,
     description: Option<Arc<str>>,
     /// Whether a `task_started` announced the current run; false for a subagent the Agent
@@ -1428,6 +1437,17 @@ impl ClaudeCodeStreamJsonV1Parser {
             {
                 self.rejection_context.stage = ClaudeCodeStreamJsonV1ProtocolStage::SystemEvent;
                 self.resume_settled_subagent(object)
+            }
+            // A live subagent launches a subagent of its own after the exchange has ended:
+            // tracked as in an exchange, a foreground one as its launcher's work and a
+            // backgrounded one as background work of the step (REQ-AGENT-82).
+            "system"
+                if required_string(object, "subtype") == Some("task_started")
+                    && required_string(object, "task_type") == Some("local_agent")
+                    && self.launched_by_live_subagent(object) =>
+            {
+                self.rejection_context.stage = ClaudeCodeStreamJsonV1ProtocolStage::SystemEvent;
+                self.start_subagent(object)
             }
             "system"
                 if required_string(object, "subtype") == Some("task_started")
@@ -2716,11 +2736,46 @@ impl ClaudeCodeStreamJsonV1Parser {
         }
     }
 
-    /// Whether the Agent call `tool_use_id` started a backgrounded subagent that has not
-    /// yet settled, so that a message naming it as parent is that subagent's activity.
+    /// Whether the Agent call `tool_use_id` started a live subagent (`subagent_is_live`), so
+    /// that a message naming it as parent in the drain is that subagent's activity.
     fn awaits_subagent(&self, tool_use_id: &str) -> bool {
         self.subagents.iter().any(|subagent| {
-            subagent.awaits_notification() && subagent.agent_call_id.as_ref() == tool_use_id
+            subagent.agent_call_id.as_ref() == tool_use_id && self.subagent_is_live(subagent)
+        })
+    }
+
+    /// Whether `subagent` is live: backgrounded and still owing its notification, or a
+    /// foreground one, unsettled while tracked, whose launcher (`parent_task_id`) is a
+    /// tracked subagent that is live, transitively (REQ-AGENT-82, INV-HARNESS-15). The walk
+    /// up the launchers takes at most one step per tracked subagent, so a cycle ends it.
+    fn subagent_is_live(&self, subagent: &Subagent) -> bool {
+        let mut current = subagent;
+        for _ in 0..self.subagents.len() {
+            if current.awaits_notification() {
+                return true;
+            }
+            if current.backgrounded {
+                return false;
+            }
+            let Some(launcher) = current.parent_task_id.as_deref().and_then(|parent| {
+                self.subagents
+                    .iter()
+                    .find(|tracked| tracked.task_id.as_ref() == parent)
+            }) else {
+                return false;
+            };
+            current = launcher;
+        }
+        false
+    }
+
+    /// Whether a `task_started` names a live tracked subagent as its `parent_task_id`: the
+    /// start of a subagent's own subagent, which the drain tracks as an exchange does.
+    fn launched_by_live_subagent(&self, object: &Map<String, Value>) -> bool {
+        required_nonempty_string(object, "parent_task_id").is_some_and(|parent| {
+            self.subagents.iter().any(|subagent| {
+                subagent.task_id.as_ref() == parent && self.subagent_is_live(subagent)
+            })
         })
     }
 
@@ -2954,7 +3009,8 @@ impl ClaudeCodeStreamJsonV1Parser {
     }
 
     fn start_subagent(&mut self, object: &Map<String, Value>) -> Result<(), AgentFailureCause> {
-        if !self.exchange_active {
+        // Outside an exchange only a live subagent's own subagent starts (REQ-AGENT-82).
+        if !self.exchange_active && !self.launched_by_live_subagent(object) {
             return Err(self.protocol_failure());
         }
         let task_id =
@@ -3009,6 +3065,7 @@ impl ClaudeCodeStreamJsonV1Parser {
             agent_call_id: Arc::from(tool_use_id),
             tool_use_id: Arc::from(tool_use_id),
             run_id,
+            parent_task_id: required_nonempty_string(object, "parent_task_id").map(Arc::from),
             subagent_type: required_nonempty_string(object, "subagent_type")
                 .map(|kind| Arc::from(ellipsize(kind, MAXIMUM_SUBAGENT_TOKEN_WIDTH))),
             description: required_nonempty_string(object, "description")
@@ -3130,6 +3187,7 @@ impl ClaudeCodeStreamJsonV1Parser {
             agent_call_id: Arc::from(call_id),
             tool_use_id: Arc::from(call_id),
             run_id: None,
+            parent_task_id: None,
             subagent_type: None,
             description: required_nonempty_string(launch, "description")
                 .map(|text| Arc::from(ellipsize(text, MAXIMUM_SUBAGENT_DESCRIPTION_WIDTH))),
@@ -3437,8 +3495,16 @@ impl ClaudeCodeStreamJsonV1Parser {
             }
         }
         // A foreground subagent the exchange did not settle carries no completion duty and
-        // is retired by identity; a backgrounded one still owes its notification.
-        self.retire_subagents(|subagent| subagent.backgrounded);
+        // is retired by identity, unless a live subagent launched it and it is still that
+        // subagent's work (REQ-AGENT-82); a backgrounded one still owes its notification.
+        // Liveness reads the whole ledger, which the retirement drains, so it comes first.
+        let kept: Vec<Arc<str>> = self
+            .subagents
+            .iter()
+            .filter(|subagent| subagent.backgrounded || self.subagent_is_live(subagent))
+            .map(|subagent| Arc::clone(&subagent.task_id))
+            .collect();
+        self.retire_subagents(|subagent| kept.contains(&subagent.task_id));
         self.completed_exchanges = self
             .completed_exchanges
             .checked_add(1)
@@ -3634,6 +3700,7 @@ impl ClaudeCodeStreamJsonV1Parser {
                 run_id: subagent.run_id.as_deref().map(tracked_work_id),
                 backgrounded: subagent.backgrounded,
                 notified: subagent.notified,
+                parent_task_id: subagent.parent_task_id.as_deref().map(tracked_work_id),
             }
         });
         let (forgotten_subagents, forgotten_cut) =

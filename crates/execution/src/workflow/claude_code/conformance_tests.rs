@@ -21,12 +21,13 @@ use super::adapter::{ClaudeCodeStreamJsonV1Adapter, premature_candidate_feedback
 use super::lifecycle_matrix::{self, enforcement_nags, tool_names};
 use super::test_support::{
     BACKGROUND_SUBAGENT_DESCRIPTION, BACKGROUND_SUBAGENT_PROMPT, BACKGROUND_SUBAGENT_RESPONSE,
-    BackgroundSubagent, FixtureSignal, LoopbackBlock, LoopbackProvider, MODEL, PendingClock,
-    RecordingObservationSink, RunningProductionClaudeCode, RunningStartedClaudeCode,
-    SUBAGENT_OUTSTANDING, SyntheticClaudeCodeRoot, WATCHDOG, admitted_adapter,
-    assert_backgrounded_subagent_activity, assistant_text, backgrounded_subagent_statuses,
-    conformance_executable, conformance_limits, exclusive_conformance_executable,
-    invocation_identity, launched_agent_id, next_request_or_outcome, version_probe_environment,
+    BackgroundSubagent, ControlledProviderRequest, FixtureSignal, LoopbackBlock, LoopbackProvider,
+    MODEL, PendingClock, RecordingObservationSink, RunningProductionClaudeCode,
+    RunningStartedClaudeCode, SUBAGENT_OUTSTANDING, SyntheticClaudeCodeRoot, WATCHDOG,
+    admitted_adapter, assert_backgrounded_subagent_activity, assistant_text,
+    backgrounded_subagent_statuses, conformance_executable, conformance_limits,
+    exclusive_conformance_executable, invocation_identity, launched_agent_id,
+    next_request_or_outcome, subagent_statuses, version_probe_environment,
     wait_for_completed_turns,
 };
 use super::*;
@@ -1808,6 +1809,247 @@ async fn pinned_real_claude_code_09g_a_lead_that_loads_send_message_before_messa
         assert!(!provider.has_pending_request());
         provider.shutdown().await;
     })
+    .await;
+}
+
+const NESTED_SUBAGENT_PROMPT: &str = "Run the controlled nested subagent.";
+const NESTED_SUBAGENT_DESCRIPTION: &str = "Run a nested subagent";
+const NESTED_SUBAGENT_RESPONSE: &str = "nested subagent finished";
+/// The nested `Agent` call's own id. The loopback names a call by its block's index, so the
+/// nested call, first in the outer subagent's message, would otherwise carry the id of the
+/// main thread's `Agent` call, under which Claude Code would file the nested thread.
+const NESTED_AGENT_CALL_ID: &str = "tool_scherzo_loopback_nested_agent";
+
+/// When and how the backgrounded outer subagent launches its own subagent.
+#[derive(Clone, Copy)]
+enum NestedLaunch {
+    /// In the foreground, inside the main thread's exchange, running past its `result`.
+    ForegroundInTheExchange,
+    /// In the foreground, after the main thread's turn has ended.
+    ForegroundAfterTheTurn,
+    /// In the background, after the main thread's turn has ended, outliving the outer
+    /// subagent.
+    BackgroundedOutlivingItsLauncher,
+}
+
+/// The conversation a case holds with the three threads of a nested launch, which share the
+/// provider: each request is told apart by the prompt its conversation opens with and held
+/// until the case answers its thread, so the threads' interleaving does not matter.
+struct NestedConversation {
+    provider: LoopbackProvider,
+    terminal: tokio::sync::oneshot::Receiver<AgentOutcome>,
+    held: Vec<(NestedThread, ControlledProviderRequest)>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NestedThread {
+    Main,
+    Outer,
+    Nested,
+}
+
+impl NestedConversation {
+    async fn next(&mut self, thread: NestedThread) -> ControlledProviderRequest {
+        if let Some(position) = self.held.iter().position(|(held, _)| *held == thread) {
+            return self.held.remove(position).1;
+        }
+        loop {
+            let request = next_request_or_outcome(&mut self.provider, &mut self.terminal).await;
+            let from = if request.opens_with(NESTED_SUBAGENT_PROMPT) {
+                NestedThread::Nested
+            } else if request.opens_with(BACKGROUND_SUBAGENT_PROMPT) {
+                NestedThread::Outer
+            } else {
+                NestedThread::Main
+            };
+            if from == thread {
+                return request;
+            }
+            assert!(
+                self.held.iter().all(|(held, _)| *held != from),
+                "the {from:?} thread asked twice before it was answered"
+            );
+            self.held.push((from, request));
+        }
+    }
+
+    /// Answers the main thread's held request with text and waits for its turn to end.
+    async fn end_the_first_turn(&mut self, observations: &RecordingObservationSink) {
+        self.next(NestedThread::Main)
+            .await
+            .release_text("first response");
+        wait_for_completed_turns(observations, 1).await;
+    }
+
+    fn assert_running(&mut self) {
+        assert!(matches!(
+            self.terminal.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+    }
+}
+
+/// The outer subagent's `Agent` call launching the nested one.
+fn nested_launch(backgrounded: bool) -> LoopbackBlock {
+    let mut input = json!({
+        "description": NESTED_SUBAGENT_DESCRIPTION,
+        "prompt": NESTED_SUBAGENT_PROMPT,
+        "subagent_type": "general-purpose",
+    });
+    if backgrounded {
+        input["run_in_background"] = json!(true);
+    }
+    LoopbackBlock::tool_use_with_id(NESTED_AGENT_CALL_ID, "Agent", input)
+}
+
+/// Drives a Response-mode step whose backgrounded subagent launches a subagent of its own as
+/// `launch` says, and checks that the step settles on the turn the last notification opens,
+/// with both subagents' starts and settlements reported and nothing refused.
+async fn drive_a_subagents_own_subagent(label: &'static str, launch: NestedLaunch) {
+    use NestedThread::{Main, Nested, Outer};
+    let (executable, _exclusive) = exclusive_conformance_executable().await;
+    host_scaled_watchdog(label, WATCHDOG, async {
+        let provider = LoopbackProvider::start().await;
+        let root = SyntheticClaudeCodeRoot::new();
+        let nested = BackgroundSubagent::named(&root, "nested");
+        let observations = RecordingObservationSink::default();
+        let running =
+            launch_recorded_response_lifecycle(executable, &root, &provider, &observations).await;
+        let mut conversation = NestedConversation {
+            provider,
+            terminal: running.terminal,
+            held: Vec::new(),
+        };
+        conversation
+            .next(Main)
+            .await
+            .release_tool_use("Agent", BackgroundSubagent::launch_input());
+        let outer_opening = conversation.next(Outer).await;
+
+        match launch {
+            NestedLaunch::ForegroundInTheExchange => {
+                // AUTO-254's order: the nested subagent starts and blocks inside the main
+                // thread's exchange, and works on after its `result`.
+                outer_opening.release_blocks(vec![nested_launch(false)]);
+                conversation
+                    .next(Nested)
+                    .await
+                    .release_tool_use("Bash", nested.blocking_command());
+                nested.await_ready().await;
+                conversation.end_the_first_turn(&observations).await;
+                conversation.assert_running();
+                nested.release().await;
+                conversation
+                    .next(Nested)
+                    .await
+                    .release_text(NESTED_SUBAGENT_RESPONSE);
+                conversation
+                    .next(Outer)
+                    .await
+                    .release_text(BACKGROUND_SUBAGENT_RESPONSE);
+            }
+            NestedLaunch::ForegroundAfterTheTurn => {
+                conversation.end_the_first_turn(&observations).await;
+                outer_opening.release_blocks(vec![nested_launch(false)]);
+                conversation
+                    .next(Nested)
+                    .await
+                    .release_text(NESTED_SUBAGENT_RESPONSE);
+                conversation
+                    .next(Outer)
+                    .await
+                    .release_text(BACKGROUND_SUBAGENT_RESPONSE);
+            }
+            NestedLaunch::BackgroundedOutlivingItsLauncher => {
+                conversation.end_the_first_turn(&observations).await;
+                outer_opening.release_blocks(vec![nested_launch(true)]);
+                conversation
+                    .next(Nested)
+                    .await
+                    .release_tool_use("Bash", nested.blocking_command());
+                nested.await_ready().await;
+                // The outer subagent finishes with the nested one blocked; its notification
+                // opens a turn with a model call, which ends with the nested one running.
+                conversation
+                    .next(Outer)
+                    .await
+                    .release_text(BACKGROUND_SUBAGENT_RESPONSE);
+                conversation
+                    .next(Main)
+                    .await
+                    .release_text("waiting for the nested subagent");
+                wait_for_completed_turns(&observations, 2).await;
+                conversation.assert_running();
+                nested.release().await;
+                conversation
+                    .next(Nested)
+                    .await
+                    .release_text(NESTED_SUBAGENT_RESPONSE);
+            }
+        }
+
+        conversation.next(Main).await.release_text("final response");
+        let outcome = (&mut conversation.terminal).await.unwrap();
+        running.task.await.unwrap();
+        let AgentOutcome::Completed(CompletedAgentInvocation::Response(response)) = outcome else {
+            panic!("the last notified turn must settle the invocation, got {outcome:?}");
+        };
+        assert_eq!(response.as_str(), "final response");
+        let snapshot = observations.snapshot();
+        assert_eq!(
+            subagent_statuses(
+                snapshot.iter().map(|envelope| envelope.observation()),
+                NESTED_SUBAGENT_DESCRIPTION
+            ),
+            ["started", "completed"]
+        );
+        assert_backgrounded_subagent_activity(&observations);
+        assert!(conversation.held.is_empty());
+        assert!(!conversation.provider.has_pending_request());
+        conversation.provider.shutdown().await;
+    })
+    .await;
+}
+
+// SC-AGENT-9
+// REQ-AGENT-82
+// INV-HARNESS-15 (AUTO-283)
+#[tokio::test]
+#[ignore = "requires pinned harness"]
+async fn pinned_real_claude_code_09h_a_subagents_own_subagent_started_in_the_exchange_keeps_working_after_it()
+ {
+    drive_a_subagents_own_subagent(
+        "pinned Claude Code nested subagent in the exchange",
+        NestedLaunch::ForegroundInTheExchange,
+    )
+    .await;
+}
+
+// SC-AGENT-9
+// REQ-AGENT-82
+// INV-HARNESS-15 (AUTO-283)
+#[tokio::test]
+#[ignore = "requires pinned harness"]
+async fn pinned_real_claude_code_09i_a_subagents_own_subagent_started_after_the_turn_ended_is_tracked()
+ {
+    drive_a_subagents_own_subagent(
+        "pinned Claude Code nested subagent in the drain",
+        NestedLaunch::ForegroundAfterTheTurn,
+    )
+    .await;
+}
+
+// SC-AGENT-9
+// REQ-AGENT-82
+// INV-HARNESS-15 (AUTO-283)
+#[tokio::test]
+#[ignore = "requires pinned harness"]
+async fn pinned_real_claude_code_09j_a_backgrounded_subagent_a_subagent_started_outlives_it_and_wakes_the_agent()
+ {
+    drive_a_subagents_own_subagent(
+        "pinned Claude Code backgrounded nested subagent",
+        NestedLaunch::BackgroundedOutlivingItsLauncher,
+    )
     .await;
 }
 
