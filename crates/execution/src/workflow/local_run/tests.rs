@@ -4168,6 +4168,112 @@ fn a_failed_nodes_diagnostic_reads_back_and_is_refused_anywhere_else() {
     );
 }
 
+/// The run's own guard journal, except that it refuses to register `refused`'s launch.
+struct GuardRegistrationRefusal {
+    store: Arc<StateStore>,
+    refused: &'static str,
+}
+
+impl DurableProcessGuardStore for GuardRegistrationRefusal {
+    fn register(
+        &self,
+        step: &str,
+        action_id: u64,
+        identity: &AuthenticatedProcessGroup,
+    ) -> Result<String, ProcessGuardStoreError> {
+        if step == self.refused {
+            return Err(ProcessGuardStoreError);
+        }
+        self.store.register(step, action_id, identity)
+    }
+
+    fn mark_released(&self, guard_id: &str) -> Result<(), ProcessGuardStoreError> {
+        self.store.mark_released(guard_id)
+    }
+
+    fn mark_quiesced(&self, guard_id: &str) -> Result<(), ProcessGuardStoreError> {
+        self.store.mark_quiesced(guard_id)
+    }
+}
+
+// REQ-LOCALRUN-198, REQ-DIAG-38
+#[tokio::test]
+async fn a_finalizer_refused_at_launch_records_its_diagnostic_when_finalization_completes() {
+    let fixture = AdmittedFixture::from_source(
+        "schemaVersion: 1\nsteps:\n  work:\n    kind: cmd\n    command: {argv: [\"/bin/sh\", \"-c\", \"exit 0\"]}\nfinalizers:\n  cleanup:\n    kind: cmd\n    command: {argv: [\"/bin/sh\", \"-c\", \"exit 0\"]}\n",
+    );
+    let run_path = fixture.run_path("refused-finalizer");
+    let _writable = WritableTreeCopyOnDrop(run_path.clone());
+    let run = InitialLocalRun::create(&run_path, &fixture.admitted).unwrap();
+    let artifacts =
+        ArtifactStaging::create(fixture.admitted.execution(), run.private_directory()).unwrap();
+    let inputs = crate::workflow::input::InputStaging::create(
+        fixture.admitted.execution(),
+        run.private_directory(),
+    )
+    .unwrap();
+    let diagnostics = crate::workflow::diagnostic::StepDiagnosticLog::default();
+    let guards = ProcessGuardRegistry::durable(Arc::new(GuardRegistrationRefusal {
+        store: Arc::clone(&run.state),
+        refused: "cleanup",
+    }));
+    cloud_test_watchdog(crate::workflow::execution::execute_workflow(
+        fixture.admitted.clone(),
+        &artifacts,
+        &inputs,
+        &diagnostics,
+        crate::workflow::step_runtime::AgentExecution::disabled(),
+        crate::workflow::test_support::step_clock::TestClock,
+        run.commit_port(
+            diagnostics.clone(),
+            InvocationAccountingLog::default(),
+            artifacts.clone(),
+        ),
+        crate::workflow::observation::NoopExecutionObserver,
+        crate::workflow::step_runtime::WorkflowExecutionStart::initial(guards),
+    ))
+    .await
+    .unwrap();
+
+    let document =
+        serde_json::from_slice::<Value>(&fs::read(run_path.join(STATE_FILE)).unwrap()).unwrap();
+    assert_eq!(
+        document.pointer("/attempts/0/finalization/finalizers/0/diagnostic"),
+        Some(&json!({"launchFailure": "guard_registration"}))
+    );
+    let state = read_state(run.root_handle()).unwrap();
+    assert_eq!(serde_json::to_value(&state).unwrap(), document);
+    let attempt = &state.attempts[0];
+    let Some(AttemptFinalizationV1::Complete(complete)) = &attempt.finalization else {
+        panic!(
+            "finalization should be complete: {:?}",
+            attempt.finalization
+        );
+    };
+    let [cleanup] = complete.finalizers.as_slice() else {
+        panic!("one finalizer should run: {:?}", complete.finalizers);
+    };
+    assert_eq!(cleanup.id, "cleanup");
+    assert_eq!(cleanup.state, AttemptStepStateV1::Failed);
+    let Some(NodeDetail::Failed(detail)) = &cleanup.detail else {
+        panic!("the finalizer should carry a failure: {:?}", cleanup.detail);
+    };
+    assert_eq!(
+        (detail.phase, detail.code),
+        (
+            crate::workflow::evidence::FailurePhase::Start,
+            crate::workflow::evidence::FailureCode::CommandLaunchFailed
+        )
+    );
+    let [work] = attempt.progress.steps.as_slice() else {
+        panic!("one step should run: {:?}", attempt.progress.steps);
+    };
+    assert_eq!(
+        (work.id.as_str(), work.state, &work.diagnostic),
+        ("work", AttemptStepStateV1::Succeeded, &None)
+    );
+}
+
 // REQ-LOCALRUN-201
 #[test]
 fn a_nodes_start_reads_back_and_is_refused_where_the_node_never_started() {

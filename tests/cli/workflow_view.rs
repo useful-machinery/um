@@ -231,6 +231,10 @@ fn automatic_and_explicit_plain_and_json_are_complete_frozen_snapshots() {
     assert_eq!(durable_files(&run_directory), before);
 }
 
+// REQ-WFRECOVERY-62: `valid/recovery-handler-launch-diagnostic.json` carries a recovery
+// handler's `command_launch_failed` diagnostic, and
+// `invalid/recovery-handler-launch-diagnostic-slug.json` is refused for its `launchFailure`
+// that is no slug.
 #[test]
 fn closed_workflow_view_schema_accepts_valid_and_rejects_invalid_fixtures() {
     let validator = workflow_view_schema();

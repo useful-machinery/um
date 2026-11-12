@@ -1,7 +1,8 @@
 //! `github` / `pull_request.queue_settled` (REQ-WFEXEC-65): whether the pull request an
 //! `external` wait's rule names has left the merge queue. The pull request is read from the
-//! GitHub REST API and its queue entry from Mergify's, the repository's merge queue, both with
-//! the operator's GitHub token, through `um_api::provider_get`. `UM_GITHUB_API_URL` and
+//! GitHub REST API with the operator's GitHub token and its queue entry from Mergify's, the
+//! repository's merge queue, with `MERGIFY_TOKEN` when the CLI's environment holds one and else
+//! with that GitHub token, through `um_api::provider_get`. `UM_GITHUB_API_URL` and
 //! `UM_MERGIFY_API_URL` override the two base URLs for development and tests, and admit
 //! `http`.
 
@@ -21,6 +22,7 @@ const MERGIFY_API: &str = "https://api.mergify.com";
 const GITHUB_API_VARIABLE: &str = "UM_GITHUB_API_URL";
 const MERGIFY_API_VARIABLE: &str = "UM_MERGIFY_API_URL";
 const TOKEN_VARIABLE: &str = "GITHUB_TOKEN";
+const MERGIFY_TOKEN_VARIABLE: &str = "MERGIFY_TOKEN";
 const PULL_REQUEST_PREFIX: &str = "https://github.com/";
 const TIMEOUT: Duration = Duration::from_secs(30);
 /// Mergify's error code for a pull request its per-pull-request endpoint does not hold.
@@ -134,23 +136,30 @@ impl PullRequest {
     }
 }
 
-/// Observes the queue of the pull request the wait's rule names, with the operator's token
+/// Observes the queue of the pull request the wait's rule names, with the operator's tokens
 /// and the configured APIs.
 pub(super) fn observe_queue_settled(
     wait: &WaitRecord,
 ) -> Result<Vec<ExternalEvent>, ConditionError> {
     let pull_request = PullRequest::of(wait)?;
     let token = token()?;
+    let mergify = mergify_token(std::env::var(MERGIFY_TOKEN_VARIABLE).ok())?;
     let endpoints = Endpoints::from_environment();
     let policy = endpoints.transport_policy();
-    settle(&pull_request, &endpoints, &token, &|request| {
-        provider_get(&request.url, request.accept, request.token, policy, TIMEOUT)
-            .map(|response| Response {
-                status: response.status,
-                body: response.body,
-            })
-            .map_err(|error| error.to_string())
-    })
+    settle(
+        &pull_request,
+        &endpoints,
+        &token,
+        mergify.as_deref(),
+        &|request| {
+            provider_get(&request.url, request.accept, request.token, policy, TIMEOUT)
+                .map(|response| Response {
+                    status: response.status,
+                    body: response.body,
+                })
+                .map_err(|error| error.to_string())
+        },
+    )
 }
 
 /// `GITHUB_TOKEN` when set and non-empty, else the trimmed output of `gh auth token`.
@@ -182,13 +191,33 @@ fn token() -> Result<String, ConditionError> {
     })
 }
 
+/// `MERGIFY_TOKEN`'s trimmed value when it is set and not blank, else none, the GitHub token
+/// then serving Mergify too. A value with whitespace inside is refused rather than replaced,
+/// so a run's Mergify reads keep one identity.
+fn mergify_token(value: Option<String>) -> Result<Option<String>, ConditionError> {
+    let Some(token) = value
+        .map(|value| value.trim().to_owned())
+        .filter(|token| !token.is_empty())
+    else {
+        return Ok(None);
+    };
+    if token.contains(char::is_whitespace) {
+        return Err(ConditionError::unavailable(format!(
+            "{MERGIFY_TOKEN_VARIABLE} holds whitespace inside its value; set it to one Mergify application key or unset it."
+        )));
+    }
+    Ok(Some(token))
+}
+
 /// The pull request's queue state: `merged` when GitHub reports it merged, `dequeued` when it
 /// is not and Mergify answers that its queue does not hold it, no event while Mergify holds
-/// it, and an error for any other answer.
+/// it, and an error for any other answer. GitHub is read with `token` and Mergify with
+/// `mergify`, else with `token`.
 fn settle(
     pull_request: &PullRequest,
     endpoints: &Endpoints,
     token: &str,
+    mergify: Option<&str>,
     requester: Requester<'_>,
 ) -> Result<Vec<ExternalEvent>, ConditionError> {
     let PullRequest {
@@ -197,7 +226,7 @@ fn settle(
         number,
         ..
     } = pull_request;
-    let get = |service: &str, url: String, accept| {
+    let get = |service: &str, url: String, accept, token| {
         requester(&Request { url, accept, token }).map_err(|error| {
             ConditionError::unavailable(format!(
                 "{service} could not be read for {}: {error}.",
@@ -233,6 +262,7 @@ fn settle(
             endpoints.github
         ),
         GITHUB_ACCEPT,
+        token,
     )?;
     if github.status != 200 {
         return Err(refused("GitHub", github.status));
@@ -254,24 +284,36 @@ fn settle(
         return Ok(vec![event(pull_request, "merged", head_sha)]);
     }
 
-    let mergify = get(
+    let queue = get(
         "Mergify",
         format!(
             "{}/v1/repos/{owner}/{repository}/merge-queue/pull/{number}",
             endpoints.mergify
         ),
         MERGIFY_ACCEPT,
+        mergify.unwrap_or(token),
     )?;
-    match mergify.status {
+    match queue.status {
         200 => {
-            object("Mergify", &mergify.body)?;
+            object("Mergify", &queue.body)?;
             Ok(Vec::new())
         }
-        404 if object("Mergify", &mergify.body).is_ok_and(|body| {
+        404 if object("Mergify", &queue.body).is_ok_and(|body| {
             body.get("error_code").and_then(Value::as_str) == Some(NOT_QUEUED)
         }) =>
         {
             Ok(vec![event(pull_request, "dequeued", head_sha)])
+        }
+        status @ (401 | 403) => {
+            let credential = if mergify.is_some() {
+                MERGIFY_TOKEN_VARIABLE.to_owned()
+            } else {
+                format!("the GitHub token ({MERGIFY_TOKEN_VARIABLE} is unset)")
+            };
+            Err(ConditionError::unavailable(format!(
+                "Mergify answered HTTP {status} for {} to {credential}: it refused the credential or the credential lacks permission for the repository; set {MERGIFY_TOKEN_VARIABLE} to a Mergify application key that can read it.",
+                pull_request.url
+            )))
         }
         status => Err(refused("Mergify", status)),
     }
@@ -335,15 +377,21 @@ mod tests {
         }
     }
 
-    /// Settles the pull request against scripted answers by URL, returning the result and
-    /// the URLs requested in order.
-    fn settled(
+    /// A settled result and what was requested, in order.
+    type Settled<T> = (Result<Vec<ExternalEvent>, ConditionError>, Vec<T>);
+
+    /// Settles the pull request against scripted answers by URL with the GitHub token `test`
+    /// and `mergify` as the Mergify token, returning the result and each request's URL and
+    /// token in order.
+    fn settled_with(
         answers: &[(&str, u16, Value)],
-    ) -> (Result<Vec<ExternalEvent>, ConditionError>, Vec<String>) {
+        mergify: Option<&str>,
+    ) -> Settled<(String, String)> {
         let requested = RefCell::new(Vec::new());
-        let result = settle(&pull_request(), &endpoints(), "test", &|request| {
-            assert_eq!(request.token, "test");
-            requested.borrow_mut().push(request.url.clone());
+        let result = settle(&pull_request(), &endpoints(), "test", mergify, &|request| {
+            requested
+                .borrow_mut()
+                .push((request.url.clone(), request.token.to_owned()));
             let (_, status, body) = answers
                 .iter()
                 .find(|(url, _, _)| *url == request.url)
@@ -354,6 +402,12 @@ mod tests {
             })
         });
         (result, requested.into_inner())
+    }
+
+    /// `settled_with` without a Mergify token, returning the URLs requested in order.
+    fn settled(answers: &[(&str, u16, Value)]) -> Settled<String> {
+        let (result, requested) = settled_with(answers, None);
+        (result, requested.into_iter().map(|(url, _)| url).collect())
     }
 
     fn pull(merged: bool) -> (&'static str, u16, Value) {
@@ -433,12 +487,71 @@ mod tests {
             assert_eq!(error.code, ConditionError::UNAVAILABLE, "{answers:?}");
             assert!(error.message.contains(cause), "{error}");
         }
-        let error = settle(&pull_request(), &endpoints(), "test", &|_| {
+        let error = settle(&pull_request(), &endpoints(), "test", None, &|_| {
             Err("connection refused".to_owned())
         })
         .unwrap_err();
         assert_eq!(error.code, ConditionError::UNAVAILABLE);
         assert!(error.message.contains("connection refused"), "{error}");
+    }
+
+    // REQ-WFEXEC-65: GitHub is read with the GitHub token and Mergify with `MERGIFY_TOKEN`
+    // when the CLI holds one, else with the GitHub token.
+    #[test]
+    fn mergify_is_read_with_its_own_token_when_one_is_held() {
+        let answers = [pull(false), (QUEUE, 200, json!({"number": 3958}))];
+        for (mergify, sent) in [(Some("mergify-key"), "mergify-key"), (None, "test")] {
+            let (result, requested) = settled_with(&answers, mergify);
+            assert_eq!(result.unwrap(), []);
+            assert_eq!(
+                requested,
+                [
+                    (PULL.to_owned(), "test".to_owned()),
+                    (QUEUE.to_owned(), sent.to_owned())
+                ]
+            );
+        }
+    }
+
+    // REQ-WFEXEC-65, REQ-CONTINUE-74: Mergify refusing the credential is unavailable, never an
+    // event, and the error names which credential was sent without its value.
+    #[test]
+    fn a_refused_mergify_credential_is_unavailable_and_named() {
+        for status in [401, 403] {
+            let answers = [pull(false), (QUEUE, status, json!({}))];
+            for (mergify, named) in [
+                (Some("mergify-key"), MERGIFY_TOKEN_VARIABLE),
+                (None, "GitHub token"),
+            ] {
+                let error = settled_with(&answers, mergify).0.unwrap_err();
+                assert_eq!(error.code, ConditionError::UNAVAILABLE);
+                assert!(error.message.contains(&status.to_string()), "{error}");
+                assert!(error.message.contains(named), "{error}");
+                assert!(!error.message.contains("mergify-key"), "{error}");
+                assert!(!error.message.contains("test"), "{error}");
+            }
+        }
+    }
+
+    // REQ-WFEXEC-65: an unset or blank `MERGIFY_TOKEN` falls back to the GitHub token; one with
+    // whitespace inside is refused rather than replaced.
+    #[test]
+    fn the_mergify_token_is_a_held_non_empty_value() {
+        for unset in [None, Some(""), Some("  \n")] {
+            assert_eq!(
+                mergify_token(unset.map(str::to_owned)).unwrap(),
+                None,
+                "{unset:?}"
+            );
+        }
+        assert_eq!(
+            mergify_token(Some(" mergify-key\n".to_owned())).unwrap(),
+            Some("mergify-key".to_owned())
+        );
+        let error = mergify_token(Some("mergify key".to_owned())).unwrap_err();
+        assert_eq!(error.code, ConditionError::UNAVAILABLE);
+        assert!(error.message.contains(MERGIFY_TOKEN_VARIABLE), "{error}");
+        assert!(!error.message.contains("mergify key"), "{error}");
     }
 
     // REQ-WFEXEC-65: the pull request comes from the rule's `event.pullRequest` conjunct.

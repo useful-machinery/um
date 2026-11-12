@@ -1,0 +1,136 @@
+{
+  "schemaVersion": 1,
+  "command": "um workflow run status",
+  "outcome": "status",
+  "exitStatus": 0,
+  "runDirectory": "/tmp/run",
+  "run": {
+    "schemaVersion": 1,
+    "localRunId": "52a51f00-96f1-4d6a-aa28-43f0cce8d16f",
+    "createdAt": "2026-08-17T00:00:00Z",
+    "workflowDigest": {
+      "algorithm": "sha256",
+      "value": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    "workflowManifestDigest": {
+      "algorithm": "sha256",
+      "value": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    }
+  },
+  "state": {
+    "schemaVersion": 1,
+    "localRunId": "52a51f00-96f1-4d6a-aa28-43f0cce8d16f",
+    "revision": 10,
+    "currentAttemptNumber": 1,
+    "attempts": [
+      {
+        "attemptId": "f77ecf09-28cd-435f-a567-82f0e59876b4",
+        "attemptNumber": 1,
+        "trigger": "initial",
+        "state": "workflow_failed",
+        "executionRoot": "/tmp/execution",
+        "createdAt": "2026-08-17T00:00:00Z",
+        "startedAt": "2026-08-17T00:00:00Z",
+        "settledAt": "2026-08-17T00:00:01Z",
+        "owner": {
+          "ownerNonce": "622c7ab4-7d32-4c57-81d4-953bd9d79d63",
+          "executionHost": {
+            "kind": "host_boot",
+            "value": "2133364d-1c26-469c-821e-9c8099b74692"
+          }
+        },
+        "progress": {
+          "acceptedOccurrenceOrdinal": 4,
+          "lastTransitionSequence": 6,
+          "steps": [
+            {
+              "id": "verify",
+              "role": "step",
+              "failurePolicy": "required",
+              "state": "failed",
+              "detail": {
+                "phase": "execution",
+                "code": "command_exit",
+                "exitCode": 75
+              },
+              "recovery": {
+                "schemaVersion": 1,
+                "configuredRetries": 1,
+                "handlerKind": "cmd",
+                "rounds": [
+                  {
+                    "number": 1,
+                    "failedExecution": {
+                      "executionNumber": 1,
+                      "invocationId": 1,
+                      "failure": {
+                        "phase": "execution",
+                        "cause": {
+                          "code": "command_exit",
+                          "exitCode": 75
+                        }
+                      }
+                    },
+                    "handler": {
+                      "kind": "cmd",
+                      "invocationId": 3,
+                      "outcome": "failed",
+                      "failure": {
+                        "phase": "start",
+                        "cause": {
+                          "code": "command_launch_failed",
+                          "diagnostic": {
+                            "launchFailure": "spawn",
+                            "osError": 35
+                          }
+                        }
+                      }
+                    }
+                  }
+                ],
+                "termination": {
+                  "kind": "handler_failed",
+                  "round": 1,
+                  "handlerFailure": {
+                    "phase": "start",
+                    "cause": {
+                      "code": "command_launch_failed",
+                      "diagnostic": {
+                        "launchFailure": "spawn",
+                        "osError": 35
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          ],
+          "outstandingActions": [],
+          "accounting": {
+            "maximumInvocations": 3,
+            "observedInvocations": 2,
+            "settledInvocations": 2,
+            "inputTokens": 0,
+            "outputTokens": 0,
+            "retainedDiagnosticBytes": 0,
+            "discardedDiagnosticBytes": 0
+          }
+        },
+        "processGuards": [],
+        "result": {
+          "status": "published",
+          "relativeDirectory": "attempts/000001/result"
+        },
+        "forceAbort": null
+      }
+    ],
+    "diagnostics": []
+  },
+  "record": null,
+  "recovery": {
+    "status": "settled"
+  },
+  "retry": {
+    "eligible": true
+  }
+}

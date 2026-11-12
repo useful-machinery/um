@@ -1,0 +1,120 @@
+{
+  "schemaVersion": 1,
+  "command": "um workflow run view",
+  "outcome": "view",
+  "exitStatus": 0,
+  "runDirectory": "/tmp/run",
+  "currentAttemptNumber": 1,
+  "attemptNumber": 1,
+  "selection": "current",
+  "trigger": "initial",
+  "attemptState": "workflow_failed",
+  "resultDirectory": "/tmp/run/attempts/000001/result",
+  "result": {
+    "schemaVersion": 1,
+    "attemptNumber": 1,
+    "workflow": {
+      "path": "workflow.yaml",
+      "provenance": {
+        "kind": "local",
+        "sourceRoot": "/tmp/source"
+      },
+      "digest": {
+        "algorithm": "sha256",
+        "value": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      }
+    },
+    "execution": {
+      "executionRoot": "/tmp/execution",
+      "maximumParallelSteps": 1,
+      "startedAt": "2026-08-17T00:00:00Z",
+      "finishedAt": "2026-08-17T00:00:01Z",
+      "durationMilliseconds": 1000
+    },
+    "commandOutputPolicy": {
+      "encoding": "base64",
+      "maximumRetainedBytesPerStream": 4194304
+    },
+    "outcome": "failed",
+    "primaryIssue": {
+      "node": {
+        "id": "verify",
+        "role": "step"
+      },
+      "state": "failed",
+      "detail": {
+        "phase": "execution",
+        "code": "command_exit",
+        "exitCode": 75
+      }
+    },
+    "steps": [
+      {
+        "id": "verify",
+        "role": "step",
+        "kind": "cmd",
+        "failurePolicy": "required",
+        "state": "failed",
+        "startedAt": "2026-08-17T00:00:00Z",
+        "durationMilliseconds": 1000,
+        "detail": {
+          "phase": "execution",
+          "code": "command_exit",
+          "exitCode": 75
+        },
+        "recovery": {
+          "schemaVersion": 1,
+          "configuredRetries": 1,
+          "handlerKind": "cmd",
+          "rounds": [
+            {
+              "number": 1,
+              "failedExecution": {
+                "executionNumber": 1,
+                "invocationId": 1,
+                "failure": {
+                  "phase": "execution",
+                  "cause": {
+                    "code": "command_exit",
+                    "exitCode": 75
+                  }
+                }
+              },
+              "handler": {
+                "kind": "cmd",
+                "invocationId": 3,
+                "outcome": "failed",
+                "failure": {
+                  "phase": "start",
+                  "cause": {
+                    "code": "command_launch_failed",
+                    "diagnostic": {
+                      "launchFailure": "Spawn",
+                      "osError": 35
+                    }
+                  }
+                }
+              }
+            }
+          ],
+          "termination": {
+            "kind": "handler_failed",
+            "round": 1,
+            "handlerFailure": {
+              "phase": "start",
+              "cause": {
+                "code": "command_launch_failed",
+                "diagnostic": {
+                  "launchFailure": "spawn",
+                  "osError": 35
+                }
+              }
+            }
+          }
+        }
+      }
+    ],
+    "exports": {},
+    "forceAbort": null
+  }
+}

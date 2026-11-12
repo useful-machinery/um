@@ -156,6 +156,14 @@ fn assert_failed(outcome: AgentOutcome, cause: AgentFailureCause) {
     assert_eq!(failure.cause(), &cause);
 }
 
+/// The failed invocation's `trackedWork` as the rejection record lists it (REQ-AGENT-74).
+fn tracked_work_value(outcome: &AgentOutcome) -> Value {
+    let AgentOutcome::Failed(failure) = outcome else {
+        panic!("expected agent failure, got {outcome:?}");
+    };
+    serde_json::to_value(failure.tracked_work().unwrap()).unwrap()
+}
+
 fn protocol_rejection_value(outcome: &AgentOutcome) -> Value {
     let AgentOutcome::Failed(failure) = outcome else {
         panic!("expected agent failure, got {outcome:?}");
@@ -903,7 +911,9 @@ fn listed_subagents(entries: &[&str]) -> Value {
 /// notifications queued together (an empty turn, then the notified turn; 2.1.321), the
 /// launching subagent finishing first with the nested one still running (the launcher's
 /// notification opens a turn with a model call; 2.1.310 and 2.1.321), and the nested one
-/// finishing first, reported to its launcher with no turn of its own.
+/// finishing first, reported to its launcher with no turn of its own. The launcher's frame with
+/// the nested call's result carries no `tool_use_result` on 2.1.310 and 2.1.321, where no
+/// subagent-thread `user` frame does (loopback captures of 2026-11-12, AUTO-343).
 fn backgrounded_nested_subagent_transcripts() -> [(&'static str, Vec<Value>); 3] {
     let base = backgrounded_subagent_transcript();
     let first_result = position_of(&base, |value| value["type"] == "result");
@@ -913,13 +923,10 @@ fn backgrounded_nested_subagent_transcripts() -> [(&'static str, Vec<Value>); 3]
     let tail = &base[emptied..];
     let mut launch = base[..=first_result].to_vec();
     launch.extend(nested_launch("general-purpose", true));
-    let mut launch_result = nested_call_result();
-    launch_result["tool_use_result"] =
-        json!({"status": "async_launched", "agentId": "nested-task"});
     launch.extend([
         listed_subagents(&["t1", "nested-task"]),
         nested_subagent_started("general-purpose", true),
-        launch_result,
+        nested_call_result(),
     ]);
     let run = nested_run();
 
@@ -972,41 +979,63 @@ fn backgrounded_nested_subagent_transcripts() -> [(&'static str, Vec<Value>); 3]
     ]
 }
 
+/// A Response-mode replay of `values`, one order of a nested subagent in the background,
+/// completes with the final turn's text and shows both subagents start and complete, and no
+/// turn before the last completes the step while the nested subagent runs. Returns the
+/// observations of the whole replay.
+fn assert_nested_subagent_is_background_work(
+    order: &str,
+    values: &[Value],
+) -> Vec<AgentObservation> {
+    let (observations, outcome) = replay(&framed(values), AgentValueKind::Response, 1024);
+    assert_eq!(completed_response(&outcome), "final", "{order}");
+    assert_eq!(subagent_statuses(&observations), ["started", "completed"]);
+    assert_eq!(
+        test_support::subagent_statuses(&observations, NESTED_DESCRIPTION),
+        ["started", "completed"],
+        "{order}"
+    );
+    let last_result = values
+        .iter()
+        .rposition(|value| value["type"] == "result")
+        .unwrap();
+    let (earlier, _) = replay(
+        &framed(&values[..last_result]),
+        AgentValueKind::Response,
+        1024,
+    );
+    assert_eq!(
+        milestone_count(&earlier, AgentLifecycleMilestone::HarnessCompleted),
+        0,
+        "{order}"
+    );
+    assert_eq!(
+        milestone_count(&earlier, AgentLifecycleMilestone::TurnCompleted),
+        values[..last_result]
+            .iter()
+            .filter(|value| value["type"] == "result")
+            .count(),
+        "{order}"
+    );
+    observations
+}
+
+/// The subagent `task_id` as the failed invocation's `trackedWork` records it.
+fn tracked_subagent(outcome: &AgentOutcome, task_id: &str) -> Value {
+    tracked_work_value(outcome)["subagents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|subagent| subagent["taskId"] == task_id)
+        .unwrap()
+        .clone()
+}
+
 // REQ-AGENT-82, REQ-AGENT-64, REQ-AGENT-35, REQ-AGENT-69, INV-HARNESS-15 (AUTO-283)
 #[test]
 fn a_backgrounded_subagent_a_subagent_started_is_background_work_of_the_step() {
     for (order, values) in backgrounded_nested_subagent_transcripts() {
-        let (observations, outcome) = replay(&framed(&values), AgentValueKind::Response, 1024);
-        assert_eq!(completed_response(&outcome), "final", "{order}");
-        assert_eq!(subagent_statuses(&observations), ["started", "completed"]);
-        assert_eq!(
-            test_support::subagent_statuses(&observations, NESTED_DESCRIPTION),
-            ["started", "completed"],
-            "{order}"
-        );
-        // No turn before the last completes the step while the nested subagent runs.
-        let last_result = values
-            .iter()
-            .rposition(|value| value["type"] == "result")
-            .unwrap();
-        let (observations, _) = replay(
-            &framed(&values[..last_result]),
-            AgentValueKind::Response,
-            1024,
-        );
-        assert_eq!(
-            milestone_count(&observations, AgentLifecycleMilestone::HarnessCompleted),
-            0,
-            "{order}"
-        );
-        assert_eq!(
-            milestone_count(&observations, AgentLifecycleMilestone::TurnCompleted),
-            values[..last_result]
-                .iter()
-                .filter(|value| value["type"] == "result")
-                .count(),
-            "{order}"
-        );
+        assert_nested_subagent_is_background_work(order, &values);
     }
 
     // In Result mode the turn the launcher's notification opens, ending with a candidate
@@ -1029,6 +1058,67 @@ fn a_backgrounded_subagent_a_subagent_started_is_background_work_of_the_step() {
             }
         ))
     );
+}
+
+// REQ-AGENT-82, REQ-AGENT-35, REQ-AGENT-74, INV-HARNESS-15 (AUTO-343)
+// A nested launch registered in the foreground and moved by a `task_updated` patch, the
+// shape UM-3077 read on the main thread; neither captured release registered one so.
+#[test]
+fn a_nested_subagent_moved_to_the_background_after_its_start_is_background_work_of_the_step() {
+    for (order, mut values) in backgrounded_nested_subagent_transcripts() {
+        let start = position_of(&values, |value| {
+            value["subtype"] == "task_started" && value["task_id"] == "nested-task"
+        });
+        values[start]["is_backgrounded"] = json!(false);
+
+        let mut moved = values.clone();
+        moved.insert(
+            start + 1,
+            system_event(
+                "task_updated",
+                json!({"task_id": "nested-task", "run_id": "nested-run",
+                    "patch": {"is_backgrounded": true}}),
+            ),
+        );
+        let observations = assert_nested_subagent_is_background_work(order, &moved);
+        assert_eq!(
+            unrecognized_events(&observations),
+            Vec::<&Value>::new(),
+            "{order}"
+        );
+
+        // Unmoved, a nested subagent that outlives its launcher is refused at the task list
+        // naming it alone, and the record names it in the foreground under its launcher.
+        let (_, outcome) = replay(&framed(&values), AgentValueKind::Response, 1024);
+        if order == "finishing first" {
+            assert_eq!(completed_response(&outcome), "final");
+            continue;
+        }
+        let rejection = protocol_rejection_value(&outcome);
+        assert_eq!(
+            rejection["detail"]["reason"], "terminal_drain_event_invalid",
+            "{order}"
+        );
+        assert_eq!(rejection["detail"]["outerEvent"], "system", "{order}");
+        assert_eq!(
+            stream_excerpt_value(&outcome)["rejectedLine"]["text"],
+            serde_json::to_string(&listed_subagents(&["nested-task"])).unwrap(),
+            "{order}"
+        );
+        assert_eq!(
+            tracked_subagent(&outcome, "nested-task"),
+            json!({"taskId": "nested-task", "agentCallId": "nested-call",
+                "toolUseId": "nested-call", "runId": "nested-run", "backgrounded": false,
+                "notified": false, "parentTaskId": "t1"}),
+            "{order}"
+        );
+        let launcher = tracked_subagent(&outcome, "t1");
+        assert_eq!(
+            (&launcher["backgrounded"], &launcher["notified"]),
+            (&json!(true), &json!(true)),
+            "{order}"
+        );
+    }
 }
 
 // REQ-AGENT-82, REQ-AGENT-64, REQ-AGENT-35, REQ-AGENT-69, REQ-AGENT-74, INV-HARNESS-15 (AUTO-283)
@@ -1082,19 +1172,9 @@ fn a_nested_subagent_no_live_subagent_owns_is_refused() {
 
     // The record names the orphaned subagent's launcher.
     let (_, outcome) = replay(&framed(&orphaned), AgentValueKind::Response, 1024);
-    let AgentOutcome::Failed(failure) = &outcome else {
-        panic!("the orphaned message must fail the invocation, got {outcome:?}");
-    };
-    let tracked = serde_json::to_value(failure.tracked_work().unwrap()).unwrap();
-    let nested = tracked["subagents"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|subagent| subagent["taskId"] == "nested-task")
-        .unwrap();
     assert_eq!(
-        nested,
-        &json!({"taskId": "nested-task", "agentCallId": "nested-call",
+        tracked_subagent(&outcome, "nested-task"),
+        json!({"taskId": "nested-task", "agentCallId": "nested-call",
             "toolUseId": "nested-call", "runId": "nested-run", "backgrounded": false,
             "notified": false, "parentTaskId": "t1"})
     );
@@ -1919,10 +1999,7 @@ fn a_refused_init_records_the_tracked_work_the_parser_held() {
         protocol_rejection_value(&outcome)["detail"]["reason"],
         "initialization_invalid"
     );
-    let AgentOutcome::Failed(failure) = &outcome else {
-        panic!("the refused init must fail the invocation, got {outcome:?}");
-    };
-    let tracked = serde_json::to_value(failure.tracked_work().unwrap()).unwrap();
+    let tracked = tracked_work_value(&outcome);
     assert_eq!(
         tracked,
         json!({
@@ -1971,10 +2048,7 @@ fn the_recorded_tracked_work_keeps_the_newest_sixteen_of_each_list() {
     values.push(init(QUALIFICATION_VERSION, SESSION_ID));
 
     let (_, outcome) = replay(&framed(&values), AgentValueKind::Result, 1024);
-    let AgentOutcome::Failed(failure) = &outcome else {
-        panic!("the refused init must fail the invocation, got {outcome:?}");
-    };
-    let tracked = serde_json::to_value(failure.tracked_work().unwrap()).unwrap();
+    let tracked = tracked_work_value(&outcome);
     let recorded = tracked["backgroundCommands"].as_array().unwrap();
     assert_eq!(recorded.len(), 16);
     assert_eq!(recorded[0]["taskId"], "task-1");
@@ -1985,6 +2059,10 @@ fn the_recorded_tracked_work_keeps_the_newest_sixteen_of_each_list() {
 
 /// A subagent's own Bash call moving to the background: its task start and the tool
 /// result naming that task's `backgroundTaskId`, neither of which this invocation tracks.
+/// The result's `tool_use_result` is 2.1.306's shape (UM-2841): 2.1.310 and 2.1.321 put none
+/// on a subagent's thread, where the start's `is_backgrounded: true` alone says so (AUTO-343),
+/// so a transcript of a later release that splices this in carries that one field as 2.1.306
+/// wrote it.
 fn subagent_backgrounded_bash_run() -> [Value; 2] {
     let mut tool_result = subagent_message(
         "user",
@@ -2762,10 +2840,7 @@ fn a_turn_that_waits_for_a_subagents_own_background_work_holds_the_step() {
         protocol_rejection_value(&outcome)["detail"]["reason"],
         "end_of_stream_invariant_invalid"
     );
-    let AgentOutcome::Failed(failure) = &outcome else {
-        panic!("the cut stream must fail, got {outcome:?}");
-    };
-    let tracked = serde_json::to_value(failure.tracked_work().unwrap()).unwrap();
+    let tracked = tracked_work_value(&outcome);
     assert!(
         tracked["subagentTasks"].as_array().unwrap().contains(
             &json!({"taskId": "sub-watch-task", "backgrounded": true, "notified": false})

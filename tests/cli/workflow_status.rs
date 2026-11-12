@@ -418,6 +418,10 @@ fn status_json_records_when_a_step_that_ran_started() {
     assert!(!status_schema().is_valid(&pending), "{pending}");
 }
 
+// REQ-WFRECOVERY-62: `valid/recovery-handler-launch-diagnostic.json` carries a recovery
+// handler's `command_launch_failed` diagnostic, and
+// `invalid/recovery-handler-launch-diagnostic-slug.json` is refused for its `launchFailure`
+// that is no slug.
 #[test]
 fn closed_status_schema_accepts_positive_and_rejects_negative_fixtures() {
     let validator = status_schema();

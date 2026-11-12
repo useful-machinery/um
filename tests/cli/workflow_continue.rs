@@ -3112,8 +3112,8 @@ pub(super) enum QueueAnswer {
 /// `pull_request.queue_settled` condition reads (REQ-WFEXEC-65): it serves
 /// `GET /repos/useful-machinery/platform/pulls/3958` and
 /// `GET /v1/repos/useful-machinery/platform/merge-queue/pull/3958` as its answer says and
-/// records each request's head. `command` points a `um` invocation at it with the token
-/// `test`.
+/// records each request's head. `command` points a `um` invocation at it with the GitHub token
+/// `test` and no `MERGIFY_TOKEN`.
 pub(super) struct QueueStub {
     base: String,
     answer: std::sync::Arc<std::sync::Mutex<QueueAnswer>>,
@@ -3185,11 +3185,34 @@ impl QueueStub {
         self.requests.lock().unwrap().clone()
     }
 
-    /// `um` with `args`, its GitHub token `test` and both APIs at the stub.
+    /// The path and bearer token of every request served so far, in order.
+    pub(super) fn bearers(&self) -> Vec<(String, String)> {
+        self.requests()
+            .iter()
+            .map(|head| {
+                let path = head.split(' ').nth(1).unwrap_or_default().to_owned();
+                let bearer = head.lines().find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    let value = value.trim();
+                    name.eq_ignore_ascii_case("authorization")
+                        .then(|| {
+                            value
+                                .strip_prefix("Bearer ")
+                                .or(value.strip_prefix("bearer "))
+                        })
+                        .flatten()
+                });
+                (path, bearer.unwrap_or_default().to_owned())
+            })
+            .collect()
+    }
+
+    /// `um` with `args`, its GitHub token `test`, no `MERGIFY_TOKEN` and both APIs at the stub.
     pub(super) fn command(&self, args: &[String]) -> std::process::Command {
         let mut command = isolated_command(args);
         command
             .env("GITHUB_TOKEN", "test")
+            .env_remove("MERGIFY_TOKEN")
             .env("UM_GITHUB_API_URL", &self.base)
             .env("UM_MERGIFY_API_URL", &self.base)
             .env("NO_PROXY", "127.0.0.1")
@@ -3199,8 +3222,9 @@ impl QueueStub {
 }
 
 // REQ-WFEXEC-65, REQ-CONTINUE-74, REQ-CONTINUE-75: `merge` admitted to the queue waits for
-// the pull request `design` exported; `resume` holds while it is queued, refuses a condition
-// it cannot read, and continues at `merge` once the pull request is merged.
+// the pull request `design` exported; `resume` holds while it is queued, reading Mergify with
+// `MERGIFY_TOKEN` when it is set and else with the GitHub token, refuses a condition it cannot
+// read, and continues at `merge` once the pull request is merged.
 #[test]
 fn an_external_wait_holds_while_queued_and_continues_once_merged() {
     let bundle = loop_tree();
@@ -3239,14 +3263,23 @@ fn an_external_wait_holds_while_queued_and_continues_once_merged() {
     assert_eq!(held["wait"], wait);
     assert_eq!(fs::read(run.join("state.json")).unwrap(), state);
     assert_eq!(attempt_count(&run), 1);
-    let requests = stub.requests();
-    assert_eq!(requests.len(), 2, "{requests:?}");
-    assert!(
-        requests.iter().all(|request| request
-            .lines()
-            .any(|line| line.eq_ignore_ascii_case("authorization: bearer test"))),
-        "{requests:?}"
-    );
+    const PULL_PATH: &str = "/repos/useful-machinery/platform/pulls/3958";
+    const QUEUE_PATH: &str = "/v1/repos/useful-machinery/platform/merge-queue/pull/3958";
+    let sent = |github: &str, mergify: &str| {
+        vec![
+            (PULL_PATH.to_owned(), github.to_owned()),
+            (QUEUE_PATH.to_owned(), mergify.to_owned()),
+        ]
+    };
+    assert_eq!(stub.bearers(), sent("test", "test"));
+
+    // REQ-WFEXEC-65: with `MERGIFY_TOKEN` in the CLI's environment, Mergify is read with it.
+    let mut command = stub.command(&continue_args(&run, &[]));
+    command.env("MERGIFY_TOKEN", "mergify-key");
+    let held = completed(&command.output().unwrap());
+    assert_eq!(held["outcome"], "waiting", "{held}");
+    assert_eq!(fs::read(run.join("state.json")).unwrap(), state);
+    assert_eq!(stub.bearers()[2..], sent("test", "mergify-key"));
 
     // A condition the CLI cannot read is refused and changes nothing.
     stub.answer(QueueAnswer::Failing);
