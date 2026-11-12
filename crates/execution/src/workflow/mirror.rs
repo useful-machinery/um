@@ -555,9 +555,15 @@ impl Mirror {
         )
     }
 
+    /// Whether `onOutcome` maps `outcome`, so that `outcome` performs a write
+    /// (REQ-LOCALRUN-204).
+    pub fn maps_outcome(&self, outcome: &str) -> bool {
+        self.block.on_outcome.contains_key(outcome)
+    }
+
     /// `onOutcome.<outcome>`, once the run record reads `exited` with `outcome`: the issue
     /// moves to the bound state unless the entry's guard holds over the issue's state, read
-    /// once.
+    /// once. An outcome the block does not map (`maps_outcome`) writes nothing.
     pub fn outcome(
         &self,
         target: &dyn MirrorTarget,

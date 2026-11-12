@@ -110,17 +110,28 @@ impl LinearTarget {
         }
     }
 
+    /// Whether the target holds a key: `mirror_credentials_unavailable` when
+    /// `LINEAR_API_KEY` is unset or empty (REQ-LOCALRUN-192). Every request takes its key
+    /// from here, so a check before a write and the write agree (REQ-LOCALRUN-204).
+    pub(super) fn credentials(&self) -> Result<(), MirrorFailure> {
+        self.key().map(|_| ())
+    }
+
+    fn key(&self) -> Result<&str, MirrorFailure> {
+        self.key.as_deref().map(String::as_str).ok_or_else(|| {
+            MirrorFailure::credentials_unavailable(format!(
+                "{KEY_VARIABLE} is unset or empty, so Linear cannot be written."
+            ))
+        })
+    }
+
     /// The `data` of one GraphQL `operation` with `variables`, or the classified failure.
     fn post(
         &self,
         (operation, query): (&str, &str),
         variables: Value,
     ) -> Result<Value, MirrorFailure> {
-        let key = self.key.as_ref().ok_or_else(|| {
-            MirrorFailure::credentials_unavailable(format!(
-                "{KEY_VARIABLE} is unset or empty, so Linear cannot be written."
-            ))
-        })?;
+        let key = self.key()?;
         let body = serde_json::to_vec(&json!({
             "operationName": operation,
             "query": query,
@@ -525,12 +536,14 @@ mod tests {
         assert_eq!(failure.code, MirrorFailure::UNAVAILABLE);
     }
 
-    // REQ-LOCALRUN-192: without a key nothing is sent.
+    // REQ-LOCALRUN-192, REQ-LOCALRUN-204: without a key the check before a write and every
+    // write fail alike and nothing is sent; with one the check passes.
     #[test]
     fn an_unset_or_empty_key_fails_before_any_request() {
         for key in [None, Some("")] {
             let (target, seen) = linear(key, Vec::new());
             for failure in [
+                target.credentials().unwrap_err(),
                 target.comment("AUTO-143", "x").unwrap_err(),
                 target.issue_state("AUTO-143").unwrap_err(),
                 target.set_state("AUTO-143", "Done").unwrap_err(),
@@ -539,5 +552,6 @@ mod tests {
             }
             assert!(seen.borrow().is_empty());
         }
+        assert_eq!(linear(Some("key"), Vec::new()).0.credentials(), Ok(()));
     }
 }

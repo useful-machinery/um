@@ -292,6 +292,20 @@ pub(super) async fn continue_run(
             let mirror = super::mirror::read_run_record(&run_directory).and_then(|record| {
                 super::mirror::run_mirror(&record, &workflow.definition, inputs, &run_directory)
             });
+            // REQ-LOCALRUN-204: a write without credentials refuses before the run changes;
+            // the run still waits, so the settlement writes nothing.
+            if let Err(failure) =
+                super::mirror::outcome_credentials(mirror.as_ref(), WITHDRAWN_OUTCOME)
+            {
+                let result = refusal(
+                    &config,
+                    leaf,
+                    &pending,
+                    failure.code,
+                    super::mirror::CREDENTIALS_REFUSAL,
+                );
+                return reject_after_settlement(pending, &signal_task, result).await;
+            }
             let withdrawn = tokio::task::spawn_blocking(move || {
                 pending.withdraw()?;
                 if let Some(mirror) = &mirror {

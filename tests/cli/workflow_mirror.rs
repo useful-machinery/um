@@ -10,10 +10,12 @@ use std::sync::{Arc, Mutex};
 
 use serde_json::{Value, json};
 
-use super::workflow_continue::{WAIT_TREE_ROOT, completed, decide, wait_tree};
+use super::workflow_continue::{
+    WAIT_TREE_ROOT, append_control, completed, control, decide, ordinals_of, wait_tree,
+};
 use super::workflow_definition::{Home, Tree, read_json};
 use super::workflow_run::{TreeBundle, isolated_command, run_record};
-use super::workflow_run_control::LiveRun;
+use super::workflow_run_control::{LiveRun, refused};
 use super::workflow_run_create::Published;
 
 /// The login name the mirrored runs are created by, which `{{operator}}` renders.
@@ -466,11 +468,12 @@ struct MirroredWaitTree {
 }
 
 impl MirroredWaitTree {
-    fn publish() -> Self {
+    /// The wait tree published with `header` in place of its first line.
+    fn publish(header: &str) -> Self {
         let bundle = wait_tree();
         bundle.write_source(
             "workflow.yaml",
-            &WAIT_TREE_ROOT.replacen("schemaVersion: 1\n", MIRRORED_WAIT_HEADER, 1),
+            &WAIT_TREE_ROOT.replacen("schemaVersion: 1\n", header, 1),
         );
         let home = Home::new();
         let report = home.json(&["publish", bundle.source_root().to_str().unwrap()]);
@@ -485,11 +488,21 @@ impl MirroredWaitTree {
 
     /// `um workflow run ARGS` under the home, pointed at `stub`.
     fn run(&self, stub: &LinearStub, args: &[&str]) -> Output {
+        self.run_adjusted(stub, args, |command| command)
+    }
+
+    /// `run` with its command, once pointed at `stub`, adjusted by `adjust`.
+    fn run_adjusted(
+        &self,
+        stub: &LinearStub,
+        args: &[&str],
+        adjust: impl FnOnce(&mut Command) -> &mut Command,
+    ) -> Output {
         let mut full = vec!["workflow".to_owned(), "run".to_owned()];
         full.extend(args.iter().map(|arg| (*arg).to_owned()));
         let mut command = isolated_command(&full);
         command.env("UM_HOME", self.home.path());
-        stub.point(&mut command).output().unwrap()
+        adjust(stub.point(&mut command)).output().unwrap()
     }
 
     /// A run for `ticket` whose `design` stage holds its step: the live process.
@@ -534,7 +547,12 @@ impl MirroredWaitTree {
 
     /// A run for `ticket` whose `design` waits on an answer.
     fn waiting(&self, stub: &LinearStub, ticket: &str) -> PathBuf {
-        decide(&self.bundle, "design", "blocked");
+        self.waiting_after(stub, ticket, "blocked", "answer")
+    }
+
+    /// A run for `ticket` whose `design` decided `verdict` and waits on `kind`.
+    fn waiting_after(&self, stub: &LinearStub, ticket: &str, verdict: &str, kind: &str) -> PathBuf {
+        decide(&self.bundle, "design", verdict);
         let execution_root = self.bundle.execution_root().to_str().unwrap().to_owned();
         let terminal = completed(&self.run(
             stub,
@@ -549,7 +567,7 @@ impl MirroredWaitTree {
                 "--json",
             ],
         ));
-        assert_eq!(terminal["wait"]["kind"], "answer", "{terminal}");
+        assert_eq!(terminal["wait"]["kind"], kind, "{terminal}");
         PathBuf::from(terminal["runDirectory"].as_str().unwrap())
     }
 }
@@ -561,7 +579,7 @@ impl MirroredWaitTree {
 // `cancel` moves an issue still in it to the bound `Canceled`, and `show` lists every write.
 #[test]
 fn a_tickets_lifecycle_is_mirrored_and_show_lists_every_write() {
-    let tree = MirroredWaitTree::publish();
+    let tree = MirroredWaitTree::publish(MIRRORED_WAIT_HEADER);
     let stub = LinearStub::start();
 
     let run = tree.waiting(&stub, "AUTO-1");
@@ -657,13 +675,13 @@ fn a_tickets_lifecycle_is_mirrored_and_show_lists_every_write() {
     );
 }
 
-// SC-LOCALRUN-15, REQ-LOCALRUN-191, REQ-LOCALRUN-135, REQ-LOCALRUN-186: SIGINT to the process
-// of a mirrored run interrupts its stage, whose repair wait's `onWait` comment begins with the
-// interruption, and the run writes no `onOutcome`; a live run ended by `cancel` still writes
-// `onOutcome.canceled`.
+// SC-LOCALRUN-15, REQ-LOCALRUN-191, REQ-LOCALRUN-135, REQ-LOCALRUN-186, REQ-LOCALRUN-204:
+// SIGINT to the process of a mirrored run interrupts its stage, whose repair wait's `onWait`
+// comment begins with the interruption, and the run writes no `onOutcome`; a live run ended
+// by `cancel`, even from a shell without the key, still writes `onOutcome.canceled`.
 #[test]
 fn an_interrupted_run_mirrors_its_wait_and_a_cancelled_one_its_outcome() {
-    let tree = MirroredWaitTree::publish();
+    let tree = MirroredWaitTree::publish(MIRRORED_WAIT_HEADER);
     let stub = LinearStub::start();
 
     let output = tree
@@ -697,9 +715,11 @@ fn an_interrupted_run_mirrors_its_wait_and_a_cancelled_one_its_outcome() {
     );
     assert!(!stub.operations().contains(&"UpdateIssueState".to_owned()));
 
+    // A live run is cancelled from a shell without the key: the process that holds it writes
+    // `onOutcome.canceled` with its own (REQ-LOCALRUN-204).
     stub.clear();
     let mut live = tree.held(&stub, "AUTO-2");
-    let output = tree.run(&stub, &["cancel", "AUTO-2", "--json"]);
+    let output = tree.run_adjusted(&stub, &["cancel", "AUTO-2", "--json"], without_key);
     assert_eq!(output.status.code(), Some(0), "{output:?}");
     let exited = super::poll_until(
         "the cancelled run's process exit",
@@ -717,5 +737,215 @@ fn an_interrupted_run_mirrors_its_wait_and_a_cancelled_one_its_outcome() {
     assert_eq!(
         write["action"],
         json!({"kind": "state", "state": "Canceled", "binding": "canceled"})
+    );
+}
+
+/// `command` without `LINEAR_API_KEY`.
+fn without_key(command: &mut Command) -> &mut Command {
+    command.env_remove("LINEAR_API_KEY")
+}
+
+/// `command` with `LINEAR_API_KEY` set to the empty string.
+fn with_empty_key(command: &mut Command) -> &mut Command {
+    command.env("LINEAR_API_KEY", "")
+}
+
+/// The names of the run's mirror writes, in ordinal order.
+fn mirror_names(run: &Path) -> Vec<String> {
+    mirror_writes(run)
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect()
+}
+
+/// The names of the run's controls, in ordinal order; none before the first is appended.
+fn control_names(run: &Path) -> Vec<String> {
+    let controls = run.join("controls");
+    if controls.exists() {
+        ordinals_of(&controls)
+    } else {
+        Vec::new()
+    }
+}
+
+/// Checks that `output` is `leaf` refused `mirror_credentials_unavailable` with a message
+/// naming the variable.
+fn refused_without_key(output: &Output, leaf: &str) {
+    let document = refused(output, leaf, "mirror_credentials_unavailable");
+    let message = document["diagnostics"][0]["message"].as_str().unwrap();
+    assert!(message.contains("LINEAR_API_KEY"), "{document}");
+}
+
+// SC-LOCALRUN-17, REQ-LOCALRUN-204, REQ-LOCALRUN-181, REQ-LOCALRUN-186: `withdraw` and
+// `cancel` of a mirrored waiting run from a shell whose `LINEAR_API_KEY` is unset or empty
+// are refused before anything changes and nothing is sent, and the same `cancel` with the key
+// ends the run and moves its issue.
+#[test]
+fn ending_a_mirrored_waiting_run_without_the_key_is_refused_before_anything_changes() {
+    let tree = MirroredWaitTree::publish(MIRRORED_WAIT_HEADER);
+    let stub = LinearStub::start();
+
+    let run = tree.waiting(&stub, "AUTO-1");
+    let record = fs::read(run.join("run.json")).unwrap();
+    let wait = fs::read(run.join("wait.json")).unwrap();
+    let writes = mirror_names(&run);
+    stub.clear();
+    let path = run.to_str().unwrap();
+    for leaf in ["withdraw", "cancel"] {
+        for adjust in [without_key, with_empty_key] {
+            refused_without_key(
+                &tree.run_adjusted(&stub, &[leaf, path, "--json"], adjust),
+                leaf,
+            );
+            assert_eq!(control_names(&run), Vec::<String>::new());
+            assert_eq!(fs::read(run.join("run.json")).unwrap(), record);
+            assert_eq!(fs::read(run.join("wait.json")).unwrap(), wait);
+            assert_eq!(mirror_names(&run), writes);
+            assert_eq!(stub.bodies(), Vec::<Value>::new());
+        }
+    }
+
+    let output = tree.run(&stub, &["cancel", path, "--json"]);
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let record = run_record(&run);
+    assert_eq!(record["state"], "exited", "{record}");
+    assert_eq!(record["outcome"], "canceled", "{record}");
+    assert_eq!(control_names(&run), ["0001-cancel.json"]);
+    let writes = mirror_writes(&run);
+    let (name, write) = writes.last().unwrap();
+    assert_eq!(name, "0004-outcome.json");
+    assert_eq!(write["outcome"], "written", "{write}");
+}
+
+// REQ-LOCALRUN-204, REQ-LOCALRUN-186, REQ-CONTINUE-2: `cancel` of a mirrored `running` run
+// whose process is gone, from a shell without the key, is refused and leaves the abandoned
+// attempt unsettled, so the same `cancel` with the key ends the run.
+#[test]
+fn ending_a_mirrored_abandoned_run_without_the_key_is_refused_before_anything_changes() {
+    let tree = MirroredWaitTree::publish(MIRRORED_WAIT_HEADER);
+    let stub = LinearStub::start();
+
+    let mut live = tree.held(&stub, "AUTO-2");
+    let shown = tree.run(&stub, &["show", "AUTO-2", "--json"]);
+    assert_eq!(shown.status.code(), Some(0), "{shown:?}");
+    let shown: Value = serde_json::from_slice(&shown.stdout).unwrap();
+    let run = PathBuf::from(shown["runDirectory"].as_str().unwrap());
+    live.process.kill().unwrap();
+    live.process.wait().unwrap();
+    assert_eq!(run_record(&run)["state"], "running");
+    fs::write(&live.release, "").unwrap();
+
+    // The orphaned step process ends first; until it does, the attempt's ownership is
+    // unproven and the command fails without a document.
+    let path = run.to_str().unwrap();
+    let output = super::poll_until(
+        "the abandoned run's refused cancel",
+        || tree.run_adjusted(&stub, &["cancel", path, "--json"], without_key),
+        |output| {
+            serde_json::from_slice::<Value>(&output.stdout)
+                .is_ok_and(|document| document["outcome"] != Value::Null)
+        },
+    );
+    refused_without_key(&output, "cancel");
+    assert_eq!(run_record(&run)["state"], "running");
+    assert_eq!(control_names(&run), Vec::<String>::new());
+    assert!(
+        !mirror_names(&run)
+            .iter()
+            .any(|name| name.ends_with("-outcome.json")),
+        "{:?}",
+        mirror_names(&run)
+    );
+
+    let output = tree.run(&stub, &["cancel", path, "--json"]);
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let document: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(document["outcome"], "canceled", "{document}");
+    assert_eq!(run_record(&run)["outcome"], "canceled");
+}
+
+// REQ-LOCALRUN-204: a mirror whose `onOutcome` does not map the outcome writes nothing, so
+// `withdraw` without the key ends the run.
+#[test]
+fn a_mirror_that_does_not_map_the_outcome_needs_no_key() {
+    let withdrawn = "      withdrawn: {state: $backlog, unless: issue.state != $ownedState}\n";
+    assert!(MIRRORED_WAIT_HEADER.contains(withdrawn));
+    let tree = MirroredWaitTree::publish(&MIRRORED_WAIT_HEADER.replacen(withdrawn, "", 1));
+    let stub = LinearStub::start();
+
+    let run = tree.waiting(&stub, "AUTO-3");
+    let writes = mirror_names(&run);
+    let output = tree.run_adjusted(
+        &stub,
+        &["withdraw", run.to_str().unwrap(), "--json"],
+        without_key,
+    );
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let document: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(document["outcome"], "withdrawn", "{document}");
+    assert_eq!(run_record(&run)["outcome"], "withdrawn");
+    assert_eq!(mirror_names(&run), writes);
+}
+
+// REQ-LOCALRUN-204, REQ-CONTINUE-75: `resume` of a mirrored run whose repair wait a recorded
+// `control.withdraw` resolves, from a shell without the key, is refused at phase
+// `continuation` and keeps waiting with the control recorded; the same `resume` with the key
+// withdraws the run and moves its issue.
+#[test]
+fn resuming_a_recorded_withdrawal_without_the_key_is_refused_and_keeps_the_run_waiting() {
+    let tree = MirroredWaitTree::publish(MIRRORED_WAIT_HEADER);
+    let stub = LinearStub::start();
+
+    let run = tree.waiting_after(&stub, "AUTO-4", "failed", "repair");
+    let wait = fs::read(run.join("wait.json")).unwrap();
+    append_control(
+        &run,
+        &control(
+            &run,
+            "control.withdraw",
+            Some(&read_json(&run.join("wait.json"))),
+            json!({}),
+        ),
+    );
+    stub.clear();
+    let path = run.to_str().unwrap();
+
+    let output = tree.run_adjusted(&stub, &["resume", path, "--json"], without_key);
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let document: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(document["outcome"], "rejected", "{document}");
+    assert_eq!(document["phase"], "continuation", "{document}");
+    let diagnostics = document["diagnostics"].as_array().unwrap();
+    assert_eq!(diagnostics.len(), 1, "{document}");
+    assert_eq!(
+        diagnostics[0]["code"], "mirror_credentials_unavailable",
+        "{document}"
+    );
+    assert_eq!(run_record(&run)["state"], "waiting");
+    assert_eq!(fs::read(run.join("wait.json")).unwrap(), wait);
+    assert_eq!(control_names(&run), ["0001-withdraw.json"]);
+    assert!(
+        !mirror_names(&run)
+            .iter()
+            .any(|name| name.ends_with("-outcome.json")),
+        "{:?}",
+        mirror_names(&run)
+    );
+    assert_eq!(stub.bodies(), Vec::<Value>::new());
+
+    let output = tree.run(&stub, &["resume", path, "--json"]);
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let document: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(document["outcome"], "withdrawn", "{document}");
+    let record = run_record(&run);
+    assert_eq!(record["state"], "exited", "{record}");
+    assert_eq!(record["outcome"], "withdrawn", "{record}");
+    let writes = mirror_writes(&run);
+    let (name, write) = writes.last().unwrap();
+    assert!(name.ends_with("-outcome.json"), "{writes:?}");
+    assert_eq!(write["outcome"], "written", "{write}");
+    assert_eq!(
+        write["action"],
+        json!({"kind": "state", "state": "Backlog", "binding": "backlog"})
     );
 }

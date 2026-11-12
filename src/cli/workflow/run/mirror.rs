@@ -2,7 +2,8 @@
 //! what. A definition run of a root workflow that carries `mirror` gets a `Mirror` over its
 //! issue input, its revision's bindings snapshot, its owner and its run directory; the hook
 //! sites in `create.rs`, `end.rs` and `resume.rs` drive it against the Linear target, and a
-//! write's result never changes the command's.
+//! write's result never changes the command's. A command that ends a run itself checks the
+//! key first (`outcome_credentials`, REQ-LOCALRUN-204).
 
 mod linear;
 
@@ -98,6 +99,28 @@ pub(super) fn read_run_record(run_directory: &Path) -> Option<WorkflowRunRecord>
         .ok()
         .and_then(|snapshot| snapshot.record)
         .and_then(|record| serde_json::from_value(record).ok())
+}
+
+/// The message a command refuses with when `outcome_credentials` fails (REQ-LOCALRUN-204).
+pub(super) const CREDENTIALS_REFUSAL: &str = "LINEAR_API_KEY is unset or empty, so the run's \
+    mirror cannot update its issue in Linear; the run is unchanged. Set LINEAR_API_KEY and \
+    run the command again.";
+
+/// The check a command makes before it ends a run itself with `outcome` and then performs
+/// `onOutcome` (REQ-LOCALRUN-204): `mirror_credentials_unavailable` when the run's mirror maps
+/// `outcome` and the environment's Linear target has no key, the failure that write would
+/// record; nothing for a run without a mirror or an outcome the mirror does not map. It reads
+/// the environment and sends nothing.
+pub(super) fn outcome_credentials(
+    mirror: Option<&Mirror>,
+    outcome: &str,
+) -> Result<(), MirrorFailure> {
+    match mirror {
+        Some(mirror) if mirror.maps_outcome(outcome) => {
+            linear::LinearTarget::from_environment().credentials()
+        }
+        _ => Ok(()),
+    }
 }
 
 /// Performs `hook` against Linear on this thread. A failed write is already a record; a record

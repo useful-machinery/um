@@ -132,7 +132,8 @@ fn acquire(run_directory: &Path) -> Result<PendingLocalContinuation, ControlFail
 }
 
 /// Ends a waiting run with `outcome` (REQ-CONTINUE-75): under the run lock, once the run
-/// still waits on `wait`, appends `event` naming it and marks the record `exited`.
+/// still waits on `wait` and the mirror's write has its credentials (REQ-LOCALRUN-204),
+/// appends `event` naming it and marks the record `exited`.
 fn end_waiting(
     target: &ControlTarget,
     wait: &WaitRecord,
@@ -148,8 +149,9 @@ fn end_waiting(
         )
         .into());
     }
-    let control = target.record(event, Some(wait.id()), None)?;
     let mirror = mirror(target, &pending);
+    outcome_credentials(mirror.as_ref(), outcome)?;
+    let control = target.record(event, Some(wait.id()), None)?;
     pending.end_waiting(outcome)?;
     write_outcome(mirror.as_ref(), outcome);
     Ok(Acted {
@@ -160,16 +162,18 @@ fn end_waiting(
 }
 
 /// Ends a run whose record reads `running` but whose process is gone with `outcome`
-/// (REQ-LOCALRUN-186): under the run lock, appends `event` naming no wait, marks the record
-/// `exited` and settles the abandoned attempt (REQ-CONTINUE-2), creating no attempt.
+/// (REQ-LOCALRUN-186): under the run lock, once the mirror's write has its credentials
+/// (REQ-LOCALRUN-204), appends `event` naming no wait, marks the record `exited` and settles
+/// the abandoned attempt (REQ-CONTINUE-2), creating no attempt.
 fn end_abandoned(
     target: &ControlTarget,
     event: &str,
     outcome: &'static str,
 ) -> Result<Acted, ControlFailure> {
     let pending = acquire(&target.run_directory)?;
-    let control = target.record(event, None, None)?;
     let mirror = mirror(target, &pending);
+    outcome_credentials(mirror.as_ref(), outcome)?;
+    let control = target.record(event, None, None)?;
     pending.update_run_record(RunState::Exited, target.record.attempts, Some(outcome))?;
     pending.settle_abandoned()?;
     write_outcome(mirror.as_ref(), outcome);
@@ -178,6 +182,15 @@ fn end_abandoned(
         wait: None,
         outcome,
     })
+}
+
+/// Refuses `mirror_credentials_unavailable` when the run's mirror would write `onOutcome` for
+/// `outcome` without a key (REQ-LOCALRUN-204). The caller drops its continuation unsettled on
+/// the refusal, which releases the lock and leaves the run's record, wait, controls and
+/// `mirror/` as the command found them.
+fn outcome_credentials(mirror: Option<&Mirror>, outcome: &str) -> Result<(), ControlFailure> {
+    super::mirror::outcome_credentials(mirror, outcome)
+        .map_err(|failure| Refusal::new(failure.code, super::mirror::CREDENTIALS_REFUSAL).into())
 }
 
 /// The run's mirror, read before the continuation that holds its root workflow is consumed.

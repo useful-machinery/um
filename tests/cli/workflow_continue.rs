@@ -1906,7 +1906,7 @@ pub(super) fn resume(run: &Path) -> std::process::Output {
 }
 
 /// Appends `control` to the run as `controls/<NNNN>-<event>.json` (REQ-LOCALRUN-178).
-fn append_control(run: &Path, control: &serde_json::Value) {
+pub(super) fn append_control(run: &Path, control: &serde_json::Value) {
     let directory = run.join("controls");
     if !directory.exists() {
         fs::create_dir(&directory).unwrap();
@@ -1925,7 +1925,7 @@ fn append_control(run: &Path, control: &serde_json::Value) {
 }
 
 /// A control event for the run at `run`, resolving `wait` when it names one.
-fn control(
+pub(super) fn control(
     run: &Path,
     event: &str,
     wait: Option<&serde_json::Value>,
