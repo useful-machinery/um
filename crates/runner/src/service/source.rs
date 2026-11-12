@@ -3871,32 +3871,10 @@ mod tests {
     }
 
     fn read_source_broker_request(stream: &mut TcpStream) -> String {
-        let mut request = Vec::new();
-        let mut buffer = [0_u8; 4096];
-        let header_end = loop {
-            let read = stream.read(&mut buffer).unwrap();
-            assert_ne!(read, 0);
-            request.extend_from_slice(&buffer[..read]);
-            if let Some(index) = request.windows(4).position(|window| window == b"\r\n\r\n") {
-                break index + 4;
-            }
-        };
-        let headers = String::from_utf8(request[..header_end].to_vec()).unwrap();
-        let content_length = headers
-            .lines()
-            .find_map(|line| {
-                line.to_ascii_lowercase()
-                    .strip_prefix("content-length:")
-                    .map(str::trim)
-                    .and_then(|value| value.parse::<usize>().ok())
-            })
-            .unwrap();
-        while request.len() < header_end + content_length {
-            let read = stream.read(&mut buffer).unwrap();
-            assert_ne!(read, 0);
-            request.extend_from_slice(&buffer[..read]);
-        }
-        String::from_utf8(request[header_end..header_end + content_length].to_vec()).unwrap()
+        let request = String::from_utf8(um_test_support::read_request(stream)).unwrap();
+        let (_, body) = request.split_once("\r\n\r\n").unwrap();
+        assert!(!body.is_empty());
+        body.to_owned()
     }
 
     fn write_source_broker_response(
@@ -4343,22 +4321,15 @@ mod tests {
         let (request_sender, request_receiver) = std::sync::mpsc::sync_channel(1);
         let server = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
+            let request = um_test_support::read_request(&mut stream);
+            if um_test_support::split_request(&request).is_none() {
+                return;
+            }
+            let _ = request_sender.send(());
             stream
                 .set_read_timeout(Some(host_scaled_duration(FIXTURE_WAIT_BASE)))
                 .unwrap();
-            let mut request = Vec::new();
             let mut buffer = [0_u8; 4096];
-            loop {
-                let read = stream.read(&mut buffer).unwrap();
-                if read == 0 {
-                    return;
-                }
-                request.extend_from_slice(&buffer[..read]);
-                if request.windows(4).any(|window| window == b"\r\n\r\n") {
-                    let _ = request_sender.send(());
-                    break;
-                }
-            }
             while stream.read(&mut buffer).is_ok_and(|read| read != 0) {}
         });
         let endpoint = Url::parse(&format!("ws://{address}/v1/runner/connect")).unwrap();

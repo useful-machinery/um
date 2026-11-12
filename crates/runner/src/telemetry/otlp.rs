@@ -829,15 +829,12 @@ mod tests {
                                 .set_nonblocking(false)
                                 .expect("make accepted OTLP connection blocking");
                             let request = um_test_support::read_request(&mut stream);
-                            let body_start = request
-                                .windows(4)
-                                .position(|part| part == b"\r\n\r\n")
-                                .map(|index| index + 4)
+                            let (head, body) = um_test_support::split_request(&request)
                                 .expect("OTLP request should have headers");
                             requests.push(CapturedRequest {
-                                head: String::from_utf8(request[..body_start].to_vec())
+                                head: String::from_utf8(head.to_vec())
                                     .expect("OTLP request headers should be text"),
-                                body: request[body_start..].to_vec(),
+                                body: body.to_vec(),
                             });
                             let response = format!(
                                 "HTTP/1.1 {status}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"

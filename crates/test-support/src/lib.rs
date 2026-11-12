@@ -261,12 +261,31 @@ pub fn read_request(stream: &mut TcpStream) -> Vec<u8> {
     try_read_request(stream).expect("request should be readable")
 }
 
-/// Frames one loopback HTTP request for a serve loop that must keep its
-/// listener for the whole test (INV-TESTING-22): a read that fails or times
-/// out, or a request past the size bound, returns the error, so the loop can
-/// skip the connection instead of dropping its address. The request ends at
-/// its declared `Content-Length`, or where the peer closed first.
+/// Splits a framed request after its first blank line into its head, that
+/// blank line included, and its body: `None` when the peer closed before the
+/// head was complete. The framing cuts a request by the same split.
+pub fn split_request(request: &[u8]) -> Option<(&[u8], &[u8])> {
+    let head_end = request.windows(4).position(|part| part == b"\r\n\r\n")?;
+    Some(request.split_at(head_end + 4))
+}
+
+/// [`try_read_request_within`] at the shared 128 KiB bound, for a serve loop
+/// that must keep its listener for the whole test (INV-TESTING-22).
 pub fn try_read_request(stream: &mut TcpStream) -> std::io::Result<Vec<u8>> {
+    try_read_request_within(stream, MAX_REQUEST_BYTES)
+}
+
+/// Frames one loopback HTTP request under a bound its caller names: a read
+/// that fails or times out, or a request or declared body past
+/// `max_request_bytes`, returns the error, so a serve loop can skip the
+/// connection instead of dropping its address. The request ends at its
+/// declared `Content-Length`, or where the peer closed first. It is for a
+/// fixture whose test sends a request past the shared bound on purpose; every
+/// other fixture takes [`try_read_request`] or [`read_request`].
+pub fn try_read_request_within(
+    stream: &mut TcpStream,
+    max_request_bytes: usize,
+) -> std::io::Result<Vec<u8>> {
     stream.set_read_timeout(Some(host_scaled_duration(FIXTURE_WAIT_BASE)))?;
     let mut request = Vec::new();
     let mut buffer = [0_u8; 1024];
@@ -278,17 +297,17 @@ pub fn try_read_request(stream: &mut TcpStream) -> std::io::Result<Vec<u8>> {
             break;
         }
         request.extend_from_slice(&buffer[..read]);
-        if request.len() > MAX_REQUEST_BYTES {
+        if request.len() > max_request_bytes {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "fixture request is unexpectedly large",
             ));
         }
 
-        if let Some(header_end) = request.windows(4).position(|part| part == b"\r\n\r\n") {
-            let body_start = header_end + 4;
+        if let Some((head, _)) = split_request(&request) {
+            let body_start = head.len();
             let length = *expected_length.get_or_insert_with(|| {
-                String::from_utf8_lossy(&request[..body_start])
+                String::from_utf8_lossy(head)
                     .lines()
                     .find_map(|line| {
                         let (name, value) = line.split_once(':')?;
@@ -298,7 +317,7 @@ pub fn try_read_request(stream: &mut TcpStream) -> std::io::Result<Vec<u8>> {
                     })
                     .unwrap_or_default()
             });
-            if body_start.saturating_add(length) > MAX_REQUEST_BYTES {
+            if body_start.saturating_add(length) > max_request_bytes {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
                     "fixture request declares an unexpectedly large body",
@@ -467,6 +486,46 @@ mod tests {
         let request = try_read_request(&mut server)?;
         drop(client);
         assert_eq!(request, [&head[..], b"{}"].concat());
+        Ok(())
+    }
+
+    // INV-TESTING-25
+    #[test]
+    fn a_request_past_the_shared_bound_is_read_whole_within_a_bound_its_caller_names()
+    -> std::io::Result<()> {
+        let mut sent = b"PUT /upload HTTP/1.1\r\nContent-Length: 131072\r\n\r\n".to_vec();
+        // Byte `index % 251` at each index, so a dropped or repeated read shows.
+        sent.extend((0..=250_u8).cycle().take(131_072));
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
+        let client = TcpStream::connect(listener.local_addr()?)?;
+        let (mut server, _) = listener.accept()?;
+        let request = thread::scope(|scope| {
+            let writer = scope.spawn(|| (&client).write_all(&sent));
+            let request = try_read_request_within(&mut server, sent.len());
+            writer
+                .join()
+                .map_err(|_| std::io::Error::other("fixture request writer panicked"))??;
+            request
+        })?;
+        drop(client);
+        assert_eq!(request, sent);
+        Ok(())
+    }
+
+    // INV-TESTING-25
+    #[test]
+    fn a_request_past_the_bound_its_caller_names_is_an_error() -> std::io::Result<()> {
+        let head = b"PUT /upload HTTP/1.1\r\nContent-Length: 64\r\n\r\n";
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
+        let mut client = TcpStream::connect(listener.local_addr()?)?;
+        client.write_all(head)?;
+        let (mut server, _) = listener.accept()?;
+        let read = try_read_request_within(&mut server, head.len() + 63);
+        drop(client);
+        assert_eq!(
+            read.map_err(|error| error.kind()),
+            Err(ErrorKind::InvalidData)
+        );
         Ok(())
     }
 }

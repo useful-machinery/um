@@ -1566,7 +1566,6 @@ mod tests {
 
     use super::*;
     use crate::service::test_support::{controlled_sleeper, with_watchdog};
-    use um_test_support::watchdog::{FIXTURE_WAIT_BASE, host_scaled_duration};
 
     fn result_spec() -> ArtifactDeliverySpec {
         ArtifactDeliverySpec::result(
@@ -1590,10 +1589,18 @@ mod tests {
         work
     }
 
+    /// Splits a framed PUT at its first blank line into its lowercased head and
+    /// its body bytes.
+    fn split_put(request: &[u8]) -> (String, &[u8]) {
+        let (head, body) =
+            um_test_support::split_request(request).expect("PUT closed before its head");
+        (String::from_utf8_lossy(head).to_ascii_lowercase(), body)
+    }
+
     // REQ-DIAG-6
     #[test]
     fn upload_put_diagnostic_contains_only_status_or_transport_class() {
-        use std::io::{Read as _, Write as _};
+        use std::io::Write as _;
         use std::net::{TcpListener, TcpStream};
 
         let spec = result_spec();
@@ -1602,34 +1609,13 @@ mod tests {
             let address = listener.local_addr().unwrap();
             let server = std::thread::spawn(move || {
                 let (mut stream, _) = listener.accept().unwrap();
-                stream
-                    .set_read_timeout(Some(host_scaled_duration(FIXTURE_WAIT_BASE)))
-                    .unwrap();
                 // Wait for the entire PUT, not just its first TCP segment. Closing
                 // with an unread body can reset the connection before reqwest sees
                 // the status line, making the status case a transport failure.
-                let mut request = Vec::new();
-                let mut buffer = [0_u8; 4096];
-                let header_end = loop {
-                    let count = stream.read(&mut buffer).unwrap();
-                    assert!(count > 0, "PUT closed before its body");
-                    request.extend_from_slice(&buffer[..count]);
-                    assert!(request.len() <= 4096, "unexpectedly large PUT");
-                    if let Some(end) = request.windows(4).position(|window| window == b"\r\n\r\n") {
-                        break end + 4;
-                    }
-                };
-                assert!(
-                    String::from_utf8_lossy(&request[..header_end])
-                        .to_ascii_lowercase()
-                        .contains("content-length: 2\r\n")
-                );
-                while request.len() - header_end < 2 {
-                    let count = stream.read(&mut buffer).unwrap();
-                    assert!(count > 0, "PUT closed before its body");
-                    request.extend_from_slice(&buffer[..count]);
-                }
-                assert_eq!(&request[header_end..], b"{}");
+                let request = um_test_support::read_request(&mut stream);
+                let (head, body) = split_put(&request);
+                assert!(head.contains("content-length: 2\r\n"));
+                assert_eq!(body, b"{}");
                 if respond {
                     stream.write_all(b"HTTP/1.1 503 Unavailable\r\nContent-Length: 23\r\n\r\nsecret provider message").unwrap();
                 }
@@ -1667,7 +1653,7 @@ mod tests {
     // (REQ-ARTIFACT-1).
     #[test]
     fn upload_streams_a_body_longer_than_one_chunk() {
-        use std::io::{Read as _, Write as _};
+        use std::io::Write as _;
         use std::net::TcpListener;
 
         let payload: Vec<u8> = (0..UPLOAD_CHUNK_BYTES * 3 + 17)
@@ -1683,31 +1669,15 @@ mod tests {
         let expected = payload.clone();
         let server = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
-            stream
-                .set_read_timeout(Some(host_scaled_duration(FIXTURE_WAIT_BASE)))
-                .unwrap();
-            let mut request = Vec::new();
-            let mut buffer = [0_u8; 65536];
-            let header_end = loop {
-                let count = stream.read(&mut buffer).unwrap();
-                assert!(count > 0, "PUT closed before its body");
-                request.extend_from_slice(&buffer[..count]);
-                if let Some(end) = request.windows(4).position(|window| window == b"\r\n\r\n") {
-                    break end + 4;
-                }
-            };
+            // This PUT is past the shared 128 KiB bound on purpose: the whole
+            // multi-chunk body plus 4096 bytes for its head of a few hundred.
+            let request =
+                um_test_support::try_read_request_within(&mut stream, expected.len() + 4096)
+                    .unwrap();
+            let (head, body) = split_put(&request);
             let length = format!("content-length: {}\r\n", expected.len());
-            assert!(
-                String::from_utf8_lossy(&request[..header_end])
-                    .to_ascii_lowercase()
-                    .contains(&length)
-            );
-            while request.len() - header_end < expected.len() {
-                let count = stream.read(&mut buffer).unwrap();
-                assert!(count > 0, "PUT closed before its body");
-                request.extend_from_slice(&buffer[..count]);
-            }
-            assert!(request[header_end..] == expected[..]);
+            assert!(head.contains(&length));
+            assert!(body == expected.as_slice());
             stream
                 .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
                 .unwrap();

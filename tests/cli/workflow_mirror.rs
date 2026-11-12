@@ -208,10 +208,8 @@ impl StubState {
 /// The framed request's path and JSON body (`Null` when the body is not JSON), or `None` when
 /// the peer closed before a complete head or the request line names no path.
 fn parse_request(request: &[u8]) -> Option<(String, Value)> {
-    let head_end = request.windows(4).position(|part| part == b"\r\n\r\n")?;
-    let head = String::from_utf8_lossy(&request[..head_end]);
-    let path = head.split(' ').nth(1)?.to_owned();
-    let body = &request[head_end + 4..];
+    let (head, body) = um_test_support::split_request(request)?;
+    let path = String::from_utf8_lossy(head).split(' ').nth(1)?.to_owned();
     Some((path, serde_json::from_slice(body).unwrap_or(Value::Null)))
 }
 
