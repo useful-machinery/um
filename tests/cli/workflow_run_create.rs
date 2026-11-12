@@ -96,7 +96,7 @@ impl Published {
     }
 
     /// The canonical `workflows/<id>/runs/` the definition's runs are created under.
-    fn runs_directory(&self) -> PathBuf {
+    pub(super) fn runs_directory(&self) -> PathBuf {
         self.home
             .definition_directory(&self.id)
             .canonicalize()

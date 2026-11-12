@@ -94,7 +94,7 @@ pub use workflow::git_capture::CloudGitCaptureProjection;
 pub use workflow::input::InputStaging;
 pub use workflow::invocation_accounting::InvocationAccountingLog;
 pub use workflow::local_run::{
-    AttemptControls, CANCELED_OUTCOME, CarryMiss, ChildRun, ChildRunParent,
+    AttemptControls, CANCELED_OUTCOME, CarryMiss, ChildCommitFailure, ChildRun, ChildRunParent,
     ContinuationDefinitionMode, DurableDeadline, DurableInvocationStateV1, DurableInvocationV1,
     FailedAttemptRestart, InitialLocalRun, ListedRun, LocalAttemptOwner,
     LocalAttemptOwnershipReleased, LocalContinuationOpen, LocalRecoveryStatus,

@@ -56,12 +56,13 @@ use um_execution::{
     MAXIMUM_AGENT_PROFILE_REPLACEMENT_BYTES,
 };
 use um_execution::{
-    CONTROL_CANCEL, CONTROL_INTERRUPT, CONTROL_STOP, CapturedValue, ChildInputValue,
-    ChildRunControl, ChildRunDispatcher, ChildRunOutcome, ChildRunParent, ChildRunRequest,
-    ChildRuns, ControlEvent, EnteredWait, ExportValue, LocalRetryBeginError, LocalRetryOpen,
-    Mirror, RejectionDiagnostic, Scheduling, WaitKind, WaitRecord, acquire_local_retry,
-    adopted_child_outcome, append_control, attempt_controls, await_child_start_gate, position_path,
-    read_controls, read_numbered_controls, stop_in_force, wait_payload,
+    CONTROL_CANCEL, CONTROL_INTERRUPT, CONTROL_STOP, CapturedValue, ChildCommitFailure,
+    ChildInputValue, ChildRunControl, ChildRunDispatcher, ChildRunOutcome, ChildRunParent,
+    ChildRunRequest, ChildRuns, ControlEvent, EnteredWait, ExportValue, LocalRetryBeginError,
+    LocalRetryOpen, Mirror, RejectionDiagnostic, Scheduling, WaitKind, WaitRecord,
+    acquire_local_retry, adopted_child_outcome, append_control, attempt_controls,
+    await_child_start_gate, position_path, read_controls, read_numbered_controls, stop_in_force,
+    wait_payload,
 };
 use um_execution::{
     DefinitionError, SubjectClaim, SubjectError, WorkflowHome, check_subject, chosen_outcome,
@@ -1298,6 +1299,43 @@ async fn execute_owned_attempt_with(
     }
 }
 
+/// REQ-LOCALRUN-143, INV-ENGINE-33: a failed state commit as the command reports it. Its
+/// diagnostic line reads the commit port's own error, which names the write, the file and
+/// the operating system's message, or, when the port kept none, the failure's write and
+/// error number; the class follows as a field and the remedy that resumes the run is last.
+/// It has no source, so the shared renderer prints nothing after the remedy.
+#[derive(Debug)]
+struct StateCommitFailed {
+    failure: CommitFailure,
+    text: Option<String>,
+    run_directory: PathBuf,
+}
+
+impl std::fmt::Display for StateCommitFailed {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("record run state")?;
+        if let Some(text) = &self.text {
+            write!(formatter, ": {text}")?;
+        } else {
+            if let Some(operation) = self.failure.operation {
+                write!(formatter, ": {operation}")?;
+            }
+            if let Some(os_error) = self.failure.os_error {
+                write!(formatter, ": {}", io::Error::from_raw_os_error(os_error))?;
+            }
+        }
+        write!(
+            formatter,
+            "\nclass: {}\n\nThe run is still running, and this attempt is not settled. \
+             Correct the cause, then continue the run:\n  um workflow run resume {}",
+            self.failure.class.as_str(),
+            normalize_terminal_path(&self.run_directory),
+        )
+    }
+}
+
+impl Error for StateCommitFailed {}
+
 async fn execute_attempt_phases(
     workflow: &ResolvedWorkflow,
     admitted: &AdmittedWorkflow,
@@ -1530,6 +1568,8 @@ async fn execute_attempt_phases(
         attempt
             .run()?
             .commit_port(diagnostics.clone(), accounting, artifacts.clone());
+    // REQ-LOCALRUN-143: the text of the port's failed commit outlives the engine's port.
+    let commit_failure_text = commit_port.failure_text();
     let dispatcher = if quiet || !has_workflow_steps(workflow) {
         None
     } else {
@@ -1602,12 +1642,17 @@ async fn execute_attempt_phases(
         Ok(execution) => execution,
         Err(error) => {
             // REQ-LOCALRUN-143, REQ-LOCALRUN-205: a failed state commit is recorded, best
-            // effort, and settles nothing; the error names it and downcasts to it.
+            // effort, and settles nothing; the error prints it and downcasts to it.
             if let CoordinationError::CommitFailed(failure) = error {
                 let _ = attempt
                     .run()?
                     .record_state_persistence_failure_async(failure)
                     .await;
+                return Err(anyhow::Error::new(StateCommitFailed {
+                    failure,
+                    text: commit_failure_text.get().cloned(),
+                    run_directory: attempt.run()?.run_directory().to_owned(),
+                }));
             }
             return Err(anyhow::Error::new(error).context("execute admitted local workflow"));
         }
@@ -2220,7 +2265,7 @@ struct LocalChildRunParent {
     presentation: Option<SystemPresentation>,
     /// The parent's commit-port latch, set by a child whose own state commit failed so the
     /// parent commits nothing after it (REQ-LOCALRUN-207, INV-ENGINE-33).
-    child_failure: Arc<OnceLock<CommitFailure>>,
+    child_failure: Arc<OnceLock<ChildCommitFailure>>,
 }
 
 impl LocalChildRunDispatcher {
@@ -2231,7 +2276,7 @@ impl LocalChildRunDispatcher {
         (recovery, mirror): (Option<ChildRecovery>, Option<Arc<Mirror>>),
         journals: ControlJournals,
         presentation: Option<SystemPresentation>,
-        child_failure: Arc<OnceLock<CommitFailure>>,
+        child_failure: Arc<OnceLock<ChildCommitFailure>>,
     ) -> anyhow::Result<Self> {
         let parent = run
             .child_run_parent()
@@ -2457,11 +2502,15 @@ async fn run_local_child(
     .await;
     if let Err(error) = result {
         // REQ-LOCALRUN-207, INV-ENGINE-33: a child whose state commit failed latches the
-        // failure on the parent's commit port before the parent's step can settle from it.
-        if let Some(CoordinationError::CommitFailed(failure)) =
-            error.downcast_ref::<CoordinationError>()
+        // failure and its text on the parent's commit port before the parent's step can
+        // settle from it.
+        if let Some(StateCommitFailed { failure, text, .. }) =
+            error.downcast_ref::<StateCommitFailed>()
         {
-            let _ = parent.child_failure.set(*failure);
+            let _ = parent.child_failure.set(ChildCommitFailure {
+                failure: *failure,
+                text: text.clone(),
+            });
         }
         attempt.teardown().await;
         return ChildRunOutcome::Interrupted;
@@ -4838,14 +4887,34 @@ mod tests {
             );
             let diagnostics = state["diagnostics"].as_array().unwrap();
             if recorded {
+                // REQ-LOCALRUN-143: no port ran, so the diagnostic line names the write and
+                // its error number from the failure; the class is a field and the remedy,
+                // last, resumes the run.
+                let rendered = format!("{:#}", failure.error());
+                let lines = rendered.lines().collect::<Vec<_>>();
+                assert!(lines.contains(&"class: storage_full"), "{rendered}");
                 assert!(
-                    format!("{:#}", failure.error()).contains("storage_full"),
-                    "{:#}",
-                    failure.error()
+                    lines[0].contains("write temporary state")
+                        && lines[0].ends_with(&io::Error::from_raw_os_error(28).to_string()),
+                    "{rendered}"
                 );
                 assert_eq!(
-                    failure.error().downcast_ref::<CoordinationError>().copied(),
-                    Some(error)
+                    lines.last().map(|line| line.trim()),
+                    Some(
+                        format!(
+                            "um workflow run resume {}",
+                            normalize_terminal_path(&run_directory)
+                        )
+                        .as_str()
+                    ),
+                    "{rendered}"
+                );
+                assert_eq!(
+                    failure
+                        .error()
+                        .downcast_ref::<StateCommitFailed>()
+                        .map(|failed| failed.failure),
+                    Some(commit_failure)
                 );
                 assert_eq!(
                     diagnostics.as_slice(),

@@ -255,8 +255,18 @@ pub enum LocalRunDirectoryError {
     /// No run under the `um` home has the id (REQ-LOCALRUN-180): `run_not_found`.
     RunNotFound,
     /// A parent's commit refused because one of its child runs failed to commit its own
-    /// state (REQ-LOCALRUN-207, INV-ENGINE-33); it classifies as the child's failure.
-    ChildCommitFailed(CommitFailure),
+    /// state (REQ-LOCALRUN-207, INV-ENGINE-33); it classifies as the child's failure and
+    /// reads as the child's own error.
+    ChildCommitFailed(ChildCommitFailure),
+}
+
+/// A child run's failed state commit as its parent's [`LocalRunCommitPort`] latches it
+/// (REQ-LOCALRUN-207, INV-ENGINE-33): the classified failure and, beside it, the text of
+/// the child's own error, which names the child's file, for the root command to print.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ChildCommitFailure {
+    pub failure: CommitFailure,
+    pub text: Option<String>,
 }
 
 impl PartialEq for LocalRunDirectoryError {
@@ -349,7 +359,7 @@ impl ClassifiedCommitError for LocalRunDirectoryError {
             Self::StateFile { source, .. } => source.commit_failure(),
             Self::StateConflict => CommitFailure::of_class(CommitFailureClass::StateConflict),
             Self::StateInvalid => CommitFailure::of_class(CommitFailureClass::StateInvalid),
-            Self::ChildCommitFailed(failure) => *failure,
+            Self::ChildCommitFailed(child) => child.failure,
             _ => CommitFailure::of_class(CommitFailureClass::Unclassified),
         }
     }
@@ -374,7 +384,10 @@ impl fmt::Display for LocalRunDirectoryError {
                 operation,
                 source,
             } => write!(formatter, "{operation} {}: {source}", safe_path(path)),
-            Self::ChildCommitFailed(failure) => {
+            Self::ChildCommitFailed(ChildCommitFailure {
+                text: Some(text), ..
+            }) => formatter.write_str(text),
+            Self::ChildCommitFailed(ChildCommitFailure { failure, .. }) => {
                 write!(formatter, "child run state commit failed: {failure}")
             }
             // Variant names are stable, narrow invariant identifiers; split words for CLI prose.
@@ -3186,6 +3199,7 @@ impl LocalAttemptOwner {
             accounting,
             artifacts,
             child_failure: Arc::new(OnceLock::new()),
+            failure_text: Arc::new(OnceLock::new()),
         }
     }
 
@@ -3433,14 +3447,23 @@ pub struct LocalRunCommitPort {
     artifacts: ArtifactStaging,
     /// Set by a child run whose own state commit failed; once set, every commit is refused
     /// with it and writes nothing (REQ-LOCALRUN-207, INV-ENGINE-33).
-    child_failure: Arc<OnceLock<CommitFailure>>,
+    child_failure: Arc<OnceLock<ChildCommitFailure>>,
+    /// The text of the error the first failed commit returned: its write, path and OS
+    /// message, which the classified failure never holds (REQ-LOCALRUN-143, INV-ENGINE-33).
+    failure_text: Arc<OnceLock<String>>,
 }
 
 impl LocalRunCommitPort {
     /// The latch a child run's failed state commit sets, after which this port refuses
     /// every commit with that failure (REQ-LOCALRUN-207, INV-ENGINE-33).
-    pub fn child_failure_latch(&self) -> Arc<OnceLock<CommitFailure>> {
+    pub fn child_failure_latch(&self) -> Arc<OnceLock<ChildCommitFailure>> {
         Arc::clone(&self.child_failure)
+    }
+
+    /// The cell this port sets to the text of its first failed commit's error, for the
+    /// command to print once the engine has consumed the port (REQ-LOCALRUN-143).
+    pub fn failure_text(&self) -> Arc<OnceLock<String>> {
+        Arc::clone(&self.failure_text)
     }
 }
 
@@ -3462,15 +3485,26 @@ where
         let accounting = self.accounting.clone();
         let artifacts = self.artifacts.clone();
         let child_failure = Arc::clone(&self.child_failure);
+        let failure_text = Arc::clone(&self.failure_text);
         async move {
-            if let Some(failure) = child_failure.get() {
-                return Err(LocalRunDirectoryError::ChildCommitFailed(*failure));
+            let result = match child_failure.get() {
+                Some(child) => Err(LocalRunDirectoryError::ChildCommitFailed(child.clone())),
+                None => tokio::task::spawn_blocking(move || {
+                    state.commit_runtime(
+                        &commit,
+                        &finalizers,
+                        &diagnostics,
+                        &accounting,
+                        &artifacts,
+                    )
+                })
+                .await
+                .unwrap_or(Err(LocalRunDirectoryError::StateWriteUnavailable)),
+            };
+            if let Err(error) = &result {
+                failure_text.get_or_init(|| error.to_string());
             }
-            tokio::task::spawn_blocking(move || {
-                state.commit_runtime(&commit, &finalizers, &diagnostics, &accounting, &artifacts)
-            })
-            .await
-            .map_err(|_| LocalRunDirectoryError::StateWriteUnavailable)?
+            result
         }
     }
 }

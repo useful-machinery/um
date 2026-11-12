@@ -939,6 +939,45 @@ fn resuming_an_abandoned_parent_adopts_its_exited_child() {
     assert_eq!(parent["attempts"], 2);
 }
 
+/// REQ-LOCALRUN-143: a failed state commit's standard error has a diagnostic line naming the
+/// write, `exchange state`, its file and the operating system's message for a missing file, a
+/// `class:` field, and after an empty line ends with the indented `um workflow run resume` for
+/// `run_directory`.
+fn assert_state_commit_failure(stderr: &[u8], state_file: &Path, run_directory: &Path) {
+    let stderr = String::from_utf8_lossy(stderr);
+    let lines = stderr.lines().collect::<Vec<_>>();
+    let missing = std::io::Error::from_raw_os_error(2).to_string();
+    let diagnostic = lines
+        .iter()
+        .find(|line| line.starts_with("Error: "))
+        .unwrap_or_else(|| panic!("no diagnostic line in {stderr}"));
+    assert!(
+        diagnostic.contains("exchange state")
+            && diagnostic.contains(state_file.to_str().unwrap())
+            && diagnostic.contains(&missing),
+        "{stderr}"
+    );
+    assert!(!diagnostic.contains("not_found"), "{stderr}");
+    let class = lines
+        .iter()
+        .position(|line| *line == "class: not_found")
+        .unwrap_or_else(|| panic!("no class field in {stderr}"));
+    let remedy = lines
+        .iter()
+        .rposition(|line| !line.trim().is_empty())
+        .unwrap();
+    assert!(
+        lines[class + 1..remedy].iter().any(|line| line.is_empty()),
+        "{stderr}"
+    );
+    assert_eq!(
+        lines[remedy].trim(),
+        format!("um workflow run resume {}", run_directory.display()),
+        "{stderr}"
+    );
+    assert!(lines[remedy].starts_with(char::is_whitespace), "{stderr}");
+}
+
 // REQ-LOCALRUN-143, REQ-LOCALRUN-206, REQ-CONTINUE-2, REQ-CONTINUE-76: a root whose state
 // commit fails names the failure's class, leaves its attempt unsettled and its record
 // `running`, and once the state is back the run is abandoned and resumes at the step that
@@ -963,11 +1002,12 @@ fn a_failed_state_commit_leaves_the_run_running_and_resumable() {
     let output = run(&child_tree_args(&bundle, &destination));
 
     assert_eq!(output.status.code(), Some(1), "{output:?}");
-    assert!(
-        String::from_utf8_lossy(&output.stderr).contains("not_found"),
-        "{output:?}"
-    );
     let destination = fs::canonicalize(&destination).unwrap();
+    assert_state_commit_failure(
+        &output.stderr,
+        &destination.join("state.json"),
+        &destination,
+    );
     let record = run_record(&destination);
     assert_eq!(record["state"], "running", "{record}");
     assert_eq!(record["outcome"], serde_json::Value::Null, "{record}");
@@ -1021,12 +1061,10 @@ fn a_childs_failed_state_commit_leaves_its_parent_running_and_resumable() {
     let output = run(&child_tree_args(&bundle, &destination));
 
     assert_eq!(output.status.code(), Some(1), "{output:?}");
-    assert!(
-        String::from_utf8_lossy(&output.stderr).contains("not_found"),
-        "{output:?}"
-    );
     let destination = fs::canonicalize(&destination).unwrap();
     let child = destination.join("children/design/000001");
+    // The parent's error prints the child's own failure, and its remedy names the parent.
+    assert_state_commit_failure(&output.stderr, &child.join("state.json"), &destination);
     for record in [run_record(&destination), run_record(&child)] {
         assert_eq!(record["state"], "running", "{record}");
         assert_eq!(record["outcome"], serde_json::Value::Null, "{record}");

@@ -223,6 +223,12 @@ fn read_request(stream: &std::net::TcpStream) -> Option<(String, Value)> {
 /// The engineering tree whose root's steps are `DESIGN_STAGE_STEPS`, with or without its
 /// `mirror` block, published.
 fn engineering(mirrored: bool) -> Published {
+    Published::publish(engineering_tree(mirrored))
+}
+
+/// The engineering tree whose root's steps are `DESIGN_STAGE_STEPS`, with or without its
+/// `mirror` block.
+fn engineering_tree(mirrored: bool) -> Tree {
     let tree = Tree::engineering();
     let root = fs::read_to_string(Path::new(tree.path()).join("workflow.yaml")).unwrap();
     let (header, _) = root.split_once("\nsteps:\n").unwrap();
@@ -234,7 +240,7 @@ fn engineering(mirrored: bool) -> Published {
         format!("{before}\ninputs:{inputs}")
     };
     tree.write("workflow.yaml", &format!("{header}\n{DESIGN_STAGE_STEPS}"));
-    Published::publish(tree)
+    tree
 }
 
 /// `um workflow run create` of the definition for `ticket`, its command adjusted by `adjust`:
@@ -244,8 +250,14 @@ fn create(
     ticket: &str,
     adjust: impl FnOnce(&mut Command) -> &mut Command,
 ) -> PathBuf {
+    let terminal = completed(&adjust(&mut creation(published, ticket)).output().unwrap());
+    PathBuf::from(terminal["runDirectory"].as_str().unwrap())
+}
+
+/// The `um workflow run create --json` command of the definition for `ticket`.
+fn creation(published: &Published, ticket: &str) -> Command {
     let execution_root = published.execution_root();
-    let mut command = published.command(&[
+    published.command(&[
         "create",
         &published.id,
         "--execution-root",
@@ -254,9 +266,7 @@ fn create(
         "ticket",
         ticket,
         "--json",
-    ]);
-    let terminal = completed(&adjust(&mut command).output().unwrap());
-    PathBuf::from(terminal["runDirectory"].as_str().unwrap())
+    ])
 }
 
 /// The run's mirror writes as `(file name, record)`, in ordinal order.
@@ -388,6 +398,92 @@ fn a_failed_mirror_write_is_recorded_and_never_fails_the_run() {
         assert_eq!(write["code"], "mirror_credentials_unavailable", "{write}");
     }
     assert_eq!(stub.bodies(), Vec::<Value>::new());
+}
+
+/// The `design` stage's program in `a_failed_state_commit_writes_no_outcome_to_the_mirror`,
+/// run in the execution root: while `um-runs` there names the definition's runs directory, it
+/// moves the `state.json` of the run that has not exited aside, so the root's next commit, the
+/// step's settlement, finds none, and forgets `um-runs`. It always fails.
+const STATE_MOVING_DESIGN: &str = r#"if [ -e um-runs ]; then for state in "$(cat um-runs)"/*/state.json; do case "$(cat "${state%state.json}run.json")" in *exited*) ;; *) mv "$state" root-state.json ;; esac; done; rm um-runs; fi; exit 1"#;
+
+/// `contents` with its one `from` replaced by `to`.
+fn replaced(contents: &str, from: &str, to: &str) -> String {
+    assert_eq!(contents.matches(from).count(), 1, "{contents}");
+    contents.replacen(from, to, 1)
+}
+
+// REQ-LOCALRUN-206, REQ-LOCALRUN-143: a mirrored run whose stage fails mirrors the failure
+// outcome its record reads, but when the root's state commit fails the attempt is left
+// unsettled, its record `running`, and nothing is written for `onOutcome`.
+#[test]
+fn a_failed_state_commit_writes_no_outcome_to_the_mirror() {
+    let tree = engineering_tree(true);
+    let on_outcome = "    onOutcome:\n";
+    let root = fs::read_to_string(Path::new(tree.path()).join("workflow.yaml")).unwrap();
+    tree.write(
+        "workflow.yaml",
+        &replaced(
+            &root,
+            on_outcome,
+            &format!("{on_outcome}      failed:    {{state: $backlog}}\n"),
+        ),
+    );
+    let design = fs::read_to_string(Path::new(tree.path()).join("design.yaml")).unwrap();
+    tree.write(
+        "design.yaml",
+        &replaced(
+            &design,
+            r#"argv: ["design.py"]"#,
+            &format!("argv: [\"sh\", \"-c\", '{STATE_MOVING_DESIGN}']"),
+        ),
+    );
+    let published = Published::publish(tree);
+    let stub = LinearStub::start();
+    let execution_root = published.execution_root();
+    let run = |ticket: &str, known: Option<&Path>| {
+        let output = stub
+            .point(&mut creation(&published, ticket))
+            .output()
+            .unwrap();
+        let mut runs = fs::read_dir(published.runs_directory())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|run| Some(run.as_path()) != known)
+            .collect::<Vec<_>>();
+        assert_eq!(runs.len(), 1, "{runs:?}");
+        (output, runs.pop().unwrap())
+    };
+
+    let (_, control) = run("AUTO-1", None);
+    let record = run_record(&control);
+    assert_eq!(record["state"], "exited", "{record}");
+    assert_eq!(record["outcome"], "failed", "{record}");
+    let writes = mirror_names(&control);
+    assert!(
+        writes.last().unwrap().ends_with("-outcome.json"),
+        "{writes:?}"
+    );
+    assert!(stub.operations().contains(&"UpdateIssueState".to_owned()));
+
+    stub.clear();
+    fs::write(
+        execution_root.join("um-runs"),
+        published.runs_directory().to_str().unwrap(),
+    )
+    .unwrap();
+    let (output, unsettled) = run("AUTO-2", Some(&control));
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(execution_root.join("root-state.json").is_file());
+    let writes = mirror_names(&unsettled);
+    assert_eq!(writes, ["0001-start.json", "0002-stage.json"]);
+    let operations = stub.operations();
+    assert!(
+        !operations.contains(&"UpdateIssueState".to_owned()),
+        "{operations:?}"
+    );
+    let record = run_record(&unsettled);
+    assert_eq!(record["state"], "running", "{record}");
+    assert_eq!(record["outcome"], Value::Null, "{record}");
 }
 
 // REQ-LOCALRUN-191: a run started by path and a run of a root without `mirror` write
