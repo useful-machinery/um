@@ -9,9 +9,10 @@ use rustix::process::{Pid, Signal, kill_process};
 
 use super::workflow_continue::GIT_CONTINUATION_SOURCE;
 use super::workflow_run::{
-    RunBundle, TreeBundle, assert_attempt_resources_released,
-    assert_executor_fault_before_execution, git, initialize_git_repository, isolated_command, run,
-    run_record, run_with_unusable_tui, signal_bundle, spawn_held_child_tree, workflow_run_schema,
+    CHILD_TREE_DECIDE, RunBundle, TreeBundle, assert_attempt_resources_released,
+    assert_executor_fault_before_execution, child_tree, child_tree_args, git,
+    initialize_git_repository, isolated_command, run, run_record, run_with_unusable_tui,
+    signal_bundle, spawn_held_child_tree, workflow_run_schema,
 };
 
 fn retry_args(run_directory: &Path, execution_root: &Path, options: &[&str]) -> Vec<String> {
@@ -934,6 +935,141 @@ fn resuming_an_abandoned_parent_adopts_its_exited_child() {
     assert!(!destination.join("children/design/000002").exists());
     assert!(destination.join("children/build/000001").is_dir());
     let parent = run_record(&destination);
+    assert_eq!(parent["outcome"], "landed");
+    assert_eq!(parent["attempts"], 2);
+}
+
+// REQ-LOCALRUN-143, REQ-LOCALRUN-206, REQ-CONTINUE-2, REQ-CONTINUE-76: a root whose state
+// commit fails names the failure's class, leaves its attempt unsettled and its record
+// `running`, and once the state is back the run is abandoned and resumes at the step that
+// was running, adopting the child that exited.
+#[test]
+fn a_failed_state_commit_leaves_the_run_running_and_resumable() {
+    let bundle = child_tree(CHILD_TREE_DECIDE);
+    let destination = bundle.result("unsettled");
+    let state = destination.join("state.json");
+    let aside = bundle.execution_root().join("root-state.json");
+    // `decide` runs in the child, so the root's next commit, the step's settlement, finds
+    // no `state.json` to exchange while the child's own commits succeed.
+    bundle.write_program(
+        "bin/decide",
+        &format!(
+            "{CHILD_TREE_DECIDE}if [ ! -e state-moved ]; then\n  : > state-moved\n  mv '{}' '{}'\nfi\n",
+            state.display(),
+            aside.display(),
+        ),
+    );
+    fs::write(bundle.execution_root().join("verdict-input"), "planned").unwrap();
+    let output = run(&child_tree_args(&bundle, &destination));
+
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("not_found"),
+        "{output:?}"
+    );
+    let destination = fs::canonicalize(&destination).unwrap();
+    let record = run_record(&destination);
+    assert_eq!(record["state"], "running", "{record}");
+    assert_eq!(record["outcome"], serde_json::Value::Null, "{record}");
+    let child = run_record(&destination.join("children/design/000001"));
+    assert_eq!(child["state"], "exited");
+    assert_eq!(child["outcome"], "planned");
+
+    fs::rename(&aside, &state).unwrap();
+    let (output, status) = super::workflow_status::status_json(&destination);
+    assert!(output.status.success(), "{output:?}");
+    assert!(
+        super::workflow_status::status_schema().is_valid(&status),
+        "{status}"
+    );
+    assert_eq!(status["recovery"]["status"], "abandoned", "{status}");
+    assert_eq!(status["continuation"]["eligible"], true, "{status}");
+
+    let terminal = resumed(&destination);
+    assert_eq!(terminal["attemptNumber"], 2);
+    let record = run_record(&destination);
+    assert_eq!(record["state"], "exited");
+    assert_eq!(record["outcome"], "landed");
+    assert_eq!(
+        read_state(&destination)["attempts"][0]["state"],
+        "interrupted"
+    );
+    assert!(!destination.join("children/design/000002").exists());
+}
+
+// REQ-LOCALRUN-205, REQ-LOCALRUN-207, REQ-CONTINUE-76: a child whose state commit fails ends
+// its parent unsettled too: the parent's step is not settled from the child, the parent
+// records the child's failure, which its status carries, and stays `running`, and resuming
+// it retries the child in place.
+#[test]
+fn a_childs_failed_state_commit_leaves_its_parent_running_and_resumable() {
+    let bundle = child_tree(CHILD_TREE_DECIDE);
+    let destination = bundle.result("unsettled-child");
+    let child_state = destination.join("children/design/000001/state.json");
+    let aside = bundle.execution_root().join("child-state.json");
+    // `decide` runs in the child, so the child's next commit, its step's settlement, finds
+    // no `state.json` to exchange while the parent's state is untouched.
+    bundle.write_program(
+        "bin/decide",
+        &format!(
+            "{CHILD_TREE_DECIDE}if [ ! -e state-moved ]; then\n  : > state-moved\n  mv '{}' '{}'\nfi\n",
+            child_state.display(),
+            aside.display(),
+        ),
+    );
+    fs::write(bundle.execution_root().join("verdict-input"), "planned").unwrap();
+    let output = run(&child_tree_args(&bundle, &destination));
+
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("not_found"),
+        "{output:?}"
+    );
+    let destination = fs::canonicalize(&destination).unwrap();
+    let child = destination.join("children/design/000001");
+    for record in [run_record(&destination), run_record(&child)] {
+        assert_eq!(record["state"], "running", "{record}");
+        assert_eq!(record["outcome"], serde_json::Value::Null, "{record}");
+    }
+    let state = read_state(&destination);
+    let design = state["attempts"][0]["progress"]["steps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|step| step["id"] == "design")
+        .unwrap_or_else(|| panic!("{state}"));
+    assert_eq!(design["state"], "running", "{state}");
+    let diagnostic = state["diagnostics"]
+        .as_array()
+        .unwrap()
+        .last()
+        .unwrap_or_else(|| panic!("{state}"));
+    assert_eq!(diagnostic["code"], "state_persistence_failure", "{state}");
+    assert_eq!(diagnostic["attemptNumber"], 1, "{state}");
+    assert_eq!(diagnostic["cause"], "not_found", "{state}");
+    assert_eq!(diagnostic["osError"], 2, "{state}");
+
+    fs::rename(&aside, &child_state).unwrap();
+    // REQ-LOCALRUN-205: the status carries the entry, `cause` and `osError` with it, in a
+    // `state` its schema admits.
+    let (output, status) = super::workflow_status::status_json(&destination);
+    assert!(output.status.success(), "{output:?}");
+    assert!(
+        super::workflow_status::status_schema().is_valid(&status),
+        "{status}"
+    );
+    assert_eq!(status["recovery"]["status"], "abandoned", "{status}");
+    assert_eq!(
+        status["state"]["diagnostics"].as_array().unwrap().last(),
+        Some(diagnostic),
+        "{status}"
+    );
+    let terminal = resumed(&destination);
+    assert_eq!(terminal["attemptNumber"], 2);
+    assert!(child.join("attempts/000002").is_dir());
+    assert!(!destination.join("children/design/000002").exists());
+    let parent = run_record(&destination);
+    assert_eq!(parent["state"], "exited");
     assert_eq!(parent["outcome"], "landed");
     assert_eq!(parent["attempts"], 2);
 }

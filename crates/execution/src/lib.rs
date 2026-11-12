@@ -69,7 +69,9 @@ pub use workflow::child_guard::{
 pub use workflow::continuation::{
     AdmissionViolation as ContinuationAdmissionViolation, PriorState as ContinuationPriorState,
 };
-pub use workflow::coordinator::{CoordinationError, CoordinatorClock};
+pub use workflow::coordinator::{
+    ClassifiedCommitError, CommitFailure, CommitFailureClass, CoordinationError, CoordinatorClock,
+};
 pub use workflow::definition_store::{
     BindingsFile, BindingsSnapshot, BoundBinding, DefinitionError, DefinitionRecord, EnabledChange,
     PublishTarget, Published, RevisionRecord, StoredDefinition, WorkflowHome, list_definitions,

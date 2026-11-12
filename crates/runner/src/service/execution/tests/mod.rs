@@ -7,8 +7,8 @@ use super::*;
 use crate::service::lease_clock::{LeaseTimerRelease, controlled_lease_clock};
 use crate::service::test_support::{controlled_sleeper, sleep_request, with_watchdog};
 use um_execution::{
-    ExecutionSettlement, ObservedExecutions, RecoveryFailureKind, SettledExecution,
-    StartedExecution, StepFailureKind,
+    CommitFailure, CommitFailureClass, ExecutionSettlement, ObservedExecutions,
+    RecoveryFailureKind, SettledExecution, StartedExecution, StepFailureKind,
 };
 use um_runner_protocol::{MAXIMUM_ORDINARY_FRAME_BYTES, RunnerEnvelope, RunnerFrame};
 
@@ -153,7 +153,11 @@ fn collapse_causes_are_variant_based_and_ignore_error_text() {
             "agent_runtime_unavailable",
         ),
         (
-            CoordinationError::CommitFailed,
+            CoordinationError::CommitFailed(CommitFailure {
+                class: CommitFailureClass::StorageFull,
+                operation: Some("write temporary state"),
+                os_error: Some(28),
+            }),
             "coordination_commit_failed",
         ),
         (

@@ -8,7 +8,7 @@ use std::io::{self, Read};
 use std::ops::Add;
 use std::os::fd::AsFd;
 use std::path::{Component, Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, anyhow};
@@ -24,7 +24,7 @@ use um_execution::admit_workflow;
 use um_execution::{
     ActionId, AdmittedWorkflow, AgentExecution, AgentHarnessInstallationFailure, AgentInputStaging,
     ArtifactStaging, CancellationPolicy, CancellationReason, CancellationSource, ColorChoice,
-    CoordinationError, CoordinatorClock, DisplayDeadline, DurableDeadline,
+    CommitFailure, CoordinationError, CoordinatorClock, DisplayDeadline, DurableDeadline,
     DurableInvocationStateV1, DurableInvocationV1, EnvironmentSnapshot, ExecutionContext,
     ExecutionObservation, ExecutionObserver, FailurePolicy, InitialLocalRun, InputStaging,
     InvocationAccountingLog, LocalAttemptOwner, LocalAttemptOwnershipReleased,
@@ -1053,6 +1053,11 @@ impl AttemptTeardown {
             let mirror = self.mirror.take();
             if let Ok(run) = blocking_operation(move || {
                 record_private_cleanup_failure(&run, cleanup_failed);
+                // REQ-LOCALRUN-206: an attempt left unsettled leaves the record `running`,
+                // the abandoned attempt a continuation settles, and performs no `onOutcome`.
+                if !run.attempt_settled() {
+                    return Ok(run);
+                }
                 let exited =
                     run.update_run_record(RunState::Exited, run.attempt_number(), Some(&outcome));
                 // REQ-LOCALRUN-191: the failure outcome's `onOutcome`, once the record reads it.
@@ -1521,6 +1526,10 @@ async fn execute_attempt_phases(
     let execution_start =
         WorkflowExecutionStart::seeded(attempt.run()?.process_guard_registry(), seed)
             .with_finalization_identity(run_id, attempt_id);
+    let commit_port =
+        attempt
+            .run()?
+            .commit_port(diagnostics.clone(), accounting, artifacts.clone());
     let dispatcher = if quiet || !has_workflow_steps(workflow) {
         None
     } else {
@@ -1554,6 +1563,9 @@ async fn execute_attempt_phases(
                     Some(ActiveRunHost::Standard(presentation)) => Some(presentation.clone()),
                     _ => None,
                 },
+                // REQ-LOCALRUN-207: a child's failed state commit refuses this attempt's
+                // later commits.
+                commit_port.child_failure_latch(),
             )?,
             context,
         ))
@@ -1577,9 +1589,7 @@ async fn execute_attempt_phases(
             agents,
             children,
             SystemExecutionClock,
-            attempt
-                .run()?
-                .commit_port(diagnostics.clone(), accounting, artifacts.clone()),
+            commit_port,
             observer.clone(),
             execution_start,
         )
@@ -1591,13 +1601,15 @@ async fn execute_attempt_phases(
     let execution = match execution {
         Ok(execution) => execution,
         Err(error) => {
-            if error == CoordinationError::CommitFailed {
+            // REQ-LOCALRUN-143, REQ-LOCALRUN-205: a failed state commit is recorded, best
+            // effort, and settles nothing; the error names it and downcasts to it.
+            if let CoordinationError::CommitFailed(failure) = error {
                 let _ = attempt
                     .run()?
-                    .record_state_persistence_failure_async()
+                    .record_state_persistence_failure_async(failure)
                     .await;
             }
-            return Err(anyhow!("execute admitted local workflow: {error:?}"));
+            return Err(anyhow::Error::new(error).context("execute admitted local workflow"));
         }
     };
     let durable_invocations = attempt.run()?.durable_invocations()?;
@@ -2206,6 +2218,9 @@ struct LocalChildRunParent {
     /// The parent's progress stream, which carries each child's step state records
     /// (REQ-LOCALRUN-200); none when the parent presents through the terminal interface.
     presentation: Option<SystemPresentation>,
+    /// The parent's commit-port latch, set by a child whose own state commit failed so the
+    /// parent commits nothing after it (REQ-LOCALRUN-207, INV-ENGINE-33).
+    child_failure: Arc<OnceLock<CommitFailure>>,
 }
 
 impl LocalChildRunDispatcher {
@@ -2216,6 +2231,7 @@ impl LocalChildRunDispatcher {
         (recovery, mirror): (Option<ChildRecovery>, Option<Arc<Mirror>>),
         journals: ControlJournals,
         presentation: Option<SystemPresentation>,
+        child_failure: Arc<OnceLock<CommitFailure>>,
     ) -> anyhow::Result<Self> {
         let parent = run
             .child_run_parent()
@@ -2246,6 +2262,7 @@ impl LocalChildRunDispatcher {
                 mirror,
                 journals,
                 presentation,
+                child_failure,
             }),
         })
     }
@@ -2438,7 +2455,14 @@ async fn run_local_child(
         },
     )
     .await;
-    if result.is_err() {
+    if let Err(error) = result {
+        // REQ-LOCALRUN-207, INV-ENGINE-33: a child whose state commit failed latches the
+        // failure on the parent's commit port before the parent's step can settle from it.
+        if let Some(CoordinationError::CommitFailed(failure)) =
+            error.downcast_ref::<CoordinationError>()
+        {
+            let _ = parent.child_failure.set(*failure);
+        }
         attempt.teardown().await;
         return ChildRunOutcome::Interrupted;
     }
@@ -4727,6 +4751,121 @@ mod tests {
         assert!(first["startedAt"].is_string(), "{first}");
         assert!(first["durationMilliseconds"].is_u64(), "{first}");
         assert_eq!(step("second")["state"], "cancelled");
+    }
+
+    // REQ-LOCALRUN-205, REQ-LOCALRUN-206: a failed state commit is named in the command's
+    // error and recorded as a `state_persistence_failure` diagnostic with its class and OS
+    // error number, and the attempt it leaves unsettled leaves the run record `running`.
+    // Any other execution failure leaves the record `running` and records nothing.
+    #[tokio::test]
+    async fn an_execution_failure_over_an_unsettled_attempt_leaves_the_run_running() {
+        let commit_failure = um_execution::CommitFailure {
+            class: um_execution::CommitFailureClass::StorageFull,
+            operation: Some("write temporary state"),
+            os_error: Some(28),
+        };
+        for (error, recorded) in [
+            (CoordinationError::CommitFailed(commit_failure), true),
+            (CoordinationError::ReducerStateUnavailable, false),
+        ] {
+            let temporary = tempfile::tempdir().unwrap();
+            let cancellation = CancellationSource::new();
+            let (creation, _home, _run_directory) =
+                subject_creation(temporary.path(), &cancellation);
+            let admitted = creation.admitted.clone();
+            let workflow =
+                resolve(&temporary.path().join("source"), Path::new("workflow.yaml")).unwrap();
+            let Ok((run, _journal)) = creation.create(&cancellation, &ControlJournals::default())
+            else {
+                panic!("the run was not created");
+            };
+            let run_directory = run.run_directory().to_owned();
+
+            let result = execute_owned_attempt_with(
+                workflow,
+                admitted,
+                run,
+                cancellation,
+                SignalObservation {
+                    task: tokio::spawn(std::future::pending()),
+                    journals: ControlJournals::default(),
+                },
+                AttemptSettings {
+                    presentation_config: PresentationConfig {
+                        requested_mode: RequestedPresentationMode::Plain,
+                        color: ColorChoice::Never,
+                        capabilities: TerminalCapabilities {
+                            stdin_is_terminal: false,
+                            stdout_is_terminal: false,
+                            stderr_is_terminal: false,
+                            stdout_width: None,
+                            stderr_width: None,
+                            term: None,
+                            no_color: None,
+                        },
+                        standard_input_reserved: false,
+                    },
+                    leaf: ExecutionLeaf::Run,
+                    child: None,
+                    child_recovery: None,
+                    journals: ControlJournals::default(),
+                    hooks: (
+                        |_| Ok(()),
+                        |view, cancellation, color| {
+                            WorkflowTerminalHost::start_with_boundary(
+                                view,
+                                cancellation,
+                                color,
+                                RestoringBoundary(Arc::new(AtomicBool::new(false))),
+                            )
+                        },
+                        move || Some(error),
+                    ),
+                },
+            )
+            .await;
+
+            let Err(failure) = result else {
+                panic!("{error:?} must fail the command");
+            };
+            let state: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(run_directory.join("state.json")).unwrap())
+                    .unwrap();
+            let attempt = &state["attempts"][0];
+            assert!(
+                ["created", "running"].contains(&attempt["state"].as_str().unwrap()),
+                "{error:?}: {attempt}"
+            );
+            let diagnostics = state["diagnostics"].as_array().unwrap();
+            if recorded {
+                assert!(
+                    format!("{:#}", failure.error()).contains("storage_full"),
+                    "{:#}",
+                    failure.error()
+                );
+                assert_eq!(
+                    failure.error().downcast_ref::<CoordinationError>().copied(),
+                    Some(error)
+                );
+                assert_eq!(
+                    diagnostics.as_slice(),
+                    [serde_json::json!({
+                        "sequence": 1,
+                        "attemptNumber": 1,
+                        "code": "state_persistence_failure",
+                        "cause": "storage_full",
+                        "osError": 28,
+                    })],
+                );
+            } else {
+                assert!(diagnostics.is_empty(), "{error:?}: {diagnostics:?}");
+            }
+            let record: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(run_directory.join("run.json")).unwrap())
+                    .unwrap();
+            assert_eq!(record["state"], "running", "{error:?}: {record}");
+            assert_eq!(record["outcome"], serde_json::Value::Null, "{error:?}");
+        }
     }
 
     const SUBJECT_DEFINITION: &str = "def_01jz0000000000000000000000";

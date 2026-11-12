@@ -2805,6 +2805,7 @@
           "enum": [
             "stale_occurrence",
             "state_persistence_failure",
+            "transition_capacity_exceeded",
             "result_publication_failure",
             "private_cleanup_failure"
           ]
@@ -2819,6 +2820,13 @@
         },
         "guardId": {
           "$ref": "#/$defs/Uuid"
+        },
+        "cause": {
+          "$ref": "#/$defs/DiagnosticSlug"
+        },
+        "osError": {
+          "type": "integer",
+          "minimum": 1
         }
       }
     },

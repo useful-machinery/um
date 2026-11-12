@@ -13,7 +13,7 @@ use std::future::Future;
 use std::io::{self, Read, Write};
 use std::os::fd::{AsFd as _, OwnedFd};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
 
 use ring::digest::{Context as DigestContext, SHA256, digest};
@@ -43,7 +43,8 @@ use super::artifact::{
 };
 use super::cancellation::MAXIMUM_CANCELLATION_GRACE;
 use super::coordinator::{
-    CommitPort, CommittedActionKind, CommittedReduction, CoordinationDiagnostic,
+    ClassifiedCommitError, CommitFailure, CommitFailureClass, CommitPort, CommittedActionKind,
+    CommittedReduction, CoordinationDiagnostic,
 };
 use super::definition_store::WorkflowHome;
 use super::diagnostic::{StepDiagnostic, StepDiagnosticLog};
@@ -253,11 +254,14 @@ pub enum LocalRunDirectoryError {
     MirrorWriteInvalid,
     /// No run under the `um` home has the id (REQ-LOCALRUN-180): `run_not_found`.
     RunNotFound,
+    /// A parent's commit refused because one of its child runs failed to commit its own
+    /// state (REQ-LOCALRUN-207, INV-ENGINE-33); it classifies as the child's failure.
+    ChildCommitFailed(CommitFailure),
 }
 
 impl PartialEq for LocalRunDirectoryError {
     fn eq(&self, other: &Self) -> bool {
-        use LocalRunDirectoryError::{Artifact, File, Json, StateFile};
+        use LocalRunDirectoryError::{Artifact, ChildCommitFailed, File, Json, StateFile};
         match (self, other) {
             (
                 File {
@@ -315,12 +319,41 @@ impl PartialEq for LocalRunDirectoryError {
                     && a.line() == b.line()
                     && a.column() == b.column()
             }
+            (ChildCommitFailed(a), ChildCommitFailed(b)) => a == b,
             _ => std::mem::discriminant(self) == std::mem::discriminant(other),
         }
     }
 }
 
 impl Eq for LocalRunDirectoryError {}
+
+/// INV-ENGINE-33: a failed state write keeps its class, operation and OS error number,
+/// never its path or the operating system's message.
+impl ClassifiedCommitError for LocalRunDirectoryError {
+    fn commit_failure(&self) -> CommitFailure {
+        match self {
+            Self::File {
+                operation, source, ..
+            } => CommitFailure {
+                class: match source.kind() {
+                    io::ErrorKind::StorageFull => CommitFailureClass::StorageFull,
+                    io::ErrorKind::QuotaExceeded => CommitFailureClass::QuotaExceeded,
+                    io::ErrorKind::PermissionDenied => CommitFailureClass::PermissionDenied,
+                    io::ErrorKind::ReadOnlyFilesystem => CommitFailureClass::ReadOnlyFilesystem,
+                    io::ErrorKind::NotFound => CommitFailureClass::NotFound,
+                    _ => CommitFailureClass::IoFailure,
+                },
+                operation: Some(operation),
+                os_error: source.raw_os_error(),
+            },
+            Self::StateFile { source, .. } => source.commit_failure(),
+            Self::StateConflict => CommitFailure::of_class(CommitFailureClass::StateConflict),
+            Self::StateInvalid => CommitFailure::of_class(CommitFailureClass::StateInvalid),
+            Self::ChildCommitFailed(failure) => *failure,
+            _ => CommitFailure::of_class(CommitFailureClass::Unclassified),
+        }
+    }
+}
 
 impl fmt::Display for LocalRunDirectoryError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -341,6 +374,9 @@ impl fmt::Display for LocalRunDirectoryError {
                 operation,
                 source,
             } => write!(formatter, "{operation} {}: {source}", safe_path(path)),
+            Self::ChildCommitFailed(failure) => {
+                write!(formatter, "child run state commit failed: {failure}")
+            }
             // Variant names are stable, narrow invariant identifiers; split words for CLI prose.
             other => {
                 let name = format!("{other:?}");
@@ -1342,6 +1378,12 @@ struct LocalDiagnosticV1 {
     action_id: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     guard_id: Option<String>,
+    /// A `state_persistence_failure`'s class (REQ-LOCALRUN-205).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cause: Option<CommitFailureClass>,
+    /// A `state_persistence_failure`'s operating-system error number (REQ-LOCALRUN-205).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    os_error: Option<i32>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -2667,6 +2709,7 @@ impl PendingLocalContinuation {
         }
         let store = self.state_store()?;
         store.update(|state| {
+            let cause = abandoned_attempt_cause(state, next - 1);
             let previous = current_attempt_mut(state)?;
             if previous.attempt_number != next - 1 {
                 return Err(LocalRunDirectoryError::StateConflict);
@@ -2676,12 +2719,7 @@ impl PendingLocalContinuation {
                     guard.state = ProcessGuardStateV1::Quiesced;
                 }
                 let started = previous.started_at.is_some();
-                settle_interrupted_attempt(
-                    previous,
-                    InterruptionCauseV1::ExecutionOwnerLost,
-                    started,
-                    abandonment,
-                )?;
+                settle_interrupted_attempt(previous, cause, started, abandonment)?;
             }
             state.current_attempt_number = next;
             state.attempts.push(attempt);
@@ -2738,17 +2776,13 @@ fn settle_abandoned_snapshot(
         WorkspaceSnapshotSettlementV1::AbandonmentRecovery,
     );
     store_from_locked_snapshot(root, state)?.update(|state| {
+        let cause = abandoned_attempt_cause(state, state.current_attempt_number);
         let prior = current_attempt_mut(state)?;
         for guard in &mut prior.process_guards {
             guard.state = ProcessGuardStateV1::Quiesced;
         }
         let started = prior.started_at.is_some();
-        settle_interrupted_attempt(
-            prior,
-            InterruptionCauseV1::ExecutionOwnerLost,
-            started,
-            Some(snapshot),
-        )
+        settle_interrupted_attempt(prior, cause, started, Some(snapshot))
     })
 }
 
@@ -3151,6 +3185,7 @@ impl LocalAttemptOwner {
             diagnostics,
             accounting,
             artifacts,
+            child_failure: Arc::new(OnceLock::new()),
         }
     }
 
@@ -3248,13 +3283,25 @@ impl LocalAttemptOwner {
             .map_err(|_| LocalRunDirectoryError::StateWriteUnavailable)?
     }
 
+    /// Appends the `state_persistence_failure` diagnostic of `failure` for the current
+    /// attempt and settles nothing (REQ-LOCALRUN-205, INV-ENGINE-33): the attempt stays the
+    /// abandoned attempt the next retry or continuation settles.
     pub async fn record_state_persistence_failure_async(
         &self,
+        failure: CommitFailure,
     ) -> Result<(), LocalRunDirectoryError> {
         let state = Arc::clone(&self.state);
-        tokio::task::spawn_blocking(move || record_state_persistence_failure(&state))
+        tokio::task::spawn_blocking(move || record_state_persistence_failure(&state, failure))
             .await
             .map_err(|_| LocalRunDirectoryError::StateWriteUnavailable)?
+    }
+
+    /// Whether the attempt reads settled in the last state this owner committed
+    /// (REQ-LOCALRUN-206). A state write that failed did not advance it.
+    pub fn attempt_settled(&self) -> bool {
+        lock_state(&self.state.current).is_ok_and(|state| {
+            current_attempt(&state).is_ok_and(|attempt| attempt.state.is_terminal())
+        })
     }
 
     pub fn record_private_cleanup_failure(&self) -> Result<(), LocalRunDirectoryError> {
@@ -3299,29 +3346,32 @@ fn record_executor_fault_before_execution(
     })
 }
 
-fn record_state_persistence_failure(state: &StateStore) -> Result<(), LocalRunDirectoryError> {
-    let snapshot = settlement_snapshot(state, WorkspaceSnapshotSettlementV1::Engine)?;
+fn record_state_persistence_failure(
+    state: &StateStore,
+    failure: CommitFailure,
+) -> Result<(), LocalRunDirectoryError> {
     state.update(|state| {
-        let attempt_number = state.current_attempt_number;
-        {
-            let attempt = current_attempt_mut(state)?;
-            if attempt.state.is_terminal() {
-                return Ok(());
-            }
-            let execution_may_have_started = attempt.started_at.is_some();
-            settle_interrupted_attempt(
-                attempt,
-                InterruptionCauseV1::StatePersistenceFailure,
-                execution_may_have_started,
-                Some(snapshot.clone()),
-            )?;
-        }
-        append_diagnostic(
+        append_diagnostic_of(
             state,
-            attempt_number,
+            state.current_attempt_number,
             DiagnosticCodeV1::StatePersistenceFailure,
+            Some(failure),
         )
     })
+}
+
+/// The cause an unsettled `attempt_number` is settled `interrupted` with: the state
+/// persistence failure its owner recorded before it stopped, or the owner's loss
+/// (REQ-LOCALRUN-205).
+fn abandoned_attempt_cause(state: &LocalRunStateV1, attempt_number: u64) -> InterruptionCauseV1 {
+    if state.diagnostics.iter().any(|diagnostic| {
+        diagnostic.attempt_number == attempt_number
+            && diagnostic.code == DiagnosticCodeV1::StatePersistenceFailure
+    }) {
+        InterruptionCauseV1::StatePersistenceFailure
+    } else {
+        InterruptionCauseV1::ExecutionOwnerLost
+    }
 }
 
 fn settlement_snapshot(
@@ -3381,6 +3431,17 @@ pub struct LocalRunCommitPort {
     diagnostics: StepDiagnosticLog,
     accounting: InvocationAccountingLog,
     artifacts: ArtifactStaging,
+    /// Set by a child run whose own state commit failed; once set, every commit is refused
+    /// with it and writes nothing (REQ-LOCALRUN-207, INV-ENGINE-33).
+    child_failure: Arc<OnceLock<CommitFailure>>,
+}
+
+impl LocalRunCommitPort {
+    /// The latch a child run's failed state commit sets, after which this port refuses
+    /// every commit with that failure (REQ-LOCALRUN-207, INV-ENGINE-33).
+    pub fn child_failure_latch(&self) -> Arc<OnceLock<CommitFailure>> {
+        Arc::clone(&self.child_failure)
+    }
 }
 
 impl<Deadline>
@@ -3400,7 +3461,11 @@ where
         let diagnostics = self.diagnostics.clone();
         let accounting = self.accounting.clone();
         let artifacts = self.artifacts.clone();
+        let child_failure = Arc::clone(&self.child_failure);
         async move {
+            if let Some(failure) = child_failure.get() {
+                return Err(LocalRunDirectoryError::ChildCommitFailed(*failure));
+            }
             tokio::task::spawn_blocking(move || {
                 state.commit_runtime(&commit, &finalizers, &diagnostics, &accounting, &artifacts)
             })
@@ -6027,6 +6092,17 @@ fn append_diagnostic(
     attempt_number: u64,
     code: DiagnosticCodeV1,
 ) -> Result<(), LocalRunDirectoryError> {
+    append_diagnostic_of(state, attempt_number, code, None)
+}
+
+/// Appends a `code` diagnostic for `attempt_number`, carrying the class and OS error number
+/// of the commit `failure` a `state_persistence_failure` names (REQ-LOCALRUN-205).
+fn append_diagnostic_of(
+    state: &mut LocalRunStateV1,
+    attempt_number: u64,
+    code: DiagnosticCodeV1,
+    failure: Option<CommitFailure>,
+) -> Result<(), LocalRunDirectoryError> {
     let sequence = state
         .diagnostics
         .last()
@@ -6039,6 +6115,10 @@ fn append_diagnostic(
         step_id: None,
         action_id: None,
         guard_id: None,
+        cause: failure.map(|failure| failure.class),
+        os_error: failure
+            .and_then(|failure| failure.os_error)
+            .filter(|number| *number > 0),
     });
     if state.diagnostics.len() > MAXIMUM_DIAGNOSTICS {
         state.diagnostics.remove(0);
@@ -9176,6 +9256,7 @@ fn begin_local_retry(
         if state.current_attempt_number != prior.attempt_number {
             return Err(LocalRunDirectoryError::StateConflict);
         }
+        let cause = abandoned_attempt_cause(state, prior.attempt_number);
         let current_attempt = current_attempt_mut(state)?;
         if !current_attempt.state.is_terminal() {
             for guard in &mut current_attempt.process_guards {
@@ -9184,7 +9265,7 @@ fn begin_local_retry(
             let execution_may_have_started = current_attempt.started_at.is_some();
             settle_interrupted_attempt(
                 current_attempt,
-                InterruptionCauseV1::ExecutionOwnerLost,
+                cause,
                 execution_may_have_started,
                 abandonment_snapshot.clone(),
             )?;
@@ -10138,6 +10219,9 @@ fn validate_state(state: &LocalRunStateV1) -> Result<(), LocalRunDirectoryError>
                 .guard_id
                 .as_deref()
                 .is_some_and(|guard| !is_canonical_uuid(guard))
+            || diagnostic.os_error.is_some_and(|number| number < 1)
+            || ((diagnostic.cause.is_some() || diagnostic.os_error.is_some())
+                && diagnostic.code != DiagnosticCodeV1::StatePersistenceFailure)
         {
             return Err(LocalRunDirectoryError::StateInvalid);
         }

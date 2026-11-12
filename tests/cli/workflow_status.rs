@@ -57,7 +57,7 @@ fn status(run_directory: &Path, options: &[&str]) -> std::process::Output {
         .unwrap()
 }
 
-fn status_json(run_directory: &Path) -> (std::process::Output, serde_json::Value) {
+pub(super) fn status_json(run_directory: &Path) -> (std::process::Output, serde_json::Value) {
     let output = status(run_directory, &["--json"]);
     let value = serde_json::from_slice(&output.stdout).unwrap();
     (output, value)

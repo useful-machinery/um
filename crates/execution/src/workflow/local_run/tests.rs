@@ -3687,6 +3687,14 @@ impl StateCommitObserver for FailBeforeReplace {
     }
 }
 
+struct StorageFullTemporaryWrite;
+
+impl StateCommitObserver for StorageFullTemporaryWrite {
+    fn write_temporary(&mut self, _file: &mut File, _bytes: &[u8]) -> io::Result<()> {
+        Err(io::Error::from_raw_os_error(libc::ENOSPC))
+    }
+}
+
 struct CorruptBeforeReplace {
     state_path: PathBuf,
 }
@@ -3784,6 +3792,68 @@ fn atomic_state_crash_boundaries_expose_only_complete_snapshots() {
         Err(LocalRunDirectoryError::StateFile { path, source, .. })
             if path == run.run_directory().join(STATE_FILE) && matches!(*source, LocalRunDirectoryError::DocumentFramingInvalid)
     ));
+}
+
+// INV-ENGINE-33
+#[test]
+fn failed_state_commit_classifies_its_cause_without_path_or_message() {
+    use crate::workflow::coordinator::{
+        ClassifiedCommitError as _, CommitFailure, CommitFailureClass,
+    };
+
+    let fixture = AdmittedFixture::new();
+    let run = InitialLocalRun::create(&fixture.run_path("classified"), &fixture.admitted).unwrap();
+    let mutate = |state: &mut LocalRunStateV1| {
+        append_diagnostic(
+            state,
+            INITIAL_ATTEMPT_NUMBER,
+            DiagnosticCodeV1::StaleOccurrence,
+        )
+    };
+
+    let storage_full = run
+        .state
+        .update_with_observer(mutate, &mut StorageFullTemporaryWrite)
+        .unwrap_err();
+    assert_eq!(
+        storage_full.commit_failure(),
+        CommitFailure {
+            class: CommitFailureClass::StorageFull,
+            operation: Some("write temporary state"),
+            os_error: Some(28),
+        }
+    );
+    let state_file = LocalRunDirectoryError::StateFile {
+        path: run.run_directory().join(STATE_FILE),
+        operation: "read state",
+        source: Box::new(storage_full),
+    };
+    assert_eq!(
+        state_file.commit_failure().class,
+        CommitFailureClass::StorageFull
+    );
+
+    assert_eq!(
+        LocalRunDirectoryError::StateConflict.commit_failure(),
+        CommitFailure {
+            class: CommitFailureClass::StateConflict,
+            operation: None,
+            os_error: None,
+        }
+    );
+
+    let unjoined = run
+        .state
+        .update_with_observer(mutate, &mut FailBeforeReplace)
+        .unwrap_err();
+    assert_eq!(
+        unjoined.commit_failure(),
+        CommitFailure {
+            class: CommitFailureClass::Unclassified,
+            operation: None,
+            os_error: None,
+        }
+    );
 }
 
 #[test]
@@ -6074,6 +6144,75 @@ fn postclaim_owner_loss_remains_auditable_and_can_be_settled_again() {
         state.attempts[1].interruption.as_ref().unwrap().cause,
         InterruptionCauseV1::ExecutionOwnerLost
     );
+}
+
+// REQ-LOCALRUN-205: the retry, the continuation and an abandoned continuation's rejection
+// settle an unsettled attempt `interrupted{state_persistence_failure}` when the run recorded
+// that diagnostic for it, and `interrupted{execution_owner_lost}` otherwise.
+#[test]
+fn a_recorded_state_persistence_failure_names_the_abandoned_attempts_interruption() {
+    let fixture = AdmittedFixture::new();
+    let failure = CommitFailure {
+        class: CommitFailureClass::StorageFull,
+        operation: Some("write temporary state"),
+        os_error: Some(28),
+    };
+    for (recorded, cause) in [
+        (true, InterruptionCauseV1::StatePersistenceFailure),
+        (false, InterruptionCauseV1::ExecutionOwnerLost),
+    ] {
+        let unsettled = |name: &str| {
+            let path = fixture.run_path(&format!("{name}-{recorded}"));
+            let original = InitialLocalRun::create(&path, &fixture.admitted).unwrap();
+            if recorded {
+                record_state_persistence_failure(&original.state, failure).unwrap();
+            }
+            drop(original);
+            path
+        };
+        let interruption = |path: &Path| {
+            let state = read_state(&open_directory_path(path).unwrap()).unwrap();
+            assert_eq!(state.attempts[0].state, AttemptStateV1::Interrupted);
+            state.attempts[0].interruption.as_ref().unwrap().cause
+        };
+
+        let path = unsettled("retried");
+        let LocalRetryOpen::Acquired(pending) = acquire_local_retry(&path).unwrap() else {
+            panic!("an abandoned attempt is retryable");
+        };
+        let Ok(_retry) = (*pending).begin(&fixture.admitted) else {
+            panic!("an abandoned attempt's retry begins");
+        };
+        assert_eq!(interruption(&path), cause, "retry, recorded {recorded}");
+
+        let path = unsettled("continued");
+        let LocalContinuationOpen::Acquired(pending) = acquire_local_continuation(&path).unwrap()
+        else {
+            panic!("an abandoned attempt is continuable");
+        };
+        pending
+            .begin(
+                &fixture.admitted,
+                vec!["first".to_owned()],
+                ContinuationDefinitionMode::Inherited,
+                crate::workflow::publication::ContinuationReasonV1::Resume,
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            interruption(&path),
+            cause,
+            "continuation, recorded {recorded}"
+        );
+
+        let path = unsettled("rejected");
+        let LocalContinuationOpen::Acquired(pending) = acquire_local_continuation(&path).unwrap()
+        else {
+            panic!("an abandoned attempt is continuable");
+        };
+        pending.settle_abandoned().unwrap();
+        assert_eq!(interruption(&path), cause, "rejection, recorded {recorded}");
+    }
 }
 
 #[test]
@@ -8859,7 +8998,7 @@ async fn failed_cloud_checkpoint_never_releases_step_success() {
     .await;
     assert!(matches!(
         result,
-        Err(crate::workflow::coordinator::CoordinationError::CommitFailed)
+        Err(crate::workflow::coordinator::CoordinationError::CommitFailed(_))
     ));
     assert!(!fixture.execution_root.join("downstream").exists());
     assert!(!private.join("cloud-retained-v1/state.json").exists());

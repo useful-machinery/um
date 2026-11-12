@@ -4217,7 +4217,7 @@ where
         .await;
     if matches!(
         result,
-        Err(CoordinationError::CommitFailed | CoordinationError::TransitionCapacityExceeded)
+        Err(CoordinationError::CommitFailed(_) | CoordinationError::TransitionCapacityExceeded)
     ) {
         lifecycle.quiesce_active_work().await;
     } else {

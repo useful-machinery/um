@@ -622,7 +622,7 @@ pub(super) fn coordination_cause(error: CoordinationError) -> &'static str {
         CoordinationError::InputStagingMismatch => "input_staging_mismatch",
         CoordinationError::AgentInputStagingMismatch => "agent_input_staging_mismatch",
         CoordinationError::AgentRuntimeUnavailable => "agent_runtime_unavailable",
-        CoordinationError::CommitFailed => "coordination_commit_failed",
+        CoordinationError::CommitFailed(_) => "coordination_commit_failed",
         CoordinationError::OccurrenceChannelClosed => "occurrence_channel_closed",
         CoordinationError::OccurrenceConflict => "occurrence_conflict",
         CoordinationError::OccurrenceIdentityCapacityExceeded => {

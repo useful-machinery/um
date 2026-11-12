@@ -517,13 +517,27 @@ finalizers:
     ));
 }
 
-struct FailingCommitPort;
+struct FailingCommitPort<Error>(fn() -> Error);
 
-impl CommitPort<TestCommit> for FailingCommitPort {
-    type Error = ();
+impl<Error: ClassifiedCommitError> CommitPort<TestCommit> for FailingCommitPort<Error> {
+    type Error = Error;
 
     fn commit(&mut self, _commit: TestCommit) -> impl Future<Output = Result<(), Self::Error>> {
-        ready(Err(()))
+        ready(Err((self.0)()))
+    }
+}
+
+impl ClassifiedCommitError for () {
+    fn commit_failure(&self) -> CommitFailure {
+        CommitFailure::of_class(CommitFailureClass::Unclassified)
+    }
+}
+
+fn storage_full_state_write() -> crate::workflow::local_run::LocalRunDirectoryError {
+    crate::workflow::local_run::LocalRunDirectoryError::File {
+        path: "/run/.private/state.tmp".into(),
+        operation: "write temporary state",
+        source: std::io::Error::from_raw_os_error(libc::ENOSPC),
     }
 }
 
@@ -632,7 +646,7 @@ async fn failed_commit_prevents_initial_action_release() {
             instant: TestInstant(Duration::ZERO),
             reads: Arc::new(AtomicUsize::new(0)),
         },
-        FailingCommitPort,
+        FailingCommitPort(|| ()),
         ControlledActionPort {
             actions: action_sender,
             timeline: Arc::clone(&timeline),
@@ -641,10 +655,53 @@ async fn failed_commit_prevents_initial_action_release() {
 
     assert_eq!(
         coordinator.run().await,
-        Err(CoordinationError::CommitFailed)
+        Err(CoordinationError::CommitFailed(CommitFailure::of_class(
+            CommitFailureClass::Unclassified
+        )))
     );
     assert!(actions.try_recv().is_err());
     assert!(timeline.lock().unwrap().is_empty());
+}
+
+// INV-ENGINE-8, INV-ENGINE-33: both commit sites, the reduction's and the coordination
+// diagnostic's, carry the port's classified failure and release no action.
+#[tokio::test]
+async fn failed_commit_carries_the_port_failure_from_both_commit_sites() {
+    let expected = CommitFailure {
+        class: CommitFailureClass::StorageFull,
+        operation: Some("write temporary state"),
+        os_error: Some(libc::ENOSPC),
+    };
+    for transition_ceiling in [None, Some(0)] {
+        let mut fixture = admitted_fixture(CancellationSource::new(), Duration::from_secs(7));
+        if let Some(ceiling) = transition_ceiling {
+            fixture.admitted.set_transition_ceiling(ceiling);
+        }
+        let (_sender, receiver) = occurrence_channel(NonZeroUsize::new(1).unwrap());
+        let timeline = Arc::new(Mutex::new(Vec::new()));
+        let (action_sender, mut actions) = mpsc::unbounded_channel();
+        let coordinator = Coordinator::<String, String, String, _, _, _>::new(
+            fixture.admitted,
+            receiver,
+            TestClock {
+                instant: TestInstant(Duration::ZERO),
+                reads: Arc::new(AtomicUsize::new(0)),
+            },
+            FailingCommitPort(storage_full_state_write),
+            ControlledActionPort {
+                actions: action_sender,
+                timeline: Arc::clone(&timeline),
+            },
+        );
+
+        assert_eq!(
+            coordinator.run().await,
+            Err(CoordinationError::CommitFailed(expected)),
+            "transition ceiling {transition_ceiling:?}"
+        );
+        assert!(actions.try_recv().is_err());
+        assert!(timeline.lock().unwrap().is_empty());
+    }
 }
 
 #[tokio::test]

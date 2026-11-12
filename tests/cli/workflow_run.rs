@@ -5068,6 +5068,11 @@ steps:
     remover_release.write_all(b"release\n").unwrap();
     let output = child.wait_with_output().unwrap();
     assert_eq!(output.status.code(), Some(1));
+    // The failure's class: the exchange found no `state.json`.
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("not_found"),
+        "{output:?}"
+    );
     let survivor = Pid::from_raw(
         fs::read_to_string(&survivor_pid)
             .unwrap()

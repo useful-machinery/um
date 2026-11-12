@@ -951,9 +951,86 @@ pub struct CommittedReduction<Cause, Output, Deadline> {
 }
 
 pub trait CommitPort<Commit> {
-    type Error;
+    type Error: ClassifiedCommitError;
 
     fn commit(&mut self, commit: Commit) -> impl Future<Output = Result<(), Self::Error>>;
+}
+
+/// A commit port's error names its own cause as a [`CommitFailure`], which
+/// [`CoordinationError::CommitFailed`] carries out of the coordinator (INV-ENGINE-33).
+pub trait ClassifiedCommitError {
+    fn commit_failure(&self) -> CommitFailure;
+}
+
+impl ClassifiedCommitError for std::convert::Infallible {
+    fn commit_failure(&self) -> CommitFailure {
+        match *self {}
+    }
+}
+
+/// The closed class of a failed state commit. Its serialized form is [`Self::as_str`]'s slug,
+/// which a run's `state_persistence_failure` diagnostic records as `cause`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CommitFailureClass {
+    StorageFull,
+    QuotaExceeded,
+    PermissionDenied,
+    ReadOnlyFilesystem,
+    NotFound,
+    /// Any other I/O error.
+    IoFailure,
+    StateConflict,
+    StateInvalid,
+    Unclassified,
+}
+
+impl CommitFailureClass {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::StorageFull => "storage_full",
+            Self::QuotaExceeded => "quota_exceeded",
+            Self::PermissionDenied => "permission_denied",
+            Self::ReadOnlyFilesystem => "read_only_filesystem",
+            Self::NotFound => "not_found",
+            Self::IoFailure => "io_failure",
+            Self::StateConflict => "state_conflict",
+            Self::StateInvalid => "state_invalid",
+            Self::Unclassified => "unclassified",
+        }
+    }
+}
+
+/// Why a commit failed: its class, the static name of the write that failed and the
+/// operating system's error number. It never holds a path or an OS message.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CommitFailure {
+    pub class: CommitFailureClass,
+    pub operation: Option<&'static str>,
+    pub os_error: Option<i32>,
+}
+
+impl CommitFailure {
+    pub const fn of_class(class: CommitFailureClass) -> Self {
+        Self {
+            class,
+            operation: None,
+            os_error: None,
+        }
+    }
+}
+
+impl fmt::Display for CommitFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.class.as_str())?;
+        if let Some(operation) = self.operation {
+            write!(formatter, " during {operation}")?;
+        }
+        if let Some(os_error) = self.os_error {
+            write!(formatter, " (os error {os_error})")?;
+        }
+        Ok(())
+    }
 }
 
 pub(crate) trait ActionPort<Action> {
@@ -971,7 +1048,7 @@ pub enum CoordinationError {
     InputStagingMismatch,
     AgentInputStagingMismatch,
     AgentRuntimeUnavailable,
-    CommitFailed,
+    CommitFailed(CommitFailure),
     OccurrenceChannelClosed,
     OccurrenceConflict,
     OccurrenceIdentityCapacityExceeded,
@@ -979,6 +1056,19 @@ pub enum CoordinationError {
     ReducerStateUnavailable,
     TransitionCapacityExceeded,
 }
+
+/// A failed commit names its [`CommitFailure`] (INV-ENGINE-33); every other error names its
+/// variant.
+impl fmt::Display for CoordinationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::CommitFailed(failure) => write!(formatter, "state commit failed: {failure}"),
+            other => Debug::fmt(other, formatter),
+        }
+    }
+}
+
+impl std::error::Error for CoordinationError {}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct CoordinationResult<Cause, Output, Deadline = ()> {
@@ -1272,7 +1362,7 @@ where
         acknowledgement: Option<DriverOccurrenceAcknowledgement>,
         diagnostic: CoordinationDiagnostic,
     ) -> Result<(), CoordinationError> {
-        if self
+        if let Err(failure) = self
             .commits
             .commit(CommittedReduction {
                 occurrence_ordinal,
@@ -1283,9 +1373,9 @@ where
                 diagnostic: Some(diagnostic),
             })
             .await
-            .is_err()
+            .map_err(|error| error.commit_failure())
         {
-            return Err(CoordinationError::CommitFailed);
+            return Err(CoordinationError::CommitFailed(failure));
         }
         if let Some(finalization) =
             acknowledgement.and_then(|acknowledgement| acknowledgement.resolve(false))
@@ -1326,7 +1416,7 @@ where
         let cancellation = self.admitted.execution().cancellation().source();
         let finalization_arm_started =
             entered_finalization && cancellation.begin_finalization_arm();
-        if self
+        if let Err(failure) = self
             .commits
             .commit(CommittedReduction {
                 occurrence_ordinal,
@@ -1337,13 +1427,13 @@ where
                 diagnostic: None,
             })
             .await
-            .is_err()
+            .map_err(|error| error.commit_failure())
         {
             if finalization_arm_started {
                 cancellation.abort_finalization_arm();
             }
             self.release_action_resources(actions).await;
-            return Err(CoordinationError::CommitFailed);
+            return Err(CoordinationError::CommitFailed(failure));
         }
         self.state = Some(state);
         if finalization_arm_started {
