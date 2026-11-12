@@ -108,7 +108,7 @@ fn write_human_valid(workflow: &ResolvedWorkflow) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn write_human_invalid(failure: &ResolutionFailure) -> anyhow::Result<()> {
+pub(in crate::cli) fn write_human_invalid(failure: &ResolutionFailure) -> anyhow::Result<()> {
     let diagnostic = Diagnostic::from_resolution(failure);
     let stdout = io::stdout();
     let mut stdout = stdout.lock();
@@ -187,7 +187,7 @@ fn write_json_valid(workflow: &ResolvedWorkflow) -> anyhow::Result<()> {
     write_json(&report)
 }
 
-fn write_json_invalid(failure: &ResolutionFailure) -> anyhow::Result<()> {
+pub(in crate::cli) fn write_json_invalid(failure: &ResolutionFailure) -> anyhow::Result<()> {
     let report = JsonReport {
         schema_version: 1,
         command: COMMAND_NAME,

@@ -822,6 +822,78 @@ fn runner_test_waits_hold_no_literal_real_time_bound() {
     );
 }
 
+// INV-TESTING-26
+#[test]
+fn runner_watchdog_call_sites_print_the_expiry() {
+    let root = cli_root();
+    let mut calls = 0;
+    let mut violations = Vec::new();
+    for file in rust_sources(&root.join("crates/runner/src/")) {
+        let relative = file.strip_prefix(&root).unwrap();
+        let relative_text = relative.to_string_lossy().replace('\\', "/");
+        for (call_line, discard_line) in watchdog_call_sites(&read_source(&file)) {
+            calls += 1;
+            if let Some(discard_line) = discard_line {
+                violations.push(format!(
+                    "{relative_text}:{discard_line}: the `with_watchdog` call on line \
+                     {call_line} does not print the `WatchdogExpired` it returns; `unwrap` or \
+                     `expect` it, or bind it into the site's panic message"
+                ));
+            }
+        }
+    }
+
+    assert!(
+        calls > 0,
+        "found no `with_watchdog` call in the runner's sources"
+    );
+    assert!(
+        violations.is_empty(),
+        "runner watchdog call sites that discard the expiry ({} of {calls} calls):\n{}",
+        violations.len(),
+        violations.join("\n")
+    );
+}
+
+// INV-TESTING-26
+#[test]
+fn runner_watchdog_scan_rejects_each_discarding_form() {
+    let discards = |source: &str| {
+        let sites = watchdog_call_sites(source);
+        assert_eq!(sites.len(), 1, "one call in: {source}");
+        sites[0].1.is_some()
+    };
+    for discarding in [
+        "with_watchdog(wait()).await.unwrap_or_else(|_| panic!());",
+        "with_watchdog(wait()).await.unwrap_or_else(|_expired| panic!());",
+        "with_watchdog(wait()).await.ok();",
+        "assert!(matches!(with_watchdog(wait()).await, Ok(Some(_))));",
+        "match with_watchdog(wait()).await { Ok(value) => value, Err(_) => panic!() }",
+        "match with_watchdog(wait()).await { Ok(value) => value, _ => panic!() }",
+        "match with_watchdog(wait()).await { Ok(Err(error)) => panic!(\"{error}\"), _ => panic!() }",
+        "match with_watchdog(wait()).await { Ok(value) => Err(value), _ => panic!() }",
+        "let waited = with_watchdog(wait()).await; if waited.is_err() { panic!() }",
+        "let waited = with_watchdog(wait()).await; assert!(waited.is_ok());",
+        "let waited = runtime.block_on(with_watchdog(wait())); cleanup(waited.ok());",
+        "let waited = with_watchdog(wait()).await; if let Err(_) = waited { panic!() }",
+    ] {
+        assert!(
+            discards(discarding),
+            "accepted a discarded expiry: {discarding}"
+        );
+    }
+    for printing in [
+        "with_watchdog(wait()).await.unwrap();",
+        "runtime.block_on(with_watchdog(wait())).expect(\"waited\");",
+        "with_watchdog(wait()).await.unwrap_or_else(|expired| panic!(\"{expired}\"));",
+        "match with_watchdog(wait()).await { Ok(value) => value, Err(expired) => panic!(\"{expired}\") }",
+        "let waited = with_watchdog(wait()).await; cleanup(); waited.expect(\"waited\");",
+        "let waited = with_watchdog(wait()).await; if let Err(expired) = waited { panic!(\"{expired}\") }",
+    ] {
+        assert!(!discards(printing), "rejected a printed expiry: {printing}");
+    }
+}
+
 fn cli_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).to_path_buf()
 }
@@ -943,6 +1015,223 @@ fn strip_line_comment(line: &str) -> &str {
 
 fn is_ident_byte(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || byte == b'_'
+}
+
+/// Every `with_watchdog(` call in `source`: the line it is on and, when the call's
+/// `WatchdogExpired` is discarded instead of printed, the line that discards it.
+fn watchdog_call_sites(source: &str) -> Vec<(usize, Option<usize>)> {
+    const CALL: &str = "with_watchdog(";
+
+    let code = source
+        .lines()
+        .map(strip_line_comment)
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut sites = Vec::new();
+    let mut search_from = 0;
+    while let Some(found) = code[search_from..].find(CALL) {
+        let call = search_from + found;
+        search_from = call + CALL.len();
+        if call > 0 && is_ident_byte(code.as_bytes()[call - 1]) {
+            continue;
+        }
+        let discard = watchdog_expiry_discard(&code, call, search_from - 1);
+        sites.push((
+            line_of_offset(&code, call),
+            discard.map(|offset| line_of_offset(&code, offset)),
+        ));
+    }
+    sites
+}
+
+/// Where the `Result` of the `with_watchdog` call starting at `call`, whose argument list
+/// opens at `open`, is consumed without printing its `WatchdogExpired`, if anywhere.
+fn watchdog_expiry_discard(code: &str, call: usize, open: usize) -> Option<usize> {
+    let path_start = code[..call]
+        .trim_end_matches(|character: char| {
+            character == ':' || character == '_' || character.is_ascii_alphanumeric()
+        })
+        .len();
+    let before = code[..path_start].trim_end();
+    let after_call = matching_delimiter(code, open, b'(', b')') + 1;
+    let driven = skip_whitespace(code, after_call);
+    let resolved = if before.ends_with("block_on(") {
+        if !code[driven..].starts_with(')') {
+            return Some(driven);
+        }
+        driven + 1
+    } else {
+        if !code[driven..].starts_with(".await") {
+            return Some(driven);
+        }
+        driven + ".await".len()
+    };
+
+    let consumer = skip_whitespace(code, resolved);
+    let rest = &code[consumer..];
+    if rest.starts_with(".unwrap()") || rest.starts_with(".expect(") {
+        return None;
+    }
+    if let Some(closure) = rest.strip_prefix(".unwrap_or_else(") {
+        let parameter = closure
+            .trim_start()
+            .strip_prefix('|')
+            .and_then(|parameter| parameter.split_once('|'))
+            .map(|(parameter, _)| parameter.trim());
+        return (!parameter.is_some_and(is_binding_name)).then_some(consumer);
+    }
+    if ends_with_word(before, "match") {
+        return match_error_arm_discard(code, consumer);
+    }
+    if rest.starts_with(';')
+        && let Some(name) = let_binding_name(code, call)
+    {
+        return bound_result_discard(code, consumer + 1, name).err();
+    }
+    Some(consumer)
+}
+
+/// Where the `match` whose body opens at `body` discards the error, if it does: an
+/// `Err(_)` arm, or no `Err` arm that binds a name. An arm's pattern sits directly in the
+/// body, where the body opens or after the arm or the alternative before it; an `Err(`
+/// nested in another pattern or in an arm's expression is not the watchdog's error.
+fn match_error_arm_discard(code: &str, body: usize) -> Option<usize> {
+    if !code[body..].starts_with('{') {
+        return Some(body);
+    }
+    let end = matching_delimiter(code, body, b'{', b'}');
+    let mut binds = false;
+    for (found, _) in code[body..end].match_indices("Err(") {
+        let arm = body + found;
+        let preceding = code[body + 1..arm].trim_end();
+        let nesting = preceding.bytes().fold(0_usize, |depth, byte| match byte {
+            b'(' | b'[' | b'{' => depth + 1,
+            b')' | b']' | b'}' => depth.saturating_sub(1),
+            _ => depth,
+        });
+        if nesting > 0 || !(preceding.is_empty() || preceding.ends_with([',', '}', '|'])) {
+            continue;
+        }
+        let open = arm + "Err".len();
+        let pattern = code[open + 1..matching_delimiter(code, open, b'(', b')')].trim();
+        if !is_binding_name(pattern) {
+            return Some(arm);
+        }
+        binds = true;
+    }
+    (!binds).then_some(body)
+}
+
+/// The name a `let <name> = ..` statement ending in the call at `call` binds.
+fn let_binding_name(code: &str, call: usize) -> Option<&str> {
+    let statement_start = code[..call]
+        .rfind([';', '{', '}'])
+        .map_or(0, |found| found + 1);
+    let statement = code[statement_start..call]
+        .trim_start()
+        .strip_prefix("let ")?;
+    let statement = statement.trim_start();
+    let statement = statement.strip_prefix("mut ").unwrap_or(statement);
+    let length = statement
+        .bytes()
+        .take_while(|byte| is_ident_byte(*byte))
+        .count();
+    let (name, rest) = statement.split_at(length);
+    (is_binding_name(name) && rest.trim_start().starts_with('=')).then_some(name)
+}
+
+/// Whether the result bound to `name` is printed later in its block: `Ok` when some use
+/// unwraps, expects or binds its error and none discards it, else where it is discarded.
+fn bound_result_discard(code: &str, from: usize, name: &str) -> Result<(), usize> {
+    let bytes = code.as_bytes();
+    let mut depth = 0_usize;
+    let mut end = code.len();
+    for (index, byte) in bytes.iter().enumerate().skip(from) {
+        match byte {
+            b'{' => depth += 1,
+            b'}' if depth == 0 => {
+                end = index;
+                break;
+            }
+            b'}' => depth -= 1,
+            _ => {}
+        }
+    }
+
+    let mut printed = false;
+    for (found, _) in code[from..end].match_indices(name) {
+        let start = from + found;
+        let stop = start + name.len();
+        if is_ident_byte(bytes[start - 1]) || bytes.get(stop).is_some_and(|b| is_ident_byte(*b)) {
+            continue;
+        }
+        let used = &code[skip_whitespace(code, stop)..];
+        if [".is_err()", ".is_ok()", ".ok()"]
+            .iter()
+            .any(|discard| used.starts_with(discard))
+        {
+            return Err(start);
+        }
+        if used.starts_with(".unwrap()") || used.starts_with(".expect(") {
+            printed = true;
+        } else if let Some(pattern) = if_let_error_pattern(&code[..start]) {
+            if !is_binding_name(pattern) {
+                return Err(start);
+            }
+            printed = true;
+        }
+    }
+    if printed { Ok(()) } else { Err(from - 1) }
+}
+
+/// The pattern inside `Err(..)` when `head` ends in `if let Err(..) =`.
+fn if_let_error_pattern(head: &str) -> Option<&str> {
+    let head = head.trim_end().strip_suffix('=')?.trim_end();
+    let head = head.strip_suffix(')')?;
+    let open = head.rfind("Err(")?;
+    let keywords = head[..open].trim_end();
+    let conditional = ends_with_word(keywords, "let")
+        && ends_with_word(keywords[..keywords.len() - "let".len()].trim_end(), "if");
+    conditional.then(|| head[open + "Err(".len()..].trim())
+}
+
+fn is_binding_name(name: &str) -> bool {
+    name.bytes()
+        .next()
+        .is_some_and(|first| first.is_ascii_lowercase())
+        && name.bytes().all(is_ident_byte)
+}
+
+fn ends_with_word(text: &str, word: &str) -> bool {
+    text.strip_suffix(word)
+        .is_some_and(|rest| !rest.bytes().next_back().is_some_and(is_ident_byte))
+}
+
+fn skip_whitespace(code: &str, from: usize) -> usize {
+    from + code[from..]
+        .bytes()
+        .take_while(u8::is_ascii_whitespace)
+        .count()
+}
+
+/// The offset of the delimiter that closes the one at `open`.
+fn matching_delimiter(code: &str, open: usize, opening: u8, closing: u8) -> usize {
+    let mut depth = 0_usize;
+    for (index, byte) in code.bytes().enumerate().skip(open) {
+        if byte == opening {
+            depth += 1;
+        } else if byte == closing {
+            depth -= 1;
+            if depth == 0 {
+                return index;
+            }
+        }
+    }
+    panic!("unbalanced `{}` at offset {open}", char::from(opening));
+}
+
+fn line_of_offset(code: &str, offset: usize) -> usize {
+    code[..offset].matches('\n').count() + 1
 }
 
 fn is_path_prefix(target: &str, prefix: &str) -> bool {

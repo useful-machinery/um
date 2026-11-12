@@ -4323,9 +4323,9 @@ mod tests {
         let mut owner = ServingOwner::spawn(temporary.path(), &endpoint, &source, &work);
         let (mut socket, accepted) = with_watchdog(accept_offered_assignment(&listener, offer))
             .await
-            .unwrap_or_else(|_| {
+            .unwrap_or_else(|expired| {
                 panic!(
-                    "serving owner did not accept the assignment: {}",
+                    "serving owner did not accept the assignment: {expired}: {}",
                     owner.diagnostics()
                 )
             });
@@ -4350,7 +4350,12 @@ mod tests {
             || guarded_processes(&record),
         ))
         .await
-        .unwrap_or_else(|_| panic!("guarded step did not hold: {}", owner.diagnostics()));
+        .unwrap_or_else(|expired| {
+            panic!(
+                "guarded step did not hold: {expired}: {}",
+                owner.diagnostics()
+            )
+        });
         for member in [leader, descendant] {
             assert_eq!(
                 getpgid(Some(member)),
@@ -4369,9 +4374,9 @@ mod tests {
             }
         })
         .await;
-        if quiesced.is_err() {
+        if let Err(expired) = quiesced {
             let _ = kill_process_group(leader, Signal::KILL);
-            panic!("guarded processes outlived the serving owner");
+            panic!("guarded processes outlived the serving owner: {expired}");
         }
     }
 
@@ -4455,11 +4460,11 @@ mod tests {
         use super::super::test_support::{
             ConfigFixture, ControlledShutdownTrigger, FAKE_AGENT_LOGIN_SENTINEL,
             FakeAgentLoginCloud, SleepRelease, accept_fixture_socket, assignment_offer,
-            begin_assignment_preparation, controlled_shutdown, controlled_sleeper,
-            deterministic_frame_source, effect_acknowledgement, fake_agent_login_material,
-            fake_agent_login_setup, fake_codex_answer, fake_codex_authorized, fixture_lease_clock,
-            fixture_listener, observation_acknowledgement, scripted_connector, sleep_request,
-            welcome, with_watchdog,
+            assignment_prepare, begin_assignment_preparation, controlled_shutdown,
+            controlled_sleeper, deterministic_frame_source, effect_acknowledgement,
+            effect_observation_acknowledgement, fake_agent_login_material, fake_agent_login_setup,
+            fake_codex_answer, fake_codex_authorized, fixture_lease_clock, fixture_listener,
+            observation_acknowledgement, scripted_connector, sleep_request, welcome, with_watchdog,
         };
         use super::super::workspace::WorkRootLease;
         use super::super::{
@@ -4603,7 +4608,9 @@ mod tests {
 
             async fn stop(self) {
                 self.shutdown.notify_one();
-                let _ = with_watchdog(self.task).await;
+                let _ = with_watchdog(self.task)
+                    .await
+                    .expect("runner ignored controlled shutdown");
             }
         }
 
@@ -4720,7 +4727,8 @@ mod tests {
                 hello["sequence"].as_u64().unwrap(),
             ));
             connection.inbound.send(assignment_offer());
-            next_text(&mut connection.outbound, "assignment_preparing").await;
+            let offered = next_text(&mut connection.outbound, "effect_acknowledged").await;
+            let preparing = next_text(&mut connection.outbound, "assignment_preparing").await;
 
             // While it holds the assignment, a setup that falls due does
             // not run.
@@ -4731,6 +4739,21 @@ mod tests {
             assert_eq!(service.installed_material(), None);
             assert_eq!(service.recorded_codex(), None);
             assert!(service.setup_records().is_empty());
+
+            // A runner holding a preparation stops only once Cloud has its
+            // answer, so let the assignment go before stopping: with no
+            // source broker it rejects the preparation.
+            let acknowledge = |frame: &serde_json::Value| {
+                connection.inbound.send(effect_observation_acknowledgement(
+                    frame["messageId"].as_str().unwrap(),
+                    frame["sequence"].as_u64().unwrap(),
+                ));
+            };
+            acknowledge(&offered);
+            acknowledge(&preparing);
+            connection.inbound.send(assignment_prepare());
+            let rejection = next_text(&mut connection.outbound, "assignment_rejected").await;
+            acknowledge(&rejection);
             service.stop().await;
         }
 

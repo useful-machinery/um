@@ -2,7 +2,7 @@ mod definition;
 mod reference;
 mod run;
 mod schema;
-mod validate;
+pub(in crate::cli) mod validate;
 
 use std::future::Future;
 use std::io::{self, Write};

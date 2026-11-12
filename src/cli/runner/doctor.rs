@@ -1,3 +1,6 @@
+mod readiness;
+mod workflow;
+
 use std::io::{self, Write};
 use std::path::PathBuf;
 
@@ -5,6 +8,7 @@ use anyhow::{Context, anyhow};
 use clap::Args;
 use serde::Serialize;
 
+use super::super::{OrganizationArg, PrincipalAuthenticationArgs, ProjectArg};
 use crate::exit_code::ExitCode;
 use um_runner::{CheckResult, Report, Status, built_in_registry};
 
@@ -17,24 +21,102 @@ pub(super) struct Command {
     checks: Vec<String>,
 
     #[arg(
+        long = "workflow",
+        value_name = "FILE",
+        requires = "source_root",
+        conflicts_with_all = ["checks", "list_checks"],
+        help = "Report the credentials a workflow and its child workflows need instead of running checks"
+    )]
+    workflows: Vec<PathBuf>,
+
+    #[arg(
+        long,
+        value_name = "ROOT",
+        requires = "workflows",
+        help = "Directory boundary for the --workflow files"
+    )]
+    source_root: Option<PathBuf>,
+
+    #[arg(
         long,
         conflicts_with_all = ["checks", "json"],
         help = "List registered checks without running them"
     )]
     list_checks: bool,
 
+    #[arg(
+        long,
+        requires = "workflows",
+        requires = "organization_id",
+        help = "Ask Cloud about the organization's connections for the providers the workflows need"
+    )]
+    readiness: bool,
+
+    #[arg(
+        long,
+        value_name = OrganizationArg::VALUE_NAME,
+        requires = "readiness",
+        help = "Organization whose connections --readiness reads, by ID or exact slug"
+    )]
+    organization_id: Option<OrganizationArg>,
+
+    #[arg(
+        long,
+        value_name = ProjectArg::VALUE_NAME,
+        requires = "readiness",
+        help = ProjectArg::HELP
+    )]
+    project_id: Option<ProjectArg>,
+
     /// Read the runner operator configuration for a selected check that needs it.
-    #[arg(long, value_name = "PATH", conflicts_with = "list_checks")]
+    #[arg(long, value_name = "PATH", conflicts_with_all = ["list_checks", "workflows"])]
     config: Option<PathBuf>,
 
     // Doctor and enrollment have unrelated operation inputs and execution paths; sharing their
     // command shells would couple those contracts merely because both use runner JSON output.
+    // The authentication and HTTP options serve only --readiness.
     #[command(flatten)]
-    output: super::super::JsonArgs<super::super::RunnerJson>,
+    options: super::super::CommonArgs<super::super::RunnerJson, PrincipalAuthenticationArgs>,
 }
 
 impl Command {
     pub(super) fn execute(self) -> super::super::CommandResult {
+        // Flattened options cannot carry `requires`, so they are refused here (REQ-CREDREADY-13).
+        if !self.readiness {
+            let unrequested = if self.options.authentication.service_api_key_file.is_some() {
+                Some("--service-api-key-file")
+            } else if self.options.http.allow_insecure_http {
+                Some("--allow-insecure-http")
+            } else {
+                None
+            };
+            if let Some(option) = unrequested {
+                return Err(super::super::CommandFailure::with_exit_code(
+                    anyhow!("{option} requires --readiness"),
+                    ExitCode::UsageError,
+                ));
+            }
+        }
+        if let Some(source_root) = &self.source_root
+            && !self.workflows.is_empty()
+        {
+            let readiness = self
+                .organization_id
+                .as_ref()
+                .filter(|_| self.readiness)
+                .map(|organization| readiness::Readiness {
+                    organization,
+                    project: self.project_id.as_deref(),
+                    authentication: &self.options.authentication,
+                    policy: self.options.http.transport_policy(),
+                });
+            return workflow::execute(
+                source_root,
+                &self.workflows,
+                self.options.json,
+                readiness.as_ref(),
+            );
+        }
         let config = self
             .config
             .as_deref()
@@ -50,7 +132,7 @@ impl Command {
         let report = registry.run(&self.checks).map_err(|error| {
             super::super::CommandFailure::with_exit_code(anyhow!(error), ExitCode::UsageError)
         })?;
-        if self.output.json {
+        if self.options.json {
             write_json_report(&report)?;
         } else {
             write_human_report(&report).context("write runner doctor report")?;

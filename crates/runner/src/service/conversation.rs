@@ -324,7 +324,7 @@ async fn replays_gateway_conversations_against_established_runner() {
         let name = conversation.name.clone();
         with_watchdog(replay_conversation(conversation))
             .await
-            .unwrap_or_else(|_| panic!("conversation replay timed out: {name}"))
+            .unwrap_or_else(|expired| panic!("conversation replay timed out: {name}: {expired}"))
             .unwrap_or_else(|error| {
                 panic!("conversation {name} failed in established runner loop: {error}")
             });

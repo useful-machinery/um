@@ -144,9 +144,9 @@ impl Deref for ConfigFixture {
 
 /// Bounds a runner test's awaited wait against hangs on `FIXTURE_WAIT_BASE`, scaled by the
 /// host's load (INV-TESTING-26). The case is the call site (`file:line`), and an expiry is
-/// returned as the error the call site's `expect` prints. A plain function, not an
-/// `async fn`, so the body is heap-pinned before this wrapper's state exists
-/// (INV-TESTING-18).
+/// returned as an error that every call site prints, through `unwrap` or `expect` or in its
+/// own panic message. A plain function, not an `async fn`, so the body is heap-pinned
+/// before this wrapper's state exists (INV-TESTING-18).
 #[track_caller]
 pub(crate) fn with_watchdog<F: Future>(
     future: F,
@@ -1139,7 +1139,12 @@ mod tests {
         let rendered = format!("{expired:?}");
         assert!(rendered.starts_with(&expected), "{rendered}");
 
-        assert_eq!(with_watchdog(async { 7 }).await.ok(), Some(7));
+        assert_eq!(
+            with_watchdog(async { 7 })
+                .await
+                .expect("a ready wait does not expire"),
+            7
+        );
     }
 
     #[tokio::test]

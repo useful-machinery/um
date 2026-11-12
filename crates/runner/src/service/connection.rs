@@ -4174,8 +4174,10 @@ mod tests {
             ));
             inbound.send(Message::Ping(b"cancellation-applied".to_vec().into()));
             assert!(matches!(
-                with_watchdog(outbound.recv()).await,
-                Ok(Some(Message::Pong(payload))) if payload.as_ref() == b"cancellation-applied"
+                with_watchdog(outbound.recv())
+                    .await
+                    .expect("the cancellation-applied Pong did not arrive"),
+                Some(Message::Pong(payload)) if payload.as_ref() == b"cancellation-applied"
             ));
             assert!(outbound.try_recv().is_err());
             inbound.send(Message::Close(None));

@@ -3,6 +3,7 @@ mod claude_code;
 mod codex;
 mod git;
 mod pi;
+mod workflow_credentials;
 
 use std::collections::BTreeSet;
 use std::fmt;
@@ -15,6 +16,12 @@ use claude_code::ClaudeCodeCheck;
 use codex::CodexCheck;
 use git::GitCheck;
 use pi::PiCheck;
+
+pub use workflow_credentials::{
+    CredentialKind, CredentialOrigin, CredentialRequirement, CredentialSummary, Declaration,
+    DeclarationKind, Node, NodeKind, OriginDeclaration, ReadinessCode, RepositorySource,
+    UnknownCredential, UnknownDeclaration, WorkflowCredentials, read_workflow_credentials,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CheckDescriptor {

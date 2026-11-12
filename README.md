@@ -2137,6 +2137,44 @@ um runner doctor --list-checks
 um runner doctor --json
 ```
 
+With `--workflow FILE --source-root ROOT` the doctor runs no check and instead lists the
+credentials a workflow tree needs: it resolves each named workflow and every child workflow
+its `workflow` steps name, as `um workflow validate` does, and reports one requirement per
+kind (`github`, `gitlab`, `linear`, `claude_code`, `codex`) with every declaration that calls
+for it, followed by the nodes and forwarded variables whose credentials it cannot see. Agent
+profiles on Claude Code or Codex and credential-like names in the root
+`environmentPassthrough` count; nothing runs, no harness sign-in or variable value is read,
+and Cloud is not contacted, so every requirement reads `unverified` with a next action.
+Repeat `--workflow` to cover several files; `--json` prints the same as one document.
+
+With `--readiness --organization-id ORGANIZATION` the doctor also asks Useful Machinery, as
+the signed-in member or, with `--service-api-key-file`, a service principal, about the
+organization's connections for the providers the workflows need: its Linear and GitLab
+connections and its GitHub App installations. A provider reads `missing`,
+`reconnect_required` (an inactive connection, or a GitLab credential that expired) or, for
+Linear, `insufficient_permission` with the `um connection` command that fixes it, and the
+command exits 1; a connection Useful Machinery holds ready stays `unverified` with
+`cloud: ready`, because the credential reaches a runner only for a run. A read the caller may
+not make leaves its requirement `unverified` with code `not_permitted`; only an organization
+owner may list GitHub App installations. Add `--project-id PROJECT` to take the repository's
+provider from the project's repository instead of the `origin` remote: an unavailable
+repository reads `reconnect_required` with code `repository_unavailable`, or `unverified`
+with code `provider_unavailable` while the deployment's GitLab admission is closed, and names
+`um project repository show`. Without `--readiness` nothing is contacted.
+
+```sh
+# List the credentials a workflow tree needs without running it.
+um runner doctor --workflow workflow.yaml --source-root .
+
+# Also check the organization's connections for the providers it needs.
+um runner doctor --workflow workflow.yaml --source-root . \
+  --readiness --organization-id acme
+
+# Take the repository's provider from a project instead of the origin remote.
+um runner doctor --workflow workflow.yaml --source-root . \
+  --readiness --organization-id acme --project-id PROJECT
+```
+
 A selected harness check identifies its execution profile and compatibility policy in
 both report formats, including when the harness is missing or incompatible. Human
 reports label an available observed version separately from a supported range or exact
@@ -2157,8 +2195,8 @@ configuration it cannot load, and `config_required` without `--config`. It takes
 never reads the runner credential, contacts nothing, and reports no login material.
 
 Checks are registered statically by components compiled into this executable. The
-command does not load plugins, read human credentials, contact Useful Machinery, or change
-runner configuration. It executes `git --version` with a five-second deadline, bounds
+command does not load plugins or change runner configuration, and it reads human
+credentials and contacts Useful Machinery only for `--readiness`. It executes `git --version` with a five-second deadline, bounds
 captured standard output, drains standard error without reporting it, and exposes only
 a normalized numeric version in its report.
 

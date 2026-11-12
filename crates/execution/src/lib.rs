@@ -82,6 +82,7 @@ pub use workflow::diagnostic::{CapturedDiagnosticStream, StepDiagnostic};
 pub use workflow::document::BindingKind;
 pub use workflow::document::FailurePolicy;
 pub use workflow::document::FinalizationTrigger;
+pub use workflow::document::RootBlocks;
 pub use workflow::evidence::{BlockedDetail, Prerequisite};
 pub use workflow::evidence::{
     FailureDetail, InheritedDetail, InheritedPriorState, NodeDetail, PrimaryIssue,

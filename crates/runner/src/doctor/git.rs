@@ -8,8 +8,9 @@ use super::{CheckDescriptor, DoctorCheck, Outcome, Status};
 use um_execution::{CommandProbeError, CommandRequest, CommandRunner, SystemCommandRunner};
 
 const MINIMUM_VERSION: GitVersion = GitVersion(2, 29, 0);
-const SYSTEM_TIMEOUT: Duration = Duration::from_secs(5);
-const MAXIMUM_STDOUT_BYTES: usize = 8 * 1024;
+/// The bounds of every Git probe the doctor starts.
+pub(super) const SYSTEM_TIMEOUT: Duration = Duration::from_secs(5);
+pub(super) const MAXIMUM_STDOUT_BYTES: usize = 8 * 1024;
 
 pub(super) struct GitCheck {
     runner: Arc<dyn CommandRunner>,
@@ -82,6 +83,49 @@ impl DoctorCheck for GitCheck {
             ),
         }
     }
+}
+
+/// The host of the `origin` remote of the repository holding `directory`, read with
+/// `git remote get-url origin` under the Git check's bounds (INV-HARNESS-17). The address
+/// can embed a credential, so it is dropped here once the host is read. A failed, missing,
+/// timed-out or truncated probe, or an address with no host, has no host to report and is
+/// `None`: every such repository is one unknown to the caller.
+pub(super) fn origin_remote_host(runner: &dyn CommandRunner, directory: &Path) -> Option<String> {
+    let output = runner
+        .run(CommandRequest {
+            program: Path::new("git"),
+            args: &["remote", "get-url", "origin"],
+            timeout: SYSTEM_TIMEOUT,
+            maximum_stdout_bytes: MAXIMUM_STDOUT_BYTES,
+            clear_environment: false,
+            environment: &[],
+            current_directory: Some(directory),
+        })
+        .ok()?;
+    if !output.success || output.truncated {
+        return None;
+    }
+    let address = std::str::from_utf8(&output.stdout).ok()?.trim();
+    remote_host(address).map(str::to_owned)
+}
+
+/// The host of a Git remote address: `scheme://[userinfo@]host[:port]/path` or the scp form
+/// `[user@]host:path`. A local path has none.
+fn remote_host(address: &str) -> Option<&str> {
+    let host = if let Some((_, rest)) = address.split_once("://") {
+        let authority = rest.split('/').next().unwrap_or_default();
+        let host_and_port = authority
+            .rsplit_once('@')
+            .map_or(authority, |(_, host)| host);
+        host_and_port.split(':').next().unwrap_or_default()
+    } else {
+        let (prefix, _) = address.split_once(':')?;
+        if prefix.contains('/') {
+            return None;
+        }
+        prefix.rsplit_once('@').map_or(prefix, |(_, host)| host)
+    };
+    (!host.is_empty()).then_some(host)
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]

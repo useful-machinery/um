@@ -74,6 +74,8 @@ mod run_command;
 mod runner_administration;
 #[path = "cli/runner_agent_login.rs"]
 mod runner_agent_login;
+#[path = "cli/runner_doctor_workflow.rs"]
+mod runner_doctor_workflow;
 #[path = "cli/runner_enrollment.rs"]
 mod runner_enrollment;
 #[path = "cli/runner_status.rs"]

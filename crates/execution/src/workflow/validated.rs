@@ -97,6 +97,12 @@ impl ValidatedWorkflow {
             .or_else(|| self.finalizers.get(id).map(|finalizer| &finalizer.body))
     }
 
+    /// The workflow's root `environmentPassthrough` names (REQ-WFFORMAT-102); a node's own
+    /// list can only narrow it.
+    pub fn environment_passthrough(&self) -> &BTreeSet<String> {
+        &self.environment_passthrough
+    }
+
     /// Whether a run may omit the declared input, because it is optional or defaulted.
     pub(crate) fn input_may_be_omitted(&self, name: &str) -> bool {
         self.optional_inputs.contains(name) || self.input_defaults.contains_key(name)
@@ -317,6 +323,13 @@ pub struct ValidatedAgent {
     pub(crate) system_prompt: String,
     pub(crate) message: ValidatedAgentMessage,
     pub harness: ValidatedHarness,
+}
+
+impl ValidatedAgent {
+    /// The name of the agent profile the node selects.
+    pub fn profile_name(&self) -> &str {
+        &self.profile
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

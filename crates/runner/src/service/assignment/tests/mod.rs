@@ -1829,9 +1829,11 @@ fn guarded_step_processes_do_not_outlive_a_panicking_test() {
                 sleeper.sleep(Duration::from_millis(10)).await;
             }
         }));
-    if quiesced.is_err() {
+    if let Err(expired) = quiesced {
         let _ = kill_process_group(leader, Signal::KILL);
-        panic!("guarded processes outlived the panicking test: {leader:?} {descendant:?}");
+        panic!(
+            "guarded processes outlived the panicking test: {leader:?} {descendant:?}: {expired}"
+        );
     }
 }
 
@@ -1896,8 +1898,8 @@ async fn execute_fixture_to_terminal(
     .await
     {
         Ok((reports, ())) => reports,
-        Err(_) => panic!(
-            "assignment command fixture did not finish; pending: {:#?}",
+        Err(expired) => panic!(
+            "assignment command fixture did not finish: {expired}; pending: {:#?}",
             manager.pending_observations(&BTreeSet::new(), 100)
         ),
     }
@@ -3415,7 +3417,7 @@ async fn cancellation_before_start_waits_for_preparation_containment_and_replays
         manager.slot.is_none() && manager.reporting.is_some()
     }))
     .await;
-    if contained.is_err() {
+    if let Err(expired) = contained {
         let slot = match &manager.slot {
             Some(LocalSlot::Preparing(_)) => "preparing",
             Some(LocalSlot::Accepted(_)) => "accepted",
@@ -3425,7 +3427,7 @@ async fn cancellation_before_start_waits_for_preparation_containment_and_replays
             None => "idle",
         };
         panic!(
-            "cancelled preparation did not prove containment: slot={slot}, reporting={}, cleanup_failed={}, cancellations={:?}",
+            "cancelled preparation did not prove containment: slot={slot}, reporting={}, cleanup_failed={}, cancellations={:?}: {expired}",
             manager.reporting.is_some(),
             manager.cleanup_failed,
             manager.cancellations
