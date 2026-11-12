@@ -4018,9 +4018,9 @@ fn execution_outcome(run: &WorkflowRunResult, outcome: WorkflowOutcomeV1) -> Exe
     }
     match (outcome, &run.outcome) {
         // An attempt an interruption ended exits by its reason, whether it failed on the
-        // interrupted step or waits on the repair an interrupted stage routed to
-        // (REQ-WFEXEC-40, REQ-WFEXEC-69, REQ-WFEXEC-70); a required failure recorded first
-        // is the primary issue and exits 1.
+        // interrupted step, waits on the repair an interrupted stage routed to or keeps the
+        // wait it continued from (REQ-WFEXEC-40, REQ-WFEXEC-69, REQ-WFEXEC-70,
+        // REQ-WFEXEC-72); a required failure recorded first is the primary issue and exits 1.
         (WorkflowOutcomeV1::Failed, run_outcome) => run_outcome
             .interruption()
             .map_or(ExecutionOutcome::Failed, |interruption| {
@@ -4028,9 +4028,9 @@ fn execution_outcome(run: &WorkflowRunResult, outcome: WorkflowOutcomeV1) -> Exe
             }),
         (WorkflowOutcomeV1::Waiting, RunOutcome::Waiting { wait }) => wait
             .interrupted()
-            .map_or(ExecutionOutcome::Succeeded, |interruption| {
-                signal_outcome(interruption.reason)
-            }),
+            .map(|interruption| interruption.reason)
+            .or_else(|| wait.kept())
+            .map_or(ExecutionOutcome::Succeeded, signal_outcome),
         // Any other wait or a continuing edge exits 0 like a success (REQ-WFEXEC-40); the
         // chained attempt's result decides the command's exit (REQ-WFEXEC-64), unless the
         // interruption held it back (`hold_back_continuation`).

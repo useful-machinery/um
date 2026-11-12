@@ -2768,8 +2768,11 @@ fn make_interrupted(run: &mut WorkflowRunResult, reason: CancellationReason) {
 }
 
 /// A `repair` wait at `build`, entered for a child the interruption `interrupted` failed when
-/// it carries one (REQ-WFEXEC-70).
-fn repair_wait(interrupted: Option<CancellationReason>) -> RunOutcome {
+/// it carries one (REQ-WFEXEC-70), or kept by the interruption `kept` (REQ-WFEXEC-72).
+fn repair_wait(
+    interrupted: Option<CancellationReason>,
+    kept: Option<CancellationReason>,
+) -> RunOutcome {
     RunOutcome::Waiting {
         wait: super::super::runtime::EnteredWait {
             step: "build".to_owned(),
@@ -2782,14 +2785,16 @@ fn repair_wait(interrupted: Option<CancellationReason>) -> RunOutcome {
                 reason,
                 step: "work".to_owned(),
             }),
+            kept,
         },
     }
 }
 
-// REQ-WFEXEC-40, REQ-WFEXEC-69, REQ-WFEXEC-70, SC-WFEXEC-4: an attempt an interruption ended
-// exits by its reason, 130 for `user_request` and 143 for `termination_request`, whether it
-// failed on the interrupted step or waits on the repair an interrupted stage routed to; a
-// required failure recorded before the interruption keeps exit 1, and any other wait exits 0.
+// REQ-WFEXEC-40, REQ-WFEXEC-69, REQ-WFEXEC-70, REQ-WFEXEC-72, SC-WFEXEC-4: an attempt an
+// interruption ended exits by its reason, 130 for `user_request` and 143 for
+// `termination_request`, whether it failed on the interrupted step, waits on the repair an
+// interrupted stage routed to or keeps the wait it continued from; a required failure recorded
+// before the interruption keeps exit 1, and any other wait exits 0.
 #[test]
 fn an_interrupted_attempt_exits_by_the_interruptions_reason() {
     let fixture = PublicationFixture::new();
@@ -2811,9 +2816,15 @@ fn an_interrupted_attempt_exits_by_the_interruptions_reason() {
             expected
         );
         let mut waiting = base.clone();
-        waiting.outcome = repair_wait(Some(reason));
+        waiting.outcome = repair_wait(Some(reason), None);
         assert_eq!(
             execution_outcome(&waiting, WorkflowOutcomeV1::Waiting),
+            expected
+        );
+        let mut kept = base.clone();
+        kept.outcome = repair_wait(None, Some(reason));
+        assert_eq!(
+            execution_outcome(&kept, WorkflowOutcomeV1::Waiting),
             expected
         );
     }
@@ -2831,7 +2842,7 @@ fn an_interrupted_attempt_exits_by_the_interruptions_reason() {
         ExecutionOutcome::Failed
     );
     let mut waiting = base.clone();
-    waiting.outcome = repair_wait(None);
+    waiting.outcome = repair_wait(None, None);
     assert_eq!(
         execution_outcome(&waiting, WorkflowOutcomeV1::Waiting),
         ExecutionOutcome::Succeeded

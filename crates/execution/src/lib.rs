@@ -101,10 +101,11 @@ pub use workflow::local_run::{
     PublicationFailurePhaseV1, ResolvedBy, RetryIneligibilityReason, RunListing,
     SUPERSEDED_OUTCOME, SuccessorCarry, TreeCopyMismatch, WITHDRAWN_OUTCOME, WaitChild,
     WaitInspection, WaitProbe, acquire_local_continuation, acquire_local_retry, attempt_controls,
-    await_run_lock_gate, bind_cloud_continuation_context, child_runs, inspect_wait, is_run_id,
-    latest_attempt_failed, latest_child_run, list_runs, load_cloud_continuation_seed, locate_run,
-    lock_holder, positioned_element, read_local_run_status, retain_cloud_continuation_evidence,
-    retain_cloud_workflow_evidence, wait_child,
+    await_child_start_gate, await_run_lock_gate, bind_cloud_continuation_context, child_runs,
+    inspect_wait, is_run_id, latest_attempt_failed, latest_child_run, list_runs,
+    load_cloud_continuation_seed, locate_run, lock_holder, positioned_element,
+    read_local_run_status, retain_cloud_continuation_evidence, retain_cloud_workflow_evidence,
+    wait_child,
 };
 pub use workflow::observation::{
     ExecutionObservation, ExecutionObserver, ExecutionSettlement, ObservedExecutions,

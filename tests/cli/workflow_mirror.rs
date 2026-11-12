@@ -15,7 +15,7 @@ use super::workflow_continue::{
 };
 use super::workflow_definition::{Home, Tree, read_json};
 use super::workflow_run::{TreeBundle, isolated_command, run_record};
-use super::workflow_run_control::{LiveRun, refused};
+use super::workflow_run_control::{LiveRun, refused, signalled_at_child_start_gate};
 use super::workflow_run_create::Published;
 
 /// The login name the mirrored runs are created by, which `{{operator}}` renders.
@@ -498,11 +498,18 @@ impl MirroredWaitTree {
         args: &[&str],
         adjust: impl FnOnce(&mut Command) -> &mut Command,
     ) -> Output {
+        let mut command = self.command(stub, args);
+        adjust(&mut command).output().unwrap()
+    }
+
+    /// The command `run` runs, to spawn.
+    fn command(&self, stub: &LinearStub, args: &[&str]) -> Command {
         let mut full = vec!["workflow".to_owned(), "run".to_owned()];
         full.extend(args.iter().map(|arg| (*arg).to_owned()));
         let mut command = isolated_command(&full);
         command.env("UM_HOME", self.home.path());
-        adjust(stub.point(&mut command)).output().unwrap()
+        stub.point(&mut command);
+        command
     }
 
     /// A run for `ticket` whose `design` stage holds its step: the live process.
@@ -738,6 +745,46 @@ fn an_interrupted_run_mirrors_its_wait_and_a_cancelled_one_its_outcome() {
         write["action"],
         json!({"kind": "state", "state": "Canceled", "binding": "canceled"})
     );
+}
+
+// SC-CONTINUE-12, REQ-LOCALRUN-191, REQ-WFEXEC-72: a `retry` of a mirrored run's repair
+// wait that SIGINT stops before its stage's child is prepared keeps that wait and writes no
+// `onWait`, since the wait's was written when it was entered; nothing else is written either.
+#[test]
+fn a_kept_wait_writes_no_mirror_record() {
+    let tree = MirroredWaitTree::publish(MIRRORED_WAIT_HEADER);
+    let stub = LinearStub::start();
+    let output = tree
+        .held(&stub, "AUTO-1")
+        .signal(rustix::process::Signal::INT);
+    assert_eq!(output.status.code(), Some(130), "{output:?}");
+    let terminal: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let run = PathBuf::from(terminal["runDirectory"].as_str().unwrap());
+    let written = mirror_names(&run);
+    assert_eq!(
+        written
+            .iter()
+            .filter(|name| name.ends_with("-wait.json"))
+            .count(),
+        1,
+        "{written:?}"
+    );
+
+    stub.clear();
+    let output = signalled_at_child_start_gate(
+        tree.command(&stub, &["retry", run.to_str().unwrap(), "--json"]),
+        &tree.bundle.result("child-start-gate"),
+        rustix::process::Signal::INT,
+        || {},
+    );
+    assert_eq!(output.status.code(), Some(130), "{output:?}");
+    assert_eq!(run_record(&run)["state"], "waiting");
+    assert_eq!(
+        read_json(&run.join("attempts/000002/wait.json"))["kind"],
+        "repair"
+    );
+    assert_eq!(mirror_names(&run), written);
+    assert!(comments(&stub).is_empty(), "{:?}", comments(&stub));
 }
 
 /// `command` without `LINEAR_API_KEY`.

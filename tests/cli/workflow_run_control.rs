@@ -3077,27 +3077,8 @@ fn a_signal_before_a_successor_exists_leaves_the_predecessor_waiting() {
         let before = records(&predecessor);
 
         let gate = published.bundle.result("successor-lock-gate");
-        fs::create_dir_all(gate.parent().unwrap()).unwrap();
-        let mut command = LiveRun {
-            process: control_command(home, leaf, &id, args)
-                .env("UM_TEST_RUN_LOCK_GATE", &gate)
-                .stdin(Stdio::null())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .unwrap(),
-            release: gate.clone(),
-        };
-        poll_until(
-            "the command's inspection",
-            || gate.with_extension("inspected").exists(),
-            |inspected| *inspected,
-        );
-        kill_process(command.pid(), signal).unwrap();
-        // The process is idle at the gate; give its observer time to take the signal.
-        um_support::sleep(std::time::Duration::from_millis(500));
-        fs::write(&gate, "").unwrap();
-        let output = command.output();
+        let output =
+            signalled_at_lock_gate(control_command(home, leaf, &id, args), &gate, signal, || {});
 
         assert_eq!(output.status.code(), Some(status), "{leaf}: {output:?}");
         assert_eq!(run_directories(predecessor.parent().unwrap()), 1);
@@ -3110,6 +3091,256 @@ fn a_signal_before_a_successor_exists_leaves_the_predecessor_waiting() {
         assert!(moved.status.success(), "{leaf}: {moved:?}");
         assert_eq!(run_record(&predecessor)["outcome"], "superseded");
     }
+}
+
+/// Spawns `command` held at the run lock gate `gate` (`UM_TEST_RUN_LOCK_GATE`); once it has
+/// inspected the run, calls `at_gate`, sends it `signal`, opens the gate and returns its
+/// output.
+fn signalled_at_lock_gate(
+    command: std::process::Command,
+    gate: &Path,
+    signal: Signal,
+    at_gate: impl FnOnce(),
+) -> Output {
+    signalled_at_gate(
+        command,
+        ("UM_TEST_RUN_LOCK_GATE", "inspected"),
+        gate,
+        signal,
+        at_gate,
+    )
+}
+
+/// Spawns `command` held at the child start gate `gate` (`UM_TEST_CHILD_START_GATE`); once
+/// its attempt is about to prepare a stage's child, calls `at_gate`, sends it `signal`, opens
+/// the gate and returns its output.
+pub(super) fn signalled_at_child_start_gate(
+    command: std::process::Command,
+    gate: &Path,
+    signal: Signal,
+    at_gate: impl FnOnce(),
+) -> Output {
+    signalled_at_gate(
+        command,
+        ("UM_TEST_CHILD_START_GATE", "starting"),
+        gate,
+        signal,
+        at_gate,
+    )
+}
+
+/// Spawns `command` with the test seam `variable` set to `gate`; once the seam has written
+/// its `marker` beside the gate, calls `at_gate`, sends `signal`, gives the command's signal
+/// observer time to take it, opens the gate and returns the command's output.
+fn signalled_at_gate(
+    mut command: std::process::Command,
+    (variable, marker): (&str, &str),
+    gate: &Path,
+    signal: Signal,
+    at_gate: impl FnOnce(),
+) -> Output {
+    fs::create_dir_all(gate.parent().unwrap()).unwrap();
+    let mut command = LiveRun {
+        process: command
+            .env(variable, gate)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+        release: gate.to_owned(),
+    };
+    poll_until(
+        "the command's held seam",
+        || gate.with_extension(marker).exists() || command.process.try_wait().unwrap().is_some(),
+        |held| *held,
+    );
+    assert!(
+        gate.with_extension(marker).exists(),
+        "the command ended before its seam: {:?}",
+        command.output()
+    );
+    at_gate();
+    kill_process(command.pid(), signal).unwrap();
+    // The process is idle at the gate; give its observer time to take the signal.
+    um_support::sleep(std::time::Duration::from_millis(500));
+    fs::write(gate, "").unwrap();
+    command.output()
+}
+
+// REQ-LOCALRUN-135: SIGINT or SIGTERM a `retry` holds before its attempt begins starts no
+// attempt and ends the command with 130 or 143. A retry of a run waiting for a repair keeps
+// the `control.retry` it recorded and leaves the run, its wait and its stage's child as they
+// were, so `resume` continues the same child; a retry from the start of a run that ended
+// `failed` leaves it `exited` `failed` for a later retry. The command is held between its
+// inspection and the run's lock.
+#[test]
+fn a_signal_before_a_continuation_begins_starts_no_attempt() {
+    let bundle = interrupt_tree();
+    let root = bundle.execution_root();
+    let (run, mut live) = held_stage(&bundle, "repair");
+    assert_eq!(live.signal(Signal::INT).status.code(), Some(130));
+    assert_eq!(run_record(&run)["state"], "waiting");
+    let child = run.join("children/build/000001");
+    let child_id = run_record(&child)["id"].clone();
+    fs::remove_file(root.join("hold-work")).unwrap();
+
+    let mut before = None;
+    let output = signalled_at_lock_gate(
+        control_command(None, "retry", &run, &[]),
+        &bundle.result("retry-lock-gate"),
+        Signal::INT,
+        || before = Some((records(&run), fs::read(run.join("wait.json")).unwrap())),
+    );
+    assert_eq!(output.status.code(), Some(130), "{output:?}");
+    assert_eq!(attempt_count(&run), 1);
+    assert_eq!(
+        (records(&run), fs::read(run.join("wait.json")).unwrap()),
+        before.unwrap()
+    );
+    assert_eq!(run_record(&run)["state"], "waiting");
+    assert_eq!(control_count(&run), 1);
+    assert_eq!(attempt_count(&child), 1);
+    assert_eq!(build_counts(root), [1, 1]);
+
+    // The recorded retry still resolves the wait: `resume` continues the same child.
+    let terminal = last_document(&run_control(None, "resume", &run, &[]));
+    assert_eq!(terminal["outcome"], "succeeded", "{terminal}");
+    assert_eq!(run_record(&run)["outcome"], "landed");
+    assert_eq!(ordinals_of(&run.join("children/build")), ["000001"]);
+    assert_eq!(run_record(&child)["id"], child_id);
+    assert_eq!(attempt_count(&child), 2);
+    assert_eq!(build_counts(root), [1, 2]);
+
+    let flat = TreeBundle::new(
+        "schemaVersion: 1\nsteps:\n  fail:\n    kind: cmd\n    command:\n      argv: [\"false\"]\n",
+    );
+    let destination = flat.result("failed");
+    let created = isolated_command(&flat.args(&destination)).output().unwrap();
+    assert_eq!(created.status.code(), Some(1), "{created:?}");
+    let run = fs::canonicalize(&destination).unwrap();
+    let before = records(&run);
+    let retry = ["--execution-root", flat.execution_root().to_str().unwrap()];
+    let output = signalled_at_lock_gate(
+        control_command(None, "retry", &run, &retry),
+        &flat.result("retry-lock-gate"),
+        Signal::TERM,
+        || {},
+    );
+    assert_eq!(output.status.code(), Some(143), "{output:?}");
+    assert_eq!(attempt_count(&run), 1);
+    assert_eq!(records(&run), before);
+    let record = run_record(&run);
+    assert_eq!(record["state"], "exited", "{record}");
+    assert_eq!(record["outcome"], "failed", "{record}");
+
+    let output = run_control(None, "retry", &run, &retry);
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert_eq!(attempt_count(&run), 2);
+}
+
+// SC-CONTINUE-12, REQ-WFEXEC-72, REQ-WFEXEC-40, REQ-LOCALRUN-178, REQ-CONTINUE-81: SIGINT or
+// SIGTERM to a `retry` whose attempt has begun but has not yet prepared its stage's child keeps
+// the repair wait it continued from: the command exits 130 or 143, the run still waits on the
+// same record, written again as attempt 2's copy, `build` is `not_run` `not_reached`, and the
+// child gets no attempt. The recorded `control.retry` still resolves the wait, so a second
+// `retry` is refused and `resume` continues the same child to the run's outcome. The command
+// is held before its child dispatcher prepares the child.
+#[test]
+fn an_interrupted_retry_keeps_the_wait_it_continued_from() {
+    for (signal, status, reason) in [
+        (Signal::INT, 130, "user_request"),
+        (Signal::TERM, 143, "termination_request"),
+    ] {
+        let bundle = interrupt_tree();
+        let root = bundle.execution_root();
+        let (run, mut live) = held_stage(&bundle, reason);
+        assert_eq!(live.signal(signal).status.code(), Some(status));
+        let kept = read_json(&run.join("wait.json"));
+        assert_eq!(kept["kind"], "repair", "{kept}");
+        let child = run.join("children/build/000001");
+        let child_id = run_record(&child)["id"].clone();
+        fs::remove_file(root.join("hold-work")).unwrap();
+
+        let output = signalled_at_child_start_gate(
+            control_command(None, "retry", &run, &[]),
+            &bundle.result(&format!("{reason}-child-start-gate")),
+            signal,
+            || {},
+        );
+        assert_eq!(output.status.code(), Some(status), "{reason}: {output:?}");
+        let terminal = json(&output);
+        assert!(workflow_run_schema().is_valid(&terminal), "{terminal}");
+        assert_eq!(terminal["outcome"], "waiting", "{terminal}");
+        assert_eq!(terminal["exitStatus"], status, "{terminal}");
+        assert_eq!(run_record(&run)["state"], "waiting");
+        assert_eq!(attempt_count(&run), 2);
+        assert_eq!(read_json(&run.join("wait.json")), kept);
+        assert_eq!(read_json(&run.join("attempts/000002/wait.json")), kept);
+        let second = attempt_result(&run, 2);
+        let build = result_step(&second, "build");
+        assert_eq!(build["state"], "not_run", "{second}");
+        assert_eq!(build["detail"]["code"], "not_reached", "{second}");
+        assert!(second["cancellation"].is_null(), "{second}");
+        assert_eq!(attempt_count(&child), 1);
+        assert_eq!(build_counts(root), [1, 1]);
+        assert_eq!(control_count(&run), 1);
+
+        // The recorded retry still resolves the kept wait.
+        refused(
+            &run_control(None, "retry", &run, &[]),
+            "retry",
+            "wait_resolved",
+        );
+        let terminal = last_document(&run_control(None, "resume", &run, &[]));
+        assert_eq!(terminal["outcome"], "succeeded", "{terminal}");
+        assert_eq!(run_record(&run)["outcome"], "landed");
+        assert_eq!(ordinals_of(&run.join("children/build")), ["000001"]);
+        assert_eq!(run_record(&child)["id"], child_id);
+        assert_eq!(attempt_count(&child), 2);
+        let continued = attempt_result(&child, 2);
+        assert_eq!(continued["continuation"]["reason"], "retry", "{continued}");
+        assert_eq!(
+            step_states(&continued),
+            states(&[("prepare", "inherited"), ("work", "succeeded")])
+        );
+        assert_eq!(build_counts(root), [1, 2]);
+    }
+}
+
+// REQ-WFEXEC-70, REQ-WFEXEC-72, REQ-WFEXEC-40: an attempt that continues from no wait keeps
+// none. SIGINT to a `create` whose first attempt has not yet prepared its stage's child creates
+// no child and gives it no attempt: `build` fails at `start` with `interrupted`, the run ends
+// `failed` with no wait and the command exits 130. The command is held before its child
+// dispatcher prepares the child.
+#[test]
+fn an_interrupted_first_attempt_creates_no_child_and_fails_its_stage() {
+    let bundle = interrupt_tree();
+    let destination = bundle.result("unprepared");
+    let output = signalled_at_child_start_gate(
+        isolated_command(&bundle.args(&destination)),
+        &bundle.result("unprepared-child-start-gate"),
+        Signal::INT,
+        || {},
+    );
+    assert_eq!(output.status.code(), Some(130), "{output:?}");
+    let run = fs::canonicalize(&destination).unwrap();
+    let record = run_record(&run);
+    assert_eq!(record["state"], "exited", "{record}");
+    assert_eq!(record["outcome"], "failed", "{record}");
+    assert!(!run.join("wait.json").exists());
+    assert_eq!(attempt_count(&run), 1);
+    let first = attempt_result(&run, 1);
+    let build = result_step(&first, "build");
+    assert_eq!(build["state"], "failed", "{first}");
+    assert_eq!(build["detail"]["phase"], "start", "{first}");
+    assert_eq!(build["detail"]["code"], "interrupted", "{first}");
+    assert_eq!(first["cancellation"]["reason"], "user_request", "{first}");
+    assert!(
+        !run.join("children/build").exists(),
+        "the interrupted stage's child was created"
+    );
+    assert_eq!(build_counts(bundle.execution_root()), [0, 0]);
 }
 
 // REQ-LOCALRUN-186, REQ-LOCALRUN-135: `cancel` on a live staged run records the cancel its

@@ -421,6 +421,9 @@ pub struct EnteredWait {
     /// The interruption that failed the child whose `repair` edge this wait is
     /// (REQ-WFEXEC-70); `None` for any other wait.
     pub(crate) interrupted: Option<ChildInterruption>,
+    /// The reason of the interruption that ended the attempt on the wait it continued from,
+    /// kept rather than entered (REQ-WFEXEC-72, INV-ENGINE-32); `None` for an entered wait.
+    pub(crate) kept: Option<CancellationReason>,
 }
 
 impl EnteredWait {
@@ -455,6 +458,12 @@ impl EnteredWait {
 
     pub fn interrupted(&self) -> Option<&ChildInterruption> {
         self.interrupted.as_ref()
+    }
+
+    /// The interruption's reason when the attempt kept the wait it continued from instead
+    /// of entering one (REQ-WFEXEC-72): its record is the one the attempt continued from.
+    pub const fn kept(&self) -> Option<CancellationReason> {
+        self.kept
     }
 }
 
@@ -531,6 +540,9 @@ pub struct ExecutionSeed<Output> {
     entry: Option<String>,
     /// The run's limited-edge counts by `<step>.<outcome>` (REQ-WFEXEC-64, INV-ENGINE-22).
     edge_counts: BTreeMap<String, u64>,
+    /// The wait an edge-scheduled continuation continues from, which an interruption before
+    /// any of its steps has started keeps (REQ-WFEXEC-72, INV-ENGINE-32).
+    resumed_wait: Option<EnteredWait>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -548,6 +560,7 @@ impl<Output> ExecutionSeed<Output> {
             steps: BTreeMap::new(),
             entry: None,
             edge_counts: BTreeMap::new(),
+            resumed_wait: None,
         }
     }
 
@@ -564,6 +577,15 @@ impl<Output> ExecutionSeed<Output> {
     #[must_use]
     pub fn with_edge_counts(mut self, counts: BTreeMap<String, u64>) -> Self {
         self.edge_counts = counts;
+        self
+    }
+
+    /// Carries the wait the continuation continues from: an interruption accepted before any
+    /// step of the attempt has started ends it on this wait, kept (REQ-WFEXEC-72,
+    /// INV-ENGINE-32). A dataflow workflow ignores it.
+    #[must_use]
+    pub fn with_resumed_wait(mut self, wait: EnteredWait) -> Self {
+        self.resumed_wait = Some(wait);
         self
     }
 
@@ -611,6 +633,7 @@ impl<Output> ExecutionSeed<Output> {
             steps,
             entry: None,
             edge_counts: BTreeMap::new(),
+            resumed_wait: None,
         })
     }
 }
@@ -1184,6 +1207,10 @@ pub(crate) struct RuntimeState<Cause, Output, Deadline = ()> {
     /// The continuing edge the walk took (REQ-WFEXEC-64); once set no step is authorized and
     /// the attempt ends `continued` (INV-ENGINE-20).
     pub(crate) continued: Option<TakenEdgeRecord>,
+    /// The wait an edge-scheduled continuation continues from (`ExecutionSeed::
+    /// with_resumed_wait`), which an interruption before any step of the attempt has started
+    /// keeps (REQ-WFEXEC-72, INV-ENGINE-32).
+    resumed_wait: Option<EnteredWait>,
 }
 
 impl<Cause, Output, Deadline> RuntimeState<Cause, Output, Deadline> {
@@ -1600,6 +1627,7 @@ where
             exit_outcome: None,
             wait: None,
             continued: None,
+            resumed_wait: seed.resumed_wait,
         },
         events: Vec::new(),
         actions: Vec::new(),
@@ -1975,7 +2003,16 @@ where
                 && !action.is_force_abort()
                 && step_role(&reduction.state, &step) == Some(WorkflowNodeRole::Step)
             {
-                // A `workflow` step whose child had not started fails at `start`
+                // A continuation's entry `workflow` step whose child had not started keeps the
+                // wait the attempt continues from (REQ-WFEXEC-72, INV-ENGINE-32).
+                if reduction.state.unstarted_children.contains(&step)
+                    && entry_step(&reduction.state) == Some(step.as_str())
+                    && let Some(kept) = kept_resumed_wait(&reduction.state)
+                {
+                    settle_unstarted_on_wait(reduction, &step, kept);
+                    return true;
+                }
+                // Any other `workflow` step whose child had not started fails at `start`
                 // (REQ-WFEXEC-70).
                 let detail = if reduction.state.unstarted_children.contains(&step) {
                     FailureDetail::interrupted_before_start()
@@ -2039,30 +2076,89 @@ where
     {
         return false;
     }
-    if let Some(runtime) = reduction.state.steps.get_mut(&step) {
+    let wait = EnteredWait {
+        step: step.clone(),
+        outcome: None,
+        kind: WaitKind::Stop,
+        then: step.clone(),
+        on_hand_back: None,
+        rule: None,
+        interrupted: None,
+        kept: None,
+    };
+    settle_unstarted_on_wait(reduction, &step, wait);
+    true
+}
+
+// A step that never started drops its target invocation and becomes `not_reached` with every
+// other unstarted step, and the attempt ends on `wait`: the `stop` wait entered before it
+// (REQ-WFEXEC-62) or the wait an interruption kept (REQ-WFEXEC-72).
+fn settle_unstarted_on_wait<Provisional, Cause, Output, Deadline>(
+    reduction: &mut Reduction<Provisional, Cause, Output, Deadline>,
+    step: &str,
+    wait: EnteredWait,
+) where
+    Cause: Clone,
+    Output: Clone,
+    Deadline: Clone,
+{
+    if let Some(runtime) = reduction.state.steps.get_mut(step) {
         runtime.target_execution = None;
         runtime.target_invocation = None;
         runtime.active_invocation = None;
     }
     transition_step(
         reduction,
-        &step,
+        step,
         StepState::NotRun {
             detail: NonExecutionDetail::not_reached(),
         },
         None,
     );
-    reduction.state.wait = Some(EnteredWait {
-        step: step.clone(),
-        outcome: None,
-        kind: WaitKind::Stop,
-        then: step,
-        on_hand_back: None,
-        rule: None,
-        interrupted: None,
-    });
+    reduction.state.wait = Some(wait);
     mark_unstarted_not_reached(reduction);
-    true
+}
+
+/// The step an edge-scheduled walk starts at (REQ-WFEXEC-58), a continuation's included
+/// (REQ-CONTINUE-3); `None` for a dataflow workflow.
+fn entry_step<Cause, Output, Deadline>(
+    state: &RuntimeState<Cause, Output, Deadline>,
+) -> Option<&str> {
+    match &state.definition.scheduling {
+        RuntimeScheduling::Edges { entry } => Some(entry),
+        RuntimeScheduling::Dataflow => None,
+    }
+}
+
+/// The wait the attempt continues from, marked kept with the interruption's reason, when an
+/// interruption accepted with no issue recorded stops an edge-scheduled continuation of a
+/// wait before its walk ended (REQ-WFEXEC-72, INV-ENGINE-32); the caller establishes that no
+/// step of the attempt has started.
+fn kept_resumed_wait<Cause, Output, Deadline>(
+    state: &RuntimeState<Cause, Output, Deadline>,
+) -> Option<EnteredWait> {
+    let WorkflowState::Executing {
+        gate:
+            SchedulingGate::Cancelling {
+                reason,
+                prior_issue: None,
+            },
+    } = &state.workflow
+    else {
+        return None;
+    };
+    if !state.interrupted
+        || entry_step(state).is_none()
+        || state.wait.is_some()
+        || state.continued.is_some()
+        || state.exit_outcome.is_some()
+    {
+        return None;
+    }
+    state.resumed_wait.as_ref().map(|wait| EnteredWait {
+        kept: Some(*reason),
+        ..wait.clone()
+    })
 }
 
 fn apply_ordinary_only_cancellation<Provisional, Cause, Output, Deadline>(
@@ -2195,7 +2291,7 @@ where
     let mut keep_pending = false;
     if interruption {
         reduction.state.interrupted = true;
-        fail_first_pending_step_when_idle(reduction);
+        settle_idle_interruption(reduction);
         reduction.state.unstarted_children = active_workflow_steps(&reduction.state)
             .filter(|(_, kind)| *kind == StepStateKind::Starting)
             .map(|(step, _)| step.clone())
@@ -2571,10 +2667,12 @@ fn step_role<Cause, Output, Deadline>(
         .map(|definition| definition.role)
 }
 
-// An interruption that finds no ordinary step active fails the first pending one in
-// document order at `start`, so the attempt still names the step it stopped at; every other
-// pending step is then cancelled (REQ-WFEXEC-69).
-fn fail_first_pending_step_when_idle<Provisional, Cause, Output, Deadline>(
+// An interruption that finds no ordinary step active ends a continuation whose entry is still
+// pending on the wait it continues from, kept, with every unstarted step `not_reached`
+// (REQ-WFEXEC-72). Otherwise it fails the first pending step in document order at `start`, so
+// the attempt still names the step it stopped at; every other pending step is then cancelled
+// (REQ-WFEXEC-69).
+fn settle_idle_interruption<Provisional, Cause, Output, Deadline>(
     reduction: &mut Reduction<Provisional, Cause, Output, Deadline>,
 ) where
     Cause: Clone,
@@ -2588,6 +2686,14 @@ fn fail_first_pending_step_when_idle<Provisional, Cause, Output, Deadline>(
         .iter()
         .any(|(id, runtime)| ordinary(&id) && runtime.state.is_active())
     {
+        return;
+    }
+    let entry_pending = entry_step(state)
+        .and_then(|entry| state.steps.get(entry))
+        .is_some_and(|runtime| matches!(runtime.state, StepState::Pending));
+    if entry_pending && let Some(kept) = kept_resumed_wait(state) {
+        reduction.state.wait = Some(kept);
+        mark_unstarted_not_reached(reduction);
         return;
     }
     let Some(step) = state
@@ -4344,6 +4450,7 @@ fn end_edge_walk<Provisional, Cause, Output, Deadline>(
                     on_hand_back: on_hand_back.clone(),
                     rule: rule.clone(),
                     interrupted: interrupted.clone(),
+                    kept: None,
                 }),
                 TakenEdge::Wait(_) | TakenEdge::Unrouted => WalkEnding::Unrouted(producer.clone()),
             };
@@ -4613,6 +4720,11 @@ where
             &state.exit_outcome,
         ) {
             (Some(_), Some(wait), _, _) => OrdinaryOutcome::Waiting { wait: wait.clone() },
+            // So does the wait an interruption kept before any step of the continuation
+            // started (REQ-WFEXEC-72).
+            (None, Some(wait), _, _) if wait.kept.is_some() => {
+                OrdinaryOutcome::Waiting { wait: wait.clone() }
+            }
             (Some(_), None, Some(edge), _) => OrdinaryOutcome::Continued { edge: edge.clone() },
             (Some(_), None, None, Some(_)) => OrdinaryOutcome::Succeeded,
             _ => OrdinaryOutcome::Cancelled { reason: *reason },

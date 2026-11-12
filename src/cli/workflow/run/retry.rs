@@ -6,7 +6,7 @@ use clap::Args;
 
 use um_execution::{
     CONTROL_RETRY, CancellationSource, LocalRetryBeginError, LocalRetryOpen, WaitInspection,
-    WaitKind, WorkflowRunOutput, acquire_local_retry, admit_local_workflow,
+    WaitKind, WorkflowRunOutput, acquire_local_retry, admit_local_workflow, await_run_lock_gate,
     reconcile_current_result_publication,
 };
 
@@ -99,6 +99,8 @@ impl Command {
             reconcile_current_result_publication(&run_directory).map_err(|error| {
                 anyhow::anyhow!("finalize workflow result publication: {error:?}")
             })?;
+            // A test seam between the inspection and the lock; nothing outside `test-fixtures`.
+            await_run_lock_gate()?;
             acquire_local_retry(&run_directory).map_err(anyhow::Error::new)
         })
         .await
@@ -240,6 +242,16 @@ impl Command {
                 .into());
         }
 
+        // REQ-LOCALRUN-135: an interruption held before the attempt begins starts none, and the
+        // run is released as it was; a signal that carries a recorded `control.cancel` is a
+        // cancellation, which begins the attempt and cancels it.
+        if cancellation.interruption_requested() {
+            drop(pending);
+            signal_task.abort();
+            return Err(super::create::signalled_before_attempt(
+                cancellation.cancellation_reason(),
+            ));
+        }
         let admitted_for_begin = admitted.clone();
         let owned_run =
             match tokio::task::spawn_blocking(move || pending.begin(&admitted_for_begin)).await {

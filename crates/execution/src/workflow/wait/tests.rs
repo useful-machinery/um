@@ -47,6 +47,7 @@ fn entered(kind: WaitKind, step: &str, then: &str, on_hand_back: Option<&str>) -
         on_hand_back: on_hand_back.map(str::to_owned),
         rule: None,
         interrupted: None,
+        kept: None,
     }
 }
 
@@ -340,6 +341,47 @@ fn attempt_controls_resume_the_element_of_a_wait_continuing_at_the_waiting_step(
         .unwrap()
         .controls;
     assert_eq!(controls.resume_item, None);
+}
+
+// REQ-WFEXEC-63, REQ-WFEXEC-68, REQ-WFEXEC-72: an attempt that kept the wait it continued from
+// holds a second copy of that wait, so the attempt the still-resolved wait starts next reads
+// the same control fields and resumes the same fan-out element.
+#[test]
+fn attempt_controls_carry_a_kept_wait_to_the_attempt_it_starts_next() {
+    let wait = WaitRecord::entered(
+        &entered(WaitKind::Answer, "build", "build", None),
+        Some(2),
+        Map::new(),
+        since(),
+        &ResolvedInputs::default(),
+        &BTreeMap::new(),
+    )
+    .unwrap();
+    let run = answered_run(&wait);
+    fs::create_dir_all(run.path().join("attempts/000002")).unwrap();
+    fs::write(
+        run.path().join("attempts/000002/wait.json"),
+        serde_json::to_vec(&wait).unwrap(),
+    )
+    .unwrap();
+    for attempt in [2, 3] {
+        let controls = crate::workflow::local_run::attempt_controls(run.path(), attempt)
+            .unwrap()
+            .controls;
+        assert_eq!(
+            controls.wait,
+            Some((
+                "build".to_owned(),
+                BTreeMap::from([("summary".to_owned(), "ship it".to_owned())])
+            )),
+            "attempt {attempt}"
+        );
+        assert_eq!(
+            controls.resume_item,
+            Some(("build".to_owned(), 2)),
+            "attempt {attempt}"
+        );
+    }
 }
 
 // REQ-WFDEF-5, REQ-WFEXEC-59

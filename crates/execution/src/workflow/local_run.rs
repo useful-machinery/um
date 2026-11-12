@@ -74,7 +74,7 @@ use super::publication::{
 use super::resolution::{ResolvedWorkflow, resolve_retained};
 use super::run_record::{RunState, WorkflowRunRecord};
 use super::runtime::{
-    ActiveStepInvocation, ExecutionSeed, FinalizationSummary, InheritedDisposition,
+    ActiveStepInvocation, EnteredWait, ExecutionSeed, FinalizationSummary, InheritedDisposition,
     InheritedStepSeed, StepState, TargetExecutionNumber, WorkflowState,
 };
 use super::schema_common::{
@@ -1654,11 +1654,23 @@ pub struct PendingLocalContinuation {
     maximum_parallel_steps: usize,
     quiescence: super::publication::ContinuationQuiescenceV1,
     tree: Option<ManifestTreeV1>,
+    /// Whether `begin` keeps the root wait record it removes (`keep_resolved_wait`).
+    keep_resolved_wait: bool,
 }
 
 impl PendingLocalContinuation {
     pub fn run_directory(&self) -> &Path {
         &self.normalized
+    }
+
+    /// Declares that the attempt `begin` starts continues from the run's wait, which a
+    /// control or an external event resolved (REQ-CONTINUE-75, REQ-CONTINUE-80): `begin`
+    /// reads the root wait record before removing it, the returned owner holds it
+    /// (`LocalAttemptOwner::resumed_wait_record`) and the attempt's execution seed carries it,
+    /// so an interruption before any step of the attempt has started keeps that wait
+    /// (REQ-WFEXEC-72, INV-ENGINE-32). `begin` then refuses a run without a root wait record.
+    pub fn keep_resolved_wait(&mut self) {
+        self.keep_resolved_wait = true;
     }
 
     /// `LocalAttemptOwner::update_run_record` under the continuation's run lock.
@@ -2375,6 +2387,16 @@ impl PendingLocalContinuation {
         edge: Option<super::publication::ContinuationEdgeV1>,
     ) -> Result<LocalAttemptOwner, LocalRunDirectoryError> {
         verify_retry_lock_identity(&self.root, &self.lock)?;
+        // The wait the attempt continues from, read before anything changes and before
+        // `remove_root_wait_record` removes it (REQ-WFEXEC-72).
+        let resumed_wait = if self.keep_resolved_wait {
+            Some(
+                read_optional_wait_record(&self.root)?
+                    .ok_or(LocalRunDirectoryError::StateConflict)?,
+            )
+        } else {
+            None
+        };
         if admitted.workflow().source.source_root != self.initial_workflow.source.source_root
             || admitted.execution().limits().maximum_parallel_steps().get()
                 != self.maximum_parallel_steps
@@ -2681,6 +2703,7 @@ impl PendingLocalContinuation {
             attempt_number: next,
             finalizers,
             state: store,
+            resumed_wait,
         })
     }
 }
@@ -2830,6 +2853,9 @@ pub struct LocalAttemptOwner {
     attempt_number: u64,
     finalizers: Arc<[AttemptStepV1]>,
     state: Arc<StateStore>,
+    /// The root wait record `begin` removed for a continuation that keeps it
+    /// (`PendingLocalContinuation::keep_resolved_wait`); `None` otherwise.
+    resumed_wait: Option<WaitRecord>,
 }
 
 pub type InitialLocalRun = LocalAttemptOwner;
@@ -2955,6 +2981,14 @@ impl LocalAttemptOwner {
             RenameFlags::empty(),
         )?;
         sync_directory(&self.state.root)
+    }
+
+    /// The record of the wait this attempt continues from, as `begin` removed it, when the
+    /// continuation kept it (`PendingLocalContinuation::keep_resolved_wait`). An attempt that
+    /// ends on that wait kept (`EnteredWait::kept`, REQ-WFEXEC-72) writes this record back
+    /// unchanged with `record_wait` (REQ-LOCALRUN-178).
+    pub fn resumed_wait_record(&self) -> Option<&WaitRecord> {
+        self.resumed_wait.as_ref()
     }
 
     pub fn run_directory(&self) -> &Path {
@@ -3142,14 +3176,21 @@ impl LocalAttemptOwner {
     ) -> Result<ExecutionSeed<CapturedValue>, LocalRunDirectoryError> {
         let state = Arc::clone(&self.state);
         let attempt_number = self.attempt_number;
+        let resumed_wait = self.resumed_wait.clone();
         tokio::task::spawn_blocking(move || {
-            load_execution_seed(
+            let seed = load_execution_seed(
                 &state.root,
                 &state.current,
                 attempt_number,
                 &admitted,
                 &artifacts,
-            )
+            )?;
+            // A continuation of a resolved wait carries it, so an interruption before any
+            // step has started keeps it (REQ-WFEXEC-72, INV-ENGINE-32).
+            Ok(match resumed_wait {
+                Some(record) => seed.with_resumed_wait(resumed_entered_wait(&record)?),
+                None => seed,
+            })
         })
         .await
         .map_err(|_| LocalRunDirectoryError::StateInvalid)?
@@ -3693,6 +3734,7 @@ fn create_with_observer(
         attempt_number: INITIAL_ATTEMPT_NUMBER,
         finalizers: Arc::from(fresh_finalizer_progress(admitted)?),
         state,
+        resumed_wait: None,
     })
 }
 
@@ -7107,31 +7149,61 @@ pub fn acquire_local_retry(requested: &Path) -> Result<LocalRetryOpen, LocalRunD
 /// (feature `test-fixtures`): when `UM_TEST_RUN_LOCK_GATE` names a path, the command calls
 /// this before the lock, which writes `<path>.inspected` and returns once `<path>` exists,
 /// so a test can act on the run between the inspection and the lock; a gate not opened within
-/// `RUN_LOCK_GATE_TIMEOUT` is a `File` error, never a hung command. Without the feature, or
+/// `TEST_GATE_TIMEOUT` is a `File` error, never a hung command. Without the feature, or
 /// the variable, it returns at once.
 pub fn await_run_lock_gate() -> Result<(), LocalRunDirectoryError> {
     #[cfg(feature = "test-fixtures")]
-    if let Some(gate) = std::env::var_os(RUN_LOCK_GATE).map(PathBuf::from) {
-        let inspected = gate.with_extension("inspected");
-        std::fs::write(&inspected, b"").map_err(|source| LocalRunDirectoryError::File {
-            path: inspected,
-            operation: "write",
-            source,
-        })?;
-        let deadline = um_support::monotonic_now() + RUN_LOCK_GATE_TIMEOUT;
-        while !gate.exists() {
-            if um_support::monotonic_now() >= deadline {
-                return Err(LocalRunDirectoryError::File {
-                    path: gate,
-                    operation: "await",
-                    source: io::Error::new(
-                        io::ErrorKind::TimedOut,
-                        "the run lock gate was not opened in time",
-                    ),
-                });
-            }
-            um_support::sleep(RUN_LOCK_GATE_POLL_INTERVAL);
+    await_test_gate(
+        RUN_LOCK_GATE,
+        "inspected",
+        "the run lock gate was not opened in time",
+    )?;
+    Ok(())
+}
+
+/// A seam for the end-to-end tests of an attempt interrupted before its stage's child is
+/// prepared (feature `test-fixtures`, REQ-WFEXEC-72): when `UM_TEST_CHILD_START_GATE` names a
+/// path, the child dispatcher calls this before it prepares a child, which writes
+/// `<path>.starting` and returns once `<path>` exists, with `await_run_lock_gate`'s timeout.
+/// Without the feature, or the variable, it returns at once.
+pub fn await_child_start_gate() -> Result<(), LocalRunDirectoryError> {
+    #[cfg(feature = "test-fixtures")]
+    await_test_gate(
+        CHILD_START_GATE,
+        "starting",
+        "the child start gate was not opened in time",
+    )?;
+    Ok(())
+}
+
+/// The gate both test seams share: when `variable` names a path, writes the marker beside it
+/// with `extension` and returns once the path exists, or a `File` error after
+/// `TEST_GATE_TIMEOUT`.
+#[cfg(feature = "test-fixtures")]
+fn await_test_gate(
+    variable: &str,
+    extension: &str,
+    timed_out: &'static str,
+) -> Result<(), LocalRunDirectoryError> {
+    let Some(gate) = std::env::var_os(variable).map(PathBuf::from) else {
+        return Ok(());
+    };
+    let marker = gate.with_extension(extension);
+    std::fs::write(&marker, b"").map_err(|source| LocalRunDirectoryError::File {
+        path: marker,
+        operation: "write",
+        source,
+    })?;
+    let deadline = um_support::monotonic_now() + TEST_GATE_TIMEOUT;
+    while !gate.exists() {
+        if um_support::monotonic_now() >= deadline {
+            return Err(LocalRunDirectoryError::File {
+                path: gate,
+                operation: "await",
+                source: io::Error::new(io::ErrorKind::TimedOut, timed_out),
+            });
         }
+        um_support::sleep(TEST_GATE_POLL_INTERVAL);
     }
     Ok(())
 }
@@ -7139,9 +7211,11 @@ pub fn await_run_lock_gate() -> Result<(), LocalRunDirectoryError> {
 #[cfg(feature = "test-fixtures")]
 const RUN_LOCK_GATE: &str = "UM_TEST_RUN_LOCK_GATE";
 #[cfg(feature = "test-fixtures")]
-const RUN_LOCK_GATE_POLL_INTERVAL: Duration = Duration::from_millis(10);
+const CHILD_START_GATE: &str = "UM_TEST_CHILD_START_GATE";
 #[cfg(feature = "test-fixtures")]
-const RUN_LOCK_GATE_TIMEOUT: Duration = Duration::from_secs(30);
+const TEST_GATE_POLL_INTERVAL: Duration = Duration::from_millis(10);
+#[cfg(feature = "test-fixtures")]
+const TEST_GATE_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub fn acquire_local_continuation(
     requested: &Path,
@@ -7250,6 +7324,7 @@ pub fn acquire_local_continuation(
             maximum_parallel_steps,
             quiescence,
             tree,
+            keep_resolved_wait: false,
         },
     )))
 }
@@ -7718,6 +7793,31 @@ fn load_execution_seed(
             _ => seed,
         },
     )
+}
+
+/// The wait `record` names as the engine holds it: its kind, its waiting step, `then`,
+/// `onHandBack` and the `payload.outcome` it was entered on when that is a string. The record
+/// itself, not this, is what a kept wait writes back (REQ-WFEXEC-72).
+fn resumed_entered_wait(record: &WaitRecord) -> Result<EnteredWait, LocalRunDirectoryError> {
+    let step = record
+        .step
+        .first()
+        .and_then(Value::as_str)
+        .ok_or(LocalRunDirectoryError::WaitRecordInvalid)?;
+    Ok(EnteredWait {
+        step: step.to_owned(),
+        outcome: record
+            .payload
+            .get("outcome")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        kind: record.kind,
+        then: record.then.clone(),
+        on_hand_back: record.on_hand_back.clone(),
+        rule: None,
+        interrupted: None,
+        kept: None,
+    })
 }
 
 fn step_output_declaration<'a>(
@@ -9112,6 +9212,7 @@ fn begin_local_retry(
         attempt_number: next_attempt_number,
         finalizers: Arc::from(fresh_finalizer_progress(admitted)?),
         state: pending.state,
+        resumed_wait: None,
     })
 }
 

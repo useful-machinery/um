@@ -5974,6 +5974,27 @@ async fn interrupt_held_child(
     crate::workflow::coordinator::CoordinationResult<StepFailureCause, CapturedValue, TestInstant>,
     HeldChildObservation,
 ) {
+    interrupt_held_child_seeded(
+        fixture,
+        endings,
+        held,
+        running,
+        runtime::ExecutionSeed::empty(),
+    )
+    .await
+}
+
+/// `interrupt_held_child` for an attempt started from `seed`.
+async fn interrupt_held_child_seeded(
+    fixture: &ChildFixture,
+    endings: Vec<ChildRunOutcome>,
+    held: usize,
+    running: Option<&str>,
+    seed: runtime::ExecutionSeed<CapturedValue>,
+) -> (
+    crate::workflow::coordinator::CoordinationResult<StepFailureCause, CapturedValue, TestInstant>,
+    HeldChildObservation,
+) {
     let parent = fixture.admitted.execution().cancellation().source().clone();
     let (events, mut received) = mpsc::unbounded_channel();
     let release = Arc::new(tokio::sync::Notify::new());
@@ -6004,7 +6025,7 @@ async fn interrupt_held_child(
             dispatcher,
             controls: ControlContext::default(),
         },
-        WorkflowExecutionStart::initial(ProcessGuardRegistry::default()),
+        WorkflowExecutionStart::seeded(ProcessGuardRegistry::default(), seed),
     );
     let interrupt = async {
         assert!(matches!(
@@ -6244,6 +6265,51 @@ async fn a_child_ending_without_an_outcome_under_an_interruption_fails_its_step(
             WorkflowState::Failed { .. }
         ));
         assert_eq!(result.state.wait, None);
+    })
+    .await;
+}
+
+// REQ-WFEXEC-72, REQ-WFEXEC-70: a continuation of a wait whose entry `workflow` step the
+// interruption reaches before its child started keeps that wait, with the step `not_run` and
+// no step failed.
+#[tokio::test]
+async fn an_interruption_before_a_continuations_child_starts_keeps_its_wait() {
+    with_watchdog(async {
+        let fixture = interrupted_parent("build", REPAIR_AT_DESIGN);
+        let resumed = runtime::EnteredWait {
+            step: "design".to_owned(),
+            outcome: Some("failed".to_owned()),
+            kind: crate::workflow::document::WaitKind::Repair,
+            then: "design".to_owned(),
+            on_hand_back: None,
+            rule: None,
+            interrupted: None,
+            kept: None,
+        };
+        let seed = runtime::ExecutionSeed::empty()
+            .with_entry("design")
+            .with_resumed_wait(resumed.clone());
+        let (result, observed) = interrupt_held_child_seeded(
+            &fixture,
+            vec![interrupted_exit("failed", "plan")],
+            0,
+            None,
+            seed,
+        )
+        .await;
+
+        assert_eq!(observed.interrupted, Some(true));
+        let kept = runtime::EnteredWait {
+            kept: Some(CancellationReason::UserRequest),
+            ..resumed
+        };
+        assert_eq!(
+            result.state.workflow,
+            WorkflowState::Waiting { wait: kept.clone() }
+        );
+        assert_eq!(result.state.wait, Some(kept));
+        assert!(not_reached_step(&result, "design"));
+        assert!(not_reached_step(&result, "build"));
     })
     .await;
 }

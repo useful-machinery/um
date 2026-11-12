@@ -60,12 +60,12 @@ use um_execution::{
     ChildRunControl, ChildRunDispatcher, ChildRunOutcome, ChildRunParent, ChildRunRequest,
     ChildRuns, ControlEvent, EnteredWait, ExportValue, LocalRetryBeginError, LocalRetryOpen,
     Mirror, RejectionDiagnostic, Scheduling, WaitKind, WaitRecord, acquire_local_retry,
-    adopted_child_outcome, append_control, attempt_controls, position_path, read_controls,
-    read_numbered_controls, stop_in_force, wait_payload,
+    adopted_child_outcome, append_control, attempt_controls, await_child_start_gate, position_path,
+    read_controls, read_numbered_controls, stop_in_force, wait_payload,
 };
 use um_execution::{
     DefinitionError, SubjectClaim, SubjectError, WorkflowHome, check_subject, chosen_outcome,
-    claim_subject, failure_outcome, is_subject, read_definition,
+    failure_outcome, is_subject, read_definition,
 };
 
 pub(super) const ABOUT: &str = "Start a local workflow run";
@@ -528,17 +528,14 @@ impl RunDestination {
         }
     }
 
-    /// Takes the definition's slot for `subject` for the run `run`, holding the index's
-    /// lock until the claim drops; a `--path` run takes no slot (REQ-LOCALRUN-173).
-    fn take_subject_slot(
-        &self,
-        subject: &str,
-        run: &str,
-    ) -> Result<Option<SubjectClaim>, SubjectError> {
+    /// Takes the definition's claim on the slot for `subject`, holding the index's lock until
+    /// the claim drops and writing nothing until the claim names a run; a `--path` run takes
+    /// no claim (REQ-LOCALRUN-173).
+    fn take_subject_slot(&self, subject: &str) -> Result<Option<SubjectClaim>, SubjectError> {
         match self {
             Self::Path(_) => Ok(None),
             Self::Definition { home, id, .. } => {
-                claim_subject(home, id, subject, run, None).map(Some)
+                SubjectClaim::take(home, id, subject, None).map(Some)
             }
         }
     }
@@ -567,13 +564,13 @@ struct RunCreation {
 }
 
 impl RunCreation {
-    /// Creates the run directory, taking the subject's slot under the index's lock, and
-    /// returns the run with its control journal watched in `journals`. A signal
-    /// `cancellation` holds before the slot is taken or the directory is created refuses
-    /// the creation, so no run exists and the slot's claim is released. `journals` watches
-    /// the run directory from before the first of those checks, so a signal that arrives
-    /// after the last one, while the directory is made, is an interruption: the run it
-    /// could not refuse never ends `canceled` (REQ-LOCALRUN-135).
+    /// Creates the run directory, holding the subject's claim under the index's lock and
+    /// writing the slot only after the directory exists, and returns the run with its
+    /// control journal watched in `journals`. A signal `cancellation` holds before the claim
+    /// is taken or the directory is created refuses the creation, so no run exists and no
+    /// slot is written. `journals` watches the run directory from before the first of those
+    /// checks, so a signal that arrives after the last one, while the directory is made, is
+    /// an interruption: the run it could not refuse never ends `canceled` (REQ-LOCALRUN-135).
     fn create(
         self,
         cancellation: &CancellationSource,
@@ -598,20 +595,30 @@ impl RunCreation {
         };
         refuse_when_signalled()?;
         destination.prepare().map_err(CreationFailure::Other)?;
-        // REQ-WFDEF-28: the slot is taken under the index's lock, held until the run
-        // directory exists, so of two creates for one subject one is refused.
+        // REQ-WFDEF-28: the claim is taken under the index's lock, held until the run
+        // directory exists and the slot names it, so of two creates for one subject one is
+        // refused.
         let claim = match (&subject, &record) {
-            (Some(subject), Some(record)) => destination
-                .take_subject_slot(subject, &record.id)
+            (Some(subject), Some(_)) => destination
+                .take_subject_slot(subject)
                 .map_err(CreationFailure::Subject)?,
             _ => None,
         };
-        // A refusal here drops the claim; the slot then names a run with no directory,
-        // which leaves it free (REQ-WFDEF-28).
+        // A refusal here drops the claim before it names a run, so no slot is written
+        // (REQ-LOCALRUN-135, REQ-WFDEF-28).
         refuse_when_signalled()?;
         let owned_run =
             InitialLocalRun::create_with_record(&run_directory, &admitted, record.as_ref())
                 .map_err(|error| CreationFailure::Other(anyhow::Error::new(error)))?;
+        // The slot names the run only now that its directory exists.
+        if let (Some(claim), Some(record)) = (&claim, &record) {
+            claim.name(&record.id).map_err(|error| {
+                CreationFailure::Other(
+                    anyhow::Error::new(error)
+                        .context(format!("name run {} in the subject's slot", record.id)),
+                )
+            })?;
+        }
         drop(claim);
         // REQ-LOCALRUN-185: the stop is recorded before the first step starts.
         if let (Some(step), Some(record)) = (stop_before, &record) {
@@ -644,6 +651,17 @@ pub(super) fn signalled_before_creation(
 ) -> super::super::super::CommandFailure {
     signalled_failure(
         anyhow!("workflow run not created: a signal arrived before its run directory existed"),
+        reason,
+    )
+}
+
+/// The failure of a `resume`, `retry` or `restart` a signal reached before its attempt began:
+/// no attempt began and the run is as it was (REQ-LOCALRUN-135).
+pub(super) fn signalled_before_attempt(
+    reason: Option<CancellationReason>,
+) -> super::super::super::CommandFailure {
+    signalled_failure(
+        anyhow!("workflow run attempt not begun: a signal arrived before the attempt began"),
         reason,
     )
 }
@@ -1590,13 +1608,24 @@ async fn execute_attempt_phases(
     // and writes its wait record before the run record reads `waiting`.
     let wait_record = match &execution.outcome {
         RunOutcome::Waiting { wait } => {
-            let record = entered_wait_record(
-                wait,
-                admitted.inputs(),
-                &execution.steps,
-                attempt.run()?.run_directory(),
-                dispatcher.as_ref().map(|(dispatcher, _)| dispatcher),
-            )?;
+            // REQ-WFEXEC-72: an attempt that kept the wait it continued from writes back the
+            // record `begin` removed, unchanged, and performs no `onWait` (REQ-LOCALRUN-191).
+            let kept = wait.kept().is_some();
+            let record = if kept {
+                attempt
+                    .run()?
+                    .resumed_wait_record()
+                    .cloned()
+                    .ok_or_else(|| anyhow!("the kept wait's record is unavailable"))?
+            } else {
+                entered_wait_record(
+                    wait,
+                    admitted.inputs(),
+                    &execution.steps,
+                    attempt.run()?.run_directory(),
+                    dispatcher.as_ref().map(|(dispatcher, _)| dispatcher),
+                )?
+            };
             let owned_run = attempt
                 .run
                 .take()
@@ -1616,13 +1645,15 @@ async fn execute_attempt_phases(
             };
             attempt.run = Some(owned_run);
             recorded.context("record the local workflow wait")?;
-            // REQ-LOCALRUN-191: `onWait`, once the wait record is written.
-            let waited = record.clone();
-            super::mirror::perform_blocking(
-                attempt.mirror.as_ref(),
-                Box::new(move |mirror, target| mirror.wait(target, &waited)),
-            )
-            .await;
+            // REQ-LOCALRUN-191: `onWait`, once the wait record is written, for a wait entered.
+            if !kept {
+                let waited = record.clone();
+                super::mirror::perform_blocking(
+                    attempt.mirror.as_ref(),
+                    Box::new(move |mirror, target| mirror.wait(target, &waited)),
+                )
+                .await;
+            }
             Some(record)
         }
         _ => None,
@@ -2300,6 +2331,12 @@ async fn run_local_child(
     mut control: ChildRunControl,
 ) -> ChildRunOutcome {
     let cancellation = control.cancellation().clone();
+    // A test seam before the child is prepared; nothing outside `test-fixtures`.
+    if blocking_operation(await_child_start_gate).await.is_err() {
+        return ChildRunOutcome::Rejected {
+            code: "child_preparation_unavailable".to_owned(),
+        };
+    }
     let recovery = parent.take_recovery(&request.step, request.item);
     if let Some(ChildRecovery::Adopt { directory, .. }) = recovery {
         // REQ-CONTINUE-76: a child that exited settles the step from its record and
@@ -2312,6 +2349,13 @@ async fn run_local_child(
         .unwrap_or(ChildRunOutcome::Interrupted);
         parent.record_started(&request, &directory, &mut control);
         return outcome;
+    }
+    // REQ-WFEXEC-70, REQ-WFEXEC-72: a child whose preparation an interruption precedes is not
+    // created and gets no attempt; the driver settles the step as an unstarted child, and the
+    // dropped recovery releases what it held. An exited child is adopted above as before, and a
+    // cancellation prepares the child as before.
+    if cancellation.interruption_requested() {
+        return ChildRunOutcome::Interrupted;
     }
     let preparation_parent = Arc::clone(&parent);
     let preparation_request = request.clone();
@@ -4797,8 +4841,8 @@ mod tests {
     // REQ-LOCALRUN-135, REQ-WFEXEC-40: from the moment `create` begins to make the run
     // directory a signal is an interruption, never a cancel, so a run the creation still
     // makes cannot end `canceled`; one the creation meets before the directory exists
-    // refuses it. The creation is held at the subject index's lock, as a concurrent create
-    // of the subject holds it.
+    // refuses it and writes no subject slot. The creation is held at the subject index's
+    // lock, as a concurrent create of the subject holds it.
     #[tokio::test]
     async fn a_signal_while_the_run_directory_is_created_interrupts() {
         let temporary = tempfile::tempdir().unwrap();
@@ -4835,6 +4879,14 @@ mod tests {
         assert!(cancellation.interruption_requested());
         let failure = refused_creation(created, &home, &run_directory);
         assert_eq!(failure.exit_code(), ExitCode::Interrupted);
+        assert!(
+            !home
+                .definition_directory(SUBJECT_DEFINITION)
+                .join("subjects")
+                .join(SUBJECT)
+                .exists(),
+            "the refused creation wrote the subject slot"
+        );
         assert!(observer.journals.watched().is_empty());
         drop(sender);
         observer.task.await.unwrap();

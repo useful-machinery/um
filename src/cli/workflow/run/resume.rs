@@ -9,9 +9,10 @@ use um_execution::{
     ResolvedBy, ResolvedInputs, ResolvedWorkflow, RunState, UntestedHarnessAdvisory, ValidatedTree,
     WITHDRAWN_OUTCOME, WaitInspection, WaitProbe, WaitRecord, WorkflowRunOutput,
     WorkflowRunPresentationResult, acquire_local_continuation, admit_local_continuation_workflow,
-    inspect_wait, latest_child_run, normalize_terminal_path, normalize_terminal_scalar,
-    positioned_element, read_local_run_status, reconcile_current_result_publication,
-    resolve_workflow_file_with_agent_profiles, superseded_rejection_message,
+    await_run_lock_gate, inspect_wait, latest_child_run, normalize_terminal_path,
+    normalize_terminal_scalar, positioned_element, read_local_run_status,
+    reconcile_current_result_publication, resolve_workflow_file_with_agent_profiles,
+    superseded_rejection_message,
 };
 
 use super::create::{ChildRecovery, ExecutionLeaf};
@@ -249,6 +250,8 @@ pub(super) async fn continue_run(
     let opened = tokio::task::spawn_blocking(move || {
         reconcile_current_result_publication(&run_directory)
             .map_err(|error| anyhow::anyhow!("finalize workflow result publication: {error:?}"))?;
+        // A test seam between the probe and the lock; nothing outside `test-fixtures`.
+        await_run_lock_gate()?;
         acquire_local_continuation(&run_directory).map_err(anyhow::Error::new)
     })
     .await
@@ -568,7 +571,24 @@ pub(super) async fn continue_run(
     } else {
         ContinuationDefinitionMode::Inherited
     };
+    // REQ-LOCALRUN-135: an interruption held before the attempt begins starts none; the run,
+    // its wait and a control the command recorded stay as they are. A signal that carries a
+    // recorded `control.cancel` is a cancellation, which begins the attempt and cancels it.
+    if cancellation.interruption_requested() {
+        drop(child_recovery);
+        settle(pending, &signal_task).await?;
+        return Err(super::create::signalled_before_attempt(
+            cancellation.cancellation_reason(),
+        ));
+    }
     let admitted_for_begin = admitted.clone();
+    // REQ-WFEXEC-72: an attempt a resolved wait starts, whatever resolved it and a successor's
+    // carried wait included, continues from that wait and keeps it when an interruption stops
+    // it before any step has started; `--from`, an edge and an abandoned run continue from none.
+    let mut pending = pending;
+    if matches!(selection_edge, Selection::Wait { .. }) {
+        pending.keep_resolved_wait();
+    }
     let taken_edge = match selection_edge {
         Selection::Edge(edge) => Some(edge),
         _ => None,

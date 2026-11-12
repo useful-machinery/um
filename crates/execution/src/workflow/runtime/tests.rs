@@ -180,6 +180,7 @@ fn inherited_seed(
         )]),
         entry: None,
         edge_counts: BTreeMap::new(),
+        resumed_wait: None,
     }
 }
 
@@ -2928,6 +2929,132 @@ fn an_interruption_with_no_active_step_fails_the_first_pending_step_at_start() {
             .iter()
             .all(|action| !matches!(action.action, Action::StartStep { .. }))
     );
+}
+
+/// The `repair` wait at `build` a continuation of `design_waiting_on_answers` continues from.
+fn resumed_repair_wait() -> EnteredWait {
+    EnteredWait {
+        step: "build".to_owned(),
+        outcome: Some("failed".to_owned()),
+        kind: WaitKind::Repair,
+        then: "build".to_owned(),
+        on_hand_back: None,
+        rule: None,
+        interrupted: None,
+        kept: None,
+    }
+}
+
+/// A continuation of `design_waiting_on_answers` at `build` from `resumed_repair_wait`.
+fn resumed_at_build() -> ReductionBuilder<String, TestDeadline> {
+    ReductionBuilder::<String, TestDeadline>::new(design_waiting_on_answers()).seeded(
+        ExecutionSeed::empty()
+            .with_entry("build")
+            .with_resumed_wait(resumed_repair_wait()),
+    )
+}
+
+/// The attempt ended on `resumed_repair_wait`, kept with `reason`: no step failed, every
+/// ordinary step is `not_reached`, and no finalizer started.
+fn assert_kept_wait(state: &TestRuntimeState, ending: &TestReduction, reason: CancellationReason) {
+    let kept = EnteredWait {
+        kept: Some(reason),
+        ..resumed_repair_wait()
+    };
+    for step in ["design", "build", "review"] {
+        assert_eq!(state.steps[step].state, not_reached(), "{step}");
+    }
+    assert_eq!(state.wait.as_ref(), Some(&kept));
+    assert_eq!(
+        state.wait.as_ref().and_then(EnteredWait::kept),
+        Some(reason)
+    );
+    assert_eq!(
+        state.workflow,
+        WorkflowState::Waiting { wait: kept.clone() }
+    );
+    assert_eq!(
+        finished_outcome(ending),
+        Some(&RunOutcome::Waiting { wait: kept })
+    );
+    assert_eq!(
+        state.steps["notify"].state,
+        not_run_state(
+            WorkflowNodeRole::Finalizer,
+            NonExecutionCode::FinalizerTriggerNotSelected
+        )
+    );
+    assert!(
+        ending
+            .actions
+            .iter()
+            .all(|action| !matches!(action.action, Action::StartStep { .. }))
+    );
+}
+
+// REQ-WFEXEC-72, REQ-WFEXEC-69, REQ-WFEXEC-70, INV-ENGINE-32: an interruption before any step of
+// a continuation has started, its entry pending or its entry `workflow` step stopped while
+// `starting`, keeps the wait the continuation continues from and fails nothing; a cancellation
+// of the same continuation cancels it as before.
+#[test]
+fn an_interruption_before_a_continuation_starts_a_step_keeps_its_wait() {
+    let reason = CancellationReason::TerminationRequest;
+    let pending = resumed_at_build()
+        .initially_cancelled(InitialCancellation::Interruption {
+            request: cancellation(reason, 5_000),
+            operation: None,
+        })
+        .build::<String, String>();
+    assert_kept_wait(&pending.state, &pending, reason);
+
+    let reason = CancellationReason::UserRequest;
+    let started = resumed_at_build().build::<String, String>();
+    assert_eq!(started.actions, [start_action(1, "build")]);
+    let mut state = started.state;
+    let interrupted = reduce_and_advance(&mut state, interruption(1, reason, 9_001));
+    let [stop] = interrupted.actions.as_slice() else {
+        panic!("the interruption did not stop the starting entry");
+    };
+    assert!(matches!(stop.action, Action::CancelStep { .. }));
+    assert_step(&state, "design", StepStateKind::Pending);
+    let quiesced = reduce_and_advance(
+        &mut state,
+        Occurrence::StepQuiesced {
+            step: "build".to_owned(),
+            action: stop.id,
+        },
+    );
+    assert!(quiesced.occurrence_accepted);
+    assert_kept_wait(&state, &quiesced, reason);
+
+    let cancelled = resumed_at_build()
+        .initially_cancelled(InitialCancellation::Graceful {
+            request: cancellation(reason, 5_000),
+            operation: None,
+        })
+        .build::<String, String>();
+    let mut state = resumed_at_build().build::<String, String>().state;
+    let stop = reduce_and_advance(&mut state, cancellation_operation(1, reason, 9_001));
+    reduce_and_advance(
+        &mut state,
+        Occurrence::StepQuiesced {
+            step: "build".to_owned(),
+            action: stop.actions[0].id,
+        },
+    );
+    for state in [&cancelled.state, &state] {
+        assert_eq!(state.wait, None);
+        for step in ["design", "build", "review"] {
+            assert_eq!(state.steps[step].state, cancelled_state(reason), "{step}");
+        }
+        assert!(matches!(
+            state.workflow,
+            WorkflowState::Finalizing {
+                trigger: FinalizationTrigger::Cancelled,
+                ..
+            }
+        ));
+    }
 }
 
 // REQ-WFEXEC-69
@@ -6743,6 +6870,7 @@ fn a_wait_edge_ends_the_attempt_waiting_without_finalization() {
         on_hand_back: None,
         rule: None,
         interrupted: None,
+        kept: None,
     };
     assert_eq!(
         state.workflow,
@@ -6820,6 +6948,7 @@ fn a_stop_entered_before_an_authorized_step_ends_the_attempt_waiting() {
                 on_hand_back: None,
                 rule: None,
                 interrupted: None,
+                kept: None,
             },
         }
     );
