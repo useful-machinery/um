@@ -557,11 +557,9 @@ fn denied_forced_login_preserves_the_previous_credential() {
 // REQ-AUTH-27, REQ-AUTH-29
 #[test]
 fn human_login_connection_failure_names_the_oauth_issuer_and_cause_on_stderr() {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let address = listener.local_addr().unwrap();
-    drop(listener);
+    let refused = api_test_support::RefusedPort::hold();
     let api_url = "http://api.fixture.test/api";
-    let issuer = format!("http://{address}/auth/");
+    let issuer = format!("http://{}/auth/", refused.address());
     let credential_directory = private_credential_directory();
     let credential_path = credential_directory.path().join("credentials.json");
     let credential_path = credential_path.to_str().unwrap();

@@ -926,9 +926,8 @@ fn networked_auth_requires_http_opt_in_but_local_logout_does_not() {
 
 #[test]
 fn status_does_not_apply_transport_policy_to_the_unused_issuer() {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let api_url = format!("https://{}/api", listener.local_addr().unwrap());
-    drop(listener);
+    let refused = api_test_support::RefusedPort::hold();
+    let api_url = format!("https://{}/api", refused.address());
     let credential_directory = private_credential_directory();
     let credential_path = credential_directory.path().join("credentials.json");
     let credential_path_string = credential_path.to_str().unwrap();
@@ -1493,11 +1492,9 @@ fn transient_refresh_failure_preserves_the_rotating_session() {
 // REQ-AUTH-46
 #[test]
 fn connection_failure_during_refresh_preserves_the_rotating_session() {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let address = listener.local_addr().unwrap();
-    drop(listener);
+    let refused = api_test_support::RefusedPort::hold();
     let api_url = "http://api.fixture.test/api";
-    let issuer = format!("http://{address}/auth/");
+    let issuer = format!("http://{}/auth/", refused.address());
     let credential_directory = private_credential_directory();
     let credential_path = credential_directory.path().join("credentials.json");
     write_credential_fixture_with_refresh_token(
@@ -1738,9 +1735,8 @@ fn unreachable_status_uses_unavailable_exit_code() {
 // REQ-AUTH-32, REQ-AUTH-33, REQ-AUTH-35
 #[test]
 fn connection_failure_uses_unavailable_exit_code_and_status() {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let api_url = format!("http://{}", listener.local_addr().unwrap());
-    drop(listener);
+    let refused = api_test_support::RefusedPort::hold();
+    let api_url = format!("http://{}", refused.address());
     let credential_directory = private_credential_directory();
     let credential_path = credential_directory.path().join("credentials.json");
     let credential_path_string = credential_path.to_str().unwrap();

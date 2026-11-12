@@ -1650,46 +1650,15 @@ mod tests {
             }
         }
 
-        let (_holder, _peer, _accepted, address) = refused_port();
-        let diagnostic = loopback_upload(&spec, address).run().unwrap().unwrap();
+        let refused = um_test_support::RefusedPort::hold();
+        let diagnostic = loopback_upload(&spec, refused.address())
+            .run()
+            .unwrap()
+            .unwrap();
         assert_eq!(
             diagnostic,
             serde_json::json!({"stage": "artifact_upload", "transportError": "connect_failed"})
         );
-    }
-
-    /// Holds a loopback port that refuses every connect for as long as the
-    /// returned sockets live. Nothing may listen there: a dropped listener frees
-    /// its port for a parallel test's next bind, which would then answer the PUT.
-    /// A socket that is bound but never listens is refused on Linux but macOS
-    /// drops its SYNs until the connect times out, and the client end of a live
-    /// connection is refused on both but Linux can hand its auto-assigned port
-    /// to the PUT's own connect, which then reaches itself. So the holder is
-    /// bound explicitly, which Linux never reuses as a source port, and then
-    /// connected, which both kernels answer with a reset.
-    fn refused_port() -> (
-        rustix::fd::OwnedFd,
-        std::net::TcpListener,
-        std::net::TcpStream,
-        std::net::SocketAddr,
-    ) {
-        let holder = rustix::net::socket(
-            rustix::net::AddressFamily::INET,
-            rustix::net::SocketType::STREAM,
-            None,
-        )
-        .unwrap();
-        rustix::net::bind(
-            &holder,
-            &std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 0)),
-        )
-        .unwrap();
-        let address =
-            std::net::SocketAddr::try_from(rustix::net::getsockname(&holder).unwrap()).unwrap();
-        let peer = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        rustix::net::connect(&holder, &peer.local_addr().unwrap()).unwrap();
-        let (accepted, _) = peer.accept().unwrap();
-        (holder, peer, accepted, address)
     }
 
     // The streamed body reaches the provider whole across several chunks, so an
@@ -1752,9 +1721,12 @@ mod tests {
     #[test]
     fn refused_upload_is_classified_as_connect_failed_every_time() {
         let spec = result_spec();
-        let (_holder, _peer, _accepted, address) = refused_port();
+        let refused = um_test_support::RefusedPort::hold();
         for attempt in 0..200 {
-            let diagnostic = loopback_upload(&spec, address).run().unwrap().unwrap();
+            let diagnostic = loopback_upload(&spec, refused.address())
+                .run()
+                .unwrap()
+                .unwrap();
             assert_eq!(
                 diagnostic,
                 serde_json::json!({"stage": "artifact_upload", "transportError": "connect_failed"}),

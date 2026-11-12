@@ -8216,9 +8216,8 @@ fn run_failures_use_registered_outcomes_without_exposing_secrets() {
     assert_no_secret_output(&output, &[TOKEN]);
     malformed.finish();
 
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let api_url = format!("http://{}/api", listener.local_addr().unwrap());
-    drop(listener);
+    let refused = api_test_support::RefusedPort::hold();
+    let api_url = format!("http://{}/api", refused.address());
     let credential_directory = private_credential_directory();
     let credential_path = credential_directory.path().join("credentials.json");
     write_credential_fixture(&credential_path, &api_url, TOKEN, "2999-01-01T00:00:00Z");

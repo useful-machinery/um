@@ -1,6 +1,6 @@
 use std::ffi::OsStr;
 use std::io::{Read as _, Write as _};
-use std::net::{TcpListener, TcpStream};
+use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::thread::{self, JoinHandle};
@@ -213,6 +213,7 @@ impl ScriptedHttpServer {
 
 #[allow(
     clippy::expect_used,
+    clippy::panic,
     reason = "the idempotency echo is an explicit test-fixture contract and malformed fixture data must fail the invoking test"
 )]
 fn response_for_request(response: Vec<u8>, request: &str) -> Vec<u8> {
@@ -225,12 +226,17 @@ fn response_for_request(response: Vec<u8>, request: &str) -> Vec<u8> {
             name.eq_ignore_ascii_case("idempotency-key")
                 .then(|| value.trim())
         });
+        // Name the request line only: the other headers hold the bearer credential.
+        let Some(idempotency_key) = idempotency_key else {
+            panic!(
+                "the scripted response echoes the request's Idempotency-Key, and the request \
+                 carries none; request line: {:?}",
+                request.lines().next().unwrap_or_default()
+            );
+        };
         String::from_utf8(response)
             .expect("an idempotency-echo response should be text")
-            .replace(
-                REQUEST_IDEMPOTENCY_KEY_ECHO,
-                idempotency_key.expect("request should contain an idempotency key"),
-            )
+            .replace(REQUEST_IDEMPOTENCY_KEY_ECHO, idempotency_key)
             .into_bytes()
     } else {
         response
@@ -293,4 +299,129 @@ pub fn read_request(stream: &mut TcpStream) -> Vec<u8> {
     }
 
     request
+}
+
+/// Holds a loopback port that refuses every connect for as long as the
+/// value lives. Nothing may listen there: a dropped listener frees its port
+/// for a parallel test's next bind, which would then answer the request.
+/// A socket that is bound but never listens is refused on Linux but macOS
+/// drops its SYNs until the connect times out, and the client end of a live
+/// connection is refused on both but Linux can hand its auto-assigned port
+/// to the client's own connect, which then reaches itself. So the holder is
+/// bound explicitly, which Linux never reuses as a source port, and then
+/// connected, which both kernels answer with a reset.
+pub struct RefusedPort {
+    _holder: rustix::fd::OwnedFd,
+    _peer: TcpListener,
+    _accepted: TcpStream,
+    address: SocketAddr,
+}
+
+impl RefusedPort {
+    #[allow(
+        clippy::expect_used,
+        reason = "a test that cannot hold its refusing loopback port must fail at the fixture boundary"
+    )]
+    pub fn hold() -> Self {
+        let holder = rustix::net::socket(
+            rustix::net::AddressFamily::INET,
+            rustix::net::SocketType::STREAM,
+            None,
+        )
+        .expect("refused-port holder socket should open");
+        rustix::net::bind(&holder, &SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+            .expect("refused-port holder should bind");
+        let address = SocketAddr::try_from(
+            rustix::net::getsockname(&holder).expect("refused-port holder address should exist"),
+        )
+        .expect("refused-port holder address should be an IP address");
+        let peer = TcpListener::bind("127.0.0.1:0").expect("refused-port peer should bind");
+        rustix::net::connect(
+            &holder,
+            &peer
+                .local_addr()
+                .expect("refused-port peer address should exist"),
+        )
+        .expect("refused-port holder should connect to its peer");
+        let (accepted, _) = peer.accept().expect("refused-port peer should accept");
+        Self {
+            _holder: holder,
+            _peer: peer,
+            _accepted: accepted,
+            address,
+        }
+    }
+
+    pub fn address(&self) -> SocketAddr {
+        self.address
+    }
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::disallowed_macros,
+    reason = "fixture unit tests use Rust equality assertions"
+)]
+mod tests {
+    use std::io::ErrorKind;
+
+    use super::*;
+
+    // INV-TESTING-22
+    #[test]
+    fn a_held_refused_port_refuses_connects_and_cannot_be_bound() -> rustix::io::Result<()> {
+        let refused = RefusedPort::hold();
+        for _ in 0..2 {
+            assert_eq!(
+                TcpStream::connect(refused.address())
+                    .map(|_| ())
+                    .map_err(|error| error.kind()),
+                Err(ErrorKind::ConnectionRefused)
+            );
+        }
+        // No bind to port 0 may be given the held port. Both kernels refuse the address to
+        // a bind that sets no reuse option, which is how macOS looks a port up when it
+        // assigns one. Linux assigns a listener's port by the rules of its explicit bind,
+        // `SO_REUSEADDR` included, so there the listener's own bind is refused too; macOS
+        // lets that bind name the address of a connected socket.
+        let plain = rustix::net::socket(
+            rustix::net::AddressFamily::INET,
+            rustix::net::SocketType::STREAM,
+            None,
+        )?;
+        assert_eq!(
+            rustix::net::bind(&plain, &refused.address()),
+            Err(rustix::io::Errno::ADDRINUSE)
+        );
+        if cfg!(target_os = "linux") {
+            assert_eq!(
+                TcpListener::bind(refused.address())
+                    .map(|_| ())
+                    .map_err(|error| error.kind()),
+                Err(ErrorKind::AddrInUse)
+            );
+        }
+        Ok(())
+    }
+
+    // INV-TESTING-22
+    #[test]
+    fn an_echo_response_rejects_a_keyless_request_by_its_request_line() {
+        let response =
+            format!("HTTP/1.1 200 OK\r\n\r\n{REQUEST_IDEMPOTENCY_KEY_ECHO}").into_bytes();
+        let message = std::panic::catch_unwind(move || {
+            response_for_request(
+                response,
+                "GET /api/v1/stray HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
+            )
+        })
+        .err()
+        .and_then(|payload| payload.downcast::<String>().ok());
+        assert!(
+            message
+                .as_deref()
+                .is_some_and(|message| message.contains("GET /api/v1/stray HTTP/1.1")),
+            "{message:?}"
+        );
+    }
 }
