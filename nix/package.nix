@@ -72,7 +72,6 @@ let
   testBuildIdentity = "0000000000000000000000000000000000000000";
 
   testArgs = commonArgs // {
-    inherit cargoArtifacts;
     version = testVersion;
     nativeBuildInputs = [
       git
@@ -88,11 +87,19 @@ let
     testArgs
     // {
       cargoExtraArgs = "--locked --workspace --all-targets --all-features";
+      # Crane defaults CARGO_PROFILE to release. The empty value passes no
+      # --cargo-profile, so nextest builds Cargo's test profile, unoptimized
+      # with debug assertions and overflow checks, as check-suite does
+      # (INV-TESTING-23).
+      CARGO_PROFILE = "";
+      # The package's dependency archive is a release build, which this
+      # build cannot use, so it is not taken.
+      cargoArtifacts = null;
       doInstallCargoArtifacts = false;
-      # The dependency archive is built for release; nextest and its worker
-      # example compile fresh debug artifacts. Avoid storing full debug symbols
-      # in both builds, which can exhaust the validation host's disk before
-      # the test suite runs. Keep debug assertions and every test enabled.
+      # preBuild's dev build and the test build share target/debug and its
+      # dependency artifacts because their debuginfo settings are equal.
+      # Debuginfo is off in both to keep the build directory small, which full
+      # debug symbols can exhaust on the validation host before the suite runs.
       env = testArgs.env // {
         CARGO_PROFILE_DEV_DEBUG = "0";
         CARGO_PROFILE_TEST_DEBUG = "0";

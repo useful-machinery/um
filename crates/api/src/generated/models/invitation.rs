@@ -22,7 +22,7 @@ pub struct Invitation {
     pub id: String,
     #[serde(rename = "organizationId")]
     pub organization_id: String,
-    /// Omitted from history after issuer erasure or when old event evidence is unavailable; present on issuance.
+    /// Principal that issued the invitation. Omitted from history only after the issuer's account is deleted; present on issuance and on every other entry, including one whose issuerIdentity is unavailable.
     #[serde(rename = "issuerPrincipalId", skip_serializing_if = "Option::is_none")]
     pub issuer_principal_id: Option<String>,
     /// The immutable invitation target variant.

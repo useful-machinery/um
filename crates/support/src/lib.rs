@@ -1,3 +1,9 @@
+#[cfg(test)]
+#[allow(
+    clippy::disallowed_macros,
+    reason = "the build-profile unit test uses Rust assertions"
+)]
+mod build_profile;
 mod idempotency;
 mod public_id;
 mod timing;

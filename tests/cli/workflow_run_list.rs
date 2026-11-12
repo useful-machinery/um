@@ -1,4 +1,5 @@
 use std::fs;
+use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
 use std::process::{Output, Stdio};
 
@@ -14,6 +15,11 @@ use super::workflow_run_control::{LiveRun, OPERATOR, PublishedWaitTree, refused,
 
 /// `um workflow run list ARGS` as `OPERATOR` against `home`.
 fn list(home: &Home, args: &[&str]) -> Output {
+    list_at(Path::new(home.path()), args)
+}
+
+/// `um workflow run list ARGS` as `OPERATOR` against the home at `home`, as that path spells it.
+fn list_at(home: &Path, args: &[&str]) -> Output {
     isolated_command(
         &["workflow", "run", "list"]
             .into_iter()
@@ -21,7 +27,7 @@ fn list(home: &Home, args: &[&str]) -> Output {
             .map(str::to_owned)
             .collect::<Vec<_>>(),
     )
-    .env("UM_HOME", home.path())
+    .env("UM_HOME", home)
     .env("USER", OPERATOR)
     .output()
     .unwrap()
@@ -123,7 +129,7 @@ fn list_shows_the_live_runs_or_with_all_every_run() {
         .map(|entry| entry.unwrap().file_name().into_string().unwrap())
         .find(|id| ![&waiting_id, &landed_id, &withdrawn_id].contains(&id))
         .unwrap();
-    let running = runs_directory.join(&running_id);
+    let running = fs::canonicalize(runs_directory.join(&running_id)).unwrap();
     assert_eq!(run_record(&running)["state"], "running");
 
     let mut live_ids = vec![waiting_id.clone(), running_id.clone()];
@@ -164,6 +170,24 @@ fn list_shows_the_live_runs_or_with_all_every_run() {
         assert_eq!(listed["definition"], published.definition.as_str());
         assert_eq!(listed["owner"], OPERATOR);
     }
+    // A home spelled through a symbolic link lists each run by the same resolved directory,
+    // whatever `TMPDIR` the suite runs under.
+    let alias = tempfile::tempdir().unwrap();
+    let aliased = alias.path().join("home");
+    symlink(home.path(), &aliased).unwrap();
+    let output = list_at(&aliased, &["--all", "--json"]);
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let through_alias: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let directories = |runs: &[Value]| {
+        runs.iter()
+            .map(|run| (run["id"].clone(), run["directory"].clone()))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        directories(through_alias["runs"].as_array().unwrap()),
+        directories(&runs),
+        "{through_alias}"
+    );
     let entry = |id: &str| runs.iter().find(|run| run["id"] == id).unwrap();
     let waiting_entry = entry(&waiting_id);
     assert_eq!(waiting_entry["state"], "waiting");
