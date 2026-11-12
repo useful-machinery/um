@@ -26,3 +26,4 @@ zeroize.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+um-test-support.workspace = true

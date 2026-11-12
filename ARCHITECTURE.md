@@ -393,7 +393,8 @@ library members occupy their final roots:
   test-support only for tests. Its test-only internal-worker example keeps package
   suites independent of a previously built root executable;
 - `um-human-auth` owns human OAuth sessions and credential storage, depends
-  on support and API, and exposes only the command-facing facade; and
+  on support and API in production, uses test-support only for tests, and
+  exposes only the command-facing facade; and
 - `um-runner` owns Runner Serve, enrollment, doctor, local control,
   assignment execution, artifact delivery, and telemetry. It depends only on support,
   runner-protocol, and execution in production and uses test-support only for tests.

@@ -1,108 +1,25 @@
-use std::io::{Read as _, Write as _};
-use std::net::{TcpListener, TcpStream};
-use std::sync::mpsc::{self, Receiver};
-use std::thread::{self, JoinHandle};
+use std::io::Write as _;
+use std::net::TcpListener;
+use std::thread;
 use std::time::Duration;
 
 use super::*;
 use anyhow::Context as _;
 use um_api::MAX_RESPONSE_BODY_BYTES;
+use um_test_support::{ScriptedHttpServer, read_request};
 
-struct ScriptedServer {
-    issuer: String,
-    requests: Receiver<String>,
-    thread: JoinHandle<anyhow::Result<()>>,
-    expected_requests: usize,
-}
-
-impl ScriptedServer {
-    fn new(responses: Vec<Vec<u8>>) -> anyhow::Result<Self> {
-        let expected_requests = responses.len();
-        let listener = TcpListener::bind("127.0.0.1:0").context("fixture listener should bind")?;
-        let address = listener
-            .local_addr()
-            .context("fixture value should exist")?;
-        let (sender, requests) = mpsc::channel();
-        let thread = thread::spawn(move || {
-            for response in responses {
-                let (mut stream, _) = listener.accept().context("fixture request should arrive")?;
-                let request = read_request(&mut stream)?;
-                sender
-                    .send(String::from_utf8(request).context("request should be text")?)
-                    .context("fixture value should exist")?;
-                stream.write_all(&response)?;
-            }
-            Ok(())
-        });
-
-        Ok(Self {
-            issuer: format!("http://{address}/tenant/"),
-            requests,
-            thread,
-            expected_requests,
-        })
-    }
-
-    fn deployment(&self) -> anyhow::Result<Deployment> {
-        Ok(Deployment::for_test(
-            "http://api.fixture.example".to_owned(),
-            self.issuer.clone(),
-        )?)
-    }
-
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "wall time only bounds the external HTTP fixture's readiness messages"
-    )]
-    fn finish(self) -> anyhow::Result<Vec<String>> {
-        let requests: anyhow::Result<Vec<_>> = (0..self.expected_requests)
-            .map(|_| {
-                self.requests
-                    .recv_timeout(Duration::from_secs(2))
-                    .context("fixture should capture request")
-            })
-            .collect();
-        self.thread
-            .join()
-            .map_err(|_| anyhow::anyhow!("fixture server panicked"))??;
-        requests
-    }
-}
-
-fn read_request(stream: &mut TcpStream) -> anyhow::Result<Vec<u8>> {
-    stream
-        .set_read_timeout(Some(Duration::from_secs(2)))
-        .context("fixture value should exist")?;
-    let mut request = Vec::new();
-    let mut buffer = [0_u8; 1024];
-    let mut expected_length = None;
-    loop {
-        let read = stream
-            .read(&mut buffer)
-            .context("request should be readable")?;
-        if read == 0 {
-            break;
-        }
-        request.extend_from_slice(&buffer[..read]);
-        if let Some(header_end) = request.windows(4).position(|part| part == b"\r\n\r\n") {
-            let body_start = header_end + 4;
-            let length = *expected_length.get_or_insert_with(|| {
-                String::from_utf8_lossy(&request[..body_start])
-                    .lines()
-                    .find_map(|line| {
-                        line.to_ascii_lowercase()
-                            .strip_prefix("content-length: ")
-                            .and_then(|value| value.parse::<usize>().ok())
-                    })
-                    .unwrap_or_default()
-            });
-            if request.len() >= body_start + length {
-                break;
-            }
-        }
-        check!(request.len() < 128 * 1024);
-    }
-    Ok(request)
+fn deployment(server: &ScriptedHttpServer) -> anyhow::Result<Deployment> {
+    let issuer = format!(
+        "{}tenant/",
+        server
+            .api_url
+            .strip_suffix("api/")
+            .context("fixture API URL should end with api/")?
+    );
+    Ok(Deployment::for_test(
+        "http://api.fixture.example".to_owned(),
+        issuer,
+    )?)
 }
 
 fn response(status: &str, content_type: Option<&str>, body: &[u8]) -> Vec<u8> {
@@ -147,7 +64,7 @@ fn request_form(request: &str) -> std::collections::HashMap<String, String> {
 // REQ-AUTH-23
 #[test]
 fn device_authorization_requests_the_exact_client_audience_and_scopes() -> anyhow::Result<()> {
-    let server = ScriptedServer::new(vec![json_response(
+    let server = ScriptedHttpServer::respond(json_response(
         "200 OK",
         serde_json::json!({
             "device_code": "unique-private-device-code",
@@ -157,8 +74,8 @@ fn device_authorization_requests_the_exact_client_audience_and_scopes() -> anyho
             "expires_in": 600,
             "interval": 2
         }),
-    )?])?;
-    let deployment = server.deployment()?;
+    )?);
+    let deployment = deployment(&server)?;
     let client = HttpClient::new(HttpTransportPolicy::AllowInsecureHttp)
         .map_err(|error| anyhow::anyhow!("{error}"))?;
 
@@ -174,7 +91,7 @@ fn device_authorization_requests_the_exact_client_audience_and_scopes() -> anyho
     check!(!debug.contains("ABCD-EFGH"));
     check!(!debug.contains("auth.fixture.example"));
 
-    let requests = server.finish()?;
+    let requests = server.finish();
     check!(requests[0].starts_with("POST /tenant/oauth/device/code HTTP/1.1\r\n"));
     let form = request_form(&requests[0]);
     check_eq!(
@@ -245,8 +162,8 @@ fn token_polling_handles_standard_device_grant_outcomes() -> anyhow::Result<()> 
     .map(|(error, status)| json_response(status, serde_json::json!({ "error": error })))
     .into_iter()
     .collect::<anyhow::Result<Vec<_>>>()?;
-    let server = ScriptedServer::new(responses)?;
-    let deployment = server.deployment()?;
+    let server = ScriptedHttpServer::respond_in_sequence(responses);
+    let deployment = deployment(&server)?;
     let client = HttpClient::new(HttpTransportPolicy::AllowInsecureHttp)
         .map_err(|error| anyhow::anyhow!("{error}"))?;
 
@@ -271,7 +188,7 @@ fn token_polling_handles_standard_device_grant_outcomes() -> anyhow::Result<()> 
         TokenPoll::Expired
     ));
 
-    for request in server.finish()? {
+    for request in server.finish() {
         check!(request.starts_with("POST /tenant/oauth/token HTTP/1.1\r\n"));
         let form = request_form(&request);
         check_eq!(
@@ -303,7 +220,7 @@ fn token_polling_reuses_one_http_connection() -> anyhow::Result<()> {
         let (mut stream, _) = listener.accept().context("fixture value should exist")?;
         let mut requests = Vec::new();
         for error in ["authorization_pending", "access_denied"] {
-            requests.push(String::from_utf8(read_request(&mut stream)?)?);
+            requests.push(String::from_utf8(read_request(&mut stream))?);
             stream.write_all(&keep_alive_json_response(
                 "400 Bad Request",
                 serde_json::json!({ "error": error }),
@@ -344,7 +261,7 @@ fn token_polling_reuses_one_http_connection() -> anyhow::Result<()> {
 // REQ-AUTH-24, REQ-AUTH-54
 #[test]
 fn issued_access_and_refresh_tokens_are_validated_and_redacted() -> anyhow::Result<()> {
-    let server = ScriptedServer::new(vec![json_response(
+    let server = ScriptedHttpServer::respond(json_response(
         "200 OK",
         serde_json::json!({
             "access_token": "unique-issued-access-token",
@@ -352,8 +269,8 @@ fn issued_access_and_refresh_tokens_are_validated_and_redacted() -> anyhow::Resu
             "expires_in": 300,
             "refresh_token": "unique-issued-refresh-token"
         }),
-    )?])?;
-    let deployment = server.deployment()?;
+    )?);
+    let deployment = deployment(&server)?;
     let client = HttpClient::new(HttpTransportPolicy::AllowInsecureHttp)
         .map_err(|error| anyhow::anyhow!("{error}"))?;
 
@@ -369,7 +286,7 @@ fn issued_access_and_refresh_tokens_are_validated_and_redacted() -> anyhow::Resu
     let debug = format!("{token:?}");
     check!(!debug.contains("unique-issued-access-token"));
     check!(!debug.contains("unique-issued-refresh-token"));
-    server.finish()?;
+    server.finish();
     Ok(())
 }
 
@@ -474,38 +391,22 @@ fn invalid_device_and_token_payloads_are_protocol_errors() -> anyhow::Result<()>
 // REQ-AUTH-33
 #[test]
 fn oauth_request_deadline_bounds_the_complete_exchange() -> anyhow::Result<()> {
-    let listener = TcpListener::bind("127.0.0.1:0").context("fixture value should exist")?;
-    let address = listener
-        .local_addr()
-        .context("fixture value should exist")?;
     // Keep the peer pending so this isolated check observes only the production
     // request deadline; release it deterministically after classification.
-    let (release_response, response_release) = mpsc::sync_channel(0);
-    let server = thread::spawn(move || {
-        let (mut stream, _) = listener.accept().context("fixture value should exist")?;
-        read_request(&mut stream)?;
-        response_release
-            .recv()
-            .context("OAuth response should be released")?;
-        stream.write_all(&json_response("200 OK", serde_json::json!({}))?)?;
-        Ok::<_, anyhow::Error>(())
-    });
+    let mut server =
+        ScriptedHttpServer::respond_when_released(json_response("200 OK", serde_json::json!({}))?);
 
     let client = HttpClient::new(HttpTransportPolicy::AllowInsecureHttp)
         .map_err(|error| anyhow::anyhow!("{error}"))?;
     let Err(error) = post_form_with_timeout(
         &client,
-        Url::parse(&format!("http://{address}/oauth/token"))
+        Url::parse(&format!("{}oauth/token", server.api_url))
             .context("fixture value should exist")?,
         &[],
         Duration::from_millis(20),
     ) else {
-        release_response
-            .send(())
-            .context("OAuth response should be released")?;
-        server
-            .join()
-            .map_err(|_| anyhow::anyhow!("fixture server panicked"))??;
+        server.release_response();
+        server.finish_one();
         anyhow::bail!("slow OAuth request should time out");
     };
 
@@ -513,12 +414,8 @@ fn oauth_request_deadline_bounds_the_complete_exchange() -> anyhow::Result<()> {
         error,
         AuthorizationError::Unreachable(UnreachableCategory::Timeout)
     ));
-    release_response
-        .send(())
-        .context("OAuth response should be released")?;
-    server
-        .join()
-        .map_err(|_| anyhow::anyhow!("fixture server panicked"))??;
+    server.release_response();
+    server.finish_one();
     Ok(())
 }
 
@@ -531,13 +428,13 @@ fn redirects_oversized_responses_and_temporary_failures_are_classified() -> anyh
     )
     .into_bytes();
     let redirect = b"HTTP/1.1 302 Found\r\nConnection: close\r\nLocation: http://127.0.0.1:1/escaped\r\nContent-Length: 0\r\n\r\n".to_vec();
-    let server = ScriptedServer::new(vec![
+    let server = ScriptedHttpServer::respond_in_sequence(vec![
         redirect,
         oversized,
         response("429 Too Many Requests", None, &[]),
         response("503 Service Unavailable", None, &[]),
-    ])?;
-    let deployment = server.deployment()?;
+    ]);
+    let deployment = deployment(&server)?;
     let client = HttpClient::new(HttpTransportPolicy::AllowInsecureHttp)
         .map_err(|error| anyhow::anyhow!("{error}"))?;
 
@@ -559,6 +456,6 @@ fn redirects_oversized_responses_and_temporary_failures_are_classified() -> anyh
         authorize(&client, &deployment),
         Err(AuthorizationError::Unreachable(UnreachableCategory::Server))
     ));
-    server.finish()?;
+    server.finish();
     Ok(())
 }

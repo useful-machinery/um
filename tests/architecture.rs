@@ -145,6 +145,7 @@ fn workspace_members_and_edges_match_final_graph() {
         ("um-api", "um-test-support", "dev"),
         ("um-human-auth", "um-api", "normal"),
         ("um-human-auth", "um-support", "normal"),
+        ("um-human-auth", "um-test-support", "dev"),
         ("um-execution", "um-support", "normal"),
         ("um-execution", "um-test-support", "dev"),
         ("um-runner", "um-execution", "normal"),
