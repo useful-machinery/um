@@ -49,30 +49,37 @@ impl Command {
     }
 }
 
+impl super::super::HumanSessionApi for GrantApi {
+    type Failure = GrantFailure;
+    type BuildError = um_api::GrantApiError;
+
+    fn build(
+        api_url: &str,
+        token: &str,
+        policy: um_api::HttpTransportPolicy,
+    ) -> Result<Self, Self::BuildError> {
+        Self::new(api_url, token, policy)
+    }
+
+    fn credential_rejected(failure: &GrantFailure) -> bool {
+        failure.credential_rejected()
+    }
+
+    fn unauthenticated() -> GrantFailure {
+        GrantFailure::Unauthenticated
+    }
+
+    fn unreachable(category: um_api::UnreachableCategory) -> GrantFailure {
+        GrantFailure::Unreachable { category }
+    }
+}
+
 /// Runs `f` against the grant API with the signed-in human session, refreshing a rejected
 /// session once.
 fn with_api<T, F: super::super::JsonOutputKind>(
     deployment: &Deployment,
     options: &super::super::CommonArgs<F, super::super::NoAuthenticationArgs>,
-    mut f: impl FnMut(&GrantApi) -> Result<T, GrantFailure>,
+    f: impl FnMut(&GrantApi) -> Result<T, GrantFailure>,
 ) -> anyhow::Result<Result<T, GrantFailure>> {
-    let policy = options.http.transport_policy();
-    let client = super::super::human_session_client(policy)?;
-    super::super::execute_required_api_operation_retrying_result(
-        &client,
-        deployment,
-        |token| {
-            let api = GrantApi::new(deployment.fingerprint().api_url(), token, policy)
-                .map_err(|error| anyhow::anyhow!(error))?;
-            Ok(f(&api))
-        },
-        |result| {
-            result
-                .as_ref()
-                .is_err_and(GrantFailure::credential_rejected)
-        },
-        || GrantFailure::Unauthenticated,
-        |category| GrantFailure::Unreachable { category },
-        "acquire human session",
-    )
+    super::super::with_human_session_api(deployment, options.http.transport_policy(), f)
 }

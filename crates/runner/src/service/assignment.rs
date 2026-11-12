@@ -953,7 +953,13 @@ pub(super) struct AssignmentManager {
     pi_installation: Option<ValidatedPiInstallation>,
     claude_code_installation: Option<ValidatedClaudeCodeInstallation>,
     codex_installation: Option<ValidatedCodexInstallation>,
+    /// The process environment, taken once when the manager is built.
     environment: EnvironmentSnapshot,
+    /// Where the runner keeps the agent logins it is delivered, which each
+    /// admission offers to the environment its steps draw from
+    /// (REQ-AGENTLOGIN-27, REQ-AGENTLOGIN-34); `None` for a runner without
+    /// protected state.
+    agent_login_directory: Option<crate::agent_login::directory::LoginDirectory>,
     execution_version: Arc<str>,
     lease_clock: LeaseClock,
     sleeper: Arc<dyn Sleeper>,

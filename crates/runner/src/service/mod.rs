@@ -31,8 +31,14 @@ pub(crate) use assignment::run_nested_workflow_delivery_failure_scenario;
 #[cfg(test)]
 pub(crate) use config::AssignmentConfig;
 pub use config::{Config, ConfigError};
+#[cfg(test)]
+pub(crate) use test_support::{
+    CountedGate, FAKE_AGENT_LOGIN_ID, FAKE_AGENT_LOGIN_SENTINEL, FakeAgentLoginCloud,
+    fake_agent_login_material, fake_codex_authorized,
+};
 
-use crate::control_protocol::{ConnectionFailure, ControlError};
+use crate::agent_login::setup::{AgentLoginSetup, AssignmentGate, SetupDependencies};
+use crate::control_protocol::{AssignmentCounts, ConnectionFailure, ControlError};
 use crate::telemetry::{self, Event, Outcome, Recorder};
 use assignment::{AssignmentDependencies, AssignmentManager};
 use backoff::Backoff;
@@ -41,7 +47,9 @@ use connection::{
     ConnectionProgress, FailureKind, FrameSource, OpeningHello, SystemFrameSource, opening_hello,
     record_progress,
 };
-use control::{ControlServer, ControlServerError, ControlTimeouts, LiveStatus, ReloadRequest};
+use control::{
+    ControlContext, ControlServer, ControlServerError, ControlTimeouts, LiveStatus, ReloadRequest,
+};
 use lease_clock::{LeaseClock, LeaseClockError};
 use um_execution::MAXIMUM_CANCELLATION_GRACE;
 use um_execution::untested_harness_advisories;
@@ -86,6 +94,8 @@ impl Sequence {
     }
 }
 
+/// How long the runner waits between agent-login setups (REQ-AGENTLOGIN-29).
+const AGENT_LOGIN_SETUP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5 * 60);
 const SHUTDOWN_DELIVERY_RESERVE: std::time::Duration = std::time::Duration::from_secs(10);
 const SHUTDOWN_CLEANUP_RESERVE: std::time::Duration = std::time::Duration::from_secs(5);
 const SHUTDOWN_CLEANUP_START_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
@@ -211,6 +221,72 @@ struct ReloadDependencies {
     live_status: Arc<LiveStatus>,
 }
 
+/// The assignment manager as agent-login setup sees it: idle when it holds
+/// no assignment in any state, and kept idle by its lock while setup installs
+/// or removes a login (INV-RUNNER-15).
+struct IdleAssignmentGate {
+    assignment_manager: Arc<Mutex<AssignmentManager>>,
+    // Setup runs on a thread of its own, and reading the manager's state may
+    // hand work to the runtime.
+    runtime: tokio::runtime::Handle,
+}
+
+impl IdleAssignmentGate {
+    fn new(assignment_manager: Arc<Mutex<AssignmentManager>>) -> Self {
+        Self {
+            assignment_manager,
+            runtime: tokio::runtime::Handle::current(),
+        }
+    }
+}
+
+impl AssignmentGate for IdleAssignmentGate {
+    fn while_idle(&self, change: &mut dyn FnMut()) -> bool {
+        let _runtime = self.runtime.enter();
+        let mut manager = self
+            .assignment_manager
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if manager.status_counts() != AssignmentCounts::default() {
+            return false;
+        }
+        change();
+        true
+    }
+}
+
+/// The serving process's repeating agent-login setup: a pass at once, then
+/// one every `AGENT_LOGIN_SETUP_INTERVAL` on the service's sleeper, each
+/// publishing the readiness it recorded in the live status. A pass that
+/// finds an assignment held is skipped, not queued. Dropping the schedule
+/// stops it.
+struct AgentLoginSchedule {
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl AgentLoginSchedule {
+    fn start(
+        setup: Arc<AgentLoginSetup>,
+        status: Arc<LiveStatus>,
+        sleeper: Arc<dyn Sleeper>,
+    ) -> Self {
+        Self {
+            task: tokio::spawn(async move {
+                loop {
+                    let _ = control::set_up_agent_logins(&setup, &status).await;
+                    sleeper.sleep(AGENT_LOGIN_SETUP_INTERVAL).await;
+                }
+            }),
+        }
+    }
+}
+
+impl Drop for AgentLoginSchedule {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
 trait Connector: Send + Sync {
     fn connect<'a>(&'a self, attempt: ConnectionAttempt<'a>) -> ConnectionFuture<'a>;
 }
@@ -236,6 +312,9 @@ struct ConnectionLoopDependencies {
     boot_id: String,
     source_broker: Option<Arc<dyn source::SourceCredentialBroker>>,
     recovery_host: Arc<dyn recovery::RecoveryHost>,
+    /// Agent-login setup, for a runner with protected state to record its
+    /// readiness beside.
+    agent_login_setup: Option<SetupDependencies>,
 }
 
 #[derive(Debug)]
@@ -346,6 +425,14 @@ async fn run_until_cancelled(config: Config, service_version: &str) -> Result<()
     let recorder = Recorder::stderr(&boot_id, service_version);
     let lease_clock = LeaseClock::system().map_err(ServiceError::LeaseClock)?;
     let mut shutdown = ProcessShutdown::new()?;
+    let agent_login_setup = config.state_access().and_then(|state| {
+        SetupDependencies::enrolled(
+            config.endpoint(),
+            config.credential(),
+            state.path(),
+            Arc::clone(&recorder),
+        )
+    });
     Box::pin(run_connection_loop(
         ConnectionLoopDependencies {
             config,
@@ -356,6 +443,7 @@ async fn run_until_cancelled(config: Config, service_version: &str) -> Result<()
             boot_id,
             source_broker: None,
             recovery_host: Arc::new(recovery::SystemRecoveryHost),
+            agent_login_setup,
         },
         &WebSocketConnector,
         Backoff::new(),
@@ -385,6 +473,7 @@ async fn run_until_cancelled_with_dependencies(
             boot_id,
             source_broker,
             recovery_host: recovery::host_fixture::fixture_host(),
+            agent_login_setup: None,
         },
         &WebSocketConnector,
         Backoff::new(),
@@ -503,6 +592,7 @@ async fn run_connection_loop_with_work_root(
         boot_id,
         source_broker,
         recovery_host: _,
+        agent_login_setup,
     } = dependencies;
     let recovery_root = Arc::clone(&work_root);
     let discovery_recorder = Arc::clone(&recorder);
@@ -562,20 +652,41 @@ async fn run_connection_loop_with_work_root(
         assignment_manager: Arc::clone(&assignment_manager),
         live_status: Arc::clone(&live_status),
     };
+    let agent_login_setup = agent_login_setup.map(|dependencies| {
+        let clock = Arc::clone(&sleeper);
+        Arc::new(AgentLoginSetup::new(
+            dependencies,
+            Arc::new(IdleAssignmentGate::new(Arc::clone(&assignment_manager))),
+            move || clock.utc_now(),
+        ))
+    });
     let (reload_sender, mut reload_requests) = tokio::sync::mpsc::channel::<ReloadRequest>(1);
     let _control_server = config
         .control_socket_path()
         .map(|path| {
             ControlServer::bind(
                 path,
-                Arc::clone(&live_status),
-                Arc::clone(&assignment_manager),
-                reload_sender,
-                ControlTimeouts::production(),
+                ControlContext {
+                    status: Arc::clone(&live_status),
+                    assignments: Arc::clone(&assignment_manager),
+                    reloads: reload_sender,
+                    agent_logins: agent_login_setup.clone(),
+                    timeouts: ControlTimeouts::production(),
+                },
             )
         })
         .transpose()
         .map_err(ServiceError::Control)?;
+    // Setup never delays connecting: its first pass starts once the control
+    // socket is bound, on a task of its own, and the connection loop below
+    // never waits for it.
+    let _agent_login_schedule = agent_login_setup.as_ref().map(|setup| {
+        AgentLoginSchedule::start(
+            Arc::clone(setup),
+            Arc::clone(&live_status),
+            Arc::clone(&sleeper),
+        )
+    });
     let mut opening_sequence = 1;
     let sequence = Sequence::new(2);
     let mut opening_message_id = frame_source.public_id("rmsg_");
@@ -646,6 +757,12 @@ async fn run_connection_loop_with_work_root(
         }
         live_status.connecting();
         let promoted = promoted_attempt.take();
+        if promoted.is_some()
+            && let Some(setup) = &agent_login_setup
+        {
+            // Every promotion arrives here with `config` already replaced.
+            setup.follow_credential(config.endpoint(), config.credential());
+        }
         let (connection_event, active_effect_event, candidate) = match promoted {
             Some(promoted) => (
                 promoted.connection_event,
@@ -1897,6 +2014,7 @@ mod tests {
             boot_id: boot_id.clone(),
             source_broker: None,
             recovery_host: super::recovery::host_fixture::fixture_host(),
+            agent_login_setup: None,
         };
         let remover = Arc::new(FailingBootRemover {
             calls: AtomicUsize::new(0),
@@ -4321,5 +4439,431 @@ mod tests {
         assert!(connection.get("um.connection.failure_kind").is_none());
         assert!(connection.get("um.connection.backoff_ms").is_none());
         assert_eq!(capture.span_count("runner.gateway_connection"), 1);
+    }
+
+    mod agent_login_setup {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt as _;
+        use std::path::PathBuf;
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        use futures_util::{SinkExt as _, StreamExt as _};
+        use tokio_tungstenite::tungstenite::Message;
+
+        use super::super::source::test_support::unavailable_source_broker;
+        use super::super::test_support::{
+            ConfigFixture, ControlledShutdownTrigger, FAKE_AGENT_LOGIN_SENTINEL,
+            FakeAgentLoginCloud, SleepRelease, accept_fixture_socket, assignment_offer,
+            begin_assignment_preparation, controlled_shutdown, controlled_sleeper,
+            deterministic_frame_source, effect_acknowledgement, fake_agent_login_material,
+            fake_agent_login_setup, fake_codex_answer, fake_codex_authorized, fixture_lease_clock,
+            fixture_listener, observation_acknowledgement, scripted_connector, sleep_request,
+            welcome, with_watchdog,
+        };
+        use super::super::workspace::WorkRootLease;
+        use super::super::{
+            AGENT_LOGIN_SETUP_INTERVAL, Backoff, ConnectionLoopDependencies, Connector,
+            ServiceError, WebSocketConnector, run_connection_loop_with_work_root,
+        };
+        use super::{acknowledge_runner_frame, next_semantic_assignment_frame};
+        use crate::agent_login::cloud::{CloudFailure, LoginStatus};
+        use crate::agent_login::readiness::{LoginReadiness, ReadinessDocument, readiness_path};
+        use crate::control_protocol::{AgentLoginProvider, AgentLoginState};
+        use crate::credential::test_credential;
+        use crate::telemetry::{TestCapture, test_recorder};
+
+        const SETUP_RECORD: &str = "runner.agent_login_setup";
+
+        /// A serving runner whose agent-login setup asks `cloud`, on the
+        /// controlled sleeper, with its own `HOME` and state directory.
+        struct SetupService {
+            home: tempfile::TempDir,
+            state: tempfile::TempDir,
+            capture: TestCapture,
+            sleeps: tokio::sync::mpsc::UnboundedReceiver<(Duration, SleepRelease)>,
+            pending_setup: Option<SleepRelease>,
+            task: tokio::task::JoinHandle<Result<(), ServiceError>>,
+            shutdown: ControlledShutdownTrigger,
+            _config: ConfigFixture,
+        }
+
+        impl SetupService {
+            fn spawn(
+                endpoint: &str,
+                connector: impl Connector + 'static,
+                cloud: Arc<FakeAgentLoginCloud>,
+            ) -> Self {
+                let config =
+                    ConfigFixture::new(endpoint, test_credential(), true).expect("configure");
+                let home = tempfile::tempdir().expect("service home");
+                let state = tempfile::tempdir().expect("state directory");
+                fs::set_permissions(state.path(), fs::Permissions::from_mode(0o700))
+                    .expect("private state directory");
+                let frame_source = deterministic_frame_source();
+                let boot_id = frame_source.public_id("rbt_");
+                let (recorder, capture) = test_recorder(&boot_id);
+                let (sleeper, sleeps) = controlled_sleeper();
+                let (mut shutdown, shutdown_trigger) = controlled_shutdown();
+                let dependencies = ConnectionLoopDependencies {
+                    config: config.cloned_config(),
+                    frame_source,
+                    sleeper,
+                    recorder: Arc::clone(&recorder),
+                    lease_clock: fixture_lease_clock(),
+                    boot_id: boot_id.clone(),
+                    source_broker: Some(unavailable_source_broker()),
+                    recovery_host: super::super::recovery::host_fixture::fixture_host(),
+                    agent_login_setup: Some(fake_agent_login_setup(
+                        Arc::clone(&cloud),
+                        home.path(),
+                        state.path(),
+                        recorder,
+                    )),
+                };
+                let work_root =
+                    WorkRootLease::acquire_for_test(config.assignment().work_root(), &boot_id)
+                        .expect("acquire work root");
+                let task = tokio::spawn(async move {
+                    run_connection_loop_with_work_root(
+                        dependencies,
+                        &connector,
+                        Backoff::with_fixed_unit(1.0),
+                        shutdown.as_mut(),
+                        work_root,
+                    )
+                    .await
+                });
+                Self {
+                    home,
+                    state,
+                    capture,
+                    sleeps,
+                    pending_setup: None,
+                    task,
+                    shutdown: shutdown_trigger,
+                    _config: config,
+                }
+            }
+
+            /// Waits until the pass in flight has ended, which it shows by
+            /// waiting for the next one.
+            async fn pass_ended(&mut self) {
+                let release =
+                    with_watchdog(sleep_request(&mut self.sleeps, AGENT_LOGIN_SETUP_INTERVAL))
+                        .await
+                        .expect("agent-login setup did not wait for its next pass");
+                self.pending_setup = Some(release);
+            }
+
+            /// Lets the setup interval elapse and waits for that pass to end.
+            async fn next_pass(&mut self) {
+                self.pending_setup
+                    .take()
+                    .expect("no agent-login setup is waiting")
+                    .release();
+                self.pass_ended().await;
+            }
+
+            fn auth_path(&self) -> PathBuf {
+                self.state
+                    .path()
+                    .join(".runner-agent-login/codex/auth.json")
+            }
+
+            fn installed_material(&self) -> Option<Vec<u8>> {
+                fs::read(self.auth_path()).ok()
+            }
+
+            fn codex(&self) -> LoginReadiness {
+                self.recorded_codex().expect("codex readiness")
+            }
+
+            fn recorded_codex(&self) -> Option<LoginReadiness> {
+                ReadinessDocument::load(&readiness_path(
+                    &self.state.path().join("runner-state.json"),
+                ))
+                .expect("read readiness")
+                .and_then(|document| document.login(AgentLoginProvider::Codex).cloned())
+            }
+
+            fn generation(&self) -> Option<u64> {
+                self.codex()
+                    .installation()
+                    .map(|installation| installation.generation)
+            }
+
+            fn setup_records(&self) -> Vec<serde_json::Map<String, serde_json::Value>> {
+                self.capture
+                    .events()
+                    .into_iter()
+                    .filter(|event| event["event.name"] == SETUP_RECORD)
+                    .collect()
+            }
+
+            async fn stop(self) {
+                self.shutdown.notify_one();
+                let _ = with_watchdog(self.task).await;
+            }
+        }
+
+        fn assert_no_material_outside_the_login(service: &SetupService) {
+            let readiness = fs::read_to_string(readiness_path(
+                &service.state.path().join("runner-state.json"),
+            ))
+            .expect("read readiness document");
+            assert!(!readiness.contains(FAKE_AGENT_LOGIN_SENTINEL));
+            let records = serde_json::to_string(&service.capture.records()).unwrap();
+            assert!(!records.contains(FAKE_AGENT_LOGIN_SENTINEL));
+            let spans = format!("{:?}", service.capture.spans());
+            assert!(!spans.contains(FAKE_AGENT_LOGIN_SENTINEL));
+        }
+
+        async fn next_text(
+            outbound: &mut tokio::sync::mpsc::UnboundedReceiver<Message>,
+            message_type: &str,
+        ) -> serde_json::Value {
+            loop {
+                let message = with_watchdog(outbound.recv())
+                    .await
+                    .expect("runner sent nothing")
+                    .expect("runner connection closed");
+                let Message::Text(text) = message else {
+                    continue;
+                };
+                let frame: serde_json::Value = serde_json::from_str(&text).unwrap();
+                if frame["type"] == message_type {
+                    return frame;
+                }
+            }
+        }
+
+        // REQ-AGENTLOGIN-29, REQ-TELEMETRY-45
+        #[tokio::test]
+        async fn starting_installs_an_authorized_login_without_holding_up_the_connection() {
+            let cloud = FakeAgentLoginCloud::new(fake_codex_authorized(1));
+            let status_held = cloud.hold_next_status();
+            let (connector, mut attempts) = scripted_connector(Default::default());
+            let mut service = SetupService::spawn(
+                "ws://127.0.0.1:1/v1/runner/connect",
+                connector,
+                Arc::clone(&cloud),
+            );
+
+            // Cloud has not answered setup, and the runner is connecting.
+            let mut connection = with_watchdog(attempts.recv())
+                .await
+                .expect("the runner did not connect while setup waited")
+                .expect("connection attempt");
+            let hello = next_text(&mut connection.outbound, "hello").await;
+            assert_eq!(hello["type"], "hello");
+            assert_eq!(cloud.status_requests(), 0);
+            drop(status_held);
+            service.pass_ended().await;
+
+            assert_eq!(
+                service.installed_material(),
+                Some(fake_agent_login_material(1))
+            );
+            assert_eq!(
+                fs::metadata(service.auth_path())
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+            assert_eq!(service.codex().state, AgentLoginState::Ready);
+            assert_eq!(service.generation(), Some(1));
+            let records = service.setup_records();
+            assert_eq!(records.len(), 1);
+            assert_eq!(records[0]["um.agent_login.codex.state"], "ready");
+            assert_eq!(records[0]["um.agent_login.codex.generation"], 1);
+            assert_eq!(records[0]["um.outcome"], "success");
+
+            // Five minutes later, with no assignment, setup runs again; it
+            // finds the installed generation and changes nothing.
+            service.next_pass().await;
+            assert_eq!(cloud.status_requests(), 3);
+            assert_eq!(cloud.deliveries(), 1);
+            assert_eq!(service.codex().state, AgentLoginState::Ready);
+            assert_eq!(service.setup_records().len(), 1);
+            assert_no_material_outside_the_login(&service);
+            service.stop().await;
+        }
+
+        // REQ-AGENTLOGIN-29, INV-RUNNER-15
+        #[tokio::test]
+        async fn an_unavailable_cloud_neither_stops_serving_nor_runs_setup_during_an_assignment() {
+            let cloud = FakeAgentLoginCloud::new(Err(CloudFailure::Transport));
+            let (connector, mut attempts) = scripted_connector(Default::default());
+            let mut service = SetupService::spawn(
+                "ws://127.0.0.1:1/v1/runner/connect",
+                connector,
+                Arc::clone(&cloud),
+            );
+            service.pass_ended().await;
+            // Nothing was authorized, so an unanswered Cloud changes nothing
+            // (REQ-AGENTLOGIN-28).
+            assert_eq!(service.recorded_codex(), None);
+            assert!(service.setup_records().is_empty());
+
+            // The runner still connects and serves: it takes an assignment.
+            let mut connection = with_watchdog(attempts.recv())
+                .await
+                .expect("the runner did not connect")
+                .expect("connection attempt");
+            let hello = next_text(&mut connection.outbound, "hello").await;
+            connection.inbound.send(welcome());
+            connection.inbound.send(observation_acknowledgement(
+                hello["messageId"].as_str().unwrap(),
+                hello["sequence"].as_u64().unwrap(),
+            ));
+            connection.inbound.send(assignment_offer());
+            next_text(&mut connection.outbound, "assignment_preparing").await;
+
+            // While it holds the assignment, a setup that falls due does
+            // not run.
+            cloud.answer(fake_codex_authorized(1));
+            service.next_pass().await;
+            assert_eq!(cloud.status_requests(), 1);
+            assert_eq!(cloud.deliveries(), 0);
+            assert_eq!(service.installed_material(), None);
+            assert_eq!(service.recorded_codex(), None);
+            assert!(service.setup_records().is_empty());
+            service.stop().await;
+        }
+
+        // REQ-AGENTLOGIN-30, INV-RUNNER-15, REQ-TELEMETRY-45
+        #[tokio::test]
+        async fn an_ended_login_is_removed_and_an_unrecorded_one_is_the_runners_own() {
+            let cloud = FakeAgentLoginCloud::new(fake_codex_authorized(1));
+            let (connector, _attempts) = scripted_connector(Default::default());
+            let mut service = SetupService::spawn(
+                "ws://127.0.0.1:1/v1/runner/connect",
+                connector,
+                Arc::clone(&cloud),
+            );
+            service.pass_ended().await;
+            assert_eq!(service.generation(), Some(1));
+
+            let ended = [
+                (fake_codex_answer(LoginStatus::Revoked), "revoked"),
+                (
+                    fake_codex_answer(LoginStatus::Unauthorized),
+                    "not_authorized",
+                ),
+                (Ok(Vec::new()), "not_authorized"),
+            ];
+            for (generation, (answer, state)) in (2..).zip(ended) {
+                cloud.answer(answer);
+                service.next_pass().await;
+                assert_eq!(service.installed_material(), None, "{state}");
+                assert_eq!(service.codex().state.as_str(), state);
+                assert_eq!(service.generation(), None);
+                let records = service.setup_records();
+                let last = records.last().unwrap();
+                assert_eq!(last["um.agent_login.codex.state"], state);
+                assert!(last.get("um.agent_login.codex.generation").is_none());
+
+                cloud.answer(fake_codex_authorized(generation));
+                service.next_pass().await;
+                assert_eq!(
+                    service.installed_material(),
+                    Some(fake_agent_login_material(generation))
+                );
+                assert_eq!(service.generation(), Some(generation));
+            }
+
+            // A file in the runner's directory it has no record of is its
+            // own: replaced by a delivery, and removed when the login ends.
+            cloud.answer(Ok(Vec::new()));
+            service.next_pass().await;
+            fs::write(service.auth_path(), b"{\"unrecorded\":true}").unwrap();
+            cloud.answer(fake_codex_authorized(5));
+            service.next_pass().await;
+            assert_eq!(service.codex().state, AgentLoginState::Ready);
+            assert_eq!(
+                service.installed_material(),
+                Some(fake_agent_login_material(5))
+            );
+            cloud.answer(fake_codex_answer(LoginStatus::Revoked));
+            service.next_pass().await;
+            assert_eq!(service.codex().state, AgentLoginState::Revoked);
+            assert_eq!(service.installed_material(), None);
+            assert_eq!(fs::read_dir(service.home.path()).unwrap().count(), 0);
+            assert_no_material_outside_the_login(&service);
+            service.stop().await;
+        }
+
+        // REQ-AGENTLOGIN-30, INV-RUNNER-15
+        #[tokio::test]
+        async fn a_setup_due_during_an_assignment_waits_for_its_release() {
+            let (listener, endpoint) = fixture_listener().await;
+            let (offer_sent, offer) = tokio::sync::oneshot::channel::<()>();
+            let (held_sent, held) = tokio::sync::oneshot::channel();
+            let (release_sent, release) = tokio::sync::oneshot::channel::<()>();
+            let (released_sent, released) = tokio::sync::oneshot::channel();
+            let gateway = tokio::spawn(async move {
+                let mut socket = accept_fixture_socket(&listener).await;
+                let Some(Ok(Message::Text(hello))) = socket.next().await else {
+                    panic!("the runner sent no hello");
+                };
+                let hello: serde_json::Value = serde_json::from_str(&hello).unwrap();
+                socket.send(welcome()).await.unwrap();
+                socket
+                    .send(observation_acknowledgement(
+                        hello["messageId"].as_str().unwrap(),
+                        hello["sequence"].as_u64().unwrap(),
+                    ))
+                    .await
+                    .unwrap();
+                offer.await.unwrap();
+                socket.send(assignment_offer()).await.unwrap();
+                let offered = effect_acknowledgement(&mut socket).await;
+                acknowledge_runner_frame(&mut socket, &offered, "acknowledge offer").await;
+                held_sent.send(()).unwrap();
+                release.await.unwrap();
+                let prepare = begin_assignment_preparation(&mut socket).await;
+                acknowledge_runner_frame(&mut socket, &prepare, "acknowledge prepare").await;
+                let rejection =
+                    next_semantic_assignment_frame(&mut socket, "assignment_rejected", true).await;
+                acknowledge_runner_frame(&mut socket, &rejection, "acknowledge rejection").await;
+                released_sent.send(()).unwrap();
+                while let Some(Ok(_)) = socket.next().await {}
+            });
+            let cloud = FakeAgentLoginCloud::new(fake_codex_authorized(1));
+            let mut service =
+                SetupService::spawn(&endpoint, WebSocketConnector, Arc::clone(&cloud));
+            service.pass_ended().await;
+            assert_eq!(service.generation(), Some(1));
+            offer_sent.send(()).unwrap();
+            with_watchdog(held).await.unwrap().unwrap();
+
+            cloud.answer(fake_codex_answer(LoginStatus::Revoked));
+            service.next_pass().await;
+            assert_eq!(cloud.status_requests(), 2);
+            assert_eq!(
+                service.installed_material(),
+                Some(fake_agent_login_material(1))
+            );
+            assert_eq!(service.codex().state, AgentLoginState::Ready);
+
+            release_sent.send(()).unwrap();
+            with_watchdog(released).await.unwrap().unwrap();
+            // The runner lets the assignment go once its rejection is
+            // acknowledged; the first pass after that removes the login.
+            with_watchdog(async {
+                while cloud.status_requests() == 2 {
+                    service.next_pass().await;
+                }
+            })
+            .await
+            .expect("setup did not run after the assignment was released");
+            assert_eq!(service.installed_material(), None);
+            assert_eq!(service.codex().state, AgentLoginState::Revoked);
+            service.stop().await;
+            gateway.abort();
+        }
     }
 }

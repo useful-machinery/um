@@ -1,3 +1,4 @@
+mod agent_logins;
 mod grants;
 mod identities;
 mod login;
@@ -19,6 +20,8 @@ pub(super) struct Command {
 
 #[derive(Debug, Subcommand)]
 enum AuthCommand {
+    #[command(about = agent_logins::ABOUT)]
+    AgentLogin(agent_logins::Command),
     #[command(about = grants::ABOUT)]
     Grant(grants::Command),
     #[command(about = identities::ABOUT)]
@@ -38,6 +41,7 @@ impl Command {
             Some(AuthCommand::Login(command)) => execute_leaf(command, login::Command::execute),
             Some(AuthCommand::Status(command)) => execute_leaf(command, status::Command::execute),
             Some(AuthCommand::Logout(command)) => execute_leaf(command, logout::Command::execute),
+            Some(AuthCommand::AgentLogin(command)) => command.execute(),
             Some(AuthCommand::Grant(command)) => command.execute(),
             Some(AuthCommand::Identity(command)) => command.execute(),
         }

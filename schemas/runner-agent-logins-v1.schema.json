@@ -1,0 +1,72 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://docs.usefulmachinery.com/schemas/runner-agent-logins-v1.schema.json",
+  "title": "Useful Machinery Runner Agent-Login Readiness V1",
+  "description": "Each provider's readiness on a runner and the record of what the runner installed. It holds no login material.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "updatedAt", "providers"],
+  "$defs": {
+    "installable": {
+      "description": "A coding agent whose login a runner installs. A provider other than claude_code and codex, and its state, are a newer runner's, which an older runner keeps as written.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["provider", "state"],
+      "properties": {
+        "provider": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_]{0,63}$",
+          "not": { "enum": ["github", "gitlab", "linear"] }
+        },
+        "state": { "type": "string", "pattern": "^[a-z][a-z0-9_]{0,63}$" },
+        "agentLoginId": { "type": "string", "pattern": "^agl_[0-7][0-9a-hjkmnp-tv-z]{25}$" },
+        "generation": { "type": "integer", "minimum": 1 },
+        "checkedAt": { "type": "string", "format": "date-time" },
+        "installedAt": { "type": "string", "format": "date-time" },
+        "installedPath": { "type": "string", "pattern": "^/" }
+      },
+      "dependentRequired": {
+        "generation": ["agentLoginId", "installedAt", "installedPath"],
+        "installedAt": ["generation"],
+        "installedPath": ["generation"]
+      },
+      "if": { "properties": { "provider": { "enum": ["claude_code", "codex"] } } },
+      "then": {
+        "properties": {
+          "state": {
+            "enum": [
+              "ready",
+              "not_authorized",
+              "revoked",
+              "foreign_login",
+              "unsupported_target",
+              "stale_generation",
+              "cloud_unavailable",
+              "install_failed"
+            ]
+          }
+        }
+      }
+    },
+    "brokered": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["provider", "state"],
+      "properties": {
+        "provider": { "enum": ["github", "gitlab", "linear"] },
+        "state": { "const": "not_delivered" }
+      }
+    }
+  },
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "updatedAt": { "type": "string", "format": "date-time" },
+    "providers": {
+      "type": "array",
+      "maxItems": 16,
+      "items": {
+        "oneOf": [{ "$ref": "#/$defs/installable" }, { "$ref": "#/$defs/brokered" }]
+      }
+    }
+  }
+}

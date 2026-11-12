@@ -4,7 +4,7 @@ use std::os::unix::fs::PermissionsExt as _;
 use std::panic::Location;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
@@ -22,6 +22,13 @@ use tokio_tungstenite::tungstenite::protocol::CloseFrame;
 use tokio_tungstenite::{WebSocketStream, accept_hdr_async};
 use um_test_support::watchdog::{FIXTURE_WAIT_BASE, WatchdogExpired, host_scaled_timeout};
 
+use crate::agent_login::ServiceEnvironment;
+use crate::agent_login::cloud::{
+    AgentLoginCloud, CloudFailure, Delivery, DeliveryFailure, DeliveryRequest, LoginMaterial,
+    LoginStatus, ProviderLogin, StatusRequest,
+};
+use crate::agent_login::setup::{AssignmentGate, SetupDependencies};
+use crate::control_protocol::AgentLoginProvider;
 use crate::credential::Credential;
 use crate::service::config::{AssignmentConfig, Config, ConfigError, RepositoryUrlPolicy};
 use crate::service::connection::{ConnectionError, FrameSource, run_established_shared};
@@ -29,6 +36,7 @@ pub(crate) use crate::service::lease_clock::fixture_lease_clock;
 use crate::service::{
     ConnectionAttempt, ConnectionFuture, Connector, Shutdown, ShutdownFuture, Sleeper,
 };
+use crate::telemetry::Recorder;
 
 pub(crate) type FixtureSocket = WebSocketStream<TcpStream>;
 
@@ -935,6 +943,177 @@ pub(crate) async fn expect_close_frame(socket: &mut FixtureSocket) -> CloseFrame
             other => panic!("fixture did not receive close: {other:?}"),
         }
     }
+}
+
+/// The agent login the fake Cloud names.
+pub(crate) const FAKE_AGENT_LOGIN_ID: &str = "agl_01k0z6r1w8f4jy2m7q9v3x5abc";
+/// Text in every material the fake Cloud delivers, which no output but the
+/// installed login may hold.
+pub(crate) const FAKE_AGENT_LOGIN_SENTINEL: &str = "agent-login-material-sentinel";
+
+/// The Codex `auth.json` the fake Cloud delivers for `generation`.
+pub(crate) fn fake_agent_login_material(generation: u64) -> Vec<u8> {
+    json!({"tokens": {"access_token": format!("{FAKE_AGENT_LOGIN_SENTINEL}-{generation}")}})
+        .to_string()
+        .into_bytes()
+}
+
+/// Cloud's answer naming the fake agent login for Codex with `status`.
+pub(crate) fn fake_codex_answer(status: LoginStatus) -> Result<Vec<ProviderLogin>, CloudFailure> {
+    Ok(vec![ProviderLogin {
+        provider: AgentLoginProvider::Codex,
+        agent_login_id: FAKE_AGENT_LOGIN_ID.to_owned(),
+        status,
+    }])
+}
+
+/// Cloud's answer authorizing the fake agent login for Codex at `generation`.
+pub(crate) fn fake_codex_authorized(generation: u64) -> Result<Vec<ProviderLogin>, CloudFailure> {
+    fake_codex_answer(LoginStatus::Authorized {
+        generation,
+        record_schema_version: 1,
+    })
+}
+
+/// Cloud's side of agent-login setup for service tests: answers each status
+/// request with what the test last set and delivers the fake material for the
+/// generation asked for, or fails each delivery as the test last set. It
+/// counts both requests.
+pub(crate) struct FakeAgentLoginCloud {
+    answer: Mutex<Result<Vec<ProviderLogin>, CloudFailure>>,
+    delivery_failure: Mutex<Option<CloudFailure>>,
+    held: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+    status_requests: AtomicU64,
+    deliveries: AtomicU64,
+}
+
+impl FakeAgentLoginCloud {
+    pub(crate) fn new(answer: Result<Vec<ProviderLogin>, CloudFailure>) -> Arc<Self> {
+        Arc::new(Self {
+            answer: Mutex::new(answer),
+            delivery_failure: Mutex::new(None),
+            held: Mutex::new(None),
+            status_requests: AtomicU64::new(0),
+            deliveries: AtomicU64::new(0),
+        })
+    }
+
+    /// What later status requests answer.
+    pub(crate) fn answer(&self, answer: Result<Vec<ProviderLogin>, CloudFailure>) {
+        *self.answer.lock().expect("fake Cloud mutex poisoned") = answer;
+    }
+
+    /// How later delivery requests fail; `None` delivers again.
+    pub(crate) fn fail_deliveries(&self, failure: Option<CloudFailure>) {
+        *self
+            .delivery_failure
+            .lock()
+            .expect("fake Cloud mutex poisoned") = failure;
+    }
+
+    /// Makes the next status request wait until the returned sender sends or
+    /// is dropped.
+    pub(crate) fn hold_next_status(&self) -> std::sync::mpsc::SyncSender<()> {
+        let (release, held) = std::sync::mpsc::sync_channel(1);
+        *self.held.lock().expect("fake Cloud mutex poisoned") = Some(held);
+        release
+    }
+
+    pub(crate) fn status_requests(&self) -> u64 {
+        self.status_requests.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn deliveries(&self) -> u64 {
+        self.deliveries.load(Ordering::SeqCst)
+    }
+}
+
+impl AgentLoginCloud for FakeAgentLoginCloud {
+    fn status(&self, _request: &StatusRequest) -> Result<Vec<ProviderLogin>, CloudFailure> {
+        let held = self.held.lock().expect("fake Cloud mutex poisoned").take();
+        if let Some(held) = held {
+            let _ = held.recv();
+        }
+        self.status_requests.fetch_add(1, Ordering::SeqCst);
+        self.answer
+            .lock()
+            .expect("fake Cloud mutex poisoned")
+            .clone()
+    }
+
+    fn follow_credential(&self, _endpoint: &url::Url, _runner_credential: &Credential) {}
+
+    fn delivery(&self, request: &DeliveryRequest) -> Result<Delivery, DeliveryFailure> {
+        self.deliveries.fetch_add(1, Ordering::SeqCst);
+        if let Some(failure) = *self
+            .delivery_failure
+            .lock()
+            .expect("fake Cloud mutex poisoned")
+        {
+            return Err(failure.into());
+        }
+        Ok(Delivery {
+            provider: request.provider,
+            agent_login_id: request.agent_login_id.clone(),
+            generation: request.generation,
+            record_schema_version: 1,
+            material: LoginMaterial::from_bytes(&fake_agent_login_material(request.generation)),
+        })
+    }
+}
+
+/// An assignment gate that is idle for a number of calls and busy after
+/// them, as when an assignment starts while a pass runs.
+pub(crate) struct CountedGate {
+    pub(crate) idle_calls: AtomicUsize,
+}
+
+impl CountedGate {
+    /// A gate that is always idle.
+    pub(crate) fn idle() -> Self {
+        Self {
+            idle_calls: AtomicUsize::new(usize::MAX),
+        }
+    }
+
+    /// A gate that is always busy.
+    pub(crate) fn busy() -> Self {
+        Self {
+            idle_calls: AtomicUsize::new(0),
+        }
+    }
+}
+
+impl AssignmentGate for CountedGate {
+    fn while_idle(&self, change: &mut dyn FnMut()) -> bool {
+        let idle = self
+            .idle_calls
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                left.checked_sub(1)
+            })
+            .is_ok();
+        if idle {
+            change();
+        }
+        idle
+    }
+}
+
+/// Agent-login setup against `cloud` for a service whose `HOME` is `home`
+/// and whose protected state is in `state_directory`.
+pub(crate) fn fake_agent_login_setup(
+    cloud: Arc<FakeAgentLoginCloud>,
+    home: &Path,
+    state_directory: &Path,
+    recorder: Arc<Recorder>,
+) -> SetupDependencies {
+    let home = std::ffi::OsString::from(home);
+    SetupDependencies::new(
+        cloud,
+        ServiceEnvironment::from_lookup(|name| (name == "HOME").then(|| home.clone())),
+        &state_directory.join("runner-state.json"),
+        recorder,
+    )
 }
 
 #[cfg(test)]

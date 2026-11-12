@@ -9,10 +9,10 @@ use reqwest::{StatusCode, Url};
 use super::generated::{apis, models};
 use super::http_client::zeroize_generated_bearer_access_token;
 use super::resource::{
-    ResourceFailure, mutation_request, receive_raw, resource_configuration,
-    validate_json_media_type, validate_mutation_key,
+    ProblemFailure, ProblemRow, ResourceFailure, classify_problem_error, confirmed_delete,
+    expect_problem_status, receive_raw, resource_configuration, validate_json_media_type,
 };
-use super::{HttpTransportPolicy, UnreachableCategory, classify_reqwest_error, problem};
+use super::{HttpTransportPolicy, UnreachableCategory, problem};
 
 pub type Grant = models::ProviderGrant;
 pub type GrantList = models::ProviderGrantList;
@@ -51,16 +51,23 @@ impl GrantFailure {
 }
 
 impl From<ResourceFailure> for GrantFailure {
-    // `receive_raw` fails only as unreachable or as an invalid response.
     fn from(failure: ResourceFailure) -> Self {
-        match failure {
-            ResourceFailure::Unreachable { category } => Self::Unreachable { category },
-            ResourceFailure::InvalidResponse {
-                credential_rejected,
-            } => Self::InvalidResponse {
-                credential_rejected,
-            },
-            _ => invalid(),
+        failure.into_problem_failure()
+    }
+}
+
+impl ProblemFailure for GrantFailure {
+    fn rate_limited(retry_after: Option<u64>) -> Self {
+        Self::RateLimited { retry_after }
+    }
+
+    fn unreachable(category: UnreachableCategory) -> Self {
+        Self::Unreachable { category }
+    }
+
+    fn invalid_response(credential_rejected: bool) -> Self {
+        Self::InvalidResponse {
+            credential_rejected,
         }
     }
 }
@@ -73,7 +80,7 @@ const fn invalid() -> GrantFailure {
 
 /// The problems a grant operation answers, by status and type. Anything else is outside
 /// the contract.
-const PROBLEMS: [(StatusCode, &str, GrantFailure); 10] = [
+const PROBLEMS: [ProblemRow<GrantFailure>; 10] = [
     (
         StatusCode::BAD_REQUEST,
         problem::BAD_REQUEST,
@@ -126,39 +133,8 @@ const PROBLEMS: [(StatusCode, &str, GrantFailure); 10] = [
     ),
 ];
 
-fn classify(status: StatusCode, body: &[u8], retry_after: Option<u64>) -> GrantFailure {
-    if status == StatusCode::TOO_MANY_REQUESTS {
-        return GrantFailure::RateLimited { retry_after };
-    }
-    let kind = problem::decode(body, status)
-        .ok()
-        .map(|problem| problem.r#type);
-    if let Some((_, _, failure)) = PROBLEMS
-        .iter()
-        .find(|(expected, slug, _)| *expected == status && kind.as_deref() == Some(*slug))
-    {
-        return failure.clone();
-    }
-    if status.is_server_error() {
-        return GrantFailure::Unreachable {
-            category: UnreachableCategory::Server,
-        };
-    }
-    GrantFailure::InvalidResponse {
-        credential_rejected: status == StatusCode::UNAUTHORIZED && kind.is_none(),
-    }
-}
-
 fn classify_error<E>(error: apis::Error<E>) -> GrantFailure {
-    match error {
-        apis::Error::Reqwest(error) => GrantFailure::Unreachable {
-            category: classify_reqwest_error(&error),
-        },
-        apis::Error::ResponseError(response) => {
-            classify(response.status, response.content.as_bytes(), None)
-        }
-        apis::Error::Serde(_) | apis::Error::Io(_) => invalid(),
-    }
+    classify_problem_error(error, &PROBLEMS)
 }
 
 pub struct GrantApi {
@@ -223,18 +199,15 @@ impl GrantApi {
             self.configuration.base_path.trim_end_matches('/'),
             apis::urlencode(id)
         );
-        let response = receive_raw(super::generated_api_request(
-            &self.configuration,
-            reqwest::Method::GET,
-            &endpoint,
-        ))?;
-        if response.status != StatusCode::OK {
-            return Err(classify(
-                response.status,
-                &response.body,
-                response.retry_after,
-            ));
-        }
+        let response = expect_problem_status(
+            receive_raw(super::generated_api_request(
+                &self.configuration,
+                reqwest::Method::GET,
+                &endpoint,
+            ))?,
+            StatusCode::OK,
+            &PROBLEMS,
+        )?;
         validate_json_media_type(&response.headers)?;
         let session = serde_json::from_slice(&response.body).map_err(|_| invalid())?;
         validate_session(session, Some(id))
@@ -268,29 +241,13 @@ impl GrantApi {
         Ok(page)
     }
 
-    // The generated DELETE accepts any 2xx and drops its headers; the contract's answer is
-    // 204 echoing this request's key.
     pub fn revoke(&self, grant_id: &str, key: &str) -> Result<(), GrantFailure> {
         let endpoint = format!(
             "{}/v1/me/grants/{}",
             self.configuration.base_path.trim_end_matches('/'),
             apis::urlencode(grant_id)
         );
-        let response = receive_raw(mutation_request(
-            &self.configuration,
-            reqwest::Method::DELETE,
-            &endpoint,
-            key,
-        ))?;
-        if response.status != StatusCode::NO_CONTENT {
-            return Err(classify(
-                response.status,
-                &response.body,
-                response.retry_after,
-            ));
-        }
-        validate_mutation_key(&response.headers, key)?;
-        Ok(())
+        confirmed_delete(&self.configuration, &endpoint, key, &PROBLEMS)
     }
 }
 
@@ -384,6 +341,7 @@ impl std::error::Error for GrantApiError {}
 )]
 mod tests {
     use super::*;
+    use crate::resource::classify_problem;
     use um_test_support::ScriptedHttpServer;
 
     fn observe(response: &str) -> Result<GrantSession, GrantFailure> {
@@ -431,7 +389,12 @@ mod tests {
         ] {
             let body = serde_json::json!({"type": slug, "title": "Conflict", "status": 409});
             assert_eq!(
-                classify(StatusCode::CONFLICT, body.to_string().as_bytes(), None),
+                classify_problem(
+                    StatusCode::CONFLICT,
+                    body.to_string().as_bytes(),
+                    None,
+                    &PROBLEMS
+                ),
                 want,
                 "{slug}"
             );

@@ -26,6 +26,8 @@ const DIRECTORY_MODE: u32 = 0o700;
 const FILE_MODE: u32 = 0o600;
 const JOURNAL_FILE: &str = ".runner-enrollment.json";
 const LOCK_FILE: &str = ".runner-state.lock";
+/// The temporary files of the runner's protected host documents.
+const STATE_TEMPORARY_PREFIX: &str = ".runner-state.tmp";
 const LOCK_TIMEOUT: Duration = Duration::from_secs(5);
 const LOCK_RETRY: Duration = Duration::from_millis(25);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
@@ -609,6 +611,12 @@ pub fn load_control_socket_path(path: &Path) -> Result<PathBuf, EnrollmentError>
     Ok(load_operator_config(path)?.control_socket_path)
 }
 
+/// The protected state path, `runnerStatePath`, from the operator
+/// configuration, read without taking the state lock or reading the state.
+pub(crate) fn load_runner_state_path(path: &Path) -> Result<PathBuf, EnrollmentError> {
+    Ok(load_operator_config(path)?.runner_state_path)
+}
+
 pub fn replacement_disposition(
     config_path: &Path,
     expected_runner_id: &str,
@@ -650,6 +658,11 @@ fn load_locked_runner_state(
 }
 
 impl RunnerStateAccess {
+    /// The protected state file, `runnerStatePath`.
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
     pub(crate) fn load_pending(
         &self,
         expected_runner_id: &str,
@@ -1140,30 +1153,130 @@ fn valid_terminal_receipt(receipt: &TerminalReceipt) -> bool {
         && parse_rfc3339(&receipt.observed_at).is_some()
 }
 
-fn atomic_write_json(path: &Path, value: &impl Serialize) -> Result<(), EnrollmentError> {
-    let mut bytes = serde_json::to_vec_pretty(value).map_err(|_| EnrollmentError::StateWrite)?;
+/// Writes one of the runner's protected host documents beside its state.
+pub(crate) fn atomic_write_json(
+    path: &Path,
+    value: &impl Serialize,
+) -> Result<(), EnrollmentError> {
+    let bytes = json_document(value).map_err(|_| EnrollmentError::StateWrite)?;
+    write_private_file_atomically(
+        path,
+        &bytes,
+        STATE_TEMPORARY_PREFIX,
+        ensure_destination_safe,
+        |_| EnrollmentError::StateWrite,
+    )
+}
+
+/// `atomic_write_json` through temporary files named from
+/// `temporary_prefix`, answering the I/O error that stopped it, for a caller
+/// that classifies it: a destination that is not a private file of the
+/// effective user is `PermissionDenied`, a value that cannot be encoded
+/// `InvalidData`.
+pub(crate) fn write_private_json(
+    path: &Path,
+    value: &impl Serialize,
+    temporary_prefix: &str,
+) -> io::Result<()> {
+    let bytes = json_document(value)?;
+    write_private_file_atomically(
+        path,
+        &bytes,
+        temporary_prefix,
+        ensure_private_destination,
+        |error| error,
+    )
+}
+
+fn json_document(value: &impl Serialize) -> serde_json::Result<Vec<u8>> {
+    let mut bytes = serde_json::to_vec_pretty(value)?;
     bytes.push(b'\n');
-    let parent = path.parent().ok_or(EnrollmentError::StateWrite)?;
-    ensure_destination_safe(path)?;
+    Ok(bytes)
+}
+
+/// Replaces `path` with `bytes` in one step, the private-file write the
+/// runner's state documents and an installed agent login share: a new `0600`
+/// temporary file in the same directory, created without following a
+/// symbolic link and named from `temporary_prefix`, is written and synced,
+/// `check_destination` is asked again about the destination, and the file is
+/// renamed over it and the directory synced. `check_destination` is asked
+/// once before the temporary file exists as well. A failure at any step
+/// removes the temporary file, so the destination keeps its earlier content
+/// whole; an I/O failure is reported as `write_failure(error)`, a path
+/// without a parent as `InvalidInput`.
+pub(crate) fn write_private_file_atomically<E>(
+    path: &Path,
+    bytes: &[u8],
+    temporary_prefix: &str,
+    check_destination: impl Fn(&Path) -> Result<(), E>,
+    write_failure: impl Fn(io::Error) -> E,
+) -> Result<(), E> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| write_failure(io::ErrorKind::InvalidInput.into()))?;
+    check_destination(path)?;
     let sequence = TEMPORARY_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     let temporary = parent.join(format!(
-        ".runner-state.tmp.{}.{sequence}",
+        "{temporary_prefix}.{}.{sequence}",
         std::process::id()
     ));
-    let mut file = create_new_private_file(&temporary).map_err(|_| EnrollmentError::StateWrite)?;
+    let mut file = create_new_private_file(&temporary).map_err(&write_failure)?;
     let result = (|| {
-        file.write_all(&bytes)
+        file.write_all(bytes)
             .and_then(|()| file.sync_all())
-            .map_err(|_| EnrollmentError::StateWrite)?;
+            .map_err(&write_failure)?;
         drop(file);
-        ensure_destination_safe(path)?;
-        fs::rename(&temporary, path).map_err(|_| EnrollmentError::StateWrite)?;
-        sync_directory(parent)
+        check_destination(path)?;
+        fs::rename(&temporary, path).map_err(&write_failure)?;
+        sync_directory_io(parent).map_err(&write_failure)
     })();
     if result.is_err() {
         let _ = fs::remove_file(&temporary);
     }
     result
+}
+
+/// Removes from `directory` the temporary files that writes through
+/// `write_private_file_atomically` with one of `prefixes` left when their
+/// process was killed between creating the file and the rename: each regular
+/// file of the effective user named `<prefix>.<pid>.<sequence>`. A link is
+/// never followed or removed, and nothing else is touched. For a caller that
+/// is the only writer with those prefixes, while it writes nothing; a file
+/// that cannot be removed is left for its next call.
+pub(crate) fn remove_leftover_temporary_files(directory: &Path, prefixes: &[&str]) {
+    let Ok(entries) = fs::read_dir(directory) else {
+        return;
+    };
+    let owner = rustix::process::geteuid().as_raw();
+    let mut removed = false;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let leftover = name
+            .to_str()
+            .is_some_and(|name| prefixes.iter().any(|prefix| temporary_of(name, prefix)));
+        // `DirEntry::metadata` does not follow a link.
+        if leftover
+            && entry
+                .metadata()
+                .is_ok_and(|metadata| metadata.file_type().is_file() && metadata.uid() == owner)
+            && fs::remove_file(entry.path()).is_ok()
+        {
+            removed = true;
+        }
+    }
+    if removed {
+        let _ = sync_directory_io(directory);
+    }
+}
+
+/// Whether `name` is a temporary file name `write_private_file_atomically`
+/// makes from `prefix`.
+fn temporary_of(name: &str, prefix: &str) -> bool {
+    let digits = |part: &str| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit());
+    name.strip_prefix(prefix)
+        .and_then(|rest| rest.strip_prefix('.'))
+        .and_then(|rest| rest.split_once('.'))
+        .is_some_and(|(pid, sequence)| digits(pid) && digits(sequence))
 }
 
 fn remove_and_sync(path: &Path) -> Result<(), EnrollmentError> {
@@ -1173,9 +1286,11 @@ fn remove_and_sync(path: &Path) -> Result<(), EnrollmentError> {
 }
 
 fn sync_directory(path: &Path) -> Result<(), EnrollmentError> {
-    File::open(path)
-        .and_then(|directory| directory.sync_all())
-        .map_err(|_| EnrollmentError::StateWrite)
+    sync_directory_io(path).map_err(|_| EnrollmentError::StateWrite)
+}
+
+pub(crate) fn sync_directory_io(path: &Path) -> io::Result<()> {
+    File::open(path).and_then(|directory| directory.sync_all())
 }
 
 fn acquire_state_lock(path: &Path) -> Result<StateLock, EnrollmentError> {
@@ -1246,16 +1361,57 @@ fn validate_private_directory(metadata: &Metadata) -> Result<(), EnrollmentError
 }
 
 fn validate_private_file(metadata: &Metadata) -> Result<(), EnrollmentError> {
+    private_file(metadata).map_err(EnrollmentError::from)
+}
+
+fn private_file(metadata: &Metadata) -> Result<(), PrivateFileFailure> {
     if !metadata.file_type().is_file()
         || metadata.uid() != rustix::process::geteuid().as_raw()
         || metadata.mode() & 0o7777 != FILE_MODE
         || metadata.nlink() != 1
     {
-        return Err(EnrollmentError::UnsafePath(
+        return Err(PrivateFileFailure::refused(
             "runner state file must be owned by the current user with mode 0600",
+            io::ErrorKind::PermissionDenied,
         ));
     }
     Ok(())
+}
+
+/// A read or check of one of the runner's private files that failed: the
+/// requirement enrollment reports, and the I/O error beneath it that the
+/// agent-login readiness record classifies. A file that is not a private
+/// regular file of the effective user is `PermissionDenied`; one over its
+/// size bound is `InvalidData`.
+#[derive(Debug)]
+pub(crate) struct PrivateFileFailure {
+    requirement: &'static str,
+    error: io::Error,
+}
+
+impl PrivateFileFailure {
+    /// The failure of an I/O call that stopped the read, which enrollment
+    /// reports as `requirement`.
+    fn new(requirement: &'static str) -> impl FnOnce(io::Error) -> Self {
+        move |error| Self { requirement, error }
+    }
+
+    /// A file the runner refuses to read, as an error of `kind`.
+    fn refused(requirement: &'static str, kind: io::ErrorKind) -> Self {
+        Self::new(requirement)(kind.into())
+    }
+}
+
+impl From<PrivateFileFailure> for EnrollmentError {
+    fn from(failure: PrivateFileFailure) -> Self {
+        Self::UnsafePath(failure.requirement)
+    }
+}
+
+impl From<PrivateFileFailure> for io::Error {
+    fn from(failure: PrivateFileFailure) -> Self {
+        failure.error
+    }
 }
 
 // Enrollment state and human OAuth storage intentionally translate the same
@@ -1299,19 +1455,38 @@ fn ensure_destination_safe(path: &Path) -> Result<(), EnrollmentError> {
     }
 }
 
-fn read_private_file_if_present(
+fn ensure_private_destination(path: &Path) -> io::Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => private_file(&metadata).map_err(io::Error::from),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+/// Reads one of the runner's protected host documents, `None` when it is
+/// absent.
+pub(crate) fn read_private_file_if_present(
     path: &Path,
     limit: u64,
 ) -> Result<Option<Vec<u8>>, EnrollmentError> {
+    read_private_document(path, limit).map_err(EnrollmentError::from)
+}
+
+/// `read_private_file_if_present` keeping the I/O error beneath a failure,
+/// for a caller that classifies it.
+pub(crate) fn read_private_document(
+    path: &Path,
+    limit: u64,
+) -> Result<Option<Vec<u8>>, PrivateFileFailure> {
     match fs::symlink_metadata(path) {
         Ok(metadata) => {
-            validate_private_file(&metadata)?;
+            private_file(&metadata)?;
             let bytes = read_bounded_regular_file(path, limit, true)?;
             Ok(Some(bytes))
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(_) => Err(EnrollmentError::UnsafePath(
-            "cannot inspect runner state file",
+        Err(error) => Err(PrivateFileFailure::new("cannot inspect runner state file")(
+            error,
         )),
     }
 }
@@ -1320,40 +1495,47 @@ fn read_bounded_regular_file(
     path: &Path,
     limit: u64,
     private: bool,
-) -> Result<Vec<u8>, EnrollmentError> {
-    let metadata = fs::symlink_metadata(path)
-        .map_err(|_| EnrollmentError::UnsafePath("cannot inspect input file"))?;
+) -> Result<Vec<u8>, PrivateFileFailure> {
+    const OVER_LIMIT: &str = "input file exceeds its size limit";
+    let metadata =
+        fs::symlink_metadata(path).map_err(PrivateFileFailure::new("cannot inspect input file"))?;
     if !metadata.file_type().is_file() {
-        return Err(EnrollmentError::UnsafePath(
+        return Err(PrivateFileFailure::refused(
             "input must be a regular non-symbolic-link file",
+            io::ErrorKind::PermissionDenied,
         ));
     }
     if private {
-        validate_private_file(&metadata)?;
+        private_file(&metadata)?;
     }
     if metadata.len() > limit {
-        return Err(EnrollmentError::UnsafePath(
-            "input file exceeds its size limit",
+        return Err(PrivateFileFailure::refused(
+            OVER_LIMIT,
+            io::ErrorKind::InvalidData,
         ));
     }
     let file = OpenOptions::new()
         .read(true)
         .custom_flags(NOFOLLOW_FLAG)
         .open(path)
-        .map_err(|_| EnrollmentError::UnsafePath("cannot open input file"))?;
+        .map_err(PrivateFileFailure::new("cannot open input file"))?;
     let opened = file
         .metadata()
-        .map_err(|_| EnrollmentError::UnsafePath("cannot inspect opened input file"))?;
-    if !opened.file_type().is_file() || private && validate_private_file(&opened).is_err() {
-        return Err(EnrollmentError::UnsafePath("opened input file is unsafe"));
+        .map_err(PrivateFileFailure::new("cannot inspect opened input file"))?;
+    if !opened.file_type().is_file() || private && private_file(&opened).is_err() {
+        return Err(PrivateFileFailure::refused(
+            "opened input file is unsafe",
+            io::ErrorKind::PermissionDenied,
+        ));
     }
     let mut bytes = Vec::new();
     file.take(limit + 1)
         .read_to_end(&mut bytes)
-        .map_err(|_| EnrollmentError::UnsafePath("cannot read input file"))?;
+        .map_err(PrivateFileFailure::new("cannot read input file"))?;
     if bytes.len() as u64 > limit {
-        return Err(EnrollmentError::UnsafePath(
-            "input file exceeds its size limit",
+        return Err(PrivateFileFailure::refused(
+            OVER_LIMIT,
+            io::ErrorKind::InvalidData,
         ));
     }
     Ok(bytes)
@@ -1366,7 +1548,7 @@ fn valid_secret(value: &str) -> bool {
             .is_ok_and(|decoded| decoded.len() == 32)
 }
 
-fn parse_rfc3339(value: &str) -> Option<time::OffsetDateTime> {
+pub(crate) fn parse_rfc3339(value: &str) -> Option<time::OffsetDateTime> {
     time::OffsetDateTime::parse(value, &Rfc3339).ok()
 }
 

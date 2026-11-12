@@ -1,6 +1,5 @@
-use std::fs::{self, OpenOptions};
+use std::fs::OpenOptions;
 use std::io::{self, BufRead, BufReader, Read, Write};
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, anyhow, bail};
@@ -13,6 +12,7 @@ use um_api::{
 use um_human_auth::Deployment;
 use zeroize::Zeroizing;
 
+use super::super::secret_file::{SecretInput, trim_line_ending};
 use super::NAME;
 type Options =
     super::super::CommonArgs<super::super::GitlabJson, super::super::PrincipalAuthenticationArgs>;
@@ -943,55 +943,15 @@ fn review_identity(shown: &Value) -> anyhow::Result<String> {
     Ok(user.to_owned())
 }
 
-fn validate_token_file(metadata: &fs::Metadata, uid: u32) -> anyhow::Result<()> {
-    if !metadata.file_type().is_file() || metadata.uid() != uid || metadata.mode() & 0o7777 != 0o600
-    {
-        bail!("GitLab token file must be a regular non-symlink file owned by you with mode 0600");
-    }
-    if metadata.len() > MAX_TOKEN + 2 {
-        bail!("GitLab token file exceeds 16 KiB");
-    }
-    Ok(())
-}
+const TOKEN_INPUT: SecretInput = SecretInput {
+    name: "GitLab token",
+    max_bytes: MAX_TOKEN + 2,
+    max_text: "16 KiB",
+};
 
 fn read_token(path: &Path) -> anyhow::Result<Zeroizing<String>> {
-    let mut bytes = Zeroizing::new(Vec::new());
-    if path == Path::new("-") {
-        io::stdin()
-            .lock()
-            .take(MAX_TOKEN + 3)
-            .read_to_end(&mut bytes)
-            .context("read GitLab token from standard input")?;
-    } else {
-        let uid = rustix::process::geteuid().as_raw();
-        validate_token_file(
-            &fs::symlink_metadata(path).context("inspect GitLab token file")?,
-            uid,
-        )?;
-        let file = OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(path)
-            .context("open GitLab token file")?;
-        validate_token_file(
-            &file
-                .metadata()
-                .context("inspect opened GitLab token file")?,
-            uid,
-        )?;
-        file.take(MAX_TOKEN + 3)
-            .read_to_end(&mut bytes)
-            .context("read GitLab token file")?;
-    }
-    if bytes.len() as u64 > MAX_TOKEN + 2 {
-        bail!("GitLab token input exceeds 16 KiB");
-    }
-    if bytes.last() == Some(&b'\n') {
-        bytes.pop();
-        if bytes.last() == Some(&b'\r') {
-            bytes.pop();
-        }
-    }
+    let mut bytes = TOKEN_INPUT.read(path)?;
+    trim_line_ending(&mut bytes);
     if bytes.is_empty() || bytes.len() as u64 > MAX_TOKEN {
         bail!("GitLab token must contain 1–16384 UTF-8 bytes");
     }
@@ -1005,7 +965,8 @@ fn read_token(path: &Path) -> anyhow::Result<Zeroizing<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::PermissionsExt;
+    use std::fs;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
     #[test]
     fn private_token_file_rejects_a_different_owner() -> anyhow::Result<()> {
@@ -1014,8 +975,12 @@ mod tests {
         fs::write(&path, b"fixture")?;
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
         let metadata = fs::symlink_metadata(path)?;
-        assert!(validate_token_file(&metadata, metadata.uid()).is_ok());
-        assert!(validate_token_file(&metadata, metadata.uid().wrapping_add(1)).is_err());
+        assert!(TOKEN_INPUT.validate(&metadata, metadata.uid()).is_ok());
+        assert!(
+            TOKEN_INPUT
+                .validate(&metadata, metadata.uid().wrapping_add(1))
+                .is_err()
+        );
         Ok(())
     }
 }

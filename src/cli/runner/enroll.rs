@@ -232,6 +232,7 @@ impl PromotionFailure {
             Self::RunnerServeUnreachable => "runner_serve_unreachable",
             Self::Control(ControlError::InvalidRequest) => "invalid_request",
             Self::Control(ControlError::UnsupportedVersion) => "unsupported_version",
+            Self::Control(ControlError::RunnerBusy) => "runner_busy",
             Self::Control(ControlError::NoPendingCredential) => "no_pending_credential",
             Self::Control(ControlError::PendingRegistrationMismatch) => {
                 "pending_registration_mismatch"
@@ -252,7 +253,11 @@ impl PromotionFailure {
             Self::RunnerServeUnreachable | Self::Control(ControlError::PendingConnectionFailed) => {
                 OutcomeClass::Unreachable
             }
-            Self::Control(ControlError::InvalidRequest | ControlError::UnsupportedVersion)
+            Self::Control(
+                ControlError::InvalidRequest
+                | ControlError::UnsupportedVersion
+                | ControlError::RunnerBusy,
+            )
             | Self::Control(ControlError::PendingProtocolFailed)
             | Self::InvalidControlResponse => OutcomeClass::Protocol,
             Self::Control(_) | Self::StateUnavailable => OutcomeClass::GeneralFailure,
@@ -270,6 +275,7 @@ impl PromotionFailure {
             Self::Control(ControlError::PendingProtocolFailed)
             | Self::Control(ControlError::UnsupportedVersion)
             | Self::Control(ControlError::InvalidRequest)
+            | Self::Control(ControlError::RunnerBusy)
             | Self::InvalidControlResponse => {
                 "Verify that the CLI and Runner Serve versions agree, then rerun the replacement enrollment with the same protected activation file."
             }
@@ -301,7 +307,8 @@ fn promote_replacement(
         Ok(Response::Error(error)) => {
             PromotionOutcome::Incomplete(PromotionFailure::Control(error))
         }
-        Ok(Response::Reloaded { .. } | Response::Status(_)) | Err(RequestFailure::Protocol(_)) => {
+        Ok(Response::Reloaded { .. } | Response::Status(_) | Response::AgentLoginsSynced(_))
+        | Err(RequestFailure::Protocol(_)) => {
             PromotionOutcome::Incomplete(PromotionFailure::InvalidControlResponse)
         }
         Err(RequestFailure::NotReachable) => {

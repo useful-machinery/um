@@ -26,6 +26,8 @@ mod account_deletion;
 mod account_signup;
 #[path = "cli/account_update.rs"]
 mod account_update;
+#[path = "cli/agent_logins.rs"]
+mod agent_logins;
 use api_test_support::read_request;
 use um_test_support as api_test_support;
 #[path = "cli/artifact_remote.rs"]
@@ -70,6 +72,8 @@ mod recovery;
 mod run_command;
 #[path = "cli/runner_administration.rs"]
 mod runner_administration;
+#[path = "cli/runner_agent_login.rs"]
+mod runner_agent_login;
 #[path = "cli/runner_enrollment.rs"]
 mod runner_enrollment;
 #[path = "cli/runner_status.rs"]
@@ -2060,7 +2064,7 @@ fn runner_doctor_lists_registered_checks_without_running_git() {
     assert!(output.status.success());
     assert_eq!(
         output.stdout,
-        b"environment.command.git\nexecution.harness.pi-json-v1\nexecution.harness.claude-code-stream-json-v1\nexecution.harness.codex-app-server-v1\n"
+        b"environment.command.git\nexecution.harness.pi-json-v1\nexecution.harness.claude-code-stream-json-v1\nexecution.harness.codex-app-server-v1\ncredentials.agent-logins\n"
     );
     assert!(output.stderr.is_empty());
 }
@@ -2196,6 +2200,72 @@ fn runner_doctor_does_not_load_human_configuration() {
     assert!(output.status.success());
     assert!(!output.stdout.is_empty());
     assert!(output.stderr.is_empty());
+}
+
+fn record_codex_readiness(directory: &tempfile::TempDir, state: &str) {
+    let path = directory.path().join(".runner-agent-logins.json");
+    fs::write(
+        &path,
+        serde_json::to_vec(&serde_json::json!({
+            "schemaVersion": 1,
+            "updatedAt": "2026-11-12T01:00:00Z",
+            "providers": [
+                {"provider": "codex", "state": state},
+                {"provider": "github", "state": "not_delivered"},
+                {"provider": "gitlab", "state": "not_delivered"},
+                {"provider": "linear", "state": "not_delivered"},
+            ],
+        }))
+        .expect("encode readiness document"),
+    )
+    .expect("write readiness document");
+    fs::set_permissions(&path, Permissions::from_mode(0o600)).expect("protect readiness document");
+}
+
+// REQ-RUNNERENROLL-86
+#[test]
+fn runner_doctor_agent_logins_check_reads_the_recorded_readiness() {
+    let runner_directory = private_credential_directory();
+    let config_path = write_runner_config(
+        &runner_directory,
+        "https://not-a-websocket.example.test/v1/runner/connect",
+    );
+    let check = ["runner", "doctor", "--check", "credentials.agent-logins"];
+
+    let without_config = run(&check);
+    assert_eq!(without_config.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&without_config.stdout).contains("config_required"));
+
+    let with_config = [check.as_slice(), &["--config", &config_path]].concat();
+    let unknown = run(&with_config);
+    assert_eq!(unknown.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&unknown.stdout).contains("readiness_unknown"));
+
+    record_codex_readiness(&runner_directory, "foreign_login");
+    let failed = run(&with_config);
+    assert_eq!(failed.status.code(), Some(1));
+    let stdout = String::from_utf8_lossy(&failed.stdout);
+    assert!(stdout.contains("code: foreign_login"), "{stdout}");
+    assert!(failed.stderr.is_empty());
+
+    let json = run(&[with_config.as_slice(), &["--json"]].concat());
+    assert_eq!(json.status.code(), Some(1));
+    let report: serde_json::Value =
+        serde_json::from_slice(&json.stdout).expect("runner doctor report should be JSON");
+    assert_eq!(report["checks"][0]["id"], "credentials.agent-logins");
+    assert_eq!(report["checks"][0]["status"], "fail");
+    assert_eq!(report["checks"][0]["code"], "foreign_login");
+    assert_eq!(report["checks"][0]["details"]["provider"], "codex");
+    assert_eq!(
+        report["summary"],
+        serde_json::json!({"passed": 0, "failed": 1})
+    );
+
+    record_codex_readiness(&runner_directory, "ready");
+    let passed = run(&with_config);
+    assert!(passed.status.success());
+    // The check never reads the runner state, so its credential cannot reach the report.
+    assert!(!String::from_utf8_lossy(&passed.stdout).contains("AAAAAAAAAAAAAAAA"));
 }
 
 #[test]

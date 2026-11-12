@@ -46,6 +46,7 @@ use um_runner_protocol::{
 use um_test_support::watchdog::{FIXTURE_WAIT_BASE, host_scaled_recv};
 
 const NOW: &str = "2026-07-23T00:00:00Z";
+mod agent_login_overlay_tests;
 mod artifact_delivery_tests;
 mod git_continuation_tests;
 mod gitlab_execution;

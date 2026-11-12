@@ -9,7 +9,10 @@ use futures_util::{SinkExt, StreamExt};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::http::{HeaderValue, header};
 
-fn write_status_config(directory: &tempfile::TempDir, socket_path: &std::path::Path) -> String {
+pub(super) fn write_status_config(
+    directory: &tempfile::TempDir,
+    socket_path: &std::path::Path,
+) -> String {
     let config = directory.path().join("runner.json");
     fs::write(
         &config,
@@ -26,14 +29,14 @@ fn write_status_config(directory: &tempfile::TempDir, socket_path: &std::path::P
     config.to_string_lossy().into_owned()
 }
 
-struct ServeStatusFixture {
-    _root: tempfile::TempDir,
+pub(super) struct ServeStatusFixture {
+    root: tempfile::TempDir,
     _runtime: tempfile::TempDir,
-    config: String,
+    pub(super) config: String,
 }
 
 impl ServeStatusFixture {
-    fn new(endpoint: &str) -> Self {
+    pub(super) fn new(endpoint: &str) -> Self {
         Self::new_inner(endpoint, false)
     }
 
@@ -98,14 +101,20 @@ impl ServeStatusFixture {
         )
         .unwrap();
         Self {
-            _root: root,
+            root,
             _runtime: runtime,
             config: config_path.to_string_lossy().into_owned(),
         }
     }
+
+    /// The directory of `runnerStatePath`, where the runner keeps its
+    /// readiness document.
+    pub(super) fn state_directory(&self) -> std::path::PathBuf {
+        self.root.path().join("state")
+    }
 }
 
-fn cloud_welcome() -> Message {
+pub(super) fn cloud_welcome() -> Message {
     Message::Text(
         serde_json::json!({
             "protocolVersion": 1,
@@ -133,7 +142,7 @@ fn cloud_welcome() -> Message {
     )
 }
 
-fn cloud_observation_ack(message_id: &str, sequence: u64) -> Message {
+pub(super) fn cloud_observation_ack(message_id: &str, sequence: u64) -> Message {
     Message::Text(
         serde_json::json!({
             "protocolVersion": 1,
@@ -222,11 +231,65 @@ fn cloud_assignment_offer_with_mismatched_sources() -> Message {
     )
 }
 
+const AGENT_LOGIN_REQUEST: &[u8] = b"POST /v1/runner/agent-logins/";
+
+/// The next connection of the serving runner other than its agent-login
+/// setup, which shares the endpoint's host and port: this fake gateway has
+/// no agent-login routes and answers those requests 404, as a Cloud without
+/// them would.
+fn accept_runner_request(listener: &TcpListener) -> std::net::TcpStream {
+    loop {
+        let (mut stream, _) = listener.accept().unwrap();
+        let request = read_request(&mut stream);
+        if !request.starts_with(AGENT_LOGIN_REQUEST) {
+            return stream;
+        }
+        let _ = stream.write_all(&http_response("404 Not Found", None, b""));
+    }
+}
+
+/// `accept_runner_request` on an async listener, leaving the request unread.
+async fn accept_runner_connection(listener: &tokio::net::TcpListener) -> tokio::net::TcpStream {
+    accept_runner_connection_answering(listener, &|_request: &[u8]| {
+        http_response("404 Not Found", None, b"")
+    })
+    .await
+}
+
+/// `accept_runner_connection` for a fake gateway that has agent-login
+/// routes: `agent_logins` is given each agent-login request it read, head
+/// and body, and returns the whole HTTP answer.
+pub(super) async fn accept_runner_connection_answering(
+    listener: &tokio::net::TcpListener,
+    agent_logins: &dyn Fn(&[u8]) -> Vec<u8>,
+) -> tokio::net::TcpStream {
+    loop {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut start = [0_u8; AGENT_LOGIN_REQUEST.len()];
+        let mut peeked = 0;
+        while peeked < start.len() {
+            peeked = stream.peek(&mut start).await.unwrap();
+            if peeked == 0 || !AGENT_LOGIN_REQUEST.starts_with(&start[..peeked]) {
+                break;
+            }
+        }
+        if start != AGENT_LOGIN_REQUEST {
+            return stream;
+        }
+        // The runner sends each short request whole, so reading it blocks
+        // this fake only briefly.
+        let mut stream = stream.into_std().unwrap();
+        stream.set_nonblocking(false).unwrap();
+        let request = read_request(&mut stream);
+        let _ = stream.write_all(&agent_logins(&request));
+    }
+}
+
 #[allow(
     clippy::result_large_err,
     reason = "tungstenite's handshake callback requires its large error type"
 )]
-async fn accept_runner_socket(
+pub(super) async fn accept_runner_socket(
     stream: tokio::net::TcpStream,
 ) -> tokio_tungstenite::WebSocketStream<tokio::net::TcpStream> {
     tokio_tungstenite::accept_hdr_async(
@@ -244,7 +307,9 @@ async fn accept_runner_socket(
     .unwrap()
 }
 
-// REQ-RUNNERENROLL-41, REQ-RUNNERENROLL-42, REQ-RUNNERENROLL-80
+// REQ-RUNNERENROLL-41, REQ-RUNNERENROLL-42, REQ-RUNNERENROLL-80: a status
+// without readiness, as from a runner that has set up nothing, prints no
+// agent-login line.
 #[test]
 fn runner_status_queries_only_the_configured_local_socket() {
     let directory = private_credential_directory();
@@ -300,8 +365,7 @@ fn terminal_authentication_remains_locally_inspectable() {
     let (request_seen, request_received) = mpsc::sync_channel(1);
     let (response_release, response_released) = mpsc::sync_channel(1);
     let server = thread::spawn(move || {
-        let (mut stream, _) = listener.accept().unwrap();
-        let _ = read_request(&mut stream);
+        let mut stream = accept_runner_request(&listener);
         request_seen.send(()).unwrap();
         response_released.recv().unwrap();
         stream
@@ -418,8 +482,8 @@ fn pending_handshake_preserves_contiguous_current_boot_sequences() {
             .unwrap()
             .block_on(async move {
                 let listener = tokio::net::TcpListener::from_std(listener).unwrap();
-                let (stream, _) = listener.accept().await.unwrap();
-                let mut current = accept_runner_socket(stream).await;
+                let mut current =
+                    accept_runner_socket(accept_runner_connection(&listener).await).await;
                 let Some(Ok(Message::Text(current_hello))) = current.next().await else {
                     panic!("current connection omitted hello");
                 };
@@ -436,7 +500,7 @@ fn pending_handshake_preserves_contiguous_current_boot_sequences() {
 
                 // Hold the pending HTTP upgrade so any current-session frames
                 // must remain contiguous before the candidate hello is sent.
-                let (pending_stream, _) = listener.accept().await.unwrap();
+                let pending_stream = accept_runner_connection(&listener).await;
                 // Keep this sequencing proof independent of source-provider I/O. A
                 // mismatched identity pair produces a synchronous structured rejection
                 // while the candidate handshake remains deliberately blocked.
@@ -514,6 +578,31 @@ fn run_status_with_response(response: &'static [u8]) -> Output {
 
     server.join().unwrap();
     output
+}
+
+// REQ-RUNNERENROLL-42
+#[test]
+fn runner_status_prints_each_provider_readiness_once_the_runner_has_set_up() {
+    let output = run_status_with_response(
+        b"{\"schemaVersion\":1,\"outcome\":\"ok\",\"status\":{\"processState\":\"running\",\"bootId\":\"rbt_01k0z6r1w8f4jy2m7q9v3x5abc\",\"uptimeMilliseconds\":10000,\"connectionState\":\"connected\",\"assignmentCounts\":{\"preparing\":0,\"accepted\":0,\"running\":0,\"finishing\":0,\"reporting\":0},\"agentLogins\":{\"updatedAt\":\"2026-11-12T01:00:00Z\",\"providers\":[{\"provider\":\"codex\",\"state\":\"ready\",\"agentLoginId\":\"agl_01k0z6r1w8f4jy2m7q9v3x5abc\",\"generation\":3,\"checkedAt\":\"2026-11-12T01:00:00Z\",\"installedAt\":\"2026-11-12T00:55:00Z\"},{\"provider\":\"claude_code\",\"state\":\"foreign_login\",\"checkedAt\":\"2026-11-12T01:00:00Z\"},{\"provider\":\"github\",\"state\":\"not_delivered\"},{\"provider\":\"gitlab\",\"state\":\"not_delivered\"},{\"provider\":\"linear\",\"state\":\"not_delivered\"}]}}}\n",
+    );
+
+    assert!(output.status.success());
+    let expected = [
+        "process:        running\n",
+        "boot:           rbt_01k0z6r1w8f4jy2m7q9v3x5abc\n",
+        "uptime:         10s\n",
+        "connection:     connected\n",
+        "assignments:    0 total\n",
+        "codex login:       ready (generation 3)\n",
+        "claude_code login: foreign_login\n",
+        "github login:      not_delivered\n",
+        "gitlab login:      not_delivered\n",
+        "linear login:      not_delivered\n",
+    ]
+    .concat();
+    assert_eq!(String::from_utf8(output.stdout).unwrap(), expected);
+    assert!(output.stderr.is_empty());
 }
 
 // REQ-RUNNERENROLL-44

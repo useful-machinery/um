@@ -6,8 +6,10 @@
   "oneOf": [
     { "$ref": "#/$defs/statusRequest" },
     { "$ref": "#/$defs/reloadRequest" },
+    { "$ref": "#/$defs/syncAgentLoginsRequest" },
     { "$ref": "#/$defs/statusResponse" },
     { "$ref": "#/$defs/reloadedResponse" },
+    { "$ref": "#/$defs/agentLoginsSyncedResponse" },
     { "$ref": "#/$defs/errorResponse" }
   ],
   "$defs": {
@@ -27,6 +29,15 @@
       "properties": {
         "schemaVersion": { "const": 1 },
         "operation": { "const": "reload_credential" }
+      }
+    },
+    "syncAgentLoginsRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schemaVersion", "operation"],
+      "properties": {
+        "schemaVersion": { "const": 1 },
+        "operation": { "const": "sync_agent_logins" }
       }
     },
     "assignmentCounts": {
@@ -68,7 +79,61 @@
         "currentCredentialId": { "type": "string", "pattern": "^rrc_[0-7][0-9a-hjkmnp-tv-z]{25}$" },
         "pendingCredentialId": { "type": "string", "pattern": "^rrc_[0-7][0-9a-hjkmnp-tv-z]{25}$" },
         "assignmentCounts": { "$ref": "#/$defs/assignmentCounts" },
-        "lastConnectionFailure": { "enum": ["network", "rate_limited", "cloud_unavailable", "authentication", "protocol"] }
+        "lastConnectionFailure": { "enum": ["network", "rate_limited", "cloud_unavailable", "authentication", "protocol"] },
+        "agentLogins": { "$ref": "#/$defs/agentLoginReadiness" }
+      }
+    },
+    "agentLoginReadiness": {
+      "description": "Each provider's readiness as the runner last recorded it in runner-agent-logins-v1, without the path of an install.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["updatedAt", "providers"],
+      "properties": {
+        "updatedAt": { "type": "string", "format": "date-time" },
+        "providers": {
+          "type": "array",
+          "maxItems": 16,
+          "items": {
+            "oneOf": [{ "$ref": "#/$defs/installableAgentLogin" }, { "$ref": "#/$defs/brokeredAgentLogin" }]
+          }
+        }
+      }
+    },
+    "installableAgentLogin": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["provider", "state"],
+      "properties": {
+        "provider": { "enum": ["claude_code", "codex"] },
+        "state": {
+          "enum": [
+            "ready",
+            "not_authorized",
+            "revoked",
+            "foreign_login",
+            "unsupported_target",
+            "stale_generation",
+            "cloud_unavailable",
+            "install_failed"
+          ]
+        },
+        "agentLoginId": { "type": "string", "pattern": "^agl_[0-7][0-9a-hjkmnp-tv-z]{25}$" },
+        "generation": { "type": "integer", "minimum": 1 },
+        "checkedAt": { "type": "string", "format": "date-time" },
+        "installedAt": { "type": "string", "format": "date-time" }
+      },
+      "dependentRequired": {
+        "generation": ["agentLoginId", "installedAt"],
+        "installedAt": ["generation"]
+      }
+    },
+    "brokeredAgentLogin": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["provider", "state"],
+      "properties": {
+        "provider": { "enum": ["github", "gitlab", "linear"] },
+        "state": { "const": "not_delivered" }
       }
     },
     "statusResponse": {
@@ -91,6 +156,16 @@
         "credentialId": { "type": "string", "pattern": "^rrc_[0-7][0-9a-hjkmnp-tv-z]{25}$" }
       }
     },
+    "agentLoginsSyncedResponse": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schemaVersion", "outcome", "agentLogins"],
+      "properties": {
+        "schemaVersion": { "const": 1 },
+        "outcome": { "const": "synced" },
+        "agentLogins": { "$ref": "#/$defs/agentLoginReadiness" }
+      }
+    },
     "errorResponse": {
       "type": "object",
       "additionalProperties": false,
@@ -102,6 +177,7 @@
           "enum": [
             "invalid_request",
             "unsupported_version",
+            "runner_busy",
             "no_pending_credential",
             "pending_registration_mismatch",
             "pending_authentication_failed",

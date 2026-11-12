@@ -3,6 +3,7 @@ use std::io::{self, Write};
 use anyhow::Context;
 use serde::Serialize;
 
+use super::super::super::ApiFailureReport;
 use crate::exit_code::{ExitCode, OutcomeClass};
 use um_api::{
     Grant, GrantFailure, GrantList, GrantSession, GrantSessionReason, GrantSessionStatus,
@@ -219,103 +220,44 @@ pub(super) fn write_revoke(
     Ok(ExitCode::Success)
 }
 
-/// A grant operation's failure as the member reads it: the closed outcome, the facts a
-/// script needs, and the human summary and remedy.
-struct FailureReport {
-    outcome: &'static str,
-    category: Option<&'static str>,
-    retry_after: Option<u64>,
-    summary: String,
-    remedy: String,
-    class: OutcomeClass,
-}
-
-impl FailureReport {
-    fn new(deployment: &str, failure: &GrantFailure) -> Self {
-        let report = |outcome, summary: &str, remedy: &str, class| Self {
-            outcome,
-            category: None,
-            retry_after: None,
-            summary: summary.to_owned(),
-            remedy: remedy.to_owned(),
-            class,
-        };
-        match failure {
-            GrantFailure::Unauthenticated => report(
-                "unauthenticated",
-                "! You must sign in before managing provider grants.",
-                "Run:\n  um auth login",
-                OutcomeClass::Unauthenticated,
-            ),
-            GrantFailure::Forbidden => report(
-                "forbidden",
-                "! Your account is not permitted to manage provider grants.",
-                "Sign in as an active member:\n  um auth login",
-                OutcomeClass::Forbidden,
-            ),
-            GrantFailure::InvalidInput => report(
-                "invalid_input",
-                "error: provider grant request rejected by the deployment",
-                "Check the grant ID, --limit and --cursor values.",
-                OutcomeClass::GeneralFailure,
-            ),
-            GrantFailure::NotFound => report(
-                "not_found",
-                "error: provider grant not found",
-                "List your provider grants:\n  um auth grant list",
-                OutcomeClass::GeneralFailure,
-            ),
-            GrantFailure::IdempotencyConflict => report(
-                "idempotency_conflict",
-                "error: provider grant request key already used for another request",
-                "Run the command again; it sends a new request key.",
-                OutcomeClass::GeneralFailure,
-            ),
-            GrantFailure::ConsentInProgress => report(
-                "consent_in_progress",
-                "error: a consent for this provider is already in progress",
-                "Finish that consent or wait for it to expire, then list your provider grants:\n  um auth grant list",
-                OutcomeClass::GeneralFailure,
-            ),
-            GrantFailure::ProviderUnavailable => report(
-                "provider_unavailable",
-                "error: this deployment does not serve grants for that provider",
-                "Ask the deployment operator which providers it serves grants for.",
-                OutcomeClass::Unreachable,
-            ),
-            GrantFailure::RateLimited { retry_after } => Self {
-                retry_after: *retry_after,
-                ..report(
-                    "rate_limited",
-                    &match retry_after {
-                        Some(seconds) => format!(
-                            "error: provider grant requests rate limited\nretry after: {seconds}s"
-                        ),
-                        None => "error: provider grant requests rate limited".to_owned(),
-                    },
-                    "Wait, then run the command again.",
-                    OutcomeClass::RateLimited,
-                )
-            },
-            GrantFailure::Unreachable { category } => Self {
-                category: Some(category.as_str()),
-                ..report(
-                    "unreachable",
-                    &format!(
-                        "error: Useful Machinery deployment unreachable: {deployment}\ncategory: {}",
-                        category.as_str()
-                    ),
-                    "Check access to the deployment, then run the command again.",
-                    super::super::super::unreachable_outcome_class(*category),
-                )
-            },
-            GrantFailure::InvalidResponse { .. } => report(
-                "invalid_response",
-                "error: invalid provider grant response from the deployment",
-                "Use a CLI version supported by this deployment.",
-                OutcomeClass::Protocol,
-            ),
+/// A grant operation's failure as the member reads it.
+fn report(deployment: &str, failure: &GrantFailure) -> ApiFailureReport {
+    const SUBJECT: &str = "provider grant";
+    match failure {
+        GrantFailure::Unauthenticated => ApiFailureReport::unauthenticated(SUBJECT),
+        GrantFailure::Forbidden => ApiFailureReport::forbidden(SUBJECT),
+        GrantFailure::InvalidInput => ApiFailureReport::new(
+            "invalid_input",
+            "error: provider grant request rejected by the deployment",
+            "Check the grant ID, --limit and --cursor values.",
+            OutcomeClass::GeneralFailure,
+        ),
+        GrantFailure::NotFound => ApiFailureReport::new(
+            "not_found",
+            "error: provider grant not found",
+            "List your provider grants:\n  um auth grant list",
+            OutcomeClass::GeneralFailure,
+        ),
+        GrantFailure::IdempotencyConflict => ApiFailureReport::idempotency_conflict(SUBJECT),
+        GrantFailure::ConsentInProgress => ApiFailureReport::new(
+            "consent_in_progress",
+            "error: a consent for this provider is already in progress",
+            "Finish that consent or wait for it to expire, then list your provider grants:\n  um auth grant list",
+            OutcomeClass::GeneralFailure,
+        ),
+        GrantFailure::ProviderUnavailable => ApiFailureReport::new(
+            "provider_unavailable",
+            "error: this deployment does not serve grants for that provider",
+            "Ask the deployment operator which providers it serves grants for.",
+            OutcomeClass::Unreachable,
+        ),
+        GrantFailure::RateLimited { retry_after } => {
+            ApiFailureReport::rate_limited(SUBJECT, *retry_after)
         }
+        GrantFailure::Unreachable { category } => {
+            ApiFailureReport::unreachable(deployment, *category)
+        }
+        GrantFailure::InvalidResponse { .. } => ApiFailureReport::invalid_response(SUBJECT),
     }
 }
 
@@ -325,23 +267,7 @@ pub(super) fn failure(
     failure: &GrantFailure,
     json: bool,
 ) -> anyhow::Result<ExitCode> {
-    let report = FailureReport::new(deployment, failure);
-    if json {
-        write_json(&super::super::super::ApiFailureResult::with_retry_after(
-            deployment,
-            report.outcome,
-            report.category,
-            report.retry_after,
-        ))?;
-    } else {
-        writeln!(
-            io::stderr().lock(),
-            "{}\n\n{}",
-            report.summary,
-            report.remedy
-        )?;
-    }
-    Ok(report.class.exit_code())
+    report(deployment, failure).write(deployment, json)
 }
 
 /// The provider a consent asks, as its wire name and its name in prose.
@@ -605,7 +531,7 @@ pub(super) fn write_consent_failure(
     failure: &GrantFailure,
     json: bool,
 ) -> anyhow::Result<ExitCode> {
-    let mut report = FailureReport::new(deployment, failure);
+    let mut report = report(deployment, failure);
     match (failure, session_id) {
         (GrantFailure::NotFound, None) => {
             report.summary = "error: linked identity not found".to_owned();

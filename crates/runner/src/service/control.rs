@@ -14,9 +14,11 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{Semaphore, mpsc, oneshot};
 
 use super::assignment::AssignmentManager;
+use crate::agent_login::readiness::ReadinessDocument;
+use crate::agent_login::setup::{AgentLoginSetup, SYNC_BOUND, SetupOutcome};
 use crate::control_protocol::{
-    ConnectionFailure, ConnectionState, ControlError, Operation, ProcessState, Response,
-    StatusSnapshot, decode_request, encode_response,
+    AgentLoginReadiness, ConnectionFailure, ConnectionState, ControlError, Operation, ProcessState,
+    Response, StatusSnapshot, decode_request, encode_response,
 };
 
 const RUNTIME_DIRECTORY_MODE: u32 = 0o700;
@@ -38,6 +40,8 @@ pub(super) struct ControlTimeouts {
     io: Duration,
     snapshot: Duration,
     reload: Duration,
+    /// How long a sync waits for its agent-login pass: `SYNC_BOUND`.
+    agent_login_sync: Duration,
 }
 
 impl ControlTimeouts {
@@ -46,6 +50,44 @@ impl ControlTimeouts {
             io: Duration::from_secs(2),
             snapshot: Duration::from_secs(1),
             reload: Duration::from_secs(30),
+            agent_login_sync: SYNC_BOUND,
+        }
+    }
+}
+
+/// What the control socket serves from: the live status, the assignment
+/// manager for its counts, the reload channel and the agent-login setup,
+/// which is absent without protected state.
+#[derive(Clone)]
+pub(super) struct ControlContext {
+    pub(super) status: Arc<LiveStatus>,
+    pub(super) assignments: Arc<Mutex<AssignmentManager>>,
+    pub(super) reloads: mpsc::Sender<ReloadRequest>,
+    pub(super) agent_logins: Option<Arc<AgentLoginSetup>>,
+    pub(super) timeouts: ControlTimeouts,
+}
+
+/// Runs one agent-login setup pass and publishes the readiness it recorded
+/// in the live status, also when an assignment interrupted it after it had
+/// recorded an install or removal: `runner_busy` while the runner holds an
+/// assignment, and `state_update_failed` when the readiness could not be
+/// recorded.
+pub(super) async fn set_up_agent_logins(
+    setup: &Arc<AgentLoginSetup>,
+    status: &LiveStatus,
+) -> Result<AgentLoginReadiness, ControlError> {
+    match setup.run_pass().await {
+        SetupOutcome::Busy(recorded) => {
+            if let Some(readiness) = recorded.as_ref().and_then(ReadinessDocument::reported) {
+                status.agent_logins_recorded(readiness);
+            }
+            Err(ControlError::RunnerBusy)
+        }
+        SetupOutcome::Failed => Err(ControlError::StateUpdateFailed),
+        SetupOutcome::Recorded(document) => {
+            let readiness = document.reported().ok_or(ControlError::StateUpdateFailed)?;
+            status.agent_logins_recorded(readiness.clone());
+            Ok(readiness)
         }
     }
 }
@@ -57,6 +99,7 @@ struct LiveStatusState {
     current_credential_id: Option<String>,
     pending_credential_id: Option<String>,
     last_connection_failure: Option<ConnectionFailure>,
+    agent_logins: Option<AgentLoginReadiness>,
 }
 
 pub(super) struct LiveStatus {
@@ -82,6 +125,7 @@ impl LiveStatus {
                 current_credential_id: Some(current_credential_id),
                 pending_credential_id,
                 last_connection_failure: None,
+                agent_logins: None,
             }),
             connected: tokio::sync::Notify::new(),
         }
@@ -150,6 +194,11 @@ impl LiveStatus {
         self.lock().pending_credential_id = credential_id;
     }
 
+    /// The readiness the latest agent-login setup pass recorded.
+    pub(super) fn agent_logins_recorded(&self, readiness: AgentLoginReadiness) {
+        self.lock().agent_logins = Some(readiness);
+    }
+
     fn update_connection(
         &self,
         connection_state: ConnectionState,
@@ -177,6 +226,7 @@ impl LiveStatus {
             pending_credential_id: state.pending_credential_id.clone(),
             assignment_counts,
             last_connection_failure: state.last_connection_failure,
+            agent_logins: state.agent_logins.clone(),
         }
     }
 
@@ -195,13 +245,10 @@ pub(super) struct ControlServer {
 impl ControlServer {
     pub(super) fn bind(
         socket_path: &Path,
-        status: Arc<LiveStatus>,
-        assignments: Arc<Mutex<AssignmentManager>>,
-        reloads: mpsc::Sender<ReloadRequest>,
-        timeouts: ControlTimeouts,
+        context: ControlContext,
     ) -> Result<Self, ControlServerError> {
         let (listener, socket) = SocketGuard::bind(socket_path)?;
-        let task = tokio::spawn(serve(listener, status, assignments, reloads, timeouts));
+        let task = tokio::spawn(serve(listener, context));
         Ok(Self {
             task,
             _socket: socket,
@@ -383,36 +430,29 @@ fn inspect_existing_socket(path: &Path) -> Result<(), ControlServerError> {
     }
 }
 
-async fn serve(
-    listener: UnixListener,
-    status: Arc<LiveStatus>,
-    assignments: Arc<Mutex<AssignmentManager>>,
-    reloads: mpsc::Sender<ReloadRequest>,
-    timeouts: ControlTimeouts,
-) {
+async fn serve(listener: UnixListener, context: ControlContext) {
     let capacity = Arc::new(Semaphore::new(MAXIMUM_CONNECTIONS));
     while let Ok((stream, _)) = listener.accept().await {
         let Ok(permit) = Arc::clone(&capacity).try_acquire_owned() else {
             drop(stream);
             continue;
         };
-        let status = Arc::clone(&status);
-        let assignments = Arc::clone(&assignments);
-        let reloads = reloads.clone();
+        let context = context.clone();
         tokio::spawn(async move {
             let _permit = permit;
-            handle_connection(stream, status, assignments, reloads, timeouts).await;
+            handle_connection(stream, context).await;
         });
     }
 }
 
-async fn handle_connection(
-    mut stream: UnixStream,
-    status: Arc<LiveStatus>,
-    assignments: Arc<Mutex<AssignmentManager>>,
-    reloads: mpsc::Sender<ReloadRequest>,
-    timeouts: ControlTimeouts,
-) {
+async fn handle_connection(mut stream: UnixStream, context: ControlContext) {
+    let ControlContext {
+        status,
+        assignments,
+        reloads,
+        agent_logins,
+        timeouts,
+    } = context;
     if stream.peer_cred().ok().map(|credential| credential.uid())
         != Some(rustix::process::geteuid().as_raw())
     {
@@ -452,6 +492,21 @@ async fn handle_connection(
                 }
             }
         }
+        Ok(Operation::SyncAgentLogins) => match agent_logins {
+            // Every enrolled runner has a setup; one without protected state
+            // cannot record readiness.
+            None => Response::Error(ControlError::StateUpdateFailed),
+            Some(setup) => {
+                // The pass publishes its readiness even if the answer is
+                // abandoned at the bound.
+                let sync = tokio::spawn(async move { set_up_agent_logins(&setup, &status).await });
+                match control_timeout(timeouts.agent_login_sync, sync).await {
+                    Ok(Ok(Ok(readiness))) => Response::AgentLoginsSynced(readiness),
+                    Ok(Ok(Err(error))) => Response::Error(error),
+                    Ok(Err(_)) | Err(_) => Response::Error(ControlError::StateUpdateFailed),
+                }
+            }
+        },
         Err(error) => Response::Error(error),
     };
     let Ok(bytes) = encode_response(&response) else {
@@ -498,19 +553,27 @@ mod tests {
     use super::*;
     use std::os::unix::fs::symlink;
 
-    use crate::control_protocol::{AssignmentCounts, Response, decode_response};
+    use crate::agent_login::cloud::{LoginStatus, ProviderLogin};
+    use crate::agent_login::readiness::READINESS_FILE;
+    use crate::control_protocol::{
+        AgentLoginProvider, AgentLoginState, AssignmentCounts, Response, decode_response,
+    };
     use crate::credential::test_credential;
     use crate::service::assignment::test_support::manager;
-    use crate::service::test_support::{ConfigFixture, fixture_lease_clock};
+    use crate::service::test_support::{
+        ConfigFixture, CountedGate, FAKE_AGENT_LOGIN_ID, FAKE_AGENT_LOGIN_SENTINEL,
+        FakeAgentLoginCloud, fake_agent_login_setup, fake_codex_authorized, fixture_lease_clock,
+    };
+    use crate::telemetry::test_recorder;
 
     const TEST_TIMEOUTS: ControlTimeouts = ControlTimeouts {
         io: Duration::from_millis(50),
         snapshot: Duration::from_secs(1),
         reload: Duration::from_secs(30),
+        agent_login_sync: Duration::from_secs(30),
     };
 
-    async fn exchange(request: &[u8]) -> Vec<u8> {
-        let (mut client, server) = UnixStream::pair().unwrap();
+    fn context(agent_logins: Option<Arc<AgentLoginSetup>>) -> ControlContext {
         let config = ConfigFixture::new(
             "ws://127.0.0.1:1/v1/runner/connect",
             test_credential(),
@@ -528,18 +591,199 @@ mod tests {
             None,
         ));
         let (reloads, _requests) = mpsc::channel(1);
-        let server = tokio::spawn(handle_connection(
-            server,
+        ControlContext {
             status,
             assignments,
             reloads,
-            TEST_TIMEOUTS,
-        ));
+            agent_logins,
+            timeouts: TEST_TIMEOUTS,
+        }
+    }
+
+    async fn exchange_in(context: ControlContext, request: &[u8]) -> Vec<u8> {
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let server = tokio::spawn(handle_connection(server, context));
         client.write_all(request).await.unwrap();
         let mut response = Vec::new();
         client.read_to_end(&mut response).await.unwrap();
         server.await.unwrap();
         response
+    }
+
+    async fn exchange(request: &[u8]) -> Vec<u8> {
+        exchange_in(context(None), request).await
+    }
+
+    /// Agent-login setup against `cloud` for a service whose home and state
+    /// directory are under `root`.
+    fn agent_login_setup(
+        cloud: Arc<FakeAgentLoginCloud>,
+        root: &Path,
+        gate: CountedGate,
+    ) -> Arc<AgentLoginSetup> {
+        let (home, state) = (root.join("home"), root.join("state"));
+        fs::create_dir(&home).unwrap();
+        fs::create_dir(&state).unwrap();
+        fs::set_permissions(&state, Permissions::from_mode(0o700)).unwrap();
+        let (recorder, _capture) = test_recorder("rbt_01k0z6r1w8f4jy2m7q9v3x5abc");
+        Arc::new(AgentLoginSetup::new(
+            fake_agent_login_setup(cloud, &home, &state, recorder),
+            Arc::new(gate),
+            || time::OffsetDateTime::from_unix_timestamp(1_794_450_000).unwrap(),
+        ))
+    }
+
+    const SYNC_REQUEST: &[u8] = b"{\"schemaVersion\":1,\"operation\":\"sync_agent_logins\"}\n";
+    const STATUS_REQUEST: &[u8] = b"{\"schemaVersion\":1,\"operation\":\"status\"}\n";
+
+    // REQ-AGENTLOGIN-31, REQ-RUNNERENROLL-42, REQ-RUNNERENROLL-63
+    #[tokio::test]
+    async fn sync_runs_a_pass_and_answers_its_readiness_without_a_path() {
+        let root = tempfile::tempdir().unwrap();
+        let cloud = FakeAgentLoginCloud::new(fake_codex_authorized(2));
+        let context = context(Some(agent_login_setup(
+            Arc::clone(&cloud),
+            root.path(),
+            CountedGate::idle(),
+        )));
+
+        let before = exchange_in(context.clone(), STATUS_REQUEST).await;
+        let Response::Status(status) = decode_response(&before).unwrap() else {
+            panic!("status request did not return a snapshot");
+        };
+        assert_eq!(status.agent_logins, None);
+        assert!(!String::from_utf8(before).unwrap().contains("agentLogins"));
+
+        let response = exchange_in(context.clone(), SYNC_REQUEST).await;
+        let Response::AgentLoginsSynced(readiness) = decode_response(&response).unwrap() else {
+            panic!("sync request did not return readiness");
+        };
+        assert_eq!(cloud.status_requests(), 2);
+        assert_eq!(cloud.deliveries(), 1);
+        let states = readiness
+            .providers
+            .iter()
+            .map(|entry| (entry.provider, entry.state, entry.generation))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            states,
+            [
+                (AgentLoginProvider::Codex, AgentLoginState::Ready, Some(2)),
+                (
+                    AgentLoginProvider::ClaudeCode,
+                    AgentLoginState::NotAuthorized,
+                    None
+                ),
+                (
+                    AgentLoginProvider::Github,
+                    AgentLoginState::NotDelivered,
+                    None
+                ),
+                (
+                    AgentLoginProvider::Gitlab,
+                    AgentLoginState::NotDelivered,
+                    None
+                ),
+                (
+                    AgentLoginProvider::Linear,
+                    AgentLoginState::NotDelivered,
+                    None
+                ),
+            ]
+        );
+        assert!(
+            root.path()
+                .join("state/.runner-agent-login/codex/auth.json")
+                .is_file()
+        );
+
+        let after = exchange_in(context, STATUS_REQUEST).await;
+        let Response::Status(status) = decode_response(&after).unwrap() else {
+            panic!("status request did not return a snapshot");
+        };
+        assert_eq!(status.agent_logins.as_ref(), Some(&readiness));
+        for encoded in [response, after] {
+            let encoded = String::from_utf8(encoded).unwrap();
+            for forbidden in [
+                "installedPath",
+                root.path().to_str().unwrap(),
+                FAKE_AGENT_LOGIN_SENTINEL,
+            ] {
+                assert!(!encoded.contains(forbidden), "{forbidden}");
+            }
+        }
+    }
+
+    // REQ-AGENTLOGIN-31, REQ-RUNNERENROLL-82
+    #[tokio::test]
+    async fn sync_while_an_assignment_is_held_answers_runner_busy_without_asking() {
+        let root = tempfile::tempdir().unwrap();
+        let cloud = FakeAgentLoginCloud::new(fake_codex_authorized(1));
+        let context = context(Some(agent_login_setup(
+            Arc::clone(&cloud),
+            root.path(),
+            CountedGate::busy(),
+        )));
+
+        assert_eq!(
+            decode_response(&exchange_in(context.clone(), SYNC_REQUEST).await).unwrap(),
+            Response::Error(ControlError::RunnerBusy)
+        );
+        assert_eq!(cloud.status_requests(), 0);
+        assert!(!root.path().join("state").join(READINESS_FILE).exists());
+        let Response::Status(status) =
+            decode_response(&exchange_in(context, STATUS_REQUEST).await).unwrap()
+        else {
+            panic!("status request did not return a snapshot");
+        };
+        assert_eq!(status.agent_logins, None);
+    }
+
+    // REQ-AGENTLOGIN-31, REQ-RUNNERENROLL-42
+    #[tokio::test]
+    async fn a_sync_an_assignment_interrupts_answers_runner_busy_and_status_shows_what_it_recorded()
+    {
+        let root = tempfile::tempdir().unwrap();
+        let authorized = |provider| ProviderLogin {
+            provider,
+            agent_login_id: FAKE_AGENT_LOGIN_ID.to_owned(),
+            status: LoginStatus::Authorized {
+                generation: 1,
+                record_schema_version: 1,
+            },
+        };
+        let cloud =
+            FakeAgentLoginCloud::new(Ok(AgentLoginProvider::INSTALLABLE.map(authorized).to_vec()));
+        // The pass finds the runner idle, asks for the Codex login and
+        // installs it; an assignment starts before it asks for the next.
+        let gate = CountedGate::idle();
+        gate.idle_calls
+            .store(3, std::sync::atomic::Ordering::SeqCst);
+        let context = context(Some(agent_login_setup(
+            Arc::clone(&cloud),
+            root.path(),
+            gate,
+        )));
+
+        assert_eq!(
+            decode_response(&exchange_in(context.clone(), SYNC_REQUEST).await).unwrap(),
+            Response::Error(ControlError::RunnerBusy)
+        );
+        assert_eq!(cloud.deliveries(), 1);
+        let Response::Status(status) =
+            decode_response(&exchange_in(context, STATUS_REQUEST).await).unwrap()
+        else {
+            panic!("status request did not return a snapshot");
+        };
+        let readiness = status
+            .agent_logins
+            .expect("status shows what the interrupted pass recorded");
+        let codex = readiness
+            .providers
+            .iter()
+            .find(|entry| entry.provider == AgentLoginProvider::Codex)
+            .expect("the Codex entry");
+        assert_eq!(codex.state, AgentLoginState::Ready);
     }
 
     // REQ-RUNNERENROLL-33, REQ-RUNNERENROLL-34

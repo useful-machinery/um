@@ -17,6 +17,22 @@ use crate::generated::{apis::ResponseContent, models};
 use reqwest;
 use serde::{Deserialize, Serialize, de::Error as _};
 
+/// struct for typed errors of method [`authorize_agent_login_runner`]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum AuthorizeAgentLoginRunnerError {
+    Status400(models::Problem),
+    Status401(models::Problem),
+    Status403(models::Problem),
+    Status404(models::Problem),
+    Status409(models::Problem),
+    Status413(models::Problem),
+    Status415(models::Problem),
+    Status500(models::Problem),
+    Status503(models::Problem),
+    UnknownValue(serde_json::Value),
+}
+
 /// struct for typed errors of method [`begin_docs_account_handoff`]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
@@ -103,6 +119,19 @@ pub enum CreateServicePrincipalError {
     UnknownValue(serde_json::Value),
 }
 
+/// struct for typed errors of method [`get_agent_login`]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum GetAgentLoginError {
+    Status400(models::Problem),
+    Status401(models::Problem),
+    Status403(models::Problem),
+    Status404(models::Problem),
+    Status500(models::Problem),
+    Status503(models::Problem),
+    UnknownValue(serde_json::Value),
+}
+
 /// struct for typed errors of method [`get_current_principal`]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
@@ -136,6 +165,22 @@ pub enum GetGrantSessionError {
     UnknownValue(serde_json::Value),
 }
 
+/// struct for typed errors of method [`import_agent_login`]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ImportAgentLoginError {
+    Status400(models::Problem),
+    Status401(models::Problem),
+    Status403(models::Problem),
+    Status404(models::Problem),
+    Status409(models::Problem),
+    Status413(models::Problem),
+    Status415(models::Problem),
+    Status500(models::Problem),
+    Status503(models::Problem),
+    UnknownValue(serde_json::Value),
+}
+
 /// struct for typed errors of method [`issue_current_service_credential`]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
@@ -159,6 +204,18 @@ pub enum LinkCurrentPrincipalIdentityError {
     Status413(models::Problem),
     Status415(models::Problem),
     Status500(models::Problem),
+    UnknownValue(serde_json::Value),
+}
+
+/// struct for typed errors of method [`list_agent_logins`]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ListAgentLoginsError {
+    Status400(models::Problem),
+    Status401(models::Problem),
+    Status403(models::Problem),
+    Status500(models::Problem),
+    Status503(models::Problem),
     UnknownValue(serde_json::Value),
 }
 
@@ -254,6 +311,22 @@ pub enum RemoveCurrentPrincipalIdentityError {
     UnknownValue(serde_json::Value),
 }
 
+/// struct for typed errors of method [`replace_agent_login_material`]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ReplaceAgentLoginMaterialError {
+    Status400(models::Problem),
+    Status401(models::Problem),
+    Status403(models::Problem),
+    Status404(models::Problem),
+    Status409(models::Problem),
+    Status413(models::Problem),
+    Status415(models::Problem),
+    Status500(models::Problem),
+    Status503(models::Problem),
+    UnknownValue(serde_json::Value),
+}
+
 /// struct for typed errors of method [`request_current_principal_deletion`]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
@@ -263,6 +336,34 @@ pub enum RequestCurrentPrincipalDeletionError {
     Status403(models::Problem),
     Status409(models::Problem),
     Status500(models::Problem),
+    UnknownValue(serde_json::Value),
+}
+
+/// struct for typed errors of method [`revoke_agent_login`]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum RevokeAgentLoginError {
+    Status400(models::Problem),
+    Status401(models::Problem),
+    Status403(models::Problem),
+    Status404(models::Problem),
+    Status409(models::Problem),
+    Status500(models::Problem),
+    Status503(models::Problem),
+    UnknownValue(serde_json::Value),
+}
+
+/// struct for typed errors of method [`revoke_agent_login_authorization`]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum RevokeAgentLoginAuthorizationError {
+    Status400(models::Problem),
+    Status401(models::Problem),
+    Status403(models::Problem),
+    Status404(models::Problem),
+    Status409(models::Problem),
+    Status500(models::Problem),
+    Status503(models::Problem),
     UnknownValue(serde_json::Value),
 }
 
@@ -317,6 +418,73 @@ pub enum UpdateCurrentPrincipalError {
     Status415(models::Problem),
     Status500(models::Problem),
     UnknownValue(serde_json::Value),
+}
+
+/// Authorizes one runner registration of the agent login's organization to receive one of the active human's own active agent logins and answers the authorization (REQ-AGENTLOGIN-8). Only the owner, while an active member of the agent login's organization, may authorize it; an agent login that is unknown, revoked or another member's, or whose owner is no longer an active member, is `agent-login-not-found`. The runner need not have enrolled yet. A runner that is unknown, deleted or in another organization is `agent-login-runner-not-found`. A runner that already has an authorization in force for the agent login's provider, from any member, is `agent-login-runner-conflict`, and nothing is replaced. A `codex` agent login, which one runner holds at a time, that already has an authorization in force is `agent-login-already-authorized`. A provider the deployment lists no operating system for, or a deployment without the agent-login key, is refused `provider-unavailable` (REQ-AGENTLOGIN-5).  Idempotency-Key is scoped to the exact acting OIDC identity and a semantic fingerprint containing agentLoginId and runnerId. Exact replay returns the original created response. Reusing the key for another request conflicts.  Problem types: 404 `agent-login-not-found`, `agent-login-runner-not-found`; 409 `agent-login-runner-conflict`, `agent-login-already-authorized`; 503 `provider-unavailable`.
+pub fn authorize_agent_login_runner(
+    configuration: &configuration::Configuration,
+    agent_login_id: &str,
+    idempotency_key: &str,
+    authorize_agent_login_runner_request: models::AuthorizeAgentLoginRunnerRequest,
+) -> Result<models::AgentLoginAuthorization, Error<AuthorizeAgentLoginRunnerError>> {
+    // add a prefix to parameters to efficiently prevent name collisions
+    let p_path_agent_login_id = agent_login_id;
+    let p_header_idempotency_key = idempotency_key;
+    let p_body_authorize_agent_login_runner_request = authorize_agent_login_runner_request;
+
+    let uri_str = format!(
+        "{}/v1/me/agent-logins/{agentLoginId}/authorizations",
+        configuration.base_path,
+        agentLoginId = crate::generated::apis::urlencode(p_path_agent_login_id)
+    );
+    let mut req_builder = configuration
+        .client
+        .request(reqwest::Method::POST, &uri_str);
+
+    if let Some(ref user_agent) = configuration.user_agent {
+        req_builder = req_builder.header(reqwest::header::USER_AGENT, user_agent.clone());
+    }
+    req_builder = req_builder.header("Idempotency-Key", p_header_idempotency_key.to_string());
+    if let Some(ref token) = configuration.bearer_access_token {
+        req_builder = req_builder.bearer_auth(token.to_owned());
+    };
+    req_builder = req_builder.json(&p_body_authorize_agent_login_runner_request);
+
+    let req = req_builder.build()?;
+    let resp = configuration.client.execute(req)?;
+
+    let status = resp.status();
+    let content_type = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/octet-stream");
+    let content_type = super::ContentType::from(content_type);
+
+    if !status.is_client_error() && !status.is_server_error() {
+        let content = resp.text()?;
+        match content_type {
+            ContentType::Json => serde_json::from_str(&content).map_err(Error::from),
+            ContentType::Text => {
+                return Err(Error::from(serde_json::Error::custom(
+                    "Received `text/plain` content type response that cannot be converted to `models::AgentLoginAuthorization`",
+                )));
+            }
+            ContentType::Unsupported(unknown_type) => {
+                return Err(Error::from(serde_json::Error::custom(format!(
+                    "Received `{unknown_type}` content type response that cannot be converted to `models::AgentLoginAuthorization`"
+                ))));
+            }
+        }
+    } else {
+        let content = resp.text()?;
+        let entity: Option<AuthorizeAgentLoginRunnerError> = serde_json::from_str(&content).ok();
+        Err(Error::ResponseError(ResponseContent {
+            status,
+            content,
+            entity,
+        }))
+    }
 }
 
 /// Google identity is not a Cloud bearer. State and verifier remain private to Apps Script server code.
@@ -730,6 +898,65 @@ pub fn create_service_principal(
     }
 }
 
+/// Returns one of the active human's own agent logins with its organization, provider, label, state, generation, record schema version, key version, import time and the authorizations in force (REQ-AGENTLOGIN-3). Another member's agent login, an unknown one and a malformed ID are not found. No response carries material (REQ-AGENTLOGIN-4).  Problem types: 404 `agent-login-not-found`; 503 `provider-unavailable`.
+pub fn get_agent_login(
+    configuration: &configuration::Configuration,
+    agent_login_id: &str,
+) -> Result<models::AgentLogin, Error<GetAgentLoginError>> {
+    // add a prefix to parameters to efficiently prevent name collisions
+    let p_path_agent_login_id = agent_login_id;
+
+    let uri_str = format!(
+        "{}/v1/me/agent-logins/{agentLoginId}",
+        configuration.base_path,
+        agentLoginId = crate::generated::apis::urlencode(p_path_agent_login_id)
+    );
+    let mut req_builder = configuration.client.request(reqwest::Method::GET, &uri_str);
+
+    if let Some(ref user_agent) = configuration.user_agent {
+        req_builder = req_builder.header(reqwest::header::USER_AGENT, user_agent.clone());
+    }
+    if let Some(ref token) = configuration.bearer_access_token {
+        req_builder = req_builder.bearer_auth(token.to_owned());
+    };
+
+    let req = req_builder.build()?;
+    let resp = configuration.client.execute(req)?;
+
+    let status = resp.status();
+    let content_type = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/octet-stream");
+    let content_type = super::ContentType::from(content_type);
+
+    if !status.is_client_error() && !status.is_server_error() {
+        let content = resp.text()?;
+        match content_type {
+            ContentType::Json => serde_json::from_str(&content).map_err(Error::from),
+            ContentType::Text => {
+                return Err(Error::from(serde_json::Error::custom(
+                    "Received `text/plain` content type response that cannot be converted to `models::AgentLogin`",
+                )));
+            }
+            ContentType::Unsupported(unknown_type) => {
+                return Err(Error::from(serde_json::Error::custom(format!(
+                    "Received `{unknown_type}` content type response that cannot be converted to `models::AgentLogin`"
+                ))));
+            }
+        }
+    } else {
+        let content = resp.text()?;
+        let entity: Option<GetAgentLoginError> = serde_json::from_str(&content).ok();
+        Err(Error::ResponseError(ResponseContent {
+            status,
+            content,
+            entity,
+        }))
+    }
+}
+
 /// Returns the active human or service principal associated with the bearer token. This operation is read-only and never provisions a principal. An authenticated human identity that has not completed explicit signup receives a principal-not-provisioned response.  Problem types: 403 `principal-not-provisioned`.
 pub fn get_current_principal(
     configuration: &configuration::Configuration,
@@ -900,6 +1127,67 @@ pub fn get_grant_session(
     }
 }
 
+/// Stores a coding agent's own sign-in for one organization the active human is an active member of, sealed in Cloud custody, and answers the new agent login at generation 1 (REQ-AGENTLOGIN-1). The body names the organization by ID or slug, the provider, an optional label, the record schema version and the material as base64 of at most 32 KiB: for `codex` the text of a Codex `auth.json`, for `claude_code` the token `claude setup-token` prints (REQ-AGENTLOGIN-2). Material in any other form, or of a record schema version the provider does not accept, is refused `agent-login-material-invalid`, and no answer repeats it. An organization that is unknown or that the caller is not an active member of is not found. A member holds at most 16 unrevoked agent logins in one organization. A provider the deployment lists no operating system for, or a deployment without the agent-login key, is refused `provider-unavailable` (REQ-AGENTLOGIN-5). No response carries material (REQ-AGENTLOGIN-4).  Idempotency-Key is scoped to the exact acting OIDC identity and a semantic fingerprint containing organization, provider, label, recordSchemaVersion and a keyed digest of the material. Exact replay returns the original created response with the agent login's current state. Reusing the key for another request conflicts.  Problem types: 400 `agent-login-material-invalid`; 409 `quantity-limit-reached`; 503 `provider-unavailable`.
+pub fn import_agent_login(
+    configuration: &configuration::Configuration,
+    idempotency_key: &str,
+    import_agent_login_request: models::ImportAgentLoginRequest,
+) -> Result<models::AgentLogin, Error<ImportAgentLoginError>> {
+    // add a prefix to parameters to efficiently prevent name collisions
+    let p_header_idempotency_key = idempotency_key;
+    let p_body_import_agent_login_request = import_agent_login_request;
+
+    let uri_str = format!("{}/v1/me/agent-logins", configuration.base_path);
+    let mut req_builder = configuration
+        .client
+        .request(reqwest::Method::POST, &uri_str);
+
+    if let Some(ref user_agent) = configuration.user_agent {
+        req_builder = req_builder.header(reqwest::header::USER_AGENT, user_agent.clone());
+    }
+    req_builder = req_builder.header("Idempotency-Key", p_header_idempotency_key.to_string());
+    if let Some(ref token) = configuration.bearer_access_token {
+        req_builder = req_builder.bearer_auth(token.to_owned());
+    };
+    req_builder = req_builder.json(&p_body_import_agent_login_request);
+
+    let req = req_builder.build()?;
+    let resp = configuration.client.execute(req)?;
+
+    let status = resp.status();
+    let content_type = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/octet-stream");
+    let content_type = super::ContentType::from(content_type);
+
+    if !status.is_client_error() && !status.is_server_error() {
+        let content = resp.text()?;
+        match content_type {
+            ContentType::Json => serde_json::from_str(&content).map_err(Error::from),
+            ContentType::Text => {
+                return Err(Error::from(serde_json::Error::custom(
+                    "Received `text/plain` content type response that cannot be converted to `models::AgentLogin`",
+                )));
+            }
+            ContentType::Unsupported(unknown_type) => {
+                return Err(Error::from(serde_json::Error::custom(format!(
+                    "Received `{unknown_type}` content type response that cannot be converted to `models::AgentLogin`"
+                ))));
+            }
+        }
+    } else {
+        let content = resp.text()?;
+        let entity: Option<ImportAgentLoginError> = serde_json::from_str(&content).ok();
+        Err(Error::ResponseError(ResponseContent {
+            status,
+            content,
+            entity,
+        }))
+    }
+}
+
 /// Issues a non-expiring Useful Machinery platform credential for the authenticated service. The request must have no body and must itself use a platform credential. The API key is returned only on the first completed request; replay returns the same metadata with apiKey omitted.  Problem types: 403 `platform-credential-required`; 409 `quantity-limit-reached`.
 pub fn issue_current_service_credential(
     configuration: &configuration::Configuration,
@@ -1012,6 +1300,69 @@ pub fn link_current_principal_identity(
     } else {
         let content = resp.text()?;
         let entity: Option<LinkCurrentPrincipalIdentityError> = serde_json::from_str(&content).ok();
+        Err(Error::ResponseError(ResponseContent {
+            status,
+            content,
+            entity,
+        }))
+    }
+}
+
+/// Returns one page of the active human's own agent logins, oldest first by creation time and opaque agent login ID, each with its organization, provider, label, state, generation, record schema version, key version, import time and the authorizations in force (REQ-AGENTLOGIN-3). Another member's agent logins are never listed, and no response carries material (REQ-AGENTLOGIN-4). The cursor is opaque and may be used only with this operation. A deployment configured without the agent-login key answers `provider-unavailable` (REQ-AGENTLOGIN-5).  Problem types: 503 `provider-unavailable`.
+pub fn list_agent_logins(
+    configuration: &configuration::Configuration,
+    limit: Option<i32>,
+    cursor: Option<&str>,
+) -> Result<models::AgentLoginList, Error<ListAgentLoginsError>> {
+    // add a prefix to parameters to efficiently prevent name collisions
+    let p_query_limit = limit;
+    let p_query_cursor = cursor;
+
+    let uri_str = format!("{}/v1/me/agent-logins", configuration.base_path);
+    let mut req_builder = configuration.client.request(reqwest::Method::GET, &uri_str);
+
+    if let Some(ref param_value) = p_query_limit {
+        req_builder = req_builder.query(&[("limit", &param_value.to_string())]);
+    }
+    if let Some(ref param_value) = p_query_cursor {
+        req_builder = req_builder.query(&[("cursor", &param_value.to_string())]);
+    }
+    if let Some(ref user_agent) = configuration.user_agent {
+        req_builder = req_builder.header(reqwest::header::USER_AGENT, user_agent.clone());
+    }
+    if let Some(ref token) = configuration.bearer_access_token {
+        req_builder = req_builder.bearer_auth(token.to_owned());
+    };
+
+    let req = req_builder.build()?;
+    let resp = configuration.client.execute(req)?;
+
+    let status = resp.status();
+    let content_type = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/octet-stream");
+    let content_type = super::ContentType::from(content_type);
+
+    if !status.is_client_error() && !status.is_server_error() {
+        let content = resp.text()?;
+        match content_type {
+            ContentType::Json => serde_json::from_str(&content).map_err(Error::from),
+            ContentType::Text => {
+                return Err(Error::from(serde_json::Error::custom(
+                    "Received `text/plain` content type response that cannot be converted to `models::AgentLoginList`",
+                )));
+            }
+            ContentType::Unsupported(unknown_type) => {
+                return Err(Error::from(serde_json::Error::custom(format!(
+                    "Received `{unknown_type}` content type response that cannot be converted to `models::AgentLoginList`"
+                ))));
+            }
+        }
+    } else {
+        let content = resp.text()?;
+        let entity: Option<ListAgentLoginsError> = serde_json::from_str(&content).ok();
         Err(Error::ResponseError(ResponseContent {
             status,
             content,
@@ -1514,6 +1865,73 @@ pub fn remove_current_principal_identity(
     }
 }
 
+/// Stores new material for one of the active human's own active agent logins as its next generation and answers the agent login (REQ-AGENTLOGIN-6). The earlier generation's material is erased; the agent login keeps its ID, organization, provider and authorizations. The body is the record schema version and the material as base64 of at most 32 KiB, in the form of the agent login's provider (REQ-AGENTLOGIN-2); material in any other form is refused `agent-login-material-invalid`, and no answer repeats it. An agent login that is unknown, revoked or another member's, or whose owner is no longer an active member of its organization, is not found. A provider the deployment lists no operating system for, or a deployment without the agent-login key, is refused `provider-unavailable` (REQ-AGENTLOGIN-5). No response carries material (REQ-AGENTLOGIN-4).  Idempotency-Key is scoped to the exact acting OIDC identity and a semantic fingerprint containing agentLoginId, recordSchemaVersion and a keyed digest of the material. Exact replay returns the original response with the agent login's current state. Reusing the key for another request conflicts.  Problem types: 400 `agent-login-material-invalid`; 404 `agent-login-not-found`; 503 `provider-unavailable`.
+pub fn replace_agent_login_material(
+    configuration: &configuration::Configuration,
+    agent_login_id: &str,
+    idempotency_key: &str,
+    replace_agent_login_material_request: models::ReplaceAgentLoginMaterialRequest,
+) -> Result<models::AgentLogin, Error<ReplaceAgentLoginMaterialError>> {
+    // add a prefix to parameters to efficiently prevent name collisions
+    let p_path_agent_login_id = agent_login_id;
+    let p_header_idempotency_key = idempotency_key;
+    let p_body_replace_agent_login_material_request = replace_agent_login_material_request;
+
+    let uri_str = format!(
+        "{}/v1/me/agent-logins/{agentLoginId}/generations",
+        configuration.base_path,
+        agentLoginId = crate::generated::apis::urlencode(p_path_agent_login_id)
+    );
+    let mut req_builder = configuration
+        .client
+        .request(reqwest::Method::POST, &uri_str);
+
+    if let Some(ref user_agent) = configuration.user_agent {
+        req_builder = req_builder.header(reqwest::header::USER_AGENT, user_agent.clone());
+    }
+    req_builder = req_builder.header("Idempotency-Key", p_header_idempotency_key.to_string());
+    if let Some(ref token) = configuration.bearer_access_token {
+        req_builder = req_builder.bearer_auth(token.to_owned());
+    };
+    req_builder = req_builder.json(&p_body_replace_agent_login_material_request);
+
+    let req = req_builder.build()?;
+    let resp = configuration.client.execute(req)?;
+
+    let status = resp.status();
+    let content_type = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/octet-stream");
+    let content_type = super::ContentType::from(content_type);
+
+    if !status.is_client_error() && !status.is_server_error() {
+        let content = resp.text()?;
+        match content_type {
+            ContentType::Json => serde_json::from_str(&content).map_err(Error::from),
+            ContentType::Text => {
+                return Err(Error::from(serde_json::Error::custom(
+                    "Received `text/plain` content type response that cannot be converted to `models::AgentLogin`",
+                )));
+            }
+            ContentType::Unsupported(unknown_type) => {
+                return Err(Error::from(serde_json::Error::custom(format!(
+                    "Received `{unknown_type}` content type response that cannot be converted to `models::AgentLogin`"
+                ))));
+            }
+        }
+    } else {
+        let content = resp.text()?;
+        let entity: Option<ReplaceAgentLoginMaterialError> = serde_json::from_str(&content).ok();
+        Err(Error::ResponseError(ResponseContent {
+            status,
+            content,
+            entity,
+        }))
+    }
+}
+
 /// A human schedule durably binds the linked identity, the SHA-256 fingerprint of this verified bearer, and this bearer's issuer `iat`. The bearer itself and the retained proof are never exposed. Service principals continue to delete immediately without scheduled proof.  Problem types: 409 `lifecycle-transition-unavailable`, `human-owner-required`.
 pub fn request_current_principal_deletion(
     configuration: &configuration::Configuration,
@@ -1564,6 +1982,100 @@ pub fn request_current_principal_deletion(
     } else {
         let content = resp.text()?;
         let entity: Option<RequestCurrentPrincipalDeletionError> =
+            serde_json::from_str(&content).ok();
+        Err(Error::ResponseError(ResponseContent {
+            status,
+            content,
+            entity,
+        }))
+    }
+}
+
+/// Erases the material of one of the active human's own agent logins and ends every authorization of it, answering 204; an agent login already revoked answers 204 too (REQ-AGENTLOGIN-7). Only the owner can revoke it. The request accepts no body. An agent login that is unknown or belongs to another member is not found. Revocation serves every provider, whether or not the deployment lists an operating system for it (REQ-AGENTLOGIN-5). Revoking in Cloud does not end the session at the provider.  Idempotency-Key is scoped to the exact acting OIDC identity and a semantic fingerprint containing agentLoginId. Exact replay returns the original 204 response. Reusing the key for another agent login conflicts.  Problem types: 404 `agent-login-not-found`; 503 `provider-unavailable`.
+pub fn revoke_agent_login(
+    configuration: &configuration::Configuration,
+    agent_login_id: &str,
+    idempotency_key: &str,
+) -> Result<(), Error<RevokeAgentLoginError>> {
+    // add a prefix to parameters to efficiently prevent name collisions
+    let p_path_agent_login_id = agent_login_id;
+    let p_header_idempotency_key = idempotency_key;
+
+    let uri_str = format!(
+        "{}/v1/me/agent-logins/{agentLoginId}",
+        configuration.base_path,
+        agentLoginId = crate::generated::apis::urlencode(p_path_agent_login_id)
+    );
+    let mut req_builder = configuration
+        .client
+        .request(reqwest::Method::DELETE, &uri_str);
+
+    if let Some(ref user_agent) = configuration.user_agent {
+        req_builder = req_builder.header(reqwest::header::USER_AGENT, user_agent.clone());
+    }
+    req_builder = req_builder.header("Idempotency-Key", p_header_idempotency_key.to_string());
+    if let Some(ref token) = configuration.bearer_access_token {
+        req_builder = req_builder.bearer_auth(token.to_owned());
+    };
+
+    let req = req_builder.build()?;
+    let resp = configuration.client.execute(req)?;
+
+    let status = resp.status();
+
+    if !status.is_client_error() && !status.is_server_error() {
+        Ok(())
+    } else {
+        let content = resp.text()?;
+        let entity: Option<RevokeAgentLoginError> = serde_json::from_str(&content).ok();
+        Err(Error::ResponseError(ResponseContent {
+            status,
+            content,
+            entity,
+        }))
+    }
+}
+
+/// Ends one authorization in force of one of the active human's own agent logins, freeing its runner for another authorization, and answers 204; an authorization already ended answers 204 too (REQ-AGENTLOGIN-9). The request accepts no body. An authorization that is unknown, or not on one of the caller's agent logins, is `agent-login-authorization-not-found`. Ending an authorization serves every provider, whether or not the deployment lists an operating system for it (REQ-AGENTLOGIN-5).  Idempotency-Key is scoped to the exact acting OIDC identity and a semantic fingerprint containing agentLoginId and authorizationId. Exact replay returns the original 204 response. Reusing the key for another authorization conflicts.  Problem types: 404 `agent-login-authorization-not-found`; 503 `provider-unavailable`.
+pub fn revoke_agent_login_authorization(
+    configuration: &configuration::Configuration,
+    agent_login_id: &str,
+    authorization_id: &str,
+    idempotency_key: &str,
+) -> Result<(), Error<RevokeAgentLoginAuthorizationError>> {
+    // add a prefix to parameters to efficiently prevent name collisions
+    let p_path_agent_login_id = agent_login_id;
+    let p_path_authorization_id = authorization_id;
+    let p_header_idempotency_key = idempotency_key;
+
+    let uri_str = format!(
+        "{}/v1/me/agent-logins/{agentLoginId}/authorizations/{authorizationId}",
+        configuration.base_path,
+        agentLoginId = crate::generated::apis::urlencode(p_path_agent_login_id),
+        authorizationId = crate::generated::apis::urlencode(p_path_authorization_id)
+    );
+    let mut req_builder = configuration
+        .client
+        .request(reqwest::Method::DELETE, &uri_str);
+
+    if let Some(ref user_agent) = configuration.user_agent {
+        req_builder = req_builder.header(reqwest::header::USER_AGENT, user_agent.clone());
+    }
+    req_builder = req_builder.header("Idempotency-Key", p_header_idempotency_key.to_string());
+    if let Some(ref token) = configuration.bearer_access_token {
+        req_builder = req_builder.bearer_auth(token.to_owned());
+    };
+
+    let req = req_builder.build()?;
+    let resp = configuration.client.execute(req)?;
+
+    let status = resp.status();
+
+    if !status.is_client_error() && !status.is_server_error() {
+        Ok(())
+    } else {
+        let content = resp.text()?;
+        let entity: Option<RevokeAgentLoginAuthorizationError> =
             serde_json::from_str(&content).ok();
         Err(Error::ResponseError(ResponseContent {
             status,

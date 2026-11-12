@@ -10,6 +10,7 @@ struct RunnerCreationOutput<'a> {
     activation: &'a um_api::RunnerActivation,
     activation_file: &'a str,
 }
+mod agent_login;
 mod cloud;
 mod credential;
 mod doctor;
@@ -42,6 +43,8 @@ pub(super) struct Command {
 enum RunnerCommand {
     #[command(about = activation::ABOUT)]
     Activation(activation::Command),
+    #[command(about = agent_login::ABOUT)]
+    AgentLogin(agent_login::Command),
     #[command(about = "Create a runner registration and enrollment activation")]
     Create(CreateCommand),
     #[command(about = credential::ABOUT)]
@@ -207,6 +210,7 @@ impl Command {
             Some(RunnerCommand::Pool(command)) => command.execute(),
             Some(RunnerCommand::Create(command)) => execute_cloud(command, CreateCommand::execute),
             Some(RunnerCommand::Activation(command)) => command.execute(),
+            Some(RunnerCommand::AgentLogin(command)) => command.execute(),
             Some(RunnerCommand::Credential(command)) => command.execute(),
             Some(RunnerCommand::Enroll(command)) => command.execute(),
             Some(RunnerCommand::List(command)) => execute_cloud(command, ListCommand::execute),

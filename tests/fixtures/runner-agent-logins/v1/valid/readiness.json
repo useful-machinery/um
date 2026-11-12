@@ -1,0 +1,32 @@
+{
+  "schemaVersion": 1,
+  "updatedAt": "2026-11-12T01:00:00Z",
+  "providers": [
+    {
+      "provider": "codex",
+      "state": "ready",
+      "agentLoginId": "agl_01k0z6r1w8f4jy2m7q9v3x5abc",
+      "generation": 3,
+      "checkedAt": "2026-11-12T01:00:00Z",
+      "installedAt": "2026-11-12T00:55:00Z",
+      "installedPath": "/var/lib/um-runner/.runner-agent-login/codex/auth.json"
+    },
+    {
+      "provider": "claude_code",
+      "state": "ready",
+      "agentLoginId": "agl_01k0z6r1w8f4jy2m7q9v3x5abd",
+      "generation": 1,
+      "checkedAt": "2026-11-12T01:00:00Z",
+      "installedAt": "2026-11-12T00:56:00Z",
+      "installedPath": "/var/lib/um-runner/.runner-agent-login/claude-code.token"
+    },
+    {
+      "provider": "gemini",
+      "state": "awaiting_consent",
+      "agentLoginId": "agl_01k0z6r1w8f4jy2m7q9v3x5abe"
+    },
+    { "provider": "github", "state": "not_delivered" },
+    { "provider": "gitlab", "state": "not_delivered" },
+    { "provider": "linear", "state": "not_delivered" }
+  ]
+}

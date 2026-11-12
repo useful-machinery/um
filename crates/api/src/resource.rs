@@ -1,4 +1,4 @@
-//! Closed-response plumbing shared by the hand-written project resource clients.
+//! Closed-response plumbing shared by the hand-written resource clients.
 //!
 //! The generated client drops error headers and tolerates unknown members. These
 //! helpers keep its models while reading `Retry-After`, bounding every body,
@@ -284,6 +284,110 @@ pub(crate) fn classify_response(
         }
         _ => invalid(),
     }
+}
+
+/// A client's failure type that a problem table classifies: its own outcomes for the problems
+/// its operations answer, and these for everything outside the table.
+pub(crate) trait ProblemFailure: Clone {
+    fn rate_limited(retry_after: Option<u64>) -> Self;
+    fn unreachable(category: UnreachableCategory) -> Self;
+    fn invalid_response(credential_rejected: bool) -> Self;
+}
+
+/// One problem an operation answers: its status, its type and the failure it means.
+pub(crate) type ProblemRow<F> = (StatusCode, &'static str, F);
+
+impl ResourceFailure {
+    /// The failure of `receive_raw` or a response check, which fail only as unreachable or as
+    /// an invalid response, in a problem-classified client's terms.
+    pub(crate) fn into_problem_failure<F: ProblemFailure>(self) -> F {
+        match self {
+            Self::Unreachable { category } => F::unreachable(category),
+            Self::InvalidResponse {
+                credential_rejected,
+            } => F::invalid_response(credential_rejected),
+            _ => F::invalid_response(false),
+        }
+    }
+}
+
+/// Classifies a refusal by the row matching its status and problem type exactly. A rate limit
+/// keeps its `Retry-After`; any other unmatched server error is unreachable, and anything else
+/// is outside the contract.
+pub(crate) fn classify_problem<'a, F: ProblemFailure + 'a>(
+    status: StatusCode,
+    body: &[u8],
+    retry_after: Option<u64>,
+    problems: impl IntoIterator<Item = &'a ProblemRow<F>>,
+) -> F {
+    if status == StatusCode::TOO_MANY_REQUESTS {
+        return F::rate_limited(retry_after);
+    }
+    let kind = problem::decode(body, status)
+        .ok()
+        .map(|problem| problem.r#type);
+    if let Some((_, _, failure)) = problems
+        .into_iter()
+        .find(|(expected, slug, _)| *expected == status && kind.as_deref() == Some(*slug))
+    {
+        return failure.clone();
+    }
+    if status.is_server_error() {
+        return F::unreachable(UnreachableCategory::Server);
+    }
+    F::invalid_response(status == StatusCode::UNAUTHORIZED && kind.is_none())
+}
+
+/// Classifies a generated client's error against a problem table.
+pub(crate) fn classify_problem_error<'a, E, F: ProblemFailure + 'a>(
+    error: apis::Error<E>,
+    problems: impl IntoIterator<Item = &'a ProblemRow<F>>,
+) -> F {
+    match error {
+        apis::Error::Reqwest(error) => F::unreachable(classify_reqwest_error(&error)),
+        apis::Error::ResponseError(response) => {
+            classify_problem(response.status, response.content.as_bytes(), None, problems)
+        }
+        apis::Error::Serde(_) | apis::Error::Io(_) => F::invalid_response(false),
+    }
+}
+
+/// The response when its status is the contract's answer, otherwise the failure its problem
+/// names in `problems`.
+pub(crate) fn expect_problem_status<'a, F: ProblemFailure + 'a>(
+    response: RawResponse,
+    expected: StatusCode,
+    problems: impl IntoIterator<Item = &'a ProblemRow<F>>,
+) -> Result<RawResponse, F> {
+    if response.status == expected {
+        Ok(response)
+    } else {
+        Err(classify_problem(
+            response.status,
+            &response.body,
+            response.retry_after,
+            problems,
+        ))
+    }
+}
+
+/// Sends a DELETE whose contract answer is 204 echoing this request's key. The generated
+/// DELETE accepts any 2xx and drops its headers, so it goes out under the configured client.
+pub(crate) fn confirmed_delete<'a, F: ProblemFailure + From<ResourceFailure> + 'a>(
+    configuration: &apis::configuration::Configuration,
+    endpoint: &str,
+    key: &str,
+    problems: impl IntoIterator<Item = &'a ProblemRow<F>>,
+) -> Result<(), F> {
+    let response = receive_raw(mutation_request(
+        configuration,
+        reqwest::Method::DELETE,
+        endpoint,
+        key,
+    ))?;
+    let response = expect_problem_status(response, StatusCode::NO_CONTENT, problems)?;
+    validate_mutation_key(&response.headers, key)?;
+    Ok(())
 }
 
 /// A problem-details body of the given status whose `type` is the API problem `kind`, for the

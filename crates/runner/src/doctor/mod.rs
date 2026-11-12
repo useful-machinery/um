@@ -1,3 +1,4 @@
+mod agent_logins;
 mod claude_code;
 mod codex;
 mod git;
@@ -5,9 +6,11 @@ mod pi;
 
 use std::collections::BTreeSet;
 use std::fmt;
+use std::path::PathBuf;
 
 use um_execution::{HarnessQualification, UntestedHarnessAdvisory};
 
+use agent_logins::AgentLoginsCheck;
 use claude_code::ClaudeCodeCheck;
 use codex::CodexCheck;
 use git::GitCheck;
@@ -221,12 +224,16 @@ impl Registry {
     }
 }
 
-pub fn built_in_registry() -> Result<Registry, RegistryError> {
+/// The checks compiled into this executable. `config` is the runner operator
+/// configuration a check that needs it reads when it runs; no check reads it
+/// unless it is selected (REQ-RUNNERENROLL-45).
+pub fn built_in_registry(config: Option<PathBuf>) -> Result<Registry, RegistryError> {
     let mut registry = Registry::new();
     registry.register(Box::new(GitCheck::system()))?;
     registry.register(Box::new(PiCheck))?;
     registry.register(Box::new(ClaudeCodeCheck))?;
     registry.register(Box::new(CodexCheck))?;
+    registry.register(Box::new(AgentLoginsCheck::new(config)))?;
     Ok(registry)
 }
 
@@ -524,7 +531,7 @@ mod tests {
     // REQ-AGENT-47
     #[test]
     fn built_in_registry_contains_the_default_git_check() {
-        let registry = built_in_registry().unwrap();
+        let registry = built_in_registry(None).unwrap();
 
         assert_eq!(
             registry.descriptors(),
@@ -549,7 +556,198 @@ mod tests {
                     title: "CodexAppServerV1 installation",
                     default: false,
                 },
+                CheckDescriptor {
+                    id: "credentials.agent-logins",
+                    title: "Agent logins",
+                    default: false,
+                },
             ]
+        );
+    }
+
+    /// A runner host as enrollment leaves it: a private state directory and
+    /// the operator configuration naming the state inside it.
+    struct AgentLoginHost {
+        root: tempfile::TempDir,
+        config: std::path::PathBuf,
+    }
+
+    impl AgentLoginHost {
+        fn new() -> Self {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            let root = tempfile::tempdir().unwrap();
+            let state = root.path().join("state");
+            std::fs::create_dir(&state).unwrap();
+            std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let config = root.path().join("runner.json");
+            std::fs::write(
+                &config,
+                serde_json::to_vec(&serde_json::json!({
+                    "schemaVersion": 1,
+                    "deploymentMode": "development",
+                    "runnerStatePath": state.join("runner-state.json"),
+                    "controlSocketPath": root.path().join("runner.sock"),
+                    "workRoot": root.path().join("work"),
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            Self { root, config }
+        }
+
+        fn record_codex(&self, state: &str) {
+            use std::os::unix::fs::OpenOptionsExt as _;
+
+            let document = serde_json::json!({
+                "schemaVersion": 1,
+                "updatedAt": "2026-11-12T01:00:00Z",
+                "providers": [
+                    {"provider": "codex", "state": state},
+                    {"provider": "github", "state": "not_delivered"},
+                    {"provider": "gitlab", "state": "not_delivered"},
+                    {"provider": "linear", "state": "not_delivered"},
+                ],
+            });
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(
+                    self.root
+                        .path()
+                        .join("state")
+                        .join(".runner-agent-logins.json"),
+                )
+                .unwrap();
+            std::io::Write::write_all(&mut file, &serde_json::to_vec(&document).unwrap()).unwrap();
+        }
+
+        fn run(&self) -> Outcome {
+            run_agent_logins(Some(self.config.clone()))
+        }
+    }
+
+    fn run_agent_logins(config: Option<std::path::PathBuf>) -> Outcome {
+        let report = built_in_registry(config)
+            .unwrap()
+            .run(&["credentials.agent-logins".to_owned()])
+            .unwrap();
+        let [result] = <[_; 1]>::try_from(report.results).unwrap();
+        result.outcome
+    }
+
+    // REQ-RUNNERENROLL-86
+    #[test]
+    fn agent_logins_check_passes_when_every_authorized_provider_is_ready() {
+        let host = AgentLoginHost::new();
+        host.record_codex("ready");
+
+        let outcome = host.run();
+
+        assert_eq!((outcome.status, outcome.code), (Status::Pass, "ok"));
+        assert_eq!(
+            outcome.details.get("codex").map(String::as_str),
+            Some("ready")
+        );
+    }
+
+    // REQ-RUNNERENROLL-86
+    #[test]
+    fn agent_logins_check_fails_with_the_state_of_an_authorized_provider_that_is_not_ready() {
+        let host = AgentLoginHost::new();
+        host.record_codex("foreign_login");
+
+        let outcome = host.run();
+
+        assert_eq!(
+            (outcome.status, outcome.code),
+            (Status::Fail, "foreign_login")
+        );
+        assert_eq!(
+            outcome.details.get("provider").map(String::as_str),
+            Some("codex")
+        );
+    }
+
+    // REQ-RUNNERENROLL-86
+    #[test]
+    fn agent_logins_check_passes_when_cloud_authorized_no_provider() {
+        for state in ["not_authorized", "revoked"] {
+            let host = AgentLoginHost::new();
+            host.record_codex(state);
+
+            let outcome = host.run();
+
+            assert_eq!(
+                (outcome.status, outcome.code),
+                (Status::Pass, "ok"),
+                "{state}"
+            );
+        }
+    }
+
+    // REQ-RUNNERENROLL-86
+    #[test]
+    fn agent_logins_check_fails_without_recorded_readiness_or_configuration() {
+        let host = AgentLoginHost::new();
+        let outcome = host.run();
+        assert_eq!(
+            (outcome.status, outcome.code),
+            (Status::Fail, "readiness_unknown")
+        );
+
+        // A document the check cannot load says why, as a closed class.
+        host.record_codex("ready");
+        let document = host.root.path().join("state/.runner-agent-logins.json");
+        std::fs::set_permissions(
+            &document,
+            <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o644),
+        )
+        .unwrap();
+        let outcome = host.run();
+        assert_eq!(
+            (outcome.status, outcome.code),
+            (Status::Fail, "readiness_unknown")
+        );
+        assert_eq!(
+            outcome.details.get("cause").map(String::as_str),
+            Some("permission_denied")
+        );
+
+        let outcome = run_agent_logins(None);
+        assert_eq!(
+            (outcome.status, outcome.code),
+            (Status::Fail, "config_required")
+        );
+
+        let absent = host.config.with_file_name("no-such-runner.toml");
+        let outcome = run_agent_logins(Some(absent));
+        assert_eq!(
+            (outcome.status, outcome.code),
+            (Status::Fail, "config_invalid")
+        );
+    }
+
+    // REQ-RUNNERENROLL-45
+    #[test]
+    fn a_default_run_with_configuration_runs_only_the_git_check() {
+        let host = AgentLoginHost::new();
+        // A readiness document the default run would fail on if it read it.
+        host.record_codex("install_failed");
+
+        let report = built_in_registry(Some(host.config.clone()))
+            .unwrap()
+            .run(&[])
+            .unwrap();
+
+        assert_eq!(
+            report
+                .results
+                .iter()
+                .map(|result| result.descriptor.id)
+                .collect::<Vec<_>>(),
+            ["environment.command.git"]
         );
     }
 }

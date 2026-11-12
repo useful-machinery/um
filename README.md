@@ -886,6 +886,61 @@ The example is synthetic: the GitLab.com namespace was observed in an isolated
 tenant, not yet qualified against the production connection. These labels do not
 enable a provider or link accounts by email.
 
+Agent logins are the sign-ins of the coding agents (Codex and Claude Code) a member keeps in
+Useful Machinery for an organization's runners. Import, read, authorize and revoke your own
+under `auth agent-login`; the commands use the signed-in human session only:
+
+```sh
+# Import a Codex login for the organization from an auth.json you own with mode 0600 (or -
+# for standard input). The file is sent unchanged, at most 32 KiB, and must be a JSON object.
+um auth agent-login import acme codex --from-file ./auth.json --label "build laptop"
+
+# Or make a fresh Codex login for it: runs `codex login` (found on PATH) in a private
+# temporary Codex home, imports the login it writes and removes that home. Your own Codex
+# login in ~/.codex is neither read nor changed.
+um auth agent-login import acme codex --login --label "build runner"
+
+# Import the token `claude setup-token` printed, saved as one line in a file you own with
+# mode 0600 (or - for standard input).
+um auth agent-login import acme claude_code --token-file ./claude-token
+
+# Store a newer sign-in as the next generation of an existing agent login.
+um auth agent-login import acme codex --from-file ./auth.json \
+  --agent-login agl_01k0z6r1w8f4jy2m7q9v3x5abc
+
+# List one page of your agent logins with their authorized runners, what each runner was
+# last delivered and what it last reported. Continue with --cursor when a next cursor is shown.
+um auth agent-login list --limit 50
+
+# Show one agent login by the agl_ ID that list prints.
+um auth agent-login show agl_01k0z6r1w8f4jy2m7q9v3x5abc
+
+# Authorize one runner of the organization, named by the rnr_ ID that `um runner list acme`
+# prints, to receive it. Every run that runner serves, whichever member caused it, can then
+# use the login, and every step on that runner can read it; the command says so first and
+# does nothing without --yes. A Codex login serves one runner at a time.
+um auth agent-login authorize agl_01k0z6r1w8f4jy2m7q9v3x5abc \
+  --runner rnr_01k0z6r1w8f4jy2m7q9v3x5abc --yes
+
+# End that runner's authorization.
+um auth agent-login deauthorize agl_01k0z6r1w8f4jy2m7q9v3x5abc \
+  --runner rnr_01k0z6r1w8f4jy2m7q9v3x5abc --yes
+
+# Revoke it. Cloud erases the login and ends its authorizations; the session at the
+# provider stays signed in until you sign out there.
+um auth agent-login revoke agl_01k0z6r1w8f4jy2m7q9v3x5abc --yes
+```
+
+Each command prints the agent login without its material, and `--json` prints one
+schema-version-1 document (`listed` with `items` and `nextCursor`, `shown` or `imported`
+with `agentLogin`, `authorized` with `agentLoginId` and `authorization`, `deauthorized`
+with `agentLoginId`, `authorizationId` and `runnerId`, or `revoked` with `agentLoginId`). An unsafe or malformed source exits 2
+before anything is sent; a `--login` sign-in that fails, is interrupted or writes no login
+reports `provider_login_failed`, exits 1 and sends nothing. A refusal names one outcome, such as `agent_login_not_found`,
+`material_invalid`, `runner_holds_login` or `authorization_not_found`, and exits 1. Import,
+authorization, deauthorization and revocation each send one request key and replay it once
+when the response is lost.
+
 One successful login establishes a renewable human session. The CLI stores the one-hour
 access token, its expiration, and a rotating refresh token in
 `~/.um/credentials.json`, then silently renews access for every human-authenticated
@@ -2071,6 +2126,10 @@ um runner doctor \
 um runner doctor \
   --check execution.harness.codex-app-server-v1
 
+# Check the agent-login readiness the serving runner recorded.
+um runner doctor \
+  --check credentials.agent-logins --config /etc/um/runner.json
+
 # List IDs without running any checks.
 um runner doctor --list-checks
 
@@ -2087,6 +2146,15 @@ release. A passing harness check also reports the detail `qualification`:
 `supported_range` for a release in the qualified range, or `untested` for a stable
 release newer than the qualification release. An untested installation still passes
 with code `ok`, and the command exits 0 when every selected check passes.
+
+The opt-in `credentials.agent-logins` check reads the readiness document
+`um runner serve` records beside `runnerStatePath`, found through `--config PATH`; no
+other check reads the configuration. It passes when every agent login Cloud authorized
+for the runner is `ready`, or Cloud authorized none (`not_authorized` or `revoked`), and
+otherwise fails with that provider's state as its code, such as `foreign_login`. It fails
+`readiness_unknown` when the runner has recorded no readiness yet, `config_invalid` for a
+configuration it cannot load, and `config_required` without `--config`. It takes no lock,
+never reads the runner credential, contacts nothing, and reports no login material.
 
 Checks are registered statically by components compiled into this executable. The
 command does not load plugins, read human credentials, contact Useful Machinery, or change
@@ -2194,6 +2262,29 @@ old Cloud credential active until local status shows the replacement current and
 `runner credential list` shows its `lastAuthenticatedAt`; then retire it with the fixed
 grace or revoke it immediately if compromise is suspected. Never print an activation
 artifact or runner state while transferring or verifying it.
+
+Runner Serve installs the agent logins members have authorized for the runner when it
+starts and every five minutes while it holds no assignment. It keeps them in its own
+`.runner-agent-login/` directory beside `runnerStatePath`, never in the service's `~/.codex`
+or Claude Code configuration, and offers them to each assignment as `CODEX_HOME` and
+`CLAUDE_CODE_OAUTH_TOKEN`: a workflow's steps use a delivered login only when the workflow's
+`environmentPassthrough` names that variable. Steps given the runner's `CODEX_HOME` read
+only its configuration there, not the service's own Codex configuration. While the service
+sets `CODEX_HOME` or has a Claude Code login of its own, that provider is reported
+`foreign_login` and nothing is installed for it. `um runner status` shows each provider's
+readiness once it has set up, and you can ask the live runner to set up now:
+
+```sh
+um runner agent-login sync --config /etc/um/runner.json
+um runner agent-login sync --config /etc/um/runner.json --json
+```
+
+The command goes only through the local control socket and prints one line per provider
+(`codex login:       ready (generation 3)`), or with `--json` a schema-version-1 `synced`
+document with `agentLogins`. It exits 1 when a provider authorized for the runner is not
+`ready`, and 4 when Runner Serve is not reachable or holds an assignment (`runner_busy`). A
+Runner Serve process started from an older `um` refuses the request; restart it on this
+release.
 
 Runner startup selects `pi`, `claude`, and `codex` independently from its inherited
 operator-controlled `PATH`. Useful Machinery installs none of them. Each successful installation

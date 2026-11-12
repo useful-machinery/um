@@ -78,10 +78,13 @@ fn write_status(output: &mut impl Write, status: &StatusSnapshot) -> io::Result<
     if let Some(failure) = status.last_connection_failure {
         writeln!(output, "last failure:   {}", enum_json(failure)?)?;
     }
+    if let Some(readiness) = &status.agent_logins {
+        super::agent_login::write_readiness(output, readiness)?;
+    }
     Ok(())
 }
 
-fn enum_json(value: impl serde::Serialize) -> io::Result<String> {
+pub(super) fn enum_json(value: impl serde::Serialize) -> io::Result<String> {
     let value = serde_json::to_value(value)?;
     value
         .as_str()
@@ -193,6 +196,7 @@ mod tests {
                 ..AssignmentCounts::default()
             },
             last_connection_failure: None,
+            agent_logins: None,
         };
         let mut output = Vec::new();
         write_status(&mut output, &status).unwrap();

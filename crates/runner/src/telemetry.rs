@@ -17,6 +17,25 @@ use serde_json::{Map, Number, Value};
 
 mod otlp;
 pub(crate) mod attribute {
+    /// A `runner.agent_login_setup` record names each provider whose
+    /// readiness changed in the attribute's key, so one record can carry
+    /// every provider a pass changed (REQ-TELEMETRY-45).
+    pub(crate) const AGENT_LOGIN_CODEX_STATE: &str = "um.agent_login.codex.state";
+    pub(crate) const AGENT_LOGIN_CODEX_GENERATION: &str = "um.agent_login.codex.generation";
+    pub(crate) const AGENT_LOGIN_CLAUDE_CODE_STATE: &str = "um.agent_login.claude_code.state";
+    pub(crate) const AGENT_LOGIN_CLAUDE_CODE_GENERATION: &str =
+        "um.agent_login.claude_code.generation";
+    /// Beside a provider's state when a step of its setup failed: the stage,
+    /// the closed cause, and Cloud's HTTP status when the cause is one.
+    pub(crate) const AGENT_LOGIN_CODEX_FAILURE_STAGE: &str = "um.agent_login.codex.failure_stage";
+    pub(crate) const AGENT_LOGIN_CODEX_FAILURE_CAUSE: &str = "um.agent_login.codex.failure_cause";
+    pub(crate) const AGENT_LOGIN_CODEX_HTTP_STATUS: &str = "um.agent_login.codex.http_status";
+    pub(crate) const AGENT_LOGIN_CLAUDE_CODE_FAILURE_STAGE: &str =
+        "um.agent_login.claude_code.failure_stage";
+    pub(crate) const AGENT_LOGIN_CLAUDE_CODE_FAILURE_CAUSE: &str =
+        "um.agent_login.claude_code.failure_cause";
+    pub(crate) const AGENT_LOGIN_CLAUDE_CODE_HTTP_STATUS: &str =
+        "um.agent_login.claude_code.http_status";
     pub(crate) const BACKOFF_MS: &str = "um.connection.backoff_ms";
     pub(crate) const CONNECTION_ATTEMPT: &str = "um.connection.attempt";
     pub(crate) const EFFECT_ACKNOWLEDGEMENTS_CONFIRMED: &str =
@@ -641,6 +660,21 @@ pub(crate) fn integer(value: u64) -> i64 {
 
 pub(crate) fn integer_u128(value: u128) -> i64 {
     i64::try_from(value).unwrap_or(i64::MAX)
+}
+
+/// The closed class a record carries for an I/O failure, never its message:
+/// the kinds a runner host commonly meets, else `io_error`.
+pub(crate) fn io_error_class(kind: io::ErrorKind) -> &'static str {
+    match kind {
+        io::ErrorKind::NotFound => "not_found",
+        io::ErrorKind::PermissionDenied => "permission_denied",
+        io::ErrorKind::NotADirectory => "not_a_directory",
+        io::ErrorKind::IsADirectory => "is_a_directory",
+        io::ErrorKind::StorageFull => "storage_full",
+        io::ErrorKind::Unsupported => "unsupported",
+        io::ErrorKind::InvalidData => "invalid_data",
+        _ => "io_error",
+    }
 }
 
 #[cfg(test)]

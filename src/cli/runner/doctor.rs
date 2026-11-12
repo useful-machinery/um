@@ -1,4 +1,5 @@
 use std::io::{self, Write};
+use std::path::PathBuf;
 
 use anyhow::{Context, anyhow};
 use clap::Args;
@@ -22,6 +23,10 @@ pub(super) struct Command {
     )]
     list_checks: bool,
 
+    /// Read the runner operator configuration for a selected check that needs it.
+    #[arg(long, value_name = "PATH", conflicts_with = "list_checks")]
+    config: Option<PathBuf>,
+
     // Doctor and enrollment have unrelated operation inputs and execution paths; sharing their
     // command shells would couple those contracts merely because both use runner JSON output.
     #[command(flatten)]
@@ -30,7 +35,12 @@ pub(super) struct Command {
 
 impl Command {
     pub(super) fn execute(self) -> super::super::CommandResult {
-        let registry = built_in_registry().map_err(|error| anyhow!(error))?;
+        let config = self
+            .config
+            .as_deref()
+            .map(super::operator_config_path)
+            .transpose()?;
+        let registry = built_in_registry(config).map_err(|error| anyhow!(error))?;
 
         if self.list_checks {
             write_check_list(&registry.descriptors())?;

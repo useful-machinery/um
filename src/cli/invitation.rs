@@ -577,12 +577,7 @@ fn read_capability(path: &Path, invitation_id: &str) -> Result<SecretToken, Capa
             "capability input exceeds 128 bytes",
         ));
     }
-    if bytes.last() == Some(&b'\n') {
-        bytes.pop();
-        if bytes.last() == Some(&b'\r') {
-            bytes.pop();
-        }
-    }
+    super::secret_file::trim_line_ending(&mut bytes);
     let capability = std::str::from_utf8(&bytes)
         .map_err(|_| CapabilityError::invalid(source.clone(), "capability input is not UTF-8"))?;
     if !valid_capability(capability, invitation_id) {

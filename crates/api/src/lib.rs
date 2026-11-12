@@ -1,3 +1,4 @@
+mod agent_logins;
 mod artifacts;
 #[cfg(test)]
 #[allow(
@@ -69,6 +70,11 @@ fn bearer_authorization(access_token: &str) -> Result<HeaderValue, InvalidHeader
     HeaderValue::from_str(&value)
 }
 
+pub use agent_logins::{
+    AGENT_LOGIN_RECORD_SCHEMA_VERSION, AgentLogin, AgentLoginApi, AgentLoginApiError,
+    AgentLoginAuthorization, AgentLoginFailure, AgentLoginImport, AgentLoginImportProvider,
+    AgentLoginList, AgentLoginProvider, AgentLoginReportState, AgentLoginState,
+};
 pub use artifacts::{
     ArtifactApi, ArtifactApiError, ArtifactCapabilityMember, ArtifactInventoryPage, ArtifactMember,
     ArtifactSource,

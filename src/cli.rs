@@ -43,6 +43,7 @@ mod project;
 mod publication;
 mod run;
 mod runner;
+mod secret_file;
 mod service_principal;
 mod version;
 mod workflow;
@@ -684,6 +685,119 @@ impl<'a> ApiFailureResult<'a> {
             category,
             retry_after,
         }
+    }
+}
+
+/// An API operation's failure as a member reads it: the closed outcome and the facts a script
+/// needs, which `--json` prints, and the human summary and remedy.
+struct ApiFailureReport {
+    outcome: &'static str,
+    category: Option<&'static str>,
+    retry_after: Option<u64>,
+    summary: String,
+    remedy: String,
+    class: OutcomeClass,
+}
+
+impl ApiFailureReport {
+    fn new(
+        outcome: &'static str,
+        summary: impl Into<String>,
+        remedy: impl Into<String>,
+        class: OutcomeClass,
+    ) -> Self {
+        Self {
+            outcome,
+            category: None,
+            retry_after: None,
+            summary: summary.into(),
+            remedy: remedy.into(),
+            class,
+        }
+    }
+
+    // The failures every member API reports alike, worded for its `subject`: "agent login" or
+    // "provider grant".
+    fn unauthenticated(subject: &str) -> Self {
+        Self::new(
+            "unauthenticated",
+            format!("! You must sign in before managing {subject}s."),
+            "Run:\n  um auth login",
+            OutcomeClass::Unauthenticated,
+        )
+    }
+
+    fn forbidden(subject: &str) -> Self {
+        Self::new(
+            "forbidden",
+            format!("! Your account is not permitted to manage {subject}s."),
+            "Sign in as an active member:\n  um auth login",
+            OutcomeClass::Forbidden,
+        )
+    }
+
+    fn idempotency_conflict(subject: &str) -> Self {
+        Self::new(
+            "idempotency_conflict",
+            format!("error: {subject} request key already used for another request"),
+            "Run the command again; it sends a new request key.",
+            OutcomeClass::GeneralFailure,
+        )
+    }
+
+    fn rate_limited(subject: &str, retry_after: Option<u64>) -> Self {
+        let summary = match retry_after {
+            Some(seconds) => {
+                format!("error: {subject} requests rate limited\nretry after: {seconds}s")
+            }
+            None => format!("error: {subject} requests rate limited"),
+        };
+        Self {
+            retry_after,
+            ..Self::new(
+                "rate_limited",
+                summary,
+                "Wait, then run the command again.",
+                OutcomeClass::RateLimited,
+            )
+        }
+    }
+
+    fn unreachable(deployment: &str, category: UnreachableCategory) -> Self {
+        Self {
+            category: Some(category.as_str()),
+            ..Self::new(
+                "unreachable",
+                format!(
+                    "error: Useful Machinery deployment unreachable: {deployment}\ncategory: {}",
+                    category.as_str()
+                ),
+                "Check access to the deployment, then run the command again.",
+                unreachable_outcome_class(category),
+            )
+        }
+    }
+
+    fn invalid_response(subject: &str) -> Self {
+        Self::new(
+            "invalid_response",
+            format!("error: invalid {subject} response from the deployment"),
+            "Use a CLI version supported by this deployment.",
+            OutcomeClass::Protocol,
+        )
+    }
+
+    /// Prints the closed result with `--json`, otherwise the summary and remedy on stderr.
+    fn write(&self, deployment: &str, json: bool) -> anyhow::Result<ExitCode> {
+        write_api_failure(
+            deployment,
+            self.outcome,
+            self.category,
+            self.retry_after,
+            &format!("{}\n\n{}", self.summary, self.remedy),
+            self.class,
+            json,
+        )
     }
 }
 
@@ -1768,6 +1882,44 @@ fn execute_required_api_operation_retrying_result<T, E>(
     }
 }
 
+/// A member API that admits only the signed-in human session.
+trait HumanSessionApi: Sized {
+    type Failure;
+    type BuildError: std::error::Error + Send + Sync + 'static;
+
+    fn build(
+        api_url: &str,
+        token: &str,
+        policy: HttpTransportPolicy,
+    ) -> Result<Self, Self::BuildError>;
+    fn credential_rejected(failure: &Self::Failure) -> bool;
+    fn unauthenticated() -> Self::Failure;
+    fn unreachable(category: UnreachableCategory) -> Self::Failure;
+}
+
+/// Runs `f` against a member API with the signed-in human session, refreshing a rejected
+/// session once.
+fn with_human_session_api<A: HumanSessionApi, T>(
+    deployment: &Deployment,
+    policy: HttpTransportPolicy,
+    mut f: impl FnMut(&A) -> Result<T, A::Failure>,
+) -> anyhow::Result<Result<T, A::Failure>> {
+    let client = human_session_client(policy)?;
+    execute_required_api_operation_retrying_result(
+        &client,
+        deployment,
+        |token| {
+            let api = A::build(deployment.fingerprint().api_url(), token, policy)
+                .map_err(anyhow::Error::new)?;
+            Ok(f(&api))
+        },
+        |result| result.as_ref().is_err_and(A::credential_rejected),
+        A::unauthenticated,
+        A::unreachable,
+        "acquire human session",
+    )
+}
+
 fn execute_human_api_operation<O, E>(
     client: &um_api::HttpClient,
     deployment: &Deployment,
@@ -2439,6 +2591,13 @@ mod tests {
             "artifact list",
             "artifact validate",
             "auth",
+            "auth agent-login",
+            "auth agent-login authorize",
+            "auth agent-login deauthorize",
+            "auth agent-login import",
+            "auth agent-login list",
+            "auth agent-login revoke",
+            "auth agent-login show",
             "auth grant",
             "auth grant create",
             "auth grant list",
@@ -2608,6 +2767,8 @@ mod tests {
             "runner activation issue",
             "runner activation list",
             "runner activation revoke",
+            "runner agent-login",
+            "runner agent-login sync",
             "runner create",
             "runner credential",
             "runner credential list",

@@ -1,0 +1,16 @@
+{
+  "schemaVersion": 1,
+  "updatedAt": "2026-11-12T01:00:00Z",
+  "providers": [
+    {
+      "provider": "codex",
+      "state": "ready",
+      "agentLoginId": "agl_01k0z6r1w8f4jy2m7q9v3x5abc",
+      "generation": 3,
+      "checkedAt": "2026-11-12T01:00:00Z",
+      "installedAt": "2026-11-12T00:55:00Z",
+      "installedPath": "/var/lib/um-runner/.runner-agent-login/codex/auth.json",
+      "material": "eyJ0b2tlbnMiOnt9fQ=="
+    }
+  ]
+}

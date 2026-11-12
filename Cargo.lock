@@ -2826,6 +2826,7 @@ dependencies = [
  "time",
  "tokio",
  "tokio-tungstenite",
+ "toml_edit",
  "ulid",
  "um-execution",
  "um-runner-protocol",

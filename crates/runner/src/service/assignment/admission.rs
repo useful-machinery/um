@@ -35,6 +35,9 @@ impl AssignmentManager {
             claude_code_installation: config.claude_code_installation().cloned(),
             codex_installation: config.codex_installation().cloned(),
             environment: EnvironmentSnapshot::new(std::env::vars_os()),
+            agent_login_directory: config
+                .state_access()
+                .map(|state| crate::agent_login::directory::LoginDirectory::beside(state.path())),
             execution_version,
             lease_clock,
             sleeper,
@@ -414,7 +417,8 @@ impl AssignmentManager {
         let worker_offer = offer.clone();
         let environment = self.environment.clone();
         let input_broker = self.input_broker.clone();
-        let runtime = self.admission_runtime();
+        let mut runtime = self.admission_runtime();
+        let agent_login_directory = self.agent_login_directory.clone();
         let sender = self.event_sender.clone();
         let wake = self.outbox.clone();
         if let Some(LocalSlot::Preparing(preparing)) = &mut self.slot {
@@ -439,6 +443,12 @@ impl AssignmentManager {
                 }
             };
             let _preparation_fence = preparation_fence;
+            // The steps draw from the process environment with the agent
+            // logins the runner keeps now, looked at for this admission, so a
+            // login delivered or removed while the runner serves applies from
+            // the next assignment (REQ-AGENTLOGIN-27, REQ-AGENTLOGIN-34).
+            runtime.environment =
+                crate::agent_login::offer(&runtime.environment, agent_login_directory.as_ref());
             let mut root = root;
             let workspace_path = root.workspace.path();
             let preparation = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {

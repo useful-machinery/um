@@ -5,8 +5,8 @@ use clap::{Arg, ArgAction, Command, CommandFactory};
 
 use super::Cli;
 
-const LEAVES: &str = "accept activate answer approve begin cancel complete continue create decline delete disable doctor download drain enable end enroll hand-back history interrupt issue leave lift link list login logout move preview propose publish reference release remove rename replay request restart resume retire retry revoke revoke-previous-secret rotate-secret run schema seal serve set show signup status stop test update upgrade upload uses validate version view wait withdraw";
-const GROUPS: &str = "account action activation artifact audit auth authorization connection credential definition delegation deletion delivery github gitlab grant identity input input-set installation invitation linear member occurrence organization pool project publication repository run runner runner-pool schedule service-principal setup state team trigger evaluation webhook workflow";
+const LEAVES: &str = "accept activate answer approve authorize begin cancel complete continue create deauthorize decline delete disable doctor download drain enable end enroll hand-back history import interrupt issue leave lift link list login logout move preview propose publish reference release remove rename replay request restart resume retire retry revoke revoke-previous-secret rotate-secret run schema seal serve set show signup status stop sync test update upgrade upload uses validate version view wait withdraw";
+const GROUPS: &str = "account action activation agent-login artifact audit auth authorization connection credential definition delegation deletion delivery github gitlab grant identity input input-set installation invitation linear member occurrence organization pool project publication repository run runner runner-pool schedule service-principal setup state team trigger evaluation webhook workflow";
 const COMMON: [&str; 3] = ["json", "service-api-key-file", "allow-insecure-http"];
 // These leaves have no limit/cursor contract; see cli/docs/output-style.md.
 const UNPAGINATED_LISTS: [&str; 4] = [
@@ -42,6 +42,7 @@ fn semantic_class(path: &str, long: &str) -> Option<String> {
         "limit" => match path {
             "organization audit list" => "limit:100",
             "artifact list"
+            | "auth agent-login list"
             | "auth grant list"
             | "auth grant uses"
             | "auth identity list"
@@ -84,6 +85,8 @@ fn semantic_class(path: &str, long: &str) -> Option<String> {
                 "streaming-events"
             } else if matches!(path, "auth logout" | "auth status") {
                 "sign-in"
+            } else if path.starts_with("auth agent-login ") {
+                "agent-login"
             } else if path.starts_with("auth grant ") {
                 "grant"
             } else if path.starts_with("auth identity ") {
@@ -371,6 +374,8 @@ fn entity_identifier_flags_match_the_command_tree_and_parser() {
 // REQ-ACCOUNT-61
 // REQ-SERVICEPRINCIPAL-20
 // REQ-GRANT-6
+// REQ-AGENTLOGIN-20
+// REQ-AGENTLOGIN-25
 #[test]
 fn destructive_leaves_require_confirmation_but_runner_modes_do_not() {
     let gated: &[&[&str]] = &[
@@ -407,6 +412,28 @@ fn destructive_leaves_require_confirmation_but_runner_modes_do_not() {
             "activation",
         ],
         &["auth", "grant", "revoke", "pgr_01k0z6r1w8f4jy2m7q9v3x5abc"],
+        &[
+            "auth",
+            "agent-login",
+            "revoke",
+            "agl_01k0z6r1w8f4jy2m7q9v3x5abc",
+        ],
+        &[
+            "auth",
+            "agent-login",
+            "authorize",
+            "agl_01k0z6r1w8f4jy2m7q9v3x5abc",
+            "--runner",
+            "rnr_01k0z6r1w8f4jy2m7q9v3x5abc",
+        ],
+        &[
+            "auth",
+            "agent-login",
+            "deauthorize",
+            "agl_01k0z6r1w8f4jy2m7q9v3x5abc",
+            "--runner",
+            "rnr_01k0z6r1w8f4jy2m7q9v3x5abc",
+        ],
         &["auth", "identity", "remove", "identity"],
         &[
             "connection",

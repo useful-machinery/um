@@ -978,6 +978,7 @@ fn deterministic_connection_loop_dependencies(
         boot_id,
         source_broker: None,
         recovery_host: super::recovery::host_fixture::fixture_host(),
+        agent_login_setup: None,
     }
 }
 

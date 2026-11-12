@@ -4,12 +4,17 @@ use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::time::Duration;
 
+use super::agent_login::setup::SYNC_BOUND;
 use super::control_protocol::{
     Operation, ProtocolFailure, RESPONSE_LIMIT, Response, decode_response, encode_request,
 };
 
 const IO_TIMEOUT: Duration = Duration::from_secs(2);
 const RELOAD_RESPONSE_TIMEOUT: Duration = Duration::from_secs(32);
+/// Runner Serve bounds an agent-login sync at `SYNC_BOUND`; the client waits
+/// a little longer for its answer.
+pub(crate) const SYNC_RESPONSE_TIMEOUT: Duration =
+    SYNC_BOUND.saturating_add(Duration::from_secs(2));
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum RequestFailure {
@@ -40,6 +45,7 @@ pub fn request(socket_path: &Path, operation: Operation) -> Result<Response, Req
     let response_timeout = match operation {
         Operation::Status => IO_TIMEOUT,
         Operation::ReloadCredential => RELOAD_RESPONSE_TIMEOUT,
+        Operation::SyncAgentLogins => SYNC_RESPONSE_TIMEOUT,
     };
     stream
         .set_read_timeout(Some(response_timeout))
