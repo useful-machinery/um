@@ -1,0 +1,151 @@
+#!/usr/bin/env python3
+"""Drive run-named-test against a stub cargo that records each argument vector."""
+
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+
+PUBLIC_ROOT = Path(__file__).resolve().parent.parent
+SCRIPT = PUBLIC_ROOT / "scripts/run-named-test"
+PACKAGE = "fixture-package"
+TEST_PATH = "module::tests::named_test"
+OPTIONS = ["--release", "--target", "fixture-target"]
+LIST_SUFFIX = ["--", "--exact", "--list", "--format", "terse"]
+# The run names --include-ignored: a named test marked #[ignore] lists as selected, and
+# without the flag it would run as zero tests and exit 0.
+RUN_SUFFIX = ["--", "--exact", "--include-ignored", "--nocapture"]
+STUB = f"""#!{sys.executable}
+import json
+import os
+import sys
+from pathlib import Path
+
+arguments = sys.argv[1:]
+with open(os.environ["STUB_CARGO_LOG"], "a", encoding="utf-8") as log:
+    log.write(json.dumps(arguments) + "\\n")
+if "--list" in arguments:
+    sys.stdout.buffer.write(Path(os.environ["STUB_CARGO_LISTING"]).read_bytes())
+    raise SystemExit(int(os.environ["STUB_CARGO_LIST_STATUS"]))
+raise SystemExit(int(os.environ["STUB_CARGO_RUN_STATUS"]))
+"""
+
+
+def fail(message: str) -> None:
+    raise SystemExit(f"test-run-named-test: {message}")
+
+
+class Fixture:
+    def __init__(self, root: Path) -> None:
+        self.root = root
+        self.bin = root / "bin"
+        self.bin.mkdir()
+        cargo = self.bin / "cargo"
+        cargo.write_text(STUB, encoding="utf-8")
+        cargo.chmod(0o755)
+        self.log = root / "cargo.log"
+        self.listing = root / "listing"
+
+    def run(
+        self,
+        arguments: list[str],
+        *,
+        listing: str = "",
+        list_status: int = 0,
+        run_status: int = 0,
+    ) -> tuple[subprocess.CompletedProcess[bytes], list[list[str]]]:
+        self.log.write_text("", encoding="utf-8")
+        self.listing.write_text(listing, encoding="utf-8")
+        environment = dict(os.environ)
+        environment.update(
+            PATH=f"{self.bin}{os.pathsep}{environment.get('PATH', '')}",
+            STUB_CARGO_LOG=str(self.log),
+            STUB_CARGO_LISTING=str(self.listing),
+            STUB_CARGO_LIST_STATUS=str(list_status),
+            STUB_CARGO_RUN_STATUS=str(run_status),
+        )
+        result = subprocess.run(
+            [sys.executable, str(SCRIPT), *arguments],
+            env=environment,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        calls = [
+            json.loads(line)
+            for line in self.log.read_text(encoding="utf-8").splitlines()
+            if line
+        ]
+        return result, calls
+
+
+def selection(suffix: list[str]) -> list[str]:
+    return ["test", "--locked", *OPTIONS, "-p", PACKAGE, TEST_PATH, *suffix]
+
+
+def expect_refusal(
+    fixture: Fixture, description: str, *, listing: str, list_status: int = 0
+) -> None:
+    result, calls = fixture.run(
+        [PACKAGE, TEST_PATH, *OPTIONS], listing=listing, list_status=list_status
+    )
+    if result.returncode == 0:
+        fail(f"{description} exited 0")
+    if not result.stderr.strip():
+        fail(f"{description} printed no diagnostic on standard error")
+    if calls != [selection(LIST_SUFFIX)]:
+        fail(f"{description} made calls other than the one listing: {calls}")
+
+
+# INV-TESTING-24
+def main() -> None:
+    if not SCRIPT.is_file():
+        fail(f"{SCRIPT} is missing")
+    with tempfile.TemporaryDirectory(prefix="run-named-test-") as temporary:
+        fixture = Fixture(Path(temporary))
+        exact = f"{TEST_PATH}: test\n"
+
+        result, calls = fixture.run([PACKAGE, TEST_PATH, *OPTIONS], listing=exact)
+        if result.returncode != 0:
+            fail(f"the one named test did not pass: {result.stderr.decode()}")
+        if calls != [selection(LIST_SUFFIX), selection(RUN_SUFFIX)]:
+            fail(f"the one named test was not listed then run as expected: {calls}")
+
+        expect_refusal(fixture, "an empty listing", listing="")
+        expect_refusal(
+            fixture, "a listing of another path", listing="module::tests::other: test\n"
+        )
+        expect_refusal(
+            fixture,
+            "a listing of two tests",
+            listing=f"{TEST_PATH}: test\n{TEST_PATH}_too: test\n",
+        )
+        expect_refusal(fixture, "a failing listing", listing=exact, list_status=101)
+
+        result, calls = fixture.run(
+            [PACKAGE, TEST_PATH, *OPTIONS], listing=exact, run_status=101
+        )
+        if result.returncode != 101:
+            fail(f"a failing run exited {result.returncode}, not Cargo's 101")
+        if len(calls) != 2:
+            fail(f"a failing run did not list then run: {calls}")
+
+        for arguments in ([], [PACKAGE]):
+            result, calls = fixture.run(arguments, listing=exact)
+            if result.returncode != 2 or calls:
+                fail(
+                    f"{len(arguments)} arguments exited {result.returncode} "
+                    f"after {len(calls)} cargo calls, not 2 after none"
+                )
+
+    print("run-named-test checks passed.")
+
+
+if __name__ == "__main__":
+    main()

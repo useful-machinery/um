@@ -49,12 +49,14 @@ required_files=(
   scripts/package-release-archive
   scripts/reconcile-release
   scripts/release-impact
+  scripts/run-named-test
   scripts/test-change-fragments
   scripts/test-release-candidate
   scripts/test-release-impact
   scripts/test-release-package
   scripts/test-release-path-classifier
   scripts/test-public-api-boundary
+  scripts/test-run-named-test
   scripts/verify-release-candidate
   scripts/verify-release-package
   scripts/verify-release-package-isolated
@@ -165,8 +167,10 @@ done < <(find "$public_root/scripts" -type f -print0)
 python3 - \
   "$public_root/scripts/package-release-archive" \
   "$public_root/scripts/reconcile-release" \
+  "$public_root/scripts/run-named-test" \
   "$public_root/scripts/test-release-candidate" \
   "$public_root/scripts/test-release-package" \
+  "$public_root/scripts/test-run-named-test" \
   "$public_root/scripts/verify-release-candidate" \
   "$public_root/scripts/verify-release-package" \
   "$public_root/scripts/verify-release-package-isolated" <<'PY'
@@ -189,6 +193,7 @@ python3 "$public_root/scripts/test-release-candidate"
 python3 "$public_root/scripts/test-release-package"
 "$public_root/scripts/test-release-path-classifier"
 "$public_root/scripts/test-public-api-boundary"
+python3 "$public_root/scripts/test-run-named-test"
 "$public_root/scripts/check-release"
 
 for readme_contract in \

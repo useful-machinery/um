@@ -200,9 +200,9 @@ jobs:
           UM_VERSION: ${{ needs.verify_release.outputs.version }}
         run: |
           set -euo pipefail
-          cargo test --locked --release --target "${{ matrix.target }}" \
-            command_uses_contained_cwd_literal_argv_and_isolates_parent_environment \
-            -- --nocapture
+          ./scripts/run-named-test um-execution \
+            workflow::step_runtime::tests::command_uses_contained_cwd_literal_argv_and_isolates_parent_environment \
+            --release --target "${{ matrix.target }}"
       - name: Verify release identity
         shell: bash
         env:

@@ -1,0 +1,68 @@
+#!/usr/bin/env python3
+"""Run exactly one named test of one package, refusing any other selection.
+
+Usage: run-named-test PACKAGE TEST_PATH [CARGO_TEST_OPTION...]
+
+Cargo reports a test filter that matches nothing as success, so this lists the
+selection under --exact first and runs nothing unless the listing is exactly
+TEST_PATH. It then runs that test, ignored or not, and exits with Cargo's status.
+"""
+
+from __future__ import annotations
+
+import subprocess
+import sys
+
+USAGE = "usage: run-named-test PACKAGE TEST_PATH [CARGO_TEST_OPTION...]"
+
+
+def exit_status(returncode: int) -> int:
+    return returncode if returncode >= 0 else 128 - returncode
+
+
+def main(arguments: list[str]) -> int:
+    if len(arguments) < 2 or not arguments[0] or not arguments[1]:
+        print(USAGE, file=sys.stderr)
+        return 2
+    package, test_path, *options = arguments
+    selection = [
+        "cargo",
+        "test",
+        "--locked",
+        *options,
+        "-p",
+        package,
+        test_path,
+        "--",
+        "--exact",
+    ]
+
+    listed = subprocess.run(
+        [*selection, "--list", "--format", "terse"],
+        stdout=subprocess.PIPE,
+        check=False,
+    )
+    if listed.returncode != 0:
+        print(
+            f"run-named-test: listing package {package} test {test_path} failed "
+            f"with status {exit_status(listed.returncode)}",
+            file=sys.stderr,
+        )
+        return 1
+    listing = listed.stdout.decode("utf-8", "replace")
+    if listing.removesuffix("\n") != f"{test_path}: test":
+        print(
+            f"run-named-test: package {package} does not select exactly the test "
+            f"{test_path}; listed {listing!r}",
+            file=sys.stderr,
+        )
+        return 1
+
+    sys.stdout.flush()
+    # An #[ignore]d test lists as selected, then runs as zero tests and exits 0.
+    run = subprocess.run([*selection, "--include-ignored", "--nocapture"], check=False)
+    return exit_status(run.returncode)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

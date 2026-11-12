@@ -11,11 +11,14 @@ import importlib.util
 import io
 import json
 import os
+import re
+import shlex
 import shutil
 import subprocess
 import sys
 import tarfile
 import tempfile
+import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 from types import ModuleType
@@ -25,6 +28,7 @@ ROOT = Path(__file__).resolve().parents[1]
 VERIFIER = ROOT / "scripts/verify-release-candidate"
 RECONCILER = ROOT / "scripts/reconcile-release"
 WORKFLOW = ROOT / ".github/workflows/check.yml"
+RUN_NAMED_TEST = "./scripts/run-named-test"
 REPOSITORY_NAME = "fixture/um-cli"
 
 
@@ -558,6 +562,79 @@ def make_dist(root: Path, version: str = "0.25.0") -> Path:
     return dist
 
 
+def workspace_packages() -> dict[str, Path]:
+    workspace = tomllib.loads((ROOT / "Cargo.toml").read_text(encoding="utf-8"))
+    packages = {}
+    for member in workspace["workspace"]["members"]:
+        directory = ROOT / member
+        manifest = tomllib.loads((directory / "Cargo.toml").read_text(encoding="utf-8"))
+        packages[manifest["package"]["name"]] = directory
+    return packages
+
+
+def workflow_commands(workflow: str) -> list[str]:
+    return re.sub(r"\\\n[ \t]*", " ", workflow).splitlines()
+
+
+def named_test_calls(workflow: str) -> list[list[str]]:
+    return [
+        shlex.split(line[line.index(RUN_NAMED_TEST) :])
+        for line in workflow_commands(workflow)
+        if RUN_NAMED_TEST in line
+    ]
+
+
+def named_test_violation(workflow: str, packages: Mapping[str, Path]) -> str | None:
+    if any(re.search(r"\bcargo\s+test\b", line) for line in workflow_commands(workflow)):
+        return "public workflow runs a cargo test of its own, not through run-named-test"
+    calls = named_test_calls(workflow)
+    if not calls:
+        return f"public workflow runs no test through {RUN_NAMED_TEST}"
+    for call in calls:
+        if len(call) < 3 or not all(call[2].split("::")):
+            return f"named test call lacks a package and a test path: {' '.join(call)}"
+        package, test_path = call[1], call[2]
+        directory = packages.get(package)
+        if directory is None:
+            return f"named test package is not a workspace member: {package}"
+        *modules, name = test_path.split("::")
+        source = directory / "src"
+        if modules:
+            files = (
+                source.joinpath(*modules[:-1], f"{modules[-1]}.rs"),
+                source.joinpath(*modules, "mod.rs"),
+            )
+        else:
+            files = (source / "lib.rs", source / "main.rs")
+        definition = re.compile(rf"\bfn\s+{re.escape(name)}\s*\(")
+        if not any(
+            path.is_file() and definition.search(path.read_text(encoding="utf-8"))
+            for path in files
+        ):
+            return f"named test {package} {test_path} resolves to no function in its module"
+    return None
+
+
+def prove_named_tests(workflow: str) -> None:
+    packages = workspace_packages()
+    violation = named_test_violation(workflow, packages)
+    if violation is not None:
+        fail(violation)
+    package, test_path = named_test_calls(workflow)[0][1:3]
+    for description, mutated in (
+        ("a bare cargo test", f"{workflow}\n          cargo test --locked some_test\n"),
+        ("no named test", workflow.replace(RUN_NAMED_TEST, "./scripts/other")),
+        ("an unknown package", f"{workflow}\n  {RUN_NAMED_TEST} um-absent {test_path}\n"),
+        ("a renamed test", f"{workflow}\n  {RUN_NAMED_TEST} {package} {test_path}_renamed\n"),
+        (
+            "a moved test",
+            f"{workflow}\n  {RUN_NAMED_TEST} {package} absent::{test_path}\n",
+        ),
+    ):
+        if named_test_violation(mutated, packages) is None:
+            fail(f"named-test contract accepted {description}")
+
+
 def prove_workflow_contract() -> None:
     workflow = WORKFLOW.read_text()
     required = (
@@ -582,6 +659,8 @@ def prove_workflow_contract() -> None:
     ):
         if forbidden in workflow:
             fail(f"public workflow retains allocation state: {forbidden}")
+    # INV-TESTING-24
+    prove_named_tests(workflow)
     prefix, _, publish = workflow.partition("  reconcile_release:\n")
     if "contents: write" in prefix or "environment: cli-release" not in publish:
         fail("public workflow exposes write authority before protected publication")
