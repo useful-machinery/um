@@ -2808,6 +2808,8 @@ mod tests {
     use std::process::{Child, Command, Stdio};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    use um_test_support::watchdog::{FIXTURE_WAIT_BASE, host_scaled_recv};
+
     use super::*;
 
     const BOOT_A: &str = "rbt_01k0z6r1w8f4jy2m7q9v3x5abc";
@@ -4155,10 +4157,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "the timeout only bounds failure to reach the deterministic cleanup-sleep handshake"
-    )]
     fn cleanup_retry_sleep_is_preemptible_within_the_shutdown_reserve() {
         assert_eq!(
             REMOVAL_DELAYS.into_iter().sum::<Duration>(),
@@ -4183,8 +4181,7 @@ mod tests {
         let pending = assignment
             .workspace
             .release_pending(ProcessQuiescence::Proven);
-        sleeping
-            .recv_timeout(Duration::from_secs(1))
+        host_scaled_recv("cleanup retry sleep", FIXTURE_WAIT_BASE, &sleeping)
             .expect("cleanup did not reach its interruptible retry sleep");
         owner.cancel_cleanup();
         assert_eq!(pending.wait(), CleanupResult::Preempted);

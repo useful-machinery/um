@@ -12,3 +12,4 @@ workspace = true
 
 [dependencies]
 rustix.workspace = true
+tokio.workspace = true

@@ -2161,6 +2161,7 @@ mod tests {
         WorkflowRunStep, WorkflowRunStepKind, WorkflowRunTiming, WorkflowStepTiming,
         admit_runner_workflow, default_execution_policy_limits, prepare_cloud_workflow_result,
     };
+    use um_test_support::watchdog::{FIXTURE_WAIT_BASE, host_scaled_duration, host_scaled_recv};
 
     use super::test_support::{fixture_credential, materialize};
 
@@ -2249,10 +2250,6 @@ mod tests {
         token_observed_in_private_root: bool,
     }
 
-    // This timeout only bounds anti-hang failure at the external Git/socket
-    // boundary; request progress has no in-process readiness signal.
-    const AUTHENTICATED_GIT_FIXTURE_IO_TIMEOUT: Duration = Duration::from_secs(10);
-
     struct AuthenticatedGitServer {
         _temporary: tempfile::TempDir,
         repository_url: String,
@@ -2326,11 +2323,12 @@ mod tests {
                     if worker_shutdown.load(Ordering::Acquire) {
                         break;
                     }
+                    // This timeout only bounds anti-hang failure at the external Git/socket
+                    // boundary; request progress has no in-process readiness signal.
+                    let io_timeout = host_scaled_duration(FIXTURE_WAIT_BASE);
                     let result = stream
-                        .set_read_timeout(Some(AUTHENTICATED_GIT_FIXTURE_IO_TIMEOUT))
-                        .and_then(|()| {
-                            stream.set_write_timeout(Some(AUTHENTICATED_GIT_FIXTURE_IO_TIMEOUT))
-                        })
+                        .set_read_timeout(Some(io_timeout))
+                        .and_then(|()| stream.set_write_timeout(Some(io_timeout)))
                         .and_then(|()| {
                             serve_authenticated_git_request(
                                 &mut stream,
@@ -4339,10 +4337,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "the bounded receive is an item-scoped watchdog for explicit request readiness"
-    )]
     fn broker_request_is_cancelled_when_the_assignment_is_fenced() {
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let address = listener.local_addr().unwrap();
@@ -4350,7 +4344,7 @@ mod tests {
         let server = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             stream
-                .set_read_timeout(Some(Duration::from_secs(2)))
+                .set_read_timeout(Some(host_scaled_duration(FIXTURE_WAIT_BASE)))
                 .unwrap();
             let mut request = Vec::new();
             let mut buffer = [0_u8; 4096];
@@ -4378,11 +4372,8 @@ mod tests {
         let cancellation = CaptureCancellation::default();
         let cancel = cancellation.clone();
         let canceller = std::thread::spawn(move || {
-            assert!(
-                request_receiver
-                    .recv_timeout(Duration::from_secs(1))
-                    .is_ok()
-            );
+            host_scaled_recv("broker request", FIXTURE_WAIT_BASE, &request_receiver)
+                .expect("broker request did not reach the fixture");
             cancel.cancel();
         });
         let result = broker.issue("asn_01k0z6r1w8f4jy2m7q9v3x5abc", &cancellation);

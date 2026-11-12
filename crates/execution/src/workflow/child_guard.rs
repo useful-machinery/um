@@ -33,6 +33,13 @@ use super::process_group::{
     continue_authenticated_process_group, system_process_identity_observation,
     terminate_authenticated_process_group, terminate_authenticated_process_group_with,
 };
+#[cfg(not(target_os = "linux"))]
+use super::socket_alias::SOCKET_ALIAS_ROOT;
+#[cfg(any(not(target_os = "linux"), test))]
+use super::socket_alias::{
+    SOCKET_ALIAS_NAME, create_socket_alias_retry, random_socket_alias_directory,
+    remove_socket_alias,
+};
 
 const INTERNAL_WORKER_ENVIRONMENT: &str = "UM_INTERNAL_CHILD_GUARD_WORKER";
 const INTERNAL_ROOT_ENVIRONMENT: &str = "UM_INTERNAL_CHILD_GUARD_ROOT";
@@ -55,11 +62,18 @@ const TEMPORARY_DIRECTORY_PREFIX: &str = "scherzo-child-guard-v1-";
 const WORKER_POLL_INTERVAL: Duration = Duration::from_millis(5);
 const WORKER_BOUNDARY_TIMEOUT: Duration = MAXIMUM_CANCELLATION_GRACE;
 const MAXIMUM_MANIFEST_BYTES: u64 = 16 * 1024 * 1024;
+#[cfg(any(not(target_os = "linux"), test))]
+const STAGING_SOCKET_ALIAS_PREFIX: &str = ".szc-";
+// The size of `sockaddr_un.sun_path` on Apple targets and the BSDs. `std` refuses,
+// before any system call, a socket path whose byte length is this size or more.
+#[cfg(not(target_os = "linux"))]
+const SOCKET_ADDRESS_PATH_CAPACITY: usize = 104;
 
 // Unix socket addresses have a much smaller limit than filesystem paths. Linux can
 // address the private staging directory through /proc/self/fd while bind/connect
 // runs, so a long TMPDIR does not consume the socket pathname budget. macOS does
-// not support traversing a directory through /dev/fd and uses the direct path.
+// not support traversing a directory through /dev/fd: it uses the direct path when
+// that fits and otherwise a short alias under /tmp for the one call (INV-ENGINE-34).
 fn with_staging_socket<T>(
     root: &Path,
     name: &str,
@@ -73,8 +87,33 @@ fn with_staging_socket<T>(
     }
     #[cfg(not(target_os = "linux"))]
     {
-        operation(&root.join(name))
+        let direct = root.join(name);
+        if direct.as_os_str().len() < SOCKET_ADDRESS_PATH_CAPACITY {
+            return operation(&direct);
+        }
+        with_staging_socket_alias(Path::new(SOCKET_ALIAS_ROOT), root, name, operation)
     }
+}
+
+// Binds or connects `<alias>/e/<name>`, where `<alias>` is a fresh private
+// directory under `alias_root` holding the one link `e` to `root`. The alias
+// exists only for this one operation (INV-ENGINE-34).
+#[cfg(any(not(target_os = "linux"), test))]
+fn with_staging_socket_alias<T>(
+    alias_root: &Path,
+    root: &Path,
+    name: &str,
+    operation: impl FnOnce(&Path) -> io::Result<T>,
+) -> io::Result<T> {
+    let directory = create_socket_alias_retry(root, || {
+        random_socket_alias_directory(alias_root, STAGING_SOCKET_ALIAS_PREFIX)
+    })?;
+    let alias = directory.join(SOCKET_ALIAS_NAME);
+    let result = operation(&alias.join(name));
+    // The socket file lives in `root`, not in the alias, so a failure to remove the
+    // alias never changes the operation's result.
+    let _ = remove_socket_alias(&directory, &alias);
+    result
 }
 
 fn create_guard_staging() -> io::Result<tempfile::TempDir> {
@@ -1211,46 +1250,90 @@ mod tests {
         }
     }
 
-    #[test]
-    #[ignore = "run only in a child process with an isolated TMPDIR"]
-    fn guard_tmpdir_fixture() {
-        let root = PathBuf::from(std::env::var_os("TEST_TMPDIR_ROOT").unwrap());
-        let staging = create_guard_staging().unwrap();
-        assert!(staging.path().starts_with(root));
-        let _standard_input =
-            with_staging_socket(staging.path(), STANDARD_INPUT_SOCKET, |socket| {
-                UnixListener::bind(socket)
-            })
-            .unwrap();
-        let _exec_boundary = with_staging_socket(staging.path(), EXEC_BOUNDARY_SOCKET, |socket| {
-            UnixListener::bind(socket)
-        })
-        .unwrap();
-        assert!(staging.path().join(STANDARD_INPUT_SOCKET).exists());
-        assert!(staging.path().join(EXEC_BOUNDARY_SOCKET).exists());
+    const LONG_TMPDIR_FIXTURE: &str =
+        "workflow::child_guard::tests::guarded_child_long_tmpdir_fixture";
+    const LONG_TMPDIR_FIXTURE_ROOT: &str = "UM_LONG_TMPDIR_FIXTURE_ROOT";
+
+    fn long_directory_under(parent: &Path) -> PathBuf {
+        let root = parent.join("long-directory-component-".repeat(5));
+        fs::create_dir(&root).unwrap();
+        assert!(root.join(TEMPORARY_DIRECTORY_PREFIX).as_os_str().len() > 108);
+        root
     }
 
+    #[tokio::test]
+    #[ignore = "run only in a child process with a long TMPDIR"]
+    async fn guarded_child_long_tmpdir_fixture() {
+        let root = PathBuf::from(std::env::var_os(LONG_TMPDIR_FIXTURE_ROOT).unwrap());
+        let arguments = [
+            OsString::from("-c"),
+            OsString::from("IFS= read -r line; printf 'received:%s\\n' \"$line\""),
+        ];
+        let cancellation = ChildGuardCancellation::default();
+        let (mut child, mut standard_input) = StoppedChildGuard::spawn_with_stdin_cancellable(
+            Path::new("/bin/sh"),
+            &arguments,
+            &[],
+            &cancellation,
+            |_| Ok(()),
+        )
+        .unwrap();
+        assert!(child.staging.path().starts_with(&root));
+        assert!(child.staging.path().join(EXEC_BOUNDARY_SOCKET).exists());
+        assert!(child.staging.path().join(STANDARD_INPUT_SOCKET).exists());
+        let mut standard_output = child.take_stdout().unwrap();
+        child.continue_execution_cancellable(&cancellation).unwrap();
+
+        standard_input.write_all(b"long tmpdir\n").await.unwrap();
+        standard_input.shutdown().await.unwrap();
+        let mut output = Vec::new();
+        standard_output.read_to_end(&mut output).await.unwrap();
+
+        assert!(child.wait().await.unwrap().success());
+        assert_eq!(output, b"received:long tmpdir\n");
+    }
+
+    // INV-ENGINE-34
     #[test]
-    fn guard_staging_uses_tmpdir() {
+    fn guarded_child_starts_under_a_long_tmpdir() {
         let temporary = tempfile::tempdir_in("/tmp").unwrap();
-        #[cfg(target_os = "linux")]
-        let root = temporary.path().join("long-directory-component-".repeat(5));
-        #[cfg(not(target_os = "linux"))]
-        let root = temporary.path().join("isolated");
-        fs::create_dir(&root).unwrap();
-        #[cfg(target_os = "linux")]
-        assert!(root.join(TEMPORARY_DIRECTORY_PREFIX).as_os_str().len() > 108);
+        let root = long_directory_under(temporary.path());
         let status = StdCommand::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "workflow::child_guard::tests::guard_tmpdir_fixture",
-                "--ignored",
-            ])
+            .args(["--exact", LONG_TMPDIR_FIXTURE, "--ignored"])
             .env("TMPDIR", &root)
-            .env("TEST_TMPDIR_ROOT", &root)
+            .env(LONG_TMPDIR_FIXTURE_ROOT, &root)
             .status()
             .unwrap();
         assert!(status.success());
+    }
+
+    // INV-ENGINE-34
+    #[test]
+    fn a_socket_alias_lasts_only_for_its_operation() {
+        use std::os::unix::fs::FileTypeExt as _;
+
+        let alias_root = tempfile::tempdir_in("/tmp").unwrap();
+        let temporary = tempfile::tempdir_in("/tmp").unwrap();
+        let root = long_directory_under(temporary.path());
+        let alias_root_is_empty = || fs::read_dir(alias_root.path()).unwrap().next().is_none();
+
+        let _listener =
+            with_staging_socket_alias(alias_root.path(), &root, EXEC_BOUNDARY_SOCKET, |socket| {
+                assert!(socket.starts_with(alias_root.path()));
+                UnixListener::bind(socket)
+            })
+            .unwrap();
+        let socket = fs::symlink_metadata(root.join(EXEC_BOUNDARY_SOCKET)).unwrap();
+        assert!(socket.file_type().is_socket());
+        assert!(alias_root_is_empty());
+
+        let failure =
+            with_staging_socket_alias(alias_root.path(), &root, STANDARD_INPUT_SOCKET, |socket| {
+                UnixStream::connect(socket)
+            })
+            .unwrap_err();
+        assert_eq!(failure.kind(), io::ErrorKind::NotFound);
+        assert!(alias_root_is_empty());
     }
 
     #[test]

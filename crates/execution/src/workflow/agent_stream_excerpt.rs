@@ -96,13 +96,23 @@ impl StreamTail {
 // in `client_secret`), and a URL authority carrying a password. A GitHub shape matches without
 // a leading word boundary where a stripped control character may have joined it to the text
 // before it; a bearer credential is the rest of its line, never the next line's first word.
+// An assignment's value is the word after `=`: a quoted piece runs through its closing quote,
+// the quotes bare or each behind one backslash as a JSON string carries them (there a quote
+// behind 4n+3 backslashes is the value's own and one behind 4n+1 closes it), a single-quoted
+// piece that reading backslashes as escapes leaves unclosed closes at its next single quote,
+// as a shell reads it, the pieces joined to it belong to the value, as does a
+// backslash-escaped single quote before a single-quoted piece (`'it'\''s'`); after the first
+// piece a double quote, bare or behind a backslash, ends the value unless it is the `"'"` that
+// joins two single-quoted pieces, and an unquoted run stops before the backslashes in front of
+// a double quote; and a quote that never closes takes the rest of its line or of the JSON
+// string holding it.
 const REDACTED: &str = "[redacted]";
 const SECRET_SHAPES: [(&str, &str); 5] = [
     (r"gh[pousr]_[A-Za-z0-9]{16,}", REDACTED),
     (r"github_pat_[A-Za-z0-9_]{16,}", REDACTED),
     (r"(?i)(\bBearer[ \t]+)[A-Za-z0-9._~+/=-]+", "${1}[redacted]"),
     (
-        r#"(?i)(\b[a-z_-]*(?:token|api[_-]?key|secret|password|passwd)=)[^&\s"'<>]+"#,
+        r#"(?i)(\b[a-z_-]*(?:token|api[_-]?key|secret|password|passwd)=)(?:\\"(?:(?:\\{4})*(?:\\{3}"|\\{0,3}[^"\\\n]))*(?:\\{4})*\\"|"(?:\\.|[^"\\\n])*"|'(?:\\.|[^'\\\n])*'|'[^'\n]*'|\\*["'](?:\\.|[^"\\\n])*|[^&\s"'<>])(?:\\{1,2}''(?:\\.|[^'\\\n])*'|\\{1,2}''[^'\n]*'|\\*'(?:\\.|[^'\\\n])*'|\\*'[^'\n]*'|"'"|\\"'\\"|[^&\s"'<>\\]|\\+[^&\s"'<>\\])*"#,
         "${1}[redacted]",
     ),
     (r"(://)[^/\s@:]+:[^/\s@]+@", "${1}[redacted]@"),
@@ -191,6 +201,125 @@ mod tests {
         let redacted = redact_secrets("client_secret=hunter2&x=1");
         assert_eq!(redacted, "client_secret=[redacted]&x=1");
         assert_redacted("API_KEY=abc", "abc", "API_KEY=[redacted]");
+    }
+
+    /// A Claude Code assistant frame calling the shell tool with `command`.
+    fn tool_use_frame(command: &str) -> String {
+        json!({
+            "type": "assistant",
+            "message": {
+                "role": "assistant",
+                "content": [{
+                    "type": "tool_use",
+                    "id": "toolu_1",
+                    "name": "Bash",
+                    "input": {"command": command},
+                }],
+            },
+            "parent_tool_use_id": null,
+            "session_id": "session",
+        })
+        .to_string()
+    }
+
+    // REQ-AGENT-71
+    #[test]
+    fn quoted_assignment_value_is_redacted_through_its_closing_quote() {
+        let cases = [
+            ("client_secret=hunter2&x=1", "client_secret=[redacted]&x=1"),
+            (
+                r#"export API_TOKEN="s3cr3t v" && run"#,
+                "export API_TOKEN=[redacted] && run",
+            ),
+            ("PGPASSWORD='s3cr3t v' psql", "PGPASSWORD=[redacted] psql"),
+            (
+                r#"DB_PASSWORD="a\" s3cr3t v" x"#,
+                "DB_PASSWORD=[redacted] x",
+            ),
+            (
+                r#"DB_PASSWORD="s3cr3t v\\" x "y""#,
+                r#"DB_PASSWORD=[redacted] x "y""#,
+            ),
+            (r#"PASSWORD="" x"#, "PASSWORD=[redacted] x"),
+            (
+                r#"PGPASSWORD='a"s3cr3t v' psql"#,
+                "PGPASSWORD=[redacted] psql",
+            ),
+            (
+                r#"PGPASSWORD='it'"'"'s3cr3t v' psql"#,
+                "PGPASSWORD=[redacted] psql",
+            ),
+            (
+                r"PGPASSWORD='it'\''s3cr3t v' psql",
+                "PGPASSWORD=[redacted] psql",
+            ),
+            (r#"TOKEN="s3cr3t v"tail next"#, "TOKEN=[redacted] next"),
+            (r#"TOKEN="s3cr3t v"#, "TOKEN=[redacted]"),
+            ("TOKEN='s3cr3t v", "TOKEN=[redacted]"),
+            (r#"grep -n "token=" file"#, r#"grep -n "token=[redacted]"#),
+            ("token=<TOKEN>", "token=<TOKEN>"),
+            (
+                r#"echo "TOKEN=abc" && echo "done""#,
+                r#"echo "TOKEN=[redacted]" && echo "done""#,
+            ),
+            (r#"echo "TOKEN=abc""#, r#"echo "TOKEN=[redacted]""#),
+            (r"PGPASSWORD=abc'def\' psql", "PGPASSWORD=[redacted] psql"),
+            (
+                r#"PGPASSWORD='a"b\'s3cr3t psql"#,
+                "PGPASSWORD=[redacted] psql",
+            ),
+            (
+                r"PGPASSWORD='it'\''s3cr3t v\' psql",
+                "PGPASSWORD=[redacted] psql",
+            ),
+        ];
+        for (line, redacted) in cases {
+            assert_eq!(redact_secrets(line), redacted, "plain: {line}");
+            let frame = tool_use_frame(line);
+            let framed = redact_secrets(&frame);
+            assert_eq!(framed, tool_use_frame(redacted), "framed: {line}");
+            assert!(
+                serde_json::from_str::<serde_json::Value>(&framed).is_ok(),
+                "decodes: {framed}"
+            );
+        }
+        assert_eq!(
+            redact_secrets("TOKEN=\"s3cr3t v\nnext \"q\""),
+            "TOKEN=[redacted]\nnext \"q\""
+        );
+        let nested = json!({"command": r#"export TOKEN="s3cr3t v" x"#}).to_string();
+        assert_eq!(
+            redact_secrets(&tool_use_frame(&nested)),
+            tool_use_frame(r#"{"command":"export TOKEN=[redacted]"#)
+        );
+    }
+
+    // REQ-AGENT-71
+    #[test]
+    fn quoted_assignment_in_a_rejected_stream_keeps_no_value() {
+        let frame = tool_use_frame(r#"export API_TOKEN="s3cr3t v" && run"#);
+        let mut tail = StreamTail::new(bound(8), bound(1024));
+        tail.push(frame.as_bytes());
+        let rejected = RetainedStreamLine::retain(frame.as_bytes(), bound(8192));
+        let mut retained = tail.lines();
+        retained.push(rejected);
+        assert_eq!(retained.len(), 2);
+        for line in retained {
+            assert!(!line.text.contains("s3cr3t"), "{}", line.text);
+            assert!(!line.truncated);
+            let command = serde_json::from_str::<serde_json::Value>(&line.text)
+                .ok()
+                .and_then(|frame| {
+                    frame
+                        .pointer("/message/content/0/input/command")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned)
+                });
+            assert_eq!(
+                command.as_deref(),
+                Some("export API_TOKEN=[redacted] && run")
+            );
+        }
     }
 
     // REQ-AGENT-71

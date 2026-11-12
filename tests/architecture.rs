@@ -774,6 +774,54 @@ fn external_crates_stay_inside_their_owning_packages() {
     );
 }
 
+// INV-TESTING-26
+#[test]
+fn runner_test_waits_hold_no_literal_real_time_bound() {
+    const LITERAL_BOUNDS: [&str; 2] = [
+        "recv_timeout(Duration::from_secs(",
+        "_timeout(Some(Duration::from_secs(",
+    ];
+    const RUNNER_SOURCES: &str = "crates/runner/src/";
+    const PRODUCTION_TOKIO_TIMEOUT: &str = "crates/runner/src/service/control.rs";
+
+    let root = cli_root();
+    let mut violations = Vec::new();
+    let mut files = rust_sources(&root.join(RUNNER_SOURCES));
+    files.extend(rust_sources(&root.join("crates/test-support/src")));
+
+    for file in files {
+        let relative = file.strip_prefix(&root).unwrap();
+        let relative_text = relative.to_string_lossy().replace('\\', "/");
+        let checks_tokio_timeout =
+            relative_text.starts_with(RUNNER_SOURCES) && relative_text != PRODUCTION_TOKIO_TIMEOUT;
+        let text = read_source(&file);
+        for (line_number, line) in text.lines().enumerate() {
+            let code = strip_line_comment(line);
+            if let Some(bound) = LITERAL_BOUNDS.iter().find(|bound| code.contains(*bound)) {
+                violations.push(format!(
+                    "{relative_text}:{}: `{bound}` is a literal bound; use \
+                     `um_test_support::watchdog` on `FIXTURE_WAIT_BASE`",
+                    line_number + 1
+                ));
+            }
+            if checks_tokio_timeout && code.contains("tokio::time::timeout(") {
+                violations.push(format!(
+                    "{relative_text}:{}: `tokio::time::timeout(` belongs only to \
+                     {PRODUCTION_TOKIO_TIMEOUT}; use `with_watchdog` or \
+                     `um_test_support::watchdog`",
+                    line_number + 1
+                ));
+            }
+        }
+    }
+
+    assert!(
+        violations.is_empty(),
+        "literal real-time bounds in runner tests:\n{}",
+        violations.join("\n")
+    );
+}
+
 fn cli_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).to_path_buf()
 }

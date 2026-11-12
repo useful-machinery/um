@@ -11,6 +11,7 @@ use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use super::*;
 use crate::workflow::agent::WorkflowRunId;
 use crate::workflow::runtime::{ActionId, TransitionSequence};
+use crate::workflow::socket_alias::create_socket_alias;
 
 const RETAINED_FIXTURE: &[u8] = include_bytes!(concat!(
     env!("CARGO_MANIFEST_DIR"),

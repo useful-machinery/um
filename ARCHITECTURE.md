@@ -382,8 +382,8 @@ library members occupy their final roots:
 
 - `um-support` owns shared public-ID, timing, TLS-provider, and Workflow
   contract leaves and has no internal dependency;
-- `um-test-support` owns the HTTP and hermetic Git fixtures and is reachable
-  only through dev dependencies;
+- `um-test-support` owns the HTTP and hermetic Git fixtures and the host-scaled
+  test watchdog, and is reachable only through dev dependencies;
 - `um-runner-protocol` owns runner wire DTOs, its generated codec, and its
   embedded schema and has no internal dependency;
 - `um-api` owns the handwritten API and private generated client, depends on

@@ -43,6 +43,7 @@ use um_runner_protocol::{
     WorkflowDefinitionSourceV1RunnerProjection, WorkflowSourceClosureDigestV1RunnerProjection,
     WorkspaceMembership, WorkspaceWitness, decode_cloud_frame,
 };
+use um_test_support::watchdog::{FIXTURE_WAIT_BASE, host_scaled_recv};
 
 const NOW: &str = "2026-07-23T00:00:00Z";
 mod artifact_delivery_tests;
@@ -351,20 +352,22 @@ impl BlockingSourceFixture {
         assert!(self.started.try_recv().is_err());
     }
 
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "wall time only bounds the blocking source fixture's readiness message"
-    )]
     fn wait_until_started(&self) {
-        assert!(self.started.recv_timeout(Duration::from_secs(1)).is_ok());
+        host_scaled_recv(
+            "blocking source fixture readiness",
+            FIXTURE_WAIT_BASE,
+            &self.started,
+        )
+        .expect("blocking source fixture did not start");
     }
 
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "wall time only bounds the blocking source fixture's cancellation message"
-    )]
     fn wait_until_stopped(&self) {
-        assert!(self.stopped.recv_timeout(Duration::from_secs(1)).is_ok());
+        host_scaled_recv(
+            "blocking source fixture cancellation",
+            FIXTURE_WAIT_BASE,
+            &self.stopped,
+        )
+        .expect("blocking source fixture was not cancelled");
     }
 }
 
@@ -6867,10 +6870,6 @@ async fn final_grace_acknowledgement_and_successor_fence_cleanup_state() {
     assert_eq!(manager.outbox.lock().entries.len(), 1);
 }
 
-#[expect(
-    clippy::disallowed_methods,
-    reason = "wall time only bounds explicit root-worker and runtime-shutdown completion signals"
-)]
 #[test]
 fn blocked_root_preparation_does_not_hold_tokio_runtime_shutdown() {
     let (started, mut root_preparation_started) = tokio::sync::mpsc::unbounded_channel();
@@ -6909,9 +6908,12 @@ fn blocked_root_preparation_does_not_hold_tokio_runtime_shutdown() {
         .blocking_recv()
         .expect("assignment root preparation did not start");
     begin_shutdown.send(()).expect("begin runtime shutdown");
-    runtime_finished
-        .recv_timeout(Duration::from_secs(1))
-        .expect("Tokio runtime waited for blocked assignment root preparation");
+    host_scaled_recv(
+        "Tokio runtime shutdown",
+        FIXTURE_WAIT_BASE,
+        &runtime_finished,
+    )
+    .expect("Tokio runtime waited for blocked assignment root preparation");
     release_root_preparation
         .send(())
         .expect("release assignment root preparation");

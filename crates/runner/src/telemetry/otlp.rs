@@ -632,6 +632,7 @@ mod tests {
 
     use super::*;
     use crate::telemetry::{Outcome, Recorder, TestCapture, runner_resource};
+    use um_test_support::watchdog::{FIXTURE_WAIT_BASE, host_scaled_recv};
 
     fn outcome(values: &[(&str, &str)]) -> SettingsOutcome {
         let values = values
@@ -1153,17 +1154,12 @@ mod tests {
 
     // REQ-TELEMETRY-28
     #[test]
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "wall time only bounds the test fixture's export-start readiness message"
-    )]
     fn stalled_export_has_bounded_shutdown() {
         let (recorder, capture, export_started, release) = stalled_recorder(EXPORT_QUEUE_CAPACITY);
         recorder
             .start("runner.gateway_connection", [])
             .finish(Outcome::Disconnected);
-        export_started
-            .recv_timeout(Duration::from_secs(1))
+        host_scaled_recv("export start", FIXTURE_WAIT_BASE, &export_started)
             .expect("export should stall");
 
         drop(recorder);
@@ -1177,17 +1173,12 @@ mod tests {
     // REQ-TELEMETRY-28
     // INV-TELEMETRY-3
     #[test]
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "wall time only bounds the test fixture's export-start readiness messages"
-    )]
     fn saturated_export_queue_drops_without_blocking_runner_events() {
         let (recorder, capture, export_started, release) = stalled_recorder(1);
         recorder
             .start("runner.gateway_connection", [])
             .finish(Outcome::Disconnected);
-        export_started
-            .recv_timeout(Duration::from_secs(1))
+        host_scaled_recv("first export start", FIXTURE_WAIT_BASE, &export_started)
             .expect("first export should stall");
         recorder
             .start("runner.effect_acknowledgement", [])
@@ -1202,8 +1193,7 @@ mod tests {
         }));
 
         release.send(()).expect("release first export");
-        export_started
-            .recv_timeout(Duration::from_secs(1))
+        host_scaled_recv("queued export start", FIXTURE_WAIT_BASE, &export_started)
             .expect("queued export should begin");
         release.send(()).expect("release queued export");
         drop(recorder);

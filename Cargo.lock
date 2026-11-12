@@ -2864,6 +2864,7 @@ name = "um-test-support"
 version = "0.0.0-dev"
 dependencies = [
  "rustix",
+ "tokio",
 ]
 
 [[package]]

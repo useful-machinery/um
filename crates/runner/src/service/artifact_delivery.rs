@@ -1566,6 +1566,7 @@ mod tests {
 
     use super::*;
     use crate::service::test_support::{controlled_sleeper, with_watchdog};
+    use um_test_support::watchdog::{FIXTURE_WAIT_BASE, host_scaled_duration};
 
     fn result_spec() -> ArtifactDeliverySpec {
         ArtifactDeliverySpec::result(
@@ -1602,7 +1603,7 @@ mod tests {
             let server = std::thread::spawn(move || {
                 let (mut stream, _) = listener.accept().unwrap();
                 stream
-                    .set_read_timeout(Some(Duration::from_secs(10)))
+                    .set_read_timeout(Some(host_scaled_duration(FIXTURE_WAIT_BASE)))
                     .unwrap();
                 // Wait for the entire PUT, not just its first TCP segment. Closing
                 // with an unread body can reset the connection before reqwest sees
@@ -1683,7 +1684,7 @@ mod tests {
         let server = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             stream
-                .set_read_timeout(Some(Duration::from_secs(10)))
+                .set_read_timeout(Some(host_scaled_duration(FIXTURE_WAIT_BASE)))
                 .unwrap();
             let mut request = Vec::new();
             let mut buffer = [0_u8; 65536];

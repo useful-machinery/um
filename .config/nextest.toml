@@ -38,6 +38,14 @@ filter = "package(um-execution) & test(=workflow::pi::adapter_tests::stubborn_de
 slow-timeout = { period = "60s", terminate-after = 2 }
 
 [[profile.default.overrides]]
+# The runner's test waits have a 30-second idle-host base (FIXTURE_WAIT_BASE)
+# that host_scaled_watchdog multiplies by the host's load, up to four times;
+# the package receives the integration-test backstop so the watchdog's
+# diagnosis, not this termination, is what a loaded host reports.
+filter = "package(um-runner)"
+slow-timeout = { period = "60s", terminate-after = 2 }
+
+[[profile.default.overrides]]
 # On macOS, the process-heavy tests below use the wider group instead. Only
 # the group differs; the later overrides still set their timeouts.
 platform = 'cfg(target_os = "macos")'

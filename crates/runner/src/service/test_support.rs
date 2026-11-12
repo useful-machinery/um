@@ -1,6 +1,7 @@
 use std::future::Future;
 use std::ops::Deref;
 use std::os::unix::fs::PermissionsExt as _;
+use std::panic::Location;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -19,6 +20,7 @@ use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
 use tokio_tungstenite::tungstenite::http::{HeaderMap, HeaderValue, header};
 use tokio_tungstenite::tungstenite::protocol::CloseFrame;
 use tokio_tungstenite::{WebSocketStream, accept_hdr_async};
+use um_test_support::watchdog::{FIXTURE_WAIT_BASE, WatchdogExpired, host_scaled_timeout};
 
 use crate::credential::Credential;
 use crate::service::config::{AssignmentConfig, Config, ConfigError, RepositoryUrlPolicy};
@@ -30,7 +32,6 @@ use crate::service::{
 
 pub(crate) type FixtureSocket = WebSocketStream<TcpStream>;
 
-const TEST_WATCHDOG: Duration = Duration::from_secs(10);
 const INTERNAL_WORKER_EXECUTABLE_VARIABLE: &str = "UM_TEST_INTERNAL_WORKER_EXECUTABLE";
 
 /// The built `internal-worker` example that guards every command step a runner test
@@ -133,15 +134,28 @@ impl Deref for ConfigFixture {
     }
 }
 
-#[expect(
-    clippy::disallowed_methods,
-    reason = "real time is allowed only to keep a broken test from hanging"
-)]
-pub(crate) async fn with_watchdog<F>(future: F) -> Result<F::Output, tokio::time::error::Elapsed>
-where
-    F: Future,
-{
-    tokio::time::timeout(TEST_WATCHDOG, future).await
+/// Bounds a runner test's awaited wait against hangs on `FIXTURE_WAIT_BASE`, scaled by the
+/// host's load (INV-TESTING-26). The case is the call site (`file:line`), and an expiry is
+/// returned as the error the call site's `expect` prints. A plain function, not an
+/// `async fn`, so the body is heap-pinned before this wrapper's state exists
+/// (INV-TESTING-18).
+#[track_caller]
+pub(crate) fn with_watchdog<F: Future>(
+    future: F,
+) -> impl Future<Output = Result<F::Output, WatchdogExpired>> {
+    watchdog_at(Location::caller(), FIXTURE_WAIT_BASE, future)
+}
+
+fn watchdog_at<F: Future>(
+    location: &Location<'_>,
+    base: Duration,
+    future: F,
+) -> impl Future<Output = Result<F::Output, WatchdogExpired>> {
+    host_scaled_timeout(
+        format!("{}:{}", location.file(), location.line()),
+        base,
+        future,
+    )
 }
 
 struct DeterministicFrameSource {
@@ -926,6 +940,28 @@ pub(crate) async fn expect_close_frame(socket: &mut FixtureSocket) -> CloseFrame
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // INV-TESTING-26
+    #[tokio::test]
+    async fn watchdog_names_its_call_site_and_returns_the_case_output() {
+        let location = Location::caller();
+        let expired = watchdog_at(
+            location,
+            Duration::from_millis(1),
+            std::future::pending::<()>(),
+        )
+        .await
+        .expect_err("a case that never completes expires");
+        let expected = format!(
+            "{}:{} watchdog expired after",
+            location.file(),
+            location.line()
+        );
+        let rendered = format!("{expired:?}");
+        assert!(rendered.starts_with(&expected), "{rendered}");
+
+        assert_eq!(with_watchdog(async { 7 }).await.ok(), Some(7));
+    }
 
     #[tokio::test]
     async fn overlapping_releases_advance_both_clocks_by_elapsed_time() {

@@ -3,7 +3,7 @@ use std::fs::{self, OpenOptions};
 use std::io::{self, Write as _};
 use std::num::NonZeroU64;
 use std::ops::Add as _;
-use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _, PermissionsExt as _, symlink};
+use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -22,6 +22,10 @@ use crate::workflow::agent::{AgentInvocationIdentity, PositiveDuration, Retained
 use crate::workflow::coordinator::CoordinatorClock;
 use crate::workflow::result_validation::{decode_uri_fragment, join_pointer};
 use crate::workflow::schema_common::lowercase_hex;
+use crate::workflow::socket_alias::{
+    SOCKET_ALIAS_NAME, SOCKET_ALIAS_ROOT, create_socket_alias_retry, ignore_not_found,
+    random_socket_alias_directory, remove_socket_alias,
+};
 
 fn invalid_bridge(error: impl std::fmt::Display) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, error.to_string())
@@ -33,8 +37,6 @@ const MAX_MODEL_REFERENCE_EXPANSIONS: usize = 128;
 const TOOL_NAME_PREFIX: &str = "scherzo_result_";
 const EXTENSION_FILE_NAME: &str = "pi-json-v1-result-extension.ts";
 const SOCKET_FILE_NAME: &str = "result-validation.sock";
-const SOCKET_ALIAS_NAME: &str = "e";
-const SOCKET_ALIAS_ROOT: &str = "/tmp";
 const CONFIG_MARKER: &str = "\"__UM_PI_JSON_V1_CONFIG_JSON__\"";
 const CHANNEL_FAILURE_CAUSE: &str = "The result-validation channel failed.";
 const EXTENSION_TEMPLATE: &str = include_str!(concat!(
@@ -1228,63 +1230,11 @@ fn socket_alias_directory(tool_name: &str) -> io::Result<PathBuf> {
     let identity = tool_name
         .strip_prefix(TOOL_NAME_PREFIX)
         .ok_or_else(|| invalid_bridge("invalid result tool name"))?;
-    let mut nonce = [0_u8; 8];
-    getrandom::fill(&mut nonce).map_err(io::Error::other)?;
-    Ok(Path::new(SOCKET_ALIAS_ROOT).join(format!(".szp-{identity}-{}", lowercase_hex(&nonce))))
+    random_socket_alias_directory(Path::new(SOCKET_ALIAS_ROOT), &format!(".szp-{identity}-"))
 }
 
 fn create_random_socket_alias(tool_name: &str, target: &Path) -> io::Result<PathBuf> {
     create_socket_alias_retry(target, || socket_alias_directory(tool_name))
-}
-
-fn create_socket_alias_retry(
-    target: &Path,
-    mut next_directory: impl FnMut() -> io::Result<PathBuf>,
-) -> io::Result<PathBuf> {
-    for _ in 0..16 {
-        let directory = next_directory()?;
-        let alias = directory.join(SOCKET_ALIAS_NAME);
-        match create_socket_alias(&directory, &alias, target) {
-            Ok(()) => return Ok(directory),
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
-            Err(error) => {
-                return Err(io::Error::new(
-                    error.kind(),
-                    format!("socket alias: {error}"),
-                ));
-            }
-        }
-    }
-    Err(io::Error::new(
-        io::ErrorKind::AlreadyExists,
-        "socket alias collisions exhausted",
-    ))
-}
-
-fn create_socket_alias(directory: &Path, alias: &Path, target: &Path) -> io::Result<()> {
-    // AF_UNIX limits the address bytes even when the private staging path is valid.
-    let mut builder = fs::DirBuilder::new();
-    builder.mode(0o700);
-    builder.create(directory)?;
-    if let Err(error) = fs::set_permissions(directory, fs::Permissions::from_mode(0o700)) {
-        let _ = fs::remove_dir(directory);
-        return Err(error);
-    }
-    if let Err(error) = symlink(target, alias) {
-        let _ = fs::remove_dir(directory);
-        return Err(error);
-    }
-    Ok(())
-}
-
-fn remove_socket_alias(directory: &Path, alias: &Path) -> io::Result<()> {
-    let alias_result = remove_materialized_file(alias);
-    let directory_result = match fs::remove_dir(directory) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error),
-    };
-    alias_result.and(directory_result)
 }
 
 fn make_socket_private(path: &Path) -> io::Result<()> {
@@ -1303,11 +1253,7 @@ pub(super) fn write_private_file(path: &Path, bytes: &[u8]) -> io::Result<()> {
 }
 
 fn remove_materialized_file(path: &Path) -> Result<(), io::Error> {
-    match fs::remove_file(path) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error),
-    }
+    ignore_not_found(fs::remove_file(path))
 }
 
 #[cfg(test)]

@@ -4,7 +4,10 @@ use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+
+use watchdog::{FIXTURE_WAIT_BASE, host_scaled_duration, host_scaled_recv};
+
+pub mod watchdog;
 
 pub fn fixture_git_command(program: impl AsRef<OsStr>) -> Command {
     let path = std::env::var_os("PATH");
@@ -159,15 +162,13 @@ impl ScriptedHttpServer {
         clippy::expect_used,
         reason = "a missing scripted request must fail the invoking test at the fixture boundary"
     )]
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "wall time only bounds the external HTTP fixture's readiness messages"
-    )]
     pub fn next_request(&mut self) -> String {
-        let request = self
-            .requests
-            .recv_timeout(Duration::from_secs(2))
-            .expect("fixture should capture request");
+        let request = host_scaled_recv(
+            "scripted HTTP fixture request",
+            FIXTURE_WAIT_BASE,
+            &self.requests,
+        )
+        .expect("fixture should capture request");
         self.remaining_requests -= 1;
         request
     }
@@ -266,7 +267,7 @@ pub fn read_request(stream: &mut TcpStream) -> Vec<u8> {
 /// skip the connection instead of dropping its address. The request ends at
 /// its declared `Content-Length`, or where the peer closed first.
 pub fn try_read_request(stream: &mut TcpStream) -> std::io::Result<Vec<u8>> {
-    stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+    stream.set_read_timeout(Some(host_scaled_duration(FIXTURE_WAIT_BASE)))?;
     let mut request = Vec::new();
     let mut buffer = [0_u8; 1024];
     let mut expected_length = None;
