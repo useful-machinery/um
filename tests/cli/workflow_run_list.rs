@@ -1,15 +1,16 @@
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Output;
+use std::process::{Output, Stdio};
 
 use serde_json::{Value, json};
 
+use super::poll_until;
 use super::workflow_continue::{
     chained, completed, decide, decide_each, loop_tree, read_json, resume,
 };
 use super::workflow_definition::Home;
 use super::workflow_run::{isolated_command, run_record};
-use super::workflow_run_control::{OPERATOR, PublishedWaitTree, refused, run_control};
+use super::workflow_run_control::{LiveRun, OPERATOR, PublishedWaitTree, refused, run_control};
 
 /// `um workflow run list ARGS` as `OPERATOR` against `home`.
 fn list(home: &Home, args: &[&str]) -> Output {
@@ -26,14 +27,37 @@ fn list(home: &Home, args: &[&str]) -> Output {
     .unwrap()
 }
 
-/// The ids of the runs `um workflow run list ARGS --json` lists, checking the document.
-fn listed(home: &Home, args: &[&str]) -> Vec<Value> {
+/// The `um workflow run list ARGS --json` document, checked.
+fn document(home: &Home, args: &[&str]) -> Value {
     let output = list(home, &[args, &["--json"]].concat());
     assert_eq!(output.status.code(), Some(0), "{output:?}");
     let document: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(document["schemaVersion"], 1, "{document}");
     assert_eq!(document["command"], "um workflow run list");
-    document["runs"].as_array().unwrap().clone()
+    document
+}
+
+/// The runs `um workflow run list ARGS --json` lists.
+fn listed(home: &Home, args: &[&str]) -> Vec<Value> {
+    document(home, args)["runs"].as_array().unwrap().clone()
+}
+
+/// The ids `um workflow run list ARGS --json` lists and the exited runs it says it left out
+/// (REQ-LOCALRUN-203).
+fn selected(home: &Home, args: &[&str]) -> (Vec<String>, u64) {
+    let document = document(home, args);
+    let ids = ids(document["runs"].as_array().unwrap())
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+    (ids, document["exitedHidden"].as_u64().unwrap())
+}
+
+/// `um workflow run list ARGS`'s plain output, which exits 0.
+fn plain(home: &Home, args: &[&str]) -> String {
+    let output = list(home, args);
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    String::from_utf8(output.stdout).unwrap()
 }
 
 fn ids(runs: &[Value]) -> Vec<&str> {
@@ -48,10 +72,11 @@ fn two_questions() -> Value {
     ])
 }
 
-// REQ-LOCALRUN-188: `list` lists every run under the home in id order with its record and
-// wait, filters in memory, and names an unreadable entry on stderr.
+// REQ-LOCALRUN-188, REQ-LOCALRUN-203: `list` lists the live runs under the home in id order
+// with their record and wait and counts the exited runs it left out, `--all` lists every run,
+// the filters select in memory, and an unreadable entry is named on stderr.
 #[test]
-fn list_shows_every_run_under_the_home() {
+fn list_shows_the_live_runs_or_with_all_every_run() {
     let published = PublishedWaitTree::with_json_questions(&two_questions());
     let home = Some(&published.home);
     decide(&published.bundle, "review", "approve");
@@ -71,18 +96,55 @@ fn list_shows_every_run_under_the_home() {
     let output = run_control(home, "withdraw", &withdrawn_id, &[]);
     assert_eq!(output.status.code(), Some(0), "{output:?}");
 
-    let runs = listed(&published.home, &[]);
-    let mut expected = vec![
-        waiting_id.as_str(),
-        landed_id.as_str(),
-        withdrawn_id.as_str(),
+    // A run whose `design` holds its step reads `running` while its process lives.
+    let execution = published.bundle.execution_root();
+    fs::write(execution.join("hold-design"), "").unwrap();
+    let mut live = LiveRun {
+        process: published
+            .create_command(&published.definition, &[])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+        release: execution.join("release-design"),
+    };
+    poll_until(
+        "the running run's held step",
+        || execution.join("held-design").exists(),
+        |held| *held,
+    );
+    let runs_directory = PathBuf::from(published.home.path())
+        .join("workflows")
+        .join(&published.definition)
+        .join("runs");
+    let running_id = fs::read_dir(&runs_directory)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .find(|id| ![&waiting_id, &landed_id, &withdrawn_id].contains(&id))
+        .unwrap();
+    let running = runs_directory.join(&running_id);
+    assert_eq!(run_record(&running)["state"], "running");
+
+    let mut live_ids = vec![waiting_id.clone(), running_id.clone()];
+    live_ids.sort_unstable();
+    let mut every = vec![
+        waiting_id.clone(),
+        landed_id.clone(),
+        withdrawn_id.clone(),
+        running_id.clone(),
     ];
-    expected.sort_unstable();
-    assert_eq!(ids(&runs), expected);
+    every.sort_unstable();
+    let home = &published.home;
+    assert_eq!(selected(home, &[]), (live_ids.clone(), 2));
+    assert_eq!(selected(home, &["--all"]), (every.clone(), 0));
+
+    let runs = listed(home, &["--all"]);
     for (run, directory) in [
         (&waiting_id, &waiting),
         (&landed_id, &landed),
         (&withdrawn_id, &withdrawn),
+        (&running_id, &running),
     ] {
         let listed = runs.iter().find(|listed| listed["id"] == **run).unwrap();
         let record = run_record(directory);
@@ -102,55 +164,78 @@ fn list_shows_every_run_under_the_home() {
         assert_eq!(listed["definition"], published.definition.as_str());
         assert_eq!(listed["owner"], OPERATOR);
     }
-    let waiting_entry = runs.iter().find(|run| run["id"] == *waiting_id).unwrap();
+    let entry = |id: &str| runs.iter().find(|run| run["id"] == id).unwrap();
+    let waiting_entry = entry(&waiting_id);
     assert_eq!(waiting_entry["state"], "waiting");
     assert_eq!(waiting_entry["position"], "design");
     assert_eq!(
         waiting_entry["wait"],
         json!({"kind": "answer", "since": wait["since"], "step": ["design"]})
     );
+    assert_eq!(entry(&running_id)["state"], "running");
+    assert_eq!(entry(&running_id)["wait"], Value::Null);
     for other in [&landed_id, &withdrawn_id] {
-        let entry = runs.iter().find(|run| run["id"] == **other).unwrap();
+        let entry = entry(other);
         assert_eq!(entry["state"], "exited", "{entry}");
         assert_eq!(entry["position"], Value::Null, "{entry}");
         assert_eq!(entry["wait"], Value::Null, "{entry}");
     }
-    let landed_entry = runs.iter().find(|run| run["id"] == *landed_id).unwrap();
-    assert_eq!(landed_entry["outcome"], "landed");
+    assert_eq!(entry(&landed_id)["outcome"], "landed");
 
-    let home = &published.home;
-    assert_eq!(ids(&listed(home, &["--waiting"])), [waiting_id.as_str()]);
-    assert_eq!(ids(&listed(home, &["--owner", "me"])), expected);
-    assert_eq!(ids(&listed(home, &["--owner", OPERATOR])), expected);
-    assert!(listed(home, &["--owner", "nobody"]).is_empty());
     assert_eq!(
-        ids(&listed(home, &["--definition", &published.definition])),
-        expected
+        selected(home, &["--waiting"]),
+        (vec![waiting_id.clone()], 0)
     );
-    assert!(listed(home, &["--definition", "def_7zzzzzzzzzzzzzzzzzzzzzzzzz"]).is_empty());
+    for filter in [
+        ["--owner", "me"],
+        ["--owner", OPERATOR],
+        ["--definition", published.definition.as_str()],
+    ] {
+        assert_eq!(selected(home, &filter), (live_ids.clone(), 2), "{filter:?}");
+        assert_eq!(
+            selected(home, &[&filter[..], &["--all"]].concat()),
+            (every.clone(), 0),
+            "{filter:?}"
+        );
+    }
+    assert_eq!(selected(home, &["--owner", "nobody"]), (vec![], 0));
+    assert_eq!(
+        selected(home, &["--definition", "def_7zzzzzzzzzzzzzzzzzzzzzzzzz"]),
+        (vec![], 0)
+    );
+    for flag in ["--waiting", "--drift"] {
+        let output = list(home, &["--all", flag]);
+        assert_eq!(output.status.code(), Some(2), "{output:?}");
+        assert!(output.stdout.is_empty(), "{output:?}");
+    }
 
-    let plain = list(home, &[]);
-    assert_eq!(plain.status.code(), Some(0), "{plain:?}");
-    let plain = String::from_utf8(plain.stdout).unwrap();
-    let lines = plain.lines().collect::<Vec<_>>();
-    assert_eq!(lines.len(), 3, "{plain}");
-    for (line, id) in lines.iter().zip(&expected) {
-        assert!(line.starts_with(id), "{plain}");
+    let output = plain(home, &[]);
+    let lines = output.lines().collect::<Vec<_>>();
+    assert_eq!(lines.len(), 4, "{output}");
+    for (line, id) in lines.iter().zip(&live_ids) {
+        assert!(line.starts_with(id.as_str()), "{output}");
+    }
+    assert_eq!(
+        lines[2..],
+        ["", "2 exited runs hidden. Pass --all to list every run."],
+        "{output}"
+    );
+    let output = plain(home, &["--all"]);
+    let lines = output.lines().collect::<Vec<_>>();
+    assert_eq!(lines.len(), 4, "{output}");
+    for (line, id) in lines.iter().zip(&every) {
+        assert!(line.starts_with(id.as_str()), "{output}");
     }
 
     // An entry under `runs/` without a run record is named on stderr and omitted.
-    let stray = PathBuf::from(home.path())
-        .join("workflows")
-        .join(&published.definition)
-        .join("runs")
-        .join("run_00000000000000000000000000");
+    let stray = runs_directory.join("run_00000000000000000000000000");
     fs::create_dir(&stray).unwrap();
-    let output = list(home, &["--json"]);
+    let output = list(home, &["--all", "--json"]);
     assert_eq!(output.status.code(), Some(0), "{output:?}");
     let document: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(
         ids(document["runs"].as_array().unwrap()),
-        expected,
+        every,
         "{document}"
     );
     let stderr = String::from_utf8(output.stderr).unwrap();
@@ -158,19 +243,34 @@ fn list_shows_every_run_under_the_home() {
         stderr.contains(&format!("! {}: run_record_missing", stray.display())),
         "{stderr}"
     );
+    fs::remove_dir(&stray).unwrap();
+
+    // With the live runs ended, the listing has no run and says how many it left out.
+    let output = run_control(Some(home), "cancel", &running_id, &[]);
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    poll_until(
+        "the canceled run's process exit",
+        || live.process.try_wait().unwrap(),
+        Option::is_some,
+    );
+    let output = run_control(Some(home), "withdraw", &waiting_id, &[]);
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert_eq!(selected(home, &[]), (vec![], 4));
+    assert_eq!(
+        plain(home, &[]),
+        "No live workflow runs.\n\n4 exited runs hidden. Pass --all to list every run.\n"
+    );
 
     let empty = Home::new();
-    let output = list(&empty, &[]);
-    assert_eq!(output.status.code(), Some(0), "{output:?}");
-    assert_eq!(
-        String::from_utf8(output.stdout).unwrap(),
-        "No workflow runs.\n"
-    );
-    assert!(listed(&empty, &[]).is_empty());
+    assert_eq!(plain(&empty, &[]), "No live workflow runs.\n");
+    assert_eq!(plain(&empty, &["--all"]), "No workflow runs.\n");
+    assert_eq!(selected(&empty, &[]), (vec![], 0));
+    assert_eq!(selected(&empty, &["--all"]), (vec![], 0));
 }
 
-// REQ-LOCALRUN-188, REQ-LOCALRUN-190: each run lists its subject, and `--drift` keeps the
-// live runs behind their definition's current revision, each with that revision.
+// REQ-LOCALRUN-188, REQ-LOCALRUN-190, REQ-LOCALRUN-203: each run lists its subject, the one
+// exited run is counted as hidden, and `--drift` keeps the live runs behind their
+// definition's current revision, each with that revision.
 #[test]
 fn list_shows_the_subject_and_the_drifted_runs() {
     let published = PublishedWaitTree::with_subject();
@@ -198,12 +298,18 @@ fn list_shows_the_subject_and_the_drifted_runs() {
         )),
         "{plain}"
     );
+    assert_eq!(
+        plain.lines().last(),
+        Some("1 exited run hidden. Pass --all to list every run."),
+        "{plain}"
+    );
     assert!(listed(home, &["--drift"]).is_empty());
 
     let second = published.republish(&[]);
     assert_eq!(second["revision"]["n"], 2, "{second}");
     let (_, current) = published.waiting_for(&published.definition, "AUTO-3");
-    assert_eq!(ids(&listed(home, &[])).len(), 3);
+    assert_eq!(ids(&listed(home, &[])).len(), 2);
+    assert_eq!(ids(&listed(home, &["--all"])).len(), 3);
 
     let drifted = listed(home, &["--drift"]);
     assert_eq!(ids(&drifted), [behind.as_str()], "{drifted:?}");

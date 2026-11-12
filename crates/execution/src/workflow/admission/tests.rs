@@ -1903,6 +1903,28 @@ fn workflow_admission_only_forwards_base_and_explicit_safe_names() {
     }
 }
 
+// INV-ENGINE-31
+#[test]
+fn node_narrowing_drops_only_root_names_the_node_omits() {
+    let environment = EnvironmentSnapshot::new([
+        ("PATH", "/bin"),
+        ("TMPDIR", "/tmp/run"),
+        ("UM_WORKFLOW_ROOT", "/tree"),
+        ("VISIBLE", "kept"),
+        ("HIDDEN_FROM_NODE", "dropped"),
+    ]);
+    let root = ["VISIBLE", "HIDDEN_FROM_NODE", "TMPDIR"]
+        .map(str::to_owned)
+        .into();
+
+    let narrowed = environment.narrowed_for_node(&root, &["VISIBLE".to_owned()].into());
+
+    assert_eq!(
+        narrowed.variables().keys().collect::<Vec<_>>(),
+        ["PATH", "TMPDIR", "UM_WORKFLOW_ROOT", "VISIBLE"]
+    );
+}
+
 fn execution_context(
     root: PathBuf,
     maximum_parallel_steps: usize,

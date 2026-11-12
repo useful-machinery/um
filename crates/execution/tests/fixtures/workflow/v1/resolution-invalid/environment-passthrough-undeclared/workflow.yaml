@@ -1,0 +1,8 @@
+schemaVersion: 1
+environmentPassthrough: [WORKFLOW_VISIBLE]
+steps:
+  build:
+    kind: cmd
+    environmentPassthrough: [TRACKER_TOKEN]
+    command:
+      argv: ["true"]

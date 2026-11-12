@@ -100,6 +100,7 @@ pub(crate) enum ValidationFailureKind {
     ItemReferenceRequiresForEach,
     SubjectInputUndeclared,
     SubjectInputNotText,
+    EnvironmentPassthroughUndeclared,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -112,6 +113,9 @@ pub(crate) enum ValidationLocation {
     AgentProfileReference { step: String },
     RecoveryAgentProfileReference { step: String },
     FinalizerAgentProfileReference { finalizer: String },
+    EnvironmentPassthrough { step: String },
+    RecoveryEnvironmentPassthrough { step: String },
+    FinalizerEnvironmentPassthrough { finalizer: String },
     StepDependency { step: String, index: usize },
     StepInput { step: String, input: String },
     MessageText { step: String, index: usize },
@@ -388,7 +392,12 @@ pub(crate) fn validate_with_children(
                 &mut declared_inputs,
             )?,
         };
-        let recovery = validate_recovery(step_name, step.recovery.as_ref(), &agent_profiles)?;
+        let recovery = validate_recovery(
+            step_name,
+            step.recovery.as_ref(),
+            &agent_profiles,
+            &document.environment_passthrough,
+        )?;
         steps.insert(step_name.clone(), body);
         recoveries.insert(step_name.clone(), recovery);
     }
@@ -673,6 +682,7 @@ fn validate_workflow_step(
             prerequisites: Vec::new(),
             evidence_prerequisites: Vec::new(),
             cwd: None,
+            environment_passthrough: None,
             outputs,
         },
         workflow: node.workflow.clone(),
@@ -1753,23 +1763,36 @@ fn validate_recovery(
     step_name: &str,
     recovery: Option<&StepRecovery>,
     agent_profiles: &BTreeMap<String, ValidatedHarness>,
+    root_passthrough: &BTreeSet<String>,
 ) -> Result<Option<ValidatedStepRecovery>, ValidationFailure> {
+    let declared = |environment_passthrough: &Option<BTreeSet<String>>| {
+        check_environment_passthrough(environment_passthrough.as_ref(), root_passthrough, || {
+            ValidationLocation::RecoveryEnvironmentPassthrough {
+                step: step_name.to_owned(),
+            }
+        })
+        .map(|()| environment_passthrough.clone())
+    };
     recovery
         .map(|recovery| {
             let handler = recovery
                 .handler
                 .as_ref()
                 .map(|handler| match handler {
-                    RecoveryHandler::Command { argv, cwd } => {
-                        Ok(ValidatedRecoveryHandler::Command {
-                            argv: argv.clone(),
-                            cwd: cwd.clone(),
-                        })
-                    }
+                    RecoveryHandler::Command {
+                        argv,
+                        cwd,
+                        environment_passthrough,
+                    } => Ok(ValidatedRecoveryHandler::Command {
+                        argv: argv.clone(),
+                        cwd: cwd.clone(),
+                        environment_passthrough: declared(environment_passthrough)?,
+                    }),
                     RecoveryHandler::Agent {
                         profile,
                         prompt,
                         cwd,
+                        environment_passthrough,
                     } => {
                         let harness = agent_profiles.get(profile).cloned().ok_or_else(|| {
                             ValidationFailure::new(
@@ -1784,6 +1807,7 @@ fn validate_recovery(
                             prompt: prompt.clone(),
                             cwd: cwd.clone(),
                             harness,
+                            environment_passthrough: declared(environment_passthrough)?,
                         })
                     }
                 })
@@ -1794,6 +1818,22 @@ fn validate_recovery(
             })
         })
         .transpose()
+}
+
+/// A node's own `environmentPassthrough` lists only names the root declares
+/// (REQ-WFFORMAT-102).
+fn check_environment_passthrough(
+    declared: Option<&BTreeSet<String>>,
+    root_passthrough: &BTreeSet<String>,
+    location: impl FnOnce() -> ValidationLocation,
+) -> Result<(), ValidationFailure> {
+    if declared.is_some_and(|names| !names.is_subset(root_passthrough)) {
+        return Err(ValidationFailure::new(
+            ValidationFailureKind::EnvironmentPassthroughUndeclared,
+            location(),
+        ));
+    }
+    Ok(())
 }
 
 fn resolve_condition_predicate(
@@ -2037,6 +2077,18 @@ fn validate_body(
     agent_profiles: &BTreeMap<String, ValidatedHarness>,
     declared_inputs: &mut DeclaredInputs,
 ) -> Result<ValidatedStep, ValidationFailure> {
+    check_environment_passthrough(
+        common_node(body).environment_passthrough.as_ref(),
+        &document.environment_passthrough,
+        || match role {
+            WorkflowNodeRole::Step => ValidationLocation::EnvironmentPassthrough {
+                step: node_name.to_owned(),
+            },
+            WorkflowNodeRole::Finalizer => ValidationLocation::FinalizerEnvironmentPassthrough {
+                finalizer: node_name.to_owned(),
+            },
+        },
+    )?;
     let mut condition_values = BTreeMap::new();
     let condition = common_node(body)
         .condition
@@ -2225,6 +2277,7 @@ fn validate_common(
         prerequisites: prerequisites.to_vec(),
         evidence_prerequisites,
         cwd: common.cwd.clone(),
+        environment_passthrough: common.environment_passthrough.clone(),
         outputs,
     }
 }
@@ -2643,6 +2696,7 @@ static WORKFLOW_STEP_COMMON: CommonNode = CommonNode {
     failure_policy: FailurePolicy::Required,
     condition: None,
     cwd: None,
+    environment_passthrough: None,
     outputs: BTreeMap::new(),
 };
 

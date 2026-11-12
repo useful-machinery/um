@@ -1,0 +1,8 @@
+schemaVersion: 1
+environmentPassthrough: [TRACKER_TOKEN]
+steps:
+  file:
+    kind: cmd
+    environmentPassthrough: [GH_TOKEN]
+    command:
+      argv: ["./file-issue"]

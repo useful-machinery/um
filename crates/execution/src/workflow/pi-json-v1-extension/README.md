@@ -6,6 +6,8 @@ published package and not a workflow runtime. Rust remains responsible for invoc
 identity, retained-schema validation, and terminal workflow state. The result
 extension leaves provider tool arguments unchanged while Pi streams, validates,
 executes, and persists them; it does not maintain a redacted or restorable copy.
+It submits for validation the arguments the session records for the result call, not
+the copy Pi normalizes for `execute`.
 
 The checked-in fixture is a complete materialization for the fixed inputs in
 `fixtures/materialization-input.json`. The extension loaded by Pi is a standalone file;

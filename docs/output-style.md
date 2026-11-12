@@ -271,5 +271,6 @@ Pagination:
 
   `workflow definition list` and `workflow run list` read the definitions and
   runs under the local `um` home, not an API, so there is no continuation to
-  page through: each prints every definition or run the home holds in one
-  listing.
+  page through: `workflow definition list` prints every definition the home
+  holds, and `workflow run list` the home's live runs, or every run under
+  `--all`, in one listing.

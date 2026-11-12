@@ -896,6 +896,46 @@ fn count_one_result_response(call_id: &str, tool_name: &str) -> Value {
     })
 }
 
+/// Waits for the authoritative validator to reject a result candidate, then
+/// returns the model request that carries the rejection back to the model as
+/// an error `toolResult` for `call_id`.
+async fn next_model_request_after_result_rejection(
+    running: &mut RunningRealPi,
+    call_id: &str,
+) -> ControlledRequest {
+    loop {
+        let Some(observation) = running.fixture.observations.recv().await else {
+            panic!(
+                "real Pi ended before rejecting result call {call_id}: {:?}",
+                running.fixture.diagnostics.get("agent-step")
+            );
+        };
+        if matches!(
+            observation.observation(),
+            AgentObservation::ValueRejected {
+                kind: AgentValueKind::Result,
+                ..
+            }
+        ) {
+            break;
+        }
+    }
+    let corrected = running.fixture.controller.next("model").await;
+    assert!(
+        corrected.value["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|message| {
+                message["role"] == "toolResult"
+                    && message["toolCallId"] == call_id
+                    && message["isError"] == true
+            }),
+        "the next model request carried no error toolResult for {call_id}"
+    );
+    corrected
+}
+
 async fn assert_count_one_result(fixture: RealPiFixture, outcome: AgentOutcome) {
     let AgentOutcome::Completed(CompletedAgentInvocation::Result(result)) = outcome else {
         panic!("corrected terminating result did not complete");
@@ -1371,31 +1411,13 @@ async fn pinned_real_pi_04_result_rejection_sibling_correction_and_termination_c
             }]
         }));
 
-        loop {
-            let Some(observation) = running.fixture.observations.recv().await else {
-                panic!(
-                    "real Pi ended before schema rejection: {:?}",
-                    running.fixture.diagnostics.get("agent-step")
-                );
-            };
-            if matches!(
-                observation.observation(),
-                AgentObservation::ValueRejected {
-                    kind: AgentValueKind::Result,
-                    ..
-                }
-            ) {
-                break;
-            }
-        }
-        let corrected_after_schema_rejection = running.fixture.controller.next("model").await;
+        let corrected_after_schema_rejection =
+            next_model_request_after_result_rejection(&mut running, "call-invalid").await;
         let messages = corrected_after_schema_rejection.value["messages"]
             .as_array()
             .unwrap();
         assert!(messages.iter().any(|message| {
-            message["role"] == "toolResult"
-                && message["toolCallId"] == "call-invalid"
-                && message["isError"] == true
+            message["toolCallId"] == "call-invalid"
                 && serde_json::to_string(message)
                     .unwrap()
                     .contains("workflow schema")
@@ -1465,6 +1487,45 @@ async fn pinned_real_pi_04_malformed_tool_arguments_cannot_settle_a_result() {
                 })
         );
         corrected.release(count_one_result_response("call-corrected", &tool_name));
+        let (fixture, outcome) = running.finish().await;
+        assert_count_one_result(fixture, outcome).await;
+    })
+    .await;
+}
+
+// REQ-AGENT-83, REQ-AGENT-29
+// INV-HARNESS-16 (AUTO-263)
+#[tokio::test]
+#[ignore = "requires pinned harness"]
+async fn pinned_real_pi_04_result_is_judged_as_the_model_wrote_it() {
+    let _executable = require_conformance_executable();
+    host_scaled_watchdog("Pi result as written", PINNED_TEST_WATCHDOG, async {
+        let (mut running, first, tool_name) = launch_result_case().await;
+        // Pi's model-facing projection would drop the null optional field and
+        // coerce the numeric string; the retained schema rejects both as written.
+        first.release(json!({
+            "kind": "toolCalls",
+            "calls": [{
+                "id": "call-optional-null",
+                "name": tool_name,
+                "arguments": {"result": {"count": 1, "x": null}}
+            }]
+        }));
+        let after_optional_null =
+            next_model_request_after_result_rejection(&mut running, "call-optional-null").await;
+        after_optional_null.release(json!({
+            "kind": "toolCalls",
+            "calls": [{
+                "id": "call-numeric-string",
+                "name": tool_name,
+                "arguments": {"result": {"count": "1"}}
+            }]
+        }));
+        let after_numeric_string =
+            next_model_request_after_result_rejection(&mut running, "call-numeric-string").await;
+        after_numeric_string.release(count_one_result_response("call-valid", &tool_name));
+
+        running.await_started().await;
         let (fixture, outcome) = running.finish().await;
         assert_count_one_result(fixture, outcome).await;
     })

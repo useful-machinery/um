@@ -58,7 +58,7 @@ repository changes.
 | `version` | no | Label for people, 1 to 64 characters. |
 | `subject` | no | Root only: the declared `text` input naming the run's subject. |
 | `inputs` | no | Named Text, JSON, File, or attachments; optional JSON schema or exact File media type; may be `optional` or carry a `default`. |
-| `environmentPassthrough` | no | Unique host environment variable names explicitly forwarded to all steps, agents, and recovery handlers. |
+| `environmentPassthrough` | no | Host variable names forwarded to nodes; a node may narrow them. |
 | `agentProfiles` | no | Workflow-local harness configurations. |
 | `steps` | yes | At least one ordinary `cmd`, `agent`, or `workflow` node. |
 | `finalizers` | no | Nodes considered after the ordinary phase. |
@@ -73,28 +73,28 @@ multiple YAML documents, `%YAML` and unknown directives, and floating-point numb
 (write `1`, not `1.0`). A workflow file is at most 1 MiB and nests values at most
 100 levels deep.
 
-Execution inherits only `PATH`, `HOME`, `USER`, `LOGNAME`, `LANG`, `LC_ALL`,
-`LC_CTYPE`, `TERM`, and `TMPDIR` from the launching process by default. Add
-other names at the workflow root, for example `environmentPassthrough: [MY_TOKEN]`.
-Names must be unique ASCII shell variable names (letter or underscore, then
-letters, digits, or underscores). Missing names remain unset. Engine-reserved
-`UM_*` and `SCHERZO_*`, along with runner-private Git, SSH, and GitHub credential/helper names
-cannot be passed through. Runner source revision metadata is injected by the
-engine, not inherited from the host. Treat every declared name as available to
-all workflow code, including recovery. Guard and recovery scratch directories
-use `TMPDIR` when set (otherwise the system temporary directory); the guard's
-launch manifest never records environment values.
+Execution inherits only `PATH`, `HOME`, `USER`, `LOGNAME`, `LANG`, `LC_ALL`, `LC_CTYPE`,
+`TERM`, and `TMPDIR` from the launching process by default. Add other names at the
+workflow root, for example `environmentPassthrough: [MY_TOKEN]`. Names are unique shell
+variable names; missing ones stay unset. Engine-reserved `UM_*` and `SCHERZO_*` and
+runner-private Git, SSH, and GitHub credential/helper names cannot be passed through.
+The engine injects runner source revision metadata. A step, finalizer, or recovery
+handler may list root names in its own `environmentPassthrough` (else
+`environment_passthrough_undeclared`) to get only those, `[]` for none; a handler
+without one gets its step's. Guard and recovery scratch directories use `TMPDIR` when
+set (otherwise the system temporary directory); the guard's launch manifest never
+records environment values.
 
 The `cmd` and `agent` node kinds may declare `failurePolicy`, `recovery`, `dependsOn`,
-`cwd`, and `outputs`. `failurePolicy` is `required` by default or may be `advisory`.
-`recovery.retries` is 1 through 10. It either omits `handler` for an immediate unchanged
-target recheck, names one closed command handler, or names one fresh-agent handler with
-an existing profile and retained prompt. A command handler reads the bounded private
-Recovery Context Schema 1 path from `UM_RECOVERY_CONTEXT` and writes exactly one
-closed, at-most-16-KiB `recheck` or `gave_up` decision document to the fresh private
-`UM_RECOVERY_RESULT` path. An agent handler's profile and compatible installed
-harness are admission and runner-placement requirements even when recovery never
-activates.
+`cwd`, `outputs`, and `environmentPassthrough`. `failurePolicy` is `required` by default
+or may be `advisory`. `recovery.retries` is 1 through 10. It either omits `handler` for
+an immediate unchanged target recheck, names one closed command handler, or names one
+fresh-agent handler with an existing profile and retained prompt. A command handler
+reads the bounded private Recovery Context Schema 1 path from `UM_RECOVERY_CONTEXT` and
+writes exactly one closed, at-most-16-KiB `recheck` or `gave_up` decision document to
+the fresh private `UM_RECOVERY_RESULT` path. An agent handler's profile and compatible
+installed harness are admission and runner-placement requirements even when recovery
+never activates.
 
 - `dependsOn` names unique ordinary steps and creates control-only ordering.
 - An `outputs.<step>.<output>` reference creates a direct inferred data edge. Naming
@@ -490,7 +490,7 @@ after every ordinary outcome.
   tools, secrets, credentials, or repositories.
 
 Workflow V1 has no workflow-declared retry, timeout, loop, matrix, fan-out, concurrency,
-secret, environment, or workspace field.
+secret, environment-setting, or workspace field.
 
 ## Schema retrieval and authoritative validation
 

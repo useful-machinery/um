@@ -558,16 +558,7 @@ where
     let definition = admitted
         .workflow()
         .definition
-        .steps
-        .get(step_name)
-        .or_else(|| {
-            admitted
-                .workflow()
-                .definition
-                .finalizers
-                .get(step_name)
-                .map(|finalizer| &finalizer.body)
-        })
+        .node(step_name)
         .ok_or_else(|| start_error(AgentInputStartFailure::StepUnavailable))?;
     let ValidatedStep::Agent(step) = definition else {
         return Err(start_error(AgentInputStartFailure::StepUnavailable));
@@ -634,12 +625,13 @@ where
         &identity,
         admitted_step,
     )?;
+    let environment = admitted.node_environment(identity.step());
     let invocation = admitted_agent_invocation(
         admitted_step,
         None,
         identity,
         working_directory,
-        admitted.execution().environment().clone(),
+        environment,
         invocation_staging,
         diagnostic_session,
         plan.prompt,
@@ -729,10 +721,12 @@ where
     let (lifecycle, view, diagnostic_session) =
         allocate_diagnostic_session(lifecycle, view, diagnostic_sessions, &identity, harness)?;
     accounting.record_native_session(&identity, harness.profile(), &diagnostic_session);
-    let environment = admitted.execution().environment().with_variable(
-        RECOVERY_CONTEXT_VARIABLE.into(),
-        context_path.as_os_str().to_owned(),
-    );
+    let environment = admitted
+        .recovery_handler_environment(step_name)
+        .with_variable(
+            RECOVERY_CONTEXT_VARIABLE.into(),
+            context_path.as_os_str().to_owned(),
+        );
     let prompt = AgentPrompt::new(
         Arc::from(RECOVERY_AGENT_INSTRUCTIONS),
         Arc::from(trusted_prompt),

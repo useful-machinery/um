@@ -292,3 +292,124 @@ fn refused_organization_audit_listing_reports_outcome_and_exit_without_server_wo
         server.finish();
     }
 }
+
+fn gitlab_audit_item(
+    record_id: &str,
+    occurred_at: &str,
+    actor: serde_json::Value,
+    action: &str,
+    subject: serde_json::Value,
+    changes: serde_json::Value,
+) -> serde_json::Value {
+    serde_json::json!({
+        "id": record_id,
+        "occurredAt": occurred_at,
+        "retention": {
+            "identifier": "identity-tenancy-production-730d-v1",
+            "retainUntil": "2028-10-19T12:00:00Z"
+        },
+        "detailsStatus": "details_available",
+        "actor": actor,
+        "action": action,
+        "subject": subject,
+        "changes": changes
+    })
+}
+
+fn gitlab_audit_page() -> serde_json::Value {
+    let principal = serde_json::json!({
+        "kind": "principal",
+        "principalId": "prn_01k0z6r1w8f4jy2m7q9v3x5abc"
+    });
+    let connection = serde_json::json!({
+        "kind": "gitlab_connection",
+        "id": "glc_01k0z6r1w8f4jy2m7q9v3x5abc"
+    });
+    serde_json::json!({
+        "items": [
+            gitlab_audit_item(
+                "aud_01k0z6r1w8f4jy2m7q9v3x5abc",
+                "2026-10-20T12:00:00Z",
+                principal.clone(),
+                "gitlab_repository.selection",
+                connection.clone(),
+                serde_json::json!([{
+                    "field": "selected_repository_ids",
+                    "before": "[]",
+                    "after": "[\"12\",\"34\"]"
+                }]),
+            ),
+            gitlab_audit_item(
+                "aud_01k0z6r1w8f4jy2m7q9v3x5abd",
+                "2026-10-20T12:01:00Z",
+                principal,
+                "gitlab_connection.disconnect",
+                connection,
+                serde_json::json!([{ "field": "state", "before": "active", "after": "disconnected" }]),
+            ),
+            gitlab_audit_item(
+                "aud_01k0z6r1w8f4jy2m7q9v3x5abe",
+                "2026-10-20T12:02:00Z",
+                serde_json::json!({ "kind": "system" }),
+                "gitlab_candidate.expired",
+                serde_json::json!({
+                    "kind": "gitlab_candidate",
+                    "id": "glca_01k0z6r1w8f4jy2m7q9v3x5abc"
+                }),
+                serde_json::json!([{ "field": "state", "after": "expired" }]),
+            ),
+        ],
+        "warnings": []
+    })
+}
+
+// REQ-AUDIT-10, REQ-AUDIT-22, REQ-AUDIT-23
+#[test]
+fn organization_audit_list_reads_gitlab_connection_and_candidate_records() {
+    let page = gitlab_audit_page();
+
+    let (server, _directory, _path, credential_path) = organization::prepared_organization(
+        vec![json_http_response("200 OK", page.clone())],
+        TOKEN,
+    );
+    let output = run_with_env(
+        &[
+            "organization",
+            "audit",
+            "list",
+            "acme-research",
+            "--json",
+            "--allow-insecure-http",
+        ],
+        &deployment_environment(&server.api_url, &credential_path),
+    );
+    assert!(output.status.success(), "{output:?}");
+    let document: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(document["items"], page["items"]);
+    server.finish();
+
+    let (server, _directory, _path, credential_path) =
+        organization::prepared_organization(vec![json_http_response("200 OK", page)], TOKEN);
+    let output = run_with_env(
+        &[
+            "organization",
+            "audit",
+            "list",
+            "acme-research",
+            "--allow-insecure-http",
+        ],
+        &deployment_environment(&server.api_url, &credential_path),
+    );
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    for expected in [
+        "target: gitlab_connection glc_01k0z6r1w8f4jy2m7q9v3x5abc",
+        "target: gitlab_candidate glca_01k0z6r1w8f4jy2m7q9v3x5abc",
+    ] {
+        assert!(
+            stdout.lines().any(|line| line == expected),
+            "missing {expected}"
+        );
+    }
+    server.finish();
+}

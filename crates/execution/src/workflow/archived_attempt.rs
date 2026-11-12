@@ -1903,18 +1903,7 @@ fn export_media_type<'a>(
     workflow: &'a super::resolution::ResolvedWorkflow,
     source: &super::validated::ResolvedOutputSource,
 ) -> Result<&'a str, ()> {
-    let step = workflow
-        .definition
-        .steps
-        .get(&source.node.id)
-        .or_else(|| {
-            workflow
-                .definition
-                .finalizers
-                .get(&source.node.id)
-                .map(|finalizer| &finalizer.body)
-        })
-        .ok_or(())?;
+    let step = workflow.definition.node(&source.node.id).ok_or(())?;
     let output = step.common().outputs.get(&source.output).ok_or(())?;
     Ok(match &output.definition {
         Output::TextPath { .. } | Output::TextAgentResponse | Output::ChildOutcome => {
@@ -1943,22 +1932,16 @@ fn step_kind_matches(kind: &str, definition: &ValidatedStep) -> bool {
 }
 
 fn step_state_matches(result: WorkflowStepStateV1, durable: AttemptStepStateV1) -> bool {
-    matches!(
-        (result, durable),
-        (
-            WorkflowStepStateV1::Succeeded,
-            AttemptStepStateV1::Succeeded
-        ) | (
-            WorkflowStepStateV1::Inherited,
-            AttemptStepStateV1::Inherited
-        ) | (WorkflowStepStateV1::Failed, AttemptStepStateV1::Failed)
-            | (WorkflowStepStateV1::Blocked, AttemptStepStateV1::Blocked)
-            | (WorkflowStepStateV1::NotRun, AttemptStepStateV1::NotRun)
-            | (
-                WorkflowStepStateV1::Cancelled,
-                AttemptStepStateV1::Cancelled
-            )
-    )
+    let expected = match result {
+        WorkflowStepStateV1::Succeeded => AttemptStepStateV1::Succeeded,
+        WorkflowStepStateV1::Inherited => AttemptStepStateV1::Inherited,
+        WorkflowStepStateV1::Failed => AttemptStepStateV1::Failed,
+        WorkflowStepStateV1::Blocked => AttemptStepStateV1::Blocked,
+        WorkflowStepStateV1::Skipped => AttemptStepStateV1::Skipped,
+        WorkflowStepStateV1::NotRun => AttemptStepStateV1::NotRun,
+        WorkflowStepStateV1::Cancelled => AttemptStepStateV1::Cancelled,
+    };
+    durable == expected
 }
 
 fn step_failure_policy(step: &ValidatedStep) -> FailurePolicy {

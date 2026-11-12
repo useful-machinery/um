@@ -263,6 +263,18 @@ pub(crate) struct HostLoad {
     pub(crate) cores: usize,
 }
 
+/// A validator for one `$defs` definition of a JSON Schema document, so a test checks a
+/// fragment of a published schema without a whole document around it.
+pub(crate) fn schema_definition(schema: &str, definition: &str) -> jsonschema::Validator {
+    let document: serde_json::Value = serde_json::from_str(schema).unwrap();
+    let schema = serde_json::json!({
+        "$schema": document["$schema"],
+        "$defs": document["$defs"],
+        "$ref": format!("#/$defs/{definition}"),
+    });
+    jsonschema::draft202012::new(&schema).unwrap()
+}
+
 /// Reads `/proc/loadavg` on Linux and `sysctl -n vm.loadavg` elsewhere; `None` when the
 /// load is unreadable.
 pub(crate) fn host_load() -> Option<HostLoad> {

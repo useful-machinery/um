@@ -806,6 +806,18 @@ impl EnvironmentSnapshot {
         })
     }
 
+    /// Removes the root-declared names a node's effective `environmentPassthrough` omits
+    /// (INV-ENGINE-31). A fixed inherited name stays even when the root lists it, and an
+    /// engine variable cannot be a passthrough name, so neither is ever removed.
+    fn narrowed_for_node(&self, root: &BTreeSet<String>, kept: &BTreeSet<String>) -> Self {
+        self.without_variables_matching(|name| {
+            !is_base_workflow_environment_name(name)
+                && name
+                    .to_str()
+                    .is_some_and(|name| root.contains(name) && !kept.contains(name))
+        })
+    }
+
     pub fn without_managed_runner_credentials_and_helpers(&self) -> Self {
         self.without_variables_matching(is_managed_runner_private_environment_name)
     }
@@ -1520,6 +1532,54 @@ impl AdmittedWorkflow {
         &self.execution
     }
 
+    /// The admitted environment a step or finalizer process starts from, narrowed by the
+    /// node's own `environmentPassthrough` when it declares one (REQ-WFEXEC-71).
+    pub(crate) fn node_environment(&self, node: &str) -> EnvironmentSnapshot {
+        let declared = self
+            .workflow
+            .definition
+            .node(node)
+            .and_then(|body| body.common().environment_passthrough.as_ref());
+        self.environment_narrowed_to(declared)
+    }
+
+    /// The admitted environment the recovery handler of `step` starts from: narrowed by
+    /// the handler's own `environmentPassthrough`, or its step's when it declares none
+    /// (REQ-WFRECOVERY-64).
+    pub(crate) fn recovery_handler_environment(&self, step: &str) -> EnvironmentSnapshot {
+        let declared = self
+            .workflow
+            .definition
+            .recoveries
+            .get(step)
+            .and_then(Option::as_ref)
+            .and_then(|recovery| recovery.handler.as_ref())
+            .and_then(|handler| match handler {
+                ValidatedRecoveryHandler::Command {
+                    environment_passthrough,
+                    ..
+                }
+                | ValidatedRecoveryHandler::Agent {
+                    environment_passthrough,
+                    ..
+                } => environment_passthrough.as_ref(),
+            });
+        match declared {
+            Some(_) => self.environment_narrowed_to(declared),
+            None => self.node_environment(step),
+        }
+    }
+
+    fn environment_narrowed_to(&self, kept: Option<&BTreeSet<String>>) -> EnvironmentSnapshot {
+        match kept {
+            Some(kept) => self
+                .execution
+                .environment
+                .narrowed_for_node(&self.workflow.definition.environment_passthrough, kept),
+            None => self.execution.environment.clone(),
+        }
+    }
+
     /// Engine-only binding after the continuation claim, never from caller-supplied
     /// environment (which admission strips as an engine-reserved variable).
     pub(crate) fn with_continuation_context(mut self, path: &Path) -> Self {
@@ -1583,6 +1643,13 @@ impl AdmittedWorkflow {
 
     pub fn agent_steps(&self) -> &BTreeMap<String, AdmittedHarness> {
         &self.agent_steps
+    }
+
+    /// Whether execution needs the agent runtime: admission admitted a harness for an agent
+    /// step, an agent finalizer or an agent recovery handler (INV-ENGINE-30). Hosts prepare
+    /// agent staging, and the engine refuses `AgentExecution::Disabled`, by this predicate.
+    pub fn requires_agent_runtime(&self) -> bool {
+        !self.agent_steps().is_empty() || !self.recovery_handlers().is_empty()
     }
 
     pub(crate) fn recovery_handler(&self, step: &str) -> Option<&AdmittedHarness> {

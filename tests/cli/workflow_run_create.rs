@@ -7,7 +7,9 @@ use serde_json::Value;
 use tempfile::TempDir;
 
 use super::workflow_definition::{Home, Tree, read_json, schema};
-use super::workflow_run::{assert_usage_error, isolated_command, succeeded, tree_rejection};
+use super::workflow_run::{
+    assert_usage_error, fixture_path_with_host_tools, isolated_command, succeeded, tree_rejection,
+};
 
 const STAGE_PROGRAM: &str = "#!/bin/sh\nexit 0\n";
 
@@ -73,12 +75,7 @@ impl Published {
     pub(super) fn command(&self, args: &[&str]) -> Command {
         let mut full = vec!["workflow".to_owned(), "run".to_owned()];
         full.extend(args.iter().map(|arg| (*arg).to_owned()));
-        let inherited = std::env::var_os("PATH").unwrap_or_default();
-        let path = std::env::join_paths(
-            std::iter::once(self.scratch.path().join("tools"))
-                .chain(std::env::split_paths(&inherited)),
-        )
-        .unwrap();
+        let path = fixture_path_with_host_tools(&[&self.scratch.path().join("tools")]);
         let mut command = isolated_command(&full);
         command.env("UM_HOME", self.home.path()).env("PATH", path);
         command

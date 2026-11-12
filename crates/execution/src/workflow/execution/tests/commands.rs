@@ -48,6 +48,152 @@ async fn command_environment_requires_declared_passthrough() {
     .await;
 }
 
+const OBSERVE_SCOPED_ENVIRONMENT: &str =
+    r#"'printf "%s %s" "${KEPT-unset}" "${DROPPED-unset}" > "$0.txt"'"#;
+
+// REQ-WFEXEC-71, INV-ENGINE-31
+#[tokio::test]
+async fn node_environment_passthrough_scopes_each_command_to_its_listed_names() {
+    with_watchdog(async {
+        let observe = |name: &str, program: &str, declaration: &str| {
+            format!(
+                "  {name}:\n    kind: cmd\n{declaration}    command:\n      argv: [{program}, -c, {OBSERVE_SCOPED_ENVIRONMENT}, {name}]\n"
+            )
+        };
+        let source = format!(
+            "schemaVersion: 1\nenvironmentPassthrough: [KEPT, DROPPED]\nsteps:\n{}{}{}finalizers:\n{}",
+            observe(
+                "kept",
+                "/bin/sh",
+                "    environmentPassthrough: [KEPT]\n"
+            ),
+            observe("inspect", "sh", "    environmentPassthrough: []\n"),
+            observe("legacy", "/bin/sh", ""),
+            observe(
+                "report",
+                "/bin/sh",
+                "    environmentPassthrough: [DROPPED]\n"
+            ),
+        );
+        let fixture = execution_fixture(
+            &source,
+            ResolvedInputs::default(),
+            EnvironmentSnapshot::new([
+                ("PATH", "/bin:/usr/bin"),
+                ("KEPT", "kept"),
+                ("DROPPED", "dropped"),
+            ]),
+            CancellationSource::new(),
+            1,
+            1024,
+        );
+        let result = execute_workflow(
+            fixture.admitted,
+            &fixture.artifacts,
+            &fixture.inputs,
+            &StepDiagnosticLog::default(),
+            AgentExecution::disabled(),
+            TestClock,
+            NoopExecutionObserver,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.outcome, RunOutcome::Succeeded);
+        for (node, expected) in [
+            ("kept", "kept unset"),
+            ("inspect", "unset unset"),
+            ("legacy", "kept dropped"),
+            ("report", "unset dropped"),
+        ] {
+            assert_eq!(
+                fs::read_to_string(fixture.execution_root.join(format!("{node}.txt"))).unwrap(),
+                expected,
+                "{node}"
+            );
+        }
+    })
+    .await;
+}
+
+// REQ-WFRECOVERY-64, REQ-WFRECOVERY-7, REQ-WFEXEC-71
+#[tokio::test]
+async fn command_handler_receives_its_own_or_its_steps_environment_selection() {
+    with_watchdog(async {
+        for (handler_declaration, expected) in [
+            ("", "kept unset"),
+            ("        environmentPassthrough: [DROPPED]\n", "unset dropped"),
+        ] {
+            let source = format!(
+                r#"schemaVersion: 1
+environmentPassthrough: [KEPT, DROPPED]
+steps:
+  repair:
+    kind: cmd
+    environmentPassthrough: [KEPT]
+    recovery:
+      retries: 1
+      handler:
+        kind: cmd
+{handler_declaration}        command:
+          argv:
+            - /bin/sh
+            - -c
+            - |
+              test -n "$UM_RECOVERY_CONTEXT" || exit 92
+              printf '%s %s' "${{KEPT-unset}}" "${{DROPPED-unset}}" > handler.txt
+              printf repaired > repaired.marker
+              printf '%s' '{{"schemaVersion":1,"decision":"recheck","summary":"repaired","reason":"recheck"}}' > "$UM_RECOVERY_RESULT"
+    command:
+      argv:
+        - /bin/sh
+        - -c
+        - |
+          printf '%s %s\n' "${{KEPT-unset}}" "${{DROPPED-unset}}" >> step.txt
+          test -f repaired.marker
+"#
+            );
+            let fixture = execution_fixture(
+                &source,
+                ResolvedInputs::default(),
+                EnvironmentSnapshot::new([
+                    ("PATH", "/bin:/usr/bin"),
+                    ("KEPT", "kept"),
+                    ("DROPPED", "dropped"),
+                ]),
+                CancellationSource::new(),
+                1,
+                1024,
+            );
+            let result = execute_workflow(
+                fixture.admitted,
+                &fixture.artifacts,
+                &fixture.inputs,
+                &StepDiagnosticLog::default(),
+                AgentExecution::disabled(),
+                TestClock,
+                NoopExecutionObserver,
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(result.outcome, RunOutcome::Succeeded, "{handler_declaration}");
+            assert_eq!(
+                fs::read_to_string(fixture.execution_root.join("handler.txt")).unwrap(),
+                expected,
+                "{handler_declaration}"
+            );
+            // The first execution and the rerun both keep the step's own selection.
+            assert_eq!(
+                fs::read_to_string(fixture.execution_root.join("step.txt")).unwrap(),
+                "kept unset\nkept unset\n",
+                "{handler_declaration}"
+            );
+        }
+    })
+    .await;
+}
+
 /// A command target that fails once, then passes after a command handler repairs the
 /// workspace and decides to recheck.
 const SOURCE_NEUTRAL_COMMAND_RECOVERY: &str = r#"schemaVersion: 1

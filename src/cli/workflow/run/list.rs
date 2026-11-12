@@ -1,5 +1,5 @@
-//! `um workflow run list` (REQ-LOCALRUN-188): every run under the `um` home, read without
-//! taking a run lock or changing a directory.
+//! `um workflow run list` (REQ-LOCALRUN-188, REQ-LOCALRUN-203): the live runs under the `um`
+//! home, or every run under `--all`, read without taking a run lock or changing a directory.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, Write};
@@ -21,6 +21,13 @@ const COMMAND: &str = "um workflow run list";
 
 #[derive(Debug, Args)]
 pub(super) struct Command {
+    #[arg(
+        long,
+        conflicts_with_all = ["waiting", "drift"],
+        help = "List every run, the exited ones included"
+    )]
+    all: bool,
+
     #[arg(long, help = "List only runs that wait")]
     waiting: bool,
 
@@ -89,6 +96,18 @@ impl Command {
                     .is_none_or(|id| run.record.definition.as_ref() == Some(id))
             })
             .collect::<Vec<_>>();
+        let selected = runs.len();
+        let runs = runs
+            .into_iter()
+            .filter(|run| self.all || run.record.state != RunState::Exited)
+            .collect::<Vec<_>>();
+        // `--waiting` and `--drift` select among the live runs, so they hide none
+        // (REQ-LOCALRUN-203).
+        let hidden = if self.all || self.waiting || self.drift {
+            0
+        } else {
+            selected - runs.len()
+        };
         let runs = if self.drift {
             let currents = current_revisions(&home, &runs)
                 .with_context(|| format!("write {COMMAND} output"))?;
@@ -105,13 +124,14 @@ impl Command {
             super::super::super::write_pretty_json(&ListDocument {
                 schema_version: 1,
                 command: COMMAND,
+                exited_hidden: hidden,
                 runs: runs
                     .iter()
                     .map(|(run, current)| listed(run, *current))
                     .collect(),
             })
         } else {
-            write_plain(&runs)
+            write_plain(&runs, self.all, hidden)
         }
         .with_context(|| format!("write {COMMAND} output"))?;
         Ok(ExitCode::Success)
@@ -195,11 +215,16 @@ pub(super) fn or_dash(value: Option<&str>) -> String {
     )
 }
 
-fn write_plain(runs: &[(&ListedRun, Option<u64>)]) -> io::Result<()> {
+/// The listing's lines, then, when `hidden` exited runs were left out, an empty line and
+/// their count (REQ-LOCALRUN-203).
+fn write_plain(runs: &[(&ListedRun, Option<u64>)], all: bool, hidden: usize) -> io::Result<()> {
     let mut stdout = io::stdout().lock();
     if runs.is_empty() {
-        writeln!(stdout, "No workflow runs.")?;
-        return stdout.flush();
+        if all {
+            writeln!(stdout, "No workflow runs.")?;
+        } else {
+            writeln!(stdout, "No live workflow runs.")?;
+        }
     }
     for (run, current) in runs {
         let record = &run.record;
@@ -237,6 +262,13 @@ fn write_plain(runs: &[(&ListedRun, Option<u64>)]) -> io::Result<()> {
             None => writeln!(stdout)?,
         }
     }
+    if hidden > 0 {
+        let runs = if hidden == 1 { "run" } else { "runs" };
+        writeln!(
+            stdout,
+            "\n{hidden} exited {runs} hidden. Pass --all to list every run."
+        )?;
+    }
     stdout.flush()
 }
 
@@ -273,6 +305,8 @@ fn listed(run: &ListedRun, current: Option<u64>) -> Listed<'_> {
 struct ListDocument<'a> {
     schema_version: u8,
     command: &'static str,
+    /// The exited runs the default left out (REQ-LOCALRUN-203).
+    exited_hidden: usize,
     runs: Vec<Listed<'a>>,
 }
 

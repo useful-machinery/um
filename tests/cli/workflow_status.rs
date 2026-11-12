@@ -442,6 +442,40 @@ fn closed_status_schema_accepts_positive_and_rejects_negative_fixtures() {
     }
 }
 
+// REQ-LOCALRUN-149, REQ-LOCALRUN-150
+#[test]
+fn status_json_records_committed_pending_result_with_skipped_nodes() {
+    let bundle = RunBundle::new(include_str!(
+        "../fixtures/workflow-run/conditional-skip.yaml"
+    ));
+    let run_directory = bundle.result("skipped-pending-result");
+    let output = run(&bundle.args(&run_directory));
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let mut state = read_state(&run_directory);
+    let published = state["attempts"][0]["result"].clone();
+    state["attempts"][0]["result"] =
+        serde_json::json!({"status": "not_published", "reason": "publication_pending"});
+    write_state(&run_directory, &state);
+
+    let (output, status) = status_json(&run_directory);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(output.stderr.is_empty());
+    assert!(status_schema().is_valid(&status));
+    assert_eq!(
+        read_state(&run_directory)["attempts"][0]["result"],
+        published
+    );
+}
+
 // REQ-LOCALRUN-150, REQ-LOCALRUN-165
 #[test]
 fn status_json_reports_invalid_committed_pending_result() {

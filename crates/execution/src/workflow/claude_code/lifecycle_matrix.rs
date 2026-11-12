@@ -54,6 +54,7 @@ use crate::workflow::agent::{
 };
 #[cfg(target_os = "linux")]
 use crate::workflow::process_group::process_group_is_quiescent;
+use crate::workflow::test_support::{MAX_WATCHDOG_SCALE, host_load, watchdog_scale};
 
 const CELL_FILTER: &str = "UM_CLAUDE_CODE_LIFECYCLE_CELLS";
 const SKIP_SLOW_CELLS: &str = "UM_CLAUDE_CODE_CONFORMANCE_SKIP_SLOW_CELLS";
@@ -64,6 +65,16 @@ const PROMOTION_TIMEOUT: (&str, &str) = ("CLAUDE_CODE_AUTO_BACKGROUND_TIMEOUT_MS
 const RESPONSE: &str = "lifecycle cell complete";
 const RESULT: i64 = 7;
 const WAITING: &str = "waiting for the work to report";
+/// The status a subagent's command released after a wait exits with in its failing form
+/// (`Release::FailedAfterAWait`).
+const FAILED_COMMAND_STATUS: u8 = 3;
+/// The deadline Claude Code stops a subagent's command at in its stopped form
+/// (`Release::StoppedAfterAWait`), on an idle host. It runs from the command's start and must
+/// outlast the main thread's first turn, the subagent's closing turn and the waiting turn, a
+/// few loopback rounds that took under a second in the drive (AUTO-315), so `stop_deadline`
+/// scales it with the host's load as a watchdog is scaled, and the driver fails the cell when
+/// the stop arrives before the wait is held.
+const STOP_DEADLINE: Duration = Duration::from_secs(6);
 /// How the adapter's feedback for a rejected result candidate begins.
 const RESULT_REJECTED: &str = "Result rejected:";
 /// The opening of the enforcement nag, the synthetic user text 2.1.310 sends in Result mode
@@ -78,6 +89,11 @@ const WAKEUP_DELAY_SECONDS: u64 = 60;
 /// The anti-hang watchdog of a slow cell, which waits out the 60 s wakeup floor or a
 /// subagent command's two-minute promotion besides its fast work.
 const SLOW_WATCHDOG: Duration = Duration::from_secs(180);
+/// The anti-hang watchdog of a cell whose subagent's command Claude Code stops at its
+/// deadline, which waits out the most `stop_deadline` scales `STOP_DEADLINE` to besides its
+/// fast work.
+const STOPPED_COMMAND_WATCHDOG: Duration =
+    WATCHDOG.saturating_add(STOP_DEADLINE.saturating_mul(MAX_WATCHDOG_SCALE));
 const INIT_PROBE_SESSION_ID: &str = "00000000-0000-4000-8000-000000000013";
 /// What 2.1.310's `init` lists among `tools`. It names the subagent tool by its legacy
 /// name, `Task`; the provider request's `tools[]` names it `Agent`.
@@ -122,8 +138,21 @@ pub(super) enum Release {
     /// subagent's own command runs, and the driver releases the command once that turn has
     /// ended, with stdin open; Claude Code resumes the subagent for the command's report and
     /// the report run's notification wakes the turn that settles (REQ-AGENT-80, AUTO-297).
-    /// For a backgrounded command alone, in Result mode alone.
+    /// For a backgrounded command or a monitor, whose released command reports its line and
+    /// its end in one notification, in Result mode alone; 2.1.321 resumed the subagent for a
+    /// monitor's end as for a command's (AUTO-315).
     AfterAWait,
+    /// As `AfterAWait`, for a backgrounded command alone, whose released command exits with
+    /// `FAILED_COMMAND_STATUS`, with no followup: 2.1.321 reports the task `failed` and resumes
+    /// the subagent for that report as for a completing command, so the wait ends the same way
+    /// (REQ-AGENT-80, AUTO-315).
+    FailedAfterAWait,
+    /// As `AfterAWait`, for a backgrounded command alone, which the driver never releases,
+    /// with no followup: the subagent's Bash call carries a `timeout`, and Claude Code stops
+    /// the command at that deadline once the wait is held. 2.1.321 reports the task `stopped`
+    /// (then `killed`) and resumes the subagent for that report as for a completing command,
+    /// so the wait ends the same way (REQ-AGENT-80, AUTO-315).
+    StoppedAfterAWait,
 }
 
 /// What the subagent's own turn does.
@@ -138,15 +167,15 @@ pub(super) enum SubagentWork {
     PromotedBash,
     /// A command run under 2.1.310's deferred `Monitor` tool, still running when the
     /// subagent closes its turn; it prints nothing before its release, so the monitor's
-    /// only notification is its end. Released in the drain or after the answer, never in
-    /// the exchange.
+    /// only notification is its end. Released in the drain, after the answer or after a wait,
+    /// never in the exchange.
     Monitor {
         released: Release,
     },
 }
 
 impl SubagentWork {
-    pub(super) const ALL: [Self; 8] = [
+    pub(super) const ALL: [Self; 11] = [
         Self::ForegroundBash,
         Self::BackgroundBash {
             released: Release::InExchange,
@@ -167,6 +196,15 @@ impl SubagentWork {
         Self::BackgroundBash {
             released: Release::AfterAWait,
         },
+        Self::Monitor {
+            released: Release::AfterAWait,
+        },
+        Self::BackgroundBash {
+            released: Release::FailedAfterAWait,
+        },
+        Self::BackgroundBash {
+            released: Release::StoppedAfterAWait,
+        },
     ];
 
     const fn slug(self) -> &'static str {
@@ -184,9 +222,20 @@ impl SubagentWork {
             Self::BackgroundBash {
                 released: Release::AfterAWait,
             } => "background-bash-after-a-wait",
+            Self::BackgroundBash {
+                released: Release::FailedAfterAWait,
+            } => "background-bash-failed-after-a-wait",
+            Self::BackgroundBash {
+                released: Release::StoppedAfterAWait,
+            } => "background-bash-stopped-after-a-wait",
             Self::PromotedBash => "promoted-bash",
+            // A monitor is never released in the exchange, failed or stopped after a wait.
             Self::Monitor {
-                released: Release::InDrain | Release::InExchange,
+                released:
+                    Release::InDrain
+                    | Release::InExchange
+                    | Release::FailedAfterAWait
+                    | Release::StoppedAfterAWait,
             } => "monitor",
             Self::Monitor {
                 released: Release::AfterTheAnswer,
@@ -210,15 +259,46 @@ impl SubagentWork {
         )
     }
 
-    /// Whether the subagent's own command is released after the main thread waited a turn for
-    /// it (REQ-AGENT-80, AUTO-297).
+    /// Whether the subagent's own command or monitor is released after the main thread waited
+    /// a turn for it (REQ-AGENT-80, AUTO-297, AUTO-315).
     const fn released_after_a_wait(self) -> bool {
         matches!(
             self,
             Self::BackgroundBash {
+                released: Release::AfterAWait
+                    | Release::FailedAfterAWait
+                    | Release::StoppedAfterAWait,
+            } | Self::Monitor {
                 released: Release::AfterAWait,
             }
         )
+    }
+
+    /// Whether the subagent's own command exits with `FAILED_COMMAND_STATUS` once released.
+    const fn fails(self) -> bool {
+        matches!(
+            self,
+            Self::BackgroundBash {
+                released: Release::FailedAfterAWait,
+            }
+        )
+    }
+
+    /// Whether Claude Code stops the subagent's own command at its Bash call's deadline
+    /// during the wait, the driver never releasing it.
+    const fn stopped_at_its_deadline(self) -> bool {
+        matches!(
+            self,
+            Self::BackgroundBash {
+                released: Release::StoppedAfterAWait,
+            }
+        )
+    }
+
+    /// Whether the subagent's own command ends otherwise than by completing: it fails or is
+    /// stopped.
+    const fn ends_without_completing(self) -> bool {
+        self.fails() || self.stopped_at_its_deadline()
     }
 }
 
@@ -730,9 +810,9 @@ impl LifecycleCell {
         }
     }
 
-    /// A backgrounded subagent's own command released after the main thread waited a turn for
-    /// it, with stdin open: its report reaches Claude Code before the value settles, so nothing
-    /// races an exit and the cell has one exact ending (REQ-AGENT-80).
+    /// A backgrounded subagent's own command or monitor released after the main thread waited
+    /// a turn for it, with stdin open: its report reaches Claude Code before the value settles,
+    /// so nothing races an exit and the cell has one exact ending (REQ-AGENT-80).
     const fn released_after_a_wait(&self) -> bool {
         match self.work {
             Work::BackgroundAgent { subagent } => subagent.released_after_a_wait(),
@@ -857,13 +937,19 @@ pub(super) const PRUNE_RULES: [PruneRule; 12] = [
         name: "release-after-a-wait-companions",
         reason: "a wait without the value exists in Result mode alone, where a turn can end \
                  without it; the waiting turn is the notified turn or, after a resume, the \
-                 messaged run's, and the cell settles on the report run's turn",
+                 messaged run's, and the cell settles on the report run's turn; a resume adds \
+                 nothing about how the command ended, so only a completing command has one",
         forbids: |cell| {
             cell.released_after_a_wait()
                 && (cell.mode != Mode::Result
                     || cell.ending != Ending::Settle
                     || cell.round != Round::AnotherRound
-                    || !matches!(cell.followup, Followup::None | Followup::Resume))
+                    || !matches!(cell.followup, Followup::None | Followup::Resume)
+                    || (cell.followup == Followup::Resume
+                        && cell
+                            .work
+                            .subagent()
+                            .is_some_and(SubagentWork::ends_without_completing)))
         },
     },
 ];
@@ -953,6 +1039,11 @@ impl Drop for CancelOnDrop {
 struct BlockedCommand {
     signal: FixtureSignal,
     blocker: PathBuf,
+    /// Whether the command exits with `FAILED_COMMAND_STATUS` once released.
+    fails: bool,
+    /// The deadline a backgrounded call gives the command, its Bash `timeout`, at which Claude
+    /// Code stops it (`Release::StoppedAfterAWait`).
+    deadline: Option<Duration>,
 }
 
 impl BlockedCommand {
@@ -960,24 +1051,50 @@ impl BlockedCommand {
         let signal = FixtureSignal::create(root.private().join(format!("{name}.signal")));
         let blocker = root.private().join(format!("{name}.blocker"));
         mkfifo(&blocker, FifoMode::S_IRUSR | FifoMode::S_IWUSR).unwrap();
-        Self { signal, blocker }
+        Self {
+            signal,
+            blocker,
+            fails: false,
+            deadline: None,
+        }
+    }
+
+    /// A backgrounded call gives the command `deadline` as its Bash `timeout`, so that Claude
+    /// Code stops it then.
+    const fn stopped_at(mut self, deadline: Duration) -> Self {
+        self.deadline = Some(deadline);
+        self
+    }
+
+    /// The command exits with `FAILED_COMMAND_STATUS` once released, after `finished`.
+    const fn failing(mut self) -> Self {
+        self.fails = true;
+        self
     }
 
     /// The shell command; `printf` and `read` are builtins, so it needs no coreutils. The
     /// blocker is opened for reading and writing, which does not wait for a writer, before
     /// `ready` is reported, so a `release` after `started` always finds the command's reader.
     fn script(&self) -> String {
-        format!(
+        let script = format!(
             "{{ printf 'ready %s\\n' \"$$\" > '{signal}'; IFS= read -r done; }} <> '{blocker}'; printf 'finished\\n' > '{signal}'; printf 'command finished\\n'",
             signal = self.signal.path().display(),
             blocker = self.blocker.display(),
-        )
+        );
+        if self.fails {
+            format!("{script}; exit {FAILED_COMMAND_STATUS}")
+        } else {
+            script
+        }
     }
 
     fn bash(&self, description: &str, run_in_background: bool) -> Value {
         let mut input = json!({"command": self.script(), "description": description});
         if run_in_background {
             input["run_in_background"] = json!(true);
+            if let Some(deadline) = self.deadline {
+                input["timeout"] = json!(deadline.as_millis());
+            }
         }
         input
     }
@@ -1012,6 +1129,16 @@ impl BlockedCommand {
     /// Releases the command, and reports whether it was still waiting: the blocker is
     /// opened without blocking, and only a command the harness stopped has no reader on it.
     async fn release(&self) -> bool {
+        self.open_the_blocker(true).await
+    }
+
+    /// Whether the command is still waiting, without releasing it: the command holds the
+    /// blocker open for writing too, so a writer that closes without writing ends no read.
+    async fn still_waiting(&self) -> bool {
+        self.open_the_blocker(false).await
+    }
+
+    async fn open_the_blocker(&self, release: bool) -> bool {
         let blocker = self.blocker.clone();
         tokio::task::spawn_blocking(move || {
             match std::fs::OpenOptions::new()
@@ -1020,11 +1147,13 @@ impl BlockedCommand {
                 .open(blocker)
             {
                 Ok(mut writer) => {
-                    writer.write_all(b"done\n").unwrap();
+                    if release {
+                        writer.write_all(b"done\n").unwrap();
+                    }
                     true
                 }
                 Err(error) if error.raw_os_error() == Some(libc::ENXIO) => false,
-                Err(error) => panic!("failed to release the blocked command: {error}"),
+                Err(error) => panic!("failed to open the blocked command's blocker: {error}"),
             }
         })
         .await
@@ -1804,6 +1933,11 @@ impl Session {
     /// Code's wind-down is: 2.1.321 then exits and stops the command, the incident's ending. A
     /// prompt release would instead let the binary resume the subagent before it exits, which
     /// hides the missing result (AUTO-297).
+    ///
+    /// A command with a deadline (`Release::StoppedAfterAWait`) is never released: once the
+    /// waiting turn has ended with the wait held (REQ-AGENT-81's information diagnostic) and
+    /// the command still waiting, Claude Code's stop at that deadline is what has it resume the
+    /// subagent. A stop that arrived before the wait was held fails the cell.
     async fn wait_for_the_subagents_command(
         &mut self,
         request: ControlledProviderRequest,
@@ -1812,12 +1946,26 @@ impl Session {
         let turns = self.completed_turns();
         let nags = self.nags_refused;
         let warnings = diagnostics(&self.observations, AgentDiagnosticLevel::Warning).len();
+        let waits = held_waits(&self.observations);
         request.release_text(WAITING);
         self.wait_out_turn(turns + 1).await;
         self.nags_refused_while_waiting = self.nags_refused - nags;
+        if command.deadline.is_some() && !command.still_waiting().await {
+            panic!(
+                "Claude Code stopped the subagent's command at its deadline before the wait was \
+                 held; the deadline is too short for this host"
+            );
+        }
         if diagnostics(&self.observations, AgentDiagnosticLevel::Warning).len() > warnings {
             self.notes
                 .push("the waiting turn was decided as a missing result".into());
+            return self.next_turn_or_end().await;
+        }
+        if command.deadline.is_some() {
+            assert!(
+                held_waits(&self.observations) > waits,
+                "the waiting turn ended without the held wait's diagnostic"
+            );
             return self.next_turn_or_end().await;
         }
         assert!(
@@ -1886,6 +2034,15 @@ impl Session {
             }
         }
     }
+}
+
+/// How many times the parser has held a wait for a subagent's own background tasks: its
+/// information diagnostic at the waiting turn (REQ-AGENT-81).
+fn held_waits(observations: &RecordingObservationSink) -> usize {
+    diagnostics(observations, AgentDiagnosticLevel::Information)
+        .iter()
+        .filter(|message| message.starts_with("waiting for a subagent's background tasks"))
+        .count()
 }
 
 fn diagnostics(
@@ -2119,8 +2276,9 @@ async fn drive(
             if let Some(turn) = request.take() {
                 request = session.wait_for_the_subagents_command(turn, &command).await;
             }
-            // Finished by now, or left blocked when the waiting turn was decided as a missing
-            // result, so that the failed invocation's teardown is checked as any other.
+            // Finished by now, stopped at its deadline by Claude Code, or left blocked when the
+            // waiting turn was decided as a missing result, so that the failed invocation's
+            // teardown is checked as any other: a stopped command must have no reader left.
             blocked.push(command);
         }
         match request {
@@ -2440,10 +2598,19 @@ async fn drive_foreground_agent(
             Handoff::turn(session.next_main_request().await)
         }
         SubagentWork::BackgroundBash {
-            released: Release::AfterTheAnswer | Release::AfterAWait,
+            released:
+                Release::AfterTheAnswer
+                | Release::AfterAWait
+                | Release::FailedAfterAWait
+                | Release::StoppedAfterAWait,
         }
         | SubagentWork::Monitor {
-            released: Release::InExchange | Release::AfterTheAnswer | Release::AfterAWait,
+            released:
+                Release::InExchange
+                | Release::AfterTheAnswer
+                | Release::AfterAWait
+                | Release::FailedAfterAWait
+                | Release::StoppedAfterAWait,
         } => panic!("the generator keeps {subagent:?} from a foreground subagent"),
         SubagentWork::BackgroundBash {
             released: Release::InDrain,
@@ -2515,6 +2682,13 @@ async fn drive_background_agent(
         followup, ending, ..
     } = cell;
     let command = BlockedCommand::new(root, "subagent-command");
+    let command = if subagent.fails() {
+        command.failing()
+    } else if subagent.stopped_at_its_deadline() {
+        command.stopped_at(stop_deadline())
+    } else {
+        command
+    };
     let thread = match subagent {
         // `09`'s shape: the subagent's foreground command blocks while the main thread ends
         // its turn, and its notification begins the next.
@@ -2629,6 +2803,10 @@ async fn drive_background_agent(
         }
         (
             SubagentWork::BackgroundBash {
+                released:
+                    Release::AfterAWait | Release::FailedAfterAWait | Release::StoppedAfterAWait,
+            }
+            | SubagentWork::Monitor {
                 released: Release::AfterAWait,
             },
             Ending::Settle,
@@ -2638,16 +2816,21 @@ async fn drive_background_agent(
         }
         (
             SubagentWork::BackgroundBash {
-                released: Release::AfterTheAnswer | Release::AfterAWait,
+                released:
+                    Release::AfterTheAnswer
+                    | Release::AfterAWait
+                    | Release::FailedAfterAWait
+                    | Release::StoppedAfterAWait,
             }
             | SubagentWork::Monitor {
-                released: Release::InExchange | Release::AfterTheAnswer,
+                released: Release::AfterTheAnswer | Release::AfterAWait,
             },
             Ending::CancelInExchange,
         )
         | (
             SubagentWork::Monitor {
-                released: Release::InExchange | Release::AfterAWait,
+                released:
+                    Release::InExchange | Release::FailedAfterAWait | Release::StoppedAfterAWait,
             },
             Ending::Settle | Ending::CancelInExchange,
         ) => panic!("the generator keeps {subagent:?} from {ending:?}"),
@@ -2658,6 +2841,12 @@ async fn drive_background_agent(
             Handoff::turn(session.next_main_request().await)
         }
     }
+}
+
+/// `STOP_DEADLINE` scaled with the host's load, as `host_scaled_watchdog` scales a watchdog, so
+/// that a loaded host's slower rounds still hold the wait before Claude Code's stop.
+fn stop_deadline() -> Duration {
+    STOP_DEADLINE * watchdog_scale(host_load().as_ref())
 }
 
 /// Launches the backgrounded subagent with `thread` as its script and returns the main
@@ -3222,6 +3411,12 @@ async fn run_cell(executable: PathBuf, cell: LifecycleCell) -> (String, bool) {
     let observations = RecordingObservationSink::default();
     let watchdog = if cell.is_slow() {
         SLOW_WATCHDOG
+    } else if cell
+        .work
+        .subagent()
+        .is_some_and(SubagentWork::stopped_at_its_deadline)
+    {
+        STOPPED_COMMAND_WATCHDOG
     } else {
         WATCHDOG
     };
@@ -3231,6 +3426,7 @@ async fn run_cell(executable: PathBuf, cell: LifecycleCell) -> (String, bool) {
     ))
     .catch_unwind()
     .await;
+
     let mut notes = Vec::new();
     let mut outcome = None;
     let verdict = match driven {
@@ -3400,6 +3596,27 @@ fn wind_down_endings_are_accepted_where_the_leftover_report_races_the_exit() {
     for ending in [no_resume, abandoned, resumed_again] {
         assert!(!accepts(waited, ending), "{waited} {ending:?}");
     }
+    // A subagent's monitor released after a wait reports its line and its end in one
+    // notification, so its cell has the command's one exact ending (REQ-AGENT-80, AUTO-315).
+    let monitored = "result/background-agent[monitor-after-a-wait]/none/settle";
+    assert!(accepts(monitored, resumed));
+    for ending in [unfinished, no_resume, abandoned, resumed_again] {
+        assert!(!accepts(monitored, ending), "{monitored} {ending:?}");
+    }
+    // A command that exits non-zero after its release ends the wait as a completing one does
+    // (REQ-AGENT-80, AUTO-315).
+    let failed = "result/background-agent[background-bash-failed-after-a-wait]/none/settle";
+    assert!(accepts(failed, resumed));
+    for ending in [unfinished, no_resume, abandoned, resumed_again] {
+        assert!(!accepts(failed, ending), "{failed} {ending:?}");
+    }
+    // A command Claude Code stops at its own deadline during the wait ends it as a completing
+    // one does (REQ-AGENT-80, AUTO-315).
+    let stopped = "result/background-agent[background-bash-stopped-after-a-wait]/none/settle";
+    assert!(accepts(stopped, resumed));
+    for ending in [unfinished, no_resume, abandoned, resumed_again] {
+        assert!(!accepts(stopped, ending), "{stopped} {ending:?}");
+    }
     let waited_after_a_message =
         "result/background-agent[background-bash-after-a-wait]/resume/settle";
     assert!(accepts(waited_after_a_message, &reported));
@@ -3533,10 +3750,10 @@ fn lifecycle_matrix_enumerates_every_dimension_value_once() {
             .count(),
         6
     );
-    // A backgrounded subagent's command released after the main thread waited a turn for it
-    // exists in Result mode alone, where a turn can end without the value (REQ-AGENT-80): it
-    // is driven to `settle` with no followup or with a resume, on a later round, never under a
-    // foreground subagent.
+    // A backgrounded subagent's command or monitor released after the main thread waited a
+    // turn for it exists in Result mode alone, where a turn can end without the value
+    // (REQ-AGENT-80): it is driven to `settle` with no followup or, for a command that
+    // completes, with a resume, on a later round, never under a foreground subagent.
     assert!(
         PRUNE_RULES
             .iter()
@@ -3552,8 +3769,18 @@ fn lifecycle_matrix_enumerates_every_dimension_value_once() {
         [
             "result/background-agent[background-bash-after-a-wait]/none/settle",
             "result/background-agent[background-bash-after-a-wait]/resume/settle",
+            "result/background-agent[monitor-after-a-wait]/none/settle",
+            "result/background-agent[background-bash-failed-after-a-wait]/none/settle",
+            "result/background-agent[background-bash-stopped-after-a-wait]/none/settle",
         ]
     );
+    // A command that fails or is stopped during the wait is driven with no followup alone: a
+    // resume adds nothing about how the command ended (AUTO-315).
+    assert!(!cells.iter().any(|cell| {
+        let name = cell.name();
+        (name.contains("-failed-after-a-wait") || name.contains("-stopped-after-a-wait"))
+            && cell.followup != Followup::None
+    }));
     // A main-thread monitor is background work (REQ-AGENT-35) whose outstanding task
     // announces its event turns (REQ-AGENT-69): it is stopped from its event turn in both
     // rounds and cancelled in the exchange and in the drain it pauses, while a wakeup over it

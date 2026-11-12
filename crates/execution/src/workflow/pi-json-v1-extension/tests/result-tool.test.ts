@@ -51,7 +51,10 @@ interface RegisteredResultTool {
     argumentsValue: { result: unknown },
     signal: AbortSignal | undefined,
     onUpdate: undefined,
-    context: { abort(): void },
+    context: {
+      abort(): void;
+      sessionManager: { getBranch(): readonly unknown[] };
+    },
   ): Promise<{ terminate?: boolean }>;
 }
 
@@ -103,8 +106,29 @@ function toolCallContext(content: readonly Record<string, unknown>[]): {
   return branchContext([{ role: "assistant", content }]);
 }
 
-function resultToolContext(abort: () => void): ResultToolContext {
-  return { abort } as ResultToolContext;
+function resultToolCallContext(
+  toolCallId: string,
+  argumentsValue: unknown,
+): { sessionManager: { getBranch(): readonly unknown[] } } {
+  return toolCallContext([
+    {
+      type: "toolCall",
+      id: toolCallId,
+      name: fixedConfig.toolName,
+      arguments: argumentsValue,
+    },
+  ]);
+}
+
+function resultToolContext(
+  toolCallId: string,
+  argumentsValue: unknown,
+  abort: () => void,
+): ResultToolContext {
+  return {
+    abort,
+    ...resultToolCallContext(toolCallId, argumentsValue),
+  } as unknown as ResultToolContext;
 }
 
 test("a valid fixed payload produces a terminating tool result", async () => {
@@ -124,7 +148,9 @@ test("a valid fixed payload produces a terminating tool result", async () => {
     { result: fixedPayload },
     undefined,
     undefined,
-    resultToolContext(() => assert.fail("valid results must not abort Pi")),
+    resultToolContext("tool-call-fixed", { result: fixedPayload }, () =>
+      assert.fail("valid results must not abort Pi"),
+    ),
   );
 
   assert.deepEqual(capturedRequest, {
@@ -148,7 +174,7 @@ test("validator feedback is returned as a tool error", async () => {
       { result: fixedPayload },
       undefined,
       undefined,
-      resultToolContext(() =>
+      resultToolContext("tool-call-fixed", { result: fixedPayload }, () =>
         assert.fail("rejected results must not abort Pi"),
       ),
     ),
@@ -156,8 +182,12 @@ test("validator feedback is returned as a tool error", async () => {
   );
 });
 
-test("validation forwards Pi's registered-tool arguments unchanged", async () => {
-  const assistantArguments = { result: fixedPayload };
+// REQ-AGENT-83, REQ-AGENT-29, INV-HARNESS-16 (AUTO-263)
+test("validation submits the arguments the session records, not the ones Pi executes the tool with", async () => {
+  const sessionArguments = {
+    result: { summary: "fixed payload", note: null, count: "3" },
+  };
+  const executedArguments = { result: { summary: "fixed payload", count: 3 } };
   let capturedRequest: ValidatePiResultV1Request | undefined;
   const { gate, tool } = loadResultExtension(
     fixedConfig,
@@ -166,31 +196,54 @@ test("validation forwards Pi's registered-tool arguments unchanged", async () =>
       return { kind: "Valid" };
     },
   );
-  const toolCallId = "tool-call-unchanged-fixed";
+  const toolCallId = "tool-call-recorded-fixed";
+  const session = resultToolCallContext(toolCallId, sessionArguments);
 
   assert.equal(
     gate(
       {
         toolCallId,
         toolName: fixedConfig.toolName,
-        input: assistantArguments,
+        input: executedArguments,
       },
-      toolCallContext([
-        {
-          type: "toolCall",
-          id: toolCallId,
-          name: fixedConfig.toolName,
-          arguments: assistantArguments,
-        },
-      ]),
+      session,
     ),
     undefined,
   );
-  await tool.execute(toolCallId, assistantArguments, undefined, undefined, {
-    abort() {},
+  await tool.execute(toolCallId, executedArguments, undefined, undefined, {
+    abort: () => assert.fail("accepted results must not abort Pi"),
+    ...session,
   });
 
-  assert.deepEqual(capturedRequest?.arguments, assistantArguments);
+  assert.deepEqual(capturedRequest?.arguments, sessionArguments);
+});
+
+// INV-HARNESS-16 (AUTO-263)
+test("a result call the session does not record alone is refused before validation", async () => {
+  let validations = 0;
+  const { tool } = loadResultExtension(fixedConfig, async () => {
+    validations += 1;
+    return { kind: "Valid" };
+  });
+
+  await assert.rejects(
+    tool.execute(
+      "tool-call-unrecorded-fixed",
+      { result: fixedPayload },
+      undefined,
+      undefined,
+      {
+        abort: () => assert.fail("an uncorrelated call must not abort Pi"),
+        ...resultToolCallContext("tool-call-other-fixed", {
+          result: fixedPayload,
+        }),
+      },
+    ),
+    new Error(
+      "No result was accepted. The workflow result call could not be correlated.",
+    ),
+  );
+  assert.equal(validations, 0);
 });
 
 test("compaction remains available until one result is accepted", async () => {
@@ -208,7 +261,11 @@ test("compaction remains available until one result is accepted", async () => {
       { result: fixedPayload },
       undefined,
       undefined,
-      resultToolContext(() => assert.fail("rejection must not abort Pi")),
+      resultToolContext(
+        "tool-call-rejected-fixed",
+        { result: fixedPayload },
+        () => assert.fail("rejection must not abort Pi"),
+      ),
     ),
   );
   assert.equal(compact(), undefined);
@@ -219,7 +276,11 @@ test("compaction remains available until one result is accepted", async () => {
     { result: fixedPayload },
     undefined,
     undefined,
-    resultToolContext(() => assert.fail("acceptance must not abort Pi")),
+    resultToolContext(
+      "tool-call-accepted-fixed",
+      { result: fixedPayload },
+      () => assert.fail("acceptance must not abort Pi"),
+    ),
   );
   assert.deepEqual(compact(), { cancel: true });
 });
@@ -280,14 +341,7 @@ test("a sibling result is blocked without affecting ordinary work or correction"
         toolName: fixedConfig.toolName,
         input: correctedArguments,
       },
-      toolCallContext([
-        {
-          type: "toolCall",
-          id: correctedCallId,
-          name: fixedConfig.toolName,
-          arguments: correctedArguments,
-        },
-      ]),
+      resultToolCallContext(correctedCallId, correctedArguments),
     ),
     undefined,
   );
@@ -298,7 +352,9 @@ test("a sibling result is blocked without affecting ordinary work or correction"
         correctedArguments,
         undefined,
         undefined,
-        { abort() {} },
+        resultToolContext(correctedCallId, correctedArguments, () =>
+          assert.fail("acceptance must not abort Pi"),
+        ),
       )
     ).terminate,
     true,
@@ -311,14 +367,9 @@ test("reused call identities and ambiguous argument objects are blocked", () => 
     kind: "Valid",
   }));
   const toolCallId = "tool-call-reused-fixed";
-  const validContext = toolCallContext([
-    {
-      type: "toolCall",
-      id: toolCallId,
-      name: fixedConfig.toolName,
-      arguments: { result: fixedPayload },
-    },
-  ]);
+  const validContext = resultToolCallContext(toolCallId, {
+    result: fixedPayload,
+  });
 
   assert.equal(
     gate(
@@ -347,14 +398,10 @@ test("reused call identities and ambiguous argument objects are blocked", () => 
       toolName: fixedConfig.toolName,
       input: { result: fixedPayload },
     },
-    toolCallContext([
-      {
-        type: "toolCall",
-        id: "tool-call-extra-fixed",
-        name: fixedConfig.toolName,
-        arguments: { result: fixedPayload, extra: true },
-      },
-    ]),
+    resultToolCallContext("tool-call-extra-fixed", {
+      result: fixedPayload,
+      extra: true,
+    }),
   );
   assert.equal((ambiguous as { block?: unknown }).block, true);
 
@@ -408,9 +455,13 @@ test("a validator transport failure aborts Pi instead of becoming recoverable", 
       { result: fixedPayload },
       undefined,
       undefined,
-      resultToolContext(() => {
-        aborted = true;
-      }),
+      resultToolContext(
+        "tool-call-transport-failure-fixed",
+        { result: fixedPayload },
+        () => {
+          aborted = true;
+        },
+      ),
     ),
   );
 
@@ -437,23 +488,20 @@ test("a fatal validator response aborts Pi before surfacing the failure", async 
         toolName: fixedConfig.toolName,
         input: argumentsValue,
       },
-      toolCallContext([
-        {
-          type: "toolCall",
-          id: toolCallId,
-          name: fixedConfig.toolName,
-          arguments: argumentsValue,
-        },
-      ]),
+      resultToolCallContext(toolCallId, argumentsValue),
     ),
     undefined,
   );
   await assert.rejects(
-    tool.execute(toolCallId, argumentsValue, undefined, undefined, {
-      abort() {
+    tool.execute(
+      toolCallId,
+      argumentsValue,
+      undefined,
+      undefined,
+      resultToolContext(toolCallId, argumentsValue, () => {
         aborted = true;
-      },
-    }),
+      }),
+    ),
   );
 
   assert.equal(aborted, true);

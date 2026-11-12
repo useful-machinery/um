@@ -183,11 +183,13 @@ pub(crate) enum RecoveryHandler {
     Command {
         argv: Vec<String>,
         cwd: Option<String>,
+        environment_passthrough: Option<BTreeSet<String>>,
     },
     Agent {
         profile: String,
         prompt: String,
         cwd: Option<String>,
+        environment_passthrough: Option<BTreeSet<String>>,
     },
 }
 
@@ -356,6 +358,9 @@ pub(crate) struct CommonNode {
     pub(crate) failure_policy: FailurePolicy,
     pub(crate) condition: Option<ConditionPredicate>,
     pub(crate) cwd: Option<String>,
+    /// The node's own `environmentPassthrough` (REQ-WFFORMAT-102): `None` when absent, so
+    /// the node receives every name the root declares, distinct from an empty list.
+    pub(crate) environment_passthrough: Option<BTreeSet<String>>,
     pub(crate) outputs: BTreeMap<String, Output>,
 }
 

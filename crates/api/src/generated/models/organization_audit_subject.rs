@@ -56,6 +56,10 @@ pub enum Kind {
     RunnerCredential,
     #[serde(rename = "github_installation")]
     GithubInstallation,
+    #[serde(rename = "gitlab_connection")]
+    GitlabConnection,
+    #[serde(rename = "gitlab_candidate")]
+    GitlabCandidate,
     #[serde(rename = "linear_authorization_session")]
     LinearAuthorizationSession,
     #[serde(rename = "linear_connection")]

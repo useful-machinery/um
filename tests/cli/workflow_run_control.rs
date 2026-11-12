@@ -780,7 +780,12 @@ impl PublishedWaitTree {
 
     /// `um workflow run create` of `definition` under this home with `args` as `OPERATOR`.
     pub(super) fn create_in(&self, definition: &str, args: &[&str]) -> Output {
-        isolated_command(&[
+        self.create_command(definition, args).output().unwrap()
+    }
+
+    /// The command `create_in` runs, to spawn.
+    pub(super) fn create_command(&self, definition: &str, args: &[&str]) -> std::process::Command {
+        let mut command = isolated_command(&[
             "workflow".to_owned(),
             "run".to_owned(),
             "create".to_owned(),
@@ -788,12 +793,12 @@ impl PublishedWaitTree {
             "--execution-root".to_owned(),
             self.bundle.execution_root().to_str().unwrap().to_owned(),
             "--json".to_owned(),
-        ])
-        .args(args)
-        .env("UM_HOME", self.home.path())
-        .env("USER", OPERATOR)
-        .output()
-        .unwrap()
+        ]);
+        command
+            .args(args)
+            .env("UM_HOME", self.home.path())
+            .env("USER", OPERATOR);
+        command
     }
 
     /// Publishes the tree again with `args`: a new revision of the definition, or with
@@ -1422,30 +1427,38 @@ fn a_restarted_successors_design_receives_the_predecessors_answers() {
     assert_eq!(control_count(&successor), 1);
 }
 
-// REQ-LOCALRUN-188, REQ-LOCALRUN-189, SC-LOCALRUN-13: after a restart, `list` names each
-// run's lineage after its outcome and `show` prints the predecessor and successor and marks
-// the attempts the successor imported.
+// REQ-LOCALRUN-188, REQ-LOCALRUN-189, REQ-LOCALRUN-203, SC-LOCALRUN-13: after a restart,
+// `list --all` names each run's lineage after its outcome, `list` the live successor alone,
+// and `show` prints the predecessor and successor and marks the attempts the successor
+// imported.
 #[test]
 fn list_and_show_print_a_restarted_runs_lineage() {
     let restarted = RestartedSubject::new();
     let home = &restarted.published.home;
     let (predecessor, successor) = (&restarted.predecessor, &restarted.successor);
     let (predecessor_id, successor_id) = (&restarted.predecessor_id, &restarted.successor_id);
-    let list = |json: bool| {
-        let mut args = vec!["workflow".to_owned(), "run".to_owned(), "list".to_owned()];
-        if json {
-            args.push("--json".to_owned());
-        }
-        let output = isolated_command(&args)
-            .env("UM_HOME", home.path())
-            .env("USER", OPERATOR)
-            .output()
-            .unwrap();
+    let list = |args: &[&str]| {
+        let output = isolated_command(
+            &["workflow", "run", "list"]
+                .iter()
+                .chain(args)
+                .map(|arg| (*arg).to_owned())
+                .collect::<Vec<_>>(),
+        )
+        .env("UM_HOME", home.path())
+        .env("USER", OPERATOR)
+        .output()
+        .unwrap();
         assert_eq!(output.status.code(), Some(0), "{output:?}");
         output
     };
 
-    let listed = json(&list(true));
+    let live = json(&list(&["--json"]));
+    let live = live["runs"].as_array().unwrap();
+    assert_eq!(live.len(), 1, "{live:?}");
+    assert_eq!(live[0]["id"], successor_id.as_str(), "{live:?}");
+
+    let listed = json(&list(&["--all", "--json"]));
     let runs = listed["runs"].as_array().unwrap();
     let entry = |id: &str| {
         runs.iter()
@@ -1458,7 +1471,7 @@ fn list_and_show_print_a_restarted_runs_lineage() {
     let new = entry(successor_id);
     assert_eq!(new["predecessor"], predecessor_id.as_str(), "{new}");
     assert_eq!(new["successor"], serde_json::Value::Null, "{new}");
-    let plain = String::from_utf8(list(false).stdout).unwrap();
+    let plain = String::from_utf8(list(&["--all"]).stdout).unwrap();
     let line = |id: &str| {
         plain
             .lines()

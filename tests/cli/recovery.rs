@@ -6,8 +6,9 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use rustix::process::{Pid, Signal, kill_process};
 
+use super::pi_installation::{COMPLETE_HELP, PiFixture};
 use super::poll_until;
-use super::workflow_run::{RunBundle, isolated_command, run};
+use super::workflow_run::{RunBundle, fixture_path_with_host_tools, isolated_command, run};
 
 fn json_run_args(bundle: &RunBundle, run_directory: &Path) -> Vec<String> {
     let mut args = bundle.args(run_directory);
@@ -779,6 +780,86 @@ fn archived_view_rejects_invocation_bytes_that_disagree_with_durable_evidence() 
     );
     let view: serde_json::Value = serde_json::from_slice(&view.stdout).unwrap();
     assert_eq!(view["error"]["code"], "published_result_invalid");
+}
+
+/// Runs a workflow whose only agent use is an agent recovery handler on its one command step
+/// `check`, with an admitted Pi fixture on `PATH` that answers only its probes.
+fn run_agent_recovery_only(name: &str, command: &str) -> (RunBundle, std::process::Output) {
+    let pi = PiFixture::new("0.84.2", COMPLETE_HELP, true);
+    let bundle = RunBundle::new(&format!(
+        r#"schemaVersion: 1
+agentProfiles:
+  repair:
+    harness:
+      kind: pi
+      config:
+        model: fixture/model
+        thinking: off
+steps:
+  check:
+    kind: cmd
+    recovery:
+      retries: 1
+      handler:
+        kind: agent
+        profile: repair
+        prompt: recovery.md
+    command:
+      argv: ["/bin/sh", "-c", {}]
+"#,
+        serde_json::to_string(command).unwrap(),
+    ));
+    fs::write(bundle.source_root().join("recovery.md"), "Repair the step.").unwrap();
+    let run_directory = bundle.result(name);
+    let output = isolated_command(&json_run_args(&bundle, &run_directory))
+        .env("PATH", fixture_path_with_host_tools(&[pi.path_directory()]))
+        .output()
+        .unwrap();
+    (bundle, output)
+}
+
+// REQ-WFRECOVERY-63
+// INV-ENGINE-30 (AUTO-262)
+#[test]
+fn agent_recovery_handler_without_agent_steps_runs_the_command_step() {
+    let (bundle, output) =
+        run_agent_recovery_only("agent-recovery-only", "printf ran > command-ran");
+
+    assert!(
+        output.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let terminal: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(terminal["outcome"], "succeeded");
+    assert_eq!(terminal["result"]["steps"][0]["state"], "succeeded");
+    assert_eq!(
+        fs::read(bundle.execution_root().join("command-ran")).unwrap(),
+        b"ran"
+    );
+}
+
+// REQ-WFRECOVERY-63
+// INV-ENGINE-30 (AUTO-262)
+#[test]
+fn agent_recovery_handler_without_agent_steps_is_invoked_when_the_step_fails() {
+    let (_bundle, output) = run_agent_recovery_only("agent-recovery-only-failed", "exit 75");
+
+    assert_eq!(output.status.code(), Some(1));
+    let terminal: serde_json::Value =
+        serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+            panic!(
+                "no terminal document ({error}); stderr={}",
+                String::from_utf8_lossy(&output.stderr)
+            )
+        });
+    let step = &terminal["result"]["steps"][0];
+    assert_eq!(step["state"], "failed");
+    assert_eq!(step["detail"]["code"], "command_exit");
+    assert_eq!(step["detail"]["exitCode"], 75);
+    assert_eq!(step["recovery"]["termination"]["kind"], "handler_failed");
+    assert_eq!(step["invocations"][1]["role"], "recovery_handler");
 }
 
 fn write_json(path: impl AsRef<Path>, value: &serde_json::Value) {

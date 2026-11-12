@@ -3466,3 +3466,69 @@ fn output_kinds_require_their_source_schema_and_media_type_fields() {
         assert_structurally_invalid(&output(incomplete));
     }
 }
+
+fn passthrough_workflow(root: &str, step: &str, handler: &str, finalizer: &str) -> String {
+    format!(
+        "schemaVersion: 1
+{root}steps:
+  check:
+    kind: cmd
+{step}    recovery:
+      retries: 1
+      handler:
+        kind: cmd
+{handler}        command:
+          argv: [\"true\"]
+    command:
+      argv: [\"true\"]
+finalizers:
+  report:
+    kind: cmd
+{finalizer}    command:
+      argv: [\"true\"]
+"
+    )
+}
+
+// REQ-WFFORMAT-102
+#[test]
+fn node_environment_passthrough_names_must_be_declared_at_the_root() {
+    let root = "environmentPassthrough: [VISIBLE]\n";
+    let node = "    environmentPassthrough: [VISIBLE]\n";
+    let handler = "        environmentPassthrough: [VISIBLE]\n";
+    let undeclared_node = "    environmentPassthrough: [VISIBLE, OTHER]\n";
+    let undeclared_handler = "        environmentPassthrough: [OTHER]\n";
+    validate_yaml(&passthrough_workflow(root, node, handler, node)).unwrap();
+
+    assert_failure(
+        &passthrough_workflow(root, undeclared_node, handler, node),
+        ValidationFailureKind::EnvironmentPassthroughUndeclared,
+        ValidationLocation::EnvironmentPassthrough {
+            step: "check".to_owned(),
+        },
+    );
+    assert_failure(
+        &passthrough_workflow(root, node, handler, undeclared_node),
+        ValidationFailureKind::EnvironmentPassthroughUndeclared,
+        ValidationLocation::FinalizerEnvironmentPassthrough {
+            finalizer: "report".to_owned(),
+        },
+    );
+    assert_failure(
+        &passthrough_workflow(root, node, undeclared_handler, node),
+        ValidationFailureKind::EnvironmentPassthroughUndeclared,
+        ValidationLocation::RecoveryEnvironmentPassthrough {
+            step: "check".to_owned(),
+        },
+    );
+
+    let empty = "    environmentPassthrough: []\n";
+    validate_yaml(&passthrough_workflow("", empty, "", "")).unwrap();
+    assert_failure(
+        &passthrough_workflow("", node, "", ""),
+        ValidationFailureKind::EnvironmentPassthroughUndeclared,
+        ValidationLocation::EnvironmentPassthrough {
+            step: "check".to_owned(),
+        },
+    );
+}

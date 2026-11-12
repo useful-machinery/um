@@ -1365,7 +1365,7 @@ async fn execute_attempt_phases(
         InputStaging::create_bound(admitted.execution(), staging.path(), staging.root_handle())?;
     attempt.inputs = Some(inputs.clone());
     hooks.checkpoint(AttemptCheckpoint::InputsStaged)?;
-    let agent_staging = if admitted.agent_steps().is_empty() {
+    let agent_staging = if !admitted.requires_agent_runtime() {
         None
     } else {
         Some(
@@ -1880,13 +1880,7 @@ fn required_agent_harnesses(
         .iter()
         .chain(&workflow.definition.finalizer_source_order)
         .filter_map(|step_name| {
-            let step = workflow.definition.steps.get(step_name).or_else(|| {
-                workflow
-                    .definition
-                    .finalizers
-                    .get(step_name)
-                    .map(|finalizer| &finalizer.body)
-            })?;
+            let step = workflow.definition.node(step_name)?;
             let ValidatedStep::Agent(step) = step else {
                 return None;
             };

@@ -344,6 +344,7 @@ fn recovery_resolution_pins_profiles_paths_prompt_bytes_and_explicit_absence() {
         prompt,
         cwd,
         harness,
+        ..
     }) = &recovery.handler
     else {
         panic!("fixture recovery must use an agent handler");
@@ -368,6 +369,7 @@ fn recovery_resolution_pins_profiles_paths_prompt_bytes_and_explicit_absence() {
         Some(ValidatedRecoveryHandler::Command {
             argv: vec!["./repair".to_owned(), "--generated".to_owned()],
             cwd: Some("repairs".to_owned()),
+            environment_passthrough: None,
         })
     );
     assert!(first.capacity.is_bound_to(&first.content_digest));

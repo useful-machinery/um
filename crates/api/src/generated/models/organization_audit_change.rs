@@ -15,7 +15,7 @@
 use crate::generated::models;
 use serde::{Deserialize, Serialize};
 
-/// OrganizationAuditChange : One typed string transition; omitted sides represent no prior or resulting value.
+/// OrganizationAuditChange : One typed string transition; omitted sides represent no prior or resulting value. A selected_repository_ids change carries each side as a JSON array of decimal GitLab project IDs.
 #[derive(Clone, Default, Debug, PartialEq, Serialize, Deserialize)]
 pub struct OrganizationAuditChange {
     #[serde(rename = "field")]
@@ -27,7 +27,7 @@ pub struct OrganizationAuditChange {
 }
 
 impl OrganizationAuditChange {
-    /// One typed string transition; omitted sides represent no prior or resulting value.
+    /// One typed string transition; omitted sides represent no prior or resulting value. A selected_repository_ids change carries each side as a JSON array of decimal GitLab project IDs.
     pub fn new(field: Field) -> OrganizationAuditChange {
         OrganizationAuditChange {
             field,
@@ -60,6 +60,8 @@ pub enum Field {
     ProviderRepositoryId,
     #[serde(rename = "repository_full_name")]
     RepositoryFullName,
+    #[serde(rename = "selected_repository_ids")]
+    SelectedRepositoryIds,
     #[serde(rename = "default_branch")]
     DefaultBranch,
     #[serde(rename = "base_branch")]

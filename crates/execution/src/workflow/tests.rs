@@ -178,6 +178,45 @@ fn environment_passthrough_rejects_reserved_invalid_and_duplicate_names() {
     );
 }
 
+// REQ-WFFORMAT-102
+#[test]
+fn node_environment_passthrough_decodes_absent_distinct_from_empty() {
+    let fixture = fs::read(fixture_root().join("valid/node-environment-passthrough.yaml")).unwrap();
+    let workflow = decode(&fixture).unwrap();
+    let names = |names: &[&str]| Some(names.iter().map(|name| (*name).to_owned()).collect());
+    let common = |body: &NodeBody| match body {
+        NodeBody::Command(node) => node.common.environment_passthrough.clone(),
+        NodeBody::Agent(node) => node.common.environment_passthrough.clone(),
+        NodeBody::Workflow(_) => panic!("fixture has no workflow step"),
+    };
+    let handler = |step: &str| match &workflow.steps[step].recovery.as_ref().unwrap().handler {
+        Some(
+            RecoveryHandler::Command {
+                environment_passthrough,
+                ..
+            }
+            | RecoveryHandler::Agent {
+                environment_passthrough,
+                ..
+            },
+        ) => environment_passthrough.clone(),
+        None => panic!("{step} has no recovery handler"),
+    };
+
+    assert_eq!(
+        common(&workflow.steps["file"].body),
+        names(&["TRACKER_TOKEN"])
+    );
+    assert_eq!(common(&workflow.steps["inspect"].body), names(&[]));
+    assert_eq!(common(&workflow.steps["legacy"].body), None);
+    assert_eq!(handler("file"), names(&[]));
+    assert_eq!(handler("inspect"), names(&["WORKFLOW_VISIBLE"]));
+    assert_eq!(
+        common(&workflow.finalizers["report"].body),
+        names(&["WORKFLOW_VISIBLE"])
+    );
+}
+
 // REQ-WFFORMAT-1, REQ-WFFORMAT-34, REQ-WFFORMAT-44
 #[test]
 fn canonical_workflow_decodes_into_the_complete_execution_document() {
@@ -349,6 +388,7 @@ fn workflow_v1_decodes_the_three_closed_recovery_forms_only_on_ordinary_steps() 
         Some(RecoveryHandler::Command {
             argv: vec!["./repair".to_owned(), "--generated".to_owned()],
             cwd: Some("repair".to_owned()),
+            environment_passthrough: None,
         })
     );
     let agent = workflow.steps["agentRepair"].recovery.as_ref().unwrap();
@@ -359,6 +399,7 @@ fn workflow_v1_decodes_the_three_closed_recovery_forms_only_on_ordinary_steps() 
             profile: "repair".to_owned(),
             prompt: "prompts/recovery.md".to_owned(),
             cwd: Some("repair".to_owned()),
+            environment_passthrough: None,
         })
     );
     assert!(workflow.finalizers.is_empty());
@@ -842,7 +883,7 @@ fn workflow_steps_decode_backward_limited_and_external_edges() {
     );
 }
 
-// REQ-WFFORMAT-2, REQ-WFFORMAT-8, REQ-WFFORMAT-11, REQ-WFFORMAT-34, REQ-WFFORMAT-36, REQ-WFFORMAT-37, REQ-WFFORMAT-41, REQ-WFFORMAT-42, REQ-WFFORMAT-45, REQ-WFFORMAT-46, REQ-WFFORMAT-53, REQ-WFFORMAT-54, REQ-WFFORMAT-61, REQ-WFRECOVERY-56, REQ-WFRECOVERY-57, REQ-WFFORMAT-28, REQ-WFFORMAT-82, REQ-WFFORMAT-89, REQ-WFFORMAT-92, REQ-WFFORMAT-95, REQ-WFFORMAT-96
+// REQ-WFFORMAT-2, REQ-WFFORMAT-8, REQ-WFFORMAT-11, REQ-WFFORMAT-34, REQ-WFFORMAT-36, REQ-WFFORMAT-37, REQ-WFFORMAT-41, REQ-WFFORMAT-42, REQ-WFFORMAT-45, REQ-WFFORMAT-46, REQ-WFFORMAT-53, REQ-WFFORMAT-54, REQ-WFFORMAT-61, REQ-WFRECOVERY-56, REQ-WFRECOVERY-57, REQ-WFFORMAT-28, REQ-WFFORMAT-82, REQ-WFFORMAT-89, REQ-WFFORMAT-92, REQ-WFFORMAT-95, REQ-WFFORMAT-96, REQ-WFFORMAT-102
 #[test]
 fn every_canonical_invalid_fixture_is_a_structural_failure() {
     let invalid_root = fixture_root().join("invalid");

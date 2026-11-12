@@ -214,6 +214,15 @@ impl<'a> RejectionLocation<'a> {
             ValidationLocation::FinalizerAgentProfileReference { finalizer } => {
                 Self::for_finalizer("agent_profile_reference", finalizer)
             }
+            ValidationLocation::EnvironmentPassthrough { step } => {
+                Self::for_step("environment_passthrough", step)
+            }
+            ValidationLocation::RecoveryEnvironmentPassthrough { step } => {
+                Self::for_step("recovery_environment_passthrough", step)
+            }
+            ValidationLocation::FinalizerEnvironmentPassthrough { finalizer } => {
+                Self::for_finalizer("environment_passthrough", finalizer)
+            }
             ValidationLocation::StepDependency { step, index } => Self {
                 index: Some(*index),
                 ..Self::for_step("step_dependency", step)
@@ -776,6 +785,10 @@ fn validation_classification(kind: ValidationFailureKind) -> (&'static str, &'st
             "subject_input_not_text",
             "Name a text input as the workflow's subject.",
         ),
+        ValidationFailureKind::EnvironmentPassthroughUndeclared => (
+            "environment_passthrough_undeclared",
+            "List the name in the workflow's root `environmentPassthrough` or remove it from the node.",
+        ),
     }
 }
 
@@ -1093,6 +1106,9 @@ mod tests {
             ValidationLocation::AgentProfileReference { step: text() },
             ValidationLocation::RecoveryAgentProfileReference { step: text() },
             ValidationLocation::FinalizerAgentProfileReference { finalizer: text() },
+            ValidationLocation::EnvironmentPassthrough { step: text() },
+            ValidationLocation::RecoveryEnvironmentPassthrough { step: text() },
+            ValidationLocation::FinalizerEnvironmentPassthrough { finalizer: text() },
             ValidationLocation::StepDependency {
                 step: text(),
                 index: 0,
@@ -1245,9 +1261,11 @@ mod tests {
             "agent_profile_reference",
             "agent_profile_replacement",
             "agent_harness",
+            "environment_passthrough",
             "recovery_handler",
             "recovery_prompt",
             "recovery_agent_profile_reference",
+            "recovery_environment_passthrough",
             "finalizer_after",
             "finalizer_input",
             "finalizer_message_text",

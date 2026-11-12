@@ -1253,18 +1253,15 @@ where
             .and_then(|recovery| recovery.handler.as_ref())
             .ok_or(RecoveryHandlerFailure::HandlerUnavailable)?;
         match handler {
-            ValidatedRecoveryHandler::Command { argv, cwd } => {
+            ValidatedRecoveryHandler::Command { argv, cwd, .. } => {
                 let cwd = recovery_handler_cwd(&self.admitted, step, cwd.as_deref())
                     .map_err(|()| RecoveryHandlerFailure::HandlerUnavailable)?;
                 let cwd = resolve_working_directory(self.admitted.execution().root_identity(), cwd)
                     .map_err(|_| RecoveryHandlerFailure::WorkingDirectoryUnavailable)?;
-                let mut command =
-                    prepare_command(argv, cwd, self.admitted.execution().environment().clone())
-                        .map_err(|_| RecoveryHandlerFailure::CommandPreparationFailed)?;
-                command.environment = self
-                    .admitted
-                    .execution()
-                    .environment()
+                let environment = self.admitted.recovery_handler_environment(step);
+                let mut command = prepare_command(argv, cwd, environment.clone())
+                    .map_err(|_| RecoveryHandlerFailure::CommandPreparationFailed)?;
+                command.environment = environment
                     .with_variable(
                         RECOVERY_CONTEXT_VARIABLE.into(),
                         context.context_path().as_os_str().to_owned(),
@@ -2560,7 +2557,7 @@ where
                 let mut prepared = prepare_command(
                     command.argv.as_slice(),
                     cwd,
-                    self.admitted.execution().environment().clone(),
+                    self.admitted.node_environment(step),
                 )?;
                 if command.inputs.keys().ne(action_inputs.keys()) {
                     return Err(StepStartFailure::InputsUnavailable);
@@ -4191,9 +4188,7 @@ where
         return Err(CoordinationError::InputStagingMismatch);
     }
     match &agents {
-        AgentExecution::Disabled
-            if !admitted.agent_steps().is_empty() || !admitted.recovery_handlers().is_empty() =>
-        {
+        AgentExecution::Disabled if admitted.requires_agent_runtime() => {
             return Err(CoordinationError::AgentRuntimeUnavailable);
         }
         AgentExecution::Enabled { staging, .. } if !staging.is_bound_to(admitted.execution()) => {
@@ -4258,14 +4253,7 @@ impl StepBody<'_> {
 }
 
 fn workflow_node<'a>(admitted: &'a AdmittedWorkflow, id: &str) -> Option<&'a ValidatedStep> {
-    admitted.workflow().definition.steps.get(id).or_else(|| {
-        admitted
-            .workflow()
-            .definition
-            .finalizers
-            .get(id)
-            .map(|finalizer| &finalizer.body)
-    })
+    admitted.workflow().definition.node(id)
 }
 
 /// A child's exported `text` or `json` value as a value of the parent's own, so that the

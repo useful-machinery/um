@@ -2340,16 +2340,17 @@ fn make_harness_failed(run: &mut WorkflowRunResult, http_status: u16) {
 }
 
 fn view_schema_definition(definition: &str) -> jsonschema::Validator {
-    let document: Value = serde_json::from_str(include_str!(
-        "../../../../../schemas/workflow-view-result-v1.schema.json"
-    ))
-    .unwrap();
-    let schema = json!({
-        "$schema": document["$schema"],
-        "$defs": document["$defs"],
-        "$ref": format!("#/$defs/{definition}"),
-    });
-    jsonschema::draft202012::new(&schema).unwrap()
+    crate::workflow::test_support::schema_definition(
+        include_str!("../../../../../schemas/workflow-view-result-v1.schema.json"),
+        definition,
+    )
+}
+
+fn status_schema_definition(definition: &str) -> jsonschema::Validator {
+    crate::workflow::test_support::schema_definition(
+        include_str!("../../../../../schemas/workflow-status-result-v1.schema.json"),
+        definition,
+    )
 }
 
 // REQ-EVIDENCE-27, REQ-AGENT-72
@@ -2519,9 +2520,8 @@ fn failed_node_diagnostic_decodes_the_input_and_launch_facts_of_the_one_projecti
     }
 }
 
-// REQ-EVIDENCE-12
-#[test]
-fn structured_agent_failure_keeps_protocol_rejection_out_of_node_detail() {
+/// A Pi agent failure whose stream was refused, so it holds a protocol rejection.
+fn rejected_pi_agent_failure() -> crate::workflow::agent::AgentFailure {
     let mut parser =
         PiJsonV1Parser::profile(Arc::from("/execution/worktree"), AgentValueKind::None);
     let frames = concat!(
@@ -2537,6 +2537,13 @@ fn structured_agent_failure_keeps_protocol_rejection_out_of_node_detail() {
     else {
         panic!("invalid agent lifecycle must fail");
     };
+    failure
+}
+
+// REQ-EVIDENCE-12
+#[test]
+fn structured_agent_failure_keeps_protocol_rejection_out_of_node_detail() {
+    let failure = rejected_pi_agent_failure();
 
     let source = StepFailureCause::Execution(StepExecutionFailure::Agent(failure));
     let projected = canonical_failure_detail(FailurePhase::Execution, &source).unwrap();
@@ -2601,6 +2608,37 @@ fn launch_failure_projects_only_contract_supported_recovery_cause() {
         projected,
         serde_json::json!({ "code": "harness_start_failed" })
     );
+}
+
+// REQ-WFRECOVERY-37, REQ-WFRECOVERY-40 (AUTO-342)
+#[test]
+fn a_recovery_rounds_failure_carries_no_protocol_rejection() {
+    let failure = rejected_pi_agent_failure();
+    let rejection = serde_json::to_value(failure.protocol_rejection().unwrap()).unwrap();
+
+    let source = StepFailureCause::Execution(StepExecutionFailure::Agent(failure));
+    let projected = failure_v1(FailurePhase::Execution, &source).unwrap();
+    let value = serde_json::to_value(&projected).unwrap();
+    assert_eq!(
+        value,
+        json!({"phase": "execution", "cause": {"code": "harness_protocol_failed"}})
+    );
+    assert_eq!(
+        serde_json::from_value::<FailureV1>(value.clone()).unwrap(),
+        projected
+    );
+    let mut carrying = value.clone();
+    carrying["cause"]["protocolRejection"] = rejection;
+    assert!(serde_json::from_value::<FailureV1>(carrying.clone()).is_err());
+
+    // The schema of each `--json` document takes the round's failure and refuses the member.
+    for (document, schema) in [
+        ("view", view_schema_definition("Failure")),
+        ("status", status_schema_definition("Failure")),
+    ] {
+        assert!(schema.is_valid(&value), "{document}: {value}");
+        assert!(!schema.is_valid(&carrying), "{document}: {carrying}");
+    }
 }
 
 // REQ-LOCALRUN-134

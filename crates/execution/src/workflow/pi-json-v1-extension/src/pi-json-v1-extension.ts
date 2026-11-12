@@ -45,8 +45,20 @@ interface ToolCallBlock {
   arguments?: unknown;
 }
 
+// A singleton carries the arguments the session records for the call: the
+// model's toolCall block, not the copy Pi normalizes before execute.
 type ResultToolCallGroup =
-  { kind: "singleton" } | { kind: "sibling" } | { kind: "uncorrelated" };
+  | { kind: "singleton"; arguments: ResultArguments }
+  | { kind: "sibling" }
+  | { kind: "uncorrelated" };
+
+function resultToolCallRefusal(
+  group: Exclude<ResultToolCallGroup, { kind: "singleton" }>,
+): string {
+  return group.kind === "sibling"
+    ? "No result was accepted. Call the workflow result tool by itself, without sibling tool calls."
+    : "No result was accepted. The workflow result call could not be correlated.";
+}
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -123,7 +135,7 @@ function classifyResultToolCallGroup(
       return { kind: "uncorrelated" };
     }
 
-    candidate = { kind: "singleton" };
+    candidate = { kind: "singleton", arguments: toolCall.arguments };
   }
 
   return candidate ?? { kind: "uncorrelated" };
@@ -279,11 +291,22 @@ export function createResultTool(
     parameters,
     async execute(
       toolCallId: string,
-      argumentsValue: ResultArguments,
+      _argumentsValue: ResultArguments,
       signal: AbortSignal | undefined,
       _onUpdate: AgentToolUpdateCallback | undefined,
       ctx: ExtensionContext,
     ) {
+      // Pi passes execute a copy of the arguments normalized against the
+      // model-facing projection; submit the session's record of the call.
+      const group = classifyResultToolCallGroup(
+        ctx,
+        toolCallId,
+        config.toolName,
+      );
+      if (group.kind !== "singleton") {
+        throw new Error(resultToolCallRefusal(group));
+      }
+
       let response: ValidatePiResultV1Response;
       try {
         response = await validate(
@@ -292,7 +315,7 @@ export function createResultTool(
             kind: "ValidatePiResultV1",
             toolCallId,
             toolName: config.toolName,
-            arguments: argumentsValue,
+            arguments: group.arguments,
           },
           signal,
         );
@@ -355,13 +378,7 @@ export function createPiJsonV1Extension(
         return;
       }
 
-      return {
-        block: true,
-        reason:
-          group.kind === "sibling"
-            ? "No result was accepted. Call the workflow result tool by itself, without sibling tool calls."
-            : "No result was accepted. The workflow result call could not be correlated.",
-      };
+      return { block: true, reason: resultToolCallRefusal(group) };
     });
 
     pi.on("session_before_compact", () =>

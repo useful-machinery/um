@@ -83,6 +83,24 @@ impl Fixture {
         attachment_splices: usize,
         consumer_harness: ConsumerHarness,
     ) -> Self {
+        Self::with_consumer_declaration(mode, attachment_splices, consumer_harness, "")
+    }
+
+    fn with_consumer_environment_passthrough(declaration: &str) -> Self {
+        Self::with_consumer_declaration(
+            ConsumerValueMode::None,
+            1,
+            ConsumerHarness::Pi,
+            &format!("    environmentPassthrough: {declaration}\n"),
+        )
+    }
+
+    fn with_consumer_declaration(
+        mode: ConsumerValueMode,
+        attachment_splices: usize,
+        consumer_harness: ConsumerHarness,
+        consumer_declaration: &str,
+    ) -> Self {
         let temporary = tempfile::tempdir().unwrap();
         let source_root = temporary.path().join("source");
         let execution_root = temporary.path().join("execution");
@@ -104,7 +122,7 @@ impl Fixture {
         )
         .unwrap();
         fs::write(source_root.join("schemas/result.json"), RESULT_SCHEMA).unwrap();
-        let workflow = workflow_source(mode, attachment_splices);
+        let workflow = workflow_source(mode, attachment_splices, consumer_declaration);
         fs::write(source_root.join("workflow.yaml"), &workflow).unwrap();
         fs::write(
             execution_root.join("artifact-source.bin"),
@@ -258,7 +276,11 @@ impl Fixture {
     }
 }
 
-fn workflow_source(mode: ConsumerValueMode, attachment_splices: usize) -> String {
+fn workflow_source(
+    mode: ConsumerValueMode,
+    attachment_splices: usize,
+    consumer_declaration: &str,
+) -> String {
     let consumer_output = match mode {
         ConsumerValueMode::None => String::new(),
         ConsumerValueMode::Response => {
@@ -324,7 +346,7 @@ steps:
   consumer:
     kind: agent
     cwd: work
-    agent:
+{consumer_declaration}    agent:
       profile: coding
       systemPrompt: prompts/system.md
       message:
@@ -463,6 +485,32 @@ fn retained_named_and_upstream_values_materialize_exactly_in_declared_order() {
     assert_ne!(
         fs::read(fixture.source_root.join("attachments/static.png")).unwrap(),
         fs::read(invocation.attachments()[0].path()).unwrap()
+    );
+}
+
+// REQ-WFEXEC-26, REQ-WFEXEC-71
+#[test]
+fn agent_step_environment_passthrough_narrows_the_harness_environment() {
+    let environment_names = |fixture: Fixture| {
+        fixture
+            .materialize(CancellationSource::new())
+            .unwrap()
+            .invocation()
+            .process()
+            .environment()
+            .variables()
+            .keys()
+            .map(|name| name.to_str().unwrap().to_owned())
+            .collect::<Vec<_>>()
+    };
+
+    assert_eq!(
+        environment_names(Fixture::with_consumer_environment_passthrough("[]")),
+        ["PATH"]
+    );
+    assert_eq!(
+        environment_names(Fixture::new(ConsumerValueMode::None)),
+        ["PATH", "VISIBLE"]
     );
 }
 

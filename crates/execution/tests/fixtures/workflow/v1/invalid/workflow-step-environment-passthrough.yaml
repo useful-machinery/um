@@ -1,0 +1,10 @@
+schemaVersion: 1
+environmentPassthrough: [TRACKER_TOKEN]
+steps:
+  design:
+    kind: workflow
+    workflow: design.yaml
+    environmentPassthrough: [TRACKER_TOKEN]
+    on:
+      succeeded: exit.succeeded
+      failed: exit.failed

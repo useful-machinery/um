@@ -459,6 +459,12 @@ struct CommonNodeDto {
     failure_policy: FailurePolicy,
     condition: Option<ConditionPredicateDto>,
     cwd: Option<String>,
+    #[serde(
+        rename = "environmentPassthrough",
+        default,
+        deserialize_with = "deserialize_node_environment_passthrough"
+    )]
+    environment_passthrough: Option<BTreeSet<String>>,
     #[serde(default)]
     outputs: BTreeMap<String, OutputDto>,
 }
@@ -483,12 +489,24 @@ enum RecoveryHandlerDto {
     Command {
         command: CommandDto,
         cwd: Option<String>,
+        #[serde(
+            rename = "environmentPassthrough",
+            default,
+            deserialize_with = "deserialize_node_environment_passthrough"
+        )]
+        environment_passthrough: Option<BTreeSet<String>>,
     },
     #[serde(rename = "agent")]
     Agent {
         profile: String,
         prompt: String,
         cwd: Option<String>,
+        #[serde(
+            rename = "environmentPassthrough",
+            default,
+            deserialize_with = "deserialize_node_environment_passthrough"
+        )]
+        environment_passthrough: Option<BTreeSet<String>>,
     },
 }
 
@@ -710,6 +728,17 @@ where
         }
     }
     Ok(allowed)
+}
+
+/// A node's `environmentPassthrough`, under the root list's name rules; present as
+/// `Some` even when empty, so an absent list stays distinct (REQ-WFFORMAT-102).
+fn deserialize_node_environment_passthrough<'de, D>(
+    deserializer: D,
+) -> Result<Option<BTreeSet<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    deserialize_environment_passthrough(deserializer).map(Some)
 }
 
 #[derive(Deserialize)]
@@ -967,6 +996,7 @@ impl CommonNodeDto {
                 None => None,
             },
             cwd: self.cwd,
+            environment_passthrough: self.environment_passthrough,
             outputs,
         })
     }
@@ -1047,18 +1077,25 @@ impl RecoveryDto {
 impl RecoveryHandlerDto {
     fn into_handler(self) -> RecoveryHandler {
         match self {
-            Self::Command { command, cwd } => RecoveryHandler::Command {
+            Self::Command {
+                command,
+                cwd,
+                environment_passthrough,
+            } => RecoveryHandler::Command {
                 argv: command.argv,
                 cwd,
+                environment_passthrough,
             },
             Self::Agent {
                 profile,
                 prompt,
                 cwd,
+                environment_passthrough,
             } => RecoveryHandler::Agent {
                 profile,
                 prompt,
                 cwd,
+                environment_passthrough,
             },
         }
     }

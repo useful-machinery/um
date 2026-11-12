@@ -518,3 +518,86 @@ async fn cancellation_waits_for_recovery_agent_quiescence_and_rejects_late_decis
     })
     .await;
 }
+
+// REQ-WFRECOVERY-12, REQ-WFRECOVERY-64
+#[tokio::test]
+async fn agent_handler_environment_passthrough_narrows_the_recovery_harness() {
+    with_watchdog(async {
+        let source = format!(
+            r#"schemaVersion: 1
+environmentPassthrough: [VISIBLE]
+{}steps:
+  repair:
+    kind: cmd
+    recovery:
+      retries: 1
+      handler:
+        kind: agent
+        profile: recovery
+        prompt: recovery.md
+        environmentPassthrough: []
+    command:
+      argv: [/bin/sh, -c, "exit 75"]
+"#,
+            recovery_profile_source(AgentCompatibilityProfile::PiJsonV1)
+        );
+        let fixture = execution_fixture_with_source_files(
+            &source,
+            &[("recovery.md", b"Inspect the failure.")],
+            ResolvedInputs::default(),
+            EnvironmentSnapshot::new([("PATH", "/bin:/usr/bin"), ("VISIBLE", "root-only")]),
+            CancellationSource::new(),
+            1,
+            1024,
+        );
+        let (adapter, mut control) = scripted_agent_dispatcher();
+        let artifacts = fixture.artifacts.clone();
+        let inputs = fixture.inputs.clone();
+        let execution = tokio::spawn({
+            let admitted = fixture.admitted.clone();
+            let agents = agent_runtime(&fixture, adapter);
+            async move {
+                execute_workflow(
+                    admitted,
+                    &artifacts,
+                    &inputs,
+                    &StepDiagnosticLog::default(),
+                    agents,
+                    TestClock,
+                    NoopExecutionObserver,
+                )
+                .await
+            }
+        });
+
+        let started = control.wait_until_started().await.unwrap();
+        let environment = started.environment();
+        assert!(
+            environment
+                .variable(std::ffi::OsStr::new(RECOVERY_CONTEXT_VARIABLE))
+                .is_some()
+        );
+        assert!(
+            environment
+                .variable(std::ffi::OsStr::new("VISIBLE"))
+                .is_none()
+        );
+        started.control().start().await.unwrap();
+        started
+            .control()
+            .propose(ScriptedAgentValue::Result(Arc::new(json!({
+                "schemaVersion": 1,
+                "decision": "gave_up",
+                "summary": "environment observed",
+                "reason": "the fixture only checks the handler environment"
+            }))))
+            .await
+            .unwrap();
+        started.control().complete().await.unwrap();
+        assert!(matches!(
+            execution.await.unwrap().unwrap().outcome,
+            RunOutcome::Failed { .. }
+        ));
+    })
+    .await;
+}

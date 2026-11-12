@@ -18,8 +18,9 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Default, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SetProjectRepositoryRequest {
-    #[serde(rename = "providerKind")]
-    pub provider_kind: ProviderKind,
+    /// Omission selects `github`; a `gitlab` selection names its kind.
+    #[serde(rename = "providerKind", skip_serializing_if = "Option::is_none")]
+    pub provider_kind: Option<ProviderKind>,
     #[serde(
         rename = "installationBindingId",
         skip_serializing_if = "Option::is_none"
@@ -42,12 +43,9 @@ pub struct SetProjectRepositoryRequest {
 }
 
 impl SetProjectRepositoryRequest {
-    pub fn new(
-        provider_kind: ProviderKind,
-        provider_repository_id: String,
-    ) -> SetProjectRepositoryRequest {
+    pub fn new(provider_repository_id: String) -> SetProjectRepositoryRequest {
         SetProjectRepositoryRequest {
-            provider_kind,
+            provider_kind: None,
             installation_binding_id: None,
             gitlab_connection_id: None,
             provider_repository_id,
@@ -56,6 +54,7 @@ impl SetProjectRepositoryRequest {
         }
     }
 }
+/// Omission selects `github`; a `gitlab` selection names its kind.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
 pub enum ProviderKind {
     #[serde(rename = "github")]

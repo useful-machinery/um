@@ -683,13 +683,23 @@
         ]
       }
     },
+    "EnvironmentPassthrough": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "pattern": "^[A-Za-z_][A-Za-z0-9_]*$",
+        "not": { "pattern": "^(UM_|SCHERZO_|GIT_ASKPASS($|_REQUIRE$)|GIT_TERMINAL_PROMPT$|GIT_CURL_VERBOSE$|GIT_CONFIG($|_(COUNT|PARAMETERS|GLOBAL|NOSYSTEM|SYSTEM)$|_(KEY|VALUE)_)|GIT_SSH($|_COMMAND$)|GIT_TRACE|SSH_ASKPASS($|_REQUIRE$)|SSH_AUTH_SOCK$|SSH_AGENT_PID$|GH_TOKEN$|GITHUB_TOKEN$)" }
+      }
+    },
     "CommandRecoveryHandler": {
       "type": "object",
       "additionalProperties": false,
       "properties": {
         "kind": { "const": "cmd" },
         "command": { "$ref": "#/$defs/Command" },
-        "cwd": { "$ref": "#/$defs/RuntimeRelativePath" }
+        "cwd": { "$ref": "#/$defs/RuntimeRelativePath" },
+        "environmentPassthrough": { "$ref": "#/$defs/EnvironmentPassthrough" }
       },
       "required": ["kind", "command"]
     },
@@ -700,7 +710,8 @@
         "kind": { "const": "agent" },
         "profile": { "$ref": "#/$defs/Identifier" },
         "prompt": { "$ref": "#/$defs/SourceRelativePath" },
-        "cwd": { "$ref": "#/$defs/RuntimeRelativePath" }
+        "cwd": { "$ref": "#/$defs/RuntimeRelativePath" },
+        "environmentPassthrough": { "$ref": "#/$defs/EnvironmentPassthrough" }
       },
       "required": ["kind", "profile", "prompt"]
     },
@@ -732,6 +743,7 @@
         "cwd": { "$ref": "#/$defs/RuntimeRelativePath" },
         "recovery": { "$ref": "#/$defs/Recovery" },
         "condition": { "$ref": "#/$defs/OrdinaryCondition" },
+        "environmentPassthrough": { "$ref": "#/$defs/EnvironmentPassthrough" },
         "inputs": { "$ref": "#/$defs/InputBindings" },
         "outputs": { "$ref": "#/$defs/CommandOutputs" },
         "command": { "$ref": "#/$defs/Command" }
@@ -748,6 +760,7 @@
         "cwd": { "$ref": "#/$defs/RuntimeRelativePath" },
         "recovery": { "$ref": "#/$defs/Recovery" },
         "condition": { "$ref": "#/$defs/OrdinaryCondition" },
+        "environmentPassthrough": { "$ref": "#/$defs/EnvironmentPassthrough" },
         "outputs": { "$ref": "#/$defs/AgentOutputs" },
         "agent": { "$ref": "#/$defs/Agent" }
       },
@@ -879,6 +892,7 @@
         "when": { "$ref": "#/$defs/FinalizerWhen" },
         "condition": { "$ref": "#/$defs/FinalizerCondition" },
         "cwd": { "$ref": "#/$defs/RuntimeRelativePath" },
+        "environmentPassthrough": { "$ref": "#/$defs/EnvironmentPassthrough" },
         "inputs": { "$ref": "#/$defs/FinalizerInputBindings" },
         "outputs": { "$ref": "#/$defs/CommandOutputs" },
         "command": { "$ref": "#/$defs/Command" }
@@ -895,6 +909,7 @@
         "when": { "$ref": "#/$defs/FinalizerWhen" },
         "condition": { "$ref": "#/$defs/FinalizerCondition" },
         "cwd": { "$ref": "#/$defs/RuntimeRelativePath" },
+        "environmentPassthrough": { "$ref": "#/$defs/EnvironmentPassthrough" },
         "outputs": { "$ref": "#/$defs/AgentOutputs" },
         "agent": { "$ref": "#/$defs/FinalizerAgent" }
       },
@@ -1141,15 +1156,7 @@
         "version": { "type": "string", "minLength": 1, "maxLength": 64 },
         "subject": { "$ref": "#/$defs/Identifier" },
         "description": { "type": "string" },
-        "environmentPassthrough": {
-          "type": "array",
-          "uniqueItems": true,
-          "items": {
-            "type": "string",
-            "pattern": "^[A-Za-z_][A-Za-z0-9_]*$",
-            "not": { "pattern": "^(UM_|SCHERZO_|GIT_ASKPASS($|_REQUIRE$)|GIT_TERMINAL_PROMPT$|GIT_CURL_VERBOSE$|GIT_CONFIG($|_(COUNT|PARAMETERS|GLOBAL|NOSYSTEM|SYSTEM)$|_(KEY|VALUE)_)|GIT_SSH($|_COMMAND$)|GIT_TRACE|SSH_ASKPASS($|_REQUIRE$)|SSH_AUTH_SOCK$|SSH_AGENT_PID$|GH_TOKEN$|GITHUB_TOKEN$)" }
-          }
-        },
+        "environmentPassthrough": { "$ref": "#/$defs/EnvironmentPassthrough" },
         "inputs": { "$ref": "#/$defs/WorkflowInputs" },
         "agentProfiles": { "$ref": "#/$defs/AgentProfiles" },
         "steps": {

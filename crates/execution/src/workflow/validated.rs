@@ -90,6 +90,13 @@ pub enum Scheduling {
 }
 
 impl ValidatedWorkflow {
+    /// The step or finalizer named `id`; the two share one namespace.
+    pub fn node(&self, id: &str) -> Option<&ValidatedStep> {
+        self.steps
+            .get(id)
+            .or_else(|| self.finalizers.get(id).map(|finalizer| &finalizer.body))
+    }
+
     /// Whether a run may omit the declared input, because it is optional or defaulted.
     pub(crate) fn input_may_be_omitted(&self, name: &str) -> bool {
         self.optional_inputs.contains(name) || self.input_defaults.contains_key(name)
@@ -136,12 +143,14 @@ pub enum ValidatedRecoveryHandler {
     Command {
         argv: Vec<String>,
         cwd: Option<String>,
+        environment_passthrough: Option<BTreeSet<String>>,
     },
     Agent {
         profile: String,
         prompt: String,
         cwd: Option<String>,
         harness: ValidatedHarness,
+        environment_passthrough: Option<BTreeSet<String>>,
     },
 }
 
@@ -255,6 +264,9 @@ pub struct ValidatedCommonStep {
     pub(crate) prerequisites: Vec<ResolvedDirectPrerequisite>,
     pub(crate) evidence_prerequisites: Vec<Prerequisite>,
     pub(crate) cwd: Option<String>,
+    /// The node's own `environmentPassthrough`, each name one the root declares; `None`
+    /// when the node declares none (REQ-WFFORMAT-102).
+    pub(crate) environment_passthrough: Option<BTreeSet<String>>,
     pub(crate) outputs: BTreeMap<String, ValidatedOutput>,
 }
 

@@ -418,7 +418,7 @@ pub(super) fn run(args: &[String]) -> Output {
     isolated_command(args).output().unwrap()
 }
 
-fn fixture_path_with_host_tools(fixtures: &[&Path]) -> OsString {
+pub(super) fn fixture_path_with_host_tools(fixtures: &[&Path]) -> OsString {
     let inherited = std::env::var_os("PATH").unwrap_or_default();
     std::env::join_paths(
         fixtures
@@ -1139,6 +1139,57 @@ fn conditional_skips_persist_for_steps_and_finalizers() {
         String::from_utf8_lossy(&validation.stdout),
         String::from_utf8_lossy(&validation.stderr)
     );
+}
+
+// REQ-EVIDENCE-13, REQ-LOCALRUN-156, REQ-LOCALRUN-158, REQ-WFCOND-41
+#[test]
+fn conditional_skips_are_viewable_after_publication() {
+    let bundle = RunBundle::new(include_str!(
+        "../fixtures/workflow-run/conditional-skip.yaml"
+    ));
+    let destination = bundle.result("conditional-skips-view");
+    let output = run(&bundle.args(&destination));
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let view_args = |options: &[&str]| {
+        let mut args = vec![
+            "workflow".to_owned(),
+            "run".to_owned(),
+            "view".to_owned(),
+            destination.to_string_lossy().into_owned(),
+        ];
+        args.extend(options.iter().map(|option| (*option).to_owned()));
+        args
+    };
+
+    let view = isolated_command(&view_args(&["--json"])).output().unwrap();
+    assert!(
+        view.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&view.stdout),
+        String::from_utf8_lossy(&view.stderr)
+    );
+    let view: serde_json::Value = serde_json::from_slice(&view.stdout).unwrap();
+    assert!(workflow_view_schema().is_valid(&view));
+    assert_eq!(view["result"], result_json(&destination));
+    assert_eq!(view["result"]["steps"][1]["state"], "skipped");
+    assert_eq!(
+        view["result"]["finalization"]["finalizers"][0]["state"],
+        "skipped"
+    );
+
+    let plain = isolated_command(&view_args(&[])).output().unwrap();
+    assert!(
+        plain.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&plain.stdout),
+        String::from_utf8_lossy(&plain.stderr)
+    );
+    assert!(String::from_utf8_lossy(&plain.stdout).contains("condition_false"));
 }
 
 // REQ-WFCOND-6, REQ-WFCOND-21, REQ-WFEXEC-24
@@ -4065,6 +4116,43 @@ fn local_run_forwards_only_declared_host_environment() {
         assert_eq!(
             fs::read_to_string(bundle.execution_root().join("observed.txt")).unwrap(),
             expected
+        );
+    }
+}
+
+// SC-WFEXEC-5, REQ-WFEXEC-71
+#[test]
+fn local_run_scopes_declared_host_environment_to_each_step() {
+    let observe = |name: &str, declaration: &str| {
+        format!(
+            "  {name}:\n    kind: cmd\n{declaration}    command:\n      argv: [sh, -c, 'printf \"%s %s\" \"${{TRACKER_TOKEN-unset}}\" \"${{WORKFLOW_VISIBLE-unset}}\" > {name}.txt']\n"
+        )
+    };
+    let bundle = RunBundle::new(&format!(
+        "schemaVersion: 1\nenvironmentPassthrough: [TRACKER_TOKEN, WORKFLOW_VISIBLE]\nsteps:\n{}{}{}",
+        observe("file", "    environmentPassthrough: [TRACKER_TOKEN]\n"),
+        observe("inspect", "    environmentPassthrough: []\n"),
+        observe("legacy", ""),
+    ));
+    let output = isolated_command(&bundle.args(&bundle.result("scoped")))
+        .env("TRACKER_TOKEN", "token")
+        .env("WORKFLOW_VISIBLE", "visible")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    for (step, expected) in [
+        ("file", "token unset"),
+        ("inspect", "unset unset"),
+        ("legacy", "token visible"),
+    ] {
+        assert_eq!(
+            fs::read_to_string(bundle.execution_root().join(format!("{step}.txt"))).unwrap(),
+            expected,
+            "{step}"
         );
     }
 }
@@ -7679,18 +7767,38 @@ fn show_reports_a_running_childs_attempt_and_in_flight_steps() {
         assert_eq!(children[0]["step"], "design", "{document}");
         children[0].clone()
     };
-    // The command has started before the child commits `decide` running; once it has, the
-    // held child writes nothing until it is interrupted.
+    // The command has started before the child commits `decide` running; once that commit has
+    // also removed the state it exchanged out (a `.state-*` temporary), the held child writes
+    // nothing until it is interrupted. The state is read before the temporaries are listed: a
+    // commit seen in `state.json` has exchanged already, so a listing after it that holds no
+    // temporary proves that commit's removal.
     let state = run.join("children/design/000001/state.json");
     poll_until(
         "the child commits decide running",
-        || read_json(&state)["attempts"][0]["progress"]["steps"].clone(),
-        |steps| {
-            steps.as_array().is_some_and(|steps| {
-                steps
-                    .iter()
-                    .any(|step| step["id"] == "decide" && step["state"] == "running")
-            })
+        || {
+            let steps = read_json(&state)["attempts"][0]["progress"]["steps"].clone();
+            let pending_temporary = [
+                run.join(".private"),
+                run.join("children/design/000001/.private"),
+            ]
+            .iter()
+            .flat_map(|private| fs::read_dir(private).unwrap())
+            .any(|entry| {
+                entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".state-")
+            });
+            (steps, pending_temporary)
+        },
+        |(steps, pending_temporary)| {
+            !*pending_temporary
+                && steps.as_array().is_some_and(|steps| {
+                    steps
+                        .iter()
+                        .any(|step| step["id"] == "decide" && step["state"] == "running")
+                })
         },
     );
 

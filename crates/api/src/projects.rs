@@ -94,18 +94,18 @@ impl ProjectApi {
     ) -> Result<Project, ProjectFailure> {
         let mut repository = match input.repository {
             ProjectRepositorySelector::GitHub(id) => {
-                let mut selection = models::ProjectRepositorySelection::new(
-                    models::project_repository_selection::ProviderKind::Github,
-                    input.repository_id.to_owned(),
-                );
+                let mut selection =
+                    models::ProjectRepositorySelection::new(input.repository_id.to_owned());
+                selection.provider_kind =
+                    Some(models::project_repository_selection::ProviderKind::Github);
                 selection.installation_binding_id = Some(id.to_owned());
                 selection
             }
             ProjectRepositorySelector::GitLab(id) => {
-                let mut selection = models::ProjectRepositorySelection::new(
-                    models::project_repository_selection::ProviderKind::Gitlab,
-                    input.repository_id.to_owned(),
-                );
+                let mut selection =
+                    models::ProjectRepositorySelection::new(input.repository_id.to_owned());
+                selection.provider_kind =
+                    Some(models::project_repository_selection::ProviderKind::Gitlab);
                 selection.gitlab_connection_id = Some(id.to_owned());
                 selection
             }
@@ -252,18 +252,18 @@ impl ProjectApi {
     ) -> Result<Project, ProjectFailure> {
         let mut request = match repository {
             ProjectRepositorySelector::GitHub(id) => {
-                let mut selection = models::SetProjectRepositoryRequest::new(
-                    models::set_project_repository_request::ProviderKind::Github,
-                    repository_id.to_owned(),
-                );
+                let mut selection =
+                    models::SetProjectRepositoryRequest::new(repository_id.to_owned());
+                selection.provider_kind =
+                    Some(models::set_project_repository_request::ProviderKind::Github);
                 selection.installation_binding_id = Some(id.to_owned());
                 selection
             }
             ProjectRepositorySelector::GitLab(id) => {
-                let mut selection = models::SetProjectRepositoryRequest::new(
-                    models::set_project_repository_request::ProviderKind::Gitlab,
-                    repository_id.to_owned(),
-                );
+                let mut selection =
+                    models::SetProjectRepositoryRequest::new(repository_id.to_owned());
+                selection.provider_kind =
+                    Some(models::set_project_repository_request::ProviderKind::Gitlab);
                 selection.gitlab_connection_id = Some(id.to_owned());
                 selection
             }

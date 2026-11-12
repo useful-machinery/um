@@ -2945,6 +2945,129 @@ fn each_announcement_that_a_subagents_task_runs_in_the_background_holds_the_wait
     );
 }
 
+/// Sanitized from the stream Claude Code 2.1.321 emits for the lifecycle cell
+/// `result/background-agent[monitor-after-a-wait]/none/settle` (AUTO-315): the backgrounded
+/// subagent of `backgrounded_subagent_transcript` starts a `Monitor` over a blocked command
+/// before its closing text, and the stream is cut at the notified turn's `init`. The
+/// monitor's `task_started` is the one announcement that it runs in the background: the
+/// subagent's `Monitor` result carries no `tool_use_result`, and the task list that names the
+/// monitor after the subagent's completion is not read as one.
+fn subagent_stopping_with_its_monitor_running() -> Vec<Value> {
+    let acknowledgement = subagent_message(
+        "user",
+        json!({"role": "user", "content": [{"type": "tool_result", "tool_use_id": "sub-monitor",
+            "content": "Monitor started (task sub-monitor-task, expires in 5m unless the source \
+                ends first). You will be notified on each event."}]}),
+    );
+    let monitor_task = json!({"task_id": "sub-monitor-task", "run_id": "sub-monitor-run",
+        "task_type": "local_bash", "description": "Watch tests", "parent_task_id": "t1"});
+    let monitor_run = [
+        subagent_message(
+            "assistant",
+            json!({"id": "msg-sub-monitor", "type": "message", "role": "assistant",
+                "model": "subagent-model", "content": [{"type": "tool_use", "id": "sub-monitor",
+                "name": "Monitor", "input": {"command": "./watch-tests",
+                "description": "Watch tests"}}]}),
+        ),
+        system_event(
+            "background_tasks_changed",
+            json!({"tasks": [{"task_id": "t1", "run_id": "agent-run", "task_type": "local_agent",
+                "subagent_type": "Explore", "description": "Review the diff"},
+                monitor_task.clone()]}),
+        ),
+        system_event(
+            "task_started",
+            json!({"task_id": "sub-monitor-task", "run_id": "sub-monitor-run",
+                "owned_by_subagent": true, "tool_use_id": "sub-monitor",
+                "description": "Watch tests", "is_backgrounded": true, "parent_task_id": "t1",
+                "task_type": "local_bash"}),
+        ),
+        acknowledgement,
+    ];
+    let mut values = backgrounded_subagent_transcript();
+    let closing_text = position_of(&values, |value| value["message"]["id"] == "msg-sub-2");
+    values.splice(closing_text..closing_text, monitor_run);
+    values.truncate(last_init(&values));
+    let task_list = values.len() - 1;
+    values[task_list]["tasks"] = json!([monitor_task]);
+    values
+}
+
+/// The monitor's end once the driver releases its command, which prints its one line and
+/// exits: one notification reports the stream's end, and Claude Code's resume delivers the
+/// line and the end together, its prompt carrying the line as the notification's `event`.
+fn subagent_monitor_end_and_resume() -> Vec<Value> {
+    let mut values = vec![
+        system_event(
+            "task_updated",
+            json!({"task_id": "sub-monitor-task", "run_id": "sub-monitor-run",
+                "patch": {"status": "completed", "end_time": 2}}),
+        ),
+        system_event(
+            "task_notification",
+            json!({"task_id": "sub-monitor-task", "run_id": "sub-monitor-run",
+                "tool_use_id": "sub-monitor", "status": "completed",
+                "output_file": "/tmp/sub-monitor-task.output",
+                "summary": "Monitor \"Watch tests\" stream ended"}),
+        ),
+        system_event("background_tasks_changed", json!({"tasks": []})),
+    ];
+    let mut resume = harness_resume_delivering_the_report("agent-run-3");
+    let start = position_of(&resume, |value| value["subtype"] == "task_started");
+    resume[start]["prompt"] = json!(
+        "<task-notification>\n<task-id>sub-monitor-task</task-id>\n\
+        <tool-use-id>sub-monitor</tool-use-id>\n\
+        <output-file>/tmp/sub-monitor-task.output</output-file>\n<status>completed</status>\n\
+        <summary>Monitor \"Watch tests\" stream ended</summary>\n\
+        <event>tests passed</event>\n</task-notification>"
+    );
+    values.extend(resume);
+    values
+}
+
+// REQ-AGENT-80, INV-HARNESS-14 (AUTO-315)
+#[test]
+fn a_subagents_monitor_holds_the_wait_until_its_end_reports() {
+    let stopped = framed(&subagent_stopping_with_its_monitor_running());
+    let waiting = framed(&turn_waiting_for_the_subagent());
+    let ended = framed(&subagent_monitor_end_and_resume());
+    let submission = framed(&structured_output_exchange_after(&[]));
+
+    let mut held = parser(AgentValueKind::Result, 1024);
+    let mut observations = Vec::new();
+    for bytes in [&stopped, &waiting] {
+        held.push_stdout(bytes, |observation| observations.push(observation))
+            .unwrap();
+    }
+    assert_eq!(held.take_completed_result_exchange(), None);
+    assert_eq!(warning_diagnostics(&observations), Vec::<&str>::new());
+    // The monitor's end, Claude Code's resume of the subagent, the report run's notification
+    // and the turn it wakes, which submits.
+    let mut after_the_wait = Vec::new();
+    for bytes in [&ended, &submission] {
+        held.push_stdout(bytes, |observation| after_the_wait.push(observation))
+            .unwrap();
+    }
+    assert_eq!(
+        held.take_completed_result_exchange(),
+        Some(CompletedResultExchange::Candidate(Arc::new(json!(7))))
+    );
+    held.accept_result(CapturedJson::fixture(Arc::new(json!(7))))
+        .unwrap();
+    assert!(matches!(
+        held.finish(true),
+        AgentOutcome::Completed(CompletedAgentInvocation::Result(_))
+    ));
+    assert_eq!(unrecognized_events(&after_the_wait), Vec::<&Value>::new());
+    observations.extend(after_the_wait);
+    assert_eq!(
+        subagent_statuses(&observations),
+        ["started", "completed", "resumed", "completed"]
+    );
+    // Result mode observes the waiting turn's enforcement nag; nothing else is unrecognized.
+    assert_eq!(unrecognized_events(&observations), [&enforcement_nag()]);
+}
+
 /// The turn Claude Code 2.1.310 opens for the messaged run's queued notification when it
 /// dequeues it before the report run has queued its own (the `resume-unawaited` cells,
 /// AUTO-64): delivered with a model call, as any notification is, rather than as the
@@ -4955,31 +5078,16 @@ fn malformed_and_contradictory_recorded_streams_never_accept_a_response() {
     );
 }
 
-/// Validates a serialized rejection against the protocol schema the runner reports it in
-/// and the `workflow view` result schema that mirrors it.
-fn assert_rejection_matches_schemas(rejection: &Value) {
-    for (schema, definition) in [
-        (
-            include_str!("../../../../runner-protocol/src/schema/runner-protocol-v1.schema.json"),
-            "AgentProtocolRejectionDiagnostic",
-        ),
-        (
-            include_str!("../../../../../schemas/workflow-view-result-v1.schema.json"),
-            "ProtocolRejection",
-        ),
-    ] {
-        let document: Value = serde_json::from_str(schema).unwrap();
-        let schema = json!({
-            "$schema": document["$schema"],
-            "$defs": document["$defs"],
-            "$ref": format!("#/$defs/{definition}"),
-        });
-        let validator = jsonschema::draft202012::new(&schema).unwrap();
-        assert!(
-            validator.is_valid(rejection),
-            "{definition} rejected {rejection}"
-        );
-    }
+/// Validates a serialized rejection against the protocol schema the runner reports it in.
+fn assert_rejection_matches_schema(rejection: &Value) {
+    let validator = crate::workflow::test_support::schema_definition(
+        include_str!("../../../../runner-protocol/src/schema/runner-protocol-v1.schema.json"),
+        "AgentProtocolRejectionDiagnostic",
+    );
+    assert!(
+        validator.is_valid(rejection),
+        "AgentProtocolRejectionDiagnostic rejected {rejection}"
+    );
 }
 
 // REQ-AGENT-42
@@ -5022,7 +5130,7 @@ fn parser_rejections_report_stable_profile_owned_structural_context() {
             }
         })
     );
-    assert_rejection_matches_schemas(&protocol_rejection_value(&malformed));
+    assert_rejection_matches_schema(&protocol_rejection_value(&malformed));
 
     let mut initialization = init(QUALIFICATION_VERSION, SESSION_ID);
     initialization["cwd"] = json!("/contradictory");
@@ -5060,7 +5168,7 @@ fn parser_rejections_report_stable_profile_owned_structural_context() {
         missing_exchange_init["detail"]["state"]["eventThread"],
         "main"
     );
-    assert_rejection_matches_schemas(&missing_exchange_init);
+    assert_rejection_matches_schema(&missing_exchange_init);
 
     let wrong_parent = json!({
         "type": "stream_event",
@@ -5180,7 +5288,7 @@ fn parser_rejections_report_stable_profile_owned_structural_context() {
         assert!(!serialized.contains(sentinel));
     }
     assert!(serialized.len() < 16 * 1024);
-    assert_rejection_matches_schemas(&rejected_delta);
+    assert_rejection_matches_schema(&rejected_delta);
 
     let (_, result_correlation) = replay(
         &framed(&[
@@ -5246,7 +5354,7 @@ fn parser_rejections_report_stable_profile_owned_structural_context() {
             .to_string()
             .contains("SENTINEL_SUBAGENT_TEXT")
     );
-    assert_rejection_matches_schemas(&orphan_subagent);
+    assert_rejection_matches_schema(&orphan_subagent);
 
     // A main-thread message while a backgrounded command is still outstanding.
     let mut main_while_waiting = background_first_turn();
@@ -5262,7 +5370,7 @@ fn parser_rejections_report_stable_profile_owned_structural_context() {
     assert_eq!(state["eventThread"], "main");
     assert_eq!(state["outstandingBackgroundCommands"], 1);
     assert_eq!(state["outstandingBackgroundSubagents"], 0);
-    assert_rejection_matches_schemas(&main_while_waiting);
+    assert_rejection_matches_schema(&main_while_waiting);
 
     let (_, eof) = replay(
         &framed(&[init(QUALIFICATION_VERSION, SESSION_ID)]),
@@ -5274,7 +5382,7 @@ fn parser_rejections_report_stable_profile_owned_structural_context() {
     assert_eq!(eof["detail"]["stage"], "end_of_stream");
     assert!(eof["detail"].get("outerEvent").is_none());
     assert!(eof["detail"]["state"].get("eventThread").is_none());
-    assert_rejection_matches_schemas(&eof);
+    assert_rejection_matches_schema(&eof);
 }
 
 // REQ-AGENT-42
@@ -5295,7 +5403,7 @@ fn standard_input_write_rejections_match_the_published_schemas() {
         let rejection = protocol_rejection_value(&parser.finish(true));
         assert_eq!(rejection["detail"]["reason"], expected);
         assert_eq!(rejection["detail"]["stage"], "initial_input");
-        assert_rejection_matches_schemas(&rejection);
+        assert_rejection_matches_schema(&rejection);
     }
 }
 
@@ -5473,7 +5581,7 @@ fn rejection_retains_the_redacted_rejected_line_and_the_bounded_tail_before_it()
     members.sort();
     assert_eq!(members, ["detail", "profile", "schemaVersion"]);
     assert!(!rejection.to_string().contains("requesting"));
-    assert_rejection_matches_schemas(&rejection);
+    assert_rejection_matches_schema(&rejection);
 }
 
 // REQ-AGENT-71

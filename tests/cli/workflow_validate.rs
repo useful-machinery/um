@@ -442,6 +442,25 @@ fn edge_diagnostics_name_the_step_and_the_outcome() {
     assert_eq!(location["outcome"], "planned");
 }
 
+// REQ-WFFORMAT-80, REQ-WFFORMAT-102
+#[test]
+fn undeclared_node_environment_passthrough_names_the_step() {
+    let bundle = WorkflowBundle::valid();
+    bundle.replace_workflow(
+        "schemaVersion: 1\nenvironmentPassthrough: [TRACKER_TOKEN]\nsteps:\n  inspect:\n    kind: cmd\n    environmentPassthrough: [OTHER_TOKEN]\n    command: { argv: [\"true\"] }\n",
+    );
+
+    let output = validate(&bundle, true);
+    assert_eq!(output.status.code(), Some(1));
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let diagnostics = report["diagnostics"].as_array().unwrap();
+    assert_eq!(diagnostics.len(), 1);
+    assert_eq!(diagnostics[0]["code"], "environment_passthrough_undeclared");
+    let location = &diagnostics[0]["location"];
+    assert_eq!(location["kind"], "environment_passthrough");
+    assert_eq!(location["step"], "inspect");
+}
+
 // REQ-WFFORMAT-98, REQ-WFFORMAT-99
 #[test]
 fn for_each_diagnostics_name_the_step_and_its_input() {

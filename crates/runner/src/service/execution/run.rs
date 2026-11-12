@@ -111,7 +111,7 @@ impl ExecutionJob {
                 })
             })
             .collect();
-        let agent_staging = if self.accepted.admitted.agent_steps().is_empty() {
+        let agent_staging = if !self.accepted.admitted.requires_agent_runtime() {
             None
         } else {
             match AgentInputStaging::create(

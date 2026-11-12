@@ -6254,6 +6254,41 @@ async fn runner_executes_recovery_and_reports_exact_summary_and_invocations() {
     ));
 }
 
+// REQ-WFRECOVERY-63
+// INV-ENGINE-30 (AUTO-262)
+#[tokio::test]
+async fn runner_runs_a_workflow_whose_only_agent_is_a_recovery_handler() {
+    let workflow = |argv: Vec<String>| {
+        let argv = serde_json::to_string(&argv).unwrap();
+        format!(
+            "schemaVersion: 1\nagentProfiles:\n  repair:\n    harness:\n      kind: pi\n      config:\n        model: fixture/pi\n        thinking: high\nsteps:\n  verify:\n    kind: cmd\n    recovery:\n      retries: 1\n      handler:\n        kind: agent\n        profile: repair\n        prompt: system.md\n    command:\n      argv: {argv}\n"
+        )
+    };
+
+    let (temporary, mut manager) =
+        manager_fixture_with_pi(&workflow(command_fixture_arguments()), Some(SUCCESSFUL_PI));
+    let reports = offer_and_execute_with_command_fixtures(&mut manager, 1).await;
+    assert_succeeded(&reports);
+    assert!(!temporary.path().join("pi.calls").exists());
+
+    let (temporary, mut manager) = manager_fixture_with_pi(
+        &workflow(failing_command_fixture_arguments()),
+        Some(SUCCESSFUL_PI),
+    );
+    let reports = offer_and_execute_with_command_fixtures(&mut manager, 1).await;
+    assert!(
+        matches!(
+            reports.last(),
+            Some(ExecutionReport::Finished { outcome, .. })
+                if outcome["outcome"] == "failed"
+                    && outcome["recoverySummaries"]["verify"]["termination"]["kind"]
+                        == "handler_failed"
+        ),
+        "unexpected reports: {reports:#?}"
+    );
+    assert!(temporary.path().join("pi.calls").exists());
+}
+
 #[tokio::test]
 async fn failed_command_with_agent_finalizer_retains_the_workflow_failure() {
     let failing_argv = serde_json::to_string(&failing_command_fixture_arguments()).unwrap();
