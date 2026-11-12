@@ -8,6 +8,7 @@
         reason = "unit tests use Cargo-provided fixture paths and panic shortcuts"
     )
 )]
+#![cfg_attr(not(test), deny(clippy::large_futures))]
 
 mod control_client;
 mod control_protocol;

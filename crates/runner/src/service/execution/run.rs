@@ -351,9 +351,14 @@ impl ExecutionJob {
             );
             // Enabled and disabled execution carry distinct static dispatcher types;
             // keeping each engine call explicit avoids a dynamic adapter boundary.
+            // The engine future is heap-pinned here, before the wrappers take it:
+            // `run_under_lease` and `mark_engine_terminal` each keep the future they are
+            // given in their own state, so held inline it would be copied once per wrapper
+            // into the frames above the engine. A pin inside either wrapper would leave the
+            // full future in that wrapper's unresumed state.
             mark_engine_terminal(
                 run_under_lease(
-                    execute_workflow(
+                    Box::pin(execute_workflow(
                         self.accepted.admitted.clone(),
                         &artifacts,
                         &inputs,
@@ -363,7 +368,7 @@ impl ExecutionJob {
                         cloud_commit,
                         observer.clone(),
                         start,
-                    ),
+                    )),
                     &cancellation,
                     &self.lease_clock,
                     self.authority_updates.clone(),
@@ -380,10 +385,11 @@ impl ExecutionJob {
             )
             .await
         } else {
-            // See the enabled branch: the no-agent dispatcher is intentionally a different type.
+            // See the enabled branch: the no-agent dispatcher is intentionally a different type,
+            // and its engine future is heap-pinned for the same reason.
             mark_engine_terminal(
                 run_under_lease(
-                    execute_workflow(
+                    Box::pin(execute_workflow(
                         self.accepted.admitted.clone(),
                         &artifacts,
                         &inputs,
@@ -393,7 +399,7 @@ impl ExecutionJob {
                         cloud_commit,
                         observer.clone(),
                         start,
-                    ),
+                    )),
                     &cancellation,
                     &self.lease_clock,
                     self.authority_updates.clone(),

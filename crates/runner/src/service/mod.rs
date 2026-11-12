@@ -346,7 +346,7 @@ async fn run_until_cancelled(config: Config, service_version: &str) -> Result<()
     let recorder = Recorder::stderr(&boot_id, service_version);
     let lease_clock = LeaseClock::system().map_err(ServiceError::LeaseClock)?;
     let mut shutdown = ProcessShutdown::new()?;
-    run_connection_loop(
+    Box::pin(run_connection_loop(
         ConnectionLoopDependencies {
             config,
             frame_source,
@@ -360,7 +360,7 @@ async fn run_until_cancelled(config: Config, service_version: &str) -> Result<()
         &WebSocketConnector,
         Backoff::new(),
         &mut shutdown,
-    )
+    ))
     .await
 }
 
@@ -400,9 +400,13 @@ async fn run_connection_loop(
     backoff: Backoff,
     shutdown: &mut dyn Shutdown,
 ) -> Result<(), ServiceError> {
-    run_connection_loop_acquiring(dependencies, connector, backoff, shutdown, |root, boot| {
-        workspace::WorkRootLease::acquire(&root, &boot)
-    })
+    Box::pin(run_connection_loop_acquiring(
+        dependencies,
+        connector,
+        backoff,
+        shutdown,
+        |root, boot| workspace::WorkRootLease::acquire(&root, &boot),
+    ))
     .await
 }
 
@@ -469,13 +473,13 @@ where
     })
     .await;
     record_startup_retention(&dependencies.recorder, work_root.startup_retained());
-    let result = run_connection_loop_with_work_root(
+    let result = Box::pin(run_connection_loop_with_work_root(
         dependencies,
         connector,
         backoff,
         shutdown,
         Arc::clone(&work_root),
-    )
+    ))
     .await;
     if result.is_err() {
         work_root.cancel_cleanup();
@@ -771,16 +775,15 @@ async fn run_connection_loop_with_work_root(
                     if startup {
                         startup_reload_pending = false;
                     }
-                    match reload_dependencies
-                        .perform_while_connected(
-                            &config,
-                            &sequence,
-                            attempt.saturating_add(1),
-                            request,
-                            &mut connection,
-                            shutdown,
-                        )
-                        .await
+                    match Box::pin(reload_dependencies.perform_while_connected(
+                        &config,
+                        &sequence,
+                        attempt.saturating_add(1),
+                        request,
+                        &mut connection,
+                        shutdown,
+                    ))
+                    .await
                     {
                         ConnectedReloadResult::Continue => {}
                         ConnectedReloadResult::Promoted(promoted) => {
