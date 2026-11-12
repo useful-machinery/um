@@ -21,8 +21,7 @@ const WORKFLOW_PATH: &str = "workflows/build.yaml";
 
 mod continuation_command_tests {
     use super::*;
-    use std::io::{BufRead, BufReader, Read};
-    use std::net::{TcpListener, TcpStream};
+    use std::net::TcpListener;
     #[cfg(target_os = "linux")]
     use std::process::Stdio;
     #[cfg(target_os = "linux")]
@@ -117,32 +116,6 @@ mod continuation_command_tests {
         },"run":run})
     }
 
-    fn request(stream: &TcpStream) -> String {
-        stream
-            .set_read_timeout(Some(std::time::Duration::from_secs(10)))
-            .unwrap();
-        let mut reader = BufReader::new(stream.try_clone().unwrap());
-        let mut lines = String::new();
-        let mut length = 0;
-        loop {
-            let mut line = String::new();
-            reader.read_line(&mut line).unwrap();
-            assert!(!line.is_empty());
-            if line == "\r\n" {
-                break;
-            }
-            if line.to_ascii_lowercase().starts_with("content-length:") {
-                length = line.split(':').nth(1).unwrap().trim().parse().unwrap();
-            }
-            lines.push_str(&line);
-        }
-        let mut body = vec![0; length];
-        reader.read_exact(&mut body).unwrap();
-        lines.push_str("\r\n");
-        lines.push_str(std::str::from_utf8(&body).unwrap());
-        lines
-    }
-
     // Each accepted socket is a scripted response barrier, not a timed race.
     fn execute(steps: &[&str], args: &[&str]) -> (Output, Vec<String>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -158,7 +131,7 @@ mod continuation_command_tests {
             let mut requests = Vec::new();
             for step in steps {
                 let (mut stream, _) = listener.accept().unwrap();
-                let captured = request(&stream);
+                let captured = request_text(&mut stream);
                 if step == "truncated-401" {
                     stream.write_all(b"HTTP/1.1 401 Unauthorized\r\nContent-Type: application/problem+json\r\nContent-Length: 100\r\nConnection: close\r\n\r\n{}").unwrap();
                 } else if step != "lost" {
@@ -363,7 +336,7 @@ mod continuation_command_tests {
         let (release, released) = mpsc::sync_channel(0);
         let server = std::thread::spawn(move || {
             let (mut post, _) = listener.accept().unwrap();
-            let captured = request(&post);
+            let captured = request_text(&mut post);
             let key = header_value(&captured, "idempotency-key").to_owned();
             let location = format!(
                 "/v1/organizations/{ORGANIZATION_ID}/runs/{RUN_ID}/continuation-requests/{REQUEST_ID}"
@@ -379,8 +352,8 @@ mod continuation_command_tests {
                 &serde_json::to_vec(&envelope("preparing")).unwrap(),
             ))
             .unwrap();
-            let (get, _) = listener.accept().unwrap();
-            let observed = request(&get);
+            let (mut get, _) = listener.accept().unwrap();
+            let observed = request_text(&mut get);
             ready.send(()).unwrap();
             released.recv().unwrap();
             drop(get);
@@ -603,8 +576,7 @@ mod continuation_command_tests {
 
 mod retry_command_tests {
     use super::*;
-    use std::io::{BufRead, BufReader, Read};
-    use std::net::{TcpListener, TcpStream};
+    use std::net::TcpListener;
     use std::sync::mpsc;
 
     const REQUEST_ID: &str = "cmd_01k0z6r1w8f4jy2m7q9v3x5abc";
@@ -626,32 +598,6 @@ mod retry_command_tests {
         })
     }
 
-    fn read_request(stream: &TcpStream) -> String {
-        stream
-            .set_read_timeout(Some(std::time::Duration::from_secs(10)))
-            .unwrap();
-        let mut reader = BufReader::new(stream.try_clone().unwrap());
-        let mut lines = String::new();
-        let mut length = 0;
-        loop {
-            let mut line = String::new();
-            reader.read_line(&mut line).unwrap();
-            assert!(!line.is_empty(), "request ended before headers");
-            if line == "\r\n" {
-                break;
-            }
-            if line.to_ascii_lowercase().starts_with("content-length:") {
-                length = line.split(':').nth(1).unwrap().trim().parse().unwrap();
-            }
-            lines.push_str(&line);
-        }
-        let mut body = vec![0; length];
-        reader.read_exact(&mut body).unwrap();
-        lines.push_str("\r\n");
-        lines.push_str(std::str::from_utf8(&body).unwrap());
-        lines
-    }
-
     // A scripted TCP peer echoes the generated key, rather than predicting random input.
     // Each accepted connection is a synchronization point; an IO timeout only bounds a
     // broken fixture, never determines when an assertion is safe.
@@ -669,7 +615,7 @@ mod retry_command_tests {
             let mut requests = Vec::new();
             for (state, code) in script {
                 let (mut stream, _) = listener.accept().unwrap();
-                let lines = read_request(&stream);
+                let lines = request_text(&mut stream);
                 let key = lines.lines().find_map(|line| {
                     line.to_ascii_lowercase()
                         .strip_prefix("idempotency-key: ")
@@ -973,7 +919,7 @@ mod retry_command_tests {
         let (release, released) = mpsc::sync_channel(0);
         let server = std::thread::spawn(move || {
             let (mut post, _) = listener.accept().unwrap();
-            let request = read_request(&post);
+            let request = request_text(&mut post);
             let replacement = server_path.with_extension("replacement");
             write_credential_fixture_with_refresh_token(
                 &replacement,
@@ -1090,7 +1036,7 @@ mod retry_command_tests {
             let (release, released) = mpsc::sync_channel(0);
             let server = std::thread::spawn(move || {
                 let (mut post, _) = listener.accept().unwrap();
-                let request = read_request(&post);
+                let request = request_text(&mut post);
                 let key = header_value(&request, "idempotency-key").to_owned();
                 let mut requests = vec![request];
                 if after_acceptance {
@@ -1110,8 +1056,8 @@ mod retry_command_tests {
                     );
                     post.write_all(&response).unwrap();
                     drop(post);
-                    let (get, _) = listener.accept().unwrap();
-                    requests.push(read_request(&get));
+                    let (mut get, _) = listener.accept().unwrap();
+                    requests.push(request_text(&mut get));
                     ready.send(key.clone()).unwrap();
                     released.recv().unwrap();
                     drop(get);
@@ -1177,7 +1123,7 @@ mod retry_command_tests {
         let (release, released) = mpsc::sync_channel(0);
         let server = std::thread::spawn(move || {
             let (mut post, _) = listener.accept().unwrap();
-            let request = read_request(&post);
+            let request = request_text(&mut post);
             let key = header_value(&request, "idempotency-key");
             let location = format!(
                 "/v1/organizations/{ORGANIZATION_ID}/runs/{RUN_ID}/retry-requests/{REQUEST_ID}"
@@ -1263,6 +1209,10 @@ mod retry_command_tests {
             assert_eq!(requests.len(), 1);
         }
     }
+}
+
+fn request_text(stream: &mut std::net::TcpStream) -> String {
+    String::from_utf8(read_request(stream)).expect("scripted peer request should be UTF-8")
 }
 
 fn prepared_run(responses: Vec<Vec<u8>>) -> (ScriptedServer, tempfile::TempDir, String) {

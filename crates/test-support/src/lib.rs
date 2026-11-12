@@ -248,31 +248,41 @@ struct ScriptedResponse {
     response: Vec<u8>,
 }
 
+/// Reads one loopback HTTP request for a fixture thread its test joins, as
+/// `ScriptedHttpServer`'s is: a request that cannot be read panics and so
+/// fails the test at the fixture. A serve loop that must keep its listener
+/// for the whole test reads with [`try_read_request`] instead.
 #[allow(
-    clippy::disallowed_macros,
     clippy::expect_used,
-    reason = "the bounded loopback HTTP fixture must fail its invoking test on local I/O or request-size contract violations"
+    reason = "a joined loopback HTTP fixture thread must fail its invoking test when its request cannot be read"
 )]
 pub fn read_request(stream: &mut TcpStream) -> Vec<u8> {
-    stream
-        .set_read_timeout(Some(Duration::from_secs(2)))
-        .expect("fixture read timeout should be configurable");
+    try_read_request(stream).expect("request should be readable")
+}
+
+/// Frames one loopback HTTP request for a serve loop that must keep its
+/// listener for the whole test (INV-TESTING-22): a read that fails or times
+/// out, or a request past the size bound, returns the error, so the loop can
+/// skip the connection instead of dropping its address. The request ends at
+/// its declared `Content-Length`, or where the peer closed first.
+pub fn try_read_request(stream: &mut TcpStream) -> std::io::Result<Vec<u8>> {
+    stream.set_read_timeout(Some(Duration::from_secs(2)))?;
     let mut request = Vec::new();
     let mut buffer = [0_u8; 1024];
     let mut expected_length = None;
 
     loop {
-        let read = stream
-            .read(&mut buffer)
-            .expect("request should be readable");
+        let read = stream.read(&mut buffer)?;
         if read == 0 {
             break;
         }
         request.extend_from_slice(&buffer[..read]);
-        assert!(
-            request.len() <= MAX_REQUEST_BYTES,
-            "fixture request is unexpectedly large"
-        );
+        if request.len() > MAX_REQUEST_BYTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "fixture request is unexpectedly large",
+            ));
+        }
 
         if let Some(header_end) = request.windows(4).position(|part| part == b"\r\n\r\n") {
             let body_start = header_end + 4;
@@ -287,10 +297,12 @@ pub fn read_request(stream: &mut TcpStream) -> Vec<u8> {
                     })
                     .unwrap_or_default()
             });
-            assert!(
-                body_start.saturating_add(length) <= MAX_REQUEST_BYTES,
-                "fixture request declares an unexpectedly large body"
-            );
+            if body_start.saturating_add(length) > MAX_REQUEST_BYTES {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "fixture request declares an unexpectedly large body",
+                ));
+            }
             if request.len() >= body_start + length {
                 request.truncate(body_start + length);
                 break;
@@ -298,7 +310,7 @@ pub fn read_request(stream: &mut TcpStream) -> Vec<u8> {
         }
     }
 
-    request
+    Ok(request)
 }
 
 /// Holds a loopback port that refuses every connect for as long as the
@@ -423,5 +435,37 @@ mod tests {
                 .is_some_and(|message| message.contains("GET /api/v1/stray HTTP/1.1")),
             "{message:?}"
         );
+    }
+
+    // INV-TESTING-25
+    #[test]
+    fn a_request_declaring_a_body_past_the_bound_is_an_error_not_a_panic() -> std::io::Result<()> {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
+        let mut client = TcpStream::connect(listener.local_addr()?)?;
+        client.write_all(b"POST /graphql HTTP/1.1\r\nContent-Length: 131072\r\n\r\n")?;
+        let (mut server, _) = listener.accept()?;
+        let read = try_read_request(&mut server);
+        drop(client);
+        assert_eq!(
+            read.map_err(|error| error.kind()),
+            Err(ErrorKind::InvalidData)
+        );
+        Ok(())
+    }
+
+    // INV-TESTING-25
+    #[test]
+    fn a_request_ends_at_its_declared_length_while_the_peer_stays_open() -> std::io::Result<()> {
+        let head = b"POST /graphql HTTP/1.1\r\nContent-Length: 2\r\n\r\n";
+        let mut sent = head.to_vec();
+        sent.extend_from_slice(b"{}GET /next HTTP/1.1\r\n\r\n");
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
+        let mut client = TcpStream::connect(listener.local_addr()?)?;
+        client.write_all(&sent)?;
+        let (mut server, _) = listener.accept()?;
+        let request = try_read_request(&mut server)?;
+        drop(client);
+        assert_eq!(request, [&head[..], b"{}"].concat());
+        Ok(())
     }
 }

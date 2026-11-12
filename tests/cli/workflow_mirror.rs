@@ -3,7 +3,7 @@
 //! API and records each under the run's `mirror/`.
 
 use std::fs;
-use std::io::{BufRead as _, Read as _, Write as _};
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::{Arc, Mutex};
@@ -97,7 +97,17 @@ impl LinearStub {
         std::thread::spawn(move || {
             for stream in listener.incoming() {
                 let Ok(mut stream) = stream else { continue };
-                let Some((path, body)) = read_request(&stream) else {
+                // The thread is detached and holds the listener for the whole test, so a panic
+                // here would release the address while the test's `um` processes still aim at it
+                // (INV-TESTING-22): an unreadable connection is skipped and the next one served.
+                let request = match um_test_support::try_read_request(&mut stream) {
+                    Ok(request) => request,
+                    Err(error) => {
+                        eprintln!("LinearStub skipped an unreadable request: {error}");
+                        continue;
+                    }
+                };
+                let Some((path, body)) = parse_request(&request) else {
                     continue;
                 };
                 let (status, answer) = served.lock().unwrap().answer(&path, body);
@@ -195,29 +205,14 @@ impl StubState {
     }
 }
 
-/// The request's path and JSON body, read by its `Content-Length`.
-fn read_request(stream: &std::net::TcpStream) -> Option<(String, Value)> {
-    let mut reader = std::io::BufReader::new(stream.try_clone().ok()?);
-    let mut head = String::new();
-    loop {
-        let mut line = String::new();
-        if reader.read_line(&mut line).ok()? == 0 || line == "\r\n" {
-            break;
-        }
-        head.push_str(&line);
-    }
+/// The framed request's path and JSON body (`Null` when the body is not JSON), or `None` when
+/// the peer closed before a complete head or the request line names no path.
+fn parse_request(request: &[u8]) -> Option<(String, Value)> {
+    let head_end = request.windows(4).position(|part| part == b"\r\n\r\n")?;
+    let head = String::from_utf8_lossy(&request[..head_end]);
     let path = head.split(' ').nth(1)?.to_owned();
-    let length = head
-        .lines()
-        .find_map(|line| {
-            let (name, value) = line.split_once(':')?;
-            name.eq_ignore_ascii_case("content-length")
-                .then(|| value.trim().parse::<usize>().ok())?
-        })
-        .unwrap_or(0);
-    let mut body = vec![0; length];
-    reader.read_exact(&mut body).ok()?;
-    Some((path, serde_json::from_slice(&body).unwrap_or(Value::Null)))
+    let body = &request[head_end + 4..];
+    Some((path, serde_json::from_slice(body).unwrap_or(Value::Null)))
 }
 
 /// The engineering tree whose root's steps are `DESIGN_STAGE_STEPS`, with or without its

@@ -3122,7 +3122,7 @@ pub(super) struct QueueStub {
 
 impl QueueStub {
     pub(super) fn start(answer: QueueAnswer) -> Self {
-        use std::io::{BufRead as _, Write as _};
+        use std::io::Write as _;
 
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
@@ -3132,15 +3132,21 @@ impl QueueStub {
         std::thread::spawn(move || {
             for stream in listener.incoming() {
                 let Ok(mut stream) = stream else { continue };
-                let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
-                let mut head = String::new();
-                loop {
-                    let mut line = String::new();
-                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
-                        break;
+                // As in `LinearStub`: the thread is detached and holds the listener for the whole
+                // test, so a connection it cannot read is skipped, where a panic would release
+                // the address the test's `um` processes still aim at (INV-TESTING-22).
+                let request = match um_test_support::try_read_request(&mut stream) {
+                    Ok(request) => request,
+                    Err(error) => {
+                        eprintln!("QueueStub skipped an unreadable request: {error}");
+                        continue;
                     }
-                    head.push_str(&line);
-                }
+                };
+                let request = String::from_utf8_lossy(&request);
+                let head = request
+                    .split_once("\r\n\r\n")
+                    .map_or(&*request, |(head, _)| head)
+                    .to_owned();
                 let path = head.split(' ').nth(1).unwrap_or_default().to_owned();
                 served_requests.lock().unwrap().push(head);
                 let answer = *served_answer.lock().unwrap();
