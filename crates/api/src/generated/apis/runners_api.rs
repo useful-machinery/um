@@ -620,7 +620,7 @@ pub fn create_runner_registration(
     }
 }
 
-/// Permanently tombstones one pool only when it has no active runner registrations, current project assignments, or nonterminal runs. The request has no body, accepts no delegation attribution or reason, and never cascades to child resources. Exact completed replay reauthorizes the original principal, authenticator, organization, and owner role. A member's personal pool is answered `409` `runner-pool-personal` while its member has an active or suspended membership of the organization; once the membership has ended, the pool is deleted as any other.
+/// Permanently tombstones one pool only when it has no active runner registrations, current project assignments, or nonterminal runs. The request has no body, accepts no delegation attribution or reason, and never cascades to child resources. Exact completed replay reauthorizes the original principal, authenticator, organization, and owner role. A member's personal pool is answered `403` `forbidden` with `reason` `runner-pool-personal` while its member has an active or suspended membership of the organization; once the membership has ended, the pool is deleted as any other.
 pub fn delete_runner_pool(
     configuration: &configuration::Configuration,
     organization_ref: &str,
@@ -1461,7 +1461,7 @@ pub fn move_runner_registration(
     }
 }
 
-/// Replaces only the canonical name. An equivalent rename is a no-op that changes neither updatedAt nor audit history. Missing, cross-organization, inactive, and inaccessible resources share the not-found representation. A member's personal pool keeps the name the service chose: renaming it is answered `409` `runner-pool-personal`.
+/// Replaces only the canonical name. An equivalent rename is a no-op that changes neither updatedAt nor audit history. Missing, cross-organization, inactive, and inaccessible resources share the not-found representation. A member's personal pool keeps the name the service chose: renaming it is answered `403` `forbidden` with `reason` `runner-pool-personal`.
 pub fn rename_runner_pool(
     configuration: &configuration::Configuration,
     organization_ref: &str,

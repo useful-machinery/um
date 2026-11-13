@@ -258,6 +258,43 @@ fn name_lookup_stops_after_ten_pages() {
     assert_eq!(pages, 10);
 }
 
+// REQ-API-37, REQ-RUNNERPOOL-78
+#[test]
+fn forbidden_reason_narrows_only_the_reason_the_client_names() {
+    let forbidden = |reason: Option<&str>| {
+        let mut problem = serde_json::json!({
+            "type": "https://api.usefulmachinery.com/problems/forbidden",
+            "title": "Forbidden",
+            "status": 403
+        });
+        if let Some(reason) = reason {
+            problem["reason"] = serde_json::Value::from(reason);
+        }
+        serde_json::to_vec(&problem).unwrap()
+    };
+    for (reason, expected) in [
+        (Some("runner-pool-personal"), RunnerFailure::PoolPersonal),
+        (Some("a-later-reason"), RunnerFailure::Forbidden),
+        (None, RunnerFailure::Forbidden),
+    ] {
+        assert_eq!(
+            classify_runner_response(StatusCode::FORBIDDEN, &forbidden(reason)),
+            expected,
+            "{reason:?}"
+        );
+    }
+    let earlier_cloud = serde_json::to_vec(&serde_json::json!({
+        "type": "https://api.usefulmachinery.com/problems/runner-pool-personal",
+        "title": "Runner pool is personal",
+        "status": 409
+    }))
+    .unwrap();
+    assert_eq!(
+        classify_runner_response(StatusCode::CONFLICT, &earlier_cloud),
+        RunnerFailure::PoolPersonal
+    );
+}
+
 #[test]
 fn runner_client_requires_contracted_problem_types() {
     let body = serde_json::to_vec(&serde_json::json!({

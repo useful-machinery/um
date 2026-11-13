@@ -1868,21 +1868,27 @@ fn pool_member_commands_are_unknown_and_send_nothing() {
     }
 }
 
+/// The shared 403 `forbidden` problem whose `reason` names the personal-pool refusal.
+fn personal_pool_refusal_response() -> Vec<u8> {
+    problem_http_response(
+        "403 Forbidden",
+        serde_json::json!({
+            "type": "https://api.usefulmachinery.com/problems/forbidden",
+            "title": "Forbidden",
+            "status": 403,
+            "detail": "A member's personal runner pool cannot be renamed, or deleted while its member belongs to the organization.",
+            "reason": "runner-pool-personal"
+        }),
+    )
+}
+
 // REQ-RUNNERPOOL-78, REQ-RUNNERPOOL-84
 #[test]
 fn personal_pool_rename_refusal_exits_with_pool_personal() {
     for json in [true, false] {
-        let refused = problem_http_response(
-            "409 Conflict",
-            serde_json::json!({
-                "type": "https://api.usefulmachinery.com/problems/runner-pool-personal",
-                "title": "Runner pool is personal",
-                "status": 409
-            }),
-        );
         let (server, _directory, credential_path) = prepared_runner(vec![
             json_http_response("200 OK", personal_pool_body()),
-            refused,
+            personal_pool_refusal_response(),
         ]);
         let environment = deployment_environment(&server.api_url, &credential_path);
         let mut args = vec![
@@ -1914,6 +1920,45 @@ fn personal_pool_rename_refusal_exits_with_pool_personal() {
         assert_eq!(requests.len(), 2);
         assert!(requests[1].starts_with(&format!(
             "PATCH /api/v1/organizations/{ORGANIZATION}/runner-pools/{POOL_ID} HTTP/1.1\r\n"
+        )));
+    }
+}
+
+// REQ-RUNNERPOOL-78, REQ-RUNNERPOOL-84
+#[test]
+fn personal_pool_deletion_refusal_exits_with_pool_personal() {
+    for json in [true, false] {
+        let (server, _directory, credential_path) = prepared_runner(vec![
+            json_http_response("200 OK", personal_pool_body()),
+            personal_pool_refusal_response(),
+        ]);
+        let environment = deployment_environment(&server.api_url, &credential_path);
+        let mut args = vec!["runner", "pool", "delete", ORGANIZATION, POOL_ID, "--yes"];
+        if json {
+            args.push("--json");
+        }
+        args.push("--allow-insecure-http");
+
+        let output = run_with_env(&args, &environment);
+
+        assert_eq!(output.status.code(), Some(1));
+        if json {
+            assert!(output.stderr.is_empty());
+            let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(result["outcome"], "pool_personal");
+            assert_eq!(result["runnerPoolId"], POOL_ID);
+            assert!(result.get("commitment").is_none(), "{result}");
+        } else {
+            assert!(output.stdout.is_empty());
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(stderr.starts_with("error: "), "{stderr}");
+            assert!(stderr.contains(POOL_ID), "{stderr}");
+        }
+        let requests = server.finish();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].starts_with("GET "));
+        assert!(requests[1].starts_with(&format!(
+            "DELETE /api/v1/organizations/{ORGANIZATION}/runner-pools/{POOL_ID} HTTP/1.1\r\n"
         )));
     }
 }

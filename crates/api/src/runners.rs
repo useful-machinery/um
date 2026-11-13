@@ -24,6 +24,7 @@ const CREDENTIAL_TRANSITION_UNAVAILABLE: &str =
 const POOL_MOVE_UNAVAILABLE: &str =
     "https://api.usefulmachinery.com/problems/runner-pool-move-unavailable";
 const POOL_PERSONAL: &str = "https://api.usefulmachinery.com/problems/runner-pool-personal";
+const POOL_PERSONAL_REASON: &str = "runner-pool-personal";
 const POOL_PERSONAL_UNAVAILABLE: &str =
     "https://api.usefulmachinery.com/problems/runner-pool-personal-unavailable";
 
@@ -720,7 +721,10 @@ fn classify_runner_response(status: StatusCode, body: &[u8]) -> RunnerFailure {
     match (status, decoded.r#type.as_str()) {
         (StatusCode::BAD_REQUEST, BAD_REQUEST) => RunnerFailure::InvalidInput,
         (StatusCode::UNAUTHORIZED, UNAUTHORIZED) => RunnerFailure::Unauthenticated,
-        (StatusCode::FORBIDDEN, FORBIDDEN) => RunnerFailure::Forbidden,
+        (StatusCode::FORBIDDEN, FORBIDDEN) => match decoded.reason.as_deref() {
+            Some(POOL_PERSONAL_REASON) => RunnerFailure::PoolPersonal,
+            _ => RunnerFailure::Forbidden,
+        },
         (StatusCode::NOT_FOUND, NOT_FOUND) => RunnerFailure::NotFound,
         (StatusCode::CONFLICT, NAME_UNAVAILABLE) => RunnerFailure::NameUnavailable,
         (StatusCode::CONFLICT, QUANTITY_LIMIT_REACHED) => RunnerFailure::QuantityLimitReached,
@@ -731,6 +735,8 @@ fn classify_runner_response(status: StatusCode, body: &[u8]) -> RunnerFailure {
             RunnerFailure::CredentialTransitionUnavailable
         }
         (StatusCode::CONFLICT, POOL_MOVE_UNAVAILABLE) => RunnerFailure::PoolMoveUnavailable,
+        // A Cloud release before the 403 reason answers this 409; keep reading it until none
+        // is deployed.
         (StatusCode::CONFLICT, POOL_PERSONAL) => RunnerFailure::PoolPersonal,
         (StatusCode::CONFLICT, POOL_PERSONAL_UNAVAILABLE) => RunnerFailure::PoolPersonalUnavailable,
         (StatusCode::TOO_MANY_REQUESTS, RATE_LIMIT_EXCEEDED) => RunnerFailure::RateLimited,

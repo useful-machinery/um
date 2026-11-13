@@ -52,6 +52,9 @@ pub struct Problem {
     pub continuation_violations: Option<Vec<models::ContinuationAdmissionViolation>>,
     #[serde(rename = "workflow", skip_serializing_if = "Option::is_none")]
     pub workflow: Option<Box<models::WorkflowProblemDetail>>,
+    /// A stable slug that narrows a shared problem type, such as `runner-pool-personal` under `forbidden`. The `type` stays the value a client branches on; a client ignores a reason it does not name.
+    #[serde(rename = "reason", skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 impl Problem {
@@ -69,6 +72,7 @@ impl Problem {
             admission_diagnostic: None,
             continuation_violations: None,
             workflow: None,
+            reason: None,
         }
     }
 }

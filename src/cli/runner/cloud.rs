@@ -687,7 +687,7 @@ fn write_failure_with_context(
         RunnerFailure::PoolPersonal => (
             "pool_personal",
             None,
-            "error: a personal runner pool cannot be renamed or deleted\n\nUse another runner pool, or delete a personal pool only after its member has left the organization.".to_owned(),
+            "error: runner pool is a member's personal pool, which Cloud protects; nothing was renamed or deleted\n\nAn organization owner can delete this pool once its member has left the organization. Use another runner pool until then.".to_owned(),
             OutcomeClass::GeneralFailure,
         ),
         RunnerFailure::PoolPersonalUnavailable => (
