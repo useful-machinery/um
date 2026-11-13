@@ -1,5 +1,6 @@
 use std::fmt;
 use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 
 use url::Url;
@@ -79,6 +80,7 @@ impl fmt::Debug for Config {
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum ConfigError {
     InvalidOperatorConfiguration,
+    StateLockUnavailable,
     InvalidGatewayUrl,
     InsecureGatewayUrl,
     WorkRootUnavailable,
@@ -89,6 +91,9 @@ impl fmt::Display for ConfigError {
         match self {
             Self::InvalidOperatorConfiguration => {
                 formatter.write_str("runner operator configuration or protected state is invalid")
+            }
+            Self::StateLockUnavailable => {
+                fmt::Display::fmt(&crate::enrollment::EnrollmentError::StateLock, formatter)
             }
             Self::InvalidGatewayUrl => formatter.write_str("invalid runner gateway URL"),
             Self::InsecureGatewayUrl => {
@@ -104,9 +109,38 @@ impl fmt::Display for ConfigError {
 impl std::error::Error for ConfigError {}
 
 impl Config {
-    pub fn load(path: &Path) -> Result<Self, ConfigError> {
-        let enrolled = crate::enrollment::load_runner_service_configuration(path)
+    /// Whether the host the operator configuration at `path` describes holds
+    /// enrolled state: anything at its `runnerStatePath`, judged without the
+    /// state lock and without reading the state. Only a path that does not
+    /// exist answers `false`; a file of any kind, a dangling link or a path
+    /// that cannot be inspected answers `true`, so the load that follows names
+    /// the failure rather than the host being joined over.
+    pub fn holds_enrolled_state(path: &Path) -> Result<bool, ConfigError> {
+        let state_path = crate::enrollment::load_runner_state_path(path)
             .map_err(|_| ConfigError::InvalidOperatorConfiguration)?;
+        match fs::symlink_metadata(state_path) {
+            Ok(_) => Ok(true),
+            Err(error) => Ok(error.kind() != io::ErrorKind::NotFound),
+        }
+    }
+
+    /// Validates, for a host that holds no state yet, what [`Config::load`]
+    /// validates of the host before any state exists: that the operator
+    /// configuration at `path` reads and that its work root is an existing
+    /// directory. A host that fails here cannot serve, so it must not join.
+    pub fn validate_before_join(path: &Path) -> Result<(), ConfigError> {
+        let work_root = crate::enrollment::load_work_root(path)
+            .map_err(|_| ConfigError::InvalidOperatorConfiguration)?;
+        AssignmentConfig::new(&work_root).map(|_| ())
+    }
+
+    pub fn load(path: &Path) -> Result<Self, ConfigError> {
+        let enrolled = crate::enrollment::load_runner_service_configuration(path).map_err(
+            |error| match error {
+                crate::enrollment::EnrollmentError::StateLock => ConfigError::StateLockUnavailable,
+                _ => ConfigError::InvalidOperatorConfiguration,
+            },
+        )?;
         let credential = Credential::from_enrolled_state(
             &enrolled.runner_id,
             &enrolled.credential_id,
@@ -285,7 +319,9 @@ fn canonical_directory(path: &Path, failure: ConfigError) -> Result<PathBuf, Con
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
+    use std::fs::{self, Permissions};
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::PathBuf;
     use tempfile::TempDir;
 
     use super::{AssignmentConfig, Config, ConfigError, RepositoryUrlPolicy};
@@ -353,6 +389,117 @@ mod tests {
             AssignmentConfig::new(&temporary.path().join("missing")).unwrap_err(),
             ConfigError::WorkRootUnavailable,
         );
+    }
+
+    /// An operator configuration in a private directory whose state file and
+    /// work root do not exist yet.
+    struct Host {
+        _root: TempDir,
+        config: PathBuf,
+        state: PathBuf,
+    }
+
+    impl Host {
+        fn new() -> Self {
+            let root = tempfile::tempdir().unwrap();
+            fs::set_permissions(root.path(), Permissions::from_mode(0o700)).unwrap();
+            let config = root.path().join("runner.json");
+            let state = root.path().join("state/runner-state.json");
+            fs::write(
+                &config,
+                serde_json::to_vec(&serde_json::json!({
+                    "schemaVersion": 1,
+                    "deploymentMode": "development",
+                    "runnerStatePath": state,
+                    "controlSocketPath": root.path().join("run/runner.sock"),
+                    "workRoot": root.path().join("work")
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            Self {
+                _root: root,
+                config,
+                state,
+            }
+        }
+
+        fn write_state(&self, document: &serde_json::Value) {
+            let directory = self.state.parent().unwrap();
+            fs::create_dir(directory).unwrap();
+            fs::set_permissions(directory, Permissions::from_mode(0o700)).unwrap();
+            fs::write(&self.state, serde_json::to_vec(document).unwrap()).unwrap();
+            fs::set_permissions(&self.state, Permissions::from_mode(0o600)).unwrap();
+        }
+    }
+
+    // REQ-RUNNERENROLL-104
+    #[test]
+    fn a_host_holds_enrolled_state_when_its_state_file_is_present() {
+        let unenrolled = Host::new();
+        assert_eq!(Config::holds_enrolled_state(&unenrolled.config), Ok(false));
+
+        let empty = Host::new();
+        empty.write_state(&serde_json::json!({}));
+        assert_eq!(Config::holds_enrolled_state(&empty.config), Ok(true));
+        assert_eq!(
+            Config::load(&empty.config).unwrap_err(),
+            ConfigError::InvalidOperatorConfiguration,
+        );
+
+        let without_work_root = Host::new();
+        without_work_root.write_state(&serde_json::json!({
+            "schemaVersion": 1,
+            "runnerId": "rnr_01k0z6r1w8f4jy2m7q9v3x5abc",
+            "connectionUrl": "ws://127.0.0.1:8765/v1/runner/connect",
+            "currentCredential": {
+                "id": "rrc_01k0z6r1w8f4jy2m7q9v3x5abc",
+                "secret": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+                "activationId": "rna_01k0z6r1w8f4jy2m7q9v3x5abc",
+                "enrolledAt": "2026-08-06T12:00:00Z"
+            },
+            "updatedAt": "2026-08-06T12:00:00Z"
+        }));
+        assert_eq!(
+            Config::load(&without_work_root.config).unwrap_err(),
+            ConfigError::WorkRootUnavailable,
+        );
+        assert_eq!(
+            Config::holds_enrolled_state(&without_work_root.config),
+            Ok(true)
+        );
+    }
+
+    // REQ-RUNNERENROLL-104
+    #[test]
+    fn a_host_whose_operator_configuration_does_not_parse_holds_no_answer() {
+        let host = Host::new();
+        fs::write(&host.config, b"{").unwrap();
+        assert_eq!(
+            Config::holds_enrolled_state(&host.config),
+            Err(ConfigError::InvalidOperatorConfiguration),
+        );
+    }
+
+    // REQ-RUNNERENROLL-105
+    #[test]
+    fn a_host_is_checked_before_it_joins_for_a_work_root_that_is_a_directory() {
+        let host = Host::new();
+        let work_root = host.config.parent().unwrap().join("work");
+        assert_eq!(
+            Config::validate_before_join(&host.config),
+            Err(ConfigError::WorkRootUnavailable),
+        );
+
+        fs::write(&work_root, b"").unwrap();
+        assert_eq!(
+            Config::validate_before_join(&host.config),
+            Err(ConfigError::WorkRootUnavailable),
+        );
+
+        fs::remove_file(&work_root).unwrap();
+        fs::create_dir(&work_root).unwrap();
+        assert_eq!(Config::validate_before_join(&host.config), Ok(()));
     }
 
     #[test]

@@ -1128,6 +1128,77 @@ fn a_resent_join_answered_unauthorized_keeps_and_names_its_journal() {
 
 // REQ-RUNNERENROLL-97
 #[test]
+fn a_join_refused_gone_clears_its_journal_and_says_whether_it_was_resent() {
+    let server = ScriptedHttpServer::respond_in_sequence(vec![
+        empty_response("410 Gone"),
+        empty_response("400 Bad Request"),
+        empty_response("410 Gone"),
+    ]);
+    let fixture = EnrollmentFixture::new(&server, ACTIVATION_ID, future_time());
+    let start = || {
+        join_unless_enrolled(
+            &fixture.config_path,
+            join_key(&server, JOIN_KEY_ID, &future_time()),
+        )
+    };
+
+    // A first send refused: no earlier send can have registered a runner.
+    assert!(matches!(
+        start(),
+        Err(EnrollmentError::JoinRefused {
+            refusal: JoinRefusal::Gone,
+            resent: false,
+        })
+    ));
+    assert!(!fixture.journal_path().exists());
+    assert!(!fixture.state_path.exists());
+
+    // A staged join resent by the next start and refused: the earlier send may
+    // have registered a runner that Cloud has since deleted.
+    assert!(matches!(start(), Err(EnrollmentError::InvalidResponse)));
+    assert!(fixture.journal_path().exists());
+    assert!(matches!(
+        start(),
+        Err(EnrollmentError::JoinRefused {
+            refusal: JoinRefusal::Gone,
+            resent: true,
+        })
+    ));
+    assert!(!fixture.journal_path().exists());
+    assert!(!fixture.state_path.exists());
+    assert_eq!(server.finish().len(), 3);
+}
+
+// REQ-RUNNERENROLL-97
+#[test]
+fn a_staged_join_refused_unauthorized_names_its_journal_without_the_resend_remedy() {
+    let journal = PathBuf::from("/var/lib/um/runner-state.join.json");
+    let resend = ResendRemedy {
+        journal: &journal,
+        join_key_id: JOIN_KEY_ID,
+    }
+    .to_string();
+    let another_key = EnrollmentError::JoinJournalForAnotherKey {
+        journal: journal.clone(),
+        join_key_id: JOIN_KEY_ID.to_owned(),
+    }
+    .to_string();
+    let unauthorized = EnrollmentError::StagedJoinUnauthorized {
+        journal: journal.clone(),
+        join_key_id: JOIN_KEY_ID.to_owned(),
+    }
+    .to_string();
+
+    assert!(another_key.contains(&resend));
+    assert!(unauthorized.contains(&journal.display().to_string()));
+    assert!(unauthorized.contains(JOIN_KEY_ID));
+    // Cloud just rejected the token this start gave, so resending it with the
+    // same key cannot be the remedy.
+    assert!(!unauthorized.contains(&resend));
+}
+
+// REQ-RUNNERENROLL-97
+#[test]
 fn an_enrolled_host_removes_a_join_journal_its_state_already_holds() {
     let server = ScriptedHttpServer::respond_in_sequence(Vec::new());
     let fixture = EnrollmentFixture::new(&server, ACTIVATION_ID, future_time());
@@ -1260,4 +1331,39 @@ fn host_files_name_exactly_one_activation_or_join_key() {
             "{document}"
         );
     }
+}
+
+// REQ-RUNNERENROLL-106
+#[test]
+fn a_service_load_that_cannot_take_the_state_lock_names_the_lock() {
+    let server = ScriptedHttpServer::respond_in_sequence(Vec::new());
+    let fixture = EnrollmentFixture::new(&server, ACTIVATION_ID, future_time());
+    fixture.write_current_state();
+    let state_directory = fixture.state_path.parent().expect("state directory");
+    let lock = acquire_state_lock(&state_directory.join(LOCK_FILE)).expect("hold the state lock");
+
+    assert_eq!(
+        crate::Config::load(&fixture.config_path).map(|_| ()),
+        Err(crate::ConfigError::StateLockUnavailable),
+    );
+
+    drop(lock);
+    assert_eq!(
+        crate::Config::load(&fixture.config_path).map(|_| ()),
+        Err(crate::ConfigError::WorkRootUnavailable),
+    );
+    assert!(server.finish().is_empty());
+}
+
+// REQ-RUNNERENROLL-106
+#[test]
+fn an_unavailable_state_lock_renders_as_the_enrollment_lock_failure() {
+    assert_eq!(
+        crate::ConfigError::StateLockUnavailable.to_string(),
+        EnrollmentError::StateLock.to_string(),
+    );
+    assert_ne!(
+        crate::ConfigError::StateLockUnavailable.to_string(),
+        crate::ConfigError::InvalidOperatorConfiguration.to_string(),
+    );
 }

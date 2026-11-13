@@ -1012,6 +1012,176 @@ fn an_enrolled_host_serves_without_reading_its_join_key() {
     );
 }
 
+// REQ-RUNNERENROLL-104, REQ-RUNNERENROLL-30: a host whose state file is present
+// is enrolled even when its configuration or state does not load, so the start
+// fails with that cause and never reads its join key, whatever the key's condition.
+#[test]
+fn an_enrolled_host_that_does_not_load_fails_with_its_own_cause() {
+    let cloud = TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("http://{}", cloud.local_addr().unwrap());
+    let connection_url = format!("ws://{}/v1/runner/connect", cloud.local_addr().unwrap());
+    let artifact = join_key_artifact(&base, &future_expiry());
+
+    let remove_work_root = |host: &JoinHost| fs::remove_dir(host.root.path().join("work")).unwrap();
+    let remove_key_file = |host: &JoinHost| fs::remove_file(&host.key_file).unwrap();
+    let missing_key = JoinHost::new(&artifact);
+    remove_work_root(&missing_key);
+    remove_key_file(&missing_key);
+    let shared_key = JoinHost::new(&artifact);
+    remove_work_root(&shared_key);
+    fs::set_permissions(&shared_key.key_file, Permissions::from_mode(0o644)).unwrap();
+    let malformed_variable = JoinHost::new(&artifact);
+    remove_work_root(&malformed_variable);
+    let empty_state = JoinHost::new(&artifact);
+    remove_key_file(&empty_state);
+
+    // Each case: the host, the environment it starts with, whether it names
+    // its key file, and whether its state is overwritten with `{}`.
+    type Case<'a> = (&'a JoinHost, &'a [(&'a str, &'a str)], bool, bool);
+    let cases: [Case<'_>; 4] = [
+        (&missing_key, &[], true, false),
+        (&shared_key, &[], true, false),
+        (
+            &malformed_variable,
+            &[(JOIN_KEY_VARIABLE, "not a join key")],
+            false,
+            false,
+        ),
+        (&empty_state, &[], true, true),
+    ];
+    for (host, environment, with_key_file, empty) in cases {
+        host.write_enrolled_state(&connection_url);
+        if empty {
+            write_private_json(&host.state, &serde_json::json!({}));
+        }
+        let original = fs::read(&host.state).unwrap();
+        let key_file = host.key_file.to_string_lossy().into_owned();
+        let arguments: &[&str] = if with_key_file {
+            &["--join-key-file", &key_file]
+        } else {
+            &[]
+        };
+
+        let (exit, stderr) = host.serve(arguments, environment).wait_for_exit();
+
+        assert_eq!(exit.code(), Some(1), "{stderr}");
+        assert!(stderr.contains(&host.config), "{stderr}");
+        assert!(!stderr.contains(&key_file), "{stderr}");
+        assert!(!stderr.contains(JOIN_KEY_VARIABLE), "{stderr}");
+        assert_eq!(fs::read(&host.state).unwrap(), original);
+        assert!(!host.journal.exists());
+    }
+    cloud.set_nonblocking(true).unwrap();
+    assert_eq!(
+        cloud.accept().unwrap_err().kind(),
+        io::ErrorKind::WouldBlock
+    );
+}
+
+// REQ-RUNNERENROLL-105, REQ-RUNNERENROLL-30: a host with no state whose work
+// root does not exist fails with that cause before it reads its join key or
+// contacts Cloud, so it registers no runner, stages no join and writes no
+// state, and a join an earlier start staged stays as it was.
+#[test]
+fn a_host_without_a_work_root_fails_before_it_joins() {
+    let cloud = TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("http://{}", cloud.local_addr().unwrap());
+    let artifact = join_key_artifact(&base, &future_expiry());
+
+    let remove_work_root = |host: &JoinHost| fs::remove_dir(host.root.path().join("work")).unwrap();
+    let key_file = JoinHost::new(&artifact);
+    remove_work_root(&key_file);
+    let variable = JoinHost::new(&artifact);
+    remove_work_root(&variable);
+    let staged = JoinHost::new(&artifact);
+    remove_work_root(&staged);
+    let state_directory = staged.state.parent().unwrap();
+    fs::create_dir(state_directory).unwrap();
+    fs::set_permissions(state_directory, Permissions::from_mode(0o700)).unwrap();
+    staged.write_join_journal(&base, JOIN_SECRET);
+    let staged_journal = fs::read(&staged.journal).unwrap();
+    let missing_key = JoinHost::new(&artifact);
+    remove_work_root(&missing_key);
+    fs::remove_file(&missing_key.key_file).unwrap();
+
+    // Each case: the host, the environment it starts with, whether it names
+    // its key file, and the journal it must leave.
+    type Case<'a> = (
+        &'a JoinHost,
+        &'a [(&'a str, &'a str)],
+        bool,
+        Option<&'a [u8]>,
+    );
+    let cases: [Case<'_>; 4] = [
+        (&key_file, &[], true, None),
+        (
+            &variable,
+            &[(JOIN_KEY_VARIABLE, artifact.as_str())],
+            false,
+            None,
+        ),
+        (&staged, &[], true, Some(&staged_journal)),
+        (&missing_key, &[], true, None),
+    ];
+    for (host, environment, with_key_file, journal) in cases {
+        let key_file = host.key_file.to_string_lossy().into_owned();
+        let arguments: &[&str] = if with_key_file {
+            &["--join-key-file", &key_file]
+        } else {
+            &[]
+        };
+
+        let (exit, stderr) = host.serve(arguments, environment).wait_for_exit();
+
+        assert_eq!(exit.code(), Some(1), "{stderr}");
+        assert!(stderr.contains(&host.config), "{stderr}");
+        assert!(!stderr.contains(JOIN_SECRET), "{stderr}");
+        assert!(!stderr.contains(&key_file), "{stderr}");
+        assert!(!host.state.exists());
+        match journal {
+            Some(journal) => assert_eq!(fs::read(&host.journal).unwrap(), journal),
+            None => assert!(!host.journal.exists()),
+        }
+    }
+    cloud.set_nonblocking(true).unwrap();
+    assert_eq!(
+        cloud.accept().unwrap_err().kind(),
+        io::ErrorKind::WouldBlock
+    );
+}
+
+// REQ-RUNNERENROLL-105, REQ-RUNNERENROLL-30: a host with no state whose
+// operator configuration is missing or malformed fails with that cause before
+// it reads its join key, so a key file that is gone is never the failure.
+#[test]
+fn a_host_whose_configuration_does_not_read_fails_before_it_reads_its_join_key() {
+    let cloud = TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("http://{}", cloud.local_addr().unwrap());
+    let artifact = join_key_artifact(&base, &future_expiry());
+    let missing = JoinHost::new(&artifact);
+    fs::remove_file(&missing.config).unwrap();
+    let malformed = JoinHost::new(&artifact);
+    fs::write(&malformed.config, b"{").unwrap();
+
+    for host in [&missing, &malformed] {
+        fs::remove_file(&host.key_file).unwrap();
+        let key_file = host.key_file.to_string_lossy().into_owned();
+
+        let (exit, stderr) = host.serve_with_key_file().wait_for_exit();
+
+        assert_eq!(exit.code(), Some(1), "{stderr}");
+        assert!(stderr.contains(&host.config), "{stderr}");
+        assert!(!stderr.contains(&key_file), "{stderr}");
+        assert!(!host.state.exists());
+        assert!(!host.journal.exists());
+    }
+    cloud.set_nonblocking(true).unwrap();
+    assert_eq!(
+        cloud.accept().unwrap_err().kind(),
+        io::ErrorKind::WouldBlock
+    );
+}
+
 // REQ-RUNNERENROLL-97: the start of an enrolled host, with or without a join
 // key, removes the journal its own completed join left, a second copy of the
 // state's credential secret, and leaves a journal for another credential.

@@ -42,10 +42,11 @@ impl Command {
             std::env::var_os(JOIN_KEY_VARIABLE),
         )?;
         let config_path = super::operator_config_path(&self.config)?;
-        // A host that holds enrolled state serves with it and never reads its
-        // join key, so a key that is gone or unreadable does not stop it. The
-        // journal its own completed join left is removed first, as the second
-        // copy of the credential secret it is.
+        // A host whose state file is present holds enrolled state: it serves
+        // with it and never reads its join key, so a key that is gone or
+        // unreadable does not stop it, and a configuration or state that does
+        // not load is the start's failure. The journal its own completed join
+        // left is removed first, as the second copy of the credential secret it is.
         // Harness discovery runs before the operator configuration is judged,
         // so a start with an invalid configuration still reports what it found.
         let discover = || {
@@ -55,25 +56,40 @@ impl Command {
                 discover_and_validate_codex_installation,
             )
         };
+        let configuration_failure = |error| {
+            discover();
+            config_load_error(&config_path, error)
+        };
         let (config, (pi_installation, claude_code_installation, codex_installation)) =
-            match (Config::load(&config_path), join_key) {
-                (Ok(_), Some(JoinKeySource::Variable(_))) => {
-                    return Err(restart_without_join_key_variable().into());
+            match (Config::holds_enrolled_state(&config_path), join_key) {
+                (Err(error), _) => return Err(configuration_failure(error).into()),
+                // A host with no state file and no key has nothing to join
+                // with, so its configuration's load is the start's answer.
+                (Ok(true), join_key) | (Ok(false), join_key @ None) => {
+                    match (Config::load(&config_path), join_key) {
+                        (Err(error), _) => return Err(configuration_failure(error).into()),
+                        (Ok(_), Some(JoinKeySource::Variable(_))) => {
+                            return Err(restart_without_join_key_variable().into());
+                        }
+                        (Ok(config), _) => {
+                            um_runner::remove_completed_join_journal(&config_path)
+                                .context("remove the journal of the runner's completed join")?;
+                            (config, discover())
+                        }
+                    }
                 }
-                (Ok(config), _) => {
-                    um_runner::remove_completed_join_journal(&config_path)
-                        .context("remove the journal of the runner's completed join")?;
-                    (config, discover())
-                }
-                (Err(_), Some(join_key)) => {
+                // A host with no state file checks what it can of its
+                // configuration before it reads the key, in both images of a
+                // key given in the variable, so a host that cannot serve
+                // stages, sends and writes nothing.
+                (Ok(false), Some(join_key)) => {
+                    if let Err(error) = Config::validate_before_join(&config_path) {
+                        return Err(configuration_failure(error).into());
+                    }
                     let key = join_key.read()?;
                     let installations = discover();
                     join_unless_enrolled(&config_path, key)?;
                     (load_config(&config_path)?, installations)
-                }
-                (Err(error), None) => {
-                    discover();
-                    return Err(config_load_error(&config_path, error).into());
                 }
             };
         let config = configure_harness_installations(
@@ -219,20 +235,39 @@ fn join_unless_enrolled(
             write_join(&mut io::stderr().lock(), &response)?;
             Ok(())
         }
-        Err(EnrollmentError::JoinRefused(refusal)) => Err(anyhow::anyhow!(
-            "join runner pool with join key {join_key_id}: {}\ncode: {}\n\nNo runner was registered. Start the runner with a join key Cloud accepts.",
-            EnrollmentError::JoinRefused(refusal),
-            refusal.code()
-        )
-        .into()),
-        Err(error @ EnrollmentError::StagedJoinUnauthorized { .. }) => Err(anyhow::anyhow!(
-            "join runner pool with join key {join_key_id}: {error}\ncode: {}",
-            JoinRefusal::Unauthorized.code()
-        )
-        .into()),
-        Err(error) => Err(anyhow::Error::new(error)
-            .context(format!("join runner pool with join key {join_key_id}"))
-            .into()),
+        Err(error) => Err(join_failure(&join_key_id, error).into()),
+    }
+}
+
+/// Said of a refused join only when no earlier send of it can have reached
+/// Cloud: a resent join may have registered a runner Cloud has since deleted.
+const NO_RUNNER_REGISTERED: &str = "No runner was registered.";
+
+fn join_failure(join_key_id: &str, error: EnrollmentError) -> anyhow::Error {
+    match error {
+        error @ EnrollmentError::JoinRefused { refusal, resent } => {
+            let registration = if resent {
+                "Cloud holds no runner for this host's join: none was registered, or the one registered was deleted."
+            } else {
+                NO_RUNNER_REGISTERED
+            };
+            anyhow::anyhow!(
+                "join runner pool with join key {join_key_id}: {error}\ncode: {}\n\n{registration} Start the runner with a join key Cloud accepts.",
+                refusal.code()
+            )
+        }
+        // Cloud rejected the token this start gave, so starting again with the
+        // same key file or variable resends a join it rejects again.
+        EnrollmentError::StagedJoinUnauthorized {
+            ref journal,
+            ref join_key_id,
+        } => anyhow::anyhow!(
+            "join runner pool with join key {join_key_id}: {error}\ncode: {}\n\nCloud rejected the token this start gave for join key {join_key_id}, so the same join key file or {JOIN_KEY_VARIABLE} value will be rejected again. Start um runner serve with join key {join_key_id} as it was issued, which completes the staged join. Otherwise look in the pool for a runner that joined from this host and delete it if there is one, then remove {} and start the runner with a join key Cloud accepts.",
+            JoinRefusal::Unauthorized.code(),
+            journal.display()
+        ),
+        error => anyhow::Error::new(error)
+            .context(format!("join runner pool with join key {join_key_id}")),
     }
 }
 
@@ -411,6 +446,54 @@ mod tests {
         assert_eq!(config.pi_installation(), Some(&pi));
         assert_eq!(config.claude_code_installation(), None);
         assert_eq!(config.codex_installation(), None);
+    }
+
+    // REQ-RUNNERENROLL-97
+    #[test]
+    fn a_refused_join_claims_no_registration_only_when_no_earlier_send_can_have_registered() {
+        const JOIN_KEY_ID: &str = "rjk_01k0z6r1w8f4jy2m7q9v3x5abc";
+        for refusal in [
+            JoinRefusal::Unauthorized,
+            JoinRefusal::Gone,
+            JoinRefusal::Conflict,
+        ] {
+            for resent in [false, true] {
+                let failure = join_failure(
+                    JOIN_KEY_ID,
+                    EnrollmentError::JoinRefused { refusal, resent },
+                )
+                .to_string();
+
+                assert!(
+                    failure
+                        .lines()
+                        .any(|line| line == format!("code: {}", refusal.code())),
+                    "{failure}"
+                );
+                assert_eq!(failure.contains(NO_RUNNER_REGISTERED), !resent, "{failure}");
+            }
+        }
+
+        let journal = PathBuf::from("/var/lib/um/runner-state.join.json");
+        let failure = join_failure(
+            JOIN_KEY_ID,
+            EnrollmentError::StagedJoinUnauthorized {
+                journal: journal.clone(),
+                join_key_id: JOIN_KEY_ID.to_owned(),
+            },
+        )
+        .to_string();
+        assert!(
+            failure
+                .lines()
+                .any(|line| line == format!("code: {}", JoinRefusal::Unauthorized.code())),
+            "{failure}"
+        );
+        assert!(
+            failure.contains(&journal.display().to_string()),
+            "{failure}"
+        );
+        assert!(!failure.contains(NO_RUNNER_REGISTERED), "{failure}");
     }
 
     // REQ-RUNNERENROLL-97

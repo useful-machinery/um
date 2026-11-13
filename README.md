@@ -2508,7 +2508,11 @@ UM_RUNNER_JOIN_KEY="$BUILDERS_JOIN_KEY" um runner serve --config /etc/um/runner.
 On a host that holds no enrolled state, the service generates its credential, joins the
 key's pool as a new runner, writes enrolled state, and serves. On a host that already holds
 enrolled state, it serves with that state and ignores the key, so the same command can
-start the service every time. The key is read as an activation is: from a regular file
+start the service every time. A host that holds enrolled state never reads the key, and when
+its configuration or state does not load the start reports that cause. On a host that
+holds no enrolled state, the service checks the host's configuration, its work root
+included, before it reads the key or contacts Cloud, so a host that cannot serve registers
+no runner. The key is read as an activation is: from a regular file
 private to the current user, which is left in place, or from piped standard input with
 `--join-key-file -`; an interactive terminal is refused. Giving the key both ways is a
 usage error, and an expired key is refused before Cloud is contacted. The service reads
@@ -2524,6 +2528,16 @@ with a different key than the journal names is refused with the journal's path a
 key it names: start the service once more with that key, which resends the same join, or
 remove the journal after confirming in the pool that no runner joined from the host.
 `runner enroll` with an activation is refused the same way while that journal exists.
+
+A join resent from the journal, after an interrupted start or a lost response, may already
+have registered a runner. When Cloud rejects its token, the journal stays and the failure
+names it: the same key file or variable would be rejected again, so start the service with
+the key as it was issued, or delete any runner that joined from the host in the pool, remove
+the journal, and start with a key Cloud accepts. When Cloud refuses a resent join as gone,
+the key may be revoked or expired, its issuer may no longer issue a key for the pool, or the
+runner the earlier join registered may have been deleted; the journal is removed, and the
+failure says that Cloud holds no runner for the host's join rather than that none was
+registered.
 
 The connection URL, runner ID, and current credential come only from the enrolled state
 written by enrollment or by a join. There are no endpoint environment overrides or command-line aliases for the removed

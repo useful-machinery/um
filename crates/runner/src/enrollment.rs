@@ -827,9 +827,10 @@ impl JoinRefusal {
 /// leaves the state as it is and sends nothing. A staged join left by an
 /// interrupted start is resent before anything else, and an ambiguous outcome
 /// is resent with the service's reconnect backoff, so one host registers at
-/// most one runner. A definite refusal of a join that no earlier send can have
-/// registered clears the journal; a resent join whose token Cloud rejects
-/// keeps it. The key, and with it the token, is dropped when this returns.
+/// most one runner. A definite refusal clears the journal and says whether an
+/// earlier send can have reached Cloud, except that a resent join whose token
+/// Cloud rejects keeps it. The key, and with it the token, is dropped when this
+/// returns.
 pub fn join_unless_enrolled(
     config_path: &Path,
     key: JoinKeyArtifact,
@@ -888,7 +889,7 @@ pub fn join_unless_enrolled(
             Err(error) => return Err(error),
         };
         remove_and_sync(journal_path)?;
-        return Err(EnrollmentError::JoinRefused(refusal));
+        return Err(EnrollmentError::JoinRefused { refusal, resent });
     };
     drop(key);
     validate_enrollment_response(&response, None, mode)?;
@@ -1088,6 +1089,12 @@ pub fn load_control_socket_path(path: &Path) -> Result<PathBuf, EnrollmentError>
 /// configuration, read without taking the state lock or reading the state.
 pub(crate) fn load_runner_state_path(path: &Path) -> Result<PathBuf, EnrollmentError> {
     Ok(load_operator_config(path)?.runner_state_path)
+}
+
+/// The work root, `workRoot`, from the operator configuration, read without
+/// taking the state lock or reading the state.
+pub(crate) fn load_work_root(path: &Path) -> Result<PathBuf, EnrollmentError> {
+    Ok(load_operator_config(path)?.work_root)
 }
 
 pub fn replacement_disposition(
@@ -2130,7 +2137,14 @@ pub enum EnrollmentError {
         journal: PathBuf,
         join_key_id: String,
     },
-    JoinRefused(JoinRefusal),
+    /// Cloud refused the join definitely, and the journal is removed.
+    /// `resent` says whether an earlier send of the journal, in this start or
+    /// an earlier one, can have reached Cloud: only when it is false is it
+    /// certain that no runner was registered.
+    JoinRefused {
+        refusal: JoinRefusal,
+        resent: bool,
+    },
 }
 
 impl fmt::Display for EnrollmentError {
@@ -2183,14 +2197,14 @@ impl fmt::Display for EnrollmentError {
                 join_key_id,
             } => {
                 formatter.write_str("enrollment cannot resolve a staged join: ")?;
-                return write_staged_join(formatter, journal, join_key_id);
+                return write_staged_join_and_resend_remedy(formatter, journal, join_key_id);
             }
             Self::JoinJournalForAnotherKey {
                 journal,
                 join_key_id,
             } => {
                 formatter.write_str("this join key cannot resolve the host's staged join: ")?;
-                return write_staged_join(formatter, journal, join_key_id);
+                return write_staged_join_and_resend_remedy(formatter, journal, join_key_id);
             }
             Self::StagedJoinUnauthorized {
                 journal,
@@ -2201,11 +2215,26 @@ impl fmt::Display for EnrollmentError {
                 )?;
                 return write_staged_join(formatter, journal, join_key_id);
             }
-            Self::JoinRefused(JoinRefusal::Unauthorized) => "Cloud rejected the join key's token",
-            Self::JoinRefused(JoinRefusal::Gone) => {
+            Self::JoinRefused {
+                refusal: JoinRefusal::Unauthorized,
+                ..
+            } => "Cloud rejected the join key's token",
+            Self::JoinRefused {
+                refusal: JoinRefusal::Gone,
+                resent: false,
+            } => {
                 "the join key is revoked or expired, or its issuer may no longer issue a key for the pool"
             }
-            Self::JoinRefused(JoinRefusal::Conflict) => {
+            Self::JoinRefused {
+                refusal: JoinRefusal::Gone,
+                resent: true,
+            } => {
+                "the join key is revoked or expired, its issuer may no longer issue a key for the pool, or the runner this host's earlier join registered was deleted"
+            }
+            Self::JoinRefused {
+                refusal: JoinRefusal::Conflict,
+                ..
+            } => {
                 "the pool cannot admit the join: its member is not active or the organization is at its runner limit"
             }
         };
@@ -2216,18 +2245,56 @@ impl fmt::Display for EnrollmentError {
 impl Error for EnrollmentError {}
 
 // A staged join was written before its request was sent, so the host cannot
-// know whether Cloud registered a runner from it; the remedy keeps one host to
-// at most one runner. It names the key by id: the token is never kept.
+// know whether Cloud registered a runner from it. It names the key by id: the
+// token is never kept.
 fn write_staged_join(
     formatter: &mut fmt::Formatter<'_>,
     journal: &Path,
     join_key_id: &str,
 ) -> fmt::Result {
-    let journal = journal.display();
     write!(
         formatter,
-        "join journal {journal} was staged for join key {join_key_id}, and Cloud may already have registered a runner from it; start um runner serve once more with join key {join_key_id}, which resends the same join, or remove {journal} after confirming in the pool that no runner joined from this host"
+        "join journal {} was staged for join key {join_key_id}, and Cloud may already have registered a runner from it",
+        journal.display()
     )
+}
+
+fn write_staged_join_and_resend_remedy(
+    formatter: &mut fmt::Formatter<'_>,
+    journal: &Path,
+    join_key_id: &str,
+) -> fmt::Result {
+    write_staged_join(formatter, journal, join_key_id)?;
+    write!(
+        formatter,
+        "; {}",
+        ResendRemedy {
+            journal,
+            join_key_id
+        }
+    )
+}
+
+// The remedy for a staged join that a start could not send: resend it with its
+// own key, or clear it after checking the pool, so one host makes at most one
+// runner. It does not fit a join whose resent token Cloud rejected.
+struct ResendRemedy<'a> {
+    journal: &'a Path,
+    join_key_id: &'a str,
+}
+
+impl fmt::Display for ResendRemedy<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self {
+            journal,
+            join_key_id,
+        } = self;
+        write!(
+            formatter,
+            "start um runner serve once more with join key {join_key_id}, which resends the same join, or remove {} after confirming in the pool that no runner joined from this host",
+            journal.display()
+        )
+    }
 }
 
 #[cfg(test)]
