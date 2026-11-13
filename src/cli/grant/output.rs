@@ -663,8 +663,9 @@ pub(super) fn report(deployment: &str, failure: &MemberGrantFailure) -> ApiFailu
     }
 }
 
-/// Reports a grant operation's failure with the remedy a member can act on.
-pub(super) fn failure(
+/// Reports a grant operation's failure with the remedy a member can act on; `um runner doctor
+/// --grants` ends with it too (REQ-CREDREADY-22).
+pub(in crate::cli) fn failure(
     deployment: &str,
     failure: &MemberGrantFailure,
     json: bool,
@@ -763,6 +764,10 @@ pub(super) fn write_import_refusal(
 /// organization was resolved for its grant (REQ-GRANT-75).
 pub(super) const ORGANIZATION_REQUIRED: &str = "organization_required";
 
+/// The outcome of a provider `um grant create --workflow` passes over because every grant the
+/// member holds of it needs reconnecting and its replacement was not settled (REQ-GRANT-79).
+pub(super) const RECONNECT_REQUIRED: &str = "reconnect_required";
+
 /// Reports a coding agent passed over for want of an organization: as its `import_result`
 /// event, or on standard error with the `refusal` that says why and names `--organization`
 /// (REQ-GRANT-75).
@@ -836,20 +841,24 @@ impl<'a> CreateSummary<'a> {
     }
 }
 
-/// The providers `um grant create` without `PROVIDER` chose among, as its report names them.
+/// The providers `um grant create` without `PROVIDER` chose among, and the command that ran
+/// the choice, as its report names them.
 #[derive(Clone, Copy)]
-pub(super) enum Scope {
+pub(in crate::cli) enum Scope {
     /// Every provider (REQ-GRANT-75).
     Every,
     /// Those the `--workflow` files call for (REQ-GRANT-76).
     Workflows,
+    /// Those the `--workflow` files call for, from `um runner doctor --connect`
+    /// (REQ-CREDREADY-24).
+    Doctor,
 }
 
 impl Scope {
     const fn all_held(self) -> &'static str {
         match self {
             Self::Every => "✓ You already hold a grant of each provider.",
-            Self::Workflows => {
+            Self::Workflows | Self::Doctor => {
                 "✓ You already hold a grant of each provider the workflows call for."
             }
         }
@@ -859,13 +868,17 @@ impl Scope {
         match self {
             Self::Every => "um grant create",
             Self::Workflows => "um grant create --workflow FILE",
+            Self::Doctor => "um runner doctor --workflow FILE --connect",
         }
     }
 
-    const fn organization(self) -> &'static str {
+    pub(super) const fn organization(self) -> &'static str {
         match self {
             Self::Every => "um grant create --organization ORGANIZATION",
             Self::Workflows => "um grant create --workflow FILE --organization ORGANIZATION",
+            Self::Doctor => {
+                "um runner doctor --workflow FILE --connect --organization-id ORGANIZATION"
+            }
         }
     }
 }
@@ -884,10 +897,12 @@ fn native_remedy(provider: &str) -> Option<&'static str> {
     }
 }
 
-/// Prints one outcome per provider `um grant create` signed in to, after their own output,
-/// as the last JSON event or a report on standard output; `code` is the command's exit status
-/// (REQ-GRANT-75). The report's verdict claims each grant made only when every provider ended
-/// with one, and its remedies name what each other outcome present leaves to do.
+/// Prints one outcome per provider `um grant create` signed in to or passed over, after their
+/// own output, as the last JSON event or a report on standard output; `code` is the command's
+/// exit status (REQ-GRANT-75). The report's verdict claims each grant made only when every
+/// provider ended with one, created or `replaced`, and its remedies name what each other
+/// outcome present leaves to do, `um grant create PROVIDER --replace` for each provider passed
+/// over as `reconnect_required` (REQ-GRANT-79).
 pub(super) fn write_create_summary(
     deployment: &str,
     outcomes: &[(&'static str, &'static str)],
@@ -927,10 +942,13 @@ pub(super) fn write_create_summary(
     let started = with("started");
     let unavailable = with("provider_unavailable");
     let organization = with(ORGANIZATION_REQUIRED);
+    let reconnect = with(RECONNECT_REQUIRED);
     let failed = with("failed");
+    let made = |kinds: &[&str]| outcomes.iter().all(|(_, outcome)| kinds.contains(outcome));
     let verdict = match outcome {
-        "completed" if outcomes.iter().all(|(_, outcome)| *outcome == "created") => {
-            "✓ Signed in to each provider you lacked."
+        "completed" if made(&["created"]) => "✓ Signed in to each provider you lacked.",
+        "completed" if made(&["created", "replaced"]) => {
+            "✓ Signed in to each provider you lacked or reconnected."
         }
         "completed" => "! Not every provider you lacked has a grant yet.",
         "interrupted" | "terminated" => "✗ Stopped before each sign-in ended.",
@@ -963,6 +981,16 @@ pub(super) fn write_create_summary(
             organization.join(", "),
             scope.organization()
         )?;
+    }
+    if !reconnect.is_empty() {
+        writeln!(
+            stdout,
+            "\nYour grants of {} need reconnecting. Replace each with a new sign-in:",
+            reconnect.join(", ")
+        )?;
+        for provider in &reconnect {
+            writeln!(stdout, "  um grant create {provider} --replace")?;
+        }
     }
     for remedy in failed.iter().filter_map(|provider| native_remedy(provider)) {
         writeln!(stdout, "\n{remedy}")?;

@@ -1845,6 +1845,263 @@ async fn a_retry_of_a_waiting_run_removes_the_root_wait_record() {
     drop(owned);
 }
 
+// REQ-LOCALRUN-211, REQ-WFEXEC-73: an attempt that ends the run spends a withdrawal naming no
+// wait recorded after it settled by taking its `settledAt` again, so a retry's attempt reads
+// none pending; with none later than `settledAt`, or only one naming a wait, the state is left
+// byte for byte.
+#[test]
+fn spending_withdrawals_takes_settled_at_again_only_for_a_later_withdrawal() {
+    let fixture = AdmittedFixture::new();
+    let run_path = fixture.run_path("spent");
+    let run = InitialLocalRun::create(&run_path, &fixture.admitted).unwrap();
+    settle_as_workflow_failed(&run);
+    let settled = "2026-11-06T16:00:00Z";
+    run.state
+        .update(|state| {
+            current_attempt_mut(state)?.settled_at = Some(settled.to_owned());
+            Ok(())
+        })
+        .unwrap();
+    let withdraw = |at: &str, wait: Option<&str>| crate::workflow::wait::ControlEvent {
+        wait: wait.map(str::to_owned),
+        ..withdrawal_at(at)
+    };
+    let state_path = run_path.join(STATE_FILE);
+    for control in [
+        withdraw("2026-11-06T15:59:00Z", None),
+        withdraw("2026-11-06T16:01:00Z", Some("answer@2026-11-06T15:58:00Z")),
+    ] {
+        crate::workflow::wait::append_control(&run_path, &control).unwrap();
+        let before = fs::read(&state_path).unwrap();
+        run.spend_withdrawals().unwrap();
+        assert_eq!(fs::read(&state_path).unwrap(), before);
+    }
+
+    crate::workflow::wait::append_control(&run_path, &withdraw("2026-11-06T16:01:00Z", None))
+        .unwrap();
+    run.spend_withdrawals().unwrap();
+    let state = read_state(&open_directory_path(&run_path).unwrap()).unwrap();
+    let spent = state.attempts[0].settled_at.as_deref().unwrap();
+    assert!(
+        OffsetDateTime::parse(spent, &Rfc3339).unwrap()
+            > OffsetDateTime::parse("2026-11-06T16:01:00Z", &Rfc3339).unwrap(),
+        "{spent}"
+    );
+    drop(run);
+
+    let LocalRetryOpen::Acquired(pending) = acquire_local_retry(&run_path).unwrap() else {
+        panic!("a failed run should be retryable");
+    };
+    let Ok(retried) = pending.begin(&fixture.admitted) else {
+        panic!("the retry of a failed run did not begin");
+    };
+    assert!(!retried.withdrawal_pending().unwrap());
+}
+
+/// A `control.withdraw` naming no wait recorded at `at`, as `um workflow run withdraw` of a run
+/// that does not wait appends it.
+fn withdrawal_at(at: &str) -> crate::workflow::wait::ControlEvent {
+    crate::workflow::wait::ControlEvent {
+        source: "um".to_owned(),
+        event: crate::workflow::wait::CONTROL_WITHDRAW.to_owned(),
+        run: "run_01j0000000000000000000zzzz".to_owned(),
+        by: "saeed".to_owned(),
+        at: at.to_owned(),
+        wait: None,
+        payload: None,
+    }
+}
+
+// REQ-LOCALRUN-212, REQ-LOCALRUN-186, REQ-WFEXEC-73: a reader that does not own the latest
+// attempt answers as its owner while that attempt's span is open (unsettled, or `continued`
+// while the record does not read `exited`), counting a withdrawal recorded since the attempt
+// before it settled, and otherwise counts only one later than the latest attempt's `settledAt`.
+#[test]
+fn a_reader_counts_only_the_withdrawals_the_next_attempt_would_honor() {
+    let fixture = AdmittedFixture::new();
+    let run = InitialLocalRun::create(&fixture.run_path("reader"), &fixture.admitted).unwrap();
+    let base = read_state(run.root_handle()).unwrap().attempts.remove(0);
+    let mut earlier = base.clone();
+    earlier.state = AttemptStateV1::WorkflowFailed;
+    earlier.settled_at = Some("2026-11-06T15:00:00Z".to_owned());
+    // Pending for a withdrawal before the earlier attempt's `settledAt`, between it and the
+    // latest attempt's, and after the latest attempt's.
+    let withdrawn = [
+        "2026-11-06T14:30:00Z",
+        "2026-11-06T15:30:00Z",
+        "2026-11-06T16:30:00Z",
+    ];
+    let open = [false, true, true];
+    let settled = [false, false, true];
+    for (state, exited, expected) in [
+        (AttemptStateV1::Created, false, open),
+        (AttemptStateV1::Running, false, open),
+        (AttemptStateV1::Cancelling, false, open),
+        (AttemptStateV1::Continued, false, open),
+        (AttemptStateV1::Continued, true, settled),
+        (AttemptStateV1::Succeeded, true, settled),
+        (AttemptStateV1::WorkflowFailed, true, settled),
+        (AttemptStateV1::Cancelled, true, settled),
+        (AttemptStateV1::Interrupted, true, settled),
+        (AttemptStateV1::Rejected, true, settled),
+        (AttemptStateV1::Waiting, false, settled),
+    ] {
+        let mut latest = base.clone();
+        latest.state = state;
+        latest.settled_at = state
+            .is_terminal()
+            .then(|| "2026-11-06T16:00:00Z".to_owned());
+        let attempts = [earlier.clone(), latest];
+        for (at, pending) in withdrawn.into_iter().zip(expected) {
+            assert_eq!(
+                withdrawal_pending_for_reader(&attempts, &[withdrawal_at(at)], exited),
+                pending,
+                "{state:?}, exited {exited}, withdrawn at {at}"
+            );
+        }
+    }
+}
+
+/// The run record `end_running` leaves: `running` before it, `exited` with `outcome` and the
+/// attempt count unchanged after it.
+fn assert_ended(run_path: &Path, running: &Value, outcome: &str) {
+    assert_eq!(running["state"], json!("running"));
+    let mut ended = running.clone();
+    ended["state"] = json!("exited");
+    ended["outcome"] = json!(outcome);
+    assert_eq!(run_record_document(run_path), ended, "{outcome}");
+}
+
+// REQ-LOCALRUN-211, REQ-LOCALRUN-186, REQ-CONTINUE-2: ending a `running` run whose process is
+// gone marks the record `exited` with the outcome and settles its unsettled attempt as
+// interrupted, which spends the withdrawal recorded before; the run lock is released.
+#[test]
+fn ending_a_running_run_settles_its_unsettled_attempt_interrupted() {
+    let fixture = tree_fixture();
+    let run_path = fixture.run_path("ended-unsettled");
+    let _writable = WritableTreeCopyOnDrop(run_path.clone());
+    let record = tree_record(&fixture, None);
+    drop(InitialLocalRun::create_with_record(&run_path, &fixture.admitted, Some(&record)).unwrap());
+    let withdrawn = "2026-11-06T16:01:00Z";
+    crate::workflow::wait::append_control(&run_path, &withdrawal_at(withdrawn)).unwrap();
+    let running = run_record_document(&run_path);
+
+    acquired(&run_path).end_running(WITHDRAWN_OUTCOME).unwrap();
+    assert_ended(&run_path, &running, WITHDRAWN_OUTCOME);
+    let state = read_state(&open_directory_path(&run_path).unwrap()).unwrap();
+    assert_eq!(state.attempts.len(), 1);
+    let attempt = &state.attempts[0];
+    assert_eq!(attempt.state, AttemptStateV1::Interrupted);
+    assert_eq!(
+        attempt.interruption.as_ref().unwrap().cause,
+        InterruptionCauseV1::ExecutionOwnerLost
+    );
+    let settled = OffsetDateTime::parse(attempt.settled_at.as_deref().unwrap(), &Rfc3339).unwrap();
+    assert!(settled > OffsetDateTime::parse(withdrawn, &Rfc3339).unwrap());
+    // The run lock is released.
+    assert!(matches!(
+        acquire_local_retry(&run_path).unwrap(),
+        LocalRetryOpen::Acquired(_)
+    ));
+}
+
+// REQ-LOCALRUN-211, REQ-LOCALRUN-186, REQ-WFEXEC-73: ending a `running` run whose latest attempt
+// is terminal (as one that ended `continued` before its process was gone) marks the record
+// `exited` with the outcome and takes the attempt's `settledAt` again only when a withdrawal
+// naming no wait is later than it, so a retry's attempt reads none pending; otherwise the state
+// is left byte for byte.
+#[test]
+fn ending_a_running_run_spends_the_withdrawals_later_than_its_terminal_attempt() {
+    let fixture = tree_fixture();
+    let settled = "2026-11-06T16:00:00Z";
+    for (name, withdrawn, outcome) in [
+        ("ended-earlier", "2026-11-06T15:59:00Z", CANCELED_OUTCOME),
+        ("ended-later", "2026-11-06T16:01:00Z", WITHDRAWN_OUTCOME),
+    ] {
+        let run_path = fixture.run_path(name);
+        let _writable = WritableTreeCopyOnDrop(run_path.clone());
+        let record = tree_record(&fixture, None);
+        let run = InitialLocalRun::create_with_record(&run_path, &fixture.admitted, Some(&record))
+            .unwrap();
+        settle_as_workflow_failed(&run);
+        run.state
+            .update(|state| {
+                current_attempt_mut(state)?.settled_at = Some(settled.to_owned());
+                Ok(())
+            })
+            .unwrap();
+        drop(run);
+        crate::workflow::wait::append_control(&run_path, &withdrawal_at(withdrawn)).unwrap();
+        let state_path = run_path.join(STATE_FILE);
+        let before = fs::read(&state_path).unwrap();
+        let running = run_record_document(&run_path);
+
+        acquired(&run_path).end_running(outcome).unwrap();
+        assert_ended(&run_path, &running, outcome);
+        if withdrawn < settled {
+            assert_eq!(fs::read(&state_path).unwrap(), before, "{name}");
+        } else {
+            let state = read_state(&open_directory_path(&run_path).unwrap()).unwrap();
+            let attempt = &state.attempts[0];
+            assert_eq!(attempt.state, AttemptStateV1::WorkflowFailed);
+            let spent = attempt.settled_at.as_deref().unwrap();
+            assert!(
+                OffsetDateTime::parse(spent, &Rfc3339).unwrap()
+                    > OffsetDateTime::parse(withdrawn, &Rfc3339).unwrap(),
+                "{spent}"
+            );
+        }
+
+        // The run lock is released, and a retry's attempt reads no withdrawal pending.
+        let LocalRetryOpen::Acquired(pending) = acquire_local_retry(&run_path).unwrap() else {
+            panic!("the ended run should be retryable");
+        };
+        let Ok(retried) = pending.begin(&fixture.admitted) else {
+            panic!("the retry of the ended run did not begin");
+        };
+        assert!(!retried.withdrawal_pending().unwrap(), "{name}");
+    }
+}
+
+// REQ-LOCALRUN-213, REQ-LOCALRUN-186, REQ-WFEXEC-73: a command refused before its attempt begins
+// settles the abandoned attempt only when no withdrawal is unhonored over it. With one recorded,
+// `settle_abandoned` leaves the state byte for byte, so the same run's next continuation still
+// finds the withdrawal unhonored; without one it settles the attempt as interrupted.
+#[test]
+fn settling_an_abandoned_attempt_keeps_an_unhonored_withdrawal_pending() {
+    let fixture = tree_fixture();
+    for (name, withdrawn) in [("refused-withdrawn", true), ("refused", false)] {
+        let run_path = fixture.run_path(name);
+        let _writable = WritableTreeCopyOnDrop(run_path.clone());
+        let record = tree_record(&fixture, None);
+        drop(
+            InitialLocalRun::create_with_record(&run_path, &fixture.admitted, Some(&record))
+                .unwrap(),
+        );
+        if withdrawn {
+            crate::workflow::wait::append_control(
+                &run_path,
+                &withdrawal_at("2026-11-06T16:01:00Z"),
+            )
+            .unwrap();
+        }
+        let state_path = run_path.join(STATE_FILE);
+        let before = fs::read(&state_path).unwrap();
+
+        acquired(&run_path).settle_abandoned().unwrap();
+        let next = acquired(&run_path);
+        assert_eq!(next.withdrawal_unhonored().unwrap(), withdrawn, "{name}");
+        if withdrawn {
+            assert_eq!(fs::read(&state_path).unwrap(), before);
+        } else {
+            let state = read_state(&open_directory_path(&run_path).unwrap()).unwrap();
+            assert_eq!(state.attempts.len(), 1);
+            assert_eq!(state.attempts[0].state, AttemptStateV1::Interrupted);
+        }
+        assert_eq!(run_record_document(&run_path)["state"], json!("running"));
+    }
+}
+
 /// `TREE_ROOT_WORKFLOW` with `second` changed: a later revision of the same definition.
 const REVISED_TREE_ROOT_WORKFLOW: &str = "schemaVersion: 1\nprograms: [bin]\nexclude: [\"tests/\"]\nsteps:\n  first:\n    kind: cmd\n    command:\n      argv: [\"hello\"]\n  second:\n    kind: cmd\n    dependsOn: [first]\n    command:\n      argv: [\"false\"]\n";
 /// `TREE_ROOT_WORKFLOW` with `second` changed another way: a replacement or a stray revision.

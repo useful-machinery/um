@@ -781,6 +781,7 @@ fn create_and_supersede(
                 execution_root: Some(execution_root),
                 leaf: ExecutionLeaf::Restart,
                 edge: None,
+                bridge: None,
             },
             restarted_element,
         },

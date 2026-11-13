@@ -151,6 +151,7 @@ pub enum IssueRunnerJoinKeyError {
     Status409(models::Problem),
     Status413(models::Problem),
     Status415(models::Problem),
+    Status429(models::Problem),
     Status500(models::Problem),
     UnknownValue(serde_json::Value),
 }
@@ -900,7 +901,7 @@ pub fn get_runner_registration(
     }
 }
 
-/// Issues a join key for the pool. Any number of hosts may present it to join the pool as new runners until it expires or is revoked. The expiry, 60 seconds to 365 days from issue, and the time a runner it admitted may stay offline before removal, 300 seconds to 30 days, are set here and never change; a value outside its bounds is answered 400. Only the secret's digest is stored. The secret-bearing artifact is present only on the first completed response and is omitted from an exact idempotency replay. An owner may issue for any pool; a member only for their own personal pool, and is answered 403 for any other.
+/// Issues a join key for the pool. Any number of hosts may present it to join the pool as new runners until it expires or is revoked. The expiry, 60 seconds to 365 days from issue, and the time a runner it admitted may stay offline before removal, 300 seconds to 30 days, are set here and never change; a value outside its bounds is answered 400. Only the secret's digest is stored. The secret-bearing artifact is present only on the first completed response and is omitted from an exact idempotency replay. An owner may issue for any pool; a member only for their own personal pool, and is answered 403 for any other. A pool holds at most 20 live keys, those issued and not yet expired, and issues at most 20 keys in each fixed hour, in every deployment. An issuance for a pool holding 20 live keys is answered `409` `quantity-limit-reached` and one in an hour of 20 issuances `429` `rate-limit-exceeded` with `Retry-After`; either issues nothing. A revoked or expired key no longer counts toward the 20 live keys; an exact idempotency replay counts toward neither bound.
 pub fn issue_runner_join_key(
     configuration: &configuration::Configuration,
     organization_ref: &str,
@@ -970,7 +971,7 @@ pub fn issue_runner_join_key(
     }
 }
 
-/// The join key's token authenticates only this operation; a malformed, mismatched or unverifiable token is answered 401 without revealing whether the key exists. Any number of hosts may join with one key: each join registers a new enabled runner in the key's pool, with a name the service chooses, and creates its first credential from the SHA-256 verifier of a host-generated secret, never the complete rrc_ bearer. The answer is the enrollment response. A revoked or expired key is answered 410; a member's personal pool whose member is not an active member of the organization with an active account `409` `runner-pool-member-inactive`; an organization holding its registration quantity `409` `quantity-limit-reached`. A join counts toward the registration quantity and not toward the hourly registration creation rate. The exact repeat of a successful join, with the same key, idempotency key and verifier, answers with the runner it made and that runner's first credential and creates nothing, even after the key's revocation or expiry; once that runner is deleted the repeat is answered 410. The same idempotency key with another verifier is answered 409.
+/// The join key's token authenticates only this operation; a malformed, mismatched or unverifiable token is answered 401 without revealing whether the key exists. Any number of hosts may join with one key: each join registers a new enabled runner in the key's pool, with a name the service chooses, and creates its first credential from the SHA-256 verifier of a host-generated secret, never the complete rrc_ bearer. The answer is the enrollment response. A revoked or expired key is answered 410, as is a key whose issuer may no longer issue a key for its pool: one whose issuer is not an active member of the organization with an active account, or is neither an owner nor the member of the key's personal pool. Such a key still lists as `issued` and admits hosts again once its issuer could issue it again. A member's personal pool whose member is not an active member of the organization with an active account is answered `409` `runner-pool-member-inactive` first; an organization holding its registration quantity `409` `quantity-limit-reached`. A join counts toward the registration quantity and not toward the hourly registration creation rate. The exact repeat of a successful join, with the same key, idempotency key and verifier, answers with the runner it made and that runner's first credential and creates nothing, even after the key's revocation or expiry or a lapse of its issuer's authority; once that runner is deleted the repeat is answered 410. The same idempotency key with another verifier is answered 409.
 pub fn join_runner_pool(
     configuration: &configuration::Configuration,
     join_key_id: &str,

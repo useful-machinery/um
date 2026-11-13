@@ -1,13 +1,16 @@
+mod grants;
 mod readiness;
+pub(in crate::cli) mod roots;
 pub(in crate::cli) mod workflow;
 
 use std::io::{self, Write};
 use std::path::PathBuf;
 
 use anyhow::{Context, anyhow};
-use clap::Args;
+use clap::{ArgGroup, Args};
 use serde::Serialize;
 
+use super::super::grant::Flow;
 use super::super::{OrganizationArg, PrincipalAuthenticationArgs, ProjectArg};
 use crate::exit_code::ExitCode;
 use um_runner::{AgentLoginProvider, CheckResult, Report, Status, built_in_registry};
@@ -17,6 +20,14 @@ pub(super) const ABOUT: &str = "Check local runner prerequisites";
 const COMMAND_NAME: &str = "um runner doctor";
 
 #[derive(Debug, Args)]
+// `--organization-id` serves each Cloud read and the sign-ins (REQ-CREDREADY-13).
+#[command(group(
+    ArgGroup::new("cloud_read")
+        .args(["readiness", "grants", "connect"])
+        .multiple(true)
+))]
+// `--runner-id` narrows the grants report either prints (REQ-CREDREADY-23).
+#[command(group(ArgGroup::new("grants_read").args(["grants", "connect"]).multiple(true)))]
 pub(super) struct Command {
     #[arg(long = "check", value_name = "ID", help = "Run only the named check")]
     checks: Vec<String>,
@@ -24,7 +35,6 @@ pub(super) struct Command {
     #[arg(
         long = "workflow",
         value_name = "FILE",
-        requires = "source_root",
         conflicts_with_all = ["checks", "list_checks"],
         help = "Report the credentials a workflow and its child workflows need instead of running checks"
     )]
@@ -55,9 +65,39 @@ pub(super) struct Command {
 
     #[arg(
         long,
+        requires = "workflows",
+        help = "Show your grants for the providers the workflows need"
+    )]
+    grants: bool,
+
+    #[arg(
+        long,
+        requires = "workflows",
+        help = "Sign in to the providers the workflows need that you lack, then show your grants for them"
+    )]
+    connect: bool,
+
+    #[arg(
+        long,
+        requires = "connect",
+        help = "Replace each grant that needs reconnecting without asking"
+    )]
+    replace: bool,
+
+    #[arg(
+        long,
+        value_name = "RUNNER",
+        requires = "grants_read",
+        value_parser = super::super::grant::parse_runner_id,
+        help = "Show each grant's status on this runner alone, by ID as um runner list prints it"
+    )]
+    runner_id: Option<String>,
+
+    #[arg(
+        long,
         value_name = OrganizationArg::VALUE_NAME,
-        requires = "readiness",
-        help = "Organization whose connections --readiness reads, by ID or exact slug"
+        requires = "cloud_read",
+        help = "Organization whose connections --readiness reads, and whose coding agent grants --grants keeps and --connect makes, by ID or exact slug"
     )]
     organization_id: Option<OrganizationArg>,
 
@@ -75,32 +115,43 @@ pub(super) struct Command {
 
     // Doctor and enrollment have unrelated operation inputs and execution paths; sharing their
     // command shells would couple those contracts merely because both use runner JSON output.
-    // The authentication and HTTP options serve only --readiness.
+    // The authentication options serve only --readiness, the HTTP options it, --grants and
+    // --connect.
     #[command(flatten)]
     options: super::super::CommonArgs<super::super::RunnerJson, PrincipalAuthenticationArgs>,
 }
 
 impl Command {
     pub(super) fn execute(self) -> super::super::CommandResult {
-        // Flattened options cannot carry `requires`, so they are refused here (REQ-CREDREADY-13).
-        if !self.readiness {
-            let unrequested = if self.options.authentication.service_api_key_file.is_some() {
-                Some("--service-api-key-file")
-            } else if self.options.http.allow_insecure_http {
-                Some("--allow-insecure-http")
-            } else {
-                None
-            };
-            if let Some(option) = unrequested {
-                return Err(super::super::CommandFailure::with_exit_code(
-                    anyhow!("{option} requires --readiness"),
-                    ExitCode::UsageError,
-                ));
-            }
-        }
-        if let Some(source_root) = &self.source_root
-            && !self.workflows.is_empty()
+        // Flattened options cannot carry `requires`, so they are refused here (REQ-CREDREADY-13,
+        // REQ-CREDREADY-22, REQ-CREDREADY-24). The grants resource admits only a human session.
+        let service_api_key = self.options.authentication.service_api_key_file.is_some();
+        let refusal = if service_api_key && self.connect {
+            Some(
+                "--service-api-key-file cannot be used with --connect, which signs in with your own session",
+            )
+        } else if service_api_key && self.grants {
+            Some(
+                "--service-api-key-file cannot be used with --grants, which reads your grants with your own session",
+            )
+        } else if service_api_key && !self.readiness {
+            Some("--service-api-key-file requires --readiness")
+        } else if self.options.http.allow_insecure_http
+            && !self.readiness
+            && !self.grants
+            && !self.connect
         {
+            Some("--allow-insecure-http requires --readiness, --grants or --connect")
+        } else {
+            None
+        };
+        if let Some(refusal) = refusal {
+            return Err(super::super::CommandFailure::with_exit_code(
+                anyhow!(refusal),
+                ExitCode::UsageError,
+            ));
+        }
+        if !self.workflows.is_empty() {
             let readiness = self
                 .organization_id
                 .as_ref()
@@ -111,11 +162,28 @@ impl Command {
                     authentication: &self.options.authentication,
                     policy: self.options.http.transport_policy(),
                 });
+            // `--connect` prints the report of `--grants` once its sign-ins end (REQ-CREDREADY-25).
+            let grants = (self.grants || self.connect).then(|| grants::Request {
+                organization: self.organization_id.as_deref(),
+                runner: self.runner_id.as_deref(),
+                policy: self.options.http.transport_policy(),
+            });
+            // The flow's defaults hold for the rest: Codex signs in by browser or by device code
+            // as this machine allows, and each consent is waited for (REQ-CREDREADY-24).
+            let connect = self.connect.then(|| Flow {
+                json: self.options.json,
+                allow_insecure_http: self.options.http.allow_insecure_http,
+                organization: self.organization_id.as_deref(),
+                replace: self.replace,
+                ..Flow::default()
+            });
             return workflow::execute(
-                source_root,
+                self.source_root.as_deref(),
                 &self.workflows,
                 self.options.json,
                 readiness.as_ref(),
+                grants.as_ref(),
+                connect.as_ref(),
             );
         }
         let config = self

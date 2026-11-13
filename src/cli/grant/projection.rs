@@ -12,6 +12,7 @@ use um_api::{
     AgentLoginState, Grant, GrantReport, GrantState, MemberGrant, MemberGrantAuthorization,
     MemberGrantKind, MemberGrantState, provider_grant,
 };
+use um_runner::CredentialKind;
 use um_support::{Availability, CredentialStatus, NextAction};
 
 /// The status of an agent login's authorization in force, or of the agent login when it has
@@ -167,6 +168,18 @@ pub(in crate::cli) enum Provider {
 }
 
 impl Provider {
+    /// The provider whose grant a kind a workflow calls for names; `gitlab` is GitLab.com
+    /// (REQ-GRANT-76, REQ-CREDREADY-22).
+    pub(in crate::cli) const fn of_kind(kind: CredentialKind) -> Self {
+        match kind {
+            CredentialKind::Github => Self::Grant("github"),
+            CredentialKind::Gitlab => Self::Grant("gitlab.com"),
+            CredentialKind::Linear => Self::Grant("linear"),
+            CredentialKind::ClaudeCode => Self::CodingAgent("claude_code"),
+            CredentialKind::Codex => Self::CodingAgent("codex"),
+        }
+    }
+
     pub(in crate::cli) const fn name(self) -> &'static str {
         match self {
             Self::Grant(name) | Self::CodingAgent(name) => name,

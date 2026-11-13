@@ -5,6 +5,11 @@ use std::process::Output;
 use serde_json::{Value, json};
 use tempfile::TempDir;
 
+use super::grant::{
+    ENDED_RUNNER_ID, Git, IDENTITY_ID, LIST_FIRST_PAGE, NATIVE_GRANT_ID, OAUTH_GRANT_ID,
+    ORGANIZATION_ID, REVOKED_OAUTH_GRANT_ID, RUNNER_ID, SENTINEL, native_grant_in_use, oauth_grant,
+    page,
+};
 use super::{
     CREDENTIALS_FILE_VARIABLE, ScriptedServer, assert_no_secret_output,
     deployment_environment_with_issuer, fake_git, header_value, json_http_response,
@@ -555,7 +560,6 @@ fn runner_doctor_workflow_refuses_conflicting_or_incomplete_options() {
             "--list-checks",
         ]
         .as_slice(),
-        ["runner", "doctor", "--workflow", "main.yaml"].as_slice(),
         ["runner", "doctor", "--source-root", "."].as_slice(),
     ] {
         let output = run(arguments);
@@ -563,6 +567,59 @@ fn runner_doctor_workflow_refuses_conflicting_or_incomplete_options() {
         assert_eq!(output.status.code(), Some(2), "{arguments:?}");
         assert!(output.stdout.is_empty(), "{arguments:?}");
     }
+}
+
+// REQ-CREDREADY-1
+#[test]
+fn runner_doctor_workflow_bounds_its_files_by_their_git_repository() {
+    let tree = WorkflowTree::new();
+    fs::create_dir(tree.root.join(".git")).expect("Git marker should be created");
+    let git = Git::new();
+    let doctor = |options: &[&str]| {
+        let mut arguments = vec!["runner", "doctor", "--workflow", "main.yaml"];
+        arguments.extend_from_slice(options);
+        arguments.push("--json");
+        run_with_env_from(
+            &arguments,
+            &[
+                ("UM_API_URL", "partial-override-is-ignored"),
+                (CREDENTIALS_FILE_VARIABLE, "/dev/null/credentials.json"),
+                ("PATH", git_path(&git.0)),
+            ],
+            Some(&tree.root),
+        )
+    };
+    let bounded = doctor(&["--source-root", tree.root_argument()]);
+    assert_eq!(bounded.status.code(), Some(0), "{bounded:?}");
+    assert!(
+        !git.invocations()
+            .contains(&"rev-parse --show-toplevel".to_owned()),
+        "Git was asked for a root --source-root names"
+    );
+
+    let found = doctor(&[]);
+
+    assert_eq!(found.status.code(), Some(0), "{found:?}");
+    assert!(found.stderr.is_empty(), "{found:?}");
+    assert!(
+        git.invocations()
+            .contains(&"rev-parse --show-toplevel".to_owned()),
+        "Git was not asked for the root"
+    );
+    let (bounded, found) = (json_report(&bounded), json_report(&found));
+    for field in ["workflows", "requirements", "unknown"] {
+        assert_eq!(found[field], bounded[field], "{field}");
+    }
+
+    fs::remove_dir(tree.root.join(".git")).expect("Git marker should be removed");
+    let refused = doctor(&[]);
+
+    assert_eq!(refused.status.code(), Some(2), "{refused:?}");
+    assert!(refused.stdout.is_empty(), "{refused:?}");
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("--source-root"),
+        "{refused:?}"
+    );
 }
 
 /// Runs the scenario's doctor from its source root with a Git whose `origin` remote is
@@ -794,7 +851,7 @@ fn forbidden() -> Vec<u8> {
     )
 }
 
-fn connection_page(items: &[Value], next_cursor: Option<&str>) -> Vec<u8> {
+pub(super) fn connection_page(items: &[Value], next_cursor: Option<&str>) -> Vec<u8> {
     let mut body = json!({"items": items});
     if let Some(cursor) = next_cursor {
         body["nextCursor"] = cursor.into();
@@ -854,6 +911,20 @@ impl Deployment {
         options: &[&str],
         environment: &[(&str, &str)],
     ) -> Output {
+        let readiness = ["--readiness", "--organization-id", ORGANIZATION];
+        self.run_doctor(api_url, tree, json, &[&readiness, options], environment)
+    }
+
+    /// Runs the doctor of `tree` against the deployment at `api_url`, as `doctor_with` does,
+    /// with `options` in order after the source root.
+    fn run_doctor(
+        &self,
+        api_url: &str,
+        tree: &WorkflowTree,
+        json: bool,
+        options: &[&[&str]],
+        environment: &[(&str, &str)],
+    ) -> Output {
         let mut arguments = vec![
             "runner",
             "doctor",
@@ -861,12 +932,9 @@ impl Deployment {
             "main.yaml",
             "--source-root",
             tree.root_argument(),
-            "--readiness",
-            "--organization-id",
-            ORGANIZATION,
             "--allow-insecure-http",
         ];
-        arguments.extend_from_slice(options);
+        arguments.extend(options.iter().flat_map(|options| options.iter().copied()));
         if json {
             arguments.push("--json");
         }
@@ -880,6 +948,18 @@ impl Deployment {
         .to_vec();
         deployment_environment.extend_from_slice(environment);
         run_with_env_from(&arguments, &deployment_environment, Some(&tree.root))
+    }
+
+    /// Runs the grants read of `tree` against this deployment, with `options` after
+    /// `--grants`.
+    fn doctor_grants(&self, tree: &WorkflowTree, json: bool, options: &[&str]) -> Output {
+        self.run_doctor(
+            &self.server.api_url,
+            tree,
+            json,
+            &[&["--grants"], options],
+            &[],
+        )
     }
 
     /// The requests the deployment saw, in order, each carrying the session's bearer token.
@@ -906,7 +986,7 @@ impl Deployment {
 }
 
 /// The request lines of the organization's connection lists, up to the query or the version.
-const LINEAR_LIST: &str = "GET /api/v1/organizations/acme/connections/linear?limit=100";
+pub(super) const LINEAR_LIST: &str = "GET /api/v1/organizations/acme/connections/linear?limit=100";
 const GITLAB_LIST: &str = "GET /api/v1/organizations/acme/connections/gitlab?limit=100";
 const GITHUB_LIST: &str = "GET /api/v1/organizations/acme/github/installations HTTP/1.1\r\n";
 
@@ -915,7 +995,7 @@ fn json_report(output: &Output) -> Value {
 }
 
 /// The requirement of `kind` in a JSON report.
-fn requirement<'a>(report: &'a Value, kind: &str) -> &'a Value {
+pub(super) fn requirement<'a>(report: &'a Value, kind: &str) -> &'a Value {
     report["requirements"]
         .as_array()
         .expect("requirements should be an array")
@@ -1791,4 +1871,315 @@ fn runner_doctor_readiness_ends_as_project_show_does_for_an_unknown_project() {
     assert_eq!(requests.len(), 1, "{requests:?}");
     assert!(requests[0].starts_with(PROJECT_READ), "{}", requests[0]);
     shown.requests();
+}
+
+/// A tree that needs GitHub, by a required tool, Linear, by a forwarded key, and Codex, by an
+/// agent step.
+fn grants_tree() -> WorkflowTree {
+    single_file_tree(
+        &LINEAR_WORKFLOW
+            .replace(
+                "environmentPassthrough: [LINEAR_API_KEY]",
+                "environmentPassthrough: [LINEAR_API_KEY]\nrequires: {tools: [gh]}",
+            )
+            .replace("kind: claude_code", "kind: codex")
+            .replace("model: claude-opus-4-1", "model: gpt-5.4"),
+    )
+}
+
+/// The member's grants list: an active GitHub grant authorized for `RUNNER_ID`, a Codex grant
+/// that runner reported ready and accepted at its last use, and a revoked Linear grant.
+fn held_grants() -> Vec<u8> {
+    page(
+        &[
+            oauth_grant(OAUTH_GRANT_ID, "github", "active"),
+            oauth_grant(REVOKED_OAUTH_GRANT_ID, "linear", "revoked"),
+            native_grant_in_use(),
+        ],
+        None,
+    )
+}
+
+/// The requests the deployment saw, each of which must be the first page of the member's
+/// grants list with the session's bearer token.
+fn assert_only_grants_lists(deployment: Deployment, count: usize) {
+    let requests = deployment.requests();
+    assert_eq!(requests.len(), count, "{requests:?}");
+    for request in &requests {
+        assert!(request.starts_with(LIST_FIRST_PAGE), "{request}");
+    }
+}
+
+/// The one grant a requirement of `kind` reports.
+pub(super) fn held<'a>(report: &'a Value, kind: &str) -> &'a Value {
+    let grants = requirement(report, kind)["grant"]["grants"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{kind} carries no grants in {report}"));
+    assert_eq!(grants.len(), 1, "{kind}: {grants:?}");
+    &grants[0]
+}
+
+// REQ-CREDREADY-22, REQ-CREDREADY-18
+#[test]
+fn runner_doctor_grants_shows_the_members_grants_beside_each_requirement() {
+    let tree = grants_tree();
+    let offline = json_report(&doctor(&tree, true));
+    let deployment = Deployment::signed_in(vec![held_grants(), held_grants()]);
+
+    let output = deployment.doctor_grants(&tree, true, &[]);
+
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert!(output.stderr.is_empty(), "{output:?}");
+    assert_no_secret_output(&output, &[SENTINEL, SESSION_TOKEN]);
+    let report = json_report(&output);
+    assert_eq!(report["deployment"], deployment.server.api_url.as_str());
+    // A grant is a facet: no requirement's state, code or next action, and not the summary,
+    // changes (REQ-CREDREADY-18).
+    for kind in ["github", "linear", "codex"] {
+        for field in ["state", "code", "cloud", "nextAction"] {
+            assert_eq!(
+                requirement(&report, kind)[field],
+                requirement(&offline, kind)[field],
+                "{kind} {field}"
+            );
+        }
+    }
+    assert_eq!(report["summary"], offline["summary"]);
+    for (kind, id, generation, account, account_id) in [
+        ("github", OAUTH_GRANT_ID, 1, "identityId", IDENTITY_ID),
+        (
+            "codex",
+            NATIVE_GRANT_ID,
+            2,
+            "organizationId",
+            ORGANIZATION_ID,
+        ),
+    ] {
+        assert_eq!(requirement(&report, kind)["grant"]["provider"], kind);
+        let grant = held(&report, kind);
+        assert_eq!(grant["id"], id, "{kind}");
+        assert_eq!(grant["state"], "active", "{kind}");
+        assert_eq!(grant["generation"], generation, "{kind}");
+        assert_eq!(grant[account], account_id, "{kind}");
+        assert_eq!(
+            grant["authorizations"],
+            json!([{"runnerId": RUNNER_ID, "availability": "available", "nextAction": "none"}]),
+            "{kind}"
+        );
+        assert!(grant.get("availability").is_none(), "{grant}");
+    }
+    // The revoked Linear grant is not held.
+    assert_eq!(
+        requirement(&report, "linear")["grant"],
+        json!({"provider": "linear", "grants": [], "availability": "not_connected", "nextAction": "connect"})
+    );
+
+    let human = deployment.doctor_grants(&tree, false, &[]);
+
+    assert_eq!(human.status.code(), Some(0), "{human:?}");
+    assert_no_secret_output(&human, &[SENTINEL, SESSION_TOKEN]);
+    let stdout = String::from_utf8(human.stdout).expect("report should be UTF-8");
+    for fragment in [
+        OAUTH_GRANT_ID,
+        NATIVE_GRANT_ID,
+        RUNNER_ID,
+        "um grant create linear",
+        deployment.server.api_url.as_str(),
+    ] {
+        assert!(
+            stdout.contains(fragment),
+            "{fragment} missing from:\n{stdout}"
+        );
+    }
+    assert_only_grants_lists(deployment, 2);
+}
+
+// REQ-CREDREADY-22
+#[test]
+fn runner_doctor_grants_keeps_the_named_organizations_coding_agent_grants() {
+    let tree = grants_tree();
+    let deployment = Deployment::signed_in(vec![held_grants()]);
+
+    let output = deployment.doctor_grants(
+        &tree,
+        true,
+        &["--organization-id", "org_01k0z6r1w8f4jy2m7q9v3x5abd"],
+    );
+
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let report = json_report(&output);
+    assert_eq!(held(&report, "github")["id"], OAUTH_GRANT_ID);
+    assert_eq!(
+        requirement(&report, "codex")["grant"],
+        json!({"provider": "codex", "grants": [], "availability": "not_connected", "nextAction": "connect"})
+    );
+    // An organization named by ID is not read.
+    assert_only_grants_lists(deployment, 1);
+}
+
+// REQ-CREDREADY-23
+#[test]
+fn runner_doctor_grants_reports_each_grant_on_the_named_runner() {
+    let tree = grants_tree();
+    let mut github = oauth_grant(OAUTH_GRANT_ID, "github", "active");
+    github["authorizations"]
+        .as_array_mut()
+        .expect("authorizations should be an array")
+        .push(json!({
+            "id": "pga_01k0z6r1w8f4jy2m7q9v3x5abd",
+            "runnerId": "rnr_01k0z6r1w8f4jy2m7q9v3x5abe",
+            "organizationId": ORGANIZATION_ID,
+            "createdAt": "2026-11-01T08:06:00Z"
+        }));
+    let grants = || page(&[github.clone(), native_grant_in_use()], None);
+    let deployment = Deployment::signed_in(vec![grants(), grants()]);
+
+    let named = json_report(&deployment.doctor_grants(&tree, true, &["--runner-id", RUNNER_ID]));
+    // The runner whose authorization of the Codex grant ended holds neither grant.
+    let other =
+        json_report(&deployment.doctor_grants(&tree, true, &["--runner-id", ENDED_RUNNER_ID]));
+
+    for kind in ["github", "codex"] {
+        let grant = held(&named, kind);
+        assert_eq!(
+            grant["authorizations"],
+            json!([{"runnerId": RUNNER_ID, "availability": "available", "nextAction": "none"}]),
+            "{kind}"
+        );
+        assert!(grant.get("availability").is_none(), "{grant}");
+        let grant = held(&other, kind);
+        assert_eq!(grant["authorizations"], json!([]), "{kind}");
+        assert_eq!(grant["availability"], "not_connected", "{kind}");
+        assert_eq!(grant["nextAction"], "authorize_runner", "{kind}");
+    }
+    assert_only_grants_lists(deployment, 2);
+
+    let report = |state: &str, last_use: Option<&str>| {
+        let mut report =
+            json!({"state": state, "generation": 2, "reportedAt": "2026-11-02T10:07:00Z"});
+        if let Some(last_use) = last_use {
+            report["lastUse"] = last_use.into();
+        }
+        report
+    };
+    for (runner_report, availability, next_action) in [
+        (None, "pending", "wait_for_runner"),
+        (
+            Some(report("ready", Some("refused"))),
+            "reconnect_required",
+            "reconnect",
+        ),
+        (
+            Some(report("install_failed", None)),
+            "delivery_failed",
+            "sync_runner",
+        ),
+    ] {
+        let mut codex = native_grant_in_use();
+        let authorization = codex["authorizations"][0]
+            .as_object_mut()
+            .expect("authorization should be an object");
+        match &runner_report {
+            None => authorization.remove("report"),
+            Some(runner_report) => authorization.insert("report".to_owned(), runner_report.clone()),
+        };
+        let deployment = Deployment::signed_in(vec![page(&[codex], None)]);
+
+        let output = deployment.doctor_grants(&tree, true, &["--runner-id", RUNNER_ID]);
+
+        assert_eq!(output.status.code(), Some(0), "{output:?}");
+        let report = json_report(&output);
+        assert_eq!(
+            held(&report, "codex")["authorizations"],
+            json!([{"runnerId": RUNNER_ID, "availability": availability, "nextAction": next_action}]),
+            "{runner_report:?}"
+        );
+        assert_only_grants_lists(deployment, 1);
+    }
+}
+
+// REQ-CREDREADY-13, REQ-CREDREADY-22, REQ-CREDREADY-23
+#[test]
+fn runner_doctor_grants_refuses_incomplete_or_unrequested_options() {
+    let tree = grants_tree();
+    let deployment = Deployment::signed_in(Vec::new());
+    let service_key: &[&str] = &["--service-api-key-file", "/dev/null/key"];
+    let readiness: &[&str] = &["--readiness", "--organization-id", ORGANIZATION];
+    let cases: [&[&[&str]]; 5] = [
+        &[&["--grants"], service_key],
+        &[&["--grants"], readiness, service_key],
+        // With --readiness, so that only the grants read --runner-id needs is missing.
+        &[readiness, &["--runner-id", RUNNER_ID]],
+        &[&["--grants", "--runner-id", "builder-one"]],
+        &[&["--grants", "--project-id", PROJECT_ID]],
+    ];
+    for options in cases {
+        let output = deployment.run_doctor(&deployment.server.api_url, &tree, true, options, &[]);
+
+        assert_eq!(output.status.code(), Some(2), "{options:?}: {output:?}");
+        assert!(output.stdout.is_empty(), "{options:?}");
+    }
+    let output = run(&["runner", "doctor", "--grants"]);
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    assert!(output.stdout.is_empty(), "{output:?}");
+    assert!(deployment.server.finish().is_empty());
+}
+
+// REQ-CREDREADY-22
+#[test]
+fn runner_doctor_grants_ends_without_a_report_when_not_signed_in() {
+    let tree = grants_tree();
+    let signed_out = Deployment::new(Vec::new(), false);
+
+    let output = signed_out.doctor_grants(&tree, true, &[]);
+
+    assert_eq!(output.status.code(), Some(3), "{output:?}");
+    let failure = json_report(&output);
+    assert_eq!(failure["outcome"], "unauthenticated");
+    assert!(failure.get("requirements").is_none(), "{failure}");
+    let human = signed_out.doctor_grants(&tree, false, &[]);
+    assert_eq!(human.status.code(), Some(3), "{human:?}");
+    assert!(human.stdout.is_empty(), "{human:?}");
+    assert!(signed_out.server.finish().is_empty());
+}
+
+// REQ-CREDREADY-22
+#[test]
+fn runner_doctor_grants_asks_nothing_when_no_kind_is_needed() {
+    let tree = single_file_tree(
+        r#"schemaVersion: 1
+steps:
+  build:
+    kind: cmd
+    command:
+      argv: ["./build"]
+"#,
+    );
+    let deployment = Deployment::signed_in(Vec::new());
+
+    let output = deployment.doctor_grants(&tree, true, &[]);
+
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let report = json_report(&output);
+    assert_eq!(report["requirements"], json!([]));
+    assert_eq!(report["deployment"], Value::Null);
+    assert!(deployment.server.finish().is_empty());
+}
+
+// REQ-CREDREADY-7
+#[test]
+fn runner_doctor_workflow_names_the_grant_commands_for_each_coding_agent() {
+    let report = json_report(&doctor(&WorkflowTree::new(), true));
+
+    for kind in ["claude_code", "codex"] {
+        let next_action = next_action(requirement(&report, kind));
+        assert!(
+            next_action.contains(&format!("um grant create {kind}")),
+            "{kind}: {next_action}"
+        );
+        assert!(
+            next_action.contains("um grant authorize"),
+            "{kind}: {next_action}"
+        );
+    }
 }

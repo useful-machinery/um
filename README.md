@@ -959,9 +959,9 @@ um grant create claude_code --token-file - --organization acme < token.txt
 # over, and the consents still run. The command ends with one outcome per provider and exits 1
 # when any sign-in failed or every provider selected was passed over; an interrupt or a
 # termination signal during a sign-in ends it there with status 130 or 143. --device applies to
-# the Codex sign-in; --no-wait and --timeout apply to the consents. --from-file, --token-file
-# and --replace need a provider. With --json each provider's events are followed by a summary
-# event.
+# the Codex sign-in; --no-wait and --timeout apply to the consents. --from-file and --token-file
+# need a provider, and --replace a provider or --workflow. With --json each provider's events
+# are followed by a summary event.
 um grant create
 um grant create --all --organization acme --json
 
@@ -973,9 +973,16 @@ um grant create --all --organization acme --json
 # run. Without --source-root each file is bounded by the root of the Git repository that holds
 # it, and a file in no repository is refused with exit 2. A file that does not resolve is
 # reported as um workflow validate reports it, with exit 1. --workflow does not take a provider.
-# With --json the plan is a first workflow_requirements event.
+# A provider every grant of which you hold needs reconnecting (its consent lapsed, or a runner
+# reported its login refused) is planned to reconnect: on a terminal the command asks first,
+# before any sign-in, and --replace replaces it without asking, storing the sign-in as the
+# grant's next generation so it keeps its ID and its runners; it never replaces a healthy
+# grant. One you keep is reported reconnect_required, naming um grant create PROVIDER
+# --replace. With --json the plan is a first workflow_requirements event, whose selected,
+# reconnect and held arrays name each provider and what calls for it.
 um grant create --workflow workflow.yaml --workflow ../other/workflow.yaml
 um grant create --workflow workflow.yaml --source-root . --json
+um grant create --workflow workflow.yaml --replace
 
 # List every grant you hold: its ID, provider, kind, the account it acts as (an OAuth grant's
 # linked identity, a native grant's organization), its state and generation, and each runner
@@ -2307,15 +2314,18 @@ um runner doctor --list-checks
 um runner doctor --json
 ```
 
-With `--workflow FILE --source-root ROOT` the doctor runs no check and instead lists the
-credentials a workflow tree needs: it resolves each named workflow and every child workflow
+With `--workflow FILE` the doctor runs no check and instead lists the credentials a workflow
+tree needs: it resolves each named workflow and every child workflow
 its `workflow` steps name, as `um workflow validate` does, and reports one requirement per
 kind (`github`, `gitlab`, `linear`, `claude_code`, `codex`) with every declaration that calls
 for it, followed by the nodes and forwarded variables whose credentials it cannot see. Agent
 profiles on Claude Code or Codex and credential-like names in the root
 `environmentPassthrough` count; nothing runs, no harness sign-in or variable value is read,
 and Cloud is not contacted, so every requirement reads `unverified` with a next action.
-Repeat `--workflow` to cover several files; `--json` prints the same as one document.
+Repeat `--workflow` to cover several files; `--json` prints the same as one document. Each
+file is bounded by the root of the Git repository that holds it, files of several repositories
+are listed together, and a file in no repository is refused; `--source-root ROOT` names the
+boundary instead.
 
 With `--readiness --organization-id ORGANIZATION` the doctor also asks Useful Machinery, as
 the signed-in member or, with `--service-api-key-file`, a service principal, about the
@@ -2330,19 +2340,55 @@ owner may list GitHub App installations. Add `--project-id PROJECT` to take the 
 provider from the project's repository instead of the `origin` remote: an unavailable
 repository reads `reconnect_required` with code `repository_unavailable`, or `unverified`
 with code `provider_unavailable` while the deployment's GitLab admission is closed, and names
-`um project repository show`. Without `--readiness` nothing is contacted.
+`um project repository show`.
+
+With `--grants` the doctor also reads your own grants and shows, beneath each requirement, what
+you hold of its provider: each grant with, for every runner it is authorized for, its
+availability and next action as `um grant list` reports them, or `not_connected` with the
+`um grant create` command that makes one. Add `--runner-id RUNNER`, the runner's ID as
+`um runner list` prints it, to see each grant's status on that runner alone, or
+`not_connected` with the `um grant authorize` command when it is not authorized there;
+`--organization-id` keeps only that organization's coding agent grants. Your grants never
+change a requirement's state or the exit status, and `--grants` uses your own sign-in, never a
+service API key.
+
+With `--connect` the doctor signs you in to what the workflows need and then checks again. It
+runs the flow `um grant create --workflow` runs over the same files: it prints the plan of the
+providers to sign in to, to reconnect and already held, runs the same sign-ins in the same
+order, and prints the same summary. `--organization-id ORGANIZATION` names the organization of
+a coding agent's grant, and `--replace` replaces each grant that needs reconnecting without
+asking. Once the sign-ins end it reads your grants again and prints the `--grants` report,
+with the organization's connections when `--readiness` is given; add `--runner-id RUNNER` to
+see each grant's status on that runner. With `--json` every line is one JSON document: the
+events `um grant create --workflow --json` prints, then the report as a last event `report`.
+A failure before the summary, or a signal that stops a sign-in, ends the command with that
+status and no report. Otherwise it exits 1 when a sign-in failed, when every provider selected
+was passed over, or when `--readiness` finds a requirement failing, and 0 otherwise.
+`--connect` uses your own sign-in, never a service API key. The doctor runs no step of the
+workflow in any mode, and it does not authorize a runner: the report names the
+`um grant authorize` command that does. Without `--readiness`, `--grants` or `--connect`
+nothing is contacted.
 
 ```sh
 # List the credentials a workflow tree needs without running it.
+um runner doctor --workflow workflow.yaml
+
+# Bound the files by a directory other than their Git repository.
 um runner doctor --workflow workflow.yaml --source-root .
 
 # Also check the organization's connections for the providers it needs.
-um runner doctor --workflow workflow.yaml --source-root . \
+um runner doctor --workflow workflow.yaml \
   --readiness --organization-id acme
 
 # Take the repository's provider from a project instead of the origin remote.
-um runner doctor --workflow workflow.yaml --source-root . \
+um runner doctor --workflow workflow.yaml \
   --readiness --organization-id acme --project-id PROJECT
+
+# Show your grants for the providers it needs, and their status on one runner.
+um runner doctor --workflow workflow.yaml --grants --runner-id RUNNER
+
+# Sign in to what it lacks, replace what needs reconnecting, and report again.
+um runner doctor --workflow workflow.yaml --connect --replace --runner-id RUNNER
 ```
 
 A selected harness check identifies its execution profile and compatibility policy in
@@ -2370,7 +2416,8 @@ never reads the runner credential, contacts nothing, and reports no login materi
 
 Checks are registered statically by components compiled into this executable. The
 command does not load plugins or change runner configuration, and it reads human
-credentials and contacts Useful Machinery only for `--readiness`. It executes `git --version` with a five-second deadline, bounds
+credentials and contacts Useful Machinery only for `--readiness`, `--grants` or
+`--connect`. It executes `git --version` with a five-second deadline, bounds
 captured standard output, drains standard error without reporting it, and exposes only
 a normalized numeric version in its report.
 

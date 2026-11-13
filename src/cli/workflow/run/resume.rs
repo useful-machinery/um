@@ -5,14 +5,15 @@ use clap::Args;
 use serde::Serialize;
 use um_execution::{
     AdmittedWorkflow, CONTROL_WITHDRAW, CancellationSource, ContinuationDefinitionMode,
-    ContinuationEdgeV1, ContinuationReasonV1, LocalContinuationOpen, PendingLocalContinuation,
-    ResolvedBy, ResolvedInputs, ResolvedWorkflow, RunState, UntestedHarnessAdvisory, ValidatedTree,
+    ContinuationEdgeV1, ContinuationReasonV1, ControlsLock, LocalAttemptOwner,
+    LocalContinuationOpen, LocalRetryBeginError, PendingLocalContinuation, ResolvedBy,
+    ResolvedInputs, ResolvedWorkflow, RunState, UntestedHarnessAdvisory, ValidatedTree,
     WITHDRAWN_OUTCOME, WaitInspection, WaitProbe, WaitRecord, WorkflowRunOutput,
-    WorkflowRunPresentationResult, acquire_local_continuation, admit_local_continuation_workflow,
-    await_run_lock_gate, inspect_wait, latest_child_run, normalize_terminal_path,
-    normalize_terminal_scalar, positioned_element, read_local_run_status,
-    reconcile_current_result_publication, resolve_workflow_file_with_agent_profiles,
-    superseded_rejection_message,
+    WorkflowRunPresentationResult, acquire_local_continuation_bridged,
+    admit_local_continuation_workflow, await_begin_gate, await_run_lock_gate, inspect_wait,
+    latest_child_run, normalize_terminal_path, normalize_terminal_scalar, positioned_element,
+    read_local_run_status, reconcile_current_result_publication,
+    resolve_workflow_file_with_agent_profiles, superseded_rejection_message,
 };
 
 use super::super::super::OrganizationArg;
@@ -58,6 +59,14 @@ pub(super) fn continuation_output(
             output.for_resume(run_directory)
         }
     }
+}
+
+/// What the blocking closure that begins a continuation's or a retry's attempt hands back: the
+/// attempt it began, or the pending value it did not begin because a withdrawal is unhonored
+/// over the run (REQ-LOCALRUN-213), with the controls lock already dropped.
+pub(super) enum Begun<P> {
+    Owned(Box<LocalAttemptOwner>),
+    Withdrawn(Box<P>),
 }
 
 /// What the continuation starts from.
@@ -191,6 +200,7 @@ impl Command {
                 execution_root: self.execution_root,
                 leaf: ExecutionLeaf::Resume,
                 edge: None,
+                bridge: None,
             },
             config,
             cancellation,
@@ -203,7 +213,9 @@ impl Command {
 /// What a continuation continues: the run, `--from`, `--workflow` and `--execution-root`, and
 /// the leaf whose command its documents name. `edge` is the backward or limited edge the
 /// attempt that just ended `continued` took, which the attempt loop continues from without
-/// probing the run (REQ-WFEXEC-64).
+/// probing the run (REQ-WFEXEC-64), and `bridge` the run's controls lock that attempt took
+/// before it released the run lock, held until this continuation tried the run lock again
+/// (REQ-LOCALRUN-214, INV-ENGINE-39); a command's own continuation carries none.
 pub(super) struct Continuation {
     pub(super) run_directory: PathBuf,
     pub(super) from_steps: Vec<String>,
@@ -211,6 +223,7 @@ pub(super) struct Continuation {
     pub(super) execution_root: Option<PathBuf>,
     pub(super) leaf: ExecutionLeaf,
     pub(super) edge: Option<ContinuationEdgeV1>,
+    pub(super) bridge: Option<ControlsLock>,
 }
 
 /// Continues the run as `um workflow run resume` does (REQ-CONTINUE-74 to REQ-CONTINUE-78):
@@ -232,6 +245,7 @@ pub(super) async fn continue_run(
         execution_root,
         leaf,
         edge,
+        bridge,
     } = continuation;
     // REQ-LOCALRUN-135: a signal reads the run's control journal.
     let _journal = signal_task.watch(&run_directory);
@@ -302,7 +316,9 @@ pub(super) async fn continue_run(
             .map_err(|error| anyhow::anyhow!("finalize workflow result publication: {error:?}"))?;
         // A test seam between the probe and the lock; nothing outside `test-fixtures`.
         await_run_lock_gate()?;
-        acquire_local_continuation(&run_directory).map_err(anyhow::Error::new)
+        // REQ-LOCALRUN-214: the bridge a chaining attempt carried is dropped once the run lock
+        // was tried, and on every return before; the chained `begin` takes no controls lock.
+        acquire_local_continuation_bridged(&run_directory, bridge).map_err(anyhow::Error::new)
     })
     .await
     .map_err(anyhow::Error::new)??;
@@ -316,6 +332,19 @@ pub(super) async fn continue_run(
             );
         }
     };
+    // REQ-LOCALRUN-186, REQ-LOCALRUN-213: a withdrawal no process honored over the run's open
+    // latest attempt ends the run `withdrawn` without another attempt, as `withdraw` of the run
+    // would, whatever the continuation starts from; settling the attempt for one would spend it.
+    // An edge continuation begins the chained attempt, which honors it at its first step
+    // boundary (REQ-CONTINUE-78).
+    if !matches!(selection, Selection::Edge(_))
+        && matches!(pending.withdrawal_unhonored(), Ok(true))
+    {
+        return end_continuation_withdrawn(pending, &signal_task, &config, leaf, |pending| {
+            pending.end_running(WITHDRAWN_OUTCOME)
+        })
+        .await;
+    }
     // The probe ran without the lock: the wait it evaluated must still be the run's. The reason
     // is the command's intent; `begin` records `restart` for any run-definition continuation,
     // including a `resume --from` that finishes an interrupted restart (REQ-CONTINUE-79).
@@ -337,26 +366,13 @@ pub(super) async fn continue_run(
             return reject_after_settlement(pending, &signal_task, result).await;
         }
         Selection::Withdraw { .. } => {
-            return end_withdrawn(
+            return end_continuation_withdrawn(
                 pending,
                 &signal_task,
                 &config,
                 leaf,
                 PendingLocalContinuation::withdraw,
             )
-            .await;
-        }
-        // REQ-LOCALRUN-186: a withdrawal recorded while the abandoned attempt was live ends the
-        // run `withdrawn` without another attempt, as `withdraw` of the abandoned run would.
-        Selection::Abandoned if matches!(pending.withdrawal_pending(), Ok(true)) => {
-            return end_withdrawn(pending, &signal_task, &config, leaf, |pending| {
-                pending.update_run_record(
-                    RunState::Exited,
-                    pending.prior_attempt_number(),
-                    Some(WITHDRAWN_OUTCOME),
-                )?;
-                pending.settle_abandoned()
-            })
             .await;
         }
         Selection::Wait { target, reason, .. } => (vec![target.clone()], *reason),
@@ -619,18 +635,46 @@ pub(super) async fn continue_run(
         Selection::Edge(edge) => Some(edge),
         _ => None,
     };
-    let owned = tokio::task::spawn_blocking(move || {
-        pending.begin(
+    // REQ-LOCALRUN-213: unless it continues an edge, the attempt begins under the controls lock
+    // only once no withdrawal is unhonored over the run, one recorded since the check above
+    // included; otherwise the continuation is handed back to end the run `withdrawn`.
+    let edge_continuation = taken_edge.is_some();
+    let begun = tokio::task::spawn_blocking(move || {
+        let controls = if edge_continuation {
+            None
+        } else {
+            // A test seam before the controls lock; nothing outside `test-fixtures`.
+            await_begin_gate()?;
+            let controls = pending.lock_controls()?;
+            if matches!(pending.withdrawal_unhonored(), Ok(true)) {
+                drop(controls);
+                return Ok(Begun::Withdrawn(Box::new(pending)));
+            }
+            Some(controls)
+        };
+        let owned = pending.begin(
             &admitted_for_begin,
             from,
             definition_mode,
             reason,
             taken_edge,
-        )
+        );
+        drop(controls);
+        owned.map(|owned| Begun::Owned(Box::new(owned)))
     })
     .await
     .map_err(anyhow::Error::new)?
     .map_err(anyhow::Error::new)?;
+    let owned = match begun {
+        Begun::Owned(owned) => *owned,
+        Begun::Withdrawn(pending) => {
+            drop(child_recovery);
+            return end_continuation_withdrawn(*pending, &signal_task, &config, leaf, |pending| {
+                pending.end_running(WITHDRAWN_OUTCOME)
+            })
+            .await;
+        }
+    };
     let record = owned.continuation_record().map_err(anyhow::Error::new)?;
     let Some(record) = record else {
         signal_task.abort();
@@ -1092,10 +1136,38 @@ async fn diagnose_after_settlement(
     super::create::diagnose(error)
 }
 
-/// Ends the run `withdrawn` without an attempt through `end`, which consumes the continuation,
-/// then performs the root's `onOutcome.withdrawn` (REQ-LOCALRUN-191), read before `end` and
-/// written once the record reads `exited`, and reports the unattempted continuation.
-async fn end_withdrawn(
+/// What `end_withdrawn` needs of the run a command ends `withdrawn` without an attempt, read
+/// before the command's pending continuation or retry is consumed: the run directory, its
+/// latest attempt's number, the root's mirror (from the root workflow and its inputs) and the
+/// output a refusal is rendered on.
+pub(super) struct Unattempted {
+    run_directory: PathBuf,
+    attempt_number: u64,
+    mirror: Option<um_execution::Mirror>,
+    output: WorkflowRunOutput<io::Stdout, io::Stderr>,
+}
+
+impl Unattempted {
+    pub(super) fn new(
+        run_directory: &Path,
+        attempt_number: u64,
+        (workflow, inputs): (&ResolvedWorkflow, &ResolvedInputs),
+        output: WorkflowRunOutput<io::Stdout, io::Stderr>,
+    ) -> Self {
+        let mirror = super::mirror::read_run_record(run_directory).and_then(|record| {
+            super::mirror::run_mirror(&record, &workflow.definition, inputs, run_directory)
+        });
+        Self {
+            run_directory: run_directory.to_owned(),
+            attempt_number,
+            mirror,
+            output,
+        }
+    }
+}
+
+/// `end_withdrawn` for a continuation, whose refusals are reported as its others are.
+async fn end_continuation_withdrawn(
     pending: PendingLocalContinuation,
     signal_task: &super::create::SignalObservation,
     config: &um_execution::PresentationConfig,
@@ -1104,20 +1176,45 @@ async fn end_withdrawn(
     + Send
     + 'static,
 ) -> super::super::super::CommandResult {
-    let run_directory = pending.run_directory().to_owned();
-    let attempt_number = pending.prior_attempt_number();
-    let (workflow, inputs) = pending.root_specification();
-    let mirror = super::mirror::read_run_record(&run_directory).and_then(|record| {
-        super::mirror::run_mirror(&record, &workflow.definition, inputs, &run_directory)
-    });
+    let unattempted = Unattempted::new(
+        pending.run_directory(),
+        pending.prior_attempt_number(),
+        pending.root_specification(),
+        continuation_output(config.clone(), leaf, pending.run_directory()),
+    );
+    end_withdrawn(pending, unattempted, signal_task, config, leaf, |pending| {
+        end(pending).map_err(LocalRetryBeginError::from)
+    })
+    .await
+}
+
+/// Ends the run `withdrawn` without an attempt through `end`, which consumes the pending
+/// continuation or retry, then performs the root's `onOutcome.withdrawn` (REQ-LOCALRUN-191),
+/// read before `end` and written once the record reads `exited`, and reports the unattempted
+/// command under `command_name(leaf)`. A mirrored run whose write has no credentials is refused
+/// first (REQ-LOCALRUN-204), and an `end` refused `OwnershipUnproven` is reported as a retry
+/// rejection; neither changes the run. The caller holds no controls lock.
+pub(super) async fn end_withdrawn<P: Send + 'static>(
+    pending: P,
+    unattempted: Unattempted,
+    signal_task: &super::create::SignalObservation,
+    config: &um_execution::PresentationConfig,
+    leaf: ExecutionLeaf,
+    end: impl FnOnce(P) -> Result<(), LocalRetryBeginError> + Send + 'static,
+) -> super::super::super::CommandResult {
+    let Unattempted {
+        run_directory,
+        attempt_number,
+        mirror,
+        output,
+    } = unattempted;
     // REQ-LOCALRUN-204: a write without credentials refuses before the run changes. The
-    // continuation is dropped unsettled, as `end.rs` drops its own: a waiting run's attempt is
+    // pending value is dropped unsettled, as `end.rs` drops its own: a waiting run's attempt is
     // already settled, and an abandoned attempt stays as the command found it.
     if let Err(failure) = super::mirror::outcome_credentials(mirror.as_ref(), WITHDRAWN_OUTCOME) {
-        let result = refusal(
-            config,
-            leaf,
-            &pending,
+        let result = output.render_continuation_refusal(
+            &run_directory,
+            attempt_number,
             failure.code,
             super::mirror::CREDENTIALS_REFUSAL,
         );
@@ -1133,13 +1230,19 @@ async fn end_withdrawn(
                 Box::new(|mirror, target| mirror.outcome(target, WITHDRAWN_OUTCOME)),
             );
         }
-        Ok::<_, um_execution::LocalRunDirectoryError>(())
+        Ok::<_, LocalRetryBeginError>(())
     })
     .await;
     signal_task.abort();
-    withdrawn
-        .map_err(anyhow::Error::new)?
-        .map_err(anyhow::Error::new)?;
+    match withdrawn.map_err(anyhow::Error::new)? {
+        Ok(()) => {}
+        Err(LocalRetryBeginError::Rejected(rejection)) => {
+            return super::create::rejection_exit(output.render_retry_rejection(&rejection));
+        }
+        Err(LocalRetryBeginError::Operational(error)) => {
+            return Err(anyhow::Error::new(error).into());
+        }
+    }
     write_unattempted(
         config,
         command_name(leaf),

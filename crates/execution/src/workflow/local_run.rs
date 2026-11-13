@@ -1637,6 +1637,50 @@ impl PendingLocalRetry {
             .collect())
     }
 
+    /// The number of the run's latest attempt, the one a retry follows.
+    pub fn prior_attempt_number(&self) -> Result<u64, LocalRunDirectoryError> {
+        Ok(current_attempt(&*lock_state(&self.state.current)?)?.attempt_number)
+    }
+
+    /// Whether a withdrawal is unhonored over the run this retry holds before its attempt
+    /// begins (`withdrawal_unhonored_in`, REQ-LOCALRUN-213), read under the run lock.
+    pub fn withdrawal_unhonored(&self) -> Result<bool, LocalRunDirectoryError> {
+        withdrawal_unhonored_in(
+            &self.normalized,
+            &self.root,
+            &*lock_state(&self.state.current)?,
+        )
+    }
+
+    /// Takes the run's controls lock (`ControlsLock`), waiting while a `withdraw` holds it, so
+    /// the retry asks `withdrawal_unhonored` again and begins its attempt without a withdrawal
+    /// being appended in between (REQ-LOCALRUN-213); it is held until the returned value is
+    /// dropped. `end_running` takes it itself, so it must be dropped before that.
+    pub fn lock_controls(&self) -> Result<ControlsLock, LocalRunDirectoryError> {
+        ControlsLock::take(&self.root)
+    }
+
+    /// Ends the `running` run this retry holds with `outcome` without an attempt, as
+    /// `PendingLocalContinuation::end_running` does (`end_running_run`, REQ-LOCALRUN-213), once
+    /// the latest attempt's processes are quiesced as `begin` quiesces them: a process whose
+    /// ownership cannot be proven refuses it `OwnershipUnproven` with the run unchanged. The
+    /// caller holds no controls lock.
+    pub fn end_running(self, outcome: &str) -> Result<(), LocalRetryBeginError> {
+        let state = lock_state(&self.state.current)?.clone();
+        quiesce_retried_attempt(
+            &self.normalized,
+            current_attempt(&state)?,
+            &SystemLocalRecoveryAuthority,
+        )?;
+        Ok(end_running_run(
+            &self.normalized,
+            &self.root,
+            self.lock,
+            &state,
+            outcome,
+        )?)
+    }
+
     pub fn begin(
         self,
         admitted: &AdmittedWorkflow,
@@ -1761,13 +1805,19 @@ impl PendingLocalContinuation {
             .flatten())
     }
 
-    /// Whether a withdrawal recorded while the run was live is still pending, read under the
-    /// run lock (REQ-LOCALRUN-186).
-    pub fn withdrawal_pending(&self) -> Result<bool, LocalRunDirectoryError> {
-        Ok(withdrawal_pending_in(
-            &self.state.attempts,
-            &super::wait::read_controls(&self.normalized)?,
-        ))
+    /// Whether a withdrawal is unhonored over the run this continuation holds before its attempt
+    /// begins (`withdrawal_unhonored_in`, REQ-LOCALRUN-213), read under the run lock.
+    pub fn withdrawal_unhonored(&self) -> Result<bool, LocalRunDirectoryError> {
+        withdrawal_unhonored_in(&self.normalized, &self.root, &self.state)
+    }
+
+    /// Takes the run's controls lock (`ControlsLock`), waiting while a `withdraw` holds it, so
+    /// the continuation asks `withdrawal_unhonored` again and begins its attempt without a
+    /// withdrawal being appended in between (REQ-LOCALRUN-213); it is held until the returned
+    /// value is dropped. `end_running`, `end_waiting` and `settle_abandoned` take it
+    /// themselves, so it must be dropped before any of them.
+    pub fn lock_controls(&self) -> Result<ControlsLock, LocalRunDirectoryError> {
+        ControlsLock::take(&self.root)
     }
 
     /// `end_waiting(WITHDRAWN_OUTCOME)`.
@@ -1777,17 +1827,42 @@ impl PendingLocalContinuation {
 
     /// Ends a waiting run without another attempt (REQ-CONTINUE-75): the run record reads
     /// `exited` with `outcome` (`withdrawn` or `canceled`) and its attempt count unchanged,
-    /// the root wait record is removed, and the run lock is released. A run that does not
-    /// wait is `StateConflict` and left as it is.
+    /// the root wait record is removed, and the run lock is released. Under the controls lock,
+    /// before the record changes, the withdrawals later than the waiting attempt's `settledAt`
+    /// are spent (REQ-LOCALRUN-211); the run lock is released before the controls lock. A run
+    /// that does not wait is `StateConflict` and left as it is. The caller holds no controls
+    /// lock.
     pub fn end_waiting(self, outcome: &str) -> Result<(), LocalRunDirectoryError> {
         verify_retry_lock_identity(&self.root, &self.lock)?;
         if read_optional_wait_record(&self.root)?.is_none() {
             return Err(LocalRunDirectoryError::StateConflict);
         }
-        if let Some(record) = read_optional_run_record(&self.root)? {
-            update_run_record(&self.root, RunState::Exited, record.attempts, Some(outcome))?;
-        }
-        remove_root_wait_record(&self.root)
+        end_under_controls(&self.root, self.lock, || {
+            let store = store_from_locked_snapshot(&self.root, &self.state)?;
+            spend_withdrawals_in(&self.normalized, &store)?;
+            if let Some(record) = read_optional_run_record(&self.root)? {
+                update_run_record(&self.root, RunState::Exited, record.attempts, Some(outcome))?;
+            }
+            remove_root_wait_record(&self.root)
+        })
+    }
+
+    /// Ends a run whose record reads `running` and whose process is gone without another
+    /// attempt (REQ-LOCALRUN-186, REQ-LOCALRUN-211): under the controls lock the run record
+    /// reads `exited` with `outcome` (`withdrawn` or `canceled`) and its attempt count
+    /// unchanged, then an unsettled latest attempt is settled as interrupted (REQ-CONTINUE-2)
+    /// and a terminal one, such as one that ended `continued`, takes its `settledAt` again when
+    /// a withdrawal is later than it, so no later attempt is withdrawn by a withdrawal recorded
+    /// before; the run lock is released before the controls lock. The caller holds no controls
+    /// lock.
+    pub fn end_running(self, outcome: &str) -> Result<(), LocalRunDirectoryError> {
+        end_running_run(
+            &self.normalized,
+            &self.root,
+            self.lock,
+            &self.state,
+            outcome,
+        )
     }
 
     /// Supersedes this waiting run by `successor`, a run that already exists
@@ -2167,9 +2242,12 @@ impl PendingLocalContinuation {
     }
 
     /// A later admission rejection still settles an abandoned owner, without claiming
-    /// a new attempt. Already terminal history remains byte-for-byte unchanged.
+    /// a new attempt. Already terminal history remains byte-for-byte unchanged, and so does an
+    /// attempt a withdrawal is unhonored over (REQ-LOCALRUN-213), which the run's next `resume`
+    /// or `retry` ends. A command that ends the run uses `end_running` instead. The caller holds
+    /// no controls lock.
     pub fn settle_abandoned(self) -> Result<(), LocalRunDirectoryError> {
-        settle_abandoned_snapshot(&self.root, &self.state)
+        settle_abandoned_snapshot(&self.normalized, &self.root, &self.state)
     }
 
     fn state_store(&self) -> Result<Arc<StateStore>, LocalRunDirectoryError> {
@@ -2782,7 +2860,15 @@ fn store_from_locked_snapshot(
     }))
 }
 
+/// Settles the unsettled latest attempt of the locked `state` of the run at `normalized`, whose
+/// root is `root`, for a command that ends without an attempt and without ending the run
+/// (`settle_unsettled_attempt`, REQ-CONTINUE-2); a terminal attempt is left as it is. Settling
+/// never spends a withdrawal (REQ-LOCALRUN-213): under the controls lock, an attempt a
+/// withdrawal is unhonored over (`withdrawal_unhonored_in`) stays unsettled, so the run's next
+/// `resume` or `retry` still reads it and ends the run `withdrawn`. The caller holds no controls
+/// lock.
 fn settle_abandoned_snapshot(
+    normalized: &Path,
     root: &OwnedFd,
     state: &LocalRunStateV1,
 ) -> Result<(), LocalRunDirectoryError> {
@@ -2793,6 +2879,20 @@ fn settle_abandoned_snapshot(
     if prior.state.is_terminal() {
         return Ok(());
     }
+    let _controls = ControlsLock::take(root)?;
+    if withdrawal_unhonored_in(normalized, root, state)? {
+        return Ok(());
+    }
+    settle_unsettled_attempt(root, state, prior)
+}
+
+/// Settles `prior`, the unsettled latest attempt of the locked `state`, as interrupted by its
+/// process's abandonment (REQ-CONTINUE-2), with `settledAt` now and its process guards quiesced.
+fn settle_unsettled_attempt(
+    root: &OwnedFd,
+    state: &LocalRunStateV1,
+    prior: &LocalAttemptV1,
+) -> Result<(), LocalRunDirectoryError> {
     let snapshot = capture_settlement_snapshot(
         Path::new(&prior.execution_root),
         WorkspaceSnapshotSettlementV1::AbandonmentRecovery,
@@ -4226,24 +4326,19 @@ impl LocalAttemptOwner {
     /// Takes the run's controls lock (`ControlsLock`) for the attempt's last read of the
     /// withdrawals (REQ-WFEXEC-73), waiting while a `withdraw` holds it; it is held until the
     /// returned value is dropped, after the run lock is released.
-    pub fn lock_controls(&self) -> Result<impl Sized + use<>, LocalRunDirectoryError> {
+    pub fn lock_controls(&self) -> Result<ControlsLock, LocalRunDirectoryError> {
         ControlsLock::take(&self.state.root)
     }
 
-    /// Spends the withdrawals this settled attempt honored (REQ-WFEXEC-73): its `settledAt`
-    /// is taken again now, so every withdrawal recorded before it reads spent to the next
-    /// attempt (`withdrawal_pending_in`). Called under the controls lock after the read that
-    /// honored one, so a `withdraw` appended after it finds the run released; an unsettled
-    /// attempt is left as it is.
+    /// Spends the withdrawals recorded before this settled attempt ends the run, honored or
+    /// not (REQ-WFEXEC-73, REQ-LOCALRUN-211): when one naming no wait is later than its
+    /// `settledAt` (`withdrawn_after_settlement`), that is taken again now, so every withdrawal
+    /// recorded before it reads spent to the next attempt (`withdrawal_pending_in`). Called
+    /// under the controls lock after the attempt's last read, so a `withdraw` appended after it
+    /// finds the run released. An unsettled attempt, one no withdrawal is later than and
+    /// unreadable controls leave the state as it is.
     pub fn spend_withdrawals(&self) -> Result<(), LocalRunDirectoryError> {
-        let now = timestamp(um_support::utc_now())?;
-        self.state.update(|state| {
-            let attempt = current_attempt_mut(state)?;
-            if attempt.state.is_terminal() {
-                attempt.settled_at = Some(now);
-            }
-            Ok(())
-        })
+        spend_withdrawals_in(&self.normalized, &self.state)
     }
 
     /// Removes the run's root `wait.json` this attempt wrote with `record_wait`, when present,
@@ -6613,15 +6708,24 @@ pub struct WaitProbe {
 
 impl WaitProbe {
     /// Whether a withdrawal recorded for the probed run is pending (REQ-LOCALRUN-186), read
-    /// without the run lock a live process holds.
+    /// without the run lock a live process holds: the reader's read
+    /// (`withdrawal_pending_for_reader`), since the holder may be a command that has not begun
+    /// its attempt yet (REQ-LOCALRUN-212).
     pub fn withdrawal_pending(&self) -> Result<bool, LocalRunDirectoryError> {
         let (normalized, root) = open_run_root(&self.run_directory)?;
-        read_withdrawal_pending(&normalized, &root)
+        let Some(state) = read_optional_state(&root)? else {
+            return Ok(false);
+        };
+        Ok(withdrawal_pending_for_reader(
+            &state.attempts,
+            &super::wait::read_controls(&normalized)?,
+            record_exited(&root)?,
+        ))
     }
 
     /// Takes the probed run's controls lock (`ControlsLock`), waiting while another holds it;
     /// it is held until the returned value is dropped.
-    pub fn lock_controls(&self) -> Result<impl Sized + use<>, LocalRunDirectoryError> {
+    pub fn lock_controls(&self) -> Result<ControlsLock, LocalRunDirectoryError> {
         let (_, root) = open_run_root(&self.run_directory)?;
         ControlsLock::take(&root)
     }
@@ -6734,7 +6838,11 @@ pub fn inspect_wait(
 /// (REQ-WFEXEC-64), those; a run with no earlier attempt has every such control pending. So a
 /// withdrawal an earlier attempt ended on, outlived or honored as it settled (whose
 /// `settledAt` `LocalAttemptOwner::spend_withdrawals` took after that read) is spent, and one
-/// recorded while a `retry` or resume held the lock before creating its attempt is not.
+/// recorded while a `retry` or resume held the lock before creating its attempt is not. This is
+/// the owner's read (`LocalAttemptOwner::withdrawal_pending`,
+/// `ChildRunParent::withdrawal_pending`): an attempt in its cleanup is already terminal, and its
+/// last read still sees a withdrawal recorded before its own `settledAt`. A reader that does
+/// not own the latest attempt reads through `withdrawal_pending_for_reader`.
 fn withdrawal_pending_in(attempts: &[LocalAttemptV1], controls: &[ControlEvent]) -> bool {
     let mut first = attempts.len();
     while let Some(attempt) = first.checked_sub(1).and_then(|index| attempts.get(index)) {
@@ -6748,16 +6856,161 @@ fn withdrawal_pending_in(attempts: &[LocalAttemptV1], controls: &[ControlEvent])
             break;
         }
     }
-    let since = match first.checked_sub(1).and_then(|index| attempts.get(index)) {
-        None => None,
+    match first.checked_sub(1).and_then(|index| attempts.get(index)) {
+        None => withdrawn_since(controls, None),
         Some(earlier) => {
-            let settled = earlier.settled_at.as_deref().unwrap_or(&earlier.created_at);
-            match OffsetDateTime::parse(settled, &Rfc3339) {
-                Ok(since) => Some(since),
-                Err(_) => return false,
-            }
+            settled_at(earlier).is_some_and(|since| withdrawn_since(controls, Some(since)))
         }
+    }
+}
+
+/// Whether `controls` hold a `control.withdraw` naming no wait that the attempt a reader that
+/// does not own the latest of `attempts` finds next would honor (REQ-LOCALRUN-212): a
+/// `withdraw` (`WaitProbe::withdrawal_pending`), which may find the run held by a `retry` or
+/// `resume` that has not begun its attempt. While the latest attempt's span is open, because it
+/// is unsettled or ended `continued` while the run record does not read `exited` (`exited`
+/// false), the reader answers as its owner does (`withdrawal_pending_in`); otherwise only one
+/// later than the latest attempt's `settledAt` is pending, so one that attempt honored, or the
+/// run's ending spent, is not. A command that holds the run asks `withdrawal_unhonored_in`,
+/// the same rule over an open span.
+fn withdrawal_pending_for_reader(
+    attempts: &[LocalAttemptV1],
+    controls: &[ControlEvent],
+    exited: bool,
+) -> bool {
+    match attempts.last() {
+        Some(latest)
+            if latest.state.is_terminal()
+                && (latest.state != AttemptStateV1::Continued || exited) =>
+        {
+            withdrawn_after_settlement(latest, controls)
+        }
+        _ => withdrawal_pending_in(attempts, controls),
+    }
+}
+
+/// Whether a withdrawal is unhonored over the run at `normalized`, whose root is `root` and whose
+/// locked state is `state` (REQ-LOCALRUN-213): the run record reads `running`, the latest
+/// attempt is unsettled or ended `continued`, so no process honored or spent what was recorded
+/// over its span, and the owner's read (`withdrawal_pending_in`) finds a `control.withdraw`
+/// naming no wait. The one question a command that holds the run before its attempt begins asks,
+/// and the one `settle_abandoned_snapshot` asks before it settles; a run without a record has
+/// none.
+fn withdrawal_unhonored_in(
+    normalized: &Path,
+    root: &OwnedFd,
+    state: &LocalRunStateV1,
+) -> Result<bool, LocalRunDirectoryError> {
+    let open = state.attempts.last().is_some_and(|latest| {
+        !latest.state.is_terminal() || latest.state == AttemptStateV1::Continued
+    });
+    if !open
+        || !read_optional_run_record(root)?.is_some_and(|record| record.state == RunState::Running)
+    {
+        return Ok(false);
+    }
+    Ok(withdrawal_pending_in(
+        &state.attempts,
+        &super::wait::read_controls(normalized)?,
+    ))
+}
+
+/// Whether the run whose root is `root` reads `exited`; a run without a record does not.
+fn record_exited(root: &OwnedFd) -> Result<bool, LocalRunDirectoryError> {
+    Ok(read_optional_run_record(root)?.is_some_and(|record| record.state == RunState::Exited))
+}
+
+/// Takes the `settledAt` of the latest attempt in `store`, the state of the run at `normalized`,
+/// again now when `withdrawn_after_settlement` holds for it (REQ-LOCALRUN-211), so every
+/// withdrawal recorded before reads spent to the next attempt (`withdrawal_pending_in`). The
+/// caller holds the run lock and the controls lock. An unsettled attempt, one no withdrawal is
+/// later than and unreadable controls leave the state as it is.
+fn spend_withdrawals_in(
+    normalized: &Path,
+    store: &StateStore,
+) -> Result<(), LocalRunDirectoryError> {
+    let Ok(controls) = super::wait::read_controls(normalized) else {
+        return Ok(());
     };
+    // The guard is released before the update below takes the state again.
+    let later = {
+        let state = lock_state(&store.current)?;
+        withdrawn_after_settlement(current_attempt(&state)?, &controls)
+    };
+    if !later {
+        return Ok(());
+    }
+    let now = timestamp(um_support::utc_now())?;
+    store.update(|state| {
+        current_attempt_mut(state)?.settled_at = Some(now);
+        Ok(())
+    })
+}
+
+/// Runs `end` under the run's controls lock (`ControlsLock`) and releases the run lock `lock`,
+/// which the caller verified, before the controls lock, also when `end` fails: a `withdraw`
+/// waiting for the controls lock then finds the run released (REQ-LOCALRUN-211). No caller may
+/// hold the controls lock already.
+fn end_under_controls(
+    root: &OwnedFd,
+    lock: File,
+    end: impl FnOnce() -> Result<(), LocalRunDirectoryError>,
+) -> Result<(), LocalRunDirectoryError> {
+    let controls = ControlsLock::take(root)?;
+    let ended = end();
+    drop(lock);
+    drop(controls);
+    ended
+}
+
+/// Ends the `running` run at `normalized`, whose root is `root` and whose locked state is
+/// `state`, with `outcome` once its process is gone (REQ-LOCALRUN-186, REQ-LOCALRUN-211):
+/// under the controls lock it marks the record `exited` with `outcome` and the attempt count
+/// unchanged, then settles the latest attempt as interrupted when it is unsettled, or spends the
+/// withdrawals later than its `settledAt` when it is terminal (`spend_withdrawals_in`), and
+/// releases the run lock `lock` before the controls lock.
+fn end_running_run(
+    normalized: &Path,
+    root: &OwnedFd,
+    lock: File,
+    state: &LocalRunStateV1,
+    outcome: &str,
+) -> Result<(), LocalRunDirectoryError> {
+    verify_retry_lock_identity(root, &lock)?;
+    end_under_controls(root, lock, || {
+        if let Some(record) = read_optional_run_record(root)? {
+            update_run_record(root, RunState::Exited, record.attempts, Some(outcome))?;
+        }
+        let latest = state
+            .attempts
+            .last()
+            .ok_or(LocalRunDirectoryError::StateInvalid)?;
+        if latest.state.is_terminal() {
+            let store = store_from_locked_snapshot(root, state)?;
+            spend_withdrawals_in(normalized, &store)
+        } else {
+            settle_unsettled_attempt(root, state, latest)
+        }
+    })
+}
+
+/// Whether `attempt` is settled and `controls` hold a `control.withdraw` naming no wait later
+/// than its `settledAt` (REQ-LOCALRUN-211): one its spend has not covered, which a later
+/// attempt would read as pending (`withdrawal_pending_in`).
+fn withdrawn_after_settlement(attempt: &LocalAttemptV1, controls: &[ControlEvent]) -> bool {
+    attempt.state.is_terminal()
+        && settled_at(attempt).is_some_and(|since| withdrawn_since(controls, Some(since)))
+}
+
+/// The time `attempt` settled, its creation when it records none; `None` when unreadable.
+fn settled_at(attempt: &LocalAttemptV1) -> Option<OffsetDateTime> {
+    let settled = attempt.settled_at.as_deref().unwrap_or(&attempt.created_at);
+    OffsetDateTime::parse(settled, &Rfc3339).ok()
+}
+
+/// Whether `controls` hold a `control.withdraw` naming no wait recorded after `since`, or at
+/// all when `since` is `None`.
+fn withdrawn_since(controls: &[ControlEvent], since: Option<OffsetDateTime>) -> bool {
     controls.iter().any(|control| {
         control.event == super::wait::CONTROL_WITHDRAW
             && control.wait.is_none()
@@ -6766,12 +7019,15 @@ fn withdrawal_pending_in(attempts: &[LocalAttemptV1], controls: &[ControlEvent])
     })
 }
 
-/// A run's controls lock (REQ-LOCALRUN-186, REQ-WFEXEC-73): an exclusive `flock` on the run
-/// directory itself, which nothing else locks. `withdraw` holds it from its check that a live
-/// process holds the run through its append, and that process holds it from its last read of
-/// the withdrawals through the release of the run lock, so a withdrawal is appended only while
-/// the process will still read it, or finds the run released. Released when dropped.
-struct ControlsLock {
+/// A run's controls lock (REQ-LOCALRUN-186, REQ-WFEXEC-73, INV-ENGINE-39): an exclusive
+/// `flock` on the run directory itself, which nothing else locks. `withdraw` holds it from its
+/// check that a live process holds the run through its append, and that process holds it from
+/// its last read of the withdrawals through the release of the run lock, so a withdrawal is
+/// appended only while the process will still read it, or finds the run released. A process
+/// that chains attempts carries it from before the release of one attempt's run lock into
+/// `acquire_local_continuation_bridged`, which drops it once the next attempt's try of the run
+/// lock answered (REQ-LOCALRUN-214). Opaque; released when dropped.
+pub struct ControlsLock {
     _directory: OwnedFd,
 }
 
@@ -6794,8 +7050,8 @@ impl ControlsLock {
     }
 }
 
-/// `withdrawal_pending_in` for the run whose root is `root`, read from its `state.json` and
-/// controls; a run without `state.json` has none pending.
+/// `withdrawal_pending_in`, the owner's read, for the run whose root is `root`, read from its
+/// `state.json` and controls; a run without `state.json` has none pending.
 fn read_withdrawal_pending(
     normalized: &Path,
     root: &OwnedFd,
@@ -7504,7 +7760,56 @@ pub fn await_child_start_gate() -> Result<(), LocalRunDirectoryError> {
     Ok(())
 }
 
-/// The gate both test seams share: when `variable` names a path, writes the marker beside it
+/// A seam for the end-to-end tests of a withdrawal recorded while a settled attempt finishes
+/// (feature `test-fixtures`, REQ-LOCALRUN-211): when `UM_TEST_SETTLED_GATE` names a path, an
+/// attempt that is not a quiet child calls this once its execution returned and before its
+/// first read of the withdrawals, which writes `<path>.settled` and returns once `<path>`
+/// exists, with `await_run_lock_gate`'s timeout. Without the feature, or the variable, it
+/// returns at once.
+pub fn await_settled_gate() -> Result<(), LocalRunDirectoryError> {
+    #[cfg(feature = "test-fixtures")]
+    await_test_gate(
+        SETTLED_GATE,
+        "settled",
+        "the settled gate was not opened in time",
+    )?;
+    Ok(())
+}
+
+/// A seam for the end-to-end tests of a `withdraw` that meets an attempt ending its run
+/// (feature `test-fixtures`, REQ-LOCALRUN-211): when `UM_TEST_RELEASE_GATE` names a path, an
+/// attempt that ends the run calls this while it holds the run's controls lock, after its last
+/// read and its spend and before its final record, which writes `<path>.releasing` and returns
+/// once `<path>` exists, with `await_run_lock_gate`'s timeout. Without the feature, or the
+/// variable, it returns at once.
+pub fn await_release_gate() -> Result<(), LocalRunDirectoryError> {
+    #[cfg(feature = "test-fixtures")]
+    await_test_gate(
+        RELEASE_GATE,
+        "releasing",
+        "the release gate was not opened in time",
+    )?;
+    Ok(())
+}
+
+/// A seam for the end-to-end tests of a withdrawal recorded while a `retry` or `resume` holds a
+/// run before its attempt begins (feature `test-fixtures`, REQ-LOCALRUN-213): when
+/// `UM_TEST_BEGIN_GATE` names a path, a command that begins an attempt not continuing an edge
+/// calls this on its blocking thread before it takes the controls lock to ask again for an
+/// unhonored withdrawal and begin, which writes `<path>.beginning` and returns once `<path>`
+/// exists, with `await_run_lock_gate`'s timeout. Without the feature, or the variable, it
+/// returns at once.
+pub fn await_begin_gate() -> Result<(), LocalRunDirectoryError> {
+    #[cfg(feature = "test-fixtures")]
+    await_test_gate(
+        BEGIN_GATE,
+        "beginning",
+        "the begin gate was not opened in time",
+    )?;
+    Ok(())
+}
+
+/// The gate the test seams share: when `variable` names a path, writes the marker beside it
 /// with `extension` and returns once the path exists, or a `File` error after
 /// `TEST_GATE_TIMEOUT`.
 #[cfg(feature = "test-fixtures")]
@@ -7541,6 +7846,12 @@ const RUN_LOCK_GATE: &str = "UM_TEST_RUN_LOCK_GATE";
 #[cfg(feature = "test-fixtures")]
 const CHILD_START_GATE: &str = "UM_TEST_CHILD_START_GATE";
 #[cfg(feature = "test-fixtures")]
+const SETTLED_GATE: &str = "UM_TEST_SETTLED_GATE";
+#[cfg(feature = "test-fixtures")]
+const RELEASE_GATE: &str = "UM_TEST_RELEASE_GATE";
+#[cfg(feature = "test-fixtures")]
+const BEGIN_GATE: &str = "UM_TEST_BEGIN_GATE";
+#[cfg(feature = "test-fixtures")]
 const TEST_GATE_POLL_INTERVAL: Duration = Duration::from_millis(10);
 #[cfg(feature = "test-fixtures")]
 const TEST_GATE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -7548,10 +7859,25 @@ const TEST_GATE_TIMEOUT: Duration = Duration::from_secs(30);
 pub fn acquire_local_continuation(
     requested: &Path,
 ) -> Result<LocalContinuationOpen, LocalRunDirectoryError> {
+    acquire_local_continuation_bridged(requested, None)
+}
+
+/// `acquire_local_continuation` for a process that chains attempts (REQ-WFEXEC-64,
+/// REQ-LOCALRUN-214, INV-ENGINE-39): `bridge` is the run's controls lock the attempt that ended
+/// `continued` took before it released the run lock, so a `withdraw` that arrives in between
+/// waits for this acquisition. It is dropped as soon as the one non-blocking try of the run
+/// lock answered, taken or contended, before anything else here runs: the error path settles
+/// the abandoned attempt (`settle_abandoned_snapshot`), which takes the controls lock itself.
+pub fn acquire_local_continuation_bridged(
+    requested: &Path,
+    bridge: Option<ControlsLock>,
+) -> Result<LocalContinuationOpen, LocalRunDirectoryError> {
     // Unlike retry's status-retry loop, continuation fails closed on lock contention.
     let (normalized, root) = open_run_root(requested)?;
     let lock = open_retry_lock(&root)?;
-    match fcntl_lock(&lock, FlockOperation::NonBlockingLockExclusive) {
+    let locked = fcntl_lock(&lock, FlockOperation::NonBlockingLockExclusive);
+    drop(bridge);
+    match locked {
         Ok(()) => {}
         Err(Errno::AGAIN | Errno::ACCESS) => {
             let snapshot = read_local_run_status(requested)
@@ -7634,7 +7960,7 @@ pub fn acquire_local_continuation(
     let (prior_workflow, initial_workflow, inputs, maximum_parallel_steps, tree) = match retained {
         Ok(retained) => retained,
         Err(error) => {
-            settle_abandoned_snapshot(&root, &state)?;
+            settle_abandoned_snapshot(&normalized, &root, &state)?;
             return Err(error);
         }
     };
@@ -9481,16 +9807,7 @@ fn begin_local_retry(
         prior.attempt_number,
         pending.definition.clone(),
     )?;
-    if let Err((guard_ids, ownership_reason)) = quiesce_attempt(prior, authority) {
-        return Err(LocalRetryBeginError::Rejected(LocalRetryRejection {
-            run_directory: pending.normalized.clone(),
-            attempt_number: prior.attempt_number,
-            reason: RetryIneligibilityReason::OwnershipUnproven,
-            guard_ids,
-            ownership_reason: Some(ownership_reason),
-            successor: None,
-        }));
-    }
+    quiesce_retried_attempt(&pending.normalized, prior, authority)?;
     let abandonment_snapshot = (!prior.state.is_terminal()).then(|| {
         capture_settlement_snapshot(
             Path::new(&prior.execution_root),
@@ -9542,6 +9859,26 @@ fn begin_local_retry(
         finalizers: Arc::from(fresh_finalizer_progress(admitted)?),
         state: pending.state,
         resumed_wait: None,
+    })
+}
+
+/// Quiesces `prior`, the latest attempt of the run at `normalized`, for a retry that settles it
+/// (`quiesce_attempt`): a process whose ownership cannot be proven refuses the retry
+/// `OwnershipUnproven`, with the run unchanged.
+fn quiesce_retried_attempt(
+    normalized: &Path,
+    prior: &LocalAttemptV1,
+    authority: &impl LocalQuiescenceAuthority,
+) -> Result<(), LocalRetryBeginError> {
+    quiesce_attempt(prior, authority).map_err(|(guard_ids, ownership_reason)| {
+        LocalRetryBeginError::Rejected(LocalRetryRejection {
+            run_directory: normalized.to_owned(),
+            attempt_number: prior.attempt_number,
+            reason: RetryIneligibilityReason::OwnershipUnproven,
+            guard_ids,
+            ownership_reason: Some(ownership_reason),
+            successor: None,
+        })
     })
 }
 

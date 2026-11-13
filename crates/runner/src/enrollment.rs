@@ -805,8 +805,8 @@ pub enum JoinOutcome {
 pub enum JoinRefusal {
     /// 401: the token is malformed or does not verify.
     Unauthorized,
-    /// 410: the key is revoked or expired, or the runner its exact repeat made
-    /// is deleted.
+    /// 410: the key is revoked or expired, its issuer may no longer issue a
+    /// key for the pool, or the runner its exact repeat made is deleted.
     Gone,
     /// 409: the pool's member is not active, the organization is at its
     /// registration limit, or the idempotency key names another verifier.
@@ -2202,7 +2202,9 @@ impl fmt::Display for EnrollmentError {
                 return write_staged_join(formatter, journal, join_key_id);
             }
             Self::JoinRefused(JoinRefusal::Unauthorized) => "Cloud rejected the join key's token",
-            Self::JoinRefused(JoinRefusal::Gone) => "the join key is revoked or expired",
+            Self::JoinRefused(JoinRefusal::Gone) => {
+                "the join key is revoked or expired, or its issuer may no longer issue a key for the pool"
+            }
             Self::JoinRefused(JoinRefusal::Conflict) => {
                 "the pool cannot admit the join: its member is not active or the organization is at its runner limit"
             }

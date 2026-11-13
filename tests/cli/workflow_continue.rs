@@ -2,11 +2,14 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::Path;
 
+use super::poll_until;
 use super::workflow_run::{
     RunBundle, TreeBundle, git, initialize_git_repository, isolated_command, run_record,
     workflow_run_schema,
 };
-use super::workflow_run_control::run_control;
+use super::workflow_run_control::{
+    control_command, control_count, control_file, recorded_as, refused, run_control,
+};
 use super::workflow_run_list::shown_plain;
 
 pub(super) const GIT_CONTINUATION_SOURCE: &str = r#"schemaVersion: 1
@@ -3188,13 +3191,11 @@ fn remove_tree(path: &Path) {
     fs::remove_dir(path).unwrap();
 }
 
-// REQ-CONTINUE-78: a run whose process ended after an attempt ended `continued` and before
-// the next began is continued by `resume` from the recorded edge's target, uncounted.
-#[test]
-fn resume_continues_a_run_whose_latest_attempt_continued() {
-    let bundle = loop_tree();
-    let (run, _) = exhausted_loop(&bundle, "interrupted-chain");
-    // Rewind the run to the moment attempt 2 (`fix` built, backward to `review`) ended.
+/// Runs the loop tree as `exhausted_loop` does and rewinds the run to the moment attempt 2
+/// (`fix` built, backward to `review`) ended `continued`, before its process began the next:
+/// the record reads `running` with 2 attempts and no wait.
+fn interrupted_chain(bundle: &TreeBundle, name: &str) -> std::path::PathBuf {
+    let (run, _) = exhausted_loop(bundle, name);
     let mut state = read_json(&run.join("state.json"));
     state["attempts"].as_array_mut().unwrap().pop();
     state["currentAttemptNumber"] = 2.into();
@@ -3215,6 +3216,15 @@ fn resume_continues_a_run_whose_latest_attempt_continued() {
         status_document(&run)["state"]["attempts"][1]["state"],
         "continued"
     );
+    run
+}
+
+// REQ-CONTINUE-78: a run whose process ended after an attempt ended `continued` and before
+// the next began is continued by `resume` from the recorded edge's target, uncounted.
+#[test]
+fn resume_continues_a_run_whose_latest_attempt_continued() {
+    let bundle = loop_tree();
+    let run = interrupted_chain(&bundle, "interrupted-chain");
 
     decide_each(&bundle, "review", &["proceed"]);
     decide(&bundle, "merge", "landed");
@@ -3235,6 +3245,133 @@ fn resume_continues_a_run_whose_latest_attempt_continued() {
     assert_eq!(record["outcome"], "landed");
     assert_eq!(record["attempts"], 3);
     assert_eq!(record["edges"], serde_json::json!({"review.hand_back": 1}));
+}
+
+// REQ-LOCALRUN-211, REQ-LOCALRUN-186, REQ-WFEXEC-73: `withdraw` of a run whose process ended
+// between chained attempts ends it `withdrawn` and spends the withdrawal it records, so a later
+// `retry` of the run is not withdrawn by it: the retry's attempt runs its stages.
+#[test]
+fn withdraw_of_a_run_whose_latest_attempt_continued_is_spent() {
+    let bundle = loop_tree();
+    let run = interrupted_chain(&bundle, "withdrawn-chain");
+
+    let output = run_control(None, "withdraw", &run, &[]);
+    let document = recorded_as(&output, "withdraw", "withdrawn", &run);
+    assert_eq!(document["control"]["event"], "control.withdraw");
+    assert_eq!(document["control"]["wait"], serde_json::Value::Null);
+    control_file(&run, &document);
+    assert_eq!(control_count(&run), 1);
+    let record = run_record(&run);
+    assert_eq!(record["state"], "exited", "{record}");
+    assert_eq!(record["outcome"], "withdrawn", "{record}");
+    assert_eq!(record["attempts"], 2, "{record}");
+
+    decide_each(&bundle, "review", &["proceed"]);
+    decide(&bundle, "merge", "landed");
+    let retry = isolated_command(&[
+        "workflow".to_owned(),
+        "run".to_owned(),
+        "retry".to_owned(),
+        run.to_string_lossy().into_owned(),
+        "--execution-root".to_owned(),
+        bundle.execution_root().to_string_lossy().into_owned(),
+        "--json".to_owned(),
+    ])
+    .output()
+    .unwrap();
+    let documents = chained(&retry);
+    let last = documents.last().unwrap();
+    assert_ne!(last["outcome"], "cancelled", "{last}");
+    let result = read_json(&run.join("attempts/000003/result/result.json"));
+    let steps = result["steps"].as_array().unwrap();
+    assert!(
+        steps.iter().any(|step| step["state"] == "succeeded"),
+        "{result}"
+    );
+    for step in steps {
+        assert!(
+            step["state"] != "cancelled" || step["detail"]["code"] != "user_request",
+            "{result}"
+        );
+    }
+    let record = run_record(&run);
+    assert_ne!(record["outcome"], "withdrawn", "{record}");
+    assert!(record["attempts"].as_u64().unwrap() >= 3, "{record}");
+}
+
+// REQ-LOCALRUN-214, INV-ENGINE-39, REQ-LOCALRUN-186, REQ-WFEXEC-73: a `withdraw` that arrives
+// after the process released the run for one chained attempt and before it took the run for the
+// next waits for the process, which keeps the run's controls lock across that gap; it then finds
+// the run held, appends `control.withdraw` naming no wait and answers `recorded`, and the chained
+// attempt honors it: the run ends `withdrawn` after 2 attempts, never by the `withdraw` itself.
+#[test]
+fn a_withdraw_between_chained_attempts_waits_for_the_process_and_is_recorded() {
+    let bundle = loop_tree();
+    decide(&bundle, "design", "planned");
+    decide_each(&bundle, "review", &["hand_back"]);
+    // `fix` fails and takes no edge, so the chained attempt ends the run `withdrawn` whether the
+    // control lands before its first step boundary or while `fix` runs.
+    decide(&bundle, "fix", "failed");
+    let destination = bundle.result("chain-withdrawn");
+    let gate = bundle.result("chain-lock-gate");
+    fs::create_dir_all(gate.parent().unwrap()).unwrap();
+    let live = isolated_command(&bundle.args(&destination))
+        .env("UM_TEST_RUN_LOCK_GATE", &gate)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    poll_until(
+        "the chaining process's gap between attempts",
+        || gate.with_extension("inspected").exists(),
+        |inspected| *inspected,
+    );
+    let run = fs::canonicalize(&destination).unwrap();
+    // Attempt 1 ended `continued`, the run lock is free and the record reads `running`.
+    let inspection = um_execution::inspect_wait(&run, &um_execution::NoConditions)
+        .unwrap()
+        .inspection;
+    assert!(
+        matches!(inspection, um_execution::WaitInspection::Continued { .. }),
+        "{inspection:?}"
+    );
+
+    let mut withdraw = control_command(None, "withdraw", &run, &[])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    um_support::sleep(std::time::Duration::from_millis(500));
+    if withdraw.try_wait().unwrap().is_some() {
+        panic!(
+            "the withdraw did not wait for the chaining process: {:?}",
+            withdraw.wait_with_output().unwrap()
+        );
+    }
+    assert_eq!(control_count(&run), 0);
+
+    fs::write(&gate, "").unwrap();
+    let output = withdraw.wait_with_output().unwrap();
+    let document = recorded_as(&output, "withdraw", "recorded", &run);
+    assert_eq!(document["control"]["event"], "control.withdraw");
+    assert_eq!(document["control"]["wait"], serde_json::Value::Null);
+    control_file(&run, &document);
+    assert_eq!(control_count(&run), 1);
+
+    let exited = live.wait_with_output().unwrap();
+    let record = run_record(&run);
+    assert_eq!(record["state"], "exited", "{record}\n{exited:?}");
+    assert_eq!(record["outcome"], "withdrawn", "{record}\n{exited:?}");
+    assert_eq!(record["attempts"], 2, "{record}");
+    assert_eq!(attempt_count(&run), 2);
+    assert_eq!(control_count(&run), 1);
+    refused(
+        &run_control(None, "withdraw", &run, &[]),
+        "withdraw",
+        "run_exited",
+    );
 }
 
 /// The pull request `design` exports in the external-wait scenarios.

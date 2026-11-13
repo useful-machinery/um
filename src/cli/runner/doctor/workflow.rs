@@ -1,36 +1,50 @@
-//! The workflow mode of `um runner doctor` (REQ-CREDREADY-1 to REQ-CREDREADY-21): the
+//! The workflow mode of `um runner doctor` (REQ-CREDREADY-1 to REQ-CREDREADY-25): the
 //! credentials a workflow tree declares, with what Cloud holds for the organization and a named
-//! project when `--readiness` asks, printed as a checklist or a JSON document.
+//! project when `--readiness` asks and what the member holds of each provider when `--grants`
+//! asks, printed as a checklist or a JSON document. `--connect` first runs the grant flow of
+//! `um grant create --workflow` over the same derivation (INV-CLI-15).
 
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
 use anyhow::Context;
 use serde::Serialize;
 
+use crate::cli::CommandFailure;
 use crate::exit_code::ExitCode;
-use um_execution::SystemCommandRunner;
+use um_human_auth::Deployment;
 use um_runner::{
     CredentialRequirement, Declaration, DeclarationKind, Node, NodeKind, OriginDeclaration,
     RepositorySource, UnknownDeclaration, WorkflowCredentials, read_workflow_credentials,
 };
 
+use super::super::super::grant::{Flow, output};
+use super::grants::{self, Held};
 use super::readiness::{self, Readiness, Repository};
+use super::roots::Roots;
 
 pub(super) fn execute(
-    source_root: &Path,
+    source_root: Option<&Path>,
     workflow_files: &[PathBuf],
     json: bool,
     readiness: Option<&Readiness<'_>>,
+    grants: Option<&grants::Request<'_>>,
+    connect: Option<&Flow<'_>>,
 ) -> super::super::super::CommandResult {
+    // A file in no repository is refused before anything is loaded (REQ-CREDREADY-1).
+    let roots = Roots::find(
+        workflow_files,
+        source_root,
+        "um runner doctor --workflow FILE --source-root ROOT",
+    )?;
+    let format = Format::new(json, connect.is_some());
     // A named project, not the `origin` remote, names the repository's provider, so the project
-    // is read before the derivation and Git is not asked (REQ-CREDREADY-21).
+    // is read before the derivation and Git is not asked for it (REQ-CREDREADY-21).
     if let Some(readiness) = readiness
         && let Some(project) = readiness.project
     {
-        return super::super::super::execute_deployment_leaf(
-            readiness,
+        return super::super::super::execute_deployment_command(
+            Some(readiness),
             COMMAND_PATH,
             DEPLOYMENT_CONTEXT,
             |readiness, deployment| {
@@ -39,56 +53,149 @@ pub(super) fn execute(
                 let repository = match session.read_project(project)? {
                     Ok(repository) => repository,
                     Err(ending) => {
-                        return ending.write(api_url, readiness.authentication.kind(), json);
+                        return ending
+                            .write(api_url, readiness.authentication.kind(), json)
+                            .map_err(Into::into);
                     }
                 };
                 let source =
                     RepositorySource::Project(repository.map(|repository| repository.kind));
-                let Some(credentials) = derive(source_root, workflow_files, source, json)? else {
+                let Some(credentials) = roots.derive(&source, json)? else {
                     return Ok(ExitCode::GeneralFailure);
                 };
-                check(&session, readiness, api_url, credentials, repository, json)
+                let flowed = match connected(connect, deployment, &credentials)? {
+                    Ok(flowed) => flowed,
+                    Err(ended) => return Ok(ended),
+                };
+                let checked = check(
+                    deployment,
+                    Some((&session, readiness)),
+                    grants,
+                    credentials,
+                    repository,
+                    format,
+                )?;
+                Ok(joined(flowed, checked))
             },
         );
     }
-    let source = RepositorySource::OriginRemote(Arc::new(SystemCommandRunner));
-    let Some(credentials) = derive(source_root, workflow_files, source, json)? else {
+    let Some(credentials) = roots.derive(&roots.origin_remote(), json)? else {
         return Ok(ExitCode::GeneralFailure);
     };
-    // Nothing is loaded and Cloud is not contacted unless a requirement has a read
-    // (REQ-RUNNERENROLL-45, REQ-CREDREADY-13).
-    let Some(readiness) = readiness.filter(|_| {
-        credentials
+    // Nothing is loaded and Cloud is not contacted unless a requirement has a read: a
+    // connection read, or the grants read, which any requirement has, or `--connect` asks for
+    // the grant flow, which takes a tree that calls for no kind to Cloud for nothing
+    // (REQ-RUNNERENROLL-45, REQ-CREDREADY-13, REQ-CREDREADY-22, REQ-CREDREADY-24).
+    let connections = readiness.is_some()
+        && credentials
             .requirements
             .iter()
-            .any(|requirement| readiness::read_for(requirement.kind).is_some())
-    }) else {
-        let report = Report {
-            credentials,
-            organization: readiness.map(|readiness| readiness.organization),
-            project: None,
-            deployment: None,
-        };
-        return write_report(&report, json).map_err(Into::into);
-    };
-    super::super::super::execute_deployment_leaf(
-        credentials,
+            .any(|requirement| readiness::read_for(requirement.kind).is_some());
+    let reads = connections || (grants.is_some() && !credentials.requirements.is_empty());
+    if connect.is_none() && !reads {
+        return write_report(&unread(credentials, readiness), format).map_err(Into::into);
+    }
+    super::super::super::execute_deployment_command(
+        Some(credentials),
         COMMAND_PATH,
         DEPLOYMENT_CONTEXT,
         |credentials, deployment| {
-            let session = readiness::Session::new(deployment, readiness)?;
-            let api_url = deployment.fingerprint().api_url();
-            check(&session, readiness, api_url, credentials, None, json)
+            let flowed = match connected(connect, deployment, &credentials)? {
+                Ok(flowed) => flowed,
+                Err(ended) => return Ok(ended),
+            };
+            let checked = if reads {
+                let session = readiness
+                    .map(|readiness| readiness::Session::new(deployment, readiness))
+                    .transpose()?;
+                let readiness = session.as_ref().zip(readiness);
+                check(deployment, readiness, grants, credentials, None, format)?
+            } else {
+                write_report(&unread(credentials, readiness), format)?
+            };
+            Ok(joined(flowed, checked))
         },
     )
 }
 
-const COMMAND_PATH: &[&str] = &["runner", "doctor"];
-const DEPLOYMENT_CONTEXT: &str = "configure the readiness check's Cloud access";
+/// The report of a derivation no Cloud read was made for.
+fn unread<'a>(
+    credentials: WorkflowCredentials,
+    readiness: Option<&'a Readiness<'a>>,
+) -> Report<'a> {
+    Report {
+        credentials,
+        organization: readiness.map(|readiness| readiness.organization),
+        project: None,
+        grants: None,
+        deployment: None,
+    }
+}
 
-/// The credentials the tree needs, or `None` once the first file that does not resolve was
-/// rejected as `um workflow validate` rejects it (REQ-CREDREADY-2).
-pub(in crate::cli) fn derive(
+/// Runs the grant flow over `credentials` when `--connect` asks for it (REQ-CREDREADY-24): its
+/// status once it reached its summary and no signal stopped it, for the report that follows,
+/// and otherwise, as the error, the status the command ends with at once, with no report
+/// (REQ-CREDREADY-25). Without `--connect` nothing is run and nothing failed.
+fn connected(
+    connect: Option<&Flow<'_>>,
+    deployment: &Deployment,
+    credentials: &WorkflowCredentials,
+) -> Result<Result<ExitCode, ExitCode>, CommandFailure> {
+    let Some(flow) = connect else {
+        return Ok(Ok(ExitCode::Success));
+    };
+    let ending = flow.run_workflows(deployment, credentials, output::Scope::Doctor)?;
+    if !ending.summarized || ending.stopped() {
+        return Ok(Err(ending.code));
+    }
+    // The report follows the summary as a section of its own.
+    if !flow.json {
+        writeln!(io::stdout()).context("write runner doctor report")?;
+    }
+    Ok(Ok(ending.code))
+}
+
+/// The command's status once the report is written: the report's when it failed, and otherwise
+/// the flow's, which is 1 when a sign-in failed or every provider selected was passed over
+/// (REQ-CREDREADY-17, REQ-CREDREADY-25).
+fn joined(flowed: ExitCode, checked: ExitCode) -> ExitCode {
+    if checked == ExitCode::Success {
+        flowed
+    } else {
+        checked
+    }
+}
+
+/// How the report is written.
+#[derive(Clone, Copy)]
+enum Format {
+    Human,
+    /// One JSON document.
+    Json,
+    /// One JSON line, the event `report`, after the grant flow's events (REQ-CREDREADY-25).
+    Event,
+}
+
+impl Format {
+    const fn new(json: bool, connect: bool) -> Self {
+        match (json, connect) {
+            (false, _) => Self::Human,
+            (true, false) => Self::Json,
+            (true, true) => Self::Event,
+        }
+    }
+
+    const fn json(self) -> bool {
+        !matches!(self, Self::Human)
+    }
+}
+
+const COMMAND_PATH: &[&str] = &["runner", "doctor"];
+const DEPLOYMENT_CONTEXT: &str = "configure the doctor's Cloud access";
+
+/// The credentials the tree under `source_root` needs, or `None` once the first file that does
+/// not resolve was rejected as `um workflow validate` rejects it (REQ-CREDREADY-2).
+pub(super) fn derive(
     source_root: &Path,
     workflow_files: &[PathBuf],
     repository: RepositorySource,
@@ -108,39 +215,53 @@ pub(in crate::cli) fn derive(
     }
 }
 
-/// Makes the read of each requirement that has one, in kind order, combines a named project's
-/// repository with its kind's code, and writes the report; a failure that ends the command is
-/// written instead (REQ-CREDREADY-14).
+/// With `readiness`, makes the connection read of each requirement that has one, in kind
+/// order, and combines a named project's repository with its kind's code; with `grants`, then
+/// reads the member's grants when a requirement exists; and writes the report. A failure that
+/// ends the command is written instead (REQ-CREDREADY-14, REQ-CREDREADY-22).
 fn check(
-    session: &readiness::Session<'_>,
-    readiness: &Readiness<'_>,
-    api_url: &str,
+    deployment: &Deployment,
+    readiness: Option<(&readiness::Session<'_>, &Readiness<'_>)>,
+    grants: Option<&grants::Request<'_>>,
     mut credentials: WorkflowCredentials,
     repository: Option<Repository>,
-    json: bool,
+    format: Format,
 ) -> anyhow::Result<ExitCode> {
-    for requirement in &mut credentials.requirements {
-        let Some(read) = readiness::read_for(requirement.kind) else {
-            continue;
-        };
-        match read(session)? {
-            Ok(code) => {
-                requirement.code = repository
-                    .filter(|repository| repository.kind == requirement.kind)
-                    .map_or(code, |repository| repository.code(code));
-            }
-            Err(ending) => {
-                return ending.write(api_url, readiness.authentication.kind(), json);
+    let api_url = deployment.fingerprint().api_url();
+    let json = format.json();
+    if let Some((session, readiness)) = readiness {
+        for requirement in &mut credentials.requirements {
+            let Some(read) = readiness::read_for(requirement.kind) else {
+                continue;
+            };
+            match read(session)? {
+                Ok(code) => {
+                    requirement.code = repository
+                        .filter(|repository| repository.kind == requirement.kind)
+                        .map_or(code, |repository| repository.code(code));
+                }
+                Err(ending) => {
+                    return ending.write(api_url, readiness.authentication.kind(), json);
+                }
             }
         }
     }
+    let held = match grants.filter(|_| !credentials.requirements.is_empty()) {
+        Some(request) => match request.read(deployment)? {
+            Ok(held) => Some(held),
+            Err(failure) => return output::failure(api_url, &failure, json),
+        },
+        None => None,
+    };
+    let readiness = readiness.map(|(_, readiness)| readiness);
     let report = Report {
         credentials,
-        organization: Some(readiness.organization),
-        project: readiness.project,
+        organization: readiness.map(|readiness| readiness.organization),
+        project: readiness.and_then(|readiness| readiness.project),
+        grants: held,
         deployment: Some(api_url),
     };
-    write_report(&report, json)
+    write_report(&report, format)
 }
 
 /// The derivation's result, after any Cloud reads, and what the report names beside it.
@@ -150,19 +271,28 @@ struct Report<'a> {
     organization: Option<&'a str>,
     /// The project `--project-id` named, for the next actions.
     project: Option<&'a str>,
+    /// The member's grants, when `--grants` read them (REQ-CREDREADY-22).
+    grants: Option<Held<'a>>,
     /// The deployment asked, when a read was made (REQ-CREDREADY-17).
     deployment: Option<&'a str>,
 }
 
 /// Writes the report; the command fails when a requirement does (REQ-CREDREADY-17).
-fn write_report(report: &Report<'_>, json: bool) -> anyhow::Result<ExitCode> {
-    if json {
-        super::super::super::write_pretty_json(&JsonReport::from_report(report))
-            .context("write JSON runner doctor report")?;
-    } else {
-        let stdout = io::stdout();
-        let mut stdout = stdout.lock();
-        write_human_report_to(&mut stdout, report).context("write runner doctor report")?;
+fn write_report(report: &Report<'_>, format: Format) -> anyhow::Result<ExitCode> {
+    match format {
+        Format::Human => {
+            let stdout = io::stdout();
+            let mut stdout = stdout.lock();
+            write_human_report_to(&mut stdout, report).context("write runner doctor report")?;
+        }
+        Format::Json => {
+            super::super::super::write_pretty_json(&JsonReport::from_report(report, None))
+                .context("write JSON runner doctor report")?;
+        }
+        Format::Event => {
+            super::super::super::write_json_line(&JsonReport::from_report(report, Some("report")))
+                .context("write JSON runner doctor report")?;
+        }
     }
     Ok(if report.credentials.fails() {
         ExitCode::GeneralFailure
@@ -251,6 +381,10 @@ fn write_requirement(
         "  {}",
         requirement.next_action(report.organization, report.project)
     )?;
+    if let Some(held) = &report.grants {
+        writeln!(output)?;
+        held.of(requirement.kind).write_human(output)?;
+    }
     writeln!(output)
 }
 
@@ -315,6 +449,9 @@ const fn node_label(kind: NodeKind) -> &'static str {
 #[serde(rename_all = "camelCase")]
 struct JsonReport<'a> {
     schema_version: u8,
+    /// `report`, when the report follows the grant flow's events (REQ-CREDREADY-25).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    event: Option<&'static str>,
     command: &'static str,
     deployment: Option<&'a str>,
     workflows: &'a [String],
@@ -324,11 +461,12 @@ struct JsonReport<'a> {
 }
 
 impl<'a> JsonReport<'a> {
-    fn from_report(report: &'a Report<'a>) -> Self {
+    fn from_report(report: &'a Report<'a>, event: Option<&'static str>) -> Self {
         let credentials = &report.credentials;
         let summary = credentials.summary();
         Self {
             schema_version: 1,
+            event,
             command: super::COMMAND_NAME,
             deployment: report.deployment,
             workflows: &credentials.workflows,
@@ -364,10 +502,13 @@ struct JsonRequirement<'a> {
     cloud: Option<&'static str>,
     next_action: String,
     origins: Vec<JsonDeclaration<'a>>,
+    /// What the member holds of the kind's provider, with `--grants` (REQ-CREDREADY-22).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    grant: Option<grants::ProviderView<'a>>,
 }
 
 impl<'a> JsonRequirement<'a> {
-    fn from_requirement(requirement: &'a CredentialRequirement, report: &Report<'_>) -> Self {
+    fn from_requirement(requirement: &'a CredentialRequirement, report: &'a Report<'a>) -> Self {
         Self {
             kind: requirement.kind.as_str(),
             state: requirement.state(),
@@ -379,6 +520,7 @@ impl<'a> JsonRequirement<'a> {
                 .iter()
                 .map(JsonDeclaration::from_declaration)
                 .collect(),
+            grant: report.grants.as_ref().map(|held| held.of(requirement.kind)),
         }
     }
 }

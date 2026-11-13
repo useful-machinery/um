@@ -16,7 +16,7 @@ pub(super) mod deauthorize;
 mod list;
 pub(super) mod material;
 mod organization;
-mod output;
+pub(super) mod output;
 mod program;
 pub(super) mod projection;
 mod replacement;
@@ -28,11 +28,14 @@ use clap::{Args, Subcommand};
 
 use crate::exit_code::ExitCode;
 use um_api::{
-    MEMBER_GRANT_PAGE, MemberGrant, MemberGrantApi, MemberGrantFailure, MemberGrantState,
+    MEMBER_GRANT_PAGE, MemberGrant, MemberGrantApi, MemberGrantFailure, MemberGrantKind,
+    MemberGrantState,
 };
 use um_human_auth::Deployment;
 
 use confirmation::Stated;
+
+pub(super) use create::Flow;
 
 pub(super) const ABOUT: &str = "Manage what Useful Machinery may do as you at other providers";
 
@@ -180,6 +183,31 @@ fn resolve(api: &MemberGrantApi, grant: &GrantArg) -> Result<Resolved, MemberGra
             ids: held.into_iter().map(|grant| grant.id).collect(),
         }),
     }
+}
+
+/// The signed-in member's unrevoked grants of both kinds, read as `um grant list` reads them
+/// with the human session alone; with `organization`, an ID or a slug, only that
+/// organization's among the coding agents' grants (REQ-CREDREADY-22).
+pub(super) fn held(
+    deployment: &Deployment,
+    policy: um_api::HttpTransportPolicy,
+    organization: Option<&str>,
+) -> anyhow::Result<Result<Vec<MemberGrant>, MemberGrantFailure>> {
+    super::with_human_session_api(deployment, policy, |api: &MemberGrantApi| {
+        let organization = organization
+            .map(|named| organization::named(api, named))
+            .transpose()?;
+        Ok(every_grant(api)?
+            .into_iter()
+            .filter(|grant| {
+                unrevoked(grant)
+                    && (grant.kind == MemberGrantKind::GrantKindOAuth
+                        || organization.as_ref().is_none_or(|organization| {
+                            grant.organization_id.as_deref() == Some(organization.id.as_str())
+                        }))
+            })
+            .collect())
+    })
 }
 
 fn unrevoked(grant: &MemberGrant) -> bool {

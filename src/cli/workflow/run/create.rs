@@ -58,11 +58,11 @@ use um_execution::{
 use um_execution::{
     CONTROL_CANCEL, CONTROL_INTERRUPT, CONTROL_STOP, CapturedValue, ChildCommitFailure,
     ChildInputValue, ChildRunControl, ChildRunDispatcher, ChildRunOutcome, ChildRunParent,
-    ChildRunRequest, ChildRuns, ControlEvent, EnteredWait, ExportValue, LocalRetryBeginError,
-    LocalRetryOpen, Mirror, RejectionDiagnostic, Scheduling, WaitKind, WaitRecord,
-    acquire_local_retry, adopted_child_outcome, append_control, attempt_controls,
-    await_child_start_gate, position_path, read_controls, read_numbered_controls, stop_in_force,
-    wait_payload,
+    ChildRunRequest, ChildRuns, ControlEvent, ControlsLock, EnteredWait, ExportValue,
+    LocalRetryBeginError, LocalRetryOpen, Mirror, RejectionDiagnostic, Scheduling, WaitKind,
+    WaitRecord, acquire_local_retry, adopted_child_outcome, append_control, attempt_controls,
+    await_child_start_gate, await_release_gate, await_settled_gate, position_path, read_controls,
+    read_numbered_controls, stop_in_force, wait_payload,
 };
 use um_execution::{
     DefinitionError, SubjectClaim, SubjectError, WITHDRAWN_OUTCOME, WorkflowHome, check_subject,
@@ -1017,6 +1017,13 @@ impl Drop for AbortOnDrop {
 
 struct AttemptTeardown {
     run: Option<LocalAttemptOwner>,
+    /// The run's controls lock a failed attempt that ends the run takes for its spend
+    /// (REQ-LOCALRUN-211), declared after `run` so it is released after the run lock.
+    controls: Option<ControlsLock>,
+    /// The run's controls lock an attempt that ended `continued` and chains took before it
+    /// released the run lock, which the attempt loop carries until the next attempt's
+    /// acquisition tried the run lock (REQ-LOCALRUN-214, INV-ENGINE-39).
+    bridge: Option<ControlsLock>,
     /// The outcome the run record takes when the attempt ends without a published result
     /// (REQ-WFEXEC-57).
     failure_outcome: String,
@@ -1044,6 +1051,8 @@ impl AttemptTeardown {
     ) -> Self {
         Self {
             run: Some(run),
+            controls: None,
+            bridge: None,
             failure_outcome: failure_outcome.to_owned(),
             signal_task,
             private_staging: None,
@@ -1117,13 +1126,18 @@ impl AttemptTeardown {
             let cleanup_failed = !matches!(cleanup, Ok(false));
             let outcome = self.failure_outcome.clone();
             let mirror = self.mirror.take();
-            if let Ok(run) = blocking_operation(move || {
+            if let Ok((run, controls)) = blocking_operation(move || {
                 record_private_cleanup_failure(&run, cleanup_failed);
                 // REQ-LOCALRUN-206: an attempt left unsettled leaves the record `running`,
                 // the abandoned attempt a continuation settles, and performs no `onOutcome`.
                 if !run.attempt_settled() {
-                    return Ok(run);
+                    return Ok((run, None));
                 }
+                // REQ-LOCALRUN-211: the attempt ends the run, so it spends every withdrawal
+                // recorded before it under the controls lock, kept until the run lock is
+                // released.
+                let controls = run.lock_controls().ok();
+                let _ = run.spend_withdrawals();
                 let exited =
                     run.update_run_record(RunState::Exited, run.attempt_number(), Some(&outcome));
                 // REQ-LOCALRUN-191: the failure outcome's `onOutcome`, once the record reads it.
@@ -1133,11 +1147,12 @@ impl AttemptTeardown {
                         Box::new(move |mirror, target| mirror.outcome(target, &outcome)),
                     );
                 }
-                Ok::<_, std::convert::Infallible>(run)
+                Ok::<_, std::convert::Infallible>((run, controls))
             })
             .await
             {
                 self.run = Some(run);
+                self.controls = controls;
             }
         }
         if let Some(host) = self.host.as_mut() {
@@ -1157,6 +1172,8 @@ impl Drop for AttemptTeardown {
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             let mut pending = Self {
                 run: self.run.take(),
+                controls: self.controls.take(),
+                bridge: None,
                 failure_outcome: std::mem::take(&mut self.failure_outcome),
                 signal_task: self.signal_task.take(),
                 private_staging: self.private_staging.take(),
@@ -1344,6 +1361,7 @@ async fn execute_owned_attempt_with(
                 .source()
                 .interruption_requested() =>
         {
+            let bridge = attempt.bridge.take();
             let signal_task = start_signal_observation(cancellation.clone(), UnixSignals::new()?);
             Box::pin(super::resume::continue_run(
                 super::resume::Continuation {
@@ -1353,6 +1371,7 @@ async fn execute_owned_attempt_with(
                     execution_root: None,
                     leaf,
                     edge: Some(edge.into()),
+                    bridge,
                 },
                 config,
                 cancellation,
@@ -1738,6 +1757,15 @@ async fn execute_attempt_phases(
             execution.outcome,
             RunOutcome::Waiting { .. } | RunOutcome::Succeeded | RunOutcome::Failed { .. }
         );
+    // A test seam between the settlement and the first read; nothing outside `test-fixtures`.
+    if !quiet {
+        blocking_operation(await_settled_gate)
+            .await
+            .map_err(|error| match error {
+                BlockingOperationError::Operation(error) => anyhow::Error::new(error),
+                BlockingOperationError::WorkerUnavailable => anyhow!("await the settled gate"),
+            })?;
+    }
     let withdrawn = settles_withdrawable && attempt_withdrawal_pending(attempt).await?;
     // REQ-WFEXEC-61, REQ-LOCALRUN-178: an attempt that ends in a wait chooses no outcome
     // and writes its wait record before the run record reads `waiting`.
@@ -1834,6 +1862,7 @@ async fn execute_attempt_phases(
         .then(|| source.cancellation_reason())
         .flatten()
         .filter(|_| continued);
+    let chains = !quiet && continued && held_back.is_none();
     let owned_run = attempt
         .run
         .take()
@@ -1891,7 +1920,7 @@ async fn execute_attempt_phases(
         .ok_or_else(|| anyhow!("local attempt ownership unavailable"))?;
     let exit_mirror = attempt.mirror.take();
     let wait_written = wait_record.is_some();
-    let (cleanup_failed, cleanup_state, released_ownership) = complete_blocking_phase(
+    let (cleanup_failed, cleanup_state, released_ownership, bridge) = complete_blocking_phase(
         blocking_operation(move || {
             let execution_staging_failed =
                 release_execution_staging(&inputs, agent_staging.as_ref(), &artifacts);
@@ -1905,18 +1934,29 @@ async fn execute_attempt_phases(
             // REQ-WFEXEC-73: a withdrawal recorded while the attempt finished, after the first
             // read, is read again under the run lock as the final record is written. It ends
             // the run `withdrawn` in place of the outcome or wait the attempt chose: the wait
-            // record it wrote is removed, and an `onWait` already written stays. The read
-            // holds the run's controls lock until the run lock is released, so a `withdraw`
-            // either appends before it or finds the run released (REQ-LOCALRUN-186); a lock
-            // that cannot be taken leaves the read unserialized, as unreadable controls
-            // withdraw nothing. An attempt that ends the run `withdrawn` spends what it
-            // honored under that lock: its `settledAt` is taken again after the read, so a
-            // retry of the run is not withdrawn by it again.
+            // record it wrote is removed, and an `onWait` already written stays. Every attempt
+            // that ends the run, a `canceled` one included, holds the run's controls lock from
+            // before that read until the run lock is released, so a `withdraw` either appends
+            // before it or finds the run released (REQ-LOCALRUN-186); a lock that cannot be
+            // taken leaves the read unserialized, as unreadable controls withdraw nothing.
+            // REQ-LOCALRUN-211: under that lock it spends every withdrawal recorded before it,
+            // honored or not: its `settledAt` is taken again when one is later, so a retry of
+            // the run is not withdrawn by it. A `canceled` attempt keeps its outcome.
+            // REQ-LOCALRUN-214, INV-ENGINE-39: an attempt that ended `continued` and chains, one
+            // no interruption holds back, takes the same lock before it releases the run and
+            // hands it to the next attempt's acquisition, so a `withdraw` arriving between the
+            // attempts waits for that acquisition and finds the run held.
+            let ends_run = !quiet && !continued;
             let last_read = settles_withdrawable && !withdrawn;
-            let controls = settles_withdrawable.then(|| owned_run.lock_controls().ok());
+            let controls = (ends_run || chains)
+                .then(|| owned_run.lock_controls().ok())
+                .flatten();
             let withdrawn_late = last_read && owned_run.withdrawal_pending().unwrap_or(false);
-            let spent = if withdrawn || withdrawn_late {
-                owned_run.spend_withdrawals()
+            let spent = if ends_run {
+                // A test seam before the final record; nothing outside `test-fixtures`.
+                owned_run
+                    .spend_withdrawals()
+                    .and_then(|()| await_release_gate())
             } else {
                 Ok(())
             };
@@ -1941,7 +1981,7 @@ async fn execute_attempt_phases(
             };
             let cleanup_state = cleanup_state.and(spent).and(record_state);
             let released_ownership = owned_run.release();
-            drop(controls);
+            let bridge = controls.filter(|_| chains);
             // REQ-LOCALRUN-191: the chosen outcome's `onOutcome`, once the record reads it and
             // the run is released, so a write never holds the run.
             if let (true, Some(outcome), Some(mirror)) = (exited, outcome, exit_mirror) {
@@ -1950,13 +1990,19 @@ async fn execute_attempt_phases(
                     Box::new(move |mirror, target| mirror.outcome(target, &outcome)),
                 );
             }
-            Ok::<_, std::convert::Infallible>((cleanup_failed, cleanup_state, released_ownership))
+            Ok::<_, std::convert::Infallible>((
+                cleanup_failed,
+                cleanup_state,
+                released_ownership,
+                bridge,
+            ))
         })
         .await,
         attempt.host()?,
         "release private local workflow staging",
     )
     .await?;
+    attempt.bridge = bridge;
     attempt.host()?.complete_cleanup(cleanup_failed);
     let state_commit_failed = state_publication.is_err() || cleanup_state.is_err();
     attempt

@@ -107,29 +107,28 @@ impl Command {
 
 /// Withdraws the run `target` opened, as `um workflow run withdraw` does (REQ-LOCALRUN-186);
 /// `um workflow run event` applies a control trigger's `withdraw` through it
-/// (REQ-LOCALRUN-208).
+/// (REQ-LOCALRUN-208). A run a live process holds goes to `withdraw_live`, and so does a
+/// `running` one found without a lock holder, which may be a process between the attempts it
+/// chains (REQ-LOCALRUN-214); anything else is ended as `end_unheld` does.
 pub(super) fn withdraw_run(target: &ControlTarget) -> Result<Acted, ControlFailure> {
-    end_run(target, withdraw_live, CONTROL_WITHDRAW, WITHDRAWN_OUTCOME)
+    match &target.inspection {
+        WaitInspection::Locked(_)
+        | WaitInspection::Continued { .. }
+        | WaitInspection::NoWait {
+            state: Some(RunState::Running),
+            ..
+        } => withdraw_live(target),
+        _ => end_unheld(target, CONTROL_WITHDRAW, WITHDRAWN_OUTCOME),
+    }
 }
 
 /// Cancels the run `target` opened, as `um workflow run cancel` does (REQ-LOCALRUN-186);
 /// `um workflow run event` applies a control trigger's `cancel` through it
-/// (REQ-LOCALRUN-208).
+/// (REQ-LOCALRUN-208): a live one through `cancel_live`, and otherwise as `end_unheld` does.
 pub(super) fn cancel_run(target: &ControlTarget) -> Result<Acted, ControlFailure> {
-    end_run(target, cancel_live, CONTROL_CANCEL, CANCELED_OUTCOME)
-}
-
-/// Ends the run with `event` and `outcome`: a live one through `live`, and otherwise as
-/// `end_unheld` does.
-fn end_run(
-    target: &ControlTarget,
-    live: fn(&ControlTarget) -> Result<Acted, ControlFailure>,
-    event: &str,
-    outcome: &'static str,
-) -> Result<Acted, ControlFailure> {
     match &target.inspection {
-        WaitInspection::Locked(_) => live(target),
-        _ => end_unheld(target, event, outcome),
+        WaitInspection::Locked(_) => cancel_live(target),
+        _ => end_unheld(target, CONTROL_CANCEL, CANCELED_OUTCOME),
     }
 }
 
@@ -214,8 +213,11 @@ fn end_waiting(
 
 /// Ends a run whose record reads `running` but whose process is gone with `outcome`
 /// (REQ-LOCALRUN-186): under the run lock, once the mirror's write has its credentials
-/// (REQ-LOCALRUN-204), appends `event` naming no wait, marks the record `exited` and settles
-/// the abandoned attempt (REQ-CONTINUE-2), creating no attempt.
+/// (REQ-LOCALRUN-204), appends `event` naming no wait and ends the run through
+/// `PendingLocalContinuation::end_running`, which marks the record `exited` and settles the
+/// abandoned attempt (REQ-CONTINUE-2) or, for a run interrupted between chained attempts, spends
+/// the withdrawals recorded for it (REQ-LOCALRUN-211), creating no attempt. It takes the
+/// controls lock itself, so this command holds none here.
 fn end_abandoned(
     target: &ControlTarget,
     event: &str,
@@ -225,8 +227,7 @@ fn end_abandoned(
     let mirror = mirror(target, &pending);
     outcome_credentials(mirror.as_ref(), outcome)?;
     let control = target.record(event, None, None)?;
-    pending.update_run_record(RunState::Exited, target.record.attempts, Some(outcome))?;
-    pending.settle_abandoned()?;
+    pending.end_running(outcome)?;
     write_outcome(mirror.as_ref(), outcome);
     Ok(Acted {
         control,
@@ -266,29 +267,31 @@ fn write_outcome(mirror: Option<&Mirror>, outcome: &'static str) {
     }
 }
 
-/// Withdraws a run a live process holds (REQ-LOCALRUN-186): under the run's controls lock,
-/// which that process takes for its last read of the withdrawals and keeps until it releases
-/// the run, appends `control.withdraw` naming no wait while the process still holds the run,
-/// so the process honors it before its next `workflow` step starts or, when it reaches none,
-/// as its attempt settles (REQ-WFEXEC-73); `withdraw_pending` when one it has not honored is
-/// already recorded. A process that released the run in the meantime has read for the last
-/// time, so the command appends nothing there and ends the run as it finds it again
-/// (`end_unheld`).
+/// Withdraws a run a live process holds (REQ-LOCALRUN-186, INV-ENGINE-39): under the run's
+/// controls lock, which that process takes for its last read of the withdrawals and keeps
+/// until it releases the run, and which a process that chains attempts keeps from the release
+/// of one until it holds the run for the next (REQ-LOCALRUN-214), the command opens the run
+/// again. When a lock holds the run, whether or not the system reports its holder's process,
+/// it appends `control.withdraw` naming no wait, so the holder honors it before its next
+/// `workflow` step starts or, when it reaches none, as its attempt settles (REQ-WFEXEC-73);
+/// `withdraw_pending` when one it has not honored is already recorded. A run no lock holds
+/// has been released for the last time, or its process is gone, so the command appends
+/// nothing there and ends the run as it finds it again (`end_unheld`).
 fn withdraw_live(target: &ControlTarget) -> Result<Acted, ControlFailure> {
     // A test seam between the inspection and the controls lock; nothing outside
     // `test-fixtures`.
     await_run_lock_gate()?;
     let probe = inspect_wait(&target.run_directory, &um_execution::NoConditions)?;
     let controls = probe.lock_controls()?;
-    if lock_holder(&target.run_directory)?.is_none() {
+    let current = super::control::open(&target.run_directory)?;
+    if !matches!(current.inspection, WaitInspection::Locked(_)) {
         drop(controls);
-        let released = super::control::open(&target.run_directory)?;
-        return end_unheld(&released, CONTROL_WITHDRAW, WITHDRAWN_OUTCOME);
+        return end_unheld(&current, CONTROL_WITHDRAW, WITHDRAWN_OUTCOME);
     }
     if probe.withdrawal_pending()? {
         return Err(super::control::withdraw_pending().into());
     }
-    let control = target.record(CONTROL_WITHDRAW, None, None)?;
+    let control = current.record(CONTROL_WITHDRAW, None, None)?;
     drop(controls);
     Ok(Acted::recorded(control, None))
 }

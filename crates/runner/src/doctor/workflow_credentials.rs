@@ -319,7 +319,8 @@ impl CredentialRequirement {
             ),
             CredentialKind::ClaudeCode | CredentialKind::Codex => {
                 return format!(
-                    "Sign {title} in on the runner host as the user that runs um runner serve."
+                    "Sign {title} in on the runner host as the user that runs um runner serve, or give the runner your own login with um grant create {} and um grant authorize GRANT RUNNER --yes.",
+                    self.kind.as_str()
                 );
             }
         };

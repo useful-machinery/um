@@ -5,8 +5,9 @@ use anyhow::anyhow;
 use clap::Args;
 
 use um_execution::{
-    CONTROL_RETRY, CancellationSource, LocalRetryBeginError, LocalRetryOpen, WaitInspection,
-    WaitKind, WorkflowRunOutput, acquire_local_retry, admit_local_workflow, await_run_lock_gate,
+    CONTROL_RETRY, CancellationSource, LocalRetryBeginError, LocalRetryOpen, PendingLocalRetry,
+    WITHDRAWN_OUTCOME, WaitInspection, WaitKind, WorkflowRunOutput, acquire_local_retry,
+    admit_local_workflow, await_begin_gate, await_run_lock_gate,
     reconcile_current_result_publication,
 };
 
@@ -143,6 +144,12 @@ impl Command {
                 return Err(error.into());
             }
         };
+        // REQ-LOCALRUN-213, REQ-LOCALRUN-186: a withdrawal no process honored over the run's
+        // open latest attempt ends the run `withdrawn` without an attempt, as `resume` ends it;
+        // the settlement `begin` makes would spend it.
+        if matches!(pending.withdrawal_unhonored(), Ok(true)) {
+            return end_withdrawn(pending, &signal_task, &presentation_config).await;
+        }
         let (workflow, inputs, maximum_parallel_steps) = {
             let (workflow, inputs, maximum_parallel_steps) = pending.execution_specification();
             (workflow.clone(), inputs.clone(), maximum_parallel_steps)
@@ -274,22 +281,40 @@ impl Command {
             ));
         }
         let admitted_for_begin = admitted.clone();
-        let owned_run =
-            match tokio::task::spawn_blocking(move || pending.begin(&admitted_for_begin)).await {
-                Ok(Ok(owned_run)) => owned_run,
-                Ok(Err(LocalRetryBeginError::Rejected(rejection))) => {
-                    signal_task.abort();
-                    return render_retry_rejection(presentation_config, &rejection);
-                }
-                Ok(Err(LocalRetryBeginError::Operational(error))) => {
-                    signal_task.abort();
-                    return super::create::diagnose(error);
-                }
-                Err(_) => {
-                    signal_task.abort();
-                    return Err(anyhow::anyhow!("commit local workflow retry attempt").into());
-                }
-            };
+        // REQ-LOCALRUN-213: the attempt begins under the controls lock only once no withdrawal
+        // is unhonored over the run, one recorded since the check above included; otherwise the
+        // retry is handed back to end the run `withdrawn`.
+        let begun = tokio::task::spawn_blocking(move || {
+            // A test seam before the controls lock; nothing outside `test-fixtures`.
+            await_begin_gate()?;
+            let controls = pending.lock_controls()?;
+            if matches!(pending.withdrawal_unhonored(), Ok(true)) {
+                drop(controls);
+                return Ok(super::resume::Begun::Withdrawn(Box::new(pending)));
+            }
+            let owned_run = pending.begin(&admitted_for_begin);
+            drop(controls);
+            owned_run.map(|owned_run| super::resume::Begun::Owned(Box::new(owned_run)))
+        })
+        .await;
+        let owned_run = match begun {
+            Ok(Ok(super::resume::Begun::Owned(owned_run))) => *owned_run,
+            Ok(Ok(super::resume::Begun::Withdrawn(pending))) => {
+                return end_withdrawn(*pending, &signal_task, &presentation_config).await;
+            }
+            Ok(Err(LocalRetryBeginError::Rejected(rejection))) => {
+                signal_task.abort();
+                return render_retry_rejection(presentation_config, &rejection);
+            }
+            Ok(Err(LocalRetryBeginError::Operational(error))) => {
+                signal_task.abort();
+                return super::create::diagnose(error);
+            }
+            Err(_) => {
+                signal_task.abort();
+                return Err(anyhow::anyhow!("commit local workflow retry attempt").into());
+            }
+        };
         super::create::execute_owned_attempt(
             workflow,
             admitted,
@@ -379,6 +404,7 @@ impl Command {
                 execution_root: self.execution_root.clone(),
                 leaf: super::create::ExecutionLeaf::Retry,
                 edge: None,
+                bridge: None,
             },
             config,
             cancellation,
@@ -408,6 +434,40 @@ fn replacement_payload(
         "agentProfiles".to_owned(),
         profiles,
     )]))
+}
+
+/// Ends the `running` run `pending` holds `withdrawn` without an attempt through
+/// `PendingLocalRetry::end_running`, as `resume` ends it (`resume::end_withdrawn`), reported on
+/// the retry's own documents. The caller holds no controls lock.
+async fn end_withdrawn(
+    pending: PendingLocalRetry,
+    signal_task: &super::create::SignalObservation,
+    config: &um_execution::PresentationConfig,
+) -> super::super::super::CommandResult {
+    let attempt_number = match pending.prior_attempt_number() {
+        Ok(attempt_number) => attempt_number,
+        Err(error) => {
+            signal_task.abort();
+            return super::create::diagnose(error);
+        }
+    };
+    let (workflow, inputs, _) = pending.execution_specification();
+    let unattempted = super::resume::Unattempted::new(
+        pending.run_directory(),
+        attempt_number,
+        (workflow, inputs),
+        WorkflowRunOutput::new(config.clone(), io::stdout(), io::stderr())
+            .for_retry(pending.run_directory()),
+    );
+    super::resume::end_withdrawn(
+        pending,
+        unattempted,
+        signal_task,
+        config,
+        super::create::ExecutionLeaf::Retry,
+        |pending| pending.end_running(WITHDRAWN_OUTCOME),
+    )
+    .await
 }
 
 fn render_retry_rejection(

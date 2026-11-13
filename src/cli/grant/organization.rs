@@ -26,18 +26,7 @@ pub(super) fn resolve(
     example: &str,
 ) -> Result<Result<Organization, anyhow::Error>, MemberGrantFailure> {
     if let Some(named) = named {
-        if um_support::valid_typed_id(named, "org_") {
-            return Ok(Ok(Organization {
-                id: named.to_owned(),
-                slug: None,
-            }));
-        }
-        return api.organization_id(named).map(|id| {
-            Ok(Organization {
-                id,
-                slug: Some(named.to_owned()),
-            })
-        });
+        return self::named(api, named).map(Ok);
     }
     let invalid = MemberGrantFailure::InvalidResponse {
         credential_rejected: false,
@@ -68,4 +57,19 @@ pub(super) fn resolve(
              {slugs}\n\nName the one it is for with --organization:\n  {example}"
         )
     }))
+}
+
+/// The organization `named` names: an ID as given, a slug to the ID of the organization it
+/// names among the member's.
+pub(super) fn named(api: &MemberGrantApi, named: &str) -> Result<Organization, MemberGrantFailure> {
+    if um_support::valid_typed_id(named, "org_") {
+        return Ok(Organization {
+            id: named.to_owned(),
+            slug: None,
+        });
+    }
+    api.organization_id(named).map(|id| Organization {
+        id,
+        slug: Some(named.to_owned()),
+    })
 }

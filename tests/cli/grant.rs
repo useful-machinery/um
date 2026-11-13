@@ -5,21 +5,24 @@ use super::agent_logins::{
     CLAUDE_TOKEN_SENTINEL, CODEX_MATERIAL, DEVICE_CODE_PROMPT, FakeProgram, PASTE_CODE,
     PASTE_PROMPT, SENTINEL as CODEX_SENTINEL, SetupToken, SignIn, encoded, private_file,
 };
+use super::runner_doctor_workflow::{
+    LINEAR_LIST, connection_page, held as held_grant, requirement,
+};
 
 const TOKEN: &str = "unique-grant-list-session-token";
-const OAUTH_GRANT_ID: &str = "pgr_01k0z6r1w8f4jy2m7q9v3x5abc";
-const REVOKED_OAUTH_GRANT_ID: &str = "pgr_01k0z6r1w8f4jy2m7q9v3x5abd";
-const NATIVE_GRANT_ID: &str = "agl_01k0z6r1w8f4jy2m7q9v3x5abc";
+pub(super) const OAUTH_GRANT_ID: &str = "pgr_01k0z6r1w8f4jy2m7q9v3x5abc";
+pub(super) const REVOKED_OAUTH_GRANT_ID: &str = "pgr_01k0z6r1w8f4jy2m7q9v3x5abd";
+pub(super) const NATIVE_GRANT_ID: &str = "agl_01k0z6r1w8f4jy2m7q9v3x5abc";
 const OTHER_NATIVE_GRANT_ID: &str = "agl_01k0z6r1w8f4jy2m7q9v3x5abd";
-const IDENTITY_ID: &str = "idn_01k0z6r1w8f4jy2m7q9v3x5abc";
-const ORGANIZATION_ID: &str = "org_01k0z6r1w8f4jy2m7q9v3x5abc";
-const RUNNER_ID: &str = "rnr_01k0z6r1w8f4jy2m7q9v3x5abc";
-const ENDED_RUNNER_ID: &str = "rnr_01k0z6r1w8f4jy2m7q9v3x5abd";
+pub(super) const IDENTITY_ID: &str = "idn_01k0z6r1w8f4jy2m7q9v3x5abc";
+pub(super) const ORGANIZATION_ID: &str = "org_01k0z6r1w8f4jy2m7q9v3x5abc";
+pub(super) const RUNNER_ID: &str = "rnr_01k0z6r1w8f4jy2m7q9v3x5abc";
+pub(super) const ENDED_RUNNER_ID: &str = "rnr_01k0z6r1w8f4jy2m7q9v3x5abd";
 const RUN_ID: &str = "run_01k0z6r1w8f4jy2m7q9v3x5abc";
 const EMAIL: &str = "ada@example.test";
 // Material no fixture is meant to carry: every grant below carries it in a member no model
 // names, so it stands for anything a response might wrongly add.
-const SENTINEL: &str = "private-grant-list-material-sentinel";
+pub(super) const SENTINEL: &str = "private-grant-list-material-sentinel";
 
 fn prepared(responses: Vec<Vec<u8>>) -> (ScriptedServer, tempfile::TempDir, std::path::PathBuf) {
     let server = ScriptedServer::respond(responses);
@@ -54,7 +57,7 @@ fn with_material(mut grant: serde_json::Value) -> serde_json::Value {
     grant
 }
 
-fn page(items: &[serde_json::Value], next_cursor: Option<&str>) -> Vec<u8> {
+pub(super) fn page(items: &[serde_json::Value], next_cursor: Option<&str>) -> Vec<u8> {
     let items: Vec<_> = items.iter().cloned().map(with_material).collect();
     let mut body = serde_json::json!({"items": items});
     if let Some(cursor) = next_cursor {
@@ -68,7 +71,7 @@ fn one(grant: &serde_json::Value) -> Vec<u8> {
 }
 
 // A GitHub grant authorized for one runner.
-fn oauth_grant(id: &str, provider: &str, state: &str) -> serde_json::Value {
+pub(super) fn oauth_grant(id: &str, provider: &str, state: &str) -> serde_json::Value {
     serde_json::json!({
         "id": id,
         "kind": "oauth",
@@ -119,7 +122,7 @@ fn native_grant(id: &str, state: &str) -> serde_json::Value {
 // The Codex grant authorized for one runner, which reported it ready and accepted at its last
 // use, after another runner's authorization ended while it was serving a run (REQ-GRANT-13,
 // REQ-GRANT-47, REQ-GRANT-48).
-fn native_grant_in_use() -> serde_json::Value {
+pub(super) fn native_grant_in_use() -> serde_json::Value {
     let mut grant = native_grant(NATIVE_GRANT_ID, "active");
     grant["authorizations"] = serde_json::json!([{
         "id": "aga_01k0z6r1w8f4jy2m7q9v3x5abc",
@@ -281,7 +284,7 @@ fn two_pages() -> [Vec<u8>; 2] {
     ]
 }
 
-const LIST_FIRST_PAGE: &str = "GET /api/v1/me/grants?kind=all&limit=200 HTTP/1.1";
+pub(super) const LIST_FIRST_PAGE: &str = "GET /api/v1/me/grants?kind=all&limit=200 HTTP/1.1";
 const LIST_SECOND_PAGE: &str = "GET /api/v1/me/grants?kind=all&limit=200&cursor=grants-2 HTTP/1.1";
 const READ_IDENTITIES: &str = "GET /api/v1/me/identities?limit=200 HTTP/1.1";
 const READ_ORGANIZATION: &str = "GET /api/v1/organizations/org_01k0z6r1w8f4jy2m7q9v3x5abc HTTP/1.1";
@@ -1863,6 +1866,11 @@ impl Opener {
     }
 }
 
+/// The leading words of `um grant create`.
+const GRANT_CREATE: &[&str] = &["grant", "create"];
+/// The leading words of `um runner doctor`.
+const RUNNER_DOCTOR: &[&str] = &["runner", "doctor"];
+
 fn create_command(
     server: &ScriptedServer,
     credential: &Path,
@@ -1870,9 +1878,13 @@ fn create_command(
     place: Place,
     args: &[&str],
 ) -> Command {
-    let mut arguments = vec!["grant", "create"];
-    arguments.extend_from_slice(args);
-    opener_command(server, credential, opener, place, &arguments)
+    opener_command(
+        server,
+        credential,
+        opener,
+        place,
+        &[GRANT_CREATE, args].concat(),
+    )
 }
 
 /// `um` with `arguments`, where `place` decides whether this machine has a browser and the
@@ -2277,6 +2289,44 @@ fn create_does_not_hold_a_revoked_grant_or_one_of_another_provider_against_a_con
     assert_eq!(request_lines(&server.finish()), [LIST_OAUTH, START_CONSENT]);
 }
 
+/// Runs `command` with a pseudo-terminal as its standard input and standard error, waits for
+/// its `[y/N]` question, answers it with `answer`, and returns what the terminal showed up to
+/// the question and the command's output.
+fn answered(mut command: Command, answer: &str) -> (String, Output) {
+    let pty = open_test_pty(None).unwrap();
+    command
+        .stdin(Stdio::from(pty.slave.try_clone().unwrap()))
+        .stderr(Stdio::from(pty.slave))
+        .stdout(Stdio::piped());
+    let child = command.spawn().unwrap();
+    // The command holds this process's copies of the terminal's peer; once they close,
+    // reading the terminal ends when the child exits.
+    drop(command);
+    let (sender, chunks) = mpsc::channel();
+    let mut reader = fs::File::from(rustix::io::dup(&pty.master).unwrap());
+    let reading = thread::spawn(move || {
+        let mut buffer = [0; 512];
+        while let Ok(count) = reader.read(&mut buffer) {
+            if count == 0 || sender.send(buffer[..count].to_vec()).is_err() {
+                break;
+            }
+        }
+    });
+    let mut transcript = String::new();
+    while !transcript.contains("[y/N]") {
+        let chunk = chunks
+            .recv()
+            .unwrap_or_else(|_| panic!("no question was asked: {transcript}"));
+        transcript.push_str(&String::from_utf8_lossy(&chunk));
+    }
+    let mut writer = fs::File::from(pty.master);
+    writer.write_all(answer.as_bytes()).unwrap();
+    let output = child.wait_with_output().unwrap();
+    drop(writer);
+    reading.join().unwrap();
+    (transcript, output)
+}
+
 // REQ-GRANT-73
 #[test]
 fn create_on_a_terminal_asks_before_it_replaces_a_held_grant() {
@@ -2290,46 +2340,16 @@ fn create_on_a_terminal_asks_before_it_replaces_a_held_grant() {
         }
         let (server, _directory, credential) = prepared(responses);
         let opener = Opener::new(0);
-        let pty = open_test_pty(None).unwrap();
-        let mut command = create_command(
+        let command = create_command(
             &server,
             &credential,
             &opener,
             Place::Remote,
             &["linear", "--no-wait"],
         );
-        command
-            .stdin(Stdio::from(pty.slave.try_clone().unwrap()))
-            .stderr(Stdio::from(pty.slave))
-            .stdout(Stdio::piped());
-        let child = command.spawn().unwrap();
-        // The command holds this process's copies of the terminal's peer; once they close,
-        // reading the terminal ends when the child exits.
-        drop(command);
-        let (sender, chunks) = mpsc::channel();
-        let mut reader = fs::File::from(rustix::io::dup(&pty.master).unwrap());
-        let reading = thread::spawn(move || {
-            let mut buffer = [0; 512];
-            while let Ok(count) = reader.read(&mut buffer) {
-                if count == 0 || sender.send(buffer[..count].to_vec()).is_err() {
-                    break;
-                }
-            }
-        });
-        let mut transcript = String::new();
-        while !transcript.contains("[y/N]") {
-            let chunk = chunks
-                .recv()
-                .unwrap_or_else(|_| panic!("no question was asked: {transcript}"));
-            transcript.push_str(&String::from_utf8_lossy(&chunk));
-        }
-        assert!(transcript.contains(OAUTH_GRANT_ID), "{transcript}");
-        let mut writer = fs::File::from(pty.master);
-        writer.write_all(answer.as_bytes()).unwrap();
-        let output = child.wait_with_output().unwrap();
-        drop(writer);
-        reading.join().unwrap();
+        let (transcript, output) = answered(command, answer);
 
+        assert!(transcript.contains(OAUTH_GRANT_ID), "{transcript}");
         assert_eq!(
             output.status.code(),
             Some(if replaced { 0 } else { 2 }),
@@ -2497,7 +2517,8 @@ fn run_fake(
         environment,
         checkout: None,
     };
-    let output = run_programs(server, credential, home, fakes, place, args, input);
+    let arguments = [GRANT_CREATE, args].concat();
+    let output = run_programs(server, credential, home, fakes, place, &arguments, input);
     assert!(opener.opened(0).is_empty());
     output
 }
@@ -2512,15 +2533,16 @@ struct Fakes<'a> {
     checkout: Option<Checkout<'a>>,
 }
 
-/// The directory `um grant create` runs in and the directory of the fake `git` it finds there.
+/// The directory `um` runs in and the directory of the fake `git` it finds there.
 #[derive(Clone, Copy)]
 struct Checkout<'a> {
     directory: &'a Path,
     git: &'a Path,
 }
 
-/// Runs `um grant create` from the member's `home` with `fakes` and standard input `input`, or
-/// none, and checks what [`run_native`] promises of its outcome.
+/// Runs `um` with `arguments`, its command's leading words first, from the member's `home` with
+/// `fakes` and standard input `input`, or none, and checks what [`run_native`] promises of its
+/// outcome.
 fn run_programs(
     server: &ScriptedServer,
     credential: &Path,
@@ -2532,7 +2554,7 @@ fn run_programs(
         checkout,
     }: Fakes<'_>,
     place: Place,
-    args: &[&str],
+    arguments: &[&str],
     input: Option<&[u8]>,
 ) -> Output {
     let path = std::env::join_paths(
@@ -2541,7 +2563,7 @@ fn run_programs(
             .chain(checkout.map(|checkout| checkout.git)),
     )
     .unwrap();
-    let mut command = create_command(server, credential, opener, place, args);
+    let mut command = opener_command(server, credential, opener, place, arguments);
     command
         .env("PATH", path)
         .envs(home.variables())
@@ -3529,6 +3551,27 @@ fn run_in(
     checkout: Option<Checkout<'_>>,
     args: &[&str],
 ) -> Output {
+    run_command_in(
+        server,
+        credential,
+        opener,
+        programs,
+        checkout,
+        GRANT_CREATE,
+        args,
+    )
+}
+
+/// [`run_in`] for the command whose leading words are `command`, such as [`RUNNER_DOCTOR`].
+fn run_command_in(
+    server: &ScriptedServer,
+    credential: &Path,
+    opener: &Opener,
+    programs: &[&FakeProgram],
+    checkout: Option<Checkout<'_>>,
+    command: &[&str],
+    args: &[&str],
+) -> Output {
     let home = AmbientHome::new();
     let fakes = Fakes {
         opener,
@@ -3536,7 +3579,16 @@ fn run_in(
         environment: &[(CLAUDE_FLOW, "browser")],
         checkout,
     };
-    run_programs(server, credential, &home, fakes, Place::Desktop, args, None)
+    let arguments = [command, args].concat();
+    run_programs(
+        server,
+        credential,
+        &home,
+        fakes,
+        Place::Desktop,
+        &arguments,
+        None,
+    )
 }
 
 fn start_body(request: &str) -> serde_json::Value {
@@ -4321,15 +4373,17 @@ fn a_coding_agent_held_only_in_another_organization_is_selected_for_the_one_name
 }
 
 // REQ-GRANT-75
+// REQ-GRANT-79
 #[test]
 fn an_option_that_needs_a_provider_or_all_with_one_exits_2_before_any_request() {
     let directory = tempfile::tempdir().unwrap();
     let login = private_file(directory.path(), "auth.json", CODEX_MATERIAL.as_bytes());
     let login = login.to_str().unwrap();
-    let cases: [&[&str]; 5] = [
+    let cases: [&[&str]; 6] = [
         &["--from-file", login],
         &["--token-file", login],
         &["--replace"],
+        &["--all", "--replace"],
         &["--all", "linear"],
         &["codex", "--all"],
     ];
@@ -4541,10 +4595,10 @@ impl Tree {
 /// A fake `git` that records each invocation's arguments beside itself, answers
 /// `rev-parse --show-toplevel` with the nearest directory at or above the physical working
 /// directory that holds a `.git` marker, and fails anything else, so no `origin` remote is found.
-struct Git(tempfile::TempDir);
+pub(super) struct Git(pub(super) tempfile::TempDir);
 
 impl Git {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         Self(fake_git(
             "printf '%s\\n' \"$*\" >> \"${0%/*}/invoked\"\n\
              if [ \"$1 $2\" = 'rev-parse --show-toplevel' ]; then\n\
@@ -4567,7 +4621,7 @@ impl Git {
         })
     }
 
-    fn invocations(&self) -> Vec<String> {
+    pub(super) fn invocations(&self) -> Vec<String> {
         fs::read_to_string(self.0.path().join("invoked"))
             .map(|record| record.lines().map(str::to_owned).collect())
             .unwrap_or_default()
@@ -4733,6 +4787,896 @@ fn a_held_provider_is_passed_over_and_json_carries_the_plan_before_the_sign_ins(
         request_lines(&server.finish()),
         [LIST_EVERY_KIND, READ_SERVED, LIST_MEMBERSHIPS, IMPORT_GRANT]
     );
+}
+
+// The Claude Code grant `id` in Acme, authorized for a runner that reported it ready at its
+// generation and refused at its last use, so its status there is `reconnect_required`
+// (REQ-GRANT-53).
+fn claude_grant_refused(id: &str) -> serde_json::Value {
+    let mut grant = native_grant_in_use();
+    grant["id"] = id.into();
+    grant["provider"] = "claude_code".into();
+    grant["authorizations"][0]["report"]["lastUse"] = "refused".into();
+    grant
+}
+
+// The member's grants: a Linear grant whose consent lapsed and a Claude Code grant a runner
+// reported refused.
+fn needing_reconnect() -> Vec<u8> {
+    page(
+        &[
+            oauth_grant(OAUTH_GRANT_ID, "linear", "reconnect_required"),
+            claude_grant_refused(NATIVE_GRANT_ID),
+        ],
+        None,
+    )
+}
+
+// REQ-GRANT-79
+// REQ-GRANT-76
+// REQ-GRANT-73
+#[test]
+fn create_workflow_replaces_a_grant_that_needs_reconnecting_off_a_terminal_only_with_replace() {
+    let tree = Tree::linear_and_claude_code(true);
+    let git = Git::new();
+    let opener = Opener::new(0);
+
+    // Without --replace nothing is settled: both are passed over, and no sign-in starts.
+    let (server, _directory, credential) = prepared(vec![needing_reconnect(), serving_every()]);
+    let claude = FakeProgram::claude(SetupToken::Prints);
+    let kept = run_in(
+        &server,
+        &credential,
+        &opener,
+        &[&claude],
+        git.in_tree(&tree),
+        &["--workflow", "root.yaml", "--json"],
+    );
+
+    assert_eq!(kept.status.code(), Some(1), "{}", stderr(&kept));
+    let kept_events = events(&kept);
+    let plan = &kept_events[0];
+    assert_eq!(plan["event"], "workflow_requirements", "{kept_events:?}");
+    assert!(providers_of(plan, "selected").is_empty(), "{plan}");
+    assert!(providers_of(plan, "reconnect").is_empty(), "{plan}");
+    assert_eq!(providers_of(plan, "held"), ["linear", "claude_code"]);
+    assert_eq!(kept_events.len(), 2, "{kept_events:?}");
+    assert_eq!(
+        summary(&kept_events),
+        (
+            "failed".to_owned(),
+            outcomes(&[
+                ("linear", "reconnect_required"),
+                ("claude_code", "reconnect_required")
+            ])
+        )
+    );
+    assert_eq!(claude.recorded("arguments"), None);
+    assert!(opener.opened(0).is_empty());
+    assert_eq!(
+        request_lines(&server.finish()),
+        [LIST_EVERY_KIND, READ_SERVED]
+    );
+
+    // The report names the command that replaces each grant passed over.
+    let (server, _directory, credential) = prepared(vec![needing_reconnect(), serving_every()]);
+    let told = run_in(
+        &server,
+        &credential,
+        &opener,
+        &[&claude],
+        git.in_tree(&tree),
+        &["--workflow", "root.yaml"],
+    );
+
+    assert_eq!(told.status.code(), Some(1), "{}", stderr(&told));
+    let report = stdout(&told);
+    for provider in ["linear", "claude_code"] {
+        assert!(
+            report.contains(&format!("um grant create {provider} --replace")),
+            "{report}"
+        );
+    }
+    assert_eq!(
+        request_lines(&server.finish()),
+        [LIST_EVERY_KIND, READ_SERVED]
+    );
+
+    // With --replace the Linear consent runs and the Claude Code sign-in is stored as the held
+    // grant's next generation, not as a new import.
+    let (server, _directory, credential) = prepared(
+        [
+            vec![needing_reconnect(), serving_every()],
+            approved("linear").to_vec(),
+            vec![stored(CLAUDE_CODE, "200 OK", 3)],
+        ]
+        .concat(),
+    );
+    let claude = FakeProgram::claude(SetupToken::Prints);
+    let replaced = run_in(
+        &server,
+        &credential,
+        &opener,
+        &[&claude],
+        git.in_tree(&tree),
+        &["--workflow", "root.yaml", "--replace", "--json"],
+    );
+
+    assert_eq!(replaced.status.code(), Some(0), "{}", stderr(&replaced));
+    let events = events(&replaced);
+    let plan = &events[0];
+    assert!(providers_of(plan, "selected").is_empty(), "{plan}");
+    assert!(providers_of(plan, "held").is_empty(), "{plan}");
+    assert_eq!(
+        planned(plan, "reconnect"),
+        [
+            ("linear".to_owned(), origins(LINEAR_ORIGINS)),
+            ("claude_code".to_owned(), origins(CLAUDE_CODE_ORIGINS))
+        ]
+    );
+    let import = events
+        .iter()
+        .find(|event| event["event"] == "import_result")
+        .unwrap();
+    assert_eq!(import["outcome"], "replaced");
+    assert_eq!(import["grant"]["id"], NATIVE_GRANT_ID);
+    assert_eq!(
+        summary(&events),
+        (
+            "completed".to_owned(),
+            outcomes(&[("linear", "replaced"), ("claude_code", "replaced")])
+        )
+    );
+    assert_eq!(claude.recorded("arguments").unwrap(), "setup-token\n");
+    assert_eq!(opener.opened(1), [format!("1 {}", consent_url("linear"))]);
+    let requests = server.finish();
+    let poll = poll_line();
+    let replace = replace_line(NATIVE_GRANT_ID);
+    assert_eq!(
+        request_lines(&requests),
+        [
+            LIST_EVERY_KIND,
+            READ_SERVED,
+            START_CONSENT,
+            poll.as_str(),
+            replace.as_str()
+        ]
+    );
+    assert_eq!(start_body(&requests[2]), "linear");
+    assert_eq!(
+        request_body(&requests[4]),
+        serde_json::json!({
+            "recordSchemaVersion": 1,
+            "material": encoded(CLAUDE_TOKEN.as_bytes())
+        })
+    );
+}
+
+// REQ-GRANT-79
+// REQ-GRANT-73
+#[test]
+fn create_workflow_on_a_terminal_asks_before_it_replaces_a_grant_that_needs_reconnecting() {
+    let tree = Tree::linear_and_claude_code(true);
+    let git = Git::new();
+    for (answer, replaced) in [("y\n", true), ("\n", false)] {
+        // The Claude Code grant is healthy, so it is held and never asked about.
+        let mut responses = vec![page(
+            &[
+                oauth_grant(OAUTH_GRANT_ID, "linear", "reconnect_required"),
+                claude_grant_of(NATIVE_GRANT_ID),
+            ],
+            None,
+        )];
+        if replaced {
+            responses.extend(approved("linear"));
+        }
+        let (server, _directory, credential) = prepared(responses);
+        let opener = Opener::new(0);
+        let mut command = create_command(
+            &server,
+            &credential,
+            &opener,
+            Place::Remote,
+            &["--workflow", "root.yaml", "--json"],
+        );
+        command
+            .env(
+                "PATH",
+                std::env::join_paths([opener.directory.path(), git.0.path()]).unwrap(),
+            )
+            .current_dir(&tree.root);
+        let (transcript, output) = answered(command, answer);
+
+        assert!(transcript.contains(OAUTH_GRANT_ID), "{transcript}");
+        // The question precedes the plan and any sign-in.
+        assert!(!transcript.contains("── linear ──"), "{transcript}");
+        assert_eq!(
+            output.status.code(),
+            Some(if replaced { 0 } else { 1 }),
+            "{answer:?}"
+        );
+        let events = events(&output);
+        let plan = &events[0];
+        assert_eq!(plan["event"], "workflow_requirements", "{events:?}");
+        let (reconnect, held, outcome, summary_outcome): (&[&str], &[&str], _, _) = if replaced {
+            (&["linear"], &["claude_code"], "replaced", "completed")
+        } else {
+            (
+                &[],
+                &["linear", "claude_code"],
+                "reconnect_required",
+                "failed",
+            )
+        };
+        assert_eq!(providers_of(plan, "reconnect"), reconnect, "{answer:?}");
+        assert_eq!(providers_of(plan, "held"), held, "{answer:?}");
+        assert_eq!(
+            summary(&events),
+            (summary_outcome.to_owned(), outcomes(&[("linear", outcome)])),
+            "{answer:?}"
+        );
+        let poll = poll_line();
+        let expected: &[&str] = if replaced {
+            &[LIST_EVERY_KIND, START_CONSENT, poll.as_str()]
+        } else {
+            &[LIST_EVERY_KIND]
+        };
+        assert_eq!(request_lines(&server.finish()), expected, "{answer:?}");
+    }
+}
+
+// REQ-GRANT-79
+#[test]
+fn create_workflow_never_replaces_a_provider_held_healthy_beside_one_that_needs_reconnecting() {
+    let tree = Tree::linear_and_claude_code(true);
+    let git = Git::new();
+    // Linear is held through one working grant and one whose consent lapsed; Claude Code
+    // through two grants in Acme that both need reconnecting, between which the command
+    // cannot choose.
+    let (server, _directory, credential) = prepared(vec![
+        page(
+            &[
+                oauth_grant(OAUTH_GRANT_ID, "linear", "active"),
+                oauth_grant(LINEAR_GRANT_ID, "linear", "reconnect_required"),
+                claude_grant_refused(NATIVE_GRANT_ID),
+                claude_grant_refused(OTHER_NATIVE_GRANT_ID),
+            ],
+            None,
+        ),
+        serving_every(),
+    ]);
+    let opener = Opener::new(0);
+    let claude = FakeProgram::claude(SetupToken::Prints);
+    let output = run_in(
+        &server,
+        &credential,
+        &opener,
+        &[&claude],
+        git.in_tree(&tree),
+        &["--workflow", "root.yaml", "--replace", "--json"],
+    );
+
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    let events = events(&output);
+    let plan = &events[0];
+    assert!(providers_of(plan, "reconnect").is_empty(), "{plan}");
+    assert_eq!(providers_of(plan, "held"), ["linear", "claude_code"]);
+    assert_eq!(
+        summary(&events),
+        (
+            "failed".to_owned(),
+            outcomes(&[("claude_code", "reconnect_required")])
+        )
+    );
+    assert_eq!(claude.recorded("arguments"), None);
+    assert!(opener.opened(0).is_empty());
+    assert_eq!(
+        request_lines(&server.finish()),
+        [LIST_EVERY_KIND, READ_SERVED]
+    );
+}
+
+// REQ-GRANT-75
+// REQ-GRANT-79
+#[test]
+fn create_all_selects_nothing_for_a_grant_that_needs_reconnecting() {
+    let (server, _directory, credential) = prepared(vec![page(
+        &[
+            oauth_grant(OAUTH_GRANT_ID, "github", "active"),
+            oauth_grant(OAUTH_GRANT_ID, "gitlab.com", "active"),
+            oauth_grant(LINEAR_GRANT_ID, "linear", "reconnect_required"),
+            native_grant(OTHER_NATIVE_GRANT_ID, "active"),
+            claude_grant_refused(NATIVE_GRANT_ID),
+        ],
+        None,
+    )]);
+    let opener = Opener::new(0);
+    let claude = FakeProgram::claude(SetupToken::Prints);
+    let output = run_every(
+        &server,
+        &credential,
+        &opener,
+        &[&claude],
+        &["--all", "--json"],
+    );
+
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert_eq!(
+        summary(&events(&output)),
+        ("nothing_to_create".to_owned(), Vec::new())
+    );
+    assert_eq!(claude.recorded("arguments"), None);
+    assert_eq!(request_lines(&server.finish()), [LIST_EVERY_KIND]);
+}
+
+// `um runner doctor --workflow FILE --connect`: the flow of `um grant create --workflow` over the
+// doctor's derivation, then the doctor's report of the member's grants, read again.
+
+/// What one command run in a checkout of a tree left: its output, the requests its deployment
+/// saw, and the fake `claude` it found.
+struct Ran {
+    output: Output,
+    requests: Vec<String>,
+    claude: FakeProgram,
+}
+
+/// Runs the command whose leading words are `command` with `args` in a checkout of `tree`,
+/// against a deployment answering `script`, with `claude` and the opener on `PATH`.
+fn ran_in(
+    tree: &Tree,
+    claude: FakeProgram,
+    script: Vec<Vec<u8>>,
+    command: &[&str],
+    args: &[&str],
+) -> Ran {
+    let git = Git::new();
+    let opener = Opener::new(0);
+    let (server, _directory, credential) = prepared(script);
+    let output = run_command_in(
+        &server,
+        &credential,
+        &opener,
+        &[&claude],
+        git.in_tree(tree),
+        command,
+        args,
+    );
+    Ran {
+        output,
+        requests: server.finish(),
+        claude,
+    }
+}
+
+/// The events of `output`, each with its `deployment` set aside, since two scripted deployments
+/// have different addresses.
+fn events_elsewhere(output: &Output) -> Vec<serde_json::Value> {
+    events(output)
+        .into_iter()
+        .map(|mut event| {
+            event.as_object_mut().unwrap().remove("deployment");
+            event
+        })
+        .collect()
+}
+
+/// The `report` event that ends the doctor's output, once each event before it is checked to
+/// be the one `um grant create` printed in its place against the same script (INV-CLI-15).
+fn report_after(create: &Output, doctor: &Output) -> serde_json::Value {
+    let mut events = events(doctor);
+    let report = events.pop().unwrap();
+    assert_eq!(report["event"], "report", "{report}");
+    let flow: Vec<_> = events_elsewhere(doctor)
+        .into_iter()
+        .take(events.len())
+        .collect();
+    assert_eq!(flow, events_elsewhere(create));
+    report
+}
+
+/// The doctor's events but the last, which is its report.
+fn flow_events(output: &Output) -> Vec<serde_json::Value> {
+    let mut events = events(output);
+    assert_eq!(events.pop().unwrap()["event"], "report", "{events:?}");
+    events
+}
+
+/// The doctor's deployment saw the requests `create`'s saw, then one more grants list for the
+/// report.
+fn assert_flow_requests_then_a_list(doctor: &Ran, create: &Ran) {
+    let lines = request_lines(&doctor.requests);
+    let (last, flow) = lines.split_last().unwrap();
+    assert_eq!(flow, request_lines(&create.requests));
+    assert_eq!(*last, LIST_EVERY_KIND);
+}
+
+/// The member's grants once a Linear consent and a Claude Code sign-in made one of each, no
+/// runner authorized for either.
+fn made_unauthorized() -> Vec<u8> {
+    let mut linear = oauth_grant(OAUTH_GRANT_ID, "linear", "active");
+    linear["authorizations"] = serde_json::json!([]);
+    page(&[linear, claude_grant_of(NATIVE_GRANT_ID)], None)
+}
+
+/// The script of a member who holds nothing the tree calls for: the grants list, the providers
+/// served, the one membership, the Linear consent approved and the Claude Code import.
+fn signing_in_to_both() -> Vec<Vec<u8>> {
+    [
+        vec![nothing_held(), serving_every(), only_acme()],
+        approved("linear").to_vec(),
+        vec![stored(CLAUDE_CODE, "201 Created", 1)],
+    ]
+    .concat()
+}
+
+/// A grant `grant` of a report's requirement carries with no runner authorized: none reported,
+/// and its own status `not_connected` with `authorize_runner` (REQ-CREDREADY-23).
+fn assert_authorizes_no_runner(grant: &serde_json::Value) {
+    assert_eq!(grant["authorizations"], serde_json::json!([]), "{grant}");
+    assert_eq!(grant["availability"], "not_connected", "{grant}");
+    assert_eq!(grant["nextAction"], "authorize_runner", "{grant}");
+}
+
+const CONNECT: [&str; 4] = ["--workflow", "root.yaml", "--connect", "--json"];
+
+// REQ-CREDREADY-24
+// REQ-CREDREADY-25
+// INV-CLI-15
+#[test]
+fn doctor_connect_runs_the_grant_flow_then_reports_the_grants_read_again() {
+    let tree = Tree::linear_and_claude_code(true);
+    let create = ran_in(
+        &tree,
+        FakeProgram::claude(SetupToken::Prints),
+        signing_in_to_both(),
+        GRANT_CREATE,
+        &["--workflow", "root.yaml", "--json"],
+    );
+    let doctor = ran_in(
+        &tree,
+        FakeProgram::claude(SetupToken::Prints),
+        [signing_in_to_both(), vec![made_unauthorized()]].concat(),
+        RUNNER_DOCTOR,
+        &CONNECT,
+    );
+
+    assert_eq!(
+        create.output.status.code(),
+        Some(0),
+        "{}",
+        stderr(&create.output)
+    );
+    assert_eq!(
+        doctor.output.status.code(),
+        Some(0),
+        "{}",
+        stderr(&doctor.output)
+    );
+    let report = report_after(&create.output, &doctor.output);
+    let flow = flow_events(&doctor.output);
+    assert_eq!(flow[0]["event"], "workflow_requirements", "{flow:?}");
+    assert_eq!(
+        summary(&flow),
+        (
+            "completed".to_owned(),
+            outcomes(&[("linear", "created"), ("claude_code", "created")])
+        )
+    );
+    assert_eq!(report["schemaVersion"], 1);
+    assert_eq!(
+        report["workflows"],
+        serde_json::json!(["child.yaml", "root.yaml"])
+    );
+    for (kind, id) in [("linear", OAUTH_GRANT_ID), ("claude_code", NATIVE_GRANT_ID)] {
+        let grant = held_grant(&report, kind);
+        assert_eq!(grant["id"], id, "{kind}");
+        assert_authorizes_no_runner(grant);
+    }
+    assert_eq!(
+        doctor.claude.recorded("arguments").unwrap(),
+        "setup-token\n"
+    );
+    assert_member_requests(&doctor.requests);
+    assert_flow_requests_then_a_list(&doctor, &create);
+}
+
+// The workflow of one command step, which calls for no kind.
+const NO_KIND_WORKFLOW: &str = r#"schemaVersion: 1
+steps:
+  build:
+    kind: cmd
+    command:
+      argv: ["./build"]
+"#;
+
+// REQ-CREDREADY-25
+// REQ-CREDREADY-9
+#[test]
+fn doctor_connect_for_a_member_who_holds_each_kind_starts_no_sign_in_and_still_reports() {
+    let tree = Tree::linear_and_claude_code(true);
+    let held = || holding(&["linear"], true);
+    let doctor = ran_in(
+        &tree,
+        FakeProgram::claude(SetupToken::Prints),
+        vec![held(), held()],
+        RUNNER_DOCTOR,
+        &CONNECT,
+    );
+
+    assert_eq!(
+        doctor.output.status.code(),
+        Some(0),
+        "{}",
+        stderr(&doctor.output)
+    );
+    let flow = flow_events(&doctor.output);
+    assert_eq!(flow.len(), 2, "{flow:?}");
+    assert_eq!(summary(&flow), ("nothing_to_create".to_owned(), Vec::new()));
+    let report = events(&doctor.output).pop().unwrap();
+    assert_eq!(held_grant(&report, "linear")["id"], OAUTH_GRANT_ID);
+    assert_eq!(
+        held_grant(&report, "claude_code")["id"],
+        OTHER_NATIVE_GRANT_ID
+    );
+    assert_eq!(doctor.claude.recorded("arguments"), None);
+    assert_eq!(
+        request_lines(&doctor.requests),
+        [LIST_EVERY_KIND, LIST_EVERY_KIND]
+    );
+
+    // Without --json the report follows the flow's on standard output.
+    let human = ran_in(
+        &tree,
+        FakeProgram::claude(SetupToken::Prints),
+        vec![held(), held()],
+        RUNNER_DOCTOR,
+        &CONNECT[..3],
+    );
+    assert_eq!(
+        human.output.status.code(),
+        Some(0),
+        "{}",
+        stderr(&human.output)
+    );
+    let text = stdout(&human.output);
+    for fact in [OAUTH_GRANT_ID, OTHER_NATIVE_GRANT_ID, RUNNER_ID] {
+        assert!(text.contains(fact), "{fact}: {text}");
+    }
+    assert_eq!(
+        request_lines(&human.requests),
+        [LIST_EVERY_KIND, LIST_EVERY_KIND]
+    );
+
+    // A tree that calls for no kind takes the flow's path for nothing to create, and neither the
+    // flow nor the report asks Cloud anything.
+    let tree = Tree::new(&[("build.yaml", NO_KIND_WORKFLOW)], true);
+    let nothing = ran_in(
+        &tree,
+        FakeProgram::claude(SetupToken::Prints),
+        Vec::new(),
+        RUNNER_DOCTOR,
+        &["--workflow", "build.yaml", "--connect", "--json"],
+    );
+    assert_eq!(
+        nothing.output.status.code(),
+        Some(0),
+        "{}",
+        stderr(&nothing.output)
+    );
+    let flow = flow_events(&nothing.output);
+    assert_eq!(summary(&flow), ("nothing_to_create".to_owned(), Vec::new()));
+    let report = events(&nothing.output).pop().unwrap();
+    assert_eq!(report["requirements"], serde_json::json!([]));
+    assert_eq!(report["deployment"], serde_json::Value::Null);
+    assert!(nothing.requests.is_empty(), "{:?}", nothing.requests);
+}
+
+// REQ-CREDREADY-25
+#[test]
+fn doctor_connect_whose_sign_in_fails_exits_1_and_still_reports() {
+    let tree = Tree::linear_and_claude_code(true);
+    let mut linear = oauth_grant(OAUTH_GRANT_ID, "linear", "active");
+    linear["authorizations"] = serde_json::json!([]);
+    let doctor = ran_in(
+        &tree,
+        FakeProgram::claude(SetupToken::Exits(1)),
+        [
+            vec![nothing_held(), serving_every(), only_acme()],
+            approved("linear").to_vec(),
+            vec![page(&[linear], None)],
+        ]
+        .concat(),
+        RUNNER_DOCTOR,
+        &CONNECT,
+    );
+
+    assert_eq!(
+        doctor.output.status.code(),
+        Some(1),
+        "{}",
+        stderr(&doctor.output)
+    );
+    assert_eq!(
+        summary(&flow_events(&doctor.output)),
+        (
+            "failed".to_owned(),
+            outcomes(&[("linear", "created"), ("claude_code", "failed")])
+        )
+    );
+    let report = events(&doctor.output).pop().unwrap();
+    assert_authorizes_no_runner(held_grant(&report, "linear"));
+    assert_eq!(
+        requirement(&report, "claude_code")["grant"],
+        serde_json::json!({"provider": "claude_code", "grants": [], "availability": "not_connected", "nextAction": "connect"})
+    );
+    let poll = poll_line();
+    assert_eq!(
+        request_lines(&doctor.requests),
+        [
+            LIST_EVERY_KIND,
+            READ_SERVED,
+            LIST_MEMBERSHIPS,
+            START_CONSENT,
+            poll.as_str(),
+            LIST_EVERY_KIND
+        ]
+    );
+}
+
+// REQ-CREDREADY-25
+#[test]
+fn doctor_connect_without_a_session_ends_as_grant_create_does_with_no_report() {
+    let tree = Tree::linear_and_claude_code(true);
+    let git = Git::new();
+    let opener = Opener::new(0);
+    let signed_out = |command: &[&str], args: &[&str]| {
+        let server = ScriptedServer::respond(Vec::new());
+        let directory = private_credential_directory();
+        let credential = directory.path().join("credentials.json");
+        let claude = FakeProgram::claude(SetupToken::Prints);
+        let output = run_command_in(
+            &server,
+            &credential,
+            &opener,
+            &[&claude],
+            git.in_tree(&tree),
+            command,
+            args,
+        );
+        assert_eq!(claude.recorded("arguments"), None);
+        assert!(server.finish().is_empty());
+        output
+    };
+
+    let create = signed_out(GRANT_CREATE, &["--workflow", "root.yaml", "--json"]);
+    let doctor = signed_out(RUNNER_DOCTOR, &CONNECT);
+
+    assert_eq!(create.status.code(), Some(3), "{}", stderr(&create));
+    assert_eq!(
+        doctor.status.code(),
+        create.status.code(),
+        "{}",
+        stderr(&doctor)
+    );
+    assert_eq!(events_elsewhere(&doctor), events_elsewhere(&create));
+    assert!(
+        events(&doctor)
+            .iter()
+            .all(|event| event["event"] != "report"),
+        "{}",
+        stdout(&doctor)
+    );
+}
+
+// REQ-CREDREADY-25
+// REQ-GRANT-75
+#[test]
+fn a_signal_that_ends_the_claude_sign_in_ends_doctor_connect_with_its_status_and_no_report() {
+    let tree = Tree::linear_and_claude_code(true);
+    let doctor = ran_in(
+        &tree,
+        FakeProgram::claude(SetupToken::Interrupts),
+        vec![holding(&["linear"], false), serving_every(), only_acme()],
+        RUNNER_DOCTOR,
+        &CONNECT,
+    );
+
+    assert_eq!(
+        doctor.output.status.code(),
+        Some(143),
+        "{}",
+        stderr(&doctor.output)
+    );
+    let events = events(&doctor.output);
+    assert_eq!(
+        summary(&events),
+        (
+            "terminated".to_owned(),
+            outcomes(&[("claude_code", "terminated")])
+        )
+    );
+    assert_eq!(
+        request_lines(&doctor.requests),
+        [LIST_EVERY_KIND, READ_SERVED, LIST_MEMBERSHIPS]
+    );
+}
+
+// REQ-CREDREADY-25
+// REQ-CREDREADY-17
+#[test]
+fn doctor_connect_with_readiness_reads_the_connections_after_the_sign_ins() {
+    let tree = Tree::linear_and_claude_code(true);
+    let doctor = ran_in(
+        &tree,
+        FakeProgram::claude(SetupToken::Prints),
+        [
+            vec![nothing_held(), serving_every(), acme()],
+            approved("linear").to_vec(),
+            vec![
+                stored(CLAUDE_CODE, "201 Created", 1),
+                connection_page(&[], None),
+                acme(),
+                made_unauthorized(),
+            ],
+        ]
+        .concat(),
+        RUNNER_DOCTOR,
+        &[&CONNECT[..], &["--readiness", "--organization-id", "acme"]].concat(),
+    );
+
+    // The sign-ins made both grants, and the missing Linear connection fails the report.
+    assert_eq!(
+        doctor.output.status.code(),
+        Some(1),
+        "{}",
+        stderr(&doctor.output)
+    );
+    assert_eq!(
+        summary(&flow_events(&doctor.output)),
+        (
+            "completed".to_owned(),
+            outcomes(&[("linear", "created"), ("claude_code", "created")])
+        )
+    );
+    let report = events(&doctor.output).pop().unwrap();
+    assert_eq!(report["summary"]["missing"], 1, "{report}");
+    assert_authorizes_no_runner(held_grant(&report, "linear"));
+    let lines = request_lines(&doctor.requests);
+    let poll = poll_line();
+    assert_eq!(
+        lines[..6],
+        [
+            LIST_EVERY_KIND,
+            READ_SERVED,
+            READ_ACME,
+            START_CONSENT,
+            poll.as_str(),
+            IMPORT_GRANT
+        ]
+    );
+    assert!(lines[6].starts_with(LINEAR_LIST), "{lines:?}");
+    assert_eq!(lines[7..], [READ_ACME, LIST_EVERY_KIND]);
+}
+
+// REQ-CREDREADY-24
+// REQ-GRANT-79
+// INV-CLI-15
+#[test]
+fn doctor_connect_with_replace_replaces_as_grant_create_does() {
+    let tree = Tree::linear_and_claude_code(true);
+    let script = || {
+        [
+            vec![needing_reconnect(), serving_every()],
+            approved("linear").to_vec(),
+            vec![stored(CLAUDE_CODE, "200 OK", 3)],
+        ]
+        .concat()
+    };
+    let create = ran_in(
+        &tree,
+        FakeProgram::claude(SetupToken::Prints),
+        script(),
+        GRANT_CREATE,
+        &["--workflow", "root.yaml", "--replace", "--json"],
+    );
+    let doctor = ran_in(
+        &tree,
+        FakeProgram::claude(SetupToken::Prints),
+        [script(), vec![made_unauthorized()]].concat(),
+        RUNNER_DOCTOR,
+        &[&CONNECT[..], &["--replace"]].concat(),
+    );
+
+    assert_eq!(
+        doctor.output.status.code(),
+        Some(0),
+        "{}",
+        stderr(&doctor.output)
+    );
+    report_after(&create.output, &doctor.output);
+    assert_eq!(
+        summary(&flow_events(&doctor.output)),
+        (
+            "completed".to_owned(),
+            outcomes(&[("linear", "replaced"), ("claude_code", "replaced")])
+        )
+    );
+    assert_flow_requests_then_a_list(&doctor, &create);
+}
+
+// REQ-CREDREADY-23
+#[test]
+fn doctor_connect_with_a_runner_reports_each_grant_on_that_runner_alone() {
+    let tree = Tree::linear_and_claude_code(true);
+    let held = || holding(&["linear"], true);
+    let on = |runner: &str| {
+        let doctor = ran_in(
+            &tree,
+            FakeProgram::claude(SetupToken::Prints),
+            vec![held(), held()],
+            RUNNER_DOCTOR,
+            &[&CONNECT[..], &["--runner-id", runner]].concat(),
+        );
+        assert_eq!(
+            doctor.output.status.code(),
+            Some(0),
+            "{}",
+            stderr(&doctor.output)
+        );
+        events(&doctor.output).pop().unwrap()
+    };
+
+    let named = on(RUNNER_ID);
+    let other = on(NEW_RUNNER_ID);
+
+    assert_eq!(
+        held_grant(&named, "linear")["authorizations"],
+        serde_json::json!([{"runnerId": RUNNER_ID, "availability": "available", "nextAction": "none"}])
+    );
+    assert_authorizes_no_runner(held_grant(&other, "linear"));
+}
+
+// REQ-CREDREADY-24
+#[test]
+fn doctor_connect_refuses_options_it_does_not_take_before_anything_is_asked() {
+    let tree = Tree::linear_and_claude_code(true);
+    // Each case is otherwise a command the doctor accepts, so only the rule it names refuses
+    // it: the harness adds --allow-insecure-http, which alone needs a mode that contacts Cloud,
+    // and a service API key alone needs --readiness.
+    let cases: [&[&str]; 3] = [
+        &["--connect", "--json"],
+        &["--workflow", "root.yaml", "--grants", "--replace", "--json"],
+        &[
+            "--workflow",
+            "root.yaml",
+            "--connect",
+            "--readiness",
+            "--organization-id",
+            ORGANIZATION_ID,
+            "--service-api-key-file",
+            "/dev/null/key",
+            "--json",
+        ],
+    ];
+    for args in cases {
+        let doctor = ran_in(
+            &tree,
+            FakeProgram::claude(SetupToken::Prints),
+            Vec::new(),
+            RUNNER_DOCTOR,
+            args,
+        );
+
+        assert_eq!(
+            doctor.output.status.code(),
+            Some(2),
+            "{args:?}: {}",
+            stderr(&doctor.output)
+        );
+        assert!(doctor.output.stdout.is_empty(), "{args:?}");
+        assert_eq!(doctor.claude.recorded("arguments"), None, "{args:?}");
+        assert!(doctor.requests.is_empty(), "{args:?}");
+    }
 }
 
 // SC-GRANT-4's workflow: GitHub through the `gh` it requires, Linear through a forwarded
@@ -4951,6 +5895,219 @@ fn connecting_what_a_workflow_needs_leaves_grants_one_command_authorizes_a_runne
             serde_json::json!({"runnerId": RUNNER_ID})
         );
     }
+}
+
+// The child of SC-CREDREADY-3's workflow: its one step is a Codex agent, which would start the
+// fake `codex` if it ran.
+const CODEX_CHILD_WORKFLOW: &str = r#"schemaVersion: 1
+agentProfiles:
+  writing:
+    harness:
+      kind: codex
+      config:
+        model: gpt-5.4
+        effort: xhigh
+steps:
+  draft:
+    kind: agent
+    agent:
+      profile: writing
+      systemPrompt: prompts/system.md
+      message:
+        text:
+          - file: prompts/message.md
+"#;
+
+/// The Codex grant authorized for `RUNNER_ID`, which reported it ready at generation 2 and
+/// refused at its last use, as it reads at `generation`.
+fn codex_refused_at(generation: i64) -> serde_json::Value {
+    let mut grant = native_grant_in_use();
+    grant["generation"] = generation.into();
+    grant["authorizations"][0]["report"]["lastUse"] = "refused".into();
+    grant
+}
+
+/// The fields of each requirement of `report` that a grant never changes, and its summary.
+fn requirement_states(report: &serde_json::Value) -> Vec<serde_json::Value> {
+    let mut states: Vec<_> = report["requirements"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|requirement| {
+            serde_json::json!([
+                requirement["kind"],
+                requirement["state"],
+                requirement["code"],
+                requirement["cloud"],
+                requirement["nextAction"]
+            ])
+        })
+        .collect();
+    states.push(report["summary"].clone());
+    states
+}
+
+// SC-CREDREADY-3, REQ-CREDREADY-22, REQ-CREDREADY-23, REQ-CREDREADY-18, REQ-CREDREADY-24,
+// REQ-GRANT-79, REQ-CREDREADY-25, REQ-CREDREADY-9
+#[test]
+fn connecting_what_a_tree_lacks_from_the_doctor_reports_the_grants_it_made_on_the_runner() {
+    let elsewhere = tempfile::tempdir().unwrap();
+    let tree = Tree::new(
+        &[
+            ("workflow.yaml", CONNECTING_WORKFLOW),
+            ("child.yaml", CODEX_CHILD_WORKFLOW),
+            ("prompts/system.md", "System prompt."),
+            ("prompts/message.md", "Message."),
+        ],
+        true,
+    );
+    let git = Git::new();
+    // Ada, a member of Acme alone, holds a GitHub grant and a Codex grant authorized for the
+    // runner, where Codex was refused at its last use.
+    let github = oauth_grant(OAUTH_GRANT_ID, "github", "active");
+    let before = page(&[github.clone(), codex_refused_at(2)], None);
+    // The Linear consent makes a grant with no runner authorized, and the Codex sign-in is
+    // stored as the grant's generation 3, which the runner has not yet reported installing.
+    let mut linear = oauth_grant(LINEAR_GRANT_ID, "linear", "active");
+    linear["authorizations"] = serde_json::json!([]);
+    let mut consented = consent_of("linear", "completed");
+    consented["resultGrant"]["id"] = LINEAR_GRANT_ID.into();
+    let after = page(&[github, linear, codex_refused_at(3)], None);
+    let (server, _directory, credential) = prepared(vec![
+        // um runner doctor --workflow workflow.yaml --grants --runner-id RUNNER
+        before.clone(),
+        // um runner doctor --workflow workflow.yaml --connect --replace --runner-id RUNNER
+        before,
+        serving_every(),
+        json_http_response("201 Created", consent_of("linear", "pending")),
+        polled(consented),
+        stored(CODEX, "200 OK", 3),
+        after,
+    ]);
+    let opener = Opener::new(0);
+    let codex = FakeProgram::codex(SignIn::Writes(CODEX_MATERIAL));
+    // run_command_in checks that no output carries the login and that Ada's own Codex home is
+    // untouched (REQ-GRANT-74).
+    let doctor = |args: &[&str]| {
+        let output = run_command_in(
+            &server,
+            &credential,
+            &opener,
+            &[&codex],
+            git.in_tree(&tree),
+            RUNNER_DOCTOR,
+            &[&["--workflow", "workflow.yaml"], args, &["--json"]].concat(),
+        );
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "{args:?}: {}",
+            stderr(&output)
+        );
+        output
+    };
+
+    // The report without a grant read, which contacts nothing.
+    let offline = Command::new(env!("CARGO_BIN_EXE_um"))
+        .args(["runner", "doctor", "--workflow", "workflow.yaml", "--json"])
+        .current_dir(&tree.root)
+        .env_clear()
+        .env("PATH", git.0.path())
+        .env("HOME", elsewhere.path())
+        .output()
+        .unwrap();
+    assert_eq!(offline.status.code(), Some(0), "{}", stderr(&offline));
+    let offline = json_output(&offline);
+    let grants = json_output(&doctor(&["--grants", "--runner-id", RUNNER_ID]));
+
+    // GitHub is available on the runner, Linear lacks a grant and Codex needs reconnecting
+    // there, and no requirement's state changes (REQ-CREDREADY-22, REQ-CREDREADY-23,
+    // REQ-CREDREADY-18).
+    assert_eq!(requirement_states(&grants), requirement_states(&offline));
+    assert_eq!(
+        held_grant(&grants, "github")["authorizations"],
+        serde_json::json!([{"runnerId": RUNNER_ID, "availability": "available", "nextAction": "none"}])
+    );
+    assert_eq!(
+        requirement(&grants, "linear")["grant"],
+        serde_json::json!({"provider": "linear", "grants": [], "availability": "not_connected", "nextAction": "connect"})
+    );
+    let codex_grant = held_grant(&grants, "codex");
+    assert_eq!(codex_grant["generation"], 2);
+    assert_eq!(
+        codex_grant["authorizations"],
+        serde_json::json!([{"runnerId": RUNNER_ID, "availability": "reconnect_required", "nextAction": "reconnect"}])
+    );
+
+    let connected = doctor(&["--connect", "--replace", "--runner-id", RUNNER_ID]);
+
+    // The plan names Linear to sign in, Codex to reconnect and GitHub as held; the Linear
+    // consent is approved and the Codex sign-in replaces the held grant (REQ-CREDREADY-24,
+    // REQ-GRANT-79).
+    let flow = flow_events(&connected);
+    let plan = &flow[0];
+    assert_eq!(plan["event"], "workflow_requirements", "{flow:?}");
+    assert_eq!(providers_of(plan, "selected"), ["linear"]);
+    assert_eq!(providers_of(plan, "reconnect"), ["codex"]);
+    assert_eq!(providers_of(plan, "held"), ["github"]);
+    assert_eq!(opener.opened(1), [format!("1 {}", consent_url("linear"))]);
+    // `codex` was last started for the sign-in, so the tree's agent step did not run once the
+    // sign-ins ended (REQ-CREDREADY-9).
+    assert_eq!(codex.recorded("arguments").unwrap(), "login\n");
+    let import = flow
+        .iter()
+        .find(|event| event["event"] == "import_result")
+        .unwrap();
+    assert_eq!(import["outcome"], "replaced");
+    assert_eq!(import["grant"]["id"], NATIVE_GRANT_ID);
+    assert_eq!(import["grant"]["generation"], 3);
+    assert_eq!(
+        summary(&flow),
+        (
+            "completed".to_owned(),
+            outcomes(&[("linear", "created"), ("codex", "replaced")])
+        )
+    );
+
+    // The report that follows reads the grants again: Linear's has no runner authorized, and
+    // Codex is pending on the runner at its next generation (REQ-CREDREADY-25).
+    let report = events(&connected).pop().unwrap();
+    assert_eq!(requirement_states(&report), requirement_states(&offline));
+    let linear_grant = held_grant(&report, "linear");
+    assert_eq!(linear_grant["id"], LINEAR_GRANT_ID);
+    assert_authorizes_no_runner(linear_grant);
+    let codex_grant = held_grant(&report, "codex");
+    assert_eq!(codex_grant["id"], NATIVE_GRANT_ID);
+    assert_eq!(codex_grant["generation"], 3);
+    assert_eq!(
+        codex_grant["authorizations"],
+        serde_json::json!([{"runnerId": RUNNER_ID, "availability": "pending", "nextAction": "wait_for_runner"}])
+    );
+
+    let requests = server.finish();
+    assert_member_requests(&requests);
+    let poll = poll_line();
+    let replace = replace_line(NATIVE_GRANT_ID);
+    assert_eq!(
+        request_lines(&requests),
+        [
+            LIST_EVERY_KIND,
+            LIST_EVERY_KIND,
+            READ_SERVED,
+            START_CONSENT,
+            poll.as_str(),
+            replace.as_str(),
+            LIST_EVERY_KIND
+        ]
+    );
+    assert_eq!(start_body(&requests[3]), "linear");
+    assert_eq!(
+        request_body(&requests[5]),
+        serde_json::json!({
+            "recordSchemaVersion": 1,
+            "material": encoded(CODEX_MATERIAL.as_bytes())
+        })
+    );
 }
 
 // REQ-GRANT-76
