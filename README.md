@@ -85,6 +85,7 @@ cancellation, advisory failures, attachments, and finalizers.
 | Find workflow examples | [Workflow examples](examples/workflows/README.md) |
 | Learn workflow syntax and semantics | [Workflow V1 reference](https://docs.usefulmachinery.com/reference/workflow-v1.md) |
 | Validate and run a local workflow | [Validation](#local-workflow-validation) and [execution](#local-workflow-execution) |
+| Publish and manage Cloud workflow definitions | [Cloud workflow definitions](#cloud-workflow-definitions) |
 | Submit and inspect Cloud runs | [Cloud runs](#cloud-runs) |
 | Understand this public mirror | [Contributing](#contributing) |
 
@@ -214,9 +215,11 @@ The current release supports:
   mixed named-input and inputless Cloud run creation, explicit single-use Run Input Set
   administration, retained-input inspection/download/deletion, terminal waiting, and
   Artifact Set download and inspection;
-- runner and runner-pool administration plus prerequisite diagnostics; and
-- enrollment and service operation for an outbound runner that connects only to its
-  Cloud-issued endpoint and waits for explicit start authorization.
+- runner and runner-pool administration, including personal pools, pool status and pool
+  join keys, plus prerequisite diagnostics; and
+- enrollment, or joining a pool with a join key when the service first starts, and service
+  operation for an outbound runner that connects only to its Cloud-issued endpoint and
+  waits for explicit start authorization.
 
 The Cloud management surface is not complete. The CLI can discover and manage accessible
 organizations, manage invitations and membership, connect GitHub App installations,
@@ -1341,7 +1344,10 @@ installation ID.
 
 Organization owners configure Google Docs workflow actions under the provider-neutral
 `project action` namespace. The configuration file is a closed JSON object: create
-requires `displayName`, `workflowPath`, and explicit `enabled`. See
+requires `displayName`, `workflowPath`, and explicit `enabled`. The optional
+`definitionId` names the published Cloud workflow definition whose tree holds
+`workflowPath`; an action without one cannot be launched. An action that names a
+definition selects no publication. See
 [`examples/action-config.json`](examples/action-config.json) for a complete example.
 Bindings may be `user`, `document` (`field` is `id` or `url`), or `literal`
 (`kind` is `text` with a string value or `json` with any JSON value, including null).
@@ -1362,7 +1368,8 @@ um project action delete ORG PROJECT ACTION --yes
 
 A patch contains only changed configuration fields, never `enabled` or
 `expectedVersion`; the positive version comes from the flag. A `publication: null`
-patch clears the selection, while omission leaves it unchanged. Enable, disable,
+patch clears the selection, while omission leaves it unchanged. A patched
+`definitionId` replaces the definition; a definition cannot be removed. Enable, disable,
 and delete use no version or preliminary read. `--config-file -` reads standard input;
 it cannot share that input with `--service-api-key-file -`. List is paginated with
 an opaque next cursor. Show returns a nonsecret tombstone for a recently deleted
@@ -1376,135 +1383,14 @@ first mutation failed: the CLI reports `result_uncertain`, the replay outcome,
 and the original key rather than advising another create. A source-built CLI
 is not a published or installed release.
 
-## Linear triggers and evaluations
+## Triggers and schedules
 
-Organization owners configure project triggers against a connected Linear workspace. Create
-requires a complete JSON object with explicit `enabled`, `source`, `target`, `conditions`,
-`inputs`, and `integrationContext`. For example:
-
-```json
-{
-  "enabled": true,
-  "source": {"type": "linear", "connectionId": "lcn_01k0z6r1w8f4jy2m7q9v3x5abc"},
-  "target": {"workflowPath": ".um/cloud/one-shot.yaml", "executionPrincipalId": "prn_01k0z6r1w8f4jy2m7q9v3x5abc"},
-  "conditions": [{"field": "event.action", "operator": "eq", "value": "update"}],
-  "inputs": {"ticket": {"kind": "file", "source": {"type": "snapshot"}}},
-  "integrationContext": {"issue": {"type": "field", "field": "current.identifier"}}
-}
-```
-
-The optional `publication` object (`{"exportName":"name"}`) selects the run export on
-creation or replaces that selection on update. The `ticket` File input receives the
-complete Ticket Snapshot Schema 1 JSON document; `file` accepts only `snapshot`.
-Text and JSON mappings also accept `literal` or `field` sources; JSON literals
-preserve null and structured values. Field names are a closed
-vocabulary, not paths or expressions. Conditions and mappings are replaced as whole
-collections, including an explicit empty object for clearing mappings. Update files
-contain only the fields to replace, never `enabled` or `expectedVersion`:
-
-```sh
-um project trigger create ORG PROJECT --config-file trigger.json
-um project trigger list ORG PROJECT --limit 50 --cursor CURSOR
-um project trigger show ORG PROJECT TRIGGER
-um project trigger update ORG PROJECT TRIGGER --config-file changes.json --expected-version 3
-um project trigger disable ORG PROJECT TRIGGER
-um project trigger enable ORG PROJECT TRIGGER
-um project trigger delete ORG PROJECT TRIGGER --yes
-um project trigger evaluation list ORG PROJECT TRIGGER --state failed --run-id RUN --limit 50
-um project trigger evaluation show ORG PROJECT TRIGGER EVALUATION
-```
-
-Use `--config-file -` for stdin unless the service API key also reads stdin. Unknown,
-missing, null and late-schema configuration properties are rejected before sending a
-request. There is no automatic fetch-and-patch: a version conflict requires inspecting
-and deliberately updating the selected version. Lifecycle actions use separate routes.
-Lists return only one page; pass the printed opaque next cursor with the same filters
-for another page. `--json` emits one schema-version-1 result with complete trigger
-configuration or evaluation facts, including the immutable selected version, attempt,
-reason, condition results, observations, and resulting or blocking run. History never
-claims the run of an overlapping evaluation. The evaluation API deliberately does not
-embed issue prose or snapshot bytes. After `run_created`, use `um run input show ORG RUN`
-and `um run input download ORG RUN --member inputs/ticket --output DIRECTORY` (using
-the configured File input name) to inspect the complete, verified Schema 1 file while
-its retained Run Input is available. A deletion stops pending work, not runs already
-admitted; retained evaluation history remains inspectable. If a mutation's response is lost,
-`commitment_unknown` retains its idempotency key even if replay is refused; JSON
-`replayOutcome` reports the closed replay failure without implying the first request failed.
-Inspect the trigger and your access before deciding whether to repeat the operation.
-
-## Linear evaluation recovery
-
-An organization owner can start a new cycle for a failed evaluation while its
-original 30-day history remains available. The cycle uses the original event,
-connection, configuration and grant, and reads current Linear state again. It
-does not retry an already created run or revive a stopped evaluation.
-
-```sh
-um project trigger evaluation retry ORG PROJECT TRIGGER EVALUATION --timeout 5m --json
-```
-
-The command prints the request key in JSON results, including an unknown
-acceptance or interrupted observation. To recover after a process restart,
-repeat the same command as the same owner with `--idempotency-key KEY`; do not
-start with a new key until you have shown the evaluation. A timed-out or
-interrupted observation does not cancel a cycle. A result reports the final
-run, nonmatch, overlap, stopped, or failed state and its safe reason code;
-unknown acceptance never claims a run was created.
-
-## Schedules and occurrences
-
-Any active organization member, person or service principal, may list and show a project's
-schedules and their occurrences; only an organization owner may create, update, enable, disable
-or delete a schedule. Create requires a complete JSON object with explicit `name`, `enabled`,
-`timing`, `target`, `inputs`, and `integrationContext`. For example:
-
-```json
-{
-  "name": "Code hygiene",
-  "enabled": true,
-  "timing": {"cron": "0 6 * * 1-5", "timeZone": "Europe/London"},
-  "target": {"workflowPath": ".um/cloud/code-hygiene.yaml", "executionPrincipalId": "prn_01k0z6r1w8f4jy2m7q9v3x5abc"},
-  "inputs": {"publish": "file-tickets"},
-  "integrationContext": {}
-}
-```
-
-`timing` is a five-field cron expression evaluated in an IANA time zone, and `target` names
-the workflow and the service principal its runs execute as. The optional `publication` object
-(`{"exportName":"name"}`) names a Git branch export of the target workflow that each scheduled
-run requests. Update files contain only the members to replace, each replacing the whole value,
-never `enabled` or `expectedVersion`; `"publication": null` removes the publication:
-
-```sh
-um project schedule create ORG PROJECT --config-file schedule.json
-um project schedule list ORG PROJECT --limit 50 --cursor CURSOR
-um project schedule show ORG PROJECT SCHEDULE
-um project schedule update ORG PROJECT SCHEDULE --config-file changes.json --expected-version 3
-um project schedule disable ORG PROJECT SCHEDULE
-um project schedule enable ORG PROJECT SCHEDULE
-um project schedule delete ORG PROJECT SCHEDULE --yes
-um project schedule occurrence list ORG PROJECT SCHEDULE --state skipped_active --limit 50
-um project schedule occurrence show ORG PROJECT SCHEDULE OCCURRENCE
-```
-
-Use `--config-file -` for stdin unless the service API key also reads stdin. A configuration
-file that is not the API's configuration shape is rejected before sending a request; every
-other rule is Cloud's. A schedule may match at most once every five minutes, and
-`integrationContext` keys beginning `um.` are reserved; Cloud refuses a denser or invalid
-timing, a reserved key, or a workflow with file or attachments inputs, and the CLI reports the refusal as
-`invalid_input` with the typed problem, such as `timing-too-frequent`, as `reason`. A version
-conflict requires showing the schedule and deliberately updating the current version.
-
-Lists return only one page; pass the printed opaque next cursor with the same filters for
-another page. Without `--json`, `show` prints the timing, the next due time and the upcoming
-times, and `occurrence list` prints one line per occurrence with its due time, state, reason
-and created or blocking run. `--json` emits one schema-version-1 result with `deployment`,
-`organizationRef`, `outcome`, and the schedule, occurrence or `items`, plus `nextCursor`
-while more remain; a deleted schedule reads as a tombstone for 30 days. Disabling or deleting
-a schedule stops its pending and retrying occurrences, not runs already created. If a mutation's response
-is lost, the CLI resends it once with the same key; when the outcome stays unknown,
-`commitment_unknown` reports its `idempotencyKey`. Show the schedule before deciding whether
-to repeat the operation.
+`um project trigger` and `um project schedule` are removed. Triggers that target a
+`workflowPath` and their Linear lifecycle policy are retired in Cloud: declare start, control
+and schedule triggers in a published workflow definition's root instead, and use the root's
+`mirror` for issue state. Retained trigger and schedule records
+stay readable through the public API; `um run linear show` and `um run linear history` still
+read a run's retained lifecycle binding.
 
 ## GitLab.com connections and credential candidates
 
@@ -1609,15 +1495,7 @@ releases that binding. Reauthorization targets the exact connection ID. Once wri
 consent has been verified, a plain reauthorization requests it again even after
 credential loss; it is not a downgrade. Session `requestedScopes` and connection
 `stateUpdatesConsented` are nonsecret inspection metadata. Discovery pages require
-owner access and suggest states without installing rules or writing to Linear.
-New triggers on an active write-capable connection must state `linearLifecycle`
-in their configuration: either `{"enabled":false}`, or `{"enabled":true,"teamMappings":[…]}`
-mapping each Linear team ID to rules of a lifecycle `eventType`, an optional `node`
-selector for `step.*` events, and a destination `stateId`. `trigger create` and
-`trigger update` check this shape locally before sending. The Gateway verifies every
-mapped team and state against Linear, and answers 503 with `Retry-After` when Linear
-is unavailable. Enabled policies synchronize newly admitted Linear-triggered runs;
-existing runs are never retrofitted. Use `--json`
+owner access and suggest states without installing rules or writing to Linear. Use `--json`
 for schema-version-1 newline-delimited events when starting or waiting and a single
 JSON line for inspection/lifecycle commands. A lost start response is retried only
 with the same internally generated request key during that invocation. If commitment
@@ -1634,8 +1512,7 @@ Project commands use the selected human OAuth credential by default and accept
 `--service-api-key-file PATH|-` when an API operation permits a service actor. Project
 IDs, GitHub installation binding IDs, and provider repository IDs remain exact authority
 inputs; repository full names are display metadata only. Runner pools can be selected by ID
-or exact name. Start by
-discovering those values:
+or exact name. Start by discovering those values:
 
 ```sh
 # Discover the current account's organization memberships.
@@ -1655,7 +1532,8 @@ um runner pool list acme-labs
 
 Create a project from one discovered repository. Omit `--default-branch` to select the
 provider-observed default branch, and omit `--pool-id` to create a valid project
-that reports `runner_pool_unassigned` until configured:
+that reports `runner_pool_unassigned` until configured. `--pool-id` names the project's
+first pool; add more with `um project runner-pool set`:
 
 ```sh
 um project create acme-labs \
@@ -1679,7 +1557,14 @@ um project rename \
 ```
 
 Repository and runner-pool settings are independent. `set` assigns or atomically
-replaces the current value. Repeated removals are API-defined no-ops:
+replaces the current value. Repeated removals are API-defined no-ops.
+
+A project runs on a set of the organization's runner pools, with no order among them, and
+one pool may serve several projects. `um project runner-pool set` replaces the whole set
+with the one or more pools it names, up to 20, each by ID or exact name; naming the same
+set again changes nothing. `um project runner-pool remove` empties the set, after which the
+project reports `runner_pool_unassigned`. `um project show` lists every pool of the set. A
+member's personal pool cannot serve a project, and naming one is refused:
 
 ```sh
 # Read, replace, update, or remove the repository binding.
@@ -1695,10 +1580,10 @@ um project repository update \
 um project repository remove \
   acme-labs prj_01k0z6r1w8f4jy2m7q9v3x5abc --yes
 
-# Assign, replace, or remove the runner pool.
+# Replace the project's runner pools with the pools named, or remove them all.
 um project runner-pool set \
   acme-labs prj_01k0z6r1w8f4jy2m7q9v3x5abc \
-  rpl_01k0z6r1w8f4jy2m7q9v3x5abc
+  rpl_01k0z6r1w8f4jy2m7q9v3x5abc builders
 um project runner-pool remove \
   acme-labs prj_01k0z6r1w8f4jy2m7q9v3x5abc --yes
 ```
@@ -1746,6 +1631,68 @@ invocation without first inspecting retained state. A completed replay returns
 [receiver and recovery guidance](../docs/operations/webhook-delivery.md) for
 raw-body signature verification, deduplication, overlap and retention.
 
+## Cloud workflow definitions
+
+`um workflow definition publish --cloud ORGANIZATION --project PROJECT` records the
+revision locally and then publishes the tree to that project's Cloud definition: it
+uploads and seals the tree under its digest and publishes the revision with its bindings.
+The first publication creates the Cloud definition and records its id locally; later ones
+publish to it, and `--cloud-new` creates another. A Cloud refusal leaves the local
+revision recorded and exits 1.
+
+```sh
+um workflow definition publish .um/engineering --bindings bindings.json \
+  --cloud acme-labs --project prj_01k0z6r1w8f4jy2m7q9v3x5abc --json
+```
+
+`--to` and `--new` choose the local definition under the home, and `--cloud-to` and
+`--cloud-new` choose the Cloud one. Cloud and the home assign their ids separately, in the
+same `def_` shape, and they are not interchangeable: `--to` takes an id
+`um workflow definition list` prints, and `--cloud-to` one
+`um workflow definition cloud list` prints. To publish the next revision of an existing
+Cloud definition from a home that has never published it, find its id and name it once:
+
+```sh
+um workflow definition cloud list acme-labs prj_01k0z6r1w8f4jy2m7q9v3x5abc
+um workflow definition publish .um/engineering --bindings bindings.json \
+  --cloud acme-labs --project prj_01k0z6r1w8f4jy2m7q9v3x5abc --cloud-to DEFINITION
+```
+
+The home then records `DEFINITION` as the local definition's Cloud id, so later
+publications from it need no target. Without `--cloud-to`, a home with no recorded Cloud id
+creates a second Cloud definition.
+
+`um workflow definition cloud` reads and changes a project's Cloud definitions, and lists
+and shows a definition's start evaluations, newest first:
+
+```sh
+um workflow definition cloud list acme-labs prj_01k0z6r1w8f4jy2m7q9v3x5abc --limit 20
+um workflow definition cloud show acme-labs DEFINITION \
+  --project-id prj_01k0z6r1w8f4jy2m7q9v3x5abc
+# enable, disable, archive and unarchive take the same arguments.
+um workflow definition cloud disable acme-labs DEFINITION \
+  --project-id prj_01k0z6r1w8f4jy2m7q9v3x5abc
+um workflow definition cloud set-principal acme-labs DEFINITION PRINCIPAL \
+  --project-id prj_01k0z6r1w8f4jy2m7q9v3x5abc
+um workflow definition cloud evaluation list acme-labs DEFINITION \
+  --project-id prj_01k0z6r1w8f4jy2m7q9v3x5abc --state failed
+um workflow definition cloud evaluation show acme-labs DEFINITION EVALUATION \
+  --project-id prj_01k0z6r1w8f4jy2m7q9v3x5abc
+```
+
+With `--cloud ORGANIZATION`, `um workflow run show`, `resume` and `release` take a Cloud
+run ID as `RUN` and read or write no local run: `show` reads the run with its definition,
+subject claim, workflow state, latest progress, exits and newest trigger deliveries;
+`resume` asks Cloud to continue it, as `um run continue` does; and `release` asks Cloud,
+as an organization owner, to release the subject claim of the exited run. The control
+leaves take the same option ([Cloud runs](#cloud-runs)).
+
+```sh
+um workflow run show run_01k0z6r1w8f4jy2m7q9v3x5abc --cloud acme-labs --json
+um workflow run resume run_01k0z6r1w8f4jy2m7q9v3x5abc --cloud acme-labs --from build
+um workflow run release run_01k0z6r1w8f4jy2m7q9v3x5abc --cloud acme-labs
+```
+
 ## Cloud runs
 
 List materialized runs within one organization (newest first) with bounded,
@@ -1767,25 +1714,44 @@ placement when available, and the next cursor; `--json` returns `items` and
 `nextCursor` as in the API. Context is private: avoid shell-history exposure when
 using context filters, and do not put context in logs. For ticket dispatch, write
 `{"source":"linear","linearIssue":"LIV-123"}` to a protected file and supply
-`run create --integration-context-file PATH`.
+`workflow run create --cloud --integration-context-file PATH`.
 
 Run commands use the selected human OAuth credential by default and accept
 `--service-api-key-file PATH|-` when an API operation permits a service actor. They use
-the configured Useful Machinery deployment and remain separate from `um workflow`,
-which runs and inspects local workflow definitions and run directories.
+the configured Useful Machinery deployment. `um workflow` runs and inspects local workflow
+definitions and run directories; with `--cloud ORGANIZATION` it also publishes a definition
+to Cloud, creates a run of a Cloud definition, and reads and controls a definition-backed
+Cloud run, and `um workflow definition cloud` manages Cloud definitions (see
+[Cloud workflow definitions](#cloud-workflow-definitions)).
+
+Start a Cloud run of a workflow published as a Cloud definition with
+`um workflow run create ID --cloud ORGANIZATION --project PROJECT`; `um workflow definition
+publish DIR --bindings FILE --cloud ORGANIZATION --project PROJECT` prints the id. `ID` is
+sent as the Cloud definition id, and nothing under the `um` home or any execution root is
+read. `--workflow FILE` names a workflow file of the definition's tree, relative to its root,
+and the root workflow is run when it is omitted. The command takes `--source-branch`,
+`--workspace-branch` or `--workspace-commit`, `--display-name`, the named-input options or
+`--input-set-id`, `--integration-context-file`, `--max-parallel` from 1 to 64, sent only when
+given, `--no-owner`, and `--wait` with `--timeout`, uses one idempotency key per invocation,
+and writes one `create` result. A run you create is owned by you unless `--no-owner` starts
+it with no owner, in the project's runner pools. The local options (`--path`,
+`--execution-root`, `--run-dir`, `--agent-profiles`, `--stop-before`, `--owner`,
+`--external`) are usage errors beside `--cloud`, as the Cloud options are without it. A run
+of a definition names no publication: publish an export of a succeeded run with
+`um publication create`.
 
 ```sh
-# Admit an inputless run without waiting for execution.
-um run create acme-labs \
-  --project-id prj_01k0z6r1w8f4jy2m7q9v3x5abc \
-  --workflow-path workflows/build.yaml \
+# Admit an inputless run of the definition's root workflow without waiting for execution.
+um workflow run create def_01k0z6r1w8f4jy2m7q9v3x5abc \
+  --cloud acme-labs --project prj_01k0z6r1w8f4jy2m7q9v3x5abc \
   --source-branch main \
   --display-name "Release checks"
 
-# Or bind mixed values, including ordered and explicitly empty collections.
-um run create acme-labs \
-  --project-id prj_01k0z6r1w8f4jy2m7q9v3x5abc \
-  --workflow-path workflows/build.yaml \
+# Or run a workflow file of its tree and bind mixed values, including ordered and
+# explicitly empty collections.
+um workflow run create def_01k0z6r1w8f4jy2m7q9v3x5abc \
+  --cloud acme-labs --project prj_01k0z6r1w8f4jy2m7q9v3x5abc \
+  --workflow flows/review.yaml \
   --input-text-file request ./request.txt \
   --input-json settings '{"mode":"review"}' \
   --integration-context-file ./integration-context.json \
@@ -1808,9 +1774,8 @@ um run input-set upload acme-labs "$input_set_id" \
   --member-file inputs/evidence/000001 ./report.pdf
 um run input-set seal acme-labs "$input_set_id"
 
-um run create acme-labs \
-  --project-id prj_01k0z6r1w8f4jy2m7q9v3x5abc \
-  --workflow-path workflows/build.yaml \
+um workflow run create def_01k0z6r1w8f4jy2m7q9v3x5abc \
+  --cloud acme-labs --project prj_01k0z6r1w8f4jy2m7q9v3x5abc \
   --input-set-id "$input_set_id"
 
 # Read the latest public projection.
@@ -1822,13 +1787,11 @@ um run show \
 um run show acme-labs run_01k0z6r1w8f4jy2m7q9v3x5abc \
   --wait --timeout 30m
 
-# Read the Linear lifecycle binding a trigger admitted the run with; outcome not_found when none.
+# Read the retained Linear lifecycle binding a retired trigger admitted the run with;
+# outcome not_found when none.
 um run linear show acme-labs run_01k0z6r1w8f4jy2m7q9v3x5abc --json
 # List the binding's retained desired-state updates, newest first; --cursor continues a page.
 um run linear history acme-labs run_01k0z6r1w8f4jy2m7q9v3x5abc --limit 50 --json
-# Open the next cycle of an exhausted retryable update; the key is generated when omitted.
-um run linear retry acme-labs run_01k0z6r1w8f4jy2m7q9v3x5abc \
-  llu_01k0z6r1w8f4jy2m7q9v3x5abc --json
 
 # Continue from selected steps on the same retained runner boot. Admission is not execution.
 um run continue acme-labs run_01k0z6r1w8f4jy2m7q9v3x5abc \
@@ -1836,7 +1799,6 @@ um run continue acme-labs run_01k0z6r1w8f4jy2m7q9v3x5abc \
 # Observe the immutable admission receipt with the current Run until it settles.
 um run continue acme-labs run_01k0z6r1w8f4jy2m7q9v3x5abc \
   --from build --wait --timeout 30m
-# To replace the definition, supply both --workflow-commit OID and --workflow-path PATH.
 
 # Retry an eligible terminal run; observe the durable receipt until it resolves.
 um run retry acme-labs run_01k0z6r1w8f4jy2m7q9v3x5abc \
@@ -1847,7 +1809,26 @@ um run cancel acme-labs run_01k0z6r1w8f4jy2m7q9v3x5abc \
   --wait --timeout 30m
 ```
 
-Without an input flag, `run create` admits an inputless run. The mixed-input flags may be
+A definition-backed Cloud run's wait takes the local run controls with
+`--cloud ORGANIZATION`. Each leaf but `stop` reads the run's current wait, refuses
+`run_not_waiting` or `wait_kind_mismatch` before sending anything, and asks Cloud under one
+request key to carry the control to the runner executing the run, which applies it as the
+leaf applies it to a local run. The output reports Cloud's acceptance, not the runner's
+application; `wait_not_current` means the run's wait changed after the read.
+
+```sh
+um workflow run answer run_01k0z6r1w8f4jy2m7q9v3x5abc --cloud acme-labs \
+  --question scope --text "Only the public API"
+um workflow run approve run_01k0z6r1w8f4jy2m7q9v3x5abc --cloud acme-labs
+um workflow run hand-back run_01k0z6r1w8f4jy2m7q9v3x5abc --cloud acme-labs \
+  --notes "Split the migration"
+um workflow run retry run_01k0z6r1w8f4jy2m7q9v3x5abc --cloud acme-labs --json
+um workflow run stop run_01k0z6r1w8f4jy2m7q9v3x5abc --cloud acme-labs \
+  --before review --reason "Hold for review"
+um workflow run lift run_01k0z6r1w8f4jy2m7q9v3x5abc --cloud acme-labs --before review
+```
+
+Without an input flag, `workflow run create --cloud` admits an inputless run. The mixed-input flags may be
 repeated in one invocation: Text uses `--input-text NAME TEXT` or
 `--input-text-file NAME PATH`, JSON uses `--input-json NAME JSON` or
 `--input-json-file NAME PATH`, a singular File uses
@@ -1893,7 +1874,7 @@ attachment collections require no upload. `run input-set seal` completes authori
 verification.
 `run input-set delete ... --yes` makes a set logically unavailable and schedules exact-key
 content cleanup. Once a set is sealed, pass
-its exact ID to `run create --input-set-id`; this conflicts with every acquisition flag
+its exact ID to `workflow run create --cloud --input-set-id`; this conflicts with every acquisition flag
 and never restages content.
 
 Create output reports the accepted Run ID and whether the deployment replayed the
@@ -1933,16 +1914,15 @@ context. Both deletion commands require literal
 `--yes`, use fresh idempotency keys, and report an unknown commitment if interrupted
 after dispatch.
 
-`run create`, `run show`, and `run cancel` accept `--wait` and optional
+`workflow run create --cloud`, `run show`, and `run cancel` accept `--wait` and optional
 `--timeout DURATION` (positive integral `ms`, `s`, `m`, `h`, or bare seconds).
 `--timeout` requires `--wait`. Create and cancel budgets begin after acceptance; show
 starts immediately. The remaining wait budget caps credential refresh, read retries,
 and each observation request; it does not bound the accepted mutation. Reads continue
-through admitted creation. `run create --publish-export NAME` selects exactly one
-`git_branch` workflow export for automatic publication after successful execution;
-omitting it remains artifact-only. Without `--wait`, create returns on durable run
-acceptance. With `--wait`, create/show observe execution, artifact attachment, the
-handoff, and the linked automatic Publication using one timeout budget. A successful
+through admitted creation. Without `--wait`, create returns on durable run acceptance;
+with `--wait`, it observes execution and artifact attachment. Show-wait also observes the
+automatic publication handoff and its linked Publication, which only a run created by
+workflow path before its retirement can have, under the same timeout budget. A successful
 Run with pending handoff is not settled; waiting never creates an attempt or switches
 to a later manual attempt. Cancel observes only its receipt and terminal Run. A cancellation receipt being accepted or resolved is not by itself
 proof of a stopped Run. Force requires explicit `--force`; to escalate use a new
@@ -1950,9 +1930,9 @@ idempotency key. Reuse `--idempotency-key` with the same mode and Run to reconci
 uncertain response. Signals and timeouts stop only local observation.
 
 `run continue ORGANIZATION RUN --from STEP [--from STEP ...]` selects distinct steps
-in the supplied order. The optional `--workflow-commit OID --workflow-path PATH` pair
-replaces the workflow definition; otherwise the definition is inherited.
-`--expected-version N` guards admission. A generated key is reused for at most one
+in the supplied order. The run always continues with the definition it was created
+from; a receipt admitted earlier under a replaced definition still shows that
+definition's commit and workflow path. `--expected-version N` guards admission. A generated key is reused for at most one
 ambiguous transport replay of the identical request and principal. If both attempts
 are ambiguous, acceptance is unknown: inspect the run before another request; a 404
 is not proof of non-admission. A 201 contains an immutable accepted attempt and
@@ -1963,8 +1943,10 @@ JSON emits `operation: continue`, `outcome`, `request` (the immutable receipt),
 `run` (the current projection), `idempotencyKey` when acceptance is unknown, and
 `code` on failure. Admission rejection includes a `diagnostic` array of safe
 violation codes and optional node/producer/reference/prior-state details in
-JSON, also shown in human output. The Run shows selected/inherited/reexecuted
-steps, effective source digest, both workspace paths, pending/ready/unavailable preparation,
+JSON, also shown in human output. A `410` `path-run-retired` answer, for a run Cloud no
+longer continues because it was created by workflow path, is outcome `error` with code
+`path_run_retired` and exit 1 for `run continue` and `workflow run resume --cloud` alike.
+The Run shows selected/inherited/reexecuted steps, effective source digest, both workspace paths, pending/ready/unavailable preparation,
 modified true/false/unknown, interruption cause, and portable-result absence.
 The Run partition is not an output-producer inventory; direct producer identities
 for inherited output values are preserved in retained and portable results, not
@@ -1977,14 +1959,18 @@ A single generated key is reused for ambiguous transport replay. POST acceptance
 never reports application: only an applied GET receipt succeeds. JSON retry results
 contain `schemaVersion`, `operation: retry`, `deployment`, `organizationRef`, `runId`,
 `outcome`, nullable `requestId`, `idempotencyKey`, `receipt`, and `code`.
-Outcomes are `applied`, exact-code `rejected`, `trigger_slot_conflict`,
-`retry_pending`, `timed_out`, `observation_stopped`, `acceptance_unknown`, and
-`error`. Rejection, conflict, and timeout exit 1; usage exits 2; authentication
+Outcomes are `applied`, exact-code `rejected`, `subject_busy` and `subject_settled`
+(another run holds the run's subject; `holderRunId` in JSON names it), `retry_pending`,
+`timed_out`, `observation_stopped`, `acceptance_unknown`, and `error`. A `409`
+`path-run-retired` answer, for a run Cloud no longer retries because it was created by
+workflow path, is outcome `error` with code `path_run_retired`; publish the workflow as a
+definition and start a run of it instead.
+Rejection, conflict, and timeout exit 1; usage exits 2; authentication
 exits 3; unresolved transport exits 4; SIGINT/SIGTERM exit 130/143. A known
 interruption retains the request ID; unknown submission retains the key. Neither
 cancels or creates another retry. Inspect the run and request before trying again.
 
-For `run create`, `run show`, and `run cancel`, `--json` emits one
+For `workflow run create --cloud`, `run show`, and `run cancel`, `--json` emits one
 schema-version-1 object with `operation`, `deployment`, `organizationRef`,
 nullable `runId`, `outcome`, full nullable `run`,
 `publication`, `cancellationRequest`, nullable create `replayed`, and nullable `error`.
@@ -1997,13 +1983,13 @@ code `admission_rejected`; its error adds `httpStatus`, the full `problemType` U
 human mode prints the same facts with a remedy. Such a refusal created no run and is never
 `acceptance_unknown`, which a create reports with its key and exit 4 only when the outcome
 is unconfirmed: a transport failure, a `5xx`, or an unreadable response after dispatch.
-Progress goes to stderr. Human create/show results show the Run's automatic publication
+Progress goes to stderr. Human show results show the Run's automatic publication
 handoff and any observed Publication state, outcome, receipt disposition, failure, and
 redacted confirmed pull-request URL separately from execution. On failure, inspect the existing publication or handoff
 and provider effects before creating another publication attempt. Human cancellation
 errors retain the requested mode, known receipt, Run state, interruption, and artifact
 delivery evidence for same-key reconciliation.
-Create-wait exits nonzero on failed execution/publication; show-wait and cancel-wait
+Create-wait exits nonzero unless the run succeeded; show-wait and cancel-wait
 exit zero on observed settlement, regardless of the Run's execution result. Timeout
 exits 1; SIGINT/SIGTERM exit 130/143 without sending a new cancellation request.
 
@@ -2016,12 +2002,12 @@ complete the run using only stable JSON command surfaces and the downloaded loca
 set -euo pipefail
 organization=acme-labs
 project=prj_01k0z6r1w8f4jy2m7q9v3x5abc
+definition=def_01k0z6r1w8f4jy2m7q9v3x5abc
 request_path=./request.txt
 artifact_path=./downloaded-run
 
-um run create "$organization" \
-  --project-id "$project" \
-  --workflow-path workflows/build.yaml \
+um workflow run create "$definition" \
+  --cloud "$organization" --project "$project" \
   --input-text-file request "$request_path" \
   --json > create.json
 run_id=$(jq -er 'select(.outcome == "accepted") | .runId' create.json)
@@ -2045,9 +2031,11 @@ Set has been downloaded, verified, and committed at the requested destination.
 Publication commands use the selected human OAuth credential by default and accept
 `--service-api-key-file PATH|-` when the operation permits a service actor. They turn one
 available `git_branch` export from a succeeded Cloud run into a ready-for-review pull
-request. Run success and export declaration alone do not publish anything automatically. A
-caller may select `run create --publish-export NAME` to request one automatic attempt;
-otherwise Publication commands create explicit post-run attempts.
+request. Run success and export declaration alone do not publish anything automatically;
+Publication commands create explicit post-run attempts. A run of a Cloud definition delivers
+no export to publish yet, so they apply to runs that already have one: runs created by
+workflow path before that form was retired, some of which named an export at creation and
+were handed off to an automatic attempt.
 
 The complete Publication command surface is:
 
@@ -2077,9 +2065,6 @@ use the optional hash when the caller has already inspected that exact revision:
 ```sh
 um publication create acme-labs "$run_id" --export changes \
   --change-request 42 --expected-head "$inspected_head" --wait --json
-um run create acme-labs --project-id "$project" --workflow-path workflows/publish.yaml \
-  --publish-export changes --publish-change-request 42 \
-  --publish-expected-head "$inspected_head" --wait --json
 ```
 
 An accepted update advances only the request's own source ref by a guarded fast-forward;
@@ -2091,19 +2076,13 @@ Publication proves the guarded ref effect, not fresh human approval. A stale has
 ineligible request is refused at acceptance; a later race is reported on the separate
 Publication without changing the run's outcome.
 
-For a run submitted without publication intent, an explicit publication workflow
-first creates and waits for the run, then creates and waits for the selected Publication:
+An explicit publication workflow first waits for a run that has an export, then creates and
+waits for the selected Publication:
 
 ```sh
 set -euo pipefail
 organization=acme-labs
-project=prj_01k0z6r1w8f4jy2m7q9v3x5abc
 
-um run create "$organization" \
-  --project-id "$project" \
-  --workflow-path workflows/publish.yaml \
-  --json > run-create.json
-run_id=$(jq -er '.runId' run-create.json)
 um run show "$organization" "$run_id" \
   --wait --timeout 30m --json > run-observed.json
 jq -e '.outcome == "settled" and .run.state == "succeeded"' run-observed.json >/dev/null
@@ -2114,10 +2093,9 @@ jq -e '.outcome == "succeeded"' publication.json >/dev/null
 publication_id=$(jq -er '.publication.id' publication.json)
 ```
 
-Alternatively, submit with `run create --publish-export changes --wait --json` and
-inspect `.run.state`, `.run.publication`, and `.publication` in its one final JSON
-object. Create-wait exits nonzero if execution, the handoff, or the automatic attempt
-fails; show-wait exits zero on a terminal failure but retains the failure fields.
+For a run handed off to an automatic attempt, `run show --wait --json` follows the handoff
+and that attempt and reports `.run.state`, `.run.publication`, and `.publication` in its one
+final JSON object; it exits zero on a terminal failure but retains the failure fields.
 `no_changes` and `pull_request_already_merged` are successful Publication outcomes,
 not newly created pull requests. Neither timeout nor a signal cancels remote work.
 
@@ -2144,6 +2122,70 @@ Publication consumes the run's existing private Artifact Set and grants no publi
 artifact access or download URL. Plain output contains only the public Publication
 projection and credential-free, query-free provider links; it does not stream provider
 logs or expose credentials.
+
+## Runner pools, registrations, and join keys
+
+A runner pool is a named group of runners that projects run on. Every human member of an
+organization also has a personal pool, named by the service, that shows its member in
+`um runner pool show`; it serves that member's own runners and cannot serve a project.
+Owners administer every pool. A member administers the runners in their own personal pool:
+registering, renaming, changing the mode of and deleting them, and issuing their
+activations and join keys. Creating, renaming and deleting pools and moving runners between
+pools stay with owners. Commands taking a pool or runner accept its ID or exact name.
+
+```sh
+# Show a pool, its member when it is personal, its waiting runs, and how many of its
+# runners are online, busy, idle and offline.
+um runner pool show acme-labs builders
+
+# Register a runner in a named pool, in a member's personal pool by principal ID, or,
+# naming neither, in your own personal pool. The activation file must not exist.
+um runner create acme-labs --pool-id builders --activation-file ./runner.activation.json
+um runner create acme-labs --member prn_01k0z6r1w8f4jy2m7q9v3x5abc \
+  --activation-file ./runner.activation.json
+um runner create acme-labs --activation-file ./runner.activation.json
+```
+
+`um runner pool show` counts a runner busy while it holds unfinished work and idle while it
+is enabled, connected and free, from one snapshot; `--json` carries the counts and waiting
+runs as `status`. Against a Cloud release that does not report pool status, it shows the
+pool alone. `--pool-id` and `--member` cannot be combined, and a service actor must name one
+of them, since it has no personal pool.
+
+A join key lets hosts become runners in a pool without an activation each. Any number of
+hosts may join with one key until it expires or is revoked; each becomes a new runner with
+a name the service chooses and its own credential, generated on the host.
+
+```sh
+# Issue a key for a pool (or, naming none, your personal pool) that admits hosts for
+# seven days. A runner that joined with it is removed after one hour offline.
+um runner join-key issue acme-labs \
+  --pool-id builders \
+  --expires-in 7d \
+  --remove-after 1h \
+  --join-key-file ./builders.join-key.json
+
+# List keys with their pool, issuer, state (issued, revoked or expired), expiry and
+# removal time. Continue with --cursor when a next cursor is shown.
+um runner join-key list acme-labs --pool-id builders
+
+# Stop new joins. The runners that joined with the key stay in the pool.
+um runner join-key revoke acme-labs rjk_01k0z6r1w8f4jy2m7q9v3x5abc --yes
+```
+
+`--expires-in` runs from `1m` to `365d` and `--remove-after` from `5m` to `30d`, each a
+whole number of minutes, hours or days; both are fixed at issue, and a value outside its
+bounds is refused before anything is sent. Like an activation, the key is written once, as
+one line of JSON, to a new file only you can read, or to standard output with `-`; the file
+is created before the key is issued, and Cloud cannot show the key again. `--json` reports
+the key's metadata and the file's path, never the key itself. Keep the key in a secret
+store and out of version control, logs and transcripts.
+
+A runner that joined with a key is removed automatically once it has been offline for the
+key's removal time, counted from when Cloud last saw it, or from its join if it never
+connected, and holds no reserved or unfinished work; its runs and records are kept. A
+runner registered with an activation is never removed this way, and revoking or expiring a
+key removes no runner. `um runner show` names the key a runner joined with.
 
 ## Runner doctor
 
@@ -2300,9 +2342,10 @@ commit a workflow value.
 
 ## Runner serve
 
-`runner serve` uses the protected `rrc_` credential created by `runner enroll`; it
-never reads human OAuth credentials. Enrollment and service startup consume the same
-closed operator configuration:
+`runner serve` uses the protected `rrc_` credential created by `runner enroll`, or by
+joining a pool with a join key when the service first starts; it never reads human OAuth
+credentials. Enrollment and service startup consume the same closed operator
+configuration:
 
 ```json
 {
@@ -2325,8 +2368,41 @@ Production operators should follow the private monorepo's
 service-manager shutdown allowance, control-plane cutover, drain, and recovery. That
 operator runbook is intentionally outside this public CLI source mirror.
 
-The connection URL, runner ID, and current credential come only from enrolled state.
-There are no endpoint environment overrides or command-line aliases for the removed
+A host can instead join a pool when the service first starts, with no activation, by
+giving `runner serve` a join key (see
+[Runner pools, registrations, and join keys](#runner-pools-registrations-and-join-keys)),
+either as a file or in the `UM_RUNNER_JOIN_KEY` environment variable, which holds the
+key file's one line of JSON, for example from a platform's secret store:
+
+```sh
+um runner serve \
+  --config /etc/um/runner.json \
+  --join-key-file /protected/path/builders.join-key.json
+UM_RUNNER_JOIN_KEY="$BUILDERS_JOIN_KEY" um runner serve --config /etc/um/runner.json
+```
+
+On a host that holds no enrolled state, the service generates its credential, joins the
+key's pool as a new runner, writes enrolled state, and serves. On a host that already holds
+enrolled state, it serves with that state and ignores the key, so the same command can
+start the service every time. The key is read as an activation is: from a regular file
+private to the current user, which is left in place, or from piped standard input with
+`--join-key-file -`; an interactive terminal is refused. Giving the key both ways is a
+usage error, and an expired key is refused before Cloud is contacted. The service reads
+the key once, removes `UM_RUNNER_JOIN_KEY` from its own environment by restarting itself
+without it, never writes the key to its state, and never passes it to a workflow step.
+
+A key Cloud refuses, because its token is not recognized or the key is revoked or expired, or because its pool cannot
+admit the runner (a personal pool whose member is not active, or an organization at its
+runner limit), stops the start with a failure naming the refusal. An ambiguous outcome,
+such as a lost response, is retried as the same request, so one start never registers two
+runners. Until a join resolves, the host keeps a join journal beside its state. A start
+with a different key than the journal names is refused with the journal's path and the
+key it names: start the service once more with that key, which resends the same join, or
+remove the journal after confirming in the pool that no runner joined from the host.
+`runner enroll` with an activation is refused the same way while that journal exists.
+
+The connection URL, runner ID, and current credential come only from the enrolled state
+written by enrollment or by a join. There are no endpoint environment overrides or command-line aliases for the removed
 Gateway, credential, transport-mode, workflow-mapping, source, workflow-path, and work
 root options. `production` requires the Cloud-issued `wss://` connection URL.
 `development` additionally permits `ws://` only for exact `localhost`, IPv4 loopback,

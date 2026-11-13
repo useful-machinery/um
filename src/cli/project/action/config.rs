@@ -34,6 +34,7 @@ fn validate(value: &Value, patch: bool) -> Result<()> {
         &[
             "displayName",
             "workflowPath",
+            "definitionId",
             "description",
             "sortOrder",
             "inputBindings",
@@ -44,6 +45,7 @@ fn validate(value: &Value, patch: bool) -> Result<()> {
         &[
             "displayName",
             "workflowPath",
+            "definitionId",
             "enabled",
             "description",
             "sortOrder",
@@ -60,6 +62,18 @@ fn validate(value: &Value, patch: bool) -> Result<()> {
     let fields = object(value, allowed, required)?;
     if patch && fields.is_empty() {
         return Err(anyhow!("update requires a configuration field"));
+    }
+    // An action that names a definition selects no publication; the server
+    // decides an update against the stored action.
+    if !patch
+        && fields.contains_key("definitionId")
+        && fields
+            .get("publication")
+            .is_some_and(|field| !field.is_null())
+    {
+        return Err(anyhow!(
+            "an action with a definition selects no publication"
+        ));
     }
     for (key, field) in fields {
         if key != "publication" {
@@ -111,6 +125,10 @@ fn validate(value: &Value, patch: bool) -> Result<()> {
                         return Err(anyhow!("invalid input presentation"));
                     }
                 }
+            }
+            // The server owns the identifier's grammar.
+            "definitionId" if !field.is_string() => {
+                return Err(anyhow!("definition must be a string"));
             }
             "publication" if !field.is_null() => {
                 let fields = object(field, &["exportName"], &["exportName"])?;

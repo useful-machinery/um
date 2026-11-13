@@ -19,6 +19,7 @@ use super::execution::{
 use super::lease_clock::{LeaseClock, LeaseClockError, LeaseInstant, LeaseWaitCancellation};
 use super::run_inputs::{HttpRunInputBroker, PreparationDeadline, RunInputBroker, RunInputFailure};
 use super::source::{HttpSourceCredentialBroker, MaterializationFailure, SourceCredentialBroker};
+use super::tree_run::{HttpTreeBroker, TreeRunDependencies};
 use super::workflow_git::{WorkflowGitAuthority, WorkflowGitInstall};
 use super::workspace::{
     AssignmentRoot, AssignmentRootCreationError, CleanupResult, ProcessQuiescence, RetentionReason,
@@ -182,12 +183,31 @@ pub(super) struct AcceptedAssignment {
     pub(super) attempt_number: u64,
     pub(super) continuation: Option<Box<ContinuationOffer>>,
     pub(super) root: AssignmentRoot,
-    pub(super) admitted: AdmittedWorkflow,
+    pub(super) execution: AcceptedExecution,
     pub(super) transition_budget: usize,
     pub(super) execution_version: Arc<str>,
     pub(super) process_guards: AssignmentProcessGuards,
     pub(super) guard_processes: bool,
-    pub(super) workflow_git: WorkflowGitAuthority,
+    /// The runner's Git relay for the workspace; a tree run uses the host's own Git
+    /// access and has none.
+    pub(super) workflow_git: Option<WorkflowGitAuthority>,
+}
+
+/// What an accepted assignment executes: an admitted workflow on the embedded engine,
+/// or a published tree through the `um` commands (REQ-RUNNERENROLL-91).
+#[derive(Clone)]
+pub(super) enum AcceptedExecution {
+    Engine(Box<AdmittedWorkflow>),
+    Tree(Arc<super::tree_run::TreeRun>),
+}
+
+impl AcceptedExecution {
+    pub(super) fn cancellation(&self) -> &CancellationPolicy {
+        match self {
+            Self::Engine(admitted) => admitted.execution().cancellation(),
+            Self::Tree(tree) => tree.cancellation(),
+        }
+    }
 }
 
 impl AcceptedAssignment {
@@ -484,7 +504,7 @@ struct RunningAssignment {
     authority_updates: tokio::sync::watch::Sender<LeaseAuthority>,
     start_authority: tokio::sync::watch::Sender<bool>,
     infrastructure_interruption: tokio::sync::watch::Sender<Option<InfrastructureInterruption>>,
-    workflow_git: WorkflowGitAuthority,
+    workflow_git: Option<WorkflowGitAuthority>,
     engine_terminal: Arc<AtomicBool>,
     workspace_release: Option<CleanupResult>,
     run_event: RunEvent,
@@ -778,6 +798,53 @@ impl AdmissionRuntime {
         let Some(workflow_git) = root.workflow_git() else {
             return Err(Box::new((root, environment_unavailable())));
         };
+        self.accept(
+            offer,
+            root,
+            AcceptedExecution::Engine(Box::new(admitted)),
+            transition_budget,
+            Some(workflow_git),
+        )
+    }
+
+    /// Accepts a prepared tree run (REQ-RUNNERENROLL-91): no workflow admission and no
+    /// Git relay, the outbox reserved as for any run of the spec's capacity.
+    fn finish_tree(
+        &self,
+        offer: &AssignmentOffer,
+        root: AssignmentRoot,
+        tree: super::tree_run::TreeRun,
+        authority: PreparationAuthority<'_>,
+    ) -> Result<AcceptedAssignment, Box<(AssignmentRoot, AssignmentDecline)>> {
+        let carried = &offer.execution_spec.capacity;
+        let transition_budget = authority.ensure_current().and_then(|()| {
+            self.outbox.reserve(
+                usize::try_from(carried.selected_maximum_transitions)
+                    .map_err(|_| environment_unavailable())?,
+                carried.encoded_outbox_bytes,
+            )
+        });
+        let transition_budget = match transition_budget {
+            Ok(budget) => budget,
+            Err(decline) => return Err(Box::new((root, decline))),
+        };
+        self.accept(
+            offer,
+            root,
+            AcceptedExecution::Tree(Arc::new(tree)),
+            transition_budget,
+            None,
+        )
+    }
+
+    fn accept(
+        &self,
+        offer: &AssignmentOffer,
+        root: AssignmentRoot,
+        execution: AcceptedExecution,
+        transition_budget: usize,
+        workflow_git: Option<WorkflowGitAuthority>,
+    ) -> Result<AcceptedAssignment, Box<(AssignmentRoot, AssignmentDecline)>> {
         let process_guards = if self.guard_processes {
             let journal = if offer.continuation.is_none() {
                 self.work_root.recovery().and_then(|store| {
@@ -848,7 +915,7 @@ impl AdmissionRuntime {
             attempt_number: offer.attempt_number,
             continuation: offer.continuation.clone(),
             root,
-            admitted,
+            execution,
             transition_budget,
             execution_version: Arc::clone(&self.execution_version),
             process_guards,
@@ -866,6 +933,7 @@ pub(super) struct AssignmentDependencies {
     sleeper: Arc<dyn Sleeper>,
     source_broker: Option<Arc<dyn SourceCredentialBroker>>,
     input_broker: Option<Arc<dyn RunInputBroker>>,
+    tree_run: TreeRunDependencies,
     execution_version: Arc<str>,
     recorder: Option<Arc<crate::telemetry::Recorder>>,
     guard_processes: bool,
@@ -888,10 +956,17 @@ impl AssignmentDependencies {
             sleeper,
             source_broker,
             input_broker,
+            tree_run: TreeRunDependencies::new(None),
             execution_version,
             recorder,
             guard_processes,
         }
+    }
+
+    /// Executes published trees with `tree_run` (REQ-RUNNERENROLL-91).
+    pub(super) fn with_tree_run(mut self, tree_run: TreeRunDependencies) -> Self {
+        self.tree_run = tree_run;
+        self
     }
 
     pub(super) fn production(
@@ -910,6 +985,8 @@ impl AssignmentDependencies {
             recorder.clone(),
             source_override,
         )?;
+        let tree_broker = HttpTreeBroker::new(config.endpoint(), config.credential(), boot_id)
+            .map_err(|_| super::ServiceError::TreeBrokerConfiguration(config.endpoint().clone()))?;
         Ok(Self::new(
             work_root,
             sleeper,
@@ -918,7 +995,8 @@ impl AssignmentDependencies {
             Arc::from(recorder.service_version()),
             Some(recorder),
             true,
-        ))
+        )
+        .with_tree_run(TreeRunDependencies::new(Some(Arc::new(tree_broker)))))
     }
 
     fn production_brokers(
@@ -980,6 +1058,7 @@ pub(super) struct AssignmentManager {
     sleeper: Arc<dyn Sleeper>,
     source_broker: Option<Arc<dyn SourceCredentialBroker>>,
     input_broker: Option<Arc<dyn RunInputBroker>>,
+    tree_run: TreeRunDependencies,
     recorder: Option<Arc<crate::telemetry::Recorder>>,
     runner_id: String,
     run_events: BTreeMap<String, RunEvent>,
@@ -1258,7 +1337,7 @@ pub(super) mod test_support {
             authority_updates,
             start_authority,
             infrastructure_interruption,
-            workflow_git,
+            workflow_git: Some(workflow_git),
             engine_terminal: Arc::new(AtomicBool::new(false)),
             workspace_release: None,
             run_event: RunEvent::default(),
@@ -1390,9 +1469,12 @@ pub(super) mod test_support {
 
     pub(in crate::service) fn active_step_count(manager: &AssignmentManager) -> Option<usize> {
         match &manager.slot {
-            Some(LocalSlot::Accepted(accepted)) => {
-                Some(accepted.admitted.workflow().definition.steps.len())
-            }
+            Some(LocalSlot::Accepted(accepted)) => match &accepted.execution {
+                AcceptedExecution::Engine(admitted) => {
+                    Some(admitted.workflow().definition.steps.len())
+                }
+                AcceptedExecution::Tree(_) => None,
+            },
             _ => None,
         }
     }
@@ -1428,6 +1510,310 @@ pub(super) mod test_support {
             portable_result_bytes: requirements.portable_result_bytes,
             encoded_outbox_bytes: requirements.encoded_outbox_bytes,
         };
+    }
+
+    /// A manager executing published trees with `tree_run` (REQ-RUNNERENROLL-91): its
+    /// sources come from the fixture repository at `source`, `environment` stands for
+    /// the daemon's, and it guards each assignment's processes in a durable journal as
+    /// the production runner does, which a continuation's retained claim recovers.
+    pub(in crate::service) fn tree_run_manager(
+        config: &Config,
+        source: &Path,
+        tree_run: TreeRunDependencies,
+        environment: EnvironmentSnapshot,
+        recorder: Option<Arc<crate::telemetry::Recorder>>,
+    ) -> AssignmentManager {
+        let work_root = WorkRootLease::acquire_for_test(
+            config.assignment().work_root(),
+            "rbt_01k0z6r1w8f4jy2m7q9v3x5abe",
+        )
+        .unwrap_or_else(|error| panic!("acquire isolated test work root: {error}"));
+        let dependencies = AssignmentDependencies::new(
+            work_root,
+            Arc::new(super::super::TokioSleeper),
+            Some(super::super::source::test_support::fixture_source_broker(
+                source,
+            )),
+            None,
+            Arc::from(crate::telemetry::TEST_SERVICE_VERSION),
+            recorder,
+            true,
+        )
+        .with_tree_run(tree_run);
+        let mut manager = AssignmentManager::new(
+            config,
+            super::super::lease_clock::fixture_lease_clock(),
+            dependencies,
+        );
+        manager.environment = environment;
+        manager
+            .retain_lease_policy(&ExecutionLeasePolicy {
+                schema_version: 2,
+                force_stop_and_reap_budget_milliseconds: 5000,
+                terminal_report_delivery_budget_milliseconds: 5000,
+                renewal_delivery_budget_milliseconds: 5000,
+                lease_duration_milliseconds: 371_000,
+                fencing_margin_milliseconds: 11_000,
+            })
+            .unwrap();
+        manager
+    }
+
+    /// Has `manager` keep its agent logins in `directory`, as a runner with
+    /// protected state does (REQ-AGENTLOGIN-26).
+    pub(in crate::service) fn keep_agent_logins_in(
+        manager: &mut AssignmentManager,
+        directory: crate::agent_login::directory::LoginDirectory,
+    ) {
+        manager.agent_login_directory = Some(directory);
+    }
+
+    async fn wait_until(
+        manager: &mut AssignmentManager,
+        mut reached: impl FnMut(&mut AssignmentManager) -> bool,
+    ) {
+        let notification = manager.notification();
+        super::super::test_support::with_watchdog(async {
+            loop {
+                let notified = notification.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                if reached(manager) {
+                    return;
+                }
+                notified.await;
+            }
+        })
+        .await
+        .expect("assignment state was not reached");
+    }
+
+    /// Offers and prepares `offer` as Cloud does, returning the preparation's decline,
+    /// or `None` once the assignment is accepted.
+    pub(in crate::service) async fn prepare_offered(
+        manager: &mut AssignmentManager,
+        offer: &AssignmentOffer,
+    ) -> Option<AssignmentDecline> {
+        prepare_with(manager, offer, "eff_01k0z6r1w8f4jy2m7q9v3x5acz")
+            .await
+            .0
+    }
+
+    /// Offers and prepares the continuation `offer` under the prepare effect `effect_id`,
+    /// acknowledging its `continuation_ready` as Cloud does. Returns the preparation's
+    /// decline, or `None` once the assignment is accepted, and whether the runner sent
+    /// `continuation_ready` while it still held the assignment in preparation.
+    pub(in crate::service) async fn prepare_continued(
+        manager: &mut AssignmentManager,
+        offer: &AssignmentOffer,
+        effect_id: &str,
+    ) -> (Option<AssignmentDecline>, bool) {
+        prepare_with(manager, offer, effect_id).await
+    }
+
+    async fn prepare_with(
+        manager: &mut AssignmentManager,
+        offer: &AssignmentOffer,
+        effect_id: &str,
+    ) -> (Option<AssignmentDecline>, bool) {
+        manager.handle_offer(offer.clone()).unwrap();
+        let mut preparing = None;
+        let mut rejected = None;
+        wait_until(manager, |manager| {
+            for pending in manager.pending_observations(&BTreeSet::new(), 100) {
+                match pending.observation {
+                    AssignmentObservation::Preparing { .. } => preparing = Some(pending.id),
+                    AssignmentObservation::Decision(AssignmentDecision::Rejected {
+                        assignment_id,
+                        decline,
+                        ..
+                    }) if assignment_id == offer.assignment_id => rejected = Some(decline),
+                    _ => {}
+                }
+            }
+            preparing.is_some() || rejected.is_some()
+        })
+        .await;
+        let Some(preparing) = preparing else {
+            return (rejected, false);
+        };
+        manager.acknowledge_observation(preparing);
+        let preparation_expires_at = (manager.sleeper.utc_now() + time::Duration::minutes(15))
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap();
+        manager
+            .handle_prepare(AssignmentPrepare {
+                effect_id: effect_id.to_owned(),
+                assignment_id: offer.assignment_id.clone(),
+                run_id: offer.run_id.clone(),
+                attempt_id: offer.attempt_id.clone(),
+                execution_spec_id: offer.execution_spec.execution_spec_id.clone(),
+                preparation_expires_at,
+            })
+            .unwrap();
+        let mut ready_while_preparing = false;
+        wait_until(manager, |manager| {
+            manager.drain_events();
+            let preparing = matches!(manager.slot, Some(LocalSlot::Preparing(_)));
+            if let Some(ready) = manager
+                .pending_observations(&BTreeSet::new(), 100)
+                .into_iter()
+                .find(|pending| {
+                    matches!(
+                        pending.observation,
+                        AssignmentObservation::ContinuationReady { .. }
+                    )
+                })
+            {
+                ready_while_preparing = preparing;
+                manager.acknowledge_observation(ready.id);
+                return false;
+            }
+            !preparing
+        })
+        .await;
+        let mut decline = None;
+        for pending in manager.pending_observations(&BTreeSet::new(), 100) {
+            match pending.observation {
+                AssignmentObservation::PreparationProgress { .. } => {
+                    manager.acknowledge_observation(pending.id);
+                }
+                AssignmentObservation::Decision(AssignmentDecision::Rejected {
+                    decline: rejected,
+                    ..
+                }) => decline = Some(rejected),
+                _ => {}
+            }
+        }
+        (decline, ready_while_preparing)
+    }
+
+    /// Starts the accepted `offer` with its first lease and authorizes execution.
+    pub(in crate::service) fn start_offered(
+        manager: &mut AssignmentManager,
+        offer: &AssignmentOffer,
+    ) -> ExecutionJob {
+        start_offered_with(
+            manager,
+            offer,
+            [
+                "eff_01k0z6r1w8f4jy2m7q9v3x5abh",
+                "eff_01k0z6r1w8f4jy2m7q9v3x5abk",
+            ],
+        )
+    }
+
+    /// `start_offered`, the start and its authorization under the effects `effect_ids`.
+    pub(in crate::service) fn start_offered_with(
+        manager: &mut AssignmentManager,
+        offer: &AssignmentOffer,
+        effect_ids: [&str; 2],
+    ) -> ExecutionJob {
+        let [start, authorization] = effect_ids;
+        let job = manager
+            .handle_start(AssignmentStart {
+                effect_id: start.to_owned(),
+                assignment_id: offer.assignment_id.clone(),
+                run_id: offer.run_id.clone(),
+                attempt_id: offer.attempt_id.clone(),
+                execution_spec_id: offer.execution_spec.execution_spec_id.clone(),
+                lease: ExecutionLeaseGrant { sequence: 1 },
+            })
+            .unwrap()
+            .expect("a valid start dispatches execution");
+        manager
+            .handle_start_authorized(AssignmentStartAuthorization {
+                effect_id: authorization.to_owned(),
+                assignment_id: offer.assignment_id.clone(),
+                run_id: offer.run_id.clone(),
+                attempt_id: offer.attempt_id.clone(),
+            })
+            .expect("a valid start authorization is accepted");
+        job
+    }
+
+    /// Waits until the manager holds no assignment, its last root released or retained,
+    /// and returns the observations still queued, as the next session would replay them.
+    pub(in crate::service) async fn settled_observations(
+        manager: &mut AssignmentManager,
+    ) -> Vec<AssignmentObservation> {
+        wait_until(manager, |manager| {
+            manager.drain_events();
+            manager.slot.is_none()
+        })
+        .await;
+        manager
+            .pending_observations(&BTreeSet::new(), 100)
+            .into_iter()
+            .map(|pending| pending.observation)
+            .collect()
+    }
+
+    /// Whether a root cleanup failed, fencing this boot from further offers.
+    pub(in crate::service) fn cleanup_failed(manager: &mut AssignmentManager) -> bool {
+        manager.drain_events();
+        manager.cleanup_failed
+    }
+
+    /// Replaces the manager's lease clock with one whose time passes only as each of
+    /// its timers is released through the returned requests.
+    pub(in crate::service) fn control_lease_clock(
+        manager: &mut AssignmentManager,
+    ) -> tokio::sync::mpsc::UnboundedReceiver<(
+        Duration,
+        super::super::lease_clock::LeaseTimerRelease,
+    )> {
+        let (clock, _control, waits) = super::super::lease_clock::controlled_lease_clock();
+        manager.lease_clock = clock;
+        waits
+    }
+
+    /// Waits for the running job's terminal report and teardown, acknowledges the
+    /// report, and returns the execution reports in order.
+    pub(in crate::service) async fn finished_reports(
+        manager: &mut AssignmentManager,
+    ) -> Vec<ExecutionReport> {
+        wait_until(manager, |manager| {
+            manager.drain_events();
+            !matches!(manager.slot, Some(LocalSlot::Running(_)))
+                && manager
+                    .pending_observations(&BTreeSet::new(), MAXIMUM_SERVICE_OBSERVATIONS)
+                    .iter()
+                    .any(|pending| pending.observation.is_terminal())
+        })
+        .await;
+        let mut reports = Vec::new();
+        for pending in manager.pending_observations(&BTreeSet::new(), MAXIMUM_SERVICE_OBSERVATIONS)
+        {
+            if let AssignmentObservation::Execution { report, .. } = pending.observation {
+                if report.is_terminal() {
+                    manager.acknowledge_observation(pending.id);
+                }
+                reports.push(report);
+            }
+        }
+        reports
+    }
+
+    /// Waits until the queued execution reports, in order, satisfy `reached`, leaving
+    /// them queued.
+    pub(in crate::service) async fn wait_for_reports(
+        manager: &mut AssignmentManager,
+        reached: impl Fn(&[ExecutionReport]) -> bool,
+    ) {
+        wait_until(manager, |manager| {
+            manager.drain_events();
+            let reports = manager
+                .pending_observations(&BTreeSet::new(), 100)
+                .into_iter()
+                .filter_map(|pending| match pending.observation {
+                    AssignmentObservation::Execution { report, .. } => Some(report),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            reached(&reports)
+        })
+        .await;
     }
 }
 
@@ -1557,7 +1943,9 @@ fn build_execution_context(
 }
 
 fn revoke_authority(running: &mut RunningAssignment) {
-    disable_workflow_git_off_thread(&running.workflow_git);
+    if let Some(workflow_git) = &running.workflow_git {
+        disable_workflow_git_off_thread(workflow_git);
+    }
     running.authority_updates.send_modify(|authority| {
         authority.revoked = true;
     });

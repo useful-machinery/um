@@ -1,0 +1,32 @@
+{
+  "protocolVersion": 1,
+  "direction": "cloud_to_runner",
+  "messageId": "cmsg_01k0z6r1w8f4jy2m7q9v3x5atd",
+  "sentAt": "2026-07-23T00:00:09Z",
+  "type": "trigger_delivery",
+  "payloadVersion": 1,
+  "payload": {
+    "effectId": "eff_01k0z6r1w8f4jy2m7q9v3x5atd",
+    "assignmentId": "asn_01k0z6r1w8f4jy2m7q9v3x5abn",
+    "runId": "run_01k0z6r1w8f4jy2m7q9v3x5abp",
+    "attemptId": "atm_01k0z6r1w8f4jy2m7q9v3x5abc",
+    "deliveryId": "wtd_01k0z6r1w8f4jy2m7q9v3x5abt",
+    "claimId": "wsc_01k0z6r1w8f4jy2m7q9v3x5abv",
+    "event": {
+      "source": "lcn_01k0z6r1w8f4jy2m7q9v3x5abw",
+      "event": "issue.state_left",
+      "at": "2026-07-23T00:00:08Z",
+      "payload": {
+        "issue": {
+          "id": "5b0c7e4a-2f1d-4c8e-9a3b-6d2e1f0a9c47",
+          "identifier": "ENG-42"
+        },
+        "issueUpdatedAt": "2026-07-23T00:00:07.512Z",
+        "team": "team_8c1b",
+        "state": "state_build",
+        "to": "state_canceled",
+        "actor": "user_7f3a"
+      }
+    }
+  }
+}

@@ -2066,8 +2066,8 @@ fn design_step() -> AdmissionLocation {
     }
 }
 
-// REQ-WFEXEC-59: a local run of a workflow with `workflow` steps comes from a tree, and
-// Cloud runs none.
+// REQ-WFEXEC-59, REQ-WFFORMAT-94: a local run of a workflow with `workflow` steps comes from
+// a tree, and a runner refuses one outside a tree.
 #[test]
 fn workflow_steps_need_a_tree_locally_and_are_refused_by_runner_admission() {
     let fixture = child_step_fixture(CHILD_STEP_WORKFLOW);

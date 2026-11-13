@@ -45,6 +45,8 @@ pub enum OrganizationAuditAction {
     RunContinuationRequested,
     #[serde(rename = "run.cancellation_requested")]
     RunCancellationRequested,
+    #[serde(rename = "run.claim_released")]
+    RunClaimReleased,
     #[serde(rename = "run.publication_intent_accepted")]
     RunPublicationIntentAccepted,
     #[serde(rename = "run.publication_started")]
@@ -139,6 +141,12 @@ pub enum OrganizationAuditAction {
     RunnerCredentialRetirementScheduled,
     #[serde(rename = "runner_credential.revoked")]
     RunnerCredentialRevoked,
+    #[serde(rename = "runner_join_key.issued")]
+    RunnerJoinKeyIssued,
+    #[serde(rename = "runner_join_key.used")]
+    RunnerJoinKeyUsed,
+    #[serde(rename = "runner_join_key.revoked")]
+    RunnerJoinKeyRevoked,
     #[serde(rename = "github_installation.connected")]
     GithubInstallationConnected,
     #[serde(rename = "github_installation.reactivated")]
@@ -197,6 +205,8 @@ pub enum OrganizationAuditAction {
     LinearTriggerLifecycleEnabled,
     #[serde(rename = "linear_trigger.lifecycle_disabled")]
     LinearTriggerLifecycleDisabled,
+    #[serde(rename = "linear_trigger.retired")]
+    LinearTriggerRetired,
     #[serde(rename = "linear_lifecycle_update.requested")]
     LinearLifecycleUpdateRequested,
     #[serde(rename = "linear_lifecycle_update.applied")]
@@ -243,6 +253,8 @@ pub enum OrganizationAuditAction {
     ScheduleDisabled,
     #[serde(rename = "schedule.deleted")]
     ScheduleDeleted,
+    #[serde(rename = "schedule.retired")]
+    ScheduleRetired,
     #[serde(rename = "project.renamed")]
     ProjectRenamed,
     #[serde(rename = "project.runner_pool_changed")]
@@ -259,6 +271,20 @@ pub enum OrganizationAuditAction {
     RepositoryTokenIssued,
     #[serde(rename = "artifact.download_capabilities_issued")]
     ArtifactDownloadCapabilitiesIssued,
+    #[serde(rename = "workflow_definition.created")]
+    WorkflowDefinitionCreated,
+    #[serde(rename = "workflow_definition.published")]
+    WorkflowDefinitionPublished,
+    #[serde(rename = "workflow_definition.enabled")]
+    WorkflowDefinitionEnabled,
+    #[serde(rename = "workflow_definition.disabled")]
+    WorkflowDefinitionDisabled,
+    #[serde(rename = "workflow_definition.archived")]
+    WorkflowDefinitionArchived,
+    #[serde(rename = "workflow_definition.unarchived")]
+    WorkflowDefinitionUnarchived,
+    #[serde(rename = "workflow_definition.execution_principal_changed")]
+    WorkflowDefinitionExecutionPrincipalChanged,
 }
 
 impl std::fmt::Display for OrganizationAuditAction {
@@ -277,6 +303,7 @@ impl std::fmt::Display for OrganizationAuditAction {
             Self::RunRetryRequested => write!(f, "run.retry_requested"),
             Self::RunContinuationRequested => write!(f, "run.continuation_requested"),
             Self::RunCancellationRequested => write!(f, "run.cancellation_requested"),
+            Self::RunClaimReleased => write!(f, "run.claim_released"),
             Self::RunPublicationIntentAccepted => write!(f, "run.publication_intent_accepted"),
             Self::RunPublicationStarted => write!(f, "run.publication_started"),
             Self::RunPublicationSkipped => write!(f, "run.publication_skipped"),
@@ -334,6 +361,9 @@ impl std::fmt::Display for OrganizationAuditAction {
                 write!(f, "runner_credential.retirement_scheduled")
             }
             Self::RunnerCredentialRevoked => write!(f, "runner_credential.revoked"),
+            Self::RunnerJoinKeyIssued => write!(f, "runner_join_key.issued"),
+            Self::RunnerJoinKeyUsed => write!(f, "runner_join_key.used"),
+            Self::RunnerJoinKeyRevoked => write!(f, "runner_join_key.revoked"),
             Self::GithubInstallationConnected => write!(f, "github_installation.connected"),
             Self::GithubInstallationReactivated => write!(f, "github_installation.reactivated"),
             Self::GithubInstallationDisconnected => write!(f, "github_installation.disconnected"),
@@ -367,6 +397,7 @@ impl std::fmt::Display for OrganizationAuditAction {
             Self::LinearEvaluationRetryRequested => write!(f, "linear_evaluation.retry_requested"),
             Self::LinearTriggerLifecycleEnabled => write!(f, "linear_trigger.lifecycle_enabled"),
             Self::LinearTriggerLifecycleDisabled => write!(f, "linear_trigger.lifecycle_disabled"),
+            Self::LinearTriggerRetired => write!(f, "linear_trigger.retired"),
             Self::LinearLifecycleUpdateRequested => write!(f, "linear_lifecycle_update.requested"),
             Self::LinearLifecycleUpdateApplied => write!(f, "linear_lifecycle_update.applied"),
             Self::LinearLifecycleUpdateAlreadySatisfied => {
@@ -396,6 +427,7 @@ impl std::fmt::Display for OrganizationAuditAction {
             Self::ScheduleEnabled => write!(f, "schedule.enabled"),
             Self::ScheduleDisabled => write!(f, "schedule.disabled"),
             Self::ScheduleDeleted => write!(f, "schedule.deleted"),
+            Self::ScheduleRetired => write!(f, "schedule.retired"),
             Self::ProjectRenamed => write!(f, "project.renamed"),
             Self::ProjectRunnerPoolChanged => write!(f, "project.runner_pool_changed"),
             Self::ProjectRepositoryBound => write!(f, "project.repository_bound"),
@@ -405,6 +437,15 @@ impl std::fmt::Display for OrganizationAuditAction {
             Self::RepositoryTokenIssued => write!(f, "repository_token.issued"),
             Self::ArtifactDownloadCapabilitiesIssued => {
                 write!(f, "artifact.download_capabilities_issued")
+            }
+            Self::WorkflowDefinitionCreated => write!(f, "workflow_definition.created"),
+            Self::WorkflowDefinitionPublished => write!(f, "workflow_definition.published"),
+            Self::WorkflowDefinitionEnabled => write!(f, "workflow_definition.enabled"),
+            Self::WorkflowDefinitionDisabled => write!(f, "workflow_definition.disabled"),
+            Self::WorkflowDefinitionArchived => write!(f, "workflow_definition.archived"),
+            Self::WorkflowDefinitionUnarchived => write!(f, "workflow_definition.unarchived"),
+            Self::WorkflowDefinitionExecutionPrincipalChanged => {
+                write!(f, "workflow_definition.execution_principal_changed")
             }
         }
     }

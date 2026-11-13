@@ -667,6 +667,13 @@ pub trait ChildRunDispatcher: Clone + Send + Sync + 'static {
     /// Whether a stop control is in force for `step`, which then does not start and the
     /// run enters a `stop` wait at it (REQ-WFEXEC-62).
     fn stop_before(&self, step: &str) -> impl Future<Output = bool> + Send;
+
+    /// Whether a withdrawal recorded for the run is pending, which ends the attempt as a
+    /// cancellation before the next `workflow` step starts (REQ-WFEXEC-73). A dispatcher
+    /// that reads no run's controls has none.
+    fn withdrawal_pending(&self) -> impl Future<Output = bool> + Send {
+        std::future::ready(false)
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1137,18 +1144,37 @@ where
     ) -> Result<(), StepRuntimeError> {
         let preparation_runtime = self.clone();
         let preparation_step = step.clone();
-        // A stop control in force for a `workflow` step enters a `stop` wait instead of
-        // starting the step (REQ-WFEXEC-62).
         if let ChildRuns::Enabled { dispatcher, .. } = &self.children
             && matches!(
                 workflow_node(&self.admitted, &step).map(StepBody::from),
                 Some(StepBody::Workflow(_))
             )
-            && dispatcher.stop_before(&step).await
         {
-            return self
-                .settle_unlaunched(action, DriverOccurrence::stop_entered(step, action))
-                .await;
+            // A withdrawal recorded for the run ends the attempt before an ordinary
+            // `workflow` step starts (REQ-WFEXEC-73).
+            if self
+                .admitted
+                .workflow()
+                .definition
+                .steps
+                .contains_key(&step)
+                && dispatcher.withdrawal_pending().await
+                && self
+                    .admitted
+                    .execution()
+                    .cancellation()
+                    .source()
+                    .request_withdrawal()
+            {
+                return self.withdraw_before(step, action, cancellation).await;
+            }
+            // A stop control in force for a `workflow` step enters a `stop` wait instead of
+            // starting the step (REQ-WFEXEC-62).
+            if dispatcher.stop_before(&step).await {
+                return self
+                    .settle_unlaunched(action, DriverOccurrence::stop_entered(step, action))
+                    .await;
+            }
         }
         let prepared = tokio::task::spawn_blocking(move || {
             preparation_runtime.prepare_step(&preparation_step, action, &inputs)
@@ -1184,6 +1210,31 @@ where
             PreparedStepBody::Workflow(child) => {
                 self.execute_prepared_child(step, action, child, cancellation)
                     .await
+            }
+        }
+    }
+
+    // The withdrawal's cancellation reaches the step it was requested before as it reaches
+    // any starting step, so the step quiesces unlaunched and ends `cancelled` with every
+    // unstarted step (REQ-WFEXEC-45, REQ-WFEXEC-73). The step's wake is sent only once its
+    // cancellation is registered, so after it the cancellation is found; were it not, the
+    // step settles as a start failure rather than waiting on a wake that cannot come.
+    async fn withdraw_before(
+        &self,
+        step: String,
+        action: ActionId,
+        cancellation: oneshot::Receiver<()>,
+    ) -> Result<(), StepRuntimeError> {
+        let _ = cancellation.await;
+        match self.cancellation_for(action) {
+            Some(cancellation) => self.quiesce_unlaunched(action, cancellation).await,
+            None => {
+                self.settle_start_failure(
+                    step,
+                    action,
+                    StepStartFailure::PreparationTaskUnavailable,
+                )
+                .await
             }
         }
     }

@@ -1,7 +1,8 @@
 //! `um workflow run show` (REQ-LOCALRUN-189): one run from its records, read as `status`
 //! reads it, without taking its lock or changing its directory, with its mirror writes
 //! (REQ-LOCALRUN-193) and each running child's attempt and in-flight steps, read from the
-//! child's records the same way.
+//! child's records the same way; with `--cloud ORGANIZATION`, the Cloud run `RUN` names
+//! instead.
 
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -23,7 +24,8 @@ use super::list::{or_dash, position, state_name};
 use crate::exit_code::ExitCode;
 
 pub(super) const ABOUT: &str =
-    "Show a local workflow run with its wait, children, controls and mirror writes";
+    "Show a local workflow run from its records, or a Cloud run with --cloud";
+pub(super) const AFTER_HELP: &str = "With --cloud ORGANIZATION, RUN is a Cloud run ID: the command reads that run with its definition, subject claim, workflow state and outcome, latest progress, exits and newest trigger deliveries. It reads and writes no local run.";
 const COMMAND: &str = "um workflow run show";
 
 #[derive(Debug, Args)]
@@ -33,6 +35,9 @@ pub(super) struct Command {
 
     #[command(flatten)]
     output: super::control::JsonOutput,
+
+    #[command(flatten)]
+    cloud: super::CloudSelector,
 }
 
 /// Everything `show` prints about one run.
@@ -73,7 +78,16 @@ struct ChildProgress {
 type Refused = (Option<PathBuf>, Refusal);
 
 impl Command {
-    pub(super) fn execute(self) -> super::super::super::CommandResult {
+    pub(super) fn execute(mut self) -> super::super::super::CommandResult {
+        if let Some(organization) = self.cloud.organization.take() {
+            return super::cloud::CloudRun::new(
+                self.run,
+                organization,
+                self.cloud,
+                self.output.json,
+            )?
+            .show();
+        }
         super::super::super::execute_read_only_with_signals("workflow run show", move |control| {
             let json = self.output.json;
             let shown = self.read();

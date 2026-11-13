@@ -36,6 +36,17 @@ steps:
     command:
       argv: ["true"]
 "#;
+const MEMBER_ROOT: &str = r#"schemaVersion: 1
+name: members
+bindings:
+  includedOwners: {kind: members, default: []}
+  nightlyOwner: {kind: member}
+steps:
+  prepare:
+    kind: cmd
+    command:
+      argv: ["true"]
+"#;
 const ID_PATTERN: &str = "^def_[0-7][0-9a-hjkmnp-tv-z]{25}$";
 const DIGEST_PATTERN: &str = "^sha256:[0-9a-f]{64}$";
 
@@ -428,7 +439,7 @@ fn bindings_file_members_are_checked_against_the_declared_bindings() {
         "done": {"kind": "linear.state", "value": "Shipped"},
     }))
     .expect("the object form should be accepted");
-    assert_eq!(snapshot.bindings()["done"].value, "Shipped");
+    assert_eq!(snapshot.bindings()["done"].value.as_text(), Some("Shipped"));
     assert_eq!(
         snapshot.bindings()["linearTeam"].kind,
         BindingKind::LinearTeam
@@ -475,6 +486,96 @@ fn bindings_file_members_are_checked_against_the_declared_bindings() {
         let error = BindingsFile::parse(bytes).expect_err("a non-object file should refuse");
         assert_eq!(error.code(), "bindings_file_invalid");
     }
+}
+
+// REQ-WFDEF-3, REQ-WFDEF-20, REQ-WFDEF-29
+#[test]
+fn member_and_members_bindings_publish_typed_values_kept_as_written() {
+    let home = Home::new();
+    let tree = Tree::with(MEMBER_ROOT).validated();
+    let publish_with = |file: Option<Value>| {
+        publish(
+            &home.home,
+            &tree,
+            PublishTarget::Resolve,
+            file.map(bindings).as_ref(),
+            "tester",
+        )
+        .expect("publish should succeed")
+    };
+
+    let first = publish_with(Some(json!({"nightlyOwner": "prn_x"})));
+    let id = first.record.id.clone();
+    let snapshot = serde_json::from_slice::<Value>(&home.snapshot_bytes(&id, 1))
+        .expect("snapshot should be JSON");
+    assert_eq!(
+        snapshot,
+        json!({
+            "includedOwners": {"kind": "members", "value": []},
+            "nightlyOwner": {"kind": "member", "value": "prn_x"},
+        })
+    );
+    assert_records_match_schemas(&home, &id, 1);
+
+    let second = publish_with(Some(json!({"nightlyOwner": "prn_x"})));
+    assert_eq!(
+        second.record.revisions[0].bindings,
+        first.record.revisions[0].bindings
+    );
+
+    let third = publish_with(Some(
+        json!({"nightlyOwner": "prn_x", "includedOwners": ["prn_a"]}),
+    ));
+    assert_eq!(
+        third.snapshot.bindings()["includedOwners"].value,
+        BindingValue::List(vec!["prn_a".to_owned()])
+    );
+    assert_ne!(
+        third.record.revisions[0].bindings,
+        first.record.revisions[0].bindings
+    );
+    assert_records_match_schemas(&home, &id, 3);
+
+    // Carried forward without a file, the list is read back as a list.
+    let fourth = publish_with(None);
+    assert_eq!(home.snapshot_bytes(&id, 4), home.snapshot_bytes(&id, 3));
+    assert_eq!(fourth.snapshot, third.snapshot);
+
+    for (value, key) in [
+        (
+            json!({"nightlyOwner": "prn_x", "includedOwners": "prn_a"}),
+            "includedOwners",
+        ),
+        (json!({"nightlyOwner": ["prn_x"]}), "nightlyOwner"),
+        (
+            json!({"nightlyOwner": "prn_x", "includedOwners": [""]}),
+            "includedOwners",
+        ),
+        (
+            json!({"nightlyOwner": "prn_x", "includedOwners": {"value": [7]}}),
+            "includedOwners",
+        ),
+    ] {
+        let error = resolve_bindings(&tree.bindings, Some(&bindings(value)), None)
+            .expect_err("a value that does not fit its kind should refuse");
+        assert_eq!(
+            (error.code(), error.key()),
+            ("binding_value_invalid", Some(key))
+        );
+    }
+
+    let empty_member_default =
+        Tree::with(&MEMBER_ROOT.replace("default: []", "default: [\"\"]")).validated();
+    let error = resolve_bindings(
+        &empty_member_default.bindings,
+        Some(&bindings(json!({"nightlyOwner": "prn_x"}))),
+        None,
+    )
+    .expect_err("an empty member in a default should refuse");
+    assert_eq!(
+        (error.code(), error.key()),
+        ("binding_value_invalid", Some("includedOwners"))
+    );
 }
 
 // REQ-WFDEF-21
@@ -537,8 +638,8 @@ fn a_later_publish_carries_the_snapshot_forward_and_drops_undeclared_keys() {
     let snapshot = second.snapshot.bindings();
     assert!(!snapshot.contains_key("repository"));
     assert_eq!(snapshot.len(), 6);
-    assert_eq!(snapshot["done"].value, "Shipped");
-    assert_eq!(snapshot["linearTeam"].value, "AUTO");
+    assert_eq!(snapshot["done"].value.as_text(), Some("Shipped"));
+    assert_eq!(snapshot["linearTeam"].value.as_text(), Some("AUTO"));
 
     let with_new_binding = without_repository.replacen(
         "  done:",
@@ -925,9 +1026,9 @@ fn a_revision_s_snapshot_reads_back_after_a_later_publish_changed_the_bindings()
 
     let one = read_revision_bindings(&home.home, &id, 1).expect("revision 1 should read");
     assert_eq!(one, first.snapshot);
-    assert_eq!(one.bindings()["done"].value, "Done");
+    assert_eq!(one.bindings()["done"].value.as_text(), Some("Done"));
     let two = read_revision_bindings(&home.home, &id, 2).expect("revision 2 should read");
-    assert_eq!(two.bindings()["done"].value, "Shipped");
+    assert_eq!(two.bindings()["done"].value.as_text(), Some("Shipped"));
 
     let unlisted = read_revision_bindings(&home.home, &id, 3)
         .expect_err("a revision the record does not list should refuse");
@@ -948,4 +1049,169 @@ fn a_revision_s_snapshot_reads_back_after_a_later_publish_changed_the_bindings()
         .expect_err("a snapshot unlike its digest should refuse");
     assert_eq!(error.code(), "definition_record_invalid");
     assert_eq!(error.path(), Some(snapshot.as_path()));
+}
+
+// REQ-WFDEF-32, REQ-WFDEF-7: publish never writes a revision's resolution record, so a
+// revision without one reads none; one beside `bindings.json` reads back as the resolved id
+// by binding key, and one not of the record's shape is `definition_record_invalid` at its
+// path.
+#[test]
+fn a_revision_s_resolution_record_is_optional_and_read_by_binding_key() {
+    let home = Home::new();
+    let first = publish_engineering(&home, PublishTarget::Resolve);
+    let id = first.record.id.clone();
+    let revision = home.home.definition_directory(&id).join("revisions/1");
+    assert!(!revision.join("resolution.json").exists());
+    assert_eq!(
+        home.home
+            .revision_resolution(&id, 1)
+            .expect("a revision without a record should read"),
+        None
+    );
+
+    let record = revision.join("resolution.json");
+    fs::write(
+        &record,
+        json!({
+            "linearTeam": {"id": "team-1", "name": "AUTO"},
+            "done": {"id": "state-done", "name": "Done"},
+        })
+        .to_string(),
+    )
+    .expect("resolution record should be written");
+    let resolved = home
+        .home
+        .revision_resolution(&id, 1)
+        .expect("the record should read")
+        .expect("the record should be present");
+    assert_eq!(
+        resolved,
+        BTreeMap::from([
+            ("done".to_owned(), "state-done".to_owned()),
+            ("linearTeam".to_owned(), "team-1".to_owned()),
+        ])
+    );
+
+    for invalid in [
+        json!([]),
+        json!({"done": "state-done"}),
+        json!({"done": {"id": "state-done"}}),
+        json!({"done": {"id": "", "name": "Done"}}),
+        json!({"done": {"id": "state-done", "name": "Done", "extra": 1}}),
+        json!({"not a key": {"id": "state-done", "name": "Done"}}),
+    ] {
+        fs::write(&record, invalid.to_string()).expect("resolution record should be replaced");
+        let error = home
+            .home
+            .revision_resolution(&id, 1)
+            .expect_err("a record not of the shape should refuse");
+        assert_eq!(error.code(), "definition_record_invalid", "{invalid}");
+        assert_eq!(error.path(), Some(record.as_path()), "{invalid}");
+    }
+
+    let unlisted = home
+        .home
+        .revision_resolution(&id, 2)
+        .expect_err("a revision the record does not list should refuse");
+    assert_eq!(unlisted.code(), "definition_record_invalid");
+
+    // A later publish writes its own revision without a record and leaves revision 1's.
+    publish_engineering(&home, PublishTarget::Resolve);
+    assert_eq!(home.home.revision_resolution(&id, 2).unwrap(), None);
+    assert!(record.exists());
+}
+
+const CLOUD_ID: &str = "def_01k0z6r1w8f4jy2m7q9v3x5abc";
+const OTHER_CLOUD_ID: &str = "def_01k0z6r1w8f4jy2m7q9v3x5abd";
+
+// REQ-CLOUDDEF-14, REQ-WFDEF-7, REQ-WFDEF-22
+#[test]
+fn set_cloud_id_replaces_the_record_whole_and_a_later_publish_keeps_it() {
+    let home = Home::new();
+    let first = publish_engineering(&home, PublishTarget::Resolve);
+    let id = first.record.id.clone();
+    assert_eq!(first.record.cloud_id, None);
+
+    let set = home
+        .home
+        .set_cloud_id(&id, CLOUD_ID)
+        .expect("cloud id should be recorded");
+    let mut expected = first.record.clone();
+    expected.cloud_id = Some(CLOUD_ID.to_owned());
+    assert_eq!(set.record, expected);
+    assert_eq!(
+        read_definition(&home.home, &id)
+            .expect("record should read")
+            .record,
+        expected
+    );
+    assert_records_match_schemas(&home, &id, 1);
+
+    let second = publish(
+        &home.home,
+        &Tree::engineering().validated(),
+        PublishTarget::Resolve,
+        None,
+        "tester",
+    )
+    .expect("a later publish should succeed");
+    assert_eq!(second.record.cloud_id.as_deref(), Some(CLOUD_ID));
+
+    let replaced = home
+        .home
+        .set_cloud_id(&id, OTHER_CLOUD_ID)
+        .expect("another cloud id should replace the first");
+    assert_eq!(replaced.record.cloud_id.as_deref(), Some(OTHER_CLOUD_ID));
+    assert_eq!(replaced.record.revisions, second.record.revisions);
+}
+
+// REQ-CLOUDDEF-14, REQ-WFDEF-27
+#[test]
+fn set_cloud_id_refuses_an_invalid_id_or_a_held_lock_and_changes_nothing() {
+    let home = Home::new();
+    let first = publish_engineering(&home, PublishTarget::Resolve);
+    let id = first.record.id.clone();
+    let before = home.definition_bytes(&id);
+
+    let invalid = home
+        .home
+        .set_cloud_id(&id, "def_not-a-cloud-id")
+        .expect_err("a cloud id that is not a def_ id should refuse");
+    assert_eq!(invalid.code(), "definition_id_invalid");
+    let unknown = home
+        .home
+        .set_cloud_id(OTHER_CLOUD_ID, CLOUD_ID)
+        .expect_err("an unknown local id should refuse");
+    assert_eq!(unknown.code(), "definition_not_found");
+
+    let other = PublishLock::acquire(&first.path, &id).expect("lock should be free");
+    let held = home
+        .home
+        .set_cloud_id(&id, CLOUD_ID)
+        .expect_err("a held publish lock should refuse");
+    assert_eq!(held.code(), "publish_conflict");
+    assert_eq!(home.definition_bytes(&id), before);
+    drop(other);
+}
+
+// REQ-CLOUDDEF-20, REQ-WFDEF-27
+#[test]
+fn check_definition_id_accepts_only_the_definition_id_shape() {
+    for valid in [CLOUD_ID, OTHER_CLOUD_ID, "def_7zzzzzzzzzzzzzzzzzzzzzzzzz"] {
+        check_definition_id(valid).expect("a definition id should pass");
+    }
+    for invalid in [
+        "",
+        "def_not-a-cloud-id",
+        "prj_01k0z6r1w8f4jy2m7q9v3x5abc",
+        "def_81k0z6r1w8f4jy2m7q9v3x5abc",
+        "def_01k0z6r1w8f4jy2m7q9v3x5ab",
+        "def_01k0z6r1w8f4jy2m7q9v3x5abcd",
+        "def_01K0Z6R1W8F4JY2M7Q9V3X5ABC",
+        "def_01k0z6r1w8f4jy2m7q9v3x5abu",
+    ] {
+        let error = check_definition_id(invalid).expect_err("a malformed id should refuse");
+        assert_eq!(error.code(), "definition_id_invalid", "{invalid}");
+        assert_eq!(error.id(), Some(invalid), "{invalid}");
+    }
 }

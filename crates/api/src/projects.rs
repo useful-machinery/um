@@ -192,17 +192,17 @@ impl ProjectApi {
         )
     }
 
-    pub fn set_runner_pool(
+    pub fn set_runner_pools(
         &self,
         organization: &str,
         project_id: &str,
         idempotency_key: &str,
-        runner_pool_id: &str,
+        runner_pool_ids: &[String],
     ) -> Result<Project, ProjectFailure> {
-        let body = serialize_request(&models::SetProjectRunnerPoolRequest::new(
-            runner_pool_id.to_owned(),
+        let body = serialize_request(&models::SetProjectRunnerPoolsRequest::new(
+            runner_pool_ids.to_vec(),
         ))?;
-        let path = project_child_path(organization, project_id, "runner-pool");
+        let path = project_child_path(organization, project_id, "runner-pools");
         self.project_body_mutation(
             project_id,
             Method::PUT,
@@ -793,7 +793,23 @@ fn parse_retry_after(response: &ReceivedResponse) -> Option<u64> {
         .filter(|seconds| *seconds > 0 && seconds.to_string() == value)
 }
 
-fn validate_project(project: Project) -> Result<Project, ProjectFailure> {
+fn validate_project(mut project: Project) -> Result<Project, ProjectFailure> {
+    // A Cloud that predates the pool set omits `runnerPools`; its single pool is the set.
+    let runner_pools = project.runner_pools.get_or_insert_with(|| {
+        project
+            .runner_pool
+            .as_deref()
+            .cloned()
+            .into_iter()
+            .collect()
+    });
+    let pool_set_valid = runner_pools.first() == project.runner_pool.as_deref()
+        && runner_pools.iter().enumerate().all(|(index, pool)| {
+            valid_runner_pool(pool)
+                && runner_pools[..index]
+                    .iter()
+                    .all(|earlier| earlier.id != pool.id)
+        });
     let expected_blockers = match (project.runner_pool.is_none(), project.repository.as_deref()) {
         (true, None) => vec![
             models::ProjectReadinessBlocker::RunnerPoolUnassigned,
@@ -820,9 +836,6 @@ fn validate_project(project: Project) -> Result<Project, ProjectFailure> {
         .ok()
         .zip(OffsetDateTime::parse(&project.updated_at, &Rfc3339).ok())
         .is_some_and(|(created, updated)| updated >= created);
-    let pool_valid = project.runner_pool.as_deref().is_none_or(|pool| {
-        um_support::valid_typed_id(&pool.id, "rpl_") && valid_bounded_text(&pool.name, 1, 63)
-    });
     let repository_valid = project
         .repository
         .as_deref()
@@ -830,7 +843,7 @@ fn validate_project(project: Project) -> Result<Project, ProjectFailure> {
     let valid = um_support::valid_typed_id(&project.id, "prj_")
         && um_support::valid_typed_id(&project.organization_id, "org_")
         && um_support::valid_url_safe_name(&project.name)
-        && pool_valid
+        && pool_set_valid
         && repository_valid
         && project.execution_readiness.blockers == expected_blockers
         && project.execution_readiness.ready == expected_blockers.is_empty()
@@ -840,6 +853,10 @@ fn validate_project(project: Project) -> Result<Project, ProjectFailure> {
     } else {
         Err(ProjectFailure::protocol(false))
     }
+}
+
+fn valid_runner_pool(pool: &models::ProjectRunnerPoolSummary) -> bool {
+    um_support::valid_typed_id(&pool.id, "rpl_") && valid_bounded_text(&pool.name, 1, 63)
 }
 
 fn validate_repository(repository: ProjectRepository) -> Result<ProjectRepository, ProjectFailure> {
@@ -960,6 +977,61 @@ impl fmt::Display for ProjectApiError {
             Self::BuildClient(error) => {
                 write!(formatter, "prepare project management networking: {error}")
             }
+        }
+    }
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::disallowed_macros,
+    clippy::unwrap_used,
+    reason = "project response-validation unit tests use Rust test assertions"
+)]
+mod tests {
+    use super::*;
+
+    fn pool(index: usize) -> serde_json::Value {
+        serde_json::json!({
+            "id": format!("rpl_01k0z6r1w8f4jy2m7q9v3x5{index:03}"),
+            "name": format!("pool-{index}"),
+        })
+    }
+
+    fn project_with_pools(pools: Vec<serde_json::Value>) -> Result<Project, ProjectFailure> {
+        let project = serde_json::from_value(serde_json::json!({
+            "id": "prj_01k0z6r1w8f4jy2m7q9v3x5abc",
+            "organizationId": "org_01k0z6r1w8f4jy2m7q9v3x5abc",
+            "name": "widget",
+            "runnerPool": pool(0),
+            "runnerPools": pools,
+            "repository": null,
+            "executionReadiness": {"ready": false, "blockers": ["repository_detached"]},
+            "createdAt": "2026-01-01T00:00:00Z",
+            "updatedAt": "2026-01-01T00:00:00Z",
+        }))
+        .unwrap();
+        validate_project(project)
+    }
+
+    // REQ-COMPAT-20: the pool-set limit is the server's, so a published CLI
+    // keeps reading a project whatever number of pools a later Cloud allows.
+    #[test]
+    fn a_project_with_any_number_of_pools_decodes_and_malformed_sets_are_refused() {
+        let pools: Vec<_> = (0..21).map(pool).collect();
+        let project = project_with_pools(pools.clone()).unwrap();
+        assert_eq!(project.runner_pools.unwrap().len(), 21);
+
+        let mut missing_id = pools.clone();
+        missing_id[3]["id"] = serde_json::json!("");
+        let mut missing_name = pools.clone();
+        missing_name[3]["name"] = serde_json::json!("");
+        let mut duplicate = pools;
+        duplicate[20] = pool(3);
+        for refused in [missing_id, missing_name, duplicate] {
+            assert_eq!(
+                project_with_pools(refused),
+                Err(ProjectFailure::protocol(false))
+            );
         }
     }
 }

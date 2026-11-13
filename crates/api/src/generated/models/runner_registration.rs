@@ -36,6 +36,8 @@ pub struct RunnerRegistration {
     pub activity: Box<models::RunnerActivity>,
     #[serde(rename = "advertisedMetadata", skip_serializing_if = "Option::is_none")]
     pub advertised_metadata: Option<Box<models::RunnerAdvertisedMetadata>>,
+    #[serde(rename = "joinKey", skip_serializing_if = "Option::is_none")]
+    pub join_key: Option<Box<models::RunnerRegistrationJoinKey>>,
 }
 
 impl RunnerRegistration {
@@ -59,6 +61,7 @@ impl RunnerRegistration {
             connectivity: Box::new(connectivity),
             activity: Box::new(activity),
             advertised_metadata: None,
+            join_key: None,
         }
     }
 }

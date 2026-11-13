@@ -59,9 +59,16 @@ impl Command {
             self.replace_credential,
             self.resume,
         )
-        .map_err(|error| anyhow::anyhow!(
-            "runner enrollment did not complete: {error}\n\nKeep the protected enrollment journal and rerun with --resume when appropriate."
-        ))?;
+        .map_err(|error| match error {
+            // A staged join is resolved by `um runner serve` with its key, never by --resume;
+            // the error itself names the journal and the remedy.
+            um_runner::EnrollmentError::UnresolvedJoin { .. } => {
+                anyhow::anyhow!("runner enrollment did not complete: {error}")
+            }
+            error => anyhow::anyhow!(
+                "runner enrollment did not complete: {error}\n\nKeep the protected enrollment journal and rerun with --resume when appropriate."
+            ),
+        })?;
         match outcome {
             EnrollmentOutcome::Enrolled {
                 response,

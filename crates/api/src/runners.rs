@@ -4,7 +4,7 @@ use std::time::Duration;
 use reqwest::header::{CONTENT_LENGTH, CONTENT_TYPE, HeaderMap, TRANSFER_ENCODING};
 use reqwest::{StatusCode, Url};
 
-use super::generated::apis::{self, runners_api};
+use super::generated::apis::{self, principals_api, runners_api};
 use super::generated::models;
 use super::http_client::generated_configuration;
 use super::problem::{
@@ -23,9 +23,13 @@ const CREDENTIAL_TRANSITION_UNAVAILABLE: &str =
     "https://api.usefulmachinery.com/problems/runner-credential-transition-unavailable";
 const POOL_MOVE_UNAVAILABLE: &str =
     "https://api.usefulmachinery.com/problems/runner-pool-move-unavailable";
+const POOL_PERSONAL: &str = "https://api.usefulmachinery.com/problems/runner-pool-personal";
+const POOL_PERSONAL_UNAVAILABLE: &str =
+    "https://api.usefulmachinery.com/problems/runner-pool-personal-unavailable";
 
 pub type RunnerPool = models::RunnerPool;
 pub type RunnerPoolList = models::RunnerPoolList;
+pub(crate) type RunnerPoolStatus = models::RunnerPoolStatus;
 pub type RunnerCurrentAssignment = models::RunnerCurrentAssignment;
 pub type RunnerRegistration = models::RunnerRegistration;
 pub type RunnerRegistrationList = models::RunnerRegistrationList;
@@ -38,6 +42,9 @@ pub(crate) type RunnerCredentialList = models::RunnerCredentialList;
 pub type RunnerCredentialStoredState = models::runner_credential::StoredState;
 pub type RunnerCredentialEffectiveState = models::runner_credential::EffectiveState;
 pub type RunnerDeletionBlocker = models::ProblemBlocker;
+pub(crate) type RunnerJoinKey = models::RunnerJoinKey;
+pub(crate) type RunnerJoinKeyIssuance = models::RunnerJoinKeyIssuance;
+pub(crate) type RunnerJoinKeyList = models::RunnerJoinKeyList;
 
 #[derive(Clone, Copy)]
 pub enum RunnerRegistrationMode {
@@ -123,6 +130,38 @@ impl RunnerApi {
         )
     }
 
+    /// Reads the waiting runs and runner counts of the pool `pool_id` names,
+    /// one snapshot that Cloud does not cache.
+    pub fn get_pool_status(
+        &self,
+        organization: &str,
+        pool_id: &str,
+    ) -> Result<RunnerPoolStatus, RunnerFailure> {
+        runners_api::get_runner_pool_status(&self.configuration, organization, pool_id)
+            .map_err(classify_runner_error)
+    }
+
+    /// Finds the caller's own personal pool: the pool whose member is the
+    /// authenticated principal. A caller with none receives `PersonalPoolNotFound`.
+    pub fn get_personal_pool(&self, organization: &str) -> Result<RunnerPool, RunnerFailure> {
+        let caller = principals_api::get_current_principal(&self.configuration)
+            .map_err(classify_runner_error)?
+            .principal
+            .id;
+        find_listed(
+            |cursor| {
+                let page = self.list_pools(organization, Some(200), cursor)?;
+                Ok((page.items, page.next_cursor))
+            },
+            |pool| {
+                pool.member
+                    .as_ref()
+                    .is_some_and(|member| member.id == caller)
+            },
+            RunnerFailure::PersonalPoolNotFound,
+        )
+    }
+
     pub fn rename_pool(
         &self,
         organization: &str,
@@ -155,14 +194,19 @@ impl RunnerApi {
         )
     }
 
+    /// Creates a registration in the pool `pool_id` names, or in the personal
+    /// pool of the member `member_id` names; the caller names exactly one.
     pub fn create_registration(
         &self,
         organization: &str,
         idempotency_key: &str,
-        pool_id: &str,
+        pool_id: Option<&str>,
+        member_id: Option<&str>,
         name: Option<&str>,
     ) -> Result<RunnerRegistration, RunnerFailure> {
-        let mut request = models::CreateRunnerRegistrationRequest::new(pool_id.to_owned());
+        let mut request = models::CreateRunnerRegistrationRequest::new();
+        request.runner_pool_id = pool_id.map(ToOwned::to_owned);
+        request.member_id = member_id.map(ToOwned::to_owned);
         request.name = name.map(ToOwned::to_owned);
         runners_api::create_runner_registration(
             &self.configuration,
@@ -220,6 +264,57 @@ impl RunnerApi {
             activation_id,
             idempotency_key,
             models::RevokeRunnerActivationRequest::new(),
+        )
+        .map_err(classify_runner_error)
+    }
+
+    pub fn issue_join_key(
+        &self,
+        organization: &str,
+        pool_id: &str,
+        idempotency_key: &str,
+        expires_in_seconds: i32,
+        offline_removal_seconds: i32,
+    ) -> Result<RunnerJoinKeyIssuance, RunnerFailure> {
+        runners_api::issue_runner_join_key(
+            &self.configuration,
+            organization,
+            pool_id,
+            idempotency_key,
+            models::IssueRunnerJoinKeyRequest::new(expires_in_seconds, offline_removal_seconds),
+        )
+        .map_err(classify_runner_error)
+    }
+
+    pub fn list_join_keys(
+        &self,
+        organization: &str,
+        pool_id: Option<&str>,
+        limit: Option<u16>,
+        cursor: Option<&str>,
+    ) -> Result<RunnerJoinKeyList, RunnerFailure> {
+        runners_api::list_runner_join_keys(
+            &self.configuration,
+            organization,
+            pool_id,
+            limit.map(i32::from),
+            cursor,
+        )
+        .map_err(classify_runner_error)
+    }
+
+    pub fn revoke_join_key(
+        &self,
+        organization: &str,
+        join_key_id: &str,
+        idempotency_key: &str,
+    ) -> Result<RunnerJoinKey, RunnerFailure> {
+        runners_api::revoke_runner_join_key(
+            &self.configuration,
+            organization,
+            join_key_id,
+            idempotency_key,
+            models::RevokeRunnerJoinKeyRequest::new(),
         )
         .map_err(classify_runner_error)
     }
@@ -532,25 +627,34 @@ fn find_named_resource<T>(
     resource_ref: &str,
     id_prefix: &str,
     get_by_id: impl FnOnce() -> Result<T, RunnerFailure>,
-    mut list_page: impl FnMut(Option<&str>) -> Result<(Vec<T>, Option<String>), RunnerFailure>,
+    list_page: impl FnMut(Option<&str>) -> Result<(Vec<T>, Option<String>), RunnerFailure>,
     name: impl Fn(&T) -> &str,
 ) -> Result<T, RunnerFailure> {
     if um_support::valid_typed_id(resource_ref, id_prefix) {
         return get_by_id();
     }
+    find_listed(
+        list_page,
+        |resource| name(resource) == resource_ref,
+        RunnerFailure::NotFound,
+    )
+}
+
+fn find_listed<T>(
+    mut list_page: impl FnMut(Option<&str>) -> Result<(Vec<T>, Option<String>), RunnerFailure>,
+    matches: impl Fn(&T) -> bool,
+    absent: RunnerFailure,
+) -> Result<T, RunnerFailure> {
     let mut cursor = None;
-    // Bound name lookup like other human resource references: do not walk an
+    // Bound list lookup like other human resource references: do not walk an
     // unbounded deployment-wide collection for one interactive command.
     for _ in 0..10 {
         let (items, next_cursor) = list_page(cursor.as_deref())?;
-        if let Some(resource) = items
-            .into_iter()
-            .find(|resource| name(resource) == resource_ref)
-        {
+        if let Some(resource) = items.into_iter().find(&matches) {
             return Ok(resource);
         }
         let Some(next) = next_cursor else {
-            return Err(RunnerFailure::NotFound);
+            return Err(absent);
         };
         if cursor.as_deref() == Some(next.as_str()) {
             return Err(RunnerFailure::Protocol);
@@ -575,6 +679,10 @@ pub enum RunnerFailure {
     ActivationUnavailable,
     CredentialTransitionUnavailable,
     PoolMoveUnavailable,
+    PoolPersonal,
+    PoolPersonalUnavailable,
+    /// The caller has no personal pool in the organization's pool list.
+    PersonalPoolNotFound,
     DeletionUnavailable(Vec<RunnerDeletionBlocker>),
     Unreachable(UnreachableCategory),
     Protocol,
@@ -623,6 +731,8 @@ fn classify_runner_response(status: StatusCode, body: &[u8]) -> RunnerFailure {
             RunnerFailure::CredentialTransitionUnavailable
         }
         (StatusCode::CONFLICT, POOL_MOVE_UNAVAILABLE) => RunnerFailure::PoolMoveUnavailable,
+        (StatusCode::CONFLICT, POOL_PERSONAL) => RunnerFailure::PoolPersonal,
+        (StatusCode::CONFLICT, POOL_PERSONAL_UNAVAILABLE) => RunnerFailure::PoolPersonalUnavailable,
         (StatusCode::TOO_MANY_REQUESTS, RATE_LIMIT_EXCEEDED) => RunnerFailure::RateLimited,
         _ => RunnerFailure::Protocol,
     }

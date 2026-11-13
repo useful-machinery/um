@@ -4,10 +4,10 @@ use std::path::{Path, PathBuf};
 use super::claude_code::{ClaudeCodeConfig, ClaudeCodeEffort};
 use super::codex::CodexConfig;
 use super::document::{
-    Binding, BindingKind, EdgeTarget, FailurePolicy, FinalizationTrigger, ForEach,
+    Binding, BindingKind, BindingValue, EdgeTarget, FailurePolicy, FinalizationTrigger, ForEach,
     InputDeclaration, JsonDefault, MessageSource, NodeBody, OutcomeDeclaration, Output,
-    OutputReference, RecoveryHandler, Trigger, TriggerControlAction, ValueReference, WaitKind,
-    WaitRule, WorkflowNode,
+    OutputReference, RecoveryHandler, StartRule, Trigger, TriggerControlAction, ValueReference,
+    WaitKind, WaitRule, WorkflowNode,
 };
 use super::pi::{PiConfig, Thinking};
 use super::validated::ValidatedHarness;
@@ -561,16 +561,18 @@ fn root_workflow_decodes_name_version_root_blocks_and_input_completion() {
         root.bindings["ownedState"],
         Binding {
             kind: BindingKind::LinearState,
-            default: Some("Engineering".to_owned())
+            default: Some(BindingValue::Text("Engineering".to_owned()))
         }
     );
     let Trigger::Start {
-        on,
+        on: StartRule::Event(on),
         subject,
         inputs,
+        stop_before: None,
+        owner: None,
     } = &root.triggers["start"]
     else {
-        panic!("start must be a start trigger");
+        panic!("start must be an event start trigger without stopBefore or owner");
     };
     assert_eq!(on.source, "$connection");
     assert_eq!(on.event, "issue.state_entered");
@@ -905,7 +907,7 @@ fn every_canonical_invalid_fixture_is_a_structural_failure() {
     }
 }
 
-// REQ-WFFORMAT-4, REQ-WFFORMAT-5, REQ-WFFORMAT-75, REQ-WFCOND-3
+// REQ-WFFORMAT-4, REQ-WFFORMAT-5, REQ-WFCOND-3
 #[test]
 fn every_canonical_forbidden_yaml_fixture_is_refused() {
     let forbidden_root = fixture_root().join("yaml-forbidden");
@@ -1172,7 +1174,7 @@ fn tag_directive_is_accepted() {
     assert!(workflow.steps.contains_key("prepare"));
 }
 
-// REQ-WFFORMAT-75
+// REQ-WFFORMAT-4
 #[test]
 fn byte_order_mark_prefix_is_accepted() {
     let source = b"schemaVersion: 1\nsteps: {prepare: {kind: cmd, command: {argv: [\"true\"]}}}\n";

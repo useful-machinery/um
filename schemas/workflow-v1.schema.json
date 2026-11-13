@@ -973,7 +973,7 @@
       "description": "A reference to a declared binding, written `$` followed by the binding key."
     },
     "BindingKind": {
-      "enum": ["connection", "linear.team", "linear.state", "github.repository"]
+      "enum": ["connection", "linear.team", "linear.state", "github.repository", "member", "members"]
     },
     "EventName": {
       "type": "string",
@@ -1011,13 +1011,27 @@
       }
     },
     "Binding": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["kind"],
-      "properties": {
-        "kind": { "$ref": "#/$defs/BindingKind" },
-        "default": { "type": "string" }
-      }
+      "description": "A binding's kind and optional default: an array for members, a string for every other kind.",
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind"],
+          "properties": {
+            "kind": { "const": "members" },
+            "default": { "type": "array", "items": { "type": "string" } }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind"],
+          "properties": {
+            "kind": { "$ref": "#/$defs/BindingKind", "not": { "const": "members" } },
+            "default": { "type": "string" }
+          }
+        }
+      ]
     },
     "Bindings": {
       "type": "object",
@@ -1036,20 +1050,81 @@
         "where": { "type": "string", "minLength": 1 }
       }
     },
+    "ScheduleRule": {
+      "type": "object",
+      "description": "A timetable in place of a provider event: a five-field cron expression and an IANA time zone. Their grammar is checked with the tree, not here.",
+      "additionalProperties": false,
+      "required": ["schedule", "timezone"],
+      "properties": {
+        "schedule": { "type": "string", "minLength": 1 },
+        "timezone": { "type": "string", "minLength": 1 }
+      }
+    },
+    "EventPath": {
+      "type": "string",
+      "pattern": "^event(\\.[A-Za-z0-9_]+)+$",
+      "description": "A value read from the event, written `event.` and a dotted path."
+    },
+    "StopBefore": {
+      "type": "object",
+      "description": "The event's label list and the prefix that, followed by a root step's name, stops the run before that step.",
+      "additionalProperties": false,
+      "required": ["labels", "prefix"],
+      "properties": {
+        "labels": { "type": "string", "minLength": 1 },
+        "prefix": { "type": "string", "minLength": 1 }
+      }
+    },
+    "OwnerSource": {
+      "description": "Who a run belongs to: a provider user read from the event, a list of them taken in order, or a member binding.",
+      "oneOf": [
+        { "$ref": "#/$defs/EventPath" },
+        {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/EventPath" }
+        },
+        { "$ref": "#/$defs/BindingReference" }
+      ]
+    },
+    "Owner": {
+      "oneOf": [
+        { "$ref": "#/$defs/OwnerSource" },
+        {
+          "type": "object",
+          "description": "The owner with filters, each a members binding; a filter beside a binding owner is refused with the tree.",
+          "additionalProperties": false,
+          "required": ["from"],
+          "properties": {
+            "from": { "$ref": "#/$defs/OwnerSource" },
+            "only": { "$ref": "#/$defs/BindingReference" },
+            "except": { "$ref": "#/$defs/BindingReference" }
+          }
+        }
+      ]
+    },
     "StartTrigger": {
       "type": "object",
-      "description": "A trigger that starts a run of the workflow.",
+      "description": "A trigger that starts a run of the workflow, on a provider event or a schedule.",
       "additionalProperties": false,
       "required": ["on", "inputs"],
       "properties": {
-        "on": { "$ref": "#/$defs/TriggerRule" },
+        "on": {
+          "oneOf": [
+            { "$ref": "#/$defs/TriggerRule" },
+            { "$ref": "#/$defs/ScheduleRule" }
+          ]
+        },
         "subject": { "type": "string", "minLength": 1 },
         "inputs": {
           "type": "object",
           "minProperties": 1,
           "propertyNames": { "$ref": "#/$defs/Identifier" },
           "additionalProperties": { "type": "string" }
-        }
+        },
+        "stopBefore": { "$ref": "#/$defs/StopBefore" },
+        "owner": { "$ref": "#/$defs/Owner" }
       }
     },
     "ControlTrigger": {

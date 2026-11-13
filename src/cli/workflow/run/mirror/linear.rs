@@ -2,7 +2,8 @@
 //! API with the operator's `LINEAR_API_KEY`, sent bare in `Authorization` as Linear's personal
 //! keys are, through `um_api::provider_post_json`. `UM_LINEAR_API_URL` overrides the base URL
 //! for development and tests, and admits `http`. Every request is one attempt: a comment is
-//! not idempotent, and a failed write is recorded for a person to see.
+//! not idempotent, and a failed write is recorded for a person to see. `um workflow run event`
+//! reads an issue by its Linear id through the same target (REQ-LOCALRUN-208).
 
 use std::cell::RefCell;
 use std::time::Duration;
@@ -21,7 +22,7 @@ const MAXIMUM_MESSAGE_CHARACTERS: usize = 512;
 
 const ISSUE_STATE: (&str, &str) = (
     "IssueState",
-    "query IssueState($id: String!) { issue(id: $id) { id identifier state { id name } team { states(first: 100) { nodes { id name } } } } }",
+    "query IssueState($id: String!) { issue(id: $id) { id identifier updatedAt state { id name } team { id states(first: 100) { nodes { id name } } } } }",
 );
 const CREATE_COMMENT: (&str, &str) = (
     "CreateIssueComment",
@@ -53,14 +54,27 @@ struct Issue {
     identifier: String,
     id: String,
     state: String,
+    state_id: String,
+    /// The team's id and the issue's `updatedAt`, which only `observe` needs.
+    team: Option<String>,
+    updated_at: Option<String>,
     /// The team's states by `(id, name)`.
     states: Vec<(String, String)>,
+}
+
+/// An issue as `um workflow run event` reads it fresh (REQ-LOCALRUN-208): its team id, its
+/// state's id and name, and its `updatedAt`, none when Linear's answer lacks them.
+pub(in super::super) struct IssueObservation {
+    pub(in super::super) team: Option<String>,
+    pub(in super::super) state: String,
+    pub(in super::super) state_name: String,
+    pub(in super::super) updated_at: Option<String>,
 }
 
 /// Linear, reached at `endpoint` with `key`. Every write is keyed by the issue's id, which
 /// `issue(id:)` resolves from the identifier; the issue read is kept, so a hook reads the
 /// issue once however many writes it makes (REQ-LOCALRUN-192).
-pub(super) struct LinearTarget {
+pub(in super::super) struct LinearTarget {
     endpoint: String,
     key: Option<Zeroizing<String>>,
     requester: Requester,
@@ -70,7 +84,7 @@ pub(super) struct LinearTarget {
 impl LinearTarget {
     /// The target the environment configures: `UM_LINEAR_API_URL` or Linear's API, and
     /// `LINEAR_API_KEY`.
-    pub(super) fn from_environment() -> Self {
+    pub(in super::super) fn from_environment() -> Self {
         let overridden = std::env::var(API_VARIABLE)
             .ok()
             .filter(|url| !url.is_empty());
@@ -188,19 +202,41 @@ impl LinearTarget {
         {
             return Ok(issue.clone());
         }
-        let data = self.post(ISSUE_STATE, json!({"id": identifier}))?;
+        let issue = self.read(identifier, "identifier")?;
+        *self.issue.borrow_mut() = Some(issue.clone());
+        Ok(issue)
+    }
+
+    /// The issue whose Linear id is `issue_id`, read fresh with one `IssueState`
+    /// (REQ-LOCALRUN-208); a null or different issue is `mirror_issue_unavailable`.
+    pub(in super::super) fn observe(
+        &self,
+        issue_id: &str,
+    ) -> Result<IssueObservation, MirrorFailure> {
+        let issue = self.read(issue_id, "id")?;
+        Ok(IssueObservation {
+            team: issue.team,
+            state: issue.state_id,
+            state_name: issue.state,
+            updated_at: issue.updated_at,
+        })
+    }
+
+    /// One `IssueState` for `requested`, which the answer's `field` must repeat.
+    fn read(&self, requested: &str, field: &str) -> Result<Issue, MirrorFailure> {
+        let data = self.post(ISSUE_STATE, json!({"id": requested}))?;
         let issue = match data.get("issue") {
             None | Some(Value::Null) => {
                 return Err(MirrorFailure::issue_unavailable(format!(
-                    "Linear has no issue {identifier} the key can read."
+                    "Linear has no issue {requested} the key can read."
                 )));
             }
             Some(issue) => issue,
         };
         let text = |value: Option<&Value>| value.and_then(Value::as_str).map(str::to_owned);
-        if text(issue.get("identifier")).as_deref() != Some(identifier) {
+        if text(issue.get(field)).as_deref() != Some(requested) {
             return Err(MirrorFailure::issue_unavailable(format!(
-                "Linear answered another issue than {identifier}."
+                "Linear answered another issue than {requested}."
             )));
         }
         let states = issue
@@ -212,23 +248,34 @@ impl LinearTarget {
                     .filter_map(|node| Some((text(node.get("id"))?, text(node.get("name"))?)))
                     .collect::<Vec<_>>()
             });
-        let (Some(id), Some(state), Some(states)) = (
+        let (Some(id), Some(state), Some(state_id), Some(states)) = (
             text(issue.get("id")),
             text(issue.pointer("/state/name")),
+            text(issue.pointer("/state/id")),
             states,
         ) else {
             return Err(MirrorFailure::unavailable(format!(
-                "Linear's document for {identifier} has no id, state name or team states."
+                "Linear's document for {requested} has no id, state name, state id or team states."
             )));
         };
-        let issue = Issue {
-            identifier: identifier.to_owned(),
+        Ok(Issue {
+            identifier: text(issue.get("identifier")).unwrap_or_default(),
             id,
             state,
+            state_id,
+            team: text(issue.pointer("/team/id")),
+            updated_at: text(issue.get("updatedAt")),
             states,
-        };
-        *self.issue.borrow_mut() = Some(issue.clone());
-        Ok(issue)
+        })
+    }
+
+    /// Moves the issue whose Linear id is `issue_id` to the state whose id is `state_id`.
+    fn update_state(&self, issue_id: &str, state_id: &str) -> Result<(), MirrorFailure> {
+        let data = self.post(
+            UPDATE_STATE,
+            json!({"id": issue_id, "input": {"stateId": state_id}}),
+        )?;
+        Self::confirmed(&data, "issueUpdate")
     }
 
     /// Requires `data.<field>.success` to be true.
@@ -263,6 +310,10 @@ impl MirrorTarget for LinearTarget {
         self.issue(issue).map(|issue| issue.state)
     }
 
+    fn issue_state_id(&self, issue: &str) -> Result<String, MirrorFailure> {
+        self.issue(issue).map(|issue| issue.state_id)
+    }
+
     fn comment(&self, issue: &str, body: &str) -> Result<(), MirrorFailure> {
         // `CommentCreateInput.issueId` is keyed by the issue's id, as every write is; the
         // identifier is only ever sent to `issue(id:)`.
@@ -286,11 +337,14 @@ impl MirrorTarget for LinearTarget {
                     "The team of {issue} has no state named {state:?}."
                 ))
             })?;
-        let data = self.post(
-            UPDATE_STATE,
-            json!({"id": read.id, "input": {"stateId": state_id}}),
-        )?;
-        Self::confirmed(&data, "issueUpdate")
+        self.update_state(&read.id, &state_id)
+    }
+
+    /// The resolved id is sent as it stands: the team's states are not consulted, so a state
+    /// renamed since Cloud resolved it is still found (REQ-WFDEF-32).
+    fn set_state_id(&self, issue: &str, state_id: &str) -> Result<(), MirrorFailure> {
+        let read = self.issue(issue)?;
+        self.update_state(&read.id, state_id)
     }
 }
 
@@ -430,6 +484,50 @@ mod tests {
         assert_eq!(operations(&seen), ["IssueState"]);
     }
 
+    // REQ-LOCALRUN-192, REQ-WFDEF-32: by id, the issue's state id is the one Linear answers
+    // and a state write sends the given id without matching any team state's name.
+    #[test]
+    fn by_id_the_state_is_read_and_written_by_its_id() {
+        let success = json!({"data": {"issueUpdate": {"success": true}}});
+        let (target, seen) = linear(
+            Some(KEY),
+            vec![
+                ("IssueState", 200, issue("Engineering")),
+                ("UpdateIssueState", 200, success),
+            ],
+        );
+        assert_eq!(target.issue_state_id("AUTO-143").unwrap(), "id-Engineering");
+        target.set_state_id("AUTO-143", "id-Shipped").unwrap();
+        assert_eq!(operations(&seen), ["IssueState", "UpdateIssueState"]);
+        assert_eq!(
+            seen.borrow()[1].2["variables"],
+            json!({"id": "uuid-143", "input": {"stateId": "id-Shipped"}})
+        );
+    }
+
+    // REQ-LOCALRUN-208: `observe` reads the issue by its Linear id, answering its team,
+    // state and `updatedAt`, and an answer for another id is `mirror_issue_unavailable`.
+    #[test]
+    fn observe_reads_the_issue_by_its_linear_id() {
+        let mut answer = issue("Canceled");
+        answer["data"]["issue"]["team"]["id"] = json!("team-auto");
+        answer["data"]["issue"]["updatedAt"] = json!("2026-11-10T12:00:00.000Z");
+        let (target, seen) = linear(Some(KEY), vec![("IssueState", 200, answer)]);
+        let observed = target.observe("uuid-143").unwrap();
+        assert_eq!(observed.team.as_deref(), Some("team-auto"));
+        assert_eq!(observed.state, "id-Canceled");
+        assert_eq!(observed.state_name, "Canceled");
+        assert_eq!(
+            observed.updated_at.as_deref(),
+            Some("2026-11-10T12:00:00.000Z")
+        );
+        assert_eq!(seen.borrow()[0].2["variables"], json!({"id": "uuid-143"}));
+
+        let (target, _) = linear(Some(KEY), vec![("IssueState", 200, issue("Canceled"))]);
+        let failure = target.observe("uuid-144").err().unwrap();
+        assert_eq!(failure.code, MirrorFailure::ISSUE_UNAVAILABLE);
+    }
+
     // REQ-LOCALRUN-192: a comment reads the issue once for its id and is one `commentCreate`
     // keyed by that id, never the identifier, with the body; an earlier read serves it.
     #[test]
@@ -547,6 +645,8 @@ mod tests {
                 target.comment("AUTO-143", "x").unwrap_err(),
                 target.issue_state("AUTO-143").unwrap_err(),
                 target.set_state("AUTO-143", "Done").unwrap_err(),
+                target.issue_state_id("AUTO-143").unwrap_err(),
+                target.set_state_id("AUTO-143", "id-Done").unwrap_err(),
             ] {
                 assert_eq!(failure.code, MirrorFailure::CREDENTIALS_UNAVAILABLE);
             }

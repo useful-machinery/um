@@ -116,6 +116,18 @@ pub enum GetRunnerPoolError {
     UnknownValue(serde_json::Value),
 }
 
+/// struct for typed errors of method [`get_runner_pool_status`]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum GetRunnerPoolStatusError {
+    Status400(models::Problem),
+    Status401(models::Problem),
+    Status403(models::Problem),
+    Status404(models::Problem),
+    Status500(models::Problem),
+    UnknownValue(serde_json::Value),
+}
+
 /// struct for typed errors of method [`get_runner_registration`]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
@@ -124,6 +136,35 @@ pub enum GetRunnerRegistrationError {
     Status401(models::Problem),
     Status403(models::Problem),
     Status404(models::Problem),
+    Status500(models::Problem),
+    UnknownValue(serde_json::Value),
+}
+
+/// struct for typed errors of method [`issue_runner_join_key`]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum IssueRunnerJoinKeyError {
+    Status400(models::Problem),
+    Status401(models::Problem),
+    Status403(models::Problem),
+    Status404(models::Problem),
+    Status409(models::Problem),
+    Status413(models::Problem),
+    Status415(models::Problem),
+    Status500(models::Problem),
+    UnknownValue(serde_json::Value),
+}
+
+/// struct for typed errors of method [`join_runner_pool`]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum JoinRunnerPoolError {
+    Status400(models::Problem),
+    Status401(models::Problem),
+    Status409(models::Problem),
+    Status410(models::Problem),
+    Status413(models::Problem),
+    Status415(models::Problem),
     Status500(models::Problem),
     UnknownValue(serde_json::Value),
 }
@@ -144,6 +185,18 @@ pub enum ListRunnerActivationsError {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum ListRunnerCredentialsError {
+    Status400(models::Problem),
+    Status401(models::Problem),
+    Status403(models::Problem),
+    Status404(models::Problem),
+    Status500(models::Problem),
+    UnknownValue(serde_json::Value),
+}
+
+/// struct for typed errors of method [`list_runner_join_keys`]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ListRunnerJoinKeysError {
     Status400(models::Problem),
     Status401(models::Problem),
     Status403(models::Problem),
@@ -266,6 +319,21 @@ pub enum RevokeRunnerCredentialError {
     UnknownValue(serde_json::Value),
 }
 
+/// struct for typed errors of method [`revoke_runner_join_key`]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum RevokeRunnerJoinKeyError {
+    Status400(models::Problem),
+    Status401(models::Problem),
+    Status403(models::Problem),
+    Status404(models::Problem),
+    Status409(models::Problem),
+    Status413(models::Problem),
+    Status415(models::Problem),
+    Status500(models::Problem),
+    UnknownValue(serde_json::Value),
+}
+
 /// struct for typed errors of method [`update_runner_registration_mode`]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
@@ -281,7 +349,7 @@ pub enum UpdateRunnerRegistrationModeError {
     UnknownValue(serde_json::Value),
 }
 
-/// The activation bearer authenticates only this operation. The request carries the SHA-256 verifier of a host-generated secret, never the complete rrc_ bearer. Exact successful replay is retained without a time-based expiry and returns the original non-secret credential ID even after activation expiry.
+/// The activation bearer authenticates only this operation. The request carries the SHA-256 verifier of a host-generated secret, never the complete rrc_ bearer. Exact successful replay is retained without a time-based expiry and returns the original non-secret credential ID even after activation expiry. A runner in a member's personal pool is answered `409` `runner-pool-member-inactive` while that member is not an active member of the organization with an active account; the refusal consumes nothing, so the same activation enrolls once the member is active again.
 pub fn activate_runner_enrollment(
     configuration: &configuration::Configuration,
     activation_id: &str,
@@ -348,7 +416,7 @@ pub fn activate_runner_enrollment(
     }
 }
 
-/// Atomically revokes any prior issued activation and creates a fixed one-hour activation when an effective credential slot remains. The secret-bearing artifact is present only on the first completed response and is omitted from an exact principal idempotency replay.
+/// Atomically revokes any prior issued activation and creates a fixed one-hour activation when an effective credential slot remains. The secret-bearing artifact is present only on the first completed response and is omitted from an exact principal idempotency replay. An owner may issue for any registration; a member only for one in their own personal pool, and is answered 403 for any other.
 pub fn create_runner_activation(
     configuration: &configuration::Configuration,
     organization_ref: &str,
@@ -485,7 +553,7 @@ pub fn create_runner_pool(
     }
 }
 
-/// Creates an enabled registration in one exact same-organization pool. When name is omitted, Cloud generates a non-sensitive unique name using only the newly allocated opaque runner ID. This operation creates no activation, credential, or host connectivity.
+/// Creates an enabled registration in one exact same-organization pool, named by runnerPoolId, or in the personal pool of the human member named by memberId, or, when the body names neither, in the caller's own personal pool; a body naming both is refused with 400, and a memberId naming no human member of the organization with 404. An owner may create in any pool; a member only in their own personal pool, and is answered 403 for any other. A caller with no personal pool, a service, that names neither is answered `409` `runner-pool-personal-unavailable`. When name is omitted, Cloud generates a non-sensitive unique name using only the newly allocated opaque runner ID. This operation creates no activation, credential, or host connectivity.
 pub fn create_runner_registration(
     configuration: &configuration::Configuration,
     organization_ref: &str,
@@ -552,7 +620,7 @@ pub fn create_runner_registration(
     }
 }
 
-/// Permanently tombstones one pool only when it has no active runner registrations, current project assignments, or nonterminal runs. The request has no body, accepts no delegation attribution or reason, and never cascades to child resources. Exact completed replay reauthorizes the original principal, authenticator, organization, and owner role.
+/// Permanently tombstones one pool only when it has no active runner registrations, current project assignments, or nonterminal runs. The request has no body, accepts no delegation attribution or reason, and never cascades to child resources. Exact completed replay reauthorizes the original principal, authenticator, organization, and owner role. A member's personal pool is answered `409` `runner-pool-personal` while its member has an active or suspended membership of the organization; once the membership has ended, the pool is deleted as any other.
 pub fn delete_runner_pool(
     configuration: &configuration::Configuration,
     organization_ref: &str,
@@ -600,7 +668,7 @@ pub fn delete_runner_pool(
     }
 }
 
-/// Permanently tombstones one registration only when it has no reserved capacity or nonterminal assignment. The request has no body, accepts no delegation attribution or reason, and erases all live runner authority without deleting retained history. Exact completed replay reauthorizes the original principal, authenticator, organization, and owner role.
+/// Permanently tombstones one registration only when it has no reserved capacity or nonterminal assignment. The request has no body, accepts no delegation attribution or reason, and erases all live runner authority without deleting retained history. An owner may delete any registration; a member only one in their own personal pool, and is answered 403 for any other. Exact completed replay reauthorizes the original principal, authenticator, organization, and that authority.
 pub fn delete_runner_registration(
     configuration: &configuration::Configuration,
     organization_ref: &str,
@@ -709,6 +777,68 @@ pub fn get_runner_pool(
     }
 }
 
+/// Reports, from one snapshot and without caching, the queued runs whose pools include this pool and how many of its runners are online, offline, busy and idle, so a program outside Cloud can decide when to add or remove machines. A runner is online while its presence is live and busy while it holds an assignment, whatever its connectivity; it is idle while enabled, online, holding a valid credential and free. Missing, cross-organization, inactive, and inaccessible resources share the not-found representation.
+pub fn get_runner_pool_status(
+    configuration: &configuration::Configuration,
+    organization_ref: &str,
+    runner_pool_id: &str,
+) -> Result<models::RunnerPoolStatus, Error<GetRunnerPoolStatusError>> {
+    // add a prefix to parameters to efficiently prevent name collisions
+    let p_path_organization_ref = organization_ref;
+    let p_path_runner_pool_id = runner_pool_id;
+
+    let uri_str = format!(
+        "{}/v1/organizations/{organizationRef}/runner-pools/{runnerPoolId}/status",
+        configuration.base_path,
+        organizationRef = crate::generated::apis::urlencode(p_path_organization_ref),
+        runnerPoolId = crate::generated::apis::urlencode(p_path_runner_pool_id)
+    );
+    let mut req_builder = configuration.client.request(reqwest::Method::GET, &uri_str);
+
+    if let Some(ref user_agent) = configuration.user_agent {
+        req_builder = req_builder.header(reqwest::header::USER_AGENT, user_agent.clone());
+    }
+    if let Some(ref token) = configuration.bearer_access_token {
+        req_builder = req_builder.bearer_auth(token.to_owned());
+    };
+
+    let req = req_builder.build()?;
+    let resp = configuration.client.execute(req)?;
+
+    let status = resp.status();
+    let content_type = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/octet-stream");
+    let content_type = super::ContentType::from(content_type);
+
+    if !status.is_client_error() && !status.is_server_error() {
+        let content = resp.text()?;
+        match content_type {
+            ContentType::Json => serde_json::from_str(&content).map_err(Error::from),
+            ContentType::Text => {
+                return Err(Error::from(serde_json::Error::custom(
+                    "Received `text/plain` content type response that cannot be converted to `models::RunnerPoolStatus`",
+                )));
+            }
+            ContentType::Unsupported(unknown_type) => {
+                return Err(Error::from(serde_json::Error::custom(format!(
+                    "Received `{unknown_type}` content type response that cannot be converted to `models::RunnerPoolStatus`"
+                ))));
+            }
+        }
+    } else {
+        let content = resp.text()?;
+        let entity: Option<GetRunnerPoolStatusError> = serde_json::from_str(&content).ok();
+        Err(Error::ResponseError(ResponseContent {
+            status,
+            content,
+            entity,
+        }))
+    }
+}
+
 pub fn get_runner_registration(
     configuration: &configuration::Configuration,
     organization_ref: &str,
@@ -770,6 +900,144 @@ pub fn get_runner_registration(
     }
 }
 
+/// Issues a join key for the pool. Any number of hosts may present it to join the pool as new runners until it expires or is revoked. The expiry, 60 seconds to 365 days from issue, and the time a runner it admitted may stay offline before removal, 300 seconds to 30 days, are set here and never change; a value outside its bounds is answered 400. Only the secret's digest is stored. The secret-bearing artifact is present only on the first completed response and is omitted from an exact idempotency replay. An owner may issue for any pool; a member only for their own personal pool, and is answered 403 for any other.
+pub fn issue_runner_join_key(
+    configuration: &configuration::Configuration,
+    organization_ref: &str,
+    runner_pool_id: &str,
+    idempotency_key: &str,
+    issue_runner_join_key_request: models::IssueRunnerJoinKeyRequest,
+) -> Result<models::RunnerJoinKeyIssuance, Error<IssueRunnerJoinKeyError>> {
+    // add a prefix to parameters to efficiently prevent name collisions
+    let p_path_organization_ref = organization_ref;
+    let p_path_runner_pool_id = runner_pool_id;
+    let p_header_idempotency_key = idempotency_key;
+    let p_body_issue_runner_join_key_request = issue_runner_join_key_request;
+
+    let uri_str = format!(
+        "{}/v1/organizations/{organizationRef}/runner-pools/{runnerPoolId}/join-keys",
+        configuration.base_path,
+        organizationRef = crate::generated::apis::urlencode(p_path_organization_ref),
+        runnerPoolId = crate::generated::apis::urlencode(p_path_runner_pool_id)
+    );
+    let mut req_builder = configuration
+        .client
+        .request(reqwest::Method::POST, &uri_str);
+
+    if let Some(ref user_agent) = configuration.user_agent {
+        req_builder = req_builder.header(reqwest::header::USER_AGENT, user_agent.clone());
+    }
+    req_builder = req_builder.header("Idempotency-Key", p_header_idempotency_key.to_string());
+    if let Some(ref token) = configuration.bearer_access_token {
+        req_builder = req_builder.bearer_auth(token.to_owned());
+    };
+    req_builder = req_builder.json(&p_body_issue_runner_join_key_request);
+
+    let req = req_builder.build()?;
+    let resp = configuration.client.execute(req)?;
+
+    let status = resp.status();
+    let content_type = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/octet-stream");
+    let content_type = super::ContentType::from(content_type);
+
+    if !status.is_client_error() && !status.is_server_error() {
+        let content = resp.text()?;
+        match content_type {
+            ContentType::Json => serde_json::from_str(&content).map_err(Error::from),
+            ContentType::Text => {
+                return Err(Error::from(serde_json::Error::custom(
+                    "Received `text/plain` content type response that cannot be converted to `models::RunnerJoinKeyIssuance`",
+                )));
+            }
+            ContentType::Unsupported(unknown_type) => {
+                return Err(Error::from(serde_json::Error::custom(format!(
+                    "Received `{unknown_type}` content type response that cannot be converted to `models::RunnerJoinKeyIssuance`"
+                ))));
+            }
+        }
+    } else {
+        let content = resp.text()?;
+        let entity: Option<IssueRunnerJoinKeyError> = serde_json::from_str(&content).ok();
+        Err(Error::ResponseError(ResponseContent {
+            status,
+            content,
+            entity,
+        }))
+    }
+}
+
+/// The join key's token authenticates only this operation; a malformed, mismatched or unverifiable token is answered 401 without revealing whether the key exists. Any number of hosts may join with one key: each join registers a new enabled runner in the key's pool, with a name the service chooses, and creates its first credential from the SHA-256 verifier of a host-generated secret, never the complete rrc_ bearer. The answer is the enrollment response. A revoked or expired key is answered 410; a member's personal pool whose member is not an active member of the organization with an active account `409` `runner-pool-member-inactive`; an organization holding its registration quantity `409` `quantity-limit-reached`. A join counts toward the registration quantity and not toward the hourly registration creation rate. The exact repeat of a successful join, with the same key, idempotency key and verifier, answers with the runner it made and that runner's first credential and creates nothing, even after the key's revocation or expiry; once that runner is deleted the repeat is answered 410. The same idempotency key with another verifier is answered 409.
+pub fn join_runner_pool(
+    configuration: &configuration::Configuration,
+    join_key_id: &str,
+    idempotency_key: &str,
+    runner_join_request: models::RunnerJoinRequest,
+) -> Result<models::RunnerEnrollmentResponse, Error<JoinRunnerPoolError>> {
+    // add a prefix to parameters to efficiently prevent name collisions
+    let p_path_join_key_id = join_key_id;
+    let p_header_idempotency_key = idempotency_key;
+    let p_body_runner_join_request = runner_join_request;
+
+    let uri_str = format!(
+        "{}/v1/runner-join-keys/{joinKeyId}/join",
+        configuration.base_path,
+        joinKeyId = crate::generated::apis::urlencode(p_path_join_key_id)
+    );
+    let mut req_builder = configuration
+        .client
+        .request(reqwest::Method::POST, &uri_str);
+
+    if let Some(ref user_agent) = configuration.user_agent {
+        req_builder = req_builder.header(reqwest::header::USER_AGENT, user_agent.clone());
+    }
+    req_builder = req_builder.header("Idempotency-Key", p_header_idempotency_key.to_string());
+    if let Some(ref token) = configuration.bearer_access_token {
+        req_builder = req_builder.bearer_auth(token.to_owned());
+    };
+    req_builder = req_builder.json(&p_body_runner_join_request);
+
+    let req = req_builder.build()?;
+    let resp = configuration.client.execute(req)?;
+
+    let status = resp.status();
+    let content_type = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/octet-stream");
+    let content_type = super::ContentType::from(content_type);
+
+    if !status.is_client_error() && !status.is_server_error() {
+        let content = resp.text()?;
+        match content_type {
+            ContentType::Json => serde_json::from_str(&content).map_err(Error::from),
+            ContentType::Text => {
+                return Err(Error::from(serde_json::Error::custom(
+                    "Received `text/plain` content type response that cannot be converted to `models::RunnerEnrollmentResponse`",
+                )));
+            }
+            ContentType::Unsupported(unknown_type) => {
+                return Err(Error::from(serde_json::Error::custom(format!(
+                    "Received `{unknown_type}` content type response that cannot be converted to `models::RunnerEnrollmentResponse`"
+                ))));
+            }
+        }
+    } else {
+        let content = resp.text()?;
+        let entity: Option<JoinRunnerPoolError> = serde_json::from_str(&content).ok();
+        Err(Error::ResponseError(ResponseContent {
+            status,
+            content,
+            entity,
+        }))
+    }
+}
+
+/// An owner may list the activations of any registration; a member only of one in their own personal pool, and is answered 403 for any other.
 pub fn list_runner_activations(
     configuration: &configuration::Configuration,
     organization_ref: &str,
@@ -841,7 +1109,7 @@ pub fn list_runner_activations(
     }
 }
 
-/// Returns oldest-first non-secret lifecycle metadata. Stored state remains the durable row value while effective state treats a retiring credential as revoked at or after its database-time retirement boundary.
+/// Returns oldest-first non-secret lifecycle metadata. Stored state remains the durable row value while effective state treats a retiring credential as revoked at or after its database-time retirement boundary. An owner may list the credentials of any registration; a member only of one in their own personal pool, and is answered 403 for any other.
 pub fn list_runner_credentials(
     configuration: &configuration::Configuration,
     organization_ref: &str,
@@ -905,6 +1173,80 @@ pub fn list_runner_credentials(
     } else {
         let content = resp.text()?;
         let entity: Option<ListRunnerCredentialsError> = serde_json::from_str(&content).ok();
+        Err(Error::ResponseError(ResponseContent {
+            status,
+            content,
+            entity,
+        }))
+    }
+}
+
+/// Returns non-secret join key metadata oldest first, optionally for one pool. An issued key lists as `expired` from its expiry onward. An owner sees the keys of every pool; a member only those of their own personal pool, and is answered 403 when naming any other pool.
+pub fn list_runner_join_keys(
+    configuration: &configuration::Configuration,
+    organization_ref: &str,
+    runner_pool_id: Option<&str>,
+    limit: Option<i32>,
+    cursor: Option<&str>,
+) -> Result<models::RunnerJoinKeyList, Error<ListRunnerJoinKeysError>> {
+    // add a prefix to parameters to efficiently prevent name collisions
+    let p_path_organization_ref = organization_ref;
+    let p_query_runner_pool_id = runner_pool_id;
+    let p_query_limit = limit;
+    let p_query_cursor = cursor;
+
+    let uri_str = format!(
+        "{}/v1/organizations/{organizationRef}/runner-join-keys",
+        configuration.base_path,
+        organizationRef = crate::generated::apis::urlencode(p_path_organization_ref)
+    );
+    let mut req_builder = configuration.client.request(reqwest::Method::GET, &uri_str);
+
+    if let Some(ref param_value) = p_query_runner_pool_id {
+        req_builder = req_builder.query(&[("runnerPoolId", &param_value.to_string())]);
+    }
+    if let Some(ref param_value) = p_query_limit {
+        req_builder = req_builder.query(&[("limit", &param_value.to_string())]);
+    }
+    if let Some(ref param_value) = p_query_cursor {
+        req_builder = req_builder.query(&[("cursor", &param_value.to_string())]);
+    }
+    if let Some(ref user_agent) = configuration.user_agent {
+        req_builder = req_builder.header(reqwest::header::USER_AGENT, user_agent.clone());
+    }
+    if let Some(ref token) = configuration.bearer_access_token {
+        req_builder = req_builder.bearer_auth(token.to_owned());
+    };
+
+    let req = req_builder.build()?;
+    let resp = configuration.client.execute(req)?;
+
+    let status = resp.status();
+    let content_type = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/octet-stream");
+    let content_type = super::ContentType::from(content_type);
+
+    if !status.is_client_error() && !status.is_server_error() {
+        let content = resp.text()?;
+        match content_type {
+            ContentType::Json => serde_json::from_str(&content).map_err(Error::from),
+            ContentType::Text => {
+                return Err(Error::from(serde_json::Error::custom(
+                    "Received `text/plain` content type response that cannot be converted to `models::RunnerJoinKeyList`",
+                )));
+            }
+            ContentType::Unsupported(unknown_type) => {
+                return Err(Error::from(serde_json::Error::custom(format!(
+                    "Received `{unknown_type}` content type response that cannot be converted to `models::RunnerJoinKeyList`"
+                ))));
+            }
+        }
+    } else {
+        let content = resp.text()?;
+        let entity: Option<ListRunnerJoinKeysError> = serde_json::from_str(&content).ok();
         Err(Error::ResponseError(ResponseContent {
             status,
             content,
@@ -1051,7 +1393,7 @@ pub fn list_runner_registrations(
     }
 }
 
-/// Moves a draining or disabled registration to one active destination pool in the same organization. The move conflicts while capacity is reserved or any nonterminal assignment targets the runner. Placement and movement serialize on the registration, and historical assignments retain their original pool identity. An equivalent target is an exact no-op. Inaccessible and cross-organization pools are not distinguished from absent resources.
+/// Moves a draining or disabled registration to one active destination pool in the same organization. The move conflicts while capacity is reserved or any nonterminal assignment targets the runner. Placement and movement serialize on the registration, and historical assignments retain their original pool identity. An equivalent target is an exact no-op. Inaccessible and cross-organization pools are not distinguished from absent resources. Only an owner moves a registration, including into or out of a personal pool; a member is answered 403.
 pub fn move_runner_registration(
     configuration: &configuration::Configuration,
     organization_ref: &str,
@@ -1119,7 +1461,7 @@ pub fn move_runner_registration(
     }
 }
 
-/// Replaces only the canonical name. An equivalent rename is a no-op that changes neither updatedAt nor audit history. Missing, cross-organization, inactive, and inaccessible resources share the not-found representation.
+/// Replaces only the canonical name. An equivalent rename is a no-op that changes neither updatedAt nor audit history. Missing, cross-organization, inactive, and inaccessible resources share the not-found representation. A member's personal pool keeps the name the service chose: renaming it is answered `409` `runner-pool-personal`.
 pub fn rename_runner_pool(
     configuration: &configuration::Configuration,
     organization_ref: &str,
@@ -1194,7 +1536,7 @@ pub fn rename_runner_pool(
     }
 }
 
-/// Replaces only the registration name. Equivalent renames are no-ops. Administrative mode and pool association cannot be changed through this operation and no premature mode or pool mutation operation is exposed.
+/// Replaces only the registration name. Equivalent renames are no-ops. An owner may rename any registration; a member only one in their own personal pool, and is answered 403 for any other. Administrative mode and pool association cannot be changed through this operation and no premature mode or pool mutation operation is exposed.
 pub fn rename_runner_registration(
     configuration: &configuration::Configuration,
     organization_ref: &str,
@@ -1271,7 +1613,7 @@ pub fn rename_runner_registration(
     }
 }
 
-/// Irreversibly schedules the deployment's fixed one-hour retirement grace. Exact principal idempotency replay appends no duplicate audit record.
+/// Irreversibly schedules the deployment's fixed one-hour retirement grace. Exact principal idempotency replay appends no duplicate audit record. An owner may retire the credentials of any registration; a member only of one in their own personal pool, and is answered 403 for any other.
 pub fn retire_runner_credential(
     configuration: &configuration::Configuration,
     organization_ref: &str,
@@ -1344,6 +1686,7 @@ pub fn retire_runner_credential(
     }
 }
 
+/// An owner may revoke the activations of any registration; a member only of one in their own personal pool, and is answered 403 for any other.
 pub fn revoke_runner_activation(
     configuration: &configuration::Configuration,
     organization_ref: &str,
@@ -1416,7 +1759,7 @@ pub fn revoke_runner_activation(
     }
 }
 
-/// Irreversibly revokes the credential and transactionally invalidates only current presence authenticated by it. Durable authorization checks remain authoritative if a Gateway replica retains the socket briefly.
+/// Irreversibly revokes the credential and transactionally invalidates only current presence authenticated by it. Durable authorization checks remain authoritative if a Gateway replica retains the socket briefly. An owner may revoke the credentials of any registration; a member only of one in their own personal pool, and is answered 403 for any other.
 pub fn revoke_runner_credential(
     configuration: &configuration::Configuration,
     organization_ref: &str,
@@ -1489,7 +1832,77 @@ pub fn revoke_runner_credential(
     }
 }
 
-/// Sets the registration to enabled, draining, or disabled. Draining immediately prevents new placement and withdraws still-offered work while retaining presence and accepted-work renewal authority. Disablement removes current Cloud session authority. Re-enablement changes only mode and never creates or restores credentials, presence, or withdrawn offers. An equivalent target is an exact no-op.
+/// Revokes the join key, including one past its expiry, so it admits no further host; the runners it admitted stay. Revoking a revoked key returns it unchanged. An owner may revoke the key of any pool; a member only one of their own personal pool, and is answered 403 for any other.
+pub fn revoke_runner_join_key(
+    configuration: &configuration::Configuration,
+    organization_ref: &str,
+    join_key_id: &str,
+    idempotency_key: &str,
+    revoke_runner_join_key_request: models::RevokeRunnerJoinKeyRequest,
+) -> Result<models::RunnerJoinKey, Error<RevokeRunnerJoinKeyError>> {
+    // add a prefix to parameters to efficiently prevent name collisions
+    let p_path_organization_ref = organization_ref;
+    let p_path_join_key_id = join_key_id;
+    let p_header_idempotency_key = idempotency_key;
+    let p_body_revoke_runner_join_key_request = revoke_runner_join_key_request;
+
+    let uri_str = format!(
+        "{}/v1/organizations/{organizationRef}/runner-join-keys/{joinKeyId}/revocation",
+        configuration.base_path,
+        organizationRef = crate::generated::apis::urlencode(p_path_organization_ref),
+        joinKeyId = crate::generated::apis::urlencode(p_path_join_key_id)
+    );
+    let mut req_builder = configuration
+        .client
+        .request(reqwest::Method::POST, &uri_str);
+
+    if let Some(ref user_agent) = configuration.user_agent {
+        req_builder = req_builder.header(reqwest::header::USER_AGENT, user_agent.clone());
+    }
+    req_builder = req_builder.header("Idempotency-Key", p_header_idempotency_key.to_string());
+    if let Some(ref token) = configuration.bearer_access_token {
+        req_builder = req_builder.bearer_auth(token.to_owned());
+    };
+    req_builder = req_builder.json(&p_body_revoke_runner_join_key_request);
+
+    let req = req_builder.build()?;
+    let resp = configuration.client.execute(req)?;
+
+    let status = resp.status();
+    let content_type = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/octet-stream");
+    let content_type = super::ContentType::from(content_type);
+
+    if !status.is_client_error() && !status.is_server_error() {
+        let content = resp.text()?;
+        match content_type {
+            ContentType::Json => serde_json::from_str(&content).map_err(Error::from),
+            ContentType::Text => {
+                return Err(Error::from(serde_json::Error::custom(
+                    "Received `text/plain` content type response that cannot be converted to `models::RunnerJoinKey`",
+                )));
+            }
+            ContentType::Unsupported(unknown_type) => {
+                return Err(Error::from(serde_json::Error::custom(format!(
+                    "Received `{unknown_type}` content type response that cannot be converted to `models::RunnerJoinKey`"
+                ))));
+            }
+        }
+    } else {
+        let content = resp.text()?;
+        let entity: Option<RevokeRunnerJoinKeyError> = serde_json::from_str(&content).ok();
+        Err(Error::ResponseError(ResponseContent {
+            status,
+            content,
+            entity,
+        }))
+    }
+}
+
+/// Sets the registration to enabled, draining, or disabled. Draining immediately prevents new placement and withdraws still-offered work while retaining presence and accepted-work renewal authority. Disablement removes current Cloud session authority. Re-enablement changes only mode and never creates or restores credentials, presence, or withdrawn offers. An equivalent target is an exact no-op. An owner may set the mode of any registration; a member only of one in their own personal pool, and is answered 403 for any other.
 pub fn update_runner_registration_mode(
     configuration: &configuration::Configuration,
     organization_ref: &str,

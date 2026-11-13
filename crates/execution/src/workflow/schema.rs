@@ -4,13 +4,14 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use super::document::{
-    Agent, AgentMessage, AgentNode, AgentProfile, Binding, BindingKind, CommandNode, CommonNode,
-    ConditionOperand, ConditionPredicate, ConditionSelector, EdgeTarget, ExportDefinition,
-    ExportPresentation, FailurePolicy, FinalizationTrigger, FinalizerDefinition, ForEach,
-    InputDeclaration, JsonDefault, MessageSource, NodeBody, OutcomeDeclaration, Output,
-    OutputReference, PresentationSource, RecoveryHandler, RootBlocks, RootRequires, StepDefinition,
-    StepRecovery, Trigger, TriggerControlAction, TriggerRule, ValueReference, WaitKind, WaitRule,
-    WorkflowDocument, WorkflowNode,
+    Agent, AgentMessage, AgentNode, AgentProfile, Binding, BindingKind, BindingValue, CommandNode,
+    CommonNode, ConditionOperand, ConditionPredicate, ConditionSelector, EdgeTarget,
+    ExportDefinition, ExportPresentation, FailurePolicy, FinalizationTrigger, FinalizerDefinition,
+    ForEach, InputDeclaration, JsonDefault, MessageSource, NodeBody, OutcomeDeclaration, Output,
+    OutputReference, OwnerDeclaration, OwnerSource, PresentationSource, RecoveryHandler,
+    RootBlocks, RootRequires, StartRule, StepDefinition, StepRecovery, StopBefore, Trigger,
+    TriggerControlAction, TriggerRule, ValueReference, WaitKind, WaitRule, WorkflowDocument,
+    WorkflowNode,
 };
 use super::mirror::{MirrorBlock, MirrorState};
 use super::validated::ValidatedHarness;
@@ -93,7 +94,7 @@ struct RequiresDto {
 #[serde(deny_unknown_fields)]
 struct BindingDto {
     kind: BindingKind,
-    default: Option<String>,
+    default: Option<BindingValue>,
 }
 
 #[derive(Deserialize)]
@@ -168,9 +169,83 @@ enum TriggerDto {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct StartTriggerDto {
-    on: TriggerRuleDto,
+    on: StartRuleDto,
     subject: Option<String>,
     inputs: BTreeMap<String, String>,
+    #[serde(rename = "stopBefore")]
+    stop_before: Option<StopBeforeDto>,
+    owner: Option<OwnerDto>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum StartRuleDto {
+    Event(TriggerRuleDto),
+    Schedule(ScheduleRuleDto),
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ScheduleRuleDto {
+    schedule: String,
+    timezone: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StopBeforeDto {
+    labels: String,
+    prefix: String,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum OwnerDto {
+    Filtered(FilteredOwnerDto),
+    Source(OwnerSourceDto),
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FilteredOwnerDto {
+    from: OwnerSourceDto,
+    only: Option<String>,
+    except: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum OwnerSourceDto {
+    One(String),
+    List(Vec<String>),
+}
+
+impl OwnerSourceDto {
+    /// The schema fixed a string as `event.<path>` or `$<key>` and a list as event paths.
+    fn into_source(self) -> OwnerSource {
+        match self {
+            Self::One(reference) if reference.starts_with('$') => OwnerSource::Binding(reference),
+            Self::One(path) => OwnerSource::Event(path),
+            Self::List(paths) => OwnerSource::Events(paths),
+        }
+    }
+}
+
+impl OwnerDto {
+    fn into_declaration(self) -> OwnerDeclaration {
+        match self {
+            Self::Filtered(owner) => OwnerDeclaration {
+                from: owner.from.into_source(),
+                only: owner.only,
+                except: owner.except,
+            },
+            Self::Source(source) => OwnerDeclaration {
+                from: source.into_source(),
+                only: None,
+                except: None,
+            },
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -228,9 +303,20 @@ impl TriggerDto {
     fn into_trigger(self) -> Trigger {
         match self {
             Self::Start(start) => Trigger::Start {
-                on: start.on.into_rule(),
+                on: match start.on {
+                    StartRuleDto::Event(rule) => StartRule::Event(rule.into_rule()),
+                    StartRuleDto::Schedule(rule) => StartRule::Schedule {
+                        cron: rule.schedule,
+                        timezone: rule.timezone,
+                    },
+                },
                 subject: start.subject,
                 inputs: start.inputs,
+                stop_before: start.stop_before.map(|stop_before| StopBefore {
+                    labels: stop_before.labels,
+                    prefix: stop_before.prefix,
+                }),
+                owner: start.owner.map(OwnerDto::into_declaration),
             },
             Self::Control(control) => Trigger::Control {
                 on: control.on.into_rule(),

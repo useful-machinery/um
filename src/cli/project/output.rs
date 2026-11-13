@@ -167,9 +167,12 @@ fn write_project_human(deployment: &str, heading: &str, project: &Project) -> an
     writeln!(stdout, "project: {}", project.id)?;
     writeln!(stdout, "name: {}", project.name)?;
     writeln!(stdout, "organization: {}", project.organization_id)?;
-    match project.runner_pool.as_deref() {
-        Some(pool) => writeln!(stdout, "runner pool: {} ({})", pool.name, pool.id)?,
-        None => writeln!(stdout, "runner pool: none")?,
+    let runner_pools = project.runner_pools.as_deref().unwrap_or_default();
+    if runner_pools.is_empty() {
+        writeln!(stdout, "runner pool: none")?;
+    }
+    for pool in runner_pools {
+        writeln!(stdout, "runner pool: {} ({})", pool.name, pool.id)?;
     }
     match project.repository.as_deref() {
         Some(repository) => {

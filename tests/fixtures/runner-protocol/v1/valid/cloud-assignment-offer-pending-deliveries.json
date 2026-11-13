@@ -1,0 +1,177 @@
+{
+  "protocolVersion": 1,
+  "direction": "cloud_to_runner",
+  "messageId": "cmsg_01k0z6r1w8f4jy2m7q9v3x5atp",
+  "sentAt": "2026-07-23T00:00:02Z",
+  "type": "assignment_offer",
+  "payloadVersion": 1,
+  "payload": {
+    "effectId": "eff_01k0z6r1w8f4jy2m7q9v3x5abg",
+    "assignmentId": "asn_01k0z6r1w8f4jy2m7q9v3x5abn",
+    "runId": "run_01k0z6r1w8f4jy2m7q9v3x5abp",
+    "executionSpec": {
+      "executionSpecId": "xsp_01k0z6r1w8f4jy2m7q9v3x5abq",
+      "schemaVersion": 2,
+      "executionLimits": {
+        "maximumParallelSteps": 1,
+        "cancellationGraceSeconds": 1
+      },
+      "sourceBranch": "main",
+      "workflowDefinitionSource": {
+        "repositoryConnectionId": "rpc_01k0z6r1w8f4jy2m7q9v3x5abc",
+        "objectFormat": "sha1",
+        "commitOid": "0123456789abcdef0123456789abcdef01234567",
+        "workflowPath": "workflows/build.yaml",
+        "workflowSourceClosureDigest": {
+          "algorithm": "sha256",
+          "value": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        }
+      },
+      "primaryWorkspaceSource": {
+        "kind": "connected_repository",
+        "providerKind": "github",
+        "repositoryConnectionId": "rpc_01k0z6r1w8f4jy2m7q9v3x5abc",
+        "objectFormat": "sha1",
+        "commitOid": "0123456789abcdef0123456789abcdef01234567",
+        "materializationContract": "git_full_clone_v1"
+      },
+      "capacity": {
+        "executionContract": "workflow_v1_cloud_inputs_artifacts@1",
+        "sourceClosureDigest": {
+          "algorithm": "sha256",
+          "value": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        },
+        "generalMaximumTransitions": 8,
+        "selectedMaximumTransitions": 7,
+        "maximumInvocations": 1,
+        "maximumRetainedBytesPerInvocation": 4194304,
+        "diagnosticRetentionBytes": 8388608,
+        "nativeSessionRetentionBytes": 4194304,
+        "aggregateRetentionBytes": 12582912,
+        "conditionTransitionCount": 1,
+        "aggregateConditionTransitionBytes": 33871,
+        "terminalResultStructureBytes": 67742,
+        "portableResultBytes": 364277238,
+        "encodedOutboxBytes": 18189549
+      },
+      "runInputs": null,
+      "sourceDisplaySnapshot": {
+        "organizationDisplayName": "Example Organization",
+        "projectName": "example-project",
+        "repository": {
+          "providerKind": "github",
+          "fullName": "example/repository"
+        }
+      },
+      "workflowTree": {
+        "digest": "sha256:4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+        "definitionId": "def_01k0z6r1w8f4jy2m7q9v3x5abr",
+        "revision": 3,
+        "workflowPath": "workflows/build.yaml",
+        "files": [
+          {
+            "path": "workflows/build.yaml",
+            "sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            "size": 812,
+            "executable": false
+          },
+          {
+            "path": "workflows/scripts/check.sh",
+            "sha256": "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210",
+            "size": 96,
+            "executable": true
+          }
+        ],
+        "bindings": {
+          "linearTeam": {
+            "kind": "linear.team",
+            "value": "ENG"
+          },
+          "reviewers": {
+            "kind": "members",
+            "value": [
+              "prn_01k0z6r1w8f4jy2m7q9v3x5abs"
+            ]
+          }
+        },
+        "resolution": {
+          "linearTeam": {
+            "kind": "linear.team",
+            "value": "ENG",
+            "id": "team_8c1b",
+            "name": "Engineering"
+          },
+          "reviewers": {
+            "kind": "members",
+            "value": [
+              "prn_01k0z6r1w8f4jy2m7q9v3x5abs"
+            ]
+          }
+        },
+        "owner": {
+          "displayName": "Ada Lovelace"
+        },
+        "stopBefore": null,
+        "pendingDeliveries": [
+          {
+            "deliveryId": "wtd_01k0z6r1w8f4jy2m7q9v3x5abt",
+            "claimId": "wsc_01k0z6r1w8f4jy2m7q9v3x5abv",
+            "event": {
+              "source": "lcn_01k0z6r1w8f4jy2m7q9v3x5abw",
+              "event": "issue.state_left",
+              "at": "2026-07-23T00:00:08Z",
+              "payload": {
+                "issue": {
+                  "id": "5b0c7e4a-2f1d-4c8e-9a3b-6d2e1f0a9c47",
+                  "identifier": "ENG-42"
+                },
+                "issueUpdatedAt": "2026-07-23T00:00:07.512Z",
+                "team": "team_8c1b",
+                "state": "state_build",
+                "to": "state_canceled",
+                "actor": "user_7f3a"
+              }
+            },
+            "claim": {
+              "connection": "lcn_01k0z6r1w8f4jy2m7q9v3x5abw",
+              "issue": "5b0c7e4a-2f1d-4c8e-9a3b-6d2e1f0a9c47",
+              "observation": {
+                "team": "team_8c1b",
+                "state": "state_build",
+                "updatedAt": "2026-07-23T00:00:01.250Z"
+              }
+            }
+          },
+          {
+            "deliveryId": "wtd_01k0z6r1w8f4jy2m7q9v3x5abx",
+            "claimId": "wsc_01k0z6r1w8f4jy2m7q9v3x5aby",
+            "event": {
+              "source": "lcn_01k0z6r1w8f4jy2m7q9v3x5abw",
+              "event": "issue.state_left",
+              "at": "2026-07-23T00:00:09Z",
+              "payload": {
+                "issue": {
+                  "id": "5b0c7e4a-2f1d-4c8e-9a3b-6d2e1f0a9c47",
+                  "identifier": "ENG-42"
+                },
+                "issueUpdatedAt": "2026-07-23T00:00:07.512Z",
+                "team": "team_8c1b",
+                "state": "state_build",
+                "to": "state_canceled",
+                "actor": "user_7f3a"
+              }
+            },
+            "claim": {
+              "connection": "lcn_01k0z6r1w8f4jy2m7q9v3x5abw",
+              "issue": "5b0c7e4a-2f1d-4c8e-9a3b-6d2e1f0a9c47"
+            }
+          }
+        ],
+        "runUrl": "https://usefulmachinery.com/acme/runs/run_01k0z6r1w8f4jy2m7q9v3x5abp"
+      }
+    },
+    "attemptId": "atm_01k0z6r1w8f4jy2m7q9v3x5abc",
+    "projectId": "prj_01k0z6r1w8f4jy2m7q9v3x5abc",
+    "attemptNumber": 1
+  }
+}

@@ -24,6 +24,9 @@
     {
       "$ref": "#/$defs/RunnerContinuationReady"
     },
+    { "$ref": "#/$defs/RunnerTreeProgress" },
+    { "$ref": "#/$defs/RunnerTriggerDeliveryApplied" },
+    { "$ref": "#/$defs/RunnerRunControlApplied" },
     {
       "$ref": "#/$defs/RunnerAssignmentAccepted"
     },
@@ -106,7 +109,9 @@
     },
     {
       "$ref": "#/$defs/CloudAssignmentRelease"
-    }
+    },
+    { "$ref": "#/$defs/CloudTriggerDelivery" },
+    { "$ref": "#/$defs/CloudRunControl" }
   ],
   "$defs": {
     "workRootId": {"type": "string", "pattern": "^rwr_[0-7][0-9a-hjkmnp-tv-z]{25}$"},
@@ -559,7 +564,8 @@
               "$ref": "#/$defs/RunInputProjection"
             }
           ]
-        }
+        },
+        "workflowTree": {"$ref": "#/$defs/WorkflowTreeExecution"}
       },
       "required": [
         "executionSpecId",
@@ -596,6 +602,261 @@
           "else": {"properties": {"sourceDisplaySnapshot": {"properties": {"repository": {"$ref": "#/$defs/GitHubSourceDisplayRepository"}}}}}
         }
       ]
+    },
+    "WorkflowTreeExecution": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "The definition revision a definition-backed run executes: the sealed tree's files, the bindings snapshot and its resolution, and the start's owner, stop step and pending deliveries.",
+      "properties": {
+        "digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+        "definitionId": {"type": "string", "pattern": "^def_[0-7][0-9a-hjkmnp-tv-z]{25}$"},
+        "revision": {"type": "integer", "minimum": 1, "maximum": 2147483647},
+        "workflowPath": {"type": "string", "minLength": 1, "maxLength": 1024, "pattern": "^[^/]+(?:/[^/]+)*$"},
+        "files": {
+          "type": "array", "minItems": 1, "maxItems": 4096,
+          "items": {"$ref": "#/$defs/WorkflowTreeFile"}
+        },
+        "bindings": {
+          "type": "object", "maxProperties": 256,
+          "propertyNames": {"$ref": "#/$defs/workflowBindingKey"},
+          "additionalProperties": {"$ref": "#/$defs/WorkflowTreeBinding"}
+        },
+        "resolution": {
+          "type": "object", "maxProperties": 256,
+          "propertyNames": {"$ref": "#/$defs/workflowBindingKey"},
+          "additionalProperties": {"$ref": "#/$defs/WorkflowTreeResolvedBinding"}
+        },
+        "owner": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/WorkflowTreeOwner"}]},
+        "stopBefore": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/stepId"}]},
+        "pendingDeliveries": {"type": "array", "maxItems": 64, "items": {"$ref": "#/$defs/TriggerDelivery"}},
+        "runUrl": {"type": "string", "format": "uri", "maxLength": 2048, "description": "The Cloud run page, which the runner records as the local run's `external.url`."}
+      },
+      "required": ["digest", "definitionId", "revision", "workflowPath", "files", "bindings", "resolution", "owner", "stopBefore", "pendingDeliveries"]
+    },
+    "triggerDeliveryId": {"type": "string", "pattern": "^wtd_[0-7][0-9a-hjkmnp-tv-z]{25}$"},
+    "subjectClaimId": {"type": "string", "pattern": "^wsc_[0-7][0-9a-hjkmnp-tv-z]{25}$"},
+    "TriggerDelivery": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "A control delivery Cloud pinned to the run's subject claim (REQ-TRIGGER-134), which the runner applies with `um workflow run event` (REQ-TRIGGER-136).",
+      "properties": {
+        "deliveryId": {"$ref": "#/$defs/triggerDeliveryId"},
+        "claimId": {"$ref": "#/$defs/subjectClaimId"},
+        "event": {"$ref": "#/$defs/TriggerDeliveryEvent"},
+        "claim": {"$ref": "#/$defs/TriggerDeliveryClaim"}
+      },
+      "required": ["deliveryId", "claimId", "event", "claim"]
+    },
+    "TriggerDeliveryEvent": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "The shared event the control trigger matched: its source, name, time and provider payload (REQ-TRIGGER-124).",
+      "properties": {
+        "source": {"type": "string", "minLength": 1, "maxLength": 255},
+        "event": {"type": "string", "minLength": 1, "maxLength": 128},
+        "at": {"$ref": "#/$defs/utcTimestamp"},
+        "payload": {"type": "object"}
+      },
+      "required": ["source", "event", "at", "payload"]
+    },
+    "TriggerDeliveryClaim": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "The claim the delivery is pinned to: its connection, the provider issue id and, for a claim admitted from a provider event, its admission observation.",
+      "properties": {
+        "connection": {"type": "string", "minLength": 1, "maxLength": 255},
+        "issue": {"type": "string", "minLength": 1, "maxLength": 255},
+        "observation": {"$ref": "#/$defs/TriggerClaimObservation"}
+      },
+      "required": ["connection", "issue"]
+    },
+    "TriggerClaimObservation": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "team": {"type": "string", "minLength": 1, "maxLength": 255},
+        "state": {"type": "string", "minLength": 1, "maxLength": 255},
+        "updatedAt": {"type": "string", "minLength": 1, "maxLength": 64}
+      },
+      "required": ["team", "state", "updatedAt"]
+    },
+    "TriggerIssueObservation": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "The fresh issue read an application acted on: the issue's team, state and update time, team and time null when the provider reported none.",
+      "properties": {
+        "team": {"oneOf": [{"type": "null"}, {"type": "string", "minLength": 1, "maxLength": 255}]},
+        "state": {"type": "string", "minLength": 1, "maxLength": 255},
+        "updatedAt": {"oneOf": [{"type": "null"}, {"type": "string", "minLength": 1, "maxLength": 64}]}
+      },
+      "required": ["team", "state", "updatedAt"]
+    },
+    "runControlId": {"type": "string", "pattern": "^rct_[0-7][0-9a-hjkmnp-tv-z]{25}$"},
+    "RunControlWait": {
+      "type": "object", "additionalProperties": false,
+      "description": "The wait a control resolves: the kind and `since` of the run's pending wait as `tree_progress` reported it, which together name the wait.",
+      "properties": {
+        "kind": {"$ref": "#/$defs/treeWaitKind"},
+        "since": {"$ref": "#/$defs/utcTimestamp"}
+      },
+      "required": ["kind", "since"]
+    },
+    "RunControlAnswer": {
+      "type": "object", "additionalProperties": false,
+      "description": "One answer: the question's id and the answer text (at most 65,536 UTF-8 bytes).",
+      "properties": {
+        "question": {"type": "string", "minLength": 1, "maxLength": 255},
+        "text": {"type": "string", "minLength": 1, "maxLength": 65536}
+      },
+      "required": ["question", "text"]
+    },
+    "RunControl": {
+      "type": "object", "additionalProperties": false,
+      "description": "An authorized control for a run's wait (REQ-RUNNERENROLL-90), each member present only for its kind: `answer` carries `wait` and `answers`; `approve` and `retry` carry `wait`; `hand_back` carries `wait` and `notes`; `lift` may carry `wait` and `before`; `stop` carries `before` and may carry `reason`.",
+      "properties": {
+        "kind": {"enum": ["answer", "approve", "hand_back", "lift", "stop", "retry"]},
+        "wait": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/RunControlWait"}]},
+        "answers": {"type": "array", "minItems": 1, "maxItems": 64, "items": {"$ref": "#/$defs/RunControlAnswer"}},
+        "notes": {"type": "string", "minLength": 1, "maxLength": 4096},
+        "before": {"$ref": "#/$defs/stepId"},
+        "reason": {"type": "string", "minLength": 1, "maxLength": 1024}
+      },
+      "required": ["kind"],
+      "if": {"properties": {"kind": {"const": "answer"}}},
+      "then": {
+        "required": ["wait", "answers"],
+        "properties": {"wait": {"$ref": "#/$defs/RunControlWait"}},
+        "not": {"anyOf": [{"required": ["notes"]}, {"required": ["before"]}, {"required": ["reason"]}]}
+      },
+      "else": {
+        "if": {"properties": {"kind": {"enum": ["approve", "retry"]}}},
+        "then": {
+          "required": ["wait"],
+          "properties": {"wait": {"$ref": "#/$defs/RunControlWait"}},
+          "not": {"anyOf": [{"required": ["answers"]}, {"required": ["notes"]}, {"required": ["before"]}, {"required": ["reason"]}]}
+        },
+        "else": {
+          "if": {"properties": {"kind": {"const": "hand_back"}}},
+          "then": {
+            "required": ["wait", "notes"],
+            "properties": {"wait": {"$ref": "#/$defs/RunControlWait"}},
+            "not": {"anyOf": [{"required": ["answers"]}, {"required": ["before"]}, {"required": ["reason"]}]}
+          },
+          "else": {
+            "if": {"properties": {"kind": {"const": "lift"}}},
+            "then": {
+              "not": {"anyOf": [{"required": ["answers"]}, {"required": ["notes"]}, {"required": ["reason"]}]}
+            },
+            "else": {
+              "required": ["before"],
+              "not": {"anyOf": [{"required": ["wait"]}, {"required": ["answers"]}, {"required": ["notes"]}]}
+            }
+          }
+        }
+      }
+    },
+    "WorkflowTreeFile": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "path": {"type": "string", "minLength": 1, "maxLength": 1024, "pattern": "^[^/]+(?:/[^/]+)*$"},
+        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "size": {"type": "integer", "minimum": 0, "maximum": 67108864},
+        "executable": {"type": "boolean"}
+      },
+      "required": ["path", "sha256", "size", "executable"]
+    },
+    "workflowBindingKey": {
+      "type": "string",
+      "maxLength": 64,
+      "pattern": "^[a-z][A-Za-z0-9]*$"
+    },
+    "WorkflowBindingKind": {
+      "enum": ["connection", "linear.team", "linear.state", "github.repository", "member", "members"]
+    },
+    "WorkflowBindingValue": {
+      "oneOf": [
+        {"type": "string", "minLength": 1},
+        {"type": "array", "items": {"type": "string", "minLength": 1}}
+      ]
+    },
+    "WorkflowTreeBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "kind": {"$ref": "#/$defs/WorkflowBindingKind"},
+        "value": {"$ref": "#/$defs/WorkflowBindingValue"}
+      },
+      "required": ["kind", "value"]
+    },
+    "WorkflowTreeResolvedBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "kind": {"$ref": "#/$defs/WorkflowBindingKind"},
+        "value": {"$ref": "#/$defs/WorkflowBindingValue"},
+        "id": {"type": "string", "minLength": 1, "maxLength": 255},
+        "name": {"type": "string", "maxLength": 255}
+      },
+      "required": ["kind", "value"]
+    },
+    "MirrorResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "One mirror write a tree run made, as its run's `mirror/<NNNN>-<hook>.json` records it without `schemaVersion`.",
+      "properties": {
+        "hook": {"enum": ["start", "stage", "wait", "outcome"]},
+        "at": {"$ref": "#/$defs/utcTimestamp"},
+        "issue": {"type": "string"},
+        "action": {
+          "oneOf": [
+            {"$ref": "#/$defs/MirrorCommentAction"},
+            {"$ref": "#/$defs/MirrorStateAction"}
+          ]
+        },
+        "outcome": {"enum": ["written", "skipped", "failed"]},
+        "reason": {"enum": ["guard_held"]},
+        "code": {
+          "enum": [
+            "mirror_credentials_unavailable",
+            "mirror_bindings_unavailable",
+            "mirror_issue_unavailable",
+            "mirror_state_unknown",
+            "mirror_write_rejected",
+            "mirror_unavailable"
+          ]
+        },
+        "diagnostic": {"type": "string"}
+      },
+      "required": ["hook", "at", "issue", "action", "outcome"]
+    },
+    "MirrorCommentAction": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "kind": {"const": "comment"},
+        "body": {"type": "string"}
+      },
+      "required": ["kind", "body"]
+    },
+    "MirrorStateAction": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "A state write: `state` is the bound value of `binding`, absent when it could not be read.",
+      "properties": {
+        "kind": {"const": "state"},
+        "state": {"type": "string"},
+        "binding": {"type": "string"}
+      },
+      "required": ["kind", "binding"]
+    },
+    "WorkflowTreeOwner": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "displayName": {"type": "string", "minLength": 1, "maxLength": 255}
+      },
+      "required": ["displayName"]
     },
     "RunInputProjection": {
       "type": "object",
@@ -857,6 +1118,8 @@
                   "maxLength": 128
                 },
                 "workspaceRecoveryVersion": {"const": 1},
+                "treeExecution": {"const": 1},
+                "treeContinuation": {"const": 1},
                 "workspaceRecoveryRoot": {
                   "type": "object", "additionalProperties": false,
                   "properties": {
@@ -1068,6 +1331,141 @@
                 "preparationSequence",
                 "phase"
               ]
+            }
+          }
+        }
+      ],
+      "unevaluatedProperties": false
+    },
+    "TreeProgressPositionElement": {
+      "description": "One element of a tree run's stage path: a step identifier, or the one-based element of a forEach step.",
+      "oneOf": [
+        {"type": "string", "maxLength": 64, "pattern": "^[a-z][A-Za-z0-9]*$"},
+        {
+          "type": "object", "additionalProperties": false,
+          "properties": {"item": {"type": "integer", "minimum": 1, "maximum": 2147483647}},
+          "required": ["item"]
+        }
+      ]
+    },
+    "treeWaitKind": {"enum": ["answer", "approval", "repair", "stop", "external", "children"]},
+    "TreeProgressWait": {
+      "type": "object", "additionalProperties": false,
+      "properties": {
+        "kind": {"$ref": "#/$defs/treeWaitKind"},
+        "since": {"$ref": "#/$defs/utcTimestamp"},
+        "step": {"type": "array", "minItems": 1, "maxItems": 64, "items": {"$ref": "#/$defs/TreeProgressPositionElement"}}
+      },
+      "required": ["kind", "since", "step"]
+    },
+    "TreeProgressStepRunElement": {
+      "description": "One level of child workflow on the path to the run a step observation belongs to: the parent step, the one-based fan-out element when that step fans out, and the child run's one-based ordinal.",
+      "type": "object", "additionalProperties": false,
+      "properties": {
+        "step": {"type": "string", "maxLength": 64, "pattern": "^[a-z][A-Za-z0-9]*$"},
+        "item": {"type": "integer", "minimum": 1, "maximum": 2147483647},
+        "ordinal": {"type": "integer", "minimum": 1, "maximum": 2147483647}
+      },
+      "required": ["step", "ordinal"]
+    },
+    "TreeProgressStep": {
+      "description": "One step observation of a tree run (REQ-COMPAT-18): the run inside the tree it belongs to (empty for the root), that run's engine attempt, the step and its latest state. A frame names each (run, runAttempt, step) at most once; the Gateway refuses a repeat.",
+      "type": "object", "additionalProperties": false,
+      "properties": {
+        "run": {"type": "array", "maxItems": 16, "items": {"$ref": "#/$defs/TreeProgressStepRunElement"}},
+        "runAttempt": {"type": "integer", "minimum": 1, "maximum": 2147483647},
+        "step": {"type": "string", "maxLength": 64, "pattern": "^[a-z][A-Za-z0-9]*$"},
+        "state": {"enum": ["pending", "starting", "running", "capturing_outputs", "cancelling", "succeeded", "inherited", "failed", "blocked", "skipped", "not_run", "cancelled"]}
+      },
+      "required": ["run", "runAttempt", "step", "state"]
+    },
+    "RunnerTreeProgress": {
+      "description": "Ordered root progress of a tree run between engine attempts (REQ-RUN-88, REQ-RUNNERENROLL-99). progressSequence is numbered per assignment apart from executionEventSequence; a waiting report names its wait and a running report names none. The optional steps carry step observations (REQ-COMPAT-18); a frame without them reports none.",
+      "allOf": [
+        { "$ref": "#/$defs/RunnerEnvelope" },
+        {
+          "properties": {
+            "type": { "const": "tree_progress" },
+            "payload": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "assignmentId": { "$ref": "#/$defs/assignmentId" },
+                "attemptId": { "$ref": "#/$defs/attemptId" },
+                "progressSequence": { "$ref": "#/$defs/positiveSequence" },
+                "attempt": { "type": "integer", "minimum": 1, "maximum": 2147483647 },
+                "state": { "enum": ["running", "waiting"] },
+                "position": { "type": "array", "maxItems": 64, "items": { "$ref": "#/$defs/TreeProgressPositionElement" } },
+                "wait": { "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/TreeProgressWait" }] },
+                "reportedAt": { "$ref": "#/$defs/utcTimestamp" },
+                "steps": { "type": "array", "maxItems": 64, "items": { "$ref": "#/$defs/TreeProgressStep" } }
+              },
+              "required": ["assignmentId", "attemptId", "progressSequence", "attempt", "state", "position", "wait", "reportedAt"],
+              "if": { "properties": { "state": { "const": "waiting" } }, "required": ["state"] },
+              "then": { "properties": { "wait": { "not": { "type": "null" } } } },
+              "else": { "properties": { "wait": { "type": "null" } } }
+            }
+          }
+        }
+      ],
+      "unevaluatedProperties": false
+    },
+    "RunnerTriggerDeliveryApplied": {
+      "description": "The runner's application of one trigger delivery to the run its assignment holds (REQ-TRIGGER-136): `applied` with the action `um workflow run event` took, or `refused` with its code, and the fresh issue read, null when the command refused before reading.",
+      "allOf": [
+        { "$ref": "#/$defs/RunnerEnvelope" },
+        {
+          "properties": {
+            "type": { "const": "trigger_delivery_applied" },
+            "payload": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "assignmentId": { "$ref": "#/$defs/assignmentId" },
+                "attemptId": { "$ref": "#/$defs/attemptId" },
+                "deliveryId": { "$ref": "#/$defs/triggerDeliveryId" },
+                "outcome": { "enum": ["applied", "refused"] },
+                "action": { "enum": ["cancel", "withdraw"] },
+                "code": { "type": "string", "pattern": "^[a-z][a-z0-9_]{0,63}$" },
+                "observation": { "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/TriggerIssueObservation" }] }
+              },
+              "required": ["assignmentId", "attemptId", "deliveryId", "outcome", "observation"],
+              "if": { "properties": { "outcome": { "const": "applied" } }, "required": ["outcome"] },
+              "then": { "required": ["action"], "not": { "required": ["code"] } },
+              "else": { "required": ["code"], "not": { "required": ["action"] } }
+            }
+          }
+        }
+      ],
+      "unevaluatedProperties": false
+    },
+    "RunnerRunControlApplied": {
+      "description": "The runner's application of one authorized Cloud run control to the run its assignment holds (REQ-RUNNERENROLL-90): `applied` with the control command's own `actionOutcome`, `refused` with the runtime's refusal `code`, or `skipped` with `wait_not_current` when the run no longer waits on the control's wait or `assignment_ended` when the assignment ended before it was applied.",
+      "allOf": [
+        { "$ref": "#/$defs/RunnerEnvelope" },
+        {
+          "properties": {
+            "type": { "const": "run_control_applied" },
+            "payload": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "assignmentId": { "$ref": "#/$defs/assignmentId" },
+                "attemptId": { "$ref": "#/$defs/attemptId" },
+                "controlId": { "$ref": "#/$defs/runControlId" },
+                "outcome": { "enum": ["applied", "refused", "skipped"] },
+                "code": { "type": "string", "pattern": "^[a-z][a-z0-9_]{0,63}$" },
+                "actionOutcome": { "type": "string", "minLength": 1, "maxLength": 64 }
+              },
+              "required": ["assignmentId", "attemptId", "controlId", "outcome"],
+              "if": { "properties": { "outcome": { "const": "applied" } }, "required": ["outcome"] },
+              "then": { "required": ["actionOutcome"], "not": { "required": ["code"] } },
+              "else": {
+                "required": ["code"],
+                "not": { "required": ["actionOutcome"] },
+                "if": { "properties": { "outcome": { "const": "skipped" } }, "required": ["outcome"] },
+                "then": { "properties": { "code": { "enum": ["wait_not_current", "assignment_ended"] } } }
+              }
             }
           }
         }
@@ -1446,7 +1844,7 @@
         "effectiveCapacity": { "$ref": "#/$defs/ExecutionCapacity" },
         "priorManifestDigest": { "$ref": "#/$defs/WorkflowSourceClosureDigest" },
         "request": { "type": "object" },
-        "reexecutedSteps": { "type": "array", "minItems": 1, "items": { "type": "string" } },
+        "reexecutedSteps": { "type": "array", "minItems": 0, "items": { "type": "string" } },
         "inheritedSteps": { "type": "array", "items": { "type": "object" } },
         "priorSettlementSnapshot": { "type": ["object", "null"] }
       },
@@ -1654,6 +2052,58 @@
                 "requestId",
                 "mode"
               ]
+            }
+          }
+        }
+      ],
+      "unevaluatedProperties": false
+    },
+    "CloudTriggerDelivery": {
+      "description": "A trigger delivery for the run the assignment holds, a Gateway-originated effect the runner acknowledges and then applies (REQ-TRIGGER-136).",
+      "allOf": [
+        { "$ref": "#/$defs/CloudEnvelope" },
+        {
+          "properties": {
+            "type": { "const": "trigger_delivery" },
+            "payload": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "effectId": { "$ref": "#/$defs/effectId" },
+                "assignmentId": { "$ref": "#/$defs/assignmentId" },
+                "runId": { "$ref": "#/$defs/runId" },
+                "attemptId": { "$ref": "#/$defs/attemptId" },
+                "deliveryId": { "$ref": "#/$defs/triggerDeliveryId" },
+                "claimId": { "$ref": "#/$defs/subjectClaimId" },
+                "event": { "$ref": "#/$defs/TriggerDeliveryEvent" },
+                "claim": { "$ref": "#/$defs/TriggerDeliveryClaim" }
+              },
+              "required": ["effectId", "assignmentId", "runId", "attemptId", "deliveryId", "claimId", "event", "claim"]
+            }
+          }
+        }
+      ],
+      "unevaluatedProperties": false
+    },
+    "CloudRunControl": {
+      "description": "An authorized Cloud control for the run the assignment holds, a Gateway-originated effect the runner acknowledges and then applies to the run's current wait (REQ-RUNNERENROLL-90).",
+      "allOf": [
+        { "$ref": "#/$defs/CloudEnvelope" },
+        {
+          "properties": {
+            "type": { "const": "run_control" },
+            "payload": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "effectId": { "$ref": "#/$defs/effectId" },
+                "assignmentId": { "$ref": "#/$defs/assignmentId" },
+                "runId": { "$ref": "#/$defs/runId" },
+                "attemptId": { "$ref": "#/$defs/attemptId" },
+                "controlId": { "$ref": "#/$defs/runControlId" },
+                "control": { "$ref": "#/$defs/RunControl" }
+              },
+              "required": ["effectId", "assignmentId", "runId", "attemptId", "controlId", "control"]
             }
           }
         }
@@ -4933,6 +5383,22 @@
                 "diagnostic": {"$ref": "#/$defs/RunnerDiagnostic"},
                 "artifactDelivery": {
                   "$ref": "#/$defs/ArtifactDeliveryResult"
+                },
+                "chosenOutcome": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 64,
+                  "description": "For a run executing a published tree, the outcome its root chose; absent when the runner reports none."
+                },
+                "mirror": {
+                  "type": "array",
+                  "maxItems": 1024,
+                  "items": {"$ref": "#/$defs/MirrorResult"},
+                  "description": "For a run executing a published tree, the results of the mirror writes its run made, in order."
+                },
+                "claimRelease": {
+                  "type": "boolean",
+                  "description": "For a run executing a published tree, whether the runner requests release of the run's subject claim: true exactly when its outcome hook confirmed the issue's departure."
                 }
               },
               "required": [

@@ -53,7 +53,7 @@ pub struct RootRequires {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Binding {
     pub kind: BindingKind,
-    pub default: Option<String>,
+    pub default: Option<BindingValue>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -66,6 +66,12 @@ pub enum BindingKind {
     LinearState,
     #[serde(rename = "github.repository")]
     GithubRepository,
+    /// One organization member.
+    #[serde(rename = "member")]
+    Member,
+    /// A list of organization members.
+    #[serde(rename = "members")]
+    Members,
 }
 
 impl BindingKind {
@@ -75,17 +81,51 @@ impl BindingKind {
             Self::LinearTeam => "linear.team",
             Self::LinearState => "linear.state",
             Self::GithubRepository => "github.repository",
+            Self::Member => "member",
+            Self::Members => "members",
+        }
+    }
+}
+
+/// A binding's default or bound value: a string for every kind but `members`, whose value is
+/// a list (REQ-WFDEF-3, REQ-WFDEF-20). Serialized as written, a list as a JSON array.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(untagged)]
+pub enum BindingValue {
+    Text(String),
+    List(Vec<String>),
+}
+
+impl BindingValue {
+    /// Whether this value fits `kind`: a non-empty string, or for `members` a list of
+    /// non-empty strings, empty included.
+    pub fn fits(&self, kind: BindingKind) -> bool {
+        match (self, kind) {
+            (Self::List(items), BindingKind::Members) => items.iter().all(|item| !item.is_empty()),
+            (Self::List(_), _) | (Self::Text(_), BindingKind::Members) => false,
+            (Self::Text(text), _) => !text.is_empty(),
+        }
+    }
+
+    /// The string of a value of any kind but `members`.
+    pub fn as_text(&self) -> Option<&str> {
+        match self {
+            Self::Text(text) => Some(text),
+            Self::List(_) => None,
         }
     }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Trigger {
-    /// Starts a run of the workflow.
+    /// Starts a run of the workflow. No local command acts on `stop_before`, `owner` or a
+    /// schedule rule (REQ-WFDEF-30, REQ-WFDEF-31).
     Start {
-        on: TriggerRule,
+        on: StartRule,
         subject: Option<String>,
         inputs: BTreeMap<String, String>,
+        stop_before: Option<StopBefore>,
+        owner: Option<OwnerDeclaration>,
     },
     /// Acts on the live run for the event's subject.
     Control {
@@ -100,6 +140,50 @@ pub struct TriggerRule {
     pub source: String,
     pub event: String,
     pub condition: Option<String>,
+}
+
+/// What a start trigger evaluates: a provider event or a timetable (REQ-WFDEF-31).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum StartRule {
+    Event(TriggerRule),
+    /// A cron expression and its time zone, both as written.
+    Schedule {
+        cron: String,
+        timezone: String,
+    },
+}
+
+/// A start trigger's `stopBefore` (REQ-WFDEF-30): the event's label list and the prefix
+/// that, followed by a root step's name, stops the run before that step.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct StopBefore {
+    /// An `event.<path>` as written.
+    pub labels: String,
+    pub prefix: String,
+}
+
+/// A start trigger's `owner` (REQ-WFDEF-30), the short form read as `from` alone.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct OwnerDeclaration {
+    pub from: OwnerSource,
+    /// A binding reference of kind `members`, `$` followed by the binding key.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub only: Option<String>,
+    /// A binding reference of kind `members`, `$` followed by the binding key.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub except: Option<String>,
+}
+
+/// Who a run belongs to, as written: serialized as the string or list the root declares.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(untagged)]
+pub enum OwnerSource {
+    /// One `event.<path>`, a provider user.
+    Event(String),
+    /// `event.<path>` values taken in order.
+    Events(Vec<String>),
+    /// A binding reference of kind `member`, `$` followed by the binding key.
+    Binding(String),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

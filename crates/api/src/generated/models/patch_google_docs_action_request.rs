@@ -23,6 +23,8 @@ pub struct PatchGoogleDocsActionRequest {
     pub display_name: Option<String>,
     #[serde(rename = "workflowPath", skip_serializing_if = "Option::is_none")]
     pub workflow_path: Option<String>,
+    #[serde(rename = "definitionId", skip_serializing_if = "Option::is_none")]
+    pub definition_id: Option<String>,
     #[serde(rename = "description", skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     #[serde(rename = "sortOrder", skip_serializing_if = "Option::is_none")]
@@ -47,6 +49,7 @@ impl PatchGoogleDocsActionRequest {
             expected_version,
             display_name: None,
             workflow_path: None,
+            definition_id: None,
             description: None,
             sort_order: None,
             input_bindings: None,

@@ -1182,6 +1182,59 @@ steps:
     }
 }
 
+// REQ-WFCOND-17
+#[test]
+fn condition_references_obey_failure_impact_and_finalizer_trigger_rules() {
+    let source = "schemaVersion: 1
+steps:
+  plan:
+    kind: cmd
+    failurePolicy: advisory
+    command: {argv: [\"true\"]}
+    outputs:
+      note: {kind: text, from: path, path: note.txt}
+  gate:
+    kind: cmd
+#gate
+    condition: {equals: [{ref: outputs.plan.note}, {value: x}]}
+    command: {argv: [\"true\"]}
+finalizers:
+  produce:
+    kind: cmd
+    when: [failed]
+    command: {argv: [\"true\"]}
+    outputs:
+      value: {kind: text, from: path, path: value.txt}
+  consume:
+    kind: cmd
+#consume
+    condition: {equals: [{ref: outputs.produce.value}, {value: x}]}
+    command: {argv: [\"true\"]}
+";
+    let workflow = |gate: &str, consume: &str| {
+        source
+            .replace("#gate\n", gate)
+            .replace("#consume\n", consume)
+    };
+    let advisory = "    failurePolicy: advisory\n";
+    let within = "    when: [failed]\n";
+    let outside = "    when: [succeeded]\n";
+
+    assert_failure(
+        &workflow("", within),
+        ValidationFailureKind::AdvisoryDataDependency,
+        gate_location(),
+    );
+    assert_failure(
+        &workflow(advisory, outside),
+        ValidationFailureKind::IncompatibleFinalizerTriggers,
+        ValidationLocation::FinalizerCondition {
+            finalizer: "consume".to_owned(),
+        },
+    );
+    validate_yaml(&workflow(advisory, within)).unwrap();
+}
+
 // REQ-WFFORMAT-35, REQ-WFFORMAT-49
 #[test]
 fn message_type_table_rejects_every_inverse_destination_without_conversion() {

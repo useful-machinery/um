@@ -65,11 +65,13 @@ use um_execution::{
     wait_payload,
 };
 use um_execution::{
-    DefinitionError, SubjectClaim, SubjectError, WorkflowHome, check_subject, chosen_outcome,
-    failure_outcome, is_subject, read_definition,
+    DefinitionError, SubjectClaim, SubjectError, WITHDRAWN_OUTCOME, WorkflowHome, check_subject,
+    chosen_outcome, failure_outcome, is_subject, read_definition,
 };
 
-pub(super) const ABOUT: &str = "Start a local workflow run";
+mod cloud;
+
+pub(super) const ABOUT: &str = "Start a local workflow run, or with --cloud a Cloud run";
 pub(super) const AFTER_HELP: &str = "Interactive mode:
   Automatic mode uses the terminal interface only when stdin and stdout are terminals,
   TERM is usable, and stdin is not reserved by a Text or JSON input. Resize keeps the
@@ -98,19 +100,28 @@ pub(super) enum ExecutionLeaf {
     Upgrade,
 }
 
+// `--execution-root` is required only of a local run, and `--cloud` needs `--project`
+// (REQ-LOCALRUN-76, REQ-RUN-94).
 #[derive(Debug, Args)]
+#[command(
+    mut_arg("execution_root", |arg| arg
+        .required(false)
+        .required_unless_present("cloud")
+        .conflicts_with("cloud")),
+    mut_arg("cloud", |arg| arg.requires("project"))
+)]
 pub(super) struct Command {
     #[arg(
         value_name = "ID",
         required_unless_present = "path",
-        help = "Workflow definition id, as `um workflow definition list` prints it"
+        help = "Workflow definition id, as `um workflow definition list` prints it; with --cloud, a Cloud definition id"
     )]
     id: Option<String>,
 
     #[arg(
         long,
         value_name = "DIR",
-        conflicts_with = "id",
+        conflicts_with_all = ["id", "cloud"],
         requires = "run_dir",
         help = "Run the tree or workflow source directory at DIR instead of a definition"
     )]
@@ -124,12 +135,12 @@ pub(super) struct Command {
     workflow: Option<PathBuf>,
 
     #[command(flatten)]
-    execution: super::LocalExecutionRoot,
+    execution: Option<super::LocalExecutionRoot>,
 
     #[arg(
         long,
         value_name = "PATH",
-        conflicts_with = "id",
+        conflicts_with_all = ["id", "cloud"],
         help = "Directory to create for this run (must not already exist)"
     )]
     run_dir: Option<PathBuf>,
@@ -140,6 +151,7 @@ pub(super) struct Command {
     #[arg(
         long,
         value_name = "PATH",
+        conflicts_with = "cloud",
         help = "Replace declared agent profiles with the closed replacement document at PATH"
     )]
     agent_profiles: Option<PathBuf>,
@@ -147,29 +159,69 @@ pub(super) struct Command {
     #[arg(
         long,
         value_name = "COUNT",
-        default_value_t = 1,
         value_parser = parse_parallelism,
-        help = "Maximum simultaneous workflow steps"
+        help = "Maximum simultaneous workflow steps (1 to 256, or 1 to 64 with --cloud; 1 when omitted)"
     )]
-    max_parallel: usize,
+    max_parallel: Option<usize>,
 
     #[arg(
         long,
         value_name = "STEP",
+        conflicts_with = "cloud",
         help = "Park the run before STEP until the stop is lifted"
     )]
     stop_before: Option<String>,
 
+    #[arg(
+        long,
+        value_name = "OWNER",
+        value_parser = parse_owner,
+        conflicts_with = "cloud",
+        help = "Record OWNER as the run's owner in place of the login name"
+    )]
+    owner: Option<String>,
+
+    #[arg(
+        long,
+        value_name = "NAME=VALUE",
+        value_parser = parse_external,
+        conflicts_with = "cloud",
+        help = "Record VALUE as the run's external reference NAME (repeatable)"
+    )]
+    external: Vec<(String, String)>,
+
     #[command(flatten)]
     presentation: super::PresentationOptions,
+
+    #[command(flatten)]
+    cloud: super::CloudSelector,
+
+    #[command(flatten)]
+    cloud_creation: cloud::Options,
 }
 
 impl Command {
-    pub(super) fn execute(self) -> super::super::super::CommandResult {
+    pub(super) fn execute(mut self) -> super::super::super::CommandResult {
+        if let Some(organization) = self.cloud.organization.take() {
+            return self.create_in_cloud(organization);
+        }
+        if let Some(flag) = self.cloud_creation.given() {
+            return Err(super::super::super::CommandFailure::with_exit_code(
+                anyhow!("{flag} needs --cloud ORGANIZATION"),
+                ExitCode::UsageError,
+            ));
+        }
         execute_with_runtime("start local workflow runtime", self.execute_async())
     }
 
-    async fn execute_async(self) -> super::super::super::CommandResult {
+    async fn execute_async(mut self) -> super::super::super::CommandResult {
+        // The argument rules require it of a local run (REQ-LOCALRUN-76).
+        let Some(super::LocalExecutionRoot { execution_root }) = self.execution.take() else {
+            return Err(super::super::super::CommandFailure::with_exit_code(
+                anyhow!("a local run needs --execution-root PATH"),
+                ExitCode::UsageError,
+            ));
+        };
         let source = match (self.id.clone(), self.path.clone(), self.run_dir.clone()) {
             (Some(id), None, None) => RunSubject::Definition(id),
             (None, Some(root), Some(run_directory)) => RunSubject::Path {
@@ -184,6 +236,9 @@ impl Command {
                 ));
             }
         };
+        let external = external_references(&self.external).map_err(|error| {
+            super::super::super::CommandFailure::with_exit_code(error, ExitCode::UsageError)
+        })?;
         let relative_workflow = tree_workflow_file(self.workflow.as_deref()).map_err(|error| {
             super::super::super::CommandFailure::with_exit_code(error, ExitCode::UsageError)
         })?;
@@ -301,9 +356,17 @@ impl Command {
                 ));
             }
         }
+        // REQ-LOCALRUN-209: the owner and external references land in the run record.
+        if tree.is_none() && (self.owner.is_some() || !external.is_empty()) {
+            return Err(super::super::super::CommandFailure::with_exit_code(
+                anyhow!(
+                    "--owner and --external need a run of a tree or a definition, which has a run record"
+                ),
+                ExitCode::UsageError,
+            ));
+        }
         let workflow_for_context = workflow.clone();
-        let execution_root = self.execution.execution_root;
-        let maximum_parallel_steps = self.max_parallel;
+        let maximum_parallel_steps = self.max_parallel.unwrap_or(1);
         let context_cancellation = cancellation.clone();
         let context = match blocking_operation(move || {
             execution_context_for_workflow(
@@ -367,15 +430,17 @@ impl Command {
             return subject_rejection(presentation_config, destination.definition(), error);
         }
         write_untested_advisories(&untested_advisories);
-        // REQ-LOCALRUN-175: a run admitted from a tree records itself in `run.json`.
+        // REQ-LOCALRUN-175, REQ-LOCALRUN-209: a run admitted from a tree records itself in
+        // `run.json`, owned by `--owner` or the login name.
         let record = tree_digest.map(|digest| {
             let mut record = WorkflowRunRecord::new(
                 destination.definition(),
                 &digest,
                 &workflow.source.workflow_path,
-                &super::super::login_name(),
+                &self.owner.clone().unwrap_or_else(super::super::login_name),
             );
             record.subject.clone_from(&subject);
+            record.external = external;
             record
         });
         let run_directory = destination.run_directory(record.as_ref())?;
@@ -1661,9 +1726,23 @@ async fn execute_attempt_phases(
     let observed_timing = observer.snapshot();
     let run_timing = observed_run_timing(&observed_timing)
         .ok_or_else(|| anyhow!("prepare authoritative local workflow terminal result"))?;
+    // REQ-WFEXEC-73, REQ-LOCALRUN-186: a withdrawal recorded while the attempt ran that no
+    // `workflow` step boundary honored, because the root has no `workflow` step, the active
+    // stage ended the attempt in a wait or the attempt exited, ends the run `withdrawn` here
+    // instead: no wait record and no `onWait`, the published result the attempt reached, and
+    // `onOutcome.withdrawn` once. It is read again as the final record is written. A
+    // continued attempt leaves it to the chained attempt's first boundary; a child run's
+    // withdrawal is its parent's.
+    let settles_withdrawable = !quiet
+        && matches!(
+            execution.outcome,
+            RunOutcome::Waiting { .. } | RunOutcome::Succeeded | RunOutcome::Failed { .. }
+        );
+    let withdrawn = settles_withdrawable && attempt_withdrawal_pending(attempt).await?;
     // REQ-WFEXEC-61, REQ-LOCALRUN-178: an attempt that ends in a wait chooses no outcome
     // and writes its wait record before the run record reads `waiting`.
     let wait_record = match &execution.outcome {
+        RunOutcome::Waiting { .. } if withdrawn => None,
         RunOutcome::Waiting { wait } => {
             // REQ-WFEXEC-72: an attempt that kept the wait it continued from writes back the
             // record `begin` removed, unchanged, and performs no `onWait` (REQ-LOCALRUN-191).
@@ -1721,8 +1800,12 @@ async fn execute_attempt_phases(
         attempt.continued = Some(edge.clone());
     }
     let continued = attempt.continued.is_some();
-    let outcome = (wait_record.is_none() && !continued)
-        .then(|| chosen_outcome(&workflow.definition, &execution));
+    let outcome = if withdrawn {
+        Some(WITHDRAWN_OUTCOME.to_owned())
+    } else {
+        (wait_record.is_none() && !continued)
+            .then(|| chosen_outcome(&workflow.definition, &execution))
+    };
     if let (Some(outcome), Some(ActiveRunHost::Quiet(host))) = (&outcome, attempt.host.as_mut()) {
         host.outcome = Some(child_run_outcome(outcome, &execution));
     }
@@ -1807,6 +1890,7 @@ async fn execute_attempt_phases(
         .take()
         .ok_or_else(|| anyhow!("local attempt ownership unavailable"))?;
     let exit_mirror = attempt.mirror.take();
+    let wait_written = wait_record.is_some();
     let (cleanup_failed, cleanup_state, released_ownership) = complete_blocking_phase(
         blocking_operation(move || {
             let execution_staging_failed =
@@ -1818,6 +1902,29 @@ async fn execute_attempt_phases(
             } else {
                 Ok(())
             };
+            // REQ-WFEXEC-73: a withdrawal recorded while the attempt finished, after the first
+            // read, is read again under the run lock as the final record is written. It ends
+            // the run `withdrawn` in place of the outcome or wait the attempt chose: the wait
+            // record it wrote is removed, and an `onWait` already written stays. The read
+            // holds the run's controls lock until the run lock is released, so a `withdraw`
+            // either appends before it or finds the run released (REQ-LOCALRUN-186); a lock
+            // that cannot be taken leaves the read unserialized, as unreadable controls
+            // withdraw nothing. An attempt that ends the run `withdrawn` spends what it
+            // honored under that lock: its `settledAt` is taken again after the read, so a
+            // retry of the run is not withdrawn by it again.
+            let last_read = settles_withdrawable && !withdrawn;
+            let controls = settles_withdrawable.then(|| owned_run.lock_controls().ok());
+            let withdrawn_late = last_read && owned_run.withdrawal_pending().unwrap_or(false);
+            let spent = if withdrawn || withdrawn_late {
+                owned_run.spend_withdrawals()
+            } else {
+                Ok(())
+            };
+            let outcome = if withdrawn_late {
+                Some(WITHDRAWN_OUTCOME.to_owned())
+            } else {
+                outcome
+            };
             let record_state = match &outcome {
                 Some(outcome) => {
                     owned_run.update_run_record(RunState::Exited, attempt_number, Some(outcome))
@@ -1828,8 +1935,13 @@ async fn execute_attempt_phases(
                 None => owned_run.update_run_record(RunState::Waiting, attempt_number, None),
             };
             let exited = record_state.is_ok();
-            let cleanup_state = cleanup_state.and(record_state);
+            let record_state = match record_state {
+                Ok(()) if withdrawn_late && wait_written => owned_run.remove_wait_record(),
+                record_state => record_state,
+            };
+            let cleanup_state = cleanup_state.and(spent).and(record_state);
             let released_ownership = owned_run.release();
+            drop(controls);
             // REQ-LOCALRUN-191: the chosen outcome's `onOutcome`, once the record reads it and
             // the run is released, so a write never holds the run.
             if let (true, Some(outcome), Some(mirror)) = (exited, outcome, exit_mirror) {
@@ -1861,6 +1973,30 @@ async fn execute_attempt_phases(
             state_commit_failed,
         )
         .await)
+}
+
+/// REQ-WFEXEC-73: whether a withdrawal recorded while the run is live is pending, read
+/// through the attempt's owner under the run lock it holds. Controls that cannot be read
+/// withdraw nothing.
+async fn attempt_withdrawal_pending(attempt: &mut AttemptTeardown) -> anyhow::Result<bool> {
+    let owned_run = attempt
+        .run
+        .take()
+        .ok_or_else(|| anyhow!("local attempt ownership unavailable"))?;
+    let (owned_run, pending) = match blocking_operation(move || {
+        let pending = owned_run.withdrawal_pending().unwrap_or(false);
+        Ok::<_, std::convert::Infallible>((owned_run, pending))
+    })
+    .await
+    {
+        Ok(read) => read,
+        Err(BlockingOperationError::Operation(never)) => match never {},
+        Err(BlockingOperationError::WorkerUnavailable) => {
+            return Err(anyhow!("read the run's controls"));
+        }
+    };
+    attempt.run = Some(owned_run);
+    Ok(pending)
 }
 
 async fn complete_blocking_phase<Value>(
@@ -1957,6 +2093,39 @@ fn parse_parallelism(value: &str) -> Result<usize, String> {
         .ok()
         .filter(|value| (1..=MAXIMUM_PARALLEL_STEPS).contains(value))
         .ok_or_else(|| format!("value must be between 1 and {MAXIMUM_PARALLEL_STEPS}"))
+}
+
+/// REQ-LOCALRUN-209: a run's owner is a non-empty name.
+fn parse_owner(value: &str) -> Result<String, String> {
+    if value.is_empty() {
+        return Err("the owner must not be empty".to_owned());
+    }
+    Ok(value.to_owned())
+}
+
+/// REQ-LOCALRUN-209: `NAME=VALUE`, split at the first `=`, with `NAME` of the external
+/// reference form.
+fn parse_external(value: &str) -> Result<(String, String), String> {
+    let (name, value) = value
+        .split_once('=')
+        .ok_or_else(|| "expected NAME=VALUE".to_owned())?;
+    if !WorkflowRunRecord::is_external_name(name) {
+        return Err(
+            "NAME must be a lowercase letter followed by letters, digits or dots".to_owned(),
+        );
+    }
+    Ok((name.to_owned(), value.to_owned()))
+}
+
+/// REQ-LOCALRUN-209: the `--external` references by name, each named at most once.
+fn external_references(entries: &[(String, String)]) -> anyhow::Result<BTreeMap<String, String>> {
+    let mut references = BTreeMap::new();
+    for (name, value) in entries {
+        if references.insert(name.clone(), value.clone()).is_some() {
+            return Err(anyhow!("--external names `{name}` more than once"));
+        }
+    }
+    Ok(references)
 }
 
 fn required_agent_harnesses(
@@ -2384,6 +2553,15 @@ impl ChildRunDispatcher for LocalChildRunDispatcher {
         })
         .await
         .unwrap_or(false)
+    }
+
+    /// REQ-WFEXEC-73: a withdrawal recorded while the run is live, read under the run lock
+    /// this attempt holds. Controls that cannot be read withdraw nothing.
+    async fn withdrawal_pending(&self) -> bool {
+        let parent = Arc::clone(&self.parent);
+        blocking_operation(move || parent.run.withdrawal_pending())
+            .await
+            .unwrap_or(false)
     }
 }
 
@@ -5412,35 +5590,23 @@ mod tests {
             term: Some("xterm".into()),
             no_color: Some("1".into()),
         };
-        let command = Command {
-            id: None,
-            path: Some(PathBuf::from("source")),
-            workflow: None,
-            execution: super::super::LocalExecutionRoot {
-                execution_root: PathBuf::from("execution"),
-            },
-            run_dir: Some(PathBuf::from("run")),
-            agent_profiles: None,
-            inputs: super::super::super::super::NamedInputArgs {
-                input_text: Vec::new(),
-                input_text_file: Vec::new(),
-                input_json: Vec::new(),
-                input_json_file: Vec::new(),
-                input_file: Vec::new(),
-                input_attachment: Vec::new(),
-                input_attachments_empty: Vec::new(),
-            },
-            max_parallel: 2,
-            stop_before: None,
-            presentation: super::super::super::PresentationOptions {
-                plain: false,
-                output: super::super::super::super::JsonArgs {
-                    json: true,
-                    output: std::marker::PhantomData,
-                },
-                color: super::super::super::ColorArgument::Always,
-            },
-        };
+        let command = <Command as clap::FromArgMatches>::from_arg_matches(
+            &<Command as Args>::augment_args(clap::Command::new("create")).get_matches_from([
+                "create",
+                "--path",
+                "source",
+                "--execution-root",
+                "execution",
+                "--run-dir",
+                "run",
+                "--max-parallel",
+                "2",
+                "--json",
+                "--color",
+                "always",
+            ]),
+        )
+        .unwrap();
 
         assert_eq!(
             command.presentation_config_with(capabilities.clone()),

@@ -35,18 +35,79 @@ pub type RunLinearLifecycle = models::RunLinearLifecycle;
 pub type RunLinearLifecycleOwnershipEvent = models::RunLinearLifecycleOwnershipEvent;
 pub type RunLinearLifecycleUpdate = models::RunLinearLifecycleUpdate;
 pub(crate) type RunLinearLifecycleUpdateList = models::RunLinearLifecycleUpdateList;
-pub(crate) type RunLinearLifecycleRetryReceipt = models::RunLinearLifecycleRetryReceipt;
 pub type RunState = models::run::State;
 pub type RunCreationAcceptance = models::RunCreationAcceptance;
 pub type RunCreationPending = models::RunCreationPending;
+pub type RunDefinitionSelection = models::RunDefinitionSelection;
 pub type RunArtifactDelivery = models::RunArtifactDelivery;
-pub type ContinuationAdmissionViolation = models::ContinuationAdmissionViolation;
+/// A violation a refused continuation names, as `um` reports it: a code of the
+/// contract's `ContinuationAdmissionViolation` list, or a definition-backed run's
+/// refusal, which Cloud answers under a problem type of its own and `um` reports by
+/// the code of the same name (REQ-CONTINUE-83, REQ-CONTINUE-84, REQ-COMPAT-20).
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContinuationAdmissionViolation {
+    pub code: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recovery_reason: Option<models::RecoveryReason>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub node: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub producer: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reference: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prior_state: Option<String>,
+}
+
+impl From<models::ContinuationAdmissionViolation> for ContinuationAdmissionViolation {
+    fn from(violation: models::ContinuationAdmissionViolation) -> Self {
+        Self {
+            code: listed_violation_code(violation.code),
+            recovery_reason: violation.recovery_reason,
+            node: violation.node,
+            producer: violation.producer,
+            reference: violation.reference,
+            prior_state: violation.prior_state,
+        }
+    }
+}
+
+/// The wire code of a violation the contract lists.
+fn listed_violation_code(code: models::continuation_admission_violation::Code) -> &'static str {
+    use models::continuation_admission_violation::Code;
+    match code {
+        Code::ExpectedRunVersionConflict => "expected_run_version_conflict",
+        Code::ContinuationAttemptUnavailable => "continuation_attempt_unavailable",
+        Code::RetainedWorkspaceUnavailable => "retained_workspace_unavailable",
+        Code::OwnershipUnproven => "ownership_unproven",
+        Code::RunnerDiscovering => "runner_discovering",
+        Code::ContinuationInputsUnsatisfied => "continuation_inputs_unsatisfied",
+        Code::ContinuationNodesUnsatisfied => "continuation_nodes_unsatisfied",
+        Code::ContinuationReferencesUnsatisfied => "continuation_references_unsatisfied",
+    }
+}
+
+/// The code `um` reports a definition-backed run's refusal by, keyed by the
+/// problem type Cloud answers it under (REQ-CONTINUE-83, REQ-CONTINUE-84).
+fn definition_run_refusal_code(problem_type: &str) -> Option<&'static str> {
+    match problem_type {
+        "https://api.usefulmachinery.com/problems/definition-run-not-continuable" => {
+            Some("definition_run_not_continuable")
+        }
+        "https://api.usefulmachinery.com/problems/continuation-step-required" => {
+            Some("continuation_step_required")
+        }
+        "https://api.usefulmachinery.com/problems/tree-continuation-unavailable" => {
+            Some("tree_continuation_unavailable")
+        }
+        _ => None,
+    }
+}
 pub type RunContinuationEnvelope = models::RunContinuationEnvelope;
 pub type RunContinuationReceipt = models::RunContinuationReceipt;
 pub type RunContinuationRequest = models::RunContinuationRequest;
 pub type RunContinuationDefinition = models::RunContinuationRequestDefinition;
-pub type RunContinuationReplacement = models::RunContinuationRequestDefinitionOneOf;
-pub type RunContinuationReplacementSource = models::RunContinuationRequestDefinitionOneOfReplaced;
 pub type RunContinuationWorkspaceModified = models::RunContinuationWorkspaceModified;
 pub type RunRetryReceipt = models::RunRetryReceipt;
 pub type RunRetryState = models::run_retry_receipt::State;
@@ -64,6 +125,60 @@ pub type RunCancellationReceiptMode = models::run_cancellation_receipt::Mode;
 pub type RunCancellationEffectiveMode = models::run_cancellation::Mode;
 pub type RunCancellationResolutionKind = models::run_cancellation_resolution::Kind;
 pub type RunPublicationHandoffState = models::run_publication_handoff::State;
+pub type RunSubjectClaim = models::RunSubjectClaim;
+pub type RunSubjectClaimState = models::run_subject_claim::State;
+pub type RunTriggerDelivery = models::RunTriggerDelivery;
+pub type RunControl = models::RunControl;
+pub type RunControlRequest = models::RunControlRequest;
+pub type RunControlKind = models::RunControlKind;
+pub type RunControlWait = models::RunControlWait;
+pub type RunControlAnswer = models::RunControlAnswer;
+
+/// What an owner's release of a run's subject claim answered (REQ-CLOUDDEF-19): the claim
+/// released, or the conflict that refused the release and changed nothing.
+#[derive(Clone, Debug, PartialEq)]
+pub enum RunClaimRelease {
+    Released(Box<RunSubjectClaim>),
+    /// `claim-live`: the run is live and still holds its claim.
+    Live,
+    /// `claim-changed`: the named claim is not the run's current claim.
+    Changed,
+    /// The key was first used for another request.
+    IdempotencyConflict,
+}
+
+/// What a member's control for a definition-backed run answered (REQ-RUN-91): the control
+/// Cloud accepted, or the refusal that recorded nothing.
+#[derive(Clone, Debug, PartialEq)]
+pub enum RunControlSubmission {
+    Accepted(Box<RunControl>),
+    /// `run-not-live`: the run's current attempt holds no executing assignment.
+    RunNotLive,
+    /// `wait-not-current`: the control's wait is not the run's current wait.
+    WaitNotCurrent,
+    /// `control-too-large`: the control would exceed the runner's frame.
+    TooLarge,
+    /// The key was first used for another request.
+    IdempotencyConflict,
+}
+
+impl From<&models::RunWorkflowWait> for RunControlWait {
+    /// The wait a run's `workflowProgress.wait` names, as a control names it: its kind and
+    /// since.
+    fn from(wait: &models::RunWorkflowWait) -> Self {
+        use models::run_control_wait::Kind as Control;
+        use models::run_workflow_wait::Kind as Progress;
+        let kind = match wait.kind {
+            Progress::RunWorkflowWaitAnswer => Control::RunControlWaitAnswer,
+            Progress::RunWorkflowWaitApproval => Control::RunControlWaitApproval,
+            Progress::RunWorkflowWaitRepair => Control::RunControlWaitRepair,
+            Progress::RunWorkflowWaitStop => Control::RunControlWaitStop,
+            Progress::RunWorkflowWaitExternal => Control::RunControlWaitExternal,
+            Progress::RunWorkflowWaitChildren => Control::RunControlWaitChildren,
+        };
+        Self::new(kind, wait.since.clone())
+    }
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum RunRead {
@@ -73,16 +188,18 @@ pub enum RunRead {
 
 pub struct CreateRunInput<'a> {
     pub project_id: &'a str,
-    pub workflow_path: &'a str,
+    /// The definition of the project the run executes (REQ-CLOUDDEF-16).
+    pub definition: RunDefinitionSelection,
     pub source_branch: Option<&'a str>,
     pub workspace_branch: Option<&'a str>,
     pub workspace_commit: Option<&'a str>,
     pub display_name: Option<&'a str>,
     pub input_set_id: Option<&'a str>,
-    pub publish_export: Option<&'a str>,
-    pub publish_target: Option<super::publications::ExistingPublicationTarget<'a>>,
     pub integration_context: Option<&'a BTreeMap<String, String>>,
     pub maximum_parallel_steps: Option<u8>,
+    /// Starts the run with no owner (`owner` `none`); otherwise the request names no owner
+    /// and a human member's run is that member's (REQ-RUN-99).
+    pub unowned: bool,
 }
 
 pub struct RunListFilter<'a> {
@@ -145,10 +262,8 @@ impl<'a> RunApi<'a> {
         {
             return Err(RunFailure::InvalidInput);
         }
-        let mut request = models::CreateRunRequest::new(
-            input.project_id.to_owned(),
-            input.workflow_path.to_owned(),
-        );
+        let mut request = models::CreateRunRequest::new(input.project_id.to_owned());
+        request.definition = Some(Box::new(input.definition));
         request.source_branch = input.source_branch.map(str::to_owned);
         request.workspace_source = match (input.workspace_branch, input.workspace_commit) {
             (Some(branch), None) => Some(Box::new(
@@ -171,13 +286,6 @@ impl<'a> RunApi<'a> {
         };
         request.display_name = input.display_name.map(str::to_owned);
         request.input_set_id = input.input_set_id.map(|id| Some(id.to_owned()));
-        request.publication = input.publish_export.map(|name| {
-            let mut publication = models::RunPublicationRequest::new(name.to_owned());
-            publication.target = input
-                .publish_target
-                .map(|target| Box::new(super::publications::target_selection(target)));
-            Box::new(publication)
-        });
         request.integration_context = input.integration_context.map(|context| {
             Some(
                 context
@@ -187,6 +295,9 @@ impl<'a> RunApi<'a> {
             )
         });
         request.maximum_parallel_steps = input.maximum_parallel_steps.map(i32::from);
+        request.owner = input
+            .unowned
+            .then_some(models::create_run_request::Owner::CreateRunOwnerNone);
         let endpoint = self.collection_endpoint(organization);
         let response = self.send_api_request(
             StatusCode::ACCEPTED,
@@ -533,54 +644,189 @@ impl<'a> RunApi<'a> {
         decode_linear_lifecycle_update_list(self.read_response(endpoint.as_str(), None)?)
     }
 
-    /// Sends one keyed owner retry; transport recovery replays the same key, and
-    /// no unsuccessful replay establishes whether an ambiguous first request
-    /// opened the cycle.
-    pub fn retry_linear_lifecycle_update(
+    /// One page of the control trigger deliveries pinned to the definition-backed run
+    /// `run_id`, newest first, with the next page's cursor (REQ-TRIGGER-138); `limit` and
+    /// `cursor` select the page.
+    pub fn list_trigger_deliveries(
         &self,
         organization: &str,
         run_id: &str,
-        update_id: &str,
-        key: &str,
-        begin_dispatch: impl Fn() -> bool,
-    ) -> Result<RunLinearLifecycleRetryReceipt, RunFailure> {
-        let endpoint = format!(
-            "{}/{}/linear-lifecycle/updates/{}/retry",
+        limit: Option<u32>,
+        cursor: Option<&str>,
+    ) -> Result<(Vec<RunTriggerDelivery>, Option<String>), RunFailure> {
+        let mut endpoint = Url::parse(&format!(
+            "{}/{}/trigger-deliveries",
             self.collection_endpoint(organization),
-            apis::urlencode(run_id),
-            apis::urlencode(update_id)
-        );
-        let (response, ambiguous) = self
-            .send_api_request_with_statuses(
-                &[StatusCode::ACCEPTED],
-                Some(key),
-                begin_dispatch,
-                || {
-                    self.request(Method::POST, &endpoint)
-                        .header("Idempotency-Key", key)
-                },
-            )
-            .map_err(|(failure, ambiguous)| {
-                if ambiguous {
-                    RunFailure::LinearLifecycleRetryAcceptanceUnknown
-                } else {
-                    failure
-                }
-            })?;
-        if response.status != StatusCode::ACCEPTED {
-            return Err(if ambiguous {
-                RunFailure::LinearLifecycleRetryAcceptanceUnknown
-            } else {
-                classify_failure(&response, RunOperation::LinearLifecycleRetry)
-            });
+            apis::urlencode(run_id)
+        ))
+        .map_err(|_| RunFailure::protocol(false))?;
+        // Opening the query writes a `?` even when no pair follows.
+        if limit.is_some() || cursor.is_some() {
+            let mut query = endpoint.query_pairs_mut();
+            if let Some(limit) = limit {
+                query.append_pair("limit", &limit.to_string());
+            }
+            if let Some(cursor) = cursor {
+                query.append_pair("cursor", cursor);
+            }
+        }
+        let response = self.read_response(endpoint.as_str(), None)?;
+        if response.status != StatusCode::OK {
+            return Err(classify_failure(&response, RunOperation::Get));
         }
         require_media_type(&response, JSON_MEDIA_TYPE, false)?;
-        require_exact_header(response.idempotency_keys.iter(), key)?;
         require_exact_header(response.cache_controls.iter(), PRIVATE_CACHE_CONTROL)?;
-        let receipt: RunLinearLifecycleRetryReceipt =
+        let list: models::RunTriggerDeliveryList =
             serde_json::from_slice(&response.body).map_err(|_| RunFailure::protocol(false))?;
-        validate_linear_lifecycle_retry_receipt(&receipt, run_id, update_id)?;
-        Ok(receipt)
+        let valid_cursor = list
+            .next_cursor
+            .as_deref()
+            .is_none_or(|cursor| !cursor.is_empty() && cursor.len() <= 2048);
+        if valid_cursor
+            && list.items.iter().all(|delivery| {
+                um_support::valid_typed_id(&delivery.id, "wtd_")
+                    && um_support::valid_typed_id(&delivery.definition_id, "def_")
+                    && um_support::valid_typed_id(&delivery.claim.claim_id, "wsc_")
+                    && delivery.revision >= 1
+            })
+        {
+            Ok((list.items, list.next_cursor))
+        } else {
+            Err(RunFailure::protocol(false))
+        }
+    }
+
+    /// Releases the subject claim the definition-backed run `run_id` currently holds, as an
+    /// owner, under `key` (REQ-CLOUDDEF-19); the request is sent again under the same key
+    /// when its response is lost.
+    pub fn release_claim(
+        &self,
+        organization: &str,
+        run_id: &str,
+        key: &str,
+    ) -> Result<RunClaimRelease, RunFailure> {
+        let endpoint = format!(
+            "{}/{}/claim-release",
+            self.collection_endpoint(organization),
+            apis::urlencode(run_id)
+        );
+        let request = models::RunClaimReleaseRequest::new();
+        let response = self.send_api_request(
+            StatusCode::OK,
+            Some(key),
+            || true,
+            || {
+                self.request(Method::POST, &endpoint)
+                    .header("Idempotency-Key", key)
+                    .json(&request)
+            },
+        )?;
+        if response.status == StatusCode::CONFLICT {
+            let problem = problem::decode_header_parts(
+                &response.body,
+                response.status,
+                response.content_type.as_ref(),
+            )
+            .map_err(|_| RunFailure::protocol(false))?;
+            return match problem.r#type.as_str() {
+                "https://api.usefulmachinery.com/problems/claim-live" => Ok(RunClaimRelease::Live),
+                "https://api.usefulmachinery.com/problems/claim-changed" => {
+                    Ok(RunClaimRelease::Changed)
+                }
+                "https://api.usefulmachinery.com/problems/idempotency-conflict" => {
+                    Ok(RunClaimRelease::IdempotencyConflict)
+                }
+                // A refusal a later Cloud release names stays a conflict (REQ-COMPAT-20).
+                _ => Err(RunFailure::Conflict),
+            };
+        }
+        if response.status != StatusCode::OK {
+            return Err(classify_failure(&response, RunOperation::Get));
+        }
+        require_media_type(&response, JSON_MEDIA_TYPE, false)?;
+        require_exact_header(response.cache_controls.iter(), PRIVATE_CACHE_CONTROL)?;
+        let claim: RunSubjectClaim =
+            serde_json::from_slice(&response.body).map_err(|_| RunFailure::protocol(false))?;
+        if um_support::valid_typed_id(&claim.claim_id, "wsc_")
+            && claim.state == RunSubjectClaimState::RunSubjectClaimReleased
+        {
+            Ok(RunClaimRelease::Released(Box::new(claim)))
+        } else {
+            Err(RunFailure::protocol(false))
+        }
+    }
+
+    /// Asks Cloud to carry `request` to the runner executing the definition-backed run
+    /// `run_id` (REQ-RUN-91), under `key` (the `requestRunControl` operation); the request is
+    /// sent again under the same key when its response is lost.
+    pub fn request_control(
+        &self,
+        organization: &str,
+        run_id: &str,
+        key: &str,
+        request: &RunControlRequest,
+    ) -> Result<RunControlSubmission, RunFailure> {
+        let endpoint = format!(
+            "{}/{}/controls",
+            self.collection_endpoint(organization),
+            apis::urlencode(run_id)
+        );
+        let response = self.send_api_request(
+            StatusCode::ACCEPTED,
+            Some(key),
+            || true,
+            || {
+                self.request(Method::POST, &endpoint)
+                    .header("Idempotency-Key", key)
+                    .json(request)
+            },
+        )?;
+        if matches!(
+            response.status,
+            StatusCode::CONFLICT | StatusCode::UNPROCESSABLE_ENTITY
+        ) {
+            let problem = problem::decode_header_parts(
+                &response.body,
+                response.status,
+                response.content_type.as_ref(),
+            )
+            .map_err(|_| RunFailure::protocol(false))?;
+            return match (response.status, problem.r#type.as_str()) {
+                (StatusCode::CONFLICT, "https://api.usefulmachinery.com/problems/run-not-live") => {
+                    Ok(RunControlSubmission::RunNotLive)
+                }
+                (
+                    StatusCode::CONFLICT,
+                    "https://api.usefulmachinery.com/problems/wait-not-current",
+                ) => Ok(RunControlSubmission::WaitNotCurrent),
+                (
+                    StatusCode::CONFLICT,
+                    "https://api.usefulmachinery.com/problems/idempotency-conflict",
+                ) => Ok(RunControlSubmission::IdempotencyConflict),
+                (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "https://api.usefulmachinery.com/problems/control-too-large",
+                ) => Ok(RunControlSubmission::TooLarge),
+                // A refusal a later Cloud release names stays a conflict (REQ-COMPAT-20).
+                (StatusCode::CONFLICT, _) => Err(RunFailure::Conflict),
+                _ => Err(RunFailure::protocol(false)),
+            };
+        }
+        if response.status != StatusCode::ACCEPTED {
+            return Err(classify_failure(&response, RunOperation::Get));
+        }
+        require_media_type(&response, JSON_MEDIA_TYPE, false)?;
+        require_exact_header(response.cache_controls.iter(), PRIVATE_CACHE_CONTROL)?;
+        let control: RunControl =
+            serde_json::from_slice(&response.body).map_err(|_| RunFailure::protocol(false))?;
+        if um_support::valid_typed_id(&control.id, "rct_")
+            && control.run_id == run_id
+            && control.kind == request.kind
+        {
+            Ok(RunControlSubmission::Accepted(Box::new(control)))
+        } else {
+            Err(RunFailure::protocol(false))
+        }
     }
 
     pub fn cancel(
@@ -821,8 +1067,11 @@ pub enum RunFailure {
     RetryAmbiguousRateLimited,
     RetryAmbiguousAuthentication,
     ContinuationAcceptanceUnknown,
-    LinearLifecycleRetryAcceptanceUnknown,
-    ContinuationAdmissionInvalid(Vec<models::ContinuationAdmissionViolation>),
+    ContinuationAdmissionInvalid(Vec<ContinuationAdmissionViolation>),
+    /// A `path-run-retired` answer, `409` to a retry and `410` to a continuation: Cloud
+    /// no longer retries or continues a run created by workflow path (REQ-RETRY-35,
+    /// REQ-RETRY-52, REQ-CONTINUE-87).
+    PathRunRetired,
     Gone,
     Unreachable(UnreachableCategory),
     InputUploadRejected,
@@ -855,34 +1104,81 @@ impl RunFailure {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// A retry the Gateway refused with 409 (REQ-RETRY-35).
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RetryConflict {
-    TriggerSlot,
     Pending,
     Idempotency,
+    /// `subject-busy`: a live run of the definition holds the subject (REQ-CLOUDDEF-18).
+    SubjectBusy {
+        holder_run_id: String,
+    },
+    /// `subject-settled`: an exited run of the definition still holds the subject.
+    SubjectSettled {
+        holder_run_id: String,
+    },
 }
 
 pub(super) type ReceivedResponse = BufferedBlockingResponse;
 
+const PATH_RUN_RETIRED: &str = "https://api.usefulmachinery.com/problems/path-run-retired";
+
+/// A problem of `status` whose type is exactly `path-run-retired`; any other answer of that
+/// status keeps the operation's own classification. Cloud refuses a retry `409` and a
+/// continuation `410`.
+fn path_run_retired(response: &ReceivedResponse, status: StatusCode) -> bool {
+    response.status == status
+        && problem::decode_header_parts(
+            &response.body,
+            response.status,
+            response.content_type.as_ref(),
+        )
+        .is_ok_and(|problem| problem.r#type == PATH_RUN_RETIRED)
+}
+
 fn classify_retry_failure(response: &ReceivedResponse) -> RunFailure {
+    // Cloud refuses a retry of a run by workflow path 409 (REQ-RETRY-52).
+    if path_run_retired(response, StatusCode::CONFLICT) {
+        return RunFailure::PathRunRetired;
+    }
     if response.status == StatusCode::CONFLICT {
         return match problem::decode_header_parts(
             &response.body,
             response.status,
             response.content_type.as_ref(),
         ) {
-            Ok(problem) => match problem.r#type.as_str() {
-                "https://api.usefulmachinery.com/problems/trigger-active-run" => {
-                    RunFailure::RetryConflict(RetryConflict::TriggerSlot)
+            Ok(problem) => {
+                // A subject refusal names the run holding the subject; one without a valid
+                // holder is not a refusal this release can report.
+                let holder = || {
+                    problem
+                        .workflow
+                        .as_ref()
+                        .and_then(|detail| detail.holder_run_id.clone())
+                        .filter(|id| um_support::valid_typed_id(id, "run_"))
+                };
+                match problem.r#type.as_str() {
+                    "https://api.usefulmachinery.com/problems/run-retry-pending" => {
+                        RunFailure::RetryConflict(RetryConflict::Pending)
+                    }
+                    "https://api.usefulmachinery.com/problems/idempotency-conflict" => {
+                        RunFailure::RetryConflict(RetryConflict::Idempotency)
+                    }
+                    "https://api.usefulmachinery.com/problems/subject-busy" => {
+                        holder().map_or(RunFailure::protocol(false), |holder_run_id| {
+                            RunFailure::RetryConflict(RetryConflict::SubjectBusy { holder_run_id })
+                        })
+                    }
+                    "https://api.usefulmachinery.com/problems/subject-settled" => {
+                        holder().map_or(RunFailure::protocol(false), |holder_run_id| {
+                            RunFailure::RetryConflict(RetryConflict::SubjectSettled {
+                                holder_run_id,
+                            })
+                        })
+                    }
+                    _ => RunFailure::Conflict,
                 }
-                "https://api.usefulmachinery.com/problems/run-retry-pending" => {
-                    RunFailure::RetryConflict(RetryConflict::Pending)
-                }
-                "https://api.usefulmachinery.com/problems/idempotency-conflict" => {
-                    RunFailure::RetryConflict(RetryConflict::Idempotency)
-                }
-                _ => RunFailure::Conflict,
-            },
+            }
             Err(_) => RunFailure::protocol(false),
         };
     }
@@ -899,6 +1195,38 @@ fn classify_retry_failure(response: &ReceivedResponse) -> RunFailure {
         return RunFailure::RetryAfter(Duration::from_secs(delay));
     }
     classify_failure(response, RunOperation::Get)
+}
+
+/// A continuation admission refusal whose violations this release cannot all
+/// name: a later Gateway may add a code, and the request was still refused.
+/// The rest of the problem must decode as usual.
+fn names_unknown_continuation_violation(response: &ReceivedResponse) -> bool {
+    let Ok(serde_json::Value::Object(mut problem_object)) =
+        serde_json::from_slice::<serde_json::Value>(&response.body)
+    else {
+        return false;
+    };
+    let Some(serde_json::Value::Array(violations)) =
+        problem_object.remove("continuationViolations")
+    else {
+        return false;
+    };
+    !violations.is_empty()
+        && violations.iter().all(|violation| {
+            violation
+                .get("code")
+                .is_some_and(serde_json::Value::is_string)
+        })
+        && serde_json::to_vec(&problem_object)
+            .ok()
+            .and_then(|body| {
+                problem::decode_header_parts(&body, response.status, response.content_type.as_ref())
+                    .ok()
+            })
+            .is_some_and(|problem| {
+                problem.r#type
+                    == "https://api.usefulmachinery.com/problems/continuation-admission-invalid"
+            })
 }
 
 fn classify_continuation_failure(response: &ReceivedResponse) -> RunFailure {
@@ -918,19 +1246,18 @@ fn classify_continuation_failure(response: &ReceivedResponse) -> RunFailure {
                         !violations.is_empty()
                             && violations.iter().all(|violation| {
                                 violation.recovery_reason.is_none_or(|reason| {
-                                    let code = match violation.code {
-                                        models::continuation_admission_violation::Code::RetainedWorkspaceUnavailable => "retained_workspace_unavailable",
-                                        models::continuation_admission_violation::Code::OwnershipUnproven => "ownership_unproven",
-                                        _ => return false,
-                                    };
-                                    valid_recovery_reason_for_code(code, reason)
+                                    valid_recovery_reason_for_code(
+                                        listed_violation_code(violation.code),
+                                        reason,
+                                    )
                                 })
                             })
                     })
-                    .map_or(
-                        RunFailure::protocol(false),
-                        RunFailure::ContinuationAdmissionInvalid,
-                    )
+                    .map_or(RunFailure::protocol(false), |violations| {
+                        RunFailure::ContinuationAdmissionInvalid(
+                            violations.into_iter().map(Into::into).collect(),
+                        )
+                    })
             }
             Ok(problem)
                 if problem.r#type
@@ -938,9 +1265,24 @@ fn classify_continuation_failure(response: &ReceivedResponse) -> RunFailure {
             {
                 RunFailure::IdempotencyConflict
             }
-            Ok(_) => RunFailure::Conflict,
+            Ok(problem) => {
+                definition_run_refusal_code(&problem.r#type).map_or(RunFailure::Conflict, |code| {
+                    RunFailure::ContinuationAdmissionInvalid(vec![ContinuationAdmissionViolation {
+                        code,
+                        recovery_reason: None,
+                        node: None,
+                        producer: None,
+                        reference: None,
+                        prior_state: None,
+                    }])
+                })
+            }
+            Err(_) if names_unknown_continuation_violation(response) => RunFailure::Conflict,
             Err(_) => RunFailure::protocol(false),
         };
+    }
+    if path_run_retired(response, StatusCode::GONE) {
+        return RunFailure::PathRunRetired;
     }
     // A continuation names no input set, so a gone input is never an input
     // admission rejection here.
@@ -1120,7 +1462,6 @@ pub(super) enum RunOperation {
     Create,
     Get,
     Input,
-    LinearLifecycleRetry,
 }
 
 pub(super) fn classify_failure(response: &ReceivedResponse, operation: RunOperation) -> RunFailure {
@@ -1142,10 +1483,6 @@ pub(super) fn classify_failure(response: &ReceivedResponse, operation: RunOperat
         }
         StatusCode::NOT_FOUND => {
             validated_problem_failure(response, Some(NOT_FOUND), RunFailure::NotFound, false)
-        }
-        // Every retry rejection is one conflict, whatever problem type it carries.
-        StatusCode::CONFLICT if operation == RunOperation::LinearLifecycleRetry => {
-            validated_problem_failure(response, None, RunFailure::Conflict, false)
         }
         StatusCode::CONFLICT if matches!(operation, RunOperation::Create | RunOperation::Input) => {
             match problem::decode_header_parts(
@@ -2119,25 +2456,6 @@ fn decode_linear_lifecycle_update_list(
     }
 }
 
-// Mirrors cloudrun.LinearLifecycleRetryReceipt.Validate and binds the receipt to
-// the route it answers.
-fn validate_linear_lifecycle_retry_receipt(
-    receipt: &RunLinearLifecycleRetryReceipt,
-    run_id: &str,
-    update_id: &str,
-) -> Result<(), RunFailure> {
-    if receipt.run_id == run_id
-        && receipt.update_id == update_id
-        && receipt.cycle_number >= 2
-        && valid_timestamp(&receipt.accepted_at)
-        && valid_timestamp(&receipt.cycle_deadline)
-    {
-        Ok(())
-    } else {
-        Err(RunFailure::protocol(false))
-    }
-}
-
 // Mirrors cloudrun.LinearLifecycle.Validate: the schema closes the enums, but not
 // the reason and state pair, the attempt pair, the step-only event node, or the
 // latest update's own rules.
@@ -2211,41 +2529,6 @@ fn valid_recovery_reason_for_code(code: &str, reason: models::RecoveryReason) ->
 )]
 mod recovery_read_tests {
     use super::*;
-
-    #[test]
-    #[ignore = "requires the admitted Run API response supplied by the cross-component harness"]
-    fn admitted_gitlab_run_response_decodes_in_cli() {
-        let file = std::env::var("UM_GITLAB_ADMITTED_API_FILE").unwrap();
-        let document: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(file).unwrap()).unwrap();
-        let run_id = document["id"].as_str().unwrap();
-        let expected = document["sourceDisplaySnapshot"].clone();
-        let encoded = serde_json::to_vec(&document).unwrap();
-        assert!(valid_recovery_json_shape(&encoded));
-        let typed: Run = serde_json::from_slice(&encoded).unwrap();
-        assert!(validate_run(typed, run_id).is_ok());
-        let response = decode_get_response(
-            BufferedBlockingResponse {
-                status: StatusCode::OK,
-                content_type: Some(HeaderValue::from_static("application/json")),
-                idempotency_keys: vec![],
-                locations: vec![],
-                cache_controls: vec![HeaderValue::from_static(PRIVATE_CACHE_CONTROL)],
-                retry_afters: vec![],
-                request_ids: vec![],
-                body: serde_json::to_vec(&document).unwrap(),
-            },
-            run_id,
-        )
-        .unwrap();
-        assert!(matches!(response, RunRead::Materialized(_)));
-        if let RunRead::Materialized(run) = response {
-            assert_eq!(
-                serde_json::to_value(run.as_ref()).unwrap()["sourceDisplaySnapshot"],
-                expected,
-            );
-        }
-    }
 
     // REQ-WORKSPACE-11, REQ-WORKSPACE-31
     #[test]
@@ -2393,8 +2676,7 @@ mod recovery_read_tests {
             classify_continuation_failure(&response("ownership_unproven", "host_identity_mismatch")),
             RunFailure::ContinuationAdmissionInvalid(violations)
                 if violations.len() == 1
-                    && violations[0].code
-                        == models::continuation_admission_violation::Code::OwnershipUnproven
+                    && violations[0].code == "ownership_unproven"
                     && violations[0].recovery_reason
                         == Some(models::RecoveryReason::HostIdentityMismatch)
         ));
@@ -2404,7 +2686,91 @@ mod recovery_read_tests {
         ));
     }
 
-    // REQ-RUNINPUT-59, REQ-CONTINUE-72
+    // REQ-CONTINUE-84: a newer Gateway may refuse with a code this release
+    // does not name; that is still a refusal, not a protocol failure.
+    #[test]
+    fn continuation_violation_code_unknown_to_this_release_is_a_conflict() {
+        let response = |code: &str| BufferedBlockingResponse {
+            status: StatusCode::CONFLICT,
+            content_type: Some(HeaderValue::from_static("application/problem+json")),
+            idempotency_keys: vec![],
+            locations: vec![],
+            cache_controls: vec![],
+            retry_afters: vec![],
+            request_ids: vec![],
+            body: serde_json::to_vec(&serde_json::json!({
+                "type": "https://api.usefulmachinery.com/problems/continuation-admission-invalid",
+                "title": "Admission invalid", "status": 409,
+                "continuationViolations": [{"code": code}]
+            }))
+            .unwrap(),
+        };
+        assert!(matches!(
+            classify_continuation_failure(&response("continuation_nodes_unsatisfied")),
+            RunFailure::ContinuationAdmissionInvalid(violations)
+                if violations[0].code == "continuation_nodes_unsatisfied"
+        ));
+        assert!(matches!(
+            classify_continuation_failure(&response("a_code_from_a_later_release")),
+            RunFailure::Conflict
+        ));
+        let mut malformed = response("continuation_nodes_unsatisfied");
+        malformed.body = serde_json::to_vec(&serde_json::json!({
+            "type": "https://api.usefulmachinery.com/problems/continuation-admission-invalid",
+            "title": "Admission invalid", "status": 409,
+            "continuationViolations": [{"code": 7}]
+        }))
+        .unwrap();
+        assert!(matches!(
+            classify_continuation_failure(&malformed),
+            RunFailure::Protocol { .. }
+        ));
+    }
+
+    // REQ-CONTINUE-83, REQ-CONTINUE-84, REQ-COMPAT-20: Cloud answers a
+    // definition-backed run's refusal under a problem type of its own, which
+    // this release reports by the code of the same name.
+    #[test]
+    fn a_definition_run_continuation_refusal_type_is_reported_by_its_code() {
+        for (slug, code) in [
+            (
+                "definition-run-not-continuable",
+                "definition_run_not_continuable",
+            ),
+            ("continuation-step-required", "continuation_step_required"),
+            (
+                "tree-continuation-unavailable",
+                "tree_continuation_unavailable",
+            ),
+        ] {
+            let response = BufferedBlockingResponse {
+                status: StatusCode::CONFLICT,
+                content_type: Some(HeaderValue::from_static("application/problem+json")),
+                idempotency_keys: vec![],
+                locations: vec![],
+                cache_controls: vec![],
+                retry_afters: vec![],
+                request_ids: vec![],
+                body: serde_json::to_vec(&serde_json::json!({
+                    "type": format!("https://api.usefulmachinery.com/problems/{slug}"),
+                    "title": "Refused", "status": 409
+                }))
+                .unwrap(),
+            };
+            assert!(
+                matches!(
+                    classify_continuation_failure(&response),
+                    RunFailure::ContinuationAdmissionInvalid(violations)
+                        if violations.len() == 1
+                            && violations[0].code == code
+                            && violations[0].node.is_none()
+                ),
+                "{slug}"
+            );
+        }
+    }
+
+    // REQ-RUNINPUT-59
     #[test]
     fn gone_input_content_is_a_create_admission_rejection_and_a_gone_continuation() {
         let response = BufferedBlockingResponse {
@@ -2660,9 +3026,9 @@ mod recovery_read_tests {
         );
     }
 
-    // REQ-RUN-84
+    // REQ-RUN-84, REQ-RUN-99
     #[test]
-    fn create_sends_the_parallel_step_limit_only_when_asked() {
+    fn create_sends_the_parallel_step_limit_and_no_owner_only_when_asked() {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let body = br#"{"type":"https://api.usefulmachinery.com/problems/validation-failed","title":"Invalid","status":400}"#;
         let mut response = format!(
@@ -2683,22 +3049,23 @@ mod recovery_read_tests {
             &storage,
         )
         .unwrap();
-        for maximum_parallel_steps in [Some(4), None] {
+        for (maximum_parallel_steps, unowned) in [(Some(4), true), (None, false)] {
             let _ = api.create(
                 "acme",
                 "fixture-key",
                 CreateRunInput {
                     project_id: "prj_01k0z6r1w8f4jy2m7q9v3x5abc",
-                    workflow_path: ".um/workflows/build.yaml",
+                    definition: RunDefinitionSelection::new(
+                        "def_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned(),
+                    ),
                     source_branch: None,
                     workspace_branch: None,
                     workspace_commit: None,
                     display_name: None,
                     input_set_id: None,
-                    publish_export: None,
-                    publish_target: None,
                     integration_context: None,
                     maximum_parallel_steps,
+                    unowned,
                 },
                 || true,
             );
@@ -2709,7 +3076,9 @@ mod recovery_read_tests {
             .map(|request| serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap())
             .collect();
         assert_eq!(bodies[0]["maximumParallelSteps"], serde_json::json!(4));
+        assert_eq!(bodies[0]["owner"], serde_json::json!("none"));
         assert!(bodies[1].get("maximumParallelSteps").is_none());
+        assert!(bodies[1].get("owner").is_none());
     }
 
     // REQ-RUN-80
@@ -2752,6 +3121,139 @@ mod recovery_read_tests {
                 request_id: None,
             }
         );
+    }
+
+    // REQ-RETRY-52, REQ-COMPAT-20: Cloud refuses a retry of a run by workflow
+    // path as a 409 conflict, which this release names and an earlier one
+    // reports as a conflict; a 409 of a type this release does not name stays
+    // a conflict.
+    #[test]
+    fn path_run_retired_retry_conflict_is_named_and_an_unknown_conflict_stays_one() {
+        assert_eq!(
+            classify_retry_failure(&create_problem_response(
+                StatusCode::CONFLICT,
+                "path-run-retired",
+                &[],
+            )),
+            RunFailure::PathRunRetired
+        );
+        assert_eq!(
+            classify_retry_failure(&create_problem_response(
+                StatusCode::CONFLICT,
+                "a-conflict-from-a-later-release",
+                &[],
+            )),
+            RunFailure::Conflict
+        );
+    }
+
+    /// An API client whose one request is answered `409` under a problem type this
+    /// release does not name.
+    fn unnamed_conflict_server() -> (um_test_support::ScriptedHttpServer, HttpClient) {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let body = br#"{"type":"https://api.usefulmachinery.com/problems/a-conflict-from-a-later-release","title":"Refused","status":409}"#;
+        let mut response = format!(
+            "HTTP/1.1 409 Conflict\r\nContent-Type: application/problem+json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        response.extend_from_slice(body);
+        let server = um_test_support::ScriptedHttpServer::respond_in_sequence(vec![response]);
+        let storage = HttpClient::new(HttpTransportPolicy::AllowInsecureHttp).unwrap();
+        (server, storage)
+    }
+
+    // REQ-COMPAT-20: a refusal of a claim release the released vocabulary does not
+    // name is a conflict, not a protocol failure.
+    #[test]
+    fn release_claim_reports_an_unnamed_conflict_as_a_conflict() {
+        let (server, storage) = unnamed_conflict_server();
+        let api = RunApi::new(
+            &server.api_url,
+            "fixture-token",
+            HttpTransportPolicy::AllowInsecureHttp,
+            &storage,
+        )
+        .unwrap();
+        assert_eq!(
+            api.release_claim("acme", "run_01k0z6r1w8f4jy2m7q9v3x5abc", "fixture-key"),
+            Err(RunFailure::Conflict)
+        );
+        assert_eq!(server.finish().len(), 1);
+    }
+
+    // REQ-COMPAT-20: a refusal of a run control the released vocabulary does not
+    // name is a conflict, not a protocol failure.
+    #[test]
+    fn request_control_reports_an_unnamed_conflict_as_a_conflict() {
+        let (server, storage) = unnamed_conflict_server();
+        let api = RunApi::new(
+            &server.api_url,
+            "fixture-token",
+            HttpTransportPolicy::AllowInsecureHttp,
+            &storage,
+        )
+        .unwrap();
+        assert_eq!(
+            api.request_control(
+                "acme",
+                "run_01k0z6r1w8f4jy2m7q9v3x5abc",
+                "fixture-key",
+                &RunControlRequest::new(RunControlKind::RunControlKindApprove),
+            ),
+            Err(RunFailure::Conflict)
+        );
+        assert_eq!(server.finish().len(), 1);
+    }
+
+    // REQ-COMPAT-20: a page longer than the 100-item `limit` maximum this release requests
+    // is still an answer it reads.
+    #[test]
+    fn a_trigger_delivery_page_of_any_length_decodes() {
+        let length = 101;
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let delivery = serde_json::json!({
+            "id": "wtd_01k0z6r1w8f4jy2m7q9v3x5abc", "definitionId": "def_01k0z6r1w8f4jy2m7q9v3x5abc",
+            "revision": 3, "triggerName": "withdraw-on-hold",
+            "connectionId": "lnc_01k0z6r1w8f4jy2m7q9v3x5abc",
+            "eventName": "issue.state_entered",
+            "event": {
+                "issue": {"id": "issue-7", "identifier": "AUTO-7"},
+                "issueUpdatedAt": "2026-08-10T12:04:30Z", "team": "team-1",
+                "state": "state-closed", "actor": null, "at": "2026-08-10T12:04:30Z",
+            },
+            "claim": {"claimId": "wsc_01k0z6r1w8f4jy2m7q9v3x5abc", "issueId": "issue-7",
+                      "observation": {"teamId": "team-1", "stateId": "state-todo", "updatedAt": null}},
+            "state": "skipped", "action": null, "reason": "run_exited", "observation": null,
+            "acceptedAt": "2026-08-10T12:04:31Z", "deliveredAt": "2026-08-10T12:04:32Z",
+            "settledAt": "2026-08-10T12:04:33Z",
+        });
+        let body = serde_json::to_vec(&serde_json::json!({
+            "items": vec![delivery; length],
+            "nextCursor": "older-deliveries",
+        }))
+        .unwrap();
+        let mut response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nCache-Control: {PRIVATE_CACHE_CONTROL}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        response.extend_from_slice(&body);
+        let server = um_test_support::ScriptedHttpServer::respond(response);
+        let storage = HttpClient::new(HttpTransportPolicy::AllowInsecureHttp).unwrap();
+        let api = RunApi::new(
+            &server.api_url,
+            "fixture-token",
+            HttpTransportPolicy::AllowInsecureHttp,
+            &storage,
+        )
+        .unwrap();
+        let (items, cursor) = api
+            .list_trigger_deliveries("acme", "run_01k0z6r1w8f4jy2m7q9v3x5abc", None, None)
+            .unwrap();
+        assert_eq!(items.len(), length);
+        assert_eq!(cursor.as_deref(), Some("older-deliveries"));
+        server.finish_one();
     }
 
     // REQ-RUN-80
@@ -3002,7 +3504,7 @@ mod linear_lifecycle_tests {
             .is_ok_and(|view| validate_linear_lifecycle(&view))
     }
 
-    // REQ-TRIGGER-107
+    // REQ-TRIGGER-145
     #[test]
     fn linear_lifecycle_accepts_exactly_the_reason_and_state_table() {
         for state in STATES {
@@ -3025,7 +3527,7 @@ mod linear_lifecycle_tests {
         assert!(!accepted(&view("released", None)));
     }
 
-    // REQ-TRIGGER-107
+    // REQ-TRIGGER-145
     #[test]
     fn linear_lifecycle_refuses_half_attempts_stray_nodes_and_bad_identities() {
         let event = serde_json::json!({
@@ -3142,7 +3644,7 @@ mod linear_lifecycle_tests {
         view
     }
 
-    // REQ-TRIGGER-111
+    // REQ-TRIGGER-145
     #[test]
     fn linear_lifecycle_update_accepts_exactly_the_reason_and_state_table() {
         for state in UPDATE_STATES {
@@ -3165,7 +3667,7 @@ mod linear_lifecycle_tests {
         assert!(!accepted(&with_update("queued", None)));
     }
 
-    // REQ-TRIGGER-111
+    // REQ-TRIGGER-145
     #[test]
     fn linear_lifecycle_update_refuses_stray_members() {
         let mut complete = with_update("retry_waiting", Some("outcome_unresolved"));
@@ -3221,7 +3723,7 @@ mod linear_lifecycle_tests {
         );
     }
 
-    // REQ-TRIGGER-111
+    // REQ-TRIGGER-145
     #[test]
     fn linear_lifecycle_update_refuses_an_empty_diagnostic() {
         let mut exhausted = with_update("failed", Some("retry_exhausted"));
@@ -3266,7 +3768,7 @@ mod linear_lifecycle_tests {
         }
     }
 
-    // REQ-TRIGGER-118, REQ-TRIGGER-111
+    // REQ-TRIGGER-145
     #[test]
     fn linear_lifecycle_history_accepts_only_valid_pages() {
         let update =
@@ -3315,7 +3817,7 @@ mod linear_lifecycle_tests {
         }));
     }
 
-    // REQ-TRIGGER-107
+    // REQ-TRIGGER-145
     #[test]
     fn linear_lifecycle_invalid_view_makes_the_run_read_invalid() {
         let mut document: serde_json::Value = serde_json::from_str(include_str!(

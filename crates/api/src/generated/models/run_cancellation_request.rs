@@ -19,11 +19,14 @@ use serde::{Deserialize, Serialize};
 pub struct RunCancellationRequest {
     #[serde(rename = "mode")]
     pub mode: Mode,
+    /// Records `workflowOutcome` `withdrawn` rather than `canceled` when a definition-backed run is cancelled before any runner starts it. Ignored once a runner has started the run, and for a run by `workflowPath`.
+    #[serde(rename = "intent", skip_serializing_if = "Option::is_none")]
+    pub intent: Option<Intent>,
 }
 
 impl RunCancellationRequest {
     pub fn new(mode: Mode) -> RunCancellationRequest {
-        RunCancellationRequest { mode }
+        RunCancellationRequest { mode, intent: None }
     }
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
@@ -37,5 +40,17 @@ pub enum Mode {
 impl Default for Mode {
     fn default() -> Mode {
         Self::Graceful
+    }
+}
+/// Records `workflowOutcome` `withdrawn` rather than `canceled` when a definition-backed run is cancelled before any runner starts it. Ignored once a runner has started the run, and for a run by `workflowPath`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
+pub enum Intent {
+    #[serde(rename = "withdraw")]
+    Withdraw,
+}
+
+impl Default for Intent {
+    fn default() -> Intent {
+        Self::Withdraw
     }
 }

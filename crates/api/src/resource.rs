@@ -101,18 +101,6 @@ pub(crate) fn receive_closed_json_response<T: serde::de::DeserializeOwned + serd
     decode_closed_json(&body)
 }
 
-pub(crate) fn receive_confirmed_json_response<T: serde::de::DeserializeOwned + serde::Serialize>(
-    request: reqwest::blocking::RequestBuilder,
-    expected_status: StatusCode,
-    key: &str,
-    vocabulary: &ProblemVocabulary,
-) -> Result<T, ResourceFailure> {
-    let (body, headers) = receive_response(request, expected_status, vocabulary)?;
-    validate_mutation_key(&headers, key)?;
-    validate_json_media_type(&headers)?;
-    decode_closed_json(&body)
-}
-
 pub(crate) fn validate_mutation_key(
     headers: &reqwest::header::HeaderMap,
     key: &str,

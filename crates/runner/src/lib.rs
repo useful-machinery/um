@@ -37,8 +37,10 @@ pub use doctor::{
 };
 pub use enrollment::{
     ActivationArtifact, ActivationArtifactParts, EnrollmentError, EnrollmentOutcome,
-    EnrollmentResponse, ReplacementDisposition, enroll, load_control_socket_path,
-    replacement_disposition, write_activation_file,
+    EnrollmentResponse, JoinKeyArtifact, JoinOutcome, JoinRefusal, PrivateArtifactError,
+    PrivateArtifactFile, ReplacementDisposition, enroll, join_unless_enrolled,
+    load_control_socket_path, remove_completed_join_journal, replacement_disposition,
+    write_activation_file,
 };
 pub use service::{Config, ConfigError};
 

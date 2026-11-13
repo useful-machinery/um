@@ -475,8 +475,12 @@ fn resume_finishes_after_state_commits_before_journal_removal() {
     let fixture = EnrollmentFixture::new(&server, ACTIVATION_ID, future_time());
     let state_directory = fixture.state_path.parent().expect("state directory");
     ensure_private_directory(state_directory).expect("create state directory");
-    let journal = stage_journal(&fixture.journal_path(), fixture.artifact.clone(), false)
-        .expect("stage journal");
+    let journal = stage_journal(
+        &fixture.journal_path(),
+        EnrollmentTarget::Activation(fixture.artifact.clone()),
+        false,
+    )
+    .expect("stage journal");
     let response: EnrollmentResponse =
         serde_json::from_value(enrollment_response_document()).expect("decode enrollment response");
     persist_enrollment_state(
@@ -523,8 +527,12 @@ fn replacement_resume_recognizes_a_startup_promotion_before_journal_cleanup() {
         }),
     )
     .expect("write current runner state");
-    let journal = stage_journal(&fixture.journal_path(), fixture.artifact.clone(), true)
-        .expect("stage replacement journal");
+    let journal = stage_journal(
+        &fixture.journal_path(),
+        EnrollmentTarget::Activation(fixture.artifact.clone()),
+        true,
+    )
+    .expect("stage replacement journal");
     let response: EnrollmentResponse = serde_json::from_value(
         enrollment_response_document_with_credential(REPLACEMENT_CREDENTIAL_ID),
     )
@@ -566,7 +574,7 @@ fn replacement_resume_recognizes_a_startup_promotion_before_journal_cleanup() {
 fn journal_rejects_a_verifier_that_does_not_match_its_secret() {
     let journal = EnrollmentJournal {
         schema_version: 1,
-        activation_artifact: ActivationArtifact {
+        target: EnrollmentTarget::Activation(ActivationArtifact {
             schema_version: 1,
             activation_url: format!(
                 "https://api.usefulmachinery.com/v1/runner-enrollments/{ACTIVATION_ID}/activate"
@@ -574,7 +582,7 @@ fn journal_rejects_a_verifier_that_does_not_match_its_secret() {
             activation_token: format!("{ACTIVATION_ID}.{ACTIVATION_SECRET}"),
             runner_id: RUNNER_ID.to_owned(),
             expires_at: future_time(),
-        },
+        }),
         credential_secret: ACTIVATION_SECRET.to_owned(),
         credential_secret_verifier: ACTIVATION_SECRET.to_owned(),
         idempotency_key: "enrollment-idempotency".to_owned(),
@@ -599,8 +607,12 @@ fn resume_sends_an_expired_journal_instead_of_applying_local_expiry() {
 
     let state_directory = fixture.state_path.parent().expect("state directory");
     ensure_private_directory(state_directory).expect("create state directory");
-    stage_journal(&fixture.journal_path(), fixture.artifact.clone(), false)
-        .expect("stage expired journal");
+    stage_journal(
+        &fixture.journal_path(),
+        EnrollmentTarget::Activation(fixture.artifact.clone()),
+        false,
+    )
+    .expect("stage expired journal");
     let outcome = enroll(None, &fixture.config_path, false, true).expect("resume expired journal");
     assert!(matches!(outcome, EnrollmentOutcome::Enrolled { .. }));
     assert!(!fixture.journal_path().exists());
@@ -909,4 +921,343 @@ fn expired_time() -> String {
     (um_support::utc_now() - time::Duration::days(3))
         .format(&Rfc3339)
         .expect("format expired time")
+}
+
+const JOIN_KEY_ID: &str = "rjk_01k0z6r1w8f4jy2m7q9v3x5abc";
+const OTHER_JOIN_KEY_ID: &str = "rjk_01k0z6r1w8f4jy2m7q9v3x5abd";
+const JOIN_SECRET: &str = "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc";
+
+fn join_key(server: &ScriptedHttpServer, join_key_id: &str, expires_at: &str) -> JoinKeyArtifact {
+    let base = server.api_url.trim_end_matches("/api/");
+    JoinKeyArtifact::parse(
+        serde_json::json!({
+            "schemaVersion": 1,
+            "joinUrl": format!("{base}/v1/runner-join-keys/{join_key_id}/join"),
+            "joinKeyId": join_key_id,
+            "joinToken": format!("{join_key_id}.{JOIN_SECRET}"),
+            "expiresAt": expires_at
+        })
+        .to_string()
+        .as_bytes(),
+    )
+    .expect("parse join key")
+}
+
+fn assert_schema_rejects(format: &str, schema_source: &str, document: &serde_json::Value) {
+    let schema: serde_json::Value =
+        serde_json::from_str(schema_source).expect("decode mirrored runner host schema");
+    let validator = jsonschema::draft202012::new(&schema).expect("compile runner host schema");
+    assert!(
+        !validator.is_valid(document),
+        "{format} schema accepted {document}"
+    );
+}
+
+// REQ-RUNNERENROLL-97
+#[test]
+fn an_interrupted_join_keeps_a_token_free_journal_and_resumes_the_same_request() {
+    let server = ScriptedHttpServer::respond_in_sequence(vec![
+        empty_response("400 Bad Request"),
+        enrollment_response(),
+    ]);
+    let fixture = EnrollmentFixture::new(&server, ACTIVATION_ID, future_time());
+
+    assert!(matches!(
+        join_unless_enrolled(
+            &fixture.config_path,
+            join_key(&server, JOIN_KEY_ID, &future_time())
+        ),
+        Err(EnrollmentError::InvalidResponse)
+    ));
+    let journal_bytes = fs::read(fixture.journal_path()).expect("read staged join journal");
+    assert_json_matches_schema(
+        "runner enrollment journal",
+        ENROLLMENT_JOURNAL_SCHEMA,
+        &journal_bytes,
+    );
+    let journal_document: serde_json::Value =
+        serde_json::from_slice(&journal_bytes).expect("decode join journal");
+    assert_eq!(journal_document["joinKey"]["joinKeyId"], JOIN_KEY_ID);
+    assert!(journal_document.get("activationArtifact").is_none());
+    assert!(!String::from_utf8_lossy(&journal_bytes).contains(JOIN_SECRET));
+    assert!(!fixture.state_path.exists());
+
+    let outcome = join_unless_enrolled(
+        &fixture.config_path,
+        join_key(&server, JOIN_KEY_ID, &expired_time()),
+    )
+    .expect("resume the staged join even after the key's expiry");
+    assert!(matches!(outcome, JoinOutcome::Joined(_)));
+    assert!(!fixture.journal_path().exists());
+    let state_bytes = fs::read(&fixture.state_path).expect("read joined state");
+    assert_json_matches_schema("runner state", RUNNER_STATE_SCHEMA, &state_bytes);
+    assert!(!String::from_utf8_lossy(&state_bytes).contains(JOIN_SECRET));
+    let state: RunnerState = serde_json::from_slice(&state_bytes).expect("decode joined state");
+    assert_eq!(
+        state.current_credential.join_key_id.as_deref(),
+        Some(JOIN_KEY_ID)
+    );
+    assert_eq!(state.current_credential.activation_id, None);
+    let service = load_runner_service_configuration(&fixture.config_path)
+        .expect("serve with the joined state");
+    assert_eq!(service.credential_id, CREDENTIAL_ID);
+
+    let requests = server.finish();
+    assert_eq!(request_body(&requests[0]), request_body(&requests[1]));
+    assert_eq!(
+        request_header(&requests[0], "idempotency-key"),
+        request_header(&requests[1], "idempotency-key")
+    );
+    for request in &requests {
+        assert_eq!(
+            request_header(request, "authorization"),
+            format!("Bearer {JOIN_KEY_ID}.{JOIN_SECRET}")
+        );
+    }
+}
+
+// REQ-RUNNERENROLL-97, REQ-RUNNERENROLL-24
+#[test]
+fn a_staged_join_names_its_journal_and_key_to_a_start_with_another_key_or_an_enrollment() {
+    let server = ScriptedHttpServer::respond_in_sequence(vec![empty_response("400 Bad Request")]);
+    let fixture = EnrollmentFixture::new(&server, ACTIVATION_ID, future_time());
+    assert!(matches!(
+        join_unless_enrolled(
+            &fixture.config_path,
+            join_key(&server, JOIN_KEY_ID, &future_time())
+        ),
+        Err(EnrollmentError::InvalidResponse)
+    ));
+    let journal = fs::read(fixture.journal_path()).expect("read staged join journal");
+    let staged = |error: EnrollmentError| match error {
+        EnrollmentError::JoinJournalForAnotherKey {
+            journal,
+            join_key_id,
+        }
+        | EnrollmentError::UnresolvedJoin {
+            journal,
+            join_key_id,
+        } => (journal, join_key_id),
+        other => panic!("expected the staged join's facts, got {other:?}"),
+    };
+    let expected = (fixture.journal_path(), JOIN_KEY_ID.to_owned());
+
+    // The journal was written before the request was sent, so Cloud may have
+    // registered a runner from it: another key cannot supersede it.
+    let error = join_unless_enrolled(
+        &fixture.config_path,
+        join_key(&server, OTHER_JOIN_KEY_ID, &future_time()),
+    )
+    .expect_err("another key cannot supersede a staged join");
+    assert!(matches!(
+        error,
+        EnrollmentError::JoinJournalForAnotherKey { .. }
+    ));
+    assert_eq!(staged(error), expected);
+
+    // Enrollment, resumed or with an activation, cannot resolve it either.
+    let resumed = enroll(None, &fixture.config_path, false, true)
+        .expect_err("enrollment's resume cannot send a join");
+    assert!(matches!(resumed, EnrollmentError::UnresolvedJoin { .. }));
+    assert_eq!(staged(resumed), expected);
+    let activated = enroll(
+        Some(&fixture.activation_path),
+        &fixture.config_path,
+        false,
+        false,
+    )
+    .expect_err("an activation cannot supersede a staged join");
+    assert!(matches!(activated, EnrollmentError::UnresolvedJoin { .. }));
+    assert_eq!(staged(activated), expected);
+
+    assert_eq!(
+        fs::read(fixture.journal_path()).expect("reread staged join journal"),
+        journal
+    );
+    assert!(!fixture.state_path.exists());
+    assert_eq!(server.finish().len(), 1);
+}
+
+// REQ-RUNNERENROLL-97
+#[test]
+fn a_resent_join_answered_unauthorized_keeps_and_names_its_journal() {
+    let server = ScriptedHttpServer::respond_in_sequence(vec![
+        empty_response("400 Bad Request"),
+        empty_response("401 Unauthorized"),
+    ]);
+    let fixture = EnrollmentFixture::new(&server, ACTIVATION_ID, future_time());
+    assert!(matches!(
+        join_unless_enrolled(
+            &fixture.config_path,
+            join_key(&server, JOIN_KEY_ID, &future_time())
+        ),
+        Err(EnrollmentError::InvalidResponse)
+    ));
+    let journal = fs::read(fixture.journal_path()).expect("read staged join journal");
+
+    let error = join_unless_enrolled(
+        &fixture.config_path,
+        join_key(&server, JOIN_KEY_ID, &future_time()),
+    )
+    .expect_err("Cloud rejected the resent join's token");
+
+    // The first send may have registered a runner, so the refusal keeps the
+    // journal for the join to be completed or cleaned up deliberately.
+    assert!(
+        fixture.journal_path().exists(),
+        "the refusal removed the journal"
+    );
+    assert_eq!(
+        fs::read(fixture.journal_path()).expect("reread staged join journal"),
+        journal
+    );
+    let EnrollmentError::StagedJoinUnauthorized {
+        journal,
+        join_key_id,
+    } = error
+    else {
+        panic!("expected the staged join's refusal, got {error:?}");
+    };
+    assert_eq!(
+        (journal, join_key_id),
+        (fixture.journal_path(), JOIN_KEY_ID.to_owned())
+    );
+    assert!(!fixture.state_path.exists());
+    assert_eq!(server.finish().len(), 2);
+}
+
+// REQ-RUNNERENROLL-97
+#[test]
+fn an_enrolled_host_removes_a_join_journal_its_state_already_holds() {
+    let server = ScriptedHttpServer::respond_in_sequence(Vec::new());
+    let fixture = EnrollmentFixture::new(&server, ACTIVATION_ID, future_time());
+    let key = join_key(&server, JOIN_KEY_ID, &future_time());
+    let state_directory = fixture.state_path.parent().expect("state directory");
+    ensure_private_directory(state_directory).expect("create state directory");
+    let journal =
+        stage_join(&fixture.journal_path(), &key, DeploymentMode::Development).expect("stage join");
+    let response: EnrollmentResponse =
+        serde_json::from_value(enrollment_response_document()).expect("decode response");
+    persist_enrollment_state(
+        &fixture.state_path,
+        &journal,
+        &response,
+        DeploymentMode::Development,
+    )
+    .expect("persist joined state");
+
+    assert!(matches!(
+        join_unless_enrolled(&fixture.config_path, key),
+        Ok(JoinOutcome::AlreadyEnrolled)
+    ));
+    assert!(!fixture.journal_path().exists());
+    assert!(server.finish().is_empty());
+}
+
+// REQ-RUNNERENROLL-97
+#[test]
+fn host_files_name_exactly_one_activation_or_join_key() {
+    let credential = |origin: serde_json::Value| {
+        let mut credential = serde_json::json!({
+            "id": CREDENTIAL_ID,
+            "secret": ACTIVATION_SECRET,
+            "enrolledAt": "2026-08-06T12:00:00Z"
+        });
+        credential
+            .as_object_mut()
+            .expect("credential object")
+            .extend(origin.as_object().expect("origin object").clone());
+        serde_json::json!({
+            "schemaVersion": 1,
+            "runnerId": RUNNER_ID,
+            "connectionUrl": "ws://127.0.0.1:8765/v1/runner/connect",
+            "currentCredential": credential,
+            "updatedAt": "2026-08-06T12:00:00Z"
+        })
+    };
+    let root = tempfile::TempDir::new().expect("create state fixture");
+    fs::set_permissions(root.path(), Permissions::from_mode(0o700)).expect("protect fixture");
+    let state_path = root.path().join("runner-state.json");
+    for (origin, valid) in [
+        (serde_json::json!({"activationId": ACTIVATION_ID}), true),
+        (serde_json::json!({"joinKeyId": JOIN_KEY_ID}), true),
+        (
+            serde_json::json!({"activationId": ACTIVATION_ID, "joinKeyId": JOIN_KEY_ID}),
+            false,
+        ),
+        (serde_json::json!({}), false),
+    ] {
+        let state = credential(origin);
+        let bytes = serde_json::to_vec(&state).expect("encode state");
+        if valid {
+            assert_json_matches_schema("runner state", RUNNER_STATE_SCHEMA, &bytes);
+        } else {
+            assert_schema_rejects("runner state", RUNNER_STATE_SCHEMA, &state);
+        }
+        let _ = fs::remove_file(&state_path);
+        atomic_write_json(&state_path, &state).expect("write state");
+        assert_eq!(
+            read_runner_state_if_present(&state_path, DeploymentMode::Development).is_ok(),
+            valid,
+            "{state}"
+        );
+    }
+
+    let journal = |target: serde_json::Value| {
+        let mut journal = serde_json::json!({
+            "schemaVersion": 1,
+            "credentialSecret": ACTIVATION_SECRET,
+            "credentialSecretVerifier": ACTIVATION_SECRET,
+            "idempotencyKey": "join-idempotency",
+            "replaceCredential": false,
+            "stagedAt": "2026-08-06T12:00:00Z"
+        });
+        journal
+            .as_object_mut()
+            .expect("journal object")
+            .extend(target.as_object().expect("target object").clone());
+        journal
+    };
+    let join_target = serde_json::json!({"joinKey": {
+        "joinUrl": format!("https://api.usefulmachinery.com/v1/runner-join-keys/{JOIN_KEY_ID}/join"),
+        "joinKeyId": JOIN_KEY_ID,
+        "expiresAt": "2026-08-07T12:00:00Z"
+    }});
+    let activation_target = serde_json::json!({"activationArtifact": {
+        "schemaVersion": 1,
+        "activationUrl": format!("https://api.usefulmachinery.com/v1/runner-enrollments/{ACTIVATION_ID}/activate"),
+        "activationToken": format!("{ACTIVATION_ID}.{ACTIVATION_SECRET}"),
+        "runnerId": RUNNER_ID,
+        "expiresAt": "2026-08-07T12:00:00Z"
+    }});
+    let mut both = activation_target.clone();
+    both.as_object_mut()
+        .expect("target object")
+        .extend(join_target.as_object().expect("join object").clone());
+    for (target, valid) in [
+        (activation_target, true),
+        (join_target, true),
+        (both, false),
+        (serde_json::json!({}), false),
+    ] {
+        let document = journal(target);
+        if valid {
+            assert_json_matches_schema(
+                "runner enrollment journal",
+                ENROLLMENT_JOURNAL_SCHEMA,
+                &serde_json::to_vec(&document).expect("encode journal"),
+            );
+        } else {
+            assert_schema_rejects(
+                "runner enrollment journal",
+                ENROLLMENT_JOURNAL_SCHEMA,
+                &document,
+            );
+        }
+        assert_eq!(
+            serde_json::from_value::<EnrollmentJournal>(document.clone()).is_ok(),
+            valid,
+            "{document}"
+        );
+    }
 }

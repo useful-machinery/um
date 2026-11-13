@@ -1,7 +1,8 @@
 //! Workflow definitions under the `um` home (REQ-WFDEF-17 to REQ-WFDEF-22): the home's
 //! location, the `definition.json` records and their `revisions/<n>/bindings.json`
-//! snapshots under `workflows/<id>/`, and the read-only tree copies under
-//! `trees/sha256/<hex>/`. Publishing holds an exclusive lock on the definition's
+//! snapshots under `workflows/<id>/`, each with the optional `resolution.json` of provider
+//! ids beside it that the Cloud runner writes and publishing never does (REQ-WFDEF-32), and
+//! the read-only tree copies under `trees/sha256/<hex>/`. Publishing holds an exclusive lock on the definition's
 //! `publish.lock`, reads the record under it, writes the snapshot, then the tree copy when
 //! none is present, then the record, which is replaced whole by a rename. A definition is
 //! created under a dot-named `workflows/.staging-<id>/` that readers skip and renamed to
@@ -25,7 +26,7 @@ use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
 use super::canonical_json;
-use super::document::{Binding, BindingKind};
+use super::document::{Binding, BindingKind, BindingValue};
 use super::schema_common::{
     DIGEST_PREFIX, digest_hex, is_identifier, is_prefixed_ulid, lowercase_hex, utc_timestamp,
 };
@@ -47,6 +48,7 @@ const DEFINITION_TEMPORARY_FILE: &str = "definition.json.tmp";
 const DEFINITION_STAGING_PREFIX: &str = ".staging-";
 const PUBLISH_LOCK_FILE: &str = "publish.lock";
 const BINDINGS_FILE: &str = "bindings.json";
+const RESOLUTION_FILE: &str = "resolution.json";
 const DIRECTORY_MODE: u32 = 0o700;
 const RECORD_FILE_MODE: u32 = 0o600;
 const SNAPSHOT_FILE_MODE: u32 = 0o444;
@@ -141,6 +143,57 @@ impl WorkflowHome {
     fn trees_directory(&self) -> PathBuf {
         self.root.join(TREES_DIRECTORY).join(SHA256_DIRECTORY)
     }
+
+    /// Revision `revision`'s resolution record of definition `id` (REQ-WFDEF-32): the
+    /// provider id resolved for each binding key it names, or `None` when the revision has
+    /// no `resolution.json`. A revision the record does not list, or a record that cannot be
+    /// read or is not of the record's shape, is `definition_record_invalid`.
+    pub fn revision_resolution(
+        &self,
+        id: &str,
+        revision: u64,
+    ) -> Result<Option<BTreeMap<String, String>>, DefinitionError> {
+        let definition = read_definition(self, id)?;
+        let path = revision_directory(&definition.path, revision).join(RESOLUTION_FILE);
+        let invalid = |reason, source| DefinitionError::RecordInvalid {
+            path: path.clone(),
+            reason,
+            source,
+        };
+        if definition.record.revision(revision).is_none() {
+            return Err(invalid("revision not listed", None));
+        }
+        let bytes = match read_bounded(&path, MAXIMUM_BINDINGS_BYTES) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(source) => return Err(invalid("resolution record unreadable", Some(source))),
+        };
+        serde_json::from_slice::<BTreeMap<String, ResolvedBinding>>(&bytes)
+            .ok()
+            .filter(|resolution| {
+                resolution.iter().all(|(key, resolved)| {
+                    is_identifier(key) && !resolved.id.is_empty() && !resolved.name.is_empty()
+                })
+            })
+            .map(|resolution| {
+                Some(
+                    resolution
+                        .into_iter()
+                        .map(|(key, resolved)| (key, resolved.id))
+                        .collect(),
+                )
+            })
+            .ok_or_else(|| invalid("resolution record is not of the record's shape", None))
+    }
+}
+
+/// One member of a revision's `resolution.json` (REQ-WFDEF-32): the provider's id for the
+/// bound value and the name it had when Cloud resolved it.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ResolvedBinding {
+    id: String,
+    name: String,
 }
 
 /// `definition.json`, exactly `contracts/jsonschema/workflow-definition-v1.schema.json`.
@@ -228,7 +281,7 @@ impl BindingsSnapshot {
         snapshot
             .0
             .iter()
-            .all(|(key, bound)| is_identifier(key) && !bound.value.is_empty())
+            .all(|(key, bound)| is_identifier(key) && bound.value.fits(bound.kind))
             .then_some(snapshot)
     }
 }
@@ -237,7 +290,8 @@ impl BindingsSnapshot {
 #[serde(deny_unknown_fields)]
 pub struct BoundBinding {
     pub kind: BindingKind,
-    pub value: String,
+    /// A string, or for `members` a list kept as a list in the snapshot and its digest.
+    pub value: BindingValue,
 }
 
 /// A `--bindings` file (REQ-WFDEF-20): a JSON object keyed by binding key whose members
@@ -342,7 +396,7 @@ pub(crate) fn resolve_bindings(
     file: Option<&BindingsFile>,
     carried: Option<&BindingsSnapshot>,
 ) -> Result<BindingsSnapshot, DefinitionError> {
-    let mut supplied = BTreeMap::<&str, &str>::new();
+    let mut supplied = BTreeMap::<&str, BindingValue>::new();
     if let Some(file) = file {
         for (key, member) in &file.members {
             let binding = declared
@@ -355,10 +409,9 @@ pub(crate) fn resolve_bindings(
             {
                 return Err(DefinitionError::BindingKindMismatch { key: key.clone() });
             }
-            let value = member
-                .value
-                .as_str()
-                .filter(|value| !value.is_empty())
+            let value = BindingValue::deserialize(&member.value)
+                .ok()
+                .filter(|value| value.fits(binding.kind))
                 .ok_or_else(|| DefinitionError::BindingValueInvalid { key: key.clone() })?;
             supplied.insert(key, value);
         }
@@ -370,22 +423,22 @@ pub(crate) fn resolve_bindings(
             if bound.kind != binding.kind {
                 return Err(DefinitionError::BindingKindMismatch { key: key.clone() });
             }
-            if bound.value.is_empty() {
+            if !bound.value.fits(bound.kind) {
                 return Err(DefinitionError::BindingValueInvalid { key: key.clone() });
             }
-            supplied.insert(key, &bound.value);
+            supplied.insert(key, bound.value.clone());
         }
     }
     let mut snapshot = BTreeMap::new();
     for (key, binding) in declared {
-        let value = match supplied.get(key.as_str()) {
-            Some(value) => (*value).to_owned(),
+        let value = match supplied.remove(key.as_str()) {
+            Some(value) => value,
             None => binding
                 .default
                 .clone()
                 .ok_or_else(|| DefinitionError::BindingMissing { key: key.clone() })?,
         };
-        if value.is_empty() {
+        if !value.fits(binding.kind) {
             return Err(DefinitionError::BindingValueInvalid { key: key.clone() });
         }
         snapshot.insert(
@@ -550,9 +603,7 @@ pub fn publish(
 /// The record `id` (REQ-WFDEF-27: `definition_id_invalid`, `definition_not_found` or
 /// `definition_record_invalid`).
 pub fn read_definition(home: &WorkflowHome, id: &str) -> Result<StoredDefinition, DefinitionError> {
-    if !is_definition_id(id) {
-        return Err(DefinitionError::IdInvalid { id: id.to_owned() });
-    }
+    check_definition_id(id)?;
     let path = home.definition_directory(id);
     match fs::symlink_metadata(&path) {
         Ok(_) => read_stored(path, id),
@@ -665,6 +716,30 @@ pub fn set_enabled(
         definition,
         changed,
     })
+}
+
+impl WorkflowHome {
+    /// Records `cloud_id` as the `cloudId` of definition `id` (REQ-CLOUDDEF-14), replacing
+    /// the record whole only when it changes, as `set_enabled` does. The write follows a
+    /// publish, so it holds the definition's `publish.lock` and reads the record under it;
+    /// a held lock is `publish_conflict`, and a `cloud_id` that is not a `def_` id is
+    /// `definition_id_invalid`. A method of the home because the store module is crate-private
+    /// and the CLI reaches it through the exported home.
+    pub fn set_cloud_id(
+        &self,
+        id: &str,
+        cloud_id: &str,
+    ) -> Result<StoredDefinition, DefinitionError> {
+        check_definition_id(cloud_id)?;
+        let StoredDefinition { path, .. } = read_definition(self, id)?;
+        let _lock = PublishLock::acquire(&path, id)?;
+        let mut definition = read_stored(path, id)?;
+        if definition.record.cloud_id.as_deref() != Some(cloud_id) {
+            definition.record.cloud_id = Some(cloud_id.to_owned());
+            write_record(&definition.path, &definition.record)?;
+        }
+        Ok(definition)
+    }
 }
 
 /// A refused or failed definition command, with the id, ids, binding key or path it
@@ -870,7 +945,10 @@ impl fmt::Display for DefinitionError {
                 )
             }
             Self::BindingValueInvalid { key } => {
-                write!(formatter, "the value of {key} is not a non-empty string")
+                write!(
+                    formatter,
+                    "the value of {key} does not fit its declared kind"
+                )
             }
             Self::BindingMissing { key } => write!(formatter, "no value is bound for {key}"),
             Self::PublishConflict { id } => {
@@ -929,6 +1007,17 @@ impl From<FileOperationError> for DefinitionError {
 
 fn is_definition_id(value: &str) -> bool {
     is_prefixed_ulid(value, DEFINITION_ID_PREFIX)
+}
+
+/// Refuses `id` with `definition_id_invalid` unless it is `def_` and 26 characters
+/// (REQ-WFDEF-27). Local and Cloud definition ids share the shape, so the check cannot tell
+/// one from the other: `publish --cloud-to` checks a Cloud id with it (REQ-CLOUDDEF-20).
+pub fn check_definition_id(id: &str) -> Result<(), DefinitionError> {
+    if is_definition_id(id) {
+        Ok(())
+    } else {
+        Err(DefinitionError::IdInvalid { id: id.to_owned() })
+    }
 }
 
 fn mint_definition_id() -> String {

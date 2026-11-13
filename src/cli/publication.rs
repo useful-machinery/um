@@ -1487,35 +1487,6 @@ mod tests {
             "--expected-head",
             "ABC"
         ]));
-        let run = |extras: &[&str]| {
-            let mut args = vec![
-                "um",
-                "run",
-                "create",
-                "acme-labs",
-                "--project-id",
-                "prj_01k0z6r1w8f4jy2m7q9v3x5abc",
-                "--workflow-path",
-                "workflow.yaml",
-            ];
-            args.extend_from_slice(extras);
-            super::super::Cli::try_parse_from(args).is_ok()
-        };
-        assert!(run(&[
-            "--publish-export",
-            "changes",
-            "--publish-change-request",
-            "42",
-            "--publish-expected-head",
-            HASH
-        ]));
-        assert!(!run(&["--publish-change-request", "42"]));
-        assert!(!run(&[
-            "--publish-export",
-            "changes",
-            "--publish-expected-head",
-            HASH
-        ]));
     }
 
     #[test]

@@ -1,4 +1,6 @@
-//! `um workflow run withdraw`, `cancel` and `release` (REQ-LOCALRUN-186, REQ-LOCALRUN-187).
+//! `um workflow run withdraw`, `cancel` and `release` (REQ-LOCALRUN-186, REQ-LOCALRUN-187);
+//! `release --cloud ORGANIZATION` releases a Cloud run's subject claim instead
+//! (REQ-CLOUDDEF-19).
 
 use std::path::Path;
 use std::time::Duration;
@@ -9,14 +11,17 @@ use rustix::process::{Pid, Signal, kill_process};
 use um_execution::{
     CANCELED_OUTCOME, CONTROL_CANCEL, CONTROL_RELEASE, CONTROL_WITHDRAW, LocalContinuationOpen,
     Mirror, PendingLocalContinuation, RetryIneligibilityReason, RunState, WITHDRAWN_OUTCOME,
-    WaitInspection, WaitRecord, acquire_local_continuation, lock_holder, read_controls,
+    WaitInspection, WaitRecord, acquire_local_continuation, await_run_lock_gate, inspect_wait,
+    lock_holder, read_controls,
 };
 
 use super::control::{Acted, ControlFailure, ControlTarget, Refusal};
 
 pub(super) const WITHDRAW_ABOUT: &str = "End a run without continuing it";
 pub(super) const CANCEL_ABOUT: &str = "End a run, signalling the process that runs it";
-pub(super) const RELEASE_ABOUT: &str = "Record the release of an exited run";
+pub(super) const RELEASE_ABOUT: &str =
+    "Record the release of an exited run, or release a Cloud run's claim with --cloud";
+pub(super) const RELEASE_AFTER_HELP: &str = "With --cloud ORGANIZATION, RUN is a Cloud run ID: the command asks Cloud, as an organization owner, to release the subject claim of that exited run under one request key, sent again if the response is lost. It reads and writes no local run.";
 const WITHDRAW_COMMAND: &str = "um workflow run withdraw";
 const CANCEL_COMMAND: &str = "um workflow run cancel";
 const RELEASE_COMMAND: &str = "um workflow run release";
@@ -38,53 +43,42 @@ pub(super) struct Command {
     output: super::control::JsonOutput,
 }
 
+/// `release`'s arguments: the shared ones and the Cloud selector, which `withdraw` and
+/// `cancel` do not take.
+#[derive(Debug, Args)]
+pub(super) struct Release {
+    #[command(flatten)]
+    command: Command,
+
+    #[command(flatten)]
+    cloud: super::CloudSelector,
+}
+
+impl Release {
+    pub(super) fn execute(mut self) -> super::super::super::CommandResult {
+        match self.cloud.organization.take() {
+            Some(organization) => super::cloud::CloudRun::new(
+                self.command.run,
+                organization,
+                self.cloud,
+                self.command.output.json,
+            )?
+            .release(),
+            None => self.command.release(),
+        }
+    }
+}
+
 impl Command {
     pub(super) fn withdraw(self) -> super::super::super::CommandResult {
-        super::control::execute(WITHDRAW_COMMAND, &self.run, self.output.json, |target| {
-            match &target.inspection {
-                WaitInspection::Locked(_) => Err(super::control::run_locked().into()),
-                WaitInspection::Held { wait }
-                | WaitInspection::Satisfied { wait, .. }
-                | WaitInspection::RuleInvalid { wait, .. }
-                | WaitInspection::ConditionUnavailable { wait, .. } => {
-                    end_waiting(target, wait, CONTROL_WITHDRAW, WITHDRAWN_OUTCOME)
-                }
-                WaitInspection::NoWait {
-                    state: Some(RunState::Exited),
-                    ..
-                } => Err(run_exited().into()),
-                WaitInspection::NoWait { .. } | WaitInspection::Continued { .. } => {
-                    end_abandoned(target, CONTROL_WITHDRAW, WITHDRAWN_OUTCOME)
-                }
-            }
-        })
+        super::control::execute(WITHDRAW_COMMAND, &self.run, self.output.json, withdraw_run)
     }
 
     pub(super) fn cancel(self) -> super::super::super::CommandResult {
-        super::control::execute(
-            CANCEL_COMMAND,
-            &self.run,
-            self.output.json,
-            |target| match &target.inspection {
-                WaitInspection::Locked(_) => cancel_live(target),
-                WaitInspection::Held { wait }
-                | WaitInspection::Satisfied { wait, .. }
-                | WaitInspection::RuleInvalid { wait, .. }
-                | WaitInspection::ConditionUnavailable { wait, .. } => {
-                    end_waiting(target, wait, CONTROL_CANCEL, CANCELED_OUTCOME)
-                }
-                WaitInspection::NoWait {
-                    state: Some(RunState::Exited),
-                    ..
-                } => Err(run_exited().into()),
-                WaitInspection::NoWait { .. } | WaitInspection::Continued { .. } => {
-                    end_abandoned(target, CONTROL_CANCEL, CANCELED_OUTCOME)
-                }
-            },
-        )
+        super::control::execute(CANCEL_COMMAND, &self.run, self.output.json, cancel_run)
     }
 
-    pub(super) fn release(self) -> super::super::super::CommandResult {
+    fn release(self) -> super::super::super::CommandResult {
         super::control::execute(RELEASE_COMMAND, &self.run, self.output.json, |target| {
             if !matches!(
                 target.inspection,
@@ -111,6 +105,61 @@ impl Command {
     }
 }
 
+/// Withdraws the run `target` opened, as `um workflow run withdraw` does (REQ-LOCALRUN-186);
+/// `um workflow run event` applies a control trigger's `withdraw` through it
+/// (REQ-LOCALRUN-208).
+pub(super) fn withdraw_run(target: &ControlTarget) -> Result<Acted, ControlFailure> {
+    end_run(target, withdraw_live, CONTROL_WITHDRAW, WITHDRAWN_OUTCOME)
+}
+
+/// Cancels the run `target` opened, as `um workflow run cancel` does (REQ-LOCALRUN-186);
+/// `um workflow run event` applies a control trigger's `cancel` through it
+/// (REQ-LOCALRUN-208).
+pub(super) fn cancel_run(target: &ControlTarget) -> Result<Acted, ControlFailure> {
+    end_run(target, cancel_live, CONTROL_CANCEL, CANCELED_OUTCOME)
+}
+
+/// Ends the run with `event` and `outcome`: a live one through `live`, and otherwise as
+/// `end_unheld` does.
+fn end_run(
+    target: &ControlTarget,
+    live: fn(&ControlTarget) -> Result<Acted, ControlFailure>,
+    event: &str,
+    outcome: &'static str,
+) -> Result<Acted, ControlFailure> {
+    match &target.inspection {
+        WaitInspection::Locked(_) => live(target),
+        _ => end_unheld(target, event, outcome),
+    }
+}
+
+/// Ends the run with `event` and `outcome` as `target` found it: a waiting one at its wait,
+/// and one whose process is gone as abandoned, each appending `event` only as it ends the
+/// run; a run a process holds is `run_locked` and an exited run `run_exited`, with nothing
+/// appended.
+fn end_unheld(
+    target: &ControlTarget,
+    event: &str,
+    outcome: &'static str,
+) -> Result<Acted, ControlFailure> {
+    match &target.inspection {
+        WaitInspection::Locked(_) => Err(super::control::run_locked().into()),
+        WaitInspection::Held { wait }
+        | WaitInspection::Satisfied { wait, .. }
+        | WaitInspection::RuleInvalid { wait, .. }
+        | WaitInspection::ConditionUnavailable { wait, .. } => {
+            end_waiting(target, wait, event, outcome)
+        }
+        WaitInspection::NoWait {
+            state: Some(RunState::Exited),
+            ..
+        } => Err(run_exited().into()),
+        WaitInspection::NoWait { .. } | WaitInspection::Continued { .. } => {
+            end_abandoned(target, event, outcome)
+        }
+    }
+}
+
 pub(super) fn run_exited() -> Refusal {
     Refusal::new("run_exited", "The run has exited.")
 }
@@ -118,6 +167,8 @@ pub(super) fn run_exited() -> Refusal {
 /// The run's continuation lock, or `run_locked` when a process took the run since it was
 /// inspected.
 fn acquire(run_directory: &Path) -> Result<PendingLocalContinuation, ControlFailure> {
+    // A test seam between the inspection and the run lock; nothing outside `test-fixtures`.
+    await_run_lock_gate()?;
     match acquire_local_continuation(run_directory)? {
         LocalContinuationOpen::Acquired(pending) => Ok(*pending),
         LocalContinuationOpen::Rejected(rejection)
@@ -133,7 +184,7 @@ fn acquire(run_directory: &Path) -> Result<PendingLocalContinuation, ControlFail
 
 /// Ends a waiting run with `outcome` (REQ-CONTINUE-75): under the run lock, once the run
 /// still waits on `wait` and the mirror's write has its credentials (REQ-LOCALRUN-204),
-/// appends `event` naming it and marks the record `exited`.
+/// appends `event` naming the wait and marks the record `exited`.
 fn end_waiting(
     target: &ControlTarget,
     wait: &WaitRecord,
@@ -213,6 +264,33 @@ fn write_outcome(mirror: Option<&Mirror>, outcome: &'static str) {
             Box::new(move |mirror, target| mirror.outcome(target, outcome)),
         );
     }
+}
+
+/// Withdraws a run a live process holds (REQ-LOCALRUN-186): under the run's controls lock,
+/// which that process takes for its last read of the withdrawals and keeps until it releases
+/// the run, appends `control.withdraw` naming no wait while the process still holds the run,
+/// so the process honors it before its next `workflow` step starts or, when it reaches none,
+/// as its attempt settles (REQ-WFEXEC-73); `withdraw_pending` when one it has not honored is
+/// already recorded. A process that released the run in the meantime has read for the last
+/// time, so the command appends nothing there and ends the run as it finds it again
+/// (`end_unheld`).
+fn withdraw_live(target: &ControlTarget) -> Result<Acted, ControlFailure> {
+    // A test seam between the inspection and the controls lock; nothing outside
+    // `test-fixtures`.
+    await_run_lock_gate()?;
+    let probe = inspect_wait(&target.run_directory, &um_execution::NoConditions)?;
+    let controls = probe.lock_controls()?;
+    if lock_holder(&target.run_directory)?.is_none() {
+        drop(controls);
+        let released = super::control::open(&target.run_directory)?;
+        return end_unheld(&released, CONTROL_WITHDRAW, WITHDRAWN_OUTCOME);
+    }
+    if probe.withdrawal_pending()? {
+        return Err(super::control::withdraw_pending().into());
+    }
+    let control = target.record(CONTROL_WITHDRAW, None, None)?;
+    drop(controls);
+    Ok(Acted::recorded(control, None))
 }
 
 /// Cancels a run a live process holds: signals that process to terminate, whose own

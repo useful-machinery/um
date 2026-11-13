@@ -1,6 +1,7 @@
 {
   "displayName": "Review this document",
   "workflowPath": ".um/workflows/review-document.yaml",
+  "definitionId": "def_01k0z6r1w8f4jy2m7q9v3x5abc",
   "enabled": true,
   "description": "Review the current document.",
   "inputBindings": {

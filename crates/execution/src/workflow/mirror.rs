@@ -295,11 +295,22 @@ impl fmt::Display for MirrorFailure {
 impl std::error::Error for MirrorFailure {}
 
 /// Where the mirror writes: the execution crate declares it and the CLI implements it over
-/// Linear. `issue_state` answers the issue's state name.
+/// Linear. `issue_state` answers the issue's state name and `set_state` moves it to the state
+/// of a name; `issue_state_id` and `set_state_id` do the same by the provider's state id, for
+/// a revision with a resolution record (REQ-WFDEF-32).
 pub trait MirrorTarget {
     fn issue_state(&self, issue: &str) -> Result<String, MirrorFailure>;
+    fn issue_state_id(&self, issue: &str) -> Result<String, MirrorFailure>;
     fn comment(&self, issue: &str, body: &str) -> Result<(), MirrorFailure>;
     fn set_state(&self, issue: &str, state: &str) -> Result<(), MirrorFailure>;
+    fn set_state_id(&self, issue: &str, state_id: &str) -> Result<(), MirrorFailure>;
+}
+
+/// A bound state as the target is asked for it: by its bound name, or by the id the
+/// revision's resolution record gives its key.
+enum StateSelector {
+    Name(String),
+    Id(String),
 }
 
 /// What a write asked the target to do.
@@ -477,15 +488,18 @@ pub fn read_numbered_mirror_writes(
 
 /// A run's mirror (REQ-LOCALRUN-193): the root's block, the issue identifier, the bound
 /// values of its revision's bindings snapshot by key (or why they cannot be had), the
-/// operator, the run's id, the run directory as a `file://` URL and the run directory the
-/// records go under. Each hook performs the block's write when the block declares it and
-/// appends one record of how it ended; its only error is that record's own write failing,
-/// and a failed write is a record, never an error.
+/// resolved provider ids by key when the revision has a resolution record, the operator,
+/// the run's id and URL and the run directory the records go under. With resolved ids the
+/// outcome's guard and state write go by id, else by the bound name (REQ-LOCALRUN-192).
+/// Each hook performs the block's write when the block declares it and appends one
+/// record of how it ended; its only error is that record's own write failing, and a failed
+/// write is a record, never an error.
 #[derive(Clone, Debug)]
 pub struct Mirror {
     block: MirrorBlock,
     issue: String,
     bindings: Result<BTreeMap<String, String>, MirrorFailure>,
+    resolved_ids: Option<BTreeMap<String, String>>,
     operator: String,
     run_id: String,
     run_url: String,
@@ -506,11 +520,20 @@ impl Mirror {
             block,
             issue,
             bindings,
+            resolved_ids: None,
             operator,
             run_id,
             run_url,
             run_directory,
         }
+    }
+
+    /// The mirror matching and writing states by the provider ids of the revision's
+    /// resolution record (REQ-WFDEF-32), by binding key.
+    #[must_use]
+    pub fn with_resolved_ids(mut self, resolved_ids: BTreeMap<String, String>) -> Self {
+        self.resolved_ids = Some(resolved_ids);
+        self
     }
 
     /// `onStart`, once when `um workflow run create` has made the run.
@@ -563,7 +586,8 @@ impl Mirror {
 
     /// `onOutcome.<outcome>`, once the run record reads `exited` with `outcome`: the issue
     /// moves to the bound state unless the entry's guard holds over the issue's state, read
-    /// once. An outcome the block does not map (`maps_outcome`) writes nothing.
+    /// once; both by id when the mirror has resolved ids. An outcome the block does not map
+    /// (`maps_outcome`) writes nothing.
     pub fn outcome(
         &self,
         target: &dyn MirrorTarget,
@@ -572,19 +596,21 @@ impl Mirror {
         let Some(entry) = self.block.on_outcome.get(outcome) else {
             return Ok(());
         };
-        let state = self.bound(&entry.state);
         let action = MirrorAction::State {
-            state: state.as_ref().ok().cloned(),
+            state: self.bound(&entry.state).ok(),
             binding: entry.state.clone(),
         };
-        let guarded = state.and_then(|state| {
+        let guarded = self.selector(&entry.state).and_then(|state| {
             self.guard_holds(target, entry.unless.as_deref())
                 .map(|holds| (state, holds))
         });
         let performed = match guarded {
             Err(failure) => Performed::Failed(failure),
             Ok((_, true)) => Performed::Skipped(MirrorSkipReason::GuardHeld),
-            Ok((state, false)) => target.set_state(&self.issue, &state).into(),
+            Ok((StateSelector::Name(state), false)) => target.set_state(&self.issue, &state).into(),
+            Ok((StateSelector::Id(state_id), false)) => {
+                target.set_state_id(&self.issue, &state_id).into()
+            }
         };
         self.record(MirrorHook::Outcome, action, performed)
     }
@@ -647,8 +673,27 @@ impl Mirror {
         })
     }
 
-    /// Whether the `unless` guard holds over the issue's state, read once; no guard never
-    /// holds and reads nothing.
+    /// The bound state of binding `key` as the target is asked for it: its id in the
+    /// resolution record when the mirror has one (`mirror_state_unknown` for a key the
+    /// record gives none), else its bound name.
+    fn selector(&self, key: &str) -> Result<StateSelector, MirrorFailure> {
+        let bound = self.bound(key)?;
+        let Some(resolved_ids) = &self.resolved_ids else {
+            return Ok(StateSelector::Name(bound));
+        };
+        resolved_ids
+            .get(key)
+            .cloned()
+            .map(StateSelector::Id)
+            .ok_or_else(|| {
+                MirrorFailure::state_unknown(format!(
+                    "the binding `{key}` has no resolved id in the revision's resolution record"
+                ))
+            })
+    }
+
+    /// Whether the `unless` guard holds over the issue's state, read once and compared by id
+    /// when the mirror has resolved ids; no guard never holds and reads nothing.
     fn guard_holds(
         &self,
         target: &dyn MirrorTarget,
@@ -660,11 +705,13 @@ impl Mirror {
         let guard = MirrorGuard::parse(unless).map_err(|error| {
             MirrorFailure::bindings_unavailable(format!("the outcome's guard is invalid: {error}"))
         })?;
-        let bound = self.bound(&guard.binding)?;
-        let current = target.issue_state(&self.issue)?;
+        let in_state = match self.selector(&guard.binding)? {
+            StateSelector::Name(state) => target.issue_state(&self.issue)? == state,
+            StateSelector::Id(state_id) => target.issue_state_id(&self.issue)? == state_id,
+        };
         Ok(match guard.operator {
-            MirrorGuardOperator::Equal => current == bound,
-            MirrorGuardOperator::NotEqual => current != bound,
+            MirrorGuardOperator::Equal => in_state,
+            MirrorGuardOperator::NotEqual => !in_state,
         })
     }
 
@@ -698,13 +745,16 @@ mod tests {
     #[derive(Clone, Debug, Eq, PartialEq)]
     enum Call {
         IssueState(String),
+        IssueStateId(String),
         Comment(String, String),
         SetState(String, String),
+        SetStateId(String, String),
     }
 
     /// A target that records each call and answers as told.
     struct FakeTarget {
         state: Result<String, MirrorFailure>,
+        state_id: Result<String, MirrorFailure>,
         writes: Result<(), MirrorFailure>,
         calls: RefCell<Vec<Call>>,
     }
@@ -713,6 +763,7 @@ mod tests {
         fn new() -> Self {
             Self {
                 state: Ok("Engineering".to_owned()),
+                state_id: Ok("state-engineering".to_owned()),
                 writes: Ok(()),
                 calls: RefCell::default(),
             }
@@ -738,6 +789,13 @@ mod tests {
             self.state.clone()
         }
 
+        fn issue_state_id(&self, issue: &str) -> Result<String, MirrorFailure> {
+            self.calls
+                .borrow_mut()
+                .push(Call::IssueStateId(issue.to_owned()));
+            self.state_id.clone()
+        }
+
         fn comment(&self, issue: &str, body: &str) -> Result<(), MirrorFailure> {
             self.calls
                 .borrow_mut()
@@ -749,6 +807,13 @@ mod tests {
             self.calls
                 .borrow_mut()
                 .push(Call::SetState(issue.to_owned(), state.to_owned()));
+            self.writes.clone()
+        }
+
+        fn set_state_id(&self, issue: &str, state_id: &str) -> Result<(), MirrorFailure> {
+            self.calls
+                .borrow_mut()
+                .push(Call::SetStateId(issue.to_owned(), state_id.to_owned()));
             self.writes.clone()
         }
     }
@@ -971,6 +1036,97 @@ mod tests {
         assert_eq!(failed["outcome"], "failed");
         assert_eq!(failed["code"], "mirror_issue_unavailable");
         assert_eq!(failed["diagnostic"], "the issue AUTO-143 was not found");
+    }
+
+    /// The provider ids a revision's resolution record gives the sketch's state bindings.
+    fn resolved_ids() -> BTreeMap<String, String> {
+        [
+            ("linearTeam", "team-auto"),
+            ("ownedState", "state-engineering"),
+            ("backlog", "state-backlog"),
+            ("canceled", "state-canceled"),
+            ("done", "state-done"),
+        ]
+        .into_iter()
+        .map(|(key, value)| (key.to_owned(), value.to_owned()))
+        .collect()
+    }
+
+    // REQ-LOCALRUN-192, REQ-WFDEF-32: with resolved ids the guard compares the issue's state
+    // id with the bound state's id and the write sends the id, whatever the states are named
+    // now; the record keeps the bound value.
+    #[test]
+    fn with_resolved_ids_the_guard_compares_and_the_write_sends_state_ids() {
+        let root = run_root();
+        let mirror = mirror(&root, Ok(engineering_bindings())).with_resolved_ids(resolved_ids());
+
+        let target = FakeTarget::new();
+        mirror.outcome(&target, "landed").unwrap();
+        assert_eq!(
+            target.calls(),
+            [Call::SetStateId(
+                "AUTO-143".to_owned(),
+                "state-done".to_owned()
+            )]
+        );
+        let landed = record_json(&root, "0001-outcome.json");
+        assert_eq!(landed["outcome"], "written");
+        assert_eq!(
+            landed["action"],
+            json!({"kind": "state", "state": "Done", "binding": "done"})
+        );
+
+        // The owned state was renamed: its id still matches, so the guard does not hold.
+        let renamed = FakeTarget {
+            state: Ok("In engineering".to_owned()),
+            ..FakeTarget::new()
+        };
+        mirror.outcome(&renamed, "withdrawn").unwrap();
+        assert_eq!(
+            renamed.calls(),
+            [
+                Call::IssueStateId("AUTO-143".to_owned()),
+                Call::SetStateId("AUTO-143".to_owned(), "state-backlog".to_owned()),
+            ]
+        );
+        assert_eq!(
+            record_json(&root, "0002-outcome.json")["outcome"],
+            "written"
+        );
+
+        // Another state now named as the owned one was: its id differs, so the guard holds.
+        let moved = FakeTarget {
+            state_id: Ok("state-triage".to_owned()),
+            ..FakeTarget::new()
+        };
+        mirror.outcome(&moved, "withdrawn").unwrap();
+        assert_eq!(moved.calls(), [Call::IssueStateId("AUTO-143".to_owned())]);
+        let skipped = record_json(&root, "0003-outcome.json");
+        assert_eq!(skipped["outcome"], "skipped");
+        assert_eq!(skipped["reason"], "guard_held");
+    }
+
+    // REQ-LOCALRUN-192, REQ-WFDEF-32: with a resolution record, a bound state or guard key it
+    // gives no id is `mirror_state_unknown` before any request.
+    #[test]
+    fn with_resolved_ids_a_bound_key_without_an_id_is_state_unknown() {
+        for missing in ["done", "ownedState", "backlog"] {
+            let root = run_root();
+            let mut ids = resolved_ids();
+            ids.remove(missing);
+            let mirror = mirror(&root, Ok(engineering_bindings())).with_resolved_ids(ids);
+            let target = FakeTarget::new();
+            let outcome = if missing == "done" {
+                "landed"
+            } else {
+                "withdrawn"
+            };
+            mirror.outcome(&target, outcome).unwrap();
+            assert_eq!(target.calls(), [], "{missing}");
+            let failed = record_json(&root, "0001-outcome.json");
+            assert_eq!(failed["outcome"], "failed", "{missing}");
+            assert_eq!(failed["code"], "mirror_state_unknown", "{missing}");
+        }
     }
 
     // REQ-LOCALRUN-193

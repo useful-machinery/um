@@ -31,6 +31,8 @@ pub struct GoogleDocsAction {
     pub display_name: String,
     #[serde(rename = "workflowPath")]
     pub workflow_path: String,
+    #[serde(rename = "definitionId", deserialize_with = "Option::deserialize")]
+    pub definition_id: Option<String>,
     #[serde(rename = "enabled")]
     pub enabled: bool,
     #[serde(rename = "description")]
@@ -54,6 +56,7 @@ impl GoogleDocsAction {
         updated_at: String,
         display_name: String,
         workflow_path: String,
+        definition_id: Option<String>,
         enabled: bool,
         description: String,
         sort_order: i32,
@@ -69,6 +72,7 @@ impl GoogleDocsAction {
             updated_at,
             display_name,
             workflow_path,
+            definition_id,
             enabled,
             description,
             sort_order,

@@ -22,13 +22,14 @@ use super::artifact_delivery::{
     ArtifactDeliveryBroker, ArtifactDeliveryOutcome, ArtifactDeliverySpec,
 };
 use super::assignment::{
-    AcceptedAssignment, AssignmentObservation, CausalLease, ExecutionReport, LeaseAuthority,
-    ManagerEvent, ObservationOutbox, OutboxFailure, PhaseEnd, RenewalRequestFailure, RunEvent,
-    RunPhase, lease_clock_cause,
+    AcceptedAssignment, AcceptedExecution, AssignmentObservation, CausalLease, ExecutionReport,
+    LeaseAuthority, ManagerEvent, ObservationOutbox, OutboxFailure, PhaseEnd,
+    RenewalRequestFailure, RunEvent, RunPhase, lease_clock_cause,
 };
 use super::lease_clock::{
     LeaseClock, LeaseClockError, LeaseInstant, LeaseWait, LeaseWaitCancellation,
 };
+use super::tree_run::{TransportResult, TreeConclusion, TreeRun};
 use super::workspace::{RetentionReason, WorkspaceDisposition};
 use crate::telemetry;
 use um_execution::{

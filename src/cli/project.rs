@@ -1,8 +1,5 @@
 mod action;
 mod output;
-mod resource;
-mod schedule;
-mod trigger;
 mod webhook;
 
 use anyhow::{Context, anyhow};
@@ -43,14 +40,10 @@ enum ProjectCommand {
     Rename(RenameCommand),
     #[command(about = "Manage a project's repository binding")]
     Repository(RepositoryCommand),
-    #[command(about = "Manage a project's runner pool")]
+    #[command(about = "Manage a project's runner pools")]
     RunnerPool(RunnerPoolCommand),
-    #[command(about = "Manage a project's schedules")]
-    Schedule(schedule::Command),
     #[command(about = "Show a project")]
     Show(ShowCommand),
-    #[command(about = "Manage a project's Linear triggers")]
-    Trigger(trigger::Command),
     #[command(about = "Manage a project's signed webhooks")]
     Webhook(webhook::Command),
 }
@@ -247,7 +240,7 @@ struct RunnerPoolCommand {
 enum RunnerPoolSubcommand {
     #[command(about = "Remove a project's runner pool")]
     Remove(RunnerPoolRemoveCommand),
-    #[command(about = "Assign or replace a project's runner pool")]
+    #[command(about = "Replace a project's runner pools with the pools named")]
     Set(RunnerPoolSetCommand),
 }
 
@@ -256,8 +249,8 @@ struct RunnerPoolSetCommand {
     #[command(flatten)]
     project: ProjectReference,
 
-    #[arg(value_name = PoolArg::VALUE_NAME, help = PoolArg::HELP)]
-    pool: PoolArg,
+    #[arg(value_name = PoolArg::VALUE_NAME, help = PoolArg::HELP, required = true)]
+    pools: Vec<PoolArg>,
 
     #[command(flatten)]
     options: Options,
@@ -288,8 +281,6 @@ impl Command {
             ProjectCommand::Rename(command) => execute_leaf(command, RenameCommand::execute),
             ProjectCommand::Repository(command) => command.execute(),
             ProjectCommand::RunnerPool(command) => command.execute(),
-            ProjectCommand::Schedule(command) => command.execute(),
-            ProjectCommand::Trigger(command) => command.execute(),
             ProjectCommand::Webhook(command) => command.execute(),
         }
     }
@@ -574,23 +565,30 @@ impl RepositoryRemoveCommand {
 impl RunnerPoolSetCommand {
     fn execute(self, deployment: &Deployment) -> anyhow::Result<ExitCode> {
         let transport_policy = self.options.http.transport_policy();
-        let runner_pool_id = match resolve_pool_id(
-            deployment,
-            transport_policy,
-            &self.options.authentication,
-            &self.project.organization,
-            &self.pool,
-        )? {
-            Ok(pool_id) => pool_id,
-            Err(failure) => {
-                return super::runner::write_failure(
-                    deployment,
-                    &failure,
-                    &self.options.authentication,
-                    self.options.json,
-                );
+        let mut runner_pool_ids = Vec::with_capacity(self.pools.len());
+        for pool in &self.pools {
+            let pool_id = match resolve_pool_id(
+                deployment,
+                transport_policy,
+                &self.options.authentication,
+                &self.project.organization,
+                pool,
+            )? {
+                Ok(pool_id) => pool_id,
+                Err(failure) => {
+                    return super::runner::write_failure(
+                        deployment,
+                        &failure,
+                        &self.options.authentication,
+                        self.options.json,
+                    );
+                }
+            };
+            // The pools form a set: naming one pool twice, by id and by name, names it once.
+            if !runner_pool_ids.contains(&pool_id) {
+                runner_pool_ids.push(pool_id);
             }
-        };
+        }
         let key = um_support::generate_idempotency_key()
             .context("generate project runner pool request identity")?;
         let result = with_api(
@@ -598,11 +596,11 @@ impl RunnerPoolSetCommand {
             transport_policy,
             &self.options.authentication,
             |api| {
-                api.set_runner_pool(
+                api.set_runner_pools(
                     &self.project.organization,
                     &self.project.project_id,
                     &key,
-                    &runner_pool_id,
+                    &runner_pool_ids,
                 )
             },
         )?;

@@ -16,6 +16,7 @@ use time::format_description::well_known::Rfc3339;
 
 use um_support::generate_idempotency_key;
 
+use super::service::Backoff;
 use super::validation::{valid_secret_syntax, valid_typed_id};
 
 const ARTIFACT_LIMIT: u64 = 4096;
@@ -106,6 +107,80 @@ impl<'a> From<&'a ActivationArtifact> for TransferableActivationArtifact<'a> {
     }
 }
 
+/// A pool's join key, the OpenAPI `RunnerJoinKeyArtifact`. Its token stays in
+/// memory for one start: it is never serialized, so neither the state, the
+/// journal nor a diagnostic can carry it.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct JoinKeyArtifact {
+    schema_version: u8,
+    join_url: String,
+    join_key_id: String,
+    join_token: String,
+    expires_at: String,
+}
+
+impl JoinKeyArtifact {
+    /// Reads the artifact as an activation file is read: from a regular file
+    /// private to the current user, which is neither removed nor rewritten, or
+    /// with `-` from piped standard input.
+    pub fn read_file(path: &Path) -> Result<Self, EnrollmentError> {
+        let bytes = if path == Path::new("-") {
+            if io::stdin().is_terminal() {
+                return Err(EnrollmentError::TerminalStdin);
+            }
+            read_piped_artifact().map_err(|_| EnrollmentError::InvalidJoinKey)?
+        } else {
+            read_bounded_regular_file(path, ARTIFACT_LIMIT, true)
+                .map_err(|_| EnrollmentError::JoinKeyFile)?
+        };
+        Self::parse(&bytes)
+    }
+
+    /// Parses the artifact text, as supplied by the environment.
+    pub fn parse(bytes: &[u8]) -> Result<Self, EnrollmentError> {
+        if bytes.len() as u64 > ARTIFACT_LIMIT {
+            return Err(EnrollmentError::InvalidJoinKey);
+        }
+        let key: Self =
+            serde_json::from_slice(bytes).map_err(|_| EnrollmentError::InvalidJoinKey)?;
+        if key.schema_version != 1
+            || !valid_typed_id(&key.join_key_id, "rjk_")
+            || parse_rfc3339(&key.expires_at).is_none()
+            || bearer_capability_id(&key.join_token, "rjk_").as_deref()
+                != Some(key.join_key_id.as_str())
+        {
+            return Err(EnrollmentError::InvalidJoinKey);
+        }
+        Ok(key)
+    }
+
+    pub fn join_key_id(&self) -> &str {
+        &self.join_key_id
+    }
+}
+
+// StagedJoinKey is what a join journal keeps of its key: enough to resend the
+// staged request, never the token, which the next start re-reads from the
+// still-supplied key.
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct StagedJoinKey {
+    join_url: String,
+    join_key_id: String,
+    expires_at: String,
+}
+
+impl From<&JoinKeyArtifact> for StagedJoinKey {
+    fn from(key: &JoinKeyArtifact) -> Self {
+        Self {
+            join_url: key.join_url.clone(),
+            join_key_id: key.join_key_id.clone(),
+            expires_at: key.expires_at.clone(),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum DeploymentMode {
@@ -157,25 +232,99 @@ pub(crate) enum ReloadStateError {
     StateUpdate,
 }
 
-#[derive(Clone, Deserialize, Serialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
+// A journal stages either an activation's enrollment or a join with a pool's
+// join key; the retained format names exactly one of the two.
+#[derive(Clone)]
+enum EnrollmentTarget {
+    Activation(ActivationArtifact),
+    Join(StagedJoinKey),
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(try_from = "StoredEnrollmentJournal")]
 struct EnrollmentJournal {
     schema_version: u8,
-    activation_artifact: ActivationArtifact,
-    #[serde(skip_serializing)]
+    target: EnrollmentTarget,
     credential_secret: String,
     credential_secret_verifier: String,
-    #[serde(skip_serializing)]
     idempotency_key: String,
     replace_credential: bool,
     staged_at: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct StoredEnrollmentJournal {
+    schema_version: u8,
+    #[serde(default)]
+    activation_artifact: Option<ActivationArtifact>,
+    #[serde(default)]
+    join_key: Option<StagedJoinKey>,
+    credential_secret: String,
+    credential_secret_verifier: String,
+    idempotency_key: String,
+    replace_credential: bool,
+    staged_at: String,
+}
+
+impl TryFrom<StoredEnrollmentJournal> for EnrollmentJournal {
+    type Error = &'static str;
+
+    fn try_from(stored: StoredEnrollmentJournal) -> Result<Self, Self::Error> {
+        let target = match (stored.activation_artifact, stored.join_key) {
+            (Some(artifact), None) => EnrollmentTarget::Activation(artifact),
+            (None, Some(join_key)) => EnrollmentTarget::Join(join_key),
+            _ => {
+                return Err(
+                    "enrollment journal names neither or both of an activation and a join key",
+                );
+            }
+        };
+        Ok(Self {
+            schema_version: stored.schema_version,
+            target,
+            credential_secret: stored.credential_secret,
+            credential_secret_verifier: stored.credential_secret_verifier,
+            idempotency_key: stored.idempotency_key,
+            replace_credential: stored.replace_credential,
+            staged_at: stored.staged_at,
+        })
+    }
+}
+
+impl EnrollmentJournal {
+    // The path is the journal's own, which an unresolved join names so the
+    // operator can find it.
+    fn activation_artifact(&self, path: &Path) -> Result<&ActivationArtifact, EnrollmentError> {
+        match &self.target {
+            EnrollmentTarget::Activation(artifact) => Ok(artifact),
+            EnrollmentTarget::Join(staged) => Err(EnrollmentError::UnresolvedJoin {
+                journal: path.to_owned(),
+                join_key_id: staged.join_key_id.clone(),
+            }),
+        }
+    }
+
+    fn credential_origin(&self) -> Result<CredentialOrigin, EnrollmentError> {
+        match &self.target {
+            EnrollmentTarget::Activation(artifact) => {
+                Ok(CredentialOrigin::Activation(activation_id(artifact)?))
+            }
+            EnrollmentTarget::Join(join_key) => {
+                Ok(CredentialOrigin::JoinKey(join_key.join_key_id.clone()))
+            }
+        }
+    }
 }
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct PersistedEnrollmentJournal<'a> {
     schema_version: u8,
-    activation_artifact: TransferableActivationArtifact<'a>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    activation_artifact: Option<TransferableActivationArtifact<'a>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    join_key: Option<&'a StagedJoinKey>,
     credential_secret: &'a str,
     credential_secret_verifier: &'a str,
     idempotency_key: &'a str,
@@ -187,7 +336,16 @@ impl<'a> From<&'a EnrollmentJournal> for PersistedEnrollmentJournal<'a> {
     fn from(journal: &'a EnrollmentJournal) -> Self {
         Self {
             schema_version: journal.schema_version,
-            activation_artifact: TransferableActivationArtifact::from(&journal.activation_artifact),
+            activation_artifact: match &journal.target {
+                EnrollmentTarget::Activation(artifact) => {
+                    Some(TransferableActivationArtifact::from(artifact))
+                }
+                EnrollmentTarget::Join(_) => None,
+            },
+            join_key: match &journal.target {
+                EnrollmentTarget::Activation(_) => None,
+                EnrollmentTarget::Join(join_key) => Some(join_key),
+            },
             credential_secret: &journal.credential_secret,
             credential_secret_verifier: &journal.credential_secret_verifier,
             idempotency_key: &journal.idempotency_key,
@@ -232,8 +390,51 @@ struct StoredRunnerCredential {
     id: String,
     #[serde(skip_serializing)]
     secret: String,
-    activation_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    activation_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    join_key_id: Option<String>,
     enrolled_at: String,
+}
+
+// A credential is created either by an activation's enrollment or by a join
+// with a pool's join key; its state names exactly one of them.
+#[derive(Clone, Eq, PartialEq)]
+enum CredentialOrigin {
+    Activation(String),
+    JoinKey(String),
+}
+
+impl StoredRunnerCredential {
+    fn new(id: String, secret: String, origin: CredentialOrigin, enrolled_at: String) -> Self {
+        let (activation_id, join_key_id) = match origin {
+            CredentialOrigin::Activation(activation_id) => (Some(activation_id), None),
+            CredentialOrigin::JoinKey(join_key_id) => (None, Some(join_key_id)),
+        };
+        Self {
+            id,
+            secret,
+            activation_id,
+            join_key_id,
+            enrolled_at,
+        }
+    }
+
+    fn origin(&self) -> Option<CredentialOrigin> {
+        match (&self.activation_id, &self.join_key_id) {
+            (Some(activation_id), None) if valid_typed_id(activation_id, "rna_") => {
+                Some(CredentialOrigin::Activation(activation_id.clone()))
+            }
+            (None, Some(join_key_id)) if valid_typed_id(join_key_id, "rjk_") => {
+                Some(CredentialOrigin::JoinKey(join_key_id.clone()))
+            }
+            _ => None,
+        }
+    }
+
+    fn activated_by(&self, activation_id: &str) -> bool {
+        self.activation_id.as_deref() == Some(activation_id)
+    }
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -263,7 +464,10 @@ struct PersistedRunnerState<'a> {
 struct PersistedRunnerCredential<'a> {
     id: &'a str,
     secret: &'a str,
-    activation_id: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    activation_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    join_key_id: Option<&'a str>,
     enrolled_at: &'a str,
 }
 
@@ -272,7 +476,8 @@ impl<'a> From<&'a StoredRunnerCredential> for PersistedRunnerCredential<'a> {
         Self {
             id: &credential.id,
             secret: &credential.secret,
-            activation_id: &credential.activation_id,
+            activation_id: credential.activation_id.as_deref(),
+            join_key_id: credential.join_key_id.as_deref(),
             enrolled_at: &credential.enrolled_at,
         }
     }
@@ -371,21 +576,107 @@ pub fn write_activation_file(
     if destination == "-" {
         return artifact.write_json(&mut io::stdout().lock());
     }
-    let path = Path::new(destination);
-    let parent = artifact_parent(path);
-    let metadata = fs::symlink_metadata(parent).map_err(|_| EnrollmentError::ArtifactWrite)?;
-    if !metadata.file_type().is_dir() {
-        return Err(EnrollmentError::UnsafePath(
-            "activation artifact parent must be a non-symbolic-link directory",
-        ));
-    }
-    let mut file = create_new_private_file(path).map_err(|_| EnrollmentError::ArtifactWrite)?;
-    artifact.write_json(&mut file)?;
-    file.sync_all()
-        .map_err(|_| EnrollmentError::ArtifactWrite)?;
-    File::open(parent)
-        .and_then(|directory| directory.sync_all())
+    let file =
+        PrivateArtifactFile::create(Path::new(destination)).map_err(|error| match error {
+            PrivateArtifactError::UnsafeDirectory => EnrollmentError::UnsafePath(
+                "activation artifact parent must be a non-symbolic-link directory",
+            ),
+            _ => EnrollmentError::ArtifactWrite,
+        })?;
+    let mut document = zeroize::Zeroizing::new(Vec::new());
+    artifact.write_json(&mut *document)?;
+    file.write(&document)
         .map_err(|_| EnrollmentError::ArtifactWrite)
+}
+
+/// A new file only the current user can read and write, which holds a
+/// secret-bearing artifact that cannot be fetched again: the activation and
+/// join key artifacts. `create` makes it empty, so a caller can refuse an
+/// unusable destination before the secret is issued; `write` fills it once.
+/// A file dropped before its content is written and synced is removed.
+pub struct PrivateArtifactFile {
+    path: PathBuf,
+    file: File,
+    written: bool,
+}
+
+impl PrivateArtifactFile {
+    /// Creates the file at `path`, with mode `0600`, in a directory that is
+    /// not a symbolic link. It never follows a symbolic link at `path` and
+    /// never replaces an existing path.
+    pub fn create(path: &Path) -> Result<Self, PrivateArtifactError> {
+        let metadata =
+            fs::symlink_metadata(artifact_parent(path)).map_err(PrivateArtifactError::Directory)?;
+        if !metadata.file_type().is_dir() {
+            return Err(PrivateArtifactError::UnsafeDirectory);
+        }
+        let file = create_new_private_file(path).map_err(PrivateArtifactError::Create)?;
+        Ok(Self {
+            path: path.to_path_buf(),
+            file,
+            written: false,
+        })
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Writes `bytes` as the file's whole content and syncs the file and its
+    /// directory. Once the content is synced the file is kept, even when its
+    /// directory cannot be synced, since the secret it holds cannot be
+    /// fetched again.
+    pub fn write(mut self, bytes: &[u8]) -> Result<(), PrivateArtifactError> {
+        self.file
+            .write_all(bytes)
+            .and_then(|()| self.file.sync_all())
+            .map_err(PrivateArtifactError::Write)?;
+        self.written = true;
+        sync_directory_io(artifact_parent(&self.path)).map_err(PrivateArtifactError::SyncDirectory)
+    }
+}
+
+impl Drop for PrivateArtifactFile {
+    fn drop(&mut self) {
+        if !self.written {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
+/// The step at which a `PrivateArtifactFile` failed, with the I/O error
+/// beneath it.
+#[derive(Debug)]
+pub enum PrivateArtifactError {
+    Directory(io::Error),
+    UnsafeDirectory,
+    Create(io::Error),
+    Write(io::Error),
+    SyncDirectory(io::Error),
+}
+
+impl fmt::Display for PrivateArtifactError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Directory(_) => "inspect its directory",
+            Self::UnsafeDirectory => "its directory must be a directory, not a symbolic link",
+            Self::Create(_) => "create it",
+            Self::Write(_) => "write it",
+            Self::SyncDirectory(_) => "sync its directory",
+        })
+    }
+}
+
+impl Error for PrivateArtifactError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Directory(error)
+            | Self::Create(error)
+            | Self::Write(error)
+            | Self::SyncDirectory(error) => Some(error),
+            Self::UnsafeDirectory => None,
+        }
+    }
 }
 
 pub fn enroll(
@@ -404,27 +695,21 @@ pub fn enroll(
         return Err(EnrollmentError::TerminalStdin);
     }
 
-    let config = load_operator_config(config_path)?;
-    let state_path = config.runner_state_path;
-    let state_directory = state_path
-        .parent()
-        .filter(|value| !value.as_os_str().is_empty())
-        .ok_or(EnrollmentError::UnsafePath(
-            "runner state path has no parent directory",
-        ))?;
-    ensure_private_directory(state_directory)?;
-    let lock_path = state_directory.join(LOCK_FILE);
-    let lock = acquire_state_lock(&lock_path)?;
-    let journal_path = state_directory.join(JOURNAL_FILE);
+    let LockedStateDirectory {
+        mode,
+        state_path,
+        journal_path,
+        _lock: lock,
+    } = LockedStateDirectory::lock(config_path)?;
 
     let journal = if resume {
         read_journal(&journal_path)?
     } else {
         let artifact = read_activation_artifact_allow_expired(
             activation_file.ok_or(EnrollmentError::InvalidCommand)?,
-            config.deployment_mode,
+            mode,
         )?;
-        let existing_state = read_runner_state_if_present(&state_path, config.deployment_mode)?;
+        let existing_state = read_runner_state_if_present(&state_path, mode)?;
         match (&existing_state, replace_credential) {
             (Some(_), false) => return Err(EnrollmentError::StateAlreadyEnrolled),
             (None, true) => return Err(EnrollmentError::ReplacementStateMissing),
@@ -434,7 +719,7 @@ pub fn enroll(
                 }
                 let artifact_activation_id = activation_id(&artifact)?;
                 let local_credential = if let Some(pending) = &state.pending_credential {
-                    if pending.activation_id != artifact_activation_id {
+                    if !pending.activated_by(&artifact_activation_id) {
                         return Err(EnrollmentError::PendingCredentialExists);
                     }
                     Some(pending)
@@ -459,28 +744,29 @@ pub fn enroll(
             }
             (None, false) => {}
         }
-        require_unexpired_artifact(&artifact)?;
-        stage_journal(&journal_path, artifact, replace_credential)?
+        require_unexpired(&artifact.expires_at, EnrollmentError::ExpiredArtifact)?;
+        stage_journal(
+            &journal_path,
+            EnrollmentTarget::Activation(artifact),
+            replace_credential,
+        )?
     };
 
-    validate_journal(&journal, config.deployment_mode)?;
+    let artifact = journal.activation_artifact(&journal_path)?;
+    validate_journal(&journal, mode)?;
     if journal.replace_credential {
-        validate_replacement_journal_local_state(&state_path, config.deployment_mode, &journal)?;
+        validate_replacement_journal_local_state(&state_path, mode, &journal, artifact)?;
     }
 
-    let request = EnrollmentRequest {
-        schema_version: 1,
-        credential_secret_verifier: &journal.credential_secret_verifier,
-    };
-    let deployment = enrollment_deployment(&journal.activation_artifact.activation_url)?;
-    match send_enrollment(&journal, &request)? {
+    let deployment = enrollment_deployment(&artifact.activation_url)?;
+    match send_enrollment(
+        &journal,
+        &artifact.activation_url,
+        &artifact.activation_token,
+    )? {
         EnrollmentHTTPOutcome::Success(response) => {
-            validate_enrollment_response(
-                &response,
-                &journal.activation_artifact,
-                config.deployment_mode,
-            )?;
-            persist_enrollment_state(&state_path, &journal, &response, config.deployment_mode)?;
+            validate_enrollment_response(&response, Some(&artifact.runner_id), mode)?;
+            persist_enrollment_state(&state_path, &journal, &response, mode)?;
             remove_and_sync(&journal_path)?;
             drop(lock);
             Ok(EnrollmentOutcome::Enrolled {
@@ -490,7 +776,7 @@ pub fn enroll(
             })
         }
         EnrollmentHTTPOutcome::Gone => {
-            let activation_id = activation_id(&journal.activation_artifact)?;
+            let activation_id = activation_id(artifact)?;
             let receipt = TerminalReceipt {
                 schema_version: 1,
                 activation_id: activation_id.clone(),
@@ -507,11 +793,194 @@ pub fn enroll(
     }
 }
 
-// Validation requires the root-level /v1/runner-enrollments/.../activate path,
-// so this origin is the API base that actually received enrollment. The
-// caller's human-auth deployment may differ from the issued artifact's target.
-fn enrollment_deployment(activation_url: &str) -> Result<String, EnrollmentError> {
-    let url = Url::parse(activation_url).map_err(|_| EnrollmentError::InvalidJournal)?;
+#[derive(Debug)]
+pub enum JoinOutcome {
+    /// The host already holds enrolled state, so it sent no join.
+    AlreadyEnrolled,
+    Joined(Box<EnrollmentResponse>),
+}
+
+/// Cloud's definite refusal of a join, a closed category.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum JoinRefusal {
+    /// 401: the token is malformed or does not verify.
+    Unauthorized,
+    /// 410: the key is revoked or expired, or the runner its exact repeat made
+    /// is deleted.
+    Gone,
+    /// 409: the pool's member is not active, the organization is at its
+    /// registration limit, or the idempotency key names another verifier.
+    Conflict,
+}
+
+impl JoinRefusal {
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::Unauthorized => "join_key_unauthorized",
+            Self::Gone => "join_key_gone",
+            Self::Conflict => "join_conflict",
+        }
+    }
+}
+
+/// Joins the key's pool when the host holds no enrolled state, and otherwise
+/// leaves the state as it is and sends nothing. A staged join left by an
+/// interrupted start is resent before anything else, and an ambiguous outcome
+/// is resent with the service's reconnect backoff, so one host registers at
+/// most one runner. A definite refusal of a join that no earlier send can have
+/// registered clears the journal; a resent join whose token Cloud rejects
+/// keeps it. The key, and with it the token, is dropped when this returns.
+pub fn join_unless_enrolled(
+    config_path: &Path,
+    key: JoinKeyArtifact,
+) -> Result<JoinOutcome, EnrollmentError> {
+    let host = LockedStateDirectory::lock(config_path)?;
+    let mode = host.mode;
+    let journal_path = &host.journal_path;
+
+    if let Some(state) = read_runner_state_if_present(&host.state_path, mode)? {
+        remove_persisted_join_journal(journal_path, &state)?;
+        return Ok(JoinOutcome::AlreadyEnrolled);
+    }
+
+    let (journal, mut resent) = match read_private_file_if_present(journal_path, STATE_LIMIT)? {
+        Some(bytes) => match serde_json::from_slice::<EnrollmentJournal>(&bytes) {
+            Ok(journal) => (journal, true),
+            Err(_) => {
+                require_terminal_receipt(&bytes)?;
+                (stage_join(journal_path, &key, mode)?, false)
+            }
+        },
+        None => (stage_join(journal_path, &key, mode)?, false),
+    };
+    let EnrollmentTarget::Join(staged) = &journal.target else {
+        return Err(EnrollmentError::UnresolvedJournal);
+    };
+    if staged.join_key_id != key.join_key_id {
+        return Err(EnrollmentError::JoinJournalForAnotherKey {
+            journal: journal_path.clone(),
+            join_key_id: staged.join_key_id.clone(),
+        });
+    }
+    validate_journal(&journal, mode)?;
+
+    let mut backoff = Backoff::new();
+    let response = loop {
+        let refusal = match send_enrollment(&journal, &staged.join_url, &key.join_token) {
+            Ok(EnrollmentHTTPOutcome::Success(response)) => break response,
+            Ok(EnrollmentHTTPOutcome::Gone) => JoinRefusal::Gone,
+            // An earlier send of this journal may have registered a runner,
+            // so the journal stays for the join to be completed or cleaned up
+            // deliberately.
+            Err(EnrollmentError::Unauthorized) if resent => {
+                return Err(EnrollmentError::StagedJoinUnauthorized {
+                    journal: journal_path.clone(),
+                    join_key_id: staged.join_key_id.clone(),
+                });
+            }
+            Err(EnrollmentError::Unauthorized) => JoinRefusal::Unauthorized,
+            Err(EnrollmentError::Conflict) => JoinRefusal::Conflict,
+            Err(EnrollmentError::NetworkAmbiguous) => {
+                resent = true;
+                um_support::sleep(backoff.next_delay());
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        remove_and_sync(journal_path)?;
+        return Err(EnrollmentError::JoinRefused(refusal));
+    };
+    drop(key);
+    validate_enrollment_response(&response, None, mode)?;
+    persist_enrollment_state(&host.state_path, &journal, &response, mode)?;
+    remove_and_sync(journal_path)?;
+    drop(host);
+    Ok(JoinOutcome::Joined(Box::new(response)))
+}
+
+/// Removes the journal of the host's own completed join, the one whose
+/// credential the enrolled state already holds, under the state lock. A start
+/// of an enrolled host calls it before serving, so the journal neither keeps a
+/// second copy of the credential secret nor blocks a later enrollment. Any
+/// other journal, and a host without enrolled state, are left as they are.
+pub fn remove_completed_join_journal(config_path: &Path) -> Result<(), EnrollmentError> {
+    let host = LockedStateDirectory::lock(config_path)?;
+    if let Some(state) = read_runner_state_if_present(&host.state_path, host.mode)? {
+        remove_persisted_join_journal(&host.journal_path, &state)?;
+    }
+    Ok(())
+}
+
+/// The operator configuration's state directory, held under its state lock
+/// until this is dropped.
+struct LockedStateDirectory {
+    mode: DeploymentMode,
+    state_path: PathBuf,
+    journal_path: PathBuf,
+    _lock: StateLock,
+}
+
+impl LockedStateDirectory {
+    fn lock(config_path: &Path) -> Result<Self, EnrollmentError> {
+        let config = load_operator_config(config_path)?;
+        let state_path = config.runner_state_path;
+        let state_directory = state_path
+            .parent()
+            .filter(|value| !value.as_os_str().is_empty())
+            .ok_or(EnrollmentError::UnsafePath(
+                "runner state path has no parent directory",
+            ))?;
+        ensure_private_directory(state_directory)?;
+        let lock = acquire_state_lock(&state_directory.join(LOCK_FILE))?;
+        Ok(Self {
+            mode: config.deployment_mode,
+            journal_path: state_directory.join(JOURNAL_FILE),
+            state_path,
+            _lock: lock,
+        })
+    }
+}
+
+fn stage_join(
+    journal_path: &Path,
+    key: &JoinKeyArtifact,
+    mode: DeploymentMode,
+) -> Result<EnrollmentJournal, EnrollmentError> {
+    validate_join_url(&key.join_url, &key.join_key_id, mode)?;
+    require_unexpired(&key.expires_at, EnrollmentError::ExpiredJoinKey)?;
+    stage_journal(
+        journal_path,
+        EnrollmentTarget::Join(StagedJoinKey::from(key)),
+        false,
+    )
+}
+
+// A start interrupted after it wrote the joined state but before it removed the
+// journal leaves a journal whose credential the state already holds; it is
+// removed so it neither keeps a second copy of the secret nor blocks a later
+// enrollment. Any other journal is left for its own resolution.
+fn remove_persisted_join_journal(path: &Path, state: &RunnerState) -> Result<(), EnrollmentError> {
+    let persisted = read_private_file_if_present(path, STATE_LIMIT)
+        .ok()
+        .flatten()
+        .and_then(|bytes| serde_json::from_slice::<EnrollmentJournal>(&bytes).ok())
+        .is_some_and(|journal| {
+            matches!(journal.target, EnrollmentTarget::Join(_))
+                && journal.credential_origin().ok() == state.current_credential.origin()
+                && journal.credential_secret == state.current_credential.secret
+        });
+    if persisted {
+        remove_and_sync(path)?;
+    }
+    Ok(())
+}
+
+// Validation requires the root-level /v1/runner-enrollments/.../activate or
+// /v1/runner-join-keys/.../join path, so this origin is the API base that
+// actually received enrollment. The caller's human-auth deployment may differ
+// from the issued artifact's target.
+fn enrollment_deployment(request_url: &str) -> Result<String, EnrollmentError> {
+    let url = Url::parse(request_url).map_err(|_| EnrollmentError::InvalidJournal)?;
     Ok(url.origin().ascii_serialization())
 }
 
@@ -527,9 +996,12 @@ enum EnrollmentHTTPOutcome {
     Gone,
 }
 
+// send_enrollment posts the journal's staged request, the same body for an
+// activation and a join, to `url` with the capability `token` as bearer.
 fn send_enrollment(
     journal: &EnrollmentJournal,
-    request: &EnrollmentRequest<'_>,
+    url: &str,
+    token: &str,
 ) -> Result<EnrollmentHTTPOutcome, EnrollmentError> {
     um_support::install_provider();
     let client = reqwest::blocking::Client::builder()
@@ -537,13 +1009,14 @@ fn send_enrollment(
         .timeout(REQUEST_TIMEOUT)
         .build()
         .map_err(|_| EnrollmentError::NetworkAmbiguous)?;
-    let body = serde_json::to_vec(request).map_err(|_| EnrollmentError::InvalidJournal)?;
+    let request = EnrollmentRequest {
+        schema_version: 1,
+        credential_secret_verifier: &journal.credential_secret_verifier,
+    };
+    let body = serde_json::to_vec(&request).map_err(|_| EnrollmentError::InvalidJournal)?;
     let mut response = client
-        .post(&journal.activation_artifact.activation_url)
-        .header(
-            "Authorization",
-            format!("Bearer {}", journal.activation_artifact.activation_token),
-        )
+        .post(url)
+        .header("Authorization", format!("Bearer {token}"))
         .header("Idempotency-Key", &journal.idempotency_key)
         .header(reqwest::header::CONTENT_TYPE, "application/json")
         .body(body)
@@ -712,10 +1185,14 @@ impl RunnerStateAccess {
             .take()
             .filter(|credential| credential.id == expected_pending_credential_id)
             .ok_or(ReloadStateError::StateUpdate)?;
+        let activation_id = pending
+            .activation_id
+            .clone()
+            .ok_or(ReloadStateError::StateUpdate)?;
         let promoted_at = now_rfc3339().map_err(|_| ReloadStateError::StateUpdate)?;
         state.last_promotion = Some(CredentialPromotion {
             credential_id: pending.id.clone(),
-            activation_id: pending.activation_id.clone(),
+            activation_id,
             promoted_at: promoted_at.clone(),
         });
         state.current_credential = pending;
@@ -748,7 +1225,7 @@ fn read_activation_artifact(
     mode: DeploymentMode,
 ) -> Result<ActivationArtifact, EnrollmentError> {
     let artifact = read_activation_artifact_allow_expired(path, mode)?;
-    require_unexpired_artifact(&artifact)?;
+    require_unexpired(&artifact.expires_at, EnrollmentError::ExpiredArtifact)?;
     Ok(artifact)
 }
 
@@ -757,13 +1234,7 @@ fn read_activation_artifact_allow_expired(
     mode: DeploymentMode,
 ) -> Result<ActivationArtifact, EnrollmentError> {
     let bytes = if path == Path::new("-") {
-        let mut bytes = Vec::new();
-        io::stdin()
-            .lock()
-            .take(ARTIFACT_LIMIT + 1)
-            .read_to_end(&mut bytes)
-            .map_err(|_| EnrollmentError::InvalidArtifact)?;
-        bytes
+        read_piped_artifact().map_err(|_| EnrollmentError::InvalidArtifact)?
     } else {
         read_bounded_regular_file(path, ARTIFACT_LIMIT, true)
             .map_err(|_| EnrollmentError::InvalidArtifact)?
@@ -776,11 +1247,19 @@ fn read_activation_artifact_allow_expired(
     Ok(artifact)
 }
 
-fn require_unexpired_artifact(artifact: &ActivationArtifact) -> Result<(), EnrollmentError> {
-    if parse_rfc3339(&artifact.expires_at)
-        .is_none_or(|expires_at| expires_at <= um_support::utc_now())
-    {
-        return Err(EnrollmentError::ExpiredArtifact);
+// The bound admits one byte over the limit so the caller can refuse it.
+fn read_piped_artifact() -> io::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    io::stdin()
+        .lock()
+        .take(ARTIFACT_LIMIT + 1)
+        .read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
+fn require_unexpired(expires_at: &str, expired: EnrollmentError) -> Result<(), EnrollmentError> {
+    if parse_rfc3339(expires_at).is_none_or(|expires_at| expires_at <= um_support::utc_now()) {
+        return Err(expired);
     }
     Ok(())
 }
@@ -804,23 +1283,32 @@ fn validate_artifact(
 }
 
 fn activation_id(artifact: &ActivationArtifact) -> Result<String, EnrollmentError> {
-    if artifact.activation_token.len() > 256 {
-        return Err(EnrollmentError::InvalidArtifact);
+    bearer_capability_id(&artifact.activation_token, "rna_").ok_or(EnrollmentError::InvalidArtifact)
+}
+
+// bearer_capability_id returns the typed id of a `<prefix><id>.<secret>`
+// capability token whose secret encodes 32 bytes.
+fn bearer_capability_id(token: &str, prefix: &str) -> Option<String> {
+    if token.len() > 256 {
+        return None;
     }
-    let (activation_id, secret) = artifact
-        .activation_token
-        .split_once('.')
-        .ok_or(EnrollmentError::InvalidArtifact)?;
-    if secret.contains('.') || !valid_typed_id(activation_id, "rna_") || !valid_secret(secret) {
-        return Err(EnrollmentError::InvalidArtifact);
+    let (id, secret) = token.split_once('.')?;
+    if secret.contains('.') || !valid_typed_id(id, prefix) || !valid_secret(secret) {
+        return None;
     }
-    let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(secret)
-        .map_err(|_| EnrollmentError::InvalidArtifact)?;
-    if decoded.len() != 32 {
-        return Err(EnrollmentError::InvalidArtifact);
+    Some(id.to_owned())
+}
+
+fn validate_join_url(
+    join_url: &str,
+    join_key_id: &str,
+    mode: DeploymentMode,
+) -> Result<(), EnrollmentError> {
+    let url = validate_cloud_url(join_url, mode, CloudURLKind::Activation)?;
+    if url.path() != format!("/v1/runner-join-keys/{join_key_id}/join") {
+        return Err(EnrollmentError::InvalidJoinKey);
     }
-    Ok(activation_id.to_owned())
+    Ok(())
 }
 
 #[derive(Clone, Copy)]
@@ -896,13 +1384,14 @@ fn raw_url_host(value: &str) -> Option<&str> {
     )
 }
 
+// A join names no runner in advance, so it expects none.
 fn validate_enrollment_response(
     response: &EnrollmentResponse,
-    artifact: &ActivationArtifact,
+    expected_runner_id: Option<&str>,
     mode: DeploymentMode,
 ) -> Result<(), EnrollmentError> {
     if response.schema_version != 1
-        || response.runner_id != artifact.runner_id
+        || expected_runner_id.is_some_and(|runner_id| response.runner_id != runner_id)
         || !valid_typed_id(&response.runner_id, "rnr_")
         || !valid_typed_id(&response.organization.id, "org_")
         || !valid_typed_id(&response.runner_pool.id, "rpl_")
@@ -922,7 +1411,7 @@ fn validate_enrollment_response(
 
 fn stage_journal(
     path: &Path,
-    artifact: ActivationArtifact,
+    target: EnrollmentTarget,
     replace_credential: bool,
 ) -> Result<EnrollmentJournal, EnrollmentError> {
     require_resolved_journal(path)?;
@@ -934,7 +1423,7 @@ fn stage_journal(
         base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(verifier.as_ref());
     let journal = EnrollmentJournal {
         schema_version: 1,
-        activation_artifact: artifact,
+        target,
         credential_secret,
         credential_secret_verifier,
         idempotency_key: generate_idempotency_key()
@@ -947,12 +1436,22 @@ fn stage_journal(
 }
 
 fn require_resolved_journal(path: &Path) -> Result<(), EnrollmentError> {
-    if let Some(bytes) = read_private_file_if_present(path, STATE_LIMIT)? {
-        let receipt = serde_json::from_slice::<TerminalReceipt>(&bytes)
-            .map_err(|_| EnrollmentError::UnresolvedJournal)?;
-        if !valid_terminal_receipt(&receipt) {
-            return Err(EnrollmentError::UnresolvedJournal);
+    let Some(bytes) = read_private_file_if_present(path, STATE_LIMIT)? else {
+        return Ok(());
+    };
+    require_terminal_receipt(&bytes).map_err(|error| {
+        match serde_json::from_slice::<EnrollmentJournal>(&bytes) {
+            Ok(journal) => journal.activation_artifact(path).err().unwrap_or(error),
+            Err(_) => error,
         }
+    })
+}
+
+fn require_terminal_receipt(bytes: &[u8]) -> Result<(), EnrollmentError> {
+    let receipt = serde_json::from_slice::<TerminalReceipt>(bytes)
+        .map_err(|_| EnrollmentError::UnresolvedJournal)?;
+    if !valid_terminal_receipt(&receipt) {
+        return Err(EnrollmentError::UnresolvedJournal);
     }
     Ok(())
 }
@@ -968,7 +1467,18 @@ fn validate_journal(
     journal: &EnrollmentJournal,
     mode: DeploymentMode,
 ) -> Result<(), EnrollmentError> {
-    validate_artifact(&journal.activation_artifact, mode)?;
+    match &journal.target {
+        EnrollmentTarget::Activation(artifact) => validate_artifact(artifact, mode)?,
+        EnrollmentTarget::Join(join_key) => {
+            if journal.replace_credential
+                || !valid_typed_id(&join_key.join_key_id, "rjk_")
+                || parse_rfc3339(&join_key.expires_at).is_none()
+            {
+                return Err(EnrollmentError::InvalidJournal);
+            }
+            validate_join_url(&join_key.join_url, &join_key.join_key_id, mode)?;
+        }
+    }
     if journal.schema_version != 1
         || !valid_secret(&journal.credential_secret)
         || !valid_secret(&journal.credential_secret_verifier)
@@ -990,13 +1500,14 @@ fn validate_replacement_journal_local_state(
     path: &Path,
     mode: DeploymentMode,
     journal: &EnrollmentJournal,
+    artifact: &ActivationArtifact,
 ) -> Result<(), EnrollmentError> {
     let state = read_runner_state_if_present(path, mode)?
         .ok_or(EnrollmentError::ReplacementStateMissing)?;
-    if state.runner_id != journal.activation_artifact.runner_id {
+    if state.runner_id != artifact.runner_id {
         return Err(EnrollmentError::RunnerMismatch);
     }
-    let activation_id = activation_id(&journal.activation_artifact)?;
+    let activation_id = activation_id(artifact)?;
     let staged = state.pending_credential.as_ref().or_else(|| {
         state
             .last_promotion
@@ -1005,7 +1516,7 @@ fn validate_replacement_journal_local_state(
             .map(|_| &state.current_credential)
     });
     if staged.is_some_and(|credential| {
-        credential.activation_id != activation_id || credential.secret != journal.credential_secret
+        !credential.activated_by(&activation_id) || credential.secret != journal.credential_secret
     }) {
         return Err(EnrollmentError::PendingCredentialExists);
     }
@@ -1018,22 +1529,22 @@ fn persist_enrollment_state(
     response: &EnrollmentResponse,
     mode: DeploymentMode,
 ) -> Result<(), EnrollmentError> {
-    let activation_id = activation_id(&journal.activation_artifact)?;
+    let origin = journal.credential_origin()?;
     let existing = read_runner_state_if_present(path, mode)?;
     if existing
         .as_ref()
-        .is_some_and(|state| enrollment_already_persisted(state, journal, response, &activation_id))
+        .is_some_and(|state| enrollment_already_persisted(state, journal, response, &origin))
     {
         return Ok(());
     }
 
     let enrolled_at = now_rfc3339()?;
-    let credential = StoredRunnerCredential {
-        id: response.credential_id.clone(),
-        secret: journal.credential_secret.clone(),
-        activation_id,
-        enrolled_at: enrolled_at.clone(),
-    };
+    let credential = StoredRunnerCredential::new(
+        response.credential_id.clone(),
+        journal.credential_secret.clone(),
+        origin,
+        enrolled_at.clone(),
+    );
     let state = if journal.replace_credential {
         let mut state = existing.ok_or(EnrollmentError::ReplacementStateMissing)?;
         if state.runner_id != response.runner_id {
@@ -1067,7 +1578,7 @@ fn enrollment_already_persisted(
     state: &RunnerState,
     journal: &EnrollmentJournal,
     response: &EnrollmentResponse,
-    activation_id: &str,
+    origin: &CredentialOrigin,
 ) -> bool {
     if state.runner_id != response.runner_id || state.connection_url != response.connection_url {
         return false;
@@ -1079,7 +1590,7 @@ fn enrollment_already_persisted(
                 .as_ref()
                 .filter(|promotion| {
                     promotion.credential_id == response.credential_id
-                        && promotion.activation_id == activation_id
+                        && *origin == CredentialOrigin::Activation(promotion.activation_id.clone())
                 })
                 .map(|_| &state.current_credential)
         })
@@ -1091,7 +1602,7 @@ fn enrollment_already_persisted(
     persisted.is_some_and(|credential| {
         credential.id == response.credential_id
             && credential.secret == journal.credential_secret
-            && credential.activation_id == activation_id
+            && credential.origin().as_ref() == Some(origin)
     })
 }
 
@@ -1114,7 +1625,9 @@ fn read_runner_state_if_present(
         })
         || state.last_promotion.as_ref().is_some_and(|promotion| {
             promotion.credential_id != state.current_credential.id
-                || promotion.activation_id != state.current_credential.activation_id
+                || !state
+                    .current_credential
+                    .activated_by(&promotion.activation_id)
                 || parse_rfc3339(&promotion.promoted_at).is_none()
         })
         || parse_rfc3339(&state.updated_at).is_none()
@@ -1131,7 +1644,7 @@ fn read_runner_state_if_present(
 fn valid_stored_credential(credential: &StoredRunnerCredential) -> bool {
     valid_typed_id(&credential.id, "rrc_")
         && valid_secret(&credential.secret)
-        && valid_typed_id(&credential.activation_id, "rna_")
+        && credential.origin().is_some()
         && parse_rfc3339(&credential.enrolled_at).is_some()
 }
 
@@ -1594,13 +2107,39 @@ pub enum EnrollmentError {
     Unauthorized,
     Conflict,
     InvalidResponse,
+    InvalidJoinKey,
+    JoinKeyFile,
+    ExpiredJoinKey,
+    /// Enrollment found a join journal, which only a start with its key
+    /// resolves.
+    UnresolvedJoin {
+        journal: PathBuf,
+        join_key_id: String,
+    },
+    /// A start's join key is not the one its host's staged join was written
+    /// for. The staged request may have registered a runner, so another key
+    /// does not supersede it.
+    JoinJournalForAnotherKey {
+        journal: PathBuf,
+        join_key_id: String,
+    },
+    /// Cloud rejected the token of a resent staged join. An earlier send may
+    /// have registered a runner, so the journal is kept for the join to be
+    /// completed or cleaned up deliberately.
+    StagedJoinUnauthorized {
+        journal: PathBuf,
+        join_key_id: String,
+    },
+    JoinRefused(JoinRefusal),
 }
 
 impl fmt::Display for EnrollmentError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let message = match self {
             Self::InvalidCommand => "runner enrollment options are inconsistent",
-            Self::TerminalStdin => "terminal stdin cannot supply an activation artifact",
+            Self::TerminalStdin => {
+                "terminal stdin cannot supply an activation artifact or join key"
+            }
             Self::InvalidConfig => "runner operator configuration is invalid",
             Self::InvalidArtifact => "activation artifact is invalid",
             Self::ExpiredArtifact => {
@@ -1634,12 +2173,60 @@ impl fmt::Display for EnrollmentError {
             Self::InvalidResponse => {
                 "enrollment response is invalid; the journal remains unresolved"
             }
+            Self::InvalidJoinKey => "join key is invalid",
+            Self::JoinKeyFile => {
+                "join key file must be a regular file owned by the current user with mode 0600 and at most 4096 bytes"
+            }
+            Self::ExpiredJoinKey => "join key has expired; issue a different join key",
+            Self::UnresolvedJoin {
+                journal,
+                join_key_id,
+            } => {
+                formatter.write_str("enrollment cannot resolve a staged join: ")?;
+                return write_staged_join(formatter, journal, join_key_id);
+            }
+            Self::JoinJournalForAnotherKey {
+                journal,
+                join_key_id,
+            } => {
+                formatter.write_str("this join key cannot resolve the host's staged join: ")?;
+                return write_staged_join(formatter, journal, join_key_id);
+            }
+            Self::StagedJoinUnauthorized {
+                journal,
+                join_key_id,
+            } => {
+                formatter.write_str(
+                    "Cloud rejected the join key's token for the host's staged join: ",
+                )?;
+                return write_staged_join(formatter, journal, join_key_id);
+            }
+            Self::JoinRefused(JoinRefusal::Unauthorized) => "Cloud rejected the join key's token",
+            Self::JoinRefused(JoinRefusal::Gone) => "the join key is revoked or expired",
+            Self::JoinRefused(JoinRefusal::Conflict) => {
+                "the pool cannot admit the join: its member is not active or the organization is at its runner limit"
+            }
         };
         formatter.write_str(message)
     }
 }
 
 impl Error for EnrollmentError {}
+
+// A staged join was written before its request was sent, so the host cannot
+// know whether Cloud registered a runner from it; the remedy keeps one host to
+// at most one runner. It names the key by id: the token is never kept.
+fn write_staged_join(
+    formatter: &mut fmt::Formatter<'_>,
+    journal: &Path,
+    join_key_id: &str,
+) -> fmt::Result {
+    let journal = journal.display();
+    write!(
+        formatter,
+        "join journal {journal} was staged for join key {join_key_id}, and Cloud may already have registered a runner from it; start um runner serve once more with join key {join_key_id}, which resends the same join, or remove {journal} after confirming in the pool that no runner joined from this host"
+    )
+}
 
 #[cfg(test)]
 mod tests;

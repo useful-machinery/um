@@ -12,7 +12,9 @@
         "direction": "runner_to_cloud",
         "messageId": "«mid-1»",
         "payload": {
-          "runnerVersion": "«ver»"
+          "runnerVersion": "«ver»",
+          "treeContinuation": 1,
+          "treeExecution": 1
         },
         "payloadVersion": 1,
         "protocolVersion": 1,

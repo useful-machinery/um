@@ -6,7 +6,7 @@ use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 
 use serde_json::{Value, json};
 
@@ -21,7 +21,10 @@ use super::workflow_run_create::Published;
 /// The login name the mirrored runs are created by, which `{{operator}}` renders.
 pub(super) const MIRROR_OPERATOR: &str = "mirror-operator";
 
-/// The team states the stub's issue offers, by name and id.
+/// The `updatedAt` the stub's issue reads with.
+pub(super) const ISSUE_UPDATED_AT: &str = "2026-11-10T12:00:00.000Z";
+
+/// The team states the stub's issue offers at first, by name and id.
 const STATES: [(&str, &str); 4] = [
     ("Engineering", "state-engineering"),
     ("Backlog", "state-backlog"),
@@ -71,16 +74,28 @@ inputs:
 
 /// A loopback stand-in for Linear's GraphQL API (REQ-LOCALRUN-192): it serves
 /// `POST /graphql` by the body's `operationName`, answering `IssueState` with the issue in
-/// its current state and the team's `STATES`, and each mutation with `success` true, or with
-/// HTTP 500 and a GraphQL error while it fails mutations. It records every body in order.
+/// its current state, by the name and the id of the team state so named, its `updatedAt`
+/// (`ISSUE_UPDATED_AT`), and its team, `team-auto` until it is moved, with the team's
+/// states, `STATES` until one is renamed, and each mutation with `success` true, or with
+/// HTTP 500 and a GraphQL error while it fails mutations. A mutation it is told to hold stays
+/// in flight, unanswered, until it is released. It records every body in order.
 pub(super) struct LinearStub {
     base: String,
     state: Arc<Mutex<StubState>>,
+    /// Notified when a held mutation is released.
+    released: Arc<Condvar>,
 }
 
 struct StubState {
     issue_state: String,
+    team: String,
+    /// The team's states by name and id.
+    states: Vec<(String, String)>,
     failing: bool,
+    /// The text a mutation's body holds that keeps it in flight until released, and whether
+    /// one is held.
+    hold: Option<String>,
+    held: bool,
     bodies: Vec<Value>,
 }
 
@@ -90,10 +105,19 @@ impl LinearStub {
         let base = format!("http://{}", listener.local_addr().unwrap());
         let state = Arc::new(Mutex::new(StubState {
             issue_state: "Engineering".to_owned(),
+            team: "team-auto".to_owned(),
+            states: STATES
+                .iter()
+                .map(|(name, id)| ((*name).to_owned(), (*id).to_owned()))
+                .collect(),
             failing: false,
+            hold: None,
+            held: false,
             bodies: Vec::new(),
         }));
         let served = Arc::clone(&state);
+        let released = Arc::new(Condvar::new());
+        let awaited = Arc::clone(&released);
         std::thread::spawn(move || {
             for stream in listener.incoming() {
                 let Ok(mut stream) = stream else { continue };
@@ -110,7 +134,14 @@ impl LinearStub {
                 let Some((path, body)) = parse_request(&request) else {
                     continue;
                 };
-                let (status, answer) = served.lock().unwrap().answer(&path, body);
+                let mut serving = served.lock().unwrap();
+                if serving.holds(&body) {
+                    serving = awaited
+                        .wait_while(serving, |state| state.hold.is_some())
+                        .unwrap();
+                }
+                let (status, answer) = serving.answer(&path, body);
+                drop(serving);
                 let answer = serde_json::to_vec(&answer).unwrap();
                 let _ = write!(
                     stream,
@@ -120,7 +151,11 @@ impl LinearStub {
                 let _ = stream.write_all(&answer);
             }
         });
-        Self { base, state }
+        Self {
+            base,
+            state,
+            released,
+        }
     }
 
     /// The state name `IssueState` answers from now on.
@@ -128,9 +163,47 @@ impl LinearStub {
         state.clone_into(&mut self.state.lock().unwrap().issue_state);
     }
 
+    /// The team id `IssueState` answers from now on, as when a person moves the issue to
+    /// another team.
+    pub(super) fn issue_team(&self, team: &str) {
+        team.clone_into(&mut self.state.lock().unwrap().team);
+    }
+
+    /// Renames the team state whose id is `id` to `name`, as a person editing the team's
+    /// workflow would.
+    pub(super) fn rename_state(&self, id: &str, name: &str) {
+        let mut state = self.state.lock().unwrap();
+        let entry = state
+            .states
+            .iter_mut()
+            .find(|(_, state_id)| state_id == id)
+            .unwrap();
+        name.clone_into(&mut entry.0);
+    }
+
     /// Whether every mutation is answered HTTP 500 with a GraphQL error.
     pub(super) fn fail_mutations(&self, failing: bool) {
         self.state.lock().unwrap().failing = failing;
+    }
+
+    /// Keeps the next mutation whose body contains `text` in flight, unanswered, until
+    /// `release_mutation`.
+    pub(super) fn hold_mutation(&self, text: &str) {
+        let mut state = self.state.lock().unwrap();
+        state.hold = Some(text.to_owned());
+        state.held = false;
+    }
+
+    /// Whether a mutation `hold_mutation` named is held in flight.
+    pub(super) fn holding_mutation(&self) -> bool {
+        let state = self.state.lock().unwrap();
+        state.held && state.hold.is_some()
+    }
+
+    /// Answers the held mutation, and holds no other.
+    pub(super) fn release_mutation(&self) {
+        self.state.lock().unwrap().hold = None;
+        self.released.notify_all();
     }
 
     /// Every request body served so far, in order.
@@ -168,6 +241,21 @@ impl LinearStub {
 }
 
 impl StubState {
+    /// Whether `body` is a mutation the stub holds, marking it held.
+    fn holds(&mut self, body: &Value) -> bool {
+        let mutation = matches!(
+            body["operationName"].as_str(),
+            Some("CreateIssueComment" | "UpdateIssueState")
+        );
+        let holds = mutation
+            && self
+                .hold
+                .as_ref()
+                .is_some_and(|text| body.to_string().contains(text.as_str()));
+        self.held |= holds;
+        holds
+    }
+
     fn answer(&mut self, path: &str, body: Value) -> (&'static str, Value) {
         let operation = body["operationName"]
             .as_str()
@@ -185,14 +273,21 @@ impl StubState {
                 ("200 OK", json!({"data": {field: {"success": true}}}))
             }
         };
+        let state_id = self
+            .states
+            .iter()
+            .find(|(name, _)| *name == self.issue_state)
+            .map_or("current", |(_, id)| id.as_str());
         match (path, operation.as_str()) {
             ("/graphql", "IssueState") => (
                 "200 OK",
                 json!({"data": {"issue": {
                     "id": "issue-1",
                     "identifier": identifier,
-                    "state": {"id": "current", "name": self.issue_state},
-                    "team": {"states": {"nodes": STATES
+                    "state": {"id": state_id, "name": self.issue_state},
+                    "updatedAt": ISSUE_UPDATED_AT,
+                    "team": {"id": self.team, "states": {"nodes": self
+                        .states
                         .iter()
                         .map(|(name, id)| json!({"id": id, "name": name}))
                         .collect::<Vec<_>>()}},
@@ -278,6 +373,35 @@ pub(super) fn mirror_writes(run: &Path) -> Vec<(String, Value)> {
         .collect::<Vec<_>>();
     writes.sort_by(|left, right| left.0.cmp(&right.0));
     writes
+}
+
+/// Writes `resolution` as revision 1's `resolution.json` (REQ-WFDEF-32) of `definition` in
+/// `home`, as the Cloud runner records the revision's resolution.
+pub(super) fn write_resolution(home: &Home, definition: &str, resolution: &Value) {
+    let path = Path::new(home.path())
+        .join("workflows")
+        .join(definition)
+        .join("revisions/1/resolution.json");
+    fs::write(path, resolution.to_string()).unwrap();
+}
+
+/// The resolution record of the engineering root's `linear.team` and `linear.state`
+/// bindings, by `STATES`' ids, without the keys in `omit`.
+pub(super) fn resolution(omit: &[&str]) -> Value {
+    let mut record = json!({"linearTeam": {"id": "team-auto", "name": "AUTO"}});
+    for (key, name) in [
+        ("ownedState", "Engineering"),
+        ("backlog", "Backlog"),
+        ("canceled", "Canceled"),
+        ("done", "Done"),
+    ] {
+        let id = STATES.iter().find(|(state, _)| *state == name).unwrap().1;
+        record[key] = json!({"id": id, "name": name});
+    }
+    for key in omit {
+        record.as_object_mut().unwrap().remove(*key);
+    }
+    record
 }
 
 /// The comment bodies the stub was sent, in order.
@@ -523,6 +647,117 @@ fn a_path_run_and_an_unmirrored_root_write_nothing() {
             .unwrap(),
     );
     assert_eq!(document["mirror"], json!([]), "{document}");
+}
+
+// REQ-WFDEF-32, REQ-LOCALRUN-191, REQ-LOCALRUN-192: once a person renamed the `Done` state,
+// a run of a revision without a resolution record finds no team state of the bound name,
+// while one of a revision with the record moves the issue by the id it resolved; `run.url`
+// is the run directory's `file://` URL, or the record's `external.url` when it has one.
+#[test]
+fn a_resolution_record_moves_the_issue_by_state_id_and_run_url_is_the_external_url() {
+    let published = engineering(true);
+    let stub = LinearStub::start();
+    stub.rename_state("state-done", "Completed");
+
+    let run = create(&published, "AUTO-1", |command| stub.point(command));
+    assert_eq!(run_record(&run)["outcome"], "landed");
+    let run_url = url::Url::from_file_path(&run).unwrap().to_string();
+    assert_eq!(
+        comments(&stub)[0],
+        format!("Engineering started by {MIRROR_OPERATOR}. Run: {run_url}")
+    );
+    assert_eq!(stub.operations().last().unwrap(), "IssueState");
+    let writes = mirror_writes(&run);
+    let (name, write) = writes.last().unwrap();
+    assert_eq!(name, "0003-outcome.json");
+    assert_eq!(write["outcome"], "failed", "{write}");
+    assert_eq!(write["code"], "mirror_state_unknown", "{write}");
+
+    write_resolution(&published.home, &published.id, &resolution(&[]));
+    stub.clear();
+    let external = "https://usefulmachinery.test/runs/run_x";
+    let run = create(&published, "AUTO-2", |command| {
+        stub.point(command)
+            .args(["--external", &format!("url={external}")])
+    });
+    assert_eq!(run_record(&run)["outcome"], "landed");
+    assert_eq!(
+        comments(&stub),
+        [
+            format!("Engineering started by {MIRROR_OPERATOR}. Run: {external}"),
+            "design: succeeded".to_owned(),
+        ]
+    );
+    assert_eq!(stub.operations()[4..], ["IssueState", "UpdateIssueState"]);
+    assert_eq!(
+        stub.bodies()[5]["variables"],
+        json!({"id": "issue-1", "input": {"stateId": "state-done"}})
+    );
+    let writes = mirror_writes(&run);
+    let (name, write) = writes.last().unwrap();
+    assert_eq!(name, "0003-outcome.json");
+    assert_eq!(write["outcome"], "written", "{write}");
+    assert_eq!(
+        write["action"],
+        json!({"kind": "state", "state": "Done", "binding": "done"})
+    );
+}
+
+// REQ-WFDEF-32, REQ-LOCALRUN-192: with a resolution record the guard
+// `issue.state != $ownedState` compares state ids: it does not hold for an issue in the
+// owned state a person renamed, and holds for one in another state now bearing the owned
+// state's name; a bound key the record gives no id is `mirror_state_unknown` and sends
+// nothing.
+#[test]
+fn with_a_resolution_record_the_guard_holds_by_state_id() {
+    let tree = MirroredWaitTree::publish(MIRRORED_WAIT_HEADER);
+    write_resolution(
+        &tree.home,
+        &tree.definition,
+        &resolution(&["linearTeam", "canceled", "done"]),
+    );
+    let stub = LinearStub::start();
+    stub.rename_state("state-engineering", "In engineering");
+    stub.issue_state("In engineering");
+
+    let renamed = tree.waiting(&stub, "AUTO-1");
+    stub.clear();
+    let output = tree.run(&stub, &["withdraw", renamed.to_str().unwrap(), "--json"]);
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert_eq!(stub.operations(), ["IssueState", "UpdateIssueState"]);
+    assert_eq!(
+        stub.bodies()[1]["variables"],
+        json!({"id": "issue-1", "input": {"stateId": "state-backlog"}})
+    );
+    let writes = mirror_writes(&renamed);
+    assert_eq!(writes.last().unwrap().1["outcome"], "written", "{writes:?}");
+
+    stub.rename_state("state-backlog", "Engineering");
+    stub.issue_state("Engineering");
+    let elsewhere = tree.waiting(&stub, "AUTO-2");
+    stub.clear();
+    let output = tree.run(&stub, &["withdraw", elsewhere.to_str().unwrap(), "--json"]);
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert_eq!(stub.operations(), ["IssueState"]);
+    let writes = mirror_writes(&elsewhere);
+    let (_, write) = writes.last().unwrap();
+    assert_eq!(write["outcome"], "skipped", "{write}");
+    assert_eq!(write["reason"], "guard_held", "{write}");
+
+    let unresolved = tree.waiting(&stub, "AUTO-3");
+    stub.clear();
+    let output = tree.run(&stub, &["cancel", unresolved.to_str().unwrap(), "--json"]);
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert_eq!(run_record(&unresolved)["outcome"], "canceled");
+    assert_eq!(stub.bodies(), Vec::<Value>::new());
+    let writes = mirror_writes(&unresolved);
+    let (_, write) = writes.last().unwrap();
+    assert_eq!(write["outcome"], "failed", "{write}");
+    assert_eq!(write["code"], "mirror_state_unknown", "{write}");
+    assert_eq!(
+        write["action"],
+        json!({"kind": "state", "state": "Canceled", "binding": "canceled"})
+    );
 }
 
 /// `um workflow run show --json`'s document.
@@ -771,6 +1006,87 @@ fn a_tickets_lifecycle_is_mirrored_and_show_lists_every_write() {
     );
 }
 
+// REQ-WFEXEC-73, REQ-LOCALRUN-191, REQ-LOCALRUN-186: a live run withdrawn while its stage runs
+// ends `withdrawn` once the stage finishes, and its process fires `onOutcome.withdrawn` once,
+// moving the issue still in the owned state to the bound `Backlog`.
+#[test]
+fn a_live_withdrawn_run_fires_its_withdrawn_outcome_once() {
+    let tree = MirroredWaitTree::publish(MIRRORED_WAIT_HEADER);
+    let stub = LinearStub::start();
+    let execution = tree.bundle.execution_root();
+    fs::write(execution.join("hold-design"), "").unwrap();
+    decide(&tree.bundle, "design", "planned");
+    let execution_root = execution.to_str().unwrap().to_owned();
+    let mut command = isolated_command(&[
+        "workflow".to_owned(),
+        "run".to_owned(),
+        "create".to_owned(),
+        tree.definition.clone(),
+        "--execution-root".to_owned(),
+        execution_root,
+        "--input-text".to_owned(),
+        "ticket".to_owned(),
+        "AUTO-4".to_owned(),
+        "--json".to_owned(),
+    ]);
+    command
+        .env("UM_HOME", tree.home.path())
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null());
+    /// Lets the held stage go if the test ends early, so its process never sleeps on.
+    struct Release(PathBuf);
+    impl Drop for Release {
+        fn drop(&mut self) {
+            let _ = fs::write(&self.0, "");
+        }
+    }
+    let release = Release(execution.join("release-design"));
+    let process = stub.point(&mut command).spawn().unwrap();
+    super::poll_until(
+        "the live run's held stage",
+        || execution.join("held-design").exists(),
+        |held| *held,
+    );
+    let withdrawn = super::poll_until(
+        "the live run's withdraw",
+        || tree.run(&stub, &["withdraw", "AUTO-4", "--json"]),
+        |output| output.status.code() == Some(0),
+    );
+    let document: Value = serde_json::from_slice(&withdrawn.stdout).unwrap();
+    assert_eq!(document["outcome"], "recorded", "{document}");
+    let run = PathBuf::from(document["runDirectory"].as_str().unwrap());
+
+    drop(release);
+    let output = process.wait_with_output().unwrap();
+    let terminal: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(terminal["result"]["outcome"], "cancelled", "{terminal}");
+    let record = run_record(&run);
+    assert_eq!(record["state"], "exited", "{record}");
+    assert_eq!(record["outcome"], "withdrawn", "{record}");
+
+    let outcomes = mirror_writes(&run)
+        .into_iter()
+        .filter(|(name, _)| name.ends_with("-outcome.json"))
+        .collect::<Vec<_>>();
+    assert_eq!(outcomes.len(), 1, "{outcomes:?}");
+    assert_eq!(outcomes[0].1["outcome"], "written", "{outcomes:?}");
+    assert_eq!(
+        outcomes[0].1["action"],
+        json!({"kind": "state", "state": "Backlog", "binding": "backlog"})
+    );
+    let updates = stub
+        .bodies()
+        .into_iter()
+        .filter(|body| body["operationName"] == "UpdateIssueState")
+        .collect::<Vec<_>>();
+    assert_eq!(updates.len(), 1, "{updates:?}");
+    assert_eq!(
+        updates[0]["variables"],
+        json!({"id": "issue-1", "input": {"stateId": "state-backlog"}})
+    );
+}
+
 // SC-LOCALRUN-15, REQ-LOCALRUN-191, REQ-LOCALRUN-135, REQ-LOCALRUN-186, REQ-LOCALRUN-204:
 // SIGINT to the process of a mirrored run interrupts its stage, whose repair wait's `onWait`
 // comment begins with the interruption, and the run writes no `onOutcome`; a live run ended
@@ -998,6 +1314,94 @@ fn ending_a_mirrored_abandoned_run_without_the_key_is_refused_before_anything_ch
     let document: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(document["outcome"], "canceled", "{document}");
     assert_eq!(run_record(&run)["outcome"], "canceled");
+}
+
+/// The first attempt of the run's `state.json`.
+fn first_attempt(run: &Path) -> Value {
+    read_json(&run.join("state.json"))["attempts"][0].clone()
+}
+
+// REQ-LOCALRUN-204, REQ-LOCALRUN-186: `resume` of a mirrored `running` run whose process is
+// gone after a withdrawal was recorded, from a shell without the key, is refused at phase
+// `continuation` and leaves the abandoned attempt unsettled with the control kept; the same
+// `resume` with the key withdraws the run and writes its `onOutcome.withdrawn` once.
+#[test]
+fn resuming_an_abandoned_run_whose_withdrawal_is_recorded_without_the_key_is_refused() {
+    let tree = MirroredWaitTree::publish(MIRRORED_WAIT_HEADER);
+    let stub = LinearStub::start();
+
+    let mut live = tree.held(&stub, "AUTO-5");
+    let withdrawn = super::poll_until(
+        "the live run's withdraw",
+        || tree.run(&stub, &["withdraw", "AUTO-5", "--json"]),
+        |output| output.status.code() == Some(0),
+    );
+    let document: Value = serde_json::from_slice(&withdrawn.stdout).unwrap();
+    assert_eq!(document["outcome"], "recorded", "{document}");
+    let run = PathBuf::from(document["runDirectory"].as_str().unwrap());
+    live.process.kill().unwrap();
+    live.process.wait().unwrap();
+    assert_eq!(run_record(&run)["state"], "running");
+    fs::write(&live.release, "").unwrap();
+    let attempt = first_attempt(&run);
+    assert_eq!(attempt.get("settledAt"), None, "{attempt}");
+    stub.clear();
+
+    // The orphaned step process ends first; until it does, the attempt's ownership is
+    // unproven and the command fails without the refusal.
+    let path = run.to_str().unwrap();
+    let output = super::poll_until(
+        "the abandoned run's refused resume",
+        || tree.run_adjusted(&stub, &["resume", path, "--json"], without_key),
+        |output| {
+            output.status.code() == Some(0)
+                || serde_json::from_slice::<Value>(&output.stdout).is_ok_and(|document| {
+                    document["diagnostics"][0]["code"] == "mirror_credentials_unavailable"
+                })
+        },
+    );
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let document: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(document["outcome"], "rejected", "{document}");
+    assert_eq!(document["phase"], "continuation", "{document}");
+    assert_eq!(
+        document["diagnostics"].as_array().unwrap().len(),
+        1,
+        "{document}"
+    );
+    assert_eq!(run_record(&run)["state"], "running");
+    assert_eq!(first_attempt(&run), attempt);
+    assert_eq!(control_names(&run), ["0001-withdraw.json"]);
+    assert!(
+        !mirror_names(&run)
+            .iter()
+            .any(|name| name.ends_with("-outcome.json")),
+        "{:?}",
+        mirror_names(&run)
+    );
+    assert_eq!(stub.bodies(), Vec::<Value>::new());
+
+    let output = tree.run(&stub, &["resume", path, "--json"]);
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let document: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(document["outcome"], "withdrawn", "{document}");
+    let record = run_record(&run);
+    assert_eq!(record["state"], "exited", "{record}");
+    assert_eq!(record["outcome"], "withdrawn", "{record}");
+    assert_eq!(record["attempts"], 1, "{record}");
+    let attempt = first_attempt(&run);
+    assert!(attempt["settledAt"].is_string(), "{attempt}");
+    assert_eq!(control_names(&run), ["0001-withdraw.json"]);
+    let outcomes = mirror_writes(&run)
+        .into_iter()
+        .filter(|(name, _)| name.ends_with("-outcome.json"))
+        .collect::<Vec<_>>();
+    assert_eq!(outcomes.len(), 1, "{outcomes:?}");
+    assert_eq!(outcomes[0].1["outcome"], "written", "{outcomes:?}");
+    assert_eq!(
+        outcomes[0].1["action"],
+        json!({"kind": "state", "state": "Backlog", "binding": "backlog"})
+    );
 }
 
 // REQ-LOCALRUN-204: a mirror whose `onOutcome` does not map the outcome writes nothing, so

@@ -26,6 +26,7 @@ pub enum CreateScheduleError {
     Status403(models::Problem),
     Status404(models::Problem),
     Status409(models::Problem),
+    Status410(models::Problem),
     Status422(models::Problem),
     Status500(models::Problem),
     UnknownValue(serde_json::Value),
@@ -66,6 +67,7 @@ pub enum EnableScheduleError {
     Status403(models::Problem),
     Status404(models::Problem),
     Status409(models::Problem),
+    Status410(models::Problem),
     Status422(models::Problem),
     Status500(models::Problem),
     UnknownValue(serde_json::Value),
@@ -126,11 +128,13 @@ pub enum UpdateScheduleError {
     Status403(models::Problem),
     Status404(models::Problem),
     Status409(models::Problem),
+    Status410(models::Problem),
     Status422(models::Problem),
     Status500(models::Problem),
     UnknownValue(serde_json::Value),
 }
 
+/// Retired with project schedules: answers 410 `schedule-model-retired` for every authenticated caller and changes nothing. Its `detail` names schedule triggers, which a published workflow definition's root declares, as the replacement. Apart from 400 for a malformed request, 401 and 500, the other responses describe the retired operation and are no longer answered.
 pub fn create_schedule(
     configuration: &configuration::Configuration,
     organization_ref: &str,
@@ -319,6 +323,7 @@ pub fn disable_schedule(
     }
 }
 
+/// Retired with project schedules: answers 410 `schedule-model-retired` for every authenticated caller and changes nothing. Its `detail` names schedule triggers, which a published workflow definition's root declares, as the replacement. Apart from 400 for a malformed request, 401 and 500, the other responses describe the retired operation and are no longer answered.
 pub fn enable_schedule(
     configuration: &configuration::Configuration,
     organization_ref: &str,
@@ -669,6 +674,7 @@ pub fn list_schedules(
     }
 }
 
+/// Retired with project schedules: answers 410 `schedule-model-retired` for every authenticated caller and changes nothing. Its `detail` names schedule triggers, which a published workflow definition's root declares, as the replacement. Apart from 400 for a malformed request, 401 and 500, the other responses describe the retired operation and are no longer answered.
 pub fn update_schedule(
     configuration: &configuration::Configuration,
     organization_ref: &str,

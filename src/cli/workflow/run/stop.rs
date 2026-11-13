@@ -1,4 +1,5 @@
-//! `um workflow run stop` and `um workflow run lift` (REQ-LOCALRUN-185).
+//! `um workflow run stop` and `um workflow run lift` (REQ-LOCALRUN-185); with `--cloud
+//! ORGANIZATION`, the control is carried to the Cloud run's runner instead (REQ-LOCALRUN-210).
 
 use std::collections::BTreeSet;
 
@@ -26,6 +27,9 @@ pub(super) struct Stop {
 
     #[command(flatten)]
     output: super::control::JsonOutput,
+
+    #[command(flatten)]
+    cloud: super::CloudSelector,
 }
 
 #[derive(Debug, Args)]
@@ -42,10 +46,25 @@ pub(super) struct Lift {
 
     #[command(flatten)]
     output: super::control::JsonOutput,
+
+    #[command(flatten)]
+    cloud: super::CloudSelector,
 }
 
 impl Stop {
-    pub(super) fn execute(self) -> super::super::super::CommandResult {
+    pub(super) fn execute(mut self) -> super::super::super::CommandResult {
+        if let Some(organization) = self.cloud.organization.take() {
+            return super::cloud::CloudRun::new(
+                self.run,
+                organization,
+                self.cloud,
+                self.output.json,
+            )?
+            .control(super::cloud::Control::Stop {
+                before: self.before,
+                reason: self.reason,
+            });
+        }
         super::control::execute(STOP_COMMAND, &self.run, self.output.json, |target| {
             self.stop(target)
         })
@@ -78,7 +97,18 @@ impl Stop {
 }
 
 impl Lift {
-    pub(super) fn execute(self) -> super::super::super::CommandResult {
+    pub(super) fn execute(mut self) -> super::super::super::CommandResult {
+        if let Some(organization) = self.cloud.organization.take() {
+            return super::cloud::CloudRun::new(
+                self.run,
+                organization,
+                self.cloud,
+                self.output.json,
+            )?
+            .control(super::cloud::Control::Lift {
+                before: self.before,
+            });
+        }
         super::control::execute(LIFT_COMMAND, &self.run, self.output.json, |target| {
             self.lift(target)
         })

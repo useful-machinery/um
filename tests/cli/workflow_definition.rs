@@ -185,8 +185,20 @@ fn engineering_tree_validates_with_digest_files_triggers_and_bindings() {
     assert_eq!(
         report["triggers"],
         json!({
-            "start": {"kind": "start", "source": "$connection", "event": "issue.state_entered"},
-            "release": {"kind": "control", "source": "$connection", "event": "issue.state_left"},
+            "start": {
+                "kind": "start",
+                "source": "$connection",
+                "event": "issue.state_entered",
+                "where": START_WHERE,
+                "subject": "event.issue.identifier",
+                "inputs": {"ticket": "event.issue.identifier", "baseBranch": "main"},
+            },
+            "release": {
+                "kind": "control",
+                "source": "$connection",
+                "event": "issue.state_left",
+                "where": START_WHERE,
+            },
         })
     );
     assert_eq!(
@@ -238,6 +250,25 @@ fn engineering_tree_validates_with_digest_files_triggers_and_bindings() {
             "missing {expected:?} in {stdout}"
         );
     }
+}
+
+// REQ-WFDEF-14: `files` lists, in bytewise order, the paths the digest covers and none
+// the root's `exclude` matches (`tests/`, `**/__pycache__/`).
+#[test]
+fn validate_json_reports_the_files_the_digest_covers() {
+    let tree = Tree::engineering();
+    tree.write("scripts/__pycache__/design.cpython-312.pyc", "cached\n");
+    let output = validate(tree.path(), true);
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert_eq!(
+        report(&output)["files"],
+        json!([
+            "design.yaml",
+            "policy/engineering.json",
+            "scripts/design.py",
+            "workflow.yaml",
+        ])
+    );
 }
 
 fn report_digest(output: &std::process::Output) -> String {
@@ -461,6 +492,32 @@ fn trigger_rules_must_name_declared_bindings_of_the_right_kind() {
     assert_eq!(code, "binding_undeclared");
     assert_eq!(location["trigger"], "start");
     assert_eq!(location["binding"], "nobody");
+}
+
+// REQ-WFDEF-10: a trigger rule outside the grammar that evaluates it is refused, the start
+// `where` against Cloud's and the control `when` against the wait's.
+#[test]
+fn trigger_rules_outside_their_grammar_are_refused() {
+    let unequal = ROOT_WORKFLOW.replacen(
+        &format!("\"{START_WHERE}\""),
+        "\"event.team != $linearTeam and event.state == $ownedState\"",
+        1,
+    );
+    let (code, location) = single_rejection(&unequal, DESIGN_WORKFLOW);
+    assert_eq!(code, "trigger_rule_invalid");
+    assert_eq!(location["kind"], "trigger");
+    assert_eq!(location["trigger"], "start");
+    assert_eq!(location["key"], "on.where");
+
+    let disjunction = ROOT_WORKFLOW.replacen(
+        "\"event.to == $canceled\"",
+        "\"event.to == $canceled or event.to == $done\"",
+        1,
+    );
+    let (code, location) = single_rejection(&disjunction, DESIGN_WORKFLOW);
+    assert_eq!(code, "trigger_rule_invalid");
+    assert_eq!(location["trigger"], "release");
+    assert_eq!(location["key"], "control.action.when");
 }
 
 // REQ-WFDEF-10
@@ -886,6 +943,166 @@ fn publish_refuses_missing_or_unusable_bindings() {
     home.assert_no_runs();
 }
 
+const MEMBER_ROOT: &str = r#"schemaVersion: 1
+name: owners
+bindings:
+  includedOwners: {kind: members, default: []}
+  reviewers: {kind: members, default: ["prn_a", "prn_b"]}
+  nightlyOwner: {kind: member}
+steps:
+  prepare:
+    kind: cmd
+    command:
+      argv: ["true"]
+"#;
+
+// REQ-WFDEF-14, REQ-WFDEF-20, REQ-WFDEF-26, REQ-WFDEF-29: `member` and `members` bindings
+// are reported with their defaults as declared and shown with their values as bound, a
+// list kept a list.
+#[test]
+fn member_bindings_are_reported_and_shown_as_typed_values() {
+    let tree = Tree::with(MEMBER_ROOT, DESIGN_WORKFLOW);
+    let output = validate(tree.path(), true);
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert_eq!(
+        report(&output)["bindings"],
+        json!({
+            "includedOwners": {"kind": "members", "default": [], "required": false},
+            "reviewers": {"kind": "members", "default": ["prn_a", "prn_b"], "required": false},
+            "nightlyOwner": {"kind": "member", "required": true},
+        })
+    );
+    let human = validate(tree.path(), false);
+    assert_eq!(human.status.code(), Some(0), "{human:?}");
+    assert_contains_all(
+        &String::from_utf8(human.stdout).expect("human output should be UTF-8"),
+        &[
+            "includedOwners: members (default [])",
+            "reviewers: members (default [\"prn_a\", \"prn_b\"])",
+            "nightlyOwner: member (required)",
+        ],
+    );
+
+    let home = Home::new();
+    let string_for_members = tree.bindings_file(
+        "string.json",
+        &json!({"nightlyOwner": "prn_x", "includedOwners": "prn_a"}),
+    );
+    let refused = home.refused(
+        &tree,
+        &["--bindings", &string_for_members],
+        "binding_value_invalid",
+    );
+    assert_eq!(refused["binding"], "includedOwners");
+
+    let owners = tree.bindings_file(
+        "owners.json",
+        &json!({"nightlyOwner": "prn_x", "includedOwners": ["prn_a"]}),
+    );
+    let published = home.publish(&tree, &["--bindings", &owners]);
+    let id = text(&published["definition"]["id"], "definition id").to_owned();
+    let shown = home.json(&["show", &id]);
+    assert_eq!(
+        shown["bindings"],
+        json!({
+            "includedOwners": {"kind": "members", "value": ["prn_a"]},
+            "reviewers": {"kind": "members", "value": ["prn_a", "prn_b"]},
+            "nightlyOwner": {"kind": "member", "value": "prn_x"},
+        })
+    );
+    assert_contains_all(
+        &home.human(&["show", &id], 0),
+        &[
+            "includedOwners: [\"prn_a\"] (members)",
+            "nightlyOwner: prn_x (member)",
+        ],
+    );
+}
+
+/// The engineering root with a start policy on `start` and a `nightly` schedule trigger.
+fn start_policy_root() -> String {
+    let replacements = [
+        (
+            "  repository:      {kind: github.repository}\n",
+            "  repository:      {kind: github.repository}\n  includedOwners:  {kind: members, default: []}\n  nightlyOwner:    {kind: member, default: \"prn_n\"}\n",
+        ),
+        (
+            "and event.state == $ownedState\"}\n    subject:",
+            "and event.state == $ownedState and event.issue.blocked == false\"}\n    stopBefore: {labels: event.issue.labels, prefix: \"hold:\"}\n    owner: {from: [event.issue.assignee, event.issue.creator], only: $includedOwners}\n    subject:",
+        ),
+        (
+            "  release:",
+            "  nightly:\n    on: {schedule: \"0 6 * * *\", timezone: \"UTC\"}\n    subject: \"nightly-sweep\"\n    owner: $nightlyOwner\n    inputs:\n      ticket: \"nightly\"\n  release:",
+        ),
+    ];
+    replacements
+        .into_iter()
+        .fold(ROOT_WORKFLOW.to_owned(), |root, (from, to)| {
+            assert!(root.contains(from), "{from}");
+            root.replacen(from, to, 1)
+        })
+}
+
+// REQ-WFDEF-10, REQ-WFDEF-14, REQ-WFDEF-30, REQ-WFDEF-31: the report prints each start
+// trigger's `where`, `subject`, `inputs`, `stopBefore` and `owner` and names a schedule
+// trigger by its kind and timetable; publishing the tree starts no run.
+#[test]
+fn start_policies_and_schedule_triggers_are_reported_and_start_nothing() {
+    let tree = Tree::with(&start_policy_root(), DESIGN_WORKFLOW);
+    let output = validate(tree.path(), true);
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert_eq!(
+        report(&output)["triggers"],
+        json!({
+            "start": {
+                "kind": "start",
+                "source": "$connection",
+                "event": "issue.state_entered",
+                "where": format!("{START_WHERE} and event.issue.blocked == false"),
+                "subject": "event.issue.identifier",
+                "inputs": {"ticket": "event.issue.identifier", "baseBranch": "main"},
+                "stopBefore": {"labels": "event.issue.labels", "prefix": "hold:"},
+                "owner": {
+                    "from": ["event.issue.assignee", "event.issue.creator"],
+                    "only": "$includedOwners",
+                },
+            },
+            "nightly": {
+                "kind": "schedule",
+                "schedule": "0 6 * * *",
+                "timezone": "UTC",
+                "subject": "nightly-sweep",
+                "inputs": {"ticket": "nightly"},
+                "owner": {"from": "$nightlyOwner"},
+            },
+            "release": {
+                "kind": "control",
+                "source": "$connection",
+                "event": "issue.state_left",
+                "where": START_WHERE,
+            },
+        })
+    );
+    let human = validate(tree.path(), false);
+    assert_eq!(human.status.code(), Some(0), "{human:?}");
+    assert_contains_all(
+        &String::from_utf8(human.stdout).expect("human output should be UTF-8"),
+        &[
+            "nightly: schedule",
+            "0 6 * * *",
+            "hold:",
+            "$includedOwners",
+            "event.issue.blocked == false",
+            "nightly-sweep",
+            "event.issue.identifier",
+        ],
+    );
+
+    let home = Home::new();
+    home.publish(&tree, &["--bindings", &tree.engineering_bindings()]);
+    home.assert_no_runs();
+}
+
 impl Home {
     /// `um workflow definition ARGS --json`, asserting it exits 0; the report.
     pub(super) fn json(&self, args: &[&str]) -> Value {
@@ -1274,4 +1491,1466 @@ fn list_and_show_refuse_a_record_not_of_the_published_shape() {
     assert_contains_all(&stdout, &["definition_record_invalid", record]);
     let stdout = home.human(&["show", &id], 1);
     assert_contains_all(&stdout, &["definition_record_invalid", record]);
+}
+
+const CLOUD_TOKEN: &str = "unique-workflow-definition-cloud-token-sentinel";
+const CLOUD_ORGANIZATION: &str = "acme-research";
+const CLOUD_PROJECT: &str = "prj_01k0z6r1w8f4jy2m7q9v3x5abc";
+const CLOUD_PUBLISHER: &str = "prn_01k0z6r1w8f4jy2m7q9v3x5abc";
+const CLOUD_TIME: &str = "2026-11-10T12:00:00Z";
+/// A minted Cloud definition id is this and one more character.
+const CLOUD_ID_STEM: &str = "def_01k0z6r1w8f4jy2m7q9v3x5ab";
+const PROBLEMS: &str = "https://api.usefulmachinery.com/problems/";
+
+/// One request the fake Gateway received, its path below the listener.
+pub(super) struct GatewayRequest {
+    pub(super) method: String,
+    pub(super) path: String,
+    headers: Vec<(String, String)>,
+    pub(super) body: Vec<u8>,
+}
+
+impl GatewayRequest {
+    pub(super) fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(candidate, _)| candidate.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.as_str())
+    }
+
+    pub(super) fn json(&self) -> Value {
+        serde_json::from_slice(&self.body).expect("request body should be JSON")
+    }
+
+    /// `METHOD path`, the path without its query.
+    pub(super) fn route(&self) -> String {
+        format!(
+            "{} {}",
+            self.method,
+            self.path.split('?').next().unwrap_or_default()
+        )
+    }
+}
+
+/// What the fake Gateway holds between invocations: the file contents the organization
+/// retains, the sealed tree digests, each definition, whether the next publication to an id
+/// loses a race to another publisher or is forbidden, whether the reply to the next create
+/// or publication is lost after it is applied, and each such reply by its `Idempotency-Key`.
+#[derive(Default)]
+struct GatewayState {
+    retained: std::collections::BTreeSet<String>,
+    sealed: std::collections::BTreeSet<String>,
+    definitions: std::collections::BTreeMap<String, FakeDefinition>,
+    lose_next_publication: bool,
+    forbid_next_publication: bool,
+    drop_next_publication_reply: bool,
+    publications: std::collections::BTreeMap<String, Value>,
+}
+
+impl GatewayState {
+    /// The reply to a create or publication keyed `key`: the one recorded under the key, or
+    /// `publish`'s, recorded and, when the next reply is to be lost, not sent (no bytes).
+    fn publication(
+        &mut self,
+        key: &str,
+        keyed: impl Fn(&str, Value) -> Vec<u8>,
+        publish: impl FnOnce(&mut Self) -> Result<Value, Vec<u8>>,
+    ) -> Vec<u8> {
+        if let Some(replayed) = self.publications.get(key) {
+            return keyed("201 Created", replayed.clone());
+        }
+        let published = match publish(self) {
+            Ok(published) => published,
+            Err(refusal) => return refusal,
+        };
+        self.publications.insert(key.to_owned(), published.clone());
+        if std::mem::take(&mut self.drop_next_publication_reply) {
+            return Vec::new();
+        }
+        keyed("201 Created", published)
+    }
+}
+
+/// One Cloud definition the fake Gateway holds: its current revision and settings.
+#[derive(Clone, Default)]
+struct FakeDefinition {
+    current: i64,
+    archived: bool,
+    automatic_starts: bool,
+    principal: Option<String>,
+}
+
+/// A loopback fake of the Gateway's tree and definition operations and of signed storage,
+/// serving one `um` invocation at a time with a stored human session for `CLOUD_TOKEN`. A
+/// tree upload reports missing the files under `scripts/` and `policy/` the organization
+/// does not yet retain.
+pub(super) struct FakeGateway {
+    listener: TcpListener,
+    api_url: String,
+    _credentials: TempDir,
+    credentials: String,
+    state: std::sync::Arc<std::sync::Mutex<GatewayState>>,
+}
+
+impl FakeGateway {
+    pub(super) fn new() -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("fake Gateway should bind");
+        let api_url = format!("http://{}/api", listener.local_addr().unwrap());
+        let directory = super::private_credential_directory();
+        let credentials = directory.path().join("credentials.json");
+        super::write_credential_fixture(
+            &credentials,
+            &api_url,
+            CLOUD_TOKEN,
+            "2999-01-01T00:00:00Z",
+        );
+        Self {
+            listener,
+            api_url,
+            credentials: credentials.to_str().unwrap().to_owned(),
+            _credentials: directory,
+            state: std::sync::Arc::default(),
+        }
+    }
+
+    /// Answers the next publication to an existing id with 409 `definition-revision-conflict`
+    /// after another publisher's revision.
+    pub(super) fn lose_next_publication(&self) {
+        self.state.lock().unwrap().lose_next_publication = true;
+    }
+
+    /// Answers the next publication to an existing id with 403 `forbidden`, as Cloud answers
+    /// a caller who is not an owner, and changes nothing.
+    pub(super) fn forbid_next_publication(&self) {
+        self.state.lock().unwrap().forbid_next_publication = true;
+    }
+
+    /// Applies the next create or publication but sends no reply to it.
+    pub(super) fn drop_next_publication_reply(&self) {
+        self.state.lock().unwrap().drop_next_publication_reply = true;
+    }
+
+    /// Holds definition `id` at revision `current`, active, disabled and with no principal.
+    pub(super) fn define(&self, id: &str, current: i64) {
+        self.state.lock().unwrap().definitions.insert(
+            id.to_owned(),
+            FakeDefinition {
+                current,
+                ..FakeDefinition::default()
+            },
+        );
+    }
+
+    /// Runs `um ARGS` against this Gateway and `home`; the output and the requests served.
+    pub(super) fn run(
+        &self,
+        home: &Home,
+        args: &[&str],
+    ) -> (std::process::Output, Vec<GatewayRequest>) {
+        let listener = self.listener.try_clone().unwrap();
+        let address = listener.local_addr().unwrap();
+        let state = std::sync::Arc::clone(&self.state);
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stopping = std::sync::Arc::clone(&stop);
+        let server = std::thread::spawn(move || {
+            let mut requests = Vec::new();
+            loop {
+                let (mut stream, _) = listener.accept().unwrap();
+                if stopping.load(std::sync::atomic::Ordering::SeqCst) {
+                    return requests;
+                }
+                let request = read_gateway_request(&stream);
+                let response = respond(&mut state.lock().unwrap(), &request, &address.to_string());
+                std::io::Write::write_all(&mut stream, &response).unwrap();
+                requests.push(request);
+            }
+        });
+        let mut environment =
+            super::deployment_environment(&self.api_url, &self.credentials).to_vec();
+        environment.push(("UM_HOME", home.path()));
+        let output = run_with_env(args, &environment);
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        let _ = std::net::TcpStream::connect(address);
+        (output, server.join().unwrap())
+    }
+}
+
+fn read_gateway_request(stream: &std::net::TcpStream) -> GatewayRequest {
+    use std::io::{BufRead as _, Read as _};
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+        .unwrap();
+    let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+    let mut line = String::new();
+    reader.read_line(&mut line).unwrap();
+    let mut parts = line.split_whitespace();
+    let method = parts.next().unwrap_or_default().to_owned();
+    let path = parts.next().unwrap_or_default().to_owned();
+    let mut headers = Vec::new();
+    loop {
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        let line = line.trim_end();
+        if line.is_empty() {
+            break;
+        }
+        let (name, value) = line.split_once(':').expect("header should have a colon");
+        headers.push((name.trim().to_ascii_lowercase(), value.trim().to_owned()));
+    }
+    let length = headers
+        .iter()
+        .find(|(name, _)| name == "content-length")
+        .map_or(0, |(_, value)| value.parse().unwrap());
+    let mut body = vec![0; length];
+    reader.read_exact(&mut body).unwrap();
+    GatewayRequest {
+        method,
+        path,
+        headers,
+        body,
+    }
+}
+
+/// The 404 `not-found` problem the fake answers for anything it does not hold.
+fn gateway_not_found() -> Vec<u8> {
+    super::problem_http_response(
+        "404 Not Found",
+        json!({"type": format!("{PROBLEMS}not-found"), "title": "Not Found", "status": 404}),
+    )
+}
+
+fn respond(state: &mut GatewayState, request: &GatewayRequest, address: &str) -> Vec<u8> {
+    let organization = format!("/api/v1/organizations/{CLOUD_ORGANIZATION}");
+    let definitions = format!("{organization}/projects/{CLOUD_PROJECT}/workflow-definitions");
+    let route = request.route();
+    let key = request
+        .header("idempotency-key")
+        .unwrap_or_default()
+        .to_owned();
+    let keyed = |status: &str, body: Value| {
+        super::http_response_with_headers(
+            status,
+            Some("application/json"),
+            &[("Idempotency-Key", &key), ("Location", "/v1/fixture")],
+            &serde_json::to_vec(&body).unwrap(),
+        )
+    };
+    if route == format!("POST {organization}/workflow-trees") {
+        let manifest = request.json();
+        let digest = text(&manifest["digest"], "manifest digest").to_owned();
+        let sealed = state.sealed.contains(&digest);
+        let capabilities =
+            if sealed {
+                Vec::new()
+            } else {
+                manifest["files"]
+                .as_array()
+                .expect("manifest files should be a list")
+                .iter()
+                .filter(|file| {
+                    let path = text(&file["path"], "manifest path");
+                    (path.starts_with("scripts/") || path.starts_with("policy/"))
+                        && !state.retained.contains(text(&file["sha256"], "file sha256"))
+                })
+                .map(|file| {
+                    let sha256 = text(&file["sha256"], "file sha256");
+                    let raw = (0..sha256.len())
+                        .step_by(2)
+                        .map(|at| u8::from_str_radix(&sha256[at..at + 2], 16).unwrap())
+                        .collect::<Vec<_>>();
+                    json!({
+                        "sha256": sha256,
+                        "url": format!("http://{address}/storage/{sha256}?X-Amz-Signature=fixture"),
+                        "requiredHeaders": {
+                            "contentLength": file["sizeBytes"].to_string(),
+                            "contentType": "application/octet-stream",
+                            "ifNoneMatch": "*",
+                            "xAmzChecksumSha256": base64::Engine::encode(
+                                &base64::engine::general_purpose::STANDARD, raw),
+                        },
+                    })
+                })
+                .collect()
+            };
+        let expires = if capabilities.is_empty() {
+            Value::Null
+        } else {
+            json!("2999-01-01T00:00:00Z")
+        };
+        return super::json_http_response(
+            "200 OK",
+            json!({
+                "tree": gateway_tree(&digest, sealed),
+                "capabilityExpiresAt": expires,
+                "capabilities": capabilities,
+            }),
+        );
+    }
+    if let Some(sha256) = route.strip_prefix("PUT /storage/") {
+        let observed = ring::digest::digest(&ring::digest::SHA256, &request.body);
+        let hex = observed
+            .as_ref()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        assert_eq!(
+            hex, sha256,
+            "an uploaded object should have its manifest digest"
+        );
+        state.retained.insert(hex);
+        return super::http_response("200 OK", None, b"");
+    }
+    if let Some(digest) = route
+        .strip_prefix(&format!("POST {organization}/workflow-trees/"))
+        .and_then(|rest| rest.strip_suffix("/seal"))
+    {
+        let digest = digest.replace("%3A", ":").replace("%3a", ":");
+        state.sealed.insert(digest.clone());
+        return keyed("200 OK", gateway_tree(&digest, true));
+    }
+    if route == format!("POST {definitions}") {
+        let body = request.json();
+        return state.publication(&key, keyed, |state| {
+            let id = format!(
+                "{CLOUD_ID_STEM}{}",
+                ['c', 'd', 'e', 'f', 'g', 'h'][state.definitions.len()]
+            );
+            state.definitions.insert(
+                id.clone(),
+                FakeDefinition {
+                    current: 1,
+                    ..FakeDefinition::default()
+                },
+            );
+            Ok(gateway_publication(
+                &id,
+                &state.definitions[&id],
+                &body["treeDigest"],
+            ))
+        });
+    }
+    if let Some(response) = respond_settings(state, request, &definitions, keyed) {
+        return response;
+    }
+    if let Some((id, evaluation)) = route
+        .strip_prefix(&format!("GET {definitions}/"))
+        .and_then(|rest| rest.split_once("/evaluations"))
+    {
+        return super::json_http_response(
+            "200 OK",
+            match evaluation.strip_prefix('/') {
+                Some(evaluation) => gateway_evaluation(id, evaluation),
+                None => json!({
+                    "items": [gateway_evaluation(id, CLOUD_EVALUATION)],
+                    "nextCursor": "older-evaluations",
+                }),
+            },
+        );
+    }
+    if let Some(id) = route.strip_prefix(&format!("GET {definitions}/")) {
+        return match state.definitions.get(id) {
+            Some(definition) => {
+                super::json_http_response("200 OK", gateway_definition(id, definition))
+            }
+            None => gateway_not_found(),
+        };
+    }
+    if let Some(id) = route
+        .strip_prefix(&format!("POST {definitions}/"))
+        .and_then(|rest| rest.strip_suffix("/revisions"))
+    {
+        let body = request.json();
+        return state.publication(&key, keyed, |state| {
+            let lose = std::mem::take(&mut state.lose_next_publication);
+            let forbid = std::mem::take(&mut state.forbid_next_publication);
+            let Some(definition) = state.definitions.get_mut(id) else {
+                return Err(gateway_not_found());
+            };
+            if forbid {
+                return Err(super::problem_http_response(
+                    "403 Forbidden",
+                    json!({"type": format!("{PROBLEMS}forbidden"), "title": "Forbidden", "status": 403}),
+                ));
+            }
+            if lose {
+                definition.current += 1;
+            }
+            if body["expectedCurrentRevision"] != json!(definition.current) {
+                return Err(super::problem_http_response(
+                    "409 Conflict",
+                    json!({
+                        "type": format!("{PROBLEMS}definition-revision-conflict"),
+                        "title": "Definition revision conflict",
+                        "status": 409,
+                        "workflow": {"currentRevision": definition.current},
+                    }),
+                ));
+            }
+            definition.current += 1;
+            Ok(gateway_publication(id, definition, &body["treeDigest"]))
+        });
+    }
+    gateway_not_found()
+}
+
+fn gateway_tree(digest: &str, sealed: bool) -> Value {
+    json!({
+        "digest": digest,
+        "state": if sealed { "sealed" } else { "uploading" },
+        "sizeBytes": 512,
+        "fileCount": 4,
+        "name": if sealed { json!("engineering") } else { Value::Null },
+        "createdAt": CLOUD_TIME,
+        "sealedAt": if sealed { json!(CLOUD_TIME) } else { Value::Null },
+    })
+}
+
+fn gateway_definition(id: &str, definition: &FakeDefinition) -> Value {
+    json!({
+        "id": id,
+        "projectId": CLOUD_PROJECT,
+        "name": "engineering",
+        "state": if definition.archived { "archived" } else { "active" },
+        "automaticStarts": definition.automatic_starts,
+        "executionPrincipalId": definition.principal,
+        "currentRevision": definition.current,
+        "createdAt": CLOUD_TIME,
+        "updatedAt": CLOUD_TIME,
+    })
+}
+
+const CLOUD_EVALUATION: &str = "wev_01k0z6r1w8f4jy2m7q9v3x5abc";
+
+/// A failed start evaluation `evaluation` of definition `id` with its stored reason.
+fn gateway_evaluation(id: &str, evaluation: &str) -> Value {
+    json!({
+        "id": evaluation,
+        "definitionId": id,
+        "revision": 2,
+        "triggerName": "start-on-todo",
+        "connectionId": "lnc_01k0z6r1w8f4jy2m7q9v3x5abc",
+        "executionPrincipalId": CLOUD_PRINCIPAL,
+        "eventName": "issue.state_entered",
+        "event": {
+            "issue": {"id": "issue-7", "identifier": "AUTO-7"},
+            "issueUpdatedAt": CLOUD_TIME,
+            "team": CLOUD_TEAM_ID,
+            "state": "state-todo",
+            "actor": null,
+            "at": CLOUD_TIME,
+        },
+        "state": "failed",
+        "reason": "owner_unresolved",
+        "observations": null,
+        "runId": null,
+        "blockingRunId": null,
+        "cycleNumber": 1,
+        "attemptNumber": 2,
+        "cycleStartedAt": CLOUD_TIME,
+        "cycleDeadline": "2026-11-11T12:00:00Z",
+        "nextAttemptAt": null,
+        "acceptedAt": CLOUD_TIME,
+        "expiresAt": "2026-12-10T12:00:00Z",
+        "settledAt": CLOUD_TIME,
+    })
+}
+
+fn gateway_publication(id: &str, definition: &FakeDefinition, tree_digest: &Value) -> Value {
+    json!({
+        "definition": gateway_definition(id, definition),
+        "revision": {
+            "definitionId": id,
+            "number": definition.current,
+            "treeDigest": tree_digest,
+            "bindings": {},
+            "resolution": {},
+            "publishedAt": CLOUD_TIME,
+            "publishedBy": CLOUD_PUBLISHER,
+        },
+    })
+}
+
+fn cloud_publish_args<'a>(tree: &'a Tree, bindings: &'a str, extra: &[&'a str]) -> Vec<&'a str> {
+    let mut args = vec![
+        "workflow",
+        "definition",
+        "publish",
+        tree.path(),
+        "--bindings",
+        bindings,
+        "--cloud",
+        CLOUD_ORGANIZATION,
+        "--project",
+        CLOUD_PROJECT,
+        "--allow-insecure-http",
+    ];
+    args.extend_from_slice(extra);
+    args
+}
+
+fn routes(requests: &[GatewayRequest]) -> Vec<String> {
+    requests.iter().map(GatewayRequest::route).collect()
+}
+
+// REQ-CLOUDDEF-14, REQ-WFDEF-7, REQ-WFDEF-23
+#[test]
+fn publish_cloud_creates_then_publishes_to_the_recorded_cloud_definition() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let home = Home::new();
+    let tree = Tree::engineering();
+    fs::set_permissions(
+        Path::new(tree.path()).join("scripts/design.py"),
+        fs::Permissions::from_mode(0o755),
+    )
+    .expect("script should become executable");
+    let bindings = tree.engineering_bindings();
+    let gateway = FakeGateway::new();
+    let organization = format!("/api/v1/organizations/{CLOUD_ORGANIZATION}");
+    let definitions = format!("{organization}/projects/{CLOUD_PROJECT}/workflow-definitions");
+
+    let (output, requests) = gateway.run(&home, &cloud_publish_args(&tree, &bindings, &["--json"]));
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert_no_content(&output);
+    super::assert_no_secret_output(&output, &[CLOUD_TOKEN]);
+    let first = report(&output);
+    assert_eq!(first["outcome"], "published", "{first}");
+    let id = text(&first["definition"]["id"], "definition id").to_owned();
+    let digest = text(&first["revision"]["tree"], "tree digest").to_owned();
+    assert_eq!(first["revision"]["n"], 1);
+    let cloud_id = text(&first["cloud"]["definition"], "cloud definition id").to_owned();
+    assert!(
+        cloud_id.starts_with(CLOUD_ID_STEM) && is_definition_id(&cloud_id),
+        "{first}"
+    );
+    assert_eq!(first["cloud"]["created"], true);
+    assert_eq!(first["cloud"]["revision"], 1);
+    assert_eq!(first["cloud"]["treeDigest"], digest.as_str());
+    let record_path = home.definition_directory(&id).join("definition.json");
+    let record = read_json(&record_path);
+    assert_eq!(record["cloudId"], cloud_id.as_str());
+    assert!(
+        schema("workflow-definition-v1.schema.json").is_valid(&record),
+        "{record}"
+    );
+
+    let seal = format!(
+        "POST {organization}/workflow-trees/{}/seal",
+        digest.replace(':', "%3A")
+    );
+    let stored = |path: &str| {
+        let bytes = fs::read(Path::new(tree.path()).join(path)).unwrap();
+        let sha256 = ring::digest::digest(&ring::digest::SHA256, &bytes)
+            .as_ref()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        (bytes, sha256)
+    };
+    let (script, script_sha) = stored("scripts/design.py");
+    let (policy, policy_sha) = stored("policy/engineering.json");
+    assert_eq!(
+        routes(&requests),
+        vec![
+            format!("POST {organization}/workflow-trees"),
+            format!("PUT /storage/{policy_sha}"),
+            format!("PUT /storage/{script_sha}"),
+            seal,
+            format!("POST {definitions}"),
+        ]
+    );
+    let manifest = requests[0].json();
+    assert_eq!(manifest["digest"], digest.as_str());
+    let files = manifest["files"].as_array().expect("manifest files");
+    assert_eq!(
+        files
+            .iter()
+            .map(|file| (text(&file["path"], "path"), file["executable"].as_bool()))
+            .collect::<Vec<_>>(),
+        vec![
+            ("design.yaml", Some(false)),
+            ("policy/engineering.json", Some(false)),
+            ("scripts/design.py", Some(true)),
+            ("workflow.yaml", Some(false)),
+        ]
+    );
+    let script_entry = &files[2];
+    assert_eq!(script_entry["sha256"], script_sha.as_str());
+    assert_eq!(script_entry["sizeBytes"], script.len());
+    assert_eq!(requests[1].body, policy);
+    assert_eq!(requests[2].body, script);
+    assert_eq!(requests[1].header("if-none-match"), Some("*"));
+    let key = requests[3]
+        .header("idempotency-key")
+        .expect("seal key")
+        .to_owned();
+    assert_eq!(requests[4].header("idempotency-key"), Some(key.as_str()));
+    for request in [&requests[0], &requests[3], &requests[4]] {
+        assert_eq!(
+            request.header("authorization"),
+            Some(format!("Bearer {CLOUD_TOKEN}").as_str())
+        );
+    }
+    let created = requests[4].json();
+    assert_eq!(created["treeDigest"], digest.as_str());
+    assert_eq!(created["bindings"]["linearTeam"], "AUTO");
+    assert_eq!(created["bindings"]["ownedState"], "Engineering");
+
+    // A second publish reads the recorded Cloud definition's revision and publishes to it.
+    let (output, requests) = gateway.run(&home, &cloud_publish_args(&tree, &bindings, &["--json"]));
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let second = report(&output);
+    assert_eq!(second["revision"]["n"], 2);
+    assert_eq!(second["cloud"]["definition"], cloud_id.as_str());
+    assert_eq!(second["cloud"]["created"], false);
+    assert_eq!(second["cloud"]["revision"], 2);
+    assert_eq!(
+        routes(&requests),
+        vec![
+            format!("POST {organization}/workflow-trees"),
+            format!("GET {definitions}/{cloud_id}"),
+            format!("POST {definitions}/{cloud_id}/revisions"),
+        ]
+    );
+    assert_eq!(requests[2].json()["expectedCurrentRevision"], 1);
+    assert_eq!(requests[2].json()["treeDigest"], digest.as_str());
+    assert_ne!(requests[2].header("idempotency-key"), Some(key.as_str()));
+    assert_eq!(read_json(&record_path)["cloudId"], cloud_id.as_str());
+
+    // A refusal leaves the local revision recorded and names the problem type.
+    gateway.lose_next_publication();
+    let (output, requests) = gateway.run(&home, &cloud_publish_args(&tree, &bindings, &[]));
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert_eq!(requests.len(), 3);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("definition-revision-conflict"), "{stderr}");
+    let record = read_json(&record_path);
+    assert_eq!(record["current"], 3);
+    assert_eq!(record["cloudId"], cloud_id.as_str());
+
+    // `--cloud-new` creates another Cloud definition and records it.
+    let (output, requests) = gateway.run(
+        &home,
+        &cloud_publish_args(&tree, &bindings, &["--cloud-new", "--json"]),
+    );
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let fourth = report(&output);
+    let other = text(&fourth["cloud"]["definition"], "cloud definition id").to_owned();
+    assert_ne!(other, cloud_id);
+    assert_eq!(fourth["cloud"]["created"], true);
+    assert_eq!(fourth["cloud"]["revision"], 1);
+    assert_eq!(fourth["revision"]["n"], 4);
+    assert_eq!(
+        routes(&requests),
+        vec![
+            format!("POST {organization}/workflow-trees"),
+            format!("POST {definitions}"),
+        ]
+    );
+    assert_eq!(read_json(&record_path)["cloudId"], other.as_str());
+    assert_eq!(home.workflow_entries(), vec![id]);
+}
+
+// REQ-CLOUDDEF-14
+#[test]
+fn publish_cloud_resends_a_lost_publication_once_and_publishes_executable_bits() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let home = Home::new();
+    let tree = Tree::engineering();
+    let script = Path::new(tree.path()).join("scripts/design.py");
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o755))
+        .expect("script should become executable");
+    let bindings = tree.engineering_bindings();
+    let gateway = FakeGateway::new();
+    let definitions = format!(
+        "/api/v1/organizations/{CLOUD_ORGANIZATION}/projects/{CLOUD_PROJECT}/workflow-definitions"
+    );
+
+    // The create's reply is lost: it is sent once more under the same key and creates one
+    // definition, recorded as the local definition's `cloudId`.
+    gateway.drop_next_publication_reply();
+    let (output, requests) = gateway.run(&home, &cloud_publish_args(&tree, &bindings, &["--json"]));
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let first = report(&output);
+    assert_eq!(first["outcome"], "published", "{first}");
+    let cloud_id = text(&first["cloud"]["definition"], "cloud definition id").to_owned();
+    assert_eq!(first["cloud"]["created"], true);
+    let digest = text(&first["revision"]["tree"], "tree digest").to_owned();
+    let creates = requests
+        .iter()
+        .filter(|request| request.route() == format!("POST {definitions}"))
+        .collect::<Vec<_>>();
+    assert_eq!(creates.len(), 2, "{:?}", routes(&requests));
+    let key = creates[0].header("idempotency-key").expect("create key");
+    assert_eq!(creates[1].header("idempotency-key"), Some(key));
+    assert_eq!(creates[0].body, creates[1].body);
+    assert_eq!(
+        creates[0].json()["executablePaths"],
+        json!(["scripts/design.py"])
+    );
+    assert_eq!(
+        gateway
+            .state
+            .lock()
+            .unwrap()
+            .definitions
+            .keys()
+            .collect::<Vec<_>>(),
+        vec![&cloud_id]
+    );
+    let id = text(&first["definition"]["id"], "definition id").to_owned();
+    let record_path = home.definition_directory(&id).join("definition.json");
+    assert_eq!(read_json(&record_path)["cloudId"], cloud_id.as_str());
+
+    // Clearing the last executable bit leaves the digest and publishes a new revision that
+    // runs no file executable.
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o644))
+        .expect("script should stop being executable");
+    let (output, requests) = gateway.run(&home, &cloud_publish_args(&tree, &bindings, &["--json"]));
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let second = report(&output);
+    assert_eq!(second["revision"]["tree"], digest.as_str());
+    assert_eq!(second["cloud"]["definition"], cloud_id.as_str());
+    assert_eq!(second["cloud"]["revision"], 2);
+    let published = requests
+        .iter()
+        .find(|request| request.route() == format!("POST {definitions}/{cloud_id}/revisions"))
+        .expect("publication request")
+        .json();
+    assert_eq!(published["treeDigest"], digest.as_str());
+    assert_eq!(published["executablePaths"], json!([]));
+}
+
+// REQ-CLOUDDEF-14, REQ-WFDEF-19
+#[test]
+fn publish_cloud_flags_without_their_companions_are_usage_errors_that_write_nothing() {
+    let home = Home::new();
+    let tree = Tree::engineering();
+    for args in [
+        vec!["publish", tree.path(), "--cloud", CLOUD_ORGANIZATION],
+        vec!["publish", tree.path(), "--project", CLOUD_PROJECT],
+        vec!["publish", tree.path(), "--cloud-new"],
+        vec!["publish", tree.path(), "--cloud-to", CLOUD_TARGET],
+        vec![
+            "publish",
+            tree.path(),
+            "--cloud",
+            CLOUD_ORGANIZATION,
+            "--project",
+            CLOUD_PROJECT,
+            "--cloud-to",
+            CLOUD_TARGET,
+            "--cloud-new",
+        ],
+    ] {
+        let output = home.run(&args);
+        assert_eq!(output.status.code(), Some(2), "{args:?}: {output:?}");
+        assert!(output.stdout.is_empty());
+    }
+    assert!(home.workflow_entries().is_empty());
+}
+
+/// A Cloud definition id of the definition id shape that no fake Gateway mints.
+const CLOUD_TARGET: &str = "def_01k0z6r1w8f4jy2m7q9v3x5abz";
+
+/// The fake's definitions, each with its current revision.
+fn gateway_definitions(gateway: &FakeGateway) -> Vec<(String, i64)> {
+    gateway
+        .state
+        .lock()
+        .unwrap()
+        .definitions
+        .iter()
+        .map(|(id, definition)| (id.clone(), definition.current))
+        .collect()
+}
+
+/// The record `report` published under `home`.
+fn published_record(home: &Home, report: &Value) -> Value {
+    let id = text(&report["definition"]["id"], "definition id");
+    read_json(&home.definition_directory(id).join("definition.json"))
+}
+
+// REQ-CLOUDDEF-20, REQ-CLOUDDEF-14, REQ-WFDEF-19
+#[test]
+fn publish_cloud_to_publishes_a_fresh_home_s_revision_to_the_named_cloud_definition() {
+    let (first_home, second_home) = (Home::new(), Home::new());
+    let tree = Tree::engineering();
+    let bindings = tree.engineering_bindings();
+    let gateway = FakeGateway::new();
+    let organization = format!("/api/v1/organizations/{CLOUD_ORGANIZATION}");
+    let definitions = format!("{organization}/projects/{CLOUD_PROJECT}/workflow-definitions");
+
+    // The first home creates the Cloud definition; a create names no target.
+    let (output, _) = gateway.run(
+        &first_home,
+        &cloud_publish_args(&tree, &bindings, &["--json"]),
+    );
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let created = report(&output);
+    let cloud_id = text(&created["cloud"]["definition"], "cloud definition id").to_owned();
+    assert_eq!(created["cloud"]["created"], true);
+    assert!(created["cloud"].get("target").is_none(), "{created}");
+
+    // The second home, which has never published, finds the id with `cloud list`.
+    let list = [
+        "workflow",
+        "definition",
+        "cloud",
+        "list",
+        CLOUD_ORGANIZATION,
+        CLOUD_PROJECT,
+        "--json",
+        "--allow-insecure-http",
+    ];
+    let (output, _) = gateway.run(&second_home, &list);
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let listed = report(&output);
+    assert_eq!(
+        listed["definitions"][0]["id"],
+        cloud_id.as_str(),
+        "{listed}"
+    );
+    assert!(second_home.workflow_entries().is_empty());
+
+    let (output, requests) = gateway.run(
+        &second_home,
+        &cloud_publish_args(&tree, &bindings, &["--cloud-to", &cloud_id, "--json"]),
+    );
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert_no_content(&output);
+    super::assert_no_secret_output(&output, &[CLOUD_TOKEN]);
+    let targeted = report(&output);
+    assert_eq!(targeted["outcome"], "published", "{targeted}");
+    assert_eq!(targeted["definition"]["created"], true);
+    assert_eq!(targeted["revision"]["n"], 1);
+    assert_eq!(targeted["cloud"]["created"], false);
+    assert_eq!(targeted["cloud"]["definition"], cloud_id.as_str());
+    assert_eq!(targeted["cloud"]["target"], cloud_id.as_str());
+    assert_eq!(targeted["cloud"]["revision"], 2);
+    assert_eq!(
+        routes(&requests),
+        vec![
+            format!("POST {organization}/workflow-trees"),
+            format!("GET {definitions}/{cloud_id}"),
+            format!("POST {definitions}/{cloud_id}/revisions"),
+        ]
+    );
+    assert_eq!(requests[2].json()["expectedCurrentRevision"], 1);
+    let record = published_record(&second_home, &targeted);
+    assert_eq!(record["cloudId"], cloud_id.as_str());
+    assert!(
+        schema("workflow-definition-v1.schema.json").is_valid(&record),
+        "{record}"
+    );
+    let (output, _) = gateway.run(&second_home, &list);
+    assert_eq!(
+        report(&output)["definitions"].as_array().map(Vec::len),
+        Some(1)
+    );
+
+    // The recorded id is the target of the next publication from that home.
+    let (output, requests) = gateway.run(
+        &second_home,
+        &cloud_publish_args(&tree, &bindings, &["--json"]),
+    );
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let recorded = report(&output);
+    assert_eq!(recorded["definition"]["created"], false);
+    assert_eq!(recorded["cloud"]["created"], false);
+    assert_eq!(recorded["cloud"]["definition"], cloud_id.as_str());
+    assert_eq!(recorded["cloud"]["target"], cloud_id.as_str());
+    assert_eq!(recorded["cloud"]["revision"], 3);
+    assert!(
+        !routes(&requests).contains(&format!("POST {definitions}")),
+        "{:?}",
+        routes(&requests)
+    );
+
+    // A changed root name resolves a new local record and still updates the named definition.
+    let renamed = Tree::with(
+        &ROOT_WORKFLOW.replacen("name: engineering\n", "name: alpha\n", 1),
+        DESIGN_WORKFLOW,
+    );
+    let renamed_bindings = renamed.engineering_bindings();
+    let (output, requests) = gateway.run(
+        &second_home,
+        &cloud_publish_args(
+            &renamed,
+            &renamed_bindings,
+            &["--cloud-to", &cloud_id, "--json"],
+        ),
+    );
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let moved = report(&output);
+    assert_eq!(moved["definition"]["created"], true);
+    assert_eq!(moved["cloud"]["definition"], cloud_id.as_str());
+    assert_eq!(moved["cloud"]["revision"], 4);
+    // The new tree is uploaded and sealed, then published to the named id.
+    let moved_routes = routes(&requests);
+    assert!(
+        moved_routes.ends_with(&[
+            format!("GET {definitions}/{cloud_id}"),
+            format!("POST {definitions}/{cloud_id}/revisions"),
+        ]),
+        "{moved_routes:?}"
+    );
+    assert!(
+        !moved_routes.contains(&format!("POST {definitions}")),
+        "{moved_routes:?}"
+    );
+    assert_eq!(second_home.workflow_entries().len(), 2);
+    assert_eq!(
+        published_record(&second_home, &moved)["cloudId"],
+        cloud_id.as_str()
+    );
+    assert_eq!(gateway_definitions(&gateway), vec![(cloud_id, 4)]);
+}
+
+/// No request created a Cloud definition, in the addressed project or any other.
+fn assert_no_definition_created(requests: &[GatewayRequest]) {
+    let routes = routes(requests);
+    assert!(
+        !routes
+            .iter()
+            .any(|route| route.starts_with("POST ") && route.ends_with("/workflow-definitions")),
+        "{routes:?}"
+    );
+}
+
+// REQ-CLOUDDEF-20: a named target is published to whatever Cloud id the local record
+// holds and replaces it once Cloud accepts; a refused target leaves the recorded id as it
+// was and creates nothing.
+#[test]
+fn publish_cloud_to_replaces_the_recorded_cloud_definition_only_once_cloud_accepts() {
+    let home = Home::new();
+    let tree = Tree::engineering();
+    let bindings = tree.engineering_bindings();
+    let gateway = FakeGateway::new();
+    let definitions = format!(
+        "/api/v1/organizations/{CLOUD_ORGANIZATION}/projects/{CLOUD_PROJECT}/workflow-definitions"
+    );
+
+    // The home creates one Cloud definition and records its id.
+    let (output, _) = gateway.run(&home, &cloud_publish_args(&tree, &bindings, &["--json"]));
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let created = report(&output);
+    let recorded = text(&created["cloud"]["definition"], "cloud definition id").to_owned();
+    assert_eq!(
+        published_record(&home, &created)["cloudId"],
+        recorded.as_str()
+    );
+
+    // Naming another Cloud definition publishes there, not to the recorded one.
+    let named = CLOUD_TARGET;
+    assert_ne!(named, recorded);
+    gateway.define(named, 5);
+    let (output, requests) = gateway.run(
+        &home,
+        &cloud_publish_args(&tree, &bindings, &["--cloud-to", named, "--json"]),
+    );
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let moved = report(&output);
+    assert_eq!(moved["cloud"]["created"], false, "{moved}");
+    assert_eq!(moved["cloud"]["definition"], named);
+    assert_eq!(moved["cloud"]["revision"], 6);
+    let moved_routes = routes(&requests);
+    assert!(
+        moved_routes.ends_with(&[
+            format!("GET {definitions}/{named}"),
+            format!("POST {definitions}/{named}/revisions"),
+        ]),
+        "{moved_routes:?}"
+    );
+    assert!(
+        !moved_routes.iter().any(|route| route.contains(&recorded)),
+        "{moved_routes:?}"
+    );
+    assert_no_definition_created(&requests);
+    assert_eq!(published_record(&home, &moved)["cloudId"], named);
+    assert_eq!(
+        gateway_definitions(&gateway),
+        vec![(recorded.clone(), 1), (named.to_owned(), 6)]
+    );
+
+    // A target Cloud refuses leaves the record naming the definition it last published to.
+    let absent = format!("{CLOUD_ID_STEM}y");
+    let (output, requests) = gateway.run(
+        &home,
+        &cloud_publish_args(&tree, &bindings, &["--cloud-to", &absent, "--json"]),
+    );
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let refused = report(&output);
+    assert_eq!(refused["cloud"]["failure"], "refused", "{refused}");
+    assert_eq!(refused["cloud"]["target"], absent.as_str());
+    assert_no_definition_created(&requests);
+    assert_eq!(published_record(&home, &refused)["cloudId"], named);
+    assert_eq!(
+        gateway_definitions(&gateway),
+        vec![(recorded, 1), (named.to_owned(), 6)]
+    );
+}
+
+// REQ-CLOUDDEF-20, REQ-CLOUDDEF-14, REQ-WFDEF-27
+#[test]
+fn publish_cloud_to_refusals_create_nothing_and_leave_the_record_unlinked() {
+    let tree = Tree::engineering();
+    let bindings = tree.engineering_bindings();
+    let gateway = FakeGateway::new();
+    let cloud_id = format!("{CLOUD_ID_STEM}c");
+    gateway.define(&cloud_id, 2);
+    // Publishes from a fresh home with `args`, asserting a Cloud refusal of `target` with
+    // `status` and `problem`, no create in any project, and a local record still without a
+    // `cloudId`.
+    let refused = |args: &[&str], target: &str, status: u16, problem: &str| {
+        let home = Home::new();
+        let (output, requests) = gateway.run(&home, args);
+        assert_eq!(output.status.code(), Some(1), "{output:?}");
+        let failed = report(&output);
+        assert_eq!(failed["outcome"], "cloud_failed", "{failed}");
+        assert_eq!(failed["cloud"]["failure"], "refused");
+        assert_eq!(failed["cloud"]["status"], status);
+        assert_eq!(failed["cloud"]["problem"], problem);
+        assert_eq!(failed["cloud"]["target"], target);
+        assert!(failed["cloud"].get("definition").is_none(), "{failed}");
+        assert_no_definition_created(&requests);
+        assert_eq!(published_record(&home, &failed)["cloudId"], Value::Null);
+        failed
+    };
+
+    refused(
+        &cloud_publish_args(&tree, &bindings, &["--cloud-to", CLOUD_TARGET, "--json"]),
+        CLOUD_TARGET,
+        404,
+        "not-found",
+    );
+    assert_eq!(gateway_definitions(&gateway), vec![(cloud_id.clone(), 2)]);
+
+    let other_project = [
+        "workflow",
+        "definition",
+        "publish",
+        tree.path(),
+        "--bindings",
+        &bindings,
+        "--cloud",
+        CLOUD_ORGANIZATION,
+        "--project",
+        "prj_01k0z6r1w8f4jy2m7q9v3x5xyz",
+        "--cloud-to",
+        &cloud_id,
+        "--allow-insecure-http",
+        "--json",
+    ];
+    refused(&other_project, &cloud_id, 404, "not-found");
+    assert_eq!(gateway_definitions(&gateway), vec![(cloud_id.clone(), 2)]);
+
+    gateway.forbid_next_publication();
+    refused(
+        &cloud_publish_args(&tree, &bindings, &["--cloud-to", &cloud_id, "--json"]),
+        &cloud_id,
+        403,
+        "forbidden",
+    );
+    assert_eq!(gateway_definitions(&gateway), vec![(cloud_id.clone(), 2)]);
+
+    // Another publisher's revision 3 lands first: the conflict carries it.
+    gateway.lose_next_publication();
+    let conflict = refused(
+        &cloud_publish_args(&tree, &bindings, &["--cloud-to", &cloud_id, "--json"]),
+        &cloud_id,
+        409,
+        "definition-revision-conflict",
+    );
+    assert_eq!(conflict["cloud"]["workflow"]["currentRevision"], 3);
+    assert_eq!(gateway_definitions(&gateway), vec![(cloud_id.clone(), 3)]);
+
+    // A target not of the definition id shape is refused before anything is written or sent.
+    let home = Home::new();
+    let (output, requests) = gateway.run(
+        &home,
+        &cloud_publish_args(
+            &tree,
+            &bindings,
+            &["--cloud-to", "def_not-a-cloud-id", "--json"],
+        ),
+    );
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let invalid = report(&output);
+    assert_eq!(invalid["outcome"], "refused", "{invalid}");
+    assert_eq!(invalid["diagnostics"][0]["code"], "definition_id_invalid");
+    assert!(requests.is_empty(), "{:?}", routes(&requests));
+    assert!(home.workflow_entries().is_empty());
+    assert_eq!(gateway_definitions(&gateway), vec![(cloud_id, 3)]);
+}
+
+const CLOUD_PRINCIPAL: &str = "prn_01k0z6r1w8f4jy2m7q9v3x5xyz";
+const CLOUD_TEAM_ID: &str = "8f2c4c9e-team-automation";
+
+/// The tree digest the fake records for revision `number`.
+fn gateway_tree_digest(number: i64) -> String {
+    format!("sha256:{number:0>64}")
+}
+
+/// Revision `number` of `id`, with one Linear team binding and its resolution.
+fn gateway_revision(id: &str, number: i64) -> Value {
+    json!({
+        "definitionId": id,
+        "number": number,
+        "treeDigest": gateway_tree_digest(number),
+        "bindings": {"linearTeam": {"kind": "linear.team", "value": "AUTO"}},
+        "resolution": {"linearTeam": {
+            "kind": "linear.team", "value": "AUTO", "id": CLOUD_TEAM_ID, "name": "Automation",
+        }},
+        "publishedAt": CLOUD_TIME,
+        "publishedBy": CLOUD_PUBLISHER,
+    })
+}
+
+/// The definition list, the revision reads and the setting changes; an enable without an
+/// execution principal is refused 409 `definition-not-startable`.
+fn respond_settings(
+    state: &mut GatewayState,
+    request: &GatewayRequest,
+    definitions: &str,
+    keyed: impl Fn(&str, Value) -> Vec<u8>,
+) -> Option<Vec<u8>> {
+    let route = request.route();
+    if route == format!("GET {definitions}") {
+        let items = state
+            .definitions
+            .iter()
+            .map(|(id, definition)| gateway_definition(id, definition))
+            .collect::<Vec<_>>();
+        return Some(super::json_http_response("200 OK", json!({"items": items})));
+    }
+    let (method, rest) = route.split_once(' ')?;
+    let (id, action) = rest
+        .strip_prefix(definitions)?
+        .strip_prefix('/')?
+        .split_once('/')?;
+    let definition = state.definitions.get_mut(id)?;
+    match (method, action) {
+        ("GET", "revisions") => {
+            let items = (1..=definition.current)
+                .rev()
+                .map(|number| gateway_revision(id, number))
+                .collect::<Vec<_>>();
+            return Some(super::json_http_response("200 OK", json!({"items": items})));
+        }
+        ("GET", action) => {
+            let number = action.strip_prefix("revisions/")?.parse().ok()?;
+            return Some(super::json_http_response(
+                "200 OK",
+                gateway_revision(id, number),
+            ));
+        }
+        ("POST", "enable") if definition.principal.is_none() => {
+            return Some(super::problem_http_response(
+                "409 Conflict",
+                json!({
+                    "type": format!("{PROBLEMS}definition-not-startable"),
+                    "title": "Definition not startable",
+                    "status": 409,
+                    "workflow": {"startCheck": "execution-principal"},
+                }),
+            ));
+        }
+        ("POST", "enable") => definition.automatic_starts = true,
+        ("POST", "disable") => definition.automatic_starts = false,
+        ("POST", "archive") => {
+            definition.archived = true;
+            definition.automatic_starts = false;
+        }
+        ("POST", "unarchive") => definition.archived = false,
+        ("PUT", "execution-principal") => {
+            definition.principal =
+                Some(text(&request.json()["principalId"], "principal id").to_owned());
+        }
+        _ => return None,
+    }
+    Some(keyed("200 OK", gateway_definition(id, definition)))
+}
+
+// REQ-CLOUDDEF-15
+#[test]
+fn cloud_group_lists_shows_and_administers_cloud_definitions() {
+    let home = Home::new();
+    let gateway = FakeGateway::new();
+    let first = format!("{CLOUD_ID_STEM}c");
+    let second = format!("{CLOUD_ID_STEM}d");
+    gateway.define(&second, 1);
+    gateway.define(&first, 2);
+    let definitions = format!(
+        "/api/v1/organizations/{CLOUD_ORGANIZATION}/projects/{CLOUD_PROJECT}/workflow-definitions"
+    );
+    let cloud = |args: &[&str]| {
+        let mut all = vec!["workflow", "definition", "cloud"];
+        all.extend_from_slice(args);
+        all.push("--allow-insecure-http");
+        let (output, requests) = gateway.run(&home, &all);
+        super::assert_no_secret_output(&output, &[CLOUD_TOKEN]);
+        for request in &requests {
+            assert_eq!(
+                request.header("authorization"),
+                Some(format!("Bearer {CLOUD_TOKEN}").as_str())
+            );
+        }
+        (output, requests)
+    };
+    let target = |leaf: &'static str, json: bool| {
+        let mut args = vec![
+            leaf,
+            CLOUD_ORGANIZATION,
+            first.as_str(),
+            "--project-id",
+            CLOUD_PROJECT,
+        ];
+        if json {
+            args.push("--json");
+        }
+        args
+    };
+
+    let (output, requests) = cloud(&["list", CLOUD_ORGANIZATION, CLOUD_PROJECT, "--json"]);
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let listed = report(&output);
+    assert_eq!(listed["outcome"], "listed", "{listed}");
+    assert_eq!(listed["organizationRef"], CLOUD_ORGANIZATION);
+    assert_eq!(listed["projectId"], CLOUD_PROJECT);
+    let items = listed["definitions"].as_array().expect("definitions");
+    assert_eq!(
+        items
+            .iter()
+            .map(|item| (text(&item["id"], "id"), item["currentRevision"].as_i64()))
+            .collect::<Vec<_>>(),
+        vec![(first.as_str(), Some(2)), (second.as_str(), Some(1))]
+    );
+    assert_eq!(routes(&requests), vec![format!("GET {definitions}")]);
+
+    let (output, requests) = cloud(&target("show", false));
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_contains_all(
+        &stdout,
+        &[
+            &first,
+            &gateway_tree_digest(2),
+            &gateway_tree_digest(1),
+            "linearTeam",
+            CLOUD_TEAM_ID,
+            "Automation",
+            CLOUD_PUBLISHER,
+        ],
+    );
+    assert_eq!(
+        routes(&requests),
+        vec![
+            format!("GET {definitions}/{first}"),
+            format!("GET {definitions}/{first}/revisions/2"),
+            format!("GET {definitions}/{first}/revisions"),
+        ]
+    );
+    let (output, _) = cloud(&target("show", true));
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let shown = report(&output);
+    assert_eq!(shown["outcome"], "shown", "{shown}");
+    assert_eq!(shown["definition"]["id"], first.as_str());
+    assert_eq!(shown["revision"]["number"], 2);
+    assert_eq!(shown["revision"]["treeDigest"], gateway_tree_digest(2));
+    assert_eq!(
+        shown["revision"]["resolution"]["linearTeam"]["id"],
+        CLOUD_TEAM_ID
+    );
+    assert_eq!(
+        shown["revisions"]
+            .as_array()
+            .expect("revisions")
+            .iter()
+            .map(|revision| revision["number"].as_i64())
+            .collect::<Vec<_>>(),
+        vec![Some(2), Some(1)]
+    );
+
+    // Enabling without an execution principal is refused with the problem type.
+    let (output, requests) = cloud(&target("enable", false));
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_contains_all(
+        &stderr,
+        &["definition-not-startable", "execution-principal"],
+    );
+    assert_eq!(
+        routes(&requests),
+        vec![format!("POST {definitions}/{first}/enable")]
+    );
+    assert!(requests[0].header("idempotency-key").is_some());
+    let (output, _) = cloud(&target("enable", true));
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let refused = report(&output);
+    assert_eq!(refused["outcome"], "refused", "{refused}");
+    assert_eq!(refused["status"], 409);
+    assert_eq!(refused["problem"], "definition-not-startable");
+    assert_eq!(refused["workflow"]["startCheck"], "execution-principal");
+
+    let mut args = target("set-principal", true);
+    args.insert(3, CLOUD_PRINCIPAL);
+    let (output, requests) = cloud(&args);
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let set = report(&output);
+    assert_eq!(set["outcome"], "principal_set", "{set}");
+    assert_eq!(set["definition"]["executionPrincipalId"], CLOUD_PRINCIPAL);
+    assert_eq!(
+        routes(&requests),
+        vec![format!("PUT {definitions}/{first}/execution-principal")]
+    );
+    assert_eq!(requests[0].json(), json!({"principalId": CLOUD_PRINCIPAL}));
+    assert!(requests[0].header("idempotency-key").is_some());
+
+    let (output, requests) = cloud(&target("enable", true));
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let enabled = report(&output);
+    assert_eq!(enabled["outcome"], "enabled", "{enabled}");
+    assert_eq!(enabled["definition"]["automaticStarts"], true);
+    assert_eq!(
+        routes(&requests),
+        vec![format!("POST {definitions}/{first}/enable")]
+    );
+
+    for (leaf, state, automatic_starts) in [
+        ("disable", "active", false),
+        ("archive", "archived", false),
+        ("unarchive", "active", false),
+    ] {
+        let (output, requests) = cloud(&target(leaf, true));
+        assert_eq!(output.status.code(), Some(0), "{leaf}: {output:?}");
+        let changed = report(&output);
+        assert_eq!(changed["outcome"], format!("{leaf}d"), "{changed}");
+        assert_eq!(changed["definition"]["state"], state);
+        assert_eq!(changed["definition"]["automaticStarts"], automatic_starts);
+        assert_eq!(
+            routes(&requests),
+            vec![format!("POST {definitions}/{first}/{leaf}")]
+        );
+    }
+    assert!(home.workflow_entries().is_empty());
+}
+
+// REQ-CLOUDDEF-15: `evaluation list` sends its filters and page as typed and `evaluation
+// show` reads one evaluation; both report each evaluation's state and stored reason.
+#[test]
+fn cloud_evaluations_are_listed_with_their_filters_and_shown_with_their_reason() {
+    let home = Home::new();
+    let gateway = FakeGateway::new();
+    let definition = format!("{CLOUD_ID_STEM}c");
+    gateway.define(&definition, 2);
+    let evaluations = format!(
+        "/api/v1/organizations/{CLOUD_ORGANIZATION}/projects/{CLOUD_PROJECT}/workflow-definitions/{definition}/evaluations"
+    );
+    let run_id = "run_01k0z6r1w8f4jy2m7q9v3x5abc";
+    let evaluation = |args: &[&str]| {
+        let mut all = vec!["workflow", "definition", "cloud", "evaluation"];
+        all.extend_from_slice(args);
+        all.push("--allow-insecure-http");
+        let (output, requests) = gateway.run(&home, &all);
+        super::assert_no_secret_output(&output, &[CLOUD_TOKEN]);
+        (output, requests)
+    };
+    let list = |extra: &[&str]| {
+        let mut args = vec![
+            "list",
+            CLOUD_ORGANIZATION,
+            definition.as_str(),
+            "--project-id",
+            CLOUD_PROJECT,
+        ];
+        args.extend_from_slice(extra);
+        evaluation(&args)
+    };
+
+    let (output, requests) = list(&[
+        "--state", "failed", "--run-id", run_id, "--limit", "5", "--cursor", "page-2", "--json",
+    ]);
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert_eq!(requests.len(), 1);
+    let (path, query) = requests[0].path.split_once('?').expect("a query");
+    assert_eq!(path, evaluations);
+    let mut pairs = query.split('&').collect::<Vec<_>>();
+    pairs.sort_unstable();
+    assert_eq!(
+        pairs,
+        [
+            "cursor=page-2",
+            "limit=5",
+            &format!("runId={run_id}"),
+            "state=failed"
+        ]
+    );
+    let listed = report(&output);
+    assert_eq!(
+        listed["command"],
+        "um workflow definition cloud evaluation list"
+    );
+    assert_eq!(listed["outcome"], "listed", "{listed}");
+    assert_eq!(listed["organizationRef"], CLOUD_ORGANIZATION);
+    assert_eq!(listed["projectId"], CLOUD_PROJECT);
+    assert_eq!(listed["definitionId"], definition.as_str());
+    assert_eq!(listed["nextCursor"], "older-evaluations");
+    let items = listed["evaluations"].as_array().expect("evaluations");
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0], gateway_evaluation(&definition, CLOUD_EVALUATION));
+
+    let (output, requests) = list(&[]);
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert_eq!(requests[0].path, evaluations);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_contains_all(
+        &stdout,
+        &[
+            CLOUD_EVALUATION,
+            "failed",
+            "owner_unresolved",
+            "start-on-todo",
+            "older-evaluations",
+        ],
+    );
+
+    let show = |json: bool| {
+        let mut args = vec![
+            "show",
+            CLOUD_ORGANIZATION,
+            definition.as_str(),
+            CLOUD_EVALUATION,
+            "--project-id",
+            CLOUD_PROJECT,
+        ];
+        if json {
+            args.push("--json");
+        }
+        evaluation(&args)
+    };
+    let (output, requests) = show(true);
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert_eq!(
+        routes(&requests),
+        vec![format!("GET {evaluations}/{CLOUD_EVALUATION}")]
+    );
+    let shown = report(&output);
+    assert_eq!(shown["outcome"], "shown", "{shown}");
+    assert_eq!(
+        shown["evaluation"],
+        gateway_evaluation(&definition, CLOUD_EVALUATION)
+    );
+    let (output, _) = show(false);
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert_contains_all(
+        &String::from_utf8_lossy(&output.stdout),
+        &[
+            CLOUD_EVALUATION,
+            "failed",
+            "owner_unresolved",
+            "AUTO-7",
+            CLOUD_PRINCIPAL,
+        ],
+    );
+    assert!(home.workflow_entries().is_empty());
 }

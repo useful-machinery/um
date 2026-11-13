@@ -12,6 +12,7 @@ impl AssignmentManager {
             sleeper,
             source_broker,
             input_broker,
+            tree_run,
             execution_version,
             recorder,
             guard_processes,
@@ -44,6 +45,7 @@ impl AssignmentManager {
             sleeper,
             source_broker,
             input_broker,
+            tree_run,
             recorder,
             runner_id: config.credential().runner_id().to_owned(),
             run_events: BTreeMap::new(),
@@ -428,6 +430,7 @@ impl AssignmentManager {
         let worker_offer = offer.clone();
         let environment = self.environment.clone();
         let input_broker = self.input_broker.clone();
+        let tree_run = self.tree_run.clone();
         let mut runtime = self.admission_runtime();
         let agent_login_directory = self.agent_login_directory.clone();
         let agent_login_setup = self.agent_login_setup.clone();
@@ -464,12 +467,13 @@ impl AssignmentManager {
             if let Some(setup) = &agent_login_setup {
                 let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| setup.set_up()));
             }
-            // The steps draw from the process environment with the agent
-            // logins the runner keeps now, looked at for this admission
-            // (REQ-AGENTLOGIN-27, REQ-AGENTLOGIN-34); a selected provider's
-            // login the runner keeps none of is withheld instead, and the
-            // engine refuses an agent step that would have received it
-            // (REQ-AGENTLOGIN-41, INV-RUNNER-17).
+            // The steps, a tree run's `um` commands included, draw from the
+            // process environment with the agent logins the runner keeps now,
+            // looked at for this admission (REQ-AGENTLOGIN-27,
+            // REQ-AGENTLOGIN-34); a selected provider's login the runner keeps
+            // none of is withheld instead, and the engine refuses an agent
+            // step that would have received it (REQ-AGENTLOGIN-41,
+            // INV-RUNNER-17).
             let offered =
                 crate::agent_login::offer(&runtime.environment, agent_login_directory.as_ref());
             runtime.environment = offered.environment;
@@ -480,130 +484,60 @@ impl AssignmentManager {
             runtime.harness_login_observer = agent_login_setup
                 .as_ref()
                 .and_then(|setup| setup.observer(offered.offered));
+            if let Some(tree) = &worker_offer.execution_spec.workflow_tree {
+                let mut root = root;
+                let preparation = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let admission = TreeAdmission {
+                        runtime: &runtime,
+                        tree_run: &tree_run,
+                        broker: Arc::clone(&broker),
+                        input_broker: input_broker.as_deref(),
+                        environment: &environment,
+                        offer: &worker_offer,
+                        tree,
+                        deadline,
+                        cancellation: &worker_cancellation,
+                        sleeper: Arc::clone(&sleeper),
+                    };
+                    match &worker_offer.continuation {
+                        Some(continuation) => admission.adopt(&mut root, continuation),
+                        None => admission.prepare(&mut root),
+                    }
+                }));
+                let admission = match preparation {
+                    Ok(Ok(prepared)) => runtime.finish_tree(
+                        &worker_offer,
+                        root,
+                        prepared,
+                        PreparationAuthority {
+                            deadline,
+                            cancellation: &worker_cancellation,
+                            monotonic_now: sleeper.now(),
+                        },
+                    ),
+                    Ok(Err(decline)) => Err(Box::new((root, decline))),
+                    Err(_) => Err(Box::new((root, environment_unavailable()))),
+                };
+                let _ = sender.send(ManagerEvent::Prepared {
+                    offer: Box::new(worker_offer),
+                    prepare_effect_id,
+                    deadline,
+                    admission: Box::new(admission),
+                });
+                wake.wake();
+                return;
+            }
             let mut root = root;
             let workspace_path = root.workspace.path();
             let preparation = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 if let Some(continuation) = &worker_offer.continuation {
-                    if runtime.work_root.boot_id()
-                        != Some(continuation.required_runner_boot_id.as_str())
-                    {
-                        runtime.preparation_failure(
-                            &worker_offer,
-                            "continuation_boot_identity",
-                            "boot_mismatch",
-                        );
-                        return Err(environment_unavailable());
-                    }
-                    runtime
-                        .work_root
-                        .claim_retained_for_attempt(
-                            &mut root,
-                            super::super::workspace::RetainedClaimRequest {
-                                assignment_id: &worker_offer.assignment_id,
-                                run_id: &worker_offer.run_id,
-                                attempt_id: &worker_offer.attempt_id,
-                                prior_assignment_id: &continuation.prior_assignment_id,
-                                prior_attempt_id: &continuation.prior_attempt_id,
-                                recorded_root: Path::new(&continuation.execution_root),
-                            },
-                        )
-                        .inspect_err(|&error| {
-                            runtime.preparation_failure(
-                                &worker_offer,
-                                "continuation_retained_claim",
-                                match error {
-                                    AssignmentRootCreationError::OwnershipUnproven => {
-                                        "ownership_unproven"
-                                    }
-                                    AssignmentRootCreationError::Unavailable => "unavailable",
-                                    AssignmentRootCreationError::CleanupFailed => "cleanup_failed",
-                                    AssignmentRootCreationError::RetainedClaimCleanup(site) => site,
-                                },
-                            );
-                        })
-                        .map_err(|error| match error {
-                            AssignmentRootCreationError::OwnershipUnproven => {
-                                AssignmentDecline::RunnerUnable(
-                                    RunnerUnableReason::OwnershipUnproven,
-                                )
-                            }
-                            AssignmentRootCreationError::Unavailable => {
-                                AssignmentDecline::RunnerUnable(
-                                    RunnerUnableReason::RetainedWorkspaceUnavailable,
-                                )
-                            }
-                            _ => environment_unavailable(),
-                        })?;
-                    // Snapshot after the durable claim, on this blocking worker.
-                    // An unavailable snapshot is explicit evidence, not a reason
-                    // to substitute null or to read the unclaimed workspace.
-                    root.continuation_snapshot = Some(
-                        um_execution::capture_cloud_continuation_snapshot(
-                            &root.execution,
-                            continuation.prior_settlement_snapshot.as_ref(),
-                        )
-                        .map_err(|_| {
-                            runtime.preparation_failure(
-                                &worker_offer,
-                                "continuation_snapshot",
-                                "capture_failed",
-                            );
-                            environment_unavailable()
-                        })?,
-                    );
-                    let proof = root.retained_quiescence.ok_or_else(|| {
-                        runtime.preparation_failure(
-                            &worker_offer,
-                            "continuation_quiescence",
-                            "proof_absent",
-                        );
-                        environment_unavailable()
-                    })?;
-                    let snapshot = root
-                        .continuation_snapshot
-                        .as_ref()
-                        .ok_or_else(environment_unavailable)?;
-                    let proven_at = sleeper
-                        .utc_now()
-                        .format(&time::format_description::well_known::Rfc3339)
-                        .map_err(|_| {
-                            runtime.preparation_failure(
-                                &worker_offer,
-                                "continuation_clock",
-                                "format_failed",
-                            );
-                            environment_unavailable()
-                        })?;
-                    root.continuation_proven_at = Some(proven_at.clone());
-                    let id = runtime
-                        .outbox
-                        .enqueue(AssignmentObservation::ContinuationReady {
-                            assignment_id: worker_offer.assignment_id.clone(),
-                            attempt_id: worker_offer.attempt_id.clone(),
-                            start_snapshot: snapshot.start_snapshot.clone(),
-                            quiescence: serde_json::json!({
-                                "groupsRecorded": proof.recorded,
-                                "groupsTerminated": proof.terminated,
-                                "groupsAbsent": proof.absent,
-                                "provenAt": proven_at,
-                            }),
-                            modified: snapshot.modified.clone(),
-                        })
-                        .map_err(|_| {
-                            runtime.preparation_failure(
-                                &worker_offer,
-                                "continuation_ready_outbox",
-                                "enqueue_failed",
-                            );
-                            environment_unavailable()
-                        })?;
-                    tokio::runtime::Handle::current().block_on(
-                        runtime.outbox.wait_for_continuation_ready(
-                            id,
-                            deadline,
-                            &worker_cancellation,
-                            sleeper.as_ref(),
-                        ),
+                    runtime.prove_continuation(
+                        &worker_offer,
+                        continuation,
+                        &mut root,
+                        deadline,
+                        &worker_cancellation,
+                        sleeper.as_ref(),
                     )?;
                 }
                 let separate_definition = worker_offer.execution_spec.schema_version == 3;
@@ -1063,5 +997,244 @@ impl AssignmentManager {
             }
         }
         Ok(())
+    }
+}
+
+impl AdmissionRuntime {
+    /// Proves the retained workspace a continuation offer names (REQ-CONTINUE-47 to 49),
+    /// on the calling blocking worker: the offer's boot is this one, the retained chain
+    /// is claimed for the new attempt and quiesced, the workspace is snapshotted, and
+    /// `continuation_ready` is sent and acknowledged before preparation goes on.
+    fn prove_continuation(
+        &self,
+        offer: &AssignmentOffer,
+        continuation: &ContinuationOffer,
+        root: &mut AssignmentRoot,
+        deadline: PreparationDeadline,
+        cancellation: &CaptureCancellation,
+        sleeper: &dyn Sleeper,
+    ) -> Result<(), AssignmentDecline> {
+        if self.work_root.boot_id() != Some(continuation.required_runner_boot_id.as_str()) {
+            self.preparation_failure(offer, "continuation_boot_identity", "boot_mismatch");
+            return Err(environment_unavailable());
+        }
+        self.work_root
+            .claim_retained_for_attempt(
+                root,
+                super::super::workspace::RetainedClaimRequest {
+                    assignment_id: &offer.assignment_id,
+                    run_id: &offer.run_id,
+                    attempt_id: &offer.attempt_id,
+                    prior_assignment_id: &continuation.prior_assignment_id,
+                    prior_attempt_id: &continuation.prior_attempt_id,
+                    recorded_root: Path::new(&continuation.execution_root),
+                },
+            )
+            .inspect_err(|&error| {
+                self.preparation_failure(
+                    offer,
+                    "continuation_retained_claim",
+                    match error {
+                        AssignmentRootCreationError::OwnershipUnproven => "ownership_unproven",
+                        AssignmentRootCreationError::Unavailable => "unavailable",
+                        AssignmentRootCreationError::CleanupFailed => "cleanup_failed",
+                        AssignmentRootCreationError::RetainedClaimCleanup(site) => site,
+                    },
+                );
+            })
+            .map_err(|error| match error {
+                AssignmentRootCreationError::OwnershipUnproven => {
+                    AssignmentDecline::RunnerUnable(RunnerUnableReason::OwnershipUnproven)
+                }
+                AssignmentRootCreationError::Unavailable => AssignmentDecline::RunnerUnable(
+                    RunnerUnableReason::RetainedWorkspaceUnavailable,
+                ),
+                _ => environment_unavailable(),
+            })?;
+        // Snapshot after the durable claim, on this blocking worker.
+        // An unavailable snapshot is explicit evidence, not a reason
+        // to substitute null or to read the unclaimed workspace.
+        root.continuation_snapshot = Some(
+            um_execution::capture_cloud_continuation_snapshot(
+                &root.execution,
+                continuation.prior_settlement_snapshot.as_ref(),
+            )
+            .map_err(|_| {
+                self.preparation_failure(offer, "continuation_snapshot", "capture_failed");
+                environment_unavailable()
+            })?,
+        );
+        let proof = root.retained_quiescence.ok_or_else(|| {
+            self.preparation_failure(offer, "continuation_quiescence", "proof_absent");
+            environment_unavailable()
+        })?;
+        let snapshot = root
+            .continuation_snapshot
+            .as_ref()
+            .ok_or_else(environment_unavailable)?;
+        let proven_at = sleeper
+            .utc_now()
+            .format(&time::format_description::well_known::Rfc3339)
+            .map_err(|_| {
+                self.preparation_failure(offer, "continuation_clock", "format_failed");
+                environment_unavailable()
+            })?;
+        root.continuation_proven_at = Some(proven_at.clone());
+        let id = self
+            .outbox
+            .enqueue(AssignmentObservation::ContinuationReady {
+                assignment_id: offer.assignment_id.clone(),
+                attempt_id: offer.attempt_id.clone(),
+                start_snapshot: snapshot.start_snapshot.clone(),
+                quiescence: serde_json::json!({
+                    "groupsRecorded": proof.recorded,
+                    "groupsTerminated": proof.terminated,
+                    "groupsAbsent": proof.absent,
+                    "provenAt": proven_at,
+                }),
+                modified: snapshot.modified.clone(),
+            })
+            .map_err(|_| {
+                self.preparation_failure(offer, "continuation_ready_outbox", "enqueue_failed");
+                environment_unavailable()
+            })?;
+        tokio::runtime::Handle::current().block_on(self.outbox.wait_for_continuation_ready(
+            id,
+            deadline,
+            cancellation,
+            sleeper,
+        ))?;
+        Ok(())
+    }
+}
+
+/// The preparation of a tree run (REQ-RUNNERENROLL-91): the workspace checkout and run
+/// inputs as for any run, then the published tree in place of the Git definition
+/// checkout and workflow admission; or, for a continuation, the adoption of the run an
+/// earlier attempt created (REQ-RUNNERENROLL-89).
+struct TreeAdmission<'a> {
+    runtime: &'a AdmissionRuntime,
+    tree_run: &'a TreeRunDependencies,
+    broker: Arc<dyn SourceCredentialBroker>,
+    input_broker: Option<&'a dyn RunInputBroker>,
+    /// The service environment the checkout uses; the tree's `um` commands run with
+    /// `runtime.environment`, which carries the agent logins offered to the assignment.
+    environment: &'a EnvironmentSnapshot,
+    offer: &'a AssignmentOffer,
+    tree: &'a um_runner_protocol::WorkflowTreeV1RunnerProjection,
+    deadline: PreparationDeadline,
+    cancellation: &'a CaptureCancellation,
+    sleeper: Arc<dyn Sleeper>,
+}
+
+impl TreeAdmission<'_> {
+    fn prepare(
+        self,
+        root: &mut AssignmentRoot,
+    ) -> Result<super::super::tree_run::TreeRun, AssignmentDecline> {
+        let offer = self.offer;
+        let spec = &offer.execution_spec;
+        let workspace = root.workspace.path();
+        let source = super::super::source::MaterializationRequest::from_validated(spec)
+            .for_workspace(&spec.primary_workspace_source.commit_oid);
+        // Dropping the checkout restores the clone's canonical origin: the runtime's
+        // steps use the host's own Git access, not the runner's relay.
+        drop(
+            super::super::source::checkout(
+                self.broker,
+                self.environment,
+                &offer.assignment_id,
+                &source,
+                self.cancellation,
+                &workspace,
+                &root.private,
+            )
+            .map_err(materialization_decline)?,
+        );
+        root.execution.clone_from(&workspace);
+        self.runtime.run_event.enter(RunPhase::Preparation);
+        self.runtime.progress(offer, 2, "input_download")?;
+        let inputs = super::super::run_inputs::materialize(
+            self.input_broker,
+            &offer.assignment_id,
+            &spec.execution_spec_id,
+            spec.run_inputs.as_ref(),
+            self.deadline,
+            self.cancellation,
+            &root.private,
+        )
+        .map_err(run_input_decline)?;
+        self.runtime.progress(offer, 3, "workflow_admission")?;
+        super::super::tree_run::prepare(
+            self.tree_run,
+            &super::super::tree_run::TreePreparation {
+                assignment_id: &offer.assignment_id,
+                execution_spec: spec,
+                tree: self.tree,
+                private: &root.private,
+                workspace: &workspace,
+                environment: &self.runtime.environment,
+                deadline: self.deadline,
+                cancellation: self.cancellation,
+                sleeper: self.sleeper,
+            },
+            &inputs,
+        )
+    }
+
+    /// Proves the retained workspace as for any continuation, then adopts the run in the
+    /// run-scoped home of the one attempt of the retained chain that holds one, the
+    /// attempt that created the run: no checkout, no run input and no tree download. The
+    /// run executes in the retained workspace its record names, which the claim proved.
+    fn adopt(
+        self,
+        root: &mut AssignmentRoot,
+        continuation: &ContinuationOffer,
+    ) -> Result<super::super::tree_run::TreeRun, AssignmentDecline> {
+        let offer = self.offer;
+        self.runtime.prove_continuation(
+            offer,
+            continuation,
+            root,
+            self.deadline,
+            self.cancellation,
+            self.sleeper.as_ref(),
+        )?;
+        self.runtime.run_event.enter(RunPhase::Preparation);
+        self.runtime.progress(offer, 2, "workflow_admission")?;
+        let homes = root
+            .retained_private_roots
+            .values()
+            .map(|private| super::super::tree_run::tree_home(private))
+            .filter(|home| std::fs::symlink_metadata(home).is_ok_and(|home| home.is_dir()))
+            .collect::<Vec<_>>();
+        let [home] = homes.as_slice() else {
+            self.runtime.preparation_failure(
+                offer,
+                "continuation_tree_home",
+                if homes.is_empty() {
+                    "absent"
+                } else {
+                    "ambiguous"
+                },
+            );
+            return Err(AssignmentDecline::RunnerUnable(
+                RunnerUnableReason::RetainedWorkspaceUnavailable,
+            )
+            .diagnosed("workflow_tree_adoption", "tree_run_home_unavailable"));
+        };
+        super::super::tree_run::adopt(
+            self.tree_run,
+            &super::super::tree_run::TreeAdoption {
+                assignment_id: &offer.assignment_id,
+                home,
+                private: &root.private,
+                environment: &self.runtime.environment,
+                execution_spec: &offer.execution_spec,
+                sleeper: self.sleeper,
+                steps: &continuation.reexecuted_steps,
+                pending_deliveries: &self.tree.pending_deliveries,
+            },
+        )
     }
 }

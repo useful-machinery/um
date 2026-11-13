@@ -1,7 +1,7 @@
 use super::*;
 const ACTION: &str = "gda_01k0z6r1w8f4jy2m7q9v3x5abc";
 fn action() -> serde_json::Value {
-    serde_json::json!({"id":ACTION,"projectId":PROJECT_ID,"version":3,"createdAt":"2026-09-01T00:00:00Z","updatedAt":"2026-09-01T00:00:00Z","displayName":"Review","workflowPath":".um/workflows/review.yaml","enabled":true,"description":"","sortOrder":0,"inputBindings":{},"inputPresentation":{},"publication":null})
+    serde_json::json!({"id":ACTION,"projectId":PROJECT_ID,"version":3,"createdAt":"2026-09-01T00:00:00Z","updatedAt":"2026-09-01T00:00:00Z","displayName":"Review","workflowPath":".um/workflows/review.yaml","definitionId":null,"enabled":true,"description":"","sortOrder":0,"inputBindings":{},"inputPresentation":{},"publication":null})
 }
 fn response(status: &str, body: serde_json::Value, mutation: bool) -> Vec<u8> {
     http_response_with_headers(
@@ -321,6 +321,122 @@ fn human_output_uses_safe_metadata_and_errors_use_stderr() {
     assert!(output.stdout.is_empty());
     assert!(!String::from_utf8_lossy(&output.stderr).contains("private-literal"));
     assert_eq!(server.finish().len(), 1);
+}
+
+const DEFINITION: &str = "def_01k0z6r1w8f4jy2m7q9v3x5abc";
+fn definition_lines(output: &Output) -> Vec<String> {
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter(|line| line.starts_with("definition:"))
+        .map(str::to_owned)
+        .collect()
+}
+// REQ-DOCSACTION-70
+#[test]
+fn human_output_names_the_definition_only_when_the_action_has_one() {
+    let (_dir, path) = file(&format!(
+        r#"{{"displayName":"Review","workflowPath":".um/workflows/review.yaml","definitionId":"{DEFINITION}","enabled":true}}"#
+    ));
+    let mut named = action();
+    named["definitionId"] = DEFINITION.into();
+    let (server, _credentials, credential) = prepared(vec![response("201 Created", named, true)]);
+    let output = run_project(
+        &[
+            "project",
+            "action",
+            "create",
+            ORGANIZATION,
+            PROJECT_ID,
+            "--config-file",
+            &path,
+            "--allow-insecure-http",
+        ],
+        &server,
+        &credential,
+    );
+    assert!(output.status.success());
+    assert_eq!(
+        request_body(&server.finish().remove(0))["definitionId"],
+        DEFINITION
+    );
+    let lines = definition_lines(&output);
+    assert_eq!(lines.len(), 1);
+    assert!(lines[0].contains(DEFINITION));
+
+    let (server, _credentials, credential) = prepared(vec![response("200 OK", action(), false)]);
+    let output = run_project(
+        &[
+            "project",
+            "action",
+            "show",
+            ORGANIZATION,
+            PROJECT_ID,
+            ACTION,
+            "--allow-insecure-http",
+        ],
+        &server,
+        &credential,
+    );
+    assert!(output.status.success());
+    assert!(definition_lines(&output).is_empty());
+    assert_eq!(server.finish().len(), 1);
+}
+
+// REQ-DOCSACTION-65
+#[test]
+fn update_sends_a_definition_given_alone() {
+    let (_dir, path) = file(&format!(r#"{{"definitionId":"{DEFINITION}"}}"#));
+    let (server, _credentials, credential) = prepared(vec![response("200 OK", action(), true)]);
+    assert_json_success(
+        &run(
+            &[
+                "update",
+                ORGANIZATION,
+                PROJECT_ID,
+                ACTION,
+                "--expected-version",
+                "3",
+                "--config-file",
+                &path,
+            ],
+            &server,
+            &credential,
+        ),
+        "updated",
+    );
+    assert_eq!(
+        request_body(&server.finish().remove(0)),
+        serde_json::json!({"expectedVersion":3,"definitionId":DEFINITION})
+    );
+}
+
+// REQ-DOCSACTION-66
+#[test]
+fn invalid_definition_is_rejected_before_any_request_without_echo() {
+    for config in [
+        r#"{"displayName":"Review","workflowPath":".um/workflows/review.yaml","enabled":true,"definitionId":{"private":"secret-definition"}}"#,
+        r#"{"displayName":"Review","workflowPath":".um/workflows/review.yaml","enabled":true,"definitionId":"def_01k0z6r1w8f4jy2m7q9v3x5abc","publication":{"exportName":"secret-export"}}"#,
+    ] {
+        let (_dir, path) = file(config);
+        let (server, _credentials, credential) = prepared(vec![]);
+        let result = run(
+            &["create", ORGANIZATION, PROJECT_ID, "--config-file", &path],
+            &server,
+            &credential,
+        );
+        assert!(!result.status.success());
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&result.stdout).unwrap()["outcome"],
+            "invalid_input"
+        );
+        let printed = format!(
+            "{}{}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert!(!printed.contains("secret") && !printed.contains(DEFINITION));
+        assert!(server.finish().is_empty());
+    }
 }
 
 // REQ-DOCSACTION-66

@@ -4,7 +4,8 @@
   "title": "Useful Machinery Runner Enrollment Journal V1",
   "type": "object",
   "additionalProperties": false,
-  "required": ["schemaVersion", "activationArtifact", "credentialSecret", "credentialSecretVerifier", "idempotencyKey", "replaceCredential", "stagedAt"],
+  "required": ["schemaVersion", "credentialSecret", "credentialSecretVerifier", "idempotencyKey", "replaceCredential", "stagedAt"],
+  "oneOf": [{ "required": ["activationArtifact"] }, { "required": ["joinKey"] }],
   "properties": {
     "schemaVersion": { "const": 1 },
     "activationArtifact": {
@@ -16,6 +17,16 @@
         "activationUrl": { "type": "string", "format": "uri", "pattern": "^https?://[^#]+/v1/runner-enrollments/rna_[0-7][0-9a-hjkmnp-tv-z]{25}/activate$" },
         "activationToken": { "type": "string", "pattern": "^rna_[0-7][0-9a-hjkmnp-tv-z]{25}\\.[A-Za-z0-9_-]{43}$" },
         "runnerId": { "type": "string", "pattern": "^rnr_[0-7][0-9a-hjkmnp-tv-z]{25}$" },
+        "expiresAt": { "type": "string", "format": "date-time" }
+      }
+    },
+    "joinKey": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["joinUrl", "joinKeyId", "expiresAt"],
+      "properties": {
+        "joinUrl": { "type": "string", "format": "uri", "pattern": "^https?://[^#]+/v1/runner-join-keys/rjk_[0-7][0-9a-hjkmnp-tv-z]{25}/join$" },
+        "joinKeyId": { "type": "string", "pattern": "^rjk_[0-7][0-9a-hjkmnp-tv-z]{25}$" },
         "expiresAt": { "type": "string", "format": "date-time" }
       }
     },

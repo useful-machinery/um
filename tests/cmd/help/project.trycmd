@@ -10,10 +10,8 @@ Commands:
   list         List projects
   rename       Rename a project
   repository   Manage a project's repository binding
-  runner-pool  Manage a project's runner pool
-  schedule     Manage a project's schedules
+  runner-pool  Manage a project's runner pools
   show         Show a project
-  trigger      Manage a project's Linear triggers
   webhook      Manage a project's signed webhooks
   help         Print this message or the help of the given subcommand(s)
 

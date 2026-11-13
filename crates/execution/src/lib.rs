@@ -75,15 +75,18 @@ pub use workflow::coordinator::{
 };
 pub use workflow::definition_store::{
     BindingsFile, BindingsSnapshot, BoundBinding, DefinitionError, DefinitionRecord, EnabledChange,
-    PublishTarget, Published, RevisionRecord, StoredDefinition, WorkflowHome, list_definitions,
-    publish, read_current_bindings, read_definition, read_revision_bindings, set_enabled,
+    PublishTarget, Published, RevisionRecord, StoredDefinition, WorkflowHome, check_definition_id,
+    list_definitions, publish, read_current_bindings, read_definition, read_revision_bindings,
+    set_enabled,
 };
 pub use workflow::diagnostic::StepDiagnosticLog;
 pub use workflow::diagnostic::{CapturedDiagnosticStream, StepDiagnostic};
 pub use workflow::document::BindingKind;
+pub use workflow::document::BindingValue;
 pub use workflow::document::FailurePolicy;
 pub use workflow::document::FinalizationTrigger;
 pub use workflow::document::RootBlocks;
+pub use workflow::document::{OwnerDeclaration, OwnerSource, StopBefore};
 pub use workflow::evidence::{BlockedDetail, Prerequisite};
 pub use workflow::evidence::{
     FailureDetail, InheritedDetail, InheritedPriorState, NodeDetail, PrimaryIssue,
@@ -96,20 +99,20 @@ pub use workflow::git_capture::CloudGitCaptureProjection;
 pub use workflow::input::InputStaging;
 pub use workflow::invocation_accounting::InvocationAccountingLog;
 pub use workflow::local_run::{
-    AttemptControls, CANCELED_OUTCOME, CarryMiss, ChildCommitFailure, ChildRun, ChildRunParent,
-    ContinuationDefinitionMode, DurableDeadline, DurableInvocationStateV1, DurableInvocationV1,
-    FailedAttemptRestart, InitialLocalRun, ListedRun, LocalAttemptOwner,
+    AttemptControls, CANCELED_OUTCOME, CarryMiss, ChildCommitFailure, ChildRun, ChildRunDirectory,
+    ChildRunParent, ContinuationDefinitionMode, DurableDeadline, DurableInvocationStateV1,
+    DurableInvocationV1, FailedAttemptRestart, InitialLocalRun, ListedRun, LocalAttemptOwner,
     LocalAttemptOwnershipReleased, LocalContinuationOpen, LocalRecoveryStatus,
     LocalRetryBeginError, LocalRetryEligibility, LocalRetryOpen, LocalRetryRejection,
-    LocalRunStatusSnapshot, LocalStatusError, LocalStatusResult, PendingLocalContinuation,
-    PublicationFailurePhaseV1, ResolvedBy, RetryIneligibilityReason, RunListing,
-    SUPERSEDED_OUTCOME, SuccessorCarry, TreeCopyMismatch, WITHDRAWN_OUTCOME, WaitChild,
+    LocalRunStatusSnapshot, LocalStatusError, LocalStatusResult, MAXIMUM_DURABLE_RECORD_BYTES,
+    PendingLocalContinuation, PublicationFailurePhaseV1, ResolvedBy, RetryIneligibilityReason,
+    RunListing, SUPERSEDED_OUTCOME, SuccessorCarry, TreeCopyMismatch, WITHDRAWN_OUTCOME, WaitChild,
     WaitInspection, WaitProbe, acquire_local_continuation, acquire_local_retry, attempt_controls,
-    await_child_start_gate, await_run_lock_gate, bind_cloud_continuation_context, child_runs,
-    inspect_wait, is_run_id, latest_attempt_failed, latest_child_run, list_runs,
-    load_cloud_continuation_seed, locate_run, lock_holder, positioned_element,
-    read_local_run_status, retain_cloud_continuation_evidence, retain_cloud_workflow_evidence,
-    wait_child,
+    await_child_start_gate, await_run_lock_gate, bind_cloud_continuation_context,
+    child_run_directories, child_runs, inspect_wait, is_run_id, latest_attempt_failed,
+    latest_child_run, list_runs, load_cloud_continuation_seed, locate_run, lock_holder,
+    positioned_element, read_durable_record, read_local_run_status,
+    retain_cloud_continuation_evidence, retain_cloud_workflow_evidence, wait_child,
 };
 pub use workflow::observation::{
     ExecutionObservation, ExecutionObserver, ExecutionSettlement, ObservedExecutions,
@@ -192,9 +195,9 @@ pub use workflow::value::CapturedValue;
 pub use workflow::wait::{
     CONTROL_ANSWER, CONTROL_APPROVE, CONTROL_CANCEL, CONTROL_HAND_BACK, CONTROL_INTERRUPT,
     CONTROL_LIFT, CONTROL_RELEASE, CONTROL_RETRY, CONTROL_STOP, CONTROL_WITHDRAW, ConditionError,
-    ConditionSource, ControlEvent, Event, ExternalEvent, NoConditions, RuleError, WaitKind,
-    WaitRecord, WaitRule, append_control, evaluate, event_literal, position_path, read_controls,
-    read_numbered_controls, stop_in_force, wait_payload,
+    ConditionSource, ControlEvent, ControlTrigger, Event, ExternalEvent, NoConditions, RuleError,
+    WaitKind, WaitRecord, WaitRule, append_control, evaluate, event_literal, position_path,
+    read_controls, read_numbered_controls, stop_in_force, wait_identity, wait_payload,
 };
 pub use workflow::workspace_snapshot::{
     CloudContinuationSnapshot, capture_cloud_continuation_snapshot,

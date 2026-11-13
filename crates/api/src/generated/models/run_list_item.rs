@@ -35,6 +35,30 @@ pub struct RunListItem {
     pub integration_context: std::collections::HashMap<String, String>,
     #[serde(rename = "placement", deserialize_with = "Option::deserialize")]
     pub placement: Option<Box<models::RunPlacement>>,
+    /// The pinned definition revision; null for a run by `workflowPath`.
+    #[serde(
+        rename = "definition",
+        default,
+        with = "crate::nullable::double_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub definition: Option<Option<Box<models::RunDefinition>>>,
+    /// The subject claim of the run's current admission; null when it claimed none.
+    #[serde(
+        rename = "subjectClaim",
+        default,
+        with = "crate::nullable::double_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub subject_claim: Option<Option<Box<models::RunSubjectClaim>>>,
+    /// The member who owns the run: for a definition-backed run a human member created, that member unless the request said `owner` `none`, and for a trigger-created run, the member its start evaluation resolved; null when the run has no owner.
+    #[serde(
+        rename = "owner",
+        default,
+        with = "crate::nullable::double_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub owner: Option<Option<String>>,
 }
 
 impl RunListItem {
@@ -59,6 +83,9 @@ impl RunListItem {
             updated_at,
             integration_context,
             placement: placement.map(Box::new),
+            definition: None,
+            subject_claim: None,
+            owner: None,
         }
     }
 }

@@ -201,6 +201,7 @@ pub enum OrganizationAuditSubjectKind {
     RunnerRegistration,
     RunnerActivation,
     RunnerCredential,
+    RunnerJoinKey,
     GithubInstallation,
     GitlabConnection,
     GitlabCandidate,
@@ -217,6 +218,7 @@ pub enum OrganizationAuditSubjectKind {
     RepositoryConnection,
     Assignment,
     Schedule,
+    WorkflowDefinition,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -1189,6 +1191,7 @@ impl TryFrom<models::OrganizationAuditSubject> for OrganizationAuditSubject {
             Kind::RunnerRegistration => (OrganizationAuditSubjectKind::RunnerRegistration, "rnr_"),
             Kind::RunnerActivation => (OrganizationAuditSubjectKind::RunnerActivation, "rna_"),
             Kind::RunnerCredential => (OrganizationAuditSubjectKind::RunnerCredential, "rrc_"),
+            Kind::RunnerJoinKey => (OrganizationAuditSubjectKind::RunnerJoinKey, "rjk_"),
             Kind::GithubInstallation => (OrganizationAuditSubjectKind::GithubInstallation, "ghi_"),
             Kind::GitlabConnection => (OrganizationAuditSubjectKind::GitlabConnection, "glc_"),
             Kind::GitlabCandidate => (OrganizationAuditSubjectKind::GitlabCandidate, "glca_"),
@@ -1216,6 +1219,7 @@ impl TryFrom<models::OrganizationAuditSubject> for OrganizationAuditSubject {
             }
             Kind::Assignment => (OrganizationAuditSubjectKind::Assignment, "asn_"),
             Kind::Schedule => (OrganizationAuditSubjectKind::Schedule, "sch_"),
+            Kind::WorkflowDefinition => (OrganizationAuditSubjectKind::WorkflowDefinition, "def_"),
         };
         if !um_support::valid_typed_id(&value.id, prefix) {
             return Err("the organization audit subject is invalid");

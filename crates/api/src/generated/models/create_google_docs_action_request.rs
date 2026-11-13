@@ -21,6 +21,8 @@ pub struct CreateGoogleDocsActionRequest {
     pub display_name: String,
     #[serde(rename = "workflowPath")]
     pub workflow_path: String,
+    #[serde(rename = "definitionId", skip_serializing_if = "Option::is_none")]
+    pub definition_id: Option<String>,
     #[serde(rename = "enabled")]
     pub enabled: bool,
     #[serde(rename = "description", skip_serializing_if = "Option::is_none")]
@@ -50,6 +52,7 @@ impl CreateGoogleDocsActionRequest {
         CreateGoogleDocsActionRequest {
             display_name,
             workflow_path,
+            definition_id: None,
             enabled,
             description: None,
             sort_order: None,

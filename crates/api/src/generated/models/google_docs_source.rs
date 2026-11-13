@@ -21,20 +21,13 @@ pub struct GoogleDocsSource {
     pub repository_connection_id: String,
     #[serde(rename = "branch")]
     pub branch: String,
-    #[serde(rename = "commit")]
-    pub commit: String,
 }
 
 impl GoogleDocsSource {
-    pub fn new(
-        repository_connection_id: String,
-        branch: String,
-        commit: String,
-    ) -> GoogleDocsSource {
+    pub fn new(repository_connection_id: String, branch: String) -> GoogleDocsSource {
         GoogleDocsSource {
             repository_connection_id,
             branch,
-            commit,
         }
     }
 }

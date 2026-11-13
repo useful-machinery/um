@@ -23,8 +23,12 @@ pub struct Project {
     pub organization_id: String,
     #[serde(rename = "name")]
     pub name: String,
+    /// The pool of the set that was added first; null exactly when the set is empty.
     #[serde(rename = "runnerPool", deserialize_with = "Option::deserialize")]
     pub runner_pool: Option<Box<models::ProjectRunnerPoolSummary>>,
+    /// The project's whole pool set in the order its pools were added.
+    #[serde(rename = "runnerPools", skip_serializing_if = "Option::is_none")]
+    pub runner_pools: Option<Vec<models::ProjectRunnerPoolSummary>>,
     #[serde(rename = "repository", deserialize_with = "Option::deserialize")]
     pub repository: Option<Box<models::ProjectRepository>>,
     #[serde(rename = "executionReadiness")]
@@ -51,6 +55,7 @@ impl Project {
             organization_id,
             name,
             runner_pool: runner_pool.map(Box::new),
+            runner_pools: None,
             repository: repository.map(Box::new),
             execution_readiness: Box::new(execution_readiness),
             created_at,

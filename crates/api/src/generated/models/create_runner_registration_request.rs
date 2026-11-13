@@ -15,10 +15,15 @@
 use crate::generated::models;
 use serde::{Deserialize, Serialize};
 
+/// CreateRunnerRegistrationRequest : Names the registration's pool by at most one of runnerPoolId and memberId; naming neither takes the caller's own personal pool.
 #[derive(Clone, Default, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CreateRunnerRegistrationRequest {
-    #[serde(rename = "runnerPoolId")]
-    pub runner_pool_id: String,
+    /// The same-organization pool that takes the registration.
+    #[serde(rename = "runnerPoolId", skip_serializing_if = "Option::is_none")]
+    pub runner_pool_id: Option<String>,
+    /// The human member of the organization whose personal pool takes the registration.
+    #[serde(rename = "memberId", skip_serializing_if = "Option::is_none")]
+    pub member_id: Option<String>,
     /// A canonical lowercase organization-scoped runner resource name.
     #[serde(rename = "name", skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
@@ -31,9 +36,11 @@ pub struct CreateRunnerRegistrationRequest {
 }
 
 impl CreateRunnerRegistrationRequest {
-    pub fn new(runner_pool_id: String) -> CreateRunnerRegistrationRequest {
+    /// Names the registration's pool by at most one of runnerPoolId and memberId; naming neither takes the caller's own personal pool.
+    pub fn new() -> CreateRunnerRegistrationRequest {
         CreateRunnerRegistrationRequest {
-            runner_pool_id,
+            runner_pool_id: None,
+            member_id: None,
             name: None,
             delegator_principal_id: None,
         }

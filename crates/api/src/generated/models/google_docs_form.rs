@@ -35,6 +35,8 @@ pub struct GoogleDocsForm {
     pub document_id: String,
     #[serde(rename = "documentUrl")]
     pub document_url: String,
+    #[serde(rename = "definition")]
+    pub definition: Box<models::GoogleDocsFormDefinition>,
     #[serde(rename = "source")]
     pub source: Box<models::GoogleDocsSource>,
     #[serde(rename = "publication", deserialize_with = "Option::deserialize")]
@@ -54,6 +56,7 @@ impl GoogleDocsForm {
         description: String,
         document_id: String,
         document_url: String,
+        definition: models::GoogleDocsFormDefinition,
         source: models::GoogleDocsSource,
         publication: Option<models::GoogleDocsPublication>,
         inputs: Vec<models::GoogleDocsInputDescriptor>,
@@ -68,6 +71,7 @@ impl GoogleDocsForm {
             description,
             document_id,
             document_url,
+            definition: Box::new(definition),
             source: Box::new(source),
             publication: publication.map(Box::new),
             inputs,

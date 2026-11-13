@@ -109,39 +109,6 @@ fn cloud_result_fixture() -> Value {
     result
 }
 
-// The Coordinator integration harness supplies this Run API response from a
-// real Gateway-admitted run; preparation deliberately cannot execute GitLab
-// yet, so construct only a portable result reader fixture from its retained
-// identity rather than pretending that the runner produced an output.
-#[test]
-#[ignore = "requires the admitted Run API response supplied by the cross-component harness"]
-fn admitted_gitlab_snapshot_survives_portable_result_reader() {
-    let file = std::env::var("UM_GITLAB_ADMITTED_API_FILE").unwrap();
-    let run: Value = serde_json::from_slice(&std::fs::read(file).unwrap()).unwrap();
-    let mut result = cloud_result_fixture();
-    result["workflow"]["provenance"]["projectId"] = run["projectId"].clone();
-    result["workflow"]["provenance"]["repositoryConnectionId"] =
-        run["primaryWorkspaceSource"]["repositoryConnectionId"].clone();
-    result["workflow"]["provenance"]["commitOid"] =
-        run["primaryWorkspaceSource"]["commitOid"].clone();
-    result["workflow"]["provenance"]["sourceDisplaySnapshot"] =
-        run["sourceDisplaySnapshot"].clone();
-    let decoded = decode(&encode(&result)).unwrap();
-    let super::super::publication::WorkflowProvenanceV1::Cloud {
-        source_display_snapshot: Some(snapshot),
-        ..
-    } = decoded.workflow.provenance
-    else {
-        panic!("portable reader lost the admitted source snapshot");
-    };
-    assert_eq!(
-        snapshot.repository.full_name,
-        run["sourceDisplaySnapshot"]["repository"]["fullName"]
-            .as_str()
-            .unwrap()
-    );
-}
-
 // REQ-WORKSPACE-30, REQ-WORKSPACE-31
 #[test]
 fn cloud_gitlab_snapshot_round_trips_exact_boundary_and_rejects_malformed_names() {

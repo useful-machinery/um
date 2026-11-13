@@ -4,8 +4,9 @@ use anyhow::Context;
 use serde::Serialize;
 use um_api::{
     Publication, PublicationState, Run, RunArtifactDelivery, RunCancellationReceipt,
-    RunPublicationHandoffState,
+    RunObservation, RunPublicationHandoffState,
 };
+use um_execution::visible_text;
 
 use crate::exit_code::ExitCode;
 
@@ -469,4 +470,60 @@ fn write_delivery_failure(
         super::enum_text(code)?
     )?;
     Ok(())
+}
+
+/// The lines naming a Cloud run's owner, or that it has none, the rule that routed it and
+/// the pools it may use (REQ-RUN-101). A field a Cloud does not send prints no line.
+pub(crate) fn write_route(out: &mut impl Write, run: &Run) -> io::Result<()> {
+    match &run.owner {
+        Some(Some(owner)) => writeln!(out, "owner: {}", visible_text(owner))?,
+        Some(None) => writeln!(out, "owner: none")?,
+        None => {}
+    }
+    match &run.routing {
+        Some(Some(routing)) => {
+            writeln!(
+                out,
+                "routing: {} · policy {}",
+                visible_text(&routing.rule),
+                routing.policy_version
+            )?;
+            let pools = routing
+                .pools
+                .iter()
+                .map(|pool| match pool.name.as_deref() {
+                    Some(name) => format!("{} ({})", visible_text(name), visible_text(&pool.id)),
+                    None => visible_text(&pool.id),
+                })
+                .collect::<Vec<_>>();
+            if pools.is_empty() {
+                writeln!(out, "pools: none")?;
+            } else {
+                writeln!(out, "pools: {}", pools.join(", "))?;
+            }
+        }
+        Some(None) => writeln!(out, "routing: none")?,
+        None => {}
+    }
+    Ok(())
+}
+
+/// The line saying what a queued run waits for, its reason in words and an unrecognized
+/// reason as given (REQ-RUN-100, REQ-RUN-101); nothing when it waits for nothing.
+pub(crate) fn write_waiting(out: &mut impl Write, observation: &RunObservation) -> io::Result<()> {
+    let Some(Some(waiting)) = &observation.waiting else {
+        return Ok(());
+    };
+    let reason = match waiting.reason.as_str() {
+        "owner_inactive" => "owner is not an active member".to_owned(),
+        "no_runner" => "no runner in its pools".to_owned(),
+        "no_fitting_runner" => "no runner in its pools fits the run".to_owned(),
+        "runners_offline" => "runners offline".to_owned(),
+        "runners_busy" => "runners busy".to_owned(),
+        other => visible_text(other),
+    };
+    match waiting.since.as_deref() {
+        Some(since) => writeln!(out, "waiting: {reason} since {}", visible_text(since)),
+        None => writeln!(out, "waiting: {reason}"),
+    }
 }

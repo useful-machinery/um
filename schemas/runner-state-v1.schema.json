@@ -9,11 +9,13 @@
     "credential": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["id", "secret", "activationId", "enrolledAt"],
+      "required": ["id", "secret", "enrolledAt"],
+      "oneOf": [{ "required": ["activationId"] }, { "required": ["joinKeyId"] }],
       "properties": {
         "id": { "type": "string", "pattern": "^rrc_[0-7][0-9a-hjkmnp-tv-z]{25}$" },
         "secret": { "type": "string", "pattern": "^[A-Za-z0-9_-]{43}$" },
         "activationId": { "type": "string", "pattern": "^rna_[0-7][0-9a-hjkmnp-tv-z]{25}$" },
+        "joinKeyId": { "type": "string", "pattern": "^rjk_[0-7][0-9a-hjkmnp-tv-z]{25}$" },
         "enrolledAt": { "type": "string", "format": "date-time" }
       }
     },

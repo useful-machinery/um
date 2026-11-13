@@ -114,8 +114,7 @@ fn keep_codex_login(directory: &LoginDirectory) -> PathBuf {
 
 fn accepted_variable(manager: &AssignmentManager, name: &str) -> Option<OsString> {
     match &manager.slot {
-        Some(LocalSlot::Accepted(accepted)) => accepted
-            .admitted
+        Some(LocalSlot::Accepted(accepted)) => engine_admission(accepted)
             .execution()
             .environment()
             .variable(OsStr::new(name))

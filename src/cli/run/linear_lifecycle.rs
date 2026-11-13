@@ -1,6 +1,5 @@
 use std::io::{self, Write};
 
-use anyhow::Context;
 use clap::{Args, Subcommand};
 use serde::Serialize;
 
@@ -22,8 +21,6 @@ pub(super) struct Command {
 enum LinearLifecycleCommand {
     #[command(about = "List a run's Linear state updates, newest first")]
     History(HistoryCommand),
-    #[command(about = "Retry a failed Linear state update")]
-    Retry(RetryCommand),
     #[command(about = "Show a run's Linear issue binding and latest state update")]
     Show(ShowCommand),
 }
@@ -46,23 +43,6 @@ struct HistoryCommand {
     options: super::RunOptions,
 }
 
-#[derive(Debug, Args)]
-struct RetryCommand {
-    #[command(flatten)]
-    run: super::RunReference,
-    #[arg(value_name = "UPDATE", help = "Linear state update ID")]
-    update_id: String,
-    #[arg(
-        long,
-        value_name = "KEY",
-        value_parser = super::super::publication::parse_idempotency_key,
-        help = "Opaque request identity (generated when omitted)"
-    )]
-    idempotency_key: Option<String>,
-    #[command(flatten)]
-    options: super::RunOptions,
-}
-
 impl Command {
     pub(super) fn execute(self) -> super::super::CommandResult {
         let path = &[super::NAME, NAME];
@@ -70,14 +50,6 @@ impl Command {
         match self.command {
             None => super::super::print_help(path),
             Some(LinearLifecycleCommand::History(command)) => {
-                super::super::execute_deployment_command(
-                    Some(command),
-                    path,
-                    context,
-                    |command, deployment| command.execute(deployment.clone()),
-                )
-            }
-            Some(LinearLifecycleCommand::Retry(command)) => {
                 super::super::execute_deployment_command(
                     Some(command),
                     path,
@@ -182,104 +154,6 @@ impl HistoryCommand {
     }
 }
 
-impl RetryCommand {
-    fn execute(self, deployment: Deployment) -> super::super::CommandResult {
-        let key = match self.idempotency_key.clone() {
-            Some(key) => key,
-            None => um_support::generate_idempotency_key()
-                .context("generate Cloud run Linear lifecycle retry request identity")?,
-        };
-        let signal_deployment = deployment.fingerprint().api_url().to_owned();
-        let signal_organization = (*self.run.organization).to_owned();
-        let signal_run_id = self.run.run_id.clone();
-        let signal_update_id = self.update_id.clone();
-        let signal_key = key.clone();
-        let signal_json = self.options.json;
-        super::super::execute_mutation_with_signals(
-            "Cloud run Linear lifecycle retry",
-            (),
-            move |control| {
-                let submitted = super::with_pinned_run_mutation(
-                    &deployment,
-                    &self.options,
-                    "acquire human session for Cloud run Linear lifecycle retry",
-                    |api| {
-                        api.retry_linear_lifecycle_update(
-                            &self.run.organization,
-                            &self.run.run_id,
-                            &self.update_id,
-                            &key,
-                            || control.begin_dispatch(),
-                        )
-                    },
-                );
-                let result = match submitted {
-                    Ok(result) => result,
-                    Err(_) if control.dispatched() => {
-                        Err(RunFailure::LinearLifecycleRetryAcceptanceUnknown)
-                    }
-                    Err(error) => return Err(error.into()),
-                };
-                super::finish_operation(control, || {
-                    let target = Target {
-                        deployment: deployment.fingerprint().api_url(),
-                        organization: &self.run.organization,
-                        run_id: &self.run.run_id,
-                    };
-                    let (outcome, error, exit) = match &result {
-                        Ok(_) => ("accepted", None, ExitCode::Success),
-                        Err(RunFailure::LinearLifecycleRetryAcceptanceUnknown) => {
-                            acceptance_unknown(ExitCode::Unavailable)
-                        }
-                        Err(RunFailure::Unreachable(_)) if control.dispatched() => {
-                            acceptance_unknown(ExitCode::Unavailable)
-                        }
-                        Err(failure) => {
-                            failure_outcome(failure, self.options.authentication.kind())
-                        }
-                    };
-                    let receipt = result.as_ref().ok().map(|receipt| {
-                        let lines = [
-                            ("run", receipt.run_id.clone()),
-                            ("update", receipt.update_id.clone()),
-                            ("cycle number", receipt.cycle_number.to_string()),
-                            ("accepted", receipt.accepted_at.clone()),
-                            ("cycle deadline", receipt.cycle_deadline.clone()),
-                        ];
-                        (receipt, lines)
-                    });
-                    write_retry(
-                        &target,
-                        &self.update_id,
-                        &key,
-                        receipt,
-                        (outcome, error, exit),
-                        self.options.json,
-                    )
-                })
-            },
-            move |signal, snapshot| {
-                super::super::report_dispatched_signal(signal, snapshot, |()| {
-                    let target = Target {
-                        deployment: &signal_deployment,
-                        organization: &signal_organization,
-                        run_id: &signal_run_id,
-                    };
-                    write_retry::<()>(
-                        &target,
-                        &signal_update_id,
-                        &signal_key,
-                        None,
-                        acceptance_unknown(signal),
-                        signal_json,
-                    )
-                    .map_err(Into::into)
-                })
-            },
-        )
-    }
-}
-
 /// The JSON envelope every lifecycle command writes, with its operation's
 /// members between the outcome and the error.
 #[derive(Serialize)]
@@ -305,13 +179,6 @@ struct ShowPayload<'a> {
 #[derive(Serialize)]
 struct HistoryPayload<'a, P> {
     updates: Option<&'a P>,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct RetryPayload<'a, R> {
-    idempotency_key: &'a str,
-    receipt: Option<&'a R>,
 }
 
 #[derive(Serialize)]
@@ -374,54 +241,6 @@ fn failure_outcome(
         _ => "error",
     };
     (outcome, Some(LinearLifecycleError { code }), exit)
-}
-
-fn acceptance_unknown(exit: ExitCode) -> Outcome {
-    (
-        "acceptance_unknown",
-        Some(LinearLifecycleError {
-            code: "acceptance_unknown",
-        }),
-        exit,
-    )
-}
-
-/// Writes a retry's envelope, or the receipt one line per member with the key,
-/// or its failure with the update and key.
-fn write_retry<R: Serialize>(
-    target: &Target<'_>,
-    update_id: &str,
-    key: &str,
-    receipt: Option<(&R, [(&str, String); 5])>,
-    (outcome, error, exit): Outcome,
-    json: bool,
-) -> anyhow::Result<ExitCode> {
-    if json {
-        write_envelope(
-            target,
-            "retry",
-            outcome,
-            RetryPayload {
-                idempotency_key: key,
-                receipt: receipt.map(|(receipt, _)| receipt),
-            },
-            error,
-        )?;
-    } else if let Some((_, lines)) = receipt {
-        let mut stdout = io::stdout().lock();
-        for (label, value) in lines {
-            writeln!(stdout, "{label}: {value}")?;
-        }
-        writeln!(stdout, "idempotency key: {key}")?;
-    } else if let Some(error) = error {
-        write_failure(
-            target,
-            "retry",
-            error.code,
-            &[("update", update_id), ("idempotency key", key)],
-        )?;
-    }
-    Ok(exit)
 }
 
 fn write_failure(

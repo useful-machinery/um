@@ -142,6 +142,21 @@ pub enum SetProjectRunnerPoolError {
     UnknownValue(serde_json::Value),
 }
 
+/// struct for typed errors of method [`set_project_runner_pools`]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum SetProjectRunnerPoolsError {
+    Status400(models::Problem),
+    Status401(models::Problem),
+    Status403(models::Problem),
+    Status404(models::Problem),
+    Status409(models::Problem),
+    Status413(models::Problem),
+    Status415(models::Problem),
+    Status500(models::Problem),
+    UnknownValue(serde_json::Value),
+}
+
 /// struct for typed errors of method [`update_project_repository`]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
@@ -158,6 +173,7 @@ pub enum UpdateProjectRepositoryError {
     UnknownValue(serde_json::Value),
 }
 
+/// An optional `runnerPoolId` that names a member's personal pool is answered `409` `runner-pool-member-assigned`.
 pub fn create_project(
     configuration: &configuration::Configuration,
     organization_ref: &str,
@@ -480,6 +496,7 @@ pub fn list_projects(
     }
 }
 
+/// Empties the project's pool set.
 pub fn remove_project_runner_pool(
     configuration: &configuration::Configuration,
     organization_ref: &str,
@@ -687,6 +704,7 @@ pub fn set_project_repository(
     }
 }
 
+/// Replaces the project's pool set with this one pool. A pool that is missing, not active or in another organization shares the not-found representation, and a member's personal pool is answered `409` `runner-pool-member-assigned`.
 pub fn set_project_runner_pool(
     configuration: &configuration::Configuration,
     organization_ref: &str,
@@ -746,6 +764,74 @@ pub fn set_project_runner_pool(
     } else {
         let content = resp.text()?;
         let entity: Option<SetProjectRunnerPoolError> = serde_json::from_str(&content).ok();
+        Err(Error::ResponseError(ResponseContent {
+            status,
+            content,
+            entity,
+        }))
+    }
+}
+
+/// Replaces the project's pool set with the pools named, which have no order; the same set again changes nothing. A pool that is missing, not active or in another organization shares the not-found representation, and a member's personal pool is answered `409` `runner-pool-member-assigned`; either refusal changes nothing.
+pub fn set_project_runner_pools(
+    configuration: &configuration::Configuration,
+    organization_ref: &str,
+    project_id: &str,
+    idempotency_key: &str,
+    set_project_runner_pools_request: models::SetProjectRunnerPoolsRequest,
+) -> Result<models::Project, Error<SetProjectRunnerPoolsError>> {
+    // add a prefix to parameters to efficiently prevent name collisions
+    let p_path_organization_ref = organization_ref;
+    let p_path_project_id = project_id;
+    let p_header_idempotency_key = idempotency_key;
+    let p_body_set_project_runner_pools_request = set_project_runner_pools_request;
+
+    let uri_str = format!(
+        "{}/v1/organizations/{organizationRef}/projects/{projectId}/runner-pools",
+        configuration.base_path,
+        organizationRef = crate::generated::apis::urlencode(p_path_organization_ref),
+        projectId = crate::generated::apis::urlencode(p_path_project_id)
+    );
+    let mut req_builder = configuration.client.request(reqwest::Method::PUT, &uri_str);
+
+    if let Some(ref user_agent) = configuration.user_agent {
+        req_builder = req_builder.header(reqwest::header::USER_AGENT, user_agent.clone());
+    }
+    req_builder = req_builder.header("Idempotency-Key", p_header_idempotency_key.to_string());
+    if let Some(ref token) = configuration.bearer_access_token {
+        req_builder = req_builder.bearer_auth(token.to_owned());
+    };
+    req_builder = req_builder.json(&p_body_set_project_runner_pools_request);
+
+    let req = req_builder.build()?;
+    let resp = configuration.client.execute(req)?;
+
+    let status = resp.status();
+    let content_type = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/octet-stream");
+    let content_type = super::ContentType::from(content_type);
+
+    if !status.is_client_error() && !status.is_server_error() {
+        let content = resp.text()?;
+        match content_type {
+            ContentType::Json => serde_json::from_str(&content).map_err(Error::from),
+            ContentType::Text => {
+                return Err(Error::from(serde_json::Error::custom(
+                    "Received `text/plain` content type response that cannot be converted to `models::Project`",
+                )));
+            }
+            ContentType::Unsupported(unknown_type) => {
+                return Err(Error::from(serde_json::Error::custom(format!(
+                    "Received `{unknown_type}` content type response that cannot be converted to `models::Project`"
+                ))));
+            }
+        }
+    } else {
+        let content = resp.text()?;
+        let entity: Option<SetProjectRunnerPoolsError> = serde_json::from_str(&content).ok();
         Err(Error::ResponseError(ResponseContent {
             status,
             content,

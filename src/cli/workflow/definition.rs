@@ -1,3 +1,4 @@
+mod cloud;
 mod enabled;
 mod list;
 mod publish;
@@ -23,6 +24,8 @@ pub(super) struct Command {
 
 #[derive(Debug, Subcommand)]
 enum DefinitionCommand {
+    #[command(about = cloud::ABOUT)]
+    Cloud(cloud::Command),
     #[command(about = enabled::DISABLE_ABOUT)]
     Disable(enabled::Command),
     #[command(about = enabled::ENABLE_ABOUT)]
@@ -41,6 +44,7 @@ impl Command {
     pub(super) fn execute(self) -> super::super::CommandResult {
         match self.command {
             None => super::super::print_help(COMMAND_PATH),
+            Some(DefinitionCommand::Cloud(command)) => command.execute(),
             Some(DefinitionCommand::Disable(command)) => command.execute(false),
             Some(DefinitionCommand::Enable(command)) => command.execute(true),
             Some(DefinitionCommand::List(command)) => command.execute(),

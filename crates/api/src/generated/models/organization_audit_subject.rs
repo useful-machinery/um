@@ -54,6 +54,8 @@ pub enum Kind {
     RunnerActivation,
     #[serde(rename = "runner_credential")]
     RunnerCredential,
+    #[serde(rename = "runner_join_key")]
+    RunnerJoinKey,
     #[serde(rename = "github_installation")]
     GithubInstallation,
     #[serde(rename = "gitlab_connection")]
@@ -86,6 +88,8 @@ pub enum Kind {
     Assignment,
     #[serde(rename = "schedule")]
     Schedule,
+    #[serde(rename = "workflow_definition")]
+    WorkflowDefinition,
 }
 
 impl Default for Kind {

@@ -13,7 +13,8 @@ use um_execution::{
 use super::control::{ControlFailure, ControlTarget, Refusal};
 use crate::exit_code::ExitCode;
 
-pub(super) const ABOUT: &str = "Retry a local workflow run";
+pub(super) const ABOUT: &str =
+    "Retry a local workflow run, or a Cloud run waiting for repair with --cloud";
 pub(super) const AFTER_HELP: &str = "Retry eligibility:
   Retry is available when the latest attempt did not succeed or end in rejection, no
   execution owner holds the run, and prior process ownership can be proven safe. A retry
@@ -24,7 +25,13 @@ with the replacement profiles of --agent-profiles when given, and the run contin
 resume continues it, in the previous attempt's execution root unless --execution-root
 names another. A stage whose child run failed continues that child in place, inheriting
 its completed steps and rerunning the rest; in another execution root the stage starts
-afresh. No separate resume is needed.";
+afresh. No separate resume is needed.
+
+With --cloud ORGANIZATION, RUN is a Cloud run ID waiting for repair: the command reads that
+run and asks Cloud, under one request key sent again if the response is lost, to carry the
+retry for its current wait to the runner executing it, which retries the run as this command
+retries a local run. It takes no --execution-root or --agent-profiles. Cloud's acceptance is
+not the runner's application. It reads and writes no local run.";
 
 const COMMAND: &str = "um workflow run retry";
 
@@ -37,6 +44,7 @@ pub(super) struct Command {
     #[arg(
         long,
         value_name = "PATH",
+        conflicts_with = "cloud",
         help = "Directory for workflow execution (must already exist); required unless the run waits for repair"
     )]
     execution_root: Option<PathBuf>,
@@ -44,16 +52,29 @@ pub(super) struct Command {
     #[arg(
         long,
         value_name = "PATH",
+        conflicts_with = "cloud",
         help = "Replace declared agent profiles with the closed replacement document at PATH"
     )]
     agent_profiles: Option<PathBuf>,
 
     #[command(flatten)]
     presentation: super::PresentationOptions,
+
+    #[command(flatten)]
+    cloud: super::CloudSelector,
 }
 
 impl Command {
-    pub(super) fn execute(self) -> super::super::super::CommandResult {
+    pub(super) fn execute(mut self) -> super::super::super::CommandResult {
+        if let Some(organization) = self.cloud.organization.take() {
+            return super::cloud::CloudRun::new(
+                self.run,
+                organization,
+                self.cloud,
+                self.presentation.output.json,
+            )?
+            .control(super::cloud::Control::Retry);
+        }
         super::create::execute_with_runtime(
             "start local workflow retry runtime",
             self.execute_async(),

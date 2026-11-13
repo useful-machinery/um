@@ -612,7 +612,7 @@ fn publication_commands_use_only_the_explicit_service_api_key() {
     )));
 }
 
-// REQ-PUBLISH-54
+// REQ-PUBLISH-13, REQ-PUBLISH-54
 #[test]
 fn publication_create_sends_the_closed_request_and_renders_plain_and_json_receipts() {
     for json in [false, true] {

@@ -193,7 +193,7 @@ separate entity family.
 ### Command names
 
 - **Noun number:** every command-group token is a singular noun. Compound group
-  names have a singular head noun (`input-set`, `runner-pool`,
+  names have a singular head noun (`input-set`, `join-key`, `runner-pool`,
   `service-principal`). There are no plural exceptions. The number-neutral
   names are exactly `auth` (an abbreviation), `github` and `gitlab` (proper
   nouns); add any future number-neutral or irregular spelling here rather than
@@ -201,12 +201,12 @@ separate entity family.
   `input`, `invitation`, and `member`, never `identities`, `inputs`,
   `invitations`, or `members`.
 - **Verb lexicon:** the final token of every leaf below a command group is one
-  of this closed set: `accept`, `activate`, `begin`, `cancel`, `complete`, `create`,
+  of this closed set: `accept`, `activate`, `archive`, `begin`, `cancel`, `complete`, `create`,
   `decline`, `delete`, `disable`, `doctor`, `download`, `drain`, `enable`,
   `end`, `enroll`, `history`, `interrupt`, `issue`, `leave`, `link`, `list`,
   `login`, `logout`, `move`, `preview`, `propose`, `reference`, `remove`, `rename`,
   `request`, `retire`, `retry`, `revoke`, `run`, `schema`, `seal`, `serve`,
-  `set`, `show`, `signup`, `status`, `update`, `upload`, `uses` (the record of
+  `set`, `set-principal`, `show`, `signup`, `status`, `unarchive`, `update`, `upload`, `uses` (the record of
   tokens issued from a grant), `validate`, `version`, `view`, `wait`. A new leaf
   verb requires an amendment to this list; an existing command is not precedent
   for adding one.

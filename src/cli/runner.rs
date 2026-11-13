@@ -15,6 +15,7 @@ mod cloud;
 mod credential;
 mod doctor;
 mod enroll;
+mod join_key;
 mod pool;
 mod serve;
 mod status;
@@ -64,6 +65,8 @@ enum RunnerCommand {
     Enable(ModeCommand),
     #[command(about = enroll::ABOUT)]
     Enroll(enroll::Command),
+    #[command(about = join_key::ABOUT)]
+    JoinKey(join_key::Command),
     #[command(about = "List runner registrations")]
     List(ListCommand),
     #[command(
@@ -104,12 +107,22 @@ impl CloudOptions {
 // distinct Clap types because their positional resources and required options
 // are different operator contracts.
 #[derive(Debug, Args)]
+// With neither target, Cloud places the runner in the caller's own personal pool.
+#[command(group(clap::ArgGroup::new("target").args(["pool", "member"])))]
 struct CreateCommand {
     #[arg(value_name = OrganizationArg::VALUE_NAME, help = OrganizationArg::HELP)]
     organization: OrganizationArg,
 
     #[arg(long = "pool-id", value_name = PoolArg::VALUE_NAME, help = PoolArg::HELP)]
-    pool: PoolArg,
+    pool: Option<PoolArg>,
+
+    #[arg(
+        long,
+        value_name = "MEMBER",
+        value_parser = parse_member_id,
+        help = "Register the runner in this member's personal pool, by exact principal ID"
+    )]
+    member: Option<String>,
 
     #[arg(long, help = "Set the exact runner name")]
     name: Option<String>,
@@ -213,6 +226,7 @@ impl Command {
             Some(RunnerCommand::AgentLogin(command)) => command.execute(),
             Some(RunnerCommand::Credential(command)) => command.execute(),
             Some(RunnerCommand::Enroll(command)) => command.execute(),
+            Some(RunnerCommand::JoinKey(command)) => command.execute(),
             Some(RunnerCommand::List(command)) => execute_cloud(command, ListCommand::execute),
             Some(RunnerCommand::Show(command)) => execute_cloud(command, ShowCommand::execute),
             Some(RunnerCommand::Enable(command)) => {
@@ -278,6 +292,14 @@ impl CreateOutcome {
     }
 }
 
+fn parse_member_id(value: &str) -> Result<String, String> {
+    if um_support::valid_typed_id(value, "prn_") {
+        Ok(value.to_owned())
+    } else {
+        Err("must be an exact member principal ID".to_owned())
+    }
+}
+
 impl CreateCommand {
     fn execute(self, deployment: &Deployment) -> anyhow::Result<ExitCode> {
         validate_activation_destination(&self.activation_file, self.options.json)?;
@@ -291,11 +313,16 @@ impl CreateCommand {
             self.options.http.transport_policy(),
             &self.options.authentication,
             |api| {
-                let pool_id = self.pool.resolve_id(api, &self.organization)?;
+                let pool_id = self
+                    .pool
+                    .as_ref()
+                    .map(|pool| pool.resolve_id(api, &self.organization))
+                    .transpose()?;
                 let registration = api.create_registration(
                     &self.organization,
                     &registration_key,
-                    &pool_id,
+                    pool_id.as_deref(),
+                    self.member.as_deref(),
                     self.name.as_deref(),
                 )?;
                 committed_registration = Some(registration.clone());

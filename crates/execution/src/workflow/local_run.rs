@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use ring::digest::{Context as DigestContext, SHA256, digest};
 use rustix::fs::{
-    AtFlags, FileType, FlockOperation, Mode, OFlags, RenameFlags, fchmod, fcntl_lock, fstat,
+    AtFlags, FileType, FlockOperation, Mode, OFlags, RenameFlags, fchmod, fcntl_lock, flock, fstat,
     linkat, mkdirat, openat, renameat_with, statat, unlinkat,
 };
 use rustix::io::{Errno, dup};
@@ -1759,6 +1759,15 @@ impl PendingLocalContinuation {
         Ok(control_resolution(&self.normalized, &record.id, wait)?
             .ok()
             .flatten())
+    }
+
+    /// Whether a withdrawal recorded while the run was live is still pending, read under the
+    /// run lock (REQ-LOCALRUN-186).
+    pub fn withdrawal_pending(&self) -> Result<bool, LocalRunDirectoryError> {
+        Ok(withdrawal_pending_in(
+            &self.state.attempts,
+            &super::wait::read_controls(&self.normalized)?,
+        ))
     }
 
     /// `end_waiting(WITHDRAWN_OUTCOME)`.
@@ -4189,6 +4198,12 @@ impl ChildRunParent {
     ) -> Result<InitialLocalRun, LocalRunDirectoryError> {
         create_child_under(&self.root, &self.normalized, step, item, admitted, record)
     }
+
+    /// Whether a withdrawal recorded for this run is pending (REQ-WFEXEC-73), read under the
+    /// run lock its attempt holds.
+    pub fn withdrawal_pending(&self) -> Result<bool, LocalRunDirectoryError> {
+        read_withdrawal_pending(&self.normalized, &self.root)
+    }
 }
 
 impl LocalAttemptOwner {
@@ -4200,6 +4215,42 @@ impl LocalAttemptOwner {
             normalized: self.normalized.clone(),
             record: read_run_record(&self.state.root)?,
         })
+    }
+
+    /// Whether a withdrawal recorded for this run is pending (REQ-WFEXEC-73), read under the
+    /// run lock this attempt holds, whether or not the run has `workflow` steps.
+    pub fn withdrawal_pending(&self) -> Result<bool, LocalRunDirectoryError> {
+        read_withdrawal_pending(&self.normalized, &self.state.root)
+    }
+
+    /// Takes the run's controls lock (`ControlsLock`) for the attempt's last read of the
+    /// withdrawals (REQ-WFEXEC-73), waiting while a `withdraw` holds it; it is held until the
+    /// returned value is dropped, after the run lock is released.
+    pub fn lock_controls(&self) -> Result<impl Sized + use<>, LocalRunDirectoryError> {
+        ControlsLock::take(&self.state.root)
+    }
+
+    /// Spends the withdrawals this settled attempt honored (REQ-WFEXEC-73): its `settledAt`
+    /// is taken again now, so every withdrawal recorded before it reads spent to the next
+    /// attempt (`withdrawal_pending_in`). Called under the controls lock after the read that
+    /// honored one, so a `withdraw` appended after it finds the run released; an unsettled
+    /// attempt is left as it is.
+    pub fn spend_withdrawals(&self) -> Result<(), LocalRunDirectoryError> {
+        let now = timestamp(um_support::utc_now())?;
+        self.state.update(|state| {
+            let attempt = current_attempt_mut(state)?;
+            if attempt.state.is_terminal() {
+                attempt.settled_at = Some(now);
+            }
+            Ok(())
+        })
+    }
+
+    /// Removes the run's root `wait.json` this attempt wrote with `record_wait`, when present,
+    /// for an attempt that ends `withdrawn` after writing it (REQ-WFEXEC-73). The attempt's
+    /// copy stays as history.
+    pub fn remove_wait_record(&self) -> Result<(), LocalRunDirectoryError> {
+        remove_root_wait_record(&self.state.root)
     }
 }
 
@@ -4305,24 +4356,27 @@ fn ordinals_in(directory: &OwnedFd) -> Result<Vec<u64>, LocalRunDirectoryError> 
 }
 
 /// One six-digit entry of `children/<step>/` (REQ-LOCALRUN-177): a plain child run, which
-/// holds `run.json`, or the directory of a fan-out element's child runs, which does not.
-enum StepChildEntry {
-    Child(Box<WorkflowRunRecord>),
+/// holds `run.json`, as what was read of it, or the directory of a fan-out element's child
+/// runs, which does not.
+enum StepChildEntry<T> {
+    Child(T),
     Element(OwnedFd),
 }
 
-/// The entries of `children/<step>/` in ordinal order with their names.
-fn step_child_entries(
+/// The entries of `children/<step>/` in ordinal order with their names, `read` giving what
+/// a child run's entry holds.
+fn step_child_entries<T>(
     step_directory: &OwnedFd,
-) -> Result<Vec<(u64, String, StepChildEntry)>, LocalRunDirectoryError> {
+    read: impl Fn(&OwnedFd) -> Result<T, LocalRunDirectoryError>,
+) -> Result<Vec<(u64, String, StepChildEntry<T>)>, LocalRunDirectoryError> {
     ordinals_in(step_directory)?
         .into_iter()
         .map(|ordinal| {
             let name =
                 attempt_directory_name(ordinal).ok_or(LocalRunDirectoryError::StateInvalid)?;
             let entry = open_directory_at(step_directory, &name)?;
-            let entry = match read_optional_run_record(&entry)? {
-                Some(record) => StepChildEntry::Child(Box::new(record)),
+            let entry = match read_if_present(&entry, RUN_RECORD_FILE, &read)? {
+                Some(child) => StepChildEntry::Child(child),
                 None => StepChildEntry::Element(entry),
             };
             Ok((ordinal, name, entry))
@@ -6557,6 +6611,22 @@ pub struct WaitProbe {
     pub inspection: WaitInspection,
 }
 
+impl WaitProbe {
+    /// Whether a withdrawal recorded for the probed run is pending (REQ-LOCALRUN-186), read
+    /// without the run lock a live process holds.
+    pub fn withdrawal_pending(&self) -> Result<bool, LocalRunDirectoryError> {
+        let (normalized, root) = open_run_root(&self.run_directory)?;
+        read_withdrawal_pending(&normalized, &root)
+    }
+
+    /// Takes the probed run's controls lock (`ControlsLock`), waiting while another holds it;
+    /// it is held until the returned value is dropped.
+    pub fn lock_controls(&self) -> Result<impl Sized + use<>, LocalRunDirectoryError> {
+        let (_, root) = open_run_root(&self.run_directory)?;
+        ControlsLock::take(&root)
+    }
+}
+
 /// The first control under `run_directory`'s `controls/`, in ordinal order, that `wait`'s
 /// rule matches for the run `run_id` (REQ-CONTINUE-74), `Ok(None)` when none does and
 /// `Ok(None)` without reading the controls for a rule on a source other than `um`
@@ -6655,6 +6725,88 @@ pub fn inspect_wait(
         Err(error) => WaitInspection::RuleInvalid { wait, error },
     };
     Ok(probe(inspection))
+}
+
+/// Whether `controls` hold a `control.withdraw` naming no wait that no attempt of `attempts`
+/// has honored (REQ-LOCALRUN-186, REQ-WFEXEC-73): one recorded after the attempt before the
+/// current process's attempts settled. The current process's attempts are the latest and,
+/// when backward or limited edges chained it to earlier ones in the same process
+/// (REQ-WFEXEC-64), those; a run with no earlier attempt has every such control pending. So a
+/// withdrawal an earlier attempt ended on, outlived or honored as it settled (whose
+/// `settledAt` `LocalAttemptOwner::spend_withdrawals` took after that read) is spent, and one
+/// recorded while a `retry` or resume held the lock before creating its attempt is not.
+fn withdrawal_pending_in(attempts: &[LocalAttemptV1], controls: &[ControlEvent]) -> bool {
+    let mut first = attempts.len();
+    while let Some(attempt) = first.checked_sub(1).and_then(|index| attempts.get(index)) {
+        first -= 1;
+        let chained = attempt
+            .continuation
+            .as_ref()
+            .and_then(|continuation| continuation.reason)
+            == Some(super::publication::ContinuationReasonV1::Edge);
+        if !chained {
+            break;
+        }
+    }
+    let since = match first.checked_sub(1).and_then(|index| attempts.get(index)) {
+        None => None,
+        Some(earlier) => {
+            let settled = earlier.settled_at.as_deref().unwrap_or(&earlier.created_at);
+            match OffsetDateTime::parse(settled, &Rfc3339) {
+                Ok(since) => Some(since),
+                Err(_) => return false,
+            }
+        }
+    };
+    controls.iter().any(|control| {
+        control.event == super::wait::CONTROL_WITHDRAW
+            && control.wait.is_none()
+            && OffsetDateTime::parse(&control.at, &Rfc3339)
+                .is_ok_and(|at| since.is_none_or(|since| at > since))
+    })
+}
+
+/// A run's controls lock (REQ-LOCALRUN-186, REQ-WFEXEC-73): an exclusive `flock` on the run
+/// directory itself, which nothing else locks. `withdraw` holds it from its check that a live
+/// process holds the run through its append, and that process holds it from its last read of
+/// the withdrawals through the release of the run lock, so a withdrawal is appended only while
+/// the process will still read it, or finds the run released. Released when dropped.
+struct ControlsLock {
+    _directory: OwnedFd,
+}
+
+impl ControlsLock {
+    /// Takes the lock of the run whose root is `root` on a description of its own, so it
+    /// excludes another holder in this process too.
+    fn take(root: &OwnedFd) -> Result<Self, LocalRunDirectoryError> {
+        let directory = openat(
+            root,
+            ".",
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|source| file_error(root, ".", "open", source))?;
+        flock(&directory, FlockOperation::LockExclusive)
+            .map_err(|source| file_error(root, ".", "lock controls", source))?;
+        Ok(Self {
+            _directory: directory,
+        })
+    }
+}
+
+/// `withdrawal_pending_in` for the run whose root is `root`, read from its `state.json` and
+/// controls; a run without `state.json` has none pending.
+fn read_withdrawal_pending(
+    normalized: &Path,
+    root: &OwnedFd,
+) -> Result<bool, LocalRunDirectoryError> {
+    let Some(state) = read_optional_state(root)? else {
+        return Ok(false);
+    };
+    Ok(withdrawal_pending_in(
+        &state.attempts,
+        &super::wait::read_controls(normalized)?,
+    ))
 }
 
 /// The control values an attempt of the run at `requested` starts with (REQ-WFEXEC-63,
@@ -6867,7 +7019,7 @@ pub fn latest_child_run(
             };
             (step_path.join(name), element, item)
         }
-        None => match step_child_entries(&step_directory)?.pop() {
+        None => match step_child_entries(&step_directory, read_run_record)?.pop() {
             None => return Ok(None),
             Some((_, name, StepChildEntry::Child(record))) => {
                 return Ok(Some((step_path.join(name), record.state, None)));
@@ -7035,6 +7187,16 @@ fn sorted_entries(directory: &Path) -> Result<Vec<OsString>, LocalRunDirectoryEr
     Ok(names)
 }
 
+/// Where one child run lies under a run's `children/` (REQ-LOCALRUN-177).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ChildRunDirectory {
+    pub step: String,
+    /// The one-based fan-out element the child ran for, `None` for a plain step's child.
+    pub item: Option<u64>,
+    pub ordinal: u64,
+    pub directory: PathBuf,
+}
+
 /// One child run under a run's `children/` (REQ-LOCALRUN-177).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ChildRun {
@@ -7050,6 +7212,37 @@ pub struct ChildRun {
 /// run at `requested`, in step, then element, then ordinal order, each with its run record;
 /// none before a step has run a child.
 pub fn child_runs(requested: &Path) -> Result<Vec<ChildRun>, LocalRunDirectoryError> {
+    Ok(child_runs_reading(requested, read_run_record)?
+        .into_iter()
+        .map(|(child, record)| ChildRun {
+            step: child.step,
+            item: child.item,
+            ordinal: child.ordinal,
+            directory: child.directory,
+            record,
+        })
+        .collect())
+}
+
+/// Where each child run of the run at `requested` lies, in `child_runs`' order, for a
+/// reader that takes no run record: an entry of `children/<step>/` is a child run when it
+/// holds `run.json`, whatever the record reads, and a fan-out element's directory when it
+/// does not.
+pub fn child_run_directories(
+    requested: &Path,
+) -> Result<Vec<ChildRunDirectory>, LocalRunDirectoryError> {
+    Ok(child_runs_reading(requested, |_| Ok(()))?
+        .into_iter()
+        .map(|(child, ())| child)
+        .collect())
+}
+
+/// Every child run of the run at `requested` in step, then element, then ordinal order,
+/// each with what `read` gives of its run directory.
+fn child_runs_reading<T>(
+    requested: &Path,
+    read: impl Fn(&OwnedFd) -> Result<T, LocalRunDirectoryError>,
+) -> Result<Vec<(ChildRunDirectory, T)>, LocalRunDirectoryError> {
     let (normalized, root) = open_run_root(requested)?;
     let Some(children) = open_optional_directory(&root, CHILDREN_DIRECTORY)? else {
         return Ok(Vec::new());
@@ -7066,26 +7259,30 @@ pub fn child_runs(requested: &Path) -> Result<Vec<ChildRun>, LocalRunDirectoryEr
             continue;
         };
         let step_path = normalized.join(CHILDREN_DIRECTORY).join(&step);
-        for (number, name, entry) in step_child_entries(&step_directory)? {
+        for (number, name, entry) in step_child_entries(&step_directory, &read)? {
             match entry {
-                StepChildEntry::Child(record) => runs.push(ChildRun {
-                    directory: step_path.join(&name),
-                    record: *record,
-                    step: step.clone(),
-                    item: None,
-                    ordinal: number,
-                }),
+                StepChildEntry::Child(child) => runs.push((
+                    ChildRunDirectory {
+                        step: step.clone(),
+                        item: None,
+                        ordinal: number,
+                        directory: step_path.join(&name),
+                    },
+                    child,
+                )),
                 StepChildEntry::Element(element) => {
                     for ordinal in ordinals_in(&element)? {
                         let child = attempt_directory_name(ordinal)
                             .ok_or(LocalRunDirectoryError::StateInvalid)?;
-                        runs.push(ChildRun {
-                            record: read_run_record(&open_directory_at(&element, &child)?)?,
-                            directory: step_path.join(&name).join(child),
-                            step: step.clone(),
-                            item: Some(number),
-                            ordinal,
-                        });
+                        runs.push((
+                            ChildRunDirectory {
+                                step: step.clone(),
+                                item: Some(number),
+                                ordinal,
+                                directory: step_path.join(&name).join(&child),
+                            },
+                            read(&open_directory_at(&element, &child)?)?,
+                        ));
                     }
                 }
             }
@@ -7105,6 +7302,23 @@ fn remove_root_wait_record(root: &OwnedFd) -> Result<(), LocalRunDirectoryError>
 }
 
 /// The canonical path of a run directory and its root handle.
+/// The most bytes a durable JSON record of a run (`run.json`, `wait.json`, `state.json`)
+/// holds; the engine refuses a larger one unread and writes none.
+pub const MAXIMUM_DURABLE_RECORD_BYTES: u64 = MAXIMUM_DURABLE_JSON_BYTES;
+
+/// Reads the bytes of the durable record `name` of the run at `requested` as the engine
+/// reads its own records: a regular file opened without following a symbolic link and
+/// without waiting on a FIFO, of at most `MAXIMUM_DURABLE_RECORD_BYTES`. A reader outside
+/// the engine, such as the runner observing a tree run whose steps can replace the file,
+/// reads a record through this one reader, never through one of its own.
+pub fn read_durable_record(
+    requested: &Path,
+    name: &str,
+) -> Result<Vec<u8>, LocalRunDirectoryError> {
+    let (_, root) = open_run_root(requested)?;
+    read_regular_file(&root, name)
+}
+
 pub(super) fn open_run_root(
     requested: &Path,
 ) -> Result<(PathBuf, OwnedFd), LocalRunDirectoryError> {

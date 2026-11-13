@@ -322,7 +322,7 @@ impl AssignmentManager {
             self.finish_before_execution(identity, root, "execution_lease_expired")?;
             return Ok(None);
         };
-        let cancellation_grace = accepted.admitted.execution().cancellation().grace();
+        let cancellation_grace = accepted.execution.cancellation().grace();
         let authority =
             match self.validate_grant(&start.lease, 1, cancellation_grace, &causal_lease) {
                 Ok(authority) => authority,
@@ -360,12 +360,7 @@ impl AssignmentManager {
                 return Err(AssignmentManagerFailure::LeaseClock);
             }
         }
-        let cancellation = accepted
-            .admitted
-            .execution()
-            .cancellation()
-            .source()
-            .clone();
+        let cancellation = accepted.execution.cancellation().source().clone();
         let (authority_updates, authority_receiver) = tokio::sync::watch::channel(authority);
         let (start_authority, start_authority_receiver) = tokio::sync::watch::channel(false);
         let (infrastructure_interruption, infrastructure_interruption_receiver) =
@@ -1016,7 +1011,9 @@ impl AssignmentManager {
                 running
                     .infrastructure_interruption
                     .send_replace(Some(InfrastructureInterruption::RunnerShutdown));
-                disable_workflow_git_off_thread(&running.workflow_git);
+                if let Some(workflow_git) = &running.workflow_git {
+                    disable_workflow_git_off_thread(workflow_git);
+                }
                 running
                     .cancellation
                     .request_cancellation(CancellationReason::RunnerShutdown);

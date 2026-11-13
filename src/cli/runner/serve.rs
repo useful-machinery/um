@@ -1,4 +1,9 @@
-use std::path::PathBuf;
+use std::ffi::{OsStr, OsString};
+use std::io::{self, Write};
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::process::CommandExt;
+use std::path::{Path, PathBuf};
+use std::process::{self, Stdio};
 
 use anyhow::Context;
 use clap::Args;
@@ -10,32 +15,67 @@ use um_execution::{
     discover_and_validate_claude_code_installation, discover_and_validate_codex_installation,
     discover_and_validate_pi_installation,
 };
-use um_runner::Config;
+use um_runner::{
+    Config, EnrollmentError, EnrollmentResponse, JoinKeyArtifact, JoinOutcome, JoinRefusal,
+};
 
 pub(super) const ABOUT: &str = "Serve run assignments";
+
+const JOIN_KEY_VARIABLE: &str = "UM_RUNNER_JOIN_KEY";
 
 #[derive(Debug, Args)]
 pub(super) struct Command {
     /// Read the closed runner operator configuration and enrolled state.
     #[arg(long, value_name = "PATH")]
     config: PathBuf,
+
+    /// Join the key's pool from a protected file or explicit stdin when the
+    /// host holds no enrolled state; UM_RUNNER_JOIN_KEY may hold the key instead.
+    #[arg(long, value_name = "PATH|-")]
+    join_key_file: Option<PathBuf>,
 }
 
 impl Command {
     pub(super) fn execute(self) -> super::super::CommandResult {
-        let (pi_installation, claude_code_installation, codex_installation) =
+        let join_key = join_key_source(
+            self.join_key_file.as_deref(),
+            std::env::var_os(JOIN_KEY_VARIABLE),
+        )?;
+        let config_path = super::operator_config_path(&self.config)?;
+        // A host that holds enrolled state serves with it and never reads its
+        // join key, so a key that is gone or unreadable does not stop it. The
+        // journal its own completed join left is removed first, as the second
+        // copy of the credential secret it is.
+        // Harness discovery runs before the operator configuration is judged,
+        // so a start with an invalid configuration still reports what it found.
+        let discover = || {
             discover_harness_installations_with(
                 discover_and_validate_pi_installation,
                 discover_and_validate_claude_code_installation,
                 discover_and_validate_codex_installation,
-            );
-        let config_path = super::operator_config_path(&self.config)?;
-        let config = Config::load(&config_path).with_context(|| {
-            format!(
-                "load runner operator configuration {}",
-                config_path.display()
             )
-        })?;
+        };
+        let (config, (pi_installation, claude_code_installation, codex_installation)) =
+            match (Config::load(&config_path), join_key) {
+                (Ok(_), Some(JoinKeySource::Variable(_))) => {
+                    return Err(restart_without_join_key_variable().into());
+                }
+                (Ok(config), _) => {
+                    um_runner::remove_completed_join_journal(&config_path)
+                        .context("remove the journal of the runner's completed join")?;
+                    (config, discover())
+                }
+                (Err(_), Some(join_key)) => {
+                    let key = join_key.read()?;
+                    let installations = discover();
+                    join_unless_enrolled(&config_path, key)?;
+                    (load_config(&config_path)?, installations)
+                }
+                (Err(error), None) => {
+                    discover();
+                    return Err(config_load_error(&config_path, error).into());
+                }
+            };
         let config = configure_harness_installations(
             config,
             pi_installation,
@@ -53,6 +93,156 @@ impl Command {
             }
         }
     }
+}
+
+fn load_config(config_path: &Path) -> anyhow::Result<Config> {
+    Config::load(config_path).map_err(|error| config_load_error(config_path, error))
+}
+
+fn config_load_error(config_path: &Path, error: um_runner::ConfigError) -> anyhow::Error {
+    anyhow::Error::new(error).context(format!(
+        "load runner operator configuration {}",
+        config_path.display()
+    ))
+}
+
+/// Where the join key would be read from; nothing is read until the host is
+/// found to hold no enrolled state.
+enum JoinKeySource {
+    File(PathBuf),
+    Variable(OsString),
+}
+
+fn join_key_source(
+    file: Option<&Path>,
+    variable: Option<OsString>,
+) -> Result<Option<JoinKeySource>, super::super::CommandFailure> {
+    match (file, variable) {
+        (None, None) => Ok(None),
+        (Some(_), Some(_)) => Err(super::super::CommandFailure::with_exit_code(
+            anyhow::anyhow!(
+                "read join key: --join-key-file and {JOIN_KEY_VARIABLE} are both set\n\nGive the join key in one of them."
+            ),
+            ExitCode::UsageError,
+        )),
+        (Some(path), None) => Ok(Some(JoinKeySource::File(path.to_owned()))),
+        (None, Some(text)) => Ok(Some(JoinKeySource::Variable(text))),
+    }
+}
+
+impl JoinKeySource {
+    fn read(self) -> Result<JoinKeyArtifact, super::super::CommandFailure> {
+        match self {
+            Self::File(path) => Ok(JoinKeyArtifact::read_file(&path)
+                .with_context(|| format!("read join key {}", path.display()))?),
+            Self::Variable(text) => Err(hand_join_key_to_new_image(&text).into()),
+        }
+    }
+}
+
+// A key in UM_RUNNER_JOIN_KEY never stays in this process's environment block,
+// which `/proc/<pid>/environ` and `ps eww` read. The command validates it and
+// replaces itself with the same `um runner serve` started without the variable
+// and with the key on a pipe as `--join-key-file -`; the new image has no
+// variable, so it reads the pipe and does not hand the key on again.
+//
+// Returns only when the handoff fails: a successful `exec` does not return.
+fn hand_join_key_to_new_image(text: &OsStr) -> anyhow::Error {
+    match stage_join_key_handoff(text) {
+        Ok(mut command) => anyhow::Error::new(command.exec())
+            .context("start um runner serve with the join key on standard input"),
+        Err(error) => error,
+    }
+}
+
+// An enrolled host does not read UM_RUNNER_JOIN_KEY, but the variable still
+// leaves its environment block: the command replaces itself with the same
+// `um runner serve` started without it. Returns only when the restart fails.
+fn restart_without_join_key_variable() -> anyhow::Error {
+    match std::env::current_exe().context("locate the um executable") {
+        Ok(executable) => anyhow::Error::new(
+            join_key_handoff_command(&executable, std::env::args_os(), None).exec(),
+        )
+        .context(format!(
+            "restart um runner serve without {JOIN_KEY_VARIABLE}"
+        )),
+        Err(error) => error,
+    }
+}
+
+fn stage_join_key_handoff(text: &OsStr) -> anyhow::Result<process::Command> {
+    let key = text.as_bytes();
+    JoinKeyArtifact::parse(key)
+        .with_context(|| format!("read join key from {JOIN_KEY_VARIABLE}"))?;
+    // The parsed key is at most 4096 bytes, within any pipe's capacity, so the
+    // write completes before the new image starts reading.
+    let (reader, mut writer) = io::pipe().context("open the join key pipe")?;
+    writer
+        .write_all(key)
+        .context("write the join key to its pipe")?;
+    drop(writer);
+    let executable = std::env::current_exe().context("locate the um executable")?;
+    Ok(join_key_handoff_command(
+        &executable,
+        std::env::args_os(),
+        Some(Stdio::from(reader)),
+    ))
+}
+
+// The same `um runner serve` without UM_RUNNER_JOIN_KEY, given the key on
+// standard input as `--join-key-file -` when there is one to hand on.
+fn join_key_handoff_command(
+    executable: &Path,
+    arguments: impl IntoIterator<Item = OsString>,
+    key: Option<Stdio>,
+) -> process::Command {
+    let mut arguments = arguments.into_iter();
+    let mut command = process::Command::new(executable);
+    if let Some(name) = arguments.next() {
+        command.arg0(name);
+    }
+    command.args(arguments).env_remove(JOIN_KEY_VARIABLE);
+    if let Some(key) = key {
+        command.args(["--join-key-file", "-"]).stdin(key);
+    }
+    command
+}
+
+fn join_unless_enrolled(
+    config_path: &Path,
+    join_key: JoinKeyArtifact,
+) -> Result<(), super::super::CommandFailure> {
+    let join_key_id = join_key.join_key_id().to_owned();
+    match um_runner::join_unless_enrolled(config_path, join_key) {
+        Ok(JoinOutcome::AlreadyEnrolled) => Ok(()),
+        Ok(JoinOutcome::Joined(response)) => {
+            write_join(&mut io::stderr().lock(), &response)?;
+            Ok(())
+        }
+        Err(EnrollmentError::JoinRefused(refusal)) => Err(anyhow::anyhow!(
+            "join runner pool with join key {join_key_id}: {}\ncode: {}\n\nNo runner was registered. Start the runner with a join key Cloud accepts.",
+            EnrollmentError::JoinRefused(refusal),
+            refusal.code()
+        )
+        .into()),
+        Err(error @ EnrollmentError::StagedJoinUnauthorized { .. }) => Err(anyhow::anyhow!(
+            "join runner pool with join key {join_key_id}: {error}\ncode: {}",
+            JoinRefusal::Unauthorized.code()
+        )
+        .into()),
+        Err(error) => Err(anyhow::Error::new(error)
+            .context(format!("join runner pool with join key {join_key_id}"))
+            .into()),
+    }
+}
+
+fn write_join(output: &mut impl Write, response: &EnrollmentResponse) -> anyhow::Result<()> {
+    writeln!(output, "✓ Runner joined.\n")?;
+    writeln!(output, "runner:     {}", response.runner_id())?;
+    writeln!(output, "name:       {}", response.runner_name())?;
+    writeln!(output, "pool:       {}", response.pool_name())?;
+    writeln!(output, "credential: {}", response.credential_id())?;
+    Ok(())
 }
 
 const fn service_exit_code(requires_operator_recovery: bool) -> ExitCode {
@@ -221,5 +411,53 @@ mod tests {
         assert_eq!(config.pi_installation(), Some(&pi));
         assert_eq!(config.claude_code_installation(), None);
         assert_eq!(config.codex_installation(), None);
+    }
+
+    // REQ-RUNNERENROLL-97
+    #[test]
+    fn a_join_key_variable_is_handed_to_a_new_image_without_it_on_standard_input() {
+        let (reader, _writer) = io::pipe().unwrap();
+        let command = join_key_handoff_command(
+            Path::new("/installed/um"),
+            ["um", "runner", "serve", "--config", "/etc/um/runner.toml"].map(OsString::from),
+            Some(Stdio::from(reader)),
+        );
+
+        assert_eq!(command.get_program(), "/installed/um");
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            [
+                "runner",
+                "serve",
+                "--config",
+                "/etc/um/runner.toml",
+                "--join-key-file",
+                "-",
+            ],
+        );
+        assert_eq!(
+            command.get_envs().collect::<Vec<_>>(),
+            [(std::ffi::OsStr::new(JOIN_KEY_VARIABLE), None)],
+        );
+    }
+
+    // REQ-RUNNERENROLL-97
+    #[test]
+    fn an_enrolled_host_restarts_without_the_join_key_variable_and_hands_on_no_key() {
+        let command = join_key_handoff_command(
+            Path::new("/installed/um"),
+            ["um", "runner", "serve", "--config", "/etc/um/runner.toml"].map(OsString::from),
+            None,
+        );
+
+        assert_eq!(command.get_program(), "/installed/um");
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            ["runner", "serve", "--config", "/etc/um/runner.toml"],
+        );
+        assert_eq!(
+            command.get_envs().collect::<Vec<_>>(),
+            [(std::ffi::OsStr::new(JOIN_KEY_VARIABLE), None)],
+        );
     }
 }

@@ -7,19 +7,20 @@ use ring::digest::{SHA256, digest};
 use std::os::unix::ffi::OsStringExt as _;
 use std::process::Stdio;
 
-const TOKEN: &str = "unique-cloud-run-command-token-sentinel";
-const REFRESHED_TOKEN: &str = "unique-cloud-run-refreshed-token-sentinel";
-const ORGANIZATION: &str = "acme-research";
-const ORGANIZATION_ID: &str = "org_01k0z6r1w8f4jy2m7q9v3x5abc";
-const PROJECT_ID: &str = "prj_01k0z6r1w8f4jy2m7q9v3x5abc";
-const RUN_ID: &str = "run_01k0z6r1w8f4jy2m7q9v3x5abc";
+pub(super) const TOKEN: &str = "unique-cloud-run-command-token-sentinel";
+pub(super) const REFRESHED_TOKEN: &str = "unique-cloud-run-refreshed-token-sentinel";
+pub(super) const ORGANIZATION: &str = "acme-research";
+pub(super) const ORGANIZATION_ID: &str = "org_01k0z6r1w8f4jy2m7q9v3x5abc";
+pub(super) const PROJECT_ID: &str = "prj_01k0z6r1w8f4jy2m7q9v3x5abc";
+pub(super) const RUN_ID: &str = "run_01k0z6r1w8f4jy2m7q9v3x5abc";
 const ATTEMPT_ID: &str = "atm_01k0z6r1w8f4jy2m7q9v3x5abc";
 const EXECUTION_SPEC_ID: &str = "xsp_01k0z6r1w8f4jy2m7q9v3x5abc";
 const REPOSITORY_CONNECTION_ID: &str = "rpc_01k0z6r1w8f4jy2m7q9v3x5abc";
-const INPUT_SET_ID: &str = "ris_01k0z6r1w8f4jy2m7q9v3x5abc";
+pub(super) const INPUT_SET_ID: &str = "ris_01k0z6r1w8f4jy2m7q9v3x5abc";
 const WORKFLOW_PATH: &str = "workflows/build.yaml";
+pub(super) const DEFINITION_ID: &str = "def_01k0z6r1w8f4jy2m7q9v3x5abc";
 
-mod continuation_command_tests {
+pub(super) mod continuation_command_tests {
     use super::*;
     use std::net::TcpListener;
     #[cfg(target_os = "linux")]
@@ -33,7 +34,6 @@ mod continuation_command_tests {
 
     fn projection(state: &str) -> serde_json::Value {
         let mut run = run_body_with_state(match state {
-            "replaced" => "preparing",
             "changed-receipt" => "running",
             "third" => "succeeded",
             other => other,
@@ -62,14 +62,6 @@ mod continuation_command_tests {
                 "preparation":preparation, "startSnapshot":null, "priorSettlementSnapshot":null,
                 "modified":"unknown", "quiescence":null}
         });
-        if state == "replaced" {
-            run["continuation"]["definitionSource"]["kind"] = serde_json::json!("replaced");
-            run["continuation"]["definitionSource"]["manifestDigest"]["value"] =
-                serde_json::json!(CURRENT);
-            run["continuation"]["request"]["definition"] = serde_json::json!({"replaced":{
-                "commitOid":"abcdef0123456789abcdef0123456789abcdef01",
-                "workflowPath":"workflows/replacement.yaml"}});
-        }
         if state == "third" {
             run["currentAttemptId"] = serde_json::json!("atm_01k0z6r1w8f4jy2m7q9v3x5abd");
             run["currentAttemptNumber"] = serde_json::json!(3);
@@ -102,12 +94,7 @@ mod continuation_command_tests {
 
     fn envelope(state: &str) -> serde_json::Value {
         let run = projection(state);
-        let mut definition = projection("preparing")["workflowDefinitionSource"].clone();
-        if state == "replaced" {
-            definition["commitOid"] = serde_json::json!("abcdef0123456789abcdef0123456789abcdef01");
-            definition["workflowPath"] = serde_json::json!("workflows/replacement.yaml");
-            definition["workflowSourceClosureDigest"]["value"] = serde_json::json!(CURRENT);
-        }
+        let definition = projection("preparing")["workflowDefinitionSource"].clone();
         serde_json::json!({"request":{
             "requestId":REQUEST_ID,"organizationId":ORGANIZATION_ID,"runId":RUN_ID,
             "attemptId":ATTEMPT_ID,"attemptNumber":2,"acceptedAt":"2026-08-10T12:00:00Z",
@@ -116,8 +103,21 @@ mod continuation_command_tests {
         },"run":run})
     }
 
-    // Each accepted socket is a scripted response barrier, not a timed race.
     fn execute(steps: &[&str], args: &[&str]) -> (Output, Vec<String>) {
+        execute_with_env(steps, args, &[])
+    }
+
+    /// Runs `um` with `args` and `environment` against a server that answers one accepted
+    /// socket per step. Each accepted socket is a scripted response barrier, not a timed race.
+    /// Besides the named fixtures, `submitted` admits the POSTed request as it was sent, as
+    /// Cloud admits a definition-backed run (REQ-CONTINUE-84), and `violation:CODE` refuses it
+    /// with that one admission violation, `conflict:SLUG` answers 409 with that problem type and
+    /// no violation list, and `gone:SLUG` answers 410 with that problem type.
+    pub(crate) fn execute_with_env(
+        steps: &[&str],
+        args: &[&str],
+        environment: &[(&'static str, &str)],
+    ) -> (Output, Vec<String>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let api_url = format!("http://{}/api", listener.local_addr().unwrap());
         let directory = private_credential_directory();
@@ -162,12 +162,31 @@ mod continuation_command_tests {
                     if step == "changed-receipt" {
                         body["request"]["acceptedAt"] = serde_json::json!("2026-08-11T12:00:00Z");
                     }
+                    if step == "submitted" {
+                        let submitted: serde_json::Value =
+                            serde_json::from_str(captured.split("\r\n\r\n").nth(1).unwrap())
+                                .unwrap();
+                        let steps = submitted["fromSteps"].clone();
+                        body = envelope("preparing");
+                        body["request"]["reexecutedSteps"] = steps.clone();
+                        body["request"]["inheritedSteps"] = serde_json::json!([]);
+                        body["run"]["continuation"]["request"] = submitted;
+                        body["run"]["continuation"]["fromSteps"] = steps.clone();
+                        body["run"]["continuation"]["reexecutedSteps"] = steps;
+                        body["run"]["continuation"]["inheritedSteps"] = serde_json::json!([]);
+                    }
                     if step == "changed-request" {
                         body["run"]["continuation"]["request"]["fromSteps"] =
                             serde_json::json!(["test", "build"]);
                     }
-                    let response = if step == "admission-version" || step == "admission-node" {
-                        let violation = if step == "admission-version" {
+                    let violation_code = step.strip_prefix("violation:");
+                    let response = if step == "admission-version"
+                        || step == "admission-node"
+                        || violation_code.is_some()
+                    {
+                        let violation = if let Some(code) = violation_code {
+                            serde_json::json!({ "code": code })
+                        } else if step == "admission-version" {
                             serde_json::json!({"code":"expected_run_version_conflict"})
                         } else {
                             serde_json::json!({"code":"continuation_references_unsatisfied", "node":"test", "producer":"source", "reference":"steps.source.outputs.file", "priorState":"failed"})
@@ -177,6 +196,12 @@ mod continuation_command_tests {
                     } else if step == "not-found" {
                         http_response_with_headers("404 Not Found", Some("application/problem+json"), &[],
                             br#"{"type":"https://api.usefulmachinery.com/problems/not-found","title":"Not Found","status":404}"#)
+                    } else if let Some(slug) = step.strip_prefix("conflict:") {
+                        http_response_with_headers("409 Conflict", Some("application/problem+json"), &[],
+                            &serde_json::to_vec(&serde_json::json!({"type":format!("https://api.usefulmachinery.com/problems/{slug}"), "title":"Conflict", "status":409})).unwrap())
+                    } else if let Some(slug) = step.strip_prefix("gone:") {
+                        http_response_with_headers("410 Gone", Some("application/problem+json"), &[],
+                            &serde_json::to_vec(&serde_json::json!({"type":format!("https://api.usefulmachinery.com/problems/{slug}"), "title":"Gone", "status":410})).unwrap())
                     } else {
                         http_response_with_headers(
                             status,
@@ -191,7 +216,10 @@ mod continuation_command_tests {
             }
             requests
         });
-        let environment = deployment_environment(&api_url, credentials.to_str().unwrap());
+        let environment = deployment_environment(&api_url, credentials.to_str().unwrap())
+            .into_iter()
+            .chain(environment.iter().copied())
+            .collect::<Vec<_>>();
         let output = run_with_env(args, &environment);
         (output, server.join().unwrap())
     }
@@ -246,34 +274,81 @@ mod continuation_command_tests {
         );
     }
 
-    // REQ-CONTINUE-55, REQ-CONTINUE-56, REQ-CONTINUE-61
+    // REQ-CONTINUE-55
     #[test]
-    fn replacement_pair_is_exact_and_human_output_distinguishes_inheritance() {
+    fn retired_replacement_pair_is_unknown_and_the_definition_is_always_inherited() {
+        let (output, requests) = execute(
+            &[],
+            &[
+                "run",
+                "continue",
+                ORGANIZATION,
+                RUN_ID,
+                "--from",
+                "build",
+                "--workflow-commit",
+                "abcdef0123456789abcdef0123456789abcdef01",
+                "--workflow-path",
+                "workflows/replacement.yaml",
+                "--allow-insecure-http",
+            ],
+        );
+        assert_eq!(output.status.code(), Some(2), "{output:?}");
+        assert!(output.stdout.is_empty(), "{output:?}");
+        assert!(requests.is_empty());
+
+        let (output, requests) = execute(
+            &["submitted"],
+            &[
+                "run",
+                "continue",
+                ORGANIZATION,
+                RUN_ID,
+                "--from",
+                "build",
+                "--expected-version",
+                "3",
+                "--json",
+                "--allow-insecure-http",
+            ],
+        );
+        assert_eq!(output.status.code(), Some(0), "{output:?}");
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            request_body(&requests[0]),
+            serde_json::json!({"fromSteps":["build"],"definition":"inherited","expectedRunVersion":3})
+        );
+    }
+
+    // REQ-CONTINUE-56, REQ-CONTINUE-61
+    #[test]
+    fn human_output_distinguishes_inheritance_and_keeps_an_earlier_replaced_definition() {
         let mut args = args();
         args.retain(|arg| *arg != "--json");
-        args.extend([
-            "--workflow-commit",
-            "abcdef0123456789abcdef0123456789abcdef01",
-            "--workflow-path",
-            "workflows/replacement.yaml",
-        ]);
-        let (output, requests) = execute(&["replaced"], &args);
+        let (output, _) = execute(&["preparing"], &args);
         assert_eq!(output.status.code(), Some(0), "{output:?}");
-        let body: serde_json::Value =
-            serde_json::from_str(requests[0].split("\r\n\r\n").nth(1).unwrap()).unwrap();
-        assert_eq!(
-            body["definition"]["replaced"],
-            serde_json::json!({
-            "commitOid":"abcdef0123456789abcdef0123456789abcdef01",
-            "workflowPath":"workflows/replacement.yaml"})
-        );
         let text = String::from_utf8(output.stdout).unwrap();
         assert!(text.contains("accepted attempt:"));
         assert!(text.contains("inherited: source"));
         assert!(text.contains("preparation: pending"));
-        assert!(text.contains("effective commit: abcdef0123456789abcdef0123456789abcdef01"));
         assert!(text.contains("portable result: absent"));
         assert!(text.contains("execution root: /work/current"));
+        assert!(!text.contains("effective commit:"));
+
+        // A receipt admitted before the replacement pair was retired keeps its replaced
+        // definition, and both the waiting command and `um run show` still render it.
+        args.push("--wait");
+        let (waited, _) = execute(&["preparing", "third"], &args);
+        let (shown, _) = execute(
+            &["show-third"],
+            &["run", "show", ORGANIZATION, RUN_ID, "--allow-insecure-http"],
+        );
+        for output in [waited, shown] {
+            assert_eq!(output.status.code(), Some(0), "{output:?}");
+            let text = String::from_utf8(output.stdout).unwrap();
+            assert!(text.contains("effective commit: abcdef0123456789abcdef0123456789abcdef01"));
+            assert!(text.contains("effective workflow: workflows/replacement.yaml"));
+        }
     }
 
     // REQ-CONTINUE-61
@@ -524,6 +599,31 @@ mod continuation_command_tests {
         assert_eq!(requests.len(), 2);
     }
 
+    // REQ-CONTINUE-87
+    #[test]
+    fn a_path_run_retired_answer_is_reported_as_path_run_retired() {
+        for (step, code) in [
+            ("gone:path-run-retired", "path_run_retired"),
+            ("gone:run-input-content-gone", "submission_failed"),
+        ] {
+            let (output, requests) = execute(&[step], &args());
+            assert_eq!(output.status.code(), Some(1), "{output:?}");
+            let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(result["outcome"], "error");
+            assert_eq!(result["code"], code);
+            assert!(result["request"].is_null());
+            assert_eq!(requests.len(), 1);
+
+            let human = args()
+                .into_iter()
+                .filter(|arg| *arg != "--json")
+                .collect::<Vec<_>>();
+            let (output, _) = execute(&[step], &human);
+            assert_eq!(output.status.code(), Some(1), "{output:?}");
+            assert!(String::from_utf8_lossy(&output.stderr).contains(&format!("code: {code}")));
+        }
+    }
+
     // REQ-CONTINUE-58
     #[test]
     fn post_cannot_report_a_different_semantic_request_as_accepted() {
@@ -655,10 +755,14 @@ mod retry_command_tests {
                             "not-found" => ("404 Not Found", "Not Found"),
                             "rate-limited" => ("429 Too Many Requests", "Too Many Requests"),
                             "unavailable" => ("503 Service Unavailable", "Service Unavailable"),
+                            "run-input-content-gone" => ("410 Gone", "Gone"),
                             _ => ("409 Conflict", "Conflict"),
                         };
                         let status_number: u16 = status.split(' ').next().unwrap().parse().unwrap();
-                        let body = serde_json::json!({"type":format!("https://api.usefulmachinery.com/problems/{other}"),"title":title,"status":status_number});
+                        let mut body = serde_json::json!({"type":format!("https://api.usefulmachinery.com/problems/{other}"),"title":title,"status":status_number});
+                        if let Some(holder) = code.as_deref() {
+                            body["workflow"] = serde_json::json!({"holderRunId": holder});
+                        }
                         let bytes = serde_json::to_vec(&body).unwrap();
                         Some(http_response_with_headers(
                             status,
@@ -1197,17 +1301,75 @@ mod retry_command_tests {
     // REQ-RETRY-35
     #[test]
     fn conflicts_are_not_reported_as_applied() {
-        for (problem, outcome) in [
-            ("trigger-active-run", "trigger_slot_conflict"),
-            ("run-retry-pending", "retry_pending"),
+        let (output, requests) = execute(&[("run-retry-pending", None)], &args());
+        assert_eq!(output.status.code(), Some(1));
+        assert!(output.stderr.is_empty());
+        let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(json["outcome"], "retry_pending");
+        assert_eq!(json["code"], "retry_pending");
+        assert!(json.get("holderRunId").is_none());
+        assert_eq!(requests.len(), 1);
+    }
+
+    // REQ-RETRY-35
+    #[test]
+    fn subject_refusals_name_the_holding_run() {
+        const HOLDER: &str = "run_01k0z6r1w8f4jy2m7q9v3x5abd";
+        for (problem, code) in [
+            ("subject-busy", "subject_busy"),
+            ("subject-settled", "subject_settled"),
         ] {
-            let (output, requests) = execute(&[(problem, None)], &args());
+            let (output, requests) = execute(&[(problem, Some(HOLDER))], &args());
             assert_eq!(output.status.code(), Some(1));
             assert!(output.stderr.is_empty());
             let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-            assert_eq!(json["outcome"], outcome);
+            assert_eq!(json["outcome"], code);
+            assert_eq!(json["code"], code);
+            assert_eq!(json["holderRunId"], HOLDER);
+            assert!(json["receipt"].is_null());
             assert_eq!(requests.len(), 1);
+            let human = [
+                "run",
+                "retry",
+                ORGANIZATION,
+                RUN_ID,
+                "--allow-insecure-http",
+            ];
+            let (output, _) = execute(&[(problem, Some(HOLDER))], &human);
+            assert_eq!(output.status.code(), Some(1));
+            assert!(output.stdout.is_empty());
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(stderr.contains(&format!("code: {code}")), "{stderr}");
+            assert!(stderr.contains(HOLDER), "{stderr}");
         }
+    }
+
+    // REQ-RETRY-35, REQ-RETRY-52: Cloud refuses the retry of a run by workflow path 409
+    // `path-run-retired`, which the scripted peer answers as it does any conflict.
+    #[test]
+    fn a_path_run_retired_answer_is_reported_as_path_run_retired() {
+        let (output, requests) = execute(&[("path-run-retired", None)], &args());
+        assert_eq!(output.status.code(), Some(1), "{output:?}");
+        assert!(output.stderr.is_empty());
+        let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(json["outcome"], "error");
+        assert_eq!(json["code"], "path_run_retired");
+        assert_eq!(requests.len(), 1);
+
+        let human = args()
+            .into_iter()
+            .filter(|arg| *arg != "--json")
+            .collect::<Vec<_>>();
+        let (output, _) = execute(&[("path-run-retired", None)], &human);
+        assert_eq!(output.status.code(), Some(1), "{output:?}");
+        assert!(output.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("code: path_run_retired"));
+
+        let (other, requests) = execute(&[("run-input-content-gone", None)], &args());
+        let json: serde_json::Value = serde_json::from_slice(&other.stdout).unwrap();
+        assert_eq!(other.status.code(), Some(4), "{other:?}");
+        assert_eq!(json["code"], "acceptance_unknown");
+        assert_eq!(requests.len(), 1);
     }
 }
 
@@ -1215,7 +1377,7 @@ fn request_text(stream: &mut std::net::TcpStream) -> String {
     String::from_utf8(read_request(stream)).expect("scripted peer request should be UTF-8")
 }
 
-fn prepared_run(responses: Vec<Vec<u8>>) -> (ScriptedServer, tempfile::TempDir, String) {
+pub(super) fn prepared_run(responses: Vec<Vec<u8>>) -> (ScriptedServer, tempfile::TempDir, String) {
     let server = ScriptedServer::respond(responses);
     let credential_directory = private_credential_directory();
     let credential_path = credential_directory.path().join("credentials.json");
@@ -1405,7 +1567,7 @@ fn acceptance_body(run_id: &str, replayed: bool) -> Vec<u8> {
     .unwrap()
 }
 
-fn acceptance_response(replayed: bool) -> Vec<u8> {
+pub(super) fn acceptance_response(replayed: bool) -> Vec<u8> {
     acceptance_response_for(
         "202 Accepted",
         RUN_ID,
@@ -1420,7 +1582,7 @@ fn acceptance_response(replayed: bool) -> Vec<u8> {
     )
 }
 
-fn acceptance_response_for(
+pub(super) fn acceptance_response_for(
     status: &str,
     run_id: &str,
     replayed: bool,
@@ -1449,7 +1611,7 @@ fn run_body() -> serde_json::Value {
     run_body_with_state("running")
 }
 
-fn run_body_with_state(state: &str) -> serde_json::Value {
+pub(super) fn run_body_with_state(state: &str) -> serde_json::Value {
     let interruption = if state == "interrupted" {
         serde_json::json!({
             "phase": "running",
@@ -1692,7 +1854,7 @@ fn publication_response(body: serde_json::Value) -> Vec<u8> {
     )
 }
 
-fn run_response(body: serde_json::Value) -> Vec<u8> {
+pub(super) fn run_response(body: serde_json::Value) -> Vec<u8> {
     http_response_with_headers(
         "200 OK",
         Some("application/json"),
@@ -2493,15 +2655,18 @@ fn cancellation_retry_can_observe_pending_receipt_with_prior_failed_attempt() {
     )));
 }
 
-fn create_args(json: bool) -> Vec<&'static str> {
+/// `um workflow run create DEFINITION --cloud ORGANIZATION --project PROJECT`, the command
+/// that creates a Cloud run (REQ-RUN-94), with a source branch and a display name.
+pub(super) fn create_args(json: bool) -> Vec<&'static str> {
     let mut args = vec![
+        "workflow",
         "run",
         "create",
+        DEFINITION_ID,
+        "--cloud",
         ORGANIZATION,
-        "--project-id",
+        "--project",
         PROJECT_ID,
-        "--workflow-path",
-        WORKFLOW_PATH,
         "--source-branch",
         "release/next",
         "--display-name",
@@ -2514,51 +2679,14 @@ fn create_args(json: bool) -> Vec<&'static str> {
     args
 }
 
-fn create_args_with_scalar_input<'a>(
-    flag: &'a str,
-    input_name: &'a str,
-    input_source: &'a str,
-    json: bool,
-) -> Vec<&'a str> {
-    let mut args: Vec<&'a str> = create_args(json);
-    let insertion = args.len() - 1;
-    args.insert(insertion, flag);
-    args.insert(insertion + 1, input_name);
-    args.insert(insertion + 2, input_source);
-    args
-}
-
-fn create_args_with_text_input<'a>(
-    input_name: &'a str,
-    input_file: &'a str,
-    json: bool,
-) -> Vec<&'a str> {
-    create_args_with_scalar_input("--input-text-file", input_name, input_file, json)
-}
-
-fn create_args_with_file_input<'a>(
-    input_name: &'a str,
-    media_type: &'a str,
-    input_file: &'a str,
-    json: bool,
-) -> Vec<&'a str> {
-    let mut args: Vec<&'a str> = create_args(json);
-    let insertion = args.len() - 1;
-    args.splice(
-        insertion..insertion,
-        ["--input-file", input_name, media_type, input_file],
-    );
-    args
-}
-
-fn sha256(bytes: &[u8]) -> [u8; 32] {
+pub(super) fn sha256(bytes: &[u8]) -> [u8; 32] {
     let observed = digest(&SHA256, bytes);
     let mut sha256 = [0_u8; 32];
     sha256.copy_from_slice(observed.as_ref());
     sha256
 }
 
-fn hex_digest(bytes: &[u8]) -> String {
+pub(super) fn hex_digest(bytes: &[u8]) -> String {
     sha256(bytes)
         .into_iter()
         .map(|byte| format!("{byte:02x}"))
@@ -2574,17 +2702,7 @@ fn scalar_manifest_digest(bytes: &[u8], kind: &str) -> String {
     hex_digest(canonical.as_bytes())
 }
 
-fn file_manifest_digest(bytes: &[u8], media_type: &str) -> String {
-    let canonical = format!(
-        "{{\"inputs\":{{\"request\":{{\"kind\":\"file\",\"mediaType\":{},\"sha256\":\"{}\",\"sizeBytes\":{}}}}},\"schemaVersion\":1}}",
-        serde_json::to_string(media_type).unwrap(),
-        hex_digest(bytes),
-        bytes.len()
-    );
-    hex_digest(canonical.as_bytes())
-}
-
-fn scalar_input_set_body(
+pub(super) fn scalar_input_set_body(
     bytes: &[u8],
     kind: &str,
     state: &str,
@@ -2626,19 +2744,11 @@ fn scalar_input_set_body(
     body
 }
 
-fn file_input_set_body(
+pub(super) fn create_scalar_input_set_response(
     bytes: &[u8],
-    media_type: &str,
-    state: &str,
-    uploaded: bool,
-) -> serde_json::Value {
-    let mut body = scalar_input_set_body(bytes, "file", state, uploaded, false);
-    body["manifest"]["inputs"]["request"]["mediaType"] = serde_json::json!(media_type);
-    body["manifestDigest"]["value"] = serde_json::json!(file_manifest_digest(bytes, media_type));
-    body
-}
-
-fn create_scalar_input_set_response(bytes: &[u8], kind: &str, replayed: bool) -> Vec<u8> {
+    kind: &str,
+    replayed: bool,
+) -> Vec<u8> {
     http_response_with_headers(
         "201 Created",
         Some("application/json"),
@@ -2653,26 +2763,15 @@ fn create_scalar_input_set_response(bytes: &[u8], kind: &str, replayed: bool) ->
     )
 }
 
-fn create_file_input_set_response(bytes: &[u8], media_type: &str) -> Vec<u8> {
-    http_response_with_headers(
-        "201 Created",
-        Some("application/json"),
-        &[
-            ("Idempotency-Key", ECHO_IDEMPOTENCY_KEY),
-            (
-                "Location",
-                "/v1/organizations/acme-research/run-input-sets/ris_01k0z6r1w8f4jy2m7q9v3x5abc",
-            ),
-        ],
-        &serde_json::to_vec(&file_input_set_body(bytes, media_type, "open", false)).unwrap(),
-    )
-}
-
-fn create_input_set_response(bytes: &[u8], replayed: bool) -> Vec<u8> {
+pub(super) fn create_input_set_response(bytes: &[u8], replayed: bool) -> Vec<u8> {
     create_scalar_input_set_response(bytes, "text", replayed)
 }
 
-fn scalar_upload_capability_response(bytes: &[u8], media_type: &str, url: &str) -> Vec<u8> {
+pub(super) fn scalar_upload_capability_response(
+    bytes: &[u8],
+    media_type: &str,
+    url: &str,
+) -> Vec<u8> {
     http_response_with_headers(
         "200 OK",
         Some("application/json"),
@@ -2695,20 +2794,11 @@ fn scalar_upload_capability_response(bytes: &[u8], media_type: &str, url: &str) 
     )
 }
 
-fn upload_capability_response(bytes: &[u8], url: &str) -> Vec<u8> {
+pub(super) fn upload_capability_response(bytes: &[u8], url: &str) -> Vec<u8> {
     scalar_upload_capability_response(bytes, "text/plain; charset=utf-8", url)
 }
 
-fn seal_file_input_set_response(bytes: &[u8], media_type: &str) -> Vec<u8> {
-    http_response_with_headers(
-        "200 OK",
-        Some("application/json"),
-        &[("Idempotency-Key", ECHO_IDEMPOTENCY_KEY)],
-        &serde_json::to_vec(&file_input_set_body(bytes, media_type, "sealed", true)).unwrap(),
-    )
-}
-
-fn seal_scalar_input_set_response(bytes: &[u8], kind: &str, replayed: bool) -> Vec<u8> {
+pub(super) fn seal_scalar_input_set_response(bytes: &[u8], kind: &str, replayed: bool) -> Vec<u8> {
     http_response_with_headers(
         "200 OK",
         Some("application/json"),
@@ -2720,23 +2810,15 @@ fn seal_scalar_input_set_response(bytes: &[u8], kind: &str, replayed: bool) -> V
     )
 }
 
-fn seal_input_set_response(bytes: &[u8], replayed: bool) -> Vec<u8> {
+pub(super) fn seal_input_set_response(bytes: &[u8], replayed: bool) -> Vec<u8> {
     seal_scalar_input_set_response(bytes, "text", replayed)
 }
 
-fn request_body(request: &str) -> serde_json::Value {
+pub(super) fn request_body(request: &str) -> serde_json::Value {
     serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap()
 }
 
-fn assert_create_invalid_input(output: &Output) {
-    assert_eq!(output.status.code(), Some(1));
-    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(result["operation"], "create");
-    assert_eq!(result["outcome"], "error");
-    assert_eq!(result["error"]["code"], "invalid_input");
-}
-
-fn assert_invalid_response(output: &Output) {
+pub(super) fn assert_invalid_response(output: &Output) {
     let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     if result.get("operation").is_none() {
         assert_eq!(output.status.code(), Some(1));
@@ -2774,11 +2856,12 @@ fn run_show_with_response(response: Vec<u8>) -> (Output, ScriptedServer) {
     (output, server)
 }
 
-// REQ-CANCEL-47, REQ-CANCEL-54
+// REQ-RUN-94
 #[test]
-fn cloud_run_wait_flags_require_explicit_observation_and_bare_wait_is_absent() {
-    for args in [
-        vec![
+fn run_create_is_no_longer_a_command() {
+    let (server, _directory, credential_path) = prepared_run(Vec::new());
+    let output = run_with_env(
+        &[
             "run",
             "create",
             ORGANIZATION,
@@ -2786,6 +2869,29 @@ fn cloud_run_wait_flags_require_explicit_observation_and_bare_wait_is_absent() {
             PROJECT_ID,
             "--workflow-path",
             WORKFLOW_PATH,
+            "--json",
+            "--allow-insecure-http",
+        ],
+        &deployment_environment(&server.api_url, &credential_path),
+    );
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    assert!(output.stdout.is_empty(), "{output:?}");
+    assert!(server.finish().is_empty());
+}
+
+// REQ-CANCEL-47, REQ-CANCEL-54
+#[test]
+fn cloud_run_wait_flags_require_explicit_observation_and_bare_wait_is_absent() {
+    for args in [
+        vec![
+            "workflow",
+            "run",
+            "create",
+            DEFINITION_ID,
+            "--cloud",
+            ORGANIZATION,
+            "--project",
+            PROJECT_ID,
             "--timeout",
             "1s",
         ],
@@ -2799,95 +2905,11 @@ fn cloud_run_wait_flags_require_explicit_observation_and_bare_wait_is_absent() {
     }
 }
 
-// REQ-PUBLISH-13
-#[test]
-fn create_selects_exact_export_once_and_omission_is_artifact_only() {
-    for selected in [Some("changes"), Some("review"), None] {
-        let (server, _directory, credential_path) = prepared_run(vec![acceptance_response(false)]);
-        let mut args = create_args(true);
-        if let Some(name) = selected {
-            args.splice(args.len() - 1..args.len() - 1, ["--publish-export", name]);
-        }
-        let output = run_with_env(
-            &args,
-            &deployment_environment(&server.api_url, &credential_path),
-        );
-        assert_eq!(output.status.code(), Some(0));
-        assert!(output.stderr.is_empty());
-        let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-        assert_eq!(result["outcome"], "accepted");
-        assert_eq!(result["runId"], RUN_ID);
-        assert!(result["run"].is_null());
-        assert!(result["publication"].is_null());
-        let requests = server.finish();
-        assert_eq!(requests.len(), 1);
-        assert!(requests[0].starts_with("POST "));
-        match selected {
-            Some(name) => assert_eq!(
-                request_body(&requests[0])["publication"],
-                serde_json::json!({"exportName": name})
-            ),
-            None => assert!(request_body(&requests[0]).get("publication").is_none()),
-        }
-    }
-    for names in [["changes", "review"], ["changes", "changes"]] {
-        let mut args = create_args(true);
-        args.splice(
-            args.len() - 1..args.len() - 1,
-            ["--publish-export", names[0], "--publish-export", names[1]],
-        );
-        let output = run(&args);
-        assert_eq!(output.status.code(), Some(2));
-        assert!(output.stdout.is_empty());
-    }
-}
-
-// REQ-PUBLISH-87, REQ-PUBLISH-95
-#[test]
-fn run_create_sends_bound_existing_request_intent_without_caller_ref() {
-    const HASH: &str = "0123456789abcdef0123456789abcdef01234567";
-    let (server, _directory, credential_path) = prepared_run(vec![acceptance_response(false)]);
-    let mut args = create_args(true);
-    args.splice(
-        args.len() - 1..args.len() - 1,
-        [
-            "--publish-export",
-            "changes",
-            "--publish-change-request",
-            "42",
-            "--publish-expected-head",
-            HASH,
-        ],
-    );
-    let output = run_with_env(
-        &args,
-        &deployment_environment(&server.api_url, &credential_path),
-    );
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let request = server.finish().remove(0);
-    assert_eq!(
-        request_body(&request)["publication"],
-        serde_json::json!({
-            "exportName":"changes", "target":{"kind":"existing_change_request","number":42,"expectedHeadOid":HASH}
-        })
-    );
-}
-
 // REQ-DIAG-28, REQ-DIAG-30
 // REQ-PUBLISH-62, REQ-PUBLISH-63
 #[test]
-fn create_and_show_wait_separate_failed_publication_handoff_from_execution() {
-    for (operation, expected_exit, json, wait) in [
-        ("create", 1, true, true),
-        ("show", 0, true, true),
-        ("create", 1, false, true),
-        ("show", 0, false, true),
-        ("show", 0, false, false),
-    ] {
+fn show_wait_separates_failed_publication_handoff_from_execution() {
+    for (json, wait) in [(true, true), (false, true), (false, false)] {
         let mut body = run_body_with_state("succeeded");
         body["publication"] = serde_json::json!({
             "exportName":"review", "state":"failed", "publicationId":null,
@@ -2895,28 +2917,18 @@ fn create_and_show_wait_separate_failed_publication_handoff_from_execution() {
                 "diagnostic": {"stage":"acceptance", "deliveryPhase":"artifact_upload",
                     "deliveryCode":"future_delivery_code", "errorType":"future_handoff_error"}}
         });
-        let mut responses = Vec::new();
-        if operation == "create" {
-            responses.push(acceptance_response(true));
-        }
-        responses.push(run_response(body.clone()));
-        let (server, _directory, credential_path) = prepared_run(responses);
+        let (server, _directory, credential_path) = prepared_run(vec![run_response(body.clone())]);
         let environment = deployment_environment(&server.api_url, &credential_path);
-        let mut arguments = if operation == "create" {
-            create_args(json)
-        } else {
-            let mut args = vec!["run", "show", ORGANIZATION, RUN_ID];
-            if json {
-                args.push("--json");
-            }
-            args.push("--allow-insecure-http");
-            args
-        };
-        if wait {
-            arguments.insert(arguments.len() - 1, "--wait");
+        let mut arguments = vec!["run", "show", ORGANIZATION, RUN_ID];
+        if json {
+            arguments.push("--json");
         }
+        if wait {
+            arguments.push("--wait");
+        }
+        arguments.push("--allow-insecure-http");
         let output = run_with_env(&arguments, &environment);
-        assert_eq!(output.status.code(), Some(expected_exit));
+        assert_eq!(output.status.code(), Some(0));
         if json {
             let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
             assert_eq!(result["outcome"], "settled");
@@ -2959,10 +2971,7 @@ fn create_and_show_wait_separate_failed_publication_handoff_from_execution() {
                 assert!(report.contains("um publication create"));
             }
         }
-        assert_eq!(
-            server.finish().len(),
-            if operation == "create" { 2 } else { 1 }
-        );
+        assert_eq!(server.finish().len(), 1);
     }
 }
 
@@ -3004,32 +3013,23 @@ fn human_run_observation_reports_failed_automatic_publication() {
         "createdAt": "2026-09-03T18:00:00Z", "updatedAt": "2026-09-03T18:00:02Z",
         "startedAt": "2026-09-03T18:00:01Z", "terminalAt": "2026-09-03T18:00:02Z"
     });
-    for (operation, wait, expected_exit) in
-        [("create", true, 1), ("show", true, 0), ("show", false, 0)]
-    {
-        let mut responses = Vec::new();
-        if operation == "create" {
-            responses.push(acceptance_response(false));
-        }
-        responses.push(run_response(run.clone()));
-        responses.push(http_response_with_headers(
-            "200 OK",
-            Some("application/json"),
-            &[("Cache-Control", "private, no-store")],
-            &serde_json::to_vec(&publication).unwrap(),
-        ));
-        let (server, _directory, credential_path) = prepared_run(responses);
+    for wait in [true, false] {
+        let (server, _directory, credential_path) = prepared_run(vec![
+            run_response(run.clone()),
+            http_response_with_headers(
+                "200 OK",
+                Some("application/json"),
+                &[("Cache-Control", "private, no-store")],
+                &serde_json::to_vec(&publication).unwrap(),
+            ),
+        ]);
         let environment = deployment_environment(&server.api_url, &credential_path);
-        let mut args = if operation == "create" {
-            create_args(false)
-        } else {
-            vec!["run", "show", ORGANIZATION, RUN_ID, "--allow-insecure-http"]
-        };
+        let mut args = vec!["run", "show", ORGANIZATION, RUN_ID, "--allow-insecure-http"];
         if wait {
             args.insert(args.len() - 1, "--wait");
         }
         let output = run_with_env(&args, &environment);
-        assert_eq!(output.status.code(), Some(expected_exit));
+        assert_eq!(output.status.code(), Some(0));
         let report = String::from_utf8(output.stdout).unwrap();
         assert!(report.starts_with('✗'));
         for line in [
@@ -3065,10 +3065,7 @@ fn human_run_observation_reports_failed_automatic_publication() {
             assert!(report.find("provider_unavailable").unwrap() < report.find(*fact).unwrap());
         }
         assert!(report.contains("um publication show"));
-        assert_eq!(
-            server.finish().len(),
-            if operation == "create" { 3 } else { 2 }
-        );
+        assert_eq!(server.finish().len(), 2);
     }
 }
 
@@ -3115,24 +3112,17 @@ fn human_run_observation_reports_successful_automatic_publication_url() {
         "url": "https://actor:secret@example.test/review/42?token=private#fragment",
         "disposition": "created", "state": "open"
     });
-    for (operation, wait) in [("create", true), ("show", true), ("show", false)] {
-        let mut responses = Vec::new();
-        if operation == "create" {
-            responses.push(acceptance_response(false));
-        }
-        responses.push(run_response(run.clone()));
-        responses.push(http_response_with_headers(
-            "200 OK",
-            Some("application/json"),
-            &[("Cache-Control", "private, no-store")],
-            &serde_json::to_vec(&publication).unwrap(),
-        ));
-        let (server, _directory, credential_path) = prepared_run(responses);
-        let mut args = if operation == "create" {
-            create_args(false)
-        } else {
-            vec!["run", "show", ORGANIZATION, RUN_ID, "--allow-insecure-http"]
-        };
+    for wait in [true, false] {
+        let (server, _directory, credential_path) = prepared_run(vec![
+            run_response(run.clone()),
+            http_response_with_headers(
+                "200 OK",
+                Some("application/json"),
+                &[("Cache-Control", "private, no-store")],
+                &serde_json::to_vec(&publication).unwrap(),
+            ),
+        ]);
+        let mut args = vec!["run", "show", ORGANIZATION, RUN_ID, "--allow-insecure-http"];
         if wait {
             args.insert(args.len() - 1, "--wait");
         }
@@ -3148,16 +3138,13 @@ fn human_run_observation_reports_successful_automatic_publication_url() {
         assert!(report.contains("pull request url: https://example.test/review/42"));
         assert!(!report.contains("secret"));
         assert!(!report.contains("token=private"));
-        assert_eq!(
-            server.finish().len(),
-            if operation == "create" { 3 } else { 2 }
-        );
+        assert_eq!(server.finish().len(), 2);
     }
 }
 
-// REQ-PUBLISH-61
+// REQ-PUBLISH-62
 #[test]
-fn run_wait_tracks_automatic_attempt_through_handoff_and_publication() {
+fn show_wait_tracks_automatic_attempt_through_handoff_and_publication() {
     let mut pending = run_body_with_state("succeeded");
     pending["publication"] = automatic_handoff("pending");
     let mut started = pending.clone();
@@ -3167,45 +3154,26 @@ fn run_wait_tracks_automatic_attempt_through_handoff_and_publication() {
     queued["outcome"] = serde_json::Value::Null;
     queued["terminalAt"] = serde_json::Value::Null;
     queued["startedAt"] = serde_json::Value::Null;
-    for (operation, outcome, state) in [
-        ("create", "no_changes", "succeeded"),
-        ("show", "pull_request_already_merged", "succeeded"),
-    ] {
-        let mut responses = Vec::new();
-        if operation == "create" {
-            responses.push(acceptance_response(true));
-        }
-        responses.extend([
+    for outcome in ["no_changes", "pull_request_already_merged"] {
+        let (server, _directory, credential_path) = prepared_run(vec![
             run_response(pending.clone()),
             run_response(started.clone()),
             publication_response(queued.clone()),
             run_response(started.clone()),
             publication_response(automatic_publication(outcome)),
         ]);
-        let (server, _directory, credential_path) = prepared_run(responses);
-        let mut args = if operation == "create" {
-            let mut args = create_args(true);
-            args.splice(
-                args.len() - 1..args.len() - 1,
-                ["--publish-export", "changes"],
-            );
-            args
-        } else {
-            vec![
+        let output = run_with_env(
+            &[
                 "run",
                 "show",
                 ORGANIZATION,
                 RUN_ID,
                 "--json",
+                "--wait",
+                "--timeout",
+                "2m",
                 "--allow-insecure-http",
-            ]
-        };
-        args.splice(
-            args.len() - 1..args.len() - 1,
-            ["--wait", "--timeout", "2m"],
-        );
-        let output = run_with_env(
-            &args,
+            ],
             &deployment_environment(&server.api_url, &credential_path),
         );
         assert_eq!(
@@ -3216,31 +3184,18 @@ fn run_wait_tracks_automatic_attempt_through_handoff_and_publication() {
         );
         let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
         assert_eq!(result["outcome"], "settled");
-        assert_eq!(result["run"]["state"], state);
+        assert_eq!(result["run"]["state"], "succeeded");
         assert_eq!(
             result["run"]["publication"]["publicationId"],
             result["publication"]["id"]
         );
         assert_eq!(result["publication"]["outcome"], outcome);
-        assert_eq!(
-            result["replayed"],
-            if operation == "create" {
-                serde_json::json!(true)
-            } else {
-                serde_json::Value::Null
-            }
-        );
+        assert!(result["replayed"].is_null());
         assert!(result["error"].is_null());
         assert!(!output.stderr.is_empty());
         let requests = server.finish();
-        assert_eq!(requests.len(), if operation == "create" { 6 } else { 5 });
-        if operation == "create" {
-            assert_eq!(
-                request_body(&requests[0])["publication"],
-                serde_json::json!({"exportName": "changes"})
-            );
-        }
-        for request in requests.iter().skip(usize::from(operation == "create")) {
+        assert_eq!(requests.len(), 5);
+        for request in &requests {
             assert!(
                 request.starts_with("GET "),
                 "unexpected mutation while waiting: {request}"
@@ -3254,7 +3209,7 @@ fn run_wait_tracks_automatic_attempt_through_handoff_and_publication() {
 
 // REQ-PUBLISH-22, REQ-PUBLISH-62
 #[test]
-fn run_wait_keeps_successful_execution_separate_from_failed_publication() {
+fn show_wait_keeps_successful_execution_separate_from_failed_publication() {
     let mut run = run_body_with_state("succeeded");
     run["publication"] = automatic_handoff("started");
     let mut failed = automatic_publication("no_changes");
@@ -3263,49 +3218,32 @@ fn run_wait_keeps_successful_execution_separate_from_failed_publication() {
     failed["failure"] = serde_json::json!({
         "phase": "branch", "code": "provider_unavailable", "retryable": true
     });
-    for (operation, exit) in [("create", 1), ("show", 0)] {
-        let mut responses = Vec::new();
-        if operation == "create" {
-            responses.push(acceptance_response(false));
-        }
-        responses.extend([
-            run_response(run.clone()),
-            publication_response(failed.clone()),
-        ]);
-        let (server, _directory, credential_path) = prepared_run(responses);
-        let mut args = if operation == "create" {
-            create_args(true)
-        } else {
-            vec![
-                "run",
-                "show",
-                ORGANIZATION,
-                RUN_ID,
-                "--json",
-                "--allow-insecure-http",
-            ]
-        };
-        args.insert(args.len() - 1, "--wait");
-        let output = run_with_env(
-            &args,
-            &deployment_environment(&server.api_url, &credential_path),
-        );
-        assert_eq!(output.status.code(), Some(exit));
-        let document: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-        assert_eq!(document["outcome"], "settled");
-        assert_eq!(document["run"]["state"], "succeeded");
-        assert_eq!(document["run"]["publication"]["state"], "started");
-        assert_eq!(document["publication"]["state"], "failed");
-        assert_eq!(
-            document["publication"]["failure"]["code"],
-            "provider_unavailable"
-        );
-        assert_eq!(document["error"], serde_json::Value::Null);
-        assert_eq!(
-            server.finish().len(),
-            if operation == "create" { 3 } else { 2 }
-        );
-    }
+    let (server, _directory, credential_path) =
+        prepared_run(vec![run_response(run), publication_response(failed)]);
+    let output = run_with_env(
+        &[
+            "run",
+            "show",
+            ORGANIZATION,
+            RUN_ID,
+            "--json",
+            "--wait",
+            "--allow-insecure-http",
+        ],
+        &deployment_environment(&server.api_url, &credential_path),
+    );
+    assert_eq!(output.status.code(), Some(0));
+    let document: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(document["outcome"], "settled");
+    assert_eq!(document["run"]["state"], "succeeded");
+    assert_eq!(document["run"]["publication"]["state"], "started");
+    assert_eq!(document["publication"]["state"], "failed");
+    assert_eq!(
+        document["publication"]["failure"]["code"],
+        "provider_unavailable"
+    );
+    assert_eq!(document["error"], serde_json::Value::Null);
+    assert_eq!(server.finish().len(), 2);
 }
 
 // REQ-PUBLISH-91, REQ-PUBLISH-62: run waits preserve a terminal existing-target
@@ -3442,69 +3380,13 @@ fn run_plain_publication_outcomes_do_not_invent_a_new_pull_request() {
     }
 }
 
-// REQ-RUN-62
+// REQ-PUBLISH-62
 #[cfg(target_os = "linux")]
 #[test]
-fn create_signal_after_acceptance_stops_only_observation_and_keeps_replay() {
-    let mut server = ScriptedServer::respond_with_paused_last_response(vec![
-        acceptance_response(true),
-        run_response(run_body_with_state("succeeded")),
-    ]);
-    let credential_directory = private_credential_directory();
-    let credential_path = credential_directory.path().join("credentials.json");
-    write_credential_fixture(
-        &credential_path,
-        &server.api_url,
-        TOKEN,
-        "2999-01-01T00:00:00Z",
-    );
-    let environment = deployment_environment(&server.api_url, credential_path.to_str().unwrap());
-    let mut args = create_args(true);
-    args.insert(args.len() - 1, "--wait");
-    let mut command = Command::new(env!("CARGO_BIN_EXE_um"));
-    command
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .env_remove(CREDENTIALS_FILE_VARIABLE);
-    for variable in DEPLOYMENT_VARIABLES {
-        command.env_remove(variable);
-    }
-    for (name, value) in environment {
-        command.env(name, value);
-    }
-    let child = command.spawn().unwrap();
-    assert!(server.wait_for_request().contains("/runs HTTP/1.1"));
-    assert!(
-        server
-            .wait_for_request()
-            .contains(&format!("/runs/{RUN_ID} HTTP/1.1"))
-    );
-    rustix::process::kill_process(
-        rustix::process::Pid::from_raw(i32::try_from(child.id()).unwrap()).unwrap(),
-        rustix::process::Signal::INT,
-    )
-    .unwrap();
-    let output = child.wait_with_output().unwrap();
-    server.release_paused_response();
-    assert_eq!(output.status.code(), Some(130));
-    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(result["operation"], "create");
-    assert_eq!(result["outcome"], "observation_stopped");
-    assert_eq!(result["replayed"], true);
-    assert_eq!(result["runId"], RUN_ID);
-    assert_eq!(result["error"]["code"], "observation_stopped");
-    assert_eq!(server.finish().len(), 0);
-}
-
-#[cfg(target_os = "linux")]
-#[test]
-fn publication_observation_signal_retains_handoff_without_a_second_mutation() {
+fn publication_observation_signal_stops_show_wait_and_retains_handoff() {
     let mut run = run_body_with_state("succeeded");
     run["publication"] = automatic_handoff("started");
     let mut server = ScriptedServer::respond_with_paused_last_response(vec![
-        acceptance_response(false),
         run_response(run),
         publication_response(automatic_publication("no_changes")),
     ]);
@@ -3512,14 +3394,17 @@ fn publication_observation_signal_retains_handoff_without_a_second_mutation() {
     let path = directory.path().join("credentials.json");
     write_credential_fixture(&path, &server.api_url, TOKEN, "2999-01-01T00:00:00Z");
     let environment = deployment_environment(&server.api_url, path.to_str().unwrap());
-    let mut args = create_args(true);
-    args.splice(
-        args.len() - 1..args.len() - 1,
-        ["--publish-export", "changes", "--wait"],
-    );
     let mut command = Command::new(env!("CARGO_BIN_EXE_um"));
     command
-        .args(args)
+        .args([
+            "run",
+            "show",
+            ORGANIZATION,
+            RUN_ID,
+            "--json",
+            "--wait",
+            "--allow-insecure-http",
+        ])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -3531,8 +3416,6 @@ fn publication_observation_signal_retains_handoff_without_a_second_mutation() {
         command.env(name, value);
     }
     let child = command.spawn().unwrap();
-    let submitted = server.wait_for_request();
-    assert!(submitted.starts_with("POST "));
     let run_read = server.wait_for_request();
     assert!(run_read.starts_with("GET "));
     let publication_read = server.wait_for_request();
@@ -3553,1021 +3436,6 @@ fn publication_observation_signal_retains_handoff_without_a_second_mutation() {
     assert!(result["publication"].is_null());
     assert_eq!(result["error"]["code"], "observation_stopped");
     assert_eq!(server.finish().len(), 0);
-}
-
-// REQ-RUN-58
-#[test]
-fn create_wait_preserves_authoritative_replay_through_failed_execution() {
-    let mut body = run_body_with_state("failed");
-    body["failure"] = serde_json::json!({
-        "node": {"id": "build", "role": "step"}, "state": "failed",
-        "detail": {"phase": "execution", "code": "command_exit", "exitCode": 23}
-    });
-    let (server, _directory, credential_path) =
-        prepared_run(vec![acceptance_response(true), run_response(body.clone())]);
-    let environment = deployment_environment(&server.api_url, &credential_path);
-    let mut arguments = create_args(true);
-    arguments.insert(arguments.len() - 1, "--wait");
-    let output = run_with_env(&arguments, &environment);
-    assert_eq!(output.status.code(), Some(1));
-    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(result["operation"], "create");
-    assert_eq!(result["outcome"], "settled");
-    assert_eq!(result["run"]["state"], "failed");
-    assert_eq!(result["run"]["failure"], body["failure"]);
-    assert_eq!(result["replayed"], true);
-    assert_eq!(result["error"], serde_json::Value::Null);
-    let requests = server.finish();
-    assert_eq!(requests.len(), 2);
-    assert!(requests[0].contains("/runs HTTP/1.1"));
-    assert!(requests[1].contains(&format!("/runs/{RUN_ID} HTTP/1.1")));
-}
-
-// REQ-RUN-58
-#[test]
-fn create_wait_displays_failed_primary_issue() {
-    let mut body = run_body_with_state("failed");
-    body["failure"] = serde_json::json!({
-        "node": {"id": "build", "role": "step"}, "state": "failed",
-        "detail": {"code": "command_exit", "exitCode": 23}
-    });
-    let (server, _directory, credential_path) =
-        prepared_run(vec![acceptance_response(false), run_response(body)]);
-    let environment = deployment_environment(&server.api_url, &credential_path);
-    let mut arguments = create_args(false);
-    arguments.insert(arguments.len() - 1, "--wait");
-    let output = run_with_env(&arguments, &environment);
-    assert_eq!(output.status.code(), Some(1));
-    let text = String::from_utf8(output.stdout).unwrap();
-    for field in ["build", "command_exit", "exitCode"] {
-        assert!(text.contains(field), "missing {field} in {text}");
-    }
-    assert_eq!(server.finish().len(), 2);
-}
-
-// REQ-WORKSPACE-7
-// REQ-RUN-55
-#[test]
-fn run_create_sends_inputless_request_and_reports_plain_and_json_receipts() {
-    for json in [false, true] {
-        let (server, _directory, credential_path) = prepared_run(vec![acceptance_response(false)]);
-        let environment = deployment_environment(&server.api_url, &credential_path);
-
-        let output = run_with_env(&create_args(json), &environment);
-
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        assert!(output.stderr.is_empty());
-        if json {
-            assert_eq!(
-                serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap(),
-                serde_json::json!({
-                    "schemaVersion": 1,
-                    "operation": "create",
-                    "deployment": server.api_url,
-                    "outcome": "accepted",
-                    "organizationRef": ORGANIZATION,
-                    "runId": RUN_ID,
-                    "run": null,
-                    "publication": null,
-                    "cancellationRequest": null,
-                    "replayed": false,
-                    "error": null
-                })
-            );
-        } else {
-            let stdout = String::from_utf8(output.stdout).unwrap();
-            for field in [
-                format!("run: {RUN_ID}"),
-                "replayed: no".to_owned(),
-                format!("organization: {ORGANIZATION}"),
-                format!("deployment: {}", server.api_url),
-            ] {
-                assert!(stdout.lines().any(|line| line == field));
-            }
-        }
-        let request = server.finish().pop().unwrap();
-        assert!(request.starts_with(&format!(
-            "POST /api/v1/organizations/{ORGANIZATION}/runs HTTP/1.1\r\n"
-        )));
-        assert_eq!(
-            request_body(&request),
-            serde_json::json!({
-                "projectId": PROJECT_ID,
-                "workflowPath": WORKFLOW_PATH,
-                "sourceBranch": "release/next",
-                "displayName": "Release checks"
-            })
-        );
-        assert_eq!(
-            header_value(&request, "authorization"),
-            format!("Bearer {TOKEN}")
-        );
-        let key = header_value(&request, "idempotency-key");
-        assert_eq!(key.len(), 64);
-        assert!(key.bytes().all(|byte| byte.is_ascii_hexdigit()));
-    }
-}
-
-// REQ-TRIGGER-54
-#[test]
-fn run_create_sends_integration_context_from_regular_file_and_standard_input() {
-    for source in ["file", "stdin"] {
-        let context = br#"{"empty":"","issueId":"abc-123","source":"linear"}"#;
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("context.json");
-        fs::write(&path, context).unwrap();
-        let operand = if source == "file" {
-            path.to_str().unwrap()
-        } else {
-            "-"
-        };
-        let (server, _credentials, credential_path) =
-            prepared_run(vec![acceptance_response(false)]);
-        let environment = deployment_environment(&server.api_url, &credential_path);
-        let mut arguments = create_args(true);
-        let insertion = arguments.len() - 1;
-        arguments.splice(
-            insertion..insertion,
-            ["--integration-context-file", operand],
-        );
-
-        let output = if source == "stdin" {
-            run_with_stdin(&arguments, &environment, context)
-        } else {
-            run_with_env(&arguments, &environment)
-        };
-
-        assert!(
-            output.status.success(),
-            "stdout: {}\nstderr: {}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-        assert_no_secret_output(&output, &["abc-123"]);
-        let requests = server.finish();
-        assert_eq!(requests.len(), 1);
-        assert_eq!(
-            request_body(&requests[0])["integrationContext"],
-            serde_json::json!({"empty": "", "issueId": "abc-123", "source": "linear"})
-        );
-    }
-}
-
-// REQ-RUNINPUT-53
-#[test]
-fn run_create_reads_named_text_and_json_from_standard_input() {
-    for (flag, kind, input_bytes) in [
-        ("--input-text-file", "text", b"stdin text".as_slice()),
-        ("--input-json-file", "json", br#"{"stdin":true}"#.as_slice()),
-    ] {
-        let storage = OneShotServer::respond("204 No Content", None, b"");
-        let signed_url = format!("{}/private/request?signature=stdin", storage.api_url);
-        let (server, _credentials, credential_path) = prepared_run(vec![
-            create_scalar_input_set_response(input_bytes, kind, false),
-            scalar_upload_capability_response(
-                input_bytes,
-                if kind == "text" {
-                    "text/plain; charset=utf-8"
-                } else {
-                    "application/json"
-                },
-                &signed_url,
-            ),
-            seal_scalar_input_set_response(input_bytes, kind, false),
-            acceptance_response(false),
-        ]);
-        let environment = deployment_environment(&server.api_url, &credential_path);
-        let arguments = create_args_with_scalar_input(flag, "request", "-", true);
-
-        let output = run_with_stdin(&arguments, &environment, input_bytes);
-
-        assert!(
-            output.status.success(),
-            "stdout: {}\nstderr: {}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-        assert_eq!(server.finish().len(), 4);
-        assert_eq!(
-            storage
-                .finish()
-                .split_once("\r\n\r\n")
-                .unwrap()
-                .1
-                .as_bytes(),
-            input_bytes
-        );
-    }
-}
-
-// REQ-RUNINPUT-56
-#[test]
-fn competing_standard_input_claims_reject_before_cloud_access() {
-    for input_flag in ["--input-text-file", "--input-json-file"] {
-        let (server, _credentials, credential_path) = prepared_run(Vec::new());
-        let environment = deployment_environment(&server.api_url, &credential_path);
-        let mut arguments = create_args(true);
-        let insertion = arguments.len() - 1;
-        arguments.splice(
-            insertion..insertion,
-            [
-                "--integration-context-file",
-                "-",
-                input_flag,
-                "request",
-                "-",
-            ],
-        );
-
-        let output = run_with_env(&arguments, &environment);
-
-        assert_create_invalid_input(&output);
-        assert!(server.finish().is_empty());
-    }
-}
-
-// REQ-TRIGGER-54
-#[test]
-fn invalid_integration_context_rejects_before_cloud_access() {
-    let mut too_many = serde_json::Map::new();
-    for index in 0..33 {
-        too_many.insert(
-            format!("key{index:02}"),
-            serde_json::Value::String(String::new()),
-        );
-    }
-    let invalid_documents = [
-        br#"{"duplicate":"first","duplicate":"second"}"#.to_vec(),
-        serde_json::to_vec(&too_many).unwrap(),
-        serde_json::to_vec(&serde_json::json!({"": "value"})).unwrap(),
-        serde_json::to_vec(&serde_json::json!({"key": "v".repeat(1025)})).unwrap(),
-        br#"{"key":"\u0000"}"#.to_vec(),
-    ];
-    for document in invalid_documents {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("context.json");
-        fs::write(&path, document).unwrap();
-        let (server, _credentials, credential_path) = prepared_run(Vec::new());
-        let environment = deployment_environment(&server.api_url, &credential_path);
-        let mut arguments = create_args(true);
-        let insertion = arguments.len() - 1;
-        arguments.splice(
-            insertion..insertion,
-            ["--integration-context-file", path.to_str().unwrap()],
-        );
-
-        let output = run_with_env(&arguments, &environment);
-
-        assert_create_invalid_input(&output);
-        assert!(server.finish().is_empty());
-    }
-}
-
-// REQ-TRIGGER-54
-#[test]
-fn invalid_integration_context_plain_output_redacts_caller_values() {
-    const PRIVATE_VALUE: &str = "private-parser-value-sentinel";
-    let directory = tempfile::tempdir().unwrap();
-    let path = directory.path().join("context.json");
-    let encoded_object = serde_json::json!({"token": PRIVATE_VALUE}).to_string();
-    fs::write(&path, serde_json::to_vec(&encoded_object).unwrap()).unwrap();
-    let (server, _credentials, credential_path) = prepared_run(Vec::new());
-    let environment = deployment_environment(&server.api_url, &credential_path);
-    let mut arguments = create_args(false);
-    let insertion = arguments.len() - 1;
-    arguments.splice(
-        insertion..insertion,
-        ["--integration-context-file", path.to_str().unwrap()],
-    );
-
-    let output = run_with_env(&arguments, &environment);
-
-    assert_eq!(output.status.code(), Some(1));
-    assert_no_secret_output(&output, &[PRIVATE_VALUE]);
-    assert!(server.finish().is_empty());
-}
-
-// REQ-TRIGGER-54
-#[test]
-fn oversized_integration_context_standard_input_rejects_before_cloud_access() {
-    let (server, _credentials, credential_path) = prepared_run(Vec::new());
-    let environment = deployment_environment(&server.api_url, &credential_path);
-    let mut arguments = create_args(true);
-    let insertion = arguments.len() - 1;
-    arguments.splice(insertion..insertion, ["--integration-context-file", "-"]);
-    let oversized_source = vec![b' '; 128 * 1024 + 1];
-
-    let output = run_with_stdin(&arguments, &environment, &oversized_source);
-
-    assert_create_invalid_input(&output);
-    assert!(server.finish().is_empty());
-}
-
-// REQ-TRIGGER-54
-#[test]
-fn unreadable_integration_context_rejects_before_cloud_access() {
-    let directory = tempfile::tempdir().unwrap();
-    let missing = directory.path().join("missing.json");
-    let (server, _credentials, credential_path) = prepared_run(Vec::new());
-    let environment = deployment_environment(&server.api_url, &credential_path);
-    let mut arguments = create_args(true);
-    let insertion = arguments.len() - 1;
-    arguments.splice(
-        insertion..insertion,
-        ["--integration-context-file", missing.to_str().unwrap()],
-    );
-
-    let output = run_with_env(&arguments, &environment);
-
-    assert_eq!(output.status.code(), Some(1));
-    assert!(server.finish().is_empty());
-}
-
-// REQ-RUNINPUT-57
-#[test]
-fn run_create_consumes_an_explicit_sealed_input_set_without_restaging() {
-    let (server, _directory, credential_path) = prepared_run(vec![acceptance_response(false)]);
-    let environment = deployment_environment(&server.api_url, &credential_path);
-    let mut arguments = create_args(true);
-    let insertion = arguments.len() - 1;
-    arguments.splice(insertion..insertion, ["--input-set-id", INPUT_SET_ID]);
-
-    let output = run_with_env(&arguments, &environment);
-
-    assert!(output.status.success());
-    assert!(output.stderr.is_empty());
-    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(result["outcome"], "accepted");
-    assert_eq!(result["runId"], RUN_ID);
-    assert!(result["run"].is_null());
-    let request = server.finish().remove(0);
-    assert!(request.contains("/runs HTTP/1.1"));
-    assert_eq!(request_body(&request)["inputSetId"], INPUT_SET_ID);
-}
-
-// REQ-RUNINPUT-59, REQ-RUNINPUT-72
-#[test]
-fn create_json_input_rejected_by_file_workflow_reports_safe_binding_diagnostic() {
-    let directory = tempfile::tempdir().unwrap();
-    let input = directory.path().join("request.json");
-    let bytes = b"{\"private\":\"ticket sentinel\"}";
-    fs::write(&input, bytes).unwrap();
-    let storage = OneShotServer::respond("204 No Content", None, b"");
-    let signed_url = format!(
-        "{}/private/request?signature=capability-sentinel",
-        storage.api_url
-    );
-    let rejection = problem_http_response(
-        "409 Conflict",
-        serde_json::json!({
-            "type": "https://api.usefulmachinery.com/problems/run-input-bindings-invalid",
-            "title": "Run Input bindings invalid", "status": 409,
-            "detail": "ticket sentinel must not be displayed",
-            "diagnostic": { "code": "input_kind_mismatch", "input": "request" }
-        }),
-    );
-    let (server, _credentials, credential_path) = prepared_run(vec![
-        create_scalar_input_set_response(bytes, "json", false),
-        scalar_upload_capability_response(bytes, "application/json", &signed_url),
-        seal_scalar_input_set_response(bytes, "json", false),
-        rejection,
-    ]);
-    let environment = deployment_environment(&server.api_url, &credential_path);
-    let output = run_with_env(
-        &create_args_with_scalar_input(
-            "--input-json-file",
-            "request",
-            input.to_str().unwrap(),
-            false,
-        ),
-        &environment,
-    );
-    assert_eq!(output.status.code(), Some(1));
-    let diagnostic = String::from_utf8_lossy(&output.stderr);
-    for fact in [
-        "HTTP 409",
-        "run-input-bindings-invalid",
-        "diagnostic.code: input_kind_mismatch",
-        "diagnostic.input: request",
-        INPUT_SET_ID,
-    ] {
-        assert!(diagnostic.contains(fact), "missing {fact}: {diagnostic}");
-    }
-    assert_no_secret_output(&output, &["ticket sentinel", "capability-sentinel"]);
-    let requests = server.finish();
-    assert_eq!(requests.len(), 4);
-    assert_eq!(request_body(&requests[3])["inputSetId"], INPUT_SET_ID);
-    storage.finish();
-}
-
-// REQ-RUNINPUT-59
-#[test]
-fn create_input_admission_json_keeps_cloud_envelope_and_safe_diagnostic() {
-    let (server, _directory, credential_path) = prepared_run(vec![problem_http_response(
-        "409 Conflict",
-        serde_json::json!({
-            "type": "https://api.usefulmachinery.com/problems/run-input-bindings-invalid",
-            "title": "Run Input bindings invalid", "status": 409,
-            "detail": "ticket sentinel",
-            "diagnostic": { "code": "input_kind_mismatch", "input": "request" }
-        }),
-    )]);
-    let environment = deployment_environment(&server.api_url, &credential_path);
-    let mut arguments = create_args(true);
-    let insertion = arguments.len() - 1;
-    arguments.splice(insertion..insertion, ["--input-set-id", INPUT_SET_ID]);
-    let output = run_with_env(&arguments, &environment);
-    assert_eq!(output.status.code(), Some(1));
-    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(result["operation"], "create");
-    assert_eq!(result["outcome"], "error");
-    assert_eq!(result["inputSetId"], INPUT_SET_ID);
-    assert_eq!(result["error"]["httpStatus"], 409);
-    assert_eq!(
-        result["error"]["problemType"],
-        "https://api.usefulmachinery.com/problems/run-input-bindings-invalid"
-    );
-    assert_eq!(result["error"]["diagnostic"]["code"], "input_kind_mismatch");
-    assert_eq!(result["error"]["diagnostic"]["input"], "request");
-    assert!(result["error"]["idempotencyKey"].as_str().is_some());
-    assert_no_secret_output(&output, &["ticket sentinel"]);
-    assert_eq!(server.finish().len(), 1);
-}
-
-// REQ-RUNINPUT-59, REQ-RUNINPUT-76, REQ-RUNINPUT-77
-#[test]
-fn create_input_set_rejections_without_diagnostic_retain_safe_http_facts() {
-    for (status, kind, remedy) in [
-        (
-            "409 Conflict",
-            "run-input-set-not-sealed",
-            "Seal the retained input set",
-        ),
-        (
-            "409 Conflict",
-            "run-input-set-consumed",
-            "Create and seal a new input set",
-        ),
-        (
-            "410 Gone",
-            "run-input-set-expired",
-            "Create and seal a new input set",
-        ),
-        (
-            "410 Gone",
-            "run-input-content-gone",
-            "Create and seal a new input set",
-        ),
-    ] {
-        for json in [false, true] {
-            let (server, _directory, credential_path) = prepared_run(vec![problem_http_response(
-                status,
-                serde_json::json!({
-                    "type": format!("https://api.usefulmachinery.com/problems/{kind}"),
-                    "title": "Input set not ready", "status": if status == "410 Gone" { 410 } else { 409 },
-                    "detail": "ticket sentinel"
-                }),
-            )]);
-            let environment = deployment_environment(&server.api_url, &credential_path);
-            let mut arguments = create_args(json);
-            let insertion = arguments.len() - 1;
-            arguments.splice(insertion..insertion, ["--input-set-id", INPUT_SET_ID]);
-            let output = run_with_env(&arguments, &environment);
-            assert_eq!(output.status.code(), Some(1), "{kind}");
-            if json {
-                let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-                assert_eq!(
-                    result["error"]["httpStatus"],
-                    if status == "410 Gone" { 410 } else { 409 }
-                );
-                assert_eq!(
-                    result["error"]["problemType"],
-                    format!("https://api.usefulmachinery.com/problems/{kind}")
-                );
-                assert!(result["error"].get("diagnostic").is_none());
-                assert_eq!(result["inputSetId"], INPUT_SET_ID);
-            } else {
-                let diagnostic = String::from_utf8_lossy(&output.stderr);
-                assert!(
-                    diagnostic.contains(kind)
-                        && diagnostic.contains(INPUT_SET_ID)
-                        && diagnostic.contains(remedy)
-                        && diagnostic.contains(if status == "410 Gone" {
-                            "HTTP 410"
-                        } else {
-                            "HTTP 409"
-                        }),
-                    "{diagnostic}"
-                );
-                assert!(!diagnostic.contains("diagnostic.code"));
-            }
-            assert_no_secret_output(&output, &["ticket sentinel"]);
-            assert_eq!(server.finish().len(), 1);
-        }
-    }
-}
-
-// REQ-RUNINPUT-57
-#[test]
-fn explicit_input_set_conflicts_with_acquired_inputs_before_cloud_access() {
-    let output = Command::new(env!("CARGO_BIN_EXE_um"))
-        .args([
-            "run",
-            "create",
-            ORGANIZATION,
-            "--project-id",
-            PROJECT_ID,
-            "--workflow-path",
-            WORKFLOW_PATH,
-            "--input-set-id",
-            INPUT_SET_ID,
-            "--input-text",
-            "request",
-            "private argument sentinel",
-        ])
-        .output()
-        .unwrap();
-
-    assert_eq!(output.status.code(), Some(2));
-    assert!(output.stdout.is_empty());
-    assert!(!String::from_utf8_lossy(&output.stderr).contains("private argument sentinel"));
-}
-
-// REQ-RUNINPUT-54
-#[test]
-fn run_create_stages_present_named_text_input_files_before_binding_the_sealed_set() {
-    for input_bytes in [b"".as_slice(), b"Write a concise limerick.\n".as_slice()] {
-        let input_directory = tempfile::tempdir().unwrap();
-        let input_path = input_directory.path().join("request.txt");
-        fs::write(&input_path, input_bytes).unwrap();
-        let input_path = input_path.to_str().unwrap();
-        let storage = OneShotServer::respond("204 No Content", None, b"");
-        let signed_url = format!(
-            "{}/private/request?signature=unique-input-capability-sentinel",
-            storage.api_url
-        );
-        let (server, _credential_directory, credential_path) = prepared_run(vec![
-            create_input_set_response(input_bytes, false),
-            upload_capability_response(input_bytes, &signed_url),
-            seal_input_set_response(input_bytes, false),
-            acceptance_response(false),
-        ]);
-        let environment = deployment_environment(&server.api_url, &credential_path);
-
-        let output = run_with_env(
-            &create_args_with_text_input("request", input_path, true),
-            &environment,
-        );
-
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        assert!(output.stderr.is_empty());
-        let receipt: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-        assert_eq!(receipt["outcome"], "accepted");
-        assert_eq!(receipt["runId"], RUN_ID);
-        let mut secrets = vec![TOKEN, "unique-input-capability-sentinel"];
-        if !input_bytes.is_empty() {
-            secrets.push(std::str::from_utf8(input_bytes).unwrap());
-        }
-        assert_no_secret_output(&output, &secrets);
-
-        let requests = server.finish();
-        assert_eq!(requests.len(), 4);
-        assert!(requests[0].starts_with(&format!(
-            "POST /api/v1/organizations/{ORGANIZATION}/run-input-sets HTTP/1.1\r\n"
-        )));
-        assert_eq!(
-            request_body(&requests[0]),
-            serde_json::json!({
-                "projectId": PROJECT_ID,
-                "schemaVersion": 1,
-                "inputs": {
-                    "request": {
-                        "kind": "text",
-                        "sizeBytes": input_bytes.len(),
-                        "sha256": hex_digest(input_bytes)
-                    }
-                }
-            })
-        );
-        assert!(requests[1].starts_with(&format!(
-            "POST /api/v1/organizations/{ORGANIZATION}/run-input-sets/{INPUT_SET_ID}/upload-capabilities HTTP/1.1\r\n"
-        )));
-        assert_eq!(
-            request_body(&requests[1]),
-            serde_json::json!({"members": ["inputs/request"]})
-        );
-        assert!(requests[2].starts_with(&format!(
-            "POST /api/v1/organizations/{ORGANIZATION}/run-input-sets/{INPUT_SET_ID}/seal HTTP/1.1\r\n"
-        )));
-        assert!(requests[3].starts_with(&format!(
-            "POST /api/v1/organizations/{ORGANIZATION}/runs HTTP/1.1\r\n"
-        )));
-        assert_eq!(
-            request_body(&requests[3]),
-            serde_json::json!({
-                "projectId": PROJECT_ID,
-                "workflowPath": WORKFLOW_PATH,
-                "sourceBranch": "release/next",
-                "displayName": "Release checks",
-                "inputSetId": INPUT_SET_ID
-            })
-        );
-        for request in &requests {
-            assert_eq!(
-                header_value(request, "authorization"),
-                format!("Bearer {TOKEN}")
-            );
-        }
-        let mutation_keys = [&requests[0], &requests[2], &requests[3]]
-            .map(|request| header_value(request, "idempotency-key"));
-        assert!(mutation_keys.iter().all(|key| key.len() == 64));
-        assert_ne!(mutation_keys[0], mutation_keys[1]);
-        assert_ne!(mutation_keys[1], mutation_keys[2]);
-        assert!(!requests[1].contains("idempotency-key:"));
-
-        let upload = storage.finish();
-        assert!(upload.starts_with("PUT /api/private/request?signature="));
-        assert_eq!(
-            upload.split_once("\r\n\r\n").unwrap().1.as_bytes(),
-            input_bytes
-        );
-        assert_eq!(
-            header_value(&upload, "content-length"),
-            input_bytes.len().to_string()
-        );
-        assert_eq!(
-            header_value(&upload, "content-type"),
-            "text/plain; charset=utf-8"
-        );
-        assert_eq!(header_value(&upload, "if-none-match"), "*");
-        assert_eq!(
-            header_value(&upload, "x-amz-checksum-sha256"),
-            base64::engine::general_purpose::STANDARD.encode(sha256(input_bytes))
-        );
-        let mut header_names = upload
-            .split_once("\r\n\r\n")
-            .unwrap()
-            .0
-            .lines()
-            .skip(1)
-            .map(|line| line.split_once(':').unwrap().0.to_ascii_lowercase())
-            .collect::<Vec<_>>();
-        header_names.sort();
-        assert_eq!(
-            header_names,
-            [
-                "content-length",
-                "content-type",
-                "host",
-                "if-none-match",
-                "x-amz-checksum-sha256",
-            ]
-            .map(str::to_owned)
-        );
-    }
-}
-
-// REQ-RUNINPUT-54
-#[test]
-fn run_create_stages_named_json_sources_without_rewriting_bytes() {
-    let input_bytes = b"{\n  \"enabled\": true, \"ratio\": 1.00\n}\n";
-    let input_directory = tempfile::tempdir().unwrap();
-    let input_path = input_directory.path().join("request.json");
-    fs::write(&input_path, input_bytes).unwrap();
-    let input_path = input_path.to_str().unwrap();
-
-    for (flag, source) in [
-        ("--input-json", std::str::from_utf8(input_bytes).unwrap()),
-        ("--input-json-file", input_path),
-    ] {
-        let storage = OneShotServer::respond("204 No Content", None, b"");
-        let signed_url = format!(
-            "{}/private/request?signature=unique-json-capability-sentinel",
-            storage.api_url
-        );
-        let (server, _credential_directory, credential_path) = prepared_run(vec![
-            create_scalar_input_set_response(input_bytes, "json", false),
-            scalar_upload_capability_response(input_bytes, "application/json", &signed_url),
-            seal_scalar_input_set_response(input_bytes, "json", false),
-            acceptance_response(false),
-        ]);
-        let environment = deployment_environment(&server.api_url, &credential_path);
-
-        let output = run_with_env(
-            &create_args_with_scalar_input(flag, "request", source, true),
-            &environment,
-        );
-
-        assert!(
-            output.status.success(),
-            "stdout: {}\nstderr: {}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-        assert!(output.stderr.is_empty());
-        assert_no_secret_output(
-            &output,
-            &[
-                TOKEN,
-                "unique-json-capability-sentinel",
-                std::str::from_utf8(input_bytes).unwrap(),
-            ],
-        );
-        let requests = server.finish();
-        assert_eq!(
-            request_body(&requests[0]),
-            serde_json::json!({
-                "projectId": PROJECT_ID,
-                "schemaVersion": 1,
-                "inputs": {
-                    "request": {
-                        "kind": "json",
-                        "sizeBytes": input_bytes.len(),
-                        "sha256": hex_digest(input_bytes)
-                    }
-                }
-            })
-        );
-        assert_eq!(
-            request_body(&requests[1]),
-            serde_json::json!({"members": ["inputs/request"]})
-        );
-        assert_eq!(request_body(&requests[3])["inputSetId"], INPUT_SET_ID);
-
-        let upload = storage.finish();
-        assert_eq!(
-            upload.split_once("\r\n\r\n").unwrap().1.as_bytes(),
-            input_bytes
-        );
-        assert_eq!(header_value(&upload, "content-type"), "application/json");
-        assert_eq!(
-            header_value(&upload, "x-amz-checksum-sha256"),
-            base64::engine::general_purpose::STANDARD.encode(sha256(input_bytes))
-        );
-    }
-}
-
-// REQ-RUNINPUT-53, REQ-RUNINPUT-54
-#[test]
-fn run_create_stages_named_file_with_exact_media_type_and_bytes() {
-    let input_bytes = *b"exact file bytes";
-    let media_type = "application/octet-stream; version=1";
-    let input_directory = tempfile::tempdir().unwrap();
-    let input_path = input_directory.path().join("request.bin");
-    fs::write(&input_path, input_bytes).unwrap();
-    let input_path = input_path.to_str().unwrap();
-    let storage = OneShotServer::respond("204 No Content", None, b"");
-    let signed_url = format!(
-        "{}/private/request?signature=unique-file-capability-sentinel",
-        storage.api_url
-    );
-    let (server, _credential_directory, credential_path) = prepared_run(vec![
-        create_file_input_set_response(&input_bytes, media_type),
-        scalar_upload_capability_response(&input_bytes, media_type, &signed_url),
-        seal_file_input_set_response(&input_bytes, media_type),
-        acceptance_response(false),
-    ]);
-    let environment = deployment_environment(&server.api_url, &credential_path);
-
-    let output = run_with_env(
-        &create_args_with_file_input("request", media_type, input_path, true),
-        &environment,
-    );
-
-    assert!(
-        output.status.success(),
-        "stdout: {}\nstderr: {}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert!(output.stderr.is_empty());
-    assert_no_secret_output(&output, &[TOKEN, "unique-file-capability-sentinel"]);
-    let requests = server.finish();
-    assert_eq!(
-        request_body(&requests[0]),
-        serde_json::json!({
-            "projectId": PROJECT_ID,
-            "schemaVersion": 1,
-            "inputs": {
-                "request": {
-                    "kind": "file",
-                    "mediaType": media_type,
-                    "sizeBytes": input_bytes.len(),
-                    "sha256": hex_digest(&input_bytes)
-                }
-            }
-        })
-    );
-    assert_eq!(
-        request_body(&requests[1]),
-        serde_json::json!({"members": ["inputs/request"]})
-    );
-    assert_eq!(request_body(&requests[3])["inputSetId"], INPUT_SET_ID);
-
-    let upload = storage.finish();
-    assert_eq!(
-        upload.split_once("\r\n\r\n").unwrap().1.as_bytes(),
-        input_bytes
-    );
-    assert_eq!(header_value(&upload, "content-type"), media_type);
-}
-
-// REQ-RUNINPUT-53, REQ-RUNINPUT-54, REQ-RUNINPUT-71
-#[test]
-fn run_create_stages_mixed_values_ordered_attachments_and_present_empty_collections() {
-    let directory = tempfile::tempdir().unwrap();
-    let first_path = directory.path().join("first.txt");
-    let second_path = directory.path().join("second.bin");
-    fs::write(&first_path, b"first attachment").unwrap();
-    fs::write(&second_path, b"second attachment").unwrap();
-    let json_bytes = b"{\"enabled\":true}";
-    let values: [&[u8]; 4] = [b"", b"first attachment", b"second attachment", json_bytes];
-    let media_types = [
-        "text/plain; charset=utf-8",
-        "text/plain",
-        "application/octet-stream",
-        "application/json",
-    ];
-    let storages = values
-        .iter()
-        .map(|_| OneShotServer::respond("204 No Content", None, b""))
-        .collect::<Vec<_>>();
-    let urls = storages
-        .iter()
-        .enumerate()
-        .map(|(index, storage)| format!("{}/member-{index}?signature=mixed", storage.api_url))
-        .collect::<Vec<_>>();
-    let manifest = serde_json::json!({
-        "schemaVersion": 1,
-        "inputs": {
-            "emptyText": {
-                "kind": "text",
-                "sizeBytes": 0,
-                "sha256": hex_digest(b"")
-            },
-            "evidence": {
-                "kind": "attachments",
-                "items": [
-                    {
-                        "index": 0,
-                        "displayName": null,
-                        "mediaType": "text/plain",
-                        "sizeBytes": values[1].len(),
-                        "sha256": hex_digest(values[1])
-                    },
-                    {
-                        "index": 1,
-                        "displayName": null,
-                        "mediaType": "application/octet-stream",
-                        "sizeBytes": values[2].len(),
-                        "sha256": hex_digest(values[2])
-                    }
-                ]
-            },
-            "nothing": {"kind": "attachments", "items": []},
-            "settings": {
-                "kind": "json",
-                "sizeBytes": json_bytes.len(),
-                "sha256": hex_digest(json_bytes)
-            }
-        }
-    });
-    let canonical = serde_json::to_vec(&manifest).unwrap();
-    let member_ids = [
-        "inputs/emptyText",
-        "inputs/evidence/000000",
-        "inputs/evidence/000001",
-        "inputs/settings",
-    ];
-    let set_body = |state: &str, uploaded: bool| {
-        let mut body = serde_json::json!({
-            "id": INPUT_SET_ID,
-            "organizationId": ORGANIZATION_ID,
-            "projectId": PROJECT_ID,
-            "boundsProfile": 1,
-            "manifest": manifest.clone(),
-            "manifestDigest": {"algorithm": "sha256", "value": hex_digest(&canonical)},
-            "inputCount": 4,
-            "attachmentCount": 2,
-            "aggregateSizeBytes": values.iter().map(|value| value.len()).sum::<usize>(),
-            "state": state,
-            "createdAt": "2026-08-24T01:00:00Z",
-            "openDeadlineAt": "2999-08-25T01:00:00Z",
-            "members": member_ids.iter().map(|member| serde_json::json!({
-                "memberId": member,
-                "uploadConfirmed": uploaded
-            })).collect::<Vec<_>>(),
-            "replayed": false
-        });
-        if state == "sealed" {
-            body["sealedAt"] = serde_json::json!("2026-08-24T01:02:00Z");
-            body["sealedDeadlineAt"] = serde_json::json!("2026-08-25T01:02:00Z");
-        }
-        body
-    };
-    let create_response = http_response_with_headers(
-        "201 Created",
-        Some("application/json"),
-        &[
-            ("Idempotency-Key", ECHO_IDEMPOTENCY_KEY),
-            (
-                "Location",
-                "/v1/organizations/acme-research/run-input-sets/ris_01k0z6r1w8f4jy2m7q9v3x5abc",
-            ),
-        ],
-        &serde_json::to_vec(&set_body("open", false)).unwrap(),
-    );
-    let capability_response = http_response_with_headers(
-        "200 OK",
-        Some("application/json"),
-        &[("Cache-Control", "private, no-store")],
-        &serde_json::to_vec(&serde_json::json!({
-            "inputSetId": INPUT_SET_ID,
-            "capabilityExpiresAt": "2998-08-24T01:05:00Z",
-            "members": member_ids.iter().enumerate().map(|(index, member)| serde_json::json!({
-                "memberId": member,
-                "url": urls[index],
-                "requiredHeaders": {
-                    "contentLength": values[index].len().to_string(),
-                    "contentType": media_types[index],
-                    "ifNoneMatch": "*",
-                    "xAmzChecksumSha256": base64::engine::general_purpose::STANDARD.encode(sha256(values[index]))
-                }
-            })).collect::<Vec<_>>()
-        }))
-        .unwrap(),
-    );
-    let sealed_response = http_response_with_headers(
-        "200 OK",
-        Some("application/json"),
-        &[("Idempotency-Key", ECHO_IDEMPOTENCY_KEY)],
-        &serde_json::to_vec(&set_body("sealed", true)).unwrap(),
-    );
-    let (server, _credentials, credential_path) = prepared_run(vec![
-        create_response,
-        capability_response,
-        sealed_response,
-        acceptance_response(false),
-    ]);
-    let environment = deployment_environment(&server.api_url, &credential_path);
-    let mut arguments = create_args(true);
-    let insertion = arguments.len() - 1;
-    arguments.splice(
-        insertion..insertion,
-        [
-            "--input-text",
-            "emptyText",
-            "",
-            "--input-json",
-            "settings",
-            std::str::from_utf8(json_bytes).unwrap(),
-            "--input-attachment",
-            "evidence",
-            "text/plain",
-            first_path.to_str().unwrap(),
-            "--input-attachment",
-            "evidence",
-            "application/octet-stream",
-            second_path.to_str().unwrap(),
-            "--input-attachments-empty",
-            "nothing",
-        ],
-    );
-
-    let output = run_with_env(&arguments, &environment);
-
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert_no_secret_output(&output, &[TOKEN, "first attachment", "second attachment"]);
-    let requests = server.finish();
-    assert_eq!(request_body(&requests[0])["inputs"], manifest["inputs"]);
-    assert_eq!(
-        request_body(&requests[1]),
-        serde_json::json!({"members": member_ids})
-    );
-    assert_eq!(request_body(&requests[3])["inputSetId"], INPUT_SET_ID);
-    for (storage, expected) in storages.into_iter().zip(values) {
-        assert_eq!(
-            storage
-                .finish()
-                .split_once("\r\n\r\n")
-                .unwrap()
-                .1
-                .as_bytes(),
-            expected
-        );
-    }
 }
 
 fn retained_inputs_response(bytes: &[u8]) -> Vec<u8> {
@@ -5918,610 +4786,6 @@ fn retained_input_deletion_requires_confirmation_and_sends_one_idempotent_reques
     assert_eq!(header_value(&request, "idempotency-key").len(), 64);
 }
 
-// REQ-RUNINPUT-55
-#[test]
-fn named_file_parameter_controls_stop_before_cloud_input_set_allocation() {
-    let input_directory = tempfile::tempdir().unwrap();
-    let input_path = input_directory.path().join("request.bin");
-    fs::write(&input_path, b"private file input").unwrap();
-    let input_path = input_path.to_str().unwrap();
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    listener.set_nonblocking(true).unwrap();
-    let api_url = format!("http://{}/api", listener.local_addr().unwrap());
-    let credential_directory = private_credential_directory();
-    let credential_path = credential_directory.path().join("credentials.json");
-    write_credential_fixture(&credential_path, &api_url, TOKEN, "2999-01-01T00:00:00Z");
-    let environment = deployment_environment(&api_url, credential_path.to_str().unwrap());
-
-    for control in ['\u{000b}', '\u{000c}', '\u{007f}'] {
-        let media_type = format!("application/octet-stream;version=one{control}two");
-        let output = run_with_env(
-            &create_args_with_file_input("request", &media_type, input_path, true),
-            &environment,
-        );
-
-        assert_eq!(output.status.code(), Some(1));
-        assert!(output.stderr.is_empty());
-        let failure: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-        assert_eq!(failure["outcome"], "error");
-        assert_eq!(failure["error"]["code"], "invalid_input");
-        assert_no_secret_output(&output, &[TOKEN, "private file input"]);
-    }
-    assert!(matches!(
-        listener.accept(),
-        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
-    ));
-}
-
-#[test]
-fn invalid_json_and_scalar_binding_conflicts_stop_before_cloud_access() {
-    let input_directory = tempfile::tempdir().unwrap();
-    let text_path = input_directory.path().join("request.txt");
-    fs::write(&text_path, b"private text input").unwrap();
-    let text_path = text_path.to_str().unwrap();
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    listener.set_nonblocking(true).unwrap();
-    let api_url = format!("http://{}/api", listener.local_addr().unwrap());
-    let credential_directory = private_credential_directory();
-    let credential_path = credential_directory.path().join("credentials.json");
-    write_credential_fixture(&credential_path, &api_url, TOKEN, "2999-01-01T00:00:00Z");
-    let environment = deployment_environment(&api_url, credential_path.to_str().unwrap());
-
-    let malformed = run_with_env(
-        &create_args_with_scalar_input(
-            "--input-json",
-            "request",
-            "{\"secret\":1,\"secret\":2}",
-            true,
-        ),
-        &environment,
-    );
-    assert_eq!(malformed.status.code(), Some(1));
-    assert_no_secret_output(&malformed, &[TOKEN, "secret"]);
-
-    let malformed_file = run_with_env(
-        &create_args_with_file_input("request", "not a media type", text_path, true),
-        &environment,
-    );
-    assert_eq!(malformed_file.status.code(), Some(1));
-    assert_no_secret_output(&malformed_file, &[TOKEN, "private text input"]);
-
-    let mut conflicting = create_args_with_text_input("request", text_path, true);
-    let insertion = conflicting.len() - 1;
-    conflicting.splice(insertion..insertion, ["--input-json", "request", "null"]);
-    let conflict = run_with_env(&conflicting, &environment);
-    assert_eq!(conflict.status.code(), Some(1));
-    assert_no_secret_output(&conflict, &[TOKEN, "private text input"]);
-    assert!(matches!(
-        listener.accept(),
-        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
-    ));
-}
-
-// REQ-RUNINPUT-55, REQ-RUNINPUT-72
-#[test]
-fn invalid_and_oversized_named_text_input_files_stop_before_cloud_access() {
-    let input_directory = tempfile::tempdir().unwrap();
-    let invalid_path = input_directory.path().join("invalid.txt");
-    fs::write(&invalid_path, b"secret-valid-prefix\xff").unwrap();
-    let oversized_path = input_directory.path().join("oversized.txt");
-    fs::write(&oversized_path, vec![b'x'; 1024 * 1024 + 1]).unwrap();
-    let valid_path = input_directory.path().join("valid.txt");
-    fs::write(&valid_path, b"private valid input sentinel").unwrap();
-
-    for (name, path) in [
-        ("request", invalid_path.as_path()),
-        ("request", oversized_path.as_path()),
-        ("Request", valid_path.as_path()),
-        ("request", input_directory.path()),
-    ] {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        listener.set_nonblocking(true).unwrap();
-        let api_url = format!("http://{}/api", listener.local_addr().unwrap());
-        let credential_directory = private_credential_directory();
-        let credential_path = credential_directory.path().join("credentials.json");
-        write_credential_fixture(&credential_path, &api_url, TOKEN, "2999-01-01T00:00:00Z");
-        let environment = deployment_environment(&api_url, credential_path.to_str().unwrap());
-
-        let output = run_with_env(
-            &create_args_with_text_input(name, path.to_str().unwrap(), true),
-            &environment,
-        );
-
-        assert_eq!(output.status.code(), Some(1));
-        assert!(output.stderr.is_empty());
-        let failure: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-        assert_eq!(failure["outcome"], "error");
-        assert_eq!(failure["error"]["code"], "invalid_input");
-        assert_no_secret_output(
-            &output,
-            &[TOKEN, "secret-valid-prefix", "private valid input sentinel"],
-        );
-        assert!(matches!(
-            listener.accept(),
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
-        ));
-    }
-}
-
-// REQ-RUNINPUT-55
-#[test]
-fn exactly_one_mib_text_input_reaches_input_set_creation() {
-    let input_directory = tempfile::tempdir().unwrap();
-    let input_path = input_directory.path().join("boundary.txt");
-    let input_bytes = vec![b'z'; 1024 * 1024];
-    fs::write(&input_path, &input_bytes).unwrap();
-    let (server, _credential_directory, credential_path) =
-        prepared_run(vec![problem_http_response(
-            "403 Forbidden",
-            serde_json::json!({
-                "type": "https://api.usefulmachinery.com/problems/forbidden",
-                "title": "Forbidden",
-                "status": 403
-            }),
-        )]);
-    let environment = deployment_environment(&server.api_url, &credential_path);
-
-    let output = run_with_env(
-        &create_args_with_text_input("request", input_path.to_str().unwrap(), true),
-        &environment,
-    );
-
-    assert_eq!(output.status.code(), Some(1));
-    assert_eq!(
-        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()["error"]["code"],
-        "forbidden"
-    );
-    let request = server.finish().pop().unwrap();
-    assert!(request.contains("/run-input-sets HTTP/1.1"));
-    assert_eq!(
-        request_body(&request)["inputs"]["request"]["sizeBytes"],
-        1024 * 1024
-    );
-    assert_eq!(
-        request_body(&request)["inputs"]["request"]["sha256"],
-        hex_digest(&input_bytes)
-    );
-}
-
-// REQ-RUN-56
-#[test]
-fn credential_rejection_reuses_the_create_key_and_reports_the_server_replay() {
-    let server = ScriptedServer::respond(vec![
-        problem_http_response(
-            "401 Unauthorized",
-            serde_json::json!({
-                "type": "https://api.usefulmachinery.com/problems/unauthorized",
-                "title": "Unauthorized",
-                "status": 401
-            }),
-        ),
-        json_http_response(
-            "200 OK",
-            serde_json::json!({
-                "access_token": REFRESHED_TOKEN,
-                "refresh_token": "unique-cloud-run-refreshed-refresh-token",
-                "token_type": "Bearer",
-                "expires_in": 3600
-            }),
-        ),
-        acceptance_response(true),
-    ]);
-    let credential_directory = private_credential_directory();
-    let credential_path = credential_directory.path().join("credentials.json");
-    write_credential_fixture_for_deployment(
-        &credential_path,
-        &server.api_url,
-        &server.issuer,
-        TOKEN,
-        "2999-01-01T00:00:00Z",
-    );
-    let environment = deployment_environment_with_issuer(
-        &server.api_url,
-        &server.issuer,
-        credential_path.to_str().unwrap(),
-    );
-
-    let output = run_with_env(&create_args(true), &environment);
-
-    assert!(output.status.success());
-    let receipt: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(receipt["runId"], RUN_ID);
-    assert_eq!(receipt["replayed"], true);
-    assert_no_secret_output(&output, &[TOKEN, REFRESHED_TOKEN]);
-    let requests = server.finish();
-    assert_eq!(requests.len(), 3);
-    assert!(requests[0].starts_with("POST /api/v1/organizations/"));
-    assert!(requests[1].starts_with("POST /auth/oauth/token HTTP/1.1\r\n"));
-    assert!(requests[2].starts_with("POST /api/v1/organizations/"));
-    assert_eq!(
-        header_value(&requests[0], "idempotency-key"),
-        header_value(&requests[2], "idempotency-key")
-    );
-    assert_eq!(request_body(&requests[0]), request_body(&requests[2]));
-    assert_eq!(
-        header_value(&requests[2], "authorization"),
-        format!("Bearer {REFRESHED_TOKEN}")
-    );
-}
-
-#[test]
-fn malformed_unauthorized_response_still_refreshes_the_human_session() {
-    let server = ScriptedServer::respond(vec![
-        http_response_with_headers(
-            "401 Unauthorized",
-            Some("application/problem+json"),
-            &[],
-            b"not-json",
-        ),
-        json_http_response(
-            "200 OK",
-            serde_json::json!({
-                "access_token": REFRESHED_TOKEN,
-                "refresh_token": "unique-cloud-run-refreshed-refresh-token",
-                "token_type": "Bearer",
-                "expires_in": 3600
-            }),
-        ),
-        acceptance_response(true),
-    ]);
-    let credential_directory = private_credential_directory();
-    let credential_path = credential_directory.path().join("credentials.json");
-    write_credential_fixture_for_deployment(
-        &credential_path,
-        &server.api_url,
-        &server.issuer,
-        TOKEN,
-        "2999-01-01T00:00:00Z",
-    );
-    let environment = deployment_environment_with_issuer(
-        &server.api_url,
-        &server.issuer,
-        credential_path.to_str().unwrap(),
-    );
-
-    let output = run_with_env(&create_args(true), &environment);
-
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stdout)
-    );
-    let receipt: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(receipt["runId"], RUN_ID);
-    assert_no_secret_output(&output, &[TOKEN, REFRESHED_TOKEN]);
-    let requests = server.finish();
-    assert_eq!(requests.len(), 3);
-    assert!(requests[1].starts_with("POST /auth/oauth/token HTTP/1.1\r\n"));
-}
-
-#[test]
-fn interrupted_create_without_an_idempotency_echo_is_invalid_response() {
-    let truncated_response = format!(
-        "HTTP/1.1 202 Accepted\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: 4096\r\nLocation: /v1/organizations/{ORGANIZATION}/runs/{RUN_ID}\r\n\r\n{{\"runId\":\"{RUN_ID}\""
-    )
-    .into_bytes();
-    let (server, _directory, credential_path) = prepared_run(vec![truncated_response]);
-    let environment = deployment_environment(&server.api_url, &credential_path);
-
-    let output = run_with_env(&create_args(true), &environment);
-
-    assert_invalid_response(&output);
-    assert_no_secret_output(&output, &[TOKEN]);
-    server.finish();
-}
-
-// REQ-RUN-56
-#[test]
-fn ambiguous_transport_retry_reuses_the_create_key_and_request() {
-    let directory = tempfile::tempdir().unwrap();
-    let context_path = directory.path().join("context.json");
-    fs::write(&context_path, br#"{"issueId":"retry-context"}"#).unwrap();
-    let (server, _credential_directory, credential_path) =
-        prepared_run(vec![Vec::new(), acceptance_response(true)]);
-    let environment = deployment_environment(&server.api_url, &credential_path);
-    let mut arguments = create_args(true);
-    let insertion = arguments.len() - 1;
-    arguments.splice(
-        insertion..insertion,
-        ["--integration-context-file", context_path.to_str().unwrap()],
-    );
-
-    let output = run_with_env(&arguments, &environment);
-
-    assert!(output.status.success());
-    let receipt: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(receipt["runId"], RUN_ID);
-    assert_eq!(receipt["replayed"], true);
-    let requests = server.finish();
-    assert_eq!(requests.len(), 2);
-    assert_eq!(
-        header_value(&requests[0], "idempotency-key"),
-        header_value(&requests[1], "idempotency-key")
-    );
-    assert_eq!(request_body(&requests[0]), request_body(&requests[1]));
-}
-
-#[test]
-fn text_input_sequence_refreshes_authority_but_does_not_treat_network_failure_as_upload_evidence() {
-    let input_bytes = b"Explain why 2 + 3 = 5.\n";
-    let input_directory = tempfile::tempdir().unwrap();
-    let input_path = input_directory.path().join("request.txt");
-    fs::write(&input_path, input_bytes).unwrap();
-    let storage = OneShotServer::respond("", None, b"");
-    let signed_url = format!(
-        "{}/private/request?signature=unique-refreshed-capability-sentinel",
-        storage.api_url
-    );
-    let server = ScriptedServer::respond(vec![
-        create_input_set_response(input_bytes, false),
-        problem_http_response(
-            "401 Unauthorized",
-            serde_json::json!({
-                "type": "https://api.usefulmachinery.com/problems/unauthorized",
-                "title": "Unauthorized",
-                "status": 401
-            }),
-        ),
-        json_http_response(
-            "200 OK",
-            serde_json::json!({
-                "access_token": REFRESHED_TOKEN,
-                "refresh_token": "unique-input-refreshed-refresh-token",
-                "token_type": "Bearer",
-                "expires_in": 3600
-            }),
-        ),
-        upload_capability_response(input_bytes, &signed_url),
-    ]);
-    let credential_directory = private_credential_directory();
-    let credential_path = credential_directory.path().join("credentials.json");
-    write_credential_fixture_for_deployment(
-        &credential_path,
-        &server.api_url,
-        &server.issuer,
-        TOKEN,
-        "2999-01-01T00:00:00Z",
-    );
-    let environment = deployment_environment_with_issuer(
-        &server.api_url,
-        &server.issuer,
-        credential_path.to_str().unwrap(),
-    );
-
-    let output = run_with_env(
-        &create_args_with_text_input("request", input_path.to_str().unwrap(), true),
-        &environment,
-    );
-
-    assert_eq!(output.status.code(), Some(4));
-    let receipt: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(receipt["outcome"], "error");
-    assert_eq!(receipt["error"]["code"], "unavailable");
-    assert!(receipt["runId"].is_null());
-    assert_no_secret_output(
-        &output,
-        &[
-            TOKEN,
-            REFRESHED_TOKEN,
-            "unique-refreshed-capability-sentinel",
-            std::str::from_utf8(input_bytes).unwrap(),
-        ],
-    );
-    let requests = server.finish();
-    assert_eq!(requests.len(), 4);
-    assert!(requests[1].contains("/upload-capabilities HTTP/1.1"));
-    assert!(requests[2].starts_with("POST /auth/oauth/token HTTP/1.1\r\n"));
-    assert!(requests[3].contains("/upload-capabilities HTTP/1.1"));
-    assert!(!requests[1].contains("idempotency-key:"));
-    assert!(!requests[3].contains("idempotency-key:"));
-    assert_eq!(
-        header_value(&requests[1], "authorization"),
-        format!("Bearer {TOKEN}")
-    );
-    assert_eq!(
-        header_value(&requests[3], "authorization"),
-        format!("Bearer {REFRESHED_TOKEN}")
-    );
-    let upload = storage.finish();
-    assert!(upload.starts_with("PUT "));
-    assert!(!upload.contains("authorization:"));
-    assert_eq!(
-        upload.split_once("\r\n\r\n").unwrap().1.as_bytes(),
-        input_bytes
-    );
-}
-
-#[test]
-fn definite_upload_rejection_with_truncated_body_never_reaches_seal_or_run() {
-    let input_bytes = b"definite upload rejection sentinel\n";
-    let input_directory = tempfile::tempdir().unwrap();
-    let input_path = input_directory.path().join("request.txt");
-    fs::write(&input_path, input_bytes).unwrap();
-    let storage = api_test_support::ScriptedHttpServer::respond(
-        b"HTTP/1.1 403 Forbidden\r\nConnection: close\r\nContent-Length: 100\r\n\r\nshort".to_vec(),
-    );
-    let signed_url = format!("{}private/request?signature=private", storage.api_url);
-    let (server, _credential_directory, credential_path) = prepared_run(vec![
-        create_input_set_response(input_bytes, false),
-        upload_capability_response(input_bytes, &signed_url),
-        seal_input_set_response(input_bytes, false),
-        acceptance_response(false),
-    ]);
-    let environment = deployment_environment(&server.api_url, &credential_path);
-
-    let output = run_with_env(
-        &create_args_with_text_input("request", input_path.to_str().unwrap(), true),
-        &environment,
-    );
-    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-
-    // A corrected command consumes only the first two scripted responses. Drain the fixture's
-    // deliberately unreachable responses after the command so the same test terminates on both
-    // sides of the assertion without making those requests part of command behavior.
-    if !output.status.success() {
-        let authority = server
-            .api_url
-            .strip_prefix("http://")
-            .unwrap()
-            .split('/')
-            .next()
-            .unwrap();
-        for index in 0..2 {
-            let mut stream = std::net::TcpStream::connect(authority).unwrap();
-            write!(
-                stream,
-                "GET /review-fixture-drain/{index} HTTP/1.1\r\nHost: {authority}\r\nIdempotency-Key: fixture-drain-{index}\r\nConnection: close\r\n\r\n"
-            )
-            .unwrap();
-            let mut ignored = Vec::new();
-            stream.read_to_end(&mut ignored).unwrap();
-        }
-    }
-    let requests = server.finish();
-    storage.finish_one();
-    let command_continued = !requests[2].starts_with("GET /review-fixture-drain/");
-
-    assert!(
-        !output.status.success()
-            && result["outcome"] != "accepted"
-            && result["runId"].is_null()
-            && !command_continued,
-        "a definite 403 must abort before seal and CreateRun; observed status={:?}, outcome={:?}, run_id_present={}, continued={command_continued}",
-        output.status.code(),
-        result["outcome"],
-        !result["runId"].is_null(),
-    );
-}
-
-#[test]
-fn text_input_upload_redirect_is_not_followed_or_reported_as_acceptance() {
-    let input_bytes = b"redirect safety sentinel\n";
-    let input_directory = tempfile::tempdir().unwrap();
-    let input_path = input_directory.path().join("request.txt");
-    fs::write(&input_path, input_bytes).unwrap();
-    let redirect_secret = "unique-redirect-target-sentinel";
-    let storage = api_test_support::ScriptedHttpServer::respond(http_response_with_headers(
-        "307 Temporary Redirect",
-        None,
-        &[(
-            "Location",
-            "https://storage.invalid/private/redirect?signature=unique-redirect-target-sentinel",
-        )],
-        b"storage response details",
-    ));
-    let signed_url = format!(
-        "{}private/request?signature=unique-original-capability-sentinel",
-        storage.api_url
-    );
-    let (server, _credential_directory, credential_path) = prepared_run(vec![
-        create_input_set_response(input_bytes, false),
-        upload_capability_response(input_bytes, &signed_url),
-    ]);
-    let environment = deployment_environment(&server.api_url, &credential_path);
-
-    let output = run_with_env(
-        &create_args_with_text_input("request", input_path.to_str().unwrap(), true),
-        &environment,
-    );
-
-    assert_eq!(output.status.code(), Some(1));
-    let diagnostic = String::from_utf8_lossy(&output.stderr);
-    assert!(diagnostic.contains(&format!("input set: {INPUT_SET_ID}")));
-    assert!(diagnostic.contains("run input-set show"));
-    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(result["outcome"], "error");
-    assert_eq!(result["error"]["code"], "submission_failed");
-    assert!(result["runId"].is_null());
-    assert!(result.get("inputSetId").is_none());
-    assert_no_secret_output(
-        &output,
-        &[
-            TOKEN,
-            redirect_secret,
-            "unique-original-capability-sentinel",
-            std::str::from_utf8(input_bytes).unwrap(),
-            "storage response details",
-        ],
-    );
-    assert_eq!(server.finish().len(), 2);
-    let upload = storage.finish_one();
-    assert!(upload.starts_with("PUT "));
-    assert!(!upload.contains("authorization:"));
-}
-
-// REQ-RUNINPUT-58
-#[test]
-fn failed_staging_reports_allocated_input_set_in_human_mode() {
-    let input_directory = tempfile::tempdir().unwrap();
-    let input_path = input_directory.path().join("request.txt");
-    let input_bytes = b"staging rejection sentinel\n";
-    fs::write(&input_path, input_bytes).unwrap();
-    let (server, _credential_directory, credential_path) = prepared_run(vec![
-        create_input_set_response(input_bytes, false),
-        problem_http_response(
-            "403 Forbidden",
-            serde_json::json!({
-                "type": "https://api.usefulmachinery.com/problems/forbidden",
-                "title": "Forbidden",
-                "status": 403
-            }),
-        ),
-    ]);
-    let environment = deployment_environment(&server.api_url, &credential_path);
-
-    let output = run_with_env(
-        &create_args_with_text_input("request", input_path.to_str().unwrap(), false),
-        &environment,
-    );
-
-    assert_eq!(output.status.code(), Some(1));
-    assert!(output.stdout.is_empty());
-    let diagnostic = String::from_utf8_lossy(&output.stderr);
-    assert!(diagnostic.contains(&format!("input set: {INPUT_SET_ID}")));
-    assert!(diagnostic.contains("run input-set show"));
-    assert_no_secret_output(&output, &[TOKEN, std::str::from_utf8(input_bytes).unwrap()]);
-    let requests = server.finish();
-    assert_eq!(requests.len(), 2);
-    assert!(requests[1].contains(&format!(
-        "/run-input-sets/{INPUT_SET_ID}/upload-capabilities"
-    )));
-}
-
-// REQ-RUNINPUT-60
-#[test]
-fn precondition_replay_is_resolved_by_authoritative_sealing() {
-    let input_bytes = b"already uploaded named input sentinel\n";
-    let input_directory = tempfile::tempdir().unwrap();
-    let input_path = input_directory.path().join("request.txt");
-    fs::write(&input_path, input_bytes).unwrap();
-    let storage = OneShotServer::respond("412 Precondition Failed", None, b"");
-    let signed_url = format!("{}/private/request?signature=private", storage.api_url);
-    let (server, _credential_directory, credential_path) = prepared_run(vec![
-        create_input_set_response(input_bytes, false),
-        upload_capability_response(input_bytes, &signed_url),
-        seal_input_set_response(input_bytes, false),
-        acceptance_response(false),
-    ]);
-    let environment = deployment_environment(&server.api_url, &credential_path);
-
-    let output = run_with_env(
-        &create_args_with_text_input("request", input_path.to_str().unwrap(), true),
-        &environment,
-    );
-
-    assert!(
-        output.status.success(),
-        "a 412 replay must be resolved by sealing: {}",
-        String::from_utf8_lossy(&output.stdout)
-    );
-    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(result["outcome"], "accepted");
-    assert_eq!(result["runId"], RUN_ID);
-    assert_eq!(server.finish().len(), 4);
-    storage.finish();
-}
-
 // REQ-RUNINPUT-45
 // REQ-WORKSPACE-12
 // REQ-RUN-59
@@ -6659,7 +4923,7 @@ fn lifecycle_identity_lines(indent: &str) -> Vec<String> {
     ]
 }
 
-// REQ-TRIGGER-108
+// REQ-TRIGGER-145
 #[test]
 fn linear_lifecycle_show_writes_the_view_unchanged_and_one_line_per_member() {
     let view = linear_lifecycle_body("skipped", Some("team_unmapped"));
@@ -6702,7 +4966,7 @@ fn linear_lifecycle_show_writes_the_view_unchanged_and_one_line_per_member() {
     server.finish();
 }
 
-// REQ-TRIGGER-108
+// REQ-TRIGGER-145
 #[test]
 fn linear_lifecycle_show_writes_the_latest_update_under_the_view() {
     let mut view = linear_lifecycle_body("awaiting_event", None);
@@ -6776,7 +5040,7 @@ fn linear_lifecycle_show_writes_the_latest_update_under_the_view() {
     server.finish();
 }
 
-// REQ-TRIGGER-108
+// REQ-TRIGGER-145
 #[test]
 fn linear_lifecycle_show_reports_absence_and_refuses_a_wrong_pair() {
     let (output, server) = linear_lifecycle_show(
@@ -6847,28 +5111,6 @@ fn lifecycle_history_page() -> serde_json::Value {
     })
 }
 
-fn lifecycle_retry_receipt() -> serde_json::Value {
-    serde_json::json!({
-        "runId": RUN_ID,
-        "updateId": LIFECYCLE_UPDATE_ID,
-        "cycleNumber": 2,
-        "acceptedAt": "2026-10-27T13:00:00Z",
-        "cycleDeadline": "2026-10-28T13:00:00Z"
-    })
-}
-
-fn lifecycle_retry_response(receipt: &serde_json::Value, key: &str) -> Vec<u8> {
-    http_response_with_headers(
-        "202 Accepted",
-        Some("application/json"),
-        &[
-            ("Idempotency-Key", key),
-            ("Cache-Control", "private, no-store"),
-        ],
-        &serde_json::to_vec(receipt).unwrap(),
-    )
-}
-
 fn lifecycle_problem(status: &str, problem: &str) -> Vec<u8> {
     let number: u16 = status.split(' ').next().unwrap().parse().unwrap();
     problem_http_response(
@@ -6881,7 +5123,7 @@ fn lifecycle_problem(status: &str, problem: &str) -> Vec<u8> {
     )
 }
 
-// REQ-TRIGGER-108, REQ-TRIGGER-118
+// REQ-TRIGGER-145
 #[test]
 fn linear_lifecycle_history_writes_the_page_unchanged_and_each_update_as_show_does() {
     let page = lifecycle_history_page();
@@ -6970,7 +5212,7 @@ fn linear_lifecycle_history_writes_the_page_unchanged_and_each_update_as_show_do
     server.finish();
 }
 
-// REQ-TRIGGER-108, REQ-TRIGGER-111, REQ-TRIGGER-118
+// REQ-TRIGGER-145
 #[test]
 fn linear_lifecycle_history_reports_absence_and_refuses_invalid_updates() {
     let (output, server) = linear_lifecycle_command(
@@ -7020,141 +5262,7 @@ fn linear_lifecycle_history_reports_absence_and_refuses_invalid_updates() {
     }
 }
 
-// REQ-TRIGGER-108, REQ-TRIGGER-119
-#[test]
-fn linear_lifecycle_retry_sends_one_keyed_post_and_writes_the_receipt() {
-    let receipt = lifecycle_retry_receipt();
-    let (output, server) = linear_lifecycle_command(
-        vec![lifecycle_retry_response(&receipt, "owner-key-1")],
-        &[
-            "retry",
-            ORGANIZATION,
-            RUN_ID,
-            LIFECYCLE_UPDATE_ID,
-            "--idempotency-key",
-            "owner-key-1",
-            "--json",
-        ],
-    );
-    assert!(output.status.success(), "{output:?}");
-    assert!(output.stderr.is_empty());
-    assert_eq!(
-        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap(),
-        serde_json::json!({
-            "schemaVersion": 1,
-            "operation": "retry",
-            "deployment": server.api_url,
-            "organizationRef": ORGANIZATION,
-            "runId": RUN_ID,
-            "outcome": "accepted",
-            "idempotencyKey": "owner-key-1",
-            "receipt": receipt,
-            "error": null
-        })
-    );
-    let requests = server.finish();
-    assert_eq!(requests.len(), 1);
-    assert!(requests[0].starts_with(&format!(
-        "POST /api/v1/organizations/{ORGANIZATION}/runs/{RUN_ID}/linear-lifecycle/updates/{LIFECYCLE_UPDATE_ID}/retry HTTP/1.1\r\n"
-    )));
-    assert_eq!(header_value(&requests[0], "idempotency-key"), "owner-key-1");
-    assert_eq!(requests[0].split("\r\n\r\n").nth(1), Some(""));
-
-    // The first connection closes without a response; the replay carries the same key.
-    let (output, server) = linear_lifecycle_command(
-        vec![
-            Vec::new(),
-            lifecycle_retry_response(&receipt, ECHO_IDEMPOTENCY_KEY),
-        ],
-        &["retry", ORGANIZATION, RUN_ID, LIFECYCLE_UPDATE_ID],
-    );
-    assert!(output.status.success(), "{output:?}");
-    let requests = server.finish();
-    assert_eq!(requests.len(), 2);
-    let key = header_value(&requests[0], "idempotency-key");
-    assert!(
-        key.len() == 64
-            && key
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
-        "{key:?}"
-    );
-    assert_eq!(header_value(&requests[1], "idempotency-key"), key);
-    let stdout = String::from_utf8(output.stdout).unwrap();
-    for field in [
-        format!("run: {RUN_ID}"),
-        format!("update: {LIFECYCLE_UPDATE_ID}"),
-        "cycle number: 2".to_owned(),
-        "accepted: 2026-10-27T13:00:00Z".to_owned(),
-        "cycle deadline: 2026-10-28T13:00:00Z".to_owned(),
-        format!("idempotency key: {key}"),
-    ] {
-        assert!(
-            stdout.lines().any(|line| line == field),
-            "missing {field:?} in {stdout:?}"
-        );
-    }
-}
-
-// REQ-TRIGGER-108, REQ-TRIGGER-119
-#[test]
-fn linear_lifecycle_retry_refuses_a_receipt_off_the_route_and_reports_rejections() {
-    let retry = ["retry", ORGANIZATION, RUN_ID, LIFECYCLE_UPDATE_ID, "--json"];
-    for (member, value) in [
-        ("runId", serde_json::json!("run_01k0z6r1w8f4jy2m7q9v3x5abe")),
-        ("updateId", serde_json::json!(LIFECYCLE_OLDER_UPDATE_ID)),
-        ("cycleNumber", serde_json::json!(1)),
-    ] {
-        let mut receipt = lifecycle_retry_receipt();
-        receipt[member] = value;
-        let (output, server) = linear_lifecycle_command(
-            vec![lifecycle_retry_response(&receipt, ECHO_IDEMPOTENCY_KEY)],
-            &retry,
-        );
-        assert_invalid_response(&output);
-        server.finish();
-    }
-    let (output, server) = linear_lifecycle_command(
-        vec![lifecycle_retry_response(
-            &lifecycle_retry_receipt(),
-            "another-key",
-        )],
-        &retry,
-    );
-    assert_invalid_response(&output);
-    server.finish();
-
-    for (response, outcome) in [
-        (
-            lifecycle_problem("409 Conflict", "linear-lifecycle-retry-conflict"),
-            "conflict",
-        ),
-        (lifecycle_problem("404 Not Found", "not-found"), "not_found"),
-    ] {
-        let (output, server) = linear_lifecycle_command(vec![response], &retry);
-        assert_eq!(output.status.code(), Some(1), "{output:?}");
-        let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-        assert_eq!(result["operation"], "retry");
-        assert_eq!(result["outcome"], outcome);
-        assert!(result["receipt"].is_null());
-        assert_eq!(server.finish().len(), 1);
-    }
-
-    let output = run(&[
-        "run",
-        "linear",
-        "retry",
-        ORGANIZATION,
-        RUN_ID,
-        LIFECYCLE_UPDATE_ID,
-        "--idempotency-key",
-        "two words",
-    ]);
-    assert_eq!(output.status.code(), Some(2));
-    assert!(output.stdout.is_empty());
-}
-
-// REQ-RUN-59, REQ-TRIGGER-108
+// REQ-RUN-59, REQ-TRIGGER-145
 #[test]
 fn run_show_carries_the_linear_lifecycle_binding_only_when_present() {
     let mut body = run_body();
@@ -7741,225 +5849,6 @@ fn pre_dispatch_refresh_outage_is_not_run_acceptance_unknown() {
     }
 }
 
-const WORKSPACE_COMMIT: &str = "a3d0e2d3abc0bf0742be096155f683bf985e485a";
-const CREATE_REQUEST_ID: &str = "req_01m622k6qsf09npetkmdkdj51j";
-
-fn create_args_with_workspace_commit(json: bool) -> Vec<&'static str> {
-    let mut args = create_args(json);
-    let insertion = args.len() - 1;
-    args.splice(
-        insertion..insertion,
-        ["--workspace-commit", WORKSPACE_COMMIT],
-    );
-    args
-}
-
-fn create_problem_response(status: &str, kind: &str, request_id: Option<&str>) -> Vec<u8> {
-    let status_number: u16 = status.split(' ').next().unwrap().parse().unwrap();
-    let body = serde_json::json!({
-        "type": format!("https://api.usefulmachinery.com/problems/{kind}"),
-        "title": "server title sentinel",
-        "status": status_number,
-        "detail": "server detail sentinel"
-    });
-    let headers: Vec<(&str, &str)> = request_id
-        .map(|id| ("X-Request-ID", id))
-        .into_iter()
-        .collect();
-    http_response_with_headers(
-        status,
-        Some("application/problem+json"),
-        &headers,
-        &serde_json::to_vec(&body).unwrap(),
-    )
-}
-
-// REQ-RUN-80
-#[test]
-fn unsupported_workspace_selection_is_a_definite_admission_rejection() {
-    for json in [false, true] {
-        let (server, _directory, credential_path) = prepared_run(vec![create_problem_response(
-            "409 Conflict",
-            "workspace-selection-unsupported",
-            Some(CREATE_REQUEST_ID),
-        )]);
-        let output = run_with_env(
-            &create_args_with_workspace_commit(json),
-            &deployment_environment(&server.api_url, &credential_path),
-        );
-        assert_eq!(output.status.code(), Some(1));
-        if json {
-            let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-            assert_eq!(result["operation"], "create");
-            assert_eq!(result["outcome"], "error");
-            assert!(result["runId"].is_null());
-            assert_eq!(result["error"]["code"], "admission_rejected");
-            assert_eq!(result["error"]["httpStatus"], 409);
-            assert_eq!(
-                result["error"]["problemType"],
-                "https://api.usefulmachinery.com/problems/workspace-selection-unsupported"
-            );
-            assert_eq!(result["error"]["correlationId"], CREATE_REQUEST_ID);
-        } else {
-            assert!(output.stdout.is_empty());
-            let diagnostic = String::from_utf8_lossy(&output.stderr);
-            assert!(
-                diagnostic.contains(
-                    "https://api.usefulmachinery.com/problems/workspace-selection-unsupported"
-                ) && diagnostic.contains(CREATE_REQUEST_ID)
-                    && diagnostic.contains("HTTP 409"),
-                "{diagnostic}"
-            );
-            assert!(!diagnostic.contains("acceptance_unknown"), "{diagnostic}");
-        }
-        assert_no_secret_output(
-            &output,
-            &["server title sentinel", "server detail sentinel"],
-        );
-        let requests = server.finish();
-        assert_eq!(requests.len(), 1);
-        assert!(requests[0].contains(WORKSPACE_COMMIT));
-    }
-}
-
-// REQ-RUN-80
-#[test]
-fn admission_rejection_without_request_id_omits_correlation_id() {
-    let (server, _directory, credential_path) = prepared_run(vec![create_problem_response(
-        "422 Unprocessable Entity",
-        "workflow-source-invalid",
-        None,
-    )]);
-    let output = run_with_env(
-        &create_args(true),
-        &deployment_environment(&server.api_url, &credential_path),
-    );
-    assert_eq!(output.status.code(), Some(1));
-    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(result["outcome"], "error");
-    assert_eq!(result["error"]["code"], "admission_rejected");
-    assert_eq!(result["error"]["httpStatus"], 422);
-    assert_eq!(
-        result["error"]["problemType"],
-        "https://api.usefulmachinery.com/problems/workflow-source-invalid"
-    );
-    // The member is omitted, not null, like `httpStatus` and `problemType` outside a rejection.
-    assert!(result["error"].get("correlationId").is_none());
-    assert_eq!(server.finish().len(), 1);
-}
-
-// REQ-RUN-57
-#[test]
-fn create_server_error_after_dispatch_remains_acceptance_unknown() {
-    let (server, _directory, credential_path) = prepared_run(vec![create_problem_response(
-        "503 Service Unavailable",
-        "source-resolution-unavailable",
-        Some(CREATE_REQUEST_ID),
-    )]);
-    let output = run_with_env(
-        &create_args_with_workspace_commit(true),
-        &deployment_environment(&server.api_url, &credential_path),
-    );
-    assert_eq!(output.status.code(), Some(4));
-    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(result["outcome"], "acceptance_unknown");
-    assert_eq!(result["error"]["code"], "acceptance_unknown");
-    let requests = server.finish();
-    assert_eq!(requests.len(), 1);
-    assert_eq!(
-        result["error"]["idempotencyKey"],
-        header_value(&requests[0], "idempotency-key")
-    );
-}
-
-// REQ-RUN-57
-#[test]
-fn invalid_create_acceptance_in_plain_mode_retains_reconciliation_key() {
-    let (server, _directory, credential_path) = prepared_run(vec![acceptance_response_for(
-        "202 Accepted",
-        RUN_ID,
-        false,
-        &[],
-    )]);
-    let output = run_with_env(
-        &create_args(false),
-        &deployment_environment(&server.api_url, &credential_path),
-    );
-    assert_eq!(output.status.code(), Some(4));
-    assert!(output.stdout.is_empty());
-    let requests = server.finish();
-    assert_eq!(requests.len(), 1);
-    let key = header_value(&requests[0], "idempotency-key");
-    let stderr = String::from_utf8(output.stderr).unwrap();
-    assert!(stderr.contains("acceptance_unknown"));
-    assert!(stderr.contains(&format!("idempotency key: {key}")));
-}
-
-#[test]
-fn run_create_rejects_malformed_success_envelopes() {
-    let cases = [
-        acceptance_response_for("202 Accepted", RUN_ID, false, &[]),
-        acceptance_response_for(
-            "201 Created",
-            RUN_ID,
-            false,
-            &[
-                ("Idempotency-Key", ECHO_IDEMPOTENCY_KEY),
-                (
-                    "Location",
-                    "/v1/organizations/acme-research/runs/run_01k0z6r1w8f4jy2m7q9v3x5abc",
-                ),
-            ],
-        ),
-        acceptance_response_for(
-            "202 Accepted",
-            RUN_ID,
-            false,
-            &[
-                ("Idempotency-Key", "mismatched-request-key"),
-                (
-                    "Location",
-                    "/v1/organizations/acme-research/runs/run_01k0z6r1w8f4jy2m7q9v3x5abc",
-                ),
-            ],
-        ),
-        acceptance_response_for(
-            "202 Accepted",
-            RUN_ID,
-            false,
-            &[
-                ("Idempotency-Key", ECHO_IDEMPOTENCY_KEY),
-                ("Idempotency-Key", ECHO_IDEMPOTENCY_KEY),
-                (
-                    "Location",
-                    "/v1/organizations/acme-research/runs/run_01k0z6r1w8f4jy2m7q9v3x5abc",
-                ),
-            ],
-        ),
-        acceptance_response_for(
-            "202 Accepted",
-            RUN_ID,
-            false,
-            &[
-                ("Idempotency-Key", ECHO_IDEMPOTENCY_KEY),
-                (
-                    "Location",
-                    "/v1/organizations/acme-research/runs/run_01k0z6r1w8f4jy2m7q9v3x5abd",
-                ),
-            ],
-        ),
-    ];
-    for response in cases {
-        let (server, _directory, credential_path) = prepared_run(vec![response]);
-        let environment = deployment_environment(&server.api_url, &credential_path);
-
-        let output = run_with_env(&create_args(true), &environment);
-
-        assert_invalid_response(&output);
-        server.finish();
-    }
-}
-
 #[test]
 fn run_operations_reject_responses_larger_than_the_api_limit() {
     let mut create_body = acceptance_body(RUN_ID, false);
@@ -8287,80 +6176,6 @@ fn signals_stop_only_active_cloud_run_show_observation() {
     }
 }
 
-// REQ-RUN-57
-#[cfg(target_os = "linux")]
-#[test]
-fn signalled_create_reports_unknown_commitment_without_exposing_credentials() {
-    for (signal, expected_exit) in [
-        (rustix::process::Signal::INT, 130),
-        (rustix::process::Signal::TERM, 143),
-    ] {
-        for json in [true, false] {
-            let mut server =
-                ScriptedServer::respond_with_paused_first_response(vec![acceptance_response(
-                    false,
-                )]);
-            let credential_directory = private_credential_directory();
-            let credential_path = credential_directory.path().join("credentials.json");
-            write_credential_fixture(
-                &credential_path,
-                &server.api_url,
-                TOKEN,
-                "2999-01-01T00:00:00Z",
-            );
-            let environment =
-                deployment_environment(&server.api_url, credential_path.to_str().unwrap());
-            let mut command = Command::new(env!("CARGO_BIN_EXE_um"));
-            command
-                .args(create_args(json))
-                .stdin(Stdio::null())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .env_remove(CREDENTIALS_FILE_VARIABLE);
-            for variable in DEPLOYMENT_VARIABLES {
-                command.env_remove(variable);
-            }
-            for (name, value) in environment {
-                command.env(name, value);
-            }
-            let child = command.spawn().unwrap();
-            let request = server.next_request();
-            assert!(request.starts_with("POST /api/v1/organizations/"));
-
-            rustix::process::kill_process(
-                rustix::process::Pid::from_raw(i32::try_from(child.id()).unwrap()).unwrap(),
-                signal,
-            )
-            .unwrap();
-            let output = child.wait_with_output().unwrap();
-            server.release_paused_response();
-
-            assert_eq!(output.status.code(), Some(expected_exit));
-            let key = header_value(&request, "idempotency-key");
-            if json {
-                assert!(output.stderr.is_empty());
-                let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-                assert_eq!(result["outcome"], "acceptance_unknown");
-                assert_eq!(result["error"]["code"], "acceptance_unknown");
-                assert_eq!(result["error"]["idempotencyKey"], key);
-                assert_eq!(result["organizationRef"], ORGANIZATION);
-                assert!(result["runId"].is_null());
-            } else {
-                assert!(output.stdout.is_empty());
-                let diagnostic = String::from_utf8_lossy(&output.stderr);
-                assert!(
-                    diagnostic
-                        .lines()
-                        .any(|line| line == format!("idempotency key: {key}"))
-                );
-                assert!(diagnostic.contains("commitment: unknown"));
-            }
-            assert_no_secret_output(&output, &[TOKEN]);
-            assert!(server.finish().is_empty());
-        }
-    }
-}
-
 #[cfg(target_os = "linux")]
 #[test]
 fn signalled_input_set_create_reports_unknown_without_an_invented_id() {
@@ -8511,83 +6326,888 @@ fn signalled_input_set_seal_reports_one_unknown_receipt() {
     assert!(server.finish().is_empty());
 }
 
-#[cfg(target_os = "linux")]
-#[test]
-fn interruption_during_text_input_upload_never_claims_run_acceptance() {
-    for json in [true, false] {
-        let input_bytes = b"private interrupted named input sentinel\n";
-        let input_directory = tempfile::tempdir().unwrap();
-        let input_path = input_directory.path().join("request.txt");
-        fs::write(&input_path, input_bytes).unwrap();
-        let mut storage =
-            ScriptedServer::respond_with_paused_first_response(vec![http_response_with_headers(
-                "204 No Content",
-                None,
-                &[],
-                b"",
-            )]);
-        let signed_url = format!(
-            "{}/private/request?signature=unique-interrupted-capability-sentinel",
-            storage.api_url
-        );
-        let (server, _credential_directory, credential_path) = prepared_run(vec![
-            create_input_set_response(input_bytes, false),
-            upload_capability_response(input_bytes, &signed_url),
-        ]);
-        let environment = deployment_environment(&server.api_url, &credential_path);
-        let mut command = Command::new(env!("CARGO_BIN_EXE_um"));
-        command
-            .args(create_args_with_text_input(
-                "request",
-                input_path.to_str().unwrap(),
-                json,
-            ))
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .env_remove(CREDENTIALS_FILE_VARIABLE);
-        for variable in DEPLOYMENT_VARIABLES {
-            command.env_remove(variable);
-        }
-        for (name, value) in environment {
-            command.env(name, value);
-        }
-        let child = command.spawn().unwrap();
-        let upload = storage.next_request();
-        assert!(upload.starts_with("PUT "));
-        assert!(!upload.contains("authorization:"));
+/// `um workflow run show RUN --cloud ORGANIZATION`, `um workflow run release RUN --cloud
+/// ORGANIZATION` and the control leaves with `--cloud` against the scripted Gateway the `um
+/// run` tests use: `RUN` is a Cloud run id, and nothing under the `um` home is read or
+/// written.
+mod workflow_run_cloud {
+    use super::*;
 
-        rustix::process::kill_process(
-            rustix::process::Pid::from_raw(i32::try_from(child.id()).unwrap()).unwrap(),
-            rustix::process::Signal::INT,
-        )
-        .unwrap();
-        let output = child.wait_with_output().unwrap();
-        storage.release_paused_response();
+    const DEFINITION_ID: &str = "def_01k0z6r1w8f4jy2m7q9v3x5abc";
+    const CLAIM_ID: &str = "wsc_01k0z6r1w8f4jy2m7q9v3x5abc";
+    const APPLIED_DELIVERY: &str = "wtd_01k0z6r1w8f4jy2m7q9v3x5abd";
+    const SKIPPED_DELIVERY: &str = "wtd_01k0z6r1w8f4jy2m7q9v3x5abc";
+    const TREE_DIGEST: &str =
+        "sha256:89abcdef0123456789abcdef0123456789abcdef0123456789abcdef01234567";
 
-        assert_eq!(output.status.code(), Some(130));
-        let diagnostic = String::from_utf8_lossy(&output.stderr);
-        assert!(diagnostic.contains(&format!("input set: {INPUT_SET_ID}")));
-        assert!(diagnostic.contains("run input-set show"));
-        if json {
-            let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-            assert_eq!(result["outcome"], "acceptance_unknown");
-            assert_eq!(result["error"]["code"], "acceptance_unknown");
-            assert!(result["runId"].is_null());
-            assert!(result.get("inputSetId").is_none());
-            assert_eq!(result["organizationRef"], ORGANIZATION);
-        } else {
-            assert!(output.stdout.is_empty());
-        }
-        assert_no_secret_output(
-            &output,
-            &[
-                TOKEN,
-                "unique-interrupted-capability-sentinel",
-                std::str::from_utf8(input_bytes).unwrap(),
+    /// A definition-backed run whose current attempt exited `planned` after it waited on an
+    /// answer, holding its subject's claim.
+    fn definition_run() -> serde_json::Value {
+        let mut run = run_body_with_state("succeeded");
+        run["definition"] = serde_json::json!({
+            "definitionId": DEFINITION_ID, "revision": 3,
+            "treeDigest": TREE_DIGEST, "workflowPath": "workflow.yaml",
+        });
+        run["subjectClaim"] = serde_json::json!({
+            "claimId": CLAIM_ID, "subject": "AUTO-7", "state": "held", "releaseCause": null,
+        });
+        run["workflowState"] = serde_json::json!("exited");
+        run["workflowOutcome"] = serde_json::json!("planned");
+        run["workflowProgress"] = serde_json::json!({
+            "attempt": 2,
+            "position": ["design", {"item": 1}, "review"],
+            "wait": {"kind": "answer", "since": "2026-08-10T12:03:00Z", "step": ["design", {"item": 1}, "review"]},
+            "reportedAt": "2026-08-10T12:03:01Z",
+        });
+        run["exits"] = serde_json::json!([{
+            "attemptNumber": 2,
+            "workflowOutcome": "planned",
+            "mirror": [
+                {"hook": "outcome", "at": "2026-08-10T12:04:00Z", "issue": "AUTO-7",
+                 "action": {"kind": "comment", "body": "Planned"}, "outcome": "written"},
+                {"hook": "outcome", "at": "2026-08-10T12:04:01Z", "issue": "AUTO-7",
+                 "action": {"kind": "state", "state": "Planned", "binding": "plannedState"},
+                 "outcome": "failed", "code": "mirror_write_rejected"},
             ],
+            "claimRelease": false,
+        }]);
+        run
+    }
+
+    fn delivery(id: &str, state: &str) -> serde_json::Value {
+        let applied = state == "applied";
+        serde_json::json!({
+            "id": id, "definitionId": DEFINITION_ID, "revision": 3,
+            "triggerName": if applied { "cancel-on-close" } else { "withdraw-on-hold" },
+            "connectionId": "lnc_01k0z6r1w8f4jy2m7q9v3x5abc",
+            "eventName": "issue.state_entered",
+            "event": {
+                "issue": {"id": "issue-7", "identifier": "AUTO-7"},
+                "issueUpdatedAt": "2026-08-10T12:04:30Z", "team": "team-1",
+                "state": "state-closed", "actor": null, "at": "2026-08-10T12:04:30Z",
+            },
+            "claim": {"claimId": CLAIM_ID, "issueId": "issue-7",
+                      "observation": {"teamId": "team-1", "stateId": "state-todo", "updatedAt": null}},
+            "state": state,
+            "action": if applied { serde_json::json!("cancel") } else { serde_json::Value::Null },
+            "reason": if applied { serde_json::Value::Null } else { serde_json::json!("run_exited") },
+            "observation": null,
+            "acceptedAt": "2026-08-10T12:04:31Z",
+            "deliveredAt": "2026-08-10T12:04:32Z",
+            "settledAt": "2026-08-10T12:04:33Z",
+        })
+    }
+
+    fn deliveries_response(more: bool) -> Vec<u8> {
+        let mut page = serde_json::json!({
+            "items": [delivery(APPLIED_DELIVERY, "applied"), delivery(SKIPPED_DELIVERY, "skipped")],
+        });
+        if more {
+            page["nextCursor"] = serde_json::json!("older-deliveries");
+        }
+        run_response(page)
+    }
+
+    fn released_claim() -> Vec<u8> {
+        http_response_with_headers(
+            "200 OK",
+            Some("application/json"),
+            &[
+                ("Cache-Control", "private, no-store"),
+                (
+                    "Idempotency-Key",
+                    api_test_support::REQUEST_IDEMPOTENCY_KEY_ECHO,
+                ),
+            ],
+            &serde_json::to_vec(&serde_json::json!({
+                "claimId": CLAIM_ID, "subject": "AUTO-7", "state": "released",
+                "releaseCause": "owner",
+            }))
+            .unwrap(),
+        )
+    }
+
+    fn conflict(slug: &str) -> Vec<u8> {
+        problem_http_response(
+            "409 Conflict",
+            serde_json::json!({
+                "type": format!("https://api.usefulmachinery.com/problems/{slug}"),
+                "title": "Conflict", "status": 409,
+            }),
+        )
+    }
+
+    /// `um workflow run LEAF RUN --cloud ORGANIZATION ARGS --allow-insecure-http` against a
+    /// Gateway answering `responses` in order, with `UM_HOME` at `home`: the output and the
+    /// requests served.
+    fn cloud(
+        leaf: &str,
+        run: &str,
+        args: &[&str],
+        responses: Vec<Vec<u8>>,
+        home: &std::path::Path,
+    ) -> (Output, Vec<String>) {
+        let (server, _directory, credential_path) = prepared_run(responses);
+        let mut environment = deployment_environment(&server.api_url, &credential_path).to_vec();
+        environment.push(("UM_HOME", home.to_str().unwrap()));
+        let mut all = vec!["workflow", "run", leaf, run, "--cloud", ORGANIZATION];
+        all.extend_from_slice(args);
+        all.push("--allow-insecure-http");
+        let output = run_with_env(&all, &environment);
+        assert_no_secret_output(&output, &[TOKEN]);
+        (output, server.finish())
+    }
+
+    fn document(output: &Output) -> serde_json::Value {
+        serde_json::from_slice(&output.stdout).unwrap_or_else(|_| panic!("{output:?}"))
+    }
+
+    fn route(request: &str) -> &str {
+        request
+            .lines()
+            .next()
+            .unwrap()
+            .trim_end_matches(" HTTP/1.1")
+    }
+
+    // REQ-RUN-96, REQ-RUN-87, REQ-RUN-88, REQ-LOCALRUN-189, REQ-LOCALRUN-180: Cloud show
+    // reads the run and the newest page of its deliveries, and reports the definition
+    // identity, claim, workflow state and outcome, progress, exits and deliveries.
+    #[test]
+    fn cloud_show_reports_a_definition_runs_identity_observations_and_deliveries() {
+        let home = tempfile::tempdir().unwrap();
+        let (output, requests) = cloud(
+            "show",
+            RUN_ID,
+            &["--json"],
+            vec![run_response(definition_run()), deliveries_response(true)],
+            home.path(),
         );
-        assert_eq!(server.finish().len(), 2);
-        assert!(storage.finish().is_empty());
+        assert_eq!(output.status.code(), Some(0), "{output:?}");
+        assert_eq!(
+            requests
+                .iter()
+                .map(|request| route(request))
+                .collect::<Vec<_>>(),
+            [
+                format!("GET /api/v1/organizations/{ORGANIZATION}/runs/{RUN_ID}"),
+                format!(
+                    "GET /api/v1/organizations/{ORGANIZATION}/runs/{RUN_ID}/trigger-deliveries?limit=100"
+                ),
+            ]
+        );
+        let shown = document(&output);
+        assert_eq!(shown["command"], "um workflow run show");
+        assert_eq!(shown["outcome"], "shown");
+        assert_eq!(shown["exitStatus"], 0);
+        assert_eq!(shown["organizationRef"], ORGANIZATION);
+        assert!(shown.get("runDirectory").is_none(), "{shown}");
+        let fixture = definition_run();
+        let run = &shown["run"];
+        assert_eq!(run["id"], RUN_ID);
+        assert_eq!(run["state"], "succeeded");
+        for field in [
+            "definition",
+            "subjectClaim",
+            "workflowState",
+            "workflowOutcome",
+            "workflowProgress",
+            "exits",
+        ] {
+            assert_eq!(run[field], fixture[field], "{field}");
+        }
+        let deliveries = shown["deliveries"].as_array().unwrap();
+        assert_eq!(
+            deliveries
+                .iter()
+                .map(|delivery| (&delivery["id"], &delivery["state"], &delivery["action"]))
+                .collect::<Vec<_>>(),
+            [
+                (
+                    &serde_json::json!(APPLIED_DELIVERY),
+                    &serde_json::json!("applied"),
+                    &serde_json::json!("cancel")
+                ),
+                (
+                    &serde_json::json!(SKIPPED_DELIVERY),
+                    &serde_json::json!("skipped"),
+                    &serde_json::Value::Null
+                ),
+            ]
+        );
+        assert_eq!(shown["moreDeliveries"], true);
+        assert_eq!(std::fs::read_dir(home.path()).unwrap().count(), 0);
+
+        let (output, _) = cloud(
+            "show",
+            RUN_ID,
+            &[],
+            vec![run_response(definition_run()), deliveries_response(false)],
+            home.path(),
+        );
+        assert_eq!(output.status.code(), Some(0), "{output:?}");
+        let text = String::from_utf8(output.stdout).unwrap();
+        for fact in [
+            RUN_ID,
+            DEFINITION_ID,
+            TREE_DIGEST,
+            "workflow.yaml",
+            CLAIM_ID,
+            "AUTO-7",
+            "held",
+            "exited",
+            "planned",
+            "answer",
+            "design.1.review",
+            "mirror_write_rejected",
+            APPLIED_DELIVERY,
+            "cancel-on-close",
+            "cancel",
+            SKIPPED_DELIVERY,
+            "run_exited",
+            "2026-08-10T12:04:31Z",
+        ] {
+            assert!(text.contains(fact), "{fact} missing from {text}");
+        }
+    }
+
+    const OWNER: &str = "prn_01k0z6r1w8f4jy2m7q9v3x5abd";
+    const PERSONAL_POOL: &str = "rpl_01k0z6r1w8f4jy2m7q9v3x5abd";
+    const LAST_SEEN: &str = "2026-08-10T11:40:00Z";
+
+    /// A queued run its owner's trigger started, routed to her personal pool, whose only
+    /// runner Cloud last saw at `LAST_SEEN`.
+    fn queued_owned_run(waiting: serde_json::Value) -> serde_json::Value {
+        let mut run = run_body_with_state("queued");
+        run["owner"] = serde_json::json!(OWNER);
+        run["routing"] = serde_json::json!({
+            "policyVersion": 1, "rule": "owner_personal_pool",
+            "pools": [{"id": PERSONAL_POOL, "name": "ada-laptop"}],
+        });
+        run["observation"] = serde_json::json!({
+            "observedAt": "2026-08-10T12:05:00Z", "placement": null, "assignment": null,
+            "lastTransition": null, "lastDecline": null, "waiting": waiting,
+        });
+        run
+    }
+
+    fn offline_since_last_seen() -> serde_json::Value {
+        serde_json::json!({"reason": "runners_offline", "since": LAST_SEEN})
+    }
+
+    /// The value of the human report's `key: value` line, if it printed one.
+    fn reported<'a>(text: &'a str, key: &str) -> Option<&'a str> {
+        text.lines()
+            .find_map(|line| line.trim_start().strip_prefix(key)?.strip_prefix(": "))
+    }
+
+    /// Asserts the report names the queued owned run's owner, rule, pool and, in words,
+    /// that its runners are offline since `LAST_SEEN`.
+    fn assert_reports_owned_route(text: &str) {
+        assert_eq!(reported(text, "owner"), Some(OWNER), "{text}");
+        let routing = reported(text, "routing").unwrap_or_else(|| panic!("{text}"));
+        assert!(routing.contains("owner_personal_pool"), "{text}");
+        let pools = reported(text, "pools").unwrap_or_else(|| panic!("{text}"));
+        assert!(
+            pools.contains(PERSONAL_POOL) && pools.contains("ada-laptop"),
+            "{text}"
+        );
+        let waiting = reported(text, "waiting").unwrap_or_else(|| panic!("{text}"));
+        assert!(waiting.contains(LAST_SEEN), "{text}");
+        assert!(!waiting.contains("runners_offline"), "{text}");
+    }
+
+    // REQ-RUN-101, SC-RUN-7: Cloud show names a run's owner, the rule that routed it, the
+    // pools it may use and, while it is queued, what it waits for in words; it says when a
+    // run has no owner or route, shows an unrecognized reason as given, and passes all
+    // three through under --json as received.
+    #[test]
+    fn cloud_show_reports_a_runs_owner_route_and_what_it_waits_for() {
+        let home = tempfile::tempdir().unwrap();
+        let fixture = queued_owned_run(offline_since_last_seen());
+        let (output, _) = cloud(
+            "show",
+            RUN_ID,
+            &["--json"],
+            vec![run_response(fixture.clone())],
+            home.path(),
+        );
+        assert_eq!(output.status.code(), Some(0), "{output:?}");
+        let run = &document(&output)["run"];
+        assert_eq!(run["owner"], fixture["owner"]);
+        assert_eq!(run["routing"], fixture["routing"]);
+        assert_eq!(
+            run["observation"]["waiting"],
+            fixture["observation"]["waiting"]
+        );
+
+        let (output, _) = cloud(
+            "show",
+            RUN_ID,
+            &[],
+            vec![run_response(fixture)],
+            home.path(),
+        );
+        assert_eq!(output.status.code(), Some(0), "{output:?}");
+        assert_reports_owned_route(&String::from_utf8(output.stdout).unwrap());
+
+        let mut unowned = queued_owned_run(serde_json::Value::Null);
+        unowned["owner"] = serde_json::Value::Null;
+        unowned["routing"] = serde_json::Value::Null;
+        let (output, _) = cloud(
+            "show",
+            RUN_ID,
+            &["--json"],
+            vec![run_response(unowned.clone())],
+            home.path(),
+        );
+        assert_eq!(output.status.code(), Some(0), "{output:?}");
+        let run = &document(&output)["run"];
+        for field in ["owner", "routing"] {
+            assert_eq!(run.get(field), Some(&serde_json::Value::Null), "{field}");
+        }
+        assert_eq!(
+            run["observation"].get("waiting"),
+            Some(&serde_json::Value::Null)
+        );
+        let (output, _) = cloud(
+            "show",
+            RUN_ID,
+            &[],
+            vec![run_response(unowned)],
+            home.path(),
+        );
+        assert_eq!(output.status.code(), Some(0), "{output:?}");
+        let text = String::from_utf8(output.stdout).unwrap();
+        assert_eq!(reported(&text, "owner"), Some("none"), "{text}");
+        assert_eq!(reported(&text, "routing"), Some("none"), "{text}");
+        assert_eq!(reported(&text, "waiting"), None, "{text}");
+
+        let unrecognized = queued_owned_run(serde_json::json!({"reason": "runners_asleep"}));
+        let (output, _) = cloud(
+            "show",
+            RUN_ID,
+            &[],
+            vec![run_response(unrecognized)],
+            home.path(),
+        );
+        assert_eq!(output.status.code(), Some(0), "{output:?}");
+        let text = String::from_utf8(output.stdout).unwrap();
+        assert_eq!(reported(&text, "waiting"), Some("runners_asleep"), "{text}");
+    }
+
+    // REQ-RUN-101: `um run show` names the same owner, route and waiting reason.
+    #[test]
+    fn run_show_reports_a_runs_owner_route_and_what_it_waits_for() {
+        let (server, _directory, credential_path) = prepared_run(vec![run_response(
+            queued_owned_run(offline_since_last_seen()),
+        )]);
+        let environment = deployment_environment(&server.api_url, &credential_path);
+        let output = run_with_env(
+            &["run", "show", ORGANIZATION, RUN_ID, "--allow-insecure-http"],
+            &environment,
+        );
+        assert_eq!(output.status.code(), Some(0), "{output:?}");
+        assert_reports_owned_route(&String::from_utf8(output.stdout).unwrap());
+        server.finish();
+    }
+
+    // REQ-RUN-96, REQ-RUN-87, REQ-RUN-88: a run by `workflowPath` reads no deliveries, and
+    // the observations its read leaves out are null, not absent.
+    #[test]
+    fn cloud_show_of_a_path_run_reads_no_deliveries_and_reports_unknown_fields_as_null() {
+        let home = tempfile::tempdir().unwrap();
+        let (output, requests) = cloud(
+            "show",
+            RUN_ID,
+            &["--json"],
+            vec![run_response(run_body())],
+            home.path(),
+        );
+        assert_eq!(output.status.code(), Some(0), "{output:?}");
+        assert_eq!(requests.len(), 1);
+        let shown = document(&output);
+        for field in [
+            "definition",
+            "subjectClaim",
+            "workflowState",
+            "workflowOutcome",
+            "workflowProgress",
+            "exits",
+        ] {
+            let value = shown["run"].get(field);
+            assert_eq!(value, Some(&serde_json::Value::Null), "{field}: {shown}");
+        }
+        assert_eq!(shown["deliveries"], serde_json::Value::Null);
+        assert_eq!(shown["moreDeliveries"], false);
+
+        let (output, _) = cloud(
+            "show",
+            RUN_ID,
+            &[],
+            vec![run_response(run_body())],
+            home.path(),
+        );
+        assert_eq!(output.status.code(), Some(0), "{output:?}");
+        assert!(String::from_utf8(output.stdout).unwrap().contains(RUN_ID));
+    }
+
+    // REQ-LOCALRUN-189: a run Cloud does not find is refused without reading any local run.
+    #[test]
+    fn cloud_show_reports_a_missing_run_and_a_rejected_session() {
+        let home = tempfile::tempdir().unwrap();
+        let (output, _) = cloud(
+            "show",
+            RUN_ID,
+            &["--json"],
+            vec![problem_http_response(
+                "404 Not Found",
+                serde_json::json!({"type": "https://api.usefulmachinery.com/problems/not-found", "title": "Not Found", "status": 404}),
+            )],
+            home.path(),
+        );
+        assert_eq!(output.status.code(), Some(1), "{output:?}");
+        let refused = document(&output);
+        assert_eq!(refused["outcome"], "refused");
+        assert_eq!(refused["exitStatus"], 1);
+        assert_eq!(refused["diagnostics"][0]["code"], "not_found");
+    }
+
+    // REQ-CLOUDDEF-19, REQ-LOCALRUN-187: Cloud release asks Cloud to release the run's
+    // current claim under one fresh key, sent again when the response is lost, and reports
+    // the released claim.
+    #[test]
+    fn cloud_release_sends_one_keyed_claim_release_and_reports_the_claim() {
+        let home = tempfile::tempdir().unwrap();
+        let (output, requests) = cloud(
+            "release",
+            RUN_ID,
+            &["--json"],
+            vec![Vec::new(), released_claim()],
+            home.path(),
+        );
+        assert_eq!(output.status.code(), Some(0), "{output:?}");
+        assert_eq!(requests.len(), 2);
+        for request in &requests {
+            assert_eq!(
+                route(request),
+                format!("POST /api/v1/organizations/{ORGANIZATION}/runs/{RUN_ID}/claim-release")
+            );
+            assert_eq!(request.split("\r\n\r\n").nth(1), Some("{}"));
+        }
+        let key = header_value(&requests[0], "idempotency-key");
+        assert!(!key.is_empty());
+        assert_eq!(header_value(&requests[1], "idempotency-key"), key);
+        let released = document(&output);
+        assert_eq!(released["command"], "um workflow run release");
+        assert_eq!(released["outcome"], "released");
+        assert_eq!(released["exitStatus"], 0);
+        assert_eq!(released["runId"], RUN_ID);
+        assert_eq!(released["claim"]["claimId"], CLAIM_ID);
+        assert_eq!(released["claim"]["state"], "released");
+        assert_eq!(released["claim"]["releaseCause"], "owner");
+        assert_eq!(std::fs::read_dir(home.path()).unwrap().count(), 0);
+
+        let (output, requests) = cloud("release", RUN_ID, &[], vec![released_claim()], home.path());
+        assert_eq!(output.status.code(), Some(0), "{output:?}");
+        assert_eq!(requests.len(), 1);
+        let text = String::from_utf8(output.stdout).unwrap();
+        assert!(text.contains(CLAIM_ID) && text.contains("owner"), "{text}");
+    }
+
+    // REQ-CLOUDDEF-19, REQ-LOCALRUN-187, REQ-LOCALRUN-189: a live run's claim, a changed
+    // claim, a reused key and a member's release are refused with exit 1, and show or release
+    // without a session exits 3.
+    #[test]
+    fn cloud_release_refusals_name_their_cause() {
+        let home = tempfile::tempdir().unwrap();
+        for (response, code) in [
+            (conflict("claim-live"), "claim_live"),
+            (conflict("claim-changed"), "claim_changed"),
+            (conflict("idempotency-conflict"), "idempotency_conflict"),
+            (
+                problem_http_response(
+                    "403 Forbidden",
+                    serde_json::json!({"type": "https://api.usefulmachinery.com/problems/forbidden", "title": "Forbidden", "status": 403}),
+                ),
+                "forbidden",
+            ),
+        ] {
+            let (output, requests) = cloud(
+                "release",
+                RUN_ID,
+                &["--json"],
+                vec![response.clone()],
+                home.path(),
+            );
+            assert_eq!(output.status.code(), Some(1), "{code}: {output:?}");
+            assert_eq!(requests.len(), 1);
+            let refused = document(&output);
+            assert_eq!(refused["outcome"], "refused", "{refused}");
+            assert_eq!(refused["exitStatus"], 1);
+            assert_eq!(refused["diagnostics"][0]["code"], code, "{refused}");
+
+            let (output, _) = cloud("release", RUN_ID, &[], vec![response], home.path());
+            assert_eq!(output.status.code(), Some(1), "{code}: {output:?}");
+            assert!(output.stdout.is_empty());
+            assert!(String::from_utf8(output.stderr).unwrap().contains(code));
+        }
+        for leaf in ["show", "release"] {
+            let output = run(&[
+                "workflow",
+                "run",
+                leaf,
+                RUN_ID,
+                "--cloud",
+                ORGANIZATION,
+                "--json",
+            ]);
+            assert_eq!(output.status.code(), Some(3), "{leaf}: {output:?}");
+            assert_eq!(
+                document(&output)["diagnostics"][0]["code"],
+                "authentication_required"
+            );
+        }
+        assert_eq!(std::fs::read_dir(home.path()).unwrap().count(), 0);
+    }
+
+    const CONTROL_ID: &str = "rct_01k0z6r1w8f4jy2m7q9v3x5abc";
+    const WAIT_SINCE: &str = "2026-08-10T12:03:00Z";
+
+    /// The definition-backed run above while its current attempt waits on a `kind` wait, or
+    /// runs without one for `None`.
+    fn waiting_run(kind: Option<&str>) -> serde_json::Value {
+        let mut run = definition_run();
+        run["state"] = serde_json::json!("running");
+        run["workflowState"] =
+            serde_json::json!(if kind.is_some() { "waiting" } else { "running" });
+        run["workflowOutcome"] = serde_json::Value::Null;
+        run["exits"] = serde_json::json!([]);
+        run["workflowProgress"]["wait"] = kind.map_or(serde_json::Value::Null, |kind| {
+            serde_json::json!({"kind": kind, "since": WAIT_SINCE, "step": ["design", {"item": 1}, "review"]})
+        });
+        run
+    }
+
+    /// Cloud's `202` for an accepted control of `kind` carrying the request's members.
+    fn accepted_control(kind: &str, request: &serde_json::Value) -> Vec<u8> {
+        let member = |name: &str| {
+            request
+                .get(name)
+                .cloned()
+                .unwrap_or(serde_json::Value::Null)
+        };
+        http_response_with_headers(
+            "202 Accepted",
+            Some("application/json"),
+            &[
+                ("Cache-Control", "private, no-store"),
+                (
+                    "Idempotency-Key",
+                    api_test_support::REQUEST_IDEMPOTENCY_KEY_ECHO,
+                ),
+            ],
+            &serde_json::to_vec(&serde_json::json!({
+                "id": CONTROL_ID, "runId": RUN_ID, "attemptNumber": 2, "kind": kind,
+                "wait": member("wait"), "answers": member("answers"), "notes": member("notes"),
+                "before": member("before"), "reason": member("reason"),
+                "state": "accepted", "code": null, "actionOutcome": null,
+                "requestedBy": "prn_01k0z6r1w8f4jy2m7q9v3x5abc",
+                "acceptedAt": "2026-08-10T12:05:00Z",
+                "deliveredAt": null, "settledAt": null,
+            }))
+            .unwrap(),
+        )
+    }
+
+    fn body(request: &str) -> serde_json::Value {
+        serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap())
+            .unwrap_or_else(|_| panic!("{request}"))
+    }
+
+    fn controls_route() -> String {
+        format!("POST /api/v1/organizations/{ORGANIZATION}/runs/{RUN_ID}/controls")
+    }
+
+    // REQ-LOCALRUN-210, REQ-RUN-91: Cloud answer reads the run, sends one control naming the
+    // run's current wait under one fresh key, sent again when the response is lost, and
+    // reports the accepted control; nothing under the `um` home is read or written.
+    #[test]
+    fn cloud_answer_sends_the_runs_current_wait_under_one_key_and_reports_the_control() {
+        let home = tempfile::tempdir().unwrap();
+        let request = serde_json::json!({
+            "kind": "answer",
+            "wait": {"kind": "answer", "since": WAIT_SINCE},
+            "answers": [{"question": "scope", "text": "Only the API"}],
+        });
+        let (output, requests) = cloud(
+            "answer",
+            RUN_ID,
+            &["--question", "scope", "--text", "Only the API", "--json"],
+            vec![
+                run_response(waiting_run(Some("answer"))),
+                Vec::new(),
+                accepted_control("answer", &request),
+            ],
+            home.path(),
+        );
+        assert_eq!(output.status.code(), Some(0), "{output:?}");
+        assert_eq!(requests.len(), 3);
+        assert_eq!(
+            route(&requests[0]),
+            format!("GET /api/v1/organizations/{ORGANIZATION}/runs/{RUN_ID}")
+        );
+        for request_sent in &requests[1..] {
+            assert_eq!(route(request_sent), controls_route());
+            assert_eq!(body(request_sent), request);
+        }
+        let key = header_value(&requests[1], "idempotency-key");
+        assert!(!key.is_empty());
+        assert_eq!(header_value(&requests[2], "idempotency-key"), key);
+        let accepted = document(&output);
+        assert_eq!(accepted["command"], "um workflow run answer");
+        assert_eq!(accepted["outcome"], "accepted");
+        assert_eq!(accepted["exitStatus"], 0);
+        assert_eq!(accepted["organizationRef"], ORGANIZATION);
+        assert_eq!(accepted["runId"], RUN_ID);
+        assert_eq!(accepted["control"]["id"], CONTROL_ID);
+        assert_eq!(accepted["control"]["state"], "accepted");
+        assert_eq!(accepted["control"]["wait"], request["wait"]);
+        assert_eq!(std::fs::read_dir(home.path()).unwrap().count(), 0);
+
+        let (output, requests) = cloud(
+            "answer",
+            RUN_ID,
+            &["--question", "scope", "--text", "Only the API"],
+            vec![
+                run_response(waiting_run(Some("answer"))),
+                accepted_control("answer", &request),
+            ],
+            home.path(),
+        );
+        assert_eq!(output.status.code(), Some(0), "{output:?}");
+        assert_eq!(requests.len(), 2);
+        let text = String::from_utf8(output.stdout).unwrap();
+        assert!(
+            text.contains(CONTROL_ID) && text.contains("accepted"),
+            "{text}"
+        );
+    }
+
+    // REQ-LOCALRUN-210, REQ-RUN-91: approve, hand-back, retry and a lift name the run's
+    // current wait with their kinds; a lift of a run that does not wait on a stop, and a
+    // stop, name none, and a stop does not read the run.
+    #[test]
+    fn cloud_control_leaves_send_their_kinds() {
+        let home = tempfile::tempdir().unwrap();
+        let wait = |kind: &str| serde_json::json!({"kind": kind, "since": WAIT_SINCE});
+        for (leaf, args, waiting, request) in [
+            (
+                "approve",
+                &[][..],
+                Some("approval"),
+                serde_json::json!({"kind": "approve", "wait": wait("approval")}),
+            ),
+            (
+                "hand-back",
+                &["--notes", "Split the migration"][..],
+                Some("approval"),
+                serde_json::json!({"kind": "hand_back", "wait": wait("approval"), "notes": "Split the migration"}),
+            ),
+            (
+                "retry",
+                &[][..],
+                Some("repair"),
+                serde_json::json!({"kind": "retry", "wait": wait("repair")}),
+            ),
+            (
+                "lift",
+                &["--before", "review"][..],
+                Some("stop"),
+                serde_json::json!({"kind": "lift", "wait": wait("stop"), "before": "review"}),
+            ),
+            ("lift", &[][..], None, serde_json::json!({"kind": "lift"})),
+            (
+                "stop",
+                &["--before", "review", "--reason", "Hold for review"][..],
+                None,
+                serde_json::json!({"kind": "stop", "before": "review", "reason": "Hold for review"}),
+            ),
+        ] {
+            let kind = request["kind"].as_str().unwrap();
+            let mut responses = Vec::new();
+            if leaf != "stop" {
+                responses.push(run_response(waiting_run(waiting)));
+            }
+            responses.push(accepted_control(kind, &request));
+            let mut all = args.to_vec();
+            all.push("--json");
+            let (output, requests) = cloud(leaf, RUN_ID, &all, responses, home.path());
+            assert_eq!(output.status.code(), Some(0), "{leaf}: {output:?}");
+            let posted = requests.last().unwrap();
+            assert_eq!(requests.len(), if leaf == "stop" { 1 } else { 2 }, "{leaf}");
+            assert_eq!(route(posted), controls_route(), "{leaf}");
+            assert_eq!(body(posted), request, "{leaf}");
+            let accepted = document(&output);
+            assert_eq!(accepted["command"], format!("um workflow run {leaf}"));
+            assert_eq!(accepted["outcome"], "accepted", "{leaf}");
+            assert_eq!(accepted["control"]["kind"], kind, "{leaf}");
+        }
+        assert_eq!(std::fs::read_dir(home.path()).unwrap().count(), 0);
+    }
+
+    // REQ-LOCALRUN-210, REQ-RUN-91: Cloud's refusals exit 1 with their slugs, a run that does
+    // not wait on the leaf's kind is refused before any control is sent, and a leaf without a
+    // session exits 3.
+    #[test]
+    fn cloud_control_refusals_name_their_cause() {
+        let home = tempfile::tempdir().unwrap();
+        let answer = ["--question", "scope", "--text", "Only the API", "--json"];
+        for (response, code) in [
+            (conflict("wait-not-current"), "wait_not_current"),
+            (conflict("run-not-live"), "run_not_live"),
+            (conflict("idempotency-conflict"), "idempotency_conflict"),
+            (
+                problem_http_response(
+                    "422 Unprocessable Entity",
+                    serde_json::json!({"type": "https://api.usefulmachinery.com/problems/control-too-large", "title": "Unprocessable Entity", "status": 422}),
+                ),
+                "control_too_large",
+            ),
+        ] {
+            let (output, requests) = cloud(
+                "answer",
+                RUN_ID,
+                &answer,
+                vec![run_response(waiting_run(Some("answer"))), response],
+                home.path(),
+            );
+            assert_eq!(output.status.code(), Some(1), "{code}: {output:?}");
+            assert_eq!(requests.len(), 2, "{code}");
+            let refused = document(&output);
+            assert_eq!(refused["outcome"], "refused", "{refused}");
+            assert_eq!(refused["exitStatus"], 1);
+            assert_eq!(refused["diagnostics"][0]["code"], code, "{refused}");
+        }
+        for (waiting, code) in [
+            (Some("approval"), "wait_kind_mismatch"),
+            (None, "run_not_waiting"),
+        ] {
+            let (output, requests) = cloud(
+                "answer",
+                RUN_ID,
+                &answer,
+                vec![run_response(waiting_run(waiting))],
+                home.path(),
+            );
+            assert_eq!(output.status.code(), Some(1), "{code}: {output:?}");
+            assert_eq!(requests.len(), 1, "{code}");
+            assert_eq!(document(&output)["diagnostics"][0]["code"], code);
+        }
+        let (output, _) = cloud(
+            "approve",
+            RUN_ID,
+            &[],
+            vec![run_response(waiting_run(Some("answer")))],
+            home.path(),
+        );
+        assert_eq!(output.status.code(), Some(1), "{output:?}");
+        assert!(output.stdout.is_empty());
+        assert!(
+            String::from_utf8(output.stderr)
+                .unwrap()
+                .contains("wait_kind_mismatch")
+        );
+        let output = run(&[
+            "workflow",
+            "run",
+            "approve",
+            RUN_ID,
+            "--cloud",
+            ORGANIZATION,
+            "--json",
+        ]);
+        assert_eq!(output.status.code(), Some(3), "{output:?}");
+        assert_eq!(
+            document(&output)["diagnostics"][0]["code"],
+            "authentication_required"
+        );
+        assert_eq!(std::fs::read_dir(home.path()).unwrap().count(), 0);
+    }
+
+    // REQ-LOCALRUN-210: a Cloud retry takes no local execution root or replacement profiles.
+    #[test]
+    fn cloud_retry_refuses_its_local_options() {
+        for local in [
+            &["--execution-root", "root"][..],
+            &["--agent-profiles", "profiles.json"][..],
+        ] {
+            let mut all = vec!["workflow", "run", "retry", RUN_ID, "--cloud", ORGANIZATION];
+            all.extend_from_slice(local);
+            let output = run(&all);
+            assert_eq!(output.status.code(), Some(2), "{local:?}: {output:?}");
+            assert!(output.stdout.is_empty(), "{local:?}");
+        }
+    }
+
+    // REQ-LOCALRUN-180, REQ-LOCALRUN-181, REQ-LOCALRUN-187, REQ-LOCALRUN-189: with
+    // `--cloud`, a local run's id is sent to Cloud as typed and the local run is neither read
+    // nor changed; without it, show and release keep resolving and acting on the local run.
+    #[test]
+    fn cloud_show_and_release_leave_a_same_named_local_run_unchanged() {
+        let published = super::super::workflow_run_control::PublishedWaitTree::new();
+        let (directory, id, terminal) = published.run("blocked");
+        assert_eq!(terminal["wait"]["kind"], "answer", "{terminal}");
+        let before = std::fs::read(directory.join("run.json")).unwrap();
+        let controls = |directory: &std::path::Path| {
+            std::fs::read_dir(directory.join("controls")).map_or(0, |entries| entries.count())
+        };
+        let controls_before = controls(&directory);
+
+        let mut cloud_run = definition_run();
+        cloud_run["id"] = serde_json::json!(id);
+        let (output, requests) = cloud(
+            "show",
+            &id,
+            &["--json"],
+            vec![run_response(cloud_run), deliveries_response(false)],
+            std::path::Path::new(published.home.path()),
+        );
+        assert_eq!(output.status.code(), Some(0), "{output:?}");
+        assert_eq!(
+            route(&requests[0]),
+            format!("GET /api/v1/organizations/{ORGANIZATION}/runs/{id}")
+        );
+        let shown = document(&output);
+        assert!(shown.get("runDirectory").is_none(), "{shown}");
+        assert_eq!(shown["run"]["definition"]["definitionId"], DEFINITION_ID);
+
+        let (output, requests) = cloud(
+            "release",
+            &id,
+            &["--json"],
+            vec![released_claim()],
+            std::path::Path::new(published.home.path()),
+        );
+        assert_eq!(output.status.code(), Some(0), "{output:?}");
+        assert_eq!(
+            route(&requests[0]),
+            format!("POST /api/v1/organizations/{ORGANIZATION}/runs/{id}/claim-release")
+        );
+        assert_eq!(std::fs::read(directory.join("run.json")).unwrap(), before);
+        assert_eq!(controls(&directory), controls_before);
+
+        let home = Some(&published.home);
+        let local = super::super::workflow_run_control::run_control(home, "show", &id, &[]);
+        let local = document(&local);
+        assert_eq!(local["outcome"], "shown", "{local}");
+        assert_eq!(local["runDirectory"], directory.to_str().unwrap());
+        let refused = super::super::workflow_run_control::refused(
+            &super::super::workflow_run_control::run_control(home, "release", &id, &[]),
+            "release",
+            "run_live",
+        );
+        assert_eq!(refused["runDirectory"], directory.to_str().unwrap());
+        assert_eq!(controls(&directory), controls_before);
     }
 }

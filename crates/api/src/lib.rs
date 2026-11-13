@@ -31,10 +31,10 @@ mod resource;
 mod run_inputs;
 mod runners;
 mod runs;
-mod schedules;
 mod service_principals;
 mod signup;
 mod webhooks;
+mod workflow_definitions;
 
 use reqwest::header::{HeaderValue, InvalidHeaderValue};
 use zeroize::{Zeroize as _, Zeroizing};
@@ -137,10 +137,8 @@ pub use lifecycle::{
     request_current_principal_deletion, request_organization_deletion,
 };
 pub use linear::{
-    CreateLinearTriggerRequest, EvaluationFilters, LinearApi, LinearConnection,
-    LinearConnectionList, LinearEvaluation, LinearEvaluationList, LinearEvaluationState,
-    LinearFailure, LinearSession, LinearSessionStatus, LinearTeamList, LinearTeamStateList,
-    LinearTrigger, LinearTriggerList, LinearTriggerRead, TriggerAction, UpdateLinearTriggerRequest,
+    LinearApi, LinearConnection, LinearConnectionList, LinearFailure, LinearSession,
+    LinearSessionStatus, LinearTeamList, LinearTeamStateList,
 };
 pub use organizations::{
     AcceptInvitationOutcome, AcceptedInvitationMembership, AuditActor, AuditProjectionWarning,
@@ -194,19 +192,15 @@ pub use runs::{
     ContinuationAdmissionViolation, CreateRunInput, RetryConflict, Run, RunApi,
     RunArtifactDelivery, RunCancellation, RunCancellationEffectiveMode, RunCancellationEnvelope,
     RunCancellationMode, RunCancellationReceipt, RunCancellationReceiptMode,
-    RunCancellationReceiptState, RunCancellationResolutionKind, RunContinuationDefinition,
-    RunContinuationEnvelope, RunContinuationPreparation, RunContinuationReceipt,
-    RunContinuationReplacement, RunContinuationReplacementSource, RunContinuationRequest,
-    RunContinuationWorkspaceModified, RunCreationAcceptance, RunCreationPending, RunFailure,
-    RunInterruption, RunInterruptionPhase, RunLinearLifecycle, RunLinearLifecycleOwnershipEvent,
+    RunCancellationReceiptState, RunCancellationResolutionKind, RunClaimRelease,
+    RunContinuationDefinition, RunContinuationEnvelope, RunContinuationPreparation,
+    RunContinuationReceipt, RunContinuationRequest, RunContinuationWorkspaceModified, RunControl,
+    RunControlAnswer, RunControlKind, RunControlRequest, RunControlSubmission, RunControlWait,
+    RunCreationAcceptance, RunCreationPending, RunDefinitionSelection, RunFailure, RunInterruption,
+    RunInterruptionPhase, RunLinearLifecycle, RunLinearLifecycleOwnershipEvent,
     RunLinearLifecycleUpdate, RunList, RunListFilter, RunObservation, RunPublicationHandoffState,
     RunRead, RunRetryFailureCode, RunRetryReceipt, RunRetryRejection, RunRetryState, RunState,
-    valid_integration_context,
-};
-pub use schedules::{
-    CreateScheduleRequest, Schedule, ScheduleApi, ScheduleApiError, ScheduleList,
-    ScheduleOccurrence, ScheduleOccurrenceFilters, ScheduleOccurrenceList, ScheduleOccurrenceState,
-    ScheduleRead, ScheduleTombstone, UpdateScheduleRequest,
+    RunSubjectClaim, RunSubjectClaimState, RunTriggerDelivery, valid_integration_context,
 };
 pub use service_principals::{
     CreateServicePrincipalOutcome, IssueServiceCredentialOutcome, IssuedServiceApiKey,
@@ -219,6 +213,12 @@ pub use signup::{SignupError, SignupOutcome, signup_human};
 pub use webhooks::{
     Mutation as WebhookMutation, WebhookApi, WebhookDelivery, WebhookDeliveryList, WebhookFailure,
     WebhookSubscription, WebhookSubscriptionList,
+};
+pub use workflow_definitions::{
+    WorkflowBindingValues, WorkflowDefinition, WorkflowDefinitionApi, WorkflowDefinitionApiError,
+    WorkflowDefinitionEvaluation, WorkflowDefinitionFailure, WorkflowDefinitionPublication,
+    WorkflowDefinitionRevision, WorkflowEvaluationFilter, WorkflowProblemDetail,
+    WorkflowPublication, WorkflowRefusal, WorkflowTree, WorkflowTreeFile,
 };
 
 // OpenAPI Generator emits a library-shaped client; keep its public declarations
@@ -360,10 +360,8 @@ mod tests {
         assert_eq!(null.input_set_id, None);
         assert_eq!(present.input_set_id, Some(Some("ris_fixture".to_owned())));
 
-        let mut explicit_null = generated::models::CreateRunRequest::new(
-            "prj_fixture".to_owned(),
-            "workflow.yaml".to_owned(),
-        );
+        let mut explicit_null = generated::models::CreateRunRequest::new("prj_fixture".to_owned());
+        explicit_null.workflow_path = Some("workflow.yaml".to_owned());
         explicit_null.input_set_id = Some(None);
         let encoded = serde_json::to_value(explicit_null).expect("null input set should encode");
         assert_eq!(encoded["inputSetId"], serde_json::Value::Null);
@@ -394,10 +392,8 @@ mod tests {
             )])))
         );
 
-        let mut explicit_null = generated::models::CreateRunRequest::new(
-            "prj_fixture".to_owned(),
-            "workflow.yaml".to_owned(),
-        );
+        let mut explicit_null = generated::models::CreateRunRequest::new("prj_fixture".to_owned());
+        explicit_null.workflow_path = Some("workflow.yaml".to_owned());
         explicit_null.integration_context = Some(None);
         let encoded = serde_json::to_value(explicit_null).expect("null context should encode");
         assert_eq!(encoded["integrationContext"], serde_json::Value::Null);

@@ -29,7 +29,10 @@ async fn exercise_retained_cloud_git_continuation(v3: bool) {
     };
     assert_eq!(accepted.root.execution, workspace);
     assert_eq!(
-        accepted.admitted.git_capture().unwrap().baseline_oid(),
+        engine_admission(accepted)
+            .git_capture()
+            .unwrap()
+            .baseline_oid(),
         baseline
     );
     let job = start_continuation(&mut manager, &successor);

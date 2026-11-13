@@ -21,8 +21,9 @@ use crate::service::artifact_delivery::ArtifactCloudResponse;
 use crate::service::assignment::{
     ArtifactRequestKind, AssignmentCancel, AssignmentManager, AssignmentManagerFailure,
     AssignmentObservation, AssignmentOffer, AssignmentPrepare, AssignmentRelease,
-    AssignmentRenewal, AssignmentStart, AssignmentStartAuthorization, PendingAssignmentObservation,
-    RetainedObservationFrame, WelcomePolicyFailure,
+    AssignmentRenewal, AssignmentRunControl, AssignmentStart, AssignmentStartAuthorization,
+    AssignmentTriggerDelivery, PendingAssignmentObservation, RetainedObservationFrame,
+    WelcomePolicyFailure,
 };
 use crate::service::config::Config;
 use crate::service::control::LiveStatus;
@@ -247,6 +248,26 @@ impl<'a> ProtocolLog<'a> {
                 assignment_id,
                 ..
             } => (envelope, "execution_transition", None, Some(assignment_id)),
+            RunnerFrame::TreeProgress {
+                envelope,
+                assignment_id,
+                ..
+            } => (envelope, "tree_progress", None, Some(assignment_id)),
+            RunnerFrame::TriggerDeliveryApplied {
+                envelope,
+                assignment_id,
+                ..
+            } => (
+                envelope,
+                "trigger_delivery_applied",
+                None,
+                Some(assignment_id),
+            ),
+            RunnerFrame::RunControlApplied {
+                envelope,
+                assignment_id,
+                ..
+            } => (envelope, "run_control_applied", None, Some(assignment_id)),
             RunnerFrame::ExecutionFinished {
                 envelope,
                 assignment_id,
@@ -540,6 +561,36 @@ impl<'a> ProtocolLog<'a> {
             } => (
                 envelope,
                 "assignment_release",
+                vec![
+                    KeyValue::new(telemetry::attribute::EFFECT_ID, effect_id.clone()),
+                    KeyValue::new(telemetry::attribute::ASSIGNMENT_ID, assignment_id.clone()),
+                    KeyValue::new(telemetry::attribute::RUN_ID, run_id.clone()),
+                ],
+            ),
+            CloudFrame::TriggerDelivery {
+                envelope,
+                effect_id,
+                assignment_id,
+                run_id,
+                ..
+            } => (
+                envelope,
+                "trigger_delivery",
+                vec![
+                    KeyValue::new(telemetry::attribute::EFFECT_ID, effect_id.clone()),
+                    KeyValue::new(telemetry::attribute::ASSIGNMENT_ID, assignment_id.clone()),
+                    KeyValue::new(telemetry::attribute::RUN_ID, run_id.clone()),
+                ],
+            ),
+            CloudFrame::RunControl {
+                envelope,
+                effect_id,
+                assignment_id,
+                run_id,
+                ..
+            } => (
+                envelope,
+                "run_control",
                 vec![
                     KeyValue::new(telemetry::attribute::EFFECT_ID, effect_id.clone()),
                     KeyValue::new(telemetry::attribute::ASSIGNMENT_ID, assignment_id.clone()),
@@ -1601,6 +1652,46 @@ impl BufferedEffect {
                     reason,
                 }),
             ),
+            CloudFrame::TriggerDelivery {
+                effect_id,
+                assignment_id,
+                run_id,
+                attempt_id,
+                delivery,
+                ..
+            } => (
+                effect_id.clone(),
+                assignment_id.clone(),
+                run_id.clone(),
+                None,
+                AssignmentManagerEffect::TriggerDelivery(Box::new(AssignmentTriggerDelivery {
+                    effect_id,
+                    assignment_id,
+                    run_id,
+                    attempt_id,
+                    delivery,
+                })),
+            ),
+            CloudFrame::RunControl {
+                effect_id,
+                assignment_id,
+                run_id,
+                attempt_id,
+                control,
+                ..
+            } => (
+                effect_id.clone(),
+                assignment_id.clone(),
+                run_id.clone(),
+                None,
+                AssignmentManagerEffect::RunControl(Box::new(AssignmentRunControl {
+                    effect_id,
+                    assignment_id,
+                    run_id,
+                    attempt_id,
+                    control,
+                })),
+            ),
             _ => {
                 return Err(ConnectionError::terminal(
                     *progress,
@@ -1692,6 +1783,8 @@ enum AssignmentManagerEffect {
     StartAuthorized(AssignmentStartAuthorization),
     Renewal(AssignmentRenewal),
     Release(AssignmentRelease),
+    TriggerDelivery(Box<AssignmentTriggerDelivery>),
+    RunControl(Box<AssignmentRunControl>),
 }
 
 fn apply_assignment_manager_effect(
@@ -1735,6 +1828,12 @@ fn apply_assignment_manager_effect(
             }
             AssignmentManagerEffect::Release(release) => {
                 manager.handle_release(release).map(|_| None)
+            }
+            AssignmentManagerEffect::TriggerDelivery(delivery) => {
+                manager.handle_trigger_delivery(*delivery).map(|()| None)
+            }
+            AssignmentManagerEffect::RunControl(control) => {
+                manager.handle_run_control(*control).map(|()| None)
             }
         }
     };
@@ -2562,6 +2661,8 @@ where
             | effect @ CloudFrame::ExecutionStartAuthorized { .. }
             | effect @ CloudFrame::AssignmentLeaseRenewed { .. }
             | effect @ CloudFrame::AssignmentRelease { .. }
+            | effect @ CloudFrame::TriggerDelivery { .. }
+            | effect @ CloudFrame::RunControl { .. }
                 if progress.handshake_completed =>
             {
                 let mut received = BufferedEffect::received(
@@ -3033,6 +3134,9 @@ pub(crate) fn opening_hello(
         },
         runner_version: runner_version.to_owned(),
         recovery_root: None,
+        tree_execution: true,
+        // It adopts a retained tree run on a continuation offer (REQ-RUNNERENROLL-89).
+        tree_continuation: true,
     })
     .map_err(|_| {
         ConnectionError::terminal(
@@ -4192,6 +4296,82 @@ mod tests {
         assert_eq!(next_sequence, 3);
     }
 
+    /// Sends `frame`, an effect for an assignment the runner does not hold, and checks that
+    /// it is acknowledged and applies to nothing, the session staying up.
+    async fn unheld_effect_is_acknowledged_and_dropped(frame: &str, effect_id: &str) {
+        let context = EstablishedTestContext::new();
+        let mut next_sequence = 2;
+        let (inbound, mut outbound, established) =
+            established_fixture(&context, &mut next_sequence);
+        let peer = async {
+            assert!(matches!(outbound.recv().await, Some(Message::Text(_))));
+            inbound.send(welcome());
+            inbound.send(observation_acknowledgement(OPENING_MESSAGE_ID, 1));
+            inbound.send(Message::Text(frame.into()));
+
+            let receipt = with_watchdog(outbound.recv())
+                .await
+                .expect("effect receipt timed out")
+                .expect("effect receipt missing");
+            let Message::Text(receipt) = receipt else {
+                panic!("effect receipt was not text");
+            };
+            let receipt: serde_json::Value =
+                serde_json::from_str(&receipt).expect("decode effect receipt");
+            assert_eq!(receipt["type"], "effect_acknowledged");
+            assert_eq!(receipt["payload"]["effectId"], effect_id);
+            inbound.send(observation_acknowledgement(
+                receipt["messageId"].as_str().expect("receipt message ID"),
+                2,
+            ));
+            // No assignment is held, so nothing is applied or reported and the session stays.
+            inbound.send(Message::Ping(b"effect-dropped".to_vec().into()));
+            let pong = with_watchdog(outbound.recv())
+                .await
+                .expect("pong after the dropped effect timed out");
+            assert!(matches!(
+                pong,
+                Some(Message::Pong(payload)) if payload.as_ref() == b"effect-dropped"
+            ));
+            assert!(outbound.try_recv().is_err());
+            inbound.send(Message::Close(None));
+        };
+
+        let (result, ()) = with_watchdog(async { tokio::join!(established, peer) })
+            .await
+            .expect("effect receipt transcript timed out");
+        let progress = result.expect("effect receipt transcript failed");
+        assert_eq!(progress.effects_received, 1);
+        assert_eq!(progress.effect_acknowledgements_confirmed, 1);
+        assert_eq!(next_sequence, 3);
+    }
+
+    // REQ-TRIGGER-136
+    #[tokio::test]
+    async fn trigger_delivery_is_acknowledged_as_an_effect_and_dropped_when_unheld() {
+        unheld_effect_is_acknowledged_and_dropped(
+            include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../tests/fixtures/runner-protocol/v1/valid/cloud-trigger-delivery.json"
+            )),
+            "eff_01k0z6r1w8f4jy2m7q9v3x5atd",
+        )
+        .await;
+    }
+
+    // REQ-RUNNERENROLL-90
+    #[tokio::test]
+    async fn run_control_is_acknowledged_as_an_effect_and_dropped_when_unheld() {
+        unheld_effect_is_acknowledged_and_dropped(
+            include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../tests/fixtures/runner-protocol/v1/valid/cloud-run-control-answer.json"
+            )),
+            "eff_01k0z6r1w8f4jy2m7q9v3x5acr",
+        )
+        .await;
+    }
+
     #[tokio::test]
     async fn renewal_receipt_success_does_not_claim_authority_was_applied() {
         let context =
@@ -5198,6 +5378,7 @@ mod tests {
         reason = "tungstenite's handshake callback requires its large error type"
     )]
     // REQ-RUNNERENROLL-31
+    // REQ-RUNNERENROLL-91
     // REQ-TELEMETRY-12
     #[tokio::test]
     async fn authenticates_and_completes_hello_and_ping_pong() {
@@ -5228,6 +5409,9 @@ mod tests {
             let hello: serde_json::Value =
                 serde_json::from_str(&hello).expect("decode opening hello");
             assert_eq!(hello["messageId"], OPENING_MESSAGE_ID);
+            assert_eq!(hello["payload"]["treeExecution"], 1);
+            // REQ-RUNNERENROLL-89
+            assert_eq!(hello["payload"]["treeContinuation"], 1);
             socket.send(welcome()).await.expect("send welcome");
             socket
                 .send(observation_acknowledgement(OPENING_MESSAGE_ID, 1))

@@ -705,17 +705,19 @@ pub fn leave_organization(
     }
 }
 
-/// Returns the active organization's immutable audit history oldest first in the order its records were written, then by audit-record ID; a record written after an earlier page was read appears on a later page even when its occurredAt is earlier, so following cursors never skips one. The exact authenticator must belong to an active principal with an effective owner membership. Unknown actions and malformed records remain in page order as metadata-only details_unavailable items; warnings identify only the affected record and a closed reason. The cursor is opaque and scoped to this collection. Missing, inactive, and inaccessible organizations share the common not-found representation.
+/// Returns the active organization's immutable audit history oldest first in the order its records were written, then by audit-record ID; a record written after an earlier page was read appears on a later page even when its occurredAt is earlier, so following cursors never skips one. The exact authenticator must belong to an active principal with an effective owner membership. Unknown actions and malformed records remain in page order as metadata-only details_unavailable items; warnings identify only the affected record and a closed reason. A record whose action, subject kind, subject ID prefix or any change field lies outside the requested `vocabulary` is listed the same way, with reason unknown_action, so a client is never sent a value it cannot decode; the stored records are the same whichever vocabulary is asked for. The cursor is opaque, scoped to this collection and independent of `vocabulary`. Missing, inactive, and inaccessible organizations share the common not-found representation.
 pub fn list_organization_audit_records(
     configuration: &configuration::Configuration,
     organization_ref: &str,
     limit: Option<i32>,
     cursor: Option<&str>,
+    vocabulary: Option<i32>,
 ) -> Result<models::OrganizationAuditRecordList, Error<ListOrganizationAuditRecordsError>> {
     // add a prefix to parameters to efficiently prevent name collisions
     let p_path_organization_ref = organization_ref;
     let p_query_limit = limit;
     let p_query_cursor = cursor;
+    let p_query_vocabulary = vocabulary;
 
     let uri_str = format!(
         "{}/v1/organizations/{organizationRef}/audit-records",
@@ -729,6 +731,9 @@ pub fn list_organization_audit_records(
     }
     if let Some(ref param_value) = p_query_cursor {
         req_builder = req_builder.query(&[("cursor", &param_value.to_string())]);
+    }
+    if let Some(ref param_value) = p_query_vocabulary {
+        req_builder = req_builder.query(&[("vocabulary", &param_value.to_string())]);
     }
     if let Some(ref user_agent) = configuration.user_agent {
         req_builder = req_builder.header(reqwest::header::USER_AGENT, user_agent.clone());

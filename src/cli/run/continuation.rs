@@ -10,6 +10,7 @@ use um_human_auth::Deployment;
 
 use crate::exit_code::ExitCode;
 
+use super::super::{HttpOptions, OrganizationArg, PrincipalAuthenticationArgs};
 use super::{
     RunOptions, RunReference, RunWaitArgs, failure_code, finish_operation, start_cloud_observation,
 };
@@ -21,12 +22,6 @@ pub(super) struct Command {
     #[arg(long = "from", required = true, value_name = "STEP", value_parser = parse_step,
         help = "Reexecute from this step (repeatable; order is preserved)")]
     from_steps: Vec<String>,
-    #[arg(long, value_name = "OID", requires = "workflow_path", value_parser = parse_oid,
-        help = "Use a replacement workflow commit")]
-    workflow_commit: Option<String>,
-    #[arg(long, value_name = "PATH", requires = "workflow_commit", value_parser = parse_workflow_path,
-        help = "Use a replacement canonical workflow path")]
-    workflow_path: Option<String>,
     #[arg(long, value_name = "VERSION", value_parser = clap::value_parser!(i64).range(1..),
         help = "Require this positive run version at admission")]
     expected_version: Option<i64>,
@@ -36,7 +31,7 @@ pub(super) struct Command {
     options: RunOptions,
 }
 
-fn parse_step(value: &str) -> Result<String, String> {
+pub(in crate::cli) fn parse_step(value: &str) -> Result<String, String> {
     let mut bytes = value.bytes();
     if value.len() <= 64
         && bytes.next().is_some_and(|byte| byte.is_ascii_lowercase())
@@ -45,32 +40,6 @@ fn parse_step(value: &str) -> Result<String, String> {
         Ok(value.to_owned())
     } else {
         Err("step must begin with a lowercase letter and contain at most 64 ASCII letters or digits".to_owned())
-    }
-}
-
-fn parse_workflow_path(value: &str) -> Result<String, String> {
-    if !value.is_empty()
-        && value.len() <= 4096
-        && !value.starts_with('/')
-        && value
-            .split('/')
-            .all(|part| !part.is_empty() && part != "." && part != ".." && !part.contains('\0'))
-    {
-        Ok(value.to_owned())
-    } else {
-        Err("workflow path must be canonical and repository-relative".to_owned())
-    }
-}
-
-fn parse_oid(value: &str) -> Result<String, String> {
-    if value.len() == 40
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
-    {
-        Ok(value.to_owned())
-    } else {
-        Err("commit OID must be 40 lowercase hexadecimal characters".to_owned())
     }
 }
 
@@ -97,8 +66,59 @@ struct ResultDocument<'a> {
     diagnostic: Option<&'a [um_api::ContinuationAdmissionViolation]>,
 }
 
+/// A Cloud continuation request, always under the run's inherited definition, with how its
+/// submission is observed and reported: what `um run continue` (REQ-CONTINUE-55) and
+/// `um workflow run resume --cloud` (REQ-CONTINUE-85) both submit through
+/// [`Submission::submit`].
+pub(in crate::cli) struct Submission {
+    run: RunReference,
+    from_steps: Vec<String>,
+    expected_version: Option<i64>,
+    wait: RunWaitArgs,
+    options: RunOptions,
+}
+
 impl Command {
     pub(super) fn execute(self, deployment: Deployment) -> super::super::CommandResult {
+        Submission {
+            run: self.run,
+            from_steps: self.from_steps,
+            expected_version: self.expected_version,
+            wait: self.wait,
+            options: self.options,
+        }
+        .submit(deployment)
+    }
+}
+
+impl Submission {
+    /// The request `um workflow run resume RUN --cloud ORGANIZATION` sends (REQ-CONTINUE-85):
+    /// the steps as given, possibly none, under the run's own definition, with no expected
+    /// version, reported once admitted.
+    pub(in crate::cli) fn inherited(
+        organization: OrganizationArg,
+        run_id: String,
+        from_steps: Vec<String>,
+        json: bool,
+        authentication: PrincipalAuthenticationArgs,
+        http: HttpOptions,
+    ) -> Self {
+        Self {
+            run: RunReference {
+                organization,
+                run_id,
+            },
+            from_steps,
+            expected_version: None,
+            wait: RunWaitArgs {
+                wait: false,
+                timeout: None,
+            },
+            options: RunOptions::new(json, authentication, http),
+        }
+    }
+
+    pub(in crate::cli) fn submit(self, deployment: Deployment) -> super::super::CommandResult {
         let key = um_support::generate_idempotency_key()
             .context("generate Cloud run continuation identity")?;
         let signal_deployment = deployment.clone();
@@ -164,17 +184,10 @@ impl Command {
                 ExitCode::GeneralFailure,
             );
         }
-        let definition = match (self.workflow_commit.clone(), self.workflow_path.clone()) {
-            (Some(commit), Some(path)) => {
-                RunContinuationDefinition::RunContinuationRequestDefinitionOneOf(Box::new(
-                    um_api::RunContinuationReplacement::new(
-                        um_api::RunContinuationReplacementSource::new(commit, path),
-                    ),
-                ))
-            }
-            _ => RunContinuationDefinition::String("inherited".to_owned()),
-        };
-        let mut request = RunContinuationRequest::new(self.from_steps.clone(), definition);
+        let mut request = RunContinuationRequest::new(
+            self.from_steps.clone(),
+            RunContinuationDefinition::String("inherited".to_owned()),
+        );
         request.expected_run_version = self.expected_version;
         let result = pinned_submission(
             deployment,
@@ -523,7 +536,12 @@ fn render(
         }
         writeln!(
             stderr,
-            "\nInspect the run before requesting another continuation with a new key."
+            "\n{}",
+            if code == Some("path_run_retired") {
+                super::PATH_RUN_RETIRED_GUIDANCE
+            } else {
+                "Inspect the run before requesting another continuation with a new key."
+            }
         )?;
     }
     Ok(exit)
@@ -688,22 +706,6 @@ mod tests {
             "registration_rejected",
         ] {
             assert!(text.contains(marker), "missing {marker}");
-        }
-    }
-
-    #[test]
-    fn workflow_path_matches_the_server_canonical_path_boundary() {
-        assert_eq!(
-            parse_workflow_path("workflows/build.yaml"),
-            Ok("workflows/build.yaml".to_owned())
-        );
-        for path in [
-            "/workflows/build.yaml",
-            "workflows/../build.yaml",
-            "workflows/",
-            "workflows/a\0b",
-        ] {
-            assert!(parse_workflow_path(path).is_err(), "accepted {path:?}");
         }
     }
 

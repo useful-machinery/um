@@ -590,6 +590,8 @@ impl Reading {
                     self.add_unknown(path, UnknownDeclaration::ConnectionBinding, None, Some(key));
                     continue;
                 }
+                // A member names an organization principal, not a provider credential.
+                BindingKind::Member | BindingKind::Members => continue,
             };
             self.add_origin(kind, path, OriginDeclaration::Binding, None, Some(key));
         }

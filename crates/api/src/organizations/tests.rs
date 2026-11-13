@@ -797,6 +797,45 @@ fn update_and_membership_list_classify_only_their_contracted_failures() {
     }
 }
 
+// REQ-AUDIT-44
+#[test]
+fn audit_listing_asks_for_the_vocabulary_this_release_decodes() {
+    for (limit, cursor, query) in [
+        (None, None, "?vocabulary=2"),
+        (
+            Some(100),
+            Some("opaque cursor"),
+            "?limit=100&cursor=opaque+cursor&vocabulary=2",
+        ),
+    ] {
+        let page = serde_json::to_vec(&serde_json::json!({"items": []})).unwrap();
+        let server =
+            ScriptedHttpServer::respond(response("200 OK", Some(JSON_MEDIA_TYPE), &[], &page));
+
+        let outcome = list_organization_audit_records(
+            &http_client(),
+            &server.api_url,
+            TOKEN,
+            "acme",
+            limit,
+            cursor,
+        )
+        .expect("empty audit page should decode");
+
+        assert!(matches!(
+            outcome,
+            ListOrganizationAuditRecordsOutcome::Listed(_)
+        ));
+        let request = server.finish_one();
+        assert!(
+            request.starts_with(&format!(
+                "GET /api/v1/organizations/acme/audit-records{query} HTTP/1.1\r\n"
+            )),
+            "{request}"
+        );
+    }
+}
+
 #[test]
 fn membership_list_omits_absent_query_parameters() {
     let page = serde_json::to_vec(&serde_json::json!({"items": []})).unwrap();

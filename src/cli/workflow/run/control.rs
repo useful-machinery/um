@@ -201,6 +201,15 @@ pub(super) fn run_locked() -> Refusal {
     )
 }
 
+/// A live run that already holds a withdrawal its process has not yet honored
+/// (REQ-LOCALRUN-186).
+pub(super) fn withdraw_pending() -> Refusal {
+    Refusal::new(
+        "withdraw_pending",
+        "A withdrawal is already recorded; the run ends once its running stage finishes.",
+    )
+}
+
 pub(super) fn wait_kind_mismatch(wait: &WaitRecord) -> Refusal {
     Refusal::new(
         "wait_kind_mismatch",
@@ -220,7 +229,7 @@ pub(super) fn wait_resolved() -> Refusal {
 
 /// Opens the run at `run_directory` (REQ-LOCALRUN-181): a run without a run record is
 /// `run_record_missing`, and a directory that is not a run `run_directory_invalid`.
-fn open(run_directory: &Path) -> Result<ControlTarget, Refusal> {
+pub(super) fn open(run_directory: &Path) -> Result<ControlTarget, Refusal> {
     fn invalid<E>(_: E) -> Refusal {
         Refusal::new(
             "run_directory_invalid",

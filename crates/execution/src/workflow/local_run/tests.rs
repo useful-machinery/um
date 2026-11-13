@@ -1372,8 +1372,21 @@ fn a_fan_out_child_nests_under_its_element_and_the_parent_position_names_it() {
     assert_eq!(latest_child_run(&parent_path, "review").unwrap(), None);
 
     // `child_runs` lists step, then element, then ordinal.
-    let listed = child_runs(&parent_path)
-        .unwrap()
+    let listed = child_runs(&parent_path).unwrap();
+    // A reader of the layout alone finds the same runs in the same order.
+    assert_eq!(
+        child_run_directories(&parent_path).unwrap(),
+        listed
+            .iter()
+            .map(|child| ChildRunDirectory {
+                step: child.step.clone(),
+                item: child.item,
+                ordinal: child.ordinal,
+                directory: child.directory.clone(),
+            })
+            .collect::<Vec<_>>()
+    );
+    let listed = listed
         .into_iter()
         .map(|child| {
             (
@@ -4702,6 +4715,7 @@ async fn cloud_continuation_recovers_unexported_output_across_three_attempts() {
             exports: BTreeMap::new(),
             provenance: fixture.admitted.workflow().source.clone(),
             content_digest: fixture.admitted.workflow().content_digest.clone(),
+            withdrawn: false,
         };
     retain_cloud_completed_steps(
         &private1,
@@ -4768,6 +4782,7 @@ async fn cloud_continuation_recovers_unexported_output_across_three_attempts() {
             exports: BTreeMap::new(),
             provenance: fixture.admitted.workflow().source.clone(),
             content_digest: fixture.admitted.workflow().content_digest.clone(),
+            withdrawn: false,
         };
     retain_cloud_completed_steps(
         &private2,

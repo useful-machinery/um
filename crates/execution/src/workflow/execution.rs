@@ -8,6 +8,7 @@ use super::artifact::ArtifactStaging;
 use super::coordinator::{CommitPort, CommittedReduction, CoordinationError, CoordinatorClock};
 use super::diagnostic::StepDiagnosticLog;
 use super::input::InputStaging;
+use super::local_run::{CANCELED_OUTCOME, WITHDRAWN_OUTCOME};
 use super::observation::{
     ExecutionObservation, ExecutionObserver, ExecutionSettlement, ObservedExecutions,
     ObservedStepTransition, SettledExecution, StartedExecution, TransitionObservation,
@@ -38,10 +39,14 @@ pub struct WorkflowExecutionResult<Deadline = ()> {
     pub exports: ExportSet<CapturedValue>,
     pub provenance: WorkflowSourceProvenance,
     pub content_digest: WorkflowContentDigest,
+    /// The attempt ended `cancelled` on a withdrawal honored at a `workflow` step boundary
+    /// (REQ-WFEXEC-73), which `chosen_outcome` records as `withdrawn`.
+    pub withdrawn: bool,
 }
 
-/// The outcome an attempt records on the run record (REQ-WFEXEC-57): `canceled` for a
-/// cancelled run; for a workflow that declares `outcome`, the text of its `from` output when
+/// The outcome an attempt records on the run record (REQ-WFEXEC-57): `withdrawn` for a run
+/// whose cancellation was a withdrawal (REQ-WFEXEC-73), `canceled` for any other cancelled
+/// run; for a workflow that declares `outcome`, the text of its `from` output when
 /// the run succeeded and `onFailure` when it failed; for an edge-scheduled workflow the exit
 /// outcome its walk took when it succeeded and `failed` when it failed; otherwise
 /// `succeeded` or `failed`. A waiting or continued attempt chooses no outcome and the run
@@ -52,7 +57,10 @@ pub fn chosen_outcome<Deadline>(
     result: &WorkflowExecutionResult<Deadline>,
 ) -> String {
     let declared = match (&result.outcome, &workflow.outcome) {
-        (RunOutcome::Cancelled { .. }, _) => return "canceled".to_owned(),
+        (RunOutcome::Cancelled { .. }, _) if result.withdrawn => {
+            return WITHDRAWN_OUTCOME.to_owned();
+        }
+        (RunOutcome::Cancelled { .. }, _) => return CANCELED_OUTCOME.to_owned(),
         (RunOutcome::Failed { .. }, _) => return failure_outcome(workflow).to_owned(),
         (RunOutcome::Waiting { wait }, _) => {
             tracing::error!(event = "chosen_outcome_waiting", step = %wait.step());
@@ -599,6 +607,7 @@ where
 {
     let provenance = admitted.workflow().source.clone();
     let content_digest = admitted.workflow().content_digest.clone();
+    let cancellation = admitted.execution().cancellation().source().clone();
     let start = start.into();
     let coordinated = execute_workflow_observed_with_children(
         admitted,
@@ -645,6 +654,8 @@ where
         .state
         .exports
         .ok_or(CoordinationError::ReducerStateUnavailable)?;
+    let withdrawn =
+        matches!(outcome, RunOutcome::Cancelled { .. }) && cancellation.withdrawal_requested();
     Ok(WorkflowExecutionResult {
         outcome,
         steps,
@@ -655,6 +666,7 @@ where
         exports,
         provenance,
         content_digest,
+        withdrawn,
     })
 }
 

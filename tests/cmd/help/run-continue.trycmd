@@ -10,8 +10,6 @@ Arguments:
 
 Options:
       --from <STEP>                    Reexecute from this step (repeatable; order is preserved)
-      --workflow-commit <OID>          Use a replacement workflow commit
-      --workflow-path <PATH>           Use a replacement canonical workflow path
       --expected-version <VERSION>     Require this positive run version at admission
       --wait                           Observe the run until it settles
       --timeout <DURATION>             Stop waiting after a positive duration (units: ms, s, m, or h; a bare number means seconds)

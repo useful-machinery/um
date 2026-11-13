@@ -5,9 +5,10 @@
 //! (`derive_rule`, the only place a kind is named), the substitution of an `external` wait's
 //! run-value operands, the matcher that resolves a wait through its rule alone over any
 //! `Event` (`evaluate`), the `ConditionSource` an `external` wait's events come from, the
-//! stop-in-force rule, and the numbered record directory's writer and reader, which the
-//! controls directory and the mirror's `mirror/` share. `local_run` writes the wait record
-//! into the run directory.
+//! action a root's control trigger takes on a delivered event in the same grammar
+//! (`ControlTrigger`), the stop-in-force rule, and the numbered record directory's
+//! writer and reader, which the controls directory and the mirror's `mirror/` share.
+//! `local_run` writes the wait record into the run directory.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -24,6 +25,7 @@ use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
 use super::admission::{ResolvedInput, ResolvedInputs};
+use super::document::{Trigger, TriggerControlAction};
 pub use super::document::{WaitKind, WaitRule};
 use super::local_run::{
     CONTROLS_DIRECTORY, LocalRunDirectoryError, PRIVATE_DIRECTORY, create_or_open_directory,
@@ -33,6 +35,7 @@ use super::local_run::{
 use super::runtime::{EnteredWait, StepState, step_outputs};
 use super::schema_common::{is_identifier, is_prefixed_ulid, parse_canonical_utc_timestamp};
 use super::tree_copy::file_locator;
+use super::validated::ValidatedWorkflow;
 use super::value::CapturedValue;
 
 /// The source every derived rule and every control event names.
@@ -85,6 +88,12 @@ const WHERE_RUN_STEP_AND_STOP: &str = "event.run == run.id and event.payload.bef
 /// The highest ordinal a numbered record directory holds: `<NNNN>` has four digits.
 const NUMBERED_ORDINAL_LIMIT: u64 = 9999;
 const CONTROL_TEMPORARY_FILE: &str = "control.json.tmp";
+
+/// A wait's identity `<kind>@<since>` (REQ-LOCALRUN-181): what a control names in its
+/// `wait`, and what a reader of a run's wait record or of a Cloud control's wait compares.
+pub fn wait_identity(kind: &str, since: &str) -> String {
+    format!("{kind}@{since}")
+}
 
 /// One `wait.json` (REQ-WFDEF-5): what the run waits for, since when, at which step, where
 /// it continues and the rule whose matching control resolves it.
@@ -330,7 +339,7 @@ impl WaitRecord {
 
     /// The wait's identity `<kind>@<since>`, which a control names in its `wait`.
     pub fn id(&self) -> String {
-        format!("{}@{}", self.kind.name(), self.since)
+        wait_identity(self.kind.name(), &self.since)
     }
 
     /// The kind's name as the record spells it.
@@ -735,6 +744,103 @@ pub fn event_literal(clause: &str, path: &[&str]) -> Result<Option<String>, Rule
             }
             _ => None,
         }))
+}
+
+/// A root's control trigger for a delivered provider event (REQ-LOCALRUN-208): the first
+/// control trigger, by name, whose `on.event` is the event's.
+#[derive(Clone, Copy, Debug)]
+pub struct ControlTrigger<'a> {
+    name: &'a str,
+    control: &'a TriggerControlAction,
+}
+
+impl<'a> ControlTrigger<'a> {
+    /// The control trigger of `workflow`'s root for provider event `event`, or `None` when
+    /// the root names none.
+    pub fn find(workflow: &'a ValidatedWorkflow, event: &str) -> Option<Self> {
+        workflow
+            .root
+            .as_ref()?
+            .triggers
+            .iter()
+            .find_map(|(name, trigger)| match trigger {
+                Trigger::Control { on, control } if on.event == event => {
+                    Some(Self { name, control })
+                }
+                Trigger::Control { .. } | Trigger::Start { .. } => None,
+            })
+    }
+
+    pub fn name(&self) -> &'a str {
+        self.name
+    }
+
+    /// The action the trigger takes: its named action, or its conditional action's `then`
+    /// when `when` holds over `fields` and its `else` otherwise. `when` is read in the
+    /// matcher's grammar, a conjunction of `lhs == rhs`, with `event.<path>` read from
+    /// `fields`, quoted literals and `true` and `false`, and a `$<key>` operand the text
+    /// `bound` answers for the binding key; a side that does not resolve never equals
+    /// anything. A `when` outside that grammar, or naming `run.*`, `wait.*`, `inputs.*` or
+    /// `outputs.*`, is `RuleError`.
+    pub fn action(
+        &self,
+        fields: &Value,
+        bound: impl Fn(&str) -> Option<String>,
+    ) -> Result<&'a str, RuleError> {
+        Ok(match self.control {
+            TriggerControlAction::Named(action) => action,
+            TriggerControlAction::Conditional {
+                when,
+                then,
+                otherwise,
+            } => {
+                if control_when_holds(when, fields, &bound)? {
+                    then
+                } else {
+                    otherwise
+                }
+            }
+        })
+    }
+}
+
+/// Whether a control's `when` is a rule `control_when_holds` can evaluate at the wait, the
+/// grammar `um workflow definition validate` holds it to (REQ-WFDEF-10): parsed by the
+/// evaluator itself over an empty event, so validation and evaluation cannot disagree.
+pub(crate) fn control_when_parses(clause: &str) -> bool {
+    control_when_holds(clause, &Value::Null, &|_| None).is_ok()
+}
+
+fn control_when_holds(
+    clause: &str,
+    fields: &Value,
+    bound: &impl Fn(&str) -> Option<String>,
+) -> Result<bool, RuleError> {
+    let invalid = || RuleError {
+        clause: clause.to_owned(),
+    };
+    let side = |text: &str| match text.strip_prefix('$') {
+        Some(key) if is_identifier(key) => Ok(bound(key).map(Value::String)),
+        Some(_) => Err(invalid()),
+        None => match parse_operand(text).ok_or_else(invalid)? {
+            Operand::Event(path) => Ok(path
+                .iter()
+                .try_fold(fields, |value, segment| value.get(segment))
+                .cloned()),
+            Operand::Literal(literal) => Ok(Some(Value::String(literal))),
+            Operand::Bool(literal) => Ok(Some(Value::Bool(literal))),
+            Operand::RunId | Operand::Wait(_) | Operand::Inputs(_) | Operand::Outputs { .. } => {
+                Err(invalid())
+            }
+        },
+    };
+    let mut holds = true;
+    for conjunct in clause.split(" and ") {
+        let (left, right) = conjunct.split_once(" == ").ok_or_else(invalid)?;
+        let (left, right) = (side(left)?, side(right)?);
+        holds &= matches!((left, right), (Some(left), Some(right)) if left == right);
+    }
+    Ok(holds)
 }
 
 /// The `control.stop` in force before `step` (REQ-WFEXEC-62, INV-ENGINE-21): the last

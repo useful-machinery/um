@@ -739,8 +739,17 @@ fn offer(suffix: &str) -> AssignmentOffer {
             workspace_membership: None,
             capacity: production_capacity(),
             run_inputs: None,
+            workflow_tree: None,
         },
         continuation: None,
+    }
+}
+
+/// The admitted workflow of an engine run.
+fn engine_admission(accepted: &AcceptedAssignment) -> &AdmittedWorkflow {
+    match &accepted.execution {
+        AcceptedExecution::Engine(admitted) => admitted,
+        AcceptedExecution::Tree(_) => panic!("expected an engine run"),
     }
 }
 
@@ -2958,68 +2967,6 @@ impl SourceCredentialBroker for UnavailableGitLabGrantBroker {
     }
 }
 
-// Run by the Coordinator's cross-component harness while the admitting
-// Gateway test owns the disposable database. The JSON is the persisted
-// Coordinator effect, not a reconstructed execution-specification fixture.
-#[tokio::test]
-#[ignore = "requires the admitted Coordinator offer supplied by the integration harness"]
-async fn gitlab_admitted_offer_from_coordinator_requires_a_cloud_grant() {
-    let file = std::env::var("UM_GITLAB_ADMITTED_OFFER_FILE").unwrap();
-    let effect: Value = serde_json::from_slice(&std::fs::read(file).unwrap()).unwrap();
-    let mut payload = effect["payload"].as_object().unwrap().clone();
-    // Gateway's assignmentEffectFrame moves routing fields into the wire
-    // payload and consumes the Coordinator-only offer expiry timestamp.
-    payload.remove("offerExpiresAt");
-    for field in ["effectId", "assignmentId", "runId", "attemptId"] {
-        payload.insert(field.to_owned(), effect[field].clone());
-    }
-    let frame = serde_json::json!({
-        "protocolVersion": 1, "direction": "cloud_to_runner",
-        "messageId": "cmsg_01k0z6r1w8f4jy2m7q9v3x5abm",
-        "sentAt": "2026-07-23T00:00:02Z", "type": "assignment_offer",
-        "payloadVersion": 1, "payload": payload,
-    });
-    let offered = decoded_offer_from_frame(&serde_json::to_vec(&frame).unwrap());
-    assert_eq!(offered.execution_spec.schema_version, 2);
-    assert_eq!(
-        offered
-            .execution_spec
-            .primary_workspace_source
-            .provider_kind,
-        "gitlab"
-    );
-    assert_eq!(
-        offered
-            .execution_spec
-            .workflow_definition_source
-            .workflow_path,
-        "nested/workflows/build.yaml"
-    );
-    assert_eq!(
-        offered
-            .execution_spec
-            .workflow_definition_source
-            .workflow_source_closure_digest
-            .value,
-        "9cc9dcb0a9bf763b6b000f08cfa1a6b109891037eb3cb8e5e43e0fd50b4448ba"
-    );
-    let (_temporary, mut manager) = manager_fixture(
-        "schemaVersion: 1\nsteps:\n  check:\n    kind: cmd\n    command: {argv: [\"true\"]}\n",
-    );
-    let broker = Arc::new(UnavailableGitLabGrantBroker {
-        calls: AtomicUsize::new(0),
-    });
-    manager.source_broker = Some(broker.clone());
-    assert_unmodified_preparation_declined(
-        &mut manager,
-        offered,
-        AssignmentDecline::RunnerUnable(RunnerUnableReason::SourceServiceUnavailable)
-            .diagnosed("source_materialization", "source_provider_unavailable"),
-    )
-    .await;
-    assert_eq!(broker.calls.load(Ordering::SeqCst), 1);
-}
-
 #[tokio::test]
 async fn gitlab_assignment_preparation_fails_without_a_cloud_grant() {
     for length in [256, 8192] {
@@ -3950,7 +3897,7 @@ async fn failed_execution_activation_is_classified_without_error_text() {
         "schemaVersion: 1\nsteps:\n  check:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n";
     let (_temporary, mut manager, _offered, job, capture) = run_event_fixture(workflow).await;
     if let Some(LocalSlot::Running(running)) = &manager.slot {
-        running.workflow_git.disable();
+        running.workflow_git.as_ref().unwrap().disable();
     }
     job.spawn();
     let reports = with_watchdog(wait_for_terminal(&mut manager))
@@ -4502,7 +4449,7 @@ steps:
     offer_then_prepare(&mut manager, &offered).await;
 
     let execution = match &manager.slot {
-        Some(LocalSlot::Accepted(accepted)) => accepted.admitted.execution(),
+        Some(LocalSlot::Accepted(accepted)) => engine_admission(accepted).execution(),
         _ => panic!("assignment should be accepted"),
     };
     assert!(execution.root().join(".git").is_dir());
@@ -4672,10 +4619,10 @@ async fn shutdown_requests_runner_cancellation_for_running_work() {
                 == Some(CancellationReason::RunnerShutdown)
     ));
     let (authority_active, authority) = match &manager.slot {
-        Some(LocalSlot::Running(running)) => (
-            running.workflow_git.is_active(),
-            running.workflow_git.clone(),
-        ),
+        Some(LocalSlot::Running(running)) => {
+            let authority = running.workflow_git.clone().unwrap();
+            (authority.is_active(), authority)
+        }
         _ => panic!("assignment must remain running during graceful shutdown"),
     };
     let report = authority.teardown(ProcessQuiescence::Proven);
@@ -4732,7 +4679,7 @@ async fn start_execution_waiting_for_authority(
         .unwrap()
         .expect("valid start dispatches execution");
     let workflow_git = match &manager.slot {
-        Some(LocalSlot::Running(running)) => running.workflow_git.clone(),
+        Some(LocalSlot::Running(running)) => running.workflow_git.clone().unwrap(),
         _ => panic!("assignment must be waiting to run"),
     };
     job.spawn();
@@ -6457,6 +6404,36 @@ fn optional_discovery_leaves_outbox_capacity_for_execution() {
             report: ExecutionReport::Started,
         })
         .unwrap();
+}
+
+// REQ-RUNNERENROLL-88: a progress report for steps alone cannot use the slots a run's own
+// reports are owed; one that carries the root can.
+#[test]
+fn steps_only_progress_leaves_outbox_capacity_for_the_run() {
+    let outbox = ObservationOutbox::new();
+    let progress = |steps_only| AssignmentObservation::Execution {
+        assignment_id: "asn_01k0z6r1w8f4jy2m7q9v3x5abc".into(),
+        attempt_id: "atm_01k0z6r1w8f4jy2m7q9v3x5abc".into(),
+        report: ExecutionReport::TreeProgress {
+            progress_sequence: 1,
+            progress: um_runner_protocol::TreeRootProgress {
+                attempt: 1,
+                position: vec![json!("build")],
+                wait: None,
+                reported_at: "2026-07-23T00:00:05Z".into(),
+                steps: Vec::new(),
+            },
+            steps_only,
+        },
+    };
+    for _ in 0..(MAXIMUM_SERVICE_OBSERVATIONS - OBSERVATION_RESERVE_BASE) {
+        outbox.enqueue(progress(true)).unwrap();
+    }
+    assert!(matches!(
+        outbox.enqueue(progress(true)),
+        Err(OutboxFailure::Capacity)
+    ));
+    outbox.enqueue(progress(false)).unwrap();
 }
 
 #[test]

@@ -48,6 +48,9 @@ struct ResultDocument<'a> {
     idempotency_key: Option<&'a str>,
     receipt: Option<&'a RunRetryReceipt>,
     code: Option<&'a str>,
+    /// The run holding the subject, present only for a subject refusal (REQ-RETRY-35).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    holder_run_id: Option<&'a str>,
 }
 
 impl Command {
@@ -110,14 +113,19 @@ impl Command {
                     control.dispatched(),
                     self.options.authentication.kind(),
                 );
-                return self.finish_result(
-                    deployment,
-                    control,
-                    &recovery,
-                    outcome,
-                    Some(code),
-                    exit,
-                );
+                return finish_operation(control, || {
+                    render_with_holder(
+                        (
+                            deployment,
+                            &self.run.organization,
+                            &self.run.run_id,
+                            self.options.json,
+                        ),
+                        &recovery,
+                        (outcome, Some(code), subject_holder(&failure)),
+                        exit,
+                    )
+                });
             }
             Err(_) => {
                 let dispatched = control.dispatched();
@@ -405,16 +413,15 @@ fn submission_failure(
     auth: super::super::PrincipalAuthenticationKind,
 ) -> (&'static str, &'static str, ExitCode) {
     match failure {
-        RunFailure::RetryConflict(RetryConflict::TriggerSlot) => (
-            "trigger_slot_conflict",
-            "trigger_slot_conflict",
-            ExitCode::GeneralFailure,
-        ),
-        RunFailure::RetryConflict(RetryConflict::Pending) => {
-            ("retry_pending", "retry_pending", ExitCode::GeneralFailure)
-        }
-        RunFailure::RetryConflict(RetryConflict::Idempotency) => {
-            ("error", "idempotency_conflict", ExitCode::GeneralFailure)
+        // A state conflict is its own outcome; a key conflict is an error (REQ-RETRY-35).
+        RunFailure::RetryConflict(conflict) => {
+            let (code, exit) = failure_code(failure, auth);
+            let outcome = if *conflict == RetryConflict::Idempotency {
+                "error"
+            } else {
+                code
+            };
+            (outcome, code, exit)
         }
         RunFailure::Unreachable(UnreachableCategory::RateLimited) => {
             ("error", "rate_limited", ExitCode::Unavailable)
@@ -444,11 +451,31 @@ fn submission_failure(
     }
 }
 
+/// The run a subject refusal names as holding the subject.
+fn subject_holder(failure: &RunFailure) -> Option<&str> {
+    match failure {
+        RunFailure::RetryConflict(
+            RetryConflict::SubjectBusy { holder_run_id }
+            | RetryConflict::SubjectSettled { holder_run_id },
+        ) => Some(holder_run_id),
+        _ => None,
+    }
+}
+
 fn render(
-    (deployment, org, run, json): (&Deployment, &str, &str, bool),
+    target: (&Deployment, &str, &str, bool),
     recovery: &Recovery,
     outcome: &str,
     code: Option<&str>,
+    exit: ExitCode,
+) -> anyhow::Result<ExitCode> {
+    render_with_holder(target, recovery, (outcome, code, None), exit)
+}
+
+fn render_with_holder(
+    (deployment, org, run, json): (&Deployment, &str, &str, bool),
+    recovery: &Recovery,
+    (outcome, code, holder_run_id): (&str, Option<&str>, Option<&str>),
     exit: ExitCode,
 ) -> anyhow::Result<ExitCode> {
     let receipt = recovery.receipt.as_ref();
@@ -466,6 +493,7 @@ fn render(
                 .then_some(recovery.key.as_str()),
             receipt,
             code,
+            holder_run_id,
         };
         let mut stdout = io::stdout().lock();
         serde_json::to_writer(&mut stdout, &document)
@@ -482,7 +510,10 @@ fn render(
         let diagnostic = match outcome {
             "rejected" => "run retry rejected",
             "failed" => "run retry command failed",
-            "trigger_slot_conflict" | "retry_pending" => "run retry conflicts with current state",
+            "retry_pending" => "run retry conflicts with current state",
+            "subject_busy" | "subject_settled" => {
+                "run retry refused: another run holds the subject"
+            }
             "timed_out" => "run retry observation timed out",
             "observation_stopped" => "run retry observation stopped",
             "acceptance_unknown" => "run retry acceptance unconfirmed",
@@ -498,6 +529,9 @@ fn render(
         } else {
             writeln!(stderr, "idempotency key: {}", recovery.key)?;
         }
+        if let Some(holder) = holder_run_id {
+            writeln!(stderr, "holding run: {holder}")?;
+        }
         if let Some(error_type) = receipt
             .and_then(|receipt| receipt.failure.as_ref())
             .and_then(|failure| failure.diagnostic.error_type.as_deref())
@@ -510,6 +544,12 @@ fn render(
             match code {
                 Some("authentication_required") => "Sign in first, then show the run and request.",
                 Some("forbidden") => "Ask an organization owner to check access to this run.",
+                Some("path_run_retired") => super::PATH_RUN_RETIRED_GUIDANCE,
+                Some("subject_busy") =>
+                    "Wait for the holding run to finish, then request the retry again.",
+                Some("subject_settled") => {
+                    "Release the holding run with `um workflow run release --cloud`, then request the retry again."
+                }
                 _ => "Show the run and known request before requesting another retry.",
             }
         )?;

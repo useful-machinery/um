@@ -39,6 +39,7 @@ pub enum CreateGoogleDocsFormError {
     Status403(models::Problem),
     Status404(models::Problem),
     Status409(models::Problem),
+    Status410(models::Problem),
     Status422(models::Problem),
     Status500(models::Problem),
     UnknownValue(serde_json::Value),
@@ -240,6 +241,7 @@ pub fn create_google_docs_action(
     }
 }
 
+/// Reviews an enabled action that names a definition for the current document. The answer is a form token valid for fifteen minutes with the action version, the definition with its current revision and the workflow file of its tree a launch will run, the project's repository connection and branch, and each input that workflow file declares with its binding. No commit is resolved and no publication is selected.  An action that names no definition is answered `410` `path-run-retired` and no form is issued. A workflow file declaring an input other than text or JSON, or more than 256 inputs, is `422` `google-docs-input-kind-unsupported`; a binding or presentation that does not match the declared inputs is `422` `google-docs-input-binding-invalid`; a definition the project lacks, a `workflowPath` that is no workflow file of the current revision's tree, an invalid workflow file or input schema, or a project since bound to GitLab is `422` `google-docs-action-invalid`. An archived definition is `409` `definition-archived`, a disabled or deleted action `409` `google-docs-action-disabled` or `google-docs-action-deleted`, a project with configuration blockers `409` `project-not-ready`, and a tree that cannot be read `409` `workflow-source-unavailable`.
 pub fn create_google_docs_form(
     configuration: &configuration::Configuration,
     organization_ref: &str,
@@ -306,6 +308,7 @@ pub fn create_google_docs_form(
     }
 }
 
+/// Repeating a launch with its key and body returns the original receipt, even after the form expires or the action is disabled or deleted; the same key with another body is `409` `idempotency-conflict`. Keys are scoped to the launcher and the action.  Otherwise the launch, with the `formToken`, the reviewed `documentId` and, when the form has inputs, a sealed run input set the launcher created, admits one run of the reviewed revision of the action's definition as the launcher, in the newest commit of the project's branch, and answers `202` with a `gdl_` receipt. The receipt names the selected workflow file as `workflowPath`, the workspace commit as `sourceCommit` and no publication.  An action that names no definition is answered `410` `path-run-retired` and no run input set is consumed. An expired form is `409` `google-docs-form-expired`, a form for another document `409` `google-docs-document-changed`, and a form whose action, project repository or branch, or definition revision changed since review `409` `google-docs-form-stale`; a bound value that differs in the input set is `422` `google-docs-bound-input-mismatch`. What run creation refuses of the definition or the input set is answered as run creation answers it: `409` `definition-archived`, `subject-busy`, `subject-settled`, `run-input-set-consumed` or `run-input-set-not-sealed`, and `410` `run-input-set-expired`. No refusal admits a run.
 pub fn create_google_docs_launch(
     configuration: &configuration::Configuration,
     organization_ref: &str,

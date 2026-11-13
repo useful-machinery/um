@@ -24,6 +24,8 @@ pub struct RunnerPool {
     /// A canonical lowercase organization-scoped runner resource name.
     #[serde(rename = "name")]
     pub name: String,
+    #[serde(rename = "member", skip_serializing_if = "Option::is_none")]
+    pub member: Option<Box<models::RunnerPoolMember>>,
     #[serde(rename = "createdAt")]
     pub created_at: String,
     #[serde(rename = "updatedAt")]
@@ -42,6 +44,7 @@ impl RunnerPool {
             id,
             organization_id,
             name,
+            member: None,
             created_at,
             updated_at,
         }

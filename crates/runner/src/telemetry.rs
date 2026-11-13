@@ -55,6 +55,8 @@ pub(crate) mod attribute {
     pub(crate) const OPENING_ACKNOWLEDGED: &str = "um.runner.opening_acknowledged";
     pub(crate) const RUN_ID: &str = "um.run.id";
     pub(crate) const RUN_RESULT: &str = "um.run.result";
+    pub(crate) const STEP_REPORT_REFUSAL: &str = "um.run.step_report_refusal";
+    pub(crate) const MIRROR_READ_FAILURE: &str = "um.run.mirror_read_failure";
     pub(crate) const FAILURE_PHASE: &str = "um.failure.phase";
     pub(crate) const FAILURE_CODE: &str = "um.failure.code";
     pub(crate) const FAILURE_CAUSE_TYPE: &str = "um.failure.cause_type";

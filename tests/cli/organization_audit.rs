@@ -59,7 +59,7 @@ fn audit_success(next_cursor: Option<&str>) -> Vec<u8> {
     json_http_response("200 OK", audit_page(next_cursor))
 }
 
-// REQ-AUDIT-7, REQ-AUDIT-8, REQ-AUDIT-21, REQ-AUDIT-22
+// REQ-AUDIT-7, REQ-AUDIT-8, REQ-AUDIT-21, REQ-AUDIT-22, REQ-AUDIT-44
 #[test]
 fn organization_audit_list_preserves_one_privacy_safe_page_as_stable_json() {
     let cursor = "next page /+=";
@@ -141,7 +141,7 @@ fn organization_audit_list_preserves_one_privacy_safe_page_as_stable_json() {
     let requests = server.finish();
     assert_eq!(requests.len(), 1, "the CLI must return exactly one page");
     assert!(requests[0].starts_with(
-        "GET /api/v1/organizations/acme-research/audit-records?limit=100&cursor=opaque+%2F%2B%3D%3F%26 HTTP/1.1\r\n"
+        "GET /api/v1/organizations/acme-research/audit-records?limit=100&cursor=opaque+%2F%2B%3D%3F%26&vocabulary=2 HTTP/1.1\r\n"
     ));
     assert_eq!(
         header_value(&requests[0], "authorization"),
@@ -363,7 +363,7 @@ fn gitlab_audit_page() -> serde_json::Value {
     })
 }
 
-// REQ-AUDIT-10, REQ-AUDIT-22, REQ-AUDIT-23
+// REQ-AUDIT-10, REQ-AUDIT-22, REQ-AUDIT-23, REQ-AUDIT-44
 #[test]
 fn organization_audit_list_reads_gitlab_connection_and_candidate_records() {
     let page = gitlab_audit_page();
@@ -386,7 +386,10 @@ fn organization_audit_list_reads_gitlab_connection_and_candidate_records() {
     assert!(output.status.success(), "{output:?}");
     let document: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(document["items"], page["items"]);
-    server.finish();
+    let requests = server.finish();
+    assert!(requests[0].starts_with(
+        "GET /api/v1/organizations/acme-research/audit-records?vocabulary=2 HTTP/1.1\r\n"
+    ));
 
     let (server, _directory, _path, credential_path) =
         organization::prepared_organization(vec![json_http_response("200 OK", page)], TOKEN);

@@ -12,7 +12,10 @@ use std::sync::Arc;
 use ring::digest::{Context, SHA256};
 use serde::Serialize;
 
-use super::document::{Binding, BindingKind, RootBlocks, Trigger, TriggerControlAction};
+use super::document::{
+    Binding, BindingKind, OwnerDeclaration, OwnerSource, RootBlocks, StartRule, StopBefore,
+    Trigger, TriggerControlAction, TriggerRule,
+};
 use super::mirror::{MirrorBlock, MirrorGuard, MirrorGuardError, Template, hook_variables};
 use super::presentation_feed::normalize_terminal_scalar;
 use super::rejection::{RejectionDiagnostic, RejectionLocation, human_resolution_remedy};
@@ -25,6 +28,7 @@ use super::validated::{
     Scheduling, ValidatedEdgeTarget, ValidatedRecoveryHandler, ValidatedStep, ValidatedWorkflow,
     WorkflowValueType,
 };
+use super::wait::control_when_parses;
 
 const ROOT_WORKFLOW: &str = "workflow.yaml";
 const TREE_DIGEST_DOMAIN: &[u8] = b"um.workflow.tree.v1\0";
@@ -67,17 +71,35 @@ impl fmt::Debug for TreeFile {
     }
 }
 
+/// A trigger as `um workflow definition validate` reports it: a provider rule's source,
+/// event and `where`, or a schedule's timetable, and a start trigger's `subject`, `inputs`,
+/// `stopBefore` and `owner`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TreeTrigger {
     pub kind: TreeTriggerKind,
-    /// The binding reference as written, `$` and the binding key.
-    pub source: String,
-    pub event: String,
+    /// The binding reference as written, `$` and the binding key; none for a schedule.
+    pub source: Option<String>,
+    /// None for a schedule.
+    pub event: Option<String>,
+    /// A provider rule's `on.where` as written; none for a schedule or a rule without one.
+    pub condition: Option<String>,
+    /// A schedule's cron expression.
+    pub schedule: Option<String>,
+    /// A schedule's time zone.
+    pub timezone: Option<String>,
+    /// A start trigger's `subject` as written.
+    pub subject: Option<String>,
+    /// A start trigger's `inputs`, input name to the value as written; empty for a control.
+    pub inputs: BTreeMap<String, String>,
+    pub stop_before: Option<StopBefore>,
+    pub owner: Option<OwnerDeclaration>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TreeTriggerKind {
     Start,
+    /// A start trigger whose `on` is a timetable (REQ-WFDEF-31).
+    Schedule,
     Control,
 }
 
@@ -85,6 +107,7 @@ impl TreeTriggerKind {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Start => "start",
+            Self::Schedule => "schedule",
             Self::Control => "control",
         }
     }
@@ -144,8 +167,9 @@ pub struct TreeLocation {
     /// The step, finalizer or recovered step a command belongs to.
     #[serde(skip_serializing_if = "Option::is_none")]
     step: Option<String>,
-    /// A root-only key found outside the root, the key holding a command's `argv`, or the
-    /// key inside `mirror.linear`, such as `onOutcome.unless`.
+    /// A root-only key found outside the root, the key holding a command's `argv`, the key
+    /// inside `mirror.linear`, such as `onOutcome.unless`, or the key inside a trigger, such
+    /// as `owner.only` or `schedule`.
     #[serde(skip_serializing_if = "Option::is_none")]
     key: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -322,14 +346,56 @@ pub fn validate_workflow_tree(root: &Path) -> Result<ValidatedTree, Vec<TreeDiag
 
 impl From<&Trigger> for TreeTrigger {
     fn from(trigger: &Trigger) -> Self {
-        let (kind, rule) = match trigger {
-            Trigger::Start { on, .. } => (TreeTriggerKind::Start, on),
-            Trigger::Control { on, .. } => (TreeTriggerKind::Control, on),
+        let (on, subject, inputs, stop_before, owner) = match trigger {
+            Trigger::Start {
+                on,
+                subject,
+                inputs,
+                stop_before,
+                owner,
+            } => (on, subject, inputs, stop_before, owner),
+            Trigger::Control { on, .. } => {
+                return Self::event(TreeTriggerKind::Control, on);
+            }
+        };
+        let trigger = match on {
+            StartRule::Event(rule) => Self::event(TreeTriggerKind::Start, rule),
+            StartRule::Schedule { cron, timezone } => Self {
+                kind: TreeTriggerKind::Schedule,
+                source: None,
+                event: None,
+                condition: None,
+                schedule: Some(cron.clone()),
+                timezone: Some(timezone.clone()),
+                subject: None,
+                inputs: BTreeMap::new(),
+                stop_before: None,
+                owner: None,
+            },
         };
         Self {
+            subject: subject.clone(),
+            inputs: inputs.clone(),
+            stop_before: stop_before.clone(),
+            owner: owner.clone(),
+            ..trigger
+        }
+    }
+}
+
+impl TreeTrigger {
+    fn event(kind: TreeTriggerKind, rule: &TriggerRule) -> Self {
+        Self {
             kind,
-            source: rule.source.clone(),
-            event: rule.event.clone(),
+            source: Some(rule.source.clone()),
+            event: Some(rule.event.clone()),
+            condition: rule.condition.clone(),
+            schedule: None,
+            timezone: None,
+            subject: None,
+            inputs: BTreeMap::new(),
+            stop_before: None,
+            owner: None,
         }
     }
 }
@@ -441,75 +507,307 @@ fn check_triggers(
 ) {
     let required_inputs = root_workflow.required_inputs();
     for (name, trigger) in &blocks.triggers {
-        let (rule, when) = match trigger {
-            Trigger::Start { on, .. } => (on, None),
-            Trigger::Control { on, control } => (
-                on,
-                match control {
-                    TriggerControlAction::Conditional { when, .. } => Some(when),
+        match trigger {
+            Trigger::Start {
+                on: StartRule::Event(rule),
+                ..
+            } => check_rule(name, rule, None, blocks, diagnostics),
+            Trigger::Start {
+                on: StartRule::Schedule { .. },
+                ..
+            } => {}
+            Trigger::Control { on, control } => {
+                let when = match control {
+                    TriggerControlAction::Conditional { when, .. } => Some(when.as_str()),
                     TriggerControlAction::Named(_) => None,
-                },
-            ),
-        };
-        let source = rule.source.strip_prefix('$').unwrap_or(&rule.source);
-        match blocks.bindings.get(source) {
-            None => diagnostics.push(TreeDiagnostic::new(
-                "binding_undeclared",
-                TreeLocation::trigger(name).binding(source),
-            )),
-            Some(binding) if binding.kind != BindingKind::Connection => {
-                diagnostics.push(TreeDiagnostic::new(
-                    "binding_kind_mismatch",
-                    TreeLocation::trigger(name).binding(source),
-                ));
+                };
+                check_rule(name, on, when, blocks, diagnostics);
             }
-            Some(_) => {}
         }
 
-        let expressions = [rule.condition.as_ref(), when].into_iter().flatten();
-        let mut references = BTreeSet::new();
-        let mut literal = false;
-        for expression in expressions {
-            literal |= expression.contains(['"', '\'']);
-            references.extend(binding_references(expression));
-        }
-        if literal {
-            diagnostics.push(TreeDiagnostic::new(
-                "literal_where_binding_expected",
-                TreeLocation::trigger(name),
-            ));
-        }
-        for key in references
-            .into_iter()
-            .filter(|key| !blocks.bindings.contains_key(*key))
+        let Trigger::Start {
+            on,
+            subject,
+            inputs,
+            stop_before,
+            owner,
+        } = trigger
+        else {
+            continue;
+        };
+        for input in inputs
+            .keys()
+            .filter(|input| !root_workflow.declared_inputs().contains_key(*input))
         {
             diagnostics.push(TreeDiagnostic::new(
-                "binding_undeclared",
-                TreeLocation::trigger(name).binding(key),
+                "trigger_input_undeclared",
+                TreeLocation::trigger(name).input(input),
             ));
         }
-
-        if let Trigger::Start { inputs, .. } = trigger {
-            for input in inputs
-                .keys()
-                .filter(|input| !root_workflow.declared_inputs().contains_key(*input))
-            {
+        for input in required_inputs
+            .keys()
+            .filter(|input| !inputs.contains_key(*input))
+        {
+            diagnostics.push(TreeDiagnostic::new(
+                "trigger_input_missing",
+                TreeLocation::trigger(name).input(input),
+            ));
+        }
+        if let Some(stop_before) = stop_before
+            && !is_event_path(&stop_before.labels)
+        {
+            diagnostics.push(TreeDiagnostic::new(
+                "stop_before_labels_invalid",
+                TreeLocation::trigger(name).key("stopBefore.labels"),
+            ));
+        }
+        if let Some(owner) = owner {
+            check_owner(name, owner, blocks, diagnostics);
+        }
+        if let StartRule::Schedule { cron, timezone } = on {
+            check_schedule(
+                name,
+                subject.as_deref(),
+                inputs,
+                stop_before.as_ref(),
+                owner.as_ref(),
+                diagnostics,
+            );
+            if !is_cron_shape(cron) {
                 diagnostics.push(TreeDiagnostic::new(
-                    "trigger_input_undeclared",
-                    TreeLocation::trigger(name).input(input),
+                    "schedule_timing_invalid",
+                    TreeLocation::trigger(name).key("schedule"),
                 ));
             }
-            for input in required_inputs
-                .keys()
-                .filter(|input| !inputs.contains_key(*input))
-            {
+            if !is_zone_shape(timezone) {
                 diagnostics.push(TreeDiagnostic::new(
-                    "trigger_input_missing",
-                    TreeLocation::trigger(name).input(input),
+                    "schedule_timing_invalid",
+                    TreeLocation::trigger(name).key("timezone"),
                 ));
             }
         }
     }
+}
+
+/// A provider rule: its `source` names a `connection` binding, every `$key` in its `where`
+/// or a control's `when` is declared, neither holds a quoted literal, and each is in the
+/// grammar that evaluates it, a `where` Cloud's and a `when` the wait's (REQ-WFDEF-10).
+fn check_rule(
+    name: &str,
+    rule: &TriggerRule,
+    when: Option<&str>,
+    blocks: &RootBlocks,
+    diagnostics: &mut Vec<TreeDiagnostic>,
+) {
+    let source = rule.source.strip_prefix('$').unwrap_or(&rule.source);
+    check_binding(
+        blocks,
+        source,
+        BindingKind::Connection,
+        TreeLocation::trigger(name),
+        diagnostics,
+    );
+
+    let expressions = [rule.condition.as_deref(), when].into_iter().flatten();
+    let mut references = BTreeSet::new();
+    let mut literal = false;
+    for expression in expressions {
+        literal |= expression.contains(['"', '\'']);
+        references.extend(binding_references(expression));
+    }
+    // Cloud's `ParseRule` reads a `where` operand's whole `$key`, not only its alphanumeric
+    // head, so each operand's key must name a binding too. A `where` outside the grammar is
+    // `trigger_rule_invalid` below and has no operands to read.
+    if let Some(condition) = rule
+        .condition
+        .as_deref()
+        .filter(|rule| is_trigger_where(rule))
+    {
+        references.extend(
+            condition
+                .split(" and ")
+                .flat_map(|conjunct| conjunct.split(" == "))
+                .filter_map(|operand| operand.strip_prefix('$')),
+        );
+    }
+    if literal {
+        diagnostics.push(TreeDiagnostic::new(
+            "literal_where_binding_expected",
+            TreeLocation::trigger(name),
+        ));
+    }
+    for key in references
+        .into_iter()
+        .filter(|key| !blocks.bindings.contains_key(*key))
+    {
+        diagnostics.push(TreeDiagnostic::new(
+            "binding_undeclared",
+            TreeLocation::trigger(name).binding(key),
+        ));
+    }
+
+    // A quoted literal is already `literal_where_binding_expected`, whichever grammar reads it.
+    let grammars = [
+        (
+            rule.condition.as_deref(),
+            "on.where",
+            is_trigger_where as fn(&str) -> bool,
+        ),
+        (when, "control.action.when", control_when_parses),
+    ];
+    for (expression, key, parses) in grammars {
+        if let Some(expression) = expression
+            && !expression.contains(['"', '\''])
+            && !parses(expression)
+        {
+            diagnostics.push(TreeDiagnostic::new(
+                "trigger_rule_invalid",
+                TreeLocation::trigger(name).key(key),
+            ));
+        }
+    }
+}
+
+/// A trigger's `where` in the grammar Cloud evaluates it with, `workflowtrigger.ParseRule`
+/// (REQ-WFDEF-10): conjuncts joined by ` and `, each exactly one ` == ` between two operands,
+/// an operand `true`, `false`, a `$key` (non-empty, no space or `"`) or an `event.<path>`.
+/// `contracts/fixtures/workflow/v1/trigger-rule-grammar.json` pins both implementations.
+fn is_trigger_where(rule: &str) -> bool {
+    let operand = |text: &str| match text.strip_prefix('$') {
+        Some(key) => !key.is_empty() && !key.contains([' ', '"']),
+        None => matches!(text, "true" | "false") || is_event_path(text),
+    };
+    rule.split(" and ").all(|conjunct| {
+        conjunct
+            .split_once(" == ")
+            .is_some_and(|(left, right)| operand(left) && operand(right))
+    })
+}
+
+/// A start trigger's `owner` (REQ-WFDEF-10, REQ-WFDEF-30): a `$binding` owner is of kind
+/// `member` and takes no filter; each filter is a binding of kind `members`.
+fn check_owner(
+    name: &str,
+    owner: &OwnerDeclaration,
+    blocks: &RootBlocks,
+    diagnostics: &mut Vec<TreeDiagnostic>,
+) {
+    let bound = match &owner.from {
+        OwnerSource::Binding(reference) => {
+            check_binding(
+                blocks,
+                reference.trim_start_matches('$'),
+                BindingKind::Member,
+                TreeLocation::trigger(name).key("owner"),
+                diagnostics,
+            );
+            true
+        }
+        OwnerSource::Event(_) | OwnerSource::Events(_) => false,
+    };
+    for (key, filter) in [("owner.only", &owner.only), ("owner.except", &owner.except)] {
+        let Some(filter) = filter else {
+            continue;
+        };
+        let location = TreeLocation::trigger(name).key(key);
+        let filter = filter.trim_start_matches('$');
+        if bound {
+            diagnostics.push(TreeDiagnostic::new(
+                "owner_filter_invalid",
+                location.binding(filter),
+            ));
+        } else {
+            check_binding(blocks, filter, BindingKind::Members, location, diagnostics);
+        }
+    }
+}
+
+/// A schedule trigger reads no event (REQ-WFDEF-10, REQ-WFDEF-31): its subject and inputs
+/// are literals, its owner a `$binding` or absent, and it declares no `stopBefore`.
+fn check_schedule(
+    name: &str,
+    subject: Option<&str>,
+    inputs: &BTreeMap<String, String>,
+    stop_before: Option<&StopBefore>,
+    owner: Option<&OwnerDeclaration>,
+    diagnostics: &mut Vec<TreeDiagnostic>,
+) {
+    let reads_event = |value: &str| value.starts_with("event.");
+    let mut invalid = |key| {
+        diagnostics.push(TreeDiagnostic::new(
+            "schedule_trigger_invalid",
+            TreeLocation::trigger(name).key(key),
+        ));
+    };
+    if subject.is_some_and(reads_event) {
+        invalid("subject");
+    }
+    if inputs.values().any(|value| reads_event(value)) {
+        invalid("inputs");
+    }
+    if owner.is_some_and(|owner| !matches!(owner.from, OwnerSource::Binding(_))) {
+        invalid("owner");
+    }
+    if stop_before.is_some() {
+        invalid("stopBefore");
+    }
+}
+
+/// A binding reference in a trigger or the mirror names a declared binding of `kind`.
+fn check_binding(
+    blocks: &RootBlocks,
+    key: &str,
+    kind: BindingKind,
+    location: TreeLocation,
+    diagnostics: &mut Vec<TreeDiagnostic>,
+) {
+    let code = match blocks.bindings.get(key) {
+        None => "binding_undeclared",
+        Some(binding) if binding.kind != kind => "binding_kind_mismatch",
+        Some(_) => return,
+    };
+    diagnostics.push(TreeDiagnostic::new(code, location.binding(key)));
+}
+
+/// `event.` and a dotted path of non-empty ASCII alphanumeric or `_` segments, the event
+/// operand the rule grammar reads (`wait::Operand::Event`).
+fn is_event_path(value: &str) -> bool {
+    value.strip_prefix("event.").is_some_and(|path| {
+        path.split('.').all(|segment| {
+            !segment.is_empty()
+                && segment
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+        })
+    })
+}
+
+/// The shape of a five-field cron expression (REQ-WFDEF-31): each field `*`, digits,
+/// three-letter names, `-`, `,` and `/`. Cloud publication parses it fully.
+fn is_cron_shape(cron: &str) -> bool {
+    let fields = cron.split_whitespace().collect::<Vec<_>>();
+    fields.len() == 5
+        && fields.iter().all(|field| {
+            field
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"*-,/".contains(&byte))
+                && field
+                    .split(|character: char| !character.is_ascii_alphabetic())
+                    .all(|name| name.is_empty() || name.len() == 3)
+        })
+}
+
+/// `UTC` or the `Area/City` form of a zone name: two or more `/`-separated segments, each a
+/// letter followed by letters, digits, `_`, `+` or `-`. Cloud publication resolves it.
+fn is_zone_shape(timezone: &str) -> bool {
+    timezone == "UTC"
+        || timezone.split('/').count() >= 2
+            && timezone.split('/').all(|segment| {
+                segment.starts_with(|character: char| character.is_ascii_alphabetic())
+                    && segment
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || b"_+-".contains(&byte))
+            })
 }
 
 /// The root's `mirror` block (REQ-WFFORMAT-101): its issue input, outcome keys, states,
@@ -559,9 +857,10 @@ fn check_mirror(
                 location("onOutcome"),
             ));
         }
-        check_state_binding(
+        check_binding(
             blocks,
             &state.state,
+            BindingKind::LinearState,
             location("onOutcome.state"),
             diagnostics,
         );
@@ -569,9 +868,10 @@ fn check_mirror(
             continue;
         };
         match MirrorGuard::parse(unless) {
-            Ok(guard) => check_state_binding(
+            Ok(guard) => check_binding(
                 blocks,
                 &guard.binding,
+                BindingKind::LinearState,
                 location("onOutcome.unless"),
                 diagnostics,
             ),
@@ -589,21 +889,6 @@ fn check_mirror(
 /// The outcomes besides the root's own that a mirror may map: `failed` and the engine
 /// outcomes a local run reaches. `superseded` is never mirrored (REQ-WFFORMAT-101).
 const MIRRORED_ENGINE_OUTCOMES: [&str; 3] = ["failed", "withdrawn", "canceled"];
-
-/// A mirror state names a declared `linear.state` binding.
-fn check_state_binding(
-    blocks: &RootBlocks,
-    key: &str,
-    location: TreeLocation,
-    diagnostics: &mut Vec<TreeDiagnostic>,
-) {
-    let code = match blocks.bindings.get(key) {
-        None => "binding_undeclared",
-        Some(binding) if binding.kind != BindingKind::LinearState => "binding_kind_mismatch",
-        Some(_) => return,
-    };
-    diagnostics.push(TreeDiagnostic::new(code, location.binding(key)));
-}
 
 /// The outcomes a run of the root can exit with: its declared outcomes, the exits its edges
 /// reach when it is edge-scheduled, or the implicit `succeeded` and `failed`.

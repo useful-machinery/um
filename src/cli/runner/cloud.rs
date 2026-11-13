@@ -71,7 +71,7 @@ pub(super) fn write_pool_create(
 ) -> anyhow::Result<ExitCode> {
     write_pool(
         deployment,
-        result,
+        result.as_ref().map(|pool| (pool, NO_STATUS)),
         "created",
         "✓ Runner pool created.",
         authentication,
@@ -79,10 +79,25 @@ pub(super) fn write_pool_create(
     )
 }
 
+/// A pool's waiting runs and runner counts as `um runner pool show` reports them
+/// (REQ-RUNNERPOOL-89). um-api does not name its pool-status model, so the JSON
+/// document borrows it generically and the report takes its counts.
+pub(super) struct PoolStatus<'a, S> {
+    pub(super) document: &'a S,
+    pub(super) queued_runs: i32,
+    pub(super) online: i32,
+    pub(super) busy: i32,
+    pub(super) idle: i32,
+    pub(super) offline: i32,
+}
+
+// Only `show` reads a pool's status; creating and renaming a pool report its identity alone.
+const NO_STATUS: Option<PoolStatus<'static, ()>> = None;
+
 // Pool operations intentionally bind each stable machine outcome to its own command heading.
-pub(super) fn write_pool_show(
+pub(super) fn write_pool_show<S: Serialize>(
     deployment: &str,
-    result: &Result<RunnerPool, RunnerFailure>,
+    result: Result<(&RunnerPool, Option<PoolStatus<'_, S>>), &RunnerFailure>,
     authentication: super::super::PrincipalAuthenticationKind,
     json: bool,
 ) -> anyhow::Result<ExitCode> {
@@ -106,7 +121,7 @@ pub(super) fn write_pool_rename(
 ) -> anyhow::Result<ExitCode> {
     write_pool(
         deployment,
-        result,
+        result.as_ref().map(|pool| (pool, NO_STATUS)),
         "renamed",
         "✓ Runner pool renamed.",
         authentication,
@@ -114,22 +129,23 @@ pub(super) fn write_pool_rename(
     )
 }
 
-fn write_pool(
+fn write_pool<S: Serialize>(
     deployment: &str,
-    result: &Result<RunnerPool, RunnerFailure>,
+    result: Result<(&RunnerPool, Option<PoolStatus<'_, S>>), &RunnerFailure>,
     outcome: &'static str,
     heading: &'static str,
     authentication: super::super::PrincipalAuthenticationKind,
     json: bool,
 ) -> anyhow::Result<ExitCode> {
     match result {
-        Ok(pool) => {
+        Ok((pool, status)) => {
             if json {
                 write_json(&PoolResult {
                     schema_version: 1,
                     deployment,
                     outcome,
                     pool,
+                    status: status.as_ref().map(|status| status.document),
                 })?;
             } else {
                 let stdout = io::stdout();
@@ -138,6 +154,20 @@ fn write_pool(
                 writeln!(stdout, "  Pool:         {}", pool.id)?;
                 writeln!(stdout, "  Name:         {}", pool.name)?;
                 writeln!(stdout, "  Organization: {}", pool.organization_id)?;
+                if let Some(member) = &pool.member {
+                    match &member.display_name {
+                        Some(name) => writeln!(stdout, "  Member:       {} ({name})", member.id)?,
+                        None => writeln!(stdout, "  Member:       {}", member.id)?,
+                    }
+                }
+                if let Some(status) = &status {
+                    writeln!(stdout, "  Waiting runs: {}", status.queued_runs)?;
+                    writeln!(
+                        stdout,
+                        "  Runners:      {} online · {} busy · {} idle · {} offline",
+                        status.online, status.busy, status.idle, status.offline
+                    )?;
+                }
                 writeln!(stdout, "  Deployment:   {deployment}")?;
             }
             Ok(ExitCode::Success)
@@ -340,6 +370,9 @@ fn write_runner_human_to(
         "  Pool:         {} ({})",
         runner.runner_pool.name, runner.runner_pool.id
     )?;
+    if let Some(join_key) = &runner.join_key {
+        writeln!(output, "  Join key:     {}", join_key.id)?;
+    }
     writeln!(output, "\n  Administration")?;
     writeln!(
         output,
@@ -423,7 +456,7 @@ fn write_assignment_to(
     Ok(())
 }
 
-fn enum_text(value: &impl Serialize) -> anyhow::Result<String> {
+pub(super) fn enum_text(value: &impl Serialize) -> anyhow::Result<String> {
     match serde_json::to_value(value).context("serialize runner state")? {
         serde_json::Value::String(value) => Ok(value),
         _ => Err(anyhow!("runner state is not a contracted string")),
@@ -651,6 +684,24 @@ fn write_failure_with_context(
             "error: runner cannot move while it has active work\n\nDrain or disable the runner, then wait for its reservation and assignments to finish.".to_owned(),
             OutcomeClass::GeneralFailure,
         ),
+        RunnerFailure::PoolPersonal => (
+            "pool_personal",
+            None,
+            "error: a personal runner pool cannot be renamed or deleted\n\nUse another runner pool, or delete a personal pool only after its member has left the organization.".to_owned(),
+            OutcomeClass::GeneralFailure,
+        ),
+        RunnerFailure::PoolPersonalUnavailable => (
+            "pool_personal_unavailable",
+            None,
+            "error: this account has no personal runner pool\n\nName a runner pool with --pool-id, or a member with --member.".to_owned(),
+            OutcomeClass::GeneralFailure,
+        ),
+        RunnerFailure::PersonalPoolNotFound => (
+            "pool_personal_unavailable",
+            None,
+            "error: this account has no personal runner pool in this organization\n\nName a runner pool with --pool-id.".to_owned(),
+            OutcomeClass::GeneralFailure,
+        ),
         RunnerFailure::DeletionUnavailable(_) => (
             "delete_unavailable",
             None,
@@ -722,7 +773,7 @@ fn write_failure_with_context(
     Ok(outcome_class.exit_code())
 }
 
-fn write_json(value: &impl Serialize) -> anyhow::Result<()> {
+pub(super) fn write_json(value: &impl Serialize) -> anyhow::Result<()> {
     let stdout = io::stdout();
     let mut stdout = stdout.lock();
     serde_json::to_writer_pretty(&mut stdout, value).context("serialize JSON runner result")?;
@@ -731,11 +782,13 @@ fn write_json(value: &impl Serialize) -> anyhow::Result<()> {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-struct PoolResult<'a> {
+struct PoolResult<'a, S> {
     schema_version: u8,
     deployment: &'a str,
     outcome: &'static str,
     pool: &'a RunnerPool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    status: Option<&'a S>,
 }
 
 #[derive(Serialize)]

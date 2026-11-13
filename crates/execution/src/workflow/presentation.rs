@@ -1161,6 +1161,9 @@ fn tree_code_message(code: &str) -> &'static str {
         "literal_where_binding_expected" => {
             "Replace the quoted literal with a declared `$binding`."
         }
+        "trigger_rule_invalid" => {
+            "Write the rule as `A == B` comparisons joined by `and`, each operand `true`, `false`, a `$binding` or an `event.` path."
+        }
         "trigger_input_undeclared" => "Name only declared root inputs in the trigger's `inputs`.",
         "trigger_input_missing" => {
             "Supply every input the root workflow requires in the trigger's `inputs`."

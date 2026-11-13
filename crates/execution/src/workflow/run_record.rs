@@ -129,6 +129,16 @@ impl WorkflowRunRecord {
         child
     }
 
+    /// Whether `name` may name an `external` reference `um workflow run create --external`
+    /// records (REQ-LOCALRUN-209): a lowercase letter, then letters, digits and dots.
+    pub fn is_external_name(name: &str) -> bool {
+        let mut characters = name.chars();
+        characters
+            .next()
+            .is_some_and(|first| first.is_ascii_lowercase())
+            && characters.all(|character| character.is_ascii_alphanumeric() || character == '.')
+    }
+
     /// The facts this crate writes and relies on: the ids, the definition and revision
     /// present together, the tree digest, a tree-relative workflow, a subject of the subject
     /// form (REQ-WFDEF-28), a parent naming a run, a step and an element of at least 1, a

@@ -99,10 +99,46 @@ pub enum GetRunRetryRequestError {
     UnknownValue(serde_json::Value),
 }
 
+/// struct for typed errors of method [`list_run_controls`]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ListRunControlsError {
+    Status400(models::Problem),
+    Status401(models::Problem),
+    Status403(models::Problem),
+    Status404(models::Problem),
+    Status500(models::Problem),
+    UnknownValue(serde_json::Value),
+}
+
 /// struct for typed errors of method [`list_run_linear_lifecycle_updates`]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum ListRunLinearLifecycleUpdatesError {
+    Status400(models::Problem),
+    Status401(models::Problem),
+    Status403(models::Problem),
+    Status404(models::Problem),
+    Status500(models::Problem),
+    UnknownValue(serde_json::Value),
+}
+
+/// struct for typed errors of method [`list_run_trigger_deliveries`]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ListRunTriggerDeliveriesError {
+    Status400(models::Problem),
+    Status401(models::Problem),
+    Status403(models::Problem),
+    Status404(models::Problem),
+    Status500(models::Problem),
+    UnknownValue(serde_json::Value),
+}
+
+/// struct for typed errors of method [`list_run_workflow_steps`]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ListRunWorkflowStepsError {
     Status400(models::Problem),
     Status401(models::Problem),
     Status403(models::Problem),
@@ -139,6 +175,22 @@ pub enum RequestRunCancellationError {
     UnknownValue(serde_json::Value),
 }
 
+/// struct for typed errors of method [`request_run_claim_release`]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum RequestRunClaimReleaseError {
+    Status400(models::Problem),
+    Status401(models::Problem),
+    Status403(models::Problem),
+    Status404(models::Problem),
+    Status409(models::Problem),
+    Status413(models::Problem),
+    Status415(models::Problem),
+    Status500(models::Problem),
+    Status503(models::Problem),
+    UnknownValue(serde_json::Value),
+}
+
 /// struct for typed errors of method [`request_run_continuation`]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
@@ -151,6 +203,23 @@ pub enum RequestRunContinuationError {
     Status410(models::RunInputProblem),
     Status413(models::Problem),
     Status415(models::Problem),
+    Status500(models::Problem),
+    Status503(models::Problem),
+    UnknownValue(serde_json::Value),
+}
+
+/// struct for typed errors of method [`request_run_control`]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum RequestRunControlError {
+    Status400(models::Problem),
+    Status401(models::Problem),
+    Status403(models::Problem),
+    Status404(models::Problem),
+    Status409(models::Problem),
+    Status413(models::Problem),
+    Status415(models::Problem),
+    Status422(models::Problem),
     Status500(models::Problem),
     Status503(models::Problem),
     UnknownValue(serde_json::Value),
@@ -181,11 +250,12 @@ pub enum RetryRunLinearLifecycleUpdateError {
     Status403(models::Problem),
     Status404(models::Problem),
     Status409(models::Problem),
+    Status410(models::Problem),
     Status500(models::Problem),
     UnknownValue(serde_json::Value),
 }
 
-/// Resolves the definition branch to a SHA-1 commit and the optional workspace branch or commit with connected-branch membership evidence. Omission shares the definition pin. The workflow closure is read from the definition source and execution uses the workspace source before enqueueing the coordinator command. The idempotency fingerprint covers only normalized caller inputs; completed or pending exact retries retain the original pin. An explicit `workspaceSource` on a deployment without schema-3 activation is answered `409 workspace-selection-unsupported` and creates no run.
+/// Names the run's workflow with `definition`. The run pins the definition's current revision and executes its tree; no workflow file or workflow closure is read from the repository. The project's bound repository supplies only the workspace: the source branch (omission selects the project's current default) resolves to a SHA-1 commit, pinned as the workspace, or the optional `workspaceSource` selects a branch or commit of the same repository with connected-branch membership evidence, before the coordinator command is enqueued. A project bound to a GitLab repository admits no new run (`409 workflow-source-unavailable`). The idempotency fingerprint covers only normalized caller inputs; completed or pending exact retries retain the original pin. An explicit `workspaceSource` on a deployment without schema-3 activation is answered `409 workspace-selection-unsupported` and creates no run.  A request that names a top-level `workflowPath` and no `definition` is answered `410 path-run-retired`, whose detail names the replacement, and creates no run, command or idempotency record; a repeat, under the same key and body, of a creation by workflow path accepted before the retirement still answers its original run. Naming both `workflowPath` and `definition`, naming neither, or naming `publication` with `definition` is `400 bad-request`. Refusals of a definition run create no run: `409 definition-archived` for an archived definition, `422 workflow-not-in-tree` when `definition.workflowPath` names no workflow file of the revision's tree, and, when the selected workflow declares a subject whose slot is held, `409 subject-busy` while the holder is live or `409 subject-settled` once it exited unreleased, both naming the holder in `workflow.holderRunId`.
 pub fn create_run(
     configuration: &configuration::Configuration,
     organization_ref: &str,
@@ -567,6 +637,78 @@ pub fn get_run_retry_request(
     }
 }
 
+/// Pages the controls members asked for the run, newest first by acceptance time and then by id, for any active member of its organization. Each names the attempt it was pinned to, the control as accepted, who asked for it and its state, acceptance apart from application: `accepted` until the runner holding the attempt's assignment acknowledges it, `delivered`, then `applied` with the command's `actionOutcome`, `refused` with the runtime's `code`, or `skipped` with `code` `wait_not_current`, or `assignment_ended` when the assignment ended before the runner settled it. `nextCursor` is present only when more remain and is bound to the organization and run it was issued for; a `limit` outside 1 to 100 or a cursor issued for another scope is answered 400. A run by `workflowPath` and a run of another organization are answered 404 alike; a run with no control answers an empty `items`.
+pub fn list_run_controls(
+    configuration: &configuration::Configuration,
+    organization_ref: &str,
+    run_id: &str,
+    limit: Option<i32>,
+    cursor: Option<&str>,
+) -> Result<models::RunControlList, Error<ListRunControlsError>> {
+    // add a prefix to parameters to efficiently prevent name collisions
+    let p_path_organization_ref = organization_ref;
+    let p_path_run_id = run_id;
+    let p_query_limit = limit;
+    let p_query_cursor = cursor;
+
+    let uri_str = format!(
+        "{}/v1/organizations/{organizationRef}/runs/{runId}/controls",
+        configuration.base_path,
+        organizationRef = crate::generated::apis::urlencode(p_path_organization_ref),
+        runId = crate::generated::apis::urlencode(p_path_run_id)
+    );
+    let mut req_builder = configuration.client.request(reqwest::Method::GET, &uri_str);
+
+    if let Some(ref param_value) = p_query_limit {
+        req_builder = req_builder.query(&[("limit", &param_value.to_string())]);
+    }
+    if let Some(ref param_value) = p_query_cursor {
+        req_builder = req_builder.query(&[("cursor", &param_value.to_string())]);
+    }
+    if let Some(ref user_agent) = configuration.user_agent {
+        req_builder = req_builder.header(reqwest::header::USER_AGENT, user_agent.clone());
+    }
+    if let Some(ref token) = configuration.bearer_access_token {
+        req_builder = req_builder.bearer_auth(token.to_owned());
+    };
+
+    let req = req_builder.build()?;
+    let resp = configuration.client.execute(req)?;
+
+    let status = resp.status();
+    let content_type = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/octet-stream");
+    let content_type = super::ContentType::from(content_type);
+
+    if !status.is_client_error() && !status.is_server_error() {
+        let content = resp.text()?;
+        match content_type {
+            ContentType::Json => serde_json::from_str(&content).map_err(Error::from),
+            ContentType::Text => {
+                return Err(Error::from(serde_json::Error::custom(
+                    "Received `text/plain` content type response that cannot be converted to `models::RunControlList`",
+                )));
+            }
+            ContentType::Unsupported(unknown_type) => {
+                return Err(Error::from(serde_json::Error::custom(format!(
+                    "Received `{unknown_type}` content type response that cannot be converted to `models::RunControlList`"
+                ))));
+            }
+        }
+    } else {
+        let content = resp.text()?;
+        let entity: Option<ListRunControlsError> = serde_json::from_str(&content).ok();
+        Err(Error::ResponseError(ResponseContent {
+            status,
+            content,
+            entity,
+        }))
+    }
+}
+
 /// Pages the run's retained updates newest first by creation time and then by id, each at its current cycle. `nextCursor` is present only when more remain and is bound to the organization and run it was issued for; a `limit` outside 1 to 100 or a cursor issued for another scope is answered 400. A run of another organization and a run without a binding are answered 404 alike; a binding with no update yet answers an empty `items`.
 pub fn list_run_linear_lifecycle_updates(
     configuration: &configuration::Configuration,
@@ -632,6 +774,155 @@ pub fn list_run_linear_lifecycle_updates(
         let content = resp.text()?;
         let entity: Option<ListRunLinearLifecycleUpdatesError> =
             serde_json::from_str(&content).ok();
+        Err(Error::ResponseError(ResponseContent {
+            status,
+            content,
+            entity,
+        }))
+    }
+}
+
+/// Pages the deliveries Cloud pinned to the run at receipt acceptance, under any of its claims, newest first by acceptance time and then by id. Each names its pinned revision, control trigger, event and claim, with the claim's admission observation (null for a manual start), and its state: `pending` until the runner holding the run's assignment acknowledges it, `delivered`, then `applied` with the `action` taken or `skipped` with the `reason` and the runner's `observation`, or `retained` at acceptance with its `reason`. `nextCursor` is present only when more remain and is bound to the organization and run it was issued for; a `limit` outside 1 to 100 or a cursor issued for another scope is answered 400. A run without a subject claim, such as one by `workflowPath`, and a run of another organization are answered 404 alike; a run with no delivery answers an empty `items`.
+pub fn list_run_trigger_deliveries(
+    configuration: &configuration::Configuration,
+    organization_ref: &str,
+    run_id: &str,
+    limit: Option<i32>,
+    cursor: Option<&str>,
+) -> Result<models::RunTriggerDeliveryList, Error<ListRunTriggerDeliveriesError>> {
+    // add a prefix to parameters to efficiently prevent name collisions
+    let p_path_organization_ref = organization_ref;
+    let p_path_run_id = run_id;
+    let p_query_limit = limit;
+    let p_query_cursor = cursor;
+
+    let uri_str = format!(
+        "{}/v1/organizations/{organizationRef}/runs/{runId}/trigger-deliveries",
+        configuration.base_path,
+        organizationRef = crate::generated::apis::urlencode(p_path_organization_ref),
+        runId = crate::generated::apis::urlencode(p_path_run_id)
+    );
+    let mut req_builder = configuration.client.request(reqwest::Method::GET, &uri_str);
+
+    if let Some(ref param_value) = p_query_limit {
+        req_builder = req_builder.query(&[("limit", &param_value.to_string())]);
+    }
+    if let Some(ref param_value) = p_query_cursor {
+        req_builder = req_builder.query(&[("cursor", &param_value.to_string())]);
+    }
+    if let Some(ref user_agent) = configuration.user_agent {
+        req_builder = req_builder.header(reqwest::header::USER_AGENT, user_agent.clone());
+    }
+    if let Some(ref token) = configuration.bearer_access_token {
+        req_builder = req_builder.bearer_auth(token.to_owned());
+    };
+
+    let req = req_builder.build()?;
+    let resp = configuration.client.execute(req)?;
+
+    let status = resp.status();
+    let content_type = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/octet-stream");
+    let content_type = super::ContentType::from(content_type);
+
+    if !status.is_client_error() && !status.is_server_error() {
+        let content = resp.text()?;
+        match content_type {
+            ContentType::Json => serde_json::from_str(&content).map_err(Error::from),
+            ContentType::Text => {
+                return Err(Error::from(serde_json::Error::custom(
+                    "Received `text/plain` content type response that cannot be converted to `models::RunTriggerDeliveryList`",
+                )));
+            }
+            ContentType::Unsupported(unknown_type) => {
+                return Err(Error::from(serde_json::Error::custom(format!(
+                    "Received `{unknown_type}` content type response that cannot be converted to `models::RunTriggerDeliveryList`"
+                ))));
+            }
+        }
+    } else {
+        let content = resp.text()?;
+        let entity: Option<ListRunTriggerDeliveriesError> = serde_json::from_str(&content).ok();
+        Err(Error::ResponseError(ResponseContent {
+            status,
+            content,
+            entity,
+        }))
+    }
+}
+
+/// Pages the step observations the runner of a definition-backed run reported for one attempt of the run, `attemptNumber` or by default the current attempt, in the order first reported. A report changes only the item of the same run path, engine attempt and step; a step that runs again is a further item. Cloud keeps at most 4096 items for one attempt and answers `truncated: true` once a report past that was dropped. `nextCursor` is present only when more remain and is bound to the organization, run and attempt it was issued for; a `limit` outside 1 to 100, an `attemptNumber` below 1, a cursor issued for another scope or an `attemptNumber` other than the cursor's is answered 400. A run by `workflowPath`, and an attempt with no report, answer an empty `items`; a run of another organization is answered 404.
+pub fn list_run_workflow_steps(
+    configuration: &configuration::Configuration,
+    organization_ref: &str,
+    run_id: &str,
+    attempt_number: Option<i32>,
+    limit: Option<i32>,
+    cursor: Option<&str>,
+) -> Result<models::RunWorkflowStepList, Error<ListRunWorkflowStepsError>> {
+    // add a prefix to parameters to efficiently prevent name collisions
+    let p_path_organization_ref = organization_ref;
+    let p_path_run_id = run_id;
+    let p_query_attempt_number = attempt_number;
+    let p_query_limit = limit;
+    let p_query_cursor = cursor;
+
+    let uri_str = format!(
+        "{}/v1/organizations/{organizationRef}/runs/{runId}/workflow-steps",
+        configuration.base_path,
+        organizationRef = crate::generated::apis::urlencode(p_path_organization_ref),
+        runId = crate::generated::apis::urlencode(p_path_run_id)
+    );
+    let mut req_builder = configuration.client.request(reqwest::Method::GET, &uri_str);
+
+    if let Some(ref param_value) = p_query_attempt_number {
+        req_builder = req_builder.query(&[("attemptNumber", &param_value.to_string())]);
+    }
+    if let Some(ref param_value) = p_query_limit {
+        req_builder = req_builder.query(&[("limit", &param_value.to_string())]);
+    }
+    if let Some(ref param_value) = p_query_cursor {
+        req_builder = req_builder.query(&[("cursor", &param_value.to_string())]);
+    }
+    if let Some(ref user_agent) = configuration.user_agent {
+        req_builder = req_builder.header(reqwest::header::USER_AGENT, user_agent.clone());
+    }
+    if let Some(ref token) = configuration.bearer_access_token {
+        req_builder = req_builder.bearer_auth(token.to_owned());
+    };
+
+    let req = req_builder.build()?;
+    let resp = configuration.client.execute(req)?;
+
+    let status = resp.status();
+    let content_type = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/octet-stream");
+    let content_type = super::ContentType::from(content_type);
+
+    if !status.is_client_error() && !status.is_server_error() {
+        let content = resp.text()?;
+        match content_type {
+            ContentType::Json => serde_json::from_str(&content).map_err(Error::from),
+            ContentType::Text => {
+                return Err(Error::from(serde_json::Error::custom(
+                    "Received `text/plain` content type response that cannot be converted to `models::RunWorkflowStepList`",
+                )));
+            }
+            ContentType::Unsupported(unknown_type) => {
+                return Err(Error::from(serde_json::Error::custom(format!(
+                    "Received `{unknown_type}` content type response that cannot be converted to `models::RunWorkflowStepList`"
+                ))));
+            }
+        }
+    } else {
+        let content = resp.text()?;
+        let entity: Option<ListRunWorkflowStepsError> = serde_json::from_str(&content).ok();
         Err(Error::ResponseError(ResponseContent {
             status,
             content,
@@ -815,7 +1106,77 @@ pub fn request_run_cancellation(
     }
 }
 
-/// Admission is not execution. Exact authorized replay returns the original 201 response bytes. A 503 names its cause: `retryable-conflict` for concurrent work or `run-input-storage-unavailable` for input storage; both carry `Retry-After`.
+/// Requires a current direct organization owner. Releases the run's current subject claim, the claim `claimId` names or, when omitted, the current one, recording release cause `owner` and the `run.claim_released` audit action; the definition's slot for the subject reads free afterward. A live run (its creation or a retry pending, or queued, running or waiting) is answered 409 `claim-live` and a `claimId` that is not the run's current claim 409 `claim-changed`; both change nothing. A claim already released is answered as it stands. A run without a subject claim, such as one by `workflowPath`, and a run of another organization are answered 404 alike. An exact key replay answers the claim the key first answered, even after a retry took a new claim.
+pub fn request_run_claim_release(
+    configuration: &configuration::Configuration,
+    organization_ref: &str,
+    run_id: &str,
+    idempotency_key: &str,
+    run_claim_release_request: models::RunClaimReleaseRequest,
+) -> Result<models::RunSubjectClaim, Error<RequestRunClaimReleaseError>> {
+    // add a prefix to parameters to efficiently prevent name collisions
+    let p_path_organization_ref = organization_ref;
+    let p_path_run_id = run_id;
+    let p_header_idempotency_key = idempotency_key;
+    let p_body_run_claim_release_request = run_claim_release_request;
+
+    let uri_str = format!(
+        "{}/v1/organizations/{organizationRef}/runs/{runId}/claim-release",
+        configuration.base_path,
+        organizationRef = crate::generated::apis::urlencode(p_path_organization_ref),
+        runId = crate::generated::apis::urlencode(p_path_run_id)
+    );
+    let mut req_builder = configuration
+        .client
+        .request(reqwest::Method::POST, &uri_str);
+
+    if let Some(ref user_agent) = configuration.user_agent {
+        req_builder = req_builder.header(reqwest::header::USER_AGENT, user_agent.clone());
+    }
+    req_builder = req_builder.header("Idempotency-Key", p_header_idempotency_key.to_string());
+    if let Some(ref token) = configuration.bearer_access_token {
+        req_builder = req_builder.bearer_auth(token.to_owned());
+    };
+    req_builder = req_builder.json(&p_body_run_claim_release_request);
+
+    let req = req_builder.build()?;
+    let resp = configuration.client.execute(req)?;
+
+    let status = resp.status();
+    let content_type = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/octet-stream");
+    let content_type = super::ContentType::from(content_type);
+
+    if !status.is_client_error() && !status.is_server_error() {
+        let content = resp.text()?;
+        match content_type {
+            ContentType::Json => serde_json::from_str(&content).map_err(Error::from),
+            ContentType::Text => {
+                return Err(Error::from(serde_json::Error::custom(
+                    "Received `text/plain` content type response that cannot be converted to `models::RunSubjectClaim`",
+                )));
+            }
+            ContentType::Unsupported(unknown_type) => {
+                return Err(Error::from(serde_json::Error::custom(format!(
+                    "Received `{unknown_type}` content type response that cannot be converted to `models::RunSubjectClaim`"
+                ))));
+            }
+        }
+    } else {
+        let content = resp.text()?;
+        let entity: Option<RequestRunClaimReleaseError> = serde_json::from_str(&content).ok();
+        Err(Error::ResponseError(ResponseContent {
+            status,
+            content,
+            entity,
+        }))
+    }
+}
+
+/// Admission is not execution. Exact authorized replay returns the original 201 response bytes. A 503 `retryable-conflict` for concurrent work carries `Retry-After`.  Only a definition-backed run is continued. A request for a run created by `workflowPath` is answered `410` `path-run-retired` after membership and the run's existence are judged, whatever it names, and admits nothing; repeating a request admitted before the retirement still returns its original 201. A definition-backed run is continued by adoption: Cloud plans no partition, the named root steps pass to the retaining runner unvalidated and the receipt inherits no step. Its refusals create no attempt and are each a 409 problem of its own type with no `continuationViolations`: `definition-run-not-continuable` for a replaced definition, `continuation-step-required` when the request names no step and the current attempt reported an exit, `tree-continuation-unavailable` when the retaining runner does not advertise adoption, and `subject-busy` or `subject-settled`, naming the holder in `workflow.holderRunId`, when another run holds the subject.
 pub fn request_run_continuation(
     configuration: &configuration::Configuration,
     organization_ref: &str,
@@ -885,6 +1246,77 @@ pub fn request_run_continuation(
     }
 }
 
+/// Requires an active member of the run's organization. Accepts one control for the run: `answer` with the `wait` and its `answers`, `approve` or `retry` with the `wait`, `hand_back` with the `wait` and `notes`, `lift` with an optional `wait` and `before`, or `stop` with `before` and an optional `reason`; a member a kind does not carry, or a missing one it requires, is answered 400. The control is pinned to the run, its current attempt and the assignment executing that attempt, and carried to the runner holding that assignment; it is never retargeted. A run whose current attempt holds no executing assignment is answered 409 `run-not-live`. For every kind but `stop`, and for a `lift` that names a wait, `wait.kind` and `wait.since` must name the wait of the run's latest progress report for its current attempt (`workflowProgress.wait`), else 409 `wait-not-current`. A control whose runner frame would exceed the runner protocol's 262,144-byte ordinary frame is answered 422 `control-too-large`. A run by `workflowPath` and a run of another organization are answered 404 alike. Acceptance never claims application: the answer is the control `accepted`, and the runner's acknowledgement and report move it on (`listRunControls`). An exact key replay answers the control the key first accepted, as it stands now; a refusal records nothing, so the key may be sent again.
+pub fn request_run_control(
+    configuration: &configuration::Configuration,
+    organization_ref: &str,
+    run_id: &str,
+    idempotency_key: &str,
+    run_control_request: models::RunControlRequest,
+) -> Result<models::RunControl, Error<RequestRunControlError>> {
+    // add a prefix to parameters to efficiently prevent name collisions
+    let p_path_organization_ref = organization_ref;
+    let p_path_run_id = run_id;
+    let p_header_idempotency_key = idempotency_key;
+    let p_body_run_control_request = run_control_request;
+
+    let uri_str = format!(
+        "{}/v1/organizations/{organizationRef}/runs/{runId}/controls",
+        configuration.base_path,
+        organizationRef = crate::generated::apis::urlencode(p_path_organization_ref),
+        runId = crate::generated::apis::urlencode(p_path_run_id)
+    );
+    let mut req_builder = configuration
+        .client
+        .request(reqwest::Method::POST, &uri_str);
+
+    if let Some(ref user_agent) = configuration.user_agent {
+        req_builder = req_builder.header(reqwest::header::USER_AGENT, user_agent.clone());
+    }
+    req_builder = req_builder.header("Idempotency-Key", p_header_idempotency_key.to_string());
+    if let Some(ref token) = configuration.bearer_access_token {
+        req_builder = req_builder.bearer_auth(token.to_owned());
+    };
+    req_builder = req_builder.json(&p_body_run_control_request);
+
+    let req = req_builder.build()?;
+    let resp = configuration.client.execute(req)?;
+
+    let status = resp.status();
+    let content_type = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/octet-stream");
+    let content_type = super::ContentType::from(content_type);
+
+    if !status.is_client_error() && !status.is_server_error() {
+        let content = resp.text()?;
+        match content_type {
+            ContentType::Json => serde_json::from_str(&content).map_err(Error::from),
+            ContentType::Text => {
+                return Err(Error::from(serde_json::Error::custom(
+                    "Received `text/plain` content type response that cannot be converted to `models::RunControl`",
+                )));
+            }
+            ContentType::Unsupported(unknown_type) => {
+                return Err(Error::from(serde_json::Error::custom(format!(
+                    "Received `{unknown_type}` content type response that cannot be converted to `models::RunControl`"
+                ))));
+            }
+        }
+    } else {
+        let content = resp.text()?;
+        let entity: Option<RequestRunControlError> = serde_json::from_str(&content).ok();
+        Err(Error::ResponseError(ResponseContent {
+            status,
+            content,
+            entity,
+        }))
+    }
+}
+
+/// Only a definition-backed run is retried. A request for a run created by `workflowPath` is refused `409` `path-run-retired` after ownership and the run's existence are judged, and records nothing; repeating a request accepted before the retirement still answers its original receipt.
 pub fn request_run_retry(
     configuration: &configuration::Configuration,
     organization_ref: &str,
@@ -954,7 +1386,7 @@ pub fn request_run_retry(
     }
 }
 
-/// Requires a current direct organization owner. Opens the next cycle of an update that is `failed` with `retryable` true while it is the run's newest update with a desired state, its binding is `current` with the update's attempt holding the issue's epoch, and the binding's authority checks pass; the cycle's deadline is 24 hours after acceptance. An exact key replay returns the originally accepted cycle while the update is retained. An active cycle, a newer update, a superseded, relinquished or stopped binding, an ineligible outcome and a failed check are answered 409 and start nothing. A retry never starts a run, attempt or Publication.
+/// Retired with the Linear lifecycle policy: lifecycle bindings and updates are read-only history, so this answers 410 `trigger-model-retired` for every authenticated caller, opens no cycle and writes no Linear issue state. Its `detail` names a workflow definition's `mirror` as the replacement. Apart from 400 for a malformed request, 401 and 500, the other responses describe the retired operation and are no longer answered.
 pub fn retry_run_linear_lifecycle_update(
     configuration: &configuration::Configuration,
     organization_ref: &str,

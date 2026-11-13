@@ -29,6 +29,22 @@ pub struct RunObservation {
     /// Latest assignment decline only while queued; cleared by the next offer.
     #[serde(rename = "lastDecline", deserialize_with = "Option::deserialize")]
     pub last_decline: Option<Box<models::RunPlacementDecline>>,
+    /// Why a queued run cannot be offered to any runner of its pool, read at request time: tree_execution_unavailable while the run is definition-backed and no enabled, connected runner of the pool advertises tree execution. Null or absent when the run is not queued or some runner could take it.
+    #[serde(
+        rename = "placementReason",
+        default,
+        with = "crate::nullable::double_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub placement_reason: Option<Option<PlacementReason>>,
+    /// What a queued run waits for, read at request time. Null when a runner that fits the run is connected and free, and when the run is not queued; absent from a Cloud that does not report it.
+    #[serde(
+        rename = "waiting",
+        default,
+        with = "crate::nullable::double_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub waiting: Option<Option<Box<models::RunWaiting>>>,
 }
 
 impl RunObservation {
@@ -46,6 +62,20 @@ impl RunObservation {
             assignment: assignment.map(Box::new),
             last_transition: last_transition.map(Box::new),
             last_decline: last_decline.map(Box::new),
+            placement_reason: None,
+            waiting: None,
         }
+    }
+}
+/// Why a queued run cannot be offered to any runner of its pool, read at request time: tree_execution_unavailable while the run is definition-backed and no enabled, connected runner of the pool advertises tree execution. Null or absent when the run is not queued or some runner could take it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
+pub enum PlacementReason {
+    #[serde(rename = "tree_execution_unavailable")]
+    TreeExecutionUnavailable,
+}
+
+impl Default for PlacementReason {
+    fn default() -> PlacementReason {
+        Self::TreeExecutionUnavailable
     }
 }

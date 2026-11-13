@@ -3,19 +3,13 @@ use super::*;
 impl ExecutionJob {
     pub(super) async fn run_workflow(
         &mut self,
+        mut admitted: AdmittedWorkflow,
         assignment_id: &str,
         attempt_id: &str,
         run_id: &str,
     ) -> ExecutionCompletion {
-        let post_stop_fence =
-            PostStopFence::with_workflow_git(Some(self.accepted.workflow_git.clone()));
-        let cancellation = self
-            .accepted
-            .admitted
-            .execution()
-            .cancellation()
-            .source()
-            .clone();
+        let post_stop_fence = PostStopFence::with_workflow_git(self.accepted.workflow_git.clone());
+        let cancellation = admitted.execution().cancellation().source().clone();
         if let Err(completion) = self
             .ensure_execution_authority(&cancellation, &post_stop_fence, assignment_id, attempt_id)
             .await
@@ -69,10 +63,7 @@ impl ExecutionJob {
             }
         };
         let artifacts = match self.stage_or_abort(
-            ArtifactStaging::create(
-                self.accepted.admitted.execution(),
-                &self.accepted.root.private,
-            ),
+            ArtifactStaging::create(admitted.execution(), &self.accepted.root.private),
             artifact_staging_cause,
             "artifact_staging",
             assignment_id,
@@ -82,10 +73,7 @@ impl ExecutionJob {
             Err(completion) => return *completion,
         };
         let inputs = match self.stage_or_abort(
-            InputStaging::create(
-                self.accepted.admitted.execution(),
-                &self.accepted.root.private,
-            ),
+            InputStaging::create(admitted.execution(), &self.accepted.root.private),
             input_staging_cause,
             "input_staging",
             assignment_id,
@@ -94,9 +82,7 @@ impl ExecutionJob {
             Ok(staging) => staging,
             Err(completion) => return *completion,
         };
-        let recovery_agent_steps: BTreeSet<String> = self
-            .accepted
-            .admitted
+        let recovery_agent_steps: BTreeSet<String> = admitted
             .workflow()
             .definition
             .recoveries
@@ -111,13 +97,10 @@ impl ExecutionJob {
                 })
             })
             .collect();
-        let agent_staging = if !self.accepted.admitted.requires_agent_runtime() {
+        let agent_staging = if !admitted.requires_agent_runtime() {
             None
         } else {
-            match AgentInputStaging::create(
-                self.accepted.admitted.execution(),
-                &self.accepted.root.private,
-            ) {
+            match AgentInputStaging::create(admitted.execution(), &self.accepted.root.private) {
                 Ok(staging) => Some(PreserveOnDrop::new(staging)),
                 Err(error) => {
                     return self.execution_environment_lost(
@@ -181,13 +164,7 @@ impl ExecutionJob {
             RunnerInvocationEvidence {
                 diagnostics: diagnostics.clone(),
                 accounting: accounting.clone(),
-                agent_steps: self
-                    .accepted
-                    .admitted
-                    .agent_steps()
-                    .keys()
-                    .cloned()
-                    .collect(),
+                agent_steps: admitted.agent_steps().keys().cloned().collect(),
                 recovery_agent_steps,
             },
             self.run_event.clone(),
@@ -197,7 +174,7 @@ impl ExecutionJob {
             .process_guards
             .registry(self.accepted.guard_processes);
         let seed = if let Some(continuation) = &self.accepted.continuation {
-            let admitted = self.accepted.admitted.clone();
+            let admitted = admitted.clone();
             let artifacts = artifacts.clone();
             let roots = self.accepted.root.retained_private_roots.clone();
             let prior_id = continuation.prior_attempt_id.clone();
@@ -248,7 +225,7 @@ impl ExecutionJob {
                         );
                     }
                 };
-                let admitted = self.accepted.admitted.clone();
+                let bound_admitted = admitted.clone();
                 let private = self.accepted.root.private.path().to_path_buf();
                 let prior = self.accepted.continuation.as_ref().and_then(|offer| {
                     self.accepted
@@ -265,7 +242,7 @@ impl ExecutionJob {
                 });
                 let bound = tokio::task::spawn_blocking(move || {
                     let admitted = um_execution::bind_cloud_continuation_context(
-                        admitted,
+                        bound_admitted,
                         &private,
                         &record,
                         prior
@@ -275,7 +252,7 @@ impl ExecutionJob {
                     Ok::<_, um_execution::LocalRunDirectoryError>((admitted, seed))
                 })
                 .await;
-                let (admitted, seed) = match bound {
+                let (rebound, seed) = match bound {
                     Ok(Ok(bound)) => bound,
                     _ => {
                         self.run_event.leave(PhaseEnd::Failed);
@@ -287,7 +264,7 @@ impl ExecutionJob {
                         );
                     }
                 };
-                self.accepted.admitted = admitted;
+                admitted = rebound;
                 WorkflowExecutionStart::seeded(process_guard_registry, seed)
             }
             None => WorkflowExecutionStart::initial(process_guard_registry),
@@ -315,12 +292,7 @@ impl ExecutionJob {
         let execution = if let (Some(agent_staging), Some(diagnostic_sessions)) =
             (&agent_staging, agent_diagnostic_sessions)
         {
-            let maximum_log_bytes = self
-                .accepted
-                .admitted
-                .execution()
-                .limits()
-                .maximum_step_log_bytes();
+            let maximum_log_bytes = admitted.execution().limits().maximum_step_log_bytes();
             let dispatcher = production_agent_dispatcher(
                 diagnostics.clone(),
                 maximum_log_bytes,
@@ -359,7 +331,7 @@ impl ExecutionJob {
             mark_engine_terminal(
                 run_under_lease(
                     Box::pin(execute_workflow(
-                        self.accepted.admitted.clone(),
+                        admitted.clone(),
                         &artifacts,
                         &inputs,
                         &diagnostics,
@@ -390,7 +362,7 @@ impl ExecutionJob {
             mark_engine_terminal(
                 run_under_lease(
                     Box::pin(execute_workflow(
-                        self.accepted.admitted.clone(),
+                        admitted.clone(),
                         &artifacts,
                         &inputs,
                         &diagnostics,
@@ -416,7 +388,9 @@ impl ExecutionJob {
             )
             .await
         };
-        self.accepted.workflow_git.disable();
+        if let Some(workflow_git) = &self.accepted.workflow_git {
+            workflow_git.disable();
+        }
 
         let phase_end = match &execution {
             LeaseExecution::Completed {
@@ -497,13 +471,7 @@ impl ExecutionJob {
         }
         self.run_event.leave(phase_end);
         let last_sequence = observer.last_sequence();
-        let has_finalizers = !self
-            .accepted
-            .admitted
-            .workflow()
-            .definition
-            .finalizers
-            .is_empty();
+        let has_finalizers = !admitted.workflow().definition.finalizers.is_empty();
         let inconsistency = if last_sequence == 0 {
             Some("terminal_sequence_missing")
         } else if observer.terminal_sequence() != Some(last_sequence) {
@@ -593,6 +561,7 @@ impl ExecutionJob {
         .and_then(Result::ok);
         let finished_at = RunnerExecutionClock.now();
         let prepared = match self.runner_result(
+            &admitted,
             &diagnostics,
             result.clone(),
             &observer,
@@ -888,5 +857,236 @@ impl ExecutionJob {
             }
         };
         ExecutionCompletion::containment_gated(report, workspace_disposition)
+    }
+
+    /// A tree run (REQ-RUNNERENROLL-91): `um workflow run create`, or the adopted run of a
+    /// continuation (REQ-RUNNERENROLL-89), and the resume loop under the assignment's
+    /// lease, its root progress and step observations queued as they change
+    /// (REQ-RUNNERENROLL-88), then the record's exit as the attempt's one terminal report,
+    /// after the gate transitions that reach it and with no step transition
+    /// (REQ-RUNNERENROLL-99).
+    pub(super) async fn run_tree(
+        &mut self,
+        tree: &TreeRun,
+        assignment_id: &str,
+        attempt_id: &str,
+    ) -> ExecutionCompletion {
+        let post_stop_fence = PostStopFence::with_workflow_git(None);
+        let cancellation = tree.cancellation().source().clone();
+        if let Err(completion) = self
+            .ensure_execution_authority(&cancellation, &post_stop_fence, assignment_id, attempt_id)
+            .await
+        {
+            return completion;
+        }
+        if self
+            .enqueue(assignment_id, attempt_id, ExecutionReport::Started)
+            .is_none()
+        {
+            return self.abort_retained(assignment_id, attempt_id, 0, "runner_internal_failure");
+        }
+        if let Err(completion) = self
+            .wait_for_start_authority(&cancellation, &post_stop_fence, assignment_id, attempt_id)
+            .await
+        {
+            return completion;
+        }
+        let initial_authority = self.authority_updates.borrow().clone();
+        let initial_wait = match self
+            .lease_clock
+            .start_wait(initial_authority.renewal_request)
+        {
+            Ok(wait) => wait,
+            Err(error) => {
+                self.lease_clock_failure(error);
+                return self
+                    .fail_before_execution(
+                        &cancellation,
+                        &post_stop_fence,
+                        assignment_id,
+                        attempt_id,
+                    )
+                    .await;
+            }
+        };
+        self.run_event.enter(RunPhase::Execution);
+        let report = |report| self.enqueue(assignment_id, attempt_id, report).is_some();
+        let execution = mark_engine_terminal(
+            run_under_lease(
+                tree.drive(&report),
+                &cancellation,
+                &self.lease_clock,
+                self.authority_updates.clone(),
+                self.infrastructure_interruption.clone(),
+                Some((initial_authority.sequence, initial_wait)),
+                &self.causal_lease,
+                &self.outbox,
+                assignment_id,
+                attempt_id,
+                &post_stop_fence,
+                &self.accepted.process_guards,
+            ),
+            Arc::clone(&self.engine_terminal),
+        )
+        .await;
+        let end = match execution {
+            LeaseExecution::Completed {
+                output: Ok(end), ..
+            } => end,
+            LeaseExecution::Completed {
+                output: Err(super::super::tree_run::DriveFailure::ReportUnqueued),
+                ..
+            } => {
+                self.run_event.leave(PhaseEnd::Failed);
+                return self.abort_retained(
+                    assignment_id,
+                    attempt_id,
+                    0,
+                    "runner_internal_failure",
+                );
+            }
+            LeaseExecution::Completed {
+                output: Err(super::super::tree_run::DriveFailure::Cause(cause)),
+                ..
+            } => {
+                self.run_event.leave(PhaseEnd::Failed);
+                self.collapse("runner_internal_failure", cause, "harness_execution");
+                return self
+                    .abort_unless_fenced(
+                        &post_stop_fence,
+                        assignment_id,
+                        attempt_id,
+                        0,
+                        "runner_internal_failure",
+                    )
+                    .await;
+            }
+            LeaseExecution::ContainmentDeadline => {
+                self.run_event.leave(PhaseEnd::TimedOut);
+                return ExecutionCompletion::fenced(None);
+            }
+            LeaseExecution::LeaseClockFailed { quiescent, error } => {
+                self.run_event.leave(PhaseEnd::Failed);
+                self.lease_clock_failure(error);
+                let report = quiescent
+                    .then(|| self.abort(assignment_id, attempt_id, 0, "runner_internal_failure"));
+                return ExecutionCompletion::lease_clock_failed(report.flatten());
+            }
+        };
+        // A `mirror/` the runner could not read reports no writes and no release
+        // (REQ-RUNNERENROLL-99); the run event keeps why.
+        if let Some(failure) = end.mirror_failure {
+            self.run_event.set(KeyValue::new(
+                telemetry::attribute::MIRROR_READ_FAILURE,
+                failure,
+            ));
+        }
+        let (transitions, result, tree_exit) = match end.conclusion() {
+            TreeConclusion::Terminal {
+                transitions,
+                result,
+                exit,
+            } => (transitions, result, exit),
+            // No record, a failure without its issue, or a record a cancellation left
+            // unsettled has no truthful result: the attempt is interrupted as the
+            // engine interrupts an unexpected outcome.
+            TreeConclusion::Unreportable(cause) => {
+                self.run_event.leave(PhaseEnd::Failed);
+                self.collapse("runner_internal_failure", cause, "harness_execution");
+                return self
+                    .abort_unless_fenced(
+                        &post_stop_fence,
+                        assignment_id,
+                        attempt_id,
+                        0,
+                        "runner_internal_failure",
+                    )
+                    .await;
+            }
+        };
+        self.run_event.leave(match &result {
+            TransportResult::Succeeded => PhaseEnd::Succeeded,
+            TransportResult::Failed { .. } => PhaseEnd::Failed,
+            TransportResult::Interrupted {
+                reason: CancellationReason::ExecutionLeaseExpired,
+            } => PhaseEnd::TimedOut,
+            TransportResult::Cancelled { .. } | TransportResult::Interrupted { .. } => {
+                PhaseEnd::Cancelled
+            }
+        });
+        let mut last_sequence = 0;
+        for event in transitions {
+            let sequence = last_sequence + 1;
+            let report = ExecutionReport::Transition {
+                execution_event_sequence: sequence,
+                workflow_event: event,
+                diagnostic: None,
+            };
+            if self.enqueue(assignment_id, attempt_id, report).is_none() {
+                return self.abort_retained(
+                    assignment_id,
+                    attempt_id,
+                    last_sequence,
+                    "runner_internal_failure",
+                );
+            }
+            last_sequence = sequence;
+        }
+        // A tree run delivers no result set (REQ-RUNNERENROLL-99): the required field reads
+        // `failed` at `preparation` for every finish, a succeeded one included, and means only
+        // that no set was delivered. The run-scoped home is removed on success.
+        let artifact_delivery = json!({
+            "outcome": "failed",
+            "phase": "preparation",
+            "code": "delivery_internal_failure",
+        });
+        let outcome = result.outcome();
+        let (report, disposition) = match result {
+            TransportResult::Interrupted { reason } => (
+                ExecutionReport::Interrupted {
+                    final_execution_event_sequence: last_sequence,
+                    reason: if reason == CancellationReason::RunnerShutdown {
+                        InfrastructureInterruption::RunnerShutdown
+                    } else {
+                        InfrastructureInterruption::ExecutionLeaseExpired
+                    }
+                    .report_reason()
+                    .to_owned(),
+                    terminal_outcome: outcome,
+                    artifact_delivery,
+                },
+                WorkspaceDisposition::Retain(RetentionReason::Interrupted),
+            ),
+            result => {
+                // A failure the runner classified itself, such as a refused first resume of
+                // an adopted run, carries its safe facts; it is an ordinary finish, so the
+                // workspace stays retained and no boot fault is recorded.
+                let (diagnostic, disposition) = match result {
+                    TransportResult::Succeeded => (None, WorkspaceDisposition::Remove),
+                    TransportResult::Cancelled { .. } => (
+                        None,
+                        WorkspaceDisposition::Retain(RetentionReason::Cancelled),
+                    ),
+                    TransportResult::Failed { diagnostic, .. } => (
+                        diagnostic,
+                        WorkspaceDisposition::Retain(RetentionReason::Failed),
+                    ),
+                    TransportResult::Interrupted { .. } => {
+                        (None, WorkspaceDisposition::Retain(RetentionReason::Failed))
+                    }
+                };
+                (
+                    ExecutionReport::TreeFinished {
+                        final_execution_event_sequence: last_sequence,
+                        outcome,
+                        artifact_delivery,
+                        diagnostic,
+                        exit: tree_exit,
+                    },
+                    disposition,
+                )
+            }
+        };
+        ExecutionCompletion::containment_gated(report, disposition)
     }
 }

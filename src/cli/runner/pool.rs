@@ -1,5 +1,6 @@
 use anyhow::Context;
 use clap::{Args, Subcommand};
+use um_api::RunnerFailure;
 
 use super::{
     CloudOptions, Deployment, ExitCode, OrganizationArg, PaginationArgs, PoolArg, cloud,
@@ -164,11 +165,31 @@ impl ShowCommand {
             deployment,
             self.options.http.transport_policy(),
             &self.options.authentication,
-            |api| api.get_pool(&self.organization, &self.pool),
+            |api| {
+                let pool = api.get_pool(&self.organization, &self.pool)?;
+                let status = match api.get_pool_status(&self.organization, &pool.id) {
+                    Ok(status) => Some(status),
+                    // A Cloud release before the status read answers 404; show the pool alone.
+                    Err(RunnerFailure::NotFound) => None,
+                    Err(failure) => return Err(failure),
+                };
+                Ok((pool, status))
+            },
         )?;
+        let shown = result.as_ref().map(|(pool, status)| {
+            let status = status.as_ref().map(|status| cloud::PoolStatus {
+                document: status,
+                queued_runs: status.queued_runs,
+                online: status.runners.online,
+                busy: status.runners.busy,
+                idle: status.runners.idle,
+                offline: status.runners.offline,
+            });
+            (pool, status)
+        });
         cloud::write_pool_show(
             deployment.fingerprint().api_url(),
-            &result,
+            shown,
             self.options.authentication.kind(),
             self.options.json,
         )

@@ -15,6 +15,7 @@ mod run_inputs;
 mod source;
 #[cfg(test)]
 mod test_support;
+mod tree_run;
 mod workflow_git;
 mod workspace;
 
@@ -41,7 +42,8 @@ use crate::agent_login::setup::{AgentLoginSetup, AssignmentGate, SetupDependenci
 use crate::control_protocol::{AssignmentCounts, ConnectionFailure, ControlError};
 use crate::telemetry::{self, Event, Outcome, Recorder};
 use assignment::{AssignmentDependencies, AssignmentManager};
-use backoff::Backoff;
+// Enrollment resends an ambiguous join with the same reconnect backoff.
+pub(crate) use backoff::Backoff;
 use connection::{
     ActiveEffectEvent, ConnectionCause, ConnectionDependencies, ConnectionError,
     ConnectionProgress, FailureKind, FrameSource, OpeningHello, SystemFrameSource, opening_hello,
@@ -333,6 +335,7 @@ pub(crate) enum ServiceError {
     WorkspaceCleanupFailed(Option<Vec<String>>),
     SourceBrokerConfiguration(url::Url),
     InputBrokerConfiguration(url::Url),
+    TreeBrokerConfiguration(url::Url),
 }
 
 impl fmt::Display for ServiceError {
@@ -372,6 +375,11 @@ impl fmt::Display for ServiceError {
                 "start runner run-input broker: unsupported {} endpoint scheme\n\nUse a ws or wss runner endpoint.",
                 endpoint.scheme()
             ),
+            Self::TreeBrokerConfiguration(endpoint) => write!(
+                formatter,
+                "start runner workflow tree broker: unsupported {} endpoint scheme\n\nUse a ws or wss runner endpoint.",
+                endpoint.scheme()
+            ),
         }
     }
 }
@@ -396,7 +404,8 @@ impl std::error::Error for ServiceError {
             | Self::WorkRootIsolation
             | Self::WorkspaceCleanupFailed(_)
             | Self::SourceBrokerConfiguration(_)
-            | Self::InputBrokerConfiguration(_) => None,
+            | Self::InputBrokerConfiguration(_)
+            | Self::TreeBrokerConfiguration(_) => None,
             Self::Connection(error) => Some(error),
             Self::Control(error) => Some(error),
             Self::LeaseClock(error) => Some(error),
@@ -578,7 +587,27 @@ where
     result
 }
 
-async fn run_connection_loop_with_work_root(
+/// Boxes the connection loop's state (about 39 KB in a debug build, growing with
+/// the runner-protocol types it holds across await points). Returned by value,
+/// it was copied into each awaiting caller's frame, and with frame decoding on
+/// top that overflowed a two-megabyte test-thread stack.
+fn run_connection_loop_with_work_root<'a>(
+    dependencies: ConnectionLoopDependencies,
+    connector: &'a dyn Connector,
+    backoff: Backoff,
+    shutdown: &'a mut dyn Shutdown,
+    work_root: Arc<workspace::WorkRootLease>,
+) -> Pin<Box<impl Future<Output = Result<(), ServiceError>> + 'a>> {
+    Box::pin(connection_loop_with_work_root(
+        dependencies,
+        connector,
+        backoff,
+        shutdown,
+        work_root,
+    ))
+}
+
+async fn connection_loop_with_work_root(
     dependencies: ConnectionLoopDependencies,
     connector: &dyn Connector,
     mut backoff: Backoff,

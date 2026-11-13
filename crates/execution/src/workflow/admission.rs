@@ -132,6 +132,8 @@ struct CancellationOperationState {
     pending_force_abort: bool,
     phase_reason: Option<CancellationReason>,
     force_abort_requested: bool,
+    /// The ordinary-phase cancellation was requested as a withdrawal (REQ-WFEXEC-73).
+    withdrawal: bool,
     interruption_requested: bool,
 }
 
@@ -146,6 +148,7 @@ impl Default for CancellationOperationState {
             pending_force_abort: false,
             phase_reason: None,
             force_abort_requested: false,
+            withdrawal: false,
             interruption_requested: false,
         }
     }
@@ -195,13 +198,33 @@ impl CancellationSource {
     }
 
     pub fn request_cancellation(&self, reason: CancellationReason) -> bool {
+        self.request_graceful(reason, false)
+    }
+
+    /// Requests the graceful `user_request` cancellation a withdrawal honored at a `workflow`
+    /// step boundary ends the attempt with (REQ-WFEXEC-73), and marks it a withdrawal when it
+    /// is the one the ordinary phase accepts; false when another cancellation came first or
+    /// the ordinary phase has ended.
+    pub fn request_withdrawal(&self) -> bool {
+        self.request_graceful(CancellationReason::UserRequest, true)
+    }
+
+    /// Whether the ordinary-phase cancellation was requested by `request_withdrawal`.
+    pub fn withdrawal_requested(&self) -> bool {
+        lock_cancellation_operations(&self.operations).withdrawal
+    }
+
+    fn request_graceful(&self, reason: CancellationReason, withdrawal: bool) -> bool {
         if reason == CancellationReason::ForceAbort {
             return false;
         }
         let version = {
             let mut state = lock_cancellation_operations(&self.operations);
-            if state.finalization_arming {
-                if state.pending_finalization_reason.is_some() || state.pending_force_abort {
+            if state.finalization_arming || (withdrawal && state.finalization_armed) {
+                if withdrawal
+                    || state.pending_finalization_reason.is_some()
+                    || state.pending_force_abort
+                {
                     return false;
                 }
                 state.pending_finalization_reason = Some(reason);
@@ -213,6 +236,7 @@ impl CancellationSource {
                 let id = CancellationOperationId(state.next_id);
                 state.next_id = state.next_id.saturating_add(1);
                 state.phase_reason = Some(reason);
+                state.withdrawal = withdrawal;
                 state
                     .operations
                     .push(CancellationOperation::Graceful { id, reason });
@@ -597,7 +621,7 @@ impl ResolvedAttachment {
         self
     }
 
-    pub(crate) fn media_type(&self) -> &str {
+    pub fn media_type(&self) -> &str {
         &self.media_type
     }
 
@@ -725,7 +749,8 @@ impl ResolvedInputs {
         Self { values }
     }
 
-    pub(crate) fn values(&self) -> &BTreeMap<String, ResolvedInput> {
+    /// The inputs by name; a Cloud tree run hands each to `um workflow run create`.
+    pub fn values(&self) -> &BTreeMap<String, ResolvedInput> {
         &self.values
     }
 

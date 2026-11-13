@@ -481,6 +481,7 @@ const fn audit_subject_kind(kind: OrganizationAuditSubjectKind) -> &'static str 
         OrganizationAuditSubjectKind::RunnerRegistration => "runner_registration",
         OrganizationAuditSubjectKind::RunnerActivation => "runner_activation",
         OrganizationAuditSubjectKind::RunnerCredential => "runner_credential",
+        OrganizationAuditSubjectKind::RunnerJoinKey => "runner_join_key",
         OrganizationAuditSubjectKind::GithubInstallation => "github_installation",
         OrganizationAuditSubjectKind::GitlabConnection => "gitlab_connection",
         OrganizationAuditSubjectKind::GitlabCandidate => "gitlab_candidate",
@@ -497,6 +498,7 @@ const fn audit_subject_kind(kind: OrganizationAuditSubjectKind) -> &'static str 
         OrganizationAuditSubjectKind::LinearLifecycleBinding => "linear_lifecycle_binding",
         OrganizationAuditSubjectKind::GoogleDocsAction => "google_docs_action",
         OrganizationAuditSubjectKind::Schedule => "schedule",
+        OrganizationAuditSubjectKind::WorkflowDefinition => "workflow_definition",
     }
 }
 

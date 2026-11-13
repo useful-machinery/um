@@ -68,6 +68,15 @@ pub(in crate::service) fn validate_effective_spec(
         ));
     }
     if execution_spec
+        .workflow_tree
+        .as_ref()
+        .is_some_and(|tree| !valid_workflow_tree(tree))
+    {
+        return Err(AssignmentDecline::ExecutionSpecInvalid(
+            ExecutionSpecInvalidReason::InvalidSourceProjection,
+        ));
+    }
+    if execution_spec
         .run_inputs
         .as_ref()
         .is_some_and(|projection| {
@@ -205,6 +214,21 @@ pub(in crate::service) fn validate_effective_spec(
         ));
     }
     Ok(())
+}
+
+/// The tree's declared files are distinct paths that stay under the tree directory,
+/// and the workflow it runs is one of them.
+fn valid_workflow_tree(tree: &um_runner_protocol::WorkflowTreeV1RunnerProjection) -> bool {
+    let mut paths = BTreeSet::new();
+    tree.digest
+        .strip_prefix("sha256:")
+        .is_some_and(|digest| lowercase_hex(digest, SHA256_HEX_CHARACTERS))
+        && tree.files.iter().all(|file| {
+            super::super::tree_run::is_safe_tree_path(&file.path)
+                && lowercase_hex(&file.sha256, SHA256_HEX_CHARACTERS)
+                && paths.insert(file.path.as_str())
+        })
+        && paths.contains(tree.workflow_path.as_str())
 }
 
 fn valid_github_name(name: &str) -> bool {

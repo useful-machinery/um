@@ -134,5 +134,6 @@ pub mod runs_api;
 pub mod schedules_api;
 pub mod source_connections_api;
 pub mod webhooks_api;
+pub mod workflow_definitions_api;
 
 pub mod configuration;

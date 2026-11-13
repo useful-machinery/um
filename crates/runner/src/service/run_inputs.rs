@@ -235,7 +235,10 @@ pub(super) struct HttpRunInputBroker {
     boot_id: Arc<str>,
 }
 
-fn broker_operation_runtime(
+/// One broker operation's HTTP client, following no redirect and bounded by the preparation
+/// deadline or `PROVIDER_OPERATION_TIMEOUT`, whichever is sooner, and the current-thread
+/// runtime it runs on; `Fenced` once the deadline has passed.
+pub(super) fn broker_operation_runtime(
     deadline: PreparationDeadline,
 ) -> Result<(reqwest::Client, tokio::runtime::Runtime), BrokerFailure> {
     um_support::install_provider();
@@ -1063,7 +1066,9 @@ fn exact_object(value: &Value, names: &[&str]) -> bool {
     })
 }
 
-fn validate_capability_url(raw: &str) -> Result<Url, BrokerFailure> {
+/// A signed download URL: HTTPS, or HTTP on a loopback host, with a host and no
+/// credentials or fragment.
+pub(super) fn validate_capability_url(raw: &str) -> Result<Url, BrokerFailure> {
     let parsed = Url::parse(raw).map_err(|_| BrokerFailure::InvalidResponse)?;
     let loopback_http = parsed.scheme() == "http"
         && parsed

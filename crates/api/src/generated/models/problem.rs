@@ -50,6 +50,8 @@ pub struct Problem {
         skip_serializing_if = "Option::is_none"
     )]
     pub continuation_violations: Option<Vec<models::ContinuationAdmissionViolation>>,
+    #[serde(rename = "workflow", skip_serializing_if = "Option::is_none")]
+    pub workflow: Option<Box<models::WorkflowProblemDetail>>,
 }
 
 impl Problem {
@@ -66,6 +68,7 @@ impl Problem {
             diagnostic: None,
             admission_diagnostic: None,
             continuation_violations: None,
+            workflow: None,
         }
     }
 }

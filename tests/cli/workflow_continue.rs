@@ -816,6 +816,130 @@ fn invalid_selection_does_not_claim_an_attempt() {
     }
 }
 
+// REQ-CONTINUE-4, REQ-CONTINUE-6: a step the prior attempt did not settle cannot be
+// inherited, and an admitted resume lists the re-executed and the inherited steps in the
+// order the workflow would start them, not in name order.
+#[test]
+fn continuation_inherits_only_settled_steps_and_lists_them_in_start_order() {
+    let bundle = RunBundle::new(
+        "schemaVersion: 1\nsteps:\n  zeta:\n    kind: cmd\n    command: {argv: [\"true\"]}\n  alpha:\n    kind: cmd\n    dependsOn: [zeta]\n    command: {argv: [\"true\"]}\n  gamma:\n    kind: cmd\n    dependsOn: [alpha]\n    command: {argv: [\"sh\", \"-c\", \"test \\\"$PHASE\\\" = continuation\"]}\n  beta:\n    kind: cmd\n    dependsOn: [gamma]\n    command: {argv: [\"true\"]}\n",
+    );
+    let run = bundle.result("start-order");
+    let mut initial = bundle.args(&run);
+    initial.insert(initial.len() - 1, "--json".to_owned());
+    assert_eq!(
+        isolated_command(&initial)
+            .env("PHASE", "initial")
+            .output()
+            .unwrap()
+            .status
+            .code(),
+        Some(1)
+    );
+    let before = fs::read(run.join("state.json")).unwrap();
+    let refused = isolated_command(&continue_args(&run, &["beta"]))
+        .env("PHASE", "continuation")
+        .output()
+        .unwrap();
+    assert_eq!(refused.status.code(), Some(1));
+    let refusal: serde_json::Value = serde_json::from_slice(&refused.stdout).unwrap();
+    assert!(workflow_run_schema().is_valid(&refusal), "{refusal}");
+    assert_eq!(
+        refusal["diagnostics"],
+        serde_json::json!([{"code": "continuation_nodes_unsatisfied",
+            "location": {"kind": "step", "id": "gamma", "priorState": "unsatisfied"}}]),
+        "{refusal}"
+    );
+    assert_eq!(fs::read(run.join("state.json")).unwrap(), before);
+    assert!(!run.join("attempts/000002").exists());
+
+    let admitted = isolated_command(&continue_args(&run, &["gamma"]))
+        .env("PHASE", "continuation")
+        .output()
+        .unwrap();
+    assert!(
+        admitted.status.success(),
+        "{} {}",
+        String::from_utf8_lossy(&admitted.stdout),
+        String::from_utf8_lossy(&admitted.stderr)
+    );
+    let state: serde_json::Value =
+        serde_json::from_slice(&fs::read(run.join("state.json")).unwrap()).unwrap();
+    let continuation = &state["attempts"][1]["continuation"];
+    assert_eq!(
+        continuation["reexecutedSteps"],
+        serde_json::json!(["gamma", "beta"])
+    );
+    assert_eq!(
+        continuation["inheritedSteps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|step| step["id"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["zeta", "alpha"]
+    );
+}
+
+// REQ-CONTINUE-7: a required re-executed step that consumes an output of an inherited step
+// that was skipped is refused naming consumer and producer; an advisory consumer is admitted
+// and blocks when it runs.
+#[test]
+fn continuation_refuses_a_required_consumer_of_a_skipped_inherited_output() {
+    let workflow = |policy: &str| {
+        format!(
+            "schemaVersion: 1\nsteps:\n  gate:\n    kind: cmd\n    command: {{argv: [\"sh\", \"-c\", \"printf no > flag.txt\"]}}\n    outputs:\n      flag: {{kind: text, from: path, path: flag.txt}}\n  producer:\n    kind: cmd\n    condition:\n      equals:\n        - ref: outputs.gate.flag\n        - value: \"yes\"\n    command: {{argv: [\"sh\", \"-c\", \"printf made > made.txt\"]}}\n    outputs:\n      made: {{kind: text, from: path, path: made.txt}}\n  consumer:\n    kind: cmd\n    failurePolicy: {policy}\n    inputs:\n      made: {{ref: outputs.producer.made}}\n    command: {{argv: [\"true\"]}}\n  flaky:\n    kind: cmd\n    dependsOn: [consumer]\n    command: {{argv: [\"sh\", \"-c\", \"test \\\"$PHASE\\\" = continuation\"]}}\n"
+        )
+    };
+    for policy in ["required", "advisory"] {
+        let bundle = RunBundle::new(&workflow(policy));
+        let run = bundle.result(policy);
+        let mut initial = bundle.args(&run);
+        initial.insert(initial.len() - 1, "--json".to_owned());
+        assert_eq!(
+            isolated_command(&initial)
+                .env("PHASE", "initial")
+                .output()
+                .unwrap()
+                .status
+                .code(),
+            Some(1),
+            "{policy}"
+        );
+        let output = isolated_command(&continue_args(&run, &["consumer"]))
+            .env("PHASE", "continuation")
+            .output()
+            .unwrap();
+        let terminal: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert!(workflow_run_schema().is_valid(&terminal), "{terminal}");
+        if policy == "required" {
+            assert_eq!(output.status.code(), Some(1));
+            assert_eq!(
+                terminal["diagnostics"],
+                serde_json::json!([{"code": "continuation_nodes_unsatisfied",
+                    "location": {"kind": "required_skipped", "consumer": "consumer",
+                        "producer": "producer"}}]),
+                "{terminal}"
+            );
+            assert!(!run.join("attempts/000002").exists());
+        } else {
+            let state: serde_json::Value =
+                serde_json::from_slice(&fs::read(run.join("state.json")).unwrap()).unwrap();
+            let attempt = &state["attempts"][1];
+            assert_eq!(
+                attempt["continuation"]["reexecutedSteps"],
+                serde_json::json!(["consumer", "flaky"]),
+                "{terminal}"
+            );
+            assert_eq!(attempt["progress"]["steps"][2]["id"], "consumer");
+            assert_eq!(
+                attempt["progress"]["steps"][2]["state"], "blocked",
+                "{attempt}"
+            );
+        }
+    }
+}
+
 // REQ-CONTINUE-17
 #[test]
 fn inherited_zero_delta_git_keeps_original_producer_without_carrier() {
@@ -1745,6 +1869,26 @@ steps:
           where: event.pullRequest == outputs.design.pullRequest
       landed: exit.landed
       failed: exit.failed
+";
+
+/// A root of the wait tree with no `workflow` step: its one `cmd` step runs `decide design`,
+/// whose verdict is the run's outcome, and holds as `design` does.
+pub(super) const COMMAND_TREE_ROOT: &str = "schemaVersion: 1
+programs: [bin]
+outcomes: [landed, failed]
+outcome:
+  from: outputs.decide.verdict
+  onFailure: failed
+steps:
+  decide:
+    kind: cmd
+    command:
+      argv: [decide, design]
+    outputs:
+      verdict:
+        kind: text
+        from: path
+        path: verdict-design.txt
 ";
 
 /// `decide NAME` records the step inputs it received as `seen-<input>` and reports the
@@ -3520,4 +3664,166 @@ fn the_engineering_shape_loops_repairs_and_lands_through_the_queue() {
         "{}",
         shown_plain(&run)
     );
+}
+
+/// `um workflow run resume RUN --cloud ORGANIZATION` against the scripted Cloud the
+/// `um run continue` tests use (REQ-CONTINUE-85).
+mod cloud {
+    use std::process::Output;
+
+    use super::super::header_value;
+    use super::super::run_command::RUN_ID;
+    use super::super::run_command::continuation_command_tests::execute_with_env;
+
+    fn resume(steps: &[&str], from: &[&str], json: bool) -> (Output, Vec<String>) {
+        let home = tempfile::tempdir().unwrap();
+        let (output, requests) = resume_in(steps, from, json, home.path().to_str().unwrap());
+        (output, requests)
+    }
+
+    fn resume_in(steps: &[&str], from: &[&str], json: bool, home: &str) -> (Output, Vec<String>) {
+        let mut args = vec!["workflow", "run", "resume", RUN_ID, "--cloud", "acme"];
+        for step in from {
+            args.extend(["--from", step]);
+        }
+        if json {
+            args.push("--json");
+        }
+        args.push("--allow-insecure-http");
+        execute_with_env(steps, &args, &[("UM_HOME", home)])
+    }
+
+    fn body(request: &str) -> serde_json::Value {
+        serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap()
+    }
+
+    fn document(output: &Output) -> serde_json::Value {
+        serde_json::from_slice(&output.stdout).unwrap()
+    }
+
+    // REQ-CONTINUE-85, REQ-CONTINUE-56
+    #[test]
+    fn named_steps_post_one_inherited_continuation_and_report_its_receipt() {
+        let (output, requests) = resume(&["submitted"], &["build", "review"], true);
+        assert_eq!(output.status.code(), Some(0), "{output:?}");
+        assert_eq!(requests.len(), 1);
+        assert!(
+            requests[0].starts_with(&format!(
+                "POST /api/v1/organizations/acme/runs/{RUN_ID}/continuation-requests "
+            )),
+            "{}",
+            requests[0]
+        );
+        assert!(!header_value(&requests[0], "idempotency-key").is_empty());
+        assert_eq!(
+            body(&requests[0]),
+            serde_json::json!({"definition": "inherited", "fromSteps": ["build", "review"]})
+        );
+        let result = document(&output);
+        assert_eq!(result["operation"], "continue");
+        assert_eq!(result["outcome"], "accepted");
+        assert_eq!(result["runId"], RUN_ID);
+        assert_eq!(
+            result["request"]["reexecutedSteps"],
+            serde_json::json!(["build", "review"])
+        );
+
+        let (human, requests) = resume(&["submitted"], &["build", "review"], false);
+        assert_eq!(human.status.code(), Some(0), "{human:?}");
+        assert_eq!(requests.len(), 1);
+        let text = String::from_utf8(human.stdout).unwrap();
+        for receipt in [
+            &result["request"]["requestId"],
+            &result["request"]["attemptId"],
+        ] {
+            assert!(text.contains(receipt.as_str().unwrap()), "{text}");
+        }
+    }
+
+    // REQ-CONTINUE-85
+    #[test]
+    fn without_from_the_request_names_no_step_and_the_home_stays_empty() {
+        let home = tempfile::tempdir().unwrap();
+        let (output, requests) =
+            resume_in(&["submitted"], &[], true, home.path().to_str().unwrap());
+        assert_eq!(output.status.code(), Some(0), "{output:?}");
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            body(&requests[0]),
+            serde_json::json!({"definition": "inherited", "fromSteps": []})
+        );
+        assert_eq!(document(&output)["outcome"], "accepted");
+        assert_eq!(std::fs::read_dir(home.path()).unwrap().count(), 0);
+    }
+
+    // Cloud answers each refusal under a problem type of its own with no
+    // violation list; the CLI still names it by the code of the same name.
+    // REQ-CONTINUE-85, REQ-CONTINUE-59, REQ-CONTINUE-84, REQ-COMPAT-20
+    #[test]
+    fn an_admission_refusal_names_its_violation() {
+        for (slug, code) in [
+            ("continuation-step-required", "continuation_step_required"),
+            (
+                "tree-continuation-unavailable",
+                "tree_continuation_unavailable",
+            ),
+        ] {
+            let step = format!("conflict:{slug}");
+            let (output, requests) = resume(&[&step], &[], true);
+            assert_eq!(output.status.code(), Some(1), "{output:?}");
+            assert_eq!(requests.len(), 1);
+            let result = document(&output);
+            assert_eq!(result["outcome"], "error");
+            assert_eq!(result["code"], "continuation_admission_invalid");
+            assert_eq!(
+                result["diagnostic"].as_array().unwrap().len(),
+                1,
+                "{result}"
+            );
+            assert_eq!(result["diagnostic"][0]["code"], code);
+
+            let (human, _) = resume(&[&step], &[], false);
+            assert_eq!(human.status.code(), Some(1), "{human:?}");
+            assert!(String::from_utf8(human.stderr).unwrap().contains(code));
+        }
+    }
+
+    // REQ-CONTINUE-87
+    #[test]
+    fn a_path_run_retired_answer_is_reported_as_path_run_retired() {
+        for (step, code) in [
+            ("gone:path-run-retired", "path_run_retired"),
+            ("gone:run-input-content-gone", "submission_failed"),
+        ] {
+            let (output, requests) = resume(&[step], &["build"], true);
+            assert_eq!(output.status.code(), Some(1), "{output:?}");
+            assert_eq!(requests.len(), 1);
+            let result = document(&output);
+            assert_eq!(result["outcome"], "error");
+            assert_eq!(result["code"], code);
+            assert!(result["request"].is_null());
+        }
+    }
+
+    // REQ-CONTINUE-85, REQ-CONTINUE-57
+    #[test]
+    fn a_lost_response_leaves_acceptance_unknown_under_one_key() {
+        let (output, requests) = resume(&["lost", "lost"], &["build"], true);
+        assert_eq!(output.status.code(), Some(4), "{output:?}");
+        assert_eq!(requests.len(), 2);
+        let key = header_value(&requests[0], "idempotency-key");
+        assert_eq!(header_value(&requests[1], "idempotency-key"), key);
+        let result = document(&output);
+        assert_eq!(result["outcome"], "acceptance_unknown");
+        assert_eq!(result["idempotencyKey"], key);
+        assert!(result["request"].is_null());
+    }
+
+    // REQ-CONTINUE-85
+    #[test]
+    fn a_malformed_step_is_a_usage_error_before_any_request() {
+        let (output, requests) = resume(&[], &["Build"], true);
+        assert_eq!(output.status.code(), Some(2), "{output:?}");
+        assert!(requests.is_empty());
+    }
 }

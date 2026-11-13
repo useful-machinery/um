@@ -6,9 +6,8 @@ use reqwest::{StatusCode, Url};
 use super::generated::{apis, models};
 use super::http_client::zeroize_generated_bearer_access_token;
 use super::resource::{
-    LifecycleAction, ProblemVocabulary, ResourceFailure, classify_error, decode_closed_json,
-    invalid, mutation_request, receive_closed_json_response, receive_confirmed_json_response,
-    receive_json_response, receive_response, resource_configuration, validate_mutation_key,
+    ProblemVocabulary, ResourceFailure, classify_error, invalid, receive_closed_json_response,
+    receive_json_response, resource_configuration,
 };
 use super::{HttpTransportPolicy, problem};
 
@@ -17,27 +16,6 @@ pub type LinearConnection = models::LinearConnection;
 pub type LinearConnectionList = models::LinearConnectionList;
 pub type LinearTeamList = models::LinearTeamList;
 pub type LinearTeamStateList = models::LinearTeamStateList;
-pub type LinearEvaluation = models::LinearEvaluation;
-pub type LinearTrigger = models::LinearTrigger;
-pub type LinearTriggerList = models::LinearTriggerList;
-
-#[derive(Clone, serde::Serialize)]
-#[serde(untagged)]
-pub enum LinearTriggerRead {
-    Active(LinearTrigger),
-    Deleted(models::LinearTriggerTombstone),
-}
-pub type LinearEvaluationList = models::LinearEvaluationList;
-pub type CreateLinearTriggerRequest = models::CreateLinearTriggerRequest;
-pub type UpdateLinearTriggerRequest = models::UpdateLinearTriggerRequest;
-
-pub struct EvaluationFilters<'a> {
-    pub limit: Option<i32>,
-    pub cursor: Option<&'a str>,
-    pub state: Option<&'a str>,
-    pub run_id: Option<&'a str>,
-}
-pub type LinearEvaluationState = models::linear_evaluation::State;
 pub type LinearSessionStatus = models::linear_authorization_session::Status;
 
 pub struct LinearApi {
@@ -45,7 +23,6 @@ pub struct LinearApi {
 }
 
 pub type LinearFailure = ResourceFailure;
-pub type TriggerAction = LifecycleAction;
 
 const LINEAR: ProblemVocabulary = ProblemVocabulary {
     bad_request: &[problem::BAD_REQUEST],
@@ -257,278 +234,6 @@ impl LinearApi {
         Ok(url.to_string())
     }
 
-    pub fn create_trigger(
-        &self,
-        org: &str,
-        project: &str,
-        key: &str,
-        request: CreateLinearTriggerRequest,
-    ) -> Result<LinearTrigger, LinearFailure> {
-        let endpoint = self.trigger_endpoint(org, project, None);
-        let request = self
-            .mutation_request(reqwest::Method::POST, &endpoint, key)
-            .json(&request);
-        receive_confirmed_json_response(request, StatusCode::CREATED, key, &LINEAR)
-            .and_then(|value| validate_trigger(value, project, None))
-    }
-
-    pub fn update_trigger(
-        &self,
-        org: &str,
-        project: &str,
-        id: &str,
-        key: &str,
-        request: UpdateLinearTriggerRequest,
-    ) -> Result<LinearTrigger, LinearFailure> {
-        let endpoint = self.trigger_endpoint(org, project, Some(id));
-        let request = self
-            .mutation_request(reqwest::Method::PATCH, &endpoint, key)
-            .json(&request);
-        receive_confirmed_json_response(request, StatusCode::OK, key, &LINEAR)
-            .and_then(|value| validate_trigger(value, project, Some(id)))
-    }
-
-    pub fn trigger(
-        &self,
-        org: &str,
-        project: &str,
-        id: &str,
-    ) -> Result<LinearTriggerRead, LinearFailure> {
-        // The generated untagged union's active model has defaulted required fields;
-        // it would consume a tombstone before reaching the tombstone variant.
-        let endpoint = self.trigger_endpoint(org, project, Some(id));
-        let body = receive_json_response(
-            super::generated_api_request(&self.configuration, reqwest::Method::GET, &endpoint),
-            StatusCode::OK,
-            &LINEAR,
-        )?;
-        let value: serde_json::Value = serde_json::from_slice(&body).map_err(|_| invalid())?;
-        if value.get("deleted").is_some() {
-            if value.as_object().is_none_or(|m| m.len() != 4)
-                || value.get("deleted") != Some(&serde_json::Value::Bool(true))
-            {
-                return Err(invalid());
-            }
-            let tombstone: models::LinearTriggerTombstone =
-                serde_json::from_value(value).map_err(|_| invalid())?;
-            if tombstone.id != id
-                || tombstone.project_id != project
-                || tombstone.deleted_at.is_empty()
-            {
-                return Err(invalid());
-            }
-            Ok(LinearTriggerRead::Deleted(tombstone))
-        } else {
-            // Generated models can drop unknown properties (including new mapping
-            // vocabulary) rather than fail; the closed decode never presents a partial
-            // configuration.
-            let active: LinearTrigger = decode_closed_json(&body)?;
-            validate_trigger(active, project, Some(id)).map(LinearTriggerRead::Active)
-        }
-    }
-
-    pub fn triggers(
-        &self,
-        org: &str,
-        project: &str,
-        limit: Option<i32>,
-        cursor: Option<&str>,
-    ) -> Result<LinearTriggerList, LinearFailure> {
-        let endpoint = format!(
-            "{}/v1/organizations/{}/projects/{}/triggers",
-            self.configuration.base_path.trim_end_matches('/'),
-            apis::urlencode(org),
-            apis::urlencode(project),
-        );
-        let mut request =
-            super::generated_api_request(&self.configuration, reqwest::Method::GET, &endpoint);
-        if let Some(limit) = limit {
-            request = request.query(&[("limit", limit)]);
-        }
-        if let Some(cursor) = cursor {
-            request = request.query(&[("cursor", cursor)]);
-        }
-        let page: LinearTriggerList =
-            receive_closed_json_response(request, StatusCode::OK, &LINEAR)?;
-        for item in &page.items {
-            validate_trigger(item.clone(), project, None)?;
-        }
-        Ok(page)
-    }
-
-    pub fn trigger_action(
-        &self,
-        org: &str,
-        project: &str,
-        id: &str,
-        key: &str,
-        action: TriggerAction,
-    ) -> Result<Option<LinearTrigger>, LinearFailure> {
-        let endpoint = self.trigger_endpoint(org, project, Some(id));
-        let value = match action {
-            TriggerAction::Enable | TriggerAction::Disable => {
-                let suffix = if matches!(action, TriggerAction::Enable) {
-                    "/enable"
-                } else {
-                    "/disable"
-                };
-                let request =
-                    self.mutation_request(reqwest::Method::POST, &(endpoint + suffix), key);
-                Some(receive_confirmed_json_response(
-                    request,
-                    StatusCode::OK,
-                    key,
-                    &LINEAR,
-                )?)
-            }
-            TriggerAction::Delete => {
-                let request = self.mutation_request(reqwest::Method::DELETE, &endpoint, key);
-                let (body, headers) = receive_response(request, StatusCode::NO_CONTENT, &LINEAR)?;
-                validate_mutation_key(&headers, key)?;
-                if !body.is_empty() {
-                    return Err(invalid());
-                }
-                None
-            }
-        };
-        value
-            .map(|trigger| validate_trigger(trigger, project, Some(id)))
-            .transpose()
-    }
-
-    fn trigger_endpoint(&self, org: &str, project: &str, id: Option<&str>) -> String {
-        let mut endpoint = format!(
-            "{}/v1/organizations/{}/projects/{}/triggers",
-            self.configuration.base_path.trim_end_matches('/'),
-            apis::urlencode(org),
-            apis::urlencode(project),
-        );
-        if let Some(id) = id {
-            endpoint.push('/');
-            endpoint.push_str(&apis::urlencode(id));
-        }
-        endpoint
-    }
-
-    fn mutation_request(
-        &self,
-        method: reqwest::Method,
-        endpoint: &str,
-        key: &str,
-    ) -> reqwest::blocking::RequestBuilder {
-        mutation_request(&self.configuration, method, endpoint, key)
-    }
-
-    pub fn evaluations(
-        &self,
-        org: &str,
-        project: &str,
-        trigger: &str,
-        filters: EvaluationFilters<'_>,
-    ) -> Result<LinearEvaluationList, LinearFailure> {
-        let endpoint = format!(
-            "{}/v1/organizations/{}/projects/{}/triggers/{}/evaluations",
-            self.configuration.base_path.trim_end_matches('/'),
-            apis::urlencode(org),
-            apis::urlencode(project),
-            apis::urlencode(trigger),
-        );
-        let mut request =
-            super::generated_api_request(&self.configuration, reqwest::Method::GET, &endpoint);
-        if let Some(limit) = filters.limit {
-            request = request.query(&[("limit", limit)]);
-        }
-        for (name, value) in [
-            ("cursor", filters.cursor),
-            ("state", filters.state),
-            ("runId", filters.run_id),
-        ] {
-            if let Some(value) = value {
-                request = request.query(&[(name, value)]);
-            }
-        }
-        let page: LinearEvaluationList =
-            receive_closed_json_response(request, StatusCode::OK, &LINEAR)?;
-        for item in &page.items {
-            validate_evaluation(item.clone(), trigger, &item.id, None)?;
-        }
-        Ok(page)
-    }
-
-    pub fn evaluation(
-        &self,
-        organization: &str,
-        project: &str,
-        trigger: &str,
-        id: &str,
-    ) -> Result<LinearEvaluation, LinearFailure> {
-        self.request_evaluation(
-            reqwest::Method::GET,
-            organization,
-            project,
-            trigger,
-            id,
-            None,
-        )
-        .and_then(|evaluation| validate_evaluation(evaluation, trigger, id, None))
-    }
-
-    pub fn retry_evaluation(
-        &self,
-        organization: &str,
-        project: &str,
-        trigger: &str,
-        id: &str,
-        key: &str,
-    ) -> Result<LinearEvaluation, LinearFailure> {
-        self.request_evaluation(
-            reqwest::Method::POST,
-            organization,
-            project,
-            trigger,
-            id,
-            Some(key),
-        )
-        .and_then(|evaluation| validate_evaluation(evaluation, trigger, id, Some(2)))
-    }
-
-    // The generated client drops error headers. Keep its model while reading
-    // Retry-After and bounding both success and problem bodies here.
-    fn request_evaluation(
-        &self,
-        method: reqwest::Method,
-        organization: &str,
-        project: &str,
-        trigger: &str,
-        id: &str,
-        key: Option<&str>,
-    ) -> Result<LinearEvaluation, LinearFailure> {
-        let suffix = if key.is_some() { "/retry" } else { "" };
-        let endpoint = format!(
-            "{}/v1/organizations/{}/projects/{}/triggers/{}/evaluations/{}{}",
-            self.configuration.base_path.trim_end_matches('/'),
-            apis::urlencode(organization),
-            apis::urlencode(project),
-            apis::urlencode(trigger),
-            apis::urlencode(id),
-            suffix
-        );
-        let expected_status = if key.is_some() {
-            StatusCode::ACCEPTED
-        } else {
-            StatusCode::OK
-        };
-        let mut request = super::generated_api_request(&self.configuration, method, &endpoint);
-        if let Some(key) = key {
-            request = request.header("Idempotency-Key", key);
-        }
-        if let Some(key) = key {
-            receive_confirmed_json_response(request, expected_status, key, &LINEAR)
-        } else {
-            receive_closed_json_response(request, expected_status, &LINEAR)
-        }
-    }
-
     pub fn disconnect(
         &self,
         organization: &str,
@@ -556,50 +261,10 @@ impl LinearApi {
     }
 }
 
-fn validate_trigger(
-    value: LinearTrigger,
-    project: &str,
-    id: Option<&str>,
-) -> Result<LinearTrigger, LinearFailure> {
-    if value.project_id != project
-        || id.is_some_and(|id| value.id != id)
-        || value.id.is_empty()
-        || value.version < 1
-        || value.grant_id.is_empty()
-        || value.source.connection_id.is_empty()
-        || value.target.workflow_path.is_empty()
-        || value.target.execution_principal_id.is_empty()
-        || !(1..=20).contains(&value.conditions.len())
-        || value.created_at.is_empty()
-        || value.updated_at.is_empty()
-    {
-        return Err(invalid());
-    }
-    Ok(value)
-}
-
 impl Drop for LinearApi {
     fn drop(&mut self) {
         zeroize_generated_bearer_access_token(&mut self.configuration);
     }
-}
-
-fn validate_evaluation(
-    evaluation: LinearEvaluation,
-    trigger: &str,
-    id: &str,
-    minimum_cycle: Option<i32>,
-) -> Result<LinearEvaluation, LinearFailure> {
-    if evaluation.id != id
-        || evaluation.trigger_id != trigger
-        || evaluation.cycle_number < minimum_cycle.unwrap_or(1)
-        || evaluation.accepted_at.is_empty()
-        || evaluation.grant_id.is_empty()
-        || (evaluation.state == LinearEvaluationState::RunCreated) != evaluation.run_id.is_some()
-    {
-        return Err(invalid());
-    }
-    Ok(evaluation)
 }
 
 fn validate_connection(

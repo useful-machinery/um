@@ -176,10 +176,12 @@ async fn failed_gitlab_assignment_retains_edits_without_relay_wiring() {
     assert!(workspace.exists());
 }
 
-// REQ-CONTINUE-20, REQ-CONTINUE-47, REQ-CONTINUE-53, REQ-CONTINUE-70:
-// A real failed GitLab attempt leaves a claimable workspace. Its successor
-// fetches the effective definition separately and installs a new Cloud relay
-// helper without cloning or resetting the retained primary work tree.
+// REQ-CONTINUE-20, REQ-CONTINUE-47, REQ-CONTINUE-53:
+// A real failed GitLab attempt leaves a claimable workspace. Its successor, a
+// continuation admitted before Cloud stopped continuing runs created by
+// workflow path, fetches the effective definition separately and installs a
+// new Cloud relay helper without cloning or resetting the retained primary
+// work tree.
 #[tokio::test]
 async fn failed_gitlab_assignment_continues_with_fresh_grants_and_retained_workspace() {
     let workflow = "schemaVersion: 1\nsteps:\n  produce:\n    kind: cmd\n    command: {argv: [\"sh\", \"-c\", \"printf retained > note.txt\"]}\n    outputs:\n      note: {kind: text, from: path, path: note.txt}\n  check:\n    kind: cmd\n    dependsOn: [produce]\n    command: {argv: [\"sh\", \"-c\", \"if test -f .git/fixture-failed; then test $(cat note.txt) = repaired; else touch .git/fixture-failed; exit 75; fi\"]}\n";

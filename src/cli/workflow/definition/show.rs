@@ -5,10 +5,10 @@ use std::io::{self, Write};
 use clap::Args;
 use serde::Serialize;
 
-use super::report::{display, write_json};
+use super::report::{display, display_members, write_json};
 use um_execution::{
-    BindingsSnapshot, DefinitionError, ListedRun, RevisionRecord, RunState, StoredDefinition,
-    WorkflowHome, list_runs, read_current_bindings, read_definition,
+    BindingValue, BindingsSnapshot, DefinitionError, ListedRun, RevisionRecord, RunState,
+    StoredDefinition, WorkflowHome, list_runs, read_current_bindings, read_definition,
 };
 
 pub(super) const ABOUT: &str = "Show a local workflow definition and its revisions";
@@ -122,11 +122,14 @@ fn write_human(shown: &Shown) -> anyhow::Result<()> {
     }
     writeln!(stdout, "── bindings ──")?;
     for (key, bound) in shown.bindings.bindings() {
+        let value = match &bound.value {
+            BindingValue::Text(value) => display(value),
+            BindingValue::List(members) => display_members(members),
+        };
         writeln!(
             stdout,
-            "{}: {} ({})",
+            "{}: {value} ({})",
             display(key),
-            display(&bound.value),
             bound.kind.as_str()
         )?;
     }

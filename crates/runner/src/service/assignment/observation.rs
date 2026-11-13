@@ -11,11 +11,38 @@ pub(in crate::service) enum ExecutionReport {
         workflow_event: Value,
         diagnostic: Option<Value>,
     },
+    /// A tree run's root progress between and during its engine attempts, numbered by
+    /// the assignment's own progress sequence from 1 (REQ-RUNNERENROLL-99). `steps_only`
+    /// marks a report that restates the root to carry step observations alone, which is
+    /// owed to no run (REQ-RUNNERENROLL-88).
+    TreeProgress {
+        progress_sequence: u64,
+        progress: um_runner_protocol::TreeRootProgress,
+        steps_only: bool,
+    },
+    /// A tree run's application of one trigger delivery (REQ-TRIGGER-136).
+    TriggerDeliveryApplied {
+        application: um_runner_protocol::TriggerDeliveryApplication,
+    },
+    /// A tree run's application of one authorized Cloud control (REQ-RUNNERENROLL-90).
+    RunControlApplied {
+        application: um_runner_protocol::RunControlApplication,
+    },
     Finished {
         final_execution_event_sequence: u64,
         outcome: Value,
         artifact_delivery: Value,
         diagnostic: Option<Value>,
+    },
+    /// A tree run's finish, carrying the root's exit beside its transport outcome
+    /// (REQ-RUNNERENROLL-99) and the safe facts of a failure the runner classified
+    /// itself (REQ-RUNNERENROLL-89).
+    TreeFinished {
+        final_execution_event_sequence: u64,
+        outcome: Value,
+        artifact_delivery: Value,
+        diagnostic: Option<Value>,
+        exit: um_runner_protocol::TreeExit,
     },
     Interrupted {
         final_execution_event_sequence: u64,
@@ -35,8 +62,20 @@ impl ExecutionReport {
             self,
             Self::AssignmentInterrupted { .. }
                 | Self::Finished { .. }
+                | Self::TreeFinished { .. }
                 | Self::Interrupted { .. }
                 | Self::Aborted { .. }
+        )
+    }
+
+    /// Whether this is a progress report for step observations alone.
+    pub(in crate::service) fn is_steps_only(&self) -> bool {
+        matches!(
+            self,
+            Self::TreeProgress {
+                steps_only: true,
+                ..
+            }
         )
     }
 
@@ -78,6 +117,29 @@ impl ExecutionReport {
                 workflow_event: workflow_event.clone(),
                 diagnostic: diagnostic.clone(),
             },
+            Self::TreeProgress {
+                progress_sequence,
+                progress,
+                ..
+            } => RunnerFrame::TreeProgress {
+                envelope,
+                assignment_id,
+                attempt_id,
+                progress_sequence: *progress_sequence,
+                progress: progress.clone(),
+            },
+            Self::TriggerDeliveryApplied { application } => RunnerFrame::TriggerDeliveryApplied {
+                envelope,
+                assignment_id,
+                attempt_id,
+                application: application.clone(),
+            },
+            Self::RunControlApplied { application } => RunnerFrame::RunControlApplied {
+                envelope,
+                assignment_id,
+                attempt_id,
+                application: application.clone(),
+            },
             Self::Finished {
                 final_execution_event_sequence,
                 outcome,
@@ -91,6 +153,23 @@ impl ExecutionReport {
                 outcome: outcome.clone(),
                 artifact_delivery: artifact_delivery.clone(),
                 diagnostic: diagnostic.clone(),
+                tree_exit: None,
+            },
+            Self::TreeFinished {
+                final_execution_event_sequence,
+                outcome,
+                artifact_delivery,
+                diagnostic,
+                exit,
+            } => RunnerFrame::ExecutionFinished {
+                envelope,
+                assignment_id,
+                attempt_id,
+                final_execution_event_sequence: *final_execution_event_sequence,
+                outcome: outcome.clone(),
+                artifact_delivery: artifact_delivery.clone(),
+                diagnostic: diagnostic.clone(),
+                tree_exit: Some(exit.clone()),
             },
             Self::Interrupted {
                 final_execution_event_sequence,
@@ -326,6 +405,19 @@ impl AssignmentObservation {
         matches!(self, Self::Execution { report, .. } if report.is_condition_evidence_transition())
     }
 
+    /// Whether the observation is owed to no run and so may be refused rather than use
+    /// the slots and bytes reserved for mandatory execution observations: registration,
+    /// discovery, and a progress report for steps alone (REQ-RUNNERENROLL-88).
+    pub(super) fn is_optional(&self) -> bool {
+        match self {
+            Self::WorkspaceRegistration { .. }
+            | Self::DiscoveryInventory { .. }
+            | Self::DiscoveryComplete { .. } => true,
+            Self::Execution { report, .. } => report.is_steps_only(),
+            _ => false,
+        }
+    }
+
     pub(in crate::service) fn runner_frame(&self, envelope: RunnerEnvelope) -> RunnerFrame {
         match self {
             Self::Preparing {
@@ -444,5 +536,98 @@ impl PendingAssignmentObservation {
             } => Some((*delivery_id, request.kind())),
             _ => None,
         }
+    }
+}
+
+/// A `trigger_delivery` effect: one control delivery for the run an assignment holds
+/// (REQ-TRIGGER-136).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(in crate::service) struct AssignmentTriggerDelivery {
+    pub(in crate::service) effect_id: String,
+    pub(in crate::service) assignment_id: String,
+    pub(in crate::service) run_id: String,
+    pub(in crate::service) attempt_id: String,
+    pub(in crate::service) delivery: um_runner_protocol::TriggerDelivery,
+}
+
+/// A `run_control` effect: one authorized Cloud control for the run an assignment holds
+/// (REQ-RUNNERENROLL-90).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(in crate::service) struct AssignmentRunControl {
+    pub(in crate::service) effect_id: String,
+    pub(in crate::service) assignment_id: String,
+    pub(in crate::service) run_id: String,
+    pub(in crate::service) attempt_id: String,
+    pub(in crate::service) control: um_runner_protocol::RunControl,
+}
+
+impl AssignmentManager {
+    /// Hands a delivery for the assignment this manager holds to its tree run, which applies
+    /// it with `um workflow run event` and reports the application (REQ-TRIGGER-136).
+    pub(in crate::service) fn handle_trigger_delivery(
+        &mut self,
+        delivery: AssignmentTriggerDelivery,
+    ) -> Result<(), AssignmentManagerFailure> {
+        if self.holds_for_tree_run(
+            &delivery.assignment_id,
+            &delivery.run_id,
+            &delivery.attempt_id,
+        )? {
+            self.tree_run
+                .deliver(&delivery.assignment_id, delivery.delivery);
+        }
+        Ok(())
+    }
+
+    /// Hands a control for the assignment this manager holds to its tree run, which applies
+    /// it to the run's current wait with the `um workflow run` control command it names and
+    /// reports the application (REQ-RUNNERENROLL-90).
+    pub(in crate::service) fn handle_run_control(
+        &mut self,
+        control: AssignmentRunControl,
+    ) -> Result<(), AssignmentManagerFailure> {
+        if self.holds_for_tree_run(&control.assignment_id, &control.run_id, &control.attempt_id)? {
+            self.tree_run
+                .control(&control.assignment_id, control.control);
+        }
+        Ok(())
+    }
+
+    /// Whether an effect for the tree run of `assignment_id` reaches it. Cloud fences
+    /// deliveries and controls by the active assignment, so one for an assignment held no
+    /// longer, or never, is acknowledged and applies to nothing here; one naming the held
+    /// assignment with another run or attempt conflicts as a cancellation would.
+    fn holds_for_tree_run(
+        &mut self,
+        assignment_id: &str,
+        run_id: &str,
+        attempt_id: &str,
+    ) -> Result<bool, AssignmentManagerFailure> {
+        self.drain_events();
+        let held = match &self.slot {
+            Some(LocalSlot::Preparing(preparing)) => (
+                &preparing.offer.assignment_id,
+                &preparing.offer.run_id,
+                &preparing.offer.attempt_id,
+            ),
+            Some(LocalSlot::Accepted(accepted)) => (
+                &accepted.identity.assignment_id,
+                &accepted.identity.run_id,
+                &accepted.identity.attempt_id,
+            ),
+            Some(LocalSlot::Running(running)) => (
+                &running.identity.assignment_id,
+                &running.identity.run_id,
+                &running.identity.attempt_id,
+            ),
+            Some(LocalSlot::Finishing(_) | LocalSlot::Releasing(_)) | None => return Ok(false),
+        };
+        if held.0 != assignment_id {
+            return Ok(false);
+        }
+        if held.1 != run_id || held.2 != attempt_id {
+            return Err(AssignmentManagerFailure::ConflictingOffer);
+        }
+        Ok(true)
     }
 }

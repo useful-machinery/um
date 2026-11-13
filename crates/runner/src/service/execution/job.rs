@@ -118,7 +118,9 @@ impl ExecutionJob {
                 let quiescence_failure = snapshot
                     .filter(|(proven, surviving)| !proven && !surviving.is_empty())
                     .map(|(_, surviving)| surviving);
-                workflow_git.disable();
+                if let Some(workflow_git) = &workflow_git {
+                    workflow_git.disable();
+                }
                 let release = root
                     .release_workspace_pending(
                         quiescence,
@@ -153,7 +155,14 @@ impl ExecutionJob {
         // Keep the large admitted workflow future off the caller's stack. In
         // particular a retained continuation carries an inherited seed into
         // both the enabled and disabled agent execution branches.
-        let completion = Box::pin(self.run_workflow(&assignment_id, &attempt_id, &run_id)).await;
+        let completion = match self.accepted.execution.clone() {
+            AcceptedExecution::Engine(admitted) => {
+                Box::pin(self.run_workflow(*admitted, &assignment_id, &attempt_id, &run_id)).await
+            }
+            AcceptedExecution::Tree(tree) => {
+                Box::pin(self.run_tree(&tree, &assignment_id, &attempt_id)).await
+            }
+        };
         self.finish_execution(completion).await;
     }
 
@@ -215,10 +224,12 @@ impl ExecutionJob {
             // must not publish a cancelled outcome, even with failure details.
             let reportable_failure = quiescence_failure.is_some()
                 && matches!(&report, ExecutionReport::Finished { outcome, .. }
+                    | ExecutionReport::TreeFinished { outcome, .. }
                     if outcome["outcome"] != "cancelled");
             if reportable_failure
                 && let Some(surviving) = &quiescence_failure
-                && let ExecutionReport::Finished { outcome, .. } = &mut report
+                && let ExecutionReport::Finished { outcome, .. }
+                | ExecutionReport::TreeFinished { outcome, .. } = &mut report
             {
                 outcome["quiescenceFailure"] = json!({
                     "reason": "process_quiescence_failed", "survivingGuards": surviving
@@ -271,7 +282,9 @@ impl ExecutionJob {
     }
 
     pub(super) async fn activate_workflow_git(&self) -> bool {
-        let workflow_git = self.accepted.workflow_git.clone();
+        let Some(workflow_git) = self.accepted.workflow_git.clone() else {
+            return false;
+        };
         let lease_clock = self.lease_clock.clone();
         let authority = self.authority_updates.clone();
         tokio::task::spawn_blocking(move || workflow_git.activate(lease_clock, authority).is_ok())
@@ -284,7 +297,9 @@ impl ExecutionJob {
         quiescence: super::super::workspace::ProcessQuiescence,
         disposition: WorkspaceDisposition,
     ) -> super::super::workspace::CleanupResult {
-        self.accepted.workflow_git.disable();
+        if let Some(workflow_git) = &self.accepted.workflow_git {
+            workflow_git.disable();
+        }
         let result = self
             .accepted
             .root
@@ -389,13 +404,14 @@ impl ExecutionJob {
 
     pub(super) fn runner_result(
         &self,
+        admitted: &AdmittedWorkflow,
         diagnostics: &StepDiagnosticLog,
         execution: WorkflowExecutionResult<RunnerExecutionInstant>,
         observer: &RunnerExecutionObserver,
         started_at: RunnerExecutionInstant,
         finished_at: RunnerExecutionInstant,
     ) -> Result<WorkflowRunResult, RunnerResultFailure> {
-        let workflow = self.accepted.admitted.workflow();
+        let workflow = admitted.workflow();
         let cancellation =
             observed_workflow_cancellation(&execution.outcome, observer.cancellation())
                 .ok_or_else(|| RunnerResultFailure::new("cancellation_inconsistent"))?;
@@ -525,31 +541,20 @@ impl ExecutionJob {
             workflow_path: execution.provenance.workflow_path,
             source_root: execution.provenance.source_root,
             content_digest: execution.content_digest,
-            agent_profile_replacement: self
-                .accepted
-                .admitted
+            agent_profile_replacement: admitted
                 .workflow()
                 .agent_profile_replacement
                 .as_ref()
                 .map(um_execution::AgentProfileReplacementV1::from_resolved),
-            execution_root: self.accepted.admitted.execution().root().to_owned(),
-            maximum_parallel_steps: self
-                .accepted
-                .admitted
-                .execution()
-                .limits()
-                .maximum_parallel_steps(),
-            maximum_retained_bytes_per_stream: self
-                .accepted
-                .admitted
+            execution_root: admitted.execution().root().to_owned(),
+            maximum_parallel_steps: admitted.execution().limits().maximum_parallel_steps(),
+            maximum_retained_bytes_per_stream: admitted
                 .execution()
                 .limits()
                 .maximum_step_log_bytes()
                 .get(),
-            cloud_capacity: Some(cloud_execution_capacity(&self.accepted.admitted)),
-            maximum_result_bytes: self
-                .accepted
-                .admitted
+            cloud_capacity: Some(cloud_execution_capacity(admitted)),
+            maximum_result_bytes: admitted
                 .workflow()
                 .capacity
                 .requirements
@@ -910,6 +915,7 @@ impl ExecutionJob {
         report: ExecutionReport,
     ) -> Option<u64> {
         let terminal = report.is_terminal();
+        let steps_only = report.is_steps_only();
         if terminal {
             self.describe_report(&report);
         }
@@ -918,18 +924,26 @@ impl ExecutionJob {
             attempt_id: attempt_id.to_owned(),
             report,
         });
-        if let Err(error) = enqueued {
-            self.collapse(
+        match enqueued {
+            // Step reporting changes no run's result (REQ-RUNNERENROLL-88): the run event
+            // records why its latest report for steps alone was refused, and the run goes on.
+            Err(error) if steps_only => self.run_event.set(KeyValue::new(
+                telemetry::attribute::STEP_REPORT_REFUSAL,
+                outbox_cause(error, terminal),
+            )),
+            Err(error) => self.collapse(
                 "runner_internal_failure",
                 outbox_cause(error, terminal),
                 "execution_root",
-            );
+            ),
+            Ok(_) => {}
         }
         enqueued.ok()
     }
 
     pub(super) fn describe_report(&self, report: &ExecutionReport) {
         match report {
+            ExecutionReport::TreeFinished { outcome, .. } => self.describe_outcome(outcome),
             ExecutionReport::Finished {
                 outcome,
                 diagnostic,
@@ -950,34 +964,7 @@ impl ExecutionJob {
                         }
                     }
                 }
-                match outcome["outcome"].as_str() {
-                    Some("succeeded") => self.run_event.result("succeeded"),
-                    Some("failed") => {
-                        self.run_event.result("failed");
-                        for (key, value) in [
-                            (
-                                telemetry::attribute::FAILURE_PHASE,
-                                outcome["primaryIssue"]["detail"]["phase"].as_str(),
-                            ),
-                            (
-                                telemetry::attribute::FAILURE_CODE,
-                                outcome["primaryIssue"]["detail"]["code"].as_str(),
-                            ),
-                        ] {
-                            if let Some(value) = value {
-                                self.run_event.set(KeyValue::new(key, value.to_owned()));
-                            }
-                        }
-                    }
-                    Some("cancelled") => self.run_event.result("cancelled"),
-                    _ => self.run_event.result("aborted"),
-                }
-                if let Some(reason) = outcome["reason"].as_str() {
-                    self.run_event.set(KeyValue::new(
-                        telemetry::attribute::INTERRUPTION_CAUSE,
-                        reason.to_owned(),
-                    ));
-                }
+                self.describe_outcome(outcome);
             }
             ExecutionReport::Interrupted { reason, .. }
             | ExecutionReport::AssignmentInterrupted { reason } => {
@@ -994,7 +981,42 @@ impl ExecutionJob {
                     reason.clone(),
                 ));
             }
-            ExecutionReport::Started | ExecutionReport::Transition { .. } => {}
+            ExecutionReport::Started
+            | ExecutionReport::Transition { .. }
+            | ExecutionReport::TreeProgress { .. }
+            | ExecutionReport::TriggerDeliveryApplied { .. }
+            | ExecutionReport::RunControlApplied { .. } => {}
+        }
+    }
+
+    fn describe_outcome(&self, outcome: &Value) {
+        match outcome["outcome"].as_str() {
+            Some("succeeded") => self.run_event.result("succeeded"),
+            Some("failed") => {
+                self.run_event.result("failed");
+                for (key, value) in [
+                    (
+                        telemetry::attribute::FAILURE_PHASE,
+                        outcome["primaryIssue"]["detail"]["phase"].as_str(),
+                    ),
+                    (
+                        telemetry::attribute::FAILURE_CODE,
+                        outcome["primaryIssue"]["detail"]["code"].as_str(),
+                    ),
+                ] {
+                    if let Some(value) = value {
+                        self.run_event.set(KeyValue::new(key, value.to_owned()));
+                    }
+                }
+            }
+            Some("cancelled") => self.run_event.result("cancelled"),
+            _ => self.run_event.result("aborted"),
+        }
+        if let Some(reason) = outcome["reason"].as_str() {
+            self.run_event.set(KeyValue::new(
+                telemetry::attribute::INTERRUPTION_CAUSE,
+                reason.to_owned(),
+            ));
         }
     }
 

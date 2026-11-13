@@ -608,6 +608,11 @@ pub fn list_organization_membership_history(
     }
 }
 
+/// The audit vocabulary this release decodes (REQ-AUDIT-44): its subject and change tables
+/// hold every action, subject kind and change field the contract lists. A listing that named
+/// none would be shown in the vocabulary of releases before the parameter existed.
+const AUDIT_VOCABULARY: &str = "2";
+
 pub fn list_organization_audit_records(
     client: &HttpClient,
     api_url: &str,
@@ -616,15 +621,18 @@ pub fn list_organization_audit_records(
     limit: Option<u16>,
     cursor: Option<&str>,
 ) -> Result<ListOrganizationAuditRecordsOutcome, OrganizationError> {
-    let spec = list_request_spec(
+    let mut endpoint = list_endpoint(
         client,
         Operation::ListAuditRecords,
         api_url,
         &["v1", "organizations", organization_ref, "audit-records"],
-        access_token,
         limit,
         cursor,
     )?;
+    endpoint
+        .query_pairs_mut()
+        .append_pair("vocabulary", AUDIT_VOCABULARY);
+    let spec = read_request_spec(Operation::ListAuditRecords, endpoint, access_token)?;
 
     match execute_request(client, &spec, REQUEST_TIMEOUT)? {
         RequestExecution::Response(response) => decode_audit_record_list_response(response),
@@ -1079,10 +1087,30 @@ fn list_request_spec(
     limit: Option<u16>,
     cursor: Option<&str>,
 ) -> Result<RequestSpec, OrganizationError> {
+    let endpoint = list_endpoint(client, operation, api_url, path, limit, cursor)?;
+    read_request_spec(operation, endpoint, access_token)
+}
+
+fn list_endpoint(
+    client: &HttpClient,
+    operation: Operation,
+    api_url: &str,
+    path: &[&str],
+    limit: Option<u16>,
+    cursor: Option<&str>,
+) -> Result<Url, OrganizationError> {
     let mut endpoint = client.endpoint(api_url, path).map_err(|error| {
         OrganizationError::local(operation, OrganizationErrorKind::Endpoint(error))
     })?;
     http_util::append_pagination(&mut endpoint, limit, cursor);
+    Ok(endpoint)
+}
+
+fn read_request_spec(
+    operation: Operation,
+    endpoint: Url,
+    access_token: &str,
+) -> Result<RequestSpec, OrganizationError> {
     request_spec_for_endpoint(
         operation,
         Method::GET,

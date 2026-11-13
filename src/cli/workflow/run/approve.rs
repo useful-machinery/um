@@ -1,4 +1,5 @@
-//! `um workflow run approve` and `um workflow run hand-back` (REQ-LOCALRUN-183).
+//! `um workflow run approve` and `um workflow run hand-back` (REQ-LOCALRUN-183); with `--cloud
+//! ORGANIZATION`, the control is carried to the Cloud run's runner instead (REQ-LOCALRUN-210).
 
 use clap::Args;
 use serde_json::{Map, Value};
@@ -18,6 +19,9 @@ pub(super) struct Approve {
 
     #[command(flatten)]
     output: super::control::JsonOutput,
+
+    #[command(flatten)]
+    cloud: super::CloudSelector,
 }
 
 #[derive(Debug, Args)]
@@ -34,10 +38,22 @@ pub(super) struct HandBack {
 
     #[command(flatten)]
     output: super::control::JsonOutput,
+
+    #[command(flatten)]
+    cloud: super::CloudSelector,
 }
 
 impl Approve {
-    pub(super) fn execute(self) -> super::super::super::CommandResult {
+    pub(super) fn execute(mut self) -> super::super::super::CommandResult {
+        if let Some(organization) = self.cloud.organization.take() {
+            return super::cloud::CloudRun::new(
+                self.run,
+                organization,
+                self.cloud,
+                self.output.json,
+            )?
+            .control(super::cloud::Control::Approve);
+        }
         super::control::execute(APPROVE_COMMAND, &self.run, self.output.json, |target| {
             resolve_approval(target, CONTROL_APPROVE, None)
         })
@@ -45,7 +61,16 @@ impl Approve {
 }
 
 impl HandBack {
-    pub(super) fn execute(self) -> super::super::super::CommandResult {
+    pub(super) fn execute(mut self) -> super::super::super::CommandResult {
+        if let Some(organization) = self.cloud.organization.take() {
+            return super::cloud::CloudRun::new(
+                self.run,
+                organization,
+                self.cloud,
+                self.output.json,
+            )?
+            .control(super::cloud::Control::HandBack { notes: self.notes });
+        }
         super::control::execute(HAND_BACK_COMMAND, &self.run, self.output.json, |target| {
             let payload = Map::from_iter([("notes".to_owned(), Value::String(self.notes))]);
             resolve_approval(target, CONTROL_HAND_BACK, Some(payload))

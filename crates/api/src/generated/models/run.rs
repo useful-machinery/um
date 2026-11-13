@@ -49,6 +49,70 @@ pub struct Run {
     pub workspace_membership: Option<Box<models::WorkspaceMembership>>,
     #[serde(rename = "workflowDefinitionSource")]
     pub workflow_definition_source: Box<models::WorkflowDefinitionSource>,
+    /// The pinned definition revision; null for a run by `workflowPath`.
+    #[serde(
+        rename = "definition",
+        default,
+        with = "crate::nullable::double_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub definition: Option<Option<Box<models::RunDefinition>>>,
+    /// The subject claim of the run's current admission; null when it claimed none.
+    #[serde(
+        rename = "subjectClaim",
+        default,
+        with = "crate::nullable::double_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub subject_claim: Option<Option<Box<models::RunSubjectClaim>>>,
+    /// The member who owns the run: for a definition-backed run a human member created, that member unless the request said `owner` `none`, and for a trigger-created run, the member its start evaluation resolved; null when the run has no owner.
+    #[serde(
+        rename = "owner",
+        default,
+        with = "crate::nullable::double_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub owner: Option<Option<String>>,
+    /// The route the run was given when it was accepted, which never changes afterwards; null for a run accepted before routes were recorded.
+    #[serde(
+        rename = "routing",
+        default,
+        with = "crate::nullable::double_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub routing: Option<Option<Box<models::RunRouting>>>,
+    /// The outcome the runner reported the current attempt's workflow chose when it exited, distinct from `state`; null until one is recorded, when the runner reported none, and for a run by `workflowPath`.
+    #[serde(
+        rename = "workflowOutcome",
+        default,
+        with = "crate::nullable::double_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub workflow_outcome: Option<Option<String>>,
+    /// The shared run record's state, distinct from `state`: `exited` once the run is final or the runner reported the current attempt's exit, else the state of the runner's latest root progress report for the current attempt, else `running`; null for a run by `workflowPath`.
+    #[serde(
+        rename = "workflowState",
+        default,
+        with = "crate::nullable::double_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub workflow_state: Option<Option<WorkflowState>>,
+    /// The runner's latest root progress report for the current attempt; null before one is recorded and for a run by `workflowPath`.
+    #[serde(
+        rename = "workflowProgress",
+        default,
+        with = "crate::nullable::double_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub workflow_progress: Option<Option<Box<models::RunWorkflowProgress>>>,
+    /// The run's recorded root exits, one per attempt that exited, in attempt order; empty before any exit and null for a run by `workflowPath`.
+    #[serde(
+        rename = "exits",
+        default,
+        with = "crate::nullable::double_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub exits: Option<Option<Vec<models::RunWorkflowExit>>>,
     #[serde(rename = "primaryWorkspaceSource")]
     pub primary_workspace_source: Box<models::PrimaryWorkspaceSource>,
     /// Immutable historical display labels observed when this run was accepted. They can become stale and never identify, authorize, or resolve a resource. Null is retained only for runs accepted before this snapshot contract.
@@ -140,6 +204,14 @@ impl Run {
             workspace_branch,
             workspace_membership: workspace_membership.map(Box::new),
             workflow_definition_source: Box::new(workflow_definition_source),
+            definition: None,
+            subject_claim: None,
+            owner: None,
+            routing: None,
+            workflow_outcome: None,
+            workflow_state: None,
+            workflow_progress: None,
+            exits: None,
             primary_workspace_source: Box::new(primary_workspace_source),
             source_display_snapshot: source_display_snapshot.map(Box::new),
             inputs: Box::new(inputs),
@@ -190,6 +262,22 @@ pub enum State {
 impl Default for State {
     fn default() -> State {
         Self::Queued
+    }
+}
+/// The shared run record's state, distinct from `state`: `exited` once the run is final or the runner reported the current attempt's exit, else the state of the runner's latest root progress report for the current attempt, else `running`; null for a run by `workflowPath`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
+pub enum WorkflowState {
+    #[serde(rename = "running")]
+    RunWorkflowStateRunning,
+    #[serde(rename = "waiting")]
+    RunWorkflowStateWaiting,
+    #[serde(rename = "exited")]
+    RunWorkflowStateExited,
+}
+
+impl Default for WorkflowState {
+    fn default() -> WorkflowState {
+        Self::RunWorkflowStateRunning
     }
 }
 /// Whether a portable Artifact Set has been successfully committed for this attempt. Absent includes pre-engine-result interruption and does not assert that any uncommitted upload or output was verified.

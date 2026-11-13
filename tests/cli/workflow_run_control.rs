@@ -7,11 +7,12 @@ use super::poll_until;
 use rustix::process::{Pid, Signal, kill_process};
 
 use super::workflow_continue::{
-    FAN_OUT_TREE_ROOT, WAIT_TREE_ROOT, attempt_count, chained, completed, decide, decide_each,
-    fan_out_tree, ordinals_of, partition_event, read_json, resume, status_document, wait_tree,
-    wait_tree_with_json_questions, waiting_run,
+    COMMAND_TREE_ROOT, FAN_OUT_TREE_ROOT, WAIT_TREE_ROOT, attempt_count, chained, completed,
+    decide, decide_each, fan_out_tree, ordinals_of, partition_event, read_json, resume,
+    status_document, wait_tree, wait_tree_with_json_questions, waiting_run,
 };
 use super::workflow_definition::Home;
+use super::workflow_mirror::{LinearStub, resolution, write_resolution};
 use super::workflow_run::{
     RunBundle, TreeBundle, assert_usage_error, isolated_command, progress_position,
     progress_records, run_record, tree_rejection, workflow_run_schema,
@@ -569,11 +570,31 @@ impl Drop for LiveRun {
 #[test]
 fn cancel_ends_a_live_run() {
     let bundle = wait_tree();
+    let (mut live, run) = live_run_held_at_design(&bundle, "live");
+
+    let output = run_control(None, "cancel", &run, &[]);
+    let document = recorded_as(&output, "cancel", "canceled", &run);
+    assert_eq!(document["control"]["event"], "control.cancel");
+    assert_eq!(document["control"]["wait"], serde_json::Value::Null);
+    let record = run_record(&run);
+    assert_eq!(record["state"], "exited", "{record}");
+    assert_eq!(record["outcome"], "canceled", "{record}");
+    let exited = poll_until(
+        "the live run's process exit",
+        || live.process.try_wait().unwrap(),
+        Option::is_some,
+    );
+    assert!(exited.is_some());
+}
+
+/// Starts the wait tree with its `design` stage held and planned, and waits until a live
+/// process holds the run at that stage: the live run and its run directory.
+fn live_run_held_at_design(bundle: &TreeBundle, name: &str) -> (LiveRun, PathBuf) {
     let execution = bundle.execution_root();
     fs::write(execution.join("hold-design"), "").unwrap();
-    decide(&bundle, "design", "planned");
-    let destination = bundle.result("live");
-    let mut live = LiveRun {
+    decide(bundle, "design", "planned");
+    let destination = bundle.result(name);
+    let live = LiveRun {
         process: isolated_command(&bundle.args(&destination))
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -590,21 +611,536 @@ fn cancel_ends_a_live_run() {
         },
         |held| *held,
     );
-    let run = fs::canonicalize(&destination).unwrap();
+    (live, fs::canonicalize(&destination).unwrap())
+}
 
-    let output = run_control(None, "cancel", &run, &[]);
-    let document = recorded_as(&output, "cancel", "canceled", &run);
-    assert_eq!(document["control"]["event"], "control.cancel");
+/// The step `id` of a published result or a `state.json` attempt's `progress`.
+fn step<'a>(steps: &'a serde_json::Value, id: &str) -> &'a serde_json::Value {
+    steps
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|step| step["id"] == id)
+        .unwrap_or_else(|| panic!("{steps}"))
+}
+
+// REQ-WFEXEC-73, REQ-LOCALRUN-186, REQ-WFEXEC-57: `withdraw` of a live run records the control
+// and lets the running stage finish; before the next `workflow` step starts the attempt ends as
+// a cancellation, so the finished stage keeps its outcome and outputs, the rest is `cancelled`
+// `user_request`, and the record reads `exited` `withdrawn`.
+#[test]
+fn withdraw_ends_a_live_run_after_its_running_stage() {
+    let bundle = wait_tree();
+    let (mut live, run) = live_run_held_at_design(&bundle, "live-withdrawn");
+
+    let output = run_control(None, "withdraw", &run, &[]);
+    let document = recorded(&output, "withdraw", &run);
+    assert_eq!(document["control"]["event"], "control.withdraw");
     assert_eq!(document["control"]["wait"], serde_json::Value::Null);
+    assert_eq!(document["wait"], serde_json::Value::Null);
+    control_file(&run, &document);
+    assert_eq!(run_record(&run)["state"], "running");
+    refused(
+        &run_control(None, "withdraw", &run, &[]),
+        "withdraw",
+        "withdraw_pending",
+    );
+    assert_eq!(control_count(&run), 1);
+
+    fs::write(&live.release, "").unwrap();
+    let status = poll_until(
+        "the withdrawn run's process exit",
+        || live.process.try_wait().unwrap(),
+        Option::is_some,
+    );
+    assert!(status.is_some());
     let record = run_record(&run);
     assert_eq!(record["state"], "exited", "{record}");
-    assert_eq!(record["outcome"], "canceled", "{record}");
-    let exited = poll_until(
+    assert_eq!(record["outcome"], "withdrawn", "{record}");
+    assert_eq!(record["attempts"], 1, "{record}");
+    assert_eq!(attempt_count(&run), 1);
+
+    // Publication validated the result before writing it (REQ-WFEXEC-45).
+    let result = read_json(&run.join("attempts/000001/result/result.json"));
+    assert_eq!(result["outcome"], "cancelled", "{result}");
+    assert_eq!(result["cancellation"]["reason"], "user_request", "{result}");
+    assert!(result.get("finalization").is_none(), "{result}");
+    assert_eq!(step(&result["steps"], "design")["state"], "succeeded");
+    for id in ["review", "fix", "merge"] {
+        let step = step(&result["steps"], id);
+        assert_eq!(step["state"], "cancelled", "{result}");
+        assert_eq!(step["detail"]["code"], "user_request", "{result}");
+    }
+    assert!(!run.join("children/review").exists());
+    let state = read_json(&run.join("state.json"));
+    let names = step(&state["attempts"][0]["progress"]["steps"], "design")["outputs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|output| output["name"].as_str().unwrap().to_owned())
+        .collect::<Vec<_>>();
+    for name in ["outcome", "questions", "pullRequest"] {
+        assert!(names.iter().any(|kept| kept == name), "{state}");
+    }
+    // The archived attempt reads back as the cancellation it is.
+    let shown = json(&run_control(None, "show", &run, &[]));
+    assert_eq!(shown["attempts"][0]["state"], "cancelled", "{shown}");
+    refused(
+        &run_control(None, "withdraw", &run, &[]),
+        "withdraw",
+        "run_exited",
+    );
+
+    // The withdrawal is honored once: a retry of the withdrawn run runs the stage it cancelled.
+    decide(&bundle, "review", "approve");
+    let retried = isolated_command(&[
+        "workflow".to_owned(),
+        "run".to_owned(),
+        "retry".to_owned(),
+        run.to_str().unwrap().to_owned(),
+        "--execution-root".to_owned(),
+        bundle.execution_root().to_str().unwrap().to_owned(),
+        "--json".to_owned(),
+    ])
+    .output()
+    .unwrap();
+    let terminal = completed(&retried);
+    assert_eq!(terminal["wait"]["kind"], "approval", "{terminal}");
+    let record = run_record(&run);
+    assert_eq!(record["state"], "waiting", "{record}");
+    assert_eq!(record["attempts"], 2, "{record}");
+}
+
+// REQ-WFEXEC-73, REQ-LOCALRUN-186, REQ-LOCALRUN-191: a live run withdrawn while the stage that
+// ends its attempt in a wait runs is not left waiting: the attempt ends `withdrawn` with no
+// wait record and no `onWait`, the stage keeps its outputs, and `onOutcome.withdrawn` fires once.
+#[test]
+fn withdraw_ends_a_live_run_whose_running_stage_ends_in_a_wait() {
+    withdraw_ends_a_live_run_at_its_running_stage(WAIT_TREE_ROOT, "blocked", "waiting");
+}
+
+// REQ-WFEXEC-73, REQ-LOCALRUN-186, REQ-LOCALRUN-191: a live run withdrawn while its last stage
+// runs ends `withdrawn`, not with the exit the stage's outcome leads to, and fires
+// `onOutcome.withdrawn` once in place of that exit's.
+#[test]
+fn withdraw_ends_a_live_run_whose_running_stage_is_its_last() {
+    let (design, _) = WAIT_TREE_ROOT.split_once("  review:\n").unwrap();
+    let root = design.replacen("      planned: review\n", "      planned: exit.landed\n", 1);
+    withdraw_ends_a_live_run_at_its_running_stage(&root, "planned", "succeeded");
+}
+
+/// Publishes the wait tree with `root` under the engineering mirror, withdraws a run whose
+/// `design` stage is held, lets the stage decide `verdict`, which ends the attempt with the
+/// published `result` outcome, and checks the run ends `withdrawn` there.
+fn withdraw_ends_a_live_run_at_its_running_stage(root: &str, verdict: &str, result: &str) {
+    let tree = EngineeringWaitTree::publish_root(root);
+    let stub = LinearStub::start();
+    let mut live = tree.held(&stub, "AUTO-1", verdict);
+    let run = withdrawn_live(&tree, &stub);
+
+    fs::write(&live.release, "").unwrap();
+    let published = ended_withdrawn_once(&tree, &stub, &mut live, &run, 0);
+    assert_eq!(published["outcome"], result, "{published}");
+    assert_eq!(step(&published["steps"], "design")["state"], "succeeded");
+    let state = read_json(&run.join("state.json"));
+    let names = step(&state["attempts"][0]["progress"]["steps"], "design")["outputs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|output| output["name"].as_str().unwrap().to_owned())
+        .collect::<Vec<_>>();
+    for name in ["outcome", "questions", "pullRequest"] {
+        assert!(names.iter().any(|kept| kept == name), "{state}");
+    }
+}
+
+// REQ-WFEXEC-73, REQ-LOCALRUN-186, REQ-LOCALRUN-191: a live run whose root has no `workflow`
+// step, withdrawn while its command step runs, ends `withdrawn` where the attempt settles, not
+// with the outcome the step chose, and fires `onOutcome.withdrawn` once in place of that one's.
+#[test]
+fn withdraw_ends_a_live_run_whose_root_has_no_workflow_step() {
+    let tree = EngineeringWaitTree::publish_root(COMMAND_TREE_ROOT);
+    let stub = LinearStub::start();
+    let mut live = tree.held(&stub, "AUTO-1", "landed");
+    let run = withdrawn_live(&tree, &stub);
+
+    fs::write(&live.release, "").unwrap();
+    let published = ended_withdrawn_once(&tree, &stub, &mut live, &run, 0);
+    assert_eq!(published["outcome"], "succeeded", "{published}");
+    assert_eq!(step(&published["steps"], "decide")["state"], "succeeded");
+}
+
+// REQ-WFEXEC-73, REQ-LOCALRUN-186, REQ-LOCALRUN-191: a withdrawal recorded after the attempt
+// ended in a wait, while its `onWait` write is in flight, still ends the run `withdrawn` as
+// the attempt writes its final record: the wait record is removed, the `onWait` write stays
+// and `onOutcome.withdrawn` follows it once. The settlement that honored it spent it: a retry
+// of the withdrawn run is not withdrawn again.
+#[test]
+fn withdraw_ends_a_live_run_withdrawn_while_its_attempt_finishes() {
+    let tree = EngineeringWaitTree::publish();
+    let stub = LinearStub::start();
+    let mut live = tree.held(&stub, "AUTO-1", "blocked");
+    stub.hold_mutation("Waiting for");
+    fs::write(&live.release, "").unwrap();
+    poll_until(
+        "the held onWait write",
+        || stub.holding_mutation(),
+        |held| *held,
+    );
+    let run = withdrawn_live(&tree, &stub);
+    assert!(live.process.try_wait().unwrap().is_none());
+    assert_eq!(run_record(&run)["state"], "running");
+
+    stub.release_mutation();
+    let published = ended_withdrawn_once(&tree, &stub, &mut live, &run, 1);
+    assert_eq!(published["outcome"], "waiting", "{published}");
+
+    let terminal = retried(&tree, &stub, &run);
+    assert_eq!(terminal["wait"]["kind"], "answer", "{terminal}");
+    let record = run_record(&run);
+    assert_eq!(record["state"], "waiting", "{record}");
+    assert_eq!(record["attempts"], 2, "{record}");
+    assert_eq!(control_count(&run), 1);
+}
+
+// REQ-LOCALRUN-186, REQ-WFEXEC-73, REQ-LOCALRUN-191, REQ-LOCALRUN-181: a live process that
+// releases the run `waiting` before `withdraw` finds it held leaves `withdraw` to end the run as
+// it ends a waiting run: one `control.withdraw` naming the wait, the run `exited` `withdrawn`
+// with no wait record, and `onOutcome.withdrawn` after the `onWait` once. That control is
+// honored once: a retry of the withdrawn run is not withdrawn at its first boundary.
+#[test]
+fn withdraw_ends_a_live_run_its_process_releases_waiting() {
+    let tree = EngineeringWaitTree::publish();
+    let stub = LinearStub::start();
+    let mut live = tree.held(&stub, "AUTO-1", "blocked");
+    let mut wait = None;
+    let (output, run) = withdrawn_across_release(&tree, &stub, &mut live, true, |run| {
+        assert_eq!(run_record(run)["state"], "waiting");
+        wait = Some(read_json(&run.join("wait.json")));
+    });
+
+    let document = recorded_as(&output, "withdraw", "withdrawn", &run);
+    assert_eq!(document["control"]["event"], "control.withdraw");
+    assert_eq!(document["control"]["wait"], wait_id(&wait.unwrap()));
+    assert_eq!(document["control"]["path"], "controls/0001-withdraw.json");
+    assert_eq!(document["wait"], serde_json::Value::Null);
+    control_file(&run, &document);
+    let published = ended_withdrawn_once(&tree, &stub, &mut live, &run, 1);
+    assert_eq!(published["outcome"], "waiting", "{published}");
+
+    let terminal = retried(&tree, &stub, &run);
+    assert_eq!(terminal["wait"]["kind"], "answer", "{terminal}");
+    let record = run_record(&run);
+    assert_eq!(record["state"], "waiting", "{record}");
+    assert_eq!(record["attempts"], 2, "{record}");
+    assert_eq!(control_count(&run), 1);
+}
+
+// REQ-LOCALRUN-186, REQ-LOCALRUN-181, REQ-WFEXEC-73: a live process that releases the run
+// `exited` with the outcome its attempt reached before `withdraw` finds it held leaves
+// `withdraw` to answer as it does for an exited run: `run_exited`, with no control appended and
+// the record and the mirror's writes unchanged, so the next retry of that `failed` run is not
+// withdrawn.
+#[test]
+fn withdraw_of_a_live_run_its_process_releases_exited_is_run_exited() {
+    let tree = EngineeringWaitTree::publish_root(COMMAND_TREE_ROOT);
+    let stub = LinearStub::start();
+    let mut live = tree.held(&stub, "AUTO-1", "landed");
+    // Without its verdict the held step fails once released, and the run exits `failed`.
+    fs::remove_file(tree.bundle.execution_root().join("verdict-design")).unwrap();
+    let mut released = None;
+    let (output, run) = withdrawn_across_release(&tree, &stub, &mut live, true, |run| {
+        let record = run_record(run);
+        assert_eq!(record["state"], "exited", "{record}");
+        assert_eq!(record["outcome"], "failed", "{record}");
+        released = Some((record, super::workflow_mirror::mirror_writes(run)));
+    });
+
+    refused(&output, "withdraw", "run_exited");
+    assert_eq!(control_count(&run), 0);
+    let (record, writes) = released.unwrap();
+    assert_eq!(run_record(&run), record);
+    assert_eq!(super::workflow_mirror::mirror_writes(&run), writes);
+
+    decide(&tree.bundle, "design", "landed");
+    let terminal = retried(&tree, &stub, &run);
+    assert_eq!(terminal["outcome"], "succeeded", "{terminal}");
+    let record = run_record(&run);
+    assert_eq!(record["state"], "exited", "{record}");
+    assert_eq!(record["outcome"], "landed", "{record}");
+    assert_eq!(record["attempts"], 2, "{record}");
+    assert_eq!(control_count(&run), 0);
+}
+
+// REQ-LOCALRUN-204, REQ-LOCALRUN-181, REQ-LOCALRUN-186: a mirrored live run its process
+// releases `waiting` before a `withdraw` without `LINEAR_API_KEY` finds it held is refused
+// `mirror_credentials_unavailable` as a waiting run is, with no control appended; the same
+// command again appends none, and with the key it ends the run `withdrawn` on one control.
+#[test]
+fn a_withdraw_refused_credentials_across_release_appends_nothing() {
+    let tree = EngineeringWaitTree::publish();
+    let stub = LinearStub::start();
+    let mut live = tree.held(&stub, "AUTO-1", "blocked");
+    let (output, run) = withdrawn_across_release(&tree, &stub, &mut live, false, |run| {
+        assert_eq!(run_record(run)["state"], "waiting");
+    });
+
+    refused(&output, "withdraw", "mirror_credentials_unavailable");
+    assert_eq!(control_count(&run), 0);
+    let mut command = isolated_command(&[
+        "workflow".to_owned(),
+        "run".to_owned(),
+        "withdraw".to_owned(),
+        "AUTO-1".to_owned(),
+        "--json".to_owned(),
+    ]);
+    command.env("UM_HOME", tree.home.path());
+    let output = stub
+        .point(&mut command)
+        .env("USER", OPERATOR)
+        .env_remove("LINEAR_API_KEY")
+        .output()
+        .unwrap();
+    refused(&output, "withdraw", "mirror_credentials_unavailable");
+    assert_eq!(control_count(&run), 0);
+    assert_eq!(run_record(&run)["state"], "waiting");
+
+    recorded_as(
+        &tree.run(&stub, &["withdraw", "AUTO-1", "--json"]),
+        "withdraw",
+        "withdrawn",
+        &run,
+    );
+    ended_withdrawn_once(&tree, &stub, &mut live, &run, 1);
+}
+
+// REQ-LOCALRUN-181, REQ-LOCALRUN-186: `withdraw` of a waiting run refused `run_locked`, because
+// a process took the run between the inspection and the run lock, or `wait_changed`, because
+// the run's wait changed there, appends nothing.
+#[test]
+fn a_withdraw_refused_at_the_run_lock_appends_nothing() {
+    let bundle = wait_tree();
+    let (run, _) = waiting_run(&bundle, "locked", "blocked");
+    let mut held = None;
+    let output = withdrawn_at_the_lock(&bundle, &run, || held = Some(hold_lock(&run)));
+    refused(&output, "withdraw", "run_locked");
+    assert_eq!(control_count(&run), 0);
+    drop(held);
+    assert_eq!(run_record(&run)["state"], "waiting");
+
+    let (run, terminal) = waiting_run(&bundle, "changed", "blocked");
+    let mut before = 0;
+    let output = withdrawn_at_the_lock(&bundle, &run, || {
+        answer_the_one_question(&run);
+        let resumed = completed(&resume(&run));
+        assert_ne!(
+            resumed["wait"]["since"], terminal["wait"]["since"],
+            "{resumed}"
+        );
+        before = control_count(&run);
+    });
+    refused(&output, "withdraw", "wait_changed");
+    assert_eq!(control_count(&run), before);
+    assert_eq!(before, 1);
+    assert_eq!(run_record(&run)["state"], "waiting");
+}
+
+/// `um workflow run withdraw RUN` of the waiting run `run`, held between its inspection and
+/// the run lock (`UM_TEST_RUN_LOCK_GATE`) while `between` acts on the run: its output.
+fn withdrawn_at_the_lock(bundle: &TreeBundle, run: &Path, between: impl FnOnce()) -> Output {
+    let gate = bundle.result("withdraw-lock-gate");
+    fs::create_dir_all(gate.parent().unwrap()).unwrap();
+    let _ = fs::remove_file(&gate);
+    let _ = fs::remove_file(gate.with_extension("inspected"));
+    let withdraw = control_command(None, "withdraw", run, &[])
+        .env("UM_TEST_RUN_LOCK_GATE", &gate)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    poll_until(
+        "the withdraw's inspection",
+        || gate.with_extension("inspected").exists(),
+        |inspected| *inspected,
+    );
+    between();
+    fs::write(&gate, "").unwrap();
+    withdraw.wait_with_output().unwrap()
+}
+
+/// `um workflow run retry` of `run` in the tree's execution root, as `OPERATOR` pointed at
+/// `stub`: its terminal document.
+fn retried(tree: &EngineeringWaitTree, stub: &LinearStub, run: &Path) -> serde_json::Value {
+    let execution_root = tree.bundle.execution_root();
+    completed(&tree.run(
+        stub,
+        &[
+            "retry",
+            run.to_str().unwrap(),
+            "--execution-root",
+            execution_root.to_str().unwrap(),
+            "--json",
+        ],
+    ))
+}
+
+/// `um workflow run withdraw AUTO-1` of the run `live` holds, held after its inspection
+/// (`UM_TEST_RUN_LOCK_GATE`) while `live`'s held step is released and its process exits, with
+/// `LINEAR_API_KEY` set when `key` is; calls `released` with the run directory before opening
+/// the gate. The command's output and the run directory.
+fn withdrawn_across_release(
+    tree: &EngineeringWaitTree,
+    stub: &LinearStub,
+    live: &mut LiveRun,
+    key: bool,
+    released: impl FnOnce(&Path),
+) -> (Output, PathBuf) {
+    let gate = tree.files.path().join("withdraw-lock-gate");
+    let mut command = isolated_command(&[
+        "workflow".to_owned(),
+        "run".to_owned(),
+        "withdraw".to_owned(),
+        "AUTO-1".to_owned(),
+        "--json".to_owned(),
+    ]);
+    command
+        .env("UM_HOME", tree.home.path())
+        .env("UM_TEST_RUN_LOCK_GATE", &gate)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    stub.point(&mut command).env("USER", OPERATOR);
+    if !key {
+        command.env_remove("LINEAR_API_KEY");
+    }
+    let mut withdraw = LiveRun {
+        process: command.spawn().unwrap(),
+        release: gate.clone(),
+    };
+    let inspected = gate.with_extension("inspected");
+    poll_until(
+        "the withdraw's inspection",
+        || inspected.exists() || withdraw.process.try_wait().unwrap().is_some(),
+        |held| *held,
+    );
+    assert!(
+        inspected.exists(),
+        "the withdraw ended before its seam: {:?}",
+        withdraw.output()
+    );
+
+    fs::write(&live.release, "").unwrap();
+    let status = poll_until(
         "the live run's process exit",
         || live.process.try_wait().unwrap(),
         Option::is_some,
     );
-    assert!(exited.is_some());
+    assert!(status.is_some());
+    let runs = PathBuf::from(tree.home.path())
+        .join("workflows")
+        .join(&tree.definition)
+        .join("runs");
+    let mut directories = fs::read_dir(&runs).unwrap();
+    let run = fs::canonicalize(directories.next().unwrap().unwrap().path()).unwrap();
+    assert!(directories.next().is_none());
+    released(&run);
+
+    fs::write(&gate, "").unwrap();
+    (withdraw.output(), run)
+}
+
+/// `um workflow run withdraw AUTO-1` of the run a live process holds, once it answers
+/// `recorded`: the run directory.
+fn withdrawn_live(tree: &EngineeringWaitTree, stub: &LinearStub) -> PathBuf {
+    let output = poll_until(
+        "the live run's withdraw",
+        || tree.run(stub, &["withdraw", "AUTO-1", "--json"]),
+        |output| output.status.code() == Some(0),
+    );
+    let document = json(&output);
+    assert_eq!(document["outcome"], "recorded", "{document}");
+    PathBuf::from(document["runDirectory"].as_str().unwrap())
+}
+
+/// Waits for the live run's process to exit and checks the run ended `withdrawn` on its one
+/// attempt with its one withdrawal honored: no wait record, `waits` `onWait` writes and one
+/// `onOutcome.withdrawn` write after them, and a later `withdraw` refused `run_exited`. The
+/// attempt's published result, the one it reached.
+fn ended_withdrawn_once(
+    tree: &EngineeringWaitTree,
+    stub: &LinearStub,
+    live: &mut LiveRun,
+    run: &Path,
+    waits: usize,
+) -> serde_json::Value {
+    let status = poll_until(
+        "the withdrawn run's process exit",
+        || live.process.try_wait().unwrap(),
+        Option::is_some,
+    );
+    assert!(status.is_some());
+    let record = run_record(run);
+    assert_eq!(record["state"], "exited", "{record}");
+    assert_eq!(record["outcome"], "withdrawn", "{record}");
+    assert_eq!(record["attempts"], 1, "{record}");
+    assert!(!run.join("wait.json").exists());
+    assert_eq!(control_count(run), 1);
+
+    let writes = super::workflow_mirror::mirror_writes(run);
+    let kinds = writes
+        .iter()
+        .filter_map(|(name, _)| {
+            ["-wait.json", "-outcome.json"]
+                .into_iter()
+                .find(|kind| name.ends_with(kind))
+        })
+        .collect::<Vec<_>>();
+    let mut expected = vec!["-wait.json"; waits];
+    expected.push("-outcome.json");
+    assert_eq!(kinds, expected, "{writes:?}");
+    let (_, outcome) = writes
+        .iter()
+        .find(|(name, _)| name.ends_with("-outcome.json"))
+        .unwrap();
+    assert_eq!(
+        outcome["action"],
+        serde_json::json!({"kind": "state", "state": "Backlog", "binding": "backlog"}),
+        "{writes:?}"
+    );
+    refused(
+        &tree.run(stub, &["withdraw", run.to_str().unwrap(), "--json"]),
+        "withdraw",
+        "run_exited",
+    );
+    read_json(&run.join("attempts/000001/result/result.json"))
+}
+
+// REQ-LOCALRUN-186: a withdrawal the live process never honored ends the run when the
+// abandoned attempt is resumed, without another attempt.
+#[test]
+fn resume_ends_an_abandoned_run_whose_withdrawal_is_pending() {
+    let bundle = wait_tree();
+    let (mut live, run) = live_run_held_at_design(&bundle, "abandoned-withdrawn");
+    recorded(&run_control(None, "withdraw", &run, &[]), "withdraw", &run);
+    live.process.kill().unwrap();
+    live.process.wait().unwrap();
+    fs::write(&live.release, "").unwrap();
+
+    // Until the orphaned step process ends, the attempt's ownership is unproven.
+    let output = poll_until(
+        "the abandoned run's resume",
+        || resume(&run),
+        |output| output.status.code() == Some(0),
+    );
+    let terminal = completed(&output);
+    assert_eq!(terminal["outcome"], "withdrawn", "{terminal}");
+    let record = run_record(&run);
+    assert_eq!(record["state"], "exited", "{record}");
+    assert_eq!(record["outcome"], "withdrawn", "{record}");
+    assert_eq!(record["attempts"], 1, "{record}");
+    assert_eq!(attempt_count(&run), 1);
+    assert_eq!(control_count(&run), 1);
 }
 
 // REQ-LOCALRUN-186, REQ-CONTINUE-2: `cancel` of a `running` run whose process is gone settles
@@ -625,28 +1161,7 @@ fn withdraw_ends_an_abandoned_run() {
 /// abandoned run with `leaf`, which records `control.<leaf>` and exits the run `outcome`.
 fn ends_an_abandoned_run(leaf: &str, outcome: &str) {
     let bundle = wait_tree();
-    let execution = bundle.execution_root();
-    fs::write(execution.join("hold-design"), "").unwrap();
-    decide(&bundle, "design", "planned");
-    let destination = bundle.result("abandoned");
-    let mut live = LiveRun {
-        process: isolated_command(&bundle.args(&destination))
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap(),
-        release: execution.join("release-design"),
-    };
-    poll_until(
-        "the run's held step",
-        || {
-            execution.join("held-design").exists()
-                && um_execution::lock_holder(&destination).is_ok_and(|holder| holder.is_some())
-        },
-        |held| *held,
-    );
-    let run = fs::canonicalize(&destination).unwrap();
+    let (mut live, run) = live_run_held_at_design(&bundle, "abandoned");
     live.process.kill().unwrap();
     live.process.wait().unwrap();
     assert_eq!(run_record(&run)["state"], "running");
@@ -2851,6 +3366,344 @@ fn a_repair_retry_refuses_a_child_that_failed_only_in_its_finalizer() {
         fs::read_to_string(root.join("effects")).unwrap(),
         "effect\n"
     );
+}
+
+/// The root workflow fixture of the engineering lifecycle, whose `release` control trigger
+/// cancels on a departure to `$canceled` and withdraws otherwise.
+const ENGINEERING_ROOT: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/crates/execution/tests/fixtures/workflow/v1/valid/root-workflow.yaml"
+));
+
+/// The claim's admission observation `updatedAt`, T.
+const ADMITTED_AT: &str = "2026-11-10T10:00:00Z";
+
+/// The wait tree under the engineering root's `bindings`, `triggers` and `mirror` blocks,
+/// published with the engineering bindings and given the revision's resolution record, as
+/// the Cloud runner materializes a revision (REQ-WFDEF-32).
+struct EngineeringWaitTree {
+    home: Home,
+    bundle: TreeBundle,
+    definition: String,
+    files: tempfile::TempDir,
+}
+
+impl EngineeringWaitTree {
+    fn publish() -> Self {
+        Self::publish_root(WAIT_TREE_ROOT)
+    }
+
+    /// The wait tree with `root`, a root of its children, as its `workflow.yaml`, published
+    /// as `publish` does.
+    fn publish_root(root: &str) -> Self {
+        let (_, blocks) = ENGINEERING_ROOT.split_once("\nbindings:").unwrap();
+        let (blocks, _) = blocks.split_once("\ninputs:").unwrap();
+        let header = format!(
+            "schemaVersion: 1\nname: engineering\nsubject: ticket\nbindings:{blocks}\ninputs:\n  ticket:\n    kind: text\n  baseBranch:\n    kind: text\n    default: main\n"
+        );
+        let bundle = wait_tree();
+        bundle.write_source(
+            "workflow.yaml",
+            &root.replacen("schemaVersion: 1\n", &header, 1),
+        );
+        let files = tempfile::tempdir().unwrap();
+        let bindings = files.path().join("bindings.json");
+        fs::write(
+            &bindings,
+            serde_json::json!({
+                "connection": "local",
+                "linearTeam": "AUTO",
+                "repository": "useful-machinery/platform",
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let home = Home::new();
+        let report = home.json(&[
+            "publish",
+            bundle.source_root().to_str().unwrap(),
+            "--bindings",
+            bindings.to_str().unwrap(),
+        ]);
+        assert_eq!(report["outcome"], "published", "{report}");
+        let definition = report["definition"]["id"].as_str().unwrap().to_owned();
+        write_resolution(&home, &definition, &resolution(&[]));
+        Self {
+            home,
+            bundle,
+            definition,
+            files,
+        }
+    }
+
+    /// `um workflow run ARGS` under the home as `OPERATOR`, pointed at `stub`.
+    fn run(&self, stub: &LinearStub, args: &[&str]) -> Output {
+        let mut full = vec!["workflow".to_owned(), "run".to_owned()];
+        full.extend(args.iter().map(|arg| (*arg).to_owned()));
+        let mut command = isolated_command(&full);
+        command.env("UM_HOME", self.home.path());
+        stub.point(&mut command)
+            .env("USER", OPERATOR)
+            .output()
+            .unwrap()
+    }
+
+    /// A run for `ticket` whose `design` waits on an answer.
+    fn waiting(&self, stub: &LinearStub, ticket: &str) -> PathBuf {
+        decide(&self.bundle, "design", "blocked");
+        let execution_root = self.bundle.execution_root().to_str().unwrap().to_owned();
+        let terminal = completed(&self.run(
+            stub,
+            &[
+                "create",
+                &self.definition,
+                "--execution-root",
+                &execution_root,
+                "--input-text",
+                "ticket",
+                ticket,
+                "--json",
+            ],
+        ));
+        assert_eq!(terminal["wait"]["kind"], "answer", "{terminal}");
+        PathBuf::from(terminal["runDirectory"].as_str().unwrap())
+    }
+
+    /// A run for `ticket` whose `design` decides `verdict` once its held step is released:
+    /// the live process, holding the run at that step.
+    fn held(&self, stub: &LinearStub, ticket: &str, verdict: &str) -> LiveRun {
+        let execution = self.bundle.execution_root();
+        fs::write(execution.join("hold-design"), "").unwrap();
+        decide(&self.bundle, "design", verdict);
+        let execution_root = execution.to_str().unwrap().to_owned();
+        let mut command = isolated_command(&[
+            "workflow".to_owned(),
+            "run".to_owned(),
+            "create".to_owned(),
+            self.definition.clone(),
+            "--execution-root".to_owned(),
+            execution_root,
+            "--input-text".to_owned(),
+            "ticket".to_owned(),
+            ticket.to_owned(),
+            "--json".to_owned(),
+        ]);
+        command
+            .env("UM_HOME", self.home.path())
+            .env("USER", OPERATOR)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let live = LiveRun {
+            process: stub.point(&mut command).spawn().unwrap(),
+            release: execution.join("release-design"),
+        };
+        poll_until(
+            "the live run's held step",
+            || execution.join("held-design").exists(),
+            |held| *held,
+        );
+        live
+    }
+
+    /// `um workflow run event RUN --event FILE --claim FILE --json` for a departure of
+    /// `issue-1` from `Engineering` towards `to` at `updated_at`, under the claim admitted at
+    /// `ADMITTED_AT` in `Engineering`.
+    fn event(&self, stub: &LinearStub, run: &Path, updated_at: &str, to: &str) -> Output {
+        let event = self.files.path().join("event.json");
+        fs::write(
+            &event,
+            serde_json::json!({
+                "source": "linear",
+                "event": "issue.state_left",
+                "at": updated_at,
+                "payload": {
+                    "issue": {"id": "issue-1", "identifier": "AUTO-1"},
+                    "issueUpdatedAt": updated_at,
+                    "team": "team-auto",
+                    "state": "state-engineering",
+                    "to": to,
+                    "actor": {"id": "user-1", "type": "user"},
+                },
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let claim = self.files.path().join("claim.json");
+        fs::write(
+            &claim,
+            serde_json::json!({
+                "connection": "lc_1",
+                "issue": "issue-1",
+                "observation": {
+                    "team": "team-auto",
+                    "state": "state-engineering",
+                    "updatedAt": ADMITTED_AT,
+                },
+            })
+            .to_string(),
+        )
+        .unwrap();
+        self.run(
+            stub,
+            &[
+                "event",
+                run.to_str().unwrap(),
+                "--event",
+                event.to_str().unwrap(),
+                "--claim",
+                claim.to_str().unwrap(),
+                "--json",
+            ],
+        )
+    }
+}
+
+/// The document of `um workflow run event` applying `action` with `outcome`, exit 0.
+fn applied(output: &Output, run: &Path, action: &str, outcome: &str) -> serde_json::Value {
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let document = json(output);
+    assert_eq!(document["schemaVersion"], 1, "{document}");
+    assert_eq!(document["command"], "um workflow run event");
+    assert_eq!(document["outcome"], "applied", "{document}");
+    assert_eq!(document["exitStatus"], 0);
+    assert_eq!(document["runDirectory"], run.to_str().unwrap());
+    assert_eq!(document["run"], run_record(run)["id"]);
+    assert_eq!(document["trigger"], "release", "{document}");
+    assert_eq!(document["action"], action, "{document}");
+    assert_eq!(document["actionOutcome"], outcome, "{document}");
+    assert_eq!(document["control"]["event"], format!("control.{action}"));
+    document
+}
+
+// REQ-LOCALRUN-208: a delivered departure acts only when it is later than the claim's
+// admission observation, from a fresh read of the issue in the bound team outside the owned
+// state, and the fresh state, not the event's `to`, chooses `cancel` or `withdraw`.
+#[test]
+fn a_delivered_departure_is_applied_from_the_fresh_issue_state() {
+    let tree = EngineeringWaitTree::publish();
+    let stub = LinearStub::start();
+    let later = "2026-11-10T10:00:01Z";
+
+    let run = tree.waiting(&stub, "AUTO-1");
+    let controls = control_count(&run);
+    stub.clear();
+    let refusal = refused(
+        &tree.event(&stub, &run, ADMITTED_AT, "state-canceled"),
+        "event",
+        "event_not_later",
+    );
+    assert_eq!(refusal["runDirectory"], run.to_str().unwrap());
+    assert_eq!(refusal["observation"], serde_json::Value::Null, "{refusal}");
+    assert_eq!(stub.operations(), Vec::<String>::new());
+
+    let refusal = refused(
+        &tree.event(&stub, &run, later, "state-canceled"),
+        "event",
+        "issue_in_owned_state",
+    );
+    assert_eq!(refusal["observation"]["state"], "state-engineering");
+    assert_eq!(stub.operations(), ["IssueState"]);
+    assert_eq!(control_count(&run), controls);
+    assert_eq!(run_record(&run)["state"], "waiting");
+
+    // The event says Backlog; the issue is now Canceled, so the run is canceled.
+    stub.issue_state("Canceled");
+    let document = applied(
+        &tree.event(&stub, &run, later, "state-backlog"),
+        &run,
+        "cancel",
+        "canceled",
+    );
+    assert_eq!(
+        document["observation"],
+        serde_json::json!({
+            "team": "team-auto",
+            "state": "state-canceled",
+            "updatedAt": super::workflow_mirror::ISSUE_UPDATED_AT,
+        })
+    );
+    control_file(&run, &document);
+    let record = run_record(&run);
+    assert_eq!(record["state"], "exited");
+    assert_eq!(record["outcome"], "canceled");
+
+    // The event says Canceled; the issue is now in Backlog, so the run is withdrawn.
+    stub.issue_state("Backlog");
+    let withdrawn = tree.waiting(&stub, "AUTO-2");
+    applied(
+        &tree.event(&stub, &withdrawn, later, "state-canceled"),
+        &withdrawn,
+        "withdraw",
+        "withdrawn",
+    );
+    assert_eq!(run_record(&withdrawn)["outcome"], "withdrawn");
+
+    // An issue moved to another team is not the claim's to act on.
+    let moved = tree.waiting(&stub, "AUTO-3");
+    stub.issue_team("team-other");
+    stub.issue_state("Canceled");
+    let refusal = refused(
+        &tree.event(&stub, &moved, later, "state-canceled"),
+        "event",
+        "issue_unavailable",
+    );
+    assert_eq!(refusal["observation"]["team"], "team-other", "{refusal}");
+    assert_eq!(run_record(&moved)["state"], "waiting");
+}
+
+// REQ-LOCALRUN-208: a revision that cannot be read is `control_unavailable`, and the
+// refusal's diagnostic keeps the class of its cause: a resolution record that cannot be
+// read, one that is not of its shape, or a retained tree whose root does not resolve.
+#[test]
+fn an_unreadable_revision_refuses_the_event_with_the_class_of_its_cause() {
+    let tree = EngineeringWaitTree::publish();
+    let stub = LinearStub::start();
+    let later = "2026-11-10T10:00:01Z";
+    let run = tree.waiting(&stub, "AUTO-1");
+    let controls = control_count(&run);
+    stub.clear();
+    let cause = |output: &Output| {
+        let refusal = refused(output, "event", "control_unavailable");
+        assert_eq!(refusal["observation"], serde_json::Value::Null, "{refusal}");
+        refusal["diagnostics"][0]["cause"].clone()
+    };
+
+    let resolution = Path::new(tree.home.path())
+        .join("workflows")
+        .join(&tree.definition)
+        .join("revisions/1/resolution.json");
+    fs::write(&resolution, "{\"linearTeam\": ").unwrap();
+    assert_eq!(
+        cause(&tree.event(&stub, &run, later, "state-canceled")),
+        "parse"
+    );
+
+    fs::remove_file(&resolution).unwrap();
+    fs::create_dir(&resolution).unwrap();
+    assert_eq!(
+        cause(&tree.event(&stub, &run, later, "state-canceled")),
+        "read"
+    );
+    fs::remove_dir(&resolution).unwrap();
+
+    let trees = Path::new(tree.home.path()).join("trees/sha256");
+    let copies = fs::read_dir(&trees)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect::<Vec<_>>();
+    assert_eq!(copies.len(), 1, "{copies:?}");
+    let root = copies[0].join("workflow.yaml");
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o644)).unwrap();
+    fs::write(&root, "schemaVersion: 1\nsteps: [").unwrap();
+    assert_eq!(
+        cause(&tree.event(&stub, &run, later, "state-canceled")),
+        "resolve"
+    );
+
+    assert_eq!(stub.operations(), Vec::<String>::new());
+    assert_eq!(control_count(&run), controls);
+    assert_eq!(run_record(&run)["state"], "waiting");
 }
 
 /// A root whose `build` stage child runs `prepare` and then the long-running `work`, and whose

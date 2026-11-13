@@ -1,18 +1,19 @@
 //! The run mirror (REQ-LOCALRUN-191, INV-ENGINE-25): which runs write to Linear and through
 //! what. A definition run of a root workflow that carries `mirror` gets a `Mirror` over its
-//! issue input, its revision's bindings snapshot, its owner and its run directory; the hook
+//! issue input, its revision's bindings snapshot and resolution record (REQ-WFDEF-32), its
+//! owner and id, its `external.url` or run directory and its run directory; the hook
 //! sites in `create.rs`, `end.rs` and `resume.rs` drive it against the Linear target, and a
 //! write's result never changes the command's. A command that ends a run itself checks the
 //! key first (`outcome_credentials`, REQ-LOCALRUN-204).
 
-mod linear;
+pub(super) mod linear;
 
 use std::path::Path;
 use std::sync::Arc;
 
 use um_execution::{
-    LocalRunDirectoryError, Mirror, MirrorFailure, MirrorTarget, ResolvedInput, ResolvedInputs,
-    ValidatedWorkflow, WorkflowHome, WorkflowRunRecord, read_revision_bindings,
+    DefinitionError, LocalRunDirectoryError, Mirror, MirrorFailure, MirrorTarget, ResolvedInput,
+    ResolvedInputs, ValidatedWorkflow, WorkflowHome, WorkflowRunRecord, read_revision_bindings,
 };
 
 use super::create::blocking_operation;
@@ -23,8 +24,9 @@ pub(super) type Hook =
 
 /// The run's mirror, or `None` when it writes nothing: its root has no `mirror` block, it was
 /// started by path (no definition or revision), or it is a child run. A missing or non-text
-/// issue input, or a snapshot that cannot be read, still makes a `Mirror`, whose every hook
-/// records the failure.
+/// issue input, or a snapshot or resolution record that cannot be read, still makes a
+/// `Mirror`, whose every hook records the failure. A revision with a resolution record
+/// makes a mirror that matches and writes states by id (REQ-LOCALRUN-192).
 pub(super) fn mirror_for_run(
     home: Option<&WorkflowHome>,
     record: &WorkflowRunRecord,
@@ -45,40 +47,55 @@ pub(super) fn mirror_for_run(
             block.issue
         ))),
     };
-    let bindings = home
+    let unreadable = |what: &str, error: DefinitionError| {
+        MirrorFailure::bindings_unavailable(format!(
+            "The {what} of {definition} revision {revision} cannot be read: {}.",
+            error.code()
+        ))
+    };
+    let read = home
         .ok_or_else(|| MirrorFailure::bindings_unavailable("The workflow home cannot be located."))
         .and_then(|home| {
-            read_revision_bindings(home, definition, revision).map_err(|error| {
-                MirrorFailure::bindings_unavailable(format!(
-                    "The bindings snapshot of {definition} revision {revision} cannot be read: {}.",
-                    error.code()
-                ))
-            })
-        })
-        .map(|snapshot| {
-            snapshot
+            let snapshot = read_revision_bindings(home, definition, revision)
+                .map_err(|error| unreadable("bindings snapshot", error))?;
+            let resolved_ids = home
+                .revision_resolution(definition, revision)
+                .map_err(|error| unreadable("resolution record", error))?;
+            Ok((snapshot, resolved_ids))
+        });
+    let (bindings, resolved_ids) = match (issue.as_ref(), read) {
+        (Err(failure), _) => (Err(failure.clone()), None),
+        (Ok(_), Err(failure)) => (Err(failure), None),
+        (Ok(_), Ok((snapshot, resolved_ids))) => (
+            Ok(snapshot
                 .bindings()
                 .iter()
-                .map(|(key, bound)| (key.clone(), bound.value.clone()))
-                .collect()
-        });
-    let (issue, bindings) = match issue {
-        Ok(issue) => (issue, bindings),
-        Err(failure) => (String::new(), Err(failure)),
+                .filter_map(|(key, bound)| Some((key.clone(), bound.value.as_text()?.to_owned())))
+                .collect()),
+            resolved_ids,
+        ),
     };
-    let run_url = url::Url::from_file_path(run_directory).map_or_else(
-        |()| format!("file://{}", run_directory.display()),
-        String::from,
-    );
-    Some(Mirror::new(
+    // REQ-LOCALRUN-191: the record's `external.url`, which a Cloud runner sets to the run's
+    // page, else the run directory.
+    let run_url = record.external.get("url").cloned().unwrap_or_else(|| {
+        url::Url::from_file_path(run_directory).map_or_else(
+            |()| format!("file://{}", run_directory.display()),
+            String::from,
+        )
+    });
+    let mirror = Mirror::new(
         block.clone(),
-        issue,
+        issue.unwrap_or_default(),
         bindings,
         record.owner.clone(),
         record.id.clone(),
         run_url,
         run_directory.to_owned(),
-    ))
+    );
+    Some(match resolved_ids {
+        Some(resolved_ids) => mirror.with_resolved_ids(resolved_ids),
+        None => mirror,
+    })
 }
 
 /// `mirror_for_run` with the home `WorkflowHome::from_environment` locates.

@@ -82,12 +82,8 @@ mod runner_doctor_workflow;
 mod runner_enrollment;
 #[path = "cli/runner_status.rs"]
 mod runner_status;
-#[path = "cli/schedule.rs"]
-mod schedule;
 #[path = "cli/service_principal.rs"]
 mod service_principal;
-#[path = "cli/trigger.rs"]
-mod trigger;
 #[path = "cli/workflow_continue.rs"]
 mod workflow_continue;
 #[path = "cli/workflow_definition.rs"]

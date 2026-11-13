@@ -1,0 +1,28 @@
+```console
+$ um workflow run resume --help
+Continue a local workflow run, or a Cloud run with --cloud
+
+Usage: um workflow run resume [OPTIONS] <RUN>
+
+Arguments:
+  <RUN>  Run directory, or the id or subject of a run under the um home
+
+Options:
+      --from <STEP>                    Ordinary step to reexecute (repeatable); without it, resume a waiting or abandoned run
+      --workflow <FILE>                Replacement workflow file within the run's original source root
+      --execution-root <PATH>          Existing execution root; defaults to the previous attempt's root
+      --plain                          Force plain human presentation
+      --json                           Print the workflow result as JSON
+      --color <WHEN>                   Select renderer color behavior [default: auto] [possible values: auto, always, never]
+      --cloud <ORGANIZATION>           Act in Cloud in this organization (ID or exact slug) instead of locally
+      --service-api-key-file <PATH|->  Authenticate with a service API key from a private file, or - for standard input
+      --allow-insecure-http            Allow this command's Useful Machinery requests over insecure HTTP connections
+  -h, --help                           Print help
+
+Select one or more ordinary steps with --from. Their downstream ordinary dependents run again; other eligible ordinary steps are inherited. Every finalizer runs again. The original run inputs and Git baseline remain authoritative.
+
+Without --from, a waiting run continues once a control resolves its wait and otherwise reports the wait unchanged, and a run whose process died continues from the step it was running.
+
+With --cloud ORGANIZATION, RUN is a Cloud run ID: the command asks Cloud to continue that run under its own definition from the steps --from names, or with none from where its record stands, and reports the request as um run continue does. It reads and writes no local run.
+
+```

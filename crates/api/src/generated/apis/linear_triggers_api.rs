@@ -27,6 +27,7 @@ pub enum CreateLinearTriggerError {
     Status404(models::Problem),
     Status409(models::Problem),
     Status422(models::Problem),
+    Status410(models::Problem),
     Status500(models::Problem),
     Status503(models::Problem),
     UnknownValue(serde_json::Value),
@@ -68,6 +69,7 @@ pub enum EnableLinearTriggerError {
     Status404(models::Problem),
     Status409(models::Problem),
     Status422(models::Problem),
+    Status410(models::Problem),
     Status500(models::Problem),
     Status503(models::Problem),
     UnknownValue(serde_json::Value),
@@ -128,6 +130,7 @@ pub enum RetryLinearEvaluationError {
     Status403(models::Problem),
     Status404(models::Problem),
     Status409(models::Problem),
+    Status410(models::Problem),
     Status500(models::Problem),
     UnknownValue(serde_json::Value),
 }
@@ -142,11 +145,13 @@ pub enum UpdateLinearTriggerError {
     Status404(models::Problem),
     Status409(models::Problem),
     Status422(models::Problem),
+    Status410(models::Problem),
     Status500(models::Problem),
     Status503(models::Problem),
     UnknownValue(serde_json::Value),
 }
 
+/// Retired with the `workflowPath` trigger model: answers 410 `trigger-model-retired` for every authenticated caller and changes nothing. Its `detail` names workflow definitions, whose root declares revision-owned triggers, as the replacement. Apart from 400 for a malformed request, 401 and 500, the other responses describe the retired operation and are no longer answered.
 pub fn create_linear_trigger(
     configuration: &configuration::Configuration,
     organization_ref: &str,
@@ -335,6 +340,7 @@ pub fn disable_linear_trigger(
     }
 }
 
+/// Retired with the `workflowPath` trigger model: answers 410 `trigger-model-retired` for every authenticated caller and changes nothing. Its `detail` names workflow definitions, whose root declares revision-owned triggers, as the replacement. Apart from 400 for a malformed request, 401 and 500, the other responses describe the retired operation and are no longer answered.
 pub fn enable_linear_trigger(
     configuration: &configuration::Configuration,
     organization_ref: &str,
@@ -690,7 +696,7 @@ pub fn list_linear_triggers(
     }
 }
 
-/// Requires a current direct organization owner. Exact key replay returns the originally accepted cycle while the original evaluation is retained; another key can start a cycle only after that cycle fails. Each cycle retains the original event, connection, configuration and grant.
+/// Retired with the `workflowPath` trigger model: answers 410 `trigger-model-retired` for every authenticated caller and changes nothing. Its `detail` names workflow definitions, whose root declares revision-owned triggers, as the replacement. Apart from 400 for a malformed request, 401 and 500, the other responses describe the retired operation and are no longer answered.
 pub fn retry_linear_evaluation(
     configuration: &configuration::Configuration,
     organization_ref: &str,
@@ -763,6 +769,7 @@ pub fn retry_linear_evaluation(
     }
 }
 
+/// Retired with the `workflowPath` trigger model: answers 410 `trigger-model-retired` for every authenticated caller and changes nothing. Its `detail` names workflow definitions, whose root declares revision-owned triggers, as the replacement. Apart from 400 for a malformed request, 401 and 500, the other responses describe the retired operation and are no longer answered.
 pub fn update_linear_trigger(
     configuration: &configuration::Configuration,
     organization_ref: &str,

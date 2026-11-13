@@ -1,4 +1,5 @@
-//! `um workflow run answer` (REQ-LOCALRUN-182).
+//! `um workflow run answer` (REQ-LOCALRUN-182); with `--cloud ORGANIZATION`, the answer is
+//! carried to the Cloud run's runner instead (REQ-LOCALRUN-210).
 
 use clap::Args;
 use serde_json::{Map, Value};
@@ -26,10 +27,25 @@ pub(super) struct Command {
 
     #[command(flatten)]
     output: super::control::JsonOutput,
+
+    #[command(flatten)]
+    cloud: super::CloudSelector,
 }
 
 impl Command {
-    pub(super) fn execute(self) -> super::super::super::CommandResult {
+    pub(super) fn execute(mut self) -> super::super::super::CommandResult {
+        if let Some(organization) = self.cloud.organization.take() {
+            return super::cloud::CloudRun::new(
+                self.run,
+                organization,
+                self.cloud,
+                self.output.json,
+            )?
+            .control(super::cloud::Control::Answer {
+                question: self.question,
+                text: self.text,
+            });
+        }
         super::control::execute(COMMAND, &self.run, self.output.json, |target| {
             self.answer(target)
         })

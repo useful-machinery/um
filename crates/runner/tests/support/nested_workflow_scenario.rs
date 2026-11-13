@@ -822,6 +822,7 @@ fn offer() -> AssignmentOffer {
                 encoded_outbox_bytes: 85_458_944,
             },
             run_inputs: None,
+            workflow_tree: None,
         },
         continuation: None,
     }

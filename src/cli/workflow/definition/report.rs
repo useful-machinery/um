@@ -15,6 +15,15 @@ pub(super) fn display(value: &str) -> String {
     normalize_terminal_scalar(value.as_bytes())
 }
 
+/// A `members` value as `["a", "b"]`, each member normalized as [`display`] does.
+pub(super) fn display_members(members: &[String]) -> String {
+    let members = members
+        .iter()
+        .map(|member| format!("\"{}\"", display(member)))
+        .collect::<Vec<_>>();
+    format!("[{}]", members.join(", "))
+}
+
 pub(super) fn display_path(path: &Path) -> String {
     normalize_terminal_scalar(path.as_os_str().as_encoded_bytes())
 }

@@ -15,13 +15,17 @@ use um_execution::{
     superseded_rejection_message,
 };
 
+use super::super::super::OrganizationArg;
+use super::super::super::run::{ContinuationSubmission, parse_continuation_step};
 use super::create::{ChildRecovery, ExecutionLeaf};
 use crate::exit_code::ExitCode;
 
-pub(super) const ABOUT: &str = "Continue a local workflow run";
+pub(super) const ABOUT: &str = "Continue a local workflow run, or a Cloud run with --cloud";
 pub(super) const AFTER_HELP: &str = "Select one or more ordinary steps with --from. Their downstream ordinary dependents run again; other eligible ordinary steps are inherited. Every finalizer runs again. The original run inputs and Git baseline remain authoritative.
 
-Without --from, a waiting run continues once a control resolves its wait and otherwise reports the wait unchanged, and a run whose process died continues from the step it was running.";
+Without --from, a waiting run continues once a control resolves its wait and otherwise reports the wait unchanged, and a run whose process died continues from the step it was running.
+
+With --cloud ORGANIZATION, RUN is a Cloud run ID: the command asks Cloud to continue that run under its own definition from the steps --from names, or with none from where its record stands, and reports the request as um run continue does. It reads and writes no local run.";
 
 const COMMAND: &str = "um workflow run resume";
 const RETRY_COMMAND: &str = "um workflow run retry";
@@ -104,24 +108,70 @@ pub(super) struct Command {
     #[arg(
         long,
         value_name = "FILE",
+        conflicts_with = "cloud",
         help = "Replacement workflow file within the run's original source root"
     )]
     workflow: Option<PathBuf>,
     #[arg(
         long,
         value_name = "PATH",
+        conflicts_with = "cloud",
         help = "Existing execution root; defaults to the previous attempt's root"
     )]
     execution_root: Option<PathBuf>,
     #[command(flatten)]
     presentation: super::PresentationOptions,
+    #[command(flatten)]
+    cloud: super::CloudSelector,
 }
 
 impl Command {
-    pub(super) fn execute(self) -> super::super::super::CommandResult {
+    pub(super) fn execute(mut self) -> super::super::super::CommandResult {
+        if let Some(organization) = self.cloud.organization.take() {
+            return self.continue_in_cloud(organization);
+        }
         super::create::execute_with_runtime(
             "start local workflow continuation runtime",
             self.execute_async(),
+        )
+    }
+
+    /// REQ-CONTINUE-85: asks Cloud to continue the run `RUN` names, under its own definition
+    /// and from the steps `--from` names or none, as `um run continue` submits it. `RUN` is
+    /// the Cloud run id as typed, and nothing under the `um` home is read or written.
+    fn continue_in_cloud(
+        self,
+        organization: OrganizationArg,
+    ) -> super::super::super::CommandResult {
+        let usage = |error| {
+            super::super::super::CommandFailure::with_exit_code(error, ExitCode::UsageError)
+        };
+        for step in &self.from_steps {
+            parse_continuation_step(step).map_err(|reason| {
+                usage(anyhow::anyhow!(
+                    "invalid value '{step}' for '--from <STEP>': {reason}"
+                ))
+            })?;
+        }
+        let run_id = self
+            .run
+            .run_dir
+            .into_os_string()
+            .into_string()
+            .map_err(|_| usage(anyhow::anyhow!("the Cloud run id RUN must be valid UTF-8")))?;
+        let submission = ContinuationSubmission::inherited(
+            organization,
+            run_id,
+            self.from_steps,
+            self.presentation.output.json,
+            self.cloud.authentication,
+            self.cloud.http,
+        );
+        super::super::super::execute_deployment_command(
+            Some(submission),
+            &["workflow", "run", "resume"],
+            "configure Useful Machinery run continuation",
+            |submission, deployment| submission.submit(deployment.clone()),
         )
     }
 
@@ -287,51 +337,27 @@ pub(super) async fn continue_run(
             return reject_after_settlement(pending, &signal_task, result).await;
         }
         Selection::Withdraw { .. } => {
-            let run_directory = pending.run_directory().to_owned();
-            let attempt_number = pending.prior_attempt_number();
-            // REQ-LOCALRUN-191: the root's `onOutcome.withdrawn`, read before `withdraw`
-            // consumes the continuation and written once the record reads `exited`.
-            let (workflow, inputs) = pending.root_specification();
-            let mirror = super::mirror::read_run_record(&run_directory).and_then(|record| {
-                super::mirror::run_mirror(&record, &workflow.definition, inputs, &run_directory)
-            });
-            // REQ-LOCALRUN-204: a write without credentials refuses before the run changes;
-            // the run still waits, so the settlement writes nothing.
-            if let Err(failure) =
-                super::mirror::outcome_credentials(mirror.as_ref(), WITHDRAWN_OUTCOME)
-            {
-                let result = refusal(
-                    &config,
-                    leaf,
-                    &pending,
-                    failure.code,
-                    super::mirror::CREDENTIALS_REFUSAL,
-                );
-                return reject_after_settlement(pending, &signal_task, result).await;
-            }
-            let withdrawn = tokio::task::spawn_blocking(move || {
-                pending.withdraw()?;
-                if let Some(mirror) = &mirror {
-                    super::mirror::perform(
-                        mirror,
-                        Box::new(|mirror, target| mirror.outcome(target, WITHDRAWN_OUTCOME)),
-                    );
-                }
-                Ok::<_, um_execution::LocalRunDirectoryError>(())
+            return end_withdrawn(
+                pending,
+                &signal_task,
+                &config,
+                leaf,
+                PendingLocalContinuation::withdraw,
+            )
+            .await;
+        }
+        // REQ-LOCALRUN-186: a withdrawal recorded while the abandoned attempt was live ends the
+        // run `withdrawn` without another attempt, as `withdraw` of the abandoned run would.
+        Selection::Abandoned if matches!(pending.withdrawal_pending(), Ok(true)) => {
+            return end_withdrawn(pending, &signal_task, &config, leaf, |pending| {
+                pending.update_run_record(
+                    RunState::Exited,
+                    pending.prior_attempt_number(),
+                    Some(WITHDRAWN_OUTCOME),
+                )?;
+                pending.settle_abandoned()
             })
             .await;
-            signal_task.abort();
-            withdrawn
-                .map_err(anyhow::Error::new)?
-                .map_err(anyhow::Error::new)?;
-            return write_unattempted(
-                &config,
-                command_name(leaf),
-                "withdrawn",
-                &run_directory,
-                attempt_number,
-                None,
-            );
         }
         Selection::Wait { target, reason, .. } => (vec![target.clone()], *reason),
         Selection::Edge(edge) if !still_continues(&pending, edge) => {
@@ -1064,6 +1090,64 @@ async fn diagnose_after_settlement(
 ) -> super::super::super::CommandResult {
     settle(pending, signal_task).await?;
     super::create::diagnose(error)
+}
+
+/// Ends the run `withdrawn` without an attempt through `end`, which consumes the continuation,
+/// then performs the root's `onOutcome.withdrawn` (REQ-LOCALRUN-191), read before `end` and
+/// written once the record reads `exited`, and reports the unattempted continuation.
+async fn end_withdrawn(
+    pending: PendingLocalContinuation,
+    signal_task: &super::create::SignalObservation,
+    config: &um_execution::PresentationConfig,
+    leaf: ExecutionLeaf,
+    end: impl FnOnce(PendingLocalContinuation) -> Result<(), um_execution::LocalRunDirectoryError>
+    + Send
+    + 'static,
+) -> super::super::super::CommandResult {
+    let run_directory = pending.run_directory().to_owned();
+    let attempt_number = pending.prior_attempt_number();
+    let (workflow, inputs) = pending.root_specification();
+    let mirror = super::mirror::read_run_record(&run_directory).and_then(|record| {
+        super::mirror::run_mirror(&record, &workflow.definition, inputs, &run_directory)
+    });
+    // REQ-LOCALRUN-204: a write without credentials refuses before the run changes. The
+    // continuation is dropped unsettled, as `end.rs` drops its own: a waiting run's attempt is
+    // already settled, and an abandoned attempt stays as the command found it.
+    if let Err(failure) = super::mirror::outcome_credentials(mirror.as_ref(), WITHDRAWN_OUTCOME) {
+        let result = refusal(
+            config,
+            leaf,
+            &pending,
+            failure.code,
+            super::mirror::CREDENTIALS_REFUSAL,
+        );
+        drop(pending);
+        signal_task.abort();
+        return super::create::rejection_exit(result);
+    }
+    let withdrawn = tokio::task::spawn_blocking(move || {
+        end(pending)?;
+        if let Some(mirror) = &mirror {
+            super::mirror::perform(
+                mirror,
+                Box::new(|mirror, target| mirror.outcome(target, WITHDRAWN_OUTCOME)),
+            );
+        }
+        Ok::<_, um_execution::LocalRunDirectoryError>(())
+    })
+    .await;
+    signal_task.abort();
+    withdrawn
+        .map_err(anyhow::Error::new)?
+        .map_err(anyhow::Error::new)?;
+    write_unattempted(
+        config,
+        command_name(leaf),
+        "withdrawn",
+        &run_directory,
+        attempt_number,
+        None,
+    )
 }
 
 async fn reject_after_settlement(

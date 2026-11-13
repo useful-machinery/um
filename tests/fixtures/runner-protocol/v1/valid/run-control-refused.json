@@ -1,0 +1,18 @@
+{
+  "protocolVersion": 1,
+  "direction": "runner_to_cloud",
+  "messageId": "rmsg_01k0z6r1w8f4jy2m7q9v3x5acs",
+  "runnerId": "rnr_01k0z6r1w8f4jy2m7q9v3x5abc",
+  "bootId": "rbt_01k0z6r1w8f4jy2m7q9v3x5abc",
+  "sequence": 10,
+  "sentAt": "2026-07-23T00:00:13Z",
+  "type": "run_control_applied",
+  "payloadVersion": 1,
+  "payload": {
+    "assignmentId": "asn_01k0z6r1w8f4jy2m7q9v3x5abc",
+    "attemptId": "atm_01k0z6r1w8f4jy2m7q9v3x5abc",
+    "controlId": "rct_01k0z6r1w8f4jy2m7q9v3x5acr",
+    "outcome": "refused",
+    "code": "question_unknown"
+  }
+}

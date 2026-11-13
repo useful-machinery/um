@@ -8,8 +8,9 @@ use serde::Serialize;
 
 use crate::exit_code::{ExitCode, OutcomeClass};
 use um_api::{
-    CreateRunInput, HttpTransportPolicy, Run, RunApi, RunArtifactDelivery, RunCancellationMode,
-    RunCancellationResolutionKind, RunFailure, RunList, RunListFilter, RunObservation, RunState,
+    CreateRunInput, HttpTransportPolicy, RetryConflict, Run, RunApi, RunArtifactDelivery,
+    RunCancellationMode, RunCancellationResolutionKind, RunDefinitionSelection, RunFailure,
+    RunList, RunListFilter, RunObservation, RunState,
 };
 #[cfg(test)]
 use um_api::{HttpClient, RunRead};
@@ -27,7 +28,11 @@ mod list;
 mod observation;
 mod output;
 mod retry;
+pub(super) use continuation::{
+    Submission as ContinuationSubmission, parse_step as parse_continuation_step,
+};
 use output::{CloudOutput, CloudSnapshot};
+pub(super) use output::{write_route, write_waiting};
 
 // Keep the closed envelope fields grouped at the rendering boundary, without
 // repeating its context at every signal, timeout and completion call site.
@@ -66,8 +71,6 @@ enum RunCommand {
     Cancel(CancelCommand),
     #[command(about = "Continue a run from selected steps")]
     Continue(continuation::Command),
-    #[command(about = "Create a run")]
-    Create(Box<CreateCommand>),
     #[command(about = inputs::ABOUT)]
     Input(inputs::Command),
     #[command(about = input_set::ABOUT)]
@@ -82,25 +85,18 @@ enum RunCommand {
     Show(ShowCommand),
 }
 
-type RunOptions = super::CommonArgs<super::RunJson, super::PrincipalAuthenticationArgs>;
+pub(in crate::cli) type RunOptions =
+    super::CommonArgs<super::RunJson, super::PrincipalAuthenticationArgs>;
 type CloudInputOptions = super::CommonArgs<super::RunJson, super::PrincipalAuthenticationArgs>;
 
-// This leaf keeps its API identities explicit; sharing Clap fields with runner-pool
-// creation would couple unrelated command contracts and their help text.
+/// The help of `--integration-context-file` on the commands that create a Cloud run.
+pub(in crate::cli) const INTEGRATION_CONTEXT_FILE_HELP: &str =
+    "Read private immutable integration context from a JSON file, or - for standard input";
+
+/// The source, workspace, name and input-set options of `um workflow run create --cloud`
+/// (REQ-RUN-94).
 #[derive(Debug, Args)]
-struct CreateCommand {
-    #[arg(value_name = OrganizationArg::VALUE_NAME, help = OrganizationArg::HELP)]
-    organization: OrganizationArg,
-
-    #[arg(long, value_name = ProjectArg::VALUE_NAME, help = ProjectArg::HELP)]
-    project_id: ProjectArg,
-    #[arg(
-        long,
-        value_name = "PATH",
-        help = "Canonical repository-relative workflow path"
-    )]
-    workflow_path: String,
-
+pub(in crate::cli) struct CreationOptions {
     #[arg(
         long,
         value_name = "BRANCH",
@@ -146,57 +142,49 @@ struct CreateCommand {
         help = "Consume an existing sealed Run Input Set without restaging"
     )]
     input_set_id: Option<String>,
+}
 
-    #[command(flatten)]
-    inputs: super::NamedInputArgs,
+impl CreationOptions {
+    /// The first of these options given, by its flag.
+    pub(in crate::cli) fn given(&self) -> Option<&'static str> {
+        [
+            (self.source_branch.is_some(), "--source-branch"),
+            (self.workspace_branch.is_some(), "--workspace-branch"),
+            (self.workspace_commit.is_some(), "--workspace-commit"),
+            (self.display_name.is_some(), "--display-name"),
+            (self.input_set_id.is_some(), "--input-set-id"),
+        ]
+        .into_iter()
+        .find_map(|(given, flag)| given.then_some(flag))
+    }
+}
 
-    #[arg(
-        long,
-        value_name = "PATH|-",
-        help = "Read private immutable integration context from a JSON file, or - for standard input"
-    )]
-    integration_context_file: Option<PathBuf>,
-
-    #[arg(
-        long,
-        value_name = "COUNT",
-        value_parser = clap::value_parser!(u8).range(1..=64),
-        help = "Maximum simultaneous workflow steps (1 to 64; 1 when omitted)"
-    )]
-    max_parallel: Option<u8>,
-
-    #[arg(
-        long,
-        value_name = "NAME",
-        value_parser = super::publication::parse_export_name,
-        help = "Request automatic publication of this exact Git branch export after success"
-    )]
-    publish_export: Option<String>,
-
-    #[arg(long, requires = "publish_export", value_name = "NUMBER",
-        value_parser = super::publication::parse_change_request,
-        help = "Update an existing GitHub pull request after the run succeeds")]
-    publish_change_request: Option<i64>,
-
-    #[arg(long, requires = "publish_change_request", value_name = "HASH",
-        value_parser = super::publication::parse_expected_head,
-        help = "Require the pull request to have this head commit at run admission")]
-    publish_expected_head: Option<String>,
-
-    #[command(flatten)]
-    wait: RunWaitArgs,
-
-    #[command(flatten)]
-    options: RunOptions,
+/// One Cloud run creation and what follows its acceptance: one idempotency key for the
+/// invocation, the single resend, the input staging, `--wait` and the `create` document
+/// (REQ-RUN-55 to REQ-RUN-58, REQ-RUN-61, REQ-RUN-80).
+pub(in crate::cli) struct Creation {
+    pub(in crate::cli) organization: OrganizationArg,
+    pub(in crate::cli) project_id: ProjectArg,
+    /// The Cloud definition id as given, and a workflow file of its tree or none for the root
+    /// (REQ-RUN-94).
+    pub(in crate::cli) definition: RunDefinitionSelection,
+    pub(in crate::cli) selection: CreationOptions,
+    pub(in crate::cli) inputs: super::NamedInputArgs,
+    pub(in crate::cli) integration_context_file: Option<PathBuf>,
+    pub(in crate::cli) max_parallel: Option<u8>,
+    /// `--no-owner`: the run starts with no owner (REQ-RUN-94, REQ-RUN-99).
+    pub(in crate::cli) unowned: bool,
+    pub(in crate::cli) wait: RunWaitArgs,
+    pub(in crate::cli) options: RunOptions,
 }
 
 #[derive(Debug, Args)]
-struct RunWaitArgs {
+pub(in crate::cli) struct RunWaitArgs {
     #[arg(long, help = "Observe the run until it settles")]
-    wait: bool,
+    pub(in crate::cli) wait: bool,
     #[arg(long, requires = "wait", value_name = "DURATION", value_parser = super::parse_wait_timeout,
         help = super::WAIT_TIMEOUT_HELP)]
-    timeout: Option<Duration>,
+    pub(in crate::cli) timeout: Option<Duration>,
 }
 
 #[derive(Debug, Args)]
@@ -268,12 +256,6 @@ impl Command {
     pub(super) fn execute(self) -> super::CommandResult {
         match self.command {
             None => super::print_help(&[NAME]),
-            Some(RunCommand::Create(command)) => super::execute_deployment_command(
-                Some(command),
-                &[NAME],
-                "configure Useful Machinery run creation",
-                |command, deployment| command.execute(deployment.clone()),
-            ),
             Some(RunCommand::Continue(command)) => super::execute_deployment_command(
                 Some(command),
                 &[NAME],
@@ -463,9 +445,9 @@ fn write_api_outcome<T>(
     }
 }
 
-impl CreateCommand {
-    fn execute(self, deployment: Deployment) -> super::CommandResult {
-        let recovery = CreateRecoveryState::new(self.input_set_id.as_deref());
+impl Creation {
+    pub(in crate::cli) fn submit(self, deployment: Deployment) -> super::CommandResult {
+        let recovery = CreateRecoveryState::new(self.selection.input_set_id.as_deref());
         let signal_deployment = deployment.clone();
         let signal_organization = self.organization.clone();
         let signal_json = self.options.json;
@@ -658,7 +640,7 @@ impl CreateCommand {
                 }
             }
         } else {
-            self.input_set_id.clone().unwrap_or_default()
+            self.selection.input_set_id.clone().unwrap_or_default()
         };
         let input_set_id = (!input_set_id.is_empty()).then_some(input_set_id);
         if control.is_cancelled() {
@@ -681,21 +663,15 @@ impl CreateCommand {
                     &run_idempotency_key,
                     CreateRunInput {
                         project_id: &self.project_id,
-                        workflow_path: &self.workflow_path,
-                        source_branch: self.source_branch.as_deref(),
-                        workspace_branch: self.workspace_branch.as_deref(),
-                        workspace_commit: self.workspace_commit.as_deref(),
-                        display_name: self.display_name.as_deref(),
+                        definition: self.definition.clone(),
+                        source_branch: self.selection.source_branch.as_deref(),
+                        workspace_branch: self.selection.workspace_branch.as_deref(),
+                        workspace_commit: self.selection.workspace_commit.as_deref(),
+                        display_name: self.selection.display_name.as_deref(),
                         input_set_id: input_set_id.as_deref(),
-                        publish_export: self.publish_export.as_deref(),
-                        publish_target: self.publish_change_request.map(|number| {
-                            um_api::ExistingPublicationTarget {
-                                number,
-                                expected_head: self.publish_expected_head.as_deref(),
-                            }
-                        }),
                         integration_context: integration_context.as_ref(),
                         maximum_parallel_steps: self.max_parallel,
+                        unowned: self.unowned,
                     },
                     || control.begin_dispatch_with_recovery(dispatch_recovery.clone()),
                 )
@@ -1171,15 +1147,11 @@ fn finish_cloud_observation<R, S>(
                 );
             }
             let exit = if operation == "create"
-                && resource.run.as_deref().is_some_and(|run| {
-                    run.state != RunState::Succeeded
-                        || run.publication.as_deref().is_some_and(|handoff| {
-                            handoff.state != um_api::RunPublicationHandoffState::Started
-                        })
-                        || resource.publication.as_deref().is_some_and(|publication| {
-                            publication.state != um_api::PublicationState::Succeeded
-                        })
-                }) {
+                && resource
+                    .run
+                    .as_deref()
+                    .is_some_and(|run| run.state != RunState::Succeeded)
+            {
                 ExitCode::GeneralFailure
             } else {
                 ExitCode::Success
@@ -1238,6 +1210,10 @@ fn finish_cloud_observation<R, S>(
     })
 }
 
+/// What a `path_run_retired` report tells the user to do instead (REQ-RETRY-35,
+/// REQ-CONTINUE-87); Cloud's own problem prose is never relayed.
+const PATH_RUN_RETIRED_GUIDANCE: &str = "Cloud no longer retries or continues a run created by workflow path; publish the workflow as a definition (`um workflow definition publish --cloud`) and start a run of it.";
+
 fn failure_code(
     failure: &RunFailure,
     _authentication: super::PrincipalAuthenticationKind,
@@ -1253,9 +1229,17 @@ fn failure_code(
         RunFailure::ContinuationAdmissionInvalid(_) => {
             ("continuation_admission_invalid", ExitCode::GeneralFailure)
         }
-        RunFailure::Conflict | RunFailure::RetryConflict(_) => {
-            ("submission_failed", ExitCode::GeneralFailure)
-        }
+        RunFailure::PathRunRetired => ("path_run_retired", ExitCode::GeneralFailure),
+        RunFailure::RetryConflict(conflict) => (
+            match conflict {
+                RetryConflict::Pending => "retry_pending",
+                RetryConflict::Idempotency => "idempotency_conflict",
+                RetryConflict::SubjectBusy { .. } => "subject_busy",
+                RetryConflict::SubjectSettled { .. } => "subject_settled",
+            },
+            ExitCode::GeneralFailure,
+        ),
+        RunFailure::Conflict => ("submission_failed", ExitCode::GeneralFailure),
         RunFailure::InputAdmissionRejected { .. } => {
             ("input_admission_rejected", ExitCode::GeneralFailure)
         }
@@ -1264,9 +1248,6 @@ fn failure_code(
         | RunFailure::RetryAmbiguousRateLimited
         | RunFailure::RetryAmbiguousAuthentication
         | RunFailure::ContinuationAcceptanceUnknown => ("unavailable", ExitCode::Unavailable),
-        RunFailure::LinearLifecycleRetryAcceptanceUnknown => {
-            ("acceptance_unknown", ExitCode::Unavailable)
-        }
         RunFailure::CreationRejected => ("creation_rejected", ExitCode::GeneralFailure),
         RunFailure::Unreachable(_) => ("unavailable", ExitCode::Unavailable),
         RunFailure::Protocol { .. } => ("protocol_error", ExitCode::GeneralFailure),
@@ -1737,6 +1718,7 @@ fn write_observation_human(
     observation: &RunObservation,
 ) -> anyhow::Result<()> {
     writeln!(out, "\nobserved at: {}", observation.observed_at)?;
+    write_waiting(out, observation)?;
     writeln!(out, "placement (current attempt):")?;
     if let Some(place) = observation.placement.as_deref() {
         writeln!(out, "  runner: {} ({})", place.runner_name, place.runner_id)?;
@@ -1878,6 +1860,7 @@ fn write_run_human(deployment: &str, heading: &str, run: &Run) -> anyhow::Result
         Some(principal) => writeln!(stdout, "actor: {actor} {principal}")?,
         None => writeln!(stdout, "actor: {actor}")?,
     }
+    write_route(&mut stdout, run)?;
     writeln!(stdout, "\nworkflow source:")?;
     writeln!(
         stdout,
@@ -2175,6 +2158,12 @@ fn write_failure_with_input_set(
             "error: Cloud run creation was rejected before the run materialized\n\nInspect the run request and create a new run after correcting the rejection cause.".to_owned(),
             OutcomeClass::GeneralFailure,
         ),
+        RunFailure::PathRunRetired => (
+            "path_run_retired",
+            None,
+            format!("error: Cloud run is no longer retried or continued\n\n{PATH_RUN_RETIRED_GUIDANCE}"),
+            OutcomeClass::GeneralFailure,
+        ),
         RunFailure::Gone => (
             "gone",
             None,
@@ -2184,8 +2173,7 @@ fn write_failure_with_input_set(
         RunFailure::RetryAfter(_)
         | RunFailure::RetryAmbiguousRateLimited
         | RunFailure::RetryAmbiguousAuthentication
-        | RunFailure::ContinuationAcceptanceUnknown
-        | RunFailure::LinearLifecycleRetryAcceptanceUnknown => (
+        | RunFailure::ContinuationAcceptanceUnknown => (
             "unreachable", None,
             "error: Cloud run API is temporarily unavailable\n\nTry again after the reported interval.".to_owned(),
             OutcomeClass::RateLimited,
@@ -2744,16 +2732,17 @@ mod tests {
             "create-run-key",
             CreateRunInput {
                 project_id: "prj_01k0z6r1w8f4jy2m7q9v3x5abc",
-                workflow_path: "workflows/build.yaml",
+                definition: RunDefinitionSelection::new(
+                    "def_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned(),
+                ),
                 source_branch: None,
                 workspace_branch: None,
                 workspace_commit: None,
                 display_name: None,
                 input_set_id: Some("ris_explicit"),
-                publish_export: None,
-                publish_target: None,
                 integration_context: None,
                 maximum_parallel_steps: None,
+                unowned: false,
             },
             begin_dispatch,
         )

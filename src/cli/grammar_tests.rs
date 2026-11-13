@@ -5,8 +5,8 @@ use clap::{Arg, ArgAction, Command, CommandFactory};
 
 use super::Cli;
 
-const LEAVES: &str = "accept activate answer approve authorize begin cancel complete continue create deauthorize decline delete disable doctor download drain enable end enroll hand-back history import interrupt issue leave lift link list login logout move preview propose publish reconnect reference release remove rename replay request restart resume retire retry revoke revoke-previous-secret rotate-secret run schema seal serve set show signup status stop sync test update upgrade upload uses validate version view wait withdraw";
-const GROUPS: &str = "account action activation agent-login artifact audit auth authorization connection credential definition delegation deletion delivery github gitlab grant identity input input-set installation invitation linear member occurrence organization pool project publication repository run runner runner-pool schedule service-principal setup state team trigger evaluation webhook workflow";
+const LEAVES: &str = "accept activate answer approve authorize archive begin cancel complete continue create deauthorize decline delete disable doctor download drain enable end enroll event hand-back history import interrupt issue leave lift link list login logout move preview propose publish reconnect reference release remove rename replay request restart resume retire retry revoke revoke-previous-secret rotate-secret run schema seal serve set set-principal show signup status stop sync test unarchive update upgrade upload uses validate version view wait withdraw";
+const GROUPS: &str = "account action activation agent-login artifact audit auth authorization cloud connection credential definition delegation deletion delivery github gitlab grant identity input input-set installation invitation join-key linear member occurrence organization pool project publication repository run runner runner-pool schedule service-principal setup state team trigger evaluation webhook workflow";
 const COMMON: [&str; 3] = ["json", "service-api-key-file", "allow-insecure-http"];
 // These leaves have no limit/cursor contract; see cli/docs/output-style.md.
 const UNPAGINATED_LISTS: [&str; 4] = [
@@ -24,6 +24,9 @@ const SELF_CONFIRMING: [&str; 1] = ["auth agent-login revoke"];
 // and cli/src/cli/entity.rs. A long spelling alone is never a help identity.
 fn semantic_class(path: &str, long: &str) -> Option<String> {
     let shared = match long {
+        // A restart's Text input overrides one carried over from the run, so it is not
+        // the required value `--input-text` supplies elsewhere.
+        "input-text" if path == "workflow run restart" => "input-text:override",
         "service-api-key-file"
         | "allow-insecure-http"
         | "cursor"
@@ -44,7 +47,7 @@ fn semantic_class(path: &str, long: &str) -> Option<String> {
         // Only these paths flatten PaginationArgs. Other options named --limit
         // do not acquire pagination semantics just by sharing the spelling.
         "limit" => match path {
-            "organization audit list" => "limit:100",
+            "organization audit list" | "workflow definition cloud list" => "limit:100",
             "artifact list"
             | "auth agent-login list"
             | "auth grant list"
@@ -60,6 +63,7 @@ fn semantic_class(path: &str, long: &str) -> Option<String> {
             | "publication list"
             | "runner pool list"
             | "runner activation list"
+            | "runner join-key list"
             | "runner credential list"
             | "runner list"
             | "service-principal credential list" => "limit:200",
@@ -334,6 +338,18 @@ fn entity_identifier_flags_match_the_command_tree_and_parser() {
             "identity",
             &["github", "--identity-id", "idn_01k0z6r1w8f4jy2m7q9v3x5abc"],
         ),
+        (
+            &["workflow", "definition", "cloud", "set-principal"],
+            "project-id",
+            "project",
+            &[
+                "example",
+                "def_01k0z6r1w8f4jy2m7q9v3x5abc",
+                "prn_01k0z6r1w8f4jy2m7q9v3x5abc",
+                "--project-id",
+                "prj_01k0z6r1w8f4jy2m7q9v3x5abc",
+            ],
+        ),
     ];
 
     for &(path, replacement, removed, arguments) in cases {
@@ -497,6 +513,47 @@ fn github_connections_live_only_under_the_connection_family() {
             "{path:?}"
         );
     }
+}
+
+// REQ-TRIGGER-143
+#[test]
+fn project_triggers_and_schedules_are_unknown_commands() {
+    let mut root = Cli::command();
+    root.build();
+    let project = root.find_subcommand("project").unwrap();
+    for group in ["trigger", "schedule"] {
+        assert!(project.find_subcommand(group).is_none(), "{group}");
+    }
+    for path in [
+        &["project", "trigger"][..],
+        &["project", "trigger", "list", "example", "project"][..],
+        &["project", "schedule"][..],
+        &["project", "schedule", "list", "example", "project"][..],
+    ] {
+        let input = std::iter::once("um").chain(path.iter().copied());
+        assert_eq!(
+            super::parse(input).unwrap_err().kind(),
+            clap::error::ErrorKind::InvalidSubcommand,
+            "{path:?}"
+        );
+    }
+}
+
+// REQ-TRIGGER-145
+#[test]
+fn run_linear_offers_only_its_reads() {
+    let mut root = Cli::command();
+    root.build();
+    let linear = root
+        .find_subcommand("run")
+        .and_then(|run| run.find_subcommand("linear"))
+        .unwrap();
+    let leaves: Vec<_> = linear
+        .get_subcommands()
+        .map(Command::get_name)
+        .filter(|name| *name != "help")
+        .collect();
+    assert_eq!(leaves, ["history", "show"]);
 }
 
 #[test]
@@ -898,4 +955,146 @@ fn parameterized_option_classes_are_isolated_but_ratchet_within_each_class() {
             .iter()
             .any(|id| id.starts_with("option-help|json:streaming-events"))
     );
+}
+
+// REQ-CONTINUE-85
+#[test]
+fn resume_takes_cloud_only_without_its_local_options() {
+    let resume = ["um", "workflow", "run", "resume", "run_1"];
+    for local in [
+        &["--workflow", "repair.yaml"][..],
+        &["--execution-root", "root"][..],
+    ] {
+        let input = resume
+            .iter()
+            .chain(&["--cloud", "acme"])
+            .chain(local)
+            .copied();
+        let error = super::parse(input).unwrap_err();
+        assert_eq!(
+            error.kind(),
+            clap::error::ErrorKind::ArgumentConflict,
+            "{local:?}"
+        );
+        assert_eq!(error.exit_code(), 2, "{local:?}");
+    }
+    for cloud_only in ["--allow-insecure-http", "--service-api-key-file=key"] {
+        let input = resume.iter().copied().chain([cloud_only]);
+        assert_eq!(
+            super::parse(input).unwrap_err().kind(),
+            clap::error::ErrorKind::MissingRequiredArgument,
+            "{cloud_only}"
+        );
+    }
+    for accepted in [
+        &[][..],
+        &[
+            "--from",
+            "build",
+            "--workflow",
+            "repair.yaml",
+            "--execution-root",
+            "root",
+        ][..],
+        &["--cloud", "acme"][..],
+        &[
+            "--cloud", "acme", "--from", "build", "--from", "review", "--json",
+        ][..],
+    ] {
+        let input = resume.iter().chain(accepted).copied();
+        assert!(super::parse(input).is_ok(), "{accepted:?}");
+    }
+}
+
+// REQ-LOCALRUN-172, REQ-LOCALRUN-189, REQ-LOCALRUN-187, REQ-CLOUDDEF-19: `show` and `release`
+// select a Cloud run only with `--cloud`, whose authentication and transport options need it;
+// `withdraw` and `cancel` take no `--cloud`, and `um run` gains no `release`.
+#[test]
+fn show_and_release_take_cloud_and_other_run_leaves_do_not() {
+    for leaf in ["show", "release"] {
+        let base = ["um", "workflow", "run", leaf, "run_1"];
+        for accepted in [
+            &[][..],
+            &["--json"][..],
+            &["--cloud", "acme"][..],
+            &[
+                "--cloud",
+                "acme",
+                "--json",
+                "--service-api-key-file=key",
+                "--allow-insecure-http",
+            ][..],
+        ] {
+            let input = base.iter().chain(accepted).copied();
+            assert!(super::parse(input).is_ok(), "{leaf} {accepted:?}");
+        }
+        for cloud_only in ["--allow-insecure-http", "--service-api-key-file=key"] {
+            let input = base.iter().copied().chain([cloud_only]);
+            assert_eq!(
+                super::parse(input).unwrap_err().kind(),
+                clap::error::ErrorKind::MissingRequiredArgument,
+                "{leaf} {cloud_only}"
+            );
+        }
+    }
+    for leaf in ["withdraw", "cancel"] {
+        let input = ["um", "workflow", "run", leaf, "run_1", "--cloud", "acme"];
+        assert_eq!(
+            super::parse(input).unwrap_err().kind(),
+            clap::error::ErrorKind::UnknownArgument,
+            "{leaf}"
+        );
+    }
+    assert_eq!(
+        super::parse(["um", "run", "release", "acme", "run_1"])
+            .unwrap_err()
+            .kind(),
+        clap::error::ErrorKind::InvalidSubcommand
+    );
+}
+
+// REQ-CLOUDDEF-15: the definition's evaluations are listed and shown under the target
+// convention, `--state` and `--run-id` filtering the list.
+#[test]
+fn definition_cloud_evaluations_take_the_target_convention() {
+    let definition = "def_01k0z6r1w8f4jy2m7q9v3x5abc";
+    let project = "prj_01k0z6r1w8f4jy2m7q9v3x5abc";
+    let base = ["um", "workflow", "definition", "cloud", "evaluation"];
+    for accepted in [
+        &["list", "acme", definition, "--project-id", project][..],
+        &[
+            "list",
+            "acme",
+            definition,
+            "--project-id",
+            project,
+            "--state",
+            "failed",
+            "--run-id",
+            "run_1",
+            "--limit",
+            "5",
+            "--cursor",
+            "c",
+            "--json",
+        ][..],
+        &[
+            "show",
+            "acme",
+            definition,
+            "wev_01k0z6r1w8f4jy2m7q9v3x5abc",
+            "--project-id",
+            project,
+        ][..],
+    ] {
+        let input = base.iter().chain(accepted).copied();
+        assert!(super::parse(input).is_ok(), "{accepted:?}");
+    }
+    for refused in [
+        &["list", "acme", definition][..],
+        &["show", "acme", definition, "--project-id", project][..],
+    ] {
+        let input = base.iter().chain(refused).copied();
+        assert!(super::parse(input).is_err(), "{refused:?}");
+    }
 }

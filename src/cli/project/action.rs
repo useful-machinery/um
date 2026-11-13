@@ -319,8 +319,12 @@ fn call<T>(
 }
 fn summary(item: &GoogleDocsAction) -> String {
     // Never print literal input bindings as human-readable diagnostics.
+    let definition = item
+        .definition_id
+        .as_ref()
+        .map_or_else(String::new, |id| format!("\ndefinition: {id}"));
     format!(
-        "action: {}\nproject: {}\nname: {}\nworkflow: {}\nenabled: {}\nversion: {}",
+        "action: {}\nproject: {}\nname: {}\nworkflow: {}{definition}\nenabled: {}\nversion: {}",
         item.id, item.project_id, item.display_name, item.workflow_path, item.enabled, item.version
     )
 }

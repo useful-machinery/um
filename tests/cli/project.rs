@@ -2,8 +2,6 @@ use super::*;
 
 #[path = "project/action.rs"]
 mod action;
-#[path = "project/trigger.rs"]
-mod trigger;
 #[path = "project/webhook.rs"]
 mod webhook;
 
@@ -18,8 +16,10 @@ const INSTALLATION_ID: &str = "ghi_01k0z6r1w8f4jy2m7q9v3x5abc";
 const GITLAB_CONNECTION_ID: &str = "glc_01k0z6r1w8f4jy2m7q9v3x5abc";
 const CONNECTION_ID: &str = "rpc_01k0z6r1w8f4jy2m7q9v3x5abc";
 const POOL_ID: &str = "rpl_01k0z6r1w8f4jy2m7q9v3x5abc";
+const SHARED_POOL_ID: &str = "rpl_01k0z6r1w8f4jy2m7q9v3x5abd";
 const REPOSITORY_ID: &str = "123456789";
 const RUN_ID: &str = "run_01k0z6r1w8f4jy2m7q9v3x5abc";
+const DEFINITION_ID: &str = "def_01k0z6r1w8f4jy2m7q9v3x5abc";
 
 fn prepared_project(responses: Vec<Vec<u8>>) -> (ScriptedServer, tempfile::TempDir, String) {
     let server = ScriptedServer::respond(responses);
@@ -55,6 +55,13 @@ fn pool_body() -> serde_json::Value {
         "createdAt": "2026-09-05T12:00:00Z",
         "updatedAt": "2026-09-05T12:01:00Z"
     })
+}
+
+fn shared_pool_body() -> serde_json::Value {
+    let mut pool = pool_body();
+    pool["id"] = serde_json::json!(SHARED_POOL_ID);
+    pool["name"] = serde_json::json!("shared");
+    pool
 }
 
 fn project_body(
@@ -206,7 +213,7 @@ fn project_list_uses_only_the_explicit_service_api_key() {
 }
 
 // REQ-PROJECT-75, REQ-PROJECT-76,
-// REQ-PROJECT-77, REQ-PROJECT-79, REQ-PROJECT-81, REQ-WORKSPACE-7
+// REQ-PROJECT-77, REQ-PROJECT-79, REQ-PROJECT-81, REQ-PROJECT-90, REQ-WORKSPACE-7
 #[test]
 fn discovery_and_project_management_feed_an_inputless_cloud_run() {
     let membership_page = serde_json::json!({
@@ -551,13 +558,14 @@ fn discovery_and_project_management_feed_an_inputless_cloud_run() {
 
     let run_created = run_project(
         &[
+            "workflow",
             "run",
             "create",
+            DEFINITION_ID,
+            "--cloud",
             ORGANIZATION,
-            "--project-id",
+            "--project",
             PROJECT_ID,
-            "--workflow-path",
-            "workflows/build.yaml",
             "--json",
             "--allow-insecure-http",
         ],
@@ -608,10 +616,12 @@ fn discovery_and_project_management_feed_an_inputless_cloud_run() {
     assert!(requests[7].starts_with(&format!(
         "GET /api/v1/organizations/{ORGANIZATION}/runner-pools/{POOL_ID} HTTP/1.1\r\n"
     )));
-    assert!(requests[8].starts_with("PUT "));
+    assert!(requests[8].starts_with(&format!(
+        "PUT /api/v1/organizations/{ORGANIZATION}/projects/{PROJECT_ID}/runner-pools HTTP/1.1\r\n"
+    )));
     assert_eq!(
         request_body(&requests[8]),
-        serde_json::json!({"runnerPoolId": POOL_ID})
+        serde_json::json!({"runnerPoolIds": [POOL_ID]})
     );
     assert_eq!(
         request_body(&requests[10]),
@@ -630,12 +640,14 @@ fn discovery_and_project_management_feed_an_inputless_cloud_run() {
         serde_json::json!({"defaultBranch": "stable"})
     );
     assert!(requests[12].starts_with("DELETE "));
-    assert!(requests[13].starts_with("DELETE "));
+    assert!(requests[13].starts_with(&format!(
+        "DELETE /api/v1/organizations/{ORGANIZATION}/projects/{PROJECT_ID}/runner-pool HTTP/1.1\r\n"
+    )));
     assert_eq!(
         request_body(&requests[14]),
         serde_json::json!({
             "projectId": PROJECT_ID,
-            "workflowPath": "workflows/build.yaml"
+            "definition": {"definitionId": DEFINITION_ID}
         })
     );
     for request in &requests {
@@ -660,12 +672,18 @@ fn discovery_and_project_management_feed_an_inputless_cloud_run() {
     }
 }
 
-// REQ-PROJECT-77
+// REQ-PROJECT-77, REQ-PROJECT-90
 #[test]
-fn project_runner_pool_selection_resolves_an_exact_name() {
-    let project = project_body("widget", true, Some(repository_body("acme/widget", "main")));
+fn project_runner_pool_set_resolves_every_name_and_replaces_the_set_once() {
+    let mut project = project_body("widget", true, Some(repository_body("acme/widget", "main")));
+    project["runnerPools"] = serde_json::json!([
+        {"id": POOL_ID, "name": "builders"},
+        {"id": SHARED_POOL_ID, "name": "shared"}
+    ]);
+    let pools = serde_json::json!({"items": [pool_body(), shared_pool_body()]});
     let (server, _directory, credential_path) = prepared_project(vec![
-        json_http_response("200 OK", serde_json::json!({"items": [pool_body()]})),
+        json_http_response("200 OK", pools.clone()),
+        json_http_response("200 OK", pools),
         project_response("200 OK", project, false),
     ]);
 
@@ -677,6 +695,7 @@ fn project_runner_pool_selection_resolves_an_exact_name() {
             ORGANIZATION,
             PROJECT_ID,
             "builders",
+            "shared",
             "--json",
             "--allow-insecure-http",
         ],
@@ -684,18 +703,27 @@ fn project_runner_pool_selection_resolves_an_exact_name() {
         &credential_path,
     );
 
-    assert_json_success(&output, "runner_pool_set");
+    let result = assert_json_success(&output, "runner_pool_set");
+    assert_eq!(
+        result["project"]["runnerPools"],
+        serde_json::json!([
+            {"id": POOL_ID, "name": "builders"},
+            {"id": SHARED_POOL_ID, "name": "shared"}
+        ])
+    );
     let requests = server.finish();
-    assert_eq!(requests.len(), 2);
-    assert!(requests[0].starts_with(&format!(
-        "GET /api/v1/organizations/{ORGANIZATION}/runner-pools?limit=200 HTTP/1.1\r\n"
-    )));
-    assert!(requests[1].starts_with(&format!(
-        "PUT /api/v1/organizations/{ORGANIZATION}/projects/{PROJECT_ID}/runner-pool HTTP/1.1\r\n"
+    assert_eq!(requests.len(), 3);
+    for request in &requests[..2] {
+        assert!(request.starts_with(&format!(
+            "GET /api/v1/organizations/{ORGANIZATION}/runner-pools?limit=200 HTTP/1.1\r\n"
+        )));
+    }
+    assert!(requests[2].starts_with(&format!(
+        "PUT /api/v1/organizations/{ORGANIZATION}/projects/{PROJECT_ID}/runner-pools HTTP/1.1\r\n"
     )));
     assert_eq!(
-        request_body(&requests[1]),
-        serde_json::json!({"runnerPoolId": POOL_ID})
+        request_body(&requests[2]),
+        serde_json::json!({"runnerPoolIds": [POOL_ID, SHARED_POOL_ID]})
     );
 }
 
@@ -1029,6 +1057,63 @@ fn project_human_output_exposes_readiness_and_blockers() {
     server.finish();
 }
 
+fn show_project_human(project: serde_json::Value) -> Vec<String> {
+    let (server, _directory, credential_path) =
+        prepared_project(vec![json_http_response("200 OK", project)]);
+    let output = run_project(
+        &[
+            "project",
+            "show",
+            ORGANIZATION,
+            PROJECT_ID,
+            "--allow-insecure-http",
+        ],
+        &server,
+        &credential_path,
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stderr.is_empty());
+    server.finish();
+    String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .filter(|line| line.starts_with("runner pool"))
+        .map(str::to_owned)
+        .collect()
+}
+
+// REQ-PROJECT-78, REQ-PROJECT-90
+#[test]
+fn project_human_output_lists_every_pool_of_the_set() {
+    let repository = Some(repository_body("acme/widget", "main"));
+    let mut several = project_body("widget", true, repository.clone());
+    several["runnerPools"] = serde_json::json!([
+        {"id": POOL_ID, "name": "builders"},
+        {"id": SHARED_POOL_ID, "name": "shared"}
+    ]);
+    assert_eq!(
+        show_project_human(several),
+        [
+            format!("runner pool: builders ({POOL_ID})"),
+            format!("runner pool: shared ({SHARED_POOL_ID})"),
+        ]
+    );
+
+    let mut empty = project_body("widget", false, repository.clone());
+    empty["runnerPools"] = serde_json::json!([]);
+    assert_eq!(show_project_human(empty), ["runner pool: none"]);
+
+    // A Cloud that predates the set omits `runnerPools`; its single pool is the set.
+    assert_eq!(
+        show_project_human(project_body("widget", true, repository)),
+        [format!("runner pool: builders ({POOL_ID})")]
+    );
+}
+
 // REQ-PROJECT-80
 #[test]
 fn project_api_errors_have_closed_json_outcomes_and_exit_codes() {
@@ -1355,6 +1440,75 @@ fn inconsistent_project_readiness_is_an_invalid_response() {
     assert_eq!(
         serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()["outcome"],
         "invalid_response"
+    );
+    server.finish();
+}
+
+// REQ-PROJECT-82, REQ-PROJECT-90
+#[test]
+fn a_pool_set_that_disagrees_with_the_single_pool_is_an_invalid_response() {
+    let repository = Some(repository_body("acme/widget", "main"));
+    let mut first_differs = project_body("widget", true, repository.clone());
+    first_differs["runnerPools"] = serde_json::json!([
+        {"id": SHARED_POOL_ID, "name": "shared"},
+        {"id": POOL_ID, "name": "builders"}
+    ]);
+    let mut set_without_single = project_body("widget", false, repository.clone());
+    set_without_single["runnerPools"] = serde_json::json!([{"id": POOL_ID, "name": "builders"}]);
+    let mut single_without_set = project_body("widget", true, repository);
+    single_without_set["runnerPools"] = serde_json::json!([]);
+
+    for project in [first_differs, set_without_single, single_without_set] {
+        let (server, _directory, credential_path) =
+            prepared_project(vec![json_http_response("200 OK", project.clone())]);
+        let output = run_project(
+            &[
+                "project",
+                "show",
+                ORGANIZATION,
+                PROJECT_ID,
+                "--json",
+                "--allow-insecure-http",
+            ],
+            &server,
+            &credential_path,
+        );
+
+        assert_eq!(output.status.code(), Some(1), "{project}");
+        assert!(output.stderr.is_empty());
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()["outcome"],
+            "invalid_response",
+            "{project}"
+        );
+        server.finish();
+    }
+}
+
+// REQ-PROJECT-82, REQ-PROJECT-90
+#[test]
+fn a_project_without_a_pool_set_is_read_as_its_single_pool() {
+    let project = project_body("widget", true, Some(repository_body("acme/widget", "main")));
+    let (server, _directory, credential_path) =
+        prepared_project(vec![json_http_response("200 OK", project)]);
+
+    let output = run_project(
+        &[
+            "project",
+            "show",
+            ORGANIZATION,
+            PROJECT_ID,
+            "--json",
+            "--allow-insecure-http",
+        ],
+        &server,
+        &credential_path,
+    );
+
+    let result = assert_json_success(&output, "found");
+    assert_eq!(
+        result["project"]["runnerPools"],
+        serde_json::json!([{"id": POOL_ID, "name": "builders"}])
     );
     server.finish();
 }

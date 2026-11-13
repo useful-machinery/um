@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://docs.usefulmachinery.com/schemas/workflow-definition-bindings-v1.schema.json",
   "title": "Useful Machinery Workflow Definition Bindings Snapshot V1",
-  "description": "A revision's bindings.json: each binding the root workflow declares, keyed by its name, with its kind and the value bound for the environment. An empty object is the snapshot of a root workflow that declares no bindings.",
+  "description": "A revision's bindings.json: each binding the root workflow declares, keyed by its name, with its kind and the value bound for the environment. A members value is an array, empty included; every other value is a non-empty string. An empty object is the snapshot of a root workflow that declares no bindings.",
   "type": "object",
   "propertyNames": { "$ref": "#/$defs/Identifier" },
   "additionalProperties": { "$ref": "#/$defs/BoundBinding" },
@@ -13,16 +13,29 @@
       "pattern": "^[a-z][A-Za-z0-9]*$"
     },
     "BindingKind": {
-      "enum": ["connection", "linear.team", "linear.state", "github.repository"]
+      "enum": ["connection", "linear.team", "linear.state", "github.repository", "member", "members"]
     },
     "BoundBinding": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["kind", "value"],
-      "properties": {
-        "kind": { "$ref": "#/$defs/BindingKind" },
-        "value": { "type": "string", "minLength": 1 }
-      }
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "value"],
+          "properties": {
+            "kind": { "const": "members" },
+            "value": { "type": "array", "items": { "type": "string", "minLength": 1 } }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "value"],
+          "properties": {
+            "kind": { "$ref": "#/$defs/BindingKind", "not": { "const": "members" } },
+            "value": { "type": "string", "minLength": 1 }
+          }
+        }
+      ]
     }
   }
 }

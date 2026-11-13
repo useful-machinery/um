@@ -13,6 +13,7 @@ const ACTIVATION_ID: &str = "rna_01k0z6r1w8f4jy2m7q9v3x5abc";
 const ACTIVATION_SECRET: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
 // rrc_ values are public IDs, not credential secrets.
 const CREDENTIAL_ID: &str = "rrc_01k0z6r1w8f4jy2m7q9v3x5abc";
+const MEMBER_ID: &str = "prn_01k0z6r1w8f4jy2m7q9v3x5abc";
 
 fn prepared_runner(responses: Vec<Vec<u8>>) -> (ScriptedServer, tempfile::TempDir, String) {
     let server = ScriptedServer::respond(responses);
@@ -1154,6 +1155,224 @@ fn runner_create_reports_activation_failure_with_the_created_registration() {
     assert_eq!(server.finish().len(), 2);
 }
 
+fn registration_created_response() -> Vec<u8> {
+    http_response_with_headers(
+        "201 Created",
+        Some("application/json"),
+        &[
+            ("Idempotency-Key", ECHO_IDEMPOTENCY_KEY),
+            (
+                "Location",
+                &format!("/v1/organizations/{ORGANIZATION}/runner-registrations/{RUNNER_ID}"),
+            ),
+        ],
+        &serde_json::to_vec(&registration_body()).unwrap(),
+    )
+}
+
+fn activation_issued_response() -> Vec<u8> {
+    http_response_with_headers(
+        "201 Created",
+        Some("application/json"),
+        &[
+            ("Idempotency-Key", ECHO_IDEMPOTENCY_KEY),
+            (
+                "Location",
+                &format!(
+                    "/v1/organizations/{ORGANIZATION}/runner-registrations/{RUNNER_ID}/activations/{ACTIVATION_ID}"
+                ),
+            ),
+        ],
+        &serde_json::to_vec(&activation_issuance_body()).unwrap(),
+    )
+}
+
+// REQ-RUNNERENROLL-1, REQ-RUNNERPOOL-86
+#[test]
+fn runner_create_by_member_sends_the_member_and_no_pool() {
+    let (server, _credentials, credential_path) = prepared_runner(vec![
+        registration_created_response(),
+        activation_issued_response(),
+    ]);
+    let directory = tempfile::tempdir().unwrap();
+    let artifact_path = directory.path().join("activation.json");
+
+    let output = run_with_env(
+        &[
+            "runner",
+            "create",
+            ORGANIZATION,
+            "--member",
+            MEMBER_ID,
+            "--activation-file",
+            artifact_path.to_str().unwrap(),
+            "--allow-insecure-http",
+        ],
+        &deployment_environment(&server.api_url, &credential_path),
+    );
+
+    assert!(output.status.success(), "{output:?}");
+    let requests = server.finish();
+    assert_eq!(requests.len(), 2);
+    assert!(requests[0].starts_with(&format!(
+        "POST /api/v1/organizations/{ORGANIZATION}/runner-registrations HTTP/1.1\r\n"
+    )));
+    let body: serde_json::Value = serde_json::from_str(request_body(&requests[0])).unwrap();
+    assert_eq!(body["memberId"], MEMBER_ID);
+    assert!(body.get("runnerPoolId").is_none(), "{body}");
+}
+
+// REQ-RUNNERENROLL-1, REQ-RUNNERPOOL-87
+#[test]
+fn runner_create_with_neither_pool_nor_member_sends_neither_and_issues_the_activation() {
+    let (server, _credentials, credential_path) = prepared_runner(vec![
+        registration_created_response(),
+        activation_issued_response(),
+    ]);
+    let directory = tempfile::tempdir().unwrap();
+    let artifact_path = directory.path().join("activation.json");
+
+    let output = run_with_env(
+        &[
+            "runner",
+            "create",
+            ORGANIZATION,
+            "--activation-file",
+            artifact_path.to_str().unwrap(),
+            "--allow-insecure-http",
+        ],
+        &deployment_environment(&server.api_url, &credential_path),
+    );
+
+    assert!(output.status.success(), "{output:?}");
+    let requests = server.finish();
+    assert_eq!(requests.len(), 2);
+    assert!(requests[0].starts_with(&format!(
+        "POST /api/v1/organizations/{ORGANIZATION}/runner-registrations HTTP/1.1\r\n"
+    )));
+    let body: serde_json::Value = serde_json::from_str(request_body(&requests[0])).unwrap();
+    assert!(body.get("runnerPoolId").is_none(), "{body}");
+    assert!(body.get("memberId").is_none(), "{body}");
+    assert!(requests[1].starts_with(&format!(
+        "POST /api/v1/organizations/{ORGANIZATION}/runner-registrations/{RUNNER_ID}/activations HTTP/1.1\r\n"
+    )));
+    let artifact: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&artifact_path).unwrap()).unwrap();
+    assert_eq!(artifact["runnerId"], RUNNER_ID);
+}
+
+// REQ-RUNNERENROLL-1, REQ-RUNNERPOOL-87
+#[test]
+fn runner_create_without_a_personal_pool_exits_with_pool_personal_unavailable() {
+    for json in [true, false] {
+        let refused = problem_http_response(
+            "409 Conflict",
+            serde_json::json!({
+                "type": "https://api.usefulmachinery.com/problems/runner-pool-personal-unavailable",
+                "title": "Personal runner pool unavailable",
+                "status": 409
+            }),
+        );
+        let (server, _credentials, credential_path) = prepared_runner(vec![refused]);
+        let directory = tempfile::tempdir().unwrap();
+        let artifact_path = directory.path().join("activation.json");
+        let mut args = vec![
+            "runner",
+            "create",
+            ORGANIZATION,
+            "--activation-file",
+            artifact_path.to_str().unwrap(),
+        ];
+        if json {
+            args.push("--json");
+        }
+        args.push("--allow-insecure-http");
+
+        let output = run_with_env(
+            &args,
+            &deployment_environment(&server.api_url, &credential_path),
+        );
+
+        assert_eq!(output.status.code(), Some(1), "{output:?}");
+        if json {
+            assert!(output.stderr.is_empty(), "{output:?}");
+            let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(result["outcome"], "pool_personal_unavailable");
+            assert!(result.get("runnerId").is_none(), "{result}");
+        } else {
+            assert!(output.stdout.is_empty());
+            assert!(String::from_utf8_lossy(&output.stderr).contains("--pool-id"));
+        }
+        assert!(!artifact_path.exists());
+        assert_eq!(server.finish().len(), 1);
+    }
+}
+
+// REQ-RUNNERENROLL-12, REQ-RUNNERPOOL-87
+#[test]
+fn runner_disable_refused_by_cloud_exits_with_forbidden() {
+    let refused = problem_http_response(
+        "403 Forbidden",
+        serde_json::json!({
+            "type": "https://api.usefulmachinery.com/problems/forbidden",
+            "title": "Forbidden",
+            "status": 403
+        }),
+    );
+    let (server, _directory, credential_path) = prepared_runner(vec![
+        json_http_response("200 OK", registration_body()),
+        refused,
+    ]);
+
+    let output = run_with_env(
+        &[
+            "runner",
+            "disable",
+            ORGANIZATION,
+            RUNNER_ID,
+            "--json",
+            "--allow-insecure-http",
+        ],
+        &deployment_environment(&server.api_url, &credential_path),
+    );
+
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["outcome"], "forbidden");
+    let requests = server.finish();
+    assert_eq!(requests.len(), 2);
+    assert!(requests[1].starts_with(&format!(
+        "PUT /api/v1/organizations/{ORGANIZATION}/runner-registrations/{RUNNER_ID}/mode HTTP/1.1\r\n"
+    )));
+}
+
+// REQ-RUNNERENROLL-1
+#[test]
+fn runner_create_refuses_a_member_with_a_pool_or_a_malformed_member_before_network_access() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let api_url = format!("http://{}/api", listener.local_addr().unwrap());
+    let missing_credentials = tempfile::tempdir().unwrap().path().join("missing.json");
+    let environment = deployment_environment(&api_url, missing_credentials.to_str().unwrap());
+
+    for target in [
+        vec!["--member", MEMBER_ID, "--pool-id", POOL_ID],
+        vec!["--member", "prn_malformed"],
+        vec!["--member", POOL_ID],
+    ] {
+        let mut args = vec!["runner", "create", ORGANIZATION];
+        args.extend(target);
+        args.extend(["--activation-file", "-", "--allow-insecure-http"]);
+        let output = run_with_env(&args, &environment);
+        assert_eq!(output.status.code(), Some(2), "{args:?}: {output:?}");
+        assert!(output.stdout.is_empty());
+    }
+    assert_eq!(
+        listener.accept().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+}
+
 // REQ-RUNNERENROLL-10, REQ-RUNNERENROLL-11
 #[test]
 fn activation_list_and_revoke_report_the_deployment() {
@@ -1622,6 +1841,230 @@ fn runner_move_resolves_the_destination_and_sends_only_its_id() {
     }
 }
 
+fn personal_pool_body() -> serde_json::Value {
+    let mut pool = pool_body();
+    pool["member"] = serde_json::json!({"id": MEMBER_ID, "displayName": "Ada Lovelace"});
+    pool
+}
+
+// REQ-RUNNERPOOL-84
+#[test]
+fn pool_member_commands_are_unknown_and_send_nothing() {
+    for leaf in [
+        vec!["set", ORGANIZATION, POOL_ID, MEMBER_ID],
+        vec!["remove", ORGANIZATION, POOL_ID, "--yes"],
+    ] {
+        let (server, _directory, credential_path) = prepared_runner(vec![]);
+        let environment = deployment_environment(&server.api_url, &credential_path);
+        let mut args = vec!["runner", "pool", "member"];
+        args.extend(leaf);
+        args.push("--allow-insecure-http");
+
+        let output = run_with_env(&args, &environment);
+
+        assert_eq!(output.status.code(), Some(2), "{args:?}");
+        assert!(output.stdout.is_empty());
+        assert!(server.finish().is_empty());
+    }
+}
+
+// REQ-RUNNERPOOL-78, REQ-RUNNERPOOL-84
+#[test]
+fn personal_pool_rename_refusal_exits_with_pool_personal() {
+    for json in [true, false] {
+        let refused = problem_http_response(
+            "409 Conflict",
+            serde_json::json!({
+                "type": "https://api.usefulmachinery.com/problems/runner-pool-personal",
+                "title": "Runner pool is personal",
+                "status": 409
+            }),
+        );
+        let (server, _directory, credential_path) = prepared_runner(vec![
+            json_http_response("200 OK", personal_pool_body()),
+            refused,
+        ]);
+        let environment = deployment_environment(&server.api_url, &credential_path);
+        let mut args = vec![
+            "runner",
+            "pool",
+            "rename",
+            ORGANIZATION,
+            POOL_ID,
+            "--name",
+            "renamed",
+        ];
+        if json {
+            args.push("--json");
+        }
+        args.push("--allow-insecure-http");
+
+        let output = run_with_env(&args, &environment);
+
+        assert_eq!(output.status.code(), Some(1));
+        if json {
+            assert!(output.stderr.is_empty());
+            let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(result["outcome"], "pool_personal");
+        } else {
+            assert!(output.stdout.is_empty());
+            assert!(String::from_utf8_lossy(&output.stderr).starts_with("error: "));
+        }
+        let requests = server.finish();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[1].starts_with(&format!(
+            "PATCH /api/v1/organizations/{ORGANIZATION}/runner-pools/{POOL_ID} HTTP/1.1\r\n"
+        )));
+    }
+}
+
+// REQ-RUNNERPOOL-46, REQ-RUNNERPOOL-84
+#[test]
+fn pool_show_prints_the_personal_pool_member() {
+    let (server, _directory, credential_path) = prepared_runner(vec![
+        json_http_response("200 OK", personal_pool_body()),
+        pool_status_unavailable_response(),
+    ]);
+    let environment = deployment_environment(&server.api_url, &credential_path);
+
+    let output = run_with_env(
+        &[
+            "runner",
+            "pool",
+            "show",
+            ORGANIZATION,
+            POOL_ID,
+            "--allow-insecure-http",
+        ],
+        &environment,
+    );
+
+    assert!(output.status.success());
+    assert!(output.stderr.is_empty());
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        format!(
+            concat!(
+                "✓ Runner pool found.\n\n",
+                "  Pool:         {}\n",
+                "  Name:         builders\n",
+                "  Organization: {}\n",
+                "  Member:       {} (Ada Lovelace)\n",
+                "  Deployment:   {}\n"
+            ),
+            POOL_ID, ORGANIZATION_ID, MEMBER_ID, server.api_url
+        )
+    );
+    assert_eq!(server.finish().len(), 2);
+}
+
+fn pool_status_body() -> serde_json::Value {
+    serde_json::json!({
+        "runnerPoolId": POOL_ID,
+        "queuedRuns": 5,
+        "runners": {"total": 7, "online": 4, "offline": 3, "busy": 2, "idle": 1}
+    })
+}
+
+fn pool_status_unavailable_response() -> Vec<u8> {
+    problem_http_response(
+        "404 Not Found",
+        serde_json::json!({
+            "type": "https://api.usefulmachinery.com/problems/not-found",
+            "title": "Not found",
+            "status": 404
+        }),
+    )
+}
+
+fn pool_show(server: &ScriptedServer, credential_path: &str, json: bool) -> std::process::Output {
+    let environment = deployment_environment(&server.api_url, credential_path);
+    let mut args = vec!["runner", "pool", "show", ORGANIZATION, "builders"];
+    if json {
+        args.push("--json");
+    }
+    args.push("--allow-insecure-http");
+    run_with_env(&args, &environment)
+}
+
+fn assert_pool_then_status_requests(requests: &[String]) {
+    assert_eq!(requests.len(), 2, "{requests:?}");
+    assert!(requests[0].starts_with(&format!(
+        "GET /api/v1/organizations/{ORGANIZATION}/runner-pools?"
+    )));
+    assert!(requests[1].starts_with(&format!(
+        "GET /api/v1/organizations/{ORGANIZATION}/runner-pools/{POOL_ID}/status HTTP/1.1\r\n"
+    )));
+}
+
+// REQ-RUNNERPOOL-89, REQ-RUNNERPOOL-47
+#[test]
+fn pool_show_reads_the_pool_then_its_status_and_reports_its_load() {
+    for json in [false, true] {
+        let (server, _directory, credential_path) = prepared_runner(vec![
+            json_http_response("200 OK", pool_list_body()),
+            json_http_response("200 OK", pool_status_body()),
+        ]);
+
+        let output = pool_show(&server, &credential_path, json);
+
+        assert!(output.status.success(), "{output:?}");
+        assert!(output.stderr.is_empty());
+        if json {
+            let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(result["outcome"], "found");
+            assert_eq!(result["pool"]["id"], POOL_ID);
+            assert_eq!(result["status"], pool_status_body());
+        } else {
+            let stdout = String::from_utf8(output.stdout).unwrap();
+            let lines = stdout.lines().collect::<Vec<_>>();
+            let position = |label: &str| {
+                lines
+                    .iter()
+                    .position(|line| line.trim_start().starts_with(label))
+                    .unwrap_or_else(|| panic!("{label} should be printed: {stdout}"))
+            };
+            let identity = position("Organization:");
+            let waiting = position("Waiting runs:");
+            let runners = position("Runners:");
+            assert!(identity < waiting && waiting < runners, "{stdout}");
+            assert!(lines[waiting].trim_end().ends_with(" 5"), "{stdout}");
+            for count in ["4 online", "2 busy", "1 idle", "3 offline"] {
+                assert!(lines[runners].contains(count), "{count}: {stdout}");
+            }
+        }
+        assert_pool_then_status_requests(&server.finish());
+    }
+}
+
+// REQ-RUNNERPOOL-89
+#[test]
+fn pool_show_against_a_cloud_without_pool_status_prints_the_pool_alone() {
+    for json in [false, true] {
+        let (server, _directory, credential_path) = prepared_runner(vec![
+            json_http_response("200 OK", pool_list_body()),
+            pool_status_unavailable_response(),
+        ]);
+
+        let output = pool_show(&server, &credential_path, json);
+
+        assert!(output.status.success(), "{output:?}");
+        assert!(output.stderr.is_empty());
+        if json {
+            let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(result["outcome"], "found");
+            assert_eq!(result["pool"]["id"], POOL_ID);
+            assert!(result.get("status").is_none(), "{result}");
+        } else {
+            let stdout = String::from_utf8(output.stdout).unwrap();
+            assert!(stdout.contains(POOL_ID), "{stdout}");
+            assert!(!stdout.contains("Waiting runs"), "{stdout}");
+            assert!(!stdout.contains("Runners:"), "{stdout}");
+        }
+        assert_pool_then_status_requests(&server.finish());
+    }
+}
+
 // REQ-RUNNERPOOL-50, REQ-RUNNERPOOL-52
 #[test]
 fn runner_commands_report_reserved_run_and_idle_capacity() {
@@ -1743,4 +2186,506 @@ fn runner_show_reports_independent_cloud_and_informational_projections() {
         header_value(&request, "authorization"),
         format!("Bearer {TOKEN}")
     );
+}
+
+const JOIN_KEY_ID: &str = "rjk_01k0z6r1w8f4jy2m7q9v3x5abc";
+const JOIN_KEY_SECRET: &str = "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
+const SHARED_POOL_ID: &str = "rpl_01k0z6r1w8f4jy2m7q9v3x5abd";
+const OTHER_MEMBER_ID: &str = "prn_01k0z6r1w8f4jy2m7q9v3x5abd";
+
+fn join_key_body(pool_id: &str, state: &str) -> serde_json::Value {
+    let mut key = serde_json::json!({
+        "id": JOIN_KEY_ID,
+        "runnerPoolId": pool_id,
+        "issuedByPrincipalId": MEMBER_ID,
+        "state": state,
+        "issuedAt": "2026-11-09T12:00:00Z",
+        "expiresAt": "2026-11-16T12:00:00Z",
+        "offlineRemovalSeconds": 3600
+    });
+    if state == "revoked" {
+        key["revokedAt"] = serde_json::json!("2026-11-10T12:00:00Z");
+    }
+    key
+}
+
+fn join_key_issued_response(pool_id: &str) -> Vec<u8> {
+    let body = serde_json::json!({
+        "joinKey": join_key_body(pool_id, "issued"),
+        "artifact": join_key_artifact()
+    });
+    http_response_with_headers(
+        "201 Created",
+        Some("application/json"),
+        &[
+            ("Idempotency-Key", ECHO_IDEMPOTENCY_KEY),
+            (
+                "Location",
+                &format!("/v1/organizations/{ORGANIZATION}/runner-join-keys/{JOIN_KEY_ID}"),
+            ),
+        ],
+        &serde_json::to_vec(&body).unwrap(),
+    )
+}
+
+fn join_key_artifact() -> serde_json::Value {
+    serde_json::json!({
+        "schemaVersion": 1,
+        "joinUrl": format!("https://api.usefulmachinery.com/v1/runner-join-keys/{JOIN_KEY_ID}/join"),
+        "joinKeyId": JOIN_KEY_ID,
+        "joinToken": format!("{JOIN_KEY_ID}.{JOIN_KEY_SECRET}"),
+        "expiresAt": "2026-11-16T12:00:00Z"
+    })
+}
+
+fn shared_pool_body() -> serde_json::Value {
+    let mut pool = pool_body();
+    pool["id"] = serde_json::json!(SHARED_POOL_ID);
+    pool["name"] = serde_json::json!("ci");
+    pool
+}
+
+fn assert_join_key_issuance_request(request: &str, pool_id: &str, expires: u64, removal: u64) {
+    assert!(
+        request.starts_with(&format!(
+            "POST /api/v1/organizations/{ORGANIZATION}/runner-pools/{pool_id}/join-keys HTTP/1.1\r\n"
+        )),
+        "{request}"
+    );
+    assert_eq!(header_value(request, "idempotency-key").len(), 64);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(request_body(request)).unwrap(),
+        serde_json::json!({"expiresInSeconds": expires, "offlineRemovalSeconds": removal})
+    );
+}
+
+// REQ-RUNNERENROLL-93
+#[test]
+fn join_key_issue_resolves_the_pool_sends_seconds_and_writes_a_private_artifact() {
+    let (server, _credentials, credential_path) = prepared_runner(vec![
+        json_http_response("200 OK", serde_json::json!({"items": [shared_pool_body()]})),
+        join_key_issued_response(SHARED_POOL_ID),
+    ]);
+    let directory = tempfile::tempdir().unwrap();
+    let artifact_path = directory.path().join("join-key.json");
+    let artifact_path = artifact_path.to_str().unwrap();
+
+    let output = run_with_env(
+        &[
+            "runner",
+            "join-key",
+            "issue",
+            ORGANIZATION,
+            "--pool-id",
+            "ci",
+            "--expires-in",
+            "7d",
+            "--remove-after",
+            "1h",
+            "--join-key-file",
+            artifact_path,
+            "--allow-insecure-http",
+        ],
+        &deployment_environment(&server.api_url, &credential_path),
+    );
+
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains(JOIN_KEY_ID), "{stdout}");
+    assert!(!stdout.contains(JOIN_KEY_SECRET));
+    assert!(
+        !String::from_utf8(output.stderr)
+            .unwrap()
+            .contains(JOIN_KEY_SECRET)
+    );
+    let requests = server.finish();
+    assert_eq!(requests.len(), 2);
+    assert!(requests[0].starts_with(&format!(
+        "GET /api/v1/organizations/{ORGANIZATION}/runner-pools?limit=200 HTTP/1.1\r\n"
+    )));
+    assert_join_key_issuance_request(&requests[1], SHARED_POOL_ID, 604_800, 3_600);
+
+    let metadata = fs::metadata(artifact_path).unwrap();
+    assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+    let written = fs::read_to_string(artifact_path).unwrap();
+    assert_eq!(written.lines().count(), 1, "{written}");
+    assert!(written.ends_with('\n'));
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&written).unwrap(),
+        join_key_artifact()
+    );
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let api_url = format!("http://{}/api", listener.local_addr().unwrap());
+    let repeated = run_with_env(
+        &[
+            "runner",
+            "join-key",
+            "issue",
+            ORGANIZATION,
+            "--pool-id",
+            "ci",
+            "--expires-in",
+            "7d",
+            "--remove-after",
+            "1h",
+            "--join-key-file",
+            artifact_path,
+            "--allow-insecure-http",
+        ],
+        &deployment_environment(&api_url, &credential_path),
+    );
+    assert!(!repeated.status.success());
+    assert_eq!(fs::read_to_string(artifact_path).unwrap(), written);
+    assert_eq!(
+        listener.accept().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+}
+
+// REQ-RUNNERENROLL-93
+#[test]
+fn join_key_issue_without_a_pool_uses_the_callers_personal_pool_and_writes_only_the_artifact() {
+    let mut other_personal = personal_pool_body();
+    other_personal["id"] = serde_json::json!("rpl_01k0z6r1w8f4jy2m7q9v3x5abe");
+    other_personal["member"]["id"] = serde_json::json!(OTHER_MEMBER_ID);
+    let (server, _credentials, credential_path) = prepared_runner(vec![
+        json_http_response(
+            "200 OK",
+            serde_json::json!({
+                "principal": {"id": MEMBER_ID, "type": "human", "state": "active"}
+            }),
+        ),
+        json_http_response(
+            "200 OK",
+            serde_json::json!({
+                "items": [shared_pool_body(), other_personal, personal_pool_body()]
+            }),
+        ),
+        join_key_issued_response(POOL_ID),
+    ]);
+
+    let output = run_with_env(
+        &[
+            "runner",
+            "join-key",
+            "issue",
+            ORGANIZATION,
+            "--expires-in",
+            "30m",
+            "--remove-after",
+            "5m",
+            "--join-key-file",
+            "-",
+            "--allow-insecure-http",
+        ],
+        &deployment_environment(&server.api_url, &credential_path),
+    );
+
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert_eq!(stdout.lines().count(), 1, "{stdout}");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&stdout).unwrap(),
+        join_key_artifact()
+    );
+    assert!(
+        !String::from_utf8(output.stderr)
+            .unwrap()
+            .contains(JOIN_KEY_SECRET)
+    );
+    let requests = server.finish();
+    assert_eq!(requests.len(), 3);
+    assert!(requests[0].starts_with("GET /api/v1/me HTTP/1.1\r\n"));
+    assert!(requests[1].starts_with(&format!(
+        "GET /api/v1/organizations/{ORGANIZATION}/runner-pools?limit=200 HTTP/1.1\r\n"
+    )));
+    assert_join_key_issuance_request(&requests[2], POOL_ID, 1_800, 300);
+}
+
+// REQ-RUNNERENROLL-93
+#[test]
+fn join_key_issue_without_a_personal_pool_sends_no_issuance() {
+    let (server, _credentials, credential_path) = prepared_runner(vec![
+        json_http_response(
+            "200 OK",
+            serde_json::json!({
+                "principal": {"id": MEMBER_ID, "type": "service", "state": "active"}
+            }),
+        ),
+        json_http_response("200 OK", serde_json::json!({"items": [shared_pool_body()]})),
+    ]);
+    let directory = tempfile::tempdir().unwrap();
+    let artifact_path = directory.path().join("join-key.json");
+
+    let output = run_with_env(
+        &[
+            "runner",
+            "join-key",
+            "issue",
+            ORGANIZATION,
+            "--expires-in",
+            "1d",
+            "--remove-after",
+            "1h",
+            "--join-key-file",
+            artifact_path.to_str().unwrap(),
+            "--json",
+            "--allow-insecure-http",
+        ],
+        &deployment_environment(&server.api_url, &credential_path),
+    );
+
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["outcome"], "pool_personal_unavailable");
+    assert!(!artifact_path.exists());
+    assert_eq!(server.finish().len(), 2);
+}
+
+// REQ-RUNNERENROLL-93
+#[test]
+fn join_key_issue_json_reports_the_key_without_its_token() {
+    let (server, _credentials, credential_path) = prepared_runner(vec![
+        json_http_response("200 OK", shared_pool_body()),
+        join_key_issued_response(SHARED_POOL_ID),
+    ]);
+    let directory = tempfile::tempdir().unwrap();
+    let artifact_path = directory.path().join("join-key.json");
+    let artifact_path = artifact_path.to_str().unwrap();
+
+    let output = run_with_env(
+        &[
+            "runner",
+            "join-key",
+            "issue",
+            ORGANIZATION,
+            "--pool-id",
+            SHARED_POOL_ID,
+            "--expires-in",
+            "365d",
+            "--remove-after",
+            "30d",
+            "--join-key-file",
+            artifact_path,
+            "--json",
+            "--allow-insecure-http",
+        ],
+        &deployment_environment(&server.api_url, &credential_path),
+    );
+
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(!stdout.contains(JOIN_KEY_SECRET), "{stdout}");
+    let report: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(report["outcome"], "issued");
+    assert_eq!(report["deployment"], server.api_url);
+    assert_eq!(report["joinKey"], join_key_body(SHARED_POOL_ID, "issued"));
+    assert_eq!(report["joinKeyFile"], artifact_path);
+    let requests = server.finish();
+    assert_join_key_issuance_request(&requests[1], SHARED_POOL_ID, 31_536_000, 2_592_000);
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let api_url = format!("http://{}/api", listener.local_addr().unwrap());
+    for (expires, removal, destination, json) in [
+        ("7d", "1h", "-", true),
+        ("366d", "1h", "-", false),
+        ("59s", "1h", "-", false),
+        ("7d", "4m", "-", false),
+        ("7d", "31d", "-", false),
+        ("7w", "1h", "-", false),
+        ("-1d", "1h", "-", false),
+    ] {
+        let mut args = vec![
+            "runner",
+            "join-key",
+            "issue",
+            ORGANIZATION,
+            "--pool-id",
+            SHARED_POOL_ID,
+            "--expires-in",
+            expires,
+            "--remove-after",
+            removal,
+            "--join-key-file",
+            destination,
+        ];
+        if json {
+            args.push("--json");
+        }
+        args.push("--allow-insecure-http");
+        let refused = run_with_env(&args, &deployment_environment(&api_url, &credential_path));
+        assert!(!refused.status.success(), "{args:?}");
+        assert!(refused.stdout.is_empty(), "{args:?}");
+    }
+    assert_eq!(
+        listener.accept().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+}
+
+// REQ-RUNNERENROLL-94
+#[test]
+fn join_key_list_prints_each_keys_pool_state_expiry_and_removal_time() {
+    let page = serde_json::json!({
+        "items": [join_key_body(POOL_ID, "issued"), join_key_body(SHARED_POOL_ID, "revoked")],
+        "nextCursor": "next-join-keys"
+    });
+    let (server, _credentials, credential_path) = prepared_runner(vec![
+        json_http_response("200 OK", page.clone()),
+        json_http_response("200 OK", shared_pool_body()),
+        json_http_response("200 OK", page.clone()),
+    ]);
+    let environment = deployment_environment(&server.api_url, &credential_path);
+
+    let output = run_with_env(
+        &[
+            "runner",
+            "join-key",
+            "list",
+            ORGANIZATION,
+            "--allow-insecure-http",
+        ],
+        &environment,
+    );
+
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let rows: Vec<_> = stdout
+        .lines()
+        .filter(|line| line.contains(JOIN_KEY_ID))
+        .collect();
+    assert_eq!(rows.len(), 2, "{stdout}");
+    for (row, pool, state) in [
+        (rows[0], POOL_ID, "issued"),
+        (rows[1], SHARED_POOL_ID, "revoked"),
+    ] {
+        for field in [pool, MEMBER_ID, state, "2026-11-16T12:00:00Z", "1h"] {
+            assert!(row.contains(field), "missing {field:?} in {row:?}");
+        }
+    }
+    assert!(stdout.contains("next-join-keys"));
+
+    let filtered = run_with_env(
+        &[
+            "runner",
+            "join-key",
+            "list",
+            ORGANIZATION,
+            "--pool-id",
+            SHARED_POOL_ID,
+            "--json",
+            "--allow-insecure-http",
+        ],
+        &environment,
+    );
+    assert!(filtered.status.success(), "{filtered:?}");
+    let report: serde_json::Value = serde_json::from_slice(&filtered.stdout).unwrap();
+    assert_eq!(report["outcome"], "listed");
+    assert_eq!(report["items"], page["items"]);
+    assert_eq!(report["nextCursor"], "next-join-keys");
+
+    let requests = server.finish();
+    assert_eq!(requests.len(), 3);
+    assert!(requests[0].starts_with(&format!(
+        "GET /api/v1/organizations/{ORGANIZATION}/runner-join-keys HTTP/1.1\r\n"
+    )));
+    assert!(requests[2].starts_with(&format!(
+        "GET /api/v1/organizations/{ORGANIZATION}/runner-join-keys?runnerPoolId={SHARED_POOL_ID} HTTP/1.1\r\n"
+    )));
+}
+
+// REQ-RUNNERENROLL-94
+#[test]
+fn join_key_revoke_requires_confirmation_and_sends_the_revocation() {
+    let (server, _credentials, credential_path) = prepared_runner(vec![]);
+    let environment = deployment_environment(&server.api_url, &credential_path);
+    let unconfirmed = run_with_env(
+        &[
+            "runner",
+            "join-key",
+            "revoke",
+            ORGANIZATION,
+            JOIN_KEY_ID,
+            "--allow-insecure-http",
+        ],
+        &environment,
+    );
+    assert_eq!(unconfirmed.status.code(), Some(2));
+    assert!(unconfirmed.stdout.is_empty());
+    assert!(server.finish().is_empty());
+
+    let revoked = join_key_body(POOL_ID, "revoked");
+    let (server, _credentials, credential_path) =
+        prepared_runner(vec![http_response_with_headers(
+            "200 OK",
+            Some("application/json"),
+            &[("Idempotency-Key", ECHO_IDEMPOTENCY_KEY)],
+            &serde_json::to_vec(&revoked).unwrap(),
+        )]);
+    let output = run_with_env(
+        &[
+            "runner",
+            "join-key",
+            "revoke",
+            ORGANIZATION,
+            JOIN_KEY_ID,
+            "--yes",
+            "--json",
+            "--allow-insecure-http",
+        ],
+        &deployment_environment(&server.api_url, &credential_path),
+    );
+    assert!(output.status.success(), "{output:?}");
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["outcome"], "revoked");
+    assert_eq!(report["joinKey"], revoked);
+    let request = server.finish().pop().unwrap();
+    assert!(request.starts_with(&format!(
+        "POST /api/v1/organizations/{ORGANIZATION}/runner-join-keys/{JOIN_KEY_ID}/revocation HTTP/1.1\r\n"
+    )));
+    assert_eq!(header_value(&request, "idempotency-key").len(), 64);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(request_body(&request)).unwrap(),
+        serde_json::json!({})
+    );
+}
+
+// REQ-RUNNERPOOL-88
+#[test]
+fn runner_show_prints_the_join_key_of_a_joined_runner() {
+    let mut joined = registration_body();
+    joined["joinKey"] = serde_json::json!({"id": JOIN_KEY_ID});
+    let (server, _credentials, credential_path) = prepared_runner(vec![
+        json_http_response("200 OK", joined),
+        json_http_response("200 OK", registration_body()),
+    ]);
+    let environment = deployment_environment(&server.api_url, &credential_path);
+    let args = [
+        "runner",
+        "show",
+        ORGANIZATION,
+        RUNNER_ID,
+        "--allow-insecure-http",
+    ];
+
+    let shown = run_with_env(&args, &environment);
+    let by_hand = run_with_env(&args, &environment);
+
+    assert!(shown.status.success(), "{shown:?}");
+    assert!(
+        String::from_utf8(shown.stdout)
+            .unwrap()
+            .lines()
+            .any(|line| line.contains("Join key") && line.contains(JOIN_KEY_ID))
+    );
+    assert!(by_hand.status.success(), "{by_hand:?}");
+    assert!(
+        !String::from_utf8(by_hand.stdout)
+            .unwrap()
+            .contains("Join key")
+    );
+    assert_eq!(server.finish().len(), 2);
 }

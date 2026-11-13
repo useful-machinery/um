@@ -15,13 +15,16 @@
 use crate::generated::models;
 use serde::{Deserialize, Serialize};
 
+/// CreateRunRequest : Names the run's workflow with `definition`. `workflowPath` and `publication` are accepted only to repeat a creation by workflow path accepted before the retirement, which answers its original run; a new request naming a top-level `workflowPath` is answered `410 path-run-retired`, and naming both forms or neither is `400`.
 #[derive(Clone, Default, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CreateRunRequest {
     #[serde(rename = "projectId")]
     pub project_id: String,
-    /// An exact canonical confined repository-relative Workflow V1 path.
-    #[serde(rename = "workflowPath")]
-    pub workflow_path: String,
+    /// An exact canonical confined repository-relative Workflow V1 path, accepted only to repeat a creation by workflow path accepted before the retirement.
+    #[serde(rename = "workflowPath", skip_serializing_if = "Option::is_none")]
+    pub workflow_path: Option<String>,
+    #[serde(rename = "definition", skip_serializing_if = "Option::is_none")]
+    pub definition: Option<Box<models::RunDefinitionSelection>>,
     /// An exact branch name; omission selects the project's current default.
     #[serde(rename = "sourceBranch", skip_serializing_if = "Option::is_none")]
     pub source_branch: Option<String>,
@@ -50,13 +53,18 @@ pub struct CreateRunRequest {
         skip_serializing_if = "Option::is_none"
     )]
     pub maximum_parallel_steps: Option<i32>,
+    /// Who owns a run by `definition`. `requester`, the default, makes a human member who creates the run its owner, so routing gives it that member's personal pool; `none` starts it with no owner, at project scope. A run by `workflowPath` or created by a service principal has no owner, and `requester` answers 400 for it. An omission and `requester` are the same request for replay.
+    #[serde(rename = "owner", skip_serializing_if = "Option::is_none")]
+    pub owner: Option<Owner>,
 }
 
 impl CreateRunRequest {
-    pub fn new(project_id: String, workflow_path: String) -> CreateRunRequest {
+    /// Names the run's workflow with `definition`. `workflowPath` and `publication` are accepted only to repeat a creation by workflow path accepted before the retirement, which answers its original run; a new request naming a top-level `workflowPath` is answered `410 path-run-retired`, and naming both forms or neither is `400`.
+    pub fn new(project_id: String) -> CreateRunRequest {
         CreateRunRequest {
             project_id,
-            workflow_path,
+            workflow_path: None,
+            definition: None,
             source_branch: None,
             workspace_source: None,
             display_name: None,
@@ -64,6 +72,21 @@ impl CreateRunRequest {
             publication: None,
             integration_context: None,
             maximum_parallel_steps: None,
+            owner: None,
         }
+    }
+}
+/// Who owns a run by `definition`. `requester`, the default, makes a human member who creates the run its owner, so routing gives it that member's personal pool; `none` starts it with no owner, at project scope. A run by `workflowPath` or created by a service principal has no owner, and `requester` answers 400 for it. An omission and `requester` are the same request for replay.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
+pub enum Owner {
+    #[serde(rename = "requester")]
+    CreateRunOwnerRequester,
+    #[serde(rename = "none")]
+    CreateRunOwnerNone,
+}
+
+impl Default for Owner {
+    fn default() -> Owner {
+        Self::CreateRunOwnerRequester
     }
 }
