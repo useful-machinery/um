@@ -11,6 +11,7 @@ use rustix::fs::{AtFlags, FileType, Mode, OFlags, fstat, openat, readlinkat, sta
 use rustix::io::dup;
 use serde::{Deserialize, Serialize};
 
+use super::git_capture::{EXECUTION_ROOT_GIT_ARGUMENTS, EXECUTION_ROOT_GIT_ENVIRONMENT};
 use super::private_staging::open_directory_path;
 use super::schema_common::{is_lowercase_hex, lowercase_hex, utc_timestamp};
 use crate::process::{CommandProbeError, CommandRequest, CommandRunner, SystemCommandRunner};
@@ -302,10 +303,15 @@ fn run_git(
         .iter()
         .map(|(name, value)| (name.as_os_str(), value.as_os_str()))
         .collect::<Vec<_>>();
+    let arguments = EXECUTION_ROOT_GIT_ARGUMENTS
+        .iter()
+        .chain(args)
+        .copied()
+        .collect::<Vec<_>>();
     let output = runner
         .run(CommandRequest {
             program: Path::new("git"),
-            args,
+            args: &arguments,
             timeout: GIT_TIMEOUT,
             maximum_stdout_bytes: MAXIMUM_GIT_OUTPUT_BYTES,
             clear_environment: true,
@@ -326,27 +332,34 @@ fn run_git(
     }
 }
 
+/// The engine variables a snapshot's Git inherits: the program search path, and the
+/// user's home and configuration directories, through which `git ls-files
+/// --exclude-standard` reads the user's own ignore file (INV-ENGINE-38).
+const SNAPSHOT_INHERITED_GIT_ENVIRONMENT: &[&str] = &["PATH", "HOME", "XDG_CONFIG_HOME"];
+
+/// Refuses every fetch. Git 2.45 and later read `GIT_NO_LAZY_FETCH`; an empty
+/// `GIT_ALLOW_PROTOCOL` is the complete list of allowed transports, overriding the
+/// repository's `protocol.*.allow`, so every admitted Git refuses every transport.
+const SNAPSHOT_FETCH_REFUSAL_GIT_ENVIRONMENT: &[(&str, &str)] =
+    &[("GIT_NO_LAZY_FETCH", "1"), ("GIT_ALLOW_PROTOCOL", "")];
+
 fn sanitized_git_environment(
     source: impl IntoIterator<Item = (OsString, OsString)>,
 ) -> Vec<(OsString, OsString)> {
     let mut environment = source
         .into_iter()
-        .filter(|(name, _)| name != "LC_ALL" && !super::git_capture::reserved_git_environment(name))
+        .filter(|(name, _)| {
+            SNAPSHOT_INHERITED_GIT_ENVIRONMENT
+                .iter()
+                .any(|inherited| name == inherited)
+        })
         .collect::<Vec<_>>();
-    environment.extend([
-        (OsString::from("LC_ALL"), OsString::from("C")),
-        (
-            OsString::from("GIT_CONFIG_GLOBAL"),
-            OsString::from("/dev/null"),
-        ),
-        (OsString::from("GIT_CONFIG_NOSYSTEM"), OsString::from("1")),
-        (OsString::from("GIT_OPTIONAL_LOCKS"), OsString::from("0")),
-        (
-            OsString::from("GIT_NO_REPLACE_OBJECTS"),
-            OsString::from("1"),
-        ),
-        (OsString::from("GIT_TERMINAL_PROMPT"), OsString::from("0")),
-    ]);
+    environment.extend(
+        EXECUTION_ROOT_GIT_ENVIRONMENT
+            .iter()
+            .chain(SNAPSHOT_FETCH_REFUSAL_GIT_ENVIRONMENT)
+            .map(|(name, value)| (OsString::from(name), OsString::from(value))),
+    );
     environment
 }
 
@@ -620,6 +633,7 @@ mod tests {
     use std::fs;
     use std::os::unix::ffi::OsStringExt as _;
     use std::os::unix::fs::{PermissionsExt as _, symlink};
+    use std::path::PathBuf;
     use std::process::Command;
 
     use super::*;
@@ -652,9 +666,9 @@ mod tests {
         temporary
     }
 
-    fn head_oid(root: &Path) -> String {
+    fn rev_parse(root: &Path, revision: &str) -> String {
         let oid = Command::new("git")
-            .args(["rev-parse", "HEAD"])
+            .args(["rev-parse", revision])
             .current_dir(root)
             .output()
             .unwrap()
@@ -664,6 +678,21 @@ mod tests {
 
     fn available(snapshot: &WorkspaceSnapshotV1) -> &str {
         snapshot.value.as_deref().unwrap()
+    }
+
+    /// An executable outside the work tree that appends a line to the returned marker
+    /// each time it runs and exits 1.
+    fn marking_program(name: &str) -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let outside = tempfile::tempdir().unwrap();
+        let marker = outside.path().join("marker");
+        let program = outside.path().join(name);
+        fs::write(
+            &program,
+            format!("#!/bin/sh\necho ran >> '{}'\nexit 1\n", marker.display()),
+        )
+        .unwrap();
+        fs::set_permissions(&program, fs::Permissions::from_mode(0o755)).unwrap();
+        (outside, program, marker)
     }
 
     // REQ-COMPAT-14
@@ -677,57 +706,53 @@ mod tests {
         assert_eq!(empty, lowercase_hex(framing.finish().as_ref()));
     }
 
+    // REQ-CONTINUE-89, INV-ENGINE-38
     #[test]
     fn snapshot_git_environment_removes_repository_routing_and_configuration() {
-        let environment = sanitized_git_environment([
-            (OsString::from("PATH"), OsString::from("/fixture/bin")),
-            (OsString::from("GIT_DIR"), OsString::from("/hostile/git")),
-            (
-                OsString::from("GIT_WORK_TREE"),
-                OsString::from("/hostile/tree"),
-            ),
-            (
-                OsString::from("GIT_INDEX_FILE"),
-                OsString::from("/hostile/index"),
-            ),
-            (OsString::from("GIT_CONFIG_COUNT"), OsString::from("1")),
-            (
-                OsString::from("GIT_CONFIG_KEY_0"),
-                OsString::from("core.hooksPath"),
-            ),
-            (
-                OsString::from("GIT_CONFIG_VALUE_0"),
-                OsString::from("/hostile/hooks"),
-            ),
-            (OsString::from("LC_ALL"), OsString::from("hostile")),
-        ]);
+        let inherited = [
+            ("PATH", "/fixture/bin"),
+            ("HOME", "/fixture/home"),
+            ("XDG_CONFIG_HOME", "/fixture/config"),
+        ];
+        let withheld = [
+            ("LC_ALL", "hostile"),
+            ("GIT_DIR", "/hostile/git"),
+            ("GIT_WORK_TREE", "/hostile/tree"),
+            ("GIT_INDEX_FILE", "/hostile/index"),
+            ("GIT_CONFIG_COUNT", "1"),
+            ("GIT_CONFIG_KEY_0", "core.hooksPath"),
+            ("GIT_CONFIG_VALUE_0", "/hostile/hooks"),
+            ("UM_FIXTURE_CREDENTIAL", "secret"),
+            ("GIT_EXEC_PATH", "/hostile/libexec"),
+            ("GIT_ALLOW_PROTOCOL", "ext"),
+        ];
+        let environment = sanitized_git_environment(
+            inherited
+                .iter()
+                .chain(&withheld)
+                .map(|(name, value)| (OsString::from(name), OsString::from(value))),
+        );
+        let names = environment.len();
         let environment = environment.into_iter().collect::<BTreeMap<_, _>>();
-        assert_eq!(
-            environment.get(OsStr::new("PATH")),
-            Some(&OsString::from("/fixture/bin"))
-        );
-        for removed in [
-            "GIT_DIR",
-            "GIT_WORK_TREE",
-            "GIT_INDEX_FILE",
-            "GIT_CONFIG_COUNT",
-            "GIT_CONFIG_KEY_0",
-            "GIT_CONFIG_VALUE_0",
-        ] {
-            assert!(!environment.contains_key(OsStr::new(removed)), "{removed}");
-        }
-        assert_eq!(
-            environment.get(OsStr::new("LC_ALL")),
-            Some(&OsString::from("C"))
-        );
-        assert_eq!(
-            environment.get(OsStr::new("GIT_CONFIG_GLOBAL")),
-            Some(&OsString::from("/dev/null"))
-        );
-        assert_eq!(
-            environment.get(OsStr::new("GIT_CONFIG_NOSYSTEM")),
-            Some(&OsString::from("1"))
-        );
+        assert_eq!(names, environment.len());
+
+        // Written out, not read from the shared definition: this is the pin of what the
+        // snapshot's Git receives.
+        let expected = inherited
+            .iter()
+            .chain(&[
+                ("LC_ALL", "C"),
+                ("GIT_CONFIG_GLOBAL", "/dev/null"),
+                ("GIT_CONFIG_NOSYSTEM", "1"),
+                ("GIT_OPTIONAL_LOCKS", "0"),
+                ("GIT_NO_REPLACE_OBJECTS", "1"),
+                ("GIT_TERMINAL_PROMPT", "0"),
+                ("GIT_NO_LAZY_FETCH", "1"),
+                ("GIT_ALLOW_PROTOCOL", ""),
+            ])
+            .map(|(name, value)| (OsString::from(name), OsString::from(value)))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(environment, expected);
     }
 
     // REQ-CONTINUE-23
@@ -914,7 +939,7 @@ mod tests {
         let repository = repository();
         let mut observer = ReplaceIndexEntryWithGitlink {
             root: repository.path().to_owned(),
-            oid: head_oid(repository.path()),
+            oid: rev_parse(repository.path(), "HEAD"),
             mutated: false,
         };
 
@@ -946,7 +971,7 @@ mod tests {
     #[test]
     fn snapshot_rejects_gitlinks() {
         let repository = repository();
-        let oid = head_oid(repository.path());
+        let oid = rev_parse(repository.path(), "HEAD");
         git(
             repository.path(),
             &[
@@ -969,5 +994,55 @@ mod tests {
             Some(WorkspaceSnapshotUnavailableReasonV1::Gitlink)
         );
         assert!(snapshot.validate(true));
+    }
+
+    // REQ-CONTINUE-88, INV-ENGINE-37
+    #[test]
+    fn snapshot_runs_no_repository_configured_fsmonitor() {
+        let repository = repository();
+        let root = repository.path();
+        let (_outside, script, marker) = marking_program("fsmonitor");
+        git(
+            root,
+            &["config", "core.fsmonitor", script.to_str().unwrap()],
+        );
+
+        let start = capture_start_snapshot(root);
+        let settlement = capture_settlement_snapshot(root, WorkspaceSnapshotSettlementV1::Engine);
+
+        assert_eq!(available(&start), available(&settlement));
+        assert!(!marker.exists());
+    }
+
+    // REQ-CONTINUE-88, REQ-CONTINUE-89
+    #[test]
+    fn snapshot_starts_no_lazy_fetch_for_a_sparse_index_missing_a_tree() {
+        let repository = repository();
+        let root = repository.path();
+        fs::create_dir(root.join("dir")).unwrap();
+        fs::write(root.join("dir/f"), b"sparse\n").unwrap();
+        fs::create_dir(root.join("keep")).unwrap();
+        fs::write(root.join("keep/g"), b"kept\n").unwrap();
+        git(root, &["add", "dir/f", "keep/g"]);
+        git(root, &["commit", "--quiet", "-m", "sparse"]);
+        git(
+            root,
+            &["sparse-checkout", "init", "--cone", "--sparse-index"],
+        );
+        git(root, &["sparse-checkout", "set", "keep"]);
+        let tree = rev_parse(root, "HEAD:dir");
+        let (directory, file) = tree.split_at(2);
+        fs::remove_file(root.join(".git/objects").join(directory).join(file)).unwrap();
+
+        let (_outside, script, marker) = marking_program("remote");
+        let url = format!("ext::{}", script.to_str().unwrap());
+        git(root, &["config", "extensions.partialClone", "origin"]);
+        git(root, &["config", "remote.origin.promisor", "true"]);
+        git(root, &["config", "remote.origin.url", &url]);
+        git(root, &["config", "protocol.ext.allow", "always"]);
+
+        capture_settlement_snapshot(root, WorkspaceSnapshotSettlementV1::Engine);
+
+        assert!(!marker.exists());
     }
 }

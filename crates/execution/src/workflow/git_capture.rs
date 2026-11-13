@@ -1337,19 +1337,8 @@ impl GitCaptureContext {
     ) -> Command {
         let mut command = Command::new(self.git_program.as_os_str());
         command
-            .args([
-                "--no-pager",
-                "--no-optional-locks",
-                "--no-replace-objects",
-                "-c",
-                "core.fsmonitor=false",
-                "-c",
-                "gc.auto=0",
-                "-c",
-                "maintenance.auto=false",
-                "-c",
-                "fetch.writeCommitGraph=false",
-            ])
+            .args(EXECUTION_ROOT_GIT_ARGUMENTS)
+            .args(["-c", "fetch.writeCommitGraph=false"])
             .args(arguments)
             .env_clear();
         for (name, value) in self.environment.variables() {
@@ -1358,12 +1347,7 @@ impl GitCaptureContext {
             }
         }
         command
-            .env("LC_ALL", "C")
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .env("GIT_OPTIONAL_LOCKS", "0")
-            .env("GIT_NO_REPLACE_OBJECTS", "1")
-            .env("GIT_TERMINAL_PROMPT", "0")
+            .envs(EXECUTION_ROOT_GIT_ENVIRONMENT.iter().copied())
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -1589,6 +1573,34 @@ fn command_failed(output: &ProcessOutput, cause: GitCaptureFailure) -> GitCaptur
         _ => cause,
     }
 }
+
+/// The global arguments every Git command the engine itself runs in an execution root
+/// starts with (INV-ENGINE-37): no pager, no optional index writes, no replacement
+/// objects, no `core.fsmonitor` command, no stored untracked cache and no maintenance.
+pub(super) const EXECUTION_ROOT_GIT_ARGUMENTS: &[&str] = &[
+    "--no-pager",
+    "--no-optional-locks",
+    "--no-replace-objects",
+    "-c",
+    "core.fsmonitor=false",
+    "-c",
+    "core.untrackedCache=false",
+    "-c",
+    "gc.auto=0",
+    "-c",
+    "maintenance.auto=false",
+];
+
+/// The fixed variables every Git command the engine itself runs in an execution root
+/// receives (INV-ENGINE-37), set after any inherited or admitted variable.
+pub(super) const EXECUTION_ROOT_GIT_ENVIRONMENT: &[(&str, &str)] = &[
+    ("LC_ALL", "C"),
+    ("GIT_CONFIG_GLOBAL", "/dev/null"),
+    ("GIT_CONFIG_NOSYSTEM", "1"),
+    ("GIT_OPTIONAL_LOCKS", "0"),
+    ("GIT_NO_REPLACE_OBJECTS", "1"),
+    ("GIT_TERMINAL_PROMPT", "0"),
+];
 
 pub(super) fn reserved_git_environment(name: &OsStr) -> bool {
     let name = name.as_encoded_bytes();
