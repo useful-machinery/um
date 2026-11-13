@@ -207,6 +207,38 @@ fn existing_authenticated_credential_short_circuits_device_authorization() {
     assert!(requests[0].starts_with("GET /api/v1/me HTTP/1.1\r\n"));
 }
 
+// REQ-AUTH-21, REQ-AUTH-27
+#[test]
+fn existing_credential_of_a_refused_account_reports_forbidden_without_signing_in() {
+    let server = ScriptedServer::respond(vec![forbidden_problem_response()]);
+    let credential_directory = private_credential_directory();
+    let credential_path = credential_directory.path().join("credentials.json");
+    write_credential_fixture_for_deployment(
+        &credential_path,
+        &server.api_url,
+        &server.issuer,
+        "unique-refused-existing-access-token",
+        "2999-01-01T00:00:00Z",
+    );
+    let credential_path_string = credential_path.to_str().unwrap();
+    let environment = login_environment(&server, credential_path_string);
+
+    let output = run_with_env(
+        &["auth", "login", "--json", "--allow-insecure-http"],
+        &environment,
+    );
+
+    assert_eq!(output.status.code(), Some(1));
+    let events = json_lines(&output.stdout);
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0]["event"], "status");
+    assert_eq!(events[0]["status"]["state"], "forbidden");
+    assert!(output.stderr.is_empty());
+    let requests = server.finish();
+    assert_eq!(requests.len(), 1);
+    assert!(requests[0].starts_with("GET /api/v1/me HTTP/1.1\r\n"));
+}
+
 // REQ-AUTH-19, REQ-AUTH-27, REQ-AUTH-29
 #[test]
 fn human_login_writes_activation_and_terminal_result_to_stdout() {
@@ -1028,6 +1060,62 @@ fn issued_token_is_retained_when_principal_confirmation_is_unreachable() {
     assert_eq!(
         stored["credentials"][0]["accessToken"],
         "unique-retained-access-token"
+    );
+    server.finish();
+}
+
+// REQ-AUTH-75
+#[test]
+fn issued_token_is_retained_when_principal_confirmation_is_forbidden() {
+    let server = ScriptedServer::respond(vec![
+        json_http_response(
+            "200 OK",
+            serde_json::json!({
+                "device_code": "private-device-code",
+                "user_code": "REFUSE-CODE",
+                "verification_uri": "https://auth.fixture.example/activate",
+                "expires_in": 600,
+                "interval": 1
+            }),
+        ),
+        json_http_response(
+            "200 OK",
+            serde_json::json!({
+                "access_token": "unique-refused-new-access-token",
+                "refresh_token": "unique-refused-new-refresh-token",
+                "token_type": "Bearer",
+                "expires_in": 300
+            }),
+        ),
+        forbidden_problem_response(),
+    ]);
+    let credential_directory = private_credential_directory();
+    let credential_path = credential_directory.path().join("credentials.json");
+    let credential_path_string = credential_path.to_str().unwrap();
+    let environment = login_environment(&server, credential_path_string);
+
+    let output = run_with_env(
+        &[
+            "auth",
+            "login",
+            "--force",
+            "--json",
+            "--allow-insecure-http",
+        ],
+        &environment,
+    );
+
+    assert_eq!(output.status.code(), Some(1));
+    let events = json_lines(&output.stdout);
+    let last = events.last().expect("login should emit a terminal event");
+    assert_eq!(last["event"], "status");
+    assert_eq!(last["status"]["state"], "forbidden");
+    assert!(output.stderr.is_empty());
+    let stored: serde_json::Value =
+        serde_json::from_slice(&fs::read(&credential_path).unwrap()).unwrap();
+    assert_eq!(
+        stored["credentials"][0]["accessToken"],
+        "unique-refused-new-access-token"
     );
     server.finish();
 }

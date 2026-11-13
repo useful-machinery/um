@@ -698,6 +698,12 @@ fn write_request_outcome(
             ),
             json,
         ),
+        RequestDeletionOutcome::AcceptanceUnknown => write_request_failure(
+            target,
+            deployment,
+            acceptance_unknown_failure(target, authentication),
+            json,
+        ),
         RequestDeletionOutcome::IdempotencyConflict => write_request_failure(
             target,
             deployment,
@@ -712,6 +718,31 @@ fn write_request_outcome(
             json,
         ),
     }
+}
+
+fn acceptance_unknown_failure(
+    target: &DeletionTarget,
+    authentication: super::PrincipalAuthenticationKind,
+) -> FailurePresentation {
+    let remedy = match authentication {
+        super::PrincipalAuthenticationKind::HumanSession => format!(
+            "Deletion may already be scheduled. Check the {noun}'s state:\n  {status}\n\nCancel the pending deletion only if you want to keep the {noun}:\n  {cancel}",
+            noun = target.noun(),
+            status = target.status_command(),
+            cancel = target.cancellation_command()
+        ),
+        super::PrincipalAuthenticationKind::ServiceApiKey => {
+            "The service principal may already be deleted.".to_owned()
+        }
+    };
+    FailurePresentation::new(
+        "acceptance_unknown",
+        format!(
+            "error: the reply to the {} deletion request was lost and the deployment refused the repeat\n\n{remedy}",
+            target.noun()
+        ),
+        OutcomeClass::Unreachable,
+    )
 }
 
 fn write_request_failure(
@@ -1058,7 +1089,7 @@ fn common_lifecycle_failure(
         CommonLifecycleFailure::Forbidden => FailurePresentation::new(
             "forbidden",
             match (operation, target) {
-                (FailureOperation::Request, DeletionTarget::Account) => "error: account deletion not permitted\n\nResolve active ownership requirements before trying again.".to_owned(),
+                (FailureOperation::Request, DeletionTarget::Account) => "error: account deletion not permitted\n\nCheck why the deployment refuses the account:\n  um auth status".to_owned(),
                 (FailureOperation::Request, DeletionTarget::Organization(_)) => "error: organization deletion not permitted\n\nUse a current active human owner account.".to_owned(),
                 (FailureOperation::Cancellation, _) => format!(
                     "error: {} deletion cancellation not permitted\n\nUse the required linked identity and active owner account.",

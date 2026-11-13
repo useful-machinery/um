@@ -43,6 +43,7 @@ impl Command {
             AuthenticationState::Authenticated(_) | AuthenticationState::SignupRequired { .. } => {
                 OutcomeClass::Success
             }
+            AuthenticationState::Forbidden { .. } => OutcomeClass::Forbidden,
             AuthenticationState::Unauthenticated => OutcomeClass::Unauthenticated,
             AuthenticationState::Unreachable(category) => {
                 super::super::unreachable_outcome_class(*category)
@@ -79,6 +80,11 @@ enum StatusBody<'a> {
         #[serde(skip_serializing_if = "Option::is_none")]
         actions: Option<&'a [serde_json::Value]>,
     },
+    Forbidden {
+        deployment: &'a str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        actions: Option<&'a [serde_json::Value]>,
+    },
     Unauthenticated {
         deployment: &'a str,
     },
@@ -97,6 +103,10 @@ impl<'a> StatusResult<'a> {
                 actions: authenticated.actions.as_deref(),
             },
             AuthenticationState::SignupRequired { actions } => StatusBody::SignupRequired {
+                deployment: status.deployment(),
+                actions: actions.as_deref(),
+            },
+            AuthenticationState::Forbidden { actions } => StatusBody::Forbidden {
                 deployment: status.deployment(),
                 actions: actions.as_deref(),
             },
@@ -151,6 +161,24 @@ pub(super) fn write_human_status(
                 "! Your Useful Machinery account still needs to be set up."
             )
             .context("write sign-in status")?;
+            write_human_actions(&mut stdout, actions.as_deref())
+        }
+        AuthenticationState::Forbidden { actions } => {
+            writeln!(
+                stdout,
+                "! Useful Machinery refuses this sign-in's account: it may be suspended, deleted or scheduled for deletion."
+            )
+            .context("write sign-in status")?;
+            if matches!(
+                authentication,
+                super::super::PrincipalAuthenticationKind::HumanSession
+            ) {
+                writeln!(
+                    stdout,
+                    "\nTo keep an account scheduled for deletion, cancel before its deadline:\n  um account deletion cancel"
+                )
+                .context("write sign-in status")?;
+            }
             write_human_actions(&mut stdout, actions.as_deref())
         }
         AuthenticationState::Unauthenticated => writeln!(

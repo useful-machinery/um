@@ -166,6 +166,50 @@ fn signup_reports_policy_denial_without_claiming_a_principal() {
     server.finish();
 }
 
+// REQ-ACCOUNT-70
+#[test]
+fn signup_reports_a_refused_account_as_forbidden_and_names_deletion_cancel() {
+    let (server, _directory, _path, credential_path) = prepared_signup(
+        vec![forbidden_problem_response()],
+        "unique-refused-signup-synthetic-token",
+    );
+    let environment = signup_environment(&server, &credential_path);
+
+    let output = run_with_env(
+        &["account", "signup", "--json", "--allow-insecure-http"],
+        &environment,
+    );
+
+    assert_eq!(output.status.code(), Some(1));
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        result,
+        serde_json::json!({
+            "schemaVersion": 1,
+            "deployment": server.api_url,
+            "outcome": "forbidden"
+        })
+    );
+    assert!(result.get("principal").is_none());
+    assert!(output.stderr.is_empty());
+    server.finish();
+
+    let (server, _directory, _path, credential_path) = prepared_signup(
+        vec![forbidden_problem_response()],
+        "unique-refused-human-signup-synthetic-token",
+    );
+    let environment = signup_environment(&server, &credential_path);
+
+    let output = run_with_env(
+        &["account", "signup", "--allow-insecure-http"],
+        &environment,
+    );
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("um account deletion cancel"));
+    server.finish();
+}
+
 // REQ-ACCOUNT-20
 #[test]
 fn already_provisioned_signup_directs_the_human_to_status() {

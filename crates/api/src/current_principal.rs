@@ -29,6 +29,11 @@ pub enum CurrentPrincipalOutcome {
     SignupRequired {
         actions: Option<Vec<serde_json::Value>>,
     },
+    /// The deployment accepts the credential and refuses its account: one that is
+    /// suspended, deleted, or scheduled for deletion.
+    Forbidden {
+        actions: Option<Vec<serde_json::Value>>,
+    },
     Unauthenticated,
     Unreachable(UnreachableCategory),
 }
@@ -236,15 +241,18 @@ async fn decode_response(
         StatusCode::FORBIDDEN => {
             let problem = problem::decode_parts(&body, status, content_type.as_deref())
                 .map_err(|reason| CurrentPrincipalError::protocol(reason, false))?;
-            if problem.r#type != PRINCIPAL_NOT_PROVISIONED {
-                return Err(CurrentPrincipalError::protocol(
-                    "a 403 response is not the principal-not-provisioned problem",
+            match problem.r#type.as_str() {
+                PRINCIPAL_NOT_PROVISIONED => Ok(CurrentPrincipalOutcome::SignupRequired {
+                    actions: problem.actions,
+                }),
+                problem::FORBIDDEN => Ok(CurrentPrincipalOutcome::Forbidden {
+                    actions: problem.actions,
+                }),
+                _ => Err(CurrentPrincipalError::protocol(
+                    "a 403 response is neither the principal-not-provisioned nor the forbidden problem",
                     false,
-                ));
+                )),
             }
-            Ok(CurrentPrincipalOutcome::SignupRequired {
-                actions: problem.actions,
-            })
         }
         StatusCode::TOO_MANY_REQUESTS => Ok(CurrentPrincipalOutcome::Unreachable(
             UnreachableCategory::RateLimited,

@@ -21,6 +21,9 @@ pub enum AuthenticationState {
     SignupRequired {
         actions: Option<Vec<serde_json::Value>>,
     },
+    Forbidden {
+        actions: Option<Vec<serde_json::Value>>,
+    },
     Unauthenticated,
     Unreachable(UnreachableCategory),
 }
@@ -87,6 +90,9 @@ fn status_from_outcome(
         }
         CurrentPrincipalOutcome::SignupRequired { actions } => {
             AuthenticationState::SignupRequired { actions }
+        }
+        CurrentPrincipalOutcome::Forbidden { actions } => {
+            AuthenticationState::Forbidden { actions }
         }
         CurrentPrincipalOutcome::Unauthenticated => AuthenticationState::Unauthenticated,
         CurrentPrincipalOutcome::Unreachable(category) => {

@@ -552,7 +552,7 @@ fn account_deletion_cancellation_emits_a_terminal_result_for_an_invalid_api_resp
     assert_eq!(server.finish().len(), 3);
 }
 
-// REQ-ACCOUNT-38
+// REQ-ACCOUNT-38, REQ-ACCOUNT-72
 #[test]
 fn account_deletion_cancellation_reports_reauthentication_and_already_cancelled_states() {
     for (problem_type, expected_outcome) in [
@@ -561,14 +561,17 @@ fn account_deletion_cancellation_reports_reauthentication_and_already_cancelled_
             "reauthentication_required",
         ),
         (
+            "https://api.usefulmachinery.com/problems/forbidden",
+            "forbidden",
+        ),
+        (
             "https://api.usefulmachinery.com/problems/lifecycle-transition-unavailable",
             "transition_unavailable",
         ),
     ] {
-        let (status, code) = if expected_outcome == "reauthentication_required" {
-            ("403 Forbidden", 403)
-        } else {
-            ("409 Conflict", 409)
+        let (status, code) = match expected_outcome {
+            "reauthentication_required" | "forbidden" => ("403 Forbidden", 403),
+            _ => ("409 Conflict", 409),
         };
         let terminal = lifecycle_problem(status, code, problem_type);
         let server = ScriptedServer::respond(cancellation_flow_responses(terminal));
@@ -615,4 +618,72 @@ fn account_deletion_request_requires_explicit_confirmation() {
 
     assert_eq!(output.status.code(), Some(2));
     assert!(output.stdout.is_empty());
+}
+
+// REQ-ACCOUNT-71
+#[test]
+fn account_deletion_reports_acceptance_unknown_when_the_repeat_of_a_lost_reply_is_refused() {
+    const FORBIDDEN: &str = "https://api.usefulmachinery.com/problems/forbidden";
+    let request = |responses: Vec<Vec<u8>>, json: bool| {
+        let (server, _directory, credential_path) = prepared_account_request(responses);
+        let environment = deployment_environment_with_issuer(
+            &server.api_url,
+            &server.issuer,
+            credential_path.to_str().unwrap(),
+        );
+        let before = fs::read(&credential_path).unwrap();
+        let mut args = vec!["account", "deletion", "request", "--yes"];
+        if json {
+            args.push("--json");
+        }
+        args.push("--allow-insecure-http");
+        let output = run_with_env(&args, &environment);
+        assert_eq!(fs::read(&credential_path).unwrap(), before);
+        let api_url = server.api_url.clone();
+        (output, api_url, server.finish())
+    };
+    let lost_then_forbidden = || {
+        vec![
+            Vec::new(),
+            lifecycle_problem("403 Forbidden", 403, FORBIDDEN),
+        ]
+    };
+
+    let (output, api_url, requests) = request(lost_then_forbidden(), true);
+    assert_eq!(output.status.code(), Some(4));
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap(),
+        serde_json::json!({
+            "schemaVersion": 1,
+            "deployment": api_url,
+            "outcome": "acceptance_unknown"
+        })
+    );
+    assert!(output.stderr.is_empty());
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0], requests[1]);
+    assert!(!header_value(&requests[0], "idempotency-key").is_empty());
+
+    let (output, _, requests) = request(lost_then_forbidden(), false);
+    assert_eq!(output.status.code(), Some(4));
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("um auth status"));
+    assert!(stderr.contains("um account deletion cancel"));
+    assert_eq!(requests.len(), 2);
+
+    let (output, api_url, requests) = request(
+        vec![lifecycle_problem("403 Forbidden", 403, FORBIDDEN)],
+        true,
+    );
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap(),
+        serde_json::json!({
+            "schemaVersion": 1,
+            "deployment": api_url,
+            "outcome": "forbidden"
+        })
+    );
+    assert_eq!(requests.len(), 1);
 }

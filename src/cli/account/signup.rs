@@ -30,7 +30,7 @@ fn outcome_class(outcome: &SignupOutcome) -> OutcomeClass {
         SignupOutcome::Authenticated(_) => OutcomeClass::Success,
         SignupOutcome::Unauthenticated => OutcomeClass::Unauthenticated,
         SignupOutcome::Unreachable(category) => super::super::unreachable_outcome_class(*category),
-        SignupOutcome::SignupNotPermitted => OutcomeClass::Forbidden,
+        SignupOutcome::SignupNotPermitted | SignupOutcome::Forbidden => OutcomeClass::Forbidden,
         SignupOutcome::AlreadyProvisioned | SignupOutcome::IdempotencyConflict => {
             OutcomeClass::GeneralFailure
         }
@@ -52,6 +52,7 @@ enum SignupResultBody<'a> {
     Authenticated { principal: PrincipalResult<'a> },
     Unauthenticated,
     SignupNotPermitted,
+    Forbidden,
     AlreadyProvisioned,
     IdempotencyConflict,
     Unreachable { category: &'static str },
@@ -65,6 +66,7 @@ impl<'a> SignupResult<'a> {
             },
             SignupOutcome::Unauthenticated => SignupResultBody::Unauthenticated,
             SignupOutcome::SignupNotPermitted => SignupResultBody::SignupNotPermitted,
+            SignupOutcome::Forbidden => SignupResultBody::Forbidden,
             SignupOutcome::AlreadyProvisioned => SignupResultBody::AlreadyProvisioned,
             SignupOutcome::IdempotencyConflict => SignupResultBody::IdempotencyConflict,
             SignupOutcome::Unreachable(category) => SignupResultBody::Unreachable {
@@ -101,6 +103,10 @@ fn write_human_result(deployment: &str, outcome: &SignupOutcome) -> anyhow::Resu
         SignupOutcome::SignupNotPermitted => writeln!(
             stdout,
             "! Account signup is not available for this Useful Machinery deployment."
+        ),
+        SignupOutcome::Forbidden => writeln!(
+            stdout,
+            "! Useful Machinery refuses the account behind this sign-in: it may be suspended, deleted or scheduled for deletion.\n\nTo keep an account scheduled for deletion, cancel before its deadline:\n  um account deletion cancel"
         ),
         SignupOutcome::AlreadyProvisioned => writeln!(
             stdout,

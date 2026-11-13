@@ -78,6 +78,9 @@ pub enum RequestDeletionOutcome {
     HumanOwnerRequired,
     TransitionUnavailable,
     IdempotencyConflict,
+    /// The reply to an earlier attempt of this request was lost and the deployment answered the
+    /// repeat 403 `forbidden`, so the first attempt may already have scheduled deletion.
+    AcceptanceUnknown,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -231,7 +234,12 @@ enum AttemptError {
 }
 
 enum RequestExecution {
-    Response(ReceivedResponse),
+    Response {
+        response: ReceivedResponse,
+        /// An earlier attempt of this call ended without an answer, so the deployment may have
+        /// applied it before answering this one.
+        earlier_attempt_unanswered: bool,
+    },
     Unreachable(UnreachableCategory),
 }
 
@@ -319,9 +327,18 @@ fn request_deletion(
         idempotency_key,
     )?;
     match execute_request(client, &spec)? {
-        RequestExecution::Response(response) => {
-            decode_request_response(operation, response, idempotency_key)
-        }
+        RequestExecution::Response {
+            response,
+            earlier_attempt_unanswered,
+        } => decode_request_response(operation, response, idempotency_key).map(|outcome| {
+            match (operation, outcome) {
+                (
+                    Operation::RequestPrincipal,
+                    RequestDeletionOutcome::Common(CommonLifecycleFailure::Forbidden),
+                ) if earlier_attempt_unanswered => RequestDeletionOutcome::AcceptanceUnknown,
+                (_, outcome) => outcome,
+            }
+        }),
         RequestExecution::Unreachable(category) => Ok(RequestDeletionOutcome::Common(
             CommonLifecycleFailure::Unreachable(category),
         )),
@@ -346,7 +363,7 @@ fn cancel_deletion(
         idempotency_key,
     )?;
     match execute_request(client, &spec)? {
-        RequestExecution::Response(response) => {
+        RequestExecution::Response { response, .. } => {
             decode_cancel_response(operation, response, idempotency_key)
         }
         RequestExecution::Unreachable(category) => Ok(CancelDeletionOutcome::Common(
@@ -393,11 +410,17 @@ fn execute_request(
     spec: &RequestSpec,
 ) -> Result<RequestExecution, LifecycleApiError> {
     let mut last_failure = UnreachableCategory::Connection;
+    let mut earlier_attempt_unanswered = false;
     // Lifecycle retry distinguishes a received terminal failure from an ambiguous success-body
     // interruption, so sharing the simpler identity retry loop would weaken mutation semantics.
     for attempt in 0..MUTATION_ATTEMPTS {
         match client.run(REQUEST_TIMEOUT, send_request(client, spec)) {
-            Ok(Ok(response)) => return Ok(RequestExecution::Response(response)),
+            Ok(Ok(response)) => {
+                return Ok(RequestExecution::Response {
+                    response,
+                    earlier_attempt_unanswered,
+                });
+            }
             Ok(Err(AttemptError::Protocol(error))) => return Err(error),
             Ok(Err(AttemptError::Ambiguous(category))) => last_failure = category,
             Ok(Err(AttemptError::Unreachable(category))) => {
@@ -405,6 +428,7 @@ fn execute_request(
             }
             Err(_) => last_failure = UnreachableCategory::Timeout,
         }
+        earlier_attempt_unanswered = true;
         if attempt + 1 < MUTATION_ATTEMPTS {
             um_support::sleep(um_support::short_retry_delay());
         }
@@ -554,10 +578,17 @@ fn decode_cancel_response(
             require_response_idempotency_key(operation, &response, expected_idempotency_key)?;
             decode_transition(operation, &response).map(CancelDeletionOutcome::Cancelled)
         }
-        StatusCode::FORBIDDEN => {
-            require_problem(operation, &response, REAUTHENTICATION_REQUIRED, false)?;
-            Ok(CancelDeletionOutcome::ReauthenticationRequired)
-        }
+        StatusCode::FORBIDDEN => match decode_problem_type(operation, &response, false)?.as_str() {
+            REAUTHENTICATION_REQUIRED => Ok(CancelDeletionOutcome::ReauthenticationRequired),
+            FORBIDDEN => Ok(CancelDeletionOutcome::Common(
+                CommonLifecycleFailure::Forbidden,
+            )),
+            _ => Err(LifecycleApiError::protocol(
+                operation,
+                "the problem type is not valid for its HTTP status",
+                false,
+            )),
+        },
         StatusCode::NOT_FOUND if operation.permits_not_found() => {
             require_problem(operation, &response, NOT_FOUND, false)?;
             Ok(CancelDeletionOutcome::NotFound)

@@ -572,6 +572,18 @@ fn problem_http_response(status: &str, value: serde_json::Value) -> Vec<u8> {
     )
 }
 
+/// The common 403 `forbidden` problem, which the deployment answers for an account it refuses.
+fn forbidden_problem_response() -> Vec<u8> {
+    problem_http_response(
+        "403 Forbidden",
+        serde_json::json!({
+            "type": "https://api.usefulmachinery.com/problems/forbidden",
+            "title": "Forbidden",
+            "status": 403
+        }),
+    )
+}
+
 fn header_value<'a>(request: &'a str, name: &str) -> &'a str {
     let prefix = format!("{}: ", name.to_ascii_lowercase());
     request
@@ -1179,6 +1191,51 @@ fn status_without_a_credential_still_contacts_the_server_without_authorization()
     assert!(output.stderr.is_empty());
     let request = server.finish();
     assert!(!request.contains("authorization:"));
+}
+
+// REQ-AUTH-31, REQ-AUTH-35, REQ-AUTH-36, REQ-AUTH-74
+#[test]
+fn status_reports_a_refused_account_as_forbidden_and_keeps_the_sign_in() {
+    let body = br#"{"type":"https://api.usefulmachinery.com/problems/forbidden","title":"Forbidden","status":403}"#;
+    for json in [true, false] {
+        let server =
+            OneShotServer::respond("403 Forbidden", Some("application/problem+json"), body);
+        let credential_directory = private_credential_directory();
+        let credential_path = credential_directory.path().join("credentials.json");
+        write_credential_fixture(
+            &credential_path,
+            &server.api_url,
+            "unique-refused-account-token",
+            "2999-01-01T00:00:00Z",
+        );
+        let stored = fs::read(&credential_path).unwrap();
+        let environment =
+            deployment_environment(&server.api_url, credential_path.to_str().unwrap());
+        let mut arguments = vec!["auth", "status", "--allow-insecure-http"];
+        if json {
+            arguments.push("--json");
+        }
+
+        let output = run_with_env(&arguments, &environment);
+
+        assert_eq!(output.status.code(), Some(1));
+        if json {
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap(),
+                serde_json::json!({
+                    "schemaVersion": 1,
+                    "state": "forbidden",
+                    "deployment": server.api_url
+                })
+            );
+            assert!(output.stderr.is_empty());
+        } else {
+            assert!(String::from_utf8_lossy(&output.stdout).contains("um account deletion cancel"));
+        }
+        assert_eq!(fs::read(&credential_path).unwrap(), stored);
+        let request = server.finish();
+        assert!(request.contains("authorization: Bearer unique-refused-account-token\r\n"));
+    }
 }
 
 // REQ-COMPAT-16

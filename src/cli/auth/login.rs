@@ -82,6 +82,10 @@ impl Command {
                         output.status(&existing)?;
                         return Ok(OutcomeClass::Success);
                     }
+                    AuthenticationState::Forbidden { .. } => {
+                        output.status(&existing)?;
+                        return Ok(OutcomeClass::Forbidden);
+                    }
                     AuthenticationState::Unauthenticated => {}
                     AuthenticationState::Unreachable(category) => {
                         return handle_unreachable(
@@ -198,6 +202,12 @@ fn finish_login(
             AuthenticationState::Authenticated(_) | AuthenticationState::SignupRequired { .. } => {
                 output.status(&status)?;
                 Ok(OutcomeClass::Success)
+            }
+            // A refused account keeps its newly issued sign-in: it works again once
+            // deletion is cancelled or a suspension is lifted.
+            AuthenticationState::Forbidden { .. } => {
+                output.status(&status)?;
+                Ok(OutcomeClass::Forbidden)
             }
             AuthenticationState::Unauthenticated => {
                 output.status(&status)?;

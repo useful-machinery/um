@@ -182,6 +182,31 @@ fn recognized_http_failures_map_to_closed_status_categories() {
 }
 
 #[test]
+fn forbidden_problem_maps_to_forbidden_with_opaque_actions_or_none() {
+    let actions = serde_json::json!([{ "id": "future.action", "unknown": { "nested": true } }]);
+    for expected_actions in [None, Some(actions)] {
+        let body = problem(403, problem::FORBIDDEN, expected_actions.clone());
+        let server = TestServer::respond(response(
+            "403 Forbidden",
+            Some(problem::PROBLEM_MEDIA_TYPE),
+            &body,
+        ));
+
+        let outcome =
+            get_current_principal(&http_client(), &server.api_url, Some("synthetic-token"))
+                .unwrap();
+
+        assert_eq!(
+            outcome,
+            CurrentPrincipalOutcome::Forbidden {
+                actions: expected_actions.and_then(|value| value.as_array().cloned())
+            }
+        );
+        server.finish_one();
+    }
+}
+
+#[test]
 fn malformed_or_unexpected_responses_are_protocol_failures() {
     let cases = [
         (

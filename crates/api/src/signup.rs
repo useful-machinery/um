@@ -10,7 +10,7 @@ use super::bearer_authorization;
 use super::http_client::{HttpClient, HttpEndpointError};
 use super::http_util::{self, BufferedResponseError};
 use super::human_principal::{self, HumanPrincipal};
-use super::problem::{self, IDEMPOTENCY_CONFLICT, UNAUTHORIZED};
+use super::problem::{self, FORBIDDEN, IDEMPOTENCY_CONFLICT, UNAUTHORIZED};
 use super::{UnreachableCategory, classify_reqwest_error};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
@@ -26,6 +26,7 @@ pub enum SignupOutcome {
     Authenticated(HumanPrincipal),
     Unauthenticated,
     SignupNotPermitted,
+    Forbidden,
     AlreadyProvisioned,
     IdempotencyConflict,
     Unreachable(UnreachableCategory),
@@ -227,14 +228,20 @@ async fn decode_response(response: Response) -> Result<SignupOutcome, AttemptErr
             Ok(SignupOutcome::Unauthenticated)
         }
         StatusCode::FORBIDDEN => {
-            problem::require_type_parts(
+            let problem_type = problem::decode_type_parts(
                 &body,
                 StatusCode::FORBIDDEN,
                 content_type.as_deref(),
-                SIGNUP_NOT_PERMITTED,
             )
             .map_err(|reason| AttemptError::Protocol(SignupError::protocol(reason, false)))?;
-            Ok(SignupOutcome::SignupNotPermitted)
+            match problem_type.as_str() {
+                SIGNUP_NOT_PERMITTED => Ok(SignupOutcome::SignupNotPermitted),
+                FORBIDDEN => Ok(SignupOutcome::Forbidden),
+                _ => Err(AttemptError::Protocol(SignupError::protocol(
+                    "a 403 response has an unrecognized problem type",
+                    false,
+                ))),
+            }
         }
         StatusCode::CONFLICT => {
             let problem_type =

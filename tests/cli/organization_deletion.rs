@@ -265,14 +265,13 @@ fn organization_deletion_cancellation_uses_browser_proof_without_replacing_the_s
     assert!(!combined.contains(ORGANIZATION_TOKEN));
 }
 
-// REQ-ORG-74
-#[test]
-fn organization_deletion_cancellation_does_not_weaken_owner_or_actor_proof() {
-    let terminal = organization_lifecycle_problem(
-        "403 Forbidden",
-        403,
-        "https://api.usefulmachinery.com/problems/reauthentication-required",
-    );
+/// Cancels `acme-research`'s deletion against a fresh sign-in whose cancel request the
+/// deployment answers with the given 403 problem; returns the exit code, the terminal event
+/// and the cancel request after checking the stored credential is untouched.
+fn refused_organization_cancellation(
+    problem_type: &str,
+) -> (Option<i32>, serde_json::Value, String) {
+    let terminal = organization_lifecycle_problem("403 Forbidden", 403, problem_type);
     let (server, _directory, credential_path) =
         prepared_organization_deletion(organization_cancellation_flow(terminal));
     let before = fs::read(&credential_path).unwrap();
@@ -294,7 +293,6 @@ fn organization_deletion_cancellation_does_not_weaken_owner_or_actor_proof() {
         &environment,
     );
 
-    assert_eq!(output.status.code(), Some(1));
     let events = String::from_utf8(output.stdout)
         .unwrap()
         .lines()
@@ -302,13 +300,42 @@ fn organization_deletion_cancellation_does_not_weaken_owner_or_actor_proof() {
         .collect::<Vec<_>>();
     assert_eq!(events.len(), 2);
     assert_eq!(events[0]["operation"], "organization_deletion_cancellation");
-    assert_eq!(events[1]["outcome"], "reauthentication_required");
     assert_eq!(events[1]["organizationRef"], "acme-research");
     assert_eq!(events[1]["localCredential"], "unchanged");
     assert_eq!(events[1]["proofCredentialStored"], false);
     assert!(output.stderr.is_empty());
     assert_eq!(fs::read(&credential_path).unwrap(), before);
-    assert_eq!(server.finish().len(), 3);
+    let mut requests = server.finish();
+    assert_eq!(requests.len(), 3);
+    (
+        output.status.code(),
+        events[1].clone(),
+        requests.pop().unwrap(),
+    )
+}
+
+// REQ-ORG-74
+#[test]
+fn organization_deletion_cancellation_does_not_weaken_owner_or_actor_proof() {
+    let (code, terminal, _) = refused_organization_cancellation(
+        "https://api.usefulmachinery.com/problems/reauthentication-required",
+    );
+
+    assert_eq!(code, Some(1));
+    assert_eq!(terminal["outcome"], "reauthentication_required");
+}
+
+// REQ-ORG-74
+#[test]
+fn organization_deletion_cancellation_reports_forbidden_when_the_deployment_refuses_the_account() {
+    let (code, terminal, request) =
+        refused_organization_cancellation("https://api.usefulmachinery.com/problems/forbidden");
+
+    assert_eq!(code, Some(1));
+    assert_eq!(terminal["outcome"], "forbidden");
+    assert!(
+        request.starts_with("DELETE /api/v1/organizations/acme-research/deletion HTTP/1.1\r\n")
+    );
 }
 
 // REQ-ORG-73

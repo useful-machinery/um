@@ -821,9 +821,13 @@ schema-version-1 events. Use `--force` to start a new device authorization trans
 without checking an existing credential with the API.
 
 Use `um auth status` to ask the selected deployment whether the current
-identity is authenticated, requires signup, is unauthenticated, or is unreachable. Add
-`--json` for the schema-version-1 structured result. Authenticated and signup-required
-results preserve any server actions as complete opaque JSON values. The CLI does not
+identity is authenticated, requires signup, is forbidden, is unauthenticated, or is
+unreachable. `forbidden` (exit 1) means the deployment accepts the sign-in but refuses its
+account, as it does for an account that is suspended, deleted, or scheduled for deletion;
+the stored sign-in is kept, and `um account deletion cancel` stops a scheduled deletion
+before its deadline. Add `--json` for the schema-version-1 structured result.
+Authenticated, signup-required, and forbidden results preserve any server actions as
+complete opaque JSON values. The CLI does not
 validate action IDs or guide origins, fetch guides, infer commands, or execute actions.
 Status always contacts the public API, including when no local credential exists.
 
@@ -1056,6 +1060,12 @@ showing the confirmed schedule, and directs the user to local sign-out. An uncon
 API request retains the local credential and must not be repeated
 until the lifecycle state has been confirmed with the deployment operator.
 
+If the reply to the request is lost, the command repeats the identical request with the same
+request identity. When the deployment refuses that repeat as `forbidden`, the first request
+may already have scheduled deletion, so the command reports `acceptance_unknown` (exit 4)
+instead and keeps the local credential. Run `um auth status` to check the account's state,
+and `um account deletion cancel` only to keep an account whose deletion is scheduled.
+
 Supplying `--service-api-key-file PATH|-` to the request deletes the authenticated
 service principal immediately instead of creating a schedule. A successful JSON result
 reports `outcome: "deleted"`; the command does not read, remove, or update a human
@@ -1082,9 +1092,12 @@ because browser authorization is part of the command. A repeated request or canc
 with a new request identity reports `transition_unavailable` when the lifecycle is
 already in the requested state or the transition is otherwise unavailable. Scheduling
 also reports `human_owner_required` when deleting the account would leave an organization
-without an effective human owner. Browser proof rejection reports
-`reauthentication_required`; no outcome weakens the linked-identity or issuance-time
-checks.
+without an effective human owner, and `acceptance_unknown` when the deployment refuses the
+repeat of a request whose reply was lost; that result carries no `schedule` or
+`localCredential`. Browser proof rejection reports
+`reauthentication_required`, and a cancellation whose proof belongs to an account the
+deployment refuses, such as one that is suspended or already erased, reports `forbidden`
+(exit 1); no outcome weakens the linked-identity or issuance-time checks.
 
 ## Organization management
 
@@ -1174,7 +1187,9 @@ Request uses one schema-version-1 result with `--json`; cancellation uses
 newline-delimited `activation_required` and terminal `result` events. Owner denial stays
 `forbidden` on request and is deliberately included in `reauthentication_required` on
 cancellation so the CLI does not disclose whether a private target, actor, or proof would
-otherwise qualify. Missing and inaccessible organization targets remain
+otherwise qualify. A cancellation whose proof belongs to an account the deployment
+refuses, such as a suspended account or one itself scheduled for deletion, reports
+`forbidden` with exit 1. Missing and inaccessible organization targets remain
 indistinguishable. `transition_unavailable` handles a schedule or cancellation that is
 already in the requested state or otherwise unavailable.
 
