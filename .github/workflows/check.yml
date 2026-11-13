@@ -192,17 +192,6 @@ jobs:
         run: |
           set -euo pipefail
           cargo build --locked --release --target "${{ matrix.target }}"
-      - name: Exercise descriptor-bound command cwd
-        if: matrix.target == 'aarch64-apple-darwin'
-        shell: bash
-        env:
-          UM_RELEASE_COMMIT: ${{ needs.verify_release.outputs.candidate_mirror }}
-          UM_VERSION: ${{ needs.verify_release.outputs.version }}
-        run: |
-          set -euo pipefail
-          ./scripts/run-named-test um-execution \
-            workflow::step_runtime::tests::command_uses_contained_cwd_literal_argv_and_isolates_parent_environment \
-            --release --target "${{ matrix.target }}"
       - name: Verify release identity
         shell: bash
         env:
@@ -252,6 +241,17 @@ jobs:
             --version "$VERSION"
           mkdir -p dist
           cp "$archive" dist/
+      - name: Exercise descriptor-bound command cwd
+        if: matrix.target == 'aarch64-apple-darwin'
+        shell: bash
+        env:
+          UM_RELEASE_COMMIT: ${{ needs.verify_release.outputs.candidate_mirror }}
+          UM_VERSION: ${{ needs.verify_release.outputs.version }}
+        run: |
+          set -euo pipefail
+          ./scripts/run-named-test um-execution \
+            workflow::step_runtime::tests::command_uses_contained_cwd_literal_argv_and_isolates_parent_environment \
+            --release --target "${{ matrix.target }}"
       - name: Upload release archive
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:

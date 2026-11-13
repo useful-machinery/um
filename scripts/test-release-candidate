@@ -29,6 +29,9 @@ VERIFIER = ROOT / "scripts/verify-release-candidate"
 RECONCILER = ROOT / "scripts/reconcile-release"
 WORKFLOW = ROOT / ".github/workflows/check.yml"
 RUN_NAMED_TEST = "./scripts/run-named-test"
+RELEASE_BUILD = "cargo build --locked --release"
+PACKAGE_RELEASE_ARCHIVE = "./scripts/package-release-archive"
+CARGO_COMMAND = re.compile(r"""(?:^|[\s;&|(`"'/])cargo(?=[\s"']|$)""")
 REPOSITORY_NAME = "fixture/um-cli"
 
 
@@ -635,6 +638,77 @@ def prove_named_tests(workflow: str) -> None:
             fail(f"named-test contract accepted {description}")
 
 
+# Any Cargo command that builds a `um-cli` test target rebuilds `um` with the root
+# package's dev-dependency features and copies it over `target/<target>/release/um`; a
+# later `cargo build --release` copies the production build back. The rule is by
+# position, not by package, so it holds whichever crate a later test lives in.
+def release_order_violation(workflow: str) -> str | None:
+    _, found, rest = workflow.partition("  build_release:\n")
+    job, ends, _ = rest.partition("  reconcile_release:\n")
+    if not found or not ends:
+        return "public workflow has no build_release job before reconcile_release"
+    lines = workflow_commands(job)
+    builds = [index for index, line in enumerate(lines) if RELEASE_BUILD in line]
+    packs = [index for index, line in enumerate(lines) if PACKAGE_RELEASE_ARCHIVE in line]
+    if len(builds) != 1 or len(packs) != 1:
+        return (
+            f"build_release has {len(builds)} release builds and {len(packs)} "
+            "packaging calls, not one each"
+        )
+    build, pack = builds[0], packs[0]
+    if build > pack:
+        return "build_release packages before its release build"
+    for index, line in enumerate(lines[:pack]):
+        # The release build's own line is allowed that one Cargo command and no other.
+        others = len(CARGO_COMMAND.findall(line)) - (index == build)
+        if others or RUN_NAMED_TEST in line:
+            return f"build_release invokes Cargo before packaging: {line.strip()}"
+    return None
+
+
+def after_release_build(workflow: str, command: str) -> str:
+    lines = workflow.splitlines(keepends=True)
+    for index, line in enumerate(lines):
+        if RELEASE_BUILD in line:
+            indent = line[: len(line) - len(line.lstrip())]
+            lines.insert(index + 1, f"{indent}{command}\n")
+            break
+    return "".join(lines)
+
+
+def prove_release_order(workflow: str) -> None:
+    violation = release_order_violation(workflow)
+    if violation is not None:
+        fail(violation)
+    without_packaging = "".join(
+        line
+        for line in workflow.splitlines(keepends=True)
+        if PACKAGE_RELEASE_ARCHIVE not in line
+    )
+    for description, mutated in (
+        (
+            "a named test before packaging",
+            after_release_build(
+                workflow, f"{RUN_NAMED_TEST} um-execution some::test --release"
+            ),
+        ),
+        ("a cargo check before packaging", after_release_build(workflow, "cargo check --locked")),
+        (
+            "a cargo test on the release build's line",
+            workflow.replace(RELEASE_BUILD, f"cargo test --locked && {RELEASE_BUILD}"),
+        ),
+        (
+            "a cargo test named by its path before packaging",
+            after_release_build(workflow, '"$HOME/.cargo/bin/cargo" test --locked'),
+        ),
+        ("no packaging", without_packaging),
+    ):
+        if mutated == workflow:
+            fail(f"release-order mutation left the workflow unchanged: {description}")
+        if release_order_violation(mutated) is None:
+            fail(f"release-order contract accepted {description}")
+
+
 def prove_workflow_contract() -> None:
     workflow = WORKFLOW.read_text()
     required = (
@@ -661,6 +735,8 @@ def prove_workflow_contract() -> None:
             fail(f"public workflow retains allocation state: {forbidden}")
     # INV-TESTING-24
     prove_named_tests(workflow)
+    # INV-RELEASE-43: the release build is the only Cargo invocation before packaging.
+    prove_release_order(workflow)
     prefix, _, publish = workflow.partition("  reconcile_release:\n")
     if "contents: write" in prefix or "environment: cli-release" not in publish:
         fail("public workflow exposes write authority before protected publication")

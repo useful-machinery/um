@@ -25,6 +25,8 @@ TARGETS = frozenset(
 VERSION_RE = re.compile(
     r"^(?:(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)|0\.0\.0-dev)$"
 )
+DEVELOPMENT_VERSION = "0.0.0-dev"
+TEST_VARIABLE_RE = re.compile(rb"UM_TEST_[A-Z0-9_]*")
 COMMAND_TIMEOUT_SECONDS = 10
 ENVIRONMENT_DIRECTORIES = ("home", "path", "tmp", "work")
 RUNTIME_CACHE_DIRECTORIES = (Path(".cache"), Path(".cache/rosetta"))
@@ -198,6 +200,15 @@ def verify(
             fail("packaged executable is not a regular file")
         if stat.S_IMODE(binary.stat().st_mode) != 0o755:
             fail("packaged executable mode differs")
+        # Every test-fixtures seam reads a UM_TEST_ variable; an optimized build
+        # without the feature names none. Refuse before executing the binary.
+        if version != DEVELOPMENT_VERSION:
+            test_variable = TEST_VARIABLE_RE.search(binary.read_bytes())
+            if test_variable is not None:
+                fail(
+                    "packaged executable is a test build that reads "
+                    f"{test_variable.group().decode('ascii')}"
+                )
 
         environment_root = temporary_root / "environment"
         for relative in ENVIRONMENT_DIRECTORIES:

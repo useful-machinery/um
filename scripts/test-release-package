@@ -17,6 +17,8 @@ VERIFY = PUBLIC_ROOT / "scripts/verify-release-package"
 VERIFY_ISOLATED = PUBLIC_ROOT / "scripts/verify-release-package-isolated"
 TARGET = "x86_64-unknown-linux-gnu"
 VERSION = "1.2.3"
+DEVELOPMENT_VERSION = "0.0.0-dev"
+TEST_VARIABLE = "UM_TEST_INTERNAL_WORKER_EXECUTABLE"
 REFERENCE = """# Workflow V1 authoring reference
 
 Authoring guide: <https://docs.usefulmachinery.com/agent/workflow-authoring.md>
@@ -54,7 +56,9 @@ def write_binary(
         "schema-drift",
         "source-dependent",
         "state-write",
+        "test-build",
     ],
+    version: str = VERSION,
 ) -> None:
     schema = SCHEMA if mutation != "schema-drift" else '{"type":"string"}\n'
     if mutation == "misleading-help":
@@ -89,16 +93,19 @@ if arguments == ["workflow", "reference"]:
     )
 """
 
+    # A test-fixtures build of `um` names the variables its seams read.
+    test_seam = f"TEST_SEAM = {TEST_VARIABLE!r}\n" if mutation == "test-build" else ""
+
     path.write_text(
         f"""#!{sys.executable}
 import os
 import sys
 from pathlib import Path
 
-arguments = sys.argv[1:]
+{test_seam}arguments = sys.argv[1:]
 {state_write}
 if arguments == ["--version"]:
-    output = {f"um {VERSION}\n".encode()!r}
+    output = {f"um {version}\n".encode()!r}
 elif arguments == ["workflow", "--help"]:
     output = {help_output!r}
 elif arguments == ["workflow", "reference"]:
@@ -129,7 +136,9 @@ def create_source(root: Path) -> tuple[Path, Path, Path]:
     return scripts / PACKAGE.name, scripts / VERIFY_ISOLATED.name, root / "um"
 
 
-def archive(package_script: Path, binary: Path, output: Path) -> Path:
+def archive(
+    package_script: Path, binary: Path, output: Path, version: str = VERSION
+) -> Path:
     run(
         [
             package_script,
@@ -140,14 +149,16 @@ def archive(package_script: Path, binary: Path, output: Path) -> Path:
             "--target",
             TARGET,
             "--version",
-            VERSION,
+            version,
         ]
     )
-    return output / f"um-{VERSION}-{TARGET}.tar.gz"
+    return output / f"um-{version}-{TARGET}.tar.gz"
 
 
-def expect_verification_failure(verifier: Path, archive_path: Path, description: str) -> None:
-    result = run(
+def verify(
+    verifier: Path, archive_path: Path, version: str = VERSION, *, check: bool = True
+) -> subprocess.CompletedProcess[bytes]:
+    return run(
         [
             verifier,
             "--archive",
@@ -155,10 +166,14 @@ def expect_verification_failure(verifier: Path, archive_path: Path, description:
             "--target",
             TARGET,
             "--version",
-            VERSION,
+            version,
         ],
-        check=False,
+        check=check,
     )
+
+
+def expect_verification_failure(verifier: Path, archive_path: Path, description: str) -> None:
+    result = verify(verifier, archive_path, check=False)
     if result.returncode == 0:
         fail(f"{description} unexpectedly passed release-package verification")
 
@@ -175,17 +190,7 @@ def main() -> None:
         second = archive(package_script, binary, root / "dist-second")
         if first.read_bytes() != second.read_bytes():
             fail("equivalent release packages are not deterministic")
-        run(
-            [
-                verifier,
-                "--archive",
-                first,
-                "--target",
-                TARGET,
-                "--version",
-                VERSION,
-            ]
-        )
+        verify(verifier, first)
 
         write_binary(binary, "missing-command")
         missing_command = archive(package_script, binary, root / "dist-missing-command")
@@ -216,6 +221,20 @@ def main() -> None:
         expect_verification_failure(
             verifier, state_write, "state-writing packaged authoring command"
         )
+
+        # INV-RELEASE-42: a release version refuses a `um` that names a test
+        # variable; the development version `check-suite` packs its test-built
+        # debug binary at accepts the same executable.
+        write_binary(binary, "test-build")
+        test_build = archive(package_script, binary, root / "dist-test-build")
+        expect_verification_failure(
+            verifier, test_build, "test build naming a test variable"
+        )
+        write_binary(binary, "test-build", DEVELOPMENT_VERSION)
+        development_test_build = archive(
+            package_script, binary, root / "dist-development-test-build", DEVELOPMENT_VERSION
+        )
+        verify(verifier, development_test_build, DEVELOPMENT_VERSION)
 
     print("CLI release-package authoring checks passed.")
 
