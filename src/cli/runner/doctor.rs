@@ -1,5 +1,5 @@
 mod readiness;
-mod workflow;
+pub(in crate::cli) mod workflow;
 
 use std::io::{self, Write};
 use std::path::PathBuf;
@@ -211,7 +211,7 @@ fn write_harness_compatibility_details(
 }
 
 /// Writes each provider's availability and next action, with the step it
-/// names, where a result's details carry them (REQ-AGENTLOGIN-43).
+/// names, where a result's details carry them (REQ-GRANT-53).
 fn write_agent_login_details(
     output: &mut impl Write,
     details: &std::collections::BTreeMap<String, String>,

@@ -1,9 +1,9 @@
 //! `um auth credential`: the member's provider grants and agent logins, each with its
-//! availability and next action (REQ-AGENTLOGIN-45). The group holds no state of its own: it
-//! reads the grant and agent-login lists and maps what Cloud returns through `projection`.
+//! availability and next action (REQ-GRANT-55). The group holds no state of its own: it
+//! reads the grant and agent-login lists and maps what Cloud returns through the projection
+//! `um grant list` shares.
 
 mod output;
-pub(super) mod projection;
 mod status;
 
 use clap::{Args, Subcommand};

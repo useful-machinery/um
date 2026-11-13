@@ -14,7 +14,8 @@ use um_support::{CredentialStatus, NextAction};
 use super::super::{CommandFailure, CommandResult, JsonArgs, RunnerJson};
 
 pub(super) const ABOUT: &str = "Set up agent logins on the live runner";
-const COMMAND_PATH: &[&str] = &["runner", "agent-login"];
+pub(super) const GRANT_ABOUT: &str = "Set up grants on the live runner";
+pub(super) const GRANT_SYNC_ABOUT: &str = "Ask Runner Serve to set up grants now";
 
 #[derive(Debug, Args)]
 pub(super) struct Command {
@@ -39,9 +40,12 @@ struct SyncCommand {
 }
 
 impl Command {
-    pub(super) fn execute(self) -> CommandResult {
+    /// Runs the family under `path`, the spelling the invocation used:
+    /// `runner grant` or its earlier, hidden spelling (REQ-GRANT-41,
+    /// REQ-GRANT-77).
+    pub(super) fn execute(self, path: &[&str]) -> CommandResult {
         match self.command {
-            None => super::super::print_help(COMMAND_PATH),
+            None => super::super::print_help(path),
             Some(AgentLoginCommand::Sync(command)) => command.execute(),
         }
     }
@@ -56,7 +60,7 @@ struct SyncOutput<'a> {
 }
 
 /// The readiness the control socket returned, each provider with its
-/// availability and next action (REQ-AGENTLOGIN-43); the control socket
+/// availability and next action (REQ-GRANT-53); the control socket
 /// carries only the facts.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -90,7 +94,7 @@ impl<'a> ReadinessView<'a> {
 }
 
 impl SyncCommand {
-    // REQ-AGENTLOGIN-31: the live runner runs the setup pass; this command
+    // REQ-GRANT-41: the live runner runs the setup pass; this command
     // contacts no Cloud deployment itself.
     fn execute(self) -> CommandResult {
         let config_path = super::operator_config_path(&self.config)?;
@@ -171,7 +175,7 @@ fn control_failure(error: ControlError) -> CommandFailure {
 
 /// Writes one line per provider: its readiness state, for a login the runner
 /// installed the generation, and its availability with the next action and
-/// the step it names (REQ-AGENTLOGIN-43).
+/// the step it names (REQ-GRANT-53).
 pub(super) fn write_readiness(
     output: &mut impl Write,
     readiness: &AgentLoginReadiness,
@@ -184,7 +188,11 @@ pub(super) fn write_readiness(
             .map(|generation| format!(" (generation {generation})"))
             .unwrap_or_default();
         let status = entry.credential_status();
-        let step = runner_step(status, entry.agent_login_id.as_deref());
+        let login = Login {
+            provider: &super::status::enum_json(entry.provider)?,
+            id: entry.agent_login_id.as_deref(),
+        };
+        let step = runner_step(status, Some(login));
         writeln!(
             output,
             "{label:<19}{state}{generation}, {}",
@@ -194,27 +202,33 @@ pub(super) fn write_readiness(
     Ok(())
 }
 
-/// The command or step a runner's next action names. Reconnecting a login
+/// The login a runner's next action is about: its provider, and the agent
+/// login the runner holds for it when the runner names one.
+pub(super) struct Login<'a> {
+    pub(super) provider: &'a str,
+    pub(super) id: Option<&'a str>,
+}
+
+/// The command or step a runner's next action names, each command a
+/// `um grant` or `um runner grant` one (REQ-GRANT-77). Reconnecting a login
 /// and restoring its owner's membership are the agent login's owner's to do,
 /// not the runner operator's, so those name the agent login.
-pub(super) fn runner_step(
-    status: CredentialStatus,
-    agent_login_id: Option<&str>,
-) -> Option<String> {
-    let agent_login = agent_login_id.map_or_else(
+pub(super) fn runner_step(status: CredentialStatus, login: Option<Login<'_>>) -> Option<String> {
+    let id = login.as_ref().and_then(|login| login.id);
+    let agent_login = id.map_or_else(
         || "the agent login".to_owned(),
         |id| format!("agent login {id}"),
     );
     match status.next_action {
         NextAction::Reconnect => Some(format!(
-            "the owner of {agent_login} stores a new sign-in with `um auth agent-login reconnect {}`; only they can",
-            agent_login_id.unwrap_or("AGENT_LOGIN")
+            "the owner of {agent_login} stores a new sign-in with `um grant create {} --replace`; only they can",
+            login.as_ref().map_or("PROVIDER", |login| login.provider)
         )),
         NextAction::RestoreMembership => Some(format!(
             "the owner of {agent_login} must be an active member of the organization again; it is theirs to settle, not the runner's"
         )),
         NextAction::SyncRunner => {
-            Some("set agent logins up again with `um runner agent-login sync`".to_owned())
+            Some("set grants up again with `um runner grant sync --config PATH`".to_owned())
         }
         NextAction::CheckTarget => Some(
             "the deployment does not serve this provider for the runner's operating system"

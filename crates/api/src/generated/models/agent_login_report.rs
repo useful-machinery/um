@@ -15,7 +15,7 @@
 use crate::generated::models;
 use serde::{Deserialize, Serialize};
 
-/// AgentLoginReport : The state the authorization's runner last reported (REQ-AGENTLOGIN-17); omitted until the runner first reports.
+/// AgentLoginReport : The state the authorization's runner last reported (REQ-GRANT-27); omitted until the runner first reports.
 #[derive(Clone, Default, Debug, PartialEq, Serialize, Deserialize)]
 pub struct AgentLoginReport {
     /// The runner's readiness for the agent login's provider.
@@ -33,7 +33,7 @@ pub struct AgentLoginReport {
 }
 
 impl AgentLoginReport {
-    /// The state the authorization's runner last reported (REQ-AGENTLOGIN-17); omitted until the runner first reports.
+    /// The state the authorization's runner last reported (REQ-GRANT-27); omitted until the runner first reports.
     pub fn new(state: State, reported_at: String) -> AgentLoginReport {
         AgentLoginReport {
             state,

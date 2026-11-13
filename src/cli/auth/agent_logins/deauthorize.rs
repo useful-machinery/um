@@ -5,7 +5,9 @@ use crate::exit_code::ExitCode;
 use um_api::AgentLoginFailure;
 use um_human_auth::Deployment;
 
-use super::{Confirmation, Options, RunnerTarget, Stated, output, run_leaf};
+use crate::cli::grant::confirmation::NATIVE_DEAUTHORIZE;
+
+use super::{Confirmation, Options, RunnerTarget, Stated, Statement, output, run_leaf};
 
 pub(super) const ABOUT: &str = "End a runner's authorization for one of your coding agent logins";
 
@@ -21,11 +23,11 @@ pub(super) struct Command {
     options: Options,
 }
 
-/// The stop Cloud requests of the runner's run (REQ-AGENTLOGIN-38).
+/// The stop Cloud requests of the runner's run (REQ-GRANT-48).
 impl Stated for Command {
-    const NAME: &'static str = "deauthorize";
-    const STATEMENT: &'static [&'static str] =
-        &["the run the runner is serving will be asked to stop, whichever member started it"];
+    const COMMAND: &'static str = "um grant deauthorize";
+    type Usage = crate::cli::grant::deauthorize::Command;
+    const STATEMENT: Statement = Statement::Fixed(NATIVE_DEAUTHORIZE);
     const ACTION: &'static str = "to end the runner's authorization";
 }
 
@@ -35,16 +37,19 @@ impl Command {
             agent_login_id,
             runner_id,
         } = &self.target;
-        super::state::<Self>(format_args!(
-            "Ending runner {runner_id}'s authorization for agent login {agent_login_id}:"
-        ))?;
+        super::state(
+            format_args!(
+                "Ending runner {runner_id}'s authorization for agent login {agent_login_id}:"
+            ),
+            NATIVE_DEAUTHORIZE,
+        )?;
         let key = um_support::generate_idempotency_key()
             .context("generate agent login deauthorization request key")?;
         run_leaf(
             deployment,
             &self.options,
             |api| {
-                // The agent login lists only its authorizations in force (REQ-AGENTLOGIN-3).
+                // The agent login lists only its authorizations in force (REQ-GRANT-13).
                 let authorization_id = api
                     .get(agent_login_id)?
                     .authorizations

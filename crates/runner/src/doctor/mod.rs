@@ -17,6 +17,7 @@ use codex::CodexCheck;
 use git::GitCheck;
 use pi::PiCheck;
 
+pub use git::{RepositoryRootError, repository_root};
 pub use workflow_credentials::{
     CredentialKind, CredentialOrigin, CredentialRequirement, CredentialSummary, Declaration,
     DeclarationKind, Node, NodeKind, OriginDeclaration, ReadinessCode, RepositorySource,
@@ -716,7 +717,7 @@ mod tests {
         }
     }
 
-    // REQ-RUNNERENROLL-86, REQ-AGENTLOGIN-41
+    // REQ-RUNNERENROLL-86, REQ-GRANT-51
     #[test]
     fn agent_logins_check_fails_a_selected_provider_cloud_refuses() {
         let host = AgentLoginHost::new();
@@ -765,7 +766,7 @@ mod tests {
         }
     }
 
-    // REQ-RUNNERENROLL-86, REQ-AGENTLOGIN-43
+    // REQ-RUNNERENROLL-86, REQ-GRANT-53
     #[test]
     fn agent_logins_check_names_every_providers_availability_and_next_action() {
         for (record, availability, next_action) in [

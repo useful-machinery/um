@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use anyhow::{Context, anyhow, bail};
 use clap::{Args, ValueEnum};
@@ -11,25 +11,12 @@ use um_api::{
 };
 use um_human_auth::Deployment;
 
-use super::super::super::secret_file::{FileMode, SecretInput, trim_line_ending};
+use super::super::super::grant::material::{read_claude_code_token, read_codex_login};
+use super::super::super::secret_file::FileMode;
 use super::super::super::{CommandFailure, CommandResult, OrganizationArg};
 use super::{Options, codex_login, output, run_leaf, with_api};
 
 pub(super) const ABOUT: &str = "Import a coding agent login";
-
-// The bounds Cloud enforces on material (REQ-AGENTLOGIN-2).
-const CODEX_LOGIN: SecretInput = SecretInput {
-    name: "Codex login",
-    max_bytes: 32 * 1024,
-    max_text: "32 KiB",
-};
-const MAX_CLAUDE_CODE_TOKEN: usize = 4096;
-const CLAUDE_CODE_TOKEN: SecretInput = SecretInput {
-    name: "Claude Code token",
-    // One trailing LF or CRLF is trimmed after reading.
-    max_bytes: MAX_CLAUDE_CODE_TOKEN as u64 + 2,
-    max_text: "4 KiB",
-};
 
 /// The coding agent a login signs in, spelled as a workflow's harness kind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -149,7 +136,7 @@ impl Command {
     }
 
     /// Establishes the human session and, with `--agent-login`, checks the agent login it
-    /// names (REQ-AGENTLOGIN-24), returning the exit status of a reported refusal.
+    /// names (REQ-GRANT-34), returning the exit status of a reported refusal.
     fn check_session_and_target(
         &self,
         deployment: &Deployment,
@@ -176,7 +163,7 @@ impl Command {
 
     /// Reads the agent login `--agent-login` names and states how it contradicts the
     /// PROVIDER and ORGANIZATION arguments, if it does, so that no material is sent to a
-    /// login of another provider or organization (REQ-AGENTLOGIN-22). An organization slug is
+    /// login of another provider or organization (REQ-GRANT-32). An organization slug is
     /// resolved only when the provider agrees.
     fn contradiction(
         &self,
@@ -211,8 +198,8 @@ impl Command {
 }
 
 impl Source {
-    /// Takes the sign-in `provider` accepts from this source (REQ-AGENTLOGIN-22 to
-    /// REQ-AGENTLOGIN-24): reads the file or stream before `check`, refusing with exit 2 a source
+    /// Takes the sign-in `provider` accepts from this source (REQ-GRANT-32 to
+    /// REQ-GRANT-34): reads the file or stream before `check`, refusing with exit 2 a source
     /// the provider does not take and an unsafe or malformed one, or, for `--login`, runs
     /// `codex login` after it, so that a refused session or target leaves no provider session
     /// behind. Returns the exit status `check` or a failed sign-in reported in place of the
@@ -228,7 +215,7 @@ impl Source {
             if let Some(refused) = check()? {
                 return Ok(Err(refused));
             }
-            return match codex_login::sign_in(read_codex_login)? {
+            return match codex_login::sign_in(codex_login::BROWSER, read_codex_login)? {
                 Ok(material) => Ok(Ok(material)),
                 Err(failure) => output::provider_login_failed(
                     deployment.fingerprint().api_url(),
@@ -264,7 +251,7 @@ impl Source {
 }
 
 /// Reads the agent login a new generation is stored for. A revoked agent login takes no
-/// generation (REQ-AGENTLOGIN-6), so it is reported as Cloud would report the replacement,
+/// generation (REQ-GRANT-16), so it is reported as Cloud would report the replacement,
 /// before anything is signed in to or sent.
 pub(super) fn replaceable(
     api: &AgentLoginApi,
@@ -296,33 +283,4 @@ pub(super) fn store(
         write,
     )
     .map_err(Into::into)
-}
-
-/// Reads a Codex `auth.json` to send byte for byte. Only its shape is checked: one JSON
-/// object, as Cloud requires; its fields are never read. `mode` is checked for a file the
-/// member names, not for one `codex login` wrote in the command's private home.
-fn read_codex_login(path: &Path, mode: FileMode) -> anyhow::Result<Zeroizing<Vec<u8>>> {
-    let bytes = CODEX_LOGIN.read_with(path, mode)?;
-    let object = bytes.iter().find(|byte| !byte.is_ascii_whitespace()) == Some(&b'{');
-    // The parser's error can quote the input, so only the fact of failure is kept.
-    if !object || serde_json::from_slice::<serde::de::IgnoredAny>(&bytes).is_err() {
-        bail!("Codex login must be the JSON object of a Codex auth.json");
-    }
-    Ok(bytes)
-}
-
-/// Reads the token `claude setup-token` printed: one line of printable characters without
-/// spaces.
-fn read_claude_code_token(path: &Path) -> anyhow::Result<Zeroizing<Vec<u8>>> {
-    let mut bytes = CLAUDE_CODE_TOKEN.read(path)?;
-    trim_line_ending(&mut bytes);
-    if bytes.is_empty()
-        || bytes.len() > MAX_CLAUDE_CODE_TOKEN
-        || !bytes.iter().all(|byte| (b'!'..=b'~').contains(byte))
-    {
-        bail!(
-            "Claude Code token must be one line of 1 to 4096 printable characters without spaces"
-        );
-    }
-    Ok(bytes)
 }

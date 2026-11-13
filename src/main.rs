@@ -32,6 +32,9 @@ fn main() -> ExitCode {
             ExitCode::GeneralFailure
         };
     }
+    if cli::grant::controlling_terminal::requested() {
+        return cli::grant::controlling_terminal::run();
+    }
 
     match cli::parse(env::args_os()) {
         Ok(command) => match command.execute() {

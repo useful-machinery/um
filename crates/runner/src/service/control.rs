@@ -105,7 +105,7 @@ fn publish(
 }
 
 /// The agent-login setup an admission makes for itself before its
-/// assignment is offered the runner's logins (REQ-AGENTLOGIN-39), publishing
+/// assignment is offered the runner's logins (REQ-GRANT-49), publishing
 /// what it records in the live status as every pass does. The assignment
 /// manager holds it, and the setup's own gate holds the manager, so it holds
 /// the setup weakly: a setup that is gone makes no pass.
@@ -138,7 +138,7 @@ impl AdmissionAgentLogins {
 
     /// The observer of the logins `offered` added to the admission's
     /// environment, which notes each use for the next pass
-    /// (REQ-AGENTLOGIN-42); `None` when it was offered none or the setup
+    /// (REQ-GRANT-52); `None` when it was offered none or the setup
     /// is gone.
     pub(super) fn observer(
         &self,
@@ -692,7 +692,7 @@ mod tests {
     const SYNC_REQUEST: &[u8] = b"{\"schemaVersion\":1,\"operation\":\"sync_agent_logins\"}\n";
     const STATUS_REQUEST: &[u8] = b"{\"schemaVersion\":1,\"operation\":\"status\"}\n";
 
-    // REQ-AGENTLOGIN-31, REQ-RUNNERENROLL-42, REQ-RUNNERENROLL-63
+    // REQ-GRANT-41, REQ-RUNNERENROLL-42, REQ-RUNNERENROLL-63
     #[tokio::test]
     async fn sync_runs_a_pass_and_answers_its_readiness_without_a_path() {
         let root = tempfile::tempdir().unwrap();
@@ -770,7 +770,7 @@ mod tests {
         }
     }
 
-    // REQ-AGENTLOGIN-31, REQ-RUNNERENROLL-82
+    // REQ-GRANT-41, REQ-RUNNERENROLL-82
     #[tokio::test]
     async fn sync_while_an_assignment_is_held_answers_runner_busy_without_asking() {
         let root = tempfile::tempdir().unwrap();
@@ -795,7 +795,7 @@ mod tests {
         assert_eq!(status.agent_logins, None);
     }
 
-    // REQ-AGENTLOGIN-31, REQ-RUNNERENROLL-42
+    // REQ-GRANT-41, REQ-RUNNERENROLL-42
     #[tokio::test]
     async fn a_sync_an_assignment_interrupts_answers_runner_busy_and_status_shows_what_it_recorded()
     {
@@ -842,7 +842,7 @@ mod tests {
         assert_eq!(codex.state, AgentLoginState::Ready);
     }
 
-    // REQ-AGENTLOGIN-31, REQ-AGENTLOGIN-39
+    // REQ-GRANT-41, REQ-GRANT-49
     #[tokio::test]
     async fn sync_while_an_admitted_assignment_is_held_answers_runner_busy() {
         let root = tempfile::tempdir().unwrap();

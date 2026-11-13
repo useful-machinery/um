@@ -50,6 +50,8 @@ mod delegation;
 mod github;
 #[path = "cli/gitlab.rs"]
 mod gitlab;
+#[path = "cli/grant.rs"]
+mod grant;
 #[path = "cli/grants.rs"]
 mod grants;
 #[path = "cli/identities.rs"]
@@ -2279,7 +2281,7 @@ fn record_codex_readiness(directory: &tempfile::TempDir, state: &str) {
     fs::set_permissions(&path, Permissions::from_mode(0o600)).expect("protect readiness document");
 }
 
-// REQ-RUNNERENROLL-86, REQ-AGENTLOGIN-43
+// REQ-RUNNERENROLL-86, REQ-GRANT-53
 #[test]
 fn runner_doctor_agent_logins_check_reads_the_recorded_readiness() {
     let runner_directory = private_credential_directory();
@@ -2303,7 +2305,7 @@ fn runner_doctor_agent_logins_check_reads_the_recorded_readiness() {
     assert_eq!(failed.status.code(), Some(1));
     let stdout = String::from_utf8_lossy(&failed.stdout);
     assert!(stdout.contains("code: foreign_login"), "{stdout}");
-    // Each provider's availability and next action (REQ-AGENTLOGIN-43).
+    // Each provider's availability and next action (REQ-GRANT-53).
     let codex = stdout
         .lines()
         .find(|line| line.trim_start().starts_with("codex login:"))

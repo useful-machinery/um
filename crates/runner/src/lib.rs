@@ -31,9 +31,9 @@ pub use control_protocol::{
 pub use doctor::{
     CheckDescriptor, CheckResult, CredentialKind, CredentialOrigin, CredentialRequirement,
     CredentialSummary, Declaration, DeclarationKind, Node, NodeKind, OriginDeclaration, Outcome,
-    ReadinessCode, Registry, RegistryError, Report, RepositorySource, SelectionError, Status,
-    Summary, UnknownCredential, UnknownDeclaration, WorkflowCredentials, built_in_registry,
-    read_workflow_credentials,
+    ReadinessCode, Registry, RegistryError, Report, RepositoryRootError, RepositorySource,
+    SelectionError, Status, Summary, UnknownCredential, UnknownDeclaration, WorkflowCredentials,
+    built_in_registry, read_workflow_credentials, repository_root,
 };
 pub use enrollment::{
     ActivationArtifact, ActivationArtifactParts, EnrollmentError, EnrollmentOutcome,

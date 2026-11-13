@@ -6,7 +6,6 @@
 //! untrusted text.
 use std::fmt;
 
-use base64::Engine as _;
 use reqwest::StatusCode;
 use zeroize::{Zeroize as _, Zeroizing};
 
@@ -14,8 +13,8 @@ use super::generated::{apis, models};
 use super::http_client::zeroize_generated_bearer_access_token;
 use super::resource::{
     ProblemFailure, ProblemRow, ResourceFailure, classify_problem_error, confirmed_delete,
-    expect_problem_status, mutation_request, receive_raw, resource_configuration,
-    validate_json_media_type, validate_mutation_key,
+    encode_material, expect_problem_status, mutation_request, organization_id, receive_raw,
+    resource_configuration, serialize_body, validate_json_media_type, validate_mutation_key,
 };
 use super::{HttpTransportPolicy, UnreachableCategory, problem};
 
@@ -35,7 +34,7 @@ type AgentLoginReportLastUse = models::agent_login_report::LastUse;
 type AgentLoginStop = models::AgentLoginStop;
 
 impl AgentLoginRemovalState {
-    /// The removal state's wire name (REQ-AGENTLOGIN-37).
+    /// The removal state's wire name (REQ-GRANT-47).
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::AgentLoginRemovalStateNotDelivered => "not_delivered",
@@ -46,7 +45,7 @@ impl AgentLoginRemovalState {
 }
 
 impl AgentLoginReportLastUse {
-    /// The last use's wire name (REQ-AGENTLOGIN-17).
+    /// The last use's wire name (REQ-GRANT-27).
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::AgentLoginReportLastUseAccepted => "accepted",
@@ -55,8 +54,7 @@ impl AgentLoginReportLastUse {
     }
 }
 
-/// The schema version of both providers' material form (REQ-AGENTLOGIN-2).
-pub const AGENT_LOGIN_RECORD_SCHEMA_VERSION: i32 = 1;
+pub use super::resource::RECORD_SCHEMA_VERSION as AGENT_LOGIN_RECORD_SCHEMA_VERSION;
 
 const AGENT_LOGIN_NOT_FOUND: &str =
     "https://api.usefulmachinery.com/problems/agent-login-not-found";
@@ -275,6 +273,10 @@ impl AgentLoginApi {
         limit: Option<i32>,
         cursor: Option<&str>,
     ) -> Result<AgentLoginList, AgentLoginFailure> {
+        #[allow(
+            deprecated,
+            reason = "the earlier `um auth agent-login` commands keep this route for one release"
+        )]
         let page = apis::principals_api::list_agent_logins(&self.configuration, limit, cursor)
             .map_err(|error| classify_error(Operation::Other, error))?;
         if !page.items.iter().all(valid_agent_login) {
@@ -284,6 +286,10 @@ impl AgentLoginApi {
     }
 
     pub fn get(&self, agent_login_id: &str) -> Result<AgentLogin, AgentLoginFailure> {
+        #[allow(
+            deprecated,
+            reason = "the earlier `um auth agent-login` commands keep this route for one release"
+        )]
         let login = apis::principals_api::get_agent_login(&self.configuration, agent_login_id)
             .map_err(|error| classify_error(Operation::Other, error))?;
         if login.id != agent_login_id || !valid_agent_login(&login) {
@@ -294,15 +300,14 @@ impl AgentLoginApi {
 
     /// The ID of the organization an exact slug names, among the member's organizations.
     pub fn organization_id(&self, slug: &str) -> Result<String, AgentLoginFailure> {
-        let organization = apis::organizations_api::get_organization(&self.configuration, slug)
-            .map_err(|error| classify_error(Operation::NamesOrganization, error))?;
-        if organization.slug != slug || !um_support::valid_typed_id(&organization.id, "org_") {
-            return Err(invalid());
-        }
-        Ok(organization.id)
+        organization_id(
+            &self.configuration,
+            slug,
+            Operation::NamesOrganization.problems(),
+        )
     }
 
-    /// Stores a new agent login at generation 1 (REQ-AGENTLOGIN-1).
+    /// Stores a new agent login at generation 1 (REQ-GRANT-11).
     pub fn import(
         &self,
         login: &AgentLoginImport<'_>,
@@ -334,7 +339,7 @@ impl AgentLoginApi {
         Ok(created)
     }
 
-    /// Stores new material as the agent login's next generation (REQ-AGENTLOGIN-6).
+    /// Stores new material as the agent login's next generation (REQ-GRANT-16).
     pub fn replace(
         &self,
         agent_login_id: &str,
@@ -362,12 +367,12 @@ impl AgentLoginApi {
         Ok(replaced)
     }
 
-    /// Revokes the agent login (REQ-AGENTLOGIN-7).
+    /// Revokes the agent login (REQ-GRANT-17).
     pub fn revoke(&self, agent_login_id: &str, key: &str) -> Result<(), AgentLoginFailure> {
         self.send_empty(&self.endpoint(&[agent_login_id]), key)
     }
 
-    /// Authorizes one runner to receive the agent login (REQ-AGENTLOGIN-8).
+    /// Authorizes one runner to receive the agent login (REQ-GRANT-18).
     pub fn authorize(
         &self,
         agent_login_id: &str,
@@ -391,7 +396,7 @@ impl AgentLoginApi {
         Ok(authorization)
     }
 
-    /// Ends one authorization of the agent login (REQ-AGENTLOGIN-9).
+    /// Ends one authorization of the agent login (REQ-GRANT-19).
     pub fn deauthorize(
         &self,
         agent_login_id: &str,
@@ -442,20 +447,6 @@ impl Drop for AgentLoginApi {
     }
 }
 
-fn encode_material(material: &[u8]) -> Zeroizing<String> {
-    let mut encoded = Zeroizing::new(String::new());
-    base64::engine::general_purpose::STANDARD.encode_string(material, &mut encoded);
-    encoded
-}
-
-fn serialize_body(value: &impl serde::Serialize) -> Result<Zeroizing<Vec<u8>>, AgentLoginFailure> {
-    // Serializing a generated model of strings and integers cannot fail; a failure is still
-    // reported rather than sent.
-    serde_json::to_vec(value)
-        .map(Zeroizing::new)
-        .map_err(|_| invalid())
-}
-
 fn valid_agent_login(value: &AgentLogin) -> bool {
     um_support::valid_typed_id(&value.id, "agl_")
         && um_support::valid_typed_id(&value.organization_id, "org_")
@@ -478,6 +469,7 @@ fn valid_agent_login(value: &AgentLogin) -> bool {
 
 fn valid_authorization(value: &AgentLoginAuthorization) -> bool {
     valid_authorization_record(
+        "aga_",
         &value.id,
         &value.runner_id,
         &value.created_at,
@@ -486,8 +478,11 @@ fn valid_authorization(value: &AgentLoginAuthorization) -> bool {
     )
 }
 
-fn valid_ended_authorization(value: &AgentLoginEndedAuthorization) -> bool {
+/// An ended authorization of an agent login, the native grant it is (REQ-GRANT-13), whose
+/// removal and stop are well formed.
+pub(crate) fn valid_ended_authorization(value: &AgentLoginEndedAuthorization) -> bool {
     valid_authorization_record(
+        "aga_",
         &value.id,
         &value.runner_id,
         &value.created_at,
@@ -499,21 +494,24 @@ fn valid_ended_authorization(value: &AgentLoginEndedAuthorization) -> bool {
 }
 
 // A stop names the run asked to stop and the cancellation request made of it
-// (REQ-AGENTLOGIN-38).
+// (REQ-GRANT-48).
 fn valid_stop(value: &AgentLoginStop) -> bool {
     um_support::valid_typed_id(&value.run_id, "run_")
         && um_support::valid_typed_id(&value.cancellation_request_id, "cmd_")
         && !value.requested_at.is_empty()
 }
 
-fn valid_authorization_record(
+/// An authorization whose ID has `prefix`, which names its runner and creation time and whose
+/// exchange with the runner, delivery and report, is well formed.
+pub(crate) fn valid_authorization_record(
+    prefix: &str,
     id: &str,
     runner_id: &str,
     created_at: &str,
     delivery: Option<&models::AgentLoginDelivery>,
     report: Option<&AgentLoginReport>,
 ) -> bool {
-    um_support::valid_typed_id(id, "aga_")
+    um_support::valid_typed_id(id, prefix)
         && um_support::valid_typed_id(runner_id, "rnr_")
         && !created_at.is_empty()
         && delivery
@@ -563,7 +561,7 @@ mod tests {
     use super::*;
     use crate::resource::{classify_problem, problem_fixture};
 
-    // REQ-AGENTLOGIN-21
+    // REQ-GRANT-31
     #[test]
     fn each_refusal_maps_to_one_outcome_and_a_generic_not_found_only_for_an_organization() {
         use AgentLoginFailure as F;
@@ -686,8 +684,8 @@ mod tests {
         })
     }
 
-    // REQ-AGENTLOGIN-3
-    // REQ-AGENTLOGIN-37
+    // REQ-GRANT-13
+    // REQ-GRANT-47
     #[test]
     fn an_ended_authorization_is_checked_and_a_removal_time_comes_only_with_confirmed() {
         const RUNNER: &str = "rnr_01k0z6r1w8f4jy2m7q9v3x5abc";
@@ -731,8 +729,8 @@ mod tests {
         }
     }
 
-    // REQ-AGENTLOGIN-3
-    // REQ-AGENTLOGIN-38
+    // REQ-GRANT-13
+    // REQ-GRANT-48
     #[test]
     fn an_ended_authorizations_stop_names_a_run_and_a_cancellation_request() {
         const RUN: &str = "run_01k0z6r1w8f4jy2m7q9v3x5abc";

@@ -15,7 +15,7 @@
 use crate::generated::models;
 use serde::{Deserialize, Serialize};
 
-/// AgentLogin : A member's agent login for one organization; it never carries the material (REQ-AGENTLOGIN-4).
+/// AgentLogin : A member's agent login for one organization; it never carries the material (REQ-GRANT-14).
 #[derive(Clone, Default, Debug, PartialEq, Serialize, Deserialize)]
 pub struct AgentLogin {
     /// The agent login's opaque, stable identifier.
@@ -54,7 +54,7 @@ pub struct AgentLogin {
     /// The runners the agent login is authorized for, in force, oldest first.
     #[serde(rename = "authorizations")]
     pub authorizations: Vec<models::AgentLoginAuthorization>,
-    /// For each runner that has no authorization of the agent login in force, the authorization that ended last, in the order they ended (REQ-AGENTLOGIN-3). The server always sends it, empty when there is none.
+    /// For each runner that has no authorization of the agent login in force, the authorization that ended last, in the order they ended (REQ-GRANT-13). The server always sends it, empty when there is none.
     #[serde(
         rename = "endedAuthorizations",
         skip_serializing_if = "Option::is_none"
@@ -63,7 +63,7 @@ pub struct AgentLogin {
 }
 
 impl AgentLogin {
-    /// A member's agent login for one organization; it never carries the material (REQ-AGENTLOGIN-4).
+    /// A member's agent login for one organization; it never carries the material (REQ-GRANT-14).
     pub fn new(
         id: String,
         organization_id: String,

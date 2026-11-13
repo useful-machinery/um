@@ -1,14 +1,14 @@
-//! One agent-login setup pass of the serving runner (REQ-AGENTLOGIN-29,
-//! REQ-AGENTLOGIN-30): ask Cloud which agent logins the runner is authorized
+//! One agent-login setup pass of the serving runner (REQ-GRANT-39,
+//! REQ-GRANT-40): ask Cloud which agent logins the runner is authorized
 //! for, install what is new, remove what has ended, and record each
 //! provider's readiness. Nothing is installed or removed once an assignment
 //! has been offered its logins (INV-RUNNER-15), and a pass that changes a provider's
 //! readiness, or cannot record it, writes one `runner.agent_login_setup`
 //! record (REQ-TELEMETRY-45). Each admission makes a pass of its own before
-//! the assignment is offered anything (REQ-AGENTLOGIN-39). How the provider
+//! the assignment is offered anything (REQ-GRANT-49). How the provider
 //! answered each use of an offered login is noted in memory while the
 //! assignment runs and folded into the readiness by the next pass
-//! (REQ-AGENTLOGIN-42).
+//! (REQ-GRANT-52).
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -43,12 +43,12 @@ use crate::telemetry::{self, Outcome, Recorder, attribute};
 /// The record a pass writes when it changes a provider's readiness or fails.
 pub(crate) const SETUP_EVENT: &str = "runner.agent_login_setup";
 
-/// How long `sync_agent_logins` waits for its pass (REQ-AGENTLOGIN-31). A
+/// How long `sync_agent_logins` waits for its pass (REQ-GRANT-41). A
 /// pass makes at most a status request, one delivery per installable
 /// provider and a closing status request, each bounded by the request
 /// timeout, and a sync may first wait for one pass already running. A pass
 /// whose closing answer ends a login it installed reports once more
-/// (REQ-AGENTLOGIN-40), a request this bound does not count.
+/// (REQ-GRANT-50), a request this bound does not count.
 pub(crate) const SYNC_BOUND: Duration = Duration::from_secs(
     runner_http::REQUEST_TIMEOUT.as_secs() * (2 + AgentLoginProvider::INSTALLABLE.len() as u64) * 2,
 );
@@ -86,7 +86,7 @@ pub(crate) trait AssignmentGate: Send + Sync {
 /// The gate of the pass an admission makes for itself: the assignment it is
 /// admitting holds the runner's one slot and has been offered nothing yet,
 /// so each install and removal runs at once, without consulting the
-/// assignment manager (REQ-AGENTLOGIN-39, INV-RUNNER-15).
+/// assignment manager (REQ-GRANT-49, INV-RUNNER-15).
 struct Admitting;
 
 impl AssignmentGate for Admitting {
@@ -195,7 +195,7 @@ impl AgentLoginSetup {
     /// logins `offered` added to its environment: each use the engine tells
     /// it of is noted for the agent login and generation offered under that
     /// variable, and one for any other variable is ignored
-    /// (REQ-AGENTLOGIN-42). `None` when the admission was offered none. It
+    /// (REQ-GRANT-52). `None` when the admission was offered none. It
     /// writes nothing: the next pass folds what it noted in.
     pub(crate) fn observer(
         &self,
@@ -255,13 +255,13 @@ impl AgentLoginSetup {
 
     /// Sets agent logins up for an assignment the runner is admitting, on
     /// the admission's own blocking task and before the assignment is offered
-    /// them (REQ-AGENTLOGIN-39): waits for a pass already running, then makes
+    /// them (REQ-GRANT-49): waits for a pass already running, then makes
     /// one whose installs and removals run at once, for the assignment holds
     /// the slot and has been offered nothing. It makes none, and asks Cloud
     /// nothing, unless the readiness document names an installable provider's
     /// login as installed, as authorized without being ready, or as selected:
     /// a selected provider that holds none is withheld from the assignment
-    /// (REQ-AGENTLOGIN-41), so the admission asks whether Cloud authorizes it
+    /// (REQ-GRANT-51), so the admission asks whether Cloud authorizes it
     /// again. A document it cannot read names none. `None` when it made no
     /// pass; a pass never answers `Busy`.
     pub(crate) fn run_admission_pass(&self) -> Option<SetupOutcome> {
@@ -307,7 +307,7 @@ impl AgentLoginSetup {
         let recorded =
             |provider: AgentLoginProvider| previous.and_then(|document| document.login(provider));
         // The uses noted so far, which this pass folds into the entry of
-        // the install each was noted for (REQ-AGENTLOGIN-42).
+        // the install each was noted for (REQ-GRANT-52).
         let noted = self.uses.noted();
         let with_last_use = |mut login: LoginReadiness| {
             login.last_use = last_use(&login, recorded(login.provider), &noted);
@@ -339,7 +339,7 @@ impl AgentLoginSetup {
             let entry = recorded(provider);
             // Unable to ask, the runner keeps what it last knew of a provider
             // Cloud did not authorize and the runner holds nothing of, or
-            // that it has never recorded (REQ-AGENTLOGIN-28).
+            // that it has never recorded (REQ-GRANT-38).
             if answer.is_err() && !entry.is_some_and(authorized_or_installed) {
                 settled.extend(entry.cloned());
                 continue;
@@ -373,7 +373,7 @@ impl AgentLoginSetup {
                         // keeps the provider's login elsewhere: the install
                         // the record names ends, and is recorded as ended,
                         // before anything else is asked for
-                        // (REQ-AGENTLOGIN-30, INV-RUNNER-15).
+                        // (REQ-GRANT-40, INV-RUNNER-15).
                         Some(installation) => match self.end(
                             gate,
                             provider,
@@ -457,7 +457,7 @@ impl AgentLoginSetup {
         self.uses.forget(&noted);
         // The status request carried what the previous pass recorded, so a
         // pass that changed it tells Cloud in the same pass, rather than
-        // the next (REQ-AGENTLOGIN-17); not once an assignment has started,
+        // the next (REQ-GRANT-27); not once an assignment has started,
         // nor when Cloud did not answer, which leaves nothing new to report.
         // A failure changes nothing recorded: it is named only beside each
         // changed provider's state in the pass's record, unless the
@@ -471,7 +471,7 @@ impl AgentLoginSetup {
                 // longer authorizes, once, and the removal is recorded and
                 // reported; the answer to that report, and everything else
                 // in this one, is the next pass's to act on
-                // (REQ-AGENTLOGIN-40).
+                // (REQ-GRANT-50).
                 Ok(closing) => {
                     match self.end_unauthorized(
                         gate,
@@ -532,7 +532,7 @@ impl AgentLoginSetup {
     /// Ends each login this pass installed, as `document` records it against
     /// `previous`, that Cloud's closing answer `closing` no longer authorizes:
     /// Cloud answers `revoked` or `unauthorized`, names another agent login
-    /// or no longer names the provider (REQ-AGENTLOGIN-40). It changes the
+    /// or no longer names the provider (REQ-GRANT-50). It changes the
     /// provider's entry in `document` and asks for no delivery. Answers
     /// whether it ended one, or `None` when an assignment started before a
     /// removal it needed.
@@ -604,7 +604,7 @@ impl AgentLoginSetup {
 
     /// What the runner tells Cloud it can install, has installed and last
     /// recorded for each installable provider, with the last use of a
-    /// `ready` install (REQ-AGENTLOGIN-42).
+    /// `ready` install (REQ-GRANT-52).
     fn status_request(&self, previous: Option<&ReadinessDocument>) -> StatusRequest {
         StatusRequest {
             os: self.dependencies.os,
@@ -699,8 +699,8 @@ impl AgentLoginSetup {
         };
         // While the service has a login of its own the runner keeps and
         // asks for none: a kept token would outrank the service's Claude
-        // Code login (REQ-AGENTLOGIN-35), and the service's `CODEX_HOME` is
-        // never replaced (REQ-AGENTLOGIN-27).
+        // Code login (REQ-GRANT-45), and the service's `CODEX_HOME` is
+        // never replaced (REQ-GRANT-37).
         if self.foreign_login(provider) {
             return self.end(
                 gate,
@@ -809,7 +809,7 @@ impl AgentLoginSetup {
     /// there it would be offered to every later assignment), and the
     /// recorded install's file when it is elsewhere in that directory, and
     /// records `state`. For Codex that location is the runner's whole Codex
-    /// home, what Codex wrote there included (REQ-AGENTLOGIN-30); an install
+    /// home, what Codex wrote there included (REQ-GRANT-40); an install
     /// creates it again. A recorded install outside the directory, an older
     /// build's, is forgotten, never removed. What could not be removed is
     /// recorded as `install_failed`, so a later pass removes what is left.
@@ -993,7 +993,7 @@ impl AgentLoginSetup {
 
 /// The last use `login` records: the one noted for its install, else the one
 /// last recorded beside it, while that install is the one last recorded; an
-/// install, or an ending, records none (REQ-AGENTLOGIN-42).
+/// install, or an ending, records none (REQ-GRANT-52).
 fn last_use(
     login: &LoginReadiness,
     previous: Option<&LoginReadiness>,
@@ -1052,7 +1052,7 @@ impl NotedUses {
     }
 }
 
-/// The observer of one admission (REQ-AGENTLOGIN-42).
+/// The observer of one admission (REQ-GRANT-52).
 struct UseObserver {
     offered: Vec<OfferedLogin>,
     uses: Arc<NotedUses>,
@@ -1088,7 +1088,7 @@ impl HarnessLoginObserver for UseObserver {
 /// Whether the runner last knew the provider's login as installed, or as
 /// authorized by Cloud without being ready: the entries a pass that cannot
 /// reach Cloud records as `cloud_unavailable`, so that state only ever marks a
-/// provider Cloud did authorize (REQ-AGENTLOGIN-28, REQ-AGENTLOGIN-31).
+/// provider Cloud did authorize (REQ-GRANT-38, REQ-GRANT-41).
 fn authorized_or_installed(entry: &LoginReadiness) -> bool {
     entry.installation().is_some() || entry.state.fails_readiness()
 }
@@ -1096,7 +1096,7 @@ fn authorized_or_installed(entry: &LoginReadiness) -> bool {
 /// Whether a provider Cloud answered `named` for, and that a pass left in
 /// `state`, is selected: Cloud named an authorization in force for it,
 /// `authorized`, `unauthorized` or `unsupported_target`, and no delivery
-/// refused as `revoked` since (REQ-AGENTLOGIN-28).
+/// refused as `revoked` since (REQ-GRANT-38).
 fn selected(named: Option<&ProviderLogin>, state: AgentLoginState) -> bool {
     named.is_some_and(|named| named.status != LoginStatus::Revoked)
         && state != AgentLoginState::Revoked

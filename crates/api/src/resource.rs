@@ -5,9 +5,11 @@
 //! confirming idempotency keys and refusing any response outside the contract.
 use std::time::Duration;
 
+use base64::Engine as _;
 use reqwest::{StatusCode, Url};
+use zeroize::Zeroizing;
 
-use super::generated::apis;
+use super::generated::{apis, models};
 use super::http_client::generated_configuration;
 use super::http_util::{self, BoundedBodyError};
 use super::{HttpTransportPolicy, UnreachableCategory, classify_reqwest_error, problem};
@@ -376,6 +378,49 @@ pub(crate) fn confirmed_delete<'a, F: ProblemFailure + From<ResourceFailure> + '
     let response = expect_problem_status(response, StatusCode::NO_CONTENT, problems)?;
     validate_mutation_key(&response.headers, key)?;
     Ok(())
+}
+
+/// The schema version of both native providers' material form (REQ-GRANT-12).
+pub const RECORD_SCHEMA_VERSION: i32 = 1;
+
+/// A native provider's material as the base64 a request body carries, in zeroizing storage.
+pub(crate) fn encode_material(material: &[u8]) -> Zeroizing<String> {
+    let mut encoded = Zeroizing::new(String::new());
+    base64::engine::general_purpose::STANDARD.encode_string(material, &mut encoded);
+    encoded
+}
+
+/// A request body in zeroizing storage. Serializing a generated model of strings and integers
+/// cannot fail; a failure is still reported rather than sent.
+pub(crate) fn serialize_body(
+    value: &impl serde::Serialize,
+) -> Result<Zeroizing<Vec<u8>>, ResourceFailure> {
+    serde_json::to_vec(value)
+        .map(Zeroizing::new)
+        .map_err(|_| invalid())
+}
+
+/// One of the member's organizations, by its ID or exact slug, refused by `problems`.
+pub(crate) fn organization<'a, F: ProblemFailure + 'a>(
+    configuration: &apis::configuration::Configuration,
+    reference: &str,
+    problems: impl IntoIterator<Item = &'a ProblemRow<F>>,
+) -> Result<models::Organization, F> {
+    apis::organizations_api::get_organization(configuration, reference)
+        .map_err(|error| classify_problem_error(error, problems))
+}
+
+/// The ID of the member's organization an exact slug names, refused by `problems`.
+pub(crate) fn organization_id<'a, F: ProblemFailure + 'a>(
+    configuration: &apis::configuration::Configuration,
+    slug: &str,
+    problems: impl IntoIterator<Item = &'a ProblemRow<F>>,
+) -> Result<String, F> {
+    let organization = organization(configuration, slug, problems)?;
+    if organization.slug != slug || !um_support::valid_typed_id(&organization.id, "org_") {
+        return Err(F::invalid_response(false));
+    }
+    Ok(organization.id)
 }
 
 /// A problem-details body of the given status whose `type` is the API problem `kind`, for the

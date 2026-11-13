@@ -6,7 +6,6 @@
 //! repository is read first, since it names a kind, and `Repository::code` combines it with
 //! that kind's read.
 
-use std::collections::BTreeSet;
 use std::fmt::{Debug, Display};
 
 use anyhow::{Context, anyhow};
@@ -21,6 +20,7 @@ use um_runner::{CredentialKind, ReadinessCode};
 
 use crate::exit_code::{ExitCode, OutcomeClass};
 
+use super::super::super::grant::every_page;
 use super::super::super::{
     PrincipalAuthenticationArgs, PrincipalAuthenticationKind, execute_selected_api_operation,
     principal_api_context, unreachable_outcome_class, write_api_failure,
@@ -326,28 +326,6 @@ impl Ending {
     }
 }
 
-/// Every item of a paged list, following `nextCursor` until a page has none; `page` lists
-/// the page at a cursor as its items and the next cursor.
-fn every_page<I, E: FamilyFailure>(
-    mut page: impl FnMut(Option<&str>) -> Result<(Vec<I>, Option<String>), E>,
-) -> Result<Vec<I>, E> {
-    let mut items = Vec::new();
-    let mut seen = BTreeSet::new();
-    let mut cursor: Option<String> = None;
-    loop {
-        let (listed, next) = page(cursor.as_deref())?;
-        items.extend(listed);
-        let Some(next) = next else {
-            return Ok(items);
-        };
-        // A cursor seen before would page forever.
-        if !seen.insert(next.clone()) {
-            return Err(E::invalid_response());
-        }
-        cursor = Some(next);
-    }
-}
-
 impl FamilyFailure for LinearFailure {
     fn unauthenticated() -> Self {
         Self::Unauthenticated
@@ -531,7 +509,7 @@ fn read_gitlab(session: &Session<'_>) -> anyhow::Result<Result<ReadinessCode, En
         GitLabApi::new,
         "prepare GitLab connection networking",
         |api, organization| {
-            every_page(|cursor| {
+            every_page(GitLabFailure::invalid_response(), |cursor| {
                 let mut page = api.list(organization, Some(PAGE_LIMIT), cursor)?;
                 let next = page["nextCursor"].as_str().map(str::to_owned);
                 match page.get_mut("items").map(Value::take) {
@@ -580,7 +558,7 @@ fn read_linear(session: &Session<'_>) -> anyhow::Result<Result<ReadinessCode, En
         LinearApi::new,
         "prepare Linear connection networking",
         |api, organization| {
-            every_page(|cursor| {
+            every_page(LinearFailure::invalid_response(), |cursor| {
                 api.list(organization, Some(PAGE_LIMIT), cursor)
                     .map(|page| (page.items, page.next_cursor))
             })

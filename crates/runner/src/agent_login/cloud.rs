@@ -29,11 +29,11 @@ const MAXIMUM_MATERIAL_BYTES: usize = 32 * 1024;
 /// blocking thread.
 pub(crate) trait AgentLoginCloud: Send + Sync {
     /// Which agent logins Cloud has authorized for this runner among the
-    /// providers the request names (REQ-AGENTLOGIN-15). An entry for a
+    /// providers the request names (REQ-GRANT-25). An entry for a
     /// provider this build cannot install is dropped.
     fn status(&self, request: &StatusRequest) -> Result<Vec<ProviderLogin>, CloudFailure>;
 
-    /// One generation of one agent login (REQ-AGENTLOGIN-16).
+    /// One generation of one agent login (REQ-GRANT-26).
     fn delivery(&self, request: &DeliveryRequest) -> Result<Delivery, DeliveryFailure>;
 
     /// Makes later requests use the endpoint and credential the runner now
@@ -63,7 +63,7 @@ pub(crate) struct ProviderReport {
 impl ProviderReport {
     /// The report of `provider`, stating `last_use` only with `state`
     /// `ready` and an install, the only report Cloud takes it with
-    /// (REQ-AGENTLOGIN-15, REQ-AGENTLOGIN-42).
+    /// (REQ-GRANT-25, REQ-GRANT-52).
     pub(crate) fn new(
         provider: AgentLoginProvider,
         installed: Option<InstalledLogin>,

@@ -1,4 +1,4 @@
-//! The credential status vocabulary (REQ-AGENTLOGIN-43): the one availability
+//! The credential status vocabulary (REQ-GRANT-53): the one availability
 //! and the one next action every surface reports for a credential. Each side
 //! maps its own facts to it: `um-runner` a provider's readiness, the `um`
 //! binary what Cloud's API returns for an agent login's authorization and for
@@ -6,7 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 
-/// Whether a credential can be used now (REQ-AGENTLOGIN-43).
+/// Whether a credential can be used now (REQ-GRANT-53).
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Availability {
@@ -32,7 +32,7 @@ pub enum Availability {
 }
 
 impl Availability {
-    /// Every availability, in the order REQ-AGENTLOGIN-43 states them.
+    /// Every availability, in the order REQ-GRANT-53 states them.
     pub const ALL: [Self; 8] = [
         Self::Available,
         Self::Unverified,
@@ -74,7 +74,7 @@ impl Availability {
     }
 }
 
-/// What to do about a credential's availability (REQ-AGENTLOGIN-43).
+/// What to do about a credential's availability (REQ-GRANT-53).
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NextAction {
@@ -100,7 +100,7 @@ pub enum NextAction {
 }
 
 impl NextAction {
-    /// Every next action, in the order REQ-AGENTLOGIN-43 states them.
+    /// Every next action, in the order REQ-GRANT-53 states them.
     pub const ALL: [Self; 9] = [
         Self::None,
         Self::Reconnect,
@@ -167,7 +167,7 @@ impl CredentialStatus {
 mod tests {
     use super::{Availability, NextAction};
 
-    // REQ-AGENTLOGIN-43
+    // REQ-GRANT-53
     #[test]
     fn wire_names_are_the_serialized_names() {
         for availability in Availability::ALL {

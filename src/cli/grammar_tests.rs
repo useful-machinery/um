@@ -9,16 +9,17 @@ const LEAVES: &str = "accept activate answer approve authorize archive begin can
 const GROUPS: &str = "account action activation agent-login artifact audit auth authorization cloud connection credential definition delegation deletion delivery github gitlab grant identity input input-set installation invitation join-key linear member occurrence organization pool project publication repository run runner runner-pool schedule service-principal setup state team trigger evaluation webhook workflow";
 const COMMON: [&str; 3] = ["json", "service-api-key-file", "allow-insecure-http"];
 // These leaves have no limit/cursor contract; see cli/docs/output-style.md.
-const UNPAGINATED_LISTS: [&str; 4] = [
+const UNPAGINATED_LISTS: [&str; 5] = [
     "connection github installation list",
     "connection github repository list",
+    "grant list",
     "workflow definition list",
     "workflow run list",
 ];
 // These destructive leaves' own confirmation refuses a missing --yes with the statement the
 // leaf makes before it acts, which clap's refusal of a required argument cannot carry;
 // destructive_leaves_require_confirmation_but_runner_modes_do_not pins that refusal.
-const SELF_CONFIRMING: [&str; 1] = ["auth agent-login revoke"];
+const SELF_CONFIRMING: [&str; 2] = ["auth agent-login revoke", "grant revoke"];
 
 // These identities are backed by shared Args or identifier argument types in cli/src/cli.rs
 // and cli/src/cli/entity.rs. A long spelling alone is never a help identity.
@@ -86,6 +87,7 @@ fn semantic_class(path: &str, long: &str) -> Option<String> {
                 path,
                 "auth login"
                     | "auth grant create"
+                    | "grant create"
                     | "auth identity link"
                     | "account deletion cancel"
                     | "organization deletion cancel"
@@ -396,8 +398,11 @@ fn entity_identifier_flags_match_the_command_tree_and_parser() {
 // REQ-ACCOUNT-61
 // REQ-SERVICEPRINCIPAL-20
 // REQ-GRANT-6
-// REQ-AGENTLOGIN-20
-// REQ-AGENTLOGIN-25
+// REQ-GRANT-30
+// REQ-GRANT-35
+// REQ-GRANT-66
+// REQ-GRANT-67
+// REQ-GRANT-68
 #[test]
 fn destructive_leaves_require_confirmation_but_runner_modes_do_not() {
     let gated: &[&[&str]] = &[
@@ -454,6 +459,25 @@ fn destructive_leaves_require_confirmation_but_runner_modes_do_not() {
             "deauthorize",
             "agl_01k0z6r1w8f4jy2m7q9v3x5abc",
             "--runner",
+            "rnr_01k0z6r1w8f4jy2m7q9v3x5abc",
+        ],
+        &["grant", "revoke", "codex"],
+        &[
+            "grant",
+            "authorize",
+            "agl_01k0z6r1w8f4jy2m7q9v3x5abc",
+            "rnr_01k0z6r1w8f4jy2m7q9v3x5abc",
+        ],
+        &[
+            "grant",
+            "authorize",
+            "--all",
+            "rnr_01k0z6r1w8f4jy2m7q9v3x5abc",
+        ],
+        &[
+            "grant",
+            "deauthorize",
+            "pgr_01k0z6r1w8f4jy2m7q9v3x5abc",
             "rnr_01k0z6r1w8f4jy2m7q9v3x5abc",
         ],
         &["auth", "identity", "remove", "identity"],

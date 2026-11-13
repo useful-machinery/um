@@ -5,7 +5,9 @@ use crate::exit_code::ExitCode;
 use um_api::AgentLoginFailure;
 use um_human_auth::Deployment;
 
-use super::{Confirmation, Options, Stated, output, run_leaf};
+use crate::cli::grant::confirmation::NATIVE_REVOKE;
+
+use super::{Confirmation, Options, Stated, Statement, output, run_leaf};
 
 pub(super) const ABOUT: &str = "Revoke one of your coding agent logins";
 
@@ -21,22 +23,20 @@ pub(super) struct Command {
     options: Options,
 }
 
-/// The stop Cloud requests of each runner's run (REQ-AGENTLOGIN-38).
+/// The stop Cloud requests of each runner's run (REQ-GRANT-48).
 impl Stated for Command {
-    const NAME: &'static str = "revoke";
-    const STATEMENT: &'static [&'static str] = &[
-        "the run each of the agent login's runners is serving will be asked to stop, whichever \
-         member started it",
-    ];
+    const COMMAND: &'static str = "um grant revoke";
+    type Usage = crate::cli::grant::revoke::Command;
+    const STATEMENT: Statement = Statement::Fixed(NATIVE_REVOKE);
     const ACTION: &'static str = "to revoke the agent login";
 }
 
 impl Command {
     pub(super) fn run(self, deployment: &Deployment) -> anyhow::Result<ExitCode> {
-        super::state::<Self>(format_args!(
-            "Revoking agent login {}:",
-            self.agent_login_id
-        ))?;
+        super::state(
+            format_args!("Revoking agent login {}:", self.agent_login_id),
+            NATIVE_REVOKE,
+        )?;
         let key = um_support::generate_idempotency_key()
             .context("generate agent login revocation request key")?;
         run_leaf(
@@ -50,7 +50,7 @@ impl Command {
                     }
                     result => result,
                 }?;
-                // A revoked agent login is still read back (REQ-AGENTLOGIN-3). The read only
+                // A revoked agent login is still read back (REQ-GRANT-13). The read only
                 // reports each runner's removal and stop; its failure leaves the revocation done.
                 Ok(api.get(&self.agent_login_id).ok())
             },

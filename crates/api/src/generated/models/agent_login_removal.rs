@@ -15,7 +15,7 @@
 use crate::generated::models;
 use serde::{Deserialize, Serialize};
 
-/// AgentLoginRemoval : Whether the runner of an ended authorization has confirmed removing the copy of the login it kept (REQ-AGENTLOGIN-37). A confirmation says nothing of copies a step may have made, nor of the session at the provider.
+/// AgentLoginRemoval : Whether the runner of an ended authorization has confirmed removing the copy of the login it kept (REQ-GRANT-47). A confirmation says nothing of copies a step may have made, nor of the session at the provider.
 #[derive(Clone, Default, Debug, PartialEq, Serialize, Deserialize)]
 pub struct AgentLoginRemoval {
     /// `not_delivered` when Cloud never delivered the login under the authorization; `pending` until the runner, asking after the end, names the provider without the login installed; then `confirmed`.
@@ -27,7 +27,7 @@ pub struct AgentLoginRemoval {
 }
 
 impl AgentLoginRemoval {
-    /// Whether the runner of an ended authorization has confirmed removing the copy of the login it kept (REQ-AGENTLOGIN-37). A confirmation says nothing of copies a step may have made, nor of the session at the provider.
+    /// Whether the runner of an ended authorization has confirmed removing the copy of the login it kept (REQ-GRANT-47). A confirmation says nothing of copies a step may have made, nor of the session at the provider.
     pub fn new(state: State) -> AgentLoginRemoval {
         AgentLoginRemoval {
             state,

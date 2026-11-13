@@ -1,5 +1,5 @@
 //! The runner's own agent-login directory, `.runner-agent-login/` in the
-//! directory of `runnerStatePath`, mode `0700` (REQ-AGENTLOGIN-26): the
+//! directory of `runnerStatePath`, mode `0700` (REQ-GRANT-36): the
 //! runner's Codex home `codex/` and the Claude Code token
 //! `claude-code.token`. Nothing but the runner writes there, so whatever is
 //! at one of its locations is the runner's to replace or remove.
@@ -32,13 +32,13 @@ impl LoginDirectory {
     }
 
     /// The Codex home the runner keeps a `codex` agent login in and offers
-    /// as `CODEX_HOME` (REQ-AGENTLOGIN-27).
+    /// as `CODEX_HOME` (REQ-GRANT-37).
     pub(crate) fn codex_home(&self) -> PathBuf {
         self.0.join(CODEX_HOME)
     }
 
     /// The file the runner keeps a `claude_code` agent login in
-    /// (REQ-AGENTLOGIN-34).
+    /// (REQ-GRANT-44).
     pub(crate) fn claude_code_token(&self) -> PathBuf {
         self.0.join(CLAUDE_CODE_TOKEN)
     }

@@ -215,7 +215,7 @@ separate entity family.
   `create`. This makes bearer secrets and capabilities, which can be
   withdrawn, `issue`/`revoke` pairs. The rule governs what the deployment
   mints, a secret or capability it issues. A leaf that begins a ceremony the
-  member completes at a third party keeps `create`, as `auth grant create
+  member completes at a third party keeps `create`, as `grant create
   PROVIDER` does for an OAuth consent, since nothing is issued until the
   member consents.
 - **Rename or update:** use `rename` when the entity's complete set of mutable
@@ -238,10 +238,10 @@ separate entity family.
 - **Destructive confirmation:** a leaf requires `--yes` when its final token is
   `delete`, `decline`, `end`, `leave`, `remove`, `revoke`, or `retire`, or when
   its complete command identity is `account deletion request` or
-  `organization deletion request`; of other leaves only `auth agent-login
-  authorize` and `deauthorize` have `--yes`. Those two and `auth agent-login
-  revoke` check `--yes` themselves, refusing its absence as clap does but with
-  the statement of what the command will do. This set covers
+  `organization deletion request`; of other leaves only `grant authorize` and
+  `deauthorize`, and the hidden aliases of those two, have `--yes`. Those,
+  `grant revoke` and its hidden alias check `--yes` themselves, refusing its
+  absence as clap does but with the statement of what the command will do. This set covers
   permanent deletion, departure, delegation or invitation closure, and
   operations that invalidate a binding, credential, or live access. Reversible
   runner mode changes, including `runner disable` and `runner drain`, are not
@@ -277,3 +277,9 @@ Pagination:
   page through: `workflow definition list` prints every definition the home
   holds, and `workflow run list` the home's live runs, or every run under
   `--all`, in one listing.
+
+  `grant list` reads every page of the member's grants itself and prints them
+  in one listing, followed by the providers the member holds no grant of: that
+  closing list is true only of the whole set, so a page of it would misreport
+  what the member holds. A member holds a few grants, one per provider in the
+  normal case, so the whole set is small.

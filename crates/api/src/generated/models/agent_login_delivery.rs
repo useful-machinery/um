@@ -15,7 +15,7 @@
 use crate::generated::models;
 use serde::{Deserialize, Serialize};
 
-/// AgentLoginDelivery : The generation Cloud last delivered to the authorization's runner (REQ-AGENTLOGIN-17); omitted until the first delivery.
+/// AgentLoginDelivery : The generation Cloud last delivered to the authorization's runner (REQ-GRANT-27); omitted until the first delivery.
 #[derive(Clone, Default, Debug, PartialEq, Serialize, Deserialize)]
 pub struct AgentLoginDelivery {
     /// The generation delivered.
@@ -27,7 +27,7 @@ pub struct AgentLoginDelivery {
 }
 
 impl AgentLoginDelivery {
-    /// The generation Cloud last delivered to the authorization's runner (REQ-AGENTLOGIN-17); omitted until the first delivery.
+    /// The generation Cloud last delivered to the authorization's runner (REQ-GRANT-27); omitted until the first delivery.
     pub fn new(generation: i64, delivered_at: String) -> AgentLoginDelivery {
         AgentLoginDelivery {
             generation,

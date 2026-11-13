@@ -7,26 +7,10 @@ use crate::exit_code::ExitCode;
 use um_api::{AgentLogin, AgentLoginAuthorization, AgentLoginState, Grant, GrantState};
 
 use super::super::agent_logins::{EndedAuthorizationView, ended_authorizations};
-use super::projection::{
-    MemberStatus, NOT_CONNECTED, Subject, agent_login_provider, authorization_status,
+use crate::cli::grant::projection::{
+    MemberStatus, PROVIDERS, Provider, Subject, agent_login_provider, authorization_status,
     grant_provider, grant_status,
 };
-
-/// The providers a workflow can use a credential of, grant providers first, in the order the
-/// rows are printed (REQ-AGENTLOGIN-45).
-const PROVIDERS: [Provider; 5] = [
-    Provider::Grant("github"),
-    Provider::Grant("gitlab.com"),
-    Provider::Grant("linear"),
-    Provider::CodingAgent("claude_code"),
-    Provider::CodingAgent("codex"),
-];
-
-#[derive(Clone, Copy)]
-enum Provider {
-    Grant(&'static str),
-    CodingAgent(&'static str),
-}
 
 /// One credential a workflow can use as the member, with its status: a provider grant, an
 /// agent login's authorization in force or the agent login when it has none, or a provider the
@@ -83,23 +67,17 @@ impl<'a> CredentialView<'a> {
                 Some(&login.id),
                 MemberStatus::new(
                     authorization_status(login, authorization),
-                    Subject::AgentLogin { id: &login.id },
+                    Subject::AgentLogin {
+                        id: &login.id,
+                        provider: agent_login_provider(login.provider),
+                    },
                 ),
             )
         }
     }
 
     fn not_connected(provider: Provider) -> Self {
-        let (name, subject) = match provider {
-            Provider::Grant(name) => (name, Subject::Grant { provider: name }),
-            Provider::CodingAgent(name) => (name, Subject::CodingAgent { provider: name }),
-        };
-        Self::bare(
-            name,
-            "none",
-            None,
-            MemberStatus::new(NOT_CONNECTED, subject),
-        )
+        Self::bare(provider.name(), "none", None, provider.not_connected())
     }
 
     const fn bare(
@@ -151,7 +129,7 @@ impl<'a> CredentialView<'a> {
 }
 
 /// An ended authorization of one of the member's agent logins, revoked ones included, with its
-/// removal state and stop as `um auth agent-login show` prints it (REQ-AGENTLOGIN-45).
+/// removal state and stop as `um auth agent-login show` prints it (REQ-GRANT-55).
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct EndedView<'a> {

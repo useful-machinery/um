@@ -13,7 +13,7 @@ struct RunnerCreationOutput<'a> {
 mod agent_login;
 mod cloud;
 mod credential;
-mod doctor;
+pub(super) mod doctor;
 mod enroll;
 mod join_key;
 mod pool;
@@ -44,7 +44,8 @@ pub(super) struct Command {
 enum RunnerCommand {
     #[command(about = activation::ABOUT)]
     Activation(activation::Command),
-    #[command(about = agent_login::ABOUT)]
+    // The earlier spelling of `runner grant`, kept for one release out of help (REQ-GRANT-77).
+    #[command(about = agent_login::ABOUT, hide = true)]
     AgentLogin(agent_login::Command),
     #[command(about = "Create a runner registration and enrollment activation")]
     Create(CreateCommand),
@@ -65,6 +66,11 @@ enum RunnerCommand {
     Enable(ModeCommand),
     #[command(about = enroll::ABOUT)]
     Enroll(enroll::Command),
+    #[command(
+        about = agent_login::GRANT_ABOUT,
+        mut_subcommand("sync", |sync| sync.about(agent_login::GRANT_SYNC_ABOUT))
+    )]
+    Grant(agent_login::Command),
     #[command(about = join_key::ABOUT)]
     JoinKey(join_key::Command),
     #[command(about = "List runner registrations")]
@@ -223,7 +229,8 @@ impl Command {
             Some(RunnerCommand::Pool(command)) => command.execute(),
             Some(RunnerCommand::Create(command)) => execute_cloud(command, CreateCommand::execute),
             Some(RunnerCommand::Activation(command)) => command.execute(),
-            Some(RunnerCommand::AgentLogin(command)) => command.execute(),
+            Some(RunnerCommand::AgentLogin(command)) => command.execute(&[NAME, "agent-login"]),
+            Some(RunnerCommand::Grant(command)) => command.execute(&[NAME, "grant"]),
             Some(RunnerCommand::Credential(command)) => command.execute(),
             Some(RunnerCommand::Enroll(command)) => command.execute(),
             Some(RunnerCommand::JoinKey(command)) => command.execute(),

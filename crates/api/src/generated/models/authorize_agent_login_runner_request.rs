@@ -15,7 +15,7 @@
 use crate::generated::models;
 use serde::{Deserialize, Serialize};
 
-/// AuthorizeAgentLoginRunnerRequest : The runner a member authorizes to receive one agent login (REQ-AGENTLOGIN-8).
+/// AuthorizeAgentLoginRunnerRequest : The runner a member authorizes to receive one agent login (REQ-GRANT-18).
 #[derive(Clone, Default, Debug, PartialEq, Serialize, Deserialize)]
 pub struct AuthorizeAgentLoginRunnerRequest {
     /// A runner registration of the agent login's organization.
@@ -24,7 +24,7 @@ pub struct AuthorizeAgentLoginRunnerRequest {
 }
 
 impl AuthorizeAgentLoginRunnerRequest {
-    /// The runner a member authorizes to receive one agent login (REQ-AGENTLOGIN-8).
+    /// The runner a member authorizes to receive one agent login (REQ-GRANT-18).
     pub fn new(runner_id: String) -> AuthorizeAgentLoginRunnerRequest {
         AuthorizeAgentLoginRunnerRequest { runner_id }
     }

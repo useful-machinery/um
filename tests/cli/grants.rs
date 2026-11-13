@@ -1,5 +1,7 @@
 use super::*;
 
+use super::grant::{Opener, Place, after_notice, opener_command};
+
 const TOKEN: &str = "unique-grant-session-token";
 const GRANT_ID: &str = "pgr_01k0z6r1w8f4jy2m7q9v3x5abc";
 const SECOND_GRANT_ID: &str = "pgr_01k0z6r1w8f4jy2m7q9v3x5abd";
@@ -88,7 +90,7 @@ fn json_output(output: &Output) -> serde_json::Value {
     serde_json::from_slice(&output.stdout).unwrap()
 }
 
-// REQ-GRANT-3, REQ-GRANT-4
+// REQ-GRANT-3, REQ-GRANT-4, REQ-GRANT-77
 #[test]
 fn list_returns_one_page_of_grants_without_material() {
     let (server, _directory, credential) = prepared(vec![page(
@@ -116,7 +118,9 @@ fn list_returns_one_page_of_grants_without_material() {
             "nextCursor": "opaque-next-page"
         })
     );
-    assert!(output.stderr.is_empty());
+    // The earlier command names its replacement on standard error, and only that
+    // (REQ-GRANT-77).
+    assert_eq!(after_notice(&output, "um grant list"), "");
     assert_no_secret_output(&output, &[SENTINEL]);
     let request = server.finish().pop().unwrap();
     assert!(request.starts_with("GET /api/v1/me/grants?limit=2&cursor=page-before HTTP/1.1\r\n"));
@@ -180,7 +184,7 @@ fn list_reports_an_unserved_provider_and_a_rejected_session() {
     }
 }
 
-// REQ-GRANT-8
+// REQ-GRANT-8, REQ-GRANT-77
 #[test]
 fn uses_lists_the_tokens_issued_from_one_grant() {
     let item = serde_json::json!({
@@ -217,6 +221,15 @@ fn uses_lists_the_tokens_issued_from_one_grant() {
             "nextCursor": "opaque-older-uses"
         })
     );
+    // Nothing replaces this earlier command, so the one line it prints on standard error names
+    // the command itself and no `um grant` or `um runner grant` command (REQ-GRANT-77).
+    let stderr = String::from_utf8(output.stderr.clone()).unwrap();
+    let (notice, rest) = stderr.split_once('\n').unwrap_or((&stderr, ""));
+    assert!(notice.contains("um auth grant uses"), "{stderr}");
+    for replacement in ["um grant", "um runner grant"] {
+        assert!(!notice.contains(replacement), "{stderr}");
+    }
+    assert_eq!(rest, "", "{stderr}");
     assert_no_secret_output(&output, &[SENTINEL]);
     let request = server.finish().pop().unwrap();
     assert!(request.starts_with(&format!(
@@ -413,6 +426,33 @@ fn create_starts_a_consent_prints_its_url_and_polls_until_the_grant_exists() {
             "GET /api/v1/me/grant-sessions/{SESSION_ID} HTTP/1.1\r\n"
         )));
     }
+}
+
+// REQ-GRANT-69
+#[test]
+fn create_under_auth_opens_no_browser() {
+    let (server, _directory, credential) =
+        prepared(vec![started(), observed(consent("completed"))]);
+    let opener = Opener::new(0);
+    let output = opener_command(
+        &server,
+        &credential,
+        &opener,
+        Place::Desktop,
+        &["auth", "grant", "create", "github", "--json"],
+    )
+    .stdin(Stdio::null())
+    .output()
+    .unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        json_lines(&output)[0]["authorizationUrl"],
+        AUTHORIZATION_URL
+    );
+    assert!(opener.opened(0).is_empty());
+    assert_no_secret_output(&output, &[SENTINEL]);
+    assert_eq!(server.finish().len(), 2);
 }
 
 // SC-GRANT-1, REQ-GRANT-1

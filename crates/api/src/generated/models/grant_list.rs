@@ -15,20 +15,20 @@
 use crate::generated::models;
 use serde::{Deserialize, Serialize};
 
-/// ProviderGrantList : A page of the authenticated member's provider grants, oldest first.
+/// GrantList : A page of the authenticated member's grants, OAuth grants first and then native grants, each oldest first.
 #[derive(Clone, Default, Debug, PartialEq, Serialize, Deserialize)]
-pub struct ProviderGrantList {
+pub struct GrantList {
     #[serde(rename = "items")]
-    pub items: Vec<models::ProviderGrant>,
+    pub items: Vec<models::Grant>,
     /// An opaque continuation cursor, omitted on the final page.
     #[serde(rename = "nextCursor", skip_serializing_if = "Option::is_none")]
     pub next_cursor: Option<String>,
 }
 
-impl ProviderGrantList {
-    /// A page of the authenticated member's provider grants, oldest first.
-    pub fn new(items: Vec<models::ProviderGrant>) -> ProviderGrantList {
-        ProviderGrantList {
+impl GrantList {
+    /// A page of the authenticated member's grants, OAuth grants first and then native grants, each oldest first.
+    pub fn new(items: Vec<models::Grant>) -> GrantList {
+        GrantList {
             items,
             next_cursor: None,
         }

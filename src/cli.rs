@@ -36,6 +36,7 @@ mod connection;
 mod delegation;
 mod deletion;
 mod entity;
+pub(crate) mod grant;
 mod invitation;
 mod organization;
 mod principal;
@@ -61,7 +62,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, anyhow};
-use clap::{Args, CommandFactory, Parser, Subcommand};
+use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand};
 use serde::Serialize;
 
 use self::entity::{
@@ -249,6 +250,10 @@ const AFTER_HELP: &str = "Documentation:\n  Public API contract: https://docs.us
 pub(crate) struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
+
+    /// The earlier leaf the invocation named, if it named one (REQ-GRANT-77).
+    #[arg(skip)]
+    earlier: Option<grant::alias::Earlier>,
 }
 
 impl CommandFactory for Cli {
@@ -554,6 +559,8 @@ enum Command {
     Connection(connection::Command),
     #[command(about = delegation::ABOUT)]
     Delegation(delegation::Command),
+    #[command(about = grant::ABOUT)]
+    Grant(grant::Command),
     #[command(about = invitation::ABOUT)]
     Invitation(invitation::Command),
     #[command(about = organization::ABOUT)]
@@ -579,12 +586,30 @@ where
     I: IntoIterator<Item = S>,
     S: Into<OsString> + Clone,
 {
-    Cli::try_parse_from(args)
+    let mut command = Cli::command();
+    let matches = command.try_get_matches_from_mut(args)?;
+    let mut cli = Cli::from_arg_matches(&matches).map_err(|error| error.format(&mut command))?;
+    cli.earlier = grant::alias::Earlier::at(&invoked_path(&matches));
+    Ok(cli)
+}
+
+/// The subcommand names an invocation gave, joined by spaces: `grant list`.
+fn invoked_path(matches: &clap::ArgMatches) -> String {
+    let mut names = Vec::new();
+    let mut matches = matches;
+    while let Some((name, subcommand)) = matches.subcommand() {
+        names.push(name);
+        matches = subcommand;
+    }
+    names.join(" ")
 }
 
 impl Cli {
     pub(crate) fn execute(self) -> CommandResult {
         um_api::identify_client(crate::build_info::VERSION);
+        if let Some(earlier) = self.earlier {
+            earlier.write_notice();
+        }
         match self.command {
             None => print_help(&[]),
             Some(Command::Account(command)) => command.execute(),
@@ -592,6 +617,7 @@ impl Cli {
             Some(Command::Auth(command)) => command.execute(),
             Some(Command::Delegation(command)) => command.execute(),
             Some(Command::Connection(command)) => command.execute(),
+            Some(Command::Grant(command)) => command.execute(),
             Some(Command::Invitation(command)) => command.execute(),
             Some(Command::Organization(command)) => command.execute(),
             Some(Command::Project(command)) => command.execute(),
@@ -2502,6 +2528,65 @@ mod tests {
         paths
     }
 
+    /// The families `um grant` and `um runner grant` replace (REQ-GRANT-77).
+    const EARLIER_FAMILIES: [[&str; 2]; 4] = [
+        ["auth", "agent-login"],
+        ["auth", "credential"],
+        ["auth", "grant"],
+        ["runner", "agent-login"],
+    ];
+
+    fn subcommand<'a>(root: &'a clap::Command, path: &[&str]) -> &'a clap::Command {
+        path.iter().fold(root, |command, name| {
+            command
+                .find_subcommand(name)
+                .unwrap_or_else(|| panic!("no subcommand {name} in {path:?}"))
+        })
+    }
+
+    // REQ-GRANT-77
+    #[test]
+    fn the_earlier_families_are_hidden_but_still_in_the_command_surface() {
+        let root = Cli::command();
+        for family in EARLIER_FAMILIES {
+            assert!(subcommand(&root, &family).is_hide_set(), "{family:?}");
+        }
+        let visible = subcommand(&root, &["auth"])
+            .get_subcommands()
+            .filter(|command| !command.is_hide_set())
+            .map(clap::Command::get_name)
+            .collect::<Vec<_>>();
+        assert_eq!(visible, ["identity", "login", "logout", "status"]);
+
+        let paths = customer_command_paths();
+        for family in EARLIER_FAMILIES {
+            let family = family.join(" ");
+            let leaves = paths
+                .iter()
+                .filter(|path| path.starts_with(&format!("{family} ")))
+                .count();
+            assert!(paths.contains(&family) && leaves > 0, "{family}");
+        }
+    }
+
+    // REQ-GRANT-77
+    #[test]
+    fn the_notice_table_names_exactly_the_earlier_leaves() {
+        let root = Cli::command();
+        let mut leaves = Vec::new();
+        for family in EARLIER_FAMILIES {
+            for leaf in subcommand(&root, &family).get_subcommands() {
+                leaves.push(format!("{} {}", family.join(" "), leaf.get_name()));
+            }
+        }
+        leaves.sort();
+        let noticed = super::grant::alias::EARLIER
+            .iter()
+            .map(|(path, _)| (*path).to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(noticed, leaves);
+    }
+
     #[test]
     fn every_unreachable_category_uses_the_shared_outcome_table() {
         for category in [
@@ -2656,6 +2741,12 @@ mod tests {
             "delegation list",
             "delegation propose",
             "delegation show",
+            "grant",
+            "grant authorize",
+            "grant create",
+            "grant deauthorize",
+            "grant list",
+            "grant revoke",
             "invitation",
             "invitation accept",
             "invitation decline",
@@ -2758,6 +2849,8 @@ mod tests {
             "runner drain",
             "runner enable",
             "runner enroll",
+            "runner grant",
+            "runner grant sync",
             "runner join-key",
             "runner join-key issue",
             "runner join-key list",

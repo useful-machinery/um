@@ -5,6 +5,7 @@
 use std::fmt;
 
 use reqwest::{StatusCode, Url};
+use serde::Deserialize;
 
 use super::generated::{apis, models};
 use super::http_client::zeroize_generated_bearer_access_token;
@@ -15,7 +16,6 @@ use super::resource::{
 use super::{HttpTransportPolicy, UnreachableCategory, problem};
 
 pub type Grant = models::ProviderGrant;
-pub type GrantList = models::ProviderGrantList;
 pub type GrantUse = models::ProviderGrantUse;
 pub type GrantUseList = models::ProviderGrantUseList;
 pub type GrantSession = models::ProviderGrantSession;
@@ -23,6 +23,16 @@ pub type GrantProvider = models::create_grant_session_request::Provider;
 pub type GrantState = models::provider_grant::State;
 pub type GrantSessionStatus = models::provider_grant_session::Status;
 pub type GrantSessionReason = models::provider_grant_session::ReasonCode;
+
+/// One page of the member's OAuth grants as `GET /v1/me/grants` without `kind` answers
+/// it. The contract's `GrantList` item also carries native grants' members; a list that
+/// names no kind holds OAuth grants alone, each with every member `Grant` names.
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+pub struct GrantList {
+    pub items: Vec<Grant>,
+    #[serde(rename = "nextCursor")]
+    pub next_cursor: Option<String>,
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum GrantFailure {
@@ -178,6 +188,10 @@ impl GrantApi {
         identity_id: &str,
         key: &str,
     ) -> Result<GrantSession, GrantFailure> {
+        #[allow(
+            deprecated,
+            reason = "the earlier `um auth grant` commands keep this route for one release"
+        )]
         let session = apis::principals_api::create_identity_grant_session(
             &self.configuration,
             identity_id,
@@ -218,8 +232,21 @@ impl GrantApi {
         limit: Option<i32>,
         cursor: Option<&str>,
     ) -> Result<GrantList, GrantFailure> {
-        let page = apis::principals_api::list_grants(&self.configuration, limit, cursor)
-            .map_err(classify_error)?;
+        let endpoint = format!(
+            "{}/v1/me/grants",
+            self.configuration.base_path.trim_end_matches('/')
+        );
+        let mut request =
+            super::generated_api_request(&self.configuration, reqwest::Method::GET, &endpoint);
+        if let Some(limit) = limit {
+            request = request.query(&[("limit", limit.to_string())]);
+        }
+        if let Some(cursor) = cursor {
+            request = request.query(&[("cursor", cursor)]);
+        }
+        let response = expect_problem_status(receive_raw(request)?, StatusCode::OK, &PROBLEMS)?;
+        validate_json_media_type(&response.headers)?;
+        let page: GrantList = serde_json::from_slice(&response.body).map_err(|_| invalid())?;
         if !page.items.iter().all(valid_grant) {
             return Err(invalid());
         }

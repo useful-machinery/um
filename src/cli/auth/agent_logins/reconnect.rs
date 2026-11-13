@@ -1,4 +1,4 @@
-//! `reconnect AGENT_LOGIN`: `import --agent-login` found by ID (REQ-AGENTLOGIN-44). The agent
+//! `reconnect AGENT_LOGIN`: `import --agent-login` found by ID (REQ-GRANT-54). The agent
 //! login it reads gives the provider and organization, and the sign-in is then taken and stored
 //! exactly as `import` takes and stores it.
 

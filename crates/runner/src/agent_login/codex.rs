@@ -1,7 +1,7 @@
 //! Keeping a delivered Codex login as `auth.json` in a Codex home of the
-//! runner's own (REQ-AGENTLOGIN-26) and offering that home to each
+//! runner's own (REQ-GRANT-36) and offering that home to each
 //! assignment as `CODEX_HOME`, while standing back when the service sets
-//! `CODEX_HOME` itself (REQ-AGENTLOGIN-27). The service's own Codex home is
+//! `CODEX_HOME` itself (REQ-GRANT-37). The service's own Codex home is
 //! never written.
 
 use std::ffi::OsString;
@@ -18,8 +18,8 @@ use super::{FailureStage, InstallRefusal, ServiceEnvironment};
 const AUTH_FILE: &str = "auth.json";
 const CONFIG_FILE: &str = "config.toml";
 /// The runner's Codex home's whole configuration: keep the login in
-/// `auth.json`. The same bytes `um auth agent-login import codex --login`
-/// gives the Codex it signs in with.
+/// `auth.json`. The same bytes `um grant create codex` gives the Codex it
+/// signs in with.
 const CONFIG: &[u8] = b"cli_auth_credentials_store = \"file\"\n";
 const AUTH_TEMPORARY_PREFIX: &str = ".um-auth.json.tmp";
 const CONFIG_TEMPORARY_PREFIX: &str = ".um-config.toml.tmp";

@@ -893,112 +893,6 @@ The example is synthetic: the GitLab.com namespace was observed in an isolated
 tenant, not yet qualified against the production connection. These labels do not
 enable a provider or link accounts by email.
 
-Agent logins are the sign-ins of the coding agents (Codex and Claude Code) a member keeps in
-Useful Machinery for an organization's runners. Import, reconnect, read, authorize and revoke
-your own under `auth agent-login`, and see them beside your provider grants with
-`auth credential status`; the commands use the signed-in human session only:
-
-```sh
-# Import a Codex login for the organization from an auth.json you own with mode 0600 (or -
-# for standard input). The file is sent unchanged, at most 32 KiB, and must be a JSON object.
-um auth agent-login import acme codex --from-file ./auth.json --label "build laptop"
-
-# Or make a fresh Codex login for it: runs `codex login` (found on PATH) in a private
-# temporary Codex home, imports the login it writes and removes that home. Your own Codex
-# login in ~/.codex is neither read nor changed.
-um auth agent-login import acme codex --login --label "build runner"
-
-# Import the token `claude setup-token` printed, saved as one line in a file you own with
-# mode 0600 (or - for standard input).
-um auth agent-login import acme claude_code --token-file ./claude-token
-
-# Reconnect an agent login: store a newer sign-in as its next generation. It reads the agent
-# login for its provider and organization, then takes --login or --from-file for codex and
-# --token-file for claude_code exactly as import does. It keeps its ID and authorizations, and
-# each runner authorized for it installs the new generation at its next setup.
-um auth agent-login reconnect agl_01k0z6r1w8f4jy2m7q9v3x5abc --login
-
-# The same, naming the provider and organization as import takes them.
-um auth agent-login import acme codex --from-file ./auth.json \
-  --agent-login agl_01k0z6r1w8f4jy2m7q9v3x5abc
-
-# List one page of your agent logins with their authorized runners, what each runner was
-# last delivered and what it last reported, with each authorization's availability and next
-# action, and, for each runner whose authorization ended, whether it has confirmed removing
-# its copy. Continue with --cursor when a next cursor is shown.
-um auth agent-login list --limit 50
-
-# Show one agent login by the agl_ ID that list prints.
-um auth agent-login show agl_01k0z6r1w8f4jy2m7q9v3x5abc
-
-# Authorize one runner of the organization, named by the rnr_ ID that `um runner list acme`
-# prints, to receive it. Every run that runner serves, whichever member caused it, can then
-# use the login, and every step on that runner can read it; the command says so first and
-# does nothing without --yes. A Codex login serves one runner at a time.
-um auth agent-login authorize agl_01k0z6r1w8f4jy2m7q9v3x5abc \
-  --runner rnr_01k0z6r1w8f4jy2m7q9v3x5abc --yes
-
-# End that runner's authorization. Cloud also asks the run that runner is serving, whichever
-# member started it, to stop gracefully; the command says so first and does nothing without
-# --yes. It prints whether that runner has confirmed removing its copy yet, and the run asked
-# to stop with the cancellation request, if any.
-um auth agent-login deauthorize agl_01k0z6r1w8f4jy2m7q9v3x5abc \
-  --runner rnr_01k0z6r1w8f4jy2m7q9v3x5abc --yes
-
-# Revoke it. Cloud erases the login, ends its authorizations and asks the run each of those
-# runners is serving to stop, which the command says first. It prints each runner it was
-# authorized for with its removal state, `pending` until that runner confirms removing the
-# copy it kept, then `confirmed`, or `not_delivered`, and the run asked to stop there. A
-# confirmation covers only that copy, and the session at the provider stays signed in until
-# you sign out there.
-um auth agent-login revoke agl_01k0z6r1w8f4jy2m7q9v3x5abc --yes
-
-# Wait for a run asked to stop to settle.
-um run cancel acme run_01k0z6r1w8f4jy2m7q9v3x5abc --wait
-
-# See whether each credential a workflow can use as you can be used now: every provider grant,
-# each agent login once per runner it is authorized for (or once when it is authorized for
-# none), and each provider you have nothing for, then the ended authorizations. Add
-# --organization to keep only one organization's agent logins.
-um auth credential status
-um auth credential status --organization acme --json
-```
-
-Every authorization in force that `list` and `show` print, and every row `credential status`
-prints, carries one `availability` (`available`, `unverified`, `reconnect_required`,
-`pending`, `delivery_failed`, `insufficient_permission`, `not_delivered` or `not_connected`)
-and one `nextAction`, and the text form names the command or step that next action means:
-`um auth agent-login reconnect AGENT_LOGIN` or `um auth grant create PROVIDER` to reconnect,
-`um auth agent-login authorize` for an agent login no runner is authorized for,
-`um runner agent-login sync --config PATH` on the runner's host after a failed delivery, and
-`um auth agent-login import` or `um auth grant create` for a provider you have nothing for. A
-runner that has not yet reported installing what Cloud holds is `pending` with
-`wait_for_runner`, and a login in place that no step has used yet at this generation is
-`unverified`. `credential status --json` prints one schema-version-1 document with outcome
-`reported`, `credentials` (each with `provider`, `kind` as `grant`, `agent_login` or `none`,
-`availability`, `nextAction` and the identifiers it has: a grant's `id` and `identityId`, an
-agent login's `id`, `label`, `organizationId`, `generation` and the authorization's
-`runnerId`) and `endedAuthorizations` (each with `agentLoginId`, `provider`, `runnerId`,
-`endedAt`, `removal` and `stop`). It reads both lists to their last page, exits 0 whatever it
-reports, and reports a failed read as `um auth grant list` or `um auth agent-login list`
-would.
-
-Each command prints the agent login without its material, and `--json` prints one
-schema-version-1 document (`listed` with `items` and `nextCursor`, `shown`, `imported` or
-`reconnected` with `agentLogin`, `authorized` with `agentLoginId` and `authorization`, `deauthorized`
-with `agentLoginId`, `authorizationId`, `runnerId`, `removal` and `stop`, or `revoked` with
-`agentLoginId` and `endedAuthorizations`, each with its `removal` and `stop`). `stop` names
-the `runId` asked to stop, the `cancellationRequestId` and `requestedAt`, and is absent where
-no run was asked to stop. `removal`, `stop` and `endedAuthorizations` come from a read of the
-agent login after the change and are absent when that read fails, which does not fail the
-command. A revocation that fails after Cloud made it durable, for example while asking runs
-to stop, is completed by running `revoke` again. An unsafe or malformed source exits 2
-before anything is sent; a `--login` sign-in that fails, is interrupted or writes no login
-reports `provider_login_failed`, exits 1 and sends nothing. A refusal names one outcome, such as `agent_login_not_found`,
-`material_invalid`, `runner_holds_login` or `authorization_not_found`, and exits 1. Import,
-reconnection, authorization, deauthorization and revocation each send one request key and
-replay it once when the response is lost.
-
 One successful login establishes a renewable human session. The CLI stores the one-hour
 access token, its expiration, and a rotating refresh token in
 `~/.um/credentials.json`, then silently renews access for every human-authenticated
@@ -1014,6 +908,174 @@ Development deployments that use HTTP require `--allow-insecure-http` on each ne
 leaf command. This includes authentication and linked identity management, account,
 organization, GitHub connection, project, Cloud run, and runner administration commands;
 the option is not global.
+
+## Grants
+
+`um grant` manages what Useful Machinery may do as you at other providers. A grant is an
+OAuth grant (`github`, `gitlab.com`, `linear`), your consent at the provider, whose ID begins
+`pgr_`, or a native grant (`claude_code`, `codex`), a coding agent's own login imported for
+one organization, whose ID begins `agl_`. Each grant is used only on the runners you authorize
+for it. The commands take your signed-in session only, never a service API key.
+
+```sh
+# Make a grant through the provider's own sign-in. For github, gitlab.com and linear this
+# starts the provider's consent, prints its URL, opens it in your browser when this machine has
+# one (not over SSH, and on Linux only with a display), and waits until the grant is active;
+# approving the URL in any browser completes it. --no-wait returns once the consent has
+# started. When you already hold a grant of the provider, the command asks before replacing it
+# on a terminal and otherwise exits 2 unless you pass --replace; the new sign-in becomes that
+# grant's next generation, keeping its ID and the runners it is authorized for.
+um grant create linear
+um grant create github --replace --json
+
+# For codex this runs `codex login` in a private temporary Codex home (mode 0700) that it
+# removes afterwards, and imports the login it writes; your own Codex home is never read or
+# changed. With --device, or where this machine has no browser (over SSH, or on Linux without
+# a display), it runs `codex login --device-auth`, whose code you enter in any browser.
+# --login names that sign-in, the default, and is Codex's alone. --from-file imports an
+# existing auth.json from an owned mode-0600 file, or - for standard input, instead. The grant
+# is for your only organization, or the one --organization names. A coding agent's sign-in
+# has no consent to wait for, so --no-wait and --timeout are refused for codex and claude_code.
+um grant create codex
+um grant create codex --device --organization acme
+um grant create codex --from-file ~/backup/auth.json --replace
+
+# For claude_code this runs `claude setup-token` with a private temporary configuration
+# directory (mode 0700) that it removes afterwards; your own Claude Code configuration is never
+# read or changed. Its prompts appear in your terminal and what you type, such as a code to
+# paste, reaches it; the token it prints is imported and never shown. --token-file imports a
+# token claude setup-token printed from an owned mode-0600 file, or - for standard input,
+# instead.
+um grant create claude_code
+um grant create claude_code --token-file - --organization acme < token.txt
+
+# Without a provider, or with --all, run the sign-in of each provider you hold no active or
+# reconnect_required grant of, one after another: github, gitlab.com, linear, claude_code,
+# codex. Each provider's name is printed on standard error before its prompts. A sign-in that
+# fails does not stop the ones after it; a provider this deployment does not serve is reported
+# provider_unavailable and passed over. The coding agents' grants are for your only
+# organization, or the one --organization names; when you are a member of none or of several
+# and name none, a coding agent you hold nowhere is reported organization_required and passed
+# over, and the consents still run. The command ends with one outcome per provider and exits 1
+# when any sign-in failed or every provider selected was passed over; an interrupt or a
+# termination signal during a sign-in ends it there with status 130 or 143. --device applies to
+# the Codex sign-in; --no-wait and --timeout apply to the consents. --from-file, --token-file
+# and --replace need a provider. With --json each provider's events are followed by a summary
+# event.
+um grant create
+um grant create --all --organization acme --json
+
+# With --workflow FILE, which repeats, sign in to only the providers those workflows and the
+# workflows their workflow steps run call for, derived as um runner doctor --workflow derives
+# them; the kind gitlab means gitlab.com. Before any sign-in the command prints the workflow
+# files, each provider to sign in to and each passed over as held with what calls for it, and
+# the declarations that may use credentials the workflows do not name, for which no sign-in is
+# run. Without --source-root each file is bounded by the root of the Git repository that holds
+# it, and a file in no repository is refused with exit 2. A file that does not resolve is
+# reported as um workflow validate reports it, with exit 1. --workflow does not take a provider.
+# With --json the plan is a first workflow_requirements event.
+um grant create --workflow workflow.yaml --workflow ../other/workflow.yaml
+um grant create --workflow workflow.yaml --source-root . --json
+
+# List every grant you hold: its ID, provider, kind, the account it acts as (an OAuth grant's
+# linked identity, a native grant's organization), its state and generation, and each runner
+# it is authorized for with that runner's availability and next action. Then name each
+# provider you hold nothing for. It reads every page; there is no --limit or --cursor.
+um grant list
+
+# Show one grant in detail: for a native grant what each runner was last delivered and
+# reported, its last use, and each ended authorization with its removal state and stop; for
+# an OAuth grant its scopes, last use and expiries. Name it by its ID, or by its provider
+# when you hold one grant of it.
+um grant list agl_01k0z6r1w8f4jy2m7q9v3x5abc
+um grant list codex --json
+
+# Authorize one runner, named by the rnr_ ID that `um runner list acme` prints, to use a
+# grant. For an OAuth grant, every run on that runner that you start can then be issued tokens
+# from it; for a native grant, every run that runner serves, whichever member caused it, can
+# use the login, and every step on that runner can read it. The command reads the grant, says
+# which applies, and does nothing without --yes. A Codex grant serves one runner at a time.
+um grant authorize codex rnr_01k0z6r1w8f4jy2m7q9v3x5abc --yes
+
+# Authorize that runner for every grant of yours that can serve it: each OAuth grant and each
+# native grant of the runner's organization. It prints one outcome per grant (`authorized`,
+# `already_authorized`, `other_organization` for a native grant of another organization, or
+# the refusal, such as `authorized_elsewhere` for a Codex grant authorized for another runner)
+# and exits 1 when any grant was refused. A failure that is not one grant's refusal, such as a
+# rate limit, ends it at that grant: it prints the outcomes so far, then the failure naming
+# that grant, and exits 1.
+um grant authorize --all rnr_01k0z6r1w8f4jy2m7q9v3x5abc --yes
+
+# End that runner's authorization. For a native grant Cloud also asks the run that runner is
+# serving, whichever member started it, to stop, and the command prints whether the runner has
+# confirmed removing its copy and the run asked to stop; for an OAuth grant no run is stopped
+# and no further token is issued there.
+um grant deauthorize codex rnr_01k0z6r1w8f4jy2m7q9v3x5abc --yes
+
+# Revoke a grant everywhere. An OAuth grant is erased and revoked at the provider where the
+# provider offers it. A native grant is erased and the command prints each runner it was
+# authorized for with its removal state and the run asked to stop there; a confirmation covers
+# only the copy that runner kept, and the session at the provider stays signed in until you
+# sign out there.
+um grant revoke github --yes
+```
+
+`list --json` prints one schema-version-1 document with outcome `listed`, `grants` (each with
+`id`, `provider`, `kind`, `account` with its `kind`, `id` and, where it is known, `name`,
+`label` where there is one, `state`, `generation`, `createdAt` and `authorizations`, each with
+`runnerId`, `organizationId`, `availability` and `nextAction`, or the grant's own
+`availability` and `nextAction` when no runner is authorized) and `notConnected`; `list GRANT
+--json` prints outcome `shown` with `grant`. A provider name you hold no grant of reports
+`grant_not_found` and exits 1; one you hold several grants of exits 2 and names their IDs.
+
+`create --json` prints newline-delimited events: `consent_required` with `sessionId`,
+`provider`, `authorizationUrl` and `expiresAt`, then `consent_result` with its `outcome`
+(`completed` with `grant`, or `failed`, `expired` or `recovery_required` with `reason`, which
+exit 1). A consent that cannot start reports `provider_unavailable` or `consent_in_progress`.
+For `codex` it prints one `import_result` event with outcome `imported`, or `replaced` when
+it stored the next generation of a grant you hold, and `grant`; a sign-in that made no login
+reports `provider_login_failed` and exits 1, and nothing is stored. A source option the
+provider does not take, `--organization` for an OAuth provider, and a missing organization
+when you are a member of several exit 2 before anything is run or sent.
+
+`authorize`, `deauthorize` and `revoke` take `--yes`; without it they send nothing, state what
+acting does for a grant of either kind and exit 2. Each sends its request with one
+idempotency key and replays it once when the answer is lost. `authorize --json` prints outcome
+`authorized` with `grantId` and `authorization`; `authorize --all --json` prints outcome
+`authorized`, or `refused` when any grant was refused, with `runnerId` and `grants`, each with
+`grantId`, `provider`, `kind`, `outcome` and, when it was authorized, `authorization`; a
+failure that ends it follows that document with the failure's own.
+`deauthorize --json` prints outcome `deauthorized` with `grantId`, `authorizationId`,
+`runnerId` and, for a native grant, `removal` and `stop`; `revoke --json` prints outcome
+`revoked` with `grantId`, `provider`, `kind` and, for a native grant, `endedAuthorizations`.
+A refusal exits 1 with its outcome (`runner_not_found`, `runner_holds_login`,
+`already_authorized`, `authorized_elsewhere`, `authorization_not_found`, `grant_not_found` or
+`provider_unavailable`) and a remedy.
+
+Every runner authorization `list` prints, and every provider you hold nothing for, carries one
+`availability` (`available`, `unverified`, `reconnect_required`, `pending`, `delivery_failed`,
+`insufficient_permission`, `not_delivered` or `not_connected`) and one `nextAction`, and the
+text form names the command or step that next action means: `um grant create PROVIDER
+--replace` to reconnect, `um grant authorize GRANT RUNNER --yes` for a grant no runner is
+authorized for, `um runner grant sync --config PATH` on the runner's host after a failed
+delivery, and `um grant create PROVIDER` for a provider you hold nothing for. A runner that
+has not yet reported installing what Cloud holds is `pending` with `wait_for_runner`, and a
+login in place that no step has used yet at this generation is `unverified`.
+
+On the runner's host, `um runner grant sync --config PATH` asks the live runner to set up the
+agent logins authorized for it now and prints each provider's readiness; see
+[Runner serve](#runner-serve).
+
+The earlier commands remain for one release with their arguments, output and exit statuses
+unchanged, but are absent from help, and each first prints a line on standard error naming
+the command that replaces it: `um auth grant create` and `um auth agent-login import` are
+`um grant create PROVIDER`; `um auth agent-login reconnect` is
+`um grant create PROVIDER --replace`; `um auth grant list`, `um auth agent-login list` and
+`um auth credential status` are `um grant list`; `um auth agent-login show` is
+`um grant list GRANT`; `um auth agent-login authorize`, `deauthorize` and `revoke` and
+`um auth grant revoke` are the `um grant` leaf of the same name; and
+`um runner agent-login sync` is `um runner grant sync`. `um auth grant uses` has no
+replacement.
 
 ## Account management
 
@@ -2463,8 +2525,8 @@ sets `CODEX_HOME` or has a Claude Code login of its own, that provider is report
 readiness once it has set up, and you can ask the live runner to set up now:
 
 ```sh
-um runner agent-login sync --config /etc/um/runner.json
-um runner agent-login sync --config /etc/um/runner.json --json
+um runner grant sync --config /etc/um/runner.json
+um runner grant sync --config /etc/um/runner.json --json
 ```
 
 The command goes only through the local control socket and prints one line per provider

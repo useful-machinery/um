@@ -19,6 +19,7 @@ mod human_principal;
 mod identities;
 mod lifecycle;
 mod linear;
+mod member_grants;
 mod nullable;
 mod organizations;
 mod principal_profile;
@@ -139,6 +140,11 @@ pub use lifecycle::{
 pub use linear::{
     LinearApi, LinearConnection, LinearConnectionList, LinearFailure, LinearSession,
     LinearSessionStatus, LinearTeamList, LinearTeamStateList,
+};
+pub use member_grants::{
+    GrantEndedAuthorization, GrantReport, MEMBER_GRANT_PAGE, MemberGrant, MemberGrantApi,
+    MemberGrantApiError, MemberGrantAuthorization, MemberGrantFailure, MemberGrantKind,
+    MemberGrantList, MemberGrantProvider, MemberGrantState,
 };
 pub use organizations::{
     AcceptInvitationOutcome, AcceptedInvitationMembership, AuditActor, AuditProjectionWarning,

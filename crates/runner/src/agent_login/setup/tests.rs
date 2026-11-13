@@ -143,7 +143,7 @@ fn state_of(document: &ReadinessDocument, provider: AgentLoginProvider) -> Agent
     document.login(provider).expect("provider readiness").state
 }
 
-// REQ-AGENTLOGIN-26, REQ-AGENTLOGIN-30, REQ-TELEMETRY-45, INV-RUNNER-15
+// REQ-GRANT-36, REQ-GRANT-40, REQ-TELEMETRY-45, INV-RUNNER-15
 #[tokio::test]
 async fn an_install_made_before_an_assignment_starts_is_recorded_at_once() {
     let fixture = Fixture::new(Ok(vec![
@@ -231,7 +231,7 @@ fn write_private(path: &Path, bytes: &[u8]) {
     fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
 }
 
-// REQ-AGENTLOGIN-27
+// REQ-GRANT-37
 #[tokio::test]
 async fn a_service_that_sets_codex_home_is_never_sent_a_codex_login() {
     let fixture = Fixture::serving(fake_codex_authorized(1), true);
@@ -251,7 +251,7 @@ async fn a_service_that_sets_codex_home_is_never_sent_a_codex_login() {
     assert_eq!(fixture.service_entries(), 0);
 }
 
-// REQ-AGENTLOGIN-27, REQ-AGENTLOGIN-30
+// REQ-GRANT-37, REQ-GRANT-40
 #[tokio::test]
 async fn a_codex_login_the_runner_holds_is_removed_once_the_service_sets_codex_home() {
     let fixture = Fixture::new(fake_codex_authorized(1));
@@ -286,7 +286,7 @@ async fn a_codex_login_the_runner_holds_is_removed_once_the_service_sets_codex_h
     assert_eq!(fixture.service_entries(), 0);
 }
 
-// REQ-AGENTLOGIN-26, REQ-AGENTLOGIN-27
+// REQ-GRANT-36, REQ-GRANT-37
 #[tokio::test]
 async fn a_codex_login_under_the_service_home_changes_nothing() {
     let fixture = Fixture::new(fake_codex_authorized(1));
@@ -307,7 +307,7 @@ async fn a_codex_login_under_the_service_home_changes_nothing() {
     assert_eq!(fs::read(&own).unwrap(), b"{\"operator\":true}");
 }
 
-// REQ-AGENTLOGIN-26, REQ-AGENTLOGIN-35
+// REQ-GRANT-36, REQ-GRANT-45
 #[tokio::test]
 async fn a_login_without_a_record_is_removed_when_the_login_ends() {
     for answer in [
@@ -475,7 +475,7 @@ fn earlier(provider: AgentLoginProvider, state: AgentLoginState, named: bool) ->
     }
 }
 
-// REQ-AGENTLOGIN-28, REQ-AGENTLOGIN-31
+// REQ-GRANT-38, REQ-GRANT-41
 #[tokio::test]
 async fn a_failed_status_request_keeps_a_provider_cloud_did_not_authorize() {
     for state in [
@@ -504,7 +504,7 @@ async fn a_failed_status_request_keeps_a_provider_cloud_did_not_authorize() {
     assert!(fixture.pass().await.logins.is_empty());
 }
 
-// REQ-AGENTLOGIN-28
+// REQ-GRANT-38
 #[tokio::test]
 async fn a_failed_status_request_marks_a_provider_cloud_authorized_cloud_unavailable() {
     // An install is kept as it was, and marked `cloud_unavailable`.
@@ -557,7 +557,7 @@ async fn a_failed_status_request_marks_a_provider_cloud_authorized_cloud_unavail
     }
 }
 
-// REQ-AGENTLOGIN-28
+// REQ-GRANT-38
 #[tokio::test]
 async fn a_pass_records_whether_cloud_names_an_authorization_in_force() {
     for (answer, selected) in [
@@ -593,7 +593,7 @@ async fn a_pass_records_whether_cloud_names_an_authorization_in_force() {
     }
 }
 
-// REQ-AGENTLOGIN-28
+// REQ-GRANT-38
 #[tokio::test]
 async fn a_pass_that_cloud_does_not_answer_keeps_whether_the_provider_is_selected() {
     for state in [
@@ -685,7 +685,7 @@ async fn a_pass_that_cannot_read_or_replace_its_record_or_start_records_why() {
     fixture.assert_pass_failure("agent_login_setup_spawn_failed", "io_error");
 }
 
-// REQ-AGENTLOGIN-28, REQ-AGENTLOGIN-30, REQ-TELEMETRY-45
+// REQ-GRANT-38, REQ-GRANT-40, REQ-TELEMETRY-45
 #[tokio::test]
 async fn a_pass_over_a_record_it_cannot_load_proceeds_as_if_nothing_were_recorded() {
     let revoked = || {
@@ -750,7 +750,7 @@ async fn a_pass_over_a_record_it_cannot_load_proceeds_as_if_nothing_were_recorde
     }
 }
 
-// REQ-AGENTLOGIN-28
+// REQ-GRANT-38
 #[tokio::test]
 async fn a_pass_keeps_the_entry_of_a_provider_this_build_does_not_know() {
     let fixture = Fixture::new(fake_codex_authorized(1));
@@ -788,7 +788,7 @@ async fn a_pass_keeps_the_entry_of_a_provider_this_build_does_not_know() {
     );
 }
 
-// REQ-AGENTLOGIN-26
+// REQ-GRANT-36
 #[tokio::test]
 async fn an_install_whose_file_is_gone_is_installed_again() {
     let fixture = Fixture::new(Ok(vec![
@@ -955,7 +955,7 @@ impl Fixture {
     }
 }
 
-// REQ-AGENTLOGIN-30, INV-RUNNER-15
+// REQ-GRANT-40, INV-RUNNER-15
 #[tokio::test]
 async fn cloud_naming_another_agent_login_ends_the_earlier_install_before_it_asks() {
     for (failure, state) in [
@@ -1015,7 +1015,7 @@ async fn cloud_naming_another_agent_login_ends_the_earlier_install_before_it_ask
     }
 }
 
-// REQ-AGENTLOGIN-30, REQ-AGENTLOGIN-26
+// REQ-GRANT-40, REQ-GRANT-36
 #[tokio::test]
 async fn an_install_recorded_elsewhere_is_ended_before_the_login_is_installed_again() {
     let fixture = Fixture::new(fake_codex_authorized(1));
@@ -1065,7 +1065,7 @@ async fn an_install_recorded_elsewhere_is_ended_before_the_login_is_installed_ag
     }
 }
 
-// REQ-AGENTLOGIN-32, INV-RUNNER-15
+// REQ-GRANT-42, INV-RUNNER-15
 #[tokio::test]
 async fn a_pass_first_removes_the_temporary_files_its_killed_writes_left() {
     let fixture = Fixture::new(Ok(vec![
@@ -1164,7 +1164,7 @@ fn assert_reported(
     );
 }
 
-// REQ-AGENTLOGIN-17, SC-AGENTLOGIN-1
+// REQ-GRANT-27, SC-GRANT-2
 #[tokio::test]
 async fn a_pass_reports_the_readiness_it_changed_before_it_ends() {
     let fixture = Fixture::new(naming(FAKE_AGENT_LOGIN_ID, 1));
@@ -1183,7 +1183,7 @@ async fn a_pass_reports_the_readiness_it_changed_before_it_ends() {
     assert_eq!(cloud.reports(), [reports[1].clone()]);
 }
 
-// REQ-AGENTLOGIN-17, REQ-AGENTLOGIN-28
+// REQ-GRANT-27, REQ-GRANT-38
 #[tokio::test]
 async fn the_first_pass_to_reach_cloud_after_an_outage_reports_the_state_it_reaches() {
     let fixture = Fixture::new(naming(FAKE_AGENT_LOGIN_ID, 1));
@@ -1209,7 +1209,7 @@ async fn the_first_pass_to_reach_cloud_after_an_outage_reports_the_state_it_reac
     assert_reported(&reports[1], Some(AgentLoginState::Ready), Some(1));
 }
 
-// REQ-AGENTLOGIN-17, REQ-TELEMETRY-45
+// REQ-GRANT-27, REQ-TELEMETRY-45
 #[tokio::test]
 async fn a_report_cloud_does_not_take_changes_nothing_the_pass_recorded() {
     for (failure, cause, status) in [
@@ -1232,7 +1232,7 @@ async fn a_report_cloud_does_not_take_changes_nothing_the_pass_recorded() {
     }
 }
 
-// REQ-AGENTLOGIN-26, REQ-AGENTLOGIN-34
+// REQ-GRANT-36, REQ-GRANT-44
 #[tokio::test]
 async fn a_token_file_the_runner_would_not_offer_is_installed_again() {
     let fixture = Fixture::new(Ok(vec![authorized(AgentLoginProvider::ClaudeCode, 1)]));
@@ -1265,7 +1265,7 @@ async fn a_token_file_the_runner_would_not_offer_is_installed_again() {
     assert!(claude_code::offered_token(&fixture.service(), &directory).is_some());
 }
 
-// REQ-AGENTLOGIN-30, REQ-RUNNERENROLL-86
+// REQ-GRANT-40, REQ-RUNNERENROLL-86
 #[tokio::test]
 async fn a_file_where_the_runners_directory_belongs_holds_no_login_to_end() {
     for answer in [
@@ -1309,7 +1309,7 @@ fn codex_report(report: &StatusRequest) -> &ProviderReport {
         .expect("the Codex report")
 }
 
-// REQ-AGENTLOGIN-40, REQ-AGENTLOGIN-17
+// REQ-GRANT-50, REQ-GRANT-27
 #[tokio::test]
 async fn a_login_the_closing_answer_no_longer_authorizes_is_removed_before_the_pass_ends() {
     let codex = |status| ProviderLogin {
@@ -1382,7 +1382,7 @@ async fn a_login_the_closing_answer_no_longer_authorizes_is_removed_before_the_p
     }
 }
 
-// REQ-AGENTLOGIN-40, REQ-AGENTLOGIN-17
+// REQ-GRANT-50, REQ-GRANT-27
 #[tokio::test]
 async fn a_closing_answer_that_still_authorizes_the_login_leaves_it_installed() {
     // A newer generation waits for the next pass; the same generation
@@ -1414,7 +1414,7 @@ async fn a_closing_answer_that_still_authorizes_the_login_leaves_it_installed() 
     }
 }
 
-// REQ-AGENTLOGIN-40, REQ-AGENTLOGIN-17, INV-RUNNER-15
+// REQ-GRANT-50, REQ-GRANT-27, INV-RUNNER-15
 #[tokio::test]
 async fn a_closing_answer_never_reached_or_never_asked_for_changes_nothing() {
     let revoked = Ok(vec![ProviderLogin {
@@ -1490,7 +1490,7 @@ fn codex_answer(status: LoginStatus) -> Result<Vec<ProviderLogin>, CloudFailure>
     }])
 }
 
-// REQ-AGENTLOGIN-30, REQ-AGENTLOGIN-26
+// REQ-GRANT-40, REQ-GRANT-36
 #[tokio::test]
 async fn ending_a_codex_login_removes_everything_in_the_runners_codex_home() {
     for (answer, state) in [
@@ -1547,7 +1547,7 @@ async fn ending_a_codex_login_removes_everything_in_the_runners_codex_home() {
     assert_eq!(installation.agent_login_id, OTHER_AGENT_LOGIN_ID);
 }
 
-// REQ-AGENTLOGIN-30, REQ-AGENTLOGIN-26
+// REQ-GRANT-40, REQ-GRANT-36
 #[tokio::test]
 async fn a_newer_generation_replaces_auth_json_alone() {
     let fixture = Fixture::new(fake_codex_authorized(1));
@@ -1577,7 +1577,7 @@ async fn a_newer_generation_replaces_auth_json_alone() {
     );
 }
 
-// REQ-AGENTLOGIN-30, REQ-AGENTLOGIN-35
+// REQ-GRANT-40, REQ-GRANT-45
 #[tokio::test]
 async fn ending_a_claude_code_login_removes_its_token_file_alone() {
     let fixture = Fixture::new(Ok(vec![
@@ -1611,7 +1611,7 @@ async fn ending_a_claude_code_login_removes_its_token_file_alone() {
     );
 }
 
-// REQ-AGENTLOGIN-30, REQ-AGENTLOGIN-26
+// REQ-GRANT-40, REQ-GRANT-36
 #[tokio::test]
 async fn a_link_in_the_codex_home_is_removed_without_touching_its_target() {
     let fixture = Fixture::new(fake_codex_authorized(1));
@@ -1643,7 +1643,7 @@ async fn a_link_in_the_codex_home_is_removed_without_touching_its_target() {
     );
 }
 
-// REQ-AGENTLOGIN-30, REQ-TELEMETRY-45
+// REQ-GRANT-40, REQ-TELEMETRY-45
 #[tokio::test]
 async fn a_codex_home_removal_that_fails_is_finished_by_the_next_pass() {
     let fixture = Fixture::new(fake_codex_authorized(1));
@@ -1662,7 +1662,7 @@ async fn a_codex_home_removal_that_fails_is_finished_by_the_next_pass() {
         AgentLoginState::InstallFailed
     );
     // The login itself is gone whatever else the removal could not take, so
-    // no later assignment is offered the revoked login (REQ-AGENTLOGIN-39).
+    // no later assignment is offered the revoked login (REQ-GRANT-49).
     assert!(!fixture.codex_home().join("auth.json").exists());
     let records = fixture.setup_records();
     let record = records.last().expect("the failed removal's record");
@@ -1682,7 +1682,7 @@ async fn a_codex_home_removal_that_fails_is_finished_by_the_next_pass() {
     assert!(!fixture.codex_home().exists());
 }
 
-// REQ-AGENTLOGIN-39, REQ-AGENTLOGIN-40, INV-RUNNER-15
+// REQ-GRANT-49, REQ-GRANT-50, INV-RUNNER-15
 #[tokio::test]
 async fn an_admissions_pass_installs_and_ends_without_consulting_the_assignment_gate() {
     let fixture = Fixture::new(fake_codex_authorized(1));
@@ -1709,7 +1709,7 @@ async fn an_admissions_pass_installs_and_ends_without_consulting_the_assignment_
     assert_eq!(fixture.recorded().as_ref(), Some(&document));
 }
 
-// REQ-AGENTLOGIN-39
+// REQ-GRANT-49
 #[tokio::test]
 async fn an_admissions_pass_waits_for_a_pass_in_flight_and_then_makes_its_own() {
     let fixture = Fixture::new(fake_codex_authorized(1));
@@ -1798,7 +1798,7 @@ fn used(outcome: UseOutcome) -> Option<LastUse> {
     Some(LastUse { outcome, at: now() })
 }
 
-// REQ-AGENTLOGIN-42, REQ-AGENTLOGIN-15, REQ-AGENTLOGIN-17, REQ-TELEMETRY-45
+// REQ-GRANT-52, REQ-GRANT-25, REQ-GRANT-27, REQ-TELEMETRY-45
 #[tokio::test]
 async fn a_noted_use_is_recorded_beside_its_install_and_stated_to_cloud() {
     let fixture = Fixture::new(fake_codex_authorized(2));
@@ -1849,7 +1849,7 @@ async fn a_noted_use_is_recorded_beside_its_install_and_stated_to_cloud() {
     );
 }
 
-// REQ-AGENTLOGIN-42
+// REQ-GRANT-52
 #[tokio::test]
 async fn a_use_of_an_earlier_generation_is_dropped_and_an_ending_clears_the_last_use() {
     let fixture = Fixture::new(fake_codex_authorized(2));
@@ -1895,7 +1895,7 @@ async fn a_use_of_an_earlier_generation_is_dropped_and_an_ending_clears_the_last
     );
 }
 
-// REQ-AGENTLOGIN-42, REQ-AGENTLOGIN-15
+// REQ-GRANT-52, REQ-GRANT-25
 #[tokio::test]
 async fn a_use_is_stated_to_cloud_only_beside_a_ready_install() {
     let fixture = Fixture::new(fake_codex_authorized(2));

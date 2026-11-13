@@ -15,7 +15,7 @@
 use crate::generated::models;
 use serde::{Deserialize, Serialize};
 
-/// ImportAgentLoginRequest : A member's import of one coding agent's login for one organization (REQ-AGENTLOGIN-1, REQ-AGENTLOGIN-2).
+/// ImportAgentLoginRequest : A member's import of one coding agent's login for one organization (REQ-GRANT-11, REQ-GRANT-12).
 #[derive(Clone, Default, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ImportAgentLoginRequest {
     /// The organization the agent login is for, by opaque ID or slug.
@@ -36,7 +36,7 @@ pub struct ImportAgentLoginRequest {
 }
 
 impl ImportAgentLoginRequest {
-    /// A member's import of one coding agent's login for one organization (REQ-AGENTLOGIN-1, REQ-AGENTLOGIN-2).
+    /// A member's import of one coding agent's login for one organization (REQ-GRANT-11, REQ-GRANT-12).
     pub fn new(
         organization: String,
         provider: Provider,

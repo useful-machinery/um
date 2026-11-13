@@ -2,8 +2,8 @@
 //! the runner may hold, fetching one delivery at a time, keeping it in the
 //! runner's own agent-login directory, recording each provider's readiness,
 //! and offering what it keeps to each assignment it admits, once it has set
-//! them up for that admission (REQ-AGENTLOGIN-39), noting how the provider
-//! answered each use of what it offered (REQ-AGENTLOGIN-42).
+//! them up for that admission (REQ-GRANT-49), noting how the provider
+//! answered each use of what it offered (REQ-GRANT-52).
 
 pub(crate) mod claude_code;
 pub(crate) mod cloud;
@@ -149,7 +149,7 @@ impl FailureCause {
 }
 
 /// What an admission is offered: the environment its steps draw from, and
-/// the login variables withheld from it (REQ-AGENTLOGIN-41, INV-RUNNER-17).
+/// the login variables withheld from it (REQ-GRANT-51, INV-RUNNER-17).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct Offer {
     /// The process environment, with each agent login the runner offers
@@ -162,7 +162,7 @@ pub(crate) struct Offer {
     pub(crate) withheld: Vec<&'static str>,
     /// Each variable added to `environment` whose login the readiness
     /// document records as installed, with that install: the uses an
-    /// admission notes (REQ-AGENTLOGIN-42).
+    /// admission notes (REQ-GRANT-52).
     pub(crate) offered: Vec<OfferedLogin>,
 }
 
@@ -181,7 +181,7 @@ pub(crate) struct OfferedLogin {
 /// `directory`: `process`, with each login added as the variable its coding
 /// agent reads (`CODEX_HOME`, `CLAUDE_CODE_OAUTH_TOKEN`) where the service
 /// has no login of that agent's own, and the variable withheld instead where
-/// the runner keeps none of a selected provider's login (REQ-AGENTLOGIN-41).
+/// the runner keeps none of a selected provider's login (REQ-GRANT-51).
 /// A variable the process environment carries is never replaced or
 /// withheld, and the process environment itself is never changed. A missing
 /// or unreadable readiness document selects nothing, and records no install

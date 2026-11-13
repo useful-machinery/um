@@ -1,13 +1,13 @@
 //! The readiness document, `.runner-agent-logins.json` beside the runner
 //! state (`runner-agent-logins-v1`): each provider's readiness and the record
 //! of what the runner installed. It holds no login material
-//! (REQ-AGENTLOGIN-28). A missing document means the
+//! (REQ-GRANT-38). A missing document means the
 //! runner has installed nothing. An entry for a provider this build does not
 //! know, which a newer `um` may have written, is kept as it was read.
 //! A coding agent's entry records whether its provider is selected; one an
 //! earlier `um` wrote without it reads as selected by its state. Beside an
 //! install it records how the provider answered the login's last use
-//! (REQ-AGENTLOGIN-42).
+//! (REQ-GRANT-52).
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -70,15 +70,15 @@ pub(crate) struct LoginReadiness {
     pub(crate) login: Option<RecordedLogin>,
     /// Whether Cloud's last answer named an authorization in force for the
     /// provider: `authorized`, `unauthorized` or `unsupported_target`
-    /// (REQ-AGENTLOGIN-28).
+    /// (REQ-GRANT-38).
     pub(crate) selected: bool,
     /// How the provider answered the last use of the login installed, and
-    /// when; only ever beside an install (REQ-AGENTLOGIN-42).
+    /// when; only ever beside an install (REQ-GRANT-52).
     pub(crate) last_use: Option<LastUse>,
 }
 
 /// How the provider answered an agent step that received the login's
-/// variable (REQ-AGENTLOGIN-42), as the control socket also reports it.
+/// variable (REQ-GRANT-52), as the control socket also reports it.
 pub(crate) use crate::control_protocol::AgentLoginUse as UseOutcome;
 
 /// The last use of an installed login: how the provider answered it, and
@@ -91,7 +91,7 @@ pub(crate) struct LastUse {
 
 /// Whether an entry written before selection was recorded reads as
 /// selected: exactly when its state is one only an authorized login has
-/// (REQ-AGENTLOGIN-28).
+/// (REQ-GRANT-38).
 pub(crate) const fn selected_by_state(state: AgentLoginState) -> bool {
     state.selected_by_state()
 }
@@ -141,7 +141,7 @@ pub(crate) enum ReadinessError {
 impl ReadinessError {
     /// Whether a load failed because what is at the path is not the runner's
     /// document (not its private file, over its bound, or not a valid
-    /// document), which a setup replaces (REQ-AGENTLOGIN-28). Any other I/O
+    /// document), which a setup replaces (REQ-GRANT-38). Any other I/O
     /// failure says nothing about the document, which stays.
     pub(crate) const fn replaceable(self) -> bool {
         matches!(

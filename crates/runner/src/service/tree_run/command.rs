@@ -6,7 +6,7 @@
 //! (REQ-TRIGGER-136), and the `um workflow run` control command each Cloud control names
 //! (REQ-RUNNERENROLL-90).
 //! Each runs with the daemon's environment whole, with the agent logins offered to the
-//! assignment (REQ-AGENTLOGIN-27, REQ-AGENTLOGIN-34), and `UM_HOME` set to the run-scoped
+//! assignment (REQ-GRANT-37, REQ-GRANT-44), and `UM_HOME` set to the run-scoped
 //! home; the runtime's own admission applies the root's passthrough to each step
 //! (REQ-WFEXEC-22), so no step sees a runner-private name.
 //!

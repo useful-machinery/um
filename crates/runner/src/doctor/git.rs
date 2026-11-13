@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 use std::fmt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -83,6 +83,47 @@ impl DoctorCheck for GitCheck {
             ),
         }
     }
+}
+
+/// The top level of the Git repository holding `directory`, read with
+/// `git rev-parse --show-toplevel` in it under the Git check's bounds; nothing else is asked.
+pub fn repository_root(
+    runner: &dyn CommandRunner,
+    directory: &Path,
+) -> Result<PathBuf, RepositoryRootError> {
+    let output = runner
+        .run(CommandRequest {
+            program: Path::new("git"),
+            args: &["rev-parse", "--show-toplevel"],
+            timeout: SYSTEM_TIMEOUT,
+            maximum_stdout_bytes: MAXIMUM_STDOUT_BYTES,
+            clear_environment: false,
+            environment: &[],
+            current_directory: Some(directory),
+        })
+        .map_err(RepositoryRootError::Probe)?;
+    if !output.success {
+        return Err(RepositoryRootError::Failed);
+    }
+    std::str::from_utf8(&output.stdout)
+        .ok()
+        .filter(|_| !output.truncated)
+        .map(|text| text.trim_end_matches(['\n', '\r']))
+        .filter(|root| !root.is_empty())
+        .map(PathBuf::from)
+        .ok_or(RepositoryRootError::NoRoot)
+}
+
+/// Why [`repository_root`] has no root to report.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RepositoryRootError {
+    /// `git` could not be run or its answer read.
+    Probe(CommandProbeError),
+    /// `git rev-parse --show-toplevel` exited unsuccessfully: Git's exit status does not say
+    /// whether the directory is in no repository or Git failed otherwise.
+    Failed,
+    /// It succeeded but printed no root: nothing, a truncated answer, or one not UTF-8.
+    NoRoot,
 }
 
 /// The host of the `origin` remote of the repository holding `directory`, read with

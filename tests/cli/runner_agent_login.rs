@@ -1,12 +1,13 @@
 use super::*;
 
 use std::io::{BufRead as _, BufReader};
-use std::os::unix::net::UnixListener;
+use std::os::unix::net::{UnixListener, UnixStream};
 
 use base64::Engine as _;
 use futures_util::{SinkExt as _, StreamExt as _};
 use tokio_tungstenite::tungstenite::Message;
 
+use super::grant::after_notice;
 use super::runner_status::{
     ServeStatusFixture, accept_runner_connection_answering, accept_runner_socket,
     cloud_observation_ack, cloud_welcome, write_status_config,
@@ -36,10 +37,20 @@ fn synced_response(codex: &str) -> Vec<u8> {
 
 const READY_CODEX: &str = r#"{"provider":"codex","state":"ready","agentLoginId":"agl_01k0z6r1w8f4jy2m7q9v3x5abc","generation":3,"checkedAt":"2026-11-12T01:00:00Z","installedAt":"2026-11-12T00:55:00Z"}"#;
 
-/// Runs `um runner agent-login sync --config PATH` and `extra` against a fake
-/// control socket that answers `response` to one request, and returns the
-/// command's output with the request the socket received.
-fn sync_against(response: Vec<u8>, extra: &[&str]) -> (Output, Vec<u8>) {
+/// The sync command (REQ-GRANT-41).
+const SYNC: [&str; 3] = ["runner", "grant", "sync"];
+/// Its earlier spelling, which sends the same request and prints the same
+/// output with the same exit status, after a line on standard error naming
+/// `um runner grant sync` (REQ-GRANT-77).
+const EARLIER_SYNC: [&str; 3] = ["runner", "agent-login", "sync"];
+
+const BUSY_RESPONSE: &[u8] =
+    b"{\"schemaVersion\":1,\"outcome\":\"error\",\"error\":\"runner_busy\"}\n";
+
+/// Runs `command --config PATH` and `extra` against a fake control socket
+/// that answers `response` to one request, and returns the command's output
+/// with the request the socket received.
+fn sync_against(command: [&str; 3], response: Vec<u8>, extra: &[&str]) -> (Output, Vec<u8>) {
     let directory = private_credential_directory();
     let runtime = tempfile::tempdir_in("/tmp").unwrap();
     let socket_path = runtime.path().join("runner.sock");
@@ -49,23 +60,37 @@ fn sync_against(response: Vec<u8>, extra: &[&str]) -> (Output, Vec<u8>) {
         let mut reader = BufReader::new(stream);
         let mut request = Vec::new();
         reader.read_until(b'\n', &mut request).unwrap();
-        reader.get_mut().write_all(&response).unwrap();
+        // A command that never connected leaves only the closed stream
+        // below, which cannot take the answer.
+        let _ = reader.get_mut().write_all(&response);
         request
     });
     let config = write_status_config(&directory, &socket_path);
-    let mut args = vec!["runner", "agent-login", "sync", "--config", &config];
+    let mut args = command.to_vec();
+    args.extend_from_slice(&["--config", &config]);
     args.extend_from_slice(extra);
     let output = run_with_env(
         &args,
         &[("UM_API_URL", "https://cloud-sync-must-not-be-read.example")],
     );
+    // Release the server if the command exited without connecting, so the
+    // test fails on the empty request instead of waiting forever.
+    drop(UnixStream::connect(&socket_path));
     (output, server.join().unwrap())
 }
 
-// REQ-AGENTLOGIN-31
+/// Runs `command --config PATH` with no runner listening on the socket the
+/// configuration names.
+fn sync_with_no_live_runner(command: [&str; 3], config: &str) -> Output {
+    let mut args = command.to_vec();
+    args.extend_from_slice(&["--config", config]);
+    run(&args)
+}
+
+// REQ-GRANT-41
 #[test]
 fn sync_asks_the_live_runner_and_prints_each_provider_readiness() {
-    let (output, request) = sync_against(synced_response(READY_CODEX), &[]);
+    let (output, request) = sync_against(SYNC, synced_response(READY_CODEX), &[]);
 
     assert_eq!(request, SYNC_REQUEST);
     assert_eq!(output.status.code(), Some(0));
@@ -82,8 +107,51 @@ fn sync_asks_the_live_runner_and_prints_each_provider_readiness() {
     assert!(output.stderr.is_empty());
 }
 
+// REQ-GRANT-41
+// REQ-GRANT-77
+#[test]
+fn the_earlier_sync_spelling_prints_the_same_output_and_exit_status() {
+    let refused = READY_CODEX.replace(
+        r#""installedAt""#,
+        r#""selected":true,"lastUse":"refused","installedAt""#,
+    );
+    for (response, code) in [
+        (synced_response(READY_CODEX), 0),
+        (synced_response(&refused), 1),
+        (BUSY_RESPONSE.to_vec(), 4),
+    ] {
+        for extra in [&[][..], &["--json"][..]] {
+            let (output, request) = sync_against(SYNC, response.clone(), extra);
+            let (earlier, earlier_request) = sync_against(EARLIER_SYNC, response.clone(), extra);
+            assert_eq!(request, SYNC_REQUEST);
+            assert_eq!(earlier_request, SYNC_REQUEST);
+            assert_eq!(output.status.code(), Some(code), "{extra:?}");
+            assert_eq!(earlier.status.code(), Some(code), "{extra:?}");
+            assert_eq!(earlier.stdout, output.stdout, "{extra:?}");
+            assert_eq!(
+                after_notice(&earlier, "um runner grant sync").as_bytes(),
+                output.stderr,
+                "{extra:?}"
+            );
+        }
+    }
+
+    let directory = private_credential_directory();
+    let runtime = tempfile::tempdir_in("/tmp").unwrap();
+    let config = write_status_config(&directory, &runtime.path().join("runner.sock"));
+    let output = sync_with_no_live_runner(SYNC, &config);
+    let earlier = sync_with_no_live_runner(EARLIER_SYNC, &config);
+    assert_eq!(output.status.code(), Some(4));
+    assert_eq!(earlier.status.code(), Some(4));
+    assert_eq!(earlier.stdout, output.stdout);
+    assert_eq!(
+        after_notice(&earlier, "um runner grant sync").as_bytes(),
+        output.stderr
+    );
+}
+
 /// Asserts that `stdout` has exactly one line per provider, in order, each
-/// naming the provider's state and availability (REQ-AGENTLOGIN-43).
+/// naming the provider's state and availability (REQ-GRANT-53).
 pub(super) fn assert_provider_lines(stdout: &str, providers: &[(&str, &str, &str)]) {
     let lines = stdout
         .lines()
@@ -101,10 +169,10 @@ pub(super) fn assert_provider_lines(stdout: &str, providers: &[(&str, &str, &str
     }
 }
 
-// REQ-AGENTLOGIN-31
+// REQ-GRANT-41
 #[test]
 fn sync_json_prints_the_readiness_as_a_document() {
-    let (output, request) = sync_against(synced_response(READY_CODEX), &["--json"]);
+    let (output, request) = sync_against(SYNC, synced_response(READY_CODEX), &["--json"]);
 
     assert_eq!(request, SYNC_REQUEST);
     assert_eq!(output.status.code(), Some(0));
@@ -112,7 +180,7 @@ fn sync_json_prints_the_readiness_as_a_document() {
     assert_eq!(document["schemaVersion"], 1);
     assert_eq!(document["outcome"], "synced");
     // The control socket's readiness, each provider with its availability
-    // and next action (REQ-AGENTLOGIN-43).
+    // and next action (REQ-GRANT-53).
     let mut expected = serde_json::from_slice::<serde_json::Value>(&synced_response(READY_CODEX))
         .unwrap()["agentLogins"]
         .clone();
@@ -133,7 +201,7 @@ fn sync_json_prints_the_readiness_as_a_document() {
     assert_eq!(document["agentLogins"], expected);
 }
 
-// REQ-AGENTLOGIN-31, REQ-AGENTLOGIN-43
+// REQ-GRANT-41, REQ-GRANT-53
 #[test]
 fn sync_reports_each_providers_availability_and_fails_a_login_refused_at_its_last_use() {
     let used = |last_use: &str| {
@@ -153,7 +221,7 @@ fn sync_reports_each_providers_availability_and_fails_a_login_refused_at_its_las
             "restore_membership",
         ),
     ] {
-        let (output, _) = sync_against(synced_response(&codex), &["--json"]);
+        let (output, _) = sync_against(SYNC, synced_response(&codex), &["--json"]);
         assert_eq!(output.status.code(), Some(code), "{codex}");
         let document: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
         let providers = document["agentLogins"]["providers"].as_array().unwrap();
@@ -167,7 +235,7 @@ fn sync_reports_each_providers_availability_and_fails_a_login_refused_at_its_las
             "{document}"
         );
 
-        let (output, _) = sync_against(synced_response(&codex), &[]);
+        let (output, _) = sync_against(SYNC, synced_response(&codex), &[]);
         assert_eq!(output.status.code(), Some(code), "{codex}");
         let stdout = String::from_utf8(output.stdout).unwrap();
         let codex_line = stdout.lines().next().unwrap();
@@ -181,7 +249,7 @@ fn sync_reports_each_providers_availability_and_fails_a_login_refused_at_its_las
     }
 }
 
-// REQ-AGENTLOGIN-31
+// REQ-GRANT-41
 #[test]
 fn sync_exits_1_only_when_an_authorized_provider_is_not_ready() {
     for (codex, code) in [
@@ -203,38 +271,36 @@ fn sync_exits_1_only_when_an_authorized_provider_is_not_ready() {
         ),
     ] {
         for extra in [&[][..], &["--json"][..]] {
-            let (output, _) = sync_against(synced_response(codex), extra);
+            let (output, _) = sync_against(SYNC, synced_response(codex), extra);
             assert_eq!(output.status.code(), Some(code), "{codex} {extra:?}");
             assert!(!output.stdout.is_empty());
         }
     }
 }
 
-// REQ-AGENTLOGIN-31
+// REQ-GRANT-41
 #[test]
 fn sync_exits_4_when_no_runner_is_live_or_it_holds_an_assignment() {
     let directory = private_credential_directory();
     let runtime = tempfile::tempdir_in("/tmp").unwrap();
     let config = write_status_config(&directory, &runtime.path().join("runner.sock"));
-    let absent = run(&["runner", "agent-login", "sync", "--config", &config]);
+    let absent = sync_with_no_live_runner(SYNC, &config);
     assert_eq!(absent.status.code(), Some(4));
     assert!(absent.stdout.is_empty());
     assert!(!absent.stderr.is_empty());
 
-    let (busy, request) = sync_against(
-        b"{\"schemaVersion\":1,\"outcome\":\"error\",\"error\":\"runner_busy\"}\n".to_vec(),
-        &["--json"],
-    );
+    let (busy, request) = sync_against(SYNC, BUSY_RESPONSE.to_vec(), &["--json"]);
     assert_eq!(request, SYNC_REQUEST);
     assert_eq!(busy.status.code(), Some(4));
     assert!(busy.stdout.is_empty());
     assert!(String::from_utf8_lossy(&busy.stderr).contains("runner_busy"));
 }
 
-// REQ-AGENTLOGIN-31
+// REQ-GRANT-41
 #[test]
 fn sync_against_an_older_runner_says_it_must_be_restarted_on_this_release() {
     let (output, _) = sync_against(
+        SYNC,
         b"{\"schemaVersion\":1,\"outcome\":\"error\",\"error\":\"invalid_request\"}\n".to_vec(),
         &[],
     );
@@ -418,7 +484,7 @@ impl ServedRunner {
     }
 }
 
-// REQ-RUNNERENROLL-86, REQ-AGENTLOGIN-31, REQ-AGENTLOGIN-28
+// REQ-RUNNERENROLL-86, REQ-GRANT-41, REQ-GRANT-38
 #[test]
 fn a_runner_with_nothing_authorized_passes_against_a_cloud_without_the_routes() {
     let ServedRunner {
@@ -449,7 +515,7 @@ fn a_runner_with_nothing_authorized_passes_against_a_cloud_without_the_routes() 
     );
 }
 
-// REQ-AGENTLOGIN-26, REQ-AGENTLOGIN-27, REQ-AGENTLOGIN-32, REQ-AGENTLOGIN-34
+// REQ-GRANT-36, REQ-GRANT-37, REQ-GRANT-42, REQ-GRANT-44
 #[test]
 fn installed_agent_logins_reach_their_files_and_no_output() {
     let ServedRunner {
@@ -477,8 +543,8 @@ fn installed_agent_logins_reach_their_files_and_no_output() {
     assert_eq!(synced["agentLogins"]["providers"][1]["state"], "ready");
     assert_eq!(synced["agentLogins"]["providers"][1]["generation"], 1);
     // Both logins are in the runner's own directory beside its state, and
-    // nothing is written under the service's home (REQ-AGENTLOGIN-26,
-    // REQ-AGENTLOGIN-27).
+    // nothing is written under the service's home (REQ-GRANT-36,
+    // REQ-GRANT-37).
     let mode =
         |path: &std::path::Path| fs::symlink_metadata(path).unwrap().permissions().mode() & 0o777;
     let directory = fixture.state_directory().join(".runner-agent-login");

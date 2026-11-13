@@ -32,7 +32,7 @@ fn state_directory() -> tempfile::TempDir {
     directory
 }
 
-// REQ-AGENTLOGIN-28
+// REQ-GRANT-38
 #[test]
 fn the_document_lives_beside_the_runner_state() {
     assert_eq!(
@@ -41,7 +41,7 @@ fn the_document_lives_beside_the_runner_state() {
     );
 }
 
-// REQ-AGENTLOGIN-28, REQ-AGENTLOGIN-32
+// REQ-GRANT-38, REQ-GRANT-42
 #[test]
 fn the_document_records_an_install_without_its_material() {
     let login_root = tempfile::tempdir().unwrap();
@@ -115,7 +115,7 @@ fn the_document_records_an_install_without_its_material() {
     );
 }
 
-// REQ-AGENTLOGIN-28
+// REQ-GRANT-38
 #[test]
 fn every_readiness_state_round_trips_and_a_missing_document_is_none() {
     let state = state_directory();
@@ -167,7 +167,7 @@ fn every_readiness_state_round_trips_and_a_missing_document_is_none() {
     assert_eq!(entries, [READINESS_FILE]);
 }
 
-// REQ-AGENTLOGIN-28, REQ-AGENTLOGIN-42, REQ-AGENTLOGIN-43
+// REQ-GRANT-38, REQ-GRANT-52, REQ-GRANT-53
 #[test]
 fn the_last_use_of_an_install_round_trips_beside_it_and_only_there() {
     let state = state_directory();
@@ -207,7 +207,7 @@ fn the_last_use_of_an_install_round_trips_beside_it_and_only_there() {
         assert_eq!(ReadinessDocument::load(&path), Ok(Some(document.clone())));
         // The control socket reports the last use and the selection, but
         // neither when the use was nor where the install is
-        // (REQ-AGENTLOGIN-43, REQ-RUNNERENROLL-63).
+        // (REQ-GRANT-53, REQ-RUNNERENROLL-63).
         let reported = serde_json::to_value(document.reported().unwrap()).unwrap();
         let entry = &reported["providers"][0];
         assert_eq!(
@@ -274,7 +274,7 @@ fn the_last_use_of_an_install_round_trips_beside_it_and_only_there() {
     }
 }
 
-// REQ-AGENTLOGIN-28
+// REQ-GRANT-38
 #[test]
 fn an_entry_for_a_provider_this_build_does_not_know_survives_a_rewrite_verbatim() {
     let state = state_directory();
@@ -334,7 +334,7 @@ fn an_entry_for_a_provider_this_build_does_not_know_survives_a_rewrite_verbatim(
     assert_eq!(reported.providers.len(), entries.len() - 1);
 }
 
-// REQ-AGENTLOGIN-28
+// REQ-GRANT-38
 #[test]
 fn an_entry_written_before_selection_was_recorded_is_selected_by_its_state() {
     let state = state_directory();
@@ -363,7 +363,7 @@ fn an_entry_written_before_selection_was_recorded_is_selected_by_its_state() {
     }
 }
 
-// REQ-AGENTLOGIN-28
+// REQ-GRANT-38
 #[test]
 fn only_a_document_that_is_not_the_runners_record_is_replaced() {
     use std::io::ErrorKind;
@@ -436,7 +436,7 @@ fn reading_rejects_a_bad_record() {
     );
 }
 
-// REQ-AGENTLOGIN-28
+// REQ-GRANT-38
 #[test]
 fn canonical_schema_and_the_runner_accept_only_valid_readiness_fixtures() {
     let validator = validator();

@@ -97,7 +97,7 @@ impl Sequence {
     }
 }
 
-/// How long the runner waits between agent-login setups (REQ-AGENTLOGIN-29).
+/// How long the runner waits between agent-login setups (REQ-GRANT-39).
 const AGENT_LOGIN_SETUP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5 * 60);
 const SHUTDOWN_DELIVERY_RESERVE: std::time::Duration = std::time::Duration::from_secs(10);
 const SHUTDOWN_CLEANUP_RESERVE: std::time::Duration = std::time::Duration::from_secs(5);
@@ -227,7 +227,7 @@ struct ReloadDependencies {
 /// The assignment manager as the periodic and `sync` agent-login passes see
 /// it: idle when it holds no assignment in any state, and kept idle by its
 /// lock while setup installs or removes a login (INV-RUNNER-15). An
-/// admission's own pass does not consult it (REQ-AGENTLOGIN-39).
+/// admission's own pass does not consult it (REQ-GRANT-49).
 struct IdleAssignmentGate {
     assignment_manager: Arc<Mutex<AssignmentManager>>,
     // Setup runs on a thread of its own, and reading the manager's state may
@@ -692,7 +692,7 @@ async fn connection_loop_with_work_root(
         ))
     });
     // Each admission sets agent logins up for itself before it offers them
-    // (REQ-AGENTLOGIN-39).
+    // (REQ-GRANT-49).
     if let Some(setup) = &agent_login_setup {
         assignment_manager
             .lock()
@@ -4684,7 +4684,7 @@ mod tests {
             }
         }
 
-        // REQ-AGENTLOGIN-29, REQ-TELEMETRY-45
+        // REQ-GRANT-39, REQ-TELEMETRY-45
         #[tokio::test]
         async fn starting_installs_an_authorized_login_without_holding_up_the_connection() {
             let cloud = FakeAgentLoginCloud::new(fake_codex_authorized(1));
@@ -4738,7 +4738,7 @@ mod tests {
             service.stop().await;
         }
 
-        // REQ-AGENTLOGIN-29, INV-RUNNER-15
+        // REQ-GRANT-39, INV-RUNNER-15
         #[tokio::test]
         async fn an_unavailable_cloud_neither_stops_serving_nor_runs_setup_during_an_assignment() {
             let cloud = FakeAgentLoginCloud::new(Err(CloudFailure::Transport));
@@ -4750,7 +4750,7 @@ mod tests {
             );
             service.pass_ended().await;
             // Nothing was authorized, so an unanswered Cloud changes nothing
-            // (REQ-AGENTLOGIN-28).
+            // (REQ-GRANT-38).
             assert_eq!(service.recorded_codex(), None);
             assert!(service.setup_records().is_empty());
 
@@ -4796,7 +4796,7 @@ mod tests {
             service.stop().await;
         }
 
-        // REQ-AGENTLOGIN-30, INV-RUNNER-15, REQ-TELEMETRY-45
+        // REQ-GRANT-40, INV-RUNNER-15, REQ-TELEMETRY-45
         #[tokio::test]
         async fn an_ended_login_is_removed_and_an_unrecorded_one_is_the_runners_own() {
             let cloud = FakeAgentLoginCloud::new(fake_codex_authorized(1));
@@ -4841,7 +4841,7 @@ mod tests {
             // own: replaced by a delivery, and removed when the login ends.
             cloud.answer(Ok(Vec::new()));
             service.next_pass().await;
-            // The ending removed the whole Codex home (REQ-AGENTLOGIN-30).
+            // The ending removed the whole Codex home (REQ-GRANT-40).
             fs::create_dir_all(service.auth_path().parent().unwrap()).unwrap();
             fs::write(service.auth_path(), b"{\"unrecorded\":true}").unwrap();
             cloud.answer(fake_codex_authorized(5));
@@ -4860,7 +4860,7 @@ mod tests {
             service.stop().await;
         }
 
-        // REQ-AGENTLOGIN-30, INV-RUNNER-15
+        // REQ-GRANT-40, INV-RUNNER-15
         #[tokio::test]
         async fn a_setup_due_during_an_assignment_waits_for_its_release() {
             let (listener, endpoint) = fixture_listener().await;

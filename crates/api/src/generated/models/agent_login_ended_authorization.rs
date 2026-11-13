@@ -15,7 +15,7 @@
 use crate::generated::models;
 use serde::{Deserialize, Serialize};
 
-/// AgentLoginEndedAuthorization : The authorization of an agent login that ended last for one runner, with whether that runner has confirmed removing the login and the stop requested of the run it held (REQ-AGENTLOGIN-3, REQ-AGENTLOGIN-37, REQ-AGENTLOGIN-38).
+/// AgentLoginEndedAuthorization : The authorization of an agent login that ended last for one runner, with whether that runner has confirmed removing the login and the stop requested of the run it held (REQ-GRANT-13, REQ-GRANT-47, REQ-GRANT-48).
 #[derive(Clone, Default, Debug, PartialEq, Serialize, Deserialize)]
 pub struct AgentLoginEndedAuthorization {
     /// The authorization's opaque identifier.
@@ -41,7 +41,7 @@ pub struct AgentLoginEndedAuthorization {
 }
 
 impl AgentLoginEndedAuthorization {
-    /// The authorization of an agent login that ended last for one runner, with whether that runner has confirmed removing the login and the stop requested of the run it held (REQ-AGENTLOGIN-3, REQ-AGENTLOGIN-37, REQ-AGENTLOGIN-38).
+    /// The authorization of an agent login that ended last for one runner, with whether that runner has confirmed removing the login and the stop requested of the run it held (REQ-GRANT-13, REQ-GRANT-47, REQ-GRANT-48).
     pub fn new(
         id: String,
         runner_id: String,

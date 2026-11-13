@@ -149,7 +149,7 @@ impl AgentLoginProvider {
     }
 }
 
-/// A provider's readiness state (REQ-AGENTLOGIN-28).
+/// A provider's readiness state (REQ-GRANT-38).
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentLoginState {
@@ -166,11 +166,11 @@ pub enum AgentLoginState {
 
 impl AgentLoginState {
     /// Whether the provider is, or may be, authorized for the runner without
-    /// its login being ready (REQ-AGENTLOGIN-31): every state but `ready`,
+    /// its login being ready (REQ-GRANT-41): every state but `ready`,
     /// the two Cloud answers that no login is authorized, and the brokered
     /// providers' `not_delivered`. `cloud_unavailable` counts: a runner
     /// records it only for a provider it last knew as authorized or
-    /// installed (REQ-AGENTLOGIN-28).
+    /// installed (REQ-GRANT-38).
     pub const fn fails_readiness(self) -> bool {
         !matches!(
             self,
@@ -180,7 +180,7 @@ impl AgentLoginState {
 
     /// Whether an entry written before selection was recorded reads as
     /// selected: exactly when its state is one only an authorized login has
-    /// (REQ-AGENTLOGIN-28).
+    /// (REQ-GRANT-38).
     pub const fn selected_by_state(self) -> bool {
         matches!(self, Self::Ready) || self.fails_readiness()
     }
@@ -202,7 +202,7 @@ impl AgentLoginState {
 }
 
 /// How the provider answered the last use of an installed login
-/// (REQ-AGENTLOGIN-42).
+/// (REQ-GRANT-52).
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentLoginUse {
@@ -230,19 +230,19 @@ pub struct ProviderReadiness {
     pub checked_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub installed_at: Option<String>,
-    /// Whether the provider is selected (REQ-AGENTLOGIN-41); absent where
+    /// Whether the provider is selected (REQ-GRANT-51); absent where
     /// the document records none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selected: Option<bool>,
     /// How the provider answered the last use of the login installed
-    /// (REQ-AGENTLOGIN-42); only ever beside an install.
+    /// (REQ-GRANT-52); only ever beside an install.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_use: Option<AgentLoginUse>,
 }
 
 impl ProviderReadiness {
     /// Whether the provider is selected; an entry that records no selection
-    /// is selected by its state (REQ-AGENTLOGIN-28).
+    /// is selected by its state (REQ-GRANT-38).
     pub const fn is_selected(&self) -> bool {
         match self.selected {
             Some(selected) => selected,
@@ -251,7 +251,7 @@ impl ProviderReadiness {
     }
 
     /// The provider's availability and next action on the runner
-    /// (REQ-AGENTLOGIN-43).
+    /// (REQ-GRANT-53).
     pub const fn credential_status(&self) -> CredentialStatus {
         let (availability, next_action) = match self.state {
             AgentLoginState::Ready => match self.last_use {
@@ -288,10 +288,10 @@ impl ProviderReadiness {
     }
 
     /// The failure code of a provider Cloud authorized for the runner whose
-    /// login is not ready to use (REQ-AGENTLOGIN-31, REQ-RUNNERENROLL-86):
+    /// login is not ready to use (REQ-GRANT-41, REQ-RUNNERENROLL-86):
     /// its state when that fails readiness, or when it is `not_authorized`
     /// on a selected provider, whose login every admission withholds
-    /// (REQ-AGENTLOGIN-41); `reconnect_required` for a `ready` login refused
+    /// (REQ-GRANT-51); `reconnect_required` for a `ready` login refused
     /// at its last use; and `None` otherwise.
     pub const fn failure_code(&self) -> Option<&'static str> {
         if self.state.fails_readiness()
@@ -744,7 +744,7 @@ mod tests {
         }
     }
 
-    // REQ-AGENTLOGIN-31
+    // REQ-GRANT-41
     #[test]
     fn only_an_authorized_provider_that_is_not_ready_fails_readiness() {
         for (state, fails) in [
@@ -762,7 +762,7 @@ mod tests {
         }
     }
 
-    // REQ-AGENTLOGIN-43
+    // REQ-GRANT-53
     #[test]
     fn each_readiness_maps_to_one_availability_and_next_action() {
         use AgentLoginState as S;
@@ -822,7 +822,7 @@ mod tests {
                 N::None,
             ),
             // An entry written before selection was recorded is selected
-            // by its state (REQ-AGENTLOGIN-28): `not_authorized` is not.
+            // by its state (REQ-GRANT-38): `not_authorized` is not.
             (S::NotAuthorized, None, None, A::NotConnected, N::None),
             (S::Revoked, Some(false), None, A::NotConnected, N::None),
             (
@@ -862,7 +862,7 @@ mod tests {
         }
     }
 
-    // REQ-AGENTLOGIN-31, REQ-RUNNERENROLL-86
+    // REQ-GRANT-41, REQ-RUNNERENROLL-86
     #[test]
     fn a_ready_login_refused_at_its_last_use_fails_readiness() {
         let mut entry = readiness().providers[0].clone();
@@ -879,7 +879,7 @@ mod tests {
         assert_eq!(entry.failure_code(), Some("install_failed"));
     }
 
-    // REQ-AGENTLOGIN-31, REQ-RUNNERENROLL-86, REQ-AGENTLOGIN-41
+    // REQ-GRANT-41, REQ-RUNNERENROLL-86, REQ-GRANT-51
     #[test]
     fn a_selected_provider_cloud_refuses_fails_readiness() {
         // Cloud names an authorization in force and refuses its owner: the
@@ -929,7 +929,7 @@ mod tests {
         );
 
         // Selection and last use travel beside the state where the
-        // document records them (REQ-AGENTLOGIN-43).
+        // document records them (REQ-GRANT-53).
         let mut with_last_use = readiness();
         with_last_use.providers[0].selected = Some(true);
         with_last_use.providers[0].last_use = Some(AgentLoginUse::Refused);

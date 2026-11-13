@@ -1,12 +1,14 @@
 use super::*;
 
+use super::grant::{after_notice, assert_next_actions_name_the_grant_commands};
+
 const TOKEN: &str = "unique-agent-login-session-token";
 const AGENT_LOGIN_ID: &str = "agl_01k0z6r1w8f4jy2m7q9v3x5abc";
 const SECOND_AGENT_LOGIN_ID: &str = "agl_01k0z6r1w8f4jy2m7q9v3x5abd";
 const ORGANIZATION_ID: &str = "org_01k0z6r1w8f4jy2m7q9v3x5abc";
 const RUNNER_ID: &str = "rnr_01k0z6r1w8f4jy2m7q9v3x5abc";
 const SECOND_RUNNER_ID: &str = "rnr_01k0z6r1w8f4jy2m7q9v3x5abd";
-const SENTINEL: &str = "private-agent-login-material-sentinel";
+pub(super) const SENTINEL: &str = "private-agent-login-material-sentinel";
 
 fn prepared(responses: Vec<Vec<u8>>) -> (ScriptedServer, tempfile::TempDir, std::path::PathBuf) {
     let server = ScriptedServer::respond(responses);
@@ -149,7 +151,7 @@ fn revoked() -> Vec<u8> {
 }
 
 // `login` as `list` and `show` print it: each authorization in force with its availability and
-// next action (REQ-AGENTLOGIN-43), `statuses` in order.
+// next action (REQ-GRANT-53), `statuses` in order.
 fn with_statuses(mut login: serde_json::Value, statuses: &[(&str, &str)]) -> serde_json::Value {
     let authorizations = login["authorizations"].as_array_mut().unwrap();
     assert_eq!(authorizations.len(), statuses.len());
@@ -171,7 +173,7 @@ fn json_output(output: &Output) -> serde_json::Value {
 // A login in the member's ambient agent homes, which no human command may read.
 const AMBIENT_LOGIN_MARKER: &str = "ambient-agent-home-login-marker";
 
-// REQ-AGENTLOGIN-19
+// REQ-GRANT-29
 // INV-CLI-13
 #[test]
 fn list_prints_each_login_with_its_authorizations_and_never_reads_an_ambient_agent_home() {
@@ -257,7 +259,8 @@ fn list_prints_each_login_with_its_authorizations_and_never_reads_an_ambient_age
     }
 }
 
-// REQ-AGENTLOGIN-19
+// REQ-GRANT-29
+// REQ-GRANT-77
 #[test]
 fn list_json_prints_one_page_with_its_cursor_and_passes_the_page_options() {
     let (server, _directory, credential) = prepared(vec![page(
@@ -289,7 +292,9 @@ fn list_json_prints_one_page_with_its_cursor_and_passes_the_page_options() {
             "nextCursor": "opaque-next-page"
         })
     );
-    assert!(output.stderr.is_empty());
+    // The earlier command names its replacement on standard error, and only that
+    // (REQ-GRANT-77).
+    assert_eq!(after_notice(&output, "um grant list"), "");
     assert_no_secret_output(&output, &[SENTINEL]);
     let request = server.finish().pop().unwrap();
     assert!(
@@ -297,7 +302,8 @@ fn list_json_prints_one_page_with_its_cursor_and_passes_the_page_options() {
     );
 }
 
-// REQ-AGENTLOGIN-19
+// REQ-GRANT-29
+// REQ-GRANT-77
 #[test]
 fn show_reads_one_agent_login() {
     let login = agent_logins()[0].clone();
@@ -324,6 +330,8 @@ fn show_reads_one_agent_login() {
             "agentLogin": with_statuses(login, &CODEX_STATUSES)
         })
     );
+    // The replacement reads the one grant by its id (REQ-GRANT-77).
+    assert_eq!(after_notice(&output, "um grant list GRANT"), "");
     assert_no_secret_output(&output, &[SENTINEL]);
     let request = server.finish().pop().unwrap();
     assert!(request.starts_with(&format!(
@@ -338,8 +346,8 @@ fn show_reads_one_agent_login() {
 const THIRD_RUNNER_ID: &str = "rnr_01k0z6r1w8f4jy2m7q9v3x5abf";
 const ENDED_AUTHORIZATION_ID: &str = "aga_01k0z6r1w8f4jy2m7q9v3x5abf";
 
-// An ended authorization of `runner_id` (REQ-AGENTLOGIN-3) whose removal is `removal`
-// (REQ-AGENTLOGIN-37).
+// An ended authorization of `runner_id` (REQ-GRANT-13) whose removal is `removal`
+// (REQ-GRANT-47).
 fn ended_authorization(
     id: &str,
     runner_id: &str,
@@ -369,7 +377,7 @@ fn ended_authorization(
 const RUN_ID: &str = "run_01k0z6r1w8f4jy2m7q9v3x5abc";
 const CANCELLATION_REQUEST_ID: &str = "cmd_01k0z6r1w8f4jy2m7q9v3x5abc";
 
-// `ended` with the stop Cloud requested of the run its runner was serving (REQ-AGENTLOGIN-38).
+// `ended` with the stop Cloud requested of the run its runner was serving (REQ-GRANT-48).
 fn with_stop(mut ended: serde_json::Value) -> serde_json::Value {
     ended["stop"] = serde_json::json!({
         "runId": RUN_ID,
@@ -398,8 +406,8 @@ fn has_line(text: &str, line: &str) -> bool {
     text.lines().any(|candidate| candidate.trim() == line)
 }
 
-// REQ-AGENTLOGIN-19
-// REQ-AGENTLOGIN-38
+// REQ-GRANT-29
+// REQ-GRANT-48
 #[test]
 fn show_prints_ended_authorizations_with_their_removal_stop_and_a_reports_last_use() {
     let login = with_ended_authorization();
@@ -460,9 +468,10 @@ fn show_prints_ended_authorizations_with_their_removal_stop_and_a_reports_last_u
         "{text}"
     );
     assert!(
-        in_force.contains(&format!("um auth agent-login reconnect {AGENT_LOGIN_ID}")),
+        in_force.contains("um grant create codex --replace"),
         "{text}"
     );
+    assert_next_actions_name_the_grant_commands(&text);
     assert!(!ended.contains("availability"), "{text}");
     assert!(!in_force.contains(THIRD_RUNNER_ID), "{text}");
     assert!(
@@ -479,8 +488,8 @@ fn show_prints_ended_authorizations_with_their_removal_stop_and_a_reports_last_u
 }
 
 // The agent login a revoke leaves: every runner it was authorized for is listed with its
-// removal state (REQ-AGENTLOGIN-37), and the first runner's run was asked to stop
-// (REQ-AGENTLOGIN-38).
+// removal state (REQ-GRANT-47), and the first runner's run was asked to stop
+// (REQ-GRANT-48).
 fn revoked_with_ended_authorizations() -> serde_json::Value {
     let mut login = agent_logins()[0].clone();
     login["state"] = "revoked".into();
@@ -509,8 +518,8 @@ fn revoked_with_ended_authorizations() -> serde_json::Value {
     login
 }
 
-// REQ-AGENTLOGIN-20
-// REQ-AGENTLOGIN-38
+// REQ-GRANT-30
+// REQ-GRANT-48
 #[test]
 fn revoke_reads_the_agent_login_after_and_reports_each_runners_removal_and_stop() {
     let after = revoked_with_ended_authorizations();
@@ -594,7 +603,7 @@ fn revoke_reads_the_agent_login_after_and_reports_each_runners_removal_and_stop(
     }
 }
 
-// REQ-AGENTLOGIN-20
+// REQ-GRANT-30
 #[test]
 fn revoke_reports_revoked_when_the_read_after_it_fails() {
     let (server, _directory, credential) = prepared(vec![
@@ -643,7 +652,7 @@ fn revoke_reports_revoked_when_the_read_after_it_fails() {
     assert!(requests[3].starts_with("GET "));
 }
 
-// REQ-AGENTLOGIN-20
+// REQ-GRANT-30
 #[test]
 fn revoke_deletes_the_agent_login_with_one_key_and_no_body() {
     // A Cloud that lists no ended authorizations answers the read after each revoke; the
@@ -698,7 +707,7 @@ fn revoke_deletes_the_agent_login_with_one_key_and_no_body() {
     );
 }
 
-// REQ-AGENTLOGIN-20
+// REQ-GRANT-30
 #[test]
 fn revoke_replays_its_key_once_after_a_lost_response() {
     let (server, _directory, credential) = prepared(vec![
@@ -727,7 +736,7 @@ fn revoke_replays_its_key_once_after_a_lost_response() {
     );
 }
 
-// REQ-AGENTLOGIN-38
+// REQ-GRANT-48
 #[test]
 fn revoke_answered_500_fails_and_running_it_again_reports_revoked() {
     // The revocation is durable before Cloud requests the stops, so a 500 leaves it done and
@@ -807,13 +816,13 @@ fn run_refused_before_any_request(args: &[&str]) -> Output {
     output
 }
 
-// REQ-AGENTLOGIN-20
+// REQ-GRANT-30
 #[test]
 fn revoke_without_confirmation_exits_2_before_any_request() {
     run_refused_before_any_request(&["revoke", AGENT_LOGIN_ID]);
 }
 
-// REQ-AGENTLOGIN-21
+// REQ-GRANT-31
 #[test]
 fn refusals_report_their_outcome_with_exit_status_1() {
     let material = tempfile::tempdir().unwrap();
@@ -872,25 +881,21 @@ fn refusals_report_their_outcome_with_exit_status_1() {
     )]);
     let output = run_agent_login(&server, &credential, &["show", AGENT_LOGIN_ID], &[]);
     assert_eq!(output.status.code(), Some(1));
-    assert!(
-        String::from_utf8(output.stderr)
-            .unwrap()
-            .contains("um auth agent-login list")
-    );
+    assert!(after_notice(&output, "um grant list").contains("um grant list"));
     server.finish();
 }
 
 // The material a member imports: a Codex `auth.json` whose bytes, trailing newline and
 // spacing included, are what Cloud must receive.
-const CODEX_MATERIAL: &str =
+pub(super) const CODEX_MATERIAL: &str =
     "{\"tokens\": {\"access_token\": \"private-agent-login-material-sentinel\"}}\n";
 
-fn encoded(material: &[u8]) -> String {
+pub(super) fn encoded(material: &[u8]) -> String {
     use base64::Engine as _;
     base64::engine::general_purpose::STANDARD.encode(material)
 }
 
-fn private_file(directory: &Path, name: &str, contents: &[u8]) -> std::path::PathBuf {
+pub(super) fn private_file(directory: &Path, name: &str, contents: &[u8]) -> std::path::PathBuf {
     let path = directory.join(name);
     fs::write(&path, contents).unwrap();
     fs::set_permissions(&path, Permissions::from_mode(0o600)).unwrap();
@@ -915,7 +920,8 @@ fn request_body(request: &str) -> serde_json::Value {
     serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap()
 }
 
-// REQ-AGENTLOGIN-22
+// REQ-GRANT-32
+// REQ-GRANT-77
 #[test]
 fn import_codex_sends_the_file_byte_for_byte_and_prints_the_login() {
     let (server, directory, credential) = prepared(vec![
@@ -961,6 +967,11 @@ fn import_codex_sends_the_file_byte_for_byte_and_prints_the_login() {
         assert!(text.contains(fact), "{fact}: {text}");
     }
     assert_eq!(labelled.status.code(), Some(0));
+    // The replacement names the provider, without which it signs in to every provider
+    // lacked (REQ-GRANT-77).
+    for output in [&human, &labelled] {
+        after_notice(output, "um grant create PROVIDER");
+    }
     let document = json_output(&labelled);
     assert_eq!(document["outcome"], "imported");
     assert_eq!(document["agentLogin"]["id"], AGENT_LOGIN_ID);
@@ -997,8 +1008,8 @@ fn target(provider: &str, organization_id: &str) -> Vec<u8> {
     json_http_response("200 OK", login)
 }
 
-// A revoked agent login, which Cloud still shows its owner (REQ-AGENTLOGIN-3) and stores no
-// generation for (REQ-AGENTLOGIN-6).
+// A revoked agent login, which Cloud still shows its owner (REQ-GRANT-13) and stores no
+// generation for (REQ-GRANT-16).
 fn revoked_target() -> Vec<u8> {
     let mut login = agent_logins()[0].clone();
     login["state"] = "revoked".into();
@@ -1021,7 +1032,7 @@ fn organization(id: &str, slug: &str) -> Vec<u8> {
     )
 }
 
-// REQ-AGENTLOGIN-22
+// REQ-GRANT-32
 #[test]
 fn import_into_an_agent_login_stores_its_next_generation_and_replays_a_lost_response() {
     let (server, directory, credential) = prepared(vec![
@@ -1081,7 +1092,7 @@ fn import_into_an_agent_login_stores_its_next_generation_and_replays_a_lost_resp
     );
 }
 
-// REQ-AGENTLOGIN-22
+// REQ-GRANT-32
 #[test]
 fn import_into_an_agent_login_of_another_provider_or_organization_exits_2_before_sending_material()
 {
@@ -1200,8 +1211,8 @@ fn import_into_an_agent_login_of_another_provider_or_organization_exits_2_before
     assert!(requests[0].starts_with("GET "), "{requests:?}");
 }
 
-// REQ-AGENTLOGIN-22
-// REQ-AGENTLOGIN-23
+// REQ-GRANT-32
+// REQ-GRANT-33
 #[test]
 fn import_reads_standard_input() {
     let (server, _directory, credential) = prepared(vec![
@@ -1240,7 +1251,7 @@ fn import_reads_standard_input() {
     );
 }
 
-// REQ-AGENTLOGIN-23
+// REQ-GRANT-33
 #[test]
 fn import_claude_code_sends_the_token_line_without_its_newline() {
     let (server, directory, credential) = prepared(vec![stored("201 Created", "claude_code", 1)]);
@@ -1279,8 +1290,8 @@ fn import_claude_code_sends_the_token_line_without_its_newline() {
     assert_eq!(body["material"], encoded(SENTINEL.as_bytes()));
 }
 
-// REQ-AGENTLOGIN-22
-// REQ-AGENTLOGIN-23
+// REQ-GRANT-32
+// REQ-GRANT-33
 #[test]
 fn unsafe_or_malformed_material_and_a_mismatched_source_exit_2_before_any_request() {
     use std::os::unix::fs::symlink;
@@ -1348,7 +1359,7 @@ fn unsafe_or_malformed_material_and_a_mismatched_source_exit_2_before_any_reques
 }
 
 // How the fake `codex` behaves after it records its invocation.
-enum SignIn {
+pub(super) enum SignIn {
     // Writes this auth.json into $CODEX_HOME with a group- and world-readable mode, as a
     // file codex writes need not be 0600 for um to read it.
     Writes(&'static str),
@@ -1360,23 +1371,44 @@ enum SignIn {
     CannotStart,
 }
 
-// A fake `codex`, alone on PATH, that records its arguments, CODEX_HOME, that home's mode
-// and its config.toml under `record`, and prints a line on standard output.
-struct FakeCodex {
+// A fake coding agent program, alone in `bin` so that it is the only program on PATH, that
+// records what it saw under `record`.
+pub(super) struct FakeProgram {
     _directory: tempfile::TempDir,
-    bin: std::path::PathBuf,
+    pub(super) bin: std::path::PathBuf,
     record: std::path::PathBuf,
 }
 
-impl FakeCodex {
-    fn new(sign_in: SignIn) -> Self {
+pub(super) const DEVICE_CODE_PROMPT: &str = "codex-device-code-prompt";
+
+// How the fake `claude setup-token` ends after it records its invocation and shows the sign-in
+// URL; it takes the flow, a browser or a pasted code, from `CLAUDE_FLOW` (REQ-GRANT-71).
+pub(super) enum SetupToken {
+    // Prints the token in colour, as its own line, and a line after it.
+    Prints,
+    Exits(u8),
+    PrintsNothing,
+    // Asks um to terminate, as a member's interrupt would, and waits to be stopped.
+    Interrupts,
+}
+
+// The token the fake `claude` prints, in the form `CLAUDE_CODE_OAUTH_TOKEN` takes; the part
+// after `sk-ant-` is a sentinel of its own.
+pub(super) const CLAUDE_TOKEN: &str = "sk-ant-oat01-private_claude_code_token-sentinel";
+pub(super) const CLAUDE_TOKEN_SENTINEL: &str = "private_claude_code_token-sentinel";
+pub(super) const CLAUDE_SIGN_IN_URL: &str =
+    "https://claude.example.test/oauth/authorize?code=true&state=public-fixture-state";
+pub(super) const CLAUDE_FLOW: &str = "UM_TEST_CLAUDE_FLOW";
+pub(super) const PASTE_PROMPT: &str = "Paste code here if prompted > ";
+pub(super) const PASTE_CODE: &str = "public-fixture-paste-code";
+pub(super) const AFTER_TOKEN: &str = "claude-after-token";
+
+impl FakeProgram {
+    // A fake `codex` that records its arguments, CODEX_HOME, that home's mode and its
+    // config.toml, and prints a line on standard output: the device code to enter when it is
+    // given `--device-auth`, as Codex's device sign-in does.
+    pub(super) fn codex(sign_in: SignIn) -> Self {
         use super::pi_installation::quote;
-        let directory = tempfile::tempdir().unwrap();
-        let bin = directory.path().join("bin");
-        let record = directory.path().join("record");
-        fs::create_dir(&bin).unwrap();
-        fs::create_dir(&record).unwrap();
-        let record_path = |name: &str| quote(record.join(name).to_str().unwrap());
         let then = match sign_in {
             SignIn::Writes(material) => format!(
                 "umask 022\nprintf '%s' {} > \"$CODEX_HOME/auth.json\"",
@@ -1392,25 +1424,88 @@ impl FakeCodex {
         } else {
             "/bin/sh"
         };
-        // um runs this script with only `bin` on PATH; the script's own `ls` and `cp` come
-        // from the test's PATH, since a build sandbox may have nothing under /usr/bin or /bin.
+        Self::new("codex", interpreter, |record| {
+            format!(
+                "printf '%s\\n' \"$*\" > {arguments}\n\
+                 printf '%s' \"$CODEX_HOME\" > {home}\n\
+                 ls -ld \"$CODEX_HOME\" > {mode}\n\
+                 cp \"$CODEX_HOME/config.toml\" {config}\n\
+                 case \" $* \" in *\" --device-auth \"*) echo {DEVICE_CODE_PROMPT} ;; \
+                 *) echo codex-sign-in-prompt ;; esac\n\
+                 {then}\n",
+                arguments = record("arguments"),
+                home = record("home"),
+                mode = record("mode"),
+                config = record("config.toml"),
+            )
+        })
+    }
+
+    // A fake `claude` that records its arguments, CLAUDE_CONFIG_DIR, that directory's mode and
+    // whether its standard input is its controlling terminal, then shows the sign-in URL. In
+    // the paste flow it then prompts without a line ending and reads a code from its terminal,
+    // going on only when the code is `PASTE_CODE`; in the browser flow it waits a moment, as
+    // the browser's callback would make it.
+    pub(super) fn claude(setup_token: SetupToken) -> Self {
+        use super::pi_installation::quote;
+        let then = match setup_token {
+            SetupToken::Prints => format!(
+                "printf '\\033[32m%s\\033[0m\\n' {}\necho {AFTER_TOKEN}",
+                quote(CLAUDE_TOKEN)
+            ),
+            SetupToken::Exits(status) => format!("exit {status}"),
+            SetupToken::PrintsNothing => "echo claude-printed-no-token".to_owned(),
+            SetupToken::Interrupts => "kill -TERM \"$PPID\"\nexec sleep 30".to_owned(),
+        };
+        Self::new("claude", "/bin/sh", |record| {
+            format!(
+                "printf '%s\\n' \"$*\" > {arguments}\n\
+                 printf '%s' \"$CLAUDE_CONFIG_DIR\" > {config}\n\
+                 ls -ld \"$CLAUDE_CONFIG_DIR\" > {mode}\n\
+                 if [ -t 0 ] && : < /dev/tty; then echo yes; else echo no; fi > {terminal}\n\
+                 echo {url}\n\
+                 if [ \"${CLAUDE_FLOW}\" = paste ]; then\n\
+                 printf '%s' {prompt}\n\
+                 IFS= read -r code\n\
+                 [ \"$code\" = {PASTE_CODE} ] || {{ echo claude-rejected-the-code; exit 1; }}\n\
+                 else sleep 0.2; fi\n\
+                 {then}\n",
+                arguments = record("arguments"),
+                config = record("config"),
+                mode = record("mode"),
+                terminal = record("terminal"),
+                url = quote(CLAUDE_SIGN_IN_URL),
+                prompt = quote(PASTE_PROMPT),
+            )
+        })
+    }
+
+    // Writes `bin/NAME` as a script for `interpreter` whose body `script` makes, given a
+    // function that quotes the path of a record. um runs it with only `bin` on PATH; the
+    // script's own `ls`, `cp` and `sleep` come from the test's PATH, since a build sandbox
+    // may have nothing under /usr/bin or /bin.
+    fn new(
+        name: &str,
+        interpreter: &str,
+        script: impl FnOnce(&dyn Fn(&str) -> String) -> String,
+    ) -> Self {
+        use super::pi_installation::quote;
+        let directory = tempfile::tempdir().unwrap();
+        let bin = directory.path().join("bin");
+        let record = directory.path().join("record");
+        fs::create_dir(&bin).unwrap();
+        fs::create_dir(&record).unwrap();
         let tools = std::env::var("PATH").unwrap_or_default();
-        let script = format!(
-            "#!{interpreter}\nPATH={tools}\nexport PATH\n\
-             printf '%s\\n' \"$*\" > {arguments}\n\
-             printf '%s' \"$CODEX_HOME\" > {home}\n\
-             ls -ld \"$CODEX_HOME\" > {mode}\n\
-             cp \"$CODEX_HOME/config.toml\" {config}\n\
-             echo codex-sign-in-prompt\n\
-             {then}\n",
-            arguments = record_path("arguments"),
-            home = record_path("home"),
-            tools = quote(&tools),
-            mode = record_path("mode"),
-            config = record_path("config.toml"),
-        );
-        let executable = bin.join("codex");
-        fs::write(&executable, script).unwrap();
+        let body = script(&|name| quote(record.join(name).to_str().unwrap()));
+        let executable = bin.join(name);
+        fs::write(
+            &executable,
+            format!(
+                "#!{interpreter}\nPATH={tools}\nexport PATH\n{body}",
+                tools = quote(&tools)
+            ),
+        )
+        .unwrap();
         fs::set_permissions(&executable, Permissions::from_mode(0o755)).unwrap();
         Self {
             _directory: directory,
@@ -1419,37 +1514,62 @@ impl FakeCodex {
         }
     }
 
-    fn recorded(&self, name: &str) -> Option<String> {
+    pub(super) fn recorded(&self, name: &str) -> Option<String> {
         fs::read_to_string(self.record.join(name)).ok()
     }
 }
 
-// A member's home with an ambient Codex login, which --login must neither read nor change.
-struct AmbientHome {
+// A member's home with an ambient Codex login and an ambient Claude Code configuration, which a
+// sign-in `um` runs must neither read nor change.
+pub(super) struct AmbientHome {
     home: tempfile::TempDir,
-    // Where the command may create its temporary Codex home.
-    temporary: tempfile::TempDir,
+    // Where the command may create its temporary Codex home or Claude Code configuration.
+    pub(super) temporary: tempfile::TempDir,
 }
 
-const AMBIENT_MARKER: &str = "ambient-codex-login-marker";
+pub(super) const AMBIENT_MARKER: &str = "ambient-member-login-marker";
+
+// Each ambient login: its directory under HOME, the variable naming it and its one file.
+const AMBIENT_LOGINS: [(&str, &str, &str); 2] = [
+    (".codex", "CODEX_HOME", "auth.json"),
+    (".claude", "CLAUDE_CONFIG_DIR", ".credentials.json"),
+];
+
+fn ambient_login() -> String {
+    format!("{{\"marker\": \"{AMBIENT_MARKER}\"}}")
+}
 
 impl AmbientHome {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         let home = tempfile::tempdir().unwrap();
-        fs::create_dir(home.path().join(".codex")).unwrap();
-        private_file(
-            &home.path().join(".codex"),
-            "auth.json",
-            format!("{{\"marker\": \"{AMBIENT_MARKER}\"}}").as_bytes(),
-        );
+        for (directory, _, file) in AMBIENT_LOGINS {
+            let directory = home.path().join(directory);
+            fs::create_dir(&directory).unwrap();
+            private_file(&directory, file, ambient_login().as_bytes());
+        }
         Self {
             home,
             temporary: tempfile::tempdir().unwrap(),
         }
     }
 
-    fn ambient_codex(&self) -> std::path::PathBuf {
+    pub(super) fn ambient_codex(&self) -> std::path::PathBuf {
         self.home.path().join(".codex")
+    }
+
+    pub(super) fn ambient_claude(&self) -> std::path::PathBuf {
+        self.home.path().join(".claude")
+    }
+
+    // The member's HOME, CODEX_HOME and CLAUDE_CONFIG_DIR, and the temporary directory the
+    // command may use.
+    pub(super) fn variables(&self) -> [(&'static str, std::path::PathBuf); 4] {
+        [
+            ("HOME", self.home.path().to_owned()),
+            ("CODEX_HOME", self.ambient_codex()),
+            ("CLAUDE_CONFIG_DIR", self.ambient_claude()),
+            ("TMPDIR", self.temporary.path().to_owned()),
+        ]
     }
 
     fn run(
@@ -1459,46 +1579,49 @@ impl AmbientHome {
         path: &Path,
         args: &[&str],
     ) -> Output {
-        let ambient = self.ambient_codex();
-        run_agent_login(
-            server,
-            credential,
-            args,
-            &[
-                ("HOME", self.home.path().to_str().unwrap()),
-                ("CODEX_HOME", ambient.to_str().unwrap()),
-                ("TMPDIR", self.temporary.path().to_str().unwrap()),
-                ("PATH", path.to_str().unwrap()),
-            ],
-        )
+        let variables = self.variables();
+        let mut environment: Vec<_> = variables
+            .iter()
+            .map(|(name, value)| (*name, value.to_str().unwrap()))
+            .collect();
+        environment.push(("PATH", path.to_str().unwrap()));
+        run_agent_login(server, credential, args, &environment)
     }
 
-    // The ambient login is untouched and the command left nothing in its temporary directory.
-    fn assert_untouched_and_clean(&self) {
-        let ambient = self.ambient_codex();
+    // The member's home and ambient logins are untouched and the command left nothing in its
+    // temporary directory.
+    pub(super) fn assert_untouched_and_clean(&self) {
         assert_eq!(
-            fs::read_dir(&ambient).unwrap().count(),
-            1,
-            "ambient Codex home gained an entry"
+            fs::read_dir(self.home.path()).unwrap().count(),
+            AMBIENT_LOGINS.len(),
+            "HOME gained an entry"
         );
-        assert_eq!(
-            fs::read_to_string(ambient.join("auth.json")).unwrap(),
-            format!("{{\"marker\": \"{AMBIENT_MARKER}\"}}")
-        );
+        for (directory, variable, file) in AMBIENT_LOGINS {
+            let ambient = self.home.path().join(directory);
+            assert_eq!(
+                fs::read_dir(&ambient).unwrap().count(),
+                1,
+                "the ambient {variable} gained an entry"
+            );
+            assert_eq!(
+                fs::read_to_string(ambient.join(file)).unwrap(),
+                ambient_login()
+            );
+        }
         assert_eq!(
             fs::read_dir(self.temporary.path()).unwrap().count(),
             0,
-            "temporary Codex home was left behind"
+            "a temporary sign-in directory was left behind"
         );
     }
 }
 
-// REQ-AGENTLOGIN-24
+// REQ-GRANT-34
 // INV-CLI-13
 #[test]
 fn import_codex_login_signs_in_in_a_private_temporary_home_and_uploads_what_it_wrote() {
     let (server, _directory, credential) = prepared(vec![stored("201 Created", "codex", 1)]);
-    let codex = FakeCodex::new(SignIn::Writes(CODEX_MATERIAL));
+    let codex = FakeProgram::codex(SignIn::Writes(CODEX_MATERIAL));
     let home = AmbientHome::new();
     let output = home.run(
         &server,
@@ -1545,25 +1668,28 @@ fn import_codex_login_signs_in_in_a_private_temporary_home_and_uploads_what_it_w
     assert!(!requests[0].contains(&encoded(AMBIENT_MARKER.as_bytes())));
 }
 
-// REQ-AGENTLOGIN-24
+// REQ-GRANT-34
 #[test]
 fn a_codex_sign_in_that_fails_leaves_no_login_or_is_interrupted_stores_nothing() {
     let (server, _directory, credential) = prepared(vec![]);
     let absent = tempfile::tempdir().unwrap();
     let cases = [
-        ("exits nonzero", Some(FakeCodex::new(SignIn::Exits(3)))),
+        ("exits nonzero", Some(FakeProgram::codex(SignIn::Exits(3)))),
         (
             "writes no login",
-            Some(FakeCodex::new(SignIn::WritesNothing)),
+            Some(FakeProgram::codex(SignIn::WritesNothing)),
         ),
         (
             "writes no JSON object",
-            Some(FakeCodex::new(SignIn::Writes("[\"not-a-login\"]"))),
+            Some(FakeProgram::codex(SignIn::Writes("[\"not-a-login\"]"))),
         ),
-        ("is interrupted", Some(FakeCodex::new(SignIn::Interrupts))),
+        (
+            "is interrupted",
+            Some(FakeProgram::codex(SignIn::Interrupts)),
+        ),
         (
             "cannot be started",
-            Some(FakeCodex::new(SignIn::CannotStart)),
+            Some(FakeProgram::codex(SignIn::CannotStart)),
         ),
         ("is not on PATH", None),
     ];
@@ -1599,7 +1725,7 @@ fn a_codex_sign_in_that_fails_leaves_no_login_or_is_interrupted_stores_nothing()
     assert!(server.finish().is_empty());
 }
 
-// REQ-AGENTLOGIN-24
+// REQ-GRANT-34
 #[test]
 fn import_codex_login_checks_the_session_and_the_target_before_it_signs_in() {
     let invalid_grant = || {
@@ -1696,7 +1822,7 @@ fn import_codex_login_checks_the_session_and_the_target_before_it_signs_in() {
                 expiry,
             );
         }
-        let codex = FakeCodex::new(SignIn::Writes(CODEX_MATERIAL));
+        let codex = FakeProgram::codex(SignIn::Writes(CODEX_MATERIAL));
         let home = AmbientHome::new();
         let mut args = vec!["import", "acme", "codex", "--login", "--json"];
         if names_agent_login {
@@ -1726,12 +1852,12 @@ fn import_codex_login_checks_the_session_and_the_target_before_it_signs_in() {
     }
 }
 
-// REQ-AGENTLOGIN-23
-// REQ-AGENTLOGIN-24
+// REQ-GRANT-33
+// REQ-GRANT-34
 #[test]
 fn import_requires_exactly_one_source_and_refuses_login_for_claude_code() {
     let (server, directory, credential) = prepared(vec![]);
-    let codex = FakeCodex::new(SignIn::Writes(CODEX_MATERIAL));
+    let codex = FakeProgram::codex(SignIn::Writes(CODEX_MATERIAL));
     let home = AmbientHome::new();
     let file = private_file(directory.path(), "auth.json", CODEX_MATERIAL.as_bytes());
     let file = file.to_str().unwrap();
@@ -1741,7 +1867,7 @@ fn import_requires_exactly_one_source_and_refuses_login_for_claude_code() {
         &["import", "acme", "codex"],
         &["import", "acme", "claude_code", "--login"],
         &["import", "acme", "codex", "--login", "--token-file", file],
-        // A label Cloud would refuse (REQ-AGENTLOGIN-1) is refused before the sign-in.
+        // A label Cloud would refuse (REQ-GRANT-11) is refused before the sign-in.
         &["import", "acme", "codex", "--login", "--label", ""],
         &["import", "acme", "codex", "--login", "--label", &long_label],
         &[
@@ -1800,7 +1926,7 @@ fn assert_only_reads(requests: &[String], reads: usize) {
     );
 }
 
-// REQ-AGENTLOGIN-44
+// REQ-GRANT-54
 #[test]
 fn reconnect_reads_the_agent_login_and_stores_the_sign_in_its_provider_takes() {
     let (server, directory, credential) = prepared(vec![
@@ -1885,7 +2011,7 @@ fn reconnect_reads_the_agent_login_and_stores_the_sign_in_its_provider_takes() {
     assert_reconnect_requests(&requests[5..], CODEX_MATERIAL.as_bytes());
 }
 
-// REQ-AGENTLOGIN-44
+// REQ-GRANT-54
 #[test]
 fn reconnect_refuses_a_source_its_provider_does_not_take_and_an_unknown_or_revoked_login() {
     let not_found = || agent_login_problem("404 Not Found", 404, "agent-login-not-found");
@@ -1915,7 +2041,7 @@ fn reconnect_refuses_a_source_its_provider_does_not_take_and_an_unknown_or_revok
     ];
     for (response, source, outcome) in cases {
         let (server, _directory, credential) = prepared(vec![response]);
-        let codex = FakeCodex::new(SignIn::Writes(CODEX_MATERIAL));
+        let codex = FakeProgram::codex(SignIn::Writes(CODEX_MATERIAL));
         let home = AmbientHome::new();
         let mut args = vec!["reconnect", AGENT_LOGIN_ID];
         args.extend_from_slice(source);
@@ -1935,9 +2061,9 @@ fn reconnect_refuses_a_source_its_provider_does_not_take_and_an_unknown_or_revok
     }
 }
 
-// REQ-AGENTLOGIN-44
-// REQ-AGENTLOGIN-22
-// REQ-AGENTLOGIN-23
+// REQ-GRANT-54
+// REQ-GRANT-32
+// REQ-GRANT-33
 #[test]
 fn reconnect_refuses_an_unsafe_or_malformed_file_as_import_does() {
     use std::os::unix::fs::symlink;
@@ -1979,8 +2105,8 @@ fn reconnect_refuses_an_unsafe_or_malformed_file_as_import_does() {
     }
 }
 
-// REQ-AGENTLOGIN-44
-// REQ-AGENTLOGIN-24
+// REQ-GRANT-54
+// REQ-GRANT-34
 // INV-CLI-13
 #[test]
 fn reconnect_codex_login_signs_in_in_a_private_temporary_home_after_the_read() {
@@ -1988,7 +2114,7 @@ fn reconnect_codex_login_signs_in_in_a_private_temporary_home_after_the_read() {
         target("codex", ORGANIZATION_ID),
         stored("200 OK", "codex", 3),
     ]);
-    let codex = FakeCodex::new(SignIn::Writes(CODEX_MATERIAL));
+    let codex = FakeProgram::codex(SignIn::Writes(CODEX_MATERIAL));
     let home = AmbientHome::new();
     let output = home.run(
         &server,
@@ -2040,7 +2166,8 @@ fn assert_states_both_exposures(stderr: &[u8]) {
     assert!(text.contains("every step"), "{text}");
 }
 
-// REQ-AGENTLOGIN-25
+// REQ-GRANT-35
+// REQ-GRANT-77
 #[test]
 fn authorize_states_who_can_use_the_login_before_it_authorizes_the_runner() {
     let (server, _directory, credential) = prepared(vec![authorized(), Vec::new(), authorized()]);
@@ -2069,12 +2196,14 @@ fn authorize_states_who_can_use_the_login_before_it_authorizes_the_runner() {
         "{}",
         String::from_utf8_lossy(&human.stderr)
     );
-    assert_states_both_exposures(&human.stderr);
+    // The earlier command names its replacement on standard error before the statement
+    // (REQ-GRANT-77).
+    assert_states_both_exposures(after_notice(&human, "um grant authorize").as_bytes());
     let text = String::from_utf8(human.stdout).unwrap();
     assert!(text.contains(AUTHORIZATION_ID), "{text}");
     assert!(text.contains(RUNNER_ID), "{text}");
     assert!(output.status.success());
-    assert_states_both_exposures(&output.stderr);
+    assert_states_both_exposures(after_notice(&output, "um grant authorize").as_bytes());
     let document = json_output(&output);
     assert_eq!(document["outcome"], "authorized");
     assert_eq!(document["agentLoginId"], AGENT_LOGIN_ID);
@@ -2102,7 +2231,7 @@ fn authorize_states_who_can_use_the_login_before_it_authorizes_the_runner() {
     );
 }
 
-// REQ-AGENTLOGIN-25
+// REQ-GRANT-35
 #[test]
 fn authorize_and_deauthorize_without_confirmation_exit_2_before_any_request() {
     let output =
@@ -2113,7 +2242,7 @@ fn authorize_and_deauthorize_without_confirmation_exit_2_before_any_request() {
     run_refused_before_any_request(&["authorize", AGENT_LOGIN_ID, "--runner", "builder", "--yes"]);
 }
 
-// REQ-AGENTLOGIN-25
+// REQ-GRANT-35
 #[test]
 fn deauthorize_ends_the_named_runners_authorization_in_force() {
     // The read after the change lists the authorization just ended with its removal state.
@@ -2200,8 +2329,8 @@ fn deauthorize_ends_the_named_runners_authorization_in_force() {
     }
 }
 
-// REQ-AGENTLOGIN-25
-// REQ-AGENTLOGIN-38
+// REQ-GRANT-35
+// REQ-GRANT-48
 #[test]
 fn deauthorize_reports_the_stop_requested_of_the_runners_run() {
     let mut after = agent_logins()[0].clone();
@@ -2248,8 +2377,8 @@ fn deauthorize_reports_the_stop_requested_of_the_runners_run() {
     assert_eq!(server.finish().len(), 6);
 }
 
-// REQ-AGENTLOGIN-21
-// REQ-AGENTLOGIN-25
+// REQ-GRANT-31
+// REQ-GRANT-35
 #[test]
 fn deauthorize_reports_authorization_not_found_when_the_runner_holds_none() {
     let (server, _directory, credential) = prepared(vec![json_http_response(
@@ -2277,8 +2406,9 @@ fn deauthorize_reports_authorization_not_found_when_the_runner_holds_none() {
     assert!(requests[0].starts_with("GET "));
 }
 
-// REQ-AGENTLOGIN-21
-// REQ-AGENTLOGIN-25
+// REQ-GRANT-31
+// REQ-GRANT-35
+// REQ-GRANT-77
 #[test]
 fn authorize_refusals_exit_1_with_their_remedy() {
     let cases = [
@@ -2290,12 +2420,12 @@ fn authorize_refusals_exit_1_with_their_remedy() {
         (
             agent_login_problem("409 Conflict", 409, "agent-login-runner-conflict"),
             "runner_holds_login",
-            "um auth agent-login deauthorize",
+            "um grant deauthorize",
         ),
         (
             agent_login_problem("409 Conflict", 409, "agent-login-already-authorized"),
             "login_already_authorized",
-            "um auth agent-login import",
+            "um grant deauthorize GRANT RUNNER --yes",
         ),
     ];
     for (response, outcome, remedy) in cases {
@@ -2312,8 +2442,11 @@ fn authorize_refusals_exit_1_with_their_remedy() {
         assert_eq!(output.status.code(), Some(1), "{outcome}");
         assert_eq!(json_output(&output)["outcome"], outcome);
         assert_eq!(human.status.code(), Some(1), "{outcome}");
-        let text = String::from_utf8(human.stderr).unwrap();
+        let text = after_notice(&human, "um grant authorize");
         assert!(text.contains(remedy), "{outcome}: {text}");
+        // A Codex login already authorized cannot be served by another sign-in: the held
+        // grant is refused or replaced in place (REQ-GRANT-73).
+        assert!(!text.contains("um grant create codex"), "{outcome}: {text}");
         assert_eq!(server.finish().len(), 2, "{outcome}");
     }
 }

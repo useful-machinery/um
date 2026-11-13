@@ -678,7 +678,7 @@ async fn published_tree_runs_once_and_reports_the_chosen_outcome() {
     );
 }
 
-// REQ-RUNNERENROLL-91, REQ-AGENTLOGIN-34
+// REQ-RUNNERENROLL-91, REQ-GRANT-44
 #[tokio::test]
 async fn kept_agent_login_reaches_the_runtime_that_creates_the_run() {
     use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};

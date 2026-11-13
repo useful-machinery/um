@@ -1,5 +1,4 @@
 mod authorize;
-mod codex_login;
 mod deauthorize;
 mod import;
 mod list;
@@ -8,16 +7,16 @@ mod reconnect;
 mod revoke;
 mod show;
 
-use std::fmt;
-use std::io::{self, Write};
-use std::marker::PhantomData;
-
-use clap::error::{ContextKind, ContextValue, ErrorKind};
-use clap::{ArgAction, ArgMatches, Args, FromArgMatches, Subcommand};
+use clap::{Args, Subcommand};
 
 use crate::exit_code::ExitCode;
 use um_api::{AgentLoginApi, AgentLoginFailure};
 use um_human_auth::Deployment;
+
+// The Codex sign-in `import --login` and `reconnect --login` run is `um grant create`'s.
+use crate::cli::grant::codex_login;
+use crate::cli::grant::confirmation::{Confirmation, Stated, Statement, state};
+use crate::cli::grant::parse_runner_id;
 
 // `um auth credential status` reports a failed read of the agent logins as
 // `um auth agent-login` does, and lists their ended authorizations as `show` does.
@@ -75,110 +74,13 @@ struct RunnerTarget {
     runner_id: String,
 }
 
-fn parse_runner_id(value: &str) -> Result<String, String> {
-    if um_support::valid_typed_id(value, "rnr_") {
-        Ok(value.to_owned())
-    } else {
-        Err(
-            "runner must be an exact rnr_ identifier; um runner list ORGANIZATION prints it"
-                .to_owned(),
-        )
-    }
-}
-
-/// The label rule of REQ-AGENTLOGIN-1, checked before anything is read, signed in to or sent:
+/// The label rule of REQ-GRANT-11, checked before anything is read, signed in to or sent:
 /// 1 to 64 characters, none a control character. Cloud remains the judge of the rest.
 fn parse_label(value: &str) -> Result<String, String> {
     if (1..=64).contains(&value.chars().count()) && !value.chars().any(char::is_control) {
         Ok(value.to_owned())
     } else {
         Err("label must be 1 to 64 printable characters".to_owned())
-    }
-}
-
-/// A leaf that states what acting does before it acts, and in place of acting when `--yes` is
-/// missing: `authorize` who can use the login (REQ-AGENTLOGIN-25), `revoke` and `deauthorize`
-/// the runs that will be asked to stop (REQ-AGENTLOGIN-20, REQ-AGENTLOGIN-25).
-trait Stated: Args {
-    /// The leaf's name under `um auth agent-login`.
-    const NAME: &'static str;
-    /// The statement's lines.
-    const STATEMENT: &'static [&'static str];
-    /// What the leaf does, as the refusal's remedy names it.
-    const ACTION: &'static str;
-}
-
-/// States, on standard error under `heading`, what the leaf `C` is about to do.
-fn state<C: Stated>(heading: fmt::Arguments<'_>) -> io::Result<()> {
-    let mut stderr = io::stderr().lock();
-    writeln!(stderr, "{heading}")?;
-    for line in C::STATEMENT {
-        writeln!(stderr, "  {line}")?;
-    }
-    Ok(())
-}
-
-/// The `--yes` of a `Stated` leaf `C`, required like `ConfirmationArgs`, whose absence is
-/// refused with the leaf's statement: clap's own refusal of a missing required argument cannot
-/// carry it.
-struct Confirmation<C>(PhantomData<fn() -> C>);
-
-impl<C> fmt::Debug for Confirmation<C> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("Confirmation")
-    }
-}
-
-const YES: &str = "yes";
-
-impl<C: Stated> Args for Confirmation<C> {
-    fn augment_args(command: clap::Command) -> clap::Command {
-        command.arg(
-            clap::Arg::new(YES)
-                .long(YES)
-                .action(ArgAction::SetTrue)
-                .help("Confirm this action"),
-        )
-    }
-
-    fn augment_args_for_update(command: clap::Command) -> clap::Command {
-        Self::augment_args(command)
-    }
-}
-
-impl<C: Stated> FromArgMatches for Confirmation<C> {
-    fn from_arg_matches(matches: &ArgMatches) -> Result<Self, clap::Error> {
-        if matches.get_flag(YES) {
-            return Ok(Self(PhantomData));
-        }
-        let mut error = clap::Error::new(ErrorKind::MissingRequiredArgument);
-        error.insert(
-            ContextKind::InvalidArg,
-            ContextValue::Strings(vec![format!("--{YES}")]),
-        );
-        let remedy = format!("{}, run the command again with --{YES}", C::ACTION);
-        error.insert(
-            ContextKind::Suggested,
-            ContextValue::StyledStrs(
-                C::STATEMENT
-                    .iter()
-                    .map(|&line| line.into())
-                    .chain([remedy.into()])
-                    .collect(),
-            ),
-        );
-        let mut command = C::augment_args(clap::Command::new(C::NAME))
-            .bin_name(format!("um auth agent-login {}", C::NAME));
-        error.insert(
-            ContextKind::Usage,
-            ContextValue::StyledStr(command.render_usage()),
-        );
-        Err(error)
-    }
-
-    fn update_from_arg_matches(&mut self, matches: &ArgMatches) -> Result<(), clap::Error> {
-        *self = Self::from_arg_matches(matches)?;
-        Ok(())
     }
 }
 

@@ -33,6 +33,22 @@ pub enum AuthorizeAgentLoginRunnerError {
     UnknownValue(serde_json::Value),
 }
 
+/// struct for typed errors of method [`authorize_grant_runner`]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum AuthorizeGrantRunnerError {
+    Status400(models::Problem),
+    Status401(models::Problem),
+    Status403(models::Problem),
+    Status404(models::Problem),
+    Status409(models::Problem),
+    Status413(models::Problem),
+    Status415(models::Problem),
+    Status500(models::Problem),
+    Status503(models::Problem),
+    UnknownValue(serde_json::Value),
+}
+
 /// struct for typed errors of method [`begin_docs_account_handoff`]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
@@ -152,6 +168,19 @@ pub enum GetDocsAccountHandoffStatusError {
     UnknownValue(serde_json::Value),
 }
 
+/// struct for typed errors of method [`get_grant`]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum GetGrantError {
+    Status400(models::Problem),
+    Status401(models::Problem),
+    Status403(models::Problem),
+    Status404(models::Problem),
+    Status500(models::Problem),
+    Status503(models::Problem),
+    UnknownValue(serde_json::Value),
+}
+
 /// struct for typed errors of method [`get_grant_session`]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
@@ -169,6 +198,22 @@ pub enum GetGrantSessionError {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum ImportAgentLoginError {
+    Status400(models::Problem),
+    Status401(models::Problem),
+    Status403(models::Problem),
+    Status404(models::Problem),
+    Status409(models::Problem),
+    Status413(models::Problem),
+    Status415(models::Problem),
+    Status500(models::Problem),
+    Status503(models::Problem),
+    UnknownValue(serde_json::Value),
+}
+
+/// struct for typed errors of method [`import_grant`]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ImportGrantError {
     Status400(models::Problem),
     Status401(models::Problem),
     Status403(models::Problem),
@@ -263,6 +308,16 @@ pub enum ListCurrentServiceCredentialsError {
     UnknownValue(serde_json::Value),
 }
 
+/// struct for typed errors of method [`list_grant_providers`]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ListGrantProvidersError {
+    Status401(models::Problem),
+    Status403(models::Problem),
+    Status500(models::Problem),
+    UnknownValue(serde_json::Value),
+}
+
 /// struct for typed errors of method [`list_grant_uses`]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
@@ -315,6 +370,22 @@ pub enum RemoveCurrentPrincipalIdentityError {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum ReplaceAgentLoginMaterialError {
+    Status400(models::Problem),
+    Status401(models::Problem),
+    Status403(models::Problem),
+    Status404(models::Problem),
+    Status409(models::Problem),
+    Status413(models::Problem),
+    Status415(models::Problem),
+    Status500(models::Problem),
+    Status503(models::Problem),
+    UnknownValue(serde_json::Value),
+}
+
+/// struct for typed errors of method [`replace_grant_material`]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ReplaceGrantMaterialError {
     Status400(models::Problem),
     Status401(models::Problem),
     Status403(models::Problem),
@@ -394,6 +465,20 @@ pub enum RevokeGrantError {
     UnknownValue(serde_json::Value),
 }
 
+/// struct for typed errors of method [`revoke_grant_authorization`]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum RevokeGrantAuthorizationError {
+    Status400(models::Problem),
+    Status401(models::Problem),
+    Status403(models::Problem),
+    Status404(models::Problem),
+    Status409(models::Problem),
+    Status500(models::Problem),
+    Status503(models::Problem),
+    UnknownValue(serde_json::Value),
+}
+
 /// struct for typed errors of method [`signup_human`]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
@@ -420,7 +505,8 @@ pub enum UpdateCurrentPrincipalError {
     UnknownValue(serde_json::Value),
 }
 
-/// Authorizes one runner registration of the agent login's organization to receive one of the active human's own active agent logins and answers the authorization (REQ-AGENTLOGIN-8). Only the owner, while an active member of the agent login's organization, may authorize it; an agent login that is unknown, revoked or another member's, or whose owner is no longer an active member, is `agent-login-not-found`. The runner need not have enrolled yet. A runner that is unknown, deleted or in another organization is `agent-login-runner-not-found`. A runner that already has an authorization in force for the agent login's provider, from any member, is `agent-login-runner-conflict`, and nothing is replaced. A `codex` agent login, which one runner holds at a time, that already has an authorization in force is `agent-login-already-authorized`. A provider the deployment lists no operating system for, or a deployment without the agent-login key, is refused `provider-unavailable` (REQ-AGENTLOGIN-5).  Idempotency-Key is scoped to the exact acting OIDC identity and a semantic fingerprint containing agentLoginId and runnerId. Exact replay returns the original created response. Reusing the key for another request conflicts.  Problem types: 404 `agent-login-not-found`, `agent-login-runner-not-found`; 409 `agent-login-runner-conflict`, `agent-login-already-authorized`; 503 `provider-unavailable`.
+/// Deprecated: replaced by `authorizeGrantRunner` (`POST /v1/me/grants/{grantId}/authorizations`), which makes the same authorizations (REQ-GRANT-63). This route stays served.  Authorizes one runner registration of the agent login's organization to receive one of the active human's own active agent logins and answers the authorization (REQ-GRANT-18). Only the owner, while an active member of the agent login's organization, may authorize it; an agent login that is unknown, revoked or another member's, or whose owner is no longer an active member, is `agent-login-not-found`. The runner need not have enrolled yet. A runner that is unknown, deleted or in another organization is `agent-login-runner-not-found`. A runner that already has an authorization in force for the agent login's provider, from any member, is `agent-login-runner-conflict`, and nothing is replaced. A `codex` agent login, which one runner holds at a time, that already has an authorization in force is `agent-login-already-authorized`. A provider the deployment lists no operating system for, or a deployment without the agent-login key, is refused `provider-unavailable` (REQ-GRANT-15).  Idempotency-Key is scoped to the exact acting OIDC identity and a semantic fingerprint containing agentLoginId and runnerId. Exact replay returns the original created response. Reusing the key for another request conflicts.  Problem types: 404 `agent-login-not-found`, `agent-login-runner-not-found`; 409 `agent-login-runner-conflict`, `agent-login-already-authorized`; 503 `provider-unavailable`.
+#[deprecated]
 pub fn authorize_agent_login_runner(
     configuration: &configuration::Configuration,
     agent_login_id: &str,
@@ -479,6 +565,73 @@ pub fn authorize_agent_login_runner(
     } else {
         let content = resp.text()?;
         let entity: Option<AuthorizeAgentLoginRunnerError> = serde_json::from_str(&content).ok();
+        Err(Error::ResponseError(ResponseContent {
+            status,
+            content,
+            entity,
+        }))
+    }
+}
+
+/// Authorizes one runner registration to use one of the active human's own grants of either kind and answers the authorization (REQ-GRANT-59). Only the grant's owner may authorize it; a grant that is unknown, revoked or another member's is `grant-not-found`.  For an OAuth grant (`pgr_`) the runner is any runner of an organization the owner is an active member of (REQ-GRANT-56), and the authorization's ID begins `pga_`. A runner that is unknown, deleted or in another organization is `grant-runner-not-found`, and a grant already authorized for the runner is `grant-already-authorized`.  For a native grant (`agl_`) the rules are those of REQ-GRANT-18 and the authorization's ID begins `aga_`: a runner outside the grant's organization is `grant-runner-not-found`, a runner that already holds a login of the grant's provider is `grant-runner-conflict`, and a `codex` grant already authorized for a runner is `grant-already-authorized`. A provider the deployment lists no operating system for is refused `provider-unavailable` (REQ-GRANT-15).  A deployment that does not serve the grant's kind answers `provider-unavailable`.  Idempotency-Key is scoped to the exact acting OIDC identity and a semantic fingerprint containing grantId and runnerId. Exact replay returns the original created response. Reusing the key for another request conflicts.  Problem types: 404 `grant-not-found`, `grant-runner-not-found`; 409 `grant-runner-conflict`, `grant-already-authorized`; 503 `provider-unavailable`.
+pub fn authorize_grant_runner(
+    configuration: &configuration::Configuration,
+    grant_id: &str,
+    idempotency_key: &str,
+    authorize_grant_runner_request: models::AuthorizeGrantRunnerRequest,
+) -> Result<models::GrantAuthorization, Error<AuthorizeGrantRunnerError>> {
+    // add a prefix to parameters to efficiently prevent name collisions
+    let p_path_grant_id = grant_id;
+    let p_header_idempotency_key = idempotency_key;
+    let p_body_authorize_grant_runner_request = authorize_grant_runner_request;
+
+    let uri_str = format!(
+        "{}/v1/me/grants/{grantId}/authorizations",
+        configuration.base_path,
+        grantId = crate::generated::apis::urlencode(p_path_grant_id)
+    );
+    let mut req_builder = configuration
+        .client
+        .request(reqwest::Method::POST, &uri_str);
+
+    if let Some(ref user_agent) = configuration.user_agent {
+        req_builder = req_builder.header(reqwest::header::USER_AGENT, user_agent.clone());
+    }
+    req_builder = req_builder.header("Idempotency-Key", p_header_idempotency_key.to_string());
+    if let Some(ref token) = configuration.bearer_access_token {
+        req_builder = req_builder.bearer_auth(token.to_owned());
+    };
+    req_builder = req_builder.json(&p_body_authorize_grant_runner_request);
+
+    let req = req_builder.build()?;
+    let resp = configuration.client.execute(req)?;
+
+    let status = resp.status();
+    let content_type = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/octet-stream");
+    let content_type = super::ContentType::from(content_type);
+
+    if !status.is_client_error() && !status.is_server_error() {
+        let content = resp.text()?;
+        match content_type {
+            ContentType::Json => serde_json::from_str(&content).map_err(Error::from),
+            ContentType::Text => {
+                return Err(Error::from(serde_json::Error::custom(
+                    "Received `text/plain` content type response that cannot be converted to `models::GrantAuthorization`",
+                )));
+            }
+            ContentType::Unsupported(unknown_type) => {
+                return Err(Error::from(serde_json::Error::custom(format!(
+                    "Received `{unknown_type}` content type response that cannot be converted to `models::GrantAuthorization`"
+                ))));
+            }
+        }
+    } else {
+        let content = resp.text()?;
+        let entity: Option<AuthorizeGrantRunnerError> = serde_json::from_str(&content).ok();
         Err(Error::ResponseError(ResponseContent {
             status,
             content,
@@ -773,7 +926,8 @@ pub fn create_grant_session(
     }
 }
 
-/// Starts an OAuth consent at the provider of one of the active human's own linked identities for that provider's scope set (REQ-GRANT-1) and answers the pending consent session with its authorization URL. The request accepts no body and cannot choose scopes, lifetime or account. An identity that is unknown or belongs to another member is not found. A member has at most one consent in progress per provider; a second while one is pending conflicts. A Linear consent is refused `provider-unavailable` in this release, as is a provider whose OAuth application the deployment has not configured.  Idempotency-Key is scoped to the exact acting OIDC identity and a semantic fingerprint containing identityId. Exact replay returns the original created response with the session's current state. Reusing the key for another identity conflicts.  Problem types: 404 `identity-not-found`; 409 `grant-session-conflict`; 503 `provider-unavailable`.
+/// Deprecated: replaced by `createGrantSession` (`POST /v1/me/grants`), whose consent also installs the grant on an identity link the member already holds for the returned subject (REQ-GRANT-63). This route stays served.  Starts an OAuth consent at the provider of one of the active human's own linked identities for that provider's scope set (REQ-GRANT-1) and answers the pending consent session with its authorization URL. The request accepts no body and cannot choose scopes, lifetime or account. An identity that is unknown or belongs to another member is not found. A member has at most one consent in progress per provider; a second while one is pending conflicts. A Linear consent is refused `provider-unavailable` in this release, as is a provider whose OAuth application the deployment has not configured.  Idempotency-Key is scoped to the exact acting OIDC identity and a semantic fingerprint containing identityId. Exact replay returns the original created response with the session's current state. Reusing the key for another identity conflicts.  Problem types: 404 `identity-not-found`; 409 `grant-session-conflict`; 503 `provider-unavailable`.
+#[deprecated]
 pub fn create_identity_grant_session(
     configuration: &configuration::Configuration,
     identity_id: &str,
@@ -898,7 +1052,8 @@ pub fn create_service_principal(
     }
 }
 
-/// Returns one of the active human's own agent logins with its organization, provider, label, state, generation, record schema version, key version, import time, the authorizations in force and, for each runner with none in force, the authorization that ended last with its removal state (REQ-AGENTLOGIN-3, REQ-AGENTLOGIN-37). Another member's agent login, an unknown one and a malformed ID are not found. No response carries material (REQ-AGENTLOGIN-4).  Problem types: 404 `agent-login-not-found`; 503 `provider-unavailable`.
+/// Deprecated: replaced by `getGrant` (`GET /v1/me/grants/{grantId}`), which reads the same record as a native grant under the same ID (REQ-GRANT-63). This route stays served.  Returns one of the active human's own agent logins with its organization, provider, label, state, generation, record schema version, key version, import time, the authorizations in force and, for each runner with none in force, the authorization that ended last with its removal state (REQ-GRANT-13, REQ-GRANT-47). Another member's agent login, an unknown one and a malformed ID are not found. No response carries material (REQ-GRANT-14).  Problem types: 404 `agent-login-not-found`; 503 `provider-unavailable`.
+#[deprecated]
 pub fn get_agent_login(
     configuration: &configuration::Configuration,
     agent_login_id: &str,
@@ -1068,6 +1223,65 @@ pub fn get_docs_account_handoff_status(
     }
 }
 
+/// Returns one of the active human's own grants of either kind, chosen by its ID: a `pgr_` ID names an OAuth grant and an `agl_` ID a native grant (REQ-GRANT-58). The grant carries what the list shows for it. A grant that is unknown or belongs to another member is not found, and no response carries grant material.  Problem types: 404 `grant-not-found`; 503 `provider-unavailable`.
+pub fn get_grant(
+    configuration: &configuration::Configuration,
+    grant_id: &str,
+) -> Result<models::Grant, Error<GetGrantError>> {
+    // add a prefix to parameters to efficiently prevent name collisions
+    let p_path_grant_id = grant_id;
+
+    let uri_str = format!(
+        "{}/v1/me/grants/{grantId}",
+        configuration.base_path,
+        grantId = crate::generated::apis::urlencode(p_path_grant_id)
+    );
+    let mut req_builder = configuration.client.request(reqwest::Method::GET, &uri_str);
+
+    if let Some(ref user_agent) = configuration.user_agent {
+        req_builder = req_builder.header(reqwest::header::USER_AGENT, user_agent.clone());
+    }
+    if let Some(ref token) = configuration.bearer_access_token {
+        req_builder = req_builder.bearer_auth(token.to_owned());
+    };
+
+    let req = req_builder.build()?;
+    let resp = configuration.client.execute(req)?;
+
+    let status = resp.status();
+    let content_type = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/octet-stream");
+    let content_type = super::ContentType::from(content_type);
+
+    if !status.is_client_error() && !status.is_server_error() {
+        let content = resp.text()?;
+        match content_type {
+            ContentType::Json => serde_json::from_str(&content).map_err(Error::from),
+            ContentType::Text => {
+                return Err(Error::from(serde_json::Error::custom(
+                    "Received `text/plain` content type response that cannot be converted to `models::Grant`",
+                )));
+            }
+            ContentType::Unsupported(unknown_type) => {
+                return Err(Error::from(serde_json::Error::custom(format!(
+                    "Received `{unknown_type}` content type response that cannot be converted to `models::Grant`"
+                ))));
+            }
+        }
+    } else {
+        let content = resp.text()?;
+        let entity: Option<GetGrantError> = serde_json::from_str(&content).ok();
+        Err(Error::ResponseError(ResponseContent {
+            status,
+            content,
+            entity,
+        }))
+    }
+}
+
 /// Returns one of the active human's own consent sessions with its status and reason, its authorization URL while the consent is pending and its callback unclaimed, and the resulting grant once it completed (REQ-GRANT-3). Session inspection is authoritative for the outcome of a callback. Another member's session, an unknown one, and a malformed session ID are not found. No response carries the consent's state, verifier or grant material.  Problem types: 404 `grant-session-not-found`; 503 `provider-unavailable`.
 pub fn get_grant_session(
     configuration: &configuration::Configuration,
@@ -1127,7 +1341,8 @@ pub fn get_grant_session(
     }
 }
 
-/// Stores a coding agent's own sign-in for one organization the active human is an active member of, sealed in Cloud custody, and answers the new agent login at generation 1 (REQ-AGENTLOGIN-1). The body names the organization by ID or slug, the provider, an optional label, the record schema version and the material as base64 of at most 32 KiB: for `codex` the text of a Codex `auth.json`, for `claude_code` the token `claude setup-token` prints (REQ-AGENTLOGIN-2). Material in any other form, or of a record schema version the provider does not accept, is refused `agent-login-material-invalid`, and no answer repeats it. An organization that is unknown or that the caller is not an active member of is not found. A member holds at most 16 unrevoked agent logins in one organization. A provider the deployment lists no operating system for, or a deployment without the agent-login key, is refused `provider-unavailable` (REQ-AGENTLOGIN-5). No response carries material (REQ-AGENTLOGIN-4).  Idempotency-Key is scoped to the exact acting OIDC identity and a semantic fingerprint containing organization, provider, label, recordSchemaVersion and a keyed digest of the material. Exact replay returns the original created response with the agent login's current state. Reusing the key for another request conflicts.  Problem types: 400 `agent-login-material-invalid`; 409 `quantity-limit-reached`; 503 `provider-unavailable`.
+/// Deprecated: replaced by `importGrant` (`POST /v1/me/grant-imports`), which stores the same record as a native grant (REQ-GRANT-63). This route stays served.  Stores a coding agent's own sign-in for one organization the active human is an active member of, sealed in Cloud custody, and answers the new agent login at generation 1 (REQ-GRANT-11). The body names the organization by ID or slug, the provider, an optional label, the record schema version and the material as base64 of at most 32 KiB: for `codex` the text of a Codex `auth.json`, for `claude_code` the token `claude setup-token` prints (REQ-GRANT-12). Material in any other form, or of a record schema version the provider does not accept, is refused `agent-login-material-invalid`, and no answer repeats it. An organization that is unknown or that the caller is not an active member of is not found. A member holds at most 16 unrevoked agent logins in one organization. A provider the deployment lists no operating system for, or a deployment without the agent-login key, is refused `provider-unavailable` (REQ-GRANT-15). No response carries material (REQ-GRANT-14).  Idempotency-Key is scoped to the exact acting OIDC identity and a semantic fingerprint containing organization, provider, label, recordSchemaVersion and a keyed digest of the material. Exact replay returns the original created response with the agent login's current state. Reusing the key for another request conflicts.  Problem types: 400 `agent-login-material-invalid`; 409 `quantity-limit-reached`; 503 `provider-unavailable`.
+#[deprecated]
 pub fn import_agent_login(
     configuration: &configuration::Configuration,
     idempotency_key: &str,
@@ -1180,6 +1395,67 @@ pub fn import_agent_login(
     } else {
         let content = resp.text()?;
         let entity: Option<ImportAgentLoginError> = serde_json::from_str(&content).ok();
+        Err(Error::ResponseError(ResponseContent {
+            status,
+            content,
+            entity,
+        }))
+    }
+}
+
+/// Stores a coding agent's own sign-in as a native grant for one organization the active human is an active member of, sealed in Cloud custody, and answers the grant at generation 1 (REQ-GRANT-61), with the body, limits and refusals of REQ-GRANT-11 and REQ-GRANT-12. The body names the organization by ID or slug, the provider, the record schema version and the material as base64 of at most 32 KiB: for `codex` the text of a Codex `auth.json`, for `claude_code` the token `claude setup-token` prints. Material in any other form, or of a record schema version the provider does not accept, is refused `grant-material-invalid`, and no answer repeats it. An organization that is unknown or that the caller is not an active member of is not found. A member holds at most 16 unrevoked native grants in one organization. A provider the deployment lists no operating system for, or a deployment that does not serve native grants, is refused `provider-unavailable` (REQ-GRANT-15). No response carries material (REQ-GRANT-14). An OAuth grant is made by a consent, at `POST /v1/me/grants`, not here.  Idempotency-Key is scoped to the exact acting OIDC identity and a semantic fingerprint containing organization, provider, recordSchemaVersion and a keyed digest of the material. Exact replay returns the original created response with the grant's current state. Reusing the key for another request conflicts.  Problem types: 400 `grant-material-invalid`; 409 `quantity-limit-reached`; 503 `provider-unavailable`.
+pub fn import_grant(
+    configuration: &configuration::Configuration,
+    idempotency_key: &str,
+    import_grant_request: models::ImportGrantRequest,
+) -> Result<models::Grant, Error<ImportGrantError>> {
+    // add a prefix to parameters to efficiently prevent name collisions
+    let p_header_idempotency_key = idempotency_key;
+    let p_body_import_grant_request = import_grant_request;
+
+    let uri_str = format!("{}/v1/me/grant-imports", configuration.base_path);
+    let mut req_builder = configuration
+        .client
+        .request(reqwest::Method::POST, &uri_str);
+
+    if let Some(ref user_agent) = configuration.user_agent {
+        req_builder = req_builder.header(reqwest::header::USER_AGENT, user_agent.clone());
+    }
+    req_builder = req_builder.header("Idempotency-Key", p_header_idempotency_key.to_string());
+    if let Some(ref token) = configuration.bearer_access_token {
+        req_builder = req_builder.bearer_auth(token.to_owned());
+    };
+    req_builder = req_builder.json(&p_body_import_grant_request);
+
+    let req = req_builder.build()?;
+    let resp = configuration.client.execute(req)?;
+
+    let status = resp.status();
+    let content_type = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/octet-stream");
+    let content_type = super::ContentType::from(content_type);
+
+    if !status.is_client_error() && !status.is_server_error() {
+        let content = resp.text()?;
+        match content_type {
+            ContentType::Json => serde_json::from_str(&content).map_err(Error::from),
+            ContentType::Text => {
+                return Err(Error::from(serde_json::Error::custom(
+                    "Received `text/plain` content type response that cannot be converted to `models::Grant`",
+                )));
+            }
+            ContentType::Unsupported(unknown_type) => {
+                return Err(Error::from(serde_json::Error::custom(format!(
+                    "Received `{unknown_type}` content type response that cannot be converted to `models::Grant`"
+                ))));
+            }
+        }
+    } else {
+        let content = resp.text()?;
+        let entity: Option<ImportGrantError> = serde_json::from_str(&content).ok();
         Err(Error::ResponseError(ResponseContent {
             status,
             content,
@@ -1308,7 +1584,8 @@ pub fn link_current_principal_identity(
     }
 }
 
-/// Returns one page of the active human's own agent logins, oldest first by creation time and opaque agent login ID, each with its organization, provider, label, state, generation, record schema version, key version, import time, the authorizations in force and, for each runner with none in force, the authorization that ended last with its removal state (REQ-AGENTLOGIN-3, REQ-AGENTLOGIN-37). Another member's agent logins are never listed, and no response carries material (REQ-AGENTLOGIN-4). The cursor is opaque and may be used only with this operation. A deployment configured without the agent-login key answers `provider-unavailable` (REQ-AGENTLOGIN-5).  Problem types: 503 `provider-unavailable`.
+/// Deprecated: replaced by `listGrants` (`GET /v1/me/grants`) with `kind` `native`, which lists the same records as native grants (REQ-GRANT-63). This route stays served.  Returns one page of the active human's own agent logins, oldest first by creation time and opaque agent login ID, each with its organization, provider, label, state, generation, record schema version, key version, import time, the authorizations in force and, for each runner with none in force, the authorization that ended last with its removal state (REQ-GRANT-13, REQ-GRANT-47). Another member's agent logins are never listed, and no response carries material (REQ-GRANT-14). The cursor is opaque and may be used only with this operation. A deployment configured without the agent-login key answers `provider-unavailable` (REQ-GRANT-15).  Problem types: 503 `provider-unavailable`.
+#[deprecated]
 pub fn list_agent_logins(
     configuration: &configuration::Configuration,
     limit: Option<i32>,
@@ -1627,7 +1904,58 @@ pub fn list_current_service_credentials(
     }
 }
 
-/// Returns one page of the uses of one of the active human's own grants, newest first, each with the run, assignment, organization, provider and time of issue (REQ-GRANT-8); a use never carries the issued token. A grant that is unknown or belongs to another member is not found. The cursor is opaque and may be used only with this operation and grant.  Problem types: 404 `grant-not-found`; 503 `provider-unavailable`.
+/// Returns the providers for which this deployment makes grants, each with its kind (REQ-GRANT-78): an `oauth` provider (GitHub, GitLab.com or Linear) for which the deployment holds an OAuth application, then a `native` provider (Claude Code or Codex) for which it lists a target. No other provider is named, and a deployment that serves neither kind answers an empty list. The answer is the deployment's, not the member's: it names no grant and carries no material. A client reads it before a coding agent's sign-in, so that a provider the deployment does not serve is passed over before any provider token is minted.  The list is not paged: it names at most the five providers.
+pub fn list_grant_providers(
+    configuration: &configuration::Configuration,
+) -> Result<models::GrantProviderList, Error<ListGrantProvidersError>> {
+    let uri_str = format!("{}/v1/me/grant-providers", configuration.base_path);
+    let mut req_builder = configuration.client.request(reqwest::Method::GET, &uri_str);
+
+    if let Some(ref user_agent) = configuration.user_agent {
+        req_builder = req_builder.header(reqwest::header::USER_AGENT, user_agent.clone());
+    }
+    if let Some(ref token) = configuration.bearer_access_token {
+        req_builder = req_builder.bearer_auth(token.to_owned());
+    };
+
+    let req = req_builder.build()?;
+    let resp = configuration.client.execute(req)?;
+
+    let status = resp.status();
+    let content_type = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/octet-stream");
+    let content_type = super::ContentType::from(content_type);
+
+    if !status.is_client_error() && !status.is_server_error() {
+        let content = resp.text()?;
+        match content_type {
+            ContentType::Json => serde_json::from_str(&content).map_err(Error::from),
+            ContentType::Text => {
+                return Err(Error::from(serde_json::Error::custom(
+                    "Received `text/plain` content type response that cannot be converted to `models::GrantProviderList`",
+                )));
+            }
+            ContentType::Unsupported(unknown_type) => {
+                return Err(Error::from(serde_json::Error::custom(format!(
+                    "Received `{unknown_type}` content type response that cannot be converted to `models::GrantProviderList`"
+                ))));
+            }
+        }
+    } else {
+        let content = resp.text()?;
+        let entity: Option<ListGrantProvidersError> = serde_json::from_str(&content).ok();
+        Err(Error::ResponseError(ResponseContent {
+            status,
+            content,
+            entity,
+        }))
+    }
+}
+
+/// Returns one page of the uses of one of the active human's own grants, newest first, each with the run, assignment, organization, provider and time of issue (REQ-GRANT-8); a use never carries the issued token. A native grant (`agl_`), from which no token is issued, answers an empty page (REQ-GRANT-62). A grant that is unknown or belongs to another member is not found. The cursor is opaque and may be used only with this operation and grant.  Problem types: 404 `grant-not-found`; 503 `provider-unavailable`.
 pub fn list_grant_uses(
     configuration: &configuration::Configuration,
     grant_id: &str,
@@ -1696,19 +2024,24 @@ pub fn list_grant_uses(
     }
 }
 
-/// Returns one page of the active human's own provider grants, oldest first by creation time and opaque grant ID, each with its identity, provider, scopes, state, last successful use and the provider-reported expiry of its access and refresh material (REQ-GRANT-3). Another member's grants are never listed, and no response carries grant material. The cursor is opaque and may be used only with this operation.  Problem types: 503 `provider-unavailable`.
+/// Returns one page of the active human's own grants of the requested `kind` (REQ-GRANT-58): `oauth` grants (GitHub, GitLab.com and Linear), `native` grants (Claude Code and Codex), or `all`, which lists the OAuth grants first and then the native grants. Each kind is listed oldest first by creation time and opaque grant ID. Each grant states its kind, provider, state, generation, creation time and authorizations in force, and what its kind adds: an OAuth grant its identity, scopes, last successful use and the provider-reported expiry of its access and refresh material (REQ-GRANT-3); a native grant its organization, label, record schema and key versions, import time, each authorization's delivery and report, and its ended authorizations (REQ-GRANT-13). Another member's grants are never listed, and no response carries grant material.  A request without `kind` is answered as `oauth`; that form is deprecated, and a client names the kind it reads. The cursor is opaque and may be used only with this operation and the `kind` that issued it; a cursor issued for another kind is refused.  A deployment may serve only one kind. `all` then lists the kind it serves, and a cursor positioned in the other kind continues from the next grant the deployment serves. A request for `oauth` or `native` where the deployment does not serve that kind, or for `all` where it serves neither, is refused as unavailable.  Problem types: 503 `provider-unavailable`.
 pub fn list_grants(
     configuration: &configuration::Configuration,
+    kind: Option<&str>,
     limit: Option<i32>,
     cursor: Option<&str>,
-) -> Result<models::ProviderGrantList, Error<ListGrantsError>> {
+) -> Result<models::GrantList, Error<ListGrantsError>> {
     // add a prefix to parameters to efficiently prevent name collisions
+    let p_query_kind = kind;
     let p_query_limit = limit;
     let p_query_cursor = cursor;
 
     let uri_str = format!("{}/v1/me/grants", configuration.base_path);
     let mut req_builder = configuration.client.request(reqwest::Method::GET, &uri_str);
 
+    if let Some(ref param_value) = p_query_kind {
+        req_builder = req_builder.query(&[("kind", &param_value.to_string())]);
+    }
     if let Some(ref param_value) = p_query_limit {
         req_builder = req_builder.query(&[("limit", &param_value.to_string())]);
     }
@@ -1739,12 +2072,12 @@ pub fn list_grants(
             ContentType::Json => serde_json::from_str(&content).map_err(Error::from),
             ContentType::Text => {
                 return Err(Error::from(serde_json::Error::custom(
-                    "Received `text/plain` content type response that cannot be converted to `models::ProviderGrantList`",
+                    "Received `text/plain` content type response that cannot be converted to `models::GrantList`",
                 )));
             }
             ContentType::Unsupported(unknown_type) => {
                 return Err(Error::from(serde_json::Error::custom(format!(
-                    "Received `{unknown_type}` content type response that cannot be converted to `models::ProviderGrantList`"
+                    "Received `{unknown_type}` content type response that cannot be converted to `models::GrantList`"
                 ))));
             }
         }
@@ -1865,7 +2198,8 @@ pub fn remove_current_principal_identity(
     }
 }
 
-/// Stores new material for one of the active human's own active agent logins as its next generation and answers the agent login (REQ-AGENTLOGIN-6). The earlier generation's material is erased; the agent login keeps its ID, organization, provider and authorizations. The body is the record schema version and the material as base64 of at most 32 KiB, in the form of the agent login's provider (REQ-AGENTLOGIN-2); material in any other form is refused `agent-login-material-invalid`, and no answer repeats it. An agent login that is unknown, revoked or another member's, or whose owner is no longer an active member of its organization, is not found. A provider the deployment lists no operating system for, or a deployment without the agent-login key, is refused `provider-unavailable` (REQ-AGENTLOGIN-5). No response carries material (REQ-AGENTLOGIN-4).  Idempotency-Key is scoped to the exact acting OIDC identity and a semantic fingerprint containing agentLoginId, recordSchemaVersion and a keyed digest of the material. Exact replay returns the original response with the agent login's current state. Reusing the key for another request conflicts.  Problem types: 400 `agent-login-material-invalid`; 404 `agent-login-not-found`; 503 `provider-unavailable`.
+/// Deprecated: replaced by `replaceGrantMaterial` (`POST /v1/me/grants/{grantId}/generations`), which stores the same record's next generation (REQ-GRANT-63). This route stays served.  Stores new material for one of the active human's own active agent logins as its next generation and answers the agent login (REQ-GRANT-16). The earlier generation's material is erased; the agent login keeps its ID, organization, provider and authorizations. The body is the record schema version and the material as base64 of at most 32 KiB, in the form of the agent login's provider (REQ-GRANT-12); material in any other form is refused `agent-login-material-invalid`, and no answer repeats it. An agent login that is unknown, revoked or another member's, or whose owner is no longer an active member of its organization, is not found. A provider the deployment lists no operating system for, or a deployment without the agent-login key, is refused `provider-unavailable` (REQ-GRANT-15). No response carries material (REQ-GRANT-14).  Idempotency-Key is scoped to the exact acting OIDC identity and a semantic fingerprint containing agentLoginId, recordSchemaVersion and a keyed digest of the material. Exact replay returns the original response with the agent login's current state. Reusing the key for another request conflicts.  Problem types: 400 `agent-login-material-invalid`; 404 `agent-login-not-found`; 503 `provider-unavailable`.
+#[deprecated]
 pub fn replace_agent_login_material(
     configuration: &configuration::Configuration,
     agent_login_id: &str,
@@ -1924,6 +2258,73 @@ pub fn replace_agent_login_material(
     } else {
         let content = resp.text()?;
         let entity: Option<ReplaceAgentLoginMaterialError> = serde_json::from_str(&content).ok();
+        Err(Error::ResponseError(ResponseContent {
+            status,
+            content,
+            entity,
+        }))
+    }
+}
+
+/// Stores new material for one of the active human's own active native grants as its next generation and answers the grant (REQ-GRANT-61), as REQ-GRANT-16 says: the earlier generation's material is erased, and the grant keeps its ID, organization, provider and authorizations. The body is the record schema version and the material as base64 of at most 32 KiB, in the form of the grant's provider (REQ-GRANT-12); material in any other form is refused `grant-material-invalid`, and no answer repeats it. An ID that names an OAuth grant (`pgr_`) is refused `grant-kind-mismatch`, since an OAuth grant takes its next generation by consent. A native grant that is unknown, revoked or another member's, or whose owner is no longer an active member of its organization, is `grant-not-found`. A provider the deployment lists no operating system for, or a deployment that does not serve native grants, is refused `provider-unavailable` (REQ-GRANT-15). No response carries material (REQ-GRANT-14).  Idempotency-Key is scoped to the exact acting OIDC identity and a semantic fingerprint containing grantId, recordSchemaVersion and a keyed digest of the material. Exact replay returns the original response with the grant's current state. Reusing the key for another request conflicts.  Problem types: 400 `grant-material-invalid`; 404 `grant-not-found`; 409 `grant-kind-mismatch`; 503 `provider-unavailable`.
+pub fn replace_grant_material(
+    configuration: &configuration::Configuration,
+    grant_id: &str,
+    idempotency_key: &str,
+    replace_grant_material_request: models::ReplaceGrantMaterialRequest,
+) -> Result<models::Grant, Error<ReplaceGrantMaterialError>> {
+    // add a prefix to parameters to efficiently prevent name collisions
+    let p_path_grant_id = grant_id;
+    let p_header_idempotency_key = idempotency_key;
+    let p_body_replace_grant_material_request = replace_grant_material_request;
+
+    let uri_str = format!(
+        "{}/v1/me/grants/{grantId}/generations",
+        configuration.base_path,
+        grantId = crate::generated::apis::urlencode(p_path_grant_id)
+    );
+    let mut req_builder = configuration
+        .client
+        .request(reqwest::Method::POST, &uri_str);
+
+    if let Some(ref user_agent) = configuration.user_agent {
+        req_builder = req_builder.header(reqwest::header::USER_AGENT, user_agent.clone());
+    }
+    req_builder = req_builder.header("Idempotency-Key", p_header_idempotency_key.to_string());
+    if let Some(ref token) = configuration.bearer_access_token {
+        req_builder = req_builder.bearer_auth(token.to_owned());
+    };
+    req_builder = req_builder.json(&p_body_replace_grant_material_request);
+
+    let req = req_builder.build()?;
+    let resp = configuration.client.execute(req)?;
+
+    let status = resp.status();
+    let content_type = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/octet-stream");
+    let content_type = super::ContentType::from(content_type);
+
+    if !status.is_client_error() && !status.is_server_error() {
+        let content = resp.text()?;
+        match content_type {
+            ContentType::Json => serde_json::from_str(&content).map_err(Error::from),
+            ContentType::Text => {
+                return Err(Error::from(serde_json::Error::custom(
+                    "Received `text/plain` content type response that cannot be converted to `models::Grant`",
+                )));
+            }
+            ContentType::Unsupported(unknown_type) => {
+                return Err(Error::from(serde_json::Error::custom(format!(
+                    "Received `{unknown_type}` content type response that cannot be converted to `models::Grant`"
+                ))));
+            }
+        }
+    } else {
+        let content = resp.text()?;
+        let entity: Option<ReplaceGrantMaterialError> = serde_json::from_str(&content).ok();
         Err(Error::ResponseError(ResponseContent {
             status,
             content,
@@ -1991,7 +2392,8 @@ pub fn request_current_principal_deletion(
     }
 }
 
-/// Erases the material of one of the active human's own agent logins and ends every authorization of it, answering 204; an agent login already revoked answers 204 too (REQ-AGENTLOGIN-7). Only the owner can revoke it. The request accepts no body. An agent login that is unknown or belongs to another member is not found. Revocation serves every provider, whether or not the deployment lists an operating system for it (REQ-AGENTLOGIN-5). Revoking in Cloud does not end the session at the provider.  Idempotency-Key is scoped to the exact acting OIDC identity and a semantic fingerprint containing agentLoginId. Exact replay returns the original 204 response. Reusing the key for another agent login conflicts.  Problem types: 404 `agent-login-not-found`; 503 `provider-unavailable`.
+/// Deprecated: replaced by `revokeGrant` (`DELETE /v1/me/grants/{grantId}`), which revokes the same record (REQ-GRANT-63). This route stays served.  Erases the material of one of the active human's own agent logins and ends every authorization of it, answering 204; an agent login already revoked answers 204 too (REQ-GRANT-17). Only the owner can revoke it. The request accepts no body. An agent login that is unknown or belongs to another member is not found. Revocation serves every provider, whether or not the deployment lists an operating system for it (REQ-GRANT-15). Revoking in Cloud does not end the session at the provider.  Idempotency-Key is scoped to the exact acting OIDC identity and a semantic fingerprint containing agentLoginId. Exact replay returns the original 204 response. Reusing the key for another agent login conflicts.  Problem types: 404 `agent-login-not-found`; 503 `provider-unavailable`.
+#[deprecated]
 pub fn revoke_agent_login(
     configuration: &configuration::Configuration,
     agent_login_id: &str,
@@ -2036,7 +2438,8 @@ pub fn revoke_agent_login(
     }
 }
 
-/// Ends one authorization in force of one of the active human's own agent logins, freeing its runner for another authorization, and answers 204; an authorization already ended answers 204 too (REQ-AGENTLOGIN-9). The request accepts no body. An authorization that is unknown, or not on one of the caller's agent logins, is `agent-login-authorization-not-found`. Ending an authorization serves every provider, whether or not the deployment lists an operating system for it (REQ-AGENTLOGIN-5).  Idempotency-Key is scoped to the exact acting OIDC identity and a semantic fingerprint containing agentLoginId and authorizationId. Exact replay returns the original 204 response. Reusing the key for another authorization conflicts.  Problem types: 404 `agent-login-authorization-not-found`; 503 `provider-unavailable`.
+/// Deprecated: replaced by `revokeGrantAuthorization` (`DELETE /v1/me/grants/{grantId}/authorizations/{authorizationId}`), which ends the same authorizations (REQ-GRANT-63). This route stays served.  Ends one authorization in force of one of the active human's own agent logins, freeing its runner for another authorization, and answers 204; an authorization already ended answers 204 too (REQ-GRANT-19). The request accepts no body. An authorization that is unknown, or not on one of the caller's agent logins, is `agent-login-authorization-not-found`. Ending an authorization serves every provider, whether or not the deployment lists an operating system for it (REQ-GRANT-15).  Idempotency-Key is scoped to the exact acting OIDC identity and a semantic fingerprint containing agentLoginId and authorizationId. Exact replay returns the original 204 response. Reusing the key for another authorization conflicts.  Problem types: 404 `agent-login-authorization-not-found`; 503 `provider-unavailable`.
+#[deprecated]
 pub fn revoke_agent_login_authorization(
     configuration: &configuration::Configuration,
     agent_login_id: &str,
@@ -2131,7 +2534,7 @@ pub fn revoke_current_service_credential(
     }
 }
 
-/// Erases one of the active human's own grants in custody and then revokes it at the provider where the provider offers revocation, best effort (REQ-GRANT-6). The answer is 204 whatever the provider answers, and an already revoked grant answers 204 too. The request accepts no body. A grant that is unknown or belongs to another member is not found. No response carries grant material.  Idempotency-Key is scoped to the exact acting OIDC identity and a semantic fingerprint containing grantId. Exact replay returns the original 204 response. Reusing the key for another grant conflicts.  Problem types: 404 `grant-not-found`; 503 `provider-unavailable`.
+/// Revokes one of the active human's own grants of either kind, chosen by its ID, and answers 204; an already revoked grant answers 204 too (REQ-GRANT-62). The request accepts no body. A grant that is unknown or belongs to another member is not found. No response carries grant material.  An OAuth grant (`pgr_`) is erased in custody, with every authorization of it ended, and then revoked at the provider where the provider offers revocation, best effort (REQ-GRANT-6); the answer is 204 whatever the provider answers. A native grant (`agl_`) has its material erased and every authorization of it ended, and the stop of REQ-GRANT-48 is requested for each, as `DELETE /v1/me/agent-logins/{agentLoginId}` does (REQ-GRANT-17); it serves every provider, whether or not the deployment lists an operating system for it (REQ-GRANT-15), and does not end the session at the provider. A deployment that does not serve the grant's kind answers `provider-unavailable`.  Idempotency-Key is scoped to the exact acting OIDC identity and a semantic fingerprint containing grantId. Exact replay returns the original 204 response. Reusing the key for another grant conflicts.  Problem types: 404 `grant-not-found`; 503 `provider-unavailable`.
 pub fn revoke_grant(
     configuration: &configuration::Configuration,
     grant_id: &str,
@@ -2168,6 +2571,54 @@ pub fn revoke_grant(
     } else {
         let content = resp.text()?;
         let entity: Option<RevokeGrantError> = serde_json::from_str(&content).ok();
+        Err(Error::ResponseError(ResponseContent {
+            status,
+            content,
+            entity,
+        }))
+    }
+}
+
+/// Ends one authorization in force of one of the active human's own grants of either kind and answers 204; an authorization already ended answers 204 too (REQ-GRANT-60). The request accepts no body. An authorization that is unknown, not on one of the caller's grants, or of the other kind than its grant (an `aga_` ID under a `pgr_` grant, or a `pga_` ID under an `agl_` grant) is `grant-authorization-not-found`.  Ending a native grant's authorization frees its runner for another authorization and requests the stop of REQ-GRANT-48, as `DELETE /v1/me/agent-logins/{agentLoginId}/authorizations/{authorizationId}` does, and serves every provider (REQ-GRANT-15). Ending an OAuth grant's authorization requests no stop: a token already issued expires on its own lifetime and the next issue is refused.  Idempotency-Key is scoped to the exact acting OIDC identity and a semantic fingerprint containing grantId and authorizationId. Exact replay returns the original 204 response. Reusing the key for another authorization conflicts.  Problem types: 404 `grant-authorization-not-found`; 503 `provider-unavailable`.
+pub fn revoke_grant_authorization(
+    configuration: &configuration::Configuration,
+    grant_id: &str,
+    authorization_id: &str,
+    idempotency_key: &str,
+) -> Result<(), Error<RevokeGrantAuthorizationError>> {
+    // add a prefix to parameters to efficiently prevent name collisions
+    let p_path_grant_id = grant_id;
+    let p_path_authorization_id = authorization_id;
+    let p_header_idempotency_key = idempotency_key;
+
+    let uri_str = format!(
+        "{}/v1/me/grants/{grantId}/authorizations/{authorizationId}",
+        configuration.base_path,
+        grantId = crate::generated::apis::urlencode(p_path_grant_id),
+        authorizationId = crate::generated::apis::urlencode(p_path_authorization_id)
+    );
+    let mut req_builder = configuration
+        .client
+        .request(reqwest::Method::DELETE, &uri_str);
+
+    if let Some(ref user_agent) = configuration.user_agent {
+        req_builder = req_builder.header(reqwest::header::USER_AGENT, user_agent.clone());
+    }
+    req_builder = req_builder.header("Idempotency-Key", p_header_idempotency_key.to_string());
+    if let Some(ref token) = configuration.bearer_access_token {
+        req_builder = req_builder.bearer_auth(token.to_owned());
+    };
+
+    let req = req_builder.build()?;
+    let resp = configuration.client.execute(req)?;
+
+    let status = resp.status();
+
+    if !status.is_client_error() && !status.is_server_error() {
+        Ok(())
+    } else {
+        let content = resp.text()?;
+        let entity: Option<RevokeGrantAuthorizationError> = serde_json::from_str(&content).ok();
         Err(Error::ResponseError(ResponseContent {
             status,
             content,

@@ -1,8 +1,8 @@
 //! Keeping a delivered Claude Code login, the token `claude setup-token`
 //! printed, in a private file in the runner's agent-login directory and
 //! offering it to each assignment as `CLAUDE_CODE_OAUTH_TOKEN`
-//! (REQ-AGENTLOGIN-34), while standing back when the service has a Claude
-//! Code login of its own (REQ-AGENTLOGIN-35).
+//! (REQ-GRANT-44), while standing back when the service has a Claude
+//! Code login of its own (REQ-GRANT-45).
 
 use std::ffi::OsString;
 use std::fs;
@@ -23,7 +23,7 @@ use crate::enrollment::read_private_file_if_present;
 /// The file a `/login` keeps in Claude Code's configuration directory.
 const CREDENTIALS_FILE: &str = ".credentials.json";
 /// A token is one line of at most this many printable characters
-/// (REQ-AGENTLOGIN-2).
+/// (REQ-GRANT-12).
 const TOKEN_LIMIT: usize = 4096;
 /// The prefix of the temporary files the token file is written through.
 pub(crate) const TEMPORARY_PREFIX: &str = ".um-claude-code.token.tmp";
@@ -33,7 +33,7 @@ pub(crate) const TEMPORARY_PREFIX: &str = ".um-claude-code.token.tmp";
 /// Claude Code's configuration directory (`CLAUDE_CONFIG_DIR`, else `.claude`
 /// under `HOME`). The file is only looked at, never opened; one the runner
 /// cannot tell is absent counts as present. A login kept only in an
-/// operating-system credential store is not seen (REQ-AGENTLOGIN-36).
+/// operating-system credential store is not seen (REQ-GRANT-46).
 pub(crate) fn foreign_login(environment: &ServiceEnvironment) -> bool {
     if environment.claude_code_oauth_token {
         return true;
@@ -135,7 +135,7 @@ pub(crate) fn offered_token(
 }
 
 /// One line of 1 to 4096 printable characters without spaces, the form
-/// Cloud accepts (REQ-AGENTLOGIN-2) and an environment variable can carry.
+/// Cloud accepts (REQ-GRANT-12) and an environment variable can carry.
 fn valid_token(bytes: &[u8]) -> bool {
     (1..=TOKEN_LIMIT).contains(&bytes.len()) && bytes.iter().all(u8::is_ascii_graphic)
 }

@@ -88,7 +88,7 @@ const DEPLOYMENT_CONTEXT: &str = "configure the readiness check's Cloud access";
 
 /// The credentials the tree needs, or `None` once the first file that does not resolve was
 /// rejected as `um workflow validate` rejects it (REQ-CREDREADY-2).
-fn derive(
+pub(in crate::cli) fn derive(
     source_root: &Path,
     workflow_files: &[PathBuf],
     repository: RepositorySource,
@@ -255,7 +255,7 @@ fn write_requirement(
 }
 
 /// The human label of a declaration; the JSON document carries its stable identifier.
-trait HumanLabel {
+pub(in crate::cli) trait HumanLabel {
     fn label(self) -> &'static str;
 }
 
@@ -286,12 +286,12 @@ impl HumanLabel for UnknownDeclaration {
 }
 
 /// The workflow file a declaration sits in, or the source root for the repository's.
-fn group_label<K>(entry: &Declaration<K>) -> &str {
+pub(in crate::cli) fn group_label<K>(entry: &Declaration<K>) -> &str {
     entry.workflow.as_deref().unwrap_or("source root")
 }
 
 /// `<node> · <declaration> [<name>]`, without the workflow file.
-fn describe<K: DeclarationKind + HumanLabel>(entry: &Declaration<K>) -> String {
+pub(in crate::cli) fn describe<K: DeclarationKind + HumanLabel>(entry: &Declaration<K>) -> String {
     let mut parts = Vec::new();
     if let Some(node) = &entry.node {
         parts.push(format!("{} {}", node_label(node.kind), node.id));
@@ -384,7 +384,7 @@ impl<'a> JsonRequirement<'a> {
 }
 
 #[derive(Serialize)]
-struct JsonDeclaration<'a> {
+pub(in crate::cli) struct JsonDeclaration<'a> {
     declaration: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     workflow: Option<&'a str>,
@@ -395,7 +395,7 @@ struct JsonDeclaration<'a> {
 }
 
 impl<'a> JsonDeclaration<'a> {
-    fn from_declaration<K: DeclarationKind>(entry: &'a Declaration<K>) -> Self {
+    pub(in crate::cli) fn from_declaration<K: DeclarationKind>(entry: &'a Declaration<K>) -> Self {
         Self {
             declaration: entry.declaration.as_str(),
             workflow: entry.workflow.as_deref(),

@@ -70,7 +70,7 @@ fn delivery_answer() -> String {
     )
 }
 
-// REQ-AGENTLOGIN-15
+// REQ-GRANT-25
 #[test]
 fn status_posts_the_runner_report_with_its_bearer_and_reads_each_provider() {
     let answer = format!(
@@ -119,7 +119,7 @@ fn status_posts_the_runner_report_with_its_bearer_and_reads_each_provider() {
     );
 }
 
-// REQ-AGENTLOGIN-15
+// REQ-GRANT-25
 #[test]
 fn status_omits_what_the_runner_has_not_got_and_derives_the_https_base() {
     let (endpoint, request, server) = test_server::respond_once(
@@ -163,7 +163,7 @@ fn status_omits_what_the_runner_has_not_got_and_derives_the_https_base() {
     );
 }
 
-// REQ-AGENTLOGIN-15, REQ-AGENTLOGIN-34
+// REQ-GRANT-25, REQ-GRANT-44
 #[test]
 fn status_names_claude_code_with_the_record_schema_versions_this_build_installs() {
     let (endpoint, request, server) = test_server::respond_once(
@@ -193,7 +193,7 @@ fn status_names_claude_code_with_the_record_schema_versions_this_build_installs(
     );
 }
 
-// REQ-AGENTLOGIN-15, REQ-AGENTLOGIN-42
+// REQ-GRANT-25, REQ-GRANT-52
 #[test]
 fn status_states_the_last_use_only_of_a_ready_install() {
     let installed = || {
@@ -264,7 +264,7 @@ fn status_states_the_last_use_only_of_a_ready_install() {
     }
 }
 
-// REQ-AGENTLOGIN-15
+// REQ-GRANT-25
 #[test]
 fn status_drops_a_provider_this_build_does_not_know_and_reads_each_refusal_state() {
     let answer = format!(
@@ -301,7 +301,7 @@ fn status_drops_a_provider_this_build_does_not_know_and_reads_each_refusal_state
     }
 }
 
-// REQ-AGENTLOGIN-15
+// REQ-GRANT-25
 #[test]
 fn status_refuses_an_answer_that_is_not_private_or_not_the_closed_shape() {
     let entry = format!(
@@ -346,7 +346,7 @@ fn status_refuses_an_answer_that_is_not_private_or_not_the_closed_shape() {
     }
 }
 
-// REQ-AGENTLOGIN-16
+// REQ-GRANT-26
 #[test]
 fn delivery_posts_the_generation_asked_for_and_yields_the_decoded_material() {
     let answer = delivery_answer();
@@ -383,7 +383,7 @@ fn delivery_posts_the_generation_asked_for_and_yields_the_decoded_material() {
     assert_eq!(delivery.material.as_bytes(), MATERIAL.as_bytes());
 }
 
-// REQ-AGENTLOGIN-16
+// REQ-GRANT-26
 #[test]
 fn delivery_refusal_yields_exactly_the_reason_cloud_names() {
     for (reason, refusal) in [
@@ -415,7 +415,7 @@ fn delivery_refusal_yields_exactly_the_reason_cloud_names() {
     );
 }
 
-// REQ-AGENTLOGIN-16
+// REQ-GRANT-26
 #[test]
 fn delivery_refuses_an_answer_for_another_generation_or_with_unusable_material() {
     let valid = delivery_answer();
@@ -446,8 +446,8 @@ fn delivery_refuses_an_answer_for_another_generation_or_with_unusable_material()
     );
 }
 
-// REQ-AGENTLOGIN-15
-// REQ-AGENTLOGIN-16
+// REQ-GRANT-25
+// REQ-GRANT-26
 // REQ-TELEMETRY-45
 #[test]
 fn a_cloud_without_the_routes_or_failing_is_unavailable_with_its_status() {
@@ -493,8 +493,8 @@ fn a_cloud_without_the_routes_or_failing_is_unavailable_with_its_status() {
     );
 }
 
-// REQ-AGENTLOGIN-15
-// REQ-AGENTLOGIN-16
+// REQ-GRANT-25
+// REQ-GRANT-26
 // REQ-TELEMETRY-45
 #[test]
 fn a_request_cloud_does_not_answer_in_time_fails_in_transport() {
@@ -527,7 +527,7 @@ fn a_request_cloud_does_not_answer_in_time_fails_in_transport() {
     server.join().unwrap();
 }
 
-// REQ-AGENTLOGIN-16
+// REQ-GRANT-26
 #[test]
 fn material_never_appears_in_debug() {
     let answer = delivery_answer();

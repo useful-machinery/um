@@ -15,7 +15,7 @@
 use crate::generated::models;
 use serde::{Deserialize, Serialize};
 
-/// ReplaceAgentLoginMaterialRequest : A member's next generation of one agent login's material (REQ-AGENTLOGIN-6, REQ-AGENTLOGIN-2).
+/// ReplaceAgentLoginMaterialRequest : A member's next generation of one agent login's material (REQ-GRANT-16, REQ-GRANT-12).
 #[derive(Clone, Default, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ReplaceAgentLoginMaterialRequest {
     /// The schema version of the material's form; 1 for both providers.
@@ -27,7 +27,7 @@ pub struct ReplaceAgentLoginMaterialRequest {
 }
 
 impl ReplaceAgentLoginMaterialRequest {
-    /// A member's next generation of one agent login's material (REQ-AGENTLOGIN-6, REQ-AGENTLOGIN-2).
+    /// A member's next generation of one agent login's material (REQ-GRANT-16, REQ-GRANT-12).
     pub fn new(record_schema_version: i32, material: String) -> ReplaceAgentLoginMaterialRequest {
         ReplaceAgentLoginMaterialRequest {
             record_schema_version,

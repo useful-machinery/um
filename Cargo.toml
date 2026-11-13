@@ -117,7 +117,7 @@ jsonschema.workspace = true
 libc.workspace = true
 nix.workspace = true
 ring.workspace = true
-rustix.workspace = true
+rustix = { workspace = true, features = ["event", "pty"] }
 um-api.workspace = true
 um-execution.workspace = true
 um-human-auth.workspace = true

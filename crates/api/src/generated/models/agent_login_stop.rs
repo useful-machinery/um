@@ -15,7 +15,7 @@
 use crate::generated::models;
 use serde::{Deserialize, Serialize};
 
-/// AgentLoginStop : The stop requested when the authorization ended (REQ-AGENTLOGIN-38), omitted where none was. The run reads `cancelling` with this request like any member's graceful cancellation.
+/// AgentLoginStop : The stop requested when the authorization ended (REQ-GRANT-48), omitted where none was. The run reads `cancelling` with this request like any member's graceful cancellation.
 #[derive(Clone, Default, Debug, PartialEq, Serialize, Deserialize)]
 pub struct AgentLoginStop {
     /// The run the authorization's runner held, asked to stop.
@@ -30,7 +30,7 @@ pub struct AgentLoginStop {
 }
 
 impl AgentLoginStop {
-    /// The stop requested when the authorization ended (REQ-AGENTLOGIN-38), omitted where none was. The run reads `cancelling` with this request like any member's graceful cancellation.
+    /// The stop requested when the authorization ended (REQ-GRANT-48), omitted where none was. The run reads `cancelling` with this request like any member's graceful cancellation.
     pub fn new(
         run_id: String,
         cancellation_request_id: String,

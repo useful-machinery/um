@@ -684,10 +684,10 @@ struct AdmissionRuntime {
     codex_installation: Option<ValidatedCodexInstallation>,
     environment: EnvironmentSnapshot,
     /// The login variables the admission's offer withheld beside
-    /// `environment` (REQ-AGENTLOGIN-41).
+    /// `environment` (REQ-GRANT-51).
     withheld_agent_logins: Vec<&'static str>,
     /// What notes how the provider answered each use of a login the
-    /// admission's offer added (REQ-AGENTLOGIN-42).
+    /// admission's offer added (REQ-GRANT-52).
     harness_login_observer: Option<Arc<dyn HarnessLoginObserver>>,
     execution_version: Arc<str>,
     outbox: ObservationOutbox,
@@ -1046,11 +1046,11 @@ pub(super) struct AssignmentManager {
     environment: EnvironmentSnapshot,
     /// Where the runner keeps the agent logins it is delivered, which each
     /// admission offers to the environment its steps draw from
-    /// (REQ-AGENTLOGIN-27, REQ-AGENTLOGIN-34); `None` for a runner without
+    /// (REQ-GRANT-37, REQ-GRANT-44); `None` for a runner without
     /// protected state.
     agent_login_directory: Option<crate::agent_login::directory::LoginDirectory>,
     /// The agent-login setup each admission makes for itself before it
-    /// offers the runner's logins (REQ-AGENTLOGIN-39); given once the setup
+    /// offers the runner's logins (REQ-GRANT-49); given once the setup
     /// exists, and `None` for a runner without protected state.
     agent_login_setup: Option<super::control::AdmissionAgentLogins>,
     execution_version: Arc<str>,
@@ -1560,7 +1560,7 @@ pub(super) mod test_support {
     }
 
     /// Has `manager` keep its agent logins in `directory`, as a runner with
-    /// protected state does (REQ-AGENTLOGIN-26).
+    /// protected state does (REQ-GRANT-36).
     pub(in crate::service) fn keep_agent_logins_in(
         manager: &mut AssignmentManager,
         directory: crate::agent_login::directory::LoginDirectory,

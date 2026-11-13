@@ -21,11 +21,13 @@ pub(super) struct Command {
 
 #[derive(Debug, Subcommand)]
 enum AuthCommand {
-    #[command(about = agent_logins::ABOUT)]
+    // The earlier families `um grant` replaces, kept for one release out of help
+    // (REQ-GRANT-77).
+    #[command(about = agent_logins::ABOUT, hide = true)]
     AgentLogin(agent_logins::Command),
-    #[command(about = credentials::ABOUT)]
+    #[command(about = credentials::ABOUT, hide = true)]
     Credential(credentials::Command),
-    #[command(about = grants::ABOUT)]
+    #[command(about = grants::ABOUT, hide = true)]
     Grant(grants::Command),
     #[command(about = identities::ABOUT)]
     Identity(identities::Command),

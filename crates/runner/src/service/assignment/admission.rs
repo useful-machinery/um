@@ -77,7 +77,7 @@ impl AssignmentManager {
     }
 
     /// Makes each later admission set agent logins up for itself with
-    /// `setup` before it offers them (REQ-AGENTLOGIN-39). The setup is built
+    /// `setup` before it offers them (REQ-GRANT-49). The setup is built
     /// after the manager, since its gate holds the manager.
     pub(in crate::service) fn set_up_agent_logins_with(
         &mut self,
@@ -462,25 +462,24 @@ impl AssignmentManager {
             // continuation's included, so it is offered a replaced generation
             // and nothing of a revoked login; nothing has been offered yet,
             // and nothing is installed or removed once it has
-            // (REQ-AGENTLOGIN-39, INV-RUNNER-15). Whatever the setup meets,
+            // (REQ-GRANT-49, INV-RUNNER-15). Whatever the setup meets,
             // a panic included, the admission goes on with what is on disk.
             if let Some(setup) = &agent_login_setup {
                 let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| setup.set_up()));
             }
             // The steps, a tree run's `um` commands included, draw from the
             // process environment with the agent logins the runner keeps now,
-            // looked at for this admission (REQ-AGENTLOGIN-27,
-            // REQ-AGENTLOGIN-34); a selected provider's login the runner keeps
-            // none of is withheld instead, and the engine refuses an agent
-            // step that would have received it (REQ-AGENTLOGIN-41,
-            // INV-RUNNER-17).
+            // looked at for this admission (REQ-GRANT-37, REQ-GRANT-44); a
+            // selected provider's login the runner keeps none of is withheld
+            // instead, and the engine refuses an agent step that would have
+            // received it (REQ-GRANT-51, INV-RUNNER-17).
             let offered =
                 crate::agent_login::offer(&runtime.environment, agent_login_directory.as_ref());
             runtime.environment = offered.environment;
             runtime.withheld_agent_logins = offered.withheld;
             // How the provider answers each agent step given a login the
             // runner added is noted for the next pass, never for a variable
-            // the service carried (REQ-AGENTLOGIN-42).
+            // the service carried (REQ-GRANT-52).
             runtime.harness_login_observer = agent_login_setup
                 .as_ref()
                 .and_then(|setup| setup.observer(offered.offered));

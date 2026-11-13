@@ -600,7 +600,7 @@ fn runner_status_prints_each_provider_readiness_once_the_runner_has_set_up() {
     assert!(stdout.starts_with(&expected), "{stdout}");
     // A readiness without `selected` or `lastUse`, as an earlier runner
     // reports it, gives the availability its state alone gives
-    // (REQ-AGENTLOGIN-43).
+    // (REQ-GRANT-53).
     super::runner_agent_login::assert_provider_lines(
         &stdout,
         &[
@@ -614,7 +614,7 @@ fn runner_status_prints_each_provider_readiness_once_the_runner_has_set_up() {
     assert!(output.stderr.is_empty());
 }
 
-// REQ-RUNNERENROLL-42, REQ-AGENTLOGIN-43
+// REQ-RUNNERENROLL-42, REQ-GRANT-53, REQ-GRANT-77
 #[test]
 fn runner_status_prints_the_availability_selection_and_last_use_give() {
     let output = run_status_with_response(
@@ -650,6 +650,12 @@ fn runner_status_prints_the_availability_selection_and_last_use_give() {
         assert!(line.contains(next_action), "{line}");
         assert!(line.contains(agent_login_id), "{line}");
     }
+    // Its owner reconnects it with `um grant create` (REQ-GRANT-77).
+    let codex = stdout.lines().find(|line| line.starts_with("codex login:"));
+    assert!(
+        codex.is_some_and(|line| line.contains("`um grant create codex --replace`")),
+        "{stdout}"
+    );
     assert!(output.stderr.is_empty());
 }
 

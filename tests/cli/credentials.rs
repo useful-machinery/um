@@ -1,5 +1,7 @@
 use super::*;
 
+use super::grant::{after_notice, assert_next_actions_name_the_grant_commands};
+
 const TOKEN: &str = "unique-credential-status-session-token";
 const GRANT_ID: &str = "pgr_01k0z6r1w8f4jy2m7q9v3x5abc";
 const REVOKED_GRANT_ID: &str = "pgr_01k0z6r1w8f4jy2m7q9v3x5abd";
@@ -120,7 +122,7 @@ fn codex_login() -> serde_json::Value {
 }
 
 // A revoked Claude Code login whose runner was serving a run when it was revoked and has not
-// confirmed removing its copy (REQ-AGENTLOGIN-37, REQ-AGENTLOGIN-38).
+// confirmed removing its copy (REQ-GRANT-47, REQ-GRANT-48).
 fn revoked_claude_code_login() -> serde_json::Value {
     let mut login = agent_login(
         REVOKED_AGENT_LOGIN_ID,
@@ -212,7 +214,8 @@ fn assert_reads_both_lists_to_their_last_page(requests: &[String]) {
     }
 }
 
-// REQ-AGENTLOGIN-45
+// REQ-GRANT-55
+// REQ-GRANT-77
 #[test]
 fn status_reports_every_grant_and_authorization_and_each_provider_not_connected() {
     let mut responses = two_page_lists();
@@ -254,10 +257,13 @@ fn status_reports_every_grant_and_authorization_and_each_provider_not_connected(
             "endedAuthorizations": [ended]
         })
     );
-    assert!(output.stderr.is_empty());
+    // The earlier command names its replacement on standard error, and only that
+    // (REQ-GRANT-77).
+    assert_eq!(after_notice(&output, "um grant list"), "");
     assert_no_secret_output(&output, &[SENTINEL, TOKEN]);
 
     assert_eq!(human.status.code(), Some(0));
+    assert_eq!(after_notice(&human, "um grant list"), "");
     assert_no_secret_output(&human, &[SENTINEL, TOKEN]);
     let text = String::from_utf8(human.stdout).unwrap();
     let (rows, ended) = text.split_once("ended authorizations: 1").unwrap();
@@ -269,10 +275,11 @@ fn status_reports_every_grant_and_authorization_and_each_provider_not_connected(
         "reconnect_required",
         "wait_for_runner",
         "not_connected",
-        "um auth grant create github",
+        "um grant create github",
     ] {
         assert!(rows.contains(name), "missing {name:?} in\n{text}");
     }
+    assert_next_actions_name_the_grant_commands(&text);
     assert!(!rows.contains(REVOKED_GRANT_ID), "{text}");
     assert!(!rows.contains(REVOKED_AGENT_LOGIN_ID), "{text}");
     for name in [REVOKED_AGENT_LOGIN_ID, ENDED_RUNNER_ID, RUN_ID, "pending"] {
@@ -285,7 +292,7 @@ fn status_reports_every_grant_and_authorization_and_each_provider_not_connected(
     assert_reads_both_lists_to_their_last_page(human_requests);
 }
 
-// REQ-AGENTLOGIN-45
+// REQ-GRANT-55
 #[test]
 fn organization_keeps_only_that_organizations_agent_logins() {
     let other = agent_login(
@@ -354,7 +361,7 @@ fn organization_keeps_only_that_organizations_agent_logins() {
     assert!(!String::from_utf8_lossy(&by_slug.stdout).contains(OTHER_AGENT_LOGIN_ID));
 
     // The other organization's agent login has no authorization in force: it is one row whose
-    // next action is to authorize a runner (REQ-AGENTLOGIN-43).
+    // next action is to authorize a runner (REQ-GRANT-53).
     assert_eq!(by_id.status.code(), Some(0));
     let document = json_output(&by_id);
     let codex: Vec<_> = document["credentials"]
@@ -377,6 +384,41 @@ fn organization_keeps_only_that_organizations_agent_logins() {
     assert_eq!(requests.len(), 5);
 }
 
+// REQ-GRANT-53
+// REQ-GRANT-77
+#[test]
+fn the_hidden_status_keeps_the_earlier_projection_for_an_active_oauth_grant_with_no_runner() {
+    // The grant `um grant list` reports `not_connected` with `authorize_runner`.
+    let mut unauthorized = grant(GRANT_ID, "github", "active");
+    unauthorized["kind"] = "oauth".into();
+    unauthorized["generation"] = 1.into();
+    unauthorized["authorizations"] = serde_json::json!([]);
+    let (server, _directory, credential) = prepared(vec![
+        page(serde_json::json!([]), None),
+        page(serde_json::json!([unauthorized]), None),
+    ]);
+    let output = run_auth(&server, &credential, &["credential", "status", "--json"]);
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let document = json_output(&output);
+    let github: Vec<_> = document["credentials"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|row| row["provider"] == "github")
+        .collect();
+    assert_eq!(github.len(), 1, "{document}");
+    assert_eq!(github[0]["id"], GRANT_ID);
+    assert_eq!(github[0]["availability"], "available");
+    assert_eq!(github[0]["nextAction"], "none");
+    assert_eq!(server.finish().len(), 2);
+}
+
 fn problem(status: &str, code: u16, slug: &str) -> Vec<u8> {
     problem_http_response(
         status,
@@ -388,7 +430,7 @@ fn problem(status: &str, code: u16, slug: &str) -> Vec<u8> {
     )
 }
 
-// REQ-AGENTLOGIN-45
+// REQ-GRANT-55
 #[test]
 fn a_failed_read_is_reported_as_its_own_family_reports_it() {
     let unavailable = || problem("503 Service Unavailable", 503, "provider-unavailable");
@@ -414,7 +456,7 @@ fn a_failed_read_is_reported_as_its_own_family_reports_it() {
     assert_eq!(json_output(&status), json_output(&family));
 }
 
-// REQ-AGENTLOGIN-45
+// REQ-GRANT-55
 #[test]
 fn a_service_api_key_is_refused_as_the_agent_login_leaves_refuse_it() {
     let directory = tempfile::tempdir().unwrap();

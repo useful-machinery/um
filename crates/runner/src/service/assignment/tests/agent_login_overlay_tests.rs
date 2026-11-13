@@ -137,7 +137,7 @@ async fn release_unrun(manager: &mut AssignmentManager, offered: &AssignmentOffe
     assert!(manager.slot.is_none());
 }
 
-// REQ-AGENTLOGIN-34, REQ-WFEXEC-71
+// REQ-GRANT-44, REQ-WFEXEC-71
 #[tokio::test]
 async fn a_kept_token_reaches_only_the_steps_of_a_workflow_that_passes_it() {
     let (_temporary, mut manager) = manager_without_agent_logins(PASSING_WORKFLOW);
@@ -154,7 +154,7 @@ async fn a_kept_token_reaches_only_the_steps_of_a_workflow_that_passes_it() {
     assert_succeeded(&execute_to_terminal(&mut manager, &offered).await);
 }
 
-// REQ-AGENTLOGIN-34, REQ-WFEXEC-71
+// REQ-GRANT-44, REQ-WFEXEC-71
 #[tokio::test]
 async fn a_workflow_that_does_not_pass_the_name_receives_no_token() {
     let workflow = r#"schemaVersion: 1
@@ -175,7 +175,7 @@ steps:
     assert_succeeded(&execute_to_terminal(&mut manager, &offered).await);
 }
 
-// REQ-AGENTLOGIN-34, REQ-AGENTLOGIN-35
+// REQ-GRANT-44, REQ-GRANT-45
 #[tokio::test]
 async fn a_token_in_the_process_environment_passes_through_unchanged() {
     let workflow = PASSING_WORKFLOW.replace(DELIVERED, "service-token");
@@ -198,7 +198,7 @@ async fn a_token_in_the_process_environment_passes_through_unchanged() {
     assert_succeeded(&execute_to_terminal(&mut manager, &offered).await);
 }
 
-// REQ-AGENTLOGIN-34, REQ-AGENTLOGIN-35
+// REQ-GRANT-44, REQ-GRANT-45
 #[tokio::test]
 async fn each_admission_reads_the_token_the_runner_keeps_then() {
     let (_temporary, mut manager) = manager_without_agent_logins(PASSING_WORKFLOW);
@@ -215,7 +215,7 @@ async fn each_admission_reads_the_token_the_runner_keeps_then() {
     assert_eq!(accepted_token(&manager), None);
 }
 
-// REQ-AGENTLOGIN-27, REQ-WFEXEC-71
+// REQ-GRANT-37, REQ-WFEXEC-71
 #[tokio::test]
 async fn a_kept_codex_login_reaches_only_the_steps_of_a_workflow_that_passes_codex_home() {
     let (_temporary, mut manager) = manager_without_agent_logins(PASSING_CODEX_WORKFLOW);
@@ -233,7 +233,7 @@ async fn a_kept_codex_login_reaches_only_the_steps_of_a_workflow_that_passes_cod
     assert_succeeded(&execute_to_terminal(&mut manager, &offered).await);
 }
 
-// REQ-AGENTLOGIN-27, REQ-WFEXEC-71
+// REQ-GRANT-37, REQ-WFEXEC-71
 #[tokio::test]
 async fn a_workflow_that_does_not_pass_codex_home_receives_none() {
     let workflow = r#"schemaVersion: 1
@@ -254,7 +254,7 @@ steps:
     assert_succeeded(&execute_to_terminal(&mut manager, &offered).await);
 }
 
-// REQ-AGENTLOGIN-27
+// REQ-GRANT-37
 #[tokio::test]
 async fn a_codex_home_in_the_process_environment_passes_through_unchanged() {
     let (temporary, mut manager) = manager_without_agent_logins(PASSING_CODEX_WORKFLOW);
@@ -276,7 +276,7 @@ async fn a_codex_home_in_the_process_environment_passes_through_unchanged() {
     assert_succeeded(&execute_to_terminal(&mut manager, &offered).await);
 }
 
-// REQ-AGENTLOGIN-27
+// REQ-GRANT-37
 #[tokio::test]
 async fn each_admission_looks_for_the_codex_login_the_runner_keeps_then() {
     let (_temporary, mut manager) = manager_without_agent_logins(PASSING_CODEX_WORKFLOW);
@@ -294,7 +294,7 @@ async fn each_admission_looks_for_the_codex_login_the_runner_keeps_then() {
 }
 
 /// A manager for `PASSING_CODEX_WORKFLOW` whose admissions set agent logins up
-/// against a fake Cloud (REQ-AGENTLOGIN-39), behind the lock the periodic
+/// against a fake Cloud (REQ-GRANT-49), behind the lock the periodic
 /// pass's gate takes, and that setup, which keeps its readiness and
 /// agent-login directory beside the manager's state.
 struct SettingUp {
@@ -401,7 +401,7 @@ fn auth_json_in(codex_home: &OsStr) -> Option<Vec<u8>> {
     fs::read(Path::new(codex_home).join("auth.json")).ok()
 }
 
-// REQ-AGENTLOGIN-39, INV-RUNNER-15
+// REQ-GRANT-49, INV-RUNNER-15
 #[tokio::test]
 async fn an_admission_after_a_replacement_is_offered_the_new_generation() {
     let fixture = SettingUp::holding_generation_two().await;
@@ -433,7 +433,7 @@ async fn an_admission_after_a_replacement_is_offered_the_new_generation() {
     assert_eq!(codex.installation().map(|login| login.generation), Some(3));
 }
 
-// REQ-AGENTLOGIN-39, REQ-AGENTLOGIN-30
+// REQ-GRANT-49, REQ-GRANT-40
 #[tokio::test]
 async fn an_admission_after_a_revocation_is_offered_no_codex_home_and_the_home_is_gone() {
     let fixture = SettingUp::holding_generation_two().await;
@@ -447,7 +447,7 @@ async fn an_admission_after_a_revocation_is_offered_no_codex_home_and_the_home_i
     assert_eq!(fixture.codex().state, AgentLoginState::Revoked);
 }
 
-// REQ-AGENTLOGIN-39
+// REQ-GRANT-49
 #[tokio::test]
 async fn an_admission_whose_status_request_fails_is_offered_the_login_the_runner_holds() {
     let fixture = SettingUp::holding_generation_two().await;
@@ -464,7 +464,7 @@ async fn an_admission_whose_status_request_fails_is_offered_the_login_the_runner
     assert_eq!(fixture.codex().state, AgentLoginState::CloudUnavailable);
 }
 
-// REQ-AGENTLOGIN-39
+// REQ-GRANT-49
 #[tokio::test]
 async fn an_admission_whose_delivery_is_refused_stale_is_offered_the_generation_it_holds() {
     let fixture = SettingUp::holding_generation_two().await;
@@ -485,7 +485,7 @@ async fn an_admission_whose_delivery_is_refused_stale_is_offered_the_generation_
     assert_eq!(codex.installation().map(|login| login.generation), Some(2));
 }
 
-// REQ-AGENTLOGIN-39
+// REQ-GRANT-49
 #[tokio::test]
 async fn an_admission_asks_nothing_while_the_readiness_names_no_login() {
     let fixture = SettingUp::new(FakeAgentLoginCloud::new(fake_codex_authorized(1)));
@@ -508,7 +508,7 @@ async fn an_admission_asks_nothing_while_the_readiness_names_no_login() {
     assert_eq!(fixture.requests(), recorded);
 }
 
-// REQ-AGENTLOGIN-39, REQ-AGENTLOGIN-41
+// REQ-GRANT-49, REQ-GRANT-51
 #[tokio::test]
 async fn an_admission_sets_up_a_selected_provider_that_holds_no_login() {
     // Cloud names an authorization in force whose owner it refuses: the
@@ -621,7 +621,7 @@ impl Selecting {
     }
 }
 
-// REQ-AGENTLOGIN-41, INV-RUNNER-17
+// REQ-GRANT-51, INV-RUNNER-17
 #[test]
 fn a_selected_codex_login_the_runner_holds_none_of_is_withheld() {
     for state in [
@@ -650,7 +650,7 @@ fn a_selected_codex_login_the_runner_holds_none_of_is_withheld() {
     }
 }
 
-// REQ-AGENTLOGIN-41, REQ-AGENTLOGIN-27
+// REQ-GRANT-51, REQ-GRANT-37
 #[test]
 fn a_selected_codex_login_the_runner_still_holds_is_offered_and_nothing_withheld() {
     let runner = Selecting::new();
@@ -670,7 +670,7 @@ fn a_selected_codex_login_the_runner_still_holds_is_offered_and_nothing_withheld
     );
 }
 
-// REQ-AGENTLOGIN-41
+// REQ-GRANT-51
 #[test]
 fn a_revoked_or_unselected_provider_leaves_the_service_environment() {
     for (state, selected) in [
@@ -694,7 +694,7 @@ fn a_revoked_or_unselected_provider_leaves_the_service_environment() {
     }
 }
 
-// REQ-AGENTLOGIN-41, REQ-AGENTLOGIN-27, INV-RUNNER-17
+// REQ-GRANT-51, REQ-GRANT-37, INV-RUNNER-17
 #[test]
 fn a_service_codex_home_is_never_withheld_or_replaced() {
     for (state, kept) in [
@@ -724,7 +724,7 @@ fn a_service_codex_home_is_never_withheld_or_replaced() {
     }
 }
 
-// REQ-AGENTLOGIN-41, REQ-AGENTLOGIN-34, REQ-AGENTLOGIN-35
+// REQ-GRANT-51, REQ-GRANT-44, REQ-GRANT-45
 #[test]
 fn a_selected_claude_code_login_without_a_token_is_withheld_unless_the_service_has_its_own() {
     let runner = Selecting::new();
@@ -744,7 +744,7 @@ fn a_selected_claude_code_login_without_a_token_is_withheld_unless_the_service_h
     assert_eq!(offered.environment, runner.service_environment());
 }
 
-// REQ-AGENTLOGIN-41
+// REQ-GRANT-51
 #[test]
 fn no_readiness_document_or_an_unreadable_one_withholds_nothing() {
     let runner = Selecting::new();
@@ -756,7 +756,7 @@ fn no_readiness_document_or_an_unreadable_one_withholds_nothing() {
     assert_eq!(offered.environment, runner.service_environment());
 }
 
-// REQ-AGENTLOGIN-41, REQ-DIAG-41, INV-RUNNER-17
+// REQ-GRANT-51, REQ-DIAG-41, INV-RUNNER-17
 #[tokio::test]
 async fn an_agent_step_whose_codex_login_was_withheld_fails_before_codex_starts() {
     let workflow = CODEX_ONLY_WORKFLOW.replacen(
@@ -818,7 +818,7 @@ async fn an_agent_step_whose_codex_login_was_withheld_fails_before_codex_starts(
 /// The last use the readiness records of the runner's Codex login once an
 /// admission whose Codex step succeeded has been followed by a pass, for a
 /// service whose environment carries `CODEX_HOME` of its own when
-/// `service_codex_home` holds (REQ-AGENTLOGIN-42).
+/// `service_codex_home` holds (REQ-GRANT-52).
 async fn codex_last_use_after_a_codex_step(service_codex_home: bool) -> Option<UseOutcome> {
     let (temporary, mut manager) = super::harness_executable_tests::manager_fixture_with_harnesses(
         CODEX_ONLY_WORKFLOW,
@@ -873,7 +873,7 @@ async fn codex_last_use_after_a_codex_step(service_codex_home: bool) -> Option<U
     codex.last_use.map(|last_use| last_use.outcome)
 }
 
-// REQ-AGENTLOGIN-42
+// REQ-GRANT-52
 #[tokio::test]
 async fn an_admissions_observer_notes_a_use_of_the_codex_home_the_runner_added() {
     assert_eq!(
@@ -882,7 +882,7 @@ async fn an_admissions_observer_notes_a_use_of_the_codex_home_the_runner_added()
     );
 }
 
-// REQ-AGENTLOGIN-42, REQ-AGENTLOGIN-27
+// REQ-GRANT-52, REQ-GRANT-37
 #[tokio::test]
 async fn a_codex_home_the_service_carried_notes_no_use() {
     assert_eq!(codex_last_use_after_a_codex_step(true).await, None);

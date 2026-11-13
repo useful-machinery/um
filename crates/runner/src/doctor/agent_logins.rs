@@ -50,7 +50,7 @@ impl DoctorCheck for AgentLoginsCheck {
             Ok(None) => {
                 return Outcome::fail(
                     "readiness_unknown",
-                    "The runner has recorded no agent-login readiness; start `um runner serve` or run `um runner agent-login sync`.",
+                    "The runner has recorded no agent-login readiness; start `um runner serve` or run `um runner grant sync`.",
                     BTreeMap::new(),
                 );
             }
