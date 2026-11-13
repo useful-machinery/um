@@ -31,8 +31,14 @@ pub struct GoogleDocsAction {
     pub display_name: String,
     #[serde(rename = "workflowPath")]
     pub workflow_path: String,
-    #[serde(rename = "definitionId", deserialize_with = "Option::deserialize")]
-    pub definition_id: Option<String>,
+    /// The workflow definition the action names, null when it names none. Present only in an answer to a request whose `representation` is 2 or later.
+    #[serde(
+        rename = "definitionId",
+        default,
+        with = "crate::nullable::double_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub definition_id: Option<Option<String>>,
     #[serde(rename = "enabled")]
     pub enabled: bool,
     #[serde(rename = "description")]
@@ -56,7 +62,6 @@ impl GoogleDocsAction {
         updated_at: String,
         display_name: String,
         workflow_path: String,
-        definition_id: Option<String>,
         enabled: bool,
         description: String,
         sort_order: i32,
@@ -72,7 +77,7 @@ impl GoogleDocsAction {
             updated_at,
             display_name,
             workflow_path,
-            definition_id,
+            definition_id: None,
             enabled,
             description,
             sort_order,

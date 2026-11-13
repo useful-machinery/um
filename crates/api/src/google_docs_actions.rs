@@ -12,12 +12,24 @@ use super::{
     http_client::generated_configuration,
     http_util::{self, BoundedBodyError},
     problem,
+    resource::decode_closed_json,
 };
 
 use models::{
     CreateGoogleDocsActionRequest, GoogleDocsAction, GoogleDocsActionList,
     PatchGoogleDocsActionRequest,
 };
+
+/// The action representation this release decodes (REQ-DOCSACTION-124): its model holds
+/// `definitionId`, which Cloud sends only to a request that names representation 2 or later.
+const ACTION_REPRESENTATION: &str = "2";
+
+fn representation() -> [(String, String); 1] {
+    [(
+        "representation".to_owned(),
+        ACTION_REPRESENTATION.to_owned(),
+    )]
+}
 
 #[derive(Serialize)]
 #[serde(untagged)]
@@ -297,12 +309,8 @@ impl ActionApi {
         shape: ResponseShape,
     ) -> Result<(T, bool), ActionFailure> {
         let (bytes, ambiguous) = self.request(method, path, query, key, body, shape)?;
-        let invalid = || after_ambiguous_dispatch(protocol(false), ambiguous);
-        let raw: serde_json::Value = serde_json::from_slice(&bytes).map_err(|_| invalid())?;
-        let value: T = serde_json::from_value(raw.clone()).map_err(|_| invalid())?;
-        if serde_json::to_value(&value).map_err(|_| invalid())? != raw {
-            return Err(invalid());
-        }
+        let value = decode_closed_json(&bytes)
+            .map_err(|_| after_ambiguous_dispatch(protocol(false), ambiguous))?;
         Ok((value, ambiguous))
     }
     pub fn create(
@@ -316,7 +324,7 @@ impl ActionApi {
         let value = self.json(
             Method::POST,
             &self.path(org, project, None, None),
-            &[],
+            &representation(),
             Some(key),
             Some(&bytes),
             ResponseShape::Action(StatusCode::CREATED),
@@ -336,7 +344,7 @@ impl ActionApi {
         let value = self.json(
             Method::PATCH,
             &self.path(org, project, Some(id), None),
-            &[],
+            &representation(),
             Some(key),
             Some(&bytes),
             ResponseShape::Action(StatusCode::OK),
@@ -358,6 +366,7 @@ impl ActionApi {
         if let Some(cursor) = cursor {
             query.push(("cursor".to_owned(), cursor.to_owned()));
         }
+        query.extend(representation());
         let (page, _): (GoogleDocsActionList, bool) = self.json(
             Method::GET,
             &self.path(org, project, None, None),
@@ -378,7 +387,7 @@ impl ActionApi {
         let (bytes, _) = self.request(
             Method::GET,
             &self.path(org, project, Some(id), None),
-            &[],
+            &representation(),
             None,
             None,
             ResponseShape::Action(StatusCode::OK),
@@ -398,10 +407,7 @@ impl ActionApi {
             Ok(ActionRead::Deleted(value))
         } else {
             let value: GoogleDocsAction =
-                serde_json::from_value(raw.clone()).map_err(|_| protocol(false))?;
-            if serde_json::to_value(&value).map_err(|_| protocol(false))? != raw {
-                return Err(protocol(false));
-            }
+                decode_closed_json(&bytes).map_err(|_| protocol(false))?;
             Ok(ActionRead::Active(Box::new(validate(
                 value,
                 project,
@@ -430,7 +436,7 @@ impl ActionApi {
             let value = self.json(
                 method,
                 &path,
-                &[],
+                &representation(),
                 Some(key),
                 None,
                 ResponseShape::Action(expected),
@@ -458,6 +464,7 @@ fn validate(
         || value.version < 1
         || value.created_at.is_empty()
         || value.updated_at.is_empty()
+        || value.definition_id.is_none()
     {
         return Err(protocol(false));
     }

@@ -178,12 +178,14 @@ pub fn create_google_docs_action(
     project_id: &str,
     idempotency_key: &str,
     create_google_docs_action_request: models::CreateGoogleDocsActionRequest,
+    representation: Option<i32>,
 ) -> Result<models::GoogleDocsAction, Error<CreateGoogleDocsActionError>> {
     // add a prefix to parameters to efficiently prevent name collisions
     let p_path_organization_ref = organization_ref;
     let p_path_project_id = project_id;
     let p_header_idempotency_key = idempotency_key;
     let p_body_create_google_docs_action_request = create_google_docs_action_request;
+    let p_query_representation = representation;
 
     let uri_str = format!(
         "{}/v1/organizations/{organizationRef}/projects/{projectId}/google-docs-actions",
@@ -195,6 +197,9 @@ pub fn create_google_docs_action(
         .client
         .request(reqwest::Method::POST, &uri_str);
 
+    if let Some(ref param_value) = p_query_representation {
+        req_builder = req_builder.query(&[("representation", &param_value.to_string())]);
+    }
     if let Some(ref user_agent) = configuration.user_agent {
         req_builder = req_builder.header(reqwest::header::USER_AGENT, user_agent.clone());
     }
@@ -436,12 +441,14 @@ pub fn disable_google_docs_action(
     project_id: &str,
     action_id: &str,
     idempotency_key: &str,
+    representation: Option<i32>,
 ) -> Result<models::GoogleDocsAction, Error<DisableGoogleDocsActionError>> {
     // add a prefix to parameters to efficiently prevent name collisions
     let p_path_organization_ref = organization_ref;
     let p_path_project_id = project_id;
     let p_path_action_id = action_id;
     let p_header_idempotency_key = idempotency_key;
+    let p_query_representation = representation;
 
     let uri_str = format!(
         "{}/v1/organizations/{organizationRef}/projects/{projectId}/google-docs-actions/{actionId}/disable",
@@ -454,6 +461,9 @@ pub fn disable_google_docs_action(
         .client
         .request(reqwest::Method::POST, &uri_str);
 
+    if let Some(ref param_value) = p_query_representation {
+        req_builder = req_builder.query(&[("representation", &param_value.to_string())]);
+    }
     if let Some(ref user_agent) = configuration.user_agent {
         req_builder = req_builder.header(reqwest::header::USER_AGENT, user_agent.clone());
     }
@@ -506,12 +516,14 @@ pub fn enable_google_docs_action(
     project_id: &str,
     action_id: &str,
     idempotency_key: &str,
+    representation: Option<i32>,
 ) -> Result<models::GoogleDocsAction, Error<EnableGoogleDocsActionError>> {
     // add a prefix to parameters to efficiently prevent name collisions
     let p_path_organization_ref = organization_ref;
     let p_path_project_id = project_id;
     let p_path_action_id = action_id;
     let p_header_idempotency_key = idempotency_key;
+    let p_query_representation = representation;
 
     let uri_str = format!(
         "{}/v1/organizations/{organizationRef}/projects/{projectId}/google-docs-actions/{actionId}/enable",
@@ -524,6 +536,9 @@ pub fn enable_google_docs_action(
         .client
         .request(reqwest::Method::POST, &uri_str);
 
+    if let Some(ref param_value) = p_query_representation {
+        req_builder = req_builder.query(&[("representation", &param_value.to_string())]);
+    }
     if let Some(ref user_agent) = configuration.user_agent {
         req_builder = req_builder.header(reqwest::header::USER_AGENT, user_agent.clone());
     }
@@ -574,11 +589,13 @@ pub fn get_google_docs_action(
     organization_ref: &str,
     project_id: &str,
     action_id: &str,
+    representation: Option<i32>,
 ) -> Result<models::GetGoogleDocsAction200Response, Error<GetGoogleDocsActionError>> {
     // add a prefix to parameters to efficiently prevent name collisions
     let p_path_organization_ref = organization_ref;
     let p_path_project_id = project_id;
     let p_path_action_id = action_id;
+    let p_query_representation = representation;
 
     let uri_str = format!(
         "{}/v1/organizations/{organizationRef}/projects/{projectId}/google-docs-actions/{actionId}",
@@ -589,6 +606,9 @@ pub fn get_google_docs_action(
     );
     let mut req_builder = configuration.client.request(reqwest::Method::GET, &uri_str);
 
+    if let Some(ref param_value) = p_query_representation {
+        req_builder = req_builder.query(&[("representation", &param_value.to_string())]);
+    }
     if let Some(ref user_agent) = configuration.user_agent {
         req_builder = req_builder.header(reqwest::header::USER_AGENT, user_agent.clone());
     }
@@ -700,12 +720,14 @@ pub fn list_google_docs_actions(
     project_id: &str,
     limit: Option<i32>,
     cursor: Option<&str>,
+    representation: Option<i32>,
 ) -> Result<models::GoogleDocsActionList, Error<ListGoogleDocsActionsError>> {
     // add a prefix to parameters to efficiently prevent name collisions
     let p_path_organization_ref = organization_ref;
     let p_path_project_id = project_id;
     let p_query_limit = limit;
     let p_query_cursor = cursor;
+    let p_query_representation = representation;
 
     let uri_str = format!(
         "{}/v1/organizations/{organizationRef}/projects/{projectId}/google-docs-actions",
@@ -720,6 +742,9 @@ pub fn list_google_docs_actions(
     }
     if let Some(ref param_value) = p_query_cursor {
         req_builder = req_builder.query(&[("cursor", &param_value.to_string())]);
+    }
+    if let Some(ref param_value) = p_query_representation {
+        req_builder = req_builder.query(&[("representation", &param_value.to_string())]);
     }
     if let Some(ref user_agent) = configuration.user_agent {
         req_builder = req_builder.header(reqwest::header::USER_AGENT, user_agent.clone());
@@ -918,6 +943,7 @@ pub fn update_google_docs_action(
     action_id: &str,
     idempotency_key: &str,
     patch_google_docs_action_request: models::PatchGoogleDocsActionRequest,
+    representation: Option<i32>,
 ) -> Result<models::GoogleDocsAction, Error<UpdateGoogleDocsActionError>> {
     // add a prefix to parameters to efficiently prevent name collisions
     let p_path_organization_ref = organization_ref;
@@ -925,6 +951,7 @@ pub fn update_google_docs_action(
     let p_path_action_id = action_id;
     let p_header_idempotency_key = idempotency_key;
     let p_body_patch_google_docs_action_request = patch_google_docs_action_request;
+    let p_query_representation = representation;
 
     let uri_str = format!(
         "{}/v1/organizations/{organizationRef}/projects/{projectId}/google-docs-actions/{actionId}",
@@ -937,6 +964,9 @@ pub fn update_google_docs_action(
         .client
         .request(reqwest::Method::PATCH, &uri_str);
 
+    if let Some(ref param_value) = p_query_representation {
+        req_builder = req_builder.query(&[("representation", &param_value.to_string())]);
+    }
     if let Some(ref user_agent) = configuration.user_agent {
         req_builder = req_builder.header(reqwest::header::USER_AGENT, user_agent.clone());
     }

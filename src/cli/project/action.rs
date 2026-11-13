@@ -322,6 +322,7 @@ fn summary(item: &GoogleDocsAction) -> String {
     let definition = item
         .definition_id
         .as_ref()
+        .and_then(Option::as_ref)
         .map_or_else(String::new, |id| format!("\ndefinition: {id}"));
     format!(
         "action: {}\nproject: {}\nname: {}\nworkflow: {}{definition}\nenabled: {}\nversion: {}",

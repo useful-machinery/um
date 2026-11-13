@@ -1,0 +1,43 @@
+{
+  "items": [
+    {
+      "id": "gda_01k0z6r1w8f4jy2m7q9v3x5abd",
+      "projectId": "prj_01k0z6r1w8f4jy2m7q9v3x5abc",
+      "version": 3,
+      "createdAt": "2026-10-11T12:00:00Z",
+      "updatedAt": "2026-10-12T09:30:00Z",
+      "displayName": "Review this document",
+      "workflowPath": "workflow.yaml",
+      "definitionId": "def_01k0z6r1w8f4jy2m7q9v3x5abc",
+      "enabled": true,
+      "description": "Reviews the open document against the house style.",
+      "sortOrder": 0,
+      "inputBindings": {
+        "documentId": {"type": "document", "field": "id"},
+        "houseStyle": {"type": "literal", "kind": "text", "value": "Use our editorial guide."},
+        "options": {"type": "literal", "kind": "json", "value": null}
+      },
+      "inputPresentation": {"instructions": {"label": "Review instructions", "help": "Describe the review you need."}},
+      "publication": null
+    },
+    {
+      "id": "gda_01k0z6r1w8f4jy2m7q9v3x5abc",
+      "projectId": "prj_01k0z6r1w8f4jy2m7q9v3x5abc",
+      "version": 1,
+      "createdAt": "2026-10-10T12:00:00Z",
+      "updatedAt": "2026-10-10T12:00:00Z",
+      "displayName": "Summarize",
+      "workflowPath": ".um/workflows/summarize.yaml",
+      "definitionId": null,
+      "enabled": false,
+      "description": "",
+      "sortOrder": 1,
+      "inputBindings": {
+        "requester": {"type": "user"}
+      },
+      "inputPresentation": {},
+      "publication": {"exportName": "review"}
+    }
+  ],
+  "nextCursor": null
+}

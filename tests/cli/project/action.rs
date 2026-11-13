@@ -97,7 +97,7 @@ fn action_routes_and_closed_update() {
     let req = server.finish().remove(0);
     assert_eq!(
         req.lines().next(),
-        Some(format!("POST {} HTTP/1.1", collection()).as_str())
+        Some(format!("POST {}?representation=2 HTTP/1.1", collection()).as_str())
     );
     assert_eq!(
         request_body(&req)["inputBindings"]["fixed"]["value"],
@@ -128,7 +128,7 @@ fn action_routes_and_closed_update() {
     let req = server.finish().remove(0);
     assert_eq!(
         req.lines().next(),
-        Some(format!("PATCH {} HTTP/1.1", target("")).as_str())
+        Some(format!("PATCH {}?representation=2 HTTP/1.1", target("")).as_str())
     );
     assert_eq!(
         request_body(&req),
@@ -187,7 +187,13 @@ fn reads_lifecycle_and_delete_observe_status_and_confirmation() {
     let req = server.finish().remove(0);
     assert_eq!(
         req.lines().next(),
-        Some(format!("GET {}?limit=1&cursor=from HTTP/1.1", collection()).as_str())
+        Some(
+            format!(
+                "GET {}?limit=1&cursor=from&representation=2 HTTP/1.1",
+                collection()
+            )
+            .as_str()
+        )
     );
     assert!(!req.contains("idempotency-key:"));
     for (name, suffix, outcome) in [
@@ -207,7 +213,7 @@ fn reads_lifecycle_and_delete_observe_status_and_confirmation() {
         let req = server.finish().remove(0);
         assert_eq!(
             req.lines().next(),
-            Some(format!("POST {} HTTP/1.1", target(suffix)).as_str())
+            Some(format!("POST {}?representation=2 HTTP/1.1", target(suffix)).as_str())
         );
         assert_eq!(req.split_once("\r\n\r\n").unwrap().1, "");
     }
@@ -225,7 +231,7 @@ fn reads_lifecycle_and_delete_observe_status_and_confirmation() {
     );
     assert_eq!(
         server.finish()[0].lines().next(),
-        Some(format!("GET {} HTTP/1.1", target("")).as_str())
+        Some(format!("GET {}?representation=2 HTTP/1.1", target("")).as_str())
     );
     let tombstone = serde_json::json!({"id":ACTION,"projectId":PROJECT_ID,"deleted":true,"deletedAt":"2026-09-02T00:00:00Z"});
     let (server, _credentials, credential) =
@@ -243,7 +249,7 @@ fn reads_lifecycle_and_delete_observe_status_and_confirmation() {
     );
     assert_eq!(
         server.finish()[0].lines().next(),
-        Some(format!("GET {} HTTP/1.1", target("")).as_str())
+        Some(format!("GET {}?representation=2 HTTP/1.1", target("")).as_str())
     );
     let (server, _credentials, credential) = prepared(vec![http_response_with_headers(
         "204 No Content",
@@ -277,6 +283,118 @@ fn reads_lifecycle_and_delete_observe_status_and_confirmation() {
     );
     assert!(server.finish().is_empty());
 }
+// REQ-DOCSACTION-124
+#[test]
+fn commands_ask_for_the_representation_they_decode() {
+    let (_dir, path) = file(
+        r#"{"displayName":"Review","workflowPath":".um/workflows/review.yaml","enabled":true}"#,
+    );
+    let (_patch_dir, patch) = file(r#"{"description":"new"}"#);
+    let page = serde_json::json!({"items":[action()],"nextCursor":null});
+    let cases: [(&[&str], &str, serde_json::Value, bool, String); 7] = [
+        (
+            &["create", ORGANIZATION, PROJECT_ID, "--config-file", &path],
+            "201 Created",
+            action(),
+            true,
+            format!("POST {}?representation=2", collection()),
+        ),
+        (
+            &[
+                "list",
+                ORGANIZATION,
+                PROJECT_ID,
+                "--limit",
+                "1",
+                "--cursor",
+                "from",
+            ],
+            "200 OK",
+            page,
+            false,
+            format!("GET {}?limit=1&cursor=from&representation=2", collection()),
+        ),
+        (
+            &["show", ORGANIZATION, PROJECT_ID, ACTION],
+            "200 OK",
+            action(),
+            false,
+            format!("GET {}?representation=2", target("")),
+        ),
+        (
+            &[
+                "update",
+                ORGANIZATION,
+                PROJECT_ID,
+                ACTION,
+                "--expected-version",
+                "3",
+                "--config-file",
+                &patch,
+            ],
+            "200 OK",
+            action(),
+            true,
+            format!("PATCH {}?representation=2", target("")),
+        ),
+        (
+            &["enable", ORGANIZATION, PROJECT_ID, ACTION],
+            "200 OK",
+            action(),
+            true,
+            format!("POST {}?representation=2", target("/enable")),
+        ),
+        (
+            &["disable", ORGANIZATION, PROJECT_ID, ACTION],
+            "200 OK",
+            action(),
+            true,
+            format!("POST {}?representation=2", target("/disable")),
+        ),
+        (
+            &["delete", ORGANIZATION, PROJECT_ID, ACTION, "--yes"],
+            "204 No Content",
+            serde_json::Value::Null,
+            true,
+            format!("DELETE {}", target("")),
+        ),
+    ];
+    for (leaf, status, body, mutation, line) in cases {
+        let reply = if body.is_null() {
+            http_response_with_headers(
+                status,
+                None,
+                &[("Idempotency-Key", ECHO_IDEMPOTENCY_KEY)],
+                b"",
+            )
+        } else {
+            response(status, body, mutation)
+        };
+        let (server, _credentials, credential) = prepared(vec![reply]);
+        assert!(run(leaf, &server, &credential).status.success(), "{line}");
+        assert_eq!(
+            server.finish()[0].lines().next(),
+            Some(format!("{line} HTTP/1.1").as_str())
+        );
+    }
+
+    let mut without = action();
+    without.as_object_mut().unwrap().remove("definitionId");
+    for (body, outcome) in [(without, "invalid_response"), (action(), "found")] {
+        let (server, _credentials, credential) = prepared(vec![response("200 OK", body, false)]);
+        let output = run(
+            &["show", ORGANIZATION, PROJECT_ID, ACTION],
+            &server,
+            &credential,
+        );
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()["outcome"],
+            outcome
+        );
+        assert_eq!(server.finish().len(), 1);
+    }
+}
+
 // REQ-DOCSACTION-70
 #[test]
 fn human_output_uses_safe_metadata_and_errors_use_stderr() {
