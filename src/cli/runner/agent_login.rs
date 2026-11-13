@@ -6,7 +6,10 @@ use clap::{Args, Subcommand};
 use serde::Serialize;
 
 use crate::exit_code::{ExitCode, OutcomeClass};
-use um_runner::{AgentLoginReadiness, ControlError, Operation, RequestFailure, Response};
+use um_runner::{
+    AgentLoginReadiness, ControlError, Operation, ProviderReadiness, RequestFailure, Response,
+};
+use um_support::{CredentialStatus, NextAction};
 
 use super::super::{CommandFailure, CommandResult, JsonArgs, RunnerJson};
 
@@ -49,7 +52,41 @@ impl Command {
 struct SyncOutput<'a> {
     schema_version: u8,
     outcome: &'static str,
-    agent_logins: &'a AgentLoginReadiness,
+    agent_logins: ReadinessView<'a>,
+}
+
+/// The readiness the control socket returned, each provider with its
+/// availability and next action (REQ-AGENTLOGIN-43); the control socket
+/// carries only the facts.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ReadinessView<'a> {
+    updated_at: &'a str,
+    providers: Vec<ProviderView<'a>>,
+}
+
+#[derive(Serialize)]
+struct ProviderView<'a> {
+    #[serde(flatten)]
+    readiness: &'a ProviderReadiness,
+    #[serde(flatten)]
+    status: CredentialStatus,
+}
+
+impl<'a> ReadinessView<'a> {
+    fn of(readiness: &'a AgentLoginReadiness) -> Self {
+        Self {
+            updated_at: &readiness.updated_at,
+            providers: readiness
+                .providers
+                .iter()
+                .map(|entry| ProviderView {
+                    readiness: entry,
+                    status: entry.credential_status(),
+                })
+                .collect(),
+        }
+    }
 }
 
 impl SyncCommand {
@@ -90,7 +127,7 @@ impl SyncCommand {
                 &SyncOutput {
                     schema_version: 1,
                     outcome: "synced",
-                    agent_logins: &readiness,
+                    agent_logins: ReadinessView::of(&readiness),
                 },
             )
             .context("write agent-login readiness")?;
@@ -102,7 +139,7 @@ impl SyncCommand {
             if readiness
                 .providers
                 .iter()
-                .any(|entry| entry.state.fails_readiness())
+                .any(ProviderReadiness::fails_readiness)
             {
                 ExitCode::GeneralFailure
             } else {
@@ -132,8 +169,9 @@ fn control_failure(error: ControlError) -> CommandFailure {
     }
 }
 
-/// Writes one line per provider: its readiness state and, for a login the
-/// runner installed, the generation.
+/// Writes one line per provider: its readiness state, for a login the runner
+/// installed the generation, and its availability with the next action and
+/// the step it names (REQ-AGENTLOGIN-43).
 pub(super) fn write_readiness(
     output: &mut impl Write,
     readiness: &AgentLoginReadiness,
@@ -141,12 +179,54 @@ pub(super) fn write_readiness(
     for entry in &readiness.providers {
         let label = format!("{} login:", super::status::enum_json(entry.provider)?);
         let state = super::status::enum_json(entry.state)?;
-        match entry.generation {
-            Some(generation) => {
-                writeln!(output, "{label:<19}{state} (generation {generation})")?;
-            }
-            None => writeln!(output, "{label:<19}{state}")?,
-        }
+        let generation = entry
+            .generation
+            .map(|generation| format!(" (generation {generation})"))
+            .unwrap_or_default();
+        let status = entry.credential_status();
+        let step = runner_step(status, entry.agent_login_id.as_deref());
+        writeln!(
+            output,
+            "{label:<19}{state}{generation}, {}",
+            status.text(step.as_deref())
+        )?;
     }
     Ok(())
+}
+
+/// The command or step a runner's next action names. Reconnecting a login
+/// and restoring its owner's membership are the agent login's owner's to do,
+/// not the runner operator's, so those name the agent login.
+pub(super) fn runner_step(
+    status: CredentialStatus,
+    agent_login_id: Option<&str>,
+) -> Option<String> {
+    let agent_login = agent_login_id.map_or_else(
+        || "the agent login".to_owned(),
+        |id| format!("agent login {id}"),
+    );
+    match status.next_action {
+        NextAction::Reconnect => Some(format!(
+            "the owner of {agent_login} stores a new sign-in with `um auth agent-login reconnect {}`; only they can",
+            agent_login_id.unwrap_or("AGENT_LOGIN")
+        )),
+        NextAction::RestoreMembership => Some(format!(
+            "the owner of {agent_login} must be an active member of the organization again; it is theirs to settle, not the runner's"
+        )),
+        NextAction::SyncRunner => {
+            Some("set agent logins up again with `um runner agent-login sync`".to_owned())
+        }
+        NextAction::CheckTarget => Some(
+            "the deployment does not serve this provider for the runner's operating system"
+                .to_owned(),
+        ),
+        NextAction::ResolveServiceLogin => Some(
+            "the service's own login is in use; remove it from the service environment to use the agent login"
+                .to_owned(),
+        ),
+        NextAction::None
+        | NextAction::WaitForRunner
+        | NextAction::AuthorizeRunner
+        | NextAction::Connect => None,
+    }
 }

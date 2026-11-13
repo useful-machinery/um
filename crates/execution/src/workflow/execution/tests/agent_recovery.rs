@@ -601,3 +601,106 @@ environmentPassthrough: [VISIBLE]
     })
     .await;
 }
+
+/// A workflow whose `repair` command step fails and hands its failure to a Codex recovery
+/// handler, with `root`, the step's and the handler's own `environmentPassthrough` lines.
+fn withheld_login_recovery_source(root: &str, step: &str, handler: &str) -> String {
+    format!(
+        "schemaVersion: 1\n{root}{}steps:\n  repair:\n    kind: cmd\n{step}    recovery:\n      retries: 1\n      handler:\n        kind: agent\n        profile: recovery\n        prompt: prompt.md\n{handler}    command:\n      argv: [/bin/sh, -c, \"exit 75\"]\n",
+        recovery_profile_source(AgentCompatibilityProfile::CodexAppServerV1)
+    )
+}
+
+fn handler_failed_at_start_without_input(run: &WithheldLoginRun) -> bool {
+    let recovery = run.result.recoveries["repair"].as_ref().unwrap();
+    matches!(
+        &recovery.rounds[0].handler.as_ref().unwrap().outcome,
+        RecoveryHandlerOutcome::Failed {
+            phase: crate::workflow::runtime::RecoveryHandlerFailurePhase::Start,
+            cause: StepFailureCause::RecoveryHandler(RecoveryHandlerFailure::AgentInputFailed),
+        }
+    )
+}
+
+// INV-ENGINE-35, REQ-WFRECOVERY-64
+#[tokio::test]
+async fn an_agent_recovery_handler_whose_login_was_withheld_fails_its_start() {
+    with_watchdog(async {
+        let root = "environmentPassthrough: [CODEX_HOME]\n";
+        for (step, handler) in [
+            ("", ""),
+            ("    environmentPassthrough: [CODEX_HOME]\n", ""),
+            (
+                "    environmentPassthrough: []\n",
+                "        environmentPassthrough: [CODEX_HOME]\n",
+            ),
+        ] {
+            let source = withheld_login_recovery_source(root, step, handler);
+            let run = run_with_withheld_logins(&source, &["CODEX_HOME"]).await;
+            assert!(!run.harness_started, "{step:?} {handler:?}");
+            assert!(
+                handler_failed_at_start_without_input(&run),
+                "{step:?} {handler:?}: {:?}",
+                run.result.recoveries["repair"]
+            );
+            assert!(matches!(run.result.outcome, RunOutcome::Failed { .. }));
+            // The closed code is shared with every other input failure, so the step's
+            // diagnostics name what refused the handler.
+            assert!(
+                handler_refusal_names_the_withheld_login(&run),
+                "{step:?} {handler:?}"
+            );
+        }
+    })
+    .await;
+}
+
+fn handler_refusal_names_the_withheld_login(run: &WithheldLoginRun) -> bool {
+    run.diagnostics
+        .invocation_ids("repair")
+        .into_iter()
+        .filter_map(|invocation| run.diagnostics.get_invocation("repair", invocation))
+        .any(|diagnostic| {
+            String::from_utf8_lossy(diagnostic.standard_error().bytes())
+                .contains("agent_login_unavailable")
+        })
+}
+
+// INV-ENGINE-35, REQ-WFRECOVERY-64
+#[tokio::test]
+async fn an_agent_recovery_handler_that_would_not_receive_a_withheld_login_starts() {
+    with_watchdog(async {
+        let root = "environmentPassthrough: [CODEX_HOME]\n";
+        for (root, step, handler, withheld) in [
+            (root, "", "", &[][..]),
+            (
+                root,
+                "",
+                "        environmentPassthrough: []\n",
+                &["CODEX_HOME"][..],
+            ),
+            (
+                root,
+                "    environmentPassthrough: []\n",
+                "",
+                &["CODEX_HOME"][..],
+            ),
+            ("", "", "", &["CODEX_HOME"][..]),
+            (
+                "environmentPassthrough: [CODEX_HOME, CLAUDE_CODE_OAUTH_TOKEN]\n",
+                "",
+                "",
+                &["CLAUDE_CODE_OAUTH_TOKEN"][..],
+            ),
+        ] {
+            let source = withheld_login_recovery_source(root, step, handler);
+            let run = run_with_withheld_logins(&source, withheld).await;
+            assert!(
+                run.harness_started,
+                "{root:?} {step:?} {handler:?} {withheld:?}"
+            );
+            assert!(!handler_failed_at_start_without_input(&run));
+        }
+    })
+    .await;
+}

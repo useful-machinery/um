@@ -604,13 +604,35 @@ mod tests {
         }
 
         fn record_codex(&self, state: &str) {
+            self.record_codex_entry(serde_json::json!({"provider": "codex", "state": state}));
+        }
+
+        /// Records a `ready` `codex` install whose last use was `last_use`.
+        fn record_ready_codex(&self, last_use: Option<&str>) {
+            let mut entry = serde_json::json!({
+                "provider": "codex",
+                "state": "ready",
+                "agentLoginId": "agl_01k0z6r1w8f4jy2m7q9v3x5abc",
+                "generation": 2,
+                "installedAt": "2026-11-12T00:55:00Z",
+                "installedPath": self.root.path().join("state/.runner-agent-login/codex/auth.json"),
+                "selected": true,
+            });
+            if let Some(last_use) = last_use {
+                entry["lastUse"] = last_use.into();
+                entry["lastUseAt"] = "2026-11-12T00:58:00Z".into();
+            }
+            self.record_codex_entry(entry);
+        }
+
+        fn record_codex_entry(&self, codex: serde_json::Value) {
             use std::os::unix::fs::OpenOptionsExt as _;
 
             let document = serde_json::json!({
                 "schemaVersion": 1,
                 "updatedAt": "2026-11-12T01:00:00Z",
                 "providers": [
-                    {"provider": "codex", "state": state},
+                    codex,
                     {"provider": "github", "state": "not_delivered"},
                     {"provider": "gitlab", "state": "not_delivered"},
                     {"provider": "linear", "state": "not_delivered"},
@@ -692,6 +714,99 @@ mod tests {
                 "{state}"
             );
         }
+    }
+
+    // REQ-RUNNERENROLL-86, REQ-AGENTLOGIN-41
+    #[test]
+    fn agent_logins_check_fails_a_selected_provider_cloud_refuses() {
+        let host = AgentLoginHost::new();
+        host.record_codex_entry(serde_json::json!({
+            "provider": "codex",
+            "state": "not_authorized",
+            "agentLoginId": "agl_01k0z6r1w8f4jy2m7q9v3x5abc",
+            "checkedAt": "2026-11-12T01:00:00Z",
+            "selected": true,
+        }));
+
+        let outcome = host.run();
+
+        assert_eq!(
+            (outcome.status, outcome.code),
+            (Status::Fail, "not_authorized")
+        );
+        assert_eq!(
+            outcome.details.get("provider").map(String::as_str),
+            Some("codex")
+        );
+    }
+
+    // REQ-RUNNERENROLL-86
+    #[test]
+    fn agent_logins_check_fails_a_ready_login_refused_at_its_last_use() {
+        for (last_use, status, code) in [
+            (Some("refused"), Status::Fail, "reconnect_required"),
+            (Some("accepted"), Status::Pass, "ok"),
+            (None, Status::Pass, "ok"),
+        ] {
+            let host = AgentLoginHost::new();
+            host.record_ready_codex(last_use);
+
+            let outcome = host.run();
+
+            assert_eq!(
+                (outcome.status, outcome.code),
+                (status, code),
+                "{last_use:?}"
+            );
+            assert_eq!(
+                outcome.details.get("codex").map(String::as_str),
+                Some("ready")
+            );
+        }
+    }
+
+    // REQ-RUNNERENROLL-86, REQ-AGENTLOGIN-43
+    #[test]
+    fn agent_logins_check_names_every_providers_availability_and_next_action() {
+        for (record, availability, next_action) in [
+            (Some("refused"), "reconnect_required", "reconnect"),
+            (Some("accepted"), "available", "none"),
+            (None, "unverified", "none"),
+        ] {
+            let host = AgentLoginHost::new();
+            host.record_ready_codex(record);
+            let outcome = host.run();
+            let detail = |key: &str| outcome.details.get(key).map(String::as_str);
+            assert_eq!(detail("codex_availability"), Some(availability));
+            assert_eq!(detail("codex_next_action"), Some(next_action));
+            for brokered in ["github", "gitlab", "linear"] {
+                assert_eq!(
+                    detail(&format!("{brokered}_availability")),
+                    Some("not_delivered")
+                );
+                assert_eq!(detail(&format!("{brokered}_next_action")), Some("none"));
+            }
+        }
+
+        // A failing result names them too.
+        let host = AgentLoginHost::new();
+        host.record_codex("unsupported_target");
+        let outcome = host.run();
+        assert_eq!(
+            (outcome.status, outcome.code),
+            (Status::Fail, "unsupported_target")
+        );
+        assert_eq!(
+            outcome
+                .details
+                .get("codex_availability")
+                .map(String::as_str),
+            Some("delivery_failed")
+        );
+        assert_eq!(
+            outcome.details.get("codex_next_action").map(String::as_str),
+            Some("check_target")
+        );
     }
 
     // REQ-RUNNERENROLL-86

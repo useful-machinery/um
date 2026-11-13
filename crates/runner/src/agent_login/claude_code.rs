@@ -11,6 +11,7 @@ use std::os::unix::ffi::OsStringExt as _;
 use std::path::{Path, PathBuf};
 
 use time::OffsetDateTime;
+use um_execution::CLAUDE_CODE_LOGIN_VARIABLE;
 use zeroize::Zeroizing;
 
 use super::cloud::Delivery;
@@ -19,9 +20,6 @@ use super::readiness::Installation;
 use super::{FailureCause, FailureStage, InstallRefusal, ServiceEnvironment, StepFailure};
 use crate::enrollment::read_private_file_if_present;
 
-/// The variable Claude Code reads the token from, which the runner offers to
-/// each assignment.
-pub(crate) const TOKEN_VARIABLE: &str = "CLAUDE_CODE_OAUTH_TOKEN";
 /// The file a `/login` keeps in Claude Code's configuration directory.
 const CREDENTIALS_FILE: &str = ".credentials.json";
 /// A token is one line of at most this many printable characters
@@ -131,7 +129,7 @@ pub(crate) fn offered_token(
     }
     let token = read_token(&directory.claude_code_token())?;
     Some((
-        OsString::from(TOKEN_VARIABLE),
+        OsString::from(CLAUDE_CODE_LOGIN_VARIABLE),
         OsString::from_vec(token.0.to_vec()),
     ))
 }

@@ -5,7 +5,7 @@ use crate::exit_code::ExitCode;
 use um_api::AgentLoginFailure;
 use um_human_auth::Deployment;
 
-use super::{Options, RunnerTarget, output, run_leaf};
+use super::{Confirmation, Options, RunnerTarget, Stated, output, run_leaf};
 
 pub(super) const ABOUT: &str = "End a runner's authorization for one of your coding agent logins";
 
@@ -15,10 +15,18 @@ pub(super) struct Command {
     target: RunnerTarget,
 
     #[command(flatten)]
-    confirmation: super::super::super::ConfirmationArgs,
+    confirmation: Confirmation<Self>,
 
     #[command(flatten)]
     options: Options,
+}
+
+/// The stop Cloud requests of the runner's run (REQ-AGENTLOGIN-38).
+impl Stated for Command {
+    const NAME: &'static str = "deauthorize";
+    const STATEMENT: &'static [&'static str] =
+        &["the run the runner is serving will be asked to stop, whichever member started it"];
+    const ACTION: &'static str = "to end the runner's authorization";
 }
 
 impl Command {
@@ -27,6 +35,9 @@ impl Command {
             agent_login_id,
             runner_id,
         } = &self.target;
+        super::state::<Self>(format_args!(
+            "Ending runner {runner_id}'s authorization for agent login {agent_login_id}:"
+        ))?;
         let key = um_support::generate_idempotency_key()
             .context("generate agent login deauthorization request key")?;
         run_leaf(
@@ -47,15 +58,18 @@ impl Command {
                         api.deauthorize(agent_login_id, &authorization_id, &key)
                     }
                     result => result,
-                }
-                .map(|()| authorization_id)
+                }?;
+                // The read only reports the runner's removal and stop; its failure leaves the
+                // authorization ended.
+                Ok((authorization_id, api.get(agent_login_id).ok()))
             },
-            |deployment, authorization_id, json| {
+            |deployment, (authorization_id, after), json| {
                 output::write_deauthorize(
                     deployment,
                     agent_login_id,
                     authorization_id,
                     runner_id,
+                    after.as_ref(),
                     json,
                 )
             },

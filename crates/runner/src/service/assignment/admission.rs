@@ -38,6 +38,7 @@ impl AssignmentManager {
             agent_login_directory: config
                 .state_access()
                 .map(|state| crate::agent_login::directory::LoginDirectory::beside(state.path())),
+            agent_login_setup: None,
             execution_version,
             lease_clock,
             sleeper,
@@ -71,6 +72,16 @@ impl AssignmentManager {
             fenced_final_graces: BTreeSet::new(),
             guard_processes,
         }
+    }
+
+    /// Makes each later admission set agent logins up for itself with
+    /// `setup` before it offers them (REQ-AGENTLOGIN-39). The setup is built
+    /// after the manager, since its gate holds the manager.
+    pub(in crate::service) fn set_up_agent_logins_with(
+        &mut self,
+        setup: super::super::control::AdmissionAgentLogins,
+    ) {
+        self.agent_login_setup = Some(setup);
     }
 
     pub(in crate::service) fn retain_lease_policy(
@@ -419,6 +430,7 @@ impl AssignmentManager {
         let input_broker = self.input_broker.clone();
         let mut runtime = self.admission_runtime();
         let agent_login_directory = self.agent_login_directory.clone();
+        let agent_login_setup = self.agent_login_setup.clone();
         let sender = self.event_sender.clone();
         let wake = self.outbox.clone();
         if let Some(LocalSlot::Preparing(preparing)) = &mut self.slot {
@@ -443,12 +455,31 @@ impl AssignmentManager {
                 }
             };
             let _preparation_fence = preparation_fence;
+            // The admission sets agent logins up for itself first, a
+            // continuation's included, so it is offered a replaced generation
+            // and nothing of a revoked login; nothing has been offered yet,
+            // and nothing is installed or removed once it has
+            // (REQ-AGENTLOGIN-39, INV-RUNNER-15). Whatever the setup meets,
+            // a panic included, the admission goes on with what is on disk.
+            if let Some(setup) = &agent_login_setup {
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| setup.set_up()));
+            }
             // The steps draw from the process environment with the agent
-            // logins the runner keeps now, looked at for this admission, so a
-            // login delivered or removed while the runner serves applies from
-            // the next assignment (REQ-AGENTLOGIN-27, REQ-AGENTLOGIN-34).
-            runtime.environment =
+            // logins the runner keeps now, looked at for this admission
+            // (REQ-AGENTLOGIN-27, REQ-AGENTLOGIN-34); a selected provider's
+            // login the runner keeps none of is withheld instead, and the
+            // engine refuses an agent step that would have received it
+            // (REQ-AGENTLOGIN-41, INV-RUNNER-17).
+            let offered =
                 crate::agent_login::offer(&runtime.environment, agent_login_directory.as_ref());
+            runtime.environment = offered.environment;
+            runtime.withheld_agent_logins = offered.withheld;
+            // How the provider answers each agent step given a login the
+            // runner added is noted for the next pass, never for a variable
+            // the service carried (REQ-AGENTLOGIN-42).
+            runtime.harness_login_observer = agent_login_setup
+                .as_ref()
+                .and_then(|setup| setup.observer(offered.offered));
             let mut root = root;
             let workspace_path = root.workspace.path();
             let preparation = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {

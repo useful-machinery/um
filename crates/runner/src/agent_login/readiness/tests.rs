@@ -62,6 +62,8 @@ fn the_document_records_an_install_without_its_material() {
             state: AgentLoginState::Ready,
             checked_at: Some(time(1_794_445_200)),
             login: Some(RecordedLogin::Installed(installation.clone())),
+            selected: true,
+            last_use: None,
         }],
         unknown: Vec::new(),
     };
@@ -84,6 +86,7 @@ fn the_document_records_an_install_without_its_material() {
                 "checkedAt": "2026-11-12T01:00:00Z",
                 "installedAt": "2026-11-12T00:55:00Z",
                 "installedPath": installation.installed_path.to_str().unwrap(),
+                "selected": true,
             },
             {"provider": "github", "state": "not_delivered"},
             {"provider": "gitlab", "state": "not_delivered"},
@@ -136,26 +139,139 @@ fn every_readiness_state_round_trips_and_a_missing_document_is_none() {
         (AgentLoginState::CloudUnavailable, None),
         (AgentLoginState::InstallFailed, None),
     ] {
-        let document = ReadinessDocument {
-            updated_at: time(1_794_445_200),
-            logins: vec![LoginReadiness {
-                provider: AgentLoginProvider::Codex,
-                state,
-                checked_at: None,
-                login,
-            }],
-            unknown: Vec::new(),
-        };
-        document.write(&path).unwrap();
-        let value: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-        assert!(validator.is_valid(&value), "{value}");
-        assert_eq!(ReadinessDocument::load(&path), Ok(Some(document)));
+        for selected in [true, false] {
+            let document = ReadinessDocument {
+                updated_at: time(1_794_445_200),
+                logins: vec![LoginReadiness {
+                    provider: AgentLoginProvider::Codex,
+                    state,
+                    checked_at: None,
+                    login: login.clone(),
+                    selected,
+                    last_use: None,
+                }],
+                unknown: Vec::new(),
+            };
+            document.write(&path).unwrap();
+            let value: serde_json::Value =
+                serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            assert!(validator.is_valid(&value), "{value}");
+            assert_eq!(value["providers"][0]["selected"], selected, "{value}");
+            assert_eq!(ReadinessDocument::load(&path), Ok(Some(document)));
+        }
     }
     let entries = fs::read_dir(state.path())
         .unwrap()
         .map(|entry| entry.unwrap().file_name())
         .collect::<Vec<_>>();
     assert_eq!(entries, [READINESS_FILE]);
+}
+
+// REQ-AGENTLOGIN-28, REQ-AGENTLOGIN-42, REQ-AGENTLOGIN-43
+#[test]
+fn the_last_use_of_an_install_round_trips_beside_it_and_only_there() {
+    let state = state_directory();
+    let path = readiness_path(&state.path().join("state.json"));
+    let validator = validator();
+    let installation = Installation {
+        agent_login_id: AGENT_LOGIN_ID.to_owned(),
+        generation: 2,
+        installed_at: time(1_794_444_900),
+        installed_path: PathBuf::from("/var/lib/um-runner/.runner-agent-login/codex/auth.json"),
+    };
+    for outcome in [UseOutcome::Accepted, UseOutcome::Refused] {
+        let document = ReadinessDocument {
+            updated_at: time(1_794_445_200),
+            logins: vec![LoginReadiness {
+                provider: AgentLoginProvider::Codex,
+                state: AgentLoginState::Ready,
+                checked_at: Some(time(1_794_445_200)),
+                login: Some(RecordedLogin::Installed(installation.clone())),
+                selected: true,
+                last_use: Some(LastUse {
+                    outcome,
+                    at: time(1_794_445_080),
+                }),
+            }],
+            unknown: Vec::new(),
+        };
+        document.write(&path).unwrap();
+
+        let value: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert!(validator.is_valid(&value), "{value}");
+        assert_eq!(
+            value["providers"][0]["lastUse"],
+            serde_json::to_value(outcome).unwrap()
+        );
+        assert_eq!(value["providers"][0]["lastUseAt"], "2026-11-12T00:58:00Z");
+        assert_eq!(ReadinessDocument::load(&path), Ok(Some(document.clone())));
+        // The control socket reports the last use and the selection, but
+        // neither when the use was nor where the install is
+        // (REQ-AGENTLOGIN-43, REQ-RUNNERENROLL-63).
+        let reported = serde_json::to_value(document.reported().unwrap()).unwrap();
+        let entry = &reported["providers"][0];
+        assert_eq!(
+            entry["lastUse"],
+            serde_json::to_value(outcome).unwrap(),
+            "{reported}"
+        );
+        assert_eq!(entry["selected"], true, "{reported}");
+        assert!(entry.get("lastUseAt").is_none(), "{reported}");
+        assert!(entry.get("installedPath").is_none(), "{reported}");
+    }
+
+    let installed = serde_json::json!({
+        "provider": "codex",
+        "state": "ready",
+        "agentLoginId": AGENT_LOGIN_ID,
+        "generation": 2,
+        "installedAt": "2026-11-12T00:55:00Z",
+        "installedPath": "/var/lib/um-runner/.runner-agent-login/codex/auth.json",
+    });
+    let with = |entry: &serde_json::Value, members: serde_json::Value| {
+        let mut entry = entry.clone();
+        entry
+            .as_object_mut()
+            .unwrap()
+            .extend(members.as_object().unwrap().clone());
+        entry
+    };
+    for entry in [
+        // Without an install.
+        serde_json::json!({
+            "provider": "codex",
+            "state": "ready",
+            "agentLoginId": AGENT_LOGIN_ID,
+            "lastUse": "refused",
+            "lastUseAt": "2026-11-12T00:58:00Z",
+        }),
+        // Without its time, or a time without a use.
+        with(&installed, serde_json::json!({"lastUse": "accepted"})),
+        with(
+            &installed,
+            serde_json::json!({"lastUseAt": "2026-11-12T00:58:00Z"}),
+        ),
+        // A use the runner does not record.
+        with(
+            &installed,
+            serde_json::json!({"lastUse": "expired", "lastUseAt": "2026-11-12T00:58:00Z"}),
+        ),
+    ] {
+        let written = serde_json::json!({
+            "schemaVersion": 1,
+            "updatedAt": "2026-11-12T01:00:00Z",
+            "providers": [entry],
+        });
+        assert!(!validator.is_valid(&written), "{written}");
+        let _ = fs::remove_file(&path);
+        fs::write(&path, serde_json::to_vec(&written).unwrap()).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(
+            ReadinessDocument::load(&path),
+            Err(ReadinessError::Invalid),
+            "{written}"
+        );
+    }
 }
 
 // REQ-AGENTLOGIN-28
@@ -194,6 +310,8 @@ fn an_entry_for_a_provider_this_build_does_not_know_survives_a_rewrite_verbatim(
             state: AgentLoginState::Revoked,
             checked_at: None,
             login: None,
+            selected: false,
+            last_use: None,
         }]
     );
     document.updated_at = time(1_794_445_200);
@@ -217,6 +335,34 @@ fn an_entry_for_a_provider_this_build_does_not_know_survives_a_rewrite_verbatim(
 }
 
 // REQ-AGENTLOGIN-28
+#[test]
+fn an_entry_written_before_selection_was_recorded_is_selected_by_its_state() {
+    let state = state_directory();
+    let path = readiness_path(&state.path().join("state.json"));
+    for (state, selected) in [
+        (AgentLoginState::Ready, true),
+        (AgentLoginState::ForeignLogin, true),
+        (AgentLoginState::UnsupportedTarget, true),
+        (AgentLoginState::StaleGeneration, true),
+        (AgentLoginState::CloudUnavailable, true),
+        (AgentLoginState::InstallFailed, true),
+        (AgentLoginState::NotAuthorized, false),
+        (AgentLoginState::Revoked, false),
+    ] {
+        let _ = fs::remove_file(&path);
+        let written = serde_json::json!({
+            "schemaVersion": 1,
+            "updatedAt": "2026-11-12T01:00:00Z",
+            "providers": [{"provider": "codex", "state": state.as_str()}],
+        });
+        fs::write(&path, serde_json::to_vec(&written).unwrap()).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        let document = ReadinessDocument::load(&path).unwrap().unwrap();
+        let codex = document.login(AgentLoginProvider::Codex).unwrap();
+        assert_eq!(codex.selected, selected, "{state:?}");
+    }
+}
+
 // REQ-AGENTLOGIN-28
 #[test]
 fn only_a_document_that_is_not_the_runners_record_is_replaced() {

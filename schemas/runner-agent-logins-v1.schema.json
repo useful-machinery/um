@@ -23,12 +23,23 @@
         "generation": { "type": "integer", "minimum": 1 },
         "checkedAt": { "type": "string", "format": "date-time" },
         "installedAt": { "type": "string", "format": "date-time" },
-        "installedPath": { "type": "string", "pattern": "^/" }
+        "installedPath": { "type": "string", "pattern": "^/" },
+        "selected": {
+          "description": "Whether Cloud's last answer named an authorization in force for the provider: authorized, unauthorized or unsupported_target. An entry without it, written before it was recorded, is selected exactly when its state is ready, foreign_login, unsupported_target, stale_generation, cloud_unavailable or install_failed.",
+          "type": "boolean"
+        },
+        "lastUse": {
+          "description": "How the provider answered the last use of the login installed: accepted when an agent step that received its variable finished successfully, refused when one failed with the harness error unauthorized. Recorded only beside an install, with when.",
+          "enum": ["accepted", "refused"]
+        },
+        "lastUseAt": { "type": "string", "format": "date-time" }
       },
       "dependentRequired": {
         "generation": ["agentLoginId", "installedAt", "installedPath"],
         "installedAt": ["generation"],
-        "installedPath": ["generation"]
+        "installedPath": ["generation"],
+        "lastUse": ["lastUseAt", "generation"],
+        "lastUseAt": ["lastUse"]
       },
       "if": { "properties": { "provider": { "enum": ["claude_code", "codex"] } } },
       "then": {

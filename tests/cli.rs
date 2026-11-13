@@ -42,6 +42,8 @@ mod claude_code_installation;
 mod codex_installation;
 #[path = "cli/connection.rs"]
 mod connection;
+#[path = "cli/credentials.rs"]
+mod credentials;
 #[path = "cli/delegation.rs"]
 mod delegation;
 #[path = "cli/github.rs"]
@@ -2224,7 +2226,7 @@ fn record_codex_readiness(directory: &tempfile::TempDir, state: &str) {
     fs::set_permissions(&path, Permissions::from_mode(0o600)).expect("protect readiness document");
 }
 
-// REQ-RUNNERENROLL-86
+// REQ-RUNNERENROLL-86, REQ-AGENTLOGIN-43
 #[test]
 fn runner_doctor_agent_logins_check_reads_the_recorded_readiness() {
     let runner_directory = private_credential_directory();
@@ -2248,6 +2250,13 @@ fn runner_doctor_agent_logins_check_reads_the_recorded_readiness() {
     assert_eq!(failed.status.code(), Some(1));
     let stdout = String::from_utf8_lossy(&failed.stdout);
     assert!(stdout.contains("code: foreign_login"), "{stdout}");
+    // Each provider's availability and next action (REQ-AGENTLOGIN-43).
+    let codex = stdout
+        .lines()
+        .find(|line| line.trim_start().starts_with("codex login:"))
+        .unwrap_or_else(|| panic!("{stdout}"));
+    assert!(codex.contains("not_delivered"), "{stdout}");
+    assert!(codex.contains("resolve_service_login"), "{stdout}");
     assert!(failed.stderr.is_empty());
 
     let json = run(&[with_config.as_slice(), &["--json"]].concat());
@@ -2258,6 +2267,14 @@ fn runner_doctor_agent_logins_check_reads_the_recorded_readiness() {
     assert_eq!(report["checks"][0]["status"], "fail");
     assert_eq!(report["checks"][0]["code"], "foreign_login");
     assert_eq!(report["checks"][0]["details"]["provider"], "codex");
+    assert_eq!(
+        report["checks"][0]["details"]["codex_availability"],
+        "not_delivered"
+    );
+    assert_eq!(
+        report["checks"][0]["details"]["codex_next_action"],
+        "resolve_service_login"
+    );
     assert_eq!(
         report["summary"],
         serde_json::json!({"passed": 0, "failed": 1})

@@ -8,15 +8,13 @@ use std::ffi::OsString;
 use std::path::PathBuf;
 
 use time::OffsetDateTime;
+use um_execution::CODEX_LOGIN_VARIABLE;
 
 use super::cloud::Delivery;
 use super::directory::{self, LoginDirectory};
 use super::readiness::Installation;
 use super::{FailureStage, InstallRefusal, ServiceEnvironment};
 
-/// The variable Codex reads its home from, which the runner offers to each
-/// assignment.
-pub(crate) const HOME_VARIABLE: &str = "CODEX_HOME";
 const AUTH_FILE: &str = "auth.json";
 const CONFIG_FILE: &str = "config.toml";
 /// The runner's Codex home's whole configuration: keep the login in
@@ -88,7 +86,7 @@ pub(crate) fn offered_home(
     }
     directory::holds_file(&auth_path(directory)).then(|| {
         (
-            OsString::from(HOME_VARIABLE),
+            OsString::from(CODEX_LOGIN_VARIABLE),
             directory.codex_home().into_os_string(),
         )
     })

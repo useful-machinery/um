@@ -66,38 +66,64 @@ impl DoctorCheck for AgentLoginsCheck {
             }
         };
 
-        let details = document
-            .logins
-            .iter()
-            .map(|login| {
-                (
-                    login.provider.as_str().to_owned(),
-                    login.state.as_str().to_owned(),
-                )
-            })
-            .collect::<BTreeMap<_, _>>();
+        // The readiness as the control socket reports it: every provider
+        // this build knows, without the path of an install.
+        let Some(readiness) = document.reported() else {
+            return Outcome::fail(
+                "readiness_unknown",
+                "The runner's agent-login readiness document cannot be read.",
+                BTreeMap::from([(
+                    "cause".to_owned(),
+                    io_error_class(std::io::ErrorKind::InvalidData).to_owned(),
+                )]),
+            );
+        };
+        let mut details = BTreeMap::new();
+        for entry in &readiness.providers {
+            let provider = entry.provider.as_str();
+            // The brokered providers' `not_delivered` is implied, as before.
+            if !entry.provider.is_brokered() {
+                details.insert(provider.to_owned(), entry.state.as_str().to_owned());
+            }
+            let status = entry.credential_status();
+            details.insert(
+                format!("{provider}_availability"),
+                status.availability.as_str().to_owned(),
+            );
+            details.insert(
+                format!("{provider}_next_action"),
+                status.next_action.as_str().to_owned(),
+            );
+        }
         // The brokered providers are `not_delivered` and never fail the check.
-        if let Some(login) = document
-            .logins
+        if let Some((entry, code)) = readiness
+            .providers
             .iter()
-            .find(|login| login.state.fails_readiness())
+            .find_map(|entry| Some((entry, entry.failure_code()?)))
         {
-            let mut details = details;
-            details.insert("provider".to_owned(), login.provider.as_str().to_owned());
+            details.insert("provider".to_owned(), entry.provider.as_str().to_owned());
+            let message = if entry.state == AgentLoginState::Ready {
+                format!(
+                    "The {} login Cloud authorized for the runner was refused at its last use.",
+                    entry.provider.as_str()
+                )
+            } else {
+                format!(
+                    "The {} login Cloud authorized for the runner is not ready.",
+                    entry.provider.as_str()
+                )
+            };
             return Outcome {
                 status: Status::Fail,
-                code: login.state.as_str(),
-                message: format!(
-                    "The {} login Cloud authorized for the runner is not ready.",
-                    login.provider.as_str()
-                ),
+                code,
+                message,
                 details,
             };
         }
-        let message = if document
-            .logins
+        let message = if readiness
+            .providers
             .iter()
-            .any(|login| login.state == AgentLoginState::Ready)
+            .any(|entry| entry.state == AgentLoginState::Ready)
         {
             "Every agent login Cloud authorized for the runner is ready."
         } else {

@@ -24,6 +24,9 @@ pub struct AgentLoginReport {
     /// The generation of this agent login the runner had installed, omitted when it held none of it.
     #[serde(rename = "generation", skip_serializing_if = "Option::is_none")]
     pub generation: Option<i64>,
+    /// How the provider answered the last use of the login the runner stated with a `ready` report, omitted when it stated none.
+    #[serde(rename = "lastUse", skip_serializing_if = "Option::is_none")]
+    pub last_use: Option<LastUse>,
     /// When Cloud recorded the report.
     #[serde(rename = "reportedAt")]
     pub reported_at: String,
@@ -35,6 +38,7 @@ impl AgentLoginReport {
         AgentLoginReport {
             state,
             generation: None,
+            last_use: None,
             reported_at,
         }
     }
@@ -63,5 +67,19 @@ pub enum State {
 impl Default for State {
     fn default() -> State {
         Self::AgentLoginReportStateReady
+    }
+}
+/// How the provider answered the last use of the login the runner stated with a `ready` report, omitted when it stated none.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
+pub enum LastUse {
+    #[serde(rename = "accepted")]
+    AgentLoginReportLastUseAccepted,
+    #[serde(rename = "refused")]
+    AgentLoginReportLastUseRefused,
+}
+
+impl Default for LastUse {
+    fn default() -> LastUse {
+        Self::AgentLoginReportLastUseAccepted
     }
 }

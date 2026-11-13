@@ -10,7 +10,8 @@ use serde::Serialize;
 
 use super::super::{OrganizationArg, PrincipalAuthenticationArgs, ProjectArg};
 use crate::exit_code::ExitCode;
-use um_runner::{CheckResult, Report, Status, built_in_registry};
+use um_runner::{AgentLoginProvider, CheckResult, Report, Status, built_in_registry};
+use um_support::{Availability, CredentialStatus, NextAction};
 
 pub(super) const ABOUT: &str = "Check local runner prerequisites";
 const COMMAND_NAME: &str = "um runner doctor";
@@ -175,6 +176,7 @@ fn write_human_report_to(output: &mut impl Write, report: &Report) -> anyhow::Re
             writeln!(output, "  code: {}", result.outcome.code)?;
         }
         write_harness_compatibility_details(output, &result.outcome.details)?;
+        write_agent_login_details(output, &result.outcome.details)?;
         writeln!(output)?;
     }
 
@@ -204,6 +206,42 @@ fn write_harness_compatibility_details(
         if let Some(value) = details.get(key) {
             writeln!(output, "  {label}: {value}")?;
         }
+    }
+    Ok(())
+}
+
+/// Writes each provider's availability and next action, with the step it
+/// names, where a result's details carry them (REQ-AGENTLOGIN-43).
+fn write_agent_login_details(
+    output: &mut impl Write,
+    details: &std::collections::BTreeMap<String, String>,
+) -> io::Result<()> {
+    for provider in AgentLoginProvider::ALL {
+        let provider = provider.as_str();
+        let detail = |suffix: &str| details.get(&format!("{provider}_{suffix}"));
+        let availability = detail("availability").and_then(|value| {
+            Availability::ALL
+                .into_iter()
+                .find(|availability| availability.as_str() == value)
+        });
+        let next_action = detail("next_action").and_then(|value| {
+            NextAction::ALL
+                .into_iter()
+                .find(|next_action| next_action.as_str() == value)
+        });
+        let (Some(availability), Some(next_action)) = (availability, next_action) else {
+            continue;
+        };
+        let status = CredentialStatus {
+            availability,
+            next_action,
+        };
+        let step = super::agent_login::runner_step(status, None);
+        writeln!(
+            output,
+            "  {provider} login: {}",
+            status.text(step.as_deref())
+        )?;
     }
     Ok(())
 }

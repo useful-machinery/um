@@ -1086,11 +1086,49 @@ impl SourceRevisionProvenance {
     }
 }
 
+/// The variable that carries a Codex login to its harness: the runner offers a member's
+/// login through it and the Codex adapter reads its home from it.
+pub const CODEX_LOGIN_VARIABLE: &str = "CODEX_HOME";
+
+/// The variable that carries a Claude Code login to its harness.
+pub const CLAUDE_CODE_LOGIN_VARIABLE: &str = "CLAUDE_CODE_OAUTH_TOKEN";
+
+/// How the harness of one agent invocation that received its login variable answered it
+/// (INV-ENGINE-36).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HarnessLoginOutcome {
+    /// The invocation succeeded.
+    Accepted,
+    /// The invocation failed with the harness error `unauthorized`.
+    Refused,
+}
+
+/// Told, by the step runtime and never by an adapter, how a harness that received its
+/// login variable fared at one agent invocation (INV-ENGINE-36). It receives the
+/// variable's name only, never its value, and is called on the engine's executor, so it
+/// must return without blocking.
+pub trait HarnessLoginObserver: Send + Sync {
+    fn observe(&self, variable: &str, outcome: HarnessLoginOutcome);
+}
+
+/// The execution context's shared harness-login observer. Its `Debug` names the role and
+/// prints nothing of what the observer holds.
+#[derive(Clone)]
+struct SharedHarnessLoginObserver(Arc<dyn HarnessLoginObserver>);
+
+impl fmt::Debug for SharedHarnessLoginObserver {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("HarnessLoginObserver")
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct ExecutionContext {
     root: PathBuf,
     limits: ExecutionPolicyLimits,
     environment: EnvironmentSnapshot,
+    withheld_agent_logins: BTreeSet<String>,
+    harness_login_observer: Option<SharedHarnessLoginObserver>,
     cancellation: CancellationPolicy,
     source_revision: Option<SourceRevisionProvenance>,
     pi_installation: Option<ValidatedPiInstallation>,
@@ -1114,6 +1152,8 @@ impl ExecutionContext {
             root,
             limits,
             environment,
+            withheld_agent_logins: BTreeSet::new(),
+            harness_login_observer: None,
             cancellation,
             source_revision: None,
             pi_installation: None,
@@ -1125,6 +1165,25 @@ impl ExecutionContext {
             tree: None,
             conditions: BTreeSet::new(),
         }
+    }
+
+    /// The login variables the admitting runner withheld beside `environment`: a coding
+    /// agent's login it was selected to offer and could not, which fails an agent step that
+    /// would have received it (INV-ENGINE-35). None unless given; a local run gives none.
+    pub fn with_withheld_agent_logins<Name: Into<String>>(
+        mut self,
+        variables: impl IntoIterator<Item = Name>,
+    ) -> Self {
+        self.withheld_agent_logins = variables.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// The observer the step runtime tells how a harness that received its login variable
+    /// fared at each agent invocation (INV-ENGINE-36). None unless given; a local run gives
+    /// none.
+    pub fn with_harness_login_observer(mut self, observer: Arc<dyn HarnessLoginObserver>) -> Self {
+        self.harness_login_observer = Some(SharedHarnessLoginObserver(observer));
+        self
     }
 
     /// The `(source, event)` pairs the caller's condition sources evaluate, against which
@@ -1301,6 +1360,8 @@ pub struct AdmittedExecutionContext {
     root: AdmittedExecutionRoot,
     limits: ExecutionLimits,
     environment: EnvironmentSnapshot,
+    withheld_agent_logins: BTreeSet<String>,
+    harness_login_observer: Option<SharedHarnessLoginObserver>,
     cancellation: CancellationPolicy,
 }
 
@@ -1323,6 +1384,12 @@ impl AdmittedExecutionContext {
 
     pub fn cancellation(&self) -> &CancellationPolicy {
         &self.cancellation
+    }
+
+    pub(crate) fn harness_login_observer(&self) -> Option<&dyn HarnessLoginObserver> {
+        self.harness_login_observer
+            .as_ref()
+            .map(|observer| observer.0.as_ref())
     }
 }
 
@@ -1402,6 +1469,15 @@ impl AdmittedHarness {
             Self::Pi(_) => AgentCompatibilityProfile::PiJsonV1,
             Self::ClaudeCode(_) => AgentCompatibilityProfile::ClaudeCodeStreamJsonV1,
             Self::Codex(_) => AgentCompatibilityProfile::CodexAppServerV1,
+        }
+    }
+
+    /// The variable that carries this harness's coding-agent login; Pi takes none.
+    pub(crate) const fn login_variable(&self) -> Option<&'static str> {
+        match self {
+            Self::Pi(_) => None,
+            Self::ClaudeCode(_) => Some(CLAUDE_CODE_LOGIN_VARIABLE),
+            Self::Codex(_) => Some(CODEX_LOGIN_VARIABLE),
         }
     }
 
@@ -1535,20 +1611,65 @@ impl AdmittedWorkflow {
     /// The admitted environment a step or finalizer process starts from, narrowed by the
     /// node's own `environmentPassthrough` when it declares one (REQ-WFEXEC-71).
     pub(crate) fn node_environment(&self, node: &str) -> EnvironmentSnapshot {
-        let declared = self
-            .workflow
-            .definition
-            .node(node)
-            .and_then(|body| body.common().environment_passthrough.as_ref());
-        self.environment_narrowed_to(declared)
+        self.environment_narrowed_to(self.node_passthrough(node))
+    }
+
+    /// Whether the admission withheld the login variable of `step`'s harness and the step's
+    /// effective `environmentPassthrough` keeps it: the root names it and the step's own
+    /// list, when it declares one, keeps it (INV-ENGINE-31). Such a step would have received
+    /// the withheld login, so it must not start (INV-ENGINE-35). Only names are compared; no
+    /// credential is read.
+    pub(crate) fn withholds_agent_login(&self, step: &str) -> bool {
+        self.withholds_login_kept_by(self.agent_step(step), self.node_passthrough(step))
+    }
+
+    /// The same check for the agent recovery handler of `step`, whose effective list is the
+    /// one `recovery_handler_environment` narrows by (REQ-WFRECOVERY-64, INV-ENGINE-35).
+    pub(crate) fn withholds_recovery_handler_login(&self, step: &str) -> bool {
+        self.withholds_login_kept_by(
+            self.recovery_handler(step),
+            self.recovery_handler_passthrough(step),
+        )
+    }
+
+    /// Whether `harness`'s login variable is withheld and an environment narrowed to `kept`
+    /// would carry it, as `environment_narrowed_to` decides.
+    fn withholds_login_kept_by(
+        &self,
+        harness: Option<&AdmittedHarness>,
+        kept: Option<&BTreeSet<String>>,
+    ) -> bool {
+        let Some(variable) = harness.and_then(AdmittedHarness::login_variable) else {
+            return false;
+        };
+        self.execution.withheld_agent_logins.contains(variable)
+            && self
+                .workflow
+                .definition
+                .environment_passthrough
+                .contains(variable)
+            && kept.is_none_or(|kept| kept.contains(variable))
     }
 
     /// The admitted environment the recovery handler of `step` starts from: narrowed by
     /// the handler's own `environmentPassthrough`, or its step's when it declares none
     /// (REQ-WFRECOVERY-64).
     pub(crate) fn recovery_handler_environment(&self, step: &str) -> EnvironmentSnapshot {
-        let declared = self
-            .workflow
+        self.environment_narrowed_to(self.recovery_handler_passthrough(step))
+    }
+
+    /// The `environmentPassthrough` a node declares, if any.
+    fn node_passthrough(&self, node: &str) -> Option<&BTreeSet<String>> {
+        self.workflow
+            .definition
+            .node(node)
+            .and_then(|body| body.common().environment_passthrough.as_ref())
+    }
+
+    /// The effective `environmentPassthrough` of `step`'s recovery handler: its own list,
+    /// or its step's when it declares none.
+    fn recovery_handler_passthrough(&self, step: &str) -> Option<&BTreeSet<String>> {
+        self.workflow
             .definition
             .recoveries
             .get(step)
@@ -1563,11 +1684,8 @@ impl AdmittedWorkflow {
                     environment_passthrough,
                     ..
                 } => environment_passthrough.as_ref(),
-            });
-        match declared {
-            Some(_) => self.environment_narrowed_to(declared),
-            None => self.node_environment(step),
-        }
+            })
+            .or_else(|| self.node_passthrough(step))
     }
 
     fn environment_narrowed_to(&self, kept: Option<&BTreeSet<String>>) -> EnvironmentSnapshot {
@@ -2322,6 +2440,8 @@ fn admit_workflow_for(
             maximum_step_log_bytes,
         },
         environment,
+        withheld_agent_logins: context.withheld_agent_logins,
+        harness_login_observer: context.harness_login_observer,
         cancellation: context.cancellation,
     };
     let needs_git_capture = context.continuation_reexecuted.as_ref().map_or_else(

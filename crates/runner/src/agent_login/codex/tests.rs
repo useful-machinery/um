@@ -221,13 +221,13 @@ fn the_runners_codex_home_is_offered_only_when_it_keeps_a_login_and_the_service_
     assert_eq!(
         offered_home(&service, &directory),
         Some((
-            OsString::from(HOME_VARIABLE),
+            OsString::from(CODEX_LOGIN_VARIABLE),
             directory.codex_home().into_os_string()
         ))
     );
 
     let own_home = ServiceEnvironment::from_lookup(|name| {
-        (name == HOME_VARIABLE).then(|| OsString::from("/srv/codex"))
+        (name == CODEX_LOGIN_VARIABLE).then(|| OsString::from("/srv/codex"))
     });
     assert!(foreign_login(&own_home));
     assert_eq!(offered_home(&own_home, &directory), None);

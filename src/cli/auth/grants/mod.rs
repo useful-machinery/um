@@ -7,6 +7,9 @@ mod uses;
 use clap::{Args, Subcommand};
 
 use um_api::{GrantApi, GrantFailure};
+
+// `um auth credential status` reports a failed read of the grants as `um auth grant` does.
+pub(in crate::cli::auth) use output::failure;
 use um_human_auth::Deployment;
 
 pub(super) const ABOUT: &str = "Manage your provider grants";

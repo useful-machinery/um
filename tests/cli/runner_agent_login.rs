@@ -69,15 +69,36 @@ fn sync_asks_the_live_runner_and_prints_each_provider_readiness() {
 
     assert_eq!(request, SYNC_REQUEST);
     assert_eq!(output.status.code(), Some(0));
-    let expected = [
-        "codex login:       ready (generation 3)\n",
-        "github login:      not_delivered\n",
-        "gitlab login:      not_delivered\n",
-        "linear login:      not_delivered\n",
-    ]
-    .concat();
-    assert_eq!(String::from_utf8(output.stdout).unwrap(), expected);
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert_provider_lines(
+        &stdout,
+        &[
+            ("codex", "ready", "unverified"),
+            ("github", "not_delivered", "not_delivered"),
+            ("gitlab", "not_delivered", "not_delivered"),
+            ("linear", "not_delivered", "not_delivered"),
+        ],
+    );
     assert!(output.stderr.is_empty());
+}
+
+/// Asserts that `stdout` has exactly one line per provider, in order, each
+/// naming the provider's state and availability (REQ-AGENTLOGIN-43).
+pub(super) fn assert_provider_lines(stdout: &str, providers: &[(&str, &str, &str)]) {
+    let lines = stdout
+        .lines()
+        .filter(|line| line.contains(" login:"))
+        .collect::<Vec<_>>();
+    assert_eq!(lines.len(), providers.len(), "{stdout}");
+    for (line, (provider, state, availability)) in lines.iter().zip(providers) {
+        let words = line
+            .split([' ', ',', ':'])
+            .filter(|word| !word.is_empty())
+            .collect::<Vec<_>>();
+        assert_eq!(words.first(), Some(provider), "{line}");
+        assert!(words.contains(state), "{line}");
+        assert!(words.contains(availability), "{line}");
+    }
 }
 
 // REQ-AGENTLOGIN-31
@@ -90,10 +111,74 @@ fn sync_json_prints_the_readiness_as_a_document() {
     let document: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(document["schemaVersion"], 1);
     assert_eq!(document["outcome"], "synced");
-    assert_eq!(
-        document["agentLogins"],
-        serde_json::from_slice::<serde_json::Value>(&synced_response(READY_CODEX)).unwrap()["agentLogins"]
-    );
+    // The control socket's readiness, each provider with its availability
+    // and next action (REQ-AGENTLOGIN-43).
+    let mut expected = serde_json::from_slice::<serde_json::Value>(&synced_response(READY_CODEX))
+        .unwrap()["agentLogins"]
+        .clone();
+    for (entry, (availability, next_action)) in expected["providers"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .zip([
+            ("unverified", "none"),
+            ("not_delivered", "none"),
+            ("not_delivered", "none"),
+            ("not_delivered", "none"),
+        ])
+    {
+        entry["availability"] = availability.into();
+        entry["nextAction"] = next_action.into();
+    }
+    assert_eq!(document["agentLogins"], expected);
+}
+
+// REQ-AGENTLOGIN-31, REQ-AGENTLOGIN-43
+#[test]
+fn sync_reports_each_providers_availability_and_fails_a_login_refused_at_its_last_use() {
+    let used = |last_use: &str| {
+        READY_CODEX.replace(
+            r#""installedAt""#,
+            &format!(r#""selected":true,"lastUse":"{last_use}","installedAt""#),
+        )
+    };
+    for (codex, code, availability, next_action) in [
+        (used("refused"), 1, "reconnect_required", "reconnect"),
+        (used("accepted"), 0, "available", "none"),
+        (READY_CODEX.to_owned(), 0, "unverified", "none"),
+        (
+            r#"{"provider":"codex","state":"not_authorized","agentLoginId":"agl_01k0z6r1w8f4jy2m7q9v3x5abc","checkedAt":"2026-11-12T01:00:00Z","selected":true}"#.to_owned(),
+            1,
+            "insufficient_permission",
+            "restore_membership",
+        ),
+    ] {
+        let (output, _) = sync_against(synced_response(&codex), &["--json"]);
+        assert_eq!(output.status.code(), Some(code), "{codex}");
+        let document: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        let providers = document["agentLogins"]["providers"].as_array().unwrap();
+        assert_eq!(providers[0]["availability"], availability, "{codex}");
+        assert_eq!(providers[0]["nextAction"], next_action, "{codex}");
+        assert!(
+            providers[1..]
+                .iter()
+                .all(|entry| entry["availability"] == "not_delivered"
+                    && entry["nextAction"] == "none"),
+            "{document}"
+        );
+
+        let (output, _) = sync_against(synced_response(&codex), &[]);
+        assert_eq!(output.status.code(), Some(code), "{codex}");
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        let codex_line = stdout.lines().next().unwrap();
+        assert!(codex_line.contains(availability), "{stdout}");
+        // A next action is printed only when there is one to take.
+        assert_eq!(
+            codex_line.contains(next_action),
+            next_action != "none",
+            "{stdout}"
+        );
+    }
 }
 
 // REQ-AGENTLOGIN-31

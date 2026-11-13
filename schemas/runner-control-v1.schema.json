@@ -120,11 +120,20 @@
         "agentLoginId": { "type": "string", "pattern": "^agl_[0-7][0-9a-hjkmnp-tv-z]{25}$" },
         "generation": { "type": "integer", "minimum": 1 },
         "checkedAt": { "type": "string", "format": "date-time" },
-        "installedAt": { "type": "string", "format": "date-time" }
+        "installedAt": { "type": "string", "format": "date-time" },
+        "selected": {
+          "description": "Whether the provider is selected, as the readiness document records it; absent where it records none.",
+          "type": "boolean"
+        },
+        "lastUse": {
+          "description": "How the provider answered the last use of the login installed, as the readiness document records it, without its time.",
+          "enum": ["accepted", "refused"]
+        }
       },
       "dependentRequired": {
         "generation": ["agentLoginId", "installedAt"],
-        "installedAt": ["generation"]
+        "installedAt": ["generation"],
+        "lastUse": ["generation"]
       }
     },
     "brokeredAgentLogin": {

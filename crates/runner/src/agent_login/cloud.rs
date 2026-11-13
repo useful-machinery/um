@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use url::Url;
 use zeroize::Zeroizing;
 
+use super::readiness::UseOutcome;
 use super::{FailureCause, OperatingSystem};
 use crate::control_protocol::{AgentLoginProvider, AgentLoginState};
 use crate::credential::Credential;
@@ -48,13 +49,35 @@ pub(crate) struct StatusRequest {
     pub(crate) providers: Vec<ProviderReport>,
 }
 
-/// One provider as the runner reports it: what it installed and its last
-/// readiness, where there are any.
+/// One provider as the runner reports it: what it installed, its last
+/// readiness and how the provider answered the installed login's last use,
+/// where there are any.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ProviderReport {
     pub(crate) provider: AgentLoginProvider,
     pub(crate) installed: Option<InstalledLogin>,
     pub(crate) state: Option<AgentLoginState>,
+    pub(crate) last_use: Option<UseOutcome>,
+}
+
+impl ProviderReport {
+    /// The report of `provider`, stating `last_use` only with `state`
+    /// `ready` and an install, the only report Cloud takes it with
+    /// (REQ-AGENTLOGIN-15, REQ-AGENTLOGIN-42).
+    pub(crate) fn new(
+        provider: AgentLoginProvider,
+        installed: Option<InstalledLogin>,
+        state: Option<AgentLoginState>,
+        last_use: Option<UseOutcome>,
+    ) -> Self {
+        let stated = installed.is_some() && state == Some(AgentLoginState::Ready);
+        Self {
+            provider,
+            installed,
+            state,
+            last_use: last_use.filter(|_| stated),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -259,6 +282,7 @@ impl AgentLoginCloud for HttpAgentLoginCloud {
                     record_schema_versions: report.provider.record_schema_versions(),
                     installed: report.installed.as_ref(),
                     state: report.state,
+                    last_use: report.last_use,
                 })
                 .collect(),
         };
@@ -379,6 +403,8 @@ struct ProviderReportBody<'a> {
     installed: Option<&'a InstalledLogin>,
     #[serde(skip_serializing_if = "Option::is_none")]
     state: Option<AgentLoginState>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_use: Option<UseOutcome>,
 }
 
 #[derive(Deserialize)]

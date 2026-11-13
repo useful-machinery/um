@@ -4,6 +4,10 @@
 //! (REQ-AGENTLOGIN-28). A missing document means the
 //! runner has installed nothing. An entry for a provider this build does not
 //! know, which a newer `um` may have written, is kept as it was read.
+//! A coding agent's entry records whether its provider is selected; one an
+//! earlier `um` wrote without it reads as selected by its state. Beside an
+//! install it records how the provider answered the login's last use
+//! (REQ-AGENTLOGIN-42).
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -64,6 +68,32 @@ pub(crate) struct LoginReadiness {
     pub(crate) state: AgentLoginState,
     pub(crate) checked_at: Option<OffsetDateTime>,
     pub(crate) login: Option<RecordedLogin>,
+    /// Whether Cloud's last answer named an authorization in force for the
+    /// provider: `authorized`, `unauthorized` or `unsupported_target`
+    /// (REQ-AGENTLOGIN-28).
+    pub(crate) selected: bool,
+    /// How the provider answered the last use of the login installed, and
+    /// when; only ever beside an install (REQ-AGENTLOGIN-42).
+    pub(crate) last_use: Option<LastUse>,
+}
+
+/// How the provider answered an agent step that received the login's
+/// variable (REQ-AGENTLOGIN-42), as the control socket also reports it.
+pub(crate) use crate::control_protocol::AgentLoginUse as UseOutcome;
+
+/// The last use of an installed login: how the provider answered it, and
+/// when the runner noted it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct LastUse {
+    pub(crate) outcome: UseOutcome,
+    pub(crate) at: OffsetDateTime,
+}
+
+/// Whether an entry written before selection was recorded reads as
+/// selected: exactly when its state is one only an authorized login has
+/// (REQ-AGENTLOGIN-28).
+pub(crate) const fn selected_by_state(state: AgentLoginState) -> bool {
+    state.selected_by_state()
 }
 
 /// The agent login an entry concerns.
@@ -163,8 +193,8 @@ impl ReadinessDocument {
     }
 
     /// The readiness as the control socket returns it: the document without
-    /// the path of any install (REQ-RUNNERENROLL-63) or the entries of
-    /// providers this build does not know.
+    /// the path of any install (REQ-RUNNERENROLL-63), the time of a last use
+    /// or the entries of providers this build does not know.
     pub(crate) fn reported(&self) -> Option<AgentLoginReadiness> {
         let wire = self.to_wire()?;
         Some(AgentLoginReadiness {
@@ -181,6 +211,8 @@ impl ReadinessDocument {
         let mut providers = Vec::with_capacity(self.unknown.len() + AgentLoginProvider::ALL.len());
         for login in &self.logins {
             let installation = login.installation();
+            // A last use is recorded only beside the install it concerns.
+            let last_use = installation.and(login.last_use);
             providers.push(WireEntry {
                 provider: login.provider.as_str().to_owned(),
                 state: EntryState::Login(login.state),
@@ -204,6 +236,12 @@ impl ReadinessDocument {
                     })
                     .transpose()
                     .ok()?,
+                selected: Some(login.selected),
+                last_use: last_use.map(|last_use| last_use.outcome),
+                last_use_at: last_use
+                    .map(|last_use| format_time(last_use.at))
+                    .transpose()
+                    .ok()?,
             });
         }
         providers.extend(self.unknown.iter().map(|UnknownEntry(entry)| entry.clone()));
@@ -215,6 +253,9 @@ impl ReadinessDocument {
             checked_at: None,
             installed_at: None,
             installed_path: None,
+            selected: None,
+            last_use: None,
+            last_use_at: None,
         }));
         Some(WireDocument {
             schema_version: 1,
@@ -239,6 +280,9 @@ impl ReadinessDocument {
                     || entry.checked_at.is_some()
                     || entry.installed_at.is_some()
                     || entry.installed_path.is_some()
+                    || entry.selected.is_some()
+                    || entry.last_use.is_some()
+                    || entry.last_use_at.is_some()
                 {
                     return None;
                 }
@@ -252,12 +296,19 @@ impl ReadinessDocument {
                 if logins.iter().any(|login| login.provider == provider) {
                     return None;
                 }
-                let (checked_at, login) = recorded_from_wire(entry)?;
+                let selected = entry.selected.unwrap_or(selected_by_state(state));
+                let Recorded {
+                    checked_at,
+                    login,
+                    last_use,
+                } = recorded_from_wire(entry)?;
                 logins.push(LoginReadiness {
                     provider,
                     state,
                     checked_at,
                     login,
+                    selected,
+                    last_use,
                 });
             } else {
                 // Kept only as the schema admits it, so the document this
@@ -294,8 +345,17 @@ fn wire_name(name: &str) -> bool {
         && bytes.all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
 }
 
-/// An installable entry's check time and the agent login it records.
-fn recorded_from_wire(entry: WireEntry) -> Option<(Option<OffsetDateTime>, Option<RecordedLogin>)> {
+/// What an installable entry records besides its provider, state and
+/// selection.
+struct Recorded {
+    checked_at: Option<OffsetDateTime>,
+    login: Option<RecordedLogin>,
+    last_use: Option<LastUse>,
+}
+
+/// An installable entry's check time, the agent login it records and, only
+/// beside an install, its last use.
+fn recorded_from_wire(entry: WireEntry) -> Option<Recorded> {
     if entry
         .agent_login_id
         .as_deref()
@@ -329,7 +389,19 @@ fn recorded_from_wire(entry: WireEntry) -> Option<(Option<OffsetDateTime>, Optio
         Some(checked_at) => Some(parse_rfc3339(checked_at)?),
         None => None,
     };
-    Some((checked_at, login))
+    let last_use = match (entry.last_use, entry.last_use_at.as_deref(), &login) {
+        (None, None, _) => None,
+        (Some(outcome), Some(at), Some(RecordedLogin::Installed(_))) => Some(LastUse {
+            outcome,
+            at: parse_rfc3339(at)?,
+        }),
+        _ => return None,
+    };
+    Some(Recorded {
+        checked_at,
+        login,
+        last_use,
+    })
 }
 
 fn format_time(value: OffsetDateTime) -> Result<String, time::error::Format> {
@@ -359,6 +431,12 @@ struct WireEntry {
     installed_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     installed_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    selected: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_use: Option<UseOutcome>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_use_at: Option<String>,
 }
 
 impl WireEntry {
@@ -375,6 +453,8 @@ impl WireEntry {
             generation: self.generation,
             checked_at: self.checked_at,
             installed_at: self.installed_at,
+            selected: self.selected,
+            last_use: self.last_use,
         })
     }
 }

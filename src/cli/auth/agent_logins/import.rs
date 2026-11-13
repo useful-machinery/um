@@ -1,12 +1,12 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, anyhow, bail};
-use clap::{ArgGroup, Args, ValueEnum};
+use clap::{Args, ValueEnum};
 use zeroize::Zeroizing;
 
 use crate::exit_code::ExitCode;
 use um_api::{
-    AgentLoginApi, AgentLoginFailure, AgentLoginImport, AgentLoginImportProvider,
+    AgentLogin, AgentLoginApi, AgentLoginFailure, AgentLoginImport, AgentLoginImportProvider,
     AgentLoginProvider, AgentLoginState,
 };
 use um_human_auth::Deployment;
@@ -33,14 +33,14 @@ const CLAUDE_CODE_TOKEN: SecretInput = SecretInput {
 
 /// The coding agent a login signs in, spelled as a workflow's harness kind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-enum Provider {
+pub(super) enum Provider {
     #[value(name = "claude_code")]
     ClaudeCode,
     Codex,
 }
 
 impl Provider {
-    const fn of(provider: AgentLoginProvider) -> Self {
+    pub(super) const fn of(provider: AgentLoginProvider) -> Self {
         match provider {
             AgentLoginProvider::AgentLoginProviderClaudeCode => Self::ClaudeCode,
             AgentLoginProvider::AgentLoginProviderCodex => Self::Codex,
@@ -62,15 +62,10 @@ impl Provider {
     }
 }
 
+/// Where the sign-in comes from, for `import` and `reconnect` alike: exactly one source.
 #[derive(Debug, Args)]
-#[command(group = ArgGroup::new("source").required(true).args(["from_file", "token_file", "login"]))]
-pub(super) struct Command {
-    #[arg(value_name = OrganizationArg::VALUE_NAME, help = OrganizationArg::HELP)]
-    organization: OrganizationArg,
-
-    #[arg(value_name = "PROVIDER", help = "Coding agent the login signs in")]
-    provider: Provider,
-
+#[group(id = "source", required = true, multiple = false)]
+pub(super) struct Source {
     #[arg(
         long,
         value_name = "PATH",
@@ -90,6 +85,18 @@ pub(super) struct Command {
         help = "Read the token claude setup-token printed from an owned mode-0600 file, or - for standard input"
     )]
     token_file: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+pub(super) struct Command {
+    #[arg(value_name = OrganizationArg::VALUE_NAME, help = OrganizationArg::HELP)]
+    organization: OrganizationArg,
+
+    #[arg(value_name = "PROVIDER", help = "Coding agent the login signs in")]
+    provider: Provider,
+
+    #[command(flatten)]
+    source: Source,
 
     #[arg(
         long,
@@ -113,58 +120,32 @@ pub(super) struct Command {
 
 impl Command {
     pub(super) fn run(self, deployment: &Deployment) -> CommandResult {
-        let material = if self.login && matches!(self.provider, Provider::Codex) {
-            // A refused session or target must not leave a new provider session behind.
-            if let Some(refused) = self.check_session_and_target(deployment)? {
-                return Ok(refused);
-            }
-            match codex_login::sign_in(read_codex_login)? {
+        let material =
+            match self
+                .source
+                .take(self.provider, deployment, self.options.json, || {
+                    self.check_session_and_target(deployment)
+                })? {
                 Ok(material) => material,
-                Err(failure) => {
-                    return output::provider_login_failed(
-                        deployment.fingerprint().api_url(),
-                        &failure,
-                        self.options.json,
-                    )
-                    .map_err(Into::into);
-                }
-            }
-        } else {
-            let material = self
-                .read_material()
-                .map_err(|error| CommandFailure::with_exit_code(error, ExitCode::UsageError))?;
-            if let Some(refused) = self.check_session_and_target(deployment)? {
-                return Ok(refused);
-            }
-            material
-        };
-        let key = um_support::generate_idempotency_key()
-            .context("generate agent login import request key")?;
+                Err(refused) => return Ok(refused),
+            };
         let import = AgentLoginImport {
             organization: &self.organization,
             provider: self.provider.wire(),
             label: self.label.as_deref(),
             material: &material,
         };
-        run_leaf(
+        store(
             deployment,
             &self.options,
-            |api| {
-                let send = || match &self.agent_login {
-                    Some(agent_login_id) => api.replace(agent_login_id, &material, &key),
-                    None => api.import(&import, &key),
-                };
-                // A lost response may have stored the login. Replay only this key, once.
-                match send() {
-                    Err(AgentLoginFailure::Unreachable { .. }) => send(),
-                    result => result,
-                }
+            |api, key| match &self.agent_login {
+                Some(agent_login_id) => api.replace(agent_login_id, &material, key),
+                None => api.import(&import, key),
             },
             |deployment, login, json| {
                 output::write_agent_login(deployment, "imported", login, json)
             },
         )
-        .map_err(Into::into)
     }
 
     /// Establishes the human session and, with `--agent-login`, checks the agent login it
@@ -195,19 +176,14 @@ impl Command {
 
     /// Reads the agent login `--agent-login` names and states how it contradicts the
     /// PROVIDER and ORGANIZATION arguments, if it does, so that no material is sent to a
-    /// login of another provider or organization (REQ-AGENTLOGIN-22). A revoked agent login
-    /// takes no generation (REQ-AGENTLOGIN-6), so it is reported as Cloud would report the
-    /// replacement, before anything is signed in to or sent. An organization slug is
+    /// login of another provider or organization (REQ-AGENTLOGIN-22). An organization slug is
     /// resolved only when the provider agrees.
     fn contradiction(
         &self,
         api: &AgentLoginApi,
         agent_login_id: &str,
     ) -> Result<Option<anyhow::Error>, AgentLoginFailure> {
-        let login = api.get(agent_login_id)?;
-        if login.state == AgentLoginState::AgentLoginStateRevoked {
-            return Err(AgentLoginFailure::AgentLoginNotFound);
-        }
+        let login = replaceable(api, agent_login_id)?;
         let provider = Provider::of(login.provider);
         if provider != self.provider {
             return Ok(Some(anyhow!(
@@ -232,10 +208,49 @@ impl Command {
         }
         Ok(None)
     }
+}
+
+impl Source {
+    /// Takes the sign-in `provider` accepts from this source (REQ-AGENTLOGIN-22 to
+    /// REQ-AGENTLOGIN-24): reads the file or stream before `check`, refusing with exit 2 a source
+    /// the provider does not take and an unsafe or malformed one, or, for `--login`, runs
+    /// `codex login` after it, so that a refused session or target leaves no provider session
+    /// behind. Returns the exit status `check` or a failed sign-in reported in place of the
+    /// material.
+    pub(super) fn take(
+        &self,
+        provider: Provider,
+        deployment: &Deployment,
+        json: bool,
+        check: impl FnOnce() -> Result<Option<ExitCode>, CommandFailure>,
+    ) -> Result<Result<Zeroizing<Vec<u8>>, ExitCode>, CommandFailure> {
+        if self.login && matches!(provider, Provider::Codex) {
+            if let Some(refused) = check()? {
+                return Ok(Err(refused));
+            }
+            return match codex_login::sign_in(read_codex_login)? {
+                Ok(material) => Ok(Ok(material)),
+                Err(failure) => output::provider_login_failed(
+                    deployment.fingerprint().api_url(),
+                    &failure,
+                    json,
+                )
+                .map(Err)
+                .map_err(Into::into),
+            };
+        }
+        let material = self
+            .read(provider)
+            .map_err(|error| CommandFailure::with_exit_code(error, ExitCode::UsageError))?;
+        Ok(match check()? {
+            Some(refused) => Err(refused),
+            None => Ok(material),
+        })
+    }
 
     /// Reads the material from the file or stream the provider takes, before any network use.
-    fn read_material(&self) -> anyhow::Result<Zeroizing<Vec<u8>>> {
-        match (self.provider, &self.from_file, &self.token_file) {
+    fn read(&self, provider: Provider) -> anyhow::Result<Zeroizing<Vec<u8>>> {
+        match (provider, &self.from_file, &self.token_file) {
             (Provider::Codex, Some(path), None) => read_codex_login(path, FileMode::Private),
             (Provider::ClaudeCode, None, Some(path)) => read_claude_code_token(path),
             (Provider::Codex, _, _) => {
@@ -246,6 +261,41 @@ impl Command {
             }
         }
     }
+}
+
+/// Reads the agent login a new generation is stored for. A revoked agent login takes no
+/// generation (REQ-AGENTLOGIN-6), so it is reported as Cloud would report the replacement,
+/// before anything is signed in to or sent.
+pub(super) fn replaceable(
+    api: &AgentLoginApi,
+    agent_login_id: &str,
+) -> Result<AgentLogin, AgentLoginFailure> {
+    let login = api.get(agent_login_id)?;
+    if login.state == AgentLoginState::AgentLoginStateRevoked {
+        return Err(AgentLoginFailure::AgentLoginNotFound);
+    }
+    Ok(login)
+}
+
+/// Stores the material through `send` under one request key, replaying that key once when the
+/// response is lost, which may have stored it, and prints the agent login through `write`.
+pub(super) fn store(
+    deployment: &Deployment,
+    options: &Options,
+    send: impl Fn(&AgentLoginApi, &str) -> Result<AgentLogin, AgentLoginFailure>,
+    write: impl FnOnce(&str, &AgentLogin, bool) -> anyhow::Result<ExitCode>,
+) -> CommandResult {
+    let key = um_support::generate_idempotency_key().context("generate agent login request key")?;
+    run_leaf(
+        deployment,
+        options,
+        |api| match send(api, &key) {
+            Err(AgentLoginFailure::Unreachable { .. }) => send(api, &key),
+            result => result,
+        },
+        write,
+    )
+    .map_err(Into::into)
 }
 
 /// Reads a Codex `auth.json` to send byte for byte. Only its shape is checked: one JSON

@@ -1,7 +1,9 @@
 //! Agent-login setup for the serving runner: asking Cloud which agent logins
 //! the runner may hold, fetching one delivery at a time, keeping it in the
 //! runner's own agent-login directory, recording each provider's readiness,
-//! and offering what it keeps to the assignments it admits.
+//! and offering what it keeps to each assignment it admits, once it has set
+//! them up for that admission (REQ-AGENTLOGIN-39), noting how the provider
+//! answered each use of what it offered (REQ-AGENTLOGIN-42).
 
 pub(crate) mod claude_code;
 pub(crate) mod cloud;
@@ -14,7 +16,7 @@ use std::ffi::{OsStr, OsString};
 use std::io;
 
 use serde::{Deserialize, Serialize};
-use um_execution::EnvironmentSnapshot;
+use um_execution::{CLAUDE_CODE_LOGIN_VARIABLE, CODEX_LOGIN_VARIABLE, EnvironmentSnapshot};
 
 use crate::control_protocol::{AgentLoginProvider, AgentLoginState};
 use crate::telemetry;
@@ -41,8 +43,8 @@ impl ServiceEnvironment {
         Self {
             home: lookup("HOME"),
             claude_config_dir: lookup("CLAUDE_CONFIG_DIR"),
-            claude_code_oauth_token: lookup(claude_code::TOKEN_VARIABLE).is_some(),
-            codex_home: lookup(codex::HOME_VARIABLE).is_some(),
+            claude_code_oauth_token: lookup(CLAUDE_CODE_LOGIN_VARIABLE).is_some(),
+            codex_home: lookup(CODEX_LOGIN_VARIABLE).is_some(),
         }
     }
 }
@@ -146,37 +148,129 @@ impl FailureCause {
     }
 }
 
-/// The environment an assignment's steps draw from: `process`, with each
-/// agent login the runner keeps in `directory` added as the variable its
-/// coding agent reads (`CODEX_HOME`, `CLAUDE_CODE_OAUTH_TOKEN`) where the
-/// service has no login of that agent's own. A variable the process
-/// environment carries is never replaced, and the process environment itself
-/// is never changed. Which steps receive a variable is the workflow's
+/// What an admission is offered: the environment its steps draw from, and
+/// the login variables withheld from it (REQ-AGENTLOGIN-41, INV-RUNNER-17).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct Offer {
+    /// The process environment, with each agent login the runner offers
+    /// added as the variable its coding agent reads.
+    pub(crate) environment: EnvironmentSnapshot,
+    /// The variable of each coding agent whose provider is selected, which
+    /// the runner has no login of to offer and the service has none of its
+    /// own for: an agent step that would have received it fails rather than
+    /// start on the service's own login (INV-ENGINE-35).
+    pub(crate) withheld: Vec<&'static str>,
+    /// Each variable added to `environment` whose login the readiness
+    /// document records as installed, with that install: the uses an
+    /// admission notes (REQ-AGENTLOGIN-42).
+    pub(crate) offered: Vec<OfferedLogin>,
+}
+
+/// A login the runner added to an admission's environment, as the
+/// readiness document records its install.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct OfferedLogin {
+    /// The variable its coding agent reads.
+    pub(crate) variable: &'static str,
+    pub(crate) provider: AgentLoginProvider,
+    pub(crate) agent_login_id: String,
+    pub(crate) generation: u64,
+}
+
+/// What the admission is offered with the agent logins the runner keeps in
+/// `directory`: `process`, with each login added as the variable its coding
+/// agent reads (`CODEX_HOME`, `CLAUDE_CODE_OAUTH_TOKEN`) where the service
+/// has no login of that agent's own, and the variable withheld instead where
+/// the runner keeps none of a selected provider's login (REQ-AGENTLOGIN-41).
+/// A variable the process environment carries is never replaced or
+/// withheld, and the process environment itself is never changed. A missing
+/// or unreadable readiness document selects nothing, and records no install
+/// of what is added. Which steps receive a variable is the workflow's
 /// `environmentPassthrough` (REQ-WFEXEC-71).
-pub(crate) fn offer(
-    process: &EnvironmentSnapshot,
-    directory: Option<&LoginDirectory>,
-) -> EnvironmentSnapshot {
+pub(crate) fn offer(process: &EnvironmentSnapshot, directory: Option<&LoginDirectory>) -> Offer {
     let Some(directory) = directory else {
-        return process.clone();
+        return Offer {
+            environment: process.clone(),
+            withheld: Vec::new(),
+            offered: Vec::new(),
+        };
     };
     let service = ServiceEnvironment::from_lookup(|name| {
         process.variable(OsStr::new(name)).map(OsStr::to_os_string)
     });
-    let offered = [
-        codex::offered_home(&service, directory),
-        claude_code::offered_token(&service, directory),
-    ];
-    if offered.iter().all(Option::is_none) {
-        return process.clone();
+    let document = recorded_readiness(directory);
+    let recorded = |provider| {
+        document
+            .as_ref()
+            .and_then(|document| document.login(provider))
+    };
+    let mut added = Vec::new();
+    let mut offered = Vec::new();
+    let mut withheld = Vec::new();
+    for provider in AgentLoginProvider::INSTALLABLE {
+        let (variable, login, foreign_login): (_, _, fn(&ServiceEnvironment) -> bool) =
+            match provider {
+                AgentLoginProvider::Codex => (
+                    CODEX_LOGIN_VARIABLE,
+                    codex::offered_home(&service, directory),
+                    codex::foreign_login,
+                ),
+                AgentLoginProvider::ClaudeCode => (
+                    CLAUDE_CODE_LOGIN_VARIABLE,
+                    claude_code::offered_token(&service, directory),
+                    claude_code::foreign_login,
+                ),
+                AgentLoginProvider::Github
+                | AgentLoginProvider::Gitlab
+                | AgentLoginProvider::Linear => continue,
+            };
+        match login {
+            Some(login) => {
+                added.push(login);
+                offered.extend(
+                    recorded(provider)
+                        .and_then(readiness::LoginReadiness::installation)
+                        .map(|installation| OfferedLogin {
+                            variable,
+                            provider,
+                            agent_login_id: installation.agent_login_id.clone(),
+                            generation: installation.generation,
+                        }),
+                );
+            }
+            None if recorded(provider).is_some_and(|login| login.selected)
+                && !foreign_login(&service) =>
+            {
+                withheld.push(variable);
+            }
+            None => {}
+        }
     }
-    EnvironmentSnapshot::new(
-        process
-            .variables()
-            .iter()
-            .map(|(name, value)| (name.clone(), value.clone()))
-            .chain(offered.into_iter().flatten()),
-    )
+    let environment = if added.is_empty() {
+        process.clone()
+    } else {
+        EnvironmentSnapshot::new(
+            process
+                .variables()
+                .iter()
+                .map(|(name, value)| (name.clone(), value.clone()))
+                .chain(added),
+        )
+    };
+    Offer {
+        environment,
+        withheld,
+        offered,
+    }
+}
+
+/// The readiness document beside `directory`; none when there is none or it
+/// cannot be read, since the pass that read it has recorded that failure.
+fn recorded_readiness(directory: &LoginDirectory) -> Option<readiness::ReadinessDocument> {
+    // The directory and the document are both beside the runner state.
+    readiness::ReadinessDocument::load(&readiness::readiness_path(directory.path()))
+        .ok()
+        .flatten()
 }
 
 /// The agent-login side of the control protocol's provider: which of them

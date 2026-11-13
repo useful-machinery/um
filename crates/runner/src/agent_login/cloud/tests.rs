@@ -31,6 +31,7 @@ fn status_request() -> StatusRequest {
                 generation: 2,
             }),
             state: Some(AgentLoginState::Ready),
+            last_use: None,
         }],
     }
 }
@@ -175,6 +176,7 @@ fn status_names_claude_code_with_the_record_schema_versions_this_build_installs(
         provider: AgentLoginProvider::ClaudeCode,
         installed: None,
         state: Some(AgentLoginState::ForeignLogin),
+        last_use: None,
     });
 
     assert_eq!(client(&endpoint).status(&report), Ok(Vec::new()));
@@ -189,6 +191,77 @@ fn status_names_claude_code_with_the_record_schema_versions_this_build_installs(
             "state": "foreign_login",
         })
     );
+}
+
+// REQ-AGENTLOGIN-15, REQ-AGENTLOGIN-42
+#[test]
+fn status_states_the_last_use_only_of_a_ready_install() {
+    let installed = || {
+        Some(InstalledLogin {
+            agent_login_id: AGENT_LOGIN.to_owned(),
+            generation: 2,
+        })
+    };
+    for (installed, state, last_use, stated) in [
+        (
+            installed(),
+            Some(AgentLoginState::Ready),
+            Some(UseOutcome::Refused),
+            Some("refused"),
+        ),
+        (
+            installed(),
+            Some(AgentLoginState::Ready),
+            Some(UseOutcome::Accepted),
+            Some("accepted"),
+        ),
+        (installed(), Some(AgentLoginState::Ready), None, None),
+        (
+            installed(),
+            Some(AgentLoginState::StaleGeneration),
+            Some(UseOutcome::Refused),
+            None,
+        ),
+        (installed(), None, Some(UseOutcome::Refused), None),
+        (
+            None,
+            Some(AgentLoginState::Ready),
+            Some(UseOutcome::Refused),
+            None,
+        ),
+    ] {
+        let (endpoint, request, server) = test_server::respond_once(
+            "200 OK",
+            &test_server::broker_headers("", "{}"),
+            r#"{"schemaVersion":1,"logins":[]}"#,
+        );
+        let report = StatusRequest {
+            os: OperatingSystem::Linux,
+            providers: vec![ProviderReport::new(
+                AgentLoginProvider::Codex,
+                installed.clone(),
+                state,
+                last_use,
+            )],
+        };
+
+        assert_eq!(client(&endpoint).status(&report), Ok(Vec::new()));
+        let request = request.recv().unwrap();
+        server.join().unwrap();
+        let body = serde_json::from_str::<serde_json::Value>(&request.body).unwrap();
+        let entry = &body["providers"][0];
+        assert_eq!(
+            entry.get("lastUse").and_then(serde_json::Value::as_str),
+            stated,
+            "{entry}"
+        );
+        assert_eq!(entry.get("state").is_some(), state.is_some(), "{entry}");
+        assert_eq!(
+            entry.get("installed").is_some(),
+            installed.is_some(),
+            "{entry}"
+        );
+    }
 }
 
 // REQ-AGENTLOGIN-15

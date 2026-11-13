@@ -1,0 +1,8 @@
+{
+  "schemaVersion": 1,
+  "updatedAt": "2026-11-12T01:00:00Z",
+  "providers": [
+    { "provider": "codex", "state": "ready", "selected": true },
+    { "provider": "github", "state": "not_delivered", "selected": false }
+  ]
+}

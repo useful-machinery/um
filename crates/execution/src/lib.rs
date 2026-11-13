@@ -35,8 +35,9 @@ pub use pi::{
 pub use workflow::MAXIMUM_RETAINED_BYTES_PER_STREAM;
 pub use workflow::admission::admit_workflow;
 pub use workflow::admission::{
-    AdmissionFailure, AdmissionFailureKind, AdmittedWorkflow, CancellationPolicy,
-    CancellationReason, CancellationSource, EnvironmentSnapshot, ExecutionContext,
+    AdmissionFailure, AdmissionFailureKind, AdmittedWorkflow, CLAUDE_CODE_LOGIN_VARIABLE,
+    CODEX_LOGIN_VARIABLE, CancellationPolicy, CancellationReason, CancellationSource,
+    EnvironmentSnapshot, ExecutionContext, HarnessLoginObserver, HarnessLoginOutcome,
     OrdinaryCancellationRequestResult, ResolvedAttachment, ResolvedFile, ResolvedInput,
     ResolvedInputs, ResolvedJsonInput, SourceRevisionProvenance, WorkflowCapacityBudget,
     admit_local_continuation_workflow, admit_local_workflow, admit_runner_workflow,

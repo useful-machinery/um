@@ -3785,6 +3785,7 @@ fn agent_failure_cause(failure: &AgentFailure) -> FailureCauseV1 {
 fn agent_failure_code(failure: &AgentFailureCause) -> FailureCodeV1 {
     match failure {
         AgentFailureCause::HarnessStartFailed { .. }
+        | AgentFailureCause::AgentLoginUnavailable
         | AgentFailureCause::HarnessSetupFailed { .. }
         | AgentFailureCause::HarnessSetupRejected { .. } => FailureCodeV1::HarnessStartFailed,
         AgentFailureCause::HarnessInputTooLarge { .. } => FailureCodeV1::HarnessInputTooLarge,

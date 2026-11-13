@@ -240,7 +240,7 @@ async fn a_service_with_its_own_claude_code_login_gets_no_token_and_asks_for_non
             "token in the service environment",
             environment(&[
                 ("HOME", token_home.path().as_os_str()),
-                (TOKEN_VARIABLE, OsStr::new("service-token")),
+                (CLAUDE_CODE_LOGIN_VARIABLE, OsStr::new("service-token")),
             ]),
         ),
         (
@@ -332,28 +332,32 @@ fn the_token_is_offered_only_where_the_process_environment_has_no_claude_code_lo
     ]);
     let offered = |process: &EnvironmentSnapshot| {
         offer(process, Some(&directory))
-            .variable(OsStr::new(TOKEN_VARIABLE))
+            .environment
+            .variable(OsStr::new(CLAUDE_CODE_LOGIN_VARIABLE))
             .map(OsStr::to_os_string)
     };
 
     assert_eq!(offered(&process), None);
-    assert_eq!(offer(&process, Some(&directory)), process);
+    assert_eq!(offer(&process, Some(&directory)).environment, process);
     install_claude_code(&directory, None, &delivery(1), now()).unwrap();
-    assert_eq!(offer(&process, None), process);
+    assert_eq!(offer(&process, None).environment, process);
     assert_eq!(offered(&process), Some(OsString::from(token(1))));
-    let overlaid = offer(&process, Some(&directory));
+    let overlaid = offer(&process, Some(&directory)).environment;
     assert_eq!(
         overlaid.variable(OsStr::new("PATH")),
         Some(OsStr::new("/usr/bin:/bin"))
     );
     assert_eq!(overlaid.variables().len(), 3);
-    assert_eq!(process.variable(OsStr::new(TOKEN_VARIABLE)), None);
+    assert_eq!(
+        process.variable(OsStr::new(CLAUDE_CODE_LOGIN_VARIABLE)),
+        None
+    );
 
     let carrying = EnvironmentSnapshot::new([
         ("HOME", home.path().as_os_str()),
-        (TOKEN_VARIABLE, OsStr::new("service-token")),
+        (CLAUDE_CODE_LOGIN_VARIABLE, OsStr::new("service-token")),
     ]);
-    assert_eq!(offer(&carrying, Some(&directory)), carrying);
+    assert_eq!(offer(&carrying, Some(&directory)).environment, carrying);
 
     fs::create_dir(home.path().join(".claude")).unwrap();
     fs::write(home.path().join(".claude/.credentials.json"), "{}").unwrap();

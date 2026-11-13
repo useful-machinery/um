@@ -4,6 +4,7 @@
     reason = "the build-profile unit test uses Rust assertions"
 )]
 mod build_profile;
+mod credential_status;
 mod idempotency;
 mod public_id;
 mod timing;
@@ -11,6 +12,7 @@ mod tls;
 mod wire;
 mod workflow_contract;
 
+pub use credential_status::{Availability, CredentialStatus, NextAction};
 pub use idempotency::generate_idempotency_key;
 pub use public_id::{
     valid_lowercase_hyphenated, valid_organization_ref, valid_typed_id, valid_url_safe_name,

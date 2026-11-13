@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsStr;
 use std::fmt;
 use std::fs::File;
 use std::io::{self, Write};
@@ -14,7 +15,7 @@ use rustix::io::Errno;
 
 use super::admission::{
     AdmittedExecutionContext, AdmittedHarness, AdmittedWorkflow, CancellationReason,
-    CancellationSource, ResolvedInput,
+    CancellationSource, EnvironmentSnapshot, ResolvedInput,
 };
 use super::agent::{
     AdmittedAgentAdapter, AgentCompatibilityProfile, AgentInvocation, AgentInvocationIdentity,
@@ -208,11 +209,19 @@ impl Drop for AgentInputStagingLease {
 pub(crate) struct MaterializedAgentInvocation {
     invocation: AgentInvocation,
     staging: AgentInputStagingLease,
+    login_variable: Option<&'static str>,
 }
 
 impl MaterializedAgentInvocation {
     pub(crate) fn invocation(&self) -> &AgentInvocation {
         &self.invocation
+    }
+
+    /// The login variable of the invocation's harness when the environment the invocation
+    /// starts from carries it: the one the step runtime reports the outcome for
+    /// (INV-ENGINE-36). Only the name is compared; no value is read.
+    pub(crate) fn login_variable(&self) -> Option<&'static str> {
+        self.login_variable
     }
 
     #[cfg(test)]
@@ -626,6 +635,7 @@ where
         admitted_step,
     )?;
     let environment = admitted.node_environment(identity.step());
+    let login_variable = carried_login_variable(admitted_step, &environment);
     let invocation = admitted_agent_invocation(
         admitted_step,
         None,
@@ -645,7 +655,18 @@ where
     Ok(MaterializedAgentInvocation {
         invocation,
         staging: view,
+        login_variable,
     })
+}
+
+/// `harness`'s login variable when `environment` carries it (INV-ENGINE-36).
+fn carried_login_variable(
+    harness: &AdmittedHarness,
+    environment: &EnvironmentSnapshot,
+) -> Option<&'static str> {
+    harness
+        .login_variable()
+        .filter(|variable| environment.variable(OsStr::new(variable)).is_some())
 }
 
 #[expect(
@@ -727,6 +748,7 @@ where
             RECOVERY_CONTEXT_VARIABLE.into(),
             context_path.as_os_str().to_owned(),
         );
+    let login_variable = carried_login_variable(harness, &environment);
     let prompt = AgentPrompt::new(
         Arc::from(RECOVERY_AGENT_INSTRUCTIONS),
         Arc::from(trusted_prompt),
@@ -758,6 +780,7 @@ where
     Ok(MaterializedAgentInvocation {
         invocation,
         staging: view,
+        login_variable,
     })
 }
 

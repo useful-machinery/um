@@ -12,7 +12,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::{Mutex as AsyncMutex, mpsc, oneshot};
 
-use super::admission::{CancellationReason, CancellationSource, EnvironmentSnapshot};
+use super::admission::{
+    CancellationReason, CancellationSource, EnvironmentSnapshot, HarnessLoginOutcome,
+};
 use super::agent_diagnostics::AgentDiagnosticSession;
 use super::agent_stream_excerpt::RejectedStreamExcerpt;
 use super::cancellation::CancellationFlag;
@@ -1047,12 +1049,19 @@ pub(crate) enum AgentHarnessSetupStage {
     StartAcknowledgement,
 }
 
+/// The `launchFailure` slug of an agent launch refused because the admission withheld its
+/// harness's login (REQ-DIAG-41).
+pub(crate) const AGENT_LOGIN_UNAVAILABLE: &str = "agent_login_unavailable";
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum AgentFailureCause {
     HarnessStartFailed {
         stage: &'static str,
         error: String,
     },
+    /// The admission withheld the login the step's harness would have received; no harness
+    /// process was started (INV-ENGINE-35, REQ-DIAG-41).
+    AgentLoginUnavailable,
     HarnessSetupFailed {
         stage: AgentHarnessSetupStage,
     },
@@ -1255,6 +1264,27 @@ pub enum AgentOutcome {
     Completed(CompletedAgentInvocation),
     Failed(AgentFailure),
     Cancelled { reason: CancellationReason },
+}
+
+impl AgentOutcome {
+    /// What this outcome says of the login the invocation's harness received: accepted when
+    /// the invocation succeeded, refused when it failed with the harness error class
+    /// `unauthorized` (REQ-AGENT-45), and nothing for any other failure or a cancellation
+    /// (INV-ENGINE-36).
+    pub(crate) fn harness_login_outcome(&self) -> Option<HarnessLoginOutcome> {
+        match self {
+            Self::Completed(_) => Some(HarnessLoginOutcome::Accepted),
+            Self::Failed(failure) => match failure.cause() {
+                AgentFailureCause::HarnessFailed { detail } => detail
+                    .diagnostic()
+                    .and_then(|diagnostic| diagnostic.harness_error)
+                    .filter(|class| *class == "unauthorized")
+                    .map(|_| HarnessLoginOutcome::Refused),
+                _ => None,
+            },
+            Self::Cancelled { .. } => None,
+        }
+    }
 }
 
 impl From<ResultValidationFatal> for AgentFailureCause {

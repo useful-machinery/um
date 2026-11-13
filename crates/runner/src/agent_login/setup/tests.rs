@@ -281,7 +281,7 @@ async fn a_codex_login_the_runner_holds_is_removed_once_the_service_sets_codex_h
     let codex = document.login(AgentLoginProvider::Codex).unwrap();
     assert_eq!(codex.state, AgentLoginState::ForeignLogin);
     assert_eq!(codex.installation(), None);
-    assert!(!fixture.auth_path().exists());
+    assert!(!fixture.directory().codex_home().exists());
     assert_eq!(fixture.cloud.deliveries(), 1);
     assert_eq!(fixture.service_entries(), 0);
 }
@@ -470,6 +470,8 @@ fn earlier(provider: AgentLoginProvider, state: AgentLoginState, named: bool) ->
         state,
         checked_at: Some(now() - time::Duration::minutes(5)),
         login: named.then(|| RecordedLogin::Named(FAKE_AGENT_LOGIN_ID.to_owned())),
+        selected: readiness::selected_by_state(state),
+        last_use: None,
     }
 }
 
@@ -552,6 +554,63 @@ async fn a_failed_status_request_marks_a_provider_cloud_authorized_cloud_unavail
             document.login(AgentLoginProvider::ClaudeCode),
             Some(&not_authorized)
         );
+    }
+}
+
+// REQ-AGENTLOGIN-28
+#[tokio::test]
+async fn a_pass_records_whether_cloud_names_an_authorization_in_force() {
+    for (answer, selected) in [
+        (
+            codex_answer(authorized(AgentLoginProvider::Codex, 1).status),
+            true,
+        ),
+        (codex_answer(LoginStatus::Unauthorized), true),
+        (codex_answer(LoginStatus::UnsupportedTarget), true),
+        (codex_answer(LoginStatus::Revoked), false),
+        (Ok(Vec::new()), false),
+    ] {
+        let fixture = Fixture::new(answer.clone());
+        let document = fixture.pass().await;
+        let codex = document.login(AgentLoginProvider::Codex).unwrap();
+        assert_eq!(codex.selected, selected, "{answer:?}");
+        assert_eq!(fixture.recorded(), Some(document), "{answer:?}");
+    }
+
+    // A delivery refused as `revoked` ends the authorization Cloud named;
+    // one refused as `unauthorized` does not.
+    for (refusal, selected) in [
+        (DeliveryRefusal::Revoked, false),
+        (DeliveryRefusal::Unauthorized, true),
+    ] {
+        let fixture = Fixture::new(codex_answer(
+            authorized(AgentLoginProvider::Codex, 1).status,
+        ));
+        let cloud = fixture.observing(Vec::new(), Some(DeliveryFailure::Refused(refusal)));
+        let document = fixture.pass_asking(cloud).await;
+        let codex = document.login(AgentLoginProvider::Codex).unwrap();
+        assert_eq!(codex.selected, selected, "{refusal:?}");
+    }
+}
+
+// REQ-AGENTLOGIN-28
+#[tokio::test]
+async fn a_pass_that_cloud_does_not_answer_keeps_whether_the_provider_is_selected() {
+    for state in [
+        AgentLoginState::NotAuthorized,
+        AgentLoginState::InstallFailed,
+    ] {
+        for selected in [true, false] {
+            let fixture = Fixture::new(Err(CloudFailure::Transport));
+            fixture.record(vec![LoginReadiness {
+                selected,
+                ..earlier(AgentLoginProvider::Codex, state, true)
+            }]);
+            let document = fixture.pass().await;
+            let codex = document.login(AgentLoginProvider::Codex).unwrap();
+            assert_eq!(codex.selected, selected, "{state:?}");
+            assert_eq!(fixture.recorded(), Some(document), "{state:?}");
+        }
     }
 }
 
@@ -1099,6 +1158,7 @@ fn assert_reported(
                 provider,
                 installed: installed.clone(),
                 state,
+                last_use: None,
             })
             .collect::<Vec<_>>()
     );
@@ -1238,4 +1298,650 @@ async fn a_file_where_the_runners_directory_belongs_holds_no_login_to_end() {
             fixture.setup_records()
         );
     }
+}
+
+/// What `report` says of the runner's Codex login.
+fn codex_report(report: &StatusRequest) -> &ProviderReport {
+    report
+        .providers
+        .iter()
+        .find(|provider| provider.provider == AgentLoginProvider::Codex)
+        .expect("the Codex report")
+}
+
+// REQ-AGENTLOGIN-40, REQ-AGENTLOGIN-17
+#[tokio::test]
+async fn a_login_the_closing_answer_no_longer_authorizes_is_removed_before_the_pass_ends() {
+    let codex = |status| ProviderLogin {
+        status,
+        ..authorized(AgentLoginProvider::Codex, 3)
+    };
+    for (closing, state, named) in [
+        (
+            Ok(vec![codex(LoginStatus::Revoked)]),
+            AgentLoginState::Revoked,
+            Some(FAKE_AGENT_LOGIN_ID),
+        ),
+        (Ok(Vec::new()), AgentLoginState::NotAuthorized, None),
+        (
+            Ok(vec![codex(LoginStatus::Unauthorized)]),
+            AgentLoginState::NotAuthorized,
+            Some(FAKE_AGENT_LOGIN_ID),
+        ),
+        (
+            Ok(vec![ProviderLogin {
+                agent_login_id: OTHER_AGENT_LOGIN_ID.to_owned(),
+                ..authorized(AgentLoginProvider::Codex, 3)
+            }]),
+            AgentLoginState::NotAuthorized,
+            Some(OTHER_AGENT_LOGIN_ID),
+        ),
+    ] {
+        // Cloud authorizes generation 3 when the pass asks, and has ended
+        // the authorization by the time the pass reports installing it.
+        let fixture = Fixture::new(Ok(Vec::new()));
+        fixture
+            .cloud
+            .answer_next_then(fake_codex_authorized(3), closing.clone());
+        let cloud = Arc::new(fixture.reporting(None));
+
+        let document = fixture.pass_asking(Arc::clone(&cloud)).await;
+
+        assert!(!fixture.auth_path().exists(), "{closing:?}");
+        let login = document.login(AgentLoginProvider::Codex).unwrap();
+        assert_eq!(login.state, state, "{closing:?}");
+        assert_eq!(login.installation(), None, "{closing:?}");
+        assert_eq!(agent_login_id(login), named, "{closing:?}");
+        assert_eq!(fixture.recorded().as_ref(), Some(&document));
+        // The closing answer asked for no delivery, and the removal was
+        // reported in a third request whose answer is not acted on.
+        assert_eq!(fixture.cloud.deliveries(), 1, "{closing:?}");
+        let reports = cloud.reports();
+        assert_eq!(reports.len(), 3, "{reports:?}");
+        assert_eq!(
+            codex_report(&reports[1]).installed,
+            Some(InstalledLogin {
+                agent_login_id: FAKE_AGENT_LOGIN_ID.to_owned(),
+                generation: 3,
+            })
+        );
+        assert_eq!(
+            *codex_report(&reports[2]),
+            ProviderReport {
+                provider: AgentLoginProvider::Codex,
+                installed: None,
+                state: Some(state),
+                last_use: None,
+            },
+            "{closing:?}"
+        );
+        assert_eq!(
+            fixture.only_record()["um.agent_login.codex.state"],
+            state.as_str()
+        );
+    }
+}
+
+// REQ-AGENTLOGIN-40, REQ-AGENTLOGIN-17
+#[tokio::test]
+async fn a_closing_answer_that_still_authorizes_the_login_leaves_it_installed() {
+    // A newer generation waits for the next pass; the same generation
+    // changes nothing, so the pass reports nothing more.
+    for closing in [3, 4] {
+        let fixture = Fixture::new(Ok(Vec::new()));
+        fixture
+            .cloud
+            .answer_next_then(fake_codex_authorized(3), fake_codex_authorized(closing));
+        let cloud = Arc::new(fixture.reporting(None));
+
+        let document = fixture.pass_asking(Arc::clone(&cloud)).await;
+
+        assert_eq!(
+            fs::read(fixture.auth_path()).unwrap(),
+            fake_agent_login_material(3)
+        );
+        assert_eq!(
+            state_of(&document, AgentLoginProvider::Codex),
+            AgentLoginState::Ready
+        );
+        let installation = document
+            .login(AgentLoginProvider::Codex)
+            .and_then(LoginReadiness::installation)
+            .expect("the Codex installation");
+        assert_eq!(installation.generation, 3);
+        assert_eq!(fixture.cloud.deliveries(), 1);
+        assert_eq!(cloud.reports().len(), 2, "{closing}");
+    }
+}
+
+// REQ-AGENTLOGIN-40, REQ-AGENTLOGIN-17, INV-RUNNER-15
+#[tokio::test]
+async fn a_closing_answer_never_reached_or_never_asked_for_changes_nothing() {
+    let revoked = Ok(vec![ProviderLogin {
+        status: LoginStatus::Revoked,
+        ..authorized(AgentLoginProvider::Codex, 3)
+    }]);
+    // The closing request fails.
+    let fixture = Fixture::new(Ok(Vec::new()));
+    fixture
+        .cloud
+        .answer_next_then(fake_codex_authorized(3), revoked.clone());
+    let cloud = Arc::new(fixture.reporting(Some(CloudFailure::Transport)));
+    let document = fixture.pass_asking(Arc::clone(&cloud)).await;
+    assert_eq!(cloud.reports().len(), 2);
+    assert_eq!(
+        state_of(&document, AgentLoginProvider::Codex),
+        AgentLoginState::Ready
+    );
+    assert!(fixture.auth_path().is_file());
+    assert_eq!(fixture.recorded().as_ref(), Some(&document));
+
+    // An assignment starts after the Codex install, before the Claude Code
+    // delivery: the pass makes no closing request.
+    let fixture = Fixture::new(Ok(Vec::new()));
+    fixture.cloud.answer_next_then(
+        Ok(vec![
+            authorized(AgentLoginProvider::Codex, 3),
+            authorized(AgentLoginProvider::ClaudeCode, 3),
+        ]),
+        revoked,
+    );
+    fixture.gate.idle_calls.store(3, Ordering::SeqCst);
+    let outcome = fixture.setup.run_pass().await;
+    assert_eq!(outcome, SetupOutcome::Busy(fixture.recorded()));
+    assert_eq!(fixture.cloud.status_requests(), 1);
+    assert!(fixture.auth_path().is_file());
+    assert_eq!(
+        state_of(&fixture.recorded().unwrap(), AgentLoginProvider::Codex),
+        AgentLoginState::Ready
+    );
+}
+
+impl Fixture {
+    fn codex_home(&self) -> PathBuf {
+        self.directory().codex_home()
+    }
+
+    /// Writes into the runner's Codex home, beside `auth.json`, a file and a
+    /// directory holding one, as Codex writes its state and sessions there.
+    fn write_as_codex(&self) {
+        let home = self.codex_home();
+        write_private(&home.join("state_5.sqlite"), b"codex state");
+        fs::create_dir_all(home.join("sessions/2026")).unwrap();
+        write_private(&home.join("sessions/2026/rollout.jsonl"), b"{}");
+    }
+
+    /// The names in the runner's Codex home.
+    fn codex_entries(&self) -> Vec<String> {
+        let mut names = fs::read_dir(self.codex_home())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect::<Vec<_>>();
+        names.sort();
+        names
+    }
+}
+
+/// Cloud's answer naming the fake agent login for Codex with `status`.
+fn codex_answer(status: LoginStatus) -> Result<Vec<ProviderLogin>, CloudFailure> {
+    Ok(vec![ProviderLogin {
+        status,
+        ..authorized(AgentLoginProvider::Codex, 1)
+    }])
+}
+
+// REQ-AGENTLOGIN-30, REQ-AGENTLOGIN-26
+#[tokio::test]
+async fn ending_a_codex_login_removes_everything_in_the_runners_codex_home() {
+    for (answer, state) in [
+        (codex_answer(LoginStatus::Revoked), AgentLoginState::Revoked),
+        (
+            codex_answer(LoginStatus::Unauthorized),
+            AgentLoginState::NotAuthorized,
+        ),
+        (Ok(Vec::new()), AgentLoginState::NotAuthorized),
+    ] {
+        let fixture = Fixture::new(fake_codex_authorized(1));
+        fixture.pass().await;
+        fixture.write_as_codex();
+        fixture.cloud.answer(answer.clone());
+
+        let document = fixture.pass().await;
+
+        assert!(!fixture.codex_home().exists(), "{answer:?}");
+        assert!(fixture.directory().path().is_dir(), "{answer:?}");
+        let login = document.login(AgentLoginProvider::Codex).unwrap();
+        assert_eq!(login.state, state, "{answer:?}");
+        assert_eq!(login.installation(), None, "{answer:?}");
+    }
+
+    // Another agent login: the earlier one's home is gone before the other
+    // is asked for, and the other is installed into a fresh home.
+    let fixture = Fixture::new(fake_codex_authorized(1));
+    fixture.pass().await;
+    fixture.write_as_codex();
+    fixture.cloud.answer(Ok(vec![ProviderLogin {
+        agent_login_id: OTHER_AGENT_LOGIN_ID.to_owned(),
+        ..authorized(AgentLoginProvider::Codex, 1)
+    }]));
+    let cloud = fixture.observing(
+        vec![(AgentLoginProvider::Codex, fixture.codex_home())],
+        None,
+    );
+
+    let document = fixture.pass_asking(Arc::clone(&cloud)).await;
+
+    assert_eq!(
+        *cloud.seen.lock().unwrap(),
+        [AtDelivery {
+            provider: AgentLoginProvider::Codex,
+            held: false,
+            installed: None,
+        }]
+    );
+    assert_eq!(fixture.codex_entries(), ["auth.json", "config.toml"]);
+    let installation = document
+        .login(AgentLoginProvider::Codex)
+        .and_then(LoginReadiness::installation)
+        .expect("the other login's installation");
+    assert_eq!(installation.agent_login_id, OTHER_AGENT_LOGIN_ID);
+}
+
+// REQ-AGENTLOGIN-30, REQ-AGENTLOGIN-26
+#[tokio::test]
+async fn a_newer_generation_replaces_auth_json_alone() {
+    let fixture = Fixture::new(fake_codex_authorized(1));
+    fixture.pass().await;
+    fixture.write_as_codex();
+    fixture.cloud.answer(fake_codex_authorized(2));
+
+    let document = fixture.pass().await;
+
+    assert_eq!(
+        state_of(&document, AgentLoginProvider::Codex),
+        AgentLoginState::Ready
+    );
+    assert_eq!(
+        fs::read(fixture.auth_path()).unwrap(),
+        fake_agent_login_material(2)
+    );
+    assert_eq!(
+        fixture.codex_entries(),
+        ["auth.json", "config.toml", "sessions", "state_5.sqlite"]
+    );
+    assert!(
+        fixture
+            .codex_home()
+            .join("sessions/2026/rollout.jsonl")
+            .is_file()
+    );
+}
+
+// REQ-AGENTLOGIN-30, REQ-AGENTLOGIN-35
+#[tokio::test]
+async fn ending_a_claude_code_login_removes_its_token_file_alone() {
+    let fixture = Fixture::new(Ok(vec![
+        authorized(AgentLoginProvider::Codex, 1),
+        authorized(AgentLoginProvider::ClaudeCode, 1),
+    ]));
+    fixture.pass().await;
+    fixture.write_as_codex();
+    fixture.cloud.answer(Ok(vec![
+        authorized(AgentLoginProvider::Codex, 1),
+        ProviderLogin {
+            status: LoginStatus::Revoked,
+            ..authorized(AgentLoginProvider::ClaudeCode, 1)
+        },
+    ]));
+
+    let document = fixture.pass().await;
+
+    assert_eq!(
+        state_of(&document, AgentLoginProvider::ClaudeCode),
+        AgentLoginState::Revoked
+    );
+    assert!(!fixture.token_path().exists());
+    assert_eq!(
+        fixture.codex_entries(),
+        ["auth.json", "config.toml", "sessions", "state_5.sqlite"]
+    );
+    assert_eq!(
+        fs::read(fixture.auth_path()).unwrap(),
+        fake_agent_login_material(1)
+    );
+}
+
+// REQ-AGENTLOGIN-30, REQ-AGENTLOGIN-26
+#[tokio::test]
+async fn a_link_in_the_codex_home_is_removed_without_touching_its_target() {
+    let fixture = Fixture::new(fake_codex_authorized(1));
+    fixture.pass().await;
+    fixture.write_as_codex();
+    // A directory and a file outside the runner's directory, linked from
+    // the home and from a directory in it.
+    let outside = fixture.root.path().join("outside");
+    fs::create_dir(&outside).unwrap();
+    write_private(&outside.join("kept.json"), b"{\"kept\":true}");
+    std::os::unix::fs::symlink(&outside, fixture.codex_home().join("linked")).unwrap();
+    std::os::unix::fs::symlink(
+        outside.join("kept.json"),
+        fixture.codex_home().join("sessions/2026/linked.json"),
+    )
+    .unwrap();
+    fixture.cloud.answer(codex_answer(LoginStatus::Revoked));
+
+    let document = fixture.pass().await;
+
+    assert_eq!(
+        state_of(&document, AgentLoginProvider::Codex),
+        AgentLoginState::Revoked
+    );
+    assert!(!fixture.codex_home().exists());
+    assert_eq!(
+        fs::read(outside.join("kept.json")).unwrap(),
+        b"{\"kept\":true}"
+    );
+}
+
+// REQ-AGENTLOGIN-30, REQ-TELEMETRY-45
+#[tokio::test]
+async fn a_codex_home_removal_that_fails_is_finished_by_the_next_pass() {
+    let fixture = Fixture::new(fake_codex_authorized(1));
+    fixture.pass().await;
+    fixture.write_as_codex();
+    fixture.cloud.answer(codex_answer(LoginStatus::Revoked));
+    // A directory in the home whose entries cannot be removed.
+    let sessions = fixture.codex_home().join("sessions");
+    set_mode(&sessions, 0o500);
+
+    let document = fixture.pass().await;
+    set_mode(&sessions, 0o700);
+
+    assert_eq!(
+        state_of(&document, AgentLoginProvider::Codex),
+        AgentLoginState::InstallFailed
+    );
+    // The login itself is gone whatever else the removal could not take, so
+    // no later assignment is offered the revoked login (REQ-AGENTLOGIN-39).
+    assert!(!fixture.codex_home().join("auth.json").exists());
+    let records = fixture.setup_records();
+    let record = records.last().expect("the failed removal's record");
+    assert_eq!(record["um.agent_login.codex.failure_stage"], "remove");
+    assert_eq!(
+        record["um.agent_login.codex.failure_cause"],
+        "permission_denied"
+    );
+    assert!(fixture.codex_home().exists());
+
+    let document = fixture.pass().await;
+
+    assert_eq!(
+        state_of(&document, AgentLoginProvider::Codex),
+        AgentLoginState::Revoked
+    );
+    assert!(!fixture.codex_home().exists());
+}
+
+// REQ-AGENTLOGIN-39, REQ-AGENTLOGIN-40, INV-RUNNER-15
+#[tokio::test]
+async fn an_admissions_pass_installs_and_ends_without_consulting_the_assignment_gate() {
+    let fixture = Fixture::new(fake_codex_authorized(1));
+    fixture.pass().await;
+    // The assignment being admitted holds the slot, so the periodic gate
+    // refuses; the admission's own pass installs generation 2, and ends it
+    // when its closing answer has revoked the login.
+    fixture.gate.idle_calls.store(0, Ordering::SeqCst);
+    fixture
+        .cloud
+        .answer_next_then(fake_codex_authorized(2), codex_answer(LoginStatus::Revoked));
+    assert_eq!(fixture.setup.run_pass().await, SetupOutcome::Busy(None));
+
+    let Some(SetupOutcome::Recorded(document)) = fixture.setup.run_admission_pass() else {
+        panic!("the admission's pass did not record readiness");
+    };
+
+    assert_eq!(fixture.cloud.deliveries(), 2);
+    assert_eq!(
+        state_of(&document, AgentLoginProvider::Codex),
+        AgentLoginState::Revoked
+    );
+    assert!(!fixture.codex_home().exists());
+    assert_eq!(fixture.recorded().as_ref(), Some(&document));
+}
+
+// REQ-AGENTLOGIN-39
+#[tokio::test]
+async fn an_admissions_pass_waits_for_a_pass_in_flight_and_then_makes_its_own() {
+    let fixture = Fixture::new(fake_codex_authorized(1));
+    fixture.pass().await;
+    let before = fixture.cloud.status_requests();
+    fixture.cloud.answer(fake_codex_authorized(2));
+    let (held, arrival) = fixture.cloud.hold_next_status_arrival();
+    let periodic = tokio::spawn({
+        let setup = Arc::clone(&fixture.setup);
+        async move { setup.run_pass().await }
+    });
+    // The periodic pass waits on its status request.
+    tokio::task::spawn_blocking(move || arrival.recv())
+        .await
+        .unwrap()
+        .expect("the periodic pass asked Cloud");
+    let admission = tokio::task::spawn_blocking({
+        let setup = Arc::clone(&fixture.setup);
+        move || setup.run_admission_pass()
+    });
+    drop(held);
+
+    let periodic = periodic.await.unwrap();
+    let admission = admission.await.unwrap();
+
+    // The periodic pass installed generation 2 and reported it; the
+    // admission's, made after it, found it installed and asked once.
+    assert!(
+        matches!(periodic, SetupOutcome::Recorded(_)),
+        "{periodic:?}"
+    );
+    let Some(SetupOutcome::Recorded(document)) = admission else {
+        panic!("the admission's pass did not record readiness: {admission:?}");
+    };
+    assert_eq!(fixture.cloud.deliveries(), 2);
+    assert_eq!(fixture.cloud.status_requests(), before + 3);
+    assert_eq!(
+        document
+            .login(AgentLoginProvider::Codex)
+            .and_then(LoginReadiness::installation)
+            .map(|installation| installation.generation),
+        Some(2)
+    );
+}
+
+/// What an admission offered of the fake agent login for `provider` at
+/// `generation`, under the variable its coding agent reads.
+fn offered(provider: AgentLoginProvider, generation: u64) -> Vec<OfferedLogin> {
+    vec![OfferedLogin {
+        variable: match provider {
+            AgentLoginProvider::ClaudeCode => um_execution::CLAUDE_CODE_LOGIN_VARIABLE,
+            _ => um_execution::CODEX_LOGIN_VARIABLE,
+        },
+        provider,
+        agent_login_id: FAKE_AGENT_LOGIN_ID.to_owned(),
+        generation,
+    }]
+}
+
+impl Fixture {
+    /// Notes a use with `outcome` of the fake Codex login at `generation`,
+    /// as the engine tells an admission's observer.
+    fn note_codex_use(&self, generation: u64, outcome: HarnessLoginOutcome) {
+        self.setup
+            .observer(offered(AgentLoginProvider::Codex, generation))
+            .expect("an observer of what was offered")
+            .observe(um_execution::CODEX_LOGIN_VARIABLE, outcome);
+    }
+
+    /// The Codex last use each status request since the `since`th stated.
+    fn stated_codex_uses(&self, since: usize) -> Vec<Option<UseOutcome>> {
+        self.cloud.reports()[since..]
+            .iter()
+            .map(|report| codex_report(report).last_use)
+            .collect()
+    }
+}
+
+fn codex_last_use(document: &ReadinessDocument) -> Option<LastUse> {
+    document
+        .login(AgentLoginProvider::Codex)
+        .and_then(|login| login.last_use)
+}
+
+fn used(outcome: UseOutcome) -> Option<LastUse> {
+    Some(LastUse { outcome, at: now() })
+}
+
+// REQ-AGENTLOGIN-42, REQ-AGENTLOGIN-15, REQ-AGENTLOGIN-17, REQ-TELEMETRY-45
+#[tokio::test]
+async fn a_noted_use_is_recorded_beside_its_install_and_stated_to_cloud() {
+    let fixture = Fixture::new(fake_codex_authorized(2));
+    fixture.pass().await;
+    let records = fixture.setup_records().len();
+    fixture.note_codex_use(2, HarnessLoginOutcome::Refused);
+    let asked = fixture.cloud.reports().len();
+
+    let document = fixture.pass().await;
+
+    // A refused login stays installed, offered and `ready`.
+    let codex = document.login(AgentLoginProvider::Codex).unwrap();
+    assert_eq!(codex.state, AgentLoginState::Ready);
+    assert_eq!(codex.last_use, used(UseOutcome::Refused));
+    assert!(fixture.auth_path().exists());
+    assert_eq!(fixture.recorded().as_ref(), Some(&document));
+    // The opening request carried what was recorded; the changed last use
+    // alone made the pass report again.
+    assert_eq!(
+        fixture.stated_codex_uses(asked),
+        [None, Some(UseOutcome::Refused)]
+    );
+    assert_eq!(fixture.cloud.deliveries(), 1);
+    // A changed last use writes no record.
+    assert_eq!(fixture.setup_records().len(), records);
+
+    // A pass with nothing new noted keeps it, and asks once.
+    let asked = fixture.cloud.reports().len();
+    assert_eq!(
+        codex_last_use(&fixture.pass().await),
+        used(UseOutcome::Refused)
+    );
+    assert_eq!(
+        fixture.stated_codex_uses(asked),
+        [Some(UseOutcome::Refused)]
+    );
+
+    // An accepted use noted afterwards replaces it.
+    fixture.note_codex_use(2, HarnessLoginOutcome::Accepted);
+    let asked = fixture.cloud.reports().len();
+    assert_eq!(
+        codex_last_use(&fixture.pass().await),
+        used(UseOutcome::Accepted)
+    );
+    assert_eq!(
+        fixture.stated_codex_uses(asked),
+        [Some(UseOutcome::Refused), Some(UseOutcome::Accepted)]
+    );
+}
+
+// REQ-AGENTLOGIN-42
+#[tokio::test]
+async fn a_use_of_an_earlier_generation_is_dropped_and_an_ending_clears_the_last_use() {
+    let fixture = Fixture::new(fake_codex_authorized(2));
+    fixture.pass().await;
+    fixture.note_codex_use(2, HarnessLoginOutcome::Accepted);
+    assert_eq!(
+        codex_last_use(&fixture.pass().await),
+        used(UseOutcome::Accepted)
+    );
+
+    // Generation 3 is installed: what was recorded of generation 2, and a
+    // use noted for it, are forgotten.
+    fixture.note_codex_use(2, HarnessLoginOutcome::Refused);
+    fixture.cloud.answer(fake_codex_authorized(3));
+    let asked = fixture.cloud.reports().len();
+    let document = fixture.pass().await;
+    let codex = document.login(AgentLoginProvider::Codex).unwrap();
+    assert_eq!(codex.installation().map(|login| login.generation), Some(3));
+    assert_eq!(codex.last_use, None);
+    assert_eq!(
+        fixture.stated_codex_uses(asked),
+        [Some(UseOutcome::Accepted), None]
+    );
+    assert_eq!(codex_last_use(&fixture.pass().await), None);
+
+    // Ending the login clears it.
+    fixture.note_codex_use(3, HarnessLoginOutcome::Refused);
+    assert_eq!(
+        codex_last_use(&fixture.pass().await),
+        used(UseOutcome::Refused)
+    );
+    fixture.cloud.answer(codex_answer(LoginStatus::Revoked));
+    let asked = fixture.cloud.reports().len();
+    let document = fixture.pass().await;
+    assert_eq!(
+        state_of(&document, AgentLoginProvider::Codex),
+        AgentLoginState::Revoked
+    );
+    assert_eq!(codex_last_use(&document), None);
+    assert_eq!(
+        fixture.stated_codex_uses(asked),
+        [Some(UseOutcome::Refused), None]
+    );
+}
+
+// REQ-AGENTLOGIN-42, REQ-AGENTLOGIN-15
+#[tokio::test]
+async fn a_use_is_stated_to_cloud_only_beside_a_ready_install() {
+    let fixture = Fixture::new(fake_codex_authorized(2));
+    fixture.pass().await;
+
+    // Cloud names generation 3 and refuses its delivery as stale: the
+    // install is kept, not `ready`, and its last use is not stated.
+    fixture.note_codex_use(2, HarnessLoginOutcome::Refused);
+    fixture.cloud.answer(fake_codex_authorized(3));
+    fixture
+        .cloud
+        .refuse_deliveries(DeliveryRefusal::StaleGeneration);
+    let asked = fixture.cloud.reports().len();
+    let document = fixture.pass().await;
+    let codex = document.login(AgentLoginProvider::Codex).unwrap();
+    assert_eq!(codex.state, AgentLoginState::StaleGeneration);
+    assert_eq!(codex.installation().map(|login| login.generation), Some(2));
+    assert_eq!(codex.last_use, used(UseOutcome::Refused));
+    assert_eq!(fixture.stated_codex_uses(asked), [None, None]);
+
+    // A use noted for a provider the runner installed nothing of is
+    // neither recorded nor stated.
+    fixture
+        .setup
+        .observer(offered(AgentLoginProvider::ClaudeCode, 1))
+        .unwrap()
+        .observe(
+            um_execution::CLAUDE_CODE_LOGIN_VARIABLE,
+            HarnessLoginOutcome::Refused,
+        );
+    let asked = fixture.cloud.reports().len();
+    let document = fixture.pass().await;
+    assert!(
+        document
+            .logins
+            .iter()
+            .all(|login| login.provider != AgentLoginProvider::ClaudeCode
+                || login.last_use.is_none()),
+        "{document:?}"
+    );
+    assert!(
+        fixture.cloud.reports()[asked..]
+            .iter()
+            .flat_map(|report| &report.providers)
+            .all(|report| report.provider != AgentLoginProvider::ClaudeCode
+                || report.last_use.is_none())
+    );
+    assert!(fixture.setup.observer(Vec::new()).is_none());
 }

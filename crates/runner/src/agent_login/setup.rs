@@ -1,10 +1,14 @@
 //! One agent-login setup pass of the serving runner (REQ-AGENTLOGIN-29,
 //! REQ-AGENTLOGIN-30): ask Cloud which agent logins the runner is authorized
 //! for, install what is new, remove what has ended, and record each
-//! provider's readiness. Nothing is installed or removed while the runner
-//! holds an assignment (INV-RUNNER-15), and a pass that changes a provider's
+//! provider's readiness. Nothing is installed or removed once an assignment
+//! has been offered its logins (INV-RUNNER-15), and a pass that changes a provider's
 //! readiness, or cannot record it, writes one `runner.agent_login_setup`
-//! record (REQ-TELEMETRY-45).
+//! record (REQ-TELEMETRY-45). Each admission makes a pass of its own before
+//! the assignment is offered anything (REQ-AGENTLOGIN-39). How the provider
+//! answered each use of an offered login is noted in memory while the
+//! assignment runs and folded into the readiness by the next pass
+//! (REQ-AGENTLOGIN-42).
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -13,6 +17,7 @@ use std::time::Duration;
 
 use opentelemetry::KeyValue;
 use time::OffsetDateTime;
+use um_execution::{HarnessLoginObserver, HarnessLoginOutcome};
 use url::Url;
 
 use super::claude_code;
@@ -22,9 +27,12 @@ use super::cloud::{
 };
 use super::codex;
 use super::directory::{self, LoginDirectory};
-use super::readiness::{self, Installation, LoginReadiness, ReadinessDocument, RecordedLogin};
+use super::readiness::{
+    self, Installation, LastUse, LoginReadiness, ReadinessDocument, RecordedLogin, UseOutcome,
+};
 use super::{
-    FailureCause, FailureStage, InstallRefusal, OperatingSystem, ServiceEnvironment, StepFailure,
+    FailureCause, FailureStage, InstallRefusal, OfferedLogin, OperatingSystem, ServiceEnvironment,
+    StepFailure,
 };
 use crate::control_protocol::{AgentLoginProvider, AgentLoginState};
 use crate::credential::Credential;
@@ -38,7 +46,9 @@ pub(crate) const SETUP_EVENT: &str = "runner.agent_login_setup";
 /// How long `sync_agent_logins` waits for its pass (REQ-AGENTLOGIN-31). A
 /// pass makes at most a status request, one delivery per installable
 /// provider and a closing status request, each bounded by the request
-/// timeout, and a sync may first wait for one pass already running.
+/// timeout, and a sync may first wait for one pass already running. A pass
+/// whose closing answer ends a login it installed reports once more
+/// (REQ-AGENTLOGIN-40), a request this bound does not count.
 pub(crate) const SYNC_BOUND: Duration = Duration::from_secs(
     runner_http::REQUEST_TIMEOUT.as_secs() * (2 + AgentLoginProvider::INSTALLABLE.len() as u64) * 2,
 );
@@ -71,6 +81,19 @@ pub(crate) trait AssignmentGate: Send + Sync {
     /// from starting until `change` returns; answers false, without running
     /// it, while one is held.
     fn while_idle(&self, change: &mut dyn FnMut()) -> bool;
+}
+
+/// The gate of the pass an admission makes for itself: the assignment it is
+/// admitting holds the runner's one slot and has been offered nothing yet,
+/// so each install and removal runs at once, without consulting the
+/// assignment manager (REQ-AGENTLOGIN-39, INV-RUNNER-15).
+struct Admitting;
+
+impl AssignmentGate for Admitting {
+    fn while_idle(&self, change: &mut dyn FnMut()) -> bool {
+        change();
+        true
+    }
 }
 
 /// What a pass did.
@@ -138,13 +161,19 @@ impl SetupDependencies {
     }
 }
 
+/// The setup's clock, shared with the observers it builds.
+type Clock = Arc<dyn Fn() -> OffsetDateTime + Send + Sync>;
+
 /// Agent-login setup bound to one serving process. Passes never overlap: a
 /// pass asked for while another runs waits for it and then runs.
 pub(crate) struct AgentLoginSetup {
     dependencies: SetupDependencies,
+    /// The gate of the periodic and `sync` passes.
     gate: Arc<dyn AssignmentGate>,
-    clock: Box<dyn Fn() -> OffsetDateTime + Send + Sync>,
+    clock: Clock,
     pass: Mutex<()>,
+    /// The uses noted since a pass last folded them in.
+    uses: Arc<NotedUses>,
 }
 
 impl AgentLoginSetup {
@@ -156,9 +185,29 @@ impl AgentLoginSetup {
         Self {
             dependencies,
             gate,
-            clock: Box::new(clock),
+            clock: Arc::new(clock),
             pass: Mutex::new(()),
+            uses: Arc::default(),
         }
+    }
+
+    /// The observer an admission gives its execution context for the
+    /// logins `offered` added to its environment: each use the engine tells
+    /// it of is noted for the agent login and generation offered under that
+    /// variable, and one for any other variable is ignored
+    /// (REQ-AGENTLOGIN-42). `None` when the admission was offered none. It
+    /// writes nothing: the next pass folds what it noted in.
+    pub(crate) fn observer(
+        &self,
+        offered: Vec<OfferedLogin>,
+    ) -> Option<Arc<dyn HarnessLoginObserver>> {
+        (!offered.is_empty()).then(|| {
+            Arc::new(UseObserver {
+                offered,
+                uses: Arc::clone(&self.uses),
+                clock: Arc::clone(&self.clock),
+            }) as Arc<dyn HarnessLoginObserver>
+        })
     }
 
     /// Makes later passes ask Cloud with the credential the runner now
@@ -201,10 +250,38 @@ impl AgentLoginSetup {
 
     fn run_pass_blocking(&self) -> SetupOutcome {
         let _pass = self.pass.lock().unwrap_or_else(PoisonError::into_inner);
-        if !self
-            .gate
-            .while_idle(&mut || self.remove_leftover_temporary_files())
-        {
+        self.pass_under(self.gate.as_ref())
+    }
+
+    /// Sets agent logins up for an assignment the runner is admitting, on
+    /// the admission's own blocking task and before the assignment is offered
+    /// them (REQ-AGENTLOGIN-39): waits for a pass already running, then makes
+    /// one whose installs and removals run at once, for the assignment holds
+    /// the slot and has been offered nothing. It makes none, and asks Cloud
+    /// nothing, unless the readiness document names an installable provider's
+    /// login as installed, as authorized without being ready, or as selected:
+    /// a selected provider that holds none is withheld from the assignment
+    /// (REQ-AGENTLOGIN-41), so the admission asks whether Cloud authorizes it
+    /// again. A document it cannot read names none. `None` when it made no
+    /// pass; a pass never answers `Busy`.
+    pub(crate) fn run_admission_pass(&self) -> Option<SetupOutcome> {
+        let _pass = self.pass.lock().unwrap_or_else(PoisonError::into_inner);
+        let named = ReadinessDocument::load(&self.dependencies.readiness_path)
+            .ok()
+            .flatten()
+            .is_some_and(|document| {
+                AgentLoginProvider::INSTALLABLE
+                    .into_iter()
+                    .filter_map(|provider| document.login(provider))
+                    .any(|entry| authorized_or_installed(entry) || entry.selected)
+            });
+        named.then(|| self.pass_under(&Admitting))
+    }
+
+    /// One pass, each install and removal under `gate`; the caller holds the
+    /// `pass` lock.
+    fn pass_under(&self, gate: &dyn AssignmentGate) -> SetupOutcome {
+        if !gate.while_idle(&mut || self.remove_leftover_temporary_files()) {
             return SetupOutcome::Busy(None);
         }
         let now = (self.clock)();
@@ -229,6 +306,13 @@ impl AgentLoginSetup {
         let previous = previous.as_ref();
         let recorded =
             |provider: AgentLoginProvider| previous.and_then(|document| document.login(provider));
+        // The uses noted so far, which this pass folds into the entry of
+        // the install each was noted for (REQ-AGENTLOGIN-42).
+        let noted = self.uses.noted();
+        let with_last_use = |mut login: LoginReadiness| {
+            login.last_use = last_use(&login, recorded(login.provider), &noted);
+            login
+        };
         let cloud = self.dependencies.cloud.as_ref();
         let answer = cloud.status(&self.status_request(previous));
         // The providers settled so far, in order, then what was last
@@ -242,7 +326,7 @@ impl AgentLoginSetup {
                     AgentLoginProvider::INSTALLABLE
                         .into_iter()
                         .filter(|provider| settled.iter().all(|login| login.provider != *provider))
-                        .filter_map(|provider| recorded(provider).cloned()),
+                        .filter_map(|provider| recorded(provider).cloned().map(with_last_use)),
                 )
                 .collect(),
             unknown: previous.map_or_else(Vec::new, |document| document.unknown.clone()),
@@ -261,6 +345,16 @@ impl AgentLoginSetup {
                 continue;
             }
             let mut installed = entry.and_then(LoginReadiness::installation);
+            let named = answer
+                .as_ref()
+                .ok()
+                .and_then(|answer| answer.iter().find(|login| login.provider == provider));
+            // Whether the provider is selected once it is in `state`: as
+            // Cloud answered, or as last recorded when Cloud did not answer.
+            let selected_in = |state| match &answer {
+                Ok(_) => selected(named, state),
+                Err(_) => entry.is_some_and(|entry| entry.selected),
+            };
             // What the pass recorded for the provider on the way, if anything.
             let mut ended = None;
             let outcome = match &answer {
@@ -272,16 +366,16 @@ impl AgentLoginSetup {
                         cause: failure.cause(),
                     },
                 )),
-                Ok(answer) => {
-                    let named = answer.iter().find(|login| login.provider == provider);
+                Ok(_) => {
                     match installed.filter(|installation| self.superseded(installation, named)) {
-                        None => self.settle(cloud, provider, installed, named, now),
+                        None => self.settle(gate, cloud, provider, installed, named, now),
                         // Cloud names another agent login, or this build
                         // keeps the provider's login elsewhere: the install
                         // the record names ends, and is recorded as ended,
                         // before anything else is asked for
                         // (REQ-AGENTLOGIN-30, INV-RUNNER-15).
                         Some(installation) => match self.end(
+                            gate,
                             provider,
                             Some(installation),
                             AgentLoginState::NotAuthorized,
@@ -297,6 +391,8 @@ impl AgentLoginSetup {
                                     state,
                                     checked_at: Some(now),
                                     login,
+                                    selected: selected_in(state),
+                                    last_use: None,
                                 };
                                 let mut recorded = settled.clone();
                                 recorded.push(entry.clone());
@@ -306,7 +402,7 @@ impl AgentLoginSetup {
                                 recorded_change = true;
                                 installed = None;
                                 ended = Some(entry);
-                                self.settle(cloud, provider, None, named, now)
+                                self.settle(gate, cloud, provider, None, named, now)
                             }
                             failed => failed,
                         },
@@ -325,12 +421,14 @@ impl AgentLoginSetup {
                 interrupted = true;
                 break;
             };
-            let login = LoginReadiness {
+            let login = with_last_use(LoginReadiness {
                 provider,
                 state,
                 checked_at: Some(now),
                 login,
-            };
+                selected: selected_in(state),
+                last_use: None,
+            });
             let changed = login.installation() != installed;
             settled.push(login);
             failures.extend(failure.map(|failure| (provider, failure)));
@@ -350,33 +448,56 @@ impl AgentLoginSetup {
         if interrupted && !recorded_change {
             return SetupOutcome::Busy(None);
         }
-        let document = document(&settled);
+        let mut document = document(&settled);
         if !self.write(&document) {
             return SetupOutcome::Failed;
         }
+        // What was noted is recorded, or was noted for an install that is
+        // no longer the one recorded.
+        self.uses.forget(&noted);
         // The status request carried what the previous pass recorded, so a
         // pass that changed it tells Cloud in the same pass, rather than
         // the next (REQ-AGENTLOGIN-17); not once an assignment has started,
         // nor when Cloud did not answer, which leaves nothing new to report.
-        // The answer is the next pass's to act on, and a failure changes
-        // nothing recorded: it is named only beside each changed provider's
-        // state in the pass's record, unless the provider's setup already
-        // failed a step, which `record_changes` names first.
+        // A failure changes nothing recorded: it is named only beside each
+        // changed provider's state in the pass's record, unless the
+        // provider's setup already failed a step, which `record_changes`
+        // names first.
         let report = self.status_request(Some(&document));
-        if !interrupted
-            && answer.is_ok()
-            && report != self.status_request(previous)
-            && let Err(failure) = cloud.status(&report)
-        {
-            failures.extend(AgentLoginProvider::INSTALLABLE.map(|provider| {
-                (
-                    provider,
-                    StepFailure {
-                        stage: FailureStage::Status,
-                        cause: failure.cause(),
-                    },
-                )
-            }));
+        if !interrupted && answer.is_ok() && report != self.status_request(previous) {
+            match cloud.status(&report) {
+                Err(failure) => failures.extend(status_failures(failure.cause())),
+                // The answer ends what this pass installed and Cloud no
+                // longer authorizes, once, and the removal is recorded and
+                // reported; the answer to that report, and everything else
+                // in this one, is the next pass's to act on
+                // (REQ-AGENTLOGIN-40).
+                Ok(closing) => {
+                    match self.end_unauthorized(
+                        gate,
+                        previous,
+                        &mut document,
+                        &closing,
+                        &mut failures,
+                    ) {
+                        Some(false) => {}
+                        ended => {
+                            if !self.write(&document) {
+                                return SetupOutcome::Failed;
+                            }
+                            // A pass an assignment interrupted reports
+                            // nothing more.
+                            if ended.is_none() {
+                                interrupted = true;
+                            } else if let Err(failure) =
+                                cloud.status(&self.status_request(Some(&document)))
+                            {
+                                failures.extend(status_failures(failure.cause()));
+                            }
+                        }
+                    }
+                }
+            }
         }
         self.record_changes(previous, &document, &failures);
         if interrupted {
@@ -408,6 +529,57 @@ impl AgentLoginSetup {
         }
     }
 
+    /// Ends each login this pass installed, as `document` records it against
+    /// `previous`, that Cloud's closing answer `closing` no longer authorizes:
+    /// Cloud answers `revoked` or `unauthorized`, names another agent login
+    /// or no longer names the provider (REQ-AGENTLOGIN-40). It changes the
+    /// provider's entry in `document` and asks for no delivery. Answers
+    /// whether it ended one, or `None` when an assignment started before a
+    /// removal it needed.
+    fn end_unauthorized(
+        &self,
+        gate: &dyn AssignmentGate,
+        previous: Option<&ReadinessDocument>,
+        document: &mut ReadinessDocument,
+        closing: &[ProviderLogin],
+        failures: &mut Vec<(AgentLoginProvider, StepFailure)>,
+    ) -> Option<bool> {
+        let mut ended = false;
+        for entry in &mut document.logins {
+            let provider = entry.provider;
+            let Some(installation) = entry.installation().cloned() else {
+                continue;
+            };
+            let earlier = previous
+                .and_then(|previous| previous.login(provider))
+                .and_then(LoginReadiness::installation);
+            if earlier == Some(&installation) {
+                continue;
+            }
+            let named = closing.iter().find(|login| login.provider == provider);
+            let state = match named.map(|named| named.status) {
+                None => AgentLoginState::NotAuthorized,
+                Some(LoginStatus::Revoked) => AgentLoginState::Revoked,
+                Some(LoginStatus::Unauthorized) => AgentLoginState::NotAuthorized,
+                Some(_) if self.superseded(&installation, named) => AgentLoginState::NotAuthorized,
+                Some(_) => continue,
+            };
+            let login = named.map(|named| RecordedLogin::Named(named.agent_login_id.clone()));
+            let Settled {
+                state,
+                login,
+                failure,
+            } = self.end(gate, provider, Some(&installation), state, login)?;
+            entry.state = state;
+            entry.login = login;
+            entry.selected = selected(named, state);
+            entry.last_use = None;
+            failures.extend(failure.map(|failure| (provider, failure)));
+            ended = true;
+        }
+        Some(ended)
+    }
+
     /// Replaces the readiness document with `document`; on failure records
     /// why and answers false.
     fn write(&self, document: &ReadinessDocument) -> bool {
@@ -431,7 +603,8 @@ impl AgentLoginSetup {
     }
 
     /// What the runner tells Cloud it can install, has installed and last
-    /// recorded for each installable provider.
+    /// recorded for each installable provider, with the last use of a
+    /// `ready` install (REQ-AGENTLOGIN-42).
     fn status_request(&self, previous: Option<&ReadinessDocument>) -> StatusRequest {
         StatusRequest {
             os: self.dependencies.os,
@@ -439,25 +612,30 @@ impl AgentLoginSetup {
                 .into_iter()
                 .map(|provider| {
                     let entry = previous.and_then(|document| document.login(provider));
-                    ProviderReport {
+                    ProviderReport::new(
                         provider,
-                        installed: entry.and_then(LoginReadiness::installation).map(
-                            |installation| InstalledLogin {
+                        entry
+                            .and_then(LoginReadiness::installation)
+                            .map(|installation| InstalledLogin {
                                 agent_login_id: installation.agent_login_id.clone(),
                                 generation: installation.generation,
-                            },
-                        ),
-                        state: entry.map(|entry| entry.state),
-                    }
+                            }),
+                        entry.map(|entry| entry.state),
+                        entry
+                            .and_then(|entry| entry.last_use)
+                            .map(|last_use| last_use.outcome),
+                    )
                 })
                 .collect(),
         }
     }
 
-    /// One provider's readiness from Cloud's answer about it; `None` when an
-    /// assignment started before an install or removal it needed.
+    /// One provider's readiness from Cloud's answer about it, each install
+    /// and removal under `gate`; `None` when an assignment started before an
+    /// install or removal it needed.
     fn settle(
         &self,
+        gate: &dyn AssignmentGate,
         cloud: &dyn AgentLoginCloud,
         provider: AgentLoginProvider,
         installed: Option<&Installation>,
@@ -466,7 +644,13 @@ impl AgentLoginSetup {
     ) -> Option<Settled> {
         let Some(answer) = answer else {
             // Cloud no longer names the provider: nothing is authorized.
-            return self.end(provider, installed, AgentLoginState::NotAuthorized, None);
+            return self.end(
+                gate,
+                provider,
+                installed,
+                AgentLoginState::NotAuthorized,
+                None,
+            );
         };
         let named = || RecordedLogin::Named(answer.agent_login_id.clone());
         let kept = || {
@@ -476,10 +660,17 @@ impl AgentLoginSetup {
         };
         let generation = match answer.status {
             LoginStatus::Revoked => {
-                return self.end(provider, installed, AgentLoginState::Revoked, Some(named()));
+                return self.end(
+                    gate,
+                    provider,
+                    installed,
+                    AgentLoginState::Revoked,
+                    Some(named()),
+                );
             }
             LoginStatus::Unauthorized => {
                 return self.end(
+                    gate,
                     provider,
                     installed,
                     AgentLoginState::NotAuthorized,
@@ -512,6 +703,7 @@ impl AgentLoginSetup {
         // never replaced (REQ-AGENTLOGIN-27).
         if self.foreign_login(provider) {
             return self.end(
+                gate,
                 provider,
                 installed,
                 AgentLoginState::ForeignLogin,
@@ -532,7 +724,7 @@ impl AgentLoginSetup {
         }
         // No request starts once an assignment is held: Cloud would record
         // and audit a delivery the runner then could not install.
-        self.while_idle(|| ())?;
+        while_idle(gate, || ())?;
         let request = DeliveryRequest {
             os: self.dependencies.os,
             provider,
@@ -540,11 +732,16 @@ impl AgentLoginSetup {
             generation,
         };
         match cloud.delivery(&request) {
-            Ok(delivery) => self.install(installed, &delivery, now, kept()),
-            Err(DeliveryFailure::Refused(DeliveryRefusal::Revoked)) => {
-                self.end(provider, installed, AgentLoginState::Revoked, Some(named()))
-            }
+            Ok(delivery) => self.install(gate, installed, &delivery, now, kept()),
+            Err(DeliveryFailure::Refused(DeliveryRefusal::Revoked)) => self.end(
+                gate,
+                provider,
+                installed,
+                AgentLoginState::Revoked,
+                Some(named()),
+            ),
             Err(DeliveryFailure::Refused(DeliveryRefusal::Unauthorized)) => self.end(
+                gate,
                 provider,
                 installed,
                 AgentLoginState::NotAuthorized,
@@ -569,6 +766,7 @@ impl AgentLoginSetup {
 
     fn install(
         &self,
+        gate: &dyn AssignmentGate,
         installed: Option<&Installation>,
         delivery: &Delivery,
         now: OffsetDateTime,
@@ -591,7 +789,7 @@ impl AgentLoginSetup {
             }
         };
         let directory = &self.dependencies.directory;
-        let result = self.while_idle(|| install(directory, installed, delivery, now))?;
+        let result = while_idle(gate, || install(directory, installed, delivery, now))?;
         Some(match result {
             Ok(installation) => Settled::new(
                 AgentLoginState::Ready,
@@ -610,22 +808,30 @@ impl AgentLoginSetup {
     /// install the runner did not get to record is still its own, and left
     /// there it would be offered to every later assignment), and the
     /// recorded install's file when it is elsewhere in that directory, and
-    /// records `state`. A recorded install outside the directory, an older
-    /// build's, is forgotten, never removed. A file that could not be
-    /// removed is recorded as `install_failed`, so a later pass removes it.
+    /// records `state`. For Codex that location is the runner's whole Codex
+    /// home, what Codex wrote there included (REQ-AGENTLOGIN-30); an install
+    /// creates it again. A recorded install outside the directory, an older
+    /// build's, is forgotten, never removed. What could not be removed is
+    /// recorded as `install_failed`, so a later pass removes what is left.
+    /// Each removal runs under `gate`.
     fn end(
         &self,
+        gate: &dyn AssignmentGate,
         provider: AgentLoginProvider,
         installed: Option<&Installation>,
         state: AgentLoginState,
         login: Option<RecordedLogin>,
     ) -> Option<Settled> {
+        let directory = &self.dependencies.directory;
+        let home = (provider == AgentLoginProvider::Codex).then(|| directory.codex_home());
         let recorded = installed
             .map(|installation| installation.installed_path.clone())
-            .filter(|path| self.dependencies.directory.contains(path));
+            .filter(|path| directory.contains(path))
+            // The home's removal takes a file recorded in it.
+            .filter(|path| home.as_ref().is_none_or(|home| !path.starts_with(home)));
         let mut present: Vec<PathBuf> = recorded
             .into_iter()
-            .chain(self.location(provider))
+            .chain(home.clone().or_else(|| self.location(provider)))
             // Nothing is at a path that does not exist or lies under
             // something that is not a directory.
             .filter(|path| {
@@ -642,10 +848,17 @@ impl AgentLoginSetup {
             return Some(Settled::new(state, login));
         }
         Some(
-            match self.while_idle(|| {
-                present
-                    .iter()
-                    .try_for_each(|path| directory::remove_file(path))
+            match while_idle(gate, || {
+                present.iter().try_for_each(|path| {
+                    if home.as_ref() == Some(path) {
+                        // The login itself goes first, so a home whose removal
+                        // cannot finish holds no login to offer the next
+                        // assignment. Its own failure is not the answer: what
+                        // is left fails the home's removal, which reports it.
+                        let _ = directory.remove_tree(&codex::auth_path(directory));
+                    }
+                    directory.remove_tree(path)
+                })
             })? {
                 Ok(()) => Settled::new(state, login),
                 Err(error) => Settled::failed(
@@ -698,19 +911,6 @@ impl AgentLoginSetup {
             | AgentLoginProvider::Gitlab
             | AgentLoginProvider::Linear => None,
         }
-    }
-
-    /// Runs `change` under the assignment gate; `None` while an assignment is
-    /// held.
-    fn while_idle<T>(&self, change: impl FnOnce() -> T) -> Option<T> {
-        let mut change = Some(change);
-        let mut result = None;
-        self.gate.while_idle(&mut || {
-            if let Some(change) = change.take() {
-                result = Some(change());
-            }
-        });
-        result
     }
 
     /// Writes one record naming each provider whose state, agent login or
@@ -791,12 +991,143 @@ impl AgentLoginSetup {
     }
 }
 
+/// The last use `login` records: the one noted for its install, else the one
+/// last recorded beside it, while that install is the one last recorded; an
+/// install, or an ending, records none (REQ-AGENTLOGIN-42).
+fn last_use(
+    login: &LoginReadiness,
+    previous: Option<&LoginReadiness>,
+    noted: &[NotedUse],
+) -> Option<LastUse> {
+    let installation = login.installation()?;
+    let previous = previous.filter(|previous| previous.installation() == Some(installation))?;
+    noted
+        .iter()
+        .find(|noted| {
+            noted.provider == login.provider
+                && noted.agent_login_id == installation.agent_login_id
+                && noted.generation == installation.generation
+        })
+        .map(|noted| noted.last_use)
+        .or(previous.last_use)
+}
+
+/// A use of an offered login, noted while its assignment ran.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct NotedUse {
+    provider: AgentLoginProvider,
+    agent_login_id: String,
+    generation: u64,
+    last_use: LastUse,
+}
+
+/// The uses noted since a pass last folded them in, at most one per
+/// provider, the latest. An observer notes into it while the assignment
+/// runs, when no pass may write (INV-RUNNER-15), and a pass takes the lock
+/// only to read and to forget what it folded in. A process that stops
+/// before a pass loses them.
+#[derive(Debug, Default)]
+struct NotedUses(Mutex<Vec<NotedUse>>);
+
+impl NotedUses {
+    fn note(&self, noted: NotedUse) {
+        let mut uses = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        uses.retain(|kept| kept.provider != noted.provider);
+        uses.push(noted);
+    }
+
+    fn noted(&self) -> Vec<NotedUse> {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Forgets each of `folded`, keeping a use noted since.
+    fn forget(&self, folded: &[NotedUse]) {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retain(|kept| !folded.contains(kept));
+    }
+}
+
+/// The observer of one admission (REQ-AGENTLOGIN-42).
+struct UseObserver {
+    offered: Vec<OfferedLogin>,
+    uses: Arc<NotedUses>,
+    clock: Clock,
+}
+
+impl HarnessLoginObserver for UseObserver {
+    fn observe(&self, variable: &str, outcome: HarnessLoginOutcome) {
+        // A variable the runner did not add, the service's own, says
+        // nothing of a login the runner holds.
+        let Some(offered) = self
+            .offered
+            .iter()
+            .find(|offered| offered.variable == variable)
+        else {
+            return;
+        };
+        self.uses.note(NotedUse {
+            provider: offered.provider,
+            agent_login_id: offered.agent_login_id.clone(),
+            generation: offered.generation,
+            last_use: LastUse {
+                outcome: match outcome {
+                    HarnessLoginOutcome::Accepted => UseOutcome::Accepted,
+                    HarnessLoginOutcome::Refused => UseOutcome::Refused,
+                },
+                at: (self.clock)(),
+            },
+        });
+    }
+}
+
 /// Whether the runner last knew the provider's login as installed, or as
 /// authorized by Cloud without being ready: the entries a pass that cannot
 /// reach Cloud records as `cloud_unavailable`, so that state only ever marks a
 /// provider Cloud did authorize (REQ-AGENTLOGIN-28, REQ-AGENTLOGIN-31).
 fn authorized_or_installed(entry: &LoginReadiness) -> bool {
     entry.installation().is_some() || entry.state.fails_readiness()
+}
+
+/// Whether a provider Cloud answered `named` for, and that a pass left in
+/// `state`, is selected: Cloud named an authorization in force for it,
+/// `authorized`, `unauthorized` or `unsupported_target`, and no delivery
+/// refused as `revoked` since (REQ-AGENTLOGIN-28).
+fn selected(named: Option<&ProviderLogin>, state: AgentLoginState) -> bool {
+    named.is_some_and(|named| named.status != LoginStatus::Revoked)
+        && state != AgentLoginState::Revoked
+}
+
+/// Runs `change` under `gate`; `None` while an assignment is held.
+fn while_idle<T>(gate: &dyn AssignmentGate, change: impl FnOnce() -> T) -> Option<T> {
+    let mut change = Some(change);
+    let mut result = None;
+    gate.while_idle(&mut || {
+        if let Some(change) = change.take() {
+            result = Some(change());
+        }
+    });
+    result
+}
+
+/// A status request's failure with `cause`, named beside each installable
+/// provider's state in the pass's record.
+fn status_failures(
+    cause: FailureCause,
+) -> [(AgentLoginProvider, StepFailure); AgentLoginProvider::INSTALLABLE.len()] {
+    AgentLoginProvider::INSTALLABLE.map(|provider| {
+        (
+            provider,
+            StepFailure {
+                stage: FailureStage::Status,
+                cause,
+            },
+        )
+    })
 }
 
 /// A provider's state after a pass, the agent login its entry records, and

@@ -17,6 +17,7 @@ use tokio::sync::mpsc;
 use super::input::initial_turn_input;
 use super::{CodexAppServerV1Parser, CodexAppServerV1RejectionReason, ParserProgress};
 use crate::codex::compatibility_profile_for_version;
+use crate::workflow::admission::CODEX_LOGIN_VARIABLE;
 use crate::workflow::agent::{
     AgentCompatibilityProfile, AgentFailure, AgentFailureCause, AgentHarnessSetupStage,
     AgentInvocation, AgentLifecycleMilestone, AgentObservation, AgentOutcome,
@@ -320,7 +321,7 @@ fn codex_home_from_environment(
     environment: &BTreeMap<OsString, OsString>,
 ) -> Result<Arc<str>, AgentFailureCause> {
     let path = environment
-        .get(OsStr::new("CODEX_HOME"))
+        .get(OsStr::new(CODEX_LOGIN_VARIABLE))
         .map(PathBuf::from)
         .or_else(|| {
             environment

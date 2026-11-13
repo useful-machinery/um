@@ -24,8 +24,8 @@ use um_test_support::watchdog::{FIXTURE_WAIT_BASE, WatchdogExpired, host_scaled_
 
 use crate::agent_login::ServiceEnvironment;
 use crate::agent_login::cloud::{
-    AgentLoginCloud, CloudFailure, Delivery, DeliveryFailure, DeliveryRequest, LoginMaterial,
-    LoginStatus, ProviderLogin, StatusRequest,
+    AgentLoginCloud, CloudFailure, Delivery, DeliveryFailure, DeliveryRefusal, DeliveryRequest,
+    LoginMaterial, LoginStatus, ProviderLogin, StatusRequest,
 };
 use crate::agent_login::setup::{AssignmentGate, SetupDependencies};
 use crate::control_protocol::AgentLoginProvider;
@@ -976,14 +976,18 @@ pub(crate) fn fake_codex_authorized(generation: u64) -> Result<Vec<ProviderLogin
 }
 
 /// Cloud's side of agent-login setup for service tests: answers each status
-/// request with what the test last set and delivers the fake material for the
-/// generation asked for, or fails each delivery as the test last set. It
-/// counts both requests.
+/// request with what the test last set, or the next one only with what it set
+/// for it, and delivers the fake material for the generation asked for, or
+/// fails or refuses each delivery as the test last set. It counts both
+/// requests and keeps each status request.
 pub(crate) struct FakeAgentLoginCloud {
     answer: Mutex<Result<Vec<ProviderLogin>, CloudFailure>>,
-    delivery_failure: Mutex<Option<CloudFailure>>,
+    later: Mutex<Option<Result<Vec<ProviderLogin>, CloudFailure>>>,
+    delivery_failure: Mutex<Option<DeliveryFailure>>,
     held: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+    arrived: Mutex<Option<std::sync::mpsc::SyncSender<()>>>,
     status_requests: AtomicU64,
+    reports: Mutex<Vec<StatusRequest>>,
     deliveries: AtomicU64,
 }
 
@@ -991,9 +995,12 @@ impl FakeAgentLoginCloud {
     pub(crate) fn new(answer: Result<Vec<ProviderLogin>, CloudFailure>) -> Arc<Self> {
         Arc::new(Self {
             answer: Mutex::new(answer),
+            later: Mutex::new(None),
             delivery_failure: Mutex::new(None),
             held: Mutex::new(None),
+            arrived: Mutex::new(None),
             status_requests: AtomicU64::new(0),
+            reports: Mutex::new(Vec::new()),
             deliveries: AtomicU64::new(0),
         })
     }
@@ -1003,12 +1010,31 @@ impl FakeAgentLoginCloud {
         *self.answer.lock().expect("fake Cloud mutex poisoned") = answer;
     }
 
+    /// What the next status request answers, and `later` what each after it
+    /// answers.
+    pub(crate) fn answer_next_then(
+        &self,
+        next: Result<Vec<ProviderLogin>, CloudFailure>,
+        later: Result<Vec<ProviderLogin>, CloudFailure>,
+    ) {
+        self.answer(next);
+        *self.later.lock().expect("fake Cloud mutex poisoned") = Some(later);
+    }
+
     /// How later delivery requests fail; `None` delivers again.
     pub(crate) fn fail_deliveries(&self, failure: Option<CloudFailure>) {
         *self
             .delivery_failure
             .lock()
-            .expect("fake Cloud mutex poisoned") = failure;
+            .expect("fake Cloud mutex poisoned") = failure.map(DeliveryFailure::from);
+    }
+
+    /// Refuses later delivery requests with `refusal`.
+    pub(crate) fn refuse_deliveries(&self, refusal: DeliveryRefusal) {
+        *self
+            .delivery_failure
+            .lock()
+            .expect("fake Cloud mutex poisoned") = Some(DeliveryFailure::Refused(refusal));
     }
 
     /// Makes the next status request wait until the returned sender sends or
@@ -1019,8 +1045,30 @@ impl FakeAgentLoginCloud {
         release
     }
 
+    /// `hold_next_status`, and a receiver that hears when the held request
+    /// has arrived.
+    pub(crate) fn hold_next_status_arrival(
+        &self,
+    ) -> (
+        std::sync::mpsc::SyncSender<()>,
+        std::sync::mpsc::Receiver<()>,
+    ) {
+        let release = self.hold_next_status();
+        let (arrived, arrival) = std::sync::mpsc::sync_channel(1);
+        *self.arrived.lock().expect("fake Cloud mutex poisoned") = Some(arrived);
+        (release, arrival)
+    }
+
     pub(crate) fn status_requests(&self) -> u64 {
         self.status_requests.load(Ordering::SeqCst)
+    }
+
+    /// Each status request answered so far, in order.
+    pub(crate) fn reports(&self) -> Vec<StatusRequest> {
+        self.reports
+            .lock()
+            .expect("fake Cloud mutex poisoned")
+            .clone()
     }
 
     pub(crate) fn deliveries(&self) -> u64 {
@@ -1029,16 +1077,30 @@ impl FakeAgentLoginCloud {
 }
 
 impl AgentLoginCloud for FakeAgentLoginCloud {
-    fn status(&self, _request: &StatusRequest) -> Result<Vec<ProviderLogin>, CloudFailure> {
+    fn status(&self, request: &StatusRequest) -> Result<Vec<ProviderLogin>, CloudFailure> {
         let held = self.held.lock().expect("fake Cloud mutex poisoned").take();
         if let Some(held) = held {
+            if let Some(arrived) = self
+                .arrived
+                .lock()
+                .expect("fake Cloud mutex poisoned")
+                .take()
+            {
+                let _ = arrived.send(());
+            }
             let _ = held.recv();
         }
         self.status_requests.fetch_add(1, Ordering::SeqCst);
-        self.answer
+        self.reports
             .lock()
             .expect("fake Cloud mutex poisoned")
-            .clone()
+            .push(request.clone());
+        let mut answer = self.answer.lock().expect("fake Cloud mutex poisoned");
+        let answered = answer.clone();
+        if let Some(later) = self.later.lock().expect("fake Cloud mutex poisoned").take() {
+            *answer = later;
+        }
+        answered
     }
 
     fn follow_credential(&self, _endpoint: &url::Url, _runner_credential: &Credential) {}
@@ -1050,7 +1112,7 @@ impl AgentLoginCloud for FakeAgentLoginCloud {
             .lock()
             .expect("fake Cloud mutex poisoned")
         {
-            return Err(failure.into());
+            return Err(failure);
         }
         Ok(Delivery {
             provider: request.provider,

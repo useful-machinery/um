@@ -281,6 +281,52 @@ fn execution_fixture_with_source_files(
     parallelism: usize,
     log_bytes: u64,
 ) -> ExecutionFixture {
+    execution_fixture_with_context(source, source_files, imports, |execution_root| {
+        fixture_execution_context(
+            execution_root,
+            environment,
+            cancellation,
+            parallelism,
+            log_bytes,
+        )
+    })
+}
+
+/// The context every fixture admits with: the given policy and every harness installed.
+fn fixture_execution_context(
+    execution_root: PathBuf,
+    environment: EnvironmentSnapshot,
+    cancellation: CancellationSource,
+    parallelism: usize,
+    log_bytes: u64,
+) -> ExecutionContext {
+    ExecutionContext::new(
+        execution_root,
+        ExecutionPolicyLimits::new(
+            parallelism,
+            CaptureLimits::new(16, 1024 * 1024, 8 * 1024 * 1024),
+            InputLimits::new(16, 1024 * 1024, 8 * 1024 * 1024, 8 * 1024 * 1024),
+            log_bytes,
+        ),
+        environment,
+        CancellationPolicy::new(cancellation, Duration::from_secs(1)),
+    )
+    .with_pi_installation(ValidatedPiInstallation::fixture("/validated/pi".into()))
+    .with_claude_code_installation(ValidatedClaudeCodeInstallation::fixture(
+        "/validated/claude".into(),
+    ))
+    .with_codex_installation(ValidatedCodexInstallation::fixture(
+        "/validated/codex".into(),
+    ))
+}
+
+/// A fixture admitted with the context `context` builds for its execution root.
+fn execution_fixture_with_context(
+    source: &str,
+    source_files: &[(&str, &[u8])],
+    imports: ResolvedInputs,
+    context: impl FnOnce(PathBuf) -> ExecutionContext,
+) -> ExecutionFixture {
     let temporary = tempfile::tempdir().unwrap();
     let source_root = temporary.path().join("source");
     let execution_root = temporary.path().join("execution");
@@ -289,27 +335,7 @@ fn execution_fixture_with_source_files(
     fs::create_dir(&staging_root).unwrap();
     let admitted = AdmittedFixture::new(&source_root, source)
         .with_files(source_files)
-        .admit(
-            imports,
-            ExecutionContext::new(
-                execution_root.clone(),
-                ExecutionPolicyLimits::new(
-                    parallelism,
-                    CaptureLimits::new(16, 1024 * 1024, 8 * 1024 * 1024),
-                    InputLimits::new(16, 1024 * 1024, 8 * 1024 * 1024, 8 * 1024 * 1024),
-                    log_bytes,
-                ),
-                environment,
-                CancellationPolicy::new(cancellation, Duration::from_secs(1)),
-            )
-            .with_pi_installation(ValidatedPiInstallation::fixture("/validated/pi".into()))
-            .with_claude_code_installation(ValidatedClaudeCodeInstallation::fixture(
-                "/validated/claude".into(),
-            ))
-            .with_codex_installation(ValidatedCodexInstallation::fixture(
-                "/validated/codex".into(),
-            )),
-        );
+        .admit(imports, context(execution_root.clone()));
     let artifacts = ArtifactStaging::create(admitted.execution(), &staging_root).unwrap();
     let inputs = InputStaging::create(admitted.execution(), &staging_root).unwrap();
     let agent_inputs = AgentInputStaging::create(admitted.execution(), &staging_root).unwrap();
@@ -389,6 +415,71 @@ fn agent_runtime_with_accounting(
         adapter,
         accounting,
     )
+}
+
+/// How a workflow whose harness login the admission may have withheld ended, and whether
+/// any harness was ever started: an agent step's, an agent finalizer's or an agent recovery
+/// handler's.
+struct WithheldLoginRun {
+    result: WorkflowExecutionResult<TestInstant>,
+    harness_started: bool,
+    diagnostics: StepDiagnosticLog,
+}
+
+/// Runs `source` with `withheld` named as the admission's withheld login variables. The
+/// scripted dispatcher stands in for the harness executable: a started invocation is
+/// recorded and completed, and a run that never dispatched one drops the dispatcher.
+async fn run_with_withheld_logins(source: &str, withheld: &[&str]) -> WithheldLoginRun {
+    let fixture = execution_fixture_with_context(
+        source,
+        &[("prompt.md", b"start")],
+        ResolvedInputs::default(),
+        |execution_root| {
+            fixture_execution_context(
+                execution_root,
+                EnvironmentSnapshot::new([("PATH", "/bin:/usr/bin")]),
+                CancellationSource::new(),
+                1,
+                1024,
+            )
+            .with_withheld_agent_logins(withheld.iter().copied())
+        },
+    );
+    let (adapter, mut control) = scripted_agent_dispatcher();
+    let agents = agent_runtime(&fixture, adapter);
+    let artifacts = fixture.artifacts.clone();
+    let inputs = fixture.inputs.clone();
+    let diagnostics = StepDiagnosticLog::default();
+    let execution = tokio::spawn({
+        let admitted = fixture.admitted.clone();
+        let diagnostics = diagnostics.clone();
+        async move {
+            execute_workflow(
+                admitted,
+                &artifacts,
+                &inputs,
+                &diagnostics,
+                agents,
+                TestClock,
+                NoopExecutionObserver,
+            )
+            .await
+        }
+    });
+    let harness_started = match control.wait_until_started().await {
+        Ok(started) => {
+            started.control().start().await.unwrap();
+            started.control().complete().await.unwrap();
+            true
+        }
+        Err(crate::workflow::agent::scripted::ScriptedAgentError::AdapterStopped) => false,
+        Err(error) => panic!("unexpected scripted dispatcher error: {error:?}"),
+    };
+    WithheldLoginRun {
+        result: execution.await.unwrap().unwrap(),
+        harness_started,
+        diagnostics,
+    }
 }
 
 fn recovery_profile_source(profile: AgentCompatibilityProfile) -> &'static str {

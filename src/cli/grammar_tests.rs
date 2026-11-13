@@ -5,7 +5,7 @@ use clap::{Arg, ArgAction, Command, CommandFactory};
 
 use super::Cli;
 
-const LEAVES: &str = "accept activate answer approve authorize begin cancel complete continue create deauthorize decline delete disable doctor download drain enable end enroll hand-back history import interrupt issue leave lift link list login logout move preview propose publish reference release remove rename replay request restart resume retire retry revoke revoke-previous-secret rotate-secret run schema seal serve set show signup status stop sync test update upgrade upload uses validate version view wait withdraw";
+const LEAVES: &str = "accept activate answer approve authorize begin cancel complete continue create deauthorize decline delete disable doctor download drain enable end enroll hand-back history import interrupt issue leave lift link list login logout move preview propose publish reconnect reference release remove rename replay request restart resume retire retry revoke revoke-previous-secret rotate-secret run schema seal serve set show signup status stop sync test update upgrade upload uses validate version view wait withdraw";
 const GROUPS: &str = "account action activation agent-login artifact audit auth authorization connection credential definition delegation deletion delivery github gitlab grant identity input input-set installation invitation linear member occurrence organization pool project publication repository run runner runner-pool schedule service-principal setup state team trigger evaluation webhook workflow";
 const COMMON: [&str; 3] = ["json", "service-api-key-file", "allow-insecure-http"];
 // These leaves have no limit/cursor contract; see cli/docs/output-style.md.
@@ -15,6 +15,10 @@ const UNPAGINATED_LISTS: [&str; 4] = [
     "workflow definition list",
     "workflow run list",
 ];
+// These destructive leaves' own confirmation refuses a missing --yes with the statement the
+// leaf makes before it acts, which clap's refusal of a required argument cannot carry;
+// destructive_leaves_require_confirmation_but_runner_modes_do_not pins that refusal.
+const SELF_CONFIRMING: [&str; 1] = ["auth agent-login revoke"];
 
 // These identities are backed by shared Args or identifier argument types in cli/src/cli.rs
 // and cli/src/cli/entity.rs. A long spelling alone is never a help identity.
@@ -87,6 +91,8 @@ fn semantic_class(path: &str, long: &str) -> Option<String> {
                 "sign-in"
             } else if path.starts_with("auth agent-login ") {
                 "agent-login"
+            } else if path.starts_with("auth credential ") {
+                "credential"
             } else if path.starts_with("auth grant ") {
                 "grant"
             } else if path.starts_with("auth identity ") {
@@ -169,7 +175,7 @@ fn violations(root: &Command) -> BTreeSet<String> {
                     && !node.get_arguments().any(|arg| {
                         arg.get_long() == Some("yes")
                             && matches!(arg.get_action(), ArgAction::SetTrue)
-                            && arg.is_required_set()
+                            && (arg.is_required_set() || SELF_CONFIRMING.contains(&path))
                     })
                 {
                     failures.insert(format!("confirmation|{path}"));

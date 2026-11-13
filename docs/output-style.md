@@ -238,7 +238,10 @@ separate entity family.
 - **Destructive confirmation:** a leaf requires `--yes` when its final token is
   `delete`, `decline`, `end`, `leave`, `remove`, `revoke`, or `retire`, or when
   its complete command identity is `account deletion request` or
-  `organization deletion request`; no other leaf has `--yes`. This set covers
+  `organization deletion request`; of other leaves only `auth agent-login
+  authorize` and `deauthorize` have `--yes`. Those two and `auth agent-login
+  revoke` check `--yes` themselves, refusing its absence as clap does but with
+  the statement of what the command will do. This set covers
   permanent deletion, departure, delegation or invitation closure, and
   operations that invalidate a binding, credential, or live access. Reversible
   runner mode changes, including `runner disable` and `runner drain`, are not

@@ -54,6 +54,43 @@ impl LoginDirectory {
                     .all(|component| matches!(component, Component::Normal(_)))
         })
     }
+
+    /// Removes whatever is at `path` inside the directory, a directory with
+    /// everything in it included, without following a link: a link is
+    /// removed as a link and what it points to is left. A path outside the
+    /// directory, or reached through anything in it that is not a real
+    /// directory, is refused; a location already empty is removed.
+    pub(crate) fn remove_tree(&self, path: &Path) -> io::Result<()> {
+        if !self.contains(path) {
+            return Err(io::ErrorKind::InvalidInput.into());
+        }
+        let parent = path.parent().ok_or(io::ErrorKind::InvalidInput)?;
+        let mut within: Vec<&Path> = parent
+            .ancestors()
+            .take_while(|ancestor| ancestor.starts_with(&self.0))
+            .collect();
+        within.reverse();
+        for ancestor in within {
+            match fs::symlink_metadata(ancestor) {
+                Ok(metadata) if metadata.file_type().is_dir() => {}
+                Ok(_) => return Err(io::ErrorKind::NotADirectory.into()),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+                Err(error) => return Err(error),
+            }
+        }
+        // `remove_dir_all` removes a link it meets, the one at `path`
+        // included, rather than following it.
+        let removed = match fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.file_type().is_dir() => fs::remove_dir_all(path),
+            Ok(_) => fs::remove_file(path),
+            Err(error) => Err(error),
+        };
+        match removed {
+            Ok(()) => sync_directory_io(parent),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
 }
 
 /// Makes `path` a real directory of the effective user with mode `0700`:

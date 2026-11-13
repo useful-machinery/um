@@ -588,20 +588,68 @@ fn runner_status_prints_each_provider_readiness_once_the_runner_has_set_up() {
     );
 
     assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
     let expected = [
         "process:        running\n",
         "boot:           rbt_01k0z6r1w8f4jy2m7q9v3x5abc\n",
         "uptime:         10s\n",
         "connection:     connected\n",
         "assignments:    0 total\n",
-        "codex login:       ready (generation 3)\n",
-        "claude_code login: foreign_login\n",
-        "github login:      not_delivered\n",
-        "gitlab login:      not_delivered\n",
-        "linear login:      not_delivered\n",
     ]
     .concat();
-    assert_eq!(String::from_utf8(output.stdout).unwrap(), expected);
+    assert!(stdout.starts_with(&expected), "{stdout}");
+    // A readiness without `selected` or `lastUse`, as an earlier runner
+    // reports it, gives the availability its state alone gives
+    // (REQ-AGENTLOGIN-43).
+    super::runner_agent_login::assert_provider_lines(
+        &stdout,
+        &[
+            ("codex", "ready", "unverified"),
+            ("claude_code", "foreign_login", "not_delivered"),
+            ("github", "not_delivered", "not_delivered"),
+            ("gitlab", "not_delivered", "not_delivered"),
+            ("linear", "not_delivered", "not_delivered"),
+        ],
+    );
+    assert!(output.stderr.is_empty());
+}
+
+// REQ-RUNNERENROLL-42, REQ-AGENTLOGIN-43
+#[test]
+fn runner_status_prints_the_availability_selection_and_last_use_give() {
+    let output = run_status_with_response(
+        b"{\"schemaVersion\":1,\"outcome\":\"ok\",\"status\":{\"processState\":\"running\",\"bootId\":\"rbt_01k0z6r1w8f4jy2m7q9v3x5abc\",\"uptimeMilliseconds\":10000,\"connectionState\":\"connected\",\"assignmentCounts\":{\"preparing\":0,\"accepted\":0,\"running\":0,\"finishing\":0,\"reporting\":0},\"agentLogins\":{\"updatedAt\":\"2026-11-12T01:00:00Z\",\"providers\":[{\"provider\":\"codex\",\"state\":\"ready\",\"agentLoginId\":\"agl_01k0z6r1w8f4jy2m7q9v3x5abc\",\"generation\":3,\"checkedAt\":\"2026-11-12T01:00:00Z\",\"installedAt\":\"2026-11-12T00:55:00Z\",\"selected\":true,\"lastUse\":\"refused\"},{\"provider\":\"claude_code\",\"state\":\"not_authorized\",\"agentLoginId\":\"agl_01k0z6r1w8f4jy2m7q9v3x5abd\",\"checkedAt\":\"2026-11-12T01:00:00Z\",\"selected\":true},{\"provider\":\"github\",\"state\":\"not_delivered\"},{\"provider\":\"gitlab\",\"state\":\"not_delivered\"},{\"provider\":\"linear\",\"state\":\"not_delivered\"}]}}}\n",
+    );
+
+    // Status reports; it does not fail for a provider's availability.
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    super::runner_agent_login::assert_provider_lines(
+        &stdout,
+        &[
+            ("codex", "ready", "reconnect_required"),
+            ("claude_code", "not_authorized", "insufficient_permission"),
+            ("github", "not_delivered", "not_delivered"),
+            ("gitlab", "not_delivered", "not_delivered"),
+            ("linear", "not_delivered", "not_delivered"),
+        ],
+    );
+    // Each next action is the owner's, so its line names the agent login.
+    for (provider, next_action, agent_login_id) in [
+        ("codex", "reconnect", "agl_01k0z6r1w8f4jy2m7q9v3x5abc"),
+        (
+            "claude_code",
+            "restore_membership",
+            "agl_01k0z6r1w8f4jy2m7q9v3x5abd",
+        ),
+    ] {
+        let line = stdout
+            .lines()
+            .find(|line| line.starts_with(&format!("{provider} login:")))
+            .unwrap();
+        assert!(line.contains(next_action), "{line}");
+        assert!(line.contains(agent_login_id), "{line}");
+    }
     assert!(output.stderr.is_empty());
 }
 

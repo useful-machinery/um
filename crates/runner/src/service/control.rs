@@ -5,7 +5,7 @@ use std::io;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::UnixStream as StdUnixStream;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 use fs4::{FileExt, TryLockError};
@@ -13,7 +13,10 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{Semaphore, mpsc, oneshot};
 
+use um_execution::HarnessLoginObserver;
+
 use super::assignment::AssignmentManager;
+use crate::agent_login::OfferedLogin;
 use crate::agent_login::readiness::ReadinessDocument;
 use crate::agent_login::setup::{AgentLoginSetup, SYNC_BOUND, SetupOutcome};
 use crate::control_protocol::{
@@ -76,7 +79,16 @@ pub(super) async fn set_up_agent_logins(
     setup: &Arc<AgentLoginSetup>,
     status: &LiveStatus,
 ) -> Result<AgentLoginReadiness, ControlError> {
-    match setup.run_pass().await {
+    publish(setup.run_pass().await, status)
+}
+
+/// Publishes in the live status the readiness a pass that ended with
+/// `outcome` recorded, and answers as `set_up_agent_logins` does.
+fn publish(
+    outcome: SetupOutcome,
+    status: &LiveStatus,
+) -> Result<AgentLoginReadiness, ControlError> {
+    match outcome {
         SetupOutcome::Busy(recorded) => {
             if let Some(readiness) = recorded.as_ref().and_then(ReadinessDocument::reported) {
                 status.agent_logins_recorded(readiness);
@@ -89,6 +101,50 @@ pub(super) async fn set_up_agent_logins(
             status.agent_logins_recorded(readiness.clone());
             Ok(readiness)
         }
+    }
+}
+
+/// The agent-login setup an admission makes for itself before its
+/// assignment is offered the runner's logins (REQ-AGENTLOGIN-39), publishing
+/// what it records in the live status as every pass does. The assignment
+/// manager holds it, and the setup's own gate holds the manager, so it holds
+/// the setup weakly: a setup that is gone makes no pass.
+#[derive(Clone)]
+pub(super) struct AdmissionAgentLogins {
+    setup: Weak<AgentLoginSetup>,
+    status: Arc<LiveStatus>,
+}
+
+impl AdmissionAgentLogins {
+    pub(super) fn new(setup: &Arc<AgentLoginSetup>, status: Arc<LiveStatus>) -> Self {
+        Self {
+            setup: Arc::downgrade(setup),
+            status,
+        }
+    }
+
+    /// Makes the admission's pass, when the readiness names a login, and
+    /// publishes what it recorded. It blocks, on the admission's preparation
+    /// task, for the pass's bounded requests; what it fails at is the pass's
+    /// own record and never the admission's.
+    pub(super) fn set_up(&self) {
+        let Some(setup) = self.setup.upgrade() else {
+            return;
+        };
+        if let Some(outcome) = setup.run_admission_pass() {
+            let _ = publish(outcome, &self.status);
+        }
+    }
+
+    /// The observer of the logins `offered` added to the admission's
+    /// environment, which notes each use for the next pass
+    /// (REQ-AGENTLOGIN-42); `None` when it was offered none or the setup
+    /// is gone.
+    pub(super) fn observer(
+        &self,
+        offered: Vec<OfferedLogin>,
+    ) -> Option<Arc<dyn HarnessLoginObserver>> {
+        self.setup.upgrade()?.observer(offered)
     }
 }
 
@@ -619,7 +675,7 @@ mod tests {
     fn agent_login_setup(
         cloud: Arc<FakeAgentLoginCloud>,
         root: &Path,
-        gate: CountedGate,
+        gate: Arc<CountedGate>,
     ) -> Arc<AgentLoginSetup> {
         let (home, state) = (root.join("home"), root.join("state"));
         fs::create_dir(&home).unwrap();
@@ -628,7 +684,7 @@ mod tests {
         let (recorder, _capture) = test_recorder("rbt_01k0z6r1w8f4jy2m7q9v3x5abc");
         Arc::new(AgentLoginSetup::new(
             fake_agent_login_setup(cloud, &home, &state, recorder),
-            Arc::new(gate),
+            gate,
             || time::OffsetDateTime::from_unix_timestamp(1_794_450_000).unwrap(),
         ))
     }
@@ -644,7 +700,7 @@ mod tests {
         let context = context(Some(agent_login_setup(
             Arc::clone(&cloud),
             root.path(),
-            CountedGate::idle(),
+            Arc::new(CountedGate::idle()),
         )));
 
         let before = exchange_in(context.clone(), STATUS_REQUEST).await;
@@ -722,7 +778,7 @@ mod tests {
         let context = context(Some(agent_login_setup(
             Arc::clone(&cloud),
             root.path(),
-            CountedGate::busy(),
+            Arc::new(CountedGate::busy()),
         )));
 
         assert_eq!(
@@ -756,7 +812,7 @@ mod tests {
             FakeAgentLoginCloud::new(Ok(AgentLoginProvider::INSTALLABLE.map(authorized).to_vec()));
         // The pass finds the runner idle, asks for the Codex login and
         // installs it; an assignment starts before it asks for the next.
-        let gate = CountedGate::idle();
+        let gate = Arc::new(CountedGate::idle());
         gate.idle_calls
             .store(3, std::sync::atomic::Ordering::SeqCst);
         let context = context(Some(agent_login_setup(
@@ -784,6 +840,54 @@ mod tests {
             .find(|entry| entry.provider == AgentLoginProvider::Codex)
             .expect("the Codex entry");
         assert_eq!(codex.state, AgentLoginState::Ready);
+    }
+
+    // REQ-AGENTLOGIN-31, REQ-AGENTLOGIN-39
+    #[tokio::test]
+    async fn sync_while_an_admitted_assignment_is_held_answers_runner_busy() {
+        let root = tempfile::tempdir().unwrap();
+        let cloud = FakeAgentLoginCloud::new(fake_codex_authorized(1));
+        let gate = Arc::new(CountedGate::idle());
+        let setup = agent_login_setup(Arc::clone(&cloud), root.path(), Arc::clone(&gate));
+        let context = context(Some(Arc::clone(&setup)));
+        assert!(matches!(
+            decode_response(&exchange_in(context.clone(), SYNC_REQUEST).await).unwrap(),
+            Response::AgentLoginsSynced(_)
+        ));
+
+        // An assignment is admitted: its own pass installs generation 2 and
+        // publishes it, and the assignment is then held.
+        gate.idle_calls
+            .store(0, std::sync::atomic::Ordering::SeqCst);
+        cloud.answer(fake_codex_authorized(2));
+        let admission = AdmissionAgentLogins::new(&setup, Arc::clone(&context.status));
+        tokio::task::spawn_blocking(move || admission.set_up())
+            .await
+            .unwrap();
+        let requests = (cloud.status_requests(), cloud.deliveries());
+        assert_eq!(requests.1, 2);
+
+        assert_eq!(
+            decode_response(&exchange_in(context.clone(), SYNC_REQUEST).await).unwrap(),
+            Response::Error(ControlError::RunnerBusy)
+        );
+        assert_eq!((cloud.status_requests(), cloud.deliveries()), requests);
+        let Response::Status(status) =
+            decode_response(&exchange_in(context, STATUS_REQUEST).await).unwrap()
+        else {
+            panic!("status request did not return a snapshot");
+        };
+        let codex = status
+            .agent_logins
+            .expect("status shows what the admission's pass recorded")
+            .providers
+            .into_iter()
+            .find(|entry| entry.provider == AgentLoginProvider::Codex)
+            .expect("the Codex entry");
+        assert_eq!(
+            (codex.state, codex.generation),
+            (AgentLoginState::Ready, Some(2))
+        );
     }
 
     // REQ-RUNNERENROLL-33, REQ-RUNNERENROLL-34

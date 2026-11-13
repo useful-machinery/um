@@ -4,14 +4,24 @@ mod deauthorize;
 mod import;
 mod list;
 mod output;
+mod reconnect;
 mod revoke;
 mod show;
 
-use clap::{Args, Subcommand};
+use std::fmt;
+use std::io::{self, Write};
+use std::marker::PhantomData;
+
+use clap::error::{ContextKind, ContextValue, ErrorKind};
+use clap::{ArgAction, ArgMatches, Args, FromArgMatches, Subcommand};
 
 use crate::exit_code::ExitCode;
 use um_api::{AgentLoginApi, AgentLoginFailure};
 use um_human_auth::Deployment;
+
+// `um auth credential status` reports a failed read of the agent logins as
+// `um auth agent-login` does, and lists their ended authorizations as `show` does.
+pub(in crate::cli::auth) use output::{EndedAuthorizationView, ended_authorizations, failure};
 
 pub(super) const ABOUT: &str = "Manage your coding agent logins";
 
@@ -41,6 +51,8 @@ enum AgentLoginCommand {
     Import(import::Command),
     #[command(about = list::ABOUT)]
     List(list::Command),
+    #[command(about = reconnect::ABOUT)]
+    Reconnect(reconnect::Command),
     #[command(about = revoke::ABOUT)]
     Revoke(revoke::Command),
     #[command(about = show::ABOUT)]
@@ -84,6 +96,92 @@ fn parse_label(value: &str) -> Result<String, String> {
     }
 }
 
+/// A leaf that states what acting does before it acts, and in place of acting when `--yes` is
+/// missing: `authorize` who can use the login (REQ-AGENTLOGIN-25), `revoke` and `deauthorize`
+/// the runs that will be asked to stop (REQ-AGENTLOGIN-20, REQ-AGENTLOGIN-25).
+trait Stated: Args {
+    /// The leaf's name under `um auth agent-login`.
+    const NAME: &'static str;
+    /// The statement's lines.
+    const STATEMENT: &'static [&'static str];
+    /// What the leaf does, as the refusal's remedy names it.
+    const ACTION: &'static str;
+}
+
+/// States, on standard error under `heading`, what the leaf `C` is about to do.
+fn state<C: Stated>(heading: fmt::Arguments<'_>) -> io::Result<()> {
+    let mut stderr = io::stderr().lock();
+    writeln!(stderr, "{heading}")?;
+    for line in C::STATEMENT {
+        writeln!(stderr, "  {line}")?;
+    }
+    Ok(())
+}
+
+/// The `--yes` of a `Stated` leaf `C`, required like `ConfirmationArgs`, whose absence is
+/// refused with the leaf's statement: clap's own refusal of a missing required argument cannot
+/// carry it.
+struct Confirmation<C>(PhantomData<fn() -> C>);
+
+impl<C> fmt::Debug for Confirmation<C> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("Confirmation")
+    }
+}
+
+const YES: &str = "yes";
+
+impl<C: Stated> Args for Confirmation<C> {
+    fn augment_args(command: clap::Command) -> clap::Command {
+        command.arg(
+            clap::Arg::new(YES)
+                .long(YES)
+                .action(ArgAction::SetTrue)
+                .help("Confirm this action"),
+        )
+    }
+
+    fn augment_args_for_update(command: clap::Command) -> clap::Command {
+        Self::augment_args(command)
+    }
+}
+
+impl<C: Stated> FromArgMatches for Confirmation<C> {
+    fn from_arg_matches(matches: &ArgMatches) -> Result<Self, clap::Error> {
+        if matches.get_flag(YES) {
+            return Ok(Self(PhantomData));
+        }
+        let mut error = clap::Error::new(ErrorKind::MissingRequiredArgument);
+        error.insert(
+            ContextKind::InvalidArg,
+            ContextValue::Strings(vec![format!("--{YES}")]),
+        );
+        let remedy = format!("{}, run the command again with --{YES}", C::ACTION);
+        error.insert(
+            ContextKind::Suggested,
+            ContextValue::StyledStrs(
+                C::STATEMENT
+                    .iter()
+                    .map(|&line| line.into())
+                    .chain([remedy.into()])
+                    .collect(),
+            ),
+        );
+        let mut command = C::augment_args(clap::Command::new(C::NAME))
+            .bin_name(format!("um auth agent-login {}", C::NAME));
+        error.insert(
+            ContextKind::Usage,
+            ContextValue::StyledStr(command.render_usage()),
+        );
+        Err(error)
+    }
+
+    fn update_from_arg_matches(&mut self, matches: &ArgMatches) -> Result<(), clap::Error> {
+        *self = Self::from_arg_matches(matches)?;
+        Ok(())
+    }
+}
+
 impl Command {
     pub(super) fn execute(self) -> super::super::CommandResult {
         super::super::execute_deployment_command(
@@ -99,6 +197,7 @@ impl Command {
                 }
                 AgentLoginCommand::Import(command) => command.run(deployment),
                 AgentLoginCommand::List(command) => command.run(deployment).map_err(Into::into),
+                AgentLoginCommand::Reconnect(command) => command.run(deployment),
                 AgentLoginCommand::Revoke(command) => command.run(deployment).map_err(Into::into),
                 AgentLoginCommand::Show(command) => command.run(deployment).map_err(Into::into),
             },

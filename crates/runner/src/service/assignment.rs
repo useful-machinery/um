@@ -31,12 +31,12 @@ use um_execution::RUNNER_TERMINAL_FRAME_BYTES;
 use um_execution::{
     AdmissionFailure, AdmissionFailureKind, AdmittedWorkflow, CancellationPolicy,
     CancellationReason, CancellationSource, CaptureCancellation, CloudGitCaptureProjection,
-    ConditionCapacityBounds, EnvironmentSnapshot, ExecutionContext, MAXIMUM_CANCELLATION_GRACE,
-    MAXIMUM_ENCODED_OUTBOX_BYTES, MAXIMUM_PARALLEL_STEPS, MINIMUM_CANCELLATION_GRACE,
-    OrdinaryCancellationRequestResult, ResolvedInputs, ResolvedWorkflow, SourceRevisionProvenance,
-    ValidatedClaudeCodeInstallation, ValidatedCodexInstallation, ValidatedPiInstallation,
-    WorkflowCapacityBudget, admit_runner_workflow, default_execution_policy_limits,
-    valid_condition_capacity,
+    ConditionCapacityBounds, EnvironmentSnapshot, ExecutionContext, HarnessLoginObserver,
+    MAXIMUM_CANCELLATION_GRACE, MAXIMUM_ENCODED_OUTBOX_BYTES, MAXIMUM_PARALLEL_STEPS,
+    MINIMUM_CANCELLATION_GRACE, OrdinaryCancellationRequestResult, ResolvedInputs,
+    ResolvedWorkflow, SourceRevisionProvenance, ValidatedClaudeCodeInstallation,
+    ValidatedCodexInstallation, ValidatedPiInstallation, WorkflowCapacityBudget,
+    admit_runner_workflow, default_execution_policy_limits, valid_condition_capacity,
 };
 use um_runner_protocol::{
     AssignmentDecline, CancellationApplicationDisposition, CancellationMode, ContinuationOffer,
@@ -663,6 +663,12 @@ struct AdmissionRuntime {
     claude_code_installation: Option<ValidatedClaudeCodeInstallation>,
     codex_installation: Option<ValidatedCodexInstallation>,
     environment: EnvironmentSnapshot,
+    /// The login variables the admission's offer withheld beside
+    /// `environment` (REQ-AGENTLOGIN-41).
+    withheld_agent_logins: Vec<&'static str>,
+    /// What notes how the provider answered each use of a login the
+    /// admission's offer added (REQ-AGENTLOGIN-42).
+    harness_login_observer: Option<Arc<dyn HarnessLoginObserver>>,
     execution_version: Arc<str>,
     outbox: ObservationOutbox,
     guard_processes: bool,
@@ -742,10 +748,15 @@ impl AdmissionRuntime {
                 &root.execution,
                 git_capture,
                 &self.environment,
+                &self.withheld_agent_logins,
                 self.pi_installation.as_ref(),
                 self.claude_code_installation.as_ref(),
                 self.codex_installation.as_ref(),
             )?;
+            let context = match &self.harness_login_observer {
+                Some(observer) => context.with_harness_login_observer(Arc::clone(observer)),
+                None => context,
+            };
             let carried = &offer.execution_spec.capacity;
             let transition_budget = self.outbox.reserve(
                 usize::try_from(carried.selected_maximum_transitions)
@@ -960,6 +971,10 @@ pub(super) struct AssignmentManager {
     /// (REQ-AGENTLOGIN-27, REQ-AGENTLOGIN-34); `None` for a runner without
     /// protected state.
     agent_login_directory: Option<crate::agent_login::directory::LoginDirectory>,
+    /// The agent-login setup each admission makes for itself before it
+    /// offers the runner's logins (REQ-AGENTLOGIN-39); given once the setup
+    /// exists, and `None` for a runner without protected state.
+    agent_login_setup: Option<super::control::AdmissionAgentLogins>,
     execution_version: Arc<str>,
     lease_clock: LeaseClock,
     sleeper: Arc<dyn Sleeper>,
@@ -1460,11 +1475,16 @@ fn capacity_binding_invalid() -> AssignmentDecline {
     AssignmentDecline::ExecutionSpecInvalid(ExecutionSpecInvalidReason::WorkflowAdmissionInvalid)
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the context is built from the admission's offer and each harness installation"
+)]
 fn build_execution_context(
     execution_spec: &ExecutionSpecV1RunnerProjection,
     root: &Path,
     git_capture: Option<CloudGitCaptureProjection>,
     environment: &EnvironmentSnapshot,
+    withheld_agent_logins: &[&'static str],
     pi_installation: Option<&ValidatedPiInstallation>,
     claude_code_installation: Option<&ValidatedClaudeCodeInstallation>,
     codex_installation: Option<&ValidatedCodexInstallation>,
@@ -1509,6 +1529,7 @@ fn build_execution_context(
         environment.without_managed_runner_credentials_and_helpers(),
         CancellationPolicy::new(CancellationSource::new(), cancellation_grace),
     )
+    .with_withheld_agent_logins(withheld_agent_logins.iter().copied())
     .with_source_revision(provenance)
     .with_capacity_budget(WorkflowCapacityBudget {
         maximum_invocations: capacity.maximum_invocations,

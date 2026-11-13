@@ -7,7 +7,7 @@ use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize};
 
 use super::admission::CancellationReason;
-use super::agent::{AgentFailure, AgentFailureCause};
+use super::agent::{AGENT_LOGIN_UNAVAILABLE, AgentFailure, AgentFailureCause};
 use super::agent_input::AgentInputStartFailure;
 use super::artifact::CaptureFailureKind;
 use super::git_capture::GitCaptureFailure;
@@ -1059,6 +1059,7 @@ fn working_directory_detail(source: &WorkingDirectoryFailure) -> FailureDetail {
 pub(crate) fn agent_failure_code(cause: &AgentFailureCause) -> FailureCode {
     match cause {
         AgentFailureCause::HarnessStartFailed { .. }
+        | AgentFailureCause::AgentLoginUnavailable
         | AgentFailureCause::HarnessSetupFailed { .. }
         | AgentFailureCause::HarnessSetupRejected { .. } => FailureCode::HarnessStartFailed,
         AgentFailureCause::HarnessInputTooLarge { .. } => FailureCode::HarnessInputTooLarge,
@@ -1098,6 +1099,12 @@ fn agent_failure_detail(phase: FailurePhase, source: &AgentFailure) -> FailureDe
                 harness_input: Some(input.slug()),
                 limit_bytes: Some(admitted_bytes.get()),
                 observed_bytes: Some(*observed_bytes),
+                ..DiagnosticFacts::default()
+            }));
+        }
+        AgentFailureCause::AgentLoginUnavailable => {
+            detail.diagnostic_facts = Some(Box::new(DiagnosticFacts {
+                launch_failure: Some(AGENT_LOGIN_UNAVAILABLE),
                 ..DiagnosticFacts::default()
             }));
         }

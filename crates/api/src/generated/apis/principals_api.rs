@@ -898,7 +898,7 @@ pub fn create_service_principal(
     }
 }
 
-/// Returns one of the active human's own agent logins with its organization, provider, label, state, generation, record schema version, key version, import time and the authorizations in force (REQ-AGENTLOGIN-3). Another member's agent login, an unknown one and a malformed ID are not found. No response carries material (REQ-AGENTLOGIN-4).  Problem types: 404 `agent-login-not-found`; 503 `provider-unavailable`.
+/// Returns one of the active human's own agent logins with its organization, provider, label, state, generation, record schema version, key version, import time, the authorizations in force and, for each runner with none in force, the authorization that ended last with its removal state (REQ-AGENTLOGIN-3, REQ-AGENTLOGIN-37). Another member's agent login, an unknown one and a malformed ID are not found. No response carries material (REQ-AGENTLOGIN-4).  Problem types: 404 `agent-login-not-found`; 503 `provider-unavailable`.
 pub fn get_agent_login(
     configuration: &configuration::Configuration,
     agent_login_id: &str,
@@ -1308,7 +1308,7 @@ pub fn link_current_principal_identity(
     }
 }
 
-/// Returns one page of the active human's own agent logins, oldest first by creation time and opaque agent login ID, each with its organization, provider, label, state, generation, record schema version, key version, import time and the authorizations in force (REQ-AGENTLOGIN-3). Another member's agent logins are never listed, and no response carries material (REQ-AGENTLOGIN-4). The cursor is opaque and may be used only with this operation. A deployment configured without the agent-login key answers `provider-unavailable` (REQ-AGENTLOGIN-5).  Problem types: 503 `provider-unavailable`.
+/// Returns one page of the active human's own agent logins, oldest first by creation time and opaque agent login ID, each with its organization, provider, label, state, generation, record schema version, key version, import time, the authorizations in force and, for each runner with none in force, the authorization that ended last with its removal state (REQ-AGENTLOGIN-3, REQ-AGENTLOGIN-37). Another member's agent logins are never listed, and no response carries material (REQ-AGENTLOGIN-4). The cursor is opaque and may be used only with this operation. A deployment configured without the agent-login key answers `provider-unavailable` (REQ-AGENTLOGIN-5).  Problem types: 503 `provider-unavailable`.
 pub fn list_agent_logins(
     configuration: &configuration::Configuration,
     limit: Option<i32>,

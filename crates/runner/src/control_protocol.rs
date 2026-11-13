@@ -2,6 +2,7 @@ use std::collections::BTreeSet;
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
+use um_support::{Availability, CredentialStatus, NextAction};
 
 pub(crate) const REQUEST_LIMIT: usize = 4_096;
 pub(crate) const RESPONSE_LIMIT: usize = 65_536;
@@ -177,6 +178,13 @@ impl AgentLoginState {
         )
     }
 
+    /// Whether an entry written before selection was recorded reads as
+    /// selected: exactly when its state is one only an authorized login has
+    /// (REQ-AGENTLOGIN-28).
+    pub const fn selected_by_state(self) -> bool {
+        matches!(self, Self::Ready) || self.fails_readiness()
+    }
+
     /// The state's name on the wire.
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -193,8 +201,22 @@ impl AgentLoginState {
     }
 }
 
+/// How the provider answered the last use of an installed login
+/// (REQ-AGENTLOGIN-42).
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentLoginUse {
+    /// An agent step that received the login's variable finished
+    /// successfully.
+    Accepted,
+    /// An agent step that received the login's variable failed with the
+    /// harness error `unauthorized`.
+    Refused,
+}
+
 /// One provider's readiness as the control socket returns it: the readiness
-/// document's entry without the path of the install (REQ-RUNNERENROLL-63).
+/// document's entry without the path of the install (REQ-RUNNERENROLL-63)
+/// or the time of its last use.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct ProviderReadiness {
@@ -208,6 +230,87 @@ pub struct ProviderReadiness {
     pub checked_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub installed_at: Option<String>,
+    /// Whether the provider is selected (REQ-AGENTLOGIN-41); absent where
+    /// the document records none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected: Option<bool>,
+    /// How the provider answered the last use of the login installed
+    /// (REQ-AGENTLOGIN-42); only ever beside an install.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_use: Option<AgentLoginUse>,
+}
+
+impl ProviderReadiness {
+    /// Whether the provider is selected; an entry that records no selection
+    /// is selected by its state (REQ-AGENTLOGIN-28).
+    pub const fn is_selected(&self) -> bool {
+        match self.selected {
+            Some(selected) => selected,
+            None => self.state.selected_by_state(),
+        }
+    }
+
+    /// The provider's availability and next action on the runner
+    /// (REQ-AGENTLOGIN-43).
+    pub const fn credential_status(&self) -> CredentialStatus {
+        let (availability, next_action) = match self.state {
+            AgentLoginState::Ready => match self.last_use {
+                Some(AgentLoginUse::Accepted) => (Availability::Available, NextAction::None),
+                None => (Availability::Unverified, NextAction::None),
+                Some(AgentLoginUse::Refused) => {
+                    (Availability::ReconnectRequired, NextAction::Reconnect)
+                }
+            },
+            AgentLoginState::InstallFailed
+            | AgentLoginState::StaleGeneration
+            | AgentLoginState::CloudUnavailable => {
+                (Availability::DeliveryFailed, NextAction::SyncRunner)
+            }
+            AgentLoginState::UnsupportedTarget => {
+                (Availability::DeliveryFailed, NextAction::CheckTarget)
+            }
+            AgentLoginState::NotAuthorized if self.is_selected() => (
+                Availability::InsufficientPermission,
+                NextAction::RestoreMembership,
+            ),
+            AgentLoginState::NotAuthorized | AgentLoginState::Revoked => {
+                (Availability::NotConnected, NextAction::None)
+            }
+            AgentLoginState::ForeignLogin => {
+                (Availability::NotDelivered, NextAction::ResolveServiceLogin)
+            }
+            AgentLoginState::NotDelivered => (Availability::NotDelivered, NextAction::None),
+        };
+        CredentialStatus {
+            availability,
+            next_action,
+        }
+    }
+
+    /// The failure code of a provider Cloud authorized for the runner whose
+    /// login is not ready to use (REQ-AGENTLOGIN-31, REQ-RUNNERENROLL-86):
+    /// its state when that fails readiness, or when it is `not_authorized`
+    /// on a selected provider, whose login every admission withholds
+    /// (REQ-AGENTLOGIN-41); `reconnect_required` for a `ready` login refused
+    /// at its last use; and `None` otherwise.
+    pub const fn failure_code(&self) -> Option<&'static str> {
+        if self.state.fails_readiness()
+            || (matches!(self.state, AgentLoginState::NotAuthorized) && self.is_selected())
+        {
+            Some(self.state.as_str())
+        } else if matches!(self.state, AgentLoginState::Ready)
+            && matches!(self.last_use, Some(AgentLoginUse::Refused))
+        {
+            Some("reconnect_required")
+        } else {
+            None
+        }
+    }
+
+    /// Whether the provider fails readiness: it has a failure code.
+    pub const fn fails_readiness(&self) -> bool {
+        self.failure_code().is_some()
+    }
 }
 
 /// The readiness the runner last recorded for each provider.
@@ -433,7 +536,9 @@ fn valid_provider_readiness(entry: &ProviderReadiness) -> bool {
             && entry.agent_login_id.is_none()
             && entry.generation.is_none()
             && entry.checked_at.is_none()
-            && entry.installed_at.is_none();
+            && entry.installed_at.is_none()
+            && entry.selected.is_none()
+            && entry.last_use.is_none();
     }
     entry
         .agent_login_id
@@ -442,6 +547,7 @@ fn valid_provider_readiness(entry: &ProviderReadiness) -> bool {
         && entry.generation.is_none_or(|generation| generation >= 1)
         && entry.generation.is_some() == entry.installed_at.is_some()
         && (entry.generation.is_none() || entry.agent_login_id.is_some())
+        && (entry.last_use.is_none() || entry.generation.is_some())
         && entry.checked_at.as_deref().is_none_or(valid_timestamp)
         && entry.installed_at.as_deref().is_none_or(valid_timestamp)
 }
@@ -533,6 +639,8 @@ mod tests {
             generation: None,
             checked_at: None,
             installed_at: None,
+            selected: None,
+            last_use: None,
         };
         AgentLoginReadiness {
             updated_at: "2026-11-12T01:00:00Z".to_owned(),
@@ -544,6 +652,8 @@ mod tests {
                     generation: Some(3),
                     checked_at: Some("2026-11-12T01:00:00Z".to_owned()),
                     installed_at: Some("2026-11-12T00:55:00Z".to_owned()),
+                    selected: None,
+                    last_use: None,
                 },
                 brokered(AgentLoginProvider::Github),
                 brokered(AgentLoginProvider::Gitlab),
@@ -611,11 +721,23 @@ mod tests {
         duplicate.providers.push(duplicate.providers[1].clone());
         let mut generation_without_install = readiness();
         generation_without_install.providers[0].installed_at = None;
+        let mut brokered_selected = readiness();
+        brokered_selected.providers[1].selected = Some(false);
+        let mut last_use_without_install = readiness();
+        last_use_without_install.providers[0] = ProviderReadiness {
+            state: AgentLoginState::NotAuthorized,
+            generation: None,
+            installed_at: None,
+            last_use: Some(AgentLoginUse::Refused),
+            ..last_use_without_install.providers[0].clone()
+        };
         for invalid in [
             brokered_ready,
             codex_not_delivered,
             duplicate,
             generation_without_install,
+            brokered_selected,
+            last_use_without_install,
         ] {
             let encoded = encode_response(&Response::AgentLoginsSynced(invalid)).unwrap();
             assert_eq!(decode_response(&encoded), Err(ProtocolFailure::Invalid));
@@ -637,6 +759,146 @@ mod tests {
             (AgentLoginState::InstallFailed, true),
         ] {
             assert_eq!(state.fails_readiness(), fails, "{state:?}");
+        }
+    }
+
+    // REQ-AGENTLOGIN-43
+    #[test]
+    fn each_readiness_maps_to_one_availability_and_next_action() {
+        use AgentLoginState as S;
+        use um_support::{Availability as A, NextAction as N};
+        let accepted = Some(AgentLoginUse::Accepted);
+        let refused = Some(AgentLoginUse::Refused);
+        for (state, selected, last_use, availability, next_action) in [
+            (S::Ready, Some(true), accepted, A::Available, N::None),
+            (S::Ready, Some(true), None, A::Unverified, N::None),
+            (
+                S::Ready,
+                Some(true),
+                refused,
+                A::ReconnectRequired,
+                N::Reconnect,
+            ),
+            (
+                S::InstallFailed,
+                Some(true),
+                None,
+                A::DeliveryFailed,
+                N::SyncRunner,
+            ),
+            (
+                S::StaleGeneration,
+                Some(true),
+                None,
+                A::DeliveryFailed,
+                N::SyncRunner,
+            ),
+            (
+                S::CloudUnavailable,
+                Some(true),
+                None,
+                A::DeliveryFailed,
+                N::SyncRunner,
+            ),
+            (
+                S::UnsupportedTarget,
+                Some(true),
+                None,
+                A::DeliveryFailed,
+                N::CheckTarget,
+            ),
+            (
+                S::NotAuthorized,
+                Some(true),
+                None,
+                A::InsufficientPermission,
+                N::RestoreMembership,
+            ),
+            (
+                S::NotAuthorized,
+                Some(false),
+                None,
+                A::NotConnected,
+                N::None,
+            ),
+            // An entry written before selection was recorded is selected
+            // by its state (REQ-AGENTLOGIN-28): `not_authorized` is not.
+            (S::NotAuthorized, None, None, A::NotConnected, N::None),
+            (S::Revoked, Some(false), None, A::NotConnected, N::None),
+            (
+                S::ForeignLogin,
+                Some(true),
+                None,
+                A::NotDelivered,
+                N::ResolveServiceLogin,
+            ),
+            (S::NotDelivered, None, None, A::NotDelivered, N::None),
+        ] {
+            let entry = ProviderReadiness {
+                provider: AgentLoginProvider::Codex,
+                state,
+                agent_login_id: None,
+                generation: None,
+                checked_at: None,
+                installed_at: None,
+                selected,
+                last_use,
+            };
+            assert_eq!(
+                entry.credential_status(),
+                um_support::CredentialStatus {
+                    availability,
+                    next_action,
+                },
+                "{state:?} {selected:?} {last_use:?}"
+            );
+            // The mapping keeps every next action an availability fixes.
+            assert!(
+                availability
+                    .fixed_next_action()
+                    .is_none_or(|fixed| fixed == next_action),
+                "{availability:?}"
+            );
+        }
+    }
+
+    // REQ-AGENTLOGIN-31, REQ-RUNNERENROLL-86
+    #[test]
+    fn a_ready_login_refused_at_its_last_use_fails_readiness() {
+        let mut entry = readiness().providers[0].clone();
+        for (last_use, code) in [
+            (None, None),
+            (Some(AgentLoginUse::Accepted), None),
+            (Some(AgentLoginUse::Refused), Some("reconnect_required")),
+        ] {
+            entry.last_use = last_use;
+            assert_eq!(entry.failure_code(), code, "{last_use:?}");
+            assert_eq!(entry.fails_readiness(), code.is_some(), "{last_use:?}");
+        }
+        entry.state = AgentLoginState::InstallFailed;
+        assert_eq!(entry.failure_code(), Some("install_failed"));
+    }
+
+    // REQ-AGENTLOGIN-31, REQ-RUNNERENROLL-86, REQ-AGENTLOGIN-41
+    #[test]
+    fn a_selected_provider_cloud_refuses_fails_readiness() {
+        // Cloud names an authorization in force and refuses its owner: the
+        // login is withheld from every assignment, so the provider is not
+        // ready. One nobody authorized, recorded as not selected or before
+        // selection was recorded, is not a failure.
+        let mut entry = readiness().providers[0].clone();
+        entry.state = AgentLoginState::NotAuthorized;
+        entry.generation = None;
+        entry.installed_at = None;
+        entry.last_use = None;
+        for (selected, code) in [
+            (Some(true), Some("not_authorized")),
+            (Some(false), None),
+            (None, None),
+        ] {
+            entry.selected = selected;
+            assert_eq!(entry.failure_code(), code, "{selected:?}");
+            assert_eq!(entry.fails_readiness(), code.is_some(), "{selected:?}");
         }
     }
 
@@ -665,6 +927,19 @@ mod tests {
             value["status"]["agentLogins"]["providers"][0]["generation"],
             3
         );
+
+        // Selection and last use travel beside the state where the
+        // document records them (REQ-AGENTLOGIN-43).
+        let mut with_last_use = readiness();
+        with_last_use.providers[0].selected = Some(true);
+        with_last_use.providers[0].last_use = Some(AgentLoginUse::Refused);
+        let response = Response::AgentLoginsSynced(with_last_use);
+        let encoded = encode_response(&response).unwrap();
+        assert_eq!(decode_response(&encoded), Ok(response));
+        let value: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+        assert!(control_validator().is_valid(&value), "{value}");
+        assert_eq!(value["agentLogins"]["providers"][0]["selected"], true);
+        assert_eq!(value["agentLogins"]["providers"][0]["lastUse"], "refused");
     }
 
     // REQ-RUNNERENROLL-82

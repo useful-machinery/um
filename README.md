@@ -887,8 +887,9 @@ tenant, not yet qualified against the production connection. These labels do not
 enable a provider or link accounts by email.
 
 Agent logins are the sign-ins of the coding agents (Codex and Claude Code) a member keeps in
-Useful Machinery for an organization's runners. Import, read, authorize and revoke your own
-under `auth agent-login`; the commands use the signed-in human session only:
+Useful Machinery for an organization's runners. Import, reconnect, read, authorize and revoke
+your own under `auth agent-login`, and see them beside your provider grants with
+`auth credential status`; the commands use the signed-in human session only:
 
 ```sh
 # Import a Codex login for the organization from an auth.json you own with mode 0600 (or -
@@ -904,12 +905,20 @@ um auth agent-login import acme codex --login --label "build runner"
 # mode 0600 (or - for standard input).
 um auth agent-login import acme claude_code --token-file ./claude-token
 
-# Store a newer sign-in as the next generation of an existing agent login.
+# Reconnect an agent login: store a newer sign-in as its next generation. It reads the agent
+# login for its provider and organization, then takes --login or --from-file for codex and
+# --token-file for claude_code exactly as import does. It keeps its ID and authorizations, and
+# each runner authorized for it installs the new generation at its next setup.
+um auth agent-login reconnect agl_01k0z6r1w8f4jy2m7q9v3x5abc --login
+
+# The same, naming the provider and organization as import takes them.
 um auth agent-login import acme codex --from-file ./auth.json \
   --agent-login agl_01k0z6r1w8f4jy2m7q9v3x5abc
 
 # List one page of your agent logins with their authorized runners, what each runner was
-# last delivered and what it last reported. Continue with --cursor when a next cursor is shown.
+# last delivered and what it last reported, with each authorization's availability and next
+# action, and, for each runner whose authorization ended, whether it has confirmed removing
+# its copy. Continue with --cursor when a next cursor is shown.
 um auth agent-login list --limit 50
 
 # Show one agent login by the agl_ ID that list prints.
@@ -922,24 +931,66 @@ um auth agent-login show agl_01k0z6r1w8f4jy2m7q9v3x5abc
 um auth agent-login authorize agl_01k0z6r1w8f4jy2m7q9v3x5abc \
   --runner rnr_01k0z6r1w8f4jy2m7q9v3x5abc --yes
 
-# End that runner's authorization.
+# End that runner's authorization. Cloud also asks the run that runner is serving, whichever
+# member started it, to stop gracefully; the command says so first and does nothing without
+# --yes. It prints whether that runner has confirmed removing its copy yet, and the run asked
+# to stop with the cancellation request, if any.
 um auth agent-login deauthorize agl_01k0z6r1w8f4jy2m7q9v3x5abc \
   --runner rnr_01k0z6r1w8f4jy2m7q9v3x5abc --yes
 
-# Revoke it. Cloud erases the login and ends its authorizations; the session at the
-# provider stays signed in until you sign out there.
+# Revoke it. Cloud erases the login, ends its authorizations and asks the run each of those
+# runners is serving to stop, which the command says first. It prints each runner it was
+# authorized for with its removal state, `pending` until that runner confirms removing the
+# copy it kept, then `confirmed`, or `not_delivered`, and the run asked to stop there. A
+# confirmation covers only that copy, and the session at the provider stays signed in until
+# you sign out there.
 um auth agent-login revoke agl_01k0z6r1w8f4jy2m7q9v3x5abc --yes
+
+# Wait for a run asked to stop to settle.
+um run cancel acme run_01k0z6r1w8f4jy2m7q9v3x5abc --wait
+
+# See whether each credential a workflow can use as you can be used now: every provider grant,
+# each agent login once per runner it is authorized for (or once when it is authorized for
+# none), and each provider you have nothing for, then the ended authorizations. Add
+# --organization to keep only one organization's agent logins.
+um auth credential status
+um auth credential status --organization acme --json
 ```
 
+Every authorization in force that `list` and `show` print, and every row `credential status`
+prints, carries one `availability` (`available`, `unverified`, `reconnect_required`,
+`pending`, `delivery_failed`, `insufficient_permission`, `not_delivered` or `not_connected`)
+and one `nextAction`, and the text form names the command or step that next action means:
+`um auth agent-login reconnect AGENT_LOGIN` or `um auth grant create PROVIDER` to reconnect,
+`um auth agent-login authorize` for an agent login no runner is authorized for,
+`um runner agent-login sync --config PATH` on the runner's host after a failed delivery, and
+`um auth agent-login import` or `um auth grant create` for a provider you have nothing for. A
+runner that has not yet reported installing what Cloud holds is `pending` with
+`wait_for_runner`, and a login in place that no step has used yet at this generation is
+`unverified`. `credential status --json` prints one schema-version-1 document with outcome
+`reported`, `credentials` (each with `provider`, `kind` as `grant`, `agent_login` or `none`,
+`availability`, `nextAction` and the identifiers it has: a grant's `id` and `identityId`, an
+agent login's `id`, `label`, `organizationId`, `generation` and the authorization's
+`runnerId`) and `endedAuthorizations` (each with `agentLoginId`, `provider`, `runnerId`,
+`endedAt`, `removal` and `stop`). It reads both lists to their last page, exits 0 whatever it
+reports, and reports a failed read as `um auth grant list` or `um auth agent-login list`
+would.
+
 Each command prints the agent login without its material, and `--json` prints one
-schema-version-1 document (`listed` with `items` and `nextCursor`, `shown` or `imported`
-with `agentLogin`, `authorized` with `agentLoginId` and `authorization`, `deauthorized`
-with `agentLoginId`, `authorizationId` and `runnerId`, or `revoked` with `agentLoginId`). An unsafe or malformed source exits 2
+schema-version-1 document (`listed` with `items` and `nextCursor`, `shown`, `imported` or
+`reconnected` with `agentLogin`, `authorized` with `agentLoginId` and `authorization`, `deauthorized`
+with `agentLoginId`, `authorizationId`, `runnerId`, `removal` and `stop`, or `revoked` with
+`agentLoginId` and `endedAuthorizations`, each with its `removal` and `stop`). `stop` names
+the `runId` asked to stop, the `cancellationRequestId` and `requestedAt`, and is absent where
+no run was asked to stop. `removal`, `stop` and `endedAuthorizations` come from a read of the
+agent login after the change and are absent when that read fails, which does not fail the
+command. A revocation that fails after Cloud made it durable, for example while asking runs
+to stop, is completed by running `revoke` again. An unsafe or malformed source exits 2
 before anything is sent; a `--login` sign-in that fails, is interrupted or writes no login
 reports `provider_login_failed`, exits 1 and sends nothing. A refusal names one outcome, such as `agent_login_not_found`,
 `material_invalid`, `runner_holds_login` or `authorization_not_found`, and exits 1. Import,
-authorization, deauthorization and revocation each send one request key and replay it once
-when the response is lost.
+reconnection, authorization, deauthorization and revocation each send one request key and
+replay it once when the response is lost.
 
 One successful login establishes a renewable human session. The CLI stores the one-hour
 access token, its expiration, and a rotating refresh token in
@@ -2188,8 +2239,12 @@ with code `ok`, and the command exits 0 when every selected check passes.
 The opt-in `credentials.agent-logins` check reads the readiness document
 `um runner serve` records beside `runnerStatePath`, found through `--config PATH`; no
 other check reads the configuration. It passes when every agent login Cloud authorized
-for the runner is `ready`, or Cloud authorized none (`not_authorized` or `revoked`), and
-otherwise fails with that provider's state as its code, such as `foreign_login`. It fails
+for the runner is `ready` and was not refused at its last use, or Cloud authorized none
+(`revoked`, or `not_authorized` with no authorization in force), and otherwise fails with that
+provider's state as its code, such as `foreign_login`, `not_authorized` for a login whose
+authorization stands while Cloud refuses its owner, or `reconnect_required` for a `ready`
+login the provider refused at its last use. Its details name each provider's availability and next action as
+`<provider>_availability` and `<provider>_next_action`. It fails
 `readiness_unknown` when the runner has recorded no readiness yet, `config_invalid` for a
 configuration it cannot load, and `config_required` without `--config`. It takes no lock,
 never reads the runner credential, contacts nothing, and reports no login material.
@@ -2302,7 +2357,11 @@ grace or revoke it immediately if compromise is suspected. Never print an activa
 artifact or runner state while transferring or verifying it.
 
 Runner Serve installs the agent logins members have authorized for the runner when it
-starts and every five minutes while it holds no assignment. It keeps them in its own
+starts, every five minutes while it holds no assignment, and for each assignment it admits
+before offering it any, so an assignment admitted after a reconnect gets the new generation
+and one admitted after a revocation gets nothing of it, while an assignment already running
+keeps what it was offered. It removes a login once Cloud no longer authorizes it, a Codex
+login with the runner's whole Codex home. It keeps the logins in its own
 `.runner-agent-login/` directory beside `runnerStatePath`, never in the service's `~/.codex`
 or Claude Code configuration, and offers them to each assignment as `CODEX_HOME` and
 `CLAUDE_CODE_OAUTH_TOKEN`: a workflow's steps use a delivered login only when the workflow's
@@ -2318,9 +2377,14 @@ um runner agent-login sync --config /etc/um/runner.json --json
 ```
 
 The command goes only through the local control socket and prints one line per provider
-(`codex login:       ready (generation 3)`), or with `--json` a schema-version-1 `synced`
-document with `agentLogins`. It exits 1 when a provider authorized for the runner is not
-`ready`, and 4 when Runner Serve is not reachable or holds an assignment (`runner_busy`). A
+with its state, its availability and, when there is something to do, its next action and
+the step it names (`codex login:       ready (generation 3), availability unverified`), or
+with `--json` a schema-version-1 `synced` document with `agentLogins`, each provider carrying
+`availability` and `nextAction`. A login is `unverified` until a step succeeds with it,
+`available` after, and `reconnect_required` once the provider refused it; only the agent
+login's owner can reconnect it. It exits 1 when a provider authorized for the runner is not
+`ready`, one Cloud refuses the owner of (`insufficient_permission`) included, or its login was
+refused at its last use, and 4 when Runner Serve is not reachable or holds an assignment (`runner_busy`). A
 Runner Serve process started from an older `um` refuses the request; restart it on this
 release.
 

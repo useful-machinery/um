@@ -4,6 +4,7 @@ use anyhow::Context;
 use serde::Serialize;
 
 use super::super::super::ApiFailureReport;
+use super::super::credentials::projection::grant_provider;
 use crate::exit_code::{ExitCode, OutcomeClass};
 use um_api::{
     Grant, GrantFailure, GrantList, GrantSession, GrantSessionReason, GrantSessionStatus,
@@ -33,15 +34,10 @@ pub(super) struct GrantView<'a> {
 
 impl<'a> GrantView<'a> {
     pub(super) fn new(grant: &'a Grant) -> Self {
-        use um_api::provider_grant::Provider;
         Self {
             id: &grant.id,
             identity_id: &grant.identity_id,
-            provider: match grant.provider {
-                Provider::ProviderGrantProviderGithub => "github",
-                Provider::ProviderGrantProviderGitlabCom => "gitlab.com",
-                Provider::ProviderGrantProviderLinear => "linear",
-            },
+            provider: grant_provider(grant),
             scopes: &grant.scopes,
             state: match grant.state {
                 GrantState::ProviderGrantStateActive => "active",
@@ -262,7 +258,7 @@ fn report(deployment: &str, failure: &GrantFailure) -> ApiFailureReport {
 }
 
 /// Reports a grant operation's failure with the remedy a member can act on.
-pub(super) fn failure(
+pub(in crate::cli::auth) fn failure(
     deployment: &str,
     failure: &GrantFailure,
     json: bool,

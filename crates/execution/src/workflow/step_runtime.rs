@@ -20,10 +20,10 @@ use super::admission::{
 };
 use super::agent::dispatch::AgentInvocationDispatcher;
 use super::agent::{
-    AgentFailure, AgentFailureCause, AgentInvocation, AgentInvocationIdentity,
-    AgentObservationEnvelope, AgentObservationSink, AgentOutcome, AgentProcessControl,
-    AgentStartReceiveError, CompletedAgentInvocation, WorkflowRunId, agent_start_channel,
-    failed_agent_outcome,
+    AGENT_LOGIN_UNAVAILABLE, AgentFailure, AgentFailureCause, AgentInvocation,
+    AgentInvocationIdentity, AgentObservationEnvelope, AgentObservationSink, AgentOutcome,
+    AgentProcessControl, AgentStartReceiveError, CompletedAgentInvocation, WorkflowRunId,
+    agent_start_channel, failed_agent_outcome,
 };
 use super::agent_diagnostics::AgentDiagnosticSessionStore;
 use super::agent_input::{
@@ -1283,6 +1283,19 @@ where
                 else {
                     return Err(RecoveryHandlerFailure::AgentInputFailed);
                 };
+                // INV-ENGINE-35: a handler that would have received a withheld login never
+                // runs on the service's own. The closed code is every input failure's, so
+                // the step's diagnostics name what refused this one.
+                if self.admitted.withholds_recovery_handler_login(step) {
+                    self.diagnostics.record_adapter_error(
+                        step.to_owned(),
+                        action,
+                        self.admitted.execution().limits().maximum_step_log_bytes(),
+                        "recovery handler start",
+                        &AGENT_LOGIN_UNAVAILABLE,
+                    );
+                    return Err(RecoveryHandlerFailure::AgentInputFailed);
+                }
                 let identity = AgentInvocationIdentity::new(run.clone(), Arc::from(step), action);
                 let agent = materialize_recovery_agent_invocation(
                     &self.admitted,
@@ -1566,6 +1579,7 @@ where
             }
             RecordLaunch::Gone => return Ok(()),
         }
+        let login_variable = agent.login_variable();
         let (invocation, staging) = agent.into_parts();
         let (started_callback, started) = agent_start_channel();
         let dispatcher = match &self.agents {
@@ -1631,6 +1645,7 @@ where
             }
             AgentLifecycleBoundary::Terminal(outcome) => (false, outcome),
         };
+        self.observe_harness_login(login_variable, &outcome);
         if matches!(outcome, AgentOutcome::Cancelled { .. })
             && self
                 .admitted
@@ -1680,6 +1695,19 @@ where
         }
         self.settle_recovery_completion(step, round, action, decision)
             .await
+    }
+
+    /// Tells the execution context's harness-login observer how the harness of a settled
+    /// agent invocation answered the login variable its environment carried: once per
+    /// invocation, by name only, and never for an outcome that says nothing of the login
+    /// (INV-ENGINE-36).
+    fn observe_harness_login(&self, login_variable: Option<&'static str>, outcome: &AgentOutcome) {
+        let Some(observer) = self.admitted.execution().harness_login_observer() else {
+            return;
+        };
+        if let (Some(variable), Some(answer)) = (login_variable, outcome.harness_login_outcome()) {
+            observer.observe(variable, answer);
+        }
     }
 
     async fn report_recovery_handler_started(
@@ -1891,6 +1919,7 @@ where
         }
 
         let PreparedAgent { materialized } = agent;
+        let login_variable = materialized.login_variable();
         let output = materialized
             .invocation()
             .value_mode()
@@ -1958,6 +1987,7 @@ where
             }
             AgentLifecycleBoundary::Terminal(outcome) => (false, outcome),
         };
+        self.observe_harness_login(login_variable, &outcome);
 
         if matches!(outcome, AgentOutcome::Cancelled { .. }) {
             drop(staging);
@@ -2587,6 +2617,11 @@ where
                 else {
                     return Err(StepStartFailure::AgentRuntimeUnavailable);
                 };
+                if self.admitted.withholds_agent_login(step) {
+                    return Err(StepStartFailure::Agent(
+                        AgentFailureCause::AgentLoginUnavailable.into(),
+                    ));
+                }
                 let upstream = resolve_agent_upstream_outputs(agent, action_inputs)?;
                 let finalization_context = action_inputs.values().find_map(|input| match input {
                     ActionInput::FinalizationContext(bytes) => Some(bytes.as_ref()),

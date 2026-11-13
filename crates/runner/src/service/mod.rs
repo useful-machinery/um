@@ -48,7 +48,8 @@ use connection::{
     record_progress,
 };
 use control::{
-    ControlContext, ControlServer, ControlServerError, ControlTimeouts, LiveStatus, ReloadRequest,
+    AdmissionAgentLogins, ControlContext, ControlServer, ControlServerError, ControlTimeouts,
+    LiveStatus, ReloadRequest,
 };
 use lease_clock::{LeaseClock, LeaseClockError};
 use um_execution::MAXIMUM_CANCELLATION_GRACE;
@@ -221,9 +222,10 @@ struct ReloadDependencies {
     live_status: Arc<LiveStatus>,
 }
 
-/// The assignment manager as agent-login setup sees it: idle when it holds
-/// no assignment in any state, and kept idle by its lock while setup installs
-/// or removes a login (INV-RUNNER-15).
+/// The assignment manager as the periodic and `sync` agent-login passes see
+/// it: idle when it holds no assignment in any state, and kept idle by its
+/// lock while setup installs or removes a login (INV-RUNNER-15). An
+/// admission's own pass does not consult it (REQ-AGENTLOGIN-39).
 struct IdleAssignmentGate {
     assignment_manager: Arc<Mutex<AssignmentManager>>,
     // Setup runs on a thread of its own, and reading the manager's state may
@@ -660,6 +662,14 @@ async fn run_connection_loop_with_work_root(
             move || clock.utc_now(),
         ))
     });
+    // Each admission sets agent logins up for itself before it offers them
+    // (REQ-AGENTLOGIN-39).
+    if let Some(setup) = &agent_login_setup {
+        assignment_manager
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .set_up_agent_logins_with(AdmissionAgentLogins::new(setup, Arc::clone(&live_status)));
+    }
     let (reload_sender, mut reload_requests) = tokio::sync::mpsc::channel::<ReloadRequest>(1);
     let _control_server = config
         .control_socket_path()
@@ -4802,6 +4812,8 @@ mod tests {
             // own: replaced by a delivery, and removed when the login ends.
             cloud.answer(Ok(Vec::new()));
             service.next_pass().await;
+            // The ending removed the whole Codex home (REQ-AGENTLOGIN-30).
+            fs::create_dir_all(service.auth_path().parent().unwrap()).unwrap();
             fs::write(service.auth_path(), b"{\"unrecorded\":true}").unwrap();
             cloud.answer(fake_codex_authorized(5));
             service.next_pass().await;
