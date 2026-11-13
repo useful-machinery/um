@@ -2268,8 +2268,13 @@ store and out of version control, logs and transcripts.
 A runner that joined with a key is removed automatically once it has been offline for the
 key's removal time, counted from when Cloud last saw it, or from its join if it never
 connected, and holds no reserved or unfinished work; its runs and records are kept. A
-runner registered with an activation is never removed this way, and revoking or expiring a
-key removes no runner. `um runner show` names the key a runner joined with.
+disabled runner is not removed, and re-enabling, renaming or moving a runner starts its
+offline time again. A runner registered with an activation is never removed this way, and
+revoking or expiring a key removes no runner. `um runner show` names the key a runner
+joined with. A workspace a runner kept for a failed run does not keep the runner: once a
+runner is removed or deleted, the runs whose workspaces it kept can no longer be continued
+with `um run continue`. Choose `--remove-after` to cover the longest outage after which
+failed runs should still be continuable on the key's runners.
 
 ## Runner doctor
 
