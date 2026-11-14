@@ -1214,7 +1214,9 @@ fn finish_cloud_observation<R, S>(
 /// REQ-CONTINUE-87); Cloud's own problem prose is never relayed.
 const PATH_RUN_RETIRED_GUIDANCE: &str = "Cloud no longer retries or continues a run created by workflow path; publish the workflow as a definition (`um workflow definition publish --cloud`) and start a run of it.";
 
-fn failure_code(
+/// The diagnostic code and exit status a run command reports `failure` under; the `--cloud`
+/// leaves of `um workflow run` take theirs from it too (INV-CLI-17).
+pub(in crate::cli) fn failure_code(
     failure: &RunFailure,
     _authentication: super::PrincipalAuthenticationKind,
 ) -> (&'static str, ExitCode) {

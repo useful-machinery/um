@@ -3,10 +3,12 @@
 //! definition cloud` group (REQ-CLOUDDEF-15).
 //!
 //! As for the other resource clients, requests go through the generated configuration and
-//! models with a hand-written client: the generated one drops error headers and tolerates
-//! unknown members, so every response is decoded closed, a keyed mutation must echo its
-//! `Idempotency-Key`, and a refusal keeps its problem type's slug and the `workflow` safe
-//! facts for the caller to report.
+//! models with a hand-written client: the generated one drops error headers, so here a keyed
+//! mutation must echo its `Idempotency-Key` and a refusal keeps its problem type's slug and
+//! the `workflow` safe facts for the caller to report. A definition, revision, evaluation or
+//! publication answer is decoded into its generated model, which ignores a member this
+//! release does not know, and then checked against the request (REQ-CLOUDDEF-23); the tree
+//! upload and seal answers are decoded closed.
 use std::collections::HashMap;
 use std::fmt;
 use std::time::Duration;
@@ -190,7 +192,7 @@ impl<'a> WorkflowDefinitionApi<'a> {
         let request = super::generated_api_request(&self.configuration, Method::POST, &endpoint)
             .json(&manifest);
         let issued: models::WorkflowTreeUploadCapabilities =
-            receive(request, StatusCode::OK, None)?;
+            receive_closed(request, StatusCode::OK, None)?;
         if issued.tree.digest != digest {
             return Err(invalid());
         }
@@ -208,7 +210,7 @@ impl<'a> WorkflowDefinitionApi<'a> {
         }
         let endpoint = self.endpoint(organization, &["workflow-trees", digest, "seal"]);
         let request = mutation_request(&self.configuration, Method::POST, &endpoint, key);
-        let sealed: WorkflowTree = receive(request, StatusCode::OK, Some(key))?;
+        let sealed: WorkflowTree = receive_closed(request, StatusCode::OK, Some(key))?;
         if sealed.digest != digest || sealed.state != models::workflow_tree::State::Sealed {
             return Err(invalid());
         }
@@ -609,9 +611,9 @@ impl Drop for WorkflowDefinitionApi<'_> {
     }
 }
 
-/// The closed JSON body of an `expected` response, its key confirmed when `key` is given;
-/// any other status is classified.
-fn receive<T: serde::de::DeserializeOwned + serde::Serialize>(
+/// The JSON body of an `expected` response, its key confirmed when `key` is given; any other
+/// status is classified. The body is read open, as [`receive_one_of`] reads it.
+fn receive<T: serde::de::DeserializeOwned>(
     request: reqwest::blocking::RequestBuilder,
     expected: StatusCode,
     key: Option<&str>,
@@ -619,13 +621,40 @@ fn receive<T: serde::de::DeserializeOwned + serde::Serialize>(
     receive_one_of(request, &[expected], key).map(|(_, body)| body)
 }
 
-/// The status and closed JSON body of a response whose status is one of `accepted`, its key
-/// confirmed when `key` is given; any other status is classified.
-fn receive_one_of<T: serde::de::DeserializeOwned + serde::Serialize>(
+/// The status and JSON body of a response whose status is one of `accepted`, its key
+/// confirmed when `key` is given; any other status is classified. The body is decoded
+/// straight into the generated model, which refuses a required member that is missing, a
+/// mistyped one or a value outside its vocabulary and ignores a member this release does not
+/// know (REQ-CLOUDDEF-23).
+fn receive_one_of<T: serde::de::DeserializeOwned>(
     request: reqwest::blocking::RequestBuilder,
     accepted: &[StatusCode],
     key: Option<&str>,
 ) -> Result<(StatusCode, T), WorkflowDefinitionFailure> {
+    let response = receive_accepted(request, accepted, key)?;
+    let body = serde_json::from_slice(&response.body).map_err(|_| invalid())?;
+    Ok((response.status, body))
+}
+
+/// The closed JSON body of an `expected` response, its key confirmed when `key` is given; any
+/// other status is classified. Only the tree upload and seal answers are read closed: the
+/// upload answer carries the signed capabilities whose required headers are sent exactly.
+fn receive_closed<T: serde::de::DeserializeOwned + serde::Serialize>(
+    request: reqwest::blocking::RequestBuilder,
+    expected: StatusCode,
+    key: Option<&str>,
+) -> Result<T, WorkflowDefinitionFailure> {
+    let response = receive_accepted(request, &[expected], key)?;
+    decode_closed_json(&response.body).map_err(|_| invalid())
+}
+
+/// A JSON response whose status is one of `accepted`, its key confirmed when `key` is given,
+/// with its body still to decode; any other status is classified.
+fn receive_accepted(
+    request: reqwest::blocking::RequestBuilder,
+    accepted: &[StatusCode],
+    key: Option<&str>,
+) -> Result<RawResponse, WorkflowDefinitionFailure> {
     let response = receive_raw(request).map_err(|failure| match failure {
         ResourceFailure::Unreachable { category } => {
             WorkflowDefinitionFailure::Unreachable { category }
@@ -644,8 +673,7 @@ fn receive_one_of<T: serde::de::DeserializeOwned + serde::Serialize>(
         validate_mutation_key(&response.headers, key).map_err(|_| invalid())?;
     }
     validate_json_media_type(&response.headers).map_err(|_| invalid())?;
-    let body = decode_closed_json(&response.body).map_err(|_| invalid())?;
-    Ok((response.status, body))
+    Ok(response)
 }
 
 fn classify(response: &RawResponse) -> WorkflowDefinitionFailure {
@@ -862,7 +890,7 @@ mod tests {
         let digest = format!("sha256:{}", "a".repeat(64));
         let at = "2026-11-10T12:00:00Z";
         // The definition stands at revision 3, which a reuse answers as it is.
-        let body = serde_json::to_vec(&serde_json::json!({
+        let body = serde_json::json!({
             "definition": {
                 "id": definition, "projectId": project, "name": "engineering",
                 "state": "active", "automaticStarts": false, "executionPrincipalId": null,
@@ -873,14 +901,8 @@ mod tests {
                 "bindings": {}, "resolution": {}, "publishedAt": at,
                 "publishedBy": "prn_01k0z6r1w8f4jy2m7q9v3x5abc",
             },
-        }))
-        .expect("publication");
-        let mut response = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nIdempotency-Key: {REQUEST_IDEMPOTENCY_KEY_ECHO}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-            body.len()
-        )
-        .into_bytes();
-        response.extend_from_slice(&body);
+        });
+        let response = response("200 OK", "application/json", true, &body);
         let server = ScriptedHttpServer::respond_in_sequence(vec![response.clone(), response]);
         let storage = HttpClient::new(HttpTransportPolicy::AllowInsecureHttp).expect("client");
         let api =
@@ -936,18 +958,12 @@ mod tests {
             "nextAttemptAt": null, "acceptedAt": "2026-11-10T12:00:00Z",
             "expiresAt": "2026-12-10T12:00:00Z", "settledAt": "2026-11-10T12:00:00Z",
         });
-        let body = serde_json::to_vec(&serde_json::json!({
+        let body = serde_json::json!({
             "items": vec![evaluation; length],
             "nextCursor": "older-evaluations",
-        }))
-        .expect("page");
-        let mut response = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-            body.len()
-        )
-        .into_bytes();
-        response.extend_from_slice(&body);
-        let server = um_test_support::ScriptedHttpServer::respond(response);
+        });
+        let server =
+            ScriptedHttpServer::respond(response("200 OK", "application/json", false, &body));
         let storage = HttpClient::new(HttpTransportPolicy::AllowInsecureHttp).expect("client");
         let api =
             WorkflowDefinitionApi::new(&server.api_url, "fixture-token", &storage).expect("api");
@@ -967,5 +983,396 @@ mod tests {
         assert_eq!(items.len(), length);
         assert_eq!(cursor.as_deref(), Some("older-evaluations"));
         server.finish_one();
+    }
+
+    const ORGANIZATION: &str = "acme";
+    const PROJECT: &str = "prj_01k0z6r1w8f4jy2m7q9v3x5abc";
+    const DEFINITION: &str = "def_01k0z6r1w8f4jy2m7q9v3x5abc";
+    const EVALUATION: &str = "wev_01k0z6r1w8f4jy2m7q9v3x5abc";
+    const AT: &str = "2026-11-10T12:00:00Z";
+    /// The member a later Cloud release adds, which this release does not know.
+    const ADDED: &str = "addedLater";
+
+    fn tree_digest() -> String {
+        format!("sha256:{}", "a".repeat(64))
+    }
+
+    fn added() -> serde_json::Value {
+        serde_json::json!({"kind": "added", "count": 1})
+    }
+
+    fn definition_answer(current_revision: i32) -> serde_json::Value {
+        serde_json::json!({
+            "id": DEFINITION, "projectId": PROJECT, "name": "engineering", "state": "active",
+            "automaticStarts": true, "executionPrincipalId": "prn_01k0z6r1w8f4jy2m7q9v3x5xyz",
+            "currentRevision": current_revision, "createdAt": AT, "updatedAt": AT,
+            ADDED: added(),
+        })
+    }
+
+    fn revision_answer(number: i32) -> serde_json::Value {
+        serde_json::json!({
+            "definitionId": DEFINITION, "number": number, "treeDigest": tree_digest(),
+            "bindings": {}, "resolution": {}, "publishedAt": AT,
+            "publishedBy": "prn_01k0z6r1w8f4jy2m7q9v3x5abc", ADDED: added(),
+        })
+    }
+
+    fn evaluation_answer() -> serde_json::Value {
+        serde_json::json!({
+            "id": EVALUATION, "definitionId": DEFINITION, "revision": 2,
+            "triggerName": "start-on-todo", "connectionId": "lnc_01k0z6r1w8f4jy2m7q9v3x5abc",
+            "executionPrincipalId": "prn_01k0z6r1w8f4jy2m7q9v3x5xyz",
+            "eventName": "issue.state_entered",
+            "event": {
+                "issue": {"id": "issue-7", "identifier": "AUTO-7"},
+                "issueUpdatedAt": AT, "team": "team-1", "state": "state-todo", "actor": null,
+                "at": AT, ADDED: added(),
+            },
+            "state": "run_created", "reason": null, "observations": null,
+            "runId": "run_01k0z6r1w8f4jy2m7q9v3x5abc", "blockingRunId": null, "cycleNumber": 1,
+            "attemptNumber": 1, "cycleStartedAt": AT, "cycleDeadline": "2026-11-11T12:00:00Z",
+            "nextAttemptAt": null, "acceptedAt": AT, "expiresAt": "2026-12-10T12:00:00Z",
+            "settledAt": AT, ADDED: added(),
+        })
+    }
+
+    fn publication_answer(revision: i32) -> serde_json::Value {
+        serde_json::json!({
+            "definition": definition_answer(revision),
+            "revision": revision_answer(revision),
+            ADDED: added(),
+        })
+    }
+
+    fn page_answer(item: &serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "items": [item, item], "nextCursor": "next-page", ADDED: added(),
+        })
+    }
+
+    /// `answer` without the member this release does not know, at any depth.
+    fn known(mut answer: serde_json::Value) -> serde_json::Value {
+        fn strip(value: &mut serde_json::Value) {
+            match value {
+                serde_json::Value::Object(members) => {
+                    members.remove(ADDED);
+                    members.values_mut().for_each(strip);
+                }
+                serde_json::Value::Array(items) => items.iter_mut().for_each(strip),
+                _ => {}
+            }
+        }
+        strip(&mut answer);
+        answer
+    }
+
+    fn response(
+        status: &str,
+        content_type: &str,
+        echo_key: bool,
+        body: &serde_json::Value,
+    ) -> Vec<u8> {
+        let body = serde_json::to_vec(body).expect("answer");
+        let key = if echo_key {
+            format!("Idempotency-Key: {REQUEST_IDEMPOTENCY_KEY_ECHO}\r\n")
+        } else {
+            String::new()
+        };
+        let mut response = format!(
+            "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\n{key}Content-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        response.extend_from_slice(&body);
+        response
+    }
+
+    /// A page the client returned, encoded as the contract's JSON.
+    fn page<T: serde::Serialize>((items, next): (Vec<T>, Option<String>)) -> serde_json::Value {
+        serde_json::json!({"items": items, "nextCursor": next})
+    }
+
+    /// One request of the definition client whose answer may carry members it does not know.
+    #[derive(Clone, Copy, Debug)]
+    enum Read {
+        Definition,
+        Definitions,
+        Revision,
+        Revisions,
+        Evaluation,
+        Evaluations,
+        Create,
+        Publish,
+        Enable,
+    }
+
+    impl Read {
+        const ALL: [Self; 9] = [
+            Self::Definition,
+            Self::Definitions,
+            Self::Revision,
+            Self::Revisions,
+            Self::Evaluation,
+            Self::Evaluations,
+            Self::Create,
+            Self::Publish,
+            Self::Enable,
+        ];
+
+        /// The valid answer, carrying a member this release does not know at its top level
+        /// and in every object it nests.
+        fn answer(self) -> serde_json::Value {
+            match self {
+                Self::Definition | Self::Enable => definition_answer(3),
+                Self::Definitions => page_answer(&definition_answer(3)),
+                Self::Revision => revision_answer(3),
+                Self::Revisions => page_answer(&revision_answer(3)),
+                Self::Evaluation => evaluation_answer(),
+                Self::Evaluations => page_answer(&evaluation_answer()),
+                // A create is revision 1; a publish over revision 2 is revision 3.
+                Self::Create => publication_answer(1),
+                Self::Publish => publication_answer(3),
+            }
+        }
+
+        fn status(self) -> &'static str {
+            match self {
+                Self::Create | Self::Publish => "201 Created",
+                _ => "200 OK",
+            }
+        }
+
+        const fn keyed(self) -> bool {
+            matches!(self, Self::Create | Self::Publish | Self::Enable)
+        }
+
+        /// Sends the request to a server answering `response`: what the client returned,
+        /// encoded as the contract's JSON.
+        fn send(self, response: Vec<u8>) -> Result<serde_json::Value, WorkflowDefinitionFailure> {
+            let server = ScriptedHttpServer::respond(response);
+            let storage = HttpClient::new(HttpTransportPolicy::AllowInsecureHttp).expect("client");
+            let api = WorkflowDefinitionApi::new(&server.api_url, "fixture-token", &storage)
+                .expect("api");
+            let digest = tree_digest();
+            let publication = WorkflowPublication {
+                tree_digest: &digest,
+                bindings: None,
+                executable_paths: None,
+            };
+            let read = match self {
+                Self::Definition => api
+                    .definition(ORGANIZATION, PROJECT, DEFINITION)
+                    .map(|value| serde_json::json!(value)),
+                Self::Definitions => api.definitions(ORGANIZATION, PROJECT, None, None).map(page),
+                Self::Revision => api
+                    .revision(ORGANIZATION, PROJECT, DEFINITION, 3)
+                    .map(|value| serde_json::json!(value)),
+                Self::Revisions => api
+                    .revisions(ORGANIZATION, PROJECT, DEFINITION, None, None)
+                    .map(page),
+                Self::Evaluation => api
+                    .evaluation(ORGANIZATION, PROJECT, DEFINITION, EVALUATION)
+                    .map(|value| serde_json::json!(value)),
+                Self::Evaluations => api
+                    .evaluations(
+                        ORGANIZATION,
+                        PROJECT,
+                        DEFINITION,
+                        WorkflowEvaluationFilter::default(),
+                        None,
+                        None,
+                    )
+                    .map(page),
+                Self::Create => api
+                    .create_definition(ORGANIZATION, PROJECT, "create-key", publication, false)
+                    .map(|(value, _)| serde_json::json!(value)),
+                Self::Publish => api
+                    .publish_revision(
+                        ORGANIZATION,
+                        PROJECT,
+                        DEFINITION,
+                        "publish-key",
+                        2,
+                        publication,
+                    )
+                    .map(|value| serde_json::json!(value)),
+                Self::Enable => api
+                    .enable(ORGANIZATION, PROJECT, DEFINITION, "enable-key")
+                    .map(|value| serde_json::json!(value)),
+            };
+            server.finish_one();
+            read
+        }
+    }
+
+    // REQ-CLOUDDEF-23, REQ-COMPAT-20: a member a later Cloud release adds to a definition,
+    // revision, evaluation or publication answer, at any depth, is ignored and the members
+    // this release knows are read as sent.
+    #[test]
+    fn an_answer_carrying_members_this_release_does_not_know_is_read() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        for read in Read::ALL {
+            let answer = read.answer();
+            assert_eq!(
+                read.send(response(
+                    read.status(),
+                    "application/json",
+                    read.keyed(),
+                    &answer
+                )),
+                Ok(known(answer)),
+                "{read:?}"
+            );
+        }
+    }
+
+    /// One departure from a valid additive answer.
+    #[derive(Debug)]
+    enum Fault {
+        /// The answer's top-level member is absent.
+        Remove(&'static str),
+        /// The member at this JSON pointer has this value.
+        Set(&'static str, serde_json::Value),
+        /// The answer is served under this media type.
+        MediaType(&'static str),
+        /// The keyed answer does not echo the request's `Idempotency-Key`.
+        NoKeyEcho,
+    }
+
+    // REQ-CLOUDDEF-23: what this release knows of an answer is still checked: its shape, its
+    // identity against the request, its media type and a keyed change's key echo.
+    #[test]
+    fn an_additive_answer_failing_a_known_check_is_an_invalid_response() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let other_digest = format!("sha256:{}", "b".repeat(64));
+        let cases = [
+            (Read::Definition, Fault::Remove("currentRevision")),
+            (Read::Definition, Fault::Remove("executionPrincipalId")),
+            (
+                Read::Definition,
+                Fault::Set("/currentRevision", serde_json::json!("3")),
+            ),
+            (
+                Read::Definition,
+                Fault::Set("/state", serde_json::json!("deleted")),
+            ),
+            (
+                Read::Definitions,
+                Fault::Set("/items/1/id", serde_json::json!(PROJECT)),
+            ),
+            (
+                Read::Definition,
+                Fault::Set("/id", serde_json::json!("def_01k0z6r1w8f4jy2m7q9v3x5xyz")),
+            ),
+            (
+                Read::Definition,
+                Fault::Set(
+                    "/projectId",
+                    serde_json::json!("prj_01k0z6r1w8f4jy2m7q9v3x5xyz"),
+                ),
+            ),
+            (
+                Read::Revision,
+                Fault::Set(
+                    "/definitionId",
+                    serde_json::json!("def_01k0z6r1w8f4jy2m7q9v3x5xyz"),
+                ),
+            ),
+            (Read::Revision, Fault::Set("/number", serde_json::json!(4))),
+            (
+                Read::Evaluations,
+                Fault::Set(
+                    "/items/0/id",
+                    serde_json::json!("run_01k0z6r1w8f4jy2m7q9v3x5abc"),
+                ),
+            ),
+            (
+                Read::Publish,
+                Fault::Set("/revision/treeDigest", serde_json::json!(other_digest)),
+            ),
+            (Read::Enable, Fault::NoKeyEcho),
+            (Read::Definition, Fault::MediaType("text/plain")),
+        ];
+        for (read, fault) in cases {
+            let mut answer = read.answer();
+            let mut content_type = "application/json";
+            let mut echo_key = read.keyed();
+            match &fault {
+                Fault::Remove(member) => {
+                    answer
+                        .as_object_mut()
+                        .and_then(|members| members.remove(*member))
+                        .expect("member");
+                }
+                Fault::Set(pointer, value) => {
+                    *answer.pointer_mut(pointer).expect("member") = value.clone();
+                }
+                Fault::MediaType(media_type) => content_type = media_type,
+                Fault::NoKeyEcho => echo_key = false,
+            }
+            assert_eq!(
+                read.send(response(read.status(), content_type, echo_key, &answer)),
+                Err(WorkflowDefinitionFailure::InvalidResponse {
+                    credential_rejected: false
+                }),
+                "{read:?} {fault:?}"
+            );
+        }
+    }
+
+    // REQ-CLOUDDEF-23: the tree upload and seal answers stay closed, since the CLI sends the
+    // upload answer's signed capabilities' required headers exactly.
+    #[test]
+    fn a_tree_upload_or_seal_answer_carrying_a_member_this_release_does_not_know_is_refused() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let digest = tree_digest();
+        let tree = |state: &str, sealed_at: Option<&str>| {
+            serde_json::json!({
+                "digest": digest, "state": state, "sizeBytes": 0, "fileCount": 0,
+                "name": null, "createdAt": AT, "sealedAt": sealed_at,
+            })
+        };
+        let issued = |tree: serde_json::Value| {
+            serde_json::json!({
+                "tree": tree, "capabilityExpiresAt": null, "capabilities": [],
+            })
+        };
+        let additive = |mut answer: serde_json::Value| {
+            answer
+                .as_object_mut()
+                .expect("object")
+                .insert(ADDED.to_owned(), added());
+            answer
+        };
+        // The upload answer, then the seal answer when the upload answer leaves a seal to send.
+        let upload = |answers: &[&serde_json::Value]| {
+            let responses = answers
+                .iter()
+                .enumerate()
+                .map(|(index, answer)| response("200 OK", "application/json", index == 1, answer))
+                .collect();
+            let server = ScriptedHttpServer::respond_in_sequence(responses);
+            let storage = HttpClient::new(HttpTransportPolicy::AllowInsecureHttp).expect("client");
+            let api = WorkflowDefinitionApi::new(&server.api_url, "fixture-token", &storage)
+                .expect("api");
+            let uploaded = api
+                .upload_tree(ORGANIZATION, &digest, &[], "seal-key")
+                .map(|(tree, already_sealed)| (tree.digest, already_sealed));
+            server.finish();
+            uploaded
+        };
+        let refused = Err(WorkflowDefinitionFailure::InvalidResponse {
+            credential_rejected: false,
+        });
+
+        let already_sealed = issued(tree("sealed", Some(AT)));
+        assert_eq!(upload(&[&already_sealed]), Ok((digest.clone(), true)));
+        assert_eq!(upload(&[&additive(already_sealed)]), refused);
+
+        let uploading = issued(tree("uploading", None));
+        let sealed = tree("sealed", Some(AT));
+        assert_eq!(upload(&[&uploading, &sealed]), Ok((digest.clone(), false)));
+        assert_eq!(upload(&[&uploading, &additive(sealed)]), refused);
     }
 }

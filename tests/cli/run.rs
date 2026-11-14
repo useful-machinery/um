@@ -7135,6 +7135,42 @@ mod workflow_run_cloud {
         assert_eq!(std::fs::read_dir(home.path()).unwrap().count(), 0);
     }
 
+    // REQ-LOCALRUN-215, REQ-RUN-60: a leaf that reads a run whose creation Cloud refused
+    // reports `creation_rejected`, and a control leaf sends no control for it.
+    #[test]
+    fn cloud_leaves_report_a_refused_creation_as_creation_rejected() {
+        let home = tempfile::tempdir().unwrap();
+        for (leaf, args) in [
+            ("show", &["--json"][..]),
+            (
+                "answer",
+                &["--question", "scope", "--text", "Only the API", "--json"][..],
+            ),
+        ] {
+            let rejected = http_response_with_headers(
+                "409 Conflict",
+                Some("application/problem+json"),
+                &[("Cache-Control", "private, no-store")],
+                &serde_json::to_vec(&serde_json::json!({
+                    "type": "https://api.usefulmachinery.com/problems/run-creation-rejected",
+                    "title": "Run creation rejected",
+                    "status": 409
+                }))
+                .unwrap(),
+            );
+            let (output, requests) = cloud(leaf, RUN_ID, args, vec![rejected], home.path());
+            assert_eq!(output.status.code(), Some(1), "{leaf}: {output:?}");
+            assert_eq!(requests.len(), 1, "{leaf}");
+            let refused = document(&output);
+            assert_eq!(refused["outcome"], "refused", "{leaf}: {refused}");
+            assert_eq!(refused["exitStatus"], 1, "{leaf}");
+            assert_eq!(
+                refused["diagnostics"][0]["code"], "creation_rejected",
+                "{leaf}: {refused}"
+            );
+        }
+    }
+
     // REQ-LOCALRUN-210: a Cloud retry takes no local execution root or replacement profiles.
     #[test]
     fn cloud_retry_refuses_its_local_options() {

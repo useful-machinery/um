@@ -508,63 +508,39 @@ impl CloudRun {
     }
 }
 
-/// The diagnostic code, message and exit status leaf `command` reports `failure` under: a
-/// rejected session exits 3, Cloud being unreachable or rate limiting the request exits 4,
-/// and anything else exits 1. Only `show` and `release` read the run's subject claim, so
-/// only their not-found names it.
+/// The diagnostic code, message and exit status leaf `command` reports `failure` under: the
+/// code and exit status the `um run` commands report it under (`failure_code`), but for an
+/// unnamed conflict, which is `conflict`, and a rejected session, which exits 3 (INV-CLI-17,
+/// REQ-LOCALRUN-215). The message is the leaf's own, chosen by the code. Only `show` and
+/// `release` read the run's subject claim, so only their not-found names it.
 fn failure_diagnostic(
     command: &str,
     failure: &RunFailure,
 ) -> (&'static str, &'static str, ExitCode) {
-    match failure {
-        RunFailure::Unauthenticated => (
-            "authentication_required",
-            "Cloud rejected the session; sign in with um auth login and try again.",
-            ExitCode::AuthenticationRequired,
-        ),
-        RunFailure::Forbidden => (
-            "forbidden",
-            "The principal may not do this to the run.",
-            ExitCode::GeneralFailure,
-        ),
-        RunFailure::NotFound if matches!(command, SHOW_COMMAND | RELEASE_COMMAND) => (
-            "not_found",
-            "Cloud has no such run in this organization, or the run has no subject claim.",
-            ExitCode::GeneralFailure,
-        ),
-        RunFailure::NotFound => (
-            "not_found",
-            "Cloud has no such run in this organization.",
-            ExitCode::GeneralFailure,
-        ),
-        RunFailure::InvalidInput => (
-            "invalid_input",
-            "Cloud refused the request as invalid.",
-            ExitCode::GeneralFailure,
-        ),
-        RunFailure::Conflict => (
-            "conflict",
-            "Cloud refused the request because of the run's state.",
-            ExitCode::GeneralFailure,
-        ),
-        RunFailure::Unreachable(_)
-        | RunFailure::RetryAfter(_)
-        | RunFailure::RetryAmbiguousRateLimited => (
-            "unavailable",
-            "Cloud could not be reached or is limiting requests; try again.",
-            ExitCode::Unavailable,
-        ),
-        _ if failure.credential_rejected() => (
-            "authentication_required",
-            "Cloud rejected the session; sign in with um auth login and try again.",
-            ExitCode::AuthenticationRequired,
-        ),
-        _ => (
-            "protocol_error",
-            "Cloud answered with a response this CLI does not accept.",
-            ExitCode::GeneralFailure,
-        ),
-    }
+    let (code, exit) = if *failure == RunFailure::Conflict {
+        ("conflict", ExitCode::GeneralFailure)
+    } else if failure.credential_rejected() {
+        ("authentication_required", ExitCode::AuthenticationRequired)
+    } else {
+        cli::run::failure_code(failure, cli::PrincipalAuthenticationKind::HumanSession)
+    };
+    let message = match code {
+        "authentication_required" => {
+            "Cloud rejected the session; sign in with um auth login and try again."
+        }
+        "forbidden" => "The principal may not do this to the run.",
+        "not_found" if matches!(command, SHOW_COMMAND | RELEASE_COMMAND) => {
+            "Cloud has no such run in this organization, or the run has no subject claim."
+        }
+        "not_found" => "Cloud has no such run in this organization.",
+        "invalid_input" => "Cloud refused the request as invalid.",
+        "conflict" => "Cloud refused the request because of the run's state.",
+        "creation_rejected" => "Cloud refused to create the run.",
+        "unavailable" => "Cloud could not be reached or is limiting requests; try again.",
+        "protocol_error" => "Cloud answered with a response this CLI does not accept.",
+        _ => "The request to Cloud did not complete.",
+    };
+    (code, message, exit)
 }
 
 #[derive(Serialize)]
@@ -848,9 +824,12 @@ fn write_deliveries(
 
 #[cfg(test)]
 mod tests {
-    use um_api::RunFailure;
+    use std::time::Duration;
+
+    use um_api::{ContinuationAdmissionViolation, RetryConflict, RunFailure, UnreachableCategory};
 
     use super::{SHOW_COMMAND, failure_diagnostic};
+    use crate::cli::{PrincipalAuthenticationKind, run::failure_code};
     use crate::exit_code::ExitCode;
 
     // REQ-COMPAT-20, REQ-LOCALRUN-187, REQ-LOCALRUN-210: a refusal Cloud answers `409`
@@ -859,5 +838,79 @@ mod tests {
     fn an_unnamed_conflict_is_reported_as_a_conflict() {
         let (code, _, exit) = failure_diagnostic(SHOW_COMMAND, &RunFailure::Conflict);
         assert_eq!((code, exit), ("conflict", ExitCode::GeneralFailure));
+    }
+
+    // INV-CLI-17, REQ-LOCALRUN-215: the leaves report every failure under the code and exit
+    // status the shared mapping gives it, but for an unnamed conflict and a rejected session.
+    #[test]
+    fn every_failure_takes_its_code_from_the_shared_mapping() {
+        let samples = [
+            RunFailure::Unauthenticated,
+            RunFailure::Forbidden,
+            RunFailure::InvalidInput,
+            RunFailure::NotFound,
+            RunFailure::Conflict,
+            RunFailure::InputAdmissionRejected {
+                status: 422,
+                problem_type: "https://api.usefulmachinery.com/problems/input-rejected",
+                diagnostic: None,
+            },
+            RunFailure::AdmissionRejected {
+                status: 422,
+                problem_type: "https://api.usefulmachinery.com/problems/source-rejected",
+                request_id: None,
+            },
+            RunFailure::IdempotencyConflict,
+            RunFailure::CreationRejected,
+            RunFailure::RetryConflict(RetryConflict::Pending),
+            RunFailure::RetryConflict(RetryConflict::Idempotency),
+            RunFailure::RetryConflict(RetryConflict::SubjectBusy {
+                holder_run_id: "run_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned(),
+            }),
+            RunFailure::RetryConflict(RetryConflict::SubjectSettled {
+                holder_run_id: "run_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned(),
+            }),
+            RunFailure::RetryAfter(Duration::from_secs(1)),
+            RunFailure::RetryAmbiguousRateLimited,
+            RunFailure::RetryAmbiguousAuthentication,
+            RunFailure::ContinuationAcceptanceUnknown,
+            RunFailure::ContinuationAdmissionInvalid(vec![ContinuationAdmissionViolation {
+                code: "node_unknown",
+                recovery_reason: None,
+                node: None,
+                producer: None,
+                reference: None,
+                prior_state: None,
+            }]),
+            RunFailure::PathRunRetired,
+            RunFailure::Gone,
+            RunFailure::Unreachable(UnreachableCategory::Timeout),
+            RunFailure::Unreachable(UnreachableCategory::RateLimited),
+            RunFailure::InputUploadRejected,
+            RunFailure::InputDownloadRejected,
+            RunFailure::Interrupted,
+            RunFailure::Protocol {
+                credential_rejected: false,
+            },
+            RunFailure::Protocol {
+                credential_rejected: true,
+            },
+        ];
+        for failure in samples {
+            let shared = failure_code(&failure, PrincipalAuthenticationKind::HumanSession);
+            let expected = if failure == RunFailure::Conflict {
+                ("conflict", ExitCode::GeneralFailure)
+            } else if failure
+                == (RunFailure::Protocol {
+                    credential_rejected: true,
+                })
+            {
+                ("authentication_required", ExitCode::AuthenticationRequired)
+            } else {
+                shared
+            };
+            let (code, _, exit) = failure_diagnostic(SHOW_COMMAND, &failure);
+            assert_eq!((code, exit), expected, "{failure:?}");
+        }
     }
 }
