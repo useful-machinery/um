@@ -1,9 +1,13 @@
 //! The run mirror's Linear target (REQ-LOCALRUN-192): `MirrorTarget` over Linear's GraphQL
-//! API with the operator's `LINEAR_API_KEY`, sent bare in `Authorization` as Linear's personal
-//! keys are, through `um_api::provider_post_json`. `UM_LINEAR_API_URL` overrides the base URL
-//! for development and tests, and admits `http`. Every request is one attempt: a comment is
-//! not idempotent, and a failed write is recorded for a person to see. `um workflow run event`
-//! reads an issue by its Linear id through the same target (REQ-LOCALRUN-208).
+//! API with the Linear credential the environment holds when the target is made, through
+//! `um_api::provider_post_json`. The credential is the first of the token in the file
+//! `UM_LINEAR_ACCESS_TOKEN_FILE` names and `UM_LINEAR_ACCESS_TOKEN`, a runner's grant token
+//! sent as `Bearer`, and the operator's `LINEAR_API_KEY`, sent bare in `Authorization` as
+//! Linear's personal keys are; a target is made for each hook, so each reads the credential
+//! anew. `UM_LINEAR_API_URL` overrides the base URL for development and tests, and admits
+//! `http`. Every request is one attempt: a comment is not idempotent, and a failed write is
+//! recorded for a person to see. `um workflow run event` reads an issue by its Linear id
+//! through the same target (REQ-LOCALRUN-208).
 
 use std::cell::RefCell;
 use std::time::Duration;
@@ -15,6 +19,8 @@ use zeroize::Zeroizing;
 
 const LINEAR_API: &str = "https://api.linear.app";
 const API_VARIABLE: &str = "UM_LINEAR_API_URL";
+const TOKEN_FILE_VARIABLE: &str = "UM_LINEAR_ACCESS_TOKEN_FILE";
+const TOKEN_VARIABLE: &str = "UM_LINEAR_ACCESS_TOKEN";
 const KEY_VARIABLE: &str = "LINEAR_API_KEY";
 const TIMEOUT: Duration = Duration::from_secs(30);
 /// The most of Linear's error message a diagnostic carries.
@@ -33,7 +39,8 @@ const UPDATE_STATE: (&str, &str) = (
     "mutation UpdateIssueState($id: String!, $input: IssueUpdateInput!) { issueUpdate(id: $id, input: $input) { success } }",
 );
 
-/// One `POST` the target makes: the GraphQL endpoint, the bare key and the JSON body.
+/// One `POST` the target makes: the GraphQL endpoint, the whole `Authorization` value and the
+/// JSON body.
 pub(super) struct Request<'a> {
     pub(super) url: &'a str,
     pub(super) authorization: &'a str,
@@ -71,19 +78,20 @@ pub(in super::super) struct IssueObservation {
     pub(in super::super) updated_at: Option<String>,
 }
 
-/// Linear, reached at `endpoint` with `key`. Every write is keyed by the issue's id, which
-/// `issue(id:)` resolves from the identifier; the issue read is kept, so a hook reads the
+/// Linear, reached at `endpoint` with `authorization`. Every write is keyed by the issue's id,
+/// which `issue(id:)` resolves from the identifier; the issue read is kept, so a hook reads the
 /// issue once however many writes it makes (REQ-LOCALRUN-192).
 pub(in super::super) struct LinearTarget {
     endpoint: String,
-    key: Option<Zeroizing<String>>,
+    /// The whole `Authorization` value: `Bearer <token>` or the bare key.
+    authorization: Option<Zeroizing<String>>,
     requester: Requester,
     issue: RefCell<Option<Issue>>,
 }
 
 impl LinearTarget {
-    /// The target the environment configures: `UM_LINEAR_API_URL` or Linear's API, and
-    /// `LINEAR_API_KEY`.
+    /// The target the environment configures: `UM_LINEAR_API_URL` or Linear's API, and the
+    /// Linear credential it holds now (`environment_authorization`).
     pub(in super::super) fn from_environment() -> Self {
         let overridden = std::env::var(API_VARIABLE)
             .ok()
@@ -96,7 +104,7 @@ impl LinearTarget {
         let base = overridden.unwrap_or_else(|| LINEAR_API.to_owned());
         Self::new(
             &base,
-            std::env::var(KEY_VARIABLE).ok(),
+            environment_authorization(),
             Box::new(move |request| {
                 provider_post_json(
                     request.url,
@@ -114,29 +122,36 @@ impl LinearTarget {
         )
     }
 
-    /// The target at `<base>/graphql` with `key`, an empty one being none.
-    fn new(base: &str, key: Option<String>, requester: Requester) -> Self {
+    /// The target at `<base>/graphql` with the `Authorization` value `authorization`, an empty
+    /// one being none.
+    fn new(base: &str, authorization: Option<String>, requester: Requester) -> Self {
         Self {
             endpoint: format!("{}/graphql", base.trim_end_matches('/')),
-            key: key.filter(|key| !key.is_empty()).map(Zeroizing::new),
+            authorization: authorization
+                .filter(|authorization| !authorization.is_empty())
+                .map(Zeroizing::new),
             requester,
             issue: RefCell::new(None),
         }
     }
 
-    /// Whether the target holds a key: `mirror_credentials_unavailable` when
-    /// `LINEAR_API_KEY` is unset or empty (REQ-LOCALRUN-192). Every request takes its key
+    /// Whether the target holds a credential: `mirror_credentials_unavailable` when the
+    /// environment offered none (REQ-LOCALRUN-192). Every request takes its `Authorization`
     /// from here, so a check before a write and the write agree (REQ-LOCALRUN-204).
     pub(super) fn credentials(&self) -> Result<(), MirrorFailure> {
-        self.key().map(|_| ())
+        self.authorization().map(|_| ())
     }
 
-    fn key(&self) -> Result<&str, MirrorFailure> {
-        self.key.as_deref().map(String::as_str).ok_or_else(|| {
-            MirrorFailure::credentials_unavailable(format!(
-                "{KEY_VARIABLE} is unset or empty, so Linear cannot be written."
-            ))
-        })
+    fn authorization(&self) -> Result<&str, MirrorFailure> {
+        self.authorization
+            .as_deref()
+            .map(String::as_str)
+            .ok_or_else(|| {
+                MirrorFailure::credentials_unavailable(format!(
+                    "No Linear credential is set in {TOKEN_FILE_VARIABLE}, {TOKEN_VARIABLE} or \
+                     {KEY_VARIABLE}, so Linear cannot be written."
+                ))
+            })
     }
 
     /// The `data` of one GraphQL `operation` with `variables`, or the classified failure.
@@ -145,7 +160,7 @@ impl LinearTarget {
         (operation, query): (&str, &str),
         variables: Value,
     ) -> Result<Value, MirrorFailure> {
-        let key = self.key()?;
+        let authorization = self.authorization()?;
         let body = serde_json::to_vec(&json!({
             "operationName": operation,
             "query": query,
@@ -156,7 +171,7 @@ impl LinearTarget {
         })?;
         let response = (self.requester)(&Request {
             url: &self.endpoint,
-            authorization: key,
+            authorization,
             body,
         })
         .map_err(|error| {
@@ -228,7 +243,7 @@ impl LinearTarget {
         let issue = match data.get("issue") {
             None | Some(Value::Null) => {
                 return Err(MirrorFailure::issue_unavailable(format!(
-                    "Linear has no issue {requested} the key can read."
+                    "Linear has no issue {requested} the credential can read."
                 )));
             }
             Some(issue) => issue,
@@ -289,6 +304,16 @@ impl LinearTarget {
                 "Linear's answer to {field} has no boolean success."
             ))),
         }
+    }
+}
+
+/// The `Authorization` value of the Linear credential the environment holds now
+/// (REQ-LOCALRUN-192): `Bearer` and the grant token `offered_token` reads from
+/// `UM_LINEAR_ACCESS_TOKEN_FILE` and `UM_LINEAR_ACCESS_TOKEN`, else `LINEAR_API_KEY` bare.
+fn environment_authorization() -> Option<String> {
+    match super::offered_token(TOKEN_FILE_VARIABLE, TOKEN_VARIABLE) {
+        Some(token) => Some(format!("Bearer {}", token.as_str())),
+        None => std::env::var(KEY_VARIABLE).ok(),
     }
 }
 

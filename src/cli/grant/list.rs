@@ -5,8 +5,9 @@ use clap::Args;
 
 use crate::exit_code::ExitCode;
 use um_api::{
-    CommonIdentityFailure, HttpTransportPolicy, IdentityApiError, ListIdentitiesOutcome,
-    MemberGrant, MemberGrantApi, MemberGrantKind, list_identities,
+    CommonIdentityFailure, GrantApi, GrantFailure, GrantUseList, HttpTransportPolicy,
+    IdentityApiError, ListIdentitiesOutcome, MemberGrant, MemberGrantApi, MemberGrantFailure,
+    MemberGrantKind, list_identities,
 };
 use um_human_auth::Deployment;
 
@@ -18,10 +19,23 @@ pub(super) const ABOUT: &str = "List your grants with where each may run, or sho
 // The largest page the identity list serves.
 const IDENTITY_PAGE: u16 = 200;
 
+// The tokens issued from an OAuth grant that its detail shows unless `--uses` names another
+// number (REQ-GRANT-64).
+const USES_SHOWN: u16 = 20;
+
 #[derive(Debug, Args)]
 pub(super) struct Command {
     #[arg(value_name = "GRANT", value_parser = super::parse_grant, help = GRANT_HELP)]
     grant: Option<GrantArg>,
+
+    #[arg(
+        long = "uses",
+        value_name = "LIMIT",
+        requires = "grant",
+        value_parser = clap::value_parser!(u16).range(1..=200),
+        help = "Show the newest LIMIT tokens issued from an OAuth grant (1-200) [default: 20]"
+    )]
+    uses: Option<u16>,
 
     #[command(flatten)]
     options: Options,
@@ -65,6 +79,17 @@ impl Command {
             Ok(read) => read,
             Err(failure) => return output::failure(api_url, &failure, json),
         };
+        let uses = match &read {
+            Read::One(Resolved::Grant(grant)) if grant.kind == MemberGrantKind::GrantKindOAuth => {
+                let limit = self.uses.unwrap_or(USES_SHOWN);
+                match read_uses(deployment, &self.options, &grant.id, limit)? {
+                    Ok(page) => Some(page),
+                    Err(failure) => return output::failure(api_url, &failure, json),
+                }
+            }
+            // A native grant issues no token, so Cloud records no use of it (REQ-GRANT-62).
+            _ => None,
+        };
         let identities = if read
             .grants()
             .iter()
@@ -80,9 +105,13 @@ impl Command {
         };
         match &read {
             Read::Every(grants) => output::write_list(api_url, grants, &accounts, json),
-            Read::One(Resolved::Grant(grant)) => {
-                output::write_grant(api_url, grant, &accounts, json)
-            }
+            Read::One(Resolved::Grant(grant)) => output::write_grant(
+                api_url,
+                grant,
+                &accounts,
+                uses.as_ref().map(|page| page.items.as_slice()),
+                json,
+            ),
             Read::One(Resolved::Ambiguous { provider, ids }) => output::write_ambiguous(
                 api_url,
                 provider,
@@ -92,6 +121,43 @@ impl Command {
             ),
         }
     }
+}
+
+/// The newest `limit` tokens issued from the OAuth grant `grant_id`, newest first: one page,
+/// since the uses grow with every assignment (REQ-GRANT-8). A failed read is reported as a
+/// failed read of the grant.
+fn read_uses(
+    deployment: &Deployment,
+    options: &Options,
+    grant_id: &str,
+    limit: u16,
+) -> anyhow::Result<Result<GrantUseList, MemberGrantFailure>> {
+    let page = super::super::with_human_session_api(
+        deployment,
+        options.http.transport_policy(),
+        |api: &GrantApi| api.uses(grant_id, Some(i32::from(limit)), None),
+    )?;
+    Ok(page.map_err(|failure| match failure {
+        GrantFailure::Unauthenticated => MemberGrantFailure::Unauthenticated,
+        GrantFailure::Forbidden => MemberGrantFailure::Forbidden,
+        GrantFailure::InvalidInput => MemberGrantFailure::InvalidInput,
+        GrantFailure::NotFound => MemberGrantFailure::GrantNotFound,
+        GrantFailure::IdempotencyConflict => MemberGrantFailure::IdempotencyConflict,
+        GrantFailure::ProviderUnavailable => MemberGrantFailure::ProviderUnavailable,
+        GrantFailure::RateLimited { retry_after } => {
+            MemberGrantFailure::RateLimited { retry_after }
+        }
+        GrantFailure::Unreachable { category } => MemberGrantFailure::Unreachable { category },
+        GrantFailure::InvalidResponse {
+            credential_rejected,
+        } => MemberGrantFailure::InvalidResponse {
+            credential_rejected,
+        },
+        // The uses route starts no consent, so this answer is not one it defines.
+        GrantFailure::ConsentInProgress => MemberGrantFailure::InvalidResponse {
+            credential_rejected: false,
+        },
+    }))
 }
 
 /// The slug of each organization a native grant of `grants` is for, where the member's

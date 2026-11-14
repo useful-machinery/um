@@ -995,8 +995,9 @@ um grant list
 # Show one grant in detail: for a native grant what each runner was last delivered and
 # reported, its last use and when, and for each runner whose authorization has ended the one
 # that ended last, with its removal state and stop, also after that runner is authorized
-# again; for an OAuth grant its scopes, last use and expiries. Name it by its ID, or by its
-# provider when you hold one grant of it.
+# again; for an OAuth grant its scopes, last use and expiries, and the newest 20 tokens issued
+# from it with the run and assignment of each (--uses LIMIT, 1 to 200, shows another number).
+# Name it by its ID, or by its provider when you hold one grant of it.
 um grant list agl_01k0z6r1w8f4jy2m7q9v3x5abc
 um grant list codex --json
 
@@ -1110,8 +1111,8 @@ the command that replaces it: `um auth grant create` and `um auth agent-login im
 `um auth credential status` are `um grant list`; `um auth agent-login show` is
 `um grant list GRANT`; `um auth agent-login authorize`, `deauthorize` and `revoke` and
 `um auth grant revoke` are the `um grant` leaf of the same name; and
-`um runner agent-login sync` is `um runner grant sync`. `um auth grant uses` has no
-replacement.
+`um runner agent-login sync` is `um runner grant sync`; and `um auth grant uses` is
+`um grant list GRANT`.
 
 ## Account management
 
@@ -2405,9 +2406,11 @@ availability and next action as `um grant list` reports them, or `not_connected`
 `um grant create` command that makes one. Add `--runner-id RUNNER`, the runner's ID as
 `um runner list` prints it, to see each grant's status on that runner alone, or
 `not_connected` with the `um grant authorize` command when it is not authorized there;
-`--organization-id` keeps only that organization's coding agent grants. Your grants never
-change a requirement's state or the exit status, and `--grants` uses your own sign-in, never a
-service API key.
+`--organization-id` keeps only that organization's coding agent grants. Your grants change a
+requirement's state and the exit status only with `--require-grants`, which needs `--grants`
+and `--runner-id`: a provider for which you hold no grant that runner can use (one
+`available`, `unverified` or `pending` there) then reads `missing` or `reconnect_required`
+and the doctor exits 1. `--grants` uses your own sign-in, never a service API key.
 
 With `--connect` the doctor signs you in to what the workflows need and then checks again. It
 runs the flow `um grant create --workflow` runs over the same files: it prints the plan of the

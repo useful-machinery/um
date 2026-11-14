@@ -288,6 +288,8 @@ pub(super) const LIST_FIRST_PAGE: &str = "GET /api/v1/me/grants?kind=all&limit=2
 const LIST_SECOND_PAGE: &str = "GET /api/v1/me/grants?kind=all&limit=200&cursor=grants-2 HTTP/1.1";
 const READ_IDENTITIES: &str = "GET /api/v1/me/identities?limit=200 HTTP/1.1";
 const READ_ORGANIZATION: &str = "GET /api/v1/organizations/org_01k0z6r1w8f4jy2m7q9v3x5abc HTTP/1.1";
+const READ_USES: &str =
+    "GET /api/v1/me/grants/pgr_01k0z6r1w8f4jy2m7q9v3x5abc/uses?limit=20 HTTP/1.1";
 
 // REQ-GRANT-64
 // REQ-GRANT-77
@@ -542,6 +544,8 @@ fn list_grant_shows_a_native_grants_exchange_and_ended_authorizations() {
     ] {
         assert!(in_force.contains(name), "missing {name:?} in\n{text}");
     }
+    // A native grant issues no token, so its detail lists no uses.
+    assert!(!text.contains("uses:"), "{text}");
     for name in [
         ENDED_RUNNER_ID,
         "ended: 2026-11-03T09:00:00Z",
@@ -696,8 +700,10 @@ fn list_grant_shows_an_oauth_grants_scopes_last_use_and_expiries() {
     let grant = oauth_grant(OAUTH_GRANT_ID, "github", "active");
     let (server, _directory, credential) = prepared(vec![
         one(&grant),
+        uses(&[]),
         identities(ada()),
         one(&grant),
+        uses(&[]),
         identities(ada()),
     ]);
     let json = run_grant(&server, &credential, &["list", OAUTH_GRANT_ID, "--json"]);
@@ -734,7 +740,14 @@ fn list_grant_shows_an_oauth_grants_scopes_last_use_and_expiries() {
     let read = "GET /api/v1/me/grants/pgr_01k0z6r1w8f4jy2m7q9v3x5abc HTTP/1.1";
     assert_eq!(
         request_lines(&requests),
-        [read, READ_IDENTITIES, read, READ_IDENTITIES]
+        [
+            read,
+            READ_USES,
+            READ_IDENTITIES,
+            read,
+            READ_USES,
+            READ_IDENTITIES
+        ]
     );
 }
 
@@ -744,8 +757,14 @@ fn list_grant_shows_an_oauth_grants_scopes_last_use_and_expiries() {
 fn list_grant_whose_identity_read_fails_prints_the_grant_and_a_diagnostic() {
     let grant = oauth_grant(OAUTH_GRANT_ID, "github", "active");
     let unavailable = || problem("503 Service Unavailable", 503, "service-unavailable");
-    let (server, _directory, credential) =
-        prepared(vec![one(&grant), unavailable(), one(&grant), unavailable()]);
+    let (server, _directory, credential) = prepared(vec![
+        one(&grant),
+        uses(&[]),
+        unavailable(),
+        one(&grant),
+        uses(&[]),
+        unavailable(),
+    ]);
     let human = run_grant(&server, &credential, &["list", OAUTH_GRANT_ID]);
     let json = run_grant(&server, &credential, &["list", OAUTH_GRANT_ID, "--json"]);
 
@@ -770,8 +789,189 @@ fn list_grant_whose_identity_read_fails_prints_the_grant_and_a_diagnostic() {
     let read = "GET /api/v1/me/grants/pgr_01k0z6r1w8f4jy2m7q9v3x5abc HTTP/1.1";
     assert_eq!(
         request_lines(&requests),
-        [read, READ_IDENTITIES, read, READ_IDENTITIES]
+        [
+            read,
+            READ_USES,
+            READ_IDENTITIES,
+            read,
+            READ_USES,
+            READ_IDENTITIES
+        ]
     );
+}
+
+// The tokens Cloud issued from the GitHub grant, newest first, as the uses route answers them
+// (REQ-GRANT-8).
+fn three_uses() -> [serde_json::Value; 3] {
+    [
+        (
+            "pgu_01k0z6r1w8f4jy2m7q9v3x5ab3",
+            "2026-11-04T08:00:00Z",
+            "ab3",
+        ),
+        (
+            "pgu_01k0z6r1w8f4jy2m7q9v3x5ab2",
+            "2026-11-03T08:00:00Z",
+            "ab2",
+        ),
+        (
+            "pgu_01k0z6r1w8f4jy2m7q9v3x5ab1",
+            "2026-11-02T08:00:00Z",
+            "ab1",
+        ),
+    ]
+    .map(|(id, issued_at, suffix)| {
+        serde_json::json!({
+            "id": id,
+            "grantId": OAUTH_GRANT_ID,
+            "runId": format!("run_01k0z6r1w8f4jy2m7q9v3x5{suffix}"),
+            "assignmentId": format!("asn_01k0z6r1w8f4jy2m7q9v3x5{suffix}"),
+            "organizationId": ORGANIZATION_ID,
+            "provider": "github",
+            "issuedAt": issued_at
+        })
+    })
+}
+
+fn uses(items: &[serde_json::Value]) -> Vec<u8> {
+    page(items, None)
+}
+
+// REQ-GRANT-64, REQ-GRANT-8
+#[test]
+fn list_grant_lists_the_tokens_issued_from_an_oauth_grant_newest_first() {
+    let grant = oauth_grant(OAUTH_GRANT_ID, "github", "active");
+    let issued = three_uses();
+    let (server, _directory, credential) = prepared(vec![
+        one(&grant),
+        uses(&issued),
+        identities(ada()),
+        one(&grant),
+        uses(&issued),
+        identities(ada()),
+    ]);
+    let json = run_grant(&server, &credential, &["list", OAUTH_GRANT_ID, "--json"]);
+    let human = run_grant(
+        &server,
+        &credential,
+        &["list", OAUTH_GRANT_ID, "--uses", "50"],
+    );
+
+    assert_eq!(json.status.code(), Some(0), "{}", stderr(&json));
+    let shown: Vec<_> = issued
+        .iter()
+        .map(|item| {
+            serde_json::json!({
+                "id": item["id"],
+                "runId": item["runId"],
+                "assignmentId": item["assignmentId"],
+                "organizationId": item["organizationId"],
+                "issuedAt": item["issuedAt"]
+            })
+        })
+        .collect();
+    assert_eq!(
+        json_output(&json)["grant"]["uses"],
+        serde_json::json!(shown)
+    );
+
+    assert_eq!(human.status.code(), Some(0), "{}", stderr(&human));
+    let text = stdout(&human);
+    assert!(text.contains("uses: 3"), "{text}");
+    // Each use is printed, with its time, run, assignment and organization, before the one
+    // issued before it.
+    let starts: Vec<_> = issued
+        .iter()
+        .map(|item| {
+            text.find(item["id"].as_str().unwrap())
+                .unwrap_or_else(|| panic!("missing {} in\n{text}", item["id"]))
+        })
+        .chain([text.len()])
+        .collect();
+    assert!(starts.is_sorted(), "{text}");
+    for (item, bounds) in issued.iter().zip(starts.windows(2)) {
+        let printed = &text[bounds[0]..bounds[1]];
+        for member in ["issuedAt", "runId", "assignmentId", "organizationId"] {
+            let value = item[member].as_str().unwrap();
+            assert!(printed.contains(value), "missing {value} in\n{printed}");
+        }
+    }
+
+    let requests = server.finish();
+    assert_member_requests(&requests);
+    let read = "GET /api/v1/me/grants/pgr_01k0z6r1w8f4jy2m7q9v3x5abc HTTP/1.1";
+    assert_eq!(
+        request_lines(&requests),
+        [
+            read,
+            READ_USES,
+            READ_IDENTITIES,
+            read,
+            "GET /api/v1/me/grants/pgr_01k0z6r1w8f4jy2m7q9v3x5abc/uses?limit=50 HTTP/1.1",
+            READ_IDENTITIES
+        ]
+    );
+}
+
+// REQ-GRANT-64, REQ-GRANT-65: a grant named by its provider has its uses read by its ID.
+#[test]
+fn a_grant_named_by_its_provider_has_its_uses_read_by_its_id() {
+    let grant = oauth_grant(OAUTH_GRANT_ID, "github", "active");
+    let (server, _directory, credential) = prepared(vec![
+        page(&[grant], None),
+        uses(&three_uses()),
+        identities(ada()),
+    ]);
+    let output = run_grant(&server, &credential, &["list", "github", "--json"]);
+
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert_eq!(
+        json_output(&output)["grant"]["uses"]
+            .as_array()
+            .map(Vec::len),
+        Some(3)
+    );
+    let requests = server.finish();
+    assert_member_requests(&requests);
+    assert_eq!(
+        request_lines(&requests),
+        [LIST_FIRST_PAGE, READ_USES, READ_IDENTITIES]
+    );
+}
+
+// REQ-GRANT-64: a failed uses read ends the command as a failed grant read does.
+#[test]
+fn list_grant_whose_uses_read_fails_exits_1_as_a_failed_grant_read_does() {
+    let grant = oauth_grant(OAUTH_GRANT_ID, "github", "active");
+    let not_found = || problem("404 Not Found", 404, "grant-not-found");
+    let (server, _directory, credential) = prepared(vec![not_found(), one(&grant), not_found()]);
+    let read = run_grant(&server, &credential, &["list", OAUTH_GRANT_ID, "--json"]);
+    let listed = run_grant(&server, &credential, &["list", OAUTH_GRANT_ID, "--json"]);
+
+    assert_eq!(read.status.code(), Some(1));
+    assert_eq!(json_output(&read)["outcome"], "grant_not_found");
+    assert_eq!(listed.status.code(), Some(1));
+    assert_eq!(json_output(&listed), json_output(&read));
+    let requests = server.finish();
+    assert_member_requests(&requests);
+    assert_eq!(requests.len(), 3);
+}
+
+// REQ-GRANT-64
+#[test]
+fn a_uses_limit_out_of_range_or_without_a_grant_exits_2_before_anything_is_sent() {
+    let (server, _directory, credential) = prepared(vec![]);
+    for args in [
+        &["list", OAUTH_GRANT_ID, "--uses", "0"][..],
+        &["list", OAUTH_GRANT_ID, "--uses", "201"],
+        &["list", "--uses", "20"],
+        &["list", "--uses", "20", "--json"],
+    ] {
+        let output = run_grant(&server, &credential, args);
+        assert_eq!(output.status.code(), Some(2), "{args:?}");
+        assert!(output.stdout.is_empty(), "{args:?}");
+    }
+    assert!(server.finish().is_empty());
 }
 
 // REQ-GRANT-65

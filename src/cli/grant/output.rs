@@ -13,7 +13,7 @@ use super::authorize::{MOVE_CODEX_GRANT, Outcome};
 use super::projection::{MemberStatus, PROVIDERS, grant_authorization_status, grant_subject};
 use super::runner_choice::{Nothing, Runner};
 use crate::exit_code::{ExitCode, OutcomeClass};
-use um_api::{MemberGrant, MemberGrantFailure, MemberGrantKind};
+use um_api::{GrantUse, MemberGrant, MemberGrantFailure, MemberGrantKind};
 
 /// The names the member's other reads give a grant's account: each linked identity's, and
 /// each organization's slug, by ID.
@@ -86,8 +86,8 @@ struct GrantView<'a> {
     detail: Option<DetailView<'a>>,
 }
 
-/// What `um grant list GRANT` adds for each kind: an OAuth grant's scopes, last use and
-/// expiries; a native grant's record, import and ended authorizations.
+/// What `um grant list GRANT` adds for each kind: an OAuth grant's scopes, last use, expiries
+/// and the tokens issued from it; a native grant's record, import and ended authorizations.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct DetailView<'a> {
@@ -109,6 +109,39 @@ struct DetailView<'a> {
     revoked_at: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     ended_authorizations: Option<Vec<EndedAuthorizationView<'a>>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    uses: Option<Vec<UseView<'a>>>,
+}
+
+/// One token issued from an OAuth grant (REQ-GRANT-8): where it went and when, never the token.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UseView<'a> {
+    id: &'a str,
+    run_id: &'a str,
+    assignment_id: &'a str,
+    organization_id: &'a str,
+    issued_at: &'a str,
+}
+
+impl<'a> UseView<'a> {
+    fn new(issued: &'a GrantUse) -> Self {
+        Self {
+            id: &issued.id,
+            run_id: &issued.run_id,
+            assignment_id: &issued.assignment_id,
+            organization_id: &issued.organization_id,
+            issued_at: &issued.issued_at,
+        }
+    }
+
+    fn write_human(&self, output: &mut impl Write) -> io::Result<()> {
+        writeln!(output, "  use: {}", self.id)?;
+        writeln!(output, "    issued: {}", self.issued_at)?;
+        writeln!(output, "    run: {}", self.run_id)?;
+        writeln!(output, "    assignment: {}", self.assignment_id)?;
+        writeln!(output, "    organization: {}", self.organization_id)
+    }
 }
 
 impl<'a> DetailView<'a> {
@@ -126,6 +159,7 @@ impl<'a> DetailView<'a> {
                 .ended_authorizations
                 .as_deref()
                 .map(ended_authorization_views),
+            uses: None,
         }
     }
 
@@ -224,6 +258,20 @@ impl<'a> GrantView<'a> {
         for authorization in ended {
             authorization.write_human(output)?;
         }
+        match self
+            .detail
+            .as_ref()
+            .and_then(|detail| detail.uses.as_deref())
+        {
+            Some([]) => writeln!(output, "uses: none")?,
+            Some(uses) => {
+                writeln!(output, "uses: {}", uses.len())?;
+                for issued in uses {
+                    issued.write_human(output)?;
+                }
+            }
+            None => {}
+        }
         Ok(())
     }
 }
@@ -309,14 +357,19 @@ struct GrantResult<'a> {
     grant: GrantView<'a>,
 }
 
-/// Writes one grant in detail (REQ-GRANT-64).
+/// Writes one grant in detail (REQ-GRANT-64), with the tokens issued from it, newest first,
+/// when it is an OAuth grant.
 pub(super) fn write_grant(
     deployment: &str,
     grant: &MemberGrant,
     accounts: &Accounts,
+    uses: Option<&[GrantUse]>,
     json: bool,
 ) -> anyhow::Result<ExitCode> {
-    let view = GrantView::new(grant, accounts, true);
+    let mut view = GrantView::new(grant, accounts, true);
+    if let Some(detail) = &mut view.detail {
+        detail.uses = uses.map(|uses| uses.iter().map(UseView::new).collect());
+    }
     if json {
         write_json(&GrantResult {
             schema_version: 1,

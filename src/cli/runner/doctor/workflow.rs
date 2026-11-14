@@ -1,4 +1,4 @@
-//! The workflow mode of `um runner doctor` (REQ-CREDREADY-1 to REQ-CREDREADY-25): the
+//! The workflow mode of `um runner doctor` (REQ-CREDREADY-1 to REQ-CREDREADY-26): the
 //! credentials a workflow tree declares, with what Cloud holds for the organization and a named
 //! project when `--readiness` asks and what the member holds of each provider when `--grants`
 //! asks, printed as a checklist or a JSON document. `--connect` first runs the grant flow of
@@ -14,12 +14,13 @@ use crate::cli::CommandFailure;
 use crate::exit_code::ExitCode;
 use um_human_auth::Deployment;
 use um_runner::{
-    CredentialRequirement, Declaration, DeclarationKind, Node, NodeKind, OriginDeclaration,
-    RepositorySource, UnknownDeclaration, WorkflowCredentials, read_workflow_credentials,
+    CredentialRequirement, CredentialSummary, Declaration, DeclarationKind, Node, NodeKind,
+    OriginDeclaration, RepositorySource, UnknownDeclaration, WorkflowCredentials,
+    read_workflow_credentials,
 };
 
 use super::super::super::grant::{Flow, output};
-use super::grants::{self, Held};
+use super::grants::{self, Failing, Held, Shortfall};
 use super::readiness::{self, Readiness, Repository};
 use super::roots::Roots;
 
@@ -277,6 +278,42 @@ struct Report<'a> {
     deployment: Option<&'a str>,
 }
 
+impl Report<'_> {
+    /// Why `--require-grants` fails `requirement` on the member's grants (REQ-CREDREADY-26). A
+    /// requirement `--readiness` already fails keeps its state and code.
+    fn shortfall(&self, requirement: &CredentialRequirement) -> Option<Shortfall> {
+        if requirement.fails() {
+            return None;
+        }
+        self.grants.as_ref()?.shortfall(requirement.kind)
+    }
+
+    /// The requirements by state, each one `--require-grants` fails counted in its failing
+    /// state rather than as `unverified`.
+    fn summary(&self) -> CredentialSummary {
+        let mut summary = self.credentials.summary();
+        for requirement in &self.credentials.requirements {
+            if let Some(shortfall) = self.shortfall(requirement) {
+                summary.unverified -= 1;
+                match shortfall.state {
+                    Failing::Missing => summary.missing += 1,
+                    Failing::ReconnectRequired => summary.reconnect_required += 1,
+                }
+            }
+        }
+        summary
+    }
+
+    /// Whether a requirement reads `missing`, `reconnect_required` or `insufficient_permission`
+    /// (REQ-CREDREADY-17, REQ-CREDREADY-26).
+    fn fails(&self) -> bool {
+        self.credentials
+            .requirements
+            .iter()
+            .any(|requirement| requirement.fails() || self.shortfall(requirement).is_some())
+    }
+}
+
 /// Writes the report; the command fails when a requirement does (REQ-CREDREADY-17).
 fn write_report(report: &Report<'_>, format: Format) -> anyhow::Result<ExitCode> {
     match format {
@@ -294,7 +331,7 @@ fn write_report(report: &Report<'_>, format: Format) -> anyhow::Result<ExitCode>
                 .context("write JSON runner doctor report")?;
         }
     }
-    Ok(if report.credentials.fails() {
+    Ok(if report.fails() {
         ExitCode::GeneralFailure
     } else {
         ExitCode::Success
@@ -340,7 +377,7 @@ fn write_human_report_to(output: &mut impl Write, report: &Report<'_>) -> io::Re
         writeln!(output)?;
     }
 
-    let summary = credentials.summary();
+    let summary = report.summary();
     writeln!(output, "── summary ──")?;
     writeln!(output, "missing: {}", summary.missing)?;
     writeln!(output, "reconnect required: {}", summary.reconnect_required)?;
@@ -359,11 +396,20 @@ fn write_requirement(
     requirement: &CredentialRequirement,
     report: &Report<'_>,
 ) -> io::Result<()> {
-    let marker = if requirement.fails() { '✗' } else { '!' };
+    let shortfall = report.shortfall(requirement);
+    let marker = if requirement.fails() || shortfall.is_some() {
+        '✗'
+    } else {
+        '!'
+    };
     writeln!(output, "{marker} {}", requirement.kind.title())?;
     writeln!(output, "  kind: {}", requirement.kind.as_str())?;
-    writeln!(output, "  state: {}", requirement.state())?;
-    writeln!(output, "  code: {}", requirement.code.as_str())?;
+    writeln!(
+        output,
+        "  state: {}",
+        state(requirement, shortfall.as_ref())
+    )?;
+    writeln!(output, "  code: {}", code(requirement, shortfall.as_ref()))?;
     if let Some(cloud) = requirement.cloud() {
         writeln!(output, "  cloud: {cloud}")?;
     }
@@ -376,16 +422,35 @@ fn write_requirement(
         )?;
     }
     writeln!(output)?;
-    writeln!(
-        output,
-        "  {}",
-        requirement.next_action(report.organization, report.project)
-    )?;
+    writeln!(output, "  {}", next_action(requirement, shortfall, report))?;
     if let Some(held) = &report.grants {
         writeln!(output)?;
         held.of(requirement.kind).write_human(output)?;
     }
     writeln!(output)
+}
+
+/// A requirement's state, or the failing state `--require-grants` gives it (REQ-CREDREADY-26).
+fn state(requirement: &CredentialRequirement, shortfall: Option<&Shortfall>) -> &'static str {
+    shortfall.map_or_else(|| requirement.state(), |shortfall| shortfall.state.as_str())
+}
+
+/// A requirement's code, or the code `--require-grants` gives it (REQ-CREDREADY-26).
+fn code(requirement: &CredentialRequirement, shortfall: Option<&Shortfall>) -> &'static str {
+    shortfall.map_or_else(|| requirement.code.as_str(), |shortfall| shortfall.code)
+}
+
+/// A requirement's next action, or the next action of the grant status `--require-grants` fails
+/// it on, with the command it names (REQ-CREDREADY-26).
+fn next_action(
+    requirement: &CredentialRequirement,
+    shortfall: Option<Shortfall>,
+    report: &Report<'_>,
+) -> String {
+    shortfall.map_or_else(
+        || requirement.next_action(report.organization, report.project),
+        |shortfall| shortfall.next_action,
+    )
 }
 
 /// The human label of a declaration; the JSON document carries its stable identifier.
@@ -463,7 +528,7 @@ struct JsonReport<'a> {
 impl<'a> JsonReport<'a> {
     fn from_report(report: &'a Report<'a>, event: Option<&'static str>) -> Self {
         let credentials = &report.credentials;
-        let summary = credentials.summary();
+        let summary = report.summary();
         Self {
             schema_version: 1,
             event,
@@ -509,12 +574,13 @@ struct JsonRequirement<'a> {
 
 impl<'a> JsonRequirement<'a> {
     fn from_requirement(requirement: &'a CredentialRequirement, report: &'a Report<'a>) -> Self {
+        let shortfall = report.shortfall(requirement);
         Self {
             kind: requirement.kind.as_str(),
-            state: requirement.state(),
-            code: requirement.code.as_str(),
+            state: state(requirement, shortfall.as_ref()),
+            code: code(requirement, shortfall.as_ref()),
             cloud: requirement.cloud(),
-            next_action: requirement.next_action(report.organization, report.project),
+            next_action: next_action(requirement, shortfall, report),
             origins: requirement
                 .origins
                 .iter()

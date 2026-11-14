@@ -256,10 +256,16 @@ impl MemberStatus {
             "{indent}availability: {}",
             self.status.availability.as_str()
         )?;
+        writeln!(output, "{indent}next action: {}", self.next_action_text())
+    }
+
+    /// The next action as the text form prints it: the action, then the command or step it
+    /// names when it names one.
+    pub(in crate::cli) fn next_action_text(&self) -> String {
         let next_action = self.status.next_action.as_str();
         match &self.step {
-            Some(step) => writeln!(output, "{indent}next action: {next_action}: {step}"),
-            None => writeln!(output, "{indent}next action: {next_action}"),
+            Some(step) => format!("{next_action}: {step}"),
+            None => next_action.to_owned(),
         }
     }
 }

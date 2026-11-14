@@ -391,9 +391,14 @@ impl Drop for TreeBundle {
     }
 }
 
-/// The operator's Linear key and endpoint never reach a test's `um`: a mirrored run
+/// The operator's Linear credentials and endpoint never reach a test's `um`: a mirrored run
 /// writes to Linear only through a stub the test points it at (REQ-LOCALRUN-192).
-const MIRROR_VARIABLES: [&str; 2] = ["LINEAR_API_KEY", "UM_LINEAR_API_URL"];
+const MIRROR_VARIABLES: [&str; 4] = [
+    "LINEAR_API_KEY",
+    "UM_LINEAR_ACCESS_TOKEN",
+    "UM_LINEAR_ACCESS_TOKEN_FILE",
+    "UM_LINEAR_API_URL",
+];
 
 pub(super) fn isolated_command(args: &[String]) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_um"));

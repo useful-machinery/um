@@ -93,6 +93,15 @@ pub(super) struct Command {
     )]
     runner_id: Option<String>,
 
+    // A grant fails the report only when asked, and only on the named runner (REQ-CREDREADY-26).
+    #[arg(
+        long,
+        requires = "grants",
+        requires = "runner_id",
+        help = "Fail when you hold no grant the --runner-id runner can use for a provider the workflows need"
+    )]
+    require_grants: bool,
+
     #[arg(
         long,
         value_name = OrganizationArg::VALUE_NAME,
@@ -166,6 +175,7 @@ impl Command {
             let grants = (self.grants || self.connect).then(|| grants::Request {
                 organization: self.organization_id.as_deref(),
                 runner: self.runner_id.as_deref(),
+                require: self.require_grants,
                 policy: self.options.http.transport_policy(),
             });
             // The flow's defaults hold for the rest: Codex signs in by browser or by device code

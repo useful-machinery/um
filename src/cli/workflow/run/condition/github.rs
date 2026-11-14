@@ -1,6 +1,7 @@
 //! `github` / `pull_request.queue_settled` (REQ-WFEXEC-65): whether the pull request an
 //! `external` wait's rule names has left the merge queue. The pull request is read from the
-//! GitHub REST API with the operator's GitHub token and its queue entry from Mergify's, the
+//! GitHub REST API with the first GitHub token the environment offers (`GH_TOKEN_FILE`'s file,
+//! `GH_TOKEN`, `GITHUB_TOKEN`, else `gh auth token`) and its queue entry from Mergify's, the
 //! repository's merge queue, with `MERGIFY_TOKEN` when the CLI's environment holds one and else
 //! with that GitHub token, through `um_api::provider_get`. `UM_GITHUB_API_URL` and
 //! `UM_MERGIFY_API_URL` override the two base URLs for development and tests, and admit
@@ -13,6 +14,7 @@ use serde_json::{Map, Value};
 use time::format_description::well_known::Rfc3339;
 use um_api::{HttpTransportPolicy, provider_get};
 use um_execution::{ConditionError, ExternalEvent, WaitRecord};
+use zeroize::Zeroizing;
 
 pub(super) const SOURCE: &str = "github";
 pub(super) const QUEUE_SETTLED: &str = "pull_request.queue_settled";
@@ -21,6 +23,8 @@ const GITHUB_API: &str = "https://api.github.com";
 const MERGIFY_API: &str = "https://api.mergify.com";
 const GITHUB_API_VARIABLE: &str = "UM_GITHUB_API_URL";
 const MERGIFY_API_VARIABLE: &str = "UM_MERGIFY_API_URL";
+const TOKEN_FILE_VARIABLE: &str = "GH_TOKEN_FILE";
+const GRANT_VARIABLE: &str = "GH_TOKEN";
 const TOKEN_VARIABLE: &str = "GITHUB_TOKEN";
 const MERGIFY_TOKEN_VARIABLE: &str = "MERGIFY_TOKEN";
 const PULL_REQUEST_PREFIX: &str = "https://github.com/";
@@ -162,31 +166,38 @@ pub(super) fn observe_queue_settled(
     )
 }
 
-/// `GITHUB_TOKEN` when set and non-empty, else the trimmed output of `gh auth token`.
-fn token() -> Result<String, ConditionError> {
+/// The first GitHub token the environment offers (REQ-WFEXEC-65): the trimmed token in the
+/// file `GH_TOKEN_FILE` names, else `GH_TOKEN`, as `mirror::offered_token` takes the pair,
+/// else `GITHUB_TOKEN` when set and non-empty, else the trimmed output of `gh auth token`.
+/// Read at each observation, so a token file the runner replaced is read anew.
+fn token() -> Result<Zeroizing<String>, ConditionError> {
+    if let Some(token) = super::super::mirror::offered_token(TOKEN_FILE_VARIABLE, GRANT_VARIABLE) {
+        return Ok(token);
+    }
     if let Some(token) = std::env::var(TOKEN_VARIABLE)
         .ok()
         .filter(|token| !token.is_empty())
     {
-        return Ok(token);
+        return Ok(Zeroizing::new(token));
     }
     let output = Command::new("gh")
         .args(["auth", "token"])
         .output()
         .map_err(|error| {
             ConditionError::unavailable(format!(
-                "No GitHub token: {TOKEN_VARIABLE} is unset and `gh auth token` could not run: {error}."
+                "No GitHub token: the file {TOKEN_FILE_VARIABLE} names, {GRANT_VARIABLE} and {TOKEN_VARIABLE} hold none and `gh auth token` could not run: {error}."
             ))
         })?;
     let token = String::from_utf8(output.stdout)
         .ok()
-        .map(|token| token.trim().to_owned())
+        .map(Zeroizing::new)
+        .map(|token| Zeroizing::new(token.trim().to_owned()))
         .filter(|token| {
             output.status.success() && !token.is_empty() && !token.contains(char::is_whitespace)
         });
     token.ok_or_else(|| {
         ConditionError::unavailable(format!(
-            "No GitHub token: {TOKEN_VARIABLE} is unset and `gh auth token` answered none; run `gh auth login` or set {TOKEN_VARIABLE}."
+            "No GitHub token: the file {TOKEN_FILE_VARIABLE} names, {GRANT_VARIABLE} and {TOKEN_VARIABLE} hold none and `gh auth token` answered none; run `gh auth login` or set {TOKEN_FILE_VARIABLE}, {GRANT_VARIABLE} or {TOKEN_VARIABLE}."
         ))
     })
 }

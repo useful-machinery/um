@@ -2125,6 +2125,329 @@ fn runner_doctor_grants_refuses_incomplete_or_unrequested_options() {
     assert!(deployment.server.finish().is_empty());
 }
 
+/// A tree that needs GitHub, by a required tool, Linear, by a forwarded key, and Claude Code,
+/// by an agent step.
+fn require_grants_tree() -> WorkflowTree {
+    single_file_tree(&LINEAR_WORKFLOW.replace(
+        "environmentPassthrough: [LINEAR_API_KEY]",
+        "environmentPassthrough: [LINEAR_API_KEY]\nrequires: {tools: [gh]}",
+    ))
+}
+
+const LINEAR_GRANT_ID: &str = "pgr_01k0z6r1w8f4jy2m7q9v3x5abe";
+
+/// An active Linear grant authorized for `runner` alone.
+fn linear_grant_for(runner: &str) -> Value {
+    let mut linear = oauth_grant(LINEAR_GRANT_ID, "linear", "active");
+    linear["authorizations"][0]["runnerId"] = runner.into();
+    linear
+}
+
+/// A Claude Code grant authorized for `RUNNER_ID`, whose runner made `report`, or none.
+fn claude_code_grant(report: Option<Value>) -> Value {
+    let mut grant = native_grant_in_use();
+    grant["provider"] = "claude_code".into();
+    let authorization = grant["authorizations"][0]
+        .as_object_mut()
+        .expect("authorization should be an object");
+    match report {
+        None => authorization.remove("report"),
+        Some(report) => authorization.insert("report".to_owned(), report),
+    };
+    grant
+}
+
+/// A second Claude Code grant, authorized for no runner.
+fn unauthorized_claude_code_grant() -> Value {
+    let mut grant = claude_code_grant(None);
+    grant["id"] = "agl_01k0z6r1w8f4jy2m7q9v3x5abd".into();
+    grant["authorizations"] = json!([]);
+    grant
+}
+
+/// A runner's report of the Claude Code grant at its generation.
+fn runner_report(state: &str, last_use: Option<&str>) -> Value {
+    let mut report = json!({"state": state, "generation": 2, "reportedAt": "2026-11-02T10:07:00Z"});
+    if let Some(last_use) = last_use {
+        report["lastUse"] = last_use.into();
+    }
+    report
+}
+
+/// Asserts that the requirement of `kind` reads `state` with `code` and that its next action
+/// is the grant status's `next_action`, with `command` when it names one.
+fn assert_grant_fails(
+    report: &Value,
+    kind: &str,
+    state: &str,
+    code: &str,
+    next_action: &str,
+    command: &str,
+) {
+    let requirement = requirement(report, kind);
+    assert_eq!(requirement["state"], state, "{kind}: {requirement}");
+    assert_eq!(requirement["code"], code, "{kind}: {requirement}");
+    let text = self::next_action(requirement);
+    assert!(text.starts_with(next_action), "{kind}: {text}");
+    assert!(text.contains(command), "{kind}: {text}");
+}
+
+// REQ-CREDREADY-26, REQ-CREDREADY-18, REQ-CREDREADY-17
+#[test]
+fn runner_doctor_require_grants_fails_on_a_grant_the_runner_cannot_use() {
+    let tree = require_grants_tree();
+    let offline = json_report(&doctor(&tree, true));
+    let grants = || {
+        page(
+            &[
+                oauth_grant(OAUTH_GRANT_ID, "github", "active"),
+                linear_grant_for(ENDED_RUNNER_ID),
+            ],
+            None,
+        )
+    };
+    let deployment = Deployment::signed_in(vec![grants(), grants(), grants()]);
+    let require: &[&str] = &["--runner-id", RUNNER_ID, "--require-grants"];
+
+    let output = deployment.doctor_grants(&tree, true, require);
+
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let report = json_report(&output);
+    for field in ["state", "code", "cloud", "nextAction"] {
+        assert_eq!(
+            requirement(&report, "github")[field],
+            requirement(&offline, "github")[field],
+            "github {field}"
+        );
+    }
+    assert_grant_fails(
+        &report,
+        "linear",
+        "missing",
+        "grant_not_authorized",
+        "authorize_runner",
+        &format!("um grant authorize {LINEAR_GRANT_ID}"),
+    );
+    assert_grant_fails(
+        &report,
+        "claude_code",
+        "missing",
+        "grant_not_connected",
+        "connect",
+        "um grant create claude_code",
+    );
+    // The grants beside each requirement are those `--grants` shows.
+    assert_eq!(held(&report, "linear")["nextAction"], "authorize_runner");
+    assert_eq!(report["summary"]["missing"], 2);
+    assert_eq!(report["summary"]["unverified"], 1);
+
+    let human = deployment.doctor_grants(&tree, false, require);
+
+    assert_eq!(human.status.code(), Some(1), "{human:?}");
+    let stdout = String::from_utf8(human.stdout).expect("report should be UTF-8");
+    for fragment in ["grant_not_authorized", "grant_not_connected", "missing: 2"] {
+        assert!(
+            stdout.contains(fragment),
+            "{fragment} missing from:\n{stdout}"
+        );
+    }
+
+    // Without the option the report is that of `--grants` (REQ-CREDREADY-18).
+    let unrequired = deployment.doctor_grants(&tree, true, &["--runner-id", RUNNER_ID]);
+
+    assert_eq!(unrequired.status.code(), Some(0), "{unrequired:?}");
+    let unrequired = json_report(&unrequired);
+    for kind in ["github", "linear", "claude_code"] {
+        for field in ["state", "code", "cloud", "nextAction"] {
+            assert_eq!(
+                requirement(&unrequired, kind)[field],
+                requirement(&offline, kind)[field],
+                "{kind} {field}"
+            );
+        }
+    }
+    assert_eq!(unrequired["summary"], offline["summary"]);
+    assert_only_grants_lists(deployment, 3);
+}
+
+// REQ-CREDREADY-26
+#[test]
+fn runner_doctor_require_grants_fails_on_a_grant_that_needs_reconnecting_or_is_not_ready() {
+    let tree = require_grants_tree();
+    let github = || oauth_grant(OAUTH_GRANT_ID, "github", "active");
+    let linear = || linear_grant_for(RUNNER_ID);
+    let cases = [
+        (
+            vec![
+                github(),
+                oauth_grant(LINEAR_GRANT_ID, "linear", "reconnect_required"),
+                claude_code_grant(Some(runner_report("ready", Some("accepted")))),
+            ],
+            "linear",
+            "reconnect_required",
+            "grant_reconnect_required",
+            "reconnect",
+            "um grant create linear --replace",
+        ),
+        (
+            vec![
+                github(),
+                linear(),
+                claude_code_grant(Some(runner_report("install_failed", None))),
+            ],
+            "claude_code",
+            "missing",
+            "grant_not_ready",
+            "sync_runner",
+            "um runner grant sync",
+        ),
+        // The runner's service has a login of its own, which a step would run on.
+        (
+            vec![
+                github(),
+                linear(),
+                claude_code_grant(Some(runner_report("foreign_login", None))),
+            ],
+            "claude_code",
+            "missing",
+            "grant_not_ready",
+            "resolve_service_login",
+            "",
+        ),
+        // A grant authorized for the runner is reported before one that is not.
+        (
+            vec![
+                github(),
+                linear(),
+                unauthorized_claude_code_grant(),
+                claude_code_grant(Some(runner_report("install_failed", None))),
+            ],
+            "claude_code",
+            "missing",
+            "grant_not_ready",
+            "sync_runner",
+            "um runner grant sync",
+        ),
+    ];
+    for (grants, kind, state, code, next_action, command) in cases {
+        let deployment = Deployment::signed_in(vec![page(&grants, None)]);
+
+        let output =
+            deployment.doctor_grants(&tree, true, &["--runner-id", RUNNER_ID, "--require-grants"]);
+
+        assert_eq!(output.status.code(), Some(1), "{kind} {code}: {output:?}");
+        let report = json_report(&output);
+        assert_grant_fails(&report, kind, state, code, next_action, command);
+        for other in ["github", "linear", "claude_code"] {
+            if other != kind {
+                assert_eq!(
+                    requirement(&report, other)["state"],
+                    "unverified",
+                    "{kind} {code}: {other}"
+                );
+            }
+        }
+        assert_only_grants_lists(deployment, 1);
+    }
+}
+
+// REQ-CREDREADY-26
+#[test]
+fn runner_doctor_require_grants_passes_grants_the_runner_can_use() {
+    let tree = require_grants_tree();
+    let offline = json_report(&doctor(&tree, true));
+    // Available, unverified at its generation and pending the runner's report.
+    for claude_code in [
+        claude_code_grant(Some(runner_report("ready", Some("accepted")))),
+        claude_code_grant(Some(runner_report("ready", None))),
+        claude_code_grant(None),
+    ] {
+        let grants = page(
+            &[
+                linear_grant_for(ENDED_RUNNER_ID),
+                oauth_grant(OAUTH_GRANT_ID, "github", "active"),
+                linear_grant_for(RUNNER_ID),
+                claude_code,
+            ],
+            None,
+        );
+        let deployment = Deployment::signed_in(vec![grants]);
+
+        let output =
+            deployment.doctor_grants(&tree, true, &["--runner-id", RUNNER_ID, "--require-grants"]);
+
+        assert_eq!(output.status.code(), Some(0), "{output:?}");
+        let report = json_report(&output);
+        for kind in ["github", "linear", "claude_code"] {
+            for field in ["state", "code", "cloud", "nextAction"] {
+                assert_eq!(
+                    requirement(&report, kind)[field],
+                    requirement(&offline, kind)[field],
+                    "{kind} {field}"
+                );
+            }
+        }
+        assert_eq!(report["summary"], offline["summary"]);
+        assert_only_grants_lists(deployment, 1);
+    }
+}
+
+// REQ-CREDREADY-26, REQ-CREDREADY-17
+#[test]
+fn runner_doctor_require_grants_keeps_a_failing_readiness_code() {
+    let tree = single_file_tree(LINEAR_WORKFLOW);
+    let deployment = Deployment::signed_in(vec![
+        connection_page(&[], None),
+        page(&[linear_grant_for(ENDED_RUNNER_ID)], None),
+    ]);
+
+    // An organization named by ID is not read before the member's grants.
+    let output = deployment.run_doctor(
+        &deployment.server.api_url,
+        &tree,
+        true,
+        &[
+            &["--readiness", "--organization-id", ORGANIZATION_ID],
+            &["--grants", "--runner-id", RUNNER_ID, "--require-grants"],
+        ],
+        &[],
+    );
+
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let report = json_report(&output);
+    let linear = requirement(&report, "linear");
+    assert_eq!(linear["state"], "missing");
+    assert_eq!(linear["code"], "not_connected");
+    assert!(
+        next_action(linear).contains("um connection linear authorization create"),
+        "{linear}"
+    );
+    assert_eq!(
+        requirement(&report, "claude_code")["code"],
+        "grant_not_connected"
+    );
+}
+
+// REQ-CREDREADY-26
+#[test]
+fn runner_doctor_require_grants_needs_the_grants_read_on_a_runner() {
+    let tree = require_grants_tree();
+    let deployment = Deployment::signed_in(Vec::new());
+    let cases: [&[&str]; 3] = [
+        &["--require-grants"],
+        &["--grants", "--require-grants"],
+        &["--connect", "--runner-id", RUNNER_ID, "--require-grants"],
+    ];
+    for options in cases {
+        let output =
+            deployment.run_doctor(&deployment.server.api_url, &tree, true, &[options], &[]);
+
+        assert_eq!(output.status.code(), Some(2), "{options:?}: {output:?}");
+        assert!(output.stdout.is_empty(), "{options:?}");
+    }
+    assert!(deployment.server.finish().is_empty());
+}
+
 // REQ-CREDREADY-22
 #[test]
 fn runner_doctor_grants_ends_without_a_report_when_not_signed_in() {

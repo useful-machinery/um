@@ -78,7 +78,8 @@ inputs:
 /// (`ISSUE_UPDATED_AT`), and its team, `team-auto` until it is moved, with the team's
 /// states, `STATES` until one is renamed, and each mutation with `success` true, or with
 /// HTTP 500 and a GraphQL error while it fails mutations. A mutation it is told to hold stays
-/// in flight, unanswered, until it is released. It records every body in order.
+/// in flight, unanswered, until it is released. It records every body in order, and the
+/// `Authorization` value each request carried.
 pub(super) struct LinearStub {
     base: String,
     state: Arc<Mutex<StubState>>,
@@ -97,6 +98,8 @@ struct StubState {
     hold: Option<String>,
     held: bool,
     bodies: Vec<Value>,
+    /// Each request's `Authorization` value, empty when it carried none, in order.
+    authorizations: Vec<String>,
 }
 
 impl LinearStub {
@@ -114,6 +117,7 @@ impl LinearStub {
             hold: None,
             held: false,
             bodies: Vec::new(),
+            authorizations: Vec::new(),
         }));
         let served = Arc::clone(&state);
         let released = Arc::new(Condvar::new());
@@ -131,7 +135,7 @@ impl LinearStub {
                         continue;
                     }
                 };
-                let Some((path, body)) = parse_request(&request) else {
+                let Some((path, authorization, body)) = parse_request(&request) else {
                     continue;
                 };
                 let mut serving = served.lock().unwrap();
@@ -140,6 +144,7 @@ impl LinearStub {
                         .wait_while(serving, |state| state.hold.is_some())
                         .unwrap();
                 }
+                serving.authorizations.push(authorization);
                 let (status, answer) = serving.answer(&path, body);
                 drop(serving);
                 let answer = serde_json::to_vec(&answer).unwrap();
@@ -211,6 +216,11 @@ impl LinearStub {
         self.state.lock().unwrap().bodies.clone()
     }
 
+    /// The `Authorization` value of every request served so far, in order.
+    pub(super) fn authorizations(&self) -> Vec<String> {
+        self.state.lock().unwrap().authorizations.clone()
+    }
+
     /// The `operationName` of every request served so far, in order.
     pub(super) fn operations(&self) -> Vec<String> {
         self.bodies()
@@ -226,7 +236,9 @@ impl LinearStub {
 
     /// Forgets the requests served so far.
     pub(super) fn clear(&self) {
-        self.state.lock().unwrap().bodies.clear();
+        let mut state = self.state.lock().unwrap();
+        state.bodies.clear();
+        state.authorizations.clear();
     }
 
     /// Points `command` at the stub with the key `test`, as `MIRROR_OPERATOR`.
@@ -300,12 +312,24 @@ impl StubState {
     }
 }
 
-/// The framed request's path and JSON body (`Null` when the body is not JSON), or `None` when
-/// the peer closed before a complete head or the request line names no path.
-fn parse_request(request: &[u8]) -> Option<(String, Value)> {
+/// The framed request's path, `Authorization` value (empty without one) and JSON body (`Null`
+/// when the body is not JSON), or `None` when the peer closed before a complete head or the
+/// request line names no path.
+fn parse_request(request: &[u8]) -> Option<(String, String, Value)> {
     let (head, body) = um_test_support::split_request(request)?;
-    let path = String::from_utf8_lossy(head).split(' ').nth(1)?.to_owned();
-    Some((path, serde_json::from_slice(body).unwrap_or(Value::Null)))
+    let head = String::from_utf8_lossy(head);
+    let path = head.split(' ').nth(1)?.to_owned();
+    let authorization = head
+        .lines()
+        .filter_map(|line| line.split_once(':'))
+        .find(|(name, _)| name.eq_ignore_ascii_case("authorization"))
+        .map(|(_, value)| value.trim().to_owned())
+        .unwrap_or_default();
+    Some((
+        path,
+        authorization,
+        serde_json::from_slice(body).unwrap_or(Value::Null),
+    ))
 }
 
 /// The engineering tree whose root's steps are `DESIGN_STAGE_STEPS`, with or without its
@@ -515,6 +539,76 @@ fn a_failed_mirror_write_is_recorded_and_never_fails_the_run() {
         assert_eq!(write["code"], "mirror_credentials_unavailable", "{write}");
     }
     assert_eq!(stub.bodies(), Vec::<Value>::new());
+}
+
+/// The variable naming the file that holds the run's Linear grant token (REQ-LOCALRUN-192).
+const TOKEN_FILE_VARIABLE: &str = "UM_LINEAR_ACCESS_TOKEN_FILE";
+
+/// The variable holding the run's Linear grant token (REQ-LOCALRUN-192).
+const TOKEN_VARIABLE: &str = "UM_LINEAR_ACCESS_TOKEN";
+
+// REQ-LOCALRUN-192: the mirror writes with the first Linear credential the environment
+// offers, read anew for each hook: the token in the file `UM_LINEAR_ACCESS_TOKEN_FILE` names,
+// sent as `Bearer` before `UM_LINEAR_ACCESS_TOKEN` and `LINEAR_API_KEY`, and sent replaced by
+// a hook after the file is replaced; else `UM_LINEAR_ACCESS_TOKEN` as `Bearer`, a missing
+// file being skipped; else `LINEAR_API_KEY` bare.
+#[test]
+fn the_mirror_writes_with_the_first_linear_credential_the_environment_offers() {
+    let published = engineering(true);
+    let stub = LinearStub::start();
+    let files = tempfile::tempdir().unwrap();
+    let token_file = files.path().join("linear-token");
+    fs::write(&token_file, "grant-first\n").unwrap();
+
+    // The `onStart` comment is held in flight while the file is replaced, so the start hook
+    // has sent the first token and every later hook reads the second.
+    stub.hold_mutation("Engineering started by");
+    let mut command = creation(&published, "AUTO-4");
+    stub.point(&mut command)
+        .env(TOKEN_FILE_VARIABLE, &token_file)
+        .env(TOKEN_VARIABLE, "variable-token")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let process = command.spawn().unwrap();
+    super::poll_until(
+        "the held onStart write",
+        || stub.holding_mutation(),
+        |held| *held,
+    );
+    fs::write(&token_file, "grant-second\n").unwrap();
+    stub.release_mutation();
+    let terminal = completed(&process.wait_with_output().unwrap());
+    let run = PathBuf::from(terminal["runDirectory"].as_str().unwrap());
+    assert_eq!(run_record(&run)["outcome"], "landed");
+    assert_eq!(
+        stub.authorizations(),
+        [
+            "Bearer grant-first",
+            "Bearer grant-first",
+            "Bearer grant-second",
+            "Bearer grant-second",
+            "Bearer grant-second",
+            "Bearer grant-second",
+        ]
+    );
+    for (_, write) in mirror_writes(&run) {
+        assert_eq!(write["outcome"], "written", "{write}");
+    }
+
+    stub.clear();
+    let run = create(&published, "AUTO-5", |command| {
+        stub.point(command)
+            .env(TOKEN_FILE_VARIABLE, files.path().join("missing"))
+            .env(TOKEN_VARIABLE, "variable-token")
+    });
+    assert_eq!(run_record(&run)["outcome"], "landed");
+    assert_eq!(stub.authorizations(), ["Bearer variable-token"; 6]);
+
+    stub.clear();
+    let run = create(&published, "AUTO-6", |command| stub.point(command));
+    assert_eq!(run_record(&run)["outcome"], "landed");
+    assert_eq!(stub.authorizations(), ["test"; 6]);
 }
 
 /// The `design` stage's program in `a_failed_state_commit_writes_no_outcome_to_the_mirror`,
@@ -1221,17 +1315,19 @@ fn control_names(run: &Path) -> Vec<String> {
 }
 
 /// Checks that `output` is `leaf` refused `mirror_credentials_unavailable` with a message
-/// naming the variable.
+/// naming the three variables a Linear credential is read from (REQ-LOCALRUN-204).
 fn refused_without_key(output: &Output, leaf: &str) {
     let document = refused(output, leaf, "mirror_credentials_unavailable");
     let message = document["diagnostics"][0]["message"].as_str().unwrap();
-    assert!(message.contains("LINEAR_API_KEY"), "{document}");
+    for variable in [TOKEN_FILE_VARIABLE, TOKEN_VARIABLE, "LINEAR_API_KEY"] {
+        assert!(message.contains(variable), "{document}");
+    }
 }
 
 // SC-LOCALRUN-17, REQ-LOCALRUN-204, REQ-LOCALRUN-181, REQ-LOCALRUN-186: `withdraw` and
-// `cancel` of a mirrored waiting run from a shell whose `LINEAR_API_KEY` is unset or empty
-// are refused before anything changes and nothing is sent, and the same `cancel` with the key
-// ends the run and moves its issue.
+// `cancel` of a mirrored waiting run from a shell with no Linear credential, its
+// `LINEAR_API_KEY` unset or empty and no grant token, are refused before anything changes and
+// nothing is sent, and the same `cancel` with the key ends the run and moves its issue.
 #[test]
 fn ending_a_mirrored_waiting_run_without_the_key_is_refused_before_anything_changes() {
     let tree = MirroredWaitTree::publish(MIRRORED_WAIT_HEADER);
@@ -1267,6 +1363,43 @@ fn ending_a_mirrored_waiting_run_without_the_key_is_refused_before_anything_chan
     let (name, write) = writes.last().unwrap();
     assert_eq!(name, "0004-outcome.json");
     assert_eq!(write["outcome"], "written", "{write}");
+}
+
+// SC-LOCALRUN-17, REQ-LOCALRUN-204, REQ-LOCALRUN-192: the check before `withdraw` ends a
+// mirrored waiting run is for any Linear credential: a token file that is missing and an
+// empty `UM_LINEAR_ACCESS_TOKEN` are none, so it still refuses, and from a shell whose only
+// credential is `UM_LINEAR_ACCESS_TOKEN` it proceeds and moves the issue with that token.
+#[test]
+fn ending_a_mirrored_waiting_run_with_only_the_linear_access_token_proceeds() {
+    let tree = MirroredWaitTree::publish(MIRRORED_WAIT_HEADER);
+    let stub = LinearStub::start();
+    let files = tempfile::tempdir().unwrap();
+
+    let run = tree.waiting(&stub, "AUTO-1");
+    stub.clear();
+    let path = run.to_str().unwrap();
+    refused_without_key(
+        &tree.run_adjusted(&stub, &["withdraw", path, "--json"], |command| {
+            without_key(command)
+                .env(TOKEN_FILE_VARIABLE, files.path().join("missing"))
+                .env(TOKEN_VARIABLE, "")
+        }),
+        "withdraw",
+    );
+    assert_eq!(control_names(&run), Vec::<String>::new());
+    assert_eq!(stub.bodies(), Vec::<Value>::new());
+
+    let output = tree.run_adjusted(&stub, &["withdraw", path, "--json"], |command| {
+        without_key(command).env(TOKEN_VARIABLE, "variable-token")
+    });
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert_eq!(run_record(&run)["outcome"], "withdrawn");
+    let writes = mirror_writes(&run);
+    let (name, write) = writes.last().unwrap();
+    assert_eq!(name, "0004-outcome.json");
+    assert_eq!(write["outcome"], "written", "{write}");
+    assert_eq!(stub.operations(), ["IssueState", "UpdateIssueState"]);
+    assert_eq!(stub.authorizations(), ["Bearer variable-token"; 2]);
 }
 
 // REQ-LOCALRUN-204, REQ-LOCALRUN-186, REQ-CONTINUE-2: `cancel` of a mirrored `running` run

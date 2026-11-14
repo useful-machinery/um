@@ -3494,11 +3494,14 @@ impl QueueStub {
             .collect()
     }
 
-    /// `um` with `args`, its GitHub token `test`, no `MERGIFY_TOKEN` and both APIs at the stub.
+    /// `um` with `args`, its GitHub token `test` in `GITHUB_TOKEN` and no other GitHub token
+    /// name, no `MERGIFY_TOKEN` and both APIs at the stub.
     pub(super) fn command(&self, args: &[String]) -> std::process::Command {
         let mut command = isolated_command(args);
         command
             .env("GITHUB_TOKEN", "test")
+            .env_remove("GH_TOKEN")
+            .env_remove("GH_TOKEN_FILE")
             .env_remove("MERGIFY_TOKEN")
             .env("UM_GITHUB_API_URL", &self.base)
             .env("UM_MERGIFY_API_URL", &self.base)
@@ -3514,21 +3517,8 @@ impl QueueStub {
 // read, and continues at `merge` once the pull request is merged.
 #[test]
 fn an_external_wait_holds_while_queued_and_continues_once_merged() {
-    let bundle = loop_tree();
     let stub = QueueStub::start(QueueAnswer::Queued);
-    fs::write(
-        bundle.execution_root().join("verdict-design-pullRequest"),
-        QUEUED_PULL_REQUEST,
-    )
-    .unwrap();
-    decide(&bundle, "design", "planned");
-    decide(&bundle, "review", "proceed");
-    decide(&bundle, "merge", "admitted");
-    let destination = bundle.result("queued");
-    let documents = chained(&stub.command(&bundle.args(&destination)).output().unwrap());
-    assert_eq!(documents.len(), 1);
-    assert_eq!(documents[0]["outcome"], "waiting", "{}", documents[0]);
-    let run = fs::canonicalize(&destination).unwrap();
+    let (bundle, run) = admitted_to_the_queue(&stub);
     let wait = read_json(&run.join("wait.json"));
     assert_eq!(wait["kind"], "external", "{wait}");
     assert_eq!(wait["step"], serde_json::json!(["merge"]));
@@ -3596,6 +3586,114 @@ fn an_external_wait_holds_while_queued_and_continues_once_merged() {
     assert_eq!(record["state"], "exited", "{record}");
     assert_eq!(record["outcome"], "landed");
     assert_eq!(record["attempts"], 2);
+}
+
+/// The loop tree run through `merge` admitted to the queue for `QUEUED_PULL_REQUEST`, with
+/// its run directory, which waits on the queue.
+fn admitted_to_the_queue(stub: &QueueStub) -> (TreeBundle, std::path::PathBuf) {
+    let bundle = loop_tree();
+    fs::write(
+        bundle.execution_root().join("verdict-design-pullRequest"),
+        QUEUED_PULL_REQUEST,
+    )
+    .unwrap();
+    decide(&bundle, "design", "planned");
+    decide(&bundle, "review", "proceed");
+    decide(&bundle, "merge", "admitted");
+    let destination = bundle.result("queued");
+    let documents = chained(&stub.command(&bundle.args(&destination)).output().unwrap());
+    assert_eq!(documents.len(), 1);
+    assert_eq!(documents[0]["outcome"], "waiting", "{}", documents[0]);
+    let run = fs::canonicalize(&destination).unwrap();
+    (bundle, run)
+}
+
+// REQ-WFEXEC-65: the queue is read with the first GitHub token the CLI's environment offers:
+// the trimmed token in the file `GH_TOKEN_FILE` names, else `GH_TOKEN`, else `GITHUB_TOKEN`,
+// else `gh auth token`, which runs only when no variable answers; with no `MERGIFY_TOKEN`,
+// Mergify is read with that same token.
+#[test]
+fn an_external_wait_reads_the_queue_with_the_offered_github_token_first() {
+    let stub = QueueStub::start(QueueAnswer::Queued);
+    let (bundle, run) = admitted_to_the_queue(&stub);
+    let tools = bundle.execution_root().join("tools");
+    let gh_ran = tools.join("gh-ran");
+    let refusing = tools.join("refusing");
+    let answering = tools.join("answering");
+    for (directory, body) in [
+        (
+            &refusing,
+            format!("printf ran > '{}'\nexit 1", gh_ran.display()),
+        ),
+        (
+            &answering,
+            "test \"$*\" = 'auth token' && printf ' gh-token\\n'".to_owned(),
+        ),
+    ] {
+        fs::create_dir_all(directory).unwrap();
+        let gh = directory.join("gh");
+        fs::write(&gh, format!("#!/bin/sh\n{body}\n")).unwrap();
+        fs::set_permissions(&gh, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let grant = tools.join("grant-token");
+    fs::write(&grant, " grant-token\n").unwrap();
+    let grant = grant.to_string_lossy().into_owned();
+    let missing = tools.join("missing").to_string_lossy().into_owned();
+
+    // The bearer each read carries, GitHub's and then Mergify's, with `gh` first on `PATH`
+    // from `gh_directory`, the stub's `GITHUB_TOKEN` `test` and `set` applied over it.
+    let read = |gh_directory: &Path, set: &[(&str, Option<&str>)]| {
+        let before = stub.bearers().len();
+        let mut command = stub.command(&continue_args(&run, &[]));
+        let path = std::env::join_paths(std::iter::once(gh_directory.to_owned()).chain(
+            std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()),
+        ))
+        .unwrap();
+        command.env("PATH", path);
+        for (name, value) in set {
+            match value {
+                Some(value) => command.env(name, value),
+                None => command.env_remove(name),
+            };
+        }
+        let held = completed(&command.output().unwrap());
+        assert_eq!(held["outcome"], "waiting", "{held}");
+        stub.bearers()[before..]
+            .iter()
+            .map(|(_, bearer)| bearer.clone())
+            .collect::<Vec<_>>()
+    };
+    let both = |token: &str| vec![token.to_owned(), token.to_owned()];
+
+    assert_eq!(
+        read(
+            &refusing,
+            &[
+                ("GH_TOKEN_FILE", Some(&grant)),
+                ("GH_TOKEN", Some("gh-variable")),
+            ],
+        ),
+        both("grant-token")
+    );
+    assert_eq!(
+        read(
+            &refusing,
+            &[
+                ("GH_TOKEN_FILE", Some(&missing)),
+                ("GH_TOKEN", Some("gh-variable")),
+            ],
+        ),
+        both("gh-variable")
+    );
+    assert_eq!(read(&refusing, &[]), both("test"));
+    assert!(
+        !gh_ran.exists(),
+        "`gh` ran although a variable held a token"
+    );
+    assert_eq!(
+        read(&answering, &[("GITHUB_TOKEN", None)]),
+        both("gh-token")
+    );
 }
 
 /// The engineering shape (SC-CONTINUE-8): the loop tree's root with `review` handing back to

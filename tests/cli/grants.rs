@@ -221,13 +221,12 @@ fn uses_lists_the_tokens_issued_from_one_grant() {
             "nextCursor": "opaque-older-uses"
         })
     );
-    // Nothing replaces this earlier command, so the one line it prints on standard error names
-    // the command itself and no `um grant` or `um runner grant` command (REQ-GRANT-77).
+    // The one line this earlier command prints on standard error names it and the command
+    // that replaces it (REQ-GRANT-8, REQ-GRANT-77).
     let stderr = String::from_utf8(output.stderr.clone()).unwrap();
     let (notice, rest) = stderr.split_once('\n').unwrap_or((&stderr, ""));
-    assert!(notice.contains("um auth grant uses"), "{stderr}");
-    for replacement in ["um grant", "um runner grant"] {
-        assert!(!notice.contains(replacement), "{stderr}");
+    for command in ["um auth grant uses", "um grant list GRANT"] {
+        assert!(notice.contains(command), "{stderr}");
     }
     assert_eq!(rest, "", "{stderr}");
     assert_no_secret_output(&output, &[SENTINEL]);
