@@ -388,7 +388,9 @@ fn enrollment_journal_and_terminal_receipt_match_schemas_across_retries() {
             false,
             false,
         ),
-        Err(EnrollmentError::NetworkAmbiguous)
+        Err(EnrollmentError::NetworkAmbiguous(
+            AmbiguousCause::CloudUnavailable(500)
+        ))
     ));
     let journal_path = fixture.journal_path();
     let original = fs::read(&journal_path).expect("read staged journal");
@@ -461,11 +463,54 @@ fn enrollment_journal_and_terminal_receipt_match_schemas_across_retries() {
     write_artifact(&replacement_path, &replacement);
     assert!(matches!(
         enroll(Some(&replacement_path), &fixture.config_path, false, false,),
-        Err(EnrollmentError::NetworkAmbiguous)
+        Err(EnrollmentError::NetworkAmbiguous(
+            AmbiguousCause::CloudUnavailable(500)
+        ))
     ));
     let replacement_journal = fs::read(&journal_path).expect("read replacement journal");
     assert!(String::from_utf8_lossy(&replacement_journal).contains(OTHER_ACTIVATION_ID));
     replacement_server.finish_one();
+}
+
+// REQ-RUNNERENROLL-21
+#[test]
+fn an_ambiguous_enrollment_names_its_cause() {
+    for (response, expected, code) in [
+        (Vec::new(), AmbiguousCause::Network, "network"),
+        (
+            empty_response("429 Too Many Requests"),
+            AmbiguousCause::RateLimited,
+            "rate_limited",
+        ),
+        (
+            empty_response("503 Service Unavailable"),
+            AmbiguousCause::CloudUnavailable(503),
+            "cloud_unavailable",
+        ),
+    ] {
+        let server = ScriptedHttpServer::respond(response);
+        let fixture = EnrollmentFixture::new(&server, ACTIVATION_ID, future_time());
+
+        let result = enroll(
+            Some(&fixture.activation_path),
+            &fixture.config_path,
+            false,
+            false,
+        );
+
+        let Err(error) = result else {
+            panic!("expected an ambiguous outcome for {code}, got {result:?}");
+        };
+        let EnrollmentError::NetworkAmbiguous(cause) = error else {
+            panic!("expected an ambiguous outcome for {code}, got {error:?}");
+        };
+        assert_eq!(cause, expected);
+        assert_eq!(cause.code(), code);
+        // The failure `um runner enroll` prints is this error's message.
+        assert!(error.to_string().contains(code), "{error}");
+        assert!(fixture.journal_path().is_file(), "journal kept for {code}");
+        server.finish_one();
+    }
 }
 
 // REQ-RUNNERENROLL-22
@@ -710,7 +755,9 @@ fn an_unresolved_journal_refuses_a_different_activation_until_resumed() {
             false,
             false,
         ),
-        Err(EnrollmentError::NetworkAmbiguous)
+        Err(EnrollmentError::NetworkAmbiguous(
+            AmbiguousCause::CloudUnavailable(500)
+        ))
     ));
     let journal = fs::read(fixture.journal_path()).expect("read unresolved journal");
 
@@ -965,7 +1012,8 @@ fn an_interrupted_join_keeps_a_token_free_journal_and_resumes_the_same_request()
     assert!(matches!(
         join_unless_enrolled(
             &fixture.config_path,
-            join_key(&server, JOIN_KEY_ID, &future_time())
+            join_key(&server, JOIN_KEY_ID, &future_time()),
+            |_| {},
         ),
         Err(EnrollmentError::InvalidResponse)
     ));
@@ -985,6 +1033,7 @@ fn an_interrupted_join_keeps_a_token_free_journal_and_resumes_the_same_request()
     let outcome = join_unless_enrolled(
         &fixture.config_path,
         join_key(&server, JOIN_KEY_ID, &expired_time()),
+        |_| {},
     )
     .expect("resume the staged join even after the key's expiry");
     assert!(matches!(outcome, JoinOutcome::Joined(_)));
@@ -1024,7 +1073,8 @@ fn a_staged_join_names_its_journal_and_key_to_a_start_with_another_key_or_an_enr
     assert!(matches!(
         join_unless_enrolled(
             &fixture.config_path,
-            join_key(&server, JOIN_KEY_ID, &future_time())
+            join_key(&server, JOIN_KEY_ID, &future_time()),
+            |_| {},
         ),
         Err(EnrollmentError::InvalidResponse)
     ));
@@ -1047,6 +1097,7 @@ fn a_staged_join_names_its_journal_and_key_to_a_start_with_another_key_or_an_enr
     let error = join_unless_enrolled(
         &fixture.config_path,
         join_key(&server, OTHER_JOIN_KEY_ID, &future_time()),
+        |_| {},
     )
     .expect_err("another key cannot supersede a staged join");
     assert!(matches!(
@@ -1089,7 +1140,8 @@ fn a_resent_join_answered_unauthorized_keeps_and_names_its_journal() {
     assert!(matches!(
         join_unless_enrolled(
             &fixture.config_path,
-            join_key(&server, JOIN_KEY_ID, &future_time())
+            join_key(&server, JOIN_KEY_ID, &future_time()),
+            |_| {},
         ),
         Err(EnrollmentError::InvalidResponse)
     ));
@@ -1098,6 +1150,7 @@ fn a_resent_join_answered_unauthorized_keeps_and_names_its_journal() {
     let error = join_unless_enrolled(
         &fixture.config_path,
         join_key(&server, JOIN_KEY_ID, &future_time()),
+        |_| {},
     )
     .expect_err("Cloud rejected the resent join's token");
 
@@ -1126,6 +1179,60 @@ fn a_resent_join_answered_unauthorized_keeps_and_names_its_journal() {
     assert_eq!(server.finish().len(), 2);
 }
 
+// REQ-RUNNERENROLL-97, REQ-RUNNERENROLL-113
+#[test]
+fn a_join_refused_unauthorized_after_an_ambiguous_answer_in_the_same_start_keeps_its_journal() {
+    let server = ScriptedHttpServer::respond_in_sequence(vec![
+        empty_response("503 Service Unavailable"),
+        empty_response("401 Unauthorized"),
+    ]);
+    let fixture = EnrollmentFixture::new(&server, ACTIVATION_ID, future_time());
+    let mut retries = Vec::new();
+
+    let error = join_unless_enrolled(
+        &fixture.config_path,
+        join_key(&server, JOIN_KEY_ID, &future_time()),
+        |retry| retries.push(retry),
+    )
+    .expect_err("Cloud rejected the join's token after an ambiguous answer");
+
+    // The first send may have registered a runner, so the refusal of the
+    // second keeps the journal that alone holds its credential secret.
+    let EnrollmentError::StagedJoinUnauthorized {
+        journal,
+        join_key_id,
+    } = error
+    else {
+        panic!("expected the staged join's refusal, got {error:?}");
+    };
+    assert_eq!(
+        (journal, join_key_id),
+        (fixture.journal_path(), JOIN_KEY_ID.to_owned())
+    );
+    let journal_bytes = fs::read(fixture.journal_path()).expect("read kept join journal");
+    assert_json_matches_schema(
+        "runner enrollment journal",
+        ENROLLMENT_JOURNAL_SCHEMA,
+        &journal_bytes,
+    );
+    assert!(!String::from_utf8_lossy(&journal_bytes).contains(JOIN_SECRET));
+    assert!(!fixture.state_path.exists());
+
+    let [retry] = retries[..] else {
+        panic!("expected exactly one retry, got {retries:?}");
+    };
+    assert_eq!(retry.cause, AmbiguousCause::CloudUnavailable(503));
+    assert!(retry.delay <= Duration::from_secs(1), "{retry:?}");
+
+    let requests = server.finish();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(
+        request_header(&requests[0], "idempotency-key"),
+        request_header(&requests[1], "idempotency-key")
+    );
+    assert_eq!(request_body(&requests[0]), request_body(&requests[1]));
+}
+
 // REQ-RUNNERENROLL-97
 #[test]
 fn a_join_refused_gone_clears_its_journal_and_says_whether_it_was_resent() {
@@ -1139,6 +1246,7 @@ fn a_join_refused_gone_clears_its_journal_and_says_whether_it_was_resent() {
         join_unless_enrolled(
             &fixture.config_path,
             join_key(&server, JOIN_KEY_ID, &future_time()),
+            |_| {},
         )
     };
 
@@ -1218,7 +1326,7 @@ fn an_enrolled_host_removes_a_join_journal_its_state_already_holds() {
     .expect("persist joined state");
 
     assert!(matches!(
-        join_unless_enrolled(&fixture.config_path, key),
+        join_unless_enrolled(&fixture.config_path, key, |_| {}),
         Ok(JoinOutcome::AlreadyEnrolled)
     ));
     assert!(!fixture.journal_path().exists());

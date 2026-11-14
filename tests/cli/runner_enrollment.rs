@@ -233,11 +233,7 @@ fn enrolls_then_promotes_a_replacement_without_exposing_credential_material() {
     let enrolled_secret = state["currentCredential"]["secret"].as_str().unwrap();
     for output in [&output.stdout, &output.stderr, control_request.as_bytes()] {
         for secret in [CURRENT_SECRET, PENDING_SECRET, enrolled_secret] {
-            assert!(
-                !output
-                    .windows(secret.len())
-                    .any(|part| part == secret.as_bytes())
-            );
+            assert!(!bytes_contain(output, secret));
         }
     }
 }
@@ -274,16 +270,8 @@ fn retries_a_staged_replacement_through_the_secret_free_control_request() {
         "{\"schemaVersion\":1,\"operation\":\"reload_credential\"}\n"
     );
     for output in [&output.stdout, &output.stderr, request.as_bytes()] {
-        assert!(
-            !output
-                .windows(CURRENT_SECRET.len())
-                .any(|part| part == CURRENT_SECRET.as_bytes())
-        );
-        assert!(
-            !output
-                .windows(PENDING_SECRET.len())
-                .any(|part| part == PENDING_SECRET.as_bytes())
-        );
+        assert!(!bytes_contain(output, CURRENT_SECRET));
+        assert!(!bytes_contain(output, PENDING_SECRET));
     }
 }
 
@@ -352,16 +340,8 @@ fn reports_cloud_enrollment_separately_when_runner_serve_is_unreachable() {
     assert!(output.stderr.is_empty());
     assert_eq!(fs::read(&fixture.state).unwrap(), original);
     for output in [&output.stdout, &output.stderr] {
-        assert!(
-            !output
-                .windows(CURRENT_SECRET.len())
-                .any(|part| part == CURRENT_SECRET.as_bytes())
-        );
-        assert!(
-            !output
-                .windows(PENDING_SECRET.len())
-                .any(|part| part == PENDING_SECRET.as_bytes())
-        );
+        assert!(!bytes_contain(output, CURRENT_SECRET));
+        assert!(!bytes_contain(output, PENDING_SECRET));
     }
 }
 
@@ -697,11 +677,7 @@ fn assert_joined_state(host: &JoinHost, index: usize, connection_url: &str) -> S
     assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
     assert!(!host.journal.exists());
     let bytes = fs::read(&host.state).unwrap();
-    assert!(
-        !bytes
-            .windows(JOIN_SECRET.len())
-            .any(|part| part == JOIN_SECRET.as_bytes())
-    );
+    assert!(!bytes_contain(&bytes, JOIN_SECRET));
     let state = host.state_document();
     assert_eq!(state["runnerId"], JOINED_RUNNER_IDS[index]);
     assert_eq!(state["connectionUrl"], connection_url);
@@ -875,6 +851,101 @@ fn an_enrolled_host_serves_with_its_state_and_sends_no_join() {
     );
 }
 
+/// A test-only variable given to Runner Serve beside its join key: seeing it
+/// proves the observation read the serving process's environment.
+const ENVIRONMENT_WITNESS: &str = "UM_TEST_ENVIRONMENT_WITNESS";
+
+/// The raw environment block of the running process `pid`: on Linux its
+/// `/proc` entry; elsewhere the output of `ps`, which prints the arguments and
+/// then the environment of a process of the same user.
+fn process_environment(pid: u32) -> Vec<u8> {
+    if cfg!(target_os = "linux") {
+        return fs::read(format!("/proc/{pid}/environ")).unwrap();
+    }
+    let output = Command::new("/bin/ps")
+        .args(["eww", "-o", "command=", "-p", &pid.to_string()])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "ps: {}: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    output.stdout
+}
+
+fn bytes_contain(haystack: &[u8], needle: &str) -> bool {
+    haystack
+        .windows(needle.len())
+        .any(|part| part == needle.as_bytes())
+}
+
+/// Starts Runner Serve with the join key `artifact` in its environment and,
+/// once it connects to `witness`, observes the serving process's environment.
+/// A failure names `case` and never prints the environment, which holds the
+/// test's own ambient variables.
+fn assert_serving_environment_holds_no_join_key(
+    case: &str,
+    host: &JoinHost,
+    artifact: &str,
+    witness: &ConnectionWitness,
+) {
+    let mut serve = host.serve(
+        &[],
+        &[
+            (JOIN_KEY_VARIABLE, artifact),
+            (ENVIRONMENT_WITNESS, "present"),
+        ],
+    );
+    // `exec` keeps the process id and only the final image connects, so
+    // after the connection this id is the serving process.
+    let connected = witness.next_connection(&mut serve).is_some();
+    let environment = connected.then(|| process_environment(serve.child.id()));
+    let stderr = serve.stop();
+    let Some(environment) = environment else {
+        panic!("{case}: Runner Serve stopped before connecting: {stderr}");
+    };
+    assert!(
+        bytes_contain(&environment, &format!("{ENVIRONMENT_WITNESS}=present")),
+        "{case}: the observation does not hold {ENVIRONMENT_WITNESS}"
+    );
+    assert!(
+        !bytes_contain(&environment, JOIN_KEY_VARIABLE),
+        "{case}: the serving process holds {JOIN_KEY_VARIABLE}"
+    );
+    assert!(
+        !bytes_contain(&environment, JOIN_SECRET),
+        "{case}: the serving process holds the join secret"
+    );
+}
+
+// REQ-RUNNERENROLL-97
+#[test]
+fn the_serving_process_holds_no_join_key_in_its_environment() {
+    // A host that joins with the key.
+    let witness = ConnectionWitness::new();
+    let server = api_test_support::ScriptedHttpServer::respond(join_response(0, &witness.url));
+    let artifact = join_key_artifact(&join_base(&server), &future_expiry());
+    let host = JoinHost::new(&artifact);
+    assert_serving_environment_holds_no_join_key("a host that joins", &host, &artifact, &witness);
+    server.finish_one();
+
+    // A host already enrolled, which never contacts Cloud.
+    let witness = ConnectionWitness::new();
+    let cloud = TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("http://{}", cloud.local_addr().unwrap());
+    let artifact = join_key_artifact(&base, &future_expiry());
+    let host = JoinHost::new(&artifact);
+    host.write_enrolled_state(&witness.url);
+    assert_serving_environment_holds_no_join_key("an enrolled host", &host, &artifact, &witness);
+    cloud.set_nonblocking(true).unwrap();
+    assert_eq!(
+        cloud.accept().unwrap_err().kind(),
+        io::ErrorKind::WouldBlock
+    );
+}
+
 // REQ-RUNNERENROLL-97
 #[test]
 fn a_refused_join_key_stops_the_start_and_writes_no_state() {
@@ -929,6 +1000,43 @@ fn an_ambiguous_join_is_retried_as_the_same_request_and_makes_one_runner() {
         header_value(&requests[1], "idempotency-key")
     );
     assert_eq!(join_body(&requests[0]), join_body(&requests[1]));
+}
+
+// REQ-RUNNERENROLL-97, REQ-RUNNERENROLL-113
+#[test]
+fn a_join_retry_is_reported_and_a_later_unauthorized_answer_keeps_the_journal() {
+    let server = api_test_support::ScriptedHttpServer::respond_in_sequence(vec![
+        http_response("503 Service Unavailable", None, b""),
+        http_response("401 Unauthorized", None, b""),
+    ]);
+    let host = JoinHost::new(&join_key_artifact(&join_base(&server), &future_expiry()));
+
+    let (exit, stderr) = host.serve_with_key_file().wait_for_exit();
+
+    assert_eq!(exit.code(), Some(1), "{stderr}");
+    let lines: Vec<&str> = stderr.lines().map(str::trim).collect();
+    let cause = lines
+        .iter()
+        .position(|line| *line == "cause: cloud_unavailable")
+        .unwrap_or_else(|| panic!("no retry cause line: {stderr}"));
+    let refusal = lines
+        .iter()
+        .position(|line| *line == "code: join_key_unauthorized")
+        .unwrap_or_else(|| panic!("no refusal code line: {stderr}"));
+    assert!(cause < refusal, "{stderr}");
+    assert!(
+        lines[..cause].iter().any(|line| line.contains(JOIN_KEY_ID)),
+        "{stderr}"
+    );
+    assert!(!stderr.contains(JOIN_SECRET), "{stderr}");
+    assert!(host.journal.exists());
+    assert!(!host.state.exists());
+    let requests = server.finish();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(
+        header_value(&requests[0], "idempotency-key"),
+        header_value(&requests[1], "idempotency-key")
+    );
 }
 
 // REQ-RUNNERENROLL-97, REQ-RUNNERENROLL-17

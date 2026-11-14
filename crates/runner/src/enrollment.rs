@@ -829,17 +829,51 @@ impl JoinRefusal {
     }
 }
 
+/// Why an enrollment or join outcome is ambiguous, a closed category. Cloud
+/// may or may not have committed the request, so its journal is kept.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AmbiguousCause {
+    /// No complete answer: building the client, sending the request or
+    /// reading the response body failed.
+    Network,
+    /// 429: Cloud is limiting the rate of requests.
+    RateLimited,
+    /// A server error, with its status.
+    CloudUnavailable(u16),
+}
+
+impl AmbiguousCause {
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::Network => "network",
+            Self::RateLimited => "rate_limited",
+            Self::CloudUnavailable(_) => "cloud_unavailable",
+        }
+    }
+}
+
+/// One resend of a join whose outcome was ambiguous: why, and how long the
+/// join waits before it is sent again.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct JoinRetry {
+    pub cause: AmbiguousCause,
+    pub delay: Duration,
+}
+
 /// Joins the key's pool when the host holds no enrolled state, and otherwise
 /// leaves the state as it is and sends nothing. A staged join left by an
 /// interrupted start is resent before anything else, and an ambiguous outcome
 /// is resent with the service's reconnect backoff, so one host registers at
-/// most one runner. A definite refusal clears the journal and says whether an
-/// earlier send can have reached Cloud, except that a resent join whose token
-/// Cloud rejects keeps it. The key, and with it the token, is dropped when this
-/// returns.
+/// most one runner. Each such resend is handed to `observe_retry` with its
+/// cause and delay before the delay is slept, still under the state lock. A
+/// definite refusal clears the journal and says whether an earlier send can
+/// have reached Cloud, except that a resent join whose token Cloud rejects,
+/// whether an earlier start or this one sent it first, keeps it. The key, and
+/// with it the token, is dropped when this returns.
 pub fn join_unless_enrolled(
     config_path: &Path,
     key: JoinKeyArtifact,
+    mut observe_retry: impl FnMut(JoinRetry),
 ) -> Result<JoinOutcome, EnrollmentError> {
     let host = LockedStateDirectory::lock(config_path)?;
     let mode = host.mode;
@@ -887,9 +921,11 @@ pub fn join_unless_enrolled(
             }
             Err(EnrollmentError::Unauthorized) => JoinRefusal::Unauthorized,
             Err(EnrollmentError::Conflict) => JoinRefusal::Conflict,
-            Err(EnrollmentError::NetworkAmbiguous) => {
+            Err(EnrollmentError::NetworkAmbiguous(cause)) => {
                 resent = true;
-                um_support::sleep(backoff.next_delay());
+                let delay = backoff.next_delay();
+                observe_retry(JoinRetry { cause, delay });
+                um_support::sleep(delay);
                 continue;
             }
             Err(error) => return Err(error),
@@ -1015,7 +1051,7 @@ fn send_enrollment(
         .redirect(reqwest::redirect::Policy::none())
         .timeout(REQUEST_TIMEOUT)
         .build()
-        .map_err(|_| EnrollmentError::NetworkAmbiguous)?;
+        .map_err(|_| EnrollmentError::NetworkAmbiguous(AmbiguousCause::Network))?;
     let request = EnrollmentRequest {
         schema_version: 1,
         credential_secret_verifier: &journal.credential_secret_verifier,
@@ -1028,7 +1064,7 @@ fn send_enrollment(
         .header(reqwest::header::CONTENT_TYPE, "application/json")
         .body(body)
         .send()
-        .map_err(|_| EnrollmentError::NetworkAmbiguous)?;
+        .map_err(|_| EnrollmentError::NetworkAmbiguous(AmbiguousCause::Network))?;
     let status = response.status();
     if status == StatusCode::GONE {
         return Ok(EnrollmentHTTPOutcome::Gone);
@@ -1039,8 +1075,15 @@ fn send_enrollment(
     if status == StatusCode::CONFLICT {
         return Err(EnrollmentError::Conflict);
     }
-    if status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
-        return Err(EnrollmentError::NetworkAmbiguous);
+    if status == StatusCode::TOO_MANY_REQUESTS {
+        return Err(EnrollmentError::NetworkAmbiguous(
+            AmbiguousCause::RateLimited,
+        ));
+    }
+    if status.is_server_error() {
+        return Err(EnrollmentError::NetworkAmbiguous(
+            AmbiguousCause::CloudUnavailable(status.as_u16()),
+        ));
     }
     if status != StatusCode::CREATED {
         return Err(EnrollmentError::InvalidResponse);
@@ -1049,7 +1092,7 @@ fn send_enrollment(
     Read::by_ref(&mut response)
         .take(RESPONSE_LIMIT + 1)
         .read_to_end(&mut bytes)
-        .map_err(|_| EnrollmentError::NetworkAmbiguous)?;
+        .map_err(|_| EnrollmentError::NetworkAmbiguous(AmbiguousCause::Network))?;
     if bytes.len() as u64 > RESPONSE_LIMIT {
         return Err(EnrollmentError::InvalidResponse);
     }
@@ -2116,7 +2159,7 @@ pub enum EnrollmentError {
     RunnerMismatch,
     InvalidState,
     StateWrite,
-    NetworkAmbiguous,
+    NetworkAmbiguous(AmbiguousCause),
     Unauthorized,
     Conflict,
     InvalidResponse,
@@ -2181,8 +2224,16 @@ impl fmt::Display for EnrollmentError {
             Self::RunnerMismatch => "activation and local runner registration do not match",
             Self::InvalidState => "protected runner state is invalid",
             Self::StateWrite => "protected runner state could not be committed durably",
-            Self::NetworkAmbiguous => {
-                "enrollment outcome is ambiguous; resume the journal explicitly"
+            Self::NetworkAmbiguous(cause) => {
+                write!(
+                    formatter,
+                    "enrollment outcome is ambiguous ({}",
+                    cause.code()
+                )?;
+                if let AmbiguousCause::CloudUnavailable(status) = cause {
+                    write!(formatter, ", HTTP {status}")?;
+                }
+                return formatter.write_str("); resume the journal explicitly");
             }
             Self::Unauthorized => {
                 "activation authentication was rejected; the journal remains unresolved"

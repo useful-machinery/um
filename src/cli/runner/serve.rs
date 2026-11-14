@@ -13,10 +13,11 @@ use um_execution::{
     ClaudeCodeInstallationFailure, CodexInstallationFailure, PiInstallationFailure,
     ValidatedClaudeCodeInstallation, ValidatedCodexInstallation, ValidatedPiInstallation,
     discover_and_validate_claude_code_installation, discover_and_validate_codex_installation,
-    discover_and_validate_pi_installation,
+    discover_and_validate_pi_installation, human_duration,
 };
 use um_runner::{
-    Config, EnrollmentError, EnrollmentResponse, JoinKeyArtifact, JoinOutcome, JoinRefusal,
+    AmbiguousCause, Config, EnrollmentError, EnrollmentResponse, JoinKeyArtifact, JoinOutcome,
+    JoinRefusal, JoinRetry,
 };
 
 pub(super) const ABOUT: &str = "Serve run assignments";
@@ -261,7 +262,11 @@ fn join_unless_enrolled(
     join_key: JoinKeyArtifact,
 ) -> Result<(), super::super::CommandFailure> {
     let join_key_id = join_key.join_key_id().to_owned();
-    match um_runner::join_unless_enrolled(config_path, join_key) {
+    // The report is commentary: a failed write to stderr does not stop the join.
+    let report_retry = |retry| {
+        let _ = write_join_retry(&mut io::stderr().lock(), &join_key_id, retry);
+    };
+    match um_runner::join_unless_enrolled(config_path, join_key, report_retry) {
         Ok(JoinOutcome::AlreadyEnrolled) => Ok(()),
         Ok(JoinOutcome::Joined(response)) => {
             write_join(&mut io::stderr().lock(), &response)?;
@@ -310,6 +315,23 @@ fn write_join(output: &mut impl Write, response: &EnrollmentResponse) -> anyhow:
     writeln!(output, "pool:       {}", response.pool_name())?;
     writeln!(output, "credential: {}", response.credential_id())?;
     Ok(())
+}
+
+fn write_join_retry(
+    output: &mut impl Write,
+    join_key_id: &str,
+    retry: JoinRetry,
+) -> io::Result<()> {
+    let status = match retry.cause {
+        AmbiguousCause::CloudUnavailable(status) => format!(" (HTTP {status})"),
+        AmbiguousCause::Network | AmbiguousCause::RateLimited => String::new(),
+    };
+    writeln!(
+        output,
+        "join runner pool with join key {join_key_id}: no definite answer from Cloud{status}; sending the same join again in {}",
+        human_duration(retry.delay)
+    )?;
+    writeln!(output, "cause: {}", retry.cause.code())
 }
 
 const fn service_exit_code(requires_operator_recovery: bool) -> ExitCode {
@@ -366,6 +388,7 @@ fn configure_harness_installations(
 mod tests {
     use std::cell::Cell;
     use std::path::PathBuf;
+    use std::time::Duration;
 
     use super::*;
     use um_execution::ClaudeCodeIncompatibility;
@@ -478,6 +501,45 @@ mod tests {
         assert_eq!(config.pi_installation(), Some(&pi));
         assert_eq!(config.claude_code_installation(), None);
         assert_eq!(config.codex_installation(), None);
+    }
+
+    // REQ-RUNNERENROLL-113
+    #[test]
+    fn a_join_retry_report_names_the_key_its_cause_and_the_delay_handed_over() {
+        let join_key_id = "rjk_01k0z6r1w8f4jy2m7q9v3x5abc";
+        let mut output = Vec::new();
+
+        write_join_retry(
+            &mut output,
+            join_key_id,
+            JoinRetry {
+                cause: AmbiguousCause::RateLimited,
+                delay: Duration::from_millis(1500),
+            },
+        )
+        .unwrap();
+
+        let output = String::from_utf8(output).unwrap();
+        assert!(
+            output.lines().any(|line| line == "cause: rate_limited"),
+            "{output}"
+        );
+        assert!(output.contains(join_key_id), "{output}");
+        assert!(output.contains("1.5s"), "{output}");
+
+        // A delay under a tenth of a second is still the delay handed over.
+        let mut output = Vec::new();
+        write_join_retry(
+            &mut output,
+            join_key_id,
+            JoinRetry {
+                cause: AmbiguousCause::Network,
+                delay: Duration::from_millis(40),
+            },
+        )
+        .unwrap();
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("40ms"), "{output}");
     }
 
     // REQ-RUNNERENROLL-97

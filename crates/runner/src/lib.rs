@@ -37,11 +37,11 @@ pub use doctor::{
     repository_root,
 };
 pub use enrollment::{
-    ActivationArtifact, ActivationArtifactParts, EnrollmentError, EnrollmentOutcome,
-    EnrollmentResponse, JoinKeyArtifact, JoinOutcome, JoinRefusal, PrivateArtifactError,
-    PrivateArtifactFile, PublicationStage, ReplacementDisposition, RunnerHome, RunnerHomeError,
-    enroll, join_unless_enrolled, load_control_socket_path, remove_completed_join_journal,
-    replacement_disposition, write_activation_file,
+    ActivationArtifact, ActivationArtifactParts, AmbiguousCause, EnrollmentError,
+    EnrollmentOutcome, EnrollmentResponse, JoinKeyArtifact, JoinOutcome, JoinRefusal, JoinRetry,
+    PrivateArtifactError, PrivateArtifactFile, PublicationStage, ReplacementDisposition,
+    RunnerHome, RunnerHomeError, enroll, join_unless_enrolled, load_control_socket_path,
+    remove_completed_join_journal, replacement_disposition, write_activation_file,
 };
 pub use service::{Config, ConfigError};
 
