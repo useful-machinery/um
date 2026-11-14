@@ -2,6 +2,7 @@ use std::ffi::OsString;
 use std::fs;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use time::OffsetDateTime;
@@ -27,9 +28,15 @@ use crate::telemetry::{TestCapture, test_recorder};
 const BOOT: &str = "rbt_01k0z6r1w8f4jy2m7q9v3x5abe";
 const ASSIGNMENT: &str = "asn_01k0z6r1w8f4jy2m7q9v3x5abc";
 const NEXT_ASSIGNMENT: &str = "asn_01k0z6r1w8f4jy2m7q9v3x5abd";
+const RUN: &str = "run_01k0z6r1w8f4jy2m7q9v3x5abc";
+const NEXT_RUN: &str = "run_01k0z6r1w8f4jy2m7q9v3x5abd";
+
+/// When the fixture's setup starts, and every time it reads unless a test
+/// moves its clock on.
+const START: i64 = 1_794_450_000;
 
 fn now() -> OffsetDateTime {
-    OffsetDateTime::from_unix_timestamp(1_794_450_000).unwrap()
+    OffsetDateTime::from_unix_timestamp(START).unwrap()
 }
 
 /// The expiry of every token the fake Cloud issues unless a test sets
@@ -45,6 +52,8 @@ struct Fixture {
     cloud: Arc<FakeAgentLoginCloud>,
     setup: Arc<AgentLoginSetup>,
     capture: TestCapture,
+    /// The setup's clock, in seconds since the epoch.
+    clock: Arc<AtomicI64>,
 }
 
 impl Fixture {
@@ -58,6 +67,8 @@ impl Fixture {
         let cloud = FakeAgentLoginCloud::new(Ok(Vec::new()));
         let (recorder, capture) = test_recorder(BOOT);
         let home = OsString::from(root.path().join("home"));
+        let clock = Arc::new(AtomicI64::new(START));
+        let reading = Arc::clone(&clock);
         let setup = Arc::new(AgentLoginSetup::new(
             SetupDependencies::new(
                 Arc::clone(&cloud) as Arc<dyn AgentLoginCloud>,
@@ -67,14 +78,20 @@ impl Fixture {
                 recorder,
             ),
             Arc::new(CountedGate::idle()) as Arc<dyn AssignmentGate>,
-            now,
+            move || OffsetDateTime::from_unix_timestamp(reading.load(Ordering::SeqCst)).unwrap(),
         ));
         Self {
             root,
             cloud,
             setup,
             capture,
+            clock,
         }
+    }
+
+    /// Moves the setup's clock to `at`.
+    fn set_clock(&self, at: OffsetDateTime) {
+        self.clock.store(at.unix_timestamp(), Ordering::SeqCst);
     }
 
     fn state_path(&self) -> PathBuf {
@@ -98,8 +115,21 @@ impl Fixture {
             .unwrap();
     }
 
+    /// Admits the assignment `assignment_id` of the run `RUN`.
     fn admit(&self, assignment_id: &str) -> AdmissionSetup {
-        self.setup.set_up_admission(BOOT, assignment_id)
+        self.admit_of(RUN, assignment_id)
+    }
+
+    fn admit_of(&self, run_id: &str, assignment_id: &str) -> AdmissionSetup {
+        self.setup.set_up_admission(BOOT, run_id, assignment_id)
+    }
+
+    /// Each OAuth provider's recorded entry, in the document's order.
+    fn grants(&self) -> Vec<GrantReadiness> {
+        let document = self.recorded();
+        brokered_providers()
+            .map(|provider| document.grant(provider).cloned().unwrap())
+            .collect()
     }
 
     fn recorded(&self) -> ReadinessDocument {
@@ -183,6 +213,8 @@ fn an_admission_asks_for_each_provider_and_keeps_each_issued_token_in_its_own_pr
                     expires_at: expiry(),
                 }),
                 selected: true,
+                run_id: Some(RUN.to_owned()),
+                ended_at: None,
             })
         );
     }
@@ -198,6 +230,8 @@ fn an_admission_asks_for_each_provider_and_keeps_each_issued_token_in_its_own_pr
             checked_at: Some(now()),
             issued: None,
             selected: false,
+            run_id: Some(RUN.to_owned()),
+            ended_at: None,
         })
     );
     // What the admission recorded is what it publishes.
@@ -283,6 +317,8 @@ fn each_answer_without_a_token_writes_no_file_and_records_its_state() {
                         checked_at: Some(now()),
                         issued: None,
                         selected,
+                        run_id: Some(RUN.to_owned()),
+                        ended_at: None,
                     }),
                     "{answer:?} after {before:?}"
                 );
@@ -370,6 +406,82 @@ fn when_the_assignment_ends_its_files_are_gone_and_its_entries_stay() {
     }
 }
 
+// REQ-GRANT-88, INV-RUNNER-30, REQ-TELEMETRY-46
+#[test]
+fn an_admissions_entries_name_its_run_and_are_marked_ended_when_its_assignment_ends() {
+    let refused = |refusal| FakeGrantToken::Fail(GrantTokenFailure::Refused(refusal));
+    // With a token kept, and with none kept, when the files hold nothing of
+    // the assignment's.
+    for answers in [
+        [
+            FakeGrantToken::Issue(3),
+            refused(GrantTokenRefusal::ReconnectRequired),
+            refused(GrantTokenRefusal::Unauthorized),
+        ],
+        [
+            refused(GrantTokenRefusal::Revoked),
+            refused(GrantTokenRefusal::ReconnectRequired),
+            FakeGrantToken::Fail(GrantTokenFailure::Cloud(CloudFailure::Transport)),
+        ],
+    ] {
+        let fixture = Fixture::new();
+        for (provider, answer) in brokered_providers().zip(answers) {
+            fixture.cloud.answer_grant_token(provider, answer);
+        }
+        let admitted = fixture.admit(ASSIGNMENT);
+        let recorded = fixture.grants();
+        for entry in &recorded {
+            assert_eq!(entry.run_id.as_deref(), Some(RUN), "{answers:?}");
+            assert_eq!(entry.ended_at, None, "{answers:?}");
+        }
+        let records = fixture.records().len();
+        let ended_at = now() + time::Duration::minutes(7);
+        fixture.set_clock(ended_at);
+
+        drop(admitted.tokens);
+
+        // Only the end is added: the state, grant, generation, check time,
+        // run and selection stay as recorded.
+        assert_eq!(
+            fixture.grants(),
+            recorded
+                .into_iter()
+                .map(|entry| GrantReadiness {
+                    ended_at: Some(ended_at),
+                    ..entry
+                })
+                .collect::<Vec<_>>(),
+            "{answers:?}"
+        );
+        // Marking changes no state, so it writes no record.
+        assert_eq!(fixture.records().len(), records, "{answers:?}");
+    }
+
+    // The end of an earlier assignment never marks what a later admission
+    // recorded.
+    let fixture = Fixture::new();
+    fixture.answer_all(FakeGrantToken::Issue(3));
+    let earlier = fixture.admit(ASSIGNMENT);
+    fixture.answer_all(refused(GrantTokenRefusal::Revoked));
+    let later = fixture.admit_of(NEXT_RUN, NEXT_ASSIGNMENT);
+    drop(earlier.tokens);
+    for entry in fixture.grants() {
+        assert_eq!(
+            (entry.run_id.as_deref(), entry.ended_at),
+            (Some(NEXT_RUN), None),
+            "{entry:?}"
+        );
+    }
+    drop(later.tokens);
+    for entry in fixture.grants() {
+        assert_eq!(
+            (entry.run_id.as_deref(), entry.ended_at),
+            (Some(NEXT_RUN), Some(now())),
+            "{entry:?}"
+        );
+    }
+}
+
 // REQ-GRANT-86, INV-RUNNER-28
 #[test]
 fn an_idle_pass_removes_a_leftover_token_file_and_asks_cloud_for_none() {
@@ -396,6 +508,49 @@ fn an_idle_pass_removes_a_leftover_token_file_and_asks_cloud_for_none() {
     for temporary in &temporaries {
         assert!(!temporary.exists(), "{}", temporary.display());
     }
+    assert_eq!(fixture.cloud.grant_requests(), []);
+    assert_eq!(fixture.records(), []);
+}
+
+// REQ-GRANT-88, INV-RUNNER-30
+#[test]
+fn an_idle_pass_marks_ended_each_entry_an_interrupted_runner_left_and_asks_cloud_for_none() {
+    let fixture = Fixture::new();
+    // An interrupted runner's entries: each names its run and has no end.
+    let mut interrupted = ReadinessDocument {
+        updated_at: now(),
+        logins: Vec::new(),
+        unknown: Vec::new(),
+    };
+    for (provider, entry) in brokered_providers().zip([
+        ready(3, expiry()),
+        not_ready(AgentLoginState::ReconnectRequired, true),
+        not_ready(AgentLoginState::NotAuthorized, false),
+    ]) {
+        interrupted.record_grant(GrantReadiness { provider, ..entry });
+    }
+    interrupted
+        .write(&readiness_path(&fixture.state_path()))
+        .unwrap();
+    let left = fixture.grants();
+    let passed_at = now() + time::Duration::hours(2);
+    fixture.set_clock(passed_at);
+
+    let outcome = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap()
+        .block_on(fixture.setup.run_pass());
+
+    assert!(matches!(outcome, SetupOutcome::Recorded(_)), "{outcome:?}");
+    assert_eq!(
+        fixture.grants(),
+        left.into_iter()
+            .map(|entry| GrantReadiness {
+                ended_at: Some(passed_at),
+                ..entry
+            })
+            .collect::<Vec<_>>()
+    );
     assert_eq!(fixture.cloud.grant_requests(), []);
     assert_eq!(fixture.records(), []);
 }
@@ -585,10 +740,10 @@ impl Refreshing {
         );
         let published = Arc::new(Mutex::new(Vec::new()));
         let publishing = Arc::clone(&published);
-        admitted.tokens.keep_current(
-            sleeper,
-            Box::new(move |document| publishing.lock().unwrap().push(document.clone())),
-        );
+        admitted.tokens.publish_with(Arc::new(move |document| {
+            publishing.lock().unwrap().push(document.clone());
+        }));
+        admitted.tokens.keep_current(sleeper);
         Self {
             fixture,
             tokens: Some(admitted.tokens),
@@ -675,6 +830,8 @@ fn ready(generation: u64, expires_at: OffsetDateTime) -> GrantReadiness {
             expires_at,
         }),
         selected: true,
+        run_id: Some(RUN.to_owned()),
+        ended_at: None,
     }
 }
 
@@ -685,6 +842,8 @@ fn not_ready(state: AgentLoginState, selected: bool) -> GrantReadiness {
         checked_at: Some(now()),
         issued: None,
         selected,
+        run_id: Some(RUN.to_owned()),
+        ended_at: None,
     }
 }
 

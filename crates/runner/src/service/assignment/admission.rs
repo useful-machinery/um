@@ -486,7 +486,7 @@ impl AssignmentManager {
             if let Some(setup) = &agent_login_setup {
                 runtime.grant_tokens =
                     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        setup.set_up(&worker_offer.assignment_id)
+                        setup.set_up(&worker_offer.run_id, &worker_offer.assignment_id)
                     }))
                     .ok()
                     .flatten()

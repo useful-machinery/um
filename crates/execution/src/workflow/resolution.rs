@@ -15,12 +15,13 @@ use super::profile_replacement::{
 };
 use super::result_validation::{JsonSchemaSupportFailure, RetainedJsonSchema};
 use super::schema_common::lowercase_hex;
+use super::structure::StructureViolation;
 use super::validated::{
     DeclaredInputs, ValidatedInputDefault, ValidatedMessageSource, ValidatedStep,
     ValidatedWorkflow, WorkflowNodeRole,
 };
 use super::validation::{ChildWorkflowSummary, ValidationFailureKind, ValidationLocation};
-use super::{DecodeFailureKind, decode, validation};
+use super::{DecodeFailure, DecodeFailureKind, decode, validation};
 use crate::workflow::document::{NodeBody, Output, WorkflowDocument};
 
 const CONTENT_CLOSURE_DOMAIN: &[u8] = b"scherzo.workflow.content-closure.v1\0";
@@ -83,10 +84,14 @@ pub(crate) enum ResolutionLocation {
 pub struct ResolutionFailure {
     kind: ResolutionFailureKind,
     location: ResolutionLocation,
-    workflow_path: Option<String>,
+    /// Boxed, as is the violation, so the failure stays a small `Err` value.
+    workflow_path: Option<Box<str>>,
     source_path: Option<PathBuf>,
     /// The child workflow's own failure behind `child_workflow_invalid`.
     child: Option<Box<ResolutionFailure>>,
+    /// The field and the rule a structurally invalid workflow file or replacement
+    /// document breaks.
+    violation: Option<Box<StructureViolation>>,
 }
 
 impl ResolutionFailure {
@@ -111,6 +116,12 @@ impl ResolutionFailure {
         self.child.as_deref()
     }
 
+    /// The field and the rule of an `invalid_workflow_structure` or a structural
+    /// `invalid_replacement_document` failure (REQ-WFFORMAT-103).
+    pub(crate) fn structure_violation(&self) -> Option<&StructureViolation> {
+        self.violation.as_deref()
+    }
+
     fn new(kind: ResolutionFailureKind, location: ResolutionLocation) -> Self {
         Self {
             kind,
@@ -118,11 +129,26 @@ impl ResolutionFailure {
             workflow_path: None,
             source_path: None,
             child: None,
+            violation: None,
+        }
+    }
+
+    /// A document that failed to decode, keeping the field and the rule a structural
+    /// failure names.
+    fn from_decode(
+        failure: DecodeFailure,
+        kind: fn(DecodeFailureKind) -> ResolutionFailureKind,
+        location: ResolutionLocation,
+    ) -> Self {
+        let kind = kind(failure.kind());
+        Self {
+            violation: failure.into_violation().map(Box::new),
+            ..Self::new(kind, location)
         }
     }
 
     fn with_workflow_path(mut self, workflow_path: String) -> Self {
-        self.workflow_path = Some(workflow_path);
+        self.workflow_path = Some(workflow_path.into());
         self
     }
 
@@ -349,8 +375,9 @@ fn resolve_loaded_workflow(
 
 fn decode_workflow(workflow_source: &LoadedSource) -> Result<WorkflowDocument, ResolutionFailure> {
     decode(&workflow_source.bytes).map_err(|failure| {
-        ResolutionFailure::new(
-            ResolutionFailureKind::InvalidWorkflowDocument(failure.kind()),
+        ResolutionFailure::from_decode(
+            failure,
+            ResolutionFailureKind::InvalidWorkflowDocument,
             ResolutionLocation::Workflow,
         )
     })
@@ -370,8 +397,9 @@ fn resolve_decoded_workflow(
     let decoded_replacement = replacement
         .map(|document| {
             profile_replacement::decode(document.bytes()).map_err(|failure| {
-                ResolutionFailure::new(
-                    ResolutionFailureKind::InvalidReplacementDocument(failure.kind()),
+                ResolutionFailure::from_decode(
+                    failure,
+                    ResolutionFailureKind::InvalidReplacementDocument,
                     ResolutionLocation::AgentProfileReplacement,
                 )
             })

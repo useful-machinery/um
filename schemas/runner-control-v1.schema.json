@@ -168,7 +168,21 @@
         "selected": {
           "description": "Whether the provider is selected, as the readiness document records it; absent where it records none.",
           "type": "boolean"
+        },
+        "runId": {
+          "description": "The run of the assignment the entry was recorded for, as the readiness document records it; absent where it records none.",
+          "type": "string",
+          "pattern": "^run_[0-7][0-9a-hjkmnp-tv-z]{25}$"
+        },
+        "endedAt": {
+          "description": "When that assignment ended, as the readiness document records it; absent while it runs, and where a serving process that predates it answers.",
+          "type": "string",
+          "format": "date-time"
         }
+      },
+      "dependentRequired": {
+        "runId": ["checkedAt"],
+        "endedAt": ["checkedAt"]
       },
       "if": { "properties": { "state": { "const": "ready" } } },
       "then": { "required": ["grantId", "generation", "expiresAt"] },

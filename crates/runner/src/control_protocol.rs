@@ -246,7 +246,9 @@ pub enum AgentLoginUse {
 /// One provider's readiness as the control socket returns it: the readiness
 /// document's entry without the path of the install (REQ-RUNNERENROLL-63).
 /// An OAuth provider's entry carries, while `ready`, the grant, generation
-/// and expiry of the token issued (REQ-GRANT-88), never the token.
+/// and expiry of the token issued, and the run of its assignment and when
+/// that ended where the document records them (REQ-GRANT-88), never the
+/// token.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct ProviderReadiness {
@@ -278,6 +280,16 @@ pub struct ProviderReadiness {
     /// and absent where a serving process that predates it answers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_use_at: Option<String>,
+    /// The run of the assignment an OAuth provider's entry was recorded for
+    /// (REQ-GRANT-88); only beside a check time, and absent where a serving
+    /// process that predates it answers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
+    /// When that assignment ended on the runner (REQ-GRANT-88); only beside
+    /// a check time, absent while it runs and where a serving process that
+    /// predates it answers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ended_at: Option<String>,
 }
 
 impl ProviderReadiness {
@@ -292,11 +304,16 @@ impl ProviderReadiness {
     }
 
     /// The provider's availability and next action on the runner
-    /// (REQ-GRANT-53). An OAuth provider's `ready` is `available`, since no
-    /// use of a grant token is recorded; any other state of its entry is
-    /// projected as an agent login's is.
+    /// (REQ-GRANT-53). An OAuth provider's `ready` is `available` while its
+    /// assignment runs, since no use of a grant token is recorded, and
+    /// `unverified` once that has ended, which says nothing of the next one
+    /// (REQ-GRANT-88); any other state of its entry is projected as an agent
+    /// login's is.
     pub const fn credential_status(&self) -> CredentialStatus {
         let (availability, next_action) = match self.state {
+            AgentLoginState::Ready if self.provider.is_brokered() && self.ended_at.is_some() => {
+                (Availability::Unverified, NextAction::None)
+            }
             AgentLoginState::Ready if self.provider.is_brokered() => {
                 (Availability::Available, NextAction::None)
             }
@@ -657,6 +674,8 @@ fn valid_provider_readiness(entry: &ProviderReadiness) -> bool {
     entry.state.held_by_login()
         && entry.grant_id.is_none()
         && entry.expires_at.is_none()
+        && entry.run_id.is_none()
+        && entry.ended_at.is_none()
         && entry
             .agent_login_id
             .as_deref()
@@ -672,8 +691,8 @@ fn valid_provider_readiness(entry: &ProviderReadiness) -> bool {
 }
 
 /// An OAuth provider's entry (REQ-GRANT-88): a state such an entry holds,
-/// with the grant, generation and expiry exactly when `ready`, and none of
-/// an agent login's members.
+/// with the grant, generation and expiry exactly when `ready`, a run and an
+/// end only beside a check time, and none of an agent login's members.
 fn valid_grant_readiness(entry: &ProviderReadiness) -> bool {
     let issued = match (&entry.grant_id, entry.generation, &entry.expires_at) {
         (None, None, None) => false,
@@ -695,6 +714,12 @@ fn valid_grant_readiness(entry: &ProviderReadiness) -> bool {
         && entry.last_use.is_none()
         && entry.last_use_at.is_none()
         && entry.checked_at.as_deref().is_none_or(valid_timestamp)
+        && entry
+            .run_id
+            .as_deref()
+            .is_none_or(|value| super::validation::valid_typed_id(value, "run_"))
+        && entry.ended_at.as_deref().is_none_or(valid_timestamp)
+        && (entry.checked_at.is_some() || (entry.run_id.is_none() && entry.ended_at.is_none()))
 }
 
 fn valid_timestamp(value: &str) -> bool {
@@ -789,6 +814,8 @@ mod tests {
             selected: None,
             last_use: None,
             last_use_at: None,
+            run_id: None,
+            ended_at: None,
         };
         AgentLoginReadiness {
             updated_at: "2026-11-12T01:00:00Z".to_owned(),
@@ -805,6 +832,8 @@ mod tests {
                     selected: None,
                     last_use: None,
                     last_use_at: None,
+                    run_id: None,
+                    ended_at: None,
                 },
                 brokered(AgentLoginProvider::Github),
                 brokered(AgentLoginProvider::Gitlab),
@@ -923,6 +952,8 @@ mod tests {
             selected,
             last_use: None,
             last_use_at: None,
+            run_id: None,
+            ended_at: None,
         }
     }
 
@@ -950,6 +981,88 @@ mod tests {
             assert_eq!(decode_response(&encoded), Ok(response), "{state:?}");
             let value: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
             assert!(validator.is_valid(&value), "{value}");
+        }
+    }
+
+    const RUN_ID: &str = "run_01k0z6r1w8f4jy2m7q9v3x5abc";
+
+    // REQ-GRANT-88
+    #[test]
+    fn an_oauth_entry_carries_its_run_and_end_and_only_well_formed() {
+        let validator = control_validator();
+        let ended = ProviderReadiness {
+            run_id: Some(RUN_ID.to_owned()),
+            ended_at: Some("2026-11-12T01:05:00Z".to_owned()),
+            ..grant_entry(AgentLoginState::Ready, Some(true))
+        };
+        let mut carrying = readiness();
+        carrying.providers[1] = ended.clone();
+        let response = synced(carrying);
+        let encoded = encode_response(&response).unwrap();
+        assert_eq!(decode_response(&encoded), Ok(response));
+        let value: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+        assert!(validator.is_valid(&value), "{value}");
+        assert_eq!(value["agentLogins"]["providers"][1]["runId"], RUN_ID);
+        assert_eq!(
+            value["agentLogins"]["providers"][1]["endedAt"],
+            "2026-11-12T01:05:00Z"
+        );
+
+        let codex = readiness().providers[0].clone();
+        for (index, invalid) in [
+            (
+                1,
+                ProviderReadiness {
+                    run_id: Some("asn_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned()),
+                    ..ended.clone()
+                },
+            ),
+            (
+                1,
+                ProviderReadiness {
+                    ended_at: Some("after the run".to_owned()),
+                    ..ended.clone()
+                },
+            ),
+            (
+                1,
+                ProviderReadiness {
+                    checked_at: None,
+                    ended_at: None,
+                    ..ended.clone()
+                },
+            ),
+            (
+                1,
+                ProviderReadiness {
+                    checked_at: None,
+                    run_id: None,
+                    ..ended.clone()
+                },
+            ),
+            (
+                0,
+                ProviderReadiness {
+                    run_id: Some(RUN_ID.to_owned()),
+                    ..codex.clone()
+                },
+            ),
+            (
+                0,
+                ProviderReadiness {
+                    ended_at: Some("2026-11-12T01:05:00Z".to_owned()),
+                    ..codex.clone()
+                },
+            ),
+        ] {
+            let mut readiness = readiness();
+            readiness.providers[index] = invalid.clone();
+            let encoded = encode_response(&synced(readiness)).unwrap();
+            assert_eq!(
+                decode_response(&encoded),
+                Err(ProtocolFailure::Invalid),
+                "{invalid:?}"
+            );
         }
     }
 
@@ -1075,6 +1188,47 @@ mod tests {
         );
     }
 
+    // REQ-GRANT-53, REQ-GRANT-88
+    #[test]
+    fn an_ended_oauth_entry_that_was_ready_is_unverified_and_no_other_state_changes() {
+        use um_support::{Availability as A, CredentialStatus, NextAction as N};
+        for state in GRANT_STATES {
+            for selected in [Some(true), Some(false), None] {
+                let current = grant_entry(state, selected);
+                let mut ended = current.clone();
+                ended.run_id = Some("run_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned());
+                ended.ended_at = Some("2026-11-12T02:00:00Z".to_owned());
+                if state == AgentLoginState::Ready {
+                    assert_eq!(
+                        current.credential_status(),
+                        CredentialStatus {
+                            availability: A::Available,
+                            next_action: N::None,
+                        },
+                        "{selected:?}"
+                    );
+                    // An ended assignment's token says nothing of the next one.
+                    assert_eq!(
+                        ended.credential_status(),
+                        CredentialStatus {
+                            availability: A::Unverified,
+                            next_action: N::None,
+                        },
+                        "{selected:?}"
+                    );
+                } else {
+                    assert_eq!(
+                        ended.credential_status(),
+                        current.credential_status(),
+                        "{state:?} {selected:?}"
+                    );
+                }
+                assert_eq!(current.failure_code(), None, "{state:?} {selected:?}");
+                assert_eq!(ended.failure_code(), None, "{state:?} {selected:?}");
+            }
+        }
+    }
+
     // REQ-GRANT-41
     #[test]
     fn only_an_authorized_provider_that_is_not_ready_fails_readiness() {
@@ -1178,6 +1332,8 @@ mod tests {
                 selected,
                 last_use,
                 last_use_at: None,
+                run_id: None,
+                ended_at: None,
             };
             assert_eq!(
                 entry.credential_status(),

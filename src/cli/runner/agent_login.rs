@@ -187,11 +187,13 @@ fn control_failure(error: ControlError) -> CommandFailure {
     }
 }
 
-/// Writes one line per provider: its readiness state, for a login the runner
-/// installed or a token it was issued the generation, its availability with
-/// the next action and the step it names (REQ-GRANT-53, REQ-GRANT-88) and,
-/// for a login with one, its last use and when, the time left out where the
-/// serving process states none (REQ-GRANT-41).
+/// Writes one line per provider: its readiness state, for an OAuth
+/// provider's entry of an ended assignment the run and the check time it is
+/// as of, the run left out where the entry names none (REQ-GRANT-88), for a
+/// login the runner installed or a token it was issued the generation, its
+/// availability with the next action and the step it names (REQ-GRANT-53,
+/// REQ-GRANT-88) and, for a login with one, its last use and when, the time
+/// left out where the serving process states none (REQ-GRANT-41).
 pub(super) fn write_readiness(
     output: &mut impl Write,
     readiness: &AgentLoginReadiness,
@@ -199,6 +201,7 @@ pub(super) fn write_readiness(
     for entry in &readiness.providers {
         let label = format!("{} login:", super::status::enum_json(entry.provider)?);
         let state = super::status::enum_json(entry.state)?;
+        let as_of = as_of(entry);
         let generation = entry
             .generation
             .map(|generation| format!(" (generation {generation})"))
@@ -225,11 +228,26 @@ pub(super) fn write_readiness(
         };
         writeln!(
             output,
-            "{label:<19}{state}{generation}, {}{last_use}",
+            "{label:<19}{state}{as_of}{generation}, {}{last_use}",
             status.text(step.as_deref())
         )?;
     }
     Ok(())
+}
+
+/// What an OAuth provider's entry of an ended assignment is as of: its run,
+/// where the entry names one, and the time of its check (REQ-GRANT-88). An
+/// entry without an end is current and is as of nothing.
+fn as_of(entry: &ProviderReadiness) -> String {
+    if !entry.provider.is_brokered() || entry.ended_at.is_none() {
+        return String::new();
+    }
+    match (entry.run_id.as_deref(), entry.checked_at.as_deref()) {
+        (Some(run_id), Some(at)) => format!(" as of run {run_id} at {at}"),
+        (Some(run_id), None) => format!(" as of run {run_id}"),
+        (None, Some(at)) => format!(" as of {at}"),
+        (None, None) => " as of an ended run".to_owned(),
+    }
 }
 
 /// Writes, after the readiness lines, one line per login whose check gave

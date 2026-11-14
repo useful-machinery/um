@@ -18,8 +18,9 @@ use crate::service::{
 };
 use crate::telemetry::{TestCapture, test_recorder};
 
-/// The boot and the assignment an admission's setup is made for.
+/// The boot, the run and the assignment an admission's setup is made for.
 const BOOT: &str = "rbt_01k0z6r1w8f4jy2m7q9v3x5abe";
+const RUN: &str = "run_01k0z6r1w8f4jy2m7q9v3x5abc";
 const ASSIGNMENT: &str = "asn_01k0z6r1w8f4jy2m7q9v3x5abc";
 
 fn now() -> OffsetDateTime {
@@ -1723,7 +1724,7 @@ async fn an_admissions_pass_installs_and_ends_without_consulting_the_assignment_
 
     let Some(SetupOutcome::Recorded(document)) = fixture
         .setup
-        .set_up_admission(BOOT, ASSIGNMENT)
+        .set_up_admission(BOOT, RUN, ASSIGNMENT)
         .agent_logins
     else {
         panic!("the admission's pass did not record readiness");
@@ -1757,7 +1758,7 @@ async fn an_admissions_pass_waits_for_a_pass_in_flight_and_then_makes_its_own() 
         .expect("the periodic pass asked Cloud");
     let admission = tokio::task::spawn_blocking({
         let setup = Arc::clone(&fixture.setup);
-        move || setup.set_up_admission(BOOT, ASSIGNMENT).agent_logins
+        move || setup.set_up_admission(BOOT, RUN, ASSIGNMENT).agent_logins
     });
     drop(held);
 
@@ -2213,7 +2214,7 @@ async fn an_admissions_pass_checks_nothing_even_when_it_installs() {
 
     let Some(SetupOutcome::Recorded(document)) = fixture
         .setup
-        .set_up_admission(BOOT, ASSIGNMENT)
+        .set_up_admission(BOOT, RUN, ASSIGNMENT)
         .agent_logins
     else {
         panic!("the admission's pass did not record readiness");

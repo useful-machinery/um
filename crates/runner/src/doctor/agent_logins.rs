@@ -129,6 +129,13 @@ fn readiness_outcome(readiness: &AgentLoginReadiness) -> Outcome {
             format!("{provider}_next_action"),
             status.next_action.as_str().to_owned(),
         );
+        // An OAuth provider's entry of an ended assignment names its run and
+        // that end where it records them (REQ-GRANT-88).
+        for (suffix, value) in [("run_id", &entry.run_id), ("ended_at", &entry.ended_at)] {
+            if let Some(value) = value {
+                details.insert(format!("{provider}_{suffix}"), value.clone());
+            }
+        }
     }
     if let Some((entry, code)) = readiness
         .providers
@@ -192,6 +199,8 @@ mod tests {
             selected: Some(true),
             last_use: None,
             last_use_at: None,
+            run_id: None,
+            ended_at: None,
         }
     }
 
@@ -259,5 +268,35 @@ mod tests {
             outcome.details.get("provider").map(String::as_str),
             Some("codex")
         );
+    }
+
+    // REQ-GRANT-88, REQ-RUNNERENROLL-86
+    #[test]
+    fn the_check_names_an_ended_oauth_entrys_run_and_end_and_still_passes() {
+        let run_id = "run_01k0z6r1w8f4jy2m7q9v3x5abc";
+        let ended_at = "2026-11-12T02:00:00Z";
+        let readiness = AgentLoginReadiness {
+            updated_at: ended_at.to_owned(),
+            providers: vec![
+                ProviderReadiness {
+                    run_id: Some(run_id.to_owned()),
+                    ended_at: Some(ended_at.to_owned()),
+                    ..entry(AgentLoginProvider::Github, AgentLoginState::Ready)
+                },
+                entry(AgentLoginProvider::Gitlab, AgentLoginState::Revoked),
+            ],
+        };
+
+        let outcome = readiness_outcome(&readiness);
+
+        assert_eq!(outcome.status, Status::Pass, "{outcome:?}");
+        assert_eq!(outcome.code, "ok");
+        let detail = |key: &str| outcome.details.get(key).map(String::as_str);
+        assert_eq!(detail("github_run_id"), Some(run_id), "{outcome:?}");
+        assert_eq!(detail("github_ended_at"), Some(ended_at), "{outcome:?}");
+        assert_eq!(detail("github_availability"), Some("unverified"));
+        // An entry that records neither names neither.
+        assert_eq!(detail("gitlab_run_id"), None, "{outcome:?}");
+        assert_eq!(detail("gitlab_ended_at"), None, "{outcome:?}");
     }
 }

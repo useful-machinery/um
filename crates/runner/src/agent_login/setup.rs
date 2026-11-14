@@ -13,10 +13,13 @@
 //! assignment runs and folded into the readiness by the next pass
 //! (REQ-GRANT-52). A pass made while the runner holds no assignment removes
 //! the grant token files an earlier assignment or an interrupted runner left
-//! (INV-RUNNER-28). A setup the control socket asks for, or one the schedule
-//! makes that installs a login, then checks logins with their providers
-//! outside the pass and the assignment gate, and a second pass records what
-//! they found (REQ-GRANT-90, INV-RUNNER-29).
+//! (INV-RUNNER-28) and marks ended each OAuth entry left without an end; the
+//! end of an assignment marks its admission's entries ended, unless a later
+//! admission has recorded its own (REQ-GRANT-88, INV-RUNNER-30). A setup the
+//! control socket asks for, or one the schedule makes that installs a login,
+//! then checks logins with their providers outside the pass and the
+//! assignment gate, and a second pass records what they found (REQ-GRANT-90,
+//! INV-RUNNER-29).
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -216,7 +219,11 @@ pub(crate) struct AgentLoginSetup {
     /// The gate of the periodic and `sync` passes.
     gate: Arc<dyn AssignmentGate>,
     clock: Clock,
-    pass: Mutex<()>,
+    /// Held through every pass, admission, refresh and marking of an
+    /// assignment's end, so none interleaves with another's writes. It
+    /// holds the assignment whose admission last recorded the OAuth
+    /// entries, the only one whose end marks them (INV-RUNNER-30).
+    pass: Mutex<Option<String>>,
     /// The uses noted since a pass last folded them in.
     uses: Arc<NotedUses>,
     /// The grant token files of the assignment the runner holds.
@@ -248,7 +255,7 @@ impl AgentLoginSetup {
             dependencies,
             gate,
             clock: Arc::new(clock),
-            pass: Mutex::new(()),
+            pass: Mutex::new(None),
             uses: Arc::default(),
             grant_files,
         }
@@ -456,17 +463,19 @@ impl AgentLoginSetup {
     /// again. A document it cannot read names none. Its `agent_logins` is
     /// `None` when it made no pass; a pass never answers `Busy`. Then,
     /// whatever the pass did, it asks Cloud for the grant tokens of the
-    /// assignment `assignment_id` of the boot `boot_id` (REQ-GRANT-86),
-    /// under the same hold of the pass lock; what it holds of them refreshes
-    /// through this setup (REQ-GRANT-89).
+    /// assignment `assignment_id` of the run `run_id` and the boot `boot_id`
+    /// (REQ-GRANT-86), under the same hold of the pass lock; what it holds
+    /// of them refreshes through this setup (REQ-GRANT-89), and marks the
+    /// entries ended when it is dropped (INV-RUNNER-30).
     pub(crate) fn set_up_admission(
         self: &Arc<Self>,
         boot_id: &str,
+        run_id: &str,
         assignment_id: &str,
     ) -> AdmissionSetup {
-        let _pass = self.pass.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut pass = self.pass.lock().unwrap_or_else(PoisonError::into_inner);
         let agent_logins = self.admission_pass();
-        let (grants, tokens) = self.admit_grant_tokens(boot_id, assignment_id);
+        let (grants, tokens) = self.admit_grant_tokens(&mut pass, boot_id, run_id, assignment_id);
         AdmissionSetup {
             agent_logins,
             grants,
@@ -475,18 +484,23 @@ impl AgentLoginSetup {
     }
 
     /// Asks Cloud for the assignment's grant tokens and records each
-    /// provider's entry in the readiness document (REQ-GRANT-88); the caller
-    /// holds the pass lock. A document that cannot be read is neither
-    /// replaced nor written, its failure recorded as a pass's is, and the
-    /// tokens are kept all the same.
+    /// provider's entry for the run in the readiness document
+    /// (REQ-GRANT-88); the caller holds the pass lock, whose `recording` it
+    /// sets to the assignment, so the end of an earlier one no longer marks
+    /// the entries (INV-RUNNER-30). A document that cannot be read is
+    /// neither replaced nor written, its failure recorded as a pass's is,
+    /// and the tokens are kept all the same.
     fn admit_grant_tokens(
         self: &Arc<Self>,
+        recording: &mut Option<String>,
         boot_id: &str,
+        run_id: &str,
         assignment_id: &str,
     ) -> (Option<ReadinessDocument>, AssignmentGrantTokens) {
+        *recording = Some(assignment_id.to_owned());
         let now = (self.clock)();
         let (previous, mut document) = self.grant_document(now);
-        let tokens = self.asking(boot_id, assignment_id, now).admit(
+        let tokens = self.asking(boot_id, run_id, assignment_id, now).admit(
             Arc::downgrade(self),
             previous.as_ref().ok().and_then(Option::as_ref),
             &mut document,
@@ -496,8 +510,9 @@ impl AgentLoginSetup {
     }
 
     /// Asks Cloud again for the token of the provider `step` names, for the
-    /// assignment `assignment_id` of the boot `boot_id` whose token files
-    /// the runner holds, keeps or removes its file and records its entry
+    /// assignment `assignment_id` of the run `run_id` and the boot `boot_id`
+    /// whose token files the runner holds, keeps or removes its file and
+    /// records its entry
     /// (REQ-GRANT-89), under the pass lock, so that a refresh never
     /// interleaves with a pass's or an admission's writes to the directory
     /// or the readiness document. Answers what the refresh task does next,
@@ -506,13 +521,14 @@ impl AgentLoginSetup {
     pub(crate) fn refresh_grant_token(
         &self,
         boot_id: &str,
+        run_id: &str,
         assignment_id: &str,
         step: &grant_token::RefreshStep,
     ) -> (grant_token::Next, Option<ReadinessDocument>) {
         let _pass = self.pass.lock().unwrap_or_else(PoisonError::into_inner);
         let now = (self.clock)();
         let (previous, mut document) = self.grant_document(now);
-        let (next, changed) = self.asking(boot_id, assignment_id, now).refresh(
+        let (next, changed) = self.asking(boot_id, run_id, assignment_id, now).refresh(
             step,
             previous.as_ref().ok().and_then(Option::as_ref),
             &mut document,
@@ -521,12 +537,34 @@ impl AgentLoginSetup {
         (next, recorded.then_some(document))
     }
 
+    /// Marks ended, at the setup's time, each OAuth entry without an end,
+    /// now that the assignment `assignment_id` has ended, under the pass
+    /// lock (REQ-GRANT-88, INV-RUNNER-30): only while that assignment's
+    /// admission is the last that recorded the entries, so the end of an
+    /// earlier one never marks a later one's. Answers the document it wrote,
+    /// for publishing; `None` when it marked nothing, when the document
+    /// cannot be read, which leaves it as it is, or cannot be written. It
+    /// changes no state, so it writes no `runner.grant_token` record
+    /// (REQ-TELEMETRY-46); a failed load or write is recorded as a pass's
+    /// is.
+    pub(crate) fn mark_grants_ended(&self, assignment_id: &str) -> Option<ReadinessDocument> {
+        let pass = self.pass.lock().unwrap_or_else(PoisonError::into_inner);
+        if pass.as_deref() != Some(assignment_id) {
+            return None;
+        }
+        let now = (self.clock)();
+        let (previous, mut document) = self.grant_document(now);
+        let marked = matches!(previous, Ok(Some(_))) && document.end_grants(now);
+        (marked && self.write(&document)).then_some(document)
+    }
+
     /// What a grant-token request of the assignment `assignment_id` of the
-    /// boot `boot_id`, made at `now`, asks Cloud with and keeps its tokens
-    /// in.
+    /// run `run_id` and the boot `boot_id`, made at `now`, asks Cloud with
+    /// and keeps its tokens in.
     fn asking<'a>(
         &'a self,
         boot_id: &'a str,
+        run_id: &'a str,
         assignment_id: &'a str,
         now: OffsetDateTime,
     ) -> grant_token::Asking<'a> {
@@ -534,6 +572,7 @@ impl AgentLoginSetup {
             cloud: self.dependencies.cloud.as_ref(),
             files: &self.grant_files,
             boot_id,
+            run_id,
             assignment_id,
             now,
         }
@@ -628,6 +667,16 @@ impl AgentLoginSetup {
             login.last_use = last_use(&login, recorded(login.provider), &noted);
             login
         };
+        // The entries the pass carries unread: each OAuth entry left without
+        // an end is one no assignment holds, since the runner holds none,
+        // so it is marked ended now (REQ-GRANT-88, INV-RUNNER-30). An
+        // admission's own pass marks the earlier assignment's, which the
+        // admission then replaces.
+        let carried = previous.map_or_else(Vec::new, |document| {
+            let mut carried = document.clone();
+            carried.end_grants(now);
+            carried.unknown
+        });
         let cloud = self.dependencies.cloud.as_ref();
         let answer = cloud.status(&self.status_request(previous));
         // The providers settled so far, in order, then what was last
@@ -644,7 +693,7 @@ impl AgentLoginSetup {
                         .filter_map(|provider| recorded(provider).cloned().map(with_last_use)),
                 )
                 .collect(),
-            unknown: previous.map_or_else(Vec::new, |document| document.unknown.clone()),
+            unknown: carried.clone(),
         };
         let mut settled = Vec::with_capacity(AgentLoginProvider::INSTALLABLE.len());
         let mut failures = Vec::new();

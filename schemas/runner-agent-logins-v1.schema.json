@@ -60,7 +60,7 @@
       }
     },
     "brokered": {
-      "description": "An OAuth provider whose token Cloud issues for each assignment: what the last assignment the runner admitted was issued, never the token or the path of its file. A provider the runner has asked for no token of is not_delivered.",
+      "description": "An OAuth provider whose token Cloud issues for each assignment: what the last assignment the runner admitted was issued, its run and, once it has ended, when, never the token or the path of its file. A provider the runner has asked for no token of is not_delivered.",
       "type": "object",
       "additionalProperties": false,
       "required": ["provider", "state"],
@@ -85,7 +85,21 @@
         "selected": {
           "description": "Whether Cloud's last answer for the provider named a grant in force: an issued token or reconnect_required. An entry without it is not selected.",
           "type": "boolean"
+        },
+        "runId": {
+          "description": "The run of the assignment the entry was recorded for. An entry recorded before runs were has none.",
+          "type": "string",
+          "pattern": "^run_[0-7][0-9a-hjkmnp-tv-z]{25}$"
+        },
+        "endedAt": {
+          "description": "When that assignment ended on this runner; absent while it runs.",
+          "type": "string",
+          "format": "date-time"
         }
+      },
+      "dependentRequired": {
+        "runId": ["checkedAt"],
+        "endedAt": ["checkedAt"]
       },
       "if": { "properties": { "state": { "const": "ready" } } },
       "then": { "required": ["grantId", "generation", "expiresAt"] },

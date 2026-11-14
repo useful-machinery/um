@@ -61,6 +61,7 @@ mod schema_common;
 pub(crate) mod socket_alias;
 pub(crate) mod step_runtime;
 mod strict_yaml;
+pub(crate) mod structure;
 pub(crate) mod subject_index;
 pub(crate) mod terminal_host;
 #[cfg(test)]
@@ -81,6 +82,7 @@ use jsonschema::Validator;
 use serde_json::Value;
 
 use document::WorkflowDocument;
+use structure::{StructureViolation, check_structure};
 
 pub use canonical_json::CanonicalJsonError;
 pub use claude_code::ClaudeCodeConfig;
@@ -134,50 +136,72 @@ pub(crate) enum DecodeFailureKind {
 /// `maximumWorkflowDocumentBytes` holds the same bound.
 const MAXIMUM_WORKFLOW_FILE_BYTES: usize = 1024 * 1024;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct DecodeFailure {
     kind: DecodeFailureKind,
     diagnostic: &'static str,
+    /// The field and the rule of a structural failure (REQ-WFFORMAT-103).
+    violation: Option<StructureViolation>,
 }
 
 impl DecodeFailure {
-    pub(crate) fn kind(self) -> DecodeFailureKind {
+    pub(crate) fn kind(&self) -> DecodeFailureKind {
         self.kind
     }
 
-    fn malformed_yaml() -> Self {
+    pub(crate) fn into_violation(self) -> Option<StructureViolation> {
+        self.violation
+    }
+
+    fn new(kind: DecodeFailureKind, diagnostic: &'static str) -> Self {
         Self {
-            kind: DecodeFailureKind::MalformedYaml,
-            diagnostic: "workflow document is not well-formed YAML",
+            kind,
+            diagnostic,
+            violation: None,
         }
+    }
+
+    fn malformed_yaml() -> Self {
+        Self::new(
+            DecodeFailureKind::MalformedYaml,
+            "workflow document is not well-formed YAML",
+        )
     }
 
     fn forbidden_yaml() -> Self {
+        Self::new(
+            DecodeFailureKind::ForbiddenYaml,
+            "workflow document uses a forbidden YAML feature or scalar",
+        )
+    }
+
+    fn structural_contract(violation: StructureViolation) -> Self {
         Self {
-            kind: DecodeFailureKind::ForbiddenYaml,
-            diagnostic: "workflow document uses a forbidden YAML feature or scalar",
+            violation: Some(violation),
+            ..Self::new(
+                DecodeFailureKind::StructuralContract,
+                "workflow document violates the Workflow V1 structural contract",
+            )
         }
     }
 
-    fn structural_contract() -> Self {
-        Self {
-            kind: DecodeFailureKind::StructuralContract,
-            diagnostic: "workflow document violates the Workflow V1 structural contract",
-        }
+    /// A structural failure the schema check did not name: the decoder's own refusal.
+    fn structural_invalid() -> Self {
+        Self::structural_contract(StructureViolation::invalid())
     }
 
     fn workflow_file_too_large() -> Self {
-        Self {
-            kind: DecodeFailureKind::WorkflowFileTooLarge,
-            diagnostic: "workflow document exceeds 1 MiB",
-        }
+        Self::new(
+            DecodeFailureKind::WorkflowFileTooLarge,
+            "workflow document exceeds 1 MiB",
+        )
     }
 
     fn workflow_nesting_too_deep() -> Self {
-        Self {
-            kind: DecodeFailureKind::WorkflowNestingTooDeep,
-            diagnostic: "workflow document nests values more than 100 levels deep",
-        }
+        Self::new(
+            DecodeFailureKind::WorkflowNestingTooDeep,
+            "workflow document nests values more than 100 levels deep",
+        )
     }
 }
 
@@ -194,15 +218,13 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<WorkflowDocument, DecodeFailure> {
         return Err(DecodeFailure::workflow_file_too_large());
     }
     let parsed = strict_yaml::parse(bytes)?;
-    let validator = structural_validator().ok_or_else(DecodeFailure::structural_contract)?;
-    if !validator.is_valid(&parsed.value) {
-        return Err(DecodeFailure::structural_contract());
-    }
+    let validator = structural_validator().ok_or_else(DecodeFailure::structural_invalid)?;
+    check_structure(validator, &parsed.value).map_err(DecodeFailure::structural_contract)?;
 
     let dto = serde_json::from_value::<schema::WorkflowDto>(parsed.value)
-        .map_err(|_| DecodeFailure::structural_contract())?;
+        .map_err(|_| DecodeFailure::structural_invalid())?;
     dto.into_document(parsed.step_order, parsed.finalizer_order)
-        .ok_or_else(DecodeFailure::structural_contract)
+        .ok_or_else(DecodeFailure::structural_invalid)
 }
 
 fn structural_validator() -> Option<&'static Validator> {

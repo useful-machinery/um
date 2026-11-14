@@ -931,6 +931,7 @@ async fn codex_last_use_after_a_codex_step(service_codex_home: bool) -> Option<U
     let Some(SetupOutcome::Recorded(document)) = setup
         .set_up_admission(
             "rbt_01k0z6r1w8f4jy2m7q9v3x5abe",
+            "run_01k0z6r1w8f4jy2m7q9v3x5abz",
             "asn_01k0z6r1w8f4jy2m7q9v3x5abz",
         )
         .agent_logins

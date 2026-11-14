@@ -8,10 +8,11 @@
 //! earlier `um` wrote without it reads as selected by its state. Beside an
 //! install it records how the provider answered the login's last use
 //! (REQ-GRANT-52). Each OAuth provider's entry records what the last
-//! assignment the runner admitted was issued (REQ-GRANT-88): never the token
-//! or the path of its file. One the runner has asked for no token of is
-//! written as `not_delivered`, which is how a document written before these
-//! entries lists all three.
+//! assignment the runner admitted was issued, the run of that assignment and,
+//! once it has ended, when (REQ-GRANT-88): never the token or the path of its
+//! file. One the runner has asked for no token of is written as
+//! `not_delivered`, which is how a document written before these entries
+//! lists all three.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -78,8 +79,9 @@ pub(crate) enum KeptEntry {
 pub(crate) struct UnknownEntry(WireEntry);
 
 /// What the last assignment the runner admitted was issued for an OAuth
-/// provider (REQ-GRANT-88). The entry outlives the assignment; the token
-/// and its file do not, and neither is recorded here.
+/// provider (REQ-GRANT-88). The entry outlives the assignment, and is marked
+/// ended when it ends; the token and its file do not, and neither is
+/// recorded here.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct GrantReadiness {
     /// `github`, `gitlab` or `linear`.
@@ -92,6 +94,12 @@ pub(crate) struct GrantReadiness {
     /// Whether Cloud's last answer for the provider named a grant in force:
     /// an issued token or `reconnect_required`.
     pub(crate) selected: bool,
+    /// The `run_` ID of the assignment the entry was recorded for; `None`
+    /// for one recorded before runs were. Only beside a check time.
+    pub(crate) run_id: Option<String>,
+    /// When that assignment ended on this runner, by the setup's clock;
+    /// `None` while it runs (INV-RUNNER-30). Only beside a check time.
+    pub(crate) ended_at: Option<OffsetDateTime>,
 }
 
 /// The grant a `ready` OAuth provider's token was issued from.
@@ -107,7 +115,8 @@ pub(crate) struct IssuedGrant {
 
 impl GrantReadiness {
     /// Whether the entry is one the document holds: an OAuth provider, a
-    /// state its entry holds, and the grant exactly when `ready`.
+    /// state its entry holds, the grant exactly when `ready`, and a run and
+    /// an end only beside a check time.
     fn valid(&self) -> bool {
         self.provider.is_brokered()
             && self.state.held_by_grant()
@@ -115,6 +124,21 @@ impl GrantReadiness {
             && self.issued.as_ref().is_none_or(|issued| {
                 issued.generation >= 1 && um_support::valid_typed_id(&issued.grant_id, "pgr_")
             })
+            && self
+                .run_id
+                .as_deref()
+                .is_none_or(|run_id| um_support::valid_typed_id(run_id, "run_"))
+            && (self.checked_at.is_some() || (self.run_id.is_none() && self.ended_at.is_none()))
+    }
+
+    /// Marks the entry ended at `at` when it has a check time and no end
+    /// (INV-RUNNER-30), changing nothing else; answers whether it did.
+    fn end(&mut self, at: OffsetDateTime) -> bool {
+        let ending = self.checked_at.is_some() && self.ended_at.is_none();
+        if ending {
+            self.ended_at = Some(at);
+        }
+        ending
     }
 
     fn to_wire(&self) -> Option<WireEntry> {
@@ -133,14 +157,16 @@ impl GrantReadiness {
                 .ok()?,
             checked_at: self.checked_at.map(format_time).transpose().ok()?,
             selected: Some(self.selected),
+            run_id: self.run_id.clone(),
+            ended_at: self.ended_at.map(format_time).transpose().ok()?,
             ..WireEntry::bare(self.provider)
         })
     }
 
     /// The OAuth provider's entry `entry` records; `None` for one the
     /// document does not admit. A `not_delivered` entry with no grant and
-    /// neither a check time nor a selection, as every document written
-    /// before these entries lists, records nothing.
+    /// none of a check time, a selection, a run or an end, as every document
+    /// written before these entries lists, records nothing.
     fn from_wire(provider: AgentLoginProvider, entry: WireEntry) -> Option<Option<Self>> {
         let EntryState::Login(state) = entry.state else {
             return None;
@@ -166,10 +192,16 @@ impl GrantReadiness {
             Some(checked_at) => Some(parse_rfc3339(checked_at)?),
             None => None,
         };
+        let ended_at = match entry.ended_at.as_deref() {
+            Some(ended_at) => Some(parse_rfc3339(ended_at)?),
+            None => None,
+        };
         if state == AgentLoginState::NotDelivered
             && issued.is_none()
             && checked_at.is_none()
             && entry.selected.is_none()
+            && entry.run_id.is_none()
+            && ended_at.is_none()
         {
             return Some(None);
         }
@@ -179,6 +211,8 @@ impl GrantReadiness {
             checked_at,
             issued,
             selected: entry.selected.unwrap_or(false),
+            run_id: entry.run_id,
+            ended_at,
         };
         grant.valid().then_some(Some(grant))
     }
@@ -297,6 +331,18 @@ impl ReadinessDocument {
             KeptEntry::Grant(grant) if grant.provider == provider => Some(grant),
             KeptEntry::Grant(_) | KeptEntry::Unknown(_) => None,
         })
+    }
+
+    /// Marks ended at `at` each OAuth provider's entry that has a check time
+    /// and no end, changing nothing else of it (REQ-GRANT-88,
+    /// INV-RUNNER-30); answers whether it marked one.
+    pub(crate) fn end_grants(&mut self, at: OffsetDateTime) -> bool {
+        self.unknown
+            .iter_mut()
+            .fold(false, |ended, kept| match kept {
+                KeptEntry::Grant(grant) => grant.end(at) || ended,
+                KeptEntry::Unknown(_) => ended,
+            })
     }
 
     /// Records `grant` as its provider's entry, in place of the one recorded
@@ -514,6 +560,8 @@ fn recorded_from_wire(entry: WireEntry) -> Option<Recorded> {
         .is_some_and(|id| !um_support::valid_typed_id(id, "agl_"))
         || entry.grant_id.is_some()
         || entry.expires_at.is_some()
+        || entry.run_id.is_some()
+        || entry.ended_at.is_some()
     {
         return None;
     }
@@ -595,6 +643,10 @@ struct WireEntry {
     last_use: Option<UseOutcome>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     last_use_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    run_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ended_at: Option<String>,
 }
 
 impl WireEntry {
@@ -614,6 +666,8 @@ impl WireEntry {
             selected: None,
             last_use: None,
             last_use_at: None,
+            run_id: None,
+            ended_at: None,
         }
     }
 
@@ -635,6 +689,8 @@ impl WireEntry {
             selected: self.selected,
             last_use: self.last_use,
             last_use_at: self.last_use_at,
+            run_id: self.run_id,
+            ended_at: self.ended_at,
         })
     }
 }

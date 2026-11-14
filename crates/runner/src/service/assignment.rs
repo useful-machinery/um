@@ -1106,8 +1106,8 @@ pub(super) struct AssignmentManager {
 }
 
 /// The time an admission's grant-token refresh task waits on, and the live
-/// status it publishes each readiness a refresh records in, as an
-/// admission's setup publishes its own.
+/// status it publishes each readiness a refresh or the assignment's end
+/// records in, as an admission's setup publishes its own.
 #[derive(Clone)]
 struct GrantTokenRefreshing {
     sleeper: Arc<dyn Sleeper>,
@@ -1115,17 +1115,17 @@ struct GrantTokenRefreshing {
 }
 
 impl GrantTokenRefreshing {
-    /// Starts keeping the token files `tokens` holds current (REQ-GRANT-89).
+    /// Publishes in the live status each readiness `tokens` records, its
+    /// end's included whether or not it holds a token (REQ-GRANT-88), and
+    /// starts keeping the token files it holds current (REQ-GRANT-89).
     fn start(&self, tokens: &mut AssignmentGrantTokens) {
         let status = Arc::clone(&self.status);
-        tokens.keep_current(
-            Arc::clone(&self.sleeper),
-            Box::new(move |document| {
-                if let Some(readiness) = document.reported() {
-                    status.agent_logins_recorded(readiness);
-                }
-            }),
-        );
+        tokens.publish_with(Arc::new(move |document| {
+            if let Some(readiness) = document.reported() {
+                status.agent_logins_recorded(readiness);
+            }
+        }));
+        tokens.keep_current(Arc::clone(&self.sleeper));
     }
 }
 

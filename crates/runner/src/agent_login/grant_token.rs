@@ -2,9 +2,9 @@
 //! (REQ-GRANT-86): at each admission the runner asks Cloud for the token of
 //! the run's grant of each OAuth provider, keeps each token it is issued in a
 //! private file of its own in its agent-login directory, records each
-//! provider's outcome in the readiness document (REQ-GRANT-88), and writes a
-//! `runner.grant_token` record for each changed state and each failure
-//! (REQ-TELEMETRY-46). A token file is only ever the token of the assignment
+//! provider's outcome for the run in the readiness document (REQ-GRANT-88),
+//! and writes a `runner.grant_token` record for each changed state and each
+//! failure (REQ-TELEMETRY-46). A token file is only ever the token of the assignment
 //! the runner holds (INV-RUNNER-28): the admission removes every token file
 //! before it uses any answer, an idle setup removes what an interrupted
 //! runner left, and the hold an admission returns removes them when the
@@ -14,7 +14,9 @@
 //! (REQ-GRANT-89): it asks again when the wait Cloud named has passed and
 //! replaces the file in one step, retries a request Cloud did not answer,
 //! removes the file at a refusal or once the held token has expired, and
-//! stops when the hold is dropped.
+//! stops when the hold is dropped. Dropping the hold then marks the entries
+//! ended, unless a later admission has recorded its own since
+//! (INV-RUNNER-30).
 
 use std::ffi::{OsStr, OsString};
 use std::io;
@@ -231,24 +233,32 @@ struct HeldToken {
 }
 
 /// What an admission holds of its assignment's grant tokens, which the slot
-/// carries until the assignment ends: dropping it stops its refresh task,
-/// then removes the token files it holds, on a blocking thread when there is
-/// a runtime to run one on.
+/// carries until the assignment ends, whether or not it kept a token:
+/// dropping it stops its refresh task, then removes the token files it
+/// holds and marks the entries its admission recorded ended
+/// (INV-RUNNER-30), on a blocking thread when there is a runtime to run one
+/// on.
 pub(crate) struct AssignmentGrantTokens {
     files: Arc<TokenFiles>,
-    /// The setup each refresh is made and recorded through.
+    /// The setup each refresh is made and recorded through, and the end
+    /// marked through.
     setup: Weak<AgentLoginSetup>,
     boot_id: String,
+    run_id: String,
     assignment_id: String,
     /// Each token the admission kept.
     held: Vec<HeldToken>,
     /// The task keeping the files current, once started.
     refresh: Option<GrantTokenRefresh>,
+    /// Where each readiness document a refresh or the end records is
+    /// published, once given.
+    publish: Option<PublishReadiness>,
 }
 
-/// What a refresh publishes each readiness document it records to: the
-/// live status, so that `um runner status` shows it during the run.
-pub(crate) type PublishReadiness = Box<dyn Fn(&ReadinessDocument) + Send + Sync>;
+/// What a refresh, and the end of the assignment, publishes each readiness
+/// document it records to: the live status, so that `um runner status`
+/// shows it without waiting for a pass.
+pub(crate) type PublishReadiness = Arc<dyn Fn(&ReadinessDocument) + Send + Sync>;
 
 impl AssignmentGrantTokens {
     /// The file the admission kept the provider's token in, if it kept one.
@@ -259,13 +269,19 @@ impl AssignmentGrantTokens {
             .map(|held| held.file.as_path())
     }
 
+    /// Publishes with `publish` each readiness document a refresh of this
+    /// hold records, and the one its end records.
+    pub(crate) fn publish_with(&mut self, publish: PublishReadiness) {
+        self.publish = Some(publish);
+    }
+
     /// Starts the task that keeps each token file this hold has current
     /// while it is held (REQ-GRANT-89): for each provider, it waits on
     /// `sleeper` the time Cloud named with its token, from now, then asks
-    /// again, and publishes each readiness document a refresh records with
-    /// `publish`. Nothing is started without a token, without a runtime to
-    /// run on, or a second time.
-    pub(crate) fn keep_current(&mut self, sleeper: Arc<dyn Sleeper>, publish: PublishReadiness) {
+    /// again, and publishes each readiness document a refresh records as
+    /// `publish_with` named. Nothing is started without a token, without a
+    /// runtime to run on, or a second time.
+    pub(crate) fn keep_current(&mut self, sleeper: Arc<dyn Sleeper>) {
         if self.held.is_empty() || self.refresh.is_some() {
             return;
         }
@@ -288,10 +304,11 @@ impl AssignmentGrantTokens {
         let refresh = Refresh {
             setup: Weak::clone(&self.setup),
             boot_id: self.boot_id.clone(),
+            run_id: self.run_id.clone(),
             assignment_id: self.assignment_id.clone(),
         };
         self.refresh = Some(GrantTokenRefresh {
-            task: runtime.spawn(refresh.keep_current(due, sleeper, publish)),
+            task: runtime.spawn(refresh.keep_current(due, sleeper, self.publish.clone())),
         });
     }
 }
@@ -362,6 +379,7 @@ pub(crate) enum Next {
 struct Refresh {
     setup: Weak<AgentLoginSetup>,
     boot_id: String,
+    run_id: String,
     assignment_id: String,
 }
 
@@ -373,7 +391,7 @@ impl Refresh {
         self,
         mut due: Vec<Due>,
         sleeper: Arc<dyn Sleeper>,
-        publish: PublishReadiness,
+        publish: Option<PublishReadiness>,
     ) {
         let refresh = Arc::new(self);
         while let Some(next) = due.iter().map(|due| due.at).min() {
@@ -396,12 +414,17 @@ impl Refresh {
                 let asking = Arc::clone(&refresh);
                 let answered = tokio::task::spawn_blocking(move || {
                     let setup = asking.setup.upgrade()?;
-                    Some(setup.refresh_grant_token(&asking.boot_id, &asking.assignment_id, &step))
+                    Some(setup.refresh_grant_token(
+                        &asking.boot_id,
+                        &asking.run_id,
+                        &asking.assignment_id,
+                        &step,
+                    ))
                 })
                 .await;
                 let next = match answered {
                     Ok(Some((next, recorded))) => {
-                        if let Some(document) = recorded {
+                        if let (Some(document), Some(publish)) = (recorded, &publish) {
                             publish(&document);
                         }
                         next
@@ -445,6 +468,7 @@ impl std::fmt::Debug for AssignmentGrantTokens {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("AssignmentGrantTokens")
+            .field("run_id", &self.run_id)
             .field("assignment_id", &self.assignment_id)
             .field("held", &self.held)
             .field("refreshing", &self.refresh.is_some())
@@ -458,11 +482,24 @@ impl Drop for AssignmentGrantTokens {
         // on the blocking pool writes nothing once the files are released.
         drop(self.refresh.take());
         let files = Arc::clone(&self.files);
+        let setup = Weak::clone(&self.setup);
+        let publish = self.publish.take();
         let assignment_id = std::mem::take(&mut self.assignment_id);
         let held: Vec<AgentLoginProvider> = self.held.iter().map(|held| held.provider).collect();
-        let release = move || files.release(&assignment_id, &held);
-        // Removing a file and syncing its directory blocks, so on a runtime
-        // it runs on the runtime's blocking pool (`cli/AGENTS.md`).
+        // The files are released first, so a refresh still waiting for the
+        // pass lock writes nothing after the end is marked.
+        let release = move || {
+            files.release(&assignment_id, &held);
+            let ended = setup
+                .upgrade()
+                .and_then(|setup| setup.mark_grants_ended(&assignment_id));
+            if let (Some(document), Some(publish)) = (ended, publish) {
+                publish(&document);
+            }
+        };
+        // Removing a file, syncing its directory and writing the readiness
+        // document block, so on a runtime they run on the runtime's
+        // blocking pool (`cli/AGENTS.md`).
         match tokio::runtime::Handle::try_current() {
             Ok(runtime) => drop(runtime.spawn_blocking(release)),
             Err(_) => release(),
@@ -521,6 +558,8 @@ pub(crate) struct Asking<'a> {
     pub(crate) cloud: &'a dyn AgentLoginCloud,
     pub(crate) files: &'a Arc<TokenFiles>,
     pub(crate) boot_id: &'a str,
+    /// The run of the assignment, which each entry records (REQ-GRANT-88).
+    pub(crate) run_id: &'a str,
     pub(crate) assignment_id: &'a str,
     pub(crate) now: OffsetDateTime,
 }
@@ -592,12 +631,14 @@ impl Asking<'_> {
             files: Arc::clone(self.files),
             setup,
             boot_id: self.boot_id.to_owned(),
+            run_id: self.run_id.to_owned(),
             assignment_id: self.assignment_id.to_owned(),
             held: settled
                 .into_iter()
                 .filter_map(|outcome| outcome.kept)
                 .collect(),
             refresh: None,
+            publish: None,
         }
     }
 
@@ -764,7 +805,8 @@ impl Asking<'_> {
         self.settled(provider, state, state == AgentLoginState::ReconnectRequired)
     }
 
-    /// The provider `ready` with `issued`, which its file already holds.
+    /// The provider `ready` with `issued`, which its file already holds,
+    /// recorded for the run and not ended.
     fn ready(&self, provider: AgentLoginProvider, issued: &IssuedToken) -> Settled {
         Settled {
             entry: GrantReadiness {
@@ -777,6 +819,8 @@ impl Asking<'_> {
                     expires_at: issued.expires_at,
                 }),
                 selected: true,
+                run_id: Some(self.run_id.to_owned()),
+                ended_at: None,
             },
             failure: None,
             kept: None,
@@ -840,6 +884,8 @@ impl Asking<'_> {
         }
     }
 
+    /// The provider in `state` with no token, recorded for the run and not
+    /// ended.
     fn settled(
         &self,
         provider: AgentLoginProvider,
@@ -853,6 +899,8 @@ impl Asking<'_> {
                 checked_at: Some(self.now),
                 issued: None,
                 selected,
+                run_id: Some(self.run_id.to_owned()),
+                ended_at: None,
             },
             failure: None,
             kept: None,

@@ -322,6 +322,57 @@ fn mirror_in_a_stage_file_is_rejected() {
     assert_eq!(location["key"], "mirror");
 }
 
+// REQ-WFDEF-15, REQ-WFFORMAT-103
+#[test]
+fn a_structural_failure_names_the_field_and_the_rule_in_validate_and_publish() {
+    assert!(ROOT_WORKFLOW.contains("\nname: engineering\n"));
+    let tree = Tree::with(
+        &ROOT_WORKFLOW.replacen("\nname: engineering\n", "\nname: grant-e2e\n", 1),
+        DESIGN_WORKFLOW,
+    );
+    let expected = json!({
+        "kind": "workflow",
+        "field": "name",
+        "rule": "pattern",
+        "expected": "^[a-z][A-Za-z0-9]*$",
+    });
+    let assert_structural = |report: &Value| {
+        let diagnostics = report["diagnostics"]
+            .as_array()
+            .expect("diagnostics should be a list");
+        assert_eq!(diagnostics.len(), 1, "{report}");
+        assert_eq!(diagnostics[0]["code"], "invalid_workflow_structure");
+        assert_eq!(diagnostics[0]["location"]["path"], "workflow.yaml");
+        assert_eq!(diagnostics[0]["workflowLocation"], expected);
+        assert!(!report.to_string().contains("grant-e2e"), "{report}");
+    };
+
+    let output = validate(tree.path(), true);
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert_structural(&report(&output));
+
+    let home = Home::new();
+    let bindings = tree.engineering_bindings();
+    let output = home.run(&["publish", tree.path(), "--bindings", &bindings, "--json"]);
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let report = report(&output);
+    assert_eq!(report["command"], PUBLISH_COMMAND);
+    assert_structural(&report);
+    assert!(!home.root.join("workflows").exists());
+
+    let human = validate(tree.path(), false);
+    assert_eq!(human.status.code(), Some(1), "{human:?}");
+    let stdout = String::from_utf8(human.stdout).expect("human output should be UTF-8");
+    let line = stdout
+        .lines()
+        .find(|line| line.contains("invalid_workflow_structure"))
+        .unwrap_or_else(|| panic!("{stdout}"));
+    let (_, workflow_location) = line.split_once("; ").unwrap_or_else(|| panic!("{line}"));
+    assert!(workflow_location.contains("name"), "{line}");
+    assert!(workflow_location.contains("^[a-z][A-Za-z0-9]*$"), "{line}");
+    assert!(!stdout.contains("grant-e2e"), "{stdout}");
+}
+
 // REQ-WFFORMAT-101, REQ-WFDEF-10
 #[test]
 fn the_root_mirror_block_validates() {

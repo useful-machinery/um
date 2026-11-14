@@ -519,6 +519,8 @@ fn an_oauth_providers_ready_entry_survives_a_write_and_a_load_unchanged() {
             expires_at: time(1_794_474_000),
         }),
         selected: true,
+        run_id: None,
+        ended_at: None,
     };
     let document = with_grants([github.clone()]);
 
@@ -566,6 +568,148 @@ fn an_oauth_providers_ready_entry_survives_a_write_and_a_load_unchanged() {
     );
 }
 
+const RUN_ID: &str = "run_01k0z6r1w8f4jy2m7q9v3x5abc";
+
+/// `github` ready, recorded for the run `RUN_ID` at 01:00 and ended at
+/// 01:05.
+fn ended_github() -> GrantReadiness {
+    GrantReadiness {
+        provider: AgentLoginProvider::Github,
+        state: AgentLoginState::Ready,
+        checked_at: Some(time(1_794_445_200)),
+        issued: Some(IssuedGrant {
+            grant_id: GRANT_ID.to_owned(),
+            generation: 4,
+            expires_at: time(1_794_474_000),
+        }),
+        selected: true,
+        run_id: Some(RUN_ID.to_owned()),
+        ended_at: Some(time(1_794_445_500)),
+    }
+}
+
+// REQ-GRANT-88
+#[test]
+fn an_oauth_entry_with_its_run_and_end_survives_a_write_and_a_load_unchanged() {
+    let state = state_directory();
+    let path = readiness_path(&state.path().join("state.json"));
+    let document = with_grants([ended_github()]);
+
+    document.write(&path).unwrap();
+
+    let value: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    assert!(validator().is_valid(&value), "{value}");
+    assert_eq!(value["providers"][0]["runId"], RUN_ID);
+    assert_eq!(value["providers"][0]["endedAt"], "2026-11-12T01:05:00Z");
+    assert_eq!(ReadinessDocument::load(&path), Ok(Some(document.clone())));
+    // The control socket reports both.
+    let reported = serde_json::to_value(document.reported().unwrap()).unwrap();
+    assert_eq!(reported["providers"][0]["runId"], RUN_ID);
+    assert_eq!(reported["providers"][0]["endedAt"], "2026-11-12T01:05:00Z");
+
+    // An entry recorded for a run that has not ended carries no end.
+    let running = with_grants([GrantReadiness {
+        ended_at: None,
+        ..ended_github()
+    }]);
+    running.write(&path).unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    assert!(value["providers"][0].get("endedAt").is_none(), "{value}");
+    assert_eq!(ReadinessDocument::load(&path), Ok(Some(running)));
+}
+
+// REQ-GRANT-88
+#[test]
+fn a_document_written_before_runs_and_ends_were_recorded_still_loads() {
+    let state = state_directory();
+    let path = readiness_path(&state.path().join("state.json"));
+    let fixture = cli_root().join("tests/fixtures/runner-agent-logins/v1/valid/grant-tokens.json");
+    write_raw(
+        &path,
+        &serde_json::from_slice(&fs::read(fixture).unwrap()).unwrap(),
+    );
+
+    let document = ReadinessDocument::load(&path).unwrap().unwrap();
+
+    let github = document.grant(AgentLoginProvider::Github).unwrap();
+    assert_eq!(
+        (github.state, github.run_id.as_deref(), github.ended_at),
+        (AgentLoginState::Ready, None, None)
+    );
+    for provider in [AgentLoginProvider::Gitlab, AgentLoginProvider::Linear] {
+        let entry = document.grant(provider).unwrap();
+        assert_eq!((entry.run_id.as_deref(), entry.ended_at), (None, None));
+    }
+}
+
+// REQ-GRANT-88
+#[test]
+fn a_run_or_an_end_is_refused_without_a_check_time_or_beside_an_installable_entry() {
+    let state = state_directory();
+    let path = readiness_path(&state.path().join("state.json"));
+    let document = |entry: serde_json::Value| {
+        serde_json::json!({
+            "schemaVersion": 1,
+            "updatedAt": "2026-11-12T01:00:00Z",
+            "providers": [entry],
+        })
+    };
+    for entry in [
+        serde_json::json!({"provider": "linear", "state": "revoked", "runId": RUN_ID}),
+        serde_json::json!({"provider": "linear", "state": "revoked", "endedAt": "2026-11-12T01:05:00Z"}),
+        serde_json::json!({
+            "provider": "linear", "state": "not_delivered", "runId": RUN_ID,
+            "endedAt": "2026-11-12T01:05:00Z",
+        }),
+        serde_json::json!({
+            "provider": "linear", "state": "revoked", "checkedAt": "2026-11-12T01:00:00Z",
+            "runId": "asn_01k0z6r1w8f4jy2m7q9v3x5abc",
+        }),
+        serde_json::json!({
+            "provider": "linear", "state": "revoked", "checkedAt": "2026-11-12T01:00:00Z",
+            "endedAt": "after the run",
+        }),
+        serde_json::json!({
+            "provider": "codex", "state": "not_authorized", "checkedAt": "2026-11-12T01:00:00Z",
+            "runId": RUN_ID,
+        }),
+        serde_json::json!({
+            "provider": "gemini", "state": "awaiting_consent", "checkedAt": "2026-11-12T01:00:00Z",
+            "endedAt": "2026-11-12T01:05:00Z",
+        }),
+    ] {
+        write_raw(&path, &document(entry.clone()));
+        assert_eq!(
+            ReadinessDocument::load(&path),
+            Err(ReadinessError::Invalid),
+            "{entry}"
+        );
+    }
+    // Nor does the runner write one.
+    for entry in [
+        GrantReadiness {
+            checked_at: None,
+            ..ended_github()
+        },
+        GrantReadiness {
+            checked_at: None,
+            ended_at: None,
+            ..ended_github()
+        },
+        GrantReadiness {
+            checked_at: None,
+            run_id: None,
+            ..ended_github()
+        },
+    ] {
+        assert_eq!(
+            with_grants([entry.clone()]).write(&path),
+            Err(ReadinessError::WriteFailed(io::ErrorKind::InvalidData)),
+            "{entry:?}"
+        );
+    }
+}
+
 // REQ-GRANT-88
 #[test]
 fn each_state_of_an_oauth_entry_round_trips() {
@@ -592,6 +736,8 @@ fn each_state_of_an_oauth_entry_round_trips() {
                 checked_at: Some(time(1_794_445_200)),
                 issued: None,
                 selected,
+                run_id: None,
+                ended_at: None,
             });
             let document = with_grants(entries);
             document.write(&path).unwrap();
@@ -654,6 +800,8 @@ fn recording_an_oauth_entry_replaces_the_providers_last_and_keeps_the_rest() {
         checked_at: Some(time(1_794_445_200)),
         issued: None,
         selected: false,
+        run_id: None,
+        ended_at: None,
     };
     let gemini = serde_json::json!({"provider": "gemini", "state": "awaiting_consent"});
     let state = state_directory();

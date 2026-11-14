@@ -226,6 +226,10 @@
           "type": "string",
           "minLength": 1
         },
+        "outcome": {
+          "type": "string",
+          "minLength": 1
+        },
         "profile": {
           "type": "string",
           "minLength": 1
@@ -249,6 +253,44 @@
         "key": {
           "type": "string",
           "minLength": 1
+        },
+        "field": {
+          "type": "string",
+          "minLength": 1
+        },
+        "rule": {
+          "enum": [
+            "unknown_field",
+            "missing_field",
+            "pattern",
+            "enum",
+            "type",
+            "length",
+            "count",
+            "range",
+            "duplicate",
+            "forbidden",
+            "form",
+            "invalid"
+          ]
+        },
+        "expected": {
+          "oneOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "array",
+              "items": {
+                "type": [
+                  "string",
+                  "integer",
+                  "boolean",
+                  "null"
+                ]
+              }
+            }
+          ]
         }
       }
     },

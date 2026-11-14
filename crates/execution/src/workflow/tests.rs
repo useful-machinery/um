@@ -948,6 +948,139 @@ fn every_canonical_invalid_fixture_is_a_structural_failure() {
     }
 }
 
+/// The field, the wire name of the rule and the expectation a structural failure names.
+fn structural_violation(source: &[u8]) -> (Option<String>, String, Option<serde_json::Value>) {
+    let failure = decode(source).unwrap_err();
+    assert_eq!(failure.kind(), DecodeFailureKind::StructuralContract);
+    let violation = failure.into_violation().unwrap();
+    (
+        violation.field().map(str::to_owned),
+        serde_json::to_value(violation.rule())
+            .unwrap()
+            .as_str()
+            .unwrap()
+            .to_owned(),
+        violation.expected().cloned(),
+    )
+}
+
+// REQ-WFFORMAT-103
+#[test]
+fn a_structural_failure_names_the_field_and_the_rule() {
+    let mut hyphenated = canonical_valid_fixture();
+    hyphenated.extend_from_slice(b"name: grant-e2e\n");
+    assert_eq!(
+        structural_violation(&hyphenated),
+        (
+            Some("name".to_owned()),
+            "pattern".to_owned(),
+            Some(serde_json::json!("^[a-z][A-Za-z0-9]*$"))
+        )
+    );
+    assert_eq!(
+        structural_violation(
+            b"schemaVersion: 1\nsteps:\n  build:\n    kind: shell\n    command: {argv: [\"true\"]}\n"
+        ),
+        (
+            Some("steps.build.kind".to_owned()),
+            "enum".to_owned(),
+            Some(serde_json::json!(["cmd", "agent", "workflow"]))
+        )
+    );
+    assert_eq!(
+        structural_violation(
+            b"schemaVersion: 1\noutcomes: [done, failed]\nsteps:\n  design:\n    kind: workflow\n    workflow: design.yaml\n    on: {done: 5, failed: exit.failed}\n"
+        ),
+        (
+            Some("steps.design.on.done".to_owned()),
+            "type".to_owned(),
+            Some(serde_json::json!(["string", "object"]))
+        )
+    );
+    assert_eq!(
+        structural_violation(b"schemaVersion: 1\n"),
+        (Some("steps".to_owned()), "missing_field".to_owned(), None)
+    );
+
+    let invalid_root = fixture_root().join("invalid");
+    for (fixture, field, rule, expected) in [
+        (
+            "unknown-step-field.yaml",
+            "steps.prepare.timeout",
+            "unknown_field",
+            None,
+        ),
+        ("recovery-at-root.yaml", "recovery", "unknown_field", None),
+        (
+            "codex-extra-config.yaml",
+            "agentProfiles.invalid.harness.config.modelProvider",
+            "unknown_field",
+            None,
+        ),
+        (
+            "missing-agent-profile.yaml",
+            "steps.implement.agent.profile",
+            "missing_field",
+            None,
+        ),
+        (
+            "unknown-failure-policy.yaml",
+            "steps.lint.failurePolicy",
+            "enum",
+            Some(serde_json::json!(["required", "advisory"])),
+        ),
+        (
+            "empty-command-program.yaml",
+            "steps.prepare.command.argv[0]",
+            "length",
+            None,
+        ),
+        ("identifier-too-long.yaml", "steps.?", "length", None),
+        (
+            "input-optional-false.yaml",
+            "inputs.branch.optional",
+            "enum",
+            Some(serde_json::json!([true])),
+        ),
+        (
+            "output-unlisted-pair.yaml",
+            "steps.produce.outputs.summary",
+            "form",
+            None,
+        ),
+    ] {
+        assert_eq!(
+            structural_violation(&fs::read(invalid_root.join(fixture)).unwrap()),
+            (Some(field.to_owned()), rule.to_owned(), expected),
+            "{fixture}"
+        );
+    }
+
+    let rules = [
+        "unknown_field",
+        "missing_field",
+        "pattern",
+        "enum",
+        "type",
+        "length",
+        "count",
+        "range",
+        "duplicate",
+        "forbidden",
+        "form",
+        "invalid",
+    ];
+    for fixture in fs::read_dir(&invalid_root).unwrap() {
+        let path = fixture.unwrap().path();
+        let (field, rule, _) = structural_violation(&fs::read(&path).unwrap());
+        assert!(rules.contains(&rule.as_str()), "{}: {rule}", path.display());
+        // Every failure the corpus knows lies at a field the finder can name: none falls
+        // back to `invalid`, the answer for an error kind the finder does not know.
+        assert_ne!(rule, "invalid", "{}", path.display());
+        assert!(field.is_some(), "{}: {rule}", path.display());
+    }
+}
+
 // REQ-WFFORMAT-4, REQ-WFFORMAT-5, REQ-WFCOND-3
 #[test]
 fn every_canonical_forbidden_yaml_fixture_is_refused() {

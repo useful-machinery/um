@@ -2795,6 +2795,11 @@ step it names, and the login's last use and when
 (`codex login:       ready (generation 3), availability available · last use: accepted at 2026-11-13T09:30:00Z`),
 or with `--json` a schema-version-1 `synced` document with `agentLogins`, each provider
 carrying `availability` and `nextAction` and, for a login with one, `lastUse` and `lastUseAt`.
+A `github`, `gitlab` or `linear` line shows what the last assignment the runner admitted was
+issued, and once that assignment has ended it shows it as of that run and the time of its
+check, never as current, a `ready` one with availability `unverified` and `--json` carrying
+`runId` and `endedAt`
+(`github login:      ready as of run run_01k0z6r1w8f4jy2m7q9v3x5abp at 2026-11-14T15:02:11Z (generation 2), availability unverified`).
 The setup it asks for checks every `ready` login before it answers, so the command can take
 about a minute longer for each login whose provider is slow to answer. A login is
 `available` once a check or a step succeeded with it, `reconnect_required` once the provider

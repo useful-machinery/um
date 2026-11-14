@@ -748,6 +748,8 @@ fn installed_agent_logins_reach_their_files_and_no_output() {
 /// carry.
 const GRANT_TOKEN: &str = "gho_grant-token-sentinel-3c9e1a";
 const GRANT_ASSIGNMENT: &str = "asn_01k0z6r1w8f4jy2m7q9v3x5abn";
+/// The run of that assignment.
+const GRANT_RUN: &str = "run_01k0z6r1w8f4jy2m7q9v3x5abp";
 
 /// The pinned assignment offer and its prepare, whose preparation expires
 /// long after the test.
@@ -763,6 +765,7 @@ fn offer_and_prepare() -> (Message, Message) {
     let mut prepare = fixture("cloud-assignment-prepare.json");
     prepare["payload"]["preparationExpiresAt"] = "2099-01-01T00:00:00Z".into();
     assert_eq!(offer["payload"]["assignmentId"], GRANT_ASSIGNMENT);
+    assert_eq!(offer["payload"]["runId"], GRANT_RUN);
     assert_eq!(prepare["payload"]["assignmentId"], GRANT_ASSIGNMENT);
     (
         Message::Text(offer.to_string().into()),
@@ -841,85 +844,125 @@ async fn serve_one_assignment(
     }
 }
 
+/// A live `um runner serve` that admits the pinned assignment and is issued
+/// its GitHub token, once that assignment has ended: the source route has no
+/// credential, so the admission is rejected.
+struct EndedGrantAssignment {
+    fixture: ServeStatusFixture,
+    _home: tempfile::TempDir,
+    serve: std::process::Child,
+    stderr_reader: thread::JoinHandle<String>,
+    token_file: PathBuf,
+    /// What the token file held, and its mode, when the admission went on
+    /// to ask for its source credential, the step after the grant tokens.
+    held_at_source: Option<Option<(String, u32)>>,
+    rejection: Option<serde_json::Value>,
+}
+
+impl EndedGrantAssignment {
+    fn served() -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let endpoint = format!("ws://{}/v1/runner/connect", listener.local_addr().unwrap());
+        let fixture = ServeStatusFixture::new(&endpoint);
+        let home = tempfile::tempdir().unwrap();
+        let token_file = fixture
+            .state_directory()
+            .join(".runner-agent-login/github.token");
+        let (held_sender, held) = mpsc::sync_channel(1);
+        let (rejected_sender, rejected) = mpsc::sync_channel(1);
+        let watched = token_file.clone();
+        let routes = move |request: &[u8]| {
+            if request.starts_with(b"POST /v1/runner/source-credentials ") {
+                let _ = held_sender.try_send(
+                    fs::read_to_string(&watched).ok().zip(
+                        fs::symlink_metadata(&watched)
+                            .ok()
+                            .map(|metadata| metadata.permissions().mode() & 0o777),
+                    ),
+                );
+            }
+            cloud_issuing_a_github_token(request)
+        };
+        thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async move {
+                    let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+                    let stream = accept_runner_connection_answering(&listener, &routes).await;
+                    tokio::spawn(serve_one_assignment(stream, rejected_sender));
+                    // The runner's HTTP requests go on arriving on this listener.
+                    loop {
+                        drop(accept_runner_connection_answering(&listener, &routes).await);
+                    }
+                });
+        });
+        let mut serve = Command::new(env!("CARGO_BIN_EXE_um"))
+            .args(["runner", "serve", "--config", &fixture.config])
+            .env("OTEL_SDK_DISABLED", "true")
+            .env("HOME", home.path())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let serve_stderr = serve.stderr.take().unwrap();
+        let stderr_reader = thread::spawn(move || {
+            let mut output = String::new();
+            let _ = BufReader::new(serve_stderr).read_to_string(&mut output);
+            output
+        });
+
+        let held_at_source = poll_until(
+            "the admission's request for its source credential",
+            || held.try_recv().ok(),
+            Option::is_some,
+        );
+        let rejection = poll_until(
+            "the admission's rejection",
+            || rejected.try_recv().ok(),
+            Option::is_some,
+        );
+        Self {
+            fixture,
+            _home: home,
+            serve,
+            stderr_reader,
+            token_file,
+            held_at_source,
+            rejection,
+        }
+    }
+
+    /// Stops the runner and answers what it wrote to standard error.
+    fn stop(mut self) -> String {
+        self.serve.kill().unwrap();
+        self.serve.wait().unwrap();
+        self.stderr_reader.join().unwrap()
+    }
+}
+
 // REQ-GRANT-86, REQ-GRANT-88, INV-RUNNER-28
 #[test]
 fn an_admitted_assignment_keeps_its_grant_token_in_its_file_and_prints_it_nowhere() {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    listener.set_nonblocking(true).unwrap();
-    let endpoint = format!("ws://{}/v1/runner/connect", listener.local_addr().unwrap());
-    let fixture = ServeStatusFixture::new(&endpoint);
-    let home = tempfile::tempdir().unwrap();
-    let token_file = fixture
-        .state_directory()
-        .join(".runner-agent-login/github.token");
-    // What the token file held, and its mode, when the admission went on to
-    // ask for its source credential, the step after the grant tokens.
-    let (held_sender, held) = mpsc::sync_channel(1);
-    let (rejected_sender, rejected) = mpsc::sync_channel(1);
-    let watched = token_file.clone();
-    let routes = move |request: &[u8]| {
-        if request.starts_with(b"POST /v1/runner/source-credentials ") {
-            let _ = held_sender.try_send(
-                fs::read_to_string(&watched).ok().zip(
-                    fs::symlink_metadata(&watched)
-                        .ok()
-                        .map(|metadata| metadata.permissions().mode() & 0o777),
-                ),
-            );
-        }
-        cloud_issuing_a_github_token(request)
-    };
-    thread::spawn(move || {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap()
-            .block_on(async move {
-                let listener = tokio::net::TcpListener::from_std(listener).unwrap();
-                let stream = accept_runner_connection_answering(&listener, &routes).await;
-                tokio::spawn(serve_one_assignment(stream, rejected_sender));
-                // The runner's HTTP requests go on arriving on this listener.
-                loop {
-                    drop(accept_runner_connection_answering(&listener, &routes).await);
-                }
-            });
-    });
-    let mut serve = Command::new(env!("CARGO_BIN_EXE_um"))
-        .args(["runner", "serve", "--config", &fixture.config])
-        .env("OTEL_SDK_DISABLED", "true")
-        .env("HOME", home.path())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    let serve_stderr = serve.stderr.take().unwrap();
-    let stderr_reader = thread::spawn(move || {
-        let mut output = String::new();
-        let _ = BufReader::new(serve_stderr).read_to_string(&mut output);
-        output
-    });
-
-    let held_at_source = poll_until(
-        "the admission's request for its source credential",
-        || held.try_recv().ok(),
-        Option::is_some,
-    );
-    // The source route has no credential, so the admission is rejected and
-    // the assignment ends.
-    let rejection = poll_until(
-        "the admission's rejection",
-        || rejected.try_recv().ok(),
-        Option::is_some,
-    );
+    let served = EndedGrantAssignment::served();
+    let token_file = served.token_file.clone();
     let removed = poll_until(
         "the token file's removal once the assignment ended",
         || token_file.exists(),
         |exists| !exists,
     );
-    let status = run(&["runner", "status", "--config", &fixture.config]);
-    serve.kill().unwrap();
-    serve.wait().unwrap();
-    let serve_stderr = stderr_reader.join().unwrap();
+    let status = run(&["runner", "status", "--config", &served.fixture.config]);
+    let readiness = fs::read(
+        served
+            .fixture
+            .state_directory()
+            .join(".runner-agent-logins.json"),
+    )
+    .unwrap();
+    let (held_at_source, rejection) = (served.held_at_source.clone(), served.rejection.clone());
+    let serve_stderr = served.stop();
 
     assert_eq!(
         held_at_source,
@@ -928,10 +971,7 @@ fn an_admitted_assignment_keeps_its_grant_token_in_its_file_and_prints_it_nowher
     );
     assert!(rejection.is_some(), "{serve_stderr}");
     assert!(!removed);
-    let readiness: serde_json::Value = serde_json::from_slice(
-        &fs::read(fixture.state_directory().join(".runner-agent-logins.json")).unwrap(),
-    )
-    .unwrap();
+    let readiness: serde_json::Value = serde_json::from_slice(&readiness).unwrap();
     let entry = |provider: &str| {
         readiness["providers"]
             .as_array()
@@ -968,4 +1008,56 @@ fn an_admitted_assignment_keeps_its_grant_token_in_its_file_and_prints_it_nowher
             "{name} names the token file"
         );
     }
+}
+
+// REQ-GRANT-88, REQ-GRANT-41, REQ-GRANT-53
+#[test]
+fn sync_shows_an_ended_assignments_grant_token_as_of_its_run_and_not_as_current() {
+    let served = EndedGrantAssignment::served();
+    let config = served.fixture.config.clone();
+    // The runner answers a sync only once it is idle (REQ-GRANT-41).
+    let sync = poll_until(
+        "grant sync once the runner is idle",
+        || run(&["runner", "grant", "sync", "--config", &config]),
+        |output| output.status.code() != Some(4),
+    );
+    let json = run(&["runner", "grant", "sync", "--json", "--config", &config]);
+    let serve_stderr = served.stop();
+
+    // An OAuth entry never fails the sync, ended or not (REQ-GRANT-88).
+    assert_eq!(
+        sync.status.code(),
+        Some(0),
+        "{}\n{serve_stderr}",
+        String::from_utf8_lossy(&sync.stderr)
+    );
+    let stdout = String::from_utf8(sync.stdout).unwrap();
+    let github = stdout
+        .lines()
+        .find(|line| line.starts_with("github login:"))
+        .unwrap_or_else(|| panic!("{stdout}"));
+    let words = github
+        .split([' ', ',', ':'])
+        .filter(|word| !word.is_empty())
+        .collect::<Vec<_>>();
+    assert!(words.contains(&"ready"), "{github}");
+    assert!(github.contains("as of run"), "{github}");
+    assert!(words.contains(&GRANT_RUN), "{github}");
+    assert!(words.contains(&"unverified"), "{github}");
+    assert!(!github.contains("availability available"), "{github}");
+
+    assert_eq!(json.status.code(), Some(0));
+    let document: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
+    let entry = document["agentLogins"]["providers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["provider"] == "github")
+        .cloned()
+        .unwrap();
+    assert_eq!(entry["state"], "ready", "{document}");
+    assert_eq!(entry["runId"], GRANT_RUN, "{document}");
+    assert!(entry["endedAt"].is_string(), "{document}");
+    assert_eq!(entry["availability"], "unverified", "{document}");
+    assert_eq!(entry["nextAction"], "none", "{document}");
 }

@@ -2,11 +2,13 @@ use std::fmt;
 use std::os::unix::ffi::OsStrExt as _;
 
 use serde::Serialize;
+use serde_json::Value;
 
 use super::DecodeFailureKind;
 use super::admission::{AdmissionFailure, AdmissionFailureKind, AdmissionLocation};
 use super::presentation_feed::normalize_terminal_scalar;
 use super::resolution::{ResolutionFailure, ResolutionFailureKind, ResolutionLocation};
+use super::structure::{StructureRule, StructureViolation};
 use super::validation::{ValidationFailureKind, ValidationLocation};
 use crate::AgentHarnessInstallationFailure;
 use crate::claude_code::{
@@ -28,7 +30,8 @@ impl<'a> RejectionDiagnostic<'a> {
         Self {
             code,
             message,
-            location: RejectionLocation::from_resolution(failure.location()),
+            location: RejectionLocation::from_resolution(failure.location())
+                .with_violation(failure.structure_violation()),
         }
     }
 
@@ -107,6 +110,16 @@ pub struct RejectionLocation<'a> {
     /// A root field of the workflow file.
     #[serde(skip_serializing_if = "Option::is_none")]
     key: Option<&'a str>,
+    /// The path of the field a structurally invalid workflow file or replacement document
+    /// breaks (REQ-WFFORMAT-103).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    field: Option<&'a str>,
+    /// The rule that field breaks.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rule: Option<StructureRule>,
+    /// The pattern, the allowed values or the allowed JSON types, from the schema.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    expected: Option<&'a Value>,
 }
 
 impl<'a> RejectionLocation<'a> {
@@ -125,6 +138,23 @@ impl<'a> RejectionLocation<'a> {
             export: None,
             tool: None,
             key: None,
+            field: None,
+            rule: None,
+            expected: None,
+        }
+    }
+
+    /// Adds the field and the rule a structurally invalid document breaks, which only a
+    /// `workflow` or an `agent_profile_replacement` location's failure carries.
+    fn with_violation(self, violation: Option<&'a StructureViolation>) -> Self {
+        match violation {
+            Some(violation) => Self {
+                field: violation.field(),
+                rule: Some(violation.rule()),
+                expected: violation.expected(),
+                ..self
+            },
+            None => self,
         }
     }
 
@@ -372,9 +402,87 @@ impl fmt::Display for RejectionLocation<'_> {
             write!(formatter, " ({name})")?;
         } else if let Some(key) = self.key {
             write!(formatter, " (key {key})")?;
+        } else if let Some(rule) = self.rule {
+            formatter.write_str(" (")?;
+            if let Some(field) = self.field {
+                write!(
+                    formatter,
+                    "field {}, ",
+                    normalize_terminal_scalar(field.as_bytes())
+                )?;
+            }
+            write!(formatter, "rule {}", rule.as_str())?;
+            if let Some(expected) = self.expected {
+                write!(formatter, ", expected {}", expected_text(expected))?;
+            }
+            formatter.write_str(")")?;
         }
         Ok(())
     }
+}
+
+/// The pattern, or the allowed values in brackets, for a terminal.
+fn expected_text(expected: &Value) -> String {
+    match expected {
+        Value::Array(values) => format!("[{}]", allowed_values(values, ", ")),
+        value => scalar_text(value),
+    }
+}
+
+fn allowed_values(values: &[Value], separator: &str) -> String {
+    values
+        .iter()
+        .map(scalar_text)
+        .collect::<Vec<_>>()
+        .join(separator)
+}
+
+fn scalar_text(value: &Value) -> String {
+    match value {
+        Value::String(text) => normalize_terminal_scalar(text.as_bytes()),
+        value => normalize_terminal_scalar(value.to_string().as_bytes()),
+    }
+}
+
+/// What the field a structural failure names must become, under the named document format.
+fn structure_remedy(violation: &StructureViolation, format: &str) -> Option<String> {
+    let field = normalize_terminal_scalar(violation.field()?.as_bytes());
+    let values = |separator| match violation.expected() {
+        Some(Value::Array(values)) => allowed_values(values, separator),
+        Some(value) => scalar_text(value),
+        None => String::new(),
+    };
+    Some(match violation.rule() {
+        StructureRule::UnknownField => {
+            format!("Remove `{field}`; it is not a field of the {format}.")
+        }
+        StructureRule::MissingField => {
+            format!("Add `{field}`; the {format} requires it.")
+        }
+        StructureRule::Pattern => {
+            format!("Change `{field}` to match the pattern {}.", values(""))
+        }
+        StructureRule::Enum => match violation.expected() {
+            Some(Value::Array(fixed)) if fixed.len() == 1 => {
+                format!("Set `{field}` to {}.", values(""))
+            }
+            _ => format!("Set `{field}` to one of: {}.", values(", ")),
+        },
+        StructureRule::Type => format!("Give `{field}` a value of type {}.", values(" or ")),
+        StructureRule::Length => format!("Keep the length of `{field}` within its bounds."),
+        StructureRule::Count => {
+            format!("Keep the number of entries in `{field}` within its bounds.")
+        }
+        StructureRule::Range => format!("Keep `{field}` within its allowed range."),
+        StructureRule::Duplicate => format!("Remove the repeated entry from `{field}`."),
+        StructureRule::Forbidden => {
+            format!("Replace `{field}` with a value the {format} allows.")
+        }
+        StructureRule::Form => {
+            format!("Write `{field}` in one of the forms the {format} allows.")
+        }
+        StructureRule::Invalid => return None,
+    })
 }
 
 pub fn human_resolution_remedy(failure: &ResolutionFailure) -> String {
@@ -389,6 +497,16 @@ pub fn human_resolution_remedy(failure: &ResolutionFailure) -> String {
             diagnostic.location,
             human_resolution_remedy(child)
         );
+    }
+    let format = match failure.location() {
+        ResolutionLocation::AgentProfileReplacement => "agent profile replacement format",
+        _ => "workflow format",
+    };
+    if let Some(remedy) = failure
+        .structure_violation()
+        .and_then(|violation| structure_remedy(violation, format))
+    {
+        return remedy;
     }
     let Some(source_path) = failure.source_path() else {
         return default.to_owned();

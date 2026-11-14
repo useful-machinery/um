@@ -642,6 +642,49 @@ fn runner_status_prints_each_provider_readiness_once_the_runner_has_set_up() {
     assert!(output.stderr.is_empty());
 }
 
+// REQ-RUNNERENROLL-42, REQ-GRANT-88, REQ-GRANT-53
+#[test]
+fn runner_status_prints_an_ended_oauth_entry_as_of_its_run_and_not_as_current() {
+    let output = run_status_with_response(
+        b"{\"schemaVersion\":1,\"outcome\":\"ok\",\"status\":{\"processState\":\"running\",\"bootId\":\"rbt_01k0z6r1w8f4jy2m7q9v3x5abc\",\"uptimeMilliseconds\":10000,\"connectionState\":\"connected\",\"assignmentCounts\":{\"preparing\":0,\"accepted\":0,\"running\":0,\"finishing\":0,\"reporting\":0},\"agentLogins\":{\"updatedAt\":\"2026-11-12T02:00:00Z\",\"providers\":[{\"provider\":\"github\",\"state\":\"ready\",\"grantId\":\"pgr_01k0z6r1w8f4jy2m7q9v3x5abc\",\"generation\":4,\"expiresAt\":\"2026-11-12T09:00:00Z\",\"checkedAt\":\"2026-11-12T01:00:00Z\",\"selected\":true,\"runId\":\"run_01k0z6r1w8f4jy2m7q9v3x5abp\",\"endedAt\":\"2026-11-12T02:00:00Z\"},{\"provider\":\"gitlab\",\"state\":\"revoked\",\"checkedAt\":\"2026-11-12T01:30:00Z\",\"selected\":true,\"endedAt\":\"2026-11-12T02:00:00Z\"},{\"provider\":\"linear\",\"state\":\"ready\",\"grantId\":\"pgr_01k0z6r1w8f4jy2m7q9v3x5abd\",\"generation\":1,\"expiresAt\":\"2026-11-12T09:00:00Z\",\"checkedAt\":\"2026-11-12T01:00:00Z\",\"selected\":true,\"runId\":\"run_01k0z6r1w8f4jy2m7q9v3x5abq\"}]}}}\n",
+    );
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    super::runner_agent_login::assert_provider_lines(
+        &stdout,
+        &[
+            ("github", "ready", "unverified"),
+            ("gitlab", "revoked", "not_connected"),
+            ("linear", "ready", "available"),
+        ],
+    );
+    let line = |provider: &str| {
+        stdout
+            .lines()
+            .find(|line| line.starts_with(&format!("{provider} login:")))
+            .unwrap()
+    };
+    // An ended entry is as of its run and the time of its check.
+    assert!(line("github").contains("as of run"), "{stdout}");
+    assert!(
+        line("github").contains("run_01k0z6r1w8f4jy2m7q9v3x5abp"),
+        "{stdout}"
+    );
+    assert!(line("github").contains("2026-11-12T01:00:00Z"), "{stdout}");
+    // One recorded before runs were is as of its check alone.
+    assert!(line("gitlab").contains("as of"), "{stdout}");
+    assert!(!line("gitlab").contains("as of run"), "{stdout}");
+    assert!(line("gitlab").contains("2026-11-12T01:30:00Z"), "{stdout}");
+    // The assignment the runner holds is current, its run unnamed.
+    assert!(!line("linear").contains("as of"), "{stdout}");
+    assert!(
+        !line("linear").contains("run_01k0z6r1w8f4jy2m7q9v3x5abq"),
+        "{stdout}"
+    );
+    assert!(output.stderr.is_empty());
+}
+
 // REQ-GRANT-88, REQ-GRANT-53
 #[test]
 fn runner_status_names_the_grant_to_reconnect_by_its_grant_provider() {

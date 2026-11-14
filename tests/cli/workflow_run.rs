@@ -4630,6 +4630,55 @@ fn execution_root_rebinding_fails_default_and_nested_cwds_before_command_launch(
     }
 }
 
+/// The one diagnostic of a `--json` resolution rejection, checked against the run schema.
+fn resolution_rejection_diagnostic(bundle: &RunBundle, name: &str) -> serde_json::Value {
+    let destination = bundle.result(name);
+    let mut args = bundle.args(&destination);
+    args.insert(args.len() - 1, "--json".to_owned());
+    let output = run(&args);
+    assert_eq!(output.status.code(), Some(1), "{name}");
+    let rejection: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(workflow_run_schema().is_valid(&rejection), "{rejection}");
+    assert_eq!(rejection["outcome"], "rejected", "{name}");
+    assert_eq!(rejection["phase"], "resolution", "{name}");
+    assert_eq!(rejection["diagnostics"].as_array().unwrap().len(), 1);
+    assert!(!destination.exists(), "{name}");
+    rejection["diagnostics"][0].clone()
+}
+
+// REQ-LOCALRUN-128, REQ-WFFORMAT-103
+#[test]
+fn a_structural_rejection_names_the_field_and_the_rule() {
+    let structural = RunBundle::new(
+        "schemaVersion: 1\nname: grant-e2e\nsteps:\n  work:\n    kind: cmd\n    command: { argv: [\"true\"] }\n",
+    );
+    let diagnostic = resolution_rejection_diagnostic(&structural, "structural");
+    assert_eq!(diagnostic["code"], "invalid_workflow_structure");
+    assert_eq!(
+        diagnostic["location"],
+        serde_json::json!({
+            "kind": "workflow",
+            "field": "name",
+            "rule": "pattern",
+            "expected": "^[a-z][A-Za-z0-9]*$",
+        })
+    );
+    assert!(!diagnostic.to_string().contains("grant-e2e"));
+
+    // A semantic location's members are admitted by the same closed location schema.
+    let edge = RunBundle::new(
+        "schemaVersion: 1\noutcomes: [landed, failed]\nsteps:\n  design:\n    kind: workflow\n    workflow: design.yaml\n    on:\n      planned: exit.landed\n      failed: exit.failed\n",
+    );
+    edge.write_source(
+        "design.yaml",
+        "schemaVersion: 1\noutcomes: [planned, blocked, failed]\noutcome: { from: outputs.decide.verdict, onFailure: failed }\nsteps:\n  decide:\n    kind: cmd\n    command: { argv: [\"true\"] }\n    outputs:\n      verdict: { kind: text, from: path, path: verdict.txt }\n",
+    );
+    let diagnostic = resolution_rejection_diagnostic(&edge, "edge");
+    assert_eq!(diagnostic["code"], "edge_outcome_missing");
+    assert_eq!(diagnostic["location"]["kind"], "step_edge");
+    assert_eq!(diagnostic["location"]["outcome"], "blocked");
+}
+
 // REQ-LOCALRUN-80, REQ-LOCALRUN-91, REQ-LOCALRUN-95, REQ-LOCALRUN-96, REQ-LOCALRUN-128, REQ-LOCALRUN-132, REQ-LOCALRUN-133
 #[test]
 fn failure_rejection_usage_and_result_preconditions_keep_their_outcome_precedence() {
@@ -6561,7 +6610,7 @@ fn agent_profile_replacement_pins_the_replacement_harness_and_records_provenance
     );
 }
 
-// REQ-AGENT-54, REQ-AGENT-55
+// REQ-AGENT-54, REQ-AGENT-55, REQ-WFFORMAT-103
 #[test]
 fn agent_profile_replacement_rejections_are_typed_before_any_step_starts() {
     let bundle = RunBundle::new(response_agent_source());
@@ -6573,17 +6622,20 @@ fn agent_profile_replacement_rejections_are_typed_before_any_step_starts() {
             agent_profile_replacement_document("missing", "claude_code", "fixture/claude", "low"),
             "unknown_replacement_profile",
             Some("missing"),
+            None,
         ),
         (
             "empty-effort",
             agent_profile_replacement_document("local", "codex", "fixture/codex", "\"\""),
             "invalid_replacement_document",
             None,
+            None,
         ),
         (
             "empty",
             "schemaVersion: 1\nagentProfiles: {}\n".to_owned(),
             "invalid_replacement_document",
+            None,
             None,
         ),
         (
@@ -6592,11 +6644,21 @@ fn agent_profile_replacement_rejections_are_typed_before_any_step_starts() {
                 .replace("effort: xhigh", "thinking: xhigh"),
             "invalid_replacement_document",
             None,
+            None,
+        ),
+        (
+            "missing-model",
+            agent_profile_replacement_document("local", "claude_code", "fixture/claude", "low")
+                .replace("        model: fixture/claude\n", ""),
+            "invalid_replacement_document",
+            None,
+            Some(("agentProfiles.local.harness.config.model", "missing_field")),
         ),
     ];
     let documents = bundle.initial_cwd().join("replacement-path-sentinel");
     fs::create_dir(&documents).unwrap();
-    for (name, document_bytes, code, profile) in cases {
+    let schema = workflow_run_schema();
+    for (name, document_bytes, code, profile, structure) in cases {
         let document = documents.join(format!("{name}.yaml"));
         fs::write(&document, document_bytes).unwrap();
         let destination = bundle.result(name);
@@ -6605,6 +6667,7 @@ fn agent_profile_replacement_rejections_are_typed_before_any_step_starts() {
             .unwrap();
         assert_eq!(output.status.code(), Some(1), "{name}");
         let terminal: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert!(schema.is_valid(&terminal), "{name}: {terminal}");
         assert_eq!(terminal["outcome"], "rejected", "{name}");
         assert_eq!(terminal["phase"], "resolution", "{name}");
         let diagnostic = &terminal["diagnostics"][0];
@@ -6616,6 +6679,10 @@ fn agent_profile_replacement_rejections_are_typed_before_any_step_starts() {
         match profile {
             Some(profile) => assert_eq!(diagnostic["location"]["profile"], profile, "{name}"),
             None => assert!(diagnostic["location"].get("profile").is_none(), "{name}"),
+        }
+        if let Some((field, rule)) = structure {
+            assert_eq!(diagnostic["location"]["field"], field, "{name}");
+            assert_eq!(diagnostic["location"]["rule"], rule, "{name}");
         }
         assert!(!destination.exists(), "{name}");
         let rendered = String::from_utf8_lossy(&output.stdout);
@@ -6941,6 +7008,38 @@ fn a_path_argv_under_a_tree_root_is_rejected_at_phase_tree() {
             .as_str()
             .is_some_and(|text| !text.is_empty())
     );
+    assert!(!destination.exists());
+}
+
+// REQ-LOCALRUN-128, REQ-LOCALRUN-169, REQ-WFFORMAT-103
+#[test]
+fn a_tree_rejection_names_a_structural_failures_field_and_rule_in_its_workflow_location() {
+    let bundle = TreeBundle::new(
+        "schemaVersion: 1\nname: grant-e2e\nsteps:\n  work:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n",
+    );
+    let destination = bundle.result("structural");
+
+    // `tree_rejection` checks the document against the closed run schema.
+    let rejection = tree_rejection(&run(&bundle.args(&destination)));
+
+    assert_eq!(rejection["phase"], "tree");
+    let structural = rejection["diagnostics"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|diagnostic| diagnostic["code"] == "invalid_workflow_structure")
+        .unwrap_or_else(|| panic!("{rejection}"));
+    assert_eq!(structural["location"]["path"], "workflow.yaml");
+    assert_eq!(
+        structural["workflowLocation"],
+        serde_json::json!({
+            "kind": "workflow",
+            "field": "name",
+            "rule": "pattern",
+            "expected": "^[a-z][A-Za-z0-9]*$",
+        })
+    );
+    assert!(!rejection.to_string().contains("grant-e2e"), "{rejection}");
     assert!(!destination.exists());
 }
 

@@ -442,6 +442,52 @@ fn edge_diagnostics_name_the_step_and_the_outcome() {
     assert_eq!(location["outcome"], "planned");
 }
 
+// REQ-WFFORMAT-69, REQ-WFFORMAT-72, REQ-WFFORMAT-103
+#[test]
+fn structural_diagnostics_name_the_field_and_the_rule_without_the_value() {
+    let bundle = WorkflowBundle::valid();
+    let source = fs::read_to_string(bundle.workflow_path()).expect("workflow should be readable");
+    bundle.replace_workflow(&format!("{source}name: grant-e2e\n"));
+    let pattern = "^[a-z][A-Za-z0-9]*$";
+
+    let json = validate(&bundle, true);
+    assert_eq!(json.status.code(), Some(1));
+    let report: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
+    let diagnostics = report["diagnostics"].as_array().unwrap();
+    assert_eq!(diagnostics.len(), 1);
+    assert_eq!(diagnostics[0]["code"], "invalid_workflow_structure");
+    assert_eq!(
+        diagnostics[0]["location"],
+        serde_json::json!({
+            "kind": "workflow",
+            "field": "name",
+            "rule": "pattern",
+            "expected": pattern,
+        })
+    );
+
+    let human = validate(&bundle, false);
+    assert_eq!(human.status.code(), Some(1));
+    let human_text = String::from_utf8(human.stdout.clone()).unwrap();
+    let location = human_text
+        .lines()
+        .find_map(|line| line.strip_prefix("location: "))
+        .unwrap_or_else(|| panic!("{human_text:?}"));
+    assert!(location.contains("name"), "{location}");
+    assert!(location.contains(pattern), "{location}");
+    let (_, remedy) = human_text
+        .split_once("No workflow steps were executed.\n\n")
+        .unwrap_or_else(|| panic!("{human_text:?}"));
+    assert!(remedy.contains("`name`"), "{remedy}");
+    assert!(remedy.contains(pattern), "{remedy}");
+
+    for output in [&json, &human] {
+        assert!(output.stderr.is_empty());
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("grant-e2e"));
+        assert_static_contents_absent(output);
+    }
+}
+
 // REQ-WFFORMAT-80, REQ-WFFORMAT-102
 #[test]
 fn undeclared_node_environment_passthrough_names_the_step() {

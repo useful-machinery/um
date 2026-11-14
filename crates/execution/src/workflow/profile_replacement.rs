@@ -16,6 +16,7 @@ use std::sync::Arc;
 
 use super::document::AgentProfile;
 use super::schema::AgentProfileDto;
+use super::structure::check_structure;
 use super::validated::ValidatedHarness;
 use super::{DecodeFailure, strict_yaml};
 
@@ -74,17 +75,15 @@ struct ReplacementDto {
 
 pub(crate) fn decode(bytes: &[u8]) -> Result<DecodedAgentProfileReplacement, DecodeFailure> {
     let parsed = strict_yaml::parse(bytes)?;
-    let validator = structural_validator().ok_or_else(DecodeFailure::structural_contract)?;
-    if !validator.is_valid(&parsed.value) {
-        return Err(DecodeFailure::structural_contract());
-    }
+    let validator = structural_validator().ok_or_else(DecodeFailure::structural_invalid)?;
+    check_structure(validator, &parsed.value).map_err(DecodeFailure::structural_contract)?;
     let dto = serde_json::from_value::<ReplacementDto>(parsed.value)
-        .map_err(|_| DecodeFailure::structural_contract())?;
+        .map_err(|_| DecodeFailure::structural_invalid())?;
     if dto.schema_version != 1 || dto.agent_profiles.is_empty() {
-        return Err(DecodeFailure::structural_contract());
+        return Err(DecodeFailure::structural_invalid());
     }
     let profiles = AgentProfileDto::into_agent_profiles(dto.agent_profiles)
-        .ok_or_else(DecodeFailure::structural_contract)?;
+        .ok_or_else(DecodeFailure::structural_invalid)?;
     Ok(DecodedAgentProfileReplacement { profiles })
 }
 
@@ -102,6 +101,7 @@ fn structural_validator() -> Option<&'static Validator> {
 #[cfg(test)]
 mod tests {
     use super::super::DecodeFailureKind;
+    use super::super::structure::StructureRule;
     use super::*;
 
     // REQ-AGENT-54
@@ -145,5 +145,30 @@ mod tests {
                 .kind(),
             DecodeFailureKind::MalformedYaml
         );
+    }
+
+    // REQ-WFFORMAT-103
+    #[test]
+    fn a_structural_deviation_names_the_field_and_the_rule() {
+        let cases = [
+            (
+                b"schemaVersion: 1\nsteps: {}\nagentProfiles:\n  coding:\n    harness:\n      kind: pi\n      config:\n        model: m\n        thinking: low\n".as_slice(),
+                "steps",
+                StructureRule::UnknownField,
+            ),
+            (
+                b"schemaVersion: 1\nagentProfiles:\n  coding:\n    harness:\n      kind: claude_code\n      config:\n        effort: high\n",
+                "agentProfiles.coding.harness.config.model",
+                StructureRule::MissingField,
+            ),
+        ];
+        for (document, field, rule) in cases {
+            let failure = decode(document).unwrap_err();
+            assert_eq!(failure.kind(), DecodeFailureKind::StructuralContract);
+            let violation = failure.into_violation().unwrap();
+            assert_eq!(violation.field(), Some(field));
+            assert_eq!(violation.rule(), rule);
+            assert_eq!(violation.expected(), None);
+        }
     }
 }
