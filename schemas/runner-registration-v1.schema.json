@@ -1,0 +1,48 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://docs.usefulmachinery.com/schemas/runner-registration-v1.schema.json",
+  "title": "Useful Machinery Runner Registration Record V1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "deployment", "organization", "target", "principalId", "idempotencyKey", "stagedAt"],
+  "dependentRequired": { "enrolledAt": ["runner"] },
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "deployment": { "type": "string", "format": "uri", "minLength": 1 },
+    "organization": { "type": "string", "minLength": 1 },
+    "target": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind"],
+          "properties": { "kind": { "const": "personal" } }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "pool", "poolId"],
+          "properties": {
+            "kind": { "const": "pool" },
+            "pool": { "type": "string", "minLength": 1 },
+            "poolId": { "type": "string", "pattern": "^rpl_[0-7][0-9a-hjkmnp-tv-z]{25}$" }
+          }
+        }
+      ]
+    },
+    "principalId": { "type": "string", "pattern": "^prn_[0-7][0-9a-hjkmnp-tv-z]{25}$" },
+    "idempotencyKey": { "type": "string", "minLength": 1, "maxLength": 255, "pattern": "^[!-~]+$" },
+    "stagedAt": { "type": "string", "format": "date-time" },
+    "runner": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "organizationId", "poolId"],
+      "properties": {
+        "id": { "type": "string", "pattern": "^rnr_[0-7][0-9a-hjkmnp-tv-z]{25}$" },
+        "organizationId": { "type": "string", "pattern": "^org_[0-7][0-9a-hjkmnp-tv-z]{25}$" },
+        "poolId": { "type": "string", "pattern": "^rpl_[0-7][0-9a-hjkmnp-tv-z]{25}$" }
+      }
+    },
+    "enrolledAt": { "type": "string", "format": "date-time" }
+  }
+}

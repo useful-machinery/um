@@ -5,17 +5,19 @@ use std::process::Stdio;
 const TOKEN: &str = "unique-runner-command-token-sentinel";
 const SERVICE_API_KEY: &str =
     "crd_01k0z6r1w8f4jy2m7q9v3x5abc.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
-const ORGANIZATION: &str = "acme-research";
-const ORGANIZATION_ID: &str = "org_01k0z6r1w8f4jy2m7q9v3x5abc";
-const POOL_ID: &str = "rpl_01k0z6r1w8f4jy2m7q9v3x5abc";
-const RUNNER_ID: &str = "rnr_01k0z6r1w8f4jy2m7q9v3x5abc";
-const ACTIVATION_ID: &str = "rna_01k0z6r1w8f4jy2m7q9v3x5abc";
-const ACTIVATION_SECRET: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+pub(super) const ORGANIZATION: &str = "acme-research";
+pub(super) const ORGANIZATION_ID: &str = "org_01k0z6r1w8f4jy2m7q9v3x5abc";
+pub(super) const POOL_ID: &str = "rpl_01k0z6r1w8f4jy2m7q9v3x5abc";
+pub(super) const RUNNER_ID: &str = "rnr_01k0z6r1w8f4jy2m7q9v3x5abc";
+pub(super) const ACTIVATION_ID: &str = "rna_01k0z6r1w8f4jy2m7q9v3x5abc";
+pub(super) const ACTIVATION_SECRET: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
 // rrc_ values are public IDs, not credential secrets.
 const CREDENTIAL_ID: &str = "rrc_01k0z6r1w8f4jy2m7q9v3x5abc";
-const MEMBER_ID: &str = "prn_01k0z6r1w8f4jy2m7q9v3x5abc";
+pub(super) const MEMBER_ID: &str = "prn_01k0z6r1w8f4jy2m7q9v3x5abc";
 
-fn prepared_runner(responses: Vec<Vec<u8>>) -> (ScriptedServer, tempfile::TempDir, String) {
+pub(super) fn prepared_runner(
+    responses: Vec<Vec<u8>>,
+) -> (ScriptedServer, tempfile::TempDir, String) {
     let server = ScriptedServer::respond(responses);
     let credential_directory = private_credential_directory();
     let credential_path = credential_directory.path().join("credentials.json");
@@ -29,7 +31,7 @@ fn prepared_runner(responses: Vec<Vec<u8>>) -> (ScriptedServer, tempfile::TempDi
     (server, credential_directory, credential_path)
 }
 
-fn request_body(request: &str) -> &str {
+pub(super) fn request_body(request: &str) -> &str {
     request
         .split_once("\r\n\r\n")
         .map(|(_, body)| body)
@@ -46,7 +48,7 @@ fn pool_body() -> serde_json::Value {
     })
 }
 
-fn activation_issuance_body() -> serde_json::Value {
+pub(super) fn activation_issuance_body() -> serde_json::Value {
     serde_json::json!({
         "activation": {
             "id": ACTIVATION_ID,
@@ -85,7 +87,7 @@ fn credential_body(state: &str) -> serde_json::Value {
     credential
 }
 
-fn pool_list_body() -> serde_json::Value {
+pub(super) fn pool_list_body() -> serde_json::Value {
     serde_json::json!({"items": [pool_body()]})
 }
 
@@ -1155,7 +1157,17 @@ fn runner_create_reports_activation_failure_with_the_created_registration() {
     assert_eq!(server.finish().len(), 2);
 }
 
-fn registration_created_response() -> Vec<u8> {
+/// The API's answer to the read of the signed-in principal, `MEMBER_ID`.
+pub(super) fn current_principal_response() -> Vec<u8> {
+    json_http_response(
+        "200 OK",
+        serde_json::json!({
+            "principal": {"id": MEMBER_ID, "type": "human", "state": "active"}
+        }),
+    )
+}
+
+pub(super) fn registration_created_response() -> Vec<u8> {
     http_response_with_headers(
         "201 Created",
         Some("application/json"),
@@ -1171,6 +1183,10 @@ fn registration_created_response() -> Vec<u8> {
 }
 
 fn activation_issued_response() -> Vec<u8> {
+    activation_issued_response_with(&activation_issuance_body())
+}
+
+pub(super) fn activation_issued_response_with(issuance: &serde_json::Value) -> Vec<u8> {
     http_response_with_headers(
         "201 Created",
         Some("application/json"),
@@ -1183,7 +1199,7 @@ fn activation_issued_response() -> Vec<u8> {
                 ),
             ),
         ],
-        &serde_json::to_vec(&activation_issuance_body()).unwrap(),
+        &serde_json::to_vec(issuance).unwrap(),
     )
 }
 
@@ -2396,12 +2412,7 @@ fn join_key_issue_without_a_pool_uses_the_callers_personal_pool_and_writes_only_
     other_personal["id"] = serde_json::json!("rpl_01k0z6r1w8f4jy2m7q9v3x5abe");
     other_personal["member"]["id"] = serde_json::json!(OTHER_MEMBER_ID);
     let (server, _credentials, credential_path) = prepared_runner(vec![
-        json_http_response(
-            "200 OK",
-            serde_json::json!({
-                "principal": {"id": MEMBER_ID, "type": "human", "state": "active"}
-            }),
-        ),
+        current_principal_response(),
         json_http_response(
             "200 OK",
             serde_json::json!({
@@ -2447,6 +2458,75 @@ fn join_key_issue_without_a_pool_uses_the_callers_personal_pool_and_writes_only_
         "GET /api/v1/organizations/{ORGANIZATION}/runner-pools?limit=200 HTTP/1.1\r\n"
     )));
     assert_join_key_issuance_request(&requests[2], POOL_ID, 1_800, 300);
+}
+
+// REQ-RUNNERENROLL-93
+#[test]
+fn join_key_issue_without_a_file_writes_only_the_artifact_to_stdout() {
+    let (server, _credentials, credential_path) = prepared_runner(vec![
+        json_http_response("200 OK", shared_pool_body()),
+        join_key_issued_response(SHARED_POOL_ID),
+    ]);
+    let working_directory = tempfile::tempdir().unwrap();
+    let args = [
+        "runner",
+        "join-key",
+        "issue",
+        ORGANIZATION,
+        "--pool-id",
+        SHARED_POOL_ID,
+        "--expires-in",
+        "1h",
+        "--remove-after",
+        "7d",
+        "--allow-insecure-http",
+    ];
+
+    let output = run_with_env_in(
+        &args,
+        &deployment_environment(&server.api_url, &credential_path),
+        working_directory.path(),
+    );
+
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert_eq!(stdout.lines().count(), 1, "{stdout}");
+    assert!(stdout.ends_with('\n'));
+    let artifact: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(artifact, join_key_artifact());
+    assert_eq!(
+        artifact["joinToken"],
+        format!("{JOIN_KEY_ID}.{JOIN_KEY_SECRET}")
+    );
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains(JOIN_KEY_ID), "{stderr}");
+    assert!(!stderr.contains(JOIN_KEY_SECRET), "{stderr}");
+    assert_eq!(
+        fs::read_dir(working_directory.path()).unwrap().count(),
+        0,
+        "no file is created when none is named"
+    );
+    let requests = server.finish();
+    assert_eq!(requests.len(), 2);
+    assert_join_key_issuance_request(&requests[1], SHARED_POOL_ID, 3_600, 604_800);
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let api_url = format!("http://{}/api", listener.local_addr().unwrap());
+    let mut json_args = args.to_vec();
+    json_args.push("--json");
+    let refused = run_with_env_in(
+        &json_args,
+        &deployment_environment(&api_url, &credential_path),
+        working_directory.path(),
+    );
+    assert!(!refused.status.success(), "{refused:?}");
+    assert!(refused.stdout.is_empty(), "{refused:?}");
+    assert_eq!(fs::read_dir(working_directory.path()).unwrap().count(), 0);
+    assert_eq!(
+        listener.accept().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
 }
 
 // REQ-RUNNERENROLL-93

@@ -544,20 +544,31 @@ fn write_activation_issuance(
     destination: &str,
     issuance: &um_api::RunnerActivationIssuance,
 ) -> anyhow::Result<um_runner::ActivationArtifact> {
-    let api_artifact = issuance.artifact.as_ref().ok_or_else(|| {
+    let artifact = host_activation_artifact(issuance).ok_or_else(|| {
         anyhow::anyhow!(
             "activation issuance replay omitted its secret; issue a replacement activation with a new command"
         )
     })?;
-    let artifact = um_runner::ActivationArtifact::from_parts(um_runner::ActivationArtifactParts {
-        activation_url: api_artifact.activation_url.clone(),
-        activation_token: api_artifact.activation_token.clone(),
-        runner_id: api_artifact.runner_id.clone(),
-        expires_at: api_artifact.expires_at.clone(),
-    });
     um_runner::write_activation_file(destination, &artifact)
         .map_err(|error| anyhow::anyhow!(error))?;
     Ok(artifact)
+}
+
+/// The activation artifact a host enrolls with, from an issuance that carries
+/// its secret; a replayed issuance carries none. The translation happens here
+/// because the runner crate never references the human API client.
+fn host_activation_artifact(
+    issuance: &um_api::RunnerActivationIssuance,
+) -> Option<um_runner::ActivationArtifact> {
+    let issued = issuance.artifact.as_ref()?;
+    Some(um_runner::ActivationArtifact::from_parts(
+        um_runner::ActivationArtifactParts {
+            activation_url: issued.activation_url.clone(),
+            activation_token: issued.activation_token.clone(),
+            runner_id: issued.runner_id.clone(),
+            expires_at: issued.expires_at.clone(),
+        },
+    ))
 }
 
 fn write_activation_summary(

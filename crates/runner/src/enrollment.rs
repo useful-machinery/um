@@ -20,8 +20,14 @@ use super::service::Backoff;
 use super::validation::{valid_secret_syntax, valid_typed_id};
 
 mod home;
+mod registration;
 
 pub use home::{PublicationStage, RunnerHome, RunnerHomeError};
+pub use registration::{
+    RecordedOptions, RegisteredRunner, RegistrationAuthority, RegistrationConflict,
+    RegistrationConflictKind, RegistrationError, RegistrationOutcome, RegistrationStage,
+    RegistrationTarget, confirm_registration, register_unless_enrolled,
+};
 
 const ARTIFACT_LIMIT: u64 = 4096;
 const CONFIG_LIMIT: u64 = 16 * 1024;
@@ -31,6 +37,7 @@ const DIRECTORY_MODE: u32 = 0o700;
 const FILE_MODE: u32 = 0o600;
 const JOURNAL_FILE: &str = ".runner-enrollment.json";
 const LOCK_FILE: &str = ".runner-state.lock";
+const REGISTRATION_FILE: &str = ".runner-registration.json";
 /// The temporary files of the runner's protected host documents.
 const STATE_TEMPORARY_PREFIX: &str = ".runner-state.tmp";
 const LOCK_TIMEOUT: Duration = Duration::from_secs(5);
@@ -782,14 +789,7 @@ pub fn enroll(
             })
         }
         EnrollmentHTTPOutcome::Gone => {
-            let activation_id = activation_id(artifact)?;
-            let receipt = TerminalReceipt {
-                schema_version: 1,
-                activation_id: activation_id.clone(),
-                disposition: TerminalDisposition::Gone,
-                observed_at: now_rfc3339()?,
-            };
-            atomic_write_json(&journal_path, &receipt)?;
+            let activation_id = write_terminal_receipt(&journal_path, artifact)?;
             drop(lock);
             Ok(EnrollmentOutcome::Gone {
                 activation_id,
@@ -873,15 +873,23 @@ pub struct JoinRetry {
 pub fn join_unless_enrolled(
     config_path: &Path,
     key: JoinKeyArtifact,
-    mut observe_retry: impl FnMut(JoinRetry),
+    observe_retry: impl FnMut(JoinRetry),
 ) -> Result<JoinOutcome, EnrollmentError> {
     let host = LockedStateDirectory::lock(config_path)?;
     let mode = host.mode;
     let journal_path = &host.journal_path;
 
     if let Some(state) = read_runner_state_if_present(&host.state_path, mode)? {
-        remove_persisted_join_journal(journal_path, &state)?;
+        remove_persisted_journal(journal_path, &state, false)?;
         return Ok(JoinOutcome::AlreadyEnrolled);
+    }
+    // A signed-in registration this host began is resumed only by a start
+    // with its options, so a key neither joins beside it nor clears it.
+    let registration_path = host.registration_path();
+    if let Some(record) = registration::read_registration_record(&registration_path)? {
+        return Err(EnrollmentError::RegistrationConflict(Box::new(
+            record.conflict(RegistrationConflictKind::Unresolved, &registration_path),
+        )));
     }
 
     let (journal, mut resent) = match read_private_file_if_present(journal_path, STATE_LIMIT)? {
@@ -905,40 +913,37 @@ pub fn join_unless_enrolled(
     }
     validate_journal(&journal, mode)?;
 
-    let mut backoff = Backoff::new();
-    let response = loop {
-        let refusal = match send_enrollment(&journal, &staged.join_url, &key.join_token) {
-            Ok(EnrollmentHTTPOutcome::Success(response)) => break response,
-            Ok(EnrollmentHTTPOutcome::Gone) => JoinRefusal::Gone,
-            // An earlier send of this journal may have registered a runner,
-            // so the journal stays for the join to be completed or cleaned up
-            // deliberately.
-            Err(EnrollmentError::Unauthorized) if resent => {
-                return Err(EnrollmentError::StagedJoinUnauthorized {
-                    journal: journal_path.clone(),
-                    join_key_id: staged.join_key_id.clone(),
-                });
-            }
-            Err(EnrollmentError::Unauthorized) => JoinRefusal::Unauthorized,
-            Err(EnrollmentError::Conflict) => JoinRefusal::Conflict,
-            Err(EnrollmentError::NetworkAmbiguous(cause)) => {
-                resent = true;
-                let delay = backoff.next_delay();
-                observe_retry(JoinRetry { cause, delay });
-                um_support::sleep(delay);
-                continue;
-            }
-            Err(error) => return Err(error),
-        };
-        remove_and_sync(journal_path)?;
-        return Err(EnrollmentError::JoinRefused { refusal, resent });
+    let refusal = match send_until_answered(
+        &journal,
+        &staged.join_url,
+        &key.join_token,
+        &mut resent,
+        observe_retry,
+    ) {
+        Ok(EnrollmentHTTPOutcome::Success(response)) => {
+            drop(key);
+            validate_enrollment_response(&response, None, mode)?;
+            persist_enrollment_state(&host.state_path, &journal, &response, mode)?;
+            remove_and_sync(journal_path)?;
+            drop(host);
+            return Ok(JoinOutcome::Joined(Box::new(response)));
+        }
+        Ok(EnrollmentHTTPOutcome::Gone) => JoinRefusal::Gone,
+        // An earlier send of this journal may have registered a runner, so
+        // the journal stays for the join to be completed or cleaned up
+        // deliberately.
+        Err(EnrollmentError::Unauthorized) if resent => {
+            return Err(EnrollmentError::StagedJoinUnauthorized {
+                journal: journal_path.clone(),
+                join_key_id: staged.join_key_id.clone(),
+            });
+        }
+        Err(EnrollmentError::Unauthorized) => JoinRefusal::Unauthorized,
+        Err(EnrollmentError::Conflict) => JoinRefusal::Conflict,
+        Err(error) => return Err(error),
     };
-    drop(key);
-    validate_enrollment_response(&response, None, mode)?;
-    persist_enrollment_state(&host.state_path, &journal, &response, mode)?;
     remove_and_sync(journal_path)?;
-    drop(host);
-    Ok(JoinOutcome::Joined(Box::new(response)))
+    Err(EnrollmentError::JoinRefused { refusal, resent })
 }
 
 /// Removes the journal of the host's own completed join, the one whose
@@ -949,7 +954,7 @@ pub fn join_unless_enrolled(
 pub fn remove_completed_join_journal(config_path: &Path) -> Result<(), EnrollmentError> {
     let host = LockedStateDirectory::lock(config_path)?;
     if let Some(state) = read_runner_state_if_present(&host.state_path, host.mode)? {
-        remove_persisted_join_journal(&host.journal_path, &state)?;
+        remove_persisted_journal(&host.journal_path, &state, false)?;
     }
     Ok(())
 }
@@ -964,6 +969,11 @@ struct LockedStateDirectory {
 }
 
 impl LockedStateDirectory {
+    /// The signed-in registration's record, beside the journal.
+    fn registration_path(&self) -> PathBuf {
+        self.journal_path.with_file_name(REGISTRATION_FILE)
+    }
+
     fn lock(config_path: &Path) -> Result<Self, EnrollmentError> {
         let config = load_operator_config(config_path)?;
         let state_path = config.runner_state_path;
@@ -998,17 +1008,28 @@ fn stage_join(
     )
 }
 
-// A start interrupted after it wrote the joined state but before it removed the
-// journal leaves a journal whose credential the state already holds; it is
-// removed so it neither keeps a second copy of the secret nor blocks a later
-// enrollment. Any other journal is left for its own resolution.
-fn remove_persisted_join_journal(path: &Path, state: &RunnerState) -> Result<(), EnrollmentError> {
+// A start interrupted after it wrote the joined state, or a signed-in
+// registration's state, but before it removed the journal leaves a journal
+// whose credential the state already holds; it is removed so it neither keeps
+// a second copy of the secret nor blocks a later enrollment. A join's journal
+// is removed always, an activation's first enrollment only when `activation`
+// is given, by the confirmation of the registration that staged it. Any other
+// journal is left for its own resolution.
+fn remove_persisted_journal(
+    path: &Path,
+    state: &RunnerState,
+    activation: bool,
+) -> Result<(), EnrollmentError> {
     let persisted = read_private_file_if_present(path, STATE_LIMIT)
         .ok()
         .flatten()
         .and_then(|bytes| serde_json::from_slice::<EnrollmentJournal>(&bytes).ok())
         .is_some_and(|journal| {
-            matches!(journal.target, EnrollmentTarget::Join(_))
+            let removable = match journal.target {
+                EnrollmentTarget::Join(_) => true,
+                EnrollmentTarget::Activation(_) => activation && !journal.replace_credential,
+            };
+            removable
                 && journal.credential_origin().ok() == state.current_credential.origin()
                 && journal.credential_secret == state.current_credential.secret
         });
@@ -1037,6 +1058,50 @@ struct EnrollmentRequest<'a> {
 enum EnrollmentHTTPOutcome {
     Success(EnrollmentResponse),
     Gone,
+}
+
+// send_until_answered sends the journal's staged request until Cloud answers
+// it definitely, resending an ambiguous outcome as the same request after the
+// service's reconnect backoff. Each resend is handed to `observe_retry` with
+// its cause and delay before the delay is slept. `resent` is set once a send
+// is repeated, since the earlier one may have reached Cloud.
+fn send_until_answered(
+    journal: &EnrollmentJournal,
+    url: &str,
+    token: &str,
+    resent: &mut bool,
+    mut observe_retry: impl FnMut(JoinRetry),
+) -> Result<EnrollmentHTTPOutcome, EnrollmentError> {
+    let mut backoff = Backoff::new();
+    loop {
+        match send_enrollment(journal, url, token) {
+            Err(EnrollmentError::NetworkAmbiguous(cause)) => {
+                *resent = true;
+                let delay = backoff.next_delay();
+                observe_retry(JoinRetry { cause, delay });
+                um_support::sleep(delay);
+            }
+            outcome => return outcome,
+        }
+    }
+}
+
+// Replaces the journal of an activation Cloud answered 410 with its terminal
+// receipt, which lets a later enrollment stage another, and answers the
+// activation's id.
+fn write_terminal_receipt(
+    journal_path: &Path,
+    artifact: &ActivationArtifact,
+) -> Result<String, EnrollmentError> {
+    let activation_id = activation_id(artifact)?;
+    let receipt = TerminalReceipt {
+        schema_version: 1,
+        activation_id: activation_id.clone(),
+        disposition: TerminalDisposition::Gone,
+        observed_at: now_rfc3339()?,
+    };
+    atomic_write_json(journal_path, &receipt)?;
+    Ok(activation_id)
 }
 
 // send_enrollment posts the journal's staged request, the same body for an
@@ -1539,12 +1604,7 @@ fn validate_journal(
         || !valid_secret(&journal.credential_secret)
         || !valid_secret(&journal.credential_secret_verifier)
         || !journal_verifier_matches_secret(journal)
-        || journal.idempotency_key.is_empty()
-        || journal.idempotency_key.len() > 255
-        || !journal
-            .idempotency_key
-            .bytes()
-            .all(|byte| byte.is_ascii_graphic())
+        || !valid_idempotency_key(&journal.idempotency_key)
         || parse_rfc3339(&journal.staged_at).is_none()
     {
         return Err(EnrollmentError::InvalidJournal);
@@ -2110,6 +2170,12 @@ fn read_bounded_regular_file(
     Ok(bytes)
 }
 
+// The `Idempotency-Key` a host document stages for a request: 1 to 255
+// printable ASCII characters.
+fn valid_idempotency_key(value: &str) -> bool {
+    !value.is_empty() && value.len() <= 255 && value.bytes().all(|byte| byte.is_ascii_graphic())
+}
+
 fn valid_secret(value: &str) -> bool {
     valid_secret_syntax(value)
         && base64::engine::general_purpose::URL_SAFE_NO_PAD
@@ -2194,6 +2260,22 @@ pub enum EnrollmentError {
         refusal: JoinRefusal,
         resent: bool,
     },
+    /// The host's registration record is not a private regular file, does
+    /// not parse, or does not validate; `requirement` says which. It is
+    /// never read as a host with no registration.
+    InvalidRegistrationRecord {
+        record: PathBuf,
+        requirement: &'static str,
+    },
+    /// An answer the registration authority gave does not match its contract:
+    /// a malformed principal, pool or runner id.
+    InvalidRegistrationAnswer,
+    /// Cloud answered 410 to the enrollment with an activation issued for
+    /// this start; its terminal receipt is written.
+    ActivationGone,
+    /// A join met a signed-in registration the host holds without enrolled
+    /// state (REQ-RUNNERENROLL-118).
+    RegistrationConflict(Box<RegistrationConflict>),
 }
 
 impl fmt::Display for EnrollmentError {
@@ -2294,6 +2376,23 @@ impl fmt::Display for EnrollmentError {
             } => {
                 "the pool cannot admit the join: its member is not active or the organization is at its runner limit"
             }
+            Self::InvalidRegistrationRecord {
+                record,
+                requirement,
+            } => {
+                return write!(
+                    formatter,
+                    "read registration record {}: {requirement}",
+                    record.display()
+                );
+            }
+            Self::InvalidRegistrationAnswer => {
+                "Cloud's answer to the registration does not match its contract"
+            }
+            Self::ActivationGone => {
+                "Cloud reports the newly issued activation revoked, expired or already used"
+            }
+            Self::RegistrationConflict(conflict) => return conflict.fmt(formatter),
         };
         formatter.write_str(message)
     }

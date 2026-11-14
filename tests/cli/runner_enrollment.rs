@@ -7,10 +7,10 @@ use std::process::{Child, ExitStatus};
 use base64::Engine as _;
 
 const RUNNER_ID: &str = "rnr_01k0z6r1w8f4jy2m7q9v3x5abc";
-const CURRENT_CREDENTIAL_ID: &str = "rrc_01k0z6r1w8f4jy2m7q9v3x5abc";
+pub(super) const CURRENT_CREDENTIAL_ID: &str = "rrc_01k0z6r1w8f4jy2m7q9v3x5abc";
 const PENDING_CREDENTIAL_ID: &str = "rrc_01k0z6r1w8f4jy2m7q9v3x5abd";
 pub(super) const ACTIVATION_ID: &str = "rna_01k0z6r1w8f4jy2m7q9v3x5abd";
-const CURRENT_SECRET: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+pub(super) const CURRENT_SECRET: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
 const PENDING_SECRET: &str = "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI";
 
 struct PendingEnrollmentFixture {
@@ -347,7 +347,7 @@ fn reports_cloud_enrollment_separately_when_runner_serve_is_unreachable() {
 
 const JOIN_KEY_ID: &str = "rjk_01k0z6r1w8f4jy2m7q9v3x5abc";
 const JOIN_SECRET: &str = "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc";
-const JOIN_KEY_VARIABLE: &str = "UM_RUNNER_JOIN_KEY";
+pub(super) const JOIN_KEY_VARIABLE: &str = "UM_RUNNER_JOIN_KEY";
 const JOINED_CREDENTIAL_IDS: [&str; 3] = [
     "rrc_01k0z6r1w8f4jy2m7q9v3x5ab1",
     "rrc_01k0z6r1w8f4jy2m7q9v3x5ab2",
@@ -379,9 +379,13 @@ pub(super) fn join_key_artifact(base: &str, expires_at: &str) -> String {
 }
 
 pub(super) fn join_response(index: usize, connection_url: &str) -> Vec<u8> {
-    json_http_response(
-        "201 Created",
-        serde_json::json!({
+    json_http_response("201 Created", join_response_body(index, connection_url))
+}
+
+/// Cloud's answer to the join of host `index`, which names the runner it
+/// registered and the credential it recorded.
+pub(super) fn join_response_body(index: usize, connection_url: &str) -> serde_json::Value {
+    serde_json::json!({
             "schemaVersion": 1,
             "runnerId": JOINED_RUNNER_IDS[index],
             "runnerName": format!("joined-{index}"),
@@ -393,26 +397,25 @@ pub(super) fn join_response(index: usize, connection_url: &str) -> Vec<u8> {
                 "id": "rpl_01k0z6r1w8f4jy2m7q9v3x5abc",
                 "name": "ci"
             },
-            "credentialId": JOINED_CREDENTIAL_IDS[index],
-            "connectionUrl": connection_url
-        }),
-    )
+        "credentialId": JOINED_CREDENTIAL_IDS[index],
+        "connectionUrl": connection_url
+    })
 }
 
 /// A host directory with an operator configuration, a join key file and no
 /// enrolled state.
-struct JoinHost {
-    root: tempfile::TempDir,
+pub(super) struct JoinHost {
+    pub(super) root: tempfile::TempDir,
     _runtime: tempfile::TempDir,
     empty_path: tempfile::TempDir,
-    config: String,
-    state: PathBuf,
-    journal: PathBuf,
-    key_file: PathBuf,
+    pub(super) config: String,
+    pub(super) state: PathBuf,
+    pub(super) journal: PathBuf,
+    pub(super) key_file: PathBuf,
 }
 
 impl JoinHost {
-    fn new(artifact: &str) -> Self {
+    pub(super) fn new(artifact: &str) -> Self {
         let root = private_credential_directory();
         let runtime = tempfile::tempdir_in("/tmp").unwrap();
         fs::set_permissions(runtime.path(), Permissions::from_mode(0o700)).unwrap();
@@ -448,7 +451,7 @@ impl JoinHost {
         }
     }
 
-    fn write_enrolled_state(&self, connection_url: &str) {
+    pub(super) fn write_enrolled_state(&self, connection_url: &str) {
         self.write_state(connection_url, ("activationId", ACTIVATION_ID));
     }
 
@@ -480,7 +483,7 @@ impl JoinHost {
     }
 
     /// A join journal staged for `JOIN_KEY_ID` with the credential `secret`.
-    fn write_join_journal(&self, base: &str, secret: &str) {
+    pub(super) fn write_join_journal(&self, base: &str, secret: &str) {
         write_private_json(
             &self.journal,
             &serde_json::json!({
@@ -504,15 +507,15 @@ impl JoinHost {
         self.serve(&["--join-key-file", &key_file], &[])
     }
 
-    fn serve(&self, arguments: &[&str], environment: &[(&str, &str)]) -> ServeProcess {
-        self.serve_with_input(arguments, environment, None)
+    pub(super) fn serve(&self, arguments: &[&str], environment: &[(&str, &str)]) -> ServeProcess {
+        self.serve_with_input(arguments, environment, StandardInput::Null)
     }
 
     fn serve_with_input(
         &self,
         arguments: &[&str],
         environment: &[(&str, &str)],
-        standard_input: Option<&str>,
+        standard_input: StandardInput<'_>,
     ) -> ServeProcess {
         let mut command = serve_command(&["--config", &self.config]);
         command.args(arguments).env("PATH", self.empty_path.path());
@@ -522,12 +525,22 @@ impl JoinHost {
         ServeProcess::start(command, standard_input)
     }
 
-    fn state_document(&self) -> serde_json::Value {
+    pub(super) fn state_document(&self) -> serde_json::Value {
         serde_json::from_slice(&fs::read(&self.state).unwrap()).unwrap()
     }
 }
 
-fn write_private_json(path: &Path, document: &serde_json::Value) {
+/// What `um runner serve` reads as its standard input.
+pub(super) enum StandardInput<'a> {
+    Null,
+    /// A pipe the text is written to and then closed.
+    Piped(&'a str),
+    /// An open descriptor, such as a pseudoterminal's peer end or a pipe's
+    /// read end, whose writer the test holds.
+    Descriptor(&'a std::os::fd::OwnedFd),
+}
+
+pub(super) fn write_private_json(path: &Path, document: &serde_json::Value) {
     fs::write(path, serde_json::to_vec_pretty(document).unwrap()).unwrap();
     fs::set_permissions(path, Permissions::from_mode(0o600)).unwrap();
 }
@@ -554,19 +567,19 @@ pub(super) struct ServeProcess {
 }
 
 impl ServeProcess {
-    /// Starts `command`, given `standard_input` when there is one, with its
-    /// standard error collected.
-    pub(super) fn start(mut command: Command, standard_input: Option<&str>) -> Self {
+    /// Starts `command` reading `standard_input`, with its standard error
+    /// collected.
+    pub(super) fn start(mut command: Command, standard_input: StandardInput<'_>) -> Self {
         command
-            .stdin(if standard_input.is_some() {
-                Stdio::piped()
-            } else {
-                Stdio::null()
+            .stdin(match standard_input {
+                StandardInput::Null => Stdio::null(),
+                StandardInput::Piped(_) => Stdio::piped(),
+                StandardInput::Descriptor(input) => Stdio::from(input.try_clone().unwrap()),
             })
             .stdout(Stdio::null())
             .stderr(Stdio::piped());
         let mut child = command.spawn().unwrap();
-        if let Some(standard_input) = standard_input {
+        if let StandardInput::Piped(standard_input) = standard_input {
             let mut stdin = child.stdin.take().unwrap();
             stdin.write_all(standard_input.as_bytes()).unwrap();
         }
@@ -616,6 +629,19 @@ pub(super) struct ConnectionWitness {
 
 impl ConnectionWitness {
     pub(super) fn new() -> Self {
+        Self::answering(None)
+    }
+
+    /// A connection endpoint that refuses the runner's credential with 401
+    /// and reports each request once the runner has closed the connection,
+    /// that is, once it has read the refusal.
+    pub(super) fn rejecting() -> Self {
+        Self::answering(Some(
+            b"HTTP/1.1 401 Unauthorized\r\ncontent-length: 0\r\n\r\n",
+        ))
+    }
+
+    fn answering(response: Option<&'static [u8]>) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("ws://{}/v1/runner/connect", listener.local_addr().unwrap());
         let (sender, requests) = mpsc::channel();
@@ -625,6 +651,11 @@ impl ConnectionWitness {
                     break;
                 };
                 let request = String::from_utf8_lossy(&read_request(&mut stream)).into_owned();
+                if let Some(response) = response {
+                    let _ = stream.write_all(response);
+                    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(10)));
+                    let _ = io::copy(&mut stream, &mut io::sink());
+                }
                 if sender.send(request).is_err() {
                     break;
                 }
@@ -763,7 +794,11 @@ fn serve_joins_with_the_key_on_piped_standard_input() {
     let host = JoinHost::new(&artifact);
 
     let bearer = connection_bearer(
-        host.serve_with_input(&["--join-key-file", "-"], &[], Some(&artifact)),
+        host.serve_with_input(
+            &["--join-key-file", "-"],
+            &[],
+            StandardInput::Piped(&artifact),
+        ),
         &witness,
     );
 
@@ -1343,6 +1378,235 @@ fn an_enrolled_host_removes_only_its_completed_joins_journal() {
         } else {
             assert!(!host.journal.exists());
         }
+    }
+    cloud.set_nonblocking(true).unwrap();
+    assert_eq!(
+        cloud.accept().unwrap_err().kind(),
+        io::ErrorKind::WouldBlock
+    );
+}
+
+/// Whether the terminal whose peer end is `peer` echoes its input.
+fn echoes(peer: &std::os::fd::OwnedFd) -> bool {
+    rustix::termios::tcgetattr(peer)
+        .unwrap()
+        .local_modes
+        .contains(rustix::termios::LocalModes::ECHO)
+}
+
+/// What the terminal's controlling end has to be read once nothing writes to it.
+fn terminal_output(controlling: &std::os::fd::OwnedFd) -> Vec<u8> {
+    let flags = rustix::fs::fcntl_getfl(controlling).unwrap();
+    rustix::fs::fcntl_setfl(controlling, flags | rustix::fs::OFlags::NONBLOCK).unwrap();
+    let mut output = Vec::new();
+    let mut buffer = [0; 512];
+    while let Ok(count @ 1..) = rustix::io::read(controlling, &mut buffer) {
+        output.extend_from_slice(&buffer[..count]);
+    }
+    output
+}
+
+fn contains_join_secret(bytes: &[u8]) -> bool {
+    bytes
+        .windows(JOIN_SECRET.len())
+        .any(|part| part == JOIN_SECRET.as_bytes())
+}
+
+// REQ-RUNNERENROLL-114, REQ-RUNNERENROLL-97
+#[test]
+fn serve_joins_with_the_key_given_at_a_prompt_that_does_not_echo_it() {
+    let witness = ConnectionWitness::new();
+    let server = api_test_support::ScriptedHttpServer::respond(join_response(0, &witness.url));
+    let artifact = join_key_artifact(&join_base(&server), &future_expiry());
+    let host = JoinHost::new(&artifact);
+    let terminal = open_test_pty(None).unwrap();
+
+    let mut serve = host.serve_with_input(
+        &["--join-key"],
+        &[],
+        StandardInput::Descriptor(&terminal.slave),
+    );
+    poll_until(
+        "join key prompt",
+        || (echoes(&terminal.slave), serve.exited()),
+        |(echo, exited)| !echo || exited.is_some(),
+    );
+    fs::File::from(terminal.master.try_clone().unwrap())
+        .write_all(format!("{artifact}\n").as_bytes())
+        .unwrap();
+    let bearer = connection_bearer(serve, &witness);
+
+    assert!(echoes(&terminal.slave));
+    let shown = terminal_output(&terminal.master);
+    assert!(
+        !contains_join_secret(&shown),
+        "{}",
+        String::from_utf8_lossy(&shown)
+    );
+    let secret = assert_joined_state(&host, 0, &witness.url);
+    assert_eq!(
+        bearer,
+        format!("Bearer {}.{secret}", JOINED_CREDENTIAL_IDS[0])
+    );
+    assert_join_request(&server.finish_one(), &secret);
+}
+
+// REQ-RUNNERENROLL-114: a start that cannot prompt fails at once, its standard
+// input left open, and stages, sends and writes nothing.
+#[test]
+fn the_join_key_prompt_without_a_terminal_is_a_usage_error_that_sends_nothing() {
+    let cloud = TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("http://{}", cloud.local_addr().unwrap());
+    let host = JoinHost::new(&join_key_artifact(&base, &future_expiry()));
+    let (reader, _writer) = io::pipe().unwrap();
+    let reader = std::os::fd::OwnedFd::from(reader);
+
+    let (exit, stderr) = host
+        .serve_with_input(&["--join-key"], &[], StandardInput::Descriptor(&reader))
+        .wait_for_exit();
+
+    assert_eq!(exit.code(), Some(2), "{stderr}");
+    assert!(stderr.contains("--join-key-file"), "{stderr}");
+    assert!(stderr.contains(JOIN_KEY_VARIABLE), "{stderr}");
+    assert!(!host.state.exists());
+    assert!(!host.journal.exists());
+    cloud.set_nonblocking(true).unwrap();
+    assert_eq!(
+        cloud.accept().unwrap_err().kind(),
+        io::ErrorKind::WouldBlock
+    );
+}
+
+// REQ-RUNNERENROLL-104
+#[test]
+fn an_enrolled_host_started_with_the_join_key_prompt_serves_without_a_terminal() {
+    let witness = ConnectionWitness::new();
+    let cloud = TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("http://{}", cloud.local_addr().unwrap());
+    let host = JoinHost::new(&join_key_artifact(&base, &future_expiry()));
+    host.write_enrolled_state(&witness.url);
+    let original = fs::read(&host.state).unwrap();
+
+    let bearer = connection_bearer(host.serve(&["--join-key"], &[]), &witness);
+
+    assert_eq!(
+        bearer,
+        format!("Bearer {CURRENT_CREDENTIAL_ID}.{CURRENT_SECRET}")
+    );
+    assert_eq!(fs::read(&host.state).unwrap(), original);
+    assert!(!host.journal.exists());
+    cloud.set_nonblocking(true).unwrap();
+    assert_eq!(
+        cloud.accept().unwrap_err().kind(),
+        io::ErrorKind::WouldBlock
+    );
+}
+
+// REQ-RUNNERENROLL-97: the prompt with a key file or the variable is refused
+// from the arguments and the environment alone, before the operator
+// configuration, the key file or the terminal is read.
+#[test]
+fn the_join_key_prompt_with_another_join_key_input_is_a_usage_error() {
+    let cloud = TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("http://{}", cloud.local_addr().unwrap());
+    let artifact = join_key_artifact(&base, &future_expiry());
+    let host = JoinHost::new(&artifact);
+    fs::remove_file(&host.config).unwrap();
+    fs::remove_file(&host.key_file).unwrap();
+    let key_file = host.key_file.to_string_lossy().into_owned();
+    let terminal = open_test_pty(None).unwrap();
+
+    type Case<'a> = (&'a [&'a str], &'a [(&'a str, &'a str)]);
+    let cases: [Case<'_>; 2] = [
+        (&["--join-key", "--join-key-file", &key_file], &[]),
+        (&["--join-key"], &[(JOIN_KEY_VARIABLE, artifact.as_str())]),
+    ];
+    for (arguments, environment) in cases {
+        let (exit, stderr) = host
+            .serve_with_input(
+                arguments,
+                environment,
+                StandardInput::Descriptor(&terminal.slave),
+            )
+            .wait_for_exit();
+
+        assert_eq!(exit.code(), Some(2), "{arguments:?}: {stderr}");
+        assert!(stderr.contains(JOIN_KEY_VARIABLE), "{stderr}");
+        assert!(!stderr.contains(JOIN_SECRET), "{stderr}");
+        assert!(echoes(&terminal.slave));
+        assert!(!host.state.exists());
+        assert!(!host.journal.exists());
+    }
+    cloud.set_nonblocking(true).unwrap();
+    assert_eq!(
+        cloud.accept().unwrap_err().kind(),
+        io::ErrorKind::WouldBlock
+    );
+}
+
+// REQ-RUNNERENROLL-105: a host with no state that cannot serve fails with its
+// configuration's cause before it prompts, so it never waits for a key.
+#[test]
+fn a_host_without_a_work_root_fails_before_it_prompts_for_its_join_key() {
+    let cloud = TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("http://{}", cloud.local_addr().unwrap());
+    let host = JoinHost::new(&join_key_artifact(&base, &future_expiry()));
+    fs::remove_dir(host.root.path().join("work")).unwrap();
+    let terminal = open_test_pty(None).unwrap();
+
+    let (exit, stderr) = host
+        .serve_with_input(
+            &["--join-key"],
+            &[],
+            StandardInput::Descriptor(&terminal.slave),
+        )
+        .wait_for_exit();
+
+    assert_eq!(exit.code(), Some(1), "{stderr}");
+    assert!(stderr.contains(&host.config), "{stderr}");
+    assert!(echoes(&terminal.slave));
+    assert!(!host.state.exists());
+    assert!(!host.journal.exists());
+    cloud.set_nonblocking(true).unwrap();
+    assert_eq!(
+        cloud.accept().unwrap_err().kind(),
+        io::ErrorKind::WouldBlock
+    );
+}
+
+// REQ-RUNNERENROLL-114: a signal that ends the start during the prompt leaves
+// the terminal echoing, and the start ends as the signal ends a process.
+#[test]
+fn a_signal_during_the_join_key_prompt_restores_the_terminal() {
+    use std::os::unix::process::ExitStatusExt;
+
+    let cloud = TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("http://{}", cloud.local_addr().unwrap());
+    let host = JoinHost::new(&join_key_artifact(&base, &future_expiry()));
+    for signal in [
+        nix::sys::signal::Signal::SIGINT,
+        nix::sys::signal::Signal::SIGTERM,
+    ] {
+        let terminal = open_test_pty(None).unwrap();
+        let mut serve = host.serve_with_input(
+            &["--join-key"],
+            &[],
+            StandardInput::Descriptor(&terminal.slave),
+        );
+        poll_until(
+            "join key prompt",
+            || (echoes(&terminal.slave), serve.exited()),
+            |(echo, exited)| !echo || exited.is_some(),
+        );
+        let id = i32::try_from(serve.child.id()).unwrap();
+        nix::sys::signal::kill(nix::unistd::Pid::from_raw(id), signal).unwrap();
+
+        let (exit, stderr) = serve.wait_for_exit();
+
+        assert_eq!(exit.signal(), Some(signal as i32), "{signal}: {stderr}");
+        assert!(echoes(&terminal.slave), "{signal}");
+        assert!(!host.state.exists());
+        assert!(!host.journal.exists());
     }
     cloud.set_nonblocking(true).unwrap();
     assert_eq!(

@@ -8,9 +8,9 @@ use super::runner_agent_login::{
     EARLIER_SYNC, READY_CODEX, SYNC, SYNC_REQUEST, ScriptedControlSocket, synced_response,
 };
 use super::runner_enrollment::{
-    ACTIVATION_ID, ConnectionWitness, ServeProcess, activation_artifact, connection_bearer,
-    enrollment_body, future_expiry, join_base, join_key_artifact, join_response, serve_command,
-    verifier_of,
+    ACTIVATION_ID, ConnectionWitness, ServeProcess, StandardInput, activation_artifact,
+    connection_bearer, enrollment_body, future_expiry, join_base, join_key_artifact, join_response,
+    serve_command, verifier_of,
 };
 use super::runner_status::{
     CONNECTED_STATUS, STATUS_REQUEST, ServeStatusFixture, enrolled_state_document,
@@ -151,7 +151,7 @@ impl ServeHome {
                 Some(self.root.path()),
                 &self.empty_path,
             ),
-            None,
+            StandardInput::Null,
         )
     }
 }
@@ -233,7 +233,7 @@ fn serve_given_a_configuration_neither_reads_nor_creates_the_runner_home() {
             Some(um_home.path()),
             &empty_path,
         ),
-        None,
+        StandardInput::Null,
     );
 
     assert_eq!(

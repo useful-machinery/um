@@ -92,9 +92,9 @@ struct IssueCommand {
     #[arg(
         long,
         value_name = "PATH|-",
-        help = "Create the protected join key file, or write only the join key to stdout"
+        help = "Create the protected join key file; with - or when omitted, write only the join key to stdout"
     )]
-    join_key_file: String,
+    join_key_file: Option<String>,
 
     #[command(flatten)]
     options: CloudOptions,
@@ -146,7 +146,7 @@ impl Command {
 impl IssueCommand {
     fn execute(self, deployment: &Deployment) -> anyhow::Result<ExitCode> {
         // The file exists before the key does, so a refused path costs no key.
-        let destination = Destination::prepare(&self.join_key_file, self.options.json)?;
+        let destination = Destination::prepare(self.join_key_file.as_deref(), self.options.json)?;
         let key = generate_idempotency_key().context("generate join key request identity")?;
         let result = cloud::with_api(
             deployment,
@@ -180,22 +180,26 @@ impl IssueCommand {
                 "join key issuance replay omitted its secret; issue a replacement join key with a new command"
             )
         })?;
+        let join_key_file = destination.file_path();
         destination.write(artifact)?;
         let join_key = &*issuance.join_key;
-        if self.join_key_file == "-" {
+        let Some(join_key_file) = join_key_file else {
+            // Standard output carries the key alone, so the status goes to stderr.
             writeln!(
                 io::stderr().lock(),
                 "✓ Runner join key {} issued for pool {}.",
                 join_key.id,
                 join_key.runner_pool_id
             )?;
-        } else if self.options.json {
+            return Ok(ExitCode::Success);
+        };
+        if self.options.json {
             cloud::write_json(&JoinKeyResult {
                 schema_version: 1,
                 deployment: deployment.fingerprint().api_url(),
                 outcome: "issued",
                 join_key,
-                join_key_file: Some(&self.join_key_file),
+                join_key_file: Some(&join_key_file),
             })?;
         } else {
             let stdout = io::stdout();
@@ -209,7 +213,7 @@ impl IssueCommand {
                 "  Remove after:  {}",
                 duration_text(join_key.offline_removal_seconds)
             )?;
-            writeln!(stdout, "  Join key file: {}", self.join_key_file)?;
+            writeln!(stdout, "  Join key file: {join_key_file}")?;
         }
         Ok(ExitCode::Success)
     }
@@ -317,16 +321,26 @@ enum Destination {
 }
 
 impl Destination {
-    fn prepare(destination: &str, json: bool) -> anyhow::Result<Self> {
-        if destination == "-" {
-            if json {
-                return Err(anyhow!("--json cannot be combined with --join-key-file -"));
+    /// No `--join-key-file`, like `-`, means standard output, which structured
+    /// output never shares with a token.
+    fn prepare(destination: Option<&str>, json: bool) -> anyhow::Result<Self> {
+        match destination {
+            None if json => Err(anyhow!("--json requires --join-key-file PATH")),
+            Some("-") if json => Err(anyhow!("--json cannot be combined with --join-key-file -")),
+            None | Some("-") => Ok(Self::Stdout),
+            Some(path) => {
+                let file = PrivateArtifactFile::create(Path::new(path))
+                    .with_context(|| format!("create join key file {path}"))?;
+                Ok(Self::File(file))
             }
-            return Ok(Self::Stdout);
         }
-        let file = PrivateArtifactFile::create(Path::new(destination))
-            .with_context(|| format!("create join key file {destination}"))?;
-        Ok(Self::File(file))
+    }
+
+    fn file_path(&self) -> Option<String> {
+        match self {
+            Self::Stdout => None,
+            Self::File(file) => Some(file.path().display().to_string()),
+        }
     }
 
     /// Writes the artifact as one line of JSON, so the same text can also be

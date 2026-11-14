@@ -84,6 +84,8 @@ mod runner_doctor_workflow;
 mod runner_enrollment;
 #[path = "cli/runner_home.rs"]
 mod runner_home;
+#[path = "cli/runner_registration.rs"]
+mod runner_registration;
 #[path = "cli/runner_status.rs"]
 mod runner_status;
 #[path = "cli/service_principal.rs"]

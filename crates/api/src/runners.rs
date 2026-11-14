@@ -142,13 +142,17 @@ impl RunnerApi {
             .map_err(classify_runner_error)
     }
 
+    /// The authenticated principal's ID, `prn_...`.
+    pub fn current_principal_id(&self) -> Result<String, RunnerFailure> {
+        principals_api::get_current_principal(&self.configuration)
+            .map(|current| current.principal.id)
+            .map_err(classify_runner_error)
+    }
+
     /// Finds the caller's own personal pool: the pool whose member is the
     /// authenticated principal. A caller with none receives `PersonalPoolNotFound`.
     pub fn get_personal_pool(&self, organization: &str) -> Result<RunnerPool, RunnerFailure> {
-        let caller = principals_api::get_current_principal(&self.configuration)
-            .map_err(classify_runner_error)?
-            .principal
-            .id;
+        let caller = self.current_principal_id()?;
         find_listed(
             |cursor| {
                 let page = self.list_pools(organization, Some(200), cursor)?;

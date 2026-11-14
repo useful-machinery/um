@@ -580,18 +580,46 @@ pub(super) fn write_activation_failure(
         authentication,
         json,
         None,
-        Some(CreatedRegistration {
+        Some(FollowUp::Created {
             organization,
             runner_id,
         }),
     )
 }
 
-#[derive(Clone, Copy)]
-struct CreatedRegistration<'a> {
-    organization: &'a str,
-    runner_id: &'a str,
+/// A failure of the human API during `um runner serve`'s signed-in
+/// registration: the closed outcome as a `code:` line, the sign-in advice of
+/// a runner start, and `progress`, what the start left and how to go on.
+pub(super) fn write_registration_failure(
+    deployment: &str,
+    failure: &RunnerFailure,
+    progress: &str,
+) -> anyhow::Result<ExitCode> {
+    write_failure_with_context(
+        deployment,
+        failure,
+        super::super::PrincipalAuthenticationKind::HumanSession,
+        false,
+        None,
+        Some(FollowUp::Registration { progress }),
+    )
 }
+
+/// What the command that failed adds after the closed outcome's remedy.
+#[derive(Clone, Copy)]
+enum FollowUp<'a> {
+    /// `um runner create` registered `runner_id` and issued no activation.
+    Created {
+        organization: &'a str,
+        runner_id: &'a str,
+    },
+    /// `um runner serve` stopped registering the host.
+    Registration { progress: &'a str },
+}
+
+const SIGN_IN_TO_ADMINISTER: &str =
+    "error: runner administration requires sign-in\n\nSign in first:\n  um auth login";
+const SIGN_IN_TO_REGISTER: &str = "error: runner registration requires sign-in\n\nSign in, then start the runner again with the same options:\n  um auth login\n\nOn a host with no sign-in, start the runner with a join key instead of --personal or --pool-id: --join-key-file PATH|-, --join-key or UM_RUNNER_JOIN_KEY.";
 
 fn write_failure_with_context(
     deployment: &str,
@@ -599,16 +627,19 @@ fn write_failure_with_context(
     authentication: super::super::PrincipalAuthenticationKind,
     json: bool,
     target: Option<DeletionTarget<'_>>,
-    created: Option<CreatedRegistration<'_>>,
+    follow_up: Option<FollowUp<'_>>,
 ) -> anyhow::Result<ExitCode> {
+    let registration = matches!(follow_up, Some(FollowUp::Registration { .. }));
     let (outcome, category, human, outcome_class) = match failure {
         RunnerFailure::Unauthenticated => (
             "unauthenticated",
             None,
             authentication
-                .rejected_error(
-                    "error: runner administration requires sign-in\n\nSign in first:\n  um auth login",
-                )
+                .rejected_error(if registration {
+                    SIGN_IN_TO_REGISTER
+                } else {
+                    SIGN_IN_TO_ADMINISTER
+                })
                 .to_owned(),
             OutcomeClass::Unauthenticated,
         ),
@@ -690,13 +721,14 @@ fn write_failure_with_context(
             "error: runner pool is a member's personal pool, which Cloud protects; nothing was renamed or deleted\n\nAn organization owner can delete this pool once its member has left the organization. Use another runner pool until then.".to_owned(),
             OutcomeClass::GeneralFailure,
         ),
-        RunnerFailure::PoolPersonalUnavailable => (
+        RunnerFailure::PoolPersonalUnavailable if !registration => (
             "pool_personal_unavailable",
             None,
             "error: this account has no personal runner pool\n\nName a runner pool with --pool-id, or a member with --member.".to_owned(),
             OutcomeClass::GeneralFailure,
         ),
-        RunnerFailure::PersonalPoolNotFound => (
+        // `um runner serve` names no member, so its remedy is a pool alone.
+        RunnerFailure::PoolPersonalUnavailable | RunnerFailure::PersonalPoolNotFound => (
             "pool_personal_unavailable",
             None,
             "error: this account has no personal runner pool in this organization\n\nName a runner pool with --pool-id.".to_owned(),
@@ -729,7 +761,10 @@ fn write_failure_with_context(
     let (runner_id, runner_pool_id) = match target {
         Some(DeletionTarget::Runner(id)) => (Some(id), None),
         Some(DeletionTarget::Pool(id)) => (None, Some(id)),
-        None => (created.map(|registration| registration.runner_id), None),
+        None => match follow_up {
+            Some(FollowUp::Created { runner_id, .. }) => (Some(runner_id), None),
+            Some(FollowUp::Registration { .. }) | None => (None, None),
+        },
     };
     let blockers = match failure {
         RunnerFailure::DeletionUnavailable(blockers) => Some(blockers.as_slice()),
@@ -761,13 +796,22 @@ fn write_failure_with_context(
     } else {
         let stderr = io::stderr();
         let mut stderr = stderr.lock();
-        writeln!(stderr, "{human}")?;
-        if let Some(created) = created {
-            writeln!(
+        match follow_up {
+            None => writeln!(stderr, "{human}")?,
+            Some(FollowUp::Created {
+                organization,
+                runner_id,
+            }) => writeln!(
                 stderr,
-                "\nRunner {} was created without an activation. Issue one without creating another runner:\n  um runner activation issue {} {} --activation-file <PATH>",
-                created.runner_id, created.organization, created.runner_id
-            )?;
+                "{human}\n\nRunner {runner_id} was created without an activation. Issue one without creating another runner:\n  um runner activation issue {organization} {runner_id} --activation-file <PATH>"
+            )?,
+            Some(FollowUp::Registration { progress }) => {
+                let (diagnostic, remedy) = human.split_once("\n\n").unwrap_or((&human, ""));
+                writeln!(
+                    stderr,
+                    "{diagnostic}\ncode: {outcome}\n\n{remedy}\n\n{progress}"
+                )?;
+            }
         }
     }
     Ok(outcome_class.exit_code())

@@ -2,6 +2,7 @@ use std::collections::BTreeSet;
 
 use um_test_support::ScriptedHttpServer;
 
+use super::registration::read_registration_record;
 use super::*;
 
 const ACTIVATION_ID: &str = "rna_01k0z6r1w8f4jy2m7q9v3x5abc";
@@ -25,6 +26,10 @@ const ENROLLMENT_JOURNAL_SCHEMA: &str = include_str!(concat!(
 const TERMINAL_RECEIPT_SCHEMA: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../schemas/runner-enrollment-terminal-receipt-v1.schema.json"
+));
+const REGISTRATION_SCHEMA: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../schemas/runner-registration-v1.schema.json"
 ));
 
 pub(super) fn assert_json_matches_schema(format: &str, schema_source: &str, bytes: &[u8]) {
@@ -862,6 +867,13 @@ impl EnrollmentFixture {
             .expect("state directory")
             .join(JOURNAL_FILE)
     }
+
+    fn registration_path(&self) -> PathBuf {
+        self.state_path
+            .parent()
+            .expect("state directory")
+            .join(REGISTRATION_FILE)
+    }
 }
 
 fn activation_artifact(
@@ -1474,4 +1486,720 @@ fn an_unavailable_state_lock_renders_as_the_enrollment_lock_failure() {
         crate::ConfigError::StateLockUnavailable.to_string(),
         crate::ConfigError::InvalidOperatorConfiguration.to_string(),
     );
+}
+
+const PRINCIPAL_ID: &str = "prn_01k0z6r1w8f4jy2m7q9v3x5abc";
+const OTHER_PRINCIPAL_ID: &str = "prn_01k0z6r1w8f4jy2m7q9v3x5abd";
+const ORGANIZATION: &str = "acme";
+const ORGANIZATION_ID: &str = "org_01k0z6r1w8f4jy2m7q9v3x5abc";
+const POOL: &str = "builders";
+const POOL_ID: &str = "rpl_01k0z6r1w8f4jy2m7q9v3x5abc";
+const REGISTRATION_API_URL: &str = "https://api.usefulmachinery.com/";
+
+/// What the operation asked of the test authority, in order.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum AuthorityCall {
+    Principal,
+    PoolId {
+        organization: String,
+        pool: String,
+    },
+    Register {
+        organization: String,
+        pool_id: Option<String>,
+        idempotency_key: String,
+    },
+    Issue {
+        organization: String,
+        runner_id: String,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TestFailure {
+    Ambiguous,
+    Refused,
+}
+
+/// A registration authority that answers from scripts and records each call,
+/// and at each registration the record then on disk.
+struct TestAuthority {
+    activation_base: String,
+    record_path: PathBuf,
+    registrations: std::collections::VecDeque<Result<RegisteredRunner, TestFailure>>,
+    issuances: std::collections::VecDeque<Result<&'static str, TestFailure>>,
+    calls: Vec<AuthorityCall>,
+    records_at_registration: Vec<Option<serde_json::Value>>,
+}
+
+impl TestAuthority {
+    fn new(server: &ScriptedHttpServer, fixture: &EnrollmentFixture) -> Self {
+        Self {
+            activation_base: server.api_url.trim_end_matches("/api/").to_owned(),
+            record_path: fixture.registration_path(),
+            registrations: std::collections::VecDeque::new(),
+            issuances: std::collections::VecDeque::new(),
+            calls: Vec::new(),
+            records_at_registration: Vec::new(),
+        }
+    }
+
+    fn registering(mut self, answer: Result<RegisteredRunner, TestFailure>) -> Self {
+        self.registrations.push_back(answer);
+        self
+    }
+
+    fn issuing(mut self, answer: Result<&'static str, TestFailure>) -> Self {
+        self.issuances.push_back(answer);
+        self
+    }
+
+    fn registrations(&self) -> Vec<&AuthorityCall> {
+        self.calls
+            .iter()
+            .filter(|call| matches!(call, AuthorityCall::Register { .. }))
+            .collect()
+    }
+}
+
+impl RegistrationAuthority for TestAuthority {
+    type Failure = TestFailure;
+
+    fn api_url(&self) -> &str {
+        REGISTRATION_API_URL
+    }
+
+    fn principal_id(&mut self) -> Result<String, TestFailure> {
+        self.calls.push(AuthorityCall::Principal);
+        Ok(PRINCIPAL_ID.to_owned())
+    }
+
+    fn pool_id(&mut self, organization: &str, pool: &str) -> Result<String, TestFailure> {
+        self.calls.push(AuthorityCall::PoolId {
+            organization: organization.to_owned(),
+            pool: pool.to_owned(),
+        });
+        Ok(POOL_ID.to_owned())
+    }
+
+    fn register(
+        &mut self,
+        organization: &str,
+        pool_id: Option<&str>,
+        idempotency_key: &str,
+    ) -> Result<RegisteredRunner, TestFailure> {
+        self.calls.push(AuthorityCall::Register {
+            organization: organization.to_owned(),
+            pool_id: pool_id.map(ToOwned::to_owned),
+            idempotency_key: idempotency_key.to_owned(),
+        });
+        self.records_at_registration.push(
+            fs::read(&self.record_path)
+                .ok()
+                .map(|bytes| serde_json::from_slice(&bytes).expect("decode staged record")),
+        );
+        self.registrations
+            .pop_front()
+            .expect("the test scripted no further registration")
+    }
+
+    fn issue_activation(
+        &mut self,
+        organization: &str,
+        runner_id: &str,
+    ) -> Result<ActivationArtifact, TestFailure> {
+        self.calls.push(AuthorityCall::Issue {
+            organization: organization.to_owned(),
+            runner_id: runner_id.to_owned(),
+        });
+        let activation_id = self
+            .issuances
+            .pop_front()
+            .expect("the test scripted no further issuance")?;
+        Ok(ActivationArtifact::from_parts(ActivationArtifactParts {
+            activation_url: format!(
+                "{}/v1/runner-enrollments/{activation_id}/activate",
+                self.activation_base
+            ),
+            activation_token: format!("{activation_id}.{ACTIVATION_SECRET}"),
+            runner_id: runner_id.to_owned(),
+            expires_at: future_time(),
+        }))
+    }
+
+    fn is_definite_refusal(&self, failure: &TestFailure) -> bool {
+        *failure == TestFailure::Refused
+    }
+}
+
+fn registered_runner() -> RegisteredRunner {
+    RegisteredRunner {
+        runner_id: RUNNER_ID.to_owned(),
+        organization_id: ORGANIZATION_ID.to_owned(),
+        pool_id: POOL_ID.to_owned(),
+    }
+}
+
+fn pool_target() -> RegistrationTarget {
+    RegistrationTarget::Pool(POOL.to_owned())
+}
+
+fn register_with(
+    fixture: &EnrollmentFixture,
+    target: &RegistrationTarget,
+    authority: &mut TestAuthority,
+) -> Result<RegistrationOutcome, RegistrationError<TestFailure>> {
+    register_unless_enrolled(&fixture.config_path, ORGANIZATION, target, authority)
+}
+
+fn read_json(path: &Path) -> serde_json::Value {
+    serde_json::from_slice(&fs::read(path).expect("read host document"))
+        .expect("decode host document")
+}
+
+fn pending_record(principal_id: &str, deployment: &str, staged_at: &str) -> serde_json::Value {
+    serde_json::json!({
+        "schemaVersion": 1,
+        "deployment": deployment,
+        "organization": ORGANIZATION,
+        "target": {"kind": "personal"},
+        "principalId": principal_id,
+        "idempotencyKey": "registration-idempotency",
+        "stagedAt": staged_at
+    })
+}
+
+fn write_record(fixture: &EnrollmentFixture, record: &serde_json::Value) -> Vec<u8> {
+    let state_directory = fixture.state_path.parent().expect("state directory");
+    ensure_private_directory(state_directory).expect("create state directory");
+    atomic_write_json(&fixture.registration_path(), record).expect("write registration record");
+    fs::read(fixture.registration_path()).expect("read written registration record")
+}
+
+fn staged_at_days_ago(days: i64) -> String {
+    (um_support::utc_now() - time::Duration::days(days))
+        .format(&Rfc3339)
+        .expect("format staging time")
+}
+
+// REQ-RUNNERENROLL-117
+// INV-RUNNER-26
+#[test]
+fn a_registration_records_its_key_before_registering_and_completes_the_record_with_the_state() {
+    let server = ScriptedHttpServer::respond(enrollment_response());
+    let fixture = EnrollmentFixture::new(&server, ACTIVATION_ID, future_time());
+    let mut authority = TestAuthority::new(&server, &fixture)
+        .registering(Ok(registered_runner()))
+        .issuing(Ok(ACTIVATION_ID));
+
+    let outcome = register_with(&fixture, &RegistrationTarget::Personal, &mut authority)
+        .expect("register and enroll the runner");
+    let RegistrationOutcome::Registered(response) = outcome else {
+        panic!("a host with no state reported itself enrolled");
+    };
+    assert_eq!(response.runner_id(), RUNNER_ID);
+
+    let [
+        AuthorityCall::Principal,
+        AuthorityCall::Register {
+            organization,
+            pool_id: None,
+            idempotency_key,
+        },
+        AuthorityCall::Issue {
+            organization: issued_organization,
+            runner_id,
+        },
+    ] = authority.calls.as_slice()
+    else {
+        panic!("unexpected authority calls {:?}", authority.calls);
+    };
+    assert_eq!(
+        (organization.as_str(), issued_organization.as_str()),
+        (ORGANIZATION, ORGANIZATION)
+    );
+    assert_eq!(runner_id, RUNNER_ID);
+
+    // The record was on disk, with the key the registration carried and no
+    // runner, before the registration was asked for.
+    let staged = authority.records_at_registration[0]
+        .as_ref()
+        .expect("the record was written before the registration");
+    assert_eq!(staged["idempotencyKey"], idempotency_key.as_str());
+    assert_eq!(staged["principalId"], PRINCIPAL_ID);
+    assert_eq!(staged["deployment"], REGISTRATION_API_URL);
+    assert_eq!(staged["target"], serde_json::json!({"kind": "personal"}));
+    assert!(staged.get("runner").is_none());
+    assert!(staged.get("enrolledAt").is_none());
+
+    let state: RunnerState =
+        serde_json::from_slice(&fs::read(&fixture.state_path).expect("read runner state"))
+            .expect("decode runner state");
+    assert_eq!(state.runner_id, RUNNER_ID);
+    assert_eq!(state.current_credential.id, CREDENTIAL_ID);
+    assert!(!fixture.journal_path().exists());
+    let record = read_json(&fixture.registration_path());
+    assert_eq!(record["idempotencyKey"], idempotency_key.as_str());
+    assert_eq!(
+        record["runner"],
+        serde_json::json!({"id": RUNNER_ID, "organizationId": ORGANIZATION_ID, "poolId": POOL_ID})
+    );
+    assert!(
+        record["enrolledAt"]
+            .as_str()
+            .and_then(parse_rfc3339)
+            .is_some()
+    );
+
+    let request = server.finish_one();
+    assert_eq!(
+        request_header(&request, "authorization"),
+        format!("Bearer {ACTIVATION_ID}.{ACTIVATION_SECRET}")
+    );
+}
+
+// REQ-RUNNERENROLL-117
+#[test]
+fn an_ambiguous_registration_keeps_its_record_and_is_resent_with_the_same_key_and_request() {
+    let server = ScriptedHttpServer::respond(enrollment_response());
+    let fixture = EnrollmentFixture::new(&server, ACTIVATION_ID, future_time());
+    let mut authority = TestAuthority::new(&server, &fixture)
+        .registering(Err(TestFailure::Ambiguous))
+        .registering(Ok(registered_runner()))
+        .issuing(Ok(ACTIVATION_ID));
+
+    let error = register_with(&fixture, &pool_target(), &mut authority)
+        .expect_err("an ambiguous registration stops the start");
+    let RegistrationError::Authority {
+        stage: RegistrationStage::Register,
+        failure: TestFailure::Ambiguous,
+        runner_id: None,
+        record: Some(record),
+    } = error
+    else {
+        panic!("expected the registration's ambiguous failure, got {error:?}");
+    };
+    assert_eq!(record, fixture.registration_path());
+    assert!(read_json(&record).get("runner").is_none());
+    assert!(!fixture.state_path.exists());
+
+    assert!(matches!(
+        register_with(&fixture, &pool_target(), &mut authority),
+        Ok(RegistrationOutcome::Registered(_))
+    ));
+    let registrations = authority.registrations();
+    assert_eq!(registrations.len(), 2);
+    assert_eq!(registrations[0], registrations[1]);
+    assert!(matches!(
+        registrations[0],
+        AuthorityCall::Register { pool_id: Some(pool_id), .. } if pool_id == POOL_ID
+    ));
+    let resolutions = authority
+        .calls
+        .iter()
+        .filter(|call| matches!(call, AuthorityCall::PoolId { .. }))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        resolutions,
+        [&AuthorityCall::PoolId {
+            organization: ORGANIZATION.to_owned(),
+            pool: POOL.to_owned()
+        }]
+    );
+    assert_eq!(
+        read_json(&fixture.registration_path())["runner"]["id"],
+        RUNNER_ID
+    );
+    server.finish_one();
+}
+
+// REQ-RUNNERENROLL-117
+#[test]
+fn a_failure_after_the_registration_was_answered_issues_for_the_recorded_runner_without_registering()
+ {
+    let server = ScriptedHttpServer::respond(enrollment_response());
+    let fixture = EnrollmentFixture::new(&server, ACTIVATION_ID, future_time());
+    let mut authority = TestAuthority::new(&server, &fixture)
+        .registering(Ok(registered_runner()))
+        .issuing(Err(TestFailure::Ambiguous))
+        .issuing(Ok(ACTIVATION_ID));
+
+    let error = register_with(&fixture, &RegistrationTarget::Personal, &mut authority)
+        .expect_err("an ambiguous issuance stops the start");
+    assert!(matches!(
+        &error,
+        RegistrationError::Authority {
+            stage: RegistrationStage::IssueActivation,
+            failure: TestFailure::Ambiguous,
+            runner_id: Some(runner_id),
+            record: Some(_),
+        } if runner_id == RUNNER_ID
+    ));
+    let record = read_json(&fixture.registration_path());
+    assert_eq!(record["runner"]["id"], RUNNER_ID);
+    assert!(record.get("enrolledAt").is_none());
+    let first_start = authority.calls.len();
+
+    assert!(matches!(
+        register_with(&fixture, &RegistrationTarget::Personal, &mut authority),
+        Ok(RegistrationOutcome::Registered(_))
+    ));
+    assert_eq!(
+        authority.calls[first_start..],
+        [AuthorityCall::Issue {
+            organization: ORGANIZATION.to_owned(),
+            runner_id: RUNNER_ID.to_owned()
+        }]
+    );
+    assert_eq!(authority.registrations().len(), 1);
+    server.finish_one();
+}
+
+// REQ-RUNNERENROLL-117
+#[test]
+fn a_staged_activation_for_the_recorded_runner_is_resent_before_any_issuance() {
+    // The first start's enrollment is answered 400, which leaves its journal
+    // staged; the second start resends it and is answered as scripted.
+    for (resent_answer, issued_again) in [
+        (vec![enrollment_response()], false),
+        (
+            vec![empty_response("410 Gone"), enrollment_response()],
+            true,
+        ),
+    ] {
+        let mut responses = vec![empty_response("400 Bad Request")];
+        responses.extend(resent_answer);
+        let server = ScriptedHttpServer::respond_in_sequence(responses);
+        let fixture = EnrollmentFixture::new(&server, ACTIVATION_ID, future_time());
+        let mut authority = TestAuthority::new(&server, &fixture)
+            .registering(Ok(registered_runner()))
+            .issuing(Ok(ACTIVATION_ID))
+            .issuing(Ok(OTHER_ACTIVATION_ID));
+
+        let error = register_with(&fixture, &RegistrationTarget::Personal, &mut authority)
+            .expect_err("an invalid enrollment answer stops the start");
+        assert!(matches!(
+            &error,
+            RegistrationError::Host {
+                stage: RegistrationStage::Enroll,
+                error: EnrollmentError::InvalidResponse,
+                runner_id: Some(runner_id),
+                record: Some(_),
+            } if runner_id == RUNNER_ID
+        ));
+        assert!(fixture.journal_path().exists());
+        let first_start = authority.calls.len();
+
+        assert!(matches!(
+            register_with(&fixture, &RegistrationTarget::Personal, &mut authority),
+            Ok(RegistrationOutcome::Registered(_))
+        ));
+        let issuance = AuthorityCall::Issue {
+            organization: ORGANIZATION.to_owned(),
+            runner_id: RUNNER_ID.to_owned(),
+        };
+        let expected: &[AuthorityCall] = if issued_again {
+            std::slice::from_ref(&issuance)
+        } else {
+            &[]
+        };
+        assert_eq!(&authority.calls[first_start..], expected);
+        assert!(!fixture.journal_path().exists());
+        assert!(
+            read_json(&fixture.registration_path())
+                .get("enrolledAt")
+                .is_some()
+        );
+
+        let requests = server.finish();
+        assert_eq!(request_body(&requests[0]), request_body(&requests[1]));
+        assert_eq!(
+            request_header(&requests[0], "idempotency-key"),
+            request_header(&requests[1], "idempotency-key")
+        );
+        assert_eq!(
+            request_header(&requests[1], "authorization"),
+            format!("Bearer {ACTIVATION_ID}.{ACTIVATION_SECRET}")
+        );
+        if issued_again {
+            assert_eq!(
+                request_header(&requests[2], "authorization"),
+                format!("Bearer {OTHER_ACTIVATION_ID}.{ACTIVATION_SECRET}")
+            );
+        }
+    }
+}
+
+// REQ-RUNNERENROLL-117
+#[test]
+fn a_record_whose_replay_cannot_be_trusted_is_not_resent_and_is_left_unchanged() {
+    let server = ScriptedHttpServer::respond_in_sequence(Vec::new());
+    let fixture = EnrollmentFixture::new(&server, ACTIVATION_ID, future_time());
+    let recent = staged_at_days_ago(1);
+    for record in [
+        pending_record(OTHER_PRINCIPAL_ID, REGISTRATION_API_URL, &recent),
+        pending_record(PRINCIPAL_ID, "https://api.example.test/", &recent),
+        pending_record(PRINCIPAL_ID, REGISTRATION_API_URL, &staged_at_days_ago(7)),
+    ] {
+        let bytes = write_record(&fixture, &record);
+        let mut authority = TestAuthority::new(&server, &fixture);
+
+        let error = register_with(&fixture, &RegistrationTarget::Personal, &mut authority)
+            .expect_err("an untrusted replay is refused");
+        let RegistrationError::Conflict(conflict) = error else {
+            panic!("expected a conflict for {record}, got {error:?}");
+        };
+        assert_eq!(conflict.kind, RegistrationConflictKind::Unresolved);
+        assert_eq!(conflict.kind.code(), "registration_unresolved");
+        assert_eq!(conflict.path, fixture.registration_path());
+        assert!(authority.registrations().is_empty(), "{record}");
+        assert_eq!(
+            fs::read(fixture.registration_path()).expect("reread record"),
+            bytes
+        );
+    }
+    assert!(!fixture.state_path.exists());
+    assert!(server.finish().is_empty());
+}
+
+// REQ-RUNNERENROLL-117
+#[test]
+fn a_definite_refusal_of_the_registration_removes_the_record() {
+    let server = ScriptedHttpServer::respond_in_sequence(Vec::new());
+    let fixture = EnrollmentFixture::new(&server, ACTIVATION_ID, future_time());
+    let mut authority =
+        TestAuthority::new(&server, &fixture).registering(Err(TestFailure::Refused));
+
+    let error = register_with(&fixture, &pool_target(), &mut authority)
+        .expect_err("a refused registration stops the start");
+    assert!(matches!(
+        error,
+        RegistrationError::Authority {
+            stage: RegistrationStage::Register,
+            failure: TestFailure::Refused,
+            runner_id: None,
+            record: None,
+        }
+    ));
+    assert!(authority.records_at_registration[0].is_some());
+    assert!(!fixture.registration_path().exists());
+    assert!(!fixture.journal_path().exists());
+    assert!(!fixture.state_path.exists());
+    assert!(server.finish().is_empty());
+}
+
+// REQ-RUNNERENROLL-117
+#[test]
+fn a_record_that_does_not_read_fails_naming_it_and_is_left_as_it_was() {
+    let server = ScriptedHttpServer::respond_in_sequence(Vec::new());
+    let fixture = EnrollmentFixture::new(&server, ACTIVATION_ID, future_time());
+    let state_directory = fixture.state_path.parent().expect("state directory");
+    ensure_private_directory(state_directory).expect("create state directory");
+    let mut file =
+        create_new_private_file(&fixture.registration_path()).expect("create registration record");
+    file.write_all(b"{\"schemaVersion\": 1,")
+        .expect("write truncated registration record");
+    drop(file);
+    let mut authority = TestAuthority::new(&server, &fixture);
+
+    let error = register_with(&fixture, &RegistrationTarget::Personal, &mut authority)
+        .expect_err("an unreadable record is not a host with no registration");
+    let RegistrationError::Host {
+        stage: RegistrationStage::ReadRecord,
+        error: EnrollmentError::InvalidRegistrationRecord { record, .. },
+        ..
+    } = error
+    else {
+        panic!("expected the record's read failure, got {error:?}");
+    };
+    assert_eq!(record, fixture.registration_path());
+    assert!(authority.calls.is_empty());
+    assert_eq!(
+        fs::read(fixture.registration_path()).expect("reread record"),
+        b"{\"schemaVersion\": 1,"
+    );
+    assert!(server.finish().is_empty());
+}
+
+// REQ-RUNNERENROLL-117
+#[test]
+fn registration_records_match_their_schema_and_are_read_closed() {
+    let server = ScriptedHttpServer::respond(enrollment_response());
+    let fixture = EnrollmentFixture::new(&server, ACTIVATION_ID, future_time());
+    let mut authority = TestAuthority::new(&server, &fixture)
+        .registering(Err(TestFailure::Ambiguous))
+        .registering(Ok(registered_runner()))
+        .issuing(Ok(ACTIVATION_ID));
+
+    register_with(&fixture, &pool_target(), &mut authority)
+        .expect_err("an ambiguous registration keeps the pending record");
+    let pending = fs::read(fixture.registration_path()).expect("read pending record");
+    assert_json_matches_schema("runner registration record", REGISTRATION_SCHEMA, &pending);
+    register_with(&fixture, &pool_target(), &mut authority).expect("complete the registration");
+    let complete = fs::read(fixture.registration_path()).expect("read complete record");
+    assert_json_matches_schema("runner registration record", REGISTRATION_SCHEMA, &complete);
+    server.finish_one();
+
+    // The schema and the reader refuse the same documents.
+    let pending: serde_json::Value = serde_json::from_slice(&pending).expect("decode record");
+    let mut enrolled_without_runner = pending.clone();
+    enrolled_without_runner["enrolledAt"] = serde_json::json!("2026-11-13T12:00:05Z");
+    let mut unknown_member = pending.clone();
+    unknown_member["runnerName"] = serde_json::json!("runner-test");
+    let mut personal_with_pool = pending;
+    personal_with_pool["target"]["kind"] = serde_json::json!("personal");
+    for document in [enrolled_without_runner, unknown_member, personal_with_pool] {
+        assert_schema_rejects("runner registration record", REGISTRATION_SCHEMA, &document);
+        write_record(&fixture, &document);
+        assert!(
+            matches!(
+                read_registration_record(&fixture.registration_path()),
+                Err(EnrollmentError::InvalidRegistrationRecord { .. })
+            ),
+            "{document}"
+        );
+    }
+}
+
+fn complete_record(target: serde_json::Value, runner_id: &str) -> serde_json::Value {
+    let mut record = pending_record(PRINCIPAL_ID, REGISTRATION_API_URL, "2026-11-13T12:00:00Z");
+    record["target"] = target;
+    record["runner"] = serde_json::json!({
+        "id": runner_id,
+        "organizationId": ORGANIZATION_ID,
+        "poolId": POOL_ID
+    });
+    record["enrolledAt"] = serde_json::json!("2026-11-13T12:00:05Z");
+    record
+}
+
+// REQ-RUNNERENROLL-117: the second of two starts takes the lock after the
+// first wrote the state, so it serves that state and asks Cloud nothing.
+#[test]
+fn a_registration_that_finds_state_under_the_lock_asks_the_authority_nothing() {
+    let server = ScriptedHttpServer::respond_in_sequence(Vec::new());
+    let fixture = EnrollmentFixture::new(&server, ACTIVATION_ID, future_time());
+    fixture.write_current_state();
+    let state = fs::read(&fixture.state_path).expect("read runner state");
+    for record in [
+        None,
+        Some(complete_record(
+            serde_json::json!({"kind": "personal"}),
+            RUNNER_ID,
+        )),
+    ] {
+        let written = record.map(|record| write_record(&fixture, &record));
+        let mut authority = TestAuthority::new(&server, &fixture);
+
+        let outcome = register_with(&fixture, &RegistrationTarget::Personal, &mut authority);
+
+        assert!(
+            matches!(outcome, Ok(RegistrationOutcome::AlreadyEnrolled)),
+            "{outcome:?}"
+        );
+        assert!(authority.calls.is_empty(), "{:?}", authority.calls);
+        assert_eq!(
+            fs::read(fixture.registration_path()).ok(),
+            written,
+            "the registration record is left as it was"
+        );
+    }
+    assert_eq!(
+        fs::read(&fixture.state_path).expect("reread runner state"),
+        state
+    );
+    assert!(server.finish().is_empty());
+}
+
+// REQ-RUNNERENROLL-118
+#[test]
+fn an_enrolled_host_accepts_only_the_recorded_organization_and_pool_or_their_ids() {
+    let server = ScriptedHttpServer::respond_in_sequence(Vec::new());
+    let fixture = EnrollmentFixture::new(&server, ACTIVATION_ID, future_time());
+    fixture.write_current_state();
+    let state = fs::read(&fixture.state_path).expect("read runner state");
+    let pool = || RegistrationTarget::Pool(POOL.to_owned());
+    let pool_id = || RegistrationTarget::Pool(POOL_ID.to_owned());
+    let pool_record = serde_json::json!({"kind": "pool", "pool": POOL, "poolId": POOL_ID});
+    let personal_record = serde_json::json!({"kind": "personal"});
+    let other_runner = "rnr_01k0z6r1w8f4jy2m7q9v3x5abd";
+
+    // Each case: the record, the options of the start, and whether they match.
+    let cases = [
+        (&pool_record, RUNNER_ID, ORGANIZATION, pool(), true),
+        (&pool_record, RUNNER_ID, ORGANIZATION_ID, pool(), true),
+        (&pool_record, RUNNER_ID, ORGANIZATION, pool_id(), true),
+        (&pool_record, RUNNER_ID, ORGANIZATION_ID, pool_id(), true),
+        (&pool_record, RUNNER_ID, "other", pool(), false),
+        (&pool_record, RUNNER_ID, POOL_ID, pool(), false),
+        (
+            &pool_record,
+            RUNNER_ID,
+            ORGANIZATION,
+            RegistrationTarget::Pool("other".to_owned()),
+            false,
+        ),
+        (
+            &pool_record,
+            RUNNER_ID,
+            ORGANIZATION,
+            RegistrationTarget::Pool(ORGANIZATION_ID.to_owned()),
+            false,
+        ),
+        (
+            &pool_record,
+            RUNNER_ID,
+            ORGANIZATION,
+            RegistrationTarget::Personal,
+            false,
+        ),
+        (&pool_record, other_runner, ORGANIZATION, pool(), false),
+        (
+            &personal_record,
+            RUNNER_ID,
+            ORGANIZATION,
+            RegistrationTarget::Personal,
+            true,
+        ),
+        (
+            &personal_record,
+            RUNNER_ID,
+            ORGANIZATION_ID,
+            RegistrationTarget::Personal,
+            true,
+        ),
+        (
+            &personal_record,
+            RUNNER_ID,
+            "other",
+            RegistrationTarget::Personal,
+            false,
+        ),
+        (&personal_record, RUNNER_ID, ORGANIZATION, pool(), false),
+        (&personal_record, RUNNER_ID, ORGANIZATION, pool_id(), false),
+    ];
+    for (target, runner_id, organization, options, matches) in cases {
+        let record = write_record(&fixture, &complete_record(target.clone(), runner_id));
+
+        let confirmed = confirm_registration(&fixture.config_path, organization, &options);
+
+        let case = format!("{target} {runner_id} {organization} {options:?}");
+        if matches {
+            confirmed.unwrap_or_else(|error| panic!("{case}: {error:?}"));
+        } else {
+            let Err(RegistrationError::Conflict(conflict)) = confirmed else {
+                panic!("{case}: expected a conflict, got {confirmed:?}");
+            };
+            assert_eq!(conflict.kind, RegistrationConflictKind::Target, "{case}");
+            assert_eq!(conflict.path, fixture.registration_path(), "{case}");
+            assert_eq!(conflict.runner_id.as_deref(), Some(runner_id), "{case}");
+        }
+        assert_eq!(
+            fs::read(fixture.registration_path()).expect("reread record"),
+            record,
+            "{case}"
+        );
+        assert_eq!(fs::read(&fixture.state_path).expect("reread state"), state);
+    }
+    assert!(server.finish().is_empty());
 }

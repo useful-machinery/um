@@ -2253,7 +2253,14 @@ a name the service chooses and its own credential, generated on the host.
 
 ```sh
 # Issue a key for a pool (or, naming none, your personal pool) that admits hosts for
-# seven days. A runner that joined with it is removed after one hour offline.
+# seven days. A runner that joined with it is removed after one hour offline. The key's
+# one line of JSON goes to standard output, ready to paste at `um runner serve --join-key`.
+um runner join-key issue acme-labs \
+  --pool-id builders \
+  --expires-in 7d \
+  --remove-after 1h
+
+# Or write the key to a new protected file, for hosts that start unattended.
 um runner join-key issue acme-labs \
   --pool-id builders \
   --expires-in 7d \
@@ -2270,11 +2277,14 @@ um runner join-key revoke acme-labs rjk_01k0z6r1w8f4jy2m7q9v3x5abc --yes
 
 `--expires-in` runs from `1m` to `365d` and `--remove-after` from `5m` to `30d`, each a
 whole number of minutes, hours or days; both are fixed at issue, and a value outside its
-bounds is refused before anything is sent. Like an activation, the key is written once, as
-one line of JSON, to a new file only you can read, or to standard output with `-`; the file
-is created before the key is issued, and Cloud cannot show the key again. `--json` reports
-the key's metadata and the file's path, never the key itself. Keep the key in a secret
-store and out of version control, logs and transcripts.
+bounds is refused before anything is sent. The key is written once, as one line of JSON:
+with no `--join-key-file`, or with `--join-key-file -`, to standard output, with the
+command's status on standard error; with `--join-key-file PATH`, like an activation, to a
+new file only you can read, created before the key is issued. Cloud cannot show the key
+again. `--json` needs `--join-key-file PATH` and is refused before anything is sent
+otherwise; it reports the key's metadata and the file's path, never the key itself. The
+key stays a secret on the screen and in the clipboard: keep it in a secret store and out of
+version control, logs and transcripts.
 
 A runner that joined with a key is removed automatically once it has been offline for the
 key's removal time, counted from when Cloud last saw it, or from its join if it never
@@ -2490,10 +2500,13 @@ commit a workflow value.
 
 ## Runner serve
 
-`runner serve` uses the protected `rrc_` credential created by `runner enroll`, or by
-joining a pool with a join key when the service first starts; it never reads human OAuth
-credentials. Enrollment, service startup, `runner status` and `runner grant sync` consume
-the same closed operator configuration. Without `--config` it is the runner home's: the
+`runner serve` uses the protected `rrc_` credential created by `runner enroll`, by a
+signed-in registration, or by joining a pool with a join key when the service first
+starts. The service never reads human OAuth credentials: `runner serve` uses the human
+sign-in only to register a host that holds no enrolled state when `--personal` or
+`--pool-id` is given, and the runner it then serves uses its own credential. Enrollment,
+service startup, `runner status` and `runner grant sync` consume the same closed operator
+configuration. Without `--config` it is the runner home's: the
 directory `runner` under the `um` home (`$UM_HOME` when it is set and not empty, otherwise
 `$HOME/.um`, a relative home taken from the working directory) holds the configuration and
 the files it names:
@@ -2501,7 +2514,7 @@ the files it names:
 ```text
 <um home>/runner/
 ├── config.json     operator configuration
-├── state.json      enrolled state, written by runner enroll or by a join
+├── state.json      enrolled state, written by runner enroll, a registration or a join
 ├── control.sock    control socket, created by a serving runner
 └── work/           work root
 ```
@@ -2537,8 +2550,8 @@ um runner serve
 um runner status
 ```
 
-A start that finds no enrolled state and is given no join key exits 1 saying the host is
-not enrolled and naming `um runner enroll --activation-file <PATH>` and
+A start that finds no enrolled state and is given neither a join key nor `--personal` or
+`--pool-id` exits 1 saying the host is not enrolled and naming `um runner enroll --activation-file <PATH>` and
 `um runner serve --join-key-file <PATH>` as the ways to enroll it; it contacts no Cloud
 deployment.
 
@@ -2574,11 +2587,78 @@ Production operators should follow the private monorepo's
 service-manager shutdown allowance, control-plane cutover, drain, and recovery. That
 operator runbook is intentionally outside this public CLI source mirror.
 
+A person signed in on the host with `um auth login` can instead register it when the
+service first starts, with no activation file, in their own personal pool or, given the
+pool's ID or exact name, in another pool:
+
+```sh
+um runner serve --config /etc/um/runner.json --personal --organization my-org
+um runner serve --config /etc/um/runner.json --pool-id builders --organization my-org
+```
+
+`--organization` is required with `--personal` or `--pool-id` and refused without one of
+them; `--personal`, `--pool-id` and a join key, `UM_RUNNER_JOIN_KEY` included, exclude one
+another. Each violation is a usage error, exit 2, before the configuration is read. The
+command takes no organization from the environment or the sign-in, never tries another
+mode when the one given fails, never looks for an existing runner by its name and takes no
+service API key. A member may register in their own personal pool and an owner in any pool,
+as with `runner create`. `--allow-insecure-http`, accepted only with `--personal` or
+`--pool-id`, permits a plain-HTTP API address for the registration requests; the
+activation and connection addresses still follow `deploymentMode`.
+
+On a host that holds no enrolled state, the start checks the configuration, its work root
+included, before it reads the sign-in or contacts Cloud. It then registers a runner with a
+name Cloud chooses, issues its activation, enrolls with it, writes enrolled state and
+serves; the activation exists only in the host's enrollment journal until it is consumed,
+and no activation file is written. It reports the runner's ID, name, pool and credential ID
+on standard error. Without a sign-in it exits 3 having registered and written nothing. The
+runner is a registration made by hand and is never removed automatically.
+
+The registration's progress is kept in `.runner-registration.json`, in the directory of
+the state file, a closed, versioned record private to the host's user that holds no
+secret and is read and written only under the state lock. It names the deployment, the
+organization and target as given, the pool's ID, the signed-in principal and the
+registration's `Idempotency-Key`, then the registered runner, then that enrollment
+completed. A start that finds the record and no enrolled state resumes that registration
+with the same request and key, or issues an activation for the recorded runner, so one
+host registers at most one runner however many starts are interrupted. An ambiguous
+registration or issuance and a missing or rejected sign-in stop the start with the record
+kept; a definite refusal of the registration removes it.
+
+Enrolled state takes precedence: on a host whose state file is present, `runner serve`
+serves with that state, registers and issues nothing, and reads no human deployment or
+credential, also when `--personal` or `--pool-id` is still given. A start whose options
+disagree with the host fails with exit 1 and a closed `code:` before anything is sent:
+`registration_target_conflict` when the options name another organization, mode or pool
+than the record, or the host was enrolled without a registration record;
+`registration_unresolved` when the record cannot be resumed (another principal or
+deployment, or staged more than six days ago), another command's enrollment or join is
+unresolved, or a join key is given beside an unfinished registration; and
+`registration_state_missing` when the record says enrollment completed and the state file
+is absent. Each failure names the recorded runner's ID, the file to inspect and the way
+forward. A host whose runner was deleted reports `authentication_failed` until its state
+file and `.runner-registration.json` are removed.
+
 A host can instead join a pool when the service first starts, with no activation, by
 giving `runner serve` a join key (see
-[Runner pools, registrations, and join keys](#runner-pools-registrations-and-join-keys)),
-either as a file or in the `UM_RUNNER_JOIN_KEY` environment variable, which holds the
-key file's one line of JSON, for example from a platform's secret store:
+[Runner pools, registrations, and join keys](#runner-pools-registrations-and-join-keys)).
+From a terminal, `--join-key` asks for the key's one line of JSON, as `runner join-key
+issue` printed it, at a prompt that does not echo it:
+
+```sh
+um runner serve --config /etc/um/runner.json --join-key
+```
+
+The flag takes no value, so the key is never a command-line argument. The prompt reads one
+line of at most 4096 bytes with echo turned off and restores the terminal's settings when
+the read ends, an interrupt included. When standard input is not a terminal, the start
+fails as a usage error, exit 2, before anything is staged or sent, and names the inputs of
+an unattended start; it never waits for input. A line that is not a join key fails as an
+unreadable key does and sends nothing.
+
+An unattended host takes the key as a file or in the `UM_RUNNER_JOIN_KEY` environment
+variable, which holds the key's one line of JSON, for example from a platform's secret
+store:
 
 ```sh
 um runner serve --join-key-file /protected/path/builders.join-key.json
@@ -2588,16 +2668,19 @@ UM_RUNNER_JOIN_KEY="$BUILDERS_JOIN_KEY" um runner serve --config /etc/um/runner.
 On a host that holds no enrolled state, the service generates its credential, joins the
 key's pool as a new runner, writes enrolled state, and serves. On a host that already holds
 enrolled state, it serves with that state and ignores the key, so the same command can
-start the service every time. A host that holds enrolled state never reads the key, and when
-its configuration or state does not load the start reports that cause. On a host that
-holds no enrolled state, the service checks the host's configuration, its work root
-included, before it reads the key or contacts Cloud, so a host that cannot serve registers
-no runner. The key is read as an activation is: from a regular file
-private to the current user, which is left in place, or from piped standard input with
-`--join-key-file -`; an interactive terminal is refused. Giving the key both ways is a
-usage error, and an expired key is refused before Cloud is contacted. The service reads
-the key once, removes `UM_RUNNER_JOIN_KEY` from its own environment by restarting itself
-without it, never writes the key to its state, and never passes it to a workflow step.
+start the service every time. A host that holds enrolled state never reads the key and is
+not prompted for one, and when its configuration or state does not load the start reports
+that cause. On a host that holds no enrolled state, the service checks the host's
+configuration, its work root included, before it reads the key, prompts for it or contacts
+Cloud, so a host that cannot serve registers no runner. A key given with `--join-key-file`
+is read as an activation is: from a regular file private to the current user, which is
+left in place, or from piped standard input with `--join-key-file -`; an interactive
+terminal is refused there, since `--join-key` is the terminal's input. `--join-key`,
+`--join-key-file` and `UM_RUNNER_JOIN_KEY` exclude one another: giving the key in more than
+one way is a usage error, and an expired key is refused before Cloud is contacted. The
+service reads the key once, removes `UM_RUNNER_JOIN_KEY` from its own environment by
+restarting itself without it, never writes the key to its state or keeps it for a later
+start, and never passes it to a workflow step.
 
 A key Cloud refuses, because its token is not recognized or the key is revoked or expired, or because its pool cannot
 admit the runner (a personal pool whose member is not active, or an organization at its
@@ -2611,9 +2694,9 @@ remove the journal after confirming in the pool that no runner joined from the h
 
 A join resent from the journal, after an interrupted start or a lost response, may already
 have registered a runner. When Cloud rejects its token, the journal stays and the failure
-names it: the same key file or variable would be rejected again, so start the service with
-the key as it was issued, or delete any runner that joined from the host in the pool, remove
-the journal, and start with a key Cloud accepts. When Cloud refuses a resent join as gone,
+names it: the same key, however it is given, would be rejected again, so start the service
+with the key as it was issued, or delete any runner that joined from the host in the pool,
+remove the journal, and start with a key Cloud accepts. When Cloud refuses a resent join as gone,
 the key may be revoked or expired, its issuer may no longer issue a key for the pool, or the
 runner the earlier join registered may have been deleted; the journal is removed, and the
 failure says that Cloud holds no runner for the host's join rather than that none was
