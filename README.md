@@ -943,9 +943,10 @@ um grant create codex --from-file ~/backup/auth.json --replace
 # For claude_code this runs `claude setup-token` with a private temporary configuration
 # directory (mode 0700) that it removes afterwards; your own Claude Code configuration is never
 # read or changed. Its prompts appear in your terminal and what you type, such as a code to
-# paste, reaches it; the token it prints is imported and never shown. --token-file imports a
-# token claude setup-token printed from an owned mode-0600 file, or - for standard input,
-# instead.
+# paste, reaches it; the token it prints is imported and never shown. Without a terminal on
+# standard input the command fails at once, starting no sign-in, and names --token-file -.
+# --token-file imports a token claude setup-token printed from an owned mode-0600 file, or -
+# for standard input, instead.
 um grant create claude_code
 um grant create claude_code --token-file - --organization acme < token.txt
 
@@ -1004,6 +1005,22 @@ um grant list codex --json
 # which applies, and does nothing without --yes. A Codex grant serves one runner at a time.
 um grant authorize codex rnr_01k0z6r1w8f4jy2m7q9v3x5abc --yes
 
+# Leave the runner out to choose it from a list. At a terminal it shows the runners the grant
+# can be authorized for and is not yet, each by name, pool, online or offline, mode when not
+# enabled, and ID, online enabled runners first; Enter takes the highlighted one. It then
+# states what authorizing does, naming the runner, and asks before it acts unless --yes was
+# given: any answer but y, or Esc at the list, sends nothing and exits 2. Where the command
+# cannot prompt (no terminal, or --json), it lists the same runners and exits 2 having sent
+# nothing. `um grant authorize --all` offers the runners of your organizations, and
+# `um grant deauthorize GRANT` only the runners the grant is authorized for.
+um grant authorize codex
+
+# Offered more than one runner, the list ends with a choice of all of them, except for a Codex
+# grant, which serves one runner at a time, and for --all. With all chosen the command states
+# how many runners it covers, acts on each in turn and prints one outcome per runner; it exits
+# 1 when any runner was refused, and a failure that is not one runner's refusal ends it there.
+um grant authorize claude_code
+
 # Authorize that runner for every grant of yours that can serve it: each OAuth grant and each
 # native grant of the runner's organization. It prints one outcome per grant (`authorized`,
 # `already_authorized`, `other_organization` for a native grant of another organization, or
@@ -1046,7 +1063,13 @@ provider does not take, `--organization` for an OAuth provider, and a missing or
 when you are a member of several exit 2 before anything is run or sent.
 
 `authorize`, `deauthorize` and `revoke` take `--yes`; without it they send nothing, state what
-acting does for a grant of either kind and exit 2. Each sends its request with one
+acting does for a grant of either kind and exit 2. `authorize` and `deauthorize` given no
+`RUNNER` read the runners they could act on instead; at a terminal they show them as a list to
+choose from and, without `--yes`, ask before acting, and otherwise exit 2 naming them; `--json`
+prints outcome `runner_required` with `grantId` (absent for `--all`) and `runners`, each with `id`,
+`name`, `pool`, `connectivity`, `mode` and `organizationId`. With no runner to offer they
+exit 1 with `runner_not_found`, `already_authorized`, `authorized_elsewhere` or
+`authorization_not_found`. Each sends its request with one
 idempotency key and replays it once when the answer is lost. `authorize --json` prints outcome
 `authorized` with `grantId` and `authorization`; `authorize --all --json` prints outcome
 `authorized`, or `refused` when any grant was refused, with `runnerId` and `grants`, each with

@@ -519,6 +519,17 @@ impl Command {
         match self.sign_in(provider)? {
             SignIn::Consent(consent) => flow.replace_by_consent(deployment, provider, consent),
             SignIn::Native(login) => {
+                // A Claude Code sign-in the member could not answer is refused before the first
+                // request (REQ-GRANT-71).
+                if matches!(login, Login::ClaudeCode)
+                    && let Some(failure) = claude_setup_token::unanswerable()
+                {
+                    return Ok(output::write_import_refusal(
+                        deployment.fingerprint().api_url(),
+                        &failure.report(),
+                        self.options.json,
+                    )?);
+                }
                 let signs_in = !matches!(login, Login::Read(_));
                 let (organization, target) = match flow.settle(deployment, provider, signs_in)? {
                     Ok(settled) => settled,

@@ -4,8 +4,6 @@
 //! organization. With `--workflow`, a grant that needs reconnecting is settled the same way,
 //! and one the member keeps is passed over rather than refused (REQ-GRANT-79).
 
-use std::io::{self, BufRead, IsTerminal, Write};
-
 use anyhow::anyhow;
 
 use crate::cli::CommandFailure;
@@ -16,7 +14,7 @@ use um_api::{
 };
 use um_support::Availability;
 
-use super::projection;
+use super::{confirmation, projection};
 
 /// The member's grants of `provider` that a new sign-in would replace: those of its kind that
 /// are `active` or `reconnect_required`, and for a native provider those of the organization
@@ -125,10 +123,13 @@ fn answer(question: impl FnOnce() -> String, replace: bool) -> anyhow::Result<Op
     if replace {
         return Ok(Some(true));
     }
-    if !(io::stdin().is_terminal() && io::stderr().is_terminal()) {
+    if !confirmation::can_ask() {
         return Ok(None);
     }
-    ask(&question()).map(Some)
+    let question = question();
+    Ok(Some(confirmation::ask(format_args!(
+        "{question}\nReplace it with a new sign-in?"
+    ))?))
 }
 
 /// The native grant a new sign-in replaces, once `settle` allows it, or none when nothing is
@@ -153,18 +154,4 @@ pub(super) fn native_target(
     }
     settle(provider, &held, replace)?;
     Ok(held.pop())
-}
-
-/// Asks on standard error whether to replace the held grant `question` names and reads one
-/// line of answer.
-fn ask(question: &str) -> anyhow::Result<bool> {
-    let mut stderr = io::stderr().lock();
-    write!(stderr, "{question}\nReplace it with a new sign-in? [y/N] ")?;
-    stderr.flush()?;
-    let mut answer = String::new();
-    io::stdin().lock().read_line(&mut answer)?;
-    Ok(matches!(
-        answer.trim().to_ascii_lowercase().as_str(),
-        "y" | "yes"
-    ))
 }

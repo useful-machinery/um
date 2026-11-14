@@ -512,6 +512,64 @@ fn destructive_leaves_require_confirmation_but_runner_modes_do_not() {
     }
 }
 
+// REQ-GRANT-65
+// REQ-GRANT-66
+// REQ-GRANT-81
+// `authorize` parses `GRANT RUNNER`, `GRANT`, `--all RUNNER` and `--all`, and a leaf given no
+// `RUNNER` runs without `--yes` to offer the runners, while one given `RUNNER` is refused
+// without it (`destructive_leaves_require_confirmation_but_runner_modes_do_not`).
+#[test]
+fn authorize_and_deauthorize_take_runner_as_an_option_and_refuse_a_malformed_target() {
+    const GRANT: &str = "agl_01k0z6r1w8f4jy2m7q9v3x5abc";
+    const RUNNER: &str = "rnr_01k0z6r1w8f4jy2m7q9v3x5abc";
+    for args in [
+        &["authorize", GRANT][..],
+        &["authorize", "codex"],
+        &["authorize", "--all"],
+        &["deauthorize", GRANT],
+        &["authorize", GRANT, RUNNER, "--yes"],
+        &["authorize", "--all", RUNNER, "--yes"],
+        &["authorize", RUNNER, "--all", "--yes"],
+    ] {
+        let input = ["um", "grant"].into_iter().chain(args.iter().copied());
+        assert!(super::parse(input).is_ok(), "{args:?}");
+    }
+    for (args, kind) in [
+        (
+            &["authorize", GRANT, "--all", "--yes"][..],
+            clap::error::ErrorKind::ArgumentConflict,
+        ),
+        (
+            &["authorize", RUNNER, "--yes"],
+            clap::error::ErrorKind::ValueValidation,
+        ),
+        (
+            &["authorize", "--all", RUNNER, RUNNER, "--yes"],
+            clap::error::ErrorKind::UnknownArgument,
+        ),
+        (
+            &["authorize", "--yes"],
+            clap::error::ErrorKind::MissingRequiredArgument,
+        ),
+        // A runner is named by its ID, also where the leaf would offer the runners.
+        (
+            &["authorize", "codex", "builder"],
+            clap::error::ErrorKind::ValueValidation,
+        ),
+        (
+            &["authorize", "--all", "builder"],
+            clap::error::ErrorKind::ValueValidation,
+        ),
+        (
+            &["deauthorize", GRANT, "builder"],
+            clap::error::ErrorKind::ValueValidation,
+        ),
+    ] {
+        let input = ["um", "grant"].into_iter().chain(args.iter().copied());
+        assert_eq!(super::parse(input).unwrap_err().kind(), kind, "{args:?}");
+    }
+}
+
 // REQ-CONNECTION-88
 #[test]
 fn github_connections_live_only_under_the_connection_family() {

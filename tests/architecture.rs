@@ -735,6 +735,7 @@ fn external_crate_containment() -> Vec<(&'static str, Vec<&'static str>)> {
         ("opentelemetry_proto", vec!["crates/runner/src/"]),
         ("ratatui", vec!["crates/execution/src/workflow/"]),
         ("crossterm", vec!["crates/execution/src/workflow/"]),
+        ("inquire", vec!["src/cli/grant/runner_picker.rs"]),
     ]
 }
 

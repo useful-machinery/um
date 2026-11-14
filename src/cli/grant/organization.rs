@@ -1,5 +1,7 @@
 //! The one organization a native grant `um grant create` makes is for (REQ-GRANT-72): the one
-//! `--organization` names, or else the member's only active membership.
+//! `--organization` names, or else the member's only active membership. The runner choice of
+//! `authorize` and `deauthorize` reads the member's active organizations here too
+//! (REQ-GRANT-81).
 
 use anyhow::anyhow;
 
@@ -28,12 +30,7 @@ pub(super) fn resolve(
     if let Some(named) = named {
         return self::named(api, named).map(Ok);
     }
-    let invalid = MemberGrantFailure::InvalidResponse {
-        credential_rejected: false,
-    };
-    let mut organizations = super::every_page(invalid, |cursor| {
-        api.active_organizations(Some(PAGE), cursor)
-    })?;
+    let mut organizations = active(api)?;
     if organizations.len() == 1 {
         let (id, slug) = organizations.remove(0);
         return Ok(Ok(Organization {
@@ -57,6 +54,17 @@ pub(super) fn resolve(
              {slugs}\n\nName the one it is for with --organization:\n  {example}"
         )
     }))
+}
+
+/// Every organization the member is an active member of, by ID and slug, read to the last
+/// page.
+pub(super) fn active(api: &MemberGrantApi) -> Result<Vec<(String, String)>, MemberGrantFailure> {
+    let invalid = MemberGrantFailure::InvalidResponse {
+        credential_rejected: false,
+    };
+    super::every_page(invalid, |cursor| {
+        api.active_organizations(Some(PAGE), cursor)
+    })
 }
 
 /// The organization `named` names: an ID as given, a slug to the ID of the organization it

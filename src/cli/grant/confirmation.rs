@@ -1,14 +1,15 @@
 //! The statement a leaf makes before it acts on a grant, and its `--yes`, which refuses a
 //! missing confirmation with that statement. `um grant` and the earlier commands it replaces
-//! share them.
+//! share them. The `[y/N]` question every grant command asks on a terminal is here too.
 
 use std::fmt;
-use std::io::{self, Write};
+use std::io::{self, BufRead, IsTerminal, Write};
 use std::marker::PhantomData;
 
 use clap::error::{ContextKind, ContextValue, ErrorKind};
 use clap::{ArgAction, ArgMatches, Args, FromArgMatches};
 
+use crate::exit_code::ExitCode;
 use um_api::MemberGrantKind;
 
 /// Who can use a native grant once a runner holds it (REQ-GRANT-35, REQ-GRANT-66).
@@ -80,6 +81,14 @@ pub(in crate::cli) trait Stated: Args {
     const STATEMENT: Statement;
     /// What the leaf does, as the refusal's remedy names it.
     const ACTION: &'static str;
+
+    /// Whether `matches` name no runner, so that the leaf offers the runners to choose from
+    /// (REQ-GRANT-81) and a missing `--yes` is left to it rather than refused before it runs,
+    /// to ask after the choice (REQ-GRANT-82): only `authorize` and `deauthorize` given no
+    /// `RUNNER` do.
+    fn chooses_runner(_matches: &ArgMatches) -> bool {
+        false
+    }
 }
 
 /// States `lines`, on standard error under `heading`: what a leaf is about to do.
@@ -95,14 +104,51 @@ pub(in crate::cli) fn state(
     Ok(())
 }
 
+/// Whether a grant command can ask the member: standard input and standard error both are
+/// terminals. Standard output may be piped, since it carries only the result.
+pub(super) fn can_ask() -> bool {
+    io::stdin().is_terminal() && io::stderr().is_terminal()
+}
+
+/// Asks `question` on standard error with `[y/N]` and reads one line of answer from standard
+/// input: whether it is yes. The grant commands ask every question this way.
+pub(super) fn ask(question: fmt::Arguments<'_>) -> io::Result<bool> {
+    let mut stderr = io::stderr().lock();
+    write!(stderr, "{question} [y/N] ")?;
+    stderr.flush()?;
+    let mut answer = String::new();
+    io::stdin().lock().read_line(&mut answer)?;
+    Ok(matches!(
+        answer.trim().to_ascii_lowercase().as_str(),
+        "y" | "yes"
+    ))
+}
+
+/// After the statement of a leaf whose runner was chosen from the list without `--yes`
+/// (REQ-GRANT-82, INV-CLI-16): asks whether to go on, the question `--yes` stands for. Any
+/// answer but yes is reported, having sent nothing, and the leaf exits 2.
+pub(super) fn go_on(asks: bool) -> anyhow::Result<Result<(), ExitCode>> {
+    if !asks || ask(format_args!("Continue?"))? {
+        return Ok(Ok(()));
+    }
+    writeln!(io::stderr().lock(), "error: not confirmed, nothing sent")?;
+    Ok(Err(ExitCode::UsageError))
+}
+
 /// The `--yes` of a `Stated` leaf `C`, required like `ConfirmationArgs`, whose absence is
 /// refused with the leaf's statement: clap's own refusal of a missing required argument cannot
-/// carry it.
-pub(in crate::cli) struct Confirmation<C>(PhantomData<fn() -> C>);
+/// carry it. A leaf that chooses the runner (`Stated::chooses_runner`) runs without it.
+pub(in crate::cli) struct Confirmation<C> {
+    /// Whether `--yes` was given: always, unless the leaf chooses the runner.
+    pub(in crate::cli) yes: bool,
+    stated: PhantomData<fn() -> C>,
+}
 
 impl<C> fmt::Debug for Confirmation<C> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("Confirmation")
+        f.debug_struct("Confirmation")
+            .field("yes", &self.yes)
+            .finish()
     }
 }
 
@@ -125,10 +171,14 @@ impl<C: Stated> Args for Confirmation<C> {
 
 impl<C: Stated> FromArgMatches for Confirmation<C> {
     fn from_arg_matches(matches: &ArgMatches) -> Result<Self, clap::Error> {
-        if matches.get_flag(YES) {
-            return Ok(Self(PhantomData));
+        let yes = matches.get_flag(YES);
+        if yes || C::chooses_runner(matches) {
+            return Ok(Self {
+                yes,
+                stated: PhantomData,
+            });
         }
-        let mut error = clap::Error::new(ErrorKind::MissingRequiredArgument);
+        let mut error = usage_error::<C>(ErrorKind::MissingRequiredArgument);
         error.insert(
             ContextKind::InvalidArg,
             ContextValue::Strings(vec![format!("--{YES}")]),
@@ -145,12 +195,6 @@ impl<C: Stated> FromArgMatches for Confirmation<C> {
                     .collect(),
             ),
         );
-        let name = C::COMMAND.rsplit(' ').next().unwrap_or(C::COMMAND);
-        let mut command = C::Usage::augment_args(clap::Command::new(name)).bin_name(C::COMMAND);
-        error.insert(
-            ContextKind::Usage,
-            ContextValue::StyledStr(command.render_usage()),
-        );
         Err(error)
     }
 
@@ -158,4 +202,18 @@ impl<C: Stated> FromArgMatches for Confirmation<C> {
         *self = Self::from_arg_matches(matches)?;
         Ok(())
     }
+}
+
+/// A usage error of kind `kind` with the usage of the leaf at `C::COMMAND`, which the error's
+/// context completes: an error a leaf raises as it reads its arguments is formatted with the
+/// root command, whose usage is not the leaf's.
+pub(super) fn usage_error<C: Stated>(kind: ErrorKind) -> clap::Error {
+    let mut error = clap::Error::new(kind);
+    let name = C::COMMAND.rsplit(' ').next().unwrap_or(C::COMMAND);
+    let mut command = C::Usage::augment_args(clap::Command::new(name)).bin_name(C::COMMAND);
+    error.insert(
+        ContextKind::Usage,
+        ContextValue::StyledStr(command.render_usage()),
+    );
+    error
 }

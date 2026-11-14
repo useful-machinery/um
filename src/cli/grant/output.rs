@@ -11,6 +11,7 @@ use super::authorization::{
 };
 use super::authorize::{MOVE_CODEX_GRANT, Outcome};
 use super::projection::{MemberStatus, PROVIDERS, grant_authorization_status, grant_subject};
+use super::runner_choice::{Nothing, Runner};
 use crate::exit_code::{ExitCode, OutcomeClass};
 use um_api::{MemberGrant, MemberGrantFailure, MemberGrantKind};
 
@@ -373,6 +374,106 @@ pub(super) fn write_ambiguous(
     Ok(ExitCode::UsageError)
 }
 
+/// A runner a command given no `RUNNER` offers (REQ-GRANT-81); a runner it found no
+/// registration of is named by its ID alone.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct OfferedRunnerView<'a> {
+    id: &'a str,
+    name: Option<&'a str>,
+    pool: Option<&'a str>,
+    connectivity: Option<&'a str>,
+    mode: Option<&'a str>,
+    organization_id: &'a str,
+}
+
+impl<'a> OfferedRunnerView<'a> {
+    fn new(runner: &'a Runner) -> Self {
+        let registration = runner.registration.as_ref();
+        Self {
+            id: &runner.id,
+            name: registration.map(|registration| registration.name.as_str()),
+            pool: registration.map(|registration| registration.pool.as_str()),
+            connectivity: registration.map(|registration| registration.connectivity.as_str()),
+            mode: registration.map(|registration| registration.mode.as_str()),
+            organization_id: &runner.organization_id,
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RunnerRequiredResult<'a> {
+    schema_version: u8,
+    deployment: &'a str,
+    outcome: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    grant_id: Option<&'a str>,
+    runners: Vec<OfferedRunnerView<'a>>,
+}
+
+/// Refuses a command given no `RUNNER` where it cannot prompt as a missing argument is refused
+/// (REQ-GRANT-81): exit 2, naming each runner offered by its name and ID under `diagnostic`,
+/// then the command line `example` that names one; under `--json`, one document with outcome
+/// `runner_required`.
+pub(super) fn write_runner_required(
+    deployment: &str,
+    grant_id: Option<&str>,
+    runners: &[Runner],
+    diagnostic: &str,
+    example: &str,
+    json: bool,
+) -> anyhow::Result<ExitCode> {
+    if json {
+        write_json(&RunnerRequiredResult {
+            schema_version: 1,
+            deployment,
+            outcome: "runner_required",
+            grant_id,
+            runners: runners.iter().map(OfferedRunnerView::new).collect(),
+        })?;
+    } else {
+        let mut stderr = io::stderr().lock();
+        writeln!(stderr, "error: {diagnostic}, one of:")?;
+        for runner in runners {
+            writeln!(stderr, "  {}", runner.line(false))?;
+        }
+        writeln!(stderr, "\nName one by its ID, for example:\n  {example}")?;
+    }
+    Ok(ExitCode::UsageError)
+}
+
+/// Reports that a command given no `RUNNER` has none to offer (REQ-GRANT-81), with exit 1 and
+/// a remedy.
+pub(super) fn write_nothing_offered(
+    deployment: &str,
+    nothing: Nothing,
+    json: bool,
+) -> anyhow::Result<ExitCode> {
+    let refused = |outcome, summary: &str, remedy: &str| {
+        ApiFailureReport::new(outcome, summary, remedy, OutcomeClass::GeneralFailure)
+    };
+    match nothing {
+        Nothing::RunnerNotFound => refused(
+            "runner_not_found",
+            "error: no runner found in the organizations the command can act in",
+            "Register a runner in the organization, then run the command again. List an organization's runners:\n  um runner list ORGANIZATION",
+        ),
+        Nothing::AlreadyAuthorized => refused(
+            "already_authorized",
+            "error: this grant is already authorized for every runner it can serve",
+            "Show the grant's authorizations:\n  um grant list GRANT",
+        ),
+        Nothing::AuthorizedElsewhere => authorized_elsewhere(),
+        Nothing::AuthorizationNotFound => refused(
+            "authorization_not_found",
+            "error: this grant is authorized for no runner",
+            "Authorize a runner for it first:\n  um grant authorize GRANT",
+        ),
+    }
+    .write(deployment, json)
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct RevokeResult<'a> {
@@ -590,6 +691,20 @@ fn write_grant_failure(
         writeln!(output, "grant: {} ({})", grant.id, grant.provider.as_str())?;
     }
     writeln!(output, "\n{}\n", report.remedy)
+}
+
+/// Reports, with its remedy, the refusal of the runner `named` among all a command acts on
+/// (REQ-GRANT-83), or the failure that ended the command at it.
+pub(super) fn write_runner_failure(
+    deployment: &str,
+    named: &str,
+    failure: &MemberGrantFailure,
+) -> io::Result<()> {
+    let report = report(deployment, failure);
+    let mut stderr = io::stderr().lock();
+    writeln!(stderr, "{}", report.summary)?;
+    writeln!(stderr, "runner: {named}")?;
+    writeln!(stderr, "\n{}\n", report.remedy)
 }
 
 /// A grant operation's failure as the member reads it: each refusal of REQ-GRANT-65 with exit

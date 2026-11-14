@@ -241,7 +241,10 @@ separate entity family.
   `organization deletion request`; of other leaves only `grant authorize` and
   `deauthorize`, and the hidden aliases of those two, have `--yes`. Those,
   `grant revoke` and its hidden alias check `--yes` themselves, refusing its
-  absence as clap does but with the statement of what the command will do. This set covers
+  absence as clap does but with the statement of what the command will do;
+  `grant authorize` and `deauthorize` given no `RUNNER` on a terminal ask a
+  `[y/N]` question after the runner is chosen instead of refusing a missing
+  `--yes`. This set covers
   permanent deletion, departure, delegation or invitation closure, and
   operations that invalidate a binding, credential, or live access. Reversible
   runner mode changes, including `runner disable` and `runner drain`, are not

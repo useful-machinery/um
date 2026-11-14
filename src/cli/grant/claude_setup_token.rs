@@ -41,6 +41,8 @@ const MARKER: &[u8] = b"sk-ant-";
 /// Why the sign-in produced no token to import (`provider_login_failed`).
 #[derive(Debug)]
 pub(in crate::cli) enum Failure {
+    /// Standard input is not a terminal, so the member could not answer the sign-in.
+    NoTerminal,
     NotFound,
     Exited(ExitStatus),
     /// A signal `um` received was passed to the sign-in.
@@ -52,6 +54,9 @@ pub(in crate::cli) enum Failure {
 impl Failure {
     const fn remedy(&self) -> &'static str {
         match self {
+            Self::NoTerminal => {
+                "Run claude setup-token where you can answer it and import the token it prints:\n  um grant create claude_code --token-file -"
+            }
             Self::NotFound => {
                 "Install Claude Code so that claude is on your PATH, or import the token claude setup-token printed with --token-file PATH."
             }
@@ -88,6 +93,7 @@ impl Failure {
 impl fmt::Display for Failure {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::NoTerminal => formatter.write_str("standard input is not a terminal"),
             Self::NotFound => formatter.write_str("claude not found on PATH"),
             Self::Exited(status) => write!(formatter, "run claude setup-token: {status}"),
             Self::Interrupted(_) => formatter.write_str("interrupted"),
@@ -98,11 +104,22 @@ impl fmt::Display for Failure {
     }
 }
 
+/// The failure a sign-in ends in before anything is run, read or sent when the member could
+/// not answer it: standard input is not a terminal (REQ-GRANT-71). `um grant create
+/// claude_code` asks this before its first request, and [`sign_in`] before anything else.
+pub(in crate::cli) fn unanswerable() -> Option<Failure> {
+    (!io::stdin().is_terminal()).then_some(Failure::NoTerminal)
+}
+
 /// Runs `claude setup-token` on a new pseudo-terminal with `CLAUDE_CONFIG_DIR` a new `0700`
 /// directory and returns the token it printed. The directory is removed whatever the outcome;
-/// failing to remove it is reported, not fatal. The outer error is a local fault; the inner
-/// one is the sign-in's.
+/// failing to remove it is reported, not fatal. Where standard input is not a terminal it runs
+/// nothing and fails as [`unanswerable`] says. The outer error is a local fault; the inner one
+/// is the sign-in's.
 pub(in crate::cli) fn sign_in() -> anyhow::Result<Result<Zeroizing<Vec<u8>>, Failure>> {
+    if let Some(failure) = unanswerable() {
+        return Ok(Err(failure));
+    }
     let Some(claude) = program::find(std::env::var_os("PATH").as_deref(), PROGRAM) else {
         return Ok(Err(Failure::NotFound));
     };
