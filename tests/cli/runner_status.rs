@@ -14,19 +14,49 @@ pub(super) fn write_status_config(
     socket_path: &std::path::Path,
 ) -> String {
     let config = directory.path().join("runner.json");
+    write_status_config_at(&config, socket_path);
+    config.to_string_lossy().into_owned()
+}
+
+/// Writes at `config` an operator configuration naming `socket_path` as its
+/// control socket and a state and work root a status must not read.
+pub(super) fn write_status_config_at(config: &std::path::Path, socket_path: &std::path::Path) {
     fs::write(
-        &config,
+        config,
         serde_json::to_vec(&serde_json::json!({
             "schemaVersion": 1,
             "deploymentMode": "production",
-            "runnerStatePath": directory.path().join("state-that-status-must-not-read.json"),
+            "runnerStatePath": config.with_file_name("state-that-status-must-not-read.json"),
             "controlSocketPath": socket_path,
             "workRoot": "/path-status-must-not-read"
         }))
         .unwrap(),
     )
     .unwrap();
-    config.to_string_lossy().into_owned()
+}
+
+/// The control socket request `um runner status` sends.
+pub(super) const STATUS_REQUEST: &[u8] = b"{\"schemaVersion\":1,\"operation\":\"status\"}\n";
+
+/// A live runner's answer to a status request: connected, one assignment
+/// running, boot `rbt_01k0z6r1w8f4jy2m7q9v3x5abc`.
+pub(super) const CONNECTED_STATUS: &[u8] = b"{\"schemaVersion\":1,\"outcome\":\"ok\",\"status\":{\"processState\":\"running\",\"bootId\":\"rbt_01k0z6r1w8f4jy2m7q9v3x5abc\",\"uptimeMilliseconds\":273600000,\"connectionState\":\"connected\",\"lastConnectedAt\":\"2026-08-06T19:00:00Z\",\"currentCredentialId\":\"rrc_01k0z6r1w8f4jy2m7q9v3x5abc\",\"assignmentCounts\":{\"preparing\":0,\"accepted\":0,\"running\":1,\"finishing\":0,\"reporting\":0}}}\n";
+
+/// The protected state of a host enrolled to connect to `endpoint`.
+pub(super) fn enrolled_state_document(endpoint: &str) -> serde_json::Value {
+    let credential_secret = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0_u8; 32]);
+    serde_json::json!({
+        "schemaVersion": 1,
+        "runnerId": "rnr_01k0z6r1w8f4jy2m7q9v3x5abc",
+        "connectionUrl": endpoint,
+        "currentCredential": {
+            "id": "rrc_01k0z6r1w8f4jy2m7q9v3x5abc",
+            "secret": credential_secret,
+            "activationId": "rna_01k0z6r1w8f4jy2m7q9v3x5abc",
+            "enrolledAt": "2026-08-06T12:00:00Z"
+        },
+        "updatedAt": "2026-08-06T12:00:00Z"
+    })
 }
 
 pub(super) struct ServeStatusFixture {
@@ -62,19 +92,7 @@ impl ServeStatusFixture {
         )
         .unwrap();
         let state_path = state_directory.join("runner.json");
-        let credential_secret = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0_u8; 32]);
-        let mut state = serde_json::json!({
-            "schemaVersion": 1,
-            "runnerId": "rnr_01k0z6r1w8f4jy2m7q9v3x5abc",
-            "connectionUrl": endpoint,
-            "currentCredential": {
-                "id": "rrc_01k0z6r1w8f4jy2m7q9v3x5abc",
-                "secret": credential_secret,
-                "activationId": "rna_01k0z6r1w8f4jy2m7q9v3x5abc",
-                "enrolledAt": "2026-08-06T12:00:00Z"
-            },
-            "updatedAt": "2026-08-06T12:00:00Z"
-        });
+        let mut state = enrolled_state_document(endpoint);
         if pending {
             let pending_secret =
                 base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([2_u8; 32]);
@@ -321,13 +339,8 @@ fn runner_status_queries_only_the_configured_local_socket() {
         let (mut stream, _) = listener.accept().unwrap();
         let mut request = [0_u8; 64];
         let read = stream.read(&mut request).unwrap();
-        assert_eq!(
-            &request[..read],
-            b"{\"schemaVersion\":1,\"operation\":\"status\"}\n"
-        );
-        stream
-            .write_all(b"{\"schemaVersion\":1,\"outcome\":\"ok\",\"status\":{\"processState\":\"running\",\"bootId\":\"rbt_01k0z6r1w8f4jy2m7q9v3x5abc\",\"uptimeMilliseconds\":273600000,\"connectionState\":\"connected\",\"lastConnectedAt\":\"2026-08-06T19:00:00Z\",\"currentCredentialId\":\"rrc_01k0z6r1w8f4jy2m7q9v3x5abc\",\"assignmentCounts\":{\"preparing\":0,\"accepted\":0,\"running\":1,\"finishing\":0,\"reporting\":0}}}\n")
-            .unwrap();
+        assert_eq!(&request[..read], STATUS_REQUEST);
+        stream.write_all(CONNECTED_STATUS).unwrap();
     });
 
     let output = run_with_env(

@@ -7,7 +7,6 @@ mod workflow_credentials;
 
 use std::collections::BTreeSet;
 use std::fmt;
-use std::path::PathBuf;
 
 use um_execution::{HarnessQualification, UntestedHarnessAdvisory};
 
@@ -17,6 +16,7 @@ use codex::CodexCheck;
 use git::GitCheck;
 use pi::PiCheck;
 
+pub use agent_logins::OperatorConfigSource;
 pub use git::{RepositoryRootError, repository_root};
 pub use workflow_credentials::{
     CredentialKind, CredentialOrigin, CredentialRequirement, CredentialSummary, Declaration,
@@ -232,10 +232,11 @@ impl Registry {
     }
 }
 
-/// The checks compiled into this executable. `config` is the runner operator
-/// configuration a check that needs it reads when it runs; no check reads it
-/// unless it is selected (REQ-RUNNERENROLL-45).
-pub fn built_in_registry(config: Option<PathBuf>) -> Result<Registry, RegistryError> {
+/// The checks compiled into this executable. `config` is where a check that
+/// needs the runner operator configuration finds it when it runs, `None` when
+/// nothing names one; no check reads it unless it is selected
+/// (REQ-RUNNERENROLL-45).
+pub fn built_in_registry(config: Option<OperatorConfigSource>) -> Result<Registry, RegistryError> {
     let mut registry = Registry::new();
     registry.register(Box::new(GitCheck::system()))?;
     registry.register(Box::new(PiCheck))?;
@@ -329,8 +330,8 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::{
-        CheckDescriptor, DoctorCheck, Outcome, Registry, RegistryError, SelectionError, Status,
-        built_in_registry,
+        CheckDescriptor, DoctorCheck, OperatorConfigSource, Outcome, Registry, RegistryError,
+        SelectionError, Status, built_in_registry,
     };
 
     struct FakeCheck {
@@ -654,11 +655,11 @@ mod tests {
         }
 
         fn run(&self) -> Outcome {
-            run_agent_logins(Some(self.config.clone()))
+            run_agent_logins(Some(OperatorConfigSource::File(self.config.clone())))
         }
     }
 
-    fn run_agent_logins(config: Option<std::path::PathBuf>) -> Outcome {
+    fn run_agent_logins(config: Option<OperatorConfigSource>) -> Outcome {
         let report = built_in_registry(config)
             .unwrap()
             .run(&["credentials.agent-logins".to_owned()])
@@ -845,7 +846,7 @@ mod tests {
         );
 
         let absent = host.config.with_file_name("no-such-runner.toml");
-        let outcome = run_agent_logins(Some(absent));
+        let outcome = run_agent_logins(Some(OperatorConfigSource::File(absent)));
         assert_eq!(
             (outcome.status, outcome.code),
             (Status::Fail, "config_invalid")
@@ -859,7 +860,7 @@ mod tests {
         // A readiness document the default run would fail on if it read it.
         host.record_codex("install_failed");
 
-        let report = built_in_registry(Some(host.config.clone()))
+        let report = built_in_registry(Some(OperatorConfigSource::File(host.config.clone())))
             .unwrap()
             .run(&[])
             .unwrap();

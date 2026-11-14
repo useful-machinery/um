@@ -82,6 +82,8 @@ mod runner_agent_login;
 mod runner_doctor_workflow;
 #[path = "cli/runner_enrollment.rs"]
 mod runner_enrollment;
+#[path = "cli/runner_home.rs"]
+mod runner_home;
 #[path = "cli/runner_status.rs"]
 mod runner_status;
 #[path = "cli/service_principal.rs"]
@@ -207,6 +209,7 @@ fn poll_until<T: std::fmt::Debug>(
 
 const ECHO_IDEMPOTENCY_KEY: &str = api_test_support::REQUEST_IDEMPOTENCY_KEY_ECHO;
 const CREDENTIALS_FILE_VARIABLE: &str = "UM_CREDENTIALS_FILE";
+const UM_HOME_VARIABLE: &str = "UM_HOME";
 const DEPLOYMENT_VARIABLES: [&str; 4] = [
     "UM_API_URL",
     "UM_AUTH_ISSUER",
@@ -225,6 +228,30 @@ const RUNNER_TELEMETRY_VARIABLES: [&str; 9] = [
     "OTEL_EXPORTER_OTLP_TIMEOUT",
 ];
 
+/// A fresh, empty `um` home a launched `um` receives as `UM_HOME` unless the
+/// test names its own, so no command reaches the real `$HOME/.um` (whose
+/// `runner/` may hold a live runner) of whoever runs the suite.
+struct IsolatedUmHome(tempfile::TempDir);
+
+impl IsolatedUmHome {
+    fn new() -> Self {
+        Self(tempfile::tempdir().expect("temporary um home should be created"))
+    }
+
+    fn apply_unless_given<Name: AsRef<str>, Value>(
+        &self,
+        command: &mut Command,
+        environment: &[(Name, Value)],
+    ) {
+        if !environment
+            .iter()
+            .any(|(name, _)| name.as_ref() == UM_HOME_VARIABLE)
+        {
+            command.env(UM_HOME_VARIABLE, self.0.path());
+        }
+    }
+}
+
 fn run(args: &[&str]) -> Output {
     run_with_env(args, &[])
 }
@@ -234,6 +261,7 @@ fn run_with_env(args: &[&str], environment: &[(&str, &str)]) -> Output {
 }
 
 fn run_with_stdin(args: &[&str], environment: &[(&str, &str)], standard_input: &[u8]) -> Output {
+    let um_home = IsolatedUmHome::new();
     let mut command = Command::new(env!("CARGO_BIN_EXE_um"));
     command
         .args(args)
@@ -247,6 +275,7 @@ fn run_with_stdin(args: &[&str], environment: &[(&str, &str)], standard_input: &
     {
         command.env_remove(variable);
     }
+    um_home.apply_unless_given(&mut command, environment);
     for (name, value) in environment {
         command.env(name, value);
     }
@@ -276,6 +305,7 @@ fn run_with_env_from(
         .expect("temporary credential directory should be private");
     let default_credential_path = credential_directory.path().join("credentials.json");
     let default_path = tempfile::tempdir().expect("temporary empty PATH should be created");
+    let um_home = IsolatedUmHome::new();
     let mut command = Command::new(env!("CARGO_BIN_EXE_um"));
     command.args(args).env_remove(CREDENTIALS_FILE_VARIABLE);
     for variable in DEPLOYMENT_VARIABLES
@@ -284,6 +314,7 @@ fn run_with_env_from(
     {
         command.env_remove(variable);
     }
+    um_home.apply_unless_given(&mut command, environment);
     if !environment
         .iter()
         .any(|(name, _)| *name == CREDENTIALS_FILE_VARIABLE)
@@ -1688,6 +1719,7 @@ fn concurrent_processes_exchange_one_rotating_refresh_token_once() {
     let api_url = server.api_url.clone();
     let issuer = server.issuer.clone();
     let environment = deployment_environment_with_issuer(&api_url, &issuer, credential_path);
+    let um_home = IsolatedUmHome::new();
     let command = || {
         let mut command = Command::new(env!("CARGO_BIN_EXE_um"));
         command
@@ -1697,6 +1729,7 @@ fn concurrent_processes_exchange_one_rotating_refresh_token_once() {
         command
             .env_remove(CREDENTIALS_FILE_VARIABLE)
             .env("PATH", "");
+        um_home.apply_unless_given(&mut command, &environment);
         for variable in DEPLOYMENT_VARIABLES {
             command.env_remove(variable);
         }
@@ -2261,8 +2294,10 @@ fn runner_doctor_does_not_load_human_configuration() {
     assert!(output.stderr.is_empty());
 }
 
-fn record_codex_readiness(directory: &tempfile::TempDir, state: &str) {
-    let path = directory.path().join(".runner-agent-logins.json");
+/// Records `state` for `codex` in the readiness document in `directory`, the
+/// directory of the runner's state.
+fn record_codex_readiness(directory: &Path, state: &str) {
+    let path = directory.join(".runner-agent-logins.json");
     fs::write(
         &path,
         serde_json::to_vec(&serde_json::json!({
@@ -2291,16 +2326,12 @@ fn runner_doctor_agent_logins_check_reads_the_recorded_readiness() {
     );
     let check = ["runner", "doctor", "--check", "credentials.agent-logins"];
 
-    let without_config = run(&check);
-    assert_eq!(without_config.status.code(), Some(1));
-    assert!(String::from_utf8_lossy(&without_config.stdout).contains("config_required"));
-
     let with_config = [check.as_slice(), &["--config", &config_path]].concat();
     let unknown = run(&with_config);
     assert_eq!(unknown.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&unknown.stdout).contains("readiness_unknown"));
 
-    record_codex_readiness(&runner_directory, "foreign_login");
+    record_codex_readiness(runner_directory.path(), "foreign_login");
     let failed = run(&with_config);
     assert_eq!(failed.status.code(), Some(1));
     let stdout = String::from_utf8_lossy(&failed.stdout);
@@ -2335,7 +2366,7 @@ fn runner_doctor_agent_logins_check_reads_the_recorded_readiness() {
         serde_json::json!({"passed": 0, "failed": 1})
     );
 
-    record_codex_readiness(&runner_directory, "ready");
+    record_codex_readiness(runner_directory.path(), "ready");
     let passed = run(&with_config);
     assert!(passed.status.success());
     // The check never reads the runner state, so its credential cannot reach the report.
@@ -2465,12 +2496,14 @@ fn privacy_and_malformed_configuration_make_no_otlp_request() {
     }
 }
 
+// REQ-RUNNERENROLL-30, REQ-RUNNERENROLL-109
 #[test]
-fn runner_serve_requires_one_configuration_and_rejects_removed_flags() {
-    let missing = run(&["runner", "serve"]);
-    assert_eq!(missing.status.code(), Some(2));
-    assert!(missing.stdout.is_empty());
-    assert!(String::from_utf8_lossy(&missing.stderr).contains("--config <PATH>"));
+fn runner_serve_defaults_to_the_runner_home_and_rejects_removed_flags() {
+    let unenrolled = run(&["runner", "serve"]);
+    assert_eq!(unenrolled.status.code(), Some(1));
+    assert!(unenrolled.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&unenrolled.stderr);
+    assert!(stderr.contains("um runner enroll"), "{stderr}");
 
     let directory = private_credential_directory();
     let config_path =

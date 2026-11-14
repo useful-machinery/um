@@ -14,7 +14,7 @@ const RUNNER_STATE_SCHEMA: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../schemas/runner-state-v1.schema.json"
 ));
-const OPERATOR_CONFIG_SCHEMA: &str = include_str!(concat!(
+pub(super) const OPERATOR_CONFIG_SCHEMA: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../schemas/runner-operator-config-v1.schema.json"
 ));
@@ -27,7 +27,7 @@ const TERMINAL_RECEIPT_SCHEMA: &str = include_str!(concat!(
     "/../../schemas/runner-enrollment-terminal-receipt-v1.schema.json"
 ));
 
-fn assert_json_matches_schema(format: &str, schema_source: &str, bytes: &[u8]) {
+pub(super) fn assert_json_matches_schema(format: &str, schema_source: &str, bytes: &[u8]) {
     let schema: serde_json::Value =
         serde_json::from_str(schema_source).expect("decode mirrored runner host schema");
     let document: serde_json::Value =

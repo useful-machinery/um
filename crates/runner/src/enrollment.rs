@@ -19,6 +19,10 @@ use um_support::generate_idempotency_key;
 use super::service::Backoff;
 use super::validation::{valid_secret_syntax, valid_typed_id};
 
+mod home;
+
+pub use home::{PublicationStage, RunnerHome, RunnerHomeError};
+
 const ARTIFACT_LIMIT: u64 = 4096;
 const CONFIG_LIMIT: u64 = 16 * 1024;
 const STATE_LIMIT: u64 = 64 * 1024;
@@ -181,14 +185,16 @@ impl From<&JoinKeyArtifact> for StagedJoinKey {
     }
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum DeploymentMode {
     Production,
     Development,
 }
 
-#[derive(Debug, Deserialize)]
+// The runner home writes the document it generates through the same
+// definition, so the field names exist once.
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 struct OperatorConfig {
     schema_version: u8,

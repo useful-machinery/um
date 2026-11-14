@@ -2,6 +2,7 @@ use super::*;
 
 use std::io::{BufRead as _, BufReader};
 use std::os::unix::net::{UnixListener, UnixStream};
+use std::path::PathBuf;
 
 use base64::Engine as _;
 use futures_util::{SinkExt as _, StreamExt as _};
@@ -13,10 +14,11 @@ use super::runner_status::{
     cloud_observation_ack, cloud_welcome, write_status_config,
 };
 
-const SYNC_REQUEST: &[u8] = b"{\"schemaVersion\":1,\"operation\":\"sync_agent_logins\"}\n";
+pub(super) const SYNC_REQUEST: &[u8] =
+    b"{\"schemaVersion\":1,\"operation\":\"sync_agent_logins\"}\n";
 
 /// The control socket's answer to a sync whose `codex` entry is `state`.
-fn synced_response(codex: &str) -> Vec<u8> {
+pub(super) fn synced_response(codex: &str) -> Vec<u8> {
     let mut response = serde_json::to_vec(&serde_json::json!({
         "schemaVersion": 1,
         "outcome": "synced",
@@ -35,14 +37,14 @@ fn synced_response(codex: &str) -> Vec<u8> {
     response
 }
 
-const READY_CODEX: &str = r#"{"provider":"codex","state":"ready","agentLoginId":"agl_01k0z6r1w8f4jy2m7q9v3x5abc","generation":3,"checkedAt":"2026-11-12T01:00:00Z","installedAt":"2026-11-12T00:55:00Z"}"#;
+pub(super) const READY_CODEX: &str = r#"{"provider":"codex","state":"ready","agentLoginId":"agl_01k0z6r1w8f4jy2m7q9v3x5abc","generation":3,"checkedAt":"2026-11-12T01:00:00Z","installedAt":"2026-11-12T00:55:00Z"}"#;
 
 /// The sync command (REQ-GRANT-41).
-const SYNC: [&str; 3] = ["runner", "grant", "sync"];
+pub(super) const SYNC: [&str; 3] = ["runner", "grant", "sync"];
 /// Its earlier spelling, which sends the same request and prints the same
 /// output with the same exit status, after a line on standard error naming
 /// `um runner grant sync` (REQ-GRANT-77).
-const EARLIER_SYNC: [&str; 3] = ["runner", "agent-login", "sync"];
+pub(super) const EARLIER_SYNC: [&str; 3] = ["runner", "agent-login", "sync"];
 
 const BUSY_RESPONSE: &[u8] =
     b"{\"schemaVersion\":1,\"outcome\":\"error\",\"error\":\"runner_busy\"}\n";
@@ -54,17 +56,7 @@ fn sync_against(command: [&str; 3], response: Vec<u8>, extra: &[&str]) -> (Outpu
     let directory = private_credential_directory();
     let runtime = tempfile::tempdir_in("/tmp").unwrap();
     let socket_path = runtime.path().join("runner.sock");
-    let listener = UnixListener::bind(&socket_path).unwrap();
-    let server = thread::spawn(move || {
-        let (stream, _) = listener.accept().unwrap();
-        let mut reader = BufReader::new(stream);
-        let mut request = Vec::new();
-        reader.read_until(b'\n', &mut request).unwrap();
-        // A command that never connected leaves only the closed stream
-        // below, which cannot take the answer.
-        let _ = reader.get_mut().write_all(&response);
-        request
-    });
+    let socket = ScriptedControlSocket::answering(&socket_path, response);
     let config = write_status_config(&directory, &socket_path);
     let mut args = command.to_vec();
     args.extend_from_slice(&["--config", &config]);
@@ -73,10 +65,43 @@ fn sync_against(command: [&str; 3], response: Vec<u8>, extra: &[&str]) -> (Outpu
         &args,
         &[("UM_API_URL", "https://cloud-sync-must-not-be-read.example")],
     );
-    // Release the server if the command exited without connecting, so the
-    // test fails on the empty request instead of waiting forever.
-    drop(UnixStream::connect(&socket_path));
-    (output, server.join().unwrap())
+    (output, socket.request())
+}
+
+/// A fake control socket that answers one request with a scripted response.
+pub(super) struct ScriptedControlSocket {
+    path: PathBuf,
+    server: thread::JoinHandle<Vec<u8>>,
+}
+
+impl ScriptedControlSocket {
+    /// Binds `path` and answers `response` to the first request line.
+    pub(super) fn answering(path: &Path, response: Vec<u8>) -> Self {
+        let listener = UnixListener::bind(path).unwrap();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream);
+            let mut request = Vec::new();
+            reader.read_until(b'\n', &mut request).unwrap();
+            // A command that never connected leaves only the closed stream
+            // below, which cannot take the answer.
+            let _ = reader.get_mut().write_all(&response);
+            request
+        });
+        Self {
+            path: path.to_owned(),
+            server,
+        }
+    }
+
+    /// The request the socket received, empty when the command never
+    /// connected.
+    pub(super) fn request(self) -> Vec<u8> {
+        // Release the server if the command exited without connecting, so the
+        // test fails on the empty request instead of waiting forever.
+        drop(UnixStream::connect(&self.path));
+        self.server.join().unwrap()
+    }
 }
 
 /// Runs `command --config PATH` with no runner listening on the socket the

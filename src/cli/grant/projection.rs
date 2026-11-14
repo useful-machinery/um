@@ -290,7 +290,7 @@ fn member_step(next_action: NextAction, subject: Subject<'_>) -> Option<String> 
             "authorize a runner with `um grant authorize {id} RUNNER --yes`"
         )),
         (NextAction::SyncRunner, _) => Some(
-            "on the runner's host, set grants up again with `um runner grant sync --config PATH`"
+            "on the runner's host, set grants up again with `um runner grant sync`"
                 .to_owned(),
         ),
         (NextAction::CheckTarget, _) => Some(

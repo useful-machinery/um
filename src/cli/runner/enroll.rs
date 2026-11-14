@@ -1,5 +1,5 @@
 use std::io::{self, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use clap::Args;
 
@@ -39,9 +39,9 @@ pub(super) struct Command {
     #[arg(
         long,
         value_name = "PATH",
-        help = "Read the closed runner operator configuration"
+        help = "Read the closed runner operator configuration; the runner home under the um home is the default, created where it is missing"
     )]
-    config: PathBuf,
+    config: Option<PathBuf>,
 
     #[command(flatten)]
     output: super::super::JsonArgs<super::super::RunnerJson>,
@@ -53,9 +53,12 @@ impl Command {
     }
 
     fn execute_enrollment(self) -> anyhow::Result<ExitCode> {
+        // One operator configuration serves the enrollment and the replacement's
+        // promotion, which reads the control socket path from the same file.
+        let config = super::initialized_operator_config_path(self.config.as_deref())?;
         let outcome = enroll(
             self.activation_file.as_deref(),
-            &self.config,
+            &config,
             self.replace_credential,
             self.resume,
         )
@@ -87,21 +90,25 @@ impl Command {
                 response,
                 replacement: true,
                 deployment,
-            } => {
-                self.finish_replacement(ReplacementEnrollment::from_response(response, deployment))
-            }
+            } => self.finish_replacement(
+                &config,
+                ReplacementEnrollment::from_response(response, deployment),
+            ),
             EnrollmentOutcome::ReplacementCredential {
                 runner_id,
                 credential_id,
                 deployment,
-            } => self.finish_replacement(ReplacementEnrollment {
-                deployment,
-                runner_id,
-                credential_id,
-                runner_name: None,
-                runner_pool_name: None,
-                cloud_outcome: "already_enrolled",
-            }),
+            } => self.finish_replacement(
+                &config,
+                ReplacementEnrollment {
+                    deployment,
+                    runner_id,
+                    credential_id,
+                    runner_name: None,
+                    runner_pool_name: None,
+                    cloud_outcome: "already_enrolled",
+                },
+            ),
             EnrollmentOutcome::Gone {
                 activation_id,
                 deployment,
@@ -128,8 +135,12 @@ impl Command {
         }
     }
 
-    fn finish_replacement(&self, enrollment: ReplacementEnrollment) -> anyhow::Result<ExitCode> {
-        let promotion = promote_replacement(&self.config, &enrollment);
+    fn finish_replacement(
+        &self,
+        config: &Path,
+        enrollment: ReplacementEnrollment,
+    ) -> anyhow::Result<ExitCode> {
+        let promotion = promote_replacement(config, &enrollment);
         if self.output.json {
             write_replacement_json(&mut io::stdout().lock(), &enrollment, promotion)?;
         } else {
@@ -300,10 +311,7 @@ impl PromotionFailure {
     }
 }
 
-fn promote_replacement(
-    config: &std::path::Path,
-    enrollment: &ReplacementEnrollment,
-) -> PromotionOutcome {
+fn promote_replacement(config: &Path, enrollment: &ReplacementEnrollment) -> PromotionOutcome {
     let Ok(socket) = um_runner::load_control_socket_path(config) else {
         return PromotionOutcome::Incomplete(PromotionFailure::StateUnavailable);
     };

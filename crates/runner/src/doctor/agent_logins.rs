@@ -4,19 +4,45 @@ use std::path::PathBuf;
 use super::{CheckDescriptor, DoctorCheck, Outcome, Status};
 use crate::agent_login::readiness::{ReadinessDocument, readiness_path};
 use crate::control_protocol::AgentLoginState;
-use crate::enrollment::load_runner_state_path;
+use crate::enrollment::{RunnerHome, load_runner_state_path};
 use crate::telemetry::io_error_class;
+
+/// Where a doctor check that needs the runner operator configuration finds it
+/// when it runs (REQ-RUNNERENROLL-45). Naming one reads nothing.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum OperatorConfigSource {
+    /// The file `--config` names.
+    File(PathBuf),
+    /// The runner home's configuration, the home's default layout when it
+    /// holds none (REQ-RUNNERENROLL-109).
+    Home(RunnerHome),
+}
+
+impl OperatorConfigSource {
+    /// `runnerStatePath`, read without taking the state lock or reading the
+    /// state; `None` when the configuration cannot be loaded. Creates nothing.
+    fn runner_state_path(&self) -> Option<PathBuf> {
+        match self {
+            Self::File(path) => load_runner_state_path(path).ok(),
+            Self::Home(home) => match home.existing_configuration() {
+                Ok(Some(path)) => load_runner_state_path(&path).ok(),
+                Ok(None) => Some(home.state_path()),
+                Err(_) => None,
+            },
+        }
+    }
+}
 
 /// `credentials.agent-logins` (REQ-RUNNERENROLL-86): reads the readiness the
 /// serving runner recorded beside its state. It takes no lock, contacts
 /// nothing and never reads the state file, so it never sees the runner
 /// credential; the readiness document holds no login material.
 pub(super) struct AgentLoginsCheck {
-    config: Option<PathBuf>,
+    config: Option<OperatorConfigSource>,
 }
 
 impl AgentLoginsCheck {
-    pub(super) const fn new(config: Option<PathBuf>) -> Self {
+    pub(super) const fn new(config: Option<OperatorConfigSource>) -> Self {
         Self { config }
     }
 }
@@ -34,11 +60,11 @@ impl DoctorCheck for AgentLoginsCheck {
         let Some(config) = &self.config else {
             return Outcome::fail(
                 "config_required",
-                "This check reads the runner's recorded readiness; name the runner operator configuration with --config PATH.",
+                "This check reads the runner's recorded readiness; set UM_HOME or HOME to locate the runner home, or name the runner operator configuration with --config PATH.",
                 BTreeMap::new(),
             );
         };
-        let Ok(state_path) = load_runner_state_path(config) else {
+        let Some(state_path) = config.runner_state_path() else {
             return Outcome::fail(
                 "config_invalid",
                 "The runner operator configuration is invalid.",

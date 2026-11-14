@@ -279,6 +279,100 @@ fn operator_config_path(path: &Path) -> anyhow::Result<PathBuf> {
         .with_context(|| format!("resolve runner operator configuration {}", path.display()))
 }
 
+/// The operator configuration of a command that prepares the host, `serve` and
+/// `enroll`: the file `--config` names, which touches no runner home, or else
+/// the runner home's, created where it is missing (REQ-RUNNERENROLL-109,
+/// REQ-RUNNERENROLL-110).
+fn initialized_operator_config_path(config: Option<&Path>) -> anyhow::Result<PathBuf> {
+    match config {
+        Some(path) => operator_config_path(path),
+        None => runner_home()?.initialize().map_err(runner_home_failure),
+    }
+}
+
+/// The control socket of a command that only asks the live runner, `status`
+/// and `grant sync`: the one the file `--config` names, which touches no runner
+/// home, or else the one the runner home's configuration names, the home's
+/// `runner/control.sock` when it holds none. Creates nothing
+/// (REQ-RUNNERENROLL-112).
+fn configured_control_socket_path(config: Option<&Path>) -> anyhow::Result<PathBuf> {
+    match config {
+        Some(path) => {
+            let config_path = operator_config_path(path)?;
+            um_runner::load_control_socket_path(&config_path).with_context(|| {
+                format!(
+                    "load runner operator configuration {}",
+                    config_path.display()
+                )
+            })
+        }
+        None => runner_home()?
+            .configured_control_socket_path()
+            .map_err(runner_home_failure),
+    }
+}
+
+/// Where `doctor`'s check that needs the operator configuration finds it when
+/// it runs: the file `--config` names, which touches no runner home, or else
+/// the runner home's; `None` when there is no `--config` and the `um` home
+/// cannot be located (REQ-RUNNERENROLL-45, REQ-RUNNERENROLL-86). Reads and
+/// creates nothing.
+fn doctor_operator_config(
+    config: Option<&Path>,
+) -> anyhow::Result<Option<um_runner::OperatorConfigSource>> {
+    Ok(match config {
+        Some(path) => Some(um_runner::OperatorConfigSource::File(operator_config_path(
+            path,
+        )?)),
+        None => located_runner_home()?.map(um_runner::OperatorConfigSource::Home),
+    })
+}
+
+/// The runner home of the `um` home the environment selects (REQ-WFDEF-17),
+/// for a command given no `--config`. Resolving it reads and creates nothing.
+fn runner_home() -> anyhow::Result<um_runner::RunnerHome> {
+    located_runner_home()?
+        .ok_or_else(|| unlocated_um_home(&um_execution::DefinitionError::HomeUnavailable))
+}
+
+/// The runner home of the `um` home the environment selects, `None` when
+/// neither `UM_HOME` nor `HOME` names one.
+fn located_runner_home() -> anyhow::Result<Option<um_runner::RunnerHome>> {
+    match um_execution::WorkflowHome::from_environment() {
+        Ok(um_home) => um_runner::RunnerHome::new(um_home.root())
+            .map(Some)
+            .map_err(runner_home_failure),
+        Err(um_execution::DefinitionError::HomeUnavailable) => Ok(None),
+        Err(error) => Err(unlocated_um_home(&error)),
+    }
+}
+
+fn unlocated_um_home(error: &um_execution::DefinitionError) -> anyhow::Error {
+    anyhow::anyhow!(
+        "locate the um home: {error}\n\nSet UM_HOME or HOME, or name the runner operator configuration with --config PATH."
+    )
+}
+
+fn runner_home_failure(error: um_runner::RunnerHomeError) -> anyhow::Error {
+    use um_runner::RunnerHomeError;
+    let remedy = match &error {
+        RunnerHomeError::UnsafeDirectory { path, .. } => format!(
+            "Make {} a directory owned by the current user with mode 0700, or name a runner operator configuration with --config PATH.",
+            path.display()
+        ),
+        RunnerHomeError::InvalidConfiguration { path, .. } => format!(
+            "Correct {}, or name another runner operator configuration with --config PATH.",
+            path.display()
+        ),
+        RunnerHomeError::StateConflict { config, .. } => format!(
+            "Correct runnerStatePath in {}, or name the runner operator configuration to use with --config PATH.",
+            config.display()
+        ),
+        _ => "Name a runner operator configuration with --config PATH.".to_owned(),
+    };
+    anyhow::anyhow!("{error}\n\n{remedy}")
+}
+
 enum CreateOutcome {
     Complete {
         registration: um_api::RunnerRegistration,

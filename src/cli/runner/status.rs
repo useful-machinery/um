@@ -1,7 +1,6 @@
 use std::io::{self, Write};
 use std::path::PathBuf;
 
-use anyhow::Context;
 use clap::Args;
 
 use crate::exit_code::{ExitCode, OutcomeClass};
@@ -12,20 +11,16 @@ pub(super) const ABOUT: &str = "Show live Runner Serve status";
 
 #[derive(Debug, Args)]
 pub(super) struct Command {
-    /// Read the control socket path from the closed runner operator configuration.
+    /// Read the control socket path from the closed runner operator
+    /// configuration; the runner home under the um home is the default, read
+    /// without creating anything.
     #[arg(long, value_name = "PATH")]
-    config: PathBuf,
+    config: Option<PathBuf>,
 }
 
 impl Command {
     pub(super) fn execute(self) -> super::super::CommandResult {
-        let config_path = super::operator_config_path(&self.config)?;
-        let socket_path = um_runner::load_control_socket_path(&config_path).with_context(|| {
-            format!(
-                "load runner operator configuration {}",
-                config_path.display()
-            )
-        })?;
+        let socket_path = super::configured_control_socket_path(self.config.as_deref())?;
         let response = um_runner::request(&socket_path, Operation::Status).map_err(|error| {
             let outcome = match error {
                 RequestFailure::NotReachable => OutcomeClass::Unreachable,

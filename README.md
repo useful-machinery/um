@@ -1064,12 +1064,13 @@ Every runner authorization `list` prints, and every provider you hold nothing fo
 `insufficient_permission`, `not_delivered` or `not_connected`) and one `nextAction`, and the
 text form names the command or step that next action means: `um grant create PROVIDER
 --replace` to reconnect, `um grant authorize GRANT RUNNER --yes` for a grant no runner is
-authorized for, `um runner grant sync --config PATH` on the runner's host after a failed
+authorized for, `um runner grant sync` on the runner's host after a failed
 delivery, and `um grant create PROVIDER` for a provider you hold nothing for. A runner that
 has not yet reported installing what Cloud holds is `pending` with `wait_for_runner`, and a
 login in place that no step has used yet at this generation is `unverified`.
 
-On the runner's host, `um runner grant sync --config PATH` asks the live runner to set up the
+On the runner's host, `um runner grant sync` asks the live runner, through the control socket
+its runner home's configuration names or, with `--config PATH`, that file's, to set up the
 agent logins authorized for it now and prints each provider's readiness; see
 [Runner serve](#runner-serve).
 
@@ -2308,7 +2309,10 @@ um runner doctor \
 um runner doctor \
   --check execution.harness.codex-app-server-v1
 
-# Check the agent-login readiness the serving runner recorded.
+# Check the agent-login readiness the runner serving from the runner home recorded.
+um runner doctor --check credentials.agent-logins
+
+# The same check for a service installation that names its configuration.
 um runner doctor \
   --check credentials.agent-logins --config /etc/um/runner.json
 
@@ -2407,17 +2411,22 @@ release newer than the qualification release. An untested installation still pas
 with code `ok`, and the command exits 0 when every selected check passes.
 
 The opt-in `credentials.agent-logins` check reads the readiness document
-`um runner serve` records beside `runnerStatePath`, found through `--config PATH`; no
-other check reads the configuration. It passes when every agent login Cloud authorized
+`um runner serve` records beside `runnerStatePath`, found through `--config PATH` or,
+without it, the runner home's configuration (see [Runner serve](#runner-serve)); a runner
+home that holds no configuration is read as its default layout, with the state at
+`runner/state.json`. No other check reads the configuration or anything under the `um`
+home, so the default checks run with neither `UM_HOME` nor `HOME` set. It passes when every agent login Cloud authorized
 for the runner is `ready` and was not refused at its last use, or Cloud authorized none
 (`revoked`, or `not_authorized` with no authorization in force), and otherwise fails with that
 provider's state as its code, such as `foreign_login`, `not_authorized` for a login whose
 authorization stands while Cloud refuses its owner, or `reconnect_required` for a `ready`
 login the provider refused at its last use. Its details name each provider's availability and next action as
 `<provider>_availability` and `<provider>_next_action`. It fails
-`readiness_unknown` when the runner has recorded no readiness yet, `config_invalid` for a
-configuration it cannot load, and `config_required` without `--config`. It takes no lock,
-never reads the runner credential, contacts nothing, and reports no login material.
+`readiness_unknown` when the runner has recorded no readiness yet, a runner home that holds
+no configuration included, `config_invalid` for a configuration it cannot load, and
+`config_required` when no `--config` is given and the `um` home cannot be located because
+neither `UM_HOME` nor `HOME` is set. It takes no lock, creates nothing, never reads the
+runner credential, contacts nothing, and reports no login material.
 
 Checks are registered statically by components compiled into this executable. The
 command does not load plugins or change runner configuration, and it reads human
@@ -2473,8 +2482,68 @@ commit a workflow value.
 
 `runner serve` uses the protected `rrc_` credential created by `runner enroll`, or by
 joining a pool with a join key when the service first starts; it never reads human OAuth
-credentials. Enrollment and service startup consume the same closed operator
-configuration:
+credentials. Enrollment, service startup, `runner status` and `runner grant sync` consume
+the same closed operator configuration. Without `--config` it is the runner home's: the
+directory `runner` under the `um` home (`$UM_HOME` when it is set and not empty, otherwise
+`$HOME/.um`, a relative home taken from the working directory) holds the configuration and
+the files it names:
+
+```text
+<um home>/runner/
+├── config.json     operator configuration
+├── state.json      enrolled state, written by runner enroll or by a join
+├── control.sock    control socket, created by a serving runner
+└── work/           work root
+```
+
+`runner serve` and `runner enroll` given no `--config` first create what the home lacks, on
+the host alone: the `um` home, `runner/` and `runner/work/`, each with mode `0700`, and
+`runner/config.json` with mode `0600`, holding `schemaVersion` 1, `deploymentMode`
+`production` and the absolute paths of `runner/state.json`, `runner/control.sock` and
+`runner/work`. Initialization writes no state, journal, lock or socket, contacts no Cloud
+deployment and registers or enrolls nothing; the command then proceeds as it does with
+`--config` naming that file. What exists is kept: a configuration already there is used as
+written and never rewritten, a directory already there keeps its mode and contents, and
+when several starts initialize one home together exactly one configuration is published
+and each of them reads it. They exit 1, having enrolled, joined and overwritten nothing,
+when `runner` is not a directory owned by the current user with mode `0700` (a link, a
+file, another owner or another mode), naming the owner and mode required; when
+`runner/config.json` is a link, a directory or a document that is not an operator
+configuration, reported as an invalid configuration; or when the configuration names a
+`runnerStatePath` other than the home's `runner/state.json` while a file exists there, as
+in a home that was moved or copied, reported as a conflict naming both paths.
+
+`runner status` and `runner grant sync` given no `--config` create and change nothing under
+the `um` home. When the runner home holds a configuration they ask the control socket it
+names, and one that does not load is their failure; when it holds none they ask
+`runner/control.sock`, so a home no runner serves from answers as an absent socket does,
+with exit 4. A command that reads the configuration, given no `--config` while neither
+`UM_HOME` nor `HOME` is set, exits 1 naming both variables and `--config`, having created
+nothing.
+
+```sh
+um runner enroll --activation-file /protected/path/activation.json
+um runner serve
+um runner status
+```
+
+A start that finds no enrolled state and is given no join key exits 1 saying the host is
+not enrolled and naming `um runner enroll --activation-file <PATH>` and
+`um runner serve --join-key-file <PATH>` as the ways to enroll it; it contacts no Cloud
+deployment.
+
+Another `UM_HOME` selects another runner home, and with it that home's workflow storage, so
+a second runner on one host is the same commands with, for example,
+`UM_HOME=/srv/um-two um runner serve`. The two homes serve at once, each with its own
+identity, while a second `runner serve` on one home is refused as it is for one
+`--config`. Where a person's sign-in is stored, a coding agent's own configuration
+directory such as `CLAUDE_CONFIG_DIR`, and the Cloud organization a command addresses do
+not follow `UM_HOME`.
+
+A service installation names a configuration with absolute paths owned by its service
+account with `--config PATH`, which is authoritative: the command uses that file as before
+and neither reads nor creates anything in the runner home. The file must exist, and the
+work root it names must exist before startup:
 
 ```json
 {
@@ -2485,8 +2554,6 @@ configuration:
   "workRoot": "/var/lib/um/work"
 }
 ```
-
-After enrollment has committed protected state, start the service with one value:
 
 ```sh
 um runner serve --config /etc/um/runner.json
@@ -2504,9 +2571,7 @@ either as a file or in the `UM_RUNNER_JOIN_KEY` environment variable, which hold
 key file's one line of JSON, for example from a platform's secret store:
 
 ```sh
-um runner serve \
-  --config /etc/um/runner.json \
-  --join-key-file /protected/path/builders.join-key.json
+um runner serve --join-key-file /protected/path/builders.join-key.json
 UM_RUNNER_JOIN_KEY="$BUILDERS_JOIN_KEY" um runner serve --config /etc/um/runner.json
 ```
 
@@ -2558,8 +2623,7 @@ Rotate a running host only with a replacement activation issued for its existing
 ```sh
 um runner enroll \
   --replace-credential \
-  --activation-file /protected/path/replacement-activation.json \
-  --config /etc/um/runner.json
+  --activation-file /protected/path/replacement-activation.json
 ```
 
 The command reports Cloud enrollment and live promotion separately. It stages the new
@@ -2591,8 +2655,8 @@ sets `CODEX_HOME` or has a Claude Code login of its own, that provider is report
 readiness once it has set up, and you can ask the live runner to set up now:
 
 ```sh
-um runner grant sync --config /etc/um/runner.json
-um runner grant sync --config /etc/um/runner.json --json
+um runner grant sync
+um runner grant sync --json
 ```
 
 The command goes only through the local control socket and prints one line per provider
@@ -2705,7 +2769,7 @@ For example, the receiver and its credential both remain under the operator's co
 ```sh
 OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=https://telemetry.example.test/v1/traces \
 OTEL_EXPORTER_OTLP_TRACES_HEADERS='authorization=Bearer%20operator-owned-token' \
-  um runner serve --config /etc/um/runner.json
+  um runner serve
 ```
 
 `OTEL_SDK_DISABLED` is the sole remote-export privacy switch. Case-insensitive `true`

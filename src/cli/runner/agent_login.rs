@@ -31,9 +31,11 @@ enum AgentLoginCommand {
 
 #[derive(Debug, Args)]
 struct SyncCommand {
-    /// Read the control socket path from the closed runner operator configuration.
+    /// Read the control socket path from the closed runner operator
+    /// configuration; the runner home under the um home is the default, read
+    /// without creating anything.
     #[arg(long, value_name = "PATH")]
-    config: PathBuf,
+    config: Option<PathBuf>,
 
     #[command(flatten)]
     output: JsonArgs<RunnerJson>,
@@ -97,13 +99,7 @@ impl SyncCommand {
     // REQ-GRANT-41: the live runner runs the setup pass; this command
     // contacts no Cloud deployment itself.
     fn execute(self) -> CommandResult {
-        let config_path = super::operator_config_path(&self.config)?;
-        let socket_path = um_runner::load_control_socket_path(&config_path).with_context(|| {
-            format!(
-                "load runner operator configuration {}",
-                config_path.display()
-            )
-        })?;
+        let socket_path = super::configured_control_socket_path(self.config.as_deref())?;
         let readiness = match um_runner::request(&socket_path, Operation::SyncAgentLogins) {
             Ok(Response::AgentLoginsSynced(readiness)) => readiness,
             Ok(Response::Error(error)) => return Err(control_failure(error)),
@@ -228,7 +224,7 @@ pub(super) fn runner_step(status: CredentialStatus, login: Option<Login<'_>>) ->
             "the owner of {agent_login} must be an active member of the organization again; it is theirs to settle, not the runner's"
         )),
         NextAction::SyncRunner => {
-            Some("set grants up again with `um runner grant sync --config PATH`".to_owned())
+            Some("set grants up again with `um runner grant sync`".to_owned())
         }
         NextAction::CheckTarget => Some(
             "the deployment does not serve this provider for the runner's operating system"

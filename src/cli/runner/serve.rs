@@ -25,9 +25,10 @@ const JOIN_KEY_VARIABLE: &str = "UM_RUNNER_JOIN_KEY";
 
 #[derive(Debug, Args)]
 pub(super) struct Command {
-    /// Read the closed runner operator configuration and enrolled state.
+    /// Read the closed runner operator configuration and enrolled state; the
+    /// runner home under the um home is the default, created where it is missing.
     #[arg(long, value_name = "PATH")]
-    config: PathBuf,
+    config: Option<PathBuf>,
 
     /// Join the key's pool from a protected file or explicit stdin when the
     /// host holds no enrolled state; UM_RUNNER_JOIN_KEY may hold the key instead.
@@ -41,12 +42,6 @@ impl Command {
             self.join_key_file.as_deref(),
             std::env::var_os(JOIN_KEY_VARIABLE),
         )?;
-        let config_path = super::operator_config_path(&self.config)?;
-        // A host whose state file is present holds enrolled state: it serves
-        // with it and never reads its join key, so a key that is gone or
-        // unreadable does not stop it, and a configuration or state that does
-        // not load is the start's failure. The journal its own completed join
-        // left is removed first, as the second copy of the credential secret it is.
         // Harness discovery runs before the operator configuration is judged,
         // so a start with an invalid configuration still reports what it found.
         let discover = || {
@@ -56,6 +51,22 @@ impl Command {
                 discover_and_validate_codex_installation,
             )
         };
+        // The runner home is prepared once the join key's source is known, so
+        // a key given both ways writes nothing, and before the host's state is
+        // judged. The image a key in the variable is handed to prepares it
+        // again and finds nothing to do.
+        let config_path = match super::initialized_operator_config_path(self.config.as_deref()) {
+            Ok(path) => path,
+            Err(error) => {
+                discover();
+                return Err(error.into());
+            }
+        };
+        // A host whose state file is present holds enrolled state: it serves
+        // with it and never reads its join key, so a key that is gone or
+        // unreadable does not stop it, and a configuration or state that does
+        // not load is the start's failure. The journal its own completed join
+        // left is removed first, as the second copy of the credential secret it is.
         let configuration_failure = |error| {
             discover();
             config_load_error(&config_path, error)
@@ -64,20 +75,26 @@ impl Command {
             match (Config::holds_enrolled_state(&config_path), join_key) {
                 (Err(error), _) => return Err(configuration_failure(error).into()),
                 // A host with no state file and no key has nothing to join
-                // with, so its configuration's load is the start's answer.
-                (Ok(true), join_key) | (Ok(false), join_key @ None) => {
-                    match (Config::load(&config_path), join_key) {
-                        (Err(error), _) => return Err(configuration_failure(error).into()),
-                        (Ok(_), Some(JoinKeySource::Variable(_))) => {
-                            return Err(restart_without_join_key_variable().into());
-                        }
-                        (Ok(config), _) => {
-                            um_runner::remove_completed_join_journal(&config_path)
-                                .context("remove the journal of the runner's completed join")?;
-                            (config, discover())
-                        }
+                // with: what can be checked of its configuration before a join
+                // keeps its own cause, and otherwise it is not enrolled.
+                (Ok(false), None) => {
+                    if let Err(error) = Config::validate_before_join(&config_path) {
+                        return Err(configuration_failure(error).into());
                     }
+                    discover();
+                    return Err(not_enrolled(&config_path, self.config.is_some()).into());
                 }
+                (Ok(true), join_key) => match (Config::load(&config_path), join_key) {
+                    (Err(error), _) => return Err(configuration_failure(error).into()),
+                    (Ok(_), Some(JoinKeySource::Variable(_))) => {
+                        return Err(restart_without_join_key_variable().into());
+                    }
+                    (Ok(config), _) => {
+                        um_runner::remove_completed_join_journal(&config_path)
+                            .context("remove the journal of the runner's completed join")?;
+                        (config, discover())
+                    }
+                },
                 // A host with no state file checks what it can of its
                 // configuration before it reads the key, in both images of a
                 // key given in the variable, so a host that cannot serve
@@ -109,6 +126,21 @@ impl Command {
             }
         }
     }
+}
+
+/// A start on a host that holds no enrolled state and was given no join key
+/// (REQ-RUNNERENROLL-30). The commands it names repeat `--config` when the
+/// start was given it.
+fn not_enrolled(config_path: &Path, explicit_config: bool) -> anyhow::Error {
+    let config = if explicit_config {
+        format!(" --config {}", config_path.display())
+    } else {
+        String::new()
+    };
+    anyhow::anyhow!(
+        "start runner with operator configuration {}: host is not enrolled\n\nEnroll the host with an activation an owner issued for it:\n  um runner enroll --activation-file <PATH>{config}\nOr start the runner with a join key a pool issued:\n  um runner serve --join-key-file <PATH>{config}",
+        config_path.display()
+    )
 }
 
 fn load_config(config_path: &Path) -> anyhow::Result<Config> {

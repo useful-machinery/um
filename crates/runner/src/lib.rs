@@ -30,17 +30,18 @@ pub use control_protocol::{
 };
 pub use doctor::{
     CheckDescriptor, CheckResult, CredentialKind, CredentialOrigin, CredentialRequirement,
-    CredentialSummary, Declaration, DeclarationKind, Node, NodeKind, OriginDeclaration, Outcome,
-    ReadinessCode, Registry, RegistryError, Report, RepositoryRootError, RepositorySource,
-    SelectionError, Status, Summary, UnknownCredential, UnknownDeclaration, WorkflowCredentials,
-    built_in_registry, read_workflow_credentials, repository_root,
+    CredentialSummary, Declaration, DeclarationKind, Node, NodeKind, OperatorConfigSource,
+    OriginDeclaration, Outcome, ReadinessCode, Registry, RegistryError, Report,
+    RepositoryRootError, RepositorySource, SelectionError, Status, Summary, UnknownCredential,
+    UnknownDeclaration, WorkflowCredentials, built_in_registry, read_workflow_credentials,
+    repository_root,
 };
 pub use enrollment::{
     ActivationArtifact, ActivationArtifactParts, EnrollmentError, EnrollmentOutcome,
     EnrollmentResponse, JoinKeyArtifact, JoinOutcome, JoinRefusal, PrivateArtifactError,
-    PrivateArtifactFile, ReplacementDisposition, enroll, join_unless_enrolled,
-    load_control_socket_path, remove_completed_join_journal, replacement_disposition,
-    write_activation_file,
+    PrivateArtifactFile, PublicationStage, ReplacementDisposition, RunnerHome, RunnerHomeError,
+    enroll, join_unless_enrolled, load_control_socket_path, remove_completed_join_journal,
+    replacement_disposition, write_activation_file,
 };
 pub use service::{Config, ConfigError};
 

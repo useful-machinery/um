@@ -9,7 +9,7 @@ use base64::Engine as _;
 const RUNNER_ID: &str = "rnr_01k0z6r1w8f4jy2m7q9v3x5abc";
 const CURRENT_CREDENTIAL_ID: &str = "rrc_01k0z6r1w8f4jy2m7q9v3x5abc";
 const PENDING_CREDENTIAL_ID: &str = "rrc_01k0z6r1w8f4jy2m7q9v3x5abd";
-const ACTIVATION_ID: &str = "rna_01k0z6r1w8f4jy2m7q9v3x5abd";
+pub(super) const ACTIVATION_ID: &str = "rna_01k0z6r1w8f4jy2m7q9v3x5abd";
 const CURRENT_SECRET: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
 const PENDING_SECRET: &str = "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI";
 
@@ -72,21 +72,10 @@ impl PendingEnrollmentFixture {
         .unwrap();
 
         let activation = root.path().join("replacement-activation.json");
-        fs::write(
+        write_private_json(
             &activation,
-            serde_json::to_vec_pretty(&serde_json::json!({
-                "schemaVersion": 1,
-                "activationUrl": format!(
-                    "http://127.0.0.1:1/v1/runner-enrollments/{ACTIVATION_ID}/activate"
-                ),
-                "activationToken": format!("{ACTIVATION_ID}.{CURRENT_SECRET}"),
-                "runnerId": RUNNER_ID,
-                "expiresAt": "2099-08-06T20:00:00Z"
-            }))
-            .unwrap(),
-        )
-        .unwrap();
-        fs::set_permissions(&activation, Permissions::from_mode(0o600)).unwrap();
+            &activation_artifact("http://127.0.0.1:1", ACTIVATION_ID),
+        );
 
         Self {
             _root: root,
@@ -110,6 +99,38 @@ impl PendingEnrollmentFixture {
             "--json",
         ]
     }
+}
+
+/// An activation artifact for `activation_id`, addressed to the Cloud at
+/// `base`, that enrolls `RUNNER_ID`.
+pub(super) fn activation_artifact(base: &str, activation_id: &str) -> serde_json::Value {
+    serde_json::json!({
+        "schemaVersion": 1,
+        "activationUrl": format!("{base}/v1/runner-enrollments/{activation_id}/activate"),
+        "activationToken": format!("{activation_id}.{CURRENT_SECRET}"),
+        "runnerId": RUNNER_ID,
+        "expiresAt": future_expiry()
+    })
+}
+
+/// Cloud's answer to an activation of `RUNNER_ID`: the credential
+/// `PENDING_CREDENTIAL_ID`, enrolled.
+pub(super) fn enrollment_body() -> serde_json::Value {
+    serde_json::json!({
+        "schemaVersion": 1,
+        "runnerId": RUNNER_ID,
+        "runnerName": "runner-test",
+        "organization": {
+            "id": "org_01k0z6r1w8f4jy2m7q9v3x5abc",
+            "displayName": "Test organization"
+        },
+        "runnerPool": {
+            "id": "rpl_01k0z6r1w8f4jy2m7q9v3x5abc",
+            "name": "builders"
+        },
+        "credentialId": PENDING_CREDENTIAL_ID,
+        "connectionUrl": "ws://127.0.0.1:1/v1/runner/connect"
+    })
 }
 
 fn accept_control_request(listener: &UnixListener) -> (UnixStream, Vec<u8>) {
@@ -137,36 +158,14 @@ fn enrolls_then_promotes_a_replacement_without_exposing_credential_material() {
 
     let cloud = TcpListener::bind("127.0.0.1:0").unwrap();
     let cloud_address = cloud.local_addr().unwrap();
-    let mut artifact: serde_json::Value =
-        serde_json::from_slice(&fs::read(&fixture.activation).unwrap()).unwrap();
-    artifact["activationUrl"] = serde_json::Value::String(format!(
-        "http://{cloud_address}/v1/runner-enrollments/{ACTIVATION_ID}/activate"
-    ));
-    fs::write(
-        &fixture.activation,
-        serde_json::to_vec_pretty(&artifact).unwrap(),
-    )
-    .unwrap();
-    fs::set_permissions(&fixture.activation, Permissions::from_mode(0o600)).unwrap();
+    write_private_json(
+        Path::new(&fixture.activation),
+        &activation_artifact(&format!("http://{cloud_address}"), ACTIVATION_ID),
+    );
     let cloud_server = thread::spawn(move || {
         let (mut stream, _) = cloud.accept().unwrap();
         let request = String::from_utf8(read_request(&mut stream)).unwrap();
-        let body = serde_json::to_vec(&serde_json::json!({
-            "schemaVersion": 1,
-            "runnerId": RUNNER_ID,
-            "runnerName": "runner-test",
-            "organization": {
-                "id": "org_01k0z6r1w8f4jy2m7q9v3x5abc",
-                "displayName": "Test organization"
-            },
-            "runnerPool": {
-                "id": "rpl_01k0z6r1w8f4jy2m7q9v3x5abc",
-                "name": "builders"
-            },
-            "credentialId": PENDING_CREDENTIAL_ID,
-            "connectionUrl": "ws://127.0.0.1:1/v1/runner/connect"
-        }))
-        .unwrap();
+        let body = serde_json::to_vec(&enrollment_body()).unwrap();
         write!(
             stream,
             "HTTP/1.1 201 Created\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -384,11 +383,11 @@ fn join_token() -> String {
     format!("{JOIN_KEY_ID}.{JOIN_SECRET}")
 }
 
-fn join_base(server: &api_test_support::ScriptedHttpServer) -> String {
+pub(super) fn join_base(server: &api_test_support::ScriptedHttpServer) -> String {
     server.api_url.trim_end_matches("/api/").to_owned()
 }
 
-fn join_key_artifact(base: &str, expires_at: &str) -> String {
+pub(super) fn join_key_artifact(base: &str, expires_at: &str) -> String {
     serde_json::json!({
         "schemaVersion": 1,
         "joinUrl": format!("{base}/v1/runner-join-keys/{JOIN_KEY_ID}/join"),
@@ -399,7 +398,7 @@ fn join_key_artifact(base: &str, expires_at: &str) -> String {
     .to_string()
 }
 
-fn join_response(index: usize, connection_url: &str) -> Vec<u8> {
+pub(super) fn join_response(index: usize, connection_url: &str) -> Vec<u8> {
     json_http_response(
         "201 Created",
         serde_json::json!({
@@ -535,41 +534,12 @@ impl JoinHost {
         environment: &[(&str, &str)],
         standard_input: Option<&str>,
     ) -> ServeProcess {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_um"));
-        command
-            .args(["runner", "serve", "--config", &self.config])
-            .args(arguments)
-            .env_remove(JOIN_KEY_VARIABLE)
-            .env("PATH", self.empty_path.path())
-            .stdin(if standard_input.is_some() {
-                Stdio::piped()
-            } else {
-                Stdio::null()
-            })
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped());
-        for variable in RUNNER_TELEMETRY_VARIABLES {
-            command.env_remove(variable);
-        }
-        command.env("OTEL_SDK_DISABLED", "true");
+        let mut command = serve_command(&["--config", &self.config]);
+        command.args(arguments).env("PATH", self.empty_path.path());
         for (name, value) in environment {
             command.env(name, value);
         }
-        let mut child = command.spawn().unwrap();
-        if let Some(standard_input) = standard_input {
-            let mut stdin = child.stdin.take().unwrap();
-            stdin.write_all(standard_input.as_bytes()).unwrap();
-        }
-        let mut stderr = child.stderr.take().unwrap();
-        let stderr = thread::spawn(move || {
-            let mut output = String::new();
-            let _ = stderr.read_to_string(&mut output);
-            output
-        });
-        ServeProcess {
-            child,
-            stderr: Some(stderr),
-        }
+        ServeProcess::start(command, standard_input)
     }
 
     fn state_document(&self) -> serde_json::Value {
@@ -582,23 +552,66 @@ fn write_private_json(path: &Path, document: &serde_json::Value) {
     fs::set_permissions(path, Permissions::from_mode(0o600)).unwrap();
 }
 
+/// `um runner serve ARGUMENTS` with telemetry off and no join key inherited
+/// from the suite's environment.
+pub(super) fn serve_command(arguments: &[&str]) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_um"));
+    command
+        .args(["runner", "serve"])
+        .args(arguments)
+        .env_remove(JOIN_KEY_VARIABLE);
+    for variable in RUNNER_TELEMETRY_VARIABLES {
+        command.env_remove(variable);
+    }
+    command.env("OTEL_SDK_DISABLED", "true");
+    command
+}
+
 /// A running `um runner serve`, killed when dropped.
-struct ServeProcess {
+pub(super) struct ServeProcess {
     child: Child,
     stderr: Option<thread::JoinHandle<String>>,
 }
 
 impl ServeProcess {
-    fn exited(&mut self) -> Option<ExitStatus> {
+    /// Starts `command`, given `standard_input` when there is one, with its
+    /// standard error collected.
+    pub(super) fn start(mut command: Command, standard_input: Option<&str>) -> Self {
+        command
+            .stdin(if standard_input.is_some() {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+        let mut child = command.spawn().unwrap();
+        if let Some(standard_input) = standard_input {
+            let mut stdin = child.stdin.take().unwrap();
+            stdin.write_all(standard_input.as_bytes()).unwrap();
+        }
+        let mut stderr = child.stderr.take().unwrap();
+        let stderr = thread::spawn(move || {
+            let mut output = String::new();
+            let _ = stderr.read_to_string(&mut output);
+            output
+        });
+        Self {
+            child,
+            stderr: Some(stderr),
+        }
+    }
+
+    pub(super) fn exited(&mut self) -> Option<ExitStatus> {
         self.child.try_wait().unwrap()
     }
 
-    fn wait_for_exit(mut self) -> (ExitStatus, String) {
+    pub(super) fn wait_for_exit(mut self) -> (ExitStatus, String) {
         let status = poll_until("Runner Serve exit", || self.exited(), Option::is_some).unwrap();
         (status, self.stderr.take().unwrap().join().unwrap())
     }
 
-    fn stop(mut self) -> String {
+    pub(super) fn stop(mut self) -> String {
         if self.exited().is_none() {
             self.child.kill().unwrap();
         }
@@ -616,13 +629,13 @@ impl Drop for ServeProcess {
 
 /// The fake Cloud's runner connection endpoint: it records each upgrade
 /// request and closes the connection, so the runner keeps reconnecting.
-struct ConnectionWitness {
-    url: String,
+pub(super) struct ConnectionWitness {
+    pub(super) url: String,
     requests: mpsc::Receiver<String>,
 }
 
 impl ConnectionWitness {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("ws://{}/v1/runner/connect", listener.local_addr().unwrap());
         let (sender, requests) = mpsc::channel();
@@ -640,7 +653,7 @@ impl ConnectionWitness {
         Self { url, requests }
     }
 
-    fn next_connection(&self, serve: &mut ServeProcess) -> Option<String> {
+    pub(super) fn next_connection(&self, serve: &mut ServeProcess) -> Option<String> {
         let mut received = None;
         poll_until(
             "runner connection",
@@ -656,7 +669,7 @@ impl ConnectionWitness {
     }
 }
 
-fn connection_bearer(serve: ServeProcess, witness: &ConnectionWitness) -> String {
+pub(super) fn connection_bearer(serve: ServeProcess, witness: &ConnectionWitness) -> String {
     let mut serve = serve;
     let Some(request) = witness.next_connection(&mut serve) else {
         let stderr = serve.stop();
@@ -667,7 +680,7 @@ fn connection_bearer(serve: ServeProcess, witness: &ConnectionWitness) -> String
     header_value(&request, "authorization").to_owned()
 }
 
-fn verifier_of(secret: &str) -> String {
+pub(super) fn verifier_of(secret: &str) -> String {
     let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(secret)
         .unwrap();
@@ -723,7 +736,7 @@ fn assert_join_request(request: &str, secret: &str) {
     assert!(!request.contains(secret));
 }
 
-fn future_expiry() -> String {
+pub(super) fn future_expiry() -> String {
     "2099-08-06T20:00:00Z".to_owned()
 }
 

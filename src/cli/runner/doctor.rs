@@ -186,11 +186,12 @@ impl Command {
                 connect.as_ref(),
             );
         }
-        let config = self
-            .config
-            .as_deref()
-            .map(super::operator_config_path)
-            .transpose()?;
+        // `--list-checks` runs no check, so it locates no configuration (REQ-RUNNERENROLL-45).
+        let config = if self.list_checks {
+            None
+        } else {
+            super::doctor_operator_config(self.config.as_deref())?
+        };
         let registry = built_in_registry(config).map_err(|error| anyhow!(error))?;
 
         if self.list_checks {
