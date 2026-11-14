@@ -987,14 +987,16 @@ um grant create --workflow workflow.yaml --replace
 
 # List every grant you hold: its ID, provider, kind, the account it acts as (an OAuth grant's
 # linked identity, a native grant's organization), its state and generation, and each runner
-# it is authorized for with that runner's availability and next action. Then name each
-# provider you hold nothing for. It reads every page; there is no --limit or --cursor.
+# it is authorized for with that runner's availability and next action and, for a native
+# grant, the last use the runner reported and when. Then name each provider you hold nothing
+# for. It reads every page; there is no --limit or --cursor.
 um grant list
 
 # Show one grant in detail: for a native grant what each runner was last delivered and
-# reported, its last use, and each ended authorization with its removal state and stop; for
-# an OAuth grant its scopes, last use and expiries. Name it by its ID, or by its provider
-# when you hold one grant of it.
+# reported, its last use and when, and for each runner whose authorization has ended the one
+# that ended last, with its removal state and stop, also after that runner is authorized
+# again; for an OAuth grant its scopes, last use and expiries. Name it by its ID, or by its
+# provider when you hold one grant of it.
 um grant list agl_01k0z6r1w8f4jy2m7q9v3x5abc
 um grant list codex --json
 
@@ -1047,10 +1049,12 @@ um grant revoke github --yes
 `list --json` prints one schema-version-1 document with outcome `listed`, `grants` (each with
 `id`, `provider`, `kind`, `account` with its `kind`, `id` and, where it is known, `name`,
 `label` where there is one, `state`, `generation`, `createdAt` and `authorizations`, each with
-`runnerId`, `organizationId`, `availability` and `nextAction`, or the grant's own
-`availability` and `nextAction` when no runner is authorized) and `notConnected`; `list GRANT
---json` prints outcome `shown` with `grant`. A provider name you hold no grant of reports
-`grant_not_found` and exits 1; one you hold several grants of exits 2 and names their IDs.
+`runnerId`, `organizationId`, `availability` and `nextAction` and, for a native grant whose
+runner reported a last use, `lastUse` (`accepted` or `refused`) and, where Cloud holds it,
+`lastUseAt`, or the grant's own `availability` and `nextAction` when no runner is authorized)
+and `notConnected`; `list GRANT --json` prints outcome `shown` with `grant`. A provider name
+you hold no grant of reports `grant_not_found` and exits 1; one you hold several grants of
+exits 2 and names their IDs.
 
 `create --json` prints newline-delimited events: `consent_required` with `sessionId`,
 `provider`, `authorizationUrl` and `expiresAt`, then `consent_result` with its `outcome`
@@ -1090,7 +1094,8 @@ text form names the command or step that next action means: `um grant create PRO
 authorized for, `um runner grant sync` on the runner's host after a failed
 delivery, and `um grant create PROVIDER` for a provider you hold nothing for. A runner that
 has not yet reported installing what Cloud holds is `pending` with `wait_for_runner`, and a
-login in place that no step has used yet at this generation is `unverified`.
+login in place that the runner has neither checked with its provider nor had a step use at
+this generation is `unverified`.
 
 On the runner's host, `um runner grant sync` asks the live runner, through the control socket
 its runner home's configuration names or, with `--config PATH`, that file's, to set up the
@@ -2767,8 +2772,14 @@ or Claude Code configuration, and offers them to each assignment as `CODEX_HOME`
 `environmentPassthrough` names that variable. Steps given the runner's `CODEX_HOME` read
 only its configuration there, not the service's own Codex configuration. While the service
 sets `CODEX_HOME` or has a Claude Code login of its own, that provider is reported
-`foreign_login` and nothing is installed for it. `um runner status` shows each provider's
-readiness once it has set up, and you can ask the live runner to set up now:
+`foreign_login` and nothing is installed for it. Runner Serve also checks a login with its
+provider by running that coding agent's own program once with the login, outside any run,
+with a fixed prompt that asks for a one-word answer: a login it installs when it starts or
+while it holds no assignment, and every `ready` login when you ask it to set up now. A check
+spends one model turn of the login owner's account at the provider, starts only while the
+runner holds no assignment, and is never made for an assignment's own setup. `um runner
+status` shows each provider's readiness once it has set up, and you can ask the live runner
+to set up now:
 
 ```sh
 um runner grant sync
@@ -2776,16 +2787,26 @@ um runner grant sync --json
 ```
 
 The command goes only through the local control socket and prints one line per provider
-with its state, its availability and, when there is something to do, its next action and
-the step it names (`codex login:       ready (generation 3), availability unverified`), or
-with `--json` a schema-version-1 `synced` document with `agentLogins`, each provider carrying
-`availability` and `nextAction`. A login is `unverified` until a step succeeds with it,
-`available` after, and `reconnect_required` once the provider refused it; only the agent
-login's owner can reconnect it. It exits 1 when a provider authorized for the runner is not
-`ready`, one Cloud refuses the owner of (`insufficient_permission`) included, or its login was
-refused at its last use, and 4 when Runner Serve is not reachable or holds an assignment (`runner_busy`). A
-Runner Serve process started from an older `um` refuses the request; restart it on this
-release.
+with its state, its availability, when there is something to do its next action and the
+step it names, and the login's last use and when
+(`codex login:       ready (generation 3), availability available · last use: accepted at 2026-11-13T09:30:00Z`),
+or with `--json` a schema-version-1 `synced` document with `agentLogins`, each provider
+carrying `availability` and `nextAction` and, for a login with one, `lastUse` and `lastUseAt`.
+The setup it asks for checks every `ready` login before it answers, so the command can take
+about a minute longer for each login whose provider is slow to answer. A login is
+`available` once a check or a step succeeded with it, `reconnect_required` once the provider
+refused one, and `unverified` until either has happened at this generation; only the agent
+login's owner can reconnect it. A check that gives no answer changes nothing: after the
+providers' lines the command prints one line naming that provider and the cause
+(`codex check:       no answer (program_unavailable)`), and `--json` lists it under
+`unansweredChecks` with its `provider` and `cause`, one of `program_unavailable` (Runner
+Serve found no supported `claude` or `codex` on its `PATH` when it started), `start_failed`,
+`timed_out` (no answer within 60 seconds) or `harness_error`. It exits 1 when a provider
+authorized for the runner is not `ready`, one Cloud refuses the owner of
+(`insufficient_permission`) included, or its login was refused at its last use, and 4 when
+Runner Serve is not reachable or holds an assignment (`runner_busy`); a check with no answer
+does not change the exit status. A Runner Serve process started from an older `um` refuses
+the request; restart it on this release.
 
 Runner startup selects `pi`, `claude`, and `codex` independently from its inherited
 operator-controlled `PATH`. Useful Machinery installs none of them. Each successful installation

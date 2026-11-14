@@ -170,10 +170,11 @@ fn assert_retained_native_session(root: &SyntheticClaudeCodeRoot, expected: &[&s
             ambient.display()
         );
     }
+    // The adapter removes the ambient project directory it created once it is
+    // empty, so one that remains holds an entry the harness left.
     let ambient_project = ambient_paths[0].parent().unwrap();
-    assert_eq!(
-        fs::read_dir(ambient_project).unwrap().count(),
-        0,
+    assert!(
+        !ambient_project.exists(),
         "ambient project history retained an unrelated entry"
     );
 }
@@ -724,11 +725,11 @@ async fn pinned_real_claude_code_04b_provider_overload_retries_and_stream_error_
         for ambient in &ambient_paths {
             assert!(!ambient.exists());
         }
-        assert_eq!(
-            fs::read_dir(ambient_paths[0].parent().unwrap())
-                .unwrap()
-                .count(),
-            0
+        // The adapter removes the ambient project directory it created once it
+        // is empty, so one that remains holds an entry the harness left.
+        assert!(
+            !ambient_paths[0].parent().unwrap().exists(),
+            "ambient project history retained an unrelated entry"
         );
         provider.shutdown().await;
 

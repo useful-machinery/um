@@ -3,16 +3,18 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicI64, Ordering};
 
 use super::*;
+use crate::agent_login::check::LoginCheckOutcome;
 use crate::agent_login::cloud::{
     CloudFailure, GrantTokenFailure, GrantTokenRequest, IssuedToken, LoginStatus, ProviderLogin,
 };
 use crate::agent_login::readiness::readiness_path;
+use crate::control_protocol::AgentLoginCheckCause;
 use crate::service::{
     CountedGate, FAKE_AGENT_LOGIN_ID, FAKE_AGENT_LOGIN_SENTINEL, FakeAgentLoginCloud,
-    fake_agent_login_material, fake_codex_authorized,
+    FakeLoginCheck, fake_agent_login_material, fake_codex_authorized,
 };
 use crate::telemetry::{TestCapture, test_recorder};
 
@@ -29,10 +31,13 @@ fn now() -> OffsetDateTime {
 struct Fixture {
     root: tempfile::TempDir,
     cloud: Arc<FakeAgentLoginCloud>,
+    check: Arc<FakeLoginCheck>,
     gate: Arc<CountedGate>,
     setup: Arc<AgentLoginSetup>,
     recorder: Arc<Recorder>,
     capture: TestCapture,
+    /// Seconds the setup's clock reads after `now()`.
+    clock: Arc<AtomicI64>,
 }
 
 impl Fixture {
@@ -50,8 +55,11 @@ impl Fixture {
         let state = root.path().join("state");
         fs::set_permissions(&state, fs::Permissions::from_mode(0o700)).unwrap();
         let cloud = FakeAgentLoginCloud::new(answer);
+        let check = FakeLoginCheck::new();
         let gate = Arc::new(CountedGate::idle());
         let (recorder, capture) = test_recorder("rbt_01k0z6r1w8f4jy2m7q9v3x5abc");
+        let clock = Arc::new(AtomicI64::new(0));
+        let elapsed = Arc::clone(&clock);
         let home = OsString::from(root.path().join("home"));
         let service_codex = OsString::from(root.path().join("service-codex"));
         let environment = ServiceEnvironment::from_lookup(|name| match name {
@@ -62,20 +70,23 @@ impl Fixture {
         let setup = Arc::new(AgentLoginSetup::new(
             SetupDependencies::new(
                 Arc::clone(&cloud) as Arc<dyn AgentLoginCloud>,
+                Arc::clone(&check) as Arc<dyn LoginCheck>,
                 environment,
                 &state.join("runner-state.json"),
                 Arc::clone(&recorder),
             ),
             Arc::clone(&gate) as Arc<dyn AssignmentGate>,
-            now,
+            move || now() + time::Duration::seconds(elapsed.load(Ordering::SeqCst)),
         ));
         Self {
             root,
             cloud,
+            check,
             gate,
             setup,
             recorder,
             capture,
+            clock,
         }
     }
 
@@ -271,6 +282,7 @@ async fn a_codex_login_the_runner_holds_is_removed_once_the_service_sets_codex_h
     let restarted = Arc::new(AgentLoginSetup::new(
         SetupDependencies::new(
             Arc::clone(&fixture.cloud) as Arc<dyn AgentLoginCloud>,
+            Arc::clone(&fixture.check) as Arc<dyn LoginCheck>,
             ServiceEnvironment::from_lookup(|name| {
                 (name == "CODEX_HOME").then(|| service_codex.clone())
             }),
@@ -684,9 +696,11 @@ async fn a_pass_that_cannot_read_or_replace_its_record_or_start_records_why() {
     let fixture = Fixture::new(Ok(Vec::new()));
     let outcome = fixture
         .setup
-        .run_pass_on(|_| Err(std::io::ErrorKind::WouldBlock.into()))
+        .set_up_on(SetupCaller::Schedule, |_| {
+            Err(std::io::ErrorKind::WouldBlock.into())
+        })
         .await;
-    assert_eq!(outcome, SetupOutcome::Failed);
+    assert_eq!(outcome.outcome, SetupOutcome::Failed);
     assert_eq!(fixture.cloud.status_requests(), 0);
     fixture.assert_pass_failure("agent_login_setup_spawn_failed", "io_error");
 }
@@ -951,6 +965,7 @@ impl Fixture {
         let setup = Arc::new(AgentLoginSetup::new(
             SetupDependencies::new(
                 cloud,
+                Arc::clone(&self.check) as Arc<dyn LoginCheck>,
                 ServiceEnvironment::from_lookup(|name| (name == "HOME").then(|| home.clone())),
                 &self.root.path().join("state/runner-state.json"),
                 Arc::clone(&self.recorder),
@@ -1793,8 +1808,13 @@ impl Fixture {
             .observe(um_execution::CODEX_LOGIN_VARIABLE, outcome);
     }
 
+    /// Moves the setup's clock `seconds` later.
+    fn advance_clock(&self, seconds: i64) {
+        self.clock.fetch_add(seconds, Ordering::SeqCst);
+    }
+
     /// The Codex last use each status request since the `since`th stated.
-    fn stated_codex_uses(&self, since: usize) -> Vec<Option<UseOutcome>> {
+    fn stated_codex_uses(&self, since: usize) -> Vec<Option<LastUse>> {
         self.cloud.reports()[since..]
             .iter()
             .map(|report| codex_report(report).last_use)
@@ -1833,7 +1853,7 @@ async fn a_noted_use_is_recorded_beside_its_install_and_stated_to_cloud() {
     // alone made the pass report again.
     assert_eq!(
         fixture.stated_codex_uses(asked),
-        [None, Some(UseOutcome::Refused)]
+        [None, used(UseOutcome::Refused)]
     );
     assert_eq!(fixture.cloud.deliveries(), 1);
     // A changed last use writes no record.
@@ -1847,7 +1867,7 @@ async fn a_noted_use_is_recorded_beside_its_install_and_stated_to_cloud() {
     );
     assert_eq!(
         fixture.stated_codex_uses(asked),
-        [Some(UseOutcome::Refused)]
+        [used(UseOutcome::Refused)]
     );
 
     // An accepted use noted afterwards replaces it.
@@ -1859,7 +1879,31 @@ async fn a_noted_use_is_recorded_beside_its_install_and_stated_to_cloud() {
     );
     assert_eq!(
         fixture.stated_codex_uses(asked),
-        [Some(UseOutcome::Refused), Some(UseOutcome::Accepted)]
+        [used(UseOutcome::Refused), used(UseOutcome::Accepted)]
+    );
+}
+
+// REQ-GRANT-52
+#[tokio::test]
+async fn a_later_use_with_the_same_outcome_is_reported_with_its_time() {
+    let fixture = Fixture::new(fake_codex_authorized(2));
+    fixture.pass().await;
+    fixture.note_codex_use(2, HarnessLoginOutcome::Accepted);
+    fixture.pass().await;
+
+    // A second accepted use, noted later, changes only the last use's time,
+    // and that alone makes the pass report again.
+    fixture.advance_clock(90);
+    fixture.note_codex_use(2, HarnessLoginOutcome::Accepted);
+    let asked = fixture.cloud.reports().len();
+    let later = Some(LastUse {
+        outcome: UseOutcome::Accepted,
+        at: now() + time::Duration::seconds(90),
+    });
+    assert_eq!(codex_last_use(&fixture.pass().await), later);
+    assert_eq!(
+        fixture.stated_codex_uses(asked),
+        [used(UseOutcome::Accepted), later]
     );
 }
 
@@ -1885,7 +1929,7 @@ async fn a_use_of_an_earlier_generation_is_dropped_and_an_ending_clears_the_last
     assert_eq!(codex.last_use, None);
     assert_eq!(
         fixture.stated_codex_uses(asked),
-        [Some(UseOutcome::Accepted), None]
+        [used(UseOutcome::Accepted), None]
     );
     assert_eq!(codex_last_use(&fixture.pass().await), None);
 
@@ -1905,7 +1949,7 @@ async fn a_use_of_an_earlier_generation_is_dropped_and_an_ending_clears_the_last
     assert_eq!(codex_last_use(&document), None);
     assert_eq!(
         fixture.stated_codex_uses(asked),
-        [Some(UseOutcome::Refused), None]
+        [used(UseOutcome::Refused), None]
     );
 }
 
@@ -1958,4 +2002,379 @@ async fn a_use_is_stated_to_cloud_only_beside_a_ready_install() {
                 || report.last_use.is_none())
     );
     assert!(fixture.setup.observer(Vec::new()).is_none());
+}
+
+impl Fixture {
+    /// A setup `um runner grant sync` asked for.
+    async fn sync(&self) -> SetupAnswer {
+        self.setup.set_up(SetupCaller::Sync).await
+    }
+
+    /// A setup that holds a `ready` Claude Code login at generation 1 with
+    /// no last use, installed by a setup whose check gave no answer.
+    async fn holding_claude_code() -> Self {
+        let fixture = Self::new(Ok(vec![authorized(AgentLoginProvider::ClaudeCode, 1)]));
+        let document = fixture.pass().await;
+        let claude_code = document.login(AgentLoginProvider::ClaudeCode).unwrap();
+        assert_eq!(claude_code.state, AgentLoginState::Ready);
+        assert_eq!(claude_code.last_use, None);
+        fixture
+    }
+
+    /// The logins checked since the `since`th check.
+    fn checked_since(&self, since: usize) -> Vec<(AgentLoginProvider, u64)> {
+        self.check.checked()[since..].to_vec()
+    }
+
+    /// The Claude Code last use each status request since the `since`th
+    /// stated.
+    fn stated_claude_code_uses(&self, since: usize) -> Vec<Option<LastUse>> {
+        self.cloud.reports()[since..]
+            .iter()
+            .map(|report| {
+                report
+                    .providers
+                    .iter()
+                    .find(|provider| provider.provider == AgentLoginProvider::ClaudeCode)
+                    .expect("the Claude Code report")
+                    .last_use
+            })
+            .collect()
+    }
+}
+
+fn claude_code_last_use(document: &ReadinessDocument) -> Option<LastUse> {
+    document
+        .login(AgentLoginProvider::ClaudeCode)
+        .and_then(|login| login.last_use)
+}
+
+/// The document a setup recorded and answered.
+fn recorded_by(answer: &SetupAnswer) -> &ReadinessDocument {
+    match &answer.outcome {
+        SetupOutcome::Recorded(document) => document,
+        other => panic!("setup did not record readiness: {other:?}"),
+    }
+}
+
+// REQ-GRANT-90, REQ-GRANT-52, REQ-GRANT-41, REQ-GRANT-25
+#[tokio::test]
+async fn a_sync_checks_each_ready_login_and_records_an_accepted_check_as_its_last_use() {
+    let fixture = Fixture::holding_claude_code().await;
+    fixture.check.answer(
+        AgentLoginProvider::ClaudeCode,
+        LoginCheckOutcome::Answered(UseOutcome::Accepted),
+    );
+    let (checks, asked) = (fixture.check.checked().len(), fixture.cloud.reports().len());
+
+    let answer = fixture.sync().await;
+
+    assert_eq!(
+        fixture.checked_since(checks),
+        [(AgentLoginProvider::ClaudeCode, 1)]
+    );
+    let document = recorded_by(&answer);
+    let accepted = Some(LastUse {
+        outcome: UseOutcome::Accepted,
+        at: now(),
+    });
+    assert_eq!(claude_code_last_use(document), accepted);
+    assert_eq!(fixture.recorded().as_ref(), Some(document));
+    assert!(answer.unanswered.is_empty(), "{answer:?}");
+    // The setup told Cloud before it ended: the second pass asked with what
+    // the first recorded and then reported the last use.
+    assert_eq!(
+        fixture.stated_claude_code_uses(asked).last(),
+        Some(&accepted)
+    );
+    let reported = document.reported().unwrap();
+    let entry = reported
+        .providers
+        .iter()
+        .find(|entry| entry.provider == AgentLoginProvider::ClaudeCode)
+        .unwrap();
+    assert_eq!(entry.last_use, Some(UseOutcome::Accepted));
+    assert!(entry.last_use_at.is_some());
+    assert_eq!(entry.failure_code(), None);
+}
+
+// REQ-GRANT-90, REQ-GRANT-52, REQ-GRANT-53
+#[tokio::test]
+async fn a_refused_check_is_recorded_and_the_login_reads_reconnect_required() {
+    let fixture = Fixture::holding_claude_code().await;
+    fixture.check.answer(
+        AgentLoginProvider::ClaudeCode,
+        LoginCheckOutcome::Answered(UseOutcome::Refused),
+    );
+
+    let answer = fixture.sync().await;
+
+    let document = recorded_by(&answer);
+    let claude_code = document.login(AgentLoginProvider::ClaudeCode).unwrap();
+    // A refused login stays installed and `ready` (REQ-GRANT-52).
+    assert_eq!(claude_code.state, AgentLoginState::Ready);
+    assert_eq!(claude_code.last_use, used(UseOutcome::Refused));
+    assert!(fixture.token_path().exists());
+    assert_eq!(fixture.recorded().as_ref(), Some(document));
+    let reported = document.reported().unwrap();
+    let entry = reported
+        .providers
+        .iter()
+        .find(|entry| entry.provider == AgentLoginProvider::ClaudeCode)
+        .unwrap();
+    assert_eq!(entry.failure_code(), Some("reconnect_required"));
+}
+
+// REQ-GRANT-90, REQ-GRANT-41
+#[tokio::test]
+async fn a_check_with_no_answer_changes_nothing_and_is_named_in_the_setups_answer() {
+    let fixture = Fixture::holding_claude_code().await;
+    fixture.check.answer(
+        AgentLoginProvider::ClaudeCode,
+        LoginCheckOutcome::Answered(UseOutcome::Accepted),
+    );
+    fixture.sync().await;
+    let earlier = fixture.recorded().unwrap();
+    assert_eq!(claude_code_last_use(&earlier), used(UseOutcome::Accepted));
+
+    for cause in [
+        AgentLoginCheckCause::ProgramUnavailable,
+        AgentLoginCheckCause::StartFailed,
+        AgentLoginCheckCause::TimedOut,
+        AgentLoginCheckCause::HarnessError,
+    ] {
+        fixture.advance_clock(90);
+        fixture.check.answer(
+            AgentLoginProvider::ClaudeCode,
+            LoginCheckOutcome::NoAnswer(cause),
+        );
+        let asked = fixture.cloud.reports().len();
+
+        let answer = fixture.sync().await;
+
+        let document = recorded_by(&answer);
+        // The last use and its time are exactly as they were, and the setup
+        // made no second pass.
+        assert_eq!(
+            claude_code_last_use(document),
+            claude_code_last_use(&earlier),
+            "{cause:?}"
+        );
+        assert_eq!(fixture.cloud.reports().len(), asked + 1, "{cause:?}");
+        assert_eq!(
+            answer.unanswered,
+            [UnansweredCheck {
+                provider: AgentLoginProvider::ClaudeCode,
+                cause,
+            }]
+        );
+    }
+}
+
+// REQ-GRANT-90
+#[tokio::test]
+async fn a_scheduled_setup_checks_only_a_login_it_installed() {
+    let fixture = Fixture::new(fake_codex_authorized(2));
+    fixture.pass().await;
+    assert_eq!(fixture.check.checked(), [(AgentLoginProvider::Codex, 2)]);
+
+    // Cloud authorizes a Claude Code login too: the setup that installs it
+    // checks it, and not the Codex login it already held.
+    fixture.cloud.answer(Ok(vec![
+        authorized(AgentLoginProvider::Codex, 2),
+        authorized(AgentLoginProvider::ClaudeCode, 1),
+    ]));
+    let document = fixture.pass().await;
+    assert_eq!(
+        state_of(&document, AgentLoginProvider::ClaudeCode),
+        AgentLoginState::Ready
+    );
+    assert_eq!(
+        fixture.checked_since(1),
+        [(AgentLoginProvider::ClaudeCode, 1)]
+    );
+
+    // A scheduled setup that installs nothing checks nothing.
+    fixture.pass().await;
+    assert_eq!(fixture.check.checked().len(), 2);
+}
+
+// REQ-GRANT-90, REQ-GRANT-49, INV-RUNNER-29
+#[tokio::test]
+async fn an_admissions_pass_checks_nothing_even_when_it_installs() {
+    let fixture = Fixture::new(fake_codex_authorized(1));
+    fixture.pass().await;
+    fixture.check.answer(
+        AgentLoginProvider::Codex,
+        LoginCheckOutcome::Answered(UseOutcome::Accepted),
+    );
+    let checks = fixture.check.checked().len();
+    fixture.cloud.answer(fake_codex_authorized(2));
+
+    let Some(SetupOutcome::Recorded(document)) = fixture
+        .setup
+        .set_up_admission(BOOT, ASSIGNMENT)
+        .agent_logins
+    else {
+        panic!("the admission's pass did not record readiness");
+    };
+
+    assert_eq!(
+        document
+            .login(AgentLoginProvider::Codex)
+            .and_then(LoginReadiness::installation)
+            .map(|installation| installation.generation),
+        Some(2)
+    );
+    assert_eq!(codex_last_use(&document), None);
+    assert_eq!(fixture.check.checked().len(), checks);
+}
+
+// REQ-GRANT-90, INV-RUNNER-29
+#[tokio::test]
+async fn no_check_starts_while_the_runner_holds_an_assignment() {
+    let fixture = Fixture::holding_claude_code().await;
+    fixture.check.answer(
+        AgentLoginProvider::ClaudeCode,
+        LoginCheckOutcome::Answered(UseOutcome::Accepted),
+    );
+    let checks = fixture.check.checked().len();
+
+    // An assignment starts once the sync's pass has finished: the pass is
+    // recorded, and no check starts.
+    fixture.gate.idle_calls.store(1, Ordering::SeqCst);
+    let answer = fixture.sync().await;
+    assert_eq!(claude_code_last_use(recorded_by(&answer)), None);
+    assert!(answer.unanswered.is_empty(), "{answer:?}");
+    assert_eq!(fixture.check.checked().len(), checks);
+
+    // While one is held throughout, as `CountedGate::busy()` is, the setup
+    // answers busy and checks nothing either.
+    fixture.gate.idle_calls.store(0, Ordering::SeqCst);
+    let answer = fixture.sync().await;
+    assert_eq!(answer.outcome, SetupOutcome::Busy(None));
+    assert_eq!(fixture.check.checked().len(), checks);
+}
+
+// REQ-GRANT-90, REQ-GRANT-52
+#[tokio::test]
+async fn a_check_noted_for_a_login_the_second_pass_ends_is_dropped() {
+    let fixture = Fixture::holding_claude_code().await;
+    fixture.check.answer(
+        AgentLoginProvider::ClaudeCode,
+        LoginCheckOutcome::Answered(UseOutcome::Accepted),
+    );
+    // Cloud still authorizes the login when the sync's pass asks, and has
+    // revoked it when its second pass does.
+    fixture.cloud.answer_next_then(
+        Ok(vec![authorized(AgentLoginProvider::ClaudeCode, 1)]),
+        Ok(vec![ProviderLogin {
+            status: LoginStatus::Revoked,
+            ..authorized(AgentLoginProvider::ClaudeCode, 1)
+        }]),
+    );
+
+    let answer = fixture.sync().await;
+
+    let document = recorded_by(&answer);
+    assert_eq!(
+        state_of(document, AgentLoginProvider::ClaudeCode),
+        AgentLoginState::Revoked
+    );
+    assert_eq!(claude_code_last_use(document), None);
+    assert!(!fixture.token_path().exists());
+
+    // Authorized again at the same generation, the login is installed
+    // anew without the dropped check's outcome.
+    fixture.check.answer(
+        AgentLoginProvider::ClaudeCode,
+        LoginCheckOutcome::NoAnswer(AgentLoginCheckCause::TimedOut),
+    );
+    fixture
+        .cloud
+        .answer(Ok(vec![authorized(AgentLoginProvider::ClaudeCode, 1)]));
+    let document = fixture.pass().await;
+    assert_eq!(
+        state_of(&document, AgentLoginProvider::ClaudeCode),
+        AgentLoginState::Ready
+    );
+    assert_eq!(claude_code_last_use(&document), None);
+}
+
+// REQ-TELEMETRY-45, REQ-GRANT-90
+#[tokio::test]
+async fn a_check_with_no_answer_is_recorded_with_its_stage_and_cause() {
+    let fixture = Fixture::holding_claude_code().await;
+    for (cause, name) in [
+        (
+            AgentLoginCheckCause::ProgramUnavailable,
+            "program_unavailable",
+        ),
+        (AgentLoginCheckCause::StartFailed, "start_failed"),
+        (AgentLoginCheckCause::TimedOut, "timed_out"),
+        (AgentLoginCheckCause::HarnessError, "harness_error"),
+    ] {
+        fixture.check.answer(
+            AgentLoginProvider::ClaudeCode,
+            LoginCheckOutcome::NoAnswer(cause),
+        );
+        let records = fixture.setup_records().len();
+
+        fixture.sync().await;
+
+        // The readiness did not change, and the setup's one record names
+        // the provider's check and its cause beside its state.
+        let new = &fixture.setup_records()[records..];
+        assert_eq!(new.len(), 1, "{new:?}");
+        let record = &new[0];
+        assert_eq!(record["um.agent_login.claude_code.state"], "ready");
+        assert_eq!(record["um.agent_login.claude_code.failure_stage"], "check");
+        assert_eq!(record["um.agent_login.claude_code.failure_cause"], name);
+        assert!(
+            record
+                .keys()
+                .all(|key| !key.starts_with("um.agent_login.codex.")),
+            "{record:?}"
+        );
+    }
+
+    // An accepted or refused check adds nothing, and neither does a setup
+    // that makes no check.
+    let records = fixture.setup_records().len();
+    for outcome in [UseOutcome::Accepted, UseOutcome::Refused] {
+        fixture.check.answer(
+            AgentLoginProvider::ClaudeCode,
+            LoginCheckOutcome::Answered(outcome),
+        );
+        fixture.sync().await;
+    }
+    fixture.pass().await;
+    assert_eq!(fixture.setup_records().len(), records);
+}
+
+// REQ-TELEMETRY-45
+#[tokio::test]
+async fn a_step_that_failed_in_the_setup_is_named_before_its_unanswered_check() {
+    // The setup installs the login, its closing status request fails, and the
+    // check of the login it installed gives no answer.
+    let fixture = Fixture::new(fake_codex_authorized(3));
+    let cloud = Arc::new(fixture.reporting(Some(CloudFailure::Transport)));
+    let records = fixture.setup_records().len();
+
+    let document = fixture.pass_asking(Arc::clone(&cloud)).await;
+
+    assert_eq!(
+        state_of(&document, AgentLoginProvider::Codex),
+        AgentLoginState::Ready
+    );
+    assert_eq!(cloud.reports().len(), 2);
+    assert_eq!(fixture.check.checked(), [(AgentLoginProvider::Codex, 3)]);
+    // The provider has one stage and cause in the record: the step that
+    // failed first, not the check.
+    let new = &fixture.setup_records()[records..];
+    assert_eq!(new.len(), 1, "{new:?}");
+    let record = &new[0];
+    assert_eq!(record["um.agent_login.codex.state"], "ready");
+    assert_eq!(record["um.agent_login.codex.failure_stage"], "status");
+    assert_eq!(record["um.agent_login.codex.failure_cause"], "transport");
 }

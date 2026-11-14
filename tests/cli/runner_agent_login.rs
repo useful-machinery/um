@@ -276,6 +276,108 @@ fn sync_reports_each_providers_availability_and_fails_a_login_refused_at_its_las
 
 // REQ-GRANT-41
 #[test]
+fn sync_prints_a_logins_last_use_with_its_time_where_the_runner_states_one() {
+    const LAST_USE_AT: &str = "2026-11-12T00:58:00Z";
+    let timed = READY_CODEX.replace(
+        r#""installedAt""#,
+        &format!(
+            r#""selected":true,"lastUse":"accepted","lastUseAt":"{LAST_USE_AT}","installedAt""#
+        ),
+    );
+    let (output, _) = sync_against(SYNC, synced_response(&timed), &["--json"]);
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let document: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let codex = &document["agentLogins"]["providers"][0];
+    assert_eq!(codex["lastUse"], "accepted", "{document}");
+    assert_eq!(codex["lastUseAt"], LAST_USE_AT, "{document}");
+
+    let (output, _) = sync_against(SYNC, synced_response(&timed), &[]);
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let line = stdout.lines().next().unwrap();
+    assert!(line.starts_with("codex login:"), "{stdout}");
+    assert!(line.contains("accepted"), "{line}");
+    assert!(line.contains(LAST_USE_AT), "{line}");
+
+    // A serving process that predates the time states the last use alone:
+    // it is printed without a time.
+    let untimed = READY_CODEX.replace(
+        r#""installedAt""#,
+        r#""selected":true,"lastUse":"accepted","installedAt""#,
+    );
+    let (output, _) = sync_against(SYNC, synced_response(&untimed), &[]);
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let line = stdout.lines().next().unwrap();
+    assert!(line.starts_with("codex login:"), "{stdout}");
+    assert!(line.contains("accepted"), "{line}");
+    assert!(!line.contains("2026-"), "{line}");
+}
+
+// REQ-GRANT-41
+#[test]
+fn sync_names_each_login_whose_check_gave_no_answer_without_changing_its_exit_status() {
+    let unanswered = |codex: &str| {
+        let mut response: serde_json::Value =
+            serde_json::from_slice(&synced_response(codex)).unwrap();
+        response["unansweredChecks"] =
+            serde_json::json!([{"provider": "codex", "cause": "program_unavailable"}]);
+        let mut response = serde_json::to_vec(&response).unwrap();
+        response.push(b'\n');
+        response
+    };
+    let refused = READY_CODEX.replace(
+        r#""installedAt""#,
+        r#""selected":true,"lastUse":"refused","installedAt""#,
+    );
+    // The exit status is what the readiness alone gives.
+    for (codex, code) in [(READY_CODEX.to_owned(), 0), (refused, 1)] {
+        let (output, request) = sync_against(SYNC, unanswered(&codex), &[]);
+        assert_eq!(request, SYNC_REQUEST);
+        assert_eq!(output.status.code(), Some(code), "{output:?}");
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        // One line per provider's readiness, and after them the check.
+        assert_provider_lines(
+            &stdout,
+            &[
+                (
+                    "codex",
+                    "ready",
+                    if code == 0 {
+                        "unverified"
+                    } else {
+                        "reconnect_required"
+                    },
+                ),
+                ("github", "not_delivered", "not_delivered"),
+                ("gitlab", "not_delivered", "not_delivered"),
+                ("linear", "not_delivered", "not_delivered"),
+            ],
+        );
+        let lines = stdout.lines().collect::<Vec<_>>();
+        assert_eq!(lines.len(), 5, "{stdout}");
+        let check = lines[4];
+        assert!(check.starts_with("codex "), "{stdout}");
+        assert!(check.contains("program_unavailable"), "{stdout}");
+
+        let (output, _) = sync_against(SYNC, unanswered(&codex), &["--json"]);
+        assert_eq!(output.status.code(), Some(code), "{output:?}");
+        let document: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(
+            document["unansweredChecks"],
+            serde_json::json!([{"provider": "codex", "cause": "program_unavailable"}])
+        );
+        assert_eq!(document["agentLogins"]["providers"][0]["provider"], "codex");
+    }
+
+    // A sync whose checks all answered carries no list.
+    let (output, _) = sync_against(SYNC, synced_response(READY_CODEX), &["--json"]);
+    let document: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(document.get("unansweredChecks").is_none(), "{document}");
+}
+
+// REQ-GRANT-41
+#[test]
 fn sync_exits_1_only_when_an_authorized_provider_is_not_ready() {
     for (codex, code) in [
         (
@@ -452,10 +554,14 @@ impl ServedRunner {
         let endpoint = format!("ws://{}/v1/runner/connect", listener.local_addr().unwrap());
         let fixture = ServeStatusFixture::new(&endpoint);
         let home = tempfile::tempdir().unwrap();
+        // No coding agent's program is on the service's `PATH`, so a check
+        // of a login gives no answer and never reaches a provider.
+        let empty_path = tempfile::tempdir().unwrap();
         serve_gateway_with_agent_logins(listener, agent_logins);
         let mut serve = Command::new(env!("CARGO_BIN_EXE_um"))
             .args(["runner", "serve", "--config", &fixture.config])
             .env("OTEL_SDK_DISABLED", "true")
+            .env("PATH", empty_path.path())
             .env("HOME", home.path())
             .env_remove("CODEX_HOME")
             .env_remove("CLAUDE_CODE_OAUTH_TOKEN")
@@ -540,7 +646,7 @@ fn a_runner_with_nothing_authorized_passes_against_a_cloud_without_the_routes() 
     );
 }
 
-// REQ-GRANT-36, REQ-GRANT-37, REQ-GRANT-42, REQ-GRANT-44
+// REQ-GRANT-36, REQ-GRANT-37, REQ-GRANT-42, REQ-GRANT-44, REQ-GRANT-90
 #[test]
 fn installed_agent_logins_reach_their_files_and_no_output() {
     let ServedRunner {
@@ -567,6 +673,16 @@ fn installed_agent_logins_reach_their_files_and_no_output() {
     );
     assert_eq!(synced["agentLogins"]["providers"][1]["state"], "ready");
     assert_eq!(synced["agentLogins"]["providers"][1]["generation"], 1);
+    // The sync checked both logins; without their programs neither check
+    // answered, which changes neither readiness nor the exit status.
+    assert_eq!(
+        synced["unansweredChecks"],
+        serde_json::json!([
+            {"provider": "codex", "cause": "program_unavailable"},
+            {"provider": "claude_code", "cause": "program_unavailable"}
+        ]),
+        "{synced}"
+    );
     // Both logins are in the runner's own directory beside its state, and
     // nothing is written under the service's home (REQ-GRANT-36,
     // REQ-GRANT-37).

@@ -56,10 +56,15 @@ impl Command {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-struct SyncOutput<'a> {
+struct SyncOutput<'a, Check: Serialize> {
     schema_version: u8,
     outcome: &'static str,
     agent_logins: ReadinessView<'a>,
+    /// Each login whose check in the setup gave no answer, with why, as
+    /// the control socket names them (REQ-GRANT-41); absent when there is
+    /// none.
+    #[serde(skip_serializing_if = "<[_]>::is_empty")]
+    unanswered_checks: &'a [Check],
 }
 
 /// The readiness the control socket returned, each provider with its
@@ -97,12 +102,12 @@ impl<'a> ReadinessView<'a> {
 }
 
 impl SyncCommand {
-    // REQ-GRANT-41: the live runner runs the setup pass; this command
-    // contacts no Cloud deployment itself.
+    // REQ-GRANT-41: the live runner runs the setup, checks included; this
+    // command contacts no Cloud deployment itself.
     fn execute(self) -> CommandResult {
         let socket_path = super::configured_control_socket_path(self.config.as_deref())?;
-        let readiness = match um_runner::request(&socket_path, Operation::SyncAgentLogins) {
-            Ok(Response::AgentLoginsSynced(readiness)) => readiness,
+        let synced = match um_runner::request(&socket_path, Operation::SyncAgentLogins) {
+            Ok(Response::AgentLoginsSynced(synced)) => synced,
             Ok(Response::Error(error)) => return Err(control_failure(error)),
             Ok(Response::Status(_) | Response::Reloaded { .. }) => {
                 return Err(CommandFailure::for_outcome(
@@ -121,6 +126,7 @@ impl SyncCommand {
                 ));
             }
         };
+        let readiness = &synced.readiness;
         let mut stdout = io::stdout().lock();
         if self.output.json {
             serde_json::to_writer_pretty(
@@ -128,13 +134,24 @@ impl SyncCommand {
                 &SyncOutput {
                     schema_version: 1,
                     outcome: "synced",
-                    agent_logins: ReadinessView::of(&readiness),
+                    agent_logins: ReadinessView::of(readiness),
+                    unanswered_checks: &synced.unanswered_checks,
                 },
             )
             .context("write agent-login readiness")?;
             writeln!(stdout).context("write agent-login readiness")?;
         } else {
-            write_readiness(&mut stdout, &readiness).context("write agent-login readiness")?;
+            write_readiness(&mut stdout, readiness)
+                .and_then(|()| {
+                    write_unanswered_checks(
+                        &mut stdout,
+                        synced
+                            .unanswered_checks
+                            .iter()
+                            .map(|check| (check.provider, check.cause)),
+                    )
+                })
+                .context("write agent-login readiness")?;
         }
         Ok(
             if readiness
@@ -171,8 +188,10 @@ fn control_failure(error: ControlError) -> CommandFailure {
 }
 
 /// Writes one line per provider: its readiness state, for a login the runner
-/// installed or a token it was issued the generation, and its availability
-/// with the next action and the step it names (REQ-GRANT-53, REQ-GRANT-88).
+/// installed or a token it was issued the generation, its availability with
+/// the next action and the step it names (REQ-GRANT-53, REQ-GRANT-88) and,
+/// for a login with one, its last use and when, the time left out where the
+/// serving process states none (REQ-GRANT-41).
 pub(super) fn write_readiness(
     output: &mut impl Write,
     readiness: &AgentLoginReadiness,
@@ -194,10 +213,38 @@ pub(super) fn write_readiness(
             };
             runner_step(status, Some(login))
         };
+        let last_use = match entry.last_use {
+            Some(last_use) => {
+                let last_use = super::status::enum_json(last_use)?;
+                match entry.last_use_at.as_deref() {
+                    Some(at) => format!(" · last use: {last_use} at {at}"),
+                    None => format!(" · last use: {last_use}"),
+                }
+            }
+            None => String::new(),
+        };
         writeln!(
             output,
-            "{label:<19}{state}{generation}, {}",
+            "{label:<19}{state}{generation}, {}{last_use}",
             status.text(step.as_deref())
+        )?;
+    }
+    Ok(())
+}
+
+/// Writes, after the readiness lines, one line per login whose check gave
+/// no answer, naming its provider and the cause (REQ-GRANT-41). A check
+/// with no answer says nothing of the login, so it changes no exit status.
+fn write_unanswered_checks<Provider: Serialize, Cause: Serialize>(
+    output: &mut impl Write,
+    checks: impl IntoIterator<Item = (Provider, Cause)>,
+) -> io::Result<()> {
+    for (provider, cause) in checks {
+        let label = format!("{} check:", super::status::enum_json(provider)?);
+        writeln!(
+            output,
+            "{label:<19}no answer ({})",
+            super::status::enum_json(cause)?
         )?;
     }
     Ok(())

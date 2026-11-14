@@ -27,6 +27,9 @@ pub struct AgentLoginReport {
     /// How the provider answered the last use of the login the runner stated with a `ready` report, omitted when it stated none.
     #[serde(rename = "lastUse", skip_serializing_if = "Option::is_none")]
     pub last_use: Option<LastUse>,
+    /// When the runner says that last use was, as the runner's clock stated it, to the microsecond; omitted when the runner stated no last use or no time for it.
+    #[serde(rename = "lastUseAt", skip_serializing_if = "Option::is_none")]
+    pub last_use_at: Option<String>,
     /// When Cloud recorded the report.
     #[serde(rename = "reportedAt")]
     pub reported_at: String,
@@ -39,6 +42,7 @@ impl AgentLoginReport {
             state,
             generation: None,
             last_use: None,
+            last_use_at: None,
             reported_at,
         }
     }

@@ -244,7 +244,7 @@ impl<'a> AdmittedFixture<'a> {
 // All clock, observation and validation fixtures live under this shared module.
 mod fixtures;
 pub(crate) use fixtures::{
-    ChannelObservationSink, ControlledClock, InlineValidationWorker, PendingClock,
+    ChannelObservationSink, ClockControl, ControlledClock, InlineValidationWorker, PendingClock,
     RecordingObservationSink,
 };
 pub(crate) use fixtures::{

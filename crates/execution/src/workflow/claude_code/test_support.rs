@@ -47,13 +47,13 @@ const THINKING_SIGNATURE: &str = "c2NoZXJ6by1sb29wYmFjay10aGlua2luZy1zaWduYXR1cm
 const STRUCTURED_OUTPUT_TOOL_NAME: &str = "StructuredOutput";
 
 #[derive(Clone)]
-pub(super) struct FixtureSignal {
+pub(crate) struct FixtureSignal {
     path: Arc<Path>,
     reader: Arc<fs::File>,
 }
 
 impl FixtureSignal {
-    pub(super) fn create(path: PathBuf) -> Self {
+    pub(crate) fn create(path: PathBuf) -> Self {
         mkfifo(&path, Mode::S_IRUSR | Mode::S_IWUSR).unwrap();
         let reader = fs::OpenOptions::new()
             .read(true)
@@ -67,11 +67,11 @@ impl FixtureSignal {
         }
     }
 
-    pub(super) fn path(&self) -> &Path {
+    pub(crate) fn path(&self) -> &Path {
         &self.path
     }
 
-    pub(super) async fn receive(&self) -> Vec<u8> {
+    pub(crate) async fn receive(&self) -> Vec<u8> {
         let reader = AsyncFd::new(self.reader.try_clone().unwrap()).unwrap();
         let mut signal = [0; 64];
         loop {

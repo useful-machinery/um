@@ -15,7 +15,7 @@ use crate::agent_login::{FailureCause, FailureStage, StepFailure, offer};
 use crate::control_protocol::{AgentLoginProvider, AgentLoginState};
 use crate::service::{
     CountedGate, FAKE_AGENT_LOGIN_ID, FAKE_AGENT_LOGIN_SENTINEL, FakeAgentLoginCloud,
-    fake_agent_login_material,
+    FakeLoginCheck, fake_agent_login_material,
 };
 use crate::telemetry::{TestCapture, test_recorder};
 
@@ -83,6 +83,7 @@ impl Fixture {
         let (recorder, capture) = test_recorder("rbt_01k0z6r1w8f4jy2m7q9v3x5abc");
         let dependencies = SetupDependencies::new(
             Arc::clone(&cloud) as Arc<dyn AgentLoginCloud>,
+            FakeLoginCheck::new(),
             environment,
             &state.path().join("runner-state.json"),
             recorder,

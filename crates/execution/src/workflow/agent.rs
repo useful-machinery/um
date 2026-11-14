@@ -1,5 +1,4 @@
 use std::future::Future;
-#[cfg(test)]
 use std::future::ready;
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::path::{Path, PathBuf};
@@ -558,11 +557,10 @@ pub trait AgentObservationSink: Clone + Send + Sync + 'static {
     fn observe(&self, observation: AgentObservationEnvelope) -> impl Future<Output = ()> + Send;
 }
 
-#[cfg(test)]
+/// Discards every observation: the login check reads only the invocation's outcome.
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct NoopAgentObservationSink;
 
-#[cfg(test)]
 impl AgentObservationSink for NoopAgentObservationSink {
     fn observe(&self, _observation: AgentObservationEnvelope) -> impl Future<Output = ()> + Send {
         ready(())

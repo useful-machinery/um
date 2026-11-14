@@ -278,6 +278,53 @@ struct ClaudeCodeNativeSessionBridge {
     transcript_target: PathBuf,
     transcript_link_name: OsString,
     links: Vec<OwnedAmbientSessionLink>,
+    // Dropped after `Drop::drop` has removed the links, so it finds the
+    // directories it removes empty of them.
+    _created_directories: CreatedAmbientDirectories,
+}
+
+/// The directories of the ambient project path the bridge created, outermost
+/// first. On drop it removes each one that is empty, innermost first, so the
+/// invocation leaves Claude Code's configuration directory as it found it
+/// unless the program itself wrote there (REQ-GRANT-37); a directory that was
+/// already present, or that holds anything, is kept.
+struct CreatedAmbientDirectories(Vec<PathBuf>);
+
+impl CreatedAmbientDirectories {
+    /// Creates `project` and any missing ancestor `0700`, recording the ones
+    /// absent beforehand. A directory another invocation creates or removes
+    /// meanwhile is safe either way: a removal only takes an empty directory,
+    /// and the recursive creation recreates a parent removed under it.
+    fn create(project: &Path) -> io::Result<Self> {
+        let mut absent = Vec::new();
+        let mut directory = Some(project);
+        while let Some(path) = directory {
+            match fs::symlink_metadata(path) {
+                Ok(_) => break,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    absent.push(path.to_path_buf());
+                    directory = path.parent();
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        absent.reverse();
+        let created = Self(absent);
+        let mut builder = fs::DirBuilder::new();
+        builder.recursive(true).mode(0o700);
+        builder.create(project)?;
+        Ok(created)
+    }
+}
+
+impl Drop for CreatedAmbientDirectories {
+    fn drop(&mut self) {
+        for directory in self.0.iter().rev() {
+            if fs::remove_dir(directory).is_err() {
+                break;
+            }
+        }
+    }
 }
 
 struct OwnedAmbientSessionLink {
@@ -334,10 +381,7 @@ impl ClaudeCodeNativeSessionBridge {
                 .join(native_project_slug(expected_cwd.to_str().ok_or(
                     AgentFailureCause::start_failure("launch preparation", "unavailable"),
                 )?));
-        let mut builder = fs::DirBuilder::new();
-        builder.recursive(true).mode(0o700);
-        builder
-            .create(&project)
+        let created_directories = CreatedAmbientDirectories::create(&project)
             .map_err(|error| AgentFailureCause::start_failure("claude project directory", error))?;
         let project = fs::canonicalize(project).map_err(|error| {
             AgentFailureCause::start_failure("claude project canonicalization", error)
@@ -350,6 +394,7 @@ impl ClaudeCodeNativeSessionBridge {
             transcript_target: transcript.clone(),
             transcript_link_name: transcript_link_name.clone(),
             links: Vec::with_capacity(2),
+            _created_directories: created_directories,
         };
         bridge.create_link(&transcript, transcript_link_name)?;
         bridge.create_link(&resources, OsString::from(session_id))?;

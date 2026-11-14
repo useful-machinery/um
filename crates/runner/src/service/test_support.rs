@@ -23,13 +23,15 @@ use tokio_tungstenite::{WebSocketStream, accept_hdr_async};
 use um_test_support::watchdog::{FIXTURE_WAIT_BASE, WatchdogExpired, host_scaled_timeout};
 
 use crate::agent_login::ServiceEnvironment;
+use crate::agent_login::check::{LoginCheck, LoginCheckOutcome};
 use crate::agent_login::cloud::{
     AgentLoginCloud, CloudFailure, Delivery, DeliveryFailure, DeliveryRefusal, DeliveryRequest,
     GrantAccessToken, GrantTokenFailure, GrantTokenRequest, IssuedToken, LoginMaterial,
     LoginStatus, ProviderLogin, StatusRequest,
 };
+use crate::agent_login::readiness::Installation;
 use crate::agent_login::setup::{AssignmentGate, SetupDependencies};
-use crate::control_protocol::AgentLoginProvider;
+use crate::control_protocol::{AgentLoginCheckCause, AgentLoginProvider};
 use crate::credential::Credential;
 use crate::service::config::{AssignmentConfig, Config, ConfigError, RepositoryUrlPolicy};
 use crate::service::connection::{ConnectionError, FrameSource, run_established_shared};
@@ -1281,8 +1283,60 @@ impl AssignmentGate for CountedGate {
     }
 }
 
+/// A login check for service tests: answers each provider as the test last
+/// set, and until then `program_unavailable`, as a runner without the
+/// coding agents' programs does. It keeps each login it was asked to check,
+/// as its provider and generation.
+pub(crate) struct FakeLoginCheck {
+    answers: Mutex<Vec<(AgentLoginProvider, LoginCheckOutcome)>>,
+    checked: Mutex<Vec<(AgentLoginProvider, u64)>>,
+}
+
+impl FakeLoginCheck {
+    pub(crate) fn new() -> Arc<Self> {
+        Arc::new(Self {
+            answers: Mutex::new(Vec::new()),
+            checked: Mutex::new(Vec::new()),
+        })
+    }
+
+    /// What later checks of `provider`'s login answer.
+    pub(crate) fn answer(&self, provider: AgentLoginProvider, outcome: LoginCheckOutcome) {
+        let mut answers = self.answers.lock().expect("fake check mutex poisoned");
+        answers.retain(|(answered, _)| *answered != provider);
+        answers.push((provider, outcome));
+    }
+
+    /// Each login checked so far, in order.
+    pub(crate) fn checked(&self) -> Vec<(AgentLoginProvider, u64)> {
+        self.checked
+            .lock()
+            .expect("fake check mutex poisoned")
+            .clone()
+    }
+}
+
+impl LoginCheck for FakeLoginCheck {
+    fn check(&self, provider: AgentLoginProvider, login: &Installation) -> LoginCheckOutcome {
+        self.checked
+            .lock()
+            .expect("fake check mutex poisoned")
+            .push((provider, login.generation));
+        self.answers
+            .lock()
+            .expect("fake check mutex poisoned")
+            .iter()
+            .find(|(answered, _)| *answered == provider)
+            .map_or(
+                LoginCheckOutcome::NoAnswer(AgentLoginCheckCause::ProgramUnavailable),
+                |(_, outcome)| *outcome,
+            )
+    }
+}
+
 /// Agent-login setup against `cloud` for a service whose `HOME` is `home`
-/// and whose protected state is in `state_directory`.
+/// and whose protected state is in `state_directory`, checking logins with
+/// a fresh `FakeLoginCheck`.
 pub(crate) fn fake_agent_login_setup(
     cloud: Arc<FakeAgentLoginCloud>,
     home: &Path,
@@ -1292,6 +1346,7 @@ pub(crate) fn fake_agent_login_setup(
     let home = std::ffi::OsString::from(home);
     SetupDependencies::new(
         cloud,
+        FakeLoginCheck::new(),
         ServiceEnvironment::from_lookup(|name| (name == "HOME").then(|| home.clone())),
         &state_directory.join("runner-state.json"),
         recorder,

@@ -35,12 +35,13 @@ pub use config::{Config, ConfigError};
 #[cfg(test)]
 pub(crate) use test_support::{
     CountedGate, FAKE_AGENT_LOGIN_ID, FAKE_AGENT_LOGIN_SENTINEL, FAKE_GRANT_ID,
-    FAKE_GRANT_TOKEN_SENTINEL, FakeAgentLoginCloud, FakeGrantToken, SleepRelease,
+    FAKE_GRANT_TOKEN_SENTINEL, FakeAgentLoginCloud, FakeGrantToken, FakeLoginCheck, SleepRelease,
     controlled_sleeper, fake_agent_login_material, fake_codex_authorized, fake_grant_expiry,
     fake_grant_token, with_watchdog,
 };
 
-use crate::agent_login::setup::{AgentLoginSetup, AssignmentGate, SetupDependencies};
+use crate::agent_login::check::ProgramLoginCheck;
+use crate::agent_login::setup::{AgentLoginSetup, AssignmentGate, SetupCaller, SetupDependencies};
 use crate::control_protocol::{AssignmentCounts, ConnectionFailure, ControlError};
 use crate::telemetry::{self, Event, Outcome, Recorder};
 use assignment::{AssignmentDependencies, AssignmentManager};
@@ -261,11 +262,11 @@ impl AssignmentGate for IdleAssignmentGate {
     }
 }
 
-/// The serving process's repeating agent-login setup: a pass at once, then
+/// The serving process's repeating agent-login setup: a setup at once, then
 /// one every `AGENT_LOGIN_SETUP_INTERVAL` on the service's sleeper, each
-/// publishing the readiness it recorded in the live status. A pass that
-/// finds an assignment held is skipped, not queued. Dropping the schedule
-/// stops it.
+/// checking a login it installed (REQ-GRANT-90) and publishing the
+/// readiness it recorded in the live status. A setup that finds an
+/// assignment held is skipped, not queued. Dropping the schedule stops it.
 struct AgentLoginSchedule {
     task: tokio::task::JoinHandle<()>,
 }
@@ -279,7 +280,8 @@ impl AgentLoginSchedule {
         Self {
             task: tokio::spawn(async move {
                 loop {
-                    let _ = control::set_up_agent_logins(&setup, &status).await;
+                    let _ =
+                        control::set_up_agent_logins(&setup, &status, SetupCaller::Schedule).await;
                     sleeper.sleep(AGENT_LOGIN_SETUP_INTERVAL).await;
                 }
             }),
@@ -439,9 +441,19 @@ async fn run_until_cancelled(config: Config, service_version: &str) -> Result<()
     let lease_clock = LeaseClock::system().map_err(ServiceError::LeaseClock)?;
     let mut shutdown = ProcessShutdown::new()?;
     let agent_login_setup = config.state_access().and_then(|state| {
+        // A login is checked with the programs `serve` validated when it
+        // started (REQ-GRANT-90).
+        let check = ProgramLoginCheck::new(
+            config.claude_code_installation().cloned(),
+            config.codex_installation().cloned(),
+            state.path(),
+            service_version,
+            execution::RunnerExecutionClock,
+        );
         SetupDependencies::enrolled(
             config.endpoint(),
             config.credential(),
+            Arc::new(check),
             state.path(),
             Arc::clone(&recorder),
         )

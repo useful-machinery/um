@@ -560,6 +560,136 @@ fn list_grant_shows_a_native_grants_exchange_and_ended_authorizations() {
     );
 }
 
+// REQ-GRANT-64: a runner authorized again keeps its last ended authorization listed, with
+// its removal state, beside the one in force.
+#[test]
+fn list_grant_shows_a_runners_ended_authorization_beside_its_authorization_in_force() {
+    const ENDED_ID: &str = "aga_01k0z6r1w8f4jy2m7q9v3x5abd";
+    const CONFIRMED_AT: &str = "2026-11-02T09:30:00Z";
+    let mut grant = native_grant_in_use();
+    grant["endedAuthorizations"] = serde_json::json!([{
+        "id": ENDED_ID,
+        "runnerId": RUNNER_ID,
+        "createdAt": "2026-11-01T09:10:00Z",
+        "delivery": {"generation": 1, "deliveredAt": "2026-11-01T09:11:00Z"},
+        "endedAt": "2026-11-02T09:00:00Z",
+        "removal": {"state": "confirmed", "confirmedAt": CONFIRMED_AT}
+    }]);
+    let in_force_id = grant["authorizations"][0]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let (server, _directory, credential) = prepared(vec![
+        one(&grant),
+        organization(),
+        one(&grant),
+        organization(),
+    ]);
+    let json = run_grant(&server, &credential, &["list", NATIVE_GRANT_ID, "--json"]);
+    let human = run_grant(&server, &credential, &["list", NATIVE_GRANT_ID]);
+
+    assert_eq!(
+        json.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&json.stderr)
+    );
+    let shown = json_output(&json);
+    assert_eq!(shown["grant"]["authorizations"][0]["id"], in_force_id);
+    assert_eq!(shown["grant"]["authorizations"][0]["runnerId"], RUNNER_ID);
+    assert_eq!(
+        shown["grant"]["endedAuthorizations"],
+        grant["endedAuthorizations"]
+    );
+
+    assert_eq!(human.status.code(), Some(0));
+    let text = stdout(&human);
+    let (in_force, ended) = text.split_once("ended authorizations: 1").unwrap();
+    assert!(in_force.contains(&in_force_id), "{text}");
+    assert!(in_force.contains(RUNNER_ID), "{text}");
+    let removal = format!("removal: confirmed at {CONFIRMED_AT}");
+    for name in [ENDED_ID, RUNNER_ID, removal.as_str()] {
+        assert!(ended.contains(name), "missing {name:?} in\n{text}");
+    }
+    server.finish();
+}
+
+// REQ-GRANT-64: both views print the last use a runner reported for a native grant and, where
+// Cloud holds it, when; a last use with no time prints alone.
+#[test]
+fn list_prints_a_native_authorizations_last_use_and_when() {
+    const LAST_USE_AT: &str = "2026-11-02T10:06:30Z";
+    let untimed = native_grant_in_use();
+    let mut timed = untimed.clone();
+    timed["authorizations"][0]["report"]["lastUseAt"] = LAST_USE_AT.into();
+    let cases = [
+        (timed, format!("last use: accepted at {LAST_USE_AT}")),
+        (untimed, "last use: accepted".to_owned()),
+    ];
+    for (grant, last_use) in &cases {
+        let (server, _directory, credential) = prepared(vec![
+            one(grant),
+            organization(),
+            one(grant),
+            organization(),
+            page(std::slice::from_ref(grant), None),
+            organization(),
+            page(std::slice::from_ref(grant), None),
+            organization(),
+        ]);
+        let detail_json = run_grant(&server, &credential, &["list", NATIVE_GRANT_ID, "--json"]);
+        let detail = run_grant(&server, &credential, &["list", NATIVE_GRANT_ID]);
+        let summary_json = run_grant(&server, &credential, &["list", "--json"]);
+        let summary = run_grant(&server, &credential, &["list"]);
+        for output in [&detail_json, &detail, &summary_json, &summary] {
+            assert_eq!(output.status.code(), Some(0), "{}", stderr(output));
+        }
+        let authorization = &grant["authorizations"][0];
+        let report = &authorization["report"];
+
+        // `list GRANT` carries the report as Cloud showed it and prints the last use with the
+        // exchange.
+        assert_eq!(
+            json_output(&detail_json)["grant"]["authorizations"][0]["report"],
+            *report
+        );
+        let text = stdout(&detail);
+        let (in_force, _) = text.split_once("ended authorizations: 1").unwrap();
+        assert!(
+            in_force.lines().any(|line| line.trim() == last_use),
+            "missing {last_use:?} in\n{text}"
+        );
+
+        // `list` carries the last use on the authorization and prints it between when the
+        // runner was authorized and its availability.
+        let mut expected = serde_json::json!({
+            "id": authorization["id"],
+            "runnerId": RUNNER_ID,
+            "organizationId": ORGANIZATION_ID,
+            "createdAt": authorization["createdAt"],
+            "lastUse": "accepted",
+            "availability": "available",
+            "nextAction": "none"
+        });
+        if let Some(time) = report.get("lastUseAt") {
+            expected["lastUseAt"] = time.clone();
+        }
+        assert_eq!(
+            json_output(&summary_json)["grants"][0]["authorizations"],
+            serde_json::json!([expected])
+        );
+        let text = stdout(&summary);
+        let lines: Vec<_> = text.lines().map(str::trim).collect();
+        let authorized = lines
+            .iter()
+            .position(|line| *line == "authorized: 2026-11-02T10:05:00Z")
+            .unwrap_or_else(|| panic!("no authorization in\n{text}"));
+        assert_eq!(lines[authorized + 1], last_use, "{text}");
+        assert_eq!(lines[authorized + 2], "availability: available", "{text}");
+        server.finish();
+    }
+}
+
 // REQ-GRANT-64
 #[test]
 fn list_grant_shows_an_oauth_grants_scopes_last_use_and_expiries() {

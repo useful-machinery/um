@@ -19,10 +19,12 @@ use super::assignment::AssignmentManager;
 use crate::agent_login::OfferedLogin;
 use crate::agent_login::grant_token::AssignmentGrantTokens;
 use crate::agent_login::readiness::ReadinessDocument;
-use crate::agent_login::setup::{AgentLoginSetup, SYNC_BOUND, SetupOutcome};
+use crate::agent_login::setup::{
+    AgentLoginSetup, SYNC_BOUND, SetupAnswer, SetupCaller, SetupOutcome,
+};
 use crate::control_protocol::{
     AgentLoginReadiness, ConnectionFailure, ConnectionState, ControlError, Operation, ProcessState,
-    Response, StatusSnapshot, decode_request, encode_response,
+    Response, StatusSnapshot, SyncedAgentLogins, decode_request, encode_response,
 };
 
 const RUNTIME_DIRECTORY_MODE: u32 = 0o700;
@@ -71,20 +73,30 @@ pub(super) struct ControlContext {
     pub(super) timeouts: ControlTimeouts,
 }
 
-/// Runs one agent-login setup pass and publishes the readiness it recorded
-/// in the live status, also when an assignment interrupted it after it had
-/// recorded an install or removal: `runner_busy` while the runner holds an
-/// assignment, and `state_update_failed` when the readiness could not be
-/// recorded.
+/// Runs one agent-login setup for `caller` and publishes the readiness it
+/// recorded in the live status, also when an assignment interrupted it
+/// after it had recorded an install or removal: answers that readiness with
+/// each login whose check gave no answer, `runner_busy` while the runner
+/// holds an assignment, and `state_update_failed` when the readiness could
+/// not be recorded. The live status carries no check's answer.
 pub(super) async fn set_up_agent_logins(
     setup: &Arc<AgentLoginSetup>,
     status: &LiveStatus,
-) -> Result<AgentLoginReadiness, ControlError> {
-    publish(setup.run_pass().await, status)
+    caller: SetupCaller,
+) -> Result<SyncedAgentLogins, ControlError> {
+    let SetupAnswer {
+        outcome,
+        unanswered,
+    } = setup.set_up(caller).await;
+    publish(outcome, status).map(|readiness| SyncedAgentLogins {
+        readiness,
+        unanswered_checks: unanswered,
+    })
 }
 
 /// Publishes in the live status the readiness a pass that ended with
-/// `outcome` recorded, and answers as `set_up_agent_logins` does.
+/// `outcome` recorded, and answers it, or the error `set_up_agent_logins`
+/// answers.
 fn publish(
     outcome: SetupOutcome,
     status: &LiveStatus,
@@ -568,9 +580,11 @@ async fn handle_connection(mut stream: UnixStream, context: ControlContext) {
             Some(setup) => {
                 // The pass publishes its readiness even if the answer is
                 // abandoned at the bound.
-                let sync = tokio::spawn(async move { set_up_agent_logins(&setup, &status).await });
+                let sync = tokio::spawn(async move {
+                    set_up_agent_logins(&setup, &status, SetupCaller::Sync).await
+                });
                 match control_timeout(timeouts.agent_login_sync, sync).await {
-                    Ok(Ok(Ok(readiness))) => Response::AgentLoginsSynced(readiness),
+                    Ok(Ok(Ok(synced))) => Response::AgentLoginsSynced(synced),
                     Ok(Ok(Err(error))) => Response::Error(error),
                     Ok(Err(_)) | Err(_) => Response::Error(ControlError::StateUpdateFailed),
                 }
@@ -625,7 +639,8 @@ mod tests {
     use crate::agent_login::cloud::{LoginStatus, ProviderLogin};
     use crate::agent_login::readiness::READINESS_FILE;
     use crate::control_protocol::{
-        AgentLoginProvider, AgentLoginState, AssignmentCounts, Response, decode_response,
+        AgentLoginCheckCause, AgentLoginProvider, AgentLoginState, AssignmentCounts, Response,
+        UnansweredCheck, decode_response,
     };
     use crate::credential::test_credential;
     use crate::service::assignment::test_support::manager;
@@ -724,9 +739,19 @@ mod tests {
         assert!(!String::from_utf8(before).unwrap().contains("agentLogins"));
 
         let response = exchange_in(context.clone(), SYNC_REQUEST).await;
-        let Response::AgentLoginsSynced(readiness) = decode_response(&response).unwrap() else {
+        let Response::AgentLoginsSynced(synced) = decode_response(&response).unwrap() else {
             panic!("sync request did not return readiness");
         };
+        // The setup checked the login it left `ready`, and the fake check,
+        // like a runner without the program, gave no answer (REQ-GRANT-90).
+        assert_eq!(
+            synced.unanswered_checks,
+            [UnansweredCheck {
+                provider: AgentLoginProvider::Codex,
+                cause: AgentLoginCheckCause::ProgramUnavailable,
+            }]
+        );
+        let readiness = synced.readiness;
         assert_eq!(cloud.status_requests(), 2);
         assert_eq!(cloud.deliveries(), 1);
         let states = readiness
@@ -771,6 +796,8 @@ mod tests {
             panic!("status request did not return a snapshot");
         };
         assert_eq!(status.agent_logins.as_ref(), Some(&readiness));
+        // The live status carries no check's answer.
+        assert!(!String::from_utf8_lossy(&after).contains("unansweredChecks"));
         for encoded in [response, after] {
             let encoded = String::from_utf8(encoded).unwrap();
             for forbidden in [

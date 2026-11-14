@@ -54,7 +54,7 @@ pub struct AgentLogin {
     /// The runners the agent login is authorized for, in force, oldest first.
     #[serde(rename = "authorizations")]
     pub authorizations: Vec<models::AgentLoginAuthorization>,
-    /// For each runner that has no authorization of the agent login in force, the authorization that ended last, in the order they ended (REQ-GRANT-13). The server always sends it, empty when there is none.
+    /// For each runner whose authorization of the agent login has ended, the authorization that ended last, whether or not that runner is authorized again, in the order they ended (REQ-GRANT-13). The server always sends it, empty when there is none.
     #[serde(
         rename = "endedAuthorizations",
         skip_serializing_if = "Option::is_none"

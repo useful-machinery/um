@@ -2376,7 +2376,7 @@ fn agent_installation_rejections_use_inherited_path_order_without_publication() 
     assert!(!incompatible_destination.exists());
 }
 
-// REQ-AGENT-10, REQ-AGENT-22, REQ-AGENT-24, REQ-AGENT-41, REQ-AGENT-63
+// REQ-AGENT-10, REQ-AGENT-22, REQ-AGENT-24, REQ-AGENT-41, REQ-AGENT-63, REQ-GRANT-37
 #[test]
 fn claude_code_only_run_pins_the_validated_executable_without_pi_or_path_fallback() {
     let replacement =
@@ -2513,10 +2513,9 @@ fn claude_code_only_run_pins_the_validated_executable_without_pi_or_path_fallbac
     for (path, expected) in runner_resources {
         assert_eq!(fs::read(path).unwrap(), expected);
     }
-    let ambient_projects = bundle.claude_config().join("projects");
-    for project in fs::read_dir(ambient_projects).unwrap() {
-        assert_eq!(fs::read_dir(project.unwrap().path()).unwrap().count(), 0);
-    }
+    // The configuration directory had no project path; the adapter removed
+    // the one it created with its links (REQ-GRANT-37).
+    assert!(!bundle.claude_config().join("projects").exists());
 }
 
 // REQ-AGENT-43, REQ-AGENT-44

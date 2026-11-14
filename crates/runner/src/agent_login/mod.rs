@@ -3,10 +3,12 @@
 //! runner's own agent-login directory, recording each provider's readiness,
 //! and offering what it keeps to each assignment it admits, once it has set
 //! them up for that admission (REQ-GRANT-49), noting how the provider
-//! answered each use of what it offered (REQ-GRANT-52). Each admission also
+//! answered each use of what it offered (REQ-GRANT-52), and checking a
+//! login it holds with its provider (REQ-GRANT-90). Each admission also
 //! asks Cloud for the grant tokens of its own assignment and keeps them
 //! until the assignment ends (REQ-GRANT-86).
 
+pub(crate) mod check;
 pub(crate) mod claude_code;
 pub(crate) mod cloud;
 pub(crate) mod codex;
@@ -24,7 +26,7 @@ use um_execution::{
     grant_token_environment_names,
 };
 
-use crate::control_protocol::{AgentLoginProvider, AgentLoginState};
+use crate::control_protocol::{AgentLoginCheckCause, AgentLoginProvider, AgentLoginState};
 use crate::telemetry;
 use directory::LoginDirectory;
 
@@ -125,6 +127,9 @@ pub(crate) enum FailureStage {
     Write,
     /// Removing the provider's file from it.
     Remove,
+    /// Checking the provider's installed login with its provider, which
+    /// gave no answer (REQ-GRANT-90).
+    Check,
 }
 
 impl FailureStage {
@@ -135,6 +140,7 @@ impl FailureStage {
             Self::Directory => "directory",
             Self::Write => "write",
             Self::Remove => "remove",
+            Self::Check => "check",
         }
     }
 }
@@ -151,6 +157,8 @@ pub(crate) enum FailureCause {
     /// Cloud's answer, or the material it delivered, is not one the runner
     /// may trust.
     InvalidResponse,
+    /// A check of the login gave no answer for this reason.
+    Check(AgentLoginCheckCause),
 }
 
 impl FailureCause {
@@ -162,6 +170,7 @@ impl FailureCause {
             Self::HttpStatus(_) => "http_status",
             Self::Transport => "transport",
             Self::InvalidResponse => "invalid_response",
+            Self::Check(cause) => cause.as_str(),
         }
     }
 }

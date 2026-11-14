@@ -126,14 +126,20 @@
           "type": "boolean"
         },
         "lastUse": {
-          "description": "How the provider answered the last use of the login installed, as the readiness document records it, without its time.",
+          "description": "How the provider answered the last use of the login installed, as the readiness document records it.",
           "enum": ["accepted", "refused"]
+        },
+        "lastUseAt": {
+          "description": "When that last use was, as the readiness document records it; absent where a serving process that predates it answers.",
+          "type": "string",
+          "format": "date-time"
         }
       },
       "dependentRequired": {
         "generation": ["agentLoginId", "installedAt"],
         "installedAt": ["generation"],
-        "lastUse": ["generation"]
+        "lastUse": ["generation"],
+        "lastUseAt": ["lastUse"]
       }
     },
     "brokeredAgentLogin": {
@@ -197,7 +203,23 @@
       "properties": {
         "schemaVersion": { "const": 1 },
         "outcome": { "const": "synced" },
-        "agentLogins": { "$ref": "#/$defs/agentLoginReadiness" }
+        "agentLogins": { "$ref": "#/$defs/agentLoginReadiness" },
+        "unansweredChecks": {
+          "description": "Each installed login whose check in the setup gave no answer, with why; absent when there is none.",
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/unansweredCheck" }
+        }
+      }
+    },
+    "unansweredCheck": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["provider", "cause"],
+      "properties": {
+        "provider": { "enum": ["claude_code", "codex"] },
+        "cause": { "enum": ["program_unavailable", "start_failed", "timed_out", "harness_error"] }
       }
     },
     "errorResponse": {

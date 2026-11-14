@@ -115,6 +115,10 @@ pub use workflow::local_run::{
     lock_holder, positioned_element, read_durable_record, read_local_run_status,
     retain_cloud_continuation_evidence, retain_cloud_workflow_evidence, wait_child,
 };
+pub use workflow::login_check::{
+    HarnessLoginCheck, HarnessLoginCheckCause, HarnessLoginCheckStage, check_claude_code_login,
+    check_codex_login,
+};
 pub use workflow::observation::{
     ExecutionObservation, ExecutionObserver, ExecutionSettlement, ObservedExecutions,
     ObservedStepTransition, SettledExecution, StartedExecution, TransitionObservation,

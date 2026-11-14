@@ -196,38 +196,45 @@ fn status_names_claude_code_with_the_record_schema_versions_this_build_installs(
 
 // REQ-GRANT-25, REQ-GRANT-52
 #[test]
-fn status_states_the_last_use_only_of_a_ready_install() {
+fn status_states_the_last_use_and_its_time_only_of_a_ready_install() {
     let installed = || {
         Some(InstalledLogin {
             agent_login_id: AGENT_LOGIN.to_owned(),
             generation: 2,
         })
     };
-    for (installed, state, last_use, stated) in [
+    let at = OffsetDateTime::from_unix_timestamp(1_794_450_000).unwrap();
+    let used = |outcome| Some(LastUse { outcome, at });
+    let at = Some("2026-11-12T02:20:00Z");
+    for (installed, state, last_use, stated, stated_at) in [
         (
             installed(),
             Some(AgentLoginState::Ready),
-            Some(UseOutcome::Refused),
+            used(UseOutcome::Refused),
             Some("refused"),
+            at,
         ),
         (
             installed(),
             Some(AgentLoginState::Ready),
-            Some(UseOutcome::Accepted),
+            used(UseOutcome::Accepted),
             Some("accepted"),
+            at,
         ),
-        (installed(), Some(AgentLoginState::Ready), None, None),
+        (installed(), Some(AgentLoginState::Ready), None, None, None),
         (
             installed(),
             Some(AgentLoginState::StaleGeneration),
-            Some(UseOutcome::Refused),
+            used(UseOutcome::Refused),
+            None,
             None,
         ),
-        (installed(), None, Some(UseOutcome::Refused), None),
+        (installed(), None, used(UseOutcome::Refused), None, None),
         (
             None,
             Some(AgentLoginState::Ready),
-            Some(UseOutcome::Refused),
+            used(UseOutcome::Refused),
+            None,
             None,
         ),
     ] {
@@ -254,6 +261,11 @@ fn status_states_the_last_use_only_of_a_ready_install() {
         assert_eq!(
             entry.get("lastUse").and_then(serde_json::Value::as_str),
             stated,
+            "{entry}"
+        );
+        assert_eq!(
+            entry.get("lastUseAt").and_then(serde_json::Value::as_str),
+            stated_at,
             "{entry}"
         );
         assert_eq!(entry.get("state").is_some(), state.is_some(), "{entry}");

@@ -57,7 +57,7 @@ fn conformance_executable() -> PathBuf {
         })
 }
 
-const FAKE_CODEX: &str = r#"#!/bin/sh
+pub(crate) const FAKE_CODEX: &str = r#"#!/bin/sh
 set -eu
 for argument in "$@"; do
   printf '%s\0' "$argument"
@@ -1164,7 +1164,7 @@ fn codex_process_fixture() {
             "id": 3,
             "result": {
                 "thread": thread_document(cwd, &version),
-                "model": MODEL,
+                "model": thread["params"]["model"],
                 "modelProvider": PROVIDER,
                 "cwd": cwd,
                 "approvalPolicy": "never",
@@ -1629,6 +1629,7 @@ fn codex_process_fixture() {
             | "failure-after-start-too-many-denials"
             | "interrupted-too-many-denials"
             | "failure-after-start-authentication"
+            | "failure-after-start-overloaded"
             | "failure-after-start-stubborn"
             | "failure-after-partial-output"
             | "failure-after-async"
@@ -1692,6 +1693,7 @@ fn codex_process_fixture() {
             "failure-after-start-authentication" => {
                 ("authentication diagnostic", json!("unauthorized"))
             }
+            "failure-after-start-overloaded" => ("overload diagnostic", json!("serverOverloaded")),
             "retry-exhausted" => {
                 send_native_error(
                     &mut output,

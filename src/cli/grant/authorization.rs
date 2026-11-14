@@ -35,6 +35,10 @@ pub(in crate::cli) struct AuthorizationView<'a> {
     delivery: Option<DeliveryView<'a>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     report: Option<ReportView<'a>>,
+    // The runner's last use of a native grant where `um grant list` prints no exchange
+    // (REQ-GRANT-64).
+    #[serde(flatten)]
+    last_use: Option<LastUseView<'a>>,
     // An authorization in force's availability and next action (REQ-GRANT-53); an ended
     // one, and the one `authorize` just made, carry none.
     #[serde(flatten)]
@@ -90,9 +94,18 @@ struct ReportView<'a> {
     state: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     generation: Option<i64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    last_use: Option<&'static str>,
+    #[serde(flatten)]
+    last_use: Option<LastUseView<'a>>,
     reported_at: &'a str,
+}
+
+/// The last use the runner reported and, where Cloud holds it, when (REQ-GRANT-64).
+#[derive(Clone, Copy, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LastUseView<'a> {
+    last_use: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_use_at: Option<&'a str>,
 }
 
 /// The fields an authorization in force and an ended one share, read alike from either
@@ -115,23 +128,33 @@ macro_rules! authorization_view {
             report: authorization.report.as_deref().map(|report| ReportView {
                 state: report_state(report.state),
                 generation: report.generation,
-                last_use: report.last_use.map(|last_use| last_use.as_str()),
+                last_use: report.last_use.map(|last_use| LastUseView {
+                    last_use: last_use.as_str(),
+                    last_use_at: report.last_use_at.as_deref(),
+                }),
                 reported_at: &report.reported_at,
             }),
+            last_use: None,
             status: None,
             exchange: true,
         }
     }};
 }
 
-/// The agent login's ended authorizations, `None` when Cloud does not list them.
+/// The agent login's ended authorizations as the earlier commands print them, without the
+/// time of the last use (REQ-GRANT-77); `None` when Cloud does not list them.
 pub(in crate::cli) fn ended_authorizations(
     login: &AgentLogin,
 ) -> Option<Vec<EndedAuthorizationView<'_>>> {
-    login
-        .ended_authorizations
-        .as_deref()
-        .map(ended_authorization_views)
+    login.ended_authorizations.as_deref().map(|ended| {
+        ended_authorization_views(ended)
+            .into_iter()
+            .map(|ended| EndedAuthorizationView {
+                authorization: ended.authorization.untimed(),
+                ..ended
+            })
+            .collect()
+    })
 }
 
 /// A native grant's ended authorizations, as the agent login's are read.
@@ -208,13 +231,26 @@ impl RemovalView<'_> {
 }
 
 impl<'a> AuthorizationView<'a> {
+    /// An authorization of an agent login as the earlier commands print it, without the time
+    /// of the last use (REQ-GRANT-77).
     pub(in crate::cli) fn new(authorization: &'a AgentLoginAuthorization) -> Self {
-        authorization_view!(authorization)
+        authorization_view!(authorization).untimed()
+    }
+
+    fn untimed(mut self) -> Self {
+        if let Some(ReportView {
+            last_use: Some(last_use),
+            ..
+        }) = &mut self.report
+        {
+            last_use.last_use_at = None;
+        }
+        self
     }
 
     /// An authorization in force of a grant, with the runner's organization and the
     /// authorization's availability and next action; `exchange` keeps what was delivered to the
-    /// runner and what it reported.
+    /// runner and what it reported, and without it the runner's last use alone is kept.
     pub(in crate::cli) fn of_grant(
         authorization: &'a MemberGrantAuthorization,
         status: MemberStatus,
@@ -223,6 +259,11 @@ impl<'a> AuthorizationView<'a> {
         let view = authorization_view!(authorization);
         Self {
             organization_id: Some(&authorization.organization_id),
+            last_use: view
+                .report
+                .as_ref()
+                .and_then(|report| report.last_use)
+                .filter(|_| !exchange),
             delivery: view.delivery.filter(|_| exchange),
             report: view.report.filter(|_| exchange),
             status: Some(status),
@@ -262,6 +303,9 @@ impl<'a> AuthorizationView<'a> {
         self.write_heading(output)?;
         if self.exchange {
             self.write_exchange(output)?;
+        }
+        if let Some(last_use) = &self.last_use {
+            last_use.write_human(output)?;
         }
         match &self.status {
             Some(status) => status.write_human(output, "    "),
@@ -307,8 +351,19 @@ impl<'a> AuthorizationView<'a> {
             None => writeln!(output, "    reported: never")?,
         }
         match self.report.as_ref().and_then(|report| report.last_use) {
-            Some(last_use) => writeln!(output, "    last use: {last_use}"),
+            Some(last_use) => last_use.write_human(output),
             None => Ok(()),
+        }
+    }
+}
+
+impl LastUseView<'_> {
+    fn write_human(&self, output: &mut impl Write) -> io::Result<()> {
+        match self.last_use_at {
+            Some(last_use_at) => {
+                writeln!(output, "    last use: {} at {last_use_at}", self.last_use)
+            }
+            None => writeln!(output, "    last use: {}", self.last_use),
         }
     }
 }

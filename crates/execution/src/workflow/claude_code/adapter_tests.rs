@@ -1377,6 +1377,26 @@ fn an_existing_native_session_entry_is_never_selected_or_replaced() {
     );
 }
 
+// REQ-GRANT-37
+// INV-HARNESS-9
+#[test]
+fn the_bridge_removes_only_the_ambient_directories_it_created() {
+    let fixture = ProcessFixture::new(AgentValueMode::None, 1024);
+    let projects = fixture.config.join("projects");
+    let unrelated = projects.join("unrelated-project");
+    std::fs::create_dir_all(&unrelated).unwrap();
+    let ambient_project =
+        projects.join(native_project_slug(fixture.expected_cwd.to_str().unwrap()));
+
+    let plan = prepare_launch(fixture.invocation.as_ref().unwrap()).unwrap();
+    assert!(ambient_project.is_dir());
+    drop(plan);
+
+    assert!(!ambient_project.exists());
+    assert!(unrelated.is_dir());
+    assert_eq!(std::fs::read_dir(&projects).unwrap().count(), 1);
+}
+
 #[test]
 fn native_project_slug_matches_the_pinned_claude_code_storage_format() {
     assert_eq!(native_project_slug("/tmp/emoji-😀"), "-tmp-emoji---");
@@ -2321,11 +2341,10 @@ async fn normal_driver_preserves_runner_configuration_and_returns_only_final_res
         .unwrap(),
         b"retained subagent activity\n"
     );
-    let ambient_project = fixture
-        .config
-        .join("projects")
-        .join(native_project_slug(fixture.expected_cwd.to_str().unwrap()));
-    assert_eq!(std::fs::read_dir(ambient_project).unwrap().count(), 0);
+    // The adapter created the ambient project path under a configuration
+    // directory that had none, and removed it with its links (REQ-GRANT-37).
+    assert!(!fixture.config.join("projects").exists());
+    assert_eq!(std::fs::read_dir(&fixture.config).unwrap().count(), 0);
 
     let observations = fixture.observations.snapshot();
     assert_eq!(

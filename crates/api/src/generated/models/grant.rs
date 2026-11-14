@@ -75,7 +75,7 @@ pub struct Grant {
     /// For a native grant, when it was revoked or erased, omitted while it is active.
     #[serde(rename = "revokedAt", skip_serializing_if = "Option::is_none")]
     pub revoked_at: Option<String>,
-    /// For a native grant, for each runner that has no authorization of it in force, the authorization that ended last, in the order they ended (REQ-GRANT-13). The server always sends it for a native grant, empty when there is none.
+    /// For a native grant, for each runner whose authorization of it has ended, the authorization that ended last, whether or not that runner is authorized again, in the order they ended (REQ-GRANT-13). The server always sends it for a native grant, empty when there is none.
     #[serde(
         rename = "endedAuthorizations",
         skip_serializing_if = "Option::is_none"

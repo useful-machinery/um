@@ -244,10 +244,9 @@ pub enum AgentLoginUse {
 }
 
 /// One provider's readiness as the control socket returns it: the readiness
-/// document's entry without the path of the install (REQ-RUNNERENROLL-63)
-/// or the time of its last use. An OAuth provider's entry carries, while
-/// `ready`, the grant, generation and expiry of the token issued
-/// (REQ-GRANT-88), never the token.
+/// document's entry without the path of the install (REQ-RUNNERENROLL-63).
+/// An OAuth provider's entry carries, while `ready`, the grant, generation
+/// and expiry of the token issued (REQ-GRANT-88), never the token.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct ProviderReadiness {
@@ -275,6 +274,10 @@ pub struct ProviderReadiness {
     /// (REQ-GRANT-52); only ever beside an install.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_use: Option<AgentLoginUse>,
+    /// When that last use was (REQ-GRANT-41); only ever beside a last use,
+    /// and absent where a serving process that predates it answers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_use_at: Option<String>,
 }
 
 impl ProviderReadiness {
@@ -371,11 +374,55 @@ pub struct AgentLoginReadiness {
     pub providers: Vec<ProviderReadiness>,
 }
 
+/// Why a check of an installed login gave no answer (REQ-GRANT-90).
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentLoginCheckCause {
+    /// The coding agent's program was not found, or not in the supported
+    /// range, when the runner started.
+    ProgramUnavailable,
+    /// The program or the login could not be read or started.
+    StartFailed,
+    /// The program did not end the turn within the check's bound.
+    TimedOut,
+    /// The turn ended with a harness error other than `unauthorized`.
+    HarnessError,
+}
+
+impl AgentLoginCheckCause {
+    /// The cause's name on the wire and in telemetry.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ProgramUnavailable => "program_unavailable",
+            Self::StartFailed => "start_failed",
+            Self::TimedOut => "timed_out",
+            Self::HarnessError => "harness_error",
+        }
+    }
+}
+
+/// An installed login whose check in the setup gave no answer, with why
+/// (REQ-GRANT-41, REQ-GRANT-90).
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct UnansweredCheck {
+    pub provider: AgentLoginProvider,
+    pub cause: AgentLoginCheckCause,
+}
+
+/// The `synced` answer: the readiness the setup recorded, and each login
+/// whose check in that setup gave no answer.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SyncedAgentLogins {
+    pub readiness: AgentLoginReadiness,
+    pub unanswered_checks: Vec<UnansweredCheck>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Response {
     Status(StatusSnapshot),
     Reloaded { credential_id: String },
-    AgentLoginsSynced(AgentLoginReadiness),
+    AgentLoginsSynced(SyncedAgentLogins),
     Error(ControlError),
 }
 
@@ -401,6 +448,8 @@ enum EncodedResponse<'a> {
         outcome: &'static str,
         #[serde(rename = "agentLogins")]
         agent_logins: &'a AgentLoginReadiness,
+        #[serde(rename = "unansweredChecks", skip_serializing_if = "<[_]>::is_empty")]
+        unanswered_checks: &'a [UnansweredCheck],
     },
     Error {
         #[serde(rename = "schemaVersion")]
@@ -421,6 +470,8 @@ struct DecodedResponse {
     credential_id: Option<String>,
     #[serde(default)]
     agent_logins: Option<AgentLoginReadiness>,
+    #[serde(default)]
+    unanswered_checks: Option<Vec<UnansweredCheck>>,
     #[serde(default)]
     error: Option<ControlError>,
 }
@@ -491,10 +542,11 @@ pub(crate) fn encode_response(response: &Response) -> Result<Vec<u8>, ProtocolFa
             outcome: "reloaded",
             credential_id,
         },
-        Response::AgentLoginsSynced(agent_logins) => EncodedResponse::AgentLoginsSynced {
+        Response::AgentLoginsSynced(synced) => EncodedResponse::AgentLoginsSynced {
             schema_version: 1,
             outcome: "synced",
-            agent_logins,
+            agent_logins: &synced.readiness,
+            unanswered_checks: &synced.unanswered_checks,
         },
         Response::Error(error) => EncodedResponse::Error {
             schema_version: 1,
@@ -527,22 +579,41 @@ pub(crate) fn decode_response(bytes: &[u8]) -> Result<Response, ProtocolFailure>
         response.status,
         response.credential_id,
         response.agent_logins,
+        response.unanswered_checks,
         response.error,
     ) {
-        ("ok", Some(status), None, None, None) if valid_status(&status) => {
+        ("ok", Some(status), None, None, None, None) if valid_status(&status) => {
             Ok(Response::Status(status))
         }
-        ("reloaded", None, Some(credential_id), None, None)
+        ("reloaded", None, Some(credential_id), None, None, None)
             if super::validation::valid_typed_id(&credential_id, "rrc_") =>
         {
             Ok(Response::Reloaded { credential_id })
         }
-        ("synced", None, None, Some(readiness), None) if valid_readiness(&readiness) => {
-            Ok(Response::AgentLoginsSynced(readiness))
+        ("synced", None, None, Some(readiness), unanswered_checks, None)
+            if valid_readiness(&readiness)
+                && unanswered_checks
+                    .as_deref()
+                    .is_none_or(valid_unanswered_checks) =>
+        {
+            Ok(Response::AgentLoginsSynced(SyncedAgentLogins {
+                readiness,
+                unanswered_checks: unanswered_checks.unwrap_or_default(),
+            }))
         }
-        ("error", None, None, None, Some(error)) => Ok(Response::Error(error)),
+        ("error", None, None, None, None, Some(error)) => Ok(Response::Error(error)),
         _ => Err(ProtocolFailure::Invalid),
     }
+}
+
+/// A `synced` answer's unanswered checks, when it carries the member: at
+/// least one, each of a different installable provider.
+fn valid_unanswered_checks(checks: &[UnansweredCheck]) -> bool {
+    let mut providers = BTreeSet::new();
+    !checks.is_empty()
+        && checks
+            .iter()
+            .all(|check| !check.provider.is_brokered() && providers.insert(check.provider))
 }
 
 fn valid_status(status: &StatusSnapshot) -> bool {
@@ -594,6 +665,8 @@ fn valid_provider_readiness(entry: &ProviderReadiness) -> bool {
         && entry.generation.is_some() == entry.installed_at.is_some()
         && (entry.generation.is_none() || entry.agent_login_id.is_some())
         && (entry.last_use.is_none() || entry.generation.is_some())
+        && (entry.last_use_at.is_none() || entry.last_use.is_some())
+        && entry.last_use_at.as_deref().is_none_or(valid_timestamp)
         && entry.checked_at.as_deref().is_none_or(valid_timestamp)
         && entry.installed_at.as_deref().is_none_or(valid_timestamp)
 }
@@ -620,6 +693,7 @@ fn valid_grant_readiness(entry: &ProviderReadiness) -> bool {
         && entry.agent_login_id.is_none()
         && entry.installed_at.is_none()
         && entry.last_use.is_none()
+        && entry.last_use_at.is_none()
         && entry.checked_at.as_deref().is_none_or(valid_timestamp)
 }
 
@@ -714,6 +788,7 @@ mod tests {
             expires_at: None,
             selected: None,
             last_use: None,
+            last_use_at: None,
         };
         AgentLoginReadiness {
             updated_at: "2026-11-12T01:00:00Z".to_owned(),
@@ -729,12 +804,21 @@ mod tests {
                     expires_at: None,
                     selected: None,
                     last_use: None,
+                    last_use_at: None,
                 },
                 brokered(AgentLoginProvider::Github),
                 brokered(AgentLoginProvider::Gitlab),
                 brokered(AgentLoginProvider::Linear),
             ],
         }
+    }
+
+    /// The `synced` answer carrying `readiness` and no unanswered check.
+    fn synced(readiness: AgentLoginReadiness) -> Response {
+        Response::AgentLoginsSynced(SyncedAgentLogins {
+            readiness,
+            unanswered_checks: Vec::new(),
+        })
     }
 
     fn control_validator() -> jsonschema::Validator {
@@ -759,7 +843,7 @@ mod tests {
         let request: serde_json::Value = serde_json::from_slice(&request).unwrap();
         assert!(validator.is_valid(&request));
 
-        let response = Response::AgentLoginsSynced(readiness());
+        let response = synced(readiness());
         let encoded = encode_response(&response).unwrap();
         assert_eq!(decode_response(&encoded), Ok(response));
         let mut value: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
@@ -779,6 +863,50 @@ mod tests {
         assert_eq!(decode_response(&with_path), Err(ProtocolFailure::Invalid));
     }
 
+    // REQ-GRANT-41, REQ-GRANT-90
+    #[test]
+    fn a_synced_answer_names_each_unanswered_check_by_provider_and_closed_cause() {
+        let response = Response::AgentLoginsSynced(SyncedAgentLogins {
+            readiness: readiness(),
+            unanswered_checks: vec![UnansweredCheck {
+                provider: AgentLoginProvider::Codex,
+                cause: AgentLoginCheckCause::TimedOut,
+            }],
+        });
+        let encoded = encode_response(&response).unwrap();
+        assert_eq!(decode_response(&encoded), Ok(response));
+        let value: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(
+            value["unansweredChecks"],
+            serde_json::json!([{"provider": "codex", "cause": "timed_out"}])
+        );
+
+        // Absent when every check answered, and only then.
+        let answered = encode_response(&synced(readiness())).unwrap();
+        let answered: serde_json::Value = serde_json::from_slice(&answered).unwrap();
+        assert!(answered.get("unansweredChecks").is_none(), "{answered}");
+        for checks in [
+            serde_json::json!([]),
+            serde_json::json!([{"provider": "codex", "cause": "overloaded"}]),
+            serde_json::json!([{"provider": "github", "cause": "timed_out"}]),
+            serde_json::json!([
+                {"provider": "codex", "cause": "timed_out"},
+                {"provider": "codex", "cause": "start_failed"}
+            ]),
+            serde_json::json!([{"provider": "codex", "cause": "timed_out", "detail": "x"}]),
+        ] {
+            let mut invalid = answered.clone();
+            invalid["unansweredChecks"] = checks;
+            let mut bytes = serde_json::to_vec(&invalid).unwrap();
+            bytes.push(b'\n');
+            assert_eq!(
+                decode_response(&bytes),
+                Err(ProtocolFailure::Invalid),
+                "{invalid}"
+            );
+        }
+    }
+
     /// An OAuth provider's entry in `state`, holding the grant issued when
     /// it is `ready` (REQ-GRANT-88).
     fn grant_entry(state: AgentLoginState, selected: Option<bool>) -> ProviderReadiness {
@@ -794,6 +922,7 @@ mod tests {
             expires_at: ready.then(|| "2026-11-12T09:00:00Z".to_owned()),
             selected,
             last_use: None,
+            last_use_at: None,
         }
     }
 
@@ -816,7 +945,7 @@ mod tests {
         for state in GRANT_STATES {
             let mut readiness = readiness();
             readiness.providers[1] = grant_entry(state, Some(true));
-            let response = Response::AgentLoginsSynced(readiness);
+            let response = synced(readiness);
             let encoded = encode_response(&response).unwrap();
             assert_eq!(decode_response(&encoded), Ok(response), "{state:?}");
             let value: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
@@ -846,6 +975,11 @@ mod tests {
             installed_at: Some("2026-11-12T00:55:00Z".to_owned()),
             ..grant_entry(AgentLoginState::Ready, Some(true))
         };
+        let mut brokered_last_use_at = readiness();
+        brokered_last_use_at.providers[1] = ProviderReadiness {
+            last_use_at: Some("2026-11-12T00:58:00Z".to_owned()),
+            ..grant_entry(AgentLoginState::Ready, Some(true))
+        };
         let mut codex_not_delivered = readiness();
         codex_not_delivered.providers[0] = ProviderReadiness {
             state: AgentLoginState::NotDelivered,
@@ -871,20 +1005,26 @@ mod tests {
             last_use: Some(AgentLoginUse::Refused),
             ..last_use_without_install.providers[0].clone()
         };
+        // A time is stated only with the last use it dates (REQ-GRANT-41).
+        let mut last_use_at_without_last_use = readiness();
+        last_use_at_without_last_use.providers[0].last_use_at =
+            Some("2026-11-12T00:58:00Z".to_owned());
         for invalid in [
             brokered_ready_without_grant,
             brokered_grant_not_ready,
             brokered_malformed_grant,
             brokered_agent_login_state,
             brokered_install,
+            brokered_last_use_at,
             codex_not_delivered,
             codex_reconnect_required,
             codex_grant,
             duplicate,
             generation_without_install,
             last_use_without_install,
+            last_use_at_without_last_use,
         ] {
-            let encoded = encode_response(&Response::AgentLoginsSynced(invalid)).unwrap();
+            let encoded = encode_response(&synced(invalid)).unwrap();
             assert_eq!(decode_response(&encoded), Err(ProtocolFailure::Invalid));
         }
     }
@@ -1037,6 +1177,7 @@ mod tests {
                 expires_at: None,
                 selected,
                 last_use,
+                last_use_at: None,
             };
             assert_eq!(
                 entry.credential_status(),
@@ -1122,18 +1263,23 @@ mod tests {
             3
         );
 
-        // Selection and last use travel beside the state where the
-        // document records them (REQ-GRANT-53).
+        // Selection and last use, with its time, travel beside the state
+        // where the document records them (REQ-GRANT-41, REQ-GRANT-53).
         let mut with_last_use = readiness();
         with_last_use.providers[0].selected = Some(true);
         with_last_use.providers[0].last_use = Some(AgentLoginUse::Refused);
-        let response = Response::AgentLoginsSynced(with_last_use);
+        with_last_use.providers[0].last_use_at = Some("2026-11-12T00:58:00Z".to_owned());
+        let response = synced(with_last_use);
         let encoded = encode_response(&response).unwrap();
         assert_eq!(decode_response(&encoded), Ok(response));
         let value: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
         assert!(control_validator().is_valid(&value), "{value}");
         assert_eq!(value["agentLogins"]["providers"][0]["selected"], true);
         assert_eq!(value["agentLogins"]["providers"][0]["lastUse"], "refused");
+        assert_eq!(
+            value["agentLogins"]["providers"][0]["lastUseAt"],
+            "2026-11-12T00:58:00Z"
+        );
     }
 
     // REQ-RUNNERENROLL-82

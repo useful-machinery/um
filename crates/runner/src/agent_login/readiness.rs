@@ -335,9 +335,9 @@ impl ReadinessDocument {
     }
 
     /// The readiness as the control socket returns it: the document without
-    /// the path of any install (REQ-RUNNERENROLL-63), the time of a last use
-    /// or the entries of providers this build does not know. An OAuth
-    /// provider's entry is reported as recorded (REQ-GRANT-88).
+    /// the path of any install (REQ-RUNNERENROLL-63) or the entries of
+    /// providers this build does not know. An OAuth provider's entry is
+    /// reported as recorded (REQ-GRANT-88).
     pub(crate) fn reported(&self) -> Option<AgentLoginReadiness> {
         let wire = self.to_wire()?;
         Some(AgentLoginReadiness {
@@ -634,6 +634,7 @@ impl WireEntry {
             expires_at: self.expires_at,
             selected: self.selected,
             last_use: self.last_use,
+            last_use_at: self.last_use_at,
         })
     }
 }

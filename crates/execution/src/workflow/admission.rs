@@ -2805,12 +2805,13 @@ fn pi_json_v1_limits() -> AgentInvocationLimits<PiJsonV1ProtocolLimits> {
     agent_invocation_limits(PiJsonV1ProtocolLimits::profile())
 }
 
-fn claude_code_stream_json_v1_limits() -> AgentInvocationLimits<ClaudeCodeStreamJsonV1ProtocolLimits>
-{
+pub(super) fn claude_code_stream_json_v1_limits()
+-> AgentInvocationLimits<ClaudeCodeStreamJsonV1ProtocolLimits> {
     agent_invocation_limits(ClaudeCodeStreamJsonV1ProtocolLimits::profile())
 }
 
-fn codex_app_server_v1_limits() -> AgentInvocationLimits<CodexAppServerV1ProtocolLimits> {
+pub(super) fn codex_app_server_v1_limits() -> AgentInvocationLimits<CodexAppServerV1ProtocolLimits>
+{
     agent_invocation_limits(CodexAppServerV1ProtocolLimits::profile())
 }
 

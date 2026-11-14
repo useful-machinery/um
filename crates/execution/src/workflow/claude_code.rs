@@ -32,6 +32,15 @@ impl ClaudeCodeEffort {
     }
 }
 
+/// The model a login check asks for (INV-HARNESS-18), which has no workflow profile: the
+/// least expensive current Anthropic model that accepts an effort, since the adapter always
+/// passes `--effort`, and the one the live Claude Code smoke pins against the qualification
+/// version `CLAUDE_CODE_STREAM_JSON_V1_QUALIFICATION_VERSION` (2.1.321). A login whose
+/// account may not use it is refused, as the provider classifies that `unauthorized`.
+pub(crate) const LOGIN_CHECK_MODEL: &str = "claude-sonnet-5";
+/// The lowest effort the adapter accepts.
+pub(crate) const LOGIN_CHECK_EFFORT: ClaudeCodeEffort = ClaudeCodeEffort::Low;
+
 // Keep this direct decoder local so Claude's closed configuration can evolve independently.
 pub(crate) fn resolve_config(value: &Value) -> Option<ClaudeCodeConfig> {
     let config = serde_json::from_value::<ClaudeCodeConfig>(value.clone()).ok()?;
@@ -4408,6 +4417,6 @@ mod conformance_tests;
 #[cfg(test)]
 mod lifecycle_matrix;
 #[cfg(test)]
-mod test_support;
+pub(crate) mod test_support;
 #[cfg(test)]
 mod tests;

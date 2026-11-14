@@ -8,6 +8,7 @@ use time::OffsetDateTime;
 
 use super::*;
 use crate::agent_login::ServiceEnvironment;
+use crate::agent_login::check::LoginCheck;
 use crate::agent_login::cloud::{
     AgentLoginCloud, CloudFailure, GrantTokenFailure, GrantTokenRefusal,
 };
@@ -18,7 +19,8 @@ use crate::agent_login::setup::{
 use crate::control_protocol::{AgentLoginProvider, AgentLoginState};
 use crate::service::{
     CountedGate, FAKE_GRANT_ID, FAKE_GRANT_TOKEN_SENTINEL, FakeAgentLoginCloud, FakeGrantToken,
-    SleepRelease, controlled_sleeper, fake_grant_expiry, fake_grant_token, with_watchdog,
+    FakeLoginCheck, SleepRelease, controlled_sleeper, fake_grant_expiry, fake_grant_token,
+    with_watchdog,
 };
 use crate::telemetry::{TestCapture, test_recorder};
 
@@ -59,6 +61,7 @@ impl Fixture {
         let setup = Arc::new(AgentLoginSetup::new(
             SetupDependencies::new(
                 Arc::clone(&cloud) as Arc<dyn AgentLoginCloud>,
+                FakeLoginCheck::new() as Arc<dyn LoginCheck>,
                 ServiceEnvironment::from_lookup(|name| (name == "HOME").then(|| home.clone())),
                 &state.join("runner-state.json"),
                 recorder,

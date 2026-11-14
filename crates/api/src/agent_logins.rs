@@ -519,6 +519,11 @@ pub(crate) fn valid_authorization_record(
         && report.is_none_or(|report| {
             report.generation.is_none_or(|generation| generation >= 1)
                 && !report.reported_at.is_empty()
+                // The time of a last use comes only with it (REQ-GRANT-27).
+                && report
+                    .last_use_at
+                    .as_deref()
+                    .is_none_or(|time| !time.is_empty() && report.last_use.is_some())
         })
 }
 

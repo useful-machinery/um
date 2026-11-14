@@ -836,6 +836,7 @@ mod tests {
 
     // REQ-GRANT-64
     // REQ-GRANT-13
+    // REQ-GRANT-27
     #[test]
     fn a_native_grants_authorizations_are_checked_as_an_agent_logins_are() {
         let authorization = serde_json::json!({
@@ -844,7 +845,7 @@ mod tests {
             "organizationId": "org_01k0z6r1w8f4jy2m7q9v3x5abc",
             "createdAt": "2026-11-01T09:05:00Z",
             "delivery": {"generation": 1, "deliveredAt": "2026-11-01T09:06:00Z"},
-            "report": {"state": "ready", "generation": 1, "lastUse": "accepted", "reportedAt": "2026-11-01T09:07:00Z"}
+            "report": {"state": "ready", "generation": 1, "lastUse": "accepted", "lastUseAt": "2026-11-01T09:06:30Z", "reportedAt": "2026-11-01T09:07:00Z"}
         });
         let mut ended = ended(
             serde_json::json!({"state": "pending"}),
@@ -853,12 +854,14 @@ mod tests {
             .clone();
         ended["delivery"] = authorization["delivery"].clone();
         ended["report"] = authorization["report"].clone();
-        let malformed: [(&str, serde_json::Value); 5] = [
+        let malformed: [(&str, serde_json::Value); 7] = [
             ("/createdAt", serde_json::json!("")),
             ("/delivery/generation", serde_json::json!(0)),
             ("/delivery/deliveredAt", serde_json::json!("")),
             ("/report/generation", serde_json::json!(0)),
             ("/report/reportedAt", serde_json::json!("")),
+            ("/report/lastUseAt", serde_json::json!("")),
+            ("/report/lastUse", serde_json::Value::Null),
         ];
         assert!(valid_grant(&native(
             serde_json::json!({"authorizations": [authorization.clone()]})

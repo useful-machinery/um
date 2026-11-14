@@ -191,6 +191,7 @@ mod tests {
             expires_at: None,
             selected: Some(true),
             last_use: None,
+            last_use_at: None,
         }
     }
 

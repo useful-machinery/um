@@ -13,7 +13,10 @@
 //! assignment runs and folded into the readiness by the next pass
 //! (REQ-GRANT-52). A pass made while the runner holds no assignment removes
 //! the grant token files an earlier assignment or an interrupted runner left
-//! (INV-RUNNER-28).
+//! (INV-RUNNER-28). A setup the control socket asks for, or one the schedule
+//! makes that installs a login, then checks logins with their providers
+//! outside the pass and the assignment gate, and a second pass records what
+//! they found (REQ-GRANT-90, INV-RUNNER-29).
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -25,6 +28,7 @@ use time::OffsetDateTime;
 use um_execution::{HarnessLoginObserver, HarnessLoginOutcome};
 use url::Url;
 
+use super::check::{CHECK_ALLOWANCE, LoginCheck, LoginCheckOutcome};
 use super::claude_code;
 use super::cloud::{
     AgentLoginCloud, Delivery, DeliveryFailure, DeliveryRefusal, DeliveryRequest,
@@ -41,7 +45,7 @@ use super::{
     FailureCause, FailureStage, InstallRefusal, OfferedLogin, OperatingSystem, ServiceEnvironment,
     StepFailure,
 };
-use crate::control_protocol::{AgentLoginProvider, AgentLoginState};
+use crate::control_protocol::{AgentLoginProvider, AgentLoginState, UnansweredCheck};
 use crate::credential::Credential;
 use crate::enrollment::remove_leftover_temporary_files;
 use crate::runner_http;
@@ -50,14 +54,21 @@ use crate::telemetry::{self, Outcome, Recorder, attribute};
 /// The record a pass writes when it changes a provider's readiness or fails.
 pub(crate) const SETUP_EVENT: &str = "runner.agent_login_setup";
 
-/// How long `sync_agent_logins` waits for its pass (REQ-GRANT-41). A
-/// pass makes at most a status request, one delivery per installable
-/// provider and a closing status request, each bounded by the request
-/// timeout, and a sync may first wait for one pass already running. A pass
-/// whose closing answer ends a login it installed reports once more
-/// (REQ-GRANT-50), a request this bound does not count.
+/// The longest one pass's requests take: at most a status request, one
+/// delivery per installable provider and a closing status request, each
+/// bounded by the request timeout. A pass whose closing answer ends a login
+/// it installed reports once more (REQ-GRANT-50), a request this bound does
+/// not count.
+const PASS_BOUND: Duration = Duration::from_secs(
+    runner_http::REQUEST_TIMEOUT.as_secs() * (2 + AgentLoginProvider::INSTALLABLE.len() as u64),
+);
+
+/// How long `sync_agent_logins` waits for its setup (REQ-GRANT-41): a pass
+/// already running, the setup's pass, one check per installable provider
+/// (REQ-GRANT-90) and the second pass that records what they found.
 pub(crate) const SYNC_BOUND: Duration = Duration::from_secs(
-    runner_http::REQUEST_TIMEOUT.as_secs() * (2 + AgentLoginProvider::INSTALLABLE.len() as u64) * 2,
+    PASS_BOUND.as_secs() * 3
+        + CHECK_ALLOWANCE.as_secs() * AgentLoginProvider::INSTALLABLE.len() as u64,
 );
 
 /// Where a pass failed apart from any one provider's setup, as its record's
@@ -103,6 +114,26 @@ impl AssignmentGate for Admitting {
     }
 }
 
+/// Who asked for a setup, which decides the logins it checks
+/// (REQ-GRANT-90).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SetupCaller {
+    /// `um runner grant sync`, through the control socket: every login the
+    /// pass leaves `ready` is checked.
+    Sync,
+    /// The schedule, at start and every interval: a login the pass
+    /// installed is checked.
+    Schedule,
+}
+
+/// What a setup did: its outcome, and each login whose check gave no
+/// answer.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct SetupAnswer {
+    pub(crate) outcome: SetupOutcome,
+    pub(crate) unanswered: Vec<UnansweredCheck>,
+}
+
 /// What a pass did.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum SetupOutcome {
@@ -121,6 +152,7 @@ pub(crate) enum SetupOutcome {
 /// Everything a pass needs besides the assignment gate and the clock.
 pub(crate) struct SetupDependencies {
     cloud: Arc<dyn AgentLoginCloud>,
+    check: Arc<dyn LoginCheck>,
     environment: ServiceEnvironment,
     readiness_path: PathBuf,
     directory: LoginDirectory,
@@ -130,35 +162,41 @@ pub(crate) struct SetupDependencies {
 
 impl SetupDependencies {
     /// The serving process's setup: Cloud at the runner's endpoint with its
-    /// enrolled credential, the process's own environment, and the readiness
-    /// document and agent-login directory beside the protected state at
-    /// `runner_state_path`. `None` for an endpoint that is not `ws(s)`.
+    /// enrolled credential, `check` for its logins, the process's own
+    /// environment, and the readiness document and agent-login directory
+    /// beside the protected state at `runner_state_path`. `None` for an
+    /// endpoint that is not `ws(s)`.
     pub(crate) fn enrolled(
         endpoint: &Url,
         credential: &Credential,
+        check: Arc<dyn LoginCheck>,
         runner_state_path: &Path,
         recorder: Arc<Recorder>,
     ) -> Option<Self> {
         let cloud = HttpAgentLoginCloud::new(endpoint, credential)?;
         Some(Self::new(
             Arc::new(cloud),
+            check,
             ServiceEnvironment::from_lookup(|name| std::env::var_os(name)),
             runner_state_path,
             recorder,
         ))
     }
 
-    /// Setup that asks `cloud`, stands back where `environment` has logins
-    /// of its own, and keeps its readiness document and agent-login
-    /// directory beside the protected state at `runner_state_path`.
+    /// Setup that asks `cloud`, checks logins with `check`, stands back
+    /// where `environment` has logins of its own, and keeps its readiness
+    /// document and agent-login directory beside the protected state at
+    /// `runner_state_path`.
     pub(crate) fn new(
         cloud: Arc<dyn AgentLoginCloud>,
+        check: Arc<dyn LoginCheck>,
         environment: ServiceEnvironment,
         runner_state_path: &Path,
         recorder: Arc<Recorder>,
     ) -> Self {
         Self {
             cloud,
+            check,
             environment,
             readiness_path: readiness::readiness_path(runner_state_path),
             directory: LoginDirectory::beside(runner_state_path),
@@ -243,34 +281,162 @@ impl AgentLoginSetup {
             .follow_credential(endpoint, credential);
     }
 
-    /// Runs one pass on a thread of its own, since its requests and file
-    /// writes block, and answers what it did: `Busy` at once while the
-    /// runner holds an assignment.
-    pub(crate) async fn run_pass(self: &Arc<Self>) -> SetupOutcome {
-        self.run_pass_on(|pass| {
+    /// Runs one setup for `caller` on a thread of its own, since its
+    /// requests, file writes and checks block, and answers what it did:
+    /// `Busy` at once while the runner holds an assignment.
+    pub(crate) async fn set_up(self: &Arc<Self>, caller: SetupCaller) -> SetupAnswer {
+        self.set_up_on(caller, |setup| {
             std::thread::Builder::new()
                 .name("um-agent-login-setup".to_owned())
-                .spawn(pass)
+                .spawn(setup)
                 .map(|_detached| ())
         })
         .await
     }
 
-    /// `run_pass`, with `spawn` starting the pass on a thread of its own.
-    async fn run_pass_on(
+    /// A setup the schedule makes, as its outcome.
+    #[cfg(test)]
+    pub(crate) async fn run_pass(self: &Arc<Self>) -> SetupOutcome {
+        self.set_up(SetupCaller::Schedule).await.outcome
+    }
+
+    /// `set_up`, with `spawn` starting the setup on a thread of its own.
+    async fn set_up_on(
         self: &Arc<Self>,
+        caller: SetupCaller,
         spawn: impl FnOnce(Box<dyn FnOnce() + Send>) -> io::Result<()>,
-    ) -> SetupOutcome {
+    ) -> SetupAnswer {
         let setup = Arc::clone(self);
         let (sender, receiver) = tokio::sync::oneshot::channel();
         let started = spawn(Box::new(move || {
-            let _ = sender.send(setup.run_pass_blocking());
+            let _ = sender.send(setup.set_up_blocking(caller));
         }));
+        let failed = || SetupAnswer {
+            outcome: SetupOutcome::Failed,
+            unanswered: Vec::new(),
+        };
         if let Err(error) = started {
             self.record_failure(PassStage::Spawn, error.kind());
-            return SetupOutcome::Failed;
+            return failed();
         }
-        receiver.await.unwrap_or(SetupOutcome::Failed)
+        receiver.await.unwrap_or_else(|_| failed())
+    }
+
+    /// One setup for `caller`: a pass; then, only when it recorded the
+    /// readiness and with the `pass` lock released, a check of each login
+    /// the caller's rule names, each started only while the runner holds no
+    /// assignment and run outside the gate, so no admission waits for one;
+    /// then, when a check found an answer, a second pass that records it as
+    /// the login's last use and reports it (REQ-GRANT-90, INV-RUNNER-29).
+    /// A check writes nothing itself.
+    fn set_up_blocking(&self, caller: SetupCaller) -> SetupAnswer {
+        let (outcome, earlier, record) = {
+            let _pass = self.pass.lock().unwrap_or_else(PoisonError::into_inner);
+            // What the document held before the pass, against which the
+            // schedule's rule finds what the pass installed.
+            let earlier = ReadinessDocument::load(&self.dependencies.readiness_path)
+                .ok()
+                .flatten();
+            let (outcome, record) = self.pass_recording(self.gate.as_ref());
+            (outcome, earlier, record)
+        };
+        let (first, mut record) = match (&outcome, record) {
+            (SetupOutcome::Recorded(first), Some(record)) => (first, record),
+            (_, record) => {
+                self.record_changes(record.as_ref());
+                return SetupAnswer {
+                    outcome,
+                    unanswered: Vec::new(),
+                };
+            }
+        };
+        let (noted, unanswered) = self.check_logins(caller, earlier.as_ref(), first);
+        // A check that gave no answer is named in the pass's record whether
+        // or not the provider's readiness changed, unless the provider's
+        // setup already failed a step, which the record names first.
+        record.failures.extend(unanswered.iter().map(|check| {
+            (
+                check.provider,
+                StepFailure {
+                    stage: FailureStage::Check,
+                    cause: FailureCause::Check(check.cause),
+                },
+            )
+        }));
+        self.record_changes(Some(&record));
+        let outcome = if noted {
+            match self.run_pass_blocking() {
+                // An assignment started first: what was noted waits for the
+                // next pass, as a run's use does.
+                SetupOutcome::Busy(None) => outcome,
+                SetupOutcome::Busy(Some(document)) => SetupOutcome::Recorded(document),
+                second => second,
+            }
+        } else {
+            outcome
+        };
+        SetupAnswer {
+            outcome,
+            unanswered,
+        }
+    }
+
+    /// Checks each login that `caller`'s rule names in `document`, the
+    /// readiness the setup's pass recorded over `earlier`: every `ready`
+    /// install for a sync, and a `ready` install `earlier` did not hold for
+    /// the schedule. Before each check it asks the gate, without holding it,
+    /// whether the runner is idle, and makes no further check once it holds
+    /// an assignment. An answer is noted as the login's last use, as an
+    /// admission's observer notes one (REQ-GRANT-52). Answers whether it
+    /// noted one, and each login whose check gave no answer.
+    fn check_logins(
+        &self,
+        caller: SetupCaller,
+        earlier: Option<&ReadinessDocument>,
+        document: &ReadinessDocument,
+    ) -> (bool, Vec<UnansweredCheck>) {
+        let mut noted = false;
+        let mut unanswered = Vec::new();
+        for login in &document.logins {
+            let Some(installation) = login.installation() else {
+                continue;
+            };
+            let named = login.state == AgentLoginState::Ready
+                && match caller {
+                    SetupCaller::Sync => true,
+                    SetupCaller::Schedule => {
+                        earlier
+                            .and_then(|earlier| earlier.login(login.provider))
+                            .and_then(LoginReadiness::installation)
+                            != Some(installation)
+                    }
+                };
+            if !named {
+                continue;
+            }
+            if while_idle(self.gate.as_ref(), || ()).is_none() {
+                break;
+            }
+            match self.dependencies.check.check(login.provider, installation) {
+                LoginCheckOutcome::Answered(outcome) => {
+                    self.uses.note(NotedUse {
+                        provider: login.provider,
+                        agent_login_id: installation.agent_login_id.clone(),
+                        generation: installation.generation,
+                        last_use: LastUse {
+                            outcome,
+                            at: (self.clock)(),
+                        },
+                    });
+                    noted = true;
+                }
+                LoginCheckOutcome::NoAnswer(cause) => unanswered.push(UnansweredCheck {
+                    provider: login.provider,
+                    cause,
+                }),
+            }
+        }
+        (noted, unanswered)
     }
 
     fn run_pass_blocking(&self) -> SetupOutcome {
@@ -413,16 +579,25 @@ impl AgentLoginSetup {
         named.then(|| self.pass_under(&Admitting))
     }
 
-    /// One pass, each install and removal under `gate`; the caller holds the
-    /// `pass` lock.
+    /// One pass, each install and removal under `gate`, writing its record;
+    /// the caller holds the `pass` lock.
     fn pass_under(&self, gate: &dyn AssignmentGate) -> SetupOutcome {
+        let (outcome, record) = self.pass_recording(gate);
+        self.record_changes(record.as_ref());
+        outcome
+    }
+
+    /// `pass_under`, answering what its record names rather than writing it:
+    /// none for a pass that failed, or that an assignment interrupted
+    /// before it changed anything.
+    fn pass_recording(&self, gate: &dyn AssignmentGate) -> (SetupOutcome, Option<PassRecord>) {
         // While the runner holds no assignment no grant token file is any
         // assignment's (INV-RUNNER-28).
         if !gate.while_idle(&mut || {
             self.remove_leftover_temporary_files();
             self.grant_files.remove_leftovers();
         }) {
-            return SetupOutcome::Busy(None);
+            return (SetupOutcome::Busy(None), None);
         }
         let now = (self.clock)();
         let path = &self.dependencies.readiness_path;
@@ -438,7 +613,7 @@ impl AgentLoginSetup {
             Err(error) => {
                 self.record_failure(PassStage::Load, error.kind());
                 if !error.replaceable() || directory::remove_file(path).is_err() {
-                    return SetupOutcome::Failed;
+                    return (SetupOutcome::Failed, None);
                 }
                 None
             }
@@ -537,7 +712,7 @@ impl AgentLoginSetup {
                                 let mut recorded = settled.clone();
                                 recorded.push(entry.clone());
                                 if !self.write(&document(&recorded)) {
-                                    return SetupOutcome::Failed;
+                                    return (SetupOutcome::Failed, None);
                                 }
                                 recorded_change = true;
                                 installed = None;
@@ -577,7 +752,7 @@ impl AgentLoginSetup {
             // (INV-RUNNER-15).
             if changed {
                 if !self.write(&document(&settled)) {
-                    return SetupOutcome::Failed;
+                    return (SetupOutcome::Failed, None);
                 }
                 recorded_change = true;
             }
@@ -586,11 +761,11 @@ impl AgentLoginSetup {
         // anything leaves the record as it was; one interrupted after records
         // what it settled and answers busy all the same.
         if interrupted && !recorded_change {
-            return SetupOutcome::Busy(None);
+            return (SetupOutcome::Busy(None), None);
         }
         let mut document = document(&settled);
         if !self.write(&document) {
-            return SetupOutcome::Failed;
+            return (SetupOutcome::Failed, None);
         }
         // What was noted is recorded, or was noted for an install that is
         // no longer the one recorded.
@@ -623,7 +798,7 @@ impl AgentLoginSetup {
                         Some(false) => {}
                         ended => {
                             if !self.write(&document) {
-                                return SetupOutcome::Failed;
+                                return (SetupOutcome::Failed, None);
                             }
                             // A pass an assignment interrupted reports
                             // nothing more.
@@ -639,12 +814,17 @@ impl AgentLoginSetup {
                 }
             }
         }
-        self.record_changes(previous, &document, &failures);
-        if interrupted {
+        let record = PassRecord {
+            previous: previous.cloned(),
+            document: document.clone(),
+            failures,
+        };
+        let outcome = if interrupted {
             SetupOutcome::Busy(Some(document))
         } else {
             SetupOutcome::Recorded(document)
-        }
+        };
+        (outcome, Some(record))
     }
 
     /// Removes the temporary files a write of the pass's own left when its
@@ -748,7 +928,7 @@ impl AgentLoginSetup {
 
     /// What the runner tells Cloud it can install, has installed and last
     /// recorded for each installable provider, with the last use of a
-    /// `ready` install (REQ-GRANT-52).
+    /// `ready` install and when it was noted (REQ-GRANT-52).
     fn status_request(&self, previous: Option<&ReadinessDocument>) -> StatusRequest {
         StatusRequest {
             os: self.dependencies.os,
@@ -765,9 +945,7 @@ impl AgentLoginSetup {
                                 generation: installation.generation,
                             }),
                         entry.map(|entry| entry.state),
-                        entry
-                            .and_then(|entry| entry.last_use)
-                            .map(|last_use| last_use.outcome),
+                        entry.and_then(|entry| entry.last_use),
                     )
                 })
                 .collect(),
@@ -1058,15 +1236,20 @@ impl AgentLoginSetup {
     }
 
     /// Writes one record naming each provider whose state, agent login or
-    /// generation this pass changed, with its new state and generation and
-    /// the step that failed on the way, if one did; none when nothing
-    /// changed, so an idle runner adds no record per interval.
-    fn record_changes(
-        &self,
-        previous: Option<&ReadinessDocument>,
-        document: &ReadinessDocument,
-        failures: &[(AgentLoginProvider, StepFailure)],
-    ) {
+    /// generation the pass of `record` changed, or whose check gave no
+    /// answer, with its state and generation and the step that failed on
+    /// the way, if one did; none when nothing changed and no check went
+    /// unanswered, so an idle runner adds no record per interval.
+    fn record_changes(&self, record: Option<&PassRecord>) {
+        let Some(PassRecord {
+            previous,
+            document,
+            failures,
+        }) = record
+        else {
+            return;
+        };
+        let previous = previous.as_ref();
         let mut attributes = Vec::new();
         for login in &document.logins {
             let generation = login
@@ -1082,7 +1265,10 @@ impl AgentLoginSetup {
                             .map(|installation| installation.generation)
                             == generation
                 });
-            if unchanged {
+            let unanswered = failures.iter().any(|(provider, failure)| {
+                *provider == login.provider && failure.stage == FailureStage::Check
+            });
+            if unchanged && !unanswered {
                 continue;
             }
             let Some(keys) = ProviderKeys::of(login.provider) else {
@@ -1272,6 +1458,15 @@ fn status_failures(
             },
         )
     })
+}
+
+/// What a pass's record names: the readiness the pass read and recorded,
+/// and each provider's failed step.
+#[derive(Debug)]
+struct PassRecord {
+    previous: Option<ReadinessDocument>,
+    document: ReadinessDocument,
+    failures: Vec<(AgentLoginProvider, StepFailure)>,
 }
 
 /// A provider's state after a pass, the agent login its entry records, and

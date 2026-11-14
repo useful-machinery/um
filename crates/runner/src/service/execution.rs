@@ -555,7 +555,7 @@ fn hex_nibble(byte: u8) -> Option<u8> {
 }
 
 #[derive(Clone, Copy, Debug)]
-struct RunnerExecutionInstant {
+pub(crate) struct RunnerExecutionInstant {
     monotonic: Instant,
     utc: OffsetDateTime,
 }
@@ -572,7 +572,7 @@ impl Add<Duration> for RunnerExecutionInstant {
 }
 
 #[derive(Clone, Copy)]
-struct RunnerExecutionClock;
+pub(crate) struct RunnerExecutionClock;
 
 impl CoordinatorClock for RunnerExecutionClock {
     type Instant = RunnerExecutionInstant;

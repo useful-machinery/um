@@ -5,6 +5,16 @@ pub struct CodexConfig {
     pub(crate) effort: String,
 }
 
+/// The model a login check asks for (INV-HARNESS-18), which has no workflow profile. The
+/// adapter names the model when it starts a thread and checks the thread's answer against
+/// it, so the installation's configured default cannot stand in: this is the fast,
+/// lowest-cost model of the GPT-5.6 family, which the qualification version
+/// `CODEX_APP_SERVER_V1_QUALIFICATION_VERSION` (0.163.0) itself uses for its guardian
+/// reviews and the live Codex smoke pins. A login whose account may not use it is refused.
+pub(crate) const LOGIN_CHECK_MODEL: &str = "gpt-5.6-luna";
+/// The lowest effort the adapter is qualified with.
+pub(crate) const LOGIN_CHECK_EFFORT: &str = "low";
+
 // Codex keeps native effort as a string and must not inherit Claude's closed effort enum.
 pub(crate) fn resolve_config(value: &Value) -> Option<CodexConfig> {
     let config = serde_json::from_value::<CodexConfig>(value.clone()).ok()?;
@@ -2906,4 +2916,4 @@ fn failed(cause: AgentFailureCause) -> AgentOutcome {
 mod tests;
 
 #[cfg(test)]
-mod adapter_tests;
+pub(crate) mod adapter_tests;

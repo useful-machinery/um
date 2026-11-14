@@ -35,6 +35,7 @@ mod identity;
 pub(crate) mod input;
 pub(crate) mod invocation_accounting;
 pub(crate) mod local_run;
+pub(crate) mod login_check;
 pub(crate) mod mirror;
 pub(crate) mod observation;
 pub(crate) mod pi;

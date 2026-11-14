@@ -205,9 +205,9 @@ fn the_last_use_of_an_install_round_trips_beside_it_and_only_there() {
         );
         assert_eq!(value["providers"][0]["lastUseAt"], "2026-11-12T00:58:00Z");
         assert_eq!(ReadinessDocument::load(&path), Ok(Some(document.clone())));
-        // The control socket reports the last use and the selection, but
-        // neither when the use was nor where the install is
-        // (REQ-GRANT-53, REQ-RUNNERENROLL-63).
+        // The control socket reports the last use with its time and the
+        // selection, but not where the install is (REQ-GRANT-41,
+        // REQ-GRANT-53, REQ-RUNNERENROLL-63).
         let reported = serde_json::to_value(document.reported().unwrap()).unwrap();
         let entry = &reported["providers"][0];
         assert_eq!(
@@ -216,7 +216,7 @@ fn the_last_use_of_an_install_round_trips_beside_it_and_only_there() {
             "{reported}"
         );
         assert_eq!(entry["selected"], true, "{reported}");
-        assert!(entry.get("lastUseAt").is_none(), "{reported}");
+        assert_eq!(entry["lastUseAt"], "2026-11-12T00:58:00Z", "{reported}");
         assert!(entry.get("installedPath").is_none(), "{reported}");
     }
 
