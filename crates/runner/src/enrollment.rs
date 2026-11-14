@@ -136,15 +136,11 @@ impl JoinKeyArtifact {
     /// private to the current user, which is neither removed nor rewritten, or
     /// with `-` from piped standard input.
     pub fn read_file(path: &Path) -> Result<Self, EnrollmentError> {
-        let bytes = if path == Path::new("-") {
-            if io::stdin().is_terminal() {
-                return Err(EnrollmentError::TerminalStdin);
-            }
-            read_piped_artifact().map_err(|_| EnrollmentError::InvalidJoinKey)?
-        } else {
-            read_bounded_regular_file(path, ARTIFACT_LIMIT, true)
-                .map_err(|_| EnrollmentError::JoinKeyFile)?
-        };
+        let bytes = read_artifact_bytes(path).map_err(|failure| match failure {
+            ArtifactReadFailure::Terminal => EnrollmentError::TerminalStdin,
+            ArtifactReadFailure::Stdin(_) => EnrollmentError::InvalidJoinKey,
+            ArtifactReadFailure::File(_) => EnrollmentError::JoinKeyFile,
+        })?;
         Self::parse(&bytes)
     }
 
@@ -586,20 +582,79 @@ pub fn write_activation_file(
     destination: &str,
     artifact: &ActivationArtifact,
 ) -> Result<(), EnrollmentError> {
-    if destination == "-" {
-        return artifact.write_json(&mut io::stdout().lock());
-    }
-    let file =
-        PrivateArtifactFile::create(Path::new(destination)).map_err(|error| match error {
-            PrivateArtifactError::UnsafeDirectory => EnrollmentError::UnsafePath(
-                "activation artifact parent must be a non-symbolic-link directory",
-            ),
-            _ => EnrollmentError::ArtifactWrite,
-        })?;
+    let destination = ArtifactDestination::prepare(destination).map_err(|error| match error {
+        PrivateArtifactError::UnsafeDirectory => EnrollmentError::UnsafePath(
+            "activation artifact parent must be a non-symbolic-link directory",
+        ),
+        _ => EnrollmentError::ArtifactWrite,
+    })?;
     let mut document = zeroize::Zeroizing::new(Vec::new());
     artifact.write_json(&mut *document)?;
-    file.write(&document)
+    destination
+        .write(&document)
         .map_err(|_| EnrollmentError::ArtifactWrite)
+}
+
+/// Where an issued secret-bearing artifact goes: standard output for `-`,
+/// otherwise a new `PrivateArtifactFile` at the path. `prepare` creates the
+/// file, so a caller can refuse an unusable destination before the secret is
+/// issued; `write` then writes the whole document once.
+pub enum ArtifactDestination {
+    Stdout,
+    File(PrivateArtifactFile),
+}
+
+impl ArtifactDestination {
+    pub fn prepare(destination: &str) -> Result<Self, PrivateArtifactError> {
+        if destination == "-" {
+            return Ok(Self::Stdout);
+        }
+        PrivateArtifactFile::create(Path::new(destination)).map(Self::File)
+    }
+
+    pub fn file_path(&self) -> Option<&Path> {
+        match self {
+            Self::Stdout => None,
+            Self::File(file) => Some(file.path()),
+        }
+    }
+
+    pub fn write(self, document: &[u8]) -> Result<(), ArtifactWriteError> {
+        match self {
+            Self::Stdout => io::stdout()
+                .lock()
+                .write_all(document)
+                .map_err(ArtifactWriteError::Stdout),
+            Self::File(file) => file.write(document).map_err(ArtifactWriteError::File),
+        }
+    }
+}
+
+/// A failed `ArtifactDestination::write`: standard output with its I/O
+/// error, or the step at which the file failed. It reads as the error it
+/// holds, so a caller's context names the destination.
+#[derive(Debug)]
+pub enum ArtifactWriteError {
+    Stdout(io::Error),
+    File(PrivateArtifactError),
+}
+
+impl fmt::Display for ArtifactWriteError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Stdout(error) => error.fmt(formatter),
+            Self::File(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl Error for ArtifactWriteError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Stdout(error) => error.source(),
+            Self::File(error) => error.source(),
+        }
+    }
 }
 
 /// A new file only the current user can read and write, which holds a
@@ -977,17 +1032,10 @@ impl LockedStateDirectory {
     fn lock(config_path: &Path) -> Result<Self, EnrollmentError> {
         let config = load_operator_config(config_path)?;
         let state_path = config.runner_state_path;
-        let state_directory = state_path
-            .parent()
-            .filter(|value| !value.as_os_str().is_empty())
-            .ok_or(EnrollmentError::UnsafePath(
-                "runner state path has no parent directory",
-            ))?;
-        ensure_private_directory(state_directory)?;
-        let lock = acquire_state_lock(&state_directory.join(LOCK_FILE))?;
+        let lock = StateLock::acquire_beside(&state_path)?;
         Ok(Self {
             mode: config.deployment_mode,
-            journal_path: state_directory.join(JOURNAL_FILE),
+            journal_path: state_directory(&state_path)?.join(JOURNAL_FILE),
             state_path,
             _lock: lock,
         })
@@ -1169,7 +1217,9 @@ pub(crate) fn load_runner_service_configuration(
     path: &Path,
 ) -> Result<RunnerServiceConfiguration, EnrollmentError> {
     let config = load_operator_config(path)?;
-    let (lock, state) = load_locked_runner_state(&config)?;
+    let lock = StateLock::acquire_beside(&config.runner_state_path)?;
+    let state = read_runner_state_if_present(&config.runner_state_path, config.deployment_mode)?
+        .ok_or(EnrollmentError::InvalidState)?;
     drop(lock);
 
     let pending_credential = state
@@ -1216,8 +1266,9 @@ pub fn replacement_disposition(
     expected_runner_id: &str,
     expected_credential_id: &str,
 ) -> Result<ReplacementDisposition, EnrollmentError> {
-    let config = load_operator_config(config_path)?;
-    let (lock, state) = load_locked_runner_state(&config)?;
+    let host = LockedStateDirectory::lock(config_path)?;
+    let state = read_runner_state_if_present(&host.state_path, host.mode)?
+        .ok_or(EnrollmentError::InvalidState)?;
     if state.runner_id != expected_runner_id {
         return Err(EnrollmentError::RunnerMismatch);
     }
@@ -1232,23 +1283,8 @@ pub fn replacement_disposition(
     } else {
         ReplacementDisposition::Missing
     };
-    drop(lock);
+    drop(host);
     Ok(disposition)
-}
-
-fn load_locked_runner_state(
-    config: &OperatorConfig,
-) -> Result<(StateLock, RunnerState), EnrollmentError> {
-    let state_directory = config
-        .runner_state_path
-        .parent()
-        .filter(|value| !value.as_os_str().is_empty())
-        .ok_or(EnrollmentError::InvalidConfig)?;
-    ensure_private_directory(state_directory)?;
-    let lock = acquire_state_lock(&state_directory.join(LOCK_FILE))?;
-    let state = read_runner_state_if_present(&config.runner_state_path, config.deployment_mode)?
-        .ok_or(EnrollmentError::InvalidState)?;
-    Ok((lock, state))
 }
 
 impl RunnerStateAccess {
@@ -1261,10 +1297,8 @@ impl RunnerStateAccess {
         &self,
         expected_runner_id: &str,
     ) -> Result<Option<PendingCredential>, ReloadStateError> {
-        let directory = self.path.parent().ok_or(ReloadStateError::StateUpdate)?;
-        ensure_private_directory(directory).map_err(|_| ReloadStateError::StateUpdate)?;
-        let lock = acquire_state_lock(&directory.join(LOCK_FILE))
-            .map_err(|_| ReloadStateError::StateUpdate)?;
+        let lock =
+            StateLock::acquire_beside(&self.path).map_err(|_| ReloadStateError::StateUpdate)?;
         let state = read_runner_state_if_present(&self.path, self.deployment_mode)
             .map_err(|_| ReloadStateError::StateUpdate)?
             .ok_or(ReloadStateError::StateUpdate)?;
@@ -1288,10 +1322,8 @@ impl RunnerStateAccess {
         expected_current_credential_id: &str,
         expected_pending_credential_id: &str,
     ) -> Result<(), ReloadStateError> {
-        let directory = self.path.parent().ok_or(ReloadStateError::StateUpdate)?;
-        ensure_private_directory(directory).map_err(|_| ReloadStateError::StateUpdate)?;
-        let lock = acquire_state_lock(&directory.join(LOCK_FILE))
-            .map_err(|_| ReloadStateError::StateUpdate)?;
+        let lock =
+            StateLock::acquire_beside(&self.path).map_err(|_| ReloadStateError::StateUpdate)?;
         let mut state = read_runner_state_if_present(&self.path, self.deployment_mode)
             .map_err(|_| ReloadStateError::StateUpdate)?
             .ok_or(ReloadStateError::StateUpdate)?;
@@ -1354,28 +1386,73 @@ fn read_activation_artifact_allow_expired(
     path: &Path,
     mode: DeploymentMode,
 ) -> Result<ActivationArtifact, EnrollmentError> {
-    let bytes = if path == Path::new("-") {
-        read_piped_artifact().map_err(|_| EnrollmentError::InvalidArtifact)?
-    } else {
-        read_bounded_regular_file(path, ARTIFACT_LIMIT, true)
-            .map_err(|_| EnrollmentError::InvalidArtifact)?
-    };
-    if bytes.len() as u64 > ARTIFACT_LIMIT {
-        return Err(EnrollmentError::InvalidArtifact);
-    }
+    let bytes = read_artifact_bytes(path).map_err(|failure| match failure {
+        ArtifactReadFailure::Terminal => EnrollmentError::TerminalStdin,
+        ArtifactReadFailure::Stdin(_) | ArtifactReadFailure::File(_) => {
+            EnrollmentError::InvalidArtifact
+        }
+    })?;
     let artifact = serde_json::from_slice(&bytes).map_err(|_| EnrollmentError::InvalidArtifact)?;
     validate_artifact(&artifact, mode)?;
     Ok(artifact)
 }
 
-// The bound admits one byte over the limit so the caller can refuse it.
-fn read_piped_artifact() -> io::Result<Vec<u8>> {
+/// Reads a presented activation or join key artifact, bounded at
+/// `ARTIFACT_LIMIT`: piped standard input for `-`, refusing a terminal, or
+/// otherwise a regular file private to the current user, opened with
+/// `O_NOFOLLOW`. Each caller maps a failure to its own error.
+fn read_artifact_bytes(path: &Path) -> Result<Vec<u8>, ArtifactReadFailure> {
+    if path != Path::new("-") {
+        return read_bounded_regular_file(path, ARTIFACT_LIMIT, true)
+            .map_err(ArtifactReadFailure::File);
+    }
+    let stdin = io::stdin().lock();
+    if stdin.is_terminal() {
+        return Err(ArtifactReadFailure::Terminal);
+    }
+    // The bound admits one byte over the limit so the read can refuse it.
     let mut bytes = Vec::new();
-    io::stdin()
-        .lock()
+    stdin
         .take(ARTIFACT_LIMIT + 1)
-        .read_to_end(&mut bytes)?;
+        .read_to_end(&mut bytes)
+        .map_err(ArtifactReadFailure::Stdin)?;
+    if bytes.len() as u64 > ARTIFACT_LIMIT {
+        return Err(ArtifactReadFailure::Stdin(
+            io::ErrorKind::InvalidData.into(),
+        ));
+    }
     Ok(bytes)
+}
+
+/// A failed `read_artifact_bytes`: standard input is a terminal, standard
+/// input failed (an over-limit read is `InvalidData`), or the file failed,
+/// with the requirement it did not meet. The I/O error beneath a failure is
+/// its source.
+#[derive(Debug)]
+enum ArtifactReadFailure {
+    Terminal,
+    Stdin(io::Error),
+    File(PrivateFileFailure),
+}
+
+impl fmt::Display for ArtifactReadFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Terminal => formatter.write_str("standard input is a terminal"),
+            Self::Stdin(_) => formatter.write_str("cannot read standard input"),
+            Self::File(failure) => formatter.write_str(failure.requirement),
+        }
+    }
+}
+
+impl Error for ArtifactReadFailure {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Terminal => None,
+            Self::Stdin(error) => Some(error),
+            Self::File(failure) => Some(&failure.error),
+        }
+    }
 }
 
 fn require_unexpired(expires_at: &str, expired: EnrollmentError) -> Result<(), EnrollmentError> {
@@ -1942,6 +2019,26 @@ struct StateLock {
     file: File,
 }
 
+impl StateLock {
+    /// Takes the state lock beside `state_path`, making the state directory
+    /// private first.
+    fn acquire_beside(state_path: &Path) -> Result<Self, EnrollmentError> {
+        let directory = state_directory(state_path)?;
+        ensure_private_directory(directory)?;
+        acquire_state_lock(&directory.join(LOCK_FILE))
+    }
+}
+
+/// The directory that holds the runner state file and the files beside it.
+fn state_directory(state_path: &Path) -> Result<&Path, EnrollmentError> {
+    state_path
+        .parent()
+        .filter(|value| !value.as_os_str().is_empty())
+        .ok_or(EnrollmentError::UnsafePath(
+            "runner state path has no parent directory",
+        ))
+}
+
 impl Drop for StateLock {
     fn drop(&mut self) {
         let _ = FileExt::unlock(&self.file);
@@ -2045,7 +2142,7 @@ impl From<PrivateFileFailure> for io::Error {
 
 // Enrollment state and human OAuth storage intentionally translate the same
 // no-follow private-file primitive into different domain error contracts.
-fn create_new_private_file(path: &Path) -> io::Result<File> {
+pub(crate) fn create_new_private_file(path: &Path) -> io::Result<File> {
     let file = OpenOptions::new()
         .read(true)
         .write(true)

@@ -523,11 +523,7 @@ pub(super) fn retain_result_publication_failure(
     });
     let bytes = serde_json::to_vec(&record).map_err(std::io::Error::other)?;
     let path = private_root.join("result-publication-failure.json");
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(path)?;
+    let mut file = crate::enrollment::create_new_private_file(&path)?;
     file.write_all(&bytes)?;
     file.sync_all()
 }

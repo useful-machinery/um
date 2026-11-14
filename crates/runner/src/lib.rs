@@ -37,12 +37,13 @@ pub use doctor::{
     repository_root,
 };
 pub use enrollment::{
-    ActivationArtifact, ActivationArtifactParts, AmbiguousCause, EnrollmentError,
-    EnrollmentOutcome, EnrollmentResponse, JoinKeyArtifact, JoinOutcome, JoinRefusal, JoinRetry,
-    PrivateArtifactError, PrivateArtifactFile, PublicationStage, RecordedOptions, RegisteredRunner,
-    RegistrationAuthority, RegistrationConflict, RegistrationConflictKind, RegistrationError,
-    RegistrationOutcome, RegistrationStage, RegistrationTarget, ReplacementDisposition, RunnerHome,
-    RunnerHomeError, confirm_registration, enroll, join_unless_enrolled, load_control_socket_path,
+    ActivationArtifact, ActivationArtifactParts, AmbiguousCause, ArtifactDestination,
+    ArtifactWriteError, EnrollmentError, EnrollmentOutcome, EnrollmentResponse, JoinKeyArtifact,
+    JoinOutcome, JoinRefusal, JoinRetry, PrivateArtifactError, PrivateArtifactFile,
+    PublicationStage, RecordedOptions, RegisteredRunner, RegistrationAuthority,
+    RegistrationConflict, RegistrationConflictKind, RegistrationError, RegistrationOutcome,
+    RegistrationStage, RegistrationTarget, ReplacementDisposition, RunnerHome, RunnerHomeError,
+    confirm_registration, enroll, join_unless_enrolled, load_control_socket_path,
     register_unless_enrolled, remove_completed_join_journal, replacement_disposition,
     write_activation_file,
 };

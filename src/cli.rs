@@ -1389,18 +1389,21 @@ fn remaining_observation_wait(
     }
 }
 
+/// The first unit of `units`, in table order, whose suffix `value` ends with, as the text
+/// in front of that suffix and the unit's scale.
+fn split_unit_suffix<'a, S: Copy>(value: &'a str, units: &[(&str, S)]) -> Option<(&'a str, S)> {
+    units
+        .iter()
+        .find_map(|&(suffix, scale)| value.strip_suffix(suffix).map(|quantity| (quantity, scale)))
+}
+
 fn parse_wait_timeout(value: &str) -> Result<Duration, String> {
-    let (quantity, milliseconds) = if let Some(quantity) = value.strip_suffix("ms") {
-        (quantity, 1)
-    } else if let Some(quantity) = value.strip_suffix('s') {
-        (quantity, 1_000)
-    } else if let Some(quantity) = value.strip_suffix('m') {
-        (quantity, 60_000)
-    } else if let Some(quantity) = value.strip_suffix('h') {
-        (quantity, 3_600_000)
-    } else {
-        (value, 1_000)
-    };
+    // `ms` precedes `s`, which it ends with.
+    let (quantity, milliseconds) = split_unit_suffix(
+        value,
+        &[("ms", 1), ("s", 1_000), ("m", 60_000), ("h", 3_600_000)],
+    )
+    .unwrap_or((value, 1_000));
     let total_milliseconds = quantity
         .parse::<u64>()
         .ok()

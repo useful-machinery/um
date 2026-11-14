@@ -1,5 +1,4 @@
 use std::io::{self, Write};
-use std::path::Path;
 
 use anyhow::{Context, anyhow};
 use clap::{Args, Subcommand};
@@ -11,13 +10,13 @@ use super::{
 };
 use crate::exit_code::ExitCode;
 use um_human_auth::Deployment;
-use um_runner::PrivateArtifactFile;
+use um_runner::ArtifactDestination;
 use um_support::generate_idempotency_key;
 
 pub(super) const ABOUT: &str = "Manage runner pool join keys";
 const COMMAND_PATH: &[&str] = &["runner", "join-key"];
 // Largest unit first, so a removal time prints as it is usually written.
-const DURATION_UNITS: [(char, u32); 3] = [('d', 86_400), ('h', 3_600), ('m', 60)];
+const DURATION_UNITS: [(&str, u32); 3] = [("d", 86_400), ("h", 3_600), ("m", 60)];
 
 // um-api does not name its join-key models, so these documents borrow them generically.
 #[derive(Serialize)]
@@ -146,7 +145,7 @@ impl Command {
 impl IssueCommand {
     fn execute(self, deployment: &Deployment) -> anyhow::Result<ExitCode> {
         // The file exists before the key does, so a refused path costs no key.
-        let destination = Destination::prepare(self.join_key_file.as_deref(), self.options.json)?;
+        let destination = prepare_destination(self.join_key_file.as_deref(), self.options.json)?;
         let key = generate_idempotency_key().context("generate join key request identity")?;
         let result = cloud::with_api(
             deployment,
@@ -180,8 +179,10 @@ impl IssueCommand {
                 "join key issuance replay omitted its secret; issue a replacement join key with a new command"
             )
         })?;
-        let join_key_file = destination.file_path();
-        destination.write(artifact)?;
+        let join_key_file = destination
+            .file_path()
+            .map(|path| path.display().to_string());
+        write_artifact(destination, artifact)?;
         let join_key = &*issuance.join_key;
         let Some(join_key_file) = join_key_file else {
             // Standard output carries the key alone, so the status goes to stderr.
@@ -313,53 +314,38 @@ impl RevokeCommand {
     }
 }
 
-/// Where an issued join key goes: standard output alone, or a new file only
-/// its owner can read (REQ-RUNNERENROLL-93).
-enum Destination {
-    Stdout,
-    File(PrivateArtifactFile),
+/// Prepares where an issued join key goes (REQ-RUNNERENROLL-93): no
+/// `--join-key-file`, like `-`, means standard output, which structured
+/// output never shares with a token; a path is a new file only its owner can
+/// read.
+fn prepare_destination(
+    destination: Option<&str>,
+    json: bool,
+) -> anyhow::Result<ArtifactDestination> {
+    match destination {
+        None if json => Err(anyhow!("--json requires --join-key-file PATH")),
+        Some("-") if json => Err(anyhow!("--json cannot be combined with --join-key-file -")),
+        None => Ok(ArtifactDestination::Stdout),
+        Some(path) => ArtifactDestination::prepare(path)
+            .with_context(|| format!("create join key file {path}")),
+    }
 }
 
-impl Destination {
-    /// No `--join-key-file`, like `-`, means standard output, which structured
-    /// output never shares with a token.
-    fn prepare(destination: Option<&str>, json: bool) -> anyhow::Result<Self> {
-        match destination {
-            None if json => Err(anyhow!("--json requires --join-key-file PATH")),
-            Some("-") if json => Err(anyhow!("--json cannot be combined with --join-key-file -")),
-            None | Some("-") => Ok(Self::Stdout),
-            Some(path) => {
-                let file = PrivateArtifactFile::create(Path::new(path))
-                    .with_context(|| format!("create join key file {path}"))?;
-                Ok(Self::File(file))
-            }
-        }
-    }
-
-    fn file_path(&self) -> Option<String> {
-        match self {
-            Self::Stdout => None,
-            Self::File(file) => Some(file.path().display().to_string()),
-        }
-    }
-
-    /// Writes the artifact as one line of JSON, so the same text can also be
-    /// held in an environment variable.
-    fn write(self, artifact: &impl Serialize) -> anyhow::Result<()> {
-        let mut line = Zeroizing::new(serde_json::to_vec(artifact).context("serialize join key")?);
-        line.push(b'\n');
-        match self {
-            Self::Stdout => io::stdout()
-                .lock()
-                .write_all(&line)
-                .context("write join key to stdout"),
-            Self::File(file) => {
-                let path = file.path().display().to_string();
-                file.write(&line)
-                    .with_context(|| format!("write join key file {path}"))
-            }
-        }
-    }
+/// Writes the artifact as one line of JSON, so the same text can also be
+/// held in an environment variable.
+fn write_artifact(
+    destination: ArtifactDestination,
+    artifact: &impl Serialize,
+) -> anyhow::Result<()> {
+    let mut line = Zeroizing::new(serde_json::to_vec(artifact).context("serialize join key")?);
+    line.push(b'\n');
+    let path = destination
+        .file_path()
+        .map(|path| path.display().to_string());
+    destination.write(&line).with_context(|| match path {
+        Some(path) => format!("write join key file {path}"),
+        None => "write join key to stdout".to_owned(),
+    })
 }
 
 fn parse_expiry(value: &str) -> Result<i32, String> {
@@ -380,13 +366,8 @@ fn parse_duration_within(
     let invalid = || {
         format!("must be a whole number of minutes, hours or days, {range}, such as 30m, 12h or 7d")
     };
-    let mut characters = value.chars();
-    let unit = characters.next_back().ok_or_else(invalid)?;
-    let quantity = characters.as_str();
-    let (_, unit_seconds) = DURATION_UNITS
-        .into_iter()
-        .find(|(suffix, _)| *suffix == unit)
-        .ok_or_else(invalid)?;
+    let (quantity, unit_seconds) =
+        super::super::split_unit_suffix(value, &DURATION_UNITS).ok_or_else(invalid)?;
     if quantity.is_empty() || !quantity.bytes().all(|byte| byte.is_ascii_digit()) {
         return Err(invalid());
     }

@@ -17,9 +17,9 @@
 
 use std::collections::VecDeque;
 use std::ffi::OsString;
-use std::fs::{self, DirBuilder};
+use std::fs::DirBuilder;
 use std::io::Write as _;
-use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
+use std::os::unix::fs::DirBuilderExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
@@ -642,11 +642,7 @@ fn stage_inputs(directory: &Path, inputs: &ResolvedInputs) -> std::io::Result<Ve
 }
 
 fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(path)?;
+    let mut file = crate::enrollment::create_new_private_file(path)?;
     file.write_all(bytes)?;
     file.sync_all()
 }
