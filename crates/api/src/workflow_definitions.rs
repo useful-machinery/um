@@ -161,14 +161,16 @@ impl<'a> WorkflowDefinitionApi<'a> {
 
     /// Uploads and seals the tree `digest` (`sha256:<hex>`) of `files` (REQ-CLOUDDEF-3):
     /// posts the manifest, puts each file the organization does not retain to its signed
-    /// capability, and seals the tree under `key` unless the Gateway answered it sealed.
+    /// capability, and seals the tree under `key` unless the Gateway answered it sealed. The
+    /// sealed tree, with whether the Gateway already held it sealed, so that nothing was
+    /// uploaded or sealed (REQ-CLOUDDEF-22).
     pub fn upload_tree(
         &self,
         organization: &str,
         digest: &str,
         files: &[WorkflowTreeFile<'_>],
         key: &str,
-    ) -> Result<WorkflowTree, WorkflowDefinitionFailure> {
+    ) -> Result<(WorkflowTree, bool), WorkflowDefinitionFailure> {
         let manifest = models::WorkflowTreeManifest::new(
             digest.to_owned(),
             files
@@ -202,7 +204,7 @@ impl<'a> WorkflowDefinitionApi<'a> {
             self.put_object(capability, file.bytes)?;
         }
         if issued.tree.state == models::workflow_tree::State::Sealed {
-            return Ok(*issued.tree);
+            return Ok((*issued.tree, true));
         }
         let endpoint = self.endpoint(organization, &["workflow-trees", digest, "seal"]);
         let request = mutation_request(&self.configuration, Method::POST, &endpoint, key);
@@ -210,7 +212,7 @@ impl<'a> WorkflowDefinitionApi<'a> {
         if sealed.digest != digest || sealed.state != models::workflow_tree::State::Sealed {
             return Err(invalid());
         }
-        Ok(sealed)
+        Ok((sealed, false))
     }
 
     /// The definition `id` of `project` (REQ-CLOUDDEF-8).
@@ -436,24 +438,43 @@ impl<'a> WorkflowDefinitionApi<'a> {
         Ok(definition)
     }
 
-    /// Creates a definition of `project` with revision 1 of the sealed tree (REQ-CLOUDDEF-4).
+    /// Creates a definition of `project` with revision 1 of the sealed tree (REQ-CLOUDDEF-4)
+    /// or, when `reuse_identical`, answers the project's definition whose current revision
+    /// is identical to the publication (REQ-CLOUDDEF-21): the publication, with whether it is
+    /// such a reused definition. A create that did not ask for reuse never sends the member,
+    /// and a reuse answered to it is an invalid response.
     pub fn create_definition(
         &self,
         organization: &str,
         project: &str,
         key: &str,
         publication: WorkflowPublication<'_>,
-    ) -> Result<WorkflowDefinitionPublication, WorkflowDefinitionFailure> {
+        reuse_identical: bool,
+    ) -> Result<(WorkflowDefinitionPublication, bool), WorkflowDefinitionFailure> {
         let mut body =
             models::CreateWorkflowDefinitionRequest::new(publication.tree_digest.to_owned());
         body.bindings = publication.bindings.cloned();
         body.executable_paths = publication.executable_paths.map(<[String]>::to_vec);
+        body.reuse_identical = reuse_identical.then_some(true);
         let endpoint = self.definitions_endpoint(organization, project, &[]);
         let request =
             mutation_request(&self.configuration, Method::POST, &endpoint, key).json(&body);
-        let published = receive(request, StatusCode::CREATED, Some(key))?;
-        validate_publication(&published, project, None, 1, publication.tree_digest)?;
-        Ok(published)
+        let accepted: &[StatusCode] = if reuse_identical {
+            &[StatusCode::CREATED, StatusCode::OK]
+        } else {
+            &[StatusCode::CREATED]
+        };
+        let (status, published): (_, WorkflowDefinitionPublication) =
+            receive_one_of(request, accepted, Some(key))?;
+        let reused = status == StatusCode::OK;
+        // A reuse answers the definition's current revision, whatever its number.
+        let revision = if reused {
+            published.definition.current_revision
+        } else {
+            1
+        };
+        validate_publication(&published, project, None, revision, publication.tree_digest)?;
+        Ok((published, reused))
     }
 
     /// Publishes the next revision of definition `id` over `expected_current_revision`
@@ -595,6 +616,16 @@ fn receive<T: serde::de::DeserializeOwned + serde::Serialize>(
     expected: StatusCode,
     key: Option<&str>,
 ) -> Result<T, WorkflowDefinitionFailure> {
+    receive_one_of(request, &[expected], key).map(|(_, body)| body)
+}
+
+/// The status and closed JSON body of a response whose status is one of `accepted`, its key
+/// confirmed when `key` is given; any other status is classified.
+fn receive_one_of<T: serde::de::DeserializeOwned + serde::Serialize>(
+    request: reqwest::blocking::RequestBuilder,
+    accepted: &[StatusCode],
+    key: Option<&str>,
+) -> Result<(StatusCode, T), WorkflowDefinitionFailure> {
     let response = receive_raw(request).map_err(|failure| match failure {
         ResourceFailure::Unreachable { category } => {
             WorkflowDefinitionFailure::Unreachable { category }
@@ -606,14 +637,15 @@ fn receive<T: serde::de::DeserializeOwned + serde::Serialize>(
         },
         _ => invalid(),
     })?;
-    if response.status != expected {
+    if !accepted.contains(&response.status) {
         return Err(classify(&response));
     }
     if let Some(key) = key {
         validate_mutation_key(&response.headers, key).map_err(|_| invalid())?;
     }
     validate_json_media_type(&response.headers).map_err(|_| invalid())?;
-    decode_closed_json(&response.body).map_err(|_| invalid())
+    let body = decode_closed_json(&response.body).map_err(|_| invalid())?;
+    Ok((response.status, body))
 }
 
 fn classify(response: &RawResponse) -> WorkflowDefinitionFailure {
@@ -768,10 +800,12 @@ mod tests {
     use reqwest::StatusCode;
     use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderValue};
 
+    use um_test_support::{REQUEST_IDEMPOTENCY_KEY_ECHO, ScriptedHttpServer};
+
     use super::super::resource::{RawResponse, problem_fixture};
     use super::{
         WorkflowDefinitionApi, WorkflowDefinitionFailure, WorkflowEvaluationFilter,
-        WorkflowRefusal, classify,
+        WorkflowPublication, WorkflowRefusal, classify,
     };
     use crate::{HttpClient, HttpTransportPolicy};
 
@@ -816,6 +850,67 @@ mod tests {
             classify(&problem(409, "Not A Slug")),
             WorkflowDefinitionFailure::InvalidResponse { .. }
         ));
+    }
+
+    // REQ-CLOUDDEF-22: a 200 answering a create is the project's identical definition, reused,
+    // only when the create asked for reuse; to any other create it is an invalid response.
+    #[test]
+    fn a_reused_definition_is_accepted_only_when_the_create_asked_for_reuse() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let project = "prj_01k0z6r1w8f4jy2m7q9v3x5abc";
+        let definition = "def_01k0z6r1w8f4jy2m7q9v3x5abc";
+        let digest = format!("sha256:{}", "a".repeat(64));
+        let at = "2026-11-10T12:00:00Z";
+        // The definition stands at revision 3, which a reuse answers as it is.
+        let body = serde_json::to_vec(&serde_json::json!({
+            "definition": {
+                "id": definition, "projectId": project, "name": "engineering",
+                "state": "active", "automaticStarts": false, "executionPrincipalId": null,
+                "currentRevision": 3, "createdAt": at, "updatedAt": at,
+            },
+            "revision": {
+                "definitionId": definition, "number": 3, "treeDigest": digest,
+                "bindings": {}, "resolution": {}, "publishedAt": at,
+                "publishedBy": "prn_01k0z6r1w8f4jy2m7q9v3x5abc",
+            },
+        }))
+        .expect("publication");
+        let mut response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nIdempotency-Key: {REQUEST_IDEMPOTENCY_KEY_ECHO}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        response.extend_from_slice(&body);
+        let server = ScriptedHttpServer::respond_in_sequence(vec![response.clone(), response]);
+        let storage = HttpClient::new(HttpTransportPolicy::AllowInsecureHttp).expect("client");
+        let api =
+            WorkflowDefinitionApi::new(&server.api_url, "fixture-token", &storage).expect("api");
+        let publication = WorkflowPublication {
+            tree_digest: &digest,
+            bindings: None,
+            executable_paths: None,
+        };
+
+        assert_eq!(
+            api.create_definition("acme", project, "create-key", publication, false)
+                .map(|(_, reused)| reused),
+            Err(WorkflowDefinitionFailure::InvalidResponse {
+                credential_rejected: false
+            })
+        );
+        let (published, reused) = api
+            .create_definition("acme", project, "reuse-key", publication, true)
+            .expect("a reuse the create asked for");
+        assert!(reused);
+        assert_eq!(published.definition.id, definition);
+        assert_eq!(published.revision.number, 3);
+        let requests = server.finish();
+        assert!(!requests[0].contains("reuseIdentical"), "{}", requests[0]);
+        assert!(
+            requests[1].contains(r#""reuseIdentical":true"#),
+            "{}",
+            requests[1]
+        );
     }
 
     // REQ-COMPAT-20: a page longer than the 100-item `limit` maximum this release requests

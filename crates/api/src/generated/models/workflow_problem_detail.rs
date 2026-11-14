@@ -35,6 +35,9 @@ pub struct WorkflowProblemDetail {
     pub validator_failure: Option<ValidatorFailure>,
     #[serde(rename = "missingPaths", skip_serializing_if = "Option::is_none")]
     pub missing_paths: Option<Vec<String>>,
+    /// The identical active definitions, in id order, for `definition-reuse-ambiguous`.
+    #[serde(rename = "definitionIds", skip_serializing_if = "Option::is_none")]
+    pub definition_ids: Option<Vec<String>>,
 }
 
 impl WorkflowProblemDetail {
@@ -49,6 +52,7 @@ impl WorkflowProblemDetail {
             diagnostic_code: None,
             validator_failure: None,
             missing_paths: None,
+            definition_ids: None,
         }
     }
 }

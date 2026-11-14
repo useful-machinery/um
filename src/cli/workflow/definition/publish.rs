@@ -24,6 +24,8 @@ use um_human_auth::Deployment;
 pub(super) const ABOUT: &str = "Publish a local workflow tree as a definition revision";
 const COMMAND_NAME: &str = "um workflow definition publish";
 const REFUSED: &str = "Publish refused.";
+/// The problem slug of a reuse that matched several identical Cloud definitions.
+const DEFINITION_REUSE_AMBIGUOUS: &str = "definition-reuse-ambiguous";
 
 #[derive(Debug, Args)]
 pub(super) struct Command {
@@ -82,7 +84,7 @@ pub(super) struct Command {
     #[arg(
         long,
         requires = "cloud",
-        help = "Create another Cloud definition even when the local definition records one"
+        help = "Create another Cloud definition even when the local definition records one or the project holds an identical one"
     )]
     cloud_new: bool,
 
@@ -99,23 +101,31 @@ struct CloudTarget {
 
 /// How the Cloud definition `--cloud` publishes to is chosen.
 enum CloudDefinition {
-    /// The local record's `cloudId`, or a new one when the record holds none.
+    /// The local record's `cloudId` or, when the record holds none, the project's identical
+    /// definition if Cloud holds one and otherwise a new one (REQ-CLOUDDEF-22).
     Recorded,
     /// `--cloud-to CLOUD_ID`, whatever the record holds (REQ-CLOUDDEF-20).
     Named(String),
-    /// `--cloud-new`.
+    /// `--cloud-new`: a new one, whatever the record or the project holds.
     New,
 }
 
 impl CloudTarget {
     /// The existing Cloud definition the publication is addressed to, given the record's
-    /// `cloudId`; none when it creates one.
+    /// `cloudId`; none when it sends a create, which creates a definition or reuses one.
     fn existing<'a>(&'a self, recorded: Option<&'a str>) -> Option<&'a str> {
         match &self.definition {
             CloudDefinition::Recorded => recorded,
             CloudDefinition::Named(id) => Some(id),
             CloudDefinition::New => None,
         }
+    }
+
+    /// Whether the create sent when no existing definition is addressed asks Cloud for the
+    /// project's identical definition: only for a record with no `cloudId` and neither
+    /// `--cloud-to` nor `--cloud-new`.
+    const fn reuses_identical(&self, recorded: Option<&str>) -> bool {
+        matches!(self.definition, CloudDefinition::Recorded) && recorded.is_none()
     }
 
     /// `--cloud-to`'s id, when it was given.
@@ -127,12 +137,16 @@ impl CloudTarget {
     }
 }
 
-/// The Cloud definition a publication reached and the revision it recorded.
+/// The Cloud definition a publication reached and its current revision: the one it recorded,
+/// or for a reused definition the one it already had; and whether Cloud already held the tree
+/// sealed.
 struct CloudPublished {
     definition: String,
     created: bool,
+    reused: bool,
     revision: i32,
     tree_digest: String,
+    tree_reused: bool,
 }
 
 impl Command {
@@ -228,7 +242,7 @@ impl Command {
         {
             writeln!(
                 io::stderr().lock(),
-                "error: Cloud definition {} received revision {} but is not recorded as the cloudId of {}",
+                "error: Cloud definition {} was reached at revision {} but is not recorded as the cloudId of {}",
                 display(&reached.definition),
                 reached.revision,
                 display(&published.record.id)
@@ -247,10 +261,12 @@ impl Command {
 
 /// Uploads and seals the tree, then publishes to the Cloud definition `--cloud-to` names
 /// or, without it, the one the local record names unless `--cloud-new`, over the current
-/// revision it reads first, else creates one (REQ-CLOUDDEF-14, REQ-CLOUDDEF-20). A refused
-/// read or publication of an existing definition never falls through to a create. The revision's bindings snapshot is sent whole, a
-/// `members` value as an array, with the tree's executable files; one fresh key covers the
-/// seal and the publication for the whole invocation.
+/// revision it reads first (REQ-CLOUDDEF-14, REQ-CLOUDDEF-20). Otherwise it creates one:
+/// `--cloud-new` always, and a record with no `cloudId` asking Cloud for the project's
+/// identical definition first (REQ-CLOUDDEF-22). A refused read or publication of an
+/// existing definition never falls through to a create. The revision's bindings snapshot is
+/// sent whole, a `members` value as an array, with the tree's executable files; one fresh key
+/// covers the seal and the publication for the whole invocation.
 fn publish_to_cloud(
     deployment: &Deployment,
     options: &CommonArgs<WorkflowJson, PrincipalAuthenticationArgs>,
@@ -290,6 +306,7 @@ fn publish_to_cloud(
         bindings: &bindings,
         executable_paths: &executable_paths,
         existing: target.existing(published.record.cloud_id.as_deref()),
+        reuse_identical: target.reuses_identical(published.record.cloud_id.as_deref()),
         key: &key,
     };
     with_api(deployment, options, |api| steps.run(api))
@@ -307,6 +324,9 @@ struct CloudSteps<'a> {
     executable_paths: &'a [String],
     /// The Cloud definition `--cloud-to` or the local record names, unless `--cloud-new`.
     existing: Option<&'a str>,
+    /// Whether the create sent without `existing` asks for the project's identical
+    /// definition: false for `--cloud-new`.
+    reuse_identical: bool,
     key: &'a str,
 }
 
@@ -319,7 +339,7 @@ impl CloudSteps<'_> {
             self.target.organization.as_str(),
             self.target.project.as_str(),
         );
-        api.upload_tree(organization, self.digest, self.files, self.key)?;
+        let (_, tree_reused) = api.upload_tree(organization, self.digest, self.files, self.key)?;
         let publication = WorkflowPublication {
             tree_digest: self.digest,
             bindings: Some(self.bindings),
@@ -327,22 +347,31 @@ impl CloudSteps<'_> {
         };
         // The create or publication is sent again once, under the same key, when Cloud
         // does not answer it.
-        let publication = match self.existing {
+        let (publication, reused) = match self.existing {
             Some(id) => {
                 let current = api.definition(organization, project, id)?.current_revision;
-                resend_once(|| {
+                let published = resend_once(|| {
                     api.publish_revision(organization, project, id, self.key, current, publication)
-                })?
+                })?;
+                (published, false)
             }
-            None => {
-                resend_once(|| api.create_definition(organization, project, self.key, publication))?
-            }
+            None => resend_once(|| {
+                api.create_definition(
+                    organization,
+                    project,
+                    self.key,
+                    publication,
+                    self.reuse_identical,
+                )
+            })?,
         };
         Ok(CloudPublished {
             definition: publication.definition.id,
-            created: self.existing.is_none(),
+            created: self.existing.is_none() && !reused,
+            reused,
             revision: publication.revision.number,
             tree_digest: publication.revision.tree_digest,
+            tree_reused,
         })
     }
 }
@@ -384,8 +413,10 @@ fn write_cloud_published(
             target: addressed,
             definition: reached_ok.map(|reached| reached.definition.as_str()),
             created: reached_ok.map(|reached| reached.created),
+            reused: reached_ok.map(|reached| reached.reused),
             revision: reached_ok.map(|reached| reached.revision),
             tree_digest: reached_ok.map(|reached| reached.tree_digest.as_str()),
+            tree_reused: reached_ok.map(|reached| reached.tree_reused),
             failure: reached
                 .as_ref()
                 .err()
@@ -405,8 +436,18 @@ fn write_cloud_published(
             let mut stdout = io::stdout().lock();
             writeln!(stdout, "cloud definition: {}", display(&reached.definition))?;
             writeln!(stdout, "cloud created: {}", super::yes_no(reached.created))?;
+            writeln!(
+                stdout,
+                "cloud definition reused: {}",
+                super::yes_no(reached.reused)
+            )?;
             writeln!(stdout, "cloud revision: {}", reached.revision)?;
             writeln!(stdout, "cloud tree: {}", display(&reached.tree_digest))?;
+            writeln!(
+                stdout,
+                "cloud tree reused: {}",
+                super::yes_no(reached.tree_reused)
+            )?;
         }
         Err(failure) => {
             let mut stderr = io::stderr().lock();
@@ -435,6 +476,14 @@ fn write_cloud_published(
                     {
                         writeln!(stderr, "binding: {}", display(key))?;
                     }
+                    if let Some(ids) = refusal
+                        .workflow
+                        .as_ref()
+                        .and_then(|detail| detail.definition_ids.as_deref())
+                    {
+                        let ids = ids.iter().map(|id| display(id)).collect::<Vec<_>>();
+                        writeln!(stderr, "cloud definitions: {}", ids.join(", "))?;
+                    }
                 }
                 None => writeln!(
                     stderr,
@@ -442,6 +491,8 @@ fn write_cloud_published(
                     cloud_failure(failure).0
                 )?,
             }
+            let ambiguous =
+                refusal.is_some_and(|refusal| refusal.problem == DEFINITION_REUSE_AMBIGUOUS);
             match target.named() {
                 // The record's Cloud definition was not changed, so the next attempt names
                 // the target again.
@@ -454,6 +505,17 @@ fn write_cloud_published(
                     display(&target.organization),
                     display(&target.project),
                     display(id)
+                )?,
+                // Several identical definitions answered the reuse: the owner chooses one.
+                None if ambiguous => writeln!(
+                    stderr,
+                    "\nRevision {} of {} stays recorded locally. Several Cloud definitions of the project are identical to it. Publish again to the one listed that you choose, or create another:\n  um workflow definition publish <DIR> --cloud {} --project {} --cloud-to <CLOUD_ID>\n  um workflow definition publish <DIR> --cloud {} --project {} --cloud-new",
+                    published.revision.n,
+                    display(&published.record.id),
+                    display(&target.organization),
+                    display(&target.project),
+                    display(&target.organization),
+                    display(&target.project)
                 )?,
                 None => writeln!(
                     stderr,
@@ -535,24 +597,34 @@ struct JsonPublished<'a> {
 }
 
 /// The Cloud half of `--cloud`: the existing definition it was addressed to, the definition
-/// and revision it reached, or its failure with a refusal's status, problem slug and
-/// `workflow` safe facts.
+/// and revision it reached with whether it was created, reused or published to and whether
+/// the tree was reused (REQ-CLOUDDEF-22), or its failure with a refusal's status, problem
+/// slug and `workflow` safe facts.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct JsonCloud<'a> {
     organization_ref: &'a str,
     project_id: &'a str,
-    /// The id from `--cloud-to` or the record's `cloudId`; absent when a create is sent.
+    /// The id from `--cloud-to` or the record's `cloudId`; absent when a create is sent,
+    /// whether it creates a definition or reuses one.
     #[serde(skip_serializing_if = "Option::is_none")]
     target: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     definition: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     created: Option<bool>,
+    /// Whether the create answered the project's identical definition; present exactly when
+    /// `created` is.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reused: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     revision: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tree_digest: Option<&'a str>,
+    /// Whether Cloud already held the tree sealed, so nothing was uploaded or sealed; present
+    /// exactly when `created` is.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tree_reused: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     failure: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]

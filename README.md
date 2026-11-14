@@ -1721,9 +1721,10 @@ raw-body signature verification, deduplication, overlap and retention.
 `um workflow definition publish --cloud ORGANIZATION --project PROJECT` records the
 revision locally and then publishes the tree to that project's Cloud definition: it
 uploads and seals the tree under its digest and publishes the revision with its bindings.
-The first publication creates the Cloud definition and records its id locally; later ones
-publish to it, and `--cloud-new` creates another. A Cloud refusal leaves the local
-revision recorded and exits 1.
+A home's first publication creates the Cloud definition, or reuses the project's definition
+whose current revision has the same tree, bindings and executable bits, and records its id
+locally; later ones publish to it, and `--cloud-new` creates another. A Cloud refusal leaves
+the local revision recorded and exits 1.
 
 ```sh
 um workflow definition publish .um/engineering --bindings bindings.json \
@@ -1744,8 +1745,17 @@ um workflow definition publish .um/engineering --bindings bindings.json \
 ```
 
 The home then records `DEFINITION` as the local definition's Cloud id, so later
-publications from it need no target. Without `--cloud-to`, a home with no recorded Cloud id
+publications from it need no target. Without `--cloud-to`, such a home reuses the definition
+only when its publication is identical to the definition's current revision, and otherwise
 creates a second Cloud definition.
+
+With `--json`, `cloud.reused` is `true` when the publication reused an identical definition;
+a reused definition records no revision, and `cloud.revision` is its current one.
+`cloud.treeReused` is `true` when Cloud already held the tree sealed under its digest, so
+nothing was uploaded; tree reuse is storage and says nothing of the definition. When more
+than one of the project's definitions is identical, Cloud refuses with
+`definition-reuse-ambiguous` and the report names their ids (`cloud.workflow.definitionIds`):
+choose one with `--cloud-to`, or create another with `--cloud-new`.
 
 `um workflow definition cloud` reads and changes a project's Cloud definitions, and lists
 and shows a definition's start evaluations, newest first:

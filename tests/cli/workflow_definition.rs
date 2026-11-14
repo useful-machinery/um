@@ -1535,7 +1535,8 @@ impl GatewayRequest {
 /// What the fake Gateway holds between invocations: the file contents the organization
 /// retains, the sealed tree digests, each definition, whether the next publication to an id
 /// loses a race to another publisher or is forbidden, whether the reply to the next create
-/// or publication is lost after it is applied, and each such reply by its `Idempotency-Key`.
+/// or publication is lost after it is applied, and each such reply, with its status, by its
+/// `Idempotency-Key`.
 #[derive(Default)]
 struct GatewayState {
     retained: std::collections::BTreeSet<String>,
@@ -1544,37 +1545,41 @@ struct GatewayState {
     lose_next_publication: bool,
     forbid_next_publication: bool,
     drop_next_publication_reply: bool,
-    publications: std::collections::BTreeMap<String, Value>,
+    publications: std::collections::BTreeMap<String, (&'static str, Value)>,
 }
 
 impl GatewayState {
-    /// The reply to a create or publication keyed `key`: the one recorded under the key, or
-    /// `publish`'s, recorded and, when the next reply is to be lost, not sent (no bytes).
+    /// The reply to a create or publication keyed `key`: the one recorded under the key with
+    /// its status, or `publish`'s, recorded and, when the next reply is to be lost, not sent
+    /// (no bytes).
     fn publication(
         &mut self,
         key: &str,
         keyed: impl Fn(&str, Value) -> Vec<u8>,
-        publish: impl FnOnce(&mut Self) -> Result<Value, Vec<u8>>,
+        publish: impl FnOnce(&mut Self) -> Result<(&'static str, Value), Vec<u8>>,
     ) -> Vec<u8> {
-        if let Some(replayed) = self.publications.get(key) {
-            return keyed("201 Created", replayed.clone());
+        if let Some((status, replayed)) = self.publications.get(key) {
+            return keyed(status, replayed.clone());
         }
-        let published = match publish(self) {
+        let (status, published) = match publish(self) {
             Ok(published) => published,
             Err(refusal) => return refusal,
         };
-        self.publications.insert(key.to_owned(), published.clone());
+        self.publications
+            .insert(key.to_owned(), (status, published.clone()));
         if std::mem::take(&mut self.drop_next_publication_reply) {
             return Vec::new();
         }
-        keyed("201 Created", published)
+        keyed(status, published)
     }
 }
 
-/// One Cloud definition the fake Gateway holds: its current revision and settings.
+/// One Cloud definition the fake Gateway holds: its current revision, what that revision
+/// published (`publication_of` the request) and its settings.
 #[derive(Clone, Default)]
 struct FakeDefinition {
     current: i64,
+    published: Value,
     archived: bool,
     automatic_starts: bool,
     principal: Option<String>,
@@ -1811,6 +1816,36 @@ fn respond(state: &mut GatewayState, request: &GatewayRequest, address: &str) ->
     if route == format!("POST {definitions}") {
         let body = request.json();
         return state.publication(&key, keyed, |state| {
+            let published = publication_of(&body);
+            // `reuseIdentical` answers the active definition whose current revision published
+            // the same, and refuses when several did (REQ-CLOUDDEF-21).
+            if body["reuseIdentical"] == true {
+                let identical = state
+                    .definitions
+                    .iter()
+                    .filter(|(_, definition)| {
+                        !definition.archived && definition.published == published
+                    })
+                    .map(|(id, _)| id.clone())
+                    .collect::<Vec<_>>();
+                match identical.as_slice() {
+                    [] => {}
+                    [id] => {
+                        return Ok(("200 OK", gateway_publication(id, &state.definitions[id])));
+                    }
+                    ids => {
+                        return Err(super::problem_http_response(
+                            "409 Conflict",
+                            json!({
+                                "type": format!("{PROBLEMS}definition-reuse-ambiguous"),
+                                "title": "Definition reuse ambiguous",
+                                "status": 409,
+                                "workflow": {"definitionIds": ids},
+                            }),
+                        ));
+                    }
+                }
+            }
             let id = format!(
                 "{CLOUD_ID_STEM}{}",
                 ['c', 'd', 'e', 'f', 'g', 'h'][state.definitions.len()]
@@ -1819,13 +1854,13 @@ fn respond(state: &mut GatewayState, request: &GatewayRequest, address: &str) ->
                 id.clone(),
                 FakeDefinition {
                     current: 1,
+                    published,
                     ..FakeDefinition::default()
                 },
             );
-            Ok(gateway_publication(
-                &id,
-                &state.definitions[&id],
-                &body["treeDigest"],
+            Ok((
+                "201 Created",
+                gateway_publication(&id, &state.definitions[&id]),
             ))
         });
     }
@@ -1887,7 +1922,8 @@ fn respond(state: &mut GatewayState, request: &GatewayRequest, address: &str) ->
                 ));
             }
             definition.current += 1;
-            Ok(gateway_publication(id, definition, &body["treeDigest"]))
+            definition.published = publication_of(&body);
+            Ok(("201 Created", gateway_publication(id, definition)))
         });
     }
     gateway_not_found()
@@ -1955,13 +1991,23 @@ fn gateway_evaluation(id: &str, evaluation: &str) -> Value {
     })
 }
 
-fn gateway_publication(id: &str, definition: &FakeDefinition, tree_digest: &Value) -> Value {
+/// What a create or publication request asks its revision to publish.
+fn publication_of(body: &Value) -> Value {
+    json!({
+        "treeDigest": body["treeDigest"],
+        "bindings": body["bindings"],
+        "executablePaths": body["executablePaths"],
+    })
+}
+
+/// Definition `id` and its current revision, as a create or publication answers them.
+fn gateway_publication(id: &str, definition: &FakeDefinition) -> Value {
     json!({
         "definition": gateway_definition(id, definition),
         "revision": {
             "definitionId": id,
             "number": definition.current,
-            "treeDigest": tree_digest,
+            "treeDigest": definition.published["treeDigest"],
             "bindings": {},
             "resolution": {},
             "publishedAt": CLOUD_TIME,
@@ -1992,7 +2038,7 @@ fn routes(requests: &[GatewayRequest]) -> Vec<String> {
     requests.iter().map(GatewayRequest::route).collect()
 }
 
-// REQ-CLOUDDEF-14, REQ-WFDEF-7, REQ-WFDEF-23
+// REQ-CLOUDDEF-14, REQ-CLOUDDEF-22, REQ-WFDEF-7, REQ-WFDEF-23
 #[test]
 fn publish_cloud_creates_then_publishes_to_the_recorded_cloud_definition() {
     use std::os::unix::fs::PermissionsExt as _;
@@ -2017,12 +2063,13 @@ fn publish_cloud_creates_then_publishes_to_the_recorded_cloud_definition() {
     let id = text(&first["definition"]["id"], "definition id").to_owned();
     let digest = text(&first["revision"]["tree"], "tree digest").to_owned();
     assert_eq!(first["revision"]["n"], 1);
-    let cloud_id = text(&first["cloud"]["definition"], "cloud definition id").to_owned();
+    let cloud_id = cloud_definition(&first);
     assert!(
         cloud_id.starts_with(CLOUD_ID_STEM) && is_definition_id(&cloud_id),
         "{first}"
     );
     assert_eq!(first["cloud"]["created"], true);
+    assert_eq!(first["cloud"]["reused"], false);
     assert_eq!(first["cloud"]["revision"], 1);
     assert_eq!(first["cloud"]["treeDigest"], digest.as_str());
     let record_path = home.definition_directory(&id).join("definition.json");
@@ -2094,6 +2141,8 @@ fn publish_cloud_creates_then_publishes_to_the_recorded_cloud_definition() {
     assert_eq!(created["treeDigest"], digest.as_str());
     assert_eq!(created["bindings"]["linearTeam"], "AUTO");
     assert_eq!(created["bindings"]["ownedState"], "Engineering");
+    // A home with no recorded Cloud definition asks Cloud for an identical one first.
+    assert_eq!(created["reuseIdentical"], true);
 
     // A second publish reads the recorded Cloud definition's revision and publishes to it.
     let (output, requests) = gateway.run(&home, &cloud_publish_args(&tree, &bindings, &["--json"]));
@@ -2102,6 +2151,7 @@ fn publish_cloud_creates_then_publishes_to_the_recorded_cloud_definition() {
     assert_eq!(second["revision"]["n"], 2);
     assert_eq!(second["cloud"]["definition"], cloud_id.as_str());
     assert_eq!(second["cloud"]["created"], false);
+    assert_eq!(second["cloud"]["reused"], false);
     assert_eq!(second["cloud"]["revision"], 2);
     assert_eq!(
         routes(&requests),
@@ -2134,7 +2184,7 @@ fn publish_cloud_creates_then_publishes_to_the_recorded_cloud_definition() {
     );
     assert_eq!(output.status.code(), Some(0), "{output:?}");
     let fourth = report(&output);
-    let other = text(&fourth["cloud"]["definition"], "cloud definition id").to_owned();
+    let other = cloud_definition(&fourth);
     assert_ne!(other, cloud_id);
     assert_eq!(fourth["cloud"]["created"], true);
     assert_eq!(fourth["cloud"]["revision"], 1);
@@ -2172,7 +2222,7 @@ fn publish_cloud_resends_a_lost_publication_once_and_publishes_executable_bits()
     assert_eq!(output.status.code(), Some(0), "{output:?}");
     let first = report(&output);
     assert_eq!(first["outcome"], "published", "{first}");
-    let cloud_id = text(&first["cloud"]["definition"], "cloud definition id").to_owned();
+    let cloud_id = cloud_definition(&first);
     assert_eq!(first["cloud"]["created"], true);
     let digest = text(&first["revision"]["tree"], "tree digest").to_owned();
     let creates = requests
@@ -2287,7 +2337,7 @@ fn publish_cloud_to_publishes_a_fresh_home_s_revision_to_the_named_cloud_definit
     );
     assert_eq!(output.status.code(), Some(0), "{output:?}");
     let created = report(&output);
-    let cloud_id = text(&created["cloud"]["definition"], "cloud definition id").to_owned();
+    let cloud_id = cloud_definition(&created);
     assert_eq!(created["cloud"]["created"], true);
     assert!(created["cloud"].get("target").is_none(), "{created}");
 
@@ -2434,7 +2484,7 @@ fn publish_cloud_to_replaces_the_recorded_cloud_definition_only_once_cloud_accep
     let (output, _) = gateway.run(&home, &cloud_publish_args(&tree, &bindings, &["--json"]));
     assert_eq!(output.status.code(), Some(0), "{output:?}");
     let created = report(&output);
-    let recorded = text(&created["cloud"]["definition"], "cloud definition id").to_owned();
+    let recorded = cloud_definition(&created);
     assert_eq!(
         published_record(&home, &created)["cloudId"],
         recorded.as_str()
@@ -2581,6 +2631,265 @@ fn publish_cloud_to_refusals_create_nothing_and_leave_the_record_unlinked() {
     assert!(requests.is_empty(), "{:?}", routes(&requests));
     assert!(home.workflow_entries().is_empty());
     assert_eq!(gateway_definitions(&gateway), vec![(cloud_id, 3)]);
+}
+
+/// The Cloud definition id `report` reached.
+fn cloud_definition(report: &Value) -> String {
+    text(&report["cloud"]["definition"], "cloud definition id").to_owned()
+}
+
+/// Publishes `tree` with `bindings` and `extra` from a fresh home, asserting it succeeds; the
+/// report.
+fn publish_from_a_fresh_home(
+    gateway: &FakeGateway,
+    tree: &Tree,
+    bindings: &str,
+    extra: &[&str],
+) -> Value {
+    let (output, _) = gateway.run(&Home::new(), &cloud_publish_args(tree, bindings, extra));
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    report(&output)
+}
+
+// REQ-CLOUDDEF-22, REQ-CLOUDDEF-14: two homes that share no files publish the same tree with
+// the same bindings and reach one Cloud definition, which the second home then keeps.
+#[test]
+fn publish_cloud_from_a_fresh_home_reuses_the_identical_cloud_definition() {
+    let (first_home, second_home) = (Home::new(), Home::new());
+    let tree = Tree::engineering();
+    let bindings = tree.engineering_bindings();
+    let gateway = FakeGateway::new();
+    let organization = format!("/api/v1/organizations/{CLOUD_ORGANIZATION}");
+    let definitions = format!("{organization}/projects/{CLOUD_PROJECT}/workflow-definitions");
+
+    let (output, _) = gateway.run(
+        &first_home,
+        &cloud_publish_args(&tree, &bindings, &["--json"]),
+    );
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let created = report(&output);
+    let cloud_id = cloud_definition(&created);
+    assert_eq!(created["cloud"]["created"], true, "{created}");
+    assert_eq!(created["cloud"]["reused"], false);
+    assert_eq!(created["cloud"]["treeReused"], false);
+
+    let (output, requests) = gateway.run(
+        &second_home,
+        &cloud_publish_args(&tree, &bindings, &["--json"]),
+    );
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert_no_content(&output);
+    super::assert_no_secret_output(&output, &[CLOUD_TOKEN]);
+    let reused = report(&output);
+    assert_eq!(reused["outcome"], "published", "{reused}");
+    assert_eq!(reused["definition"]["created"], true);
+    assert_eq!(reused["revision"]["n"], 1);
+    assert_eq!(reused["cloud"]["created"], false);
+    assert_eq!(reused["cloud"]["reused"], true);
+    assert_eq!(reused["cloud"]["definition"], cloud_id.as_str());
+    assert_eq!(reused["cloud"]["revision"], 1);
+    assert_eq!(reused["cloud"]["treeReused"], true);
+    assert!(reused["cloud"].get("target").is_none(), "{reused}");
+    assert_eq!(
+        routes(&requests),
+        vec![
+            format!("POST {organization}/workflow-trees"),
+            format!("POST {definitions}"),
+        ]
+    );
+    assert_eq!(requests[1].json()["reuseIdentical"], true);
+    assert_eq!(gateway_definitions(&gateway), vec![(cloud_id.clone(), 1)]);
+    assert_eq!(
+        published_record(&second_home, &reused)["cloudId"],
+        cloud_id.as_str()
+    );
+
+    // The association holds: the second home's next publication goes to that definition.
+    let (output, requests) = gateway.run(&second_home, &cloud_publish_args(&tree, &bindings, &[]));
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert_eq!(
+        routes(&requests),
+        vec![
+            format!("POST {organization}/workflow-trees"),
+            format!("GET {definitions}/{cloud_id}"),
+            format!("POST {definitions}/{cloud_id}/revisions"),
+        ]
+    );
+    assert_contains_all(
+        &String::from_utf8_lossy(&output.stdout),
+        &[
+            format!("cloud definition: {cloud_id}\n").as_str(),
+            "cloud created: no\n",
+            "cloud definition reused: no\n",
+            "cloud revision: 2\n",
+            "cloud tree reused: yes\n",
+        ],
+    );
+    assert_eq!(gateway_definitions(&gateway), vec![(cloud_id, 2)]);
+}
+
+// REQ-CLOUDDEF-22: a publication that shares only the tree reuses the tree, never a definition.
+#[test]
+fn publish_cloud_with_other_binding_values_reuses_the_tree_and_creates_a_definition() {
+    let tree = Tree::engineering();
+    let bindings = tree.engineering_bindings();
+    let other_bindings = tree.bindings_file(
+        "eng.json",
+        &json!({
+            "connection": "local",
+            "linearTeam": "ENG",
+            "repository": "useful-machinery/platform",
+        }),
+    );
+    let gateway = FakeGateway::new();
+    let cloud_id = cloud_definition(&publish_from_a_fresh_home(
+        &gateway,
+        &tree,
+        &bindings,
+        &["--json"],
+    ));
+
+    let other = publish_from_a_fresh_home(&gateway, &tree, &other_bindings, &["--json"]);
+    assert_eq!(other["cloud"]["created"], true, "{other}");
+    assert_eq!(other["cloud"]["reused"], false);
+    assert_eq!(other["cloud"]["treeReused"], true);
+    let other_id = cloud_definition(&other);
+    assert_ne!(other_id, cloud_id);
+    assert_eq!(
+        gateway_definitions(&gateway),
+        vec![(cloud_id, 1), (other_id, 1)]
+    );
+}
+
+// REQ-CLOUDDEF-14: `--cloud-new` never asks for reuse, so it creates another definition
+// although the project holds an identical one.
+#[test]
+fn publish_cloud_new_creates_another_definition_although_an_identical_one_exists() {
+    let tree = Tree::engineering();
+    let bindings = tree.engineering_bindings();
+    let gateway = FakeGateway::new();
+    let definitions = format!(
+        "/api/v1/organizations/{CLOUD_ORGANIZATION}/projects/{CLOUD_PROJECT}/workflow-definitions"
+    );
+    let cloud_id = cloud_definition(&publish_from_a_fresh_home(
+        &gateway,
+        &tree,
+        &bindings,
+        &["--json"],
+    ));
+
+    let home = Home::new();
+    let (output, requests) = gateway.run(
+        &home,
+        &cloud_publish_args(&tree, &bindings, &["--cloud-new", "--json"]),
+    );
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let created = report(&output);
+    assert_eq!(created["cloud"]["created"], true, "{created}");
+    assert_eq!(created["cloud"]["reused"], false);
+    assert_eq!(created["cloud"]["treeReused"], true);
+    let other = cloud_definition(&created);
+    assert_ne!(other, cloud_id);
+    let create = requests
+        .iter()
+        .find(|request| request.route() == format!("POST {definitions}"))
+        .expect("create request")
+        .json();
+    assert!(create.get("reuseIdentical").is_none(), "{create}");
+    assert_eq!(published_record(&home, &created)["cloudId"], other.as_str());
+    assert_eq!(
+        gateway_definitions(&gateway),
+        vec![(cloud_id, 1), (other, 1)]
+    );
+}
+
+// REQ-CLOUDDEF-22: with several identical definitions held, a fresh home's publication is
+// refused, names them all and leaves its record unlinked.
+#[test]
+fn publish_cloud_refuses_an_ambiguous_reuse_and_leaves_the_record_unlinked() {
+    let tree = Tree::engineering();
+    let bindings = tree.engineering_bindings();
+    let gateway = FakeGateway::new();
+    let held = [&["--json"][..], &["--cloud-new", "--json"]]
+        .into_iter()
+        .map(|extra| {
+            let created = publish_from_a_fresh_home(&gateway, &tree, &bindings, extra);
+            (cloud_definition(&created), 1)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(gateway_definitions(&gateway), held);
+    let ids = held.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>();
+
+    let home = Home::new();
+    let (output, _) = gateway.run(&home, &cloud_publish_args(&tree, &bindings, &["--json"]));
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let refused = report(&output);
+    assert_eq!(refused["outcome"], "cloud_failed", "{refused}");
+    assert_eq!(refused["cloud"]["failure"], "refused");
+    assert_eq!(refused["cloud"]["status"], 409);
+    assert_eq!(refused["cloud"]["problem"], "definition-reuse-ambiguous");
+    assert_eq!(refused["cloud"]["workflow"]["definitionIds"], json!(ids));
+    for member in ["target", "definition", "created", "reused", "treeReused"] {
+        assert!(
+            refused["cloud"].get(member).is_none(),
+            "{member}: {refused}"
+        );
+    }
+    assert_eq!(refused["revision"]["n"], 1);
+    assert_eq!(published_record(&home, &refused)["current"], 1);
+    assert_eq!(published_record(&home, &refused)["cloudId"], Value::Null);
+    assert_eq!(gateway_definitions(&gateway), held);
+
+    // The human report names every matching definition and both ways out.
+    let (output, _) = gateway.run(&Home::new(), &cloud_publish_args(&tree, &bindings, &[]));
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    for named in ids.iter().chain(&["--cloud-to", "--cloud-new"]) {
+        assert!(stderr.contains(named), "{named}: {stderr}");
+    }
+    assert_eq!(gateway_definitions(&gateway), held);
+}
+
+// REQ-CLOUDDEF-22, REQ-CLOUDDEF-14: a reuse whose reply is lost is sent once more under the
+// same key and reported as the reuse Cloud recorded.
+#[test]
+fn publish_cloud_resends_a_reuse_whose_reply_is_lost_and_reports_the_reuse() {
+    let tree = Tree::engineering();
+    let bindings = tree.engineering_bindings();
+    let gateway = FakeGateway::new();
+    let definitions = format!(
+        "/api/v1/organizations/{CLOUD_ORGANIZATION}/projects/{CLOUD_PROJECT}/workflow-definitions"
+    );
+    let cloud_id = cloud_definition(&publish_from_a_fresh_home(
+        &gateway,
+        &tree,
+        &bindings,
+        &["--json"],
+    ));
+
+    gateway.drop_next_publication_reply();
+    let home = Home::new();
+    let (output, requests) = gateway.run(&home, &cloud_publish_args(&tree, &bindings, &["--json"]));
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let reused = report(&output);
+    assert_eq!(reused["cloud"]["created"], false, "{reused}");
+    assert_eq!(reused["cloud"]["reused"], true);
+    assert_eq!(reused["cloud"]["definition"], cloud_id.as_str());
+    assert_eq!(reused["cloud"]["revision"], 1);
+    let creates = requests
+        .iter()
+        .filter(|request| request.route() == format!("POST {definitions}"))
+        .collect::<Vec<_>>();
+    assert_eq!(creates.len(), 2, "{:?}", routes(&requests));
+    let key = creates[0].header("idempotency-key").expect("create key");
+    assert_eq!(creates[1].header("idempotency-key"), Some(key));
+    assert_eq!(creates[0].body, creates[1].body);
+    assert_eq!(creates[0].json()["reuseIdentical"], true);
+    assert_eq!(
+        published_record(&home, &reused)["cloudId"],
+        cloud_id.as_str()
+    );
+    assert_eq!(gateway_definitions(&gateway), vec![(cloud_id, 1)]);
 }
 
 const CLOUD_PRINCIPAL: &str = "prn_01k0z6r1w8f4jy2m7q9v3x5xyz";

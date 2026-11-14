@@ -25,6 +25,9 @@ pub struct CreateWorkflowDefinitionRequest {
     /// The tree's files the revision runs executable, in bytewise order, each a file of the tree; `[]` makes none executable. Omitted keeps the bits the tree was sealed with.
     #[serde(rename = "executablePaths", skip_serializing_if = "Option::is_none")]
     pub executable_paths: Option<Vec<String>>,
+    /// True answers, in place of creating, the project's active definition whose current revision has the same tree digest, the same bindings snapshot as published and the same executable files (its `executablePaths`, or its tree's sealed bits when it recorded none, against the request's taken the same way). None creates as without it; exactly one is answered 200 as it stands; more than one is 409 `definition-reuse-ambiguous`. Omitted or false always creates.
+    #[serde(rename = "reuseIdentical", skip_serializing_if = "Option::is_none")]
+    pub reuse_identical: Option<bool>,
 }
 
 impl CreateWorkflowDefinitionRequest {
@@ -33,6 +36,7 @@ impl CreateWorkflowDefinitionRequest {
             tree_digest,
             bindings: None,
             executable_paths: None,
+            reuse_identical: None,
         }
     }
 }
