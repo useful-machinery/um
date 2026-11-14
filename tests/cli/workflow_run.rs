@@ -4091,19 +4091,27 @@ fn pinned_real_pi_runs_the_complete_mixed_value_and_export_dag() {
     assert!(live.contains("event       tool_result"));
 }
 
-// REQ-WFEXEC-22
+// REQ-WFEXEC-22, REQ-WFFORMAT-32, REQ-WFFORMAT-33
 #[test]
 fn local_run_forwards_only_declared_host_environment() {
     for (declaration, expected) in [
-        ("", "absent"),
-        ("environmentPassthrough: [WORKFLOW_VISIBLE]\n", "present"),
+        ("", "absent absent absent"),
+        (
+            "environmentPassthrough: [WORKFLOW_VISIBLE]\n",
+            "absent absent present",
+        ),
+        (
+            "environmentPassthrough: [GH_TOKEN, UM_LINEAR_ACCESS_TOKEN]\n",
+            "local-gh-token local-linear-token absent",
+        ),
     ] {
         let bundle = RunBundle::new(&format!(
-            "schemaVersion: 1\n{declaration}steps:\n  authenticate:\n    kind: cmd\n    command:\n      argv: [sh, -c, 'test -z \"${{GH_TOKEN+x}}\" && test -z \"${{GITHUB_TOKEN+x}}\" && test -z \"${{UM_PRIVATE_SENTINEL+x}}\" && printf %s \"${{WORKFLOW_VISIBLE-absent}}\" > observed.txt']\n"
+            "schemaVersion: 1\n{declaration}steps:\n  authenticate:\n    kind: cmd\n    command:\n      argv: [sh, -c, 'test -z \"${{GITHUB_TOKEN+x}}\" && test -z \"${{UM_PRIVATE_SENTINEL+x}}\" && printf \"%s %s %s\" \"${{GH_TOKEN-absent}}\" \"${{UM_LINEAR_ACCESS_TOKEN-absent}}\" \"${{WORKFLOW_VISIBLE-absent}}\" > observed.txt']\n"
         ));
         let output = isolated_command(&bundle.args(&bundle.result("environment")))
             .env("GH_TOKEN", "local-gh-token")
             .env("GITHUB_TOKEN", "local-github-token")
+            .env("UM_LINEAR_ACCESS_TOKEN", "local-linear-token")
             .env("WORKFLOW_VISIBLE", "present")
             .env("UM_PRIVATE_SENTINEL", "must-not-reach-command")
             .output()

@@ -6,13 +6,19 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use super::*;
-use crate::agent_login::cloud::{CloudFailure, LoginStatus, ProviderLogin};
+use crate::agent_login::cloud::{
+    CloudFailure, GrantTokenFailure, GrantTokenRequest, IssuedToken, LoginStatus, ProviderLogin,
+};
 use crate::agent_login::readiness::readiness_path;
 use crate::service::{
     CountedGate, FAKE_AGENT_LOGIN_ID, FAKE_AGENT_LOGIN_SENTINEL, FakeAgentLoginCloud,
     fake_agent_login_material, fake_codex_authorized,
 };
 use crate::telemetry::{TestCapture, test_recorder};
+
+/// The boot and the assignment an admission's setup is made for.
+const BOOT: &str = "rbt_01k0z6r1w8f4jy2m7q9v3x5abe";
+const ASSIGNMENT: &str = "asn_01k0z6r1w8f4jy2m7q9v3x5abc";
 
 fn now() -> OffsetDateTime {
     OffsetDateTime::from_unix_timestamp(1_794_450_000).unwrap()
@@ -902,6 +908,10 @@ impl AgentLoginCloud for ObservingCloud {
         }
     }
 
+    fn grant_token(&self, request: &GrantTokenRequest) -> Result<IssuedToken, GrantTokenFailure> {
+        self.inner.grant_token(request)
+    }
+
     fn follow_credential(&self, _endpoint: &Url, _runner_credential: &Credential) {}
 }
 
@@ -1696,7 +1706,11 @@ async fn an_admissions_pass_installs_and_ends_without_consulting_the_assignment_
         .answer_next_then(fake_codex_authorized(2), codex_answer(LoginStatus::Revoked));
     assert_eq!(fixture.setup.run_pass().await, SetupOutcome::Busy(None));
 
-    let Some(SetupOutcome::Recorded(document)) = fixture.setup.run_admission_pass() else {
+    let Some(SetupOutcome::Recorded(document)) = fixture
+        .setup
+        .set_up_admission(BOOT, ASSIGNMENT)
+        .agent_logins
+    else {
         panic!("the admission's pass did not record readiness");
     };
 
@@ -1706,7 +1720,7 @@ async fn an_admissions_pass_installs_and_ends_without_consulting_the_assignment_
         AgentLoginState::Revoked
     );
     assert!(!fixture.codex_home().exists());
-    assert_eq!(fixture.recorded().as_ref(), Some(&document));
+    assert_eq!(fixture.recorded().unwrap().logins, document.logins);
 }
 
 // REQ-GRANT-49
@@ -1728,7 +1742,7 @@ async fn an_admissions_pass_waits_for_a_pass_in_flight_and_then_makes_its_own() 
         .expect("the periodic pass asked Cloud");
     let admission = tokio::task::spawn_blocking({
         let setup = Arc::clone(&fixture.setup);
-        move || setup.run_admission_pass()
+        move || setup.set_up_admission(BOOT, ASSIGNMENT).agent_logins
     });
     drop(held);
 

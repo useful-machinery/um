@@ -25,6 +25,7 @@ use super::workspace::{
     AssignmentRoot, AssignmentRootCreationError, CleanupResult, ProcessQuiescence, RetentionReason,
     WorkRootLease, WorkspaceDisposition,
 };
+use crate::agent_login::grant_token::AssignmentGrantTokens;
 use crate::control_protocol::AssignmentCounts;
 use crate::telemetry::{Event as TelemetryEvent, Outcome as TelemetryOutcome};
 #[cfg(test)]
@@ -191,6 +192,9 @@ pub(super) struct AcceptedAssignment {
     /// The runner's Git relay for the workspace; a tree run uses the host's own Git
     /// access and has none.
     pub(super) workflow_git: Option<WorkflowGitAuthority>,
+    /// The assignment's grant token files, which the slot carries until the
+    /// assignment ends (INV-RUNNER-28).
+    pub(super) grant_tokens: Option<Arc<AssignmentGrantTokens>>,
 }
 
 /// What an accepted assignment executes: an admitted workflow on the embedded engine,
@@ -508,6 +512,10 @@ struct RunningAssignment {
     engine_terminal: Arc<AtomicBool>,
     workspace_release: Option<CleanupResult>,
     run_event: RunEvent,
+    /// The assignment's grant token files, held only to be dropped: they are
+    /// removed when the slot lets go of the running assignment, whatever
+    /// ends it (INV-RUNNER-28).
+    _grant_tokens: Option<Arc<AssignmentGrantTokens>>,
 }
 
 struct PreparingAssignment {
@@ -689,6 +697,10 @@ struct AdmissionRuntime {
     /// What notes how the provider answered each use of a login the
     /// admission's offer added (REQ-GRANT-52).
     harness_login_observer: Option<Arc<dyn HarnessLoginObserver>>,
+    /// The grant token files the admission's setup kept for the assignment
+    /// (REQ-GRANT-86), handed to the accepted assignment; once nothing holds
+    /// them, their files are removed (INV-RUNNER-28).
+    grant_tokens: Option<Arc<AssignmentGrantTokens>>,
     execution_version: Arc<str>,
     outbox: ObservationOutbox,
     guard_processes: bool,
@@ -921,6 +933,7 @@ impl AdmissionRuntime {
             process_guards,
             guard_processes: self.guard_processes,
             workflow_git,
+            grant_tokens: self.grant_tokens.clone(),
         })
     }
 }
@@ -1053,6 +1066,10 @@ pub(super) struct AssignmentManager {
     /// offers the runner's logins (REQ-GRANT-49); given once the setup
     /// exists, and `None` for a runner without protected state.
     agent_login_setup: Option<super::control::AdmissionAgentLogins>,
+    /// What each admission keeps its grant token files current with while
+    /// its assignment runs (REQ-GRANT-89); given with the setup, and `None`
+    /// for a runner without protected state.
+    grant_token_refresh: Option<GrantTokenRefreshing>,
     execution_version: Arc<str>,
     lease_clock: LeaseClock,
     sleeper: Arc<dyn Sleeper>,
@@ -1086,6 +1103,30 @@ pub(super) struct AssignmentManager {
     deferred_offer_failure: Option<AssignmentManagerFailure>,
     fenced_final_graces: BTreeSet<FencedFinalGrace>,
     guard_processes: bool,
+}
+
+/// The time an admission's grant-token refresh task waits on, and the live
+/// status it publishes each readiness a refresh records in, as an
+/// admission's setup publishes its own.
+#[derive(Clone)]
+struct GrantTokenRefreshing {
+    sleeper: Arc<dyn Sleeper>,
+    status: Arc<super::control::LiveStatus>,
+}
+
+impl GrantTokenRefreshing {
+    /// Starts keeping the token files `tokens` holds current (REQ-GRANT-89).
+    fn start(&self, tokens: &mut AssignmentGrantTokens) {
+        let status = Arc::clone(&self.status);
+        tokens.keep_current(
+            Arc::clone(&self.sleeper),
+            Box::new(move |document| {
+                if let Some(readiness) = document.reported() {
+                    status.agent_logins_recorded(readiness);
+                }
+            }),
+        );
+    }
 }
 
 impl Drop for AssignmentManager {
@@ -1341,6 +1382,7 @@ pub(super) mod test_support {
             engine_terminal: Arc::new(AtomicBool::new(false)),
             workspace_release: None,
             run_event: RunEvent::default(),
+            _grant_tokens: None,
         })));
         RenewalTimingFixture {
             clock,

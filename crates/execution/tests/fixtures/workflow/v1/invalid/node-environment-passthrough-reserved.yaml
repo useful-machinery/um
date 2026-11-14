@@ -3,6 +3,6 @@ environmentPassthrough: [TRACKER_TOKEN]
 steps:
   file:
     kind: cmd
-    environmentPassthrough: [GH_TOKEN]
+    environmentPassthrough: [GITHUB_TOKEN]
     command:
       argv: ["./file-issue"]

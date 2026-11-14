@@ -154,7 +154,7 @@ fn media_type_parameters_use_horizontal_separators_and_control_free_unicode_valu
 fn environment_passthrough_rejects_reserved_invalid_and_duplicate_names() {
     for names in [
         "[UM_INTERNAL_CHILD_GUARD_WORKER]",
-        "[GH_TOKEN]",
+        "[GITHUB_TOKEN]",
         "[GIT_CONFIG_KEY_0]",
         "[SSH_AUTH_SOCK]",
         "[BAD-NAME]",
@@ -176,6 +176,47 @@ fn environment_passthrough_rejects_reserved_invalid_and_duplicate_names() {
             .environment_passthrough
             .contains("VISIBLE")
     );
+}
+
+// REQ-WFFORMAT-32
+#[test]
+fn environment_passthrough_admits_only_the_grant_token_names_among_reserved_ones() {
+    let fixture =
+        fs::read(fixture_root().join("valid/grant-token-environment-passthrough.yaml")).unwrap();
+    let workflow = decode(&fixture).unwrap();
+    assert_eq!(
+        workflow
+            .environment_passthrough
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        [
+            "GH_TOKEN",
+            "UM_LINEAR_ACCESS_TOKEN",
+            "UM_LINEAR_ACCESS_TOKEN_FILE"
+        ]
+    );
+    let step = |name: &str| match &workflow.steps[name].body {
+        NodeBody::Command(node) => node.common.environment_passthrough.clone(),
+        _ => panic!("{name} is not a command step"),
+    };
+    assert_eq!(step("publish"), Some(["GH_TOKEN".to_owned()].into()));
+    assert_eq!(
+        step("track"),
+        Some(["UM_LINEAR_ACCESS_TOKEN_FILE".to_owned()].into())
+    );
+    validation::validate(workflow).unwrap();
+
+    for names in ["[UM_LINEAR_ACCESS_TOKEN_OTHER]", "[UM_STEP_INPUTS]"] {
+        let source = format!(
+            "schemaVersion: 1\nenvironmentPassthrough: {names}\nsteps:\n  check:\n    kind: cmd\n    command:\n      argv: [/bin/true]\n"
+        );
+        assert_eq!(
+            decode(source.as_bytes()).unwrap_err().kind(),
+            DecodeFailureKind::StructuralContract,
+            "accepted {names}"
+        );
+    }
 }
 
 // REQ-WFFORMAT-102

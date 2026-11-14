@@ -627,3 +627,229 @@ fn installed_agent_logins_reach_their_files_and_no_output() {
         );
     }
 }
+
+/// The GitHub token Cloud issues for the assignment, which no output may
+/// carry.
+const GRANT_TOKEN: &str = "gho_grant-token-sentinel-3c9e1a";
+const GRANT_ASSIGNMENT: &str = "asn_01k0z6r1w8f4jy2m7q9v3x5abn";
+
+/// The pinned assignment offer and its prepare, whose preparation expires
+/// long after the test.
+fn offer_and_prepare() -> (Message, Message) {
+    let fixture = |name: &str| {
+        let path = format!(
+            "{}/tests/fixtures/runner-protocol/v1/valid/{name}",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        serde_json::from_str::<serde_json::Value>(&fs::read_to_string(path).unwrap()).unwrap()
+    };
+    let offer = fixture("cloud-assignment-offer.json");
+    let mut prepare = fixture("cloud-assignment-prepare.json");
+    prepare["payload"]["preparationExpiresAt"] = "2099-01-01T00:00:00Z".into();
+    assert_eq!(offer["payload"]["assignmentId"], GRANT_ASSIGNMENT);
+    assert_eq!(prepare["payload"]["assignmentId"], GRANT_ASSIGNMENT);
+    (
+        Message::Text(offer.to_string().into()),
+        Message::Text(prepare.to_string().into()),
+    )
+}
+
+/// Cloud's grant-token route, which issues the run's GitHub token and has
+/// no grant of the other providers for it. Any other route is answered 404.
+fn cloud_issuing_a_github_token(request: &[u8]) -> Vec<u8> {
+    if !request.starts_with(b"POST /v1/runner/grants/token ") {
+        return cloud_without_agent_logins(request);
+    }
+    let text = String::from_utf8_lossy(request);
+    assert!(
+        text.contains(&format!(r#""assignmentId":"{GRANT_ASSIGNMENT}""#)),
+        "{text}"
+    );
+    assert!(text.contains(r#""bootId":"rbt_"#), "{text}");
+    if text.contains(r#""provider":"github""#) {
+        private_json_answer(&serde_json::json!({
+            "schemaVersion": 1,
+            "provider": "github",
+            "grantId": "pgr_01k0z6r1w8f4jy2m7q9v3x5abc",
+            "generation": 2,
+            "accessToken": GRANT_TOKEN,
+            "expiresAt": "2099-01-01T00:00:00.5Z",
+            "refreshAfterSeconds": 600
+        }))
+    } else {
+        http_response_with_headers(
+            "409 Conflict",
+            Some("application/json"),
+            &[("Cache-Control", "private, no-store")],
+            br#"{"schemaVersion":1,"reason":"unauthorized"}"#,
+        )
+    }
+}
+
+/// Serves the runner's connection: a welcome, an acknowledgement of each
+/// frame, the pinned offer and, once the runner is preparing, its prepare;
+/// sends the payload of the rejection that follows to `rejected`.
+async fn serve_one_assignment(
+    stream: tokio::net::TcpStream,
+    rejected: mpsc::SyncSender<serde_json::Value>,
+) {
+    let mut socket = accept_runner_socket(stream).await;
+    let (offer, prepare) = offer_and_prepare();
+    let mut prepare = Some(prepare);
+    let mut offered = false;
+    while let Some(Ok(Message::Text(frame))) = socket.next().await {
+        let frame: serde_json::Value = serde_json::from_str(&frame).unwrap();
+        if frame["type"] == "hello" {
+            socket.send(cloud_welcome()).await.unwrap();
+        }
+        if let (Some(message_id), Some(sequence)) =
+            (frame["messageId"].as_str(), frame["sequence"].as_u64())
+        {
+            socket
+                .send(cloud_observation_ack(message_id, sequence))
+                .await
+                .unwrap();
+        }
+        if !offered {
+            offered = true;
+            socket.send(offer.clone()).await.unwrap();
+        }
+        if frame["type"] == "assignment_preparing"
+            && let Some(prepare) = prepare.take()
+        {
+            socket.send(prepare).await.unwrap();
+        }
+        if frame["type"] == "assignment_rejected" {
+            let _ = rejected.try_send(frame["payload"].clone());
+        }
+    }
+}
+
+// REQ-GRANT-86, REQ-GRANT-88, INV-RUNNER-28
+#[test]
+fn an_admitted_assignment_keeps_its_grant_token_in_its_file_and_prints_it_nowhere() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let endpoint = format!("ws://{}/v1/runner/connect", listener.local_addr().unwrap());
+    let fixture = ServeStatusFixture::new(&endpoint);
+    let home = tempfile::tempdir().unwrap();
+    let token_file = fixture
+        .state_directory()
+        .join(".runner-agent-login/github.token");
+    // What the token file held, and its mode, when the admission went on to
+    // ask for its source credential, the step after the grant tokens.
+    let (held_sender, held) = mpsc::sync_channel(1);
+    let (rejected_sender, rejected) = mpsc::sync_channel(1);
+    let watched = token_file.clone();
+    let routes = move |request: &[u8]| {
+        if request.starts_with(b"POST /v1/runner/source-credentials ") {
+            let _ = held_sender.try_send(
+                fs::read_to_string(&watched).ok().zip(
+                    fs::symlink_metadata(&watched)
+                        .ok()
+                        .map(|metadata| metadata.permissions().mode() & 0o777),
+                ),
+            );
+        }
+        cloud_issuing_a_github_token(request)
+    };
+    thread::spawn(move || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async move {
+                let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+                let stream = accept_runner_connection_answering(&listener, &routes).await;
+                tokio::spawn(serve_one_assignment(stream, rejected_sender));
+                // The runner's HTTP requests go on arriving on this listener.
+                loop {
+                    drop(accept_runner_connection_answering(&listener, &routes).await);
+                }
+            });
+    });
+    let mut serve = Command::new(env!("CARGO_BIN_EXE_um"))
+        .args(["runner", "serve", "--config", &fixture.config])
+        .env("OTEL_SDK_DISABLED", "true")
+        .env("HOME", home.path())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let serve_stderr = serve.stderr.take().unwrap();
+    let stderr_reader = thread::spawn(move || {
+        let mut output = String::new();
+        let _ = BufReader::new(serve_stderr).read_to_string(&mut output);
+        output
+    });
+
+    let held_at_source = poll_until(
+        "the admission's request for its source credential",
+        || held.try_recv().ok(),
+        Option::is_some,
+    );
+    // The source route has no credential, so the admission is rejected and
+    // the assignment ends.
+    let rejection = poll_until(
+        "the admission's rejection",
+        || rejected.try_recv().ok(),
+        Option::is_some,
+    );
+    let removed = poll_until(
+        "the token file's removal once the assignment ended",
+        || token_file.exists(),
+        |exists| !exists,
+    );
+    let status = run(&["runner", "status", "--config", &fixture.config]);
+    serve.kill().unwrap();
+    serve.wait().unwrap();
+    let serve_stderr = stderr_reader.join().unwrap();
+
+    assert_eq!(
+        held_at_source,
+        Some(Some((GRANT_TOKEN.to_owned(), 0o600))),
+        "{serve_stderr}"
+    );
+    assert!(rejection.is_some(), "{serve_stderr}");
+    assert!(!removed);
+    let readiness: serde_json::Value = serde_json::from_slice(
+        &fs::read(fixture.state_directory().join(".runner-agent-logins.json")).unwrap(),
+    )
+    .unwrap();
+    let entry = |provider: &str| {
+        readiness["providers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["provider"] == provider)
+            .cloned()
+            .unwrap()
+    };
+    assert_eq!(entry("github")["state"], "ready", "{readiness}");
+    assert_eq!(entry("github")["generation"], 2, "{readiness}");
+    assert_eq!(entry("github")["selected"], true, "{readiness}");
+    for provider in ["gitlab", "linear"] {
+        assert_eq!(entry(provider)["state"], "not_authorized", "{readiness}");
+    }
+    assert!(status.status.success());
+    assert!(
+        serve_stderr.contains("runner.grant_token"),
+        "{serve_stderr}"
+    );
+    let text = |bytes: &[u8]| String::from_utf8_lossy(bytes).into_owned();
+    for (name, output) in [
+        ("runner standard error", serve_stderr),
+        ("readiness document", readiness.to_string()),
+        ("runner status", text(&status.stdout)),
+        ("runner status error", text(&status.stderr)),
+    ] {
+        assert!(
+            !output.contains(GRANT_TOKEN),
+            "{name} carries the grant token"
+        );
+        assert!(
+            !output.contains("github.token"),
+            "{name} names the token file"
+        );
+    }
+}

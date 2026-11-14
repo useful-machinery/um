@@ -17,6 +17,7 @@ use um_execution::HarnessLoginObserver;
 
 use super::assignment::AssignmentManager;
 use crate::agent_login::OfferedLogin;
+use crate::agent_login::grant_token::AssignmentGrantTokens;
 use crate::agent_login::readiness::ReadinessDocument;
 use crate::agent_login::setup::{AgentLoginSetup, SYNC_BOUND, SetupOutcome};
 use crate::control_protocol::{
@@ -123,17 +124,24 @@ impl AdmissionAgentLogins {
         }
     }
 
-    /// Makes the admission's pass, when the readiness names a login, and
-    /// publishes what it recorded. It blocks, on the admission's preparation
-    /// task, for the pass's bounded requests; what it fails at is the pass's
-    /// own record and never the admission's.
-    pub(super) fn set_up(&self) {
-        let Some(setup) = self.setup.upgrade() else {
-            return;
-        };
-        if let Some(outcome) = setup.run_admission_pass() {
+    /// Makes the admission's pass, when the readiness names a login, then
+    /// asks Cloud for the grant tokens of the assignment `assignment_id` of
+    /// this boot (REQ-GRANT-86), and publishes what each recorded. It
+    /// blocks, on the admission's preparation task, for the bounded requests
+    /// of each; what it fails at is the setup's own record and never the
+    /// admission's. It answers what the admission holds of its assignment's
+    /// grant tokens, which removes their files when it is dropped; `None`
+    /// when the setup is gone.
+    pub(super) fn set_up(&self, assignment_id: &str) -> Option<AssignmentGrantTokens> {
+        let setup = self.setup.upgrade()?;
+        let admitted = setup.set_up_admission(self.status.boot_id(), assignment_id);
+        if let Some(outcome) = admitted.agent_logins {
             let _ = publish(outcome, &self.status);
         }
+        if let Some(document) = admitted.grants {
+            let _ = publish(SetupOutcome::Recorded(document), &self.status);
+        }
+        Some(admitted.tokens)
     }
 
     /// The observer of the logins `offered` added to the admission's
@@ -185,6 +193,11 @@ impl LiveStatus {
             }),
             connected: tokio::sync::Notify::new(),
         }
+    }
+
+    /// The boot this process serves as.
+    pub(super) fn boot_id(&self) -> &str {
+        &self.boot_id
     }
 
     pub(super) fn connecting(&self) {
@@ -861,9 +874,11 @@ mod tests {
             .store(0, std::sync::atomic::Ordering::SeqCst);
         cloud.answer(fake_codex_authorized(2));
         let admission = AdmissionAgentLogins::new(&setup, Arc::clone(&context.status));
-        tokio::task::spawn_blocking(move || admission.set_up())
-            .await
-            .unwrap();
+        let tokens =
+            tokio::task::spawn_blocking(move || admission.set_up("asn_01k0z6r1w8f4jy2m7q9v3x5abc"))
+                .await
+                .unwrap();
+        assert!(tokens.is_some());
         let requests = (cloud.status_requests(), cloud.deliveries());
         assert_eq!(requests.1, 2);
 

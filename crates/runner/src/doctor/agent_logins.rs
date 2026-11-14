@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 use super::{CheckDescriptor, DoctorCheck, Outcome, Status};
 use crate::agent_login::readiness::{ReadinessDocument, readiness_path};
-use crate::control_protocol::AgentLoginState;
+use crate::control_protocol::{AgentLoginReadiness, AgentLoginState};
 use crate::enrollment::{RunnerHome, load_runner_state_path};
 use crate::telemetry::io_error_class;
 
@@ -104,62 +104,159 @@ impl DoctorCheck for AgentLoginsCheck {
                 )]),
             );
         };
-        let mut details = BTreeMap::new();
-        for entry in &readiness.providers {
-            let provider = entry.provider.as_str();
-            // The brokered providers' `not_delivered` is implied, as before.
-            if !entry.provider.is_brokered() {
-                details.insert(provider.to_owned(), entry.state.as_str().to_owned());
-            }
-            let status = entry.credential_status();
-            details.insert(
-                format!("{provider}_availability"),
-                status.availability.as_str().to_owned(),
-            );
-            details.insert(
-                format!("{provider}_next_action"),
-                status.next_action.as_str().to_owned(),
-            );
+        readiness_outcome(&readiness)
+    }
+}
+
+/// The check's outcome for the readiness the runner recorded: it fails for
+/// the first agent login Cloud authorized that is not ready to use, and never
+/// for an OAuth provider's entry, which records one assignment's outcome
+/// (REQ-GRANT-88).
+fn readiness_outcome(readiness: &AgentLoginReadiness) -> Outcome {
+    let mut details = BTreeMap::new();
+    for entry in &readiness.providers {
+        let provider = entry.provider.as_str();
+        // An OAuth provider's `not_delivered` is implied, as before.
+        if entry.state != AgentLoginState::NotDelivered {
+            details.insert(provider.to_owned(), entry.state.as_str().to_owned());
         }
-        // The brokered providers are `not_delivered` and never fail the check.
-        if let Some((entry, code)) = readiness
-            .providers
-            .iter()
-            .find_map(|entry| Some((entry, entry.failure_code()?)))
-        {
-            details.insert("provider".to_owned(), entry.provider.as_str().to_owned());
-            let message = if entry.state == AgentLoginState::Ready {
-                format!(
-                    "The {} login Cloud authorized for the runner was refused at its last use.",
-                    entry.provider.as_str()
-                )
-            } else {
-                format!(
-                    "The {} login Cloud authorized for the runner is not ready.",
-                    entry.provider.as_str()
-                )
-            };
-            return Outcome {
-                status: Status::Fail,
-                code,
-                message,
-                details,
-            };
-        }
-        let message = if readiness
-            .providers
-            .iter()
-            .any(|entry| entry.state == AgentLoginState::Ready)
-        {
-            "Every agent login Cloud authorized for the runner is ready."
+        let status = entry.credential_status();
+        details.insert(
+            format!("{provider}_availability"),
+            status.availability.as_str().to_owned(),
+        );
+        details.insert(
+            format!("{provider}_next_action"),
+            status.next_action.as_str().to_owned(),
+        );
+    }
+    if let Some((entry, code)) = readiness
+        .providers
+        .iter()
+        .find_map(|entry| Some((entry, entry.failure_code()?)))
+    {
+        details.insert("provider".to_owned(), entry.provider.as_str().to_owned());
+        let message = if entry.state == AgentLoginState::Ready {
+            format!(
+                "The {} login Cloud authorized for the runner was refused at its last use.",
+                entry.provider.as_str()
+            )
         } else {
-            "Cloud has authorized no agent login for the runner."
+            format!(
+                "The {} login Cloud authorized for the runner is not ready.",
+                entry.provider.as_str()
+            )
         };
-        Outcome {
-            status: Status::Pass,
-            code: "ok",
-            message: message.to_owned(),
+        return Outcome {
+            status: Status::Fail,
+            code,
+            message,
             details,
+        };
+    }
+    let message = if readiness
+        .providers
+        .iter()
+        .any(|entry| !entry.provider.is_brokered() && entry.state == AgentLoginState::Ready)
+    {
+        "Every agent login Cloud authorized for the runner is ready."
+    } else {
+        "Cloud has authorized no agent login for the runner."
+    };
+    Outcome {
+        status: Status::Pass,
+        code: "ok",
+        message: message.to_owned(),
+        details,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::readiness_outcome;
+    use crate::control_protocol::{
+        AgentLoginProvider, AgentLoginReadiness, AgentLoginState, ProviderReadiness,
+    };
+    use crate::doctor::Status;
+
+    fn entry(provider: AgentLoginProvider, state: AgentLoginState) -> ProviderReadiness {
+        ProviderReadiness {
+            provider,
+            state,
+            agent_login_id: None,
+            generation: None,
+            checked_at: Some("2026-11-12T01:00:00Z".to_owned()),
+            installed_at: None,
+            grant_id: None,
+            expires_at: None,
+            selected: Some(true),
+            last_use: None,
         }
+    }
+
+    // REQ-GRANT-88, REQ-RUNNERENROLL-86
+    #[test]
+    fn the_check_passes_with_an_oauth_entry_cloud_did_not_answer() {
+        let readiness = AgentLoginReadiness {
+            updated_at: "2026-11-12T01:00:00Z".to_owned(),
+            providers: vec![
+                ProviderReadiness {
+                    selected: Some(false),
+                    ..entry(AgentLoginProvider::Codex, AgentLoginState::NotAuthorized)
+                },
+                entry(
+                    AgentLoginProvider::Github,
+                    AgentLoginState::CloudUnavailable,
+                ),
+                entry(
+                    AgentLoginProvider::Gitlab,
+                    AgentLoginState::ReconnectRequired,
+                ),
+                entry(AgentLoginProvider::Linear, AgentLoginState::InstallFailed),
+            ],
+        };
+
+        let outcome = readiness_outcome(&readiness);
+
+        assert_eq!(outcome.status, Status::Pass, "{outcome:?}");
+        assert_eq!(outcome.code, "ok");
+        // Each OAuth entry is reported with its state, availability and
+        // next action (REQ-GRANT-53).
+        for (provider, state, availability, next_action) in [
+            (
+                "github",
+                "cloud_unavailable",
+                "delivery_failed",
+                "sync_runner",
+            ),
+            (
+                "gitlab",
+                "reconnect_required",
+                "reconnect_required",
+                "reconnect",
+            ),
+            ("linear", "install_failed", "delivery_failed", "sync_runner"),
+        ] {
+            let detail = |suffix: &str| {
+                outcome
+                    .details
+                    .get(&format!("{provider}{suffix}"))
+                    .map(String::as_str)
+            };
+            assert_eq!(detail(""), Some(state), "{outcome:?}");
+            assert_eq!(detail("_availability"), Some(availability), "{outcome:?}");
+            assert_eq!(detail("_next_action"), Some(next_action), "{outcome:?}");
+        }
+
+        // An installable provider in the same state still fails it.
+        let mut failing = readiness;
+        failing.providers[0] = entry(AgentLoginProvider::Codex, AgentLoginState::CloudUnavailable);
+        let outcome = readiness_outcome(&failing);
+        assert_eq!(outcome.status, Status::Fail, "{outcome:?}");
+        assert_eq!(outcome.code, "cloud_unavailable");
+        assert_eq!(
+            outcome.details.get("provider").map(String::as_str),
+            Some("codex")
+        );
     }
 }

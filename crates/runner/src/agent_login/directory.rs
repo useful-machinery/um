@@ -1,20 +1,38 @@
 //! The runner's own agent-login directory, `.runner-agent-login/` in the
 //! directory of `runnerStatePath`, mode `0700` (REQ-GRANT-36): the
-//! runner's Codex home `codex/` and the Claude Code token
-//! `claude-code.token`. Nothing but the runner writes there, so whatever is
-//! at one of its locations is the runner's to replace or remove.
+//! runner's Codex home `codex/`, the Claude Code token `claude-code.token`,
+//! and the grant tokens of the assignment the runner holds, `github.token`,
+//! `gitlab.token` and `linear.token` (REQ-GRANT-86). Nothing but the runner
+//! writes there, so whatever is at one of its locations is the runner's to
+//! replace or remove.
 
 use std::fs::{self, DirBuilder, Permissions};
 use std::io;
 use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, PermissionsExt as _};
 use std::path::{Component, Path, PathBuf};
 
-use crate::enrollment::{sync_directory_io, write_private_file_atomically};
+use zeroize::Zeroizing;
+
+use super::{TOKEN_LIMIT, valid_token};
+use crate::control_protocol::AgentLoginProvider;
+use crate::enrollment::{
+    read_private_file_if_present, sync_directory_io, write_private_file_atomically,
+};
 
 /// The directory's name in the directory of `runnerStatePath`.
 pub(crate) const DIRECTORY: &str = ".runner-agent-login";
 const CODEX_HOME: &str = "codex";
 const CLAUDE_CODE_TOKEN: &str = "claude-code.token";
+const GITHUB_TOKEN: &str = "github.token";
+const GITLAB_TOKEN: &str = "gitlab.token";
+const LINEAR_TOKEN: &str = "linear.token";
+/// The prefixes of the temporary files each grant token file is written
+/// through, in the order of `github`, `gitlab` and `linear`.
+pub(crate) const GRANT_TOKEN_TEMPORARY_PREFIXES: [&str; 3] = [
+    ".um-github.token.tmp",
+    ".um-gitlab.token.tmp",
+    ".um-linear.token.tmp",
+];
 const PRIVATE_DIRECTORY_MODE: u32 = 0o700;
 
 /// Where the runner whose protected state is at a given path keeps the
@@ -41,6 +59,23 @@ impl LoginDirectory {
     /// (REQ-GRANT-44).
     pub(crate) fn claude_code_token(&self) -> PathBuf {
         self.0.join(CLAUDE_CODE_TOKEN)
+    }
+
+    /// The file the runner keeps an OAuth provider's grant token in for the
+    /// assignment it holds (REQ-GRANT-86), and the prefix of the temporary
+    /// files it is written through; `None` for an installable provider.
+    pub(crate) fn grant_token(
+        &self,
+        provider: AgentLoginProvider,
+    ) -> Option<(PathBuf, &'static str)> {
+        let [github, gitlab, linear] = GRANT_TOKEN_TEMPORARY_PREFIXES;
+        let (name, temporary_prefix) = match provider {
+            AgentLoginProvider::Github => (GITHUB_TOKEN, github),
+            AgentLoginProvider::Gitlab => (GITLAB_TOKEN, gitlab),
+            AgentLoginProvider::Linear => (LINEAR_TOKEN, linear),
+            AgentLoginProvider::Codex | AgentLoginProvider::ClaudeCode => return None,
+        };
+        Some((self.0.join(name), temporary_prefix))
     }
 
     /// Whether `path` names something inside the directory: below it, by
@@ -124,6 +159,18 @@ pub(crate) fn ensure_private_directory(path: &Path) -> io::Result<()> {
 /// `0600`, in one step.
 pub(crate) fn write_file(path: &Path, bytes: &[u8], temporary_prefix: &str) -> io::Result<()> {
     write_private_file_atomically(path, bytes, temporary_prefix, |_| Ok(()), |error| error)
+}
+
+/// The token in the file at `path`, read through the runner's bounded
+/// private-file read; `None` when there is none, or when it is not a private
+/// file holding one valid token.
+pub(crate) fn read_token(path: &Path) -> Option<Zeroizing<Vec<u8>>> {
+    let bytes = Zeroizing::new(
+        read_private_file_if_present(path, TOKEN_LIMIT as u64)
+            .ok()
+            .flatten()?,
+    );
+    valid_token(&bytes).then_some(bytes)
 }
 
 /// Whether `path` is a real directory, looked at without following a link:

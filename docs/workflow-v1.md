@@ -74,16 +74,15 @@ multiple YAML documents, `%YAML` and unknown directives, and floating-point numb
 100 levels deep.
 
 Execution inherits only `PATH`, `HOME`, `USER`, `LOGNAME`, `LANG`, `LC_ALL`, `LC_CTYPE`,
-`TERM`, and `TMPDIR` from the launching process by default. Add other names at the
-workflow root, for example `environmentPassthrough: [MY_TOKEN]`. Names are unique shell
-variable names; missing ones stay unset. Engine-reserved `UM_*` and `SCHERZO_*` and
-runner-private Git, SSH, and GitHub credential/helper names cannot be passed through.
-The engine injects runner source revision metadata. A step, finalizer, or recovery
-handler may list root names in its own `environmentPassthrough` (else
-`environment_passthrough_undeclared`) to get only those, `[]` for none; a handler
-without one gets its step's. Guard and recovery scratch directories use `TMPDIR` when
-set (otherwise the system temporary directory); the guard's launch manifest never
-records environment values.
+`TERM`, and `TMPDIR` from the launching process. Add others at the root:
+`environmentPassthrough: [MY_TOKEN]`. Names are unique shell variables; missing ones
+are unset. `UM_*`, `SCHERZO_*`, and Git, SSH, and GitHub credential/helper names cannot
+be passed, except `GH_TOKEN`, `UM_LINEAR_ACCESS_TOKEN`, and `UM_LINEAR_ACCESS_TOKEN_FILE`;
+a runner sets these only from a grant. The engine injects source revision metadata. A
+step, finalizer, or recovery handler may list root names in `environmentPassthrough`
+(else `environment_passthrough_undeclared`) to get only those, `[]` for none; a handler
+without one gets its step's. Guard and recovery scratch use `TMPDIR` when set, else the
+system temporary directory; the guard's launch manifest records no environment values.
 
 The `cmd` and `agent` node kinds may declare `failurePolicy`, `recovery`, `dependsOn`,
 `cwd`, `outputs`, and `environmentPassthrough`. `failurePolicy` is `required` by default
@@ -113,6 +112,29 @@ never activates.
   delay/backoff, handler retry, capture-only retry, rollback, or session continuation.
 - Recovery effects are at-least-once. Authors supply stable domain idempotency keys
   through existing explicit inputs or admitted environment, not Useful Machinery lifecycle IDs.
+
+## Provider tokens from grants
+
+To call GitHub, GitLab.com, or Linear as the person who started the run, pass
+`GH_TOKEN` and `GH_TOKEN_FILE`, `GITLAB_TOKEN` and `GITLAB_TOKEN_FILE`, or
+`UM_LINEAR_ACCESS_TOKEN` and `UM_LINEAR_ACCESS_TOKEN_FILE` in the root
+`environmentPassthrough`; a step's own list, if any, must keep them. On a runner the token
+is the run's member's, issued only when that member holds a grant (`um grant create`) and
+authorized that runner (`um grant authorize`); a run acting for nobody, such as a service
+principal's or a schedule's, gets none. A local run takes them from its environment. The
+variable is fixed when the runner takes the run; the file stays current. Tokens live about
+8 hours (GitHub), 2 (GitLab.com), or 24 (Linear) and are replaced a fifth of that before
+expiry, which ends the old one, so a long step rereads the file. For Git (user `oauth2` and
+`$GITLAB_TOKEN_FILE` for GitLab.com):
+
+```sh
+git -c credential.helper= \
+  -c 'credential.helper=!f() { echo username=x-access-token; echo "password=$(cat "$GH_TOKEN_FILE")"; }; f' \
+  clone https://github.com/OWNER/REPO.git
+```
+
+A revoked grant or authorization, or one needing reconnection, removes the file when the
+runner next asks.
 
 ## Conditional steps and finalizers
 

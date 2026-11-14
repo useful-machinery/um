@@ -875,8 +875,26 @@ fn is_base_workflow_environment_name(name: &OsStr) -> bool {
     )
 }
 
+/// The grant token names (REQ-WFFORMAT-32): a workflow may declare them in
+/// `environmentPassthrough` although `GH_TOKEN` is a GitHub credential name and the
+/// Linear names start with `UM_`. On a runner they are set only from a grant, never
+/// from the service's own environment (REQ-WORKSPACE-18).
+pub fn grant_token_environment_names() -> [&'static str; 3] {
+    [
+        "GH_TOKEN",
+        "UM_LINEAR_ACCESS_TOKEN",
+        "UM_LINEAR_ACCESS_TOKEN_FILE",
+    ]
+}
+
+fn is_grant_token_environment_name(name: &OsStr) -> bool {
+    grant_token_environment_names()
+        .iter()
+        .any(|grant| name.as_encoded_bytes() == grant.as_bytes())
+}
+
 fn is_engine_reserved_environment_name(name: &OsStr) -> bool {
-    name.as_encoded_bytes().starts_with(b"UM_")
+    (name.as_encoded_bytes().starts_with(b"UM_") && !is_grant_token_environment_name(name))
         || name.as_encoded_bytes() == b"SCHERZO_CONTINUATION_CONTEXT"
 }
 
@@ -903,7 +921,6 @@ pub(super) fn is_managed_runner_private_environment_name(name: &OsStr) -> bool {
             | b"SSH_ASKPASS_REQUIRE"
             | b"SSH_AUTH_SOCK"
             | b"SSH_AGENT_PID"
-            | b"GH_TOKEN"
             | b"GITHUB_TOKEN"
     ) || name.starts_with(b"GIT_CONFIG_KEY_")
         || name.starts_with(b"GIT_CONFIG_VALUE_")

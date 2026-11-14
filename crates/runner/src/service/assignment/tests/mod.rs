@@ -4496,6 +4496,49 @@ steps:
     assert_succeeded(&execute_to_terminal(&mut manager, &offered).await);
 }
 
+// REQ-WORKSPACE-18: the grant token names may be declared, but a runner's service
+// environment never supplies them to a step.
+#[tokio::test]
+async fn declared_grant_token_names_never_carry_the_runner_service_values() {
+    const GRANT_TOKEN_NAMES: [&str; 3] = [
+        "GH_TOKEN",
+        "UM_LINEAR_ACCESS_TOKEN",
+        "UM_LINEAR_ACCESS_TOKEN_FILE",
+    ];
+    let workflow = r#"schemaVersion: 1
+environmentPassthrough: [GH_TOKEN, UM_LINEAR_ACCESS_TOKEN, UM_LINEAR_ACCESS_TOKEN_FILE]
+steps:
+  check:
+    kind: cmd
+    command:
+      argv:
+        - sh
+        - -c
+        - 'test -z "${GH_TOKEN+x}" && test -z "${UM_LINEAR_ACCESS_TOKEN+x}" && test -z "${UM_LINEAR_ACCESS_TOKEN_FILE+x}"'
+"#;
+    let (_temporary, mut manager) = manager_fixture(workflow);
+    let mut variables = manager.environment.variables().clone();
+    for name in GRANT_TOKEN_NAMES {
+        variables.insert(OsString::from(name), OsString::from("runner-private"));
+    }
+    manager.environment = EnvironmentSnapshot::new(variables);
+    let offered = offer("bg");
+
+    offer_then_prepare(&mut manager, &offered).await;
+
+    let execution = match &manager.slot {
+        Some(LocalSlot::Accepted(accepted)) => engine_admission(accepted).execution(),
+        _ => panic!("assignment should be accepted"),
+    };
+    for name in GRANT_TOKEN_NAMES {
+        assert!(
+            execution.environment().variable(OsStr::new(name)).is_none(),
+            "{name}"
+        );
+    }
+    assert_succeeded(&execute_to_terminal(&mut manager, &offered).await);
+}
+
 #[tokio::test]
 async fn release_retires_an_unsent_acceptance_observation() {
     let workflow =

@@ -3,12 +3,15 @@
 //! runner's own agent-login directory, recording each provider's readiness,
 //! and offering what it keeps to each assignment it admits, once it has set
 //! them up for that admission (REQ-GRANT-49), noting how the provider
-//! answered each use of what it offered (REQ-GRANT-52).
+//! answered each use of what it offered (REQ-GRANT-52). Each admission also
+//! asks Cloud for the grant tokens of its own assignment and keeps them
+//! until the assignment ends (REQ-GRANT-86).
 
 pub(crate) mod claude_code;
 pub(crate) mod cloud;
 pub(crate) mod codex;
 pub(crate) mod directory;
+pub(crate) mod grant_token;
 pub(crate) mod readiness;
 pub(crate) mod setup;
 
@@ -16,11 +19,26 @@ use std::ffi::{OsStr, OsString};
 use std::io;
 
 use serde::{Deserialize, Serialize};
-use um_execution::{CLAUDE_CODE_LOGIN_VARIABLE, CODEX_LOGIN_VARIABLE, EnvironmentSnapshot};
+use um_execution::{
+    CLAUDE_CODE_LOGIN_VARIABLE, CODEX_LOGIN_VARIABLE, EnvironmentSnapshot,
+    grant_token_environment_names,
+};
 
 use crate::control_protocol::{AgentLoginProvider, AgentLoginState};
 use crate::telemetry;
 use directory::LoginDirectory;
+
+/// A token the runner keeps in a file of its own, a Claude Code login or a
+/// grant access token, is one line of at most this many printable
+/// characters (REQ-GRANT-12, REQ-GRANT-86).
+pub(crate) const TOKEN_LIMIT: usize = 4096;
+
+/// Whether `bytes` are one such token: one line of 1 to `TOKEN_LIMIT`
+/// printable characters without spaces, the form Cloud accepts and an
+/// environment variable can carry.
+pub(crate) fn valid_token(bytes: &[u8]) -> bool {
+    (1..=TOKEN_LIMIT).contains(&bytes.len()) && bytes.iter().all(u8::is_ascii_graphic)
+}
 
 /// The serving process's environment as far as standing back for the
 /// service's own logins needs it. Setup takes it as a value so that the
@@ -182,12 +200,18 @@ pub(crate) struct OfferedLogin {
 /// agent reads (`CODEX_HOME`, `CLAUDE_CODE_OAUTH_TOKEN`) where the service
 /// has no login of that agent's own, and the variable withheld instead where
 /// the runner keeps none of a selected provider's login (REQ-GRANT-51).
-/// A variable the process environment carries is never replaced or
-/// withheld, and the process environment itself is never changed. A missing
-/// or unreadable readiness document selects nothing, and records no install
-/// of what is added. Which steps receive a variable is the workflow's
-/// `environmentPassthrough` (REQ-WFEXEC-71).
+/// The grant token names (`GH_TOKEN`, `UM_LINEAR_ACCESS_TOKEN`,
+/// `UM_LINEAR_ACCESS_TOKEN_FILE`) are never offered from the process
+/// environment, since a workflow may pass them to its steps and the service's
+/// own values of them stay private (REQ-WORKSPACE-18); an admission is offered
+/// its grant tokens through `offer_with_grant_tokens`. Any other variable the
+/// process environment carries is never replaced or withheld, and the process
+/// environment itself is never changed. A missing or unreadable readiness
+/// document selects nothing, and records no install of what is added. Which
+/// steps receive a variable is the workflow's `environmentPassthrough`
+/// (REQ-WFEXEC-71).
 pub(crate) fn offer(process: &EnvironmentSnapshot, directory: Option<&LoginDirectory>) -> Offer {
+    let process = &without_grant_token_names(process);
     let Some(directory) = directory else {
         return Offer {
             environment: process.clone(),
@@ -262,6 +286,39 @@ pub(crate) fn offer(process: &EnvironmentSnapshot, directory: Option<&LoginDirec
         withheld,
         offered,
     }
+}
+
+/// What an assignment's admission is offered: `offer`'s, with the grant
+/// tokens it holds, `grant_tokens`, and their files offered as well, and the
+/// names of a selected provider it holds no token of withheld
+/// (`grant_token::offer`, REQ-GRANT-87). Unlike an agent login, a grant token
+/// replaces a value the process environment carries, and its withheld names
+/// are only absent: they are not among `Offer::withheld`, and no
+/// `OfferedLogin` records a grant token, whose uses are not noted.
+pub(crate) fn offer_with_grant_tokens(
+    process: &EnvironmentSnapshot,
+    directory: Option<&LoginDirectory>,
+    grant_tokens: Option<&grant_token::AssignmentGrantTokens>,
+) -> Offer {
+    let offered = offer(process, directory);
+    let document = directory.and_then(recorded_readiness);
+    Offer {
+        environment: grant_token::offer(&offered.environment, grant_tokens, document.as_ref()),
+        ..offered
+    }
+}
+
+/// `process` without the grant token names, which a step on a runner receives
+/// only from a grant.
+fn without_grant_token_names(process: &EnvironmentSnapshot) -> EnvironmentSnapshot {
+    let grant_names = grant_token_environment_names();
+    EnvironmentSnapshot::new(
+        process
+            .variables()
+            .iter()
+            .filter(|(name, _)| !grant_names.iter().any(|grant| name.as_os_str() == *grant))
+            .map(|(name, value)| (name.clone(), value.clone())),
+    )
 }
 
 /// The readiness document beside `directory`; none when there is none or it

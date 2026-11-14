@@ -1,8 +1,9 @@
-//! The runner's two agent-login requests to Cloud: its status and one
-//! delivery. Both are POSTs on the HTTP base of the runner's endpoint,
-//! authenticated by the enrolled runner credential, and name neither a boot
-//! nor an assignment: an agent login is a standing install bound to the
-//! runner alone.
+//! The runner's requests to Cloud for what it keeps in its agent-login
+//! directory: its agent-login status and one delivery, which name neither a
+//! boot nor an assignment, since an agent login is a standing install bound
+//! to the runner alone, and the token of an assignment's grant, which names
+//! both (REQ-GRANT-84). Each is a POST on the HTTP base of the runner's
+//! endpoint, authenticated by the enrolled runner credential.
 
 use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
@@ -10,6 +11,8 @@ use std::time::Duration;
 use base64::Engine as _;
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
+use time::OffsetDateTime;
+use time::format_description::well_known::Rfc3339;
 use url::Url;
 use zeroize::Zeroizing;
 
@@ -21,6 +24,7 @@ use crate::runner_http::{self, SensitiveString};
 
 const STATUS_PATH: &str = "/v1/runner/agent-logins/status";
 const DELIVERY_PATH: &str = "/v1/runner/agent-logins/delivery";
+const GRANT_TOKEN_PATH: &str = "/v1/runner/grants/token";
 /// Cloud accepts no larger material for any provider.
 const MAXIMUM_MATERIAL_BYTES: usize = 32 * 1024;
 
@@ -35,6 +39,11 @@ pub(crate) trait AgentLoginCloud: Send + Sync {
 
     /// One generation of one agent login (REQ-GRANT-26).
     fn delivery(&self, request: &DeliveryRequest) -> Result<Delivery, DeliveryFailure>;
+
+    /// The access token of the grant Cloud resolves for the assignment the
+    /// request names (REQ-GRANT-84). A Cloud without the route answers
+    /// `NoRoute`.
+    fn grant_token(&self, request: &GrantTokenRequest) -> Result<IssuedToken, GrantTokenFailure>;
 
     /// Makes later requests use the endpoint and credential the runner now
     /// serves with, after a live credential promotion.
@@ -180,6 +189,76 @@ impl CloudFailure {
     }
 }
 
+/// A request for the access token of the grant of an assignment the runner
+/// holds, for one OAuth provider.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct GrantTokenRequest {
+    pub(crate) boot_id: String,
+    pub(crate) assignment_id: String,
+    /// `github`, `gitlab` or `linear`.
+    pub(crate) provider: AgentLoginProvider,
+}
+
+/// The access token Cloud issued from a grant (REQ-GRANT-84, REQ-GRANT-85).
+#[derive(Debug)]
+pub(crate) struct IssuedToken {
+    /// The grant's `pgr_` ID.
+    pub(crate) grant_id: String,
+    /// The grant's generation the token belongs to, at least 1.
+    pub(crate) generation: u64,
+    pub(crate) access_token: GrantAccessToken,
+    pub(crate) expires_at: OffsetDateTime,
+    /// How long the runner waits before asking again (REQ-GRANT-85,
+    /// REQ-GRANT-89).
+    pub(crate) refresh_after: std::time::Duration,
+}
+
+/// A grant access token: one line of 1 to 4096 printable characters
+/// without spaces, cleared when dropped and never shown by `Debug`.
+pub(crate) struct GrantAccessToken(Zeroizing<Vec<u8>>);
+
+impl GrantAccessToken {
+    /// The token `bytes` hold; `None` when they are not one of its form.
+    pub(crate) fn new(bytes: &[u8]) -> Option<Self> {
+        super::valid_token(bytes).then(|| Self(Zeroizing::new(bytes.to_vec())))
+    }
+
+    pub(crate) fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for GrantAccessToken {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("GrantAccessToken([redacted])")
+    }
+}
+
+/// The reason Cloud names when it issues no token (REQ-GRANT-84).
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum GrantTokenRefusal {
+    Unauthorized,
+    Revoked,
+    ReconnectRequired,
+    ProviderUnavailable,
+    AssignmentNotCurrent,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum GrantTokenFailure {
+    Refused(GrantTokenRefusal),
+    /// Cloud has no such route, so it authorizes nothing.
+    NoRoute,
+    Cloud(CloudFailure),
+}
+
+impl From<CloudFailure> for GrantTokenFailure {
+    fn from(failure: CloudFailure) -> Self {
+        Self::Cloud(failure)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum DeliveryFailure {
     Refused(DeliveryRefusal),
@@ -192,7 +271,7 @@ impl From<CloudFailure> for DeliveryFailure {
     }
 }
 
-/// The two requests over HTTP with the runner's current credential.
+/// The requests over HTTP with the runner's current credential.
 #[derive(Debug)]
 pub(crate) struct HttpAgentLoginCloud {
     target: Mutex<Target>,
@@ -204,6 +283,7 @@ pub(crate) struct HttpAgentLoginCloud {
 struct Target {
     status_endpoint: Url,
     delivery_endpoint: Url,
+    grant_token_endpoint: Url,
     runner_credential: Credential,
 }
 
@@ -215,6 +295,11 @@ impl Target {
                 .ok()?,
             delivery_endpoint: runner_http::private_runner_http_endpoint(endpoint, DELIVERY_PATH)
                 .ok()?,
+            grant_token_endpoint: runner_http::private_runner_http_endpoint(
+                endpoint,
+                GRANT_TOKEN_PATH,
+            )
+            .ok()?,
             runner_credential: runner_credential.clone(),
         })
     }
@@ -384,6 +469,58 @@ impl AgentLoginCloud for HttpAgentLoginCloud {
             material: LoginMaterial(material),
         })
     }
+
+    fn grant_token(&self, request: &GrantTokenRequest) -> Result<IssuedToken, GrantTokenFailure> {
+        // A request for an installable provider is never sent.
+        let provider = request
+            .provider
+            .grant_provider()
+            .ok_or(CloudFailure::Transport)?;
+        let body = GrantTokenRequestBody {
+            schema_version: 1,
+            boot_id: &request.boot_id,
+            assignment_id: &request.assignment_id,
+            provider,
+        };
+        let response = self.post(
+            |target| &target.grant_token_endpoint,
+            &body,
+            &[StatusCode::OK, StatusCode::CONFLICT],
+        )?;
+        match response.status {
+            StatusCode::OK => {}
+            StatusCode::CONFLICT => {
+                let refusal: GrantTokenRefusalAnswer = serde_json::from_slice(&response.body)
+                    .map_err(|_| CloudFailure::InvalidResponse)?;
+                if refusal.schema_version != 1 {
+                    return Err(CloudFailure::InvalidResponse.into());
+                }
+                return Err(GrantTokenFailure::Refused(refusal.reason));
+            }
+            StatusCode::NOT_FOUND => return Err(GrantTokenFailure::NoRoute),
+            status => return Err(CloudFailure::Status(status.as_u16()).into()),
+        }
+        let answer: IssuedTokenAnswer =
+            serde_json::from_slice(&response.body).map_err(|_| CloudFailure::InvalidResponse)?;
+        let expires_at = OffsetDateTime::parse(&answer.expires_at, &Rfc3339)
+            .map_err(|_| CloudFailure::InvalidResponse)?;
+        if answer.schema_version != 1
+            || answer.provider != provider
+            || answer.generation < 1
+            || !um_support::valid_typed_id(&answer.grant_id, "pgr_")
+        {
+            return Err(CloudFailure::InvalidResponse.into());
+        }
+        let access_token = GrantAccessToken::new(answer.access_token.0.as_bytes())
+            .ok_or(CloudFailure::InvalidResponse)?;
+        Ok(IssuedToken {
+            grant_id: answer.grant_id,
+            generation: answer.generation,
+            access_token,
+            expires_at,
+            refresh_after: std::time::Duration::from_secs(answer.refresh_after_seconds),
+        })
+    }
 }
 
 #[derive(Serialize)]
@@ -453,6 +590,36 @@ struct DeliveryAnswer {
 struct RefusalAnswer {
     schema_version: u64,
     reason: DeliveryRefusal,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GrantTokenRequestBody<'a> {
+    schema_version: u32,
+    boot_id: &'a str,
+    assignment_id: &'a str,
+    provider: &'static str,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct IssuedTokenAnswer {
+    schema_version: u64,
+    provider: String,
+    grant_id: String,
+    generation: u64,
+    access_token: SensitiveString,
+    expires_at: String,
+    /// The wait before asking again (REQ-GRANT-85), a whole number of
+    /// seconds.
+    refresh_after_seconds: u64,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct GrantTokenRefusalAnswer {
+    schema_version: u64,
+    reason: GrantTokenRefusal,
 }
 
 #[cfg(test)]

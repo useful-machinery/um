@@ -868,7 +868,7 @@ fn authorize_states_who_can_use_the_grant_then_authorizes_the_runner_with_one_ke
 
     // Before acting each states who can use the grant, as the refusal without `--yes` does:
     // for a native grant two exposures, the runs that runner serves and the steps on it that
-    // can read the login, and for an OAuth grant one, the member's own runs.
+    // can read the login, and for an OAuth grant the parts the next test counts.
     let refusal = refusal_without_yes(
         &server,
         &credential,
@@ -877,7 +877,6 @@ fn authorize_states_who_can_use_the_grant_then_authorizes_the_runner_with_one_ke
     let native_statement = statement(&native_run, NATIVE_GRANT_ID);
     let oauth_statement = statement(&oauth_run, OAUTH_GRANT_ID);
     assert_eq!(native_statement.len(), 2, "{}", stderr(&native_run));
-    assert_eq!(oauth_statement.len(), 1, "{}", stderr(&oauth_run));
     assert!(
         oauth_statement
             .iter()
@@ -941,6 +940,42 @@ fn authorize_states_who_can_use_the_grant_then_authorizes_the_runner_with_one_ke
 }
 
 // REQ-GRANT-65
+// REQ-GRANT-66
+#[test]
+fn authorize_without_yes_states_the_runs_issued_oauth_tokens_and_the_steps_reading_them() {
+    let oauth = oauth_grant(OAUTH_GRANT_ID, "github", "active");
+    let (server, _directory, credential) =
+        prepared(vec![one(&oauth), authorized(OAUTH_GRANT_ID, NEW_RUNNER_ID)]);
+
+    // Refused with exit 2 before anything is sent: the only requests are the acting run's.
+    let refusal = refusal_without_yes(
+        &server,
+        &credential,
+        &["authorize", OAUTH_GRANT_ID, NEW_RUNNER_ID],
+    );
+    let acting = run_grant(
+        &server,
+        &credential,
+        &["authorize", OAUTH_GRANT_ID, NEW_RUNNER_ID, "--yes"],
+    );
+    assert_eq!(acting.status.code(), Some(0), "{}", stderr(&acting));
+
+    // An OAuth grant's statement has two parts, the runs that can be issued tokens from it and
+    // the steps of such a run that can read the token, each stated by the refusal too.
+    let oauth_statement = statement(&acting, OAUTH_GRANT_ID);
+    assert_eq!(oauth_statement.len(), 2, "{}", stderr(&acting));
+    assert_ne!(oauth_statement[0], oauth_statement[1]);
+    assert_stated_by_the_refusal(&oauth_statement, &refusal);
+
+    assert_eq!(
+        request_lines(&server.finish()),
+        [
+            "GET /api/v1/me/grants/pgr_01k0z6r1w8f4jy2m7q9v3x5abc HTTP/1.1",
+            "POST /api/v1/me/grants/pgr_01k0z6r1w8f4jy2m7q9v3x5abc/authorizations HTTP/1.1",
+        ]
+    );
+}
+
 // REQ-GRANT-66
 // REQ-GRANT-67
 // REQ-GRANT-68

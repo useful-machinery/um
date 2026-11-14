@@ -40,6 +40,7 @@ impl AssignmentManager {
                 .state_access()
                 .map(|state| crate::agent_login::directory::LoginDirectory::beside(state.path())),
             agent_login_setup: None,
+            grant_token_refresh: None,
             execution_version,
             lease_clock,
             sleeper,
@@ -84,6 +85,18 @@ impl AssignmentManager {
         setup: super::super::control::AdmissionAgentLogins,
     ) {
         self.agent_login_setup = Some(setup);
+    }
+
+    /// Makes each later admission keep the token files of its grant tokens
+    /// current while its assignment runs, waiting on `sleeper` and
+    /// publishing each readiness a refresh records in `status`
+    /// (REQ-GRANT-89).
+    pub(in crate::service) fn refresh_grant_tokens_with(
+        &mut self,
+        sleeper: Arc<dyn Sleeper>,
+        status: Arc<super::super::control::LiveStatus>,
+    ) {
+        self.grant_token_refresh = Some(GrantTokenRefreshing { sleeper, status });
     }
 
     pub(in crate::service) fn retain_lease_policy(
@@ -434,6 +447,7 @@ impl AssignmentManager {
         let mut runtime = self.admission_runtime();
         let agent_login_directory = self.agent_login_directory.clone();
         let agent_login_setup = self.agent_login_setup.clone();
+        let grant_token_refresh = self.grant_token_refresh.clone();
         let sender = self.event_sender.clone();
         let wake = self.outbox.clone();
         if let Some(LocalSlot::Preparing(preparing)) = &mut self.slot {
@@ -462,19 +476,42 @@ impl AssignmentManager {
             // continuation's included, so it is offered a replaced generation
             // and nothing of a revoked login; nothing has been offered yet,
             // and nothing is installed or removed once it has
-            // (REQ-GRANT-49, INV-RUNNER-15). Whatever the setup meets,
-            // a panic included, the admission goes on with what is on disk.
+            // (REQ-GRANT-49, INV-RUNNER-15). Then it asks Cloud for its
+            // assignment's grant tokens, now that Cloud counts the assignment
+            // as preparing, as for its source credential, and keeps them
+            // until the assignment ends (REQ-GRANT-86, INV-RUNNER-28),
+            // keeping each file current while it runs (REQ-GRANT-89).
+            // Whatever the setup meets, a panic included, the admission goes
+            // on with what is on disk.
             if let Some(setup) = &agent_login_setup {
-                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| setup.set_up()));
+                runtime.grant_tokens =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        setup.set_up(&worker_offer.assignment_id)
+                    }))
+                    .ok()
+                    .flatten()
+                    .map(|mut tokens| {
+                        if let Some(refreshing) = &grant_token_refresh {
+                            refreshing.start(&mut tokens);
+                        }
+                        Arc::new(tokens)
+                    });
             }
             // The steps, a tree run's `um` commands included, draw from the
             // process environment with the agent logins the runner keeps now,
             // looked at for this admission (REQ-GRANT-37, REQ-GRANT-44); a
             // selected provider's login the runner keeps none of is withheld
             // instead, and the engine refuses an agent step that would have
-            // received it (REQ-GRANT-51, INV-RUNNER-17).
-            let offered =
-                crate::agent_login::offer(&runtime.environment, agent_login_directory.as_ref());
+            // received it (REQ-GRANT-51, INV-RUNNER-17). The admission's
+            // grant tokens and their files are offered too, in place of the
+            // service's values of their names, and a selected provider's
+            // names it holds no token of are absent, which refuses no step
+            // (REQ-GRANT-87).
+            let offered = crate::agent_login::offer_with_grant_tokens(
+                &runtime.environment,
+                agent_login_directory.as_ref(),
+                runtime.grant_tokens.as_deref(),
+            );
             runtime.environment = offered.environment;
             runtime.withheld_agent_logins = offered.withheld;
             // How the provider answers each agent step given a login the

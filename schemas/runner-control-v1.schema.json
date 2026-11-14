@@ -137,12 +137,37 @@
       }
     },
     "brokeredAgentLogin": {
+      "description": "An OAuth provider's entry as the readiness document records it.",
       "type": "object",
       "additionalProperties": false,
       "required": ["provider", "state"],
       "properties": {
         "provider": { "enum": ["github", "gitlab", "linear"] },
-        "state": { "const": "not_delivered" }
+        "state": {
+          "enum": [
+            "not_delivered",
+            "ready",
+            "not_authorized",
+            "revoked",
+            "reconnect_required",
+            "unsupported_target",
+            "cloud_unavailable",
+            "install_failed"
+          ]
+        },
+        "grantId": { "type": "string", "pattern": "^pgr_[0-7][0-9a-hjkmnp-tv-z]{25}$" },
+        "generation": { "type": "integer", "minimum": 1 },
+        "expiresAt": { "type": "string", "format": "date-time" },
+        "checkedAt": { "type": "string", "format": "date-time" },
+        "selected": {
+          "description": "Whether the provider is selected, as the readiness document records it; absent where it records none.",
+          "type": "boolean"
+        }
+      },
+      "if": { "properties": { "state": { "const": "ready" } } },
+      "then": { "required": ["grantId", "generation", "expiresAt"] },
+      "else": {
+        "properties": { "grantId": false, "generation": false, "expiresAt": false }
       }
     },
     "statusResponse": {

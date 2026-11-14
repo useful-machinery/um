@@ -5,18 +5,21 @@ use um_execution::{
     CLAUDE_CODE_LOGIN_VARIABLE as TOKEN_VARIABLE, CODEX_LOGIN_VARIABLE as CODEX_HOME,
 };
 
-use crate::agent_login::cloud::{CloudFailure, DeliveryRefusal, LoginStatus};
+use crate::agent_login::cloud::{
+    CloudFailure, DeliveryRefusal, GrantTokenFailure, GrantTokenRefusal, LoginStatus,
+};
 use crate::agent_login::directory::LoginDirectory;
 use crate::agent_login::readiness::{
-    LoginReadiness, ReadinessDocument, UseOutcome, readiness_path,
+    GrantReadiness, LoginReadiness, ReadinessDocument, UseOutcome, readiness_path,
 };
 use crate::agent_login::setup::{AgentLoginSetup, SetupOutcome};
 use crate::control_protocol::{AgentLoginProvider, AgentLoginState};
 use crate::service::IdleAssignmentGate;
 use crate::service::control::{AdmissionAgentLogins, LiveStatus};
 use crate::service::test_support::{
-    CountedGate, FakeAgentLoginCloud, fake_agent_login_material, fake_agent_login_setup,
-    fake_codex_answer, fake_codex_authorized,
+    CountedGate, FakeAgentLoginCloud, FakeGrantToken, SleepRelease, controlled_sleeper,
+    fake_agent_login_material, fake_agent_login_setup, fake_codex_answer, fake_codex_authorized,
+    fake_grant_expiry, fake_grant_token,
 };
 use crate::telemetry::test_recorder;
 
@@ -294,19 +297,36 @@ async fn each_admission_looks_for_the_codex_login_the_runner_keeps_then() {
 }
 
 /// A manager for `PASSING_CODEX_WORKFLOW` whose admissions set agent logins up
-/// against a fake Cloud (REQ-GRANT-49), behind the lock the periodic
-/// pass's gate takes, and that setup, which keeps its readiness and
-/// agent-login directory beside the manager's state.
+/// and ask for their grant tokens against a fake Cloud (REQ-GRANT-49,
+/// REQ-GRANT-86), behind the lock the periodic pass's gate takes, and that
+/// setup, which keeps its readiness and agent-login directory beside the
+/// manager's state.
 struct SettingUp {
     temporary: tempfile::TempDir,
     manager: Arc<Mutex<AssignmentManager>>,
     setup: Arc<AgentLoginSetup>,
     cloud: Arc<FakeAgentLoginCloud>,
+    status: Arc<LiveStatus>,
 }
 
 impl SettingUp {
     fn new(cloud: Arc<FakeAgentLoginCloud>) -> Self {
-        let (temporary, manager) = manager_without_agent_logins(PASSING_CODEX_WORKFLOW);
+        Self::running(PASSING_CODEX_WORKFLOW, cloud)
+    }
+
+    /// `new`, for a manager whose assignments run `workflow`.
+    fn running(workflow: &str, cloud: Arc<FakeAgentLoginCloud>) -> Self {
+        let (temporary, manager) = manager_without_agent_logins(workflow);
+        Self::serving(temporary, manager, cloud)
+    }
+
+    /// `new`, for `manager`, whose agent-login directory and service home
+    /// are in `temporary`.
+    fn serving(
+        temporary: tempfile::TempDir,
+        manager: AssignmentManager,
+        cloud: Arc<FakeAgentLoginCloud>,
+    ) -> Self {
         let manager = Arc::new(Mutex::new(manager));
         let (recorder, _capture) = test_recorder("rbt_01k0z6r1w8f4jy2m7q9v3x5abc");
         let setup = Arc::new(AgentLoginSetup::new(
@@ -327,13 +347,25 @@ impl SettingUp {
         manager
             .lock()
             .unwrap()
-            .set_up_agent_logins_with(AdmissionAgentLogins::new(&setup, status));
+            .set_up_agent_logins_with(AdmissionAgentLogins::new(&setup, Arc::clone(&status)));
         Self {
             temporary,
             manager,
             setup,
             cloud,
+            status,
         }
+    }
+
+    /// Has each later admission keep its grant token files current
+    /// (REQ-GRANT-89) on a controlled sleeper, whose sleeps it answers.
+    fn refreshing(&self) -> tokio::sync::mpsc::UnboundedReceiver<(Duration, SleepRelease)> {
+        let (sleeper, sleeps) = controlled_sleeper();
+        self.manager
+            .lock()
+            .unwrap()
+            .refresh_grant_tokens_with(sleeper, Arc::clone(&self.status));
+        sleeps
     }
 
     /// Admits `offered` and answers the `CODEX_HOME` it was offered. The
@@ -347,6 +379,27 @@ impl SettingUp {
         let mut manager = self.manager.lock().unwrap();
         offer_then_prepare(&mut manager, offered).await;
         accepted_variable(&manager, CODEX_HOME)
+    }
+
+    /// Adds `variables` to the service's environment.
+    fn serve_with(&self, variables: &[(&str, &str)]) {
+        let mut manager = self.manager.lock().unwrap();
+        let mut environment = manager.environment.variables().clone();
+        for (name, value) in variables {
+            environment.insert(OsString::from(name), OsString::from(value));
+        }
+        manager.environment = EnvironmentSnapshot::new(environment);
+    }
+
+    /// Admits `offered`, runs it and answers its reports.
+    #[expect(
+        clippy::await_holding_lock,
+        reason = "the admission's setup must not take the manager's lock"
+    )]
+    async fn run(&self, offered: &AssignmentOffer) -> Vec<ExecutionReport> {
+        let mut manager = self.manager.lock().unwrap();
+        offer_then_prepare(&mut manager, offered).await;
+        execute_to_terminal(&mut manager, offered).await
     }
 
     #[expect(
@@ -372,13 +425,23 @@ impl SettingUp {
         fs::read(self.codex_home().join("auth.json")).ok()
     }
 
-    fn codex(&self) -> LoginReadiness {
+    fn readiness(&self) -> Option<ReadinessDocument> {
         ReadinessDocument::load(&readiness_path(
             &self.temporary.path().join("runner-state.json"),
         ))
         .unwrap()
-        .and_then(|document| document.login(AgentLoginProvider::Codex).cloned())
-        .expect("codex readiness")
+    }
+
+    fn codex(&self) -> LoginReadiness {
+        self.readiness()
+            .and_then(|document| document.login(AgentLoginProvider::Codex).cloned())
+            .expect("codex readiness")
+    }
+
+    fn grant(&self, provider: AgentLoginProvider) -> GrantReadiness {
+        self.readiness()
+            .and_then(|document| document.grant(provider).cloned())
+            .expect("grant readiness")
     }
 
     fn requests(&self) -> (u64, u64) {
@@ -865,7 +928,13 @@ async fn codex_last_use_after_a_codex_step(service_codex_home: bool) -> Option<U
     );
     assert_succeeded(&execute_to_terminal(&mut manager, &offered).await);
 
-    let Some(SetupOutcome::Recorded(document)) = setup.run_admission_pass() else {
+    let Some(SetupOutcome::Recorded(document)) = setup
+        .set_up_admission(
+            "rbt_01k0z6r1w8f4jy2m7q9v3x5abe",
+            "asn_01k0z6r1w8f4jy2m7q9v3x5abz",
+        )
+        .agent_logins
+    else {
         panic!("the next pass did not record readiness");
     };
     let codex = document.login(AgentLoginProvider::Codex).unwrap();
@@ -886,4 +955,298 @@ async fn an_admissions_observer_notes_a_use_of_the_codex_home_the_runner_added()
 #[tokio::test]
 async fn a_codex_home_the_service_carried_notes_no_use() {
     assert_eq!(codex_last_use_after_a_codex_step(true).await, None);
+}
+
+/// The names each OAuth provider's grant token is offered as: the token's
+/// variable and the variable naming its file (REQ-GRANT-87).
+const GRANT_NAMES: [(AgentLoginProvider, &str, &str); 3] = [
+    (AgentLoginProvider::Github, "GH_TOKEN", "GH_TOKEN_FILE"),
+    (
+        AgentLoginProvider::Gitlab,
+        "GITLAB_TOKEN",
+        "GITLAB_TOKEN_FILE",
+    ),
+    (
+        AgentLoginProvider::Linear,
+        "UM_LINEAR_ACCESS_TOKEN",
+        "UM_LINEAR_ACCESS_TOKEN_FILE",
+    ),
+];
+
+/// The service's own value of every grant name.
+const SERVICE_GRANT_VALUES: [(&str, &str); 6] = [
+    ("GH_TOKEN", "service-gh-token"),
+    ("GH_TOKEN_FILE", "/service/gh-token"),
+    ("GITLAB_TOKEN", "service-gitlab-token"),
+    ("GITLAB_TOKEN_FILE", "/service/gitlab-token"),
+    ("UM_LINEAR_ACCESS_TOKEN", "service-linear-token"),
+    ("UM_LINEAR_ACCESS_TOKEN_FILE", "/service/linear-token"),
+];
+
+/// A workflow that passes `variable` and `file_variable`: `kept` must see
+/// `token` in the one and in the file the other names, and `narrowed`,
+/// whose own list omits both, neither.
+fn workflow_passing_a_grant(variable: &str, file_variable: &str, token: &str) -> String {
+    format!(
+        r#"schemaVersion: 1
+environmentPassthrough: [{variable}, {file_variable}]
+steps:
+  kept:
+    kind: cmd
+    command:
+      argv: [sh, -c, 'test "${variable}" = {token} && test "$(cat "${file_variable}")" = {token}']
+  narrowed:
+    kind: cmd
+    environmentPassthrough: []
+    command:
+      argv: [sh, -c, 'test -z "${{{variable}+x}}" && test -z "${{{file_variable}+x}}"']
+"#
+    )
+}
+
+/// A workflow whose root passes `passed` and whose one step must succeed
+/// at `check`.
+fn workflow_checking(passed: &str, check: &str) -> String {
+    format!(
+        r#"schemaVersion: 1
+environmentPassthrough: [{passed}]
+steps:
+  check:
+    kind: cmd
+    command:
+      argv: [sh, -c, '{check}']
+"#
+    )
+}
+
+/// A shell test that none of `names` is set.
+fn unset(names: &[&str]) -> String {
+    names
+        .iter()
+        .map(|name| format!(r#"test -z "${{{name}+x}}""#))
+        .collect::<Vec<_>>()
+        .join(" && ")
+}
+
+fn every_grant_name() -> Vec<&'static str> {
+    SERVICE_GRANT_VALUES.iter().map(|(name, _)| *name).collect()
+}
+
+fn refused(refusal: GrantTokenRefusal) -> FakeGrantToken {
+    FakeGrantToken::Fail(GrantTokenFailure::Refused(refusal))
+}
+
+// REQ-GRANT-87, REQ-WFEXEC-71
+#[tokio::test]
+async fn an_issued_token_and_its_file_reach_only_the_steps_that_pass_them_over_the_services() {
+    for (provider, variable, file_variable) in GRANT_NAMES {
+        let token = fake_grant_token(provider, 4);
+        let fixture = SettingUp::running(
+            &workflow_passing_a_grant(variable, file_variable, &token),
+            FakeAgentLoginCloud::new(Ok(Vec::new())),
+        );
+        fixture.serve_with(&SERVICE_GRANT_VALUES);
+        fixture
+            .cloud
+            .answer_grant_token(provider, FakeGrantToken::Issue(4));
+
+        assert_succeeded(&fixture.run(&offer("bg")).await);
+    }
+}
+
+// REQ-GRANT-87, REQ-WFEXEC-71
+#[tokio::test]
+async fn a_workflow_that_passes_no_grant_name_receives_no_token() {
+    let fixture = SettingUp::running(
+        &workflow_checking("OTHER_NAME", &unset(&every_grant_name())),
+        FakeAgentLoginCloud::new(Ok(Vec::new())),
+    );
+    for (provider, _, _) in GRANT_NAMES {
+        fixture
+            .cloud
+            .answer_grant_token(provider, FakeGrantToken::Issue(1));
+    }
+
+    assert_succeeded(&fixture.run(&offer("bg")).await);
+}
+
+// REQ-GRANT-87, REQ-WORKSPACE-18
+#[tokio::test]
+async fn an_unselected_provider_leaves_the_services_gitlab_token_and_never_its_gh_token() {
+    let check = format!(
+        r#"test "$GITLAB_TOKEN" = service-gitlab-token && test "$GITLAB_TOKEN_FILE" = /service/gitlab-token && test "$GH_TOKEN_FILE" = /service/gh-token && {}"#,
+        unset(&[
+            "GH_TOKEN",
+            "UM_LINEAR_ACCESS_TOKEN",
+            "UM_LINEAR_ACCESS_TOKEN_FILE"
+        ])
+    );
+    let fixture = SettingUp::running(
+        &workflow_checking(&every_grant_name().join(", "), &check),
+        FakeAgentLoginCloud::new(Ok(Vec::new())),
+    );
+    fixture.serve_with(&SERVICE_GRANT_VALUES);
+    for (provider, _, _) in GRANT_NAMES {
+        fixture
+            .cloud
+            .answer_grant_token(provider, refused(GrantTokenRefusal::Unauthorized));
+    }
+
+    assert_succeeded(&fixture.run(&offer("bg")).await);
+    assert!(!fixture.grant(AgentLoginProvider::Gitlab).selected);
+}
+
+// REQ-GRANT-87, REQ-GRANT-10
+#[tokio::test]
+async fn a_selected_provider_without_a_token_withholds_the_services_gitlab_token() {
+    let workflow = workflow_checking(
+        "GITLAB_TOKEN, GITLAB_TOKEN_FILE",
+        &unset(&["GITLAB_TOKEN", "GITLAB_TOKEN_FILE"]),
+    );
+    let serving = || {
+        let fixture = SettingUp::running(&workflow, FakeAgentLoginCloud::new(Ok(Vec::new())));
+        fixture.serve_with(&SERVICE_GRANT_VALUES);
+        fixture
+    };
+
+    // Cloud names a grant in force that cannot issue a token.
+    let fixture = serving();
+    fixture.cloud.answer_grant_token(
+        AgentLoginProvider::Gitlab,
+        refused(GrantTokenRefusal::ReconnectRequired),
+    );
+    assert_succeeded(&fixture.run(&offer("bg")).await);
+    assert!(fixture.grant(AgentLoginProvider::Gitlab).selected);
+
+    // Cloud does not answer for a provider an earlier admission was issued
+    // a token of.
+    let fixture = serving();
+    fixture
+        .cloud
+        .answer_grant_token(AgentLoginProvider::Gitlab, FakeGrantToken::Issue(1));
+    let first = offer("bg");
+    fixture.admit(&first).await;
+    fixture.release(&first).await;
+    fixture.cloud.answer_grant_token(
+        AgentLoginProvider::Gitlab,
+        FakeGrantToken::Fail(GrantTokenFailure::Cloud(CloudFailure::Transport)),
+    );
+    assert_succeeded(&fixture.run(&offer("bh")).await);
+    let gitlab = fixture.grant(AgentLoginProvider::Gitlab);
+    assert_eq!(gitlab.state, AgentLoginState::CloudUnavailable);
+    assert!(gitlab.selected);
+}
+
+// REQ-GRANT-87, REQ-GRANT-51
+#[tokio::test]
+async fn an_agent_step_is_not_refused_over_a_withheld_grant_name() {
+    // The names the Codex fixture reads, and the GitLab grant's.
+    let workflow = CODEX_ONLY_WORKFLOW.replacen(
+        "schemaVersion: 1\n",
+        "schemaVersion: 1\nenvironmentPassthrough: [GITLAB_TOKEN, GITLAB_TOKEN_FILE, CODEX_HOME, CODEX_FIXTURE_HELPER, CODEX_FIXTURE_ARGUMENTS, CODEX_FIXTURE_REQUESTS, CODEX_FIXTURE_PROCESS, CODEX_FIXTURE_READY, CODEX_FIXTURE_PROCEED, CODEX_FIXTURE_DESCENDANT, CODEX_FIXTURE_SCENARIO, CODEX_FIXTURE_VERSION, CODEX_FIXTURE_RESPONSE]\n",
+        1,
+    );
+    let (temporary, mut manager) = super::harness_executable_tests::manager_fixture_with_harnesses(
+        &workflow,
+        None,
+        None,
+        Some(SUCCESSFUL_CODEX),
+    );
+    fs::create_dir(temporary.path().join("service-home")).unwrap();
+    manager.agent_login_directory = Some(LoginDirectory::beside(
+        &temporary.path().join("runner-state.json"),
+    ));
+    let fixture = SettingUp::serving(temporary, manager, FakeAgentLoginCloud::new(Ok(Vec::new())));
+    fixture.serve_with(&SERVICE_GRANT_VALUES);
+    fixture.cloud.answer_grant_token(
+        AgentLoginProvider::Gitlab,
+        refused(GrantTokenRefusal::ReconnectRequired),
+    );
+
+    assert_succeeded(&fixture.run(&offer("bg")).await);
+    assert!(fixture.temporary.path().join("codex.calls").exists());
+}
+
+// REQ-GRANT-89
+#[tokio::test]
+async fn a_running_assignment_has_its_token_file_replaced_and_an_ended_one_does_not() {
+    let wait = Duration::from_secs(60);
+    let one = fake_grant_token(AgentLoginProvider::Github, 1);
+    let two = fake_grant_token(AgentLoginProvider::Github, 2);
+    let marker = tempfile::tempdir().unwrap();
+    let started = marker.path().join("started");
+    // The step says it has started, then waits for the file to hold
+    // generation 2; its variable is still generation 1's.
+    let workflow = workflow_checking(
+        "GH_TOKEN, GH_TOKEN_FILE",
+        &format!(
+            r#": > {started} && i=0 && until test "$(cat "$GH_TOKEN_FILE")" = {two}; do i=$((i+1)); test $i -lt 600 || exit 1; sleep 0.1; done && test "$GH_TOKEN" = {one}"#,
+            started = started.display(),
+        ),
+    );
+    let fixture = SettingUp::running(&workflow, FakeAgentLoginCloud::new(Ok(Vec::new())));
+    let mut sleeps = fixture.refreshing();
+    fixture
+        .cloud
+        .issue_grant_tokens_with(wait, fake_grant_expiry());
+    fixture
+        .cloud
+        .answer_grant_token(AgentLoginProvider::Github, FakeGrantToken::Issue(1));
+
+    let refresh = async {
+        let (asked, release) = sleeps.recv().await.unwrap();
+        assert_eq!(asked, wait);
+        wait_for_fixture_path(&started).await;
+        fixture
+            .cloud
+            .answer_grant_token(AgentLoginProvider::Github, FakeGrantToken::Issue(2));
+        release.release();
+    };
+    let running = offer("bg");
+    let (reports, ()) = tokio::join!(fixture.run(&running), refresh);
+
+    assert_succeeded(&reports);
+    assert_eq!(
+        fixture
+            .grant(AgentLoginProvider::Github)
+            .issued
+            .unwrap()
+            .generation,
+        2
+    );
+
+    // An assignment that has ended asks nothing when its wait passes.
+    let fixture = SettingUp::running(&workflow, FakeAgentLoginCloud::new(Ok(Vec::new())));
+    let mut sleeps = fixture.refreshing();
+    fixture
+        .cloud
+        .answer_grant_token(AgentLoginProvider::Github, FakeGrantToken::Issue(1));
+    let ended = offer("bh");
+    fixture.admit(&ended).await;
+    // Only the assignment's task keeps the sleeper now, so its sleeps end
+    // with it.
+    fixture.manager.lock().unwrap().grant_token_refresh = None;
+    let (_, release) = sleeps.recv().await.unwrap();
+    fixture.release(&ended).await;
+    fixture
+        .cloud
+        .answer_grant_token(AgentLoginProvider::Github, FakeGrantToken::Issue(2));
+
+    release.release();
+
+    assert!(
+        with_watchdog(sleeps.recv())
+            .await
+            .expect("the ended assignment's task stops")
+            .is_none()
+    );
+    assert_eq!(fixture.cloud.grant_requests().len(), 3);
+    assert_eq!(
+        fixture
+            .grant(AgentLoginProvider::Github)
+            .issued
+            .unwrap()
+            .generation,
+        1
+    );
 }

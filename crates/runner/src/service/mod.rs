@@ -34,8 +34,10 @@ pub(crate) use config::AssignmentConfig;
 pub use config::{Config, ConfigError};
 #[cfg(test)]
 pub(crate) use test_support::{
-    CountedGate, FAKE_AGENT_LOGIN_ID, FAKE_AGENT_LOGIN_SENTINEL, FakeAgentLoginCloud,
-    fake_agent_login_material, fake_codex_authorized,
+    CountedGate, FAKE_AGENT_LOGIN_ID, FAKE_AGENT_LOGIN_SENTINEL, FAKE_GRANT_ID,
+    FAKE_GRANT_TOKEN_SENTINEL, FakeAgentLoginCloud, FakeGrantToken, SleepRelease,
+    controlled_sleeper, fake_agent_login_material, fake_codex_authorized, fake_grant_expiry,
+    fake_grant_token, with_watchdog,
 };
 
 use crate::agent_login::setup::{AgentLoginSetup, AssignmentGate, SetupDependencies};
@@ -692,12 +694,15 @@ async fn connection_loop_with_work_root(
         ))
     });
     // Each admission sets agent logins up for itself before it offers them
-    // (REQ-GRANT-49).
+    // (REQ-GRANT-49), and keeps its grant token files current while its
+    // assignment runs (REQ-GRANT-89).
     if let Some(setup) = &agent_login_setup {
-        assignment_manager
+        let mut manager = assignment_manager
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        manager
             .set_up_agent_logins_with(AdmissionAgentLogins::new(setup, Arc::clone(&live_status)));
+        manager.refresh_grant_tokens_with(Arc::clone(&sleeper), Arc::clone(&live_status));
     }
     let (reload_sender, mut reload_requests) = tokio::sync::mpsc::channel::<ReloadRequest>(1);
     let _control_server = config

@@ -25,7 +25,8 @@ use um_test_support::watchdog::{FIXTURE_WAIT_BASE, WatchdogExpired, host_scaled_
 use crate::agent_login::ServiceEnvironment;
 use crate::agent_login::cloud::{
     AgentLoginCloud, CloudFailure, Delivery, DeliveryFailure, DeliveryRefusal, DeliveryRequest,
-    LoginMaterial, LoginStatus, ProviderLogin, StatusRequest,
+    GrantAccessToken, GrantTokenFailure, GrantTokenRequest, IssuedToken, LoginMaterial,
+    LoginStatus, ProviderLogin, StatusRequest,
 };
 use crate::agent_login::setup::{AssignmentGate, SetupDependencies};
 use crate::control_protocol::AgentLoginProvider;
@@ -975,6 +976,41 @@ pub(crate) fn fake_codex_authorized(generation: u64) -> Result<Vec<ProviderLogin
     })
 }
 
+/// The grant the fake Cloud issues tokens from.
+pub(crate) const FAKE_GRANT_ID: &str = "pgr_01k0z6r1w8f4jy2m7q9v3x5abc";
+/// Text in every grant token the fake Cloud issues, which no output but the
+/// token file may hold.
+pub(crate) const FAKE_GRANT_TOKEN_SENTINEL: &str = "grant-token-sentinel";
+
+/// The token the fake Cloud issues for `provider` at `generation`.
+pub(crate) fn fake_grant_token(provider: AgentLoginProvider, generation: u64) -> String {
+    format!(
+        "{FAKE_GRANT_TOKEN_SENTINEL}-{}-{generation}",
+        provider.as_str()
+    )
+}
+
+/// What the fake Cloud answers a grant-token request for one provider.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum FakeGrantToken {
+    /// Issues `fake_grant_token` from `FAKE_GRANT_ID` at this generation.
+    Issue(u64),
+    Fail(GrantTokenFailure),
+}
+
+/// The wait the fake Cloud names with each token it issues until a test
+/// sets another, as Cloud's own fixture does.
+const FAKE_GRANT_REFRESH_AFTER: Duration = Duration::from_secs(5040);
+
+/// The expiry of each token the fake Cloud issues until a test sets
+/// another: 2026-11-13T22:00:00Z.
+pub(crate) fn fake_grant_expiry() -> time::OffsetDateTime {
+    time::OffsetDateTime::from_unix_timestamp(1_794_607_200).expect("the fake expiry is a time")
+}
+
+/// A hook the fake Cloud calls with each grant-token request as it arrives.
+type GrantRequestHook = Box<dyn Fn(&GrantTokenRequest) + Send + Sync>;
+
 /// Cloud's side of agent-login setup for service tests: answers each status
 /// request with what the test last set, or the next one only with what it set
 /// for it, and delivers the fake material for the generation asked for, or
@@ -989,6 +1025,11 @@ pub(crate) struct FakeAgentLoginCloud {
     status_requests: AtomicU64,
     reports: Mutex<Vec<StatusRequest>>,
     deliveries: AtomicU64,
+    grant_tokens: Mutex<Vec<(AgentLoginProvider, FakeGrantToken)>>,
+    /// The wait and the expiry each issued token carries.
+    grant_terms: Mutex<(Duration, time::OffsetDateTime)>,
+    grant_requests: Mutex<Vec<GrantTokenRequest>>,
+    grant_request_hook: Mutex<Option<GrantRequestHook>>,
 }
 
 impl FakeAgentLoginCloud {
@@ -1002,7 +1043,46 @@ impl FakeAgentLoginCloud {
             status_requests: AtomicU64::new(0),
             reports: Mutex::new(Vec::new()),
             deliveries: AtomicU64::new(0),
+            grant_tokens: Mutex::new(Vec::new()),
+            grant_terms: Mutex::new((FAKE_GRANT_REFRESH_AFTER, fake_grant_expiry())),
+            grant_requests: Mutex::new(Vec::new()),
+            grant_request_hook: Mutex::new(None),
         })
+    }
+
+    /// What later grant-token requests for `provider` answer; until a test
+    /// sets one, each is answered as by a Cloud without the route.
+    pub(crate) fn answer_grant_token(&self, provider: AgentLoginProvider, answer: FakeGrantToken) {
+        let mut answers = self.grant_tokens.lock().expect("fake Cloud mutex poisoned");
+        answers.retain(|(answered, _)| *answered != provider);
+        answers.push((provider, answer));
+    }
+
+    /// The wait before asking again and the expiry each later issued token
+    /// carries.
+    pub(crate) fn issue_grant_tokens_with(
+        &self,
+        refresh_after: Duration,
+        expires_at: time::OffsetDateTime,
+    ) {
+        *self.grant_terms.lock().expect("fake Cloud mutex poisoned") = (refresh_after, expires_at);
+    }
+
+    /// Calls `hook` with each later grant-token request before it is
+    /// answered.
+    pub(crate) fn on_grant_request(&self, hook: GrantRequestHook) {
+        *self
+            .grant_request_hook
+            .lock()
+            .expect("fake Cloud mutex poisoned") = Some(hook);
+    }
+
+    /// Each grant-token request answered so far, in the order they arrived.
+    pub(crate) fn grant_requests(&self) -> Vec<GrantTokenRequest> {
+        self.grant_requests
+            .lock()
+            .expect("fake Cloud mutex poisoned")
+            .clone()
     }
 
     /// What later status requests answer.
@@ -1121,6 +1201,46 @@ impl AgentLoginCloud for FakeAgentLoginCloud {
             record_schema_version: 1,
             material: LoginMaterial::from_bytes(&fake_agent_login_material(request.generation)),
         })
+    }
+
+    fn grant_token(&self, request: &GrantTokenRequest) -> Result<IssuedToken, GrantTokenFailure> {
+        if let Some(hook) = self
+            .grant_request_hook
+            .lock()
+            .expect("fake Cloud mutex poisoned")
+            .as_ref()
+        {
+            hook(request);
+        }
+        self.grant_requests
+            .lock()
+            .expect("fake Cloud mutex poisoned")
+            .push(request.clone());
+        let answer = self
+            .grant_tokens
+            .lock()
+            .expect("fake Cloud mutex poisoned")
+            .iter()
+            .find(|(provider, _)| *provider == request.provider)
+            .map_or(
+                FakeGrantToken::Fail(GrantTokenFailure::NoRoute),
+                |(_, answer)| *answer,
+            );
+        let (refresh_after, expires_at) =
+            *self.grant_terms.lock().expect("fake Cloud mutex poisoned");
+        match answer {
+            FakeGrantToken::Issue(generation) => Ok(IssuedToken {
+                grant_id: FAKE_GRANT_ID.to_owned(),
+                generation,
+                access_token: GrantAccessToken::new(
+                    fake_grant_token(request.provider, generation).as_bytes(),
+                )
+                .expect("the fake grant token is one of the token's form"),
+                expires_at,
+                refresh_after,
+            }),
+            FakeGrantToken::Fail(failure) => Err(failure),
+        }
     }
 }
 

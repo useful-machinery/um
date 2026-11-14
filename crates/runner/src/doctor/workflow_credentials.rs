@@ -399,6 +399,8 @@ struct Recognition {
     credential_words: &'static [&'static str],
     /// Whole forwarded names that read as a credential without such a word.
     credential_names: &'static [&'static str],
+    /// Whole forwarded names and the kind they call for, read before the first word.
+    named_credentials: &'static [(&'static str, CredentialKind)],
     /// The first word of a credential name and the kind it calls for.
     provider_words: &'static [(&'static str, CredentialKind)],
     /// A root `requires.tools` entry and the kind it calls for; other tools are ignored.
@@ -410,6 +412,10 @@ struct Recognition {
 const RECOGNITION: Recognition = Recognition {
     credential_words: &["TOKEN", "KEY", "SECRET", "PASSWORD", "CREDENTIALS"],
     credential_names: &["CLAUDE_CONFIG_DIR", "CODEX_HOME"],
+    named_credentials: &[
+        ("UM_LINEAR_ACCESS_TOKEN", CredentialKind::Linear),
+        ("UM_LINEAR_ACCESS_TOKEN_FILE", CredentialKind::Linear),
+    ],
     provider_words: &[
         ("GITHUB", CredentialKind::Github),
         ("GH", CredentialKind::Github),
@@ -440,6 +446,13 @@ enum ForwardedVariable {
 }
 
 fn classify_forwarded_variable(name: &str) -> ForwardedVariable {
+    if let Some((_, kind)) = RECOGNITION
+        .named_credentials
+        .iter()
+        .find(|(credential, _)| name.eq_ignore_ascii_case(credential))
+    {
+        return ForwardedVariable::Calls(*kind);
+    }
     let is_credential = RECOGNITION
         .credential_names
         .iter()
@@ -1159,12 +1172,29 @@ steps:
                 "gh_api_token",
                 ForwardedVariable::Calls(CredentialKind::Github),
             ),
+            ("GH_TOKEN", ForwardedVariable::Calls(CredentialKind::Github)),
+            (
+                "GH_TOKEN_FILE",
+                ForwardedVariable::Calls(CredentialKind::Github),
+            ),
             (
                 "GITLAB_TOKEN",
                 ForwardedVariable::Calls(CredentialKind::Gitlab),
             ),
             (
+                "GITLAB_TOKEN_FILE",
+                ForwardedVariable::Calls(CredentialKind::Gitlab),
+            ),
+            (
                 "LINEAR_API_KEY",
+                ForwardedVariable::Calls(CredentialKind::Linear),
+            ),
+            (
+                "UM_LINEAR_ACCESS_TOKEN",
+                ForwardedVariable::Calls(CredentialKind::Linear),
+            ),
+            (
+                "UM_LINEAR_ACCESS_TOKEN_FILE",
                 ForwardedVariable::Calls(CredentialKind::Linear),
             ),
             (

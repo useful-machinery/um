@@ -1,0 +1,7 @@
+{
+  "schemaVersion": 1,
+  "updatedAt": "2026-11-12T01:00:00Z",
+  "providers": [
+    { "provider": "github", "state": "ready", "checkedAt": "2026-11-12T01:00:00Z", "selected": true }
+  ]
+}

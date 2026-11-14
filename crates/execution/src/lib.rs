@@ -41,8 +41,8 @@ pub use workflow::admission::{
     OrdinaryCancellationRequestResult, ResolvedAttachment, ResolvedFile, ResolvedInput,
     ResolvedInputs, ResolvedJsonInput, SourceRevisionProvenance, WorkflowCapacityBudget,
     admit_local_continuation_workflow, admit_local_workflow, admit_runner_workflow,
-    completed_inputs_match, default_execution_policy_limits, local_continuation_input_failures,
-    untested_harness_advisories,
+    completed_inputs_match, default_execution_policy_limits, grant_token_environment_names,
+    local_continuation_input_failures, untested_harness_advisories,
 };
 pub use workflow::agent::WorkflowRunId;
 pub use workflow::agent::dispatch::{ProductionAgentDispatcher, production_agent_dispatcher};

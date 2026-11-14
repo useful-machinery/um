@@ -397,9 +397,55 @@ fn reading_rejects_a_bad_record() {
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
     };
 
+    let issued = serde_json::json!({
+        "grantId": GRANT_ID,
+        "generation": 1,
+        "expiresAt": "2026-11-12T09:00:00Z",
+    });
+    let github = |members: serde_json::Value| {
+        let mut entry = serde_json::json!({"provider": "github"});
+        entry
+            .as_object_mut()
+            .unwrap()
+            .extend(members.as_object().unwrap().clone());
+        serde_json::json!([entry])
+    };
+    let ready_with = |members: serde_json::Value| {
+        let mut entry = issued.clone();
+        entry
+            .as_object_mut()
+            .unwrap()
+            .extend(members.as_object().unwrap().clone());
+        entry["state"] = "ready".into();
+        github(entry)
+    };
     for providers in [
         serde_json::json!([{"provider": "codex", "state": "not_delivered"}]),
-        serde_json::json!([{"provider": "github", "state": "ready"}]),
+        serde_json::json!([{"provider": "codex", "state": "reconnect_required"}]),
+        serde_json::json!([{"provider": "codex", "state": "ready", "grantId": GRANT_ID}]),
+        serde_json::json!([{"provider": "gemini", "state": "ready", "expiresAt": "2026-11-12T09:00:00Z"}]),
+        // A ready OAuth entry without what was issued, or another state
+        // with it.
+        github(serde_json::json!({"state": "ready"})),
+        github(serde_json::json!({"state": "revoked", "grantId": GRANT_ID})),
+        github(serde_json::json!({"state": "not_authorized", "generation": 1})),
+        // An installable provider's state, a malformed grant, a second entry.
+        github(serde_json::json!({"state": "foreign_login"})),
+        github(serde_json::json!({"state": "stale_generation"})),
+        ready_with(serde_json::json!({"grantId": AGENT_LOGIN_ID})),
+        ready_with(serde_json::json!({"generation": 0})),
+        ready_with(serde_json::json!({"expiresAt": "tomorrow"})),
+        serde_json::json!([
+            {"provider": "linear", "state": "revoked"},
+            {"provider": "linear", "state": "not_authorized"},
+        ]),
+        // An agent login's members, a path or a token.
+        github(serde_json::json!({"state": "revoked", "agentLoginId": AGENT_LOGIN_ID})),
+        ready_with(serde_json::json!({"installedAt": "2026-11-12T00:55:00Z"})),
+        ready_with(
+            serde_json::json!({"installedPath": "/var/lib/um-runner/.runner-agent-login/github.token"}),
+        ),
+        ready_with(serde_json::json!({"accessToken": "synthetic-grant-access-token"})),
         serde_json::json!([{"provider": "codex", "state": "ready", "generation": 1}]),
         serde_json::json!([
             {"provider": "codex", "state": "ready"},
@@ -436,7 +482,230 @@ fn reading_rejects_a_bad_record() {
     );
 }
 
-// REQ-GRANT-38
+const GRANT_ID: &str = "pgr_01k0z6r1w8f4jy2m7q9v3x5abc";
+
+/// A document holding nothing but `grants`, each recorded as an OAuth
+/// provider's entry.
+fn with_grants(grants: impl IntoIterator<Item = GrantReadiness>) -> ReadinessDocument {
+    let mut document = ReadinessDocument {
+        updated_at: time(1_794_445_200),
+        logins: Vec::new(),
+        unknown: Vec::new(),
+    };
+    for grant in grants {
+        document.record_grant(grant);
+    }
+    document
+}
+
+fn write_raw(path: &Path, value: &serde_json::Value) {
+    let _ = fs::remove_file(path);
+    fs::write(path, serde_json::to_vec(value).unwrap()).unwrap();
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+}
+
+// REQ-GRANT-88, REQ-GRANT-38
+#[test]
+fn an_oauth_providers_ready_entry_survives_a_write_and_a_load_unchanged() {
+    let state = state_directory();
+    let path = readiness_path(&state.path().join("state.json"));
+    let github = GrantReadiness {
+        provider: AgentLoginProvider::Github,
+        state: AgentLoginState::Ready,
+        checked_at: Some(time(1_794_445_200)),
+        issued: Some(IssuedGrant {
+            grant_id: GRANT_ID.to_owned(),
+            generation: 4,
+            expires_at: time(1_794_474_000),
+        }),
+        selected: true,
+    };
+    let document = with_grants([github.clone()]);
+
+    document.write(&path).unwrap();
+
+    let value: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    assert!(validator().is_valid(&value), "{value}");
+    // The entry holds what was issued, never a token or the path of a file;
+    // a provider with no recorded entry is still `not_delivered`.
+    assert_eq!(
+        value["providers"],
+        serde_json::json!([
+            {
+                "provider": "github",
+                "state": "ready",
+                "grantId": GRANT_ID,
+                "generation": 4,
+                "expiresAt": "2026-11-12T09:00:00Z",
+                "checkedAt": "2026-11-12T01:00:00Z",
+                "selected": true,
+            },
+            {"provider": "gitlab", "state": "not_delivered"},
+            {"provider": "linear", "state": "not_delivered"},
+        ])
+    );
+    let loaded = ReadinessDocument::load(&path).unwrap().unwrap();
+    assert_eq!(loaded, document);
+    assert_eq!(loaded.grant(AgentLoginProvider::Github), Some(&github));
+    assert_eq!(loaded.grant(AgentLoginProvider::Gitlab), None);
+
+    // Status carries the grant, its generation and the expiry
+    // (REQ-GRANT-53).
+    let reported = serde_json::to_value(document.reported().unwrap()).unwrap();
+    assert_eq!(
+        reported["providers"][0],
+        serde_json::json!({
+            "provider": "github",
+            "state": "ready",
+            "grantId": GRANT_ID,
+            "generation": 4,
+            "expiresAt": "2026-11-12T09:00:00Z",
+            "checkedAt": "2026-11-12T01:00:00Z",
+            "selected": true,
+        })
+    );
+}
+
+// REQ-GRANT-88
+#[test]
+fn each_state_of_an_oauth_entry_round_trips() {
+    let state = state_directory();
+    let path = readiness_path(&state.path().join("state.json"));
+    let validator = validator();
+    for state in [
+        AgentLoginState::NotAuthorized,
+        AgentLoginState::Revoked,
+        AgentLoginState::ReconnectRequired,
+        AgentLoginState::UnsupportedTarget,
+        AgentLoginState::CloudUnavailable,
+        AgentLoginState::InstallFailed,
+    ] {
+        for selected in [true, false] {
+            let entries = [
+                AgentLoginProvider::Github,
+                AgentLoginProvider::Gitlab,
+                AgentLoginProvider::Linear,
+            ]
+            .map(|provider| GrantReadiness {
+                provider,
+                state,
+                checked_at: Some(time(1_794_445_200)),
+                issued: None,
+                selected,
+            });
+            let document = with_grants(entries);
+            document.write(&path).unwrap();
+            let value: serde_json::Value =
+                serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            assert!(validator.is_valid(&value), "{value}");
+            assert_eq!(value["providers"][1]["state"], state.as_str(), "{value}");
+            assert_eq!(value["providers"][1]["selected"], selected, "{value}");
+            assert_eq!(
+                ReadinessDocument::load(&path),
+                Ok(Some(document)),
+                "{state:?}"
+            );
+        }
+    }
+}
+
+// REQ-GRANT-88, REQ-GRANT-38
+#[test]
+fn a_document_written_before_oauth_entries_were_recorded_still_loads() {
+    let state = state_directory();
+    let path = readiness_path(&state.path().join("state.json"));
+    let fixture = cli_root().join("tests/fixtures/runner-agent-logins/v1/valid/readiness.json");
+    let written: serde_json::Value = serde_json::from_slice(&fs::read(fixture).unwrap()).unwrap();
+    write_raw(&path, &written);
+
+    let document = ReadinessDocument::load(&path).unwrap().unwrap();
+
+    for provider in [
+        AgentLoginProvider::Github,
+        AgentLoginProvider::Gitlab,
+        AgentLoginProvider::Linear,
+    ] {
+        assert_eq!(document.grant(provider), None, "{provider:?}");
+    }
+    document.write(&path).unwrap();
+    let rewritten: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    let oauth_rows = |value: &serde_json::Value| {
+        value["providers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|entry| {
+                AgentLoginProvider::named(entry["provider"].as_str().unwrap())
+                    .is_some_and(AgentLoginProvider::is_brokered)
+            })
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(oauth_rows(&written).len(), 3);
+    assert_eq!(oauth_rows(&rewritten), oauth_rows(&written));
+}
+
+// REQ-GRANT-88
+#[test]
+fn recording_an_oauth_entry_replaces_the_providers_last_and_keeps_the_rest() {
+    let entry = |provider, state| GrantReadiness {
+        provider,
+        state,
+        checked_at: Some(time(1_794_445_200)),
+        issued: None,
+        selected: false,
+    };
+    let gemini = serde_json::json!({"provider": "gemini", "state": "awaiting_consent"});
+    let state = state_directory();
+    let path = readiness_path(&state.path().join("state.json"));
+    write_raw(
+        &path,
+        &serde_json::json!({
+            "schemaVersion": 1,
+            "updatedAt": "2026-11-12T01:00:00Z",
+            "providers": [gemini, {"provider": "linear", "state": "revoked"}],
+        }),
+    );
+    let mut document = ReadinessDocument::load(&path).unwrap().unwrap();
+
+    document.record_grant(entry(
+        AgentLoginProvider::Linear,
+        AgentLoginState::CloudUnavailable,
+    ));
+    document.record_grant(entry(
+        AgentLoginProvider::Github,
+        AgentLoginState::NotAuthorized,
+    ));
+
+    assert_eq!(
+        document.grant(AgentLoginProvider::Linear),
+        Some(&entry(
+            AgentLoginProvider::Linear,
+            AgentLoginState::CloudUnavailable
+        ))
+    );
+    document.write(&path).unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    assert!(validator().is_valid(&value), "{value}");
+    let providers = value["providers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| (entry["provider"].as_str(), entry["state"].as_str()))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        providers,
+        [
+            (Some("gemini"), Some("awaiting_consent")),
+            (Some("github"), Some("not_authorized")),
+            (Some("gitlab"), Some("not_delivered")),
+            (Some("linear"), Some("cloud_unavailable")),
+        ]
+    );
+    assert_eq!(ReadinessDocument::load(&path), Ok(Some(document)));
+}
+
+// REQ-GRANT-38, REQ-GRANT-88
 #[test]
 fn canonical_schema_and_the_runner_accept_only_valid_readiness_fixtures() {
     let validator = validator();

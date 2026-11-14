@@ -1,14 +1,19 @@
 //! One agent-login setup pass of the serving runner (REQ-GRANT-39,
 //! REQ-GRANT-40): ask Cloud which agent logins the runner is authorized
 //! for, install what is new, remove what has ended, and record each
-//! provider's readiness. Nothing is installed or removed once an assignment
-//! has been offered its logins (INV-RUNNER-15), and a pass that changes a provider's
-//! readiness, or cannot record it, writes one `runner.agent_login_setup`
-//! record (REQ-TELEMETRY-45). Each admission makes a pass of its own before
-//! the assignment is offered anything (REQ-GRANT-49). How the provider
+//! provider's readiness. No agent login is installed or removed once an
+//! assignment has been offered its logins (INV-RUNNER-15), and a pass that
+//! changes a provider's readiness, or cannot record it, writes one
+//! `runner.agent_login_setup` record (REQ-TELEMETRY-45). Each admission makes
+//! a pass of its own before the assignment is offered anything
+//! (REQ-GRANT-49), then asks Cloud for its assignment's grant tokens
+//! (REQ-GRANT-86), whose files each refresh while it runs replaces or removes
+//! under the same lock as a pass (REQ-GRANT-89). How the provider
 //! answered each use of an offered login is noted in memory while the
 //! assignment runs and folded into the readiness by the next pass
-//! (REQ-GRANT-52).
+//! (REQ-GRANT-52). A pass made while the runner holds no assignment removes
+//! the grant token files an earlier assignment or an interrupted runner left
+//! (INV-RUNNER-28).
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -27,8 +32,10 @@ use super::cloud::{
 };
 use super::codex;
 use super::directory::{self, LoginDirectory};
+use super::grant_token::{self, AssignmentGrantTokens, TokenFiles};
 use super::readiness::{
-    self, Installation, LastUse, LoginReadiness, ReadinessDocument, RecordedLogin, UseOutcome,
+    self, Installation, LastUse, LoginReadiness, ReadinessDocument, ReadinessError, RecordedLogin,
+    UseOutcome,
 };
 use super::{
     FailureCause, FailureStage, InstallRefusal, OfferedLogin, OperatingSystem, ServiceEnvironment,
@@ -174,6 +181,19 @@ pub(crate) struct AgentLoginSetup {
     pass: Mutex<()>,
     /// The uses noted since a pass last folded them in.
     uses: Arc<NotedUses>,
+    /// The grant token files of the assignment the runner holds.
+    grant_files: Arc<TokenFiles>,
+}
+
+/// What the setup an admission makes for itself did: the agent-login pass,
+/// when it made one, the readiness the grant-token requests recorded, when
+/// the document could be read and written, and what it holds of the
+/// assignment's grant tokens.
+#[derive(Debug)]
+pub(crate) struct AdmissionSetup {
+    pub(crate) agent_logins: Option<SetupOutcome>,
+    pub(crate) grants: Option<ReadinessDocument>,
+    pub(crate) tokens: AssignmentGrantTokens,
 }
 
 impl AgentLoginSetup {
@@ -182,12 +202,17 @@ impl AgentLoginSetup {
         gate: Arc<dyn AssignmentGate>,
         clock: impl Fn() -> OffsetDateTime + Send + Sync + 'static,
     ) -> Self {
+        let grant_files = Arc::new(TokenFiles::new(
+            dependencies.directory.clone(),
+            Arc::clone(&dependencies.recorder),
+        ));
         Self {
             dependencies,
             gate,
             clock: Arc::new(clock),
             pass: Mutex::new(()),
             uses: Arc::default(),
+            grant_files,
         }
     }
 
@@ -262,10 +287,120 @@ impl AgentLoginSetup {
     /// login as installed, as authorized without being ready, or as selected:
     /// a selected provider that holds none is withheld from the assignment
     /// (REQ-GRANT-51), so the admission asks whether Cloud authorizes it
-    /// again. A document it cannot read names none. `None` when it made no
-    /// pass; a pass never answers `Busy`.
-    pub(crate) fn run_admission_pass(&self) -> Option<SetupOutcome> {
+    /// again. A document it cannot read names none. Its `agent_logins` is
+    /// `None` when it made no pass; a pass never answers `Busy`. Then,
+    /// whatever the pass did, it asks Cloud for the grant tokens of the
+    /// assignment `assignment_id` of the boot `boot_id` (REQ-GRANT-86),
+    /// under the same hold of the pass lock; what it holds of them refreshes
+    /// through this setup (REQ-GRANT-89).
+    pub(crate) fn set_up_admission(
+        self: &Arc<Self>,
+        boot_id: &str,
+        assignment_id: &str,
+    ) -> AdmissionSetup {
         let _pass = self.pass.lock().unwrap_or_else(PoisonError::into_inner);
+        let agent_logins = self.admission_pass();
+        let (grants, tokens) = self.admit_grant_tokens(boot_id, assignment_id);
+        AdmissionSetup {
+            agent_logins,
+            grants,
+            tokens,
+        }
+    }
+
+    /// Asks Cloud for the assignment's grant tokens and records each
+    /// provider's entry in the readiness document (REQ-GRANT-88); the caller
+    /// holds the pass lock. A document that cannot be read is neither
+    /// replaced nor written, its failure recorded as a pass's is, and the
+    /// tokens are kept all the same.
+    fn admit_grant_tokens(
+        self: &Arc<Self>,
+        boot_id: &str,
+        assignment_id: &str,
+    ) -> (Option<ReadinessDocument>, AssignmentGrantTokens) {
+        let now = (self.clock)();
+        let (previous, mut document) = self.grant_document(now);
+        let tokens = self.asking(boot_id, assignment_id, now).admit(
+            Arc::downgrade(self),
+            previous.as_ref().ok().and_then(Option::as_ref),
+            &mut document,
+        );
+        let recorded = previous.is_ok() && self.write(&document);
+        (recorded.then_some(document), tokens)
+    }
+
+    /// Asks Cloud again for the token of the provider `step` names, for the
+    /// assignment `assignment_id` of the boot `boot_id` whose token files
+    /// the runner holds, keeps or removes its file and records its entry
+    /// (REQ-GRANT-89), under the pass lock, so that a refresh never
+    /// interleaves with a pass's or an admission's writes to the directory
+    /// or the readiness document. Answers what the refresh task does next,
+    /// and the readiness it recorded when it changed the entry and could
+    /// read and write the document.
+    pub(crate) fn refresh_grant_token(
+        &self,
+        boot_id: &str,
+        assignment_id: &str,
+        step: &grant_token::RefreshStep,
+    ) -> (grant_token::Next, Option<ReadinessDocument>) {
+        let _pass = self.pass.lock().unwrap_or_else(PoisonError::into_inner);
+        let now = (self.clock)();
+        let (previous, mut document) = self.grant_document(now);
+        let (next, changed) = self.asking(boot_id, assignment_id, now).refresh(
+            step,
+            previous.as_ref().ok().and_then(Option::as_ref),
+            &mut document,
+        );
+        let recorded = changed && previous.is_ok() && self.write(&document);
+        (next, recorded.then_some(document))
+    }
+
+    /// What a grant-token request of the assignment `assignment_id` of the
+    /// boot `boot_id`, made at `now`, asks Cloud with and keeps its tokens
+    /// in.
+    fn asking<'a>(
+        &'a self,
+        boot_id: &'a str,
+        assignment_id: &'a str,
+        now: OffsetDateTime,
+    ) -> grant_token::Asking<'a> {
+        grant_token::Asking {
+            cloud: self.dependencies.cloud.as_ref(),
+            files: &self.grant_files,
+            boot_id,
+            assignment_id,
+            now,
+        }
+    }
+
+    /// The readiness document as recorded, its failure to load recorded as
+    /// a pass's is, and the document a grant-token request at `now` records
+    /// into: the recorded one, or an empty one when there is none or it
+    /// cannot be read.
+    fn grant_document(
+        &self,
+        now: OffsetDateTime,
+    ) -> (
+        Result<Option<ReadinessDocument>, ReadinessError>,
+        ReadinessDocument,
+    ) {
+        let previous = ReadinessDocument::load(&self.dependencies.readiness_path)
+            .inspect_err(|error| self.record_failure(PassStage::Load, error.kind()));
+        let mut document = match &previous {
+            Ok(Some(previous)) => previous.clone(),
+            Ok(None) | Err(_) => ReadinessDocument {
+                updated_at: now,
+                logins: Vec::new(),
+                unknown: Vec::new(),
+            },
+        };
+        document.updated_at = now;
+        (previous, document)
+    }
+
+    /// The admission's agent-login pass, under the pass lock its caller
+    /// holds.
+    fn admission_pass(&self) -> Option<SetupOutcome> {
         let named = ReadinessDocument::load(&self.dependencies.readiness_path)
             .ok()
             .flatten()
@@ -281,7 +416,12 @@ impl AgentLoginSetup {
     /// One pass, each install and removal under `gate`; the caller holds the
     /// `pass` lock.
     fn pass_under(&self, gate: &dyn AssignmentGate) -> SetupOutcome {
-        if !gate.while_idle(&mut || self.remove_leftover_temporary_files()) {
+        // While the runner holds no assignment no grant token file is any
+        // assignment's (INV-RUNNER-28).
+        if !gate.while_idle(&mut || {
+            self.remove_leftover_temporary_files();
+            self.grant_files.remove_leftovers();
+        }) {
             return SetupOutcome::Busy(None);
         }
         let now = (self.clock)();
@@ -509,7 +649,7 @@ impl AgentLoginSetup {
 
     /// Removes the temporary files a write of the pass's own left when its
     /// process was killed before the rename, which may hold login material:
-    /// the readiness document's beside the state, and the token file's and
+    /// the readiness document's beside the state, and the token files' and
     /// the Codex home's in the runner's directory while it is a real
     /// directory. Only the serving runner writes with these prefixes, one
     /// pass at a time, so every such file is a leftover; enrollment's own
@@ -521,7 +661,11 @@ impl AgentLoginSetup {
         }
         let login_directory = dependencies.directory.path();
         if directory::real_directory(login_directory) {
-            remove_leftover_temporary_files(login_directory, &[claude_code::TEMPORARY_PREFIX]);
+            let [github, gitlab, linear] = directory::GRANT_TOKEN_TEMPORARY_PREFIXES;
+            remove_leftover_temporary_files(
+                login_directory,
+                &[claude_code::TEMPORARY_PREFIX, github, gitlab, linear],
+            );
             let codex_home = dependencies.directory.codex_home();
             if directory::real_directory(&codex_home) {
                 remove_leftover_temporary_files(&codex_home, &codex::TEMPORARY_PREFIXES);

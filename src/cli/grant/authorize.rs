@@ -172,13 +172,17 @@ impl FromArgMatches for Command {
 }
 
 /// Who can use the grant once the runner is authorized for it (REQ-GRANT-66): an OAuth
-/// grant's tokens are issued only to the runs its owner started (REQ-GRANT-10), while a native
-/// grant's login is the runner's to every run and step (REQ-GRANT-35).
+/// grant's tokens are issued only to the runs its owner started (REQ-GRANT-10), and every step
+/// of such a run can read the token, while a native grant's login is the runner's to every run
+/// and step (REQ-GRANT-35).
 impl Stated for Command {
     const COMMAND: &'static str = "um grant authorize";
     type Usage = Self;
     const STATEMENT: Statement = Statement::ByKind {
-        oauth: &["every run on the runner that you start can be issued tokens from the grant"],
+        oauth: &[
+            "every run on the runner that you start can be issued tokens from the grant",
+            "every step of such a run can read the token the runner is issued for it",
+        ],
         native: NATIVE_AUTHORIZE,
     };
     const ACTION: &'static str = "to authorize the runner";

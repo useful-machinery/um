@@ -249,17 +249,19 @@ fn cloud_assignment_offer_with_mismatched_sources() -> Message {
     )
 }
 
-const AGENT_LOGIN_REQUEST: &[u8] = b"POST /v1/runner/agent-logins/";
+/// The start of each of the serving runner's HTTP requests to Cloud, its
+/// agent-login setup and an admission's grant-token and source requests
+/// among them, which share the endpoint's host and port with its connection.
+const RUNNER_HTTP_REQUEST: &[u8] = b"POST /v1/runner/";
 
-/// The next connection of the serving runner other than its agent-login
-/// setup, which shares the endpoint's host and port: this fake gateway has
-/// no agent-login routes and answers those requests 404, as a Cloud without
-/// them would.
+/// The next connection of the serving runner other than its HTTP requests:
+/// this fake gateway has no HTTP routes and answers each of those requests
+/// 404 at once, as a Cloud without them would.
 fn accept_runner_request(listener: &TcpListener) -> std::net::TcpStream {
     loop {
         let (mut stream, _) = listener.accept().unwrap();
         let request = read_request(&mut stream);
-        if !request.starts_with(AGENT_LOGIN_REQUEST) {
+        if !request.starts_with(RUNNER_HTTP_REQUEST) {
             return stream;
         }
         let _ = stream.write_all(&http_response("404 Not Found", None, b""));
@@ -274,24 +276,25 @@ async fn accept_runner_connection(listener: &tokio::net::TcpListener) -> tokio::
     .await
 }
 
-/// `accept_runner_connection` for a fake gateway that has agent-login
-/// routes: `agent_logins` is given each agent-login request it read, head
-/// and body, and returns the whole HTTP answer.
+/// `accept_runner_connection` for a fake gateway that has HTTP routes:
+/// `routes` is given each of the runner's HTTP requests it read, head and
+/// body, and returns the whole HTTP answer at once, 404 for a route it does
+/// not have, so no request waits for the runner's timeout.
 pub(super) async fn accept_runner_connection_answering(
     listener: &tokio::net::TcpListener,
-    agent_logins: &dyn Fn(&[u8]) -> Vec<u8>,
+    routes: &dyn Fn(&[u8]) -> Vec<u8>,
 ) -> tokio::net::TcpStream {
     loop {
         let (stream, _) = listener.accept().await.unwrap();
-        let mut start = [0_u8; AGENT_LOGIN_REQUEST.len()];
+        let mut start = [0_u8; RUNNER_HTTP_REQUEST.len()];
         let mut peeked = 0;
         while peeked < start.len() {
             peeked = stream.peek(&mut start).await.unwrap();
-            if peeked == 0 || !AGENT_LOGIN_REQUEST.starts_with(&start[..peeked]) {
+            if peeked == 0 || !RUNNER_HTTP_REQUEST.starts_with(&start[..peeked]) {
                 break;
             }
         }
-        if start != AGENT_LOGIN_REQUEST {
+        if start != RUNNER_HTTP_REQUEST {
             return stream;
         }
         // The runner sends each short request whole, so reading it blocks
@@ -299,7 +302,7 @@ pub(super) async fn accept_runner_connection_answering(
         let mut stream = stream.into_std().unwrap();
         stream.set_nonblocking(false).unwrap();
         let request = read_request(&mut stream);
-        let _ = stream.write_all(&agent_logins(&request));
+        let _ = stream.write_all(&routes(&request));
     }
 }
 
@@ -593,11 +596,11 @@ fn run_status_with_response(response: &'static [u8]) -> Output {
     output
 }
 
-// REQ-RUNNERENROLL-42
+// REQ-RUNNERENROLL-42, REQ-GRANT-88
 #[test]
 fn runner_status_prints_each_provider_readiness_once_the_runner_has_set_up() {
     let output = run_status_with_response(
-        b"{\"schemaVersion\":1,\"outcome\":\"ok\",\"status\":{\"processState\":\"running\",\"bootId\":\"rbt_01k0z6r1w8f4jy2m7q9v3x5abc\",\"uptimeMilliseconds\":10000,\"connectionState\":\"connected\",\"assignmentCounts\":{\"preparing\":0,\"accepted\":0,\"running\":0,\"finishing\":0,\"reporting\":0},\"agentLogins\":{\"updatedAt\":\"2026-11-12T01:00:00Z\",\"providers\":[{\"provider\":\"codex\",\"state\":\"ready\",\"agentLoginId\":\"agl_01k0z6r1w8f4jy2m7q9v3x5abc\",\"generation\":3,\"checkedAt\":\"2026-11-12T01:00:00Z\",\"installedAt\":\"2026-11-12T00:55:00Z\"},{\"provider\":\"claude_code\",\"state\":\"foreign_login\",\"checkedAt\":\"2026-11-12T01:00:00Z\"},{\"provider\":\"github\",\"state\":\"not_delivered\"},{\"provider\":\"gitlab\",\"state\":\"not_delivered\"},{\"provider\":\"linear\",\"state\":\"not_delivered\"}]}}}\n",
+        b"{\"schemaVersion\":1,\"outcome\":\"ok\",\"status\":{\"processState\":\"running\",\"bootId\":\"rbt_01k0z6r1w8f4jy2m7q9v3x5abc\",\"uptimeMilliseconds\":10000,\"connectionState\":\"connected\",\"assignmentCounts\":{\"preparing\":0,\"accepted\":0,\"running\":0,\"finishing\":0,\"reporting\":0},\"agentLogins\":{\"updatedAt\":\"2026-11-12T01:00:00Z\",\"providers\":[{\"provider\":\"codex\",\"state\":\"ready\",\"agentLoginId\":\"agl_01k0z6r1w8f4jy2m7q9v3x5abc\",\"generation\":3,\"checkedAt\":\"2026-11-12T01:00:00Z\",\"installedAt\":\"2026-11-12T00:55:00Z\"},{\"provider\":\"claude_code\",\"state\":\"foreign_login\",\"checkedAt\":\"2026-11-12T01:00:00Z\"},{\"provider\":\"github\",\"state\":\"ready\",\"grantId\":\"pgr_01k0z6r1w8f4jy2m7q9v3x5abc\",\"generation\":4,\"expiresAt\":\"2026-11-12T09:00:00Z\",\"checkedAt\":\"2026-11-12T01:00:00Z\",\"selected\":true},{\"provider\":\"gitlab\",\"state\":\"cloud_unavailable\",\"checkedAt\":\"2026-11-12T01:00:00Z\",\"selected\":true},{\"provider\":\"linear\",\"state\":\"not_delivered\"}]}}}\n",
     );
 
     assert!(output.status.success());
@@ -619,11 +622,55 @@ fn runner_status_prints_each_provider_readiness_once_the_runner_has_set_up() {
         &[
             ("codex", "ready", "unverified"),
             ("claude_code", "foreign_login", "not_delivered"),
-            ("github", "not_delivered", "not_delivered"),
-            ("gitlab", "not_delivered", "not_delivered"),
+            ("github", "ready", "available"),
+            ("gitlab", "cloud_unavailable", "delivery_failed"),
             ("linear", "not_delivered", "not_delivered"),
         ],
     );
+    // An OAuth entry is one assignment's outcome: its line names the
+    // generation issued, and no runner command helps one Cloud did not
+    // answer, since the next assignment asks again (REQ-GRANT-88).
+    let line = |provider: &str| {
+        stdout
+            .lines()
+            .find(|line| line.starts_with(&format!("{provider} login:")))
+            .unwrap()
+    };
+    assert!(line("github").contains("(generation 4)"), "{stdout}");
+    assert!(line("gitlab").contains("sync_runner"), "{stdout}");
+    assert!(!line("gitlab").contains("um runner grant sync"), "{stdout}");
+    assert!(output.stderr.is_empty());
+}
+
+// REQ-GRANT-88, REQ-GRANT-53
+#[test]
+fn runner_status_names_the_grant_to_reconnect_by_its_grant_provider() {
+    let output = run_status_with_response(
+        b"{\"schemaVersion\":1,\"outcome\":\"ok\",\"status\":{\"processState\":\"running\",\"bootId\":\"rbt_01k0z6r1w8f4jy2m7q9v3x5abc\",\"uptimeMilliseconds\":10000,\"connectionState\":\"connected\",\"assignmentCounts\":{\"preparing\":0,\"accepted\":0,\"running\":0,\"finishing\":0,\"reporting\":0},\"agentLogins\":{\"updatedAt\":\"2026-11-12T01:00:00Z\",\"providers\":[{\"provider\":\"github\",\"state\":\"not_delivered\"},{\"provider\":\"gitlab\",\"state\":\"reconnect_required\",\"checkedAt\":\"2026-11-12T01:00:00Z\",\"selected\":true},{\"provider\":\"linear\",\"state\":\"reconnect_required\",\"checkedAt\":\"2026-11-12T01:00:00Z\",\"selected\":true}]}}}\n",
+    );
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    super::runner_agent_login::assert_provider_lines(
+        &stdout,
+        &[
+            ("github", "not_delivered", "not_delivered"),
+            ("gitlab", "reconnect_required", "reconnect_required"),
+            ("linear", "reconnect_required", "reconnect_required"),
+        ],
+    );
+    // The command the owner runs takes the grant's provider, which for
+    // GitLab is the instance and not the entry's name.
+    for (provider, grant_provider) in [("gitlab", "gitlab.com"), ("linear", "linear")] {
+        let line = stdout
+            .lines()
+            .find(|line| line.starts_with(&format!("{provider} login:")))
+            .unwrap();
+        assert!(
+            line.contains(&format!("`um grant create {grant_provider} --replace`")),
+            "{stdout}"
+        );
+    }
     assert!(output.stderr.is_empty());
 }
 

@@ -1903,6 +1903,37 @@ fn workflow_admission_only_forwards_base_and_explicit_safe_names() {
     }
 }
 
+// REQ-WFEXEC-22
+#[test]
+fn workflow_admission_forwards_only_the_declared_grant_token_names() {
+    let environment = EnvironmentSnapshot::new([
+        ("PATH", "/bin"),
+        ("GH_TOKEN", "launching-gh-token"),
+        ("UM_LINEAR_ACCESS_TOKEN", "launching-linear-token"),
+        ("UM_LINEAR_ACCESS_TOKEN_FILE", "/launching/linear-token"),
+    ]);
+    let declared = ["GH_TOKEN", "UM_LINEAR_ACCESS_TOKEN_FILE"]
+        .map(str::to_owned)
+        .into();
+
+    assert_eq!(
+        environment
+            .for_workflow_children(&declared)
+            .variables()
+            .keys()
+            .collect::<Vec<_>>(),
+        ["GH_TOKEN", "PATH", "UM_LINEAR_ACCESS_TOKEN_FILE"]
+    );
+    assert_eq!(
+        environment
+            .for_workflow_children(&BTreeSet::new())
+            .variables()
+            .keys()
+            .collect::<Vec<_>>(),
+        ["PATH"]
+    );
+}
+
 // INV-ENGINE-31
 #[test]
 fn node_narrowing_drops_only_root_names_the_node_omits() {

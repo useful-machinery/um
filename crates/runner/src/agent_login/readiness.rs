@@ -7,7 +7,11 @@
 //! A coding agent's entry records whether its provider is selected; one an
 //! earlier `um` wrote without it reads as selected by its state. Beside an
 //! install it records how the provider answered the login's last use
-//! (REQ-GRANT-52).
+//! (REQ-GRANT-52). Each OAuth provider's entry records what the last
+//! assignment the runner admitted was issued (REQ-GRANT-88): never the token
+//! or the path of its file. One the runner has asked for no token of is
+//! written as `not_delivered`, which is how a document written before these
+//! entries lists all three.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -31,9 +35,9 @@ const READINESS_LIMIT: u64 = 64 * 1024;
 /// The most entries the document holds (the schema's `maxItems`).
 const ENTRY_LIMIT: usize = 16;
 
-/// The providers whose tokens Cloud brokers per assignment and does not yet
-/// issue to a runner; the document lists each as `not_delivered`.
-fn brokered_providers() -> impl Iterator<Item = AgentLoginProvider> {
+/// The OAuth providers, in the order the document lists them and the runner
+/// asks for their grant tokens.
+pub(crate) fn brokered_providers() -> impl Iterator<Item = AgentLoginProvider> {
     AgentLoginProvider::ALL
         .into_iter()
         .filter(|provider| provider.is_brokered())
@@ -52,14 +56,133 @@ pub(crate) struct ReadinessDocument {
     /// One entry for each installable provider the runner has set up, at
     /// most one per provider.
     pub(crate) logins: Vec<LoginReadiness>,
-    /// The entries of providers this build does not know, as they were read,
-    /// kept for the build that wrote them.
-    pub(crate) unknown: Vec<UnknownEntry>,
+    /// The entries the agent-login setup carries from one document to the
+    /// next without reading them: those of providers this build does not
+    /// know, as they were read, kept for the build that wrote them, then each
+    /// OAuth provider's (REQ-GRANT-88), which `grant` reads and
+    /// `record_grant` replaces.
+    pub(crate) unknown: Vec<KeptEntry>,
+}
+
+/// An entry the agent-login setup carries without reading it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum KeptEntry {
+    /// An entry for a provider this build does not know, kept verbatim.
+    Unknown(UnknownEntry),
+    /// An OAuth provider's entry.
+    Grant(GrantReadiness),
 }
 
 /// An entry for a provider this build does not know, kept verbatim.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct UnknownEntry(WireEntry);
+
+/// What the last assignment the runner admitted was issued for an OAuth
+/// provider (REQ-GRANT-88). The entry outlives the assignment; the token
+/// and its file do not, and neither is recorded here.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct GrantReadiness {
+    /// `github`, `gitlab` or `linear`.
+    pub(crate) provider: AgentLoginProvider,
+    /// Any state but `foreign_login` and `stale_generation`.
+    pub(crate) state: AgentLoginState,
+    pub(crate) checked_at: Option<OffsetDateTime>,
+    /// The grant the token was issued from, exactly when `ready`.
+    pub(crate) issued: Option<IssuedGrant>,
+    /// Whether Cloud's last answer for the provider named a grant in force:
+    /// an issued token or `reconnect_required`.
+    pub(crate) selected: bool,
+}
+
+/// The grant a `ready` OAuth provider's token was issued from.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct IssuedGrant {
+    /// The grant's `pgr_` ID.
+    pub(crate) grant_id: String,
+    /// The grant's generation the token belongs to, at least 1.
+    pub(crate) generation: u64,
+    /// When the token expires.
+    pub(crate) expires_at: OffsetDateTime,
+}
+
+impl GrantReadiness {
+    /// Whether the entry is one the document holds: an OAuth provider, a
+    /// state its entry holds, and the grant exactly when `ready`.
+    fn valid(&self) -> bool {
+        self.provider.is_brokered()
+            && self.state.held_by_grant()
+            && self.issued.is_some() == (self.state == AgentLoginState::Ready)
+            && self.issued.as_ref().is_none_or(|issued| {
+                issued.generation >= 1 && um_support::valid_typed_id(&issued.grant_id, "pgr_")
+            })
+    }
+
+    fn to_wire(&self) -> Option<WireEntry> {
+        if !self.valid() {
+            return None;
+        }
+        let issued = self.issued.as_ref();
+        Some(WireEntry {
+            provider: self.provider.as_str().to_owned(),
+            state: EntryState::Login(self.state),
+            grant_id: issued.map(|issued| issued.grant_id.clone()),
+            generation: issued.map(|issued| issued.generation),
+            expires_at: issued
+                .map(|issued| format_time(issued.expires_at))
+                .transpose()
+                .ok()?,
+            checked_at: self.checked_at.map(format_time).transpose().ok()?,
+            selected: Some(self.selected),
+            ..WireEntry::bare(self.provider)
+        })
+    }
+
+    /// The OAuth provider's entry `entry` records; `None` for one the
+    /// document does not admit. A `not_delivered` entry with no grant and
+    /// neither a check time nor a selection, as every document written
+    /// before these entries lists, records nothing.
+    fn from_wire(provider: AgentLoginProvider, entry: WireEntry) -> Option<Option<Self>> {
+        let EntryState::Login(state) = entry.state else {
+            return None;
+        };
+        if entry.agent_login_id.is_some()
+            || entry.installed_at.is_some()
+            || entry.installed_path.is_some()
+            || entry.last_use.is_some()
+            || entry.last_use_at.is_some()
+        {
+            return None;
+        }
+        let issued = match (entry.grant_id, entry.generation, entry.expires_at) {
+            (None, None, None) => None,
+            (Some(grant_id), Some(generation), Some(expires_at)) => Some(IssuedGrant {
+                grant_id,
+                generation,
+                expires_at: parse_rfc3339(&expires_at)?,
+            }),
+            _ => return None,
+        };
+        let checked_at = match entry.checked_at.as_deref() {
+            Some(checked_at) => Some(parse_rfc3339(checked_at)?),
+            None => None,
+        };
+        if state == AgentLoginState::NotDelivered
+            && issued.is_none()
+            && checked_at.is_none()
+            && entry.selected.is_none()
+        {
+            return Some(None);
+        }
+        let grant = Self {
+            provider,
+            state,
+            checked_at,
+            issued,
+            selected: entry.selected.unwrap_or(false),
+        };
+        grant.valid().then_some(Some(grant))
+    }
+}
 
 /// One installable provider's readiness.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -167,6 +290,25 @@ impl ReadinessDocument {
         self.logins.iter().find(|login| login.provider == provider)
     }
 
+    /// The OAuth provider's entry, if the runner recorded one
+    /// (REQ-GRANT-88).
+    pub(crate) fn grant(&self, provider: AgentLoginProvider) -> Option<&GrantReadiness> {
+        self.unknown.iter().find_map(|kept| match kept {
+            KeptEntry::Grant(grant) if grant.provider == provider => Some(grant),
+            KeptEntry::Grant(_) | KeptEntry::Unknown(_) => None,
+        })
+    }
+
+    /// Records `grant` as its provider's entry, in place of the one recorded
+    /// before (REQ-GRANT-88).
+    pub(crate) fn record_grant(&mut self, grant: GrantReadiness) {
+        self.unknown.retain(
+            |kept| !matches!(kept, KeptEntry::Grant(kept) if kept.provider == grant.provider),
+        );
+        self.unknown.push(KeptEntry::Grant(grant));
+        self.unknown.sort_by_key(KeptEntry::position);
+    }
+
     /// Reads the document; `None` when there is none. An entry for a provider
     /// this build does not know is kept in `unknown`.
     pub(crate) fn load(path: &Path) -> Result<Option<Self>, ReadinessError> {
@@ -194,7 +336,8 @@ impl ReadinessDocument {
 
     /// The readiness as the control socket returns it: the document without
     /// the path of any install (REQ-RUNNERENROLL-63), the time of a last use
-    /// or the entries of providers this build does not know.
+    /// or the entries of providers this build does not know. An OAuth
+    /// provider's entry is reported as recorded (REQ-GRANT-88).
     pub(crate) fn reported(&self) -> Option<AgentLoginReadiness> {
         let wire = self.to_wire()?;
         Some(AgentLoginReadiness {
@@ -209,12 +352,24 @@ impl ReadinessDocument {
 
     fn to_wire(&self) -> Option<WireDocument> {
         let mut providers = Vec::with_capacity(self.unknown.len() + AgentLoginProvider::ALL.len());
+        // Each entry stands in its own place: a login's for an installable
+        // provider, a grant's for an OAuth one.
+        if self
+            .logins
+            .iter()
+            .any(|login| login.provider.is_brokered() || !login.state.held_by_login())
+            || self.unknown.iter().any(|kept| match kept {
+                KeptEntry::Grant(grant) => !grant.provider.is_brokered(),
+                KeptEntry::Unknown(_) => false,
+            })
+        {
+            return None;
+        }
         for login in &self.logins {
             let installation = login.installation();
             // A last use is recorded only beside the install it concerns.
             let last_use = installation.and(login.last_use);
             providers.push(WireEntry {
-                provider: login.provider.as_str().to_owned(),
                 state: EntryState::Login(login.state),
                 agent_login_id: login.login.as_ref().map(|recorded| match recorded {
                     RecordedLogin::Installed(installation) => installation.agent_login_id.clone(),
@@ -242,21 +397,19 @@ impl ReadinessDocument {
                     .map(|last_use| format_time(last_use.at))
                     .transpose()
                     .ok()?,
+                ..WireEntry::bare(login.provider)
             });
         }
-        providers.extend(self.unknown.iter().map(|UnknownEntry(entry)| entry.clone()));
-        providers.extend(brokered_providers().map(|provider| WireEntry {
-            provider: provider.as_str().to_owned(),
-            state: EntryState::Login(AgentLoginState::NotDelivered),
-            agent_login_id: None,
-            generation: None,
-            checked_at: None,
-            installed_at: None,
-            installed_path: None,
-            selected: None,
-            last_use: None,
-            last_use_at: None,
+        providers.extend(self.unknown.iter().filter_map(|kept| match kept {
+            KeptEntry::Unknown(UnknownEntry(entry)) => Some(entry.clone()),
+            KeptEntry::Grant(_) => None,
         }));
+        for provider in brokered_providers() {
+            providers.push(match self.grant(provider) {
+                Some(grant) => grant.to_wire()?,
+                None => WireEntry::bare(provider),
+            });
+        }
         Some(WireDocument {
             schema_version: 1,
             updated_at: format_time(self.updated_at).ok()?,
@@ -270,27 +423,22 @@ impl ReadinessDocument {
         }
         let mut logins: Vec<LoginReadiness> = Vec::new();
         let mut unknown: Vec<UnknownEntry> = Vec::new();
+        let mut brokered: Vec<AgentLoginProvider> = Vec::new();
+        let mut grants: Vec<GrantReadiness> = Vec::new();
         for entry in wire.providers {
-            if AgentLoginProvider::named(&entry.provider)
-                .is_some_and(AgentLoginProvider::is_brokered)
+            if let Some(provider) =
+                AgentLoginProvider::named(&entry.provider).filter(|provider| provider.is_brokered())
             {
-                if entry.state != EntryState::Login(AgentLoginState::NotDelivered)
-                    || entry.agent_login_id.is_some()
-                    || entry.generation.is_some()
-                    || entry.checked_at.is_some()
-                    || entry.installed_at.is_some()
-                    || entry.installed_path.is_some()
-                    || entry.selected.is_some()
-                    || entry.last_use.is_some()
-                    || entry.last_use_at.is_some()
-                {
+                if brokered.contains(&provider) {
                     return None;
                 }
+                brokered.push(provider);
+                grants.extend(GrantReadiness::from_wire(provider, entry)?);
             } else if let Some(provider) = AgentLoginProvider::installable(&entry.provider) {
                 let EntryState::Login(state) = entry.state else {
                     return None;
                 };
-                if state == AgentLoginState::NotDelivered {
+                if !state.held_by_login() {
                     return None;
                 }
                 if logins.iter().any(|login| login.provider == provider) {
@@ -328,11 +476,15 @@ impl ReadinessDocument {
         if unknown.len() + AgentLoginProvider::ALL.len() > ENTRY_LIMIT {
             return None;
         }
-        Some(Self {
+        let mut document = Self {
             updated_at: parse_rfc3339(&wire.updated_at)?,
             logins,
-            unknown,
-        })
+            unknown: unknown.into_iter().map(KeptEntry::Unknown).collect(),
+        };
+        for grant in grants {
+            document.record_grant(grant);
+        }
+        Some(document)
     }
 }
 
@@ -360,6 +512,8 @@ fn recorded_from_wire(entry: WireEntry) -> Option<Recorded> {
         .agent_login_id
         .as_deref()
         .is_some_and(|id| !um_support::valid_typed_id(id, "agl_"))
+        || entry.grant_id.is_some()
+        || entry.expires_at.is_some()
     {
         return None;
     }
@@ -432,6 +586,10 @@ struct WireEntry {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     installed_path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    grant_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    expires_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     selected: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     last_use: Option<UseOutcome>,
@@ -440,6 +598,25 @@ struct WireEntry {
 }
 
 impl WireEntry {
+    /// The provider's entry with its state alone, `not_delivered`; the base
+    /// every entry this build writes is built on.
+    fn bare(provider: AgentLoginProvider) -> Self {
+        Self {
+            provider: provider.as_str().to_owned(),
+            state: EntryState::Login(AgentLoginState::NotDelivered),
+            agent_login_id: None,
+            generation: None,
+            checked_at: None,
+            installed_at: None,
+            installed_path: None,
+            grant_id: None,
+            expires_at: None,
+            selected: None,
+            last_use: None,
+            last_use_at: None,
+        }
+    }
+
     /// The entry as the control socket reports it; `None` for a provider
     /// this build does not know.
     fn reported(self) -> Option<ProviderReadiness> {
@@ -453,6 +630,8 @@ impl WireEntry {
             generation: self.generation,
             checked_at: self.checked_at,
             installed_at: self.installed_at,
+            grant_id: self.grant_id,
+            expires_at: self.expires_at,
             selected: self.selected,
             last_use: self.last_use,
         })
@@ -460,8 +639,9 @@ impl WireEntry {
 }
 
 /// An entry's state: one this build knows, or one it does not, which only
-/// an unknown provider's entry may hold. A brokered provider's entry holds
-/// only `not_delivered`, which an installable provider's never does.
+/// an unknown provider's entry may hold. Only an OAuth provider's entry holds
+/// `not_delivered` or `reconnect_required`, and only an installable
+/// provider's `foreign_login` or `stale_generation`.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(untagged)]
 enum EntryState {
@@ -474,6 +654,22 @@ impl EntryState {
         match self {
             Self::Login(state) => state.as_str(),
             Self::Other(state) => state,
+        }
+    }
+}
+
+impl KeptEntry {
+    /// Where the entry stands among the kept ones: the entries of providers
+    /// this build does not know as read, then the OAuth providers' in the
+    /// document's order.
+    fn position(&self) -> usize {
+        match self {
+            Self::Unknown(_) => 0,
+            Self::Grant(grant) => {
+                1 + brokered_providers()
+                    .position(|provider| provider == grant.provider)
+                    .unwrap_or(usize::MAX - 1)
+            }
         }
     }
 }

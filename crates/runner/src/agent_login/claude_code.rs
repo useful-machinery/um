@@ -17,14 +17,12 @@ use zeroize::Zeroizing;
 use super::cloud::Delivery;
 use super::directory::{self, LoginDirectory};
 use super::readiness::Installation;
-use super::{FailureCause, FailureStage, InstallRefusal, ServiceEnvironment, StepFailure};
-use crate::enrollment::read_private_file_if_present;
+use super::{
+    FailureCause, FailureStage, InstallRefusal, ServiceEnvironment, StepFailure, valid_token,
+};
 
 /// The file a `/login` keeps in Claude Code's configuration directory.
 const CREDENTIALS_FILE: &str = ".credentials.json";
-/// A token is one line of at most this many printable characters
-/// (REQ-GRANT-12).
-const TOKEN_LIMIT: usize = 4096;
 /// The prefix of the temporary files the token file is written through.
 pub(crate) const TEMPORARY_PREFIX: &str = ".um-claude-code.token.tmp";
 
@@ -110,12 +108,7 @@ impl std::fmt::Debug for ClaudeCodeToken {
 /// read; `None` when there is none, or when it is not a private file holding
 /// one valid token.
 pub(crate) fn read_token(path: &Path) -> Option<ClaudeCodeToken> {
-    let bytes = Zeroizing::new(
-        read_private_file_if_present(path, TOKEN_LIMIT as u64)
-            .ok()
-            .flatten()?,
-    );
-    valid_token(&bytes).then_some(ClaudeCodeToken(bytes))
+    directory::read_token(path).map(ClaudeCodeToken)
 }
 
 /// `CLAUDE_CODE_OAUTH_TOKEN` with the token the runner keeps in `directory`,
@@ -132,12 +125,6 @@ pub(crate) fn offered_token(
         OsString::from(CLAUDE_CODE_LOGIN_VARIABLE),
         OsString::from_vec(token.0.to_vec()),
     ))
-}
-
-/// One line of 1 to 4096 printable characters without spaces, the form
-/// Cloud accepts (REQ-GRANT-12) and an environment variable can carry.
-fn valid_token(bytes: &[u8]) -> bool {
-    (1..=TOKEN_LIMIT).contains(&bytes.len()) && bytes.iter().all(u8::is_ascii_graphic)
 }
 
 #[cfg(test)]

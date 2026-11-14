@@ -36,6 +36,18 @@ pub(crate) mod attribute {
         "um.agent_login.claude_code.failure_cause";
     pub(crate) const AGENT_LOGIN_CLAUDE_CODE_HTTP_STATUS: &str =
         "um.agent_login.claude_code.http_status";
+    /// A `runner.grant_token` record names one OAuth provider, the phase
+    /// the runner asked in (`admission` or `refresh`), the provider's new
+    /// state and the generation of the token it keeps, and for a failure
+    /// its stage, closed cause and Cloud's HTTP status when the cause is one
+    /// (REQ-TELEMETRY-46).
+    pub(crate) const GRANT_TOKEN_PROVIDER: &str = "um.grant_token.provider";
+    pub(crate) const GRANT_TOKEN_PHASE: &str = "um.grant_token.phase";
+    pub(crate) const GRANT_TOKEN_STATE: &str = "um.grant_token.state";
+    pub(crate) const GRANT_TOKEN_GENERATION: &str = "um.grant_token.generation";
+    pub(crate) const GRANT_TOKEN_FAILURE_STAGE: &str = "um.grant_token.failure_stage";
+    pub(crate) const GRANT_TOKEN_FAILURE_CAUSE: &str = "um.grant_token.failure_cause";
+    pub(crate) const GRANT_TOKEN_HTTP_STATUS: &str = "um.grant_token.http_status";
     pub(crate) const BACKOFF_MS: &str = "um.connection.backoff_ms";
     pub(crate) const CONNECTION_ATTEMPT: &str = "um.connection.attempt";
     pub(crate) const EFFECT_ACKNOWLEDGEMENTS_CONFIRMED: &str =

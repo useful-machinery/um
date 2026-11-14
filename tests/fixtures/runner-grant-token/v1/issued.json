@@ -1,0 +1,9 @@
+{
+  "schemaVersion": 1,
+  "provider": "gitlab.com",
+  "grantId": "pgr_01k0z6r1w8f4jy2m7q9v3x5abc",
+  "generation": 4,
+  "accessToken": "synthetic-grant-access-token",
+  "expiresAt": "2026-11-13T22:00:00Z",
+  "refreshAfterSeconds": 5040
+}

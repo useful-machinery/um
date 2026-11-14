@@ -308,7 +308,7 @@ impl AssignmentManager {
         let Some(slot) = self.slot.take() else {
             return Ok(None);
         };
-        let LocalSlot::Accepted(accepted) = slot else {
+        let LocalSlot::Accepted(mut accepted) = slot else {
             self.slot = Some(slot);
             return Ok(None);
         };
@@ -387,6 +387,9 @@ impl AssignmentManager {
             engine_terminal: Arc::clone(&engine_terminal),
             workspace_release: None,
             run_event: run_event.clone(),
+            // The slot, not the execution, holds the assignment's grant
+            // tokens until the assignment ends.
+            _grant_tokens: accepted.grant_tokens.take(),
         })));
         Ok(Some(ExecutionJob::new(
             *accepted,

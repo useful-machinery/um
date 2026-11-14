@@ -7,7 +7,8 @@ use serde::Serialize;
 
 use crate::exit_code::{ExitCode, OutcomeClass};
 use um_runner::{
-    AgentLoginReadiness, ControlError, Operation, ProviderReadiness, RequestFailure, Response,
+    AgentLoginProvider, AgentLoginReadiness, ControlError, Operation, ProviderReadiness,
+    RequestFailure, Response,
 };
 use um_support::{CredentialStatus, NextAction};
 
@@ -170,8 +171,8 @@ fn control_failure(error: ControlError) -> CommandFailure {
 }
 
 /// Writes one line per provider: its readiness state, for a login the runner
-/// installed the generation, and its availability with the next action and
-/// the step it names (REQ-GRANT-53).
+/// installed or a token it was issued the generation, and its availability
+/// with the next action and the step it names (REQ-GRANT-53, REQ-GRANT-88).
 pub(super) fn write_readiness(
     output: &mut impl Write,
     readiness: &AgentLoginReadiness,
@@ -184,11 +185,15 @@ pub(super) fn write_readiness(
             .map(|generation| format!(" (generation {generation})"))
             .unwrap_or_default();
         let status = entry.credential_status();
-        let login = Login {
-            provider: &super::status::enum_json(entry.provider)?,
-            id: entry.agent_login_id.as_deref(),
+        let step = if entry.provider.is_brokered() {
+            grant_step(status, entry.provider)
+        } else {
+            let login = Login {
+                provider: &super::status::enum_json(entry.provider)?,
+                id: entry.agent_login_id.as_deref(),
+            };
+            runner_step(status, Some(login))
         };
-        let step = runner_step(status, Some(login));
         writeln!(
             output,
             "{label:<19}{state}{generation}, {}",
@@ -196,6 +201,27 @@ pub(super) fn write_readiness(
         )?;
     }
     Ok(())
+}
+
+/// The step an OAuth provider's next action names (REQ-GRANT-88). Its entry
+/// is one assignment's outcome, which no runner command changes: the next
+/// assignment the runner admits asks for a token again, and only the
+/// grant's owner can consent again.
+fn grant_step(status: CredentialStatus, provider: AgentLoginProvider) -> Option<String> {
+    let provider = provider.grant_provider().unwrap_or(provider.as_str());
+    match status.next_action {
+        NextAction::SyncRunner => {
+            Some("the next assignment the runner admits asks for a token again".to_owned())
+        }
+        NextAction::CheckTarget => Some(
+            "the deployment issues no tokens for this provider; the next assignment the runner admits asks again"
+                .to_owned(),
+        ),
+        NextAction::Reconnect => Some(format!(
+            "the owner of the grant consents again with `um grant create {provider} --replace`; only they can"
+        )),
+        _ => runner_step(status, None),
+    }
 }
 
 /// The login a runner's next action is about: its provider, and the agent

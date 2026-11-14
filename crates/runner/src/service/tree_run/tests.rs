@@ -711,6 +711,102 @@ async fn kept_agent_login_reaches_the_runtime_that_creates_the_run() {
     );
 }
 
+// REQ-RUNNERENROLL-91, REQ-GRANT-87: the runtime that creates the run is offered the
+// admission's issued GitHub token and its file, and nothing of the service's GitLab token
+// while Cloud records a GitLab grant in force that issued none.
+#[tokio::test]
+async fn issued_grant_token_reaches_the_runtime_that_creates_the_run() {
+    use crate::agent_login::cloud::{GrantTokenFailure, GrantTokenRefusal};
+    use crate::agent_login::directory::LoginDirectory;
+    use crate::agent_login::setup::AgentLoginSetup;
+    use crate::control_protocol::AgentLoginProvider;
+    use crate::service::control::{AdmissionAgentLogins, LiveStatus};
+    use crate::service::test_support::{
+        CountedGate, FakeAgentLoginCloud, FakeGrantToken, fake_agent_login_setup, fake_grant_token,
+    };
+
+    let mut fixture = fixture_with(
+        TREE_DIGEST,
+        "exited",
+        "\"planned\"",
+        &[
+            ("GITLAB_TOKEN", "service-gitlab-token"),
+            ("GITLAB_TOKEN_FILE", "/service/gitlab-token"),
+        ],
+    );
+    let state = tempfile::tempdir().unwrap();
+    let home = state.path().join("service-home");
+    fs::create_dir(&home).unwrap();
+    let directory = LoginDirectory::beside(&state.path().join("runner-state.json"));
+    let (github_file, _) = directory.grant_token(AgentLoginProvider::Github).unwrap();
+    keep_agent_logins_in(&mut fixture.manager, directory);
+    let cloud = FakeAgentLoginCloud::new(Ok(Vec::new()));
+    cloud.answer_grant_token(AgentLoginProvider::Github, FakeGrantToken::Issue(3));
+    cloud.answer_grant_token(
+        AgentLoginProvider::Gitlab,
+        FakeGrantToken::Fail(GrantTokenFailure::Refused(
+            GrantTokenRefusal::ReconnectRequired,
+        )),
+    );
+    let (recorder, _capture) = crate::telemetry::test_recorder("rbt_01k0z6r1w8f4jy2m7q9v3x5abe");
+    let setup = Arc::new(AgentLoginSetup::new(
+        fake_agent_login_setup(cloud, &home, state.path(), recorder),
+        Arc::new(CountedGate::idle()),
+        || time::OffsetDateTime::from_unix_timestamp(1_794_450_000).unwrap(),
+    ));
+    let status = Arc::new(LiveStatus::new(
+        "rbt_01k0z6r1w8f4jy2m7q9v3x5abe".to_owned(),
+        "rrc_01k0z6r1w8f4jy2m7q9v3x5abe".to_owned(),
+        None,
+    ));
+    fixture
+        .manager
+        .set_up_agent_logins_with(AdmissionAgentLogins::new(&setup, status));
+
+    execute(&mut fixture).await;
+
+    let environment = logged_lines(&fixture.log, "create.env");
+    let token = fake_grant_token(AgentLoginProvider::Github, 3);
+    assert!(environment.contains(&format!("GH_TOKEN={token}")));
+    assert!(environment.contains(&format!("GH_TOKEN_FILE={}", github_file.display())));
+    for name in ["GITLAB_TOKEN", "GITLAB_TOKEN_FILE"] {
+        assert!(
+            !environment
+                .iter()
+                .any(|line| line.starts_with(&format!("{name}="))),
+            "create.env carries {name}"
+        );
+    }
+}
+
+// REQ-WORKSPACE-18: a tree run's runtime admits its steps itself and would pass a declared
+// grant token name, so the runtime never receives the daemon's own values of them.
+#[tokio::test]
+async fn runtime_never_receives_the_daemon_grant_token_names() {
+    const GRANT_TOKEN_NAMES: [&str; 3] = [
+        "GH_TOKEN",
+        "UM_LINEAR_ACCESS_TOKEN",
+        "UM_LINEAR_ACCESS_TOKEN_FILE",
+    ];
+    let variables = GRANT_TOKEN_NAMES.map(|name| (name, "daemon-private"));
+    let mut fixture = fixture_with(TREE_DIGEST, "exited", "\"planned\"", &variables);
+
+    execute(&mut fixture).await;
+
+    for log in ["publish.env", "create.env"] {
+        let environment = logged_lines(&fixture.log, log);
+        assert!(environment.contains(&"GITHUB_TOKEN=daemon-github-token".to_owned()));
+        for name in GRANT_TOKEN_NAMES {
+            assert!(
+                !environment
+                    .iter()
+                    .any(|line| line.starts_with(&format!("{name}="))),
+                "{log} carries {name}"
+            );
+        }
+    }
+}
+
 // REQ-RUNNERENROLL-91
 #[tokio::test]
 async fn published_digest_other_than_the_spec_declines_the_assignment() {
