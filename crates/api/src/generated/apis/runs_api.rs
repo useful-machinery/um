@@ -250,7 +250,6 @@ pub enum RetryRunLinearLifecycleUpdateError {
     Status403(models::Problem),
     Status404(models::Problem),
     Status409(models::Problem),
-    Status410(models::Problem),
     Status500(models::Problem),
     UnknownValue(serde_json::Value),
 }
@@ -1386,7 +1385,7 @@ pub fn request_run_retry(
     }
 }
 
-/// Retired with the Linear lifecycle policy: lifecycle bindings and updates are read-only history, so this answers 410 `trigger-model-retired` for every authenticated caller, opens no cycle and writes no Linear issue state. Its `detail` names a workflow definition's `mirror` as the replacement. Apart from 400 for a malformed request, 401 and 500, the other responses describe the retired operation and are no longer answered.
+/// Retired with the Linear lifecycle policy: lifecycle bindings and updates are read-only history, so this answers 409 `trigger-model-retired` for every authenticated caller, opens no cycle and writes no Linear issue state. Its `detail` names a workflow definition's `mirror` as the replacement. Apart from this 409, 400 for a malformed request, 401 and 500, the other responses describe the retired operation and are no longer answered.
 pub fn retry_run_linear_lifecycle_update(
     configuration: &configuration::Configuration,
     organization_ref: &str,
