@@ -379,6 +379,7 @@ fn failure_result(
             Some(ActionFailure::InvalidInput) => "invalid_input",
             Some(ActionFailure::Conflict) => "conflict",
             Some(ActionFailure::ProjectArchived) => "project_archived",
+            Some(ActionFailure::ProjectUnsupported) => "project_unsupported",
             Some(ActionFailure::RateLimited(_)) => "rate_limited",
             Some(ActionFailure::Unreachable(_)) => "unreachable",
             Some(ActionFailure::Protocol { .. }) => "invalid_response",
@@ -433,6 +434,11 @@ fn failure_result(
             "project_archived",
             OutcomeClass::GeneralFailure,
             super::ARCHIVED_REMEDY,
+        ),
+        ActionFailure::ProjectUnsupported => (
+            "project_unsupported",
+            OutcomeClass::GeneralFailure,
+            "Google Docs actions require a project bound to a GitHub repository. Use such a project instead.",
         ),
         ActionFailure::RateLimited(_) => (
             "rate_limited",

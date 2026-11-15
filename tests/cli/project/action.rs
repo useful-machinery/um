@@ -832,11 +832,15 @@ fn action_conflict_is_not_a_protocol_failure() {
     assert_eq!(server.finish().len(), 1);
 }
 
-// REQ-DOCSACTION-127
+// REQ-DOCSACTION-127, REQ-DOCSACTION-128
 #[test]
-fn action_refusal_in_an_archived_project_is_named_only_by_its_reason() {
+fn action_refusal_is_named_only_by_its_reason() {
     for (reason, outcome) in [
         (Some("project-archived"), "project_archived"),
+        (
+            Some("google-docs-project-unsupported"),
+            "project_unsupported",
+        ),
         (None, "conflict"),
         (Some("version-mismatch"), "conflict"),
     ] {
@@ -854,6 +858,7 @@ fn action_refusal_in_an_archived_project_is_named_only_by_its_reason() {
         assert_eq!(output.status.code(), Some(1), "{reason:?}");
         let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
         assert_eq!(result["outcome"], outcome, "{reason:?}");
+        assert!(result.get("idempotencyKey").is_none(), "{reason:?}");
         assert!(!String::from_utf8_lossy(&output.stdout).contains("private"));
         assert_eq!(server.finish().len(), 1);
     }

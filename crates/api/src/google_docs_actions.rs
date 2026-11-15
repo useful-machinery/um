@@ -50,6 +50,9 @@ pub enum ActionFailure {
     /// A `google-docs-action-conflict` whose `reason` is `project-archived`
     /// (REQ-DOCSACTION-127).
     ProjectArchived,
+    /// A `google-docs-action-conflict` whose `reason` is `google-docs-project-unsupported`
+    /// (REQ-DOCSACTION-128).
+    ProjectUnsupported,
     RateLimited(Option<u64>),
     Unreachable(UnreachableCategory),
     Protocol {
@@ -276,6 +279,14 @@ impl ActionApi {
                             == Some(problem::PROJECT_ARCHIVED_REASON) =>
                         {
                             ActionFailure::ProjectArchived
+                        }
+                        (
+                            StatusCode::CONFLICT,
+                            "https://api.usefulmachinery.com/problems/google-docs-action-conflict",
+                        ) if decoded.reason.as_deref()
+                            == Some(problem::GOOGLE_DOCS_PROJECT_UNSUPPORTED_REASON) =>
+                        {
+                            ActionFailure::ProjectUnsupported
                         }
                         (
                             StatusCode::CONFLICT,

@@ -171,7 +171,7 @@ pub enum UpdateGoogleDocsActionError {
     UnknownValue(serde_json::Value),
 }
 
-/// GitLab-bound projects return 409 with problem type google-docs-project-unsupported. While the project is archived a create is 409 `google-docs-action-conflict` with `reason` `project-archived` and creates nothing; a completed request repeated with its key returns its recorded result.
+/// A GitLab-bound project is answered 409 `google-docs-action-conflict` with `reason` `google-docs-project-unsupported` and creates nothing. While the project is archived a create is 409 `google-docs-action-conflict` with `reason` `project-archived` and creates nothing; a completed request repeated with its key returns its recorded result.
 pub fn create_google_docs_action(
     configuration: &configuration::Configuration,
     organization_ref: &str,
@@ -383,7 +383,7 @@ pub fn create_google_docs_launch(
     }
 }
 
-/// GitLab-bound projects return 409 with problem type google-docs-project-unsupported. While the project is archived the change is 409 `google-docs-action-conflict` with `reason` `project-archived` and changes nothing; exact replays retain their original receipt.
+/// A GitLab-bound project is answered 409 `google-docs-action-conflict` with `reason` `google-docs-project-unsupported` and changes nothing. While the project is archived the change is 409 `google-docs-action-conflict` with `reason` `project-archived` and changes nothing; exact replays retain their original receipt.
 pub fn delete_google_docs_action(
     configuration: &configuration::Configuration,
     organization_ref: &str,
@@ -434,7 +434,7 @@ pub fn delete_google_docs_action(
     }
 }
 
-/// GitLab-bound projects return 409 with problem type google-docs-project-unsupported. While the project is archived the change is 409 `google-docs-action-conflict` with `reason` `project-archived` and changes nothing; exact replays retain their original receipt.
+/// A GitLab-bound project is answered 409 `google-docs-action-conflict` with `reason` `google-docs-project-unsupported` and changes nothing. While the project is archived the change is 409 `google-docs-action-conflict` with `reason` `project-archived` and changes nothing; exact replays retain their original receipt.
 pub fn disable_google_docs_action(
     configuration: &configuration::Configuration,
     organization_ref: &str,
@@ -509,7 +509,7 @@ pub fn disable_google_docs_action(
     }
 }
 
-/// GitLab-bound projects return 409 with problem type google-docs-project-unsupported. While the project is archived the change is 409 `google-docs-action-conflict` with `reason` `project-archived` and changes nothing; exact replays retain their original receipt.
+/// A GitLab-bound project is answered 409 `google-docs-action-conflict` with `reason` `google-docs-project-unsupported` and changes nothing. While the project is archived the change is 409 `google-docs-action-conflict` with `reason` `project-archived` and changes nothing; exact replays retain their original receipt.
 pub fn enable_google_docs_action(
     configuration: &configuration::Configuration,
     organization_ref: &str,
@@ -935,7 +935,7 @@ pub fn list_google_docs_launches(
     }
 }
 
-/// GitLab-bound projects return 409 with problem type google-docs-project-unsupported. While the project is archived the change is 409 `google-docs-action-conflict` with `reason` `project-archived` and changes nothing; exact replays retain their original receipt.
+/// A GitLab-bound project is answered 409 `google-docs-action-conflict` with `reason` `google-docs-project-unsupported` and changes nothing. While the project is archived the change is 409 `google-docs-action-conflict` with `reason` `project-archived` and changes nothing; exact replays retain their original receipt.
 pub fn update_google_docs_action(
     configuration: &configuration::Configuration,
     organization_ref: &str,

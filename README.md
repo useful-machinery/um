@@ -1490,10 +1490,11 @@ an opaque next cursor. Show returns a nonsecret tombstone for a recently deleted
 action. Delete needs `--yes` and succeeds on an empty `204` response. `--json` uses
 the schema-version-1 envelope with `action`, `items`, or `tombstone` data and a
 stable outcome. A change refused because the project is archived reports
-`project_archived` and exits 1. An ambiguous transport reply is retried with the same automatic
-request key and body. If the result remains uncertain, inspect the action before
-issuing another mutation; the key is reported for diagnosis but cannot be supplied
-as a CLI flag. A rejected replay after a lost reply does not establish that the
+`project_archived` and exits 1; one refused because the project is bound to a GitLab
+repository reports `project_unsupported` and exits 1. An ambiguous transport reply is
+retried with the same automatic request key and body. If the result remains
+uncertain, inspect the action before issuing another mutation; the key is reported
+for diagnosis but cannot be supplied as a CLI flag. A rejected replay after a lost reply does not establish that the
 first mutation failed: the CLI reports `result_uncertain`, the replay outcome,
 and the original key rather than advising another create. A source-built CLI
 is not a published or installed release.
