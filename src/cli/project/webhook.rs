@@ -770,6 +770,13 @@ fn failure_result_with_context(
             None,
             None,
         ),
+        WebhookFailure::ProjectArchived => (
+            "project_archived",
+            OutcomeClass::GeneralFailure,
+            super::ARCHIVED_REMEDY,
+            None,
+            None,
+        ),
         WebhookFailure::RateLimited(delay) => (
             "rate_limited",
             OutcomeClass::RateLimited,

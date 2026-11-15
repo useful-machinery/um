@@ -801,11 +801,11 @@ fn update_and_membership_list_classify_only_their_contracted_failures() {
 #[test]
 fn audit_listing_asks_for_the_vocabulary_this_release_decodes() {
     for (limit, cursor, query) in [
-        (None, None, "?vocabulary=2"),
+        (None, None, "?vocabulary=3"),
         (
             Some(100),
             Some("opaque cursor"),
-            "?limit=100&cursor=opaque+cursor&vocabulary=2",
+            "?limit=100&cursor=opaque+cursor&vocabulary=3",
         ),
     ] {
         let page = serde_json::to_vec(&serde_json::json!({"items": []})).unwrap();

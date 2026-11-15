@@ -47,9 +47,14 @@ pub enum ActionFailure {
     NotFound,
     InvalidInput,
     Conflict,
+    /// A `google-docs-action-conflict` whose `reason` is `project-archived`
+    /// (REQ-DOCSACTION-127).
+    ProjectArchived,
     RateLimited(Option<u64>),
     Unreachable(UnreachableCategory),
-    Protocol { credential_rejected: bool },
+    Protocol {
+        credential_rejected: bool,
+    },
 }
 impl ActionFailure {
     pub fn credential_rejected(&self) -> bool {
@@ -263,6 +268,14 @@ impl ActionApi {
                         (StatusCode::NOT_FOUND, problem::NOT_FOUND) => ActionFailure::NotFound,
                         (StatusCode::BAD_REQUEST, problem::BAD_REQUEST) => {
                             ActionFailure::InvalidInput
+                        }
+                        (
+                            StatusCode::CONFLICT,
+                            "https://api.usefulmachinery.com/problems/google-docs-action-conflict",
+                        ) if decoded.reason.as_deref()
+                            == Some(problem::PROJECT_ARCHIVED_REASON) =>
+                        {
+                            ActionFailure::ProjectArchived
                         }
                         (
                             StatusCode::CONFLICT,

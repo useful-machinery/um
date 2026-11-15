@@ -7,7 +7,7 @@ use clap::{Args, Subcommand, builder::NonEmptyStringValueParser};
 
 use crate::exit_code::ExitCode;
 use um_api::{
-    CreateProjectInput, HttpClient, HttpTransportPolicy, ProjectApi, ProjectFailure,
+    CreateProjectInput, HttpClient, HttpTransportPolicy, Project, ProjectApi, ProjectFailure,
     ProjectRepositorySelector, RunnerFailure,
 };
 use um_human_auth::Deployment;
@@ -17,6 +17,10 @@ use super::{
 };
 
 pub(super) const ABOUT: &str = "Manage Useful Machinery projects";
+/// What to do about a refusal that names an archived project, shared by the
+/// commands whose refusal is not a project outcome of its own: `um project
+/// webhook`, `um project action` and run creation.
+pub(super) const ARCHIVED_REMEDY: &str = "The project is archived. As an organization owner, unarchive it with `um project unarchive` first.";
 const NAME: &str = "project";
 
 #[derive(Debug, Args)]
@@ -29,6 +33,8 @@ pub(super) struct Command {
 enum ProjectCommand {
     #[command(about = "Manage a project's actions")]
     Action(action::Command),
+    #[command(about = "Archive a project")]
+    Archive(ArchiveCommand),
     #[command(
         about = "Create a project",
         after_help = "GitLab setup: https://docs.usefulmachinery.com/agent/gitlab-setup.md"
@@ -44,6 +50,8 @@ enum ProjectCommand {
     RunnerPool(RunnerPoolCommand),
     #[command(about = "Show a project")]
     Show(ShowCommand),
+    #[command(about = "Unarchive a project")]
+    Unarchive(ArchiveCommand),
     #[command(about = "Manage a project's signed webhooks")]
     Webhook(webhook::Command),
 }
@@ -125,6 +133,9 @@ struct ListCommand {
     #[command(flatten)]
     pagination: super::PaginationArgs,
 
+    #[arg(long, help = "Include archived projects")]
+    include_archived: bool,
+
     #[command(flatten)]
     options: Options,
 }
@@ -154,6 +165,17 @@ struct RenameCommand {
 
     #[arg(long, help = "Set the canonical project name")]
     name: String,
+
+    #[command(flatten)]
+    options: Options,
+}
+
+// Archive and unarchive share their arguments and reverse each other, so neither asks for
+// confirmation.
+#[derive(Debug, Args)]
+struct ArchiveCommand {
+    #[command(flatten)]
+    project: ProjectReference,
 
     #[command(flatten)]
     options: Options,
@@ -275,10 +297,12 @@ impl Command {
         };
         match command {
             ProjectCommand::Action(command) => command.execute(),
+            ProjectCommand::Archive(command) => execute_leaf(command, ArchiveCommand::archive),
             ProjectCommand::Create(command) => execute_leaf(command, CreateCommand::execute),
             ProjectCommand::List(command) => execute_leaf(command, ListCommand::execute),
             ProjectCommand::Show(command) => execute_leaf(command, ShowCommand::execute),
             ProjectCommand::Rename(command) => execute_leaf(command, RenameCommand::execute),
+            ProjectCommand::Unarchive(command) => execute_leaf(command, ArchiveCommand::unarchive),
             ProjectCommand::Repository(command) => command.execute(),
             ProjectCommand::RunnerPool(command) => command.execute(),
             ProjectCommand::Webhook(command) => command.execute(),
@@ -406,6 +430,7 @@ impl ListCommand {
                     &self.organization,
                     self.pagination.limit,
                     self.pagination.cursor.as_deref(),
+                    self.include_archived,
                 )
             },
         )?;
@@ -459,6 +484,60 @@ impl RenameCommand {
             result,
             "renamed",
             "✓ Project renamed.",
+            self.options.authentication.kind(),
+            self.options.json,
+        )
+    }
+}
+
+impl ArchiveCommand {
+    fn archive(self, deployment: &Deployment) -> anyhow::Result<ExitCode> {
+        self.execute(
+            deployment,
+            ProjectApi::archive,
+            "generate project archive request identity",
+            "archived",
+            "✓ Project archived.",
+        )
+    }
+
+    fn unarchive(self, deployment: &Deployment) -> anyhow::Result<ExitCode> {
+        self.execute(
+            deployment,
+            ProjectApi::unarchive,
+            "generate project unarchive request identity",
+            "unarchived",
+            "✓ Project unarchived.",
+        )
+    }
+
+    fn execute(
+        self,
+        deployment: &Deployment,
+        change: impl Fn(&ProjectApi, &str, &str, &str) -> Result<Project, ProjectFailure>,
+        key_context: &'static str,
+        outcome: &'static str,
+        heading: &'static str,
+    ) -> anyhow::Result<ExitCode> {
+        let key = um_support::generate_idempotency_key().context(key_context)?;
+        let result = with_api(
+            deployment,
+            self.options.http.transport_policy(),
+            &self.options.authentication,
+            |api| {
+                change(
+                    api,
+                    &self.project.organization,
+                    &self.project.project_id,
+                    &key,
+                )
+            },
+        )?;
+        output::write_project(
+            deployment.fingerprint().api_url(),
+            result,
+            outcome,
+            heading,
             self.options.authentication.kind(),
             self.options.json,
         )

@@ -378,6 +378,7 @@ fn failure_result(
             Some(ActionFailure::NotFound) => "not_found",
             Some(ActionFailure::InvalidInput) => "invalid_input",
             Some(ActionFailure::Conflict) => "conflict",
+            Some(ActionFailure::ProjectArchived) => "project_archived",
             Some(ActionFailure::RateLimited(_)) => "rate_limited",
             Some(ActionFailure::Unreachable(_)) => "unreachable",
             Some(ActionFailure::Protocol { .. }) => "invalid_response",
@@ -427,6 +428,11 @@ fn failure_result(
             "conflict",
             OutcomeClass::GeneralFailure,
             "Inspect the current action before trying again.",
+        ),
+        ActionFailure::ProjectArchived => (
+            "project_archived",
+            OutcomeClass::GeneralFailure,
+            super::ARCHIVED_REMEDY,
         ),
         ActionFailure::RateLimited(_) => (
             "rate_limited",

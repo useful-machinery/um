@@ -1600,13 +1600,14 @@ fn input_admission_rejection(
     })
 }
 
-// A definite source-admission rejection names only its reviewed type and the
+// A definite admission rejection names only its reviewed type and the
 // response's typed request id. Server detail and title are never used.
 fn source_admission_rejection(
     response: &ReceivedResponse,
     problem: models::Problem,
 ) -> Option<RunFailure> {
     let problem_type = match (response.status, problem.r#type.as_str()) {
+        (StatusCode::CONFLICT, problem::PROJECT_ARCHIVED) => "project-archived",
         (
             StatusCode::CONFLICT,
             "https://api.usefulmachinery.com/problems/workspace-selection-unsupported",
@@ -3105,22 +3106,27 @@ mod recovery_read_tests {
 
     // REQ-RUN-80
     #[test]
-    fn invalid_workflow_source_on_create_is_a_definite_rejection() {
-        assert_eq!(
-            classify_failure(
-                &create_problem_response(
-                    StatusCode::UNPROCESSABLE_ENTITY,
-                    "workflow-source-invalid",
-                    &[],
+    fn reviewed_admission_problems_on_create_are_definite_rejections() {
+        for (status, problem_type) in [
+            (StatusCode::CONFLICT, "project-archived"),
+            (StatusCode::CONFLICT, "workspace-selection-unsupported"),
+            (StatusCode::CONFLICT, "workflow-source-unavailable"),
+            (StatusCode::CONFLICT, "workspace-source-unavailable"),
+            (StatusCode::CONFLICT, "workspace-membership-unproven"),
+            (StatusCode::UNPROCESSABLE_ENTITY, "workflow-source-invalid"),
+        ] {
+            assert_eq!(
+                classify_failure(
+                    &create_problem_response(status, problem_type, &[]),
+                    RunOperation::Create,
                 ),
-                RunOperation::Create,
-            ),
-            RunFailure::AdmissionRejected {
-                status: 422,
-                problem_type: "workflow-source-invalid",
-                request_id: None,
-            }
-        );
+                RunFailure::AdmissionRejected {
+                    status: status.as_u16(),
+                    problem_type,
+                    request_id: None,
+                }
+            );
+        }
     }
 
     // REQ-RETRY-52, REQ-COMPAT-20: Cloud refuses a retry of a run by workflow

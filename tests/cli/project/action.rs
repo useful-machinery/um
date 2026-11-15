@@ -832,6 +832,33 @@ fn action_conflict_is_not_a_protocol_failure() {
     assert_eq!(server.finish().len(), 1);
 }
 
+// REQ-DOCSACTION-127
+#[test]
+fn action_refusal_in_an_archived_project_is_named_only_by_its_reason() {
+    for (reason, outcome) in [
+        (Some("project-archived"), "project_archived"),
+        (None, "conflict"),
+        (Some("version-mismatch"), "conflict"),
+    ] {
+        let mut body = serde_json::json!({"type":"https://api.usefulmachinery.com/problems/google-docs-action-conflict","title":"private","status":409});
+        if let Some(reason) = reason {
+            body["reason"] = serde_json::json!(reason);
+        }
+        let (server, _credentials, credential) =
+            prepared(vec![problem_http_response("409 Conflict", body)]);
+        let output = run(
+            &["disable", ORGANIZATION, PROJECT_ID, ACTION],
+            &server,
+            &credential,
+        );
+        assert_eq!(output.status.code(), Some(1), "{reason:?}");
+        let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(result["outcome"], outcome, "{reason:?}");
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("private"));
+        assert_eq!(server.finish().len(), 1);
+    }
+}
+
 #[test]
 fn rejected_replay_after_credential_refresh_stays_uncertain() {
     let (_dir, path) = file(

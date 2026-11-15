@@ -1489,7 +1489,8 @@ it cannot share that input with `--service-api-key-file -`. List is paginated wi
 an opaque next cursor. Show returns a nonsecret tombstone for a recently deleted
 action. Delete needs `--yes` and succeeds on an empty `204` response. `--json` uses
 the schema-version-1 envelope with `action`, `items`, or `tombstone` data and a
-stable outcome. An ambiguous transport reply is retried with the same automatic
+stable outcome. A change refused because the project is archived reports
+`project_archived` and exits 1. An ambiguous transport reply is retried with the same automatic
 request key and body. If the result remains uncertain, inspect the action before
 issuing another mutation; the key is reported for diagnosis but cannot be supplied
 as a CLI flag. A rejected replay after a lost reply does not establish that the
@@ -1670,6 +1671,21 @@ um project rename \
   --name um-release
 ```
 
+An owner retires a project with `um project archive` and brings it back with
+`um project unarchive`; neither asks for confirmation, and repeating either changes nothing.
+An archived project admits no new runs and no configuration change until it is unarchived,
+while runs already admitted finish. Removing its runner pools stays possible, so a pool can
+be freed for deletion. `um project list` omits archived projects unless given
+`--include-archived`, which marks each archived entry; `um project show` prints an
+`archived` line with the time. A change refused because the project is archived reports
+`project_archived` and exits 1:
+
+```sh
+um project archive acme-labs prj_01k0z6r1w8f4jy2m7q9v3x5abc
+um project list acme-labs --include-archived
+um project unarchive acme-labs prj_01k0z6r1w8f4jy2m7q9v3x5abc
+```
+
 Repository and runner-pool settings are independent. `set` assigns or atomically
 replaces the current value. Repeated removals are API-defined no-ops.
 
@@ -1741,7 +1757,8 @@ resource first. For uncertain mutation failures, JSON retains the generated
 `nextAction: "inspect_resource"`; human output also prints these non-secret
 identities. Keep the original key for diagnosis, but do not retry in a new
 invocation without first inspecting retained state. A completed replay returns
-`metadataOnly: true` and cannot recover a signing secret. See
+`metadataOnly: true` and cannot recover a signing secret. A change refused because the
+project is archived reports `project_archived` and exits 1. See
 [receiver and recovery guidance](../docs/operations/webhook-delivery.md) for
 raw-body signature verification, deduplication, overlap and retention.
 
@@ -2099,7 +2116,7 @@ schema-version-1 object with `operation`, `deployment`, `organizationRef`,
 nullable `runId`, `outcome`, full nullable `run`,
 `publication`, `cancellationRequest`, nullable create `replayed`, and nullable `error`.
 The error includes `code`, `idempotencyKey`, `requestedMode`, and `requestId` (nullable).
-A create that Cloud definitely refuses at source admission (a `409` or `422`
+A create that Cloud definitely refuses at admission (a `409` or `422` `project-archived`,
 `workspace-selection-unsupported`, `workflow-source-unavailable`, `workflow-source-invalid`,
 `workspace-source-unavailable`, or `workspace-membership-unproven` problem) exits 1 with
 code `admission_rejected`; its error adds `httpStatus`, the full `problemType` URI, and

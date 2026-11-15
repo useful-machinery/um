@@ -48,10 +48,15 @@ pub(super) fn write_project_list(
                 for project in &page.items {
                     writeln!(
                         stdout,
-                        "project: {} · name: {} · readiness: {}",
+                        "project: {} · name: {} · readiness: {}{}",
                         project.id,
                         project.name,
-                        readiness(project)
+                        readiness(project),
+                        if project.archived_at.is_some() {
+                            " · archived"
+                        } else {
+                            ""
+                        }
                     )?;
                     if !project.execution_readiness.blockers.is_empty() {
                         writeln!(
@@ -217,6 +222,9 @@ fn write_project_human(deployment: &str, heading: &str, project: &Project) -> an
     )?;
     writeln!(stdout, "created: {}", project.created_at)?;
     writeln!(stdout, "updated: {}", project.updated_at)?;
+    if let Some(archived_at) = &project.archived_at {
+        writeln!(stdout, "archived: {archived_at}")?;
+    }
     writeln!(stdout, "deployment: {deployment}")?;
     Ok(())
 }
@@ -298,7 +306,7 @@ fn write_failure(
         ProjectFailure::QuantityLimitReached => (
             "quantity_limit_reached",
             None,
-            "error: project quantity limit reached\n\nAsk the deployment operator to raise the limit.".to_owned(),
+            "error: project quantity limit reached\n\nArchive a project that is no longer needed or ask the deployment operator to raise the limit.".to_owned(),
             OutcomeClass::GeneralFailure,
         ),
         ProjectFailure::RateLimited { retry_after } => (
@@ -333,6 +341,12 @@ fn write_failure(
             "repository_unavailable",
             None,
             "error: selected GitLab repository or branch is unavailable\n\nCheck the GitLab connection, selection, and branch before retrying.".to_owned(),
+            OutcomeClass::GeneralFailure,
+        ),
+        ProjectFailure::ProjectArchived => (
+            "project_archived",
+            None,
+            "error: project is archived\n\nAs an organization owner, unarchive the project first:\n  um project unarchive <ORGANIZATION> <PROJECT>".to_owned(),
             OutcomeClass::GeneralFailure,
         ),
         ProjectFailure::Conflict => (

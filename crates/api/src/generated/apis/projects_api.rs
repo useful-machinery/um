@@ -5,7 +5,7 @@
 /*
  * Useful Machinery API
  *
- * The public programmatic API for Useful Machinery.  This contract exposes authenticated principal lookup, explicit human signup, self-service human profile and identity management, and the initial organization tenant boundary. A caller authenticates with an OAuth 2.0 access token issued by an authorization server configured for the deployment and intended for this API.  A failure is `application/problem+json` whose `type` is `https://api.usefulmachinery.com/problems/` followed by a stable slug. Any operation may answer the shared slugs `bad-request`, `idempotency-key-required`, `unauthorized`, `forbidden`, `not-found`, `idempotency-conflict`, `request-body-too-large`, `unsupported-media-type`, `retryable-conflict` and `internal-server-error` under the statuses it declares. An operation tagged Principals, Organizations or Delegations names every other slug it answers in its description.
+ * The public programmatic API for Useful Machinery.  This contract exposes authenticated principal lookup, explicit human signup, self-service human profile and identity management, and the initial organization tenant boundary. A caller authenticates with an OAuth 2.0 access token issued by an authorization server configured for the deployment and intended for this API.  A failure is `application/problem+json` whose `type` is `https://api.usefulmachinery.com/problems/` followed by a stable slug. Any operation may answer the shared slugs `bad-request`, `idempotency-key-required`, `unauthorized`, `forbidden`, `not-found`, `idempotency-conflict`, `request-body-too-large`, `unsupported-media-type`, `retryable-conflict` and `internal-server-error` under the statuses it declares. An operation tagged Principals, Organizations or Delegations names every other slug it answers in its description. `project-archived`, with `reason` `project-archived`, refuses a change an archived project does not take until it is unarchived; each operation that answers it names it.
  *
  * The version of the OpenAPI document: 0.1.0
  *
@@ -16,6 +16,19 @@ use super::{ContentType, Error, configuration};
 use crate::generated::{apis::ResponseContent, models};
 use reqwest;
 use serde::{Deserialize, Serialize, de::Error as _};
+
+/// struct for typed errors of method [`archive_project`]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ArchiveProjectError {
+    Status400(models::Problem),
+    Status401(models::Problem),
+    Status403(models::Problem),
+    Status404(models::Problem),
+    Status409(models::Problem),
+    Status500(models::Problem),
+    UnknownValue(serde_json::Value),
+}
 
 /// struct for typed errors of method [`create_project`]
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -157,6 +170,19 @@ pub enum SetProjectRunnerPoolsError {
     UnknownValue(serde_json::Value),
 }
 
+/// struct for typed errors of method [`unarchive_project`]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum UnarchiveProjectError {
+    Status400(models::Problem),
+    Status401(models::Problem),
+    Status403(models::Problem),
+    Status404(models::Problem),
+    Status409(models::Problem),
+    Status500(models::Problem),
+    UnknownValue(serde_json::Value),
+}
+
 /// struct for typed errors of method [`update_project_repository`]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
@@ -171,6 +197,73 @@ pub enum UpdateProjectRepositoryError {
     Status500(models::Problem),
     Status503(models::Problem),
     UnknownValue(serde_json::Value),
+}
+
+/// Owner only. Sets `archivedAt` and `updatedAt` to the time of the change; archiving an archived project changes nothing. An archived project keeps its name, which no other project of the organization can take, and does not count toward the organization's project limit. Reads no provider.
+pub fn archive_project(
+    configuration: &configuration::Configuration,
+    organization_ref: &str,
+    project_id: &str,
+    idempotency_key: &str,
+) -> Result<models::Project, Error<ArchiveProjectError>> {
+    // add a prefix to parameters to efficiently prevent name collisions
+    let p_path_organization_ref = organization_ref;
+    let p_path_project_id = project_id;
+    let p_header_idempotency_key = idempotency_key;
+
+    let uri_str = format!(
+        "{}/v1/organizations/{organizationRef}/projects/{projectId}/archive",
+        configuration.base_path,
+        organizationRef = crate::generated::apis::urlencode(p_path_organization_ref),
+        projectId = crate::generated::apis::urlencode(p_path_project_id)
+    );
+    let mut req_builder = configuration
+        .client
+        .request(reqwest::Method::POST, &uri_str);
+
+    if let Some(ref user_agent) = configuration.user_agent {
+        req_builder = req_builder.header(reqwest::header::USER_AGENT, user_agent.clone());
+    }
+    req_builder = req_builder.header("Idempotency-Key", p_header_idempotency_key.to_string());
+    if let Some(ref token) = configuration.bearer_access_token {
+        req_builder = req_builder.bearer_auth(token.to_owned());
+    };
+
+    let req = req_builder.build()?;
+    let resp = configuration.client.execute(req)?;
+
+    let status = resp.status();
+    let content_type = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/octet-stream");
+    let content_type = super::ContentType::from(content_type);
+
+    if !status.is_client_error() && !status.is_server_error() {
+        let content = resp.text()?;
+        match content_type {
+            ContentType::Json => serde_json::from_str(&content).map_err(Error::from),
+            ContentType::Text => {
+                return Err(Error::from(serde_json::Error::custom(
+                    "Received `text/plain` content type response that cannot be converted to `models::Project`",
+                )));
+            }
+            ContentType::Unsupported(unknown_type) => {
+                return Err(Error::from(serde_json::Error::custom(format!(
+                    "Received `{unknown_type}` content type response that cannot be converted to `models::Project`"
+                ))));
+            }
+        }
+    } else {
+        let content = resp.text()?;
+        let entity: Option<ArchiveProjectError> = serde_json::from_str(&content).ok();
+        Err(Error::ResponseError(ResponseContent {
+            status,
+            content,
+            entity,
+        }))
+    }
 }
 
 /// An optional `runnerPoolId` that names a member's personal pool is answered `409` `runner-pool-member-assigned`.
@@ -240,6 +333,7 @@ pub fn create_project(
     }
 }
 
+/// An archived project is answered `409` `project-archived` and nothing changes.
 pub fn detach_project_repository(
     configuration: &configuration::Configuration,
     organization_ref: &str,
@@ -433,11 +527,13 @@ pub fn list_projects(
     organization_ref: &str,
     limit: Option<i32>,
     cursor: Option<&str>,
+    include_archived: Option<bool>,
 ) -> Result<models::ProjectList, Error<ListProjectsError>> {
     // add a prefix to parameters to efficiently prevent name collisions
     let p_path_organization_ref = organization_ref;
     let p_query_limit = limit;
     let p_query_cursor = cursor;
+    let p_query_include_archived = include_archived;
 
     let uri_str = format!(
         "{}/v1/organizations/{organizationRef}/projects",
@@ -451,6 +547,9 @@ pub fn list_projects(
     }
     if let Some(ref param_value) = p_query_cursor {
         req_builder = req_builder.query(&[("cursor", &param_value.to_string())]);
+    }
+    if let Some(ref param_value) = p_query_include_archived {
+        req_builder = req_builder.query(&[("includeArchived", &param_value.to_string())]);
     }
     if let Some(ref user_agent) = configuration.user_agent {
         req_builder = req_builder.header(reqwest::header::USER_AGENT, user_agent.clone());
@@ -563,6 +662,7 @@ pub fn remove_project_runner_pool(
     }
 }
 
+/// An archived project is answered `409` `project-archived`, even for its current name, and nothing changes.
 pub fn rename_project(
     configuration: &configuration::Configuration,
     organization_ref: &str,
@@ -637,6 +737,7 @@ pub fn rename_project(
     }
 }
 
+/// An archived project is answered `409` `project-archived`, even for its current repository and branch, without reading the provider, and nothing changes.
 pub fn set_project_repository(
     configuration: &configuration::Configuration,
     organization_ref: &str,
@@ -704,7 +805,7 @@ pub fn set_project_repository(
     }
 }
 
-/// Replaces the project's pool set with this one pool. A pool that is missing, not active or in another organization shares the not-found representation, and a member's personal pool is answered `409` `runner-pool-member-assigned`.
+/// Replaces the project's pool set with this one pool. A pool that is missing, not active or in another organization shares the not-found representation, and a member's personal pool is answered `409` `runner-pool-member-assigned`. An archived project is answered `409` `project-archived` unless the pool is already in its set, which then holds that pool alone.
 pub fn set_project_runner_pool(
     configuration: &configuration::Configuration,
     organization_ref: &str,
@@ -772,7 +873,7 @@ pub fn set_project_runner_pool(
     }
 }
 
-/// Replaces the project's pool set with the pools named, which have no order; the same set again changes nothing. A pool that is missing, not active or in another organization shares the not-found representation, and a member's personal pool is answered `409` `runner-pool-member-assigned`; either refusal changes nothing.
+/// Replaces the project's pool set with the pools named, which have no order; the same set again changes nothing. A pool that is missing, not active or in another organization shares the not-found representation, and a member's personal pool is answered `409` `runner-pool-member-assigned`; either refusal changes nothing. On an archived project a set that adds a pool is answered `409` `project-archived` and changes nothing, while a set that only removes pools is applied.
 pub fn set_project_runner_pools(
     configuration: &configuration::Configuration,
     organization_ref: &str,
@@ -840,6 +941,74 @@ pub fn set_project_runner_pools(
     }
 }
 
+/// Owner only. Removes `archivedAt` and sets `updatedAt` to the time of the change; unarchiving an active project changes nothing. Unarchiving while the organization already holds as many unarchived projects as its limit is answered `409` `quantity-limit-reached` and leaves the project archived. Reads no provider.
+pub fn unarchive_project(
+    configuration: &configuration::Configuration,
+    organization_ref: &str,
+    project_id: &str,
+    idempotency_key: &str,
+) -> Result<models::Project, Error<UnarchiveProjectError>> {
+    // add a prefix to parameters to efficiently prevent name collisions
+    let p_path_organization_ref = organization_ref;
+    let p_path_project_id = project_id;
+    let p_header_idempotency_key = idempotency_key;
+
+    let uri_str = format!(
+        "{}/v1/organizations/{organizationRef}/projects/{projectId}/unarchive",
+        configuration.base_path,
+        organizationRef = crate::generated::apis::urlencode(p_path_organization_ref),
+        projectId = crate::generated::apis::urlencode(p_path_project_id)
+    );
+    let mut req_builder = configuration
+        .client
+        .request(reqwest::Method::POST, &uri_str);
+
+    if let Some(ref user_agent) = configuration.user_agent {
+        req_builder = req_builder.header(reqwest::header::USER_AGENT, user_agent.clone());
+    }
+    req_builder = req_builder.header("Idempotency-Key", p_header_idempotency_key.to_string());
+    if let Some(ref token) = configuration.bearer_access_token {
+        req_builder = req_builder.bearer_auth(token.to_owned());
+    };
+
+    let req = req_builder.build()?;
+    let resp = configuration.client.execute(req)?;
+
+    let status = resp.status();
+    let content_type = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/octet-stream");
+    let content_type = super::ContentType::from(content_type);
+
+    if !status.is_client_error() && !status.is_server_error() {
+        let content = resp.text()?;
+        match content_type {
+            ContentType::Json => serde_json::from_str(&content).map_err(Error::from),
+            ContentType::Text => {
+                return Err(Error::from(serde_json::Error::custom(
+                    "Received `text/plain` content type response that cannot be converted to `models::Project`",
+                )));
+            }
+            ContentType::Unsupported(unknown_type) => {
+                return Err(Error::from(serde_json::Error::custom(format!(
+                    "Received `{unknown_type}` content type response that cannot be converted to `models::Project`"
+                ))));
+            }
+        }
+    } else {
+        let content = resp.text()?;
+        let entity: Option<UnarchiveProjectError> = serde_json::from_str(&content).ok();
+        Err(Error::ResponseError(ResponseContent {
+            status,
+            content,
+            entity,
+        }))
+    }
+}
+
+/// An archived project is answered `409` `project-archived`, even for its current branch, without reading the provider, and nothing changes.
 pub fn update_project_repository(
     configuration: &configuration::Configuration,
     organization_ref: &str,

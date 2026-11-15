@@ -72,9 +72,13 @@ pub enum WebhookFailure {
     InvalidInput,
     NotFound,
     Conflict,
+    /// A `webhook-conflict` whose `reason` is `project-archived` (REQ-WEBHOOK-99).
+    ProjectArchived,
     RateLimited(u64),
     Unreachable(UnreachableCategory),
-    Protocol { credential_rejected: bool },
+    Protocol {
+        credential_rejected: bool,
+    },
 }
 
 // Webhook and run failures are separate closed policy domains despite sharing
@@ -409,6 +413,12 @@ impl WebhookApi {
                         StatusCode::UNSUPPORTED_MEDIA_TYPE,
                         "https://api.usefulmachinery.com/problems/unsupported-media-type",
                     ) => WebhookFailure::InvalidInput,
+                    (
+                        StatusCode::CONFLICT,
+                        "https://api.usefulmachinery.com/problems/webhook-conflict",
+                    ) if decoded.reason.as_deref() == Some(problem::PROJECT_ARCHIVED_REASON) => {
+                        WebhookFailure::ProjectArchived
+                    }
                     (
                         StatusCode::CONFLICT,
                         "https://api.usefulmachinery.com/problems/webhook-conflict"

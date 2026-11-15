@@ -422,6 +422,33 @@ fn webhook_rejects_mismatched_and_malformed_delivery_responses() {
     assert_eq!(server.finish().len(), 1);
 }
 
+// REQ-WEBHOOK-99
+#[test]
+fn webhook_refusal_in_an_archived_project_is_named_only_by_its_reason() {
+    for (reason, outcome) in [
+        (Some("project-archived"), "project_archived"),
+        (None, "conflict"),
+        (Some("version-mismatch"), "conflict"),
+    ] {
+        let mut body = serde_json::json!({"type":"https://api.usefulmachinery.com/problems/webhook-conflict","title":"No secret here","status":409});
+        if let Some(reason) = reason {
+            body["reason"] = serde_json::json!(reason);
+        }
+        let server = ScriptedServer::respond(vec![problem_http_response("409 Conflict", body)]);
+        let (server, _credential_directory, credentials) = prepared_server(server);
+        let output = run(
+            &["disable", ORGANIZATION, PROJECT_ID, WEBHOOK],
+            &server,
+            &credentials,
+        );
+        assert_eq!(output.status.code(), Some(1), "{reason:?}");
+        let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(value["outcome"], outcome, "{reason:?}");
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("No secret here"));
+        assert_eq!(server.finish().len(), 1);
+    }
+}
+
 // REQ-WEBHOOK-72, REQ-WEBHOOK-74
 #[test]
 fn webhook_config_standard_input_and_service_actor_are_independent() {

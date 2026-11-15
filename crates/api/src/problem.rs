@@ -29,6 +29,11 @@ pub(super) const GRANT_SESSION_CONFLICT: &str =
     "https://api.usefulmachinery.com/problems/grant-session-conflict";
 pub(super) const SERVICE_UNAVAILABLE: &str =
     "https://api.usefulmachinery.com/problems/service-unavailable";
+pub(super) const PROJECT_ARCHIVED: &str =
+    "https://api.usefulmachinery.com/problems/project-archived";
+/// The `reason` a conflict carries when its project is archived, under a type a published CLI
+/// already reads as a conflict (`webhook-conflict`, `google-docs-action-conflict`).
+pub(super) const PROJECT_ARCHIVED_REASON: &str = "project-archived";
 
 pub(super) fn decode_type(
     response: &super::http_util::BufferedResponse,

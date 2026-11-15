@@ -611,7 +611,7 @@ pub fn list_organization_membership_history(
 /// The audit vocabulary this release decodes (REQ-AUDIT-44): its subject and change tables
 /// hold every action, subject kind and change field the contract lists. A listing that named
 /// none would be shown in the vocabulary of releases before the parameter existed.
-const AUDIT_VOCABULARY: &str = "2";
+const AUDIT_VOCABULARY: &str = "3";
 
 pub fn list_organization_audit_records(
     client: &HttpClient,

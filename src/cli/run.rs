@@ -1579,7 +1579,7 @@ fn write_create(
         }
         return Ok(ExitCode::GeneralFailure);
     }
-    // REQ-RUN-80: a definite source-admission rejection is rendered before the
+    // REQ-RUN-80: a definite admission rejection is rendered before the
     // dispatched-failure arm below, so it can never be reported as acceptance_unknown.
     if let Err(RunFailure::AdmissionRejected {
         status,
@@ -1603,6 +1603,7 @@ fn write_create(
             )?;
         } else {
             let remedy = match *problem_type {
+                "project-archived" => super::project::ARCHIVED_REMEDY,
                 "workspace-selection-unsupported" => {
                     "This deployment does not admit an explicit workspace selection. Omit --workspace-branch and --workspace-commit and keep --source-branch; the workspace is then pinned at the workflow definition commit, which the acceptance receipt reports."
                 }

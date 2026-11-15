@@ -5,7 +5,7 @@
 /*
  * Useful Machinery API
  *
- * The public programmatic API for Useful Machinery.  This contract exposes authenticated principal lookup, explicit human signup, self-service human profile and identity management, and the initial organization tenant boundary. A caller authenticates with an OAuth 2.0 access token issued by an authorization server configured for the deployment and intended for this API.  A failure is `application/problem+json` whose `type` is `https://api.usefulmachinery.com/problems/` followed by a stable slug. Any operation may answer the shared slugs `bad-request`, `idempotency-key-required`, `unauthorized`, `forbidden`, `not-found`, `idempotency-conflict`, `request-body-too-large`, `unsupported-media-type`, `retryable-conflict` and `internal-server-error` under the statuses it declares. An operation tagged Principals, Organizations or Delegations names every other slug it answers in its description.
+ * The public programmatic API for Useful Machinery.  This contract exposes authenticated principal lookup, explicit human signup, self-service human profile and identity management, and the initial organization tenant boundary. A caller authenticates with an OAuth 2.0 access token issued by an authorization server configured for the deployment and intended for this API.  A failure is `application/problem+json` whose `type` is `https://api.usefulmachinery.com/problems/` followed by a stable slug. Any operation may answer the shared slugs `bad-request`, `idempotency-key-required`, `unauthorized`, `forbidden`, `not-found`, `idempotency-conflict`, `request-body-too-large`, `unsupported-media-type`, `retryable-conflict` and `internal-server-error` under the statuses it declares. An operation tagged Principals, Organizations or Delegations names every other slug it answers in its description. `project-archived`, with `reason` `project-archived`, refuses a change an archived project does not take until it is unarchived; each operation that answers it names it.
  *
  * The version of the OpenAPI document: 0.1.0
  *
@@ -171,7 +171,7 @@ pub enum UpdateGoogleDocsActionError {
     UnknownValue(serde_json::Value),
 }
 
-/// GitLab-bound projects return 409 with problem type google-docs-project-unsupported.
+/// GitLab-bound projects return 409 with problem type google-docs-project-unsupported. While the project is archived a create is 409 `google-docs-action-conflict` with `reason` `project-archived` and creates nothing; a completed request repeated with its key returns its recorded result.
 pub fn create_google_docs_action(
     configuration: &configuration::Configuration,
     organization_ref: &str,
@@ -246,7 +246,7 @@ pub fn create_google_docs_action(
     }
 }
 
-/// Reviews an enabled action that names a definition for the current document. The answer is a form token valid for fifteen minutes with the action version, the definition with its current revision and the workflow file of its tree a launch will run, the project's repository connection and branch, and each input that workflow file declares with its binding. No commit is resolved and no publication is selected.  An action that names no definition is answered `410` `path-run-retired` and no form is issued. A workflow file declaring an input other than text or JSON, or more than 256 inputs, is `422` `google-docs-input-kind-unsupported`; a binding or presentation that does not match the declared inputs is `422` `google-docs-input-binding-invalid`; a definition the project lacks, a `workflowPath` that is no workflow file of the current revision's tree, an invalid workflow file or input schema, or a project since bound to GitLab is `422` `google-docs-action-invalid`. An archived definition is `409` `definition-archived`, a disabled or deleted action `409` `google-docs-action-disabled` or `google-docs-action-deleted`, a project with configuration blockers `409` `project-not-ready`, and a tree that cannot be read `409` `workflow-source-unavailable`.
+/// Reviews an enabled action that names a definition for the current document. The answer is a form token valid for fifteen minutes with the action version, the definition with its current revision and the workflow file of its tree a launch will run, the project's repository connection and branch, and each input that workflow file declares with its binding. No commit is resolved and no publication is selected.  An action that names no definition is answered `410` `path-run-retired` and no form is issued. A workflow file declaring an input other than text or JSON, or more than 256 inputs, is `422` `google-docs-input-kind-unsupported`; a binding or presentation that does not match the declared inputs is `422` `google-docs-input-binding-invalid`; a definition the project lacks, a `workflowPath` that is no workflow file of the current revision's tree, an invalid workflow file or input schema, or a project since bound to GitLab is `422` `google-docs-action-invalid`. An archived definition is `409` `definition-archived`, a disabled or deleted action `409` `google-docs-action-disabled` or `google-docs-action-deleted`, a project with configuration blockers `409` `project-not-ready`, and a tree that cannot be read `409` `workflow-source-unavailable`. An archived project's action is `409` `project-not-ready` with `reason` `project-archived` and no `blockers`, and no form is issued.
 pub fn create_google_docs_form(
     configuration: &configuration::Configuration,
     organization_ref: &str,
@@ -313,7 +313,7 @@ pub fn create_google_docs_form(
     }
 }
 
-/// Repeating a launch with its key and body returns the original receipt, even after the form expires or the action is disabled or deleted; the same key with another body is `409` `idempotency-conflict`. Keys are scoped to the launcher and the action.  Otherwise the launch, with the `formToken`, the reviewed `documentId` and, when the form has inputs, a sealed run input set the launcher created, admits one run of the reviewed revision of the action's definition as the launcher, in the newest commit of the project's branch, and answers `202` with a `gdl_` receipt. The receipt names the selected workflow file as `workflowPath`, the workspace commit as `sourceCommit` and no publication.  An action that names no definition is answered `410` `path-run-retired` and no run input set is consumed. An expired form is `409` `google-docs-form-expired`, a form for another document `409` `google-docs-document-changed`, and a form whose action, project repository or branch, or definition revision changed since review `409` `google-docs-form-stale`; a bound value that differs in the input set is `422` `google-docs-bound-input-mismatch`. What run creation refuses of the definition or the input set is answered as run creation answers it: `409` `definition-archived`, `subject-busy`, `subject-settled`, `run-input-set-consumed` or `run-input-set-not-sealed`, and `410` `run-input-set-expired`. No refusal admits a run.
+/// Repeating a launch with its key and body returns the original receipt, even after the form expires or the action is disabled or deleted; the same key with another body is `409` `idempotency-conflict`. Keys are scoped to the launcher and the action.  Otherwise the launch, with the `formToken`, the reviewed `documentId` and, when the form has inputs, a sealed run input set the launcher created, admits one run of the reviewed revision of the action's definition as the launcher, in the newest commit of the project's branch, and answers `202` with a `gdl_` receipt. The receipt names the selected workflow file as `workflowPath`, the workspace commit as `sourceCommit` and no publication.  An action that names no definition is answered `410` `path-run-retired` and no run input set is consumed. An expired form is `409` `google-docs-form-expired`, a form for another document `409` `google-docs-document-changed`, and a form whose action, project repository or branch, or definition revision changed since review `409` `google-docs-form-stale`; a bound value that differs in the input set is `422` `google-docs-bound-input-mismatch`. What run creation refuses of the definition or the input set is answered as run creation answers it: `409` `definition-archived`, `subject-busy`, `subject-settled`, `run-input-set-consumed` or `run-input-set-not-sealed`, and `410` `run-input-set-expired`. A launch, other than a repeat, of an archived project's action is `409` `project-not-ready` with `reason` `project-archived` and no `blockers`. No refusal admits a run.
 pub fn create_google_docs_launch(
     configuration: &configuration::Configuration,
     organization_ref: &str,
@@ -383,7 +383,7 @@ pub fn create_google_docs_launch(
     }
 }
 
-/// GitLab-bound projects return 409 with problem type google-docs-project-unsupported; exact replays retain their original receipt.
+/// GitLab-bound projects return 409 with problem type google-docs-project-unsupported. While the project is archived the change is 409 `google-docs-action-conflict` with `reason` `project-archived` and changes nothing; exact replays retain their original receipt.
 pub fn delete_google_docs_action(
     configuration: &configuration::Configuration,
     organization_ref: &str,
@@ -434,7 +434,7 @@ pub fn delete_google_docs_action(
     }
 }
 
-/// GitLab-bound projects return 409 with problem type google-docs-project-unsupported; exact replays retain their original receipt.
+/// GitLab-bound projects return 409 with problem type google-docs-project-unsupported. While the project is archived the change is 409 `google-docs-action-conflict` with `reason` `project-archived` and changes nothing; exact replays retain their original receipt.
 pub fn disable_google_docs_action(
     configuration: &configuration::Configuration,
     organization_ref: &str,
@@ -509,7 +509,7 @@ pub fn disable_google_docs_action(
     }
 }
 
-/// GitLab-bound projects return 409 with problem type google-docs-project-unsupported; exact replays retain their original receipt.
+/// GitLab-bound projects return 409 with problem type google-docs-project-unsupported. While the project is archived the change is 409 `google-docs-action-conflict` with `reason` `project-archived` and changes nothing; exact replays retain their original receipt.
 pub fn enable_google_docs_action(
     configuration: &configuration::Configuration,
     organization_ref: &str,
@@ -935,7 +935,7 @@ pub fn list_google_docs_launches(
     }
 }
 
-/// GitLab-bound projects return 409 with problem type google-docs-project-unsupported; exact replays retain their original receipt.
+/// GitLab-bound projects return 409 with problem type google-docs-project-unsupported. While the project is archived the change is 409 `google-docs-action-conflict` with `reason` `project-archived` and changes nothing; exact replays retain their original receipt.
 pub fn update_google_docs_action(
     configuration: &configuration::Configuration,
     organization_ref: &str,

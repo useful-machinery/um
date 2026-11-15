@@ -465,13 +465,15 @@ impl FamilyFailure for ProjectFailure {
             },
             // GitHub or GitLab cannot answer now, as the project family's exit 4 says.
             Self::ProviderUnavailable { .. } => Ending::Unreachable(UnreachableCategory::Server),
-            // A read answers no binding, name, quantity, idempotency or source conflict.
+            // A read answers no binding, name, quantity, idempotency, source or archive
+            // conflict.
             Self::RepositoryNotBound
             | Self::NameUnavailable
             | Self::QuantityLimitReached
             | Self::IdempotencyConflict
             | Self::SourceConflict
             | Self::RepositoryUnavailable
+            | Self::ProjectArchived
             | Self::Conflict
             | Self::Protocol { .. } => Ending::InvalidResponse,
         })

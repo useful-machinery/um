@@ -5,7 +5,7 @@
 /*
  * Useful Machinery API
  *
- * The public programmatic API for Useful Machinery.  This contract exposes authenticated principal lookup, explicit human signup, self-service human profile and identity management, and the initial organization tenant boundary. A caller authenticates with an OAuth 2.0 access token issued by an authorization server configured for the deployment and intended for this API.  A failure is `application/problem+json` whose `type` is `https://api.usefulmachinery.com/problems/` followed by a stable slug. Any operation may answer the shared slugs `bad-request`, `idempotency-key-required`, `unauthorized`, `forbidden`, `not-found`, `idempotency-conflict`, `request-body-too-large`, `unsupported-media-type`, `retryable-conflict` and `internal-server-error` under the statuses it declares. An operation tagged Principals, Organizations or Delegations names every other slug it answers in its description.
+ * The public programmatic API for Useful Machinery.  This contract exposes authenticated principal lookup, explicit human signup, self-service human profile and identity management, and the initial organization tenant boundary. A caller authenticates with an OAuth 2.0 access token issued by an authorization server configured for the deployment and intended for this API.  A failure is `application/problem+json` whose `type` is `https://api.usefulmachinery.com/problems/` followed by a stable slug. Any operation may answer the shared slugs `bad-request`, `idempotency-key-required`, `unauthorized`, `forbidden`, `not-found`, `idempotency-conflict`, `request-body-too-large`, `unsupported-media-type`, `retryable-conflict` and `internal-server-error` under the statuses it declares. An operation tagged Principals, Organizations or Delegations names every other slug it answers in its description. `project-archived`, with `reason` `project-archived`, refuses a change an archived project does not take until it is unarchived; each operation that answers it names it.
  *
  * The version of the OpenAPI document: 0.1.0
  *
@@ -243,7 +243,7 @@ pub enum UnarchiveWorkflowDefinitionError {
     UnknownValue(serde_json::Value),
 }
 
-/// Owner only. An archived definition refuses publications and new runs with 409 `definition-archived`; its revisions stay readable and it is never deleted.
+/// Owner only. An archived definition refuses publications and new runs with 409 `definition-archived`; its revisions stay readable and it is never deleted. While the project is archived the change is 409 `project-archived` with `reason` `project-archived` and changes nothing; a completed request repeated with its key returns its recorded result.
 pub fn archive_workflow_definition(
     configuration: &configuration::Configuration,
     organization_ref: &str,
@@ -313,7 +313,7 @@ pub fn archive_workflow_definition(
     }
 }
 
-/// Owner only. Answers 201 with the created definition and revision 1, or, when `reuseIdentical` is true and exactly one of the project's active definitions has a current revision identical to the publication, 200 with that definition and its current revision as they stand, writing nothing. The bindings snapshot takes each supplied value, or the root's default, and is resolved before revision 1 is recorded. The definition starts active with automatic starts disabled and no execution principal. `executablePaths`, when given, are the tree's files revision 1 runs executable in place of the bits the tree was sealed with; a list that is unsorted, repeats a path or names a path that is not a file of the tree is 400, and bits whose file list the assignment offer could not carry are 422 `workflow-tree-too-large-for-delivery`. So, storing nothing, is a revision whose whole tree block (the files, the bindings snapshot, its resolution and the run facts an offer adds, each at its longest) would exceed the 163,840 bytes an offer allows. Refusals name their slug: `workflow-tree-unavailable`, `binding-missing` and `binding-unresolved` (422, with `workflow.bindingKey`), `definition-reuse-ambiguous` (409, with `workflow.definitionIds`) when more than one active definition is identical, and `idempotency-conflict` (409).
+/// Owner only. Answers 201 with the created definition and revision 1, or, when `reuseIdentical` is true and exactly one of the project's active definitions has a current revision identical to the publication, 200 with that definition and its current revision as they stand, writing nothing. The bindings snapshot takes each supplied value, or the root's default, and is resolved before revision 1 is recorded. The definition starts active with automatic starts disabled and no execution principal. `executablePaths`, when given, are the tree's files revision 1 runs executable in place of the bits the tree was sealed with; a list that is unsorted, repeats a path or names a path that is not a file of the tree is 400, and bits whose file list the assignment offer could not carry are 422 `workflow-tree-too-large-for-delivery`. So, storing nothing, is a revision whose whole tree block (the files, the bindings snapshot, its resolution and the run facts an offer adds, each at its longest) would exceed the 163,840 bytes an offer allows. Refusals name their slug: `workflow-tree-unavailable`, `binding-missing` and `binding-unresolved` (422, with `workflow.bindingKey`), `definition-reuse-ambiguous` (409, with `workflow.definitionIds`) when more than one active definition is identical, and `idempotency-conflict` (409). While the project is archived a create is 409 `project-archived` with `reason` `project-archived` and records nothing; a completed request repeated with its key returns its recorded result.
 pub fn create_workflow_definition(
     configuration: &configuration::Configuration,
     organization_ref: &str,
@@ -447,7 +447,7 @@ pub fn create_workflow_tree_upload(
     }
 }
 
-/// Owner only. Disabling a disabled definition changes nothing.
+/// Owner only. Disabling a disabled definition changes nothing. While the project is archived the change is 409 `project-archived` with `reason` `project-archived` and changes nothing; a completed request repeated with its key returns its recorded result.
 pub fn disable_workflow_definition(
     configuration: &configuration::Configuration,
     organization_ref: &str,
@@ -517,7 +517,7 @@ pub fn disable_workflow_definition(
     }
 }
 
-/// Owner only. The execution principal, every bound connection and each start trigger of the current revision are checked; a failing check is 409 `definition-not-startable` naming it in `workflow.startCheck`. An archived definition is 409 `definition-archived`.
+/// Owner only. The execution principal, every bound connection and each start trigger of the current revision are checked; a failing check is 409 `definition-not-startable` naming it in `workflow.startCheck`. An archived definition is 409 `definition-archived`. While the project is archived the change is 409 `project-archived` with `reason` `project-archived` and changes nothing; a completed request repeated with its key returns its recorded result.
 pub fn enable_workflow_definition(
     configuration: &configuration::Configuration,
     organization_ref: &str,
@@ -1020,7 +1020,7 @@ pub fn list_workflow_definitions(
     }
 }
 
-/// Owner only. A stale `expectedCurrentRevision` is 409 `definition-revision-conflict` carrying `workflow.currentRevision`, and creates nothing. An omitted `treeDigest` reuses the current revision's tree, and omitted `bindings` carry the current snapshot onto it. `executablePaths` are refused as on create, and so is a revision whose whole tree block an offer could not carry (422 `workflow-tree-too-large-for-delivery`). Omitted `executablePaths` keep the current revision's when `treeDigest` is omitted too, and otherwise the bits the named tree was sealed with. An archived definition is 409 `definition-archived`; on an enabled definition the new revision must pass the enablement checks (409 `definition-not-startable`).
+/// Owner only. A stale `expectedCurrentRevision` is 409 `definition-revision-conflict` carrying `workflow.currentRevision`, and creates nothing. An omitted `treeDigest` reuses the current revision's tree, and omitted `bindings` carry the current snapshot onto it. `executablePaths` are refused as on create, and so is a revision whose whole tree block an offer could not carry (422 `workflow-tree-too-large-for-delivery`). Omitted `executablePaths` keep the current revision's when `treeDigest` is omitted too, and otherwise the bits the named tree was sealed with. An archived definition is 409 `definition-archived`; on an enabled definition the new revision must pass the enablement checks (409 `definition-not-startable`). While the project is archived a publication is 409 `project-archived` with `reason` `project-archived` and creates nothing; a completed request repeated with its key returns its recorded result.
 pub fn publish_workflow_definition_revision(
     configuration: &configuration::Configuration,
     organization_ref: &str,
@@ -1095,7 +1095,7 @@ pub fn publish_workflow_definition_revision(
     }
 }
 
-/// Owner only. The evaluation keeps its revision, trigger, event, connection, execution principal and `expiresAt`. Only a `failed` evaluation without a run and with a reason other than `event_invalid` is retried, while its definition is active with automatic starts, its connection (when it has one; a schedule evaluation has none) active and its principal an active member; otherwise 409 `evaluation-not-retryable`. An exact key replay returns the cycle it accepted while the evaluation is retained; another key starts a cycle only once that one fails.
+/// Owner only. The evaluation keeps its revision, trigger, event, connection, execution principal and `expiresAt`. Only a `failed` evaluation without a run and with a reason other than `event_invalid` is retried, while its definition is active with automatic starts, its connection (when it has one; a schedule evaluation has none) active and its principal an active member; otherwise 409 `evaluation-not-retryable`. While the project is archived a retry opens no cycle and is answered 409 `project-archived` with `reason` `project-archived`. An exact key replay returns the cycle it accepted while the evaluation is retained, even while the project is archived; another key starts a cycle only once that one fails.
 pub fn retry_workflow_definition_evaluation(
     configuration: &configuration::Configuration,
     organization_ref: &str,
@@ -1236,7 +1236,7 @@ pub fn seal_workflow_tree(
     }
 }
 
-/// Owner only. The principal must be an active service principal, else 403, and an active member of the organization, else the not-found response. No revision is created.
+/// Owner only. The principal must be an active service principal, else 403, and an active member of the organization, else the not-found response. No revision is created. While the project is archived the change is 409 `project-archived` with `reason` `project-archived` and changes nothing; a completed request repeated with its key returns its recorded result.
 pub fn set_workflow_definition_execution_principal(
     configuration: &configuration::Configuration,
     organization_ref: &str,
@@ -1309,7 +1309,7 @@ pub fn set_workflow_definition_execution_principal(
     }
 }
 
-/// Owner only. Unarchiving an active definition changes nothing.
+/// Owner only. Unarchiving an active definition changes nothing. While the project is archived the change is 409 `project-archived` with `reason` `project-archived` and changes nothing; a completed request repeated with its key returns its recorded result.
 pub fn unarchive_workflow_definition(
     configuration: &configuration::Configuration,
     organization_ref: &str,

@@ -5,7 +5,7 @@
 /*
  * Useful Machinery API
  *
- * The public programmatic API for Useful Machinery.  This contract exposes authenticated principal lookup, explicit human signup, self-service human profile and identity management, and the initial organization tenant boundary. A caller authenticates with an OAuth 2.0 access token issued by an authorization server configured for the deployment and intended for this API.  A failure is `application/problem+json` whose `type` is `https://api.usefulmachinery.com/problems/` followed by a stable slug. Any operation may answer the shared slugs `bad-request`, `idempotency-key-required`, `unauthorized`, `forbidden`, `not-found`, `idempotency-conflict`, `request-body-too-large`, `unsupported-media-type`, `retryable-conflict` and `internal-server-error` under the statuses it declares. An operation tagged Principals, Organizations or Delegations names every other slug it answers in its description.
+ * The public programmatic API for Useful Machinery.  This contract exposes authenticated principal lookup, explicit human signup, self-service human profile and identity management, and the initial organization tenant boundary. A caller authenticates with an OAuth 2.0 access token issued by an authorization server configured for the deployment and intended for this API.  A failure is `application/problem+json` whose `type` is `https://api.usefulmachinery.com/problems/` followed by a stable slug. Any operation may answer the shared slugs `bad-request`, `idempotency-key-required`, `unauthorized`, `forbidden`, `not-found`, `idempotency-conflict`, `request-body-too-large`, `unsupported-media-type`, `retryable-conflict` and `internal-server-error` under the statuses it declares. An operation tagged Principals, Organizations or Delegations names every other slug it answers in its description. `project-archived`, with `reason` `project-archived`, refuses a change an archived project does not take until it is unarchived; each operation that answers it names it.
  *
  * The version of the OpenAPI document: 0.1.0
  *
@@ -267,6 +267,10 @@ pub enum OrganizationAuditAction {
     ProjectDefaultBranchChanged,
     #[serde(rename = "project.repository_detached")]
     ProjectRepositoryDetached,
+    #[serde(rename = "project.archived")]
+    ProjectArchived,
+    #[serde(rename = "project.unarchived")]
+    ProjectUnarchived,
     #[serde(rename = "repository_token.issued")]
     RepositoryTokenIssued,
     #[serde(rename = "artifact.download_capabilities_issued")]
@@ -434,6 +438,8 @@ impl std::fmt::Display for OrganizationAuditAction {
             Self::ProjectRepositoryRebound => write!(f, "project.repository_rebound"),
             Self::ProjectDefaultBranchChanged => write!(f, "project.default_branch_changed"),
             Self::ProjectRepositoryDetached => write!(f, "project.repository_detached"),
+            Self::ProjectArchived => write!(f, "project.archived"),
+            Self::ProjectUnarchived => write!(f, "project.unarchived"),
             Self::RepositoryTokenIssued => write!(f, "repository_token.issued"),
             Self::ArtifactDownloadCapabilitiesIssued => {
                 write!(f, "artifact.download_capabilities_issued")

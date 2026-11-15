@@ -14,7 +14,8 @@ use super::http_client::generated_configuration;
 use super::http_util::{self, BoundedBodyError};
 use super::problem::{
     self, ACCEPTED_MEDIA_TYPES, BAD_REQUEST, FORBIDDEN, IDEMPOTENCY_CONFLICT, JSON_MEDIA_TYPE,
-    NOT_FOUND, PROVIDER_UNAVAILABLE, QUANTITY_LIMIT_REACHED, RATE_LIMIT_EXCEEDED, UNAUTHORIZED,
+    NOT_FOUND, PROJECT_ARCHIVED, PROVIDER_UNAVAILABLE, QUANTITY_LIMIT_REACHED, RATE_LIMIT_EXCEEDED,
+    UNAUTHORIZED,
 };
 use super::{HttpTransportPolicy, UnreachableCategory, classify_reqwest_error};
 
@@ -138,8 +139,13 @@ impl ProjectApi {
         organization: &str,
         limit: Option<u16>,
         cursor: Option<&str>,
+        include_archived: bool,
     ) -> Result<ProjectList, ProjectFailure> {
-        let query = pagination_query(limit, cursor);
+        let mut query = pagination_query(limit, cursor);
+        // The default omits the member, so a Cloud that predates archiving reads the same list.
+        if include_archived {
+            query.push(("includeArchived", "true".to_owned()));
+        }
         let (mut page, _): (ProjectList, Vec<HeaderValue>) = self.request_json(JsonRequest {
             operation: Operation::ProjectRead,
             method: Method::GET,
@@ -220,7 +226,27 @@ impl ProjectApi {
         idempotency_key: &str,
     ) -> Result<Project, ProjectFailure> {
         let path = project_child_path(organization, project_id, "runner-pool");
-        self.project_bodyless_mutation(project_id, &path, idempotency_key)
+        self.project_bodyless_mutation(project_id, Method::DELETE, &path, idempotency_key)
+    }
+
+    pub fn archive(
+        &self,
+        organization: &str,
+        project_id: &str,
+        idempotency_key: &str,
+    ) -> Result<Project, ProjectFailure> {
+        let path = project_child_path(organization, project_id, "archive");
+        self.project_bodyless_mutation(project_id, Method::POST, &path, idempotency_key)
+    }
+
+    pub fn unarchive(
+        &self,
+        organization: &str,
+        project_id: &str,
+        idempotency_key: &str,
+    ) -> Result<Project, ProjectFailure> {
+        let path = project_child_path(organization, project_id, "unarchive");
+        self.project_bodyless_mutation(project_id, Method::POST, &path, idempotency_key)
     }
 
     pub fn get_repository(
@@ -313,7 +339,7 @@ impl ProjectApi {
         idempotency_key: &str,
     ) -> Result<Project, ProjectFailure> {
         let path = project_child_path(organization, project_id, "repository");
-        self.project_bodyless_mutation(project_id, &path, idempotency_key)
+        self.project_bodyless_mutation(project_id, Method::DELETE, &path, idempotency_key)
     }
 
     pub fn list_installations(
@@ -366,6 +392,7 @@ impl ProjectApi {
     fn project_bodyless_mutation(
         &self,
         project_id: &str,
+        method: Method,
         path: &[&str],
         idempotency_key: &str,
     ) -> Result<Project, ProjectFailure> {
@@ -373,7 +400,7 @@ impl ProjectApi {
             project_id,
             JsonRequest {
                 operation: Operation::BodylessMutation,
-                method: Method::DELETE,
+                method,
                 path,
                 query: &[],
                 idempotency_key: Some(idempotency_key),
@@ -706,6 +733,7 @@ pub enum ProjectFailure {
     IdempotencyConflict,
     SourceConflict,
     RepositoryUnavailable,
+    ProjectArchived,
     Conflict,
     Unreachable(UnreachableCategory),
     Protocol { credential_rejected: bool },
@@ -777,6 +805,7 @@ fn classify_project_response(response: &ReceivedResponse, operation: Operation) 
         (StatusCode::CONFLICT, IDEMPOTENCY_CONFLICT) => ProjectFailure::IdempotencyConflict,
         (StatusCode::CONFLICT, SOURCE_CONFLICT) => ProjectFailure::SourceConflict,
         (StatusCode::CONFLICT, REPOSITORY_UNAVAILABLE) => ProjectFailure::RepositoryUnavailable,
+        (StatusCode::CONFLICT, PROJECT_ARCHIVED) => ProjectFailure::ProjectArchived,
         (StatusCode::CONFLICT, _) => ProjectFailure::Conflict,
         _ => ProjectFailure::protocol(credential_rejected),
     }
@@ -835,7 +864,11 @@ fn validate_project(mut project: Project) -> Result<Project, ProjectFailure> {
     let timestamps_valid = OffsetDateTime::parse(&project.created_at, &Rfc3339)
         .ok()
         .zip(OffsetDateTime::parse(&project.updated_at, &Rfc3339).ok())
-        .is_some_and(|(created, updated)| updated >= created);
+        .is_some_and(|(created, updated)| updated >= created)
+        && project
+            .archived_at
+            .as_deref()
+            .is_none_or(|archived| OffsetDateTime::parse(archived, &Rfc3339).is_ok());
     let repository_valid = project
         .repository
         .as_deref()
@@ -1033,5 +1066,31 @@ mod tests {
                 Err(ProjectFailure::protocol(false))
             );
         }
+    }
+
+    // REQ-PROJECT-91: a project decodes with or without `archivedAt`, keeps the
+    // time it carries, and a member that is not a time is refused.
+    #[test]
+    fn a_project_decodes_with_or_without_archived_at() {
+        let decode = |archived_at: Option<&str>| {
+            let mut value =
+                serde_json::to_value(project_with_pools(vec![pool(0)]).unwrap()).unwrap();
+            if let Some(archived_at) = archived_at {
+                value["archivedAt"] = serde_json::json!(archived_at);
+            }
+            validate_project(serde_json::from_value(value).unwrap())
+        };
+        assert_eq!(decode(None).unwrap().archived_at, None);
+        assert_eq!(
+            decode(Some("2026-02-01T00:00:00Z"))
+                .unwrap()
+                .archived_at
+                .as_deref(),
+            Some("2026-02-01T00:00:00Z")
+        );
+        assert_eq!(
+            decode(Some("yesterday")),
+            Err(ProjectFailure::protocol(false))
+        );
     }
 }

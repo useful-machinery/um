@@ -2679,6 +2679,34 @@ pub(super) fn create_args(json: bool) -> Vec<&'static str> {
     args
 }
 
+// REQ-RUN-80
+#[test]
+fn create_in_an_archived_project_is_a_definite_admission_rejection() {
+    let (server, _directory, credential_path) = prepared_run(vec![problem_http_response(
+        "409 Conflict",
+        serde_json::json!({
+            "type": "https://api.usefulmachinery.com/problems/project-archived",
+            "title": "server title sentinel", "status": 409,
+            "reason": "project-archived"
+        }),
+    )]);
+    let output = run_with_env(
+        &create_args(true),
+        &deployment_environment(&server.api_url, &credential_path),
+    );
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["outcome"], "error");
+    assert_eq!(result["error"]["code"], "admission_rejected");
+    assert_eq!(result["error"]["httpStatus"], 409);
+    assert_eq!(
+        result["error"]["problemType"],
+        "https://api.usefulmachinery.com/problems/project-archived"
+    );
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("server title sentinel"));
+    assert_eq!(server.finish().len(), 1);
+}
+
 pub(super) fn sha256(bytes: &[u8]) -> [u8; 32] {
     let observed = digest(&SHA256, bytes);
     let mut sha256 = [0_u8; 32];

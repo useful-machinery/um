@@ -1114,6 +1114,230 @@ fn project_human_output_lists_every_pool_of_the_set() {
     );
 }
 
+const ARCHIVED_AT: &str = "2026-09-06T08:30:00Z";
+
+fn archived_project_body() -> serde_json::Value {
+    let mut project = project_body("widget", true, Some(repository_body("acme/widget", "main")));
+    project["archivedAt"] = serde_json::json!(ARCHIVED_AT);
+    project["updatedAt"] = serde_json::json!(ARCHIVED_AT);
+    project
+}
+
+fn active_project_body() -> serde_json::Value {
+    project_body("widget", true, Some(repository_body("acme/widget", "main")))
+}
+
+fn assert_bodyless_post(request: &str, verb: &str) {
+    assert!(
+        request.starts_with(&format!(
+            "POST /api/v1/organizations/{ORGANIZATION}/projects/{PROJECT_ID}/{verb} HTTP/1.1\r\n"
+        )),
+        "{request}"
+    );
+    assert_eq!(request.split_once("\r\n\r\n").unwrap().1, "");
+    let key = header_value(request, "idempotency-key");
+    assert_eq!(key.len(), 64);
+    assert!(key.bytes().all(|byte| byte.is_ascii_hexdigit()));
+}
+
+// REQ-PROJECT-75, REQ-PROJECT-79
+#[test]
+fn project_archive_and_unarchive_post_once_without_a_body() {
+    for (verb, outcome, project) in [
+        ("archive", "archived", archived_project_body()),
+        ("unarchive", "unarchived", active_project_body()),
+    ] {
+        let (server, _directory, credential_path) =
+            prepared_project(vec![project_response("200 OK", project, false)]);
+
+        let output = run_project(
+            &[
+                "project",
+                verb,
+                ORGANIZATION,
+                PROJECT_ID,
+                "--json",
+                "--allow-insecure-http",
+            ],
+            &server,
+            &credential_path,
+        );
+
+        let value = assert_json_success(&output, outcome);
+        assert_eq!(value["project"]["id"], PROJECT_ID);
+        if verb == "archive" {
+            assert_eq!(value["project"]["archivedAt"], ARCHIVED_AT);
+        } else {
+            assert!(value["project"].get("archivedAt").is_none());
+        }
+        let requests = server.finish();
+        assert_eq!(requests.len(), 1);
+        assert_bodyless_post(&requests[0], verb);
+    }
+}
+
+// REQ-PROJECT-78
+#[test]
+fn project_human_output_shows_the_archive_time_only_when_archived() {
+    for (verb, project, archived_line) in [
+        (
+            "archive",
+            archived_project_body(),
+            Some(format!("archived: {ARCHIVED_AT}")),
+        ),
+        ("unarchive", active_project_body(), None),
+    ] {
+        let (server, _directory, credential_path) =
+            prepared_project(vec![project_response("200 OK", project, false)]);
+
+        let output = run_project(
+            &[
+                "project",
+                verb,
+                ORGANIZATION,
+                PROJECT_ID,
+                "--allow-insecure-http",
+            ],
+            &server,
+            &credential_path,
+        );
+
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(output.stderr.is_empty());
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        let archived: Vec<_> = stdout
+            .lines()
+            .filter(|line| line.starts_with("archived"))
+            .collect();
+        assert_eq!(archived, archived_line.as_slice());
+        server.finish();
+    }
+}
+
+// REQ-PROJECT-76, REQ-PROJECT-78
+#[test]
+fn project_list_includes_archived_projects_only_when_asked_and_marks_them() {
+    let mut active = active_project_body();
+    active["id"] = serde_json::json!("prj_01k0z6r1w8f4jy2m7q9v3x5abd");
+    let page = serde_json::json!({"items": [archived_project_body(), active]});
+    let (server, _directory, credential_path) = prepared_project(vec![
+        json_http_response("200 OK", page),
+        json_http_response("200 OK", serde_json::json!({"items": []})),
+    ]);
+
+    let included = run_project(
+        &[
+            "project",
+            "list",
+            ORGANIZATION,
+            "--include-archived",
+            "--allow-insecure-http",
+        ],
+        &server,
+        &credential_path,
+    );
+    let default = run_project(
+        &["project", "list", ORGANIZATION, "--allow-insecure-http"],
+        &server,
+        &credential_path,
+    );
+
+    for output in [&included, &default] {
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(output.stderr.is_empty());
+    }
+    let stdout = String::from_utf8(included.stdout).unwrap();
+    let entries: Vec<_> = stdout
+        .lines()
+        .filter(|line| line.starts_with("project: "))
+        .collect();
+    assert_eq!(
+        entries,
+        [
+            format!("project: {PROJECT_ID} · name: widget · readiness: ready · archived"),
+            "project: prj_01k0z6r1w8f4jy2m7q9v3x5abd · name: widget · readiness: ready".to_owned(),
+        ]
+    );
+    let requests = server.finish();
+    assert!(requests[0].starts_with(&format!(
+        "GET /api/v1/organizations/{ORGANIZATION}/projects?includeArchived=true HTTP/1.1\r\n"
+    )));
+    assert!(requests[1].starts_with(&format!(
+        "GET /api/v1/organizations/{ORGANIZATION}/projects HTTP/1.1\r\n"
+    )));
+}
+
+// REQ-PROJECT-81
+#[test]
+fn project_archive_retries_one_lost_response_with_the_same_key() {
+    let (server, _directory, credential_path) = prepared_project(vec![
+        Vec::new(),
+        project_response("200 OK", archived_project_body(), false),
+    ]);
+
+    let output = run_project(
+        &[
+            "project",
+            "archive",
+            ORGANIZATION,
+            PROJECT_ID,
+            "--json",
+            "--allow-insecure-http",
+        ],
+        &server,
+        &credential_path,
+    );
+
+    assert_json_success(&output, "archived");
+    let requests = server.finish();
+    assert_eq!(requests.len(), 2);
+    for request in &requests {
+        assert_bodyless_post(request, "archive");
+    }
+    assert_eq!(
+        header_value(&requests[0], "idempotency-key"),
+        header_value(&requests[1], "idempotency-key")
+    );
+}
+
+// REQ-PROJECT-82
+#[test]
+fn project_archive_answered_with_another_project_is_an_invalid_response() {
+    let mut other_project = archived_project_body();
+    other_project["id"] = serde_json::json!("prj_01k0z6r1w8f4jy2m7q9v3x5abd");
+    let (server, _directory, credential_path) =
+        prepared_project(vec![project_response("200 OK", other_project, false)]);
+
+    let output = run_project(
+        &[
+            "project",
+            "archive",
+            ORGANIZATION,
+            PROJECT_ID,
+            "--json",
+            "--allow-insecure-http",
+        ],
+        &server,
+        &credential_path,
+    );
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stderr.is_empty());
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()["outcome"],
+        "invalid_response"
+    );
+    server.finish();
+}
+
 // REQ-PROJECT-80
 #[test]
 fn project_api_errors_have_closed_json_outcomes_and_exit_codes() {
@@ -1226,6 +1450,27 @@ fn project_api_errors_have_closed_json_outcomes_and_exit_codes() {
             "https://api.usefulmachinery.com/problems/provider-unavailable",
             "provider_unavailable",
             4,
+        ),
+        (
+            vec![
+                "project",
+                "rename",
+                ORGANIZATION,
+                PROJECT_ID,
+                "--name",
+                "widget",
+            ],
+            "409 Conflict",
+            "https://api.usefulmachinery.com/problems/project-archived",
+            "project_archived",
+            1,
+        ),
+        (
+            vec!["project", "unarchive", ORGANIZATION, PROJECT_ID],
+            "409 Conflict",
+            "https://api.usefulmachinery.com/problems/quantity-limit-reached",
+            "quantity_limit_reached",
+            1,
         ),
     ];
 

@@ -5,7 +5,7 @@
 /*
  * Useful Machinery API
  *
- * The public programmatic API for Useful Machinery.  This contract exposes authenticated principal lookup, explicit human signup, self-service human profile and identity management, and the initial organization tenant boundary. A caller authenticates with an OAuth 2.0 access token issued by an authorization server configured for the deployment and intended for this API.  A failure is `application/problem+json` whose `type` is `https://api.usefulmachinery.com/problems/` followed by a stable slug. Any operation may answer the shared slugs `bad-request`, `idempotency-key-required`, `unauthorized`, `forbidden`, `not-found`, `idempotency-conflict`, `request-body-too-large`, `unsupported-media-type`, `retryable-conflict` and `internal-server-error` under the statuses it declares. An operation tagged Principals, Organizations or Delegations names every other slug it answers in its description.
+ * The public programmatic API for Useful Machinery.  This contract exposes authenticated principal lookup, explicit human signup, self-service human profile and identity management, and the initial organization tenant boundary. A caller authenticates with an OAuth 2.0 access token issued by an authorization server configured for the deployment and intended for this API.  A failure is `application/problem+json` whose `type` is `https://api.usefulmachinery.com/problems/` followed by a stable slug. Any operation may answer the shared slugs `bad-request`, `idempotency-key-required`, `unauthorized`, `forbidden`, `not-found`, `idempotency-conflict`, `request-body-too-large`, `unsupported-media-type`, `retryable-conflict` and `internal-server-error` under the statuses it declares. An operation tagged Principals, Organizations or Delegations names every other slug it answers in its description. `project-archived`, with `reason` `project-archived`, refuses a change an archived project does not take until it is unarchived; each operation that answers it names it.
  *
  * The version of the OpenAPI document: 0.1.0
  *
@@ -182,6 +182,7 @@ pub enum TestWebhookSubscriptionError {
     UnknownValue(serde_json::Value),
 }
 
+/// While the project is archived a create is 409 `webhook-conflict` with `reason` `project-archived` and records nothing; a completed request repeated with its key returns its recorded result.
 pub fn create_webhook_subscription(
     configuration: &configuration::Configuration,
     organization_ref: &str,
@@ -251,6 +252,7 @@ pub fn create_webhook_subscription(
     }
 }
 
+/// While the project is archived the change is 409 `webhook-conflict` with `reason` `project-archived` and changes nothing; a completed request repeated with its key returns its recorded result.
 pub fn delete_webhook_subscription(
     configuration: &configuration::Configuration,
     organization_ref: &str,
@@ -301,6 +303,7 @@ pub fn delete_webhook_subscription(
     }
 }
 
+/// While the project is archived the change is 409 `webhook-conflict` with `reason` `project-archived` and changes nothing; a completed request repeated with its key returns its recorded result.
 pub fn disable_webhook_subscription(
     configuration: &configuration::Configuration,
     organization_ref: &str,
@@ -370,6 +373,7 @@ pub fn disable_webhook_subscription(
     }
 }
 
+/// While the project is archived the change is 409 `webhook-conflict` with `reason` `project-archived` and changes nothing; a completed request repeated with its key returns its recorded result.
 pub fn enable_webhook_subscription(
     configuration: &configuration::Configuration,
     organization_ref: &str,
@@ -725,6 +729,7 @@ pub fn list_webhook_subscriptions(
     }
 }
 
+/// While the project is archived the change is 409 `webhook-conflict` with `reason` `project-archived` and changes nothing; a completed request repeated with its key returns its recorded result.
 pub fn patch_webhook_subscription(
     configuration: &configuration::Configuration,
     organization_ref: &str,
@@ -797,6 +802,7 @@ pub fn patch_webhook_subscription(
     }
 }
 
+/// While the project is archived a replay is 409 `webhook-conflict` with `reason` `project-archived` and queues nothing; a completed request repeated with its key returns its recorded result.
 pub fn replay_webhook_delivery(
     configuration: &configuration::Configuration,
     organization_ref: &str,
@@ -869,6 +875,7 @@ pub fn replay_webhook_delivery(
     }
 }
 
+/// While the project is archived the change is 409 `webhook-conflict` with `reason` `project-archived` and changes nothing; a completed request repeated with its key returns its recorded result.
 pub fn revoke_previous_webhook_secret(
     configuration: &configuration::Configuration,
     organization_ref: &str,
@@ -938,6 +945,7 @@ pub fn revoke_previous_webhook_secret(
     }
 }
 
+/// While the project is archived the change is 409 `webhook-conflict` with `reason` `project-archived` and changes nothing; a completed request repeated with its key returns its recorded result.
 pub fn rotate_webhook_secret(
     configuration: &configuration::Configuration,
     organization_ref: &str,
@@ -1007,6 +1015,7 @@ pub fn rotate_webhook_secret(
     }
 }
 
+/// While the project is archived a test is 409 `webhook-conflict` with `reason` `project-archived` and queues nothing; a completed request repeated with its key returns its recorded result.
 pub fn test_webhook_subscription(
     configuration: &configuration::Configuration,
     organization_ref: &str,
