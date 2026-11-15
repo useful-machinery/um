@@ -56,11 +56,13 @@ use um_execution::{
     MAXIMUM_AGENT_PROFILE_REPLACEMENT_BYTES,
 };
 use um_execution::{
-    CONTROL_CANCEL, CONTROL_INTERRUPT, CONTROL_STOP, CapturedValue, ChildCommitFailure,
-    ChildInputValue, ChildRunControl, ChildRunDispatcher, ChildRunOutcome, ChildRunParent,
-    ChildRunRequest, ChildRuns, ControlEvent, ControlsLock, EnteredWait, ExportValue,
-    LocalRetryBeginError, LocalRetryOpen, Mirror, RejectionDiagnostic, Scheduling, WaitKind,
-    WaitRecord, acquire_local_retry, adopted_child_outcome, append_control, attempt_controls,
+    AttemptControls, CONTROL_CANCEL, CONTROL_INTERRUPT, CONTROL_STOP, CapturedValue,
+    ChildCommitFailure, ChildInputValue, ChildRunControl, ChildRunDispatcher, ChildRunOutcome,
+    ChildRunParent, ChildRunRequest, ChildRuns, ContinuationDefinitionMode, ContinuationEdgeV1,
+    ContinuationReasonV1, ControlEvent, ControlsLock, EnteredWait, ExportValue,
+    LocalContinuationOpen, LocalRetryBeginError, LocalRetryOpen, Mirror, RejectionDiagnostic,
+    Scheduling, WaitKind, WaitRecord, acquire_local_continuation, acquire_local_retry,
+    admit_local_continuation_workflow, adopted_child_outcome, append_control, attempt_controls,
     await_child_start_gate, await_release_gate, await_settled_gate, position_path, read_controls,
     read_numbered_controls, stop_in_force, wait_payload,
 };
@@ -338,10 +340,13 @@ impl Command {
                 output.render_workflow_not_in_tree(&workflow.source.workflow_path)
             });
         }
-        // REQ-LOCALRUN-80, REQ-LOCALRUN-185: the stop names a step of the selected workflow
-        // of a run that records itself, before the run directory exists.
+        // REQ-LOCALRUN-80, REQ-LOCALRUN-185: the stop names a step of the selected workflow,
+        // or a `workflow` step of a nested workflow it names (REQ-WFEXEC-76), of a run that
+        // records itself, before the run directory exists.
         if let Some(step) = &self.stop_before {
-            if !workflow.definition.steps.contains_key(step) {
+            if !workflow.definition.steps.contains_key(step)
+                && !super::control::nested_step_ids(&workflow).contains(step)
+            {
                 return Err(super::super::super::CommandFailure::with_exit_code(
                     anyhow!("--stop-before names no step of the selected workflow"),
                     ExitCode::UsageError,
@@ -1217,6 +1222,10 @@ struct AttemptSettings<Hooks> {
     /// The control journals the command's signal observer reads, which the attempt's run
     /// directory and its children's join while they run (REQ-LOCALRUN-135).
     journals: ControlJournals,
+    /// For a child attempt, the root run its run belongs to and the path from the root to it
+    /// (INV-ENGINE-40), which a nested run's dispatcher carries (REQ-WFEXEC-74); `None` for a
+    /// root's own attempt, which is its own root.
+    root: Option<RunRoot>,
 }
 
 trait AttemptHooks {
@@ -1305,6 +1314,7 @@ pub(super) async fn execute_recovering_attempt(
             child: None,
             child_recovery,
             journals,
+            root: None,
         },
     )
     .await
@@ -1434,6 +1444,7 @@ async fn execute_attempt_phases(
         child,
         child_recovery,
         journals,
+        root,
     } = settings;
     let _journal = journals.watch(attempt.run()?.run_directory());
     let quiet = child.is_some();
@@ -1522,6 +1533,12 @@ async fn execute_attempt_phases(
     attempt.agents = agent_staging.clone();
     hooks.checkpoint(AttemptCheckpoint::BeforeHostStart)?;
 
+    // REQ-LOCALRUN-200: a nested run's stages present through the scope the nested run has
+    // in its root's progress stream.
+    let nested_presentation = match &child {
+        Some(ChildPresentation::Forwarding(presentation)) => Some(presentation.clone()),
+        _ => None,
+    };
     let run_clock = SystemObservationClock;
     let run_for_output = attempt.run()?;
     let prepared = initialize_execution_presentation(run_clock, || {
@@ -1654,13 +1671,29 @@ async fn execute_attempt_phases(
             .commit_port(diagnostics.clone(), accounting, artifacts.clone());
     // REQ-LOCALRUN-143: the text of the port's failed commit outlives the engine's port.
     let commit_failure_text = commit_port.failure_text();
-    let dispatcher = if quiet || !has_workflow_steps(workflow) {
+    // REQ-WFEXEC-74: a nested run, a child attempt whose workflow has `workflow` steps, runs
+    // its stages through a dispatcher of its own under the root it belongs to.
+    let dispatcher = if !has_workflow_steps(workflow) {
         None
     } else {
-        // REQ-WFEXEC-63, REQ-CONTINUE-75: the values the resolved waits leave this attempt.
-        let controls_directory = attempt.run()?.run_directory().to_owned();
+        // REQ-WFEXEC-63, REQ-CONTINUE-75: the values the resolved waits leave this attempt; a
+        // nested run has no controls of its own and reads the root's (REQ-WFEXEC-75,
+        // INV-ENGINE-40).
+        let run_directory = attempt.run()?.run_directory().to_owned();
+        let (root, nested) = match root {
+            Some(root) => (root.clone(), Some(root)),
+            None => (RunRoot::of(attempt.run()?, attempt.mirror.clone())?, None),
+        };
         let controls = blocking_operation(move || {
-            attempt_controls(&controls_directory, attempt_number).map_err(anyhow::Error::new)
+            match nested {
+                Some(RunRoot {
+                    run_directory: root,
+                    path,
+                    ..
+                }) => AttemptControls::nested(&root, &run_directory, attempt_number, &path),
+                None => attempt_controls(&run_directory, attempt_number),
+            }
+            .map_err(anyhow::Error::new)
         })
         .await
         .map_err(|error| match error {
@@ -1668,9 +1701,9 @@ async fn execute_attempt_phases(
             BlockingOperationError::WorkerUnavailable => anyhow!("read the run's controls"),
         })
         .context("read the run's controls")?;
+        let (mut context, replacement) = (controls.controls, controls.replacement);
         // REQ-WFEXEC-68: an abandoned fan-out resumes at the element of the child it left,
         // and a repair retry at the element of the repaired child it adopts (REQ-CONTINUE-75).
-        let mut context = controls.controls;
         if let Some((step, Some(item))) = child_recovery.as_ref().map(ChildRecovery::target) {
             context.resume_item = Some((step.to_owned(), item));
         }
@@ -1678,14 +1711,17 @@ async fn execute_attempt_phases(
             LocalChildRunDispatcher::new(
                 attempt.run()?,
                 admitted,
-                controls.replacement,
-                (child_recovery, attempt.mirror.clone()),
+                replacement,
+                (child_recovery, root),
                 journals.clone(),
-                // REQ-LOCALRUN-200: a child's steps reach the parent's progress stream; the
-                // terminal interface shows none of them.
-                match attempt.host.as_ref() {
-                    Some(ActiveRunHost::Standard(presentation)) => Some(presentation.clone()),
-                    _ => None,
+                // REQ-LOCALRUN-200: a child's steps reach the root's progress stream, a nested
+                // run's stage's under the nested run's path; the terminal interface shows none
+                // of them.
+                match (attempt.host.as_ref(), nested_presentation) {
+                    (Some(ActiveRunHost::Standard(presentation)), _) => {
+                        Some(ParentPresentation::Root(presentation.clone()))
+                    }
+                    (_, nested) => nested.map(ParentPresentation::Nested),
                 },
                 // REQ-LOCALRUN-207: a child's failed state commit refuses this attempt's
                 // later commits.
@@ -1809,6 +1845,14 @@ async fn execute_attempt_phases(
             };
             attempt.run = Some(owned_run);
             recorded.context("record the local workflow wait")?;
+            // REQ-WFEXEC-75: a nested run's wait, once its record is written, is its parent
+            // step's to carry.
+            if let Some(ActiveRunHost::Quiet(host)) = attempt.host.as_mut() {
+                host.outcome = Some(ChildRunOutcome::Waiting {
+                    wait: Box::new(record.clone()),
+                    interruption: wait.interrupted().cloned(),
+                });
+            }
             // REQ-LOCALRUN-191: `onWait`, once the wait record is written, for a wait entered.
             if !kept {
                 let waited = record.clone();
@@ -2329,7 +2373,7 @@ fn execution_context_with_profile_failures(
 
 /// A workflow with `workflow` steps is edge-scheduled (REQ-WFFORMAT-93), and only such a
 /// workflow runs children.
-fn has_workflow_steps(workflow: &ResolvedWorkflow) -> bool {
+pub(super) fn has_workflow_steps(workflow: &ResolvedWorkflow) -> bool {
     matches!(workflow.definition.scheduling, Scheduling::Edges { .. })
 }
 
@@ -2366,8 +2410,13 @@ fn child_run_outcome(
 /// new attempt in place, and an element whose child was never created runs afresh; a repair
 /// retry adopts the child an independent repair completed after its wait began
 /// (REQ-CONTINUE-75), and otherwise, for a repair wait's retry (REQ-CONTINUE-81), the failed
-/// child the wait names continues with the partition its preflight admitted. `item` is the
-/// fan-out element, at which the continuation resumes the step (REQ-WFEXEC-68).
+/// child the wait names continues with the partition its preflight admitted. A wait the root
+/// carries from a nested run continues that nested run in place from the nested step that
+/// waited, with the stage recovery its repair names (REQ-CONTINUE-92). An abandoned root's
+/// nested run that reads `running` continues in place the same way, from its running step or
+/// recorded edge, and one that reads `waiting` is carried as the wait it recorded without
+/// starting anything (REQ-CONTINUE-91). `item` is the fan-out element, at which the
+/// continuation resumes the step (REQ-WFEXEC-68).
 pub(super) enum ChildRecovery {
     Fresh {
         step: String,
@@ -2388,6 +2437,18 @@ pub(super) enum ChildRecovery {
         item: Option<u64>,
         continuation: Box<super::child_recovery::ChildContinuation>,
     },
+    Nested {
+        step: String,
+        item: Option<u64>,
+        continuation: Box<super::child_recovery::ChildContinuation>,
+        stage: Option<Box<ChildRecovery>>,
+    },
+    Waiting {
+        step: String,
+        item: Option<u64>,
+        directory: PathBuf,
+        wait: Box<WaitRecord>,
+    },
 }
 
 impl ChildRecovery {
@@ -2396,7 +2457,9 @@ impl ChildRecovery {
             Self::Fresh { step, item }
             | Self::Adopt { step, item, .. }
             | Self::Retry { step, item, .. }
-            | Self::Continue { step, item, .. } => (step, *item),
+            | Self::Continue { step, item, .. }
+            | Self::Nested { step, item, .. }
+            | Self::Waiting { step, item, .. } => (step, *item),
         }
     }
 }
@@ -2414,10 +2477,19 @@ fn entered_wait_record(
     run_directory: &Path,
     dispatcher: Option<&LocalChildRunDispatcher>,
 ) -> anyhow::Result<WaitRecord> {
+    // REQ-WFEXEC-75: the wait a step's nested run entered is the root's, built from the
+    // nested record when the step's child returned it.
+    if let Some(carried) = dispatcher.and_then(|dispatcher| dispatcher.carried_wait(wait.step())) {
+        return Ok(carried);
+    }
     // REQ-WFDEF-6: an interrupted wait's payload names the `control.interrupt` whose
-    // interruption the signal observer requested.
+    // interruption the signal observer requested. A nested run's stop is in the root's
+    // controls (REQ-WFEXEC-76).
     let control = if wait.kind() == WaitKind::Stop {
-        let controls = read_controls(run_directory).context("read the run's controls")?;
+        let controls_directory = dispatcher.map_or(run_directory, |dispatcher| {
+            &dispatcher.parent.root.run_directory
+        });
+        let controls = read_controls(controls_directory).context("read the run's controls")?;
         stop_in_force(&controls, wait.step()).cloned()
     } else if wait.interrupted().is_some() {
         dispatcher.and_then(|dispatcher| dispatcher.parent.journals.interrupting_control())
@@ -2444,6 +2516,51 @@ fn entered_wait_record(
         .context("record the local workflow wait")
 }
 
+/// The root run a run belongs to and the path from the root to that run, as a position names
+/// it (INV-ENGINE-40). A nested run is driven by its parent's step and owned by its root,
+/// whose run directory holds what a person or Cloud addresses; `onStage` names a child, a
+/// nested run's stage included, by its path, through the root's mirror (REQ-LOCALRUN-191).
+#[derive(Clone)]
+struct RunRoot {
+    /// The root's record, rewritten under the lock the root's attempt holds.
+    run: ChildRunParent,
+    run_directory: PathBuf,
+    path: Vec<serde_json::Value>,
+    /// The root attempt's mirror, which writes `onStage` as each child of the root or of a
+    /// nested run under it exits; a nested run has none of its own (REQ-LOCALRUN-191).
+    mirror: Option<Arc<Mirror>>,
+}
+
+impl RunRoot {
+    /// A root run's own: its run directory, no path and its attempt's mirror.
+    fn of(run: &LocalAttemptOwner, mirror: Option<Arc<Mirror>>) -> anyhow::Result<Self> {
+        Ok(Self {
+            run: run
+                .child_run_parent()
+                .map_err(anyhow::Error::new)
+                .context("prepare local child runs")?,
+            run_directory: run.run_directory().to_owned(),
+            path: Vec::new(),
+            mirror,
+        })
+    }
+
+    /// The root and path of the child a `workflow` step of this run starts for `step` and,
+    /// for a fan-out, element `item`: the same root, the path followed by `<step>` and
+    /// `{item: n}` (REQ-WFEXEC-68).
+    fn descend(&self, step: &str, item: Option<u64>) -> Self {
+        let mut path = self.path.clone();
+        path.push(serde_json::Value::String(step.to_owned()));
+        path.extend(item.map(|item| serde_json::json!({ "item": item })));
+        Self {
+            run: self.run.clone(),
+            run_directory: self.run_directory.clone(),
+            path,
+            mirror: self.mirror.clone(),
+        }
+    }
+}
+
 /// Runs a parent's `workflow` steps as child runs of files in the parent's pinned tree
 /// copy, in this process and awaited (REQ-WFEXEC-59, REQ-LOCALRUN-177).
 #[derive(Clone)]
@@ -2453,7 +2570,10 @@ struct LocalChildRunDispatcher {
 
 struct LocalChildRunParent {
     run: ChildRunParent,
-    run_directory: PathBuf,
+    /// The root run the dispatching run belongs to and the path from the root to it
+    /// (INV-ENGINE-40): the run itself and no path for a root's dispatcher, the root and
+    /// `[<step>]` or `[<step>, {item: n}]` for a nested run's (REQ-WFEXEC-74).
+    root: RunRoot,
     copy_root: PathBuf,
     execution_root: PathBuf,
     maximum_parallel_steps: usize,
@@ -2470,14 +2590,15 @@ struct LocalChildRunParent {
     /// The latest child run directory each step started and the fan-out element it ran
     /// for, for a wait's payload and step (REQ-WFEXEC-61).
     started: std::sync::Mutex<BTreeMap<String, (PathBuf, Option<u64>)>>,
-    /// The parent's mirror, which writes `onStage` as each child exits (REQ-LOCALRUN-191).
-    mirror: Option<Arc<Mirror>>,
+    /// The root's record of the wait each step's nested run entered in this attempt, which
+    /// the root writes as its own when the step's walk ends on it (REQ-WFEXEC-75).
+    carried: std::sync::Mutex<BTreeMap<String, WaitRecord>>,
     /// The journals the command's signal observer reads, which each child's run directory
     /// joins while its attempt runs (REQ-LOCALRUN-135).
     journals: ControlJournals,
-    /// The parent's progress stream, which carries each child's step state records
-    /// (REQ-LOCALRUN-200); none when the parent presents through the terminal interface.
-    presentation: Option<SystemPresentation>,
+    /// The root's progress stream, which carries each child's step state records
+    /// (REQ-LOCALRUN-200); none when the root presents through the terminal interface.
+    presentation: Option<ParentPresentation>,
     /// The parent's commit-port latch, set by a child whose own state commit failed so the
     /// parent commits nothing after it (REQ-LOCALRUN-207, INV-ENGINE-33).
     child_failure: Arc<OnceLock<ChildCommitFailure>>,
@@ -2488,9 +2609,9 @@ impl LocalChildRunDispatcher {
         run: &LocalAttemptOwner,
         admitted: &AdmittedWorkflow,
         replacement: Option<(String, serde_json::Value)>,
-        (recovery, mirror): (Option<ChildRecovery>, Option<Arc<Mirror>>),
+        (recovery, root): (Option<ChildRecovery>, RunRoot),
         journals: ControlJournals,
-        presentation: Option<SystemPresentation>,
+        presentation: Option<ParentPresentation>,
         child_failure: Arc<OnceLock<ChildCommitFailure>>,
     ) -> anyhow::Result<Self> {
         let parent = run
@@ -2507,7 +2628,7 @@ impl LocalChildRunDispatcher {
         Ok(Self {
             parent: Arc::new(LocalChildRunParent {
                 run: parent,
-                run_directory: run.run_directory().to_owned(),
+                root,
                 copy_root: run.tree_copy_directory(),
                 execution_root: admitted.execution().root().to_owned(),
                 maximum_parallel_steps: admitted
@@ -2519,7 +2640,7 @@ impl LocalChildRunDispatcher {
                 replacement,
                 recovery: std::sync::Mutex::new(recovery),
                 started: std::sync::Mutex::new(BTreeMap::new()),
-                mirror,
+                carried: std::sync::Mutex::new(BTreeMap::new()),
                 journals,
                 presentation,
                 child_failure,
@@ -2534,6 +2655,15 @@ impl LocalChildRunDispatcher {
             .lock()
             .ok()
             .and_then(|started| started.get(step).cloned())
+    }
+
+    /// The root's record of the wait `step`'s nested run entered in this attempt.
+    fn carried_wait(&self, step: &str) -> Option<WaitRecord> {
+        self.parent
+            .carried
+            .lock()
+            .ok()
+            .and_then(|carried| carried.get(step).cloned())
     }
 }
 
@@ -2559,6 +2689,16 @@ impl LocalChildRunParent {
             started.insert(request.step.clone(), (directory.to_owned(), request.item));
         }
         control.report_started(directory.to_owned());
+    }
+
+    /// Keeps the root's record of the wait `step`'s nested run entered (REQ-WFEXEC-75).
+    fn record_carried(&self, step: &str, wait: WaitRecord) -> bool {
+        self.carried
+            .lock()
+            .map(|mut carried| {
+                carried.insert(step.to_owned(), wait);
+            })
+            .is_ok()
     }
 
     fn take_recovery(&self, step: &str, item: Option<u64>) -> Option<ChildRecovery> {
@@ -2589,10 +2729,11 @@ impl ChildRunDispatcher for LocalChildRunDispatcher {
         child
     }
 
-    /// REQ-WFEXEC-62: a stop control in force for `step`. A controls directory that cannot
-    /// be read stops nothing.
+    /// REQ-WFEXEC-62, REQ-WFEXEC-76: a stop control in force for `step` in the root's
+    /// controls, which are a nested run's too. A controls directory that cannot be read stops
+    /// nothing.
     async fn stop_before(&self, step: &str) -> bool {
-        let run_directory = self.parent.run_directory.clone();
+        let run_directory = self.parent.root.run_directory.clone();
         let step = step.to_owned();
         blocking_operation(move || {
             read_controls(&run_directory).map(|controls| stop_in_force(&controls, &step).is_some())
@@ -2601,11 +2742,12 @@ impl ChildRunDispatcher for LocalChildRunDispatcher {
         .unwrap_or(false)
     }
 
-    /// REQ-WFEXEC-73: a withdrawal recorded while the run is live, read under the run lock
-    /// this attempt holds. Controls that cannot be read withdraw nothing.
+    /// REQ-WFEXEC-73, REQ-WFEXEC-76: a withdrawal recorded for the root while it is live, read
+    /// under the run lock the root's attempt holds, for a nested run's step as for the root's.
+    /// Controls that cannot be read withdraw nothing.
     async fn withdrawal_pending(&self) -> bool {
         let parent = Arc::clone(&self.parent);
-        blocking_operation(move || parent.run.withdrawal_pending())
+        blocking_operation(move || parent.root.run.withdrawal_pending())
             .await
             .unwrap_or(false)
     }
@@ -2636,6 +2778,20 @@ async fn run_local_child(
         parent.record_started(&request, &directory, &mut control);
         return outcome;
     }
+    if let Some(ChildRecovery::Waiting {
+        directory, wait, ..
+    }) = recovery
+    {
+        // REQ-CONTINUE-91: a nested run an abandoned root left waiting is carried as the wait
+        // it recorded; nothing starts.
+        parent.record_started(&request, &directory, &mut control);
+        let root = parent.root.descend(&request.step, request.item);
+        let waiting = ChildRunOutcome::Waiting {
+            wait,
+            interruption: None,
+        };
+        return carried_outcome(&parent, &request.step, &directory, &root, waiting);
+    }
     // REQ-WFEXEC-70, REQ-WFEXEC-72: a child whose preparation an interruption precedes is not
     // created and gets no attempt; the driver settles the step as an unstarted child, and the
     // dropped recovery releases what it held. An exited child is adopted above as before, and a
@@ -2643,26 +2799,61 @@ async fn run_local_child(
     if cancellation.interruption_requested() {
         return ChildRunOutcome::Interrupted;
     }
+    // REQ-WFEXEC-68: a nested run's stage moves the root's position to the stage's full path
+    // under the root's run lock before the stage is created; the nested run's own record
+    // names the stage alone.
+    if !parent.root.path.is_empty() {
+        let RunRoot { run, path, .. } = parent.root.descend(&request.step, request.item);
+        if blocking_operation(move || run.rewrite_position(path))
+            .await
+            .is_err()
+        {
+            return ChildRunOutcome::Rejected {
+                code: "child_run_directory_unavailable".to_owned(),
+            };
+        }
+    }
     let preparation_parent = Arc::clone(&parent);
     let preparation_request = request.clone();
     let preparation_cancellation = cancellation.clone();
-    let (prepared, leaf) = match recovery {
-        Some(ChildRecovery::Retry { directory, .. }) => (
+    // REQ-CONTINUE-81, INV-ENGINE-27: the failed child the repair wait named, whose
+    // continuation its preflight admitted and still holds locked; REQ-CONTINUE-92: likewise
+    // the nested run the root's carried wait named, whose first attempt takes over the
+    // recovery of its stage.
+    let mut stage = None;
+    let (recovery, continuation) = match recovery {
+        Some(ChildRecovery::Continue { continuation, .. }) => (None, Some(continuation)),
+        Some(ChildRecovery::Nested {
+            continuation,
+            stage: recovered,
+            ..
+        }) => {
+            stage = recovered.map(|recovered| *recovered);
+            (None, Some(continuation))
+        }
+        recovery => (recovery, None),
+    };
+    let (prepared, leaf) = match (recovery, continuation) {
+        (_, Some(continuation)) => {
+            let leaf = match continuation.reason() {
+                ContinuationReasonV1::Retry => ExecutionLeaf::Retry,
+                _ => ExecutionLeaf::Resume,
+            };
+            (
+                blocking_operation(move || {
+                    super::child_recovery::begin(
+                        *continuation,
+                        &preparation_request,
+                        preparation_cancellation,
+                    )
+                })
+                .await,
+                leaf,
+            )
+        }
+        (Some(ChildRecovery::Retry { directory, .. }), None) => (
             blocking_operation(move || {
                 prepare_child_retry(&preparation_parent, &directory, preparation_cancellation)
-            })
-            .await,
-            ExecutionLeaf::Retry,
-        ),
-        // REQ-CONTINUE-81, INV-ENGINE-27: the failed child the repair wait named, whose
-        // continuation its preflight admitted and still holds locked.
-        Some(ChildRecovery::Continue { continuation, .. }) => (
-            blocking_operation(move || {
-                super::child_recovery::begin(
-                    *continuation,
-                    &preparation_request,
-                    preparation_cancellation,
-                )
             })
             .await,
             ExecutionLeaf::Retry,
@@ -2679,7 +2870,7 @@ async fn run_local_child(
             ExecutionLeaf::Run,
         ),
     };
-    let (workflow, admitted, owned_run) = match prepared {
+    let mut prepared = match prepared {
         Ok(prepared) => prepared,
         Err(BlockingOperationError::Operation(code)) => {
             return ChildRunOutcome::Rejected { code };
@@ -2690,79 +2881,110 @@ async fn run_local_child(
             };
         }
     };
-    parent.record_started(&request, owned_run.run_directory(), &mut control);
-    let copy_root = owned_run.tree_copy_directory();
-    let mut attempt = AttemptTeardown::new(owned_run, failure_outcome(&workflow.definition), None);
-    let Ok(admitted) = bind_tree_copy(admitted, &copy_root) else {
-        attempt.teardown().await;
-        return ChildRunOutcome::Interrupted;
-    };
-    // REQ-LOCALRUN-200: a fresh, retried or continued child's steps reach the parent's
-    // progress stream under the parent's step and element. A child file whose definition the
-    // stream cannot describe stays silent rather than failing the child.
-    let presentation = parent
-        .presentation
-        .as_ref()
-        .and_then(|presentation| {
-            presentation
-                .child_scope(&workflow, &request.step, request.item)
-                .ok()
-        })
-        .map_or(ChildPresentation::Silent, ChildPresentation::Forwarding);
-    let result = execute_attempt_phases(
-        &workflow,
-        &admitted,
-        &cancellation,
-        &mut attempt,
-        AttemptSettings {
-            presentation_config: child_presentation_config(),
-            leaf,
-            hooks: (|_| Ok(()), WorkflowTerminalHost::start, || None),
-            child: Some(presentation),
-            child_recovery: None,
-            journals: parent.journals.clone(),
-        },
-    )
-    .await;
-    if let Err(error) = result {
-        // REQ-LOCALRUN-207, INV-ENGINE-33: a child whose state commit failed latches the
-        // failure and its text on the parent's commit port before the parent's step can
-        // settle from it.
-        if let Some(StateCommitFailed { failure, text, .. }) =
-            error.downcast_ref::<StateCommitFailed>()
-        {
-            let _ = parent.child_failure.set(ChildCommitFailure {
-                failure: *failure,
-                text: text.clone(),
-            });
+    let directory = prepared.2.run_directory().to_owned();
+    parent.record_started(&request, &directory, &mut control);
+    let root = parent.root.descend(&request.step, request.item);
+    // REQ-WFEXEC-74, REQ-WFEXEC-64: the step drives its child, so a nested run's attempt that
+    // ends `continued` is chained here, its next attempt begun in the same run directory, until
+    // the nested run ends; no other child ends `continued`.
+    let outcome = loop {
+        let (workflow, admitted, owned_run) = prepared;
+        let copy_root = owned_run.tree_copy_directory();
+        let mut attempt =
+            AttemptTeardown::new(owned_run, failure_outcome(&workflow.definition), None);
+        let Ok(admitted) = bind_tree_copy(admitted, &copy_root) else {
+            attempt.teardown().await;
+            return ChildRunOutcome::Interrupted;
+        };
+        // REQ-LOCALRUN-200: a fresh, retried or continued child's steps reach the root's
+        // progress stream under the parent's path, step and element. A child file whose
+        // definition the stream cannot describe stays silent rather than failing the child.
+        let presentation = parent
+            .presentation
+            .as_ref()
+            .and_then(|presentation| {
+                presentation
+                    .child_scope(&workflow, &request.step, request.item)
+                    .ok()
+            })
+            .map_or(ChildPresentation::Silent, ChildPresentation::Forwarding);
+        let result = execute_attempt_phases(
+            &workflow,
+            &admitted,
+            &cancellation,
+            &mut attempt,
+            AttemptSettings {
+                presentation_config: child_presentation_config(),
+                leaf,
+                hooks: (|_| Ok(()), WorkflowTerminalHost::start, || None),
+                child: Some(presentation),
+                child_recovery: stage.take(),
+                journals: parent.journals.clone(),
+                root: Some(root.clone()),
+            },
+        )
+        .await;
+        if let Err(error) = result {
+            // REQ-LOCALRUN-207, INV-ENGINE-33: a child whose state commit failed latches the
+            // failure and its text on the parent's commit port before the parent's step can
+            // settle from it.
+            if let Some(StateCommitFailed { failure, text, .. }) =
+                error.downcast_ref::<StateCommitFailed>()
+            {
+                let _ = parent.child_failure.set(ChildCommitFailure {
+                    failure: *failure,
+                    text: text.clone(),
+                });
+            }
+            attempt.teardown().await;
+            return ChildRunOutcome::Interrupted;
         }
-        attempt.teardown().await;
-        return ChildRunOutcome::Interrupted;
-    }
-    let outcome = match attempt.host.as_mut() {
-        Some(ActiveRunHost::Quiet(host)) => host.outcome.take(),
-        _ => None,
-    }
-    .unwrap_or(ChildRunOutcome::Interrupted);
-    // REQ-LOCALRUN-191: the stage transition's `onStage`, before the parent routes it.
+        // REQ-LOCALRUN-135: an interruption holds the next attempt back, as it does a root's,
+        // and the nested run stays `running`.
+        match attempt.continued.take() {
+            Some(edge) if !cancellation.interruption_requested() => {
+                let continuation_parent = Arc::clone(&parent);
+                let continued = directory.clone();
+                let continuation_cancellation = cancellation.clone();
+                prepared = match blocking_operation(move || {
+                    begin_nested_continuation(
+                        &continuation_parent,
+                        &continued,
+                        edge.into(),
+                        continuation_cancellation,
+                    )
+                })
+                .await
+                {
+                    Ok(prepared) => prepared,
+                    Err(_) => return ChildRunOutcome::Interrupted,
+                };
+            }
+            _ => {
+                break match attempt.host.as_mut() {
+                    Some(ActiveRunHost::Quiet(host)) => host.outcome.take(),
+                    _ => None,
+                }
+                .unwrap_or(ChildRunOutcome::Interrupted);
+            }
+        }
+    };
+    let outcome = carried_outcome(&parent, &request.step, &directory, &root, outcome);
+    // REQ-LOCALRUN-191: the stage transition's `onStage`, before the parent routes it, through
+    // the root's mirror and named by the child's path from the root, so a nested run's stage
+    // is `<step>[n].<stage>`.
     if let ChildRunOutcome::Exited {
         outcome, exports, ..
     } = &outcome
     {
-        let stage = match request.item {
-            Some(item) => position_path(&[
-                serde_json::Value::String(request.step.clone()),
-                serde_json::json!({ "item": item }),
-            ]),
-            None => request.step.clone(),
-        };
+        let stage = position_path(&root.path);
         let summary = match exports.get("summary") {
             Some(CapturedValue::Text(summary)) => Some(summary.as_ref().to_owned()),
             _ => None,
         };
         let outcome = outcome.clone();
         super::mirror::perform_blocking(
-            parent.mirror.as_ref(),
+            root.mirror.as_ref(),
             Box::new(move |mirror, target| {
                 mirror.stage(target, &stage, &outcome, summary.as_deref())
             }),
@@ -2770,6 +2992,121 @@ async fn run_local_child(
         .await;
     }
     outcome
+}
+
+/// REQ-WFEXEC-75: a nested run at `directory` that waits leaves the root its record of the
+/// wait, which the root writes once `step`'s walk ends on it; a wait it cannot carry is a child
+/// that ended without a result. Any other outcome is the step's as it is.
+fn carried_outcome(
+    parent: &LocalChildRunParent,
+    step: &str,
+    directory: &Path,
+    root: &RunRoot,
+    outcome: ChildRunOutcome,
+) -> ChildRunOutcome {
+    match outcome {
+        ChildRunOutcome::Waiting { wait, interruption } => {
+            let carried = carried_wait_record(&wait, directory, root, step)
+                .is_some_and(|carried| parent.record_carried(step, carried));
+            if carried {
+                ChildRunOutcome::Waiting { wait, interruption }
+            } else {
+                ChildRunOutcome::Interrupted
+            }
+        }
+        outcome => outcome,
+    }
+}
+
+/// The root's record of the wait `nested` the nested run at `directory` entered, which the
+/// root's `step` carries at the nested run's path `root.path` (REQ-WFEXEC-75): its `child`
+/// made relative to the root's run directory.
+fn carried_wait_record(
+    nested: &WaitRecord,
+    directory: &Path,
+    root: &RunRoot,
+    step: &str,
+) -> Option<WaitRecord> {
+    let child = match nested.payload.get("child") {
+        Some(child) => Some(
+            directory
+                .join(child.as_str()?)
+                .strip_prefix(&root.run_directory)
+                .ok()?
+                .to_str()?
+                .to_owned(),
+        ),
+        None => None,
+    };
+    WaitRecord::carried(nested, &root.path, step, child).ok()
+}
+
+/// The next attempt of the nested run at `directory`, whose latest attempt ended `continued`
+/// on `edge` (REQ-WFEXEC-74): begun in the same run directory from the edge's target as
+/// `um workflow run resume` begins a root's (REQ-WFEXEC-64, REQ-CONTINUE-78), with reason
+/// `edge`, its own definition and retained inputs and its unchanged tree copy, admitted under
+/// the parent's execution root, limits and environment. A limited edge is counted in the
+/// nested run's own `run.json` as the attempt begins. A refusal is the child's code.
+fn begin_nested_continuation(
+    parent: &LocalChildRunParent,
+    directory: &Path,
+    edge: ContinuationEdgeV1,
+    cancellation: CancellationSource,
+) -> Result<(ResolvedWorkflow, AdmittedWorkflow, LocalAttemptOwner), String> {
+    const UNAVAILABLE: &str = "child_continuation_unavailable";
+    let pending = match acquire_local_continuation(directory) {
+        Ok(LocalContinuationOpen::Acquired(pending)) => *pending,
+        Ok(LocalContinuationOpen::Rejected(rejection)) => {
+            return Err(rejection.reason().as_str().to_owned());
+        }
+        Err(_) => return Err(UNAVAILABLE.to_owned()),
+    };
+    if !super::resume::still_continues(&pending, &edge) {
+        return Err(UNAVAILABLE.to_owned());
+    }
+    let tree = match pending.verify_tree_copy() {
+        Some(Ok(tree)) => tree,
+        Some(Err(_)) => return Err("tree_copy_modified".to_owned()),
+        None => return Err("workflow_step_requires_tree".to_owned()),
+    };
+    let workflow = pending.previous_definition().clone();
+    let from = vec![edge.target.clone()];
+    let reexecuted = pending
+        .candidate_reexecuted_steps(&workflow, &from)
+        .ok_or_else(|| UNAVAILABLE.to_owned())?;
+    let context = child_execution_context(parent, &workflow, tree, cancellation)?
+        .with_continuation_reexecuted_steps(&reexecuted);
+    let context = if workflow.requires_git_capture() {
+        context.with_local_git_baseline(pending.git_baseline())
+    } else {
+        context
+    };
+    let admitted = admit_local_continuation_workflow(
+        workflow.clone(),
+        pending.candidate_inputs(&workflow),
+        context,
+    )
+    .map_err(|failures| {
+        failures
+            .first()
+            .map_or_else(|| UNAVAILABLE.to_owned(), child_admission_code)
+    })?;
+    pending
+        .validate_execution_root(&admitted)
+        .map_err(|_| UNAVAILABLE.to_owned())?;
+    let owned = pending
+        .begin(
+            &admitted,
+            from,
+            ContinuationDefinitionMode::Inherited,
+            ContinuationReasonV1::Edge,
+            Some(edge),
+        )
+        .map_err(|_| UNAVAILABLE.to_owned())?;
+    let admitted = owned
+        .bind_continuation_context(admitted)
+        .map_err(|_| UNAVAILABLE.to_owned())?;
+    Ok((workflow, admitted, owned))
 }
 
 /// The admission context of a child: the parent's execution root, limits and admitted
@@ -3724,6 +4061,30 @@ impl CoordinatorClock for SystemExecutionClock {
 }
 
 type SystemPresentation = WorkflowRunPresentation<io::Stdout, io::Stderr, SystemObservationClock>;
+type SystemChildPresentation = ChildRunPresentation<io::Stdout, io::Stderr, SystemObservationClock>;
+
+/// Where a dispatcher's children present (REQ-LOCALRUN-200): a root's progress stream, or the
+/// scope a nested run has in its root's, which its stages extend by the nested step
+/// (REQ-WFEXEC-74, INV-ENGINE-40).
+#[derive(Clone)]
+enum ParentPresentation {
+    Root(SystemPresentation),
+    Nested(SystemChildPresentation),
+}
+
+impl ParentPresentation {
+    fn child_scope(
+        &self,
+        workflow: &ResolvedWorkflow,
+        step: &str,
+        item: Option<u64>,
+    ) -> Result<SystemChildPresentation, PresentationFailure> {
+        match self {
+            Self::Root(presentation) => presentation.child_scope(workflow, step, item),
+            Self::Nested(presentation) => presentation.child_scope(workflow, step, item),
+        }
+    }
+}
 
 #[derive(Clone)]
 enum RunExecutionObserver {
@@ -3748,7 +4109,7 @@ impl RunExecutionObserver {
 #[derive(Clone)]
 enum ChildPresentation {
     Silent,
-    Forwarding(ChildRunPresentation<io::Stdout, io::Stderr, SystemObservationClock>),
+    Forwarding(SystemChildPresentation),
 }
 
 impl ExecutionObserver<ExecutionInstant> for ChildPresentation {
@@ -4890,6 +5251,7 @@ mod tests {
                     child: None,
                     child_recovery: None,
                     journals: ControlJournals::default(),
+                    root: None,
                     hooks: (
                         move |point| {
                             if Some(point) == target {
@@ -4986,6 +5348,7 @@ mod tests {
                 child: None,
                 child_recovery: None,
                 journals: ControlJournals::default(),
+                root: None,
                 hooks: (
                     |_| Ok(()),
                     |view, cancellation, color| {
@@ -5082,6 +5445,7 @@ mod tests {
                     child: None,
                     child_recovery: None,
                     journals: ControlJournals::default(),
+                    root: None,
                     hooks: (
                         |_| Ok(()),
                         |view, cancellation, color| {

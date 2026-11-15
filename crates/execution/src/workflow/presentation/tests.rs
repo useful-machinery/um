@@ -233,6 +233,11 @@ struct Fixture {
 
 impl Fixture {
     fn new(source: &str) -> Self {
+        Self::with_files(source, &[])
+    }
+
+    /// A fixture whose `workflow.yaml` is `source`, beside the other files a tree names.
+    fn with_files(source: &str, files: &[(&str, &str)]) -> Self {
         let temporary = tempfile::tempdir().unwrap();
         let source_root = temporary.path().join("source");
         let execution_root = temporary.path().join("execution");
@@ -247,6 +252,9 @@ impl Fixture {
             std::fs::create_dir(directory).unwrap();
         }
         std::fs::write(source_root.join("workflow.yaml"), source).unwrap();
+        for (name, contents) in files {
+            std::fs::write(source_root.join(name), contents).unwrap();
+        }
         let workflow = resolution::resolve(&source_root, Path::new("workflow.yaml")).unwrap();
         let digest = workflow.content_digest.clone();
         let admitted = admit_workflow(
@@ -1980,7 +1988,20 @@ steps:
         .await;
     presentation.flush_pending().await;
 
-    let records = stdout
+    assert_eq!(
+        step_records(&stdout),
+        [
+            "a start cmd",
+            "a[2].produce start cmd",
+            "a[2].produce done exit"
+        ]
+    );
+    assert!(presentation.failure().is_none());
+}
+
+/// The scope, state and first detail word of each record in a plain stream.
+fn step_records(stdout: &SharedWriter) -> Vec<String> {
+    stdout
         .text()
         .lines()
         .filter(|line| line.starts_with('['))
@@ -1991,13 +2012,112 @@ steps:
                 .collect::<Vec<_>>()
                 .join(" ")
         })
-        .collect::<Vec<_>>();
+        .collect()
+}
+
+/// A stage that runs `decide` and routes on its verdict.
+const NESTED_STAGE: &str = "schemaVersion: 1
+outcomes: [worked, failed]
+outcome:
+  from: outputs.decide.verdict
+  onFailure: failed
+steps:
+  decide:
+    kind: cmd
+    command:
+      argv: [\"true\"]
+    outputs:
+      verdict:
+        kind: text
+        from: path
+        path: verdict.txt
+";
+
+/// A nested workflow (REQ-WFEXEC-74) whose stages `ask` and `work` are each `NESTED_STAGE`.
+fn nested_fixture() -> Fixture {
+    Fixture::with_files(
+        "schemaVersion: 1
+outcomes: [checked, failed]
+steps:
+  ask:
+    kind: workflow
+    workflow: ask.yaml
+    on:
+      worked: work
+      failed: exit.failed
+  work:
+    kind: workflow
+    workflow: work.yaml
+    on:
+      worked: exit.checked
+      failed: exit.failed
+",
+        &[("ask.yaml", NESTED_STAGE), ("work.yaml", NESTED_STAGE)],
+    )
+}
+
+// REQ-LOCALRUN-200: a stage of a nested run under element 2 of `outer` presents its step
+// records at its path from the root, `outer[2].work.<stage step>`; the nested run's own steps
+// present nothing, and a plain child's scope keeps `<step>[n].<child step>`.
+#[tokio::test]
+async fn a_nested_runs_stage_writes_its_step_records_under_its_full_path() {
+    let parent = Fixture::new(workflow_source());
+    let nested = nested_fixture();
+    let work = Fixture::new(NESTED_STAGE);
+    let child = Fixture::new(
+        "schemaVersion: 1
+steps:
+  produce:
+    kind: cmd
+    command:
+      argv: [\"true\"]
+",
+    );
+    let stdout = SharedWriter::default();
+    let presentation = WorkflowRunOutput::new(
+        config(RequestedPresentationMode::Plain, ColorChoice::Never),
+        stdout.clone(),
+        SharedWriter::default(),
+    )
+    .start(
+        &parent.workflow,
+        1,
+        TestClock::fixed("2026-08-02T12:01:44Z"),
+    )
+    .unwrap();
+    let plain = presentation
+        .child_scope(&child.workflow, "outer", Some(1))
+        .unwrap();
+    let nested_run = presentation
+        .child_scope(&nested.workflow, "outer", Some(2))
+        .unwrap();
+    let stage = nested_run
+        .child_scope(&work.workflow, "work", None)
+        .unwrap();
+
+    plain
+        .observe(step_transition("produce", StepStateKind::Starting, None))
+        .await;
+    nested_run
+        .observe(step_transition("work", StepStateKind::Starting, None))
+        .await;
+    stage
+        .observe(step_transition("decide", StepStateKind::Starting, None))
+        .await;
+    stage
+        .observe(step_transition("decide", StepStateKind::Succeeded, None))
+        .await;
+    nested_run
+        .observe(step_transition("work", StepStateKind::Succeeded, None))
+        .await;
+    presentation.flush_pending().await;
+
     assert_eq!(
-        records,
+        step_records(&stdout),
         [
-            "a start cmd",
-            "a[2].produce start cmd",
-            "a[2].produce done exit"
+            "outer[1].produce start cmd",
+            "outer[2].work.decide start cmd",
+            "outer[2].work.decide done exit"
         ]
     );
     assert!(presentation.failure().is_none());

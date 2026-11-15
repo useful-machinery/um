@@ -1820,6 +1820,23 @@ impl PendingLocalContinuation {
         ControlsLock::take(&self.root)
     }
 
+    /// The nested run a wait the root carries waits in when its payload names no child, as a
+    /// `stop` entered before the nested step started does (REQ-WFEXEC-76): the latest child of
+    /// the wait's root step at the element its `step` names, with that element, or `None` when
+    /// the latest child is at another element or there is none.
+    pub fn nested_run_at_element(
+        &self,
+        wait: &WaitRecord,
+    ) -> Result<Option<(PathBuf, Option<u64>)>, LocalRunDirectoryError> {
+        let Some(step) = wait.step.first().and_then(Value::as_str) else {
+            return Ok(None);
+        };
+        let element = wait.fan_out_element().map(|(_, item)| item);
+        Ok(latest_child_run(&self.normalized, step)?
+            .filter(|(_, _, item)| *item == element)
+            .map(|(directory, _, item)| (directory, item)))
+    }
+
     /// `end_waiting(WITHDRAWN_OUTCOME)`.
     pub fn withdraw(self) -> Result<(), LocalRunDirectoryError> {
         self.end_waiting(WITHDRAWN_OUTCOME)
@@ -1834,8 +1851,24 @@ impl PendingLocalContinuation {
     /// lock.
     pub fn end_waiting(self, outcome: &str) -> Result<(), LocalRunDirectoryError> {
         verify_retry_lock_identity(&self.root, &self.lock)?;
-        if read_optional_wait_record(&self.root)?.is_none() {
+        let Some(wait) = read_optional_wait_record(&self.root)? else {
             return Err(LocalRunDirectoryError::StateConflict);
+        };
+        // REQ-CONTINUE-92: a wait the root carries from a nested run ends that nested run's
+        // wait first, under the root's lock and then the nested run's; a carried `stop` names
+        // no child, so its nested run is the one at the wait's element (REQ-WFEXEC-76). A
+        // successor that imported the wait holds no nested run: the record's `payload.child`
+        // names its predecessor's (REQ-CONTINUE-80).
+        let nested = match wait_child(&wait) {
+            _ if self.imported_prior().is_some() => None,
+            WaitChild::Carried { locator, .. } => Some(self.normalized.join(locator)),
+            WaitChild::Absent if wait.is_carried() => self
+                .nested_run_at_element(&wait)?
+                .map(|(directory, _)| directory),
+            _ => None,
+        };
+        if let Some(nested) = nested {
+            end_carried_wait(&nested, &wait, outcome)?;
         }
         end_under_controls(&self.root, self.lock, || {
             let store = store_from_locked_snapshot(&self.root, &self.state)?;
@@ -2008,7 +2041,9 @@ impl PendingLocalContinuation {
     /// revision's, with `inputs` the run's inputs projected onto it (REQ-LOCALRUN-197): in
     /// this order, a record `position` naming no `workflow` step, or an element of a step
     /// that is not `forEach` (`position_unresolved`); the root wait record's `then`, or its
-    /// `onHandBack`, naming no step (`wait_target_unresolved`); the retained outcome of a
+    /// `onHandBack`, naming no step, or the nested step of a wait carried from a nested run
+    /// (REQ-CONTINUE-91) that is not a `workflow` step of the nested workflow its root step
+    /// names (`wait_target_unresolved`); the retained outcome of a
     /// `workflow` step the continuation from either target would inherit that is not a key of
     /// its `on` edges (`outcome_unrouted`); and a fan-out wait's element beyond the list its
     /// step now reads, or under a step that is not `forEach` (`items_unresolved`). One miss
@@ -2068,6 +2103,35 @@ impl PendingLocalContinuation {
                     target,
                     format!(
                         "The wait continues at step `{target}`, which the current revision does not define."
+                    ),
+                );
+            }
+        }
+        // REQ-CONTINUE-91: a wait the root carries from a nested run (REQ-WFEXEC-75) also
+        // continues at its nested step, which must be a `workflow` step of the nested workflow
+        // the waiting step names in this revision's tree.
+        if wait.is_carried()
+            && let (Some(step), Some(nested)) = (
+                wait.step.first().and_then(Value::as_str),
+                wait.step.last().and_then(Value::as_str),
+            )
+            && let Some(defined) = workflow_step(step)
+        {
+            let root = &workflow.source.source_root;
+            let defines =
+                super::resolution::resolve_workflow_file(root, &root.join(&defined.workflow))
+                    .is_ok_and(|child| {
+                        matches!(
+                            child.definition.steps.get(nested),
+                            Some(super::validated::ValidatedStep::Workflow(_))
+                        )
+                    });
+            if !defines {
+                miss(
+                    "wait_target_unresolved",
+                    nested,
+                    format!(
+                        "The wait continues at nested step `{nested}` of step `{step}`, which the current revision does not define."
                     ),
                 );
             }
@@ -2996,6 +3060,22 @@ pub struct LocalRunStatusSnapshot {
     pub continuation: LocalRetryEligibility,
 }
 
+impl LocalRunStatusSnapshot {
+    /// Where the run keeps the copy of the tree it was admitted from (REQ-LOCALRUN-170),
+    /// `<run directory>/workflow/tree`, as `LocalAttemptOwner::tree_copy_directory` names it;
+    /// a run admitted from a workflow file's closure, which has no run record, keeps none.
+    pub fn tree_copy_directory(&self) -> PathBuf {
+        run_tree_copy_directory(&self.run_directory)
+    }
+}
+
+/// The tree copy directory of the run at `run_directory` (REQ-LOCALRUN-170).
+fn run_tree_copy_directory(run_directory: &Path) -> PathBuf {
+    run_directory
+        .join(WORKFLOW_DIRECTORY)
+        .join(WORKFLOW_TREE_DIRECTORY)
+}
+
 pub trait DurableDeadline {
     fn deadline_utc(&self) -> OffsetDateTime;
 }
@@ -3120,9 +3200,17 @@ impl LocalAttemptOwner {
     /// INV-ENGINE-20): `attempts/<NNNNNN>/wait.json` and then, through
     /// `.private/wait.json.tmp` and a rename, the identical `wait.json` at the run root, both
     /// owner-only and read-only. The caller writes it before the run record reads `waiting`.
+    /// A wait the root carries from a nested run (`WaitRecord::is_carried`) first moves the run
+    /// record's `position` to the wait's `step`, the same path (REQ-WFEXEC-68, REQ-WFEXEC-75).
     pub fn record_wait(&self, record: &WaitRecord) -> Result<(), LocalRunDirectoryError> {
         if !record.is_valid() {
             return Err(LocalRunDirectoryError::WaitRecordInvalid);
+        }
+        if record.is_carried() {
+            rewrite_run_record(&self.state.root, |run| {
+                run.position.clone_from(&record.step);
+                Ok(())
+            })?;
         }
         let bytes = encode_json(record)?;
         write_new_immutable_file(&self.attempt_directory, WAIT_RECORD_FILE, &bytes)?;
@@ -3155,9 +3243,7 @@ impl LocalAttemptOwner {
     /// (REQ-LOCALRUN-170): `<run directory>/workflow/tree`, the root
     /// `AdmittedWorkflow::with_tree_copy` binds.
     pub fn tree_copy_directory(&self) -> PathBuf {
-        self.normalized
-            .join(WORKFLOW_DIRECTORY)
-            .join(WORKFLOW_TREE_DIRECTORY)
+        run_tree_copy_directory(&self.normalized)
     }
 
     pub fn private_directory(&self) -> &Path {
@@ -4303,6 +4389,25 @@ impl ChildRunParent {
     /// run lock its attempt holds.
     pub fn withdrawal_pending(&self) -> Result<bool, LocalRunDirectoryError> {
         read_withdrawal_pending(&self.normalized, &self.root)
+    }
+
+    /// Rewrites this run's `run.json` `position` to `position`, under the run lock its
+    /// attempt holds: a root's to the full path of the stage its nested run is about to
+    /// create, `[<step>, <nested>]` or `[<step>, {"item": n}, <nested>]` (REQ-WFEXEC-68). A
+    /// position that is not a step path is `StateInvalid` and changes nothing.
+    pub fn rewrite_position(&self, position: Vec<Value>) -> Result<(), LocalRunDirectoryError> {
+        let valid = position
+            .first()
+            .and_then(Value::as_str)
+            .is_some_and(super::schema_common::is_identifier)
+            && position.iter().all(super::run_record::is_position_element);
+        if !valid {
+            return Err(LocalRunDirectoryError::StateInvalid);
+        }
+        rewrite_run_record(&self.root, |record| {
+            record.position = position;
+            Ok(())
+        })
     }
 }
 
@@ -7089,11 +7194,136 @@ pub fn attempt_controls(
 ) -> Result<AttemptControls, LocalRunDirectoryError> {
     let (normalized, root) = open_run_root(requested)?;
     let mut resolved = AttemptControls::default();
-    let Some(record) = read_optional_run_record(&root)? else {
-        return Ok(resolved);
+    let waits = resolved_attempt_waits(&normalized, &root, attempt_number)?;
+    for (_, wait, control) in &waits {
+        resolved.record_answers(&wait.then, wait, control.as_ref());
+    }
+    resolved.continue_latest(waits.into_iter().last(), attempt_number);
+    Ok(resolved)
+}
+
+impl AttemptControls {
+    /// The control values attempt `attempt_number` of the nested run at `nested` starts with
+    /// (REQ-WFEXEC-75, INV-ENGINE-40). Controls are recorded on the root at `root` alone, the
+    /// nested run being at the root's path `prefix` (`[<step>]` or `[<step>, {"item": n}]`):
+    /// the wait copies of the nested run's earlier attempts are matched, by `kind@since` and
+    /// the full path, with the root's wait copies that carried them and read against the
+    /// control that resolved the root's (REQ-CONTINUE-92). `answers` come from every root wait
+    /// copy at `prefix` followed by one nested step, keyed by that step, so a fresh nested run
+    /// at the element, as a successor's carry starts, receives them too.
+    pub fn nested(
+        root: &Path,
+        nested: &Path,
+        attempt_number: u64,
+        prefix: &[Value],
+    ) -> Result<Self, LocalRunDirectoryError> {
+        let (root_normalized, root_handle) = open_run_root(root)?;
+        let root_attempts = read_optional_run_record(&root_handle)?
+            .map_or(0, |record| record.attempts)
+            .saturating_add(1);
+        let carried = resolved_attempt_waits(&root_normalized, &root_handle, root_attempts)?;
+        let nested_step = |wait: &WaitRecord| match wait.step.strip_prefix(prefix) {
+            Some([Value::String(step)]) => Some(step.clone()),
+            _ => None,
+        };
+        let mut resolved = Self::default();
+        for (_, wait, control) in &carried {
+            if let Some(step) = nested_step(wait) {
+                resolved.record_answers(&step, wait, control.as_ref());
+            }
+        }
+        let (_, nested_handle) = open_run_root(nested)?;
+        let mut latest = None;
+        for number in 1..attempt_number {
+            let Some(wait) = read_attempt_wait_record(&nested_handle, number)? else {
+                continue;
+            };
+            let control = carried
+                .iter()
+                .find(|(_, carrier, _)| {
+                    carrier.id() == wait.id()
+                        && carrier.step.strip_prefix(prefix) == Some(wait.step.as_slice())
+                })
+                .and_then(|(_, _, control)| control.clone());
+            latest = Some((number, wait, control));
+        }
+        resolved.continue_latest(latest, attempt_number);
+        Ok(resolved)
+    }
+
+    /// Keeps the answers of `wait` for `step` when `control` is the `control.answer` that
+    /// resolved it, the latest per step (REQ-WFEXEC-63).
+    fn record_answers(&mut self, step: &str, wait: &WaitRecord, control: Option<&ControlEvent>) {
+        if let Some(control) = control
+            && wait.kind == super::wait::WaitKind::Answer
+            && control.event == super::wait::CONTROL_ANSWER
+            && let Some(answers) = control
+                .payload
+                .as_ref()
+                .and_then(|payload| payload.get("answers"))
+        {
+            self.controls
+                .answers
+                .insert(step.to_owned(), Arc::new(answers.clone()));
+        }
+    }
+
+    /// Reads the latest earlier attempt's wait and the control that resolved it, if any: the
+    /// agent-profile replacement of a `control.retry` and, for the attempt `attempt_number`
+    /// immediately after it, the control's fields and the element it resumes at.
+    fn continue_latest(
+        &mut self,
+        latest: Option<(u64, WaitRecord, Option<ControlEvent>)>,
+        attempt_number: u64,
+    ) {
+        let Some((number, wait, Some(control))) = latest else {
+            return;
+        };
+        let target = match (control.event.as_str(), wait.on_hand_back) {
+            (super::wait::CONTROL_HAND_BACK, Some(step)) => step,
+            _ => wait.then,
+        };
+        let payload = control.payload.unwrap_or_default();
+        let fields = payload
+            .iter()
+            .filter_map(|(name, value)| Some((name.clone(), value.as_str()?.to_owned())))
+            .collect();
+        if control.event == super::wait::CONTROL_RETRY
+            && let Some(profiles) = payload.get("agentProfiles")
+        {
+            self.replacement = Some((target.clone(), profiles.clone()));
+        }
+        // Only the attempt that continues the wait reads its control's fields (REQ-WFEXEC-63)
+        // and resumes its fan-out at the recorded element (REQ-WFEXEC-68); one reaching the
+        // step after a later attempt ended without a wait (a backward or limited edge, an
+        // abandoned attempt) has no `wait.<field>` and starts at the first element.
+        if number + 1 != attempt_number {
+            return;
+        }
+        if let Some((step, item)) = fan_out_element(&wait.step)
+            && step == target
+        {
+            self.controls.resume_item = Some((target.clone(), item));
+        }
+        self.controls.wait = Some((target, fields));
+    }
+}
+
+/// Each wait copy of the attempts before `attempt_number` of the run at `root`, in attempt
+/// order, with the control that resolved it. An imported attempt's copy (REQ-LOCALRUN-195) is
+/// resolved by a control naming any run of the lineage: the run it was recorded under,
+/// copied with it, a successor that carried the wait (REQ-LOCALRUN-197) and recorded the
+/// control, or this run. A run without a record has none.
+fn resolved_attempt_waits(
+    normalized: &Path,
+    root: &OwnedFd,
+    attempt_number: u64,
+) -> Result<Vec<(u64, WaitRecord, Option<ControlEvent>)>, LocalRunDirectoryError> {
+    let Some(record) = read_optional_run_record(root)? else {
+        return Ok(Vec::new());
     };
-    let controls = super::wait::read_controls(&normalized)?;
-    let state = read_optional_state(&root)?;
+    let controls = super::wait::read_controls(normalized)?;
+    let state = read_optional_state(root)?;
     let imported = |number: u64| {
         state.as_ref().is_some_and(|state| {
             state
@@ -7102,9 +7332,9 @@ pub fn attempt_controls(
                 .any(|attempt| attempt.attempt_number == number && attempt.imported.is_some())
         })
     };
-    let mut latest = None;
+    let mut waits = Vec::new();
     for number in 1..attempt_number {
-        let Some(wait) = read_attempt_wait_record(&root, number)? else {
+        let Some(wait) = read_attempt_wait_record(root, number)? else {
             continue;
         };
         // The copy of a wait an imported attempt entered was resolved under some run of the
@@ -7130,51 +7360,27 @@ pub fn attempt_controls(
                 .flatten()
         }
         .cloned();
-        if let Some(control) = &control
-            && wait.kind == super::wait::WaitKind::Answer
-            && control.event == super::wait::CONTROL_ANSWER
-            && let Some(answers) = control
-                .payload
-                .as_ref()
-                .and_then(|payload| payload.get("answers"))
-        {
-            resolved
-                .controls
-                .answers
-                .insert(wait.then.clone(), Arc::new(answers.clone()));
-        }
-        latest = Some((number, wait, control));
+        waits.push((number, wait, control));
     }
-    if let Some((number, wait, Some(control))) = latest {
-        let target = match (control.event.as_str(), wait.on_hand_back) {
-            (super::wait::CONTROL_HAND_BACK, Some(step)) => step,
-            _ => wait.then,
-        };
-        let payload = control.payload.unwrap_or_default();
-        let fields = payload
-            .iter()
-            .filter_map(|(name, value)| Some((name.clone(), value.as_str()?.to_owned())))
-            .collect();
-        if control.event == super::wait::CONTROL_RETRY
-            && let Some(profiles) = payload.get("agentProfiles")
-        {
-            resolved.replacement = Some((target.clone(), profiles.clone()));
-        }
-        // Only the attempt that continues the wait reads its control's fields (REQ-WFEXEC-63)
-        // and resumes its fan-out at the recorded element (REQ-WFEXEC-68); one reaching the
-        // step after a later attempt ended without a wait (a backward or limited edge, an
-        // abandoned attempt) has no `wait.<field>` and starts at the first element.
-        if number + 1 != attempt_number {
-            return Ok(resolved);
-        }
-        if let Some((step, item)) = fan_out_element(&wait.step)
-            && step == target
-        {
-            resolved.controls.resume_item = Some((target.clone(), item));
-        }
-        resolved.controls.wait = Some((target, fields));
+    Ok(waits)
+}
+
+/// Ends the nested run at `nested` with `outcome` as `end_waiting` ends a waiting run, when it
+/// still waits on the wait its root carries as `wait` (REQ-CONTINUE-92); a nested run that
+/// waits on no such wait is left as it is. A nested run another process holds is
+/// `StateConflict`.
+fn end_carried_wait(
+    nested: &Path,
+    wait: &WaitRecord,
+    outcome: &str,
+) -> Result<(), LocalRunDirectoryError> {
+    let LocalContinuationOpen::Acquired(pending) = acquire_local_continuation(nested)? else {
+        return Err(LocalRunDirectoryError::StateConflict);
+    };
+    match pending.wait()? {
+        Some(nested_wait) if nested_wait.id() == wait.id() => pending.end_waiting(outcome),
+        _ => Ok(()),
     }
-    Ok(resolved)
 }
 
 /// What a wait record's `payload.child` names (REQ-CONTINUE-82, INV-ENGINE-27).
@@ -7186,6 +7392,17 @@ pub enum WaitChild {
     /// fan-out waiting at element n, `children/<step>/<n>/<NNNNNN>`, relative to the run
     /// directory (REQ-LOCALRUN-177).
     Owned { locator: PathBuf, item: Option<u64> },
+    /// A wait the root carries from a nested run (REQ-WFEXEC-75, REQ-CONTINUE-92), whose
+    /// `step` is the root step's path followed by the nested step: `locator` is the waiting
+    /// element's nested run in `Owned`'s canonical form, and `child`, the rest of the
+    /// payload's path, the nested step's own child relative to the nested run, canonical as a
+    /// plain step's.
+    Carried {
+        locator: PathBuf,
+        item: Option<u64>,
+        step: String,
+        child: PathBuf,
+    },
     /// Anything else: another step's or element's child, a path that is not canonical, or a
     /// value that is not a path.
     Unowned,
@@ -7193,45 +7410,69 @@ pub enum WaitChild {
 
 /// Reads the child `wait`'s payload names against the waiting step and element the record
 /// itself holds. The locator is evidence to check, never a path to follow: nothing is opened,
-/// and only the exact canonical form of the waiting step's child is `Owned`.
+/// and only the exact canonical form of the waiting step's child is `Owned`, or `Carried`
+/// under the waiting element's nested run for a carried wait.
 pub fn wait_child(wait: &WaitRecord) -> WaitChild {
     let Some(locator) = wait.payload.get("child") else {
         return WaitChild::Absent;
     };
-    let (step, element) = match (wait.step.as_slice(), wait.fan_out_element()) {
-        ([Value::String(step)], _) => (step.as_str(), None),
-        (_, Some((step, item))) => (step, Some(item)),
-        _ => return WaitChild::Unowned,
+    let (step, element, nested) = match wait.step.as_slice() {
+        [Value::String(step)] => (step.as_str(), None, None),
+        [Value::String(step), Value::String(nested)] => (step.as_str(), None, Some(nested)),
+        position => match (wait.fan_out_element(), position.get(2)) {
+            (Some((step, item)), None) => (step, Some(item), None),
+            (Some((step, item)), Some(Value::String(nested))) => (step, Some(item), Some(nested)),
+            _ => return WaitChild::Unowned,
+        },
     };
     let Some(locator) = locator.as_str() else {
         return WaitChild::Unowned;
     };
-    if !super::schema_common::is_identifier(step) {
-        return WaitChild::Unowned;
-    }
     let segments = locator.split('/').collect::<Vec<_>>();
+    let Some(taken) = canonical_child(step, element, &segments) else {
+        return WaitChild::Unowned;
+    };
+    let (head, rest) = segments.split_at(taken);
+    match nested {
+        None if rest.is_empty() => WaitChild::Owned {
+            locator: PathBuf::from(locator),
+            item: element,
+        },
+        Some(nested) if canonical_child(nested, None, rest) == Some(rest.len()) => {
+            WaitChild::Carried {
+                locator: PathBuf::from(head.join("/")),
+                item: element,
+                step: nested.clone(),
+                child: PathBuf::from(rest.join("/")),
+            }
+        }
+        _ => WaitChild::Unowned,
+    }
+}
+
+/// How many of `segments` the canonical child locator of `step`, at fan-out element
+/// `element`, takes from their start: `children/<step>/<NNNNNN>` or
+/// `children/<step>/<n>/<NNNNNN>` (REQ-LOCALRUN-177); `None` when they do not start with it.
+fn canonical_child(step: &str, element: Option<u64>, segments: &[&str]) -> Option<usize> {
+    if !super::schema_common::is_identifier(step) {
+        return None;
+    }
     let expected_element = element.and_then(attempt_directory_name);
-    let ordinal = match (segments.as_slice(), expected_element.as_deref()) {
-        ([CHILDREN_DIRECTORY, named, ordinal], None) if *named == step => *ordinal,
-        ([CHILDREN_DIRECTORY, named, named_element, ordinal], Some(expected))
+    let (ordinal, taken) = match (segments, expected_element.as_deref()) {
+        ([CHILDREN_DIRECTORY, named, ordinal, ..], None) if *named == step => (*ordinal, 3),
+        ([CHILDREN_DIRECTORY, named, named_element, ordinal, ..], Some(expected))
             if *named == step && *named_element == expected =>
         {
-            *ordinal
+            (*ordinal, 4)
         }
-        _ => return WaitChild::Unowned,
+        _ => return None,
     };
     let canonical = ordinal
         .parse::<u64>()
         .ok()
         .filter(|ordinal| *ordinal < 1_000_000)
         .and_then(attempt_directory_name);
-    if canonical.as_deref() != Some(ordinal) {
-        return WaitChild::Unowned;
-    }
-    WaitChild::Owned {
-        locator: PathBuf::from(locator),
-        item: element,
-    }
+    (canonical.as_deref() == Some(ordinal)).then_some(taken)
 }
 
 /// Whether the latest attempt of the run at `requested` ended `failed`, read without the run

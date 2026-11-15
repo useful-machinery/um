@@ -50,7 +50,10 @@ const RUN_URL: &str = "https://usefulmachinery.com/acme/runs/run_01k0z6r1w8f4jy2
 /// `$TREE_TEST_OUTCOME`, answering with `$TREE_TEST_RESULT` as the document's `result` when
 /// it is set: for state `waiting`
 /// beside a `wait.json` of kind `$TREE_TEST_WAIT_KIND` whose rule names
-/// `$TREE_TEST_WAIT_SOURCE`, and for state `cancellable` a running record until `run
+/// `$TREE_TEST_WAIT_SOURCE`, its `step` and the record's `position` the JSON
+/// `$TREE_TEST_POSITION` (`["merge"]` when unset) and its `then` `$TREE_TEST_THEN` (`merge`
+/// when unset), the record first reading `running` at that position while
+/// `$TREE_TEST_LOG/running` exists, and for state `cancellable` a running record until `run
 /// cancel` ends it `canceled`; for state `refused` it makes no run and answers with the
 /// runtime's rejection of a root whose `requires.tools` names a missing tool. Each `run resume` appends its command line to
 /// `resume.args`, leaves its environment in `resume.env` and answers with the next word of
@@ -59,7 +62,7 @@ const RUN_URL: &str = "https://usefulmachinery.com/acme/runs/run_01k0z6r1w8f4jy2
 /// refuses with `wait_condition_unavailable`, `refuse` refuses with
 /// `continuation_nodes_unsatisfied`, `stall` starts nothing and prints nothing until `run
 /// cancel` runs, and `continue` starts the record's next attempt at
-/// `merge`, then lands the run once `$TREE_TEST_LOG/proceed` exists. `run cancel` ends a waiting
+/// that position, then lands the run once `$TREE_TEST_LOG/proceed` exists. `run cancel` ends a waiting
 /// record `canceled`. A stage `$TREE_TEST_LOG/stages/<name>/` is copied into the run
 /// directory: `create` before the first record is written, `exited` after `create` writes
 /// an `exited` record, `resume<n>` by the n-th `resume` (after `continue` writes attempt 2)
@@ -84,6 +87,8 @@ const RUN_URL: &str = "https://usefulmachinery.com/acme/runs/run_01k0z6r1w8f4jy2
 /// injected `um` itself, so no later command can be launched.
 const UM_FIXTURE: &str = r#"#!/bin/sh
 log="$TREE_TEST_LOG"
+position='["merge"]'
+[ -z "$TREE_TEST_POSITION" ] || position="$TREE_TEST_POSITION"
 if [ -f "$log/noise" ]; then head -c "$(cat "$log/noise")" /dev/zero >&2; fi
 stage() {
   if [ -d "$log/stages/$1" ]; then cp -R "$log/stages/$1/." "$run/"; fi
@@ -130,8 +135,13 @@ case "$1 $2 $3" in
     printf '{"state":"exited","outcome":"canceled","attempts":1,"position":[]}\n' > "$run/run.json"
     ;;
   waiting)
-    printf '{"kind":"%s","since":"2026-07-23T00:00:05Z","step":["merge"],"then":"merge","rule":{"source":"%s","event":"pull_request.merged"},"payload":{}}\n' "$TREE_TEST_WAIT_KIND" "$TREE_TEST_WAIT_SOURCE" > "$run/wait.json"
-    printf '{"state":"waiting","outcome":null,"attempts":1,"position":["merge"]}\n' > "$run/run.json"
+    if [ -e "$log/running" ]; then
+      printf '{"state":"running","outcome":null,"attempts":1,"position":%s}\n' "$position" > "$run/run.json"
+      n=0
+      while [ -e "$log/running" ] && [ "$n" -lt 400 ]; do sleep 0.05; n=$((n + 1)); done
+    fi
+    printf '{"kind":"%s","since":"2026-07-23T00:00:05Z","step":%s,"then":"%s","rule":{"source":"%s","event":"pull_request.merged"},"payload":{}}\n' "$TREE_TEST_WAIT_KIND" "$position" "${TREE_TEST_THEN:-merge}" "$TREE_TEST_WAIT_SOURCE" > "$run/wait.json"
+    printf '{"state":"waiting","outcome":null,"attempts":1,"position":%s}\n' "$position" > "$run/run.json"
     ;;
   exited)
     printf '{"state":"exited","outcome":%s,"attempts":1,"position":[]}\n' "$TREE_TEST_OUTCOME" > "$run/run.json"
@@ -215,7 +225,7 @@ case "$1 $2 $3" in
   continue)
     rm -f "$run/wait.json"
     next=$(($(sed -n 's/.*"attempts":\([0-9]*\).*/\1/p' "$run/run.json") + 1))
-    printf '{"state":"running","outcome":null,"attempts":%s,"position":["merge"]}\n' "$next" > "$run/run.json"
+    printf '{"state":"running","outcome":null,"attempts":%s,"position":%s}\n' "$next" "$position" > "$run/run.json"
     stage "resume$n"
     i=0
     while [ ! -e "$log/proceed" ] && [ "$i" -lt 400 ]; do sleep 0.05; i=$((i + 1)); done
@@ -2757,6 +2767,186 @@ async fn entry_without_a_run_record_is_a_fan_out_element_as_the_engine_reads_it(
     assert_eq!(chosen_outcome(&reports).as_deref(), Some("planned"));
 }
 
+// INV-ENGINE-41, REQ-RUNNERENROLL-88, REQ-RUNNERENROLL-90, REQ-WFEXEC-75, REQ-CONTINUE-92: a
+// runner reports SC-WFEXEC-6's nested run with the frames it has. The root's records carry
+// the nested stage's position and its carried wait, the step reader finds the stage under
+// its nested run, and a control naming the wait by kind and since resolves it; every frame
+// encodes under the closed protocol schema.
+#[tokio::test]
+async fn nested_run_is_reported_and_answered_with_the_frames_it_has() {
+    let path = json!(["outer", { "item": 2 }, "ask"]);
+    let position = path.to_string();
+    let mut fixture = control_wait_fixture(
+        "answer",
+        &[
+            ("TREE_TEST_POSITION", position.as_str()),
+            ("TREE_TEST_THEN", "outer"),
+        ],
+    );
+    let log = fixture.log.clone();
+    fs::remove_file(log.join("proceed")).unwrap();
+    // The records the engine writes while element 2's `ask` stage runs: each element's
+    // nested run under `children/outer/<n>/`, its stages under its own `children/`
+    // (REQ-LOCALRUN-177).
+    let element = |item: u64| format!("children/outer/{item:06}/000001");
+    let asking = |ordinal: u64| format!("{}/children/ask/{ordinal:06}", element(2));
+    let root_waiting = vec![step("outer", "not_run"), step("finish", "not_run")];
+    let first_ask = vec![step("ask", "succeeded"), step("work", "pending")];
+    stage_state(
+        &log,
+        "create",
+        "",
+        &[(1, vec![step("outer", "running"), step("finish", "pending")])],
+    );
+    stage_child_run(
+        &log,
+        "create",
+        &element(1),
+        &[(1, vec![step("ask", "succeeded"), step("work", "succeeded")])],
+    );
+    stage_child_run(
+        &log,
+        "create",
+        &element(2),
+        &[(1, vec![step("ask", "running"), step("work", "pending")])],
+    );
+    stage_child_run(
+        &log,
+        "create",
+        &asking(1),
+        &[(1, vec![step("draft", "running")])],
+    );
+    // The answer continues the nested run in place from `ask`, with a fresh stage.
+    stage_state(
+        &log,
+        "resume1",
+        "",
+        &[
+            (1, root_waiting),
+            (2, vec![step("outer", "running"), step("finish", "pending")]),
+        ],
+    );
+    stage_state(
+        &log,
+        "resume1",
+        &element(2),
+        &[(1, first_ask), (2, vec![step("ask", "running")])],
+    );
+    stage_child_run(
+        &log,
+        "resume1",
+        &asking(2),
+        &[(1, vec![step("draft", "running")])],
+    );
+    fs::write(log.join("running"), b"").unwrap();
+    start(&mut fixture).await;
+
+    let nested = |item: u64| json!({ "step": "outer", "item": item, "ordinal": 1 });
+    let drafting = |ordinal: u64| {
+        observed(
+            json!([nested(2), { "step": "ask", "ordinal": ordinal }]),
+            1,
+            "draft",
+            "running",
+        )
+    };
+    wait_for_reports(&mut fixture.manager, |reports| {
+        progress(reports)
+            .iter()
+            .any(|(_, attempt, state, position)| {
+                (*attempt, *state, position) == (1, "running", &path)
+            })
+            && reported_steps(reports).contains(&drafting(1))
+    })
+    .await;
+    fs::remove_file(log.join("running")).unwrap();
+    wait_for_waiting(&mut fixture).await;
+    let answer = json!({
+        "kind": "answer",
+        "wait": {"kind": "answer", "since": WAIT_SINCE},
+        "answers": [{"question": "1", "text": "Take the first way."}],
+    });
+    send_control(&mut fixture, CONTROL_ID, answer);
+    wait_for_reports(&mut fixture.manager, |reports| {
+        progress(reports)
+            .iter()
+            .any(|(_, attempt, state, position)| {
+                (*attempt, *state, position) == (2, "running", &path)
+            })
+            && reported_steps(reports).contains(&drafting(2))
+    })
+    .await;
+    fs::write(log.join("proceed"), b"").unwrap();
+    let reports = finished_reports(&mut fixture.manager).await;
+
+    // The control resolved the carried wait: applied, its answer recorded against the
+    // root, and the run resumed once.
+    assert_eq!(
+        control_applications(&reports),
+        [applied(CONTROL_ID, "recorded")]
+    );
+    let commands = logged_lines(&log, "control.args");
+    assert_eq!(commands.len(), 1, "{commands:#?}");
+    assert!(
+        commands[0].starts_with("workflow run answer ")
+            && commands[0].contains("/runs/run_01k0z6r1w8f4jy2m7q9v3x5loc --question=1 "),
+        "{commands:#?}"
+    );
+    assert_eq!(order(&log), ["answer", "resume"]);
+    assert_eq!(chosen_outcome(&reports).as_deref(), Some("landed"));
+
+    // What Cloud reads: each report as the frame the runner encodes.
+    let frames = reports
+        .iter()
+        .map(|report| encoded_frame(report, &fixture.offer))
+        .collect::<Vec<_>>();
+    let roots = frames
+        .iter()
+        .filter(|frame| frame["type"] == "tree_progress")
+        .map(|frame| &frame["payload"])
+        .map(|payload| {
+            (
+                payload["attempt"].clone(),
+                payload["state"].clone(),
+                payload["position"].clone(),
+                payload["wait"].clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let waiting = json!({ "kind": "answer", "since": WAIT_SINCE, "step": path });
+    let mut distinct = roots.clone();
+    distinct.dedup();
+    assert_eq!(
+        distinct,
+        [
+            (json!(1), json!("running"), path.clone(), Value::Null),
+            (json!(1), json!("waiting"), path.clone(), waiting),
+            (json!(2), json!("running"), path.clone(), Value::Null),
+        ]
+    );
+    let observations = frames
+        .iter()
+        .filter(|frame| frame["type"] == "tree_progress")
+        .flat_map(|frame| {
+            frame["payload"]["steps"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+        })
+        .collect::<Vec<_>>();
+    for expected in [
+        observed(json!([nested(2)]), 1, "ask", "running"),
+        drafting(1),
+        observed(json!([nested(2)]), 2, "ask", "running"),
+        drafting(2),
+    ] {
+        assert!(
+            observations.contains(&expected),
+            "{expected} not among {observations:#?}"
+        );
+    }
+}
+
 // REQ-RUNNERENROLL-88
 #[tokio::test]
 async fn unreadable_state_records_report_nothing_and_leave_the_outcome() {
@@ -3507,7 +3697,15 @@ fn finished_payload(reports: &[ExecutionReport], offer: &AssignmentOffer) -> Val
     let Some(finished) = reports.last() else {
         panic!("expected a terminal report");
     };
-    let frame = finished.runner_frame(
+    let mut frame = encoded_frame(finished, offer);
+    assert_eq!(frame["type"], "execution_finished");
+    frame["payload"].take()
+}
+
+/// The frame `report` encodes for `offer`, encoding validating it against the closed
+/// protocol schema.
+fn encoded_frame(report: &ExecutionReport, offer: &AssignmentOffer) -> Value {
+    let frame = report.runner_frame(
         um_runner_protocol::RunnerEnvelope {
             message_id: "rmsg_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned(),
             runner_id: "rnr_01k0z6r1w8f4jy2m7q9v3x5abd".to_owned(),
@@ -3518,10 +3716,9 @@ fn finished_payload(reports: &[ExecutionReport], offer: &AssignmentOffer) -> Val
         offer.assignment_id.clone(),
         offer.attempt_id.clone(),
     );
-    let encoded = um_runner_protocol::encode_runner_frame(&frame).unwrap();
-    let mut frame: Value = serde_json::from_slice(&encoded).unwrap();
-    assert_eq!(frame["type"], "execution_finished");
-    frame["payload"].take()
+    let encoded = um_runner_protocol::encode_runner_frame(&frame)
+        .unwrap_or_else(|error| panic!("{report:#?} does not encode: {error:?}"));
+    serde_json::from_slice(&encoded).unwrap()
 }
 
 // REQ-RUNNERENROLL-88: a state record that could not be read is skipped only until it can

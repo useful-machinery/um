@@ -8,9 +8,10 @@ use anyhow::{Context, anyhow};
 use serde::Serialize;
 use serde_json::{Map, Value};
 use um_execution::{
-    ControlEvent, LocalRunDirectoryError, NoConditions, RunState, WaitInspection, WaitKind,
-    WaitRecord, WorkflowRunRecord, append_control, inspect_wait, normalize_terminal_path,
-    normalize_terminal_scalar, read_local_run_status,
+    ControlEvent, LocalRunDirectoryError, NoConditions, ResolvedWorkflow, RunState, ValidatedStep,
+    WaitInspection, WaitKind, WaitRecord, WorkflowRunRecord, append_control, inspect_wait,
+    normalize_terminal_path, normalize_terminal_scalar, read_local_run_status,
+    resolve_workflow_file,
 };
 
 use crate::exit_code::ExitCode;
@@ -27,6 +28,8 @@ pub(super) struct ControlTarget {
     /// The run's `state.json`, as `um workflow run status` reads it.
     pub(super) state: Value,
     pub(super) inspection: WaitInspection,
+    /// The run's copy of the tree it was admitted from (REQ-LOCALRUN-170).
+    pub(super) tree_copy: PathBuf,
 }
 
 /// A control that does not apply, refused before anything is written: one closed `code`.
@@ -130,16 +133,24 @@ impl ControlTarget {
         Ok(wait)
     }
 
-    /// The ids of the steps of the run's latest attempt.
-    pub(super) fn step_ids(&self) -> Vec<&str> {
-        self.state["attempts"]
+    /// The ids a stop may name (REQ-LOCALRUN-185): the steps of the run's latest attempt and
+    /// the `workflow` steps of each nested workflow the run's workflow names, read from the
+    /// workflow resolved again from the run's tree copy, since a nested run may not exist yet
+    /// (REQ-WFEXEC-76).
+    pub(super) fn step_ids(&self) -> Vec<String> {
+        let own = self.state["attempts"]
             .as_array()
             .and_then(|attempts| attempts.last())
             .and_then(|attempt| attempt["progress"]["steps"].as_array())
             .into_iter()
             .flatten()
             .filter_map(|step| step["id"].as_str())
-            .collect()
+            .map(str::to_owned);
+        let nested =
+            resolve_workflow_file(&self.tree_copy, &self.tree_copy.join(&self.record.workflow))
+                .map(|workflow| nested_step_ids(&workflow))
+                .unwrap_or_default();
+        own.chain(nested).collect()
     }
 
     /// Appends the control `event` naming `wait` with `payload`, by the invoking user.
@@ -237,6 +248,7 @@ pub(super) fn open(run_directory: &Path) -> Result<ControlTarget, Refusal> {
         )
     }
     let snapshot = read_local_run_status(run_directory).map_err(invalid)?;
+    let tree_copy = snapshot.tree_copy_directory();
     let record = snapshot.record.ok_or_else(|| {
         Refusal::new(
             "run_record_missing",
@@ -248,9 +260,39 @@ pub(super) fn open(run_directory: &Path) -> Result<ControlTarget, Refusal> {
     Ok(ControlTarget {
         run_directory: probe.run_directory,
         record,
+        tree_copy,
         state: snapshot.state,
         inspection: probe.inspection,
     })
+}
+
+/// The ids of the `workflow` steps of each nested workflow `workflow`'s `workflow` steps name
+/// (REQ-WFEXEC-76, REQ-LOCALRUN-185): each child resolved from `workflow`'s source root, and
+/// only a child that is itself edge-scheduled, so it has `workflow` steps of its own. A child
+/// that does not resolve contributes none.
+pub(super) fn nested_step_ids(workflow: &ResolvedWorkflow) -> Vec<String> {
+    let root = &workflow.source.source_root;
+    workflow
+        .definition
+        .steps
+        .values()
+        .filter_map(|step| match step {
+            ValidatedStep::Workflow(step) => {
+                resolve_workflow_file(root, &root.join(&step.workflow)).ok()
+            }
+            _ => None,
+        })
+        .filter(super::create::has_workflow_steps)
+        .flat_map(|child| {
+            child
+                .definition
+                .steps
+                .into_iter()
+                .filter(|(_, step)| matches!(step, ValidatedStep::Workflow(_)))
+                .map(|(id, _)| id)
+                .collect::<Vec<_>>()
+        })
+        .collect()
 }
 
 /// The run at `run_directory` opened as `open` does when it waits, or `None` when it does not

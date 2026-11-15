@@ -1,9 +1,11 @@
 //! `um workflow run show` (REQ-LOCALRUN-189): one run from its records, read as `status`
 //! reads it, without taking its lock or changing its directory, with its mirror writes
 //! (REQ-LOCALRUN-193) and each running child's attempt and in-flight steps, read from the
-//! child's records the same way; with `--cloud ORGANIZATION`, the Cloud run `RUN` names
+//! child's records the same way, and under a child that is a nested run its `edges` counts and
+//! its own children, read the same way again; with `--cloud ORGANIZATION`, the Cloud run `RUN` names
 //! instead.
 
+use std::collections::BTreeMap;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
@@ -60,10 +62,13 @@ struct Attempt {
     imported: Option<Value>,
 }
 
-/// A child run with its progress while its record is `running`.
+/// A child run with its progress while its record is `running` and, for a nested run, its
+/// own children (REQ-LOCALRUN-189).
 struct Child {
     run: ChildRun,
     progress: Option<ChildProgress>,
+    /// The nested run's children, `None` for a child that has none, as a plain stage.
+    nested: Option<Vec<Child>>,
 }
 
 /// A running child's current attempt, read from its own records (REQ-LOCALRUN-189).
@@ -130,17 +135,11 @@ impl Command {
         let record: WorkflowRunRecord =
             serde_json::from_value(record).map_err(|error| invalid(error.to_string()))?;
         let now = um_support::utc_now();
-        let children = child_runs(&run_directory)
-            .map_err(|error| invalid(error.to_string()))?
-            .into_iter()
-            .map(|run| {
-                let progress = (run.record.state == RunState::Running)
-                    .then(|| child_progress(&run, now))
-                    .transpose()
-                    .map_err(invalid)?;
-                Ok(Child { run, progress })
-            })
-            .collect::<Result<_, Refused>>()?;
+        let children = children(
+            child_runs(&run_directory).map_err(|error| invalid(error.to_string()))?,
+            now,
+        )
+        .map_err(invalid)?;
         let controls =
             read_numbered_controls(&run_directory).map_err(|error| invalid(error.to_string()))?;
         let mirror = read_numbered_mirror_writes(&run_directory)
@@ -173,6 +172,33 @@ impl Command {
             run_directory,
         })
     }
+}
+
+/// Each of `runs` with its progress while it is `running` and, when it has children of its
+/// own, as a nested run does, those children read the same way, so the entries nest as the
+/// directories do; or the reason a child's records cannot be read, naming the child.
+fn children(runs: Vec<ChildRun>, now: time::OffsetDateTime) -> Result<Vec<Child>, String> {
+    runs.into_iter()
+        .map(|run| {
+            let progress = (run.record.state == RunState::Running)
+                .then(|| child_progress(&run, now))
+                .transpose()?;
+            let nested = child_runs(&run.directory).map_err(|error| {
+                format!(
+                    "Child run {}: {error}",
+                    normalize_terminal_path(&run.directory)
+                )
+            })?;
+            let nested = (!nested.is_empty())
+                .then(|| children(nested, now))
+                .transpose()?;
+            Ok(Child {
+                run,
+                progress,
+                nested,
+            })
+        })
+        .collect()
 }
 
 /// A running child's current attempt and its in-flight nodes, with the time since each start
@@ -267,6 +293,12 @@ struct ShownChild<'a> {
     outcome: Option<&'a str>,
     directory: &'a Path,
     progress: Option<ShownProgress<'a>>,
+    /// A nested run's edge counts; absent for a plain stage's child.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    edges: Option<&'a BTreeMap<String, u64>>,
+    /// A nested run's own children; absent for a plain stage's child.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    children: Option<Vec<ShownChild<'a>>>,
 }
 
 /// A running child's progress: the recorded start times, never an elapsed time.
@@ -340,20 +372,7 @@ fn document(shown: &Shown) -> ShowDocument<'_> {
                 result: (&shown.attempt.result).into(),
             })
             .collect(),
-        children: shown
-            .children
-            .iter()
-            .map(|Child { run, progress }| ShownChild {
-                step: &run.step,
-                item: run.item,
-                ordinal: run.ordinal,
-                id: &run.record.id,
-                state: state_name(run.record.state),
-                outcome: run.record.outcome.as_deref(),
-                directory: &run.directory,
-                progress: progress.as_ref().map(shown_progress),
-            })
-            .collect(),
+        children: shown.children.iter().map(shown_child).collect(),
         controls: shown
             .controls
             .iter()
@@ -374,6 +393,28 @@ fn document(shown: &Shown) -> ShowDocument<'_> {
                 write,
             })
             .collect(),
+    }
+}
+
+fn shown_child(child: &Child) -> ShownChild<'_> {
+    let Child {
+        run,
+        progress,
+        nested,
+    } = child;
+    ShownChild {
+        step: &run.step,
+        item: run.item,
+        ordinal: run.ordinal,
+        id: &run.record.id,
+        state: state_name(run.record.state),
+        outcome: run.record.outcome.as_deref(),
+        directory: &run.directory,
+        progress: progress.as_ref().map(shown_progress),
+        edges: nested.as_ref().map(|_| &run.record.edges),
+        children: nested
+            .as_ref()
+            .map(|nested| nested.iter().map(shown_child).collect()),
     }
 }
 
@@ -469,6 +510,54 @@ fn edges_text(record: &WorkflowRunRecord) -> String {
         .join(", ")
 }
 
+/// Each child as a row indented by `indent`, with a running child's progress and a nested
+/// run's `edges` counts two further in and its own children four further (REQ-LOCALRUN-189).
+fn write_children(stdout: &mut impl Write, children: &[Child], indent: usize) -> io::Result<()> {
+    let pad = " ".repeat(indent);
+    for Child {
+        run,
+        progress,
+        nested,
+    } in children
+    {
+        writeln!(
+            stdout,
+            "{pad}{} {} {:06}  {}  {}  {}  {}",
+            text(&run.step),
+            run.item
+                .map_or_else(|| "-".to_owned(), |item| item.to_string()),
+            run.ordinal,
+            text(&run.record.id),
+            state_name(run.record.state),
+            or_dash(run.record.outcome.as_deref()),
+            normalize_terminal_path(&run.directory)
+        )?;
+        if let Some(child) = progress {
+            writeln!(
+                stdout,
+                "{pad}  attempt {} · {} · {}",
+                child.attempt,
+                child.recovery,
+                elapsed_text(child.progress.started.as_ref())
+            )?;
+            for node in &child.progress.nodes {
+                writeln!(
+                    stdout,
+                    "{pad}  {} · {} · {}",
+                    text(&node.id),
+                    node.state,
+                    elapsed_text(node.started.as_ref())
+                )?;
+            }
+        }
+        if let Some(nested) = nested {
+            writeln!(stdout, "{pad}  edges: {}", edges_text(&run.record))?;
+            write_children(stdout, nested, indent + 4)?;
+        }
+    }
+    Ok(())
+}
+
 fn write_plain(shown: &Shown) -> io::Result<()> {
     let record = &shown.record;
     let mut stdout = io::stdout().lock();
@@ -562,38 +651,7 @@ fn write_plain(shown: &Shown) -> io::Result<()> {
     }
     writeln!(stdout)?;
     writeln!(stdout, "children:")?;
-    for Child { run, progress } in &shown.children {
-        writeln!(
-            stdout,
-            "  {} {} {:06}  {}  {}  {}  {}",
-            text(&run.step),
-            run.item
-                .map_or_else(|| "-".to_owned(), |item| item.to_string()),
-            run.ordinal,
-            text(&run.record.id),
-            state_name(run.record.state),
-            or_dash(run.record.outcome.as_deref()),
-            normalize_terminal_path(&run.directory)
-        )?;
-        if let Some(child) = progress {
-            writeln!(
-                stdout,
-                "    attempt {} · {} · {}",
-                child.attempt,
-                child.recovery,
-                elapsed_text(child.progress.started.as_ref())
-            )?;
-            for node in &child.progress.nodes {
-                writeln!(
-                    stdout,
-                    "    {} · {} · {}",
-                    text(&node.id),
-                    node.state,
-                    elapsed_text(node.started.as_ref())
-                )?;
-            }
-        }
-    }
+    write_children(&mut stdout, &shown.children, 2)?;
     writeln!(stdout)?;
     writeln!(stdout, "controls:")?;
     for (ordinal, control) in &shown.controls {

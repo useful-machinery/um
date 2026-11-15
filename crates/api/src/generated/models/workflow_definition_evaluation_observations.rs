@@ -30,7 +30,7 @@ pub struct WorkflowDefinitionEvaluationObservations {
     pub input: Option<String>,
     #[serde(rename = "owner", skip_serializing_if = "Option::is_none")]
     pub owner: Option<Box<models::WorkflowDefinitionEvaluationObservationsOwner>>,
-    /// The root step the run stops before.
+    /// The step the run stops before: a root step, or a `workflow` step of a nested workflow the root names.
     #[serde(rename = "stopBefore", skip_serializing_if = "Option::is_none")]
     pub stop_before: Option<String>,
     #[serde(rename = "requester", skip_serializing_if = "Option::is_none")]

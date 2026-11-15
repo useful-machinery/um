@@ -73,6 +73,7 @@ use super::validated::{
 };
 use super::validation::CHILD_OUTCOME_OUTPUT;
 use super::value::{CapturedJson, CapturedValue};
+use super::wait::WaitRecord;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum WorkingDirectoryFailure {
@@ -414,18 +415,30 @@ impl DriverOccurrenceContent for ProvisionalStepOutputs {
             }
             None => digest.write_tag(0),
         }
-        match &self.child {
-            Some(child) => {
+        let interruption = match &self.child {
+            Some(ChildEnding::Exited {
+                outcome,
+                interruption,
+            }) => {
                 digest.write_tag(1);
-                digest.write_bytes(child.outcome.as_bytes());
-                match &child.interruption {
-                    Some(interruption) => {
-                        digest.write_tag(1);
-                        digest.write_bytes(interruption.reason.as_str().as_bytes());
-                        digest.write_bytes(interruption.step.as_bytes());
-                    }
-                    None => digest.write_tag(0),
-                }
+                digest.write_bytes(outcome.as_bytes());
+                interruption
+            }
+            Some(ChildEnding::Waiting { kind, interruption }) => {
+                digest.write_tag(2);
+                digest.write_bytes(kind.name().as_bytes());
+                interruption
+            }
+            None => {
+                digest.write_tag(0);
+                return;
+            }
+        };
+        match interruption {
+            Some(interruption) => {
+                digest.write_tag(1);
+                digest.write_bytes(interruption.reason.as_str().as_bytes());
+                digest.write_bytes(interruption.step.as_bytes());
             }
             None => digest.write_tag(0),
         }
@@ -645,6 +658,14 @@ pub enum ChildRunOutcome {
     Exited {
         outcome: String,
         exports: BTreeMap<String, CapturedValue>,
+        interruption: Option<ChildInterruption>,
+    },
+    /// The child, a nested run (REQ-WFEXEC-74), entered the wait `wait` records in its own
+    /// run directory, which its parent's step carries to the root instead of an outcome
+    /// (REQ-WFEXEC-75); `interruption` is the one that failed its stage when the wait is the
+    /// `repair` that interruption routed it to (REQ-WFEXEC-70).
+    Waiting {
+        wait: Box<WaitRecord>,
         interruption: Option<ChildInterruption>,
     },
     /// The child could not be admitted or its directory created.
@@ -2208,6 +2229,26 @@ where
                 .await
                 .unwrap_or(ChildRunOutcome::Interrupted);
         }
+        // A nested run that honored the root's withdrawal at its own step boundary ended as a
+        // cancellation through the step's source; the withdrawal is this run's too, so it
+        // ends this attempt at this step as one honored before a step would (REQ-WFEXEC-76,
+        // REQ-WFEXEC-73).
+        if matches!(outcome, ChildRunOutcome::Cancelled)
+            && child_cancellation.withdrawal_requested()
+            && self
+                .admitted
+                .execution()
+                .cancellation()
+                .source()
+                .request_withdrawal()
+        {
+            if self.cancellation_for(action).is_none() {
+                let _ = (&mut cancellation).await;
+            }
+            if let Some(cancellation) = self.cancellation_for(action) {
+                return self.finish_cancellation(action, cancellation).await;
+            }
+        }
         let outputs = self.child_outputs(&step, outcome);
         let completed = outputs.is_ok();
         let occurrence = match outputs {
@@ -2303,6 +2344,7 @@ where
         let code = match outcome {
             ChildRunOutcome::Rejected { code } => code,
             ChildRunOutcome::Exited { .. }
+            | ChildRunOutcome::Waiting { .. }
             | ChildRunOutcome::Interrupted
             | ChildRunOutcome::Cancelled => "child_start_unreported".to_owned(),
         };
@@ -2313,19 +2355,32 @@ where
     /// The values a child that exited commits for the step: `outcome` and each declared
     /// `text` or `json` export the child made available, detached from the child's staging,
     /// with the child's ending the reducer routes on under an interruption (REQ-WFEXEC-70).
-    /// An outcome the step routes nowhere, or any other ending, is an interrupted child.
+    /// A nested run that waits commits nothing and its ending is the wait the reducer ends
+    /// the walk on (REQ-WFEXEC-75). An outcome the step routes nowhere, or any other ending,
+    /// is an interrupted child.
     fn child_outputs(
         &self,
         step: &str,
         outcome: ChildRunOutcome,
     ) -> Result<(BTreeMap<String, CapturedValue>, ChildEnding), StepExecutionFailure> {
-        let ChildRunOutcome::Exited {
-            outcome,
-            exports,
-            interruption,
-        } = outcome
-        else {
-            return Err(StepExecutionFailure::ChildInterrupted);
+        let (outcome, exports, interruption) = match outcome {
+            ChildRunOutcome::Exited {
+                outcome,
+                exports,
+                interruption,
+            } => (outcome, exports, interruption),
+            ChildRunOutcome::Waiting { wait, interruption } => {
+                return Ok((
+                    BTreeMap::new(),
+                    ChildEnding::Waiting {
+                        kind: wait.kind,
+                        interruption,
+                    },
+                ));
+            }
+            ChildRunOutcome::Rejected { .. }
+            | ChildRunOutcome::Interrupted
+            | ChildRunOutcome::Cancelled => return Err(StepExecutionFailure::ChildInterrupted),
         };
         let Some(ValidatedStep::Workflow(workflow)) = workflow_node(&self.admitted, step) else {
             return Err(StepExecutionFailure::ChildInterrupted);
@@ -2351,7 +2406,7 @@ where
         );
         Ok((
             values,
-            ChildEnding {
+            ChildEnding::Exited {
                 outcome,
                 interruption,
             },

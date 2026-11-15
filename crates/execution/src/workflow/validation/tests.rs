@@ -13,7 +13,10 @@ use super::super::validated::{
     WorkflowNodeRole, WorkflowValueType,
 };
 use super::super::{DecodeFailureKind, decode};
-use super::{ChildWorkflowSummary, ValidationFailureKind, ValidationLocation};
+use super::{
+    ChildNesting, ChildWorkflowSummary, NestedShape, UnsupportedNestedShape, ValidationFailureKind,
+    ValidationLocation,
+};
 
 fn validate_yaml(source: &str) -> Result<ValidatedWorkflow, super::ValidationFailure> {
     super::validate(decode(source.as_bytes()).unwrap())
@@ -671,7 +674,7 @@ fn subject_names_a_declared_text_input() {
     assert_eq!(validated.subject.as_deref(), Some("ticket"));
     // Like `name`, `subject` keeps a file from being a `workflow` step's child
     // (REQ-WFFORMAT-89).
-    assert!(ChildWorkflowSummary::of(&validated, BTreeSet::new()).has_root_blocks);
+    assert!(ChildWorkflowSummary::of(&validated, &[], BTreeSet::new()).has_root_blocks);
     let at_subject = ValidationLocation::Workflow { key: "subject" };
     assert_failure(
         &workflow("nothing"),
@@ -1872,7 +1875,7 @@ fn design_summary() -> ChildWorkflowSummary {
         .into_iter()
         .map(|(name, input)| (name.to_owned(), input))
         .collect(),
-        has_workflow_steps: false,
+        nesting: ChildNesting::Stage,
         has_root_blocks: false,
         paths: BTreeSet::new(),
     }
@@ -1890,7 +1893,7 @@ fn build_summary() -> ChildWorkflowSummary {
         .into_iter()
         .map(|(name, input)| (name.to_owned(), input))
         .collect(),
-        has_workflow_steps: false,
+        nesting: ChildNesting::Stage,
         has_root_blocks: false,
         paths: BTreeSet::new(),
     }
@@ -2426,7 +2429,7 @@ fn external_wait_summaries() -> BTreeMap<String, ChildWorkflowSummary> {
             .map(|(name, value_type)| ((*name).to_owned(), *value_type))
             .collect(),
         inputs: BTreeMap::new(),
-        has_workflow_steps: false,
+        nesting: ChildNesting::Stage,
         has_root_blocks: false,
         paths: BTreeSet::new(),
     };
@@ -2803,18 +2806,10 @@ fn a_workflow_with_workflow_steps_is_scheduled_by_its_edges() {
 
 // REQ-WFFORMAT-89
 #[test]
-fn a_child_workflow_is_a_readable_stage_without_workflow_steps_or_root_blocks() {
+fn a_child_workflow_is_a_readable_stage_without_root_blocks() {
     let design = || ValidationLocation::StepWorkflow {
         step: "design".to_owned(),
     };
-    let mut nested = child_summaries();
-    nested.get_mut("design.yaml").unwrap().has_workflow_steps = true;
-    assert_edge_failure(
-        EDGE_WORKFLOW,
-        &nested,
-        ValidationFailureKind::ChildWorkflowNested,
-        design(),
-    );
     let mut rooted = child_summaries();
     rooted.get_mut("design.yaml").unwrap().has_root_blocks = true;
     assert_edge_failure(
@@ -2835,6 +2830,124 @@ fn a_child_workflow_is_a_readable_stage_without_workflow_steps_or_root_blocks() 
         EDGE_WORKFLOW,
         ValidationFailureKind::ChildWorkflowUnavailable,
         design(),
+    );
+}
+
+fn with_design_nesting(nesting: ChildNesting) -> BTreeMap<String, ChildWorkflowSummary> {
+    let mut children = child_summaries();
+    children.get_mut("design.yaml").unwrap().nesting = nesting;
+    children
+}
+
+// REQ-WFFORMAT-104
+#[test]
+fn a_nested_child_is_accepted_within_the_bound_unless_it_holds_a_refused_shape() {
+    let design = || ValidationLocation::StepWorkflow {
+        step: "design".to_owned(),
+    };
+    validate_with_children(EDGE_WORKFLOW, &with_design_nesting(ChildNesting::Nested)).unwrap();
+    assert_edge_failure(
+        EDGE_WORKFLOW,
+        &with_design_nesting(ChildNesting::PastBound),
+        ValidationFailureKind::ChildWorkflowNested,
+        design(),
+    );
+    let shape = UnsupportedNestedShape {
+        step: "review".to_owned(),
+        shape: NestedShape::WaitThen,
+    };
+    let failure = validate_with_children(
+        EDGE_WORKFLOW,
+        &with_design_nesting(ChildNesting::Unsupported(shape.clone())),
+    )
+    .unwrap_err();
+    assert_eq!(
+        (failure.kind(), failure.location()),
+        (ValidationFailureKind::NestedWorkflowUnsupported, &design())
+    );
+    assert_eq!(failure.unsupported_shape(), Some(&shape));
+}
+
+// REQ-WFFORMAT-104
+#[test]
+fn a_nested_workflows_first_refused_shape_is_its_summary() {
+    let nesting = |source: &str, children: &BTreeMap<String, ChildWorkflowSummary>| {
+        let workflow = validate_with_children(source, children)
+            .unwrap_or_else(|failure| panic!("{failure:?} for:\n{source}"));
+        ChildWorkflowSummary::of(&workflow, &[], BTreeSet::new()).nesting
+    };
+    let refused = |step: &str, shape| {
+        ChildNesting::Unsupported(UnsupportedNestedShape {
+            step: step.to_owned(),
+            shape,
+        })
+    };
+    let stage = validate_yaml(&format!(
+        "schemaVersion: 1\nsteps:\n{}",
+        command_step("only", "")
+    ))
+    .unwrap();
+    assert_eq!(
+        ChildWorkflowSummary::of(&stage, &[], BTreeSet::new()).nesting,
+        ChildNesting::Stage
+    );
+    let children = child_summaries();
+    for (source, expected) in [
+        (EDGE_WORKFLOW.to_owned(), ChildNesting::Nested),
+        // An answer wait continuing at its own step, and a repair wait under a limited
+        // edge's `else`, which the step owning the edge enters.
+        (
+            edge_workflow(
+                "blocked: exit.failed",
+                "blocked:\n        wait: answer\n        then: design",
+            ),
+            ChildNesting::Nested,
+        ),
+        (
+            edge_workflow(
+                "blocked: exit.failed",
+                "blocked:\n        then: build\n        limit: 2\n        else:\n          wait: repair\n          then: design",
+            ),
+            ChildNesting::Nested,
+        ),
+        (
+            fan_out_workflow("    forEach: outputs.design.parts\n", "item.name", "item"),
+            refused("build", NestedShape::ForEach),
+        ),
+        (
+            edge_workflow(
+                "planned: build",
+                "planned:\n        wait: approval\n        then: build\n        onHandBack: build",
+            ),
+            refused("design", NestedShape::WaitKind),
+        ),
+        (
+            edge_workflow(
+                "planned: build",
+                "planned:\n        wait: answer\n        then: build",
+            ),
+            refused("design", NestedShape::WaitThen),
+        ),
+        (
+            edge_workflow(
+                "blocked: exit.failed",
+                "blocked:\n        then: build\n        limit: 2\n        else:\n          wait: repair\n          then: build",
+            ),
+            refused("design", NestedShape::WaitThen),
+        ),
+        (
+            edge_workflow(
+                "blocked: exit.failed",
+                "blocked:\n        wait: answer\n        then: exit.failed",
+            ),
+            refused("design", NestedShape::WaitThen),
+        ),
+    ] {
+        assert_eq!(nesting(&source, &children), expected, "for:\n{source}");
+    }
+    assert_eq!(
+        nesting(EXTERNAL_WAIT_WORKFLOW, &external_wait_summaries()),
+        refused("merge", NestedShape::WaitKind)
     );
 }
 

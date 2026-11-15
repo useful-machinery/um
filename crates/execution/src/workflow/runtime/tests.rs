@@ -7501,3 +7501,88 @@ fn a_child_completing_under_an_interruption_continues_instead_of_starting_a_step
     let stale = reduce(&state, child_completed("child:planned"));
     assert!(!stale.occurrence_accepted);
 }
+
+/// The wait a `design` whose nested run entered a wait of `kind` carries (REQ-WFEXEC-75).
+fn carried(kind: WaitKind, interrupted: Option<ChildInterruption>) -> EnteredWait {
+    EnteredWait {
+        step: "design".to_owned(),
+        outcome: None,
+        kind,
+        then: "design".to_owned(),
+        on_hand_back: None,
+        rule: None,
+        interrupted,
+        kept: None,
+    }
+}
+
+// REQ-WFEXEC-75, INV-ENGINE-40: a `workflow` step whose nested run waits commits nothing and
+// takes no edge: it ends `not_reached` with every unstarted step and the attempt ends on the
+// same wait carried at the step, with no finalization; only the running step's completion
+// carries one.
+#[test]
+fn a_nested_runs_wait_ends_the_walk_on_the_carried_wait() {
+    let initialization = initialize_test(design_build_review());
+    let initial = initialization.state;
+    let stale = reduce(&initial, child_completed("waits:answer"));
+    assert!(!stale.occurrence_accepted);
+    assert_noop(&initial, &stale);
+
+    let mut state = initial;
+    reduce_and_advance(
+        &mut state,
+        Occurrence::StepStarted {
+            step: "design".to_owned(),
+            action: action_id(1),
+        },
+    );
+    let waiting = reduce_and_advance(&mut state, child_completed("waits:answer"));
+    assert!(waiting.occurrence_accepted);
+    for step in ["design", "build", "review"] {
+        assert_eq!(state.steps[step].state, not_reached(), "{step}");
+    }
+    assert_eq!(state.steps["design"].active_invocation, None);
+    let wait = carried(WaitKind::Answer, None);
+    assert_eq!(
+        state.workflow,
+        WorkflowState::Waiting { wait: wait.clone() }
+    );
+    assert_eq!(state.exit_outcome, None);
+    assert!(matches!(
+        waiting.actions.as_slice(),
+        [RequestedAction {
+            action: Action::FinishRun {
+                outcome: RunOutcome::Waiting { wait: finished },
+                ..
+            },
+            ..
+        }] if *finished == wait
+    ));
+}
+
+// REQ-WFEXEC-75, REQ-WFEXEC-70: under an interruption the nested run's `repair` wait, which
+// names the interruption that failed its stage, ends the walk as a routed child's edge does
+// and wins over the stop.
+#[test]
+fn an_interrupted_nested_runs_repair_wait_is_carried() {
+    let mut state = design_interrupted(interrupted_route_definition("build", "exit.failed"));
+    let completed = reduce_and_advance(&mut state, child_completed("waits:repair:plan"));
+    assert!(completed.occurrence_accepted);
+    assert_eq!(state.steps["design"].state, not_reached());
+    assert_eq!(state.steps["build"].state, not_reached());
+    let wait = carried(
+        WaitKind::Repair,
+        Some(ChildInterruption {
+            reason: CancellationReason::UserRequest,
+            step: "plan".to_owned(),
+        }),
+    );
+    assert_eq!(
+        state.workflow,
+        WorkflowState::Waiting { wait: wait.clone() }
+    );
+    assert_eq!(
+        finished_outcome(&completed),
+        Some(&RunOutcome::Waiting { wait })
+    );
+}

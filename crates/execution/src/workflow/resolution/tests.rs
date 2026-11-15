@@ -13,6 +13,7 @@ use crate::workflow::validated::{
     ValidatedHarness, ValidatedMessageSource, ValidatedRecoveryHandler, ValidatedStep,
     WorkflowValueType,
 };
+use crate::workflow::validation::NestedShape;
 
 const WORKFLOW_PATH: &str = "workflows/complete.yaml";
 const JSON_SCHEMA_DIALECT: &str = "https://json-schema.org/draft/2020-12/schema";
@@ -1449,4 +1450,247 @@ fn a_child_workflow_outside_the_tree_missing_or_invalid_fails_at_its_step() {
     let remedy = crate::workflow::rejection::human_resolution_remedy(&failure);
     assert!(remedy.contains("unknown_input"), "{remedy}");
     assert!(remedy.contains("design.yaml"), "{remedy}");
+}
+
+const NESTING_ROOT: &str = "schemaVersion: 1
+inputs:
+  ticket:
+    kind: text
+outcomes: [landed, failed]
+steps:
+  part:
+    kind: workflow
+    workflow: part.yaml
+    inputs:
+      ticket:
+        ref: inputs.ticket
+    on:
+      built: exit.landed
+      failed: exit.failed
+";
+const NESTED_WORKFLOW: &str = "schemaVersion: 1
+inputs:
+  ticket:
+    kind: text
+  parts:
+    kind: json
+    optional: true
+outcomes: [built, failed]
+steps:
+  draft:
+    kind: workflow
+    workflow: design.yaml
+    inputs:
+      ticket:
+        ref: inputs.ticket
+    on:
+      planned: vet
+      failed: exit.failed
+  vet:
+    kind: workflow
+    workflow: design.yaml
+    inputs:
+      ticket:
+        ref: inputs.ticket
+    on:
+      planned: exit.built
+      failed: exit.failed
+";
+
+impl ChildBundle {
+    /// A root whose step `part` names the nested workflow `part.yaml`, whose steps name
+    /// the stage `design.yaml`.
+    fn nesting(nested: &str) -> Self {
+        let bundle = Self::new(NESTING_ROOT);
+        bundle.write("part.yaml", nested);
+        bundle
+    }
+
+    fn write(&self, file: &str, contents: &str) {
+        fs::write(self.root.join(file), contents).unwrap();
+    }
+}
+
+fn nested_variant(from: &str, to: &str) -> String {
+    assert!(NESTED_WORKFLOW.contains(from), "{from}");
+    NESTED_WORKFLOW.replacen(from, to, 1)
+}
+
+// REQ-WFFORMAT-104, REQ-WFFORMAT-24
+#[test]
+fn a_nested_workflow_resolves_its_stages_into_the_closure_of_each_file_reaching_them() {
+    let bundle = ChildBundle::nesting(NESTED_WORKFLOW);
+    let resolved = bundle.resolve("workflow.yaml").unwrap();
+    assert_eq!(
+        resolved.source_closure.keys().collect::<Vec<_>>(),
+        [
+            "design.yaml",
+            "part.yaml",
+            "prompts/design.md",
+            "workflow.yaml"
+        ]
+    );
+    // A continuation compares the bytes of every path the nested workflow reached, the
+    // stage's static file included, and none of the parent's own.
+    let ValidatedStep::Workflow(part) = &resolved.definition.steps["part"] else {
+        panic!("part resolves as a workflow step");
+    };
+    assert_eq!(
+        part.child_paths.iter().collect::<Vec<_>>(),
+        ["design.yaml", "part.yaml", "prompts/design.md"]
+    );
+    let retained = resolve_retained(
+        bundle.root.clone(),
+        "workflow.yaml",
+        resolved.source_closure.clone(),
+        None,
+    )
+    .unwrap();
+    assert_eq!(retained.content_digest, resolved.content_digest);
+
+    // The stage's static file is part of the root's digest.
+    fs::write(bundle.root.join("prompts/design.md"), b"Design it again.\n").unwrap();
+    let changed = bundle.resolve("workflow.yaml").unwrap();
+    assert_ne!(changed.content_digest, resolved.content_digest);
+
+    super::super::tree::validate_workflow_tree(&bundle.root)
+        .unwrap_or_else(|diagnostics| panic!("the tree validates: {diagnostics:?}"));
+}
+
+// REQ-WFFORMAT-104
+#[test]
+fn a_chain_three_workflow_steps_deep_is_nested_at_the_outermost_step() {
+    // workflow.yaml -> part.yaml -> deeper.yaml -> design.yaml.
+    let bundle = ChildBundle::nesting(
+        &NESTED_WORKFLOW
+            .replace("design.yaml", "deeper.yaml")
+            .replace("planned:", "built:"),
+    );
+    bundle.write("deeper.yaml", NESTED_WORKFLOW);
+    let failure = bundle.resolve("workflow.yaml").unwrap_err();
+    assert_eq!(
+        (failure.kind(), failure.location()),
+        (
+            ResolutionFailureKind::InvalidWorkflowDefinition(
+                ValidationFailureKind::ChildWorkflowNested
+            ),
+            &step_workflow("part"),
+        )
+    );
+    let child = failure.child_failure().unwrap();
+    assert_eq!(
+        (child.kind(), child.location(), child.workflow_path()),
+        (
+            ResolutionFailureKind::InvalidWorkflowDefinition(
+                ValidationFailureKind::ChildWorkflowNested
+            ),
+            &step_workflow("draft"),
+            Some("part.yaml"),
+        )
+    );
+    // From part.yaml the chain is two deep.
+    bundle.resolve("part.yaml").unwrap();
+
+    let diagnostics = super::super::tree::validate_workflow_tree(&bundle.root).unwrap_err();
+    let reported = diagnostics
+        .iter()
+        .map(|diagnostic| {
+            (
+                diagnostic.code,
+                serde_json::to_value(&diagnostic.location).unwrap(),
+                serde_json::to_value(diagnostic.workflow_location()).unwrap(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        reported,
+        [(
+            "child_workflow_nested",
+            serde_json::json!({"kind": "workflow", "path": "workflow.yaml"}),
+            serde_json::json!({"kind": "step_workflow", "step": "part"}),
+        )]
+    );
+}
+
+// REQ-WFFORMAT-104
+#[test]
+fn two_files_that_name_each_other_are_nested_whichever_is_validated() {
+    let bundle = ChildBundle::new(PARENT_WORKFLOW);
+    let naming = |step: &str, other: &str| {
+        format!(
+            "schemaVersion: 1\nsteps:\n  {step}:\n    kind: workflow\n    workflow: {other}\n    on:\n      succeeded: exit.succeeded\n      failed: exit.failed\n"
+        )
+    };
+    bundle.write("ping.yaml", &naming("ping", "pong.yaml"));
+    bundle.write("pong.yaml", &naming("pong", "ping.yaml"));
+    for (file, step) in [("ping.yaml", "ping"), ("pong.yaml", "pong")] {
+        assert_failure(
+            bundle.resolve(file),
+            ResolutionFailureKind::InvalidWorkflowDefinition(
+                ValidationFailureKind::ChildWorkflowNested,
+            ),
+            step_workflow(step),
+        );
+    }
+}
+
+// REQ-WFFORMAT-104
+#[test]
+fn a_nested_workflow_holding_a_refused_shape_fails_at_the_parents_step() {
+    let for_each = nested_variant(
+        "    workflow: design.yaml\n",
+        "    workflow: design.yaml\n    forEach: inputs.parts\n",
+    );
+    let approval = nested_variant(
+        "planned: vet",
+        "planned:\n        wait: approval\n        then: vet\n        onHandBack: draft",
+    );
+    let external = nested_variant(
+        "planned: vet",
+        "planned:\n        wait: external\n        then: vet\n        rule:\n          source: github\n          event: pull_request.closed\n          where: 'event.merged == true'",
+    );
+    let answer_elsewhere = nested_variant(
+        "planned: vet",
+        "planned:\n        wait: answer\n        then: vet",
+    );
+    for (nested, shape) in [
+        (for_each, NestedShape::ForEach),
+        (approval, NestedShape::WaitKind),
+        (external, NestedShape::WaitKind),
+        (answer_elsewhere, NestedShape::WaitThen),
+    ] {
+        let bundle = ChildBundle::nesting(&nested);
+        // The nested workflow validates on its own.
+        bundle.resolve("part.yaml").unwrap();
+        let failure = bundle.resolve("workflow.yaml").unwrap_err();
+        assert_eq!(
+            (failure.kind(), failure.location()),
+            (
+                ResolutionFailureKind::InvalidWorkflowDefinition(
+                    ValidationFailureKind::NestedWorkflowUnsupported
+                ),
+                &step_workflow("part"),
+            ),
+            "for:\n{nested}"
+        );
+        assert_eq!(
+            failure.unsupported_shape(),
+            Some(&UnsupportedNestedShape {
+                step: "draft".to_owned(),
+                shape,
+            })
+        );
+        let remedy = crate::workflow::rejection::human_resolution_remedy(&failure);
+        assert!(remedy.contains("draft"), "{remedy}");
+    }
+
+    // A repair wait under a limited edge's `else`, continuing at the waiting step, is one
+    // the nested workflow may hold.
+    let repair = nested_variant(
+        "      failed: exit.failed\n",
+        "      failed:\n        then: draft\n        limit: 2\n        else:\n          wait: repair\n          then: draft\n",
+    );
+    ChildBundle::nesting(&repair)
+        .resolve("workflow.yaml")
+        .unwrap();
 }

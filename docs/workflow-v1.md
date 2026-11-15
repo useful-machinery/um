@@ -362,10 +362,10 @@ steps:
   `workflow.yaml` and the file itself (`child_workflow_not_in_tree`); an unreadable file
   is `child_workflow_unavailable`. The child is validated as its own workflow file and a
   failure there is `child_workflow_invalid`, whose remedy names the child's own code and
-  location. A child may not declare `workflow` steps (`child_workflow_nested`) or carry
-  `name`, `version`, `subject`, or a root-only block (`child_workflow_root_blocks`). The
-  child file and the static files it names join the parent's closure and digest. These
-  failures are at location `step_workflow`.
+  location. A child declares `workflow` steps only as a nested workflow (below) and may
+  not carry `name`, `version`, `subject`, or a root-only block
+  (`child_workflow_root_blocks`). The child file and the static files it names join the
+  parent's closure and digest. These failures are at location `step_workflow`.
 - `inputs` maps the child's input names to references of the parent's inputs or of an
   earlier step's outputs. Every child input that is neither optional nor defaulted must
   be mapped (`child_input_missing`), only declared names may be mapped
@@ -436,6 +436,16 @@ are at location `step`. References supply values but add no dependency. `outcome
 declared alone, because the `exit` edge a run reaches chooses the outcome; an `outcome`
 block is `invalid_outcome_declaration`. Finalizers work as in any workflow. Cloud does
 not run workflows with `workflow` steps.
+
+A child that declares `workflow` steps is a nested workflow: an edge-scheduled file
+whose steps run stages. The chain is at most two deep from the file being validated, so
+a nested workflow's children declare no `workflow` step; a deeper child, a cycle
+included, is `child_workflow_nested` at the outer file's step. A nested workflow declares
+no `forEach`, waits only for `answer` or `repair`, and a wait's `then` is the step whose
+edge enters it, directly or as a limited edge's `else`; any other shape is
+`nested_workflow_unsupported` at the parent's step, its remedy naming the nested step.
+A nested workflow's stages run inside the parent's step, and the root run holds its
+waits and controls.
 
 ## Complete example
 

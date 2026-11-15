@@ -96,6 +96,8 @@ mod workflow_continue;
 mod workflow_definition;
 #[path = "cli/workflow_mirror.rs"]
 mod workflow_mirror;
+#[path = "cli/workflow_nested.rs"]
+mod workflow_nested;
 #[path = "cli/workflow_reference.rs"]
 mod workflow_reference;
 #[path = "cli/workflow_retry.rs"]

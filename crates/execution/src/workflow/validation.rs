@@ -75,6 +75,7 @@ pub(crate) enum ValidationFailureKind {
     ChildWorkflowUnavailable,
     ChildWorkflowInvalid,
     ChildWorkflowNested,
+    NestedWorkflowUnsupported,
     ChildWorkflowRootBlocks,
     ChildInputUndeclared,
     ChildInputMissing,
@@ -139,6 +140,8 @@ pub(crate) enum ValidationLocation {
 pub(crate) struct ValidationFailure {
     kind: ValidationFailureKind,
     location: ValidationLocation,
+    /// The nested step and shape a `nested_workflow_unsupported` refuses, for its remedy.
+    unsupported_shape: Option<UnsupportedNestedShape>,
 }
 
 impl ValidationFailure {
@@ -150,8 +153,16 @@ impl ValidationFailure {
         &self.location
     }
 
+    pub(crate) fn unsupported_shape(&self) -> Option<&UnsupportedNestedShape> {
+        self.unsupported_shape.as_ref()
+    }
+
     fn new(kind: ValidationFailureKind, location: ValidationLocation) -> Self {
-        Self { kind, location }
+        Self {
+            kind,
+            location,
+            unsupported_shape: None,
+        }
     }
 }
 
@@ -164,7 +175,7 @@ impl fmt::Display for ValidationFailure {
 impl std::error::Error for ValidationFailure {}
 
 /// What a parent's validation needs to know of a child workflow file (REQ-WFFORMAT-89 to
-/// REQ-WFFORMAT-92); resolution builds one per file a `workflow` step names.
+/// REQ-WFFORMAT-92, REQ-WFFORMAT-104); resolution builds one per file a `workflow` step names.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ChildWorkflowSummary {
     /// The declared outcomes, or the implicit `succeeded` and `failed`.
@@ -172,20 +183,61 @@ pub(crate) struct ChildWorkflowSummary {
     pub(crate) exports: BTreeMap<String, WorkflowValueType>,
     /// Each declared input's kind and whether a run may omit it.
     pub(crate) inputs: BTreeMap<String, (WorkflowValueType, bool)>,
-    pub(crate) has_workflow_steps: bool,
+    pub(crate) nesting: ChildNesting,
     pub(crate) has_root_blocks: bool,
     /// The canonical paths the child's resolution reached, its own file included; empty
-    /// for a nested child, which is not resolved.
+    /// for a child past the bound, which is not resolved.
     pub(crate) paths: BTreeSet<String>,
 }
 
+/// Whether a child declares `workflow` steps and what its parent may make of it
+/// (REQ-WFFORMAT-104).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ChildNesting {
+    /// The child declares no `workflow` step.
+    Stage,
+    /// A nested workflow, resolved, that holds none of the refused shapes.
+    Nested,
+    /// A nested workflow, resolved, whose first refused shape this is.
+    Unsupported(UnsupportedNestedShape),
+    /// A child that declares `workflow` steps two deep below the file being validated; it
+    /// is not resolved, so the chain ends at the bound.
+    PastBound,
+}
+
+/// A step of a nested workflow and the shape it holds that its parent refuses.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct UnsupportedNestedShape {
+    pub(crate) step: String,
+    pub(crate) shape: NestedShape,
+}
+
+/// The shapes a nested workflow may not hold (REQ-WFFORMAT-104).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum NestedShape {
+    /// The step declares `forEach`.
+    ForEach,
+    /// A wait of the step's edges has a kind other than `answer` or `repair`.
+    WaitKind,
+    /// A wait of the step's edges continues at a target other than the step.
+    WaitThen,
+}
+
 impl ChildWorkflowSummary {
-    pub(crate) fn of(child: &ValidatedWorkflow, paths: BTreeSet<String>) -> Self {
+    /// `outcomes` is the child's `outcomes` list: the names its `outcome` block chooses
+    /// from, or for a nested workflow, which has none, the names its exits may take
+    /// (REQ-WFFORMAT-88); an empty list leaves the implicit `succeeded` and `failed`.
+    pub(crate) fn of(
+        child: &ValidatedWorkflow,
+        outcomes: &[String],
+        paths: BTreeSet<String>,
+    ) -> Self {
         Self {
-            outcomes: child.outcome.as_ref().map_or_else(
-                || vec!["succeeded".to_owned(), "failed".to_owned()],
-                |outcome| outcome.names.clone(),
-            ),
+            outcomes: if outcomes.is_empty() {
+                vec!["succeeded".to_owned(), "failed".to_owned()]
+            } else {
+                outcomes.to_vec()
+            },
             exports: child
                 .exports
                 .iter()
@@ -201,10 +253,7 @@ impl ChildWorkflowSummary {
                     )
                 })
                 .collect(),
-            has_workflow_steps: child
-                .steps
-                .values()
-                .any(|step| matches!(step, ValidatedStep::Workflow(_))),
+            nesting: nesting_of(child),
             has_root_blocks: child.root.is_some()
                 || child.name.is_some()
                 || child.version.is_some()
@@ -213,16 +262,66 @@ impl ChildWorkflowSummary {
         }
     }
 
-    /// A child that itself declares a `workflow` step; nothing else of it is read, since
-    /// it cannot be validated alone.
-    pub(crate) fn nested() -> Self {
+    /// A child that declares `workflow` steps past the bound; nothing else of it is read,
+    /// since it is not resolved.
+    pub(crate) fn past_bound() -> Self {
         Self {
             outcomes: Vec::new(),
             exports: BTreeMap::new(),
             inputs: BTreeMap::new(),
-            has_workflow_steps: true,
+            nesting: ChildNesting::PastBound,
             has_root_blocks: false,
             paths: BTreeSet::new(),
+        }
+    }
+}
+
+/// A child with `workflow` steps is a nested workflow; its first step in source order
+/// that declares `forEach`, or whose edges reach a wait that is not an `answer` or `repair`
+/// wait continuing at the step, is the shape its parent refuses (REQ-WFFORMAT-104).
+fn nesting_of(child: &ValidatedWorkflow) -> ChildNesting {
+    let mut workflow_steps = child
+        .source_order
+        .iter()
+        .filter_map(|name| match child.steps.get(name) {
+            Some(ValidatedStep::Workflow(step)) => Some((name, step)),
+            _ => None,
+        })
+        .peekable();
+    if workflow_steps.peek().is_none() {
+        return ChildNesting::Stage;
+    }
+    workflow_steps
+        .find_map(|(name, step)| {
+            let shape = if step.for_each.is_some() {
+                Some(NestedShape::ForEach)
+            } else {
+                step.edges
+                    .values()
+                    .find_map(|target| refused_wait(name, target))
+            };
+            shape.map(|shape| UnsupportedNestedShape {
+                step: name.clone(),
+                shape,
+            })
+        })
+        .map_or(ChildNesting::Nested, ChildNesting::Unsupported)
+}
+
+/// The refused shape of a wait an edge of `step` reaches, directly or as a limited edge's
+/// `else`, which counts as entered by `step`.
+fn refused_wait(step: &str, target: &ValidatedEdgeTarget) -> Option<NestedShape> {
+    match target {
+        ValidatedEdgeTarget::Step(_) | ValidatedEdgeTarget::Exit(_) => None,
+        ValidatedEdgeTarget::Limited { else_, .. } => refused_wait(step, else_),
+        ValidatedEdgeTarget::Wait { kind, then, .. } => {
+            if !matches!(kind, WaitKind::Answer | WaitKind::Repair) {
+                Some(NestedShape::WaitKind)
+            } else if !matches!(then.as_ref(), ValidatedEdgeTarget::Step(then) if then == step) {
+                Some(NestedShape::WaitThen)
+            } else {
+                None
+            }
         }
     }
 }
@@ -576,8 +675,17 @@ fn validate_workflow_step(
     let child = children
         .get(&node.workflow)
         .ok_or_else(|| step_failure(ValidationFailureKind::ChildWorkflowUnavailable))?;
-    if child.has_workflow_steps {
-        return Err(step_failure(ValidationFailureKind::ChildWorkflowNested));
+    match &child.nesting {
+        ChildNesting::Stage | ChildNesting::Nested => {}
+        ChildNesting::PastBound => {
+            return Err(step_failure(ValidationFailureKind::ChildWorkflowNested));
+        }
+        ChildNesting::Unsupported(shape) => {
+            return Err(ValidationFailure {
+                unsupported_shape: Some(shape.clone()),
+                ..step_failure(ValidationFailureKind::NestedWorkflowUnsupported)
+            });
+        }
     }
     if child.has_root_blocks {
         return Err(step_failure(ValidationFailureKind::ChildWorkflowRootBlocks));

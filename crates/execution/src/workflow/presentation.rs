@@ -46,7 +46,7 @@ use super::runtime::{
 #[cfg(test)]
 use super::step_runtime::{CommandExecutionFailure, StepExecutionFailure, StepFailureCause};
 use super::tree::{TreeDiagnostic, TreeLocation};
-use super::validated::ValidatedStep;
+use super::validated::{Scheduling, ValidatedStep};
 use super::wait::position_path;
 use crate::AgentHarnessInstallationFailure;
 use crate::harness_installation::UntestedHarnessAdvisory;
@@ -1712,29 +1712,72 @@ where
         item: Option<u64>,
     ) -> Result<ChildRunPresentation<StandardOutput, StandardError, Clock>, PresentationFailure>
     {
-        let mut position = vec![serde_json::Value::String(step.to_owned())];
-        position.extend(item.map(|item| serde_json::json!({ "item": item })));
-        Ok(ChildRunPresentation {
-            parent: self.clone(),
-            scope: Arc::new(Mutex::new(ChildStepScope {
-                position,
+        ChildRunPresentation::under(self.clone(), Vec::new(), workflow, step, item)
+    }
+}
+
+/// A running child run's view of its root's presentation (REQ-LOCALRUN-200,
+/// INV-ENGINE-28): the child's step and finalizer state records enqueue on the root's
+/// queue, in observation order with the root's own, scoped by the child step's position
+/// path from the root. The child's output, agent events and workflow records present
+/// nothing, and a failed write is the root's presentation failure. A nested run
+/// (REQ-WFEXEC-74) presents no step record of its own; its stages present through it.
+pub struct ChildRunPresentation<StandardOutput, StandardError, Clock> {
+    parent: WorkflowRunPresentation<StandardOutput, StandardError, Clock>,
+    /// The child run's position path from the root: `[<step>]` or `[<step>, {item: n}]`,
+    /// after a nested run's own path for one of its stages.
+    position: Arc<[serde_json::Value]>,
+    /// The child's own step records; `None` for a nested run.
+    steps: Option<Arc<Mutex<ChildStepScope>>>,
+}
+
+impl<StandardOutput, StandardError, Clock>
+    ChildRunPresentation<StandardOutput, StandardError, Clock>
+where
+    Clock: Clone,
+{
+    /// The presentation of the stage `step` of this nested run started, for element `item`
+    /// of a fan-out, whose resolved file is `workflow`: its records' scope extends this run's
+    /// path by the nested step (REQ-LOCALRUN-200).
+    pub fn child_scope(
+        &self,
+        workflow: &ResolvedWorkflow,
+        step: &str,
+        item: Option<u64>,
+    ) -> Result<Self, PresentationFailure> {
+        Self::under(
+            self.parent.clone(),
+            self.position.to_vec(),
+            workflow,
+            step,
+            item,
+        )
+    }
+
+    fn under(
+        parent: WorkflowRunPresentation<StandardOutput, StandardError, Clock>,
+        mut position: Vec<serde_json::Value>,
+        workflow: &ResolvedWorkflow,
+        step: &str,
+        item: Option<u64>,
+    ) -> Result<Self, PresentationFailure> {
+        position.push(serde_json::Value::String(step.to_owned()));
+        position.extend(item.map(super::run_record::item_position_element));
+        let steps = match workflow.definition.scheduling {
+            Scheduling::Edges { .. } => None,
+            Scheduling::Dataflow => Some(Arc::new(Mutex::new(ChildStepScope {
                 workflow: WorkflowPresentationDefinition::from_workflow(workflow),
                 // A child's records name no result directory of their own.
                 definition: PresentationDefinition::from_workflow(workflow, "")?,
                 step_starts: BTreeMap::new(),
-            })),
+            }))),
+        };
+        Ok(Self {
+            parent,
+            position: position.into(),
+            steps,
         })
     }
-}
-
-/// A running child run's view of its parent's presentation (REQ-LOCALRUN-200,
-/// INV-ENGINE-28): the child's step and finalizer state records enqueue on the parent's
-/// queue, in observation order with the parent's own, scoped by the child step's position
-/// path under the parent's step. The child's output, agent events and workflow records
-/// present nothing, and a failed write is the parent's presentation failure.
-pub struct ChildRunPresentation<StandardOutput, StandardError, Clock> {
-    parent: WorkflowRunPresentation<StandardOutput, StandardError, Clock>,
-    scope: Arc<Mutex<ChildStepScope>>,
 }
 
 impl<StandardOutput, StandardError, Clock> Clone
@@ -1745,14 +1788,13 @@ where
     fn clone(&self) -> Self {
         Self {
             parent: self.parent.clone(),
-            scope: Arc::clone(&self.scope),
+            position: Arc::clone(&self.position),
+            steps: self.steps.clone(),
         }
     }
 }
 
 struct ChildStepScope {
-    /// The parent's step and, for a fan-out, its element.
-    position: Vec<serde_json::Value>,
     workflow: WorkflowPresentationDefinition,
     definition: PresentationDefinition,
     step_starts: BTreeMap<String, Instant>,
@@ -1762,6 +1804,7 @@ impl ChildStepScope {
     fn render<StandardOutput: Write, StandardError: Write, Deadline>(
         &mut self,
         state: &mut PresentationState<StandardOutput, StandardError>,
+        position: &[serde_json::Value],
         observed_at: ObservationTime,
         transition: TransitionObservation<Deadline>,
     ) -> Result<(), PresentationFailure> {
@@ -1787,7 +1830,7 @@ impl ChildStepScope {
             to,
             transition.step,
         );
-        let mut position = self.position.clone();
+        let mut position = position.to_vec();
         position.push(serde_json::Value::String(step));
         state.write_step_records(observed_at.utc, &position_path(&position), records)?;
         state.flush_line_writer()
@@ -1806,16 +1849,16 @@ where
         &self,
         observation: ExecutionObservation<Deadline>,
     ) -> impl Future<Output = ()> + Send {
-        let forwarded = match observation {
-            ExecutionObservation::Transition(transition)
+        let forwarded = match (observation, &self.steps) {
+            (ExecutionObservation::Transition(transition), Some(steps))
                 if matches!(transition.event, TransitionEvent::Step { .. }) =>
             {
-                let scope = Arc::clone(&self.scope);
+                let (steps, position) = (Arc::clone(steps), Arc::clone(&self.position));
                 Some(self.parent.enqueue_render(move |state, observed_at| {
-                    scope
+                    steps
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .render(state, observed_at, *transition)
+                        .render(state, &position, observed_at, *transition)
                 }))
             }
             _ => None,

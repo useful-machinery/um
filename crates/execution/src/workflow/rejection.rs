@@ -9,7 +9,9 @@ use super::admission::{AdmissionFailure, AdmissionFailureKind, AdmissionLocation
 use super::presentation_feed::normalize_terminal_scalar;
 use super::resolution::{ResolutionFailure, ResolutionFailureKind, ResolutionLocation};
 use super::structure::{StructureRule, StructureViolation};
-use super::validation::{ValidationFailureKind, ValidationLocation};
+use super::validation::{
+    NestedShape, UnsupportedNestedShape, ValidationFailureKind, ValidationLocation,
+};
 use crate::AgentHarnessInstallationFailure;
 use crate::claude_code::{
     ClaudeCodeIncompatibility, ClaudeCodeInstallationFailure, ClaudeCodeProbe,
@@ -498,6 +500,9 @@ pub fn human_resolution_remedy(failure: &ResolutionFailure) -> String {
             human_resolution_remedy(child)
         );
     }
+    if let Some(nested) = failure.unsupported_shape() {
+        return unsupported_nested_shape_remedy(nested);
+    }
     let format = match failure.location() {
         ResolutionLocation::AgentProfileReplacement => "agent profile replacement format",
         _ => "workflow format",
@@ -520,6 +525,22 @@ pub fn human_resolution_remedy(failure: &ResolutionFailure) -> String {
             format!("Replace the workflow source with a regular file:\n  {source_path}")
         }
         _ => default.to_owned(),
+    }
+}
+
+/// The remedy for `nested_workflow_unsupported` names the nested step and its shape.
+fn unsupported_nested_shape_remedy(nested: &UnsupportedNestedShape) -> String {
+    let step = &nested.step;
+    match nested.shape {
+        NestedShape::ForEach => format!(
+            "Remove forEach from step {step} of the nested workflow; a nested workflow's steps do not fan out."
+        ),
+        NestedShape::WaitKind => format!(
+            "Make each wait on step {step} of the nested workflow an answer or repair wait."
+        ),
+        NestedShape::WaitThen => {
+            format!("Make each wait on step {step} of the nested workflow continue at {step}.")
+        }
     }
 }
 
@@ -801,7 +822,11 @@ fn validation_classification(kind: ValidationFailureKind) -> (&'static str, &'st
         ),
         ValidationFailureKind::ChildWorkflowNested => (
             "child_workflow_nested",
-            "Remove the workflow steps from the child workflow; a child cannot run children.",
+            "Remove the workflow steps from the file a nested workflow's step names; workflow steps nest at most two deep.",
+        ),
+        ValidationFailureKind::NestedWorkflowUnsupported => (
+            "nested_workflow_unsupported",
+            "Keep forEach, waits other than answer and repair, and waits that continue at another step out of the nested workflow.",
         ),
         ValidationFailureKind::ChildWorkflowRootBlocks => (
             "child_workflow_root_blocks",

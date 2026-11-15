@@ -50,15 +50,27 @@ impl ProvisionalStepResources for String {
     }
 
     // `child:<outcome>` names a child's ending in the reducer's tests, and
-    // `child:<outcome>:<step>` one an interruption with `user_request` failed at `step`.
+    // `child:<outcome>:<step>` one an interruption with `user_request` failed at `step`;
+    // `waits:<kind>` and `waits:<kind>:<step>` name a nested run that entered a wait of
+    // `kind`, the latter the `repair` wait such an interruption routed it to.
     fn child_ending(&self) -> Option<ChildEnding> {
+        let interruption = |step: &str| ChildInterruption {
+            reason: CancellationReason::UserRequest,
+            step: step.to_owned(),
+        };
+        if let Some(waits) = self.strip_prefix("waits:") {
+            let mut parts = waits.splitn(2, ':');
+            let kind =
+                serde_json::from_value(serde_json::Value::String(parts.next()?.to_owned())).ok()?;
+            return Some(ChildEnding::Waiting {
+                kind,
+                interruption: parts.next().map(interruption),
+            });
+        }
         let mut parts = self.strip_prefix("child:")?.splitn(2, ':');
-        Some(ChildEnding {
+        Some(ChildEnding::Exited {
             outcome: parts.next()?.to_owned(),
-            interruption: parts.next().map(|step| ChildInterruption {
-                reason: CancellationReason::UserRequest,
-                step: step.to_owned(),
-            }),
+            interruption: parts.next().map(interruption),
         })
     }
 }
@@ -71,12 +83,22 @@ pub struct ChildInterruption {
     pub step: String,
 }
 
-/// What a `workflow` step's child reported with the step's completion: the outcome it
-/// recorded and, when an interruption failed it, that interruption.
+/// What a `workflow` step's child reported with the step's completion.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct ChildEnding {
-    pub(crate) outcome: String,
-    pub(crate) interruption: Option<ChildInterruption>,
+pub(crate) enum ChildEnding {
+    /// The child exited with the outcome it recorded and, when an interruption failed it,
+    /// that interruption (REQ-WFEXEC-60, REQ-WFEXEC-70).
+    Exited {
+        outcome: String,
+        interruption: Option<ChildInterruption>,
+    },
+    /// The nested run entered a wait of `kind`, which the root carries (REQ-WFEXEC-75): with
+    /// the interruption that failed its stage when the wait is the `repair` that
+    /// interruption routed the nested run to (REQ-WFEXEC-70).
+    Waiting {
+        kind: WaitKind,
+        interruption: Option<ChildInterruption>,
+    },
 }
 
 impl ConditionOutput for CapturedValue {
@@ -1763,6 +1785,9 @@ where
             action,
             provisional,
         } => {
+            if let Some(ChildEnding::Waiting { kind, interruption }) = provisional.child_ending() {
+                return enter_carried_wait(reduction, &step, action, kind, interruption);
+            }
             let routed = match interrupted_completion(&reduction.state, &step, action, &provisional)
             {
                 InterruptedCompletion::Ordinary => false,
@@ -2090,9 +2115,80 @@ where
     true
 }
 
-// A step that never started drops its target invocation and becomes `not_reached` with every
-// other unstarted step, and the attempt ends on `wait`: the `stop` wait entered before it
-// (REQ-WFEXEC-62) or the wait an interruption kept (REQ-WFEXEC-72).
+// A `workflow` step whose nested run entered a wait ends without an outcome and takes no
+// edge: like a stopped step it becomes `not_reached` with every unstarted step, and the
+// attempt ends on the same wait carried at the step, whose `then` is the step (REQ-WFEXEC-75,
+// INV-ENGINE-40). Under an interruption with no issue recorded the carried wait ends the walk
+// as a routed child's edge does (REQ-WFEXEC-70).
+fn enter_carried_wait<Provisional, Cause, Output, Deadline>(
+    reduction: &mut Reduction<Provisional, Cause, Output, Deadline>,
+    step: &str,
+    action: ActionId,
+    kind: WaitKind,
+    interruption: Option<ChildInterruption>,
+) -> bool
+where
+    Cause: Clone,
+    Output: Clone,
+    Deadline: Clone,
+{
+    let state = &reduction.state;
+    let edge_step = matches!(state.definition.scheduling, RuntimeScheduling::Edges { .. })
+        && state
+            .definition
+            .steps
+            .get(step)
+            .is_some_and(|definition| definition.edges.is_some());
+    let running = matches!(
+        &state.workflow,
+        WorkflowState::Executing {
+            gate: SchedulingGate::Open
+        }
+    ) && step_accepts(state, step, StepStateKind::Running, action);
+    let interrupted = state.interrupted
+        && matches!(
+            &state.workflow,
+            WorkflowState::Executing {
+                gate: SchedulingGate::Cancelling {
+                    prior_issue: None,
+                    ..
+                }
+            }
+        )
+        && state.steps.get(step).is_some_and(|runtime| {
+            runtime.state.kind() == StepStateKind::Cancelling
+                && (runtime.current_action == Some(action)
+                    || runtime.target_invocation == Some(action))
+        });
+    if !edge_step
+        || state.wait.is_some()
+        || state.continued.is_some()
+        || state.exit_outcome.is_some()
+        || !(running || interrupted)
+    {
+        return false;
+    }
+    if interrupted {
+        reduction.state.routed_child = Some((step.to_owned(), interruption.clone()));
+    }
+    let wait = EnteredWait {
+        step: step.to_owned(),
+        outcome: None,
+        kind,
+        then: step.to_owned(),
+        on_hand_back: None,
+        rule: None,
+        interrupted: interruption,
+        kept: None,
+    };
+    settle_unstarted_on_wait(reduction, step, wait);
+    true
+}
+
+// A step that never started, or whose nested run waits, drops its invocations and becomes
+// `not_reached` with every other unstarted step, and the attempt ends on `wait`: the `stop`
+// wait entered before it (REQ-WFEXEC-62), the wait an interruption kept (REQ-WFEXEC-72) or
+// the nested run's wait the step carries (REQ-WFEXEC-75).
 fn settle_unstarted_on_wait<Provisional, Cause, Output, Deadline>(
     reduction: &mut Reduction<Provisional, Cause, Output, Deadline>,
     step: &str,
@@ -2823,7 +2919,11 @@ where
     {
         return InterruptedCompletion::Ordinary;
     }
-    let Some(ending) = provisional.child_ending() else {
+    let Some(ChildEnding::Exited {
+        outcome,
+        interruption,
+    }) = provisional.child_ending()
+    else {
         return InterruptedCompletion::Ordinary;
     };
     let prior_issue = matches!(
@@ -2835,7 +2935,7 @@ where
             }
         }
     );
-    match (edges.get(&ending.outcome), ending.interruption) {
+    match (edges.get(&outcome), interruption) {
         (None, _) => InterruptedCompletion::Fail,
         _ if prior_issue => InterruptedCompletion::Fail,
         (

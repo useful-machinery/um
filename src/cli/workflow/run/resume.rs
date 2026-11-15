@@ -402,7 +402,8 @@ pub(super) async fn continue_run(
         },
     };
     // REQ-CONTINUE-76, REQ-WFEXEC-68: the child run the abandoned step left, for a fan-out
-    // that of the element the run's `position` names, is adopted or retried; a repair retry
+    // that of the element the run's `position` names, is adopted or retried, a nested run's
+    // retry settled by its record once the run is admitted (REQ-CONTINUE-91); a repair retry
     // adopts the child an independent repair completed (REQ-CONTINUE-75).
     let child_recovery = match (&selection, from.as_slice()) {
         (Selection::Abandoned, [step]) => {
@@ -573,38 +574,46 @@ pub(super) async fn continue_run(
         return diagnose_after_settlement(pending, &signal_task, error).await;
     }
     // REQ-CONTINUE-81, REQ-CONTINUE-82, INV-ENGINE-27: a repair wait's retry at the waiting
-    // step continues the failed child the wait names, verified and admitted here, under both
-    // locks, before `begin` consumes the parent's wait.
-    let child_recovery = match (child_recovery, &selection_edge) {
-        (Some(recovery), _) => Some(recovery),
-        (
-            None,
-            Selection::Wait {
-                target,
-                reason: ContinuationReasonV1::Retry,
-                ..
-            },
-        ) if replacement_workflow.is_none() => {
+    // step continues the failed child the wait names, and a wait carried from a nested run
+    // continues that nested run (REQ-CONTINUE-92), verified and admitted here, under both
+    // locks, before `begin` consumes the parent's wait. REQ-CONTINUE-91: an abandoned step's
+    // nested run is settled by its record, under both locks, before `begin` settles the
+    // abandoned attempt.
+    let prepared = match (child_recovery, &selection_edge) {
+        (Some(recovery @ ChildRecovery::Retry { .. }), Selection::Abandoned) => {
+            super::child_recovery::prepare_abandoned(
+                recovery,
+                &pending,
+                &admitted,
+                &cancellation,
+                (&config, leaf),
+            )
+            .await
+        }
+        (Some(recovery), _) => Ok(Some(recovery)),
+        (None, Selection::Wait { target, reason, .. }) if replacement_workflow.is_none() => {
             let repair = super::child_recovery::Repair {
                 parent: &pending,
                 admitted: &admitted,
                 target,
                 explicit_root,
             };
-            match super::child_recovery::prepare(repair, &cancellation, (&config, leaf)).await {
-                Ok(recovery) => recovery,
-                Err(super::child_recovery::Unprepared::Rejected(result)) => {
-                    return reject_after_settlement(pending, &signal_task, result).await;
-                }
-                Err(super::child_recovery::Unprepared::Failed(message)) => {
-                    return fail_after_settlement(pending, &signal_task, message).await;
-                }
-                Err(super::child_recovery::Unprepared::Diagnosed(error)) => {
-                    return diagnose_after_settlement(pending, &signal_task, error).await;
-                }
-            }
+            super::child_recovery::prepare_wait(repair, *reason, &cancellation, (&config, leaf))
+                .await
         }
-        (None, _) => None,
+        (None, _) => Ok(None),
+    };
+    let child_recovery = match prepared {
+        Ok(recovery) => recovery,
+        Err(super::child_recovery::Unprepared::Rejected(result)) => {
+            return reject_after_settlement(pending, &signal_task, result).await;
+        }
+        Err(super::child_recovery::Unprepared::Failed(message)) => {
+            return fail_after_settlement(pending, &signal_task, message).await;
+        }
+        Err(super::child_recovery::Unprepared::Diagnosed(error)) => {
+            return diagnose_after_settlement(pending, &signal_task, error).await;
+        }
     };
     let definition_mode = if replacement_workflow.is_some() {
         ContinuationDefinitionMode::Replaced
@@ -841,8 +850,11 @@ async fn probe(
 }
 
 /// Whether the run's latest attempt, under the continuation's lock, still ended `continued`
-/// on `edge` (REQ-CONTINUE-78).
-fn still_continues(pending: &PendingLocalContinuation, edge: &ContinuationEdgeV1) -> bool {
+/// on `edge` (REQ-CONTINUE-78), for a root or a nested run (REQ-WFEXEC-74).
+pub(super) fn still_continues(
+    pending: &PendingLocalContinuation,
+    edge: &ContinuationEdgeV1,
+) -> bool {
     pending.continued_edge().is_some_and(|taken| {
         (&taken.step, &taken.outcome, &taken.target) == (&edge.step, &edge.outcome, &edge.target)
     })
@@ -862,13 +874,25 @@ fn repaired_child(
     let Some(wait) = pending.wait()? else {
         return Ok(None);
     };
+    let control = pending.resolving_control(&wait)?;
+    adopted_repair(pending, step, &wait, control)
+}
+
+/// `repaired_child` for the run `pending` holds waiting on `wait`, which `control` resolved:
+/// recorded on the run itself or, for a nested run, on its root (REQ-CONTINUE-92).
+pub(super) fn adopted_repair(
+    pending: &PendingLocalContinuation,
+    step: &str,
+    wait: &um_execution::WaitRecord,
+    control: Option<um_execution::ControlEvent>,
+) -> anyhow::Result<Option<ChildRecovery>> {
     if wait.kind != um_execution::WaitKind::Repair
         || wait.then != step
         || wait.step.first().and_then(serde_json::Value::as_str) != Some(step)
     {
         return Ok(None);
     }
-    let Some(control) = pending.resolving_control(&wait)? else {
+    let Some(control) = control else {
         return Ok(None);
     };
     if control.event != "control.retry"

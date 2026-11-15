@@ -3150,7 +3150,8 @@ fn last_document(output: &Output) -> serde_json::Value {
     chained(output).pop().unwrap()
 }
 
-fn attempt_result(run: &Path, attempt: u64) -> serde_json::Value {
+/// The published result of attempt `attempt` of the run at `run`.
+pub(super) fn attempt_result(run: &Path, attempt: u64) -> serde_json::Value {
     read_json(&run.join(format!("attempts/{attempt:06}/result/result.json")))
 }
 

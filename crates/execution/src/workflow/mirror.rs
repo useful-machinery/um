@@ -542,8 +542,9 @@ impl Mirror {
     }
 
     /// `onStage`, when a `workflow` step's child exits with `outcome`: `stage` is the step id
-    /// or its position path, and `summary` the child's `summary` text export when it made
-    /// one available.
+    /// or its position path from the root, which for a nested run's stage runs through the
+    /// nested run's step (`parts[2].partReview`), and `summary` the child's `summary` text
+    /// export when it made one available.
     pub fn stage(
         &self,
         target: &dyn MirrorTarget,

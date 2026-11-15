@@ -74,7 +74,7 @@ impl Stop {
         if super::control::exited(target) {
             return Err(Refusal::new("run_exited", "The run has exited.").into());
         }
-        if !target.step_ids().contains(&self.before.as_str()) {
+        if !target.step_ids().contains(&self.before) {
             return Err(
                 Refusal::new("step_unknown", "The run's workflow has no such step.").into(),
             );
@@ -145,10 +145,19 @@ impl Lift {
                 Refusal::new("stop_not_in_force", "No stop is in force for the step.").into(),
             );
         };
-        // The run's `stop` wait for this step, when it is in one, is the wait the lift acts on.
+        // The run's `stop` wait for this step, when it is in one, is the wait the lift acts on:
+        // the root's own before the step, or the one it carries from a nested run, whose `step`
+        // path ends in the nested step (REQ-WFEXEC-76).
         let wait = target
             .wait()
-            .filter(|wait| wait.kind == WaitKind::Stop && wait.then == step)
+            .filter(|wait| {
+                wait.kind == WaitKind::Stop
+                    && if wait.is_carried() {
+                        wait.step.last().and_then(Value::as_str) == Some(step)
+                    } else {
+                        wait.then == step
+                    }
+            })
             .map(um_execution::WaitRecord::id);
         let payload = Map::from_iter([
             ("before".to_owned(), Value::String(step.to_owned())),

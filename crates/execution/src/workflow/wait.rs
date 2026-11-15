@@ -85,6 +85,12 @@ const WHERE_RUN_WAIT_AND_COMPLETE: &str =
 /// the step the wait holds and the stop it lifts by that stop's `at` (REQ-WFEXEC-62).
 const WHERE_RUN_STEP_AND_STOP: &str = "event.run == run.id and event.payload.before == wait.then \
      and event.payload.stop == wait.payload.at";
+/// A carried stop's correlation: the root's `then` is its own step, so the lift names the
+/// nested step through the stop's own `payload.before`, which the wait's payload carries
+/// (REQ-WFEXEC-76).
+const WHERE_RUN_CARRIED_STOP: &str = "event.run == run.id \
+     and event.payload.before == wait.payload.payload.before \
+     and event.payload.stop == wait.payload.at";
 /// The highest ordinal a numbered record directory holds: `<NNNN>` has four digits.
 const NUMBERED_ORDINAL_LIMIT: u64 = 9999;
 const CONTROL_TEMPORARY_FILE: &str = "control.json.tmp";
@@ -104,7 +110,8 @@ pub struct WaitRecord {
     /// A canonical UTC RFC 3339 timestamp; with `kind` it is the wait's identity.
     pub since: String,
     /// The waiting step's position: `[<step>]`, or `[<step>, {"item": n}]` for a fan-out
-    /// waiting at its one-based element n.
+    /// waiting at its one-based element n, followed by the nested step for a wait the root
+    /// carries from a nested run (REQ-WFEXEC-75).
     pub step: Vec<Value>,
     pub then: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -335,6 +342,50 @@ impl WaitRecord {
         })
         .filter(Self::is_valid)
         .ok_or(LocalRunDirectoryError::WaitRecordInvalid)
+    }
+
+    /// The record of the wait a root carries from its nested run's record `nested`
+    /// (REQ-WFEXEC-75, INV-ENGINE-40): the nested wait's `kind`, `since` and `payload`, its
+    /// `child` replaced by `child`, the nested run's child relative to the root's run
+    /// directory; `step` the path `prefix` from the root to the nested run, `[<step>]` or
+    /// `[<step>, {"item": n}]`, followed by the nested wait's `step`; `then` the root's step
+    /// and the rule the kind derives for the root run, whose `run.id` and `wait.id` the
+    /// controls recorded on the root correlate with; a `stop` correlates its lift by the
+    /// stop's `payload.before` in place of `then` (REQ-WFEXEC-76). A kind that derives no
+    /// rule, or a record that is not valid, is `WaitRecordInvalid`.
+    pub fn carried(
+        nested: &Self,
+        prefix: &[Value],
+        then: &str,
+        child: Option<String>,
+    ) -> Result<Self, LocalRunDirectoryError> {
+        let mut rule =
+            derive_rule(nested.kind, false).ok_or(LocalRunDirectoryError::WaitRecordInvalid)?;
+        if nested.kind == WaitKind::Stop {
+            WHERE_RUN_CARRIED_STOP.clone_into(&mut rule.where_);
+        }
+        let mut payload = nested.payload.clone();
+        if let Some(child) = child {
+            payload.insert("child".to_owned(), Value::String(child));
+        }
+        Some(Self {
+            kind: nested.kind,
+            since: nested.since.clone(),
+            step: prefix.iter().chain(&nested.step).cloned().collect(),
+            then: then.to_owned(),
+            on_hand_back: None,
+            rule,
+            payload,
+        })
+        .filter(Self::is_valid)
+        .ok_or(LocalRunDirectoryError::WaitRecordInvalid)
+    }
+
+    /// Whether the root carries this wait from a nested run (REQ-WFEXEC-75): its `step`
+    /// continues past the root step's own path, `[<step>]` or `[<step>, {"item": n}]`, with the
+    /// nested step.
+    pub fn is_carried(&self) -> bool {
+        self.step.len() >= 2 && self.step.last().is_some_and(Value::is_string)
     }
 
     /// The wait's identity `<kind>@<since>`, which a control names in its `wait`.
@@ -1086,10 +1137,17 @@ pub fn position_path(position: &[Value]) -> String {
 }
 
 /// The fan-out step and element a position names (REQ-WFDEF-5, REQ-WFEXEC-68): its step and
-/// n exactly when the position is `[<step>, {"item": n}]`, and `None` for a bare `[<step>]`
-/// or any other shape.
+/// n when the position is `[<step>, {"item": n}]` or, for a nested run's step at that
+/// element (REQ-WFEXEC-75), that path followed by the nested step's id, read from its first
+/// two elements; `None` for a bare `[<step>]` or any other shape.
 pub(crate) fn fan_out_element(position: &[Value]) -> Option<(&str, u64)> {
-    let [Value::String(step), Value::Object(element)] = position else {
+    let ([Value::String(step), Value::Object(element)]
+    | [
+        Value::String(step),
+        Value::Object(element),
+        Value::String(_),
+    ]) = position
+    else {
         return None;
     };
     Some((step, element.get("item").and_then(Value::as_u64)?))

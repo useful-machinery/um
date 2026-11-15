@@ -893,6 +893,11 @@ impl MirroredWaitTree {
             "workflow.yaml",
             &WAIT_TREE_ROOT.replacen("schemaVersion: 1\n", header, 1),
         );
+        Self::published(bundle)
+    }
+
+    /// `bundle` published in a new home.
+    fn published(bundle: TreeBundle) -> Self {
         let home = Home::new();
         let report = home.json(&["publish", bundle.source_root().to_str().unwrap()]);
         assert_eq!(report["outcome"], "published", "{report}");
@@ -1284,6 +1289,110 @@ fn a_kept_wait_writes_no_mirror_record() {
     );
     assert_eq!(mirror_names(&run), written);
     assert!(comments(&stub).is_empty(), "{:?}", comments(&stub));
+}
+
+/// The root of the asking tree (`super::workflow_nested::asking_tree`) published with a
+/// subject and a mirror that comments when a stage exits and when the run waits.
+fn mirrored_nested_root() -> String {
+    let header = r#"schemaVersion: 1
+name: nested
+subject: ticket
+mirror:
+  linear:
+    issue: inputs.ticket
+    onStage: {comment: "{{stage}}: {{summary}}"}
+    onWait: {comment: "Waiting for {{wait.kind}}: {{wait.summary}}"}
+"#;
+    super::workflow_nested::NESTED_TREE_ROOT
+        .replacen("schemaVersion: 1\n", header, 1)
+        .replacen("inputs:\n", "inputs:\n  ticket:\n    kind: text\n", 1)
+}
+
+// REQ-LOCALRUN-191, REQ-WFEXEC-74, REQ-WFEXEC-75: each stage of a nested run writes the root's
+// `onStage` with its path from the root and its `summary` export, else its outcome, before
+// the nested run routes it, and the nested run's own exit writes one for the root's step;
+// the nested run writes no mirror of its own, and a stage that ends `blocked` into an
+// `answer` wait the root carries is followed by the root's one `onWait`.
+#[test]
+fn a_nested_runs_stages_comment_through_the_roots_mirror() {
+    let bundle = super::workflow_nested::asking_tree();
+    bundle.write_source("workflow.yaml", &mirrored_nested_root());
+    fs::write(bundle.execution_root().join("verdict-ask-b"), "blocked").unwrap();
+    let tree = MirroredWaitTree::published(bundle);
+    let stub = LinearStub::start();
+    let execution_root = tree.bundle.execution_root().to_str().unwrap().to_owned();
+
+    let terminal = completed(&tree.run(
+        &stub,
+        &[
+            "create",
+            &tree.definition,
+            "--execution-root",
+            &execution_root,
+            "--input-text",
+            "ticket",
+            "AUTO-1",
+            "--input-json",
+            "parts",
+            r#"[{"name":"a"},{"name":"b"}]"#,
+            "--json",
+        ],
+    ));
+    assert_eq!(terminal["wait"]["kind"], "answer", "{terminal}");
+    let run = PathBuf::from(terminal["runDirectory"].as_str().unwrap());
+
+    let written = comments(&stub);
+    let element = |prefix: &str| {
+        written
+            .iter()
+            .filter(|comment| comment.starts_with(prefix))
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        element("outer[1]"),
+        [
+            "outer[1].ask: a needs a decision",
+            "outer[1].work: worked",
+            "outer[1]: checked"
+        ],
+        "{written:?}"
+    );
+    assert_eq!(
+        element("outer[2]"),
+        ["outer[2].ask: b needs a decision"],
+        "{written:?}"
+    );
+    assert_eq!(
+        written.last().map(String::as_str),
+        Some("Waiting for answer: b needs a decision"),
+        "{written:?}"
+    );
+    assert_eq!(written.len(), 5, "{written:?}");
+
+    let writes = mirror_writes(&run);
+    let hooks = writes
+        .iter()
+        .map(|(name, write)| {
+            assert_eq!(write["outcome"], "written", "{write}");
+            name.split_once('-').unwrap().1
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        hooks,
+        [
+            "stage.json",
+            "stage.json",
+            "stage.json",
+            "stage.json",
+            "wait.json"
+        ]
+    );
+    for item in [1, 2] {
+        let nested = super::workflow_nested::nested_run(&run, item);
+        assert!(nested.is_dir(), "{}", nested.display());
+        assert!(!nested.join("mirror").exists(), "{}", nested.display());
+    }
 }
 
 /// `command` without `LINEAR_API_KEY`.

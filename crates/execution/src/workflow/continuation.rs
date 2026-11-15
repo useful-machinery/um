@@ -568,7 +568,7 @@ mod tests {
                 .collect(),
             exports: BTreeMap::new(),
             inputs: BTreeMap::new(),
-            has_workflow_steps: false,
+            nesting: super::super::validation::ChildNesting::Stage,
             has_root_blocks: false,
             paths: BTreeSet::new(),
         };
@@ -608,7 +608,7 @@ mod tests {
                 .collect(),
             exports: BTreeMap::new(),
             inputs: BTreeMap::new(),
-            has_workflow_steps: false,
+            nesting: super::super::validation::ChildNesting::Stage,
             has_root_blocks: false,
             paths: BTreeSet::new(),
         };
@@ -659,7 +659,7 @@ mod tests {
                     .iter()
                     .map(|input| ((*input).to_owned(), (WorkflowValueType::Text, true)))
                     .collect(),
-                has_workflow_steps: false,
+                nesting: super::super::validation::ChildNesting::Stage,
                 has_root_blocks: false,
                 paths: BTreeSet::new(),
             }
@@ -704,7 +704,7 @@ mod tests {
             outcomes: vec!["planned".to_owned(), "blocked".to_owned()],
             exports: BTreeMap::from([("parts".to_owned(), WorkflowValueType::Json)]),
             inputs: BTreeMap::new(),
-            has_workflow_steps: false,
+            nesting: super::super::validation::ChildNesting::Stage,
             has_root_blocks: false,
             paths: BTreeSet::new(),
         };

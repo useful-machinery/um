@@ -20,7 +20,9 @@ use super::validated::{
     DeclaredInputs, ValidatedInputDefault, ValidatedMessageSource, ValidatedStep,
     ValidatedWorkflow, WorkflowNodeRole,
 };
-use super::validation::{ChildWorkflowSummary, ValidationFailureKind, ValidationLocation};
+use super::validation::{
+    ChildWorkflowSummary, UnsupportedNestedShape, ValidationFailureKind, ValidationLocation,
+};
 use super::{DecodeFailure, DecodeFailureKind, decode, validation};
 use crate::workflow::document::{NodeBody, Output, WorkflowDocument};
 
@@ -87,11 +89,21 @@ pub struct ResolutionFailure {
     /// Boxed, as is the violation, so the failure stays a small `Err` value.
     workflow_path: Option<Box<str>>,
     source_path: Option<PathBuf>,
-    /// The child workflow's own failure behind `child_workflow_invalid`.
-    child: Option<Box<ResolutionFailure>>,
+    /// What stands behind a failure at a `workflow` step, for its remedy.
+    behind: Option<Box<BehindStepFailure>>,
     /// The field and the rule a structurally invalid workflow file or replacement
     /// document breaks.
     violation: Option<Box<StructureViolation>>,
+}
+
+/// What stands behind a failure at a `workflow` step.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum BehindStepFailure {
+    /// The child workflow's own failure behind `child_workflow_invalid`, or behind a
+    /// `child_workflow_nested` raised for a chain too deep below the child.
+    Child(ResolutionFailure),
+    /// The nested step and shape a `nested_workflow_unsupported` refuses.
+    UnsupportedShape(UnsupportedNestedShape),
 }
 
 impl ResolutionFailure {
@@ -111,9 +123,21 @@ impl ResolutionFailure {
         self.source_path.as_deref()
     }
 
-    /// The failure of the child workflow a `child_workflow_invalid` step names.
+    /// The failure of the child workflow a `child_workflow_invalid` or `child_workflow_nested`
+    /// step names.
     pub(crate) fn child_failure(&self) -> Option<&ResolutionFailure> {
-        self.child.as_deref()
+        match self.behind.as_deref() {
+            Some(BehindStepFailure::Child(child)) => Some(child),
+            Some(BehindStepFailure::UnsupportedShape(_)) | None => None,
+        }
+    }
+
+    /// The nested step and shape behind a `nested_workflow_unsupported`.
+    pub(crate) fn unsupported_shape(&self) -> Option<&UnsupportedNestedShape> {
+        match self.behind.as_deref() {
+            Some(BehindStepFailure::UnsupportedShape(shape)) => Some(shape),
+            Some(BehindStepFailure::Child(_)) | None => None,
+        }
     }
 
     /// The field and the rule of an `invalid_workflow_structure` or a structural
@@ -128,7 +152,7 @@ impl ResolutionFailure {
             location,
             workflow_path: None,
             source_path: None,
-            child: None,
+            behind: None,
             violation: None,
         }
     }
@@ -370,7 +394,7 @@ fn resolve_loaded_workflow(
     replacement: Option<&AgentProfileReplacementDocument>,
 ) -> Result<ResolvedWorkflow, ResolutionFailure> {
     let document = decode_workflow(&workflow_source)?;
-    resolve_decoded_workflow(sources, workflow_source, document, replacement)
+    resolve_decoded_workflow(sources, workflow_source, document, replacement, 0)
 }
 
 fn decode_workflow(workflow_source: &LoadedSource) -> Result<WorkflowDocument, ResolutionFailure> {
@@ -383,14 +407,20 @@ fn decode_workflow(workflow_source: &LoadedSource) -> Result<WorkflowDocument, R
     })
 }
 
+/// Resolve a decoded workflow `depth` `workflow` steps below the file being validated.
 fn resolve_decoded_workflow(
     mut sources: SourceResolver,
     workflow_source: LoadedSource,
     document: WorkflowDocument,
     replacement: Option<&AgentProfileReplacementDocument>,
+    depth: usize,
 ) -> Result<ResolvedWorkflow, ResolutionFailure> {
-    let (children, child_export_schemas) =
-        resolve_children(&document, &workflow_source.canonical_path, &mut sources)?;
+    let (children, child_export_schemas) = resolve_children(
+        &document,
+        &workflow_source.canonical_path,
+        &mut sources,
+        depth,
+    )?;
     // Decoding the selected workflow types its declared profiles before the replacement
     // is decoded, so a defective definition is reported as such rather than as a
     // replacement failure.
@@ -412,8 +442,11 @@ fn resolve_decoded_workflow(
             .map(|replacement| &replacement.profiles),
         &children,
     )
-    .map_err(|failure| {
-        ResolutionFailure::new(
+    .map_err(|failure| ResolutionFailure {
+        behind: failure
+            .unsupported_shape()
+            .map(|shape| Box::new(BehindStepFailure::UnsupportedShape(shape.clone()))),
+        ..ResolutionFailure::new(
             ResolutionFailureKind::InvalidWorkflowDefinition(failure.kind()),
             ResolutionLocation::Semantic(failure.location().clone()),
         )
@@ -491,16 +524,23 @@ fn resolve_decoded_workflow(
 /// The schema of each child's `json` export, by child workflow path and export name.
 type ChildExportSchemas = BTreeMap<String, BTreeMap<String, RetainedJsonSchema>>;
 
-/// Resolve each child workflow file a `workflow` step names (REQ-WFFORMAT-89): check its
-/// path, read it through the same sources, resolve it as its own workflow, fold its closure
-/// into the parent's so the parent's digest covers it, and summarize it for validation. A
-/// child that itself declares a `workflow` step is summarized as nested without resolving
-/// it, so resolution never recurses past one level. The schemas of a resolved child's
+/// How many `workflow` steps below the file being validated a child is a stage: one there
+/// that itself declares a `workflow` step is past the bound (REQ-WFFORMAT-104).
+const STAGE_DEPTH: usize = 2;
+
+/// Resolve each child workflow file a `workflow` step of the document `depth` steps below
+/// the file being validated names (REQ-WFFORMAT-89): check its path, read it through the
+/// same sources, resolve it as its own workflow one level deeper, fold its closure into the
+/// parent's so the parent's digest covers it, and summarize it for validation. A child at
+/// the stage depth that itself declares a `workflow` step is summarized as past the bound
+/// without resolving it, so resolution never recurses past two levels and a chain of files
+/// that name each other ends there (REQ-WFFORMAT-104). The schemas of a resolved child's
 /// `json` exports are kept for the `workflow` steps that run it.
 fn resolve_children(
     document: &WorkflowDocument,
     workflow_path: &str,
     sources: &mut SourceResolver,
+    depth: usize,
 ) -> Result<(BTreeMap<String, ChildWorkflowSummary>, ChildExportSchemas), ResolutionFailure> {
     let mut children = BTreeMap::new();
     let mut export_schemas = ChildExportSchemas::new();
@@ -542,21 +582,39 @@ fn resolve_children(
                 }
             })?;
         let child_path = loaded.canonical_path.clone();
-        let invalid = |cause: ResolutionFailure| ResolutionFailure {
-            child: Some(Box::new(cause.with_workflow_path(child_path.clone()))),
-            ..failure(ValidationFailureKind::ChildWorkflowInvalid)
+        let invalid = |cause: ResolutionFailure| {
+            // A nested workflow whose own child is past the bound makes this step's chain
+            // too deep, which is this step's failure (REQ-WFFORMAT-104).
+            let kind = if cause.kind
+                == ResolutionFailureKind::InvalidWorkflowDefinition(
+                    ValidationFailureKind::ChildWorkflowNested,
+                ) {
+                ValidationFailureKind::ChildWorkflowNested
+            } else {
+                ValidationFailureKind::ChildWorkflowInvalid
+            };
+            ResolutionFailure {
+                behind: Some(Box::new(BehindStepFailure::Child(
+                    cause.with_workflow_path(child_path.clone()),
+                ))),
+                ..failure(kind)
+            }
         };
         let child_document = decode_workflow(&loaded).map_err(invalid)?;
-        let nested = child_document
-            .steps
-            .values()
-            .any(|step| matches!(step.body, NodeBody::Workflow(_)));
-        let summary = if nested {
-            ChildWorkflowSummary::nested()
+        let child_depth = depth + 1;
+        let child_outcomes = child_document.outcomes.clone();
+        let past_bound = child_depth >= STAGE_DEPTH
+            && child_document
+                .steps
+                .values()
+                .any(|step| matches!(step.body, NodeBody::Workflow(_)));
+        let summary = if past_bound {
+            ChildWorkflowSummary::past_bound()
         } else {
-            let child = resolve_decoded_workflow(sources.fork(), loaded, child_document, None)
-                .map_err(invalid)?;
-            sources.fold(&child.source_closure, &location)?;
+            let child =
+                resolve_decoded_workflow(sources.fork(), loaded, child_document, None, child_depth)
+                    .map_err(invalid)?;
+            sources.fold(&child.source_closure, &child.reached_paths, &location)?;
             export_schemas.insert(
                 node.workflow.clone(),
                 child
@@ -573,7 +631,7 @@ fn resolve_children(
             // The child's own file was read by this resolver before the fork.
             let mut paths = child.reached_paths;
             paths.insert(child_path);
-            ChildWorkflowSummary::of(&child.definition, paths)
+            ChildWorkflowSummary::of(&child.definition, &child_outcomes, paths)
         };
         children.insert(node.workflow.clone(), summary);
     }
@@ -622,7 +680,8 @@ struct SourceResolver {
     canonical_root: PathBuf,
     supplied_root: PathBuf,
     closure: BTreeMap<String, Arc<[u8]>>,
-    /// The canonical paths `load` returned or `fold` added, for this resolution alone.
+    /// The canonical paths `load` returned or a folded child reached, for this resolution
+    /// alone.
     reached: BTreeSet<String>,
     retained_bytes: u64,
     retained_only: bool,
@@ -890,14 +949,18 @@ impl SourceResolver {
         }
     }
 
-    /// Add a child's closure to this one; a path both read holds the same bytes.
+    /// Add a child's closure to this one; a path both read holds the same bytes. Only the
+    /// paths the child's resolution reached are reached here: the rest of its closure is
+    /// what this resolver had read before the fork, which a nested workflow's step must not
+    /// count as its child's (REQ-WFFORMAT-104).
     fn fold(
         &mut self,
         closure: &BTreeMap<String, Arc<[u8]>>,
+        reached: &BTreeSet<String>,
         location: &ResolutionLocation,
     ) -> Result<(), ResolutionFailure> {
+        self.reached.extend(reached.iter().cloned());
         for (path, bytes) in closure {
-            self.reached.insert(path.clone());
             if self.closure.contains_key(path) {
                 continue;
             }

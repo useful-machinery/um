@@ -25,7 +25,8 @@ pub(super) type Hook =
     dyn FnOnce(&Mirror, &dyn MirrorTarget) -> Result<(), LocalRunDirectoryError> + Send;
 
 /// The run's mirror, or `None` when it writes nothing: its root has no `mirror` block, it was
-/// started by path (no definition or revision), or it is a child run. A missing or non-text
+/// started by path (no definition or revision), or it is a child run, a nested run included,
+/// whose stages' `onStage` its root's mirror writes. A missing or non-text
 /// issue input, or a snapshot or resolution record that cannot be read, still makes a
 /// `Mirror`, whose every hook records the failure. A revision with a resolution record
 /// makes a mirror that matches and writes states by id (REQ-LOCALRUN-192).
