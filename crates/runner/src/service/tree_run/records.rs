@@ -1,12 +1,15 @@
 //! Reading the local run and wait records a tree run leaves (REQ-LOCALRUN-175,
 //! REQ-LOCALRUN-178) and the terminal report they map to (REQ-RUNNERENROLL-99): the
-//! transport result is `succeeded` unless the record's outcome is the engine's `failed`
-//! (REQ-WFEXEC-57), or `canceled` or `withdrawn` (`cancelled`), the record's outcome
-//! travels as `chosenOutcome`, its run's mirror writes as `mirror` and its own confirmed
-//! departure as `claimRelease`. An adopted run (REQ-RUNNERENROLL-89) whose record
-//! already read `exited` `failed` reports the failure its current attempt recorded, and
-//! one whose first `resume --from` the runtime refused ends `failed` with the refusal's
-//! code, as does a run whose `create` the runtime refused (REQ-RUNNERENROLL-91).
+//! transport result is `cancelled` when the record's outcome is the engine's `canceled` or
+//! `withdrawn`, and otherwise the outcome of the engine's published result (REQ-WFEXEC-15),
+//! read from the last `--json` document or, when that carries none, from the run
+//! directory's record of the current attempt; the record's outcome, the workflow's choice,
+//! travels as `chosenOutcome` and never selects the result, its run's mirror writes as
+//! `mirror` and its own confirmed departure as `claimRelease`. An adopted run
+//! (REQ-RUNNERENROLL-89) whose record already read `exited` is concluded by the result its
+//! current attempt recorded, and one whose first `resume --from` the runtime refused ends
+//! `failed` with the refusal's code, as does a run whose `create` the runtime refused
+//! (REQ-RUNNERENROLL-91).
 
 use std::path::Path;
 
@@ -41,6 +44,14 @@ pub(in crate::service) struct TreeRecord {
     /// The run's `mirror/` writes in order (REQ-LOCALRUN-193), read only for the record
     /// the loop ends on; empty while the loop observes the record.
     pub(in crate::service) mirror: Vec<MirrorWrite>,
+}
+
+impl TreeRecord {
+    /// Whether the record's outcome is the engine's own cancellation, `canceled` or
+    /// `withdrawn`, which no workflow can declare (REQ-WFFORMAT-87).
+    pub(in crate::service) fn reads_cancellation(&self) -> bool {
+        matches!(self.outcome.as_deref(), Some("canceled" | "withdrawn"))
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -177,14 +188,114 @@ impl TransportResult {
     }
 }
 
-/// Maps the record the resume loop ended on, the last `um` command's `--json` document
-/// and the runner's applied cancellation to the attempt's report. The loop ends on a
-/// record that does not read `exited`, or before `create` wrote one, only when the
-/// runner's shutdown or lease loss stopped it, which is an interruption without an
-/// outcome; any other unsettled or missing record has no truthful result.
+/// The engine's published result for the attempt that exited the run (REQ-WFEXEC-15), as
+/// the runner read it, and whether it read it from the run directory's record of that
+/// attempt rather than from a command's `--json` document.
+#[derive(Clone, Debug, PartialEq)]
+pub(in crate::service) struct EngineResult {
+    pub(in crate::service) outcome: EngineOutcome,
+    pub(in crate::service) recorded: bool,
+}
+
+/// The settled outcome of an engine result.
+#[derive(Clone, Debug, PartialEq)]
+pub(in crate::service) enum EngineOutcome {
+    Succeeded,
+    /// A failure, with its primary issue when the result names one.
+    Failed {
+        primary_issue: Option<Value>,
+    },
+    Cancelled,
+}
+
+impl EngineResult {
+    /// The settled result a command's `--json` `document` carries (REQ-LOCALRUN-127): its
+    /// `result.outcome` `succeeded`, `failed`, with `result.primaryIssue` when that is an
+    /// object, or `cancelled`; `None` for a `waiting` or `continued` result, a refusal, or a
+    /// document with no result.
+    pub(in crate::service) fn from_document(document: &Value) -> Option<Self> {
+        let result = &document["result"];
+        let outcome = match result["outcome"].as_str()? {
+            "succeeded" => EngineOutcome::Succeeded,
+            "failed" => EngineOutcome::Failed {
+                primary_issue: Some(&result["primaryIssue"])
+                    .filter(|issue| issue.is_object())
+                    .cloned(),
+            },
+            "cancelled" => EngineOutcome::Cancelled,
+            _ => return None,
+        };
+        Some(Self {
+            outcome,
+            recorded: false,
+        })
+    }
+}
+
+/// The result `<run directory>/state.json` records for the run's current attempt, counted
+/// only once the attempt's result is recorded `published`, which the engine does before the
+/// run's record reads `exited`: its state `succeeded`, `workflow_failed`, a failure whose
+/// primary issue is the attempt's first node in state `failed` with a detail, as a document
+/// would carry it, or `cancelled`. `None` for any other state, a result not recorded
+/// published, or a file `read_json` cannot read.
+pub(in crate::service) fn read_recorded_result(run_directory: &Path) -> Option<EngineResult> {
+    let state = read_json(run_directory, "state.json")?;
+    let current = state["currentAttemptNumber"].as_u64()?;
+    let attempt = state["attempts"]
+        .as_array()?
+        .iter()
+        .find(|attempt| attempt["attemptNumber"].as_u64() == Some(current))?;
+    if attempt["result"]["status"] != "published" {
+        return None;
+    }
+    let outcome = match attempt["state"].as_str()? {
+        "succeeded" => EngineOutcome::Succeeded,
+        "workflow_failed" => EngineOutcome::Failed {
+            primary_issue: failed_issue(attempt),
+        },
+        "cancelled" => EngineOutcome::Cancelled,
+        _ => return None,
+    };
+    Some(EngineResult {
+        outcome,
+        recorded: true,
+    })
+}
+
+/// The first node of `attempt` in state `failed` with a detail, as the primary issue a
+/// document would carry.
+fn failed_issue(attempt: &Value) -> Option<Value> {
+    attempt["progress"]["steps"]
+        .as_array()?
+        .iter()
+        .find(|step| {
+            step["state"] == "failed"
+                && step["id"].is_string()
+                && matches!(step["role"].as_str(), Some("step" | "finalizer"))
+                && step["detail"].is_object()
+        })
+        .map(|step| {
+            json!({
+                "node": { "id": step["id"], "role": step["role"] },
+                "state": "failed",
+                "detail": step["detail"],
+            })
+        })
+}
+
+/// Maps the record the resume loop ended on, the engine's result for the attempt that
+/// exited it and the runner's applied cancellation to the attempt's report. An exited
+/// record whose outcome is the engine's `canceled` or `withdrawn` is a cancellation whatever
+/// any result reads; otherwise the engine's result is the transport result and the record's
+/// outcome only the chosen one: `succeeded`, `failed` with its primary issue, carrying
+/// diagnostic stage `tree_run_adopted_failure` when it was read from the run's record, or
+/// `cancelled`. No engine result, or a failure without its issue, has no truthful result.
+/// The loop ends on a record that does not read `exited`, or before `create` wrote one,
+/// only when the runner's shutdown or lease loss stopped it, which is an interruption
+/// without an outcome; any other unsettled or missing record has no truthful result.
 pub(in crate::service) fn conclude(
     record: Option<&TreeRecord>,
-    document: Option<&Value>,
+    engine: Option<&EngineResult>,
     cancellation: Option<CancellationReason>,
 ) -> TreeConclusion {
     let record = match record {
@@ -211,21 +322,29 @@ pub(in crate::service) fn conclude(
             };
         }
     };
-    let result = match record.outcome.as_deref() {
-        Some("failed") => {
-            let Some(primary_issue) = document
-                .map(|document| &document["result"]["primaryIssue"])
-                .filter(|issue| issue.is_object())
-            else {
-                return TreeConclusion::Unreportable("tree_run_failure_unclassified");
-            };
-            TransportResult::Failed {
+    let result = if record.reads_cancellation() {
+        cancelled_result(cancellation)
+    } else {
+        match engine.map(|engine| (&engine.outcome, engine.recorded)) {
+            Some((EngineOutcome::Succeeded, _)) => TransportResult::Succeeded,
+            Some((
+                EngineOutcome::Failed {
+                    primary_issue: Some(primary_issue),
+                },
+                recorded,
+            )) => TransportResult::Failed {
                 primary_issue: primary_issue.clone(),
-                diagnostic: None,
-            }
+                diagnostic: recorded.then(|| json!({ "stage": "tree_run_adopted_failure" })),
+            },
+            Some((EngineOutcome::Cancelled, _)) => cancelled_result(cancellation),
+            Some((
+                EngineOutcome::Failed {
+                    primary_issue: None,
+                },
+                _,
+            ))
+            | None => return TreeConclusion::Unreportable("tree_run_failure_unclassified"),
         }
-        Some("canceled" | "withdrawn") => cancelled_result(cancellation),
-        _ => TransportResult::Succeeded,
     };
     TreeConclusion::Terminal {
         transitions: gate_transitions(&result),
@@ -299,13 +418,10 @@ fn confirms_departure(write: &MirrorWrite) -> bool {
 }
 
 /// How a run ended when the runner classifies the end itself rather than concluding the
-/// record and the last command's document: an adopted run's (REQ-RUNNERENROLL-89), or a
-/// created run's whose `create` the runtime refused (REQ-RUNNERENROLL-91).
+/// record and the engine's result: an adopted run's (REQ-RUNNERENROLL-89), or a created
+/// run's whose `create` the runtime refused (REQ-RUNNERENROLL-91).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(in crate::service) enum ClassifiedEnd {
-    /// The adopted record already read `exited` `failed` and no command ran: the issue
-    /// its current attempt recorded on its failed node, when it recorded one.
-    RecordedFailure { primary_issue: Option<Value> },
     /// The runtime refused `command`, the run's first, with its first diagnostic's `code`,
     /// so `step` did not start: the first named step of a `resume --from`, or the root
     /// workflow's first step for a `create`.
@@ -338,33 +454,15 @@ impl RefusedCommand {
     }
 }
 
-/// Concludes a classified `end`. A recorded failure is the attempt's own issue with
-/// diagnostic stage `tree_run_adopted_failure`, its exit the record's as `conclude` reports
-/// it, mirror writes and release request included; without an issue, or without the record,
-/// it has no truthful result. A refused first command is the failure of its step to start,
-/// with diagnostic stage `tree_run_create_refused` for a `create` and
-/// `tree_run_continuation_refused` for a first resume and the runtime's code as
-/// `declineCause`, no chosen outcome and no release request: the run did not change, or was
-/// never made. Neither did one whose first resume a cancellation reached before any attempt
-/// started: it is cancelled or interrupted as that cancellation reads, and nothing of the
-/// record, which is the earlier attempt's, is reported.
-pub(in crate::service) fn conclude_classified(
-    end: &ClassifiedEnd,
-    record: Option<&TreeRecord>,
-) -> TreeConclusion {
+/// Concludes a classified `end`, whatever any engine result reads. A refused first command
+/// is the failure of its step to start, with diagnostic stage `tree_run_create_refused` for
+/// a `create` and `tree_run_continuation_refused` for a first resume and the runtime's code
+/// as `declineCause`, no chosen outcome and no release request: the run did not change, or
+/// was never made. Neither did one whose first resume a cancellation reached before any
+/// attempt started: it is cancelled or interrupted as that cancellation reads, and nothing
+/// of the record, which is the earlier attempt's, is reported.
+pub(in crate::service) fn conclude_classified(end: &ClassifiedEnd) -> TreeConclusion {
     let (result, exit) = match end {
-        ClassifiedEnd::RecordedFailure { primary_issue } => {
-            let (Some(primary_issue), Some(record)) = (primary_issue, record) else {
-                return TreeConclusion::Unreportable("tree_run_failure_unclassified");
-            };
-            (
-                TransportResult::Failed {
-                    primary_issue: primary_issue.clone(),
-                    diagnostic: Some(json!({ "stage": "tree_run_adopted_failure" })),
-                },
-                recorded_exit(record),
-            )
-        }
         ClassifiedEnd::Refused {
             command,
             step,
@@ -395,34 +493,6 @@ pub(in crate::service) fn conclude_classified(
         exit,
         result,
     }
-}
-
-/// The issue `<run directory>/state.json` records for the current attempt: its first
-/// node in state `failed` with a detail, as the primary issue a document would carry;
-/// `None` when it records none or is unreadable as `read_json` reads it.
-pub(in crate::service) fn read_failed_issue(run_directory: &Path) -> Option<Value> {
-    let state = read_json(run_directory, "state.json")?;
-    let current = state["currentAttemptNumber"].as_u64()?;
-    let attempt = state["attempts"]
-        .as_array()?
-        .iter()
-        .find(|attempt| attempt["attemptNumber"].as_u64() == Some(current))?;
-    attempt["progress"]["steps"]
-        .as_array()?
-        .iter()
-        .find(|step| {
-            step["state"] == "failed"
-                && step["id"].is_string()
-                && matches!(step["role"].as_str(), Some("step" | "finalizer"))
-                && step["detail"].is_object()
-        })
-        .map(|step| {
-            json!({
-                "node": { "id": step["id"], "role": step["role"] },
-                "state": "failed",
-                "detail": step["detail"],
-            })
-        })
 }
 
 /// The root's workflow-state transitions from the open gate to the terminal state the

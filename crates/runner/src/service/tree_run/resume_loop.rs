@@ -16,7 +16,8 @@
 //! nothing. Once
 //! the loop has ended on an exited record, after the last `um` process and so after the
 //! outcome hook, it reads the run's `mirror/` writes onto that record for the terminal
-//! report.
+//! report and, when the last document carries no settled engine result, the result the
+//! run's current attempt recorded in `state.json`.
 //!
 //! A `create` the runtime refuses made no run: it ends the loop as a
 //! `ClassifiedEnd::Refused` naming the root workflow's first step, never as a missing
@@ -63,9 +64,9 @@ use um_runner_protocol::{
 
 use super::command::{self, CommandExit, UmCommand};
 use super::records::{
-    ClassifiedEnd, MIRROR_READER_LOST, RecordState, RefusedCommand, TreeConclusion, TreeRecord,
-    TreeWait, conclude, conclude_classified, mirror_read_failure, read_failed_issue, read_record,
-    read_wait,
+    ClassifiedEnd, EngineResult, MIRROR_READER_LOST, RecordState, RefusedCommand, TreeConclusion,
+    TreeRecord, TreeWait, conclude, conclude_classified, mirror_read_failure, read_record,
+    read_recorded_result, read_wait,
 };
 use super::steps::{self, StepKey, StepReader};
 use super::{TreeRun, TreeStart};
@@ -95,59 +96,98 @@ impl Default for ResumeIntervals {
 }
 
 /// The record the loop ended on, the last command's document, the cancellation the
-/// runner applied, for a run whose end the runner classifies itself, how it ended, and the
-/// class of a failure to read the exited run's `mirror/`.
+/// runner applied, for a run whose end the runner classifies itself, how it ended, the
+/// engine's result the run directory recorded for an exited run whose document carries
+/// none, and the class of a failure to read the exited run's `mirror/`.
 #[derive(Debug)]
 pub(in crate::service) struct TreeEnd {
     pub(in crate::service) record: Option<TreeRecord>,
     pub(in crate::service) document: Option<Value>,
     pub(in crate::service) cancellation: Option<CancellationReason>,
     pub(in crate::service) classified: Option<ClassifiedEnd>,
+    pub(in crate::service) recorded: Option<EngineResult>,
     pub(in crate::service) mirror_failure: Option<&'static str>,
 }
 
 impl TreeEnd {
     /// The loop's end on `record`, as the command that last ran left it.
     fn after(record: Option<TreeRecord>, exit: CommandExit) -> Self {
+        Self::of(record, exit.document, exit.cancellation)
+    }
+
+    /// The loop's end on `record` with the last command's `document` and the applied
+    /// `cancellation`, neither classified nor yet read beyond the record.
+    fn of(
+        record: Option<TreeRecord>,
+        document: Option<Value>,
+        cancellation: Option<CancellationReason>,
+    ) -> Self {
         Self {
             record,
-            document: exit.document,
-            cancellation: exit.cancellation,
+            document,
+            cancellation,
             classified: None,
+            recorded: None,
             mirror_failure: None,
         }
     }
 
+    /// The settled engine result the last command's document carries.
+    fn documented(&self) -> Option<EngineResult> {
+        self.document.as_ref().and_then(EngineResult::from_document)
+    }
+
     /// The attempt's report: `records::conclude_classified` for an end the runner
-    /// classified, otherwise `records::conclude`.
+    /// classified, otherwise `records::conclude` over the engine's result the document
+    /// carries or, when it carries none, the one the run directory recorded.
     pub(in crate::service) fn conclusion(&self) -> TreeConclusion {
         match &self.classified {
-            Some(classified) => conclude_classified(classified, self.record.as_ref()),
-            None => conclude(
-                self.record.as_ref(),
-                self.document.as_ref(),
-                self.cancellation,
-            ),
+            Some(classified) => conclude_classified(classified),
+            None => {
+                let documented = self.documented();
+                conclude(
+                    self.record.as_ref(),
+                    documented.as_ref().or(self.recorded.as_ref()),
+                    self.cancellation,
+                )
+            }
         }
     }
 
-    /// The end with the mirror writes of the run at `directory` on its exited record, read on
-    /// a blocking worker. A `mirror/` that cannot be read reports no writes, so the report
-    /// requests no release on an outcome it cannot confirm, and the end keeps the failure's
-    /// class for the run event.
-    async fn with_mirror(mut self, directory: PathBuf) -> Self {
-        if let Some(record) = self
+    /// The end with what the run at `directory` recorded beside its exited record, read on
+    /// one blocking worker: its mirror writes on the record and, for an unclassified end
+    /// whose outcome is not the engine's cancellation and whose document carries no settled
+    /// result, the engine's result its current attempt recorded. A `mirror/` that cannot be
+    /// read reports no writes, so the report requests no release on an outcome it cannot
+    /// confirm, and the end keeps the failure's class for the run event.
+    async fn with_exit_records(mut self, directory: PathBuf) -> Self {
+        let wants_result = self.classified.is_none() && self.documented().is_none();
+        let Some(record) = self
             .record
             .as_mut()
             .filter(|record| record.state == RecordState::Exited)
+        else {
+            return self;
+        };
+        let wants_result = wants_result && !record.reads_cancellation();
+        match tokio::task::spawn_blocking(move || {
+            (
+                um_execution::read_mirror_writes(&directory),
+                wants_result
+                    .then(|| read_recorded_result(&directory))
+                    .flatten(),
+            )
+        })
+        .await
         {
-            match tokio::task::spawn_blocking(move || um_execution::read_mirror_writes(&directory))
-                .await
-            {
-                Ok(Ok(writes)) => record.mirror = writes,
-                Ok(Err(error)) => self.mirror_failure = Some(mirror_read_failure(&error)),
-                Err(_) => self.mirror_failure = Some(MIRROR_READER_LOST),
+            Ok((writes, recorded)) => {
+                match writes {
+                    Ok(writes) => record.mirror = writes,
+                    Err(error) => self.mirror_failure = Some(mirror_read_failure(&error)),
+                }
+                self.recorded = recorded;
             }
+            Err(_) => self.mirror_failure = Some(MIRROR_READER_LOST),
         }
         self
     }
@@ -376,7 +416,7 @@ pub(super) async fn drive(run: &TreeRun, sink: ReportSink<'_>) -> Result<TreeEnd
     };
     let end = drive_to_end(&mut driver).await?;
     Ok(match driver.directory {
-        Some(directory) => end.with_mirror(directory).await,
+        Some(directory) => end.with_exit_records(directory).await,
         None => end,
     })
 }
@@ -385,8 +425,6 @@ pub(super) async fn drive(run: &TreeRun, sink: ReportSink<'_>) -> Result<TreeEnd
 /// until the loop ends.
 async fn drive_to_end(driver: &mut Driver<'_>) -> Result<TreeEnd, DriveFailure> {
     let run = driver.run;
-    // Whether a command has run: an adopted run with no named step starts at its record.
-    let mut commanded = true;
     // The attempt count of an adopted exited record its first command resumes from named
     // steps: a record still exited on that count is the earlier attempt's, not this one's.
     let mut adopted_exit: Option<u64> = None;
@@ -461,13 +499,11 @@ async fn drive_to_end(driver: &mut Driver<'_>) -> Result<TreeEnd, DriveFailure> 
                     }
                     exit
                 }
-                _ => {
-                    commanded = false;
-                    CommandExit {
-                        document: None,
-                        cancellation: None,
-                    }
-                }
+                // With no named step the loop starts at the record the earlier attempt left.
+                _ => CommandExit {
+                    document: None,
+                    cancellation: None,
+                },
             }
         }
     };
@@ -507,21 +543,9 @@ async fn drive_to_end(driver: &mut Driver<'_>) -> Result<TreeEnd, DriveFailure> 
                     return Err(DriveFailure::Cause("tree_run_resume_stalled"));
                 }
                 driver.flush(&record, steps, None)?;
-                // An adopted record that already failed has no document to classify it.
-                let classified = if !commanded && record.outcome.as_deref() == Some("failed") {
-                    let primary_issue =
-                        tokio::task::spawn_blocking(move || read_failed_issue(&directory))
-                            .await
-                            .ok()
-                            .flatten();
-                    Some(ClassifiedEnd::RecordedFailure { primary_issue })
-                } else {
-                    None
-                };
-                return Ok(TreeEnd {
-                    classified,
-                    ..TreeEnd::after(Some(record), exit)
-                });
+                // An adopted record that already exited has no document: the end-of-drive
+                // read takes its result from the run directory.
+                return Ok(TreeEnd::after(Some(record), exit));
             }
             RecordState::Running => {
                 // A resume that left the record running on the same attempt started
@@ -565,7 +589,6 @@ async fn drive_to_end(driver: &mut Driver<'_>) -> Result<TreeEnd, DriveFailure> 
             Woken::Changed => continue,
             Woken::Ran(ran) => {
                 exit = ran;
-                commanded = true;
                 continue;
             }
             Woken::Cancelled(reason) => {
@@ -575,7 +598,6 @@ async fn drive_to_end(driver: &mut Driver<'_>) -> Result<TreeEnd, DriveFailure> 
         exit = driver
             .command(command::resume_arguments(&directory))
             .await?;
-        commanded = true;
     }
 }
 
@@ -928,13 +950,7 @@ impl Driver<'_> {
         record: TreeRecord,
     ) -> Result<TreeEnd, DriveFailure> {
         if command::leaves_record(reason) {
-            return Ok(TreeEnd {
-                record: Some(record),
-                document: None,
-                cancellation: Some(reason),
-                classified: None,
-                mirror_failure: None,
-            });
+            return Ok(TreeEnd::of(Some(record), None, Some(reason)));
         }
         let _ = command::cancel_run(&self.run.um, &self.run.runs).await;
         let record = match self.observe(directory.to_owned()).await {
@@ -944,13 +960,7 @@ impl Driver<'_> {
             }
             None => None,
         };
-        Ok(TreeEnd {
-            record,
-            document: None,
-            cancellation: Some(reason),
-            classified: None,
-            mirror_failure: None,
-        })
+        Ok(TreeEnd::of(record, None, Some(reason)))
     }
 
     /// Before the loop ends on an exited record, reports the step observations that

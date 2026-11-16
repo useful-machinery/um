@@ -987,9 +987,9 @@ impl ExecutionJob {
                 result,
                 exit,
             } => (transitions, result, exit),
-            // No record, a failure without its issue, or a record a cancellation left
-            // unsettled has no truthful result: the attempt is interrupted as the
-            // engine interrupts an unexpected outcome.
+            // No record, an exited record with no engine result or a failed one without
+            // its issue, or a record a cancellation left unsettled has no truthful result:
+            // the attempt is interrupted as the engine interrupts an unexpected outcome.
             TreeConclusion::Unreportable(cause) => {
                 self.run_event.leave(PhaseEnd::Failed);
                 self.collapse("runner_internal_failure", cause, "harness_execution");

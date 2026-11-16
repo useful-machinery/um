@@ -52,8 +52,8 @@ const RUN_URL: &str = "https://usefulmachinery.com/acme/runs/run_01k0z6r1w8f4jy2
 /// each command line under `$TREE_TEST_LOG`, and for `run create` copies the revision's
 /// `resolution.json` there when one exists, copies the directory `$TREE_TEST_MIRROR`, when
 /// set, as the run's `mirror/`, and leaves a `run.json` reading `$TREE_TEST_STATE` and
-/// `$TREE_TEST_OUTCOME`, answering with `$TREE_TEST_RESULT` as the document's `result` when
-/// it is set: for state `waiting`
+/// `$TREE_TEST_OUTCOME`, answering with `$TREE_TEST_RESULT` as the document's `result`, the
+/// engine's `{"outcome":"succeeded"}` when it is unset: for state `waiting`
 /// beside a `wait.json` of kind `$TREE_TEST_WAIT_KIND` whose rule names
 /// `$TREE_TEST_WAIT_SOURCE`, its `step` and the record's `position` the JSON
 /// `$TREE_TEST_POSITION` (`["merge"]` when unset) and its `then` `$TREE_TEST_THEN` (`merge`
@@ -67,7 +67,8 @@ const RUN_URL: &str = "https://usefulmachinery.com/acme/runs/run_01k0z6r1w8f4jy2
 /// refuses with `wait_condition_unavailable`, `refuse` refuses with
 /// `continuation_nodes_unsatisfied`, `stall` starts nothing and prints nothing until `run
 /// cancel` runs, and `continue` starts the record's next attempt at
-/// that position, then lands the run once `$TREE_TEST_LOG/proceed` exists. `run cancel` ends a waiting
+/// that position, then lands the run once `$TREE_TEST_LOG/proceed` exists, its result
+/// `{"outcome":"succeeded"}`. `run cancel` ends a waiting
 /// record `canceled`. A stage `$TREE_TEST_LOG/stages/<name>/` is copied into the run
 /// directory: `create` before the first record is written, `exited` after `create` writes
 /// an `exited` record, `resume<n>` by the n-th `resume` (after `continue` writes attempt 2)
@@ -157,7 +158,7 @@ case "$1 $2 $3" in
     ;;
   esac
   result="$TREE_TEST_RESULT"
-  [ -n "$result" ] || result='{}'
+  [ -n "$result" ] || result='{"outcome":"succeeded"}'
   printf '{"runDirectory":"%s","result":%s}\n' "$run" "$result"
   ;;
 "workflow run event")
@@ -236,7 +237,7 @@ case "$1 $2 $3" in
     while [ ! -e "$log/proceed" ] && [ "$i" -lt 400 ]; do sleep 0.05; i=$((i + 1)); done
     stage landed
     printf '{"state":"exited","outcome":"landed","attempts":%s,"position":[]}\n' "$next" > "$run/run.json"
-    printf '{"outcome":"succeeded","runDirectory":"%s","result":{}}\n' "$run"
+    printf '{"outcome":"succeeded","runDirectory":"%s","result":{"outcome":"succeeded"}}\n' "$run"
     ;;
   refuse)
     printf '{"schemaVersion":1,"outcome":"rejected","exitStatus":1,"phase":"continuation","runDirectory":"%s","diagnostics":[{"code":"continuation_nodes_unsatisfied","message":"refused"}]}\n' "$run"
@@ -705,6 +706,77 @@ async fn published_tree_runs_once_and_reports_the_chosen_outcome() {
     );
 }
 
+// REQ-RUNNERENROLL-99: a run that succeeded and chose an outcome its workflow names
+// `failed` finishes `succeeded`, that outcome its chosen one.
+#[tokio::test]
+async fn succeeded_run_choosing_an_outcome_named_failed_finishes_succeeded() {
+    let mut fixture = fixture_with(
+        TREE_DIGEST,
+        "exited",
+        "\"failed\"",
+        &[("TREE_TEST_RESULT", r#"{"outcome":"succeeded"}"#)],
+    );
+    let reports = execute(&mut fixture).await;
+
+    let Some(ExecutionReport::TreeFinished { outcome, .. }) = reports.last() else {
+        panic!("expected a tree finish: {reports:#?}");
+    };
+    assert_eq!(outcome["outcome"], "succeeded");
+    assert_eq!(chosen_outcome(&reports).as_deref(), Some("failed"));
+}
+
+// REQ-RUNNERENROLL-99: a run that failed and chose its `onFailure` outcome `blocked`
+// finishes `failed` with its result's primary issue, `blocked` its chosen outcome.
+#[tokio::test]
+async fn failed_run_choosing_its_on_failure_outcome_finishes_failed() {
+    let mut fixture = fixture_with(
+        TREE_DIGEST,
+        "exited",
+        "\"blocked\"",
+        &[("TREE_TEST_RESULT", BUILD_FAILED)],
+    );
+    let reports = execute(&mut fixture).await;
+
+    let Some(ExecutionReport::TreeFinished { outcome, .. }) = reports.last() else {
+        panic!("expected a tree finish: {reports:#?}");
+    };
+    assert_eq!(outcome["outcome"], "failed");
+    let failed: Value = serde_json::from_str(BUILD_FAILED).unwrap();
+    assert_eq!(outcome["primaryIssue"], failed["primaryIssue"]);
+    assert_eq!(chosen_outcome(&reports).as_deref(), Some("blocked"));
+}
+
+// REQ-RUNNERENROLL-99: a created run whose last command's document carries no settled
+// result finishes by the result its current attempt recorded published, as an adopted
+// record does.
+#[tokio::test]
+async fn exited_run_without_a_settled_document_finishes_by_its_recorded_result() {
+    let mut fixture = fixture_with(
+        TREE_DIGEST,
+        "exited",
+        "\"blocked\"",
+        &[("TREE_TEST_RESULT", "{}")],
+    );
+    let (failed_step, issue) = build_failure();
+    stage(
+        &fixture.log,
+        "exited",
+        "",
+        "state.json",
+        &attempt_state("workflow_failed", published_result(), json!([failed_step])),
+    );
+    let reports = execute(&mut fixture).await;
+
+    let payload = finished_payload(&reports, &fixture.offer);
+    assert_eq!(payload["outcome"]["outcome"], "failed");
+    assert_eq!(payload["outcome"]["primaryIssue"], issue);
+    assert_eq!(
+        payload["diagnostic"],
+        json!({ "stage": "tree_run_adopted_failure" })
+    );
+    assert_eq!(payload["chosenOutcome"], "blocked");
+}
+
 /// A tree run offered on a GitLab project as Cloud admits one: schema 2 with both
 /// pins at the workspace commit and the GitLab display snapshot, its workspace checked
 /// out over the Cloud relay through the returned broker's read grants. The run fails,
@@ -1085,9 +1157,11 @@ fn claim_release_is_requested_only_after_a_confirmed_departure() {
         (vec![failed("mirror_write_rejected")], false),
         (vec![failed("mirror_unavailable")], false),
     ] {
-        let TreeConclusion::Terminal { exit, .. } =
-            conclude(Some(&exited_with(&writes)), None, None)
-        else {
+        let TreeConclusion::Terminal { exit, .. } = conclude_documented(
+            Some(&exited_with(&writes)),
+            Some(&result_document("succeeded")),
+            None,
+        ) else {
             panic!("an exited record has a result");
         };
         assert_eq!(exit.claim_release, release, "{writes:#?}");
@@ -1106,8 +1180,11 @@ fn claim_release_is_requested_only_after_a_confirmed_departure() {
     // A frame carries at most 1,024 results: the latest, whose outcome write still counts.
     let mut writes = vec![comment_written(); 1_100];
     writes.push(state_write("written", json!({})));
-    let TreeConclusion::Terminal { exit, .. } = conclude(Some(&exited_with(&writes)), None, None)
-    else {
+    let TreeConclusion::Terminal { exit, .. } = conclude_documented(
+        Some(&exited_with(&writes)),
+        Some(&result_document("succeeded")),
+        None,
+    ) else {
         panic!("an exited record has a result");
     };
     assert_eq!(exit.mirror.len(), 1_024);
@@ -2283,22 +2360,70 @@ fn exited(outcome: &str) -> super::records::TreeRecord {
     }
 }
 
-// REQ-RUNNERENROLL-99
+/// `conclude` over the engine's result the last command's `document` carries.
+fn conclude_documented(
+    record: Option<&super::records::TreeRecord>,
+    document: Option<&Value>,
+    cancellation: Option<CancellationReason>,
+) -> TreeConclusion {
+    conclude(
+        record,
+        document
+            .and_then(super::records::EngineResult::from_document)
+            .as_ref(),
+        cancellation,
+    )
+}
+
+/// The last document of a run whose engine result reads `outcome`.
+fn result_document(outcome: &str) -> Value {
+    json!({ "outcome": outcome, "result": { "outcome": outcome } })
+}
+
+/// Each transition's gate it leaves and state it enters.
+fn gates(transitions: &[Value]) -> Vec<(Value, Value)> {
+    transitions
+        .iter()
+        .map(|event| (event["from"]["gate"].clone(), event["to"]["state"].clone()))
+        .collect()
+}
+
+// REQ-RUNNERENROLL-99: an exited run is reported by the engine's result, never by the name
+// of the outcome its workflow chose, which travels as the chosen outcome; the engine's own
+// `canceled` and `withdrawn` are a cancellation whatever the result reads.
 #[test]
-fn record_outcomes_map_to_transport_results() {
+fn exited_records_conclude_from_the_engine_result_not_the_chosen_outcome() {
     let issue = json!({
         "node": {"id": "build", "role": "step"},
         "state": "failed",
         "detail": {"phase": "execution", "code": "command_exit", "exitCode": 2},
     });
-    let document = json!({"result": {"primaryIssue": issue}});
+    // A run that succeeded and chose an outcome its workflow names `failed`.
     let TreeConclusion::Terminal {
         transitions,
         result,
         exit,
-    } = conclude(Some(&exited("failed")), Some(&document), None)
+    } = conclude_documented(
+        Some(&exited("failed")),
+        Some(&result_document("succeeded")),
+        None,
+    )
     else {
-        panic!("a failed record has a result");
+        panic!("a succeeded result has a result");
+    };
+    assert_eq!(result, TransportResult::Succeeded);
+    assert_eq!(gates(&transitions), [(json!("open"), json!("succeeded"))]);
+    assert_eq!(exit.chosen_outcome.as_deref(), Some("failed"));
+
+    // A run that failed and chose its `onFailure` outcome `blocked`.
+    let failed = json!({ "result": { "outcome": "failed", "primaryIssue": issue } });
+    let TreeConclusion::Terminal {
+        transitions,
+        result,
+        exit,
+    } = conclude_documented(Some(&exited("blocked")), Some(&failed), None)
+    else {
+        panic!("a failed result has a result");
     };
     assert_eq!(
         result,
@@ -2309,68 +2434,110 @@ fn record_outcomes_map_to_transport_results() {
     );
     assert_eq!(result.outcome()["primaryIssue"], issue);
     assert_eq!(
-        transitions
-            .iter()
-            .map(|event| (event["from"]["gate"].clone(), event["to"]["state"].clone()))
-            .collect::<Vec<_>>(),
+        gates(&transitions),
         [
             (json!("open"), json!("executing")),
             (json!("failure_stopped"), json!("failed")),
         ]
     );
-    assert_eq!(exit.chosen_outcome.as_deref(), Some("failed"));
+    assert_eq!(exit.chosen_outcome.as_deref(), Some("blocked"));
+
+    // A failure without its cause, or an exit with no engine result, is not reported.
+    let unclassified = json!({ "result": { "outcome": "failed" } });
+    let unsettled = [
+        None,
+        Some(json!({ "result": {} })),
+        Some(result_document("waiting")),
+        Some(result_document("continued")),
+        Some(json!({
+            "outcome": "rejected",
+            "diagnostics": [{ "code": "continuation_nodes_unsatisfied" }],
+        })),
+    ];
+    for outcome in ["blocked", "planned", "failed", "landed"] {
+        assert_eq!(
+            conclude_documented(Some(&exited(outcome)), Some(&unclassified), None),
+            TreeConclusion::Unreportable("tree_run_failure_unclassified"),
+            "{outcome}"
+        );
+        for document in &unsettled {
+            assert_eq!(
+                conclude_documented(Some(&exited(outcome)), document.as_ref(), None),
+                TreeConclusion::Unreportable("tree_run_failure_unclassified"),
+                "{outcome} {document:?}"
+            );
+        }
+    }
+
+    // The engine's cancellation is the run's, whatever the record names.
+    let TreeConclusion::Terminal { result, .. } = conclude_documented(
+        Some(&exited("superseded")),
+        Some(&result_document("cancelled")),
+        Some(CancellationReason::ForceAbort),
+    ) else {
+        panic!("a cancelled result has a result");
+    };
+    assert_eq!(
+        result,
+        TransportResult::Cancelled {
+            reason: CancellationReason::ForceAbort
+        }
+    );
 
     for (outcome, applied, expected) in [
         (
             "canceled",
             Some(CancellationReason::UserRequest),
-            CancellationReason::UserRequest,
+            TransportResult::Cancelled {
+                reason: CancellationReason::UserRequest,
+            },
         ),
-        ("canceled", None, CancellationReason::UserRequest),
-        ("withdrawn", None, CancellationReason::UserRequest),
+        (
+            "canceled",
+            None,
+            TransportResult::Cancelled {
+                reason: CancellationReason::UserRequest,
+            },
+        ),
+        (
+            "withdrawn",
+            None,
+            TransportResult::Cancelled {
+                reason: CancellationReason::UserRequest,
+            },
+        ),
         (
             "canceled",
             Some(CancellationReason::ForceAbort),
-            CancellationReason::ForceAbort,
+            TransportResult::Cancelled {
+                reason: CancellationReason::ForceAbort,
+            },
+        ),
+        (
+            "canceled",
+            Some(CancellationReason::ExecutionLeaseExpired),
+            TransportResult::Interrupted {
+                reason: CancellationReason::ExecutionLeaseExpired,
+            },
         ),
     ] {
-        let TreeConclusion::Terminal {
-            result,
-            transitions,
-            ..
-        } = conclude(Some(&exited(outcome)), None, applied)
-        else {
-            panic!("a canceled record has a result");
-        };
-        assert_eq!(result, TransportResult::Cancelled { reason: expected });
-        assert_eq!(result.outcome()["outcome"], "cancelled");
-        assert_eq!(transitions.last().unwrap()["to"]["state"], "cancelled");
-    }
-    let TreeConclusion::Terminal { result, .. } = conclude(
-        Some(&exited("canceled")),
-        None,
-        Some(CancellationReason::ExecutionLeaseExpired),
-    ) else {
-        panic!("a canceled record has a result");
-    };
-    assert_eq!(
-        result,
-        TransportResult::Interrupted {
-            reason: CancellationReason::ExecutionLeaseExpired
+        // A late withdrawal records `withdrawn` over a result that reads `succeeded`.
+        for document in [None, Some(result_document("succeeded"))] {
+            let TreeConclusion::Terminal {
+                result,
+                transitions,
+                exit,
+            } = conclude_documented(Some(&exited(outcome)), document.as_ref(), applied)
+            else {
+                panic!("a {outcome} record has a result");
+            };
+            assert_eq!(result, expected, "{outcome} {applied:?} {document:?}");
+            assert_eq!(result.outcome()["outcome"], "cancelled");
+            assert_eq!(transitions.last().unwrap()["to"]["state"], "cancelled");
+            assert_eq!(exit.chosen_outcome.as_deref(), Some(outcome));
         }
-    );
-    let TreeConclusion::Terminal { result, exit, .. } =
-        conclude(Some(&exited("blocked")), None, None)
-    else {
-        panic!("a chosen outcome has a result");
-    };
-    assert_eq!(result, TransportResult::Succeeded);
-    assert_eq!(exit.chosen_outcome.as_deref(), Some("blocked"));
+    }
 
-    assert_eq!(
-        conclude(Some(&exited("failed")), None, None),
-        TreeConclusion::Unreportable("tree_run_failure_unclassified")
-    );
     for state in [
         super::records::RecordState::Waiting,
         super::records::RecordState::Running,
@@ -3589,10 +3756,47 @@ async fn adopted_running_run_without_its_process_is_resumed_once() {
     succeeded_with(&end, "landed");
 }
 
+/// The current attempt's result as the engine records it once published, before the run's
+/// record reads `exited`.
+fn published_result() -> Value {
+    json!({ "status": "published", "relativeDirectory": "attempts/000001/result" })
+}
+
+/// The bytes of a `state.json` whose current attempt, 1, reads `state` with `result`, its
+/// progress `steps`.
+fn attempt_state(state: &str, result: Value, steps: Value) -> Vec<u8> {
+    let state = json!({
+        "schemaVersion": 1,
+        "currentAttemptNumber": 1,
+        "attempts": [{
+            "attemptNumber": 1,
+            "state": state,
+            "result": result,
+            "progress": { "steps": steps },
+        }],
+    });
+    serde_json::to_vec(&state).unwrap()
+}
+
+/// Writes `run`'s `state.json` as `attempt_state` builds it.
+fn write_attempt(run: &Path, state: &str, result: Value, steps: Value) {
+    fs::write(run.join("state.json"), attempt_state(state, result, steps)).unwrap();
+}
+
+/// The failure of `build` an attempt records, and the primary issue it is reported as.
+fn build_failure() -> (Value, Value) {
+    let detail = json!({ "phase": "execution", "code": "command_exit", "exitCode": 2 });
+    (
+        json!({ "id": "build", "role": "step", "state": "failed", "detail": detail }),
+        json!({ "node": { "id": "build", "role": "step" }, "state": "failed", "detail": detail }),
+    )
+}
+
 // REQ-RUNNERENROLL-89
 #[tokio::test]
 async fn adopted_exited_run_is_reported_as_it_reads_without_a_command() {
     let adopted = adopted(record("exited", Some("landed"), 1, json!([])), None);
+    write_attempt(&adopted.run, "succeeded", published_result(), json!([]));
     let home = files(&adopted.home);
     let (end, _) = drive_adopted(&adopted, &[], "").await;
 
@@ -3617,46 +3821,79 @@ async fn adopted_exited_run_is_reported_as_it_reads_without_a_command() {
 #[tokio::test]
 async fn adopted_failed_record_reports_the_failure_its_attempt_recorded() {
     let adopted = adopted(record("exited", Some("failed"), 1, json!([])), None);
-    let detail = json!({ "phase": "execution", "code": "command_exit", "exitCode": 2 });
-    let state = json!({
-        "schemaVersion": 1,
-        "currentAttemptNumber": 1,
-        "attempts": [{
-            "attemptNumber": 1,
-            "progress": { "steps": [
-                { "id": "design", "role": "step", "state": "succeeded" },
-                { "id": "build", "role": "step", "state": "failed", "detail": detail },
-            ] },
-        }],
-    });
-    fs::write(
-        adopted.run.join("state.json"),
-        serde_json::to_vec(&state).unwrap(),
-    )
-    .unwrap();
+    let (failed_step, issue) = build_failure();
+    write_attempt(
+        &adopted.run,
+        "workflow_failed",
+        published_result(),
+        json!([{ "id": "design", "role": "step", "state": "succeeded" }, failed_step]),
+    );
     let (end, _) = drive_adopted(&adopted, &[], "").await;
 
     assert_eq!(resumes(&adopted.log), 0);
     let TreeConclusion::Terminal { result, exit, .. } = end.conclusion() else {
         panic!("an adopted failed record has a result: {end:#?}");
     };
-    let TransportResult::Failed {
-        primary_issue,
-        diagnostic,
-    } = result
-    else {
-        panic!("a failed record fails the attempt");
-    };
     assert_eq!(
-        primary_issue,
-        json!({ "node": { "id": "build", "role": "step" }, "state": "failed", "detail": detail })
-    );
-    assert_eq!(
-        diagnostic,
-        Some(json!({ "stage": "tree_run_adopted_failure" }))
+        result,
+        TransportResult::Failed {
+            primary_issue: issue,
+            diagnostic: Some(json!({ "stage": "tree_run_adopted_failure" })),
+        }
     );
     assert_eq!(exit.chosen_outcome.as_deref(), Some("failed"));
     assert!(!exit.claim_release);
+}
+
+// REQ-RUNNERENROLL-89: an adopted record that already reads `exited` is concluded, with no
+// command run, by the result its current attempt recorded published, never by the name of
+// the outcome it chose; with no such result it has none to report.
+#[tokio::test]
+async fn adopted_exited_record_concludes_from_its_current_attempt_result() {
+    let (failed_step, issue) = build_failure();
+    let blocked = adopted(record("exited", Some("blocked"), 1, json!([])), None);
+    write_attempt(
+        &blocked.run,
+        "workflow_failed",
+        published_result(),
+        json!([failed_step]),
+    );
+    let (end, _) = drive_adopted(&blocked, &[], "").await;
+    assert_eq!(resumes(&blocked.log), 0);
+    let TreeConclusion::Terminal { result, exit, .. } = end.conclusion() else {
+        panic!("an adopted failed attempt has a result: {end:#?}");
+    };
+    assert_eq!(
+        result,
+        TransportResult::Failed {
+            primary_issue: issue,
+            diagnostic: Some(json!({ "stage": "tree_run_adopted_failure" })),
+        }
+    );
+    assert_eq!(exit.chosen_outcome.as_deref(), Some("blocked"));
+
+    let failed = adopted(record("exited", Some("failed"), 1, json!([])), None);
+    write_attempt(&failed.run, "succeeded", published_result(), json!([]));
+    let (end, _) = drive_adopted(&failed, &[], "").await;
+    assert_eq!(resumes(&failed.log), 0);
+    succeeded_with(&end, "failed");
+
+    let unrecorded = adopted(record("exited", Some("landed"), 1, json!([])), None);
+    let unpublished = adopted(record("exited", Some("landed"), 1, json!([])), None);
+    write_attempt(
+        &unpublished.run,
+        "succeeded",
+        json!({ "status": "not_published", "reason": "publication_pending" }),
+        json!([]),
+    );
+    for adopted in [unrecorded, unpublished] {
+        let (end, _) = drive_adopted(&adopted, &[], "").await;
+        assert_eq!(resumes(&adopted.log), 0);
+        assert_eq!(
+            end.conclusion(),
+            TreeConclusion::Unreportable("tree_run_failure_unclassified")
+        );
+    }
 }
 
 // REQ-RUNNERENROLL-89
@@ -3998,27 +4235,15 @@ async fn cancelled_first_resume_that_started_no_attempt_reports_nothing_of_the_a
 }
 
 /// A home whose one run reads `exited` `failed`, its current attempt recording `build`
-/// failed, beside `writes` as its `mirror/` files.
+/// failed and its result published, beside `writes` as its `mirror/` files.
 fn adopted_failure(writes: &[Value]) -> Adopted {
     let adopted = adopted(record("exited", Some("failed"), 1, json!([])), None);
-    let state = json!({
-        "schemaVersion": 1,
-        "currentAttemptNumber": 1,
-        "attempts": [{
-            "attemptNumber": 1,
-            "progress": { "steps": [{
-                "id": "build",
-                "role": "step",
-                "state": "failed",
-                "detail": { "phase": "execution", "code": "command_exit", "exitCode": 2 },
-            }] },
-        }],
-    });
-    fs::write(
-        adopted.run.join("state.json"),
-        serde_json::to_vec(&state).unwrap(),
-    )
-    .unwrap();
+    write_attempt(
+        &adopted.run,
+        "workflow_failed",
+        published_result(),
+        json!([build_failure().0]),
+    );
     let mirror = adopted.run.join("mirror");
     fs::create_dir(&mirror).unwrap();
     for (index, write) in writes.iter().enumerate() {
@@ -4174,8 +4399,8 @@ fn home_without_exactly_one_run_refuses_adoption() {
 /// The boot of the tree run manager's work root.
 const BOOT: &str = "rbt_01k0z6r1w8f4jy2m7q9v3x5abe";
 
-/// The primary issue the injected `um` reports for a run failing in `build`.
-const BUILD_FAILED: &str = r#"{"primaryIssue":{"node":{"id":"build","role":"step"},"state":"failed","detail":{"phase":"execution","code":"command_exit","exitCode":2}}}"#;
+/// The result the injected `um` reports for a run failing in `build`.
+const BUILD_FAILED: &str = r#"{"outcome":"failed","primaryIssue":{"node":{"id":"build","role":"step"},"state":"failed","detail":{"phase":"execution","code":"command_exit","exitCode":2}}}"#;
 
 /// A manager whose first attempt's run fails in `build` and is left retained, with
 /// `variables` added to the daemon's environment.
