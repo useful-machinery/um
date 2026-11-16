@@ -9,7 +9,7 @@ use um_execution::{CONTROL_LIFT, CONTROL_STOP, WaitKind, read_controls, stop_in_
 
 use super::control::{Acted, ControlFailure, ControlTarget, Refusal};
 
-pub(super) const STOP_ABOUT: &str = "Park a run before a step";
+pub(super) const STOP_ABOUT: &str = "Park a run before a workflow step";
 pub(super) const LIFT_ABOUT: &str = "Lift a stop so the run may continue past it";
 const STOP_COMMAND: &str = "um workflow run stop";
 const LIFT_COMMAND: &str = "um workflow run lift";
@@ -19,7 +19,7 @@ pub(super) struct Stop {
     #[command(flatten)]
     run: super::ExistingLocalRun,
 
-    #[arg(long, value_name = "STEP", help = "Step the run waits before")]
+    #[arg(long, value_name = "STEP", help = "Workflow step the run waits before")]
     before: String,
 
     #[arg(long, value_name = "TEXT", help = "Why the run is parked")]
@@ -74,10 +74,14 @@ impl Stop {
         if super::control::exited(target) {
             return Err(Refusal::new("run_exited", "The run has exited.").into());
         }
-        if !target.step_ids().contains(&self.before) {
+        let steps = target.stop_steps();
+        if !steps.known.contains(&self.before) {
             return Err(
                 Refusal::new("step_unknown", "The run's workflow has no such step.").into(),
             );
+        }
+        if !steps.holdable.contains(&self.before) {
+            return Err(super::control::step_not_holdable().into());
         }
         let controls = read_controls(&target.run_directory)?;
         if stop_in_force(&controls, &self.before).is_some() {

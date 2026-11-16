@@ -1,6 +1,7 @@
 //! What every control command shares (REQ-LOCALRUN-181): opening the run `RUN` names,
 //! appending one control event, and the recorded and refused documents.
 
+use std::collections::BTreeSet;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
@@ -133,12 +134,12 @@ impl ControlTarget {
         Ok(wait)
     }
 
-    /// The ids a stop may name (REQ-LOCALRUN-185): the steps of the run's latest attempt and
-    /// the `workflow` steps of each nested workflow the run's workflow names, read from the
+    /// The ids a stop may name and the ids the run knows (REQ-LOCALRUN-185), read from the
     /// workflow resolved again from the run's tree copy, since a nested run may not exist yet
-    /// (REQ-WFEXEC-76).
-    pub(super) fn step_ids(&self) -> Vec<String> {
-        let own = self.state["attempts"]
+    /// (REQ-WFEXEC-76). A tree copy that does not resolve holds nothing, so every step the
+    /// latest attempt's progress lists is then known and none holdable.
+    pub(super) fn stop_steps(&self) -> StopSteps {
+        let progress = self.state["attempts"]
             .as_array()
             .and_then(|attempts| attempts.last())
             .and_then(|attempt| attempt["progress"]["steps"].as_array())
@@ -146,11 +147,23 @@ impl ControlTarget {
             .flatten()
             .filter_map(|step| step["id"].as_str())
             .map(str::to_owned);
-        let nested =
+        let workflow =
             resolve_workflow_file(&self.tree_copy, &self.tree_copy.join(&self.record.workflow))
-                .map(|workflow| nested_step_ids(&workflow))
-                .unwrap_or_default();
-        own.chain(nested).collect()
+                .ok();
+        let holdable = workflow
+            .as_ref()
+            .map(holdable_step_ids)
+            .unwrap_or_default()
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        let own = workflow
+            .into_iter()
+            .flat_map(|workflow| workflow.definition.steps.into_keys());
+        let known = progress
+            .chain(own)
+            .chain(holdable.iter().cloned())
+            .collect();
+        StopSteps { known, holdable }
     }
 
     /// Appends the control `event` naming `wait` with `payload`, by the invoking user.
@@ -264,6 +277,40 @@ pub(super) fn open(run_directory: &Path) -> Result<ControlTarget, Refusal> {
         state: snapshot.state,
         inspection: probe.inspection,
     })
+}
+
+/// The steps of a run `ControlTarget::stop_steps` read (REQ-LOCALRUN-185).
+pub(super) struct StopSteps {
+    /// Every step of the run's own workflow and of its latest attempt's progress, and the
+    /// `holdable` ones: a stop naming any other is `step_unknown`.
+    pub(super) known: BTreeSet<String>,
+    /// The steps a stop may name (`holdable_step_ids`): a known step outside them is
+    /// `step_not_holdable`.
+    pub(super) holdable: BTreeSet<String>,
+}
+
+/// The steps of `workflow` a stop may name, the only steps the engine holds before
+/// (REQ-LOCALRUN-185, REQ-WFEXEC-62, REQ-WFEXEC-76): its own `workflow` steps and the
+/// `workflow` steps of the nested workflows they name (`nested_step_ids`). A step of
+/// `workflow` outside them is `step_not_holdable`.
+pub(super) fn holdable_step_ids(workflow: &ResolvedWorkflow) -> Vec<String> {
+    workflow
+        .definition
+        .steps
+        .iter()
+        .filter(|(_, step)| matches!(step, ValidatedStep::Workflow(_)))
+        .map(|(id, _)| id.clone())
+        .chain(nested_step_ids(workflow))
+        .collect()
+}
+
+/// A stop before a step of the run's workflow the engine does not hold before
+/// (REQ-LOCALRUN-185).
+pub(super) fn step_not_holdable() -> Refusal {
+    Refusal::new(
+        "step_not_holdable",
+        "The run holds only before a workflow step, and this step is not one.",
+    )
 }
 
 /// The ids of the `workflow` steps of each nested workflow `workflow`'s `workflow` steps name

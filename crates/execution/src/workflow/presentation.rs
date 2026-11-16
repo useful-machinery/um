@@ -539,6 +539,19 @@ where
         })
     }
 
+    /// A run refused before admission for the step its `--stop-before` names, which the
+    /// engine does not hold before (REQ-LOCALRUN-185): phase `definition` with the one
+    /// `code`, its `message`, and the definition and revision when the run is of one.
+    pub fn render_stop_rejection(
+        self,
+        code: &'static str,
+        message: &str,
+        definition: Option<&str>,
+        revision: Option<u64>,
+    ) -> WorkflowRunPresentationResult {
+        self.render_subject_rejection(code, message, definition, revision, None)
+    }
+
     /// A `um workflow run restart` or `upgrade` refused before the successor exists
     /// (REQ-LOCALRUN-194, REQ-LOCALRUN-197): phase `successor` with the one `code`, its
     /// `message` and `run`, the predecessor's id when it has a run record.

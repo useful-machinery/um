@@ -61,7 +61,9 @@ const RUN_URL: &str = "https://usefulmachinery.com/acme/runs/run_01k0z6r1w8f4jy2
 /// record first reading `running` at that position while
 /// `$TREE_TEST_LOG/running` exists, and for state `cancellable` a running record until `run
 /// cancel` ends it `canceled`; for state `refused` it makes no run and answers with the
-/// runtime's rejection of a root whose `requires.tools` names a missing tool. Each `run resume` appends its command line to
+/// runtime's rejection whose diagnostic code is `$TREE_TEST_REFUSAL`, by default
+/// `required_tool_unavailable`, that of a root whose `requires.tools` names a missing tool.
+/// Each `run resume` appends its command line to
 /// `resume.args`, leaves its environment in `resume.env` and answers with the next word of
 /// `$TREE_TEST_RESUMES`, or with the word in `$TREE_TEST_LOG/answer` while that file
 /// exists: `held` (the default) reports the wait unchanged, `unavailable`
@@ -128,7 +130,7 @@ case "$1 $2 $3" in
   env > "$log/create.env"
   if [ -e "$log/unlaunchable" ]; then rm -f "$0"; fi
   if [ "$TREE_TEST_STATE" = refused ]; then
-    printf '%s\n' '{"schemaVersion":1,"command":"um workflow run create","outcome":"rejected","exitStatus":1,"phase":"admission","workflow":{"path":"workflow.yaml"},"diagnostics":[{"code":"required_tool_unavailable","message":"Install the tool the root workflow'"'"'s `requires.tools` names, or put it on the launching `PATH`.","location":{"kind":"required_tool","tool":"um-test-no-such-tool"}}]}'
+    printf '{"schemaVersion":1,"command":"um workflow run create","outcome":"rejected","exitStatus":1,"phase":"admission","workflow":{"path":"workflow.yaml"},"diagnostics":[{"code":"%s","message":"Install the tool the root workflow'"'"'s `requires.tools` names, or put it on the launching `PATH`.","location":{"kind":"required_tool","tool":"um-test-no-such-tool"}}]}\n' "${TREE_TEST_REFUSAL:-required_tool_unavailable}"
     exit 1
   fi
   resolution="$UM_HOME/workflows/def_01k0z6r1w8f4jy2m7q9v3x5loc/revisions/1/resolution.json"
@@ -284,6 +286,8 @@ struct TreeFile {
     executable: bool,
 }
 
+/// A dataflow tree: its root's steps `build` and `review` are `cmd` steps, so the runtime
+/// holds before none of them.
 const TREE_FILES: &[TreeFile] = &[
     TreeFile {
         path: "workflow.yaml",
@@ -297,6 +301,29 @@ const TREE_FILES: &[TreeFile] = &[
     },
 ];
 
+/// An edge-scheduled tree: its root's steps `build` and `review` are `workflow` steps, the
+/// steps the runtime holds before, each naming a child file of one `cmd` step.
+const EDGE_TREE_FILES: &[TreeFile] = &[
+    TreeFile {
+        path: "workflow.yaml",
+        bytes: b"schemaVersion: 1\noutcomes: [landed, failed]\nsteps:\n  build:\n    kind: workflow\n    workflow: build.yaml\n    on:\n      done: review\n      failed: exit.failed\n  review:\n    kind: workflow\n    workflow: review.yaml\n    on:\n      done: exit.landed\n      failed: exit.failed\n",
+        executable: false,
+    },
+    TreeFile {
+        path: "build.yaml",
+        bytes: EDGE_TREE_STAGE,
+        executable: false,
+    },
+    TreeFile {
+        path: "review.yaml",
+        bytes: EDGE_TREE_STAGE,
+        executable: false,
+    },
+];
+
+/// A child of `EDGE_TREE_FILES`' root: one `cmd` step whose verdict is its outcome.
+const EDGE_TREE_STAGE: &[u8] = b"schemaVersion: 1\noutcomes: [done, failed]\noutcome:\n  from: outputs.decide.verdict\n  onFailure: failed\nsteps:\n  decide:\n    kind: cmd\n    command:\n      argv: [/bin/sh, -c, 'printf done > verdict.txt']\n    outputs:\n      verdict:\n        kind: text\n        from: path\n        path: verdict.txt\n";
+
 fn sha256_hex(bytes: &[u8]) -> String {
     digest(&SHA256, bytes)
         .as_ref()
@@ -305,8 +332,9 @@ fn sha256_hex(bytes: &[u8]) -> String {
         .collect()
 }
 
-/// A Gateway stand-in serving the tree capability route and the signed file URLs.
-fn capability_server() -> (Url, Arc<Mutex<Vec<Value>>>) {
+/// A Gateway stand-in serving the tree capability route and the signed file URLs of
+/// `tree`.
+fn capability_server(tree: &'static [TreeFile]) -> (Url, Arc<Mutex<Vec<Value>>>) {
     let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
     let address = listener.local_addr().unwrap();
     let requests = Arc::new(Mutex::new(Vec::new()));
@@ -338,7 +366,7 @@ fn capability_server() -> (Url, Arc<Mutex<Vec<Value>>>) {
                 .unwrap_or_default()
                 .to_owned();
             let (content_type, answer) = if let Some(path) = target.strip_prefix("/files/") {
-                let file = TREE_FILES.iter().find(|file| file.path == path).unwrap();
+                let file = tree.iter().find(|file| file.path == path).unwrap();
                 ("application/octet-stream", file.bytes.to_vec())
             } else {
                 let request: Value = serde_json::from_slice(&body).unwrap();
@@ -347,7 +375,7 @@ fn capability_server() -> (Url, Arc<Mutex<Vec<Value>>>) {
                     .unwrap()
                     .iter()
                     .map(|path| {
-                        let file = TREE_FILES
+                        let file = tree
                             .iter()
                             .find(|file| file.path == path.as_str().unwrap())
                             .unwrap();
@@ -470,11 +498,16 @@ fn fixture_bounded(
         recorder,
         bound,
         fixture_source_broker,
+        TREE_FILES,
     )
 }
 
 /// `fixture_bounded`, each workspace checked out through the broker `source_broker`
-/// makes for the fixture repository.
+/// makes for the fixture repository, the offer's tree being `files`.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each fixture variant names the parameters it varies through its wrapper"
+)]
 fn fixture_sourced(
     published_digest: &str,
     state: &str,
@@ -483,6 +516,7 @@ fn fixture_sourced(
     recorder: Option<Arc<crate::telemetry::Recorder>>,
     bound: Duration,
     source_broker: impl FnOnce(&Path) -> Arc<dyn SourceCredentialBroker>,
+    files: &'static [TreeFile],
 ) -> Fixture {
     let temporary = tempfile::tempdir().unwrap();
     let source = temporary.path().join("source");
@@ -504,7 +538,7 @@ fn fixture_sourced(
     let commit = run_fixture_git(&source, &["rev-parse", "HEAD"]);
     let um = injected_um(temporary.path());
 
-    let (endpoint, capability_requests) = capability_server();
+    let (endpoint, capability_requests) = capability_server(files);
     let config = Config::new(
         "wss://gateway.example.test/v1/runner/connect",
         crate::credential::test_credential(),
@@ -569,7 +603,7 @@ fn fixture_sourced(
     tree.digest = TREE_DIGEST.to_owned();
     tree.workflow_path = "workflow.yaml".to_owned();
     tree.stop_before = Some("review".to_owned());
-    tree.files = TREE_FILES
+    tree.files = files
         .iter()
         .map(|file| WorkflowTreeFileV1RunnerProjection {
             path: file.path.to_owned(),
@@ -808,6 +842,7 @@ fn gitlab_tree_fixture() -> (Fixture, Arc<GitLabGrantBroker>) {
             gitlab = Some(Arc::clone(&broker));
             broker
         },
+        TREE_FILES,
     );
     let spec = &mut fixture.offer.execution_spec;
     assert_eq!(spec.schema_version, 2);
@@ -2299,10 +2334,23 @@ async fn applied_withdrawal_is_reported_from_its_action_outcome() {
     }
 }
 
-/// A fixture whose offer carries `pending` deliveries, `create` leaving the run at the
-/// stop before its first step and each delivery answered by `event`.
+/// Sets the deliveries `fixture`'s offer carries as pending.
+fn with_pending(mut fixture: Fixture, pending: Vec<TriggerDelivery>) -> Fixture {
+    fixture
+        .offer
+        .execution_spec
+        .workflow_tree
+        .as_mut()
+        .unwrap()
+        .pending_deliveries = pending;
+    fixture
+}
+
+/// A fixture of the edge-scheduled `EDGE_TREE_FILES` whose offer carries `pending`
+/// deliveries, `create` leaving the run at the stop before its first step and each
+/// delivery answered by `event`.
 fn pending_fixture(event: &str, pending: Vec<TriggerDelivery>) -> Fixture {
-    let mut fixture = fixture_with(
+    let fixture = fixture_sourced(
         TREE_DIGEST,
         "waiting",
         "null",
@@ -2312,16 +2360,37 @@ fn pending_fixture(event: &str, pending: Vec<TriggerDelivery>) -> Fixture {
             ("TREE_TEST_EVENT", event),
             ("TREE_TEST_RESUMES", "continue"),
         ],
+        None,
+        super::command::SHORT_COMMAND_BOUND,
+        fixture_source_broker,
+        EDGE_TREE_FILES,
     );
     fs::write(fixture.log.join("proceed"), b"").unwrap();
-    fixture
-        .offer
-        .execution_spec
-        .workflow_tree
-        .as_mut()
-        .unwrap()
-        .pending_deliveries = pending;
-    fixture
+    with_pending(fixture, pending)
+}
+
+/// The values `--stop-before` takes in the logged `create` arguments, in order.
+fn create_stops(log: &Path) -> Vec<String> {
+    logged_lines(log, "create.args")
+        .windows(2)
+        .filter(|pair| pair[0] == "--stop-before")
+        .map(|pair| pair[1].clone())
+        .collect()
+}
+
+/// The application of a delivery `event` refused `issue_in_owned_state`.
+fn refused_owned(id: &str) -> TriggerDeliveryApplication {
+    TriggerDeliveryApplication {
+        delivery_id: id.to_owned(),
+        outcome: TriggerDeliveryOutcome::Refused {
+            code: "issue_in_owned_state".to_owned(),
+        },
+        observation: Some(TriggerIssueObservation {
+            team: Some("team_8c1b".to_owned()),
+            state: "state_build".to_owned(),
+            updated_at: None,
+        }),
+    }
 }
 
 // REQ-TRIGGER-136
@@ -2336,20 +2405,9 @@ async fn pending_deliveries_apply_before_the_first_step_and_a_surviving_run_is_l
     );
     let reports = execute(&mut fixture).await;
 
-    // The stop before the first step is earlier than the start's `review`.
-    let create = logged_lines(&fixture.log, "create.args");
-    let stop = create
-        .iter()
-        .position(|argument| argument == "--stop-before")
-        .unwrap();
-    assert_eq!(create[stop + 1], "build");
-    assert_eq!(
-        create
-            .iter()
-            .filter(|argument| *argument == "--stop-before")
-            .count(),
-        1
-    );
+    // The stop before the first step, a `workflow` step, is earlier than the start's
+    // `review`.
+    assert_eq!(create_stops(&fixture.log), ["build"]);
     assert_eq!(
         order(&fixture.log),
         ["event", "event", "stop", "lift", "resume"]
@@ -2362,26 +2420,81 @@ async fn pending_deliveries_apply_before_the_first_step_and_a_surviving_run_is_l
     let lift = logged_lines(&fixture.log, "lift.args");
     assert_eq!(lift[..3], ["workflow", "run", "lift"]);
     assert_eq!(lift[4..], ["--before=build", "--json"]);
-    let refused = |id: &str| TriggerDeliveryApplication {
-        delivery_id: id.to_owned(),
-        outcome: TriggerDeliveryOutcome::Refused {
-            code: "issue_in_owned_state".to_owned(),
-        },
-        observation: Some(TriggerIssueObservation {
-            team: Some("team_8c1b".to_owned()),
-            state: "state_build".to_owned(),
-            updated_at: None,
-        }),
-    };
     assert_eq!(
         applications(&reports),
         [
-            refused("wtd_01k0z6r1w8f4jy2m7q9v3x5abt"),
-            refused("wtd_01k0z6r1w8f4jy2m7q9v3x5abx"),
+            refused_owned("wtd_01k0z6r1w8f4jy2m7q9v3x5abt"),
+            refused_owned("wtd_01k0z6r1w8f4jy2m7q9v3x5abx"),
         ]
     );
     assert_eq!(terminal_count(&reports), 1);
     assert_eq!(chosen_outcome(&reports).as_deref(), Some("landed"));
+}
+
+// REQ-TRIGGER-136, REQ-TRIGGER-137, REQ-RUNNERENROLL-91: on a root the runtime holds before
+// nowhere, the runner adds no stop of its own; the offer's pending deliveries are applied
+// and reported once `create` returns, with no `stop`, `lift` or `resume` for them.
+#[tokio::test]
+async fn pending_deliveries_on_a_root_the_runtime_cannot_hold_apply_without_a_stop_of_the_runners()
+{
+    let mut fixture = with_pending(
+        fixture_with(
+            TREE_DIGEST,
+            "exited",
+            "\"planned\"",
+            &[("TREE_TEST_EVENT", "owned")],
+        ),
+        vec![
+            delivery("wtd_01k0z6r1w8f4jy2m7q9v3x5abt"),
+            delivery("wtd_01k0z6r1w8f4jy2m7q9v3x5abx"),
+        ],
+    );
+    let tree = fixture.offer.execution_spec.workflow_tree.as_mut().unwrap();
+    tree.stop_before = None;
+    let reports = execute(&mut fixture).await;
+
+    assert_eq!(create_stops(&fixture.log), Vec::<String>::new());
+    assert_eq!(order(&fixture.log), ["event", "event"]);
+    assert_eq!(
+        applications(&reports),
+        [
+            refused_owned("wtd_01k0z6r1w8f4jy2m7q9v3x5abt"),
+            refused_owned("wtd_01k0z6r1w8f4jy2m7q9v3x5abx"),
+        ]
+    );
+    assert_eq!(terminal_count(&reports), 1);
+    assert_eq!(chosen_outcome(&reports).as_deref(), Some("planned"));
+}
+
+// REQ-RUNNERENROLL-91, REQ-TRIGGER-128: the start's stop reaches `create` as named on a root
+// the runtime holds before nowhere, pending deliveries or not, and the runtime's refusal of
+// it ends the attempt before anything of the runner's runs.
+#[tokio::test]
+async fn a_start_stop_the_runtime_cannot_hold_reaches_create_and_its_refusal_ends_the_run() {
+    let mut fixture = with_pending(
+        fixture_with(
+            TREE_DIGEST,
+            "refused",
+            "null",
+            &[("TREE_TEST_REFUSAL", "step_not_holdable")],
+        ),
+        vec![delivery("wtd_01k0z6r1w8f4jy2m7q9v3x5abt")],
+    );
+    let reports = execute(&mut fixture).await;
+
+    assert_eq!(create_stops(&fixture.log), ["review"]);
+    assert_eq!(order(&fixture.log), Vec::<String>::new());
+    assert_eq!(applications(&reports), []);
+    let payload = &finished_payload(&reports, &fixture.offer);
+    assert_eq!(payload["outcome"]["outcome"], "failed");
+    assert_eq!(
+        payload["diagnostic"],
+        json!({
+            "stage": "tree_run_create_refused",
+            "declineCause": "step_not_holdable",
+        })
+    );
+    assert!(payload.get("chosenOutcome").is_none());
 }
 
 // REQ-TRIGGER-136

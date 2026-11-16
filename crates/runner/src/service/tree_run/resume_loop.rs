@@ -40,10 +40,12 @@
 //! and its application reported (REQ-TRIGGER-136): while a process runs, beside it, so a
 //! cancel reaches the live run; while the run waits, at once, the wait staying in place
 //! unless the application ended or moved the run. The offer's pending deliveries are
-//! applied before the run's first step: after `create`, which stopped the run before it,
-//! a run they leave standing having the start's own stop put back, the runner's lifted and
-//! being resumed; and before an adopted run's first command, which does not run when they
-//! ended the run.
+//! applied before the run's first step: on an edge-scheduled root after `create`, which
+//! stopped the run before it, a run they leave standing having the start's own stop put
+//! back, the runner's lifted and being resumed; and before an adopted run's first command,
+//! which does not run when they ended the run. On a root that is not edge-scheduled, which
+//! the runtime holds before nowhere, they are applied once `create` returns, with no stop of
+//! the runner's.
 //!
 //! Each Cloud control for the assignment is applied once and its application reported
 //! (REQ-RUNNERENROLL-90). One that names a wait (`answer`, `approve`, `hand_back`, `retry`, and
@@ -76,7 +78,7 @@ use super::records::{
     read_recorded_result, read_wait,
 };
 use super::steps::{self, StepKey, StepReader};
-use super::{TreeRun, TreeStart};
+use super::{PendingStop, TreeRun, TreeStart};
 use crate::service::assignment::ExecutionReport;
 
 /// The most step observations one progress report carries.
@@ -803,10 +805,11 @@ impl Driver<'_> {
         }
     }
 
-    /// Applies the offer's pending deliveries to the run `create` stopped before its first
-    /// step. A run they leave standing has the start's own stop put back when it names a
-    /// later step, the runner's stop lifted and is resumed; that `resume`'s exit is
-    /// returned.
+    /// Applies the offer's pending deliveries to the run `create` made. On an edge-scheduled
+    /// root `create` stopped the run before its first step, and a run they leave standing has
+    /// the start's own stop put back when it names a later step, the runner's stop lifted
+    /// and is resumed; that `resume`'s exit is returned. On any other root they are applied
+    /// as the run stands, and the loop goes on from its record.
     async fn apply_pending(
         &mut self,
         directory: &Path,
@@ -814,7 +817,7 @@ impl Driver<'_> {
         let run = self.run;
         let TreeStart::Create {
             first,
-            pending_stop: Some(stop),
+            pending_stop: Some(pending_stop),
             ..
         } = &run.start
         else {
@@ -825,7 +828,10 @@ impl Driver<'_> {
         let applications =
             command::apply_deliveries(&run.um, directory.to_owned(), pending, cancellation).await;
         self.report_applications(applications)?;
-        if !standing(directory).await || stop.start.as_ref() == Some(first) {
+        let PendingStop::Held { start } = pending_stop else {
+            return Ok(None);
+        };
+        if !standing(directory).await || start.as_ref() == Some(first) {
             return Ok(None);
         }
         // A stop or lift the assignment's cancellation abandoned leaves the run stopped for
@@ -835,7 +841,7 @@ impl Driver<'_> {
             false if cancellation.is_cancelled() => Ok(false),
             false => Err(DriveFailure::Cause(command::PENDING_STOP_UNLIFTED)),
         };
-        if let Some(start) = &stop.start
+        if let Some(start) = start
             && !recorded(command::stop_before(&run.um, directory, start, cancellation).await)?
         {
             return Ok(None);

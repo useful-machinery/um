@@ -170,7 +170,7 @@ pub(super) struct Command {
         long,
         value_name = "STEP",
         conflicts_with = "cloud",
-        help = "Park the run before STEP until the stop is lifted"
+        help = "Park the run before the workflow step STEP until the stop is lifted"
     )]
     stop_before: Option<String>,
 
@@ -344,9 +344,8 @@ impl Command {
         // or a `workflow` step of a nested workflow it names (REQ-WFEXEC-76), of a run that
         // records itself, before the run directory exists.
         if let Some(step) = &self.stop_before {
-            if !workflow.definition.steps.contains_key(step)
-                && !super::control::nested_step_ids(&workflow).contains(step)
-            {
+            let holdable = super::control::holdable_step_ids(&workflow);
+            if !workflow.definition.steps.contains_key(step) && !holdable.contains(step) {
                 return Err(super::super::super::CommandFailure::with_exit_code(
                     anyhow!("--stop-before names no step of the selected workflow"),
                     ExitCode::UsageError,
@@ -359,6 +358,21 @@ impl Command {
                     ),
                     ExitCode::UsageError,
                 ));
+            }
+            // REQ-LOCALRUN-185, REQ-RUNNERENROLL-91: a step the engine does not hold before is
+            // refused with a rejection document rather than a usage error, so a runner that
+            // created the run names the refusal.
+            if !holdable.contains(step) {
+                let refusal = super::control::step_not_holdable();
+                let (definition, revision) = destination.definition().unzip();
+                return rejection_output(presentation_config, |output| {
+                    output.render_stop_rejection(
+                        refusal.code,
+                        &refusal.message,
+                        definition.as_deref(),
+                        revision,
+                    )
+                });
             }
         }
         // REQ-LOCALRUN-209: the owner and external references land in the run record.

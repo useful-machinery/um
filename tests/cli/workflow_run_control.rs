@@ -461,6 +461,90 @@ fn a_stop_parks_a_run_until_it_is_lifted() {
     assert!(!destination.exists());
 }
 
+// REQ-LOCALRUN-185: `stop` before a step of the run's workflow that is not a `workflow` step,
+// which the engine never holds before, is refused `step_not_holdable` with nothing appended,
+// and `lift` still clears such a stop an earlier release recorded.
+#[test]
+fn a_stop_before_a_step_the_engine_does_not_hold_is_refused() {
+    let tree = EngineeringWaitTree::publish_root(COMMAND_TREE_ROOT);
+    let stub = LinearStub::start();
+    let mut live = tree.held(&stub, "AUTO-1", "landed");
+
+    let document = refused(
+        &tree.run(
+            &stub,
+            &[
+                "stop", "AUTO-1", "--before", "decide", "--reason", "x", "--json",
+            ],
+        ),
+        "stop",
+        "step_not_holdable",
+    );
+    let run = PathBuf::from(document["runDirectory"].as_str().unwrap());
+    assert_eq!(control_count(&run), 0);
+
+    let earlier = super::workflow_continue::control(
+        &run,
+        "control.stop",
+        None,
+        serde_json::json!({"before": "decide"}),
+    );
+    super::workflow_continue::append_control(&run, &earlier);
+    let lifted = recorded(
+        &tree.run(&stub, &["lift", "AUTO-1", "--json"]),
+        "lift",
+        &run,
+    );
+    assert_eq!(control_file(&run, &lifted)["payload"]["before"], "decide");
+
+    fs::write(&live.release, "").unwrap();
+    assert!(live.process.wait().unwrap().success());
+    assert_eq!(run_record(&run)["state"], "exited");
+}
+
+// REQ-LOCALRUN-185, REQ-RUNNERENROLL-91: `create --stop-before` a step of the workflow that is
+// not a `workflow` step is a `definition`-phase rejection, the document the runner's refusal
+// reads, printed before the run directory exists and before any step runs.
+#[test]
+fn create_refuses_a_stop_before_a_step_the_engine_does_not_hold() {
+    let tree = EngineeringWaitTree::publish_root(COMMAND_TREE_ROOT);
+    let stub = LinearStub::start();
+    decide(&tree.bundle, "design", "landed");
+    let execution = tree.bundle.execution_root();
+
+    let rejection = tree_rejection(&tree.run(
+        &stub,
+        &[
+            "create",
+            &tree.definition,
+            "--execution-root",
+            execution.to_str().unwrap(),
+            "--input-text",
+            "ticket",
+            "AUTO-1",
+            "--stop-before",
+            "decide",
+            "--json",
+        ],
+    ));
+    assert_eq!(rejection["phase"], "definition", "{rejection}");
+    let diagnostics = rejection["diagnostics"].as_array().unwrap();
+    assert_eq!(diagnostics.len(), 1, "{rejection}");
+    assert_eq!(diagnostics[0]["code"], "step_not_holdable");
+    assert_eq!(diagnostics[0]["definition"], tree.definition.as_str());
+
+    let runs = PathBuf::from(tree.home.path())
+        .join("workflows")
+        .join(&tree.definition)
+        .join("runs");
+    assert!(
+        !runs.exists() || fs::read_dir(&runs).unwrap().next().is_none(),
+        "a run directory was created under {}",
+        runs.display()
+    );
+    assert!(!execution.join("verdict-design.txt").exists());
+}
+
 // REQ-LOCALRUN-186, REQ-LOCALRUN-187, REQ-LOCALRUN-185: `withdraw` and `cancel` end a
 // waiting run themselves, and `release` records an exited run's release once.
 #[test]

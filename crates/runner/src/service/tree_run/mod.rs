@@ -183,10 +183,17 @@ impl<T: Inbound> Inbox<T> {
     }
 }
 
-/// The start's own stop step of a run with pending deliveries, which is created with a stop
-/// before its first step instead: the runner puts it back when it lifts its own.
-struct PendingStop {
-    start: Option<String>,
+/// How a created run meets the pending deliveries its offer carries (REQ-TRIGGER-136).
+enum PendingStop {
+    /// The root is edge-scheduled, so its first step is a `workflow` step the runtime holds
+    /// before: the run is created with a stop of the runner's own before that step in place
+    /// of the start's own stop step `start`, which the runner puts back when it lifts its own.
+    Held { start: Option<String> },
+    /// The root is not edge-scheduled, so the runtime holds before none of its steps
+    /// (REQ-WFEXEC-62, REQ-WFFORMAT-93): the run is created with the start's own stop as
+    /// named, which `create` refuses `step_not_holdable`, and no stop of the runner's, and
+    /// the deliveries are applied once `create` returns, with no `stop`, `lift` or `resume`.
+    Unheld,
 }
 
 /// The assignment's tree-run files, all under its private directory.
@@ -221,8 +228,9 @@ pub(super) fn tree_home(private: &Path) -> PathBuf {
 /// How a tree run's first command starts it.
 enum TreeStart {
     /// `um workflow run create` with these arguments (REQ-RUNNERENROLL-91), the root
-    /// workflow's first step, and the stop it was given before that step when the offer
-    /// carries pending deliveries.
+    /// workflow's first step, and, when the offer carries pending deliveries, how they meet
+    /// the run: before that step, behind a stop of the runner's own, on an edge-scheduled
+    /// root, or once `create` returns on any other.
     Create {
         arguments: Vec<OsString>,
         first: String,
@@ -420,20 +428,30 @@ pub(super) fn prepare(
     )
     .map_err(|_| environment_decline("workflow_tree_publication"))?;
     let runs = definition.join("runs");
-    let first = first_step(&layout.tree, &preparation.tree.workflow_path)?;
-    let pending_stop = (!preparation.tree.pending_deliveries.is_empty()).then(|| PendingStop {
-        start: preparation.tree.stop_before.clone(),
+    let FirstStep {
+        step: first,
+        edge_scheduled,
+    } = first_step(&layout.tree, &preparation.tree.workflow_path)?;
+    let pending_stop = (!preparation.tree.pending_deliveries.is_empty()).then(|| {
+        if edge_scheduled {
+            PendingStop::Held {
+                start: preparation.tree.stop_before.clone(),
+            }
+        } else {
+            PendingStop::Unheld
+        }
     });
+    let stop_before = match pending_stop {
+        Some(PendingStop::Held { .. }) => Some(&first),
+        Some(PendingStop::Unheld) | None => preparation.tree.stop_before.as_ref(),
+    };
     let create_arguments = create_arguments(
         &published.definition,
         preparation.execution_spec,
         preparation.tree,
         preparation.workspace,
         staged,
-        pending_stop
-            .as_ref()
-            .map(|_| &first)
-            .or(preparation.tree.stop_before.as_ref()),
+        stop_before,
     );
     Ok(TreeRun::new(
         dependencies,
@@ -510,13 +528,30 @@ pub(super) fn adopt(
     ))
 }
 
-/// The first step, in document order, of the tree's workflow at `workflow_path`: a run with
-/// pending deliveries stops before it, earlier than any step the start names, and a refused
-/// `create` names it as the step that did not start.
-fn first_step(tree: &Path, workflow_path: &str) -> Result<String, AssignmentDecline> {
+/// The first step, in document order, of a tree's root workflow, and whether the root is
+/// edge-scheduled.
+struct FirstStep {
+    step: String,
+    /// The root's steps are `workflow` steps, the only steps the runtime holds before
+    /// (REQ-WFEXEC-62); a root is all `workflow` steps or has none (REQ-WFFORMAT-93).
+    edge_scheduled: bool,
+}
+
+/// The first step of the tree's workflow at `workflow_path`: on an edge-scheduled root a run
+/// with pending deliveries stops before it, earlier than any step the start names, and a
+/// refused `create` names it as the step that did not start.
+fn first_step(tree: &Path, workflow_path: &str) -> Result<FirstStep, AssignmentDecline> {
     um_execution::resolve_workflow_file(tree, &tree.join(workflow_path))
         .ok()
-        .and_then(|workflow| workflow.definition.source_order.first().cloned())
+        .and_then(|workflow| {
+            Some(FirstStep {
+                step: workflow.definition.source_order.first().cloned()?,
+                edge_scheduled: matches!(
+                    workflow.definition.scheduling,
+                    um_execution::Scheduling::Edges { .. }
+                ),
+            })
+        })
         .ok_or_else(|| {
             AssignmentDecline::ExecutionSpecInvalid(
                 ExecutionSpecInvalidReason::WorkflowSourceInvalid,
@@ -554,7 +589,9 @@ fn resolution_record(resolution: &serde_json::Value) -> serde_json::Value {
 }
 
 /// `um workflow run create` for the run: the run inputs, the start's owner, the stop step,
-/// and the Cloud run page as `external.url` (REQ-LOCALRUN-209).
+/// and the Cloud run page as `external.url` (REQ-LOCALRUN-209). The stop step is the
+/// start's own as named, which the runtime refuses when it cannot hold before it, or, on an
+/// edge-scheduled root with pending deliveries, the runner's own before the first step.
 fn create_arguments(
     definition: &str,
     execution_spec: &ExecutionSpecV1RunnerProjection,
