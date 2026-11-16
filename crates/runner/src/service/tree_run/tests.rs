@@ -75,7 +75,8 @@ const RUN_URL: &str = "https://usefulmachinery.com/acme/runs/run_01k0z6r1w8f4jy2
 /// an `exited` record, `resume<n>` by the n-th `resume` (after `continue` writes attempt 2)
 /// and `landed` before the run lands.
 /// `run event` copies its event and claim files to the log and answers by
-/// `$TREE_TEST_EVENT`: `cancel` applies `cancel`, ending the run `canceled` and signalling
+/// `$TREE_TEST_EVENT`: `cancel` applies `cancel`, ending the run `canceled`, after copying
+/// the stage `event` into the run directory, and signalling
 /// a `cancellable` process as the live run's cancellation does, `withdraw` applies
 /// `withdraw` with the JSON `$TREE_TEST_ACTION_OUTCOME` as its `actionOutcome`, leaving the
 /// record as it is, `not_later`
@@ -165,6 +166,7 @@ case "$1 $2 $3" in
   printf '{"runDirectory":"%s","result":%s}\n' "$run" "$result"
   ;;
 "workflow run event")
+  run="$4"
   printf '%s\n' "$@" >> "$log/event.args"
   echo event >> "$log/order"
   cp "$6" "$log/event.json"
@@ -173,6 +175,7 @@ case "$1 $2 $3" in
   cancel)
     : > "$log/cancelled"
     rm -f "$4/wait.json"
+    stage event
     printf '{"state":"exited","outcome":"canceled","attempts":1,"position":[]}\n' > "$4/run.json"
     printf '{"schemaVersion":1,"command":"um workflow run event","outcome":"applied","exitStatus":0,"runDirectory":"%s","run":"run_01k0z6r1w8f4jy2m7q9v3x5loc","trigger":"departed","action":"cancel","actionOutcome":"canceled","control":{"ordinal":1,"event":"cancel","path":"controls/0001-cancel.json","wait":null},"observation":{"team":"team_8c1b","state":"state_canceled","updatedAt":"2026-07-23T00:00:07.512Z"}}\n' "$4"
     ;;
@@ -1108,12 +1111,15 @@ async fn resolution_is_written_before_create_and_the_finish_reports_the_mirror()
     );
 }
 
-fn exited_with(writes: &[Value]) -> super::records::TreeRecord {
+/// An exited record whose run's `mirror/` holds `writes`, the first `earlier_writes` of them
+/// an earlier attempt's.
+fn exited_with(writes: &[Value], earlier_writes: usize) -> super::records::TreeRecord {
     super::records::TreeRecord {
         mirror: writes
             .iter()
             .map(|write| serde_json::from_value(write.clone()).unwrap())
             .collect(),
+        earlier_writes,
         ..exited("landed")
     }
 }
@@ -1168,7 +1174,7 @@ fn claim_release_is_requested_only_after_a_confirmed_departure() {
         (vec![failed("mirror_unavailable")], false),
     ] {
         let TreeConclusion::Terminal { exit, .. } = conclude_documented(
-            Some(&exited_with(&writes)),
+            Some(&exited_with(&writes, 0)),
             Some(&result_document("succeeded")),
             None,
         ) else {
@@ -1191,7 +1197,7 @@ fn claim_release_is_requested_only_after_a_confirmed_departure() {
     let mut writes = vec![comment_written(); 1_100];
     writes.push(state_write("written", json!({})));
     let TreeConclusion::Terminal { exit, .. } = conclude_documented(
-        Some(&exited_with(&writes)),
+        Some(&exited_with(&writes, 0)),
         Some(&result_document("succeeded")),
         None,
     ) else {
@@ -1204,6 +1210,46 @@ fn claim_release_is_requested_only_after_a_confirmed_departure() {
     );
     assert!(exit.claim_release);
     encode_finish(exit).unwrap();
+}
+
+// REQ-RUNNERENROLL-99: only a departure the attempt's own outcome write confirmed requests
+// release; an earlier attempt's write is still reported but confirms nothing for it.
+#[test]
+fn claim_release_counts_only_the_attempt_own_outcome_write() {
+    let failed = state_write(
+        "failed",
+        json!({"code": "mirror_write_rejected", "diagnostic": "The update was not confirmed."}),
+    );
+    let guard_held = || state_write("skipped", json!({"reason": "guard_held"}));
+    for (earlier, own, release) in [
+        (
+            vec![comment_written(), state_write("written", json!({}))],
+            vec![failed.clone()],
+            false,
+        ),
+        (vec![state_write("written", json!({}))], vec![], false),
+        (vec![guard_held()], vec![comment_written()], false),
+        (
+            vec![state_write("written", json!({}))],
+            vec![state_write("written", json!({}))],
+            true,
+        ),
+        (vec![failed.clone()], vec![guard_held()], true),
+    ] {
+        let writes = earlier.iter().chain(&own).cloned().collect::<Vec<_>>();
+        let TreeConclusion::Terminal { exit, .. } = conclude_documented(
+            Some(&exited_with(&writes, earlier.len())),
+            Some(&result_document("succeeded")),
+            None,
+        ) else {
+            panic!("an exited record has a result");
+        };
+        assert_eq!(exit.claim_release, release, "{earlier:#?} then {own:#?}");
+        assert_eq!(
+            exit.mirror,
+            writes.into_iter().map(mirror_result).collect::<Vec<_>>()
+        );
+    }
 }
 
 /// The progress reports among `reports`: sequence, attempt, state and position.
@@ -2367,6 +2413,7 @@ fn exited(outcome: &str) -> super::records::TreeRecord {
         attempts: 1,
         position: Vec::new(),
         mirror: Vec::new(),
+        earlier_writes: 0,
     }
 }
 
@@ -2558,6 +2605,7 @@ fn exited_records_conclude_from_the_engine_result_not_the_chosen_outcome() {
             attempts: 1,
             position: vec![json!("merge")],
             mirror: Vec::new(),
+            earlier_writes: 0,
         };
         assert_eq!(
             conclude(Some(&record), None, Some(CancellationReason::UserRequest)),
@@ -4749,10 +4797,11 @@ fn adopted_failure(writes: &[Value]) -> Adopted {
 }
 
 // REQ-RUNNERENROLL-89, REQ-RUNNERENROLL-99: an adopted run's exit, the one concluded from a
-// record that already read `exited` included, reports its run's mirror writes and release
-// request as a created run's does; a refused first resume changed nothing and requests none.
+// record that already read `exited` included, reports every attempt's mirror writes but
+// requests release only on a departure its own write confirmed, so a record it adopted
+// already `exited` requests none; a refused first resume changed nothing and requests none.
 #[tokio::test]
-async fn adopted_exit_reports_the_run_mirror_and_a_refused_resume_releases_nothing() {
+async fn adopted_exit_reports_the_run_mirror_and_releases_only_on_its_own_departure() {
     let writes = [comment_written(), state_write("written", json!({}))];
     let recorded = adopted_failure(&writes);
     let (end, _) = drive_adopted(&recorded, &[], "").await;
@@ -4764,7 +4813,7 @@ async fn adopted_exit_reports_the_run_mirror_and_a_refused_resume_releases_nothi
         TreeExit {
             chosen_outcome: Some("failed".to_owned()),
             mirror: writes.iter().cloned().map(mirror_result).collect(),
-            claim_release: true,
+            claim_release: false,
         }
     );
 
@@ -4774,6 +4823,89 @@ async fn adopted_exit_reports_the_run_mirror_and_a_refused_resume_releases_nothi
         panic!("a refused first resume has a result: {end:#?}");
     };
     assert_eq!(exit, unreported_exit());
+}
+
+/// Stages `write` as the mirror file `name` the injected `um` copies into the run's `mirror/`
+/// at stage `stage`.
+fn stage_mirror_write(log: &Path, stage: &str, name: &str, write: &Value) {
+    let mirror = log.join("stages").join(stage).join("mirror");
+    fs::create_dir_all(&mirror).unwrap();
+    fs::write(mirror.join(name), serde_json::to_vec(write).unwrap()).unwrap();
+}
+
+// REQ-RUNNERENROLL-99, REQ-RUNNERENROLL-89: a continuation requests release only on a
+// departure its own outcome write confirmed: not when that write failed or it made none,
+// whatever the earlier attempt's write confirmed, and every attempt's writes are reported.
+#[tokio::test]
+async fn adopted_continuation_requests_release_only_on_its_own_outcome_write() {
+    let earlier = [comment_written(), state_write("written", json!({}))];
+    let failed = state_write(
+        "failed",
+        json!({"code": "mirror_write_rejected", "diagnostic": "The update was not confirmed."}),
+    );
+    for (own, release) in [
+        (Some(failed), false),
+        (None, false),
+        (Some(state_write("written", json!({}))), true),
+    ] {
+        let continued = adopted_failure(&earlier);
+        fs::write(continued.log.join("proceed"), b"").unwrap();
+        if let Some(own) = &own {
+            stage_mirror_write(&continued.log, "landed", "0003-outcome.json", own);
+        }
+        let (end, _) = drive_adopted(&continued, &["build"], "continue").await;
+        let TreeConclusion::Terminal { exit, .. } = end.conclusion() else {
+            panic!("a continued adopted run has a result: {end:#?}");
+        };
+        assert_eq!(
+            exit,
+            TreeExit {
+                chosen_outcome: Some("landed".to_owned()),
+                mirror: earlier
+                    .iter()
+                    .chain(&own)
+                    .cloned()
+                    .map(mirror_result)
+                    .collect(),
+                claim_release: release,
+            },
+            "{own:#?}"
+        );
+    }
+}
+
+// REQ-RUNNERENROLL-99, REQ-RUNNERENROLL-89: a `mirror/` the runner cannot read when it adopts
+// the run leaves every write the exit finds an earlier attempt's, so the continuation
+// reports them, requests no release even on a `written` outcome write, and keeps the read
+// failure's class for the run event.
+#[tokio::test]
+async fn adopted_run_whose_earlier_writes_cannot_be_counted_requests_no_release() {
+    let written = state_write("written", json!({}));
+    let bytes = serde_json::to_vec(&written).unwrap();
+    let continued = adopted_failure(&[]);
+    // Unreadable at adoption: a truncated write, which the stage `landed` replaces.
+    fs::write(
+        continued.run.join("mirror/0001-outcome.json"),
+        &bytes[..bytes.len() / 2],
+    )
+    .unwrap();
+    fs::write(continued.log.join("proceed"), b"").unwrap();
+    for name in ["0001-outcome.json", "0002-outcome.json"] {
+        stage_mirror_write(&continued.log, "landed", name, &written);
+    }
+    let (end, _) = drive_adopted(&continued, &["build"], "continue").await;
+    assert_eq!(end.mirror_failure, Some("mirror_write_invalid"));
+    let TreeConclusion::Terminal { exit, .. } = end.conclusion() else {
+        panic!("a continued adopted run has a result: {end:#?}");
+    };
+    assert_eq!(
+        exit,
+        TreeExit {
+            chosen_outcome: Some("landed".to_owned()),
+            mirror: vec![mirror_result(written.clone()), mirror_result(written)],
+            claim_release: false,
+        }
+    );
 }
 
 /// Drives the adopted run its offer carrying `pending` to its end and returns the end and
@@ -4844,6 +4976,64 @@ async fn adopted_run_applies_its_offer_pending_deliveries_before_its_first_comma
         }]
     );
     succeeded_with(&end, "landed");
+}
+
+// REQ-RUNNERENROLL-99, REQ-RUNNERENROLL-89: the writes an adopted run's `mirror/` held are
+// counted before the offer's deliveries are applied, so a delivery that ends the run
+// requests release only on an outcome write its application made.
+#[tokio::test]
+async fn adopted_run_counts_its_earlier_writes_before_applying_its_offer_deliveries() {
+    let earlier = state_write("written", json!({}));
+    for (own, release) in [
+        (Some(state_write("written", json!({}))), true),
+        (None, false),
+    ] {
+        let waiting = adopted(
+            record("waiting", None, 1, json!(["merge"])),
+            Some(json!({
+                "kind": "stop",
+                "since": "2026-07-23T00:00:05Z",
+                "step": ["merge"],
+                "then": "merge",
+                "rule": { "source": "um", "event": "pull_request.merged" },
+                "payload": {},
+            })),
+        );
+        let mirror = waiting.run.join("mirror");
+        fs::create_dir(&mirror).unwrap();
+        fs::write(
+            mirror.join("0001-outcome.json"),
+            serde_json::to_vec(&earlier).unwrap(),
+        )
+        .unwrap();
+        if let Some(own) = &own {
+            stage_mirror_write(&waiting.log, "event", "0002-outcome.json", own);
+        }
+        let (end, _) = drive_adopted_with(
+            &waiting,
+            &["merge"],
+            "cancel",
+            &[delivery("wtd_01k0z6r1w8f4jy2m7q9v3x5abt")],
+        )
+        .await;
+        assert_eq!(order(&waiting.log), ["event"]);
+        let TreeConclusion::Terminal { exit, .. } = end.conclusion() else {
+            panic!("a cancelled adopted run has a result: {end:#?}");
+        };
+        assert_eq!(
+            exit,
+            TreeExit {
+                chosen_outcome: Some("canceled".to_owned()),
+                mirror: std::iter::once(&earlier)
+                    .chain(&own)
+                    .cloned()
+                    .map(mirror_result)
+                    .collect(),
+                claim_release: release,
+            },
+            "{own:#?}"
+        );
+    }
 }
 
 // REQ-RUNNERENROLL-89

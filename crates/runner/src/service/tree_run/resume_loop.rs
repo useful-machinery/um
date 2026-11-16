@@ -16,8 +16,11 @@
 //! nothing. Once
 //! the loop has ended on an exited record, after the last `um` process and so after the
 //! outcome hook, it reads the run's `mirror/` writes onto that record for the terminal
-//! report and, when the last document carries no settled engine result, the result the
-//! run's current attempt recorded in `state.json`.
+//! report, the number the run's `mirror/` held when the runner took it marking the leading
+//! writes as earlier attempts', which request no release (REQ-RUNNERENROLL-99): none for a
+//! created run, and for an adopted run the count read before its offer's deliveries are
+//! applied and before its first command. When the last document carries no settled engine
+//! result, it also reads the result the run's current attempt recorded in `state.json`.
 //!
 //! A `create` the runtime refuses made no run: it ends the loop as a
 //! `ClassifiedEnd::Refused` naming the root workflow's first step, never as a missing
@@ -159,12 +162,23 @@ impl TreeEnd {
     }
 
     /// The end with what the run at `directory` recorded beside its exited record, read on
-    /// one blocking worker: its mirror writes on the record and, for an unclassified end
-    /// whose outcome is not the engine's cancellation and whose document carries no settled
-    /// result, the engine's result its current attempt recorded. A `mirror/` that cannot be
-    /// read reports no writes, so the report requests no release on an outcome it cannot
-    /// confirm, and the end keeps the failure's class for the run event.
-    async fn with_exit_records(mut self, directory: PathBuf) -> Self {
+    /// one blocking worker: its mirror writes on the record, the first `earlier_writes` of
+    /// them marked an earlier attempt's, and, for an unclassified end whose outcome is not
+    /// the engine's cancellation and whose document carries no settled result, the engine's
+    /// result its current attempt recorded. Only a write past the earlier ones can request
+    /// release (REQ-RUNNERENROLL-99): when their count could not be read every write is
+    /// marked earlier, and a `mirror/` that cannot be read now reports no writes, so the
+    /// report requests no release on an outcome it cannot confirm as the attempt's own. The
+    /// end keeps the class of either failure for the run event, the later read's when both
+    /// failed.
+    async fn with_exit_records(
+        mut self,
+        directory: PathBuf,
+        earlier_writes: Result<usize, &'static str>,
+    ) -> Self {
+        if let Err(failure) = earlier_writes {
+            self.mirror_failure = Some(failure);
+        }
         let wants_result = self.classified.is_none() && self.documented().is_none();
         let Some(record) = self
             .record
@@ -186,7 +200,10 @@ impl TreeEnd {
         {
             Ok((writes, recorded)) => {
                 match writes {
-                    Ok(writes) => record.mirror = writes,
+                    Ok(writes) => {
+                        record.earlier_writes = earlier_writes.unwrap_or(writes.len());
+                        record.mirror = writes;
+                    }
                     Err(error) => self.mirror_failure = Some(mirror_read_failure(&error)),
                 }
                 self.recorded = recorded;
@@ -384,6 +401,11 @@ struct Driver<'a> {
     run: &'a TreeRun,
     progress: Progress<'a>,
     directory: Option<PathBuf>,
+    /// How many writes the run's `mirror/` held when the runner took the run, which are
+    /// earlier attempts' (REQ-RUNNERENROLL-99): none for a run `create` made, and for an
+    /// adopted run the count read before anything is applied to it, or the class of the
+    /// failure to read it.
+    earlier_writes: Result<usize, &'static str>,
     steps: Arc<Mutex<StepReader>>,
     /// The deliveries and controls taken for application, by id, so a redelivered one is
     /// applied once.
@@ -415,13 +437,17 @@ pub(super) async fn drive(run: &TreeRun, sink: ReportSink<'_>) -> Result<TreeEnd
             reported: HashMap::new(),
         },
         directory: None,
+        earlier_writes: Ok(0),
         steps: Arc::default(),
         applied: BTreeSet::new(),
         controls: VecDeque::new(),
     };
     let end = drive_to_end(&mut driver).await?;
     Ok(match driver.directory {
-        Some(directory) => end.with_exit_records(directory).await,
+        Some(directory) => {
+            end.with_exit_records(directory, driver.earlier_writes)
+                .await
+        }
         None => end,
     })
 }
@@ -469,7 +495,12 @@ async fn drive_to_end(driver: &mut Driver<'_>) -> Result<TreeEnd, DriveFailure> 
         TreeStart::Adopt(steps) => {
             driver.directory = locate(&run.runs).await;
             let ended = match driver.directory.clone() {
-                Some(directory) => driver.apply_adopted_pending(&directory).await?,
+                Some(directory) => {
+                    // The writes the run already holds are earlier attempts', counted before
+                    // a delivery or command of this attempt can add one.
+                    driver.earlier_writes = count_mirror_writes(directory.clone()).await;
+                    driver.apply_adopted_pending(&directory).await?
+                }
                 None => false,
             };
             match (driver.directory.clone(), steps.first()) {
@@ -1081,6 +1112,16 @@ async fn locate(runs: &Path) -> Option<PathBuf> {
         .await
         .ok()
         .flatten()
+}
+
+/// How many writes the run's `mirror/` at `directory` holds, read on a blocking worker, or
+/// the class of the failure to read it.
+async fn count_mirror_writes(directory: PathBuf) -> Result<usize, &'static str> {
+    match tokio::task::spawn_blocking(move || um_execution::read_mirror_writes(&directory)).await {
+        Ok(Ok(writes)) => Ok(writes.len()),
+        Ok(Err(error)) => Err(mirror_read_failure(&error)),
+        Err(_) => Err(MIRROR_READER_LOST),
+    }
 }
 
 /// The run's record and, while it waits, its wait record.

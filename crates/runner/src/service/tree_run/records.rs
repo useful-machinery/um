@@ -6,11 +6,12 @@
 //! directory's record of the current attempt, a failure there with the primary issue of the
 //! `result.json` that attempt published and never a step the runner selects itself; the
 //! record's outcome, the workflow's choice, travels as `chosenOutcome` and never selects
-//! the result, its run's mirror writes as `mirror` and its own confirmed departure as
-//! `claimRelease`. An adopted run (REQ-RUNNERENROLL-89) whose record already read `exited`
-//! is concluded by the result its current attempt recorded, and one whose first
-//! `resume --from` the runtime refused ends `failed` with the refusal's code, as does a run
-//! whose `create` the runtime refused (REQ-RUNNERENROLL-91).
+//! the result, its run's mirror writes, every attempt's, as `mirror` and the departure the
+//! attempt's own outcome write confirmed as `claimRelease`. An adopted run
+//! (REQ-RUNNERENROLL-89) whose record already read `exited` is concluded by the result its
+//! current attempt recorded, and one whose first `resume --from` the runtime refused ends
+//! `failed` with the refusal's code, as does a run whose `create` the runtime refused
+//! (REQ-RUNNERENROLL-91).
 
 use std::path::Path;
 
@@ -44,9 +45,13 @@ pub(in crate::service) struct TreeRecord {
     pub(in crate::service) outcome: Option<String>,
     pub(in crate::service) attempts: u64,
     pub(in crate::service) position: Vec<Value>,
-    /// The run's `mirror/` writes in order (REQ-LOCALRUN-193), read only for the record
-    /// the loop ends on; empty while the loop observes the record.
+    /// The run's `mirror/` writes in order (REQ-LOCALRUN-193), every attempt's, read only
+    /// for the record the loop ends on; empty while the loop observes the record.
     pub(in crate::service) mirror: Vec<MirrorWrite>,
+    /// How many leading writes of `mirror` an earlier attempt of the run made: those
+    /// `mirror/` held when the runner took the run, or all of them when that count could
+    /// not be read (REQ-RUNNERENROLL-99). Zero while the loop observes the record.
+    pub(in crate::service) earlier_writes: usize,
 }
 
 impl TreeRecord {
@@ -87,6 +92,7 @@ pub(in crate::service) fn read_record(run_directory: &Path) -> Option<TreeRecord
             .filter(|attempts| *attempts >= 1)?,
         position: record["position"].as_array()?.clone(),
         mirror: Vec::new(),
+        earlier_writes: 0,
     })
 }
 
@@ -415,13 +421,18 @@ fn unchanged_exit() -> TreeExit {
     }
 }
 
-/// The exit `record` reports: its outcome as the chosen outcome, its run's mirror writes
-/// and whether they confirm the runner's own departure.
+/// The exit `record` reports: its outcome as the chosen outcome, its run's mirror writes,
+/// every attempt's, and whether a write past the earlier attempts' confirms the runner's own
+/// departure.
 fn recorded_exit(record: &TreeRecord) -> TreeExit {
     TreeExit {
         chosen_outcome: record.outcome.clone(),
         mirror: mirror_results(&record.mirror),
-        claim_release: record.mirror.iter().any(confirms_departure),
+        claim_release: record
+            .mirror
+            .iter()
+            .skip(record.earlier_writes)
+            .any(confirms_departure),
     }
 }
 
@@ -438,9 +449,10 @@ fn mirror_results(writes: &[MirrorWrite]) -> Vec<Value> {
         .collect()
 }
 
-/// The runner's own confirmed departure (REQ-RUNNERENROLL-99): the outcome hook's state
+/// Whether `write` confirms a departure (REQ-RUNNERENROLL-99): the outcome hook's state
 /// write landed, or was skipped because its guard held, the issue already being elsewhere.
-/// A failed write, whose effect is unknown, confirms nothing.
+/// A failed write, whose effect is unknown, confirms nothing, and only a write the attempt
+/// itself made confirms the runner's own departure (`recorded_exit`).
 fn confirms_departure(write: &MirrorWrite) -> bool {
     write.hook == MirrorHook::Outcome
         && matches!(write.action, MirrorAction::State { .. })
