@@ -3873,6 +3873,40 @@ impl EngineeringWaitTree {
     /// `issue-1` from `Engineering` towards `to` at `updated_at`, under the claim admitted at
     /// `ADMITTED_AT` in `Engineering`.
     fn event(&self, stub: &LinearStub, run: &Path, updated_at: &str, to: &str) -> Output {
+        self.event_of(stub, run, "issue-1", updated_at, to)
+    }
+
+    /// `event` for a departure of `issue` under the same claim for `issue-1`.
+    fn event_of(
+        &self,
+        stub: &LinearStub,
+        run: &Path,
+        issue: &str,
+        updated_at: &str,
+        to: &str,
+    ) -> Output {
+        let claim = serde_json::json!({
+            "connection": "lc_1",
+            "issue": "issue-1",
+            "observation": {
+                "team": "team-auto",
+                "state": "state-engineering",
+                "updatedAt": ADMITTED_AT,
+            },
+        });
+        self.event_under(stub, run, issue, updated_at, to, &claim)
+    }
+
+    /// `event_of` under the claim document `claim`.
+    fn event_under(
+        &self,
+        stub: &LinearStub,
+        run: &Path,
+        issue: &str,
+        updated_at: &str,
+        to: &str,
+        claim: &serde_json::Value,
+    ) -> Output {
         let event = self.files.path().join("event.json");
         fs::write(
             &event,
@@ -3881,7 +3915,7 @@ impl EngineeringWaitTree {
                 "event": "issue.state_left",
                 "at": updated_at,
                 "payload": {
-                    "issue": {"id": "issue-1", "identifier": "AUTO-1"},
+                    "issue": {"id": issue, "identifier": "AUTO-1"},
                     "issueUpdatedAt": updated_at,
                     "team": "team-auto",
                     "state": "state-engineering",
@@ -3892,21 +3926,8 @@ impl EngineeringWaitTree {
             .to_string(),
         )
         .unwrap();
-        let claim = self.files.path().join("claim.json");
-        fs::write(
-            &claim,
-            serde_json::json!({
-                "connection": "lc_1",
-                "issue": "issue-1",
-                "observation": {
-                    "team": "team-auto",
-                    "state": "state-engineering",
-                    "updatedAt": ADMITTED_AT,
-                },
-            })
-            .to_string(),
-        )
-        .unwrap();
+        let claim_file = self.files.path().join("claim.json");
+        fs::write(&claim_file, claim.to_string()).unwrap();
         self.run(
             stub,
             &[
@@ -3915,7 +3936,7 @@ impl EngineeringWaitTree {
                 "--event",
                 event.to_str().unwrap(),
                 "--claim",
-                claim.to_str().unwrap(),
+                claim_file.to_str().unwrap(),
                 "--json",
             ],
         )
@@ -4013,6 +4034,56 @@ fn a_delivered_departure_is_applied_from_the_fresh_issue_state() {
     );
     assert_eq!(refusal["observation"]["team"], "team-other", "{refusal}");
     assert_eq!(run_record(&moved)["state"], "waiting");
+}
+
+// REQ-LOCALRUN-208: a delivered departure acts only for the claim's issue; one whose
+// `issue.id` is another issue is refused before the issue is read or the run is touched.
+#[test]
+fn a_delivered_departure_of_another_issue_is_refused_before_any_read() {
+    let tree = EngineeringWaitTree::publish();
+    let stub = LinearStub::start();
+    let later = "2026-11-10T10:00:01Z";
+    let run = tree.waiting(&stub, "AUTO-1");
+    let controls = control_count(&run);
+    // Were the event applied, the fresh state would cancel the run.
+    stub.issue_state("Canceled");
+    stub.clear();
+
+    let refusal = refused(
+        &tree.event_of(&stub, &run, "issue-2", later, "state-canceled"),
+        "event",
+        "claim_mismatch",
+    );
+    assert_eq!(refusal["observation"], serde_json::Value::Null, "{refusal}");
+    assert_eq!(stub.operations(), Vec::<String>::new());
+    assert_eq!(control_count(&run), controls);
+    assert_eq!(run_record(&run)["state"], "waiting");
+}
+
+// REQ-LOCALRUN-208, REQ-TRIGGER-154: a manual start's claim is carried with the event's own
+// issue and no admission observation, so the issue comparison cannot refuse it; the missing
+// observation does, `claim_invalid`, before the issue is read or the run is touched.
+#[test]
+fn a_delivered_departure_under_a_claim_with_no_observation_is_refused_before_any_read() {
+    let tree = EngineeringWaitTree::publish();
+    let stub = LinearStub::start();
+    let later = "2026-11-10T10:00:01Z";
+    let run = tree.waiting(&stub, "AUTO-1");
+    let controls = control_count(&run);
+    // Were the event applied, the fresh state would cancel the run.
+    stub.issue_state("Canceled");
+    stub.clear();
+
+    let claim = serde_json::json!({"connection": "lc_1", "issue": "issue-1"});
+    let refusal = refused(
+        &tree.event_under(&stub, &run, "issue-1", later, "state-canceled", &claim),
+        "event",
+        "claim_invalid",
+    );
+    assert_eq!(refusal["observation"], serde_json::Value::Null, "{refusal}");
+    assert_eq!(stub.operations(), Vec::<String>::new());
+    assert_eq!(control_count(&run), controls);
+    assert_eq!(run_record(&run)["state"], "waiting");
 }
 
 // REQ-LOCALRUN-208: a revision that cannot be read is `control_unavailable`, and the
