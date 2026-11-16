@@ -17,6 +17,7 @@ use super::records::conclude;
 use super::resume_loop::ResumeIntervals;
 use super::{HttpTreeBroker, TransportResult, TreeConclusion, TreeRunDependencies};
 use crate::service::assignment::test_support::{
+    GITLAB_CANONICAL_URL, GitLabGrantBroker, accepted_roots, assert_no_runner_git_wiring,
     cleanup_failed, control_lease_clock, enqueue_transitions, finished_reports,
     keep_agent_logins_in, prepare_continued, prepare_offered, settled_observations, start_offered,
     start_offered_with, tree_run_manager, wait_for_reports,
@@ -27,6 +28,9 @@ use crate::service::assignment::{
     OBSERVATION_RESERVE_BASE,
 };
 use crate::service::config::{AssignmentConfig, Config, RepositoryUrlPolicy};
+use crate::service::source::SourceCredentialBroker;
+use crate::service::source::test_support::fixture_source_broker;
+use crate::service::test_support::run_fixture_git;
 use um_execution::{
     CancellationReason, EnvironmentSnapshot, ResolvedAttachment, ResolvedFile, ResolvedInput,
     ResolvedInputs, ResolvedJsonInput,
@@ -34,9 +38,10 @@ use um_execution::{
 use um_runner_protocol::{
     AssignmentDecline, CancellationMode, CloudFrame, ContinuationOffer, ExecutionSpecInvalidReason,
     RunControlApplication, RunControlOutcome, RunControlSkip, RunnerEnvelope, RunnerFrame,
-    RunnerUnableReason, TreeExit, TriggerDelivery, TriggerDeliveryAction,
-    TriggerDeliveryApplication, TriggerDeliveryOutcome, TriggerIssueObservation,
-    WorkflowTreeFileV1RunnerProjection, decode_cloud_frame, encode_runner_frame,
+    RunnerUnableReason, SourceDisplayRepositoryV1RunnerProjection, TreeExit, TriggerDelivery,
+    TriggerDeliveryAction, TriggerDeliveryApplication, TriggerDeliveryOutcome,
+    TriggerIssueObservation, WorkflowTreeFileV1RunnerProjection, decode_cloud_frame,
+    encode_runner_frame,
 };
 
 const TREE_DIGEST: &str = "sha256:4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945";
@@ -372,16 +377,6 @@ fn capability_server() -> (Url, Arc<Mutex<Vec<Value>>>) {
     )
 }
 
-fn run_git(repository: &Path, arguments: &[&str]) -> String {
-    let output = um_test_support::fixture_git_command("git")
-        .current_dir(repository)
-        .args(arguments)
-        .output()
-        .unwrap();
-    assert!(output.status.success(), "fixture git command failed");
-    String::from_utf8(output.stdout).unwrap().trim().to_owned()
-}
-
 /// The resume loop's intervals in the tests, in milliseconds.
 const TEST_INTERVALS: ResumeIntervals = ResumeIntervals {
     held: Duration::from_millis(20),
@@ -460,6 +455,28 @@ fn fixture_bounded(
     recorder: Option<Arc<crate::telemetry::Recorder>>,
     bound: Duration,
 ) -> Fixture {
+    fixture_sourced(
+        published_digest,
+        state,
+        outcome,
+        variables,
+        recorder,
+        bound,
+        fixture_source_broker,
+    )
+}
+
+/// `fixture_bounded`, each workspace checked out through the broker `source_broker`
+/// makes for the fixture repository.
+fn fixture_sourced(
+    published_digest: &str,
+    state: &str,
+    outcome: &str,
+    variables: &[(&str, &str)],
+    recorder: Option<Arc<crate::telemetry::Recorder>>,
+    bound: Duration,
+    source_broker: impl FnOnce(&Path) -> Arc<dyn SourceCredentialBroker>,
+) -> Fixture {
     let temporary = tempfile::tempdir().unwrap();
     let source = temporary.path().join("source");
     let work = temporary.path().join("work");
@@ -469,15 +486,15 @@ fn fixture_bounded(
     }
     fs::set_permissions(&work, fs::Permissions::from_mode(0o700)).unwrap();
     fs::write(source.join("README"), "workspace\n").unwrap();
-    run_git(&source, &["init", "--quiet", "--object-format=sha1"]);
-    run_git(&source, &["config", "user.name", "Tree Fixture"]);
-    run_git(
+    run_fixture_git(&source, &["init", "--quiet", "--object-format=sha1"]);
+    run_fixture_git(&source, &["config", "user.name", "Tree Fixture"]);
+    run_fixture_git(
         &source,
         &["config", "user.email", "fixture@usefulmachinery.invalid"],
     );
-    run_git(&source, &["add", "."]);
-    run_git(&source, &["commit", "--quiet", "-m", "fixture"]);
-    let commit = run_git(&source, &["rev-parse", "HEAD"]);
+    run_fixture_git(&source, &["add", "."]);
+    run_fixture_git(&source, &["commit", "--quiet", "-m", "fixture"]);
+    let commit = run_fixture_git(&source, &["rev-parse", "HEAD"]);
     let um = injected_um(temporary.path());
 
     let (endpoint, capability_requests) = capability_server();
@@ -513,7 +530,7 @@ fn fixture_bounded(
     );
     let manager = tree_run_manager(
         &config,
-        &source,
+        source_broker(&source),
         TreeRunDependencies::new(Some(Arc::new(broker)))
             .with_executable(um)
             .with_resume_intervals(TEST_INTERVALS)
@@ -686,6 +703,87 @@ async fn published_tree_runs_once_and_reports_the_chosen_outcome() {
             claim_release: false,
         }
     );
+}
+
+/// A tree run offered on a GitLab project as Cloud admits one: schema 2 with both
+/// pins at the workspace commit and the GitLab display snapshot, its workspace checked
+/// out over the Cloud relay through the returned broker's read grants. The run fails,
+/// so its workspace is retained for inspection (REQ-WORKSPACE-26).
+fn gitlab_tree_fixture() -> (Fixture, Arc<GitLabGrantBroker>) {
+    let mut gitlab = None;
+    let mut fixture = fixture_sourced(
+        TREE_DIGEST,
+        "exited",
+        "\"failed\"",
+        &[("TREE_TEST_RESULT", BUILD_FAILED)],
+        None,
+        super::command::SHORT_COMMAND_BOUND,
+        |source| -> Arc<dyn SourceCredentialBroker> {
+            let broker = Arc::new(GitLabGrantBroker::new(source));
+            gitlab = Some(Arc::clone(&broker));
+            broker
+        },
+    );
+    let spec = &mut fixture.offer.execution_spec;
+    assert_eq!(spec.schema_version, 2);
+    spec.primary_workspace_source.provider_kind = "gitlab".to_owned();
+    spec.source_display_snapshot.as_mut().unwrap().repository =
+        SourceDisplayRepositoryV1RunnerProjection {
+            provider_kind: "gitlab".to_owned(),
+            instance_url: Some("https://gitlab.com".to_owned()),
+            full_name: "group/sub/project".to_owned(),
+        };
+    (fixture, gitlab.unwrap())
+}
+
+// REQ-WORKSPACE-42, REQ-WORKSPACE-32, REQ-WORKSPACE-34: a definition-backed GitLab
+// run fetches its commit over the relay with preparation grants alone, revokes them,
+// and runs its tree against the credential-free canonical origin, which its retained
+// workspace keeps.
+#[tokio::test]
+async fn gitlab_tree_assignment_prepares_over_the_relay_and_runs_without_relay_wiring() {
+    let (mut fixture, gitlab) = gitlab_tree_fixture();
+    assert_eq!(
+        prepare_offered(&mut fixture.manager, &fixture.offer).await,
+        None
+    );
+    // The first grant expires inside the 30-second margin, so preparation renews it.
+    assert_eq!(gitlab.issued_preparation(), 2);
+    assert_eq!(gitlab.revoked_preparation(), 2);
+    let (workspace, private) = accepted_roots(&fixture.manager);
+    assert_eq!(
+        run_fixture_git(&workspace, &["rev-parse", "HEAD"]),
+        fixture
+            .offer
+            .execution_spec
+            .primary_workspace_source
+            .commit_oid
+    );
+    assert_eq!(
+        run_fixture_git(&workspace, &["remote", "get-url", "origin"]),
+        GITLAB_CANONICAL_URL
+    );
+    assert_no_runner_git_wiring(&workspace, &private);
+
+    start_offered(&mut fixture.manager, &fixture.offer).spawn();
+    let reports = finished_reports(&mut fixture.manager).await;
+    assert!(
+        matches!(reports.last(), Some(ExecutionReport::TreeFinished { outcome, .. })
+            if outcome["outcome"] == "failed"),
+        "{reports:#?}"
+    );
+    assert_eq!(gitlab.issued_workflow_git(), 0);
+    assert!(
+        logged_lines(&fixture.log, "create.env")
+            .iter()
+            .all(|line| !line.starts_with("GIT_") && !line.contains("grg_fixture-grant")),
+        "the runtime received runner Git wiring"
+    );
+    assert_eq!(
+        run_fixture_git(&workspace, &["remote", "get-url", "origin"]),
+        GITLAB_CANONICAL_URL
+    );
+    assert_no_runner_git_wiring(&workspace, &private);
 }
 
 // REQ-RUNNERENROLL-91, REQ-GRANT-44

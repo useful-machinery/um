@@ -16,7 +16,7 @@ use super::http_client::{HttpClient, HttpEndpointError};
 use super::http_util::{self, ApiAttemptError, BufferedResponse};
 use super::problem::{
     self, ACCEPTED_MEDIA_TYPES, BAD_REQUEST, FORBIDDEN, IDEMPOTENCY_CONFLICT, JSON_MEDIA_TYPE,
-    NOT_FOUND, QUANTITY_LIMIT_REACHED, REQUEST_BODY_TOO_LARGE, UNAUTHORIZED,
+    NOT_FOUND, QUANTITY_LIMIT_REACHED, REQUEST_BODY_TOO_LARGE, RETRYABLE_CONFLICT, UNAUTHORIZED,
 };
 use super::{UnreachableCategory, bearer_authorization, classify_reqwest_error};
 
@@ -27,7 +27,6 @@ const DELEGATION_TRANSITION_UNAVAILABLE: &str =
     "https://api.usefulmachinery.com/problems/delegation-transition-unavailable";
 const UNSUPPORTED_MEDIA_TYPE: &str =
     "https://api.usefulmachinery.com/problems/unsupported-media-type";
-const RETRYABLE_CONFLICT: &str = "https://api.usefulmachinery.com/problems/retryable-conflict";
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]

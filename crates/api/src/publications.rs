@@ -12,8 +12,8 @@ use super::generated::{apis, models};
 use super::http_client::generated_configuration;
 use super::http_util::{self, BoundedBodyError, BufferedBlockingResponse};
 use super::problem::{
-    self, BAD_REQUEST, FORBIDDEN, IDEMPOTENCY_CONFLICT, JSON_MEDIA_TYPE, NOT_FOUND,
-    REQUEST_BODY_TOO_LARGE, UNAUTHORIZED,
+    self, BAD_REQUEST, FORBIDDEN, IDEMPOTENCY_CONFLICT, INTERNAL_SERVER_ERROR, JSON_MEDIA_TYPE,
+    NOT_FOUND, REQUEST_BODY_TOO_LARGE, RETRYABLE_CONFLICT, UNAUTHORIZED,
 };
 use super::{HttpTransportPolicy, UnreachableCategory, classify_reqwest_error};
 
@@ -29,9 +29,6 @@ const TARGET_MISMATCH: &str =
     "https://api.usefulmachinery.com/problems/publication-target-mismatch";
 const UNSUPPORTED_MEDIA_TYPE: &str =
     "https://api.usefulmachinery.com/problems/unsupported-media-type";
-const INTERNAL_SERVER_ERROR: &str =
-    "https://api.usefulmachinery.com/problems/internal-server-error";
-const RETRYABLE_CONFLICT: &str = "https://api.usefulmachinery.com/problems/retryable-conflict";
 
 pub type Publication = models::Publication;
 pub type PublicationList = models::PublicationList;

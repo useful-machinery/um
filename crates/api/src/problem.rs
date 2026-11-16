@@ -29,6 +29,10 @@ pub(super) const GRANT_SESSION_CONFLICT: &str =
     "https://api.usefulmachinery.com/problems/grant-session-conflict";
 pub(super) const SERVICE_UNAVAILABLE: &str =
     "https://api.usefulmachinery.com/problems/service-unavailable";
+pub(super) const RETRYABLE_CONFLICT: &str =
+    "https://api.usefulmachinery.com/problems/retryable-conflict";
+pub(super) const INTERNAL_SERVER_ERROR: &str =
+    "https://api.usefulmachinery.com/problems/internal-server-error";
 pub(super) const PROJECT_ARCHIVED: &str =
     "https://api.usefulmachinery.com/problems/project-archived";
 /// The `reason` a conflict carries when its project is archived, under a type a published CLI

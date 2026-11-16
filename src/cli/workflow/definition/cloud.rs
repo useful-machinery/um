@@ -219,7 +219,8 @@ impl Target {
         report::finish(&scope, shown.as_ref(), |shown| report::shown(&scope, shown))
     }
 
-    /// Applies `change` under one fresh key, sent again once when the response is lost.
+    /// Applies `change` under one fresh key, sent again once when the response is lost or is
+    /// a transient problem (REQ-CLOUDDEF-25).
     fn change(&self, deployment: &Deployment, change: Change<'_>) -> cli::CommandResult {
         let key = um_support::generate_idempotency_key()
             .context("generate Cloud workflow definition request identity")?;
@@ -233,9 +234,9 @@ impl Target {
     }
 }
 
-/// Sends a keyed request, and sends it once more when Cloud does not answer: the caller
-/// keeps the key, so a request Cloud applied before its answer was lost is answered again,
-/// not applied twice.
+/// Sends a keyed request, and sends it once more, at once, when Cloud does not answer or
+/// answers with a transient problem (REQ-CLOUDDEF-25): the caller keeps the key, so a request
+/// Cloud applied before its answer was lost is answered again, not applied twice.
 pub(super) fn resend_once<T>(
     mut send: impl FnMut() -> Result<T, WorkflowDefinitionFailure>,
 ) -> Result<T, WorkflowDefinitionFailure> {

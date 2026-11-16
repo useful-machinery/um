@@ -27,7 +27,8 @@ use crate::service::source::{
 };
 use crate::service::test_support::{
     controlled_sleeper, fixture_lease_clock, fixture_sleeper, guarded_processes,
-    holding_step_workflow, process_exists, require_internal_worker_executable, with_watchdog,
+    holding_step_workflow, process_exists, require_internal_worker_executable, run_fixture_git,
+    with_watchdog,
 };
 use crate::service::workspace::{
     CleanupCancellation, CleanupSleeper, OwnedTree, TreeRemover, WorkRootHook, WorkspaceFilesystem,
@@ -1049,20 +1050,6 @@ async fn assert_unmodified_preparation_declined(
 
 fn manager_fixture(workflow: &str) -> (tempfile::TempDir, AssignmentManager) {
     manager_fixture_with_harnesses(workflow, None, None, None)
-}
-
-fn run_fixture_git(repository: &Path, arguments: &[&str]) -> String {
-    let output = um_test_support::fixture_git_command("git")
-        .current_dir(repository)
-        .args(arguments)
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "fixture git command failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    String::from_utf8(output.stdout).unwrap().trim().to_owned()
 }
 
 fn initialize_source_repository(source: &Path) {

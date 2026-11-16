@@ -68,6 +68,22 @@ pub(crate) fn require_internal_worker_executable() -> PathBuf {
     worker
 }
 
+/// Runs fixture Git in `repository` and returns its trimmed standard output; a failed
+/// command panics with Git's standard error.
+pub(crate) fn run_fixture_git(repository: &Path, arguments: &[&str]) -> String {
+    let output = um_test_support::fixture_git_command("git")
+        .current_dir(repository)
+        .args(arguments)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "fixture git command failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).unwrap().trim().to_owned()
+}
+
 /// A workflow whose one `cmd` step leads a guarded process group and holds a descendant
 /// in it, recording `<leader> <descendant>` to `record` once both exist.
 pub(crate) fn holding_step_workflow(record: &Path) -> String {

@@ -1014,6 +1014,59 @@ fn gitlab_project_create_bind_and_read_preserve_provider_identity() {
     }
 }
 
+// REQ-PROJECT-78: the closed-admission line follows the diagnostic, not the provider, so
+// a GitLab project that reads ready while the deployment's admission is open prints none.
+#[test]
+fn ready_gitlab_project_prints_no_closed_admission_line() {
+    let project = project_body(
+        "widget",
+        true,
+        Some(serde_json::json!({
+            "connectionId": CONNECTION_ID,
+            "providerKind": "gitlab",
+            "gitlabConnectionId": GITLAB_CONNECTION_ID,
+            "instanceUrl": "https://gitlab.com",
+            "providerRepositoryId": REPOSITORY_ID,
+            "fullName": "group/sub/project",
+            "defaultBranch": "main",
+            "availability": "active"
+        })),
+    );
+    let (server, _directory, credential_path) =
+        prepared_project(vec![json_http_response("200 OK", project)]);
+    let show = run_project(
+        &[
+            "project",
+            "show",
+            ORGANIZATION,
+            PROJECT_ID,
+            "--allow-insecure-http",
+        ],
+        &server,
+        &credential_path,
+    );
+    assert!(
+        show.status.success(),
+        "{}",
+        String::from_utf8_lossy(&show.stderr)
+    );
+    let text = String::from_utf8(show.stdout).unwrap();
+    assert!(
+        text.lines().any(|line| line == "readiness: ready"),
+        "{text}"
+    );
+    assert!(
+        text.lines()
+            .any(|line| line == format!("GitLab connection: {GITLAB_CONNECTION_ID}")),
+        "{text}"
+    );
+    assert!(
+        text.lines().all(|line| !line.starts_with("admission:")),
+        "{text}"
+    );
+    server.finish();
+}
+
 // REQ-PROJECT-78
 #[test]
 fn project_human_output_exposes_readiness_and_blockers() {

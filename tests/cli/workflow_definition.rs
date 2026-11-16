@@ -1586,8 +1586,9 @@ impl GatewayRequest {
 /// What the fake Gateway holds between invocations: the file contents the organization
 /// retains, the sealed tree digests, each definition, whether the next publication to an id
 /// loses a race to another publisher or is forbidden, whether the reply to the next create
-/// or publication is lost after it is applied, and each such reply, with its status, by its
-/// `Idempotency-Key`.
+/// or publication is lost after it is applied, the problems the next keyed definition
+/// requests are answered with before they are applied, and each create or publication reply,
+/// with its status, by its `Idempotency-Key`.
 #[derive(Default)]
 struct GatewayState {
     retained: std::collections::BTreeSet<String>,
@@ -1596,6 +1597,7 @@ struct GatewayState {
     lose_next_publication: bool,
     forbid_next_publication: bool,
     drop_next_publication_reply: bool,
+    keyed_problems: std::collections::VecDeque<(&'static str, u16, &'static str)>,
     publications: std::collections::BTreeMap<String, (&'static str, Value)>,
 }
 
@@ -1684,6 +1686,22 @@ impl FakeGateway {
     /// Applies the next create or publication but sends no reply to it.
     pub(super) fn drop_next_publication_reply(&self) {
         self.state.lock().unwrap().drop_next_publication_reply = true;
+    }
+
+    /// Answers the next keyed request under the definitions with problem `slug` under
+    /// `status` (its status line `line`), applying and recording nothing; queued answers are
+    /// given to successive keyed requests.
+    pub(super) fn answer_next_keyed_with(
+        &self,
+        line: &'static str,
+        status: u16,
+        slug: &'static str,
+    ) {
+        self.state
+            .lock()
+            .unwrap()
+            .keyed_problems
+            .push_back((line, status, slug));
     }
 
     /// Holds definition `id` at revision `current`, active, disabled and with no principal.
@@ -1863,6 +1881,15 @@ fn respond(state: &mut GatewayState, request: &GatewayRequest, address: &str) ->
         let digest = digest.replace("%3A", ":").replace("%3a", ":");
         state.sealed.insert(digest.clone());
         return keyed("200 OK", gateway_tree(&digest, true));
+    }
+    if request.header("idempotency-key").is_some()
+        && request.path.starts_with(definitions.as_str())
+        && let Some((line, status, slug)) = state.keyed_problems.pop_front()
+    {
+        return super::problem_http_response(
+            line,
+            json!({"type": format!("{PROBLEMS}{slug}"), "title": "Unavailable", "status": status}),
+        );
     }
     if route == format!("POST {definitions}") {
         let body = request.json();
@@ -2319,6 +2346,80 @@ fn publish_cloud_resends_a_lost_publication_once_and_publishes_executable_bits()
         .json();
     assert_eq!(published["treeDigest"], digest.as_str());
     assert_eq!(published["executablePaths"], json!([]));
+}
+
+// REQ-CLOUDDEF-14, REQ-CLOUDDEF-25: a create or publication answered with a transient problem
+// is sent once more under its key; a second such answer leaves the local revision recorded
+// and is reported as Cloud being unavailable, and a 503 naming its own cause is refused.
+#[test]
+fn publish_cloud_resends_a_create_or_publication_answered_with_a_transient_problem_once() {
+    let home = Home::new();
+    let tree = Tree::engineering();
+    let bindings = tree.engineering_bindings();
+    let gateway = FakeGateway::new();
+    let definitions = format!(
+        "/api/v1/organizations/{CLOUD_ORGANIZATION}/projects/{CLOUD_PROJECT}/workflow-definitions"
+    );
+    let keyed_to = |requests: &[GatewayRequest], route: &str| {
+        requests
+            .iter()
+            .filter(|request| request.route() == route)
+            .map(|request| {
+                (
+                    request.header("idempotency-key").expect("key").to_owned(),
+                    request.body.clone(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+
+    gateway.answer_next_keyed_with("503 Service Unavailable", 503, "service-unavailable");
+    let (output, requests) = gateway.run(&home, &cloud_publish_args(&tree, &bindings, &["--json"]));
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let first = report(&output);
+    assert_eq!(first["outcome"], "published", "{first}");
+    let cloud_id = cloud_definition(&first);
+    let creates = keyed_to(&requests, &format!("POST {definitions}"));
+    assert_eq!(creates.len(), 2, "{:?}", routes(&requests));
+    assert_eq!(creates[0], creates[1]);
+    assert_eq!(gateway_definitions(&gateway), vec![(cloud_id.clone(), 1)]);
+
+    let publications = format!("POST {definitions}/{cloud_id}/revisions");
+    gateway.answer_next_keyed_with("500 Internal Server Error", 500, "internal-server-error");
+    gateway.answer_next_keyed_with("500 Internal Server Error", 500, "internal-server-error");
+    let (output, requests) = gateway.run(&home, &cloud_publish_args(&tree, &bindings, &["--json"]));
+    assert_eq!(output.status.code(), Some(4), "{output:?}");
+    let failed = report(&output);
+    assert_eq!(failed["outcome"], "cloud_failed", "{failed}");
+    assert_eq!(failed["cloud"]["failure"], "unavailable", "{failed}");
+    for member in ["status", "problem", "workflow"] {
+        assert!(failed["cloud"].get(member).is_none(), "{failed}");
+    }
+    assert_eq!(failed["revision"]["n"], 2);
+    let sent = keyed_to(&requests, &publications);
+    assert_eq!(sent.len(), 2, "{:?}", routes(&requests));
+    assert_eq!(sent[0].0, sent[1].0);
+    let record = published_record(&home, &failed);
+    assert_eq!(record["current"], 2);
+    assert_eq!(record["cloudId"], cloud_id.as_str());
+    assert_eq!(gateway_definitions(&gateway), vec![(cloud_id.clone(), 1)]);
+
+    gateway.answer_next_keyed_with(
+        "503 Service Unavailable",
+        503,
+        "binding-resolution-unavailable",
+    );
+    let (output, requests) = gateway.run(&home, &cloud_publish_args(&tree, &bindings, &["--json"]));
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let refused = report(&output);
+    assert_eq!(refused["cloud"]["failure"], "refused", "{refused}");
+    assert_eq!(refused["cloud"]["status"], 503);
+    assert_eq!(
+        refused["cloud"]["problem"],
+        "binding-resolution-unavailable"
+    );
+    assert_eq!(keyed_to(&requests, &publications).len(), 1);
+    assert_eq!(gateway_definitions(&gateway), vec![(cloud_id, 1)]);
 }
 
 // REQ-CLOUDDEF-14, REQ-WFDEF-19
@@ -3192,6 +3293,96 @@ fn cloud_group_lists_shows_and_administers_cloud_definitions() {
             vec![format!("POST {definitions}/{first}/{leaf}")]
         );
     }
+    assert!(home.workflow_entries().is_empty());
+}
+
+/// The problems Cloud answers when it is temporarily unable to serve a request, each with its
+/// status line and status.
+const TRANSIENT_PROBLEMS: [(&str, u16, &str); 3] = [
+    ("503 Service Unavailable", 503, "service-unavailable"),
+    ("503 Service Unavailable", 503, "retryable-conflict"),
+    ("500 Internal Server Error", 500, "internal-server-error"),
+];
+
+// REQ-CLOUDDEF-25: a change answered with a transient problem is sent once more under its key
+// and a second such answer is Cloud being unavailable; a 503 naming its own cause is refused.
+#[test]
+fn cloud_group_resends_a_change_answered_with_a_transient_problem_once() {
+    let home = Home::new();
+    let gateway = FakeGateway::new();
+    let id = format!("{CLOUD_ID_STEM}c");
+    gateway.define(&id, 2);
+    let disable = format!(
+        "POST /api/v1/organizations/{CLOUD_ORGANIZATION}/projects/{CLOUD_PROJECT}/workflow-definitions/{id}/disable"
+    );
+    let args = [
+        "workflow",
+        "definition",
+        "cloud",
+        "disable",
+        CLOUD_ORGANIZATION,
+        id.as_str(),
+        "--project-id",
+        CLOUD_PROJECT,
+        "--json",
+        "--allow-insecure-http",
+    ];
+    let enable = || {
+        gateway
+            .state
+            .lock()
+            .unwrap()
+            .definitions
+            .get_mut(&id)
+            .expect("seeded definition")
+            .automatic_starts = true;
+    };
+    let one_key = |requests: &[GatewayRequest]| {
+        assert_eq!(routes(requests), vec![disable.clone(), disable.clone()]);
+        let key = requests[0].header("idempotency-key").expect("change key");
+        assert!(!key.is_empty());
+        assert_eq!(requests[1].header("idempotency-key"), Some(key));
+    };
+
+    for (line, status, slug) in TRANSIENT_PROBLEMS {
+        enable();
+        gateway.answer_next_keyed_with(line, status, slug);
+        let (output, requests) = gateway.run(&home, &args);
+        assert_eq!(output.status.code(), Some(0), "{slug}: {output:?}");
+        let changed = report(&output);
+        assert_eq!(changed["outcome"], "disabled", "{changed}");
+        assert_eq!(changed["definition"]["automaticStarts"], false);
+        one_key(&requests);
+
+        enable();
+        gateway.answer_next_keyed_with(line, status, slug);
+        gateway.answer_next_keyed_with(line, status, slug);
+        let (output, requests) = gateway.run(&home, &args);
+        assert_eq!(output.status.code(), Some(4), "{slug}: {output:?}");
+        let unavailable = report(&output);
+        assert_eq!(unavailable["outcome"], "unavailable", "{unavailable}");
+        for member in ["status", "problem", "workflow"] {
+            assert!(unavailable.get(member).is_none(), "{unavailable}");
+        }
+        one_key(&requests);
+        let state = gateway.state.lock().unwrap();
+        assert!(state.definitions[&id].automatic_starts);
+        assert_eq!(state.definitions[&id].current, 2);
+    }
+
+    gateway.answer_next_keyed_with(
+        "503 Service Unavailable",
+        503,
+        "binding-resolution-unavailable",
+    );
+    let (output, requests) = gateway.run(&home, &args);
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let refused = report(&output);
+    assert_eq!(refused["outcome"], "refused", "{refused}");
+    assert_eq!(refused["status"], 503);
+    assert_eq!(refused["problem"], "binding-resolution-unavailable");
+    assert_eq!(routes(&requests), vec![disable.clone()]);
+    assert!(gateway.state.lock().unwrap().definitions[&id].automatic_starts);
     assert!(home.workflow_entries().is_empty());
 }
 

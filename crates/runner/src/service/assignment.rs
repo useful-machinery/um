@@ -1139,6 +1139,14 @@ impl Drop for AssignmentManager {
 
 #[cfg(test)]
 pub(super) mod test_support {
+    use std::fs;
+    use std::path::PathBuf;
+    use std::sync::atomic::AtomicUsize;
+
+    use super::super::source::{
+        CommitAvailability, CredentialBrokerFailure, ProviderCredential, ProviderSecret,
+        WorkflowGitRevocation,
+    };
     use super::*;
 
     pub(in crate::service) fn manager(
@@ -1554,13 +1562,145 @@ pub(super) mod test_support {
         };
     }
 
+    /// The canonical repository URL `GitLabGrantBroker`'s grants name.
+    pub(in crate::service) const GITLAB_CANONICAL_URL: &str =
+        "https://gitlab.com/group/sub/project.git";
+
+    /// A Cloud GitLab read-grant broker over the local repository at `source`: each
+    /// grant names that repository as its relay URL and `GITLAB_CANONICAL_URL` as the
+    /// canonical one, the first expiring in five seconds so that preparation renews
+    /// it at the 30-second margin. It counts the preparation grants it issued and revoked
+    /// and the execution grants it issued.
+    pub(in crate::service) struct GitLabGrantBroker {
+        read_url: Arc<str>,
+        issued_preparation: AtomicUsize,
+        revoked_preparation: AtomicUsize,
+        issued_workflow_git: AtomicUsize,
+    }
+
+    impl GitLabGrantBroker {
+        pub(in crate::service) fn new(source: &Path) -> Self {
+            Self {
+                read_url: Arc::from(url::Url::from_file_path(source).unwrap().to_string()),
+                issued_preparation: AtomicUsize::new(0),
+                revoked_preparation: AtomicUsize::new(0),
+                issued_workflow_git: AtomicUsize::new(0),
+            }
+        }
+
+        /// The relay URL its grants name.
+        pub(in crate::service) fn read_url(&self) -> &str {
+            &self.read_url
+        }
+
+        pub(in crate::service) fn issued_preparation(&self) -> usize {
+            self.issued_preparation.load(Ordering::SeqCst)
+        }
+
+        pub(in crate::service) fn revoked_preparation(&self) -> usize {
+            self.revoked_preparation.load(Ordering::SeqCst)
+        }
+
+        pub(in crate::service) fn issued_workflow_git(&self) -> usize {
+            self.issued_workflow_git.load(Ordering::SeqCst)
+        }
+
+        fn grant(&self, sequence: usize) -> ProviderCredential {
+            ProviderCredential {
+                repository_url: Arc::clone(&self.read_url),
+                canonical_repository_url: Some(Arc::from(GITLAB_CANONICAL_URL)),
+                token: ProviderSecret(format!("grg_fixture-grant-{sequence}").into_bytes()),
+                expires_at: um_support::utc_now() + time::Duration::hours(1),
+            }
+        }
+    }
+
+    impl SourceCredentialBroker for GitLabGrantBroker {
+        fn issue(
+            &self,
+            _: &str,
+            cancellation: &CaptureCancellation,
+        ) -> Result<ProviderCredential, CredentialBrokerFailure> {
+            if cancellation.is_cancelled() {
+                return Err(CredentialBrokerFailure::Fenced);
+            }
+            let sequence = self.issued_preparation.fetch_add(1, Ordering::SeqCst);
+            let mut credential = self.grant(sequence);
+            if sequence == 0 {
+                credential.expires_at = um_support::utc_now() + time::Duration::seconds(5);
+            }
+            Ok(credential)
+        }
+
+        fn revoke_preparation(&self, _: &str, _: &[u8]) -> Result<(), CredentialBrokerFailure> {
+            self.revoked_preparation.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn commit_availability(
+            &self,
+            _: &str,
+            _: &CaptureCancellation,
+        ) -> Result<CommitAvailability, CredentialBrokerFailure> {
+            panic!("GitLab cannot prove a pinned commit is absent")
+        }
+
+        fn issue_workflow_git(
+            &self,
+            _: &str,
+            _: &CaptureCancellation,
+        ) -> Result<ProviderCredential, CredentialBrokerFailure> {
+            self.issued_workflow_git.fetch_add(1, Ordering::SeqCst);
+            Ok(self.grant(1000))
+        }
+
+        fn revoke_workflow_git(
+            &self,
+            _: &str,
+            _: &[u8],
+        ) -> Result<WorkflowGitRevocation, CredentialBrokerFailure> {
+            Ok(WorkflowGitRevocation::GitLabRevoked)
+        }
+    }
+
+    /// The workspace and private roots of the assignment `manager` has accepted.
+    pub(in crate::service) fn accepted_roots(manager: &AssignmentManager) -> (PathBuf, PathBuf) {
+        match &manager.slot {
+            Some(LocalSlot::Accepted(accepted)) => (
+                accepted.root.workspace.path().to_owned(),
+                accepted.root.private.path().to_owned(),
+            ),
+            _ => panic!("the manager holds no accepted assignment"),
+        }
+    }
+
+    /// Asserts that the runner left no Git wiring of its own: no workflow Git
+    /// credential or source askpass helper in `private`, and no `credential.*`
+    /// configuration in the repository at `workspace` (REQ-WORKSPACE-34).
+    pub(in crate::service) fn assert_no_runner_git_wiring(workspace: &Path, private: &Path) {
+        assert!(!private.join("workflow-git-credential").exists());
+        assert!(fs::read_dir(private).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with("source-askpass-")
+        }));
+        let credential_config = um_test_support::fixture_git_command("git")
+            .current_dir(workspace)
+            .args(["config", "--local", "--get-regexp", "^credential\\."])
+            .output()
+            .unwrap();
+        assert!(!credential_config.status.success());
+    }
+
     /// A manager executing published trees with `tree_run` (REQ-RUNNERENROLL-91): its
-    /// sources come from the fixture repository at `source`, `environment` stands for
-    /// the daemon's, and it guards each assignment's processes in a durable journal as
-    /// the production runner does, which a continuation's retained claim recovers.
+    /// sources come from `source_broker`, `environment` stands for the daemon's, and it
+    /// guards each assignment's processes in a durable journal as the production runner
+    /// does, which a continuation's retained claim recovers.
     pub(in crate::service) fn tree_run_manager(
         config: &Config,
-        source: &Path,
+        source_broker: Arc<dyn SourceCredentialBroker>,
         tree_run: TreeRunDependencies,
         environment: EnvironmentSnapshot,
         recorder: Option<Arc<crate::telemetry::Recorder>>,
@@ -1573,9 +1713,7 @@ pub(super) mod test_support {
         let dependencies = AssignmentDependencies::new(
             work_root,
             Arc::new(super::super::TokioSleeper),
-            Some(super::super::source::test_support::fixture_source_broker(
-                source,
-            )),
+            Some(source_broker),
             None,
             Arc::from(crate::telemetry::TEST_SERVICE_VERSION),
             recorder,

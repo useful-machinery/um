@@ -708,6 +708,23 @@ fn classify(response: &RawResponse) -> WorkflowDefinitionFailure {
             }
         };
     }
+    // A transient problem under its declared status is Cloud being unable to serve the
+    // request, as a 5xx that is no problem response is (REQ-CLOUDDEF-25).
+    if matches!(
+        (status, decoded.r#type.as_str()),
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            problem::SERVICE_UNAVAILABLE
+        ) | (StatusCode::SERVICE_UNAVAILABLE, problem::RETRYABLE_CONFLICT)
+            | (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                problem::INTERNAL_SERVER_ERROR
+            )
+    ) {
+        return WorkflowDefinitionFailure::Unreachable {
+            category: UnreachableCategory::Server,
+        };
+    }
     match decoded.r#type.strip_prefix(PROBLEM_TYPE_PREFIX) {
         Some(slug)
             if (status.is_client_error() || status.is_server_error())
@@ -835,7 +852,7 @@ mod tests {
         WorkflowDefinitionApi, WorkflowDefinitionFailure, WorkflowEvaluationFilter,
         WorkflowPublication, WorkflowRefusal, classify,
     };
-    use crate::{HttpClient, HttpTransportPolicy};
+    use crate::{HttpClient, HttpTransportPolicy, UnreachableCategory};
 
     fn problem(status: u16, kind: &str) -> RawResponse {
         let mut headers = HeaderMap::new();
@@ -878,6 +895,48 @@ mod tests {
             classify(&problem(409, "Not A Slug")),
             WorkflowDefinitionFailure::InvalidResponse { .. }
         ));
+    }
+
+    // REQ-CLOUDDEF-25: the three transient problems, each under its declared status, are
+    // Cloud being unreachable; a 503 that names its own cause and a transient type under
+    // another status stay refusals with their slug, and a rate limit stays a rate limit.
+    #[test]
+    fn a_transient_problem_is_unreachable_and_a_named_cause_stays_a_refusal() {
+        for (status, kind) in [
+            (503, "service-unavailable"),
+            (503, "retryable-conflict"),
+            (500, "internal-server-error"),
+        ] {
+            assert_eq!(
+                classify(&problem(status, kind)),
+                WorkflowDefinitionFailure::Unreachable {
+                    category: UnreachableCategory::Server,
+                },
+                "{status} {kind}"
+            );
+        }
+        for (status, kind) in [
+            (503, "workflow-validator-unavailable"),
+            (503, "binding-resolution-unavailable"),
+            (503, "workflow-tree-storage-unavailable"),
+            (500, "service-unavailable"),
+            (409, "retryable-conflict"),
+            (503, "internal-server-error"),
+        ] {
+            assert_eq!(
+                classify(&problem(status, kind)),
+                WorkflowDefinitionFailure::Refused(Box::new(WorkflowRefusal {
+                    status,
+                    problem: kind.to_owned(),
+                    workflow: None,
+                })),
+                "{status} {kind}"
+            );
+        }
+        assert_eq!(
+            classify(&problem(429, "rate-limit-exceeded")),
+            WorkflowDefinitionFailure::RateLimited { retry_after: None }
+        );
     }
 
     // REQ-CLOUDDEF-22: a 200 answering a create is the project's identical definition, reused,

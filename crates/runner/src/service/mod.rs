@@ -1862,8 +1862,8 @@ mod tests {
         expect_close_frame, expect_opening_hello, fixture_lease_clock, fixture_listener,
         fixture_sleeper, guarded_processes, holding_step_workflow, observation_acknowledgement,
         offer_assignment_after_handshake, process_exists, require_internal_worker_executable,
-        scripted_connector, sleep_request, terminal_observation_acknowledgement, welcome,
-        with_watchdog,
+        run_fixture_git, scripted_connector, sleep_request, terminal_observation_acknowledgement,
+        welcome, with_watchdog,
     };
     use super::workspace::{
         CleanupCancellation, CleanupSleeper, OwnedTree, TreeRemover, WorkRootHook, WorkRootLease,
@@ -3056,36 +3056,19 @@ mod tests {
         offer: Message,
     }
 
-    fn fixture_git(repository: &Path, arguments: &[&str]) -> String {
-        let output = um_test_support::fixture_git_command("git")
-            .current_dir(repository)
-            .args(arguments)
-            .output()
-            .expect("run fixture git command");
-        assert!(
-            output.status.success(),
-            "fixture git command failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        String::from_utf8(output.stdout)
-            .expect("fixture git output should be UTF-8")
-            .trim()
-            .to_owned()
-    }
-
     fn initialize_accepted_repository(source: &Path) {
-        fixture_git(source, &["init", "--quiet", "--object-format=sha1"]);
-        fixture_git(source, &["config", "user.name", "Scherzo Fixture"]);
-        fixture_git(
+        run_fixture_git(source, &["init", "--quiet", "--object-format=sha1"]);
+        run_fixture_git(source, &["config", "user.name", "Scherzo Fixture"]);
+        run_fixture_git(
             source,
             &["config", "user.email", "fixture@usefulmachinery.invalid"],
         );
-        fixture_git(source, &["add", "."]);
-        fixture_git(source, &["commit", "--quiet", "-m", "fixture"]);
+        run_fixture_git(source, &["add", "."]);
+        run_fixture_git(source, &["commit", "--quiet", "-m", "fixture"]);
     }
 
     fn accepted_assignment_offer(source: &Path) -> Message {
-        let commit_oid = fixture_git(source, &["rev-parse", "HEAD"]);
+        let commit_oid = run_fixture_git(source, &["rev-parse", "HEAD"]);
         let workflow = resolve(source, Path::new("workflow.yaml"))
             .expect("resolve accepted assignment workflow");
         let requirements = workflow.capacity.requirements;

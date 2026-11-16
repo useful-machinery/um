@@ -346,7 +346,7 @@ impl CloudSteps<'_> {
             executable_paths: Some(self.executable_paths),
         };
         // The create or publication is sent again once, under the same key, when Cloud
-        // does not answer it.
+        // does not answer it or answers with a transient problem (REQ-CLOUDDEF-25).
         let (publication, reused) = match self.existing {
             Some(id) => {
                 let current = api.definition(organization, project, id)?.current_revision;
