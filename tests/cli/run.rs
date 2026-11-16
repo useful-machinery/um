@@ -6045,10 +6045,9 @@ fn run_failures_use_registered_outcomes_without_exposing_secrets() {
     let (conflict, _directory, credential_path) = prepared_run(vec![problem_http_response(
         "409 Conflict",
         serde_json::json!({
-            "type": "https://api.usefulmachinery.com/problems/project-not-ready",
-            "title": "Project not ready",
-            "status": 409,
-            "blockers": ["runner_pool_unassigned"]
+            "type": "https://api.usefulmachinery.com/problems/a-conflict-from-a-later-release",
+            "title": "Refused",
+            "status": 409
         }),
     )]);
     let environment = deployment_environment(&conflict.api_url, &credential_path);

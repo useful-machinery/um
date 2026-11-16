@@ -16,6 +16,10 @@ use super::{
     GitLabConnectionArg, InstallationArg, OrganizationArg, PoolArg, ProjectArg, RepositoryArg,
 };
 
+/// How `um project show` joins readiness blockers, shared with run creation's
+/// `project-not-ready` rejection.
+pub(super) use output::blocker_list;
+
 pub(super) const ABOUT: &str = "Manage Useful Machinery projects";
 /// What to do about a refusal that names an archived project, shared by the
 /// commands whose refusal is not a project outcome of its own: `um project

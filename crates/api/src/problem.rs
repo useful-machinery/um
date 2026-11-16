@@ -110,3 +110,19 @@ pub(super) fn require_type_parts(
         Err("the problem type is not valid for its HTTP status")
     }
 }
+
+/// Whether `values` is a non-empty ordered selection from `allowed`: each value appears in
+/// `allowed` after the one before it, so a value out of order or repeated fails.
+pub(super) fn ordered_selection<T: PartialEq>(values: &[T], allowed: &[T]) -> bool {
+    if values.is_empty() {
+        return false;
+    }
+    let mut next = 0;
+    for value in values {
+        let Some(offset) = allowed[next..].iter().position(|allowed| allowed == value) else {
+            return false;
+        };
+        next += offset + 1;
+    }
+    true
+}

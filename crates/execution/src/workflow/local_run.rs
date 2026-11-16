@@ -2574,6 +2574,9 @@ impl PendingLocalContinuation {
     }
 
     /// Claim only after the caller has admitted the projected inputs and every profile.
+    /// The admitted inputs must equal the projection completed as admission completes it:
+    /// an optional or defaulted input the run lacks holds its default or empty value, and
+    /// every other input is the run's own (REQ-CONTINUE-9).
     /// Staging is non-authoritative until the single locked state replacement succeeds.
     /// An `edge` continuation records the edge it took and, when the edge is counted, first
     /// rewrites `run.json` with the new attempt count and the edge's count incremented, so a
@@ -2628,11 +2631,13 @@ impl PendingLocalContinuation {
         let (reexecuted, inherited) = self
             .partition(admitted.workflow(), &from)
             .map_err(|_| LocalRunDirectoryError::StateConflict)?;
-        if self
+        // Admission completed each optional or defaulted input the run lacks; complete the
+        // projection the same way, so only that completion and the run's own values match
+        // (REQ-CONTINUE-9, REQ-WFFORMAT-84).
+        let projected = self
             .projected_inputs(admitted.workflow())
-            .map_err(|_| LocalRunDirectoryError::StateConflict)?
-            != *admitted.inputs()
-        {
+            .map_err(|_| LocalRunDirectoryError::StateConflict)?;
+        if super::admission::complete_inputs(admitted.workflow(), projected) != *admitted.inputs() {
             return Err(LocalRunDirectoryError::StateConflict);
         }
         let executed_git = admitted

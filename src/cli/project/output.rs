@@ -241,7 +241,7 @@ fn readiness(project: &Project) -> &'static str {
     }
 }
 
-fn blocker_list(blockers: &[ProjectReadinessBlocker]) -> String {
+pub(in crate::cli) fn blocker_list(blockers: &[ProjectReadinessBlocker]) -> String {
     blockers
         .iter()
         .map(ToString::to_string)

@@ -2120,13 +2120,22 @@ fn revised_tree_fixture() -> AdmittedFixture {
 /// `fixture`'s root workflow rewritten to `source` in its own source root and admitted again
 /// against its execution root, as a replacement read from beside the original is.
 fn readmitted(fixture: &AdmittedFixture, source: &str) -> AdmittedWorkflow {
+    readmitted_with(fixture, source, ResolvedInputs::default())
+}
+
+/// `readmitted` with `inputs` supplied to admission.
+fn readmitted_with(
+    fixture: &AdmittedFixture,
+    source: &str,
+    inputs: ResolvedInputs,
+) -> AdmittedWorkflow {
     let source_root = fixture.admitted.workflow().source.source_root.clone();
     fs::write(source_root.join("workflow.yaml"), source).unwrap();
     let tree = crate::workflow::validate_workflow_tree(&source_root).unwrap();
     let workflow = resolution::resolve(&source_root, Path::new("workflow.yaml")).unwrap();
     admit_workflow(
         workflow,
-        ResolvedInputs::default(),
+        inputs,
         fixture_context(
             &fixture.execution_root,
             1024,
@@ -2827,6 +2836,58 @@ fn a_run_definition_continuation_refuses_another_definition_and_a_replaced_attem
     );
     assert_eq!(document["definitionSource"]["kind"], json!("replaced"));
     drop(owned);
+}
+
+/// `TREE_ROOT_WORKFLOW` declaring an optional and a defaulted input that its runs lack.
+const INPUTS_TREE_ROOT_WORKFLOW: &str = "schemaVersion: 1\nprograms: [bin]\nexclude: [\"tests/\"]\ninputs:\n  extra:\n    kind: text\n    optional: true\n  base:\n    kind: text\n    default: main\nsteps:\n  first:\n    kind: cmd\n    command:\n      argv: [\"hello\"]\n  second:\n    kind: cmd\n    dependsOn: [first]\n    command:\n      argv: [\"true\"]\n";
+
+// REQ-CONTINUE-9, REQ-WFFORMAT-84
+#[test]
+fn begin_accepts_only_the_completion_of_an_input_the_run_lacks() {
+    let fixture = tree_fixture();
+    let (predecessor_path, _record, _writable) = waiting_predecessor(&fixture, "predecessor");
+    let attempts = || {
+        read_state(&open_directory_path(&predecessor_path).unwrap())
+            .unwrap()
+            .attempts
+            .len()
+    };
+
+    // A value the run never held is not the completion of its omission.
+    let supplied = readmitted_with(
+        &fixture,
+        INPUTS_TREE_ROOT_WORKFLOW,
+        ResolvedInputs::new(BTreeMap::from([(
+            "extra".to_owned(),
+            ResolvedInput::Text(Arc::from("other")),
+        )])),
+    );
+    assert!(matches!(
+        acquired(&predecessor_path).begin(
+            &supplied,
+            vec!["second".to_owned()],
+            ContinuationDefinitionMode::Replaced,
+            crate::workflow::publication::ContinuationReasonV1::Resume,
+            None,
+        ),
+        Err(LocalRunDirectoryError::StateConflict)
+    ));
+    assert_eq!(attempts(), 1);
+
+    // Admission's completion of both inputs is the run's projection completed.
+    let completed = readmitted(&fixture, INPUTS_TREE_ROOT_WORKFLOW);
+    let owned = acquired(&predecessor_path)
+        .begin(
+            &completed,
+            vec!["second".to_owned()],
+            ContinuationDefinitionMode::Replaced,
+            crate::workflow::publication::ContinuationReasonV1::Resume,
+            None,
+        )
+        .unwrap();
+    assert_eq!(owned.attempt_number(), 2);
+    drop(owned);
+    assert_eq!(attempts(), 2);
 }
 
 /// The predecessor `waiting_predecessor` builds, its record rewritten as a run that took the

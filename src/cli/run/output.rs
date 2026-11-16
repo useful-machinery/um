@@ -3,8 +3,8 @@ use std::io::{self, Write};
 use anyhow::Context;
 use serde::Serialize;
 use um_api::{
-    Publication, PublicationState, Run, RunArtifactDelivery, RunCancellationReceipt,
-    RunObservation, RunPublicationHandoffState,
+    ProjectReadinessBlocker, Publication, PublicationState, Run, RunArtifactDelivery,
+    RunCancellationReceipt, RunObservation, RunPublicationHandoffState,
 };
 use um_execution::visible_text;
 
@@ -62,6 +62,9 @@ struct CloudError<'a> {
     /// The rejected response's `X-Request-ID`; `request_id` names a cancellation request.
     #[serde(skip_serializing_if = "Option::is_none")]
     correlation_id: Option<&'a str>,
+    /// A `project-not-ready` rejection's readiness blockers, by wire name.
+    #[serde(skip_serializing_if = "<[_]>::is_empty")]
+    blockers: &'a [ProjectReadinessBlocker],
 }
 
 #[derive(Serialize)]
@@ -78,6 +81,7 @@ pub(super) struct AdmissionProblem<'a> {
     pub problem_type: &'a str,
     pub diagnostic: Option<(&'a str, &'a str)>,
     pub correlation_id: Option<&'a str>,
+    pub blockers: &'a [ProjectReadinessBlocker],
 }
 
 pub(super) fn write_admission_failure(
@@ -113,6 +117,7 @@ pub(super) fn write_admission_failure(
                 .diagnostic
                 .map(|(code, input)| InputAdmissionDiagnostic { code, input }),
             correlation_id: problem.correlation_id,
+            blockers: problem.blockers,
         }),
     };
     let mut stdout = io::stdout().lock();
@@ -169,6 +174,7 @@ pub(super) fn write_cloud(
                 problem_type: None,
                 diagnostic: None,
                 correlation_id: None,
+                blockers: &[],
             }),
         };
         let stdout = io::stdout();

@@ -2611,13 +2611,23 @@ mod cloud_acceptance {
     }
 
     fn create_problem_response(status: &str, kind: &str, request_id: Option<&str>) -> Vec<u8> {
+        create_problem_response_with_body(status, kind, request_id, |_| {})
+    }
+
+    fn create_problem_response_with_body(
+        status: &str,
+        kind: &str,
+        request_id: Option<&str>,
+        extend: impl FnOnce(&mut serde_json::Value),
+    ) -> Vec<u8> {
         let status_number: u16 = status.split(' ').next().unwrap().parse().unwrap();
-        let body = serde_json::json!({
+        let mut body = serde_json::json!({
             "type": format!("https://api.usefulmachinery.com/problems/{kind}"),
             "title": "server title sentinel",
             "status": status_number,
             "detail": "server detail sentinel"
         });
+        extend(&mut body);
         let headers: Vec<(&str, &str)> = request_id
             .map(|id| ("X-Request-ID", id))
             .into_iter()
@@ -2628,6 +2638,69 @@ mod cloud_acceptance {
             &headers,
             &serde_json::to_vec(&body).unwrap(),
         )
+    }
+
+    // REQ-RUN-80, REQ-PROJECT-71
+    #[test]
+    fn project_not_ready_is_a_definite_admission_rejection_with_its_blockers() {
+        const PROJECT_NOT_READY: &str =
+            "https://api.usefulmachinery.com/problems/project-not-ready";
+        for json in [false, true] {
+            let (server, _directory, credential_path) =
+                prepared_run(vec![create_problem_response_with_body(
+                    "409 Conflict",
+                    "project-not-ready",
+                    Some(CREATE_REQUEST_ID),
+                    |body| body["blockers"] = serde_json::json!(["runner_pool_unassigned"]),
+                )]);
+            let mut arguments = create_args(json);
+            let insertion = arguments.len() - 1;
+            arguments.splice(insertion..insertion, ["--input-set-id", INPUT_SET_ID]);
+            let output = run_with_env(
+                &arguments,
+                &deployment_environment(&server.api_url, &credential_path),
+            );
+            let requests = server.finish();
+            assert_eq!(requests.len(), 1);
+            assert_eq!(output.status.code(), Some(1));
+            if json {
+                let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+                assert_eq!(result["operation"], "create");
+                assert_eq!(result["outcome"], "error");
+                assert!(result["runId"].is_null());
+                assert_eq!(result["inputSetId"], INPUT_SET_ID);
+                assert_eq!(result["error"]["code"], "admission_rejected");
+                assert_eq!(result["error"]["httpStatus"], 409);
+                assert_eq!(result["error"]["problemType"], PROJECT_NOT_READY);
+                assert_eq!(
+                    result["error"]["blockers"],
+                    serde_json::json!(["runner_pool_unassigned"])
+                );
+                assert_eq!(result["error"]["correlationId"], CREATE_REQUEST_ID);
+                assert_eq!(
+                    result["error"]["idempotencyKey"],
+                    header_value(&requests[0], "idempotency-key")
+                );
+            } else {
+                assert!(output.stdout.is_empty());
+                let diagnostic = String::from_utf8_lossy(&output.stderr);
+                assert!(
+                    diagnostic.contains(PROJECT_NOT_READY)
+                        && diagnostic.contains("HTTP 409")
+                        && diagnostic.contains(CREATE_REQUEST_ID)
+                        && diagnostic.contains("runner_pool_unassigned")
+                        && diagnostic.contains(INPUT_SET_ID),
+                    "{diagnostic}"
+                );
+            }
+            for stream in [&output.stdout, &output.stderr] {
+                assert!(!String::from_utf8_lossy(stream).contains("acceptance_unknown"));
+            }
+            assert_no_secret_output(
+                &output,
+                &["server title sentinel", "server detail sentinel"],
+            );
+        }
     }
 
     // REQ-RUN-80

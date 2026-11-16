@@ -2258,7 +2258,10 @@ fn collect_input_admission_failures(
 
 /// Completes the supplied inputs with every omitted optional or defaulted one, after the
 /// input check, so no schema applies to an engine-supplied empty value (REQ-WFFORMAT-84).
-fn complete_inputs(workflow: &ResolvedWorkflow, inputs: ResolvedInputs) -> ResolvedInputs {
+pub(super) fn complete_inputs(
+    workflow: &ResolvedWorkflow,
+    inputs: ResolvedInputs,
+) -> ResolvedInputs {
     let mut values = inputs.values;
     for (name, kind) in workflow.declared_inputs() {
         if values.contains_key(name) || !workflow.definition.input_may_be_omitted(name) {

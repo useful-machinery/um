@@ -1551,6 +1551,7 @@ fn write_create(
                         .as_ref()
                         .map(|(code, input)| (*code, input.as_str())),
                     correlation_id: None,
+                    blockers: &[],
                 },
             )?;
         } else {
@@ -1585,6 +1586,7 @@ fn write_create(
         status,
         problem_type,
         request_id,
+        blockers,
     }) = &result
     {
         if json {
@@ -1599,11 +1601,15 @@ fn write_create(
                     problem_type,
                     diagnostic: None,
                     correlation_id: request_id.as_deref(),
+                    blockers,
                 },
             )?;
         } else {
             let remedy = match *problem_type {
                 "project-archived" => super::project::ARCHIVED_REMEDY,
+                "project-not-ready" => {
+                    "The project is not ready to run workflows; inspect it with `um project show` and clear the listed blockers before submitting a new request."
+                }
                 "workspace-selection-unsupported" => {
                     "This deployment does not admit an explicit workspace selection. Omit --workspace-branch and --workspace-commit and keep --source-branch; the workspace is then pinned at the workflow definition commit, which the acceptance receipt reports."
                 }
@@ -1617,11 +1623,20 @@ fn write_create(
                     "Check that the selected workspace branch or commit exists on a connected branch of the repository."
                 }
             };
+            let mut stderr = io::stderr().lock();
             writeln!(
-                io::stderr().lock(),
-                "error: Cloud run admission rejected (HTTP {status})\nproblem type: https://api.usefulmachinery.com/problems/{problem_type}\nrequest id: {}\n\n{remedy} This rejection did not create a run.",
+                stderr,
+                "error: Cloud run admission rejected (HTTP {status})\nproblem type: https://api.usefulmachinery.com/problems/{problem_type}\nrequest id: {}",
                 request_id.as_deref().unwrap_or("none")
             )?;
+            if !blockers.is_empty() {
+                writeln!(
+                    stderr,
+                    "blockers: {}",
+                    super::project::blocker_list(blockers)
+                )?;
+            }
+            writeln!(stderr, "\n{remedy} This rejection did not create a run.")?;
         }
         if let Some(input_set_id) = input_set_id {
             write_staging_guidance(organization, input_set_id)?;

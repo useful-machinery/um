@@ -859,6 +859,7 @@ mod tests {
                 status: 422,
                 problem_type: "https://api.usefulmachinery.com/problems/source-rejected",
                 request_id: None,
+                blockers: vec![],
             },
             RunFailure::IdempotencyConflict,
             RunFailure::CreationRejected,

@@ -15,6 +15,7 @@ use super::generated::{apis, models};
 use super::http_client::{HttpClient, generated_configuration};
 use super::http_util::{self, BoundedBodyError, BufferedBlockingResponse};
 use super::problem::{self, BAD_REQUEST, FORBIDDEN, JSON_MEDIA_TYPE, NOT_FOUND, UNAUTHORIZED};
+use super::projects::ProjectReadinessBlocker;
 use super::{HttpTransportPolicy, UnreachableCategory, classify_reqwest_error};
 use um_support::wire_name;
 
@@ -1055,10 +1056,14 @@ pub enum RunFailure {
     },
     /// Reviewed source-admission problem fields only; never carry server prose.
     /// `request_id` is the response's `X-Request-ID` when it is a `req_` typed id.
+    /// `blockers` holds a `project-not-ready` problem's readiness blockers in Cloud's
+    /// order when they are a non-empty ordered selection from the readiness vocabulary
+    /// (REQ-PROJECT-71); it is empty for every other type and for any other list.
     AdmissionRejected {
         status: u16,
         problem_type: &'static str,
         request_id: Option<String>,
+        blockers: Vec<ProjectReadinessBlocker>,
     },
     IdempotencyConflict,
     CreationRejected,
@@ -1600,14 +1605,18 @@ fn input_admission_rejection(
     })
 }
 
-// A definite admission rejection names only its reviewed type and the
-// response's typed request id. Server detail and title are never used.
+// A definite admission rejection names only its reviewed type, the response's
+// typed request id and, for `project-not-ready`, its reviewed readiness blockers.
+// Server detail and title are never used.
 fn source_admission_rejection(
     response: &ReceivedResponse,
     problem: models::Problem,
 ) -> Option<RunFailure> {
     let problem_type = match (response.status, problem.r#type.as_str()) {
         (StatusCode::CONFLICT, problem::PROJECT_ARCHIVED) => "project-archived",
+        (StatusCode::CONFLICT, "https://api.usefulmachinery.com/problems/project-not-ready") => {
+            "project-not-ready"
+        }
         (
             StatusCode::CONFLICT,
             "https://api.usefulmachinery.com/problems/workspace-selection-unsupported",
@@ -1636,11 +1645,47 @@ fn source_admission_rejection(
         .filter_map(|value| value.to_str().ok())
         .find(|value| um_support::valid_typed_id(value, "req_"))
         .map(str::to_owned);
+    let blockers = if problem_type == "project-not-ready" {
+        readiness_blockers(problem.blockers.unwrap_or_default())
+    } else {
+        vec![]
+    };
     Some(RunFailure::AdmissionRejected {
         status: response.status.as_u16(),
         problem_type,
         request_id,
+        blockers,
     })
+}
+
+// REQ-PROJECT-71: a `project-not-ready` problem's blockers, kept only when every one is a
+// readiness blocker and the list is a non-empty selection in the readiness order; any
+// other list is dropped whole.
+fn readiness_blockers(blockers: Vec<models::ProblemBlocker>) -> Vec<ProjectReadinessBlocker> {
+    const ORDER: [ProjectReadinessBlocker; 3] = [
+        ProjectReadinessBlocker::RunnerPoolUnassigned,
+        ProjectReadinessBlocker::RepositoryDetached,
+        ProjectReadinessBlocker::RepositoryUnavailable,
+    ];
+    let readiness = blockers
+        .into_iter()
+        .map(|blocker| match blocker {
+            models::ProblemBlocker::RunnerPoolUnassigned => {
+                Some(ProjectReadinessBlocker::RunnerPoolUnassigned)
+            }
+            models::ProblemBlocker::RepositoryDetached => {
+                Some(ProjectReadinessBlocker::RepositoryDetached)
+            }
+            models::ProblemBlocker::RepositoryUnavailable => {
+                Some(ProjectReadinessBlocker::RepositoryUnavailable)
+            }
+            _ => None,
+        })
+        .collect::<Option<Vec<_>>>();
+    match readiness {
+        Some(readiness) if problem::ordered_selection(&readiness, &ORDER) => readiness,
+        _ => vec![],
+    }
 }
 
 fn validated_problem_failure(
@@ -3006,6 +3051,75 @@ mod recovery_read_tests {
         }
     }
 
+    fn project_not_ready_response(
+        blockers: Option<serde_json::Value>,
+        request_ids: &[&'static str],
+    ) -> BufferedBlockingResponse {
+        let mut response =
+            create_problem_response(StatusCode::CONFLICT, "project-not-ready", request_ids);
+        if let Some(blockers) = blockers {
+            let mut body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+            body["blockers"] = blockers;
+            response.body = serde_json::to_vec(&body).unwrap();
+        }
+        response
+    }
+
+    // REQ-RUN-80, REQ-PROJECT-71
+    #[test]
+    fn project_not_ready_on_create_is_a_definite_rejection_with_its_ordered_blockers() {
+        use models::ProjectReadinessBlocker::{RepositoryDetached, RunnerPoolUnassigned};
+        let request_id = "req_01m622k6qsf09npetkmdkdj51j";
+        for (blockers, expected) in [
+            (
+                Some(serde_json::json!([
+                    "runner_pool_unassigned",
+                    "repository_detached"
+                ])),
+                vec![RunnerPoolUnassigned, RepositoryDetached],
+            ),
+            (None, vec![]),
+            (Some(serde_json::json!([])), vec![]),
+            (
+                Some(serde_json::json!([
+                    "repository_detached",
+                    "runner_pool_unassigned"
+                ])),
+                vec![],
+            ),
+            (
+                Some(serde_json::json!([
+                    "runner_pool_unassigned",
+                    "runner_pool_unassigned"
+                ])),
+                vec![],
+            ),
+            (Some(serde_json::json!(["capacity_reserved"])), vec![]),
+            // A readiness blocker beside another operation's is not shown as a partial list.
+            (
+                Some(serde_json::json!([
+                    "runner_pool_unassigned",
+                    "capacity_reserved"
+                ])),
+                vec![],
+            ),
+        ] {
+            assert_eq!(
+                classify_failure(
+                    &project_not_ready_response(blockers.clone(), &[request_id]),
+                    RunOperation::Create,
+                ),
+                RunFailure::AdmissionRejected {
+                    status: 409,
+                    problem_type: "project-not-ready",
+                    request_id: Some(request_id.to_owned()),
+                    blockers: expected,
+                },
+                "{blockers:?}"
+            );
+        }
+    }
+
     // REQ-RUN-80
     #[test]
     fn source_admission_problem_on_create_is_a_definite_rejection_with_request_id() {
@@ -3023,6 +3137,7 @@ mod recovery_read_tests {
                 status: 409,
                 problem_type: "workspace-selection-unsupported",
                 request_id: Some(request_id.to_owned()),
+                blockers: vec![],
             }
         );
     }
@@ -3099,6 +3214,7 @@ mod recovery_read_tests {
                     status: 409,
                     problem_type: "workspace-selection-unsupported",
                     request_id: None,
+                    blockers: vec![],
                 }
             );
         }
@@ -3124,6 +3240,7 @@ mod recovery_read_tests {
                     status: status.as_u16(),
                     problem_type,
                     request_id: None,
+                    blockers: vec![],
                 }
             );
         }
@@ -3262,12 +3379,16 @@ mod recovery_read_tests {
         server.finish_one();
     }
 
-    // REQ-RUN-80
+    // REQ-RUN-80, REQ-COMPAT-20
     #[test]
     fn unlisted_create_conflict_stays_a_conflict() {
         assert_eq!(
             classify_failure(
-                &create_problem_response(StatusCode::CONFLICT, "project-not-ready", &[]),
+                &create_problem_response(
+                    StatusCode::CONFLICT,
+                    "a-conflict-from-a-later-release",
+                    &[],
+                ),
                 RunOperation::Create,
             ),
             RunFailure::Conflict

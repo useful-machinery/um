@@ -612,20 +612,7 @@ fn valid_deletion_blockers(kind: RunnerDeletionKind, blockers: &[RunnerDeletionB
             RunnerDeletionBlocker::NonterminalAssignment,
         ],
     };
-    if blockers.is_empty() {
-        return false;
-    }
-    let mut next = 0;
-    for blocker in blockers {
-        let Some(offset) = allowed[next..]
-            .iter()
-            .position(|allowed| allowed == blocker)
-        else {
-            return false;
-        };
-        next += offset + 1;
-    }
-    true
+    problem::ordered_selection(blockers, allowed)
 }
 
 fn find_named_resource<T>(

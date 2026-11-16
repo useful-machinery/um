@@ -166,7 +166,8 @@ pub(crate) fn project_input_candidates(
         let retained = values.get(name);
         if retained.is_none() && workflow.input_may_be_omitted(name) {
             // Admission completes an optional or defaulted input the run does not have,
-            // as Cloud's continuation planner leaves it to (REQ-CONTINUE-9).
+            // as Cloud's continuation planner leaves it to (REQ-CONTINUE-9), and
+            // `PendingLocalContinuation::begin` expects this projection completed the same way.
             continue;
         }
         if prior.declared_inputs.get(name) != Some(kind)

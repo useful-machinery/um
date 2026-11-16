@@ -2118,11 +2118,13 @@ nullable `runId`, `outcome`, full nullable `run`,
 `publication`, `cancellationRequest`, nullable create `replayed`, and nullable `error`.
 The error includes `code`, `idempotencyKey`, `requestedMode`, and `requestId` (nullable).
 A create that Cloud definitely refuses at admission (a `409` or `422` `project-archived`,
-`workspace-selection-unsupported`, `workflow-source-unavailable`, `workflow-source-invalid`,
-`workspace-source-unavailable`, or `workspace-membership-unproven` problem) exits 1 with
-code `admission_rejected`; its error adds `httpStatus`, the full `problemType` URI, and
-`correlationId`, the response's `X-Request-ID` (omitted when absent or not a `req_` id), and
-human mode prints the same facts with a remedy. Such a refusal created no run and is never
+`project-not-ready`, `workspace-selection-unsupported`, `workflow-source-unavailable`,
+`workflow-source-invalid`, `workspace-source-unavailable`, or `workspace-membership-unproven`
+problem) exits 1 with code `admission_rejected`; its error adds `httpStatus`, the full
+`problemType` URI, and `correlationId`, the response's `X-Request-ID` (omitted when absent or
+not a `req_` id), and for `project-not-ready` the project's readiness `blockers` in Cloud's
+order (omitted when the problem names none the CLI can vouch for); human mode prints the
+same facts with a remedy. Such a refusal created no run and is never
 `acceptance_unknown`, which a create reports with its key and exit 4 only when the outcome
 is unconfirmed: a transport failure, a `5xx`, or an unreadable response after dispatch.
 Progress goes to stderr. Human show results show the Run's automatic publication

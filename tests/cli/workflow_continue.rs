@@ -201,6 +201,76 @@ fn continuation_rejects_incompatible_replacements_of_optional_json_inputs() {
     }
 }
 
+// REQ-CONTINUE-9, REQ-CONTINUE-11, REQ-WFFORMAT-84: a replacement that adds an optional
+// or defaulted input the run lacks continues with the empty value or the default, and a
+// later resume without a replacement inherits that definition and sees the same values,
+// while the run's own definition and inputs stay as retained.
+#[test]
+fn continuation_completes_an_optional_or_defaulted_input_the_replacement_adds() {
+    let bundle = RunBundle::new(
+        "schemaVersion: 1\nsteps:\n  fail:\n    kind: cmd\n    command: {argv: ['false']}\n",
+    );
+    let run = bundle.result("added-inputs");
+    let output = isolated_command(&bundle.args(&run)).output().unwrap();
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(run.join("state.json").exists(), "{output:?}");
+    let manifest_path = run.join("workflow/manifest.json");
+    let original_manifest = fs::read(&manifest_path).unwrap();
+
+    let replacement = bundle.source_root().join("candidate.yaml");
+    fs::write(
+        &replacement,
+        r#"schemaVersion: 1
+inputs:
+  extra: {kind: text, optional: true}
+  base: {kind: text, default: main}
+steps:
+  fail:
+    kind: cmd
+    inputs:
+      extra: {ref: inputs.extra}
+      base: {ref: inputs.base}
+    command:
+      argv:
+        - sh
+        - -c
+        - 'printf "%s|%s" "$(cat "$UM_STEP_INPUTS/values/extra")" "$(cat "$UM_STEP_INPUTS/values/base")" > seen.txt && test -e ready'
+"#,
+    )
+    .unwrap();
+    let attempts = || {
+        read_json(&run.join("state.json"))["attempts"]
+            .as_array()
+            .unwrap()
+            .len()
+    };
+    let seen = bundle.execution_root().join("seen.txt");
+
+    let mut request = continue_args(&run, &["fail"]);
+    request.extend([
+        "--workflow".to_owned(),
+        replacement.to_string_lossy().into_owned(),
+    ]);
+    let output = isolated_command(&request).output().unwrap();
+    assert_eq!(attempts(), 2, "{output:?}");
+    assert_eq!(fs::read_to_string(&seen).unwrap(), "|main", "{output:?}");
+    assert_eq!(fs::read(&manifest_path).unwrap(), original_manifest);
+
+    // With no replacement the attempt inherits the replaced attempt's definition, and the
+    // inputs the run lacks are completed to the same values.
+    fs::remove_file(&seen).unwrap();
+    fs::write(bundle.execution_root().join("ready"), "").unwrap();
+    let output = isolated_command(&continue_args(&run, &["fail"]))
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert_eq!(attempts(), 3, "{output:?}");
+    assert_eq!(fs::read_to_string(&seen).unwrap(), "|main", "{output:?}");
+    assert_eq!(fs::read(&manifest_path).unwrap(), original_manifest);
+    let result = read_json(&run.join("attempts/000003/result/result.json"));
+    assert_eq!(result["outcome"], "succeeded", "{result}");
+}
+
 // REQ-CONTINUE-10, REQ-CONTINUE-13
 #[test]
 fn continuation_collects_all_missing_candidate_harness_profiles() {
