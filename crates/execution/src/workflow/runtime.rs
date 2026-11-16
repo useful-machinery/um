@@ -200,6 +200,7 @@ impl RecoveryRoundNumber {
         self.0
     }
 
+    #[cfg(any(test, feature = "test-fixtures"))]
     pub const fn fixture(value: u8) -> Self {
         Self(value)
     }
@@ -415,13 +416,6 @@ pub struct TakenEdgeRecord {
     pub counted: bool,
 }
 
-impl TakenEdgeRecord {
-    /// The edge's key in the run record's `edges` counts (REQ-WFDEF-4).
-    pub fn key(&self) -> String {
-        edge_key(&self.step, &self.outcome)
-    }
-}
-
 /// `<step>.<outcome>`, the key an edge is counted under (REQ-WFDEF-4).
 pub(crate) fn edge_key(step: &str, outcome: &str) -> String {
     format!("{step}.{outcome}")
@@ -453,6 +447,7 @@ impl EnteredWait {
         &self.step
     }
 
+    #[cfg(any(test, feature = "test-fixtures"))]
     pub fn outcome(&self) -> Option<&str> {
         self.outcome.as_deref()
     }
@@ -468,14 +463,6 @@ impl EnteredWait {
 
     pub fn then(&self) -> &str {
         &self.then
-    }
-
-    pub fn on_hand_back(&self) -> Option<&str> {
-        self.on_hand_back.as_deref()
-    }
-
-    pub fn rule(&self) -> Option<&WaitRule> {
-        self.rule.as_ref()
     }
 
     pub fn interrupted(&self) -> Option<&ChildInterruption> {

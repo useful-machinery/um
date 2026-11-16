@@ -25,10 +25,6 @@ pub fn open_directory_at(parent: &OwnedFd, identity: &str) -> Result<OwnedFd, Er
     openat(parent, identity, directory_open_flags(), Mode::empty())
 }
 
-#[allow(
-    dead_code,
-    reason = "the standalone owned-tree regression fixture omits regular-file consumers"
-)]
 pub fn open_regular_file_at(parent: &OwnedFd, identity: &str) -> Result<(OwnedFd, Stat), Errno> {
     let descriptor = openat(
         parent,

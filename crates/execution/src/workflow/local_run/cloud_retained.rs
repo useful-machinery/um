@@ -96,6 +96,7 @@ struct InheritedRequest {
 
 /// Called off the async executor, before terminal publication. A missing or
 /// incomplete record is never evidence for a later attempt.
+#[cfg(any(test, feature = "test-fixtures"))]
 pub fn retain_cloud_workflow_evidence<Deadline>(
     private: &Path,
     attempt_id: &str,

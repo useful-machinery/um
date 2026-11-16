@@ -518,11 +518,6 @@ pub enum ExecutionSpecInvalidReason {
     SourceCheckoutDirty,
     WorkflowSourceDigestMismatch,
     WorkflowSourceInvalid,
-    #[allow(
-        dead_code,
-        reason = "retained in the protocol taxonomy; workflow validation now rejects the local node-count case during source resolution"
-    )]
-    WorkflowContractInvalid,
     WorkflowAdmissionInvalid,
     InvalidInputProjection,
     InputManifestMismatch,
@@ -544,7 +539,6 @@ impl ExecutionSpecInvalidReason {
             Self::SourceCheckoutDirty => "source_checkout_dirty",
             Self::WorkflowSourceDigestMismatch => "workflow_source_digest_mismatch",
             Self::WorkflowSourceInvalid => "workflow_source_invalid",
-            Self::WorkflowContractInvalid => "workflow_contract_invalid",
             Self::WorkflowAdmissionInvalid => "workflow_admission_invalid",
             Self::InvalidInputProjection => "invalid_input_projection",
             Self::InputManifestMismatch => "input_manifest_mismatch",

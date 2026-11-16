@@ -316,6 +316,7 @@ where
         self.timing.clone()
     }
 
+    #[cfg(any(test, feature = "test-fixtures"))]
     pub fn snapshot(&self) -> WorkflowRunViewSnapshot {
         self.snapshot_with_logs(None)
     }

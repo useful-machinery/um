@@ -3812,7 +3812,6 @@ fn a_modified_tree_copy_is_rejected_on_reopen() {
         .actual_digest()
         .expect("the modified copy is still a tree");
     assert_ne!(actual, expected);
-    assert!(mismatch.diagnostics().is_empty());
     assert!(!run_path.join("attempts/000002").exists());
 }
 

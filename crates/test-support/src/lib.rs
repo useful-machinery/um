@@ -63,10 +63,6 @@ impl ScriptedHttpServer {
 
     // Deadline tests keep the response pending until the production timer has
     // classified the request, then release the fixture through this channel.
-    #[allow(
-        dead_code,
-        reason = "not every test target uses the shared fixture's single-response pause"
-    )]
     pub fn respond_when_released(response: Vec<u8>) -> Self {
         Self::respond_in_sequence_with_pause(vec![response], Some(0))
     }

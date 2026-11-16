@@ -256,11 +256,6 @@ pub struct RuleError {
 
 impl RuleError {
     pub const CODE: &'static str = "wait_rule_invalid";
-
-    /// The `where` clause that did not parse.
-    pub fn clause(&self) -> &str {
-        &self.clause
-    }
 }
 
 impl fmt::Display for RuleError {

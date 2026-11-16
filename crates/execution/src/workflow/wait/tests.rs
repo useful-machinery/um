@@ -979,7 +979,7 @@ fn an_answer_resolves_only_when_complete_and_a_lift_only_for_the_stop_in_force()
     bare.where_ = "event.payload.complete == maybe".to_owned();
     assert!(matches!(
         evaluate(&bare, RUN, &answer, std::slice::from_ref(&complete)),
-        Err(error) if error.clause() == "event.payload.complete == maybe"
+        Err(error) if error.clause == "event.payload.complete == maybe"
     ));
 
     let stop = WaitRecord::entered(

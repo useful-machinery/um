@@ -851,14 +851,6 @@ impl DefinitionError {
         }
     }
 
-    /// The root's `name` of `definition_name_ambiguous`.
-    pub fn name(&self) -> Option<&str> {
-        match self {
-            Self::NameAmbiguous { name, .. } => Some(name),
-            _ => None,
-        }
-    }
-
     /// The binding key the error concerns.
     pub fn key(&self) -> Option<&str> {
         match self {
@@ -879,16 +871,6 @@ impl DefinitionError {
             | Self::TreeNotRetained { path, .. }
             | Self::TreeRetainedModified { path, .. } => Some(path),
             Self::BindingsFileInvalid { path, .. } => path.as_deref(),
-            _ => None,
-        }
-    }
-
-    /// The failed stage of `definition_record_invalid` or `bindings_file_invalid`.
-    pub fn reason(&self) -> Option<&'static str> {
-        match self {
-            Self::RecordInvalid { reason, .. } | Self::BindingsFileInvalid { reason, .. } => {
-                Some(reason)
-            }
             _ => None,
         }
     }

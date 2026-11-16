@@ -1,8 +1,10 @@
 mod cloud_retained;
 pub(crate) use cloud_retained::retain_cloud_completed_steps;
+#[cfg(any(test, feature = "test-fixtures"))]
+pub use cloud_retained::retain_cloud_workflow_evidence;
 pub use cloud_retained::{
     bind_cloud_continuation_context, load_cloud_continuation_seed,
-    retain_cloud_continuation_evidence, retain_cloud_workflow_evidence,
+    retain_cloud_continuation_evidence,
 };
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -83,7 +85,7 @@ use super::schema_common::{
     utc_timestamp,
 };
 use super::step_runtime::StepFailureCause;
-use super::tree::{TreeDiagnostic, ValidatedTree, validate_workflow_tree};
+use super::tree::{ValidatedTree, validate_workflow_tree};
 use super::tree_copy::{self, FileOperationError, TreeCopyError, file_locator, write_tree_copy};
 use super::value::CapturedValue;
 use super::wait::{ControlEvent, RuleError, WaitRecord, fan_out_element};
@@ -157,7 +159,6 @@ pub enum LocalRunDirectoryError {
     DestinationExists,
     ExecutionRootOverlap,
     StagingUnavailable,
-    LockUnavailable,
     IdentityUnavailable,
     HostIdentityUnavailable,
     SerializationUnavailable,
@@ -559,24 +560,14 @@ impl ManifestTreeV1 {
     pub fn digest(&self) -> &str {
         &self.digest.value
     }
-
-    pub fn programs(&self) -> &[String] {
-        &self.programs
-    }
-
-    pub fn required_tools(&self) -> &[String] {
-        &self.required_tools
-    }
 }
 
 /// A retained tree copy whose recomputed digest differs from the manifest's
-/// (REQ-LOCALRUN-171); a copy that no longer validates as a tree has no digest and
-/// carries the validator's diagnostics instead.
+/// (REQ-LOCALRUN-171); a copy that no longer validates as a tree has no digest.
 #[derive(Debug)]
 pub struct TreeCopyMismatch {
     expected: String,
     actual: Option<String>,
-    diagnostics: Vec<TreeDiagnostic>,
 }
 
 impl TreeCopyMismatch {
@@ -588,10 +579,6 @@ impl TreeCopyMismatch {
     pub fn actual_digest(&self) -> Option<&str> {
         self.actual.as_deref()
     }
-
-    pub fn diagnostics(&self) -> &[TreeDiagnostic] {
-        &self.diagnostics
-    }
 }
 
 /// Re-validates the run's tree copy (`<run>/workflow/tree`) and compares its digest
@@ -601,10 +588,9 @@ pub(crate) fn verify_tree_copy(
     record: &ManifestTreeV1,
 ) -> Result<ValidatedTree, TreeCopyMismatch> {
     let copy = tree_copy_directory(run_directory, record);
-    let mismatch = |actual, diagnostics| TreeCopyMismatch {
+    let mismatch = |actual| TreeCopyMismatch {
         expected: record.digest.value.clone(),
         actual,
-        diagnostics,
     };
     match validate_workflow_tree(&copy) {
         Ok(tree)
@@ -613,8 +599,8 @@ pub(crate) fn verify_tree_copy(
         {
             Ok(tree)
         }
-        Ok(tree) => Err(mismatch(Some(tree.digest.value), Vec::new())),
-        Err(diagnostics) => Err(mismatch(None, diagnostics)),
+        Ok(tree) => Err(mismatch(Some(tree.digest.value))),
+        Err(_) => Err(mismatch(None)),
     }
 }
 
@@ -1589,6 +1575,7 @@ impl PendingLocalRetry {
     }
 
     /// `LocalAttemptOwner::update_run_record` under the retry's run lock.
+    #[cfg(any(test, feature = "test-fixtures"))]
     pub fn update_run_record(
         &self,
         state: RunState,
@@ -2334,6 +2321,7 @@ impl PendingLocalContinuation {
         Ok(())
     }
 
+    #[cfg(any(test, feature = "test-fixtures"))]
     pub fn quiescence_counts(&self) -> (u64, u64, u64) {
         (
             self.quiescence.groups_recorded,
@@ -2342,6 +2330,7 @@ impl PendingLocalContinuation {
         )
     }
 
+    #[cfg(any(test, feature = "test-fixtures"))]
     pub fn verify_locked_history(&self) -> Result<(), LocalRunDirectoryError> {
         verify_retry_lock_identity(&self.root, &self.lock)?;
         validate_run_state_pair(&self.run, &self.state)
@@ -3106,6 +3095,7 @@ pub struct LocalAttemptOwnershipReleased {
 }
 
 impl LocalAttemptOwner {
+    #[cfg(any(test, feature = "test-fixtures"))]
     pub fn create(
         requested: &Path,
         admitted: &AdmittedWorkflow,

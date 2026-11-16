@@ -571,7 +571,7 @@ pub(super) enum Expectation {
     /// failure with this rejection reason, and the gap is named with its ticket in the
     /// chapter's Gaps. No cell is one today; the variant is the mechanism INV-HARNESS-13
     /// keeps for the next gap a drive finds.
-    #[allow(
+    #[expect(
         dead_code,
         reason = "no cell is a known gap on 2.1.321; INV-HARNESS-13 keeps the form"
     )]
@@ -1007,10 +1007,6 @@ struct DrivenFacts {
 enum Verdict {
     Passed,
     /// A known gap met its rejection; no cell is one today (see `Expectation::KnownGap`).
-    #[allow(
-        dead_code,
-        reason = "no cell is a known gap on 2.1.321; INV-HARNESS-13 keeps the form"
-    )]
     Gap(&'static str),
 }
 

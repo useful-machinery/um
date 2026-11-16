@@ -31,10 +31,6 @@ pub type Project = models::Project;
 pub type ProjectList = models::ProjectList;
 pub type ProjectRepository = models::ProjectRepository;
 pub type ProjectReadinessBlocker = models::ProjectReadinessBlocker;
-pub type GitHubInstallation = models::GitHubInstallation;
-pub type GitHubInstallationList = models::GitHubInstallationList;
-pub type GitHubRepository = models::GitHubRepository;
-pub type GitHubRepositoryList = models::GitHubRepositoryList;
 
 pub struct ProjectApi {
     configuration: apis::configuration::Configuration,
@@ -342,53 +338,6 @@ impl ProjectApi {
         self.project_bodyless_mutation(project_id, Method::DELETE, &path, idempotency_key)
     }
 
-    pub fn list_installations(
-        &self,
-        organization: &str,
-    ) -> Result<GitHubInstallationList, ProjectFailure> {
-        let (list, _) = self.request_json(JsonRequest {
-            operation: Operation::InstallationList,
-            method: Method::GET,
-            path: &[
-                "v1",
-                "organizations",
-                organization,
-                "github",
-                "installations",
-            ],
-            query: &[],
-            idempotency_key: None,
-            content_type: None,
-            body: None,
-        })?;
-        validate_installation_list(list)
-    }
-
-    pub fn list_repositories(
-        &self,
-        organization: &str,
-        installation_id: &str,
-    ) -> Result<GitHubRepositoryList, ProjectFailure> {
-        let (list, _) = self.request_json(JsonRequest {
-            operation: Operation::RepositoryList,
-            method: Method::GET,
-            path: &[
-                "v1",
-                "organizations",
-                organization,
-                "github",
-                "installations",
-                installation_id,
-                "repositories",
-            ],
-            query: &[],
-            idempotency_key: None,
-            content_type: None,
-            body: None,
-        })?;
-        validate_repository_list(list)
-    }
-
     fn project_bodyless_mutation(
         &self,
         project_id: &str,
@@ -559,8 +508,6 @@ impl Drop for ProjectApi {
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum Operation {
-    InstallationList,
-    RepositoryList,
     ProjectRead,
     RepositoryRead,
     Create,
@@ -595,11 +542,7 @@ impl Operation {
             }
             StatusCode::CONFLICT => matches!(
                 self,
-                Self::RepositoryList
-                    | Self::Create
-                    | Self::BodyMutation
-                    | Self::BodylessMutation
-                    | Self::RepositoryUpdate
+                Self::Create | Self::BodyMutation | Self::BodylessMutation | Self::RepositoryUpdate
             ),
             StatusCode::PAYLOAD_TOO_LARGE | StatusCode::UNSUPPORTED_MEDIA_TYPE => {
                 matches!(
@@ -942,40 +885,6 @@ pub(super) fn valid_gitlab_path(value: &str) -> bool {
                     .bytes()
                     .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-'))
         })
-}
-
-fn validate_installation_list(
-    list: GitHubInstallationList,
-) -> Result<GitHubInstallationList, ProjectFailure> {
-    if list.items.iter().all(valid_installation) {
-        Ok(list)
-    } else {
-        Err(ProjectFailure::protocol(false))
-    }
-}
-
-fn validate_repository_list(
-    list: GitHubRepositoryList,
-) -> Result<GitHubRepositoryList, ProjectFailure> {
-    let valid = valid_installation(&list.installation)
-        && list.items.iter().all(|repository| {
-            valid_provider_id(&repository.provider_repository_id)
-                && valid_bounded_text(&repository.full_name, 1, 255)
-                && valid_bounded_text(&repository.default_branch, 1, 1024)
-        });
-    if valid {
-        Ok(list)
-    } else {
-        Err(ProjectFailure::protocol(false))
-    }
-}
-
-fn valid_installation(installation: &models::GitHubInstallation) -> bool {
-    um_support::valid_typed_id(&installation.id, "ghi_")
-        && valid_provider_id(&installation.provider_installation_id)
-        && valid_provider_id(&installation.provider_account_id)
-        && OffsetDateTime::parse(&installation.created_at, &Rfc3339).is_ok()
-        && OffsetDateTime::parse(&installation.updated_at, &Rfc3339).is_ok()
 }
 
 fn valid_provider_id(value: &str) -> bool {

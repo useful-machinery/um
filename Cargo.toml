@@ -113,9 +113,7 @@ workspace = true
 anyhow.workspace = true
 base64.workspace = true
 clap.workspace = true
-flate2.workspace = true
 inquire.workspace = true
-jsonschema.workspace = true
 libc.workspace = true
 nix.workspace = true
 ring.workspace = true
@@ -134,8 +132,10 @@ url.workspace = true
 zeroize.workspace = true
 
 [dev-dependencies]
+flate2.workspace = true
 fs4.workspace = true
 futures-util.workspace = true
+jsonschema.workspace = true
 rustix = { workspace = true, features = ["event", "pty"] }
 um-execution = { workspace = true, features = ["test-fixtures"] }
 um-runner = { workspace = true, features = ["test-fixtures"] }

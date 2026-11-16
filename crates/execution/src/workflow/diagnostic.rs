@@ -77,6 +77,7 @@ impl CapturedDiagnosticStream {
         }
     }
 
+    #[cfg(any(test, feature = "test-fixtures"))]
     pub fn from_parts(
         bytes: impl Into<Arc<[u8]>>,
         discarded_bytes: u64,
@@ -97,6 +98,7 @@ pub struct StepDiagnostic {
 }
 
 impl StepDiagnostic {
+    #[cfg(any(test, feature = "test-fixtures"))]
     pub fn from_streams(
         standard_output: CapturedDiagnosticStream,
         standard_error: CapturedDiagnosticStream,

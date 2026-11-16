@@ -170,11 +170,8 @@ pub use organizations::{
 pub use principal_profile::PrincipalProfile;
 pub use profile::{UpdateProfileError, UpdateProfileOutcome, update_current_principal};
 pub use projects::{
-    CreateProjectInput, GitHubInstallation as ProjectGitHubInstallation,
-    GitHubInstallationList as ProjectGitHubInstallationList,
-    GitHubRepository as ProjectGitHubRepository,
-    GitHubRepositoryList as ProjectGitHubRepositoryList, Project, ProjectApi, ProjectFailure,
-    ProjectList, ProjectReadinessBlocker, ProjectRepository, ProjectRepositorySelector,
+    CreateProjectInput, Project, ProjectApi, ProjectFailure, ProjectList, ProjectReadinessBlocker,
+    ProjectRepository, ProjectRepositorySelector,
 };
 pub use provider_http::{ProviderRequestError, ProviderResponse, provider_get, provider_post_json};
 pub use publications::{
@@ -196,17 +193,17 @@ pub use runners::{
 };
 pub use runs::{
     ContinuationAdmissionViolation, CreateRunInput, RetryConflict, Run, RunApi,
-    RunArtifactDelivery, RunCancellation, RunCancellationEffectiveMode, RunCancellationEnvelope,
-    RunCancellationMode, RunCancellationReceipt, RunCancellationReceiptMode,
-    RunCancellationReceiptState, RunCancellationResolutionKind, RunClaimRelease,
-    RunContinuationDefinition, RunContinuationEnvelope, RunContinuationPreparation,
-    RunContinuationReceipt, RunContinuationRequest, RunContinuationWorkspaceModified, RunControl,
-    RunControlAnswer, RunControlKind, RunControlRequest, RunControlSubmission, RunControlWait,
-    RunCreationAcceptance, RunCreationPending, RunDefinitionSelection, RunFailure, RunInterruption,
-    RunInterruptionPhase, RunLinearLifecycle, RunLinearLifecycleOwnershipEvent,
-    RunLinearLifecycleUpdate, RunList, RunListFilter, RunObservation, RunPublicationHandoffState,
-    RunRead, RunRetryFailureCode, RunRetryReceipt, RunRetryRejection, RunRetryState, RunState,
-    RunSubjectClaim, RunSubjectClaimState, RunTriggerDelivery, valid_integration_context,
+    RunArtifactDelivery, RunCancellation, RunCancellationEnvelope, RunCancellationMode,
+    RunCancellationReceipt, RunCancellationReceiptMode, RunCancellationReceiptState,
+    RunCancellationResolutionKind, RunClaimRelease, RunContinuationDefinition,
+    RunContinuationEnvelope, RunContinuationPreparation, RunContinuationReceipt,
+    RunContinuationRequest, RunContinuationWorkspaceModified, RunControl, RunControlAnswer,
+    RunControlKind, RunControlRequest, RunControlSubmission, RunControlWait, RunCreationAcceptance,
+    RunCreationPending, RunDefinitionSelection, RunFailure, RunInterruption, RunInterruptionPhase,
+    RunLinearLifecycle, RunLinearLifecycleUpdate, RunList, RunListFilter, RunObservation,
+    RunPublicationHandoffState, RunRead, RunRetryFailureCode, RunRetryReceipt, RunRetryRejection,
+    RunRetryState, RunState, RunSubjectClaim, RunSubjectClaimState, RunTriggerDelivery,
+    valid_integration_context,
 };
 pub use service_principals::{
     CreateServicePrincipalOutcome, IssueServiceCredentialOutcome, IssuedServiceApiKey,

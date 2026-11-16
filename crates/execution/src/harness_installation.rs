@@ -71,6 +71,7 @@ impl UntestedHarnessAdvisory {
         })
     }
 
+    #[cfg(any(test, feature = "test-fixtures"))]
     pub const fn harness(&self) -> &'static str {
         self.harness
     }

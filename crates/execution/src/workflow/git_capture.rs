@@ -545,20 +545,24 @@ impl GitCaptureContext {
         }
     }
 
+    #[cfg(any(test, feature = "test-fixtures"))]
     pub fn baseline_oid(&self) -> &str {
         &self.baseline_oid
     }
 
+    #[cfg(any(test, feature = "test-fixtures"))]
     pub fn workflow_digest(&self) -> Option<&str> {
         self.workflow_digest.as_deref()
     }
 
+    #[cfg(any(test, feature = "test-fixtures"))]
     pub fn carrier_limits(&self) -> (usize, u64, u64) {
         self.carrier_limits
     }
 
     /// Stages and verifies one branch candidate. The returned set remains provisional until its
     /// workflow reduction is accepted; dropping it rolls back the carrier and reservation.
+    #[cfg(any(test, feature = "test-fixtures"))]
     pub fn capture(
         &self,
         output_identity: &str,

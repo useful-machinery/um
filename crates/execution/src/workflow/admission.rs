@@ -423,6 +423,7 @@ impl CancellationSource {
         true
     }
 
+    #[cfg(any(test, feature = "test-fixtures"))]
     pub fn fixture_begin_finalization_arm(&self) -> bool {
         self.begin_finalization_arm()
     }
@@ -469,6 +470,7 @@ impl CancellationSource {
         true
     }
 
+    #[cfg(any(test, feature = "test-fixtures"))]
     pub fn fixture_complete_finalization_arm(&self) -> bool {
         self.complete_finalization_arm()
     }
@@ -1563,6 +1565,7 @@ impl AdmittedTree {
     }
 
     /// The canonical source tree root admission validated and probed.
+    #[cfg(any(test, feature = "test-fixtures"))]
     pub fn root(&self) -> &Path {
         &self.root
     }
@@ -2162,6 +2165,7 @@ pub fn admit_runner_workflow(
 
 /// Admits a workflow as a local run does, without the local requirement that a workflow
 /// with `workflow` steps comes from a tree.
+#[cfg(any(test, feature = "test-fixtures"))]
 pub fn admit_workflow(
     workflow: ResolvedWorkflow,
     inputs: ResolvedInputs,

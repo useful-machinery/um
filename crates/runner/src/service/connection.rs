@@ -5155,13 +5155,6 @@ mod tests {
             ),
             (
                 AssignmentDecline::ExecutionSpecInvalid(
-                    ExecutionSpecInvalidReason::WorkflowContractInvalid,
-                ),
-                "execution_spec_invalid",
-                Some("workflow_contract_invalid"),
-            ),
-            (
-                AssignmentDecline::ExecutionSpecInvalid(
                     ExecutionSpecInvalidReason::WorkflowAdmissionInvalid,
                 ),
                 "execution_spec_invalid",

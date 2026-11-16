@@ -33,6 +33,7 @@ pub use pi::{
     PiInstallationFailure, PiProbe, ValidatedPiInstallation, discover_and_validate_pi_installation,
 };
 pub use workflow::MAXIMUM_RETAINED_BYTES_PER_STREAM;
+#[cfg(any(test, feature = "test-fixtures"))]
 pub use workflow::admission::admit_workflow;
 pub use workflow::admission::{
     AdmissionFailure, AdmissionFailureKind, AdmittedWorkflow, CLAUDE_CODE_LOGIN_VARIABLE,
@@ -98,6 +99,8 @@ pub use workflow::execution::{
 pub use workflow::git_capture::CloudGitCaptureProjection;
 pub use workflow::input::InputStaging;
 pub use workflow::invocation_accounting::InvocationAccountingLog;
+#[cfg(any(test, feature = "test-fixtures"))]
+pub use workflow::local_run::retain_cloud_workflow_evidence;
 pub use workflow::local_run::{
     AttemptControls, CANCELED_OUTCOME, CarryMiss, ChildCommitFailure, ChildRun, ChildRunDirectory,
     ChildRunParent, ContinuationDefinitionMode, ControlsLock, DurableDeadline,
@@ -113,7 +116,7 @@ pub use workflow::local_run::{
     bind_cloud_continuation_context, child_run_directories, child_runs, inspect_wait, is_run_id,
     latest_attempt_failed, latest_child_run, list_runs, load_cloud_continuation_seed, locate_run,
     lock_holder, positioned_element, read_durable_record, read_local_run_status,
-    retain_cloud_continuation_evidence, retain_cloud_workflow_evidence, wait_child,
+    retain_cloud_continuation_evidence, wait_child,
 };
 pub use workflow::login_check::{
     HarnessLoginCheck, HarnessLoginCheckCause, HarnessLoginCheckStage, check_claude_code_login,
@@ -291,6 +294,7 @@ pub use workflow::resolution::WorkflowSourceProvenance;
 pub use workflow::run_timing::ObservedStepTiming;
 pub use workflow::run_view_model::WorkflowRunPublicationFailure;
 pub use workflow::run_view_model::WorkflowRunViewModelError;
+#[cfg(any(test, feature = "test-fixtures"))]
 pub use workflow::run_view_model::WorkflowRunViewSnapshot;
 pub use workflow::runtime::FinalizationCancellation;
 pub use workflow::runtime::RunCancellationPhase;
