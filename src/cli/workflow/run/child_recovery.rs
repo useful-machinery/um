@@ -259,8 +259,8 @@ async fn prepare_stage(
         mode,
     } = verified;
     // REQ-CONTINUE-82: the inputs the step will map for the child, from the run's admitted
-    // inputs, the outputs it inherits and the resolving control, must be the child's
-    // retained ones before the wait is consumed.
+    // inputs, the outputs it inherits and the attempt's `wait.<field>` values
+    // (REQ-WFEXEC-63), must be the child's retained ones before the wait is consumed.
     let mapped = Mapped {
         parent,
         admitted,

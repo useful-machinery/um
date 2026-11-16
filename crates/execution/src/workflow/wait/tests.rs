@@ -384,6 +384,164 @@ fn attempt_controls_carry_a_kept_wait_to_the_attempt_it_starts_next() {
     }
 }
 
+/// A wait of `kind` entered at `step` and continuing at `then`, `minutes` after `since()`, so
+/// that two waits of one kind in a run have different identities.
+fn wait_at(
+    kind: WaitKind,
+    step: &str,
+    then: &str,
+    on_hand_back: Option<&str>,
+    minutes: i64,
+) -> WaitRecord {
+    WaitRecord::entered(
+        &entered(kind, step, then, on_hand_back),
+        None,
+        Map::new(),
+        since() + time::Duration::minutes(minutes),
+        &ResolvedInputs::default(),
+        &BTreeMap::new(),
+    )
+    .unwrap()
+}
+
+/// Creates attempt `attempt`'s directory in the run at `run`, holding `wait` as its copy.
+fn write_attempt_wait(run: &Path, attempt: u64, wait: Option<&WaitRecord>) {
+    let directory = run.join(format!("attempts/{attempt:06}"));
+    fs::create_dir_all(&directory).unwrap();
+    if let Some(wait) = wait {
+        fs::write(
+            directory.join("wait.json"),
+            serde_json::to_vec(wait).unwrap(),
+        )
+        .unwrap();
+    }
+}
+
+/// Appends to the run at `run` the control of `event` with `payload` resolving `wait`.
+fn resolve_wait(run: &Path, wait: &WaitRecord, event: &str, payload: Option<Value>) {
+    let record: Value = serde_json::from_slice(&fs::read(run.join("run.json")).unwrap()).unwrap();
+    append_control(
+        run,
+        &control(
+            event,
+            record["id"].as_str().unwrap(),
+            Some(&wait.id()),
+            payload,
+        ),
+    )
+    .unwrap();
+}
+
+/// A run whose attempt 1 waited for approval at `review`, continuing at `merge` or, handed
+/// back, at `fix`, and was handed back with `{"notes": "tighten it"}`.
+fn handed_back_run() -> tempfile::TempDir {
+    resolved_run(
+        &record(WaitKind::Approval, "review", "merge", Some("fix")),
+        "control.hand_back",
+        json!({"notes": "tighten it"}),
+    )
+}
+
+/// A run handed back as `handed_back_run`, whose attempt 2 waited at `wait`, resolved by a
+/// control of `event` with `payload`.
+fn handed_back_then(wait: &WaitRecord, event: &str, payload: Option<Value>) -> tempfile::TempDir {
+    let run = handed_back_run();
+    write_attempt_wait(run.path(), 2, Some(wait));
+    resolve_wait(run.path(), wait, event, payload);
+    run
+}
+
+// REQ-WFEXEC-63, REQ-WFEXEC-75: a `control.retry` of a repair wait entered at the step it
+// continues at keeps, for that step, the `wait.<field>` values the attempt that entered the
+// wait had there, through retries in a row and a kept wait's second copy, under the retry's
+// own string fields; any other wait or control, or an attempt without a wait between, keeps
+// nothing. A nested run reads the same from the wait copies its root carried.
+#[test]
+fn attempt_controls_keep_a_hand_back_field_across_repair_retries_at_its_step() {
+    let fields = |notes: Option<&str>| {
+        notes
+            .map(|notes| BTreeMap::from([("notes".to_owned(), notes.to_owned())]))
+            .unwrap_or_default()
+    };
+    let at_fix = |notes| Some(("fix".to_owned(), fields(notes)));
+    let wait_of = |run: &tempfile::TempDir, attempt| {
+        crate::workflow::local_run::attempt_controls(run.path(), attempt)
+            .unwrap()
+            .controls
+            .wait
+    };
+    let repair = wait_at(WaitKind::Repair, "fix", "fix", None, 1);
+
+    let run = handed_back_then(&repair, "control.retry", None);
+    assert_eq!(wait_of(&run, 3), at_fix(Some("tighten it")));
+    // A second repair wait at `fix`, also retried, keeps them for attempt 4.
+    let again = wait_at(WaitKind::Repair, "fix", "fix", None, 2);
+    write_attempt_wait(run.path(), 3, Some(&again));
+    resolve_wait(run.path(), &again, "control.retry", None);
+    assert_eq!(wait_of(&run, 4), at_fix(Some("tighten it")));
+
+    // An interrupted attempt 3 that kept the retried wait holds its second copy
+    // (REQ-WFEXEC-72): attempt 4 still reads the hand-back's notes.
+    let run = handed_back_then(&repair, "control.retry", None);
+    write_attempt_wait(run.path(), 3, Some(&repair));
+    assert_eq!(wait_of(&run, 4), at_fix(Some("tighten it")));
+
+    // The retry's own string field takes the place of the kept one.
+    let run = handed_back_then(&repair, "control.retry", Some(json!({"notes": "changed"})));
+    assert_eq!(wait_of(&run, 3), at_fix(Some("changed")));
+
+    // A repair wait entered at another step than the one it continues at, here a later step
+    // whose repair goes back to `fix`, and an answer wait at `fix`, keep nothing.
+    let elsewhere = wait_at(WaitKind::Repair, "review", "fix", None, 1);
+    let run = handed_back_then(&elsewhere, "control.retry", None);
+    assert_eq!(wait_of(&run, 3), at_fix(None));
+    let answer = wait_at(WaitKind::Answer, "fix", "fix", None, 1);
+    let run = handed_back_then(
+        &answer,
+        "control.answer",
+        Some(json!({"complete": true, "answers": {"q1": "yes"}})),
+    );
+    assert_eq!(wait_of(&run, 3), at_fix(None));
+
+    // An attempt that entered no wait between the hand-back and the repair keeps nothing.
+    let run = handed_back_run();
+    write_attempt_wait(run.path(), 2, None);
+    write_attempt_wait(run.path(), 3, Some(&repair));
+    resolve_wait(run.path(), &repair, "control.retry", None);
+    assert_eq!(wait_of(&run, 4), at_fix(None));
+
+    // A nested run at `part` reads the kept field through the copies its root carried. A
+    // carried approval admits no hand-back, so here an answer whose control carries `notes`
+    // starts `fix`.
+    let review = record(WaitKind::Answer, "review", "fix", None);
+    let prefix = [json!("part")];
+    let root = resolved_run(
+        &WaitRecord::carried(&review, &prefix, "part", None).unwrap(),
+        "control.answer",
+        json!({"complete": true, "answers": {"q1": "yes"}, "notes": "tighten it"}),
+    );
+    let carried = WaitRecord::carried(&repair, &prefix, "part", None).unwrap();
+    assert_eq!(carried.step, [json!("part"), json!("fix")]);
+    write_attempt_wait(root.path(), 2, Some(&carried));
+    resolve_wait(root.path(), &carried, "control.retry", None);
+    let mut run_json: Value =
+        serde_json::from_slice(&fs::read(root.path().join("run.json")).unwrap()).unwrap();
+    run_json["attempts"] = json!(2);
+    fs::write(
+        root.path().join("run.json"),
+        serde_json::to_vec(&run_json).unwrap(),
+    )
+    .unwrap();
+    let nested = tempfile::tempdir().unwrap();
+    write_attempt_wait(nested.path(), 1, Some(&review));
+    write_attempt_wait(nested.path(), 2, Some(&repair));
+    let controls =
+        crate::workflow::local_run::AttemptControls::nested(root.path(), nested.path(), 3, &prefix)
+            .unwrap()
+            .controls;
+    assert_eq!(controls.wait, at_fix(Some("tighten it")));
+}
+
 // REQ-WFDEF-5, REQ-WFEXEC-59
 #[test]
 fn a_wait_without_a_derived_rule_or_continuing_at_an_exit_has_no_record() {

@@ -7193,7 +7193,7 @@ pub fn attempt_controls(
     for (_, wait, control) in &waits {
         resolved.record_answers(&wait.then, wait, control.as_ref());
     }
-    resolved.continue_latest(waits.into_iter().last(), attempt_number);
+    resolved.continue_latest(&waits, attempt_number);
     Ok(resolved)
 }
 
@@ -7228,7 +7228,7 @@ impl AttemptControls {
             }
         }
         let (_, nested_handle) = open_run_root(nested)?;
-        let mut latest = None;
+        let mut waits = Vec::new();
         for number in 1..attempt_number {
             let Some(wait) = read_attempt_wait_record(&nested_handle, number)? else {
                 continue;
@@ -7240,9 +7240,9 @@ impl AttemptControls {
                         && carrier.step.strip_prefix(prefix) == Some(wait.step.as_slice())
                 })
                 .and_then(|(_, _, control)| control.clone());
-            latest = Some((number, wait, control));
+            waits.push((number, wait, control));
         }
-        resolved.continue_latest(latest, attempt_number);
+        resolved.continue_latest(&waits, attempt_number);
         Ok(resolved)
     }
 
@@ -7263,28 +7263,20 @@ impl AttemptControls {
         }
     }
 
-    /// Reads the latest earlier attempt's wait and the control that resolved it, if any: the
-    /// agent-profile replacement of a `control.retry` and, for the attempt `attempt_number`
-    /// immediately after it, the control's fields and the element it resumes at.
-    fn continue_latest(
-        &mut self,
-        latest: Option<(u64, WaitRecord, Option<ControlEvent>)>,
-        attempt_number: u64,
-    ) {
-        let Some((number, wait, Some(control))) = latest else {
+    /// Reads the latest of the earlier attempts' `waits`, in attempt order, and the control
+    /// that resolved it, if any: the agent-profile replacement of a `control.retry` and, for
+    /// the attempt `attempt_number` immediately after it, the `wait.<field>` values
+    /// `continued_wait_fields` derives and the element it resumes at.
+    fn continue_latest(&mut self, waits: &[ResolvedAttemptWait], attempt_number: u64) {
+        let Some((number, wait, Some(control))) = waits.last() else {
             return;
         };
-        let target = match (control.event.as_str(), wait.on_hand_back) {
-            (super::wait::CONTROL_HAND_BACK, Some(step)) => step,
-            _ => wait.then,
-        };
-        let payload = control.payload.unwrap_or_default();
-        let fields = payload
-            .iter()
-            .filter_map(|(name, value)| Some((name.clone(), value.as_str()?.to_owned())))
-            .collect();
+        let target = continued_step(wait, control).to_owned();
         if control.event == super::wait::CONTROL_RETRY
-            && let Some(profiles) = payload.get("agentProfiles")
+            && let Some(profiles) = control
+                .payload
+                .as_ref()
+                .and_then(|payload| payload.get("agentProfiles"))
         {
             self.replacement = Some((target.clone(), profiles.clone()));
         }
@@ -7300,8 +7292,63 @@ impl AttemptControls {
         {
             self.controls.resume_item = Some((target.clone(), item));
         }
-        self.controls.wait = Some((target, fields));
+        self.controls.wait = Some((target, continued_wait_fields(waits)));
     }
+}
+
+/// An earlier attempt's number, its wait copy and the control that resolved the wait, if any.
+type ResolvedAttemptWait = (u64, WaitRecord, Option<ControlEvent>);
+
+/// The step a wait resolved by `control` continues at: its `onHandBack` for a
+/// `control.hand_back`, else its `then`.
+fn continued_step<'a>(wait: &'a WaitRecord, control: &ControlEvent) -> &'a str {
+    match (control.event.as_str(), &wait.on_hand_back) {
+        (super::wait::CONTROL_HAND_BACK, Some(step)) => step,
+        _ => &wait.then,
+    }
+}
+
+/// The `wait.<field>` values the attempt continuing the last of `waits`, the earlier
+/// attempts' resolved wait copies in attempt order, starts with at the step that wait
+/// continues at (REQ-WFEXEC-63): the string fields of the control that resolved it. When that
+/// control is a `control.retry` of a `repair` wait entered at the step it continues at, the
+/// fields are laid over the ones the attempt that entered the wait had there, found the same
+/// way from the copy of the attempt immediately before it, resolved and continuing at the same
+/// step, and so on back; a retried step thus keeps the fields of the control that first
+/// started it, under each retry's own. Any other wait or control keeps nothing earlier.
+fn continued_wait_fields(waits: &[ResolvedAttemptWait]) -> BTreeMap<String, String> {
+    let mut layers = Vec::new();
+    let mut entries = waits.iter().rev().peekable();
+    let mut target = None;
+    while let Some((number, wait, Some(control))) = entries.next() {
+        let step = continued_step(wait, control);
+        if target.is_some_and(|target| target != step) {
+            break;
+        }
+        target = Some(step);
+        layers.push(control);
+        let retried_in_place = control.event == super::wait::CONTROL_RETRY
+            && wait.kind == super::wait::WaitKind::Repair
+            && wait.step.first().and_then(Value::as_str) == Some(step);
+        if !retried_in_place
+            || entries
+                .peek()
+                .is_none_or(|(previous, _, _)| previous.checked_add(1) != Some(*number))
+        {
+            break;
+        }
+    }
+    let mut fields = BTreeMap::new();
+    for control in layers.into_iter().rev() {
+        fields.extend(
+            control
+                .payload
+                .iter()
+                .flatten()
+                .filter_map(|(name, value)| Some((name.clone(), value.as_str()?.to_owned()))),
+        );
+    }
+    fields
 }
 
 /// Each wait copy of the attempts before `attempt_number` of the run at `root`, in attempt
@@ -7313,7 +7360,7 @@ fn resolved_attempt_waits(
     normalized: &Path,
     root: &OwnedFd,
     attempt_number: u64,
-) -> Result<Vec<(u64, WaitRecord, Option<ControlEvent>)>, LocalRunDirectoryError> {
+) -> Result<Vec<ResolvedAttemptWait>, LocalRunDirectoryError> {
     let Some(record) = read_optional_run_record(root)? else {
         return Ok(Vec::new());
     };

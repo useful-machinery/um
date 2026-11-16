@@ -7,9 +7,9 @@ use super::poll_until;
 use rustix::process::{Pid, Signal, kill_process};
 
 use super::workflow_continue::{
-    COMMAND_TREE_ROOT, FAN_OUT_TREE_ROOT, WAIT_TREE_ROOT, attempt_count, chained, completed,
-    decide, decide_each, fan_out_tree, ordinals_of, partition_event, read_json, resume,
-    status_document, wait_tree, wait_tree_with_json_questions, waiting_run,
+    COMMAND_TREE_ROOT, FAN_OUT_TREE_ROOT, WAIT_TREE_ROOT, append_control, attempt_count, chained,
+    completed, control, decide, decide_each, fan_out_tree, ordinals_of, partition_event, read_json,
+    resume, status_document, wait_tree, wait_tree_with_json_questions, waiting_run,
 };
 use super::workflow_definition::Home;
 use super::workflow_mirror::{LinearStub, resolution, write_resolution};
@@ -3063,6 +3063,41 @@ steps:
         then: setup
 ";
 
+/// The stage tree's root whose first `review` stage waits for an approval that a hand-back
+/// continues at `design`, which maps the hand-back's `notes` and whose physically failed child
+/// waits for a repair at `design` itself (SC-CONTINUE-14).
+const STAGE_HAND_BACK_ROOT: &str = "schemaVersion: 1
+programs: [bin]
+outcomes: [landed, failed]
+steps:
+  review:
+    kind: workflow
+    workflow: merge.yaml
+    on:
+      landed:
+        wait: approval
+        then: merge
+        onHandBack: design
+      failed: exit.failed
+  design:
+    kind: workflow
+    workflow: design.yaml
+    inputs:
+      notes:
+        ref: wait.notes
+    on:
+      planned: merge
+      failed:
+        wait: repair
+        then: design
+  merge:
+    kind: workflow
+    workflow: merge.yaml
+    on:
+      landed: exit.landed
+      failed: exit.failed
+";
+
 /// The stage child: `read` and `plan` produce text outputs, `route` reads the plan and
 /// succeeds only once the workspace's plan file reads `fenced`, `effect` runs after it, and
 /// the `close` finalizer fails while `close-fails` exists. `findings` is an optional
@@ -3121,6 +3156,8 @@ steps:
         ref: inputs.part
       findings:
         ref: inputs.findings
+      notes:
+        ref: inputs.notes
     command:
       argv: [stage, route]
     outputs:
@@ -3164,7 +3201,8 @@ steps:
 ";
 
 /// `stage STEP` counts its runs in `count-<STEP>`; `plan` and `route` record the value they
-/// received as `seen-read[-<part>]` and `seen-plan[-<part>]`; `route` requires the omitted
+/// received as `seen-read[-<part>]` and `seen-plan[-<part>]`, and `route` the `notes` it
+/// received, when it has any, as `seen-notes[-<part>]`; `route` requires the omitted
 /// `findings` to read `null` and `plan[-<part>].md` to read `fenced`; `effect` appends one
 /// line to `effects`.
 const STAGE_TREE_PROGRAM: &str = "#!/bin/sh
@@ -3180,6 +3218,8 @@ case \"$1\" in
     printf 'plan-%s' \"$count\" > plan.txt ;;
   route)
     cat \"$UM_STEP_INPUTS/values/plan\" > \"seen-plan$suffix\"
+    test ! -e \"$UM_STEP_INPUTS/values/notes\" ||
+      cat \"$UM_STEP_INPUTS/values/notes\" > \"seen-notes$suffix\"
     test \"$(cat \"$UM_STEP_INPUTS/values/findings\")\" = null
     grep -qx fenced \"plan$suffix.md\"
     printf planned > verdict.txt ;;
@@ -3683,6 +3723,128 @@ fn a_repair_continuation_refuses_changed_mapped_inputs() {
     assert_eq!(ordinals_of(&run.join("children/design")), ["000001"]);
     assert_eq!(attempt_count(&child), 2);
     assert_eq!(stage_counts(root), [1, 1, 2]);
+}
+
+/// The notes `handed_back_repair_waiting` hands back: several lines, the last ended.
+const HAND_BACK_NOTES: &str = "Tighten the plan.\n\n- keep the fence\n- name the part\n";
+
+/// Creates the hand-back stage tree's run, which waits for approval after `review`, hands it
+/// back with `HAND_BACK_NOTES` and resumes it, so that the `design` child receives the notes,
+/// fails at `route` while the workspace's plan file is unfenced, and the run waits for a
+/// repair naming that child: the run's directory and that wait.
+fn handed_back_repair_waiting(bundle: &TreeBundle, name: &str) -> (PathBuf, serde_json::Value) {
+    let root = bundle.execution_root();
+    fs::write(root.join("plan.md"), "unfenced").unwrap();
+    let destination = bundle.result(name);
+    let approval = completed(
+        &isolated_command(&bundle.args(&destination))
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(approval["wait"]["kind"], "approval", "{approval}");
+    let run = fs::canonicalize(&destination).unwrap();
+    recorded(
+        &run_control(None, "hand-back", &run, &["--notes", HAND_BACK_NOTES]),
+        "hand-back",
+        &run,
+    );
+    let waiting = completed(&resume(&run));
+    assert_eq!(waiting["outcome"], "waiting", "{waiting}");
+    assert_eq!(waiting["wait"]["kind"], "repair", "{waiting}");
+    assert_eq!(waiting["wait"]["then"], "design", "{waiting}");
+    assert_eq!(
+        waiting["wait"]["payload"]["child"], "children/design/000001",
+        "{waiting}"
+    );
+    assert_eq!(stage_counts(root), [1, 1, 1]);
+    assert_eq!(
+        fs::read(root.join("seen-notes")).unwrap(),
+        HAND_BACK_NOTES.as_bytes()
+    );
+    (run, waiting["wait"].clone())
+}
+
+/// Asserts that the hand-back stage tree's run at `run` landed after continuing its one
+/// `design` child in place: attempt 2 of the child, with `read` and `plan` inherited, re-ran
+/// only `route` and `effect`, and `route` read the hand-back's notes again.
+fn continued_with_the_hand_back_notes(run: &Path, root: &Path) {
+    assert_eq!(run_record(run)["outcome"], "landed");
+    let child = run.join("children/design/000001");
+    assert_eq!(ordinals_of(&run.join("children/design")), ["000001"]);
+    assert_eq!(attempt_count(&child), 2);
+    let result = attempt_result(&child, 2);
+    assert_eq!(result["continuation"]["reason"], "retry", "{result}");
+    assert_eq!(
+        step_states(&result),
+        states(&[
+            ("read", "inherited"),
+            ("plan", "inherited"),
+            ("route", "succeeded"),
+            ("effect", "succeeded"),
+        ])
+    );
+    assert_eq!(stage_counts(root), [1, 1, 2]);
+    assert_eq!(
+        fs::read(root.join("seen-notes")).unwrap(),
+        HAND_BACK_NOTES.as_bytes()
+    );
+}
+
+// SC-CONTINUE-14, REQ-WFEXEC-63, REQ-CONTINUE-81, REQ-CONTINUE-82: a repair retry of a stage a
+// hand-back started keeps the hand-back's `wait.notes` for that stage, so the step maps the
+// inputs its failed child retained and the same child continues, re-running only its failed
+// step, which reads the notes again; a retry whose own payload carries other notes is still
+// refused before the wait is consumed, and continues the same child once they are gone.
+#[test]
+fn a_repair_retry_of_a_handed_back_stage_keeps_the_hand_back_notes() {
+    let bundle = stage_tree(STAGE_HAND_BACK_ROOT);
+    let root = bundle.execution_root();
+    let (run, _) = handed_back_repair_waiting(&bundle, "retried");
+    fs::remove_file(root.join("seen-notes")).unwrap();
+    fs::write(root.join("plan.md"), "fenced").unwrap();
+    let terminal = last_document(&run_control(None, "retry", &run, &[]));
+    assert_eq!(terminal["outcome"], "succeeded", "{terminal}");
+    continued_with_the_hand_back_notes(&run, root);
+
+    // A retry recorded with other notes changes the step's mapped inputs.
+    let bundle = stage_tree(STAGE_HAND_BACK_ROOT);
+    let root = bundle.execution_root();
+    let (run, wait) = handed_back_repair_waiting(&bundle, "changed");
+    fs::remove_file(root.join("seen-notes")).unwrap();
+    fs::write(root.join("plan.md"), "fenced").unwrap();
+    append_control(
+        &run,
+        &control(
+            &run,
+            "control.retry",
+            Some(&wait),
+            serde_json::json!({"notes": "Something else entirely."}),
+        ),
+    );
+    let controls = control_count(&run);
+    assert_eq!(controls, 2);
+    let control_path = run.join("controls/0002-retry.json");
+    assert!(control_path.is_file());
+    let before = StageSnapshot::take(&run, root);
+
+    let output = resume(&run);
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let refusal = json(&output);
+    assert_eq!(refusal["outcome"], "rejected", "{refusal}");
+    assert_eq!(
+        refusal["diagnostics"][0]["code"], "continuation_inputs_unsatisfied",
+        "{refusal}"
+    );
+    before.assert_unchanged(&run, root, "other notes");
+    assert_eq!(stage_counts(root), [1, 1, 1]);
+    assert_eq!(control_count(&run), controls);
+
+    rewrite_json(&control_path, |control| {
+        control["payload"] = serde_json::json!({});
+    });
+    let terminal = completed(&resume(&run));
+    assert_eq!(terminal["outcome"], "succeeded", "{terminal}");
+    continued_with_the_hand_back_notes(&run, root);
 }
 
 // REQ-CONTINUE-81, REQ-LOCALRUN-184: automatic continuation stays in the retained execution
